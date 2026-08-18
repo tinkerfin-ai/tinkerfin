@@ -1,0 +1,45 @@
+[project]
+name = "tinkerfin-messaging"
+version = "0.1.0"
+description = "Protocol-neutral replayable messaging for asynchronous streams."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+]
+
+dependencies = [
+    "pydantic>=2,<3",
+]
+
+[project.optional-dependencies]
+agui = ["ag-ui-protocol==0.1.19"]
+native = [
+    "tinkerfin>=0.1.0,<0.9.0",
+]
+redis = ["redis>=6,<9"]
+
+[tool.uv.sources]
+tinkerfin = { workspace = true }
+
+[project.urls]
+Homepage = "https://github.com/tinkerfin-ai/tinkerfin"
+Repository = "https://github.com/tinkerfin-ai/tinkerfin"
+Issues = "https://github.com/tinkerfin-ai/tinkerfin/issues"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+tinkerfin_messaging = ["py.typed"]

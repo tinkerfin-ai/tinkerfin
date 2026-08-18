@@ -1,0 +1,1339 @@
+import type {
+  AgentMode,
+  ChatMessageInput,
+  ChatRequestPayload,
+  ChatResumeEntry,
+  ConversationAgUiEvent,
+  InterruptEvent,
+  RawEventContext,
+} from "../../../api/conversation/types"
+import type {
+  ConversationEventEnvelope,
+  ConversationHistoryDetail,
+  ConversationSnapshotJson,
+} from "../../../api/conversation/history"
+import type {
+  ApprovalAllowedDecision,
+  ApprovalItem,
+  ApprovalState,
+  Conversation,
+  ConversationNotice,
+  JsonObject,
+  JsonValue,
+  Message,
+  TodoItem,
+  TodoStatus,
+  WorkspaceState,
+} from "../../../types"
+
+const LEGACY_SEED_CONVERSATION_IDS = new Set([
+  "new-conversation",
+  "cashflow-review",
+  "approval-demo",
+  "market-notes",
+  "deepagent-demo",
+])
+const DEFAULT_ALLOWED_DECISIONS: ApprovalAllowedDecision[] = ["approve", "edit", "reject"]
+
+export const createRunId = () =>
+  `run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
+
+const nowIso = () => new Date().toISOString()
+
+const elapsedMs = (startedAt: string, completedAt: string) => {
+  const elapsed = Date.parse(completedAt) - Date.parse(startedAt)
+  return Number.isFinite(elapsed) ? Math.max(0, elapsed) : 0
+}
+
+const parseJsonObject = (value: string) => {
+  try {
+    const parsed = JSON.parse(value) as JsonValue
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as JsonObject
+      : null
+  } catch {
+    return null
+  }
+}
+
+const isStateTodo = (value: JsonValue): value is { content: string; status: "pending" | "in_progress" | "completed" } =>
+  Boolean(
+    value
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && typeof (value as { content?: unknown }).content === "string"
+    && (
+      (value as { status?: unknown }).status === "pending"
+      || (value as { status?: unknown }).status === "in_progress"
+      || (value as { status?: unknown }).status === "completed"
+    ),
+  )
+
+const toTodoStatus = (status: "pending" | "in_progress" | "completed"): TodoStatus =>
+  status === "in_progress" ? "running" : status
+
+const isTransientMessage = (message: Message) =>
+  message.role === "process" || message.role === "approval"
+
+const findMessageIndex = (
+  conversation: Conversation,
+  predicate: (message: Message) => boolean,
+) => conversation.messages.findIndex(predicate)
+
+const updateMessage = (
+  conversation: Conversation,
+  predicate: (message: Message) => boolean,
+  updater: (message: Message) => Message,
+): Conversation => ({
+  ...conversation,
+  messages: conversation.messages.map((message) => (predicate(message) ? updater(message) : message)),
+})
+
+const setConversationNotice = (
+  conversation: Conversation,
+  content: string,
+  kind: ConversationNotice["kind"],
+): Conversation => ({
+  ...conversation,
+  notice: { kind, content },
+})
+
+const markInterruptedToolCards = (
+  conversation: Conversation,
+  interruptedRunId: string,
+  interrupts: InterruptEvent[],
+): Conversation => ({
+  ...conversation,
+  messages: conversation.messages.map((message) => {
+    if (
+      message.role !== "tool"
+      || message.meta?.status !== "running"
+      || message.meta.runId !== interruptedRunId
+    ) return message
+    const interrupt = interrupts.find((item) => item.toolCallId === message.meta?.toolCallId)
+    return {
+      ...message,
+      meta: {
+        ...message.meta,
+        status: "paused",
+        interruptId: interrupt?.id,
+      },
+    }
+  }),
+})
+
+const approvalInputFromArgs = (args: JsonObject, fallback: string | undefined) => {
+  const filePath = args.file_path
+  if (typeof filePath === "string" && filePath) return filePath
+  return fallback ?? "请确认该操作"
+}
+
+const isAllowedDecision = (value: JsonValue): value is ApprovalAllowedDecision =>
+  value === "approve" || value === "edit" || value === "reject" || value === "respond"
+
+const approvalItemsFromInterrupts = (interrupts: InterruptEvent[]): ApprovalItem[] =>
+  interrupts.map((interrupt) => {
+    const metadata = (interrupt.metadata ?? {}) as JsonObject
+    const deepagents = ((metadata.deepagents ?? {}) as JsonObject)
+    const originalArgs = ((deepagents.originalArgs ?? {}) as JsonObject)
+    const allowedDecisions: ApprovalAllowedDecision[] = Array.isArray(deepagents.allowedDecisions)
+      ? deepagents.allowedDecisions.filter(isAllowedDecision)
+      : DEFAULT_ALLOWED_DECISIONS
+    const toolName = typeof deepagents.toolName === "string"
+      ? deepagents.toolName
+      : "tool"
+
+    return {
+      id: interrupt.id,
+      interruptId: interrupt.id,
+      toolCallId: interrupt.toolCallId,
+      toolName,
+      params: JSON.stringify(originalArgs, null, 2),
+      input: approvalInputFromArgs(originalArgs, interrupt.message),
+      description: interrupt.message ?? `请确认工具 ${toolName}`,
+      originalArgs,
+      allowedDecisions,
+    }
+  })
+
+const attachApproval = (conversation: Conversation, interrupts: InterruptEvent[]) => ({
+  ...conversation,
+  approval: {
+    items: approvalItemsFromInterrupts(interrupts),
+    activeIndex: 0,
+    submitted: false,
+    mode: "options" as const,
+  },
+})
+
+const upsertAssistantMessage = (
+  conversation: Conversation,
+  messageId: string,
+  patch: (message: Message | null) => Message,
+) => {
+  const index = findMessageIndex(conversation, (message) => message.id === messageId)
+  if (index < 0) {
+    return {
+      ...conversation,
+      messages: [...conversation.messages, patch(null)],
+    }
+  }
+
+  return {
+    ...conversation,
+    messages: conversation.messages.map((message, currentIndex) =>
+      currentIndex === index ? patch(message) : message),
+  }
+}
+
+const upsertToolMessage = (
+  conversation: Conversation,
+  toolCallId: string,
+  patch: (message: Message | null) => Message,
+) => {
+  const index = findMessageIndex(
+    conversation,
+    (message) => message.role === "tool" && message.meta?.toolCallId === toolCallId,
+  )
+  if (index < 0) {
+    return {
+      ...conversation,
+      messages: [...conversation.messages, patch(null)],
+    }
+  }
+
+  return {
+    ...conversation,
+    messages: conversation.messages.map((message, currentIndex) =>
+      currentIndex === index ? patch(message) : message),
+  }
+}
+
+const parseTaskDescriptor = (params: string) => {
+  const parsed = parseJsonObject(params)
+  if (!parsed) return null
+
+  return {
+    agentName:
+      typeof parsed.subagent_type === "string" && parsed.subagent_type
+        ? parsed.subagent_type
+        : "subagent",
+    input:
+      typeof parsed.description === "string" && parsed.description
+        ? parsed.description
+        : "",
+  }
+}
+
+const graphTaskIdFromRunId = (runId: string) => runId.split(":sub:")[1]
+
+type ResolvedRawEventContext = RawEventContext & Required<
+  Pick<RawEventContext, "streamMode" | "source">
+>
+
+const runIdForSource = (
+  conversation: Conversation,
+  rawEvent: ResolvedRawEventContext,
+) => rawEvent.runId ?? conversation.messages.find(
+  (message) =>
+    message.role === "subagent"
+    && rawEvent.source.graphTaskId != null
+    && message.meta?.graphTaskId === rawEvent.source.graphTaskId,
+)?.meta?.subRunId
+
+const rawEventOrMain = (
+  conversation: Conversation,
+  rawEvent: RawEventContext | undefined,
+): ResolvedRawEventContext => ({
+  ...rawEvent,
+  streamMode: rawEvent?.streamMode ?? "messages",
+  source: rawEvent?.source ?? {
+    agentType: "main",
+    agentName: "main",
+    namespace: [],
+  },
+  runId: rawEvent?.runId ?? conversation.activeRunId,
+})
+
+const startSubagentRun = (
+  conversation: Conversation,
+  subRunId: string,
+  parentRunId: string,
+  rawEvent: ResolvedRawEventContext,
+): Conversation => {
+  if (conversation.messages.some(
+    (message) => message.role === "subagent" && message.meta?.subRunId === subRunId,
+  )) return conversation
+
+  const graphTaskId = rawEvent.source.graphTaskId ?? undefined
+  const pendingTasks = conversation.messages.filter(
+    (message) =>
+      message.role === "tool"
+      && message.meta?.toolName === "task"
+      && message.meta?.status === "running"
+      && !message.meta?.subRunId,
+  )
+  const task = rawEvent.parentToolCallId
+    ? pendingTasks.find((message) => message.meta?.toolCallId === rawEvent.parentToolCallId)
+    : undefined
+  const createdAt = nowIso()
+  const subagentMessage: Message = {
+    id: subRunId,
+    role: "subagent",
+    content: task?.content ?? "子智能体运行",
+    createdAt,
+    meta: {
+      agentName: task?.meta?.agentName ?? rawEvent.source.agentName ?? "subagent",
+      input: rawEvent.subagentInput ?? task?.meta?.input ?? "",
+      result: "",
+      status: "running",
+      toolCallId: rawEvent.parentToolCallId ?? task?.meta?.toolCallId,
+      subRunId,
+      runId: subRunId,
+      parentRunId,
+      graphTaskId,
+    },
+  }
+
+  return {
+    ...conversation,
+    messages: [
+      ...conversation.messages.map((message) => message.id === task?.id
+        ? {
+            ...message,
+            meta: {
+              ...message.meta,
+              subRunId,
+              graphTaskId,
+            },
+          }
+        : message),
+      subagentMessage,
+    ],
+  }
+}
+
+const updateSubagentRun = (
+  conversation: Conversation,
+  rawEvent: ResolvedRawEventContext,
+  updater: (message: Message) => Message,
+): Conversation => {
+  const runId = runIdForSource(conversation, rawEvent)
+  const index = findMessageIndex(
+    conversation,
+    (message) =>
+      message.role === "subagent"
+      && (runId != null
+        ? message.meta?.subRunId === runId
+        : (
+          rawEvent.source.graphTaskId != null
+          && message.meta?.graphTaskId === rawEvent.source.graphTaskId
+        )),
+  )
+
+  if (index < 0) return conversation
+
+  return {
+    ...conversation,
+    messages: conversation.messages.map((message, currentIndex) =>
+      currentIndex === index ? updater(message) : message),
+  }
+}
+
+const syncTodosFromState = (
+  conversation: Conversation,
+  state: JsonObject | undefined,
+): Conversation => {
+  const rawTodos = state?.todos
+  if (!Array.isArray(rawTodos)) return conversation
+
+  const nextTodos: TodoItem[] = rawTodos
+    .filter(isStateTodo)
+    .map((todo, index) => {
+      const previous = conversation.todos[index]
+      return {
+        id: previous?.id ?? `todo-${index}`,
+        content: todo.content,
+        status: toTodoStatus(todo.status),
+        result: previous?.result,
+      }
+    })
+
+  return {
+    ...conversation,
+    todos: nextTodos,
+    plan: null,
+  }
+}
+
+const applyStateDelta = (current: JsonObject | undefined, delta: { path: string; value?: JsonValue; op: "add" | "remove" | "replace" }[]) => {
+  let next: JsonValue = structuredClone(current ?? {})
+  for (const operation of delta) {
+    const pathParts = operation.path.split("/").slice(1)
+      .map((part) => part.replaceAll("~1", "/").replaceAll("~0", "~"))
+    if (!pathParts.length) {
+      next = operation.op === "remove" ? {} : structuredClone(operation.value ?? null)
+      continue
+    }
+    let target: JsonObject | JsonValue[] | null = (
+      next && typeof next === "object" ? next : null
+    ) as JsonObject | JsonValue[] | null
+    for (const part of pathParts.slice(0, -1)) {
+      if (target == null) break
+      const key = Array.isArray(target) ? Number.parseInt(part, 10) : part
+      if (Array.isArray(target) && !Number.isInteger(key)) {
+        target = null
+        break
+      }
+      const value = target[key as never]
+      if (!value || typeof value !== "object") {
+        target[key as never] = {} as never
+      }
+      target = target[key as never] as JsonObject | JsonValue[]
+    }
+    const finalPart = pathParts.at(-1)
+    if (target == null || finalPart == null) continue
+    if (Array.isArray(target)) {
+      const index = finalPart === "-" ? target.length : Number.parseInt(finalPart, 10)
+      if (!Number.isInteger(index) || index < 0) continue
+      if (operation.op === "remove") {
+        if (index < target.length) target.splice(index, 1)
+      } else if (operation.op === "add") {
+        if (index <= target.length) target.splice(index, 0, operation.value ?? null)
+      } else if (index < target.length) {
+        target[index] = operation.value ?? null
+      }
+    } else if (operation.op === "remove") {
+      delete target[finalPart]
+    } else {
+      target[finalPart] = operation.value ?? null
+    }
+  }
+  return next && typeof next === "object" && !Array.isArray(next) ? next : {}
+}
+
+const normalizeConversationMessages = (messages: Message[]): Message[] => {
+  const stableMessages = messages.filter((message) => !isTransientMessage(message))
+  const explicitSubagentRunIds = new Set(
+    stableMessages.flatMap((message) => (
+      message.role === "subagent"
+      && message.meta?.toolName !== "task"
+      && message.meta?.subRunId
+        ? [message.meta.subRunId]
+        : []
+    )),
+  )
+  const seenSubagentRunIds = new Set<string>()
+
+  return stableMessages.flatMap((message): Message[] => {
+    const isTaskDerivedSubagent = message.role === "subagent" && message.meta?.toolName === "task"
+    const sourceMessage: Message = (
+      isTaskDerivedSubagent
+      && message.meta?.subRunId
+      && explicitSubagentRunIds.has(message.meta.subRunId)
+        // 持久化工作区可能把委派任务本身表示为子智能体卡片；这里恢复原始工具角色，
+        // 在显示独立嵌套运行卡片的同时保留完整 AG-UI 工具历史
+        ? { ...message, role: "tool" }
+        : message
+    )
+    const subRunId = sourceMessage.meta?.subRunId
+
+    const normalizedMessage: Message = (
+      sourceMessage.role === "tool"
+      && sourceMessage.meta?.toolName === "task"
+      && sourceMessage.meta?.agentName
+      && subRunId
+      && !explicitSubagentRunIds.has(subRunId)
+        ? {
+            ...sourceMessage,
+            role: "subagent",
+            meta: {
+              ...sourceMessage.meta,
+              runId: subRunId,
+              graphTaskId:
+                sourceMessage.meta.graphTaskId
+                ?? graphTaskIdFromRunId(subRunId),
+            },
+          }
+        : sourceMessage
+    )
+
+    const normalizedSubRunId = normalizedMessage.meta?.subRunId
+    if (normalizedMessage.role === "subagent" && normalizedSubRunId) {
+      if (seenSubagentRunIds.has(normalizedSubRunId)) return []
+      seenSubagentRunIds.add(normalizedSubRunId)
+    }
+
+    return [normalizedMessage]
+  })
+}
+
+type PersistedConversation = Partial<Conversation> & {
+  id?: unknown
+  threadId?: unknown
+  title?: unknown
+  pinned?: unknown
+  updatedAt?: unknown
+  model?: unknown
+  messages?: unknown
+  todos?: unknown
+  plan?: unknown
+  approval?: unknown
+  runStatus?: unknown
+  activeRunId?: unknown
+  serverState?: unknown
+  lastSeq?: unknown
+}
+
+type PersistedWorkspaceState = {
+  conversations?: PersistedConversation[]
+  currentThreadId?: unknown
+  currentConversationId?: unknown
+}
+
+const isConversationRunStatus = (value: unknown): value is Conversation["runStatus"] =>
+  value === "idle" || value === "streaming" || value === "waiting_approval" || value === "detached" || value === "error"
+
+const legacyConversationIdFromPersistedConversation = (conversation: PersistedConversation): string =>
+  typeof conversation.id === "string" ? conversation.id : ""
+
+const threadIdFromPersistedConversation = (conversation: PersistedConversation): string => {
+  if (typeof conversation.threadId === "string" && conversation.threadId) {
+    return conversation.threadId
+  }
+  return legacyConversationIdFromPersistedConversation(conversation)
+}
+
+const legacyCurrentThreadIdFromPersistedWorkspace = (workspace: PersistedWorkspaceState): string =>
+  typeof workspace.currentConversationId === "string" ? workspace.currentConversationId : ""
+
+export const normalizeWorkspace = (workspace: PersistedWorkspaceState): WorkspaceState => {
+  const persistedConversations = Array.isArray(workspace.conversations) ? workspace.conversations : []
+  const conversations = persistedConversations
+    .filter((conversation) => !LEGACY_SEED_CONVERSATION_IDS.has(threadIdFromPersistedConversation(conversation)))
+    .map((conversation) => {
+      let nextConversation: Conversation = {
+        threadId: threadIdFromPersistedConversation(conversation),
+        title: typeof conversation.title === "string" && conversation.title ? conversation.title : "新会话",
+        pinned: Boolean(conversation.pinned),
+        updatedAt: typeof conversation.updatedAt === "string" ? conversation.updatedAt : nowIso(),
+        model: typeof conversation.model === "string" && conversation.model ? conversation.model : "GPT-5.5",
+        messages: normalizeConversationMessages(Array.isArray(conversation.messages) ? conversation.messages as Message[] : []),
+        todos: Array.isArray(conversation.todos) ? conversation.todos as TodoItem[] : [],
+        plan: (conversation.plan as Conversation["plan"] | undefined) ?? null,
+        approval: conversation.approval as Conversation["approval"],
+        runStatus: isConversationRunStatus(conversation.runStatus) ? conversation.runStatus : "idle",
+        activeRunId: typeof conversation.activeRunId === "string" ? conversation.activeRunId : undefined,
+        serverState:
+          conversation.serverState && typeof conversation.serverState === "object" && !Array.isArray(conversation.serverState)
+            ? conversation.serverState as JsonObject
+            : undefined,
+        lastSeq: typeof conversation.lastSeq === "number" ? conversation.lastSeq : undefined,
+      }
+
+      if (nextConversation.runStatus === "streaming") {
+        nextConversation = setConversationNotice(
+          {
+            ...nextConversation,
+            runStatus: "detached",
+            activeRunId: undefined,
+            approval: nextConversation.approval
+              ? { ...nextConversation.approval, submitted: false }
+              : nextConversation.approval,
+          },
+          "页面已刷新。此前的实时输出连接已断开，如需继续请重新发起任务或处理当前审批。",
+          "info",
+        )
+      }
+
+      return nextConversation
+    })
+
+  const persistedCurrentThreadId = typeof workspace.currentThreadId === "string" && workspace.currentThreadId
+    ? workspace.currentThreadId
+    : legacyCurrentThreadIdFromPersistedWorkspace(workspace)
+  const currentThreadId = conversations.some((conversation) => conversation.threadId === persistedCurrentThreadId)
+    ? persistedCurrentThreadId
+    : (conversations[0]?.threadId ?? "")
+
+  return {
+    conversations,
+    currentThreadId: currentThreadId || conversations[0]?.threadId || "",
+  }
+}
+
+export const buildInitialPayload = (
+  conversation: Conversation,
+  content: string,
+  mode: AgentMode,
+): ChatRequestPayload => ({
+  threadId: conversation.threadId,
+  runId: createRunId(),
+  state: {},
+  messages: [
+    {
+      role: "user",
+      content,
+    } satisfies ChatMessageInput,
+  ],
+  tools: [],
+  context: [],
+  forwardedProps: {
+    model: conversation.model,
+    mode,
+  },
+})
+
+const matchesApprovalGroup = (
+  approval: ApprovalState | undefined,
+  expectedInterruptIds: readonly string[],
+) => Boolean(
+  approval
+  && approval.items.length === expectedInterruptIds.length
+  && approval.items.every(
+    (item, index) => item.interruptId === expectedInterruptIds[index],
+  ),
+)
+
+export const buildResumePayload = (
+  conversation: Conversation,
+  mode: AgentMode,
+  expectedInterruptIds?: readonly string[],
+): ChatRequestPayload => {
+  const approval = conversation.approval
+  if (!approval || approval.items.length === 0) {
+    throw new Error("当前会话没有可提交的审批项")
+  }
+  if (approval.submitted) throw new Error("当前审批已经提交")
+  if (
+    expectedInterruptIds
+    && !matchesApprovalGroup(approval, expectedInterruptIds)
+  ) throw new Error("审批状态已更新")
+
+  const seenInterruptIds = new Set<string>()
+  for (const item of approval.items) {
+    if (!item.interruptId.trim()) throw new Error("审批项缺少 interruptId")
+    if (seenInterruptIds.has(item.interruptId)) throw new Error("审批项 interruptId 重复")
+    seenInterruptIds.add(item.interruptId)
+    if (!item.decision) throw new Error("请先处理所有待审批项")
+    if (item.decision === "rejected") {
+      if (!item.allowedDecisions.includes("reject")) {
+        throw new Error("审批项不允许拒绝")
+      }
+      continue
+    }
+    const requiredDecision = item.editedArgs ? "edit" : "approve"
+    if (!item.allowedDecisions.includes(requiredDecision)) {
+      throw new Error(`审批项不允许${requiredDecision === "edit" ? "编辑" : "批准"}`)
+    }
+  }
+
+  const items = approval.items
+  const resume = items.map<ChatResumeEntry>((item) => {
+    if (item.decision === "rejected") {
+      return {
+        interruptId: item.interruptId,
+        status: "resolved",
+        payload: {
+          type: "reject",
+          ...(item.rejectionReason ? { message: item.rejectionReason } : {}),
+        },
+      }
+    }
+
+    return {
+      interruptId: item.interruptId,
+      status: "resolved",
+      payload: item.editedArgs
+        ? {
+          type: "edit",
+          edited_action: {
+            name: item.toolName,
+            args: item.editedArgs,
+          },
+        }
+        : { type: "approve" },
+    }
+  })
+
+  return {
+    threadId: conversation.threadId,
+    runId: createRunId(),
+    state: {},
+    messages: [],
+    tools: [],
+    context: [],
+    forwardedProps: {
+      model: conversation.model,
+      mode,
+    },
+    resume,
+  }
+}
+
+export const markConversationDetached = (
+  conversation: Conversation,
+  reason = "已停止接收实时输出，后端任务可能仍在继续。",
+): Conversation => {
+  if (conversation.runStatus !== "streaming") return conversation
+  return setConversationNotice(
+    {
+      ...conversation,
+      runStatus: "detached",
+      activeRunId: undefined,
+      approval: conversation.approval ? { ...conversation.approval, submitted: false } : conversation.approval,
+    },
+    reason,
+    "info",
+  )
+}
+
+export const prepareResumeSubmission = (
+  conversation: Conversation,
+  expectedInterruptIds?: readonly string[],
+): Conversation => {
+  if (
+    expectedInterruptIds
+    && !matchesApprovalGroup(conversation.approval, expectedInterruptIds)
+  ) return conversation
+
+  return {
+    ...conversation,
+    runStatus: "streaming",
+    notice: undefined,
+    messages: conversation.messages.map((message) => {
+      if (message.role !== "tool") return message
+      const matchesApproval = conversation.approval?.items.some(
+        (item) => item.toolCallId && item.toolCallId === message.meta?.toolCallId,
+      )
+      if (!matchesApproval) return message
+      return {
+        ...message,
+        meta: {
+          ...message.meta,
+          status: "running",
+          interruptId: undefined,
+        },
+      }
+    }),
+    approval: conversation.approval
+      ? { ...conversation.approval, submitted: true, error: undefined }
+      : conversation.approval,
+  }
+}
+
+export const applyConversationEvent = (
+  conversation: Conversation,
+  event: ConversationAgUiEvent,
+): Conversation => {
+  switch (event.type) {
+    case "RAW": {
+      if (
+        event.source !== "langgraph.tasks"
+        || event.rawEvent?.type !== "tasks"
+        || event.rawEvent.phase !== "start"
+      ) return conversation
+      const provenanceValue = event.event.provenance
+      if (
+        !provenanceValue
+        || typeof provenanceValue !== "object"
+        || Array.isArray(provenanceValue)
+      ) return conversation
+      const subagents = provenanceValue.subagents
+      if (!Array.isArray(subagents)) return conversation
+      return subagents.reduce((current, value) => {
+        if (!value || typeof value !== "object" || Array.isArray(value)) return current
+        const namespace = value.namespace
+        const graphTaskId = value.graphTaskId
+        const agentName = value.agentName
+        const parentToolCallId = value.parentToolCallId
+        const description = value.description
+        const runId = value.runId
+        const parentAgentRunId = value.parentAgentRunId
+        if (
+          !Array.isArray(namespace)
+          || !namespace.every((item): item is string => typeof item === "string" && Boolean(item))
+          || typeof graphTaskId !== "string"
+          || !graphTaskId
+          || typeof agentName !== "string"
+          || !agentName
+          || typeof parentToolCallId !== "string"
+          || !parentToolCallId
+          || typeof description !== "string"
+          || !description
+          || typeof runId !== "string"
+          || !runId
+          || typeof parentAgentRunId !== "string"
+          || !parentAgentRunId
+        ) return current
+        return startSubagentRun(current, runId, parentAgentRunId, {
+          streamMode: "tasks",
+          runId,
+          parentAgentRunId,
+          parentToolCallId,
+          subagentInput: description,
+          source: {
+            agentType: "subagent",
+            agentName,
+            namespace,
+            graphTaskId,
+          },
+        })
+      }, conversation)
+    }
+
+    case "RUN_STARTED": {
+      // 子智能体身份以项目 AG-UI 扩展 `rawEvent.source.agentType === "subagent"`
+      // 为准，不能用表示主运行分支或时间旅行谱系的标准字段 `parentRunId` 推断
+      const rawEvent = rawEventOrMain(conversation, event.rawEvent)
+      const isSubagent = rawEvent.source.agentType === "subagent"
+      if (isSubagent) {
+        const parentRunId = rawEvent.parentAgentRunId ?? event.parentRunId ?? ""
+        return startSubagentRun(conversation, event.runId, parentRunId, rawEvent)
+      }
+      const persistedUserMessages: Message[] = (event.input?.messages ?? [])
+        .filter((message) => message.role === "user" && typeof message.content === "string")
+        .filter((message) => !conversation.messages.some((existing) => existing.id === message.id))
+        .map((message) => ({
+          id: message.id,
+          role: "user",
+          content: message.content,
+          createdAt: nowIso(),
+        }))
+      const isResume = (event.input?.resume?.length ?? 0) > 0
+      return {
+        ...conversation,
+        threadId: event.threadId,
+        title: event.title?.trim() || conversation.title,
+        activeRunId: event.runId,
+        runStatus: "streaming",
+        notice: undefined,
+        approval: isResume ? undefined : conversation.approval,
+        messages: (
+          persistedUserMessages.length > 0
+            ? [...conversation.messages, ...persistedUserMessages]
+            : conversation.messages
+        ).map((message) => (
+          isResume && message.meta?.status === "paused"
+            ? {
+                ...message,
+                meta: {
+                  ...message.meta,
+                  status: "running" as const,
+                  interruptId: undefined,
+                },
+              }
+            : message
+        )),
+      }
+    }
+
+    case "MESSAGES_SNAPSHOT":
+      // MESSAGES_SNAPSHOT 是标准 AG-UI 对话投影，不是完整 UI 快照，不能作为会话
+      // 权威状态；Todo、工具和子智能体卡片仍由事件流驱动，仅在助手文本为空时替换，
+      // 避免覆盖正在流式生成的内容
+      return {
+        ...conversation,
+        messages: conversation.messages.length === 0
+          ? event.messages
+            .filter((message) => message.role === "user" || message.role === "assistant")
+            .map((message) => ({
+              id: message.id,
+              role: message.role === "user" ? "user" : "assistant",
+              content: typeof message.content === "string" ? message.content : "",
+              createdAt: nowIso(),
+            }))
+          : conversation.messages,
+      }
+
+    case "STATE_SNAPSHOT":
+      return syncTodosFromState({
+        ...conversation,
+        serverState: event.snapshot,
+      }, event.snapshot)
+
+    case "STATE_DELTA":
+      {
+        const nextState = applyStateDelta(conversation.serverState, event.delta)
+        return syncTodosFromState({
+          ...conversation,
+          serverState: nextState,
+        }, nextState)
+      }
+
+    case "TEXT_MESSAGE_START": {
+      const rawEvent = rawEventOrMain(conversation, event.rawEvent)
+      if (rawEvent.source.agentType === "subagent") {
+        return updateSubagentRun(conversation, rawEvent, (message) => ({
+          ...message,
+          meta: {
+            ...message.meta,
+            agentName: rawEvent.source.agentName,
+            status: "running",
+          },
+        }))
+      }
+      return upsertAssistantMessage(conversation, event.messageId, (message) => ({
+        id: event.messageId,
+        role: "assistant",
+        content: message?.content ?? "",
+        createdAt: message?.createdAt ?? nowIso(),
+        meta: {
+          ...message?.meta,
+          status: "running",
+          runId: conversation.activeRunId,
+        },
+      }))
+    }
+
+    case "TEXT_MESSAGE_CONTENT": {
+      const rawEvent = rawEventOrMain(conversation, event.rawEvent)
+      if (rawEvent.source.agentType === "subagent") {
+        return updateSubagentRun(conversation, rawEvent, (message) => ({
+          ...message,
+          meta: {
+            ...message.meta,
+            agentName: rawEvent.source.agentName,
+            result: `${message.meta?.result ?? ""}${event.delta}`,
+            status: "running",
+          },
+        }))
+      }
+      return upsertAssistantMessage(conversation, event.messageId, (message) => ({
+        id: event.messageId,
+        role: "assistant",
+        content: `${message?.content ?? ""}${event.delta}`,
+        createdAt: message?.createdAt ?? nowIso(),
+        meta: {
+          ...message?.meta,
+          status: "running",
+          runId: conversation.activeRunId,
+        },
+      }))
+    }
+
+    case "TEXT_MESSAGE_END": {
+      const rawEvent = rawEventOrMain(conversation, event.rawEvent)
+      if (rawEvent.source.agentType === "subagent") {
+        return updateSubagentRun(conversation, rawEvent, (message) => ({
+          ...message,
+          meta: {
+            ...message.meta,
+            agentName: rawEvent.source.agentName,
+          },
+        }))
+      }
+      return updateMessage(
+        conversation,
+        (message) => message.id === event.messageId,
+        (message) => ({
+          ...message,
+          meta: {
+            ...message.meta,
+            status: "completed",
+          },
+        }),
+      )
+    }
+
+    case "REASONING_START":
+    case "REASONING_MESSAGE_START":
+    case "REASONING_MESSAGE_CONTENT":
+    case "REASONING_MESSAGE_END":
+    case "REASONING_END":
+      // 线上保留标准 AG-UI 事件，但会话工作区不持久化或渲染模型推理
+      return conversation
+
+    case "TOOL_CALL_START":
+      {
+        const rawEvent = rawEventOrMain(conversation, event.rawEvent)
+        const sourceRunId = runIdForSource(conversation, rawEvent)
+        const withSubagentName = rawEvent.source.agentType === "subagent"
+          ? updateSubagentRun(conversation, rawEvent, (message) => ({
+              ...message,
+              meta: {
+                ...message.meta,
+                agentName: rawEvent.source.agentName,
+                status: "running",
+              },
+            }))
+          : conversation
+        return upsertToolMessage(withSubagentName, event.toolCallId, (message) => ({
+          id: message?.id ?? event.toolCallId,
+          role: "tool",
+          content: event.toolCallName === "task"
+            ? `委派 ${message?.meta?.agentName ?? "subagent"}`
+            : event.toolCallName,
+          createdAt: message?.createdAt ?? nowIso(),
+          meta: {
+            ...message?.meta,
+            toolName: event.toolCallName,
+            params: message?.meta?.params ?? "",
+            result: message?.meta?.result ?? "",
+            status: message?.meta?.status === "paused" ? "paused" : "running",
+            toolCallId: event.toolCallId,
+            parentMessageId: event.parentMessageId,
+            batchId: message?.meta?.batchId ?? event.parentMessageId,
+            runId: sourceRunId ?? conversation.activeRunId,
+            graphTaskId: rawEvent.source.graphTaskId ?? message?.meta?.graphTaskId,
+            sourceAgentName:
+              rawEvent.source.agentType === "subagent"
+                ? rawEvent.source.agentName
+                : undefined,
+          },
+        }))
+      }
+
+    case "TOOL_CALL_ARGS":
+      return upsertToolMessage(conversation, event.toolCallId, (message) => {
+        const params = `${message?.meta?.params ?? ""}${event.delta}`
+        const taskDescriptor = message?.meta?.toolName === "task" ? parseTaskDescriptor(params) : null
+        return {
+          id: message?.id ?? event.toolCallId,
+          role: "tool",
+          content: taskDescriptor
+            ? `委派 ${taskDescriptor.agentName}`
+            : (message?.content ?? message?.meta?.toolName ?? "tool"),
+          createdAt: message?.createdAt ?? nowIso(),
+          meta: {
+            ...message?.meta,
+            params,
+            agentName: taskDescriptor?.agentName ?? message?.meta?.agentName,
+            input: taskDescriptor?.input ?? message?.meta?.input,
+            status: message?.meta?.status === "paused" ? "paused" : "running",
+          },
+        }
+      })
+
+    case "TOOL_CALL_END":
+      return conversation
+
+    case "TOOL_CALL_RESULT":
+      {
+        const rawEvent = rawEventOrMain(conversation, event.rawEvent)
+        const completedAt = nowIso()
+        let next = upsertToolMessage(conversation, event.toolCallId, (message) => {
+          const createdAt = message?.createdAt ?? completedAt
+          return {
+            id: message?.id ?? event.toolCallId,
+            role: "tool",
+            content: message?.content ?? message?.meta?.toolName ?? "tool",
+            createdAt,
+            meta: {
+              ...message?.meta,
+              result: event.content,
+              status: rawEvent.toolResultStatus === "error" ? "failed" : "completed",
+              completedAt,
+              durationMs: elapsedMs(createdAt, completedAt),
+              runId:
+                message?.meta?.runId
+                ?? runIdForSource(conversation, rawEvent)
+                ?? conversation.activeRunId,
+              graphTaskId:
+                rawEvent.source.graphTaskId
+                ?? message?.meta?.graphTaskId,
+              sourceAgentName:
+                rawEvent.source.agentType === "subagent"
+                  ? rawEvent.source.agentName
+                  : message?.meta?.sourceAgentName,
+            },
+          }
+        })
+        const taskMessage = next.messages.find(
+          (message) =>
+            message.role === "tool"
+            && message.meta?.toolCallId === event.toolCallId
+            && message.meta?.toolName === "task",
+        )
+        const relatedRunId = rawEvent.relatedRunId ?? taskMessage?.meta?.subRunId
+        if (taskMessage && relatedRunId) {
+          const relatedSubagent = next.messages.find(
+            (message) => message.role === "subagent" && message.meta?.subRunId === relatedRunId,
+          )
+          const graphTaskId = relatedSubagent?.meta?.graphTaskId
+          next = updateMessage(
+            next,
+            (message) => message.id === taskMessage.id,
+            (message) => ({
+              ...message,
+              meta: {
+                ...message.meta,
+                subRunId: relatedRunId,
+                graphTaskId,
+              },
+            }),
+          )
+          next = updateMessage(
+            next,
+            (message) => message.role === "subagent" && message.meta?.subRunId === relatedRunId,
+            (message) => ({
+              ...message,
+              content: taskMessage.content,
+              meta: {
+                ...message.meta,
+                agentName: taskMessage.meta?.agentName ?? message.meta?.agentName,
+                input: taskMessage.meta?.input ?? message.meta?.input,
+                result: event.content,
+                status: rawEvent.toolResultStatus === "error" ? "failed" : "completed",
+                toolCallId: event.toolCallId,
+                graphTaskId,
+                completedAt: message.meta?.completedAt ?? completedAt,
+                durationMs:
+                  message.meta?.durationMs
+                  ?? elapsedMs(message.createdAt, completedAt),
+              },
+            }),
+          )
+        } else if (rawEvent.source.agentType === "subagent") {
+          next = updateSubagentRun(next, rawEvent, (message) => ({
+            ...message,
+            meta: {
+              ...message.meta,
+              agentName: rawEvent.source.agentName,
+            },
+          }))
+        }
+        return next
+      }
+
+    case "RUN_FINISHED":
+      {
+        const outcome = event.outcome ?? { type: "success" as const }
+        const subagentMessage = conversation.messages.find(
+          (message) => message.role === "subagent" && message.meta?.subRunId === event.runId,
+        )
+        if (subagentMessage) {
+          const completedAt = nowIso()
+          return updateMessage(
+            conversation,
+            (message) => message.id === subagentMessage.id,
+            (message) => ({
+              ...message,
+              meta: {
+                ...message.meta,
+                status: outcome.type === "interrupt" ? "paused" : "completed",
+                completedAt,
+                durationMs: elapsedMs(message.createdAt, completedAt),
+              },
+            }),
+          )
+        }
+
+        // 嵌套运行会先于父任务结果结束；未知的非主运行不能终结整个会话
+        if (conversation.activeRunId && event.runId !== conversation.activeRunId) {
+          return conversation
+        }
+
+      if (outcome.type === "interrupt") {
+        return attachApproval(
+          markInterruptedToolCards(
+            {
+              ...conversation,
+              threadId: event.threadId,
+              runStatus: "waiting_approval",
+              activeRunId: undefined,
+            },
+            event.runId,
+            outcome.interrupts,
+          ),
+          outcome.interrupts,
+        )
+      }
+
+      return {
+        ...conversation,
+        threadId: event.threadId,
+        runStatus: "idle",
+        activeRunId: undefined,
+        approval: undefined,
+      }
+      }
+
+    case "RUN_ERROR":
+      {
+        const rawEvent = rawEventOrMain(conversation, event.rawEvent)
+        if (rawEvent.source.agentType === "subagent") {
+          const completedAt = nowIso()
+          return updateSubagentRun(conversation, rawEvent, (message) => ({
+            ...message,
+            meta: {
+              ...message.meta,
+              status: "failed",
+              completedAt,
+              durationMs: elapsedMs(message.createdAt, completedAt),
+            },
+          }))
+        }
+        const completedAt = nowIso()
+        const errorMessage = event.message ?? "对话运行失败。"
+        const isCancelled = event.code === "cancelled" || event.code === "resume_cancelled"
+        return setConversationNotice(
+          {
+            ...conversation,
+            runStatus: isCancelled ? "idle" : "error",
+            activeRunId: undefined,
+            messages: conversation.messages.map((message) => (
+              (message.role === "tool" || message.role === "subagent")
+                && (message.meta?.status === "running" || message.meta?.status === "paused")
+                ? {
+                    ...message,
+                    meta: {
+                      ...message.meta,
+                      status: "failed" as const,
+                      result: message.role === "subagent"
+                        ? message.meta?.result || errorMessage
+                        : errorMessage,
+                      completedAt,
+                      durationMs: elapsedMs(message.createdAt, completedAt),
+                    },
+                  }
+                : message
+            )),
+          },
+          errorMessage,
+          "error",
+        )
+      }
+
+    default:
+      return conversation
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 历史恢复：v2 快照与严格有序的尾部事件
+// ---------------------------------------------------------------------------
+
+const messagesFromSnapshot = (snapshot: ConversationSnapshotJson | null | undefined): Message[] => {
+  if (!snapshot) return []
+  return snapshot.messages.map((message) => ({
+    ...message,
+    meta: message.meta ? { ...message.meta } : undefined,
+  }))
+}
+
+/**
+ * 按版本化历史契约恢复持久化会话
+ *
+ * 可信 v2 快照包含完整 UI 投影，只回放 `snapshotSeq` 之后的事件；
+ * 没有可信快照时，后端返回完整事件日志并从序号零开始回放
+ */
+export const restoreConversationFromHistory = (
+  detail: ConversationHistoryDetail,
+  options: { model: string },
+): Conversation => {
+  const snapshot = detail.snapshot ?? null
+  const hasTrustedV2Snapshot = detail.snapshotVersion === 2
+    && snapshot?.snapshotVersion === 2
+    && snapshot.snapshotSeq === detail.snapshotSeq
+  const baseline: Conversation = {
+    threadId: detail.threadId,
+    title: detail.title,
+    pinned: detail.pinned,
+    updatedAt: detail.updatedAt,
+    model: options.model,
+    messages: hasTrustedV2Snapshot ? messagesFromSnapshot(snapshot) : [],
+    todos: hasTrustedV2Snapshot
+      ? snapshot.todos.map((todo) => {
+          const restoredTodo = { ...todo }
+          delete restoredTodo.targetMessageId
+          return restoredTodo
+        })
+      : [],
+    plan: null,
+    approval: hasTrustedV2Snapshot && snapshot.approval
+      ? snapshot.approval
+      : undefined,
+    runStatus: ((): Conversation["runStatus"] => {
+      switch (detail.status) {
+        // 历史水化不拥有原始 SSE 连接；服务端仍在运行时，本地应标记为断连并通过
+        // 持久化事件追赶，不能展示无效的停止按钮
+        case "running": return "detached"
+        case "waiting_approval": return "waiting_approval"
+        case "error": return "error"
+        default: return "idle"
+      }
+    })(),
+    activeRunId: hasTrustedV2Snapshot
+      ? snapshot.activeRunId ?? undefined
+      : undefined,
+    serverState: hasTrustedV2Snapshot ? snapshot.serverState : {},
+    lastSeq: hasTrustedV2Snapshot ? detail.snapshotSeq : 0,
+  }
+
+  const restored = detail.events.reduce<Conversation>(
+    (conversation, envelope) => applyHistoryEventEnvelope(conversation, envelope),
+    baseline,
+  )
+
+  // 事件回放只重建 UI 投影，不会创建浏览器持有的 SSE 连接；RUN_STARTED 不能让
+  // 已水化历史停在 `streaming` 并暴露无效停止按钮，详情状态才是权威服务端状态
+  const hasAuthoritativeApproval = detail.status === "waiting_approval"
+    && detail.hasPendingInterrupt
+  return {
+    ...restored,
+    approval: hasAuthoritativeApproval ? restored.approval : undefined,
+    runStatus: detail.status === "running"
+      ? "detached"
+      : hasAuthoritativeApproval
+        ? "waiting_approval"
+        : detail.status === "error"
+          ? "error"
+          : "idle",
+  }
+}
+
+export const applyHistoryEventEnvelope = (
+  conversation: Conversation,
+  envelope: ConversationEventEnvelope,
+): Conversation => applyPersistedEventEnvelope(conversation, envelope, false)
+
+export const applyLiveEventEnvelope = (
+  conversation: Conversation,
+  envelope: ConversationEventEnvelope,
+): Conversation => applyPersistedEventEnvelope(conversation, envelope, true)
+
+const applyPersistedEventEnvelope = (
+  conversation: Conversation,
+  envelope: ConversationEventEnvelope,
+  ownsLiveStream: boolean,
+): Conversation => {
+  const lastSeq = conversation.lastSeq ?? 0
+  if (envelope.seq <= lastSeq) return conversation
+  if (envelope.seq !== lastSeq + 1) {
+    throw new Error(
+      `会话事件序号不连续: expected=${lastSeq + 1}, actual=${envelope.seq}`,
+    )
+  }
+  const event = envelope.event as unknown as ConversationAgUiEvent
+  const next = applyConversationEvent(conversation, event)
+  const previousById = new Map(conversation.messages.map((message) => [message.id, message]))
+  const timestampedMessages = next.messages.map((message) => {
+    const previous = previousById.get(message.id)
+    const createdAt = previous?.createdAt ?? envelope.createdAt
+    const completionChanged = message.meta?.completedAt != null
+      && message.meta.completedAt !== previous?.meta?.completedAt
+    if (!completionChanged && previous) return message
+    return {
+      ...message,
+      createdAt,
+      meta: completionChanged
+        ? {
+            ...message.meta,
+            completedAt: envelope.createdAt,
+            durationMs: elapsedMs(createdAt, envelope.createdAt),
+          }
+        : message.meta,
+    }
+  })
+  return {
+    ...next,
+    // 持久化追赶属于回放，不是页面持有的实时连接；回放的 RUN_STARTED 可以标识
+    // 服务端活跃运行，但不能暴露停止等仅适用于实时连接的控件
+    runStatus: !ownsLiveStream && next.runStatus === "streaming"
+      ? "detached"
+      : next.runStatus,
+    messages: timestampedMessages,
+    lastSeq: envelope.seq,
+  }
+}

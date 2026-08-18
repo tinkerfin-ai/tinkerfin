@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#ffffff" />
+    <meta name="description" content="TinkerFin AI Agent 对话工作台" />
+    <link rel="icon" type="image/svg+xml" href="/tinkerfin-favicon.svg?v=4" />
+    <title>TinkerFin</title>
+    <script>
+      (() => {
+        const storageKey = 'tinkerfin:theme'
+        let preference = 'light'
+        try {
+          const storedPreference = window.localStorage.getItem(storageKey)
+          if (storedPreference === 'light' || storedPreference === 'dark' || storedPreference === 'system') {
+            preference = storedPreference
+          }
+        } catch {
+          preference = 'light'
+        }
+        const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches
+        const theme = preference === 'system' ? (prefersDark ? 'dark' : 'light') : preference
+        const root = document.documentElement
+        root.setAttribute('data-theme-preference', preference)
+        root.setAttribute('data-theme', theme)
+        root.style.colorScheme = theme
+        document.querySelector('meta[name="theme-color"]')
+          ?.setAttribute('content', theme === 'dark' ? '#111014' : '#ffffff')
+      })()
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

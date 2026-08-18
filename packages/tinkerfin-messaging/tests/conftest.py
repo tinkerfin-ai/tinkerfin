@@ -1,0 +1,69 @@
+"""Cross-backend test fixtures with mandatory real Redis coverage."""
+
+from __future__ import annotations
+
+import os
+from collections.abc import AsyncGenerator, Awaitable
+from typing import cast
+from uuid import uuid4
+
+import pytest
+from redis.asyncio import Redis
+from redis.exceptions import RedisError
+
+from tinkerfin_messaging import MemoryBackend, MessagingBackend, RedisBackend
+
+_REDIS_URL_ENV = "TINKERFIN_TEST_REDIS_URL"
+
+
+async def _delete_prefix(client: Redis, prefix: str) -> None:
+    cursor = 0
+    while True:
+        cursor, keys = await client.scan(
+            cursor=cursor,
+            match=f"{prefix}:*",
+            count=200,
+        )
+        if keys:
+            await client.unlink(*keys)
+        if cursor == 0:
+            return
+
+
+@pytest.fixture(params=("memory", "redis"))
+async def messaging_backend(
+    request: pytest.FixtureRequest,
+) -> AsyncGenerator[MessagingBackend, None]:
+    """Yield an isolated backend implementation for the shared runtime contract."""
+
+    if request.param == "memory":
+        yield MemoryBackend()
+        return
+
+    redis_url = os.getenv(_REDIS_URL_ENV)
+    if not redis_url:
+        pytest.skip(f"real Redis configuration is missing: {_REDIS_URL_ENV}")
+    client = Redis.from_url(
+        redis_url,
+        decode_responses=False,
+        socket_connect_timeout=5,
+        socket_timeout=5,
+    )
+    prefix = f"tfmsg:runtime-contract:{uuid4().hex}"
+    try:
+        try:
+            assert await cast(Awaitable[bool], client.ping()) is True
+        except (OSError, RedisError, TimeoutError) as error:
+            pytest.fail(
+                "real Redis PING failed without exposing credentials: "
+                f"{type(error).__name__}"
+            )
+        yield RedisBackend(
+            client,
+            key_prefix=prefix,
+            lease_ttl=3,
+            poll_interval=0.02,
+        )
+    finally:
+        await _delete_prefix(client, prefix)
+        await client.aclose()

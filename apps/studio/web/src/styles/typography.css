@@ -1,0 +1,70 @@
+:root {
+  --font-ui: 'Geist Variable', 'Noto Sans SC Variable', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  --font-mono: 'Geist Mono Variable', 'SFMono-Regular', Consolas, monospace;
+
+  --type-caption-size: 11px;
+  --type-caption-weight: 400;
+  --type-caption-line-height: 1.4;
+  --type-meta-size: 12px;
+  --type-meta-weight: 500;
+  --type-meta-line-height: 1.4;
+  --type-ui-small-size: 13px;
+  --type-ui-small-weight: 500;
+  --type-ui-small-line-height: 1.4;
+  --type-ui-size: 14px;
+  --type-ui-weight: 500;
+  --type-ui-line-height: 1.4;
+  --type-body-small-size: 15px;
+  --type-body-small-weight: 400;
+  --type-body-small-line-height: 1.65;
+  --type-body-size: 16px;
+  --type-body-weight: 400;
+  --type-body-line-height: 1.75;
+  --type-title-size: 18px;
+  --type-title-weight: 600;
+  --type-title-line-height: 1.25;
+  --type-display-size: clamp(28px, 3.4vw, 40px);
+  --type-display-weight: 600;
+  --type-display-line-height: 1.15;
+}
+
+html,
+body {
+  font-family: var(--font-ui);
+}
+
+body {
+  font-size: var(--type-ui-size);
+  font-weight: 400;
+  line-height: var(--type-ui-line-height);
+  letter-spacing: 0;
+}
+
+code,
+kbd,
+pre,
+samp,
+.typography-mono {
+  font-family: var(--font-mono);
+}
+
+.typography-heading {
+  letter-spacing: -.025em;
+}
+
+.typography-label {
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
+
+.typography-reveal--display {
+  font-size: var(--type-display-size);
+  font-weight: var(--type-display-weight);
+  line-height: var(--type-display-line-height);
+}
+
+.typography-reveal--state {
+  font-size: var(--type-title-size);
+  font-weight: var(--type-title-weight);
+  line-height: var(--type-title-line-height);
+}

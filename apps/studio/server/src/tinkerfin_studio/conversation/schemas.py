@@ -1,0 +1,84 @@
+"""会话历史、命令和取消接口模型"""
+
+from datetime import datetime
+
+from pydantic import BaseModel, ConfigDict, Field, JsonValue
+
+
+class ConversationHistoryListItem(BaseModel):
+    """历史列表中的会话摘要"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: int = Field(ge=1)
+    thread_id: str = Field(alias="threadId")
+    title: str
+    status: str
+    last_run_id: str | None = Field(default=None, alias="lastRunId")
+    last_model: str | None = Field(default=None, alias="lastModel")
+    last_seq: int = Field(alias="lastSeq", ge=0)
+    message_count: int = Field(alias="messageCount", ge=0)
+    tool_call_count: int = Field(alias="toolCallCount", ge=0)
+    has_pending_interrupt: bool = Field(alias="hasPendingInterrupt")
+    pinned: bool
+    created_at: datetime = Field(alias="createdAt")
+    updated_at: datetime = Field(alias="updatedAt")
+
+
+class ConversationHistoryListResponse(BaseModel):
+    """历史会话游标分页响应"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    items: list[ConversationHistoryListItem]
+    next_cursor: str | None = Field(default=None, alias="nextCursor")
+
+
+class ConversationEventEnvelope(BaseModel):
+    """历史读取接口返回的已提交事件"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    seq: int = Field(ge=1)
+    event_id: str = Field(alias="eventId")
+    event_type: str = Field(alias="eventType")
+    run_id: str = Field(alias="runId")
+    event: JsonValue
+    created_at: datetime = Field(alias="createdAt")
+
+
+class ConversationHistoryDetail(BaseModel):
+    """单个会话的 v2 快照和尾部事件"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: int
+    thread_id: str = Field(alias="threadId")
+    title: str
+    status: str
+    last_run_id: str | None = Field(default=None, alias="lastRunId")
+    last_model: str | None = Field(default=None, alias="lastModel")
+    last_seq: int = Field(alias="lastSeq", ge=0)
+    snapshot_seq: int = Field(alias="snapshotSeq", ge=0)
+    snapshot_version: int = Field(alias="snapshotVersion")
+    message_count: int = Field(alias="messageCount", ge=0)
+    tool_call_count: int = Field(alias="toolCallCount", ge=0)
+    has_pending_interrupt: bool = Field(alias="hasPendingInterrupt")
+    pinned: bool
+    snapshot: dict[str, JsonValue] | None
+    events: list[ConversationEventEnvelope]
+    created_at: datetime = Field(alias="createdAt")
+    updated_at: datetime = Field(alias="updatedAt")
+
+
+class ConversationThreadUpdate(BaseModel):
+    """重命名或置顶请求"""
+
+    title: str | None = Field(default=None, min_length=1, max_length=255)
+    pinned: bool | None = None
+
+
+class CancelRunResponse(BaseModel):
+    """分布式取消结果"""
+
+    cancelled: bool = Field(description="本请求是否发起并完成了取消")

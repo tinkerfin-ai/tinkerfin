@@ -1,0 +1,176 @@
+"""业务错误码、异常和 HTTP 投影"""
+
+from __future__ import annotations
+
+import logging
+from enum import IntEnum
+
+from fastapi import Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException
+
+from tinkerfin_studio.api.responses import ApiResponse
+
+logger = logging.getLogger(__name__)
+
+
+class ErrorCode(IntEnum):
+    """同时携带 HTTP 状态与安全消息的业务错误码"""
+
+    http_status: int
+    message: str
+
+    def __new__(cls, code: int, http_status: int, message: str) -> ErrorCode:
+        member = int.__new__(cls, code)
+        member._value_ = code
+        member.http_status = http_status
+        member.message = message
+        return member
+
+
+class GlobalErrorCode(ErrorCode):
+    """跨模块通用错误"""
+
+    BAD_REQUEST = (400, 400, "请求参数不正确")
+    UNAUTHORIZED = (401, 401, "请先登录")
+    FORBIDDEN = (403, 403, "没有该操作权限")
+    NOT_FOUND = (404, 404, "请求未找到")
+    METHOD_NOT_ALLOWED = (405, 405, "请求方法不正确")
+    CONFLICT = (409, 409, "请求状态冲突")
+    VALIDATION_FAILED = (422, 422, "请求参数校验失败")
+    INTERNAL_SERVER_ERROR = (500, 500, "系统异常")
+    SERVICE_UNAVAILABLE = (503, 503, "服务暂不可用")
+
+
+class AuthErrorCode(ErrorCode):
+    """认证模块错误"""
+
+    BAD_CREDENTIALS = (1_001_001_000, 401, "用户名或密码错误")
+    USER_DISABLED = (1_001_001_001, 403, "用户已被禁用")
+    SERVICE_UNAVAILABLE = (1_001_001_002, 503, "认证服务暂不可用")
+
+
+class ModelErrorCode(ErrorCode):
+    """模型目录错误"""
+
+    NOT_FOUND = (1_001_005_000, 422, "模型不存在")
+    DISABLED = (1_001_005_001, 409, "模型已停用")
+    CATALOG_UNAVAILABLE = (1_001_005_002, 503, "模型目录暂不可用")
+
+
+class ConversationErrorCode(ErrorCode):
+    """会话与分布式运行错误"""
+
+    NOT_FOUND = (1_001_004_000, 404, "会话不存在")
+    INVALID_CURSOR = (1_001_004_001, 422, "无效的分页游标")
+    RUN_CONFLICT = (1_001_004_002, 409, "会话当前状态不允许启动新的运行")
+    DELETE_CONFLICT = (1_001_004_003, 409, "会话仍在运行，请先停止并等待运行结束")
+    AGENT_UNAVAILABLE = (1_001_004_004, 503, "会话 Agent 尚未就绪")
+    USER_MESSAGE_REQUIRED = (1_001_004_006, 422, "初次运行必须包含文本 user 消息")
+    RESUME_REQUIRED = (1_001_004_013, 422, "resume 不能为空")
+    RESUME_THREAD_ID_REQUIRED = (1_001_004_017, 422, "恢复运行时 threadId 不能为空")
+    INVALID_LAST_EVENT_ID = (1_001_004_019, 400, "Last-Event-ID 必须是规范非负整数")
+    RUN_NOT_FOUND = (1_001_004_020, 404, "会话运行不存在")
+    RUN_IDENTITY_CONFLICT = (1_001_004_021, 409, "相同 runId 的请求内容不一致")
+    RUN_CANCEL_UNSUPPORTED = (1_001_004_022, 409, "当前运行不支持取消")
+    EVENT_PROJECTION_UNAVAILABLE = (1_001_004_023, 503, "会话事件投影暂不可用")
+    MIXED_RESUME_UNSUPPORTED = (1_001_004_024, 422, "不支持混合已解决和已取消的 resume")
+    RUN_CANCEL_FAILED = (1_001_004_025, 500, "取消会话运行失败")
+    RESUME_ALREADY_CLAIMED = (1_001_004_026, 409, "该审批已被另一次恢复运行认领")
+
+
+class ApplicationException(Exception):
+    """携带稳定错误码的应用异常"""
+
+    def __init__(self, error_code: ErrorCode, *, message: str | None = None) -> None:
+        self.error_code = error_code
+        self.message = message or error_code.message
+        super().__init__(self.message)
+
+
+class BusinessException(ApplicationException):
+    """调用方可以理解并修正的业务失败"""
+
+
+class SystemException(ApplicationException):
+    """仅向调用方暴露安全消息的技术失败"""
+
+
+def _response(error_code: ErrorCode, *, message: str | None = None) -> JSONResponse:
+    return JSONResponse(
+        status_code=error_code.http_status,
+        content=ApiResponse[None](
+            code=int(error_code),
+            message=message or error_code.message,
+        ).model_dump(mode="json"),
+    )
+
+
+async def application_exception_handler(
+    request: Request,
+    error: ApplicationException,
+) -> JSONResponse:
+    """记录应用异常并返回稳定包络"""
+
+    log = logger.warning if isinstance(error, BusinessException) else logger.error
+    log(
+        "应用异常: method=%s path=%s code=%s",
+        request.method,
+        request.url.path,
+        int(error.error_code),
+        exc_info=not isinstance(error, BusinessException),
+    )
+    return _response(error.error_code, message=error.message)
+
+
+async def request_validation_handler(
+    request: Request,
+    error: RequestValidationError,
+) -> JSONResponse:
+    """把请求校验失败投影为统一错误"""
+
+    logger.warning("请求校验失败: method=%s path=%s", request.method, request.url.path)
+    return _response(GlobalErrorCode.VALIDATION_FAILED)
+
+
+async def http_exception_handler(
+    request: Request,
+    error: HTTPException,
+) -> JSONResponse:
+    """把 Starlette HTTP 异常投影为统一错误"""
+
+    codes = {
+        400: GlobalErrorCode.BAD_REQUEST,
+        401: GlobalErrorCode.UNAUTHORIZED,
+        403: GlobalErrorCode.FORBIDDEN,
+        404: GlobalErrorCode.NOT_FOUND,
+        405: GlobalErrorCode.METHOD_NOT_ALLOWED,
+        409: GlobalErrorCode.CONFLICT,
+        422: GlobalErrorCode.VALIDATION_FAILED,
+        503: GlobalErrorCode.SERVICE_UNAVAILABLE,
+    }
+    logger.warning(
+        "HTTP 异常: method=%s path=%s status=%s",
+        request.method,
+        request.url.path,
+        error.status_code,
+    )
+    return _response(
+        codes.get(error.status_code, GlobalErrorCode.INTERNAL_SERVER_ERROR)
+    )
+
+
+async def unexpected_exception_handler(
+    request: Request,
+    error: Exception,
+) -> JSONResponse:
+    """记录未识别异常并隐藏内部细节"""
+
+    logger.error(
+        "未处理异常: method=%s path=%s",
+        request.method,
+        request.url.path,
+        exc_info=error,
+    )
+    return _response(GlobalErrorCode.INTERNAL_SERVER_ERROR)

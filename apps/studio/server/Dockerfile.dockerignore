@@ -1,0 +1,6 @@
+*
+
+!dist/
+dist/*
+!dist/requirements.txt
+!dist/*.whl

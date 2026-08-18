@@ -1,0 +1,55 @@
+# OS
+.DS_Store
+
+# Local environment
+.env
+.env.*
+!.env.example
+/*.sh
+*.toml
+!pyproject.toml
+!apps/studio/server/deploy/opensandbox/config.toml
+.venv/
+/.pnpm-store/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+dist/
+build/
+*.egg-info/
+.uv-cache/
+
+# Runtime data
+*.log
+/logs/
+/uploads/
+/workspace/
+/apps/studio/server/deploy/secrets/
+
+# IDE
+.idea/
+.vscode/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+/tests/
+
+# Local databases
+*.db
+
+# Local AI tooling
+**/.learnings/
+**/.agents/
+**/.codex/
+**/.claude/
+**/*superpowers*/
+**/.mcp.json
+**/AGENTS.md
+**/CLAUDE.md
