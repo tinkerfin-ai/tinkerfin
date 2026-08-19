@@ -17,7 +17,7 @@ from contextlib import AbstractAsyncContextManager
 from contextvars import ContextVar
 from typing import Generic, TypeAlias, TypeVar, cast, overload
 
-from ag_ui.core import BaseEvent
+from ag_ui.core import BaseEvent, RunAgentInput, RunErrorEvent, RunStartedEvent
 
 from tinkerfin_agui_adapter import (
     AgUiLifecycleEventFactory,
@@ -32,6 +32,7 @@ from .agui_native import (
     AgUiNativeStreamInvocation,
 )
 from .coordination import RunCoordinator
+from .deep_agent import CREATE_DEEP_AGENT
 from .native import NativeStreamPart, normalize_native_stream_part
 from .sse import (
     SseBody,
@@ -74,13 +75,6 @@ def _validate_timeout(
     if not math.isfinite(value) or value < 0:
         raise ValueError(f"{name} must be finite and non-negative")
     return value
-
-
-def _validate_run_identifier(name: str, value: object) -> None:
-    if not isinstance(value, str):
-        raise TypeError(f"{name} must be a string")
-    if not value or value != value.strip():
-        raise ValueError(f"{name} must be non-blank without surrounding whitespace")
 
 
 async def _map_sse_item(
@@ -388,13 +382,55 @@ class AgUiEventStream:
 
         return BaseEvent
 
+    @property
+    def messaging_cancel_callback(
+        self,
+    ) -> Callable[[], Awaitable[list[BaseEvent]]]:
+        """Publish the stream-owned idempotent cancellation callback."""
+
+        return self.abort
+
+    def messaging_cancel_callback_matches(self, callback: object) -> bool:
+        """Return whether a supplied callback names this stream's same owner."""
+
+        return callback == self.abort
+
+    @classmethod
+    def from_initialization_error(
+        cls,
+        error: Exception,
+        *,
+        run_input: RunAgentInput,
+    ) -> AgUiEventStream:
+        """Create one standard lifecycle for an owner-only Runtime setup failure."""
+
+        if not isinstance(error, Exception):
+            raise TypeError("error must be an Exception")
+
+        async def failed_parts() -> AsyncIterator[object]:
+            if False:  # pragma: no cover - supplies the async iterator shape
+                yield None
+            raise error
+
+        stream = cls(
+            parts=failed_parts(),
+            run_input=run_input,
+            expose_reasoning_events=False,
+            expose_subagent_events=True,
+            prior_tool_call_ids=frozenset(),
+            timeout=None,
+            settlement_timeout=None,
+            on_event=None,
+        )
+        stream._runtime_error_code = "runtime_initialization_error"
+        stream._initialization_failed = True
+        return stream
+
     def __init__(
         self,
         *,
         parts: AsyncIterable[object],
-        thread_id: str,
-        run_id: str,
-        parent_run_id: str | None,
+        run_input: RunAgentInput,
         expose_reasoning_events: bool,
         expose_subagent_events: bool,
         prior_tool_call_ids: frozenset[str],
@@ -402,9 +438,11 @@ class AgUiEventStream:
         settlement_timeout: float | None = None,
         on_event: EventObserver | None,
     ) -> None:
-        self._thread_id = thread_id
-        self._run_id = run_id
-        self._parent_run_id = parent_run_id
+        self._lifecycle = AgUiLifecycleEventFactory()
+        self._lifecycle.validate_run_input(run_input)
+        self._run_input = run_input.model_copy(deep=True)
+        self._thread_id = self._run_input.thread_id
+        self._run_id = self._run_input.run_id
         self._timeout = _validate_timeout(timeout)
         self._settlement_timeout = _validate_timeout(
             settlement_timeout,
@@ -414,12 +452,11 @@ class AgUiEventStream:
         self._upstream = aiter(parts)
         self._upstream_closed = False
         self._adapter = DeepAgentAgUiAdapter(
-            run_id,
+            run_input.run_id,
             expose_reasoning_events=expose_reasoning_events,
             expose_subagent_events=expose_subagent_events,
             prior_tool_call_ids=prior_tool_call_ids,
         )
-        self._lifecycle = AgUiLifecycleEventFactory()
         self._source = aiter(micro_batch(self._convert()))
         self._on_event = on_event
         self._closed = False
@@ -435,6 +472,8 @@ class AgUiEventStream:
         self._aborted = False
         self._abort_events_delivered = False
         self._secondary_error_notes: list[str] = []
+        self._runtime_error_code = "runtime_error"
+        self._initialization_failed = False
         self.error: Exception | None = None
 
     def __aiter__(self) -> AgUiEventStream:
@@ -516,10 +555,12 @@ class AgUiEventStream:
         tail = self._adapter.abort(code="cancelled")
         if self._main_started:
             tail.append(
-                self._lifecycle.failed(
-                    run_id=self._run_id,
-                    message="Agent run cancelled",
-                    code="cancelled",
+                self._decorate_initialization_event(
+                    self._lifecycle.failed(
+                        run_id=self._run_id,
+                        message="Agent run cancelled",
+                        code="cancelled",
+                    )
                 )
             )
         self._abort_events_delivered = True
@@ -739,10 +780,8 @@ class AgUiEventStream:
         terminal = False
         try:
             self._main_started = True
-            yield self._lifecycle.started(
-                thread_id=self._thread_id,
-                run_id=self._run_id,
-                parent_run_id=self._parent_run_id,
+            yield self._decorate_initialization_event(
+                self._lifecycle.started(run_input=self._run_input)
             )
             while True:
                 try:
@@ -776,7 +815,7 @@ class AgUiEventStream:
             error_code = (
                 "stream_timeout"
                 if isinstance(error, _AgUiStreamDeadlineExceeded)
-                else "runtime_error"
+                else self._runtime_error_code
             )
             try:
                 await self._close_upstream(error)
@@ -788,16 +827,34 @@ class AgUiEventStream:
             if not terminal:
                 terminal = True
                 self._completed = True
-                yield self._lifecycle.failed(
-                    run_id=self._run_id,
-                    message="Agent run failed",
-                    code=error_code,
+                yield self._decorate_initialization_event(
+                    self._lifecycle.failed(
+                        run_id=self._run_id,
+                        message="Agent run failed",
+                        code=error_code,
+                    )
                 )
         except BaseException as error:
             primary = error
             raise
         finally:
             await self._close_upstream(primary)
+
+    def _decorate_initialization_event(self, event: BaseEvent) -> BaseEvent:
+        """Mark only main lifecycle events emitted for initialization failure."""
+
+        if not self._initialization_failed or not isinstance(
+            event,
+            RunStartedEvent | RunErrorEvent,
+        ):
+            return event
+        raw_event: dict[str, object] = (
+            dict(event.raw_event)
+            if isinstance(event.raw_event, dict)
+            else {"runId": self._run_id}
+        )
+        raw_event["initializationFailed"] = True
+        return event.model_copy(update={"raw_event": raw_event})
 
     async def _next_part(self) -> object:
         timeout = self._timeout
@@ -888,9 +945,7 @@ class TinkerFinRun(Generic[PartT, PrincipalT]):
     def astream_agui(
         self,
         *,
-        thread_id: str,
-        run_id: str,
-        parent_run_id: str | None = None,
+        run_input: RunAgentInput,
         timeout: float | None = None,
         settlement_timeout: float | None = None,
         expose_reasoning_events: bool = False,
@@ -901,9 +956,7 @@ class TinkerFinRun(Generic[PartT, PrincipalT]):
         """Claim the native source and convert it to one AG-UI event stream.
 
         Args:
-            thread_id: Stable AG-UI thread identity supplied by the caller.
-            run_id: Stable identity for this AG-UI request.
-            parent_run_id: Optional run-lineage identity; never subgraph provenance.
+            run_input: Complete AG-UI request supplied by the caller.
             timeout: Optional total native-part pull deadline in seconds.
             settlement_timeout: Optional per-caller close-settlement wait in seconds.
                 Expiry never cancels the retained close task.
@@ -920,17 +973,12 @@ class TinkerFinRun(Generic[PartT, PrincipalT]):
             ValueError: An identifier or timeout value is invalid.
         """
 
-        _validate_run_identifier("thread_id", thread_id)
-        _validate_run_identifier("run_id", run_id)
-        if parent_run_id is not None:
-            _validate_run_identifier("parent_run_id", parent_run_id)
+        AgUiLifecycleEventFactory.validate_run_input(run_input)
         if on_event is not None and not callable(on_event):
             raise TypeError("on_event must be an async callable or None")
         return AgUiEventStream(
             parts=self.astream(),
-            thread_id=thread_id,
-            run_id=run_id,
-            parent_run_id=parent_run_id,
+            run_input=run_input,
             timeout=timeout,
             settlement_timeout=settlement_timeout,
             expose_reasoning_events=expose_reasoning_events,
@@ -963,6 +1011,8 @@ class TinkerFin(Generic[PrincipalT]):
     """Globally shareable stateless factory for single-use source bindings."""
 
     __slots__ = ("_run_coordinator",)
+
+    create_deep_agent = CREATE_DEEP_AGENT
 
     def __init__(
         self,
@@ -1024,15 +1074,10 @@ class TinkerFin(Generic[PrincipalT]):
         strict_invocation = isinstance(source_factory, AgUiNativeStreamInvocation)
         if strict_invocation:
             source_factory._validate()
-        coordinator = self._run_coordinator
-        if coordinator is None and principal is not None:
-            raise ValueError("principal requires a run_coordinator")
-        if coordinator is not None and principal is None:
-            raise ValueError("principal is required when run_coordinator is configured")
         if not callable(source_factory):
             raise TypeError("source_factory must be callable")
-        if on_part is not None and not callable(on_part):
-            raise TypeError("on_part must be an async callable or None")
+        self._validate_run_binding(principal=principal, on_part=on_part)
+        coordinator = self._run_coordinator
         if strict_invocation:
             return NativeTinkerFinRun(
                 source_factory=cast(AgUiNativeStreamInvocation, source_factory),
@@ -1049,6 +1094,22 @@ class TinkerFin(Generic[PrincipalT]):
             principal=principal,
             on_part=cast(PartObserver[PartT] | None, on_part),
         )
+
+    def _validate_run_binding(
+        self,
+        *,
+        principal: PrincipalT | None,
+        on_part: object | None,
+    ) -> None:
+        """校验一次请求绑定，不创建 Graph、source 或协调上下文"""
+
+        coordinator = self._run_coordinator
+        if coordinator is None and principal is not None:
+            raise ValueError("principal requires a run_coordinator")
+        if coordinator is not None and principal is None:
+            raise ValueError("principal is required when run_coordinator is configured")
+        if on_part is not None and not callable(on_part):
+            raise TypeError("on_part must be an async callable or None")
 
 
 __all__ = [

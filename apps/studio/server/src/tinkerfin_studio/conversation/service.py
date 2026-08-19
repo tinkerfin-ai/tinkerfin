@@ -5,18 +5,18 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import cast
 from uuid import NAMESPACE_URL, uuid5
 
-from ag_ui.core import BaseEvent, RunAgentInput, RunErrorEvent, RunStartedEvent
+from ag_ui.core import BaseEvent, RunAgentInput
+from ag_ui.core import Interrupt as AgUiInterrupt
 from langchain.agents.middleware.types import InputAgentState
-from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
-from langgraph.graph.state import CompiledStateGraph
-from langgraph.types import Command, StateSnapshot
+from langgraph.types import Command
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -28,9 +28,8 @@ from pydantic import (
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from tinkerfin.agui_native import AgUiNativeStreamConfig
+from tinkerfin import AgUiResumeBinding
 from tinkerfin_agui_adapter.lifecycle import AgUiLifecycleEventFactory
-from tinkerfin_agui_adapter.models import AgentRuntimeInterrupt
 from tinkerfin_agui_adapter.resume import ResumeMapper, ResumeMappingError
 from tinkerfin_messaging.errors import (
     CancellationUnsupported,
@@ -44,7 +43,7 @@ from tinkerfin_messaging.errors import (
 )
 from tinkerfin_messaging.models import MessageEnvelope
 from tinkerfin_messaging.protocols import MessageSource
-from tinkerfin_messaging.sources import FiniteMessageSource, map_source
+from tinkerfin_messaging.sources import FiniteMessageSource
 from tinkerfin_studio.agent.factory import ConversationAgentFactory
 from tinkerfin_studio.api.errors import (
     BusinessException,
@@ -55,7 +54,11 @@ from tinkerfin_studio.auth.types import UserContext
 from tinkerfin_studio.conversation.coordinator import (
     ConversationProjectionCoordinator,
 )
-from tinkerfin_studio.conversation.models import ConversationEvent, ConversationThread
+from tinkerfin_studio.conversation.models import (
+    ConversationEvent,
+    ConversationInterrupt,
+    ConversationThread,
+)
 from tinkerfin_studio.conversation.repository import ConversationRepository
 from tinkerfin_studio.conversation.request import ChatRequest
 from tinkerfin_studio.conversation.schemas import (
@@ -65,7 +68,6 @@ from tinkerfin_studio.conversation.schemas import (
     ConversationHistoryListItem,
     ConversationHistoryListResponse,
 )
-from tinkerfin_studio.conversation.subagent_events import SubagentRunEventEnricher
 from tinkerfin_studio.models.repository import AgentModelRepository
 from tinkerfin_studio.models.service import AgentModelService
 from tinkerfin_studio.resources import ApplicationResources
@@ -361,7 +363,7 @@ class PreparedChat:
 
 
 class ConversationChatService:
-    """创建请求级 graph 并启动或附着 durable AG-UI run"""
+    """准备请求级 Agent 事件源并启动或附着 durable AG-UI run"""
 
     def __init__(
         self,
@@ -414,17 +416,13 @@ class ConversationChatService:
         factory = ConversationAgentFactory(
             persistence=self._resources.agent_persistence,
             sandbox_manager=self._resources.sandbox_manager,
+            tinkerfin=self._resources.tinkerfin,
             tavily_api_key=(
                 None
                 if self._resources.settings.tavily_api_key is None
                 else self._resources.settings.tavily_api_key.get_secret_value()
             ),
         )
-        graph = await factory.create(
-            user_id=self._user.user_id,
-            model_config=model,
-        )
-
         existing = await self._repository.get_run(
             thread_pk=thread.id,
             run_id=request.run_id,
@@ -432,6 +430,7 @@ class ConversationChatService:
         if existing is not None and existing.input_json != normalized:
             raise BusinessException(ConversationErrorCode.RUN_IDENTITY_CONFLICT)
         claimed_interrupt_ids: frozenset[str] = frozenset()
+        claimed_interrupts: tuple[ConversationInterrupt, ...] = ()
         if request.resume is not None and existing is None:
             try:
                 await self._resources.conversation_projector.reconcile(
@@ -449,6 +448,20 @@ class ConversationChatService:
             claimed_interrupt_ids = frozenset(
                 entry.interrupt_id for entry in request.resume
             )
+            pending_interrupts = (
+                await self._repository.list_pending_interrupts_for_update(
+                    thread_pk=thread.id,
+                )
+            )
+            pending_interrupt_ids = frozenset(
+                entity.interrupt_id for entity in pending_interrupts
+            )
+            if claimed_interrupt_ids != pending_interrupt_ids:
+                await self._repository.rollback()
+                raise BusinessException(
+                    ConversationErrorCode.RESUME_REQUIRED,
+                    message="resume 必须完整覆盖当前全部待审批项",
+                )
             claimed = await self._repository.claim_pending_interrupts(
                 thread_pk=thread.id,
                 run_id=request.run_id,
@@ -459,6 +472,7 @@ class ConversationChatService:
                 run_id=request.run_id,
             )
             claimed_ids = {entity.interrupt_id for entity in claimed}
+            claimed_interrupts = tuple(claimed)
             if raced_existing is not None and raced_existing.input_json != normalized:
                 await self._repository.rollback()
                 raise BusinessException(ConversationErrorCode.RUN_IDENTITY_CONFLICT)
@@ -477,7 +491,7 @@ class ConversationChatService:
                 await self._repository.rollback()
                 raise BusinessException(ConversationErrorCode.RESUME_ALREADY_CLAIMED)
         graph_input: InputAgentState | Command | None
-        prior_tool_call_ids: frozenset[str] = frozenset()
+        resume_binding: AgUiResumeBinding | None = None
         resume_config: dict[str, object] = {}
         try:
             if request.resume is None:
@@ -493,17 +507,13 @@ class ConversationChatService:
                     ]
                 )
             else:
-                (
-                    graph_input,
-                    prior_tool_call_ids,
-                    resume_config,
-                ) = await self._resume_input(
-                    graph,
+                graph_input, resume_binding, resume_config = self._resume_input(
                     request,
-                    config,
+                    run_input=run_input,
                     existing_config=(
                         None if existing is None else existing.config_json
                     ),
+                    interrupts=claimed_interrupts,
                 )
         except BaseException:
             if claimed_interrupt_ids:
@@ -568,15 +578,13 @@ class ConversationChatService:
             await self._repository.delete_run(existing.id)
             await self._repository.commit()
 
-        cancel_run = None
         events: MessageSource[BaseEvent]
         try:
             if graph_input is None:
                 lifecycle = AgUiLifecycleEventFactory()
-                started = lifecycle.started(
-                    thread_id=thread.thread_id,
-                    run_id=request.run_id,
-                ).model_copy(update={"input": run_input, "title": thread.title})
+                started = lifecycle.started(run_input=run_input).model_copy(
+                    update={"title": thread.title}
+                )
                 events = FiniteMessageSource.from_events(
                     (
                         started,
@@ -588,49 +596,16 @@ class ConversationChatService:
                     )
                 )
             else:
-                invocation = AgUiNativeStreamConfig().bind(
-                    graph.astream,
-                    graph_input,
-                    config=config,
-                )
-                run = self._resources.tinkerfin.run(
-                    invocation,
-                    principal=stream,
-                )
-                agent_events = run.astream_agui(
-                    thread_id=thread.thread_id,
-                    run_id=request.run_id,
-                    parent_run_id=request.parent_run_id,
-                    prior_tool_call_ids=prior_tool_call_ids,
-                    expose_reasoning_events=False,
-                    expose_subagent_events=True,
-                )
-                enrich_subagent_runs = SubagentRunEventEnricher(
+                events = factory.create_agui_events(
                     user_id=self._user.user_id,
-                    thread_id=thread.thread_id,
-                    main_run_id=request.run_id,
+                    model_config=model,
+                    graph_input=graph_input,
+                    config=config,
+                    principal=stream,
+                    run_input=run_input,
+                    resume=resume_binding,
+                    title=thread.title,
                 )
-
-                def attach_run_metadata(event: BaseEvent) -> BaseEvent:
-                    """发布服务端会话元数据与子 Agent 身份"""
-
-                    event = enrich_subagent_runs(event)
-                    if (
-                        isinstance(event, RunStartedEvent)
-                        and event.run_id == request.run_id
-                    ):
-                        return event.model_copy(
-                            update={"input": run_input, "title": thread.title}
-                        )
-                    return event
-
-                events = map_source(agent_events, attach_run_metadata)
-
-                async def cancel_agent_run() -> list[BaseEvent]:
-                    tail = await agent_events.abort()
-                    return [self._localize_cancel(event) for event in tail]
-
-                cancel_run = cancel_agent_run
         except BaseException:
             await cleanup_unstarted_run()
             raise
@@ -651,7 +626,6 @@ class ConversationChatService:
                 run=request.run_id,
                 after=after,
                 attach_identity={"user_id": self._user.user_id, "input": normalized},
-                cancel=cancel_run,
                 on_committed=wake_projection,
             ),
             name=f"studio-conversation-preflight:{request.run_id}",
@@ -780,92 +754,86 @@ class ConversationChatService:
                 return index, content
         raise BusinessException(ConversationErrorCode.USER_MESSAGE_REQUIRED)
 
-    async def _resume_input(
-        self,
-        graph: CompiledStateGraph,
+    @staticmethod
+    def _resume_input(
         request: ChatRequest,
-        config: RunnableConfig,
         *,
+        run_input: RunAgentInput,
         existing_config: dict[str, object] | None,
-    ) -> tuple[Command | None, frozenset[str], dict[str, object]]:
+        interrupts: Sequence[ConversationInterrupt],
+    ) -> tuple[Command | None, AgUiResumeBinding | None, dict[str, object]]:
         if (
             existing_config is not None
             and existing_config.get("resume_abandoned") is True
         ):
-            return None, frozenset(), {"resume_abandoned": True}
+            return None, None, {"resume_abandoned": True}
         if existing_config is not None and isinstance(
             existing_config.get("resume_data"), dict
         ):
-            prior = existing_config.get("prior_tool_call_ids", [])
+            prior = existing_config.get("prior_tool_call_ids")
+            if not isinstance(prior, list) or any(
+                not isinstance(value, str) for value in prior
+            ):
+                raise BusinessException(
+                    ConversationErrorCode.RESUME_REQUIRED,
+                    message="服务端保存的审批 Tool ID 无法恢复",
+                )
+            command = Command(
+                resume=cast(dict[str, object], existing_config["resume_data"])
+            )
+            try:
+                binding = AgUiResumeBinding(
+                    run_input=run_input,
+                    command=command,
+                    prior_tool_call_ids=frozenset(prior),
+                )
+            except (TypeError, ValueError) as error:
+                raise BusinessException(
+                    ConversationErrorCode.RESUME_REQUIRED,
+                    message="服务端保存的审批状态无法恢复",
+                ) from error
             return (
-                Command(resume=cast(dict[str, object], existing_config["resume_data"])),
-                frozenset(value for value in prior if isinstance(value, str))
-                if isinstance(prior, list)
-                else frozenset(),
+                binding.command,
+                binding,
                 {
                     "resume_data": existing_config["resume_data"],
                     "prior_tool_call_ids": prior,
                 },
             )
-        snapshot = await graph.aget_state(config, subgraphs=True)
-        messages_by_namespace: dict[tuple[str, ...], tuple[BaseMessage, ...]] = {}
-
-        def visit(current: StateSnapshot) -> None:
-            configurable = current.config.get("configurable", {})
-            raw_namespace = configurable.get("checkpoint_ns", "")
-            if not isinstance(raw_namespace, str):
-                raise TypeError("checkpoint namespace 必须是字符串")
-            namespace = tuple(raw_namespace.split("|")) if raw_namespace else ()
-            values = current.values
-            raw_messages = (
-                values.get("messages", ()) if isinstance(values, Mapping) else ()
-            )
-            messages_by_namespace[namespace] = (
-                tuple(
-                    message
-                    for message in raw_messages
-                    if isinstance(message, BaseMessage)
-                )
-                if isinstance(raw_messages, Sequence)
-                else ()
-            )
-            for task in current.tasks:
-                if isinstance(task.state, StateSnapshot):
-                    visit(task.state)
-
-        visit(snapshot)
         try:
-            translation = ResumeMapper().map(
+            translation = ResumeMapper().map_agui(
                 entries=request.resume or (),
                 interrupts=tuple(
-                    AgentRuntimeInterrupt.model_validate(value)
-                    for value in snapshot.interrupts
+                    AgUiInterrupt.model_validate(entity.request_json)
+                    for entity in interrupts
                 ),
-                messages_by_namespace=messages_by_namespace,
             )
-        except ResumeMappingError as error:
+        except (ResumeMappingError, ValidationError) as error:
+            message = (
+                error.message
+                if isinstance(error, ResumeMappingError)
+                else "服务端保存的审批状态无法恢复"
+            )
             raise BusinessException(
                 ConversationErrorCode.RESUME_REQUIRED,
-                message=error.message,
+                message=message,
             ) from error
         if translation.mode == "custom":
             raise BusinessException(ConversationErrorCode.MIXED_RESUME_UNSUPPORTED)
         if translation.mode == "abandon":
-            return None, frozenset(), {"resume_abandoned": True}
+            return None, None, {"resume_abandoned": True}
+        binding = AgUiResumeBinding.from_translation(
+            run_input=run_input,
+            translation=translation,
+        )
         return (
-            Command(resume=translation.root),
-            frozenset(translation.prior_tool_call_ids),
+            binding.command,
+            binding,
             {
                 "resume_data": translation.root,
                 "prior_tool_call_ids": list(translation.prior_tool_call_ids),
             },
         )
-
-    @staticmethod
-    def _localize_cancel(event: BaseEvent) -> BaseEvent:
-        if isinstance(event, RunErrorEvent) and event.code == "cancelled":
-            return event.model_copy(update={"message": "聊天生成已取消"})
-        return event
 
     @staticmethod
     def _messaging_error(error: MessagingError) -> BusinessException | SystemException:

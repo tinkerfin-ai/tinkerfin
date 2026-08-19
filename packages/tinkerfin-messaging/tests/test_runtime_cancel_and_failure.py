@@ -9,6 +9,7 @@ from typing import ClassVar, cast
 
 import pytest
 
+import tinkerfin_messaging.sources as source_adapters
 from tinkerfin_messaging import (
     BackendOwnershipLost,
     BackendRunHandle,
@@ -233,6 +234,131 @@ class _ControlledAppendBackend(MemoryBackend):
             payload=payload,
             checkpoint=checkpoint,
         )
+
+
+async def test_channel_uses_deferred_source_owned_cancel_callback() -> None:
+    """A source-declared callback must make the durable producer cancellable."""
+
+    opened = _AbortableSource()
+    open_calls = 0
+
+    async def open_source():
+        nonlocal open_calls
+        open_calls += 1
+        return source_adapters.MessageSourceBinding(
+            source=opened,
+            cancel=opened.abort,
+        )
+
+    deferred = source_adapters.DeferredMessageSource(
+        open_source,
+        cancellable=True,
+    )
+    async with Messaging(backend=MemoryBackend()) as messaging:
+        channel = messaging.channel(name="events", codec=_TextCodec())
+        subscription = await channel.wrap(
+            deferred,
+            stream="conversation-1",
+            run="run-1",
+            after=0,
+        )
+        await asyncio.wait_for(opened.started.wait(), timeout=1)
+
+        assert await channel.cancel(stream="conversation-1", run="run-1") is True
+        assert [message.data async for message in subscription] == [
+            "started",
+            "cancelled-tail",
+        ]
+
+    assert open_calls == 1
+    assert opened.abort_calls == 1
+    assert opened.close_calls == 1
+
+
+@pytest.mark.parametrize("mapped", [False, True])
+async def test_channel_reuses_equivalent_source_owned_cancel_callback(
+    mapped: bool,
+) -> None:
+    """The same owner may be supplied explicitly without creating a second owner."""
+
+    opened = _AbortableSource()
+
+    async def open_source():
+        return source_adapters.MessageSourceBinding(
+            source=opened,
+            cancel=opened.abort,
+        )
+
+    deferred = source_adapters.DeferredMessageSource(
+        open_source,
+        cancellable=True,
+    )
+    source = source_adapters.map_source(deferred, str.upper) if mapped else deferred
+    expected = (
+        ["STARTED", "CANCELLED-TAIL"]
+        if mapped
+        else [
+            "started",
+            "cancelled-tail",
+        ]
+    )
+
+    async with Messaging(backend=MemoryBackend()) as messaging:
+        channel = messaging.channel(name="events", codec=_TextCodec())
+        subscription = await channel.wrap(
+            source,
+            stream="conversation-1",
+            run="run-1",
+            after=0,
+            cancel=deferred.cancel,
+        )
+        await asyncio.wait_for(opened.started.wait(), timeout=1)
+
+        assert await channel.cancel(stream="conversation-1", run="run-1") is True
+        assert [message.data async for message in subscription] == expected
+
+    assert opened.abort_calls == 1
+
+
+async def test_source_owned_and_explicit_cancel_are_rejected_before_claim() -> None:
+    """One producer must never have two competing cancellation owners."""
+
+    open_calls = 0
+
+    async def open_source():
+        nonlocal open_calls
+        open_calls += 1
+        opened = _AbortableSource()
+        return source_adapters.MessageSourceBinding(
+            source=opened,
+            cancel=opened.abort,
+        )
+
+    deferred = source_adapters.DeferredMessageSource(
+        open_source,
+        cancellable=True,
+    )
+    async with Messaging(backend=MemoryBackend()) as messaging:
+        channel = messaging.channel(name="events", codec=_TextCodec())
+        with pytest.raises(TypeError, match="source owns cancellation"):
+            await channel.wrap(
+                deferred,
+                stream="conversation-1",
+                run="run-1",
+                after=0,
+                cancel=lambda: (),
+            )
+        released = asyncio.Event()
+        released.set()
+        replacement = await channel.wrap(
+            _CancellableSource(release=released, before=()),
+            stream="conversation-1",
+            run="run-1",
+            after=0,
+        )
+        assert [message.data async for message in replacement] == []
+
+    assert open_calls == 0
 
 
 class _FinishOwnershipLostBackend(MemoryBackend):

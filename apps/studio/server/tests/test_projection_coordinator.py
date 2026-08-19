@@ -2,6 +2,7 @@ from ag_ui.core import RunFinishedEvent, RunFinishedSuccessOutcome, RunStartedEv
 
 from tinkerfin_messaging.agui import AgUiCodec
 from tinkerfin_messaging.backend import MemoryBackend
+from tinkerfin_messaging.messaging import Messaging
 from tinkerfin_studio.conversation.coordinator import (
     ConversationProjectionCoordinator,
 )
@@ -57,16 +58,19 @@ async def test_reconcile_projects_the_committed_redis_tail(database: Database) -
         )
     assert await backend.begin_settlement(prepared.handle) is False
     await backend.finish(prepared.handle, status="completed")
-    coordinator = ConversationProjectionCoordinator(
-        database=database,
-        backend=backend,
-        channel="studio-conversation-agui",
-    )
-
-    projected = await coordinator.reconcile(
-        thread_pk=thread_pk,
-        stream="users/7/threads/thread-reconcile",
-    )
+    async with Messaging(backend=backend) as messaging:
+        coordinator = ConversationProjectionCoordinator(
+            database=database,
+            channel=messaging.channel(
+                name="studio-conversation-agui",
+                codec=codec,
+            ),
+        )
+        projected = await coordinator.reconcile(
+            thread_pk=thread_pk,
+            stream="users/7/threads/thread-reconcile",
+        )
+        await coordinator.aclose()
 
     async with database.session() as session:
         refreshed = await ConversationRepository(session).get_thread_by_pk(thread_pk)

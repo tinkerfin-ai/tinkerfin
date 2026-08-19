@@ -7,6 +7,7 @@ from ag_ui.core import (
     AssistantMessage,
     MessagesSnapshotEvent,
     ReasoningMessageContentEvent,
+    RunAgentInput,
     RunFinishedEvent,
     RunFinishedInterruptOutcome,
     StateSnapshotEvent,
@@ -14,6 +15,20 @@ from ag_ui.core import (
 from langchain_core.messages import AIMessage, AIMessageChunk
 
 from tinkerfin_agui_adapter import astream_events
+
+
+def _run_input() -> RunAgentInput:
+    return RunAgentInput.model_validate(
+        {
+            "threadId": "thread-1",
+            "runId": "run-1",
+            "state": {},
+            "messages": [],
+            "tools": [],
+            "context": [],
+            "forwardedProps": {},
+        }
+    )
 
 
 @pytest.mark.parametrize("expose_reasoning_events", [False, True])
@@ -99,9 +114,8 @@ async def test_provider_reasoning_is_private_but_business_fields_survive(
     events = [
         event
         async for event in astream_events(
-            thread_id="thread-1",
-            run_id="run-1",
             parts=parts(),
+            run_input=_run_input(),
             expose_reasoning_events=expose_reasoning_events,
         )
     ]
@@ -161,10 +175,7 @@ async def test_public_state_rejects_opaque_objects_before_event_serialization() 
         }
 
     events = [
-        event
-        async for event in astream_events(
-            thread_id="thread-1", run_id="run-1", parts=parts()
-        )
+        event async for event in astream_events(parts=parts(), run_input=_run_input())
     ]
     terminal = json.loads(events[-1].model_dump_json(by_alias=True))
 
@@ -214,9 +225,8 @@ async def test_message_snapshot_filters_provider_metadata_but_preserves_siblings
     events = [
         event
         async for event in astream_events(
-            thread_id="thread-1",
-            run_id="run-1",
             parts=parts(),
+            run_input=_run_input(),
             expose_reasoning_events=expose_reasoning_events,
         )
     ]
@@ -266,10 +276,7 @@ async def test_structured_message_snapshot_filters_only_reserved_provider_reason
         }
 
     events = [
-        event
-        async for event in astream_events(
-            thread_id="thread-1", run_id="run-1", parts=parts()
-        )
+        event async for event in astream_events(parts=parts(), run_input=_run_input())
     ]
     serialized = "\n".join(
         event.model_dump_json(by_alias=True, exclude_none=True) for event in events

@@ -166,6 +166,25 @@ class ConversationRepository:
                 ConversationInterrupt.conversation_thread_id == thread_pk,
                 ConversationInterrupt.interrupt_id.in_(interrupt_ids),
             )
+            .order_by(ConversationInterrupt.id)
+            .with_for_update()
+        )
+        return list(result)
+
+    async def list_pending_interrupts_for_update(
+        self,
+        *,
+        thread_pk: int,
+    ) -> list[ConversationInterrupt]:
+        """锁定并按投影顺序返回会话当前全部待处理审批"""
+
+        result = await self._session.scalars(
+            select(ConversationInterrupt)
+            .where(
+                ConversationInterrupt.conversation_thread_id == thread_pk,
+                ConversationInterrupt.status == "pending",
+            )
+            .order_by(ConversationInterrupt.id)
             .with_for_update()
         )
         return list(result)

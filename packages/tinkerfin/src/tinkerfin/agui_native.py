@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from typing import cast
 
 from langgraph.types import StreamMode
 
@@ -115,6 +116,69 @@ class AgUiNativeStreamInvocation:
                 "AG-UI native invocation options cannot override "
                 f"stream configuration: {conflicts!r}"
             )
+
+
+def _bind_agui_graph_astream(
+    astream: Callable[..., AsyncIterator[Mapping[str, object]]],
+    /,
+    *args: object,
+    **options: object,
+) -> AgUiNativeStreamInvocation:
+    """校验原生 astream 保留参数并创建严格的 AG-UI 调用"""
+
+    forwarded = dict(options)
+    if "stream_mode" not in forwarded:
+        extra_modes: tuple[StreamMode, ...] = ()
+    else:
+        raw_modes = forwarded.pop("stream_mode")
+        if raw_modes is None:
+            raise AgUiNativeStreamConfigurationError(
+                "AG-UI stream_mode must include messages, tasks, and values"
+            )
+        if isinstance(raw_modes, str):
+            modes: tuple[object, ...] = (raw_modes,)
+        elif isinstance(raw_modes, Sequence):
+            modes = tuple(raw_modes)
+        else:
+            raise AgUiNativeStreamConfigurationError(
+                "AG-UI stream_mode must be a stream mode or sequence of modes"
+            )
+        duplicate = tuple(
+            mode for index, mode in enumerate(modes) if mode in modes[:index]
+        )
+        if duplicate:
+            raise AgUiNativeStreamConfigurationError(
+                f"AG-UI stream_mode contains duplicate modes: {duplicate!r}"
+            )
+        supported = frozenset((*_REQUIRED_MODES, *_SUPPORTED_EXTRA_MODES))
+        unsupported = tuple(
+            mode for mode in modes if not isinstance(mode, str) or mode not in supported
+        )
+        if unsupported:
+            raise AgUiNativeStreamConfigurationError(
+                f"AG-UI stream_mode contains unsupported modes: {unsupported!r}"
+            )
+        missing = tuple(mode for mode in _REQUIRED_MODES if mode not in modes)
+        if missing:
+            raise AgUiNativeStreamConfigurationError(
+                f"AG-UI stream_mode is missing required modes: {missing!r}"
+            )
+        extra_modes = cast(
+            tuple[StreamMode, ...],
+            tuple(mode for mode in modes if mode not in _REQUIRED_MODES),
+        )
+
+    if "version" in forwarded and forwarded.pop("version") != "v2":
+        raise AgUiNativeStreamConfigurationError("AG-UI native version must be 'v2'")
+    if "subgraphs" in forwarded and forwarded.pop("subgraphs") is not True:
+        raise AgUiNativeStreamConfigurationError("AG-UI native subgraphs must be True")
+    invocation = AgUiNativeStreamConfig(extra_modes=extra_modes).bind(
+        astream,
+        *args,
+        **forwarded,
+    )
+    invocation._validate()
+    return invocation
 
 
 __all__ = [

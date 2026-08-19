@@ -41,7 +41,10 @@ from .protocols import MessageSource as MessageSource
 from .protocols import ProfiledMessageSource as ProfiledMessageSource
 from .protocols import RecoverableSource as RecoverableSource
 from .protocols import SseRenderer as SseRenderer
+from .sources import CancellableMessageSource as CancellableMessageSource
+from .sources import DeferredMessageSource as DeferredMessageSource
 from .sources import FiniteMessageSource as FiniteMessageSource
+from .sources import MessageSourceBinding as MessageSourceBinding
 from .sources import map_source as map_source
 
 if TYPE_CHECKING:
@@ -55,10 +58,12 @@ __all__ = [
     "BackendRunHandle",
     "CancelCallback",
     "CancelContext",
+    "CancellableMessageSource",
     "CancellationUnsupported",
     "CodecMismatch",
     "CommittedCallback",
     "DecodedMessage",
+    "DeferredMessageSource",
     "FiniteMessageSource",
     "InvalidCursor",
     "MemoryBackend",
@@ -67,6 +72,7 @@ __all__ = [
     "MessageEnvelope",
     "MessageIdConflict",
     "MessageSource",
+    "MessageSourceBinding",
     "MessageSubscription",
     "Messaging",
     "MessagingBackend",

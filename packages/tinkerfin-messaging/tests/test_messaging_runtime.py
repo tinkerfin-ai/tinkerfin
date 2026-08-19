@@ -10,6 +10,8 @@ import pytest
 
 from tinkerfin_messaging import (
     DecodedMessage,
+    DeferredMessageSource,
+    MessageSourceBinding,
     MessageSubscription,
     Messaging,
     MessagingBackend,
@@ -113,6 +115,39 @@ async def test_detach_does_not_stop_the_producer_and_cursor_reconnects(
     assert source.close_calls == 1
     assert unused.close_calls == 1
     assert not unused.started.is_set()
+
+
+async def test_completed_run_attachment_never_opens_deferred_source(
+    messaging_backend: MessagingBackend,
+) -> None:
+    """A completed-run replay must not build the unused replacement producer."""
+
+    open_calls = 0
+
+    async def open_source() -> MessageSourceBinding[str]:
+        nonlocal open_calls
+        open_calls += 1
+        return MessageSourceBinding(source=_Source(("must-not-run",)))
+
+    async with Messaging(backend=messaging_backend) as messaging:
+        channel = messaging.channel(name="events", codec=_TextCodec())
+        first = await channel.wrap(
+            _Source(("persisted",)),
+            stream="conversation-1",
+            run="run-1",
+            after=0,
+        )
+        assert await _data(first) == ["persisted"]
+
+        replay = await channel.wrap(
+            DeferredMessageSource(open_source, cancellable=False),
+            stream="conversation-1",
+            run="run-1",
+            after=0,
+        )
+        assert await _data(replay) == ["persisted"]
+
+    assert open_calls == 0
 
 
 async def test_none_cursor_captures_the_tail_before_starting_a_new_run(

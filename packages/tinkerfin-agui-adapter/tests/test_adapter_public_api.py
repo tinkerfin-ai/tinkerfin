@@ -5,7 +5,7 @@ import re
 from collections.abc import AsyncIterable, AsyncIterator
 from typing import get_type_hints
 
-from ag_ui.core import BaseEvent
+from ag_ui.core import BaseEvent, RunAgentInput
 
 import tinkerfin_agui_adapter
 from tinkerfin_agui_adapter import (
@@ -29,6 +29,7 @@ _PUBLIC_EXPORTS = {
     "ResumeMappingError",
     "ResumeMappingFailure",
     "ResumeTranslation",
+    "ScopedIdCodec",
     "SseEventId",
     "astream_events",
     "encode_sse",
@@ -42,9 +43,7 @@ def test_high_level_stream_has_the_locked_public_contract() -> None:
 
     assert list(signature.parameters) == [
         "parts",
-        "thread_id",
-        "run_id",
-        "parent_run_id",
+        "run_input",
         "expose_reasoning_events",
         "expose_subagent_events",
         "prior_tool_call_ids",
@@ -56,10 +55,7 @@ def test_high_level_stream_has_the_locked_public_contract() -> None:
         if name != "parts"
     )
     assert hints["parts"] == AsyncIterable[object]
-    assert hints["thread_id"] is str
-    assert hints["run_id"] is str
-    assert hints["parent_run_id"] == str | None
-    assert signature.parameters["parent_run_id"].default is None
+    assert hints["run_input"] is RunAgentInput
     assert hints["expose_reasoning_events"] is bool
     assert signature.parameters["expose_reasoning_events"].default is False
     assert hints["expose_subagent_events"] is bool

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from ag_ui.core.types import Interrupt as AgUiInterrupt
 from ag_ui.core.types import ResumeEntry
 from langchain_core.messages import AIMessage
 from pydantic import JsonValue
@@ -91,6 +92,160 @@ def _entry(
             **({"payload": payload} if payload is not None else {}),
         }
     )
+
+
+def _public_interrupts(
+    *,
+    include_explicit_correlation: bool = True,
+) -> tuple[AgUiInterrupt, ...]:
+    native_value = _interrupts()[0].value
+    codec = ScopedIdCodec()
+    interrupts: list[AgUiInterrupt] = []
+    for index, raw_tool_call_id in enumerate(("call-main-a", "call-main-b")):
+        deepagents = {
+            "toolName": "write_file",
+            "allowedDecisions": ["approve", "edit", "reject", "respond"],
+            "originalArgs": {
+                "file_path": f"{'a' if index == 0 else 'b'}.txt",
+                "content": "A" if index == 0 else "B",
+            },
+        }
+        if include_explicit_correlation:
+            deepagents.update(
+                {
+                    "nativeInterruptId": "interrupt-main",
+                    "actionIndex": index,
+                }
+            )
+        interrupts.append(
+            AgUiInterrupt(
+                id=f"interrupt-main#{index}",
+                reason="tool_call",
+                tool_call_id=codec.encode("tool", (), raw_tool_call_id),
+                metadata={
+                    "langgraphValue": native_value,
+                    "deepagents": deepagents,
+                },
+            )
+        )
+    return tuple(interrupts)
+
+
+@pytest.mark.parametrize("include_explicit_correlation", [True, False])
+def test_resume_mapper_uses_persisted_agui_tool_ids_without_checkpoint(
+    include_explicit_correlation: bool,
+) -> None:
+    translation = ResumeMapper().map_agui(
+        entries=(
+            _entry("interrupt-main#1", payload={"type": "approve"}),
+            _entry("interrupt-main#0", payload={"type": "reject"}),
+        ),
+        interrupts=_public_interrupts(
+            include_explicit_correlation=include_explicit_correlation
+        ),
+    )
+
+    assert translation.root == {"decisions": [{"type": "reject"}, {"type": "approve"}]}
+    assert translation.prior_tool_call_ids == (
+        ScopedIdCodec().encode("tool", (), "call-main-a"),
+        ScopedIdCodec().encode("tool", (), "call-main-b"),
+    )
+
+
+def test_resume_mapper_rejects_tampered_persisted_agui_correlation() -> None:
+    interrupts = list(_public_interrupts())
+    metadata = dict(interrupts[0].metadata or {})
+    deepagents = dict(metadata["deepagents"])
+    deepagents["originalArgs"] = {"file_path": "other.txt", "content": "A"}
+    metadata["deepagents"] = deepagents
+    interrupts[0] = interrupts[0].model_copy(update={"metadata": metadata})
+
+    with pytest.raises(ResumeMappingError) as raised:
+        ResumeMapper().map_agui(
+            entries=(
+                _entry("interrupt-main#0", payload={"type": "approve"}),
+                _entry("interrupt-main#1", payload={"type": "approve"}),
+            ),
+            interrupts=interrupts,
+        )
+
+    assert raised.value.failure is ResumeMappingFailure.INTERRUPT_UNSUPPORTED
+
+
+def test_resume_mapper_restores_multiple_persisted_agui_groups() -> None:
+    secondary = AgUiInterrupt(
+        id="interrupt-secondary",
+        reason="tool_call",
+        tool_call_id=ScopedIdCodec().encode("tool", ("tools:task-1",), "call-ask"),
+        metadata={
+            "langgraphValue": {
+                "action_requests": [
+                    {"name": "ask_user", "args": {"question": "Continue?"}}
+                ],
+                "review_configs": [
+                    {
+                        "action_name": "ask_user",
+                        "allowed_decisions": ["respond"],
+                    }
+                ],
+            },
+            "deepagents": {
+                "nativeInterruptId": "interrupt-secondary",
+                "actionIndex": 0,
+                "toolName": "ask_user",
+                "allowedDecisions": ["respond"],
+                "originalArgs": {"question": "Continue?"},
+            },
+        },
+    )
+
+    translation = ResumeMapper().map_agui(
+        entries=(
+            _entry(
+                "interrupt-secondary",
+                payload={"type": "respond", "message": "Yes"},
+            ),
+            _entry("interrupt-main#1", payload={"type": "approve"}),
+            _entry("interrupt-main#0", payload={"type": "reject"}),
+        ),
+        interrupts=(*_public_interrupts(), secondary),
+    )
+
+    assert translation.root == {
+        "interrupt-main": {"decisions": [{"type": "reject"}, {"type": "approve"}]},
+        "interrupt-secondary": {"decisions": [{"type": "respond", "message": "Yes"}]},
+    }
+    assert translation.prior_tool_call_ids == (
+        ScopedIdCodec().encode("tool", (), "call-main-a"),
+        ScopedIdCodec().encode("tool", (), "call-main-b"),
+        ScopedIdCodec().encode("tool", ("tools:task-1",), "call-ask"),
+    )
+
+
+def test_resume_mapper_uses_only_resolved_persisted_tool_ids_for_mixed_resume() -> None:
+    translation = ResumeMapper().map_agui(
+        entries=(
+            _entry("interrupt-main#1", status="cancelled"),
+            _entry("interrupt-main#0", payload={"type": "approve"}),
+        ),
+        interrupts=_public_interrupts(),
+    )
+
+    assert translation.mode == "custom"
+    assert translation.cancelled_interrupt_ids == ("interrupt-main#1",)
+    assert translation.prior_tool_call_ids == (
+        ScopedIdCodec().encode("tool", (), "call-main-a"),
+    )
+
+
+def test_resume_mapper_rejects_incomplete_persisted_agui_group() -> None:
+    with pytest.raises(ResumeMappingError) as raised:
+        ResumeMapper().map_agui(
+            entries=(_entry("interrupt-main#0", payload={"type": "approve"}),),
+            interrupts=_public_interrupts()[:1],
+        )
+
+    assert raised.value.failure is ResumeMappingFailure.INCOMPLETE
 
 
 def test_resume_mapper_restores_multi_action_order_and_replaces_edited_args() -> None:

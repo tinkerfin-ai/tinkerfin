@@ -1731,6 +1731,10 @@ def test_hitl_operational_args_remain_exact_under_reasoning_privacy(
     interrupt = adapter.main_outcome().interrupts[0]
     assert interrupt.metadata is not None
     assert interrupt.metadata["deepagents"]["originalArgs"] == args
+    assert interrupt.metadata["deepagents"]["nativeInterruptId"] == (
+        "interrupt-operational"
+    )
+    assert interrupt.metadata["deepagents"]["actionIndex"] == 0
     assert interrupt.metadata["langgraphValue"]["action_requests"][0]["args"] == args
 
 

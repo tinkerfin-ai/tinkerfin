@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Literal, Never, cast
 
+from ag_ui.core.types import Interrupt as AgUiInterrupt
 from ag_ui.core.types import ResumeEntry
 from langchain_core.messages import AIMessage, BaseMessage
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
@@ -22,7 +23,7 @@ from .models import (
     AgentRuntimeInterrupt,
     JsonObject,
 )
-from .reasoning import normalize_operational_data
+from .reasoning import json_values_equal, normalize_operational_data
 
 
 class ResumeMappingFailure(StrEnum):
@@ -97,6 +98,50 @@ class _PendingInterruptAction(BaseModel):
     )
 
 
+class _PersistedDeepAgentCorrelation(BaseModel):
+    """Validated resume correlation persisted inside an AG-UI interrupt."""
+
+    model_config = ConfigDict(
+        alias_generator=None,
+        extra="allow",
+        populate_by_name=True,
+        strict=True,
+    )
+
+    tool_name: str = Field(
+        alias="toolName",
+        min_length=1,
+        description="Reviewed Deep Agents Tool name",
+    )
+    allowed_decisions: list[Literal["approve", "edit", "reject", "respond"]] = Field(
+        alias="allowedDecisions",
+        min_length=1,
+        description="Decisions allowed for the reviewed action",
+    )
+    original_args: JsonObject = Field(
+        alias="originalArgs",
+        description="Original reviewed Tool arguments",
+    )
+    native_interrupt_id: str | None = Field(
+        default=None,
+        alias="nativeInterruptId",
+        min_length=1,
+        description="Native LangGraph interrupt group ID",
+    )
+    action_index: int | None = Field(
+        default=None,
+        alias="actionIndex",
+        ge=0,
+        description="Action position within the native interrupt group",
+    )
+
+
+_PriorToolCallIdResolver = Callable[
+    [Mapping[str, Sequence[bool]] | None],
+    tuple[str, ...],
+]
+
+
 class ResumeMapper:
     """Translate complete AG-UI resume coverage without performing I/O.
 
@@ -134,6 +179,88 @@ class ResumeMapper:
         """
 
         pending, action_groups = self._pending_actions(interrupts)
+        group_ids = tuple(
+            dict.fromkeys(action.interrupt_id for action in pending.values())
+        )
+
+        def resolve_prior_tool_call_ids(
+            selected: Mapping[str, Sequence[bool]] | None,
+        ) -> tuple[str, ...]:
+            selected_slots = (
+                None
+                if selected is None
+                else tuple(tuple(selected[group_id]) for group_id in group_ids)
+            )
+            return self._prior_tool_call_ids(
+                action_groups,
+                messages_by_namespace,
+                selected_slots=selected_slots,
+            )
+
+        return self._translate(
+            entries=entries,
+            pending=pending,
+            resolve_prior_tool_call_ids=resolve_prior_tool_call_ids,
+        )
+
+    def map_agui(
+        self,
+        *,
+        entries: Sequence[ResumeEntry],
+        interrupts: Sequence[AgUiInterrupt],
+    ) -> ResumeTranslation:
+        """Translate resume entries from trusted, previously emitted interrupts.
+
+        Args:
+            entries: Resume entries already validated at the AG-UI request boundary.
+            interrupts: Complete AG-UI interrupts persisted by the host from a prior
+                run terminal. Client-supplied interrupt payloads are not trustworthy
+                correlation evidence and must not be passed here.
+
+        Returns:
+            A lossless translation with Tool IDs already correlated at emission time.
+
+        Raises:
+            ResumeMappingError: Interrupt correlation is incomplete, inconsistent, or
+                cannot be validated without weakening native resume semantics.
+        """
+
+        pending, tool_ids_by_group = self._pending_agui_actions(interrupts)
+
+        def resolve_prior_tool_call_ids(
+            selected: Mapping[str, Sequence[bool]] | None,
+        ) -> tuple[str, ...]:
+            resolved: list[str] = []
+            for group_id, tool_ids in tool_ids_by_group.items():
+                selected_group = (
+                    tuple(True for _tool_id in tool_ids)
+                    if selected is None
+                    else tuple(selected[group_id])
+                )
+                resolved.extend(
+                    tool_id
+                    for tool_id, include in zip(
+                        tool_ids,
+                        selected_group,
+                        strict=True,
+                    )
+                    if include
+                )
+            return tuple(resolved)
+
+        return self._translate(
+            entries=entries,
+            pending=pending,
+            resolve_prior_tool_call_ids=resolve_prior_tool_call_ids,
+        )
+
+    def _translate(
+        self,
+        *,
+        entries: Sequence[ResumeEntry],
+        pending: Mapping[str, _PendingInterruptAction],
+        resolve_prior_tool_call_ids: _PriorToolCallIdResolver,
+    ) -> ResumeTranslation:
         if not pending:
             raise ResumeMappingError(
                 ResumeMappingFailure.NO_PENDING_INTERRUPT,
@@ -198,14 +325,12 @@ class ResumeMapper:
             )
 
         if cancelled_interrupt_ids:
-            resolved_slots = tuple(
-                tuple(decision is not None for decision in decisions)
-                for decisions in grouped_decisions.values()
-            )
-            prior_tool_call_ids = self._prior_tool_call_ids(
-                action_groups,
-                messages_by_namespace,
-                selected_slots=resolved_slots,
+            resolved_slots = {
+                interrupt_id: tuple(decision is not None for decision in decisions)
+                for interrupt_id, decisions in grouped_decisions.items()
+            }
+            prior_tool_call_ids = resolve_prior_tool_call_ids(
+                resolved_slots,
             )
             return ResumeTranslation(
                 mode="custom",
@@ -237,10 +362,7 @@ class ResumeMapper:
             )
         else:
             resume_data = JsonObject.model_validate(serialized_groups)
-        prior_tool_call_ids = self._prior_tool_call_ids(
-            action_groups,
-            messages_by_namespace,
-        )
+        prior_tool_call_ids = resolve_prior_tool_call_ids(None)
         return ResumeTranslation(
             mode="command",
             resume_data=resume_data,
@@ -250,6 +372,160 @@ class ResumeMapper:
                 for interrupt_id, decisions in grouped_decisions.items()
             },
         )
+
+    @classmethod
+    def _pending_agui_actions(
+        cls,
+        interrupts: Sequence[AgUiInterrupt],
+    ) -> tuple[
+        dict[str, _PendingInterruptAction],
+        dict[str, tuple[str, ...]],
+    ]:
+        pending: dict[str, _PendingInterruptAction] = {}
+        groups: dict[
+            str,
+            tuple[HitlRequest, list[str | None]],
+        ] = {}
+        seen_tool_ids: set[str] = set()
+        codec = ScopedIdCodec()
+
+        for interrupt in interrupts:
+            try:
+                if interrupt.reason != "tool_call":
+                    raise ValueError("interrupt reason is not tool_call")
+                tool_call_id = interrupt.tool_call_id
+                if not isinstance(tool_call_id, str) or not tool_call_id:
+                    raise ValueError("interrupt does not contain a Tool call ID")
+                kind, _namespace, _raw_id = codec.decode(tool_call_id)
+                if kind != "tool":
+                    raise ValueError("interrupt ID does not identify a Tool call")
+                if tool_call_id in seen_tool_ids:
+                    raise ValueError("interrupts reuse a scoped Tool call ID")
+
+                metadata = interrupt.metadata
+                if not isinstance(metadata, Mapping):
+                    raise TypeError("interrupt metadata must be an object")
+                request = HitlRequest.model_validate(metadata.get("langgraphValue"))
+                correlation = _PersistedDeepAgentCorrelation.model_validate(
+                    metadata.get("deepagents")
+                )
+                native_id, action_index = cls._agui_action_position(
+                    interrupt=interrupt,
+                    request=request,
+                    correlation=correlation,
+                )
+                action = request.action_requests[action_index]
+                review = request.review_configs[action_index]
+                if correlation.tool_name != action.name:
+                    raise ValueError("persisted Tool name does not match native action")
+                if correlation.allowed_decisions != review.allowed_decisions:
+                    raise ValueError(
+                        "persisted decisions do not match native review policy"
+                    )
+                if not json_values_equal(
+                    correlation.original_args.root,
+                    action.args.root,
+                ):
+                    raise ValueError(
+                        "persisted Tool arguments do not match native action"
+                    )
+            except (TypeError, ValueError, ValidationError) as error:
+                raise ResumeMappingError(
+                    ResumeMappingFailure.INTERRUPT_UNSUPPORTED,
+                    f"persisted AG-UI interrupt is not resumable: {interrupt.id}",
+                ) from error
+
+            existing = groups.get(native_id)
+            if existing is None:
+                slots: list[str | None] = [None] * len(request.action_requests)
+                groups[native_id] = (request, slots)
+            else:
+                existing_request, slots = existing
+                if not json_values_equal(
+                    existing_request.model_dump(mode="json", by_alias=True),
+                    request.model_dump(mode="json", by_alias=True),
+                ):
+                    raise ResumeMappingError(
+                        ResumeMappingFailure.INTERRUPT_UNSUPPORTED,
+                        f"persisted AG-UI interrupt group is inconsistent: {native_id}",
+                    )
+            if slots[action_index] is not None:
+                raise ResumeMappingError(
+                    ResumeMappingFailure.DUPLICATE_PENDING_INTERRUPT_ID,
+                    f"duplicate pending interruptId: {interrupt.id}",
+                )
+            if interrupt.id in pending:
+                raise ResumeMappingError(
+                    ResumeMappingFailure.DUPLICATE_PENDING_INTERRUPT_ID,
+                    f"duplicate pending interruptId: {interrupt.id}",
+                )
+            slots[action_index] = tool_call_id
+            seen_tool_ids.add(tool_call_id)
+            pending[interrupt.id] = _PendingInterruptAction(
+                ag_ui_interrupt_id=interrupt.id,
+                interrupt_id=native_id,
+                action_index=action_index,
+                action_name=action.name,
+                allowed_decisions=review.allowed_decisions,
+            )
+
+        ordered_pending: dict[str, _PendingInterruptAction] = {}
+        tool_ids_by_group: dict[str, tuple[str, ...]] = {}
+        for native_id, (request, slots) in groups.items():
+            if any(tool_id is None for tool_id in slots):
+                raise ResumeMappingError(
+                    ResumeMappingFailure.INCOMPLETE,
+                    f"persisted AG-UI interrupt group is incomplete: {native_id}",
+                )
+            multi_action = len(request.action_requests) > 1
+            for index in range(len(slots)):
+                public_id = f"{native_id}#{index}" if multi_action else native_id
+                ordered_pending[public_id] = pending[public_id]
+            tool_ids_by_group[native_id] = tuple(
+                cast(str, tool_id) for tool_id in slots
+            )
+        return ordered_pending, tool_ids_by_group
+
+    @staticmethod
+    def _agui_action_position(
+        *,
+        interrupt: AgUiInterrupt,
+        request: HitlRequest,
+        correlation: _PersistedDeepAgentCorrelation,
+    ) -> tuple[str, int]:
+        native_id = correlation.native_interrupt_id
+        action_index = correlation.action_index
+        if (native_id is None) != (action_index is None):
+            raise ValueError(
+                "nativeInterruptId and actionIndex must be persisted together"
+            )
+        if native_id is None:
+            if len(request.action_requests) == 1:
+                native_id = interrupt.id
+                action_index = 0
+            else:
+                native_id, separator, raw_index = interrupt.id.rpartition("#")
+                if (
+                    not separator
+                    or not native_id
+                    or not raw_index.isascii()
+                    or not raw_index.isdecimal()
+                ):
+                    raise ValueError("multi-action interrupt ID has no action index")
+                action_index = int(raw_index)
+                if str(action_index) != raw_index:
+                    raise ValueError("multi-action interrupt index is not canonical")
+        assert action_index is not None
+        expected_id = (
+            native_id
+            if len(request.action_requests) == 1
+            else f"{native_id}#{action_index}"
+        )
+        if interrupt.id != expected_id or action_index >= len(request.action_requests):
+            raise ValueError(
+                "persisted interrupt ID does not match its action position"
+            )
+        return native_id, action_index
 
     @staticmethod
     def _prior_tool_call_ids(

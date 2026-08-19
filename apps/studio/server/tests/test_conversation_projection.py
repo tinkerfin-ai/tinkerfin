@@ -269,6 +269,100 @@ async def test_resume_projection_cannot_take_another_run_claim(
     assert stored.resolved_at is None
 
 
+@pytest.mark.parametrize(
+    ("error_code", "run_status"),
+    (("runtime_initialization_error", "error"), ("cancelled", "cancelled")),
+)
+async def test_initialization_error_releases_resume_claim_without_consuming_it(
+    session: AsyncSession,
+    error_code: str,
+    run_status: str,
+) -> None:
+    """Graph 尚未创建时的错误终止不得消费 checkpoint 中的待审批项"""
+
+    repository = ConversationRepository(session)
+    thread = await repository.create_thread(
+        user_id=7,
+        thread_id="thread-init-failure",
+        title="初始化失败",
+        model_id="main",
+    )
+    run = await repository.create_main_run(
+        thread_id=thread.id,
+        run_id="run-init-failure",
+        model_id="main",
+        input_json={
+            "messages": [],
+            "resume": [
+                {
+                    "interruptId": "interrupt-init-failure",
+                    "status": "resolved",
+                    "payload": {"type": "approve"},
+                }
+            ],
+        },
+        config_json={},
+    )
+    created_at = datetime(2026, 8, 18, 1, 0)
+    session.add(
+        ConversationInterrupt(
+            conversation_thread_id=thread.id,
+            run_id="run-interrupted",
+            resolved_run_id=run.run_id,
+            interrupt_id="interrupt-init-failure",
+            status="pending",
+            reason="tool_call",
+            message="确认写入",
+            request_json={"id": "interrupt-init-failure", "reason": "tool_call"},
+            resume_json=None,
+            created_at=created_at,
+            resolved_at=None,
+            updated_at=created_at,
+        )
+    )
+    await session.commit()
+    projector = ConversationProjector(session)
+    events = (
+        {
+            "type": "RUN_STARTED",
+            "threadId": thread.thread_id,
+            "runId": run.run_id,
+            "rawEvent": {
+                "runId": run.run_id,
+                "initializationFailed": True,
+            },
+        },
+        {
+            "type": "RUN_ERROR",
+            "message": "Agent run failed",
+            "code": error_code,
+            "rawEvent": {
+                "runId": run.run_id,
+                "initializationFailed": True,
+            },
+        },
+    )
+
+    for seq, value in enumerate(events, start=1):
+        envelope, event = _envelope(seq, value, run=run.run_id)
+        await projector.project(thread_pk=thread.id, envelope=envelope, event=event)
+    await session.commit()
+
+    stored = await session.scalar(
+        select(ConversationInterrupt).where(
+            ConversationInterrupt.conversation_thread_id == thread.id,
+            ConversationInterrupt.interrupt_id == "interrupt-init-failure",
+        )
+    )
+    await session.refresh(run)
+    assert stored is not None
+    assert stored.status == "pending"
+    assert stored.resolved_run_id is None
+    assert stored.resume_json is None
+    assert stored.resolved_at is None
+    assert run.status == run_status
+
+
 async def test_subagent_terminal_does_not_finish_the_main_run(
     session: AsyncSession,
 ) -> None:

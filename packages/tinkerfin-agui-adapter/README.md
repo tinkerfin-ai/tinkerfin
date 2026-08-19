@@ -26,6 +26,7 @@ The converter accepts an asynchronous iterable of live v2 parts:
 ```python
 import asyncio
 
+from ag_ui.core import RunAgentInput
 from langchain_core.messages import AIMessageChunk
 
 from tinkerfin_agui_adapter import astream_events, encode_sse
@@ -44,10 +45,20 @@ async def parts():
 
 
 async def main():
+    run_input = RunAgentInput.model_validate(
+        {
+            "threadId": "thread-1",
+            "runId": "run-1",
+            "state": {},
+            "messages": [],
+            "tools": [],
+            "context": [],
+            "forwardedProps": {},
+        }
+    )
     async for event in astream_events(
         parts(),
-        thread_id="thread-1",
-        run_id="run-1",
+        run_input=run_input,
     ):
         frame = encode_sse(event)
         print(frame, end="")
@@ -58,8 +69,8 @@ asyncio.run(main())
 <!-- adapter-quick-start:end -->
 
 Production graph integration supplies `messages`, `tasks`, and `values` with
-`version="v2"` and `subgraphs=True`. `thread_id`, `run_id`, and optional
-`parent_run_id` are protocol identity only; graph input remains the caller's concern.
+`version="v2"` and `subgraphs=True`. The caller's complete `RunAgentInput` is preserved
+on `RUN_STARTED.input`; graph input remains the caller's concern.
 One conversion exclusively consumes and closes the supplied iterator.
 `astream_events()` already creates the main lifecycle, including its unique terminal;
 `AgUiLifecycleEventFactory` is for custom orchestrators that do not use this stream
@@ -92,13 +103,16 @@ ownership.
 - Conversion pulls with bounded lookahead and closes an upstream iterator exposing
   `aclose()` on cancellation or early consumer exit.
 
-`ResumeMapper` translates complete AG-UI resume entries using host-persisted interrupt
-correlation and checkpoint messages grouped by full namespace. It distinguishes
-resolved, abandoned, and mixed decisions and never converts cancellation into
-rejection. Namespace-grouped checkpoint messages are mandatory when any review is
-resolved; only an all-cancelled abandonment can omit them. `encode_sse(event,
-event_id=...)` encodes one event; delivery, persistence, retries, and transport
-cancellation remain caller-owned.
+`ResumeMapper.map()` translates complete AG-UI resume entries from native checkpoint
+interrupts and messages grouped by full namespace. Resolved reviews require those
+messages so Tool calls can be correlated safely. `ResumeMapper.map_agui()` instead
+accepts complete AG-UI interrupts that the host persisted from an earlier terminal. It
+reuses their already verified scoped `toolCallId` values and does not query a graph or
+checkpointer. Never pass client-supplied interrupt payloads to that method.
+
+Both paths distinguish resolved, abandoned, and mixed decisions and never convert
+cancellation into rejection. `encode_sse(event, event_id=...)` encodes one event;
+delivery, persistence, retries, and transport cancellation remain caller-owned.
 
 ## License
 

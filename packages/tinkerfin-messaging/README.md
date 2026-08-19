@@ -33,28 +33,33 @@ Create `Messaging` and its name-only channel for the application lifetime. Creat
 new Runtime source per HTTP request:
 
 ```python
+import asyncio
+from functools import partial
+
 from starlette.responses import StreamingResponse
 from tinkerfin import TinkerFin
 from tinkerfin_messaging import Messaging
 
 tinkerfin = TinkerFin()
+agent = tinkerfin.create_deep_agent(
+    model=model,
+    tools=tools,
+    backend=agent_backend,
+    store=store,
+)
 
-async with Messaging(backend=backend) as messaging:
+async with Messaging(backend=messaging_backend) as messaging:
     channel = messaging.channel(name="agent-events")
 
-    run = tinkerfin.run(
-        lambda: graph.astream(
-            graph_input,
-            config={"configurable": {"thread_id": agent_input.thread_id}},
-            stream_mode=("messages", "tasks", "values"),
-            version="v2",
-            subgraphs=True,
+    runtime = await asyncio.to_thread(
+        partial(
+            agent.new_agui,
+            run_input=agent_input,
         )
     )
-    events = run.astream_agui(
-        thread_id=agent_input.thread_id,
-        run_id=agent_input.run_id,
-        parent_run_id=agent_input.parent_run_id,
+    events = runtime.astream(
+        graph_input,
+        config={"configurable": {"thread_id": agent_input.thread_id}},
     )
     body = await channel.sse(
         events,
@@ -62,7 +67,6 @@ async with Messaging(backend=backend) as messaging:
         run=agent_input.run_id,
         after=lambda: parse_last_event_id(request),
         attach_identity=agent_input,
-        cancel=events.abort,
     )
 
     response = StreamingResponse(
@@ -155,11 +159,17 @@ still use asynchronous replay; `.sse()` raises `SseRenderingUnsupported`.
 
 ### Source adapters
 
-Use `FiniteMessageSource` for a fixed in-memory sequence and `map_source()` to
-transform an existing source lazily before persistence:
+Use `FiniteMessageSource` for a fixed in-memory sequence, `map_source()` to transform
+an existing source, and `DeferredMessageSource` when source construction should happen
+only for the producer owner:
 
 ```python
-from tinkerfin_messaging import FiniteMessageSource, map_source
+from tinkerfin_messaging import (
+    DeferredMessageSource,
+    FiniteMessageSource,
+    MessageSourceBinding,
+    map_source,
+)
 
 finite = FiniteMessageSource.from_events((started_event, finished_event))
 
@@ -169,15 +179,42 @@ async def add_metadata(event: Event) -> Event:
 
 
 mapped = map_source(agent_events, add_metadata)
+
+
+async def open_events():
+    events = await create_agent_events()
+    return MessageSourceBinding(source=events)
+
+
+deferred = DeferredMessageSource(open_events, cancellable=True)
 ```
 
-Both adapters are single-use and close idempotently. `map_source()` accepts a
+All adapters are single-use and close idempotently. `map_source()` accepts a
 synchronous or asynchronous transform, waits for each result before pulling the next
-source item, and forwards `aclose()` to its upstream source exactly once. Iteration
+source item, applies the same transform to the complete cancellation tail, and forwards
+`aclose()` to its upstream source exactly once. A failed tail transform returns no
+partial tail. Iteration
 does not close the upstream source independently because the owner may need to settle
 a concurrent cancellation callback first. The adapter deliberately returns an
 unprofiled source because a transform can invalidate the original codec type; pass it
 to a channel with an explicit codec.
+
+`DeferredMessageSource` invokes its asynchronous opener exactly once on the first
+producer pull. A run attachment or replay closes it without opening the underlying
+source. Opening, cancellation, and ordinary iteration share the same binding, so a
+remote cancellation that arrives during opening waits for that source and then invokes
+its callback. When `MessageSourceBinding.cancel` is absent, the deferred source derives
+the callback from the opened source. An explicit binding callback remains authoritative.
+The deferred source declares that callback to Messaging; callers omit the `cancel=`
+argument. Supplying a different callback is rejected before durable ownership is
+claimed; the same callback, including its pre-map equivalent, is reused.
+Natural exhaustion retains the binding until the owner calls `aclose()`, so an accepted
+cancellation cannot lose its callback race. Deferred sources are also unprofiled and
+therefore require an explicit channel codec.
+
+Set `cancel_after_first_item=True` when the first item establishes a protocol lifecycle
+that cancellation must not overtake, such as AG-UI `RUN_STARTED`. The default remains
+`False` for sources whose first pull may need the cancellation callback to unblock it.
 
 ### High-level and low-level delivery
 
@@ -214,6 +251,22 @@ async for message in subscription:
 # Or render the same subscription:
 body = subscription.sse()
 ```
+
+Committed values can also be consumed without starting or attaching a producer:
+
+```python
+latest = await channel.latest_seq(stream=stream_id)
+page = await channel.read(stream=stream_id, after=after, limit=1000)
+subscription = await channel.follow(stream=stream_id, run=run_id, after=after)
+```
+
+`read()` returns an ascending tuple of `DecodedMessage` values after the exclusive
+cursor. `follow()` asynchronously binds the current durable stream generation before
+returning a closeable run-bounded `MessageSubscription`; a delete/recreate race cannot
+retarget that subscription to the new generation. It preserves completion,
+cancellation, producer failure, stream deletion, and backpressure. The
+Channel validates every envelope codec before decoding. Reading requires an explicit
+codec or a built-in profile already inferred in the current process.
 
 The high-level `sse()` method accepts a concrete `int`, `None`, or a zero-argument
 synchronous callback returning `int | None`. It invokes the callback exactly once
@@ -318,8 +371,8 @@ before using it with this package version.
 
 ### Cancellation and failures
 
-Register a synchronous or asynchronous callback with `wrap()` or `sse()`, then request
-remote cancellation:
+Register a synchronous or asynchronous callback with `wrap()` or `sse()`, or use a
+source that declares `messaging_cancel_callback`, then request remote cancellation:
 
 ```python
 cancelled = await channel.cancel(stream="thread-1", run="run-1")
@@ -327,7 +380,8 @@ cancelled = await channel.cancel(stream="thread-1", run="run-1")
 
 The callback accepts no arguments or one `CancelContext`. It must stop the active
 source and may return a finite cancellation tail. A TinkerFin AG-UI stream supplies
-`events.abort`, whose tail contains the unique `RUN_ERROR(code="cancelled")`.
+`events.abort`, whose tail contains the unique `RUN_ERROR(code="cancelled")`. An
+explicit callback and a source-owned callback are mutually exclusive.
 
 The backend orders cancellation against settlement atomically and invokes the owner
 callback at most once. Runs without a callback raise `CancellationUnsupported`.

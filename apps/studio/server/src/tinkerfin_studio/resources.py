@@ -13,10 +13,9 @@ from fastapi import FastAPI
 from opensandbox.config import ConnectionConfig
 from redis.asyncio import Redis
 
+from tinkerfin import TinkerFin
 from tinkerfin.redis import RedisRunCoordinator
-from tinkerfin.runtime import TinkerFin
 from tinkerfin_messaging.agui import AgUiCodec
-from tinkerfin_messaging.backend import MessagingBackend
 from tinkerfin_messaging.messaging import MessageChannel, Messaging
 from tinkerfin_messaging.redis import RedisBackend
 from tinkerfin_sandbox.lifecycle.client import OpenSandboxClient
@@ -41,9 +40,7 @@ class ApplicationResources:
     database: Database
     redis: Redis
     agent_persistence: AgentPersistence
-    run_coordinator: RedisRunCoordinator[str]
     tinkerfin: TinkerFin[str]
-    messaging_backend: MessagingBackend
     messaging: Messaging
     conversation_channel: MessageChannel[BaseEvent, BaseEvent]
     sandbox_manager: OpenSandboxManager[str]
@@ -115,12 +112,6 @@ def build_lifespan():
                 redis,
                 key_prefix=settings.redis.messaging_key_prefix,
             )
-            projector = ConversationProjectionCoordinator(
-                database=database,
-                backend=messaging_backend,
-                channel="studio-conversation-agui",
-            )
-            stack.push_async_callback(projector.aclose)
             messaging = await stack.enter_async_context(
                 Messaging(backend=messaging_backend)
             )
@@ -128,14 +119,17 @@ def build_lifespan():
                 name="studio-conversation-agui",
                 codec=AgUiCodec(),
             )
+            projector = ConversationProjectionCoordinator(
+                database=database,
+                channel=channel,
+            )
+            stack.push_async_callback(projector.aclose)
             application.state.resources = ApplicationResources(
                 settings=settings,
                 database=database,
                 redis=redis,
                 agent_persistence=persistence,
-                run_coordinator=run_coordinator,
                 tinkerfin=TinkerFin(run_coordinator=run_coordinator),
-                messaging_backend=messaging_backend,
                 messaging=messaging,
                 conversation_channel=channel,
                 sandbox_manager=sandbox_manager,

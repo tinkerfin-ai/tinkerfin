@@ -1,113 +1,84 @@
 # TinkerFin runtime guide
 
-TinkerFin binds a caller-owned asynchronous source factory to one native or AG-UI
-object stream. It does not construct or own the graph and does not mirror the
-`graph.astream(...)` signature. The host remains responsible for request mapping,
-checkpoint lookup, resume commands, HTTP status handling, and application resources.
+TinkerFin adds request-scoped native and AG-UI streams to Deep Agents. The host still
+owns models, tools, backends, checkpointers, stores, Sandbox resources, request mapping,
+checkpoint lookup, and resume commands.
 
-## Construction and ownership
+## Create an agent
 
 ```python
+from ag_ui.core import RunAgentInput
 from tinkerfin import TinkerFin
 
-tinkerfin = TinkerFin(run_coordinator=None)
-```
+tinkerfin = TinkerFin(run_coordinator=coordinator)
 
-`TinkerFin` is an application-scoped stateless factory. It has no asynchronous context
-manager. A configured `RunCoordinator` is borrowed and must be opened and closed by
-its owner.
-
-Each logical request creates a `TinkerFinRun`:
-
-```python
-run = tinkerfin.run(
-    lambda: graph.astream(
-        graph_input,
-        config,
-        context=context,
-        stream_mode=("messages", "tasks", "values"),
-        print_mode=(),
-        output_keys=None,
-        interrupt_before=None,
-        interrupt_after=None,
-        durability=None,
-        control=None,
-        subgraphs=True,
-        debug=None,
-        version="v2",
-    ),
-    principal=principal,
-    on_part=on_part,
+agent = tinkerfin.create_deep_agent(
+    model=model,
+    tools=tools,
+    backend=backend,
+    checkpointer=checkpointer,
+    store=store,
 )
 ```
 
-The source factory is synchronous and zero-argument. It returns a fresh, unconsumed
-`AsyncIterator` when the selected object stream is first pulled. Runtime closes that
-iterator on success, failure, cancellation, or early consumer exit. Graphs, models,
-checkpointers, stores, and values captured by the closure remain caller-owned.
+`create_deep_agent(...)` has the installed Deep Agents signature. It records the build
+arguments but does not create a Graph. Every `new()` or `new_agui()` call creates a
+fresh Graph and one single-use Runtime.
 
-One `TinkerFinRun` creates exactly one object stream. Calling `astream()` after
-`astream_agui()`, or claiming the same path twice, raises `RuntimeError`. Create a new
-run for each HTTP request or independent consumer.
+Graph construction is synchronous. Async servers should run `new()` or `new_agui()`
+through their controlled thread boundary when construction must not occupy the event
+loop.
 
-`on_part(part)` is an asynchronous observer. It completes before the part is delivered
-or converted, cannot replace the part, and participates in error and cancellation
-semantics.
-
-## Native object streams
+## Native stream
 
 ```python
-parts = run.astream()
+runtime = agent.new(
+    principal=principal,
+    on_part=on_part,
+)
 
-async for part in parts:
+async for part in runtime.astream(
+    graph_input,
+    config,
+    context=context,
+    stream_mode="values",
+    version="v2",
+):
     ...
 ```
 
-`astream()` accepts no parameters because every third-party invocation parameter is
-already present in the source factory. The stream is pull-based and preserves ordering,
-backpressure, source exceptions, cancellation, coordinator lifetime, and upstream
-cleanup.
+`runtime.astream(...)` has the installed `CompiledStateGraph.astream(...)` parameter
+shape and forwards the call unchanged. It returns `GraphRunStream` and preserves
+ordering, pull-based backpressure, errors, cancellation, early-close cleanup,
+coordination, and `on_part` ordering.
 
-## AG-UI object streams
+The Graph iterator is created on first pull. Calling `astream(...)` twice on the same
+Runtime raises `RuntimeError`.
+
+## AG-UI stream
 
 ```python
-events = run.astream_agui(
-    thread_id=agent_input.thread_id,
-    run_id=agent_input.run_id,
-    parent_run_id=agent_input.parent_run_id,
+agent_input = RunAgentInput.model_validate(request_payload)
+
+runtime = agent.new_agui(
+    principal=principal,
+    on_part=on_part,
+    run_input=agent_input,
     timeout=None,
     settlement_timeout=None,
     expose_reasoning_events=False,
     expose_subagent_events=True,
-    prior_tool_call_ids=frozenset(),
     on_event=on_event,
 )
 
-async for event in events:
-    ...
+events = runtime.astream(
+    graph_input,
+    config,
+    context=context,
+)
 ```
 
-- `thread_id`, `run_id`, and optional `parent_run_id` are caller-provided AG-UI
-  identity. `parent_run_id` represents run lineage, never subgraph nesting.
-- `timeout` is one total pull deadline for the AG-UI stream.
-- `settlement_timeout` limits only one caller's close wait. `None` waits without a
-  deadline; a finite expiry raises `AgUiSettlementTimeoutError` while the same owned
-  close task continues and remains available to another `aclose()` call.
-- `expose_reasoning_events` enables only verified public reasoning events; private
-  provider metadata remains stripped from public payloads.
-- `expose_subagent_events` controls delivery of validated non-root events.
-- `prior_tool_call_ids` contains complete scoped `tf:tool:...` IDs published before a
-  resume request. Raw native IDs are rejected.
-- `on_event(event)` is awaited before delivery and cannot replace the event.
-
-The stream emits `RUN_STARTED` once and one main terminal. `abort()` returns the
-remaining cancellation tail, including the unique `RUN_ERROR(code="cancelled")` when
-appropriate. `aclose()` closes conversion and upstream ownership without claiming a
-successful run.
-
-### Native stream requirements
-
-Strict AG-UI binding requires all three v2 modes and subgraph output:
+The AG-UI Runtime uses these native stream settings when they are omitted:
 
 ```python
 stream_mode = ("messages", "tasks", "values")
@@ -115,223 +86,143 @@ version = "v2"
 subgraphs = True
 ```
 
-The default `TinkerFin.run(source_factory)` path remains parameter-neutral and accepts
-arbitrary native objects. Runtime does not reflect its opaque closure; AG-UI conversion
-validates the envelopes that arrive and rejects malformed modes, message tuples, task
-phases, values payloads, and unregistered namespaces.
+Explicit values must satisfy the same contract. `stream_mode` may also include
+`updates`, `checkpoints`, `debug`, or `custom`. Missing, duplicate, unknown, or
+conflicting values fail before Graph iteration, coordination, observers, or
+`RUN_STARTED`.
 
-For synchronous configuration preflight, bind an optional strict source and pass it to
-the same `run()` method:
+The returned `AgUiEventStream` keeps the existing lifecycle:
 
-```python
-from tinkerfin import AgUiNativeStreamConfig
+- one `RUN_STARTED` and one main terminal;
+- the complete caller `RunAgentInput` on `RUN_STARTED.input`;
+- balanced text, reasoning, and Tool events;
+- full namespace and ID correlation for parallel Tools and subagents;
+- root/subgraph state isolation;
+- final state and message snapshots before an interrupt terminal;
+- provider-private reasoning removed from public payloads;
+- idempotent abort and deterministic upstream cleanup.
 
-run = tinkerfin.run(
-    AgUiNativeStreamConfig(extra_modes=("custom",)).bind(
-        graph.astream,
-        graph_input,
-        config,
-        context=context,
-        durability="sync",
-    ),
-    principal=principal,
-    on_part=on_part,
-)
-```
+`abort()` returns the remaining cancellation tail and is also exposed structurally to
+Messaging. `aclose()` releases resources
+without fabricating success. `on_part` runs before conversion; `on_event` runs before
+delivery. `run_input.parent_run_id` is run lineage, not subgraph nesting.
 
-The strict source fixes the required modes, `version="v2"`, and `subgraphs=True`.
-`extra_modes` accepts `updates`, `checkpoints`, `debug`, and `custom`; required,
-duplicate, or unsupported entries fail before calling the Graph boundary, creating or
-pulling its iterator, acquiring coordination, observing a part, or emitting
-`RUN_STARTED`. The bound Graph invocation remains lazy after validation.
+## Resume
 
-Strict `run(...).astream()` returns a profiled `NativeGraphRunStream` for name-only
-Messaging inference. All seven modes use the same `NativeStreamPart` codec and native
-SSE shape. Generic native streams remain profile-free and require an explicit codec for
-durable delivery.
-
-### Compiled subgraphs and Deep Agents delegates
-
-Every `tasks/start` establishes a possible child graph scope. That evidence is
-independent from Deep Agents delegation:
-
-- an ordinary child graph uses `compiled_subgraph` provenance;
-- a scope also correlated with a Deep Agents `task` Tool call uses
-  `deep_agent_subagent` provenance and adds its agent name, full description, and
-  scoped parent Tool Call ID;
-- every runtime task remains a sanitized `RAW` event from `langgraph.tasks`;
-- non-root values remain sanitized provenance from `langgraph.values` and never
-  overwrite root state.
-
-Message fragments are correlated by full namespace, message ID, and chunk index. Tool
-results are correlated by full namespace and native Tool Call ID. Parallel Tools,
-reversed result order, and subagent input/output therefore retain their identities.
-
-### Child interrupts
-
-The adapter buffers a child interrupt until root `values` propagates an identical full
-interrupt ID and value. Missing or conflicting propagation fails closed. At the root
-boundary, output order is:
-
-```text
-open lifecycle END events
-STATE_SNAPSHOT                  # root state only
-MESSAGES_SNAPSHOT               # root first, then related child scopes
-RUN_FINISHED(outcome=interrupt)
-```
-
-The message snapshot uses the same namespace-scoped message and Tool IDs as live
-events. Relevant child scopes follow registration order, and identical scoped entries
-are deduplicated without merging different namespaces.
-
-## Resume mapping
-
-AG-UI resume entries are input to a later HTTP request. The host loads pending
-interrupts and checkpoint messages, groups messages by full namespace, and invokes the
-adapter's pure mapper:
+The host maps AG-UI resume entries with current checkpoint messages:
 
 ```python
-from langgraph.types import Command
+from tinkerfin import AgUiResumeBinding
 from tinkerfin_agui_adapter import ResumeMapper
 
 translation = ResumeMapper().map(
     entries=agent_input.resume or (),
     interrupts=pending_interrupts,
-    messages_by_namespace={
-        (): root_messages,
-        child_namespace: child_messages,
-    },
+    messages_by_namespace=messages_by_namespace,
 )
 
-if translation.mode == "command":
-    graph_input = Command(resume=translation.root)
-```
-
-`messages_by_namespace` is required whenever at least one review is resolved. Missing
-checkpoint messages fail with `CHECKPOINT_MESSAGES_REQUIRED`; a wholly cancelled
-abandonment does not require Tool-call correlation.
-
-`command` means every decision can use stock Deep Agents resume data. `abandon`
-preserves full cancellation without inventing a rejection. `custom` preserves mixed
-resolved and cancelled slots for host middleware that can execute them losslessly.
-
-Pass `frozenset(translation.prior_tool_call_ids)` to the resumed
-`astream_agui()`. A subsequent child `ToolMessage` then publishes only
-`TOOL_CALL_RESULT`; it does not duplicate start, args, or end events.
-
-## Direct SSE
-
-Native and AG-UI object streams render themselves:
-
-```python
-native_body = run.astream().to_sse(
-    timeout=None,
-    mapper=native_mapper,
-    event_id_resolver=native_event_id_resolver,
+resume = AgUiResumeBinding.from_translation(
+    run_input=agent_input,
+    translation=translation,
 )
 ```
 
+When the host persists the complete interrupts emitted by the earlier AG-UI terminal,
+it can reuse the correlation already validated by the adapter:
+
 ```python
-agui_body = run.astream_agui(
-    thread_id=thread_id,
-    run_id=run_id,
-).to_sse(
-    mapper=agui_mapper,
-    event_id_resolver=agui_event_id_resolver,
+translation = ResumeMapper().map_agui(
+    entries=agent_input.resume or (),
+    interrupts=persisted_interrupts,
+)
+resume = AgUiResumeBinding.from_translation(
+    run_input=agent_input,
+    translation=translation,
 )
 ```
 
-With no mapper, native output is a versioned finite JSON object with
-`event: stream-part`; AG-UI output is its validated protocol JSON. A custom async
-mapper returns `SsePayload(data=..., event=..., retry=...)` or `None` to filter the
-source item. A separate async ID resolver returns `str`, `int`, or `None`. All SSE
-fields are validated before framing. CRLF and CR in custom data normalize to LF;
-trailing LF is preserved by an empty final `data:` field, while other Unicode
-separators remain ordinary data.
+`persisted_interrupts` must come from the host's trusted event log, not from client
+payloads. The host must load the complete current pending batch and require the resume
+entries to cover it exactly before claiming any action. This path does not query a Graph
+or require checkpoint messages.
 
-The body can be passed directly to Starlette or FastAPI:
+Pass `resume=resume` to `new_agui(...)`, then call
+`runtime.astream(resume.command, ...)`. The binding requires a pure resume Command,
+the same complete `RunAgentInput`, and complete `tf:tool:...` IDs. A mismatched Graph
+input fails before the Graph iterator and does not consume the Runtime. A resumed Tool
+result keeps its original scoped ID without repeating Tool start, args, or end.
+Cancellation remains abandonment; it is not converted into rejection.
+
+## SSE and Messaging
+
+Both object streams provide `to_sse()`:
 
 ```python
-await agui_body.prepare(preflight=authorize_request)
+body = events.to_sse(
+    mapper=event_mapper,
+    event_id_resolver=event_id_resolver,
+)
+await body.prepare(preflight=authorize_request)
+```
 
-return StreamingResponse(
-    agui_body,
-    media_type="text/event-stream",
-    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+For persistence, replay, attachment, and remote cancellation, pass the unencoded stream
+to `tinkerfin-messaging`:
+
+```python
+body = await channel.sse(
+    events,
+    stream=agent_input.thread_id,
+    run=agent_input.run_id,
+    after=lambda: parse_last_event_id(request),
+    attach_identity=agent_input,
 )
 ```
 
-`prepare()` is optional. It runs static host preflight and closes on failure without
-opening or pulling the source and without calling the mapper or ID resolver. Errors
-after response headers are committed can only terminate the body, so request
-validation that must select an HTTP status belongs before response construction.
+Direct SSE is not persisted. Durable SSE IDs are committed channel sequence numbers,
+and `Last-Event-ID` replay is exclusive. Do not pass an encoded SSE body through a
+Messaging codec.
 
-## Durable Messaging
+When creating the Agent source is expensive, `DeferredMessageSource` can postpone its
+opener until Messaging has selected the producer owner. Attachments and replays close
+that source without creating the Agent. A deferred source can also declare its own
+cancellation callback, so the `cancel=` argument is omitted.
 
-Direct SSE is not persisted. For ordered storage, replay, attachment, and remote
-cancellation, give the unencoded object stream to an application-scoped channel:
-
-```python
-async with Messaging(backend=backend) as messaging:
-    channel = messaging.channel(name="agent-events")
-
-    events = run.astream_agui(
-        thread_id=agent_input.thread_id,
-        run_id=agent_input.run_id,
-        parent_run_id=agent_input.parent_run_id,
-    )
-    body = await channel.sse(
-        events,
-        stream=agent_input.thread_id,
-        run=agent_input.run_id,
-        after=lambda: parse_last_event_id(request),
-        attach_identity=agent_input,
-        cancel=events.abort,
-    )
-
-    return StreamingResponse(body, media_type="text/event-stream")
-```
-
-A name-only channel infers `AgUiCodec` or `NativeStreamPartCodec` from immutable
-source metadata before iteration. The handle is reusable across requests and streams;
-each source is single-use. The channel name binds one codec family across every
-stream and worker, and the backend verifies that binding at preparation and append.
-Custom sources provide explicit `codec` and optional `renderer`.
-
-`channel.sse()` is the high-level form of `channel.wrap(...)` followed by
-`subscription.sse()`. Both complete backend preflight before returning. Durable SSE
-IDs are committed channel sequence numbers and support exclusive `Last-Event-ID`
-replay. Passing a pre-encoded Runtime SSE body is rejected.
-
-Its `after` argument accepts `int`, `None`, or a zero-argument synchronous callback
-returning `int | None`. The callback runs once before durable preparation, so parsing a
-request cursor remains pre-response work. Callback errors and invalid results close the
-unclaimed source. Lower-level `wrap()`, `validate_cursor()`, `wrap_recoverable()`, and
-backend APIs continue to accept only a concrete `int | None`.
-
-## Principal coordination
-
-Use a coordinator when runs for the same application principal must serialize:
+Committed events can be read without handling encoded bytes:
 
 ```python
-from tinkerfin import InMemoryRunCoordinator, TinkerFin
-
-coordinator = InMemoryRunCoordinator(key_resolver=lambda principal: principal)
-tinkerfin = TinkerFin(run_coordinator=coordinator)
-
-run = tinkerfin.run(source_factory, principal="user-1")
+latest = await channel.latest_seq(stream=stream_id)
+page = await channel.read(stream=stream_id, after=cursor, limit=1000)
+subscription = await channel.follow(stream=stream_id, run=run_id, after=cursor)
 ```
 
-`InMemoryRunCoordinator` is process-local. `RedisRunCoordinator` coordinates workers
-through leases. Coordination does not persist graph state and does not replace a
-LangGraph checkpointer.
+`read()` and `follow()` return `DecodedMessage` values. The Channel validates the
+persisted codec before decoding; an explicit codec or a profile already inferred in
+the current process is required. `follow()` also binds the authoritative durable
+generation before returning its subscription.
 
-## Sandbox integration
+## Coordination and ownership
 
-Sandbox allocation is independent from Runtime. The host resolves its application key,
-obtains a backend from `tinkerfin-sandbox`, injects it while constructing the graph,
-and then binds each invocation through `TinkerFin.run(...)`. Runtime never owns or
-closes the Sandbox manager.
+Without a coordinator, `principal` must be `None`. A configured coordinator requires a
+principal for every Runtime. Coordination serializes application principals; it does
+not persist Graph state or replace a LangGraph checkpointer.
+
+The Definition borrows every object passed to `create_deep_agent(...)`. Runtime does
+not open or close models, stores, checkpointers, Sandbox managers, or coordinators.
+
+## Low-level sources
+
+`TinkerFin.run(...)` remains available for custom asynchronous sources and existing
+integrations. Deep Agents callers normally use `create_deep_agent(...).new/new_agui`.
+
+## IDE signatures
+
+Published `.pyi` files are generated from the installed Deep Agents and LangGraph
+source:
+
+```bash
+uv run python packages/tinkerfin/scripts/generate_stubs.py
+uv run python packages/tinkerfin/scripts/generate_stubs.py --check
+```
 
 ## Related documentation
 

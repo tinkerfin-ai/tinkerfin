@@ -5,6 +5,7 @@ import json
 import pytest
 from ag_ui.core import (
     RawEvent,
+    RunAgentInput,
     RunErrorEvent,
     RunFinishedEvent,
     RunStartedEvent,
@@ -14,6 +15,20 @@ from langchain_core.messages import AIMessageChunk, ToolMessage
 
 from tinkerfin_agui_adapter import DeepAgentAgUiAdapter, astream_events
 from tinkerfin_agui_adapter.ids import ScopedIdCodec
+
+
+def _run_input() -> RunAgentInput:
+    return RunAgentInput.model_validate(
+        {
+            "threadId": "thread-1",
+            "runId": "run-1",
+            "state": {},
+            "messages": [],
+            "tools": [],
+            "context": [],
+            "forwardedProps": {},
+        }
+    )
 
 
 def _run_id() -> str:
@@ -471,10 +486,7 @@ async def test_task_error_does_not_create_a_second_main_terminal() -> None:
         yield _task(phase="result", secret="result")
 
     events = [
-        event
-        async for event in astream_events(
-            thread_id="thread-1", run_id="run-1", parts=parts()
-        )
+        event async for event in astream_events(parts=parts(), run_input=_run_input())
     ]
 
     assert len([event for event in events if isinstance(event, RunStartedEvent)]) == 1

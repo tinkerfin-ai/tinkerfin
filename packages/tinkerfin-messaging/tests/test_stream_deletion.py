@@ -70,6 +70,8 @@ def test_public_stream_deletion_contract_is_exposed() -> None:
     delete_stream = MessagingBackend.delete_stream
 
     assert inspect.iscoroutinefunction(delete_stream)
+    assert inspect.iscoroutinefunction(MessagingBackend.bind_follow)
+    assert inspect.iscoroutinefunction(messaging_api.MessageChannel.follow)
     assert issubclass(messaging_api.StreamDeleted, messaging_api.MessagingError)
     assert issubclass(
         messaging_api.StreamDeleteConflict,

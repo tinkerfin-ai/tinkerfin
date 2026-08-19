@@ -6,9 +6,10 @@ import asyncio
 import logging
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable
 from contextlib import aclosing
+from functools import wraps
 from typing import cast
 
-from ag_ui.core import BaseEvent
+from ag_ui.core import BaseEvent, RunAgentInput
 
 from .adapter import DeepAgentAgUiAdapter
 from .lifecycle import AgUiLifecycleEventFactory
@@ -35,12 +36,10 @@ async def _close_upstream(
         raise
 
 
-async def astream_events(
+async def _astream_events(
     parts: AsyncIterable[object],
     *,
-    thread_id: str,
-    run_id: str,
-    parent_run_id: str | None = None,
+    run_input: RunAgentInput,
     expose_reasoning_events: bool = False,
     expose_subagent_events: bool = True,
     prior_tool_call_ids: frozenset[str] = frozenset(),
@@ -71,9 +70,7 @@ async def astream_events(
             `debug`, and `custom` v2 parts produced under the Deep Agents profile,
             with subgraph provenance supplied by native task starts rather than
             arbitrary LangGraph namespace inference.
-        thread_id: AG-UI conversation identity supplied by the transport host.
-        run_id: AG-UI main-run identity supplied by the transport host.
-        parent_run_id: Optional AG-UI parent-run identity supplied by the host.
+        run_input: Complete AG-UI request supplied by the transport host.
         expose_reasoning_events: Emit supported reasoning events when true.
         expose_subagent_events: Emit events derived from non-root namespaces when true.
         prior_tool_call_ids: Native Tool call IDs already emitted before resume.
@@ -82,29 +79,18 @@ async def astream_events(
         Validated AG-UI events in protocol order.
     """
 
-    for name, value in (("thread_id", thread_id), ("run_id", run_id)):
-        if not isinstance(value, str):
-            raise TypeError(f"{name} must be a string")
-        if not value or value != value.strip():
-            raise ValueError(f"{name} must be non-blank without surrounding whitespace")
-    if parent_run_id is not None:
-        if not isinstance(parent_run_id, str):
-            raise TypeError("parent_run_id must be a string or None")
-        if not parent_run_id or parent_run_id != parent_run_id.strip():
-            raise ValueError(
-                "parent_run_id must be non-blank without surrounding whitespace"
-            )
+    lifecycle = AgUiLifecycleEventFactory()
+    lifecycle.validate_run_input(run_input)
     if not isinstance(expose_reasoning_events, bool):
         raise TypeError("expose_reasoning_events must be a bool")
     if not isinstance(expose_subagent_events, bool):
         raise TypeError("expose_subagent_events must be a bool")
     adapter = DeepAgentAgUiAdapter(
-        run_id,
+        run_input.run_id,
         expose_reasoning_events=expose_reasoning_events,
         expose_subagent_events=expose_subagent_events,
         prior_tool_call_ids=prior_tool_call_ids,
     )
-    lifecycle = AgUiLifecycleEventFactory()
     upstream = aiter(parts)
 
     async def converted() -> AsyncIterator[BaseEvent]:
@@ -131,11 +117,7 @@ async def astream_events(
 
         try:
             started = True
-            yield lifecycle.started(
-                thread_id=thread_id,
-                run_id=run_id,
-                parent_run_id=parent_run_id,
-            )
+            yield lifecycle.started(run_input=run_input)
             async for part in upstream:
                 for event in adapter.process(part):
                     yield event
@@ -144,8 +126,8 @@ async def astream_events(
                 yield event
             terminal = True
             yield lifecycle.finished(
-                thread_id=thread_id,
-                run_id=run_id,
+                thread_id=run_input.thread_id,
+                run_id=run_input.run_id,
                 outcome=adapter.main_outcome(),
             )
         except asyncio.CancelledError as error:
@@ -172,7 +154,7 @@ async def astream_events(
             if started and not terminal:
                 terminal = True
                 yield lifecycle.failed(
-                    run_id=run_id,
+                    run_id=run_input.run_id,
                     message="Agent run failed",
                     code="runtime_error",
                 )
@@ -186,3 +168,24 @@ async def astream_events(
     async with aclosing(batched):
         async for event in batched:
             yield event
+
+
+@wraps(_astream_events)
+def astream_events(
+    parts: AsyncIterable[object],
+    *,
+    run_input: RunAgentInput,
+    expose_reasoning_events: bool = False,
+    expose_subagent_events: bool = True,
+    prior_tool_call_ids: frozenset[str] = frozenset(),
+) -> AsyncIterator[BaseEvent]:
+    """Snapshot caller input before returning the single-use conversion stream."""
+
+    AgUiLifecycleEventFactory.validate_run_input(run_input)
+    return _astream_events(
+        parts,
+        run_input=run_input.model_copy(deep=True),
+        expose_reasoning_events=expose_reasoning_events,
+        expose_subagent_events=expose_subagent_events,
+        prior_tool_call_ids=prior_tool_call_ids,
+    )

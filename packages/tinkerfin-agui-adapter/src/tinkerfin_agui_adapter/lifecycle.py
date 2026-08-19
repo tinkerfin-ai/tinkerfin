@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from ag_ui.core import (
     BaseEvent,
+    RunAgentInput,
     RunErrorEvent,
     RunFinishedEvent,
     RunFinishedInterruptOutcome,
@@ -15,7 +16,7 @@ from .contracts import AgentRunOutcome
 
 
 class AgUiLifecycleEventFactory:
-    """Build exactly-one-owner main lifecycle events from explicit identity.
+    """Build exactly-one-owner main lifecycle events from complete caller input.
 
     The factory is stateless: it does not decide terminal ownership, access a
     graph or checkpointer, or send events over a transport. Callers must emit a
@@ -26,17 +27,39 @@ class AgUiLifecycleEventFactory:
     def started(
         self,
         *,
-        thread_id: str,
-        run_id: str,
-        parent_run_id: str | None = None,
+        run_input: RunAgentInput,
     ) -> BaseEvent:
-        """Build the main start event without fabricating an AG-UI input."""
+        """Build the main start event from the caller's complete AG-UI input."""
 
+        self.validate_run_input(run_input)
         return RunStartedEvent(
-            thread_id=thread_id,
-            run_id=run_id,
-            parent_run_id=parent_run_id,
+            thread_id=run_input.thread_id,
+            run_id=run_input.run_id,
+            parent_run_id=run_input.parent_run_id,
+            input=run_input.model_copy(deep=True),
         )
+
+    @staticmethod
+    def validate_run_input(run_input: RunAgentInput) -> None:
+        """Reject invalid AG-UI identity before a runtime performs side effects."""
+
+        if not isinstance(run_input, RunAgentInput):
+            raise TypeError("run_input must be a RunAgentInput")
+        for name, value in (
+            ("thread_id", run_input.thread_id),
+            ("run_id", run_input.run_id),
+        ):
+            if not value or value != value.strip():
+                raise ValueError(
+                    f"{name} must be non-blank without surrounding whitespace"
+                )
+        parent_run_id = run_input.parent_run_id
+        if parent_run_id is not None and (
+            not parent_run_id or parent_run_id != parent_run_id.strip()
+        ):
+            raise ValueError(
+                "parent_run_id must be non-blank without surrounding whitespace"
+            )
 
     def finished(
         self,

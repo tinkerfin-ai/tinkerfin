@@ -46,6 +46,10 @@ def test_top_level_exposes_the_stateless_runtime_contract() -> None:
         "AgUiNativeStreamConfigurationError",
         "AgUiNativeStreamInvocation",
         "AgUiEventStream",
+        "AgUiResumeBinding",
+        "DeepAgentAgUiRuntime",
+        "DeepAgentDefinition",
+        "DeepAgentRuntime",
         "EventObserver",
         "GraphRunStream",
         "InMemoryRunCoordinator",
@@ -110,9 +114,7 @@ def test_source_binding_keeps_graph_arguments_at_the_factory_call_site() -> None
     assert tuple(native_parameters) == ("self",)
     assert tuple(agui_parameters) == (
         "self",
-        "thread_id",
-        "run_id",
-        "parent_run_id",
+        "run_input",
         "timeout",
         "settlement_timeout",
         "expose_reasoning_events",

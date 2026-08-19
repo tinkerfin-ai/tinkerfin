@@ -6,6 +6,7 @@ from typing import cast
 from uuid import NAMESPACE_URL, uuid5
 
 import pytest
+from ag_ui.core import RunAgentInput
 from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, MessagesState, StateGraph
@@ -14,14 +15,15 @@ from pydantic import SecretStr
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from tinkerfin import AgUiNativeStreamConfig, AgUiResumeBinding, TinkerFin
 from tinkerfin.coordination import InMemoryRunCoordinator
-from tinkerfin.runtime import TinkerFin
+from tinkerfin_agui_adapter.ids import ScopedIdCodec
 from tinkerfin_messaging.agui import AgUiCodec
 from tinkerfin_messaging.backend import MemoryBackend
 from tinkerfin_messaging.errors import RunAlreadyActive
 from tinkerfin_messaging.messaging import Messaging
 from tinkerfin_studio.agent.factory import ConversationAgentFactory
-from tinkerfin_studio.api.errors import BusinessException
+from tinkerfin_studio.api.errors import BusinessException, ConversationErrorCode
 from tinkerfin_studio.auth.types import UserContext
 from tinkerfin_studio.conversation.coordinator import (
     ConversationProjectionCoordinator,
@@ -56,6 +58,159 @@ class ProjectionProbe:
     async def reconcile(self, *, thread_pk: int, stream: str) -> int:
         del thread_pk, stream
         return 0
+
+
+def _persisted_tool_interrupt(
+    *,
+    interrupt_id: str,
+    tool_call_id: str,
+    tool_name: str,
+    args: dict[str, object],
+    allowed_decisions: list[str],
+    message: str,
+) -> dict[str, object]:
+    """构造 adapter 已验证并由服务端持久化的 Tool interrupt"""
+
+    langgraph_value = {
+        "action_requests": [
+            {
+                "name": tool_name,
+                "args": args,
+                "description": message,
+            }
+        ],
+        "review_configs": [
+            {
+                "action_name": tool_name,
+                "allowed_decisions": allowed_decisions,
+            }
+        ],
+    }
+    return {
+        "id": interrupt_id,
+        "reason": "tool_call",
+        "message": message,
+        "toolCallId": ScopedIdCodec().encode("tool", (), tool_call_id),
+        "metadata": {
+            "langgraphValue": langgraph_value,
+            "deepagents": {
+                "nativeInterruptId": interrupt_id,
+                "actionIndex": 0,
+                "toolName": tool_name,
+                "allowedDecisions": allowed_decisions,
+                "originalArgs": args,
+            },
+        },
+    }
+
+
+def _patch_agent_graph(
+    monkeypatch,
+    graph,
+    *,
+    definition_calls: list[None] | None = None,
+) -> None:
+    """让 Studio Factory 使用测试 Graph，同时保留真实 façade 与 Runtime"""
+
+    async def create_definition(
+        factory: ConversationAgentFactory,
+        *,
+        user_id: int,
+        model_config,
+    ):
+        del user_id, model_config
+        if definition_calls is not None:
+            definition_calls.append(None)
+
+        def new_agui(
+            *,
+            principal: str | None = None,
+            run_input: RunAgentInput,
+            resume: AgUiResumeBinding | None = None,
+            expose_reasoning_events: bool = False,
+            expose_subagent_events: bool = True,
+            **options,
+        ):
+            del options
+
+            class Runtime:
+                def astream(self, graph_input, config=None):
+                    if resume is not None:
+                        resume.validate_command(graph_input)
+                    invocation = AgUiNativeStreamConfig().bind(
+                        graph.astream,
+                        graph_input,
+                        config=config,
+                    )
+                    run = factory._tinkerfin.run(
+                        invocation,
+                        principal=principal,
+                    )
+                    return run.astream_agui(
+                        run_input=run_input,
+                        expose_reasoning_events=expose_reasoning_events,
+                        expose_subagent_events=expose_subagent_events,
+                        prior_tool_call_ids=(
+                            frozenset()
+                            if resume is None
+                            else resume.prior_tool_call_ids
+                        ),
+                    )
+
+            return Runtime()
+
+        return SimpleNamespace(new_agui=new_agui)
+
+    monkeypatch.setattr(
+        ConversationAgentFactory,
+        "_create_definition",
+        create_definition,
+    )
+
+
+@pytest.mark.parametrize(
+    "prior_tool_call_ids",
+    [None, "not-a-list", ["tf:tool:valid-looking", 7]],
+)
+def test_persisted_resume_rejects_malformed_prior_tool_call_ids(
+    prior_tool_call_ids: object,
+) -> None:
+    request = ChatRequest.model_validate(
+        {
+            "threadId": "thread-1",
+            "runId": "run-resume",
+            "state": {},
+            "messages": [],
+            "tools": [],
+            "context": [],
+            "forwardedProps": {"model": "main", "mode": "default"},
+            "resume": [
+                {
+                    "interruptId": "interrupt-1",
+                    "status": "resolved",
+                    "payload": {"type": "approve"},
+                }
+            ],
+        }
+    )
+    run_input = RunAgentInput.model_validate(request.model_dump(by_alias=True))
+
+    with pytest.raises(BusinessException) as raised:
+        ConversationChatService._resume_input(
+            request,
+            run_input=run_input,
+            existing_config={
+                "resume_data": {"decisions": [{"type": "approve"}]},
+                **(
+                    {}
+                    if prior_tool_call_ids is None
+                    else {"prior_tool_call_ids": prior_tool_call_ids}
+                ),
+            },
+            interrupts=(),
+        )
+
+    assert raised.value.error_code is ConversationErrorCode.RESUME_REQUIRED
 
 
 async def test_non_empty_thread_id_must_belong_to_the_current_user(
@@ -143,16 +298,12 @@ async def test_chat_does_not_filter_optional_deep_agent_state_channels(
     builder.add_edge("answer", END)
     graph = builder.compile()
 
-    async def create_graph(
-        _factory: ConversationAgentFactory,
-        *,
-        user_id: int,
-        model_config,
-    ):
-        del user_id, model_config
-        return graph
-
-    monkeypatch.setattr(ConversationAgentFactory, "create", create_graph)
+    definition_calls: list[None] = []
+    _patch_agent_graph(
+        monkeypatch,
+        graph,
+        definition_calls=definition_calls,
+    )
     backend = MemoryBackend()
     probe = ProjectionProbe()
     async with Messaging(backend=backend) as messaging:
@@ -211,6 +362,7 @@ async def test_chat_does_not_filter_optional_deep_agent_state_channels(
         assert len(probe.runs) == len(frames)
         retried = await service.start(chat_request, last_event_id="0")
         retried_frames = [chunk async for chunk in retried.body]
+        assert len(definition_calls) == 1
         assert len(probe.runs) == len(frames)
         stored_threads = await ConversationRepository(session).list_threads(
             user_id=7,
@@ -267,16 +419,7 @@ async def test_concurrent_empty_thread_retries_share_one_thread_and_run(
     builder.add_edge("answer", END)
     graph = builder.compile()
 
-    async def create_graph(
-        _factory: ConversationAgentFactory,
-        *,
-        user_id: int,
-        model_config,
-    ):
-        del user_id, model_config
-        return graph
-
-    monkeypatch.setattr(ConversationAgentFactory, "create", create_graph)
+    _patch_agent_graph(monkeypatch, graph)
     request = ChatRequest.model_validate(
         {
             "threadId": "",
@@ -506,11 +649,14 @@ async def test_concurrent_resume_claims_one_interrupt_for_exactly_one_run(
         subgraphs=True,
     )
     public_interrupt_id = checkpoint.interrupts[0].id
-    request_json = {
-        "id": public_interrupt_id,
-        "reason": "tool_call",
-        "message": "需要审批写入文件",
-    }
+    request_json = _persisted_tool_interrupt(
+        interrupt_id=public_interrupt_id,
+        tool_call_id="call-write-audit",
+        tool_name="write_file",
+        args={"file_path": "/audit.txt", "content": "approved"},
+        allowed_decisions=["approve", "reject"],
+        message="写入审批审计文件",
+    )
     async with database.session() as setup_session:
         setup_session.add(
             ConversationInterrupt(
@@ -530,39 +676,13 @@ async def test_concurrent_resume_claims_one_interrupt_for_exactly_one_run(
         )
         await setup_session.commit()
 
-    checkpoint_reads = 0
-    first_checkpoint_read = asyncio.Event()
-    second_checkpoint_read = asyncio.Event()
-    release_stale_checkpoint = asyncio.Event()
-    original_get_state = graph.aget_state
+    async def prohibit_checkpoint_read(config, *, subgraphs: bool = False):
+        del config, subgraphs
+        raise AssertionError("首次 resume 不得重新读取 Graph checkpoint")
 
-    async def observe_get_state(config, *, subgraphs: bool = False):
-        nonlocal checkpoint_reads
-        checkpoint_reads += 1
-        captured = await original_get_state(config, subgraphs=subgraphs)
-        if checkpoint_reads == 1:
-            first_checkpoint_read.set()
-            try:
-                await asyncio.wait_for(second_checkpoint_read.wait(), timeout=0.2)
-            except TimeoutError:
-                pass
-        elif checkpoint_reads == 2:
-            second_checkpoint_read.set()
-            await release_stale_checkpoint.wait()
-        return captured
+    monkeypatch.setattr(graph, "aget_state", prohibit_checkpoint_read)
 
-    monkeypatch.setattr(graph, "aget_state", observe_get_state)
-
-    async def create_graph(
-        _factory: ConversationAgentFactory,
-        *,
-        user_id: int,
-        model_config,
-    ):
-        del user_id, model_config
-        return graph
-
-    monkeypatch.setattr(ConversationAgentFactory, "create", create_graph)
+    _patch_agent_graph(monkeypatch, graph)
     requests = tuple(
         ChatRequest.model_validate(
             {
@@ -612,25 +732,19 @@ async def test_concurrent_resume_claims_one_interrupt_for_exactly_one_run(
                 ConversationChatService(first_session, user=user, resources=resources),
                 ConversationChatService(second_session, user=user, resources=resources),
             )
-            winner_task = asyncio.create_task(
+            prepared = await asyncio.wait_for(
                 services[0].start(requests[0], last_event_id="0"),
-                name="test-resume-claim-winner",
+                timeout=5,
             )
-            await asyncio.wait_for(first_checkpoint_read.wait(), timeout=2)
-            loser_task = asyncio.create_task(
-                services[1].start(requests[1], last_event_id="0"),
-                name="test-resume-claim-loser",
-            )
-            prepared = await asyncio.wait_for(winner_task, timeout=2)
-            frames = await _collect_frames(prepared.body)
-            release_stale_checkpoint.set()
             loser_results = await asyncio.wait_for(
-                asyncio.gather(loser_task, return_exceptions=True),
-                timeout=2,
+                asyncio.gather(
+                    services[1].start(requests[1], last_event_id="0"),
+                    return_exceptions=True,
+                ),
+                timeout=5,
             )
+            frames = await _collect_frames(prepared.body)
             loser = loser_results[0]
-            if not isinstance(loser, BaseException):
-                await _collect_frames(loser.body)
             assert isinstance(loser, BusinessException)
             assert loser.error_code.http_status == 409
             assert loser.message == "该审批已被另一次恢复运行认领"
@@ -648,7 +762,6 @@ async def test_concurrent_resume_claims_one_interrupt_for_exactly_one_run(
     assert events[-1]["outcome"]["type"] == "interrupt"
     assert events[-1]["outcome"]["interrupts"][0]["id"] != public_interrupt_id
     assert retried_frames == frames
-    assert checkpoint_reads == 1
     assert [stage for stage, _decision in executed_decisions] == ["first"]
     async with database.session() as verification_session:
         stored_interrupt = await verification_session.scalar(
@@ -670,11 +783,11 @@ async def test_concurrent_resume_claims_one_interrupt_for_exactly_one_run(
     assert all(run.run_id != loser_run_id for run in stored_runs)
 
 
-async def test_concurrent_same_run_resume_attaches_without_remapping_checkpoint(
+async def test_concurrent_same_run_resume_attaches_without_reopening_agent(
     database: Database,
     monkeypatch,
 ) -> None:
-    """同 runId 并发恢复必须只消费一次 checkpoint 并返回同一事件流"""
+    """同 runId 并发恢复必须只执行一次 Agent 并返回同一事件流"""
 
     user = UserContext(
         user_id=7,
@@ -769,6 +882,14 @@ async def test_concurrent_same_run_resume_attaches_without_remapping_checkpoint(
     )
     interrupt_id = checkpoint.interrupts[0].id
     now = datetime.now(UTC).replace(tzinfo=None)
+    request_json = _persisted_tool_interrupt(
+        interrupt_id=interrupt_id,
+        tool_call_id="call-same-resume",
+        tool_name="write_file",
+        args={"file_path": "/same.txt", "content": "ok"},
+        allowed_decisions=["approve", "reject"],
+        message="写入同 run 文件",
+    )
     async with database.session() as setup_session:
         setup_session.add(
             ConversationInterrupt(
@@ -779,7 +900,7 @@ async def test_concurrent_same_run_resume_attaches_without_remapping_checkpoint(
                 status="pending",
                 reason="tool_call",
                 message="确认写入",
-                request_json={"id": interrupt_id, "reason": "tool_call"},
+                request_json=request_json,
                 resume_json=None,
                 created_at=now,
                 resolved_at=None,
@@ -788,10 +909,6 @@ async def test_concurrent_same_run_resume_attaches_without_remapping_checkpoint(
         )
         await setup_session.commit()
 
-    checkpoint_reads = 0
-    first_checkpoint_read = asyncio.Event()
-    release_second_checkpoint = asyncio.Event()
-    original_get_state = graph.aget_state
     initial_run_reads = 0
     both_initial_run_reads = asyncio.Event()
     original_get_run = ConversationRepository.get_run
@@ -830,16 +947,11 @@ async def test_concurrent_same_run_resume_attaches_without_remapping_checkpoint(
             interrupt_ids=interrupt_ids,
         )
 
-    async def observe_get_state(config, *, subgraphs: bool = False):
-        nonlocal checkpoint_reads
-        checkpoint_reads += 1
-        if checkpoint_reads == 1:
-            first_checkpoint_read.set()
-        else:
-            await release_second_checkpoint.wait()
-        return await original_get_state(config, subgraphs=subgraphs)
+    async def prohibit_checkpoint_read(config, *, subgraphs: bool = False):
+        del config, subgraphs
+        raise AssertionError("首次 resume 不得重新读取 Graph checkpoint")
 
-    monkeypatch.setattr(graph, "aget_state", observe_get_state)
+    monkeypatch.setattr(graph, "aget_state", prohibit_checkpoint_read)
     monkeypatch.setattr(ConversationRepository, "get_run", observe_get_run)
     monkeypatch.setattr(
         ConversationRepository,
@@ -847,16 +959,7 @@ async def test_concurrent_same_run_resume_attaches_without_remapping_checkpoint(
         observe_claim,
     )
 
-    async def create_graph(
-        _factory: ConversationAgentFactory,
-        *,
-        user_id: int,
-        model_config,
-    ):
-        del user_id, model_config
-        return graph
-
-    monkeypatch.setattr(ConversationAgentFactory, "create", create_graph)
+    _patch_agent_graph(monkeypatch, graph)
     request = ChatRequest.model_validate(
         {
             "threadId": thread_id,
@@ -903,38 +1006,23 @@ async def test_concurrent_same_run_resume_attaches_without_remapping_checkpoint(
                 ConversationChatService(first_session, user=user, resources=resources),
                 ConversationChatService(second_session, user=user, resources=resources),
             )
-            tasks = (
-                asyncio.create_task(
+            results = await asyncio.wait_for(
+                asyncio.gather(
                     services[0].start(request, last_event_id="0"),
-                    name="test-same-resume-first",
-                ),
-                asyncio.create_task(
                     services[1].start(request, last_event_id="0"),
-                    name="test-same-resume-second",
+                    return_exceptions=True,
                 ),
+                timeout=5,
             )
-            await asyncio.wait_for(first_checkpoint_read.wait(), timeout=2)
-            done, _pending = await asyncio.wait(
-                tasks,
-                timeout=2,
-                return_when=asyncio.FIRST_COMPLETED,
+            first, second = results
+            assert not isinstance(first, BaseException)
+            assert not isinstance(second, BaseException)
+            first_frames, second_frames = await asyncio.gather(
+                _collect_frames(first.body),
+                _collect_frames(second.body),
             )
-            assert done
-            winner_task = next(iter(done))
-            follower_task = tasks[1] if winner_task is tasks[0] else tasks[0]
-            winner = await winner_task
-            winner_frames = await _collect_frames(winner.body)
-            release_second_checkpoint.set()
-            follower_results = await asyncio.wait_for(
-                asyncio.gather(follower_task, return_exceptions=True),
-                timeout=2,
-            )
-            follower = follower_results[0]
-            assert not isinstance(follower, BaseException)
-            follower_frames = await _collect_frames(follower.body)
 
-    assert follower_frames == winner_frames
-    assert checkpoint_reads == 1
+    assert second_frames == first_frames
     assert len(executed_decisions) == 1
     async with database.session() as verification_session:
         stored_runs = list(
@@ -975,6 +1063,14 @@ async def test_resume_preflight_failure_releases_interrupt_claim(
     )
     now = datetime.now(UTC).replace(tzinfo=None)
     interrupt_id = "interrupt-preflight"
+    request_json = _persisted_tool_interrupt(
+        interrupt_id=interrupt_id,
+        tool_call_id="call-preflight",
+        tool_name="write_file",
+        args={"file_path": "/audit.txt", "content": "ok"},
+        allowed_decisions=["approve", "reject"],
+        message="写入审计文件",
+    )
     session.add(
         ConversationInterrupt(
             conversation_thread_id=thread.id,
@@ -984,7 +1080,7 @@ async def test_resume_preflight_failure_releases_interrupt_claim(
             status="pending",
             reason="tool_call",
             message="确认写入",
-            request_json={"id": interrupt_id, "reason": "tool_call"},
+            request_json=request_json,
             resume_json=None,
             created_at=now,
             resolved_at=None,
@@ -992,50 +1088,10 @@ async def test_resume_preflight_failure_releases_interrupt_claim(
         )
     )
     await repository.commit()
-    snapshot = SimpleNamespace(
-        config={"configurable": {"checkpoint_ns": ""}},
-        values={
-            "messages": [
-                AIMessage(
-                    content="",
-                    id="assistant-preflight",
-                    tool_calls=[
-                        {
-                            "name": "write_file",
-                            "args": {"file_path": "/audit.txt", "content": "ok"},
-                            "id": "call-preflight",
-                            "type": "tool_call",
-                        }
-                    ],
-                )
-            ]
-        },
-        tasks=(),
-        interrupts=(
-            SimpleNamespace(
-                id=interrupt_id,
-                value={
-                    "action_requests": [
-                        {
-                            "name": "write_file",
-                            "args": {"file_path": "/audit.txt", "content": "ok"},
-                            "description": "写入审计文件",
-                        }
-                    ],
-                    "review_configs": [
-                        {
-                            "action_name": "write_file",
-                            "allowed_decisions": ["approve", "reject"],
-                        }
-                    ],
-                },
-            ),
-        ),
-    )
 
     async def get_state(config, *, subgraphs: bool = False):
         del config, subgraphs
-        return snapshot
+        raise AssertionError("首次 resume 不得重新读取 Graph checkpoint")
 
     async def stream_events(*args, **kwargs):
         del args, kwargs
@@ -1044,16 +1100,7 @@ async def test_resume_preflight_failure_releases_interrupt_claim(
 
     graph = SimpleNamespace(aget_state=get_state, astream=stream_events)
 
-    async def create_graph(
-        _factory: ConversationAgentFactory,
-        *,
-        user_id: int,
-        model_config,
-    ):
-        del user_id, model_config
-        return graph
-
-    monkeypatch.setattr(ConversationAgentFactory, "create", create_graph)
+    _patch_agent_graph(monkeypatch, graph)
 
     class RejectingChannel:
         async def sse(self, *args, **kwargs):
@@ -1127,6 +1174,230 @@ async def test_resume_preflight_failure_releases_interrupt_claim(
     assert stored_run is None
 
 
+async def test_resume_requires_every_pending_interrupt_before_creating_run(
+    session: AsyncSession,
+) -> None:
+    """遗漏任一 native interrupt group 时不得认领部分审批或创建 run"""
+
+    await AgentModelService(AgentModelRepository(session)).upsert(
+        AgentModelWrite(
+            model_id="main",
+            display_name="Main",
+            provider="openai",
+            model_name="provider-main",
+            base_url="https://models.example.test/v1",
+            api_key=SecretStr("secret"),
+            enabled=True,
+            is_default=True,
+        )
+    )
+    repository = ConversationRepository(session)
+    thread = await repository.create_thread(
+        user_id=7,
+        thread_id="thread-incomplete-resume",
+        title="审批覆盖",
+        model_id="main",
+    )
+    now = datetime.now(UTC).replace(tzinfo=None)
+    first_id = "interrupt-first"
+    second_id = "interrupt-second"
+    session.add_all(
+        (
+            ConversationInterrupt(
+                conversation_thread_id=thread.id,
+                run_id="run-interrupted",
+                resolved_run_id=None,
+                interrupt_id=first_id,
+                status="pending",
+                reason="tool_call",
+                message="确认第一次写入",
+                request_json=_persisted_tool_interrupt(
+                    interrupt_id=first_id,
+                    tool_call_id="call-first",
+                    tool_name="write_file",
+                    args={"file_path": "/first.txt", "content": "first"},
+                    allowed_decisions=["approve", "reject"],
+                    message="确认第一次写入",
+                ),
+                resume_json=None,
+                created_at=now,
+                resolved_at=None,
+                updated_at=now,
+            ),
+            ConversationInterrupt(
+                conversation_thread_id=thread.id,
+                run_id="run-interrupted",
+                resolved_run_id=None,
+                interrupt_id=second_id,
+                status="pending",
+                reason="tool_call",
+                message="确认第二次写入",
+                request_json=_persisted_tool_interrupt(
+                    interrupt_id=second_id,
+                    tool_call_id="call-second",
+                    tool_name="write_file",
+                    args={"file_path": "/second.txt", "content": "second"},
+                    allowed_decisions=["approve", "reject"],
+                    message="确认第二次写入",
+                ),
+                resume_json=None,
+                created_at=now,
+                resolved_at=None,
+                updated_at=now,
+            ),
+        )
+    )
+    await repository.commit()
+    thread_pk = thread.id
+
+    class UnexpectedChannel:
+        async def sse(self, *args, **kwargs):
+            del args, kwargs
+            raise AssertionError("不完整 resume 不得进入 Messaging")
+
+    resources = cast(
+        ApplicationResources,
+        SimpleNamespace(
+            settings=SimpleNamespace(tavily_api_key=None),
+            agent_persistence=object(),
+            sandbox_manager=object(),
+            tinkerfin=TinkerFin(
+                run_coordinator=InMemoryRunCoordinator[str](
+                    key_resolver=lambda principal: principal
+                )
+            ),
+            conversation_channel=UnexpectedChannel(),
+            conversation_projector=ProjectionProbe(),
+        ),
+    )
+    request = ChatRequest.model_validate(
+        {
+            "threadId": thread.thread_id,
+            "runId": "run-incomplete-resume",
+            "state": {},
+            "messages": [],
+            "tools": [],
+            "context": [],
+            "forwardedProps": {"model": "main", "mode": "default"},
+            "resume": [
+                {
+                    "interruptId": first_id,
+                    "status": "resolved",
+                    "payload": {"type": "approve"},
+                }
+            ],
+        }
+    )
+
+    with pytest.raises(BusinessException) as caught:
+        await ConversationChatService(
+            session,
+            user=UserContext(
+                user_id=7,
+                username="alice",
+                display_name="Alice",
+                roles=(),
+                disabled=False,
+            ),
+            resources=resources,
+        ).start(request, last_event_id="0")
+
+    assert caught.value.message == "resume 必须完整覆盖当前全部待审批项"
+    stored = list(
+        await session.scalars(
+            select(ConversationInterrupt)
+            .where(ConversationInterrupt.conversation_thread_id == thread_pk)
+            .order_by(ConversationInterrupt.id)
+        )
+    )
+    stored_run = await repository.get_run(
+        thread_pk=thread_pk,
+        run_id=request.run_id,
+    )
+    assert [item.interrupt_id for item in stored] == [first_id, second_id]
+    assert all(item.status == "pending" for item in stored)
+    assert all(item.resolved_run_id is None for item in stored)
+    assert stored_run is None
+
+    class EmptyBody:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self) -> bytes:
+            raise StopAsyncIteration
+
+        async def aclose(self) -> None:
+            return None
+
+    class ClosingChannel:
+        async def sse(self, source, *args, **kwargs):
+            del args, kwargs
+            await source.aclose()
+            return EmptyBody()
+
+    full_request = ChatRequest.model_validate(
+        {
+            "threadId": "thread-incomplete-resume",
+            "runId": "run-complete-resume",
+            "state": {},
+            "messages": [],
+            "tools": [],
+            "context": [],
+            "forwardedProps": {"model": "main", "mode": "default"},
+            "resume": [
+                {
+                    "interruptId": second_id,
+                    "status": "resolved",
+                    "payload": {"type": "approve"},
+                },
+                {
+                    "interruptId": first_id,
+                    "status": "resolved",
+                    "payload": {"type": "reject"},
+                },
+            ],
+        }
+    )
+    complete_resources = cast(
+        ApplicationResources,
+        SimpleNamespace(
+            settings=SimpleNamespace(tavily_api_key=None),
+            agent_persistence=object(),
+            sandbox_manager=object(),
+            tinkerfin=TinkerFin(
+                run_coordinator=InMemoryRunCoordinator[str](
+                    key_resolver=lambda principal: principal
+                )
+            ),
+            conversation_channel=ClosingChannel(),
+            conversation_projector=ProjectionProbe(),
+        ),
+    )
+
+    prepared = await ConversationChatService(
+        session,
+        user=UserContext(
+            user_id=7,
+            username="alice",
+            display_name="Alice",
+            roles=(),
+            disabled=False,
+        ),
+        resources=complete_resources,
+    ).start(full_request, last_event_id="0")
+    assert await _collect_frames(prepared.body) == []
+    complete_run = await repository.get_run(
+        thread_pk=thread_pk,
+        run_id=full_request.run_id,
+    )
+    assert complete_run is not None
+    assert complete_run.config_json is not None
+    assert complete_run.config_json["resume_data"] == {
+        first_id: {"decisions": [{"type": "reject"}]},
+        second_id: {"decisions": [{"type": "approve"}]},
+    }
+
+
 @pytest.mark.parametrize(
     ("sse_succeeds", "close_fails"),
     [(True, False), (True, True), (False, False)],
@@ -1160,6 +1431,14 @@ async def test_cancelled_preflight_waits_for_a_definitive_messaging_outcome(
     )
     now = datetime.now(UTC).replace(tzinfo=None)
     interrupt_id = f"interrupt-cancelled-preflight-{sse_succeeds}"
+    request_json = _persisted_tool_interrupt(
+        interrupt_id=interrupt_id,
+        tool_call_id="call-cancelled-preflight",
+        tool_name="write_file",
+        args={"file_path": "/cancelled.txt", "content": "ok"},
+        allowed_decisions=["approve", "reject"],
+        message="写入取消审计文件",
+    )
     session.add(
         ConversationInterrupt(
             conversation_thread_id=thread.id,
@@ -1169,7 +1448,7 @@ async def test_cancelled_preflight_waits_for_a_definitive_messaging_outcome(
             status="pending",
             reason="tool_call",
             message="确认写入",
-            request_json={"id": interrupt_id, "reason": "tool_call"},
+            request_json=request_json,
             resume_json=None,
             created_at=now,
             resolved_at=None,
@@ -1177,71 +1456,15 @@ async def test_cancelled_preflight_waits_for_a_definitive_messaging_outcome(
         )
     )
     await repository.commit()
-    snapshot = SimpleNamespace(
-        config={"configurable": {"checkpoint_ns": ""}},
-        values={
-            "messages": [
-                AIMessage(
-                    content="",
-                    id="assistant-cancelled-preflight",
-                    tool_calls=[
-                        {
-                            "name": "write_file",
-                            "args": {"file_path": "/cancelled.txt", "content": "ok"},
-                            "id": "call-cancelled-preflight",
-                            "type": "tool_call",
-                        }
-                    ],
-                )
-            ]
-        },
-        tasks=(),
-        interrupts=(
-            SimpleNamespace(
-                id=interrupt_id,
-                value={
-                    "action_requests": [
-                        {
-                            "name": "write_file",
-                            "args": {
-                                "file_path": "/cancelled.txt",
-                                "content": "ok",
-                            },
-                            "description": "写入取消审计文件",
-                        }
-                    ],
-                    "review_configs": [
-                        {
-                            "action_name": "write_file",
-                            "allowed_decisions": ["approve", "reject"],
-                        }
-                    ],
-                },
-            ),
-        ),
-    )
-
-    async def get_state(config, *, subgraphs: bool = False):
-        del config, subgraphs
-        return snapshot
 
     async def stream_events(*args, **kwargs):
         del args, kwargs
         if False:
             yield None
 
-    graph = SimpleNamespace(aget_state=get_state, astream=stream_events)
+    graph = SimpleNamespace(astream=stream_events)
 
-    async def create_graph(
-        _factory: ConversationAgentFactory,
-        *,
-        user_id: int,
-        model_config,
-    ):
-        del user_id, model_config
-        return graph
-
-    monkeypatch.setattr(ConversationAgentFactory, "create", create_graph)
+    _patch_agent_graph(monkeypatch, graph)
     entered = asyncio.Event()
     release = asyncio.Event()
 
@@ -1394,16 +1617,7 @@ async def test_delete_rejects_a_committed_run_before_messaging_preflight(
 
     graph = SimpleNamespace(astream=stream_events)
 
-    async def create_graph(
-        _factory: ConversationAgentFactory,
-        *,
-        user_id: int,
-        model_config,
-    ):
-        del user_id, model_config
-        return graph
-
-    monkeypatch.setattr(ConversationAgentFactory, "create", create_graph)
+    _patch_agent_graph(monkeypatch, graph)
     entered = asyncio.Event()
     release = asyncio.Event()
     delete_stream_calls = 0
@@ -1623,16 +1837,7 @@ async def test_delete_waits_for_completed_run_attachment_preflight(
 
     graph = SimpleNamespace(astream=stream_events)
 
-    async def create_graph(
-        _factory: ConversationAgentFactory,
-        *,
-        user_id: int,
-        model_config,
-    ):
-        del user_id, model_config
-        return graph
-
-    monkeypatch.setattr(ConversationAgentFactory, "create", create_graph)
+    _patch_agent_graph(monkeypatch, graph)
     entered = asyncio.Event()
     release = asyncio.Event()
     delete_stream_calls = 0
@@ -1808,16 +2013,7 @@ async def test_immediate_resume_reconciles_committed_interrupt_before_claim(
     builder.add_edge("review_write", END)
     graph = builder.compile(checkpointer=MemorySaver())
 
-    async def create_graph(
-        _factory: ConversationAgentFactory,
-        *,
-        user_id: int,
-        model_config,
-    ):
-        del user_id, model_config
-        return graph
-
-    monkeypatch.setattr(ConversationAgentFactory, "create", create_graph)
+    _patch_agent_graph(monkeypatch, graph)
     backend = MemoryBackend()
     probe = ProjectionProbe()
     async with Messaging(backend=backend) as messaging:
@@ -1883,8 +2079,7 @@ async def test_immediate_resume_reconciles_committed_interrupt_before_claim(
 
         projector = ConversationProjectionCoordinator(
             database=database,
-            backend=backend,
-            channel="studio-conversation-agui",
+            channel=channel,
         )
         resume_resources = cast(
             ApplicationResources,
@@ -1992,16 +2187,7 @@ async def test_cancel_waits_for_the_durable_cancelled_terminal(
     builder.add_edge("block", END)
     graph = builder.compile()
 
-    async def create_graph(
-        _factory: ConversationAgentFactory,
-        *,
-        user_id: int,
-        model_config,
-    ):
-        del user_id, model_config
-        return graph
-
-    monkeypatch.setattr(ConversationAgentFactory, "create", create_graph)
+    _patch_agent_graph(monkeypatch, graph)
     backend = MemoryBackend()
     probe = ProjectionProbe()
     user = UserContext(

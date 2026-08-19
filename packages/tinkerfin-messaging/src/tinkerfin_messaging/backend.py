@@ -156,6 +156,17 @@ class MessagingBackend(Protocol):
         limit: int = 100,
     ) -> tuple[MessageEnvelope, ...]: ...
 
+    async def bind_follow(
+        self,
+        *,
+        channel: str,
+        stream: str,
+        run: str,
+    ) -> BackendRunHandle:
+        """Bind a read-only follower to the run's authoritative generation."""
+
+        ...
+
     def follow(
         self,
         handle: BackendRunHandle,
@@ -524,6 +535,43 @@ class MemoryBackend(MessagingBackend):
                     for message in state.messages[after : after + limit]
                 )
 
+    async def bind_follow(
+        self,
+        *,
+        channel: str,
+        stream: str,
+        run: str,
+    ) -> BackendRunHandle:
+        """Bind one follower without creating a stream or attaching a producer."""
+
+        required_identifier("channel", channel)
+        required_identifier("stream", stream)
+        required_identifier("run", run)
+        channel_state = self._channels.get(channel)
+        if channel_state is None:
+            raise RunNotFound(run=run)
+        async with channel_state.lock:
+            state = channel_state.streams.get(stream)
+            if state is None:
+                raise RunNotFound(run=run)
+            async with state.condition:
+                if state.deleted:
+                    raise StreamDeleted(
+                        channel=channel,
+                        stream=stream,
+                        generation=state.generation,
+                    )
+                if run not in state.runs:
+                    raise RunNotFound(run=run)
+                return BackendRunHandle(
+                    channel=channel,
+                    stream=stream,
+                    run=run,
+                    owner_token=None,
+                    fence=None,
+                    generation=state.generation,
+                )
+
     def follow(
         self,
         handle: BackendRunHandle,
@@ -551,15 +599,15 @@ class MemoryBackend(MessagingBackend):
                     available_end = (
                         record.end_seq if is_terminal else len(state.messages)
                     )
+                    if is_terminal:
+                        terminal_status = record.status
+                        terminal_error = record.error
                     if cursor < available_end:
                         page = tuple(
                             message.model_copy(deep=True)
                             for message in state.messages[cursor:available_end]
                         )
-                    elif is_terminal:
-                        terminal_status = record.status
-                        terminal_error = record.error
-                    else:
+                    elif not is_terminal:
                         await state.condition.wait()
                         continue
 
@@ -567,13 +615,13 @@ class MemoryBackend(MessagingBackend):
                     for message in page:
                         cursor = message.seq
                         yield message
-                    continue
                 if terminal_status in {"failed", "owner_lost"}:
                     cause = terminal_error or RuntimeError(
                         f"Producer for run {handle.run!r} stopped"
                     )
                     raise RunProducerFailed(run=handle.run, cause=cause)
-                return
+                if terminal_status is not None:
+                    return
 
         return iterate()
 

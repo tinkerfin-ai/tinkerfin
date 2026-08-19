@@ -2387,6 +2387,8 @@ class DeepAgentAgUiAdapter:
                                 by_alias=True,
                             ),
                             "deepagents": {
+                                "nativeInterruptId": interrupt.id,
+                                "actionIndex": index,
                                 "toolName": action.name,
                                 "allowedDecisions": list(review.allowed_decisions),
                                 "originalArgs": action.args.root,

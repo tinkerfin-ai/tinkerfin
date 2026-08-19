@@ -454,35 +454,64 @@ class ConversationProjector:
         created_at: datetime,
         run_input: dict[str, object] | None,
     ) -> None:
-        if event.get("type") == "RUN_STARTED" and run_input is not None:
-            resume = run_input.get("resume")
-            if isinstance(resume, list):
-                for entry in resume:
-                    if not isinstance(entry, dict):
-                        continue
-                    interrupt_id = entry.get("interruptId")
-                    if not isinstance(interrupt_id, str):
-                        continue
-                    entity = await self._session.scalar(
-                        select(ConversationInterrupt).where(
-                            ConversationInterrupt.conversation_thread_id == thread_pk,
-                            ConversationInterrupt.interrupt_id == interrupt_id,
-                        )
+        event_type = event.get("type")
+        resume = run_input.get("resume") if run_input is not None else None
+        resume_entries = resume if isinstance(resume, list) else []
+        raw_event = event.get("rawEvent")
+        initialization_failed = (
+            isinstance(raw_event, dict)
+            and raw_event.get("initializationFailed") is True
+        )
+        if event_type == "RUN_ERROR" and (
+            event.get("code") == "runtime_initialization_error" or initialization_failed
+        ):
+            for entry in resume_entries:
+                if not isinstance(entry, dict):
+                    continue
+                interrupt_id = entry.get("interruptId")
+                if not isinstance(interrupt_id, str):
+                    continue
+                entity = await self._session.scalar(
+                    select(ConversationInterrupt).where(
+                        ConversationInterrupt.conversation_thread_id == thread_pk,
+                        ConversationInterrupt.interrupt_id == interrupt_id,
                     )
-                    if entity is None:
-                        continue
-                    if entity.resolved_run_id != run_id:
-                        continue
-                    entity.status = (
-                        "cancelled"
-                        if entry.get("status") == "cancelled"
-                        else "resolved"
-                    )
-                    entity.resume_json = entry
-                    entity.resolved_at = created_at
-                    entity.updated_at = created_at
+                )
+                if entity is None or entity.resolved_run_id != run_id:
+                    continue
+                entity.status = "pending"
+                entity.resolved_run_id = None
+                entity.resume_json = None
+                entity.resolved_at = None
+                entity.updated_at = created_at
             return
-        if event.get("type") != "RUN_FINISHED":
+        if event_type == "RUN_STARTED" and run_input is not None:
+            if initialization_failed:
+                return
+            for entry in resume_entries:
+                if not isinstance(entry, dict):
+                    continue
+                interrupt_id = entry.get("interruptId")
+                if not isinstance(interrupt_id, str):
+                    continue
+                entity = await self._session.scalar(
+                    select(ConversationInterrupt).where(
+                        ConversationInterrupt.conversation_thread_id == thread_pk,
+                        ConversationInterrupt.interrupt_id == interrupt_id,
+                    )
+                )
+                if entity is None:
+                    continue
+                if entity.resolved_run_id != run_id:
+                    continue
+                entity.status = (
+                    "cancelled" if entry.get("status") == "cancelled" else "resolved"
+                )
+                entity.resume_json = entry
+                entity.resolved_at = created_at
+                entity.updated_at = created_at
+            return
+        if event_type != "RUN_FINISHED":
             return
         outcome = event.get("outcome")
         interrupts = outcome.get("interrupts") if isinstance(outcome, dict) else None

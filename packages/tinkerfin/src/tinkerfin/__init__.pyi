@@ -1,0 +1,65 @@
+# ruff: noqa: F403, F405
+# 此文件由 scripts/generate_stubs.py 根据锁定依赖生成，请勿手工维护参数列表
+from collections.abc import Callable, Sequence
+from typing import Any, Generic
+
+from deepagents.graph import *
+from typing_extensions import TypeVar
+
+from .agui_resume import AgUiResumeBinding as AgUiResumeBinding
+from .coordination import InMemoryRunCoordinator as InMemoryRunCoordinator
+from .coordination import RunCoordinator as RunCoordinator
+from .deep_agent import DeepAgentAgUiRuntime as DeepAgentAgUiRuntime
+from .deep_agent import DeepAgentDefinition as DeepAgentDefinition
+from .deep_agent import DeepAgentRuntime as DeepAgentRuntime
+from .runtime import AgUiEventStream as AgUiEventStream
+from .runtime import AgUiNativeStreamConfig as AgUiNativeStreamConfig
+from .runtime import (
+    AgUiNativeStreamConfigurationError as AgUiNativeStreamConfigurationError,
+)
+from .runtime import AgUiNativeStreamInvocation as AgUiNativeStreamInvocation
+from .runtime import AgUiSettlementTimeoutError as AgUiSettlementTimeoutError
+from .runtime import EventObserver as EventObserver
+from .runtime import GraphRunStream as GraphRunStream
+from .runtime import NativeGraphRunStream as NativeGraphRunStream
+from .runtime import NativeStreamPart as NativeStreamPart
+from .runtime import NativeTinkerFinRun as NativeTinkerFinRun
+from .runtime import PartObserver as PartObserver
+from .runtime import SseBody as SseBody
+from .runtime import SseEventIdResolver as SseEventIdResolver
+from .runtime import SseMapper as SseMapper
+from .runtime import SsePayload as SsePayload
+from .runtime import SsePreflight as SsePreflight
+from .runtime import TinkerFin as _RuntimeTinkerFin
+from .runtime import TinkerFinRun as TinkerFinRun
+
+PrincipalT = TypeVar("PrincipalT", default=object)
+
+class TinkerFin(_RuntimeTinkerFin[PrincipalT], Generic[PrincipalT]):
+    def create_deep_agent(
+        self,
+        model: str | BaseChatModel | None = None,
+        tools: Sequence[BaseTool | Callable | dict[str, Any]] | None = None,
+        *,
+        system_prompt: str | SystemMessage | None = None,
+        middleware: Sequence[AgentMiddleware[StateT_co, ContextT]] = (),
+        subagents: Sequence[SubAgent | CompiledSubAgent | AsyncSubAgent] | None = None,
+        skills: list[str] | None = None,
+        memory: list[str] | None = None,
+        permissions: list[FilesystemPermission] | None = None,
+        backend: BackendProtocol | None = None,
+        interrupt_on: dict[str, bool | InterruptOnConfig] | None = None,
+        response_format: ResponseFormat[ResponseT]
+        | type[ResponseT]
+        | dict[str, Any]
+        | None = None,
+        state_schema: type[DeepAgentState] | None = None,
+        context_schema: type[ContextT] | None = None,
+        checkpointer: Checkpointer | None = None,
+        store: BaseStore | None = None,
+        debug: bool = False,
+        name: str | None = None,
+        cache: BaseCache | None = None,
+    ) -> DeepAgentDefinition[ContextT, PrincipalT]: ...
+
+__all__: list[str]

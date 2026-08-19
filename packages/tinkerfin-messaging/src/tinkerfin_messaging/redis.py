@@ -82,6 +82,8 @@ class _AsyncRedisClient(Protocol):
 
     async def hgetall(self, name: str) -> dict[bytes, bytes]: ...
 
+    async def exists(self, *names: str) -> int: ...
+
     async def srandmember(
         self,
         name: str,
@@ -1174,6 +1176,42 @@ class RedisBackend(MessagingBackend):
                         entries,
                     )
                 )
+
+    async def bind_follow(
+        self,
+        *,
+        channel: str,
+        stream: str,
+        run: str,
+    ) -> BackendRunHandle:
+        """Resolve one read-only follower to an authoritative Redis generation."""
+
+        required_identifier("channel", channel)
+        required_identifier("stream", stream)
+        required_identifier("run", run)
+        unresolved = BackendRunHandle(
+            channel=channel,
+            stream=stream,
+            run=run,
+            owner_token=None,
+            fence=None,
+        )
+        keys = await self._keys_for_handle(unresolved)
+        if not await self._client.exists(keys.run):
+            if not await self._is_current_generation(keys):
+                self._raise_stream_deleted(
+                    unresolved,
+                    generation=keys.generation,
+                )
+            raise RunNotFound(run=run)
+        return BackendRunHandle(
+            channel=channel,
+            stream=stream,
+            run=run,
+            owner_token=None,
+            fence=None,
+            generation=keys.generation,
+        )
 
     def follow(
         self,

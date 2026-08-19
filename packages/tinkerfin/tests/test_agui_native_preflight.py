@@ -9,6 +9,7 @@ from dataclasses import FrozenInstanceError, fields
 from typing import TypedDict, cast, get_type_hints
 
 import pytest
+from ag_ui.core import RunAgentInput
 from langgraph.graph import START, StateGraph
 from langgraph.types import StreamMode
 
@@ -18,6 +19,20 @@ from tinkerfin import (
     AgUiNativeStreamInvocation,
     TinkerFin,
 )
+
+
+def _run_input() -> RunAgentInput:
+    return RunAgentInput.model_validate(
+        {
+            "threadId": "thread-1",
+            "runId": "run-1",
+            "state": {},
+            "messages": [],
+            "tools": [],
+            "context": [],
+            "forwardedProps": {},
+        }
+    )
 
 
 class _RecordingGraph:
@@ -218,7 +233,7 @@ async def test_valid_agui_native_config_is_forwarded_exactly_and_stays_lazy() ->
         principal="user-1",
         on_part=on_part,
     )
-    events = run.astream_agui(thread_id="thread-1", run_id="run-1")
+    events = run.astream_agui(run_input=_run_input())
 
     assert graph.calls == []
     assert coordination == []
@@ -324,7 +339,7 @@ async def test_strict_agui_run_preserves_pull_backpressure_and_cancellation_clea
             invocation,
             principal="user-1",
         )
-        .astream_agui(thread_id="thread-1", run_id="run-1")
+        .astream_agui(run_input=_run_input())
     )
 
     assert (await anext(events)).type.value == "RUN_STARTED"
@@ -353,8 +368,7 @@ async def test_strict_agui_binding_runs_a_real_compiled_langgraph_v2_stream() ->
         TinkerFin()
         .run(invocation)
         .astream_agui(
-            thread_id="thread-1",
-            run_id="run-1",
+            run_input=_run_input(),
         )
     )
 

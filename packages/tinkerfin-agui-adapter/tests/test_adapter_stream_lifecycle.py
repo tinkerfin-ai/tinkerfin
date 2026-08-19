@@ -4,12 +4,39 @@ import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
 
 import pytest
-from ag_ui.core import BaseEvent
+from ag_ui.core import BaseEvent, RunAgentInput, RunStartedEvent
 from langchain_core.messages import AIMessageChunk, ChatMessage, ToolMessage
 from pydantic import ValidationError
 
 from tinkerfin_agui_adapter import DeepAgentAgUiAdapter, astream_events
 from tinkerfin_agui_adapter.ids import ScopedIdCodec
+
+
+def _run_input(
+    *,
+    thread_id: str = "thread-1",
+    run_id: str = "run-1",
+    parent_run_id: str | None = None,
+) -> RunAgentInput:
+    return RunAgentInput.model_validate(
+        {
+            "threadId": thread_id,
+            "runId": run_id,
+            "parentRunId": parent_run_id,
+            "state": {"draft": True},
+            "messages": [{"id": "message-1", "role": "user", "content": "hello"}],
+            "tools": [
+                {
+                    "name": "lookup",
+                    "description": "Look up one value",
+                    "parameters": {"type": "object"},
+                }
+            ],
+            "context": [{"description": "tenant", "value": "acme"}],
+            "forwardedProps": {"model": "test-model"},
+            "resume": None,
+        }
+    )
 
 
 class _GateParts:
@@ -174,6 +201,43 @@ async def _collect_through(
 
 
 @pytest.mark.asyncio
+async def test_run_started_preserves_the_complete_caller_input() -> None:
+    run_input = _run_input(parent_run_id="parent-1")
+    expected = run_input.model_dump(mode="json", by_alias=True)
+
+    async def parts() -> AsyncIterator[object]:
+        if False:  # pragma: no cover - supplies the async iterator shape
+            yield None
+
+    stream = astream_events(parts(), run_input=run_input)
+    assert isinstance(run_input.state, dict)
+    run_input.state["draft"] = False
+    events = [event async for event in stream]
+
+    assert isinstance(events[0], RunStartedEvent)
+    assert events[0].input is not run_input
+    assert events[0].model_dump(mode="json", by_alias=True)["input"] == expected
+
+
+@pytest.mark.asyncio
+async def test_invalid_run_input_identity_fails_before_pulling_parts() -> None:
+    pulled = False
+
+    async def parts() -> AsyncIterator[object]:
+        nonlocal pulled
+        pulled = True
+        yield _text_part()
+
+    with pytest.raises(ValueError, match="thread_id must be non-blank"):
+        astream_events(
+            parts(),
+            run_input=_run_input(thread_id=" thread-1"),
+        )
+
+    assert pulled is False
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("part_factory", "expose_reasoning_events", "open_event"),
     [
@@ -189,9 +253,8 @@ async def test_consumer_close_abandons_open_child_lifecycle_without_run_error(
 ) -> None:
     parts = _GateParts([part_factory()])
     stream = astream_events(
-        thread_id="thread-1",
-        run_id="run-1",
         parts=parts,
+        run_input=_run_input(),
         expose_reasoning_events=expose_reasoning_events,
     )
     assert isinstance(stream, AsyncGenerator)
@@ -221,9 +284,8 @@ async def test_cancellation_during_blocked_upstream_pull_propagates_and_closes(
 ) -> None:
     parts = _GateParts([part_factory()])
     stream = astream_events(
-        thread_id="thread-1",
-        run_id="run-1",
         parts=parts,
+        run_input=_run_input(),
         expose_reasoning_events=expose_reasoning_events,
     )
     events = await _collect_through(stream, open_event)
@@ -254,9 +316,8 @@ async def test_normal_terminal_closes_every_delivered_child_lifecycle_first() ->
     events = [
         event
         async for event in astream_events(
-            thread_id="thread-1",
-            run_id="run-1",
             parts=parts(),
+            run_input=_run_input(),
             expose_reasoning_events=True,
         )
     ]
@@ -523,8 +584,7 @@ async def test_root_values_boundary_closes_an_open_child_message_lifecycle() -> 
         event
         async for event in astream_events(
             parts(),
-            thread_id="thread-1",
-            run_id="run-1",
+            run_input=_run_input(),
             expose_subagent_events=True,
         )
     ]
@@ -564,8 +624,7 @@ async def test_prior_tool_call_ids_flow_through_the_public_stream() -> None:
         event
         async for event in astream_events(
             parts(),
-            thread_id="thread-1",
-            run_id="run-1",
+            run_input=_run_input(),
             prior_tool_call_ids=frozenset(
                 {ScopedIdCodec().encode("tool", (), "call-prior")}
             ),
@@ -588,7 +647,7 @@ async def test_prior_tool_call_ids_flow_through_the_public_stream() -> None:
 @pytest.mark.asyncio
 async def test_consumer_close_after_start_closes_upstream_iterator() -> None:
     parts = _GateParts([])
-    stream = astream_events(thread_id="thread-1", run_id="run-1", parts=parts)
+    stream = astream_events(parts=parts, run_input=_run_input())
     assert isinstance(stream, AsyncGenerator)
 
     await anext(stream)
@@ -605,10 +664,7 @@ async def test_upstream_close_failure_becomes_error_before_any_success_terminal(
     parts = _FailingCloseParts()
 
     events = [
-        event
-        async for event in astream_events(
-            thread_id="thread-1", run_id="run-1", parts=parts
-        )
+        event async for event in astream_events(parts=parts, run_input=_run_input())
     ]
     event_types = [event.type.value for event in events]
 
@@ -628,9 +684,8 @@ async def test_conversion_and_secondary_close_failures_are_logged(
         events = [
             event
             async for event in astream_events(
-                thread_id="thread-1",
-                run_id="run-1",
                 parts=parts,
+                run_input=_run_input(),
             )
         ]
 
@@ -654,7 +709,7 @@ async def test_conversion_and_secondary_close_failures_are_logged(
 @pytest.mark.asyncio
 async def test_cancelled_terminal_pull_finishes_interrupted_upstream_close() -> None:
     parts = _InterruptedCloseParts()
-    stream = astream_events(parts, thread_id="thread-1", run_id="run-1")
+    stream = astream_events(parts, run_input=_run_input())
     assert isinstance(stream, AsyncGenerator)
     assert (await anext(stream)).type.value == "RUN_STARTED"
     terminal_pull = asyncio.create_task(anext(stream))
@@ -701,10 +756,7 @@ async def test_snapshot_conversion_failure_closes_open_text_before_unique_run_er
         }
 
     events = [
-        event
-        async for event in astream_events(
-            thread_id="thread-1", run_id="run-1", parts=parts()
-        )
+        event async for event in astream_events(parts=parts(), run_input=_run_input())
     ]
     event_types = [event.type.value for event in events]
 
@@ -728,9 +780,8 @@ async def test_failed_ai_chunk_does_not_leave_undelivered_reasoning_lifecycle() 
     events = [
         event
         async for event in astream_events(
-            thread_id="thread-1",
-            run_id="run-1",
             parts=parts(),
+            run_input=_run_input(),
             expose_reasoning_events=True,
         )
     ]
@@ -774,10 +825,7 @@ async def test_duplicate_tool_id_in_one_part_fails_before_any_child_lifecycle() 
         )
 
     events = [
-        event
-        async for event in astream_events(
-            thread_id="thread-1", run_id="run-1", parts=parts()
-        )
+        event async for event in astream_events(parts=parts(), run_input=_run_input())
     ]
 
     assert [event.type.value for event in events] == ["RUN_STARTED", "RUN_ERROR"]

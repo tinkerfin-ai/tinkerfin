@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import ClassVar, Never, TypeVar, assert_type, cast
 
 import pytest
+from ag_ui.core import RunAgentInput
 from pydantic import BaseModel
 
 import tinkerfin
@@ -32,6 +33,24 @@ from tinkerfin_messaging import (
 from tinkerfin_messaging.protocols import ProfiledMessageSource
 
 CollectedT = TypeVar("CollectedT")
+
+
+def _run_input(
+    *,
+    thread_id: str = "thread-1",
+    run_id: str = "run-1",
+) -> RunAgentInput:
+    return RunAgentInput.model_validate(
+        {
+            "threadId": thread_id,
+            "runId": run_id,
+            "state": {},
+            "messages": [],
+            "tools": [],
+            "context": [],
+            "forwardedProps": {},
+        }
+    )
 
 
 class _TextCodec:
@@ -419,14 +438,7 @@ async def test_name_only_channel_infers_native_and_agui_profiles() -> None:
         native = [frame async for frame in native_frames]
 
         agui_channel = messaging.channel(name="agui-events")
-        events = (
-            TinkerFin()
-            .run(empty_parts)
-            .astream_agui(
-                thread_id="thread-1",
-                run_id="run-1",
-            )
-        )
+        events = TinkerFin().run(empty_parts).astream_agui(run_input=_run_input())
         agui_frames = await agui_channel.sse(
             events,
             stream="thread-1",
@@ -434,10 +446,19 @@ async def test_name_only_channel_infers_native_and_agui_profiles() -> None:
             after=0,
         )
         agui = [frame async for frame in agui_frames]
+        committed_agui = await agui_channel.read(
+            stream="thread-1",
+            after=0,
+            limit=100,
+        )
 
     assert native[0].startswith(b"id: 1\nevent: stream-part\ndata: ")
     assert json.loads(native[0].split(b"data: ", 1)[1])["type"] == "values"
     assert [json.loads(frame.split(b"data: ", 1)[1])["type"] for frame in agui] == [
+        "RUN_STARTED",
+        "RUN_FINISHED",
+    ]
+    assert [message.data.type.value for message in committed_agui] == [
         "RUN_STARTED",
         "RUN_FINISHED",
     ]
@@ -497,14 +518,7 @@ async def test_name_only_channel_rejects_custom_and_incompatible_sources() -> No
             if False:
                 yield None
 
-        incompatible = (
-            TinkerFin()
-            .run(empty_parts)
-            .astream_agui(
-                thread_id="thread-1",
-                run_id="run-1",
-            )
-        )
+        incompatible = TinkerFin().run(empty_parts).astream_agui(run_input=_run_input())
         with pytest.raises(CodecMismatch):
             await channel.wrap(
                 incompatible,

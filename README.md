@@ -4,14 +4,12 @@
 
 ## What it is
 
-TinkerFin binds a caller-owned asynchronous LangGraph v2 source to native, AG-UI,
-direct SSE, or durable Messaging delivery. Graph construction, invocation arguments,
-models, tools, middleware, checkpoints, stores, and Sandbox ownership remain with the
-host.
+TinkerFin adds native, AG-UI, SSE, and durable Messaging delivery to Deep Agents.
+Models, tools, backends, checkpoints, stores, and Sandbox resources remain host-owned.
 
 ```text
 packages/
-├── tinkerfin/                 source binding, AG-UI, direct SSE, coordination
+├── tinkerfin/                 Deep Agents runtime, AG-UI, SSE, coordination
 ├── tinkerfin-agui-adapter/    LangGraph v2 StreamPart to AG-UI conversion
 ├── tinkerfin-messaging/       durable delivery, replay, cancellation, Redis
 └── tinkerfin-sandbox/         OpenSandbox backend and lifecycle management
@@ -29,7 +27,7 @@ Python 3.11 or newer is required.
 pip install tinkerfin
 ```
 
-Install only the integrations used by the host:
+Optional integrations:
 
 ```bash
 pip install "tinkerfin[redis]"
@@ -39,43 +37,36 @@ pip install "tinkerfin-sandbox[sqlite]"
 
 ## Quick Start
 
-Bind the caller-owned Graph stream lazily, then choose native or AG-UI objects from the
-same run interface.
-
 ```python
 import asyncio
-from typing import TypedDict
 
-from langgraph.graph import START, StateGraph
+from ag_ui.core import RunAgentInput
 from tinkerfin import TinkerFin
 
-
-class State(TypedDict):
-    message: str
-
-
-async def echo(state: State) -> dict[str, str]:
-    return {"message": f"Echo: {state['message']}"}
-
-
-builder = StateGraph(State)
-builder.add_node("echo", echo)
-builder.add_edge(START, "echo")
-graph = builder.compile()
 tinkerfin = TinkerFin()
+agent = tinkerfin.create_deep_agent(
+    model="openai:gpt-5.4",
+    tools=[],
+)
 
 
 async def main() -> None:
-    run = tinkerfin.run(
-        lambda: graph.astream(
-            {"message": "Hello"},
-            config={"configurable": {"thread_id": "thread-1"}},
-            stream_mode=("messages", "tasks", "values"),
-            version="v2",
-            subgraphs=True,
-        )
+    run_input = RunAgentInput.model_validate(
+        {
+            "threadId": "thread-1",
+            "runId": "run-1",
+            "state": {},
+            "messages": [],
+            "tools": [],
+            "context": [],
+            "forwardedProps": {},
+        }
     )
-    events = run.astream_agui(thread_id="thread-1", run_id="run-1")
+    runtime = agent.new_agui(run_input=run_input)
+    events = runtime.astream(
+        {"messages": [{"role": "user", "content": "Hello"}]},
+        {"configurable": {"thread_id": "thread-1"}},
+    )
     async for event in events:
         print(event)
 
@@ -83,29 +74,22 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-Use `run.astream()` for native objects. Use `events.to_sse()` or
-`run.astream().to_sse()` for direct HTTP SSE. For replayable delivery, give the
-unencoded object stream to a reusable name-only Messaging channel.
+Use `agent.new()` for native LangGraph objects. Both Runtime types expose the installed
+`CompiledStateGraph.astream(...)` parameter shape.
 
 ## Core concepts
 
-- `TinkerFin` is application-scoped and stateless. `TinkerFin.run(source_factory,
-  principal=None, on_part=None)` binds one lazy object source.
-- A `TinkerFinRun` claims exactly one object stream through `astream()` or
-  `astream_agui(...)`.
-- AG-UI conversion consumes v2 `messages`, `tasks`, and `values` with
-  `subgraphs=True` and validates every observed part.
-- `AgUiNativeStreamConfig(extra_modes=...).bind(...)` is an optional strict source
-  that fixes those Graph options and is preflighted by the same `run()` method.
-- Ordinary compiled subgraphs and Deep Agents `task` delegates are distinct sources.
-  Namespace provenance never changes AG-UI `parentRunId`.
-- Direct `to_sse()` supports custom payload mapping and event IDs. Pre-encoded SSE is
-  not accepted by Messaging.
-- `messaging.channel(name=...)` infers a native codec from a strict native stream and
-  an AG-UI codec from `AgUiEventStream`, without pulling the first item. A channel
-  handle is reusable; each source is single-use.
-- The host maps `RunAgentInput` and checkpoint state to graph input or
-  `Command(resume=...)`. TinkerFin does not fabricate protocol input.
+- `create_deep_agent(...)` records the installed Deep Agents build call;
+  `new()` / `new_agui()` creates a fresh Graph and a single-use Runtime.
+- AG-UI uses v2 `messages`, `tasks`, and `values` with `subgraphs=True`; invalid stream
+  options fail before iteration or lifecycle events.
+- Existing event ordering, subagent provenance, interrupt/resume, reasoning privacy,
+  cancellation, backpressure, and cleanup are preserved.
+- Object streams provide direct SSE and can be passed unencoded to Messaging for
+  persistence, replay, attachment, and remote cancellation.
+- `RUN_STARTED.input` carries the complete caller `RunAgentInput`; resumed requests use
+  `AgUiResumeBinding` to bind that input to one native Command and its scoped Tool IDs.
+- `TinkerFin.run(...)` remains available for custom asynchronous sources.
 
 ## Documentation
 

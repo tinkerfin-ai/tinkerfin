@@ -7,6 +7,7 @@ from .hitl import HitlActionRequest as HitlActionRequest
 from .hitl import HitlCorrelationError as HitlCorrelationError
 from .hitl import HitlRequest as HitlRequest
 from .hitl import HitlReviewConfig as HitlReviewConfig
+from .ids import ScopedIdCodec as ScopedIdCodec
 from .lifecycle import AgUiLifecycleEventFactory as AgUiLifecycleEventFactory
 from .microbatch import micro_batch as micro_batch
 from .models import AgentRuntimeInterrupt as AgentRuntimeInterrupt
@@ -32,6 +33,7 @@ __all__ = [
     "ResumeMappingError",
     "ResumeMappingFailure",
     "ResumeTranslation",
+    "ScopedIdCodec",
     "SseEventId",
     "astream_events",
     "encode_sse",

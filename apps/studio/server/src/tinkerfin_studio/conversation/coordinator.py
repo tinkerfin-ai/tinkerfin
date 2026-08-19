@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator
 
-from tinkerfin_messaging.agui import AgUiCodec
-from tinkerfin_messaging.backend import BackendRunHandle, MessagingBackend
-from tinkerfin_messaging.models import MessageEnvelope
+from ag_ui.core import BaseEvent
+
+from tinkerfin_messaging import DecodedMessage, MessageChannel
 from tinkerfin_studio.conversation.projection import ConversationProjector
 from tinkerfin_studio.conversation.repository import ConversationRepository
 from tinkerfin_studio.infrastructure.database import Database
@@ -23,13 +22,10 @@ class ConversationProjectionCoordinator:
         self,
         *,
         database: Database,
-        backend: MessagingBackend,
-        channel: str,
+        channel: MessageChannel[BaseEvent, BaseEvent],
     ) -> None:
         self._database = database
-        self._backend = backend
         self._channel = channel
-        self._codec = AgUiCodec()
         self._tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
         self._closed = False
 
@@ -60,24 +56,20 @@ class ConversationProjectionCoordinator:
 
         while True:
             after = await self._last_seq(thread_pk)
-            latest = await self._backend.latest_seq(
-                channel=self._channel,
-                stream=stream,
-            )
+            latest = await self._channel.latest_seq(stream=stream)
             if after >= latest:
                 return after
-            envelopes = await self._backend.read(
-                channel=self._channel,
+            messages = await self._channel.read(
                 stream=stream,
                 after=after,
                 limit=min(1000, latest - after),
             )
-            if not envelopes:
+            if not messages:
                 raise RuntimeError(
                     f"Redis 事件尾部无法补齐: after={after}, latest={latest}"
                 )
-            for envelope in envelopes:
-                await self._project(thread_pk, envelope)
+            for message in messages:
+                await self._project(thread_pk, message)
 
     async def aclose(self) -> None:
         """取消阻塞 follow，并等待所有本地投影任务退出"""
@@ -95,19 +87,16 @@ class ConversationProjectionCoordinator:
 
     async def _follow(self, *, thread_pk: int, stream: str, run: str) -> None:
         after = await self._last_seq(thread_pk)
-        handle = BackendRunHandle(
-            channel=self._channel,
+        subscription = await self._channel.follow(
             stream=stream,
             run=run,
-            owner_token=None,
-            fence=None,
+            after=after,
         )
-        iterator = self._backend.follow(handle, after=after)
         try:
-            async for envelope in iterator:
-                await self._project(thread_pk, envelope)
+            async for message in subscription:
+                await self._project(thread_pk, message)
         finally:
-            await self._close_iterator(iterator)
+            await subscription.aclose()
 
     async def _last_seq(self, thread_pk: int) -> int:
         async with self._database.session() as session:
@@ -116,14 +105,17 @@ class ConversationProjectionCoordinator:
                 raise LookupError(f"会话不存在: {thread_pk}")
             return thread.last_seq
 
-    async def _project(self, thread_pk: int, envelope: MessageEnvelope) -> None:
-        event = self._codec.decode(envelope.payload)
+    async def _project(
+        self,
+        thread_pk: int,
+        message: DecodedMessage[BaseEvent],
+    ) -> None:
         async with self._database.session() as session:
             try:
                 await ConversationProjector(session).project(
                     thread_pk=thread_pk,
-                    envelope=envelope,
-                    event=event,
+                    envelope=message.envelope,
+                    event=message.data,
                 )
                 await session.commit()
             except BaseException:
@@ -147,9 +139,3 @@ class ConversationProjectionCoordinator:
                 key[1],
                 exc_info=error,
             )
-
-    @staticmethod
-    async def _close_iterator(iterator: AsyncIterator[MessageEnvelope]) -> None:
-        close = getattr(iterator, "aclose", None)
-        if close is not None:
-            await close()

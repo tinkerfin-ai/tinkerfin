@@ -4,18 +4,19 @@
 
 ## 项目简介
 
-TinkerFin 把调用方拥有的 LangGraph v2 异步源绑定为原生流、AG-UI、直接 SSE
-或可持久化的 Messaging 交付。Graph 构造与调用参数、模型、工具、中间件、
-checkpoint、store 和 Sandbox 生命周期均由宿主负责。
+TinkerFin 为 Deep Agents 提供原生流、AG-UI、SSE 和可持久化的 Messaging 交付。
+模型、工具、backend、checkpoint、store 和 Sandbox 资源仍由宿主管理。
 
 ```text
 packages/
-├── tinkerfin/                 流源绑定、AG-UI、直接 SSE 与运行协调
+├── tinkerfin/                 Deep Agents Runtime、AG-UI、SSE 与运行协调
 ├── tinkerfin-agui-adapter/    LangGraph v2 StreamPart 到 AG-UI 的转换
 ├── tinkerfin-messaging/       持久交付、回放、取消与 Redis
 └── tinkerfin-sandbox/         OpenSandbox backend 与生命周期管理
-apps/studio/                   Studio 服务端与 Web 应用
-docs/                          运行时与集成文档
+apps/studio/
+├── server/                    Studio 服务端
+└── web/                       Studio Web 应用
+docs/                          Runtime 与集成文档
 ```
 
 ## 安装
@@ -26,7 +27,7 @@ docs/                          运行时与集成文档
 pip install tinkerfin
 ```
 
-应用只安装实际需要的集成：
+按需安装集成：
 
 ```bash
 pip install "tinkerfin[redis]"
@@ -36,43 +37,36 @@ pip install "tinkerfin-sandbox[sqlite]"
 
 ## 快速开始
 
-惰性绑定由调用方拥有的 Graph 流，再通过同一个运行接口选择原生对象或 AG-UI
-对象。
-
 ```python
 import asyncio
-from typing import TypedDict
 
-from langgraph.graph import START, StateGraph
+from ag_ui.core import RunAgentInput
 from tinkerfin import TinkerFin
 
-
-class State(TypedDict):
-    message: str
-
-
-async def echo(state: State) -> dict[str, str]:
-    return {"message": f"Echo: {state['message']}"}
-
-
-builder = StateGraph(State)
-builder.add_node("echo", echo)
-builder.add_edge(START, "echo")
-graph = builder.compile()
 tinkerfin = TinkerFin()
+agent = tinkerfin.create_deep_agent(
+    model="openai:gpt-5.4",
+    tools=[],
+)
 
 
 async def main() -> None:
-    run = tinkerfin.run(
-        lambda: graph.astream(
-            {"message": "Hello"},
-            config={"configurable": {"thread_id": "thread-1"}},
-            stream_mode=("messages", "tasks", "values"),
-            version="v2",
-            subgraphs=True,
-        )
+    run_input = RunAgentInput.model_validate(
+        {
+            "threadId": "thread-1",
+            "runId": "run-1",
+            "state": {},
+            "messages": [],
+            "tools": [],
+            "context": [],
+            "forwardedProps": {},
+        }
     )
-    events = run.astream_agui(thread_id="thread-1", run_id="run-1")
+    runtime = agent.new_agui(run_input=run_input)
+    events = runtime.astream(
+        {"messages": [{"role": "user", "content": "Hello"}]},
+        {"configurable": {"thread_id": "thread-1"}},
+    )
     async for event in events:
         print(event)
 
@@ -80,26 +74,21 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-原生对象使用 `run.astream()`。直接 HTTP SSE 使用 `events.to_sse()` 或
-`run.astream().to_sse()`。需要回放时，把尚未编码的对象流交给可复用的
-Messaging name-only channel。
+需要 LangGraph 原生对象时使用 `agent.new()`。两种 Runtime 的 `astream(...)` 都保留
+当前 `CompiledStateGraph.astream(...)` 的参数形状。
 
 ## 核心概念
 
-- `TinkerFin` 是应用级无状态对象；`TinkerFin.run(source_factory,
-  principal=None, on_part=None)` 惰性绑定一条对象源
-- 一个 `TinkerFinRun` 只能通过 `astream()` 或 `astream_agui(...)` 取得一条对象流
-- AG-UI 转换消费启用 `subgraphs=True` 的 v2 `messages`、`tasks`、`values`，并校验
-  每个实际到达的 part
-- `AgUiNativeStreamConfig(extra_modes=...).bind(...)` 提供可选的严格 source，由同一个
-  `run()` 固定并预检这些 Graph 参数
-- 普通 compiled subgraph 与 Deep Agents `task` 子代理是两种不同来源；namespace
-  provenance 不会改变 AG-UI `parentRunId`
-- 直接 `to_sse()` 支持自定义 payload mapper 与事件 ID；Messaging 拒绝预编码 SSE
-- `messaging.channel(name=...)` 从严格原生流推断原生 codec，从 `AgUiEventStream`
-  推断 AG-UI codec，且不读取第一个事件；channel handle 可复用，每条 source 只使用一次
-- 宿主负责把 `RunAgentInput` 与 checkpoint 状态映射为 graph input 或
-  `Command(resume=...)`，TinkerFin 不伪造协议输入
+- `create_deep_agent(...)` 记录 Deep Agents 建图参数，`new()` / `new_agui()` 创建新
+  Graph 和单次使用的 Runtime
+- AG-UI 固定使用 v2 `messages`、`tasks`、`values` 和 `subgraphs=True`，非法参数会在
+  迭代及生命周期事件开始前失败
+- 现有事件顺序、子 Agent 来源、interrupt/resume、推理隐私、取消、背压和清理语义
+  保持不变
+- 对象流可以直接输出 SSE，也可以交给 Messaging 持久化、回放、附着和远程取消
+- `RUN_STARTED.input` 携带调用方完整的 `RunAgentInput`；恢复请求通过
+  `AgUiResumeBinding` 绑定该输入、原生 Command 和完整 Tool ID
+- `TinkerFin.run(...)` 继续用于自定义异步源
 
 ## 文档
 

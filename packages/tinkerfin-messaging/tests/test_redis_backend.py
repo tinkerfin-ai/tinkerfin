@@ -506,6 +506,42 @@ async def counting_redis_backend() -> AsyncGenerator[
         await client.aclose()
 
 
+async def test_channel_follow_binds_generation_across_redis_backend_instances(
+    redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+) -> None:
+    owner_backend, observer_backend, _ = redis_backends
+    async with (
+        Messaging(backend=owner_backend) as owner_messaging,
+        Messaging(backend=observer_backend) as observer_messaging,
+    ):
+        owner_channel = owner_messaging.channel(name="events", codec=_TextCodec())
+        observer_channel = observer_messaging.channel(name="events", codec=_TextCodec())
+        old = await owner_channel.wrap(
+            _Source("old"),
+            stream="thread-1",
+            run="run-1",
+            after=0,
+        )
+        assert [message.data async for message in old] == ["old"]
+        stale = await observer_channel.follow(
+            stream="thread-1",
+            run="run-1",
+            after=0,
+        )
+
+        await owner_channel.delete_stream(stream="thread-1")
+        replacement = await owner_channel.wrap(
+            _Source("new"),
+            stream="thread-1",
+            run="run-1",
+            after=0,
+        )
+        assert [message.data async for message in replacement] == ["new"]
+
+        with pytest.raises(StreamDeleted):
+            await anext(aiter(stale))
+
+
 @pytest.fixture
 async def gated_xread_backends() -> AsyncGenerator[
     tuple[RedisBackend, RedisBackend, _GatedXreadRedis],

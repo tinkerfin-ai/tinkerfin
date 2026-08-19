@@ -251,6 +251,12 @@ class MessageSubscription(Generic[ReplayT]):
         self._backend_iterator = cast(AsyncIterator[object], backend_iterator)
         try:
             async for envelope in backend_iterator:
+                expected_codec = self._codec.codec_id
+                if envelope.codec != expected_codec:
+                    raise CodecMismatch(
+                        expected=expected_codec,
+                        actual=envelope.codec,
+                    )
                 yield DecodedMessage(
                     envelope=envelope,
                     data=self._codec.decode(envelope.payload),
@@ -427,6 +433,115 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         self._renderer = renderer
         self._inferred_profile = profile
 
+    def _require_read_codec(self) -> MessageCodec[SourceT, ReplayT]:
+        codec = self._codec
+        if codec is None:
+            raise TypeError(
+                "channel codec is unknown; provide one explicitly or infer it from "
+                "a profiled source first"
+            )
+        return codec
+
+    @staticmethod
+    def _validate_page(*, after: int, limit: int | None = None) -> None:
+        if isinstance(after, bool) or not isinstance(after, int):
+            raise TypeError("after must be an integer")
+        if after < 0:
+            raise ValueError("after must be greater than or equal to zero")
+        if limit is None:
+            return
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise TypeError("limit must be an integer")
+        if not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+
+    async def latest_seq(self, *, stream: str) -> int:
+        """Return the greatest committed sequence, or zero for an empty stream."""
+
+        preflight = self._messaging._begin_preflight()
+        try:
+            canonical_stream = required_identifier("stream", stream)
+            self._messaging._require_open()
+            latest = await self._messaging.backend.latest_seq(
+                channel=self.name,
+                stream=canonical_stream,
+            )
+            self._messaging._require_open()
+            return latest
+        finally:
+            self._messaging._finish_preflight(preflight)
+
+    async def read(
+        self,
+        *,
+        stream: str,
+        after: int = 0,
+        limit: int = 100,
+    ) -> tuple[DecodedMessage[ReplayT], ...]:
+        """Decode one ascending committed page after an exclusive cursor."""
+
+        self._validate_page(after=after, limit=limit)
+        preflight = self._messaging._begin_preflight()
+        try:
+            canonical_stream = required_identifier("stream", stream)
+            codec = self._require_read_codec()
+            expected_codec = required_identifier("codec_id", codec.codec_id)
+            self._messaging._require_open()
+            envelopes = await self._messaging.backend.read(
+                channel=self.name,
+                stream=canonical_stream,
+                after=after,
+                limit=limit,
+            )
+            decoded: list[DecodedMessage[ReplayT]] = []
+            for envelope in envelopes:
+                if envelope.codec != expected_codec:
+                    raise CodecMismatch(
+                        expected=expected_codec,
+                        actual=envelope.codec,
+                    )
+                decoded.append(
+                    DecodedMessage(
+                        envelope=envelope,
+                        data=codec.decode(envelope.payload),
+                    )
+                )
+            self._messaging._require_open()
+            return tuple(decoded)
+        finally:
+            self._messaging._finish_preflight(preflight)
+
+    async def follow(
+        self,
+        *,
+        stream: str,
+        run: str,
+        after: int = 0,
+    ) -> MessageSubscription[ReplayT]:
+        """Follow one run's committed events through its authoritative terminal."""
+
+        preflight = self._messaging._begin_preflight()
+        try:
+            self._validate_page(after=after)
+            canonical_stream = required_identifier("stream", stream)
+            canonical_run = required_identifier("run", run)
+            codec = self._require_read_codec()
+            self._messaging._require_open()
+            handle = await self._messaging.backend.bind_follow(
+                channel=self.name,
+                stream=canonical_stream,
+                run=canonical_run,
+            )
+            self._messaging._require_open()
+            return MessageSubscription(
+                backend=self._messaging.backend,
+                prepared=PreparedRun(handle=handle, after=after, is_owner=False),
+                codec=cast(MessageCodec[object, ReplayT], codec),
+                renderer=self._renderer,
+            )
+        finally:
+            self._messaging._finish_preflight(preflight)
+
     async def validate_cursor(self, *, stream: str, after: int | None) -> None:
         """Validate one replay cursor without creating or attaching a run.
 
@@ -536,12 +651,14 @@ class MessageChannel(Generic[SourceT, ReplayT]):
             run: Caller-defined producer identity within the stream.
             after: Exclusive durable replay cursor, or the current tail when omitted.
             attach_identity: Finite request facts that must agree for run attachment.
-            cancel: At-most-once synchronous or asynchronous callback. It may return
-                `None` or a finite iterable of additional source values, which are
-                encoded and appended after already accepted source values. The
-                callback may accept no arguments or one required positional
-                `CancelContext`, and is responsible for causing the active source to
-                stop. A signature that also accepts no arguments is invoked without
+            cancel: At-most-once synchronous or asynchronous callback. Omit it when the
+                source declares `messaging_cancel_callback`. Supplying the same owner
+                is accepted; a different callback is an ownership error. A callback
+                may return `None` or a finite iterable of
+                additional source values, which are encoded and appended after already
+                accepted source values. It may accept no arguments or one required
+                positional `CancelContext`, and is responsible for stopping the active
+                source. A signature that also accepts no arguments is invoked without
                 the context.
             on_committed: Asynchronous owner-only observer invoked with each durable
                 envelope after append. Observer failures are logged and do not change
@@ -568,6 +685,22 @@ class MessageChannel(Generic[SourceT, ReplayT]):
             codec_id = required_identifier("codec_id", codec.codec_id)
             required_identifier("stream", stream)
             required_identifier("run", run)
+            source_cancel = getattr(source, "messaging_cancel_callback", None)
+            if source_cancel is not None:
+                if cancel is not None:
+                    matcher = getattr(
+                        source,
+                        "messaging_cancel_callback_matches",
+                        None,
+                    )
+                    equivalent = cancel == source_cancel or (
+                        callable(matcher) and bool(matcher(cancel))
+                    )
+                    if not equivalent:
+                        raise TypeError(
+                            "cancel must be omitted when the source owns cancellation"
+                        )
+                cancel = cast(CancelCallback[object], source_cancel)
             if cancel is not None:
                 normalized_cancel = _normalize_cancel_callback(cancel)
             prepared = await self._messaging.backend.prepare(
@@ -673,7 +806,8 @@ class MessageChannel(Generic[SourceT, ReplayT]):
                 returning one, or `None` to start at the current tail. A resolver is
                 invoked exactly once before durable preparation.
             attach_identity: Finite request facts that must agree for run attachment.
-            cancel: Optional callback used for accepted remote cancellation.
+            cancel: Optional callback used for accepted remote cancellation. Omit it
+                when the source declares its own callback.
             on_committed: Optional owner-only observer for newly committed envelopes.
 
         Returns:

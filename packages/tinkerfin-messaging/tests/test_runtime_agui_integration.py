@@ -6,7 +6,7 @@ import json
 from collections.abc import AsyncIterator, Callable, Sequence
 from typing import Any, TypedDict
 
-from ag_ui.core import BaseEvent, RawEvent
+from ag_ui.core import BaseEvent, RawEvent, RunAgentInput
 from deepagents import create_deep_agent
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage
@@ -21,6 +21,24 @@ from tinkerfin_messaging import (
     Messaging,
     NativeStreamPart,
 )
+
+
+def _run_input(
+    *,
+    thread_id: str = "thread-1",
+    run_id: str = "run-1",
+) -> RunAgentInput:
+    return RunAgentInput.model_validate(
+        {
+            "threadId": thread_id,
+            "runId": run_id,
+            "state": {},
+            "messages": [],
+            "tools": [],
+            "context": [],
+            "forwardedProps": {},
+        }
+    )
 
 
 class _ToolBindingFakeModel(FakeMessagesListChatModel):
@@ -69,14 +87,7 @@ async def _empty_parts() -> AsyncIterator[object]:
 
 
 async def test_agui_stream_is_a_directly_iterable_message_source() -> None:
-    events = (
-        TinkerFin()
-        .run(_empty_parts)
-        .astream_agui(
-            thread_id="thread-1",
-            run_id="run-1",
-        )
-    )
+    events = TinkerFin().run(_empty_parts).astream_agui(run_input=_run_input())
 
     aiter(events)
     await events.aclose()
@@ -116,10 +127,7 @@ async def test_native_and_agui_streams_wrap_without_runtime_parameters() -> None
                     subgraphs=True,
                 )
             )
-            .astream_agui(
-                thread_id="agui-thread",
-                run_id="run-1",
-            )
+            .astream_agui(run_input=_run_input(thread_id="agui-thread"))
         )
         agui = await agui_channel.wrap(
             event_source,
@@ -191,8 +199,7 @@ async def test_real_custom_stream_is_consistent_across_all_consumers() -> None:
     events = [
         event
         async for event in strict_run().astream_agui(
-            thread_id="custom-thread",
-            run_id="custom-run",
+            run_input=_run_input(thread_id="custom-thread", run_id="custom-run"),
         )
     ]
     raw_events = [

@@ -4,9 +4,23 @@ from collections.abc import AsyncIterator
 from typing import cast
 
 import pytest
-from ag_ui.core import BaseEvent
+from ag_ui.core import BaseEvent, RunAgentInput
 
 from tinkerfin import TinkerFin
+
+
+def _run_input() -> RunAgentInput:
+    return RunAgentInput.model_validate(
+        {
+            "threadId": "thread-1",
+            "runId": "run-1",
+            "state": {},
+            "messages": [],
+            "tools": [],
+            "context": [],
+            "forwardedProps": {},
+        }
+    )
 
 
 @pytest.mark.asyncio
@@ -79,8 +93,7 @@ async def test_astream_agui_converts_the_bound_factory_without_a_parts_argument(
         TinkerFin()
         .run(source)
         .astream_agui(
-            thread_id="thread-1",
-            run_id="run-1",
+            run_input=_run_input(),
             on_event=on_event,
         )
     )

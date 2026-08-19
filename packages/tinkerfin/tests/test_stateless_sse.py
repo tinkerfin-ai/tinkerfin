@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator
 from typing import cast
 
 import pytest
-from ag_ui.core import BaseEvent
+from ag_ui.core import BaseEvent, RunAgentInput
 from pydantic import ValidationError
 
 from tinkerfin import (
@@ -16,6 +16,20 @@ from tinkerfin import (
     SsePayload,
     TinkerFin,
 )
+
+
+def _run_input() -> RunAgentInput:
+    return RunAgentInput.model_validate(
+        {
+            "threadId": "thread-1",
+            "runId": "run-1",
+            "state": {},
+            "messages": [],
+            "tools": [],
+            "context": [],
+            "forwardedProps": {},
+        }
+    )
 
 
 class _CountingParts:
@@ -79,8 +93,7 @@ async def test_prepare_does_not_observe_or_resolve_an_event_id() -> None:
         TinkerFin()
         .run(lambda: parts)
         .astream_agui(
-            thread_id="thread-1",
-            run_id="run-1",
+            run_input=_run_input(),
             on_event=on_event,
         )
         .to_sse(event_id_resolver=event_id_resolver)
@@ -232,8 +245,7 @@ async def test_agui_mapper_receives_validated_event_objects() -> None:
         TinkerFin()
         .run(source)
         .astream_agui(
-            thread_id="thread-1",
-            run_id="run-1",
+            run_input=_run_input(),
         )
         .to_sse(mapper=mapper)
     )

@@ -4,8 +4,23 @@ import json
 from collections.abc import AsyncIterator
 
 import pytest
+from ag_ui.core import RunAgentInput
 
 from tinkerfin import TinkerFin
+
+
+def _run_input() -> RunAgentInput:
+    return RunAgentInput.model_validate(
+        {
+            "threadId": "thread-1",
+            "runId": "run-1",
+            "state": {},
+            "messages": [],
+            "tools": [],
+            "context": [],
+            "forwardedProps": {},
+        }
+    )
 
 
 @pytest.mark.asyncio
@@ -75,8 +90,7 @@ async def test_agui_object_stream_encodes_protocol_json_without_event_name() -> 
         TinkerFin()
         .run(source)
         .astream_agui(
-            thread_id="thread-1",
-            run_id="run-1",
+            run_input=_run_input(),
         )
         .to_sse()
     )

@@ -8,6 +8,7 @@ import pytest
 from ag_ui.core import (
     BaseEvent,
     MessagesSnapshotEvent,
+    RunAgentInput,
     StateSnapshotEvent,
     TextMessageContentEvent,
     TextMessageStartEvent,
@@ -18,6 +19,20 @@ from pydantic_core import PydanticSerializationError
 
 from tinkerfin_agui_adapter import DeepAgentAgUiAdapter, astream_events
 from tinkerfin_agui_adapter.microbatch import ContentBatcher, micro_batch
+
+
+def _run_input() -> RunAgentInput:
+    return RunAgentInput.model_validate(
+        {
+            "threadId": "thread-1",
+            "runId": "run-1",
+            "state": {},
+            "messages": [],
+            "tools": [],
+            "context": [],
+            "forwardedProps": {},
+        }
+    )
 
 
 def _run_id() -> str:
@@ -150,9 +165,8 @@ async def test_successful_structured_ai_content_uses_one_business_text_projectio
     events = [
         event
         async for event in astream_events(
-            thread_id="thread-1",
-            run_id="run-1",
             parts=parts(),
+            run_input=_run_input(),
             expose_reasoning_events=expose_reasoning_events,
         )
     ]
@@ -679,7 +693,7 @@ async def test_cleanup_cancellation_overrides_an_earlier_pull_failure() -> None:
 @pytest.mark.asyncio
 async def test_public_stream_close_propagates_cancellation_after_cleanup() -> None:
     parts = _BlockingPartClose()
-    stream = astream_events(thread_id="thread-1", run_id="run-1", parts=parts)
+    stream = astream_events(parts=parts, run_input=_run_input())
     assert isinstance(stream, AsyncGenerator)
     assert (await anext(stream)).type.value == "RUN_STARTED"
 
@@ -702,7 +716,7 @@ async def test_public_stream_close_propagates_upstream_cleanup_failure() -> None
     cleanup_error = RuntimeError("upstream close failed")
     parts = _BlockingPartClose(close_error=cleanup_error)
     parts.release_close.set()
-    stream = astream_events(thread_id="thread-1", run_id="run-1", parts=parts)
+    stream = astream_events(parts=parts, run_input=_run_input())
     assert isinstance(stream, AsyncGenerator)
     assert (await anext(stream)).type.value == "RUN_STARTED"
 
