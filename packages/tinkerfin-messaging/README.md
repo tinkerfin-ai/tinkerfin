@@ -397,8 +397,9 @@ exactly once. External effects still need business idempotency keys or an outbox
 
 ## Documentation
 
-- [Runtime guide](https://github.com/tinkerfin-ai/tinkerfin/blob/main/docs/runtime.md)
-- [AG-UI adapter](https://github.com/tinkerfin-ai/tinkerfin/tree/main/packages/tinkerfin-agui-adapter)
+- [Messaging guide](https://github.com/tinkerfin-ai/tinkerfin/blob/main/docs/en/messaging/index.md)
+- [Runtime guide](https://github.com/tinkerfin-ai/tinkerfin/blob/main/docs/en/runtime/index.md)
+- [Complete documentation](https://github.com/tinkerfin-ai/tinkerfin/blob/main/docs/en/README.md)
 
 ## License
 

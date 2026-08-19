@@ -1,0 +1,139 @@
+# 取消、延迟创建与恢复
+
+[投递、回放和 SSE](delivery-and-replay.md) · [English](../../en/messaging/cancellation-and-recovery.md)
+
+这一页处理三种生产环境常见情况：用户取消运行、只有真正的生产者才创建 Agent，以及进程失效后从已提交位置恢复。
+
+## 远程取消
+
+先在启动生产者时提供取消函数：
+
+```python
+async def cancel_agent(context):
+    running_task.cancel()
+    return cancellation_tail
+
+
+body = await channel.sse(
+    source,
+    stream="thread-42",
+    run="run-7",
+    cancel=cancel_agent,
+)
+```
+
+随后可从另一个请求中取消：
+
+```python
+cancelled = await channel.cancel(
+    stream="thread-42",
+    run="run-7",
+)
+```
+
+取消函数可以不接收参数，也可以接收 `CancelContext`。它可以返回有限的终止事件，让订阅者收到明确的取消结尾。
+
+TinkerFin 的 AG-UI 流已经提供取消能力，直接把该流交给 Messaging 时通常不用传 `cancel=`。
+
+| 结果或错误 | 含义 |
+| --- | --- |
+| `True` | 已请求取消活跃生产者 |
+| `False` | run 已经结束，不需要再取消 |
+| `RunNotFound` | 找不到 run |
+| `CancellationUnsupported` | run 没有取消函数 |
+| `RunProducerFailed` | 生产者或取消过程失败 |
+
+## 只有 owner 才创建 Agent
+
+如果创建 Graph、模型连接或 Sandbox 很昂贵，可以延迟到 Messaging 确认当前请求是生产者 owner 之后再创建。
+
+```python
+from tinkerfin_messaging import (
+    DeferredMessageSource,
+    MessageSourceBinding,
+)
+
+
+async def open_events():
+    runtime = await create_runtime()
+    events = runtime.astream(graph_input, graph_config)
+    return MessageSourceBinding(source=events)
+
+
+source = DeferredMessageSource(
+    open_events,
+    cancellable=True,
+    cancel_after_first_item=True,
+)
+```
+
+| 参数 | 作用 |
+| --- | --- |
+| `opener` | 异步创建真正 source，并返回 `MessageSourceBinding` |
+| `cancellable` | 声明打开后的 source 是否支持取消 |
+| `cancel_after_first_item` | 是否等第一条协议事件产生后才允许取消超过它 |
+
+附着或纯回放请求不会调用 opener。`cancel_after_first_item=True` 适合必须先出现 `RUN_STARTED` 的协议。
+
+`MessageSourceBinding` 包含 `source` 和可选 `cancel`。如果 source 自己声明取消函数，可以省略 binding 的 `cancel`。
+
+## 固定事件与转换事件
+
+```python
+from tinkerfin_messaging import FiniteMessageSource, map_source
+
+
+finite = FiniteMessageSource.from_events((started, finished))
+
+
+async def enrich(event):
+    return add_request_metadata(event)
+
+
+mapped = map_source(source, enrich)
+```
+
+`FiniteMessageSource` 适合已知的有限事件。`map_source()` 可以使用同步或异步转换函数，并保持原 source 的顺序、背压、取消尾部和关闭行为。
+
+转换后类型可能改变，因此 `map_source()` 的结果不会继续声明原来的内置 codec；使用它时给 channel 显式配置 codec。
+
+## 进程失效后恢复 source
+
+如果 source 可以从稳定位置重建，实现 `RecoverableSource` 并使用 `wrap_recoverable()`：
+
+```python
+subscription = await channel.wrap_recoverable(
+    recoverable_source,
+    stream="thread-42",
+    run="run-7",
+    after=0,
+)
+```
+
+`recoverable_source.open(checkpoint)` 返回的每一项都是 `RecoverableMessage`：
+
+```python
+RecoverableMessage(
+    message_id="source-event-17",
+    data=event,
+    checkpoint=RecoveryCheckpoint(
+        position=b"17",
+        last_message_id="source-event-17",
+    ),
+)
+```
+
+| 字段 | 作用 |
+| --- | --- |
+| `message_id` | 稳定、可重试的消息 ID |
+| `data` | 要编码并保存的数据 |
+| `checkpoint.position` | source 自己解释的恢复位置 |
+| `checkpoint.last_message_id` | 必须与当前 `message_id` 相同 |
+
+稳定 message ID 只能让消息提交幂等，不能自动保证模型调用、工具调用或数据库写入只发生一次。外部副作用仍需要业务幂等键或 outbox。
+
+## 关闭与 settlement timeout
+
+`Messaging(settlement_timeout=...)` 的值只限制调用方等待清理的时间，不会粗暴取消已经接管的提交、取消尾部或 source 关闭任务。超时后会抛出 `MessagingSettlementTimeout`；稍后再次调用 `aclose()` 会继续等待同一个清理任务。
+
+下一篇：[Redis、自定义 codec 和 backend](backends-and-codecs.md)。

@@ -1,0 +1,84 @@
+# AG-UI 使用参考
+
+[AG-UI 入门](index.md) · [English](../../en/agui/api-reference.md)
+
+## 高层 Runtime 能力
+
+| API | 用途 |
+| --- | --- |
+| `DeepAgentDefinition.new_agui(...)` | 创建一次 AG-UI Runtime |
+| `DeepAgentAgUiRuntime.astream(...)` | 运行 Graph 并得到 `AgUiEventStream` |
+| `AgUiEventStream` | 迭代、取消、关闭或转成 SSE |
+| `AgUiResumeBinding` | 把恢复请求、原生命令和旧 Tool ID 绑定在一起 |
+
+完整 Runtime 参数见 [AG-UI 入门](index.md)，恢复参数见 [interrupt 与恢复](interrupts-and-resume.md)。
+
+## 转换入口
+
+| API | 主要参数 | 什么时候使用 |
+| --- | --- | --- |
+| `astream_events(...)` | `parts`、`run_input`、两个公开开关、`prior_tool_call_ids` | 已有原生异步流，希望自动管理完整生命周期 |
+| `DeepAgentAgUiAdapter(...)` | `run_id`、旧 Tool ID、两个公开开关 | 需要自己管理主开始和终止事件 |
+| `encode_sse(...)` | `event`、可选 `event_id` | 把单个 AG-UI 事件编码为 SSE |
+| `micro_batch(...)` | `events`、可选 batcher | 合并连续的小增量 |
+
+### `DeepAgentAgUiAdapter` 方法
+
+| 方法 | 作用 |
+| --- | --- |
+| `process(part)` | 校验并转换一条完整原生数据 |
+| `finish()` | 正常结束仍开放的文字、推理和 Tool 生命周期 |
+| `abort(code=...)` | 失败或取消时关闭开放生命周期 |
+| `main_outcome()` | 返回 success 或 interrupt 终止结果 |
+
+## 生命周期工厂
+
+`AgUiLifecycleEventFactory` 只适合自定义编排器。
+
+| 方法 | 参数 | 结果 |
+| --- | --- | --- |
+| `started(...)` | `run_input` | `RUN_STARTED` |
+| `finished(...)` | `thread_id`、`run_id`、`outcome` | `RUN_FINISHED` |
+| `failed(...)` | `run_id`、`message`、`code` | `RUN_ERROR` |
+| `is_main_lifecycle(...)` | `event`、`run_id` | 判断事件是否占用该主生命周期 |
+| `event_run_id(event)` | 事件 | 读取可验证的 run ID |
+| `validate_run_input(...)` | `run_input` | 提前验证运行身份 |
+
+`AgentRunOutcome` 的 `type` 为 `success` 或 `interrupt`；只有 interrupt 结果携带 `interrupts`。
+
+## 恢复类型
+
+| API | 用途 |
+| --- | --- |
+| `ResumeMapper.map(...)` | 从原生 interrupt 和 checkpoint 消息转换恢复请求 |
+| `ResumeMapper.map_agui(...)` | 从服务端保存的 AG-UI interrupt 转换恢复请求 |
+| `ResumeTranslation` | 保存 `mode`、恢复数据、取消 ID、旧 Tool ID 和逐 interrupt 决定 |
+| `ResumeMappingError` | 恢复请求无法无损映射 |
+| `ResumeMappingFailure` | 稳定的失败类别 |
+
+`ResumeTranslation.mode` 只能是 `command`、`abandon` 或 `custom`。
+
+## interrupt 数据模型
+
+| 模型 | 字段 |
+| --- | --- |
+| `AgentRuntimeInterrupt` | 非空 `id`、JSON `value` |
+| `HitlActionRequest` | 非空 `name`、对象 `args`、可选 `description` |
+| `HitlReviewConfig` | `actionName`、非空 `allowedDecisions`、可选 `argsSchema` |
+| `HitlRequest` | 等长且非空的 `actionRequests` 与 `reviewConfigs` |
+
+允许的决定为 `approve`、`edit`、`reject`、`respond`。同一请求中的 action 和 review config 按位置配对。
+
+## ID 与错误
+
+| API | 作用 |
+| --- | --- |
+| `ScopedIdCodec.encode(...)` | 由类型、完整 namespace、原始 ID 创建 scoped ID |
+| `ScopedIdCodec.decode(...)` | 还原 scoped ID 的三部分 |
+| `InterruptCorrelationError` | 原生 interrupt 无法与运行数据可靠关联 |
+| `HitlCorrelationError` | 审批动作与 Tool 消息无法可靠关联 |
+| `SseEventId` | `encode_sse()` 接受的字符串或整数 ID 类型 |
+
+并行工具、子 Agent 和恢复流程都必须使用完整 scoped ID，不能按事件到达顺序关联。
+
+`ScopedIdCodec.encode()` 的 kind 可以是 `message`、`tool`、`reasoning` 或 `reasoning-message`；namespace 必须是只含非空字符串的元组，原始 ID 也不能为空。

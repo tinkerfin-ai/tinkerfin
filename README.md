@@ -16,7 +16,7 @@ packages/
 apps/studio/
 ├── server/                    Studio server application
 └── web/                       Studio web application
-docs/                          runtime and integration documentation
+docs/                          Chinese and English usage documentation
 ```
 
 ## Installation
@@ -93,11 +93,13 @@ Use `agent.new()` for native LangGraph objects. Both Runtime types expose the in
 
 ## Documentation
 
-- [Runtime and integration guide](docs/runtime.md)
+- [Complete documentation](docs/en/README.md)
+- [Runtime](docs/en/runtime/index.md)
+- [AG-UI](docs/en/agui/index.md)
+- [Messaging](docs/en/messaging/index.md)
+- [Sandbox](docs/en/sandbox/index.md)
 - [Core package](packages/tinkerfin/README.md)
 - [AG-UI adapter](packages/tinkerfin-agui-adapter/README.md)
-- [Messaging](packages/tinkerfin-messaging/README.md)
-- [OpenSandbox integration](packages/tinkerfin-sandbox/README.md)
 - [Studio server](apps/studio/server/README.md)
 - [Studio web client](apps/studio/web/README.md)
 

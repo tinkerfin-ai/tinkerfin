@@ -268,6 +268,12 @@ authoritative and is never destroyed. A confirmed missing or superseded candidat
 be destroyed idempotently; an unreadable result closes only the current worker's local
 connection so an uncertain authoritative remote is preserved.
 
+## Documentation
+
+- [Sandbox guide](https://github.com/tinkerfin-ai/tinkerfin/blob/main/docs/en/sandbox/index.md)
+- [Persistent state and extensions](https://github.com/tinkerfin-ai/tinkerfin/blob/main/docs/en/sandbox/persistence-and-extensions.md)
+- [Complete documentation](https://github.com/tinkerfin-ai/tinkerfin/blob/main/docs/en/README.md)
+
 ## License
 
 Apache License 2.0. See the

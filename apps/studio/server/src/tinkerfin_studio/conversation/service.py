@@ -384,15 +384,13 @@ class ConversationChatService:
         last_event_id: str | None,
     ) -> PreparedChat:
         """完成业务校验、Graph 创建和 Messaging 预握手"""
-
-        after = parse_last_event_id(last_event_id)
         latest_user_message = self._validate_mode(request)
-        model = await AgentModelService(AgentModelRepository(self._session)).resolve(
-            request.forwarded_props.model
-        )
         thread = await self._resolve_thread(
             request,
-            None if latest_user_message is None else latest_user_message[1],
+            latest_user_message,
+        )
+        model = await AgentModelService(AgentModelRepository(self._session)).resolve(
+            request.forwarded_props.model
         )
         message_ids = tuple(
             f"message-{uuid5(NAMESPACE_URL, f'tinkerfin-studio:{self._user.user_id}:{thread.thread_id}:{request.run_id}:{index}')}"
@@ -624,7 +622,7 @@ class ConversationChatService:
                 events,
                 stream=stream,
                 run=request.run_id,
-                after=after,
+                after=parse_last_event_id(last_event_id),
                 attach_identity={"user_id": self._user.user_id, "input": normalized},
                 on_committed=wake_projection,
             ),
@@ -698,7 +696,7 @@ class ConversationChatService:
     async def _resolve_thread(
         self,
         request: ChatRequest,
-        latest_user_message: str | None,
+        latest_user_message: tuple[int, str] | None,
     ) -> ConversationThread:
         thread_id = request.thread_id.strip()
         if thread_id:
@@ -723,7 +721,7 @@ class ConversationChatService:
                 thread = await self._repository.create_thread(
                     user_id=self._user.user_id,
                     thread_id=generated_thread_id,
-                    title=latest_user_message.strip()[:60],
+                    title=latest_user_message[1].strip()[:60],
                     model_id=request.forwarded_props.model,
                 )
         except IntegrityError:

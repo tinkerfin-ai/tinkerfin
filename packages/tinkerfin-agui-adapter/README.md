@@ -114,6 +114,12 @@ Both paths distinguish resolved, abandoned, and mixed decisions and never conver
 cancellation into rejection. `encode_sse(event, event_id=...)` encodes one event;
 delivery, persistence, retries, and transport cancellation remain caller-owned.
 
+## Documentation
+
+- [AG-UI guide](https://github.com/tinkerfin-ai/tinkerfin/blob/main/docs/en/agui/index.md)
+- [Adapter extensions](https://github.com/tinkerfin-ai/tinkerfin/blob/main/docs/en/agui/adapter-extensions.md)
+- [Complete documentation](https://github.com/tinkerfin-ai/tinkerfin/blob/main/docs/en/README.md)
+
 ## License
 
 Apache License 2.0. See the

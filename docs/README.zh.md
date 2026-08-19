@@ -16,7 +16,6 @@ packages/
 apps/studio/
 ├── server/                    Studio 服务端
 └── web/                       Studio Web 应用
-docs/                          Runtime 与集成文档
 ```
 
 ## 安装
@@ -92,11 +91,13 @@ asyncio.run(main())
 
 ## 文档
 
-- [运行时与集成指南](runtime.md)
+- [完整使用文档](zh/README.md)
+- [Runtime](zh/runtime/index.md)
+- [AG-UI](zh/agui/index.md)
+- [Messaging](zh/messaging/index.md)
+- [Sandbox](zh/sandbox/index.md)
 - [核心包](../packages/tinkerfin/README.md)
 - [AG-UI adapter](../packages/tinkerfin-agui-adapter/README.md)
-- [Messaging](../packages/tinkerfin-messaging/README.md)
-- [OpenSandbox 集成](../packages/tinkerfin-sandbox/README.md)
 - [Studio 服务端](../apps/studio/server/README.md)
 - [Studio Web 客户端](../apps/studio/web/README.md)
 

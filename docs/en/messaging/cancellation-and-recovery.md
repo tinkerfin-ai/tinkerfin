@@ -1,0 +1,139 @@
+# Cancellation, deferred sources, and recovery
+
+[Delivery, replay, and SSE](delivery-and-replay.md) · [中文](../../zh/messaging/cancellation-and-recovery.md)
+
+This guide covers remote cancellation, creating an expensive source only for the producer owner, and rebuilding a source after owner loss.
+
+## Remote cancellation
+
+Register a callback when starting the producer:
+
+```python
+async def cancel_agent(context):
+    running_task.cancel()
+    return cancellation_tail
+
+
+body = await channel.sse(
+    source,
+    stream="thread-42",
+    run="run-7",
+    cancel=cancel_agent,
+)
+```
+
+Cancel from another request:
+
+```python
+cancelled = await channel.cancel(
+    stream="thread-42",
+    run="run-7",
+)
+```
+
+The callback may take no arguments or one `CancelContext`. It may return a finite terminal tail for subscribers.
+
+TinkerFin AG-UI streams already declare cancellation. Do not also pass `cancel=` when the source owns that callback.
+
+| Result or error | Meaning |
+| --- | --- |
+| `True` | Cancellation was requested from the active producer |
+| `False` | The run had already settled |
+| `RunNotFound` | No such run exists |
+| `CancellationUnsupported` | The run has no cancellation callback |
+| `RunProducerFailed` | Producer or cancellation work failed |
+
+## Create the agent only for the owner
+
+Use `DeferredMessageSource` when Graph, model, or Sandbox setup is expensive:
+
+```python
+from tinkerfin_messaging import (
+    DeferredMessageSource,
+    MessageSourceBinding,
+)
+
+
+async def open_events():
+    runtime = await create_runtime()
+    events = runtime.astream(graph_input, graph_config)
+    return MessageSourceBinding(source=events)
+
+
+source = DeferredMessageSource(
+    open_events,
+    cancellable=True,
+    cancel_after_first_item=True,
+)
+```
+
+| Parameter | Purpose |
+| --- | --- |
+| `opener` | Asynchronously creates the source and returns `MessageSourceBinding` |
+| `cancellable` | Declares whether the opened source supports cancellation |
+| `cancel_after_first_item` | Prevents cancellation from overtaking the first protocol event |
+
+Attachments and replay-only requests close the deferred wrapper without opening the real source. `cancel_after_first_item=True` is useful for protocols that must emit `RUN_STARTED` first.
+
+`MessageSourceBinding` holds the source and an optional cancel callback. Leave the callback empty when the source already declares its own.
+
+## Fixed and transformed sources
+
+```python
+from tinkerfin_messaging import FiniteMessageSource, map_source
+
+
+finite = FiniteMessageSource.from_events((started, finished))
+
+
+async def enrich(event):
+    return add_request_metadata(event)
+
+
+mapped = map_source(source, enrich)
+```
+
+`map_source()` accepts a synchronous or asynchronous transform and preserves order, backpressure, cancellation tails, and close behavior.
+
+A transform may change the data type, so the mapped source no longer claims the original built-in codec profile. Configure the channel codec explicitly.
+
+## Recover after producer owner loss
+
+Implement `RecoverableSource` and use `wrap_recoverable()` when a source can restart from a stable position:
+
+```python
+subscription = await channel.wrap_recoverable(
+    recoverable_source,
+    stream="thread-42",
+    run="run-7",
+    after=0,
+)
+```
+
+Each item opened by the source is a `RecoverableMessage`:
+
+```python
+RecoverableMessage(
+    message_id="source-event-17",
+    data=event,
+    checkpoint=RecoveryCheckpoint(
+        position=b"17",
+        last_message_id="source-event-17",
+    ),
+)
+```
+
+| Field | Purpose |
+| --- | --- |
+| `message_id` | Stable ID used for idempotent commits |
+| `data` | Value to encode and persist |
+| `checkpoint.position` | Opaque restart position understood by the source |
+| `checkpoint.last_message_id` | Must match the current message ID |
+
+Stable message IDs make commits idempotent. They do not make model calls, tool calls, or database writes exactly once; external effects still need business idempotency or an outbox.
+
+## Close settlement timeout
+
+`Messaging(settlement_timeout=...)` limits how long the caller waits, not the protected cleanup itself. Timeout raises `MessagingSettlementTimeout` while accepted commits, cancellation tails, source closure, and backend settlement continue. A later `aclose()` waits for that same task.
+
+Next: [Redis, custom codecs, and backends](backends-and-codecs.md).
