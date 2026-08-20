@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 from ag_ui.core import (
     BaseEvent,
     RunErrorEvent,
@@ -106,5 +108,5 @@ class AgUiLifecycleEventFactory:
         raw_event = event.raw_event
         if not isinstance(raw_event, dict):
             return None
-        raw_run_id = raw_event.get("runId")
+        raw_run_id = cast(dict[object, object], raw_event).get("runId")
         return raw_run_id if isinstance(raw_run_id, str) else None

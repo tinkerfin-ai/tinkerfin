@@ -7,6 +7,8 @@ from ..backends.sdk import OpenSandboxBackend
 from ..errors import OpenSandboxBackendError, UnexpectedOpenSandboxBackendError
 from ..models import OpenSandboxConfig, OpenSandboxRuntimeInfo
 
+__all__ = ["_SandboxClientBoundary"]
+
 
 class _SandboxClient(Protocol):
     """Create, reconnect, inspect, destroy, and close remote sandboxes."""

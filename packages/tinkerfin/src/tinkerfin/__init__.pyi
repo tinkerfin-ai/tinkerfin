@@ -53,7 +53,7 @@ class TinkerFin(_RuntimeTinkerFin):
     def create_deep_agent(
         self,
         model: str | BaseChatModel | None = None,
-        tools: Sequence[BaseTool | Callable | dict[str, Any]] | None = None,
+        tools: Sequence[BaseTool | Callable | dict[str, Any]] | None = None,  # pyright: ignore[reportMissingTypeArgument,reportUnknownParameterType]
         *,
         system_prompt: str | SystemMessage | None = None,
         middleware: Sequence[AgentMiddleware[StateT_co, ContextT]] = (),
@@ -69,11 +69,11 @@ class TinkerFin(_RuntimeTinkerFin):
         | None = None,
         state_schema: type[DeepAgentState] | None = None,
         context_schema: type[ContextT] | None = None,
-        checkpointer: Checkpointer | None = None,
+        checkpointer: Checkpointer | None = None,  # pyright: ignore[reportUnknownParameterType]
         store: BaseStore | None = None,
         debug: bool = False,
         name: str | None = None,
-        cache: BaseCache | None = None,
+        cache: BaseCache | None = None,  # pyright: ignore[reportMissingTypeArgument,reportUnknownParameterType]
     ) -> DeepAgentDefinition[ContextT]: ...
 
 __all__: list[str]

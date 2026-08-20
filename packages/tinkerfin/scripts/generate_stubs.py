@@ -28,11 +28,11 @@ class _RenameTypes(ast.NodeTransformer):
     def __init__(self, replacements: Mapping[str, str]) -> None:
         self._replacements = replacements
 
-    def visit_Name(self, node: ast.Name) -> ast.Name:
-        return ast.copy_location(
-            ast.Name(id=self._replacements.get(node.id, node.id), ctx=node.ctx),
-            node,
-        )
+    def visit_Name(self, node: ast.Name) -> ast.expr:
+        replacement = self._replacements.get(node.id)
+        if replacement is None:
+            return node
+        return ast.copy_location(ast.parse(replacement, mode="eval").body, node)
 
 
 def _method(
@@ -86,6 +86,21 @@ def _format(content: str, *, target: Path) -> str:
     return completed.stdout
 
 
+def _with_pyright_ignores(
+    content: str,
+    ignores: Mapping[str, tuple[str, ...]],
+) -> str:
+    """Annotate locked upstream generic gaps without changing public signatures."""
+
+    lines = content.splitlines()
+    for index, line in enumerate(lines):
+        for marker, rules in ignores.items():
+            if marker in line:
+                lines[index] = f"{line}  # pyright: ignore[{','.join(rules)}]"
+                break
+    return "\n".join(lines) + "\n"
+
+
 def _render_deep_agent_stub() -> str:
     astream_arguments = {"InputT": "InputAgentState"}
     content = f"""# ruff: noqa: F403, F405
@@ -117,7 +132,16 @@ class DeepAgentDefinition(Generic[ContextT]):
 
 CREATE_DEEP_AGENT: object
 """
-    return _format(content, target=_DEEP_AGENT_STUB)
+    formatted = _format(content, target=_DEEP_AGENT_STUB)
+    return _with_pyright_ignores(
+        formatted,
+        {
+            "input: InputAgentState | Command | None,": (
+                "reportMissingTypeArgument",
+                "reportUnknownParameterType",
+            ),
+        },
+    )
 
 
 def _render_init_stub() -> str:
@@ -173,7 +197,23 @@ class TinkerFin(_RuntimeTinkerFin):
 
 __all__: list[str]
 """
-    return _format(content, target=_INIT_STUB)
+    formatted = _format(content, target=_INIT_STUB)
+    return _with_pyright_ignores(
+        formatted,
+        {
+            "tools: Sequence[BaseTool | Callable | dict[str, Any]] | None = None,": (
+                "reportMissingTypeArgument",
+                "reportUnknownParameterType",
+            ),
+            "checkpointer: Checkpointer | None = None,": (
+                "reportUnknownParameterType",
+            ),
+            "cache: BaseCache | None = None,": (
+                "reportMissingTypeArgument",
+                "reportUnknownParameterType",
+            ),
+        },
+    )
 
 
 def render_stubs() -> dict[Path, str]:

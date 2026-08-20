@@ -31,7 +31,7 @@ def enum_value(value: object) -> str:
     """Project a protocol enum or ordinary value to text."""
 
     if isinstance(value, Enum):
-        return str(cast(Enum, value).value)
+        return str(value.value)
     return str(value)
 
 
@@ -71,7 +71,7 @@ def raw_event_dict(event: AgentEvent) -> dict[str, JsonValue]:
     """Return a validated AG-UI `rawEvent` object when present."""
 
     raw_event = event.raw_event
-    return raw_event if isinstance(raw_event, dict) else {}
+    return cast(dict[str, JsonValue], raw_event) if isinstance(raw_event, dict) else {}
 
 
 def event_run_id(

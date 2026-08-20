@@ -12,7 +12,7 @@ import logging
 import posixpath
 import secrets
 import shlex
-from collections.abc import Awaitable, Callable, Iterable, Iterator
+from collections.abc import Awaitable, Callable, Generator, Iterable
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import timedelta
@@ -262,7 +262,7 @@ class OpenSandboxBackend(BaseSandbox):
         self.enable_capture_offload = enable_capture_offload
 
     @contextmanager
-    def _rooted_file_operation(self) -> Iterator[None]:
+    def _rooted_file_operation(self) -> Generator[None]:
         """Keep framework file commands outside user-writable import paths."""
         token = self._is_rooted_file_operation.set(True)
         try:

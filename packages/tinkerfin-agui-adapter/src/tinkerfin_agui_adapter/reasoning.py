@@ -9,7 +9,7 @@ from pydantic_core import to_jsonable_python
 
 _PRIVATE_PROVIDER_FIELD = "reasoning_content"
 _PROVIDER_METADATA_CONTAINER = "additional_kwargs"
-_JSON_VALUE_ADAPTER = TypeAdapter(JsonValue)
+_JSON_VALUE_ADAPTER: TypeAdapter[JsonValue] = TypeAdapter(JsonValue)
 
 
 def normalize_operational_data(value: object) -> JsonValue:

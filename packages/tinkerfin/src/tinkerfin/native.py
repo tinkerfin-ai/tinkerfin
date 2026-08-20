@@ -8,7 +8,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import fields, is_dataclass
 from datetime import date, datetime, time
 from enum import Enum
-from typing import Literal
+from typing import Literal, cast
 from uuid import UUID
 
 from langchain_core.messages import BaseMessage, message_to_dict
@@ -108,7 +108,7 @@ def _normalize(value: object, *, active: set[int] | None = None) -> JsonValue:
             "message": str(value),
         }
 
-    containers = set() if active is None else active
+    containers: set[int] = set() if active is None else active
     identity = id(value)
     if identity in containers:
         raise TinkerFinStreamProtocolError(
@@ -149,8 +149,9 @@ def _normalize(value: object, *, active: set[int] | None = None) -> JsonValue:
                 "value": normalized_fields,
             }
         if isinstance(value, Mapping):
+            mapping = cast(Mapping[object, object], value)
             normalized_mapping: dict[str, JsonValue] = {}
-            for key, item in value.items():
+            for key, item in mapping.items():
                 if not isinstance(key, str):
                     raise TypeError("native mapping keys must be strings")
                 normalized_mapping[key] = _normalize(item, active=containers)
@@ -158,10 +159,16 @@ def _normalize(value: object, *, active: set[int] | None = None) -> JsonValue:
         if isinstance(value, tuple):
             return {
                 "$type": "tuple",
-                "items": [_normalize(item, active=containers) for item in value],
+                "items": [
+                    _normalize(item, active=containers)
+                    for item in cast(tuple[object, ...], value)
+                ],
             }
         if isinstance(value, Sequence) and not isinstance(value, str):
-            return [_normalize(item, active=containers) for item in value]
+            return [
+                _normalize(item, active=containers)
+                for item in cast(Sequence[object], value)
+            ]
         raise TypeError(
             f"unsupported native stream value type: {_qualified_name(value)}"
         )
@@ -174,32 +181,35 @@ def normalize_native_stream_part(item: object) -> NativeStreamPart:
 
     if not isinstance(item, Mapping):
         raise TypeError("native stream part must be a mapping")
-    unknown = set(item) - {"type", "ns", "data", "interrupts"}
+    mapping = cast(Mapping[object, object], item)
+    unknown = set(mapping) - {"type", "ns", "data", "interrupts"}
     if unknown:
         raise TinkerFinStreamProtocolError(
             f"native stream part contains unknown fields: {unknown!r}"
         )
-    mode = item.get("type")
+    mode = mapping.get("type")
     if mode not in _NATIVE_MODES:
         raise TinkerFinStreamProtocolError(
             "native stream part type must be messages, tasks, values, updates, "
             "checkpoints, debug, or custom"
         )
-    namespace = item.get("ns")
+    namespace = mapping.get("ns")
     if not isinstance(namespace, tuple) or not all(
-        isinstance(component, str) for component in namespace
+        isinstance(component, str) for component in cast(tuple[object, ...], namespace)
     ):
         raise TypeError("native stream part ns must be a tuple of strings")
-    if "data" not in item:
+    if "data" not in mapping:
         raise TinkerFinStreamProtocolError("native stream part must contain data")
-    raw_interrupts = item.get("interrupts", ())
+    raw_interrupts = mapping.get("interrupts", ())
     if not isinstance(raw_interrupts, tuple):
         raise TypeError("native stream part interrupts must be a tuple")
     return NativeStreamPart(
-        type=mode,
-        ns=namespace,
-        data=_normalize(item["data"]),
-        interrupts=tuple(_normalize(value) for value in raw_interrupts),
+        type=cast(NativeMode, mode),
+        ns=cast(tuple[str, ...], namespace),
+        data=_normalize(mapping["data"]),
+        interrupts=tuple(
+            _normalize(value) for value in cast(tuple[object, ...], raw_interrupts)
+        ),
     )
 
 

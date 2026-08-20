@@ -1,0 +1,451 @@
+"""SQLAlchemy table metadata, schema validation, and deployable DDL."""
+
+from __future__ import annotations
+
+__all__ = ["_validate_schema"]
+
+from typing import TYPE_CHECKING, Literal
+
+from sqlalchemy import (
+    BigInteger,
+    Column,
+    DateTime,
+    Index,
+    Integer,
+    MetaData,
+    PrimaryKeyConstraint,
+    String,
+    Table,
+    insert,
+    text,
+)
+from sqlalchemy import inspect as sa_inspect
+from sqlalchemy.dialects import mysql as mysql_dialect
+from sqlalchemy.dialects import sqlite as sqlite_dialect
+from sqlalchemy.engine import Connection
+from sqlalchemy.schema import CreateIndex, CreateTable, DefaultClause
+
+from ..errors import OpenSandboxStateError
+
+if TYPE_CHECKING:
+    from .sqlalchemy import SQLAlchemyOpenSandboxStateSchema
+
+_SCHEMA_VERSION = 2
+
+
+_metadata = MetaData()
+
+
+_schema_versions = Table(
+    "tinkerfin_opensandbox_schema_versions",
+    _metadata,
+    Column(
+        "component",
+        String(64),
+        primary_key=True,
+        comment="Persistent component whose schema version is recorded",
+    ),
+    Column(
+        "version",
+        Integer,
+        nullable=False,
+        comment="Latest fully committed forward migration",
+    ),
+    comment="Internal OpenSandbox State schema version",
+)
+
+
+_owners = Table(
+    "tinkerfin_opensandbox_owners",
+    _metadata,
+    Column(
+        "namespace",
+        String(64),
+        nullable=False,
+        comment="Logical OpenSandbox State deployment namespace",
+    ),
+    Column(
+        "owner_digest",
+        String(43),
+        nullable=False,
+        comment="URL-safe SHA-256 digest of the namespace and owner key",
+    ),
+    Column(
+        "sandbox_id",
+        String(255),
+        nullable=True,
+        comment="Currently committed remote OpenSandbox identifier",
+    ),
+    Column(
+        "binding_generation",
+        BigInteger,
+        nullable=False,
+        server_default=text("0"),
+        comment="Fencing generation that committed the current Sandbox binding",
+    ),
+    Column(
+        "generation",
+        BigInteger,
+        nullable=False,
+        server_default=text("0"),
+        comment="Monotonic fencing generation for owner transitions",
+    ),
+    Column(
+        "claim_token",
+        String(32),
+        nullable=True,
+        comment="Opaque token of the worker currently changing this owner",
+    ),
+    Column(
+        "lease_expires_at",
+        DateTime(timezone=False),
+        nullable=True,
+        comment="UTC expiry of the current owner transition lease",
+    ),
+    Column(
+        "updated_at",
+        DateTime(timezone=False),
+        nullable=False,
+        comment="UTC time of the latest owner state mutation",
+    ),
+    PrimaryKeyConstraint("namespace", "owner_digest"),
+    comment="Authoritative owner binding and transition fencing state",
+)
+
+
+Index(
+    "ix_tinkerfin_opensandbox_owners_lease",
+    _owners.c.namespace,
+    _owners.c.lease_expires_at,
+)
+
+
+def _type_signature(column_type: object) -> tuple[str, int | None]:
+    """Normalize reflected SQLite/MySQL types into the schema contract."""
+    if isinstance(column_type, String):
+        return ("string", column_type.length)
+    if isinstance(column_type, BigInteger):
+        return ("bigint", None)
+    if isinstance(column_type, Integer):
+        return ("integer", None)
+    if isinstance(column_type, DateTime):
+        return ("datetime", None)
+    return (type(column_type).__name__.lower(), None)
+
+
+def _default_signature(value: object | None) -> str | None:
+    """Normalize equivalent SQLite/MySQL reflected server defaults."""
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    while len(normalized) >= 2 and normalized[0] == "(" and normalized[-1] == ")":
+        normalized = normalized[1:-1].strip()
+    if (
+        len(normalized) >= 2
+        and normalized[0] in {"'", '"'}
+        and normalized[-1] == normalized[0]
+    ):
+        normalized = normalized[1:-1]
+    return normalized.casefold()
+
+
+def _validate_schema(sync_connection: Connection) -> None:
+    """Reject existing tables that do not match the internal State schema."""
+    inspector = sa_inspect(sync_connection)
+    issues: list[str] = []
+    for table in _metadata.sorted_tables:
+        if not inspector.has_table(table.name):
+            issues.append(f"{table.name}: missing table")
+            continue
+
+        reflected_columns = {
+            str(column["name"]): column for column in inspector.get_columns(table.name)
+        }
+        expected_names = {column.name for column in table.columns}
+        actual_names = set(reflected_columns)
+        if actual_names != expected_names:
+            missing = sorted(expected_names - actual_names)
+            unexpected = sorted(actual_names - expected_names)
+            issues.append(
+                f"{table.name}: columns differ; missing={missing}, "
+                f"unexpected={unexpected}"
+            )
+            continue
+
+        for expected in table.columns:
+            actual = reflected_columns[expected.name]
+            if _type_signature(actual["type"]) != _type_signature(expected.type):
+                issues.append(f"{table.name}.{expected.name}: incompatible type")
+            if bool(actual["nullable"]) != bool(expected.nullable):
+                issues.append(f"{table.name}.{expected.name}: incompatible nullable")
+            server_default = expected.server_default
+            expected_default = _default_signature(
+                server_default.arg
+                if isinstance(server_default, DefaultClause)
+                else server_default
+            )
+            actual_default = _default_signature(actual.get("default"))
+            if actual_default != expected_default:
+                issues.append(f"{table.name}.{expected.name}: incompatible default")
+
+        reflected_primary_key = tuple(
+            inspector.get_pk_constraint(table.name).get("constrained_columns") or ()
+        )
+        expected_primary_key = tuple(
+            column.name for column in table.primary_key.columns
+        )
+        if reflected_primary_key != expected_primary_key:
+            issues.append(f"{table.name}: incompatible primary key")
+
+        reflected_indexes = {
+            str(index["name"]): tuple(index.get("column_names") or ())
+            for index in inspector.get_indexes(table.name)
+            if index.get("name") is not None
+        }
+        for expected_index in table.indexes:
+            expected_name = expected_index.name
+            if expected_name is None:
+                issues.append(f"{table.name}: expected index has no name")
+                continue
+            expected_columns = tuple(column.name for column in expected_index.columns)
+            if reflected_indexes.get(expected_name) != expected_columns:
+                issues.append(
+                    f"{table.name}: missing or incompatible index {expected_name}"
+                )
+
+    if issues:
+        raise OpenSandboxStateError(
+            "OpenSandbox State schema is incompatible: " + "; ".join(issues)
+        )
+
+
+_workers = Table(
+    "tinkerfin_opensandbox_workers",
+    _metadata,
+    Column(
+        "namespace",
+        String(64),
+        nullable=False,
+        comment="Logical OpenSandbox State deployment namespace",
+    ),
+    Column(
+        "worker_id",
+        String(32),
+        nullable=False,
+        comment="Opaque identifier of one live State instance",
+    ),
+    Column(
+        "warm_pool_size",
+        Integer,
+        nullable=False,
+        comment="Global ready Sandbox capacity requested by this worker",
+    ),
+    Column(
+        "lease_expires_at",
+        DateTime(timezone=False),
+        nullable=False,
+        comment="UTC expiry used to ignore workers that exited without cleanup",
+    ),
+    Column(
+        "updated_at",
+        DateTime(timezone=False),
+        nullable=False,
+        comment="UTC time of the latest Worker registration mutation",
+    ),
+    PrimaryKeyConstraint("namespace", "worker_id"),
+    comment="Live OpenSandbox State workers and shared warm-pool agreement",
+)
+
+
+Index(
+    "ix_tinkerfin_opensandbox_workers_lease",
+    _workers.c.namespace,
+    _workers.c.lease_expires_at,
+)
+
+
+_warm_slots = Table(
+    "tinkerfin_opensandbox_warm_slots",
+    _metadata,
+    Column(
+        "namespace",
+        String(64),
+        nullable=False,
+        comment="Logical OpenSandbox State deployment namespace",
+    ),
+    Column(
+        "slot",
+        Integer,
+        nullable=False,
+        comment="Zero-based global warm-pool slot within the namespace",
+    ),
+    Column(
+        "sandbox_id",
+        String(255),
+        nullable=True,
+        comment="Ready remote Sandbox currently held by this global slot",
+    ),
+    Column(
+        "generation",
+        BigInteger,
+        nullable=False,
+        server_default=text("0"),
+        comment="Monotonic fencing generation for this warm slot",
+    ),
+    Column(
+        "claim_token",
+        String(32),
+        nullable=True,
+        comment="Opaque token of the worker currently filling this slot",
+    ),
+    Column(
+        "lease_expires_at",
+        DateTime(timezone=False),
+        nullable=True,
+        comment="UTC expiry of the current warm-slot fill lease",
+    ),
+    Column(
+        "updated_at",
+        DateTime(timezone=False),
+        nullable=False,
+        comment="UTC time of the latest warm-slot mutation",
+    ),
+    PrimaryKeyConstraint("namespace", "slot"),
+    comment="Database-global OpenSandbox warm-pool slots",
+)
+
+
+Index(
+    "ix_tinkerfin_opensandbox_warm_slots_available",
+    _warm_slots.c.namespace,
+    _warm_slots.c.sandbox_id,
+    _warm_slots.c.lease_expires_at,
+)
+
+
+_cleanup = Table(
+    "tinkerfin_opensandbox_cleanup",
+    _metadata,
+    Column(
+        "namespace",
+        String(64),
+        nullable=False,
+        comment="Logical OpenSandbox State deployment namespace",
+    ),
+    Column(
+        "sandbox_id",
+        String(255),
+        nullable=False,
+        comment="Orphaned remote Sandbox awaiting confirmed destruction",
+    ),
+    Column(
+        "generation",
+        BigInteger,
+        nullable=False,
+        server_default=text("0"),
+        comment="Monotonic fencing generation for cleanup attempts",
+    ),
+    Column(
+        "claim_token",
+        String(32),
+        nullable=True,
+        comment="Opaque token of the worker currently destroying this Sandbox",
+    ),
+    Column(
+        "lease_expires_at",
+        DateTime(timezone=False),
+        nullable=True,
+        comment="UTC expiry of the current cleanup lease",
+    ),
+    Column(
+        "attempts",
+        Integer,
+        nullable=False,
+        server_default=text("0"),
+        comment="Number of times this cleanup target has been claimed",
+    ),
+    Column(
+        "created_at",
+        DateTime(timezone=False),
+        nullable=False,
+        comment="UTC time when this cleanup target was first enqueued",
+    ),
+    Column(
+        "updated_at",
+        DateTime(timezone=False),
+        nullable=False,
+        comment="UTC time of the latest cleanup mutation",
+    ),
+    PrimaryKeyConstraint("namespace", "sandbox_id"),
+    comment="Durable retry queue for failed remote Sandbox destruction",
+)
+
+
+Index(
+    "ix_tinkerfin_opensandbox_cleanup_lease",
+    _cleanup.c.namespace,
+    _cleanup.c.lease_expires_at,
+)
+
+
+def get_sqlalchemy_opensandbox_state_schema(
+    *,
+    dialect: Literal["mysql", "sqlite"],
+) -> SQLAlchemyOpenSandboxStateSchema:
+    """Build the complete OpenSandbox State schema without database I/O.
+
+    Args:
+        dialect: Deployment SQL dialect. MySQL output targets the common MySQL
+            5.7 and 8.x DDL subset.
+
+    Returns:
+        An immutable descriptor containing deterministic full-database DDL.
+
+    Raises:
+        ValueError: The requested dialect is not ``mysql`` or ``sqlite``.
+    """
+
+    from .sqlalchemy import SQLAlchemyOpenSandboxStateSchema
+
+    if dialect == "mysql":
+        compiler = mysql_dialect.dialect()
+        compiler.server_version_info = (5, 7, 0)
+    elif dialect == "sqlite":
+        compiler = sqlite_dialect.dialect()
+    else:
+        raise ValueError("dialect must be 'mysql' or 'sqlite'")
+
+    tables = tuple(_metadata.sorted_tables)
+    statements = [
+        str(CreateTable(table).compile(dialect=compiler)).strip() for table in tables
+    ]
+    indexes = sorted(
+        (index for table in tables for index in table.indexes),
+        key=lambda index: str(index.name),
+    )
+    statements.extend(
+        str(CreateIndex(index).compile(dialect=compiler)).strip() for index in indexes
+    )
+    version_insert = insert(_schema_versions).values(
+        component="opensandbox-state",
+        version=_SCHEMA_VERSION,
+    )
+    statements.append(
+        str(
+            version_insert.compile(
+                dialect=compiler,
+                compile_kwargs={"literal_binds": True},
+            )
+        ).strip()
+    )
+    normalized = tuple(
+        "\n".join(line.rstrip() for line in statement.splitlines())
+        for statement in statements
+    )
+    return SQLAlchemyOpenSandboxStateSchema(
+        component="opensandbox-state",
+        version=_SCHEMA_VERSION,
+        dialect=dialect,
+        table_names=tuple(str(table.name) for table in tables),
+        ddl=";\n\n".join(normalized) + ";\n",
+    )

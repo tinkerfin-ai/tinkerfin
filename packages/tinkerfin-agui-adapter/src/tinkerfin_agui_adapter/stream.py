@@ -1,4 +1,4 @@
-"""High-level, backpressured Deep Agents v2 to AG-UI streaming."""
+"""High-level, backpressure Deep Agents v2 to AG-UI streaming."""
 
 from __future__ import annotations
 

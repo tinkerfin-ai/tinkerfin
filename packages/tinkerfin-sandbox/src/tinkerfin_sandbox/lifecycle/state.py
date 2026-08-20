@@ -153,7 +153,9 @@ async def _call_state(
         raise translated from error
 
 
-class _OpenSandboxStateBoundary(OpenSandboxState):
+class _OpenSandboxStateBoundary(  # pyright: ignore[reportUnusedClass]
+    OpenSandboxState
+):
     """Enforce the State failure contract for replaceable implementations."""
 
     def __init__(self, state: OpenSandboxState) -> None:

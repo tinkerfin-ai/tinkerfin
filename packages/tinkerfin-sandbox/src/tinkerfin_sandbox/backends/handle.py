@@ -7,7 +7,7 @@ remote instance. Started calls finish on their leased backend before it is recla
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncGenerator, Generator
 from contextlib import (
     asynccontextmanager,
     contextmanager,
@@ -79,13 +79,15 @@ class OpenSandboxHandle(BaseSandbox):
             return self._closed
 
     @property
-    def enable_capture_offload(self) -> bool:
+    def enable_capture_offload(  # pyright: ignore[reportIncompatibleVariableOverride]
+        self,
+    ) -> bool:
         """Return whether the current backend supports source-side output offload."""
         with self._condition:
             return bool(getattr(self._backend, "enable_capture_offload", False))
 
     @contextmanager
-    def _lease(self) -> Iterator[OpenSandboxBackend]:
+    def _lease(self) -> Generator[OpenSandboxBackend]:
         """Pin one backend for a call and register its in-flight lease."""
         backend = self._acquire_backend()
         try:
@@ -94,7 +96,7 @@ class OpenSandboxHandle(BaseSandbox):
             self._release_backend(backend)
 
     @asynccontextmanager
-    async def _alease(self) -> AsyncIterator[OpenSandboxBackend]:
+    async def _alease(self) -> AsyncGenerator[OpenSandboxBackend]:
         """Lease a backend without performing remote I/O during registration."""
         backend = self._acquire_backend()
         try:

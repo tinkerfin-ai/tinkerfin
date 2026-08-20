@@ -60,18 +60,23 @@ class ScopedIdCodec:
             payload = json.loads(decoded.decode("utf-8"))
         except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ValueError("invalid scoped ID") from error
+        if not isinstance(payload, list):
+            raise ValueError(  # noqa: TRY004 - preserve the decode error contract
+                "invalid scoped ID"
+            )
+        payload_items = cast(list[object], payload)
         if (
-            not isinstance(payload, list)
-            or len(payload) != 3
-            or payload[0] != _VERSION
-            or not isinstance(payload[1], list)
-            or not isinstance(payload[2], str)
+            len(payload_items) != 3
+            or payload_items[0] != _VERSION
+            or not isinstance(payload_items[1], list)
+            or not isinstance(payload_items[2], str)
         ):
             raise ValueError("invalid scoped ID")
-        namespace = tuple(payload[1])
+        namespace = cast(tuple[str, ...], tuple(cast(list[object], payload_items[1])))
         kind = cast(ScopedIdKind, raw_kind)
-        self._validate(kind, namespace, payload[2])
-        return kind, namespace, payload[2]
+        raw_id = payload_items[2]
+        self._validate(kind, namespace, raw_id)
+        return kind, namespace, raw_id
 
     @staticmethod
     def _validate(

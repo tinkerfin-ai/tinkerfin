@@ -16,6 +16,7 @@ dev = [
     "pyright>=1.1.411,<2.0.0",
     "pytest>=8.3.5,<10.0.0",
     "pytest-asyncio>=0.25.3,<2.0.0",
+    "pytest-cov>=7,<8",
     "ruff>=0.16.1,<0.17.0",
     "sqlalchemy[asyncio]>=2.0.48,<3",
 ]
@@ -35,10 +36,7 @@ default = true
 
 [tool.uv.workspace]
 members = [
-    "packages/tinkerfin",
-    "packages/tinkerfin-agui-adapter",
-    "packages/tinkerfin-messaging",
-    "packages/tinkerfin-sandbox",
+    "packages/*",
     "apps/studio/server",
 ]
 
@@ -73,16 +71,10 @@ select = [
 
 [tool.pyright]
 include = [
-    "packages/tinkerfin/src",
-    "packages/tinkerfin/tests",
-    "packages/tinkerfin-agui-adapter/src",
-    "packages/tinkerfin-agui-adapter/tests",
-    "packages/tinkerfin-messaging/src",
-    "packages/tinkerfin-messaging/tests",
-    "packages/tinkerfin-sandbox/src",
-    "packages/tinkerfin-sandbox/tests",
-    "apps/studio/server/src",
-    "apps/studio/server/tests",
+    "packages/*/src",
+    "packages/*/tests",
+    "apps/*/*/src",
+    "apps/*/*/tests",
 ]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
@@ -112,3 +104,17 @@ addopts = [
     "--strict-config",
     "--strict-markers",
 ]
+
+[tool.coverage.run]
+branch = true
+source = [
+    "tinkerfin",
+    "tinkerfin_agui_adapter",
+    "tinkerfin_messaging",
+    "tinkerfin_sandbox",
+]
+
+[tool.coverage.report]
+fail_under = 80
+precision = 2
+show_missing = true

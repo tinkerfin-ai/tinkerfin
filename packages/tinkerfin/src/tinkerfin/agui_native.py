@@ -53,7 +53,11 @@ def _bind_graph_identity(
         if variable_keyword is None:
             return None
         options = bound.arguments.get(variable_keyword)
-        return options.get(name) if isinstance(options, Mapping) else None
+        return (
+            cast(Mapping[object, object], options).get(name)
+            if isinstance(options, Mapping)
+            else None
+        )
 
     def write(name: str, value: object) -> None:
         parameter = parameters.get(name)
@@ -66,7 +70,11 @@ def _bind_graph_identity(
         if variable_keyword is None:
             raise TypeError(f"Graph astream must accept the {name!r} option")
         raw_options = bound.arguments.get(variable_keyword)
-        options = dict(raw_options) if isinstance(raw_options, Mapping) else {}
+        options: dict[object, object] = (
+            dict(cast(Mapping[object, object], raw_options))
+            if isinstance(raw_options, Mapping)
+            else {}
+        )
         options[name] = value
         bound.arguments[variable_keyword] = options
 
@@ -74,14 +82,14 @@ def _bind_graph_identity(
     if raw_config is None:
         config: dict[str, object] = {}
     elif isinstance(raw_config, Mapping):
-        config = dict(raw_config)
+        config = dict(cast(Mapping[str, object], raw_config))
     else:
         raise TypeError("config must be a mapping or None")
     raw_configurable = config.get("configurable")
     if raw_configurable is None:
         configurable: dict[str, object] = {}
     elif isinstance(raw_configurable, Mapping):
-        configurable = dict(raw_configurable)
+        configurable = dict(cast(Mapping[str, object], raw_configurable))
     else:
         raise TypeError("config.configurable must be a mapping")
     configured_thread = configurable.get("thread_id")
@@ -214,7 +222,7 @@ class AgUiNativeStreamInvocation:
         )
 
 
-def _bind_agui_graph_astream(
+def _bind_agui_graph_astream(  # pyright: ignore[reportUnusedFunction]
     astream: Callable[..., AsyncIterator[Mapping[str, object]]],
     /,
     *args: object,
@@ -234,7 +242,7 @@ def _bind_agui_graph_astream(
         if isinstance(raw_modes, str):
             modes: tuple[object, ...] = (raw_modes,)
         elif isinstance(raw_modes, Sequence):
-            modes = tuple(raw_modes)
+            modes = tuple(cast(Sequence[object], raw_modes))
         else:
             raise AgUiNativeStreamConfigurationError(
                 "AG-UI stream_mode must be a stream mode or sequence of modes"

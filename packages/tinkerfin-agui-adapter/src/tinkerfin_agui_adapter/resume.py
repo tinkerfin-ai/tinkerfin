@@ -45,6 +45,15 @@ class ResumeMappingError(AgUiAdapterError, ValueError):
         super().__init__(message, cause=cause)
 
 
+def _empty_decisions_by_interrupt() -> dict[
+    str,
+    tuple[dict[str, object] | None, ...],
+]:
+    """Create isolated decision storage for one translation."""
+
+    return {}
+
+
 @dataclass(frozen=True, slots=True)
 class ResumeTranslation:
     """Lossless classification of resolved, abandoned, and mixed resume data.
@@ -62,7 +71,7 @@ class ResumeTranslation:
     decisions_by_interrupt: Mapping[
         str,
         tuple[dict[str, object] | None, ...],
-    ] = field(default_factory=dict)
+    ] = field(default_factory=_empty_decisions_by_interrupt)
 
     @property
     def root(self) -> dict[str, JsonValue]:
@@ -636,14 +645,15 @@ class ResumeMapper:
         entry: ResumeEntry,
         pending: _PendingInterruptAction,
     ) -> dict[str, object]:
-        if entry.payload is None:
+        raw_payload = cast(object, entry.payload)
+        if raw_payload is None:
             raise ResumeMappingError(
                 AgUiAdapterErrorCode.RESUME_PAYLOAD_REQUIRED,
                 f"interruptId={entry.interrupt_id} requires a payload",
             )
-        if not isinstance(entry.payload, Mapping):
+        if not isinstance(raw_payload, Mapping):
             ResumeMapper._raise_invalid_payload(entry.interrupt_id)
-        payload = dict(entry.payload)
+        payload = dict(cast(Mapping[object, object], raw_payload))
         decision_type = payload.get("type")
         if decision_type not in {"approve", "edit", "reject", "respond"}:
             ResumeMapper._raise_invalid_payload(entry.interrupt_id)
@@ -668,18 +678,20 @@ class ResumeMapper:
             edited_action = payload.get("edited_action")
             if not isinstance(edited_action, Mapping):
                 ResumeMapper._raise_invalid_payload(entry.interrupt_id)
-            if set(edited_action) != {"name", "args"}:
+            edited_mapping = cast(Mapping[object, object], edited_action)
+            if set(edited_mapping) != {"name", "args"}:
                 ResumeMapper._raise_invalid_payload(entry.interrupt_id)
-            name = edited_action.get("name")
-            args = edited_action.get("args")
+            name = edited_mapping.get("name")
+            args = edited_mapping.get("args")
             if not isinstance(name, str) or not name or not isinstance(args, Mapping):
                 ResumeMapper._raise_invalid_payload(entry.interrupt_id)
+            args_mapping = cast(Mapping[object, object], args)
             # Deep Agents does not re-run review policy after an edit, so the Tool
             # identity is fixed and only its arguments may change.
             if name != pending.action_name:
                 ResumeMapper._raise_invalid_payload(entry.interrupt_id)
             try:
-                normalized = normalize_operational_data(args)
+                normalized = normalize_operational_data(args_mapping)
                 normalized_args = JsonObject.model_validate(normalized).root
             except (TypeError, ValueError) as error:
                 raise ResumeMappingError(

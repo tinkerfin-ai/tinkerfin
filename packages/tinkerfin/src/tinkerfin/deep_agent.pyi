@@ -24,7 +24,7 @@ from .runtime import AgUiEventStream, EventObserver, NativeGraphRunStream, PartO
 class DeepAgentRuntime(Generic[ContextT]):
     def astream(
         self,
-        input: InputAgentState | Command | None,
+        input: InputAgentState | Command | None,  # pyright: ignore[reportMissingTypeArgument,reportUnknownParameterType]
         config: RunnableConfig | None = None,
         *,
         context: ContextT | None = None,
@@ -44,7 +44,7 @@ class DeepAgentRuntime(Generic[ContextT]):
 class DeepAgentAgUiRuntime(Generic[ContextT]):
     def astream(
         self,
-        input: InputAgentState | Command | None,
+        input: InputAgentState | Command | None,  # pyright: ignore[reportMissingTypeArgument,reportUnknownParameterType]
         config: RunnableConfig | None = None,
         *,
         context: ContextT | None = None,

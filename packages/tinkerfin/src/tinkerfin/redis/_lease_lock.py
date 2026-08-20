@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import math
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
 from types import TracebackType
@@ -321,7 +321,11 @@ class RedisLeaseLock:
             renew_interval_seconds=renew_interval_seconds,
             wait_poll_seconds=wait_poll_seconds,
         )
-        client = Redis.from_url(url, decode_responses=False)
+        redis_from_url = cast(
+            Callable[..., Redis],
+            Redis.from_url,  # pyright: ignore[reportUnknownMemberType]
+        )
+        client = redis_from_url(url, decode_responses=False)
         return cls(
             client=client,
             owns_client=True,
@@ -419,7 +423,7 @@ class RedisLeaseLock:
 
         return self._hold(resource_key)
 
-    @asynccontextmanager
+    @asynccontextmanager  # pyright: ignore[reportDeprecated]
     async def _hold(self, resource_key: str) -> AsyncIterator[RedisLease]:
         canonical_key = _resource_key(resource_key)
         await self._register_scope()

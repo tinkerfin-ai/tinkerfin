@@ -5,6 +5,8 @@ import shlex
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
+from hashlib import sha256
+from importlib.resources import files
 from pathlib import Path
 
 import pytest
@@ -20,6 +22,20 @@ from tinkerfin_sandbox.backends._rooted_protocol import (
     _RootedError,
     _RootedTransferHandshake,
 )
+
+
+def test_rooted_helper_resource_remains_byte_stable() -> None:
+    resource = (
+        files("tinkerfin_sandbox.backends")
+        .joinpath("_rooted_helper.py.txt")
+        .read_bytes()
+        .decode("utf-8")
+        .strip()
+    )
+    assert resource == _rooted_protocol._ROOTED_HELPER_SCRIPT
+    assert sha256(resource.encode()).hexdigest() == (
+        "ea71852d53a8421258a00874a2d60bdcee6be49742cc049cdffa357a970dfa08"
+    )
 
 
 def _local_backend(*, cwd: Path | str = "/") -> LocalShellBackend:

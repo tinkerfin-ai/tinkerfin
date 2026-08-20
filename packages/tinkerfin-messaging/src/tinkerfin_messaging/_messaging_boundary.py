@@ -1,0 +1,268 @@
+"""Backend error translation and subscription lifecycle operations."""
+
+from __future__ import annotations
+
+__all__ = [
+    "_derived_message_id",
+    "_invoke_cancel",
+    "_iterate_backend",
+    "_join_owned_task",
+    "_normalize_cancel_callback",
+    "_read_backend",
+    "_validate_optional_cursor",
+]
+
+import asyncio
+import hashlib
+import inspect
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable
+from typing import TYPE_CHECKING, TypeAlias, TypeVar, cast
+
+from tinkerfin_agui_adapter import Identity
+
+from .errors import (
+    MessagingBackendError,
+    MessagingError,
+    SseRenderingUnsupported,
+    UnexpectedMessagingBackendError,
+)
+from .models import DecodedMessage
+
+if TYPE_CHECKING:
+    from .messaging import CancelContext, MessageSubscription
+
+BackendResultT = TypeVar("BackendResultT")
+ProducedT = TypeVar("ProducedT")
+ReplayT = TypeVar("ReplayT")
+
+_CancelResult: TypeAlias = (
+    Iterable[ProducedT] | Awaitable[Iterable[ProducedT] | None] | None
+)
+_ContextCancelCallback: TypeAlias = Callable[
+    ["CancelContext"],
+    _CancelResult[ProducedT],
+]
+CancelCallback: TypeAlias = (
+    Callable[[], _CancelResult[ProducedT]] | _ContextCancelCallback[ProducedT]
+)
+
+
+def _unexpected_backend_error(
+    operation: str,
+    error: Exception,
+) -> UnexpectedMessagingBackendError:
+    return UnexpectedMessagingBackendError(
+        f"Messaging backend {operation} failed",
+        diagnostic_context={"operation": operation},
+        cause=error,
+    )
+
+
+async def _await_backend(
+    operation: str,
+    awaitable: Awaitable[BackendResultT],
+) -> BackendResultT:
+    try:
+        return await awaitable
+    except MessagingError as error:
+        if isinstance(error, MessagingBackendError):
+            error._enrich_diagnostic_context({"operation": operation})
+        raise
+    except Exception as error:
+        translated = _unexpected_backend_error(operation, error)
+        raise translated from error
+
+
+def _read_backend(
+    operation: str,
+    reader: Callable[[], BackendResultT],
+) -> BackendResultT:
+    try:
+        return reader()
+    except MessagingError as error:
+        if isinstance(error, MessagingBackendError):
+            error._enrich_diagnostic_context({"operation": operation})
+        raise
+    except Exception as error:
+        translated = _unexpected_backend_error(operation, error)
+        raise translated from error
+
+
+async def _iterate_backend(
+    operation: str,
+    iterator: AsyncIterator[BackendResultT],
+) -> AsyncGenerator[BackendResultT, None]:
+    try:
+        async for item in iterator:
+            yield item
+    except MessagingError as error:
+        if isinstance(error, MessagingBackendError):
+            error._enrich_diagnostic_context({"operation": operation})
+        raise
+    except Exception as error:
+        translated = _unexpected_backend_error(operation, error)
+        raise translated from error
+
+
+def _derived_message_id(identity: Identity, ordinal: int) -> str:
+    """Keep ordinary message IDs bounded without changing the common readable form."""
+
+    candidate = f"{identity.run_id}:{ordinal}"
+    if len(candidate) <= 1024:
+        return candidate
+    digest = hashlib.sha256(candidate.encode()).hexdigest()
+    return f"sha256:{digest}"
+
+
+def _validate_optional_cursor(after: int | None) -> None:
+    if after is not None and (isinstance(after, bool) or not isinstance(after, int)):
+        raise TypeError("after must be an integer or None")
+
+
+async def _close_async_iterator(iterator: AsyncIterator[object]) -> None:
+    close = getattr(iterator, "aclose", None)
+    if close is None:
+        return
+    result = close()
+    if inspect.isawaitable(result):
+        await result
+
+
+async def _invoke_cancel(
+    callback: _ContextCancelCallback[ProducedT],
+    context: CancelContext,
+) -> Iterable[ProducedT] | None:
+    result = callback(context)
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+def _normalize_cancel_callback(
+    callback: CancelCallback[ProducedT],
+) -> _ContextCancelCallback[ProducedT]:
+    """Normalize one supported public signature before claiming a durable run."""
+
+    from .messaging import CancelContext
+
+    try:
+        signature = inspect.signature(callback)
+    except (TypeError, ValueError) as error:
+        raise TypeError(
+            "cancel callback must expose an inspectable signature"
+        ) from error
+
+    try:
+        signature.bind()
+    except TypeError:
+        pass
+    else:
+        zero_argument = cast(Callable[[], _CancelResult[ProducedT]], callback)
+
+        def invoke_without_context(
+            _context: CancelContext,
+        ) -> _CancelResult[ProducedT]:
+            return zero_argument()
+
+        return invoke_without_context
+
+    try:
+        signature.bind(
+            CancelContext(
+                channel="callback",
+                identity=Identity(threadId="callback", runId="callback"),
+            )
+        )
+    except TypeError as error:
+        raise TypeError(
+            "cancel callback must accept no arguments or one positional CancelContext"
+        ) from error
+    return cast(_ContextCancelCallback[ProducedT], callback)
+
+
+async def _join_owned_task(task: asyncio.Task[None]) -> None:
+    """Settle an owned task while preserving caller cancellation and task failure."""
+
+    current = asyncio.current_task()
+    cancel_count = current.cancelling() if current is not None else 0
+    caller_cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as cancellation:
+            next_cancel_count = current.cancelling() if current is not None else 0
+            if next_cancel_count > cancel_count:
+                if caller_cancellation is None:
+                    caller_cancellation = cancellation
+                cancel_count = next_cancel_count
+                continue
+            if task.done():
+                break
+            raise
+        except BaseException:
+            if task.done():
+                break
+            raise
+
+    task_error: BaseException | None = None
+    try:
+        task.result()
+    except BaseException as error:  # noqa: BLE001 - preserve owned task outcome
+        task_error = error
+    if caller_cancellation is not None:
+        if task_error is not None:
+            caller_cancellation.add_note(
+                "Messaging close also failed: "
+                f"{type(task_error).__name__}: {task_error}"
+            )
+        raise caller_cancellation.with_traceback(caller_cancellation.__traceback__)
+    if task_error is not None:
+        raise task_error.with_traceback(task_error.__traceback__)
+
+
+def __aiter__(
+    self: MessageSubscription[ReplayT],
+) -> AsyncIterator[DecodedMessage[ReplayT]]:
+    if self._claimed:
+        raise RuntimeError("a message subscription can only be consumed once")
+    self._claimed = True
+    delivery = self._iterate()
+    self._delivery = delivery
+    return delivery
+
+
+def sse(self: MessageSubscription[ReplayT]) -> AsyncIterator[bytes]:
+    """Render committed messages while preserving their durable sequences."""
+
+    renderer = self._renderer
+    if renderer is None:
+        raise SseRenderingUnsupported("This channel has no SSE renderer")
+
+    async def iterate() -> AsyncGenerator[bytes, None]:
+        try:
+            async for message in self:
+                yield renderer.render(
+                    seq=message.envelope.seq,
+                    payload=message.data,
+                )
+        finally:
+            await self.aclose()
+
+    return iterate()
+
+
+async def aclose(self: MessageSubscription[ReplayT]) -> None:
+    """Detach this subscriber without affecting the producer."""
+
+    delivery = self._delivery
+    if delivery is not None:
+        await _close_async_iterator(cast(AsyncIterator[object], delivery))
+        self._delivery = None
+        return
+    backend_iterator = self._backend_iterator
+    if backend_iterator is not None:
+        await _await_backend(
+            "follow close",
+            _close_async_iterator(backend_iterator),
+        )
+        self._backend_iterator = None

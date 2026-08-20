@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
+from typing import cast
 
 from langgraph.types import Command
 from pydantic import JsonValue, TypeAdapter, ValidationError
@@ -14,7 +15,7 @@ from tinkerfin_agui_adapter import (
     ScopedIdCodec,
 )
 
-_JSON_OBJECT = TypeAdapter(dict[str, JsonValue])
+_JSON_OBJECT: TypeAdapter[dict[str, JsonValue]] = TypeAdapter(dict[str, JsonValue])
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -34,24 +35,25 @@ class AgUiResumeBinding:
         self,
         *,
         identity: Identity,
-        command: Command,
+        command: Command,  # pyright: ignore[reportMissingTypeArgument,reportUnknownParameterType]
         prior_tool_call_ids: frozenset[str] = frozenset(),
     ) -> None:
         if not isinstance(identity, Identity):
             raise TypeError("identity must be an Identity")
         if not isinstance(command, Command):
             raise TypeError("command must be a Command")
+        typed_command = cast(Command[object], command)
         if (
-            command.resume is None
-            or command.graph is not None
-            or command.update is not None
-            or command.goto != ()
+            typed_command.resume is None
+            or typed_command.graph is not None
+            or typed_command.update is not None
+            or typed_command.goto != ()
         ):
             raise ValueError(
                 "command must be a pure resume Command without graph, update, or goto"
             )
         try:
-            resume_data = _JSON_OBJECT.validate_python(command.resume)
+            resume_data = _JSON_OBJECT.validate_python(typed_command.resume)
         except ValidationError as error:
             raise ValueError("command must contain JSON object resume data") from error
         if not isinstance(prior_tool_call_ids, frozenset):
@@ -73,7 +75,9 @@ class AgUiResumeBinding:
         object.__setattr__(self, "prior_tool_call_ids", prior_tool_call_ids)
 
     @property
-    def command(self) -> Command:
+    def command(  # pyright: ignore[reportUnknownParameterType]
+        self,
+    ) -> Command:  # pyright: ignore[reportMissingTypeArgument]
         """Return a defensive copy of the bound pure resume Command."""
 
         return Command(resume=copy.deepcopy(self._resume_data))

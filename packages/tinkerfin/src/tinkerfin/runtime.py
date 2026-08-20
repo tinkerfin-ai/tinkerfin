@@ -3,10 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
-import math
 from collections.abc import (
-    AsyncGenerator,
     AsyncIterable,
     AsyncIterator,
     Awaitable,
@@ -17,7 +14,7 @@ from contextlib import AbstractAsyncContextManager
 from contextvars import ContextVar
 from typing import Generic, TypeAlias, TypeVar, cast, overload
 
-from ag_ui.core import BaseEvent, RunErrorEvent, RunStartedEvent
+from ag_ui.core import BaseEvent
 
 from tinkerfin_agui_adapter import (
     AgUiLifecycleEventFactory,
@@ -26,7 +23,9 @@ from tinkerfin_agui_adapter import (
     micro_batch,
 )
 
-from ._tasks import join_task
+from . import _runtime_agui, _runtime_streams
+from ._runtime_agui import _AgUiStreamDeadlineExceeded
+from ._runtime_streams import _validate_timeout
 from .agui_native import (
     AgUiNativeStreamConfig,
     AgUiNativeStreamConfigurationError,
@@ -36,117 +35,21 @@ from .coordination import RunCoordinator
 from .deep_agent import CREATE_DEEP_AGENT
 from .errors import (
     AgUiSettlementTimeoutError,
-    RunCoordinationError,
-    RunCoordinationOwnershipLostError,
-    RunCoordinationTimeoutError,
-    RunCoordinationUnavailableError,
-    TinkerFinError,
-    TinkerFinErrorCode,
     TinkerFinLifecycleError,
 )
-from .native import NativeStreamPart, normalize_native_stream_part
+from .native import NativeStreamPart
 from .sse import (
     SseBody,
     SseEventIdResolver,
     SseMapper,
     SsePayload,
     SsePreflight,
-    encode_sse_payload,
 )
 
 PartT = TypeVar("PartT")
 
 PartObserver: TypeAlias = Callable[[PartT], Awaitable[None]]
 EventObserver = Callable[[BaseEvent], Awaitable[None]]
-
-
-def _coordination_error(operation: str, error: Exception) -> RunCoordinationError:
-    """Translate only failures owned by a replaceable coordinator boundary."""
-
-    if isinstance(error, RunCoordinationError):
-        return error
-    diagnostic_context = (
-        dict(error.diagnostic_context) if isinstance(error, TinkerFinError) else {}
-    )
-    diagnostic_context["operation"] = operation
-    if isinstance(error, TinkerFinError):
-        if error.code is TinkerFinErrorCode.REDIS_LEASE_LOST:
-            return RunCoordinationOwnershipLostError(
-                "Run coordination ownership was lost",
-                diagnostic_context=diagnostic_context,
-                cause=error,
-            )
-        if error.code is TinkerFinErrorCode.REDIS_LEASE_TIMEOUT:
-            return RunCoordinationTimeoutError(
-                "Run coordination timed out",
-                diagnostic_context=diagnostic_context,
-                cause=error,
-            )
-        if error.code is TinkerFinErrorCode.REDIS_LEASE_UNAVAILABLE:
-            return RunCoordinationUnavailableError(
-                "Run coordination is unavailable",
-                diagnostic_context=diagnostic_context,
-                cause=error,
-            )
-    if isinstance(error, TimeoutError):
-        return RunCoordinationTimeoutError(
-            "Run coordination timed out",
-            diagnostic_context=diagnostic_context,
-            cause=error,
-        )
-    return RunCoordinationError(
-        "Run coordination failed",
-        diagnostic_context=diagnostic_context,
-        cause=error,
-    )
-
-
-class _AgUiStreamDeadlineExceeded(TimeoutError):
-    """Identify only the total pull deadline owned by `AgUiEventStream`."""
-
-
-def _validate_timeout(
-    timeout: float | None,
-    *,
-    name: str = "timeout",
-) -> float | None:
-    if timeout is None:
-        return None
-    if isinstance(timeout, bool) or not isinstance(timeout, int | float):
-        raise TypeError(f"{name} must be a number or None")
-    value = float(timeout)
-    if not math.isfinite(value) or value < 0:
-        raise ValueError(f"{name} must be finite and non-negative")
-    return value
-
-
-async def _map_sse_item(
-    item: PartT,
-    *,
-    mapper: SseMapper[PartT] | None,
-    default: SsePayload,
-) -> SsePayload | None:
-    if mapper is None:
-        return default
-    mapped = mapper(item)
-    if not inspect.isawaitable(mapped):
-        raise TypeError("SSE mapper must return an awaitable")
-    payload = await mapped
-    if payload is not None and not isinstance(payload, SsePayload):
-        raise TypeError("SSE mapper must resolve to SsePayload or None")
-    return payload
-
-
-async def _resolve_sse_event_id(
-    item: PartT,
-    resolver: SseEventIdResolver[PartT] | None,
-) -> str | int | None:
-    if resolver is None:
-        return None
-    resolved = resolver(item)
-    if not inspect.isawaitable(resolved):
-        raise TypeError("event_id_resolver must return an awaitable")
-    return await resolved
 
 
 class GraphRunStream(Generic[PartT]):
@@ -180,39 +83,9 @@ class GraphRunStream(Generic[PartT]):
         return self
 
     async def __anext__(self) -> PartT:
-        if self._closed:
-            raise StopAsyncIteration
-        current = cast(asyncio.Task[object] | None, asyncio.current_task())
-        if current is None:  # pragma: no cover - async methods run in a Task
-            raise TinkerFinLifecycleError("a Graph run stream requires an asyncio task")
-        active = self._active_task
-        if active is not None and not active.done():
-            raise TinkerFinLifecycleError(
-                "a Graph run stream operation is already active"
-            )
-        self._active_task = current
-        try:
-            if not self._started:
-                await self._start()
-            source = self._source
-            assert source is not None
-            try:
-                part = await anext(source)
-            except StopAsyncIteration:
-                await self._finish(None)
-                raise
-            except BaseException as error:
-                await self._finish(error)
-                raise
-            try:
-                await self._observe(part)
-            except BaseException as error:
-                await self._finish(error)
-                raise
-            return part
-        finally:
-            if self._active_task is current:
-                self._active_task = None
+        return await _runtime_streams.__anext__(
+            self,
+        )
 
     async def aclose(self) -> None:
         """Close the native source and release coordination idempotently.
@@ -221,20 +94,9 @@ class GraphRunStream(Generic[PartT]):
         part currently being observed. An external closer cancels an active pull.
         """
 
-        current = asyncio.current_task()
-        active = self._active_task
-        observer_lineage_active = (
-            bool(self._active_observers) and self._observer_lineage.get()
+        return await _runtime_streams.aclose(
+            self,
         )
-        if (
-            active is not None
-            and active is not current
-            and not active.done()
-            and not observer_lineage_active
-        ):
-            active.cancel()
-            await asyncio.gather(active, return_exceptions=True)
-        await self._finish(None)
 
     def to_sse(
         self,
@@ -245,152 +107,35 @@ class GraphRunStream(Generic[PartT]):
     ) -> SseBody[str]:
         """Consume this native object stream as safely framed SSE text."""
 
-        total_timeout = _validate_timeout(timeout)
-
-        async def frames() -> AsyncGenerator[str, None]:
-            deadline: float | None = None
-            if total_timeout is not None:
-                loop = asyncio.get_running_loop()
-                try:
-                    deadline = loop.time() + total_timeout
-                except OverflowError:
-                    deadline = math.inf
-            try:
-                while True:
-                    try:
-                        if deadline is None:
-                            raw_part = await anext(self)
-                            part = normalize_native_stream_part(raw_part)
-                            payload = await _map_sse_item(
-                                part,
-                                mapper=mapper,
-                                default=SsePayload(
-                                    data=part.model_dump_json(by_alias=True),
-                                    event="stream-part",
-                                ),
-                            )
-                            if payload is None:
-                                continue
-                            event_id = await _resolve_sse_event_id(
-                                part,
-                                event_id_resolver,
-                            )
-                            frame = encode_sse_payload(payload, event_id=event_id)
-                        else:
-                            async with asyncio.timeout_at(deadline):
-                                raw_part = await anext(self)
-                                part = normalize_native_stream_part(raw_part)
-                                payload = await _map_sse_item(
-                                    part,
-                                    mapper=mapper,
-                                    default=SsePayload(
-                                        data=part.model_dump_json(by_alias=True),
-                                        event="stream-part",
-                                    ),
-                                )
-                                if payload is None:
-                                    continue
-                                event_id = await _resolve_sse_event_id(
-                                    part,
-                                    event_id_resolver,
-                                )
-                                frame = encode_sse_payload(
-                                    payload,
-                                    event_id=event_id,
-                                )
-                    except StopAsyncIteration:
-                        return
-                    except TimeoutError as error:
-                        raise TimeoutError("native SSE stream timed out") from error
-                    yield frame
-            finally:
-                await self.aclose()
-
-        return SseBody(source_factory=frames, close=self.aclose)
+        return _runtime_streams.to_sse(
+            self,
+            timeout=timeout,
+            mapper=mapper,
+            event_id_resolver=event_id_resolver,
+        )
 
     async def _observe(self, part: PartT) -> None:
-        observer = self._on_part
-        if observer is None:
-            return
-        self._active_observers += 1
-        token = self._observer_lineage.set(True)
-        try:
-            observed = observer(part)
-            if not inspect.isawaitable(observed):
-                raise TypeError("on_part must return an awaitable")
-            await observed
-        finally:
-            self._observer_lineage.reset(token)
-            self._active_observers -= 1
+        return await _runtime_streams._observe(
+            self,
+            part,
+        )
 
     async def _start(self) -> None:
-        coordination_factory = self._coordination_factory
-        if coordination_factory is not None:
-            try:
-                coordination = coordination_factory()
-                await coordination.__aenter__()
-            except Exception as error:
-                translated = _coordination_error("enter", error)
-                raise translated from error
-            self._coordination = coordination
-        try:
-            source = self._source_factory()
-            if not isinstance(source, AsyncIterator):
-                raise TypeError("source_factory must return an async iterator")
-            self._source = source
-        except BaseException as error:
-            await self._finish(error)
-            raise
-        self._started = True
+        return await _runtime_streams._start(
+            self,
+        )
 
     async def _finish(self, error: BaseException | None) -> None:
-        task = self._finish_task
-        if task is None:
-            self._closed = True
-            task = asyncio.create_task(
-                self._finish_once(error),
-                name="tinkerfin-graph-run-stream-close",
-            )
-            self._finish_task = task
-        await join_task(task)
+        return await _runtime_streams._finish(
+            self,
+            error,
+        )
 
     async def _finish_once(self, error: BaseException | None) -> None:
-        source = self._source
-        self._source = None
-        coordination = self._coordination
-        self._coordination = None
-        cleanup_errors: list[BaseException] = []
-        try:
-            if source is not None:
-                close = getattr(source, "aclose", None)
-                if close is not None:
-                    await close()
-        except BaseException as cleanup_error:  # noqa: BLE001 - cleanup outcome
-            cleanup_errors.append(cleanup_error)
-        if coordination is not None:
-            try:
-                await coordination.__aexit__(
-                    None if error is None else type(error),
-                    error,
-                    None if error is None else error.__traceback__,
-                )
-            except BaseException as cleanup_error:  # noqa: BLE001 - cleanup outcome
-                if isinstance(cleanup_error, Exception):
-                    cleanup_errors.append(_coordination_error("exit", cleanup_error))
-                else:
-                    cleanup_errors.append(cleanup_error)
-
-        if error is not None:
-            for cleanup_error in cleanup_errors:
-                error.add_note(
-                    "Graph run cleanup also failed: "
-                    f"{type(cleanup_error).__name__}: {cleanup_error}"
-                )
-            return
-        if len(cleanup_errors) == 1:
-            raise cleanup_errors[0]
-        if cleanup_errors:
-            raise BaseExceptionGroup("Graph run cleanup failed", cleanup_errors)
+        return await _runtime_streams._finish_once(
+            self,
+            error,
+        )
 
 
 class NativeGraphRunStream(GraphRunStream[Mapping[str, object]]):
@@ -547,53 +292,9 @@ class AgUiEventStream:
         return self
 
     async def __anext__(self) -> BaseEvent:
-        if self._closed:
-            raise StopAsyncIteration
-        current = cast(asyncio.Task[object] | None, asyncio.current_task())
-        if current is None:  # pragma: no cover - async methods run in a Task
-            raise TinkerFinLifecycleError(
-                "an AG-UI event stream requires an asyncio task"
-            )
-        active = self._active_task
-        if active is not None and not active.done():
-            raise TinkerFinLifecycleError(
-                "an AG-UI event stream operation is already active"
-            )
-        self._active_task = current
-        try:
-            try:
-                event = await anext(self._source)
-            except StopAsyncIteration:
-                self._closed = True
-                raise
-            except asyncio.CancelledError as cancellation:
-                conversion_error = self.error
-                if conversion_error is not None:
-                    cancellation.add_note(
-                        "AG-UI conversion also failed: "
-                        f"{type(conversion_error).__name__}: {conversion_error}"
-                    )
-                for note in self._secondary_error_notes:
-                    cancellation.add_note(note)
-                raise
-            except Exception as error:
-                if self.error is None:
-                    self.error = error
-                await self._close(error)
-                raise
-            observer = self._on_event
-            if observer is not None:
-                try:
-                    await self._observe(event)
-                except Exception as error:
-                    if self.error is None:
-                        self.error = error
-                    await self._close(error)
-                    raise
-            return event
-        finally:
-            if self._active_task is current:
-                self._active_task = None
+        return await _runtime_agui.__anext__(
+            self,
+        )
 
     async def abort(self) -> list[BaseEvent]:
         """Cancel the active conversion and return one observed cancelled tail.
@@ -607,37 +308,9 @@ class AgUiEventStream:
                 the main run reaches a terminal state.
         """
 
-        if self._completed or self._abort_events_delivered:
-            return []
-        current = asyncio.current_task()
-        if self._active_observers and self._observer_lineage.get():
-            raise TinkerFinLifecycleError(
-                "AgUiEventStream.abort() cannot be called from its on_event callback"
-            )
-        self._aborted = True
-        active = self._active_task
-        active_to_cancel = (
-            active
-            if active is not None and active is not current and not active.done()
-            else None
+        return await _runtime_agui.abort(
+            self,
         )
-        await self._close(None, active=active_to_cancel)
-
-        tail = self._adapter.abort(code="cancelled")
-        if self._main_started:
-            tail.append(
-                self._decorate_initialization_event(
-                    self._lifecycle.failed(
-                        identity=self._identity,
-                        message="Agent run cancelled",
-                        code="cancelled",
-                    )
-                )
-            )
-        self._abort_events_delivered = True
-        for event in tail:
-            await self._observe(event)
-        return tail
 
     async def aclose(self) -> None:
         """Close this stream and its upstream parts idempotently.
@@ -647,20 +320,9 @@ class AgUiEventStream:
         pull before waiting for the shared cleanup.
         """
 
-        current = asyncio.current_task()
-        active = self._active_task
-        observer_lineage_active = (
-            bool(self._active_observers) and self._observer_lineage.get()
+        return await _runtime_agui.aclose(
+            self,
         )
-        active_to_cancel = (
-            active
-            if active is not None
-            and active is not current
-            and not active.done()
-            and not observer_lineage_active
-            else None
-        )
-        await self._close(None, active=active_to_cancel)
 
     def to_sse(
         self,
@@ -670,30 +332,11 @@ class AgUiEventStream:
     ) -> SseBody[str]:
         """Consume this AG-UI object stream as safely framed SSE text."""
 
-        async def frames() -> AsyncGenerator[str, None]:
-            try:
-                async for event in self:
-                    payload = await _map_sse_item(
-                        event,
-                        mapper=mapper,
-                        default=SsePayload(
-                            data=event.model_dump_json(
-                                by_alias=True,
-                                exclude_none=True,
-                            )
-                        ),
-                    )
-                    if payload is None:
-                        continue
-                    event_id = await _resolve_sse_event_id(
-                        event,
-                        event_id_resolver,
-                    )
-                    yield encode_sse_payload(payload, event_id=event_id)
-            finally:
-                await self.aclose()
-
-        return SseBody(source_factory=frames, close=self.aclose)
+        return _runtime_agui.to_sse(
+            self,
+            mapper=mapper,
+            event_id_resolver=event_id_resolver,
+        )
 
     async def _close(
         self,
@@ -701,150 +344,45 @@ class AgUiEventStream:
         *,
         active: asyncio.Task[object] | None = None,
     ) -> None:
-        task = self._close_task
-        if task is None:
-            self._closed = True
-            task = asyncio.create_task(
-                self._close_once(active),
-                name="tinkerfin-agui-event-stream-close",
-            )
-            self._close_task = task
-            task.add_done_callback(self._close_finished)
-        try:
-            settlement_timeout = self._settlement_timeout
-            if settlement_timeout is None:
-                await join_task(task)
-            elif task.done():
-                task.result()
-            else:
-                settlement_deadline = asyncio.timeout(settlement_timeout)
-                try:
-                    async with settlement_deadline:
-                        await asyncio.shield(task)
-                except TimeoutError as error:
-                    if settlement_deadline.expired():
-                        raise AgUiSettlementTimeoutError(
-                            timeout=settlement_timeout
-                        ) from error
-                    raise
-        except BaseException as cleanup_error:
-            current = asyncio.current_task()
-            if isinstance(cleanup_error, asyncio.CancelledError) and (
-                current is not None and current.cancelling()
-            ):
-                if primary is not None and not isinstance(primary, GeneratorExit):
-                    cleanup_error.add_note(
-                        "AG-UI processing also failed: "
-                        f"{type(primary).__name__}: {primary}"
-                    )
-                for note in getattr(cleanup_error, "__notes__", ()):
-                    self._record_secondary_error_note(note)
-                raise
-            if primary is not None and not isinstance(primary, GeneratorExit):
-                primary.add_note(
-                    "AG-UI cleanup also failed: "
-                    f"{type(cleanup_error).__name__}: {cleanup_error}"
-                )
-                return
-            raise
+        return await _runtime_agui._close(
+            self,
+            primary,
+            active=active,
+        )
 
     @staticmethod
     def _close_finished(task: asyncio.Task[None]) -> None:
         """Consume a retained close failure even when no caller waits again."""
 
-        if not task.cancelled():
-            task.exception()
+        return _runtime_agui._close_finished(
+            task,
+        )
 
     async def _close_once(self, active: asyncio.Task[object] | None) -> None:
-        if active is not None and not active.done():
-            active.cancel()
-            await asyncio.gather(active, return_exceptions=True)
-        primary: BaseException | None = None
-        close = getattr(self._source, "aclose", None)
-        try:
-            if close is not None:
-                await close()
-        except BaseException as error:  # noqa: BLE001 - cleanup owns all outcomes
-            primary = error
-        await self._close_upstream(primary)
-        if primary is not None:
-            raise primary.with_traceback(primary.__traceback__)
+        return await _runtime_agui._close_once(
+            self,
+            active,
+        )
 
     async def _observe(self, event: BaseEvent) -> None:
-        observer = self._on_event
-        if observer is None:
-            return
-        # ContextVar marks callback-derived tasks; the active count keeps delayed
-        # descendants valid after their callback returns.
-        self._active_observers += 1
-        token = self._observer_lineage.set(True)
-        try:
-            observed = observer(event)
-            if not inspect.isawaitable(observed):
-                raise TypeError("on_event must return an awaitable")
-            await observed
-        finally:
-            self._observer_lineage.reset(token)
-            self._active_observers -= 1
+        return await _runtime_agui._observe(
+            self,
+            event,
+        )
 
     async def _close_upstream(self, primary: BaseException | None) -> None:
-        if self._upstream_closed:
-            return
-        close = getattr(self._upstream, "aclose", None)
-        if close is None:
-            self._upstream_closed = True
-            return
-        current = asyncio.current_task()
-        cancel_count = current.cancelling() if current is not None else 0
-        try:
-            await close()
-        except asyncio.CancelledError as cleanup_error:
-            next_cancel_count = current.cancelling() if current is not None else 0
-            caller_cancelled = next_cancel_count > cancel_count
-            if caller_cancelled and isinstance(primary, asyncio.CancelledError):
-                primary.add_note(
-                    "native parts cleanup also received caller cancellation: "
-                    f"{cleanup_error}"
-                )
-                for note in getattr(cleanup_error, "__notes__", ()):
-                    primary.add_note(note)
-                return
-            if caller_cancelled:
-                if primary is not None and not isinstance(primary, GeneratorExit):
-                    cleanup_error.add_note(
-                        "AG-UI processing also failed: "
-                        f"{type(primary).__name__}: {primary}"
-                    )
-                for note in getattr(cleanup_error, "__notes__", ()):
-                    self._record_secondary_error_note(note)
-                raise
-            if primary is not None and not isinstance(primary, GeneratorExit):
-                note = (
-                    f"native parts cleanup also failed: CancelledError: {cleanup_error}"
-                )
-                primary.add_note(note)
-                self._record_secondary_error_note(note)
-                return
-            raise
-        except BaseException as cleanup_error:
-            self._upstream_closed = True
-            if primary is not None and not isinstance(primary, GeneratorExit):
-                note = (
-                    "native parts cleanup also failed: "
-                    f"{type(cleanup_error).__name__}: {cleanup_error}"
-                )
-                primary.add_note(note)
-                self._record_secondary_error_note(note)
-                return
-            raise
-        else:
-            self._upstream_closed = True
+        return await _runtime_agui._close_upstream(
+            self,
+            primary,
+        )
 
     def _record_secondary_error_note(self, note: str) -> None:
         """Retain cleanup evidence across the micro-batch cancellation boundary."""
 
-        if note not in self._secondary_error_notes:
-            self._secondary_error_notes.append(note)
+        return _runtime_agui._record_secondary_error_note(
+            self,
+            note,
+        )
 
     async def _convert(self) -> AsyncIterator[BaseEvent]:
         primary: BaseException | None = None
@@ -913,46 +451,15 @@ class AgUiEventStream:
     def _decorate_initialization_event(self, event: BaseEvent) -> BaseEvent:
         """Mark only main lifecycle events emitted for initialization failure."""
 
-        if not self._initialization_failed or not isinstance(
+        return _runtime_agui._decorate_initialization_event(
+            self,
             event,
-            RunStartedEvent | RunErrorEvent,
-        ):
-            return event
-        raw_event: dict[str, object] = (
-            dict(event.raw_event)
-            if isinstance(event.raw_event, dict)
-            else {
-                "threadId": self._identity.thread_id,
-                "runId": self._identity.run_id,
-            }
         )
-        raw_event["initializationFailed"] = True
-        return event.model_copy(update={"raw_event": raw_event})
 
     async def _next_part(self) -> object:
-        timeout = self._timeout
-        if timeout is None:
-            return await anext(self._upstream)
-        if timeout == 0:
-            raise _AgUiStreamDeadlineExceeded("AG-UI stream timed out")
-        loop = asyncio.get_running_loop()
-        deadline = self._deadline
-        if deadline is None:
-            try:
-                deadline = loop.time() + timeout
-            except OverflowError:
-                deadline = math.inf
-            self._deadline = deadline
-        if loop.time() >= deadline:
-            raise _AgUiStreamDeadlineExceeded("AG-UI stream timed out")
-        timeout_context = asyncio.timeout_at(deadline)
-        try:
-            async with timeout_context:
-                return await anext(self._upstream)
-        except TimeoutError as error:
-            if timeout_context.expired():
-                raise _AgUiStreamDeadlineExceeded("AG-UI stream timed out") from error
-            raise
+        return await _runtime_agui._next_part(
+            self,
+        )
 
 
 class TinkerFinRun(Generic[PartT]):
@@ -1157,9 +664,7 @@ class TinkerFin:
         if strict_invocation:
             if identity is None:
                 raise ValueError("a strict native invocation requires an Identity")
-            invocation = cast(
-                AgUiNativeStreamInvocation, source_factory
-            )._bind_identity(identity)
+            invocation = source_factory._bind_identity(identity)
             return NativeTinkerFinRun(
                 source_factory=invocation,
                 run_coordinator=coordinator,

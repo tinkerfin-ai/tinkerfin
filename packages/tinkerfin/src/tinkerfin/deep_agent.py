@@ -5,9 +5,9 @@ from __future__ import annotations
 import inspect
 from collections.abc import AsyncIterator, Callable, Mapping
 from functools import wraps
-from typing import TYPE_CHECKING, Generic, ParamSpec, TypeVar, cast, overload
+from typing import TYPE_CHECKING, Generic, ParamSpec, Protocol, TypeVar, cast, overload
 
-from deepagents.graph import create_deep_agent as _native_create_deep_agent
+from deepagents import graph as _deepagents_graph
 
 from tinkerfin_agui_adapter import Identity
 
@@ -27,6 +27,22 @@ if TYPE_CHECKING:
 CreateP = ParamSpec("CreateP")
 GraphT = TypeVar("GraphT")
 AstreamT = TypeVar("AstreamT", bound=Callable[..., object])
+
+
+class _GraphWithAstream(Protocol):
+    astream: Callable[..., object]
+
+
+_native_create_deep_agent = cast(
+    Callable[..., object],
+    _deepagents_graph.create_deep_agent,  # pyright: ignore[reportUnknownMemberType]
+)
+
+
+def _graph_astream(graph: object) -> Callable[..., object]:
+    """Read the callable stream boundary from one compiled upstream graph."""
+
+    return cast(_GraphWithAstream, graph).astream
 
 
 class _StreamClaim:
@@ -334,7 +350,7 @@ class _EnhancedDeepAgentFactory(Generic[CreateP, GraphT, AstreamT]):
 
 CREATE_DEEP_AGENT = _EnhancedDeepAgentFactory(
     _native_create_deep_agent,
-    lambda graph: graph.astream,
+    _graph_astream,
 )
 
 

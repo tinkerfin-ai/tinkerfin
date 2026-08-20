@@ -9,7 +9,7 @@ from pydantic import TypeAdapter
 
 from .protocols import MessageCodec, SseRenderer
 
-_EVENT_ADAPTER = TypeAdapter(Event)
+_EVENT_ADAPTER: TypeAdapter[Event] = TypeAdapter(Event)
 
 
 class AgUiCodec(

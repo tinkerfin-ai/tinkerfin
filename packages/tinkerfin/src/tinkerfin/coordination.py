@@ -56,7 +56,7 @@ class InMemoryRunCoordinator:
     ) -> AbstractAsyncContextManager[None]:
         return self._coordinate(identity)
 
-    @asynccontextmanager
+    @asynccontextmanager  # pyright: ignore[reportDeprecated]
     async def _coordinate(self, identity: Identity) -> AsyncIterator[None]:
         if not isinstance(identity, Identity):
             raise TypeError("identity must be an Identity")

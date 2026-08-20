@@ -83,7 +83,7 @@ class ContentBatcher:
             self._buffer_started_at = None
             return []
         merged = TextMessageContentEvent(
-            message_id=cast(str, self._message_id),
+            message_id=self._message_id,
             delta="".join(self._buffer),
             raw_event=self._raw_event,
         )

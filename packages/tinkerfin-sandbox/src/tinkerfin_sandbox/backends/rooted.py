@@ -5,13 +5,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-import secrets
-import shlex
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Generator
 from contextlib import contextmanager
-from dataclasses import dataclass
 from datetime import timedelta
-from pathlib import PurePosixPath
 from typing import Any, NoReturn, TypeVar
 
 from deepagents.backends.protocol import (
@@ -22,10 +18,8 @@ from deepagents.backends.protocol import (
     ExecuteOffloadResult,
     ExecuteResponse,
     FileDownloadResponse,
-    FileInfo,
     FileUploadResponse,
     GlobResult,
-    GrepMatch,
     GrepResult,
     LsResult,
     ReadResult,
@@ -35,64 +29,19 @@ from deepagents.backends.sandbox import BaseSandbox
 from deepagents.backends.utils import normalize_read_bounds
 
 from ..models import OpenSandboxRuntimeInfo, _normalize_workspace_root
+from . import _rooted_projection, _rooted_transfer
+from ._rooted_projection import _ROOTED_EDIT_INLINE_MAX_BYTES, _MappedPath
 from ._rooted_protocol import (
     _build_rooted_command,
-    _parse_rooted_response,
     _RootedCommand,
 )
+from ._rooted_transfer import _AsyncStartState
 from .handle import OpenSandboxHandle
 from .sdk import OpenSandboxBackend
 
 logger = logging.getLogger(__name__)
 
 _ResultT = TypeVar("_ResultT")
-_ROOTED_BINARY_READ_SUFFIXES = frozenset(
-    {
-        ".aac",
-        ".aiff",
-        ".avi",
-        ".flac",
-        ".flv",
-        ".gif",
-        ".heic",
-        ".heif",
-        ".jpeg",
-        ".jpg",
-        ".mkv",
-        ".mov",
-        ".mp3",
-        ".mp4",
-        ".mpeg",
-        ".mpg",
-        ".ogg",
-        ".pdf",
-        ".png",
-        ".ppt",
-        ".pptx",
-        ".wav",
-        ".webm",
-        ".webp",
-        ".wmv",
-        ".3gpp",
-    }
-)
-_ROOTED_EDIT_INLINE_MAX_BYTES = 50_000
-
-
-@dataclass(frozen=True, slots=True)
-class _MappedPath:
-    """Store one virtual path input and its normalized Sandbox path."""
-
-    requested: str
-    virtual: str
-    physical: str
-
-
-@dataclass(slots=True)
-class _AsyncStartState:
-    """Track whether a native async operation has pinned a Handle lease."""
-
-    has_started: bool = False
 
 
 class RootedOpenSandboxBackend(BaseSandbox):
@@ -134,7 +83,9 @@ class RootedOpenSandboxBackend(BaseSandbox):
         return self._handle.id
 
     @property
-    def enable_capture_offload(self) -> bool:
+    def enable_capture_offload(  # pyright: ignore[reportIncompatibleVariableOverride]
+        self,
+    ) -> bool:
         """Return whether the current backend can offload captured output."""
         return self._handle.enable_capture_offload
 
@@ -172,48 +123,45 @@ class RootedOpenSandboxBackend(BaseSandbox):
         operation: Callable[[OpenSandboxBackend], Awaitable[_ResultT]],
     ) -> tuple[asyncio.Task[_ResultT], _AsyncStartState]:
         """Pin a backend in an owned task until the remote call settles."""
-        state = _AsyncStartState()
 
-        async def run() -> _ResultT:
-            async with self._handle._alease() as backend:
-                state.has_started = True
-                return await operation(backend)
-
-        task = asyncio.create_task(run())
-        self._background_tasks.add(task)
-        task.add_done_callback(self._finish_async_task)
-        return task, state
+        return _rooted_transfer._start_async_task(
+            self,
+            operation,
+        )
 
     def _finish_async_task(self, task: asyncio.Task[Any]) -> None:
         """Retain a background task and consume errors after caller cancellation."""
-        self._background_tasks.discard(task)
-        if task.cancelled():
-            return
-        _ = task.exception()
+
+        return _rooted_transfer._finish_async_task(
+            self,
+            task,
+        )
 
     async def _run_async(
         self,
         operation: Callable[[OpenSandboxBackend], Awaitable[_ResultT]],
     ) -> _ResultT:
         """Await native async I/O without abandoning a started Handle lease."""
-        task, state = self._start_async_task(operation)
-        try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError:
-            if not state.has_started:
-                task.cancel()
-            raise
+
+        return await _rooted_transfer._run_async(
+            self,
+            operation,
+        )
 
     @contextmanager
-    def _lease_backend(self) -> Iterator[OpenSandboxBackend]:
+    def _lease_backend(self) -> Generator[OpenSandboxBackend]:
         """Pin the Handle backend for one synchronous protocol call."""
-        with self._handle._lease() as backend:
-            yield backend
+
+        return _rooted_transfer._lease_backend(
+            self,
+        )
 
     def _reject_sync_remote_io(self) -> NoReturn:
         """Reject sync paths before any remote filesystem operation."""
-        with self._lease_backend():
-            OpenSandboxBackend._reject_sync()
+
+        return _rooted_transfer._reject_sync_remote_io(
+            self,
+        )
 
     def execute(
         self,
@@ -248,36 +196,35 @@ class RootedOpenSandboxBackend(BaseSandbox):
 
     def _map_path(self, path: str) -> _MappedPath | None:
         """Normalize a caller path into virtual and physical Sandbox paths."""
-        if "\x00" in path or path.startswith("//"):
-            return None
-        virtual_path = PurePosixPath(path)
-        if ".." in virtual_path.parts:
-            return None
 
-        relative_parts = tuple(
-            part for part in virtual_path.parts if part not in {"/", "."}
-        )
-        normalized_virtual = "/" + "/".join(relative_parts)
-        physical = str(PurePosixPath(self._root, *relative_parts))
-        return _MappedPath(
-            requested=path,
-            virtual=normalized_virtual,
-            physical=physical,
+        return _rooted_projection._map_path(
+            self,
+            path,
         )
 
     @staticmethod
     def _display_input(path: str) -> str:
         """Escape NUL bytes while preserving other model input for diagnostics."""
-        return path.replace("\x00", "\\0")
+
+        return _rooted_projection._display_input(
+            path,
+        )
 
     def _invalid_path_error(self, path: str) -> str:
         """Return a stable error that reveals no physical root or symlink target."""
-        return f"Path '{self._display_input(path)}': {INVALID_PATH}"
+
+        return _rooted_projection._invalid_path_error(
+            self,
+            path,
+        )
 
     @staticmethod
     def _read_as_binary(path: str) -> bool:
         """Match Deep Agents' non-text extension classification."""
-        return PurePosixPath(path).suffix.lower() in _ROOTED_BINARY_READ_SUFFIXES
+
+        return _rooted_projection._read_as_binary(
+            path,
+        )
 
     def _project_read_response(
         self,
@@ -287,30 +234,12 @@ class RootedOpenSandboxBackend(BaseSandbox):
         request: _RootedCommand,
     ) -> ReadResult:
         """Translate one validated helper envelope into ``ReadResult``."""
-        parsed = _parse_rooted_response(response, request=request)
-        if parsed.status == "error":
-            if parsed.error.code == "invalid_path":
-                return ReadResult(error=self._invalid_path_error(requested.requested))
-            message = {
-                "not_found": "file_not_found",
-                "permission_denied": "permission_denied",
-                "not_a_file": "not_a_file",
-                "not_directory": "not_a_file",
-            }.get(parsed.error.code, parsed.error.message)
-            return ReadResult(error=f"File '{requested.virtual}': {message}")
-        if parsed.operation != "read":
-            raise ValueError("rooted helper returned a non-read result")
-        result = parsed.result
-        return ReadResult(
-            file_data={
-                "content": result["content"],
-                "encoding": result["encoding"],
-            },
-            total_lines=result["total_lines"],
-            start_line=result["start_line"],
-            end_line=result["end_line"],
-            next_offset=result["next_offset"],
-            no_lines_requested=result["no_lines_requested"],
+
+        return _rooted_projection._project_read_response(
+            self,
+            requested=requested,
+            response=response,
+            request=request,
         )
 
     def _project_edit_response(
@@ -322,47 +251,20 @@ class RootedOpenSandboxBackend(BaseSandbox):
         request: _RootedCommand,
     ) -> EditResult:
         """Translate one validated helper envelope into ``EditResult``."""
-        parsed = _parse_rooted_response(response, request=request)
-        if parsed.status == "error":
-            code = parsed.error.code
-            if code == "invalid_path":
-                return EditResult(error=self._invalid_path_error(requested.requested))
-            messages = {
-                "not_found": f"Error: File '{requested.virtual}' not found",
-                "permission_denied": (
-                    f"Error: Permission denied editing file '{requested.virtual}'"
-                ),
-                "not_a_file": f"Error: '{requested.virtual}' is not a regular file",
-                "not_text_file": (
-                    f"Error: File '{requested.virtual}' is not a text file"
-                ),
-                "string_not_found": (
-                    f"Error: String not found in file: '{old_string}'"
-                ),
-                "multiple_occurrences": (
-                    f"Error: String '{old_string}' appears multiple times. "
-                    "Use replace_all=True to replace all occurrences."
-                ),
-            }
-            return EditResult(
-                error=messages.get(
-                    code,
-                    f"Error editing file '{requested.virtual}': {parsed.error.message}",
-                )
-            )
-        if parsed.operation != "edit":
-            raise ValueError("rooted helper returned a non-edit result")
-        return EditResult(
-            path=requested.requested,
-            occurrences=parsed.result["count"],
+
+        return _rooted_projection._project_edit_response(
+            self,
+            requested=requested,
+            old_string=old_string,
+            response=response,
+            request=request,
         )
 
     @staticmethod
     def _edit_staging_paths() -> tuple[str, str]:
         """Allocate unguessable Sandbox paths for an oversized edit payload."""
-        token = secrets.token_hex(16)
-        prefix = f"/tmp/.tinkerfin-rooted-edit-{token}"
-        return f"{prefix}-old", f"{prefix}-new"
+
+        return _rooted_projection._edit_staging_paths()
 
     @staticmethod
     def _edit_upload_error(
@@ -371,26 +273,20 @@ class RootedOpenSandboxBackend(BaseSandbox):
         responses: list[FileUploadResponse],
     ) -> EditResult | None:
         """Project staged edit upload failures without starting the target edit."""
-        if len(responses) != 2:
-            return EditResult(
-                error=(
-                    f"Error editing file '{requested.virtual}': "
-                    "upload returned no response"
-                )
-            )
-        for response in responses:
-            if response.error is not None:
-                return EditResult(
-                    error=(
-                        f"Error editing file '{requested.virtual}': {response.error}"
-                    )
-                )
-        return None
+
+        return _rooted_projection._edit_upload_error(
+            requested=requested,
+            responses=responses,
+        )
 
     @staticmethod
     def _edit_cleanup_command(old_path: str, new_path: str) -> str:
         """Build best-effort cleanup for generated staging paths only."""
-        return f"rm -f {shlex.quote(old_path)} {shlex.quote(new_path)}"
+
+        return _rooted_projection._edit_cleanup_command(
+            old_path,
+            new_path,
+        )
 
     def _cleanup_edit_staging(
         self,
@@ -400,18 +296,13 @@ class RootedOpenSandboxBackend(BaseSandbox):
         new_path: str,
     ) -> None:
         """Best-effort cleanup without replaying the target edit."""
-        try:
-            cleanup = backend.execute(self._edit_cleanup_command(old_path, new_path))
-        except Exception:
-            logger.warning(
-                "Failed to clean up staged Rooted edit payload", exc_info=True
-            )
-            return
-        if cleanup.exit_code != 0:
-            logger.warning(
-                "Failed to clean up staged Rooted edit payload: %s",
-                cleanup.output[:200],
-            )
+
+        return _rooted_projection._cleanup_edit_staging(
+            self,
+            backend,
+            old_path=old_path,
+            new_path=new_path,
+        )
 
     async def _acleanup_edit_staging(
         self,
@@ -421,20 +312,13 @@ class RootedOpenSandboxBackend(BaseSandbox):
         new_path: str,
     ) -> None:
         """Asynchronously clean generated staging paths without replaying edit."""
-        try:
-            cleanup = await backend.aexecute(
-                self._edit_cleanup_command(old_path, new_path)
-            )
-        except Exception:
-            logger.warning(
-                "Failed to clean up staged Rooted edit payload", exc_info=True
-            )
-            return
-        if cleanup.exit_code != 0:
-            logger.warning(
-                "Failed to clean up staged Rooted edit payload: %s",
-                cleanup.output[:200],
-            )
+
+        return await _rooted_projection._acleanup_edit_staging(
+            self,
+            backend,
+            old_path=old_path,
+            new_path=new_path,
+        )
 
     def _project_delete_response(
         self,
@@ -444,20 +328,13 @@ class RootedOpenSandboxBackend(BaseSandbox):
         request: _RootedCommand,
     ) -> DeleteResult:
         """Translate one validated helper envelope into ``DeleteResult``."""
-        parsed = _parse_rooted_response(response, request=request)
-        if parsed.status == "error":
-            if parsed.error.code == "invalid_path":
-                return DeleteResult(error=self._invalid_path_error(requested.requested))
-            if parsed.error.code == "not_found":
-                return DeleteResult(error=f"Error: '{requested.virtual}' not found")
-            return DeleteResult(
-                error=(
-                    f"Error deleting file '{requested.virtual}': {parsed.error.message}"
-                )
-            )
-        if parsed.operation != "delete":
-            raise ValueError("rooted helper returned a non-delete result")
-        return DeleteResult(path=requested.requested)
+
+        return _rooted_projection._project_delete_response(
+            self,
+            requested=requested,
+            response=response,
+            request=request,
+        )
 
     def _project_list_response(
         self,
@@ -467,31 +344,12 @@ class RootedOpenSandboxBackend(BaseSandbox):
         request: _RootedCommand,
     ) -> LsResult:
         """Translate one validated helper envelope into ``LsResult``."""
-        parsed = _parse_rooted_response(response, request=request)
-        if parsed.status == "error":
-            if parsed.error.code == "invalid_path":
-                return LsResult(
-                    error=self._invalid_path_error(requested.requested),
-                    entries=None,
-                )
-            message = {
-                "not_found": "path_not_found",
-                "not_directory": "not_a_directory",
-                "permission_denied": "permission_denied",
-            }.get(parsed.error.code, parsed.error.message)
-            return LsResult(
-                error=f"Path '{requested.virtual}': {message}",
-                entries=None,
-            )
-        if parsed.operation != "list":
-            raise ValueError("rooted helper returned a non-list result")
-        entries: list[FileInfo] = [
-            {"path": entry["path"], "is_dir": entry["is_dir"]}
-            for entry in parsed.result["entries"]
-        ]
-        return LsResult(
-            error=self._restore_error(parsed.result["partial_error"]),
-            entries=entries,
+
+        return _rooted_projection._project_list_response(
+            self,
+            requested=requested,
+            response=response,
+            request=request,
         )
 
     def _project_glob_response(
@@ -502,32 +360,12 @@ class RootedOpenSandboxBackend(BaseSandbox):
         request: _RootedCommand,
     ) -> GlobResult:
         """Translate one validated helper envelope into ``GlobResult``."""
-        parsed = _parse_rooted_response(response, request=request)
-        if parsed.status == "error":
-            if parsed.error.code == "invalid_path":
-                return GlobResult(
-                    error=self._invalid_path_error(requested.requested),
-                    matches=None,
-                )
-            message = {
-                "not_found": "path_not_found",
-                "not_directory": "not_a_directory",
-                "permission_denied": "permission_denied",
-            }.get(parsed.error.code, parsed.error.message)
-            return GlobResult(
-                error=f"Path '{requested.virtual}': {message}",
-                matches=None,
-            )
-        if parsed.operation != "glob":
-            raise ValueError("rooted helper returned a non-glob result")
-        matches: list[FileInfo] = [
-            {"path": match["path"], "is_dir": match["is_dir"]}
-            for match in parsed.result["matches"]
-        ]
-        return GlobResult(
-            error=self._restore_error(parsed.result["partial_error"]),
-            matches=matches,
-            truncated=parsed.result["truncated"],
+
+        return _rooted_projection._project_glob_response(
+            self,
+            requested=requested,
+            response=response,
+            request=request,
         )
 
     def _project_grep_response(
@@ -538,47 +376,29 @@ class RootedOpenSandboxBackend(BaseSandbox):
         request: _RootedCommand,
     ) -> GrepResult:
         """Translate one validated helper envelope into ``GrepResult``."""
-        parsed = _parse_rooted_response(response, request=request)
-        if parsed.status == "error":
-            if parsed.error.code == "invalid_path":
-                return GrepResult(
-                    error=self._invalid_path_error(requested.requested),
-                    matches=None,
-                )
-            message = {
-                "not_found": "path_not_found",
-                "permission_denied": "permission_denied",
-            }.get(parsed.error.code, parsed.error.message)
-            return GrepResult(
-                error=f"Path '{requested.virtual}': {message}",
-                matches=None,
-            )
-        if parsed.operation != "grep":
-            raise ValueError("rooted helper returned a non-grep result")
-        matches: list[GrepMatch] = [
-            {
-                "path": match["path"],
-                "line": match["line"],
-                "text": match["text"],
-            }
-            for match in parsed.result["matches"]
-        ]
-        return GrepResult(
-            error=self._restore_error(parsed.result["partial_error"]),
-            matches=matches,
-            truncated=parsed.result["truncated"],
+
+        return _rooted_projection._project_grep_response(
+            self,
+            requested=requested,
+            response=response,
+            request=request,
         )
 
     def _restore_error(self, error: str | None) -> str | None:
         """Replace physical workspace prefixes in errors with the virtual root."""
-        if error is None:
-            return None
-        return self._root_error_pattern.sub("/", error)
+
+        return _rooted_projection._restore_error(
+            self,
+            error,
+        )
 
     @staticmethod
     def _is_safe_path_pattern(pattern: str) -> bool:
         """Return whether a glob pattern avoids traversal and NUL bytes."""
-        return "\x00" not in pattern and ".." not in PurePosixPath(pattern).parts
+
+        return _rooted_projection._is_safe_path_pattern(
+            pattern,
+        )
 
     def read(
         self,
@@ -1063,8 +883,15 @@ class RootedOpenSandboxBackend(BaseSandbox):
         timeout: int | None = None,
     ) -> ExecuteOffloadResult:
         """Reject synchronous remote capture; use :meth:`aexecute_with_offload`."""
-        del command, capture_path, max_inline_bytes, max_capture_bytes, timeout
-        self._reject_sync_remote_io()
+
+        return _rooted_transfer.execute_with_offload(
+            self,
+            command,
+            capture_path,
+            max_inline_bytes=max_inline_bytes,
+            max_capture_bytes=max_capture_bytes,
+            timeout=timeout,
+        )
 
     async def aexecute_with_offload(
         self,
@@ -1076,129 +903,53 @@ class RootedOpenSandboxBackend(BaseSandbox):
         timeout: int | None = None,
     ) -> ExecuteOffloadResult:
         """Asynchronously map a capture path or execute without offload."""
-        mapped = self._map_path(capture_path)
 
-        async def operation(backend: OpenSandboxBackend) -> ExecuteOffloadResult:
-            if mapped is not None:
-                return await backend._aexecute_rooted_offload(
-                    root=self._root,
-                    command=command,
-                    capture_path=mapped.virtual,
-                    max_inline_bytes=max_inline_bytes,
-                    max_capture_bytes=max_capture_bytes,
-                    timeout=timeout,
-                )
-            response = await backend.aexecute(command, timeout=timeout)
-            return ExecuteOffloadResult(offloaded=False, response=response)
-
-        return await self._run_async(operation)
+        return await _rooted_transfer.aexecute_with_offload(
+            self,
+            command,
+            capture_path,
+            max_inline_bytes=max_inline_bytes,
+            max_capture_bytes=max_capture_bytes,
+            timeout=timeout,
+        )
 
     def download_files(self, paths: list[str]) -> list[FileDownloadResponse]:
         """Reject valid sync downloads while returning local invalid-only batches."""
-        mapped = [self._map_path(path) for path in paths]
-        if any(item is not None for item in mapped):
-            self._reject_sync_remote_io()
-        return [
-            FileDownloadResponse(
-                path=path,
-                content=None,
-                error=INVALID_PATH,
-            )
-            for path in paths
-        ]
+
+        return _rooted_transfer.download_files(
+            self,
+            paths,
+        )
 
     async def adownload_files(
         self,
         paths: list[str],
     ) -> list[FileDownloadResponse]:
         """Asynchronously download paths mapped through the virtual root."""
-        mapped = [self._map_path(path) for path in paths]
-        candidates = [item for item in mapped if item is not None]
-        if not candidates:
-            return [
-                FileDownloadResponse(
-                    path=path,
-                    content=None,
-                    error=INVALID_PATH,
-                )
-                for path in paths
-            ]
 
-        async def operation(
-            backend: OpenSandboxBackend,
-        ) -> list[FileDownloadResponse]:
-            responses: list[FileDownloadResponse] = []
-            for index, item in enumerate(mapped):
-                if item is None:
-                    responses.append(
-                        FileDownloadResponse(
-                            path=paths[index],
-                            content=None,
-                            error=INVALID_PATH,
-                        )
-                    )
-                    continue
-                raw = await backend._adownload_rooted_file(
-                    root=self._root,
-                    path=item.virtual,
-                )
-                responses.append(
-                    FileDownloadResponse(
-                        path=item.requested,
-                        content=raw.content,
-                        error=self._restore_error(raw.error),
-                    )
-                )
-            return responses
-
-        return await self._run_async(operation)
+        return await _rooted_transfer.adownload_files(
+            self,
+            paths,
+        )
 
     def upload_files(
         self,
         files: list[tuple[str, bytes]],
     ) -> list[FileUploadResponse]:
         """Reject valid sync uploads while returning local invalid-only batches."""
-        mapped = [self._map_path(path) for path, _ in files]
-        if any(item is not None for item in mapped):
-            self._reject_sync_remote_io()
-        return [FileUploadResponse(path=path, error=INVALID_PATH) for path, _ in files]
+
+        return _rooted_transfer.upload_files(
+            self,
+            files,
+        )
 
     async def aupload_files(
         self,
         files: list[tuple[str, bytes]],
     ) -> list[FileUploadResponse]:
         """Asynchronously upload paths mapped through the virtual root."""
-        mapped = [self._map_path(path) for path, _ in files]
-        candidates = [item for item in mapped if item is not None]
-        if not candidates:
-            return [
-                FileUploadResponse(path=path, error=INVALID_PATH) for path, _ in files
-            ]
 
-        async def operation(
-            backend: OpenSandboxBackend,
-        ) -> list[FileUploadResponse]:
-            responses: list[FileUploadResponse] = []
-            for index, item in enumerate(mapped):
-                if item is None:
-                    responses.append(
-                        FileUploadResponse(
-                            path=files[index][0],
-                            error=INVALID_PATH,
-                        )
-                    )
-                    continue
-                raw = await backend._aupload_rooted_file(
-                    root=self._root,
-                    path=item.virtual,
-                    content=files[index][1],
-                )
-                responses.append(
-                    FileUploadResponse(
-                        path=item.requested,
-                        error=self._restore_error(raw.error),
-                    )
-                )
-            return responses
-
-        return await self._run_async(operation)
+        return await _rooted_transfer.aupload_files(
+            self,
+            files,
+        )

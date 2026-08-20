@@ -32,12 +32,33 @@ from tinkerfin_messaging import (
     RunAlreadyActive,
     RunProducerFailed,
     StreamDeleted,
+    _redis_scripts,
 )
 
 _REDIS_URL_ENV = "TINKERFIN_TEST_REDIS_URL"
 _RedisStreamEntry = tuple[bytes, dict[bytes, bytes]]
 _XReadResponse = list[tuple[bytes, list[_RedisStreamEntry]]]
 _RedisT = TypeVar("_RedisT", bound=Redis)
+
+_REDIS_SCRIPT_DIGESTS = {
+    "_APPEND_SCRIPT": "8bdd4bf46ac3554501e679a4d4c55caea17af9560a3254ef98a77314b5222868",
+    "_BEGIN_DELETE_SCRIPT": "3a22ee94dd7437c196a2bbd5d7ab30f597144d0dd39075a25fdc86470fc9e6e5",
+    "_BEGIN_SETTLEMENT_SCRIPT": "554621573ed7a50c3b5ea0be5bb7166f051d2fdba213db0493423a84f5423414",
+    "_CANCEL_SCRIPT": "c4d82de1405dffc62a13ec7efbc11790e5bcab99c746b02fb8cb397ad59fce09",
+    "_DELETE_BATCH_SCRIPT": "e0a233eb4d17f70abb3ef4f2afda18007e267c065d7b62dc413ea0c80f37cc82",
+    "_FINALIZE_DELETE_SCRIPT": "60dba88f869c6584a5c9d9eb036c3aa9336010238a892da2e2fca6ff8008782c",
+    "_FINISH_SCRIPT": "7e020d232d28d30e75551c5661e30ad3b5abc04c6e169a7028abd5f3484b687e",
+    "_PREPARE_SCRIPT": "29f779580895f7d11e072bef8bf20f52907eca097f6e117ad147f3b9c1f611d0",
+    "_RENEW_SCRIPT": "52da64b825db95f104586e642bb614f2cf74f06834d695ba1c1272ccb8800865",
+    "_RUN_SNAPSHOT_SCRIPT": "6fd0be00eefe236c70f540a84d08be6bd757c4b4dde0728eaa25718633f5d94f",
+}
+
+
+def test_redis_lua_scripts_remain_byte_stable() -> None:
+    for name, expected in _REDIS_SCRIPT_DIGESTS.items():
+        script = getattr(_redis_scripts, name)
+        assert isinstance(script, str)
+        assert hashlib.sha256(script.encode()).hexdigest() == expected
 
 
 def _identity(

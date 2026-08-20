@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, RootModel, model_validator
 from pydantic.alias_generators import to_camel
 
@@ -43,8 +45,9 @@ class AgentRuntimeInterrupt(RuntimeModel):
         """Extract stable fields from a mapping or framework interrupt object."""
 
         if isinstance(value, dict):
-            interrupt_id = value.get("id")
-            interrupt_value = value.get("value")
+            mapping = cast(dict[object, object], value)
+            interrupt_id = mapping.get("id")
+            interrupt_value = mapping.get("value")
         else:
             interrupt_id = getattr(value, "id", None)
             interrupt_value = getattr(value, "value", None)
