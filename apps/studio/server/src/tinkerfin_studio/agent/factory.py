@@ -26,7 +26,7 @@ from tinkerfin import (
     AgUiEventStream,
     AgUiResumeBinding,
     DeepAgentDefinition,
-    TinkerFin,
+    TinkerFin, DeepAgentAgUiRuntime,
 )
 from tinkerfin_messaging import (
     MessageSourceBinding,
@@ -104,12 +104,12 @@ class ConversationAgentFactory:
     """借用全局资源，为 Messaging owner 创建请求级 AG-UI 事件源"""
 
     def __init__(
-        self,
-        *,
-        persistence: AgentPersistence,
-        sandbox_manager: OpenSandboxManager[str],
-        tinkerfin: TinkerFin,
-        tavily_api_key: str | None,
+            self,
+            *,
+            persistence: AgentPersistence,
+            sandbox_manager: OpenSandboxManager[str],
+            tinkerfin: TinkerFin,
+            tavily_api_key: str | None,
     ) -> None:
         self._persistence = persistence
         self._sandbox_manager = sandbox_manager
@@ -117,14 +117,14 @@ class ConversationAgentFactory:
         self._tavily_api_key = tavily_api_key
 
     def create_agui_events(
-        self,
-        *,
-        user_id: int,
-        model_config: AgentModelConfig,
-        graph_input: InputAgentState | Command,
-        prepared: PreparedRunRequest,
-        resume: AgUiResumeBinding | None,
-        title: str,
+            self,
+            *,
+            user_id: int,
+            model_config: AgentModelConfig,
+            graph_input: InputAgentState | Command,
+            prepared: PreparedRunRequest,
+            resume: AgUiResumeBinding | None,
+            title: str,
     ) -> ProfiledDeferredMessageSource[BaseEvent, BaseEvent]:
         """返回仅由 Messaging producer owner 打开的 AG-UI 事件源"""
 
@@ -134,7 +134,7 @@ class ConversationAgentFactory:
                     user_id=user_id,
                     model_config=model_config,
                 )
-                runtime = await to_thread.run_sync(
+                runtime: DeepAgentAgUiRuntime[None] = await to_thread.run_sync(
                     partial(
                         definition.new_agui,
                         identity=prepared.identity,
@@ -183,10 +183,10 @@ class ConversationAgentFactory:
         )
 
     async def _create_definition(
-        self,
-        *,
-        user_id: int,
-        model_config: AgentModelConfig,
+            self,
+            *,
+            user_id: int,
+            model_config: AgentModelConfig,
     ) -> DeepAgentDefinition[None]:
         """准备一次请求借用的模型、Sandbox 与 Deep Agent 建图参数"""
 
