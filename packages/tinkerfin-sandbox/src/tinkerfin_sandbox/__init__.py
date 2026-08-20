@@ -22,7 +22,18 @@ if TYPE_CHECKING:
 from .backends import OpenSandboxBackend as OpenSandboxBackend
 from .backends import OpenSandboxHandle as OpenSandboxHandle
 from .backends import RootedOpenSandboxBackend as RootedOpenSandboxBackend
+from .errors import OpenSandboxBackendError as OpenSandboxBackendError
+from .errors import (
+    OpenSandboxBackendProtocolError as OpenSandboxBackendProtocolError,
+)
+from .errors import OpenSandboxBackendTimeoutError as OpenSandboxBackendTimeoutError
+from .errors import (
+    OpenSandboxBackendUnavailableError as OpenSandboxBackendUnavailableError,
+)
 from .errors import OpenSandboxDestroyError as OpenSandboxDestroyError
+from .errors import OpenSandboxError as OpenSandboxError
+from .errors import OpenSandboxErrorCode as OpenSandboxErrorCode
+from .errors import OpenSandboxHandleClosedError as OpenSandboxHandleClosedError
 from .errors import (
     OpenSandboxHandleOwnershipError as OpenSandboxHandleOwnershipError,
 )
@@ -32,12 +43,26 @@ from .errors import (
     OpenSandboxSettlementTimeoutError as OpenSandboxSettlementTimeoutError,
 )
 from .errors import (
+    OpenSandboxStateCommitUncertainError as OpenSandboxStateCommitUncertainError,
+)
+from .errors import (
     OpenSandboxStateConfigurationError as OpenSandboxStateConfigurationError,
 )
 from .errors import OpenSandboxStateError as OpenSandboxStateError
 from .errors import (
     OpenSandboxStateOwnershipError as OpenSandboxStateOwnershipError,
 )
+from .errors import (
+    OpenSandboxStateProtocolError as OpenSandboxStateProtocolError,
+)
+from .errors import OpenSandboxStateTimeoutError as OpenSandboxStateTimeoutError
+from .errors import (
+    OpenSandboxStateUnavailableError as OpenSandboxStateUnavailableError,
+)
+from .errors import (
+    UnexpectedOpenSandboxBackendError as UnexpectedOpenSandboxBackendError,
+)
+from .errors import UnexpectedOpenSandboxStateError as UnexpectedOpenSandboxStateError
 from .lifecycle import InMemoryOpenSandboxState as InMemoryOpenSandboxState
 from .lifecycle import OpenSandboxBinding as OpenSandboxBinding
 from .lifecycle import OpenSandboxCleanupClaim as OpenSandboxCleanupClaim

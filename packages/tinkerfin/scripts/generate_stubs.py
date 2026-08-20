@@ -89,7 +89,7 @@ def _format(content: str, *, target: Path) -> str:
 def _render_deep_agent_stub() -> str:
     astream_arguments = {"InputT": "InputAgentState"}
     content = f"""# ruff: noqa: F403, F405
-# 此文件由 scripts/generate_stubs.py 根据锁定依赖生成，请勿手工维护参数列表
+# Generated from locked dependencies by scripts/generate_stubs.py; do not edit signatures manually.
 from collections.abc import Mapping, Sequence
 from typing import Generic, Literal
 
@@ -122,7 +122,7 @@ CREATE_DEEP_AGENT: object
 
 def _render_init_stub() -> str:
     content = f"""# ruff: noqa: F403, F405
-# 此文件由 scripts/generate_stubs.py 根据锁定依赖生成，请勿手工维护参数列表
+# Generated from locked dependencies by scripts/generate_stubs.py; do not edit signatures manually.
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -136,6 +136,19 @@ from .coordination import RunCoordinator as RunCoordinator
 from .deep_agent import DeepAgentAgUiRuntime as DeepAgentAgUiRuntime
 from .deep_agent import DeepAgentDefinition as DeepAgentDefinition
 from .deep_agent import DeepAgentRuntime as DeepAgentRuntime
+from .errors import RedisLeaseError as RedisLeaseError
+from .errors import RedisLeaseLifecycleError as RedisLeaseLifecycleError
+from .errors import RedisLeaseProtocolError as RedisLeaseProtocolError
+from .errors import RedisLeaseTimeoutError as RedisLeaseTimeoutError
+from .errors import RedisLeaseUnavailableError as RedisLeaseUnavailableError
+from .errors import RunCoordinationError as RunCoordinationError
+from .errors import RunCoordinationOwnershipLostError as RunCoordinationOwnershipLostError
+from .errors import RunCoordinationTimeoutError as RunCoordinationTimeoutError
+from .errors import RunCoordinationUnavailableError as RunCoordinationUnavailableError
+from .errors import TinkerFinError as TinkerFinError
+from .errors import TinkerFinErrorCode as TinkerFinErrorCode
+from .errors import TinkerFinLifecycleError as TinkerFinLifecycleError
+from .errors import TinkerFinStreamProtocolError as TinkerFinStreamProtocolError
 from .runtime import AgUiEventStream as AgUiEventStream
 from .runtime import AgUiNativeStreamConfig as AgUiNativeStreamConfig
 from .runtime import AgUiNativeStreamConfigurationError as AgUiNativeStreamConfigurationError

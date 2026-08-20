@@ -34,6 +34,16 @@ from .agui_native import (
 )
 from .coordination import RunCoordinator
 from .deep_agent import CREATE_DEEP_AGENT
+from .errors import (
+    AgUiSettlementTimeoutError,
+    RunCoordinationError,
+    RunCoordinationOwnershipLostError,
+    RunCoordinationTimeoutError,
+    RunCoordinationUnavailableError,
+    TinkerFinError,
+    TinkerFinErrorCode,
+    TinkerFinLifecycleError,
+)
 from .native import NativeStreamPart, normalize_native_stream_part
 from .sse import (
     SseBody,
@@ -50,16 +60,49 @@ PartObserver: TypeAlias = Callable[[PartT], Awaitable[None]]
 EventObserver = Callable[[BaseEvent], Awaitable[None]]
 
 
+def _coordination_error(operation: str, error: Exception) -> RunCoordinationError:
+    """Translate only failures owned by a replaceable coordinator boundary."""
+
+    if isinstance(error, RunCoordinationError):
+        return error
+    diagnostic_context = (
+        dict(error.diagnostic_context) if isinstance(error, TinkerFinError) else {}
+    )
+    diagnostic_context["operation"] = operation
+    if isinstance(error, TinkerFinError):
+        if error.code is TinkerFinErrorCode.REDIS_LEASE_LOST:
+            return RunCoordinationOwnershipLostError(
+                "Run coordination ownership was lost",
+                diagnostic_context=diagnostic_context,
+                cause=error,
+            )
+        if error.code is TinkerFinErrorCode.REDIS_LEASE_TIMEOUT:
+            return RunCoordinationTimeoutError(
+                "Run coordination timed out",
+                diagnostic_context=diagnostic_context,
+                cause=error,
+            )
+        if error.code is TinkerFinErrorCode.REDIS_LEASE_UNAVAILABLE:
+            return RunCoordinationUnavailableError(
+                "Run coordination is unavailable",
+                diagnostic_context=diagnostic_context,
+                cause=error,
+            )
+    if isinstance(error, TimeoutError):
+        return RunCoordinationTimeoutError(
+            "Run coordination timed out",
+            diagnostic_context=diagnostic_context,
+            cause=error,
+        )
+    return RunCoordinationError(
+        "Run coordination failed",
+        diagnostic_context=diagnostic_context,
+        cause=error,
+    )
+
+
 class _AgUiStreamDeadlineExceeded(TimeoutError):
     """Identify only the total pull deadline owned by `AgUiEventStream`."""
-
-
-class AgUiSettlementTimeoutError(TimeoutError):
-    """The caller stopped waiting while AG-UI close settlement remains owned."""
-
-    def __init__(self, *, timeout: float) -> None:
-        self.timeout = timeout
-        super().__init__(f"AG-UI settlement timed out after {timeout:g} seconds")
 
 
 def _validate_timeout(
@@ -141,10 +184,12 @@ class GraphRunStream(Generic[PartT]):
             raise StopAsyncIteration
         current = cast(asyncio.Task[object] | None, asyncio.current_task())
         if current is None:  # pragma: no cover - async methods run in a Task
-            raise RuntimeError("a Graph run stream requires an asyncio task")
+            raise TinkerFinLifecycleError("a Graph run stream requires an asyncio task")
         active = self._active_task
         if active is not None and not active.done():
-            raise RuntimeError("a Graph run stream operation is already active")
+            raise TinkerFinLifecycleError(
+                "a Graph run stream operation is already active"
+            )
         self._active_task = current
         try:
             if not self._started:
@@ -281,8 +326,12 @@ class GraphRunStream(Generic[PartT]):
     async def _start(self) -> None:
         coordination_factory = self._coordination_factory
         if coordination_factory is not None:
-            coordination = coordination_factory()
-            await coordination.__aenter__()
+            try:
+                coordination = coordination_factory()
+                await coordination.__aenter__()
+            except Exception as error:
+                translated = _coordination_error("enter", error)
+                raise translated from error
             self._coordination = coordination
         try:
             source = self._source_factory()
@@ -326,7 +375,10 @@ class GraphRunStream(Generic[PartT]):
                     None if error is None else error.__traceback__,
                 )
             except BaseException as cleanup_error:  # noqa: BLE001 - cleanup outcome
-                cleanup_errors.append(cleanup_error)
+                if isinstance(cleanup_error, Exception):
+                    cleanup_errors.append(_coordination_error("exit", cleanup_error))
+                else:
+                    cleanup_errors.append(cleanup_error)
 
         if error is not None:
             for cleanup_error in cleanup_errors:
@@ -350,7 +402,7 @@ class NativeGraphRunStream(GraphRunStream[Mapping[str, object]]):
 
         identity = self._identity
         if identity is None:
-            raise RuntimeError("a native stream requires an Identity")
+            raise TinkerFinLifecycleError("a native stream requires an Identity")
         return identity
 
     @property
@@ -499,10 +551,14 @@ class AgUiEventStream:
             raise StopAsyncIteration
         current = cast(asyncio.Task[object] | None, asyncio.current_task())
         if current is None:  # pragma: no cover - async methods run in a Task
-            raise RuntimeError("an AG-UI event stream requires an asyncio task")
+            raise TinkerFinLifecycleError(
+                "an AG-UI event stream requires an asyncio task"
+            )
         active = self._active_task
         if active is not None and not active.done():
-            raise RuntimeError("an AG-UI event stream operation is already active")
+            raise TinkerFinLifecycleError(
+                "an AG-UI event stream operation is already active"
+            )
         self._active_task = current
         try:
             try:
@@ -555,7 +611,7 @@ class AgUiEventStream:
             return []
         current = asyncio.current_task()
         if self._active_observers and self._observer_lineage.get():
-            raise RuntimeError(
+            raise TinkerFinLifecycleError(
                 "AgUiEventStream.abort() cannot be called from its on_event callback"
             )
         self._aborted = True
@@ -945,7 +1001,9 @@ class TinkerFinRun(Generic[PartT]):
         """Claim the binding and return the inputs for exactly one stream type."""
 
         if self._stream_claimed:
-            raise RuntimeError("a TinkerFin run can create only one object stream")
+            raise TinkerFinLifecycleError(
+                "a TinkerFin run can create only one object stream"
+            )
         self._stream_claimed = True
         coordinator = self._run_coordinator
         identity = self._identity

@@ -9,7 +9,16 @@ from redis.asyncio import Redis
 from redis.asyncio.cluster import RedisCluster
 from redis.exceptions import ConnectionError as RedisConnectionError
 
-from tinkerfin import Identity
+from tinkerfin import (
+    Identity,
+    RunCoordinationError,
+    RunCoordinationUnavailableError,
+)
+from tinkerfin.errors import (
+    RedisLeaseError,
+    RedisLeaseLifecycleError,
+    RedisLeaseUnavailableError,
+)
 from tinkerfin.redis import RedisRunCoordinator
 
 
@@ -211,7 +220,9 @@ async def test_lost_lease_cancellation_survives_a_release_failure() -> None:
     ) as raised:
         await asyncio.wait_for(task, timeout=0.5)
 
-    assert any("Redis lease release failed" in note for note in raised.value.__notes__)
+    assert any(
+        RedisLeaseUnavailableError.__name__ in note for note in raised.value.__notes__
+    )
 
 
 @pytest.mark.asyncio
@@ -328,9 +339,10 @@ async def test_from_url_closes_its_client_when_health_check_fails(
         key_resolver=lambda identity: identity.thread_id,
     )
 
-    with pytest.raises(RuntimeError, match="health check failed"):
+    with pytest.raises(RunCoordinationUnavailableError) as raised:
         await coordinator.__aenter__()
 
+    assert isinstance(raised.value.cause, RedisLeaseUnavailableError)
     assert client.close_calls == 1
 
 
@@ -351,10 +363,11 @@ async def test_from_url_closes_owned_client_after_non_redis_health_failure(
         key_resolver=lambda identity: identity.thread_id,
     )
 
-    with pytest.raises(ValueError) as raised:
+    with pytest.raises(RunCoordinationError) as raised:
         await coordinator.__aenter__()
 
-    assert raised.value is failure
+    assert isinstance(raised.value.cause, RedisLeaseError)
+    assert raised.value.cause.cause is failure
     assert client.close_calls == 1
 
 
@@ -413,9 +426,12 @@ async def test_concurrent_enter_allows_exactly_one_caller() -> None:
         await coordinator.__aexit__(None, None, None)
 
     assert sum(result is coordinator for result in results) == 1
-    failures = [result for result in results if isinstance(result, RuntimeError)]
+    failures = [
+        result for result in results if isinstance(result, RunCoordinationError)
+    ]
     assert len(failures) == 1
-    assert "single-use" in str(failures[0])
+    assert isinstance(failures[0].cause, RedisLeaseLifecycleError)
+    assert "single-use" in str(failures[0].cause)
     assert client.ping_calls == 1
 
 
@@ -456,9 +472,11 @@ async def test_close_cancellation_waits_for_active_run_cleanup() -> None:
         await asyncio.gather(running, closing, return_exceptions=True)
         await coordinator.__aexit__(None, None, None)
 
-    with pytest.raises(RuntimeError, match="entered before use"):
+    with pytest.raises(RunCoordinationError) as raised:
         async with coordinator(_identity(thread_id="user-2")):
             pass
+    assert isinstance(raised.value.cause, RedisLeaseLifecycleError)
+    assert "entered before use" in str(raised.value.cause)
 
 
 @pytest.mark.asyncio
@@ -482,8 +500,10 @@ async def test_acquisition_that_finishes_after_close_does_not_enter_run() -> Non
     await asyncio.sleep(0)
     client.release_acquire.set()
 
-    with pytest.raises(RuntimeError, match="closing"):
+    with pytest.raises(RunCoordinationError) as raised:
         await running
+    assert isinstance(raised.value.cause, RedisLeaseLifecycleError)
+    assert "closing" in str(raised.value.cause)
     await closing
 
     assert not entered

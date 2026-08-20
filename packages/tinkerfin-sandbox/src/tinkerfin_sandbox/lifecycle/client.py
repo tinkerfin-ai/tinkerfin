@@ -15,16 +15,64 @@ from uuid import uuid4
 from opensandbox import Sandbox
 from opensandbox import SandboxManager as OpenSandboxSDKManager
 from opensandbox.config import ConnectionConfig
+from opensandbox.exceptions import SandboxReadyTimeoutException
 from opensandbox.models import WriteEntry
 from opensandbox.models.sandboxes import SandboxFilter, SandboxInfo
 
 from ..backends.sdk import OpenSandboxBackend, unavailable_reason
+from ..errors import (
+    OpenSandboxBackendError,
+    OpenSandboxBackendProtocolError,
+    OpenSandboxBackendTimeoutError,
+    OpenSandboxBackendUnavailableError,
+    UnexpectedOpenSandboxBackendError,
+)
 from ..models import OpenSandboxConfig, OpenSandboxRuntimeInfo
 from ._protocols import _SandboxClient
 
 logger = logging.getLogger(__name__)
 
 _CREATE_TOKEN_METADATA_KEY = "tinkerfin.ai/create-token"
+
+
+def _backend_error(
+    operation: str,
+    error: Exception,
+) -> OpenSandboxBackendError:
+    diagnostic_context = {
+        "implementation": "opensandbox_sdk",
+        "operation": operation,
+    }
+    if isinstance(error, OpenSandboxBackendError):
+        error._enrich_diagnostic_context(diagnostic_context)
+        return error
+    if isinstance(error, SandboxReadyTimeoutException | TimeoutError):
+        return OpenSandboxBackendTimeoutError(
+            f"OpenSandbox {operation} timed out",
+            diagnostic_context=diagnostic_context,
+            cause=error,
+        )
+    if isinstance(error, (TypeError, ValueError)):
+        return OpenSandboxBackendProtocolError(
+            f"OpenSandbox {operation} returned an invalid response",
+            diagnostic_context=diagnostic_context,
+            cause=error,
+        )
+    reason = unavailable_reason(error)
+    if reason in {"not_found", "unhealthy", "unavailable"} or isinstance(
+        error, OSError
+    ):
+        return OpenSandboxBackendUnavailableError(
+            f"OpenSandbox is unavailable for {operation}",
+            diagnostic_context=diagnostic_context,
+            cause=error,
+        )
+    return UnexpectedOpenSandboxBackendError(
+        f"OpenSandbox {operation} failed",
+        diagnostic_context=diagnostic_context,
+        cause=error,
+    )
+
 
 OpenSandboxInitializer = Callable[
     [OpenSandboxBackend],
@@ -40,6 +88,8 @@ class OpenSandboxClient(_SandboxClient):
     the remote instance is absent. Initializers run in declaration order and may be
     native async callbacks or non-blocking synchronous callbacks.
     """
+
+    _tinkerfin_error_boundary = True
 
     def __init__(
         self,
@@ -161,13 +211,35 @@ class OpenSandboxClient(_SandboxClient):
                 ready_timeout=self.config.ready_timeout,
                 connection_config=self.connection_config,
             )
-        except Exception:
-            sandbox = await self._recover_unknown_create(creation_metadata)
+        except Exception as error:
+            try:
+                sandbox = await self._recover_unknown_create(creation_metadata)
+            except Exception as recovery_error:  # noqa: BLE001 - SDK recovery boundary
+                error.add_note(
+                    "OpenSandbox create recovery also failed: "
+                    f"{type(recovery_error).__name__}"
+                )
+                translated = _backend_error("create", error)
+                raise translated from error
             if sandbox is None:
-                raise
+                translated = _backend_error("create", error)
+                raise translated from error
         backend = self._wrap(sandbox)
         try:
             await self._initialize_workspace(sandbox)
+        except Exception as error:
+            try:
+                await backend.akill()
+            except Exception:
+                logger.warning(
+                    "Failed to reclaim newly created sandbox %s after initialization",
+                    backend.id,
+                    exc_info=True,
+                )
+            await self._close_quietly(backend, operation="initialization failure")
+            translated = _backend_error("workspace initialization", error)
+            raise translated from error
+        try:
             await self._initialize(backend)
         except BaseException:
             try:
@@ -178,7 +250,7 @@ class OpenSandboxClient(_SandboxClient):
                     backend.id,
                     exc_info=True,
                 )
-            await self._close_quietly(backend, operation="initialization failure")
+            await self._close_quietly(backend, operation="initializer failure")
             raise
         return backend
 
@@ -351,19 +423,31 @@ class OpenSandboxClient(_SandboxClient):
 
     async def _connect(self, sandbox_id: str) -> OpenSandboxBackend:
         """Strictly reconnect to and initialize an existing remote sandbox."""
-        sandbox = await Sandbox.connect(
-            sandbox_id,
-            connection_config=self.connection_config,
-            connect_timeout=self.config.connect_timeout,
-        )
+        try:
+            sandbox = await Sandbox.connect(
+                sandbox_id,
+                connection_config=self.connection_config,
+                connect_timeout=self.config.connect_timeout,
+            )
+        except Exception as error:
+            translated = _backend_error("connect", error)
+            raise translated from error
         backend = self._wrap(sandbox)
         try:
             await self._initialize_workspace(sandbox)
+        except Exception as error:
+            await self._close_quietly(
+                backend,
+                operation="reconnect initialization failure",
+            )
+            translated = _backend_error("workspace initialization", error)
+            raise translated from error
+        try:
             await self._initialize(backend)
         except BaseException:
             await self._close_quietly(
                 backend,
-                operation="reconnect initialization failure",
+                operation="reconnect initializer failure",
             )
             raise
         return backend
@@ -425,16 +509,18 @@ class OpenSandboxClient(_SandboxClient):
         except Exception as exc:
             if unavailable_reason(exc) == "not_found":
                 return
-            raise
+            translated = _backend_error("destroy lookup", exc)
+            raise translated from exc
         try:
             await sandbox.kill()
-        except Exception:
+        except Exception as error:
             await self._close_sdk_quietly(
                 sandbox,
                 sandbox_id=sandbox_id,
                 operation="failed destruction",
             )
-            raise
+            translated = _backend_error("destroy", error)
+            raise translated from error
         else:
             await sandbox.close()
 
@@ -443,4 +529,8 @@ class OpenSandboxClient(_SandboxClient):
         while self._cleanup_tasks:
             tasks = tuple(self._cleanup_tasks)
             await asyncio.gather(*tasks, return_exceptions=True)
-        await self.connection_config.close_transport_if_owned()
+        try:
+            await self.connection_config.close_transport_if_owned()
+        except Exception as error:
+            translated = _backend_error("client close", error)
+            raise translated from error

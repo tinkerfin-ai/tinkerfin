@@ -25,6 +25,7 @@ from tinkerfin_messaging import (
     RecoveryCheckpoint,
     RunNotFound,
     RunProducerFailed,
+    UnexpectedMessagingBackendError,
 )
 
 
@@ -846,8 +847,8 @@ async def test_cancel_tail_append_failure_preserves_the_committed_prefix() -> No
         with pytest.raises(RunProducerFailed):
             await anext(delivery)
 
-    assert captured.value.cause is not None
-    assert "cannot append payload" in str(captured.value.cause)
+    assert isinstance(captured.value.cause, UnexpectedMessagingBackendError)
+    assert "cannot append payload" in str(captured.value.cause.cause)
 
 
 async def test_cancel_callback_can_join_the_source_consumer_without_deadlock(
@@ -930,7 +931,7 @@ async def test_commit_failure_remains_primary_when_finish_loses_ownership(
             backend.release_append.set()
             await asyncio.wait_for(backend.finish_started.wait(), timeout=1)
             backend.release_finish.set()
-            with pytest.raises(ValueError) as captured:
+            with pytest.raises(UnexpectedMessagingBackendError) as captured:
                 await producer
 
         notes = "\n".join(getattr(captured.value, "__notes__", ()))
@@ -939,7 +940,7 @@ async def test_commit_failure_remains_primary_when_finish_loses_ownership(
             for record in caplog.records
             if getattr(record, "secondary_stage", None) == "finish"
         ]
-        assert captured.value is append_error
+        assert captured.value.cause is append_error
         assert "BackendOwnershipLost" in notes
         assert "finish" in notes
         assert len(records) == 1

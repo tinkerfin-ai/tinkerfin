@@ -11,15 +11,13 @@ from langgraph.types import StreamMode
 
 from tinkerfin_agui_adapter import Identity
 
+from .errors import AgUiNativeStreamConfigurationError
+
 _REQUIRED_MODES: tuple[StreamMode, ...] = ("messages", "tasks", "values")
 _SUPPORTED_EXTRA_MODES: frozenset[StreamMode] = frozenset(
     {"updates", "checkpoints", "debug", "custom"}
 )
 _RESERVED_OPTIONS = frozenset({"stream_mode", "version", "subgraphs"})
-
-
-class AgUiNativeStreamConfigurationError(ValueError):
-    """Report an invalid native LangGraph stream contract for AG-UI conversion."""
 
 
 def _bind_graph_identity(

@@ -66,7 +66,7 @@ class ConversationErrorCode(ErrorCode):
     INVALID_CURSOR = (1_001_004_001, 422, "无效的分页游标")
     RUN_CONFLICT = (1_001_004_002, 409, "会话当前状态不允许启动新的运行")
     DELETE_CONFLICT = (1_001_004_003, 409, "会话仍在运行，请先停止并等待运行结束")
-    AGENT_UNAVAILABLE = (1_001_004_004, 503, "会话 Agent 尚未就绪")
+    MESSAGING_UNAVAILABLE = (1_001_004_004, 503, "会话消息服务暂不可用")
     USER_MESSAGE_REQUIRED = (1_001_004_006, 422, "初次运行必须包含文本 user 消息")
     RESUME_REQUIRED = (1_001_004_013, 422, "resume 不能为空")
     RESUME_THREAD_ID_REQUIRED = (1_001_004_017, 422, "恢复运行时 threadId 不能为空")
@@ -78,6 +78,7 @@ class ConversationErrorCode(ErrorCode):
     MIXED_RESUME_UNSUPPORTED = (1_001_004_024, 422, "不支持混合已解决和已取消的 resume")
     RUN_CANCEL_FAILED = (1_001_004_025, 500, "取消会话运行失败")
     RESUME_ALREADY_CLAIMED = (1_001_004_026, 409, "该审批已被另一次恢复运行认领")
+    MESSAGING_FAILURE = (1_001_004_027, 500, "会话消息处理失败")
 
 
 class ApplicationException(Exception):

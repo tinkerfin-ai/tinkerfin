@@ -2,80 +2,180 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from enum import StrEnum
+from types import MappingProxyType
+from typing import TypeAlias
+
 from tinkerfin_agui_adapter import Identity
+
+_ContextValue: TypeAlias = str | int | float | bool | None
+
+
+class MessagingErrorCode(StrEnum):
+    """Stable machine-readable categories for Messaging failures."""
+
+    ERROR = "messaging.error"
+    NOT_STARTED = "messaging.not_started"
+    SETTLEMENT_TIMEOUT = "messaging.settlement_timeout"
+    CLOSED = "messaging.closed"
+    INVALID_CURSOR = "messaging.invalid_cursor"
+    CODEC_MISMATCH = "messaging.codec_mismatch"
+    SOURCE_PROFILE_MISMATCH = "messaging.source_profile_mismatch"
+    MESSAGE_ID_CONFLICT = "messaging.message_id_conflict"
+    RUN_ALREADY_ACTIVE = "messaging.run_already_active"
+    RUN_NOT_FOUND = "messaging.run_not_found"
+    RUN_PRODUCER_FAILED = "messaging.run_producer_failed"
+    CANCELLATION_UNSUPPORTED = "messaging.cancellation_unsupported"
+    RECOVERY_UNSUPPORTED = "messaging.recovery_unsupported"
+    SSE_RENDERING_UNSUPPORTED = "messaging.sse_rendering_unsupported"
+    BACKEND_OWNERSHIP_LOST = "messaging.backend_ownership_lost"
+    STREAM_DELETED = "messaging.stream_deleted"
+    STREAM_DELETE_CONFLICT = "messaging.stream_delete_conflict"
+    BACKEND_UNAVAILABLE = "messaging.backend_unavailable"
+    BACKEND_TIMEOUT = "messaging.backend_timeout"
+    BACKEND_PROTOCOL_ERROR = "messaging.backend_protocol_error"
+    UNEXPECTED_BACKEND_FAILURE = "messaging.unexpected_backend_failure"
+
+
+def _identity_context(identity: Identity) -> dict[str, _ContextValue]:
+    return {
+        "thread_id": identity.thread_id,
+        "run_id": identity.run_id,
+    }
 
 
 class MessagingError(Exception):
-    """Base failure whose message is safe to expose at a host boundary."""
+    """Base failure with separate public and trusted diagnostic context.
 
-    def __init__(self, message: str, *, cause: BaseException | None = None) -> None:
+    ``message`` and ``context`` are safe to expose at a client boundary.
+    ``diagnostic_context`` and ``cause`` are reserved for trusted logs and
+    telemetry and must not be serialized into client responses.
+
+    Args:
+        message: Safe human-readable failure summary.
+        context: Client-safe machine-readable semantic values.
+        diagnostic_context: Implementation details for trusted observability.
+        cause: Original failure retained for debugging and exception chaining.
+    """
+
+    code: MessagingErrorCode = MessagingErrorCode.ERROR
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        context: Mapping[str, _ContextValue] | None = None,
+        diagnostic_context: Mapping[str, _ContextValue] | None = None,
+        cause: BaseException | None = None,
+    ) -> None:
         self.message = message
+        self.context: Mapping[str, _ContextValue] = MappingProxyType(
+            dict(context or {})
+        )
+        self.diagnostic_context: Mapping[str, _ContextValue] = MappingProxyType(
+            dict(diagnostic_context or {})
+        )
         self.cause = cause
+        if cause is not None:
+            self.__cause__ = cause
         super().__init__(message)
+
+    def _enrich_diagnostic_context(
+        self,
+        context: Mapping[str, _ContextValue],
+    ) -> None:
+        self.diagnostic_context = MappingProxyType(
+            {**self.diagnostic_context, **context}
+        )
 
 
 class MessagingNotStarted(MessagingError):
     """The Messaging facade has not entered its asynchronous lifecycle."""
 
+    code = MessagingErrorCode.NOT_STARTED
+
 
 class MessagingSettlementTimeout(MessagingError):
     """A caller stopped waiting before Messaging settlement completed."""
 
+    code = MessagingErrorCode.SETTLEMENT_TIMEOUT
+
     def __init__(self, *, timeout: float) -> None:
         self.timeout = timeout
-        super().__init__(f"Messaging settlement timed out after {timeout:g} seconds")
+        super().__init__(
+            f"Messaging settlement timed out after {timeout:g} seconds",
+            context={"timeout": timeout},
+        )
 
 
 class MessagingClosed(MessagingError):
     """The single-use Messaging facade has already closed."""
 
+    code = MessagingErrorCode.CLOSED
+
 
 class InvalidCursor(MessagingError):
     """A replay cursor falls outside the retained stream range."""
+
+    code = MessagingErrorCode.INVALID_CURSOR
 
     def __init__(self, *, after: int, latest: int) -> None:
         self.after = after
         self.latest = latest
         super().__init__(
-            f"Replay cursor {after} is outside the retained range 0..{latest}"
+            f"Replay cursor {after} is outside the retained range 0..{latest}",
+            context={"after": after, "latest": latest},
         )
 
 
 class CodecMismatch(MessagingError):
     """One logical channel stream was opened with a different durable codec."""
 
+    code = MessagingErrorCode.CODEC_MISMATCH
+
     def __init__(self, *, expected: str, actual: str) -> None:
         self.expected = expected
         self.actual = actual
         super().__init__(
-            f"Stream codec is {expected!r}; it cannot be read as {actual!r}"
+            f"Stream codec is {expected!r}; it cannot be read as {actual!r}",
+            context={"expected": expected, "actual": actual},
         )
 
 
 class SourceProfileMismatch(MessagingError):
     """A built-in source profile is missing or contradicts its codec types."""
 
+    code = MessagingErrorCode.SOURCE_PROFILE_MISMATCH
+
     def __init__(self, *, profile: str, reason: str) -> None:
         self.profile = profile
         self.reason = reason
-        super().__init__(f"Source profile {profile!r} is incompatible: {reason}")
+        super().__init__(
+            f"Source profile {profile!r} is incompatible: {reason}",
+            context={"profile": profile},
+        )
 
 
 class MessageIdConflict(MessagingError):
     """A message ID was retried with different committed content."""
+
+    code = MessagingErrorCode.MESSAGE_ID_CONFLICT
 
     def __init__(self, *, identity: Identity, message_id: str) -> None:
         self.identity = identity
         self.message_id = message_id
         super().__init__(
             f"Message {message_id!r} already exists in thread "
-            f"{identity.thread_id!r} "
-            "with different content"
+            f"{identity.thread_id!r} with different content",
+            context={**_identity_context(identity), "message_id": message_id},
         )
 
 
 class RunAlreadyActive(MessagingError):
     """A different run already owns one channel and stream slot."""
+
+    code = MessagingErrorCode.RUN_ALREADY_ACTIVE
 
     def __init__(
         self,
@@ -87,25 +187,38 @@ class RunAlreadyActive(MessagingError):
         self.requested_identity = requested_identity
         super().__init__(
             f"Run {active_identity.run_id!r} is already active; cannot start "
-            f"{requested_identity.run_id!r}"
+            f"{requested_identity.run_id!r}",
+            context={
+                "thread_id": requested_identity.thread_id,
+                "active_run_id": active_identity.run_id,
+                "requested_run_id": requested_identity.run_id,
+            },
         )
 
 
 class RunNotFound(MessagingError):
     """No run record exists for the requested channel and stream."""
 
+    code = MessagingErrorCode.RUN_NOT_FOUND
+
     def __init__(self, *, identity: Identity) -> None:
         self.identity = identity
-        super().__init__(f"Run {identity.run_id!r} was not found")
+        super().__init__(
+            f"Run {identity.run_id!r} was not found",
+            context=_identity_context(identity),
+        )
 
 
 class RunProducerFailed(MessagingError):
     """A producer failed after zero or more messages were committed."""
 
+    code = MessagingErrorCode.RUN_PRODUCER_FAILED
+
     def __init__(self, *, identity: Identity, cause: BaseException) -> None:
         self.identity = identity
         super().__init__(
             f"Producer for run {identity.run_id!r} failed",
+            context=_identity_context(identity),
             cause=cause,
         )
 
@@ -113,25 +226,38 @@ class RunProducerFailed(MessagingError):
 class CancellationUnsupported(MessagingError):
     """The active producer has no application cancellation callback."""
 
+    code = MessagingErrorCode.CANCELLATION_UNSUPPORTED
+
     def __init__(self, *, identity: Identity) -> None:
         self.identity = identity
-        super().__init__(f"Run {identity.run_id!r} does not support cancellation")
+        super().__init__(
+            f"Run {identity.run_id!r} does not support cancellation",
+            context=_identity_context(identity),
+        )
 
 
 class RecoveryUnsupported(MessagingError):
     """A non-recoverable source cannot be rebuilt after owner loss."""
 
+    code = MessagingErrorCode.RECOVERY_UNSUPPORTED
+
 
 class SseRenderingUnsupported(MessagingError):
     """A channel has no SSE renderer for its decoded payload type."""
+
+    code = MessagingErrorCode.SSE_RENDERING_UNSUPPORTED
 
 
 class BackendOwnershipLost(MessagingError):
     """A stale producer attempted to mutate a run after losing ownership."""
 
+    code = MessagingErrorCode.BACKEND_OWNERSHIP_LOST
+
 
 class StreamDeleted(MessagingError):
     """A handle refers to a stream generation that has been deleted."""
+
+    code = MessagingErrorCode.STREAM_DELETED
 
     def __init__(
         self,
@@ -150,12 +276,19 @@ class StreamDeleted(MessagingError):
         )
         super().__init__(
             f"Thread {identity.thread_id!r} in channel {channel!r} {generation_text} "
-            "has been deleted"
+            "has been deleted",
+            context={
+                **_identity_context(identity),
+                "channel": channel,
+                "generation": generation,
+            },
         )
 
 
 class StreamDeleteConflict(MessagingError):
     """A stream cannot be deleted while one producer lease is active."""
+
+    code = MessagingErrorCode.STREAM_DELETE_CONFLICT
 
     def __init__(
         self,
@@ -169,5 +302,67 @@ class StreamDeleteConflict(MessagingError):
         self.active_identity = active_identity
         super().__init__(
             f"Thread {identity.thread_id!r} in channel {channel!r} has active run "
-            f"{active_identity.run_id!r}"
+            f"{active_identity.run_id!r}",
+            context={
+                **_identity_context(identity),
+                "channel": channel,
+                "active_run_id": active_identity.run_id,
+            },
         )
+
+
+class MessagingBackendError(MessagingError):
+    """Base failure for replaceable Messaging backend implementations."""
+
+    code = MessagingErrorCode.UNEXPECTED_BACKEND_FAILURE
+
+
+class MessagingBackendUnavailable(MessagingBackendError):
+    """The configured backend is unavailable for one operation."""
+
+    code = MessagingErrorCode.BACKEND_UNAVAILABLE
+
+
+class MessagingBackendTimeout(MessagingBackendError):
+    """A backend operation exceeded its bounded wait."""
+
+    code = MessagingErrorCode.BACKEND_TIMEOUT
+
+
+class MessagingBackendProtocolError(MessagingBackendError):
+    """A backend response violates the supported durable protocol."""
+
+    code = MessagingErrorCode.BACKEND_PROTOCOL_ERROR
+
+
+class UnexpectedMessagingBackendError(MessagingBackendError):
+    """A replaceable backend leaked an undeclared ordinary exception."""
+
+    code = MessagingErrorCode.UNEXPECTED_BACKEND_FAILURE
+
+
+__all__ = [
+    "BackendOwnershipLost",
+    "CancellationUnsupported",
+    "CodecMismatch",
+    "InvalidCursor",
+    "MessageIdConflict",
+    "MessagingBackendError",
+    "MessagingBackendProtocolError",
+    "MessagingBackendTimeout",
+    "MessagingBackendUnavailable",
+    "MessagingClosed",
+    "MessagingError",
+    "MessagingErrorCode",
+    "MessagingNotStarted",
+    "MessagingSettlementTimeout",
+    "RecoveryUnsupported",
+    "RunAlreadyActive",
+    "RunNotFound",
+    "RunProducerFailed",
+    "SourceProfileMismatch",
+    "SseRenderingUnsupported",
+    "StreamDeleteConflict",
+    "StreamDeleted",
+    "UnexpectedMessagingBackendError",
+]

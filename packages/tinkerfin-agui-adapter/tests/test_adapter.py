@@ -35,7 +35,12 @@ from langchain_core.runnables import Runnable
 from langchain_core.tools import BaseTool
 from pydantic import ValidationError
 
-from tinkerfin_agui_adapter import Identity, InterruptCorrelationError
+from tinkerfin_agui_adapter import (
+    AgUiAdapterErrorCode,
+    AgUiStreamContractError,
+    HitlCorrelationError,
+    Identity,
+)
 from tinkerfin_agui_adapter.adapter import DeepAgentAgUiAdapter
 from tinkerfin_agui_adapter.ids import ScopedIdCodec
 
@@ -1853,7 +1858,7 @@ def test_ambiguous_hitl_tool_correlation_is_rejected() -> None:
         }
     )
 
-    with pytest.raises(InterruptCorrelationError, match="ambiguous"):
+    with pytest.raises(HitlCorrelationError, match="ambiguous"):
         adapter.process(
             {
                 "type": "values",
@@ -1911,7 +1916,7 @@ def test_hitl_history_fallback_rejects_cross_message_ambiguity() -> None:
             }
         )
 
-    with pytest.raises(InterruptCorrelationError, match="ambiguous"):
+    with pytest.raises(HitlCorrelationError, match="ambiguous"):
         adapter.process(
             {
                 "type": "values",
@@ -1991,7 +1996,7 @@ def test_hitl_history_ambiguity_is_not_hidden_by_malformed_arguments() -> None:
             }
         )
 
-    with pytest.raises(InterruptCorrelationError, match="ambiguous") as raised:
+    with pytest.raises(HitlCorrelationError, match="ambiguous") as raised:
         adapter.process(
             {
                 "type": "values",
@@ -2047,7 +2052,7 @@ def test_hitl_history_reports_malformed_tool_arguments() -> None:
         }
     )
 
-    with pytest.raises(InterruptCorrelationError, match="invalid JSON") as raised:
+    with pytest.raises(HitlCorrelationError, match="invalid JSON") as raised:
         adapter.process(
             {
                 "type": "values",
@@ -2152,7 +2157,7 @@ def test_hitl_history_rejects_a_same_name_malformed_alternative() -> None:
         )
     )
 
-    with pytest.raises(InterruptCorrelationError, match="invalid JSON") as raised:
+    with pytest.raises(HitlCorrelationError, match="invalid JSON") as raised:
         adapter.process(
             _hitl_history_interrupt_part(
                 action_groups=((("write_file", {"path": "ok"}),),)
@@ -2227,7 +2232,7 @@ def test_hitl_history_rejects_relevant_malformed_sibling_in_same_message() -> No
         )
     )
 
-    with pytest.raises(InterruptCorrelationError, match="invalid JSON"):
+    with pytest.raises(HitlCorrelationError, match="invalid JSON"):
         adapter.process(
             _hitl_history_interrupt_part(
                 action_groups=((("write_file", {"path": "ok"}),),)
@@ -2286,7 +2291,7 @@ def test_hitl_history_rejects_relevant_malformed_candidate_across_groups() -> No
     ):
         adapter.process(_history_tool_part(message_id=message_id, calls=calls))
 
-    with pytest.raises(InterruptCorrelationError, match="invalid JSON") as raised:
+    with pytest.raises(HitlCorrelationError, match="invalid JSON") as raised:
         adapter.process(
             _hitl_history_interrupt_part(
                 action_groups=(
@@ -2514,7 +2519,7 @@ def test_unmatched_hitl_tool_correlation_is_rejected_with_typed_error() -> None:
         ],
     )
 
-    with pytest.raises(InterruptCorrelationError, match="cannot be correlated"):
+    with pytest.raises(HitlCorrelationError, match="cannot be correlated"):
         adapter.process(
             {
                 "type": "values",
@@ -2578,7 +2583,7 @@ def test_subagent_values_do_not_overwrite_main_ui_state() -> None:
 def test_malformed_tasks_payload_is_rejected_at_parser_boundary() -> None:
     adapter = _adapter()
 
-    with pytest.raises(ValidationError):
+    with pytest.raises(AgUiStreamContractError) as raised:
         adapter.process(
             {
                 "type": "tasks",
@@ -2591,6 +2596,9 @@ def test_malformed_tasks_payload_is_rejected_at_parser_boundary() -> None:
                 },
             }
         )
+
+    assert raised.value.code is AgUiAdapterErrorCode.STREAM_CONTRACT_INVALID
+    assert isinstance(raised.value.cause, ValidationError)
 
 
 def test_ai_message_without_stable_id_is_rejected_before_stream_state_changes() -> None:

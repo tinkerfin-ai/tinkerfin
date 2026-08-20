@@ -49,6 +49,8 @@ from tinkerfin_sandbox import (
     OpenSandboxWarmClaim,
     RootedOpenSandboxBackend,
     SQLAlchemyOpenSandboxState,
+    UnexpectedOpenSandboxBackendError,
+    UnexpectedOpenSandboxStateError,
 )
 from tinkerfin_sandbox.backends import _rooted_protocol
 
@@ -318,6 +320,12 @@ class _FakeState(InMemoryOpenSandboxState):
 
     async def shutdown_sandbox_ids(self) -> tuple[str, ...]:
         return ()
+
+
+class _LeakingState(_FakeState):
+    async def acquire_owner(self, owner_key: str) -> OpenSandboxOwnerClaim:
+        del owner_key
+        raise RuntimeError("driver-specific state failure")
 
 
 class _CleanupObservedSQLState(SQLAlchemyOpenSandboxState):
@@ -1902,8 +1910,10 @@ async def test_strict_startup_warmup_propagates_creation_failure() -> None:
         fail_on_startup_warmup_error=True,
     )
 
-    with pytest.raises(RuntimeError, match="warmup failed"):
+    with pytest.raises(UnexpectedOpenSandboxBackendError) as captured:
         await manager.start()
+    assert isinstance(captured.value.cause, RuntimeError)
+    assert str(captured.value.cause) == "warmup failed"
     await manager.aclose()
 
 
@@ -2185,9 +2195,11 @@ async def test_manager_start_failure_outranks_close_timeout() -> None:
         settlement_timeout=0.01,
     )
     try:
-        with pytest.raises(RuntimeError, match="warmup failed") as captured:
+        with pytest.raises(UnexpectedOpenSandboxBackendError) as captured:
             await manager.__aenter__()
 
+        assert isinstance(captured.value.cause, RuntimeError)
+        assert str(captured.value.cause) == "warmup failed"
         notes = "\n".join(getattr(captured.value, "__notes__", ()))
         assert "OpenSandboxSettlementTimeoutError" in notes
         assert client.close_entered.is_set()
@@ -2213,7 +2225,7 @@ async def test_manager_start_cleanup_caller_cancellation_retains_start_error() -
             await opening
 
         notes = "\n".join(getattr(captured.value, "__notes__", ()))
-        assert "OpenSandbox startup also failed: RuntimeError: warmup failed" in notes
+        assert "UnexpectedOpenSandboxBackendError" in notes
 
         client.release_close.set()
         await manager.aclose()
@@ -2869,11 +2881,28 @@ async def test_failed_replacement_preserves_the_committed_warm_sandbox() -> None
         await manager.start()
         warm_backend = client.backends[0]
 
-        with pytest.raises(RuntimeError, match="replacement creation failed"):
+        with pytest.raises(UnexpectedOpenSandboxBackendError) as captured:
             await manager.get(_key("user-1"))
+        assert isinstance(captured.value.cause, RuntimeError)
+        assert str(captured.value.cause) == "replacement creation failed"
 
         assert state.bindings == {"user-1": "sandbox-1"}
         assert client.destroy_calls == []
         assert warm_backend.close_calls == 1
     finally:
         await manager.aclose()
+
+
+async def test_manager_wraps_an_undeclared_custom_state_failure() -> None:
+    manager = _new_manager(client=_FakeClient(), state=_LeakingState())
+    await manager.start()
+    try:
+        with pytest.raises(UnexpectedOpenSandboxStateError) as captured:
+            await manager.get(_key("user-1"))
+    finally:
+        await manager.aclose()
+
+    assert isinstance(captured.value.cause, RuntimeError)
+    assert str(captured.value.cause) == "driver-specific state failure"
+    assert dict(captured.value.context) == {}
+    assert captured.value.diagnostic_context["operation"] == "acquire_owner"

@@ -14,9 +14,19 @@ from uuid import uuid4
 
 from redis.asyncio import Redis
 from redis.asyncio.cluster import RedisCluster
+from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import RedisError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from .._tasks import join_task
+from ..errors import (
+    RedisLeaseError,
+    RedisLeaseLifecycleError,
+    RedisLeaseProtocolError,
+    RedisLeaseTimeoutError,
+    RedisLeaseUnavailableError,
+    TinkerFinErrorCode,
+)
 
 _DEFAULT_KEY_PREFIX = "tinkerfin:lease:v1:"
 _DEFAULT_LEASE_TTL_SECONDS = 30.0
@@ -94,17 +104,52 @@ def _resource_key(value: str) -> str:
 
 def _redis_integer(value: object, *, operation: str) -> int:
     if isinstance(value, bool):
-        raise TypeError(f"Redis {operation} returned an invalid boolean reply")
+        raise RedisLeaseProtocolError(
+            f"Redis {operation} returned an invalid boolean reply",
+            diagnostic_context={"implementation": "redis", "operation": operation},
+        )
     if isinstance(value, int):
         return value
     if isinstance(value, bytes | str):
         try:
             return int(value)
         except ValueError as error:
-            raise RuntimeError(
-                f"Redis {operation} returned a non-integer reply"
+            raise RedisLeaseProtocolError(
+                f"Redis {operation} returned a non-integer reply",
+                diagnostic_context={
+                    "implementation": "redis",
+                    "operation": operation,
+                },
+                cause=error,
             ) from error
-    raise RuntimeError(f"Redis {operation} returned a non-integer reply")
+    raise RedisLeaseProtocolError(
+        f"Redis {operation} returned a non-integer reply",
+        diagnostic_context={"implementation": "redis", "operation": operation},
+    )
+
+
+def _redis_operation_error(
+    operation: str,
+    error: Exception,
+) -> RedisLeaseError:
+    diagnostic_context = {"implementation": "redis", "operation": operation}
+    if isinstance(error, RedisTimeoutError | TimeoutError):
+        return RedisLeaseTimeoutError(
+            f"Redis lease {operation} timed out",
+            diagnostic_context=diagnostic_context,
+            cause=error,
+        )
+    if isinstance(error, RedisConnectionError):
+        return RedisLeaseUnavailableError(
+            f"Redis is unavailable for lease {operation}",
+            diagnostic_context=diagnostic_context,
+            cause=error,
+        )
+    return RedisLeaseError(
+        f"Redis lease {operation} failed",
+        diagnostic_context=diagnostic_context,
+        cause=error,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,8 +165,10 @@ class RedisLease:
     fencing_token: int
 
 
-class RedisLeaseLost(RuntimeError):
+class RedisLeaseLost(RedisLeaseError):
     """The Redis lease can no longer authorize critical-section work."""
+
+    code = TinkerFinErrorCode.REDIS_LEASE_LOST
 
     def __init__(
         self,
@@ -130,12 +177,17 @@ class RedisLeaseLost(RuntimeError):
         cause: BaseException | None = None,
     ) -> None:
         self.lease = lease
-        self.cause = cause
-        message = (
-            f"Redis lease for {lease.resource_key!r} with fencing token "
-            f"{lease.fencing_token} was lost"
+        message = "Redis lease ownership was lost"
+        super().__init__(
+            message,
+            diagnostic_context={
+                "implementation": "redis",
+                "operation": "ownership",
+                "resource_key": lease.resource_key,
+                "fencing_token": lease.fencing_token,
+            },
+            cause=cause,
         )
-        super().__init__(message)
 
 
 @dataclass(frozen=True, slots=True)
@@ -280,7 +332,7 @@ class RedisLeaseLock:
         startup_error: BaseException | None = None
         async with self._state_lock:
             if self._state != "new":
-                raise RuntimeError("RedisLeaseLock is single-use")
+                raise RedisLeaseLifecycleError("RedisLeaseLock is single-use")
             self._state = "opening"
             try:
                 async with asyncio.timeout(self._settings.command_timeout_seconds):
@@ -311,8 +363,8 @@ class RedisLeaseLock:
                     "Redis lease startup cleanup also failed: "
                     f"{type(cleanup_error).__name__}: {cleanup_error}"
                 )
-        if isinstance(startup_error, RedisError | TimeoutError):
-            health_error = RuntimeError("Redis lease health check failed")
+        if isinstance(startup_error, Exception):
+            health_error = _redis_operation_error("health check", startup_error)
             raise health_error from startup_error
         raise startup_error.with_traceback(startup_error.__traceback__)
 
@@ -353,7 +405,11 @@ class RedisLeaseLock:
         try:
             await self._active_scopes_done.wait()
             if self._owns_client:
-                await self._client.aclose()
+                try:
+                    await self._client.aclose()
+                except Exception as error:
+                    translated = _redis_operation_error("client close", error)
+                    raise translated from error
         finally:
             async with self._state_lock:
                 self._state = "closed"
@@ -384,10 +440,12 @@ class RedisLeaseLock:
             )
             acquired = True
             if not await self._is_open():
-                raise RuntimeError("RedisLeaseLock is closing")
+                raise RedisLeaseLifecycleError("RedisLeaseLock is closing")
             owner_task = cast(asyncio.Task[object] | None, asyncio.current_task())
             if owner_task is None:  # pragma: no cover - async contexts run in Tasks
-                raise RuntimeError("Redis lease ownership requires an asyncio task")
+                raise RedisLeaseLifecycleError(
+                    "Redis lease ownership requires an asyncio task"
+                )
             lease = RedisLease(
                 resource_key=canonical_key,
                 fencing_token=fencing_token,
@@ -441,7 +499,9 @@ class RedisLeaseLock:
     async def _register_scope(self) -> None:
         async with self._state_lock:
             if self._state != "open":
-                raise RuntimeError("RedisLeaseLock must be entered before use")
+                raise RedisLeaseLifecycleError(
+                    "RedisLeaseLock must be entered before use"
+                )
             self._active_scopes += 1
             self._active_scopes_done.clear()
 
@@ -464,7 +524,7 @@ class RedisLeaseLock:
     ) -> int:
         while True:
             if not await self._is_open():
-                raise RuntimeError("RedisLeaseLock is closing")
+                raise RedisLeaseLifecycleError("RedisLeaseLock is closing")
             try:
 
                 async def evaluate() -> object:
@@ -490,7 +550,8 @@ class RedisLeaseLock:
                     owner_token=owner_token,
                     primary=error,
                 )
-                raise RuntimeError("Redis lease acquisition failed") from error
+                translated = _redis_operation_error("acquisition", error)
+                raise translated from error
             except BaseException as error:
                 await self._release_uncertain_acquisition(
                     lock_key=lock_key,
@@ -501,8 +562,12 @@ class RedisLeaseLock:
             if token > 0:
                 return token
             if token < 0:
-                raise RuntimeError(
-                    "Redis acquisition returned a negative fencing token"
+                raise RedisLeaseProtocolError(
+                    "Redis acquisition returned a negative fencing token",
+                    diagnostic_context={
+                        "implementation": "redis",
+                        "operation": "acquisition",
+                    },
                 )
             await asyncio.sleep(self._settings.wait_poll_seconds)
 
@@ -588,9 +653,16 @@ class RedisLeaseLock:
             reply = await join_task(release)
             released = _redis_integer(reply, operation="release")
         except (RedisError, TimeoutError) as error:
-            raise RuntimeError("Redis lease release failed") from error
+            translated = _redis_operation_error("release", error)
+            raise translated from error
         if released not in {0, 1}:
-            raise RuntimeError("Redis release returned an invalid result")
+            raise RedisLeaseProtocolError(
+                "Redis release returned an invalid result",
+                diagnostic_context={
+                    "implementation": "redis",
+                    "operation": "release",
+                },
+            )
         return released
 
     @staticmethod
@@ -619,7 +691,15 @@ class RedisLeaseLock:
         if len(cleanup_errors) == 1:
             raise cleanup_errors[0]
         if cleanup_errors:
-            raise BaseExceptionGroup("Redis lease cleanup failed", cleanup_errors)
+            group = BaseExceptionGroup("Redis lease cleanup failed", cleanup_errors)
+            raise RedisLeaseError(
+                "Redis lease cleanup failed",
+                diagnostic_context={
+                    "implementation": "redis",
+                    "operation": "cleanup",
+                },
+                cause=group,
+            ) from group
 
 
 __all__ = ["RedisLease", "RedisLeaseLock", "RedisLeaseLost"]

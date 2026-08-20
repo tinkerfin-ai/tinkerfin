@@ -5,13 +5,16 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+from collections.abc import Awaitable
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Protocol, cast, runtime_checkable
 from uuid import uuid4
 
 from ..errors import (
     OpenSandboxStateConfigurationError,
+    OpenSandboxStateError,
     OpenSandboxStateOwnershipError,
+    UnexpectedOpenSandboxStateError,
 )
 
 
@@ -132,6 +135,229 @@ class OpenSandboxState(Protocol):
     async def aclose(self) -> None: ...
 
 
+async def _call_state(
+    state: OpenSandboxState,
+    operation: str,
+    awaitable: object,
+) -> object:
+    try:
+        return await cast(Awaitable[object], awaitable)
+    except OpenSandboxStateError:
+        raise
+    except Exception as error:
+        translated = UnexpectedOpenSandboxStateError(
+            f"OpenSandbox State {operation} failed",
+            diagnostic_context={"operation": operation},
+            cause=error,
+        )
+        raise translated from error
+
+
+class _OpenSandboxStateBoundary(OpenSandboxState):
+    """Enforce the State failure contract for replaceable implementations."""
+
+    def __init__(self, state: OpenSandboxState) -> None:
+        self._state = state
+
+    @property
+    def persistent(self) -> bool:
+        try:
+            return self._state.persistent
+        except OpenSandboxStateError:
+            raise
+        except Exception as error:
+            translated = UnexpectedOpenSandboxStateError(
+                "OpenSandbox State persistent lookup failed",
+                diagnostic_context={"operation": "persistent"},
+                cause=error,
+            )
+            raise translated from error
+
+    @property
+    def lease_renew_interval(self) -> float | None:
+        try:
+            return self._state.lease_renew_interval
+        except OpenSandboxStateError:
+            raise
+        except Exception as error:
+            translated = UnexpectedOpenSandboxStateError(
+                "OpenSandbox State lease interval lookup failed",
+                diagnostic_context={"operation": "lease_renew_interval"},
+                cause=error,
+            )
+            raise translated from error
+
+    async def start(self, *, warm_pool_size: int) -> None:
+        await _call_state(
+            self._state,
+            "start",
+            self._state.start(warm_pool_size=warm_pool_size),
+        )
+
+    async def acquire_owner(self, owner_key: str) -> OpenSandboxOwnerClaim:
+        return cast(
+            OpenSandboxOwnerClaim,
+            await _call_state(
+                self._state,
+                "acquire_owner",
+                self._state.acquire_owner(owner_key),
+            ),
+        )
+
+    async def renew_owner(self, claim: OpenSandboxOwnerClaim) -> bool:
+        return cast(
+            bool,
+            await _call_state(
+                self._state,
+                "renew_owner",
+                self._state.renew_owner(claim),
+            ),
+        )
+
+    async def bind_owner(
+        self,
+        claim: OpenSandboxOwnerClaim,
+        sandbox_id: str,
+    ) -> OpenSandboxBinding:
+        return cast(
+            OpenSandboxBinding,
+            await _call_state(
+                self._state,
+                "bind_owner",
+                self._state.bind_owner(claim, sandbox_id),
+            ),
+        )
+
+    async def unbind_owner(self, claim: OpenSandboxOwnerClaim) -> None:
+        await _call_state(
+            self._state,
+            "unbind_owner",
+            self._state.unbind_owner(claim),
+        )
+
+    async def read_binding(self, owner_key: str) -> OpenSandboxBinding | None:
+        return cast(
+            OpenSandboxBinding | None,
+            await _call_state(
+                self._state,
+                "read_binding",
+                self._state.read_binding(owner_key),
+            ),
+        )
+
+    async def release_owner(self, claim: OpenSandboxOwnerClaim) -> None:
+        await _call_state(
+            self._state,
+            "release_owner",
+            self._state.release_owner(claim),
+        )
+
+    async def claim_warm_slot(self) -> OpenSandboxWarmClaim | None:
+        return cast(
+            OpenSandboxWarmClaim | None,
+            await _call_state(
+                self._state,
+                "claim_warm_slot",
+                self._state.claim_warm_slot(),
+            ),
+        )
+
+    async def publish_warm(
+        self,
+        claim: OpenSandboxWarmClaim,
+        sandbox_id: str,
+    ) -> None:
+        await _call_state(
+            self._state,
+            "publish_warm",
+            self._state.publish_warm(claim, sandbox_id),
+        )
+
+    async def renew_warm(self, claim: OpenSandboxWarmClaim) -> bool:
+        return cast(
+            bool,
+            await _call_state(
+                self._state,
+                "renew_warm",
+                self._state.renew_warm(claim),
+            ),
+        )
+
+    async def release_warm(self, claim: OpenSandboxWarmClaim) -> None:
+        await _call_state(
+            self._state,
+            "release_warm",
+            self._state.release_warm(claim),
+        )
+
+    async def consume_warm(
+        self,
+        claim: OpenSandboxOwnerClaim,
+    ) -> OpenSandboxBinding | None:
+        return cast(
+            OpenSandboxBinding | None,
+            await _call_state(
+                self._state,
+                "consume_warm",
+                self._state.consume_warm(claim),
+            ),
+        )
+
+    async def enqueue_cleanup(self, sandbox_id: str) -> None:
+        await _call_state(
+            self._state,
+            "enqueue_cleanup",
+            self._state.enqueue_cleanup(sandbox_id),
+        )
+
+    async def claim_cleanup(self) -> OpenSandboxCleanupClaim | None:
+        return cast(
+            OpenSandboxCleanupClaim | None,
+            await _call_state(
+                self._state,
+                "claim_cleanup",
+                self._state.claim_cleanup(),
+            ),
+        )
+
+    async def renew_cleanup(self, claim: OpenSandboxCleanupClaim) -> bool:
+        return cast(
+            bool,
+            await _call_state(
+                self._state,
+                "renew_cleanup",
+                self._state.renew_cleanup(claim),
+            ),
+        )
+
+    async def complete_cleanup(self, claim: OpenSandboxCleanupClaim) -> None:
+        await _call_state(
+            self._state,
+            "complete_cleanup",
+            self._state.complete_cleanup(claim),
+        )
+
+    async def release_cleanup(self, claim: OpenSandboxCleanupClaim) -> None:
+        await _call_state(
+            self._state,
+            "release_cleanup",
+            self._state.release_cleanup(claim),
+        )
+
+    async def shutdown_sandbox_ids(self) -> tuple[str, ...]:
+        return cast(
+            tuple[str, ...],
+            await _call_state(
+                self._state,
+                "shutdown_sandbox_ids",
+                self._state.shutdown_sandbox_ids(),
+            ),
+        )
+
+    async def aclose(self) -> None:
+        await _call_state(self._state, "close", self._state.aclose())
+
+
 @dataclass(slots=True)
 class _MemoryOwnerRecord:
     lock: asyncio.Lock
@@ -182,7 +408,7 @@ class InMemoryOpenSandboxState(OpenSandboxState):
         if warm_pool_size < 0:
             raise ValueError("warm_pool_size must not be negative")
         if self._closed:
-            raise RuntimeError("OpenSandbox state is closed")
+            raise OpenSandboxStateError("OpenSandbox state is closed")
         if self._started:
             if self._warm_pool_size != warm_pool_size:
                 raise OpenSandboxStateConfigurationError(
@@ -198,9 +424,9 @@ class InMemoryOpenSandboxState(OpenSandboxState):
 
     def _ensure_open(self) -> None:
         if not self._started:
-            raise RuntimeError("OpenSandbox state has not been started")
+            raise OpenSandboxStateError("OpenSandbox state has not been started")
         if self._closed:
-            raise RuntimeError("OpenSandbox state is closed")
+            raise OpenSandboxStateError("OpenSandbox state is closed")
 
     async def _record(self, owner_key: str) -> tuple[str, _MemoryOwnerRecord]:
         self._ensure_open()

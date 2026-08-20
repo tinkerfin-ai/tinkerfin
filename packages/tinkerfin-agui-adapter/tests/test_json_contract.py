@@ -14,7 +14,7 @@ from ag_ui.core import (
 )
 from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 
-from tinkerfin_agui_adapter import Identity
+from tinkerfin_agui_adapter import AgUiStreamContractError, Identity
 from tinkerfin_agui_adapter.adapter import DeepAgentAgUiAdapter
 from tinkerfin_agui_adapter.reasoning import normalize_operational_data
 from tinkerfin_agui_adapter.sse import encode_sse
@@ -263,8 +263,12 @@ def test_tool_text_blocks_require_a_string_before_result_state_changes(
         if mixed
         else [text_block]
     )
-    with pytest.raises(TypeError, match="text content blocks require a string"):
+    with pytest.raises(
+        AgUiStreamContractError,
+        match="text content blocks require a string",
+    ) as raised:
         adapter.process(part(invalid_content))
+    assert isinstance(raised.value.cause, TypeError)
 
     retry = adapter.process(part([{"type": "text", "text": "valid"}]))
     assert [event.type.value for event in retry] == [
@@ -304,8 +308,12 @@ def test_live_ai_text_blocks_fail_before_message_lifecycle_state_changes(
             ),
         }
 
-    with pytest.raises(TypeError, match="text content blocks require a string"):
+    with pytest.raises(
+        AgUiStreamContractError,
+        match="text content blocks require a string",
+    ) as raised:
         adapter.process(part(content))
+    assert isinstance(raised.value.cause, TypeError)
 
     retry = adapter.process(part([{"type": "text", "text": "valid"}]))
     assert [event.type.value for event in retry] == [
@@ -320,7 +328,10 @@ def test_live_ai_text_blocks_fail_before_message_lifecycle_state_changes(
 def test_snapshot_text_blocks_fail_before_root_state_is_committed() -> None:
     adapter = _adapter()
 
-    with pytest.raises(TypeError, match="text content blocks require a string"):
+    with pytest.raises(
+        AgUiStreamContractError,
+        match="text content blocks require a string",
+    ) as raised:
         adapter.process(
             {
                 "type": "values",
@@ -337,6 +348,7 @@ def test_snapshot_text_blocks_fail_before_root_state_is_committed() -> None:
                 "interrupts": ({"id": "pause", "value": {"pause": True}},),
             }
         )
+    assert isinstance(raised.value.cause, TypeError)
 
     retry = adapter.process(
         {

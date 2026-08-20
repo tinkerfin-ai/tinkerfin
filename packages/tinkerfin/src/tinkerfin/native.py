@@ -15,6 +15,8 @@ from langchain_core.messages import BaseMessage, message_to_dict
 from langgraph.types import Interrupt
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
+from .errors import TinkerFinStreamProtocolError
+
 NativeMode = Literal[
     "messages",
     "tasks",
@@ -76,7 +78,9 @@ def _normalize(value: object, *, active: set[int] | None = None) -> JsonValue:
         return value
     if isinstance(value, float):
         if not math.isfinite(value):
-            raise ValueError("native stream parts must contain finite numbers")
+            raise TinkerFinStreamProtocolError(
+                "native stream parts must contain finite numbers"
+            )
         return value
     if isinstance(value, bytes | bytearray):
         return {
@@ -107,7 +111,9 @@ def _normalize(value: object, *, active: set[int] | None = None) -> JsonValue:
     containers = set() if active is None else active
     identity = id(value)
     if identity in containers:
-        raise ValueError("native stream parts must not contain cycles")
+        raise TinkerFinStreamProtocolError(
+            "native stream parts must not contain cycles"
+        )
     containers.add(identity)
     try:
         if isinstance(value, BaseMessage):
@@ -170,10 +176,12 @@ def normalize_native_stream_part(item: object) -> NativeStreamPart:
         raise TypeError("native stream part must be a mapping")
     unknown = set(item) - {"type", "ns", "data", "interrupts"}
     if unknown:
-        raise ValueError(f"native stream part contains unknown fields: {unknown!r}")
+        raise TinkerFinStreamProtocolError(
+            f"native stream part contains unknown fields: {unknown!r}"
+        )
     mode = item.get("type")
     if mode not in _NATIVE_MODES:
-        raise ValueError(
+        raise TinkerFinStreamProtocolError(
             "native stream part type must be messages, tasks, values, updates, "
             "checkpoints, debug, or custom"
         )
@@ -183,7 +191,7 @@ def normalize_native_stream_part(item: object) -> NativeStreamPart:
     ):
         raise TypeError("native stream part ns must be a tuple of strings")
     if "data" not in item:
-        raise ValueError("native stream part must contain data")
+        raise TinkerFinStreamProtocolError("native stream part must contain data")
     raw_interrupts = item.get("interrupts", ())
     if not isinstance(raw_interrupts, tuple):
         raise TypeError("native stream part interrupts must be a tuple")

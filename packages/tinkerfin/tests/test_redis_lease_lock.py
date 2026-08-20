@@ -18,7 +18,12 @@ import pytest
 from redis.asyncio import Redis
 from redis.exceptions import ConnectionError as RedisConnectionError
 
-from tinkerfin.redis import RedisLease, RedisLeaseLock, RedisLeaseLost
+from tinkerfin.redis import (
+    RedisLease,
+    RedisLeaseLock,
+    RedisLeaseLost,
+    RedisLeaseUnavailableError,
+)
 
 _REDIS_URL_ENV = "TINKERFIN_TEST_REDIS_URL"
 
@@ -286,7 +291,7 @@ async def test_swallowed_loss_cancellation_still_fails_the_lease_scope() -> None
         renew_interval_seconds=0.01,
     )
 
-    with pytest.raises(RedisLeaseLost):
+    with pytest.raises(RedisLeaseLost) as captured:
         async with lock:
             async with lock.hold("resource"):
                 try:
@@ -295,6 +300,14 @@ async def test_swallowed_loss_cancellation_still_fails_the_lease_scope() -> None
                     pass
 
     assert client.owners == {}
+    assert dict(captured.value.context) == {}
+    assert dict(captured.value.diagnostic_context) == {
+        "implementation": "redis",
+        "operation": "ownership",
+        "resource_key": "resource",
+        "fencing_token": 1,
+    }
+    assert "resource" not in str(captured.value)
 
 
 @pytest.mark.asyncio
@@ -389,7 +402,7 @@ async def test_business_error_remains_primary_when_release_fails() -> None:
 
     assert captured.value is business_error
     assert any(
-        "Redis lease release failed" in note for note in captured.value.__notes__
+        RedisLeaseUnavailableError.__name__ in note for note in captured.value.__notes__
     )
 
 

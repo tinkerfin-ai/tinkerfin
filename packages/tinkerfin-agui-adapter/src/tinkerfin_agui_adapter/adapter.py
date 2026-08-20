@@ -55,10 +55,14 @@ from pydantic.alias_generators import to_camel
 from pydantic_core import PydanticCustomError
 
 from .contracts import AgentRunOutcome, Identity
-from .hitl import (
-    HitlActionRequest,
+from .errors import (
+    AgUiAdapterError,
+    AgUiStreamContractError,
     HitlCorrelationError,
     HitlNoMatchError,
+)
+from .hitl import (
+    HitlActionRequest,
     HitlRequest,
     HitlToolCallCandidate,
     match_hitl_action_groups,
@@ -79,7 +83,6 @@ from .reasoning import (
 from .subagent import SubagentTaskInput
 
 _MESSAGE_STATE_KEY = "messages"
-InterruptCorrelationError = HitlCorrelationError
 StreamMode = Literal[
     "values",
     "updates",
@@ -767,17 +770,41 @@ class DeepAgentAgUiAdapter:
         raised before this part changes lifecycle state.
         """
 
-        validated = DeepAgentStreamPartEnvelope.model_validate(part).root
-        if isinstance(validated, MessageStreamPart):
-            self._validate_message_part(validated)
-            events = self._process_message_part(validated)
-        elif isinstance(validated, TasksStreamPart):
-            events = self._process_tasks_part(validated)
-        elif isinstance(validated, ValuesStreamPart):
-            events = self._process_values_part(validated)
-        else:
-            events = self._process_extra_part(validated)
-        return self._visible_events(events)
+        try:
+            validated = DeepAgentStreamPartEnvelope.model_validate(part).root
+            if isinstance(validated, MessageStreamPart):
+                self._validate_message_part(validated)
+                events = self._process_message_part(validated)
+            elif isinstance(validated, TasksStreamPart):
+                events = self._process_tasks_part(validated)
+            elif isinstance(validated, ValuesStreamPart):
+                events = self._process_values_part(validated)
+            else:
+                events = self._process_extra_part(validated)
+            return self._visible_events(events)
+        except AgUiAdapterError:
+            raise
+        except (TypeError, ValueError, ValidationError) as error:
+            context: dict[str, str] = {}
+            if isinstance(part, Mapping):
+                mode = part.get("type")
+                if isinstance(mode, str):
+                    context["mode"] = mode
+            if isinstance(error, ValidationError):
+                details = error.errors(include_input=False)
+                message = (
+                    str(details[0]["msg"])
+                    if details
+                    else "Deep Agents StreamPart validation failed"
+                )
+            else:
+                message = str(error)
+            translated = AgUiStreamContractError(
+                message,
+                context=context,
+                cause=error,
+            )
+            raise translated from error
 
     def _visible_events(self, events: list[BaseEvent]) -> list[BaseEvent]:
         """Suppress every event whose serialized provenance is a subgraph."""
@@ -865,7 +892,7 @@ class DeepAgentAgUiAdapter:
 
         unresolved = set(self._child_interrupts) - self._resolved_child_interrupt_ids
         if unresolved:
-            raise InterruptCorrelationError(
+            raise HitlCorrelationError(
                 "child interrupts were not propagated by root values: "
                 f"{', '.join(sorted(unresolved))}"
             )
@@ -1430,16 +1457,14 @@ class DeepAgentAgUiAdapter:
         new_interrupts: list[AgentRuntimeInterrupt] = []
         for native in part.interrupts:
             if native.id in native_by_id:
-                raise InterruptCorrelationError(
-                    f"duplicate child interrupt ID: {native.id}"
-                )
+                raise HitlCorrelationError(f"duplicate child interrupt ID: {native.id}")
             native_by_id[native.id] = native
             existing = self._child_interrupts.get(native.id)
             if existing is None:
                 new_interrupts.append(native)
                 continue
             if existing.value_json != self._interrupt_value_json(native):
-                raise InterruptCorrelationError(
+                raise HitlCorrelationError(
                     f"conflicting child interrupt propagation for ID: {native.id}"
                 )
             if part.ns not in existing.namespaces and any(
@@ -1449,7 +1474,7 @@ class DeepAgentAgUiAdapter:
                 )
                 for namespace in existing.namespaces
             ):
-                raise InterruptCorrelationError(
+                raise HitlCorrelationError(
                     "the same interrupt ID appeared in unrelated child namespaces: "
                     f"{native.id}"
                 )
@@ -1497,12 +1522,12 @@ class DeepAgentAgUiAdapter:
         native_ids = tuple(native_by_id)
         previous_ids = self._child_interrupt_ids_by_namespace.get(part.ns)
         if previous_ids is not None and previous_ids != native_ids:
-            raise InterruptCorrelationError(
+            raise HitlCorrelationError(
                 f"conflicting child interrupt set for namespace: {part.ns!r}"
             )
         previous_messages = self._child_message_snapshots.get(part.ns)
         if previous_ids is not None and previous_messages != converted_messages:
-            raise InterruptCorrelationError(
+            raise HitlCorrelationError(
                 f"conflicting child message snapshot for namespace: {part.ns!r}"
             )
 
@@ -1525,23 +1550,21 @@ class DeepAgentAgUiAdapter:
         native_by_id: dict[str, AgentRuntimeInterrupt] = {}
         for native in native_interrupts:
             if native.id in native_by_id:
-                raise InterruptCorrelationError(
-                    f"duplicate root interrupt ID: {native.id}"
-                )
+                raise HitlCorrelationError(f"duplicate root interrupt ID: {native.id}")
             native_by_id[native.id] = native
             buffered = self._child_interrupts.get(native.id)
             if (
                 buffered is not None
                 and buffered.value_json != self._interrupt_value_json(native)
             ):
-                raise InterruptCorrelationError(
+                raise HitlCorrelationError(
                     f"conflicting root propagation for child interrupt ID: {native.id}"
                 )
 
         unresolved = set(self._child_interrupts) - self._resolved_child_interrupt_ids
         missing = unresolved - set(native_by_id)
         if missing:
-            raise InterruptCorrelationError(
+            raise HitlCorrelationError(
                 "root values did not propagate child interrupts: "
                 f"{', '.join(sorted(missing))}"
             )
@@ -2299,7 +2322,7 @@ class DeepAgentAgUiAdapter:
                 if isinstance(value, dict) and (
                     "action_requests" in value or "review_configs" in value
                 ):
-                    raise InterruptCorrelationError(
+                    raise HitlCorrelationError(
                         f"invalid Deep Agents HITL interrupt: {interrupt.id}"
                     ) from error
                 request = None
@@ -2339,7 +2362,7 @@ class DeepAgentAgUiAdapter:
             if not isinstance(public_actions, list) or len(public_actions) != len(
                 request.action_requests
             ):
-                raise InterruptCorrelationError(
+                raise HitlCorrelationError(
                     f"invalid Deep Agents HITL interrupt: {interrupt.id}"
                 )
             for public_action, action in zip(
@@ -2348,7 +2371,7 @@ class DeepAgentAgUiAdapter:
                 strict=True,
             ):
                 if not isinstance(public_action, dict):
-                    raise InterruptCorrelationError(
+                    raise HitlCorrelationError(
                         f"invalid Deep Agents HITL interrupt: {interrupt.id}"
                     )
                 public_action["args"] = normalize_operational_data(action.args.root)

@@ -1,4 +1,4 @@
-"""Deep Agents 建图定义与请求级 Runtime"""
+"""Deep Agents graph definitions and request-scoped runtimes."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from tinkerfin_agui_adapter import Identity
 
 from .agui_native import _bind_agui_graph_astream, _bind_graph_identity
 from .agui_resume import AgUiResumeBinding
+from .errors import TinkerFinLifecycleError
 
 if TYPE_CHECKING:
     from .runtime import (
@@ -36,7 +37,9 @@ class _StreamClaim:
 
     def ensure_available(self) -> None:
         if self._claimed:
-            raise RuntimeError("a TinkerFin run can create only one object stream")
+            raise TinkerFinLifecycleError(
+                "a TinkerFin run can create only one object stream"
+            )
 
     def claim(self) -> None:
         self.ensure_available()

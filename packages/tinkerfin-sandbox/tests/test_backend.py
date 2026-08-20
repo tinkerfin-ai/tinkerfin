@@ -30,9 +30,11 @@ from pydantic import ValidationError
 
 from tinkerfin_sandbox import (
     OpenSandboxBackend,
+    OpenSandboxBackendUnavailableError,
     OpenSandboxClient,
     OpenSandboxConfig,
     OpenSandboxRuntimeInfo,
+    UnexpectedOpenSandboxBackendError,
 )
 
 
@@ -667,12 +669,14 @@ async def test_rooted_descriptor_upload_response_loss_is_not_replayed() -> None:
     sandbox.files = ResponseLossFiles()
     backend = OpenSandboxBackend(sandbox=cast(Sandbox, sandbox))
 
-    with pytest.raises(ConnectionError, match="response lost"):
+    with pytest.raises(OpenSandboxBackendUnavailableError) as captured:
         await backend._aupload_rooted_file(
             root="/workspace",
             path="/target.bin",
             content=b"committed once",
         )
+    assert isinstance(captured.value.cause, ConnectionError)
+    assert str(captured.value.cause) == "upload response lost"
 
     assert sandbox.files.contents["/proc/4321/fd/9"] == b"committed once"
     assert sandbox.files.write_calls == [("/proc/4321/fd/9", b"committed once", 644)]
@@ -1406,15 +1410,15 @@ class OpenSandboxClientTests(unittest.IsolatedAsyncioTestCase):
             config=self.config,
         )
 
-        with (
-            patch(
-                "tinkerfin_sandbox.lifecycle.client.Sandbox.connect",
-                return_value=sandbox,
-            ),
-            self.assertRaisesRegex(RuntimeError, "kill failed"),
+        with patch(
+            "tinkerfin_sandbox.lifecycle.client.Sandbox.connect",
+            return_value=sandbox,
         ):
-            await client.destroy("existing")
+            with self.assertRaises(UnexpectedOpenSandboxBackendError) as captured:
+                await client.destroy("existing")
 
+        self.assertIsInstance(captured.exception.cause, RuntimeError)
+        self.assertEqual(str(captured.exception.cause), "kill failed")
         self.assertTrue(sandbox.closed)
         self.assertEqual(sandbox.kill.call_args_list, [call()])
 
@@ -1433,10 +1437,12 @@ class OpenSandboxClientTests(unittest.IsolatedAsyncioTestCase):
                 return_value=sandbox,
             ),
             self.assertLogs("tinkerfin_sandbox.lifecycle.client", level="WARNING"),
-            self.assertRaisesRegex(RuntimeError, "kill failed"),
         ):
-            await client.destroy("existing")
+            with self.assertRaises(UnexpectedOpenSandboxBackendError) as captured:
+                await client.destroy("existing")
 
+        self.assertIsInstance(captured.exception.cause, RuntimeError)
+        self.assertEqual(str(captured.exception.cause), "kill failed")
         self.assertTrue(sandbox.closed)
 
     async def test_destroy_treats_missing_remote_sandbox_as_already_deleted(
@@ -1609,9 +1615,11 @@ async def test_workspace_initialization_failure_reclaims_new_sandbox(
         config=OpenSandboxConfig(warm_pool_size=0),
     )
 
-    with pytest.raises(RuntimeError, match="mkdir failed"):
+    with pytest.raises(UnexpectedOpenSandboxBackendError) as captured:
         await client.create()
 
+    assert isinstance(captured.value.cause, RuntimeError)
+    assert str(captured.value.cause) == "mkdir failed"
     assert sandbox.killed
     assert sandbox.closed
 
@@ -1631,9 +1639,11 @@ async def test_workspace_initialization_failure_only_closes_reconnected_sandbox(
         config=OpenSandboxConfig(warm_pool_size=0),
     )
 
-    with pytest.raises(RuntimeError, match="mkdir failed"):
+    with pytest.raises(UnexpectedOpenSandboxBackendError) as captured:
         await client.connect("existing")
 
+    assert isinstance(captured.value.cause, RuntimeError)
+    assert str(captured.value.cause) == "mkdir failed"
     assert sandbox.closed
     assert not sandbox.killed
 
@@ -1751,9 +1761,11 @@ async def test_create_preserves_original_error_when_discovery_is_empty(
         config=OpenSandboxConfig(warm_pool_size=0),
     )
 
-    with pytest.raises(RuntimeError, match="response lost"):
+    with pytest.raises(UnexpectedOpenSandboxBackendError) as captured:
         await client.create()
 
+    assert isinstance(captured.value.cause, RuntimeError)
+    assert str(captured.value.cause) == "response lost"
     assert sdk_manager.filters == [
         SandboxFilter(
             metadata={"tinkerfin.ai/create-token": token},
@@ -1785,9 +1797,11 @@ async def test_create_preserves_original_error_when_discovery_close_fails(
         config=OpenSandboxConfig(warm_pool_size=0),
     )
 
-    with pytest.raises(RuntimeError, match="response lost"):
+    with pytest.raises(UnexpectedOpenSandboxBackendError) as captured:
         await client.create()
 
+    assert isinstance(captured.value.cause, RuntimeError)
+    assert str(captured.value.cause) == "response lost"
     assert sdk_manager.closed
 
 
@@ -1835,9 +1849,11 @@ async def test_create_rejects_and_cleans_multiple_discovered_candidates(
         config=OpenSandboxConfig(warm_pool_size=0),
     )
 
-    with pytest.raises(RuntimeError, match="response lost"):
+    with pytest.raises(UnexpectedOpenSandboxBackendError) as captured:
         await client.create()
 
+    assert isinstance(captured.value.cause, RuntimeError)
+    assert str(captured.value.cause) == "response lost"
     assert sdk_manager.filters == [
         SandboxFilter(
             metadata={"tinkerfin.ai/create-token": token},

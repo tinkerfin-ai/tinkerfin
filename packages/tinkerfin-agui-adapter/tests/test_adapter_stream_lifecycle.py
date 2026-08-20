@@ -9,7 +9,12 @@ from ag_ui.core import BaseEvent, RunStartedEvent
 from langchain_core.messages import AIMessageChunk, ChatMessage, ToolMessage
 from pydantic import ValidationError
 
-from tinkerfin_agui_adapter import DeepAgentAgUiAdapter, Identity, astream_events
+from tinkerfin_agui_adapter import (
+    AgUiStreamContractError,
+    DeepAgentAgUiAdapter,
+    Identity,
+    astream_events,
+)
 from tinkerfin_agui_adapter.ids import ScopedIdCodec
 
 
@@ -700,7 +705,10 @@ async def test_conversion_and_secondary_close_failures_are_logged(
         "Closing the upstream after AG-UI conversion failure also failed"
     ]
     assert conversion_record.exc_info is not None
-    assert conversion_record.exc_info[0] is ValidationError
+    assert conversion_record.exc_info[0] is AgUiStreamContractError
+    conversion_error = conversion_record.exc_info[1]
+    assert isinstance(conversion_error, AgUiStreamContractError)
+    assert isinstance(conversion_error.cause, ValidationError)
     assert close_record.exc_info is not None
     assert close_record.exc_info[0] is RuntimeError
 

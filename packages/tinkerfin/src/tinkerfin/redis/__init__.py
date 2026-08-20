@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+from ..errors import RedisLeaseError as RedisLeaseError
+from ..errors import RedisLeaseLifecycleError as RedisLeaseLifecycleError
+from ..errors import RedisLeaseProtocolError as RedisLeaseProtocolError
+from ..errors import RedisLeaseTimeoutError as RedisLeaseTimeoutError
+from ..errors import RedisLeaseUnavailableError as RedisLeaseUnavailableError
+
 try:
     from ._backend import RedisRunCoordinator as RedisRunCoordinator
     from ._lease_lock import RedisLease as RedisLease
@@ -16,7 +22,12 @@ except ModuleNotFoundError as error:
 
 __all__ = [
     "RedisLease",
+    "RedisLeaseError",
+    "RedisLeaseLifecycleError",
     "RedisLeaseLock",
     "RedisLeaseLost",
+    "RedisLeaseProtocolError",
+    "RedisLeaseTimeoutError",
+    "RedisLeaseUnavailableError",
     "RedisRunCoordinator",
 ]

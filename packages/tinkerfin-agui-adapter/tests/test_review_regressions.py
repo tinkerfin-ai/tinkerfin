@@ -16,7 +16,12 @@ from langchain_core.messages import AIMessage, AIMessageChunk
 from pydantic import ValidationError
 from pydantic_core import PydanticSerializationError
 
-from tinkerfin_agui_adapter import DeepAgentAgUiAdapter, Identity, astream_events
+from tinkerfin_agui_adapter import (
+    AgUiStreamContractError,
+    DeepAgentAgUiAdapter,
+    Identity,
+    astream_events,
+)
 from tinkerfin_agui_adapter.microbatch import ContentBatcher, micro_batch
 
 
@@ -172,7 +177,7 @@ async def test_successful_structured_ai_content_uses_one_business_text_projectio
 def test_opaque_content_block_fails_closed_at_snapshot_boundary() -> None:
     adapter = DeepAgentAgUiAdapter(identity=_identity())
 
-    with pytest.raises(PydanticSerializationError):
+    with pytest.raises(AgUiStreamContractError) as raised:
         adapter.process(
             {
                 "type": "values",
@@ -189,6 +194,7 @@ def test_opaque_content_block_fails_closed_at_snapshot_boundary() -> None:
                 "interrupts": ({"id": "pause", "value": {"pause": True}},),
             }
         )
+    assert isinstance(raised.value.cause, PydanticSerializationError)
 
 
 @pytest.mark.parametrize(
@@ -226,8 +232,9 @@ def test_malformed_v2_container_shapes_are_rejected_without_state_mutation(
     adapter = DeepAgentAgUiAdapter(identity=_identity())
     adapter.process(_message_part(AIMessageChunk(id="message-open", content="visible")))
 
-    with pytest.raises(ValidationError):
+    with pytest.raises(AgUiStreamContractError) as raised:
         adapter.process(malformed_part)
+    assert isinstance(raised.value.cause, ValidationError)
 
     assert [event.type.value for event in adapter.finish()] == ["TEXT_MESSAGE_END"]
 
@@ -281,8 +288,9 @@ def test_native_v2_objects_and_tuple_fields_reject_coerced_shapes_before_mutatio
         _message_part(AIMessageChunk(id="message-open-strict", content="visible"))
     )
 
-    with pytest.raises(ValidationError):
+    with pytest.raises(AgUiStreamContractError) as raised:
         adapter.process(malformed_part)
+    assert isinstance(raised.value.cause, ValidationError)
 
     assert [event.type.value for event in adapter.finish()] == ["TEXT_MESSAGE_END"]
 

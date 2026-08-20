@@ -8,13 +8,12 @@ from ag_ui.core.types import ResumeEntry
 from langchain_core.messages import AIMessage
 from pydantic import JsonValue
 
-from tinkerfin_agui_adapter import ResumeTranslation
+from tinkerfin_agui_adapter import AgUiAdapterErrorCode, ResumeTranslation
 from tinkerfin_agui_adapter.ids import ScopedIdCodec
 from tinkerfin_agui_adapter.models import AgentRuntimeInterrupt
 from tinkerfin_agui_adapter.resume import (
     ResumeMapper,
     ResumeMappingError,
-    ResumeMappingFailure,
 )
 
 
@@ -169,7 +168,7 @@ def test_resume_mapper_rejects_tampered_persisted_agui_correlation() -> None:
             interrupts=interrupts,
         )
 
-    assert raised.value.failure is ResumeMappingFailure.INTERRUPT_UNSUPPORTED
+    assert raised.value.code is AgUiAdapterErrorCode.RESUME_INTERRUPT_UNSUPPORTED
 
 
 def test_resume_mapper_restores_multiple_persisted_agui_groups() -> None:
@@ -245,7 +244,7 @@ def test_resume_mapper_rejects_incomplete_persisted_agui_group() -> None:
             interrupts=_public_interrupts()[:1],
         )
 
-    assert raised.value.failure is ResumeMappingFailure.INCOMPLETE
+    assert raised.value.code is AgUiAdapterErrorCode.RESUME_INCOMPLETE
 
 
 def test_resume_mapper_restores_multi_action_order_and_replaces_edited_args() -> None:
@@ -303,7 +302,7 @@ def test_resume_mapper_rejects_edit_that_changes_the_reviewed_tool() -> None:
             interrupts=_interrupts(),
         )
 
-    assert raised.value.failure is ResumeMappingFailure.PAYLOAD_INVALID
+    assert raised.value.code is AgUiAdapterErrorCode.RESUME_PAYLOAD_INVALID
 
 
 @pytest.mark.parametrize("number", [float("nan"), float("inf"), float("-inf")])
@@ -326,7 +325,7 @@ def test_resume_mapper_rejects_non_finite_edited_arguments(number: float) -> Non
             interrupts=_interrupts(),
         )
 
-    assert raised.value.failure is ResumeMappingFailure.PAYLOAD_INVALID
+    assert raised.value.code is AgUiAdapterErrorCode.RESUME_PAYLOAD_INVALID
 
 
 def test_same_name_actions_use_their_positionally_paired_review_policy() -> None:
@@ -394,34 +393,34 @@ def test_resume_mapper_rejects_unequal_hitl_action_and_config_lengths() -> None:
     with pytest.raises(ResumeMappingError) as raised:
         ResumeMapper().map(entries=(), interrupts=(interrupt,))
 
-    assert raised.value.failure is ResumeMappingFailure.INTERRUPT_UNSUPPORTED
+    assert raised.value.code is AgUiAdapterErrorCode.RESUME_INTERRUPT_UNSUPPORTED
 
 
 @pytest.mark.parametrize(
     ("entries", "failure"),
     [
-        ((), ResumeMappingFailure.INCOMPLETE),
+        ((), AgUiAdapterErrorCode.RESUME_INCOMPLETE),
         (
             (_entry("unknown", payload={"type": "approve"}),),
-            ResumeMappingFailure.UNKNOWN_INTERRUPT_ID,
+            AgUiAdapterErrorCode.RESUME_UNKNOWN_INTERRUPT_ID,
         ),
         (
             (
                 _entry("interrupt-main#0", payload={"type": "approve"}),
                 _entry("interrupt-main#0", payload={"type": "approve"}),
             ),
-            ResumeMappingFailure.DUPLICATE_RESUME_INTERRUPT_ID,
+            AgUiAdapterErrorCode.RESUME_DUPLICATE_INTERRUPT_ID,
         ),
     ],
 )
 def test_resume_mapper_raises_stable_typed_failures(
     entries: tuple[ResumeEntry, ...],
-    failure: ResumeMappingFailure,
+    failure: AgUiAdapterErrorCode,
 ) -> None:
     with pytest.raises(ResumeMappingError) as raised:
         ResumeMapper().map(entries=entries, interrupts=_interrupts())
 
-    assert raised.value.failure is failure
+    assert raised.value.code is failure
 
 
 def test_resume_mapper_rejects_missing_payload() -> None:
@@ -434,7 +433,7 @@ def test_resume_mapper_rejects_missing_payload() -> None:
             interrupts=_interrupts(),
         )
 
-    assert raised.value.failure is ResumeMappingFailure.PAYLOAD_REQUIRED
+    assert raised.value.code is AgUiAdapterErrorCode.RESUME_PAYLOAD_REQUIRED
 
 
 def test_cancelled_resume_abandons_without_building_deep_agents_decisions() -> None:
@@ -502,7 +501,7 @@ def test_resume_mapper_rejects_decision_payloads_outside_public_schema(
             interrupts=_interrupts(),
         )
 
-    assert raised.value.failure is ResumeMappingFailure.PAYLOAD_INVALID
+    assert raised.value.code is AgUiAdapterErrorCode.RESUME_PAYLOAD_INVALID
 
 
 def test_resume_translation_carries_verified_prior_tool_call_ids() -> None:
@@ -571,7 +570,7 @@ def test_resume_mapper_rejects_reused_tool_call_ids_within_one_group() -> None:
             messages_by_namespace={(): (message,)},
         )
 
-    assert raised.value.failure is ResumeMappingFailure.INTERRUPT_UNSUPPORTED
+    assert raised.value.code is AgUiAdapterErrorCode.RESUME_INTERRUPT_UNSUPPORTED
 
 
 def test_resolved_resume_requires_checkpoint_messages_for_tool_correlation() -> None:
@@ -585,7 +584,7 @@ def test_resolved_resume_requires_checkpoint_messages_for_tool_correlation() -> 
             messages_by_namespace=None,
         )
 
-    assert raised.value.failure is ResumeMappingFailure.CHECKPOINT_MESSAGES_REQUIRED
+    assert raised.value.code is AgUiAdapterErrorCode.RESUME_CHECKPOINT_MESSAGES_REQUIRED
 
 
 @pytest.mark.parametrize("action_value", [True, 1, 1.0])
@@ -800,7 +799,7 @@ def test_resume_mapper_rejects_an_ambiguous_cross_scope_tool_match() -> None:
             },
         )
 
-    assert raised.value.failure is ResumeMappingFailure.INTERRUPT_UNSUPPORTED
+    assert raised.value.code is AgUiAdapterErrorCode.RESUME_INTERRUPT_UNSUPPORTED
 
 
 def test_resume_mapper_rejects_a_decision_forbidden_by_its_position() -> None:
@@ -823,4 +822,4 @@ def test_resume_mapper_rejects_a_decision_forbidden_by_its_position() -> None:
             interrupts=(interrupt,),
         )
 
-    assert raised.value.failure is ResumeMappingFailure.DECISION_NOT_ALLOWED
+    assert raised.value.code is AgUiAdapterErrorCode.RESUME_DECISION_NOT_ALLOWED

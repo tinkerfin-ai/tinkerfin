@@ -31,10 +31,12 @@ from langchain_core.messages import AIMessageChunk
 import tinkerfin_agui_adapter
 
 expected_exports = {
+    "AgUiAdapterError", "AgUiAdapterErrorCode", "AgUiConversionError",
+    "AgUiLifecycleError", "AgUiSerializationError", "AgUiStreamContractError",
     "AgUiLifecycleEventFactory", "AgentRunOutcome", "AgentRuntimeInterrupt",
     "DeepAgentAgUiAdapter", "HitlActionRequest", "HitlCorrelationError",
-    "HitlRequest", "HitlReviewConfig", "Identity", "InterruptCorrelationError",
-    "ResumeMapper", "ResumeMappingError", "ResumeMappingFailure",
+    "HitlNoMatchError", "HitlRequest", "HitlReviewConfig", "Identity",
+    "ResumeMapper", "ResumeMappingError",
     "ResumeTranslation", "ScopedIdCodec", "SseEventId", "astream_events", "encode_sse",
     "micro_batch",
 }

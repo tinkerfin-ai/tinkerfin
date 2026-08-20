@@ -26,12 +26,15 @@ from .errors import (
     BackendOwnershipLost,
     CodecMismatch,
     InvalidCursor,
+    MessagingBackendError,
     MessagingClosed,
+    MessagingError,
     MessagingNotStarted,
     MessagingSettlementTimeout,
     RunProducerFailed,
     SourceProfileMismatch,
     SseRenderingUnsupported,
+    UnexpectedMessagingBackendError,
 )
 from .models import (
     DecodedMessage,
@@ -52,6 +55,7 @@ ReplayT = TypeVar("ReplayT")
 ProducedT = TypeVar("ProducedT")
 ProfileSourceT = TypeVar("ProfileSourceT")
 ProfileReplayT = TypeVar("ProfileReplayT")
+BackendResultT = TypeVar("BackendResultT")
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +72,63 @@ _ProducerFailureStage: TypeAlias = Literal[
 ]
 
 
+def _unexpected_backend_error(
+    operation: str,
+    error: Exception,
+) -> UnexpectedMessagingBackendError:
+    return UnexpectedMessagingBackendError(
+        f"Messaging backend {operation} failed",
+        diagnostic_context={"operation": operation},
+        cause=error,
+    )
+
+
+async def _await_backend(
+    operation: str,
+    awaitable: Awaitable[BackendResultT],
+) -> BackendResultT:
+    try:
+        return await awaitable
+    except MessagingError as error:
+        if isinstance(error, MessagingBackendError):
+            error._enrich_diagnostic_context({"operation": operation})
+        raise
+    except Exception as error:
+        translated = _unexpected_backend_error(operation, error)
+        raise translated from error
+
+
+def _read_backend(
+    operation: str,
+    reader: Callable[[], BackendResultT],
+) -> BackendResultT:
+    try:
+        return reader()
+    except MessagingError as error:
+        if isinstance(error, MessagingBackendError):
+            error._enrich_diagnostic_context({"operation": operation})
+        raise
+    except Exception as error:
+        translated = _unexpected_backend_error(operation, error)
+        raise translated from error
+
+
+async def _iterate_backend(
+    operation: str,
+    iterator: AsyncIterator[BackendResultT],
+) -> AsyncGenerator[BackendResultT, None]:
+    try:
+        async for item in iterator:
+            yield item
+    except MessagingError as error:
+        if isinstance(error, MessagingBackendError):
+            error._enrich_diagnostic_context({"operation": operation})
+        raise
+    except Exception as error:
+        translated = _unexpected_backend_error(operation, error)
+        raise translated from error
+
+
 def _derived_message_id(identity: Identity, ordinal: int) -> str:
     """Keep ordinary message IDs bounded without changing the common readable form."""
 
@@ -76,6 +137,11 @@ def _derived_message_id(identity: Identity, ordinal: int) -> str:
         return candidate
     digest = hashlib.sha256(candidate.encode()).hexdigest()
     return f"sha256:{digest}"
+
+
+def _validate_optional_cursor(after: int | None) -> None:
+    if after is not None and (isinstance(after, bool) or not isinstance(after, int)):
+        raise TypeError("after must be an integer or None")
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,13 +318,17 @@ class MessageSubscription(Generic[ReplayT]):
         return delivery
 
     async def _iterate(self) -> AsyncGenerator[DecodedMessage[ReplayT], None]:
-        backend_iterator = self._backend.follow(
-            self._prepared.handle,
-            after=self._prepared.after,
+        backend_iterator = _read_backend(
+            "follow",
+            lambda: self._backend.follow(
+                self._prepared.handle,
+                after=self._prepared.after,
+            ),
         )
         self._backend_iterator = cast(AsyncIterator[object], backend_iterator)
+        primary: BaseException | None = None
         try:
-            async for envelope in backend_iterator:
+            async for envelope in _iterate_backend("follow", backend_iterator):
                 expected_codec = self._codec.codec_id
                 if envelope.codec != expected_codec:
                     raise CodecMismatch(
@@ -269,9 +339,23 @@ class MessageSubscription(Generic[ReplayT]):
                     envelope=envelope,
                     data=self._codec.decode(envelope.payload),
                 )
+        except BaseException as error:
+            primary = error
+            raise
         finally:
-            await _close_async_iterator(cast(AsyncIterator[object], backend_iterator))
-            self._backend_iterator = None
+            try:
+                await _await_backend(
+                    "follow close",
+                    _close_async_iterator(
+                        cast(AsyncIterator[object], backend_iterator)
+                    ),
+                )
+            except BaseException as close_error:
+                if primary is None:
+                    raise
+                primary.add_note(f"Messaging follow cleanup also failed: {close_error}")
+            finally:
+                self._backend_iterator = None
 
     def sse(self) -> AsyncIterator[bytes]:
         """Render committed messages while preserving their durable sequences."""
@@ -302,7 +386,10 @@ class MessageSubscription(Generic[ReplayT]):
             return
         backend_iterator = self._backend_iterator
         if backend_iterator is not None:
-            await _close_async_iterator(backend_iterator)
+            await _await_backend(
+                "follow close",
+                _close_async_iterator(backend_iterator),
+            )
             self._backend_iterator = None
 
 
@@ -490,9 +577,12 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         try:
             required_identity(identity)
             self._messaging._require_open()
-            latest = await self._messaging.backend.latest_seq(
-                channel=self.name,
-                identity=identity,
+            latest = await _await_backend(
+                "latest_seq",
+                self._messaging.backend.latest_seq(
+                    channel=self.name,
+                    identity=identity,
+                ),
             )
             self._messaging._require_open()
             return latest
@@ -515,11 +605,14 @@ class MessageChannel(Generic[SourceT, ReplayT]):
             codec = self._require_read_codec()
             expected_codec = required_identifier("codec_id", codec.codec_id)
             self._messaging._require_open()
-            envelopes = await self._messaging.backend.read(
-                channel=self.name,
-                identity=identity,
-                after=after,
-                limit=limit,
+            envelopes = await _await_backend(
+                "read",
+                self._messaging.backend.read(
+                    channel=self.name,
+                    identity=identity,
+                    after=after,
+                    limit=limit,
+                ),
             )
             decoded: list[DecodedMessage[ReplayT]] = []
             for envelope in envelopes:
@@ -553,9 +646,12 @@ class MessageChannel(Generic[SourceT, ReplayT]):
             required_identity(identity)
             codec = self._require_read_codec()
             self._messaging._require_open()
-            handle = await self._messaging.backend.bind_follow(
-                channel=self.name,
-                identity=identity,
+            handle = await _await_backend(
+                "bind_follow",
+                self._messaging.backend.bind_follow(
+                    channel=self.name,
+                    identity=identity,
+                ),
             )
             self._messaging._require_open()
             return MessageSubscription(
@@ -597,9 +693,12 @@ class MessageChannel(Generic[SourceT, ReplayT]):
                 return
             if isinstance(after, bool) or not isinstance(after, int):
                 raise TypeError("after must be an integer or None")
-            latest = await self._messaging.backend.latest_seq(
-                channel=self.name,
-                identity=identity,
+            latest = await _await_backend(
+                "latest_seq",
+                self._messaging.backend.latest_seq(
+                    channel=self.name,
+                    identity=identity,
+                ),
             )
             self._messaging._require_open()
             if after < 0 or after > latest:
@@ -698,6 +797,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         producer_started = False
         source_released = False
         try:
+            _validate_optional_cursor(after)
             codec, renderer, profile = self._resolve_binding(source)
             producer_codec = cast(MessageCodec[object, object], codec)
             replay_renderer = cast(SseRenderer[object] | None, renderer)
@@ -721,13 +821,16 @@ class MessageChannel(Generic[SourceT, ReplayT]):
                 cancel = cast(CancelCallback[object], source_cancel)
             if cancel is not None:
                 normalized_cancel = _normalize_cancel_callback(cancel)
-            prepared = await self._messaging.backend.prepare(
-                channel=self.name,
-                identity=resolved_identity,
-                codec=codec_id,
-                after=after,
-                cancellable=normalized_cancel is not None,
-                recoverable=False,
+            prepared = await _await_backend(
+                "prepare",
+                self._messaging.backend.prepare(
+                    channel=self.name,
+                    identity=resolved_identity,
+                    codec=codec_id,
+                    after=after,
+                    cancellable=normalized_cancel is not None,
+                    recoverable=False,
+                ),
             )
             self._messaging._require_open()
             self._commit_inferred_binding(
@@ -757,10 +860,13 @@ class MessageChannel(Generic[SourceT, ReplayT]):
                 finally:
                     if prepared is not None and prepared.is_owner:
                         try:
-                            await self._messaging.backend.finish(
-                                prepared.handle,
-                                status="failed",
-                                error=error,
+                            await _await_backend(
+                                "finish",
+                                self._messaging.backend.finish(
+                                    prepared.handle,
+                                    status="failed",
+                                    error=error,
+                                ),
                             )
                         except BackendOwnershipLost:
                             pass
@@ -889,18 +995,22 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         ) = None
         producer_started = False
         try:
+            _validate_optional_cursor(after)
             codec, renderer, profile = self._resolve_binding(source)
             codec_id = required_identifier("codec_id", codec.codec_id)
             resolved_identity = self._resolve_identity(source, identity)
             if cancel is not None:
                 normalized_cancel = _normalize_cancel_callback(cancel)
-            prepared = await self._messaging.backend.prepare(
-                channel=self.name,
-                identity=resolved_identity,
-                codec=codec_id,
-                after=after,
-                cancellable=normalized_cancel is not None,
-                recoverable=True,
+            prepared = await _await_backend(
+                "prepare",
+                self._messaging.backend.prepare(
+                    channel=self.name,
+                    identity=resolved_identity,
+                    codec=codec_id,
+                    after=after,
+                    cancellable=normalized_cancel is not None,
+                    recoverable=True,
+                ),
             )
             self._messaging._require_open()
             self._commit_inferred_binding(
@@ -931,10 +1041,13 @@ class MessageChannel(Generic[SourceT, ReplayT]):
                         await opened.aclose()
                 finally:
                     try:
-                        await self._messaging.backend.finish(
-                            prepared.handle,
-                            status="failed",
-                            error=error,
+                        await _await_backend(
+                            "finish",
+                            self._messaging.backend.finish(
+                                prepared.handle,
+                                status="failed",
+                                error=error,
+                            ),
                         )
                     except BackendOwnershipLost:
                         pass
@@ -974,10 +1087,19 @@ class MessageChannel(Generic[SourceT, ReplayT]):
             owner_token=None,
             fence=None,
         )
-        initiated = await self._messaging.backend.request_cancel(handle)
-        status = await self._messaging.backend.wait_finished(handle)
+        initiated = await _await_backend(
+            "request_cancel",
+            self._messaging.backend.request_cancel(handle),
+        )
+        status = await _await_backend(
+            "wait_finished",
+            self._messaging.backend.wait_finished(handle),
+        )
         if status in {"failed", "owner_lost"}:
-            cause = await self._messaging.backend.failure(handle)
+            cause = await _await_backend(
+                "failure",
+                self._messaging.backend.failure(handle),
+            )
             raise RunProducerFailed(
                 identity=identity,
                 cause=cause
@@ -1003,9 +1125,12 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         preflight = self._messaging._begin_preflight()
         try:
             required_identity(identity)
-            await self._messaging.backend.delete_stream(
-                channel=self.name,
-                identity=identity,
+            await _await_backend(
+                "delete_stream",
+                self._messaging.backend.delete_stream(
+                    channel=self.name,
+                    identity=identity,
+                ),
             )
             self._messaging._require_open()
         finally:
@@ -1260,7 +1385,10 @@ class Messaging:
     ) -> MessageSource[RecoverableMessage[SourceT]]:
         """Keep distributed ownership alive while a source rebuilds its state."""
 
-        interval = self.backend.lease_renew_interval
+        interval = _read_backend(
+            "lease_renew_interval",
+            lambda: self.backend.lease_renew_interval,
+        )
         if interval is None:
             return await source.open(prepared.checkpoint)
 
@@ -1272,7 +1400,10 @@ class Messaging:
         async def renew_until_opened() -> None:
             while True:
                 await asyncio.sleep(interval)
-                renewed = await self.backend.renew(prepared.handle)
+                renewed = await _await_backend(
+                    "renew",
+                    self.backend.renew(prepared.handle),
+                )
                 if not renewed:
                     raise BackendOwnershipLost(
                         "Producer for run "
@@ -1463,12 +1594,15 @@ class Messaging:
                         payload = codec.encode(produced.data)
                         if not isinstance(payload, bytes):
                             raise TypeError("MessageCodec.encode() must return bytes")
-                        envelope = await self.backend.append(
-                            prepared.handle,
-                            message_id=produced.message_id,
-                            codec=self._codec_id(codec),
-                            payload=payload,
-                            checkpoint=produced.checkpoint,
+                        envelope = await _await_backend(
+                            "append",
+                            self.backend.append(
+                                prepared.handle,
+                                message_id=produced.message_id,
+                                codec=self._codec_id(codec),
+                                payload=payload,
+                                checkpoint=produced.checkpoint,
+                            ),
                         )
                         next_ordinal += 1
                         if on_committed is not None:
@@ -1554,7 +1688,10 @@ class Messaging:
                 if existing is not None:
                     return existing
                 settlement_task = asyncio.create_task(
-                    self.backend.begin_settlement(prepared.handle),
+                    _await_backend(
+                        "begin_settlement",
+                        self.backend.begin_settlement(prepared.handle),
+                    ),
                     name=(
                         "tinkerfin-messaging-settlement:"
                         f"{prepared.handle.identity.run_id}"
@@ -1596,7 +1733,10 @@ class Messaging:
                 return cancel_callback_task, True
 
             async def watch_cancel() -> Iterable[ProducedT] | None:
-                requested = await self.backend.wait_for_cancel(prepared.handle)
+                requested = await _await_backend(
+                    "wait_for_cancel",
+                    self.backend.wait_for_cancel(prepared.handle),
+                )
                 if not requested:
                     return None
                 cancel_accepted = await asyncio.shield(claim_settlement())
@@ -1617,7 +1757,10 @@ class Messaging:
                 while True:
                     await asyncio.sleep(interval)
                     try:
-                        renewed = await self.backend.renew(prepared.handle)
+                        renewed = await _await_backend(
+                            "renew",
+                            self.backend.renew(prepared.handle),
+                        )
                     except asyncio.CancelledError:
                         raise
                     except BaseException as renew_error:  # noqa: BLE001 - fence safety
@@ -1634,7 +1777,10 @@ class Messaging:
                         source_consumer.cancel()
                         return
 
-            renew_interval = self.backend.lease_renew_interval
+            renew_interval = _read_backend(
+                "lease_renew_interval",
+                lambda: self.backend.lease_renew_interval,
+            )
             if renew_interval is not None:
                 lease_renewer = asyncio.create_task(
                     renew_lease(renew_interval),
@@ -1793,10 +1939,13 @@ class Messaging:
                 except BaseException as close_error:  # noqa: BLE001 - cleanup is part of outcome
                     record_failure(stage="source_close", failure=close_error)
                 try:
-                    await self.backend.finish(
-                        prepared.handle,
-                        status=status,
-                        error=error,
+                    await _await_backend(
+                        "finish",
+                        self.backend.finish(
+                            prepared.handle,
+                            status=status,
+                            error=error,
+                        ),
                     )
                 except BaseException as finish_error:
                     if error is None:

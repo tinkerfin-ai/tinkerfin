@@ -36,6 +36,13 @@ from opensandbox.exceptions import SandboxApiException
 from opensandbox.models import OutputMessage, WriteEntry
 from opensandbox.models.execd import RunCommandOpts
 
+from ..errors import (
+    OpenSandboxBackendError,
+    OpenSandboxBackendProtocolError,
+    OpenSandboxBackendTimeoutError,
+    OpenSandboxBackendUnavailableError,
+    UnexpectedOpenSandboxBackendError,
+)
 from ..models import OpenSandboxRuntimeInfo, OpenSandboxUnavailableReason
 from ._rooted_protocol import (
     _build_rooted_command,
@@ -144,6 +151,68 @@ def unavailable_reason(exc: Exception) -> OpenSandboxUnavailableReason:
     return "unreachable"
 
 
+async def _backend_call(
+    operation: str,
+    awaitable: Awaitable[_TransferT],
+) -> _TransferT:
+    try:
+        return await awaitable
+    except OpenSandboxBackendError:
+        raise
+    except TimeoutError as error:
+        translated = OpenSandboxBackendTimeoutError(
+            f"OpenSandbox {operation} timed out",
+            diagnostic_context={
+                "implementation": "opensandbox_sdk",
+                "operation": operation,
+            },
+            cause=error,
+        )
+        raise translated from error
+    except SandboxApiException as error:
+        translated = OpenSandboxBackendUnavailableError(
+            f"OpenSandbox is unavailable for {operation}",
+            diagnostic_context={
+                "implementation": "opensandbox_sdk",
+                "operation": operation,
+            },
+            cause=error,
+        )
+        raise translated from error
+    except (FileNotFoundError, IsADirectoryError, PermissionError):
+        raise
+    except (TypeError, ValueError) as error:
+        translated = OpenSandboxBackendProtocolError(
+            f"OpenSandbox {operation} returned an invalid response",
+            diagnostic_context={
+                "implementation": "opensandbox_sdk",
+                "operation": operation,
+            },
+            cause=error,
+        )
+        raise translated from error
+    except OSError as error:
+        translated = OpenSandboxBackendUnavailableError(
+            f"OpenSandbox is unavailable for {operation}",
+            diagnostic_context={
+                "implementation": "opensandbox_sdk",
+                "operation": operation,
+            },
+            cause=error,
+        )
+        raise translated from error
+    except Exception as error:
+        translated = UnexpectedOpenSandboxBackendError(
+            f"OpenSandbox {operation} failed",
+            diagnostic_context={
+                "implementation": "opensandbox_sdk",
+                "operation": operation,
+            },
+            cause=error,
+        )
+        raise translated from error
+
+
 class OpenSandboxBackend(BaseSandbox):
     """Adapt one connected asynchronous OpenSandbox instance to ``BaseSandbox``.
 
@@ -209,7 +278,7 @@ class OpenSandboxBackend(BaseSandbox):
     @staticmethod
     def _reject_sync() -> NoReturn:
         """Reject implicit bridging of async remote operations to sync I/O."""
-        raise RuntimeError(_ASYNC_ONLY_MESSAGE)
+        raise OpenSandboxBackendError(_ASYNC_ONLY_MESSAGE)
 
     def _command_options(self, timeout: int | None) -> RunCommandOpts:
         """Build SDK options for one command invocation."""
@@ -250,9 +319,12 @@ class OpenSandboxBackend(BaseSandbox):
         timeout: int | None = None,
     ) -> ExecuteResponse:
         """Execute a Shell command through the native asynchronous command service."""
-        result = await self._sandbox.commands.run(
-            command,
-            opts=self._command_options(timeout),
+        result = await _backend_call(
+            "command execution",
+            self._sandbox.commands.run(
+                command,
+                opts=self._command_options(timeout),
+            ),
         )
         stdout = _join_output_messages(result.logs.stdout)
         stderr = _join_output_messages(result.logs.stderr).strip()
@@ -392,13 +464,16 @@ class OpenSandboxBackend(BaseSandbox):
         result: _TransferT | None = None
         primary: BaseException | None = None
         try:
-            execution = await self._sandbox.commands.run(
-                request.command,
-                opts=RunCommandOpts(
-                    background=True,
-                    working_directory="/",
-                    timeout=timedelta(seconds=_ROOTED_TRANSFER_HOLD_SECONDS + 5),
-                    envs=dict(_ROOTED_INTERNAL_COMMAND_ENV),
+            execution = await _backend_call(
+                "rooted transfer command",
+                self._sandbox.commands.run(
+                    request.command,
+                    opts=RunCommandOpts(
+                        background=True,
+                        working_directory="/",
+                        timeout=timedelta(seconds=_ROOTED_TRANSFER_HOLD_SECONDS + 5),
+                        envs=dict(_ROOTED_INTERNAL_COMMAND_ENV),
+                    ),
                 ),
             )
             if not isinstance(execution.id, str) or not execution.id.strip():
@@ -464,10 +539,13 @@ class OpenSandboxBackend(BaseSandbox):
         """Upload once through a helper-owned descriptor under ``root``."""
 
         async def transfer(descriptor_path: str) -> FileUploadResponse:
-            await self._sandbox.files.write_file(
-                descriptor_path,
-                content,
-                mode=644,
+            await _backend_call(
+                "rooted file upload",
+                self._sandbox.files.write_file(
+                    descriptor_path,
+                    content,
+                    mode=644,
+                ),
             )
             return FileUploadResponse(path=path, error=None)
 
@@ -496,7 +574,10 @@ class OpenSandboxBackend(BaseSandbox):
         """Download once through a helper-owned descriptor under ``root``."""
 
         async def transfer(descriptor_path: str) -> FileDownloadResponse:
-            content = await self._sandbox.files.read_bytes(descriptor_path)
+            content = await _backend_call(
+                "rooted file download",
+                self._sandbox.files.read_bytes(descriptor_path),
+            )
             return FileDownloadResponse(path=path, content=content, error=None)
 
         try:
@@ -660,7 +741,7 @@ class OpenSandboxBackend(BaseSandbox):
 
     async def arenew(self, timeout: timedelta) -> None:
         """Asynchronously extend remote expiry from the current time."""
-        await self._sandbox.renew(timeout)
+        await _backend_call("renew", self._sandbox.renew(timeout))
 
     def close(self) -> None:
         """Reject synchronous connection closure; use :meth:`aclose`."""
@@ -668,7 +749,7 @@ class OpenSandboxBackend(BaseSandbox):
 
     async def aclose(self) -> None:
         """Close the local SDK connection without changing remote lifecycle."""
-        await self._sandbox.close()
+        await _backend_call("close", self._sandbox.close())
 
     def kill(self) -> None:
         """Reject synchronous remote destruction; use :meth:`akill`."""
@@ -676,7 +757,7 @@ class OpenSandboxBackend(BaseSandbox):
 
     async def akill(self) -> None:
         """Destroy the remote Sandbox without implicitly closing the SDK connection."""
-        await self._sandbox.kill()
+        await _backend_call("destroy", self._sandbox.kill())
 
     def get_runtime_info(self) -> OpenSandboxRuntimeInfo:
         """Reject synchronous runtime queries; use :meth:`aget_runtime_info`."""

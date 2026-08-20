@@ -24,6 +24,7 @@ from tinkerfin_messaging import (
     CodecMismatch,
     MessageSubscription,
     Messaging,
+    MessagingBackendProtocolError,
     PreparedRun,
     RecoverableMessage,
     RecoveryCheckpoint,
@@ -1346,8 +1347,14 @@ async def test_real_redis_rejects_malformed_run_snapshot_scalars(
     assert len(run_keys) == 1
     await cast(Awaitable[int], client.hset(run_keys[0], field, value))
 
-    with pytest.raises(RuntimeError, match=message):
+    with pytest.raises(
+        MessagingBackendProtocolError,
+        match="invalid protocol response",
+    ) as captured:
         await backend.failure(prepared.handle)
+    assert message in str(captured.value.diagnostic_context["detail"])
+    assert captured.value.diagnostic_context["implementation"] == "redis"
+    assert captured.value.diagnostic_context["operation"] == "protocol_validation"
 
     await backend.finish(prepared.handle, status="completed")
 
@@ -1379,8 +1386,16 @@ async def test_real_redis_rejects_a_malformed_snapshot_message_entry(
     follower = backend.follow(prepared.handle, after=0)
 
     try:
-        with pytest.raises(RuntimeError, match="incomplete message fields"):
+        with pytest.raises(
+            MessagingBackendProtocolError,
+            match="invalid protocol response",
+        ) as captured:
             await anext(follower)
+        assert "incomplete message fields" in str(
+            captured.value.diagnostic_context["detail"]
+        )
+        assert captured.value.diagnostic_context["implementation"] == "redis"
+        assert captured.value.diagnostic_context["operation"] == "protocol_validation"
     finally:
         await follower.aclose()
     await backend.finish(prepared.handle, status="completed")

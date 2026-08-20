@@ -30,7 +30,7 @@ from deepagents.backends.protocol import (
 )
 from deepagents.backends.sandbox import BaseSandbox
 
-from ..errors import OpenSandboxHandleOwnershipError
+from ..errors import OpenSandboxHandleClosedError, OpenSandboxHandleOwnershipError
 from ..models import OpenSandboxRuntimeInfo
 from ._rooted_protocol import _build_rooted_command, _parse_rooted_response
 from .sdk import OpenSandboxBackend
@@ -106,7 +106,7 @@ class OpenSandboxHandle(BaseSandbox):
         """Atomically pin the current backend and increment its lease count."""
         with self._condition:
             if self._closed:
-                raise RuntimeError("OpenSandbox handle is closed")
+                raise OpenSandboxHandleClosedError("OpenSandbox handle is closed")
             backend = self._backend
             backend_key = id(backend)
             self._active_calls[backend_key] = self._active_calls.get(backend_key, 0) + 1
@@ -147,7 +147,7 @@ class OpenSandboxHandle(BaseSandbox):
         """Publish a replacement and return the old backend to manager cleanup."""
         with self._condition:
             if self._closed:
-                raise RuntimeError("OpenSandbox handle is closed")
+                raise OpenSandboxHandleClosedError("OpenSandbox handle is closed")
             old_backend = self._backend
             self._backend = backend
             return old_backend

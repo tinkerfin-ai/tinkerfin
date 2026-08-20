@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from enum import StrEnum
 from typing import Literal, Never, cast
 
 from ag_ui.core.types import Interrupt as AgUiInterrupt
@@ -12,9 +11,13 @@ from ag_ui.core.types import ResumeEntry
 from langchain_core.messages import AIMessage, BaseMessage
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 
+from .errors import (
+    AgUiAdapterError,
+    AgUiAdapterErrorCode,
+    HitlCorrelationError,
+)
 from .hitl import (
     HitlActionRequest,
-    HitlCorrelationError,
     HitlRequest,
     match_hitl_tool_call_id_groups,
 )
@@ -26,28 +29,20 @@ from .models import (
 from .reasoning import json_values_equal, normalize_operational_data
 
 
-class ResumeMappingFailure(StrEnum):
-    """Stable categories for failures at the resume-mapping boundary."""
-
-    INTERRUPT_UNSUPPORTED = "interrupt_unsupported"
-    DUPLICATE_PENDING_INTERRUPT_ID = "duplicate_pending_interrupt_id"
-    DECISION_NOT_ALLOWED = "decision_not_allowed"
-    PAYLOAD_REQUIRED = "payload_required"
-    PAYLOAD_INVALID = "payload_invalid"
-    NO_PENDING_INTERRUPT = "no_pending_interrupt"
-    DUPLICATE_RESUME_INTERRUPT_ID = "duplicate_resume_interrupt_id"
-    UNKNOWN_INTERRUPT_ID = "unknown_interrupt_id"
-    INCOMPLETE = "incomplete"
-    CHECKPOINT_MESSAGES_REQUIRED = "checkpoint_messages_required"
-
-
-class ResumeMappingError(ValueError):
+class ResumeMappingError(AgUiAdapterError, ValueError):
     """Resume data cannot be translated without losing native semantics."""
 
-    def __init__(self, failure: ResumeMappingFailure, message: str) -> None:
-        super().__init__(message)
-        self.failure = failure
-        self.message = message
+    def __init__(
+        self,
+        code: AgUiAdapterErrorCode,
+        message: str,
+        *,
+        cause: BaseException | None = None,
+    ) -> None:
+        if not code.name.startswith("RESUME_"):
+            raise ValueError("code must identify an AG-UI resume failure")
+        self.code = code
+        super().__init__(message, cause=cause)
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,7 +258,7 @@ class ResumeMapper:
     ) -> ResumeTranslation:
         if not pending:
             raise ResumeMappingError(
-                ResumeMappingFailure.NO_PENDING_INTERRUPT,
+                AgUiAdapterErrorCode.RESUME_NO_PENDING_INTERRUPT,
                 "the thread has no pending review to resume",
             )
 
@@ -283,12 +278,12 @@ class ResumeMapper:
             interrupt_id = entry.interrupt_id
             if interrupt_id in received_ids:
                 raise ResumeMappingError(
-                    ResumeMappingFailure.DUPLICATE_RESUME_INTERRUPT_ID,
+                    AgUiAdapterErrorCode.RESUME_DUPLICATE_INTERRUPT_ID,
                     f"resume contains duplicate interruptId: {interrupt_id}",
                 )
             if interrupt_id not in pending:
                 raise ResumeMappingError(
-                    ResumeMappingFailure.UNKNOWN_INTERRUPT_ID,
+                    AgUiAdapterErrorCode.RESUME_UNKNOWN_INTERRUPT_ID,
                     f"resume contains unknown interruptId: {interrupt_id}",
                 )
             received_ids.add(interrupt_id)
@@ -296,7 +291,7 @@ class ResumeMapper:
             if entry.status == "cancelled":
                 if entry.payload is not None:
                     raise ResumeMappingError(
-                        ResumeMappingFailure.PAYLOAD_INVALID,
+                        AgUiAdapterErrorCode.RESUME_PAYLOAD_INVALID,
                         f"cancelled interruptId={entry.interrupt_id} cannot include payload",
                     )
                 cancelled_interrupt_ids.append(entry.interrupt_id)
@@ -308,7 +303,7 @@ class ResumeMapper:
         missing_ids = sorted(expected_ids - received_ids)
         if missing_ids:
             raise ResumeMappingError(
-                ResumeMappingFailure.INCOMPLETE,
+                AgUiAdapterErrorCode.RESUME_INCOMPLETE,
                 "resume must cover every pending review; missing: "
                 f"{', '.join(missing_ids)}",
             )
@@ -347,7 +342,7 @@ class ResumeMapper:
         for interrupt_id, decisions in grouped_decisions.items():
             if any(decision is None for decision in decisions):
                 raise ResumeMappingError(
-                    ResumeMappingFailure.INCOMPLETE,
+                    AgUiAdapterErrorCode.RESUME_INCOMPLETE,
                     f"interruptId={interrupt_id} has incomplete review decisions",
                 )
             serialized_groups[interrupt_id] = {
@@ -431,8 +426,9 @@ class ResumeMapper:
                     )
             except (TypeError, ValueError, ValidationError) as error:
                 raise ResumeMappingError(
-                    ResumeMappingFailure.INTERRUPT_UNSUPPORTED,
+                    AgUiAdapterErrorCode.RESUME_INTERRUPT_UNSUPPORTED,
                     f"persisted AG-UI interrupt is not resumable: {interrupt.id}",
+                    cause=error,
                 ) from error
 
             existing = groups.get(native_id)
@@ -446,17 +442,17 @@ class ResumeMapper:
                     request.model_dump(mode="json", by_alias=True),
                 ):
                     raise ResumeMappingError(
-                        ResumeMappingFailure.INTERRUPT_UNSUPPORTED,
+                        AgUiAdapterErrorCode.RESUME_INTERRUPT_UNSUPPORTED,
                         f"persisted AG-UI interrupt group is inconsistent: {native_id}",
                     )
             if slots[action_index] is not None:
                 raise ResumeMappingError(
-                    ResumeMappingFailure.DUPLICATE_PENDING_INTERRUPT_ID,
+                    AgUiAdapterErrorCode.RESUME_DUPLICATE_PENDING_INTERRUPT_ID,
                     f"duplicate pending interruptId: {interrupt.id}",
                 )
             if interrupt.id in pending:
                 raise ResumeMappingError(
-                    ResumeMappingFailure.DUPLICATE_PENDING_INTERRUPT_ID,
+                    AgUiAdapterErrorCode.RESUME_DUPLICATE_PENDING_INTERRUPT_ID,
                     f"duplicate pending interruptId: {interrupt.id}",
                 )
             slots[action_index] = tool_call_id
@@ -474,7 +470,7 @@ class ResumeMapper:
         for native_id, (request, slots) in groups.items():
             if any(tool_id is None for tool_id in slots):
                 raise ResumeMappingError(
-                    ResumeMappingFailure.INCOMPLETE,
+                    AgUiAdapterErrorCode.RESUME_INCOMPLETE,
                     f"persisted AG-UI interrupt group is incomplete: {native_id}",
                 )
             multi_action = len(request.action_requests) > 1
@@ -538,7 +534,7 @@ class ResumeMapper:
 
         if messages_by_namespace is None:
             raise ResumeMappingError(
-                ResumeMappingFailure.CHECKPOINT_MESSAGES_REQUIRED,
+                AgUiAdapterErrorCode.RESUME_CHECKPOINT_MESSAGES_REQUIRED,
                 "resolved Tool reviews require checkpoint messages grouped by "
                 "their full graph namespace",
             )
@@ -572,8 +568,9 @@ class ResumeMapper:
                     )
         except (TypeError, ValueError) as error:
             raise ResumeMappingError(
-                ResumeMappingFailure.INTERRUPT_UNSUPPORTED,
+                AgUiAdapterErrorCode.RESUME_INTERRUPT_UNSUPPORTED,
                 "checkpoint messages do not have valid graph namespaces or Tool IDs",
+                cause=error,
             ) from error
         try:
             matched_groups = match_hitl_tool_call_id_groups(
@@ -583,8 +580,9 @@ class ResumeMapper:
             )
         except HitlCorrelationError as error:
             raise ResumeMappingError(
-                ResumeMappingFailure.INTERRUPT_UNSUPPORTED,
+                AgUiAdapterErrorCode.RESUME_INTERRUPT_UNSUPPORTED,
                 "checkpoint review actions cannot be correlated to unique Tool calls",
+                cause=error,
             ) from error
         return tuple(call_id for group in matched_groups for call_id in group)
 
@@ -602,8 +600,9 @@ class ResumeMapper:
                 request = HitlRequest.model_validate(interrupt.value)
             except ValidationError as exc:
                 raise ResumeMappingError(
-                    ResumeMappingFailure.INTERRUPT_UNSUPPORTED,
+                    AgUiAdapterErrorCode.RESUME_INTERRUPT_UNSUPPORTED,
                     "the thread contains an unsupported interrupt type",
+                    cause=exc,
                 ) from exc
 
             action_groups.append(tuple(request.action_requests))
@@ -620,7 +619,7 @@ class ResumeMapper:
                 )
                 if ag_ui_interrupt_id in pending:
                     raise ResumeMappingError(
-                        ResumeMappingFailure.DUPLICATE_PENDING_INTERRUPT_ID,
+                        AgUiAdapterErrorCode.RESUME_DUPLICATE_PENDING_INTERRUPT_ID,
                         f"duplicate pending interruptId: {ag_ui_interrupt_id}",
                     )
                 pending[ag_ui_interrupt_id] = _PendingInterruptAction(
@@ -639,7 +638,7 @@ class ResumeMapper:
     ) -> dict[str, object]:
         if entry.payload is None:
             raise ResumeMappingError(
-                ResumeMappingFailure.PAYLOAD_REQUIRED,
+                AgUiAdapterErrorCode.RESUME_PAYLOAD_REQUIRED,
                 f"interruptId={entry.interrupt_id} requires a payload",
             )
         if not isinstance(entry.payload, Mapping):
@@ -684,8 +683,9 @@ class ResumeMapper:
                 normalized_args = JsonObject.model_validate(normalized).root
             except (TypeError, ValueError) as error:
                 raise ResumeMappingError(
-                    ResumeMappingFailure.PAYLOAD_INVALID,
+                    AgUiAdapterErrorCode.RESUME_PAYLOAD_INVALID,
                     f"interruptId={entry.interrupt_id} has an invalid payload",
+                    cause=error,
                 ) from error
             return {
                 "type": "edit",
@@ -712,7 +712,7 @@ class ResumeMapper:
     @staticmethod
     def _raise_invalid_payload(interrupt_id: str) -> Never:
         raise ResumeMappingError(
-            ResumeMappingFailure.PAYLOAD_INVALID,
+            AgUiAdapterErrorCode.RESUME_PAYLOAD_INVALID,
             f"interruptId={interrupt_id} has an invalid payload",
         )
 
@@ -725,6 +725,6 @@ class ResumeMapper:
         if decision in pending.allowed_decisions:
             return
         raise ResumeMappingError(
-            ResumeMappingFailure.DECISION_NOT_ALLOWED,
+            AgUiAdapterErrorCode.RESUME_DECISION_NOT_ALLOWED,
             f"interruptId={interrupt_id} does not allow {decision}",
         )

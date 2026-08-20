@@ -10,6 +10,7 @@ from typing import Generic, TypeVar, cast
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ._tasks import join_task
+from .errors import TinkerFinLifecycleError
 
 ChunkT_co = TypeVar("ChunkT_co", covariant=True)
 SourceT = TypeVar("SourceT")
@@ -95,11 +96,11 @@ class SseBody(Generic[ChunkT_co]):
         """Run optional host preflight without opening or pulling the source."""
 
         if self._closed:
-            raise RuntimeError("a closed SSE body cannot be prepared")
+            raise TinkerFinLifecycleError("a closed SSE body cannot be prepared")
         if self._started:
-            raise RuntimeError("an active SSE body cannot be prepared")
+            raise TinkerFinLifecycleError("an active SSE body cannot be prepared")
         if self._prepared:
-            raise RuntimeError("an SSE body can only be prepared once")
+            raise TinkerFinLifecycleError("an SSE body can only be prepared once")
         if preflight is not None and not callable(preflight):
             raise TypeError("preflight must be an async callable or None")
         self._prepared = True
@@ -121,10 +122,10 @@ class SseBody(Generic[ChunkT_co]):
             raise StopAsyncIteration
         current = cast(asyncio.Task[object] | None, asyncio.current_task())
         if current is None:  # pragma: no cover - async methods run in a Task
-            raise RuntimeError("an SSE body requires an asyncio task")
+            raise TinkerFinLifecycleError("an SSE body requires an asyncio task")
         active = self._active_task
         if active is not None and not active.done():
-            raise RuntimeError("an SSE body operation is already active")
+            raise TinkerFinLifecycleError("an SSE body operation is already active")
         self._active_task = current
         self._started = True
         try:
@@ -150,7 +151,9 @@ class SseBody(Generic[ChunkT_co]):
         current = asyncio.current_task()
         active = self._active_task
         if active is current and active is not None:
-            raise RuntimeError("an SSE body cannot close its active operation")
+            raise TinkerFinLifecycleError(
+                "an SSE body cannot close its active operation"
+            )
         if active is not None and not active.done():
             active.cancel()
             await asyncio.gather(active, return_exceptions=True)

@@ -1,42 +1,226 @@
-"""Public exceptions for foundational OpenSandbox capabilities.
+"""Stable public failures for OpenSandbox capabilities."""
 
-These exceptions expose only stable semantics that callers can act on. Underlying SDK
-or storage errors remain available through ``__cause__`` for logging and diagnosis
-without entering the public exception hierarchy.
-"""
+from __future__ import annotations
+
+from collections.abc import Mapping
+from enum import StrEnum
+from types import MappingProxyType
+from typing import TypeAlias
+
+_ContextValue: TypeAlias = str | int | float | bool | None
 
 
-class OpenSandboxStateError(RuntimeError):
+class OpenSandboxErrorCode(StrEnum):
+    """Stable machine-readable categories for OpenSandbox failures."""
+
+    ERROR = "sandbox.error"
+    STATE_ERROR = "sandbox.state_error"
+    STATE_OWNERSHIP_LOST = "sandbox.state_ownership_lost"
+    STATE_CONFIGURATION = "sandbox.state_configuration"
+    STATE_UNAVAILABLE = "sandbox.state_unavailable"
+    STATE_TIMEOUT = "sandbox.state_timeout"
+    STATE_PROTOCOL_ERROR = "sandbox.state_protocol_error"
+    STATE_COMMIT_UNCERTAIN = "sandbox.state_commit_uncertain"
+    STATE_UNEXPECTED_FAILURE = "sandbox.state_unexpected_failure"
+    BACKEND_ERROR = "sandbox.backend_error"
+    BACKEND_UNAVAILABLE = "sandbox.backend_unavailable"
+    BACKEND_TIMEOUT = "sandbox.backend_timeout"
+    BACKEND_PROTOCOL_ERROR = "sandbox.backend_protocol_error"
+    BACKEND_UNEXPECTED_FAILURE = "sandbox.backend_unexpected_failure"
+    DESTROY_FAILED = "sandbox.destroy_failed"
+    RESET_FAILED = "sandbox.reset_failed"
+    HANDLE_OWNERSHIP = "sandbox.handle_ownership"
+    HANDLE_CLOSED = "sandbox.handle_closed"
+    MANAGER_CLOSED = "sandbox.manager_closed"
+    SETTLEMENT_TIMEOUT = "sandbox.settlement_timeout"
+
+
+class OpenSandboxError(Exception):
+    """Base failure for framework-owned OpenSandbox semantics.
+
+    ``message`` and ``context`` are safe to expose at a client boundary.
+    ``diagnostic_context`` and ``cause`` are reserved for trusted logs and
+    telemetry and must not be serialized into client responses.
+
+    Args:
+        message: Safe human-readable failure summary.
+        context: Client-safe machine-readable semantic values.
+        diagnostic_context: Implementation details for trusted observability.
+        cause: Original failure retained for debugging and exception chaining.
+    """
+
+    code: OpenSandboxErrorCode = OpenSandboxErrorCode.ERROR
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        context: Mapping[str, _ContextValue] | None = None,
+        diagnostic_context: Mapping[str, _ContextValue] | None = None,
+        cause: BaseException | None = None,
+    ) -> None:
+        self.message = message
+        self.context: Mapping[str, _ContextValue] = MappingProxyType(
+            dict(context or {})
+        )
+        self.diagnostic_context: Mapping[str, _ContextValue] = MappingProxyType(
+            dict(diagnostic_context or {})
+        )
+        self.cause = cause
+        if cause is not None:
+            self.__cause__ = cause
+        super().__init__(message)
+
+    def _enrich_diagnostic_context(
+        self,
+        context: Mapping[str, _ContextValue],
+    ) -> None:
+        self.diagnostic_context = MappingProxyType(
+            {**self.diagnostic_context, **context}
+        )
+
+
+class OpenSandboxStateError(OpenSandboxError, RuntimeError):
     """OpenSandbox allocation state could not complete an atomic operation."""
+
+    code = OpenSandboxErrorCode.STATE_ERROR
 
 
 class OpenSandboxStateOwnershipError(OpenSandboxStateError):
     """An expired or superseded State claim attempted to mutate ownership."""
 
+    code = OpenSandboxErrorCode.STATE_OWNERSHIP_LOST
+
 
 class OpenSandboxStateConfigurationError(OpenSandboxStateError):
     """Active workers disagree about one shared State configuration."""
 
+    code = OpenSandboxErrorCode.STATE_CONFIGURATION
 
-class OpenSandboxDestroyError(RuntimeError):
+
+class OpenSandboxStateUnavailableError(OpenSandboxStateError):
+    """The configured State implementation is unavailable."""
+
+    code = OpenSandboxErrorCode.STATE_UNAVAILABLE
+
+
+class OpenSandboxStateTimeoutError(OpenSandboxStateError):
+    """A State operation exceeded its bounded wait."""
+
+    code = OpenSandboxErrorCode.STATE_TIMEOUT
+
+
+class OpenSandboxStateProtocolError(OpenSandboxStateError):
+    """Persisted State violates the supported storage contract."""
+
+    code = OpenSandboxErrorCode.STATE_PROTOCOL_ERROR
+
+
+class OpenSandboxStateCommitUncertainError(OpenSandboxStateError):
+    """A State commit response was lost, so its outcome is unknown."""
+
+    code = OpenSandboxErrorCode.STATE_COMMIT_UNCERTAIN
+
+
+class UnexpectedOpenSandboxStateError(OpenSandboxStateError):
+    """A replaceable State implementation leaked an undeclared failure."""
+
+    code = OpenSandboxErrorCode.STATE_UNEXPECTED_FAILURE
+
+
+class OpenSandboxBackendError(OpenSandboxError, RuntimeError):
+    """A remote Sandbox backend operation failed."""
+
+    code = OpenSandboxErrorCode.BACKEND_ERROR
+
+
+class OpenSandboxBackendUnavailableError(OpenSandboxBackendError):
+    """The remote Sandbox provider is unavailable."""
+
+    code = OpenSandboxErrorCode.BACKEND_UNAVAILABLE
+
+
+class OpenSandboxBackendTimeoutError(OpenSandboxBackendError):
+    """A remote Sandbox operation exceeded its bounded wait."""
+
+    code = OpenSandboxErrorCode.BACKEND_TIMEOUT
+
+
+class OpenSandboxBackendProtocolError(OpenSandboxBackendError):
+    """A remote Sandbox response violates the supported protocol."""
+
+    code = OpenSandboxErrorCode.BACKEND_PROTOCOL_ERROR
+
+
+class UnexpectedOpenSandboxBackendError(OpenSandboxBackendError):
+    """A replaceable Sandbox backend leaked an undeclared failure."""
+
+    code = OpenSandboxErrorCode.BACKEND_UNEXPECTED_FAILURE
+
+
+class OpenSandboxDestroyError(OpenSandboxError, RuntimeError):
     """Explicit destruction was not confirmed, so the target remains retryable."""
 
+    code = OpenSandboxErrorCode.DESTROY_FAILED
 
-class OpenSandboxResetError(RuntimeError):
+
+class OpenSandboxResetError(OpenSandboxError, RuntimeError):
     """Workspace reset failed safely without changing remote identity or binding."""
 
+    code = OpenSandboxErrorCode.RESET_FAILED
 
-class OpenSandboxHandleOwnershipError(RuntimeError):
+
+class OpenSandboxHandleOwnershipError(OpenSandboxError, RuntimeError):
     """A caller tried to close a stable handle outside its lifecycle manager."""
 
+    code = OpenSandboxErrorCode.HANDLE_OWNERSHIP
 
-class OpenSandboxManagerClosedError(RuntimeError):
+
+class OpenSandboxHandleClosedError(OpenSandboxError, RuntimeError):
+    """A caller attempted to use a closed stable handle."""
+
+    code = OpenSandboxErrorCode.HANDLE_CLOSED
+
+
+class OpenSandboxManagerClosedError(OpenSandboxError, RuntimeError):
     """A lifecycle operation was requested after manager shutdown began."""
 
+    code = OpenSandboxErrorCode.MANAGER_CLOSED
 
-class OpenSandboxSettlementTimeoutError(TimeoutError):
+
+class OpenSandboxSettlementTimeoutError(OpenSandboxError, TimeoutError):
     """A caller stopped waiting before manager settlement completed."""
+
+    code = OpenSandboxErrorCode.SETTLEMENT_TIMEOUT
 
     def __init__(self, *, timeout: float) -> None:
         self.timeout = timeout
-        super().__init__(f"OpenSandbox settlement timed out after {timeout:g} seconds")
+        super().__init__(
+            f"OpenSandbox settlement timed out after {timeout:g} seconds",
+            context={"timeout": timeout},
+        )
+
+
+__all__ = [
+    "OpenSandboxBackendError",
+    "OpenSandboxBackendProtocolError",
+    "OpenSandboxBackendTimeoutError",
+    "OpenSandboxBackendUnavailableError",
+    "OpenSandboxDestroyError",
+    "OpenSandboxError",
+    "OpenSandboxErrorCode",
+    "OpenSandboxHandleClosedError",
+    "OpenSandboxHandleOwnershipError",
+    "OpenSandboxManagerClosedError",
+    "OpenSandboxResetError",
+    "OpenSandboxSettlementTimeoutError",
+    "OpenSandboxStateCommitUncertainError",
+    "OpenSandboxStateConfigurationError",
+    "OpenSandboxStateError",
+    "OpenSandboxStateOwnershipError",
+    "OpenSandboxStateProtocolError",
+    "OpenSandboxStateTimeoutError",
+    "OpenSandboxStateUnavailableError",
+    "UnexpectedOpenSandboxBackendError",
+    "UnexpectedOpenSandboxStateError",
+]

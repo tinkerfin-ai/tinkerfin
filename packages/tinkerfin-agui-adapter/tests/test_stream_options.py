@@ -5,7 +5,11 @@ from ag_ui.core import RawEvent
 from langchain_core.messages import AIMessageChunk
 from pydantic_core import PydanticSerializationError
 
-from tinkerfin_agui_adapter import DeepAgentAgUiAdapter, Identity
+from tinkerfin_agui_adapter import (
+    AgUiStreamContractError,
+    DeepAgentAgUiAdapter,
+    Identity,
+)
 
 
 def _identity() -> Identity:
@@ -302,7 +306,7 @@ def test_root_custom_mode_emits_a_sanitized_raw_event() -> None:
 def test_extra_mode_rejects_opaque_values_before_event_construction() -> None:
     adapter = DeepAgentAgUiAdapter(identity=_identity())
 
-    with pytest.raises(PydanticSerializationError):
+    with pytest.raises(AgUiStreamContractError) as raised:
         adapter.process(
             {
                 "type": "custom",
@@ -310,6 +314,7 @@ def test_extra_mode_rejects_opaque_values_before_event_construction() -> None:
                 "data": {"opaque": object()},
             }
         )
+    assert isinstance(raised.value.cause, PydanticSerializationError)
 
 
 def test_disabled_subagent_events_are_consumed_without_public_output() -> None:

@@ -5,13 +5,16 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import math
-from collections.abc import AsyncGenerator, Mapping, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Literal, Never, Protocol, TypeAlias, cast
+from typing import Literal, Never, Protocol, TypeAlias, TypeVar, cast
 from uuid import uuid4
 
 from redis.asyncio import Redis
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import RedisError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from tinkerfin_agui_adapter import Identity
 
@@ -30,11 +33,15 @@ from .errors import (
     CodecMismatch,
     InvalidCursor,
     MessageIdConflict,
+    MessagingBackendProtocolError,
+    MessagingBackendTimeout,
+    MessagingBackendUnavailable,
     RunAlreadyActive,
     RunNotFound,
     RunProducerFailed,
     StreamDeleteConflict,
     StreamDeleted,
+    UnexpectedMessagingBackendError,
 )
 from .models import MessageEnvelope, RecoveryCheckpoint
 
@@ -45,6 +52,63 @@ _SOCKET_TIMEOUT_SAFETY_RATIO = 0.9
 _RedisScriptValue: TypeAlias = bytes | list["_RedisScriptValue"]
 _RedisStreamEntry: TypeAlias = tuple[bytes, dict[bytes, bytes]]
 _RedisStreamRead: TypeAlias = list[tuple[bytes, list[_RedisStreamEntry]]]
+_RedisResultT = TypeVar("_RedisResultT")
+
+
+async def _redis_call(
+    operation: str,
+    awaitable: Awaitable[_RedisResultT],
+) -> _RedisResultT:
+    try:
+        return await awaitable
+    except RedisTimeoutError as error:
+        translated = MessagingBackendTimeout(
+            f"Messaging backend {operation} timed out",
+            diagnostic_context={
+                "implementation": "redis",
+                "operation": operation,
+            },
+            cause=error,
+        )
+        raise translated from error
+    except (RedisConnectionError, OSError) as error:
+        translated = MessagingBackendUnavailable(
+            f"Messaging backend is unavailable for {operation}",
+            diagnostic_context={
+                "implementation": "redis",
+                "operation": operation,
+            },
+            cause=error,
+        )
+        raise translated from error
+    except RedisError as error:
+        translated = UnexpectedMessagingBackendError(
+            f"Messaging backend {operation} failed",
+            diagnostic_context={
+                "implementation": "redis",
+                "operation": operation,
+            },
+            cause=error,
+        )
+        raise translated from error
+
+
+def _redis_protocol_error(
+    detail: str,
+    *,
+    cause: BaseException | None = None,
+) -> MessagingBackendProtocolError:
+    """Separate a provider-neutral message from trusted Redis diagnostics."""
+
+    return MessagingBackendProtocolError(
+        "Messaging backend returned an invalid protocol response",
+        diagnostic_context={
+            "implementation": "redis",
+            "operation": "protocol_validation",
+            "detail": detail,
+        },
+        cause=cause,
+    )
 
 
 class _RedisConnection(Protocol):
@@ -879,7 +943,7 @@ class RedisBackend(MessagingBackend):
                     generation=generation,
                 )
             if code == "INVALID_CONTROL_STATE":
-                raise RuntimeError(
+                raise _redis_protocol_error(
                     "Redis stream control has invalid state: "
                     f"{self._text(response[1])!r}"
                 )
@@ -926,7 +990,7 @@ class RedisBackend(MessagingBackend):
                 recovered=code == "RECOVER",
             )
         if code != "ATTACH":
-            raise RuntimeError(f"unexpected Redis prepare response: {code}")
+            raise _redis_protocol_error(f"unexpected Redis prepare response: {code}")
         return PreparedRun(
             handle=BackendRunHandle(
                 channel=channel,
@@ -1019,7 +1083,7 @@ class RedisBackend(MessagingBackend):
                 message_id=message_id,
             )
         if code not in {"APPENDED", "IDEMPOTENT"}:
-            raise RuntimeError(f"unexpected Redis append response: {code}")
+            raise _redis_protocol_error(f"unexpected Redis append response: {code}")
         seq = int(self._text(response[1]))
         created_at = datetime.fromtimestamp(
             int(self._text(response[2])) + int(self._text(response[3])) / 1_000_000,
@@ -1065,7 +1129,7 @@ class RedisBackend(MessagingBackend):
             raise BackendOwnershipLost(
                 f"Producer for run {handle.identity.run_id!r} lost its Redis fence"
             )
-        raise RuntimeError(f"unexpected Redis settlement response: {code}")
+        raise _redis_protocol_error(f"unexpected Redis settlement response: {code}")
 
     async def finish(
         self,
@@ -1126,7 +1190,10 @@ class RedisBackend(MessagingBackend):
                 identity,
                 generation=control.generation,
             )
-            value = await self._client.hget(keys.meta, "seq")
+            value = await _redis_call(
+                "latest sequence lookup",
+                self._client.hget(keys.meta, "seq"),
+            )
             if await self._is_current_generation(keys):
                 return 0 if value is None else int(self._text(value))
 
@@ -1158,11 +1225,14 @@ class RedisBackend(MessagingBackend):
                 identity,
                 generation=control.generation,
             )
-            entries = await self._client.xrange(
-                keys.messages,
-                min=f"({after}-0",
-                max="+",
-                count=limit,
+            entries = await _redis_call(
+                "message read",
+                self._client.xrange(
+                    keys.messages,
+                    min=f"({after}-0",
+                    max="+",
+                    count=limit,
+                ),
             )
             if await self._is_current_generation(keys):
                 return tuple(
@@ -1190,7 +1260,10 @@ class RedisBackend(MessagingBackend):
             fence=None,
         )
         keys = await self._keys_for_handle(unresolved)
-        if not await self._client.exists(keys.run_key):
+        if not await _redis_call(
+            "run existence lookup",
+            self._client.exists(keys.run_key),
+        ):
             if not await self._is_current_generation(keys):
                 self._raise_stream_deleted(
                     unresolved,
@@ -1256,7 +1329,7 @@ class RedisBackend(MessagingBackend):
         if code in {"FINAL", "DUPLICATE"}:
             return False
         if code != "REQUESTED":
-            raise RuntimeError(f"unexpected Redis cancel response: {code}")
+            raise _redis_protocol_error(f"unexpected Redis cancel response: {code}")
         return True
 
     async def wait_for_cancel(self, handle: BackendRunHandle) -> bool:
@@ -1307,7 +1380,7 @@ class RedisBackend(MessagingBackend):
         if code == "OWNERSHIP_LOST":
             return False
         if code != "RENEWED":
-            raise RuntimeError(f"unexpected Redis renew response: {code}")
+            raise _redis_protocol_error(f"unexpected Redis renew response: {code}")
         return True
 
     @property
@@ -1334,7 +1407,10 @@ class RedisBackend(MessagingBackend):
             expected_active_lease = ""
             active_lease_key = f"{keys.generation_base}:no-active-lease"
             if control is not None and control.state == "active":
-                active_lease = await self._client.hget(keys.meta, "active_lease")
+                active_lease = await _redis_call(
+                    "active lease lookup",
+                    self._client.hget(keys.meta, "active_lease"),
+                )
                 if active_lease is not None:
                     expected_active_lease = self._text(active_lease)
                     active_lease_key = expected_active_lease
@@ -1372,12 +1448,12 @@ class RedisBackend(MessagingBackend):
                 await asyncio.sleep(self._poll_interval)
                 continue
             if code == "INVALID_CONTROL_STATE":
-                raise RuntimeError(
+                raise _redis_protocol_error(
                     "Redis stream control has invalid state: "
                     f"{self._text(response[1])!r}"
                 )
             if code != "OWNED":
-                raise RuntimeError(f"unexpected Redis delete response: {code}")
+                raise _redis_protocol_error(f"unexpected Redis delete response: {code}")
             if await self._delete_owned_generation(
                 keys=keys,
                 delete_owner=delete_owner,
@@ -1393,7 +1469,10 @@ class RedisBackend(MessagingBackend):
         """Clear one fenced generation while periodically renewing ownership."""
 
         while True:
-            raw_members = await self._client.srandmember(keys.index, number=64)
+            raw_members = await _redis_call(
+                "stream index read",
+                self._client.srandmember(keys.index, number=64),
+            )
             members = tuple(
                 self._text(member)
                 for member in cast(Sequence[bytes | str], raw_members or ())
@@ -1412,7 +1491,7 @@ class RedisBackend(MessagingBackend):
                 if code in {"RETRY", "LEASE_LOST"}:
                     return False
                 if code != "OK":
-                    raise RuntimeError(
+                    raise _redis_protocol_error(
                         f"unexpected Redis delete batch response: {code}"
                     )
                 continue
@@ -1429,7 +1508,9 @@ class RedisBackend(MessagingBackend):
                 continue
             if code in {"RETRY", "LEASE_LOST"}:
                 return False
-            raise RuntimeError(f"unexpected Redis delete finalization response: {code}")
+            raise _redis_protocol_error(
+                f"unexpected Redis delete finalization response: {code}"
+            )
 
     def _scope(self, channel: str, identity: Identity) -> _RedisStreamScope:
         channel_scope = self._digest(channel)
@@ -1477,7 +1558,10 @@ class RedisBackend(MessagingBackend):
         self,
         scope: _RedisStreamScope,
     ) -> _StreamControl | None:
-        values = await self._client.hgetall(scope.control)
+        values = await _redis_call(
+            "stream control read",
+            self._client.hgetall(scope.control),
+        )
         if not values:
             return None
         decoded = {
@@ -1486,13 +1570,18 @@ class RedisBackend(MessagingBackend):
         }
         state = decoded.get("state")
         if state not in {"active", "deleting", "deleted"}:
-            raise RuntimeError(f"Redis stream control has invalid state: {state!r}")
+            raise _redis_protocol_error(
+                f"Redis stream control has invalid state: {state!r}"
+            )
         try:
             generation = int(decoded["generation"])
         except (KeyError, ValueError) as error:
-            raise RuntimeError("Redis stream control has invalid generation") from error
+            raise _redis_protocol_error(
+                "Redis stream control has invalid generation",
+                cause=error,
+            ) from error
         if generation < 1:
-            raise RuntimeError("Redis stream control has invalid generation")
+            raise _redis_protocol_error("Redis stream control has invalid generation")
         return _StreamControl(
             generation=generation,
             state=cast(_ControlState, state),
@@ -1543,23 +1632,28 @@ class RedisBackend(MessagingBackend):
     ) -> _RunSnapshot:
         """Read one authoritative run state and optional bounded message page."""
 
-        raw_response = await self._client.eval(
-            _RUN_SNAPSHOT_SCRIPT,
-            6,
-            keys.control,
-            keys.meta,
-            keys.run_key,
-            keys.lease_key,
-            keys.messages,
-            keys.signals,
-            str(keys.generation),
-            "__none__" if after is None else str(after),
+        raw_response = await _redis_call(
+            "run snapshot",
+            self._client.eval(
+                _RUN_SNAPSHOT_SCRIPT,
+                6,
+                keys.control,
+                keys.meta,
+                keys.run_key,
+                keys.lease_key,
+                keys.messages,
+                keys.signals,
+                str(keys.generation),
+                "__none__" if after is None else str(after),
+            ),
         )
         if not isinstance(raw_response, list):
-            raise TypeError("Redis run snapshot returned a non-list response")
+            raise _redis_protocol_error(
+                "Redis run snapshot returned a non-list response"
+            )
         response = cast(list[_RedisScriptValue], raw_response)
         if not response:
-            raise RuntimeError("Redis run snapshot returned an empty response")
+            raise _redis_protocol_error("Redis run snapshot returned an empty response")
         code = self._snapshot_text(response[0], field="response code")
         if code == "STREAM_DELETED":
             raise StreamDeleted(
@@ -1575,11 +1669,17 @@ class RedisBackend(MessagingBackend):
                 if len(response) > 1
                 else ""
             )
-            raise RuntimeError(f"Redis run snapshot has invalid status: {status!r}")
+            raise _redis_protocol_error(
+                f"Redis run snapshot has invalid status: {status!r}"
+            )
         if code == "INVALID_BOUNDARY":
-            raise RuntimeError("Redis run snapshot has an invalid message boundary")
+            raise _redis_protocol_error(
+                "Redis run snapshot has an invalid message boundary"
+            )
         if code != "OK" or len(response) != 8:
-            raise RuntimeError(f"unexpected Redis run snapshot response: {code}")
+            raise _redis_protocol_error(
+                f"unexpected Redis run snapshot response: {code}"
+            )
 
         status_text = self._snapshot_text(response[1], field="status")
         if status_text not in {
@@ -1590,7 +1690,7 @@ class RedisBackend(MessagingBackend):
             "failed",
             "owner_lost",
         }:
-            raise RuntimeError(
+            raise _redis_protocol_error(
                 f"Redis run snapshot has invalid status: {status_text!r}"
             )
         end_seq = self._snapshot_integer(
@@ -1689,16 +1789,22 @@ class RedisBackend(MessagingBackend):
         blocking_client = self._client.client()
         read_task: asyncio.Task[None] | None = None
         try:
-            await blocking_client.initialize()
+            await _redis_call(
+                "blocking client initialization",
+                blocking_client.initialize(),
+            )
 
             async def read() -> None:
-                await blocking_client.xread(
-                    {
-                        keys.messages: f"{snapshot.end_seq}-0",
-                        keys.signals: f"{snapshot.signal_cursor}-0",
-                    },
-                    count=1,
-                    block=self._wait_block_ms(snapshot.lease_ttl_ms),
+                await _redis_call(
+                    "stream wait",
+                    blocking_client.xread(
+                        {
+                            keys.messages: f"{snapshot.end_seq}-0",
+                            keys.signals: f"{snapshot.signal_cursor}-0",
+                        },
+                        count=1,
+                        block=self._wait_block_ms(snapshot.lease_ttl_ms),
+                    ),
                 )
 
             read_task = asyncio.create_task(
@@ -1710,7 +1816,12 @@ class RedisBackend(MessagingBackend):
             except asyncio.CancelledError as cancellation:
                 connection = blocking_client.connection
                 if connection is not None:
-                    await asyncio.shield(connection.disconnect(nowait=True))
+                    await asyncio.shield(
+                        _redis_call(
+                            "blocking read cancellation",
+                            connection.disconnect(nowait=True),
+                        )
+                    )
                 read_task.cancel()
                 await asyncio.gather(read_task, return_exceptions=True)
                 raise cancellation.with_traceback(cancellation.__traceback__)
@@ -1718,7 +1829,9 @@ class RedisBackend(MessagingBackend):
             if read_task is not None and not read_task.done():
                 read_task.cancel()
                 await asyncio.gather(read_task, return_exceptions=True)
-            await asyncio.shield(blocking_client.aclose())
+            await asyncio.shield(
+                _redis_call("blocking client close", blocking_client.aclose())
+            )
 
     def _wait_block_ms(self, lease_ttl_ms: int) -> int:
         """Bound XREAD by lease expiry, fallback progress, and socket timeout."""
@@ -1758,9 +1871,12 @@ class RedisBackend(MessagingBackend):
         try:
             parsed = int(text)
         except ValueError as error:
-            raise RuntimeError(f"Redis run snapshot has invalid {field}") from error
+            raise _redis_protocol_error(
+                f"Redis run snapshot has invalid {field}",
+                cause=error,
+            ) from error
         if str(parsed) != text or parsed < minimum:
-            raise RuntimeError(f"Redis run snapshot has invalid {field}")
+            raise _redis_protocol_error(f"Redis run snapshot has invalid {field}")
         return parsed
 
     @staticmethod
@@ -1768,18 +1884,21 @@ class RedisBackend(MessagingBackend):
         """Decode one UTF-8 scalar and reject nested or malformed responses."""
 
         if not isinstance(value, bytes):
-            raise TypeError(f"Redis run snapshot has invalid {field}")
+            raise _redis_protocol_error(f"Redis run snapshot has invalid {field}")
         try:
             return value.decode()
         except UnicodeDecodeError as error:
-            raise RuntimeError(f"Redis run snapshot has invalid {field}") from error
+            raise _redis_protocol_error(
+                f"Redis run snapshot has invalid {field}",
+                cause=error,
+            ) from error
 
     @staticmethod
     def _snapshot_bytes(value: _RedisScriptValue, *, field: str) -> bytes:
         """Return one binary scalar and reject nested snapshot structures."""
 
         if not isinstance(value, bytes):
-            raise TypeError(f"Redis run snapshot has invalid {field}")
+            raise _redis_protocol_error(f"Redis run snapshot has invalid {field}")
         return value
 
     def _snapshot_messages(
@@ -1794,11 +1913,17 @@ class RedisBackend(MessagingBackend):
         """Decode the exact nested XRANGE representation returned through EVAL."""
 
         if not isinstance(value, list):
-            raise TypeError("Redis run snapshot has an invalid message page")
+            raise _redis_protocol_error(
+                "Redis run snapshot has an invalid message page"
+            )
         if after is None and value:
-            raise RuntimeError("Redis run snapshot returned an unexpected message page")
+            raise _redis_protocol_error(
+                "Redis run snapshot returned an unexpected message page"
+            )
         if len(value) > _SNAPSHOT_PAGE_SIZE:
-            raise RuntimeError("Redis run snapshot exceeded its message page limit")
+            raise _redis_protocol_error(
+                "Redis run snapshot exceeded its message page limit"
+            )
 
         messages: list[MessageEnvelope] = []
         previous_seq = after
@@ -1812,14 +1937,18 @@ class RedisBackend(MessagingBackend):
         }
         for raw_entry in value:
             if not isinstance(raw_entry, list) or len(raw_entry) != 2:
-                raise RuntimeError("Redis run snapshot has a malformed message entry")
+                raise _redis_protocol_error(
+                    "Redis run snapshot has a malformed message entry"
+                )
             identifier = self._snapshot_bytes(
                 raw_entry[0],
                 field="message identifier",
             )
             raw_fields = raw_entry[1]
             if not isinstance(raw_fields, list) or len(raw_fields) % 2 != 0:
-                raise RuntimeError("Redis run snapshot has malformed message fields")
+                raise _redis_protocol_error(
+                    "Redis run snapshot has malformed message fields"
+                )
             fields: dict[bytes, bytes] = {}
             for index in range(0, len(raw_fields), 2):
                 key = self._snapshot_bytes(
@@ -1831,12 +1960,14 @@ class RedisBackend(MessagingBackend):
                     field="message field value",
                 )
                 if key in fields:
-                    raise RuntimeError(
+                    raise _redis_protocol_error(
                         "Redis run snapshot has duplicate message fields"
                     )
                 fields[key] = field_value
             if set(fields) != expected_fields:
-                raise RuntimeError("Redis run snapshot has incomplete message fields")
+                raise _redis_protocol_error(
+                    "Redis run snapshot has incomplete message fields"
+                )
             try:
                 message = self._decode_entry(
                     channel,
@@ -1844,13 +1975,16 @@ class RedisBackend(MessagingBackend):
                     (identifier, fields),
                 )
             except (KeyError, TypeError, ValueError, UnicodeDecodeError) as error:
-                raise RuntimeError(
-                    "Redis run snapshot has a malformed message entry"
+                raise _redis_protocol_error(
+                    "Redis run snapshot has a malformed message entry",
+                    cause=error,
                 ) from error
             if message.seq > end_seq or (
                 previous_seq is not None and message.seq <= previous_seq
             ):
-                raise RuntimeError("Redis run snapshot has an invalid message order")
+                raise _redis_protocol_error(
+                    "Redis run snapshot has an invalid message order"
+                )
             previous_seq = message.seq
             messages.append(message)
         return tuple(messages)
@@ -1899,14 +2033,17 @@ class RedisBackend(MessagingBackend):
         keys: Sequence[str],
         arguments: Sequence[str | bytes],
     ) -> list[bytes]:
-        response = await self._client.eval(
-            script,
-            len(keys),
-            *keys,
-            *arguments,
+        response = await _redis_call(
+            "script evaluation",
+            self._client.eval(
+                script,
+                len(keys),
+                *keys,
+                *arguments,
+            ),
         )
         if not isinstance(response, list):
-            raise TypeError("Redis script returned a non-list response")
+            raise _redis_protocol_error("Redis script returned a non-list response")
         return cast(list[bytes], response)
 
     @staticmethod

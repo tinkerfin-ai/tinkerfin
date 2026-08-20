@@ -13,8 +13,13 @@ from .errors import CancellationUnsupported as CancellationUnsupported
 from .errors import CodecMismatch as CodecMismatch
 from .errors import InvalidCursor as InvalidCursor
 from .errors import MessageIdConflict as MessageIdConflict
+from .errors import MessagingBackendError as MessagingBackendError
+from .errors import MessagingBackendProtocolError as MessagingBackendProtocolError
+from .errors import MessagingBackendTimeout as MessagingBackendTimeout
+from .errors import MessagingBackendUnavailable as MessagingBackendUnavailable
 from .errors import MessagingClosed as MessagingClosed
 from .errors import MessagingError as MessagingError
+from .errors import MessagingErrorCode as MessagingErrorCode
 from .errors import MessagingNotStarted as MessagingNotStarted
 from .errors import MessagingSettlementTimeout as MessagingSettlementTimeout
 from .errors import RecoveryUnsupported as RecoveryUnsupported
@@ -25,6 +30,7 @@ from .errors import SourceProfileMismatch as SourceProfileMismatch
 from .errors import SseRenderingUnsupported as SseRenderingUnsupported
 from .errors import StreamDeleteConflict as StreamDeleteConflict
 from .errors import StreamDeleted as StreamDeleted
+from .errors import UnexpectedMessagingBackendError as UnexpectedMessagingBackendError
 from .messaging import CancelCallback as CancelCallback
 from .messaging import CancelContext as CancelContext
 from .messaging import CommittedCallback as CommittedCallback
@@ -77,8 +83,13 @@ __all__ = [
     "MessageSubscription",
     "Messaging",
     "MessagingBackend",
+    "MessagingBackendError",
+    "MessagingBackendProtocolError",
+    "MessagingBackendTimeout",
+    "MessagingBackendUnavailable",
     "MessagingClosed",
     "MessagingError",
+    "MessagingErrorCode",
     "MessagingNotStarted",
     "MessagingSettlementTimeout",
     "NativeStreamPart",
@@ -99,6 +110,7 @@ __all__ = [
     "SseRenderingUnsupported",
     "StreamDeleteConflict",
     "StreamDeleted",
+    "UnexpectedMessagingBackendError",
     "map_source",
 ]
 

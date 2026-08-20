@@ -33,7 +33,7 @@ from ..errors import (
 )
 from ..middleware.filesystem import build_rooted_filesystem_middleware
 from ..models import OpenSandboxDetails, _normalize_workspace_root
-from ._protocols import _SandboxClient
+from ._protocols import _SandboxClient, _SandboxClientBoundary
 from .state import (
     InMemoryOpenSandboxState,
     OpenSandboxBinding,
@@ -41,6 +41,7 @@ from .state import (
     OpenSandboxOwnerClaim,
     OpenSandboxState,
     OpenSandboxWarmClaim,
+    _OpenSandboxStateBoundary,
 )
 
 logger = logging.getLogger(__name__)
@@ -143,9 +144,9 @@ class OpenSandboxManager(Generic[KeyT]):
             if not math.isfinite(resolved_timeout) or resolved_timeout < 0:
                 raise ValueError("settlement_timeout must be finite and non-negative")
 
-        self._client = client
+        self._client = _SandboxClientBoundary(client)
         self._key_resolver = key_resolver
-        self._state = state or InMemoryOpenSandboxState()
+        self._state = _OpenSandboxStateBoundary(state or InMemoryOpenSandboxState())
         self._warm_pool_size = resolved_warm_size
         self._fail_on_startup_warmup_error = fail_on_startup_warmup_error
         self._settlement_timeout = resolved_timeout

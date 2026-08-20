@@ -10,7 +10,8 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Literal, TypeVar
+from functools import wraps
+from typing import Literal, TypeVar, cast
 from uuid import uuid4
 
 from sqlalchemy import (
@@ -35,7 +36,8 @@ from sqlalchemy import (
 from sqlalchemy.dialects import mysql as mysql_dialect
 from sqlalchemy.dialects import sqlite as sqlite_dialect
 from sqlalchemy.engine import Connection
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import DBAPIError, SQLAlchemyError
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.ext.asyncio import (
     AsyncConnection,
     AsyncEngine,
@@ -45,9 +47,13 @@ from sqlalchemy.schema import CreateIndex, CreateTable, DefaultClause
 from sqlalchemy.sql import Select
 
 from ..errors import (
+    OpenSandboxStateCommitUncertainError,
     OpenSandboxStateConfigurationError,
     OpenSandboxStateError,
     OpenSandboxStateOwnershipError,
+    OpenSandboxStateTimeoutError,
+    OpenSandboxStateUnavailableError,
+    UnexpectedOpenSandboxStateError,
 )
 from .state import (
     OpenSandboxBinding,
@@ -66,6 +72,10 @@ _SQLITE_RETRY_MAX_DELAY_SECONDS = 0.5
 _SQLITE_BUSY_WAIT_MAX_SECONDS = 0.01
 
 _ResultT = TypeVar("_ResultT")
+_AsyncFunctionT = TypeVar(
+    "_AsyncFunctionT",
+    bound=Callable[..., Awaitable[object]],
+)
 
 
 class _RetryableSQLiteWriteError(Exception):
@@ -76,8 +86,66 @@ class _RetryableSQLiteWriteError(Exception):
         self.error = error
 
 
-class _CommitOutcomeUncertainError(OpenSandboxStateError):
-    """Prevent callers from retrying a write whose COMMIT result is unknown."""
+def _state_operation(
+    operation: str,
+) -> Callable[[_AsyncFunctionT], _AsyncFunctionT]:
+    """Translate SQLAlchemy and driver failures at each public State boundary."""
+
+    def decorate(
+        function: _AsyncFunctionT,
+    ) -> _AsyncFunctionT:
+        @wraps(function)
+        async def wrapped(*args: object, **kwargs: object) -> object:
+            state = cast(SQLAlchemyOpenSandboxState, args[0])
+            diagnostic_context = {
+                "implementation": "sqlalchemy",
+                "dialect": state._dialect,
+                "operation": operation,
+            }
+            try:
+                return await function(*args, **kwargs)
+            except OpenSandboxStateError as error:
+                error._enrich_diagnostic_context(diagnostic_context)
+                raise
+            except SQLAlchemyTimeoutError as error:
+                translated = OpenSandboxStateTimeoutError(
+                    f"OpenSandbox State {operation} timed out",
+                    diagnostic_context=diagnostic_context,
+                    cause=error,
+                )
+                raise translated from error
+            except DBAPIError as error:
+                error_type = (
+                    OpenSandboxStateUnavailableError
+                    if error.connection_invalidated
+                    else UnexpectedOpenSandboxStateError
+                )
+                translated = error_type(
+                    f"OpenSandbox State {operation} failed",
+                    diagnostic_context=diagnostic_context,
+                    cause=error,
+                )
+                raise translated from error
+            except (SQLAlchemyError, OSError) as error:
+                translated = OpenSandboxStateUnavailableError(
+                    f"OpenSandbox State {operation} is unavailable",
+                    diagnostic_context=diagnostic_context,
+                    cause=error,
+                )
+                raise translated from error
+            except (TypeError, ValueError):
+                raise
+            except Exception as error:
+                translated = UnexpectedOpenSandboxStateError(
+                    f"OpenSandbox State {operation} failed",
+                    diagnostic_context=diagnostic_context,
+                    cause=error,
+                )
+                raise translated from error
+
+        return cast(_AsyncFunctionT, wrapped)
+
+    return decorate
 
 
 @dataclass(frozen=True, slots=True)
@@ -832,7 +900,7 @@ class SQLAlchemyOpenSandboxState(OpenSandboxState):
                     ) from commit_error
                 delay = min(delay * 2, _SQLITE_RETRY_MAX_DELAY_SECONDS)
                 continue
-            raise _CommitOutcomeUncertainError(
+            raise OpenSandboxStateCommitUncertainError(
                 "OpenSandbox write COMMIT outcome is uncertain; "
                 "the transaction was not retried"
             ) from commit_error
@@ -982,6 +1050,7 @@ class SQLAlchemyOpenSandboxState(OpenSandboxState):
             finally:
                 await connection.close()
 
+    @_state_operation("start")
     async def start(self, *, warm_pool_size: int) -> None:
         """Create the schema through one instance-owned startup attempt.
 
@@ -1204,6 +1273,7 @@ class SQLAlchemyOpenSandboxState(OpenSandboxState):
         except Exception as exc:  # noqa: BLE001
             self._worker_failure = exc
 
+    @_state_operation("acquire_owner")
     async def acquire_owner(self, owner_key: str) -> OpenSandboxOwnerClaim:
         """Wait until this worker atomically owns the next owner generation."""
         self._ensure_open()
@@ -1292,6 +1362,7 @@ class SQLAlchemyOpenSandboxState(OpenSandboxState):
                     return claim
             await asyncio.sleep(self._poll_interval)
 
+    @_state_operation("bind_owner")
     async def bind_owner(
         self,
         claim: OpenSandboxOwnerClaim,
@@ -1328,6 +1399,7 @@ class SQLAlchemyOpenSandboxState(OpenSandboxState):
             generation=claim.generation,
         )
 
+    @_state_operation("renew_owner")
     async def renew_owner(self, claim: OpenSandboxOwnerClaim) -> bool:
         """Extend a current, unexpired owner lease."""
         self._ensure_open()
@@ -1352,6 +1424,7 @@ class SQLAlchemyOpenSandboxState(OpenSandboxState):
 
         return await self._run_write_transaction(renew)
 
+    @_state_operation("unbind_owner")
     async def unbind_owner(self, claim: OpenSandboxOwnerClaim) -> None:
         """Remove a binding only while the owner claim remains current."""
         self._ensure_open()
@@ -1380,6 +1453,7 @@ class SQLAlchemyOpenSandboxState(OpenSandboxState):
 
         await self._run_write_transaction(unbind)
 
+    @_state_operation("read_binding")
     async def read_binding(self, owner_key: str) -> OpenSandboxBinding | None:
         """Read the latest committed owner binding without claiming it."""
         self._ensure_open()
@@ -1403,6 +1477,7 @@ class SQLAlchemyOpenSandboxState(OpenSandboxState):
             generation=int(row.binding_generation),
         )
 
+    @_state_operation("release_owner")
     async def release_owner(self, claim: OpenSandboxOwnerClaim) -> None:
         """Release only the exact owner claim supplied by the caller."""
         self._ensure_open()
@@ -1425,6 +1500,7 @@ class SQLAlchemyOpenSandboxState(OpenSandboxState):
 
         await self._run_write_transaction(release)
 
+    @_state_operation("claim_warm_slot")
     async def claim_warm_slot(self) -> OpenSandboxWarmClaim | None:
         """Claim one empty or abandoned global warm-pool slot."""
         self._ensure_open()
@@ -1476,6 +1552,7 @@ class SQLAlchemyOpenSandboxState(OpenSandboxState):
 
         return await self._run_claim_transaction(claim)
 
+    @_state_operation("publish_warm")
     async def publish_warm(
         self,
         claim: OpenSandboxWarmClaim,
@@ -1509,6 +1586,7 @@ class SQLAlchemyOpenSandboxState(OpenSandboxState):
 
         await self._run_write_transaction(publish)
 
+    @_state_operation("renew_warm")
     async def renew_warm(self, claim: OpenSandboxWarmClaim) -> bool:
         """Extend a current, unexpired warm-slot lease."""
         self._ensure_open()
@@ -1533,6 +1611,7 @@ class SQLAlchemyOpenSandboxState(OpenSandboxState):
 
         return await self._run_write_transaction(renew)
 
+    @_state_operation("release_warm")
     async def release_warm(self, claim: OpenSandboxWarmClaim) -> None:
         """Release only the exact uncommitted warm claim."""
         self._ensure_open()
@@ -1555,6 +1634,7 @@ class SQLAlchemyOpenSandboxState(OpenSandboxState):
 
         await self._run_write_transaction(release)
 
+    @_state_operation("consume_warm")
     async def consume_warm(
         self,
         claim: OpenSandboxOwnerClaim,
@@ -1665,6 +1745,7 @@ class SQLAlchemyOpenSandboxState(OpenSandboxState):
             )
         )
 
+    @_state_operation("enqueue_cleanup")
     async def enqueue_cleanup(self, sandbox_id: str) -> None:
         """Persist an idempotent remote-destruction retry target."""
         self._ensure_open()
@@ -1685,6 +1766,7 @@ class SQLAlchemyOpenSandboxState(OpenSandboxState):
                     raise
                 await asyncio.sleep(self._poll_interval)
 
+    @_state_operation("claim_cleanup")
     async def claim_cleanup(self) -> OpenSandboxCleanupClaim | None:
         """Claim one pending or abandoned cleanup target."""
         self._ensure_open()
@@ -1738,6 +1820,7 @@ class SQLAlchemyOpenSandboxState(OpenSandboxState):
 
         return await self._run_claim_transaction(claim)
 
+    @_state_operation("renew_cleanup")
     async def renew_cleanup(self, claim: OpenSandboxCleanupClaim) -> bool:
         """Extend a current, unexpired cleanup lease."""
         self._ensure_open()
@@ -1762,6 +1845,7 @@ class SQLAlchemyOpenSandboxState(OpenSandboxState):
 
         return await self._run_write_transaction(renew)
 
+    @_state_operation("complete_cleanup")
     async def complete_cleanup(self, claim: OpenSandboxCleanupClaim) -> None:
         """Delete a cleanup row only after its claimant confirms destruction."""
         self._ensure_open()
@@ -1782,6 +1866,7 @@ class SQLAlchemyOpenSandboxState(OpenSandboxState):
 
         await self._run_write_transaction(complete)
 
+    @_state_operation("release_cleanup")
     async def release_cleanup(self, claim: OpenSandboxCleanupClaim) -> None:
         """Release one failed cleanup claim for a future retry."""
         self._ensure_open()
@@ -1804,11 +1889,13 @@ class SQLAlchemyOpenSandboxState(OpenSandboxState):
 
         await self._run_write_transaction(release)
 
+    @_state_operation("shutdown_sandbox_ids")
     async def shutdown_sandbox_ids(self) -> tuple[str, ...]:
         """Keep durable bindings, warm slots, and cleanup work on shutdown."""
         self._ensure_open()
         return ()
 
+    @_state_operation("close")
     async def aclose(self) -> None:
         """Settle startup and close owned database resources idempotently.
 

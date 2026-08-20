@@ -11,16 +11,9 @@ from typing import Literal
 from langchain_core.messages import AIMessage, BaseMessage
 from pydantic import Field, JsonValue, ValidationError, model_validator
 
+from .errors import HitlCorrelationError, HitlNoMatchError
 from .models import JsonObject, RuntimeModel
 from .reasoning import json_values_equal
-
-
-class HitlCorrelationError(ValueError):
-    """A HITL action cannot be uniquely correlated to checkpoint Tool calls."""
-
-
-class HitlNoMatchError(HitlCorrelationError):
-    """No complete Tool-call assignment exists for the native HITL actions."""
 
 
 class HitlActionRequest(RuntimeModel):

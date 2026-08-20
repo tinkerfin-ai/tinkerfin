@@ -14,12 +14,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from tinkerfin_agui_adapter.lifecycle import AgUiLifecycleEventFactory
 from tinkerfin_messaging.errors import (
-    CancellationUnsupported,
-    InvalidCursor,
     MessagingError,
-    RunAlreadyActive,
-    RunNotFound,
-    RunProducerFailed,
+    MessagingErrorCode,
 )
 from tinkerfin_messaging.models import MessageEnvelope
 from tinkerfin_messaging.protocols import ProfiledMessageSource
@@ -62,6 +58,90 @@ from tinkerfin_studio.models.service import AgentModelService
 from tinkerfin_studio.resources import ApplicationResources
 
 _TaskResult = TypeVar("_TaskResult")
+
+_MESSAGING_ERRORS: dict[
+    MessagingErrorCode,
+    tuple[ConversationErrorCode, bool],
+] = {
+    MessagingErrorCode.ERROR: (ConversationErrorCode.MESSAGING_FAILURE, False),
+    MessagingErrorCode.NOT_STARTED: (
+        ConversationErrorCode.MESSAGING_FAILURE,
+        False,
+    ),
+    MessagingErrorCode.SETTLEMENT_TIMEOUT: (
+        ConversationErrorCode.MESSAGING_UNAVAILABLE,
+        False,
+    ),
+    MessagingErrorCode.CLOSED: (ConversationErrorCode.MESSAGING_FAILURE, False),
+    MessagingErrorCode.INVALID_CURSOR: (
+        ConversationErrorCode.INVALID_LAST_EVENT_ID,
+        True,
+    ),
+    MessagingErrorCode.CODEC_MISMATCH: (
+        ConversationErrorCode.MESSAGING_FAILURE,
+        False,
+    ),
+    MessagingErrorCode.SOURCE_PROFILE_MISMATCH: (
+        ConversationErrorCode.MESSAGING_FAILURE,
+        False,
+    ),
+    MessagingErrorCode.MESSAGE_ID_CONFLICT: (
+        ConversationErrorCode.RUN_IDENTITY_CONFLICT,
+        True,
+    ),
+    MessagingErrorCode.RUN_ALREADY_ACTIVE: (
+        ConversationErrorCode.RUN_CONFLICT,
+        True,
+    ),
+    MessagingErrorCode.RUN_NOT_FOUND: (
+        ConversationErrorCode.RUN_NOT_FOUND,
+        True,
+    ),
+    MessagingErrorCode.RUN_PRODUCER_FAILED: (
+        ConversationErrorCode.MESSAGING_FAILURE,
+        False,
+    ),
+    MessagingErrorCode.CANCELLATION_UNSUPPORTED: (
+        ConversationErrorCode.RUN_CANCEL_UNSUPPORTED,
+        True,
+    ),
+    MessagingErrorCode.RECOVERY_UNSUPPORTED: (
+        ConversationErrorCode.MESSAGING_FAILURE,
+        False,
+    ),
+    MessagingErrorCode.SSE_RENDERING_UNSUPPORTED: (
+        ConversationErrorCode.MESSAGING_FAILURE,
+        False,
+    ),
+    MessagingErrorCode.BACKEND_OWNERSHIP_LOST: (
+        ConversationErrorCode.MESSAGING_FAILURE,
+        False,
+    ),
+    MessagingErrorCode.STREAM_DELETED: (
+        ConversationErrorCode.RUN_NOT_FOUND,
+        True,
+    ),
+    MessagingErrorCode.STREAM_DELETE_CONFLICT: (
+        ConversationErrorCode.DELETE_CONFLICT,
+        True,
+    ),
+    MessagingErrorCode.BACKEND_UNAVAILABLE: (
+        ConversationErrorCode.MESSAGING_UNAVAILABLE,
+        False,
+    ),
+    MessagingErrorCode.BACKEND_TIMEOUT: (
+        ConversationErrorCode.MESSAGING_UNAVAILABLE,
+        False,
+    ),
+    MessagingErrorCode.BACKEND_PROTOCOL_ERROR: (
+        ConversationErrorCode.MESSAGING_FAILURE,
+        False,
+    ),
+    MessagingErrorCode.UNEXPECTED_BACKEND_FAILURE: (
+        ConversationErrorCode.MESSAGING_FAILURE,
+        False,
+    ),
+}
 
 
 async def _settle_owned_task(task: asyncio.Task[_TaskResult]) -> _TaskResult:
@@ -369,14 +449,8 @@ class ConversationChatService:
             cancelled = await self._resources.conversation_channel.cancel(
                 identity=identity,
             )
-        except RunNotFound as error:
-            raise BusinessException(ConversationErrorCode.RUN_NOT_FOUND) from error
-        except CancellationUnsupported as error:
-            raise BusinessException(
-                ConversationErrorCode.RUN_CANCEL_UNSUPPORTED
-            ) from error
-        except RunProducerFailed as error:
-            raise SystemException(ConversationErrorCode.RUN_CANCEL_FAILED) from error
+        except MessagingError as error:
+            raise self._messaging_error(error, operation="cancel") from error
         await self._resources.conversation_projector.reconcile(
             thread_pk=thread_pk,
             identity=identity,
@@ -384,14 +458,19 @@ class ConversationChatService:
         return CancelRunResponse(cancelled=cancelled)
 
     @staticmethod
-    def _messaging_error(error: MessagingError) -> BusinessException | SystemException:
-        if isinstance(error, InvalidCursor):
-            return BusinessException(ConversationErrorCode.INVALID_LAST_EVENT_ID)
-        if isinstance(error, RunAlreadyActive):
-            return BusinessException(ConversationErrorCode.RUN_CONFLICT)
-        if isinstance(error, RunNotFound):
-            return BusinessException(ConversationErrorCode.RUN_NOT_FOUND)
-        return SystemException(ConversationErrorCode.AGENT_UNAVAILABLE)
+    def _messaging_error(
+        error: MessagingError,
+        *,
+        operation: str = "chat",
+    ) -> BusinessException | SystemException:
+        error_code, business = _MESSAGING_ERRORS[error.code]
+        if (
+            operation == "cancel"
+            and error.code is MessagingErrorCode.RUN_PRODUCER_FAILED
+        ):
+            error_code = ConversationErrorCode.RUN_CANCEL_FAILED
+        exception_type = BusinessException if business else SystemException
+        return exception_type(error_code)
 
 
 __all__ = [

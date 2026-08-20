@@ -1,5 +1,5 @@
 # ruff: noqa: F403, F405
-# 此文件由 scripts/generate_stubs.py 根据锁定依赖生成，请勿手工维护参数列表
+# Generated from locked dependencies by scripts/generate_stubs.py; do not edit signatures manually.
 from collections.abc import Mapping, Sequence
 from typing import Generic, Literal
 

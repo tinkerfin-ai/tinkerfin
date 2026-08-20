@@ -160,6 +160,41 @@ def _immediate_sqlite_url(path: Path) -> str:
     return f"{_sqlite_url(path)}?timeout=0"
 
 
+@pytest.mark.parametrize(
+    ("url", "dialect"),
+    [
+        pytest.param("sqlite+aiosqlite:///:memory:", "sqlite", id="sqlite"),
+        pytest.param(
+            "mysql+asyncmy://user:secret@localhost/database",
+            "mysql",
+            id="mysql",
+        ),
+    ],
+)
+async def test_sqlalchemy_state_boundary_records_trusted_implementation_context(
+    url: str,
+    dialect: str,
+) -> None:
+    state = tinkerfin_sandbox.SQLAlchemyOpenSandboxState(url=url)
+    try:
+        with pytest.raises(
+            tinkerfin_sandbox.OpenSandboxStateError,
+            match="has not been started",
+        ) as captured:
+            await state.read_binding("owner-1")
+    finally:
+        await state.aclose()
+
+    assert dict(captured.value.context) == {}
+    assert dict(captured.value.diagnostic_context) == {
+        "implementation": "sqlalchemy",
+        "dialect": dialect,
+        "operation": "read_binding",
+    }
+    assert url not in str(captured.value)
+    assert "secret" not in str(captured.value)
+
+
 async def _hold_sqlite_write_lock(path: Path) -> aiosqlite.Connection:
     """Return a real independent connection holding SQLite's write reservation."""
 
@@ -442,14 +477,18 @@ async def test_sqlite_state_does_not_retry_when_statement_rollback_fails(
     monkeypatch.setattr(AsyncConnection, "execute", fail_statement)
     monkeypatch.setattr(AsyncConnection, "rollback", fail_rollback)
     try:
-        with pytest.raises(OperationalError, match="database is locked") as captured:
+        state_error = _public_type("UnexpectedOpenSandboxStateError")
+        with pytest.raises(state_error, match="bind_owner failed") as captured:
             await state.bind_owner(claim, "sandbox-1")
     finally:
         monkeypatch.setattr(AsyncConnection, "execute", original_execute)
         monkeypatch.setattr(AsyncConnection, "rollback", original_rollback)
 
     assert execute_attempts == 1
-    assert any("rollback also failed" in note for note in captured.value.__notes__)
+    assert isinstance(captured.value.cause, OperationalError)
+    assert any(
+        "rollback also failed" in note for note in captured.value.cause.__notes__
+    )
     assert await state.read_binding("user-A") is None
     await state.release_owner(claim)
     await state.aclose()
@@ -572,6 +611,11 @@ async def test_sqlite_state_does_not_replay_an_uncertain_commit(
     assert committed_responses == 1
     assert isinstance(captured.value.__cause__, OperationalError)
     assert "commit response was lost" in str(captured.value.__cause__)
+    assert dict(captured.value.diagnostic_context) == {
+        "implementation": "sqlalchemy",
+        "dialect": "sqlite",
+        "operation": "bind_owner",
+    }
     assert await state.read_binding("user-A") == tinkerfin_sandbox.OpenSandboxBinding(
         sandbox_id="sandbox-1",
         generation=claim.generation,
@@ -610,10 +654,19 @@ async def test_sqlite_state_repeated_start_requires_the_same_capacity(
         await state.start(warm_pool_size=1)
         await state.start(warm_pool_size=1)
 
-        with pytest.raises(configuration_error, match="warm_pool_size"):
+        with pytest.raises(
+            configuration_error,
+            match="warm_pool_size",
+        ) as captured:
             await state.start(warm_pool_size=2)
     finally:
         await state.aclose()
+
+    assert dict(captured.value.diagnostic_context) == {
+        "implementation": "sqlalchemy",
+        "dialect": "sqlite",
+        "operation": "start",
+    }
 
 
 async def test_sqlite_state_concurrent_start_is_idempotent(tmp_path: Path) -> None:

@@ -9,6 +9,7 @@ from langchain_core.messages import AIMessageChunk
 from pydantic import ValidationError
 
 from tinkerfin import AgUiEventStream, Identity, TinkerFin
+from tinkerfin_agui_adapter import AgUiStreamContractError
 
 
 def _identity(
@@ -350,7 +351,8 @@ async def test_agui_records_conversion_error_and_emits_one_error_terminal() -> N
 
     terminals = [event for event in events if isinstance(event, RunErrorEvent)]
     assert len(terminals) == 1
-    assert isinstance(stream.error, ValidationError)
+    assert isinstance(stream.error, AgUiStreamContractError)
+    assert isinstance(stream.error.cause, ValidationError)
 
 
 @pytest.mark.asyncio
@@ -570,7 +572,8 @@ async def test_agui_conversion_error_survives_two_upstream_close_failures() -> N
     events = await _collect_events(stream)
 
     assert [event.type.value for event in events] == ["RUN_STARTED", "RUN_ERROR"]
-    assert isinstance(stream.error, ValidationError)
+    assert isinstance(stream.error, AgUiStreamContractError)
+    assert isinstance(stream.error.cause, ValidationError)
     assert any(
         "CancelledError: close awaitable cancelled itself" in note
         for note in stream.error.__notes__
@@ -595,9 +598,10 @@ async def test_agui_caller_cancellation_keeps_conversion_and_cleanup_evidence() 
         with pytest.raises(asyncio.CancelledError, match="caller stopped") as raised:
             await consumer
         notes = raised.value.__notes__
-        assert any("ValidationError" in note for note in notes)
+        assert any("AgUiStreamContractError" in note for note in notes)
         assert any("RuntimeError: native close failed" in note for note in notes)
-        assert isinstance(stream.error, ValidationError)
+        assert isinstance(stream.error, AgUiStreamContractError)
+        assert isinstance(stream.error.cause, ValidationError)
     finally:
         parts.release_close.set()
         await asyncio.gather(consumer, return_exceptions=True)

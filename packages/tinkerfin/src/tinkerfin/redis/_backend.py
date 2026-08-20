@@ -11,11 +11,52 @@ from redis.asyncio import Redis
 
 from tinkerfin_agui_adapter import Identity
 
-from ._lease_lock import RedisLeaseLock
+from ..errors import (
+    RedisLeaseError,
+    RedisLeaseTimeoutError,
+    RedisLeaseUnavailableError,
+    RunCoordinationError,
+    RunCoordinationOwnershipLostError,
+    RunCoordinationTimeoutError,
+    RunCoordinationUnavailableError,
+)
+from ._lease_lock import RedisLeaseLock, RedisLeaseLost
 
 _DEFAULT_KEY_PREFIX = "tinkerfin:run:v2:"
 _DEFAULT_LEASE_TTL_SECONDS = 30.0
 _DEFAULT_WAIT_POLL_SECONDS = 0.1
+
+
+def _coordination_error(
+    operation: str,
+    error: Exception,
+) -> RunCoordinationError:
+    diagnostic_context = {"implementation": "redis", "operation": operation}
+    if isinstance(error, RunCoordinationError):
+        return error
+    if isinstance(error, RedisLeaseLost):
+        return RunCoordinationOwnershipLostError(
+            "Run coordination ownership was lost",
+            diagnostic_context=diagnostic_context,
+            cause=error,
+        )
+    if isinstance(error, RedisLeaseTimeoutError | TimeoutError):
+        return RunCoordinationTimeoutError(
+            "Run coordination timed out",
+            diagnostic_context=diagnostic_context,
+            cause=error,
+        )
+    if isinstance(error, RedisLeaseUnavailableError):
+        return RunCoordinationUnavailableError(
+            "Run coordination is unavailable",
+            diagnostic_context=diagnostic_context,
+            cause=error,
+        )
+    return RunCoordinationError(
+        "Run coordination failed",
+        diagnostic_context=diagnostic_context,
+        cause=error,
+    )
 
 
 class RedisRunCoordinator:
@@ -92,7 +133,14 @@ class RedisRunCoordinator:
         )
 
     async def __aenter__(self) -> Self:
-        await self._lease_lock.__aenter__()
+        try:
+            await self._lease_lock.__aenter__()
+        except RedisLeaseError as error:
+            translated = _coordination_error("start", error)
+            raise translated from error
+        except Exception as error:
+            translated = _coordination_error("start", error)
+            raise translated from error
         return self
 
     async def __aexit__(
@@ -101,7 +149,14 @@ class RedisRunCoordinator:
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        await self._lease_lock.__aexit__(exc_type, exc_value, traceback)
+        try:
+            await self._lease_lock.__aexit__(exc_type, exc_value, traceback)
+        except Exception as error:
+            translated = _coordination_error("close", error)
+            if exc_value is not None:
+                exc_value.add_note(str(translated))
+                return
+            raise translated from error
 
     def __call__(
         self,
@@ -122,8 +177,32 @@ class RedisRunCoordinator:
                 "key_resolver must return a non-blank string without surrounding "
                 "whitespace"
             )
-        async with self._lease_lock.hold(resolved_key):
+        context = self._lease_lock.hold(resolved_key)
+        try:
+            await context.__aenter__()
+        except Exception as error:
+            translated = _coordination_error("enter", error)
+            raise translated from error
+
+        primary: BaseException | None = None
+        try:
             yield
+        except BaseException as error:
+            primary = error
+            raise
+        finally:
+            try:
+                await context.__aexit__(
+                    None if primary is None else type(primary),
+                    primary,
+                    None if primary is None else primary.__traceback__,
+                )
+            except Exception as error:
+                translated = _coordination_error("exit", error)
+                if primary is not None:
+                    primary.add_note(str(translated))
+                else:
+                    raise translated from error
 
 
 __all__ = ["RedisRunCoordinator"]
