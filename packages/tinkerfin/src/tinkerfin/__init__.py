@@ -1,5 +1,7 @@
 """Stateless Graph runtime with native, AG-UI, and SSE streams."""
 
+from tinkerfin_agui_adapter import Identity as Identity
+
 from .agui_resume import AgUiResumeBinding as AgUiResumeBinding
 from .coordination import InMemoryRunCoordinator as InMemoryRunCoordinator
 from .coordination import RunCoordinator as RunCoordinator
@@ -39,6 +41,7 @@ __all__ = [
     "DeepAgentRuntime",
     "EventObserver",
     "GraphRunStream",
+    "Identity",
     "InMemoryRunCoordinator",
     "NativeGraphRunStream",
     "NativeStreamPart",

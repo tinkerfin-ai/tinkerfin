@@ -17,11 +17,12 @@ from contextlib import AbstractAsyncContextManager
 from contextvars import ContextVar
 from typing import Generic, TypeAlias, TypeVar, cast, overload
 
-from ag_ui.core import BaseEvent, RunAgentInput, RunErrorEvent, RunStartedEvent
+from ag_ui.core import BaseEvent, RunErrorEvent, RunStartedEvent
 
 from tinkerfin_agui_adapter import (
     AgUiLifecycleEventFactory,
     DeepAgentAgUiAdapter,
+    Identity,
     micro_batch,
 )
 
@@ -43,7 +44,6 @@ from .sse import (
     encode_sse_payload,
 )
 
-PrincipalT = TypeVar("PrincipalT")
 PartT = TypeVar("PartT")
 
 PartObserver: TypeAlias = Callable[[PartT], Awaitable[None]]
@@ -115,10 +115,12 @@ class GraphRunStream(Generic[PartT]):
         source_factory: Callable[[], AsyncIterator[PartT]],
         coordination_factory: (Callable[[], AbstractAsyncContextManager[None]] | None),
         on_part: PartObserver[PartT] | None,
+        identity: Identity | None = None,
     ) -> None:
         self._source_factory = source_factory
         self._coordination_factory = coordination_factory
         self._on_part = on_part
+        self._identity = identity
         self._source: AsyncIterator[PartT] | None = None
         self._coordination: AbstractAsyncContextManager[None] | None = None
         self._started = False
@@ -343,6 +345,15 @@ class NativeGraphRunStream(GraphRunStream[Mapping[str, object]]):
     """Canonical LangGraph v2 stream with a complete durable codec profile."""
 
     @property
+    def messaging_identity(self) -> Identity:
+        """Return the immutable durable run identity."""
+
+        identity = self._identity
+        if identity is None:
+            raise RuntimeError("a native stream requires an Identity")
+        return identity
+
+    @property
     def messaging_codec_profile(self) -> str:
         """Return the canonical native persistence profile."""
 
@@ -383,6 +394,12 @@ class AgUiEventStream:
         return BaseEvent
 
     @property
+    def messaging_identity(self) -> Identity:
+        """Return the immutable durable run identity."""
+
+        return self._identity
+
+    @property
     def messaging_cancel_callback(
         self,
     ) -> Callable[[], Awaitable[list[BaseEvent]]]:
@@ -400,7 +417,7 @@ class AgUiEventStream:
         cls,
         error: Exception,
         *,
-        run_input: RunAgentInput,
+        identity: Identity,
     ) -> AgUiEventStream:
         """Create one standard lifecycle for an owner-only Runtime setup failure."""
 
@@ -414,7 +431,7 @@ class AgUiEventStream:
 
         stream = cls(
             parts=failed_parts(),
-            run_input=run_input,
+            identity=identity,
             expose_reasoning_events=False,
             expose_subagent_events=True,
             prior_tool_call_ids=frozenset(),
@@ -430,7 +447,7 @@ class AgUiEventStream:
         self,
         *,
         parts: AsyncIterable[object],
-        run_input: RunAgentInput,
+        identity: Identity,
         expose_reasoning_events: bool,
         expose_subagent_events: bool,
         prior_tool_call_ids: frozenset[str],
@@ -439,10 +456,8 @@ class AgUiEventStream:
         on_event: EventObserver | None,
     ) -> None:
         self._lifecycle = AgUiLifecycleEventFactory()
-        self._lifecycle.validate_run_input(run_input)
-        self._run_input = run_input.model_copy(deep=True)
-        self._thread_id = self._run_input.thread_id
-        self._run_id = self._run_input.run_id
+        self._lifecycle.validate_identity(identity)
+        self._identity = identity
         self._timeout = _validate_timeout(timeout)
         self._settlement_timeout = _validate_timeout(
             settlement_timeout,
@@ -452,7 +467,7 @@ class AgUiEventStream:
         self._upstream = aiter(parts)
         self._upstream_closed = False
         self._adapter = DeepAgentAgUiAdapter(
-            run_input.run_id,
+            identity=identity,
             expose_reasoning_events=expose_reasoning_events,
             expose_subagent_events=expose_subagent_events,
             prior_tool_call_ids=prior_tool_call_ids,
@@ -557,7 +572,7 @@ class AgUiEventStream:
             tail.append(
                 self._decorate_initialization_event(
                     self._lifecycle.failed(
-                        run_id=self._run_id,
+                        identity=self._identity,
                         message="Agent run cancelled",
                         code="cancelled",
                     )
@@ -781,7 +796,7 @@ class AgUiEventStream:
         try:
             self._main_started = True
             yield self._decorate_initialization_event(
-                self._lifecycle.started(run_input=self._run_input)
+                self._lifecycle.started(identity=self._identity)
             )
             while True:
                 try:
@@ -799,8 +814,7 @@ class AgUiEventStream:
             self._completed = True
             terminal = True
             yield self._lifecycle.finished(
-                thread_id=self._thread_id,
-                run_id=self._run_id,
+                identity=self._identity,
                 outcome=outcome,
             )
         except asyncio.CancelledError as error:
@@ -829,7 +843,7 @@ class AgUiEventStream:
                 self._completed = True
                 yield self._decorate_initialization_event(
                     self._lifecycle.failed(
-                        run_id=self._run_id,
+                        identity=self._identity,
                         message="Agent run failed",
                         code=error_code,
                     )
@@ -851,7 +865,10 @@ class AgUiEventStream:
         raw_event: dict[str, object] = (
             dict(event.raw_event)
             if isinstance(event.raw_event, dict)
-            else {"runId": self._run_id}
+            else {
+                "threadId": self._identity.thread_id,
+                "runId": self._identity.run_id,
+            }
         )
         raw_event["initializationFailed"] = True
         return event.model_copy(update={"raw_event": raw_event})
@@ -882,12 +899,12 @@ class AgUiEventStream:
             raise
 
 
-class TinkerFinRun(Generic[PartT, PrincipalT]):
-    """Single-use binding of one native source factory and optional principal."""
+class TinkerFinRun(Generic[PartT]):
+    """Single-use binding of one native source factory and optional Identity."""
 
     __slots__ = (
         "_on_part",
-        "_principal",
+        "_identity",
         "_run_coordinator",
         "_source_factory",
         "_stream_claimed",
@@ -897,13 +914,13 @@ class TinkerFinRun(Generic[PartT, PrincipalT]):
         self,
         *,
         source_factory: Callable[[], AsyncIterator[PartT]],
-        run_coordinator: RunCoordinator[PrincipalT] | None,
-        principal: PrincipalT | None,
+        run_coordinator: RunCoordinator | None,
+        identity: Identity | None,
         on_part: PartObserver[PartT] | None,
     ) -> None:
         self._source_factory = source_factory
         self._run_coordinator = run_coordinator
-        self._principal = principal
+        self._identity = identity
         self._on_part = on_part
         self._stream_claimed = False
 
@@ -915,6 +932,7 @@ class TinkerFinRun(Generic[PartT, PrincipalT]):
             source_factory=source_factory,
             coordination_factory=coordination_factory,
             on_part=on_part,
+            identity=self._identity,
         )
 
     def _claim_stream_inputs(
@@ -930,11 +948,11 @@ class TinkerFinRun(Generic[PartT, PrincipalT]):
             raise RuntimeError("a TinkerFin run can create only one object stream")
         self._stream_claimed = True
         coordinator = self._run_coordinator
-        principal = self._principal
+        identity = self._identity
         coordination_factory = (
             None
             if coordinator is None
-            else lambda: coordinator(cast(PrincipalT, principal))
+            else lambda: coordinator(cast(Identity, identity))
         )
         return (
             self._source_factory,
@@ -945,7 +963,6 @@ class TinkerFinRun(Generic[PartT, PrincipalT]):
     def astream_agui(
         self,
         *,
-        run_input: RunAgentInput,
         timeout: float | None = None,
         settlement_timeout: float | None = None,
         expose_reasoning_events: bool = False,
@@ -956,7 +973,6 @@ class TinkerFinRun(Generic[PartT, PrincipalT]):
         """Claim the native source and convert it to one AG-UI event stream.
 
         Args:
-            run_input: Complete AG-UI request supplied by the caller.
             timeout: Optional total native-part pull deadline in seconds.
             settlement_timeout: Optional per-caller close-settlement wait in seconds.
                 Expiry never cancels the retained close task.
@@ -973,12 +989,14 @@ class TinkerFinRun(Generic[PartT, PrincipalT]):
             ValueError: An identifier or timeout value is invalid.
         """
 
-        AgUiLifecycleEventFactory.validate_run_input(run_input)
+        identity = self._identity
+        if identity is None:
+            raise ValueError("AG-UI streaming requires an Identity")
         if on_event is not None and not callable(on_event):
             raise TypeError("on_event must be an async callable or None")
         return AgUiEventStream(
             parts=self.astream(),
-            run_input=run_input,
+            identity=identity,
             timeout=timeout,
             settlement_timeout=settlement_timeout,
             expose_reasoning_events=expose_reasoning_events,
@@ -989,8 +1007,7 @@ class TinkerFinRun(Generic[PartT, PrincipalT]):
 
 
 class NativeTinkerFinRun(
-    TinkerFinRun[Mapping[str, object], PrincipalT],
-    Generic[PrincipalT],
+    TinkerFinRun[Mapping[str, object]],
 ):
     """Single-use binding whose object stream is canonical LangGraph v2 data."""
 
@@ -1004,10 +1021,11 @@ class NativeTinkerFinRun(
             source_factory=source_factory,
             coordination_factory=coordination_factory,
             on_part=on_part,
+            identity=self._identity,
         )
 
 
-class TinkerFin(Generic[PrincipalT]):
+class TinkerFin:
     """Globally shareable stateless factory for single-use source bindings."""
 
     __slots__ = ("_run_coordinator",)
@@ -1017,7 +1035,7 @@ class TinkerFin(Generic[PrincipalT]):
     def __init__(
         self,
         *,
-        run_coordinator: RunCoordinator[PrincipalT] | None = None,
+        run_coordinator: RunCoordinator | None = None,
     ) -> None:
         if run_coordinator is not None and not callable(run_coordinator):
             raise TypeError("run_coordinator must be callable or None")
@@ -1028,18 +1046,18 @@ class TinkerFin(Generic[PrincipalT]):
         self,
         source_factory: AgUiNativeStreamInvocation,
         *,
-        principal: PrincipalT | None = None,
+        identity: Identity,
         on_part: PartObserver[Mapping[str, object]] | None = None,
-    ) -> NativeTinkerFinRun[PrincipalT]: ...
+    ) -> NativeTinkerFinRun: ...
 
     @overload
     def run(
         self,
         source_factory: Callable[[], AsyncIterator[PartT]],
         *,
-        principal: PrincipalT | None = None,
+        identity: Identity | None = None,
         on_part: PartObserver[PartT] | None = None,
-    ) -> TinkerFinRun[PartT, PrincipalT]: ...
+    ) -> TinkerFinRun[PartT]: ...
 
     def run(
         self,
@@ -1047,18 +1065,18 @@ class TinkerFin(Generic[PrincipalT]):
             AgUiNativeStreamInvocation | Callable[[], AsyncIterator[PartT]]
         ),
         *,
-        principal: PrincipalT | None = None,
+        identity: Identity | None = None,
         on_part: (
             PartObserver[Mapping[str, object]] | PartObserver[PartT] | None
         ) = None,
-    ) -> NativeTinkerFinRun[PrincipalT] | TinkerFinRun[PartT, PrincipalT]:
+    ) -> NativeTinkerFinRun | TinkerFinRun[PartT]:
         """Bind one lazy generic source or preflighted AG-UI native invocation.
 
         Args:
             source_factory: A zero-argument asynchronous source factory, or a native
                 invocation created by ``AgUiNativeStreamConfig.bind``.
-            principal: Optional application principal required by a configured run
-                coordinator and forbidden without one.
+            identity: Optional thread and run identity. Strict native invocations and
+                configured coordinators require it.
             on_part: Optional asynchronous observer awaited before native delivery or
                 AG-UI conversion.
 
@@ -1067,7 +1085,7 @@ class TinkerFin(Generic[PrincipalT]):
 
         Raises:
             TypeError: The source or observer is not callable.
-            ValueError: ``principal`` does not match coordinator configuration.
+            ValueError: ``identity`` is missing when required.
             AgUiNativeStreamConfigurationError: A strict invocation is invalid.
         """
 
@@ -1076,13 +1094,18 @@ class TinkerFin(Generic[PrincipalT]):
             source_factory._validate()
         if not callable(source_factory):
             raise TypeError("source_factory must be callable")
-        self._validate_run_binding(principal=principal, on_part=on_part)
+        self._validate_run_binding(identity=identity, on_part=on_part)
         coordinator = self._run_coordinator
         if strict_invocation:
+            if identity is None:
+                raise ValueError("a strict native invocation requires an Identity")
+            invocation = cast(
+                AgUiNativeStreamInvocation, source_factory
+            )._bind_identity(identity)
             return NativeTinkerFinRun(
-                source_factory=cast(AgUiNativeStreamInvocation, source_factory),
+                source_factory=invocation,
                 run_coordinator=coordinator,
-                principal=principal,
+                identity=identity,
                 on_part=cast(
                     PartObserver[Mapping[str, object]] | None,
                     on_part,
@@ -1091,25 +1114,42 @@ class TinkerFin(Generic[PrincipalT]):
         return TinkerFinRun(
             source_factory=source_factory,
             run_coordinator=coordinator,
-            principal=principal,
+            identity=identity,
             on_part=cast(PartObserver[PartT] | None, on_part),
         )
 
     def _validate_run_binding(
         self,
         *,
-        principal: PrincipalT | None,
+        identity: Identity | None,
         on_part: object | None,
     ) -> None:
         """校验一次请求绑定，不创建 Graph、source 或协调上下文"""
 
         coordinator = self._run_coordinator
-        if coordinator is None and principal is not None:
-            raise ValueError("principal requires a run_coordinator")
-        if coordinator is not None and principal is None:
-            raise ValueError("principal is required when run_coordinator is configured")
+        if identity is not None and not isinstance(identity, Identity):
+            raise TypeError("identity must be an Identity or None")
+        if coordinator is not None and identity is None:
+            raise ValueError("identity is required when run_coordinator is configured")
         if on_part is not None and not callable(on_part):
             raise TypeError("on_part must be an async callable or None")
+
+    def _run_native(
+        self,
+        source_factory: Callable[[], AsyncIterator[Mapping[str, object]]],
+        *,
+        identity: Identity,
+        on_part: PartObserver[object] | None,
+    ) -> NativeTinkerFinRun:
+        """Bind a validated canonical v2 source without changing public low-level API."""
+
+        self._validate_run_binding(identity=identity, on_part=on_part)
+        return NativeTinkerFinRun(
+            source_factory=source_factory,
+            run_coordinator=self._run_coordinator,
+            identity=identity,
+            on_part=cast(PartObserver[Mapping[str, object]] | None, on_part),
+        )
 
 
 __all__ = [

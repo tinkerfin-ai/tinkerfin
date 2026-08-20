@@ -6,10 +6,11 @@ from collections.abc import AsyncIterator
 from typing import cast
 
 import pytest
-from ag_ui.core import BaseEvent, RunAgentInput
+from ag_ui.core import BaseEvent
 from pydantic import ValidationError
 
 from tinkerfin import (
+    Identity,
     NativeStreamPart,
     SseBody,
     SseMapper,
@@ -18,18 +19,8 @@ from tinkerfin import (
 )
 
 
-def _run_input() -> RunAgentInput:
-    return RunAgentInput.model_validate(
-        {
-            "threadId": "thread-1",
-            "runId": "run-1",
-            "state": {},
-            "messages": [],
-            "tools": [],
-            "context": [],
-            "forwardedProps": {},
-        }
-    )
+def _identity() -> Identity:
+    return Identity(threadId="thread-1", runId="run-1")
 
 
 class _CountingParts:
@@ -91,9 +82,8 @@ async def test_prepare_does_not_observe_or_resolve_an_event_id() -> None:
 
     body = (
         TinkerFin()
-        .run(lambda: parts)
+        .run(lambda: parts, identity=_identity())
         .astream_agui(
-            run_input=_run_input(),
             on_event=on_event,
         )
         .to_sse(event_id_resolver=event_id_resolver)
@@ -243,10 +233,8 @@ async def test_agui_mapper_receives_validated_event_objects() -> None:
 
     body: SseBody[str] = (
         TinkerFin()
-        .run(source)
-        .astream_agui(
-            run_input=_run_input(),
-        )
+        .run(source, identity=_identity())
+        .astream_agui()
         .to_sse(mapper=mapper)
     )
 

@@ -10,6 +10,7 @@ from typing import ClassVar, cast
 import pytest
 
 import tinkerfin_messaging.sources as source_adapters
+from tinkerfin import Identity
 from tinkerfin_messaging import (
     BackendOwnershipLost,
     BackendRunHandle,
@@ -25,6 +26,10 @@ from tinkerfin_messaging import (
     RunNotFound,
     RunProducerFailed,
 )
+
+
+def _identity() -> Identity:
+    return Identity(threadId="conversation-1", runId="run-1")
 
 
 class _TextCodec:
@@ -258,13 +263,12 @@ async def test_channel_uses_deferred_source_owned_cancel_callback() -> None:
         channel = messaging.channel(name="events", codec=_TextCodec())
         subscription = await channel.wrap(
             deferred,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
         )
         await asyncio.wait_for(opened.started.wait(), timeout=1)
 
-        assert await channel.cancel(stream="conversation-1", run="run-1") is True
+        assert await channel.cancel(identity=_identity()) is True
         assert [message.data async for message in subscription] == [
             "started",
             "cancelled-tail",
@@ -307,14 +311,13 @@ async def test_channel_reuses_equivalent_source_owned_cancel_callback(
         channel = messaging.channel(name="events", codec=_TextCodec())
         subscription = await channel.wrap(
             source,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
             cancel=deferred.cancel,
         )
         await asyncio.wait_for(opened.started.wait(), timeout=1)
 
-        assert await channel.cancel(stream="conversation-1", run="run-1") is True
+        assert await channel.cancel(identity=_identity()) is True
         assert [message.data async for message in subscription] == expected
 
     assert opened.abort_calls == 1
@@ -343,8 +346,7 @@ async def test_source_owned_and_explicit_cancel_are_rejected_before_claim() -> N
         with pytest.raises(TypeError, match="source owns cancellation"):
             await channel.wrap(
                 deferred,
-                stream="conversation-1",
-                run="run-1",
+                identity=_identity(),
                 after=0,
                 cancel=lambda: (),
             )
@@ -352,8 +354,7 @@ async def test_source_owned_and_explicit_cancel_are_rejected_before_claim() -> N
         released.set()
         replacement = await channel.wrap(
             _CancellableSource(release=released, before=()),
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
         )
         assert [message.data async for message in replacement] == []
@@ -402,7 +403,7 @@ class _FinishOwnershipLostBackend(MemoryBackend):
         self.finish_started.set()
         await self.release_finish.wait()
         raise BackendOwnershipLost(
-            f"Producer for run {handle.run!r} lost ownership during finish"
+            f"Producer for run {handle.identity.run_id!r} lost ownership during finish"
         )
 
 
@@ -437,15 +438,14 @@ async def test_cancel_invokes_callback_once_and_commits_callback_output(
         channel = messaging.channel(name="events", codec=_TextCodec())
         subscription = await channel.wrap(
             source,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
             cancel=cancel_run,
         )
         await asyncio.wait_for(source.started.wait(), timeout=1)
 
         cancelled = await asyncio.wait_for(
-            channel.cancel(stream="conversation-1", run="run-1"),
+            channel.cancel(identity=_identity()),
             timeout=1,
         )
 
@@ -472,19 +472,16 @@ async def test_cancel_callback_receives_the_owned_run_context(
         channel = messaging.channel(name="events", codec=_TextCodec())
         subscription = await channel.wrap(
             source,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
             cancel=cancel_run,
         )
         await asyncio.wait_for(source.started.wait(), timeout=1)
 
-        assert await channel.cancel(stream="conversation-1", run="run-1") is True
+        assert await channel.cancel(identity=_identity()) is True
         assert await _data(subscription) == ["started", "context-cancelled-tail"]
 
-    assert received == [
-        CancelContext(channel="events", stream="conversation-1", run="run-1")
-    ]
+    assert received == [CancelContext(channel="events", identity=_identity())]
 
 
 async def test_cancel_callback_prefers_the_compatible_zero_argument_shape(
@@ -503,13 +500,12 @@ async def test_cancel_callback_prefers_the_compatible_zero_argument_shape(
         channel = messaging.channel(name="events", codec=_TextCodec())
         subscription = await channel.wrap(
             source,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
             cancel=cancel_run,
         )
 
-        assert await channel.cancel(stream="conversation-1", run="run-1") is True
+        assert await channel.cancel(identity=_identity()) is True
         assert await _data(subscription) == ["started", "ambiguous-cancelled-tail"]
 
     assert received == [None]
@@ -536,13 +532,12 @@ async def test_invalid_cancel_signature_is_rejected_before_claiming_the_run(
         ):
             await channel.wrap(
                 source,
-                stream="conversation-1",
-                run="run-1",
+                identity=_identity(),
                 after=0,
                 cancel=cast(CancelCallback[str], cancel_run),
             )
         with pytest.raises(RunNotFound):
-            await channel.cancel(stream="conversation-1", run="run-1")
+            await channel.cancel(identity=_identity())
 
     assert source.closed.is_set()
 
@@ -564,13 +559,12 @@ async def test_uninspectable_cancel_callback_is_rejected_before_claiming_the_run
         with pytest.raises(TypeError, match="must expose an inspectable signature"):
             await channel.wrap(
                 source,
-                stream="conversation-1",
-                run="run-1",
+                identity=_identity(),
                 after=0,
                 cancel=OpaqueCancel(),
             )
         with pytest.raises(RunNotFound):
-            await channel.cancel(stream="conversation-1", run="run-1")
+            await channel.cancel(identity=_identity())
 
     assert source.closed.is_set()
 
@@ -590,8 +584,7 @@ async def test_cancel_callback_type_error_is_not_retried_without_context(
         channel = messaging.channel(name="events", codec=_TextCodec())
         subscription = await channel.wrap(
             source,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
             cancel=cancel_run,
         )
@@ -599,7 +592,7 @@ async def test_cancel_callback_type_error_is_not_retried_without_context(
         assert (await anext(delivery)).data == "started"
 
         with pytest.raises(RunProducerFailed) as captured:
-            await channel.cancel(stream="conversation-1", run="run-1")
+            await channel.cancel(identity=_identity())
         with pytest.raises(RunProducerFailed):
             await anext(delivery)
 
@@ -622,14 +615,13 @@ async def test_sync_cancel_callback_can_return_tail_messages(
         channel = messaging.channel(name="events", codec=_TextCodec())
         subscription = await channel.wrap(
             source,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
             cancel=cancel_run,
         )
         await asyncio.wait_for(source.started.wait(), timeout=1)
 
-        assert await channel.cancel(stream="conversation-1", run="run-1") is True
+        assert await channel.cancel(identity=_identity()) is True
         assert await _data(subscription) == ["started", "sync-cancelled-tail"]
 
 
@@ -651,15 +643,14 @@ async def test_concurrent_cancel_callers_share_one_callback_and_settlement(
         channel = messaging.channel(name="events", codec=_TextCodec())
         subscription = await channel.wrap(
             source,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
             cancel=cancel_run,
         )
         results = await asyncio.wait_for(
             asyncio.gather(
-                channel.cancel(stream="conversation-1", run="run-1"),
-                channel.cancel(stream="conversation-1", run="run-1"),
+                channel.cancel(identity=_identity()),
+                channel.cancel(identity=_identity()),
             ),
             timeout=1,
         )
@@ -679,16 +670,13 @@ async def test_cancel_commits_an_in_flight_message_before_callback_tail() -> Non
             channel = messaging.channel(name="events", codec=_TextCodec())
             subscription = await channel.wrap(
                 source,
-                stream="conversation-1",
-                run="run-1",
+                identity=_identity(),
                 after=0,
                 cancel=source.abort,
             )
             await asyncio.wait_for(backend.append_started.wait(), timeout=1)
 
-            cancelling = asyncio.create_task(
-                channel.cancel(stream="conversation-1", run="run-1")
-            )
+            cancelling = asyncio.create_task(channel.cancel(identity=_identity()))
             await asyncio.wait_for(source.aborted.wait(), timeout=1)
             await asyncio.sleep(0)
             assert not cancelling.done()
@@ -715,14 +703,13 @@ async def test_cancel_without_callback_is_rejected_without_stopping_source(
         channel = messaging.channel(name="events", codec=_TextCodec())
         subscription = await channel.wrap(
             source,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
         )
         await asyncio.wait_for(source.started.wait(), timeout=1)
 
         with pytest.raises(CancellationUnsupported):
-            await channel.cancel(stream="conversation-1", run="run-1")
+            await channel.cancel(identity=_identity())
         assert not source.closed.is_set()
 
         release.set()
@@ -743,14 +730,13 @@ async def test_cancel_after_natural_completion_returns_false(
         channel = messaging.channel(name="events", codec=_TextCodec())
         subscription = await channel.wrap(
             source,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
             cancel=cancel_run,
         )
         assert await _data(subscription) == ["started"]
 
-        assert await channel.cancel(stream="conversation-1", run="run-1") is False
+        assert await channel.cancel(identity=_identity()) is False
 
 
 async def test_backend_rejects_a_second_cancel_settlement_claim(
@@ -758,10 +744,8 @@ async def test_backend_rejects_a_second_cancel_settlement_claim(
 ) -> None:
     prepared = await messaging_backend.prepare(
         channel="events",
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         codec="test.text.v1",
-        identity="identity-1",
         after=0,
         cancellable=True,
         recoverable=False,
@@ -794,14 +778,13 @@ async def test_cancel_callback_failure_becomes_the_run_failure(
         channel = messaging.channel(name="events", codec=_TextCodec())
         subscription = await channel.wrap(
             source,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
             cancel=cancel_run,
         )
 
         with pytest.raises(RunProducerFailed) as captured:
-            await channel.cancel(stream="conversation-1", run="run-1")
+            await channel.cancel(identity=_identity())
 
         delivery = aiter(subscription)
         assert (await anext(delivery)).data == "started"
@@ -824,8 +807,7 @@ async def test_cancel_tail_codec_failure_preserves_the_committed_prefix(
         channel = messaging.channel(name="events", codec=_TextCodec())
         subscription = await channel.wrap(
             source,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
             cancel=source.abort,
         )
@@ -833,7 +815,7 @@ async def test_cancel_tail_codec_failure_preserves_the_committed_prefix(
         assert (await anext(delivery)).data == "committed"
 
         with pytest.raises(RunProducerFailed) as captured:
-            await channel.cancel(stream="conversation-1", run="run-1")
+            await channel.cancel(identity=_identity())
         with pytest.raises(RunProducerFailed):
             await anext(delivery)
 
@@ -852,8 +834,7 @@ async def test_cancel_tail_append_failure_preserves_the_committed_prefix() -> No
         channel = messaging.channel(name="events", codec=_TextCodec())
         subscription = await channel.wrap(
             source,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
             cancel=source.abort,
         )
@@ -861,7 +842,7 @@ async def test_cancel_tail_append_failure_preserves_the_committed_prefix() -> No
         assert (await anext(delivery)).data == "committed"
 
         with pytest.raises(RunProducerFailed) as captured:
-            await channel.cancel(stream="conversation-1", run="run-1")
+            await channel.cancel(identity=_identity())
         with pytest.raises(RunProducerFailed):
             await anext(delivery)
 
@@ -878,8 +859,7 @@ async def test_cancel_callback_can_join_the_source_consumer_without_deadlock(
         channel = messaging.channel(name="events", codec=_TextCodec())
         subscription = await channel.wrap(
             source,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
             cancel=source.aclose,
         )
@@ -887,9 +867,7 @@ async def test_cancel_callback_can_join_the_source_consumer_without_deadlock(
         assert (await anext(delivery)).data == "started"
         await asyncio.wait_for(source.started.wait(), timeout=1)
 
-        cancelling = asyncio.create_task(
-            channel.cancel(stream="conversation-1", run="run-1")
-        )
+        cancelling = asyncio.create_task(channel.cancel(identity=_identity()))
         done, _ = await asyncio.wait({cancelling}, timeout=0.2)
         completed_without_cycle = cancelling in done
         if not completed_without_cycle:
@@ -914,8 +892,7 @@ async def test_codec_failure_preserves_the_committed_prefix(
         channel = messaging.channel(name="events", codec=_TextCodec())
         subscription = await channel.wrap(
             source,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
         )
         delivery = aiter(subscription)
@@ -943,8 +920,7 @@ async def test_commit_failure_remains_primary_when_finish_loses_ownership(
     try:
         await messaging.channel(name="events", codec=_TextCodec()).wrap(
             source,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
         )
         await asyncio.wait_for(backend.append_started.wait(), timeout=1)
@@ -969,8 +945,8 @@ async def test_commit_failure_remains_primary_when_finish_loses_ownership(
         assert len(records) == 1
         record_fields = vars(records[0])
         assert record_fields["channel"] == "events"
-        assert record_fields["stream"] == "conversation-1"
-        assert record_fields["run"] == "run-1"
+        assert record_fields["thread_id"] == "conversation-1"
+        assert record_fields["run_id"] == "run-1"
         assert record_fields["primary_stage"] == "commit"
         assert record_fields["ownership_lost"] is True
     finally:
@@ -989,8 +965,7 @@ async def test_finish_ownership_loss_is_primary_without_an_earlier_failure() -> 
     try:
         await messaging.channel(name="events", codec=_TextCodec()).wrap(
             source,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
         )
         await asyncio.wait_for(backend.finish_started.wait(), timeout=1)
@@ -1017,8 +992,7 @@ async def test_source_failure_retains_later_source_close_failure() -> None:
             codec=_TextCodec(),
         ).wrap(
             source,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
         )
         with pytest.raises(RunProducerFailed) as captured:
@@ -1049,15 +1023,14 @@ async def test_callback_failure_retains_later_source_close_failure(
             channel = messaging.channel(name="events", codec=_TextCodec())
             subscription = await channel.wrap(
                 source,
-                stream="conversation-1",
-                run="run-1",
+                identity=_identity(),
                 after=0,
                 cancel=cancel,
             )
             delivery = aiter(subscription)
             assert (await anext(delivery)).data == "started"
             with pytest.raises(RunProducerFailed) as captured:
-                await channel.cancel(stream="conversation-1", run="run-1")
+                await channel.cancel(identity=_identity())
 
     cause = captured.value.cause
     assert cause is callback_error

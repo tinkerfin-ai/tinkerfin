@@ -9,9 +9,10 @@ from contextlib import aclosing
 from functools import wraps
 from typing import cast
 
-from ag_ui.core import BaseEvent, RunAgentInput
+from ag_ui.core import BaseEvent
 
 from .adapter import DeepAgentAgUiAdapter
+from .contracts import Identity
 from .lifecycle import AgUiLifecycleEventFactory
 from .microbatch import micro_batch
 
@@ -39,7 +40,7 @@ async def _close_upstream(
 async def _astream_events(
     parts: AsyncIterable[object],
     *,
-    run_input: RunAgentInput,
+    identity: Identity,
     expose_reasoning_events: bool = False,
     expose_subagent_events: bool = True,
     prior_tool_call_ids: frozenset[str] = frozenset(),
@@ -70,7 +71,7 @@ async def _astream_events(
             `debug`, and `custom` v2 parts produced under the Deep Agents profile,
             with subgraph provenance supplied by native task starts rather than
             arbitrary LangGraph namespace inference.
-        run_input: Complete AG-UI request supplied by the transport host.
+        identity: Canonical thread and run identity for lifecycle events.
         expose_reasoning_events: Emit supported reasoning events when true.
         expose_subagent_events: Emit events derived from non-root namespaces when true.
         prior_tool_call_ids: Native Tool call IDs already emitted before resume.
@@ -80,13 +81,13 @@ async def _astream_events(
     """
 
     lifecycle = AgUiLifecycleEventFactory()
-    lifecycle.validate_run_input(run_input)
+    lifecycle.validate_identity(identity)
     if not isinstance(expose_reasoning_events, bool):
         raise TypeError("expose_reasoning_events must be a bool")
     if not isinstance(expose_subagent_events, bool):
         raise TypeError("expose_subagent_events must be a bool")
     adapter = DeepAgentAgUiAdapter(
-        run_input.run_id,
+        identity=identity,
         expose_reasoning_events=expose_reasoning_events,
         expose_subagent_events=expose_subagent_events,
         prior_tool_call_ids=prior_tool_call_ids,
@@ -117,7 +118,7 @@ async def _astream_events(
 
         try:
             started = True
-            yield lifecycle.started(run_input=run_input)
+            yield lifecycle.started(identity=identity)
             async for part in upstream:
                 for event in adapter.process(part):
                     yield event
@@ -126,8 +127,7 @@ async def _astream_events(
                 yield event
             terminal = True
             yield lifecycle.finished(
-                thread_id=run_input.thread_id,
-                run_id=run_input.run_id,
+                identity=identity,
                 outcome=adapter.main_outcome(),
             )
         except asyncio.CancelledError as error:
@@ -154,7 +154,7 @@ async def _astream_events(
             if started and not terminal:
                 terminal = True
                 yield lifecycle.failed(
-                    run_id=run_input.run_id,
+                    identity=identity,
                     message="Agent run failed",
                     code="runtime_error",
                 )
@@ -174,17 +174,17 @@ async def _astream_events(
 def astream_events(
     parts: AsyncIterable[object],
     *,
-    run_input: RunAgentInput,
+    identity: Identity,
     expose_reasoning_events: bool = False,
     expose_subagent_events: bool = True,
     prior_tool_call_ids: frozenset[str] = frozenset(),
 ) -> AsyncIterator[BaseEvent]:
-    """Snapshot caller input before returning the single-use conversion stream."""
+    """Bind one canonical identity before returning the conversion stream."""
 
-    AgUiLifecycleEventFactory.validate_run_input(run_input)
+    AgUiLifecycleEventFactory.validate_identity(identity)
     return _astream_events(
         parts,
-        run_input=run_input.model_copy(deep=True),
+        identity=identity,
         expose_reasoning_events=expose_reasoning_events,
         expose_subagent_events=expose_subagent_events,
         prior_tool_call_ids=prior_tool_call_ids,

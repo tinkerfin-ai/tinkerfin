@@ -1,5 +1,6 @@
 """会话事务与历史查询数据访问"""
 
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import cast
 
@@ -64,7 +65,7 @@ class ConversationRepository:
         thread_id: int,
         run_id: str,
         model_id: str,
-        input_json: dict[str, object],
+        input_json: Mapping[str, object],
         config_json: dict[str, object],
         parent_run_id: str | None = None,
     ) -> ConversationRun:
@@ -81,7 +82,7 @@ class ConversationRepository:
             graph_task_id=None,
             model_id=model_id,
             status="running",
-            input_json=input_json,
+            input_json=dict(input_json),
             config_json=config_json,
             outcome_json=None,
             started_at=now,

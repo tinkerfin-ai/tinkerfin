@@ -1,25 +1,24 @@
-"""Per-principal coordination for Graph runs."""
+"""Per-identity coordination for Graph runs."""
 
 from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
-from typing import Generic, Protocol, TypeVar, runtime_checkable
+from typing import Protocol, runtime_checkable
+
+from tinkerfin_agui_adapter import Identity
 
 from ._tasks import join_task
 
-PrincipalT = TypeVar("PrincipalT")
-PrincipalT_contra = TypeVar("PrincipalT_contra", contravariant=True)
-
 
 @runtime_checkable
-class RunCoordinator(Protocol[PrincipalT_contra]):
-    """Provide one asynchronous exclusive scope for a caller-defined principal."""
+class RunCoordinator(Protocol):
+    """Provide one asynchronous exclusive scope for a run Identity."""
 
     def __call__(
         self,
-        principal: PrincipalT_contra,
+        identity: Identity,
         /,
     ) -> AbstractAsyncContextManager[None]: ...
 
@@ -32,17 +31,17 @@ class _LockEntry:
         self.users = 0
 
 
-class InMemoryRunCoordinator(Generic[PrincipalT]):
+class InMemoryRunCoordinator:
     """Serialize Graph runs that resolve to the same process-local key.
 
     The coordinator borrows no resources and is intended for one event loop. Use the
     Redis implementation when workers or processes must share the same run boundary.
 
     Args:
-        key_resolver: Convert an opaque principal into a stable, non-blank key.
+        key_resolver: Convert a run Identity into a stable, non-blank key.
     """
 
-    def __init__(self, *, key_resolver: Callable[[PrincipalT], str]) -> None:
+    def __init__(self, *, key_resolver: Callable[[Identity], str]) -> None:
         if not callable(key_resolver):
             raise TypeError("key_resolver must be callable")
         self._key_resolver = key_resolver
@@ -52,14 +51,16 @@ class InMemoryRunCoordinator(Generic[PrincipalT]):
 
     def __call__(
         self,
-        principal: PrincipalT,
+        identity: Identity,
         /,
     ) -> AbstractAsyncContextManager[None]:
-        return self._coordinate(principal)
+        return self._coordinate(identity)
 
     @asynccontextmanager
-    async def _coordinate(self, principal: PrincipalT) -> AsyncIterator[None]:
-        key = self._key_resolver(principal)
+    async def _coordinate(self, identity: Identity) -> AsyncIterator[None]:
+        if not isinstance(identity, Identity):
+            raise TypeError("identity must be an Identity")
+        key = self._key_resolver(identity)
         if not isinstance(key, str):
             raise TypeError("key_resolver must return a string")
         if not key or key != key.strip():

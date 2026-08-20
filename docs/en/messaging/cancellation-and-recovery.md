@@ -16,8 +16,7 @@ async def cancel_agent(context):
 
 body = await channel.sse(
     source,
-    stream="thread-42",
-    run="run-7",
+    identity=identity,
     cancel=cancel_agent,
 )
 ```
@@ -25,10 +24,7 @@ body = await channel.sse(
 Cancel from another request:
 
 ```python
-cancelled = await channel.cancel(
-    stream="thread-42",
-    run="run-7",
-)
+cancelled = await channel.cancel(identity=identity)
 ```
 
 The callback may take no arguments or one `CancelContext`. It may return a finite terminal tail for subscribers.
@@ -51,6 +47,7 @@ Use `DeferredMessageSource` when Graph, model, or Sandbox setup is expensive:
 from tinkerfin_messaging import (
     DeferredMessageSource,
     MessageSourceBinding,
+    ProfiledDeferredMessageSource,
 )
 
 
@@ -76,6 +73,33 @@ source = DeferredMessageSource(
 Attachments and replay-only requests close the deferred wrapper without opening the real source. `cancel_after_first_item=True` is useful for protocols that must emit `RUN_STARTED` first.
 
 `MessageSourceBinding` holds the source and an optional cancel callback. Leave the callback empty when the source already declares its own.
+
+Use `ProfiledDeferredMessageSource` when the opener returns a known AG-UI or Native source and a name-only channel must know the codec and Identity before opening it:
+
+```python
+from ag_ui.core import BaseEvent
+
+
+source = ProfiledDeferredMessageSource(
+    open_events,
+    identity=identity,
+    codec_profile="agui.event.v1",
+    source_type=BaseEvent,
+    replay_type=BaseEvent,
+    cancellable=True,
+    cancel_after_first_item=True,
+)
+```
+
+| Parameter | Default | Purpose |
+| --- | --- | --- |
+| `opener` | required | Asynchronously returns `MessageSourceBinding` |
+| `identity` | required | Complete run identity available before open |
+| `codec_profile` | required | Stable profile ID matching a built-in codec |
+| `source_type` | required | Live value type returned by the opener |
+| `replay_type` | required | Value type decoded by the codec |
+| `cancellable` | required | Whether the source supports remote cancellation |
+| `cancel_after_first_item` | `False` | Prevent cancellation from overtaking the first protocol event |
 
 ## Fixed and transformed sources
 
@@ -104,11 +128,18 @@ Implement `RecoverableSource` and use `wrap_recoverable()` when a source can res
 ```python
 subscription = await channel.wrap_recoverable(
     recoverable_source,
-    stream="thread-42",
-    run="run-7",
+    identity=identity,
     after=0,
 )
 ```
+
+| Parameter | Default | Purpose |
+| --- | --- | --- |
+| `source` | required | Recoverable source implementing `open(checkpoint)` |
+| `identity` | optional for a profiled source | Custom-source identity or equality check for the advertised Identity |
+| `after` | `None` | Exclusive replay cursor; `None` starts at the tail captured during prepare |
+| `cancel` | `None` | Stops the source after accepted remote cancellation and may return a finite stable-ID tail |
+| `on_committed` | `None` | Async observer after each successful owner commit |
 
 Each item opened by the source is a `RecoverableMessage`:
 

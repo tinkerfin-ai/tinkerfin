@@ -9,6 +9,7 @@ from typing import ClassVar, Literal, cast
 import pytest
 
 import tinkerfin_messaging
+from tinkerfin import Identity
 from tinkerfin_messaging import (
     BackendOwnershipLost,
     BackendRunHandle,
@@ -24,6 +25,10 @@ from tinkerfin_messaging import (
     RecoveryCheckpoint,
     RunProducerFailed,
 )
+
+
+def _identity(*, run_id: str = "run-1") -> Identity:
+    return Identity(threadId="conversation-1", runId=run_id)
 
 
 class _TextCodec:
@@ -131,10 +136,8 @@ class _BlockingPrepareBackend(MemoryBackend):
         self,
         *,
         channel: str,
-        stream: str,
-        run: str,
+        identity: Identity,
         codec: str,
-        identity: str,
         after: int | None,
         cancellable: bool,
         recoverable: bool,
@@ -143,10 +146,8 @@ class _BlockingPrepareBackend(MemoryBackend):
         await self.release.wait()
         return await super().prepare(
             channel=channel,
-            stream=stream,
-            run=run,
-            codec=codec,
             identity=identity,
+            codec=codec,
             after=after,
             cancellable=cancellable,
             recoverable=recoverable,
@@ -221,7 +222,7 @@ class _FinishFailureBackend(MemoryBackend):
         self.finish_started.set()
         await self.release_finish.wait()
         raise BackendOwnershipLost(
-            f"Producer for run {handle.run!r} lost ownership during finish"
+            f"Producer for run {handle.identity.run_id!r} lost ownership during finish"
         )
 
 
@@ -367,8 +368,7 @@ async def test_backend_subscription_closes_after_normal_completion() -> None:
         channel = messaging.channel(name="events", codec=_TextCodec())
         subscription = await channel.wrap(
             source,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
         )
         assert await _data(subscription) == ["one", "two"]
@@ -385,8 +385,7 @@ async def test_backend_subscription_closes_on_early_detach() -> None:
         channel = messaging.channel(name="events", codec=_TextCodec())
         subscription = await channel.wrap(
             source,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
         )
         delivery = aiter(subscription)
@@ -407,8 +406,7 @@ async def test_never_iterated_subscription_closes_without_claiming_delivery() ->
         channel = messaging.channel(name="events", codec=_TextCodec())
         subscription = await channel.wrap(
             source,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
         )
 
@@ -427,8 +425,7 @@ async def test_backend_subscription_closes_on_producer_failure() -> None:
         channel = messaging.channel(name="events", codec=_TextCodec())
         subscription = await channel.wrap(
             source,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
         )
         delivery = aiter(subscription)
@@ -448,8 +445,7 @@ async def test_wrap_cancellation_closes_an_unclaimed_source() -> None:
         wrapping = asyncio.create_task(
             channel.wrap(
                 source,
-                stream="conversation-1",
-                run="run-1",
+                identity=_identity(),
                 after=0,
             )
         )
@@ -472,8 +468,7 @@ async def test_shutdown_waits_for_inflight_prepare_and_rejects_late_producer() -
     wrapping = asyncio.create_task(
         channel.wrap(
             source,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
         )
     )
@@ -505,8 +500,7 @@ async def test_shutdown_waits_for_recoverable_open_and_rejects_late_producer() -
     wrapping = asyncio.create_task(
         channel.wrap_recoverable(
             factory,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
         )
     )
@@ -540,8 +534,7 @@ async def test_recoverable_preflight_settles_owner_when_source_close_fails() -> 
     wrapping = asyncio.create_task(
         channel.wrap_recoverable(
             factory,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
         )
     )
@@ -562,8 +555,7 @@ async def test_recoverable_preflight_settles_owner_when_source_close_fails() -> 
             codec=_TextCodec(),
         ).wrap(
             _Source("next-run"),
-            stream="conversation-1",
-            run="run-2",
+            identity=_identity(run_id="run-2"),
             after=None,
         )
         assert await _data(resumed) == ["next-run"]
@@ -580,8 +572,7 @@ async def test_cancelled_recoverable_open_closes_a_late_returned_source() -> Non
         wrapping = asyncio.create_task(
             channel.wrap_recoverable(
                 factory,
-                stream="conversation-1",
-                run="run-1",
+                identity=_identity(),
                 after=0,
             )
         )
@@ -608,8 +599,7 @@ async def test_messaging_shutdown_closes_active_source_and_owned_tasks(
     channel = messaging.channel(name="events", codec=_TextCodec())
     await channel.wrap(
         source,
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         after=0,
         cancel=cancel,
     )
@@ -634,8 +624,7 @@ async def test_immediate_shutdown_after_wrap_closes_source_and_settles_run() -> 
     channel = messaging.channel(name="events", codec=_TextCodec())
     await channel.wrap(
         source,
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         after=0,
     )
 
@@ -646,8 +635,7 @@ async def test_immediate_shutdown_after_wrap_closes_source_and_settles_run() -> 
         backend.wait_finished(
             BackendRunHandle(
                 channel="events",
-                stream="conversation-1",
-                run="run-1",
+                identity=_identity(),
                 owner_token=None,
                 fence=None,
             )
@@ -676,16 +664,13 @@ async def test_shutdown_waits_for_an_accepted_cancel_callback_tail(
     channel = messaging.channel(name="events", codec=_TextCodec())
     subscription = await channel.wrap(
         source,
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         after=0,
         cancel=cancel,
     )
     delivery = aiter(subscription)
     first = await anext(delivery)
-    cancelling = asyncio.create_task(
-        channel.cancel(stream="conversation-1", run="run-1")
-    )
+    cancelling = asyncio.create_task(channel.cancel(identity=_identity()))
     await asyncio.wait_for(callback_started.wait(), timeout=1)
 
     closing = asyncio.create_task(messaging.__aexit__(None, None, None))
@@ -719,16 +704,13 @@ async def test_shutdown_honors_durable_cancel_before_watcher_returns() -> None:
     channel = messaging.channel(name="events", codec=_TextCodec())
     subscription = await channel.wrap(
         source,
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         after=0,
         cancel=cancel,
     )
     delivery = aiter(subscription)
     first = await anext(delivery)
-    cancelling = asyncio.create_task(
-        channel.cancel(stream="conversation-1", run="run-1")
-    )
+    cancelling = asyncio.create_task(channel.cancel(identity=_identity()))
     await asyncio.wait_for(backend.cancel_is_durable.wait(), timeout=1)
 
     closing = asyncio.create_task(messaging.__aexit__(None, None, None))
@@ -736,8 +718,7 @@ async def test_shutdown_honors_durable_cancel_before_watcher_returns() -> None:
         backend.wait_finished(
             BackendRunHandle(
                 channel="events",
-                stream="conversation-1",
-                run="run-1",
+                identity=_identity(),
                 owner_token=None,
                 fence=None,
             )
@@ -772,16 +753,13 @@ async def test_cancel_callback_starts_only_after_settlement_is_claimed() -> None
         channel = messaging.channel(name="events", codec=_TextCodec())
         subscription = await channel.wrap(
             source,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
             cancel=cancel,
         )
         delivery = aiter(subscription)
         first = await anext(delivery)
-        cancelling = asyncio.create_task(
-            channel.cancel(stream="conversation-1", run="run-1")
-        )
+        cancelling = asyncio.create_task(channel.cancel(identity=_identity()))
         await asyncio.wait_for(backend.settlement_entered.wait(), timeout=1)
         calls_before_claim = callback_calls
         backend.release_settlement.set()
@@ -811,16 +789,13 @@ async def test_cancelled_shutdown_finishes_a_claimed_settlement() -> None:
     channel = messaging.channel(name="events", codec=_TextCodec())
     subscription = await channel.wrap(
         source,
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         after=0,
         cancel=cancel,
     )
     delivery = aiter(subscription)
     first = await anext(delivery)
-    cancelling = asyncio.create_task(
-        channel.cancel(stream="conversation-1", run="run-1")
-    )
+    cancelling = asyncio.create_task(channel.cancel(identity=_identity()))
     await asyncio.wait_for(backend.cancel_is_durable.wait(), timeout=1)
 
     closing = asyncio.create_task(messaging.__aexit__(None, None, None))
@@ -858,8 +833,7 @@ async def test_messaging_shutdown_cancels_an_inflight_backend_append() -> None:
     channel = messaging.channel(name="events", codec=_TextCodec())
     await channel.wrap(
         source,
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         after=0,
     )
     await asyncio.wait_for(backend.append_started.wait(), timeout=1)
@@ -890,16 +864,13 @@ async def test_messaging_shutdown_waits_for_cancel_tail_settlement() -> None:
     channel = messaging.channel(name="events", codec=_TextCodec())
     subscription = await channel.wrap(
         source,
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         after=0,
         cancel=cancel,
     )
     delivery = aiter(subscription)
     assert (await anext(delivery)).data == "one"
-    cancelling = asyncio.create_task(
-        channel.cancel(stream="conversation-1", run="run-1")
-    )
+    cancelling = asyncio.create_task(channel.cancel(identity=_identity()))
     await asyncio.wait_for(backend.append_started.wait(), timeout=1)
 
     closing = asyncio.create_task(messaging.__aexit__(None, None, None))
@@ -964,16 +935,13 @@ async def test_finite_close_budget_keeps_cancel_tail_settlement_owned() -> None:
     channel = messaging.channel(name="events", codec=_TextCodec())
     subscription = await channel.wrap(
         source,
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         after=0,
         cancel=cancel,
     )
     delivery = aiter(subscription)
     first = await anext(delivery)
-    cancelling = asyncio.create_task(
-        channel.cancel(stream="conversation-1", run="run-1")
-    )
+    cancelling = asyncio.create_task(channel.cancel(identity=_identity()))
     await asyncio.wait_for(backend.append_started.wait(), timeout=1)
     timeout_type = getattr(
         tinkerfin_messaging,
@@ -1020,16 +988,13 @@ async def test_default_close_budget_waits_for_complete_settlement() -> None:
     channel = messaging.channel(name="events", codec=_TextCodec())
     subscription = await channel.wrap(
         source,
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         after=0,
         cancel=cancel,
     )
     delivery = aiter(subscription)
     first = await anext(delivery)
-    cancelling = asyncio.create_task(
-        channel.cancel(stream="conversation-1", run="run-1")
-    )
+    cancelling = asyncio.create_task(channel.cancel(identity=_identity()))
     await asyncio.wait_for(backend.append_started.wait(), timeout=1)
     closing = asyncio.create_task(messaging.aclose())
 
@@ -1058,8 +1023,7 @@ async def test_close_only_failure_propagates_and_is_idempotent() -> None:
     await messaging.__aenter__()
     await messaging.channel(name="events", codec=_TextCodec()).wrap(
         source,
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         after=0,
     )
     await asyncio.wait_for(source.started.wait(), timeout=1)
@@ -1098,8 +1062,7 @@ async def test_context_body_failure_outranks_close_failure(
         async with Messaging(backend=backend) as messaging:
             await messaging.channel(name="events", codec=_TextCodec()).wrap(
                 source,
-                stream="conversation-1",
-                run="run-1",
+                identity=_identity(),
                 after=0,
             )
             await asyncio.wait_for(source.started.wait(), timeout=1)
@@ -1119,8 +1082,7 @@ async def test_caller_cancellation_outranks_late_close_failure() -> None:
     await messaging.__aenter__()
     await messaging.channel(name="events", codec=_TextCodec()).wrap(
         source,
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         after=0,
     )
     await asyncio.wait_for(source.started.wait(), timeout=1)

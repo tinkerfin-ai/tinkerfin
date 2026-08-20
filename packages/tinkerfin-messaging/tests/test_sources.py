@@ -15,6 +15,7 @@ from typing import assert_type, cast
 import pytest
 
 import tinkerfin_messaging.sources as source_adapters
+from tinkerfin import Identity
 from tinkerfin_messaging import (
     CancelCallback,
     CancelContext,
@@ -22,6 +23,10 @@ from tinkerfin_messaging import (
 )
 from tinkerfin_messaging.protocols import MessageSource
 from tinkerfin_messaging.sources import FiniteMessageSource, map_source
+
+
+def _identity() -> Identity:
+    return Identity(threadId="thread-1", runId="run-1")
 
 
 class _TrackedSource:
@@ -146,7 +151,7 @@ async def test_deferred_source_cancel_waits_for_the_shared_open() -> None:
     )
     pulling = asyncio.create_task(anext(aiter(source)))
     await asyncio.wait_for(opening.wait(), timeout=1)
-    context = CancelContext(channel="events", stream="thread-1", run="run-1")
+    context = CancelContext(channel="events", identity=_identity())
     cancelling = asyncio.create_task(source.cancel(context))
     await asyncio.sleep(0)
     assert not cancelling.done()
@@ -236,7 +241,7 @@ async def test_deferred_source_keeps_cancel_binding_until_owner_close() -> None:
     """Natural exhaustion must not outrun an already accepted cancellation callback."""
 
     opened = _TrackedSource()
-    context = CancelContext(channel="events", stream="thread-1", run="run-1")
+    context = CancelContext(channel="events", identity=_identity())
 
     async def cancel(received: CancelContext) -> tuple[int, ...]:
         assert received == context
@@ -274,7 +279,7 @@ async def test_deferred_source_derives_cancel_from_opened_source() -> None:
         open_source,
         cancellable=True,
     )
-    context = CancelContext(channel="events", stream="thread-1", run="run-1")
+    context = CancelContext(channel="events", identity=_identity())
 
     assert await anext(aiter(source)) == 1
     assert await source.cancel(context) == (9,)
@@ -305,7 +310,7 @@ async def test_deferred_source_explicit_cancel_precedes_source_callback() -> Non
     )
 
     assert await source.cancel(
-        CancelContext(channel="events", stream="thread-1", run="run-1")
+        CancelContext(channel="events", identity=_identity())
     ) == (7,)
     assert explicit_calls == 1
     assert opened.cancel_calls == 0
@@ -476,9 +481,7 @@ async def test_map_source_transforms_normal_events_and_cancel_tail_identically()
         cast(CancellableMessageSource[str], mapped).messaging_cancel_callback,
     )
     assert callback is not None
-    tail = await callback(
-        CancelContext(channel="events", stream="thread-1", run="run-1")
-    )
+    tail = await callback(CancelContext(channel="events", identity=_identity()))
 
     assert tuple(tail or ()) == ("mapped:9",)
     assert transformed == [1, 9]
@@ -494,9 +497,7 @@ async def test_map_source_uses_a_synchronous_transform_for_cancel_tail() -> None
         cast(CancellableMessageSource[str], mapped).messaging_cancel_callback,
     )
 
-    tail = await callback(
-        CancelContext(channel="events", stream="thread-1", run="run-1")
-    )
+    tail = await callback(CancelContext(channel="events", identity=_identity()))
 
     assert tuple(tail or ()) == ("mapped:9",)
     await mapped.aclose()
@@ -520,6 +521,6 @@ async def test_map_source_discards_the_whole_cancel_tail_on_transform_failure() 
     assert callback is not None
 
     with pytest.raises(ValueError, match="cancellation tail"):
-        await callback(CancelContext(channel="events", stream="thread-1", run="run-1"))
+        await callback(CancelContext(channel="events", identity=_identity()))
 
     await mapped.aclose()

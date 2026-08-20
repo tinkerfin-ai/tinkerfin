@@ -13,6 +13,7 @@ from ag_ui.core import (
 )
 from langchain_core.messages import AIMessageChunk
 
+from tinkerfin_agui_adapter import Identity
 from tinkerfin_agui_adapter.adapter import DeepAgentAgUiAdapter
 
 _MESSAGE_ID = "lc_run--019fcd68-f466-4abc-9def-0123456789ab"
@@ -20,7 +21,7 @@ _MESSAGE_ID = "lc_run--019fcd68-f466-4abc-9def-0123456789ab"
 
 def _adapter(*, expose_reasoning_events: bool = False) -> DeepAgentAgUiAdapter:
     return DeepAgentAgUiAdapter(
-        "run-1",
+        identity=Identity(threadId="thread-1", runId="run-1"),
         expose_reasoning_events=expose_reasoning_events,
     )
 

@@ -33,7 +33,7 @@ agent = TinkerFin().create_deep_agent(
 {
   "interruptId": "interrupt-1",
   "status": "resolved",
-  "payload": {"decision": "approve"}
+  "payload": {"type": "approve"}
 }
 ```
 
@@ -55,13 +55,13 @@ from tinkerfin_agui_adapter import ResumeMapper
 
 
 translation = ResumeMapper().map_agui(
-    entries=run_input.resume or (),
+    entries=resume_entries,
     interrupts=persisted_interrupts,
 )
 
 if translation.mode == "command":
     binding = AgUiResumeBinding.from_translation(
-        run_input=run_input,
+        identity=identity,
         translation=translation,
     )
 ```
@@ -72,16 +72,13 @@ if translation.mode == "command":
 
 ```python
 runtime = agent.new_agui(
-    run_input=run_input,
+    identity=identity,
     resume=binding,
 )
-events = runtime.astream(
-    binding.command,
-    {"configurable": {"thread_id": run_input.thread_id}},
-)
+events = runtime.astream(binding.command)
 ```
 
-`AgUiResumeBinding` 会检查 `run_input`、恢复命令和之前的 Tool ID 属于同一次恢复，避免把决定应用到错误的运行。
+`AgUiResumeBinding` 绑定 `Identity`、纯 `Command(resume=...)` 和之前已经发出的 scoped Tool ID。完整 HTTP 请求的幂等与权限仍由应用校验。
 
 ## 使用原生 checkpoint 数据恢复
 
@@ -89,7 +86,7 @@ events = runtime.astream(
 
 ```python
 translation = ResumeMapper().map(
-    entries=run_input.resume or (),
+    entries=resume_entries,
     interrupts=pending_interrupts,
     messages_by_namespace=messages_by_namespace,
 )
@@ -120,8 +117,7 @@ translation = ResumeMapper().map(
 | --- | --- |
 | `ResumeMappingError` | ID 不存在、覆盖不完整、决定不允许或缺少 Tool 关联数据 |
 | `ValueError` | binding 使用了空 resume、非纯恢复命令或不完整 Tool ID |
-| 恢复后找不到状态 | `thread_id` 改变，或没有配置 checkpointer |
+| 恢复后找不到状态 | `Identity.threadId` 改变，或没有配置 checkpointer |
 | 同一个操作执行两次 | 应用没有原子认领 interrupt，或重试没有复用已保存的恢复数据 |
 
 下一篇：[只使用 AG-UI 转换器](adapter-extensions.md)。
-

@@ -8,7 +8,7 @@
 
 ```python
 from langgraph.checkpoint.memory import MemorySaver
-from tinkerfin import TinkerFin
+from tinkerfin import Identity, TinkerFin
 
 
 tinkerfin = TinkerFin()
@@ -55,14 +55,14 @@ agent = tinkerfin.create_deep_agent(
 
 ```python
 runtime = agent.new(
-    principal=None,
+    identity=Identity(threadId="project-7", runId="run-1"),
     on_part=None,
 )
 ```
 
 | 参数 | 默认值 | 作用 |
 | --- | --- | --- |
-| `principal` | `None` | 并发协调使用的业务身份；没有 coordinator 时必须为 `None` |
+| `identity` | 必填 | 本次运行的 `threadId` 与 `runId`，也用于 checkpoint 和并发协调 |
 | `on_part` | `None` | 每条原生数据返回给调用方之前执行的观察函数 |
 
 ## 启动运行
@@ -70,7 +70,6 @@ runtime = agent.new(
 ```python
 stream = runtime.astream(
     {"messages": [{"role": "user", "content": "检查这个项目"}]},
-    {"configurable": {"thread_id": "project-7"}},
 )
 ```
 
@@ -82,6 +81,8 @@ stream = runtime.astream(
 | `config` | `None` | thread、tags、metadata、递归限制等运行配置 |
 | `context` | `None` | 与 `context_schema` 对应的运行上下文 |
 
+一般不用在 `config` 中重复填写 `configurable.thread_id`。如果显式填写，相同值可以使用；与 `Identity.threadId` 不同会在 Graph 迭代、观察器和 coordinator 启动前报错。
+
 ### 输出控制
 
 | 参数 | 默认值 | 作用 |
@@ -90,7 +91,7 @@ stream = runtime.astream(
 | `print_mode` | `()` | 额外打印指定模式，不改变返回内容 |
 | `output_keys` | `None` | 只返回指定状态字段 |
 | `subgraphs` | `False` | 是否包含子图输出 |
-| `version` | `"v1"` | LangGraph 输出格式版本；需要统一 envelope 时使用 `"v2"` |
+| `version` | 自动为 `"v2"` | 原生 Runtime 固定使用 v2；显式传 `"v1"` 会在运行前报错 |
 | `debug` | `None` | 覆盖本次运行的调试设置 |
 
 ### 中断和持久化控制
@@ -114,7 +115,7 @@ async def record_part(part: object) -> None:
     print("received", part)
 
 
-runtime = agent.new(on_part=record_part)
+runtime = agent.new(identity=identity, on_part=record_part)
 ```
 
 观察函数抛出的异常会终止运行。不要在其中执行阻塞网络请求；需要写数据库或调用服务时使用异步客户端。
@@ -127,7 +128,7 @@ Runtime 是一次性的。重新调用 `agent.new()`。
 
 ### 会话没有延续
 
-确认 Agent 配置了 checkpointer，并且后续运行使用相同的 `thread_id`。
+确认 Agent 配置了 checkpointer，并且后续运行使用相同的 `Identity.threadId`。
 
 ### 异步服务启动时卡顿
 

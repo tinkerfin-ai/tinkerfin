@@ -53,13 +53,15 @@ channel = messaging.channel(
 )
 ```
 
-| extra | API | 用途 |
+| 安装范围 | API | 用途 |
 | --- | --- | --- |
-| `agui` | `AgUiCodec` | AG-UI 事件编码、解码和 SSE |
-| `native` | `NativeStreamPartCodec` | LangGraph v2 数据编码、解码和 SSE |
-| `redis` | `RedisBackend` | 多进程持久 backend |
+| 基础安装 | `AgUiCodec` | AG-UI 事件编码、解码和 SSE |
+| 基础安装 | `NativeStreamPartCodec` | LangGraph v2 数据编码、解码和 SSE |
+| `[redis]` | `RedisBackend` | 多进程持久 backend |
 
-TinkerFin 的规范事件流带有内置格式信息，因此 name-only channel 通常可以自动选择 codec。自定义 source 必须显式配置。
+TinkerFin 的规范事件流带有 codec 与 Identity，因此 name-only channel 可以自动选择 codec 和 durable scope。自定义 source 必须显式配置 codec，并在调用时提供 Identity。
+
+RedisBackend 只读取持久 schema 4。Schema 3 记录不兼容；切换前使用新的 `key_prefix`，或清理确认不再需要的旧记录。
 
 ## 自定义消息格式
 

@@ -17,6 +17,7 @@ from redis.asyncio import Redis
 from redis.exceptions import RedisError
 from redis.typing import KeyT, StreamIdT
 
+from tinkerfin import Identity
 from tinkerfin_messaging import (
     BackendOwnershipLost,
     BackendRunHandle,
@@ -36,6 +37,14 @@ _REDIS_URL_ENV = "TINKERFIN_TEST_REDIS_URL"
 _RedisStreamEntry = tuple[bytes, dict[bytes, bytes]]
 _XReadResponse = list[tuple[bytes, list[_RedisStreamEntry]]]
 _RedisT = TypeVar("_RedisT", bound=Redis)
+
+
+def _identity(
+    *,
+    thread_id: str = "conversation-1",
+    run_id: str = "run-1",
+) -> Identity:
+    return Identity(threadId=thread_id, runId=run_id)
 
 
 def _redis_client(
@@ -351,15 +360,13 @@ def _run_owner_until_killed(prefix: str, *, recoverable: bool) -> None:
                 if recoverable:
                     await channel.wrap_recoverable(
                         _HangingRecoveryFactory(),
-                        stream="conversation-1",
-                        run="run-1",
+                        identity=_identity(),
                         after=0,
                     )
                 else:
                     await channel.wrap(
                         _Source("first", release=asyncio.Event()),
-                        stream="conversation-1",
-                        run="run-1",
+                        identity=_identity(),
                         after=0,
                     )
                 await asyncio.Event().wait()
@@ -396,7 +403,7 @@ def _run_delete_until_killed(prefix: str, cleanup_started: ProcessEvent) -> None
             )
             await backend.delete_stream(
                 channel="events",
-                stream="conversation-1",
+                identity=_identity(),
             )
         finally:
             await client.aclose()
@@ -518,22 +525,19 @@ async def test_channel_follow_binds_generation_across_redis_backend_instances(
         observer_channel = observer_messaging.channel(name="events", codec=_TextCodec())
         old = await owner_channel.wrap(
             _Source("old"),
-            stream="thread-1",
-            run="run-1",
+            identity=_identity(thread_id="thread-1"),
             after=0,
         )
         assert [message.data async for message in old] == ["old"]
         stale = await observer_channel.follow(
-            stream="thread-1",
-            run="run-1",
+            identity=_identity(thread_id="thread-1"),
             after=0,
         )
 
-        await owner_channel.delete_stream(stream="thread-1")
+        await owner_channel.delete_stream(identity=_identity(thread_id="thread-1"))
         replacement = await owner_channel.wrap(
             _Source("new"),
-            stream="thread-1",
-            run="run-1",
+            identity=_identity(thread_id="thread-1"),
             after=0,
         )
         assert [message.data async for message in replacement] == ["new"]
@@ -619,10 +623,8 @@ async def test_real_redis_replays_commits_across_backend_instances(
     owner, follower, _ = redis_backends
     prepared = await owner.prepare(
         channel="events",
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         codec="test.bytes.v1",
-        identity="identity-1",
         after=0,
         cancellable=False,
         recoverable=False,
@@ -637,10 +639,8 @@ async def test_real_redis_replays_commits_across_backend_instances(
 
     attached = await follower.prepare(
         channel="events",
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         codec="test.bytes.v1",
-        identity="identity-1",
         after=0,
         cancellable=False,
         recoverable=False,
@@ -676,10 +676,8 @@ async def test_real_redis_rejects_invalid_append_before_lua_or_state_change(
     backend, client, prefix = counting_redis_backend
     prepared = await backend.prepare(
         channel="events",
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         codec="test.bytes.v1",
-        identity="identity-1",
         after=0,
         cancellable=False,
         recoverable=True,
@@ -742,10 +740,8 @@ async def test_real_redis_idle_waits_do_not_run_a_fixed_polling_loop(
     backend, client, _ = counting_redis_backend
     prepared = await backend.prepare(
         channel="events",
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         codec="test.bytes.v1",
-        identity="identity-1",
         after=0,
         cancellable=True,
         recoverable=False,
@@ -785,10 +781,8 @@ async def test_real_redis_twenty_idle_followers_use_one_block_each(
     backend, client, _ = counting_redis_backend
     prepared = await backend.prepare(
         channel="events",
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         codec="test.bytes.v1",
-        identity="identity-1",
         after=0,
         cancellable=False,
         recoverable=False,
@@ -826,10 +820,8 @@ async def test_real_redis_cancel_and_finish_wake_without_poll_interval_delay(
     )
     first = await actor.prepare(
         channel="events",
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         codec="test.bytes.v1",
-        identity="identity-1",
         after=0,
         cancellable=True,
         recoverable=False,
@@ -853,10 +845,8 @@ async def test_real_redis_cancel_and_finish_wake_without_poll_interval_delay(
 
     second = await actor.prepare(
         channel="events",
-        stream="conversation-1",
-        run="run-2",
+        identity=_identity(run_id="run-2"),
         codec="test.bytes.v1",
-        identity="identity-2",
         after=0,
         cancellable=False,
         recoverable=False,
@@ -887,10 +877,8 @@ async def test_real_redis_signal_closes_the_snapshot_to_xread_gap(
     waiter, actor, client = gated_xread_backends
     prepared = await actor.prepare(
         channel="events",
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         codec="test.bytes.v1",
-        identity="identity-1",
         after=0,
         cancellable=True,
         recoverable=False,
@@ -925,10 +913,8 @@ async def test_real_redis_state_change_before_snapshot_is_immediately_visible(
     owner, observer, _ = redis_backends
     prepared = await owner.prepare(
         channel="events",
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         codec="test.bytes.v1",
-        identity="identity-1",
         after=0,
         cancellable=True,
         recoverable=False,
@@ -965,10 +951,8 @@ async def test_real_redis_nonrecoverable_lease_expiry_uses_its_pttl(
     try:
         prepared = await backend.prepare(
             channel="events",
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             codec="test.bytes.v1",
-            identity="identity-1",
             after=0,
             cancellable=False,
             recoverable=False,
@@ -1016,10 +1000,8 @@ async def test_real_redis_recoverable_lease_expiry_waits_for_takeover_signal(
     try:
         original = await stale.prepare(
             channel="events",
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             codec="test.bytes.v1",
-            identity="identity-1",
             after=0,
             cancellable=False,
             recoverable=True,
@@ -1029,10 +1011,8 @@ async def test_real_redis_recoverable_lease_expiry_waits_for_takeover_signal(
 
         recovered = await recovering.prepare(
             channel="events",
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             codec="test.bytes.v1",
-            identity="identity-1",
             after=0,
             cancellable=False,
             recoverable=True,
@@ -1073,10 +1053,8 @@ async def test_real_redis_cancelled_block_releases_the_only_connection() -> None
         backend = RedisBackend(client, key_prefix=prefix, lease_ttl=3)
         prepared = await backend.prepare(
             channel="events",
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             codec="test.bytes.v1",
-            identity="identity-1",
             after=0,
             cancellable=False,
             recoverable=False,
@@ -1113,10 +1091,8 @@ async def test_real_redis_cancellation_settles_an_inflight_snapshot(
     backend, client = gated_redis_backend
     prepared = await backend.prepare(
         channel="events",
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         codec="test.bytes.v1",
-        identity="identity-1",
         after=0,
         cancellable=True,
         recoverable=False,
@@ -1152,10 +1128,8 @@ async def test_real_redis_burst_replay_keeps_a_bounded_pull_page(
     backend, client, _ = counting_redis_backend
     prepared = await backend.prepare(
         channel="events",
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         codec="test.bytes.v1",
-        identity="identity-1",
         after=0,
         cancellable=False,
         recoverable=False,
@@ -1195,16 +1169,13 @@ async def test_real_redis_workers_bind_channel_codec_atomically(
     async def prepare(
         backend: RedisBackend,
         *,
-        stream: str,
-        run: str,
+        identity: Identity,
         codec: str,
     ):
         return await backend.prepare(
             channel="shared-channel",
-            stream=stream,
-            run=run,
+            identity=identity,
             codec=codec,
-            identity=f"identity:{run}",
             after=0,
             cancellable=False,
             recoverable=False,
@@ -1213,14 +1184,12 @@ async def test_real_redis_workers_bind_channel_codec_atomically(
     outcomes = await asyncio.gather(
         prepare(
             first,
-            stream="stream-a",
-            run="run-a",
+            identity=_identity(thread_id="stream-a", run_id="run-a"),
             codec="test.codec-a.v1",
         ),
         prepare(
             second,
-            stream="stream-b",
-            run="run-b",
+            identity=_identity(thread_id="stream-b", run_id="run-b"),
             codec="test.codec-b.v1",
         ),
         return_exceptions=True,
@@ -1242,10 +1211,11 @@ async def test_real_redis_persists_channel_and_stream_metadata_separately(
     for index in (1, 2):
         prepared = await backend.prepare(
             channel="events",
-            stream=f"stream-{index}",
-            run=f"run-{index}",
+            identity=_identity(
+                thread_id=f"stream-{index}",
+                run_id=f"run-{index}",
+            ),
             codec="test.bytes.v1",
-            identity=f"identity-{index}",
             after=0,
             cancellable=False,
             recoverable=False,
@@ -1287,7 +1257,7 @@ async def test_real_redis_persists_channel_and_stream_metadata_separately(
     assert channel_meta == {
         b"channel": b"events",
         b"codec": b"test.bytes.v1",
-        b"schema_version": b"3",
+        b"schema_version": b"4",
     }
     controls = [
         await cast(Awaitable[dict[bytes, bytes]], client.hgetall(key))
@@ -1300,7 +1270,7 @@ async def test_real_redis_persists_channel_and_stream_metadata_separately(
     assert all(control[b"channel"] == b"events" for control in controls)
     assert all(control[b"generation"] == b"1" for control in controls)
     assert all(control[b"state"] == b"active" for control in controls)
-    assert all(control[b"schema_version"] == b"3" for control in controls)
+    assert all(control[b"schema_version"] == b"4" for control in controls)
     assert all(control[b"signal_seq"] == b"1" for control in controls)
     stream_metadata = [
         await cast(Awaitable[dict[bytes, bytes]], client.hgetall(key))
@@ -1313,7 +1283,7 @@ async def test_real_redis_persists_channel_and_stream_metadata_separately(
     assert all(metadata[b"channel"] == b"events" for metadata in stream_metadata)
     assert all(metadata[b"generation"] == b"1" for metadata in stream_metadata)
     assert all(metadata[b"seq"] == b"1" for metadata in stream_metadata)
-    assert all(metadata[b"schema_version"] == b"3" for metadata in stream_metadata)
+    assert all(metadata[b"schema_version"] == b"4" for metadata in stream_metadata)
 
     run_metadata = [
         await cast(Awaitable[dict[bytes, bytes]], client.hgetall(key))
@@ -1364,10 +1334,8 @@ async def test_real_redis_rejects_malformed_run_snapshot_scalars(
     backend, _, client = redis_backends
     prepared = await backend.prepare(
         channel="events",
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         codec="test.bytes.v1",
-        identity="identity-1",
         after=0,
         cancellable=False,
         recoverable=False,
@@ -1390,10 +1358,8 @@ async def test_real_redis_rejects_a_malformed_snapshot_message_entry(
     backend, _, client = redis_backends
     prepared = await backend.prepare(
         channel="events",
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         codec="test.bytes.v1",
-        identity="identity-1",
         after=0,
         cancellable=False,
         recoverable=False,
@@ -1426,10 +1392,8 @@ async def test_real_redis_rejected_prepare_does_not_index_phantom_run_keys(
     first, second, client = redis_backends
     prepared = await first.prepare(
         channel="events",
-        stream="conversation-1",
-        run="run-active",
+        identity=_identity(run_id="run-active"),
         codec="test.bytes.v1",
-        identity="identity-active",
         after=0,
         cancellable=False,
         recoverable=False,
@@ -1438,10 +1402,8 @@ async def test_real_redis_rejected_prepare_does_not_index_phantom_run_keys(
     with pytest.raises(RunAlreadyActive):
         await second.prepare(
             channel="events",
-            stream="conversation-1",
-            run="run-rejected",
+            identity=_identity(run_id="run-rejected"),
             codec="test.bytes.v1",
-            identity="identity-rejected",
             after=0,
             cancellable=False,
             recoverable=False,
@@ -1468,10 +1430,8 @@ async def test_real_redis_delete_unlinks_only_the_target_generation(
         run = f"run-{stream}"
         owner = await backend.prepare(
             channel="events",
-            stream=stream,
-            run=run,
+            identity=_identity(thread_id=stream, run_id=run),
             codec="test.bytes.v1",
-            identity=f"identity:{run}",
             after=0,
             cancellable=False,
             recoverable=False,
@@ -1498,7 +1458,10 @@ async def test_real_redis_delete_unlinks_only_the_target_generation(
     deleted_base = control_by_stream["stream-deleted"].removesuffix(":control")
     retained_base = control_by_stream["stream-retained"].removesuffix(":control")
 
-    await backend.delete_stream(channel="events", stream="stream-deleted")
+    await backend.delete_stream(
+        channel="events",
+        identity=_identity(thread_id="stream-deleted", run_id="run-stream-deleted"),
+    )
 
     deleted_control = await cast(
         Awaitable[dict[bytes, bytes]], client.hgetall(f"{deleted_base}:control")
@@ -1527,10 +1490,8 @@ async def test_real_redis_delete_unlinks_only_the_target_generation(
 
     rebuilt = await backend.prepare(
         channel="events",
-        stream="stream-deleted",
-        run="run-rebuilt",
+        identity=_identity(thread_id="stream-deleted", run_id="run-rebuilt"),
         codec="test.bytes.v1",
-        identity="identity:run-rebuilt",
         after=0,
         cancellable=False,
         recoverable=False,
@@ -1561,17 +1522,15 @@ async def test_real_redis_delete_fences_an_expired_producer(
     try:
         prepared = await stale.prepare(
             channel="events",
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             codec="test.bytes.v1",
-            identity="identity-1",
             after=0,
             cancellable=False,
             recoverable=False,
         )
         await asyncio.sleep(0.2)
 
-        await deleter.delete_stream(channel="events", stream="conversation-1")
+        await deleter.delete_stream(channel="events", identity=_identity())
 
         with pytest.raises(StreamDeleted):
             await stale.append(
@@ -1613,10 +1572,8 @@ async def test_real_redis_delete_wakes_a_follower_of_an_expired_producer(
     try:
         prepared = await stale.prepare(
             channel="events",
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             codec="test.bytes.v1",
-            identity="identity-1",
             after=0,
             cancellable=False,
             recoverable=True,
@@ -1625,7 +1582,7 @@ async def test_real_redis_delete_wakes_a_follower_of_an_expired_producer(
         waiting = asyncio.create_task(anext(follower))
         await asyncio.sleep(0.2)
 
-        await deleter.delete_stream(channel="events", stream="conversation-1")
+        await deleter.delete_stream(channel="events", identity=_identity())
 
         try:
             with pytest.raises(StreamDeleted):
@@ -1642,10 +1599,8 @@ async def test_real_redis_concurrent_deletes_converge_after_multiple_batches(
     first, second, client = redis_backends
     prepared = await first.prepare(
         channel="events",
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         codec="test.bytes.v1",
-        identity="identity-1",
         after=0,
         cancellable=False,
         recoverable=False,
@@ -1660,8 +1615,8 @@ async def test_real_redis_concurrent_deletes_converge_after_multiple_batches(
     await first.finish(prepared.handle, status="completed")
 
     await asyncio.gather(
-        first.delete_stream(channel="events", stream="conversation-1"),
-        second.delete_stream(channel="events", stream="conversation-1"),
+        first.delete_stream(channel="events", identity=_identity()),
+        second.delete_stream(channel="events", identity=_identity()),
     )
 
     controls = [key async for key in client.scan_iter(match="tfmsg:test:*:control")]
@@ -1687,10 +1642,8 @@ async def test_real_redis_cancelled_delete_is_taken_over_after_lease_expiry() ->
     try:
         prepared = await owner.prepare(
             channel="events",
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             codec="test.bytes.v1",
-            identity="identity-1",
             after=0,
             cancellable=False,
             recoverable=False,
@@ -1705,7 +1658,7 @@ async def test_real_redis_cancelled_delete_is_taken_over_after_lease_expiry() ->
         gated_client.gate_next_delete_cleanup = True
 
         deleting = asyncio.create_task(
-            owner.delete_stream(channel="events", stream="conversation-1")
+            owner.delete_stream(channel="events", identity=_identity())
         )
         await asyncio.wait_for(
             gated_client.delete_cleanup_entered.wait(),
@@ -1714,10 +1667,8 @@ async def test_real_redis_cancelled_delete_is_taken_over_after_lease_expiry() ->
         with pytest.raises(StreamDeleted):
             await takeover.prepare(
                 channel="events",
-                stream="conversation-1",
-                run="run-during-delete",
+                identity=_identity(run_id="run-during-delete"),
                 codec="test.bytes.v1",
-                identity="identity-during-delete",
                 after=0,
                 cancellable=False,
                 recoverable=False,
@@ -1725,14 +1676,14 @@ async def test_real_redis_cancelled_delete_is_taken_over_after_lease_expiry() ->
         assert (
             await takeover.latest_seq(
                 channel="events",
-                stream="conversation-1",
+                identity=_identity(),
             )
             == 0
         )
         assert (
             await takeover.read(
                 channel="events",
-                stream="conversation-1",
+                identity=_identity(),
                 after=0,
             )
             == ()
@@ -1765,7 +1716,7 @@ async def test_real_redis_cancelled_delete_is_taken_over_after_lease_expiry() ->
         )
 
         await asyncio.sleep(0.2)
-        await takeover.delete_stream(channel="events", stream="conversation-1")
+        await takeover.delete_stream(channel="events", identity=_identity())
 
         assert (
             await cast(
@@ -1798,10 +1749,8 @@ async def test_real_redis_delete_is_taken_over_after_worker_process_is_killed(
     )
     prepared = await backend.prepare(
         channel="events",
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         codec="test.bytes.v1",
-        identity="identity-1",
         after=0,
         cancellable=False,
         recoverable=False,
@@ -1834,7 +1783,7 @@ async def test_real_redis_delete_is_taken_over_after_worker_process_is_killed(
         assert process.exitcode is not None and process.exitcode != 0
         await asyncio.sleep(0.4)
 
-        await backend.delete_stream(channel="events", stream="conversation-1")
+        await backend.delete_stream(channel="events", identity=_identity())
 
         assert (
             await cast(Awaitable[bytes | None], client.hget(controls[0], "state"))
@@ -1868,10 +1817,8 @@ async def test_real_redis_lifecycle_signal_is_bounded_and_cross_generation(
     try:
         prepared = await backend.prepare(
             channel="events",
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             codec="test.bytes.v1",
-            identity="identity-1",
             after=0,
             cancellable=True,
             recoverable=False,
@@ -1890,10 +1837,8 @@ async def test_real_redis_lifecycle_signal_is_bounded_and_cross_generation(
         for index in range(2, 132):
             current = await backend.prepare(
                 channel="events",
-                stream="conversation-1",
-                run=f"run-{index}",
+                identity=_identity(run_id=f"run-{index}"),
                 codec="test.bytes.v1",
-                identity=f"identity-{index}",
                 after=0,
                 cancellable=True,
                 recoverable=False,
@@ -1913,7 +1858,7 @@ async def test_real_redis_lifecycle_signal_is_bounded_and_cross_generation(
         assert signal_entries[-1][1][b"kind"] == b"finish"
         assert signal_entries[-1][1][b"generation"] == b"1"
         assert signal_entries[-1][1][b"run"] == b"run-131"
-        await backend.delete_stream(channel="events", stream="conversation-1")
+        await backend.delete_stream(channel="events", identity=_identity())
         assert await client.xlen(signal_key) == 256
         entries = await client.xrange(signal_key)
         assert entries is not None
@@ -1924,10 +1869,8 @@ async def test_real_redis_lifecycle_signal_is_bounded_and_cross_generation(
 
         rebuilt = await backend.prepare(
             channel="events",
-            stream="conversation-1",
-            run="run-rebuilt",
+            identity=_identity(run_id="run-rebuilt"),
             codec="test.bytes.v1",
-            identity="identity-rebuilt",
             after=0,
             cancellable=False,
             recoverable=False,
@@ -1967,8 +1910,7 @@ async def test_real_redis_shutdown_settles_during_the_first_commit(
     try:
         await messaging.channel(name="events", codec=_TextCodec()).wrap(
             source,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
             cancel=cancel,
         )
@@ -1993,10 +1935,8 @@ async def test_real_redis_running_follower_never_crosses_into_a_later_run(
     backend, client = gated_redis_backend
     first = await backend.prepare(
         channel="events",
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         codec="test.redis-text.v1",
-        identity="identity-1",
         after=0,
         cancellable=False,
         recoverable=False,
@@ -2015,10 +1955,8 @@ async def test_real_redis_running_follower_never_crosses_into_a_later_run(
     await backend.finish(first.handle, status="completed")
     second = await backend.prepare(
         channel="events",
-        stream="conversation-1",
-        run="run-2",
+        identity=_identity(run_id="run-2"),
         codec="test.redis-text.v1",
-        identity="identity-2",
         after=1,
         cancellable=False,
         recoverable=False,
@@ -2045,10 +1983,8 @@ async def test_real_redis_terminal_snapshot_precedes_later_deletion(
     backend, client = gated_redis_backend
     prepared = await backend.prepare(
         channel="events",
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         codec="test.redis-text.v1",
-        identity="identity-1",
         after=0,
         cancellable=False,
         recoverable=False,
@@ -2065,7 +2001,7 @@ async def test_real_redis_terminal_snapshot_precedes_later_deletion(
     next_message = asyncio.create_task(anext(follower))
     await asyncio.wait_for(client.eval_returned.wait(), timeout=1)
 
-    await backend.delete_stream(channel="events", stream="conversation-1")
+    await backend.delete_stream(channel="events", identity=_identity())
     client.return_release.set()
 
     try:
@@ -2081,10 +2017,8 @@ async def test_real_redis_deletion_precedes_the_atomic_run_snapshot(
     backend, client = gated_redis_backend
     prepared = await backend.prepare(
         channel="events",
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         codec="test.redis-text.v1",
-        identity="identity-1",
         after=0,
         cancellable=False,
         recoverable=False,
@@ -2095,7 +2029,7 @@ async def test_real_redis_deletion_precedes_the_atomic_run_snapshot(
     next_message = asyncio.create_task(anext(follower))
     await asyncio.wait_for(client.eval_entered.wait(), timeout=1)
 
-    await backend.delete_stream(channel="events", stream="conversation-1")
+    await backend.delete_stream(channel="events", identity=_identity())
     client.eval_release.set()
 
     try:
@@ -2124,18 +2058,14 @@ async def test_real_redis_cross_worker_attach_uses_one_producer(
         )
         first = await owner_channel.wrap(
             owner_source,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
-            attach_identity={"input": "same"},
         )
         await asyncio.wait_for(owner_source.started.wait(), timeout=1)
         second = await follower_channel.wrap(
             unused_source,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
-            attach_identity={"input": "same"},
         )
         release.set()
 
@@ -2168,15 +2098,14 @@ async def test_real_redis_remote_cancel_reaches_the_owner_callback(
         remote_channel = remote_messaging.channel(name="events", codec=_TextCodec())
         subscription = await owner_channel.wrap(
             source,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
             cancel=cancel_run,
         )
         await asyncio.wait_for(source.started.wait(), timeout=1)
 
         assert await asyncio.wait_for(
-            remote_channel.cancel(stream="conversation-1", run="run-1"),
+            remote_channel.cancel(identity=_identity()),
             timeout=2,
         )
         assert await _data(subscription) == ["started"]
@@ -2190,10 +2119,8 @@ async def test_real_redis_expired_owner_is_fenced_and_prefix_remains_replayable(
     stale, observer, _ = redis_backends
     prepared = await stale.prepare(
         channel="events",
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         codec="test.bytes.v1",
-        identity="identity-1",
         after=0,
         cancellable=False,
         recoverable=False,
@@ -2208,10 +2135,8 @@ async def test_real_redis_expired_owner_is_fenced_and_prefix_remains_replayable(
 
     attached = await observer.prepare(
         channel="events",
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         codec="test.bytes.v1",
-        identity="identity-1",
         after=0,
         cancellable=False,
         recoverable=False,
@@ -2236,10 +2161,8 @@ async def test_real_redis_follower_observes_nonrecoverable_lease_expiry(
     owner, follower, _ = redis_backends
     prepared = await owner.prepare(
         channel="events",
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         codec="test.bytes.v1",
-        identity="identity-1",
         after=0,
         cancellable=False,
         recoverable=False,
@@ -2279,8 +2202,7 @@ async def test_real_redis_messaging_renews_the_owner_lease(
         )
         subscription = await owner_channel.wrap(
             source,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
         )
         await asyncio.wait_for(source.started.wait(), timeout=1)
@@ -2291,8 +2213,7 @@ async def test_real_redis_messaging_renews_the_owner_lease(
         unused = _Source("must-not-run")
         attached = await follower_channel.wrap(
             unused,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
         )
 
@@ -2305,15 +2226,10 @@ async def test_real_redis_recoverable_takeover_uses_checkpoint_and_higher_fence(
     redis_backends: tuple[RedisBackend, RedisBackend, Redis],
 ) -> None:
     stale, recovering, _ = redis_backends
-    identity = hashlib.sha256(
-        b"tinkerfin-messaging:attach-identity:v1\0null"
-    ).hexdigest()
     original = await stale.prepare(
         channel="events",
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         codec="test.redis-text.v1",
-        identity=identity,
         after=0,
         cancellable=False,
         recoverable=True,
@@ -2333,10 +2249,8 @@ async def test_real_redis_recoverable_takeover_uses_checkpoint_and_higher_fence(
 
     recovered = await recovering.prepare(
         channel="events",
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         codec="test.redis-text.v1",
-        identity=identity,
         after=0,
         cancellable=False,
         recoverable=True,
@@ -2363,10 +2277,8 @@ async def test_real_redis_recovery_preserves_an_existing_cancel_request(
     stale, recovering, _ = redis_backends
     await stale.prepare(
         channel="events",
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         codec="test.redis-text.v1",
-        identity="identity-1",
         after=0,
         cancellable=True,
         recoverable=True,
@@ -2374,8 +2286,7 @@ async def test_real_redis_recovery_preserves_an_existing_cancel_request(
     requested = await recovering.request_cancel(
         BackendRunHandle(
             channel="events",
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             owner_token=None,
             fence=None,
         )
@@ -2384,10 +2295,8 @@ async def test_real_redis_recovery_preserves_an_existing_cancel_request(
 
     recovered = await recovering.prepare(
         channel="events",
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         codec="test.redis-text.v1",
-        identity="identity-1",
         after=0,
         cancellable=True,
         recoverable=True,
@@ -2406,10 +2315,8 @@ async def test_real_redis_does_not_recover_a_claimed_cancel_settlement(
     stale, recovering, _ = redis_backends
     original = await stale.prepare(
         channel="events",
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         codec="test.redis-text.v1",
-        identity="identity-1",
         after=0,
         cancellable=True,
         recoverable=True,
@@ -2420,10 +2327,8 @@ async def test_real_redis_does_not_recover_a_claimed_cancel_settlement(
 
     attached = await recovering.prepare(
         channel="events",
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         codec="test.redis-text.v1",
-        identity="identity-1",
         after=0,
         cancellable=True,
         recoverable=True,
@@ -2442,15 +2347,10 @@ async def test_recovered_pending_cancel_survives_source_completion(
     redis_backends: tuple[RedisBackend, RedisBackend, Redis],
 ) -> None:
     stale, recovering, _ = redis_backends
-    identity = hashlib.sha256(
-        b"tinkerfin-messaging:attach-identity:v1\0null"
-    ).hexdigest()
     original = await stale.prepare(
         channel="events",
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         codec="test.redis-text.v1",
-        identity=identity,
         after=0,
         cancellable=True,
         recoverable=True,
@@ -2492,8 +2392,7 @@ async def test_recovered_pending_cancel_survives_source_completion(
         channel = messaging.channel(name="events", codec=_TextCodec())
         subscription = await channel.wrap_recoverable(
             factory,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
             cancel=cancel,
         )
@@ -2520,10 +2419,8 @@ async def test_public_cancel_settles_an_ownerless_recoverable_run(
     stale, recovering, _ = redis_backends
     await stale.prepare(
         channel="events",
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         codec="test.redis-text.v1",
-        identity="identity-1",
         after=0,
         cancellable=True,
         recoverable=True,
@@ -2534,15 +2431,14 @@ async def test_public_cancel_settles_an_ownerless_recoverable_run(
         channel = messaging.channel(name="events", codec=_TextCodec())
         with pytest.raises(RunProducerFailed) as captured:
             await asyncio.wait_for(
-                channel.cancel(stream="conversation-1", run="run-1"),
+                channel.cancel(identity=_identity()),
                 timeout=1,
             )
 
     replay = recovering.follow(
         BackendRunHandle(
             channel="events",
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             owner_token=None,
             fence=None,
         ),
@@ -2559,15 +2455,10 @@ async def test_wrap_recoverable_reopens_from_the_last_real_redis_checkpoint(
     redis_backends: tuple[RedisBackend, RedisBackend, Redis],
 ) -> None:
     stale, recovering, _ = redis_backends
-    identity = hashlib.sha256(
-        b"tinkerfin-messaging:attach-identity:v1\0null"
-    ).hexdigest()
     original = await stale.prepare(
         channel="events",
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         codec="test.redis-text.v1",
-        identity=identity,
         after=0,
         cancellable=False,
         recoverable=True,
@@ -2590,8 +2481,7 @@ async def test_wrap_recoverable_reopens_from_the_last_real_redis_checkpoint(
         channel = messaging.channel(name="events", codec=_TextCodec())
         subscription = await channel.wrap_recoverable(
             factory,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
         )
 
@@ -2624,7 +2514,7 @@ async def test_recoverable_source_resumes_after_owner_process_is_killed(
             while (
                 await recovering.latest_seq(
                     channel="events",
-                    stream="conversation-1",
+                    identity=_identity(),
                 )
                 != 1
             ):
@@ -2644,8 +2534,7 @@ async def test_recoverable_source_resumes_after_owner_process_is_killed(
             channel = messaging.channel(name="events", codec=_TextCodec())
             subscription = await channel.wrap_recoverable(
                 factory,
-                stream="conversation-1",
-                run="run-1",
+                identity=_identity(),
                 after=0,
             )
             messages = [message async for message in subscription]
@@ -2692,7 +2581,7 @@ async def test_ordinary_source_is_not_restarted_after_owner_process_is_killed(
             while (
                 await observer.latest_seq(
                     channel="events",
-                    stream="conversation-1",
+                    identity=_identity(),
                 )
                 != 1
             ):
@@ -2712,8 +2601,7 @@ async def test_ordinary_source_is_not_restarted_after_owner_process_is_killed(
             channel = messaging.channel(name="events", codec=_TextCodec())
             subscription = await channel.wrap(
                 unused,
-                stream="conversation-1",
-                run="run-1",
+                identity=_identity(),
                 after=0,
             )
             iterator = aiter(subscription)
@@ -2743,8 +2631,7 @@ async def test_slow_recoverable_open_renews_the_real_redis_owner_lease(
         channel = messaging.channel(name="events", codec=_TextCodec())
         subscription = await channel.wrap_recoverable(
             factory,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
         )
 

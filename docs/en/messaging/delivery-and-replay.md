@@ -2,126 +2,85 @@
 
 [Messaging basics](index.md) · [中文](../../zh/messaging/delivery-and-replay.md)
 
-Use `sse()` when the HTTP response needs SSE immediately. Use `wrap()` when server code needs decoded committed messages.
+## Start or attach
+
+```python
+subscription = await channel.wrap(
+    source,
+    identity=identity,  # omit for a profiled TinkerFin source
+    after=0,
+)
+```
+
+Before returning, `wrap()` atomically decides whether this caller owns a new producer or attaches an existing run. A different active run in the same thread raises `RunAlreadyActive`; a different persisted format raises `CodecMismatch`.
+
+`runId` is the idempotency key. Messaging neither reads nor stores a business request digest.
 
 ## Return SSE directly
 
 ```python
 body = await channel.sse(
     source,
-    stream="thread-42",
-    run="run-7",
-    after=lambda: parse_last_event_id(request),
-    attach_identity={"user_id": 42, "request": request_payload},
-    on_committed=notify_projection,
+    identity=identity,
+    after=lambda: parse_last_event_id(request.headers.get("Last-Event-ID")),
 )
 ```
 
-### Parameters
+The resolver runs once before durable preparation. Committed sequence numbers become SSE IDs.
 
-| Parameter | Default | Purpose |
-| --- | --- | --- |
-| `source` | required | Single-use asynchronous message source |
-| `stream` | required | Ordering and producer-concurrency scope |
-| `run` | required | Producer run identity |
-| `after` | `None` | Concrete cursor or a no-argument synchronous resolver |
-| `attach_identity` | `None` | Request identity and input that affect output |
-| `cancel` | `None` | Callback used by remote cancellation |
-| `on_committed` | `None` | Async observer called after each durable append |
-
-The cursor resolver runs once and is suitable for request-local `Last-Event-ID` parsing. It must not perform blocking I/O.
-
-`attach_identity` accepts finite JSON data or a Pydantic model. Messaging stores only its digest. Include every request fact that can change output; attaching the same run with a different identity fails.
-
-## Consume decoded messages
+## Read committed data
 
 ```python
+latest = await channel.latest_seq(identity=identity)
+page = await channel.read(identity=identity, after=100, limit=200)
+subscription = await channel.follow(identity=identity, after=100)
+```
+
+| API | Scope | Result |
+| --- | --- | --- |
+| `latest_seq()` | whole thread | Current maximum seq, or 0 |
+| `read()` | whole thread | Finite ascending page |
+| `follow()` | selected run | Replay, then wait for its terminal state |
+
+Thread-level methods use `identity.threadId`, but still accept the complete Identity so extensions never flatten thread and run into separate parameters.
+
+## Envelope v2
+
+| Field | Purpose |
+| --- | --- |
+| `schemaVersion` | Fixed at 2 |
+| `channel` | Codec namespace |
+| `identity` | Nested threadId and runId |
+| `seq` | Thread-level committed position |
+| `messageId` | Stable message idempotency ID |
+| `codec` | Persisted format ID |
+| `payload` | Encoded bytes |
+| `createdAt` | UTC time allocated on first commit |
+
+Only Envelope v2 is readable. Envelope v1 records cannot be loaded; change the storage prefix or remove records you no longer need before switching formats.
+
+## Observe owner commits
+
+```python
+async def on_committed(envelope) -> None:
+    await projection_queue.put(envelope)
+
+
 subscription = await channel.wrap(
     source,
-    stream="thread-42",
-    run="run-7",
-    after=0,
-    attach_identity=request_payload,
-)
-
-try:
-    async for message in subscription:
-        print(message.envelope.seq, message.data)
-finally:
-    await subscription.aclose()
-```
-
-`message.data` is codec-decoded. `message.envelope` contains the durable identity and sequence.
-
-The same subscription can render SSE:
-
-```python
-body = subscription.sse()
-async for chunk in body:
-    await send_to_client(chunk)
-```
-
-A channel without an SSE renderer raises `SseRenderingUnsupported`.
-
-## Read without starting a producer
-
-```python
-latest = await channel.latest_seq(stream="thread-42")
-
-page = await channel.read(
-    stream="thread-42",
-    after=100,
-    limit=50,
-)
-
-subscription = await channel.follow(
-    stream="thread-42",
-    run="run-7",
-    after=latest,
+    identity=identity,
+    on_committed=on_committed,
 )
 ```
 
-| Method | Use |
-| --- | --- |
-| `latest_seq()` | Read the current tail; an empty stream returns 0 |
-| `read()` | Read one finite ascending page |
-| `follow()` | Replay and then wait for new messages from that run |
-| `validate_cursor()` | Check a cursor before starting a response |
+Attachments do not re-notify old commits. Observer failures are logged without changing an already committed run outcome.
 
-Reads require a known codec. Configure one explicitly, or first use a built-in TinkerFin source whose immutable profile establishes it in the current process.
-
-## Observe committed messages
+## Delete a thread log
 
 ```python
-async def notify_projection(envelope) -> None:
-    await queue.put(
-        (envelope.channel, envelope.stream, envelope.seq, envelope.message_id)
-    )
+await channel.delete_stream(identity=identity)
 ```
 
-`on_committed` runs after persistence. Its failure does not roll back the message or fail the run. Recovery may notify the same envelope again, so use channel, stream, seq, and message ID for idempotency.
-
-Messaging waits for each observer before pulling the next source item, preserving order and bounded backpressure.
-
-## Attach to an existing run
-
-Only one active producer owns a `(channel, stream)`:
-
-- same run and identity attaches without executing the source again;
-- same run with a different identity raises `RunIdentityConflict`;
-- another run while active raises `RunAlreadyActive`;
-- a completed run is replay-only and never executes again.
-
-Run IDs must be stable for retries and unique across different inputs.
-
-## Delete history
-
-```python
-await channel.delete_stream(stream="thread-42")
-```
-
-Deletion removes messages, runs, recovery checkpoints, and deduplication data. An active producer raises `StreamDeleteConflict`; cancel or settle it first.
-
-Recreating the same stream name starts sequence numbers at 1. Existing subscriptions remain bound to the deleted generation and raise `StreamDeleted`.
+Deletion covers the entire threadId. An active producer raises `StreamDeleteConflict`; a missing stream is an idempotent success. Recreating the thread uses a new generation, and old handles can no longer read or mutate it.
 
 Next: [Cancellation, deferred sources, and recovery](cancellation-and-recovery.md).

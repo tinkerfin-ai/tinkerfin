@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from ag_ui.core import (
     BaseEvent,
-    RunAgentInput,
     RunErrorEvent,
     RunFinishedEvent,
     RunFinishedInterruptOutcome,
@@ -12,7 +11,7 @@ from ag_ui.core import (
     RunStartedEvent,
 )
 
-from .contracts import AgentRunOutcome
+from .contracts import AgentRunOutcome, Identity
 
 
 class AgUiLifecycleEventFactory:
@@ -27,49 +26,33 @@ class AgUiLifecycleEventFactory:
     def started(
         self,
         *,
-        run_input: RunAgentInput,
+        identity: Identity,
     ) -> BaseEvent:
-        """Build the main start event from the caller's complete AG-UI input."""
+        """Build the main start event from the canonical runtime identity."""
 
-        self.validate_run_input(run_input)
+        self.validate_identity(identity)
         return RunStartedEvent(
-            thread_id=run_input.thread_id,
-            run_id=run_input.run_id,
-            parent_run_id=run_input.parent_run_id,
-            input=run_input.model_copy(deep=True),
+            thread_id=identity.thread_id,
+            run_id=identity.run_id,
+            input=None,
         )
 
     @staticmethod
-    def validate_run_input(run_input: RunAgentInput) -> None:
-        """Reject invalid AG-UI identity before a runtime performs side effects."""
+    def validate_identity(identity: Identity) -> None:
+        """Reject values outside the shared Identity contract."""
 
-        if not isinstance(run_input, RunAgentInput):
-            raise TypeError("run_input must be a RunAgentInput")
-        for name, value in (
-            ("thread_id", run_input.thread_id),
-            ("run_id", run_input.run_id),
-        ):
-            if not value or value != value.strip():
-                raise ValueError(
-                    f"{name} must be non-blank without surrounding whitespace"
-                )
-        parent_run_id = run_input.parent_run_id
-        if parent_run_id is not None and (
-            not parent_run_id or parent_run_id != parent_run_id.strip()
-        ):
-            raise ValueError(
-                "parent_run_id must be non-blank without surrounding whitespace"
-            )
+        if not isinstance(identity, Identity):
+            raise TypeError("identity must be an Identity")
 
     def finished(
         self,
         *,
-        thread_id: str,
-        run_id: str,
+        identity: Identity,
         outcome: AgentRunOutcome,
     ) -> BaseEvent:
         """Build a success or interrupt terminal from an adapter outcome."""
 
+        self.validate_identity(identity)
         if outcome.type == "interrupt":
             run_outcome = RunFinishedInterruptOutcome(
                 interrupts=list(outcome.interrupts)
@@ -77,35 +60,40 @@ class AgUiLifecycleEventFactory:
         else:
             run_outcome = RunFinishedSuccessOutcome()
         return RunFinishedEvent(
-            thread_id=thread_id,
-            run_id=run_id,
+            thread_id=identity.thread_id,
+            run_id=identity.run_id,
             outcome=run_outcome,
         )
 
     def failed(
         self,
         *,
-        run_id: str,
+        identity: Identity,
         message: str,
         code: str,
     ) -> BaseEvent:
-        """Build a main error terminal identified by the explicit run ID."""
+        """Build a main error terminal from the canonical runtime identity."""
 
+        self.validate_identity(identity)
         return RunErrorEvent(
             message=message,
             code=code,
-            raw_event={"runId": run_id},
+            raw_event={
+                "threadId": identity.thread_id,
+                "runId": identity.run_id,
+            },
         )
 
-    def is_main_lifecycle(self, event: BaseEvent, *, run_id: str) -> bool:
-        """Return whether an event competes for the named main lifecycle."""
+    def is_main_lifecycle(self, event: BaseEvent, *, identity: Identity) -> bool:
+        """Return whether an event competes for the identified main lifecycle."""
 
+        self.validate_identity(identity)
         return (
             isinstance(
                 event,
                 RunStartedEvent | RunFinishedEvent | RunErrorEvent,
             )
-            and self.event_run_id(event) == run_id
+            and self.event_run_id(event) == identity.run_id
         )
 
     @staticmethod

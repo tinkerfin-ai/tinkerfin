@@ -8,6 +8,7 @@ from typing import ClassVar
 
 import pytest
 
+from tinkerfin import Identity
 from tinkerfin_messaging import (
     BackendOwnershipLost,
     BackendRunHandle,
@@ -20,6 +21,10 @@ from tinkerfin_messaging import (
     RecoveryCheckpoint,
     RunProducerFailed,
 )
+
+
+def _identity() -> Identity:
+    return Identity(threadId="conversation-1", runId="run-1")
 
 
 class _TextCodec:
@@ -128,16 +133,14 @@ async def test_recoverable_owner_uses_stable_id_and_attach_does_not_open_factory
         channel = messaging.channel(name="events", codec=_TextCodec())
         owner = await channel.wrap_recoverable(
             owner_factory,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
         )
         owner_delivery = aiter(owner)
         first = await anext(owner_delivery)
         attached = await channel.wrap_recoverable(
             unused_factory,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
         )
         release.set()
@@ -164,15 +167,13 @@ async def test_recoverable_factory_failure_settles_run_before_returning(
         with pytest.raises(RuntimeError, match="cannot reopen source"):
             await channel.wrap_recoverable(
                 failed_factory,
-                stream="conversation-1",
-                run="run-1",
+                identity=_identity(),
                 after=0,
             )
 
         replay = await channel.wrap_recoverable(
             unused_factory,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
         )
         with pytest.raises(RunProducerFailed) as captured:
@@ -197,8 +198,7 @@ async def test_ownership_loss_dominates_a_simultaneous_source_open_failure() -> 
         ) as captured:
             await channel.wrap_recoverable(
                 _ConcurrentOpenFailureFactory(barrier),
-                stream="conversation-1",
-                run="run-1",
+                identity=_identity(),
                 after=0,
             )
 
@@ -255,14 +255,13 @@ async def test_recoverable_cancel_callback_returns_checkpointed_tail(
         channel = messaging.channel(name="events", codec=_TextCodec())
         subscription = await channel.wrap_recoverable(
             _Factory(source),
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
             cancel=cancel_run,
         )
         await asyncio.wait_for(source.started.wait(), timeout=1)
 
-        assert await channel.cancel(stream="conversation-1", run="run-1") is True
+        assert await channel.cancel(identity=_identity()) is True
         replay = [message async for message in subscription]
 
     assert [message.data for message in replay] == ["one", "cancelled-tail"]
@@ -270,6 +269,4 @@ async def test_recoverable_cancel_callback_returns_checkpointed_tail(
         "stable-message-1",
         "stable-message-2",
     ]
-    assert received == [
-        CancelContext(channel="events", stream="conversation-1", run="run-1")
-    ]
+    assert received == [CancelContext(channel="events", identity=_identity())]

@@ -1,5 +1,6 @@
 from ag_ui.core import RunFinishedEvent, RunFinishedSuccessOutcome, RunStartedEvent
 
+from tinkerfin import Identity
 from tinkerfin_messaging.agui import AgUiCodec
 from tinkerfin_messaging.backend import MemoryBackend
 from tinkerfin_messaging.messaging import Messaging
@@ -33,12 +34,14 @@ async def test_reconcile_projects_the_committed_redis_tail(database: Database) -
 
     backend = MemoryBackend()
     codec = AgUiCodec()
+    identity = Identity(
+        threadId="users/7/threads/thread-reconcile",
+        runId="run-1",
+    )
     prepared = await backend.prepare(
         channel="studio-conversation-agui",
-        stream="users/7/threads/thread-reconcile",
-        run="run-1",
+        identity=identity,
         codec=codec.codec_id,
-        identity="identity",
         after=0,
         cancellable=False,
         recoverable=False,
@@ -68,7 +71,7 @@ async def test_reconcile_projects_the_committed_redis_tail(database: Database) -
         )
         projected = await coordinator.reconcile(
             thread_pk=thread_pk,
-            stream="users/7/threads/thread-reconcile",
+            identity=identity,
         )
         await coordinator.aclose()
 

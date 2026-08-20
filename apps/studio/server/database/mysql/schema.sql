@@ -36,7 +36,7 @@ CREATE TABLE conversation_threads (
   user_id BIGINT NOT NULL COMMENT '所属用户 ID，由应用层保证存在',
   thread_id VARCHAR(128) NOT NULL COMMENT '外部 AG-UI threadId',
   title VARCHAR(255) NOT NULL COMMENT '会话标题',
-  status VARCHAR(32) NOT NULL COMMENT '会话状态：idle/running/waiting_approval/error',
+  status VARCHAR(32) NOT NULL COMMENT '会话状态：idle/running/waiting_approval/error/deleting',
   last_run_id VARCHAR(128) COMMENT '最近主 run ID',
   last_model VARCHAR(64) COMMENT '最近主 run 使用的稳定模型 ID',
   last_seq BIGINT NOT NULL COMMENT 'Messaging 会话流最新已投影序号',

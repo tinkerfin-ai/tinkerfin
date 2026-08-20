@@ -10,8 +10,9 @@
 | --- | --- | --- |
 | `TinkerFin(run_coordinator=None)` | 创建统一入口 | 可选共享 coordinator |
 | `TinkerFin.create_deep_agent(...)` | 创建可重复生成 Runtime 的 Agent 定义 | 参数见[创建和运行 Deep Agent](deep-agents.md) |
-| `TinkerFin.run(...)` | 运行自己的异步事件源 | `source_factory`、`principal`、`on_part` |
-| `DeepAgentDefinition.new(...)` | 创建原生 Runtime | `principal`、`on_part` |
+| `Identity(threadId=..., runId=...)` | 表示一次框架运行 | 只包含 thread 和 run |
+| `TinkerFin.run(...)` | 运行自己的异步事件源 | `source_factory`、`identity`、`on_part` |
+| `DeepAgentDefinition.new(...)` | 创建原生 Runtime | 必填 `identity`，可选 `on_part` |
 | `DeepAgentDefinition.new_agui(...)` | 创建 AG-UI Runtime | 详见 [AG-UI 入门](../agui/index.md) |
 
 `DeepAgentDefinition` 可以重复使用。`DeepAgentRuntime`、`DeepAgentAgUiRuntime`、`TinkerFinRun` 和 `NativeTinkerFinRun` 都是一次性运行对象，不要自行构造。
@@ -75,6 +76,17 @@
 | `RunCoordinator` | 自定义运行互斥边界 |
 | `InMemoryRunCoordinator(key_resolver=...)` | 当前进程内按业务 key 串行运行 |
 
+安装 `tinkerfin[redis]` 后还可使用：
+
+| API | 作用 |
+| --- | --- |
+| `RedisRunCoordinator` | 多进程按 `Identity` 串行运行 |
+| `RedisLeaseLock` | 自动续期的通用 Redis 租约锁 |
+| `RedisLease` | `hold()` 返回的不可变资源 key 与 fencing token |
+| `RedisLeaseLost` | 续期不确定、租约过期或所有权丢失 |
+
+构造参数、默认值和连接池要求见[自定义事件源与并发协调](extensions.md#如果需要通用-redis-租约锁)。
+
 ## 恢复和错误
 
 | API | 什么时候遇到 |
@@ -87,7 +99,6 @@
 
 | 参数 | 默认值 | 作用 |
 | --- | --- | --- |
-| `run_input` | 必填 | 完整 AG-UI 请求 |
 | `timeout` | `None` | 等待原生数据的总时限 |
 | `settlement_timeout` | `None` | 调用方等待安全清理的时限 |
 | `expose_reasoning_events` | `False` | 是否交付支持的推理事件 |
@@ -95,6 +106,8 @@
 | `prior_tool_call_ids` | `frozenset()` | 恢复前已经发送完成的 scoped Tool ID |
 | `on_event` | `None` | AG-UI 事件交付前的观察函数 |
 
-`AgUiResumeBinding.from_translation(...)` 从恢复转换结果创建 binding；`validate_run_input(...)` 和 `validate_command(...)` 可在自定义入口提前检查请求是否属于该 binding。一般 Deep Agents 使用者直接走 `new_agui()`。
+运行身份已经在 `TinkerFin.run(..., identity=...)` 中绑定，`astream_agui()` 不再重复接收 ID。
+
+`AgUiResumeBinding.from_translation(...)` 接收 `identity` 和转换结果；`validate_identity(...)` 与 `validate_command(...)` 可在自定义入口提前检查恢复目标。一般 Deep Agents 使用者直接走 `new_agui()`。
 
 恢复流程见 [interrupt 与恢复](../agui/interrupts-and-resume.md)。

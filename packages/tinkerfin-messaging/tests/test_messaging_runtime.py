@@ -8,6 +8,7 @@ from typing import ClassVar
 
 import pytest
 
+from tinkerfin import Identity
 from tinkerfin_messaging import (
     DecodedMessage,
     DeferredMessageSource,
@@ -17,6 +18,14 @@ from tinkerfin_messaging import (
     MessagingBackend,
     RunProducerFailed,
 )
+
+
+def _identity(
+    *,
+    thread_id: str = "conversation-1",
+    run_id: str = "run-1",
+) -> Identity:
+    return Identity(threadId=thread_id, runId=run_id)
 
 
 class _TextCodec:
@@ -91,8 +100,7 @@ async def test_detach_does_not_stop_the_producer_and_cursor_reconnects(
         channel = messaging.channel(name="events", codec=_TextCodec())
         first = await channel.wrap(
             source,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
         )
         delivery = aiter(first)
@@ -106,8 +114,7 @@ async def test_detach_does_not_stop_the_producer_and_cursor_reconnects(
         unused = _Source(("must-not-run",))
         resumed = await channel.wrap(
             unused,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=1,
         )
         assert await _data(resumed) == ["second"]
@@ -133,16 +140,14 @@ async def test_completed_run_attachment_never_opens_deferred_source(
         channel = messaging.channel(name="events", codec=_TextCodec())
         first = await channel.wrap(
             _Source(("persisted",)),
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
         )
         assert await _data(first) == ["persisted"]
 
         replay = await channel.wrap(
             DeferredMessageSource(open_source, cancellable=False),
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
         )
         assert await _data(replay) == ["persisted"]
@@ -157,16 +162,14 @@ async def test_none_cursor_captures_the_tail_before_starting_a_new_run(
         channel = messaging.channel(name="events", codec=_TextCodec())
         first = await channel.wrap(
             _Source(("old",)),
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
         )
         assert await _data(first) == ["old"]
 
         second = await channel.wrap(
             _Source(("new",)),
-            stream="conversation-1",
-            run="run-2",
+            identity=_identity(run_id="run-2"),
             after=None,
         )
 
@@ -182,8 +185,7 @@ async def test_maximum_length_run_derives_stable_bounded_message_ids(
         channel = messaging.channel(name="events", codec=_TextCodec())
         subscription = await channel.wrap(
             _Source(("first", "second")),
-            stream="conversation-1",
-            run=run,
+            identity=_identity(run_id=run),
             after=0,
         )
 
@@ -204,15 +206,13 @@ async def test_explicit_zero_replays_history_until_the_requested_run_end(
         channel = messaging.channel(name="events", codec=_TextCodec())
         first = await channel.wrap(
             _Source(("old",)),
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
         )
         assert await _data(first) == ["old"]
         second = await channel.wrap(
             _Source(("new",)),
-            stream="conversation-1",
-            run="run-2",
+            identity=_identity(run_id="run-2"),
             after=0,
         )
         assert await _data(second) == ["old", "new"]
@@ -220,8 +220,7 @@ async def test_explicit_zero_replays_history_until_the_requested_run_end(
         unused = _Source(("unused",))
         replay_old = await channel.wrap(
             unused,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
         )
         assert await _data(replay_old) == ["old"]
@@ -241,8 +240,7 @@ async def test_payload_that_looks_terminal_does_not_finish_the_producer(
         channel = messaging.channel(name="events", codec=_TextCodec())
         subscription = await channel.wrap(
             source,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
         )
         delivery = aiter(subscription)
@@ -272,8 +270,7 @@ async def test_source_failure_drains_the_committed_prefix_then_propagates(
         channel = messaging.channel(name="events", codec=_TextCodec())
         subscription = await channel.wrap(
             source,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
         )
         delivery = aiter(subscription)
@@ -298,14 +295,12 @@ async def test_different_streams_can_produce_concurrently(
         channel = messaging.channel(name="events", codec=_TextCodec())
         first_subscription = await channel.wrap(
             first,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
         )
         second_subscription = await channel.wrap(
             second,
-            stream="conversation-2",
-            run="run-2",
+            identity=_identity(thread_id="conversation-2", run_id="run-2"),
             after=0,
         )
         await asyncio.wait_for(first.started.wait(), timeout=1)

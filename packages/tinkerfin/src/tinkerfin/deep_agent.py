@@ -7,19 +7,18 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from functools import wraps
 from typing import TYPE_CHECKING, Generic, ParamSpec, TypeVar, cast, overload
 
-from ag_ui.core import RunAgentInput
 from deepagents.graph import create_deep_agent as _native_create_deep_agent
 
-from tinkerfin_agui_adapter import AgUiLifecycleEventFactory
+from tinkerfin_agui_adapter import Identity
 
-from .agui_native import _bind_agui_graph_astream
+from .agui_native import _bind_agui_graph_astream, _bind_graph_identity
 from .agui_resume import AgUiResumeBinding
 
 if TYPE_CHECKING:
     from .runtime import (
         AgUiEventStream,
         EventObserver,
-        GraphRunStream,
+        NativeGraphRunStream,
         PartObserver,
         TinkerFin,
     )
@@ -27,7 +26,6 @@ if TYPE_CHECKING:
 CreateP = ParamSpec("CreateP")
 GraphT = TypeVar("GraphT")
 AstreamT = TypeVar("AstreamT", bound=Callable[..., object])
-PrincipalT = TypeVar("PrincipalT")
 
 
 class _StreamClaim:
@@ -48,24 +46,33 @@ class _StreamClaim:
 def _wrap_native_astream(
     astream: AstreamT,
     *,
-    tinkerfin: TinkerFin[PrincipalT],
-    principal: PrincipalT | None,
+    tinkerfin: TinkerFin,
+    identity: Identity,
     on_part: PartObserver[object] | None,
 ) -> AstreamT:
     signature = inspect.signature(astream)
     claim = _StreamClaim()
 
     @wraps(astream)
-    def wrapped(*args: object, **kwargs: object) -> GraphRunStream[object]:
-        signature.bind(*args, **kwargs)
+    def wrapped(*args: object, **kwargs: object) -> NativeGraphRunStream:
+        bound = _bind_graph_identity(
+            signature,
+            args,
+            kwargs,
+            identity=identity,
+            require_v2=True,
+        )
         claim.claim()
 
-        def source() -> AsyncIterator[object]:
-            return cast(AsyncIterator[object], astream(*args, **kwargs))
+        def source() -> AsyncIterator[Mapping[str, object]]:
+            return cast(
+                AsyncIterator[Mapping[str, object]],
+                astream(*bound.args, **bound.kwargs),
+            )
 
-        return tinkerfin.run(
+        return tinkerfin._run_native(
             source,
-            principal=principal,
+            identity=identity,
             on_part=on_part,
         ).astream()
 
@@ -75,10 +82,9 @@ def _wrap_native_astream(
 def _wrap_agui_astream(
     astream: AstreamT,
     *,
-    tinkerfin: TinkerFin[PrincipalT],
-    principal: PrincipalT | None,
+    tinkerfin: TinkerFin,
+    identity: Identity,
     on_part: PartObserver[Mapping[str, object]] | None,
-    run_input: RunAgentInput,
     timeout: float | None,
     settlement_timeout: float | None,
     expose_reasoning_events: bool,
@@ -95,22 +101,27 @@ def _wrap_agui_astream(
 
     @wraps(astream)
     def wrapped(*args: object, **kwargs: object) -> AgUiEventStream:
-        signature.bind(*args, **kwargs)
+        bound = _bind_graph_identity(
+            signature,
+            args,
+            kwargs,
+            identity=identity,
+            require_v2=False,
+        )
         claim.ensure_available()
         if resume is not None:
             graph_input = args[0] if args else kwargs.get("input")
             resume.validate_command(graph_input)
         invocation = _bind_agui_graph_astream(
             native_astream,
-            *args,
-            **kwargs,
+            *bound.args,
+            **bound.kwargs,
         )
         stream = tinkerfin.run(
             invocation,
-            principal=principal,
+            identity=identity,
             on_part=on_part,
         ).astream_agui(
-            run_input=run_input,
             timeout=timeout,
             settlement_timeout=settlement_timeout,
             expose_reasoning_events=expose_reasoning_events,
@@ -135,14 +146,14 @@ class DeepAgentRuntime(Generic[AstreamT]):
         self,
         *,
         astream: AstreamT,
-        tinkerfin: TinkerFin[PrincipalT],
-        principal: PrincipalT | None,
+        tinkerfin: TinkerFin,
+        identity: Identity,
         on_part: PartObserver[object] | None,
     ) -> None:
         self.astream = _wrap_native_astream(
             astream,
             tinkerfin=tinkerfin,
-            principal=principal,
+            identity=identity,
             on_part=on_part,
         )
 
@@ -156,10 +167,9 @@ class DeepAgentAgUiRuntime(Generic[AstreamT]):
         self,
         *,
         astream: AstreamT,
-        tinkerfin: TinkerFin[PrincipalT],
-        principal: PrincipalT | None,
+        tinkerfin: TinkerFin,
+        identity: Identity,
         on_part: PartObserver[Mapping[str, object]] | None,
-        run_input: RunAgentInput,
         timeout: float | None,
         settlement_timeout: float | None,
         expose_reasoning_events: bool,
@@ -170,9 +180,8 @@ class DeepAgentAgUiRuntime(Generic[AstreamT]):
         self.astream = _wrap_agui_astream(
             astream,
             tinkerfin=tinkerfin,
-            principal=principal,
+            identity=identity,
             on_part=on_part,
-            run_input=run_input,
             timeout=timeout,
             settlement_timeout=settlement_timeout,
             expose_reasoning_events=expose_reasoning_events,
@@ -182,7 +191,7 @@ class DeepAgentAgUiRuntime(Generic[AstreamT]):
         )
 
 
-class DeepAgentDefinition(Generic[GraphT, AstreamT, PrincipalT]):
+class DeepAgentDefinition(Generic[GraphT, AstreamT]):
     """保存原生建图调用，并在每次模式选择时创建一个新 Graph"""
 
     __slots__ = (
@@ -196,7 +205,7 @@ class DeepAgentDefinition(Generic[GraphT, AstreamT, PrincipalT]):
     def __init__(
         self,
         *,
-        tinkerfin: TinkerFin[PrincipalT],
+        tinkerfin: TinkerFin,
         factory: Callable[..., GraphT],
         args: tuple[object, ...],
         kwargs: dict[str, object],
@@ -211,29 +220,28 @@ class DeepAgentDefinition(Generic[GraphT, AstreamT, PrincipalT]):
     def new(
         self,
         *,
-        principal: PrincipalT | None = None,
+        identity: Identity,
         on_part: PartObserver[object] | None = None,
     ) -> DeepAgentRuntime[AstreamT]:
         """创建新 Graph，并绑定一次原生对象流请求"""
 
         self._tinkerfin._validate_run_binding(
-            principal=principal,
+            identity=identity,
             on_part=on_part,
         )
         graph = self._factory(*self._args, **self._kwargs)
         return DeepAgentRuntime(
             astream=self._get_astream(graph),
             tinkerfin=self._tinkerfin,
-            principal=principal,
+            identity=identity,
             on_part=on_part,
         )
 
     def new_agui(
         self,
         *,
-        principal: PrincipalT | None = None,
+        identity: Identity,
         on_part: PartObserver[Mapping[str, object]] | None = None,
-        run_input: RunAgentInput,
         timeout: float | None = None,
         settlement_timeout: float | None = None,
         expose_reasoning_events: bool = False,
@@ -244,28 +252,17 @@ class DeepAgentDefinition(Generic[GraphT, AstreamT, PrincipalT]):
         """创建新 Graph，并绑定一次 AG-UI 对象流请求"""
 
         self._tinkerfin._validate_run_binding(
-            principal=principal,
+            identity=identity,
             on_part=on_part,
         )
-        AgUiLifecycleEventFactory.validate_run_input(run_input)
-        if run_input.resume:
-            if resume is None:
-                raise ValueError(
-                    "resume binding is required when run_input.resume is set"
-                )
-            resume.validate_run_input(run_input)
-            bound_run_input = resume.run_input
-        elif resume is not None:
-            raise ValueError("resume binding requires non-empty run_input.resume")
-        else:
-            bound_run_input = run_input.model_copy(deep=True)
+        if resume is not None:
+            resume.validate_identity(identity)
         graph = self._factory(*self._args, **self._kwargs)
         return DeepAgentAgUiRuntime(
             astream=self._get_astream(graph),
             tinkerfin=self._tinkerfin,
-            principal=principal,
+            identity=identity,
             on_part=on_part,
-            run_input=bound_run_input,
             timeout=timeout,
             settlement_timeout=settlement_timeout,
             expose_reasoning_events=expose_reasoning_events,
@@ -293,23 +290,23 @@ class _EnhancedDeepAgentFactory(Generic[CreateP, GraphT, AstreamT]):
     def __get__(
         self,
         instance: None,
-        owner: type[TinkerFin[PrincipalT]],
+        owner: type[TinkerFin],
     ) -> _EnhancedDeepAgentFactory[CreateP, GraphT, AstreamT]: ...
 
     @overload
     def __get__(
         self,
-        instance: TinkerFin[PrincipalT],
-        owner: type[TinkerFin[PrincipalT]],
+        instance: TinkerFin,
+        owner: type[TinkerFin],
     ) -> Callable[
         CreateP,
-        DeepAgentDefinition[GraphT, AstreamT, PrincipalT],
+        DeepAgentDefinition[GraphT, AstreamT],
     ]: ...
 
     def __get__(
         self,
-        instance: TinkerFin[PrincipalT] | None,
-        owner: type[TinkerFin[PrincipalT]],
+        instance: TinkerFin | None,
+        owner: type[TinkerFin],
     ) -> object:
         if instance is None:
             return self
@@ -318,7 +315,7 @@ class _EnhancedDeepAgentFactory(Generic[CreateP, GraphT, AstreamT]):
         def create(
             *args: CreateP.args,
             **kwargs: CreateP.kwargs,
-        ) -> DeepAgentDefinition[GraphT, AstreamT, PrincipalT]:
+        ) -> DeepAgentDefinition[GraphT, AstreamT]:
             self._signature.bind(*args, **kwargs)
             factory = cast(Callable[..., GraphT], _native_create_deep_agent)
             return DeepAgentDefinition(

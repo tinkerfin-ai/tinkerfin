@@ -8,7 +8,7 @@ This guide starts with the settings most applications need, then covers the opti
 
 ```python
 from langgraph.checkpoint.memory import MemorySaver
-from tinkerfin import TinkerFin
+from tinkerfin import Identity, TinkerFin
 
 
 tinkerfin = TinkerFin()
@@ -53,24 +53,21 @@ Interrupts require a checkpointer. A backend or middleware that relies on a stor
 
 ```python
 runtime = agent.new(
-    principal=None,
+    identity=Identity(threadId="project-7", runId="run-1"),
     on_part=None,
 )
 ```
 
 | Parameter | Default | Purpose |
 | --- | --- | --- |
-| `principal` | `None` | Business identity used by a run coordinator |
+| `identity` | required | Thread and run identity used by checkpointing and coordination |
 | `on_part` | `None` | Observer called before each native part reaches the consumer |
-
-Without a coordinator, `principal` must stay `None`.
 
 ## Start the run
 
 ```python
 stream = runtime.astream(
     {"messages": [{"role": "user", "content": "Review this project"}]},
-    {"configurable": {"thread_id": "project-7"}},
 )
 ```
 
@@ -82,6 +79,8 @@ stream = runtime.astream(
 | `config` | `None` | Thread, tags, metadata, recursion limits, and other run configuration |
 | `context` | `None` | Runtime context matching `context_schema` |
 
+You normally omit `configurable.thread_id`. An explicitly equal value is accepted; a value different from `Identity.threadId` fails before Graph iteration, observers, or coordination begin.
+
 ### Output controls
 
 | Parameter | Default | Purpose |
@@ -90,7 +89,7 @@ stream = runtime.astream(
 | `print_mode` | `()` | Prints extra modes without changing yielded data |
 | `output_keys` | `None` | Limits state output to selected keys |
 | `subgraphs` | `False` | Includes subgraph output when true |
-| `version` | `"v1"` | LangGraph stream format; use `"v2"` for uniform envelopes |
+| `version` | forced to `"v2"` | Explicit v1 is rejected before Graph iteration |
 | `debug` | `None` | Overrides debugging for this run |
 
 ### Interrupt and durability controls
@@ -114,7 +113,7 @@ async def record_part(part: object) -> None:
     print("received", part)
 
 
-runtime = agent.new(on_part=record_part)
+runtime = agent.new(identity=identity, on_part=record_part)
 ```
 
 An observer failure ends the run. Use asynchronous clients inside it instead of blocking network or database calls.
@@ -127,7 +126,7 @@ The Runtime is single-use. Call `agent.new()` again.
 
 ### The conversation does not continue
 
-Make sure the agent has a checkpointer and later runs use the same `thread_id`.
+Make sure the agent has a checkpointer and later runs use the same `Identity.threadId`.
 
 ### An asynchronous server pauses while creating the Runtime
 

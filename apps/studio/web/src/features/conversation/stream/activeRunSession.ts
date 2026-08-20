@@ -51,7 +51,9 @@ const isChatRequestPayload = (value: unknown): value is ChatRequestPayload => {
   if (!Array.isArray(value.context) || !value.context.every(isJsonValue)) return false
   if (!Array.isArray(value.messages) || !value.messages.every((message) => (
     isRecord(message)
-    && Object.keys(message).every((key) => key === 'role' || key === 'content')
+    && Object.keys(message).every((key) => key === 'id' || key === 'role' || key === 'content')
+    && typeof message.id === 'string'
+    && Boolean(message.id.trim())
     && message.role === 'user'
     && typeof message.content === 'string'
   ))) return false

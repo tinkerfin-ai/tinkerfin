@@ -12,7 +12,7 @@ from langchain_core.messages import AIMessageChunk
 from langgraph.types import Interrupt
 from pydantic import ValidationError
 
-from tinkerfin_agui_adapter import DeepAgentAgUiAdapter
+from tinkerfin_agui_adapter import DeepAgentAgUiAdapter, Identity
 from tinkerfin_agui_adapter.subagent import SubagentTaskInput
 
 
@@ -51,7 +51,9 @@ def test_subagent_task_input_rejects_each_required_field_like_deepagents(
 def test_adapter_accepts_locked_v2_messages_tasks_and_values_envelopes() -> None:
     """Exercise documented v2 envelope shapes using installed framework objects."""
 
-    adapter = DeepAgentAgUiAdapter("run-1")
+    adapter = DeepAgentAgUiAdapter(
+        identity=Identity(threadId="thread-1", runId="run-1")
+    )
     task_input = TaskToolSchema(
         description="Inspect the repository and report the public API.",
         subagent_type="researcher",

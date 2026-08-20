@@ -3,6 +3,7 @@ import type { JsonObject, JsonValue } from "../../types"
 export type AgentMode = "default" | "plan"
 
 export interface ChatMessageInput {
+  id: string
   role: "user"
   content: string
 }

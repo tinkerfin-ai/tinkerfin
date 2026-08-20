@@ -2,50 +2,27 @@
 
 [Documentation](../README.md) · [中文](../../zh/agui/index.md)
 
-AG-UI represents a live agent run as events a frontend can understand. The UI can render text, tool calls, state changes, approvals, and final outcomes without knowing LangGraph message classes.
-
-## When to use it
-
-- Stream an answer into a chat interface;
-- show tool names, arguments, and results;
-- ask a user to approve sensitive work;
-- display root-agent and subagent activity through one protocol.
-
-If no frontend consumes AG-UI, the [native Runtime](../runtime/index.md) is simpler.
+AG-UI represents agent text, tool calls, state, approvals, and run outcomes as frontend-friendly events. Framework execution needs only `Identity`; whether an HTTP endpoint accepts a complete `RunAgentInput` is an application choice.
 
 ## Your first AG-UI Runtime
 
 ```python
 import asyncio
 
-from ag_ui.core import RunAgentInput
-from tinkerfin import TinkerFin
+from tinkerfin import Identity, TinkerFin
 
 
-tinkerfin = TinkerFin()
-agent = tinkerfin.create_deep_agent(
+agent = TinkerFin().create_deep_agent(
     model="openai:gpt-5.4",
     tools=[],
 )
 
 
 async def main() -> None:
-    run_input = RunAgentInput.model_validate(
-        {
-            "threadId": "conversation-1",
-            "runId": "run-1",
-            "state": {},
-            "messages": [],
-            "tools": [],
-            "context": [],
-            "forwardedProps": {},
-        }
-    )
-
-    runtime = agent.new_agui(run_input=run_input)
+    identity = Identity(threadId="conversation-1", runId="run-1")
+    runtime = agent.new_agui(identity=identity)
     events = runtime.astream(
         {"messages": [{"role": "user", "content": "Hello"}]},
-        {"configurable": {"thread_id": "conversation-1"}},
     )
 
     async for event in events:
@@ -55,57 +32,45 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-`run_input` is the complete frontend request. The first argument to `runtime.astream(...)` is still the Graph input. They serve different purposes.
+- `Identity.threadId` becomes the Graph checkpoint thread automatically.
+- `Identity.runId` identifies this semantic run.
+- The first `runtime.astream(...)` argument is the explicit Graph input.
+- Framework-owned `RUN_STARTED.input` is always `None`.
 
-## `RunAgentInput` fields
+When a frontend sends standard `RunAgentInput`, validate it at the HTTP boundary, then create the `Identity` and Graph input in application code:
 
-| Field | Required | Purpose |
-| --- | --- | --- |
-| `threadId` | yes | Conversation ID; normally matches Graph `thread_id` |
-| `runId` | yes | This run's ID; use a new one for each new run |
-| `parentRunId` | no | Caller-defined run lineage, not LangGraph subgraph nesting |
-| `state` | yes | State supplied by the frontend |
-| `messages` | yes | AG-UI message history |
-| `tools` | yes | Tool descriptions supplied by the frontend |
-| `context` | yes | Frontend context entries |
-| `forwardedProps` | yes | Application-specific forwarded properties |
-| `resume` | no | Decisions for pending interrupts |
+| `RunAgentInput` field | Protocol | Application responsibility | Automatically sent to the Graph |
+| --- | --- | --- | --- |
+| `threadId` | Required | Build `Identity` with `runId`; also identifies the checkpoint thread | Only as `configurable.thread_id` |
+| `runId` | Required | Identify this semantic run; use a new value for new input and reuse it for retries | No |
+| `parentRunId` | Optional | Persist and interpret run lineage when the application needs it | No |
+| `state` | Required | Validate, persist, or translate according to the application's trust boundary | No |
+| `messages` | Required | Preserve standard roles, multimodal content, and extension fields, then select this Graph invocation's input | No; complete history is not injected |
+| `tools` | Required | Preserve client tool descriptions without granting server execution permission | No |
+| `context` | Required | Translate to Graph context only when the application chooses to | No |
+| `forwardedProps` | Required | Preserve application extensions such as model or UI mode | No |
+| `resume` | Optional | Validate pending interrupts, then translate to `Command(resume=...)` | No |
 
-Supply the complete shape even when lists are empty. `threadId` and `runId` must be non-empty and have no surrounding whitespace.
+Do not inject a complete frontend history into a Graph that already has checkpoint state; the same message could execute twice.
 
-## Runtime parameters
-
-```python
-runtime = agent.new_agui(
-    run_input=run_input,
-    principal=None,
-    on_part=None,
-    timeout=None,
-    settlement_timeout=None,
-    expose_reasoning_events=False,
-    expose_subagent_events=True,
-    resume=None,
-    on_event=None,
-)
-```
+## `new_agui()` parameters
 
 | Parameter | Default | Purpose |
 | --- | --- | --- |
-| `run_input` | required | Complete AG-UI request |
-| `principal` | `None` | Business identity used by a coordinator |
-| `on_part` | `None` | Observes native LangGraph parts before conversion |
-| `timeout` | `None` | Total time limit for the native AG-UI stream |
-| `settlement_timeout` | `None` | Maximum caller wait for protected cleanup after cancellation |
-| `expose_reasoning_events` | `False` | Emits supported public reasoning events |
-| `expose_subagent_events` | `True` | Delivers public subagent events |
-| `resume` | `None` | `AgUiResumeBinding` for a resume request |
-| `on_event` | `None` | Observes every AG-UI event before delivery |
+| `identity` | required | Thread and run identity |
+| `on_part` | `None` | Observe each LangGraph v2 part before conversion |
+| `timeout` | `None` | Total native-stream deadline |
+| `settlement_timeout` | `None` | Caller wait limit for protected cancellation cleanup |
+| `expose_reasoning_events` | `False` | Emit supported public reasoning events |
+| `expose_subagent_events` | `True` | Emit subagent events |
+| `resume` | `None` | Validated `AgUiResumeBinding` |
+| `on_event` | `None` | Async observer before each AG-UI event is delivered |
 
-Enabling reasoning does not expose raw provider-private data. Private provider metadata is still removed from public payloads.
+The reasoning switch does not expose private provider metadata.
 
-## Stream settings used automatically
+## Fixed stream settings
 
-AG-UI needs messages, tasks, and state together, so the Runtime uses:
+AG-UI conversion requires:
 
 ```python
 stream_mode = ("messages", "tasks", "values")
@@ -113,11 +78,22 @@ version = "v2"
 subgraphs = True
 ```
 
-You can omit these values from `runtime.astream(...)`. Explicit values must satisfy the same contract. Additional supported modes are `updates`, `checkpoints`, `debug`, and `custom`.
+Usually omit them. You may add `updates`, `checkpoints`, `debug`, or `custom`. Missing required modes, v1, or `subgraphs=False` fails before Graph iteration.
+
+## Echo a complete application request when needed
+
+The framework cannot decide which frontend fields are trusted, so it does not copy `state`, `messages`, `tools`, `context`, or `forwardedProps` into the start event. An application may enrich the main start event:
+
+```python
+if event.type == "RUN_STARTED" and event.run_id == identity.run_id:
+    event = event.model_copy(update={"input": canonical_run_input})
+```
+
+Use a validated application snapshot—such as one with server-assigned message IDs—not raw untrusted JSON.
 
 ## Next steps
 
 - [Understand AG-UI events](events.md)
 - [Interrupts and resume](interrupts-and-resume.md)
-- [Use the converter directly](adapter-extensions.md)
+- [Use only the adapter](adapter-extensions.md)
 - [AG-UI usage reference](api-reference.md)

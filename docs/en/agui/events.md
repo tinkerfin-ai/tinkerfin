@@ -8,7 +8,7 @@ A normal run begins with `RUN_STARTED` and ends with one `RUN_FINISHED` or `RUN_
 
 | Event | Typical frontend action |
 | --- | --- |
-| `RUN_STARTED` | Create run state and read the complete request input |
+| `RUN_STARTED` | Create run state; framework `input` is `None`, and applications may enrich it |
 | `TEXT_MESSAGE_START` | Create a new assistant message |
 | `TEXT_MESSAGE_CONTENT` | Append text |
 | `TEXT_MESSAGE_END` | Close the message |
@@ -44,13 +44,13 @@ Subagents run in non-root namespaces. The converter preserves full namespaces an
 
 `expose_subagent_events=True` delivers their public events. With `False`, the converter still validates their input but suppresses corresponding public events.
 
-Do not use `parentRunId` to represent LangGraph subgraphs. It is caller-defined run lineage; namespace and correlation fields describe graph scope.
+The framework does not use or generate `parentRunId` for LangGraph subgraphs. Namespace and trusted correlation fields describe graph scope.
 
 ## Reasoning events
 
 ```python
 runtime = agent.new_agui(
-    run_input=run_input,
+    identity=identity,
     expose_reasoning_events=True,
 )
 ```
@@ -87,7 +87,7 @@ async def audit_event(event) -> None:
 
 
 runtime = agent.new_agui(
-    run_input=run_input,
+    identity=identity,
     on_event=audit_event,
 )
 ```
@@ -95,4 +95,3 @@ runtime = agent.new_agui(
 `on_event` is useful for audits and metrics. Keep it asynchronous and lightweight because it is part of the delivery path.
 
 Next: [Interrupts and resume](interrupts-and-resume.md).
-

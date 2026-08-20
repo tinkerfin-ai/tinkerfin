@@ -15,7 +15,7 @@ The converter does not create a Graph, invoke a model, read checkpoints, or prov
 ## The simplest conversion path
 
 ```python
-from tinkerfin_agui_adapter import astream_events
+from tinkerfin_agui_adapter import Identity, astream_events
 
 
 parts = graph.astream(
@@ -28,7 +28,7 @@ parts = graph.astream(
 
 events = astream_events(
     parts,
-    run_input=run_input,
+    identity=Identity(threadId="thread-1", runId="run-1"),
 )
 
 async for event in events:
@@ -42,7 +42,7 @@ async for event in events:
 | Parameter | Default | Purpose |
 | --- | --- | --- |
 | `parts` | required | Async LangGraph v2 stream |
-| `run_input` | required | Complete AG-UI request |
+| `identity` | required | Main thread and run identity emitted by this conversion |
 | `expose_reasoning_events` | `False` | Emits supported reasoning events |
 | `expose_subagent_events` | `True` | Delivers subagent events |
 | `prior_tool_call_ids` | `frozenset()` | Complete scoped tool IDs emitted before resume |
@@ -72,9 +72,10 @@ from tinkerfin_agui_adapter import (
 
 
 lifecycle = AgUiLifecycleEventFactory()
-adapter = DeepAgentAgUiAdapter(run_input.run_id)
+identity = Identity(threadId="thread-1", runId="run-1")
+adapter = DeepAgentAgUiAdapter(identity=identity)
 
-await send_event(lifecycle.started(run_input=run_input))
+await send_event(lifecycle.started(identity=identity))
 try:
     async for part in parts:
         for event in adapter.process(part):
@@ -83,8 +84,7 @@ try:
         await send_event(event)
     await send_event(
         lifecycle.finished(
-            thread_id=run_input.thread_id,
-            run_id=run_input.run_id,
+            identity=identity,
             outcome=adapter.main_outcome(),
         )
     )
@@ -93,7 +93,7 @@ except Exception:
         await send_event(event)
     await send_event(
         lifecycle.failed(
-            run_id=run_input.run_id,
+            identity=identity,
             message="Agent run failed",
             code="runtime_error",
         )

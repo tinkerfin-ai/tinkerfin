@@ -11,7 +11,7 @@ const payload: ChatRequestPayload = {
   threadId: 'thread-active',
   runId: 'run-active',
   state: {},
-  messages: [{ role: 'user', content: '继续输出' }],
+  messages: [{ id: 'request-run-active', role: 'user', content: '继续输出' }],
   tools: [],
   context: [],
   forwardedProps: { model: 'main', mode: 'default' },
@@ -41,13 +41,13 @@ describe('active run session', () => {
     expect(readActiveRunSession()).toBeNull()
   })
 
-  it('rejects malformed or client-id-bearing payloads', () => {
+  it('rejects a persisted protocol message without its required ID', () => {
     window.sessionStorage.setItem('tinkerfin:active-conversation-run', JSON.stringify({
       schemaVersion: 1,
       threadId: 'thread-active',
       payload: {
         ...payload,
-        messages: [{ id: 'client-message', role: 'user', content: 'invalid' }],
+        messages: [{ role: 'user', content: 'invalid' }],
       },
       mode: 'start',
       lastSeq: 1,

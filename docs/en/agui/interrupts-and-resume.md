@@ -33,7 +33,7 @@ Each entry corresponds to one pending interrupt:
 {
   "interruptId": "interrupt-1",
   "status": "resolved",
-  "payload": {"decision": "approve"}
+  "payload": {"type": "approve"}
 }
 ```
 
@@ -55,13 +55,13 @@ from tinkerfin_agui_adapter import ResumeMapper
 
 
 translation = ResumeMapper().map_agui(
-    entries=run_input.resume or (),
+    entries=resume_entries,
     interrupts=persisted_interrupts,
 )
 
 if translation.mode == "command":
     binding = AgUiResumeBinding.from_translation(
-        run_input=run_input,
+        identity=identity,
         translation=translation,
     )
 ```
@@ -72,16 +72,13 @@ Then pass both the binding and its command:
 
 ```python
 runtime = agent.new_agui(
-    run_input=run_input,
+    identity=identity,
     resume=binding,
 )
-events = runtime.astream(
-    binding.command,
-    {"configurable": {"thread_id": run_input.thread_id}},
-)
+events = runtime.astream(binding.command)
 ```
 
-The binding verifies that the complete request, native resume command, and earlier tool IDs belong together.
+`AgUiResumeBinding` binds the `Identity`, a pure `Command(resume=...)`, and the scoped Tool IDs emitted before the interrupt. The application still validates authorization and the complete HTTP request.
 
 ## Resume from native checkpoint data
 
@@ -89,7 +86,7 @@ If you did not persist AG-UI interrupts but can read the current checkpoint:
 
 ```python
 translation = ResumeMapper().map(
-    entries=run_input.resume or (),
+    entries=resume_entries,
     interrupts=pending_interrupts,
     messages_by_namespace=messages_by_namespace,
 )
@@ -120,8 +117,7 @@ Cancellation means abandoning this resume attempt. It is not a tool rejection.
 | --- | --- |
 | `ResumeMappingError` | Unknown ID, incomplete coverage, disallowed decision, or missing tool evidence |
 | `ValueError` | Empty resume, impure command, or incomplete scoped tool ID |
-| State cannot be resumed | Changed `thread_id` or missing checkpointer |
+| State cannot be resumed | Changed `Identity.threadId` or missing checkpointer |
 | Action runs twice | Pending interrupts were not claimed atomically or retry data changed |
 
 Next: [Use the converter directly](adapter-extensions.md).
-

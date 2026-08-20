@@ -2146,28 +2146,24 @@ name = "tinkerfin-messaging"
 version = "0.1.0"
 source = { editable = "packages/tinkerfin-messaging" }
 dependencies = [
+    { name = "ag-ui-protocol" },
     { name = "pydantic" },
+    { name = "tinkerfin" },
 ]
 
 [package.optional-dependencies]
-agui = [
-    { name = "ag-ui-protocol" },
-]
-native = [
-    { name = "tinkerfin" },
-]
 redis = [
     { name = "redis" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "ag-ui-protocol", marker = "extra == 'agui'", specifier = "==0.1.19" },
+    { name = "ag-ui-protocol", specifier = "==0.1.19" },
     { name = "pydantic", specifier = ">=2,<3" },
     { name = "redis", marker = "extra == 'redis'", specifier = ">=6,<9" },
-    { name = "tinkerfin", marker = "extra == 'native'", editable = "packages/tinkerfin" },
+    { name = "tinkerfin", editable = "packages/tinkerfin" },
 ]
-provides-extras = ["agui", "native", "redis"]
+provides-extras = ["redis"]
 
 [[package]]
 name = "tinkerfin-sandbox"
@@ -2231,7 +2227,7 @@ dependencies = [
     { name = "sqlalchemy", extra = ["asyncio"] },
     { name = "tavily-python" },
     { name = "tinkerfin", extra = ["redis"] },
-    { name = "tinkerfin-messaging", extra = ["agui", "redis"] },
+    { name = "tinkerfin-messaging", extra = ["redis"] },
     { name = "tinkerfin-sandbox", extra = ["mysql"] },
     { name = "uvicorn", extra = ["standard"] },
 ]
@@ -2260,7 +2256,7 @@ requires-dist = [
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.48,<3" },
     { name = "tavily-python", specifier = ">=0.7,<1" },
     { name = "tinkerfin", extras = ["redis"], editable = "packages/tinkerfin" },
-    { name = "tinkerfin-messaging", extras = ["agui", "redis"], editable = "packages/tinkerfin-messaging" },
+    { name = "tinkerfin-messaging", extras = ["redis"], editable = "packages/tinkerfin-messaging" },
     { name = "tinkerfin-sandbox", extras = ["mysql"], editable = "packages/tinkerfin-sandbox" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.52,<1" },
 ]

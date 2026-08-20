@@ -13,6 +13,7 @@ import pytest
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
+from tinkerfin import Identity
 from tinkerfin_messaging import (
     BackendRunHandle,
     CodecMismatch,
@@ -27,6 +28,14 @@ from tinkerfin_messaging import (
 )
 
 _REDIS_URL_ENV = "TINKERFIN_TEST_REDIS_URL"
+
+
+def _identity(
+    *,
+    thread_id: str = "stream-1",
+    run_id: str = "run-1",
+) -> Identity:
+    return Identity(threadId=thread_id, runId=run_id)
 
 
 async def _delete_prefix(client: Redis, prefix: str) -> None:
@@ -78,16 +87,14 @@ async def backend(
 async def _prepare(
     backend: MessagingBackend,
     *,
-    stream: str = "stream-1",
-    run: str = "run-1",
+    identity: Identity | None = None,
     codec: str = "test.bytes.v1",
 ) -> PreparedRun:
+    resolved_identity = identity or _identity()
     return await backend.prepare(
         channel="events",
-        stream=stream,
-        run=run,
+        identity=resolved_identity,
         codec=codec,
-        identity=f"identity:{run}",
         after=0,
         cancellable=False,
         recoverable=False,
@@ -159,10 +166,10 @@ async def test_message_id_retry_is_idempotent_and_content_sensitive(
         pytest.param("codec", "x" * 1025, id="overlong-codec"),
         pytest.param("channel", " ", id="blank-channel"),
         pytest.param("channel", "x" * 1025, id="overlong-channel"),
-        pytest.param("stream", " padded ", id="padded-stream"),
-        pytest.param("stream", "x" * 1025, id="overlong-stream"),
-        pytest.param("run", " ", id="blank-run"),
-        pytest.param("run", "x" * 1025, id="overlong-run"),
+        pytest.param("thread_id", " padded ", id="padded-thread-id"),
+        pytest.param("thread_id", "x" * 1025, id="overlong-thread-id"),
+        pytest.param("run_id", " ", id="blank-run-id"),
+        pytest.param("run_id", "x" * 1025, id="overlong-run-id"),
     ],
 )
 async def test_append_rejects_invalid_envelope_identifiers_before_commit(
@@ -176,8 +183,18 @@ async def test_append_rejects_invalid_envelope_identifiers_before_commit(
     handle: BackendRunHandle = prepared.handle
     message_id = "message-1"
     codec = "test.bytes.v1"
-    if field in {"channel", "stream", "run"}:
+    if field == "channel":
         handle = replace(handle, **{field: value})
+    elif field == "thread_id":
+        handle = replace(
+            handle,
+            identity=Identity.model_construct(thread_id=value, run_id="run-1"),
+        )
+    elif field == "run_id":
+        handle = replace(
+            handle,
+            identity=Identity.model_construct(thread_id="stream-1", run_id=value),
+        )
     elif field == "message_id":
         message_id = value
     elif field == "codec":
@@ -193,7 +210,7 @@ async def test_append_rejects_invalid_envelope_identifiers_before_commit(
             payload=b"must-not-commit",
         )
 
-    assert await backend.latest_seq(channel="events", stream="stream-1") == 0
+    assert await backend.latest_seq(channel="events", identity=_identity()) == 0
     await backend.finish(prepared.handle, status="completed")
 
 
@@ -245,7 +262,7 @@ async def test_append_rejects_invalid_payload_and_checkpoint_before_commit(
             checkpoint=cast(RecoveryCheckpoint | None, checkpoint),
         )
 
-    assert await backend.latest_seq(channel="events", stream="stream-1") == 0
+    assert await backend.latest_seq(channel="events", identity=_identity()) == 0
     await backend.finish(prepared.handle, status="completed")
 
 
@@ -255,10 +272,8 @@ async def test_append_accepts_complete_identifier_and_checkpoint_boundaries(
     identifier = "x" * 1024
     prepared = await backend.prepare(
         channel=identifier,
-        stream=identifier,
-        run=identifier,
+        identity=_identity(thread_id=identifier, run_id=identifier),
         codec=identifier,
-        identity=identifier,
         after=0,
         cancellable=False,
         recoverable=True,
@@ -319,7 +334,7 @@ async def test_checkpoint_participates_in_message_id_idempotency(
         )
 
     assert retried == first
-    assert await backend.latest_seq(channel="events", stream="stream-1") == 1
+    assert await backend.latest_seq(channel="events", identity=_identity()) == 1
     await backend.finish(prepared.handle, status="completed")
 
 
@@ -344,14 +359,17 @@ async def test_concurrent_message_id_retries_commit_once(
     )
 
     assert first == second
-    assert await backend.latest_seq(channel="events", stream="stream-1") == 1
+    assert await backend.latest_seq(channel="events", identity=_identity()) == 1
 
 
 async def test_stream_sequences_are_independent(
     backend: MessagingBackend,
 ) -> None:
-    first = await _prepare(backend, stream="stream-1", run="run-1")
-    second = await _prepare(backend, stream="stream-2", run="run-2")
+    first = await _prepare(backend, identity=_identity())
+    second = await _prepare(
+        backend,
+        identity=_identity(thread_id="stream-2", run_id="run-2"),
+    )
 
     first_message, second_message = await asyncio.gather(
         backend.append(
@@ -400,7 +418,7 @@ async def test_history_to_live_transition_has_no_gap_or_duplicate(
 async def test_completed_old_run_stops_before_a_later_run(
     backend: MessagingBackend,
 ) -> None:
-    old = await _prepare(backend, run="run-1")
+    old = await _prepare(backend, identity=_identity())
     await backend.append(
         old.handle,
         message_id="run-1:1",
@@ -408,7 +426,7 @@ async def test_completed_old_run_stops_before_a_later_run(
         payload=b"old",
     )
     await backend.finish(old.handle, status="completed")
-    new = await _prepare(backend, run="run-2")
+    new = await _prepare(backend, identity=_identity(run_id="run-2"))
     await backend.append(
         new.handle,
         message_id="run-2:1",
@@ -453,15 +471,17 @@ async def test_codec_is_bound_to_the_channel_across_streams(
     await backend.finish(prepared.handle, status="completed")
 
     with pytest.raises(CodecMismatch):
-        await _prepare(backend, run="run-2", codec="test.other.v1")
+        await _prepare(
+            backend,
+            identity=_identity(run_id="run-2"),
+            codec="test.other.v1",
+        )
 
     with pytest.raises(CodecMismatch):
         await backend.prepare(
             channel="events",
-            stream="stream-2",
-            run="run-1",
+            identity=_identity(thread_id="stream-2"),
             codec="test.other.v1",
-            identity="identity",
             after=0,
             cancellable=False,
             recoverable=False,
@@ -483,7 +503,7 @@ async def test_append_rejects_a_codec_different_from_the_channel_binding(
 
     assert raised.value.expected == "test.codec-a.v1"
     assert raised.value.actual == "test.codec-b.v1"
-    assert await backend.latest_seq(channel="events", stream="stream-1") == 0
+    assert await backend.latest_seq(channel="events", identity=_identity()) == 0
 
     await backend.append(
         prepared.handle,
@@ -498,7 +518,7 @@ async def test_append_rejects_a_codec_different_from_the_channel_binding(
             codec="test.codec-b.v1",
             payload=b"committed",
         )
-    assert await backend.latest_seq(channel="events", stream="stream-1") == 1
+    assert await backend.latest_seq(channel="events", identity=_identity()) == 1
     await backend.finish(prepared.handle, status="completed")
 
 
@@ -508,14 +528,12 @@ async def test_concurrent_first_use_binds_one_channel_codec_atomically(
     outcomes = await asyncio.gather(
         _prepare(
             backend,
-            stream="stream-a",
-            run="run-a",
+            identity=_identity(thread_id="stream-a", run_id="run-a"),
             codec="test.codec-a.v1",
         ),
         _prepare(
             backend,
-            stream="stream-b",
-            run="run-b",
+            identity=_identity(thread_id="stream-b", run_id="run-b"),
             codec="test.codec-b.v1",
         ),
         return_exceptions=True,
@@ -540,10 +558,10 @@ async def test_backend_exposes_defensive_cursor_reads(
             payload=str(index).encode(),
         )
 
-    assert await backend.latest_seq(channel="events", stream="stream-1") == 3
+    assert await backend.latest_seq(channel="events", identity=_identity()) == 3
     page = await backend.read(
         channel="events",
-        stream="stream-1",
+        identity=_identity(),
         after=1,
         limit=1,
     )
@@ -562,7 +580,7 @@ async def test_backend_read_rejects_invalid_limit_boundaries_consistently(
     with pytest.raises(error_type):
         await backend.read(
             channel="events",
-            stream="stream-1",
+            identity=_identity(),
             limit=limit,
         )
 
@@ -579,6 +597,6 @@ async def test_backend_read_rejects_invalid_cursor_boundaries_consistently(
     with pytest.raises(error_type):
         await backend.read(
             channel="events",
-            stream="stream-1",
+            identity=_identity(),
             after=after,
         )

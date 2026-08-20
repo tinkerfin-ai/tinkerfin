@@ -1,25 +1,35 @@
 import pytest
+from ag_ui.core import RunAgentInput
 from pydantic import ValidationError
 
 from tinkerfin_studio.api.errors import BusinessException
 from tinkerfin_studio.application import create_application
 from tinkerfin_studio.conversation.request import ChatRequest
+from tinkerfin_studio.conversation.run_preparation import (
+    StartChatIntent,
+    classify_intent,
+    prepare_run_request,
+)
 from tinkerfin_studio.conversation.service import parse_last_event_id
 
 
 def test_chat_request_preserves_plan_mode_without_interpreting_it() -> None:
     """plan 模式应留在 forwardedProps，而不是改变请求结构"""
 
-    request = ChatRequest.model_validate(
-        {
-            "threadId": "",
-            "runId": "run-1",
-            "state": {},
-            "messages": [{"role": "user", "content": "执行任务"}],
-            "tools": [],
-            "context": [],
-            "forwardedProps": {"model": "main", "mode": "plan", "trace": "x"},
-        }
+    request = ChatRequest.from_agui(
+        RunAgentInput.model_validate(
+            {
+                "threadId": "",
+                "runId": "run-1",
+                "state": {},
+                "messages": [
+                    {"id": "client-request-1", "role": "user", "content": "执行任务"}
+                ],
+                "tools": [],
+                "context": [],
+                "forwardedProps": {"model": "main", "mode": "plan", "trace": "x"},
+            }
+        )
     )
 
     normalized = request.normalized(
@@ -27,26 +37,27 @@ def test_chat_request_preserves_plan_mode_without_interpreting_it() -> None:
         message_ids=("message-server-1",),
     )
 
-    assert normalized["threadId"] == "thread-1"
-    assert normalized["messages"] == [
+    payload = normalized.model_dump(mode="json", by_alias=True, exclude_none=True)
+    assert payload["threadId"] == "thread-1"
+    assert payload["messages"] == [
         {
             "id": "message-server-1",
             "role": "user",
             "content": "执行任务",
         }
     ]
-    assert normalized["forwardedProps"] == {
+    assert payload["forwardedProps"] == {
         "model": "main",
         "mode": "plan",
         "trace": "x",
     }
 
 
-def test_chat_request_rejects_client_generated_message_id() -> None:
-    """客户端不得提交由自身生成的协议消息 ID"""
+def test_chat_request_drops_the_protocol_message_id() -> None:
+    """HTTP 要求客户端 ID，但业务快照只使用服务端权威 ID"""
 
-    with pytest.raises(ValidationError):
-        ChatRequest.model_validate(
+    request = ChatRequest.from_agui(
+        RunAgentInput.model_validate(
             {
                 "threadId": "",
                 "runId": "run-1",
@@ -59,6 +70,194 @@ def test_chat_request_rejects_client_generated_message_id() -> None:
                 "forwardedProps": {"model": "main", "mode": "default"},
             }
         )
+    )
+
+    assert request.messages == [
+        {"role": "user", "content": "执行任务", "name": None, "encryptedValue": None}
+    ]
+    normalized = request.normalized(
+        thread_id="thread-1",
+        message_ids=("message-server-1",),
+    )
+    assert normalized.messages[0].id == "message-server-1"
+
+
+def test_from_agui_preserves_standard_roles_multimodal_content_and_extensions() -> None:
+    protocol_input = RunAgentInput.model_validate(
+        {
+            "threadId": "thread-1",
+            "runId": "run-roles",
+            "parentRunId": "run-parent",
+            "state": {"draft": True},
+            "messages": [
+                {"id": "developer-1", "role": "developer", "content": "规则"},
+                {"id": "system-1", "role": "system", "content": "系统"},
+                {
+                    "id": "assistant-1",
+                    "role": "assistant",
+                    "content": "调用工具",
+                    "toolCalls": [
+                        {
+                            "id": "call-1",
+                            "function": {"name": "lookup", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {
+                    "id": "user-1",
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "分析附件"},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "url",
+                                "value": "https://example.test/chart.png",
+                                "mimeType": "image/png",
+                            },
+                            "metadata": {"alt": "图表"},
+                        },
+                        {
+                            "type": "document",
+                            "source": {
+                                "type": "data",
+                                "value": "cGRm",
+                                "mimeType": "application/pdf",
+                            },
+                        },
+                    ],
+                },
+                {
+                    "id": "tool-1",
+                    "role": "tool",
+                    "toolCallId": "call-1",
+                    "content": "完成",
+                },
+                {
+                    "id": "activity-1",
+                    "role": "activity",
+                    "activityType": "progress",
+                    "content": {"percent": 50},
+                },
+                {"id": "reasoning-1", "role": "reasoning", "content": "思考"},
+            ],
+            "tools": [
+                {
+                    "name": "client_tool",
+                    "description": "客户端声明",
+                    "parameters": {"type": "object"},
+                    "vendor": "kept",
+                }
+            ],
+            "context": [{"description": "tenant", "value": "acme", "vendor": "kept"}],
+            "forwardedProps": {
+                "model": "main",
+                "mode": "default",
+                "trace": {"sampled": True},
+            },
+        }
+    )
+
+    request = ChatRequest.from_agui(protocol_input)
+    normalized = request.normalized(
+        thread_id="thread-1",
+        message_ids=tuple(f"server-{index}" for index in range(7)),
+    )
+
+    assert [message["role"] for message in request.messages] == [
+        "developer",
+        "system",
+        "assistant",
+        "user",
+        "tool",
+        "activity",
+        "reasoning",
+    ]
+    assert all("id" not in message for message in request.messages)
+    assert normalized.messages[3].content == protocol_input.messages[3].content
+    assert normalized.forwarded_props["trace"] == {"sampled": True}
+    assert normalized.tools[0].model_extra == {"vendor": "kept"}
+    assert normalized.context[0].model_extra == {"vendor": "kept"}
+
+
+def test_multimodal_start_maps_only_the_selected_user_input_to_graph() -> None:
+    request = ChatRequest.from_agui(
+        RunAgentInput.model_validate(
+            {
+                "threadId": "",
+                "runId": "run-multimodal",
+                "state": {},
+                "messages": [
+                    {"id": "system-1", "role": "system", "content": "不注入"},
+                    {
+                        "id": "user-1",
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "分析附件"},
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "url",
+                                    "value": "https://example.test/chart.png",
+                                    "mimeType": "image/png",
+                                },
+                            },
+                        ],
+                    },
+                ],
+                "tools": [],
+                "context": [],
+                "forwardedProps": {"model": "main", "mode": "default"},
+            }
+        )
+    )
+
+    intent = classify_intent(request)
+
+    assert isinstance(intent, StartChatIntent)
+    assert intent.message_index == 1
+    assert intent.title == "分析附件"
+    assert intent.graph_message.content == [
+        {"type": "text", "text": "分析附件"},
+        {
+            "type": "image",
+            "url": "https://example.test/chart.png",
+            "mime_type": "image/png",
+        },
+    ]
+
+
+def test_client_message_id_does_not_change_the_canonical_business_snapshot() -> None:
+    def request(client_id: str) -> ChatRequest:
+        return ChatRequest.from_agui(
+            RunAgentInput.model_validate(
+                {
+                    "threadId": "thread-1",
+                    "runId": "run-1",
+                    "state": {},
+                    "messages": [
+                        {"id": client_id, "role": "user", "content": "同一请求"}
+                    ],
+                    "tools": [],
+                    "context": [],
+                    "forwardedProps": {"model": "main", "mode": "default"},
+                }
+            )
+        )
+
+    first = prepare_run_request(
+        request("client-a"),
+        user_id=7,
+        thread_id="thread-1",
+    )
+    second = prepare_run_request(
+        request("client-b"),
+        user_id=7,
+        thread_id="thread-1",
+    )
+
+    assert first.input_json == second.input_json
+    assert first.message_ids == second.message_ids
 
 
 @pytest.mark.parametrize("run_id", [" run-1", "run-1 ", "   "])

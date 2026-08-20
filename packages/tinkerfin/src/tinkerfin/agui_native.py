@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import cast
 
 from langgraph.types import StreamMode
+
+from tinkerfin_agui_adapter import Identity
 
 _REQUIRED_MODES: tuple[StreamMode, ...] = ("messages", "tasks", "values")
 _SUPPORTED_EXTRA_MODES: frozenset[StreamMode] = frozenset(
@@ -17,6 +20,85 @@ _RESERVED_OPTIONS = frozenset({"stream_mode", "version", "subgraphs"})
 
 class AgUiNativeStreamConfigurationError(ValueError):
     """Report an invalid native LangGraph stream contract for AG-UI conversion."""
+
+
+def _bind_graph_identity(
+    signature: inspect.Signature,
+    args: tuple[object, ...],
+    kwargs: Mapping[str, object],
+    *,
+    identity: Identity,
+    require_v2: bool,
+) -> inspect.BoundArguments:
+    """Bind one Graph call and inject its canonical runtime identity."""
+
+    if not isinstance(identity, Identity):
+        raise TypeError("identity must be an Identity")
+    bound = signature.bind(*args, **kwargs)
+    parameters = signature.parameters
+    variable_keyword = next(
+        (
+            name
+            for name, parameter in parameters.items()
+            if parameter.kind is inspect.Parameter.VAR_KEYWORD
+        ),
+        None,
+    )
+
+    def read(name: str) -> object | None:
+        parameter = parameters.get(name)
+        if (
+            parameter is not None
+            and parameter.kind is not inspect.Parameter.VAR_KEYWORD
+        ):
+            return bound.arguments.get(name)
+        if variable_keyword is None:
+            return None
+        options = bound.arguments.get(variable_keyword)
+        return options.get(name) if isinstance(options, Mapping) else None
+
+    def write(name: str, value: object) -> None:
+        parameter = parameters.get(name)
+        if (
+            parameter is not None
+            and parameter.kind is not inspect.Parameter.VAR_KEYWORD
+        ):
+            bound.arguments[name] = value
+            return
+        if variable_keyword is None:
+            raise TypeError(f"Graph astream must accept the {name!r} option")
+        raw_options = bound.arguments.get(variable_keyword)
+        options = dict(raw_options) if isinstance(raw_options, Mapping) else {}
+        options[name] = value
+        bound.arguments[variable_keyword] = options
+
+    raw_config = read("config")
+    if raw_config is None:
+        config: dict[str, object] = {}
+    elif isinstance(raw_config, Mapping):
+        config = dict(raw_config)
+    else:
+        raise TypeError("config must be a mapping or None")
+    raw_configurable = config.get("configurable")
+    if raw_configurable is None:
+        configurable: dict[str, object] = {}
+    elif isinstance(raw_configurable, Mapping):
+        configurable = dict(raw_configurable)
+    else:
+        raise TypeError("config.configurable must be a mapping")
+    configured_thread = configurable.get("thread_id")
+    if configured_thread is not None and configured_thread != identity.thread_id:
+        raise ValueError("config thread_id must equal identity.thread_id")
+    configurable["thread_id"] = identity.thread_id
+    config["configurable"] = configurable
+    write("config", config)
+
+    if require_v2:
+        version = read("version")
+        if version is not None and version != "v2":
+            raise ValueError("native TinkerFin Runtime requires version='v2'")
+        write("version", "v2")
+    return bound
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +198,22 @@ class AgUiNativeStreamInvocation:
                 "AG-UI native invocation options cannot override "
                 f"stream configuration: {conflicts!r}"
             )
+
+    def _bind_identity(self, identity: Identity) -> AgUiNativeStreamInvocation:
+        """Return a preflighted invocation carrying the canonical Graph thread."""
+
+        bound = _bind_graph_identity(
+            inspect.signature(self._astream),
+            self._args,
+            dict(self._options),
+            identity=identity,
+            require_v2=False,
+        )
+        return replace(
+            self,
+            _args=bound.args,
+            _options=tuple(bound.kwargs.items()),
+        )
 
 
 def _bind_agui_graph_astream(

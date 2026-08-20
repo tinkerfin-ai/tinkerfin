@@ -7,7 +7,7 @@
 ## Consume the object stream
 
 ```python
-runtime = agent.new()
+runtime = agent.new(identity=identity)
 stream = runtime.astream(graph_input, config)
 
 try:

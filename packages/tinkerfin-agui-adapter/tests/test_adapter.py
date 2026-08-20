@@ -35,11 +35,15 @@ from langchain_core.runnables import Runnable
 from langchain_core.tools import BaseTool
 from pydantic import ValidationError
 
-from tinkerfin_agui_adapter import InterruptCorrelationError
+from tinkerfin_agui_adapter import Identity, InterruptCorrelationError
 from tinkerfin_agui_adapter.adapter import DeepAgentAgUiAdapter
 from tinkerfin_agui_adapter.ids import ScopedIdCodec
 
 _IDS = ScopedIdCodec()
+
+
+def _identity(*, run_id: str = "run-main") -> Identity:
+    return Identity(threadId="thread-1", runId=run_id)
 
 
 def _message_id(namespace: tuple[str, ...], raw_id: str) -> str:
@@ -65,7 +69,7 @@ class _ToolCallingFakeModel(FakeMessagesListChatModel):
 
 
 def _adapter() -> DeepAgentAgUiAdapter:
-    return DeepAgentAgUiAdapter("run-main")
+    return DeepAgentAgUiAdapter(identity=_identity())
 
 
 def _raw_event(event: BaseEvent) -> dict[str, Any]:
@@ -1683,7 +1687,7 @@ def test_hitl_operational_args_remain_exact_under_reasoning_privacy(
         "type": "thinking",
     }
     adapter = DeepAgentAgUiAdapter(
-        "run-main",
+        identity=_identity(),
         expose_reasoning_events=expose_reasoning_events,
     )
     final_message = AIMessage(
@@ -2833,7 +2837,7 @@ def test_tool_result_rejects_a_name_conflicting_with_its_streamed_call() -> None
 
 def test_resumed_adapter_suppresses_only_verified_prior_tool_lifecycles() -> None:
     adapter = DeepAgentAgUiAdapter(
-        "run-resumed",
+        identity=_identity(run_id="run-resumed"),
         prior_tool_call_ids=frozenset({_tool_id((), "call-prior")}),
     )
 
@@ -2882,6 +2886,6 @@ def test_resumed_adapter_suppresses_only_verified_prior_tool_lifecycles() -> Non
 def test_resumed_adapter_rejects_unscoped_prior_tool_ids() -> None:
     with pytest.raises(ValueError, match="complete scoped Tool IDs"):
         DeepAgentAgUiAdapter(
-            "run-resumed",
+            identity=_identity(run_id="run-resumed"),
             prior_tool_call_ids=frozenset({"call-prior"}),
         )

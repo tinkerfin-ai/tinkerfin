@@ -31,7 +31,7 @@ Optional integrations:
 
 ```bash
 pip install "tinkerfin[redis]"
-pip install "tinkerfin-messaging[agui,native,redis]"
+pip install "tinkerfin-messaging[redis]"
 pip install "tinkerfin-sandbox[sqlite]"
 ```
 
@@ -40,8 +40,7 @@ pip install "tinkerfin-sandbox[sqlite]"
 ```python
 import asyncio
 
-from ag_ui.core import RunAgentInput
-from tinkerfin import TinkerFin
+from tinkerfin import Identity, TinkerFin
 
 tinkerfin = TinkerFin()
 agent = tinkerfin.create_deep_agent(
@@ -51,21 +50,10 @@ agent = tinkerfin.create_deep_agent(
 
 
 async def main() -> None:
-    run_input = RunAgentInput.model_validate(
-        {
-            "threadId": "thread-1",
-            "runId": "run-1",
-            "state": {},
-            "messages": [],
-            "tools": [],
-            "context": [],
-            "forwardedProps": {},
-        }
-    )
-    runtime = agent.new_agui(run_input=run_input)
+    identity = Identity(threadId="thread-1", runId="run-1")
+    runtime = agent.new_agui(identity=identity)
     events = runtime.astream(
         {"messages": [{"role": "user", "content": "Hello"}]},
-        {"configurable": {"thread_id": "thread-1"}},
     )
     async for event in events:
         print(event)
@@ -83,13 +71,14 @@ Use `agent.new()` for native LangGraph objects. Both Runtime types expose the in
   `new()` / `new_agui()` creates a fresh Graph and a single-use Runtime.
 - AG-UI uses v2 `messages`, `tasks`, and `values` with `subgraphs=True`; invalid stream
   options fail before iteration or lifecycle events.
-- Existing event ordering, subagent provenance, interrupt/resume, reasoning privacy,
-  cancellation, backpressure, and cleanup are preserved.
+- Runtime and Adapter enforce event ordering, subagent provenance, interrupt/resume,
+  reasoning privacy, cancellation, backpressure, and cleanup.
 - Object streams provide direct SSE and can be passed unencoded to Messaging for
   persistence, replay, attachment, and remote cancellation.
-- `RUN_STARTED.input` carries the complete caller `RunAgentInput`; resumed requests use
-  `AgUiResumeBinding` to bind that input to one native Command and its scoped Tool IDs.
-- `TinkerFin.run(...)` remains available for custom asynchronous sources.
+- Runtime accepts one `Identity` and injects its Graph thread. Framework
+  `RUN_STARTED.input` is `None`; applications may add a validated canonical request.
+- Resume uses `AgUiResumeBinding` to bind Identity, one native Command, and scoped Tool IDs.
+- `TinkerFin.run(...)` runs custom asynchronous sources.
 
 ## Documentation
 

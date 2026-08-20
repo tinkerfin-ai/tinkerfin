@@ -7,6 +7,8 @@ from datetime import UTC, datetime
 import pytest
 from pydantic import ValidationError
 
+from tinkerfin import Identity
+from tinkerfin_agui_adapter import Identity as AdapterIdentity
 from tinkerfin_messaging import (
     MessageEnvelope,
     RecoverableMessage,
@@ -17,10 +19,9 @@ from tinkerfin_messaging import (
 def _envelope(**changes: object) -> MessageEnvelope:
     values: dict[str, object] = {
         "channel": "events",
-        "stream": "conversation-1",
+        "identity": Identity(threadId="conversation-1", runId="run-1"),
         "seq": 1,
         "message_id": "run-1:1",
-        "run": "run-1",
         "codec": "test.bytes.v1",
         "payload": b"payload",
         "created_at": datetime(2026, 8, 14, tzinfo=UTC),
@@ -33,7 +34,13 @@ def test_envelope_preserves_protocol_neutral_bytes() -> None:
     envelope = _envelope(payload=b"\x00\xffpayload")
 
     assert envelope.payload == b"\x00\xffpayload"
+    assert envelope.schema_version == 2
     assert envelope.model_copy(deep=True) == envelope
+
+
+def test_messaging_uses_the_same_identity_type_as_the_framework() -> None:
+    assert Identity is AdapterIdentity
+    assert MessageEnvelope.model_fields["identity"].annotation is Identity
 
 
 def test_envelope_rejects_zero_sequence() -> None:
@@ -43,7 +50,7 @@ def test_envelope_rejects_zero_sequence() -> None:
 
 @pytest.mark.parametrize(
     "field",
-    ["channel", "stream", "message_id", "run", "codec"],
+    ["channel", "message_id", "codec"],
 )
 def test_envelope_rejects_noncanonical_identifiers(field: str) -> None:
     with pytest.raises(ValidationError, match="non-blank"):
@@ -67,7 +74,7 @@ def test_recovery_checkpoint_rejects_an_overlong_last_message_id() -> None:
 
 def test_public_schemas_publish_identifier_length_limits() -> None:
     envelope_properties = MessageEnvelope.model_json_schema()["properties"]
-    for field in ("channel", "stream", "message_id", "run", "codec"):
+    for field in ("channel", "message_id", "codec"):
         assert envelope_properties[field]["maxLength"] == 1024
 
     checkpoint_schema = RecoveryCheckpoint.model_json_schema()["properties"][
@@ -96,8 +103,21 @@ def test_recoverable_message_rejects_a_checkpoint_for_another_message() -> None:
 
 @pytest.mark.parametrize(
     "field",
-    ["channel", "stream", "message_id", "run", "codec"],
+    ["channel", "message_id", "codec"],
 )
 def test_envelope_rejects_identifiers_over_1024_characters(field: str) -> None:
     with pytest.raises(ValidationError, match="at most 1024"):
         _envelope(**{field: "x" * 1025})
+
+
+def test_envelope_rejects_unbounded_or_extra_identity_fields() -> None:
+    with pytest.raises(ValidationError, match="at most 1024"):
+        _envelope(identity=Identity(threadId="x" * 1025, runId="run-1"))
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        _envelope(
+            identity={
+                "threadId": "conversation-1",
+                "runId": "run-1",
+                "parentRunId": "parent-1",
+            }
+        )

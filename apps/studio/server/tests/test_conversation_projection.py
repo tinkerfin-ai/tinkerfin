@@ -8,6 +8,7 @@ from pydantic import TypeAdapter
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from tinkerfin import Identity
 from tinkerfin_messaging.models import MessageEnvelope
 from tinkerfin_studio.conversation.models import (
     ConversationEvent,
@@ -31,10 +32,12 @@ def _envelope(
     return (
         MessageEnvelope(
             channel="studio-conversation-agui",
-            stream="users/7/threads/thread-1",
+            identity=Identity(
+                threadId="users/7/threads/thread-1",
+                runId=run,
+            ),
             seq=seq,
             message_id=f"{run}:{seq}",
-            run=run,
             codec="agui.event.v1",
             payload=parsed.model_dump_json(by_alias=True, exclude_none=True).encode(),
             created_at=datetime(2026, 8, 18, 1, seq, tzinfo=UTC),

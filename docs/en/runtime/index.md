@@ -27,7 +27,7 @@ Install and configure your model provider separately, including its credentials.
 ```python
 import asyncio
 
-from tinkerfin import TinkerFin
+from tinkerfin import Identity, TinkerFin
 
 
 tinkerfin = TinkerFin()
@@ -38,10 +38,10 @@ agent = tinkerfin.create_deep_agent(
 
 
 async def main() -> None:
-    runtime = agent.new()
+    identity = Identity(threadId="conversation-1", runId="run-1")
+    runtime = agent.new(identity=identity)
     stream = runtime.astream(
         {"messages": [{"role": "user", "content": "Describe Beijing in one sentence"}]},
-        {"configurable": {"thread_id": "conversation-1"}},
     )
 
     async for part in stream:
@@ -55,26 +55,33 @@ The example has four steps:
 
 1. `TinkerFin()` creates the main entry point.
 2. `create_deep_agent(...)` records the model, tools, and other agent settings.
-3. `agent.new()` creates a fresh Graph and a single-use Runtime.
+3. `agent.new(identity=...)` creates a fresh Graph and binds one run identity.
 4. `runtime.astream(...)` starts the run and yields results as they arrive.
 
-## What `thread_id` does
+## What `Identity` does
 
-`thread_id` identifies a conversation. When the agent has a checkpointer, later runs with the same value can continue its saved state.
+`Identity` contains only `threadId` and `runId`. Runtime injects `threadId` into the Graph config automatically.
 
 ```python
-config = {"configurable": {"thread_id": "user-42-support"}}
+identity = Identity(threadId="user-42-support", runId="run-20260820-1")
 ```
 
-Keep the same ID for one continuing conversation. Do not share it across different users.
+| Field | Requirement | Purpose |
+| --- | --- | --- |
+| `threadId` | Required, non-empty, no surrounding whitespace | Continuing conversation and Graph checkpoint thread |
+| `runId` | Required, non-empty, no surrounding whitespace | Idempotent ID for one semantic run in the thread |
+
+An `Identity` is immutable and rejects extra fields. It does not contain `parentRunId`, user authentication data, or request content.
+
+Reuse `threadId` for one continuing conversation. Use a new `runId` for new semantic input, and reuse it only for retries or attachment.
 
 ## A Runtime is single-use
 
 Call `astream()` only once on each Runtime. Create another Runtime for another run:
 
 ```python
-first = agent.new()
-second = agent.new()
+first = agent.new(identity=Identity(threadId="thread-1", runId="run-1"))
+second = agent.new(identity=Identity(threadId="thread-1", runId="run-2"))
 ```
 
 The agent definition is reusable; a Runtime represents one execution.
@@ -85,4 +92,3 @@ The agent definition is reusable; a Runtime represents one execution.
 - [Streams and SSE](streams-and-sse.md)
 - [Custom sources and run coordination](extensions.md)
 - [Runtime usage reference](api-reference.md)
-

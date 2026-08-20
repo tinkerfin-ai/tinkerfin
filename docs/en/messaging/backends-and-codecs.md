@@ -53,13 +53,15 @@ channel = messaging.channel(
 )
 ```
 
-| Extra | API | Use |
+| Installation | API | Use |
 | --- | --- | --- |
-| `agui` | `AgUiCodec` | AG-UI encoding, decoding, and SSE |
-| `native` | `NativeStreamPartCodec` | Native v2 encoding, decoding, and SSE |
-| `redis` | `RedisBackend` | Multi-process durable backend |
+| base | `AgUiCodec` | AG-UI encoding, decoding, and SSE |
+| base | `NativeStreamPartCodec` | Native v2 encoding, decoding, and SSE |
+| `[redis]` | `RedisBackend` | Multi-process durable backend |
 
-Canonical TinkerFin streams include immutable profile information, so a name-only channel can usually infer the built-in codec. Custom sources need an explicit codec.
+Canonical TinkerFin streams include immutable codec and Identity profiles, so a name-only channel infers both. Custom sources need an explicit codec and Identity.
+
+RedisBackend reads persistent schema 4 only. Schema 3 records are incompatible; use a new `key_prefix` or remove records you no longer need before switching.
 
 ## Define a custom message format
 

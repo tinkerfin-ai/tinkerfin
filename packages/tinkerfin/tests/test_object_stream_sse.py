@@ -4,23 +4,12 @@ import json
 from collections.abc import AsyncIterator
 
 import pytest
-from ag_ui.core import RunAgentInput
 
-from tinkerfin import TinkerFin
+from tinkerfin import Identity, TinkerFin
 
 
-def _run_input() -> RunAgentInput:
-    return RunAgentInput.model_validate(
-        {
-            "threadId": "thread-1",
-            "runId": "run-1",
-            "state": {},
-            "messages": [],
-            "tools": [],
-            "context": [],
-            "forwardedProps": {},
-        }
-    )
+def _identity() -> Identity:
+    return Identity(threadId="thread-1", runId="run-1")
 
 
 @pytest.mark.asyncio
@@ -86,14 +75,7 @@ async def test_agui_object_stream_encodes_protocol_json_without_event_name() -> 
         if False:  # pragma: no cover - produces only lifecycle events
             yield None
 
-    body = (
-        TinkerFin()
-        .run(source)
-        .astream_agui(
-            run_input=_run_input(),
-        )
-        .to_sse()
-    )
+    body = TinkerFin().run(source, identity=_identity()).astream_agui().to_sse()
     frames = [frame async for frame in body]
 
     assert [json.loads(frame.removeprefix("data: "))["type"] for frame in frames] == [

@@ -7,7 +7,12 @@ import logging
 from collections.abc import AsyncGenerator, AsyncIterator
 from typing import ClassVar
 
+from tinkerfin import Identity
 from tinkerfin_messaging import MemoryBackend, MessageEnvelope, Messaging
+
+
+def _identity() -> Identity:
+    return Identity(threadId="stream-1", runId="run-1")
 
 
 class _TextCodec:
@@ -78,8 +83,7 @@ async def test_on_committed_receives_authoritative_envelopes_only_from_owner() -
         channel = messaging.channel(name="events", codec=_TextCodec())
         body = await channel.sse(
             _TrackedSource("one", "two"),
-            stream="stream-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
             on_committed=observe,
         )
@@ -88,8 +92,7 @@ async def test_on_committed_receives_authoritative_envelopes_only_from_owner() -
         unused = _TrackedSource("unused")
         replay = await channel.sse(
             unused,
-            stream="stream-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
             on_committed=observe_replay,
         )
@@ -100,7 +103,7 @@ async def test_on_committed_receives_authoritative_envelopes_only_from_owner() -
     assert [envelope.seq for envelope in observed] == [1, 2]
     assert [envelope.message_id for envelope in observed] == ["run-1:1", "run-1:2"]
     assert [envelope.payload for envelope in observed] == [b"one", b"two"]
-    assert all(envelope.run == "run-1" for envelope in observed)
+    assert all(envelope.identity == _identity() for envelope in observed)
     assert replay_observed == []
     assert unused.close_calls == 1
 
@@ -120,8 +123,7 @@ async def test_blocked_on_committed_keeps_first_sse_frame_available() -> None:
         channel = messaging.channel(name="events", codec=_TextCodec())
         body = await channel.sse(
             source,
-            stream="stream-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
             on_committed=observe,
         )
@@ -148,8 +150,7 @@ async def test_on_committed_failure_is_logged_without_failing_the_run(
         channel = messaging.channel(name="events", codec=_TextCodec())
         body = await channel.sse(
             _TrackedSource("secret-payload"),
-            stream="stream-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
             on_committed=fail,
         )
@@ -157,14 +158,13 @@ async def test_on_committed_failure_is_logged_without_failing_the_run(
 
         replay = await channel.sse(
             _TrackedSource("unused"),
-            stream="stream-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
         )
         assert await _collect(replay) == [b"id: 1\ndata: secret-payload\n\n"]
 
     assert "error_type=RuntimeError" in caplog.text
-    assert "channel=events stream=stream-1 run=run-1 seq=1" in caplog.text
+    assert "channel=events thread_id=stream-1 run_id=run-1 seq=1" in caplog.text
     assert "projection unavailable" not in caplog.text
     assert "secret-payload" not in caplog.text
 
@@ -187,15 +187,14 @@ async def test_on_committed_observes_the_accepted_cancellation_tail() -> None:
         channel = messaging.channel(name="events", codec=_TextCodec())
         body = await channel.sse(
             source,
-            stream="stream-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
             cancel=cancel_source,
             on_committed=observe,
         )
         delivery = asyncio.create_task(_collect(body))
         await asyncio.wait_for(source.started.wait(), timeout=1)
-        assert await channel.cancel(stream="stream-1", run="run-1") is True
+        assert await channel.cancel(identity=_identity()) is True
         frames = await asyncio.wait_for(delivery, timeout=1)
 
     assert frames == [

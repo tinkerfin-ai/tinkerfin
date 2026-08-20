@@ -26,10 +26,9 @@ The converter accepts an asynchronous iterable of live v2 parts:
 ```python
 import asyncio
 
-from ag_ui.core import RunAgentInput
 from langchain_core.messages import AIMessageChunk
 
-from tinkerfin_agui_adapter import astream_events, encode_sse
+from tinkerfin_agui_adapter import Identity, astream_events, encode_sse
 
 
 async def parts():
@@ -45,20 +44,10 @@ async def parts():
 
 
 async def main():
-    run_input = RunAgentInput.model_validate(
-        {
-            "threadId": "thread-1",
-            "runId": "run-1",
-            "state": {},
-            "messages": [],
-            "tools": [],
-            "context": [],
-            "forwardedProps": {},
-        }
-    )
+    identity = Identity(threadId="thread-1", runId="run-1")
     async for event in astream_events(
         parts(),
-        run_input=run_input,
+        identity=identity,
     ):
         frame = encode_sse(event)
         print(frame, end="")
@@ -69,8 +58,8 @@ asyncio.run(main())
 <!-- adapter-quick-start:end -->
 
 Production graph integration supplies `messages`, `tasks`, and `values` with
-`version="v2"` and `subgraphs=True`. The caller's complete `RunAgentInput` is preserved
-on `RUN_STARTED.input`; graph input remains the caller's concern.
+`version="v2"` and `subgraphs=True`. `RUN_STARTED.input` is `None`; applications may
+enrich it with their own validated request. Graph input remains caller-owned.
 One conversion exclusively consumes and closes the supplied iterator.
 `astream_events()` already creates the main lifecycle, including its unique terminal;
 `AgUiLifecycleEventFactory` is for custom orchestrators that do not use this stream

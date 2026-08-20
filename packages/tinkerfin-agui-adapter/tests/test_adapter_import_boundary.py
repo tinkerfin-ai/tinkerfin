@@ -26,14 +26,14 @@ def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
 
 builtins.__import__ = guarded_import
 
-from ag_ui.core import RunAgentInput, RunFinishedEvent, RunStartedEvent
+from ag_ui.core import RunFinishedEvent, RunStartedEvent
 from langchain_core.messages import AIMessageChunk
 import tinkerfin_agui_adapter
 
 expected_exports = {
     "AgUiLifecycleEventFactory", "AgentRunOutcome", "AgentRuntimeInterrupt",
     "DeepAgentAgUiAdapter", "HitlActionRequest", "HitlCorrelationError",
-    "HitlRequest", "HitlReviewConfig", "InterruptCorrelationError",
+    "HitlRequest", "HitlReviewConfig", "Identity", "InterruptCorrelationError",
     "ResumeMapper", "ResumeMappingError", "ResumeMappingFailure",
     "ResumeTranslation", "ScopedIdCodec", "SseEventId", "astream_events", "encode_sse",
     "micro_batch",
@@ -46,6 +46,7 @@ DeepAgentAgUiAdapter = tinkerfin_agui_adapter.DeepAgentAgUiAdapter
 ResumeMapper = tinkerfin_agui_adapter.ResumeMapper
 astream_events = tinkerfin_agui_adapter.astream_events
 encode_sse = tinkerfin_agui_adapter.encode_sse
+Identity = tinkerfin_agui_adapter.Identity
 
 async def parts():
     yield {
@@ -59,14 +60,11 @@ async def parts():
     yield {"type": "values", "ns": (), "data": {}, "interrupts": ()}
 
 async def main():
-    run_input = RunAgentInput.model_validate({
-        "threadId": "thread-1", "runId": "run-1", "state": {},
-        "messages": [], "tools": [], "context": [], "forwardedProps": {},
-    })
+    identity = Identity(threadId="thread-1", runId="run-1")
     events = [
         event
         async for event in astream_events(
-            parts(), run_input=run_input
+            parts(), identity=identity
         )
     ]
     assert isinstance(events[0], RunStartedEvent)

@@ -20,7 +20,7 @@ from langgraph.graph.message import add_messages
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import interrupt
 
-from tinkerfin_agui_adapter import DeepAgentAgUiAdapter
+from tinkerfin_agui_adapter import DeepAgentAgUiAdapter, Identity
 from tinkerfin_agui_adapter.ids import ScopedIdCodec
 
 
@@ -30,6 +30,10 @@ class _State(TypedDict):
 
 class _InterruptChildState(_State, total=False):
     messages: Annotated[list[AnyMessage], add_messages]
+
+
+def _identity(*, run_id: str = "run-1") -> Identity:
+    return Identity(threadId="thread-1", runId=run_id)
 
 
 def _increment(state: _State) -> dict[str, int]:
@@ -140,7 +144,7 @@ async def _parts(graph: CompiledStateGraph) -> AsyncIterator[object]:
 async def test_ordinary_compiled_subgraph_uses_graph_scope_not_subagent_identity() -> (
     None
 ):
-    adapter = DeepAgentAgUiAdapter("run-1")
+    adapter = DeepAgentAgUiAdapter(identity=_identity())
     events: list[BaseEvent] = []
 
     async for part in _parts(_ordinary_parent_graph()):
@@ -175,7 +179,7 @@ async def test_ordinary_compiled_subgraph_uses_graph_scope_not_subagent_identity
 
 @pytest.mark.asyncio
 async def test_nested_compiled_subgraphs_keep_complete_task_provenance() -> None:
-    adapter = DeepAgentAgUiAdapter("run-1")
+    adapter = DeepAgentAgUiAdapter(identity=_identity())
     events: list[BaseEvent] = []
 
     async for part in _parts(_nested_parent_graph()):
@@ -207,7 +211,7 @@ async def test_nested_compiled_subgraphs_keep_complete_task_provenance() -> None
 
 
 def test_unregistered_compiled_subgraph_part_is_rejected() -> None:
-    adapter = DeepAgentAgUiAdapter("run-1")
+    adapter = DeepAgentAgUiAdapter(identity=_identity())
 
     with pytest.raises(RuntimeError, match="before its native task-start correlation"):
         adapter.process(
@@ -221,7 +225,7 @@ def test_unregistered_compiled_subgraph_part_is_rejected() -> None:
 
 
 def test_ordinary_task_start_replay_and_conflict_are_deterministic() -> None:
-    adapter = DeepAgentAgUiAdapter("run-1")
+    adapter = DeepAgentAgUiAdapter(identity=_identity())
     start = {
         "type": "tasks",
         "ns": (),
@@ -264,7 +268,7 @@ def test_ordinary_task_start_replay_and_conflict_are_deterministic() -> None:
 
 @pytest.mark.asyncio
 async def test_child_interrupt_waits_for_root_and_merges_scoped_messages() -> None:
-    adapter = DeepAgentAgUiAdapter("run-1")
+    adapter = DeepAgentAgUiAdapter(identity=_identity())
     events: list[BaseEvent] = []
     graph = _interrupting_child_graph()
     config: RunnableConfig = {"configurable": {"thread_id": "thread-1"}}
@@ -334,7 +338,7 @@ def _generic_interrupt_part(
 
 
 def test_child_interrupt_requires_identical_root_propagation() -> None:
-    adapter = DeepAgentAgUiAdapter("run-1")
+    adapter = DeepAgentAgUiAdapter(identity=_identity())
     adapter.process(_ordinary_task_start(node="child", task_id="task-1"))
     child = _generic_interrupt_part(
         namespace=("child:task-1",),
@@ -366,7 +370,7 @@ def test_child_interrupt_requires_identical_root_propagation() -> None:
 
 
 def test_same_interrupt_id_in_unrelated_child_scopes_is_rejected() -> None:
-    adapter = DeepAgentAgUiAdapter("run-1")
+    adapter = DeepAgentAgUiAdapter(identity=_identity())
     adapter.process(_ordinary_task_start(node="first", task_id="task-1"))
     adapter.process(_ordinary_task_start(node="second", task_id="task-2"))
     value = {"kind": "pause"}
@@ -392,7 +396,7 @@ def test_same_interrupt_id_in_unrelated_child_scopes_is_rejected() -> None:
 
 
 def test_root_values_rejects_a_missing_child_interrupt() -> None:
-    adapter = DeepAgentAgUiAdapter("run-1")
+    adapter = DeepAgentAgUiAdapter(identity=_identity())
     adapter.process(_ordinary_task_start(node="child", task_id="task-1"))
     adapter.process(
         _generic_interrupt_part(
@@ -414,7 +418,7 @@ def test_root_values_rejects_a_missing_child_interrupt() -> None:
 
 
 def test_exact_child_and_root_interrupt_replays_are_idempotent() -> None:
-    adapter = DeepAgentAgUiAdapter("run-1")
+    adapter = DeepAgentAgUiAdapter(identity=_identity())
     adapter.process(_ordinary_task_start(node="child", task_id="task-1"))
     child = _generic_interrupt_part(
         namespace=("child:task-1",),
@@ -445,7 +449,7 @@ def test_exact_child_and_root_interrupt_replays_are_idempotent() -> None:
 
 
 def test_child_interrupt_replay_rejects_a_changed_message_snapshot_atomically() -> None:
-    adapter = DeepAgentAgUiAdapter("run-1")
+    adapter = DeepAgentAgUiAdapter(identity=_identity())
     namespace = ("child:task-1",)
     adapter.process(_ordinary_task_start(node="child", task_id="task-1"))
 
@@ -517,7 +521,7 @@ def test_child_interrupt_replay_rejects_a_changed_message_snapshot_atomically() 
 
 
 def test_multiple_child_snapshots_merge_in_scope_registration_order() -> None:
-    adapter = DeepAgentAgUiAdapter("run-1")
+    adapter = DeepAgentAgUiAdapter(identity=_identity())
     adapter.process(_ordinary_task_start(node="first", task_id="task-1"))
     adapter.process(_ordinary_task_start(node="second", task_id="task-2"))
 
@@ -609,7 +613,7 @@ def test_scoped_prior_tool_result_does_not_replay_proposal_lifecycle() -> None:
     namespace = ("child:task-1",)
     scoped_tool_id = ScopedIdCodec().encode("tool", namespace, "native-call")
     adapter = DeepAgentAgUiAdapter(
-        "run-resumed",
+        identity=_identity(run_id="run-resumed"),
         prior_tool_call_ids=frozenset({scoped_tool_id}),
     )
     adapter.process(_ordinary_task_start(node="child", task_id="task-1"))
@@ -637,7 +641,7 @@ def test_scoped_prior_tool_result_does_not_replay_proposal_lifecycle() -> None:
 
 
 def test_nested_child_interrupt_propagates_through_ancestor_and_root_once() -> None:
-    adapter = DeepAgentAgUiAdapter("run-1")
+    adapter = DeepAgentAgUiAdapter(identity=_identity())
     adapter.process(_ordinary_task_start(node="outer", task_id="outer-task"))
     outer_namespace = ("outer:outer-task",)
     adapter.process(

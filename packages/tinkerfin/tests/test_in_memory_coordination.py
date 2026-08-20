@@ -5,7 +5,12 @@ from types import TracebackType
 
 import pytest
 
+from tinkerfin import Identity
 from tinkerfin.coordination import InMemoryRunCoordinator
+
+
+def _identity(thread_id: str, *, run_id: str = "run-1") -> Identity:
+    return Identity(threadId=thread_id, runId=run_id)
 
 
 class _ControllableLock:
@@ -34,7 +39,7 @@ class _ControllableLock:
 
 
 async def _wait_for_registered_users(
-    coordinator: InMemoryRunCoordinator[str],
+    coordinator: InMemoryRunCoordinator,
     *,
     key: str,
     users: int,
@@ -50,13 +55,13 @@ async def _wait_for_registered_users(
 
 @pytest.mark.asyncio
 async def test_same_resolved_key_never_enters_two_scopes_concurrently() -> None:
-    coordinator = InMemoryRunCoordinator[str](key_resolver=lambda principal: principal)
+    coordinator = InMemoryRunCoordinator(key_resolver=lambda value: value.thread_id)
     active = 0
     peak = 0
 
     async def coordinate() -> None:
         nonlocal active, peak
-        async with coordinator("user-1"):
+        async with coordinator(_identity("user-1")):
             active += 1
             peak = max(peak, active)
             await asyncio.sleep(0)
@@ -69,20 +74,20 @@ async def test_same_resolved_key_never_enters_two_scopes_concurrently() -> None:
 
 @pytest.mark.asyncio
 async def test_different_resolved_keys_enter_without_waiting_for_each_other() -> None:
-    coordinator = InMemoryRunCoordinator[str](key_resolver=lambda principal: principal)
+    coordinator = InMemoryRunCoordinator(key_resolver=lambda value: value.thread_id)
     release = asyncio.Event()
     attempting = (asyncio.Event(), asyncio.Event())
     entered = (asyncio.Event(), asyncio.Event())
 
-    async def coordinate(index: int, principal: str) -> None:
+    async def coordinate(index: int, identity: Identity) -> None:
         attempting[index].set()
-        async with coordinator(principal):
+        async with coordinator(identity):
             entered[index].set()
             await release.wait()
 
     tasks = (
-        asyncio.create_task(coordinate(0, "user-1")),
-        asyncio.create_task(coordinate(1, "user-2")),
+        asyncio.create_task(coordinate(0, _identity("user-1"))),
+        asyncio.create_task(coordinate(1, _identity("user-2"))),
     )
     try:
         await asyncio.gather(*(event.wait() for event in attempting))
@@ -94,17 +99,17 @@ async def test_different_resolved_keys_enter_without_waiting_for_each_other() ->
 
 @pytest.mark.asyncio
 async def test_repeated_cancellation_cannot_leak_a_waiting_key_entry() -> None:
-    coordinator = InMemoryRunCoordinator[str](key_resolver=lambda principal: principal)
+    coordinator = InMemoryRunCoordinator(key_resolver=lambda value: value.thread_id)
     holder_entered = asyncio.Event()
     release_holder = asyncio.Event()
 
     async def hold_key() -> None:
-        async with coordinator("same"):
+        async with coordinator(_identity("same", run_id="holder")):
             holder_entered.set()
             await release_holder.wait()
 
     async def wait_for_key() -> None:
-        async with coordinator("same"):
+        async with coordinator(_identity("same", run_id="waiter")):
             raise AssertionError("cancelled waiter entered the protected scope")
 
     holder = asyncio.create_task(hold_key())
@@ -131,7 +136,7 @@ async def test_repeated_cancellation_cannot_leak_a_waiting_key_entry() -> None:
         await holder
         assert coordinator._entries == {}
 
-        async with coordinator("same"):
+        async with coordinator(_identity("same", run_id="after")):
             pass
         assert coordinator._entries == {}
     finally:
@@ -144,12 +149,12 @@ async def test_repeated_cancellation_cannot_leak_a_waiting_key_entry() -> None:
 
 @pytest.mark.asyncio
 async def test_cancellation_during_settlement_preserves_the_scope_failure() -> None:
-    coordinator = InMemoryRunCoordinator[str](key_resolver=lambda principal: principal)
+    coordinator = InMemoryRunCoordinator(key_resolver=lambda value: value.thread_id)
     entered = asyncio.Event()
     fail_scope = asyncio.Event()
 
     async def fail_after_release() -> None:
-        async with coordinator("same"):
+        async with coordinator(_identity("same")):
             entered.set()
             await fail_scope.wait()
             raise ValueError("scope failed")

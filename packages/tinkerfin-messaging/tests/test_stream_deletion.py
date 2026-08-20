@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 import pytest
 
 import tinkerfin_messaging as messaging_api
+from tinkerfin import Identity
 from tinkerfin_messaging import (
     BackendOwnershipLost,
     CodecMismatch,
@@ -22,18 +23,24 @@ from tinkerfin_messaging import (
 )
 
 
+def _identity(
+    *,
+    thread_id: str = "conversation-1",
+    run_id: str = "run-1",
+) -> Identity:
+    return Identity(threadId=thread_id, runId=run_id)
+
+
 async def _prepare_memory(
     backend: MemoryBackend,
     *,
-    run: str,
+    identity: Identity,
     codec: str = "test.bytes.v1",
 ) -> PreparedRun:
     return await backend.prepare(
         channel="events",
-        stream="conversation-1",
-        run=run,
+        identity=identity,
         codec=codec,
-        identity=f"identity:{run}",
         after=0,
         cancellable=True,
         recoverable=False,
@@ -43,17 +50,15 @@ async def _prepare_memory(
 async def _prepare_backend(
     backend: MessagingBackend,
     *,
-    stream: str = "conversation-1",
-    run: str = "run-1",
+    identity: Identity | None = None,
     codec: str = "test.bytes.v1",
     cancellable: bool = False,
 ) -> PreparedRun:
+    resolved_identity = identity or _identity()
     return await backend.prepare(
         channel="events",
-        stream=stream,
-        run=run,
+        identity=resolved_identity,
         codec=codec,
-        identity=f"identity:{run}",
         after=0,
         cancellable=cancellable,
         recoverable=False,
@@ -84,8 +89,8 @@ async def test_message_channel_deletes_a_missing_stream_idempotently() -> None:
     async with Messaging(backend=MemoryBackend()) as messaging:
         channel = messaging.channel(name="events")
 
-        await channel.delete_stream(stream="conversation-1")
-        await channel.delete_stream(stream="conversation-1")
+        await channel.delete_stream(identity=_identity())
+        await channel.delete_stream(identity=_identity())
 
 
 async def test_message_channel_validates_deletion_and_obeys_its_lifecycle() -> None:
@@ -95,21 +100,26 @@ async def test_message_channel_validates_deletion_and_obeys_its_lifecycle() -> N
     channel = messaging.channel(name="events")
 
     with pytest.raises(ValueError):
-        await channel.delete_stream(stream=" not-canonical ")
+        await channel.delete_stream(
+            identity=Identity.model_construct(
+                thread_id=" not-canonical ",
+                run_id="run-1",
+            )
+        )
 
     await messaging.__aexit__(None, None, None)
     with pytest.raises(MessagingClosed):
-        await channel.delete_stream(stream="conversation-1")
+        await channel.delete_stream(identity=_identity())
 
 
 async def test_message_channel_propagates_active_stream_conflicts() -> None:
     backend = MemoryBackend()
-    prepared = await _prepare_memory(backend, run="run-1")
+    prepared = await _prepare_memory(backend, identity=_identity())
     async with Messaging(backend=backend) as messaging:
         channel = messaging.channel(name="events")
 
         with pytest.raises(messaging_api.StreamDeleteConflict):
-            await channel.delete_stream(stream="conversation-1")
+            await channel.delete_stream(identity=_identity())
 
     await backend.finish(prepared.handle, status="completed")
 
@@ -118,21 +128,19 @@ async def test_memory_delete_rejects_an_active_producer_without_cancelling() -> 
     backend = MemoryBackend()
     prepared = await backend.prepare(
         channel="events",
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         codec="test.bytes.v1",
-        identity="identity-1",
         after=0,
         cancellable=True,
         recoverable=False,
     )
 
     with pytest.raises(messaging_api.StreamDeleteConflict) as captured:
-        await backend.delete_stream(channel="events", stream="conversation-1")
+        await backend.delete_stream(channel="events", identity=_identity())
 
     assert captured.value.channel == "events"
-    assert captured.value.stream == "conversation-1"
-    assert captured.value.active_run == "run-1"
+    assert captured.value.identity == _identity()
+    assert captured.value.active_identity == _identity()
     assert await backend.request_cancel(prepared.handle) is True
     await backend.finish(prepared.handle, status="cancelled")
 
@@ -141,10 +149,8 @@ async def test_memory_delete_removes_a_terminal_stream_and_is_idempotent() -> No
     backend = MemoryBackend()
     prepared = await backend.prepare(
         channel="events",
-        stream="conversation-1",
-        run="run-1",
+        identity=_identity(),
         codec="test.bytes.v1",
-        identity="identity-1",
         after=0,
         cancellable=False,
         recoverable=False,
@@ -157,16 +163,16 @@ async def test_memory_delete_removes_a_terminal_stream_and_is_idempotent() -> No
     )
     await backend.finish(prepared.handle, status="completed")
 
-    await backend.delete_stream(channel="events", stream="conversation-1")
-    await backend.delete_stream(channel="events", stream="conversation-1")
+    await backend.delete_stream(channel="events", identity=_identity())
+    await backend.delete_stream(channel="events", identity=_identity())
 
-    assert await backend.latest_seq(channel="events", stream="conversation-1") == 0
-    assert await backend.read(channel="events", stream="conversation-1", after=0) == ()
+    assert await backend.latest_seq(channel="events", identity=_identity()) == 0
+    assert await backend.read(channel="events", identity=_identity(), after=0) == ()
 
 
 async def test_memory_rebuilds_a_deleted_name_as_an_isolated_generation() -> None:
     backend = MemoryBackend()
-    old = await _prepare_memory(backend, run="run-old")
+    old = await _prepare_memory(backend, identity=_identity(run_id="run-old"))
     await backend.append(
         old.handle,
         message_id="old-message",
@@ -174,9 +180,9 @@ async def test_memory_rebuilds_a_deleted_name_as_an_isolated_generation() -> Non
         payload=b"old",
     )
     await backend.finish(old.handle, status="completed")
-    await backend.delete_stream(channel="events", stream="conversation-1")
+    await backend.delete_stream(channel="events", identity=_identity())
 
-    new = await _prepare_memory(backend, run="run-new")
+    new = await _prepare_memory(backend, identity=_identity(run_id="run-new"))
     committed = await backend.append(
         new.handle,
         message_id="new-message",
@@ -192,7 +198,7 @@ async def test_memory_rebuilds_a_deleted_name_as_an_isolated_generation() -> Non
         message.payload
         for message in await backend.read(
             channel="events",
-            stream="conversation-1",
+            identity=_identity(),
             after=0,
         )
     ] == [b"new"]
@@ -205,19 +211,22 @@ async def test_old_handles_cannot_mutate_or_observe_a_rebuilt_stream(
 ) -> None:
     old = await _prepare_backend(
         messaging_backend,
-        run="run-old",
+        identity=_identity(run_id="run-old"),
         cancellable=True,
     )
     await messaging_backend.finish(old.handle, status="completed")
     await messaging_backend.delete_stream(
         channel="events",
-        stream="conversation-1",
+        identity=_identity(),
     )
     await messaging_backend.delete_stream(
         channel="events",
-        stream="conversation-1",
+        identity=_identity(),
     )
-    new = await _prepare_backend(messaging_backend, run="run-new")
+    new = await _prepare_backend(
+        messaging_backend,
+        identity=_identity(run_id="run-new"),
+    )
 
     operations: tuple[Callable[[], Awaitable[object]], ...] = (
         lambda: messaging_backend.append(
@@ -242,7 +251,7 @@ async def test_old_handles_cannot_mutate_or_observe_a_rebuilt_stream(
     assert (
         await messaging_backend.latest_seq(
             channel="events",
-            stream="conversation-1",
+            identity=_identity(),
         )
         == 0
     )
@@ -257,13 +266,13 @@ async def test_delete_removes_an_empty_terminal_stream_across_backends(
 
     await messaging_backend.delete_stream(
         channel="events",
-        stream="conversation-1",
+        identity=_identity(),
     )
 
     assert (
         await messaging_backend.latest_seq(
             channel="events",
-            stream="conversation-1",
+            identity=_identity(),
         )
         == 0
     )
@@ -273,13 +282,13 @@ async def test_delete_removes_an_empty_terminal_stream_across_backends(
 
 async def test_memory_delete_wakes_a_waiting_follower_with_stream_deleted() -> None:
     backend = MemoryBackend()
-    prepared = await _prepare_memory(backend, run="run-1")
+    prepared = await _prepare_memory(backend, identity=_identity())
     follower = backend.follow(prepared.handle, after=0)
     waiting = asyncio.ensure_future(anext(follower))
     await asyncio.sleep(0)
 
     await backend.finish(prepared.handle, status="completed")
-    await backend.delete_stream(channel="events", stream="conversation-1")
+    await backend.delete_stream(channel="events", identity=_identity())
 
     with pytest.raises(StreamDeleted):
         await waiting
@@ -287,14 +296,14 @@ async def test_memory_delete_wakes_a_waiting_follower_with_stream_deleted() -> N
 
 async def test_memory_delete_preserves_the_channel_codec_binding() -> None:
     backend = MemoryBackend()
-    prepared = await _prepare_memory(backend, run="run-1")
+    prepared = await _prepare_memory(backend, identity=_identity())
     await backend.finish(prepared.handle, status="completed")
-    await backend.delete_stream(channel="events", stream="conversation-1")
+    await backend.delete_stream(channel="events", identity=_identity())
 
     with pytest.raises(CodecMismatch):
         await _prepare_memory(
             backend,
-            run="run-2",
+            identity=_identity(run_id="run-2"),
             codec="test.other.v1",
         )
 
@@ -303,11 +312,10 @@ async def test_memory_unknown_owner_without_generation_is_not_stream_deleted() -
     """Keep the existing ownership error distinct from cross-generation deletion."""
 
     backend = MemoryBackend()
-    prepared = await _prepare_memory(backend, run="run-1")
+    prepared = await _prepare_memory(backend, identity=_identity())
     unknown_owner = messaging_api.BackendRunHandle(
         channel=prepared.handle.channel,
-        stream=prepared.handle.stream,
-        run=prepared.handle.run,
+        identity=prepared.handle.identity,
         owner_token="unknown",
         fence=prepared.handle.fence,
         generation=prepared.handle.generation,
@@ -322,7 +330,10 @@ async def test_memory_unknown_owner_without_generation_is_not_stream_deleted() -
 async def test_delete_rebuilds_an_isolated_generation_across_backends(
     messaging_backend: MessagingBackend,
 ) -> None:
-    old = await _prepare_backend(messaging_backend, run="run-old")
+    old = await _prepare_backend(
+        messaging_backend,
+        identity=_identity(run_id="run-old"),
+    )
     await messaging_backend.append(
         old.handle,
         message_id="old-message",
@@ -333,20 +344,20 @@ async def test_delete_rebuilds_an_isolated_generation_across_backends(
 
     await messaging_backend.delete_stream(
         channel="events",
-        stream="conversation-1",
+        identity=_identity(),
     )
 
     assert (
         await messaging_backend.latest_seq(
             channel="events",
-            stream="conversation-1",
+            identity=_identity(),
         )
         == 0
     )
     assert (
         await messaging_backend.read(
             channel="events",
-            stream="conversation-1",
+            identity=_identity(),
             after=0,
         )
         == ()
@@ -354,7 +365,10 @@ async def test_delete_rebuilds_an_isolated_generation_across_backends(
     with pytest.raises(StreamDeleted):
         await _collect(messaging_backend.follow(old.handle, after=0))
 
-    new = await _prepare_backend(messaging_backend, run="run-new")
+    new = await _prepare_backend(
+        messaging_backend,
+        identity=_identity(run_id="run-new"),
+    )
     assert old.handle.generation is not None
     assert new.handle.generation == old.handle.generation + 1
     committed = await messaging_backend.append(
@@ -378,7 +392,7 @@ async def test_delete_rejects_an_active_producer_across_backends(
     with pytest.raises(messaging_api.StreamDeleteConflict):
         await messaging_backend.delete_stream(
             channel="events",
-            stream="conversation-1",
+            identity=_identity(),
         )
 
     assert await messaging_backend.request_cancel(prepared.handle) is True
@@ -390,13 +404,11 @@ async def test_delete_preserves_other_streams_and_channel_codec_across_backends(
 ) -> None:
     deleted = await _prepare_backend(
         messaging_backend,
-        stream="stream-deleted",
-        run="run-deleted",
+        identity=_identity(thread_id="stream-deleted", run_id="run-deleted"),
     )
     retained = await _prepare_backend(
         messaging_backend,
-        stream="stream-retained",
-        run="run-retained",
+        identity=_identity(thread_id="stream-retained", run_id="run-retained"),
     )
     await messaging_backend.append(
         deleted.handle,
@@ -415,13 +427,13 @@ async def test_delete_preserves_other_streams_and_channel_codec_across_backends(
 
     await messaging_backend.delete_stream(
         channel="events",
-        stream="stream-deleted",
+        identity=_identity(thread_id="stream-deleted", run_id="run-deleted"),
     )
 
     assert (
         await messaging_backend.latest_seq(
             channel="events",
-            stream="stream-deleted",
+            identity=_identity(thread_id="stream-deleted", run_id="run-deleted"),
         )
         == 0
     )
@@ -429,15 +441,14 @@ async def test_delete_preserves_other_streams_and_channel_codec_across_backends(
         message.payload
         for message in await messaging_backend.read(
             channel="events",
-            stream="stream-retained",
+            identity=_identity(thread_id="stream-retained", run_id="run-retained"),
             after=0,
         )
     ] == [b"retained"]
     with pytest.raises(CodecMismatch):
         await _prepare_backend(
             messaging_backend,
-            stream="stream-new",
-            run="run-new",
+            identity=_identity(thread_id="stream-new", run_id="run-new"),
             codec="test.other.v1",
         )
 
@@ -447,11 +458,11 @@ async def test_delete_of_a_missing_name_does_not_consume_a_generation(
 ) -> None:
     await messaging_backend.delete_stream(
         channel="events",
-        stream="conversation-1",
+        identity=_identity(),
     )
     await messaging_backend.delete_stream(
         channel="events",
-        stream="conversation-1",
+        identity=_identity(),
     )
 
     prepared = await _prepare_backend(messaging_backend)

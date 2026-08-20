@@ -2,82 +2,73 @@
 
 [Documentation](../README.md) · [中文](../../zh/messaging/index.md)
 
-Messaging turns a single-use asynchronous source into an independent producer with persistence, replay, attachment, and cancellation. An agent can continue after a browser disconnects, and the browser can reconnect from its last durable event.
-
-## When to use it
-
-| Requirement | Need Messaging? |
-| --- | --- |
-| Consume events only inside the current request | Not necessarily |
-| Keep the agent running after disconnect | Yes |
-| Resume from `Last-Event-ID` | Yes |
-| Attach several requests to one run | Yes |
-| Cancel a run from another process | Yes, with a shared backend |
-| Save events for later reads | Yes |
+Messaging turns a single-use object stream into a durable producer that supports replay, attachment, and remote cancellation. An agent can keep running after a browser disconnects, and a later request resumes from the last durable sequence.
 
 ## Installation
 
 ```bash
-pip install "tinkerfin-messaging[agui]"
+pip install tinkerfin-messaging
 ```
 
-The default `MemoryBackend` is enough for one-process development. Add Redis when several processes must share state.
+Native and AG-UI codecs are included. Install Redis only when needed:
 
-## Turn an AG-UI stream into durable SSE
+```bash
+pip install "tinkerfin-messaging[redis]"
+```
+
+## Turn a TinkerFin stream into resumable SSE
 
 ```python
+from tinkerfin import Identity
 from tinkerfin_messaging import Messaging
 
 
+identity = Identity(threadId="thread-42", runId="run-7")
+events = agent.new_agui(identity=identity).astream(graph_input)
+
 async with Messaging() as messaging:
     channel = messaging.channel(name="agent-events")
-
-    runtime = agent.new_agui(run_input=run_input)
-    events = runtime.astream(
-        graph_input,
-        {"configurable": {"thread_id": run_input.thread_id}},
-    )
-
-    body = await channel.sse(
-        events,
-        stream=run_input.thread_id,
-        run=run_input.run_id,
-        after=0,
-        attach_identity=run_input,
-    )
+    body = await channel.sse(events, after=0)
 
     async for chunk in body:
         await send_to_client(chunk)
 ```
 
-`channel.sse()` completes durable start-or-attach checks before it returns. `body` already yields SSE bytes; do not encode it again.
+`AgUiEventStream` and `NativeGraphRunStream` carry immutable codec and Identity profiles. A name-only channel therefore needs no duplicate codec, thread, or run parameters, including for an empty source.
 
-## Four important identifiers
+The returned body already contains SSE bytes. Do not call Runtime `to_sse()` first or pass a pre-encoded `SseBody` into Messaging.
 
-| Name | Example | Purpose |
-| --- | --- | --- |
-| channel name | `agent-events` | Stable message format namespace |
-| stream | `thread-42` | One independent ordered log |
-| run | `run-7` | One producer attempt inside the stream |
-| seq | `1, 2, 3...` | Position of each committed message |
+## Custom sources
 
-Do not mix AG-UI, native LangGraph, and custom formats under one channel name. A channel handle is reusable across requests, but each supplied source is single-use.
+Custom sources have no identity profile, so provide one explicitly:
 
-## The `after` cursor
+```python
+channel = messaging.channel(name="custom", codec=codec)
+subscription = await channel.wrap(source, identity=identity, after=0)
+```
 
-`after` means “the last sequence already received.” Replay is exclusive.
+If a source has an Identity profile and an explicit different Identity is supplied, preflight fails before backend preparation or source opening.
+
+## Core concepts
+
+| Name | Purpose |
+| --- | --- |
+| channel name | Stable payload format, such as AG-UI |
+| `Identity.threadId` | Ordered log, generation, and replay cursor scope |
+| `Identity.runId` | Semantic producer and caller idempotency key |
+| `seq` | One-based committed position in the thread log |
+
+The same Identity always means the same semantic run. Reuse it for retries and attachment; use a new runId for new input. Messaging does not compare request bodies—authorization and business idempotency belong to the caller.
+
+## `after`
 
 | Value | Behavior |
 | --- | --- |
-| `None` | Start at the current tail and wait for new messages |
+| `None` | Capture the current tail during prepare and receive later data |
 | `0` | Replay from the first retained message |
-| `N` | Replay messages with `seq > N` |
+| `N` | Return messages where `seq > N` |
 
-Negative or beyond-tail cursors raise `InvalidCursor`.
-
-## Application lifetime
-
-Create one Messaging instance when the application starts and close it during shutdown:
+## Application lifecycle
 
 ```python
 async with Messaging(backend=backend) as messaging:
@@ -85,11 +76,11 @@ async with Messaging(backend=backend) as messaging:
     await serve_application(channel)
 ```
 
-Closing waits for owned producers to settle. An injected backend follows its own resource-ownership contract.
+Closing waits for owned producer settlement and cleanup.
 
 ## Next steps
 
 - [Delivery, replay, and SSE](delivery-and-replay.md)
 - [Cancellation, deferred sources, and recovery](cancellation-and-recovery.md)
-- [Redis, custom codecs, and backends](backends-and-codecs.md)
+- [Redis, codecs, and custom backends](backends-and-codecs.md)
 - [Messaging usage reference](api-reference.md)

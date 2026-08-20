@@ -8,7 +8,7 @@ const requestPayload: ChatRequestPayload = {
   threadId: 'thread-conflict',
   runId: 'run-conflict',
   state: {},
-  messages: [{ role: 'user', content: '继续执行' }],
+  messages: [{ id: 'request-run-conflict', role: 'user', content: '继续执行' }],
   tools: [],
   context: [],
   forwardedProps: {},

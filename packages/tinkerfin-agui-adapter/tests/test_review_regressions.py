@@ -8,7 +8,6 @@ import pytest
 from ag_ui.core import (
     BaseEvent,
     MessagesSnapshotEvent,
-    RunAgentInput,
     StateSnapshotEvent,
     TextMessageContentEvent,
     TextMessageStartEvent,
@@ -17,26 +16,12 @@ from langchain_core.messages import AIMessage, AIMessageChunk
 from pydantic import ValidationError
 from pydantic_core import PydanticSerializationError
 
-from tinkerfin_agui_adapter import DeepAgentAgUiAdapter, astream_events
+from tinkerfin_agui_adapter import DeepAgentAgUiAdapter, Identity, astream_events
 from tinkerfin_agui_adapter.microbatch import ContentBatcher, micro_batch
 
 
-def _run_input() -> RunAgentInput:
-    return RunAgentInput.model_validate(
-        {
-            "threadId": "thread-1",
-            "runId": "run-1",
-            "state": {},
-            "messages": [],
-            "tools": [],
-            "context": [],
-            "forwardedProps": {},
-        }
-    )
-
-
-def _run_id() -> str:
-    return "run-1"
+def _identity() -> Identity:
+    return Identity(threadId="thread-1", runId="run-1")
 
 
 def _message_part(message: AIMessageChunk) -> dict[str, object]:
@@ -48,7 +33,7 @@ def _message_part(message: AIMessageChunk) -> dict[str, object]:
 
 
 def test_message_only_values_does_not_create_a_delta_baseline() -> None:
-    adapter = DeepAgentAgUiAdapter(_run_id())
+    adapter = DeepAgentAgUiAdapter(identity=_identity())
 
     assert (
         adapter.process(
@@ -89,7 +74,7 @@ def test_content_blocks_are_business_data_not_provider_reasoning(
     business_block: dict[str, str],
 ) -> None:
     adapter = DeepAgentAgUiAdapter(
-        _run_id(), expose_reasoning_events=expose_reasoning_events
+        identity=_identity(), expose_reasoning_events=expose_reasoning_events
     )
 
     live_events = adapter.process(
@@ -166,7 +151,7 @@ async def test_successful_structured_ai_content_uses_one_business_text_projectio
         event
         async for event in astream_events(
             parts=parts(),
-            run_input=_run_input(),
+            identity=_identity(),
             expose_reasoning_events=expose_reasoning_events,
         )
     ]
@@ -185,7 +170,7 @@ async def test_successful_structured_ai_content_uses_one_business_text_projectio
 
 
 def test_opaque_content_block_fails_closed_at_snapshot_boundary() -> None:
-    adapter = DeepAgentAgUiAdapter(_run_id())
+    adapter = DeepAgentAgUiAdapter(identity=_identity())
 
     with pytest.raises(PydanticSerializationError):
         adapter.process(
@@ -238,7 +223,7 @@ def test_opaque_content_block_fails_closed_at_snapshot_boundary() -> None:
 def test_malformed_v2_container_shapes_are_rejected_without_state_mutation(
     malformed_part: dict[str, object],
 ) -> None:
-    adapter = DeepAgentAgUiAdapter(_run_id())
+    adapter = DeepAgentAgUiAdapter(identity=_identity())
     adapter.process(_message_part(AIMessageChunk(id="message-open", content="visible")))
 
     with pytest.raises(ValidationError):
@@ -291,7 +276,7 @@ def test_malformed_v2_container_shapes_are_rejected_without_state_mutation(
 def test_native_v2_objects_and_tuple_fields_reject_coerced_shapes_before_mutation(
     malformed_part: dict[str, object],
 ) -> None:
-    adapter = DeepAgentAgUiAdapter(_run_id())
+    adapter = DeepAgentAgUiAdapter(identity=_identity())
     adapter.process(
         _message_part(AIMessageChunk(id="message-open-strict", content="visible"))
     )
@@ -356,7 +341,7 @@ def test_root_state_closes_child_lifecycles_before_snapshot_or_delta(
     second_state: bool,
 ) -> None:
     adapter = DeepAgentAgUiAdapter(
-        _run_id(), expose_reasoning_events=expose_reasoning_events
+        identity=_identity(), expose_reasoning_events=expose_reasoning_events
     )
     if second_state:
         adapter.process(
@@ -693,7 +678,7 @@ async def test_cleanup_cancellation_overrides_an_earlier_pull_failure() -> None:
 @pytest.mark.asyncio
 async def test_public_stream_close_propagates_cancellation_after_cleanup() -> None:
     parts = _BlockingPartClose()
-    stream = astream_events(parts=parts, run_input=_run_input())
+    stream = astream_events(parts=parts, identity=_identity())
     assert isinstance(stream, AsyncGenerator)
     assert (await anext(stream)).type.value == "RUN_STARTED"
 
@@ -716,7 +701,7 @@ async def test_public_stream_close_propagates_upstream_cleanup_failure() -> None
     cleanup_error = RuntimeError("upstream close failed")
     parts = _BlockingPartClose(close_error=cleanup_error)
     parts.release_close.set()
-    stream = astream_events(parts=parts, run_input=_run_input())
+    stream = astream_events(parts=parts, identity=_identity())
     assert isinstance(stream, AsyncGenerator)
     assert (await anext(stream)).type.value == "RUN_STARTED"
 

@@ -80,12 +80,8 @@ result = await backend.aexecute_with_offload(
 ## 上传和下载
 
 ```python
-uploads = await backend.aupload_files(
-    [("/input/data.csv", csv_bytes)]
-)
-downloads = await backend.adownload_files(
-    ["/output/report.json"]
-)
+uploads = await backend.aupload_files([("/input/data.csv", csv_bytes)])
+downloads = await backend.adownload_files(["/output/report.json"])
 ```
 
 输入顺序和响应顺序一致。某个明确无效的路径只影响对应项；网络失败或结果不确定时会直接抛出异常，不会自动重放可能已经完成的写操作。

@@ -9,7 +9,12 @@ from redis.asyncio import Redis
 from redis.asyncio.cluster import RedisCluster
 from redis.exceptions import ConnectionError as RedisConnectionError
 
+from tinkerfin import Identity
 from tinkerfin.redis import RedisRunCoordinator
+
+
+def _identity(*, thread_id: str = "user-1", run_id: str = "run-1") -> Identity:
+    return Identity(threadId=thread_id, runId=run_id)
 
 
 def test_from_client_rejects_redis_cluster_outside_the_client_boundary() -> None:
@@ -18,7 +23,7 @@ def test_from_client_rejects_redis_cluster_outside_the_client_boundary() -> None
     with pytest.raises(TypeError, match="client boundary"):
         RedisRunCoordinator.from_client(
             cast(Redis, cluster),
-            key_resolver=lambda principal: principal,
+            key_resolver=lambda identity: identity.thread_id,
         )
 
 
@@ -136,35 +141,35 @@ class _BlockingPingAndCloseRedis(_BlockingPingRedis):
 
 
 @pytest.mark.asyncio
-async def test_from_client_borrows_redis_and_hashes_the_resolved_principal() -> None:
+async def test_from_client_borrows_redis_and_hashes_the_resolved_identity() -> None:
     client = _ScriptedRedis([1, 1])
     coordinator = RedisRunCoordinator.from_client(
         cast(Redis, client),
-        key_resolver=lambda principal: f"tenant/{principal}",
+        key_resolver=lambda identity: f"tenant/{identity.thread_id}",
     )
 
     async with coordinator:
-        async with coordinator("private-user"):
+        async with coordinator(_identity(thread_id="private-user")):
             pass
 
     assert client.close_calls == 0
     assert len(client.eval_calls) == 2
     acquire_numkeys, acquire_arguments = client.eval_calls[0]
-    assert acquire_numkeys == 1
-    generated_keys = tuple(str(value) for value in acquire_arguments[:1])
-    assert all(key.startswith("tinkerfin:run:v1:") for key in generated_keys)
+    assert acquire_numkeys == 2
+    generated_keys = tuple(str(value) for value in acquire_arguments[:2])
+    assert all(key.startswith("tinkerfin:run:v2:") for key in generated_keys)
     assert all("private-user" not in key for key in generated_keys)
 
 
 @pytest.mark.asyncio
-async def test_principal_key_is_resolved_once_per_coordinated_run() -> None:
+async def test_identity_key_is_resolved_once_per_coordinated_run() -> None:
     client = _ScriptedRedis([1, 1])
     resolver_calls = 0
 
-    def resolve(principal: str) -> str:
+    def resolve(identity: Identity) -> str:
         nonlocal resolver_calls
         resolver_calls += 1
-        return principal
+        return identity.thread_id
 
     coordinator = RedisRunCoordinator.from_client(
         cast(Redis, client),
@@ -172,7 +177,7 @@ async def test_principal_key_is_resolved_once_per_coordinated_run() -> None:
     )
 
     async with coordinator:
-        async with coordinator("user-1"):
+        async with coordinator(_identity()):
             pass
 
     assert resolver_calls == 1
@@ -189,27 +194,24 @@ async def test_lost_lease_cancellation_survives_a_release_failure() -> None:
     )
     coordinator = RedisRunCoordinator.from_client(
         cast(Redis, client),
-        key_resolver=lambda principal: principal,
+        key_resolver=lambda identity: identity.thread_id,
         lease_ttl_seconds=0.1,
         renew_interval_seconds=0.01,
     )
 
     async def run_until_lease_is_lost() -> None:
         async with coordinator:
-            async with coordinator("user-1"):
+            async with coordinator(_identity()):
                 await asyncio.Event().wait()
 
     task = asyncio.create_task(run_until_lease_is_lost())
     with pytest.raises(
         asyncio.CancelledError,
-        match="Redis run coordination lease lost",
+        match="Redis lease lost",
     ) as raised:
         await asyncio.wait_for(task, timeout=0.5)
 
-    assert any(
-        "Redis run coordination release failed" in note
-        for note in raised.value.__notes__
-    )
+    assert any("Redis lease release failed" in note for note in raised.value.__notes__)
 
 
 @pytest.mark.asyncio
@@ -223,19 +225,19 @@ async def test_unverifiable_renewal_fails_closed_and_cancels_the_owner() -> None
     )
     coordinator = RedisRunCoordinator.from_client(
         cast(Redis, client),
-        key_resolver=lambda principal: principal,
+        key_resolver=lambda identity: identity.thread_id,
         lease_ttl_seconds=0.1,
         renew_interval_seconds=0.01,
     )
 
     async def run_until_renewal_is_unverifiable() -> None:
         async with coordinator:
-            async with coordinator("user-1"):
+            async with coordinator(_identity()):
                 await asyncio.Event().wait()
 
     with pytest.raises(
         asyncio.CancelledError,
-        match="Redis run coordination lease lost",
+        match="Redis lease lost",
     ):
         await asyncio.wait_for(
             run_until_renewal_is_unverifiable(),
@@ -254,19 +256,19 @@ async def test_unexpected_renewal_failure_cancels_the_owner() -> None:
     )
     coordinator = RedisRunCoordinator.from_client(
         cast(Redis, client),
-        key_resolver=lambda principal: principal,
+        key_resolver=lambda identity: identity.thread_id,
         lease_ttl_seconds=0.1,
         renew_interval_seconds=0.01,
     )
 
     async def run_until_renewal_is_unverifiable() -> None:
         async with coordinator:
-            async with coordinator("user-1"):
+            async with coordinator(_identity()):
                 await asyncio.Event().wait()
 
     with pytest.raises(
         asyncio.CancelledError,
-        match="Redis run coordination lease lost",
+        match="Redis lease lost",
     ):
         await asyncio.wait_for(
             run_until_renewal_is_unverifiable(),
@@ -279,14 +281,14 @@ async def test_coordinator_close_waits_for_active_run_release() -> None:
     client = _ScriptedRedis([1, 1])
     coordinator = RedisRunCoordinator.from_client(
         cast(Redis, client),
-        key_resolver=lambda principal: principal,
+        key_resolver=lambda identity: identity.thread_id,
     )
     await coordinator.__aenter__()
     entered = asyncio.Event()
     release_run = asyncio.Event()
 
     async def run() -> None:
-        async with coordinator("user-1"):
+        async with coordinator(_identity()):
             entered.set()
             await release_run.wait()
 
@@ -323,7 +325,7 @@ async def test_from_url_closes_its_client_when_health_check_fails(
     monkeypatch.setattr(Redis, "from_url", staticmethod(from_url))
     coordinator = RedisRunCoordinator.from_url(
         "redis://coordination.example/0",
-        key_resolver=lambda principal: principal,
+        key_resolver=lambda identity: identity.thread_id,
     )
 
     with pytest.raises(RuntimeError, match="health check failed"):
@@ -346,7 +348,7 @@ async def test_from_url_closes_owned_client_after_non_redis_health_failure(
     )
     coordinator = RedisRunCoordinator.from_url(
         "redis://coordination.example/0",
-        key_resolver=lambda principal: principal,
+        key_resolver=lambda identity: identity.thread_id,
     )
 
     with pytest.raises(ValueError) as raised:
@@ -369,7 +371,7 @@ async def test_from_url_cancellation_closes_owned_client_before_propagating(
     )
     coordinator = RedisRunCoordinator.from_url(
         "redis://coordination.example/0",
-        key_resolver=lambda principal: principal,
+        key_resolver=lambda identity: identity.thread_id,
     )
     entering = asyncio.create_task(coordinator.__aenter__())
     await client.ping_started.wait()
@@ -395,7 +397,7 @@ async def test_concurrent_enter_allows_exactly_one_caller() -> None:
     client = _BlockingPingRedis()
     coordinator = RedisRunCoordinator.from_client(
         cast(Redis, client),
-        key_resolver=lambda principal: principal,
+        key_resolver=lambda identity: identity.thread_id,
     )
     first = asyncio.create_task(coordinator.__aenter__())
     await client.ping_started.wait()
@@ -422,14 +424,14 @@ async def test_close_cancellation_waits_for_active_run_cleanup() -> None:
     client = _ScriptedRedis([1, 1])
     coordinator = RedisRunCoordinator.from_client(
         cast(Redis, client),
-        key_resolver=lambda principal: principal,
+        key_resolver=lambda identity: identity.thread_id,
     )
     await coordinator.__aenter__()
     entered = asyncio.Event()
     release_run = asyncio.Event()
 
     async def run() -> None:
-        async with coordinator("user-1"):
+        async with coordinator(_identity()):
             entered.set()
             await release_run.wait()
 
@@ -455,7 +457,7 @@ async def test_close_cancellation_waits_for_active_run_cleanup() -> None:
         await coordinator.__aexit__(None, None, None)
 
     with pytest.raises(RuntimeError, match="entered before use"):
-        async with coordinator("user-2"):
+        async with coordinator(_identity(thread_id="user-2")):
             pass
 
 
@@ -464,14 +466,14 @@ async def test_acquisition_that_finishes_after_close_does_not_enter_run() -> Non
     client = _BlockingAcquireRedis()
     coordinator = RedisRunCoordinator.from_client(
         cast(Redis, client),
-        key_resolver=lambda principal: principal,
+        key_resolver=lambda identity: identity.thread_id,
     )
     await coordinator.__aenter__()
     entered = False
 
     async def run() -> None:
         nonlocal entered
-        async with coordinator("user-1"):
+        async with coordinator(_identity()):
             entered = True
 
     running = asyncio.create_task(run())
@@ -493,14 +495,14 @@ async def test_cancellation_after_acquire_commit_waits_for_reply_and_releases() 
     client = _CommittedBlockingAcquireRedis()
     coordinator = RedisRunCoordinator.from_client(
         cast(Redis, client),
-        key_resolver=lambda principal: principal,
+        key_resolver=lambda identity: identity.thread_id,
     )
     await coordinator.__aenter__()
     entered = False
 
     async def run() -> None:
         nonlocal entered
-        async with coordinator("user-1"):
+        async with coordinator(_identity()):
             entered = True
 
     running = asyncio.create_task(run())

@@ -18,7 +18,9 @@ from dataclasses import dataclass, field
 from types import TracebackType
 from typing import Generic, Literal, Never, Self, TypeAlias, TypeVar, cast, overload
 
-from ._identity import AttachIdentity, identity_digest, required_identifier
+from tinkerfin_agui_adapter import Identity
+
+from ._identity import required_identifier, required_identity
 from .backend import BackendRunHandle, MemoryBackend, MessagingBackend, PreparedRun
 from .errors import (
     BackendOwnershipLost,
@@ -66,10 +68,10 @@ _ProducerFailureStage: TypeAlias = Literal[
 ]
 
 
-def _derived_message_id(run: str, ordinal: int) -> str:
+def _derived_message_id(identity: Identity, ordinal: int) -> str:
     """Keep ordinary message IDs bounded without changing the common readable form."""
 
-    candidate = f"{run}:{ordinal}"
+    candidate = f"{identity.run_id}:{ordinal}"
     if len(candidate) <= 1024:
         return candidate
     digest = hashlib.sha256(candidate.encode()).hexdigest()
@@ -81,8 +83,11 @@ class CancelContext:
     """Identify the run whose accepted cancellation invokes a callback."""
 
     channel: str
-    stream: str
-    run: str
+    identity: Identity
+
+    def __post_init__(self) -> None:
+        required_identifier("channel", self.channel)
+        required_identity(self.identity)
 
 
 _CancelResult: TypeAlias = (
@@ -167,7 +172,10 @@ def _normalize_cancel_callback(
 
     try:
         signature.bind(
-            CancelContext(channel="callback", stream="callback", run="callback")
+            CancelContext(
+                channel="callback",
+                identity=Identity(threadId="callback", runId="callback"),
+            )
         )
     except TypeError as error:
         raise TypeError(
@@ -299,7 +307,7 @@ class MessageSubscription(Generic[ReplayT]):
 
 
 class MessageChannel(Generic[SourceT, ReplayT]):
-    """Bind one stable codec to caller-defined stream and run identities."""
+    """Bind one stable codec to shared framework run identities."""
 
     def __init__(
         self,
@@ -325,6 +333,26 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         self._codec = codec
         self._renderer = renderer
         self._inferred_profile: str | None = None
+
+    @staticmethod
+    def _resolve_identity(source: object, identity: Identity | None) -> Identity:
+        """Resolve one explicit or immutable source identity before side effects."""
+
+        explicit = None if identity is None else required_identity(identity)
+        source_identity = getattr(source, "messaging_identity", None)
+        profiled = (
+            None if source_identity is None else required_identity(source_identity)
+        )
+        if profiled is None:
+            if explicit is None:
+                raise TypeError(
+                    "source does not advertise messaging_identity; provide "
+                    "identity explicitly"
+                )
+            return explicit
+        if explicit is not None and explicit != profiled:
+            raise ValueError("explicit identity must match source messaging_identity")
+        return profiled
 
     def _resolve_binding(
         self,
@@ -455,16 +483,16 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         if not 1 <= limit <= 1000:
             raise ValueError("limit must be between 1 and 1000")
 
-    async def latest_seq(self, *, stream: str) -> int:
+    async def latest_seq(self, *, identity: Identity) -> int:
         """Return the greatest committed sequence, or zero for an empty stream."""
 
         preflight = self._messaging._begin_preflight()
         try:
-            canonical_stream = required_identifier("stream", stream)
+            required_identity(identity)
             self._messaging._require_open()
             latest = await self._messaging.backend.latest_seq(
                 channel=self.name,
-                stream=canonical_stream,
+                identity=identity,
             )
             self._messaging._require_open()
             return latest
@@ -474,7 +502,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
     async def read(
         self,
         *,
-        stream: str,
+        identity: Identity,
         after: int = 0,
         limit: int = 100,
     ) -> tuple[DecodedMessage[ReplayT], ...]:
@@ -483,13 +511,13 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         self._validate_page(after=after, limit=limit)
         preflight = self._messaging._begin_preflight()
         try:
-            canonical_stream = required_identifier("stream", stream)
+            required_identity(identity)
             codec = self._require_read_codec()
             expected_codec = required_identifier("codec_id", codec.codec_id)
             self._messaging._require_open()
             envelopes = await self._messaging.backend.read(
                 channel=self.name,
-                stream=canonical_stream,
+                identity=identity,
                 after=after,
                 limit=limit,
             )
@@ -514,8 +542,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
     async def follow(
         self,
         *,
-        stream: str,
-        run: str,
+        identity: Identity,
         after: int = 0,
     ) -> MessageSubscription[ReplayT]:
         """Follow one run's committed events through its authoritative terminal."""
@@ -523,14 +550,12 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         preflight = self._messaging._begin_preflight()
         try:
             self._validate_page(after=after)
-            canonical_stream = required_identifier("stream", stream)
-            canonical_run = required_identifier("run", run)
+            required_identity(identity)
             codec = self._require_read_codec()
             self._messaging._require_open()
             handle = await self._messaging.backend.bind_follow(
                 channel=self.name,
-                stream=canonical_stream,
-                run=canonical_run,
+                identity=identity,
             )
             self._messaging._require_open()
             return MessageSubscription(
@@ -542,7 +567,12 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         finally:
             self._messaging._finish_preflight(preflight)
 
-    async def validate_cursor(self, *, stream: str, after: int | None) -> None:
+    async def validate_cursor(
+        self,
+        *,
+        identity: Identity,
+        after: int | None,
+    ) -> None:
         """Validate one replay cursor without creating or attaching a run.
 
         This read-only preflight lets a host reject an out-of-range reconnect cursor
@@ -550,26 +580,26 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         validation atomically with its start-or-attach decision.
 
         Args:
-            stream: Caller-defined ordering scope whose committed tail is checked.
+            identity: Run identity whose thread-level committed tail is checked.
             after: Exclusive replay cursor, or `None` to start at the current tail.
 
         Raises:
             InvalidCursor: `after` falls outside the current committed range.
             MessagingError: Messaging closes while the backend lookup is in flight.
             TypeError: `after` is neither an integer nor `None`.
-            ValueError: `stream` is not a canonical identifier.
+            ValueError: `identity` contains a non-canonical identifier.
         """
 
         preflight = self._messaging._begin_preflight()
         try:
-            canonical_stream = required_identifier("stream", stream)
+            required_identity(identity)
             if after is None:
                 return
             if isinstance(after, bool) or not isinstance(after, int):
                 raise TypeError("after must be an integer or None")
             latest = await self._messaging.backend.latest_seq(
                 channel=self.name,
-                stream=canonical_stream,
+                identity=identity,
             )
             self._messaging._require_open()
             if after < 0 or after > latest:
@@ -582,10 +612,8 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         self,
         source: MessageSource[SourceT],
         *,
-        stream: str,
-        run: str,
+        identity: Identity,
         after: int | None = None,
-        attach_identity: AttachIdentity | None = None,
         cancel: CancelCallback[SourceT] | None = None,
         on_committed: CommittedCallback | None = None,
     ) -> MessageSubscription[ReplayT]: ...
@@ -595,10 +623,8 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         self,
         source: ProfiledMessageSource[ProfileSourceT, ProfileReplayT],
         *,
-        stream: str,
-        run: str,
+        identity: Identity | None = None,
         after: int | None = None,
-        attach_identity: AttachIdentity | None = None,
         cancel: CancelCallback[ProfileSourceT] | None = None,
         on_committed: CommittedCallback | None = None,
     ) -> MessageSubscription[ProfileReplayT]: ...
@@ -610,10 +636,8 @@ class MessageChannel(Generic[SourceT, ReplayT]):
             | ProfiledMessageSource[ProfileSourceT, ProfileReplayT]
         ),
         *,
-        stream: str,
-        run: str,
+        identity: Identity | None = None,
         after: int | None = None,
-        attach_identity: AttachIdentity | None = None,
         cancel: (
             CancelCallback[SourceT] | CancelCallback[ProfileSourceT] | None
         ) = None,
@@ -623,10 +647,8 @@ class MessageChannel(Generic[SourceT, ReplayT]):
             MessageSubscription[ReplayT] | MessageSubscription[ProfileReplayT],
             await self._wrap(
                 cast(MessageSource[object], source),
-                stream=stream,
-                run=run,
+                identity=identity,
                 after=after,
-                attach_identity=attach_identity,
                 cancel=cast(CancelCallback[object] | None, cancel),
                 on_committed=on_committed,
             ),
@@ -636,10 +658,8 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         self,
         source: MessageSource[object],
         *,
-        stream: str,
-        run: str,
+        identity: Identity | None = None,
         after: int | None = None,
-        attach_identity: AttachIdentity | None = None,
         cancel: CancelCallback[object] | None = None,
         on_committed: CommittedCallback | None = None,
     ) -> MessageSubscription[object]:
@@ -647,10 +667,9 @@ class MessageChannel(Generic[SourceT, ReplayT]):
 
         Args:
             source: Single-use source owned and eventually closed by Messaging.
-            stream: Caller-defined ordering and producer-concurrency scope.
-            run: Caller-defined producer identity within the stream.
+            identity: Explicit run identity for a custom source, or an optional
+                equality check for a profiled TinkerFin source.
             after: Exclusive durable replay cursor, or the current tail when omitted.
-            attach_identity: Finite request facts that must agree for run attachment.
             cancel: At-most-once synchronous or asynchronous callback. Omit it when the
                 source declares `messaging_cancel_callback`. Supplying the same owner
                 is accepted; a different callback is an ownership error. A callback
@@ -670,7 +689,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         Raises:
             MessagingError: Backend preflight or producer startup is rejected.
             TypeError: `cancel` does not expose one of the supported signatures.
-            ValueError: A stream or run identifier is not canonical.
+            ValueError: The explicit and source identities conflict.
         """
 
         preflight = self._messaging._begin_preflight()
@@ -683,8 +702,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
             producer_codec = cast(MessageCodec[object, object], codec)
             replay_renderer = cast(SseRenderer[object] | None, renderer)
             codec_id = required_identifier("codec_id", codec.codec_id)
-            required_identifier("stream", stream)
-            required_identifier("run", run)
+            resolved_identity = self._resolve_identity(source, identity)
             source_cancel = getattr(source, "messaging_cancel_callback", None)
             if source_cancel is not None:
                 if cancel is not None:
@@ -705,10 +723,8 @@ class MessageChannel(Generic[SourceT, ReplayT]):
                 normalized_cancel = _normalize_cancel_callback(cancel)
             prepared = await self._messaging.backend.prepare(
                 channel=self.name,
-                stream=stream,
-                run=run,
+                identity=resolved_identity,
                 codec=codec_id,
-                identity=identity_digest(attach_identity),
                 after=after,
                 cancellable=normalized_cancel is not None,
                 recoverable=False,
@@ -764,10 +780,8 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         self,
         source: MessageSource[SourceT],
         *,
-        stream: str,
-        run: str,
+        identity: Identity,
         after: int | Callable[[], int | None] | None = None,
-        attach_identity: AttachIdentity | None = None,
         cancel: CancelCallback[SourceT] | None = None,
         on_committed: CommittedCallback | None = None,
     ) -> AsyncIterator[bytes]: ...
@@ -777,10 +791,8 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         self,
         source: ProfiledMessageSource[ProfileSourceT, ProfileReplayT],
         *,
-        stream: str,
-        run: str,
+        identity: Identity | None = None,
         after: int | Callable[[], int | None] | None = None,
-        attach_identity: AttachIdentity | None = None,
         cancel: CancelCallback[ProfileSourceT] | None = None,
         on_committed: CommittedCallback | None = None,
     ) -> AsyncIterator[bytes]: ...
@@ -789,10 +801,8 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         self,
         source: MessageSource[object],
         *,
-        stream: str,
-        run: str,
+        identity: Identity | None = None,
         after: int | Callable[[], int | None] | None = None,
-        attach_identity: AttachIdentity | None = None,
         cancel: CancelCallback[object] | None = None,
         on_committed: CommittedCallback | None = None,
     ) -> AsyncIterator[bytes]:
@@ -800,12 +810,11 @@ class MessageChannel(Generic[SourceT, ReplayT]):
 
         Args:
             source: Single-use object source owned and eventually closed by Messaging.
-            stream: Caller-defined ordering and producer-concurrency scope.
-            run: Caller-defined producer identity within the stream.
+            identity: Explicit run identity for a custom source, or an optional
+                equality check for a profiled TinkerFin source.
             after: Exclusive replay cursor, a zero-argument synchronous resolver
                 returning one, or `None` to start at the current tail. A resolver is
                 invoked exactly once before durable preparation.
-            attach_identity: Finite request facts that must agree for run attachment.
             cancel: Optional callback used for accepted remote cancellation. Omit it
                 when the source declares its own callback.
             on_committed: Optional owner-only observer for newly committed envelopes.
@@ -816,7 +825,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         Raises:
             MessagingError: Durable preparation or producer startup is rejected.
             TypeError: The resolved cursor is neither an integer nor `None`.
-            ValueError: A stream or run identifier is not canonical.
+            ValueError: The explicit and source identities conflict.
         """
 
         try:
@@ -827,10 +836,8 @@ class MessageChannel(Generic[SourceT, ReplayT]):
 
         subscription = await self._wrap(
             source,
-            stream=stream,
-            run=run,
+            identity=identity,
             after=resolved_after,
-            attach_identity=attach_identity,
             cancel=cancel,
             on_committed=on_committed,
         )
@@ -844,10 +851,8 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         self,
         source: RecoverableSource[SourceT],
         *,
-        stream: str,
-        run: str,
+        identity: Identity | None = None,
         after: int | None = None,
-        attach_identity: AttachIdentity | None = None,
         cancel: CancelCallback[RecoverableMessage[SourceT]] | None = None,
         on_committed: CommittedCallback | None = None,
     ) -> MessageSubscription[ReplayT]:
@@ -855,10 +860,9 @@ class MessageChannel(Generic[SourceT, ReplayT]):
 
         Args:
             source: Factory that rebuilds one owned source from a checkpoint.
-            stream: Caller-defined ordering and producer-concurrency scope.
-            run: Caller-defined producer identity within the stream.
+            identity: Explicit run identity for a custom source, or an optional
+                equality check for a profiled source factory.
             after: Exclusive durable replay cursor, or the current tail when omitted.
-            attach_identity: Finite request facts that must agree for run attachment.
             cancel: At-most-once synchronous or asynchronous callback. Returned tail
                 values must be `RecoverableMessage` instances with stable IDs and
                 matching checkpoints. The callback is responsible for causing the
@@ -874,7 +878,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         Raises:
             MessagingError: Backend preflight, recovery, or startup is rejected.
             TypeError: `cancel` does not expose one of the supported signatures.
-            ValueError: A stream or run identifier is not canonical.
+            ValueError: The explicit and source identities conflict.
         """
 
         preflight = self._messaging._begin_preflight()
@@ -887,16 +891,13 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         try:
             codec, renderer, profile = self._resolve_binding(source)
             codec_id = required_identifier("codec_id", codec.codec_id)
-            required_identifier("stream", stream)
-            required_identifier("run", run)
+            resolved_identity = self._resolve_identity(source, identity)
             if cancel is not None:
                 normalized_cancel = _normalize_cancel_callback(cancel)
             prepared = await self._messaging.backend.prepare(
                 channel=self.name,
-                stream=stream,
-                run=run,
+                identity=resolved_identity,
                 codec=codec_id,
-                identity=identity_digest(attach_identity),
                 after=after,
                 cancellable=normalized_cancel is not None,
                 recoverable=True,
@@ -948,12 +949,11 @@ class MessageChannel(Generic[SourceT, ReplayT]):
             renderer=renderer,
         )
 
-    async def cancel(self, *, stream: str, run: str) -> bool:
+    async def cancel(self, *, identity: Identity) -> bool:
         """Request cancellation and wait until the durable run status is final.
 
         Args:
-            stream: Stream containing the target run.
-            run: Run whose registered callback should be invoked.
+            identity: Thread and run identity whose callback should be invoked.
 
         Returns:
             `True` only when this call initiated cancellation and the run settled as
@@ -967,10 +967,10 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         """
 
         self._messaging._require_open()
+        required_identity(identity)
         handle = BackendRunHandle(
             channel=self.name,
-            stream=required_identifier("stream", stream),
-            run=required_identifier("run", run),
+            identity=identity,
             owner_token=None,
             fence=None,
         )
@@ -979,32 +979,33 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         if status in {"failed", "owner_lost"}:
             cause = await self._messaging.backend.failure(handle)
             raise RunProducerFailed(
-                run=run,
-                cause=cause or RuntimeError(f"Producer for run {run!r} stopped"),
+                identity=identity,
+                cause=cause
+                or RuntimeError(f"Producer for run {identity.run_id!r} stopped"),
             )
         return initiated and status == "cancelled"
 
-    async def delete_stream(self, *, stream: str) -> None:
+    async def delete_stream(self, *, identity: Identity) -> None:
         """Delete one inactive durable stream without changing the channel codec.
 
         Missing and previously deleted streams are successful no-ops. Deletion never
         requests producer cancellation; callers must settle an active run first.
 
         Args:
-            stream: Ordering and producer-concurrency scope to delete.
+            identity: Identity whose thread-level durable stream is deleted.
 
         Raises:
             MessagingError: Messaging closes or the backend rejects deletion.
             StreamDeleteConflict: The stream still has an active producer.
-            ValueError: `stream` is not a canonical identifier.
+            ValueError: `identity` contains a non-canonical identifier.
         """
 
         preflight = self._messaging._begin_preflight()
         try:
-            canonical_stream = required_identifier("stream", stream)
+            required_identity(identity)
             await self._messaging.backend.delete_stream(
                 channel=self.name,
-                stream=canonical_stream,
+                identity=identity,
             )
             self._messaging._require_open()
         finally:
@@ -1238,7 +1239,7 @@ class Messaging:
         def prepare_item(item: SourceT, ordinal: int) -> _ProducedMessage[SourceT]:
             return _ProducedMessage(
                 data=item,
-                message_id=_derived_message_id(prepared.handle.run, ordinal),
+                message_id=_derived_message_id(prepared.handle.identity, ordinal),
                 checkpoint=None,
             )
 
@@ -1265,7 +1266,7 @@ class Messaging:
 
         opening = asyncio.create_task(
             source.open(prepared.checkpoint),
-            name=f"tinkerfin-messaging-source-open:{prepared.handle.run}",
+            name=(f"tinkerfin-messaging-source-open:{prepared.handle.identity.run_id}"),
         )
 
         async def renew_until_opened() -> None:
@@ -1274,13 +1275,14 @@ class Messaging:
                 renewed = await self.backend.renew(prepared.handle)
                 if not renewed:
                     raise BackendOwnershipLost(
-                        f"Producer for run {prepared.handle.run!r} lost its lease "
+                        "Producer for run "
+                        f"{prepared.handle.identity.run_id!r} lost its lease "
                         "while reopening its source"
                     )
 
         renewing = asyncio.create_task(
             renew_until_opened(),
-            name=f"tinkerfin-messaging-open-lease:{prepared.handle.run}",
+            name=(f"tinkerfin-messaging-open-lease:{prepared.handle.identity.run_id}"),
         )
         claimed = False
         try:
@@ -1361,8 +1363,7 @@ class Messaging:
         started = asyncio.Event()
         cancel_context = CancelContext(
             channel=prepared.handle.channel,
-            stream=prepared.handle.stream,
-            run=prepared.handle.run,
+            identity=prepared.handle.identity,
         )
 
         async def produce() -> None:
@@ -1406,8 +1407,8 @@ class Messaging:
                     "Messaging producer retained a secondary failure",
                     extra={
                         "channel": prepared.handle.channel,
-                        "stream": prepared.handle.stream,
-                        "run": prepared.handle.run,
+                        "thread_id": prepared.handle.identity.thread_id,
+                        "run_id": prepared.handle.identity.run_id,
                         "primary_stage": primary_stage,
                         "secondary_stage": stage,
                         "ownership_lost": isinstance(
@@ -1476,10 +1477,11 @@ class Messaging:
                             except Exception as observer_error:  # noqa: BLE001 - observer isolation
                                 logger.error(
                                     "Committed message hook failed: "
-                                    "channel=%s stream=%s run=%s seq=%s error_type=%s",
+                                    "channel=%s thread_id=%s run_id=%s seq=%s "
+                                    "error_type=%s",
                                     envelope.channel,
-                                    envelope.stream,
-                                    envelope.run,
+                                    envelope.identity.thread_id,
+                                    envelope.identity.run_id,
                                     envelope.seq,
                                     type(observer_error).__name__,
                                 )
@@ -1497,7 +1499,9 @@ class Messaging:
 
             committer = asyncio.create_task(
                 commit_messages(),
-                name=f"tinkerfin-messaging-committer:{prepared.handle.run}",
+                name=(
+                    f"tinkerfin-messaging-committer:{prepared.handle.identity.run_id}"
+                ),
             )
 
             def enqueue_acquired(item: ProducedT) -> _PendingCommit[ProducedT]:
@@ -1541,7 +1545,7 @@ class Messaging:
 
             source_consumer = asyncio.create_task(
                 consume_source(),
-                name=f"tinkerfin-messaging-source:{prepared.handle.run}",
+                name=(f"tinkerfin-messaging-source:{prepared.handle.identity.run_id}"),
             )
 
             def claim_settlement() -> asyncio.Task[bool]:
@@ -1551,7 +1555,10 @@ class Messaging:
                     return existing
                 settlement_task = asyncio.create_task(
                     self.backend.begin_settlement(prepared.handle),
-                    name=f"tinkerfin-messaging-settlement:{prepared.handle.run}",
+                    name=(
+                        "tinkerfin-messaging-settlement:"
+                        f"{prepared.handle.identity.run_id}"
+                    ),
                 )
                 return settlement_task
 
@@ -1581,7 +1588,10 @@ class Messaging:
 
                 cancel_callback_task = asyncio.create_task(
                     invoke(),
-                    name=f"tinkerfin-messaging-cancel-callback:{prepared.handle.run}",
+                    name=(
+                        "tinkerfin-messaging-cancel-callback:"
+                        f"{prepared.handle.identity.run_id}"
+                    ),
                 )
                 return cancel_callback_task, True
 
@@ -1598,7 +1608,9 @@ class Messaging:
             if cancel is not None:
                 cancel_watcher = asyncio.create_task(
                     watch_cancel(),
-                    name=f"tinkerfin-messaging-cancel:{prepared.handle.run}",
+                    name=(
+                        f"tinkerfin-messaging-cancel:{prepared.handle.identity.run_id}"
+                    ),
                 )
 
             async def renew_lease(interval: float) -> None:
@@ -1616,7 +1628,8 @@ class Messaging:
                     if not renewed:
                         state.ownership_lost = True
                         state.ownership_error = BackendOwnershipLost(
-                            f"Producer for run {prepared.handle.run!r} lost its lease"
+                            "Producer for run "
+                            f"{prepared.handle.identity.run_id!r} lost its lease"
                         )
                         source_consumer.cancel()
                         return
@@ -1625,7 +1638,9 @@ class Messaging:
             if renew_interval is not None:
                 lease_renewer = asyncio.create_task(
                     renew_lease(renew_interval),
-                    name=f"tinkerfin-messaging-lease:{prepared.handle.run}",
+                    name=(
+                        f"tinkerfin-messaging-lease:{prepared.handle.identity.run_id}"
+                    ),
                 )
             try:
                 await asyncio.shield(source_consumer)
@@ -1804,7 +1819,7 @@ class Messaging:
 
         task = asyncio.create_task(
             produce(),
-            name=f"tinkerfin-messaging-producer:{prepared.handle.run}",
+            name=(f"tinkerfin-messaging-producer:{prepared.handle.identity.run_id}"),
         )
         self._producer_tasks.add(task)
         task.add_done_callback(self._producer_finished)

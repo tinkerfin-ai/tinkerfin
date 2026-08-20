@@ -8,7 +8,7 @@
 
 | 事件 | 前端通常怎么用 |
 | --- | --- |
-| `RUN_STARTED` | 建立运行状态，读取完整请求输入 |
+| `RUN_STARTED` | 建立运行状态；纯框架事件的 `input` 为 `None`，应用可补充权威请求 |
 | `TEXT_MESSAGE_START` | 创建一条新的 Agent 消息 |
 | `TEXT_MESSAGE_CONTENT` | 追加回答文字 |
 | `TEXT_MESSAGE_END` | 结束这条消息 |
@@ -44,7 +44,7 @@ RUN_FINISHED
 
 `expose_subagent_events=True` 会发送子 Agent 的公开事件。设置为 `False` 时，转换器仍会检查这些数据，但不把对应事件交给前端。
 
-不要用 `parentRunId` 表示 LangGraph 子图。`parentRunId` 是调用方定义的运行关系；子图来源由事件自己的 namespace 和关联信息表示。
+框架不会用 `parentRunId` 表示 LangGraph 子图，也不会自动生成该字段。子图来源由 namespace 和事件关联信息表示；业务需要父子关系时应使用自己的可信映射。
 
 ## 推理事件
 
@@ -52,7 +52,7 @@ RUN_FINISHED
 
 ```python
 runtime = agent.new_agui(
-    run_input=run_input,
+    identity=identity,
     expose_reasoning_events=True,
 )
 ```
@@ -91,7 +91,7 @@ async def audit_event(event) -> None:
 
 
 runtime = agent.new_agui(
-    run_input=run_input,
+    identity=identity,
     on_event=audit_event,
 )
 ```
@@ -99,4 +99,3 @@ runtime = agent.new_agui(
 `on_event` 在事件交给消费者前执行。它适合审计和指标，不适合阻塞 I/O。
 
 下一篇：[interrupt 与恢复](interrupts-and-resume.md)。
-

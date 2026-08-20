@@ -1,14 +1,22 @@
-"""Optional Redis-backed per-principal run coordination."""
+"""Optional Redis leases and Identity-driven run coordination."""
 
 from __future__ import annotations
 
 try:
     from ._backend import RedisRunCoordinator as RedisRunCoordinator
+    from ._lease_lock import RedisLease as RedisLease
+    from ._lease_lock import RedisLeaseLock as RedisLeaseLock
+    from ._lease_lock import RedisLeaseLost as RedisLeaseLost
 except ModuleNotFoundError as error:
     if error.name == "redis":
         raise ModuleNotFoundError(
-            'Redis coordination requires `pip install "tinkerfin[redis]"`.'
+            'Redis integration requires `pip install "tinkerfin[redis]"`.'
         ) from error
     raise
 
-__all__ = ["RedisRunCoordinator"]
+__all__ = [
+    "RedisLease",
+    "RedisLeaseLock",
+    "RedisLeaseLost",
+    "RedisRunCoordinator",
+]

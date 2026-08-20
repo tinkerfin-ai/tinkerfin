@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import cast
 
 import yaml
-from ag_ui.core import BaseEvent, RunAgentInput, RunErrorEvent, RunStartedEvent
+from ag_ui.core import BaseEvent
 from anyio import to_thread
 from deepagents.backends.composite import CompositeBackend
 from deepagents.backends.store import StoreBackend
@@ -18,7 +18,6 @@ from langchain.agents.middleware import InterruptOnConfig, TodoListMiddleware
 from langchain.agents.middleware.types import InputAgentState
 from langchain.chat_models.base import init_chat_model
 from langchain_core.language_models import BaseChatModel
-from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
 from langgraph.types import Command
 from pydantic import BaseModel, ConfigDict, Field, RootModel
@@ -30,13 +29,17 @@ from tinkerfin import (
     TinkerFin,
 )
 from tinkerfin_messaging import (
-    DeferredMessageSource,
     MessageSourceBinding,
+    ProfiledDeferredMessageSource,
     map_source,
 )
 from tinkerfin_sandbox.lifecycle.manager import OpenSandboxManager
 from tinkerfin_studio.agent.persistence import AgentPersistence
 from tinkerfin_studio.agent.tools import build_web_search_tool
+from tinkerfin_studio.conversation.run_preparation import (
+    PreparedRunRequest,
+    enrich_main_event,
+)
 from tinkerfin_studio.conversation.subagent_events import SubagentRunEventEnricher
 from tinkerfin_studio.models.schemas import AgentModelConfig
 
@@ -105,7 +108,7 @@ class ConversationAgentFactory:
         *,
         persistence: AgentPersistence,
         sandbox_manager: OpenSandboxManager[str],
-        tinkerfin: TinkerFin[str],
+        tinkerfin: TinkerFin,
         tavily_api_key: str | None,
     ) -> None:
         self._persistence = persistence
@@ -119,12 +122,10 @@ class ConversationAgentFactory:
         user_id: int,
         model_config: AgentModelConfig,
         graph_input: InputAgentState | Command,
-        config: RunnableConfig,
-        principal: str,
-        run_input: RunAgentInput,
+        prepared: PreparedRunRequest,
         resume: AgUiResumeBinding | None,
         title: str,
-    ) -> DeferredMessageSource[BaseEvent]:
+    ) -> ProfiledDeferredMessageSource[BaseEvent, BaseEvent]:
         """返回仅由 Messaging producer owner 打开的 AG-UI 事件源"""
 
         async def open_events() -> MessageSourceBinding[BaseEvent]:
@@ -136,48 +137,47 @@ class ConversationAgentFactory:
                 runtime = await to_thread.run_sync(
                     partial(
                         definition.new_agui,
-                        principal=principal,
-                        run_input=run_input,
+                        identity=prepared.identity,
                         resume=resume,
                         expose_reasoning_events=False,
                         expose_subagent_events=True,
                     )
                 )
-                agent_events = runtime.astream(graph_input, config=config)
+                agent_events = runtime.astream(
+                    graph_input,
+                    config=prepared.graph_config,
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as error:
                 logger.exception("创建会话 Agent Runtime 失败")
                 agent_events = AgUiEventStream.from_initialization_error(
                     error,
-                    run_input=run_input,
+                    identity=prepared.identity,
                 )
 
             enrich_subagent_runs = SubagentRunEventEnricher(
                 user_id=user_id,
-                thread_id=run_input.thread_id,
-                main_run_id=run_input.run_id,
+                thread_id=prepared.protocol_input.thread_id,
+                main_run_id=prepared.identity.run_id,
             )
 
             def attach_run_metadata(event: BaseEvent) -> BaseEvent:
                 """发布服务端会话元数据与子 Agent 身份"""
 
                 event = enrich_subagent_runs(event)
-                if (
-                    isinstance(event, RunStartedEvent)
-                    and event.run_id == run_input.run_id
-                ):
-                    return event.model_copy(update={"title": title})
-                if isinstance(event, RunErrorEvent) and event.code == "cancelled":
-                    return event.model_copy(update={"message": "聊天生成已取消"})
-                return event
+                return enrich_main_event(event, prepared=prepared, title=title)
 
             return MessageSourceBinding(
                 source=map_source(agent_events, attach_run_metadata),
             )
 
-        return DeferredMessageSource(
+        return ProfiledDeferredMessageSource(
             open_events,
+            identity=prepared.identity,
+            codec_profile="agui.event.v1",
+            source_type=BaseEvent,
+            replay_type=BaseEvent,
             cancellable=True,
             cancel_after_first_item=True,
         )
@@ -187,7 +187,7 @@ class ConversationAgentFactory:
         *,
         user_id: int,
         model_config: AgentModelConfig,
-    ) -> DeepAgentDefinition[None, str]:
+    ) -> DeepAgentDefinition[None]:
         """准备一次请求借用的模型、Sandbox 与 Deep Agent 建图参数"""
 
         sandbox = await self._sandbox_manager.get(f"users/{user_id}")
@@ -213,25 +213,32 @@ class ConversationAgentFactory:
             subagents.append(
                 cast(
                     SubAgent,
-                    {
-                        "name": name,
-                        "description": definition.description,
-                        "system_prompt": definition.system_prompt,
-                        "tools": [
-                            tool_registry[tool_name] for tool_name in definition.tools
-                        ],
-                        "middleware": list(
-                            self._sandbox_manager.build_agent_middleware(backend)
-                        ),
-                    },
+                    cast(
+                        object,
+                        {
+                            "name": name,
+                            "description": definition.description,
+                            "system_prompt": definition.system_prompt,
+                            "tools": [
+                                tool_registry[tool_name]
+                                for tool_name in definition.tools
+                            ],
+                            "middleware": list(
+                                self._sandbox_manager.build_agent_middleware(backend)
+                            ),
+                        },
+                    ),
                 )
             )
         interrupt = cast(
             InterruptOnConfig,
-            {
-                "allowed_decisions": ["approve", "edit", "reject"],
-                "description": "需要人工审批：Agent 正准备写入文件",
-            },
+            cast(
+                object,
+                {
+                    "allowed_decisions": ["approve", "edit", "reject"],
+                    "description": "需要人工审批：Agent 正准备写入文件",
+                },
+            ),
         )
         return self._tinkerfin.create_deep_agent(
             model=model,

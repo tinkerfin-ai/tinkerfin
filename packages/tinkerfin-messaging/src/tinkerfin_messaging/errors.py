@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tinkerfin_agui_adapter import Identity
+
 
 class MessagingError(Exception):
     """Base failure whose message is safe to expose at a host boundary."""
@@ -62,11 +64,12 @@ class SourceProfileMismatch(MessagingError):
 class MessageIdConflict(MessagingError):
     """A message ID was retried with different committed content."""
 
-    def __init__(self, *, stream: str, message_id: str) -> None:
-        self.stream = stream
+    def __init__(self, *, identity: Identity, message_id: str) -> None:
+        self.identity = identity
         self.message_id = message_id
         super().__init__(
-            f"Message {message_id!r} already exists in stream {stream!r} "
+            f"Message {message_id!r} already exists in thread "
+            f"{identity.thread_id!r} "
             "with different content"
         )
 
@@ -74,44 +77,45 @@ class MessageIdConflict(MessagingError):
 class RunAlreadyActive(MessagingError):
     """A different run already owns one channel and stream slot."""
 
-    def __init__(self, *, active_run: str, requested_run: str) -> None:
-        self.active_run = active_run
-        self.requested_run = requested_run
+    def __init__(
+        self,
+        *,
+        active_identity: Identity,
+        requested_identity: Identity,
+    ) -> None:
+        self.active_identity = active_identity
+        self.requested_identity = requested_identity
         super().__init__(
-            f"Run {active_run!r} is already active; cannot start {requested_run!r}"
+            f"Run {active_identity.run_id!r} is already active; cannot start "
+            f"{requested_identity.run_id!r}"
         )
-
-
-class RunIdentityConflict(MessagingError):
-    """A run was attached with a different caller-defined identity."""
-
-    def __init__(self, *, run: str) -> None:
-        self.run = run
-        super().__init__(f"Run {run!r} already exists with a different identity")
 
 
 class RunNotFound(MessagingError):
     """No run record exists for the requested channel and stream."""
 
-    def __init__(self, *, run: str) -> None:
-        self.run = run
-        super().__init__(f"Run {run!r} was not found")
+    def __init__(self, *, identity: Identity) -> None:
+        self.identity = identity
+        super().__init__(f"Run {identity.run_id!r} was not found")
 
 
 class RunProducerFailed(MessagingError):
     """A producer failed after zero or more messages were committed."""
 
-    def __init__(self, *, run: str, cause: BaseException) -> None:
-        self.run = run
-        super().__init__(f"Producer for run {run!r} failed", cause=cause)
+    def __init__(self, *, identity: Identity, cause: BaseException) -> None:
+        self.identity = identity
+        super().__init__(
+            f"Producer for run {identity.run_id!r} failed",
+            cause=cause,
+        )
 
 
 class CancellationUnsupported(MessagingError):
     """The active producer has no application cancellation callback."""
 
-    def __init__(self, *, run: str) -> None:
-        self.run = run
-        super().__init__(f"Run {run!r} does not support cancellation")
+    def __init__(self, *, identity: Identity) -> None:
+        self.identity = identity
+        super().__init__(f"Run {identity.run_id!r} does not support cancellation")
 
 
 class RecoveryUnsupported(MessagingError):
@@ -133,11 +137,11 @@ class StreamDeleted(MessagingError):
         self,
         *,
         channel: str,
-        stream: str,
+        identity: Identity,
         generation: int | None,
     ) -> None:
         self.channel = channel
-        self.stream = stream
+        self.identity = identity
         self.generation = generation
         generation_text = (
             "the current generation"
@@ -145,7 +149,7 @@ class StreamDeleted(MessagingError):
             else f"generation {generation}"
         )
         super().__init__(
-            f"Stream {stream!r} in channel {channel!r} {generation_text} "
+            f"Thread {identity.thread_id!r} in channel {channel!r} {generation_text} "
             "has been deleted"
         )
 
@@ -153,10 +157,17 @@ class StreamDeleted(MessagingError):
 class StreamDeleteConflict(MessagingError):
     """A stream cannot be deleted while one producer lease is active."""
 
-    def __init__(self, *, channel: str, stream: str, active_run: str) -> None:
+    def __init__(
+        self,
+        *,
+        channel: str,
+        identity: Identity,
+        active_identity: Identity,
+    ) -> None:
         self.channel = channel
-        self.stream = stream
-        self.active_run = active_run
+        self.identity = identity
+        self.active_identity = active_identity
         super().__init__(
-            f"Stream {stream!r} in channel {channel!r} has active run {active_run!r}"
+            f"Thread {identity.thread_id!r} in channel {channel!r} has active run "
+            f"{active_identity.run_id!r}"
         )

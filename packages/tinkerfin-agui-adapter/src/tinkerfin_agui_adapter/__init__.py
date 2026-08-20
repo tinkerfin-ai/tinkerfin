@@ -3,6 +3,7 @@
 from .adapter import DeepAgentAgUiAdapter as DeepAgentAgUiAdapter
 from .adapter import InterruptCorrelationError as InterruptCorrelationError
 from .contracts import AgentRunOutcome as AgentRunOutcome
+from .contracts import Identity as Identity
 from .hitl import HitlActionRequest as HitlActionRequest
 from .hitl import HitlCorrelationError as HitlCorrelationError
 from .hitl import HitlRequest as HitlRequest
@@ -28,6 +29,7 @@ __all__ = [
     "HitlCorrelationError",
     "HitlRequest",
     "HitlReviewConfig",
+    "Identity",
     "InterruptCorrelationError",
     "ResumeMapper",
     "ResumeMappingError",

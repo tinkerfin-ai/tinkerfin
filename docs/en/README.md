@@ -21,8 +21,9 @@ If this is your first time using TinkerFin, read these sections in order.
 | Graph | The workflow that actually executes the agent |
 | Runtime | The control object for one Graph run |
 | stream | Data produced continuously while a run is active |
-| thread | A conversation that can continue under a stable `thread_id` |
-| run | One execution inside a thread, usually with a new `run_id` |
+| Identity | Framework identity containing only a stable `threadId` and one `runId` |
+| thread | A continuing conversation identified by `Identity.threadId` |
+| run | One semantic execution identified by `Identity.runId` |
 | AG-UI | A protocol for exchanging live agent events with a frontend |
 | SSE | An HTTP format for sending a continuing event stream to a browser |
 | Messaging | The component that persists and delivers streams |
@@ -36,13 +37,10 @@ Python 3.11 or newer is required.
 | --- | --- |
 | Runtime and AG-UI Runtime | `pip install tinkerfin` |
 | AG-UI conversion only | `pip install tinkerfin-agui-adapter` |
-| In-memory messaging | `pip install tinkerfin-messaging` |
-| AG-UI message format | `pip install "tinkerfin-messaging[agui]"` |
-| Native LangGraph message format | `pip install "tinkerfin-messaging[native]"` |
+| In-memory messaging, AG-UI, and Native codecs | `pip install tinkerfin-messaging` |
 | Redis message storage | `pip install "tinkerfin-messaging[redis]"` |
 | OpenSandbox | `pip install tinkerfin-sandbox` |
 | SQLite Sandbox state | `pip install "tinkerfin-sandbox[sqlite]"` |
 | MySQL Sandbox state | `pip install "tinkerfin-sandbox[mysql]"` |
 
 You do not need every package at once. Start with the capability you need now.
-

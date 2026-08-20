@@ -21,8 +21,9 @@ TinkerFin 用来运行 Deep Agents、把运行过程转换成 AG-UI 事件、可
 | Graph | Agent 实际执行的工作流 |
 | Runtime | 一次 Graph 运行的控制对象 |
 | stream | 运行过程中连续产生的数据 |
-| thread | 一段可继续的会话，通常对应一个稳定的 `thread_id` |
-| run | thread 中的一次执行，通常对应一个新的 `run_id` |
+| Identity | 只包含稳定 `threadId` 与一次运行 `runId` 的框架身份 |
+| thread | 一段可继续的会话，对应 `Identity.threadId` |
+| run | thread 中的一次语义执行，对应 `Identity.runId` |
 | AG-UI | 前端和 Agent 交换运行事件的协议 |
 | SSE | 服务端持续向浏览器发送事件的一种 HTTP 格式 |
 | Messaging | 保存并投递事件流的组件 |
@@ -36,13 +37,10 @@ TinkerFin 用来运行 Deep Agents、把运行过程转换成 AG-UI 事件、可
 | --- | --- |
 | Runtime 和 AG-UI Runtime | `pip install tinkerfin` |
 | 只使用 AG-UI 转换器 | `pip install tinkerfin-agui-adapter` |
-| 内存消息流 | `pip install tinkerfin-messaging` |
-| AG-UI 消息格式 | `pip install "tinkerfin-messaging[agui]"` |
-| 原生 LangGraph 消息格式 | `pip install "tinkerfin-messaging[native]"` |
+| 内存消息流、AG-UI 与 Native codec | `pip install tinkerfin-messaging` |
 | Redis 消息存储 | `pip install "tinkerfin-messaging[redis]"` |
 | OpenSandbox | `pip install tinkerfin-sandbox` |
 | SQLite 持久化 Sandbox 状态 | `pip install "tinkerfin-sandbox[sqlite]"` |
 | MySQL 持久化 Sandbox 状态 | `pip install "tinkerfin-sandbox[mysql]"` |
 
 不必一次安装全部组件。先安装当前要用的部分，后面需要时再增加。
-

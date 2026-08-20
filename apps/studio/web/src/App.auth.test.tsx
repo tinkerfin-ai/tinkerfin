@@ -290,7 +290,7 @@ describe('App authentication boundary', () => {
         threadId: 'other-private-thread',
         runId: 'private-run',
         state: {},
-        messages: [{ role: 'user', content: 'private prompt' }],
+        messages: [{ id: 'request-private-run', role: 'user', content: 'private prompt' }],
         tools: [],
         context: [],
         forwardedProps: {},

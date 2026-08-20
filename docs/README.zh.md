@@ -30,7 +30,7 @@ pip install tinkerfin
 
 ```bash
 pip install "tinkerfin[redis]"
-pip install "tinkerfin-messaging[agui,native,redis]"
+pip install "tinkerfin-messaging[redis]"
 pip install "tinkerfin-sandbox[sqlite]"
 ```
 
@@ -39,8 +39,7 @@ pip install "tinkerfin-sandbox[sqlite]"
 ```python
 import asyncio
 
-from ag_ui.core import RunAgentInput
-from tinkerfin import TinkerFin
+from tinkerfin import Identity, TinkerFin
 
 tinkerfin = TinkerFin()
 agent = tinkerfin.create_deep_agent(
@@ -50,21 +49,10 @@ agent = tinkerfin.create_deep_agent(
 
 
 async def main() -> None:
-    run_input = RunAgentInput.model_validate(
-        {
-            "threadId": "thread-1",
-            "runId": "run-1",
-            "state": {},
-            "messages": [],
-            "tools": [],
-            "context": [],
-            "forwardedProps": {},
-        }
-    )
-    runtime = agent.new_agui(run_input=run_input)
+    identity = Identity(threadId="thread-1", runId="run-1")
+    runtime = agent.new_agui(identity=identity)
     events = runtime.astream(
         {"messages": [{"role": "user", "content": "Hello"}]},
-        {"configurable": {"thread_id": "thread-1"}},
     )
     async for event in events:
         print(event)
@@ -82,12 +70,13 @@ asyncio.run(main())
   Graph 和单次使用的 Runtime
 - AG-UI 固定使用 v2 `messages`、`tasks`、`values` 和 `subgraphs=True`，非法参数会在
   迭代及生命周期事件开始前失败
-- 现有事件顺序、子 Agent 来源、interrupt/resume、推理隐私、取消、背压和清理语义
-  保持不变
+- Runtime 与 Adapter 负责保证事件顺序、子 Agent 来源、interrupt/resume、推理隐私、
+  取消、背压和清理语义
 - 对象流可以直接输出 SSE，也可以交给 Messaging 持久化、回放、附着和远程取消
-- `RUN_STARTED.input` 携带调用方完整的 `RunAgentInput`；恢复请求通过
-  `AgUiResumeBinding` 绑定该输入、原生 Command 和完整 Tool ID
-- `TinkerFin.run(...)` 继续用于自定义异步源
+- Runtime 只接收 `Identity`，并自动注入 Graph thread；纯框架
+  `RUN_STARTED.input` 为 `None`，应用可补充自己的权威请求
+- 恢复请求通过 `AgUiResumeBinding` 绑定 Identity、原生 Command 和完整 Tool ID
+- `TinkerFin.run(...)` 用于自定义异步源
 
 ## 文档
 

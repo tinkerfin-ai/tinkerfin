@@ -23,12 +23,15 @@ Redis coordination is optional:
 pip install "tinkerfin[redis]"
 ```
 
+This extra provides `RedisRunCoordinator` and the reusable auto-renewing
+`RedisLeaseLock` with monotonic fencing tokens.
+
 ## Quick Start
 
 ```python
 import asyncio
 
-from tinkerfin import TinkerFin
+from tinkerfin import Identity, TinkerFin
 
 tinkerfin = TinkerFin()
 agent = tinkerfin.create_deep_agent(
@@ -38,10 +41,9 @@ agent = tinkerfin.create_deep_agent(
 
 
 async def main() -> None:
-    runtime = agent.new()
+    runtime = agent.new(identity=Identity(threadId="thread-1", runId="run-1"))
     async for part in runtime.astream(
         {"messages": [{"role": "user", "content": "Hello"}]},
-        {"configurable": {"thread_id": "thread-1"}},
     ):
         print(part)
 
@@ -57,31 +59,26 @@ single-use Runtime; the Graph iterator starts on first pull.
 ### Native Runtime
 
 ```python
-runtime = agent.new(principal=principal, on_part=on_part)
+runtime = agent.new(identity=identity, on_part=on_part)
 
 parts = runtime.astream(
     graph_input,
     config,
     context=context,
     stream_mode="values",
-    version="v2",
 )
 ```
 
-Arguments are forwarded to the Graph unchanged. `GraphRunStream` preserves ordering,
+Identity is injected into the Graph config and native output is fixed to v2.
+`NativeGraphRunStream` preserves ordering,
 backpressure, errors, cancellation, coordination, observer ordering, and cleanup.
 
 ### AG-UI Runtime
 
 ```python
-from ag_ui.core import RunAgentInput
-
-run_input = RunAgentInput.model_validate(request_payload)
-
 runtime = agent.new_agui(
-    principal=principal,
+    identity=identity,
     on_part=on_part,
-    run_input=run_input,
     on_event=on_event,
 )
 
@@ -93,7 +90,7 @@ When omitted, the AG-UI Runtime fixes `stream_mode` to `messages/tasks/values`,
 extra modes are `updates`, `checkpoints`, `debug`, and `custom`. Invalid options fail
 before stream side effects.
 
-The returned `AgUiEventStream` emits the complete input on `RUN_STARTED`, keeps the
+The returned `AgUiEventStream` uses `RUN_STARTED.input=None`, keeps the
 event, interrupt/resume, subagent, reasoning privacy, cancellation, and cleanup
 semantics, and can be passed directly to SSE or Messaging. Resumed runs use
 `AgUiResumeBinding`; high-level callers do not pass Tool IDs separately.
@@ -104,13 +101,13 @@ A Definition may create multiple Runtimes; each one owns a separate Graph invoca
 and one object stream. Graph construction is synchronous, so async servers should use
 their controlled thread boundary around `new()` or `new_agui()` when needed.
 
-Without a coordinator, `principal` must be `None`. A configured coordinator requires a
-principal. Coordination does not replace a LangGraph checkpointer.
+A configured coordinator receives the same complete Identity. Coordination does not
+replace a LangGraph checkpointer.
 
 ### Low-level sources
 
-`TinkerFin.run(...)` remains available for custom asynchronous sources and existing
-integrations. Deep Agents callers normally use the façade above.
+`TinkerFin.run(...)` handles custom asynchronous sources and low-level integrations.
+Deep Agents callers normally use the façade above.
 
 ## Documentation
 

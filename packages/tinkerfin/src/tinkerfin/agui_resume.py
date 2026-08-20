@@ -1,16 +1,15 @@
-"""Validated binding between one AG-UI resume request and LangGraph input."""
+"""Validated binding between one run identity and LangGraph resume input."""
 
 from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
 
-from ag_ui.core import RunAgentInput
 from langgraph.types import Command
 from pydantic import JsonValue, TypeAdapter, ValidationError
 
 from tinkerfin_agui_adapter import (
-    AgUiLifecycleEventFactory,
+    Identity,
     ResumeTranslation,
     ScopedIdCodec,
 )
@@ -20,27 +19,26 @@ _JSON_OBJECT = TypeAdapter(dict[str, JsonValue])
 
 @dataclass(frozen=True, slots=True, init=False)
 class AgUiResumeBinding:
-    """Bind one AG-UI resume request to its native command and prior Tool IDs.
+    """Bind one run identity to its native command and prior Tool IDs.
 
     The binding snapshots validated input and JSON resume data. It owns no Graph,
     checkpointer, or I/O resource, so a host can reconstruct it from trusted persisted
     `resume_data` and `prior_tool_call_ids` for an idempotent retry.
     """
 
-    _run_input: RunAgentInput
+    identity: Identity
     _resume_data: dict[str, JsonValue]
     prior_tool_call_ids: frozenset[str]
 
     def __init__(
         self,
         *,
-        run_input: RunAgentInput,
+        identity: Identity,
         command: Command,
         prior_tool_call_ids: frozenset[str] = frozenset(),
     ) -> None:
-        AgUiLifecycleEventFactory.validate_run_input(run_input)
-        if not run_input.resume:
-            raise ValueError("run_input.resume must be non-empty for a resume binding")
+        if not isinstance(identity, Identity):
+            raise TypeError("identity must be an Identity")
         if not isinstance(command, Command):
             raise TypeError("command must be a Command")
         if (
@@ -70,15 +68,9 @@ class AgUiResumeBinding:
                 raise ValueError(
                     "prior_tool_call_ids must contain complete scoped Tool IDs"
                 )
-        object.__setattr__(self, "_run_input", run_input.model_copy(deep=True))
+        object.__setattr__(self, "identity", identity)
         object.__setattr__(self, "_resume_data", copy.deepcopy(resume_data))
         object.__setattr__(self, "prior_tool_call_ids", prior_tool_call_ids)
-
-    @property
-    def run_input(self) -> RunAgentInput:
-        """Return a defensive copy of the complete bound AG-UI input."""
-
-        return self._run_input.model_copy(deep=True)
 
     @property
     def command(self) -> Command:
@@ -90,7 +82,7 @@ class AgUiResumeBinding:
     def from_translation(
         cls,
         *,
-        run_input: RunAgentInput,
+        identity: Identity,
         translation: ResumeTranslation,
     ) -> AgUiResumeBinding:
         """Build a binding from one fully resolved stock Deep Agents translation."""
@@ -100,16 +92,16 @@ class AgUiResumeBinding:
         if translation.mode != "command" or translation.resume_data is None:
             raise ValueError("translation must have mode='command'")
         return cls(
-            run_input=run_input,
+            identity=identity,
             command=Command(resume=translation.root),
             prior_tool_call_ids=frozenset(translation.prior_tool_call_ids),
         )
 
-    def validate_run_input(self, run_input: RunAgentInput) -> None:
-        """Require the exact complete AG-UI request captured by this binding."""
+    def validate_identity(self, identity: Identity) -> None:
+        """Require the exact thread and run identity captured by this binding."""
 
-        if run_input != self._run_input:
-            raise ValueError("resume binding belongs to a different run_input")
+        if identity != self.identity:
+            raise ValueError("resume binding belongs to a different identity")
 
     def validate_command(self, command: object) -> None:
         """Require the exact pure resume Command captured by this binding."""

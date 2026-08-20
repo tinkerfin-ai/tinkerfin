@@ -1,7 +1,8 @@
 """会话流、历史和线程命令 HTTP 入口"""
 
-from typing import Annotated
+from typing import Annotated, TypeAlias
 
+from ag_ui.core import RunAgentInput
 from fastapi import APIRouter, Header, Path, Query, Request
 from starlette.responses import StreamingResponse
 
@@ -26,7 +27,7 @@ from tinkerfin_studio.resources import get_resources
 
 router = APIRouter(prefix="/conversation", tags=["会话"])
 
-ThreadIdPath = Annotated[
+ThreadIdPath: TypeAlias = Annotated[
     str,
     Path(
         min_length=1,
@@ -111,7 +112,7 @@ async def delete_thread(
 
 @router.post("/chat", response_class=StreamingResponse)
 async def chat(
-    input_data: ChatRequest,
+    input_data: RunAgentInput,
     request: Request,
     session: SessionDep,
     user: UserContextDep,
@@ -123,7 +124,7 @@ async def chat(
         session,
         user=user,
         resources=get_resources(request.app),
-    ).start(input_data, last_event_id=last_event_id)
+    ).start(ChatRequest.from_agui(input_data), last_event_id=last_event_id)
     return StreamingResponse(
         prepared.body,
         media_type="text/event-stream",

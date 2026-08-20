@@ -93,26 +93,25 @@ def _render_deep_agent_stub() -> str:
 from collections.abc import Mapping, Sequence
 from typing import Generic, Literal
 
-from ag_ui.core import RunAgentInput
 from deepagents.graph import *
 from langchain.agents.middleware.types import InputAgentState
 from langchain_core.runnables import RunnableConfig
 from langgraph.pregel.main import All, DeprecatedKwargs, Durability, RunControl, StreamMode
 from langgraph.types import Command
-from typing_extensions import TypeVar, Unpack
+from typing_extensions import Unpack
+
+from tinkerfin_agui_adapter import Identity
 
 from .agui_resume import AgUiResumeBinding
-from .runtime import AgUiEventStream, EventObserver, GraphRunStream, PartObserver
-
-PrincipalT = TypeVar("PrincipalT", default=object)
+from .runtime import AgUiEventStream, EventObserver, NativeGraphRunStream, PartObserver
 
 class DeepAgentRuntime(Generic[ContextT]):
-{_method(CompiledStateGraph.astream, replacements=astream_arguments, return_type="GraphRunStream[object]")}
+{_method(CompiledStateGraph.astream, replacements=astream_arguments, return_type="NativeGraphRunStream")}
 
 class DeepAgentAgUiRuntime(Generic[ContextT]):
 {_method(CompiledStateGraph.astream, replacements=astream_arguments, return_type="AgUiEventStream")}
 
-class DeepAgentDefinition(Generic[ContextT, PrincipalT]):
+class DeepAgentDefinition(Generic[ContextT]):
 {_method(DeepAgentDefinition.new, return_type="DeepAgentRuntime[ContextT]")}
 {_method(DeepAgentDefinition.new_agui, return_type="DeepAgentAgUiRuntime[ContextT]")}
 
@@ -125,10 +124,11 @@ def _render_init_stub() -> str:
     content = f"""# ruff: noqa: F403, F405
 # 此文件由 scripts/generate_stubs.py 根据锁定依赖生成，请勿手工维护参数列表
 from collections.abc import Callable, Sequence
-from typing import Any, Generic
+from typing import Any
 
 from deepagents.graph import *
-from typing_extensions import TypeVar
+
+from tinkerfin_agui_adapter import Identity as Identity
 
 from .agui_resume import AgUiResumeBinding as AgUiResumeBinding
 from .coordination import InMemoryRunCoordinator as InMemoryRunCoordinator
@@ -155,10 +155,8 @@ from .runtime import SsePreflight as SsePreflight
 from .runtime import TinkerFin as _RuntimeTinkerFin
 from .runtime import TinkerFinRun as TinkerFinRun
 
-PrincipalT = TypeVar("PrincipalT", default=object)
-
-class TinkerFin(_RuntimeTinkerFin[PrincipalT], Generic[PrincipalT]):
-{_method(create_deep_agent, add_self=True, return_type="DeepAgentDefinition[ContextT, PrincipalT]")}
+class TinkerFin(_RuntimeTinkerFin):
+{_method(create_deep_agent, add_self=True, return_type="DeepAgentDefinition[ContextT]")}
 
 __all__: list[str]
 """

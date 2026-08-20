@@ -13,11 +13,13 @@ from pathlib import Path
 import pytest
 
 import tinkerfin_messaging
+from tinkerfin import Identity
 
 
-def test_public_namespace_exposes_the_protocol_neutral_facade() -> None:
+def test_public_namespace_exposes_the_default_tinkerfin_facade() -> None:
     required = {
         "CancelCallback",
+        "AgUiCodec",
         "CancelContext",
         "CancellableMessageSource",
         "DeferredMessageSource",
@@ -31,38 +33,37 @@ def test_public_namespace_exposes_the_protocol_neutral_facade() -> None:
         "Messaging",
         "MessagingBackend",
         "MessagingSettlementTimeout",
+        "NativeStreamPart",
+        "NativeStreamPartCodec",
         "ProfiledMessageSource",
+        "ProfiledDeferredMessageSource",
+        "RedisBackend",
         "SourceProfileMismatch",
         "SseRenderer",
     }
 
     assert required <= set(tinkerfin_messaging.__all__)
     assert all(hasattr(tinkerfin_messaging, name) for name in required)
-    assert {
-        "AgUiCodec",
-        "NativeStreamPart",
-        "NativeStreamPartCodec",
-        "RedisBackend",
-    }.isdisjoint(tinkerfin_messaging.__all__)
 
 
 def test_cancel_context_is_an_immutable_public_value() -> None:
     context = tinkerfin_messaging.CancelContext(
         channel="events",
-        stream="conversation-1",
-        run="run-1",
+        identity=Identity(threadId="conversation-1", runId="run-1"),
     )
 
-    assert (context.channel, context.stream, context.run) == (
+    assert (context.channel, context.identity) == (
         "events",
-        "conversation-1",
-        "run-1",
+        Identity(threadId="conversation-1", runId="run-1"),
     )
     with pytest.raises(FrozenInstanceError):
-        context.__setattr__("run", "replacement")
+        context.__setattr__(
+            "identity",
+            Identity(threadId="conversation-1", runId="replacement"),
+        )
 
 
-def test_base_import_does_not_load_optional_integrations() -> None:
+def test_base_import_does_not_load_core_runtime_or_redis_integration() -> None:
     repository_root = Path(__file__).resolve().parents[3]
     result = subprocess.run(
         [
@@ -72,9 +73,6 @@ def test_base_import_does_not_load_optional_integrations() -> None:
                 "import json, sys, tinkerfin_messaging; "
                 "print(json.dumps(sorted(name for name in sys.modules "
                 "if name == 'tinkerfin' or name.startswith('tinkerfin.') "
-                "or name == 'tinkerfin_agui_adapter' "
-                "or name.startswith('tinkerfin_agui_adapter.') "
-                "or name == 'ag_ui' or name.startswith('ag_ui.') "
                 "or name == 'redis' or name.startswith('redis.'))))"
             ),
         ],
@@ -87,7 +85,7 @@ def test_base_import_does_not_load_optional_integrations() -> None:
     assert json.loads(result.stdout) == []
 
 
-def test_distribution_declares_only_protocol_neutral_base_dependencies() -> None:
+def test_distribution_declares_default_tinkerfin_dependencies() -> None:
     try:
         metadata = distribution("tinkerfin-messaging")
     except PackageNotFoundError:
@@ -95,34 +93,22 @@ def test_distribution_declares_only_protocol_neutral_base_dependencies() -> None
 
     requirements = set(metadata.requires or ())
     assert "pydantic<3,>=2" in requirements
-    assert not any(
-        requirement.lower().startswith(
-            ("tinkerfin ", "tinkerfin;", "tinkerfin-", "pydantic-core")
-        )
-        for requirement in requirements
-    )
+    assert "ag-ui-protocol==0.1.19" in requirements
+    assert "tinkerfin<0.9.0,>=0.1.0" in requirements
     assert files("tinkerfin_messaging").joinpath("py.typed").is_file()
 
 
-def test_distribution_declares_independent_optional_integrations() -> None:
+def test_distribution_only_keeps_the_redis_extra() -> None:
     requirements = set(distribution("tinkerfin-messaging").requires or ())
 
-    assert 'ag-ui-protocol==0.1.19; extra == "agui"' in requirements
-    assert 'tinkerfin<0.9.0,>=0.1.0; extra == "native"' in requirements
     assert 'redis<9,>=6; extra == "redis"' in requirements
+    assert not any('extra == "agui"' in value for value in requirements)
+    assert not any('extra == "native"' in value for value in requirements)
 
 
 @pytest.mark.parametrize(
     ("symbol", "blocked_packages", "extra"),
-    (
-        ("AgUiCodec", ("ag_ui",), "agui"),
-        (
-            "NativeStreamPartCodec",
-            ("tinkerfin",),
-            "native",
-        ),
-        ("RedisBackend", ("redis",), "redis"),
-    ),
+    (("RedisBackend", ("redis",), "redis"),),
 )
 def test_missing_optional_dependency_reports_the_install_command(
     symbol: str,

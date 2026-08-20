@@ -5,7 +5,11 @@ from datetime import datetime
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from tinkerfin import Identity
 from tinkerfin_studio.api.errors import BusinessException
+from tinkerfin_studio.conversation.coordinator import (
+    ConversationProjectionCoordinator,
+)
 from tinkerfin_studio.conversation.repository import ConversationRepository
 from tinkerfin_studio.conversation.service import ConversationHistoryService
 
@@ -77,3 +81,38 @@ async def test_list_threads_pages_across_pinned_and_recent_groups(
         "thread-recent-new",
         "thread-recent-old",
     ]
+
+
+async def test_get_detail_releases_read_transaction_before_projection(
+    session: AsyncSession,
+) -> None:
+    """历史追赶属于外部 I/O，不得继承归属查询的隐式事务"""
+
+    repository = ConversationRepository(session)
+    thread = await repository.create_thread(
+        user_id=7,
+        thread_id="thread-history-transaction",
+        title="事务边界",
+        model_id="main",
+    )
+    await repository.commit()
+    transaction_states: list[bool] = []
+
+    class TransactionCheckingProjector(ConversationProjectionCoordinator):
+        def __init__(self) -> None:
+            pass
+
+        async def reconcile(self, *, thread_pk: int, identity: Identity) -> int:
+            assert thread_pk == thread.id
+            del identity
+            transaction_states.append(session.in_transaction())
+            return 0
+
+    detail = await ConversationHistoryService(
+        repository,
+        user_id=7,
+        projector=TransactionCheckingProjector(),
+    ).get_detail(thread.thread_id)
+
+    assert detail.thread_id == thread.thread_id
+    assert transaction_states == [False]

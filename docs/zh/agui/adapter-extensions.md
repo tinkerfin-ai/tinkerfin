@@ -15,7 +15,7 @@ pip install tinkerfin-agui-adapter
 ## 最简单的转换方式
 
 ```python
-from tinkerfin_agui_adapter import astream_events
+from tinkerfin_agui_adapter import Identity, astream_events
 
 
 parts = graph.astream(
@@ -28,7 +28,7 @@ parts = graph.astream(
 
 events = astream_events(
     parts,
-    run_input=run_input,
+    identity=Identity(threadId="thread-1", runId="run-1"),
 )
 
 async for event in events:
@@ -42,7 +42,7 @@ async for event in events:
 | 参数 | 默认值 | 作用 |
 | --- | --- | --- |
 | `parts` | 必填 | LangGraph v2 异步数据流 |
-| `run_input` | 必填 | 完整 AG-UI 请求 |
+| `identity` | 必填 | 本次转换产生的主 thread 和 run 身份 |
 | `expose_reasoning_events` | `False` | 是否产生支持的推理事件 |
 | `expose_subagent_events` | `True` | 是否交付子 Agent 事件 |
 | `prior_tool_call_ids` | `frozenset()` | 恢复前已经完整发送过的 scoped Tool ID |
@@ -72,9 +72,10 @@ from tinkerfin_agui_adapter import (
 
 
 lifecycle = AgUiLifecycleEventFactory()
-adapter = DeepAgentAgUiAdapter(run_input.run_id)
+identity = Identity(threadId="thread-1", runId="run-1")
+adapter = DeepAgentAgUiAdapter(identity=identity)
 
-await send_event(lifecycle.started(run_input=run_input))
+await send_event(lifecycle.started(identity=identity))
 try:
     async for part in parts:
         for event in adapter.process(part):
@@ -83,8 +84,7 @@ try:
         await send_event(event)
     await send_event(
         lifecycle.finished(
-            thread_id=run_input.thread_id,
-            run_id=run_input.run_id,
+            identity=identity,
             outcome=adapter.main_outcome(),
         )
     )
@@ -93,7 +93,7 @@ except Exception:
         await send_event(event)
     await send_event(
         lifecycle.failed(
-            run_id=run_input.run_id,
+            identity=identity,
             message="Agent run failed",
             code="runtime_error",
         )
@@ -131,4 +131,3 @@ kind, namespace, raw_id = codec.decode(public_id)
 不要截断 scoped ID，也不要只保存原始 Tool ID；不同 namespace 中可能出现相同原始 ID。
 
 下一篇：[AG-UI 使用参考](api-reference.md)。
-

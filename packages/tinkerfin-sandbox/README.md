@@ -46,7 +46,7 @@ manager = OpenSandboxManager[str](
         connection_config=ConnectionConfig(domain="127.0.0.1:8091"),
         config=OpenSandboxConfig(workspace_root="/workspace"),
     ),
-    key_resolver=lambda principal: principal,
+    key_resolver=lambda owner: owner,
 )
 
 async with manager:
@@ -259,7 +259,7 @@ started.
 
 Persistent state coordinates allocation, binding, warm slots, owner fencing, and
 cleanup. It does not serialize complete graph runs; use an application run coordinator
-when graph execution also requires per-principal exclusion.
+when graph execution also requires per-Identity exclusion.
 
 Consuming a ready warm slot atomically commits that Sandbox as the owner binding; the
 manager does not bind it a second time. An on-demand bind whose response fails or is

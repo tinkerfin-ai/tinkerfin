@@ -69,7 +69,7 @@ class ConversationThread(Base):
         String(32),
         nullable=False,
         default="idle",
-        comment="会话状态：idle/running/waiting_approval/error",
+        comment="会话状态：idle/running/waiting_approval/error/deleting",
     )
     last_run_id: Mapped[str | None] = mapped_column(
         String(128), nullable=True, comment="最近主 run ID"

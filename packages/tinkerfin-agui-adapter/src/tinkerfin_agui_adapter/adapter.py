@@ -54,7 +54,7 @@ from pydantic import (
 from pydantic.alias_generators import to_camel
 from pydantic_core import PydanticCustomError
 
-from .contracts import AgentRunOutcome
+from .contracts import AgentRunOutcome, Identity
 from .hitl import (
     HitlActionRequest,
     HitlCorrelationError,
@@ -667,11 +667,12 @@ def _safe_checkpoint_snapshot(value: object) -> dict[str, JsonValue]:
 class DeepAgentAgUiAdapter:
     """Convert individual Deep Agents v2 stream parts into AG-UI events.
 
-    Each instance belongs to one caller-declared main run and preserves event
-    order and full namespace-scoped identifiers across `messages`, `tasks`, and
-    `values` parts. It supports ordinary compiled subgraphs as native graph
-    scopes and enriches only verified Deep Agents `task` delegates with
-    subagent identity, input, and parent Tool provenance.
+    Each instance retains one caller-declared immutable `Identity` and preserves
+    event order and full namespace-scoped identifiers across `messages`, `tasks`,
+    and `values` parts. It reads the run ID only when constructing protocol output.
+    It supports ordinary compiled subgraphs as native graph scopes and enriches
+    only verified Deep Agents `task` delegates with subagent identity, input, and
+    parent Tool provenance.
 
     `process()` validates a complete part before mutating correlation state and
     propagates validation or correlation errors unchanged. `finish()` and
@@ -687,21 +688,19 @@ class DeepAgentAgUiAdapter:
 
     def __init__(
         self,
-        run_id: str,
         *,
+        identity: Identity,
         prior_tool_call_ids: frozenset[str] = frozenset(),
         expose_reasoning_events: bool = False,
         expose_subagent_events: bool = True,
     ) -> None:
-        if not isinstance(run_id, str):
-            raise TypeError("run_id must be a string")
-        if not run_id or run_id != run_id.strip():
-            raise ValueError("run_id must be non-blank without surrounding whitespace")
+        if not isinstance(identity, Identity):
+            raise TypeError("identity must be an Identity")
         if not isinstance(expose_reasoning_events, bool):
             raise TypeError("expose_reasoning_events must be a bool")
         if not isinstance(expose_subagent_events, bool):
             raise TypeError("expose_subagent_events must be a bool")
-        self.run_id = run_id
+        self._identity = identity
         self._expose_reasoning_events = expose_reasoning_events
         self._expose_subagent_events = expose_subagent_events
         self._ids = ScopedIdCodec()
@@ -2113,7 +2112,7 @@ class DeepAgentAgUiAdapter:
     def _run_id_for(self, source: AgentSource) -> str:
         """Return the caller-declared main AG-UI run ID for every graph source."""
 
-        return self.run_id
+        return self._identity.run_id
 
     def _event_context(
         self,

@@ -773,7 +773,7 @@ describe('App', () => {
       threadId: THREAD_ID,
       runId: FIRST_RUN_ID,
       state: {},
-      messages: [{ role: 'user', content: '刷新后继续' }],
+      messages: [{ id: 'request-first-run', role: 'user', content: '刷新后继续' }],
       tools: [],
       context: [],
       forwardedProps: { model: 'GPT-5.5', mode: 'default' },
@@ -1606,7 +1606,7 @@ describe('App', () => {
     expect(request.threadId).toBe('')
     expect(request.runId).toMatch(/^run-/)
     expect(request.messages).toEqual([
-      { role: 'user', content: '你好' },
+      { id: `request-${request.runId}`, role: 'user', content: '你好' },
     ])
     expect(request.forwardedProps).toEqual({ model: 'GPT-5.5', mode: 'default' })
   })

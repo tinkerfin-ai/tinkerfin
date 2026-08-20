@@ -6,7 +6,6 @@ from typing import cast
 from uuid import NAMESPACE_URL, uuid5
 
 import pytest
-from ag_ui.core import RunAgentInput
 from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, MessagesState, StateGraph
@@ -15,7 +14,7 @@ from pydantic import SecretStr
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from tinkerfin import AgUiNativeStreamConfig, AgUiResumeBinding, TinkerFin
+from tinkerfin import AgUiNativeStreamConfig, AgUiResumeBinding, Identity, TinkerFin
 from tinkerfin.coordination import InMemoryRunCoordinator
 from tinkerfin_agui_adapter.ids import ScopedIdCodec
 from tinkerfin_messaging.agui import AgUiCodec
@@ -34,6 +33,10 @@ from tinkerfin_studio.conversation.models import (
 )
 from tinkerfin_studio.conversation.repository import ConversationRepository
 from tinkerfin_studio.conversation.request import ChatRequest
+from tinkerfin_studio.conversation.run_preparation import (
+    conversation_identity,
+    prepare_resume,
+)
 from tinkerfin_studio.conversation.service import (
     ConversationChatService,
     ConversationCommandService,
@@ -51,12 +54,12 @@ class ProjectionProbe:
     def __init__(self) -> None:
         self.runs: list[str] = []
 
-    def ensure(self, *, thread_pk: int, stream: str, run: str) -> None:
-        del thread_pk, stream
-        self.runs.append(run)
+    def ensure(self, *, thread_pk: int, identity: Identity) -> None:
+        del thread_pk
+        self.runs.append(identity.run_id)
 
-    async def reconcile(self, *, thread_pk: int, stream: str) -> int:
-        del thread_pk, stream
+    async def reconcile(self, *, thread_pk: int, identity: Identity) -> int:
+        del thread_pk, identity
         return 0
 
 
@@ -124,8 +127,7 @@ def _patch_agent_graph(
 
         def new_agui(
             *,
-            principal: str | None = None,
-            run_input: RunAgentInput,
+            identity: Identity,
             resume: AgUiResumeBinding | None = None,
             expose_reasoning_events: bool = False,
             expose_subagent_events: bool = True,
@@ -144,10 +146,9 @@ def _patch_agent_graph(
                     )
                     run = factory._tinkerfin.run(
                         invocation,
-                        principal=principal,
+                        identity=identity,
                     )
                     return run.astream_agui(
-                        run_input=run_input,
                         expose_reasoning_events=expose_reasoning_events,
                         expose_subagent_events=expose_subagent_events,
                         prior_tool_call_ids=(
@@ -193,12 +194,10 @@ def test_persisted_resume_rejects_malformed_prior_tool_call_ids(
             ],
         }
     )
-    run_input = RunAgentInput.model_validate(request.model_dump(by_alias=True))
-
     with pytest.raises(BusinessException) as raised:
-        ConversationChatService._resume_input(
+        prepare_resume(
             request,
-            run_input=run_input,
+            identity=conversation_identity(7, "thread-1", "run-resume"),
             existing_config={
                 "resume_data": {"decisions": [{"type": "approve"}]},
                 **(
@@ -239,7 +238,10 @@ async def test_non_empty_thread_id_must_belong_to_the_current_user(
             roles=(),
             disabled=False,
         ),
-        resources=cast(ApplicationResources, SimpleNamespace()),
+        resources=cast(
+            ApplicationResources,
+            SimpleNamespace(conversation_projector=ProjectionProbe()),
+        ),
     )
 
     with pytest.raises(BusinessException) as caught:
@@ -314,8 +316,8 @@ async def test_chat_does_not_filter_optional_deep_agent_state_channels(
                 agent_persistence=object(),
                 sandbox_manager=object(),
                 tinkerfin=TinkerFin(
-                    run_coordinator=InMemoryRunCoordinator[str](
-                        key_resolver=lambda principal: principal
+                    run_coordinator=InMemoryRunCoordinator(
+                        key_resolver=lambda identity: identity.thread_id
                     )
                 ),
                 conversation_channel=messaging.channel(
@@ -447,8 +449,8 @@ async def test_concurrent_empty_thread_retries_share_one_thread_and_run(
                 agent_persistence=object(),
                 sandbox_manager=object(),
                 tinkerfin=TinkerFin(
-                    run_coordinator=InMemoryRunCoordinator[str](
-                        key_resolver=lambda principal: principal
+                    run_coordinator=InMemoryRunCoordinator(
+                        key_resolver=lambda identity: identity.thread_id
                     )
                 ),
                 conversation_channel=messaging.channel(
@@ -713,8 +715,8 @@ async def test_concurrent_resume_claims_one_interrupt_for_exactly_one_run(
                 agent_persistence=object(),
                 sandbox_manager=object(),
                 tinkerfin=TinkerFin(
-                    run_coordinator=InMemoryRunCoordinator[str](
-                        key_resolver=lambda principal: principal
+                    run_coordinator=InMemoryRunCoordinator(
+                        key_resolver=lambda identity: identity.thread_id
                     )
                 ),
                 conversation_channel=messaging.channel(
@@ -987,8 +989,8 @@ async def test_concurrent_same_run_resume_attaches_without_reopening_agent(
                 agent_persistence=object(),
                 sandbox_manager=object(),
                 tinkerfin=TinkerFin(
-                    run_coordinator=InMemoryRunCoordinator[str](
-                        key_resolver=lambda principal: principal
+                    run_coordinator=InMemoryRunCoordinator(
+                        key_resolver=lambda identity: identity.thread_id
                     )
                 ),
                 conversation_channel=messaging.channel(
@@ -1106,8 +1108,16 @@ async def test_resume_preflight_failure_releases_interrupt_claim(
         async def sse(self, *args, **kwargs):
             del args, kwargs
             raise RunAlreadyActive(
-                active_run="run-active",
-                requested_run="run-preflight",
+                active_identity=conversation_identity(
+                    7,
+                    "thread-preflight-failure",
+                    "run-active",
+                ),
+                requested_identity=conversation_identity(
+                    7,
+                    "thread-preflight-failure",
+                    "run-preflight",
+                ),
             )
 
     resources = cast(
@@ -1117,8 +1127,8 @@ async def test_resume_preflight_failure_releases_interrupt_claim(
             agent_persistence=object(),
             sandbox_manager=object(),
             tinkerfin=TinkerFin(
-                run_coordinator=InMemoryRunCoordinator[str](
-                    key_resolver=lambda principal: principal
+                run_coordinator=InMemoryRunCoordinator(
+                    key_resolver=lambda identity: identity.thread_id
                 )
             ),
             conversation_channel=RejectingChannel(),
@@ -1262,8 +1272,8 @@ async def test_resume_requires_every_pending_interrupt_before_creating_run(
             agent_persistence=object(),
             sandbox_manager=object(),
             tinkerfin=TinkerFin(
-                run_coordinator=InMemoryRunCoordinator[str](
-                    key_resolver=lambda principal: principal
+                run_coordinator=InMemoryRunCoordinator(
+                    key_resolver=lambda identity: identity.thread_id
                 )
             ),
             conversation_channel=UnexpectedChannel(),
@@ -1365,8 +1375,8 @@ async def test_resume_requires_every_pending_interrupt_before_creating_run(
             agent_persistence=object(),
             sandbox_manager=object(),
             tinkerfin=TinkerFin(
-                run_coordinator=InMemoryRunCoordinator[str](
-                    key_resolver=lambda principal: principal
+                run_coordinator=InMemoryRunCoordinator(
+                    key_resolver=lambda identity: identity.thread_id
                 )
             ),
             conversation_channel=ClosingChannel(),
@@ -1492,8 +1502,14 @@ async def test_cancelled_preflight_waits_for_a_definitive_messaging_outcome(
             await release.wait()
             if not sse_succeeds:
                 raise RunAlreadyActive(
-                    active_run="run-active",
-                    requested_run="run-cancelled-preflight",
+                    active_identity=Identity(
+                        threadId="users/7/threads/thread-cancelled-preflight",
+                        runId="run-active",
+                    ),
+                    requested_identity=Identity(
+                        threadId="users/7/threads/thread-cancelled-preflight",
+                        runId="run-cancelled-preflight",
+                    ),
                 )
             return body
 
@@ -1504,8 +1520,8 @@ async def test_cancelled_preflight_waits_for_a_definitive_messaging_outcome(
             agent_persistence=object(),
             sandbox_manager=object(),
             tinkerfin=TinkerFin(
-                run_coordinator=InMemoryRunCoordinator[str](
-                    key_resolver=lambda principal: principal
+                run_coordinator=InMemoryRunCoordinator(
+                    key_resolver=lambda identity: identity.thread_id
                 )
             ),
             conversation_channel=DelayedChannel(),
@@ -1640,9 +1656,9 @@ async def test_delete_rejects_a_committed_run_before_messaging_preflight(
             await release.wait()
             return Body()
 
-        async def delete_stream(self, *, stream: str) -> None:
+        async def delete_stream(self, *, identity: Identity) -> None:
             nonlocal delete_stream_calls
-            del stream
+            del identity
             delete_stream_calls += 1
 
     class Checkpointer:
@@ -1658,8 +1674,8 @@ async def test_delete_rejects_a_committed_run_before_messaging_preflight(
             agent_persistence=SimpleNamespace(checkpointer=Checkpointer()),
             sandbox_manager=object(),
             tinkerfin=TinkerFin(
-                run_coordinator=InMemoryRunCoordinator[str](
-                    key_resolver=lambda principal: principal
+                run_coordinator=InMemoryRunCoordinator(
+                    key_resolver=lambda identity: identity.thread_id
                 )
             ),
             conversation_channel=DelayedChannel(),
@@ -1722,11 +1738,11 @@ async def test_delete_rejects_a_committed_run_before_messaging_preflight(
     assert stored_run is not None
 
 
-async def test_delete_waits_for_completed_run_attachment_preflight(
+async def test_completed_run_attachment_preflight_does_not_hold_the_thread_transaction(
     database: Database,
     monkeypatch,
 ) -> None:
-    """已完成 run 的同 ID 重放必须先完成 prepare 才能被删除"""
+    """已完成 run 的重放预握手期间不得继续持有数据库 thread 锁"""
 
     user = UserContext(
         user_id=7,
@@ -1775,12 +1791,13 @@ async def test_delete_waits_for_completed_run_attachment_preflight(
             thread_id=thread.id,
             run_id=request.run_id,
             model_id="main",
-            input_json=cast(
-                dict[str, object],
-                request.normalized(
-                    thread_id=thread_id,
-                    message_ids=(message_id,),
-                ),
+            input_json=request.normalized(
+                thread_id=thread_id,
+                message_ids=(message_id,),
+            ).model_dump(
+                mode="json",
+                by_alias=True,
+                exclude_none=False,
             ),
             config_json={"thread_id": f"users/{user.user_id}/threads/{thread_id}"},
         )
@@ -1857,9 +1874,9 @@ async def test_delete_waits_for_completed_run_attachment_preflight(
             await release.wait()
             return Body()
 
-        async def delete_stream(self, *, stream: str) -> None:
+        async def delete_stream(self, *, identity: Identity) -> None:
             nonlocal delete_stream_calls
-            del stream
+            del identity
             delete_stream_calls += 1
 
     class Checkpointer:
@@ -1875,8 +1892,8 @@ async def test_delete_waits_for_completed_run_attachment_preflight(
             agent_persistence=SimpleNamespace(checkpointer=Checkpointer()),
             sandbox_manager=object(),
             tinkerfin=TinkerFin(
-                run_coordinator=InMemoryRunCoordinator[str](
-                    key_resolver=lambda principal: principal
+                run_coordinator=InMemoryRunCoordinator(
+                    key_resolver=lambda identity: identity.thread_id
                 )
             ),
             conversation_channel=DelayedChannel(),
@@ -1903,13 +1920,10 @@ async def test_delete_waits_for_completed_run_attachment_preflight(
         )
         await asyncio.sleep(0.05)
 
-        try:
-            assert not delete_task.done()
-        finally:
-            release.set()
+        await asyncio.wait_for(delete_task, timeout=1)
+        release.set()
         prepared = await start_task
         assert await _collect_frames(prepared.body) == []
-        await delete_task
 
     assert delete_stream_calls == 1
     assert delete_checkpoint_calls == 1
@@ -2028,8 +2042,8 @@ async def test_immediate_resume_reconciles_committed_interrupt_before_claim(
                 agent_persistence=object(),
                 sandbox_manager=object(),
                 tinkerfin=TinkerFin(
-                    run_coordinator=InMemoryRunCoordinator[str](
-                        key_resolver=lambda principal: principal
+                    run_coordinator=InMemoryRunCoordinator(
+                        key_resolver=lambda identity: identity.thread_id
                     )
                 ),
                 conversation_channel=channel,
@@ -2081,23 +2095,39 @@ async def test_immediate_resume_reconciles_committed_interrupt_before_claim(
             database=database,
             channel=channel,
         )
-        resume_resources = cast(
-            ApplicationResources,
-            SimpleNamespace(
-                settings=SimpleNamespace(tavily_api_key=None),
-                agent_persistence=object(),
-                sandbox_manager=object(),
-                tinkerfin=TinkerFin(
-                    run_coordinator=InMemoryRunCoordinator[str](
-                        key_resolver=lambda principal: principal
-                    )
-                ),
-                conversation_channel=channel,
-                conversation_projector=projector,
-            ),
-        )
+        reconcile_transaction_states: list[bool] = []
         try:
             async with database.session() as resume_session:
+
+                async def reconcile_without_transaction(
+                    *,
+                    thread_pk: int,
+                    identity: Identity,
+                ) -> None:
+                    reconcile_transaction_states.append(resume_session.in_transaction())
+                    await projector.reconcile(
+                        thread_pk=thread_pk,
+                        identity=identity,
+                    )
+
+                resume_resources = cast(
+                    ApplicationResources,
+                    SimpleNamespace(
+                        settings=SimpleNamespace(tavily_api_key=None),
+                        agent_persistence=object(),
+                        sandbox_manager=object(),
+                        tinkerfin=TinkerFin(
+                            run_coordinator=InMemoryRunCoordinator(
+                                key_resolver=lambda identity: identity.thread_id
+                            )
+                        ),
+                        conversation_channel=channel,
+                        conversation_projector=SimpleNamespace(
+                            ensure=projector.ensure,
+                            reconcile=reconcile_without_transaction,
+                        ),
+                    ),
+                )
                 resumed = await ConversationChatService(
                     resume_session,
                     user=user,
@@ -2152,6 +2182,7 @@ async def test_immediate_resume_reconciles_committed_interrupt_before_claim(
     assert projected_interrupt is not None
     assert projected_interrupt.status == "resolved"
     assert projected_interrupt.resolved_run_id == "run-immediate-resume"
+    assert reconcile_transaction_states == [False]
 
 
 async def test_cancel_waits_for_the_durable_cancelled_terminal(
@@ -2198,6 +2229,24 @@ async def test_cancel_waits_for_the_durable_cancelled_terminal(
         disabled=False,
     )
     async with Messaging(backend=backend) as messaging:
+        channel = messaging.channel(
+            name="studio-conversation-agui",
+            codec=AgUiCodec(),
+        )
+        external_transaction_states: list[tuple[str, bool]] = []
+
+        async def cancel_without_transaction(*, identity: Identity) -> bool:
+            external_transaction_states.append(("cancel", session.in_transaction()))
+            return await channel.cancel(identity=identity)
+
+        async def reconcile_without_transaction(
+            *,
+            thread_pk: int,
+            identity: Identity,
+        ) -> int:
+            external_transaction_states.append(("reconcile", session.in_transaction()))
+            return await probe.reconcile(thread_pk=thread_pk, identity=identity)
+
         resources = cast(
             ApplicationResources,
             SimpleNamespace(
@@ -2205,15 +2254,18 @@ async def test_cancel_waits_for_the_durable_cancelled_terminal(
                 agent_persistence=object(),
                 sandbox_manager=object(),
                 tinkerfin=TinkerFin(
-                    run_coordinator=InMemoryRunCoordinator[str](
-                        key_resolver=lambda principal: principal
+                    run_coordinator=InMemoryRunCoordinator(
+                        key_resolver=lambda identity: identity.thread_id
                     )
                 ),
-                conversation_channel=messaging.channel(
-                    name="studio-conversation-agui",
-                    codec=AgUiCodec(),
+                conversation_channel=SimpleNamespace(
+                    sse=channel.sse,
+                    cancel=cancel_without_transaction,
                 ),
-                conversation_projector=probe,
+                conversation_projector=SimpleNamespace(
+                    ensure=probe.ensure,
+                    reconcile=reconcile_without_transaction,
+                ),
             ),
         )
         service = ConversationChatService(session, user=user, resources=resources)
@@ -2247,6 +2299,10 @@ async def test_cancel_waits_for_the_durable_cancelled_terminal(
     assert [event["type"] for event in event_types].count("RUN_ERROR") == 1
     assert event_types[-1]["code"] == "cancelled"
     assert event_types[-1]["message"] == "聊天生成已取消"
+    assert external_transaction_states == [
+        ("cancel", False),
+        ("reconcile", False),
+    ]
 
 
 async def _collect_frames(body) -> list[bytes]:

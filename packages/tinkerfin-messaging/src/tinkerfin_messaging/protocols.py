@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import ClassVar, Protocol, TypeVar, runtime_checkable
 
+from tinkerfin_agui_adapter import Identity
+
 from .models import RecoverableMessage, RecoveryCheckpoint
 
 SourceT_co = TypeVar("SourceT_co", covariant=True)
@@ -36,6 +38,9 @@ class ProfiledMessageSource(
 
     @property
     def messaging_codec_profile(self) -> str: ...
+
+    @property
+    def messaging_identity(self) -> Identity: ...
 
     @property
     def messaging_source_type(self) -> type[SourceT_co]: ...

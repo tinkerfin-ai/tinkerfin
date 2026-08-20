@@ -89,7 +89,9 @@ Warm instances are not bound to an application key until `get()` atomically cons
 
 ```python
 async def install_project(backend) -> None:
-    await backend.aexecute("git clone https://example.com/project.git /workspace/project")
+    await backend.aexecute(
+        "git clone https://example.com/project.git /workspace/project"
+    )
 
 
 client = OpenSandboxClient(

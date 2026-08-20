@@ -11,7 +11,11 @@ from langgraph.runtime import RunControl
 from langgraph.types import StreamMode
 
 import tinkerfin.coordination as coordination
-from tinkerfin import GraphRunStream, TinkerFin
+from tinkerfin import GraphRunStream, Identity, TinkerFin
+
+
+def _identity() -> Identity:
+    return Identity(threadId="thread-1", runId="run-1")
 
 
 class _GraphState(TypedDict, total=False):
@@ -190,19 +194,19 @@ async def test_graph_aclose_from_observer_child_task_preserves_current_part() ->
     assert graph.closed.is_set()
 
 
-def test_principal_contract_matches_coordinator_configuration() -> None:
+def test_identity_contract_matches_coordinator_configuration() -> None:
     graph = RecordingGraph([])
     plain = TinkerFin()
 
-    with pytest.raises(ValueError, match="principal"):
-        plain.run(lambda: graph.astream({}, version="v2"), principal="user-1")
+    run = plain.run(lambda: graph.astream({}, version="v2"), identity=_identity())
+    assert run._identity == _identity()
 
     coordinated = TinkerFin(
-        run_coordinator=coordination.InMemoryRunCoordinator[str](
-            key_resolver=lambda value: value
+        run_coordinator=coordination.InMemoryRunCoordinator(
+            key_resolver=lambda value: value.thread_id
         )
     )
-    with pytest.raises(ValueError, match="principal"):
+    with pytest.raises(ValueError, match="identity"):
         coordinated.run(lambda: graph.astream({}, version="v2"))
 
 
@@ -212,8 +216,8 @@ async def test_coordinator_is_lazy_and_released_when_stream_closes() -> None:
     released = asyncio.Event()
 
     @asynccontextmanager
-    async def coordinate(principal: str) -> AsyncIterator[None]:
-        assert principal == "user-1"
+    async def coordinate(identity: Identity) -> AsyncIterator[None]:
+        assert identity == _identity()
         entered.set()
         try:
             yield
@@ -223,7 +227,7 @@ async def test_coordinator_is_lazy_and_released_when_stream_closes() -> None:
     graph = RecordingGraph([{"type": "values", "ns": (), "data": {}}])
     stream = (
         TinkerFin(run_coordinator=coordinate)
-        .run(lambda: graph.astream({}, version="v2"), principal="user-1")
+        .run(lambda: graph.astream({}, version="v2"), identity=_identity())
         .astream()
     )
 
@@ -244,8 +248,8 @@ async def test_closing_stream_cancels_an_active_graph_pull_before_releasing() ->
     released = asyncio.Event()
 
     @asynccontextmanager
-    async def coordinate(principal: str) -> AsyncIterator[None]:
-        del principal
+    async def coordinate(identity: Identity) -> AsyncIterator[None]:
+        del identity
         try:
             yield
         finally:
@@ -257,7 +261,7 @@ async def test_closing_stream_cancels_an_active_graph_pull_before_releasing() ->
     )
     stream = (
         TinkerFin(run_coordinator=coordinate)
-        .run(lambda: graph.astream({}, version="v2"), principal="user-1")
+        .run(lambda: graph.astream({}, version="v2"), identity=_identity())
         .astream()
     )
     pull = asyncio.create_task(anext(stream))

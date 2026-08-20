@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any, TypedDict, assert_type, cast, reveal_type
 
-from ag_ui.core import RunAgentInput
 from langchain.agents.middleware.types import InputAgentState
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage
@@ -17,7 +16,8 @@ from tinkerfin import (
     DeepAgentAgUiRuntime,
     DeepAgentDefinition,
     DeepAgentRuntime,
-    GraphRunStream,
+    Identity,
+    NativeGraphRunStream,
     TinkerFin,
 )
 
@@ -39,34 +39,24 @@ class _Context(TypedDict):
 
 
 if TYPE_CHECKING:
-    tinkerfin = TinkerFin[str]()
+    tinkerfin = TinkerFin()
     definition = tinkerfin.create_deep_agent(
         model=_FakeModel(responses=[AIMessage(content="ok")]),
         tools=[],
         context_schema=_Context,
     )
-    assert_type(definition, DeepAgentDefinition[_Context, str])
+    assert_type(definition, DeepAgentDefinition[_Context])
 
-    run_input = RunAgentInput.model_validate(
-        {
-            "threadId": "thread-1",
-            "runId": "run-1",
-            "state": {},
-            "messages": [],
-            "tools": [],
-            "context": [],
-            "forwardedProps": {},
-        }
-    )
-    native = definition.new()
-    agui = definition.new_agui(run_input=run_input)
+    identity = Identity(threadId="thread-1", runId="run-1")
+    native = definition.new(identity=identity)
+    agui = definition.new_agui(identity=identity)
     assert_type(native, DeepAgentRuntime[_Context])
     assert_type(agui, DeepAgentAgUiRuntime[_Context])
 
     graph_input = cast(InputAgentState, {"messages": []})
     assert_type(
         native.astream(graph_input, context={"tenant": "tenant-1"}),
-        GraphRunStream[object],
+        NativeGraphRunStream,
     )
     assert_type(
         agui.astream(graph_input, context={"tenant": "tenant-1"}),

@@ -17,8 +17,8 @@ See [AG-UI basics](index.md) for Runtime parameters and [Interrupts and resume](
 
 | API | Main parameters | When to use it |
 | --- | --- | --- |
-| `astream_events(...)` | `parts`, `run_input`, visibility flags, prior IDs | Automatic complete lifecycle around an existing native stream |
-| `DeepAgentAgUiAdapter(...)` | `run_id`, prior IDs, visibility flags | A custom orchestrator owns the main lifecycle |
+| `astream_events(...)` | `parts`, `identity`, visibility flags, prior IDs | Automatic complete lifecycle around an existing native stream |
+| `DeepAgentAgUiAdapter(...)` | `identity`, prior IDs, visibility flags | A custom orchestrator owns the main lifecycle |
 | `encode_sse(...)` | `event`, optional `event_id` | Render one AG-UI event as SSE |
 | `micro_batch(...)` | `events`, optional batcher | Combine adjacent small deltas |
 
@@ -35,12 +35,12 @@ See [AG-UI basics](index.md) for Runtime parameters and [Interrupts and resume](
 
 | Method | Parameters | Result |
 | --- | --- | --- |
-| `started(...)` | `run_input` | `RUN_STARTED` |
-| `finished(...)` | `thread_id`, `run_id`, `outcome` | `RUN_FINISHED` |
-| `failed(...)` | `run_id`, `message`, `code` | `RUN_ERROR` |
-| `is_main_lifecycle(...)` | `event`, `run_id` | Whether the event occupies this main lifecycle |
+| `started(...)` | `identity` | `RUN_STARTED` with `input=None` |
+| `finished(...)` | `identity`, `outcome` | `RUN_FINISHED` |
+| `failed(...)` | `identity`, `message`, `code` | `RUN_ERROR` |
+| `is_main_lifecycle(...)` | `event`, `identity` | Whether the event occupies this main lifecycle |
 | `event_run_id(event)` | event | Validated run ID when available |
-| `validate_run_input(...)` | `run_input` | Early identity validation |
+| `validate_identity(...)` | `identity` | Early shared identity validation |
 
 `AgentRunOutcome.type` is `success` or `interrupt`; only the latter carries `interrupts`.
 

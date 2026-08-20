@@ -70,7 +70,7 @@ class ConversationProjector:
         main_run = await self._session.scalar(
             select(ConversationRun).where(
                 ConversationRun.conversation_thread_id == thread_pk,
-                ConversationRun.run_id == envelope.run,
+                ConversationRun.run_id == envelope.identity.run_id,
             )
         )
         created_at = envelope.created_at.astimezone(UTC).replace(tzinfo=None)
@@ -80,7 +80,7 @@ class ConversationProjector:
             event=event_json,
             created_at=created_at,
         )
-        event_run_id = self._event_run_id(event_json, envelope.run)
+        event_run_id = self._event_run_id(event_json, envelope.identity.run_id)
         run = (
             main_run
             if main_run is not None and main_run.run_id == event_run_id
@@ -102,7 +102,7 @@ class ConversationProjector:
             self._session.add(run)
         run_input = (
             main_run.input_json
-            if main_run is not None and event_run_id == envelope.run
+            if main_run is not None and event_run_id == envelope.identity.run_id
             else None
         )
         snapshot = reduce_snapshot(
@@ -116,7 +116,7 @@ class ConversationProjector:
         self._session.add(
             ConversationEvent(
                 conversation_thread_id=thread_pk,
-                run_id=envelope.run,
+                run_id=envelope.identity.run_id,
                 seq=envelope.seq,
                 event_id=envelope.message_id,
                 event_type=event_type,
@@ -155,7 +155,7 @@ class ConversationProjector:
         thread.last_seq = envelope.seq
         thread.snapshot_seq = envelope.seq
         thread.snapshot_json = snapshot
-        thread.last_run_id = envelope.run
+        thread.last_run_id = envelope.identity.run_id
         thread.status = self._thread_status(snapshot)
         thread.has_pending_interrupt = snapshot.get("approval") is not None
         thread.message_count = sum(

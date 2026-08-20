@@ -80,12 +80,8 @@ result = await backend.aexecute_with_offload(
 ## Upload and download
 
 ```python
-uploads = await backend.aupload_files(
-    [("/input/data.csv", csv_bytes)]
-)
-downloads = await backend.adownload_files(
-    ["/output/report.json"]
-)
+uploads = await backend.aupload_files([("/input/data.csv", csv_bytes)])
+downloads = await backend.adownload_files(["/output/report.json"])
 ```
 
 Responses preserve input order. A confirmed invalid path affects only that item. Transport failures and uncertain results propagate instead of retrying a write that may already have happened.

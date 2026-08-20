@@ -9,7 +9,6 @@ from dataclasses import FrozenInstanceError, fields
 from typing import TypedDict, cast, get_type_hints
 
 import pytest
-from ag_ui.core import RunAgentInput
 from langgraph.graph import START, StateGraph
 from langgraph.types import StreamMode
 
@@ -17,22 +16,13 @@ from tinkerfin import (
     AgUiNativeStreamConfig,
     AgUiNativeStreamConfigurationError,
     AgUiNativeStreamInvocation,
+    Identity,
     TinkerFin,
 )
 
 
-def _run_input() -> RunAgentInput:
-    return RunAgentInput.model_validate(
-        {
-            "threadId": "thread-1",
-            "runId": "run-1",
-            "state": {},
-            "messages": [],
-            "tools": [],
-            "context": [],
-            "forwardedProps": {},
-        }
-    )
+def _identity() -> Identity:
+    return Identity(threadId="thread-1", runId="run-1")
 
 
 class _RecordingGraph:
@@ -45,13 +35,13 @@ class _RecordingGraph:
     def astream(
         self,
         graph_input: object,
-        graph_config: object | None = None,
+        config: object | None = None,
         **options: object,
     ) -> AsyncIterator[Mapping[str, object]]:
         self.calls.append(
             {
                 "graph_input": graph_input,
-                "graph_config": graph_config,
+                "graph_config": config,
                 "options": options,
             }
         )
@@ -118,7 +108,7 @@ def test_invalid_agui_native_config_fails_before_every_runtime_side_effect(
     observed_parts: list[object] = []
 
     @asynccontextmanager
-    async def coordinate(_: str) -> AsyncIterator[None]:
+    async def coordinate(_: Identity) -> AsyncIterator[None]:
         nonlocal coordinator_entries
         coordinator_entries += 1
         yield
@@ -135,7 +125,7 @@ def test_invalid_agui_native_config_fails_before_every_runtime_side_effect(
     with pytest.raises(AgUiNativeStreamConfigurationError, match=expected):
         TinkerFin(run_coordinator=coordinate).run(
             invocation,
-            principal="user-1",
+            identity=_identity(),
             on_part=on_part,
         )
 
@@ -165,11 +155,11 @@ def test_agui_native_config_rejects_noncanonical_mode_collections(
     assert graph.calls == []
 
 
-def test_invalid_strict_config_precedes_principal_validation() -> None:
+def test_invalid_strict_config_precedes_identity_validation() -> None:
     graph = _RecordingGraph()
 
     @asynccontextmanager
-    async def coordinate(_: str) -> AsyncIterator[None]:
+    async def coordinate(_: Identity) -> AsyncIterator[None]:
         yield
 
     invocation = _config(extra_modes=("messages",)).bind(graph.astream, {})
@@ -178,6 +168,44 @@ def test_invalid_strict_config_precedes_principal_validation() -> None:
         TinkerFin(run_coordinator=coordinate).run(invocation)
 
     assert graph.calls == []
+
+
+def test_strict_identity_conflict_fails_before_graph_or_coordination() -> None:
+    graph = _RecordingGraph()
+    coordinator_entries = 0
+
+    @asynccontextmanager
+    async def coordinate(_: Identity) -> AsyncIterator[None]:
+        nonlocal coordinator_entries
+        coordinator_entries += 1
+        yield
+
+    invocation = _config().bind(
+        graph.astream,
+        {"messages": []},
+        {"configurable": {"thread_id": "thread-other"}},
+    )
+
+    with pytest.raises(ValueError, match="must equal identity.thread_id"):
+        TinkerFin(run_coordinator=coordinate).run(
+            invocation,
+            identity=_identity(),
+        )
+
+    assert graph.calls == []
+    assert coordinator_entries == 0
+
+
+@pytest.mark.asyncio
+async def test_strict_identity_injects_missing_graph_thread() -> None:
+    graph = _RecordingGraph()
+    invocation = _config().bind(graph.astream, {"messages": []})
+    stream = TinkerFin().run(invocation, identity=_identity()).astream_agui()
+
+    events = [event async for event in stream]
+
+    assert events[-1].type.value == "RUN_FINISHED"
+    assert graph.calls[0]["graph_config"] == {"configurable": {"thread_id": "thread-1"}}
 
 
 @pytest.mark.parametrize("reserved", ["stream_mode", "version", "subgraphs"])
@@ -210,12 +238,12 @@ async def test_valid_agui_native_config_is_forwarded_exactly_and_stays_lazy() ->
     config = _config(extra_modes=("updates", "checkpoints", "debug", "custom"))
 
     @asynccontextmanager
-    async def coordinate(principal: str) -> AsyncIterator[None]:
-        coordination.append(f"enter:{principal}")
+    async def coordinate(identity: Identity) -> AsyncIterator[None]:
+        coordination.append(f"enter:{identity.run_id}")
         try:
             yield
         finally:
-            coordination.append(f"exit:{principal}")
+            coordination.append(f"exit:{identity.run_id}")
 
     async def on_part(part: object) -> None:
         observed_parts.append(part)
@@ -230,10 +258,10 @@ async def test_valid_agui_native_config_is_forwarded_exactly_and_stays_lazy() ->
     assert isinstance(invocation, AgUiNativeStreamInvocation)
     run = TinkerFin(run_coordinator=coordinate).run(
         invocation,
-        principal="user-1",
+        identity=_identity(),
         on_part=on_part,
     )
-    events = run.astream_agui(run_input=_run_input())
+    events = run.astream_agui()
 
     assert graph.calls == []
     assert coordination == []
@@ -267,7 +295,7 @@ async def test_valid_agui_native_config_is_forwarded_exactly_and_stays_lazy() ->
             },
         }
     ]
-    assert coordination == ["enter:user-1"]
+    assert coordination == ["enter:run-1"]
     assert observed_parts == [
         {
             "type": "values",
@@ -281,7 +309,7 @@ async def test_valid_agui_native_config_is_forwarded_exactly_and_stays_lazy() ->
     assert finished.type.value == "RUN_FINISHED"
     with pytest.raises(StopAsyncIteration):
         await anext(events)
-    assert coordination == ["enter:user-1", "exit:user-1"]
+    assert coordination == ["enter:run-1", "exit:run-1"]
     assert graph.iterator_opened == 1
     assert graph.iterator_pulled == 1
     assert graph.iterator_closed == 1
@@ -296,7 +324,12 @@ async def test_strict_agui_run_preserves_pull_backpressure_and_cancellation_clea
     iterator_closed = asyncio.Event()
     coordination: list[str] = []
 
-    def astream(**options: object) -> AsyncIterator[Mapping[str, object]]:
+    def astream(
+        *,
+        config: object | None = None,
+        **options: object,
+    ) -> AsyncIterator[Mapping[str, object]]:
+        assert config == {"configurable": {"thread_id": "thread-1"}}
         assert options == {
             "stream_mode": ("messages", "tasks", "values"),
             "version": "v2",
@@ -325,21 +358,21 @@ async def test_strict_agui_run_preserves_pull_backpressure_and_cancellation_clea
         return parts()
 
     @asynccontextmanager
-    async def coordinate(principal: str) -> AsyncIterator[None]:
-        coordination.append(f"enter:{principal}")
+    async def coordinate(identity: Identity) -> AsyncIterator[None]:
+        coordination.append(f"enter:{identity.run_id}")
         try:
             yield
         finally:
-            coordination.append(f"exit:{principal}")
+            coordination.append(f"exit:{identity.run_id}")
 
     invocation = _config().bind(astream)
     events = (
         TinkerFin(run_coordinator=coordinate)
         .run(
             invocation,
-            principal="user-1",
+            identity=_identity(),
         )
-        .astream_agui(run_input=_run_input())
+        .astream_agui()
     )
 
     assert (await anext(events)).type.value == "RUN_STARTED"
@@ -354,7 +387,7 @@ async def test_strict_agui_run_preserves_pull_backpressure_and_cancellation_clea
         await pending
 
     assert iterator_closed.is_set()
-    assert coordination == ["enter:user-1", "exit:user-1"]
+    assert coordination == ["enter:run-1", "exit:run-1"]
 
 
 @pytest.mark.asyncio
@@ -364,13 +397,7 @@ async def test_strict_agui_binding_runs_a_real_compiled_langgraph_v2_stream() ->
     builder.add_edge(START, "increment")
     graph = builder.compile()
     invocation = _config().bind(graph.astream, {"value": 1})
-    stream = (
-        TinkerFin()
-        .run(invocation)
-        .astream_agui(
-            run_input=_run_input(),
-        )
-    )
+    stream = TinkerFin().run(invocation, identity=_identity()).astream_agui()
 
     events = [event async for event in stream]
 

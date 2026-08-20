@@ -1,10 +1,11 @@
 # ruff: noqa: F403, F405
 # 此文件由 scripts/generate_stubs.py 根据锁定依赖生成，请勿手工维护参数列表
 from collections.abc import Callable, Sequence
-from typing import Any, Generic
+from typing import Any
 
 from deepagents.graph import *
-from typing_extensions import TypeVar
+
+from tinkerfin_agui_adapter import Identity as Identity
 
 from .agui_resume import AgUiResumeBinding as AgUiResumeBinding
 from .coordination import InMemoryRunCoordinator as InMemoryRunCoordinator
@@ -33,9 +34,7 @@ from .runtime import SsePreflight as SsePreflight
 from .runtime import TinkerFin as _RuntimeTinkerFin
 from .runtime import TinkerFinRun as TinkerFinRun
 
-PrincipalT = TypeVar("PrincipalT", default=object)
-
-class TinkerFin(_RuntimeTinkerFin[PrincipalT], Generic[PrincipalT]):
+class TinkerFin(_RuntimeTinkerFin):
     def create_deep_agent(
         self,
         model: str | BaseChatModel | None = None,
@@ -60,6 +59,6 @@ class TinkerFin(_RuntimeTinkerFin[PrincipalT], Generic[PrincipalT]):
         debug: bool = False,
         name: str | None = None,
         cache: BaseCache | None = None,
-    ) -> DeepAgentDefinition[ContextT, PrincipalT]: ...
+    ) -> DeepAgentDefinition[ContextT]: ...
 
 __all__: list[str]

@@ -24,6 +24,24 @@ uv run python -m tinkerfin_studio --host 127.0.0.1 --port 8090 --reload
 本地进程使用应用目录的 `.env`，其中 MySQL、Redis 和 OpenSandbox 地址必须能从宿主机
 访问。MySQL 空库结构见 [database/mysql/schema.sql](database/mysql/schema.sql)。
 
+## 对话请求边界
+
+`POST /api/conversation/chat` 接收标准 AG-UI `RunAgentInput`，并返回可回放的 AG-UI SSE。HTTP 层先完成协议校验，再由 `ChatRequest.from_agui()` 增加 Studio 的模型、会话归属、请求模式和恢复校验；Service 不接收未经转换的请求。
+
+| 字段 | Studio 的处理方式 |
+| --- | --- |
+| `threadId` | 空字符串表示新会话；已有值必须属于当前用户 |
+| `runId` | 新输入使用新值；同一次网络重试或附着复用原值 |
+| `parentRunId` | 保留在标准请求快照中，不作为框架 Identity 或子 Agent 关系 |
+| `state` | 保留在标准请求快照中，不自动成为 Graph 输入 |
+| `messages` | 保留标准角色、多模态内容和扩展字段；Graph 只接收业务选中的本次输入 |
+| `tools` | 仅保留客户端工具描述，不授予服务端工具执行权限 |
+| `context` | 保留在标准请求快照中，由业务决定是否使用 |
+| `forwardedProps` | `model` 必填，`mode` 默认为 `default`；未知扩展字段完整保留 |
+| `resume` | 必须完整覆盖当前待处理 interrupt，并通过原子认领与重试一致性校验 |
+
+每条标准 AG-UI 消息必须带非空客户端 ID。该 ID 只用于通过 HTTP 协议校验，不参与权限、幂等、Graph 关联或持久化身份；Service 会为 canonical `RUN_STARTED.input.messages` 分配权威消息 ID。
+
 ## 单机部署
 
 要求 Bash、OpenSSL、uv、Docker 和 Docker Compose 2.24 或更高版本。在仓库根目录

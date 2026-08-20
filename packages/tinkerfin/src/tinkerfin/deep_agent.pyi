@@ -3,7 +3,6 @@
 from collections.abc import Mapping, Sequence
 from typing import Generic, Literal
 
-from ag_ui.core import RunAgentInput
 from deepagents.graph import *
 from langchain.agents.middleware.types import InputAgentState
 from langchain_core.runnables import RunnableConfig
@@ -15,12 +14,12 @@ from langgraph.pregel.main import (
     StreamMode,
 )
 from langgraph.types import Command
-from typing_extensions import TypeVar, Unpack
+from typing_extensions import Unpack
+
+from tinkerfin_agui_adapter import Identity
 
 from .agui_resume import AgUiResumeBinding
-from .runtime import AgUiEventStream, EventObserver, GraphRunStream, PartObserver
-
-PrincipalT = TypeVar("PrincipalT", default=object)
+from .runtime import AgUiEventStream, EventObserver, NativeGraphRunStream, PartObserver
 
 class DeepAgentRuntime(Generic[ContextT]):
     def astream(
@@ -40,7 +39,7 @@ class DeepAgentRuntime(Generic[ContextT]):
         debug: bool | None = None,
         version: Literal["v1", "v2"] = "v1",
         **kwargs: Unpack[DeprecatedKwargs],
-    ) -> GraphRunStream[object]: ...
+    ) -> NativeGraphRunStream: ...
 
 class DeepAgentAgUiRuntime(Generic[ContextT]):
     def astream(
@@ -62,19 +61,15 @@ class DeepAgentAgUiRuntime(Generic[ContextT]):
         **kwargs: Unpack[DeprecatedKwargs],
     ) -> AgUiEventStream: ...
 
-class DeepAgentDefinition(Generic[ContextT, PrincipalT]):
+class DeepAgentDefinition(Generic[ContextT]):
     def new(
-        self,
-        *,
-        principal: PrincipalT | None = None,
-        on_part: PartObserver[object] | None = None,
+        self, *, identity: Identity, on_part: PartObserver[object] | None = None
     ) -> DeepAgentRuntime[ContextT]: ...
     def new_agui(
         self,
         *,
-        principal: PrincipalT | None = None,
+        identity: Identity,
         on_part: PartObserver[Mapping[str, object]] | None = None,
-        run_input: RunAgentInput,
         timeout: float | None = None,
         settlement_timeout: float | None = None,
         expose_reasoning_events: bool = False,

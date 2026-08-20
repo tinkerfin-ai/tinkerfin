@@ -10,8 +10,9 @@ This page groups the public Runtime capabilities by how you use them. Most appli
 | --- | --- | --- |
 | `TinkerFin(run_coordinator=None)` | Create the main entry point | Optional shared coordinator |
 | `TinkerFin.create_deep_agent(...)` | Create a reusable agent definition | See [Create and run a Deep Agent](deep-agents.md) |
-| `TinkerFin.run(...)` | Run a custom async source | `source_factory`, `principal`, `on_part` |
-| `DeepAgentDefinition.new(...)` | Create a native Runtime | `principal`, `on_part` |
+| `Identity(threadId=..., runId=...)` | Identify one framework run | Thread and run only |
+| `TinkerFin.run(...)` | Run a custom async source | `source_factory`, `identity`, `on_part` |
+| `DeepAgentDefinition.new(...)` | Create a native Runtime | Required `identity`, optional `on_part` |
 | `DeepAgentDefinition.new_agui(...)` | Create an AG-UI Runtime | See [AG-UI basics](../agui/index.md) |
 
 Reuse `DeepAgentDefinition`. Treat `DeepAgentRuntime`, `DeepAgentAgUiRuntime`, `TinkerFinRun`, and `NativeTinkerFinRun` as single-use values returned by the entry points rather than constructing them directly.
@@ -75,6 +76,17 @@ Invalid combinations raise `AgUiNativeStreamConfigurationError`.
 | `RunCoordinator` | Extension boundary for run exclusion |
 | `InMemoryRunCoordinator(key_resolver=...)` | Serializes business keys within one process |
 
+After installing `tinkerfin[redis]`:
+
+| API | Use |
+| --- | --- |
+| `RedisRunCoordinator` | Serialize matching `Identity` values across processes |
+| `RedisLeaseLock` | Manage renewable Redis resource leases |
+| `RedisLease` | Immutable resource key and fencing token yielded by `hold()` |
+| `RedisLeaseLost` | Report uncertain, expired, or lost ownership |
+
+See [Custom sources and run coordination](extensions.md#use-a-renewable-redis-lease-when-needed) for constructor defaults and connection-pool guidance.
+
 ## Resume and errors
 
 | API | When it appears |
@@ -87,7 +99,6 @@ Invalid combinations raise `AgUiNativeStreamConfigurationError`.
 
 | Parameter | Default | Purpose |
 | --- | --- | --- |
-| `run_input` | required | Complete AG-UI request |
 | `timeout` | `None` | Overall native-stream wait limit |
 | `settlement_timeout` | `None` | Caller wait limit for protected cleanup |
 | `expose_reasoning_events` | `False` | Deliver supported reasoning events |
@@ -95,6 +106,8 @@ Invalid combinations raise `AgUiNativeStreamConfigurationError`.
 | `prior_tool_call_ids` | `frozenset()` | Complete scoped tool IDs emitted before resume |
 | `on_event` | `None` | Observer called before AG-UI event delivery |
 
-`AgUiResumeBinding.from_translation(...)` creates a binding; `validate_run_input(...)` and `validate_command(...)` let a custom host check it early. Deep Agents callers normally use `new_agui()` instead.
+Identity is already bound by `TinkerFin.run(..., identity=...)`; `astream_agui()` does not accept duplicate IDs.
+
+`AgUiResumeBinding.from_translation(...)` binds an Identity and translation. `validate_identity(...)` and `validate_command(...)` let a custom host check the target early.
 
 See [Interrupts and resume](../agui/interrupts-and-resume.md) for the complete resume flow.

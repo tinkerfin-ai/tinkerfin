@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
+from ag_ui.core import RunAgentInput
 from ag_ui.core.types import (
     Context,
     ResumeEntry,
@@ -26,19 +27,10 @@ class ConversationForwardedProps(BaseModel):
     )
 
 
-class ChatUserMessage(BaseModel):
-    """尚未分配服务端消息 ID 的用户输入"""
-
-    model_config = ConfigDict(extra="forbid")
-
-    role: Literal["user"] = Field(default="user", description="本次输入固定为用户消息")
-    content: str = Field(min_length=1, description="用户提交的文本内容")
-
-
 class ChatRequest(BaseModel):
-    """Studio 锁定的 AG-UI run 输入"""
+    """完成 AG-UI 协议校验并移除客户端消息 ID 的 Studio 请求"""
 
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     thread_id: str = Field(
         alias="threadId",
@@ -58,7 +50,9 @@ class ChatRequest(BaseModel):
         description="标准 AG-UI 父 run ID",
     )
     state: JsonValue = Field(description="客户端状态快照，仅持久化和透传")
-    messages: list[ChatUserMessage] = Field(description="不含客户端 ID 的本次用户输入")
+    messages: list[dict[str, JsonValue]] = Field(
+        description="保持标准角色、内容和扩展字段但不含客户端消息 ID"
+    )
     tools: list[Tool] = Field(description="客户端工具定义，仅持久化和透传")
     context: list[Context] = Field(description="AG-UI 上下文，仅持久化和透传")
     forwarded_props: ConversationForwardedProps = Field(
@@ -75,13 +69,43 @@ class ChatRequest(BaseModel):
             raise ValueError("身份字段不得包含首尾空白")
         return value
 
+    @field_validator("messages")
+    @classmethod
+    def messages_exclude_client_ids(
+        cls,
+        value: list[dict[str, JsonValue]],
+    ) -> list[dict[str, JsonValue]]:
+        """客户端消息 ID 只在 HTTP 协议边界使用，不进入业务身份"""
+
+        if any("id" in message for message in value):
+            raise ValueError("ChatRequest.messages 不得保留客户端消息 ID")
+        return value
+
+    @classmethod
+    def from_agui(cls, value: RunAgentInput) -> ChatRequest:
+        """保留标准 AG-UI 数据并增加 Studio 必需的业务校验"""
+
+        if not isinstance(value, RunAgentInput):
+            raise TypeError("value 必须是 RunAgentInput")
+        payload = value.model_dump(mode="json", by_alias=True, exclude_none=False)
+        payload["messages"] = [
+            message.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude={"id"},
+                exclude_none=False,
+            )
+            for message in value.messages
+        ]
+        return cls.model_validate(payload)
+
     def normalized(
         self,
         *,
         thread_id: str,
         message_ids: tuple[str, ...],
-    ) -> dict[str, JsonValue]:
-        """返回绑定服务端会话与消息 ID 的完整 AG-UI 输入"""
+    ) -> RunAgentInput:
+        """返回绑定服务端会话与权威消息 ID 的标准 AG-UI 输入"""
 
         if len(message_ids) != len(self.messages) or any(
             not value for value in message_ids
@@ -93,8 +117,8 @@ class ChatRequest(BaseModel):
         payload["messages"] = [
             {
                 "id": message_id,
-                **message.model_dump(mode="json", by_alias=True),
+                **message,
             }
             for message_id, message in zip(message_ids, self.messages, strict=True)
         ]
-        return payload
+        return RunAgentInput.model_validate(payload)

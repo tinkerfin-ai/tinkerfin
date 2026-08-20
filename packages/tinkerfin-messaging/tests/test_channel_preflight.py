@@ -9,15 +9,23 @@ from typing import ClassVar, cast
 
 import pytest
 
+from tinkerfin import Identity
 from tinkerfin_messaging import (
     InvalidCursor,
     MessageSubscription,
     Messaging,
     MessagingBackend,
     RunAlreadyActive,
-    RunIdentityConflict,
     SseRenderingUnsupported,
 )
+
+
+def _identity(
+    *,
+    thread_id: str = "conversation-1",
+    run_id: str = "run-1",
+) -> Identity:
+    return Identity(threadId=thread_id, runId=run_id)
 
 
 class _TextCodec:
@@ -88,8 +96,7 @@ async def test_invalid_cursor_is_rejected_during_wrap_and_closes_source(
         with pytest.raises(InvalidCursor) as captured:
             await channel.wrap(
                 source,
-                stream="conversation-1",
-                run="run-1",
+                identity=_identity(),
                 after=1,
             )
 
@@ -110,8 +117,7 @@ async def test_boolean_cursor_is_rejected_during_wrap_and_closes_source(
         with pytest.raises(TypeError, match="after must be an integer or None"):
             await channel.wrap(
                 source,
-                stream="conversation-1",
-                run="run-1",
+                identity=_identity(),
                 after=True,
             )
 
@@ -128,8 +134,7 @@ async def test_sse_requires_a_renderer_without_affecting_async_replay(
         channel = messaging.channel(name="events", codec=_TextCodec())
         subscription = await channel.wrap(
             source,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
         )
 
@@ -146,13 +151,12 @@ async def test_validate_cursor_checks_tail_without_claiming_a_run(
     async with Messaging(backend=messaging_backend) as messaging:
         channel = messaging.channel(name="events", codec=_TextCodec())
 
-        await channel.validate_cursor(stream="conversation-1", after=0)
+        await channel.validate_cursor(identity=_identity(), after=0)
         with pytest.raises(InvalidCursor) as captured:
-            await channel.validate_cursor(stream="conversation-1", after=1)
+            await channel.validate_cursor(identity=_identity(), after=1)
         subscription = await channel.wrap(
             source,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
         )
         assert await _collect_data(subscription) == ["message"]
@@ -162,7 +166,7 @@ async def test_validate_cursor_checks_tail_without_claiming_a_run(
     assert source.close_calls == 1
 
 
-async def test_invalid_stream_closes_the_unclaimed_source(
+async def test_overlong_identity_closes_the_unclaimed_source(
     messaging_backend: MessagingBackend,
 ) -> None:
     source = _ControlledSource("never-consumed")
@@ -170,11 +174,10 @@ async def test_invalid_stream_closes_the_unclaimed_source(
     async with Messaging(backend=messaging_backend) as messaging:
         channel = messaging.channel(name="events", codec=_TextCodec())
 
-        with pytest.raises(ValueError, match="stream must be non-blank"):
+        with pytest.raises(ValueError, match="at most 1024"):
             await channel.wrap(
                 source,
-                stream="",
-                run="run-1",
+                identity=_identity(thread_id="x" * 1025),
                 after=0,
             )
 
@@ -193,19 +196,15 @@ async def test_same_run_attaches_and_closes_the_unused_candidate_source(
         channel = messaging.channel(name="events", codec=_TextCodec())
         first = await channel.wrap(
             owner,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
-            attach_identity={"input": "hello"},
         )
         await asyncio.wait_for(owner.started.wait(), timeout=1)
 
         second = await channel.wrap(
             candidate,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
-            attach_identity={"input": "hello"},
         )
 
         release.set()
@@ -221,48 +220,33 @@ async def test_same_run_attaches_and_closes_the_unused_candidate_source(
     assert owner.close_calls == 1
 
 
-async def test_wrap_rejects_identity_and_active_run_conflicts_before_returning(
+async def test_wrap_rejects_an_active_run_conflict_before_returning(
     messaging_backend: MessagingBackend,
 ) -> None:
     release = asyncio.Event()
     owner = _ControlledSource("first", release=release)
-    identity_conflict = _ControlledSource("identity-conflict")
     active_conflict = _ControlledSource("active-conflict")
 
     async with Messaging(backend=messaging_backend) as messaging:
         channel = messaging.channel(name="events", codec=_TextCodec())
         subscription = await channel.wrap(
             owner,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
-            attach_identity={"input": "hello"},
         )
         await asyncio.wait_for(owner.started.wait(), timeout=1)
-
-        with pytest.raises(RunIdentityConflict):
-            await channel.wrap(
-                identity_conflict,
-                stream="conversation-1",
-                run="run-1",
-                after=0,
-                attach_identity={"input": "different"},
-            )
 
         with pytest.raises(RunAlreadyActive):
             await channel.wrap(
                 active_conflict,
-                stream="conversation-1",
-                run="run-2",
+                identity=_identity(run_id="run-2"),
                 after=0,
             )
 
         release.set()
         await _collect_data(subscription)
 
-    assert identity_conflict.close_calls == 1
     assert active_conflict.close_calls == 1
-    assert not identity_conflict.started.is_set()
     assert not active_conflict.started.is_set()
 
 
@@ -279,8 +263,7 @@ async def test_sse_renderer_uses_the_durable_sequence(
         )
         subscription = await channel.wrap(
             source,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
         )
 
@@ -311,8 +294,7 @@ async def test_channel_sse_resolves_cursor_callback_once(
         )
         body = await channel.sse(
             source,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=resolve_after,
         )
         frames = [frame async for frame in body]
@@ -343,8 +325,7 @@ async def test_channel_sse_cursor_callback_can_follow_from_current_tail(
         )
         body = await channel.sse(
             source,
-            stream="conversation-1",
-            run="run-1",
+            identity=_identity(),
             after=resolve_after,
         )
         frames = [frame async for frame in body]
@@ -369,8 +350,7 @@ async def test_channel_sse_rejects_invalid_resolved_cursor_before_iteration(
         with pytest.raises(TypeError, match="after must be an integer or None"):
             await channel.sse(
                 source,
-                stream="conversation-1",
-                run="run-1",
+                identity=_identity(),
                 after=invalid_resolver,
             )
 
@@ -398,8 +378,7 @@ async def test_channel_sse_closes_source_when_cursor_callback_fails(
         with pytest.raises(RuntimeError, match="cursor lookup failed"):
             await channel.sse(
                 source,
-                stream="conversation-1",
-                run="run-1",
+                identity=_identity(),
                 after=resolve_after,
             )
 

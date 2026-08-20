@@ -7,6 +7,7 @@ from typing import ClassVar
 
 import pytest
 
+from tinkerfin import Identity
 from tinkerfin_messaging import (
     CodecMismatch,
     FiniteMessageSource,
@@ -18,6 +19,14 @@ from tinkerfin_messaging import (
     RunProducerFailed,
     StreamDeleted,
 )
+
+
+def _identity(
+    *,
+    thread_id: str = "thread-1",
+    run_id: str = "run-1",
+) -> Identity:
+    return Identity(threadId=thread_id, runId=run_id)
 
 
 class _TextCodec:
@@ -55,8 +64,7 @@ async def _commit(messaging: Messaging, *items: str) -> MessageChannel[str, str]
     channel = messaging.channel(name="events", codec=_TextCodec())
     subscription = await channel.wrap(
         FiniteMessageSource.from_events(items),
-        stream="thread-1",
-        run="run-1",
+        identity=_identity(),
         after=0,
     )
     assert [message.data async for message in subscription] == list(items)
@@ -69,10 +77,10 @@ async def test_channel_reads_typed_committed_pages_and_follows_one_run(
     async with Messaging(backend=messaging_backend) as messaging:
         channel = await _commit(messaging, "first", "second")
 
-        assert await channel.latest_seq(stream="thread-1") == 2
-        first = await channel.read(stream="thread-1", after=0, limit=1)
-        second = await channel.read(stream="thread-1", after=1, limit=1000)
-        following = await channel.follow(stream="thread-1", run="run-1", after=0)
+        assert await channel.latest_seq(identity=_identity()) == 2
+        first = await channel.read(identity=_identity(), after=0, limit=1)
+        second = await channel.read(identity=_identity(), after=1, limit=1000)
+        following = await channel.follow(identity=_identity(), after=0)
 
         assert [(message.envelope.seq, message.data) for message in first] == [
             (1, "first")
@@ -89,8 +97,9 @@ async def test_channel_empty_committed_stream_returns_zero_and_empty_page(
     async with Messaging(backend=messaging_backend) as messaging:
         channel = messaging.channel(name="events", codec=_TextCodec())
 
-        assert await channel.latest_seq(stream="empty") == 0
-        assert await channel.read(stream="empty", after=0, limit=100) == ()
+        empty = _identity(thread_id="empty")
+        assert await channel.latest_seq(identity=empty) == 0
+        assert await channel.read(identity=empty, after=0, limit=100) == ()
 
 
 @pytest.mark.parametrize(
@@ -113,7 +122,7 @@ async def test_channel_read_validates_page_bounds(
         channel = messaging.channel(name="events", codec=_TextCodec())
 
         with pytest.raises(error, match=message):
-            await channel.read(stream="thread-1", after=after, limit=limit)
+            await channel.read(identity=_identity(), after=after, limit=limit)
 
 
 async def test_channel_read_rejects_persisted_codec_mismatch() -> None:
@@ -122,7 +131,7 @@ async def test_channel_read_rejects_persisted_codec_mismatch() -> None:
         mismatched = messaging.channel(name="events", codec=_OtherTextCodec())
 
         with pytest.raises(CodecMismatch):
-            await mismatched.read(stream="thread-1", after=0, limit=10)
+            await mismatched.read(identity=_identity(), after=0, limit=10)
 
 
 async def test_channel_follow_preserves_unknown_run_failure_and_can_close_early() -> (
@@ -131,9 +140,9 @@ async def test_channel_follow_preserves_unknown_run_failure_and_can_close_early(
     async with Messaging(backend=MemoryBackend()) as messaging:
         channel = await _commit(messaging, "first", "second")
         with pytest.raises(RunNotFound):
-            await channel.follow(stream="thread-1", run="missing", after=0)
+            await channel.follow(identity=_identity(run_id="missing"), after=0)
 
-        following = await channel.follow(stream="thread-1", run="run-1", after=0)
+        following = await channel.follow(identity=_identity(), after=0)
         assert (await anext(aiter(following))).data == "first"
         await following.aclose()
 
@@ -145,8 +154,7 @@ async def test_channel_follow_preserves_producer_failure_after_committed_events(
         channel = messaging.channel(name="events", codec=_TextCodec())
         owner = await channel.wrap(
             _FailingSource(),
-            stream="thread-1",
-            run="run-failed",
+            identity=_identity(run_id="run-failed"),
             after=0,
         )
 
@@ -156,8 +164,7 @@ async def test_channel_follow_preserves_producer_failure_after_committed_events(
             await anext(owner_iterator)
 
         following = await channel.follow(
-            stream="thread-1",
-            run="run-failed",
+            identity=_identity(run_id="run-failed"),
             after=0,
         )
         following_iterator = aiter(following)
@@ -171,11 +178,11 @@ async def test_channel_follow_keeps_its_committed_terminal_snapshot_during_delet
 ) -> None:
     async with Messaging(backend=messaging_backend) as messaging:
         channel = await _commit(messaging, "first", "second")
-        following = await channel.follow(stream="thread-1", run="run-1", after=0)
+        following = await channel.follow(identity=_identity(), after=0)
         iterator = aiter(following)
 
         assert (await anext(iterator)).data == "first"
-        await channel.delete_stream(stream="thread-1")
+        await channel.delete_stream(identity=_identity())
 
         assert (await anext(iterator)).data == "second"
         with pytest.raises(StopAsyncIteration):
@@ -188,13 +195,12 @@ async def test_channel_follow_binds_generation_before_first_pull(
     async with Messaging(backend=messaging_backend) as messaging:
         channel = await _commit(messaging, "old")
         reader = messaging.channel(name="events", codec=_TextCodec())
-        stale = await reader.follow(stream="thread-1", run="run-1", after=0)
+        stale = await reader.follow(identity=_identity(), after=0)
 
-        await channel.delete_stream(stream="thread-1")
+        await channel.delete_stream(identity=_identity())
         replacement = await channel.wrap(
             FiniteMessageSource.from_events(("new",)),
-            stream="thread-1",
-            run="run-1",
+            identity=_identity(),
             after=0,
         )
         assert [message.data async for message in replacement] == ["new"]

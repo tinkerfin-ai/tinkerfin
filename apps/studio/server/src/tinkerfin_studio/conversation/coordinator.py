@@ -7,6 +7,7 @@ import logging
 
 from ag_ui.core import BaseEvent
 
+from tinkerfin import Identity
 from tinkerfin_messaging import DecodedMessage, MessageChannel
 from tinkerfin_studio.conversation.projection import ConversationProjector
 from tinkerfin_studio.conversation.repository import ConversationRepository
@@ -26,41 +27,39 @@ class ConversationProjectionCoordinator:
     ) -> None:
         self._database = database
         self._channel = channel
-        self._tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
+        self._tasks: dict[Identity, asyncio.Task[None]] = {}
         self._closed = False
 
     def ensure(
         self,
         *,
         thread_pk: int,
-        stream: str,
-        run: str,
+        identity: Identity,
     ) -> None:
         """保证当前 Worker 至多有一个该 run 的跟随任务"""
 
         if self._closed:
             raise RuntimeError("会话投影协调器已经关闭")
-        key = (stream, run)
-        existing = self._tasks.get(key)
+        existing = self._tasks.get(identity)
         if existing is not None and not existing.done():
             return
         task = asyncio.create_task(
-            self._follow(thread_pk=thread_pk, stream=stream, run=run),
-            name=f"studio-conversation-projector:{run}",
+            self._follow(thread_pk=thread_pk, identity=identity),
+            name=f"studio-conversation-projector:{identity.run_id}",
         )
-        self._tasks[key] = task
-        task.add_done_callback(lambda completed: self._finished(key, completed))
+        self._tasks[identity] = task
+        task.add_done_callback(lambda completed: self._finished(identity, completed))
 
-    async def reconcile(self, *, thread_pk: int, stream: str) -> int:
+    async def reconcile(self, *, thread_pk: int, identity: Identity) -> int:
         """把 Redis 当前已提交尾部完整投影到 MySQL"""
 
         while True:
             after = await self._last_seq(thread_pk)
-            latest = await self._channel.latest_seq(stream=stream)
+            latest = await self._channel.latest_seq(identity=identity)
             if after >= latest:
                 return after
             messages = await self._channel.read(
-                stream=stream,
+                identity=identity,
                 after=after,
                 limit=min(1000, latest - after),
             )
@@ -85,11 +84,10 @@ class ConversationProjectionCoordinator:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _follow(self, *, thread_pk: int, stream: str, run: str) -> None:
+    async def _follow(self, *, thread_pk: int, identity: Identity) -> None:
         after = await self._last_seq(thread_pk)
         subscription = await self._channel.follow(
-            stream=stream,
-            run=run,
+            identity=identity,
             after=after,
         )
         try:
@@ -124,18 +122,18 @@ class ConversationProjectionCoordinator:
 
     def _finished(
         self,
-        key: tuple[str, str],
+        identity: Identity,
         task: asyncio.Task[None],
     ) -> None:
-        if self._tasks.get(key) is task:
-            self._tasks.pop(key, None)
+        if self._tasks.get(identity) is task:
+            self._tasks.pop(identity, None)
         if task.cancelled():
             return
         error = task.exception()
         if error is not None:
             logger.error(
-                "会话后台投影失败: stream=%s run=%s",
-                key[0],
-                key[1],
+                "会话后台投影失败: thread_id=%s run_id=%s",
+                identity.thread_id,
+                identity.run_id,
                 exc_info=error,
             )

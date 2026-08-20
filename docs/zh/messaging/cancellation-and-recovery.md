@@ -16,8 +16,7 @@ async def cancel_agent(context):
 
 body = await channel.sse(
     source,
-    stream="thread-42",
-    run="run-7",
+    identity=identity,
     cancel=cancel_agent,
 )
 ```
@@ -25,10 +24,7 @@ body = await channel.sse(
 随后可从另一个请求中取消：
 
 ```python
-cancelled = await channel.cancel(
-    stream="thread-42",
-    run="run-7",
-)
+cancelled = await channel.cancel(identity=identity)
 ```
 
 取消函数可以不接收参数，也可以接收 `CancelContext`。它可以返回有限的终止事件，让订阅者收到明确的取消结尾。
@@ -51,6 +47,7 @@ TinkerFin 的 AG-UI 流已经提供取消能力，直接把该流交给 Messagin
 from tinkerfin_messaging import (
     DeferredMessageSource,
     MessageSourceBinding,
+    ProfiledDeferredMessageSource,
 )
 
 
@@ -76,6 +73,33 @@ source = DeferredMessageSource(
 附着或纯回放请求不会调用 opener。`cancel_after_first_item=True` 适合必须先出现 `RUN_STARTED` 的协议。
 
 `MessageSourceBinding` 包含 `source` 和可选 `cancel`。如果 source 自己声明取消函数，可以省略 binding 的 `cancel`。
+
+如果 opener 打开的是已知 AG-UI 或 Native 流，并且 name-only channel 必须在打开前识别 codec 与 Identity，使用 `ProfiledDeferredMessageSource`：
+
+```python
+from ag_ui.core import BaseEvent
+
+
+source = ProfiledDeferredMessageSource(
+    open_events,
+    identity=identity,
+    codec_profile="agui.event.v1",
+    source_type=BaseEvent,
+    replay_type=BaseEvent,
+    cancellable=True,
+    cancel_after_first_item=True,
+)
+```
+
+| 参数 | 默认值 | 作用 |
+| --- | --- | --- |
+| `opener` | 必填 | 异步返回 `MessageSourceBinding` |
+| `identity` | 必填 | 打开前可用的完整运行身份 |
+| `codec_profile` | 必填 | 与内置 codec 对应的稳定 profile ID |
+| `source_type` | 必填 | opener 产生的 live 数据类型 |
+| `replay_type` | 必填 | codec 解码后的数据类型 |
+| `cancellable` | 必填 | source 是否支持远程取消 |
+| `cancel_after_first_item` | `False` | 是否防止取消越过第一条协议事件 |
 
 ## 固定事件与转换事件
 
@@ -104,11 +128,18 @@ mapped = map_source(source, enrich)
 ```python
 subscription = await channel.wrap_recoverable(
     recoverable_source,
-    stream="thread-42",
-    run="run-7",
+    identity=identity,
     after=0,
 )
 ```
+
+| 参数 | 默认值 | 作用 |
+| --- | --- | --- |
+| `source` | 必填 | 实现 `open(checkpoint)` 的可恢复 source |
+| `identity` | profile source 可省略 | 自定义 source 的运行身份，或对 profile Identity 的一致性检查 |
+| `after` | `None` | 独占回放游标；`None` 从 prepare 时的当前末尾开始 |
+| `cancel` | `None` | 接受远程取消后停止 source，并可返回带稳定 ID 的有限尾部 |
+| `on_committed` | `None` | owner 每次成功提交后的异步观察函数 |
 
 `recoverable_source.open(checkpoint)` 返回的每一项都是 `RecoverableMessage`：
 

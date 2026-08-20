@@ -6,7 +6,7 @@ import json
 from collections.abc import AsyncIterator, Callable, Sequence
 from typing import Any, TypedDict
 
-from ag_ui.core import BaseEvent, RawEvent, RunAgentInput
+from ag_ui.core import BaseEvent, RawEvent
 from deepagents import create_deep_agent
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage
@@ -15,7 +15,7 @@ from langchain_core.tools import BaseTool
 from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 
-from tinkerfin import AgUiNativeStreamConfig, TinkerFin
+from tinkerfin import AgUiNativeStreamConfig, Identity, TinkerFin
 from tinkerfin_messaging import (
     MessageSubscription,
     Messaging,
@@ -23,22 +23,12 @@ from tinkerfin_messaging import (
 )
 
 
-def _run_input(
+def _identity(
     *,
     thread_id: str = "thread-1",
     run_id: str = "run-1",
-) -> RunAgentInput:
-    return RunAgentInput.model_validate(
-        {
-            "threadId": thread_id,
-            "runId": run_id,
-            "state": {},
-            "messages": [],
-            "tools": [],
-            "context": [],
-            "forwardedProps": {},
-        }
-    )
+) -> Identity:
+    return Identity(threadId=thread_id, runId=run_id)
 
 
 class _ToolBindingFakeModel(FakeMessagesListChatModel):
@@ -87,7 +77,7 @@ async def _empty_parts() -> AsyncIterator[object]:
 
 
 async def test_agui_stream_is_a_directly_iterable_message_source() -> None:
-    events = TinkerFin().run(_empty_parts).astream_agui(run_input=_run_input())
+    events = TinkerFin().run(_empty_parts, identity=_identity()).astream_agui()
 
     aiter(events)
     await events.aclose()
@@ -98,24 +88,21 @@ async def test_native_and_agui_streams_wrap_without_runtime_parameters() -> None
 
     async with Messaging() as messaging:
         native_channel = messaging.channel(name="native-events")
+        native_identity = _identity(thread_id="native-thread", run_id="native-run")
         native_invocation = AgUiNativeStreamConfig().bind(
             graph.astream,
             {"messages": [{"role": "user", "content": "Native"}]},
-            config={"configurable": {"thread_id": "native-thread"}},
         )
-        native_source = TinkerFin().run(native_invocation).astream()
+        native_source = (
+            TinkerFin().run(native_invocation, identity=native_identity).astream()
+        )
         native = await native_channel.wrap(
             native_source,
-            stream="native-conversation",
-            run="native-run",
             after=0,
-            attach_identity={
-                "input": "Native",
-                "streamMode": ["messages", "tasks", "values"],
-            },
         )
 
         agui_channel = messaging.channel(name="agui-events")
+        agui_identity = _identity(thread_id="agui-thread")
         event_source = (
             TinkerFin()
             .run(
@@ -125,17 +112,14 @@ async def test_native_and_agui_streams_wrap_without_runtime_parameters() -> None
                     stream_mode=("messages", "tasks", "values"),
                     version="v2",
                     subgraphs=True,
-                )
+                ),
+                identity=agui_identity,
             )
-            .astream_agui(run_input=_run_input(thread_id="agui-thread"))
+            .astream_agui()
         )
         agui = await agui_channel.wrap(
             event_source,
-            stream="agui-conversation",
-            run="run-1",
             after=0,
-            attach_identity={"threadId": "agui-thread", "runId": "run-1"},
-            cancel=event_source.abort,
         )
 
         native_values = await _native_parts(native)
@@ -164,11 +148,12 @@ async def test_real_custom_stream_is_consistent_across_all_consumers() -> None:
     graph = builder.compile()
 
     def strict_run():
+        identity = _identity(thread_id="custom-thread", run_id="custom-run")
         invocation = AgUiNativeStreamConfig(extra_modes=("custom",)).bind(
             graph.astream,
             {"value": 1},
         )
-        return TinkerFin().run(invocation)
+        return TinkerFin().run(invocation, identity=identity)
 
     direct = [part async for part in strict_run().astream()]
     assert any(
@@ -187,8 +172,6 @@ async def test_real_custom_stream_is_consistent_across_all_consumers() -> None:
     async with Messaging() as messaging:
         subscription = await messaging.channel(name="custom-native").wrap(
             strict_run().astream(),
-            stream="custom-stream",
-            run="custom-run",
         )
         replay = await _native_parts(subscription)
 
@@ -196,12 +179,7 @@ async def test_real_custom_stream_is_consistent_across_all_consumers() -> None:
         part.mode == "custom" and part.data == {"progress": 1} for part in replay
     )
 
-    events = [
-        event
-        async for event in strict_run().astream_agui(
-            run_input=_run_input(thread_id="custom-thread", run_id="custom-run"),
-        )
-    ]
+    events = [event async for event in strict_run().astream_agui()]
     raw_events = [
         event
         for event in events

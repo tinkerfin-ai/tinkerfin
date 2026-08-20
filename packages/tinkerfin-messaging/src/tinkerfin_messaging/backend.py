@@ -9,7 +9,9 @@ from datetime import UTC, datetime
 from typing import Literal, Protocol, runtime_checkable
 from uuid import uuid4
 
-from ._identity import required_identifier
+from tinkerfin_agui_adapter import Identity
+
+from ._identity import required_identifier, required_identity
 from .errors import (
     BackendOwnershipLost,
     CancellationUnsupported,
@@ -17,7 +19,6 @@ from .errors import (
     InvalidCursor,
     MessageIdConflict,
     RunAlreadyActive,
-    RunIdentityConflict,
     RunNotFound,
     RunProducerFailed,
     StreamDeleteConflict,
@@ -47,8 +48,7 @@ class BackendRunHandle:
     """
 
     channel: str
-    stream: str
-    run: str
+    identity: Identity
     owner_token: str | None
     fence: int | None
     generation: int | None = None
@@ -67,8 +67,7 @@ def _validate_append_input(
     if not isinstance(handle, BackendRunHandle):
         raise TypeError("handle must be a BackendRunHandle")
     required_identifier("channel", handle.channel)
-    required_identifier("stream", handle.stream)
-    required_identifier("run", handle.run)
+    required_identity(handle.identity)
     required_identifier("message_id", message_id)
     required_identifier("codec", codec)
     if not isinstance(payload, bytes):
@@ -98,10 +97,8 @@ class MessagingBackend(Protocol):
         self,
         *,
         channel: str,
-        stream: str,
-        run: str,
+        identity: Identity,
         codec: str,
-        identity: str,
         after: int | None,
         cancellable: bool,
         recoverable: bool,
@@ -145,13 +142,13 @@ class MessagingBackend(Protocol):
         error: BaseException | None = None,
     ) -> None: ...
 
-    async def latest_seq(self, *, channel: str, stream: str) -> int: ...
+    async def latest_seq(self, *, channel: str, identity: Identity) -> int: ...
 
     async def read(
         self,
         *,
         channel: str,
-        stream: str,
+        identity: Identity,
         after: int = 0,
         limit: int = 100,
     ) -> tuple[MessageEnvelope, ...]: ...
@@ -160,8 +157,7 @@ class MessagingBackend(Protocol):
         self,
         *,
         channel: str,
-        stream: str,
-        run: str,
+        identity: Identity,
     ) -> BackendRunHandle:
         """Bind a read-only follower to the run's authoritative generation."""
 
@@ -187,7 +183,7 @@ class MessagingBackend(Protocol):
 
     async def renew(self, handle: BackendRunHandle) -> bool: ...
 
-    async def delete_stream(self, *, channel: str, stream: str) -> None:
+    async def delete_stream(self, *, channel: str, identity: Identity) -> None:
         """Delete one inactive stream and all of its durable run data.
 
         Missing and previously deleted streams are successful no-ops. An active
@@ -195,7 +191,7 @@ class MessagingBackend(Protocol):
 
         Args:
             channel: Durable codec namespace containing the stream.
-            stream: Ordering and producer-concurrency scope to delete.
+            identity: Thread and run identity whose thread stream is deleted.
 
         Raises:
             StreamDeleteConflict: The stream still has an active producer.
@@ -208,14 +204,12 @@ class _RunRecord:
     def __init__(
         self,
         *,
-        run: str,
-        identity: str,
+        identity: Identity,
         start_seq: int,
         owner_token: str,
         cancellable: bool,
         recoverable: bool,
     ) -> None:
-        self.run = run
         self.identity = identity
         self.start_seq = start_seq
         self.end_seq = start_seq
@@ -240,7 +234,7 @@ class _StreamState:
             str, tuple[str, str, bytes, RecoveryCheckpoint | None]
         ] = {}
         self.runs: dict[str, _RunRecord] = {}
-        self.active_run: str | None = None
+        self.active_identity: Identity | None = None
 
 
 class _ChannelState:
@@ -271,42 +265,48 @@ class MemoryBackend(MessagingBackend):
             self._owned_record(state, handle)
             return True
 
-    async def delete_stream(self, *, channel: str, stream: str) -> None:
+    async def delete_stream(self, *, channel: str, identity: Identity) -> None:
         """Atomically delete one inactive in-memory stream."""
 
+        required_identifier("channel", channel)
+        required_identity(identity)
         channel_state = self._channels.get(channel)
         if channel_state is None:
             return
         async with channel_state.lock:
-            state = channel_state.streams.get(stream)
+            state = channel_state.streams.get(identity.thread_id)
             if state is None:
                 return
             async with state.condition:
-                active_run = state.active_run
-                if active_run is not None:
+                active_identity = state.active_identity
+                if active_identity is not None:
                     raise StreamDeleteConflict(
                         channel=channel,
-                        stream=stream,
-                        active_run=active_run,
+                        identity=identity,
+                        active_identity=active_identity,
                     )
                 state.deleted = True
-                del channel_state.streams[stream]
-                channel_state.next_generations[stream] = state.generation + 1
+                del channel_state.streams[identity.thread_id]
+                channel_state.next_generations[identity.thread_id] = (
+                    state.generation + 1
+                )
                 state.condition.notify_all()
 
     def _state_for_handle(self, handle: BackendRunHandle) -> _StreamState:
         channel_state = self._channels.get(handle.channel)
         state = (
-            None if channel_state is None else channel_state.streams.get(handle.stream)
+            None
+            if channel_state is None
+            else channel_state.streams.get(handle.identity.thread_id)
         )
         if state is None:
             if handle.generation is not None:
                 raise StreamDeleted(
                     channel=handle.channel,
-                    stream=handle.stream,
+                    identity=handle.identity,
                     generation=handle.generation,
                 )
-            raise RunNotFound(run=handle.run)
+            raise RunNotFound(identity=handle.identity)
         self._require_generation(state, handle)
         return state
 
@@ -321,21 +321,22 @@ class MemoryBackend(MessagingBackend):
         self,
         *,
         channel: str,
-        stream: str,
-        run: str,
+        identity: Identity,
         codec: str,
-        identity: str,
         after: int | None,
         cancellable: bool,
         recoverable: bool,
     ) -> PreparedRun:
+        required_identifier("channel", channel)
+        required_identity(identity)
+        required_identifier("codec", codec)
         channel_state = self._channel(channel)
         async with channel_state.lock:
-            state = channel_state.streams.get(stream)
+            state = channel_state.streams.get(identity.thread_id)
             if state is None:
-                generation = channel_state.next_generations.get(stream, 1)
+                generation = channel_state.next_generations.get(identity.thread_id, 1)
                 state = _StreamState(generation=generation)
-                channel_state.streams[stream] = state
+                channel_state.streams[identity.thread_id] = state
             async with state.condition:
                 latest = len(state.messages)
                 cursor = latest if after is None else after
@@ -346,17 +347,14 @@ class MemoryBackend(MessagingBackend):
                 if channel_state.codec is not None and channel_state.codec != codec:
                     raise CodecMismatch(expected=channel_state.codec, actual=codec)
 
-                existing = state.runs.get(run)
+                existing = state.runs.get(identity.run_id)
                 if existing is not None:
-                    if existing.identity != identity:
-                        raise RunIdentityConflict(run=run)
                     if channel_state.codec is None:
                         channel_state.codec = codec
                     return PreparedRun(
                         handle=BackendRunHandle(
                             channel=channel,
-                            stream=stream,
-                            run=run,
+                            identity=identity,
                             owner_token=None,
                             fence=None,
                             generation=state.generation,
@@ -365,16 +363,15 @@ class MemoryBackend(MessagingBackend):
                         is_owner=False,
                     )
 
-                active_run = state.active_run
-                if active_run is not None:
+                active_identity = state.active_identity
+                if active_identity is not None:
                     raise RunAlreadyActive(
-                        active_run=active_run,
-                        requested_run=run,
+                        active_identity=active_identity,
+                        requested_identity=identity,
                     )
 
                 owner_token = uuid4().hex
                 record = _RunRecord(
-                    run=run,
                     identity=identity,
                     start_seq=latest,
                     owner_token=owner_token,
@@ -383,13 +380,12 @@ class MemoryBackend(MessagingBackend):
                 )
                 if channel_state.codec is None:
                     channel_state.codec = codec
-                state.runs[run] = record
-                state.active_run = run
+                state.runs[identity.run_id] = record
+                state.active_identity = identity
                 return PreparedRun(
                     handle=BackendRunHandle(
                         channel=channel,
-                        stream=stream,
-                        run=run,
+                        identity=identity,
                         owner_token=owner_token,
                         fence=record.fence,
                         generation=state.generation,
@@ -416,7 +412,7 @@ class MemoryBackend(MessagingBackend):
         )
         state = self._state_for_handle(handle)
         channel_state = self._channel(handle.channel)
-        signature = (handle.run, codec, payload, checkpoint)
+        signature = (handle.identity.run_id, codec, payload, checkpoint)
         async with state.condition:
             record = self._owned_record(state, handle)
             if channel_state.codec != codec:
@@ -425,17 +421,16 @@ class MemoryBackend(MessagingBackend):
             if existing is not None:
                 if state.signatures[message_id] != signature:
                     raise MessageIdConflict(
-                        stream=handle.stream,
+                        identity=handle.identity,
                         message_id=message_id,
                     )
                 return existing.model_copy(deep=True)
 
             envelope = MessageEnvelope(
                 channel=handle.channel,
-                stream=handle.stream,
+                identity=handle.identity,
                 seq=len(state.messages) + 1,
                 message_id=message_id,
-                run=handle.run,
                 codec=codec,
                 payload=bytes(payload),
                 created_at=datetime.now(UTC),
@@ -456,14 +451,16 @@ class MemoryBackend(MessagingBackend):
             record = self._owned_record(state, handle)
             if record.settling:
                 raise BackendOwnershipLost(
-                    f"Producer for run {handle.run!r} cannot begin settlement"
+                    f"Producer for run {handle.identity.run_id!r} cannot begin "
+                    "settlement"
                 )
             if record.status == "cancel_requested":
                 record.settling = True
                 return True
             if record.status != "running":
                 raise BackendOwnershipLost(
-                    f"Producer for run {handle.run!r} cannot begin settlement"
+                    f"Producer for run {handle.identity.run_id!r} cannot begin "
+                    "settlement"
                 )
             record.settling = True
             return False
@@ -487,18 +484,20 @@ class MemoryBackend(MessagingBackend):
             record.settling = True
             record.error = error
             record.end_seq = len(state.messages)
-            if state.active_run == handle.run:
-                state.active_run = None
+            if state.active_identity == handle.identity:
+                state.active_identity = None
             state.condition.notify_all()
 
-    async def latest_seq(self, *, channel: str, stream: str) -> int:
+    async def latest_seq(self, *, channel: str, identity: Identity) -> int:
         """Return the latest committed sequence or zero for an empty stream."""
 
+        required_identifier("channel", channel)
+        required_identity(identity)
         channel_state = self._channels.get(channel)
         if channel_state is None:
             return 0
         async with channel_state.lock:
-            state = channel_state.streams.get(stream)
+            state = channel_state.streams.get(identity.thread_id)
             if state is None:
                 return 0
             async with state.condition:
@@ -508,12 +507,14 @@ class MemoryBackend(MessagingBackend):
         self,
         *,
         channel: str,
-        stream: str,
+        identity: Identity,
         after: int = 0,
         limit: int = 100,
     ) -> tuple[MessageEnvelope, ...]:
         """Read one ascending defensive page after an exclusive cursor."""
 
+        required_identifier("channel", channel)
+        required_identity(identity)
         if isinstance(after, bool) or not isinstance(after, int):
             raise TypeError("after must be an integer")
         if after < 0:
@@ -526,7 +527,7 @@ class MemoryBackend(MessagingBackend):
         if channel_state is None:
             return ()
         async with channel_state.lock:
-            state = channel_state.streams.get(stream)
+            state = channel_state.streams.get(identity.thread_id)
             if state is None:
                 return ()
             async with state.condition:
@@ -539,34 +540,31 @@ class MemoryBackend(MessagingBackend):
         self,
         *,
         channel: str,
-        stream: str,
-        run: str,
+        identity: Identity,
     ) -> BackendRunHandle:
         """Bind one follower without creating a stream or attaching a producer."""
 
         required_identifier("channel", channel)
-        required_identifier("stream", stream)
-        required_identifier("run", run)
+        required_identity(identity)
         channel_state = self._channels.get(channel)
         if channel_state is None:
-            raise RunNotFound(run=run)
+            raise RunNotFound(identity=identity)
         async with channel_state.lock:
-            state = channel_state.streams.get(stream)
+            state = channel_state.streams.get(identity.thread_id)
             if state is None:
-                raise RunNotFound(run=run)
+                raise RunNotFound(identity=identity)
             async with state.condition:
                 if state.deleted:
                     raise StreamDeleted(
                         channel=channel,
-                        stream=stream,
+                        identity=identity,
                         generation=state.generation,
                     )
-                if run not in state.runs:
-                    raise RunNotFound(run=run)
+                if identity.run_id not in state.runs:
+                    raise RunNotFound(identity=identity)
                 return BackendRunHandle(
                     channel=channel,
-                    stream=stream,
-                    run=run,
+                    identity=identity,
                     owner_token=None,
                     fence=None,
                     generation=state.generation,
@@ -587,9 +585,9 @@ class MemoryBackend(MessagingBackend):
                 terminal_error: BaseException | None = None
                 async with state.condition:
                     self._require_generation(state, handle)
-                    record = state.runs.get(handle.run)
+                    record = state.runs.get(handle.identity.run_id)
                     if record is None:
-                        raise RunNotFound(run=handle.run)
+                        raise RunNotFound(identity=handle.identity)
                     is_terminal = record.status in {
                         "completed",
                         "cancelled",
@@ -617,9 +615,9 @@ class MemoryBackend(MessagingBackend):
                         yield message
                 if terminal_status in {"failed", "owner_lost"}:
                     cause = terminal_error or RuntimeError(
-                        f"Producer for run {handle.run!r} stopped"
+                        f"Producer for run {handle.identity.run_id!r} stopped"
                     )
-                    raise RunProducerFailed(run=handle.run, cause=cause)
+                    raise RunProducerFailed(identity=handle.identity, cause=cause)
                 if terminal_status is not None:
                     return
 
@@ -629,15 +627,15 @@ class MemoryBackend(MessagingBackend):
         state = self._state_for_handle(handle)
         async with state.condition:
             self._require_generation(state, handle)
-            record = state.runs.get(handle.run)
+            record = state.runs.get(handle.identity.run_id)
             if record is None:
-                raise RunNotFound(run=handle.run)
+                raise RunNotFound(identity=handle.identity)
             if record.status in {"completed", "cancelled", "failed", "owner_lost"}:
                 return False
             if record.settling:
                 return False
             if not record.cancellable:
-                raise CancellationUnsupported(run=handle.run)
+                raise CancellationUnsupported(identity=handle.identity)
             if record.status == "cancel_requested":
                 return False
             record.status = "cancel_requested"
@@ -649,9 +647,9 @@ class MemoryBackend(MessagingBackend):
         async with state.condition:
             while True:
                 self._require_generation(state, handle)
-                record = state.runs.get(handle.run)
+                record = state.runs.get(handle.identity.run_id)
                 if record is None:
-                    raise RunNotFound(run=handle.run)
+                    raise RunNotFound(identity=handle.identity)
                 if record.status == "cancel_requested":
                     return True
                 if record.status in {
@@ -668,9 +666,9 @@ class MemoryBackend(MessagingBackend):
         async with state.condition:
             while True:
                 self._require_generation(state, handle)
-                record = state.runs.get(handle.run)
+                record = state.runs.get(handle.identity.run_id)
                 if record is None:
-                    raise RunNotFound(run=handle.run)
+                    raise RunNotFound(identity=handle.identity)
                 if record.status in {
                     "completed",
                     "cancelled",
@@ -686,9 +684,9 @@ class MemoryBackend(MessagingBackend):
         state = self._state_for_handle(handle)
         async with state.condition:
             self._require_generation(state, handle)
-            record = state.runs.get(handle.run)
+            record = state.runs.get(handle.identity.run_id)
             if record is None:
-                raise RunNotFound(run=handle.run)
+                raise RunNotFound(identity=handle.identity)
             return record.error
 
     @staticmethod
@@ -697,9 +695,9 @@ class MemoryBackend(MessagingBackend):
         handle: BackendRunHandle,
     ) -> _RunRecord:
         MemoryBackend._require_generation(state, handle)
-        record = state.runs.get(handle.run)
+        record = state.runs.get(handle.identity.run_id)
         if record is None:
-            raise RunNotFound(run=handle.run)
+            raise RunNotFound(identity=handle.identity)
         if (
             handle.owner_token is None
             or handle.fence is None
@@ -707,7 +705,7 @@ class MemoryBackend(MessagingBackend):
             or record.fence != handle.fence
         ):
             raise BackendOwnershipLost(
-                f"Producer for run {handle.run!r} no longer owns its fence"
+                f"Producer for run {handle.identity.run_id!r} no longer owns its fence"
             )
         return record
 
@@ -720,6 +718,6 @@ class MemoryBackend(MessagingBackend):
         if state.deleted or (generation is not None and generation != state.generation):
             raise StreamDeleted(
                 channel=handle.channel,
-                stream=handle.stream,
+                identity=handle.identity,
                 generation=generation,
             )

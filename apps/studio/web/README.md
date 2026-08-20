@@ -28,9 +28,10 @@ VITE_API_BASE_URL=https://api.example.com pnpm dev
 历史记录、取消和 AG-UI 对话流接口。SSE 网络中断后，客户端使用服务端回填的
 canonical threadId、原 runId 和最后一条持久化序号自动重连。
 
-新会话在侧栏以“新会话”显示，首个 chat 请求发送空 `threadId`，且 user 消息不含
-客户端 ID。客户端只生成本次请求的 `runId`；服务端在 `RUN_STARTED` 中返回已入库的
-canonical `threadId`、标题和带服务端消息 ID 的完整 input，客户端据此替换草稿状态。
+新会话在侧栏以“新会话”显示，首个 chat 请求发送空 `threadId`。客户端生成本次请求的
+`runId`，并给 user 消息填写 `request-${runId}`，以满足标准 AG-UI 消息校验。后端不把
+这个客户端消息 ID 作为业务身份；服务端在 `RUN_STARTED` 中返回已入库的 canonical
+`threadId`、标题和带权威消息 ID 的完整 input，客户端据此替换草稿状态。
 
 默认代理目标是 `http://127.0.0.1:8090`。需要临时连接其他本地端口时设置：
 

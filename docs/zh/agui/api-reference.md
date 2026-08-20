@@ -17,8 +17,8 @@
 
 | API | 主要参数 | 什么时候使用 |
 | --- | --- | --- |
-| `astream_events(...)` | `parts`、`run_input`、两个公开开关、`prior_tool_call_ids` | 已有原生异步流，希望自动管理完整生命周期 |
-| `DeepAgentAgUiAdapter(...)` | `run_id`、旧 Tool ID、两个公开开关 | 需要自己管理主开始和终止事件 |
+| `astream_events(...)` | `parts`、`identity`、两个公开开关、`prior_tool_call_ids` | 已有原生异步流，希望自动管理完整生命周期 |
+| `DeepAgentAgUiAdapter(...)` | `identity`、旧 Tool ID、两个公开开关 | 需要自己管理主开始和终止事件 |
 | `encode_sse(...)` | `event`、可选 `event_id` | 把单个 AG-UI 事件编码为 SSE |
 | `micro_batch(...)` | `events`、可选 batcher | 合并连续的小增量 |
 
@@ -37,12 +37,12 @@
 
 | 方法 | 参数 | 结果 |
 | --- | --- | --- |
-| `started(...)` | `run_input` | `RUN_STARTED` |
-| `finished(...)` | `thread_id`、`run_id`、`outcome` | `RUN_FINISHED` |
-| `failed(...)` | `run_id`、`message`、`code` | `RUN_ERROR` |
-| `is_main_lifecycle(...)` | `event`、`run_id` | 判断事件是否占用该主生命周期 |
+| `started(...)` | `identity` | `RUN_STARTED`，`input=None` |
+| `finished(...)` | `identity`、`outcome` | `RUN_FINISHED` |
+| `failed(...)` | `identity`、`message`、`code` | `RUN_ERROR` |
+| `is_main_lifecycle(...)` | `event`、`identity` | 判断事件是否占用该主生命周期 |
 | `event_run_id(event)` | 事件 | 读取可验证的 run ID |
-| `validate_run_input(...)` | `run_input` | 提前验证运行身份 |
+| `validate_identity(...)` | `identity` | 提前验证运行身份类型 |
 
 `AgentRunOutcome` 的 `type` 为 `success` 或 `interrupt`；只有 interrupt 结果携带 `interrupts`。
 

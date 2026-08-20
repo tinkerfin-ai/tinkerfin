@@ -27,7 +27,7 @@ pip install tinkerfin
 ```python
 import asyncio
 
-from tinkerfin import TinkerFin
+from tinkerfin import Identity, TinkerFin
 
 
 tinkerfin = TinkerFin()
@@ -38,10 +38,10 @@ agent = tinkerfin.create_deep_agent(
 
 
 async def main() -> None:
-    runtime = agent.new()
+    identity = Identity(threadId="conversation-1", runId="run-1")
+    runtime = agent.new(identity=identity)
     stream = runtime.astream(
         {"messages": [{"role": "user", "content": "用一句话介绍北京"}]},
-        {"configurable": {"thread_id": "conversation-1"}},
     )
 
     async for part in stream:
@@ -55,26 +55,33 @@ asyncio.run(main())
 
 1. `TinkerFin()` 创建入口对象。
 2. `create_deep_agent(...)` 保存 Agent 的模型、工具和其他配置。
-3. `agent.new()` 创建一个新的 Graph 和一次性 Runtime。
+3. `agent.new(identity=...)` 创建新的 Graph，并绑定本次运行身份。
 4. `runtime.astream(...)` 启动运行，并逐条返回结果。
 
-## `thread_id` 有什么用
+## `Identity` 有什么用
 
-`thread_id` 表示一段会话。如果配置了 checkpointer，相同的 `thread_id` 可以继续之前的状态。
+`Identity` 只包含 `threadId` 和 `runId`。Runtime 会把 `threadId` 自动写入 Graph 配置，因此调用时不用再重复填写。
 
 ```python
-config = {"configurable": {"thread_id": "user-42-support"}}
+identity = Identity(threadId="user-42-support", runId="run-20260820-1")
 ```
 
-不要为同一段连续会话随机更换 `thread_id`。不同用户也不要共用同一个值。
+| 字段 | 要求 | 作用 |
+| --- | --- | --- |
+| `threadId` | 必填、非空、不能有首尾空白 | 一段可继续的会话，也是 Graph checkpoint thread |
+| `runId` | 必填、非空、不能有首尾空白 | thread 中一次语义运行的幂等 ID |
+
+`Identity` 创建后不可修改，也不接受额外字段。`parentRunId`、用户身份和请求正文都不属于它。
+
+同一段连续会话复用 `threadId`，每次新的语义运行使用新的 `runId`。网络重试或重新附着同一次运行时复用原来的 `runId`。
 
 ## 一次性使用
 
 每个 Runtime 只能调用一次 `astream()`。需要再次运行时，重新调用 `agent.new()`：
 
 ```python
-first = agent.new()
-second = agent.new()
+first = agent.new(identity=Identity(threadId="thread-1", runId="run-1"))
+second = agent.new(identity=Identity(threadId="thread-1", runId="run-2"))
 ```
 
 Definition 可以重复使用；Runtime 只代表一次运行。
@@ -85,4 +92,3 @@ Definition 可以重复使用；Runtime 只代表一次运行。
 - [事件流与 SSE](streams-and-sse.md)
 - [自定义事件源与并发协调](extensions.md)
 - [Runtime 使用参考](api-reference.md)
-

@@ -7,7 +7,7 @@
 ## 直接消费对象流
 
 ```python
-runtime = agent.new()
+runtime = agent.new(identity=identity)
 stream = runtime.astream(graph_input, config)
 
 try:

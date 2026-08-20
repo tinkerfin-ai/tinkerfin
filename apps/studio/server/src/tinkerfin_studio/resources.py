@@ -40,7 +40,7 @@ class ApplicationResources:
     database: Database
     redis: Redis
     agent_persistence: AgentPersistence
-    tinkerfin: TinkerFin[str]
+    tinkerfin: TinkerFin
     messaging: Messaging
     conversation_channel: MessageChannel[BaseEvent, BaseEvent]
     sandbox_manager: OpenSandboxManager[str]
@@ -77,7 +77,7 @@ def build_lifespan():
             run_coordinator = await stack.enter_async_context(
                 RedisRunCoordinator.from_client(
                     redis,
-                    key_resolver=lambda principal: principal,
+                    key_resolver=lambda identity: identity.thread_id,
                     key_prefix=settings.redis.run_key_prefix,
                 )
             )

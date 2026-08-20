@@ -133,10 +133,10 @@ def test_generated_stub_declares_precise_facade_return_types() -> None:
         "astream",
     )
 
-    assert _return_type(create) == "DeepAgentDefinition[ContextT, PrincipalT]"
+    assert _return_type(create) == "DeepAgentDefinition[ContextT]"
     assert _return_type(native_new) == "DeepAgentRuntime[ContextT]"
     assert _return_type(agui_new) == "DeepAgentAgUiRuntime[ContextT]"
-    assert _return_type(native_astream) == "GraphRunStream[object]"
+    assert _return_type(native_astream) == "NativeGraphRunStream"
     assert _return_type(agui_astream) == "AgUiEventStream"
     assert "ParamSpec" not in _INIT_STUB.read_text(encoding="utf-8")
     assert "ParamSpec" not in _DEEP_AGENT_STUB.read_text(encoding="utf-8")

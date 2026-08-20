@@ -566,23 +566,27 @@ export const buildInitialPayload = (
   conversation: Conversation,
   content: string,
   mode: AgentMode,
-): ChatRequestPayload => ({
-  threadId: conversation.threadId,
-  runId: createRunId(),
-  state: {},
-  messages: [
-    {
-      role: "user",
-      content,
-    } satisfies ChatMessageInput,
-  ],
-  tools: [],
-  context: [],
-  forwardedProps: {
-    model: conversation.model,
-    mode,
-  },
-})
+): ChatRequestPayload => {
+  const runId = createRunId()
+  return {
+    threadId: conversation.threadId,
+    runId,
+    state: {},
+    messages: [
+      {
+        id: `request-${runId}`,
+        role: "user",
+        content,
+      } satisfies ChatMessageInput,
+    ],
+    tools: [],
+    context: [],
+    forwardedProps: {
+      model: conversation.model,
+      mode,
+    },
+  }
+}
 
 const matchesApprovalGroup = (
   approval: ApprovalState | undefined,

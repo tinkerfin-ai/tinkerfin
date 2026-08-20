@@ -2,18 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import ClassVar, Never, TypeVar, assert_type, cast
 
 import pytest
-from ag_ui.core import RunAgentInput
 from pydantic import BaseModel
 
 import tinkerfin
 import tinkerfin_messaging
 from tinkerfin import (
     AgUiNativeStreamConfig,
+    Identity,
     NativeGraphRunStream,
     NativeStreamPart,
     TinkerFin,
@@ -35,22 +35,12 @@ from tinkerfin_messaging.protocols import ProfiledMessageSource
 CollectedT = TypeVar("CollectedT")
 
 
-def _run_input(
+def _identity(
     *,
     thread_id: str = "thread-1",
     run_id: str = "run-1",
-) -> RunAgentInput:
-    return RunAgentInput.model_validate(
-        {
-            "threadId": thread_id,
-            "runId": run_id,
-            "state": {},
-            "messages": [],
-            "tools": [],
-            "context": [],
-            "forwardedProps": {},
-        }
-    )
+) -> Identity:
+    return Identity(threadId=thread_id, runId=run_id)
 
 
 class _TextCodec:
@@ -107,10 +97,8 @@ class _CountingBackend(MemoryBackend):
         self,
         *,
         channel: str,
-        stream: str,
-        run: str,
+        identity: Identity,
         codec: str,
-        identity: str,
         after: int | None,
         cancellable: bool,
         recoverable: bool,
@@ -118,10 +106,8 @@ class _CountingBackend(MemoryBackend):
         self.prepare_calls += 1
         return await super().prepare(
             channel=channel,
-            stream=stream,
-            run=run,
-            codec=codec,
             identity=identity,
+            codec=codec,
             after=after,
             cancellable=cancellable,
             recoverable=recoverable,
@@ -156,8 +142,10 @@ class _DeclaredProfileSource:
         profile: str,
         source_type: type[object] | None = None,
         replay_type: type[object] | None = None,
+        identity: Identity | None = None,
     ) -> None:
         self.messaging_codec_profile = profile
+        self.messaging_identity = identity or _identity()
         if source_type is not None:
             self.messaging_source_type = source_type
         if replay_type is not None:
@@ -202,8 +190,19 @@ class _UnrelatedProfileTextSource(_CustomSource):
     messaging_replay_type: ClassVar[type[int]] = int
 
 
-def _native_source(value: int = 1) -> NativeGraphRunStream:
-    async def parts(**options: object) -> AsyncIterator[Mapping[str, object]]:
+def _native_source(
+    value: int = 1,
+    *,
+    identity: Identity | None = None,
+) -> NativeGraphRunStream:
+    resolved_identity = identity or _identity()
+
+    async def parts(
+        *,
+        config: object | None = None,
+        **options: object,
+    ) -> AsyncIterator[Mapping[str, object]]:
+        assert config == {"configurable": {"thread_id": resolved_identity.thread_id}}
         assert options == {
             "stream_mode": ("messages", "tasks", "values"),
             "version": "v2",
@@ -217,7 +216,25 @@ def _native_source(value: int = 1) -> NativeGraphRunStream:
         }
 
     invocation = AgUiNativeStreamConfig().bind(parts)
-    return TinkerFin().run(invocation).astream()
+    return TinkerFin().run(invocation, identity=resolved_identity).astream()
+
+
+def _empty_native_source(*, identity: Identity) -> NativeGraphRunStream:
+    async def parts(
+        *,
+        config: object | None = None,
+        **options: object,
+    ) -> AsyncIterator[Mapping[str, object]]:
+        assert config == {"configurable": {"thread_id": identity.thread_id}}
+        assert options["version"] == "v2"
+        if False:
+            yield {}
+
+    return (
+        TinkerFin()
+        .run(AgUiNativeStreamConfig().bind(parts), identity=identity)
+        .astream()
+    )
 
 
 async def _collect(
@@ -246,8 +263,7 @@ async def test_generic_dataclass_and_model_streams_require_explicit_codecs() -> 
             codec=_DataclassCodec(),
         ).wrap(
             dataclass_source,
-            stream="stream-1",
-            run="run-1",
+            identity=_identity(thread_id="stream-1"),
             after=0,
         )
         model_subscription = await messaging.channel(
@@ -255,8 +271,7 @@ async def test_generic_dataclass_and_model_streams_require_explicit_codecs() -> 
             codec=_ModelCodec(),
         ).wrap(
             model_source,
-            stream="stream-1",
-            run="run-1",
+            identity=_identity(thread_id="stream-1"),
             after=0,
         )
 
@@ -283,8 +298,6 @@ async def test_native_profile_infers_live_and_replay_types() -> None:
     async with Messaging() as messaging:
         subscription = await messaging.channel(name="native").wrap(
             source,
-            stream="stream-1",
-            run="run-1",
             after=0,
         )
         assert_type(subscription, MessageSubscription[NativeStreamPart])
@@ -292,6 +305,19 @@ async def test_native_profile_infers_live_and_replay_types() -> None:
 
     assert len(replay) == 1
     assert isinstance(replay[0], NativeStreamPart)
+
+
+@pytest.mark.asyncio
+async def test_empty_native_profile_infers_identity_without_a_first_item() -> None:
+    identity = _identity(thread_id="empty-thread", run_id="empty-run")
+
+    async with Messaging() as messaging:
+        subscription = await messaging.channel(name="native-empty").wrap(
+            _empty_native_source(identity=identity),
+            after=0,
+        )
+
+        assert [message async for message in subscription] == []
 
 
 @pytest.mark.asyncio
@@ -309,13 +335,47 @@ async def test_generic_object_stream_without_codec_fails_before_prepare() -> Non
         with pytest.raises(TypeError, match="provide codec explicitly"):
             await messaging.channel(name="objects").wrap(
                 cast(MessageSource[Never], source),
-                stream="stream-1",
-                run="run-1",
+                identity=_identity(thread_id="stream-1"),
             )
 
     assert backend.prepare_calls == 0
     assert backend.append_calls == 0
     assert factory_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_custom_source_requires_one_explicit_identity_before_prepare() -> None:
+    backend = _CountingBackend()
+    source = _CustomSource("value")
+
+    async with Messaging(backend=backend) as messaging:
+        untyped_wrap = cast(
+            Callable[..., Awaitable[object]],
+            messaging.channel(name="custom", codec=_TextCodec()).wrap,
+        )
+        with pytest.raises(TypeError, match="provide identity explicitly"):
+            await untyped_wrap(source)
+
+    assert backend.prepare_calls == 0
+    assert source.closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_explicit_identity_must_match_profiled_source_before_prepare() -> None:
+    backend = _CountingBackend()
+    source = _native_source(
+        identity=_identity(thread_id="thread-source", run_id="run-source")
+    )
+
+    async with Messaging(backend=backend) as messaging:
+        with pytest.raises(ValueError, match="must match source messaging_identity"):
+            await messaging.channel(name="native").wrap(
+                source,
+                identity=_identity(thread_id="thread-other", run_id="run-other"),
+            )
+
+    assert backend.prepare_calls == 0
+    assert backend.append_calls == 0
 
 
 @pytest.mark.asyncio
@@ -348,8 +408,6 @@ async def test_incomplete_native_profile_fails_before_prepare(
         with pytest.raises(mismatch_type, match=reason) as captured:
             await messaging.channel(name="native").wrap(
                 source,
-                stream="stream-1",
-                run="run-1",
             )
 
     assert type(captured.value).__name__ == "SourceProfileMismatch"
@@ -373,8 +431,6 @@ async def test_unknown_profile_fails_without_opening_the_source_or_backend() -> 
         with pytest.raises(TypeError, match="unsupported built-in codec profile"):
             await messaging.channel(name="native").wrap(
                 source,
-                stream="stream-1",
-                run="run-1",
             )
 
     assert backend.prepare_calls == 0
@@ -390,9 +446,7 @@ async def test_reused_inferred_channel_revalidates_profile_before_prepare() -> N
     async with Messaging(backend=backend) as messaging:
         channel = messaging.channel(name="native")
         first = await channel.wrap(
-            _native_source(),
-            stream="stream-1",
-            run="run-1",
+            _native_source(identity=_identity(thread_id="stream-1")),
             after=0,
         )
         assert len([message async for message in first]) == 1
@@ -410,8 +464,6 @@ async def test_reused_inferred_channel_revalidates_profile_before_prepare() -> N
         ):
             await channel.wrap(
                 malformed,
-                stream="stream-2",
-                run="run-2",
             )
 
     assert backend.prepare_calls == baseline_prepare
@@ -430,24 +482,23 @@ async def test_name_only_channel_infers_native_and_agui_profiles() -> None:
     async with Messaging() as messaging:
         native_channel = messaging.channel(name="native-parts")
         native_frames = await native_channel.sse(
-            _native_source(),
-            stream="native-stream",
-            run="native-run",
+            _native_source(
+                identity=_identity(thread_id="native-stream", run_id="native-run")
+            ),
             after=0,
         )
         native = [frame async for frame in native_frames]
 
         agui_channel = messaging.channel(name="agui-events")
-        events = TinkerFin().run(empty_parts).astream_agui(run_input=_run_input())
+        agui_identity = _identity()
+        events = TinkerFin().run(empty_parts, identity=agui_identity).astream_agui()
         agui_frames = await agui_channel.sse(
             events,
-            stream="thread-1",
-            run="run-1",
             after=0,
         )
         agui = [frame async for frame in agui_frames]
         committed_agui = await agui_channel.read(
-            stream="thread-1",
+            identity=agui_identity,
             after=0,
             limit=100,
         )
@@ -469,15 +520,14 @@ async def test_name_only_channel_handle_is_reusable_across_streams() -> None:
     async with Messaging() as messaging:
         channel = messaging.channel(name="native-parts")
         first = await channel.wrap(
-            _native_source(1),
-            stream="stream-1",
-            run="run-1",
+            _native_source(1, identity=_identity(thread_id="stream-1")),
             after=0,
         )
         second = await channel.wrap(
-            _native_source(2),
-            stream="stream-2",
-            run="run-2",
+            _native_source(
+                2,
+                identity=_identity(thread_id="stream-2", run_id="run-2"),
+            ),
             after=0,
         )
 
@@ -503,13 +553,10 @@ async def test_name_only_channel_rejects_custom_and_incompatible_sources() -> No
         with pytest.raises(TypeError, match="does not advertise a built-in codec"):
             await channel.wrap(
                 cast(MessageSource[Never], custom),
-                stream="custom",
-                run="custom-run",
+                identity=_identity(thread_id="custom", run_id="custom-run"),
             )
         native = await channel.wrap(
-            _native_source(),
-            stream="native",
-            run="native-run",
+            _native_source(identity=_identity(thread_id="native", run_id="native-run")),
             after=0,
         )
         await _collect(native)
@@ -518,12 +565,17 @@ async def test_name_only_channel_rejects_custom_and_incompatible_sources() -> No
             if False:
                 yield None
 
-        incompatible = TinkerFin().run(empty_parts).astream_agui(run_input=_run_input())
+        incompatible = (
+            TinkerFin()
+            .run(
+                empty_parts,
+                identity=_identity(thread_id="agui", run_id="agui-run"),
+            )
+            .astream_agui()
+        )
         with pytest.raises(CodecMismatch):
             await channel.wrap(
                 incompatible,
-                stream="agui",
-                run="agui-run",
                 after=0,
             )
 
@@ -546,8 +598,7 @@ async def test_preencoded_runtime_sse_is_rejected_before_source_open() -> None:
         with pytest.raises(TypeError, match="object events, not pre-encoded SSE"):
             await channel.wrap(
                 cast(MessageSource[Never], encoded),
-                stream="stream-1",
-                run="run-1",
+                identity=_identity(thread_id="stream-1"),
             )
 
     assert factory_calls == 0
@@ -564,8 +615,7 @@ async def test_explicit_custom_codec_and_renderer_remain_supported() -> None:
         )
         subscription = await channel.wrap(
             source,
-            stream="stream-1",
-            run="run-1",
+            identity=_identity(thread_id="stream-1"),
             after=0,
         )
         assert_type(subscription, MessageSubscription[str])
@@ -587,8 +637,7 @@ async def test_channel_sse_matches_wrap_then_subscription_sse() -> None:
         )
         direct_body = await direct_channel.sse(
             _CustomSource("one", "two"),
-            stream="stream-1",
-            run="run-1",
+            identity=_identity(thread_id="stream-1"),
             after=0,
         )
         direct = [frame async for frame in direct_body]
@@ -600,8 +649,7 @@ async def test_channel_sse_matches_wrap_then_subscription_sse() -> None:
         )
         subscription = await composed_channel.wrap(
             _CustomSource("one", "two"),
-            stream="stream-1",
-            run="run-1",
+            identity=_identity(thread_id="stream-1"),
             after=0,
         )
         composed = [frame async for frame in subscription.sse()]

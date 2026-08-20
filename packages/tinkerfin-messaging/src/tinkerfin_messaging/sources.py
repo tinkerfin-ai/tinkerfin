@@ -8,6 +8,9 @@ from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, 
 from dataclasses import dataclass
 from typing import Generic, Protocol, TypeVar, cast, overload
 
+from tinkerfin_agui_adapter import Identity
+
+from ._identity import required_identifier, required_identity
 from .messaging import (
     CancelCallback,
     CancelContext,
@@ -20,6 +23,7 @@ from .protocols import MessageSource
 SourceT = TypeVar("SourceT")
 SourceT_co = TypeVar("SourceT_co", covariant=True)
 MappedT = TypeVar("MappedT")
+ReplayT = TypeVar("ReplayT")
 
 
 class CancellableMessageSource(
@@ -270,6 +274,65 @@ class DeferredMessageSource(Generic[SourceT]):
     def _close_finished(task: asyncio.Task[None]) -> None:
         if not task.cancelled():
             task.exception()
+
+
+class ProfiledDeferredMessageSource(
+    DeferredMessageSource[SourceT],
+    Generic[SourceT, ReplayT],
+):
+    """Defer opening while publishing a complete immutable codec profile."""
+
+    def __init__(
+        self,
+        opener: Callable[[], Awaitable[MessageSourceBinding[SourceT]]],
+        *,
+        identity: Identity,
+        codec_profile: str,
+        source_type: type[SourceT],
+        replay_type: type[ReplayT],
+        cancellable: bool,
+        cancel_after_first_item: bool = False,
+    ) -> None:
+        super().__init__(
+            opener,
+            cancellable=cancellable,
+            cancel_after_first_item=cancel_after_first_item,
+        )
+        self._messaging_identity = required_identity(identity)
+        self._messaging_codec_profile = required_identifier(
+            "codec_profile",
+            codec_profile,
+        )
+        if not isinstance(source_type, type):
+            raise TypeError("source_type must be a type")
+        if not isinstance(replay_type, type):
+            raise TypeError("replay_type must be a type")
+        self._messaging_source_type = source_type
+        self._messaging_replay_type = replay_type
+
+    @property
+    def messaging_identity(self) -> Identity:
+        """Return the durable run identity without opening the source."""
+
+        return self._messaging_identity
+
+    @property
+    def messaging_codec_profile(self) -> str:
+        """Return the codec profile without opening the source."""
+
+        return self._messaging_codec_profile
+
+    @property
+    def messaging_source_type(self) -> type[SourceT]:
+        """Return the live source item type."""
+
+        return self._messaging_source_type
+
+    @property
+    def messaging_replay_type(self) -> type[ReplayT]:
+        """Return the replay item type."""
+
+        return self._messaging_replay_type
 
 
 class FiniteMessageSource(Generic[SourceT]):

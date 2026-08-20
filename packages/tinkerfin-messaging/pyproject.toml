@@ -1,7 +1,7 @@
 [project]
 name = "tinkerfin-messaging"
 version = "0.1.0"
-description = "Protocol-neutral replayable messaging for asynchronous streams."
+description = "Replayable messaging for TinkerFin Native and AG-UI streams."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
@@ -16,14 +16,12 @@ classifiers = [
 ]
 
 dependencies = [
+    "ag-ui-protocol==0.1.19",
     "pydantic>=2,<3",
+    "tinkerfin>=0.1.0,<0.9.0",
 ]
 
 [project.optional-dependencies]
-agui = ["ag-ui-protocol==0.1.19"]
-native = [
-    "tinkerfin>=0.1.0,<0.9.0",
-]
 redis = ["redis>=6,<9"]
 
 [tool.uv.sources]

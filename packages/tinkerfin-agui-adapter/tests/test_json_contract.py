@@ -14,13 +14,16 @@ from ag_ui.core import (
 )
 from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 
+from tinkerfin_agui_adapter import Identity
 from tinkerfin_agui_adapter.adapter import DeepAgentAgUiAdapter
 from tinkerfin_agui_adapter.reasoning import normalize_operational_data
 from tinkerfin_agui_adapter.sse import encode_sse
 
 
 def _adapter() -> DeepAgentAgUiAdapter:
-    return DeepAgentAgUiAdapter("run-json")
+    return DeepAgentAgUiAdapter(
+        identity=Identity(threadId="thread-json", runId="run-json")
+    )
 
 
 @pytest.fixture(

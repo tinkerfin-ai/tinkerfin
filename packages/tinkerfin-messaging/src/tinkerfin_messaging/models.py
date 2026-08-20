@@ -8,7 +8,9 @@ from typing import Generic, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from ._identity import required_identifier
+from tinkerfin_agui_adapter import Identity
+
+from ._identity import required_identifier, required_identity
 
 ReplayT = TypeVar("ReplayT")
 
@@ -18,8 +20,8 @@ class MessageEnvelope(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal[1] = Field(
-        default=1,
+    schema_version: Literal[2] = Field(
+        default=2,
         description="Envelope schema version used to decode the durable record.",
     )
     channel: str = Field(
@@ -27,10 +29,8 @@ class MessageEnvelope(BaseModel):
         max_length=1024,
         description="Logical channel whose codec interprets the payload.",
     )
-    stream: str = Field(
-        min_length=1,
-        max_length=1024,
-        description="Caller-defined ordering and producer-concurrency scope.",
+    identity: Identity = Field(
+        description="Shared thread and semantic run identity for this payload."
     )
     seq: int = Field(
         ge=1,
@@ -40,11 +40,6 @@ class MessageEnvelope(BaseModel):
         min_length=1,
         max_length=1024,
         description="Stable idempotency identifier within the channel stream.",
-    )
-    run: str = Field(
-        min_length=1,
-        max_length=1024,
-        description="Caller-defined producer run correlated with the payload.",
     )
     codec: str = Field(
         min_length=1,
@@ -58,10 +53,15 @@ class MessageEnvelope(BaseModel):
         description="Aware UTC timestamp allocated on the first successful commit.",
     )
 
-    @field_validator("channel", "stream", "message_id", "run", "codec")
+    @field_validator("channel", "message_id", "codec")
     @classmethod
     def _identifier_is_canonical(cls, value: str) -> str:
         return required_identifier("identifier", value)
+
+    @field_validator("identity")
+    @classmethod
+    def _identity_is_bounded(cls, value: Identity) -> Identity:
+        return required_identity(value)
 
     @field_validator("created_at")
     @classmethod

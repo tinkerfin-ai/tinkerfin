@@ -1,4 +1,4 @@
-"""Protocol-neutral replayable messaging for asynchronous sources."""
+"""Replayable messaging with TinkerFin Native and AG-UI integration."""
 
 from __future__ import annotations
 
@@ -19,7 +19,6 @@ from .errors import MessagingNotStarted as MessagingNotStarted
 from .errors import MessagingSettlementTimeout as MessagingSettlementTimeout
 from .errors import RecoveryUnsupported as RecoveryUnsupported
 from .errors import RunAlreadyActive as RunAlreadyActive
-from .errors import RunIdentityConflict as RunIdentityConflict
 from .errors import RunNotFound as RunNotFound
 from .errors import RunProducerFailed as RunProducerFailed
 from .errors import SourceProfileMismatch as SourceProfileMismatch
@@ -45,6 +44,7 @@ from .sources import CancellableMessageSource as CancellableMessageSource
 from .sources import DeferredMessageSource as DeferredMessageSource
 from .sources import FiniteMessageSource as FiniteMessageSource
 from .sources import MessageSourceBinding as MessageSourceBinding
+from .sources import ProfiledDeferredMessageSource as ProfiledDeferredMessageSource
 from .sources import map_source as map_source
 
 if TYPE_CHECKING:
@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     from .redis import RedisBackend as RedisBackend
 
 __all__ = [
+    "AgUiCodec",
     "BackendOwnershipLost",
     "BackendRunHandle",
     "CancelCallback",
@@ -80,14 +81,17 @@ __all__ = [
     "MessagingError",
     "MessagingNotStarted",
     "MessagingSettlementTimeout",
+    "NativeStreamPart",
+    "NativeStreamPartCodec",
     "PreparedRun",
+    "ProfiledDeferredMessageSource",
     "ProfiledMessageSource",
     "RecoverableMessage",
     "RecoverableSource",
     "RecoveryCheckpoint",
     "RecoveryUnsupported",
+    "RedisBackend",
     "RunAlreadyActive",
-    "RunIdentityConflict",
     "RunNotFound",
     "RunProducerFailed",
     "SourceProfileMismatch",
@@ -121,28 +125,12 @@ def __getattr__(name: str) -> object:
     """Load optional integrations only when their public symbol is requested."""
 
     if name == "AgUiCodec":
-        try:
-            from .agui import AgUiCodec
-        except ModuleNotFoundError as error:
-            _raise_missing_extra(
-                error,
-                symbol=name,
-                extra="agui",
-                packages=("ag_ui",),
-            )
+        from .agui import AgUiCodec
 
         globals()[name] = AgUiCodec
         return AgUiCodec
     if name in {"NativeStreamPart", "NativeStreamPartCodec"}:
-        try:
-            from .native import NativeStreamPart, NativeStreamPartCodec
-        except ModuleNotFoundError as error:
-            _raise_missing_extra(
-                error,
-                symbol=name,
-                extra="native",
-                packages=("tinkerfin",),
-            )
+        from .native import NativeStreamPart, NativeStreamPartCodec
 
         globals()["NativeStreamPart"] = NativeStreamPart
         globals()["NativeStreamPartCodec"] = NativeStreamPartCodec

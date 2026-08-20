@@ -13,7 +13,9 @@ from uuid import uuid4
 
 from redis.asyncio import Redis
 
-from ._identity import required_identifier
+from tinkerfin_agui_adapter import Identity
+
+from ._identity import required_identifier, required_identity
 from .backend import (
     BackendRunHandle,
     FinalRunStatus,
@@ -29,7 +31,6 @@ from .errors import (
     InvalidCursor,
     MessageIdConflict,
     RunAlreadyActive,
-    RunIdentityConflict,
     RunNotFound,
     RunProducerFailed,
     StreamDeleteConflict,
@@ -117,14 +118,13 @@ local signals = KEYS[7]
 local requested_generation = tonumber(ARGV[1])
 local requested_run = ARGV[2]
 local requested_codec = ARGV[3]
-local requested_identity = ARGV[4]
-local requested_after = ARGV[5]
-local cancellable = ARGV[6]
-local recoverable = ARGV[7]
-local owner_token = ARGV[8]
-local lease_ms = ARGV[9]
-local requested_channel = ARGV[10]
-local requested_stream = ARGV[11]
+local requested_after = ARGV[4]
+local cancellable = ARGV[5]
+local recoverable = ARGV[6]
+local owner_token = ARGV[7]
+local lease_ms = ARGV[8]
+local requested_channel = ARGV[9]
+local requested_stream = ARGV[10]
 
 local function write_signal(kind, signal_run)
     local signal_seq = redis.call('HINCRBY', control, 'signal_seq', 1)
@@ -175,7 +175,7 @@ if not stored_codec then
     redis.call('HSET', channel_meta,
         'channel', requested_channel,
         'codec', requested_codec,
-        'schema_version', '3')
+        'schema_version', '4')
 end
 
 if activate_generation then
@@ -184,7 +184,7 @@ if activate_generation then
         'stream', requested_stream,
         'generation', tostring(requested_generation),
         'state', 'active',
-        'schema_version', '3')
+        'schema_version', '4')
     redis.call('HSETNX', control, 'signal_seq', '0')
 end
 
@@ -193,15 +193,11 @@ redis.call('HSET', meta,
     'stream', requested_stream,
     'generation', tostring(requested_generation),
     'seq', tostring(latest),
-    'schema_version', '3')
+    'schema_version', '4')
 redis.call('SADD', key_index, meta)
 
 if redis.call('EXISTS', run_key) == 1 then
     redis.call('SADD', key_index, run_key, lease_key)
-    local stored_identity = redis.call('HGET', run_key, 'identity')
-    if stored_identity ~= requested_identity then
-        return {'IDENTITY_CONFLICT'}
-    end
     local status = redis.call('HGET', run_key, 'status')
     if status == 'completed' or status == 'cancelled' or status == 'failed' or status == 'owner_lost' then
         return {'ATTACH', tostring(cursor), status}
@@ -282,7 +278,6 @@ local fence = redis.call('HINCRBY', meta, 'fence_counter', 1)
 redis.call('SADD', key_index, run_key, lease_key)
 redis.call('HSET', run_key,
     'run', requested_run,
-    'identity', requested_identity,
     'status', 'running',
     'settling', '0',
     'start_seq', tostring(latest),
@@ -740,14 +735,14 @@ class _RedisKeys:
     """Name the shared and generation-private keys for one run lookup."""
 
     channel: str
-    stream: str
+    identity: Identity
     channel_meta: str
     control: str
     delete_lease: str
     signals: str
     meta: str
-    run: str
-    lease: str
+    run_key: str
+    lease_key: str
     messages: str
     index: str
     base: str
@@ -820,24 +815,20 @@ class RedisBackend(MessagingBackend):
         self,
         *,
         channel: str,
-        stream: str,
-        run: str,
+        identity: Identity,
         codec: str,
-        identity: str,
         after: int | None,
         cancellable: bool,
         recoverable: bool,
     ) -> PreparedRun:
         required_identifier("channel", channel)
-        required_identifier("stream", stream)
-        required_identifier("run", run)
+        required_identity(identity)
         required_identifier("codec", codec)
-        required_identifier("identity", identity)
         if after is not None and (
             isinstance(after, bool) or not isinstance(after, int)
         ):
             raise TypeError("after must be an integer or None")
-        scope = self._scope(channel, stream)
+        scope = self._scope(channel, identity)
         owner_token = f"{self._worker_id}:{uuid4().hex}"
         while True:
             control = await self._read_control(scope)
@@ -846,37 +837,36 @@ class RedisBackend(MessagingBackend):
             elif control.state == "deleting":
                 raise StreamDeleted(
                     channel=channel,
-                    stream=stream,
+                    identity=identity,
                     generation=control.generation,
                 )
             elif control.state == "deleted":
                 generation = control.generation + 1
             else:
                 generation = control.generation
-            keys = self._keys(channel, stream, run, generation=generation)
+            keys = self._keys(channel, identity, generation=generation)
             response = await self._eval(
                 _PREPARE_SCRIPT,
                 [
                     keys.channel_meta,
                     keys.control,
                     keys.meta,
-                    keys.run,
-                    keys.lease,
+                    keys.run_key,
+                    keys.lease_key,
                     keys.index,
                     keys.signals,
                 ],
                 [
                     str(generation),
-                    run,
+                    identity.run_id,
                     codec,
-                    identity,
                     "__tail__" if after is None else str(after),
                     "1" if cancellable else "0",
                     "1" if recoverable else "0",
                     owner_token,
                     str(self._lease_ms),
                     channel,
-                    stream,
+                    identity.thread_id,
                 ],
             )
             code = self._text(response[0])
@@ -885,7 +875,7 @@ class RedisBackend(MessagingBackend):
             if code == "STREAM_DELETED":
                 raise StreamDeleted(
                     channel=channel,
-                    stream=stream,
+                    identity=identity,
                     generation=generation,
                 )
             if code == "INVALID_CONTROL_STATE":
@@ -904,12 +894,13 @@ class RedisBackend(MessagingBackend):
                 expected=self._text(response[1]),
                 actual=codec,
             )
-        if code == "IDENTITY_CONFLICT":
-            raise RunIdentityConflict(run=run)
         if code == "RUN_ACTIVE":
             raise RunAlreadyActive(
-                active_run=self._text(response[1]),
-                requested_run=run,
+                active_identity=Identity(
+                    threadId=identity.thread_id,
+                    runId=self._text(response[1]),
+                ),
+                requested_identity=identity,
             )
         cursor = int(self._text(response[1]))
         if code in {"START", "RECOVER"}:
@@ -924,8 +915,7 @@ class RedisBackend(MessagingBackend):
             return PreparedRun(
                 handle=BackendRunHandle(
                     channel=channel,
-                    stream=stream,
-                    run=run,
+                    identity=identity,
                     owner_token=owner_token,
                     fence=fence,
                     generation=generation,
@@ -940,8 +930,7 @@ class RedisBackend(MessagingBackend):
         return PreparedRun(
             handle=BackendRunHandle(
                 channel=channel,
-                stream=stream,
-                run=run,
+                identity=identity,
                 owner_token=None,
                 fence=None,
                 generation=generation,
@@ -969,17 +958,17 @@ class RedisBackend(MessagingBackend):
         generation = handle.generation
         if handle.owner_token is None or handle.fence is None or generation is None:
             raise BackendOwnershipLost(
-                f"Run {handle.run!r} has no complete producer ownership identity"
+                f"Run {handle.identity.run_id!r} has no complete producer ownership "
+                "identity"
             )
         keys = self._keys(
             handle.channel,
-            handle.stream,
-            handle.run,
+            handle.identity,
             generation=generation,
         )
         dedupe = f"{keys.generation_base}:message:{self._digest(message_id)}"
         signature = self._message_signature(
-            run=handle.run,
+            identity=handle.identity,
             codec=codec,
             payload=payload,
             checkpoint=checkpoint,
@@ -990,8 +979,8 @@ class RedisBackend(MessagingBackend):
                 keys.control,
                 keys.channel_meta,
                 keys.meta,
-                keys.run,
-                keys.lease,
+                keys.run_key,
+                keys.lease_key,
                 keys.messages,
                 dedupe,
                 keys.index,
@@ -1001,7 +990,7 @@ class RedisBackend(MessagingBackend):
                 handle.owner_token,
                 str(handle.fence),
                 message_id,
-                handle.run,
+                handle.identity.run_id,
                 codec,
                 payload,
                 signature,
@@ -1017,7 +1006,7 @@ class RedisBackend(MessagingBackend):
             self._raise_stream_deleted(handle)
         if code == "OWNERSHIP_LOST":
             raise BackendOwnershipLost(
-                f"Producer for run {handle.run!r} lost its Redis fence"
+                f"Producer for run {handle.identity.run_id!r} lost its Redis fence"
             )
         if code == "CODEC_MISMATCH":
             raise CodecMismatch(
@@ -1026,7 +1015,7 @@ class RedisBackend(MessagingBackend):
             )
         if code == "MESSAGE_CONFLICT":
             raise MessageIdConflict(
-                stream=handle.stream,
+                identity=handle.identity,
                 message_id=message_id,
             )
         if code not in {"APPENDED", "IDEMPOTENT"}:
@@ -1038,10 +1027,9 @@ class RedisBackend(MessagingBackend):
         )
         return MessageEnvelope(
             channel=handle.channel,
-            stream=handle.stream,
+            identity=handle.identity,
             seq=seq,
             message_id=message_id,
-            run=handle.run,
             codec=codec,
             payload=bytes(payload),
             created_at=created_at,
@@ -1053,17 +1041,17 @@ class RedisBackend(MessagingBackend):
         generation = handle.generation
         if handle.owner_token is None or handle.fence is None or generation is None:
             raise BackendOwnershipLost(
-                f"Run {handle.run!r} has no complete producer ownership identity"
+                f"Run {handle.identity.run_id!r} has no complete producer ownership "
+                "identity"
             )
         keys = self._keys(
             handle.channel,
-            handle.stream,
-            handle.run,
+            handle.identity,
             generation=generation,
         )
         response = await self._eval(
             _BEGIN_SETTLEMENT_SCRIPT,
-            [keys.control, keys.run, keys.lease],
+            [keys.control, keys.run_key, keys.lease_key],
             [str(generation), handle.owner_token, str(handle.fence)],
         )
         code = self._text(response[0])
@@ -1075,7 +1063,7 @@ class RedisBackend(MessagingBackend):
             self._raise_stream_deleted(handle)
         if code == "OWNERSHIP_LOST":
             raise BackendOwnershipLost(
-                f"Producer for run {handle.run!r} lost its Redis fence"
+                f"Producer for run {handle.identity.run_id!r} lost its Redis fence"
             )
         raise RuntimeError(f"unexpected Redis settlement response: {code}")
 
@@ -1089,19 +1077,25 @@ class RedisBackend(MessagingBackend):
         generation = handle.generation
         if handle.owner_token is None or handle.fence is None or generation is None:
             raise BackendOwnershipLost(
-                f"Run {handle.run!r} has no complete producer ownership identity"
+                f"Run {handle.identity.run_id!r} has no complete producer ownership "
+                "identity"
             )
         keys = self._keys(
             handle.channel,
-            handle.stream,
-            handle.run,
+            handle.identity,
             generation=generation,
         )
         error_class = "" if error is None else self._qualified_name(error)
         error_message = "" if error is None else str(error)
         response = await self._eval(
             _FINISH_SCRIPT,
-            [keys.control, keys.meta, keys.run, keys.lease, keys.signals],
+            [
+                keys.control,
+                keys.meta,
+                keys.run_key,
+                keys.lease_key,
+                keys.signals,
+            ],
             [
                 str(generation),
                 handle.owner_token,
@@ -1116,19 +1110,20 @@ class RedisBackend(MessagingBackend):
             self._raise_stream_deleted(handle)
         if code == "OWNERSHIP_LOST":
             raise BackendOwnershipLost(
-                f"Producer for run {handle.run!r} lost its Redis fence"
+                f"Producer for run {handle.identity.run_id!r} lost its Redis fence"
             )
 
-    async def latest_seq(self, *, channel: str, stream: str) -> int:
-        scope = self._scope(channel, stream)
+    async def latest_seq(self, *, channel: str, identity: Identity) -> int:
+        required_identifier("channel", channel)
+        required_identity(identity)
+        scope = self._scope(channel, identity)
         while True:
             control = await self._read_control(scope)
             if control is None or control.state != "active":
                 return 0
             keys = self._keys(
                 channel,
-                stream,
-                "placeholder",
+                identity,
                 generation=control.generation,
             )
             value = await self._client.hget(keys.meta, "seq")
@@ -1139,7 +1134,7 @@ class RedisBackend(MessagingBackend):
         self,
         *,
         channel: str,
-        stream: str,
+        identity: Identity,
         after: int = 0,
         limit: int = 100,
     ) -> tuple[MessageEnvelope, ...]:
@@ -1151,15 +1146,16 @@ class RedisBackend(MessagingBackend):
             raise TypeError("limit must be an integer")
         if not 1 <= limit <= 1000:
             raise ValueError("limit must be between 1 and 1000")
-        scope = self._scope(channel, stream)
+        required_identifier("channel", channel)
+        required_identity(identity)
+        scope = self._scope(channel, identity)
         while True:
             control = await self._read_control(scope)
             if control is None or control.state != "active":
                 return ()
             keys = self._keys(
                 channel,
-                stream,
-                "placeholder",
+                identity,
                 generation=control.generation,
             )
             entries = await self._client.xrange(
@@ -1170,7 +1166,7 @@ class RedisBackend(MessagingBackend):
             )
             if await self._is_current_generation(keys):
                 return tuple(
-                    self._decode_entry(channel, stream, entry)
+                    self._decode_entry(channel, identity, entry)
                     for entry in cast(
                         Sequence[tuple[bytes, Mapping[bytes, bytes]]],
                         entries,
@@ -1181,33 +1177,29 @@ class RedisBackend(MessagingBackend):
         self,
         *,
         channel: str,
-        stream: str,
-        run: str,
+        identity: Identity,
     ) -> BackendRunHandle:
         """Resolve one read-only follower to an authoritative Redis generation."""
 
         required_identifier("channel", channel)
-        required_identifier("stream", stream)
-        required_identifier("run", run)
+        required_identity(identity)
         unresolved = BackendRunHandle(
             channel=channel,
-            stream=stream,
-            run=run,
+            identity=identity,
             owner_token=None,
             fence=None,
         )
         keys = await self._keys_for_handle(unresolved)
-        if not await self._client.exists(keys.run):
+        if not await self._client.exists(keys.run_key):
             if not await self._is_current_generation(keys):
                 self._raise_stream_deleted(
                     unresolved,
                     generation=keys.generation,
                 )
-            raise RunNotFound(run=run)
+            raise RunNotFound(identity=identity)
         return BackendRunHandle(
             channel=channel,
-            stream=stream,
-            run=run,
+            identity=identity,
             owner_token=None,
             fence=None,
             generation=keys.generation,
@@ -1225,7 +1217,7 @@ class RedisBackend(MessagingBackend):
             while True:
                 snapshot = await self._settled_run_snapshot(
                     keys,
-                    handle.run,
+                    handle.identity,
                     after=cursor,
                 )
                 if snapshot.messages:
@@ -1237,7 +1229,10 @@ class RedisBackend(MessagingBackend):
                 if snapshot.terminal:
                     if snapshot.status in {"failed", "owner_lost"}:
                         cause = self._remote_error(snapshot)
-                        raise RunProducerFailed(run=handle.run, cause=cause)
+                        raise RunProducerFailed(
+                            identity=handle.identity,
+                            cause=cause,
+                        )
                     return
                 await self._wait_for_snapshot_change(keys, snapshot)
 
@@ -1245,19 +1240,19 @@ class RedisBackend(MessagingBackend):
 
     async def request_cancel(self, handle: BackendRunHandle) -> bool:
         keys = await self._keys_for_handle(handle)
-        await self._settled_run_snapshot(keys, handle.run)
+        await self._settled_run_snapshot(keys, handle.identity)
         response = await self._eval(
             _CANCEL_SCRIPT,
-            [keys.control, keys.run, keys.signals],
+            [keys.control, keys.run_key, keys.signals],
             [str(keys.generation)],
         )
         code = self._text(response[0])
         if code == "STREAM_DELETED":
             self._raise_stream_deleted(handle, generation=keys.generation)
         if code == "NOT_FOUND":
-            raise RunNotFound(run=handle.run)
+            raise RunNotFound(identity=handle.identity)
         if code == "UNSUPPORTED":
-            raise CancellationUnsupported(run=handle.run)
+            raise CancellationUnsupported(identity=handle.identity)
         if code in {"FINAL", "DUPLICATE"}:
             return False
         if code != "REQUESTED":
@@ -1267,7 +1262,7 @@ class RedisBackend(MessagingBackend):
     async def wait_for_cancel(self, handle: BackendRunHandle) -> bool:
         keys = await self._keys_for_handle(handle)
         while True:
-            snapshot = await self._settled_run_snapshot(keys, handle.run)
+            snapshot = await self._settled_run_snapshot(keys, handle.identity)
             if snapshot.status == "cancel_requested":
                 return True
             if snapshot.terminal:
@@ -1277,14 +1272,14 @@ class RedisBackend(MessagingBackend):
     async def wait_finished(self, handle: BackendRunHandle) -> RunStatus:
         keys = await self._keys_for_handle(handle)
         while True:
-            snapshot = await self._settled_run_snapshot(keys, handle.run)
+            snapshot = await self._settled_run_snapshot(keys, handle.identity)
             if snapshot.terminal:
                 return snapshot.status
             await self._wait_for_snapshot_change(keys, snapshot)
 
     async def failure(self, handle: BackendRunHandle) -> BaseException | None:
         keys = await self._keys_for_handle(handle)
-        snapshot = await self._settled_run_snapshot(keys, handle.run)
+        snapshot = await self._settled_run_snapshot(keys, handle.identity)
         if not snapshot.error_class and not snapshot.error_message:
             return None
         return self._remote_error(snapshot)
@@ -1297,14 +1292,13 @@ class RedisBackend(MessagingBackend):
             return False
         keys = self._keys(
             handle.channel,
-            handle.stream,
-            handle.run,
+            handle.identity,
             generation=generation,
         )
         expected = f"{handle.owner_token}:{handle.fence}"
         response = await self._eval(
             _RENEW_SCRIPT,
-            [keys.control, keys.lease],
+            [keys.control, keys.lease_key],
             [str(generation), expected, str(self._lease_ms)],
         )
         code = self._text(response[0])
@@ -1322,20 +1316,19 @@ class RedisBackend(MessagingBackend):
 
         return self._lease_ttl / 3
 
-    async def delete_stream(self, *, channel: str, stream: str) -> None:
+    async def delete_stream(self, *, channel: str, identity: Identity) -> None:
         """Delete one stream through a leased, generation-fenced cleanup."""
 
         required_identifier("channel", channel)
-        required_identifier("stream", stream)
-        scope = self._scope(channel, stream)
+        required_identity(identity)
+        scope = self._scope(channel, identity)
         delete_owner = f"{self._worker_id}:delete:{uuid4().hex}"
         while True:
             control = await self._read_control(scope)
             generation = 1 if control is None else control.generation
             keys = self._keys(
                 channel,
-                stream,
-                "placeholder",
+                identity,
                 generation=generation,
             )
             expected_active_lease = ""
@@ -1367,8 +1360,11 @@ class RedisBackend(MessagingBackend):
             if code == "ACTIVE":
                 raise StreamDeleteConflict(
                     channel=channel,
-                    stream=stream,
-                    active_run=self._text(response[1]),
+                    identity=identity,
+                    active_identity=Identity(
+                        threadId=identity.thread_id,
+                        runId=self._text(response[1]),
+                    ),
                 )
             if code in {"RETRY", "LEASE_LOST"}:
                 continue
@@ -1435,10 +1431,10 @@ class RedisBackend(MessagingBackend):
                 return False
             raise RuntimeError(f"unexpected Redis delete finalization response: {code}")
 
-    def _scope(self, channel: str, stream: str) -> _RedisStreamScope:
+    def _scope(self, channel: str, identity: Identity) -> _RedisStreamScope:
         channel_scope = self._digest(channel)
         base = f"{self._prefix}:{{{channel_scope}}}"
-        stream_digest = self._digest(stream)
+        stream_digest = self._digest(identity.thread_id)
         stream_base = f"{base}:stream:{stream_digest}"
         return _RedisStreamScope(
             channel_meta=f"{base}:channel",
@@ -1452,24 +1448,23 @@ class RedisBackend(MessagingBackend):
     def _keys(
         self,
         channel: str,
-        stream: str,
-        run: str,
+        identity: Identity,
         *,
         generation: int,
     ) -> _RedisKeys:
-        scope = self._scope(channel, stream)
+        scope = self._scope(channel, identity)
         generation_base = f"{scope.stream_base}:generation:{generation}"
-        run_digest = self._digest(run)
+        run_digest = self._digest(identity.run_id)
         return _RedisKeys(
             channel=channel,
-            stream=stream,
+            identity=identity,
             channel_meta=scope.channel_meta,
             control=scope.control,
             delete_lease=scope.delete_lease,
             signals=scope.signals,
             meta=f"{generation_base}:meta",
-            run=f"{generation_base}:run:{run_digest}",
-            lease=f"{generation_base}:lease:{run_digest}",
+            run_key=f"{generation_base}:run:{run_digest}",
+            lease_key=f"{generation_base}:lease:{run_digest}",
             messages=f"{generation_base}:messages",
             index=f"{generation_base}:index",
             base=scope.base,
@@ -1506,10 +1501,10 @@ class RedisBackend(MessagingBackend):
     async def _keys_for_handle(self, handle: BackendRunHandle) -> _RedisKeys:
         generation = handle.generation
         if generation is None:
-            scope = self._scope(handle.channel, handle.stream)
+            scope = self._scope(handle.channel, handle.identity)
             control = await self._read_control(scope)
             if control is None:
-                raise RunNotFound(run=handle.run)
+                raise RunNotFound(identity=handle.identity)
             if control.state != "active":
                 self._raise_stream_deleted(
                     handle,
@@ -1518,8 +1513,7 @@ class RedisBackend(MessagingBackend):
             generation = control.generation
         return self._keys(
             handle.channel,
-            handle.stream,
-            handle.run,
+            handle.identity,
             generation=generation,
         )
 
@@ -1543,7 +1537,7 @@ class RedisBackend(MessagingBackend):
     async def _run_snapshot(
         self,
         keys: _RedisKeys,
-        run: str,
+        identity: Identity,
         *,
         after: int | None = None,
     ) -> _RunSnapshot:
@@ -1554,8 +1548,8 @@ class RedisBackend(MessagingBackend):
             6,
             keys.control,
             keys.meta,
-            keys.run,
-            keys.lease,
+            keys.run_key,
+            keys.lease_key,
             keys.messages,
             keys.signals,
             str(keys.generation),
@@ -1570,11 +1564,11 @@ class RedisBackend(MessagingBackend):
         if code == "STREAM_DELETED":
             raise StreamDeleted(
                 channel=keys.channel,
-                stream=keys.stream,
+                identity=keys.identity,
                 generation=keys.generation,
             )
         if code == "NOT_FOUND":
-            raise RunNotFound(run=run)
+            raise RunNotFound(identity=identity)
         if code == "INVALID_STATUS":
             status = (
                 self._snapshot_text(response[1], field="invalid status")
@@ -1619,7 +1613,7 @@ class RedisBackend(MessagingBackend):
         messages = self._snapshot_messages(
             response[7],
             channel=keys.channel,
-            stream=keys.stream,
+            identity=keys.identity,
             after=after,
             end_seq=end_seq,
         )
@@ -1636,15 +1630,15 @@ class RedisBackend(MessagingBackend):
     async def _settled_run_snapshot(
         self,
         keys: _RedisKeys,
-        run: str,
+        identity: Identity,
         *,
         after: int | None = None,
     ) -> _RunSnapshot:
         """Settle one potentially mutating Lua snapshot before caller cancellation."""
 
         snapshot_task = asyncio.create_task(
-            self._run_snapshot(keys, run, after=after),
-            name=f"tinkerfin-messaging-redis-snapshot:{run}",
+            self._run_snapshot(keys, identity, after=after),
+            name=f"tinkerfin-messaging-redis-snapshot:{identity.run_id}",
         )
         current = asyncio.current_task()
         cancel_count = current.cancelling() if current is not None else 0
@@ -1793,7 +1787,7 @@ class RedisBackend(MessagingBackend):
         value: _RedisScriptValue,
         *,
         channel: str,
-        stream: str,
+        identity: Identity,
         after: int | None,
         end_seq: int,
     ) -> tuple[MessageEnvelope, ...]:
@@ -1846,7 +1840,7 @@ class RedisBackend(MessagingBackend):
             try:
                 message = self._decode_entry(
                     channel,
-                    stream,
+                    identity,
                     (identifier, fields),
                 )
             except (KeyError, TypeError, ValueError, UnicodeDecodeError) as error:
@@ -1869,14 +1863,14 @@ class RedisBackend(MessagingBackend):
     ) -> Never:
         raise StreamDeleted(
             channel=handle.channel,
-            stream=handle.stream,
+            identity=handle.identity,
             generation=(handle.generation if generation is None else generation),
         )
 
     def _decode_entry(
         self,
         channel: str,
-        stream: str,
+        identity: Identity,
         entry: tuple[bytes, Mapping[bytes, bytes]],
     ) -> MessageEnvelope:
         identifier, raw_fields = entry
@@ -1884,10 +1878,12 @@ class RedisBackend(MessagingBackend):
         seq = int(self._text(identifier).split("-", maxsplit=1)[0])
         return MessageEnvelope(
             channel=channel,
-            stream=stream,
+            identity=Identity(
+                threadId=identity.thread_id,
+                runId=self._text(fields["run"]),
+            ),
             seq=seq,
             message_id=self._text(fields["message_id"]),
-            run=self._text(fields["run"]),
             codec=self._text(fields["codec"]),
             payload=self._bytes(fields["payload"]),
             created_at=datetime.fromtimestamp(
@@ -1916,14 +1912,14 @@ class RedisBackend(MessagingBackend):
     @staticmethod
     def _message_signature(
         *,
-        run: str,
+        identity: Identity,
         codec: str,
         payload: bytes,
         checkpoint: RecoveryCheckpoint | None,
     ) -> str:
         digest = hashlib.sha256()
         digest.update(b"tinkerfin-messaging:redis-message:v1\0")
-        values = [run.encode(), codec.encode(), payload]
+        values = [identity.run_id.encode(), codec.encode(), payload]
         if checkpoint is not None:
             values.extend(
                 [

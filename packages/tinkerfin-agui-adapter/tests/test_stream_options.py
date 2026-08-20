@@ -5,11 +5,11 @@ from ag_ui.core import RawEvent
 from langchain_core.messages import AIMessageChunk
 from pydantic_core import PydanticSerializationError
 
-from tinkerfin_agui_adapter import DeepAgentAgUiAdapter
+from tinkerfin_agui_adapter import DeepAgentAgUiAdapter, Identity
 
 
-def _run_id() -> str:
-    return "run-1"
+def _identity() -> Identity:
+    return Identity(threadId="thread-1", runId="run-1")
 
 
 def _task_start(*, namespace: tuple[str, ...] = ()) -> dict[str, object]:
@@ -36,7 +36,7 @@ def _task_start(*, namespace: tuple[str, ...] = ()) -> dict[str, object]:
 
 
 def test_extra_modes_emit_sanitized_raw_events() -> None:
-    adapter = DeepAgentAgUiAdapter(_run_id())
+    adapter = DeepAgentAgUiAdapter(identity=_identity())
 
     events = adapter.process(
         {
@@ -76,7 +76,7 @@ def test_extra_modes_emit_sanitized_raw_events() -> None:
 
 
 def test_checkpoint_projection_drops_runtime_configuration_and_task_state() -> None:
-    adapter = DeepAgentAgUiAdapter(_run_id())
+    adapter = DeepAgentAgUiAdapter(identity=_identity())
 
     event = adapter.process(
         {
@@ -123,7 +123,7 @@ def test_checkpoint_projection_drops_runtime_configuration_and_task_state() -> N
 
 
 def test_checkpoint_projection_normalizes_task_exceptions() -> None:
-    adapter = DeepAgentAgUiAdapter(_run_id())
+    adapter = DeepAgentAgUiAdapter(identity=_identity())
 
     event = adapter.process(
         {
@@ -271,7 +271,7 @@ def test_debug_projection_whitelists_each_native_payload(
     data: dict[str, object],
     expected: dict[str, object],
 ) -> None:
-    adapter = DeepAgentAgUiAdapter(_run_id())
+    adapter = DeepAgentAgUiAdapter(identity=_identity())
 
     event = adapter.process({"type": "debug", "ns": (), "data": data})[0]
 
@@ -281,7 +281,7 @@ def test_debug_projection_whitelists_each_native_payload(
 
 
 def test_root_custom_mode_emits_a_sanitized_raw_event() -> None:
-    adapter = DeepAgentAgUiAdapter(_run_id())
+    adapter = DeepAgentAgUiAdapter(identity=_identity())
 
     event = adapter.process(
         {
@@ -300,7 +300,7 @@ def test_root_custom_mode_emits_a_sanitized_raw_event() -> None:
 
 
 def test_extra_mode_rejects_opaque_values_before_event_construction() -> None:
-    adapter = DeepAgentAgUiAdapter(_run_id())
+    adapter = DeepAgentAgUiAdapter(identity=_identity())
 
     with pytest.raises(PydanticSerializationError):
         adapter.process(
@@ -313,7 +313,7 @@ def test_extra_mode_rejects_opaque_values_before_event_construction() -> None:
 
 
 def test_disabled_subagent_events_are_consumed_without_public_output() -> None:
-    adapter = DeepAgentAgUiAdapter(_run_id(), expose_subagent_events=False)
+    adapter = DeepAgentAgUiAdapter(identity=_identity(), expose_subagent_events=False)
     root_events = adapter.process(_task_start())
 
     child_namespace = ("tools:graph-task-1",)
@@ -358,7 +358,7 @@ def test_disabled_subagent_events_are_consumed_without_public_output() -> None:
 
 
 def test_root_state_boundary_does_not_leak_subagent_end_events() -> None:
-    adapter = DeepAgentAgUiAdapter(_run_id(), expose_subagent_events=False)
+    adapter = DeepAgentAgUiAdapter(identity=_identity(), expose_subagent_events=False)
     adapter.process(_task_start())
     child_namespace = ("tools:graph-task-1",)
 

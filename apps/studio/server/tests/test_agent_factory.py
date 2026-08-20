@@ -9,7 +9,6 @@ from typing import cast
 
 from ag_ui.core import BaseEvent, RunAgentInput, RunErrorEvent, RunStartedEvent
 from langchain.agents.middleware.types import InputAgentState
-from langchain_core.runnables import RunnableConfig
 from pydantic import SecretStr
 
 from tinkerfin import AgUiEventStream, TinkerFin
@@ -19,6 +18,8 @@ from tinkerfin_messaging.agui import AgUiCodec
 from tinkerfin_sandbox.lifecycle.manager import OpenSandboxManager
 from tinkerfin_studio.agent.factory import ConversationAgentFactory
 from tinkerfin_studio.agent.persistence import AgentPersistence
+from tinkerfin_studio.conversation.request import ChatRequest
+from tinkerfin_studio.conversation.run_preparation import prepare_run_request
 from tinkerfin_studio.models.schemas import AgentModelConfig
 
 
@@ -56,8 +57,16 @@ def _run_input() -> RunAgentInput:
             "messages": [],
             "tools": [],
             "context": [],
-            "forwardedProps": {},
+            "forwardedProps": {"model": "main", "mode": "default"},
         }
+    )
+
+
+def _prepared():
+    return prepare_run_request(
+        ChatRequest.from_agui(_run_input()),
+        user_id=7,
+        thread_id="thread-1",
     )
 
 
@@ -77,7 +86,7 @@ async def test_create_agui_events_defers_definition_and_enriches_main_start(
             return _AgentEvents.from_events(
                 (
                     AgUiLifecycleEventFactory().started(
-                        run_input=_run_input(),
+                        identity=_prepared().identity,
                     ),
                 )
             )
@@ -102,18 +111,16 @@ async def test_create_agui_events_defers_definition_and_enriches_main_start(
     factory = ConversationAgentFactory(
         persistence=cast(AgentPersistence, SimpleNamespace()),
         sandbox_manager=cast(OpenSandboxManager[str], SimpleNamespace()),
-        tinkerfin=TinkerFin[str](),
+        tinkerfin=TinkerFin(),
         tavily_api_key=None,
     )
     model = _model_config()
-    run_input = _run_input()
+    prepared = _prepared()
     events = factory.create_agui_events(
         user_id=7,
         model_config=model,
         graph_input=cast(InputAgentState, {"messages": []}),
-        config=cast(RunnableConfig, {"configurable": {"thread_id": "principal-1"}}),
-        principal="principal-1",
-        run_input=run_input,
+        prepared=prepared,
         resume=None,
         title="会话标题",
     )
@@ -129,7 +136,7 @@ async def test_create_agui_events_defers_definition_and_enriches_main_start(
     started = emitted[0]
     assert isinstance(started, RunStartedEvent)
     started_payload = started.model_dump(mode="python", by_alias=False)
-    assert started_payload["input"] == run_input.model_dump(
+    assert started_payload["input"] == prepared.protocol_input.model_dump(
         mode="python",
         by_alias=False,
     )
@@ -155,17 +162,15 @@ async def test_create_agui_events_converts_owner_initialization_failure(
     factory = ConversationAgentFactory(
         persistence=cast(AgentPersistence, SimpleNamespace()),
         sandbox_manager=cast(OpenSandboxManager[str], SimpleNamespace()),
-        tinkerfin=TinkerFin[str](),
+        tinkerfin=TinkerFin(),
         tavily_api_key=None,
     )
-    run_input = _run_input()
+    prepared = _prepared()
     events = factory.create_agui_events(
         user_id=7,
         model_config=_model_config(),
         graph_input=cast(InputAgentState, {"messages": []}),
-        config=cast(RunnableConfig, {"configurable": {"thread_id": "principal-1"}}),
-        principal="principal-1",
-        run_input=run_input,
+        prepared=prepared,
         resume=None,
         title="会话标题",
     )
@@ -178,6 +183,7 @@ async def test_create_agui_events_converts_owner_initialization_failure(
     assert isinstance(started, RunStartedEvent)
     assert isinstance(failed, RunErrorEvent)
     assert started.raw_event == {
+        "threadId": "thread-1",
         "runId": "run-1",
         "initializationFailed": True,
     }
@@ -205,7 +211,7 @@ async def test_remote_cancel_waits_for_deferred_agent_open_and_keeps_one_termina
 
             return AgUiEventStream(
                 parts=parts(),
-                run_input=_run_input(),
+                identity=_prepared().identity,
                 expose_reasoning_events=False,
                 expose_subagent_events=True,
                 prior_tool_call_ids=frozenset(),
@@ -235,16 +241,15 @@ async def test_remote_cancel_waits_for_deferred_agent_open_and_keeps_one_termina
     factory = ConversationAgentFactory(
         persistence=cast(AgentPersistence, SimpleNamespace()),
         sandbox_manager=cast(OpenSandboxManager[str], SimpleNamespace()),
-        tinkerfin=TinkerFin[str](),
+        tinkerfin=TinkerFin(),
         tavily_api_key=None,
     )
+    prepared = _prepared()
     events = factory.create_agui_events(
         user_id=7,
         model_config=_model_config(),
         graph_input=cast(InputAgentState, {"messages": []}),
-        config=cast(RunnableConfig, {"configurable": {"thread_id": "principal-1"}}),
-        principal="principal-1",
-        run_input=_run_input(),
+        prepared=prepared,
         resume=None,
         title="会话标题",
     )
@@ -253,12 +258,10 @@ async def test_remote_cancel_waits_for_deferred_agent_open_and_keeps_one_termina
         channel = messaging.channel(name="events", codec=AgUiCodec())
         subscription = await channel.wrap(
             events,
-            stream="thread-1",
-            run="run-1",
             after=0,
         )
         await asyncio.wait_for(opening.wait(), timeout=1)
-        cancelling = asyncio.create_task(channel.cancel(stream="thread-1", run="run-1"))
+        cancelling = asyncio.create_task(channel.cancel(identity=prepared.identity))
         await asyncio.sleep(0)
         assert not cancelling.done()
 

@@ -5,7 +5,6 @@ import json
 import pytest
 from ag_ui.core import (
     RawEvent,
-    RunAgentInput,
     RunErrorEvent,
     RunFinishedEvent,
     RunStartedEvent,
@@ -13,26 +12,12 @@ from ag_ui.core import (
 )
 from langchain_core.messages import AIMessageChunk, ToolMessage
 
-from tinkerfin_agui_adapter import DeepAgentAgUiAdapter, astream_events
+from tinkerfin_agui_adapter import DeepAgentAgUiAdapter, Identity, astream_events
 from tinkerfin_agui_adapter.ids import ScopedIdCodec
 
 
-def _run_input() -> RunAgentInput:
-    return RunAgentInput.model_validate(
-        {
-            "threadId": "thread-1",
-            "runId": "run-1",
-            "state": {},
-            "messages": [],
-            "tools": [],
-            "context": [],
-            "forwardedProps": {},
-        }
-    )
-
-
-def _run_id() -> str:
-    return "run-1"
+def _identity() -> Identity:
+    return Identity(threadId="thread-1", runId="run-1")
 
 
 def _root_tool_id(raw_id: str) -> str:
@@ -88,7 +73,7 @@ def test_task_raw_filters_provider_reasoning_in_every_phase(
     expose_reasoning_events: bool,
 ) -> None:
     adapter = DeepAgentAgUiAdapter(
-        _run_id(), expose_reasoning_events=expose_reasoning_events
+        identity=_identity(), expose_reasoning_events=expose_reasoning_events
     )
 
     events = [
@@ -120,7 +105,7 @@ def test_task_tool_args_are_preserved_as_operational_data() -> None:
         "reasoning_content": "TOP-BUSINESS",
         "type": "thinking",
     }
-    adapter = DeepAgentAgUiAdapter(_run_id())
+    adapter = DeepAgentAgUiAdapter(identity=_identity())
 
     raw = adapter.process(
         {
@@ -147,7 +132,7 @@ def test_task_tool_args_are_preserved_as_operational_data() -> None:
 
 
 def test_duplicate_tool_message_emits_result_exactly_once() -> None:
-    adapter = DeepAgentAgUiAdapter(_run_id())
+    adapter = DeepAgentAgUiAdapter(identity=_identity())
     part = {
         "type": "messages",
         "ns": (),
@@ -174,7 +159,7 @@ def test_duplicate_tool_message_emits_result_exactly_once() -> None:
 
 
 def test_conflicting_duplicate_tool_message_fails_correlation() -> None:
-    adapter = DeepAgentAgUiAdapter(_run_id())
+    adapter = DeepAgentAgUiAdapter(identity=_identity())
 
     def part(content: str) -> dict[str, object]:
         return {
@@ -197,7 +182,7 @@ def test_conflicting_duplicate_tool_message_fails_correlation() -> None:
 
 
 def test_nameless_tool_message_uses_the_correlated_streamed_tool_name() -> None:
-    adapter = DeepAgentAgUiAdapter(_run_id())
+    adapter = DeepAgentAgUiAdapter(identity=_identity())
     adapter.process(
         {
             "type": "messages",
@@ -300,7 +285,7 @@ def test_resume_task_start_supplies_canonical_name_for_nameless_result_replays()
     None
 ):
     adapter = DeepAgentAgUiAdapter(
-        _run_id(),
+        identity=_identity(),
         prior_tool_call_ids=frozenset({_root_tool_id("call-approved")}),
     )
     adapter.process(
@@ -334,7 +319,7 @@ def test_resume_task_start_supplies_canonical_name_for_nameless_result_replays()
 
 def test_wrong_explicit_result_name_is_atomic_before_nameless_retry() -> None:
     adapter = DeepAgentAgUiAdapter(
-        _run_id(),
+        identity=_identity(),
         prior_tool_call_ids=frozenset({_root_tool_id("call-approved")}),
     )
     adapter.process(
@@ -360,7 +345,7 @@ def test_wrong_explicit_result_name_is_atomic_before_nameless_retry() -> None:
 
 def test_consumed_prior_tool_id_cannot_silently_restart() -> None:
     adapter = DeepAgentAgUiAdapter(
-        _run_id(),
+        identity=_identity(),
         prior_tool_call_ids=frozenset({_root_tool_id("call-approved")}),
     )
     adapter.process(
@@ -399,7 +384,7 @@ def test_consumed_prior_tool_id_cannot_silently_restart() -> None:
 
 def test_nameless_task_result_preserves_subagent_related_namespace() -> None:
     adapter = DeepAgentAgUiAdapter(
-        _run_id(),
+        identity=_identity(),
         prior_tool_call_ids=frozenset({_root_tool_id("call-task")}),
     )
     adapter.process(
@@ -425,7 +410,7 @@ def test_nameless_task_result_preserves_subagent_related_namespace() -> None:
 
 
 def test_native_task_starts_reject_scoped_tool_id_reuse_atomically() -> None:
-    adapter = DeepAgentAgUiAdapter(_run_id())
+    adapter = DeepAgentAgUiAdapter(identity=_identity())
     adapter.process(
         _native_tool_start(
             graph_task_id="native-first",
@@ -452,7 +437,7 @@ def test_native_task_starts_reject_scoped_tool_id_reuse_atomically() -> None:
 
 
 def test_native_task_start_rejects_duplicate_same_name_ids_atomically() -> None:
-    adapter = DeepAgentAgUiAdapter(_run_id())
+    adapter = DeepAgentAgUiAdapter(identity=_identity())
     duplicate = _native_tool_start(
         graph_task_id="native-duplicate",
         tool_name="read_file",
@@ -486,7 +471,7 @@ async def test_task_error_does_not_create_a_second_main_terminal() -> None:
         yield _task(phase="result", secret="result")
 
     events = [
-        event async for event in astream_events(parts=parts(), run_input=_run_input())
+        event async for event in astream_events(parts=parts(), identity=_identity())
     ]
 
     assert len([event for event in events if isinstance(event, RunStartedEvent)]) == 1
