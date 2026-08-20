@@ -1,0 +1,30 @@
+flowchart TD
+    A["ConfirmedPlan"] --> B["选择 current_stage_id"]
+    B --> C["ExecuteStage Adapter"]
+    C --> D["传入计划摘要、当前阶段、约束和证据"]
+    D --> E["DeepAgent 子图"]
+    E --> F["内部 Todo / Tool / SubAgent"]
+    F --> G["StageOutcome + evidence + artifacts"]
+    G --> H{"Stage Guard"}
+
+    H -->|"completed"| I["完成 StageRun"]
+    I --> J{"还有阶段？"}
+    J -->|"有"| B
+    J -->|"没有"| K{"Final Guard"}
+
+    H -->|"needs_input"| L["Stage / Tool Interrupt"]
+    L -->|"resume"| E
+
+    H -->|"retryable_error"| M["增加 attempt 并重试"]
+    M --> E
+
+    H -->|"blocked / plan_invalid"| N["进入 Replan"]
+
+    K -->|"自动通过"| Z(["COMPLETED"])
+    K -->|"需要用户验收"| O["Final Review Interrupt"]
+    O -->|"approve"| Z
+    O -->|"feedback"| N
+
+    K -->|"局部缺陷"| P["定位失败 Stage"]
+    P --> B
+    K -->|"计划失效"| N

@@ -1,0 +1,46 @@
+flowchart TD
+    A(["用户请求"]) --> B{"plan 是否开启？"}
+
+    B -->|"否"| C["现有 DeepAgent Graph"]
+    C --> Z(["返回结果"])
+
+    B -->|"是"| D["Gate：意图、复杂度、风险"]
+    D -->|"direct"| C
+    D -->|"clarify"| E["Clarify Interrupt"]
+    D -->|"plan"| G["Planner 生成 PlanDraft"]
+
+    E -->|"respond"| F["合并 Requirements"]
+    F --> D
+    E -->|"cancel"| X(["CANCELLED"])
+
+    G --> H{"ValidateDraft"}
+    H -->|"缺少输入"| E
+    H -->|"可自动修复"| G
+    H -->|"有效"| I["Plan Review Interrupt"]
+
+    I -->|"edit / respond"| G
+    I -->|"reject"| X
+    I -->|"approve"| J["冻结 ConfirmedPlan"]
+
+    J --> K["Dispatch 当前 Stage"]
+    K --> L["DeepAgent 执行当前阶段"]
+    L -->|"触发审批"| M["Tool / Stage Interrupt"]
+    M -->|"Command resume"| L
+    L -->|"StageOutcome"| N{"Stage Guard"}
+
+    N -->|"retryable"| R["按预算重试"]
+    R --> L
+    N -->|"plan_invalid"| S["生成修订版 PlanDraft"]
+    S --> H
+    N -->|"completed"| O{"还有 Stage？"}
+
+    O -->|"有"| K
+    O -->|"没有"| P{"Final Guard"}
+
+    P -->|"局部缺陷"| K
+    P -->|"计划失效"| S
+    P -->|"需要用户验收"| Q["Final Review Interrupt"]
+    P -->|"自动通过"| Y(["COMPLETED"])
+
+    Q -->|"approve"| Y
+    Q -->|"feedback"| S

@@ -1,0 +1,28 @@
+flowchart TD
+    A["Planner"] --> B["生成 PlanDraft v1"]
+    B --> C{"确定性校验"}
+
+    C -->|"Schema 或依赖错误"| D["自动修复"]
+    D --> C
+
+    C -->|"缺少关键输入"| E["Clarify Interrupt"]
+    E -->|"respond"| F["ApplyAnswer"]
+    F --> A
+
+    C -->|"有效"| G["Plan Review Interrupt"]
+    G --> H{"用户决策"}
+
+    H -->|"edit"| I["完整草稿 + base_revision"]
+    I --> J{"版本匹配？"}
+    J -->|"否"| K["返回版本冲突"]
+    K --> G
+    J -->|"是"| L["生成 Draft vNext"]
+    L --> C
+
+    H -->|"respond"| M["按自然语言反馈修订"]
+    M --> L
+
+    H -->|"reject"| X(["停止规划"])
+    H -->|"approve"| N["冻结 ConfirmedPlan"]
+    N --> O["创建独立 PlanRun"]
+    O --> P(["开始执行"])

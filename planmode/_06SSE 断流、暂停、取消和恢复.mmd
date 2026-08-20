@@ -1,0 +1,25 @@
+flowchart TD
+    A(["RUNNING"]) --> B{"外部事件"}
+
+    B -->|"SSE 断开"| C["Graph 继续运行"]
+    C --> D["事件持久化"]
+    D --> E["客户端按游标重连"]
+    E --> A
+
+    B -->|"pause_request"| F["设置暂停标记"]
+    F --> G["等待工具或 Stage 安全边界"]
+    G --> H(["PAUSED"])
+    H -->|"resume"| A
+
+    B -->|"cancel_request"| I["取消活动协程"]
+    I --> J["保留最后提交的 Checkpoint"]
+    J --> K(["CANCELLED"])
+
+    B -->|"进程重启"| L["按 workflow_version 重建 Graph"]
+    L --> M["加载 user + agent + thread Checkpoint"]
+    M --> N{"存在 pending interrupt？"}
+
+    N -->|"是"| O["重新返回审批状态"]
+    O --> A
+    N -->|"否"| P["从最后安全边界继续"]
+    P --> A
