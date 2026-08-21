@@ -19,6 +19,7 @@ from typing_extensions import Unpack
 from tinkerfin_agui_adapter import Identity
 
 from .agui_resume import AgUiResumeBinding
+from .plan import AgentMode
 from .runtime import AgUiEventStream, EventObserver, NativeGraphRunStream, PartObserver
 
 class DeepAgentRuntime(Generic[ContextT]):
@@ -63,12 +64,17 @@ class DeepAgentAgUiRuntime(Generic[ContextT]):
 
 class DeepAgentDefinition(Generic[ContextT]):
     def new(
-        self, *, identity: Identity, on_part: PartObserver[object] | None = None
+        self,
+        *,
+        identity: Identity,
+        mode: AgentMode | None = None,
+        on_part: PartObserver[object] | None = None,
     ) -> DeepAgentRuntime[ContextT]: ...
     def new_agui(
         self,
         *,
         identity: Identity,
+        mode: AgentMode | None = None,
         on_part: PartObserver[Mapping[str, object]] | None = None,
         timeout: float | None = None,
         settlement_timeout: float | None = None,

@@ -49,11 +49,77 @@ agent = tinkerfin.create_deep_agent(
 
 Interrupts require a checkpointer. A backend or middleware that relies on a store also needs the corresponding `store` argument.
 
+## Review a Plan before execution
+
+Use Plan Mode when a request may need clarification or a reviewed multi-step Plan. The
+capability belongs to TinkerFin, so the Deep Agents factory keeps its installed
+parameter list.
+
+```python
+from langgraph.checkpoint.memory import MemorySaver
+from tinkerfin import TinkerFin
+
+
+tinkerfin = TinkerFin(state_schema=AppState)
+agent = tinkerfin.plan(
+    enabled=True,
+    default_mode="default",
+    gate_model="openai:gpt-5.4-mini",
+    planner_model="openai:gpt-5.4",
+).create_deep_agent(
+    model="openai:gpt-5.4",
+    tools=[search_orders],
+    checkpointer=MemorySaver(),
+)
+```
+
+`.plan(...)` returns a new TinkerFin factory and does not modify `tinkerfin`. It retains
+the same run coordinator and global state schema, and every Definition freezes the
+capability options of the factory that created it. `gate_model` and `planner_model` are
+optional; each falls back to the Deep Agent model when omitted.
+
+Plan Mode routes a request through these boundaries:
+
+1. A conservative Gate chooses direct execution, clarification, or planning.
+2. The Planner can use only `ls`, `read_file`, `glob`, and `grep`.
+3. Clarification can provide model-generated single-select options and an optional
+   custom answer; clarification and plan review pause through LangGraph interrupts.
+4. Approval freezes a `ConfirmedPlan` and passes it to the configured Deep Agent in its
+   system request.
+
+A concrete `BaseCheckpointSaver` and an explicit model are required. The parent Plan
+workflow attaches the supplied checkpointer, store, and cache; all child graphs inherit
+them. Keep the same `Identity.threadId` when resuming. Plan state appears at the root
+`tinkerfin_plan` key, and public models such as `PlanDraft`, `ConfirmedPlan`, and
+`PlanState` are exported from `tinkerfin.plan`.
+
+Plan Mode fixes checkpoint durability to `sync`. Omitting `durability` is recommended;
+passing `sync` is also accepted, while `async` and `exit` fail before streaming.
+
+Choose the current request on Runtime creation:
+
+```python
+plan_runtime = agent.new(
+    identity=Identity(threadId="project-7", runId="run-1"),
+    mode="plan",
+)
+default_runtime = agent.new_agui(
+    identity=Identity(threadId="project-7", runId="run-2"),
+    mode="default",
+)
+```
+
+Both requests use the same Plan-capable topology and state schema. `default` bypasses
+the Gate, while `plan` enters it. A later request on the same checkpoint thread can
+choose either mode. Mode does not become an application state field. Do not resume a
+Plan-capable checkpoint with an ordinary Definition.
+
 ## Create one native Runtime
 
 ```python
 runtime = agent.new(
     identity=Identity(threadId="project-7", runId="run-1"),
+    mode="default",
     on_part=None,
 )
 ```
@@ -61,6 +127,7 @@ runtime = agent.new(
 | Parameter | Default | Purpose |
 | --- | --- | --- |
 | `identity` | required | Thread and run identity used by checkpointing and coordination |
+| `mode` | Definition default | `default` or `plan`; ordinary Definitions accept only `default` |
 | `on_part` | `None` | Observer called before each native part reaches the consumer |
 
 ## Start the run
@@ -98,7 +165,7 @@ You normally omit `configurable.thread_id`. An explicitly equal value is accepte
 | --- | --- | --- |
 | `interrupt_before` | `None` | Pauses before selected nodes |
 | `interrupt_after` | `None` | Pauses after selected nodes |
-| `durability` | `None` | Controls checkpoint persistence timing |
+| `durability` | `None` | Controls checkpoint persistence timing; Plan Mode requires `sync` |
 | `control` | `None` | Supplies LangGraph run control data |
 | Extra keyword arguments | none | Current additional LangGraph run options |
 

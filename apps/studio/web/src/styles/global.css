@@ -60,6 +60,8 @@
   --composer-vignette: linear-gradient(180deg, rgba(255,255,255,0) 0%, rgba(255,255,255,.66) 34%, rgba(255,255,255,.94) 70%, #fff 100%);
   --empty-mark-gradient: linear-gradient(180deg, #fbfbfc 0%, #f2f2f3 100%);
   --approval-gradient: linear-gradient(180deg, #fff 0%, #fff8f8 100%);
+  --plan-gradient: linear-gradient(145deg, rgba(57,135,221,.08) 0%, #fff 48%, rgba(22,163,122,.055) 100%);
+  --plan-line: rgba(57,135,221,.24);
   --subagent-gradient: linear-gradient(90deg, rgba(22,163,122,.085) 0%, rgba(22,163,122,.025) 58%, transparent 100%);
   --skeleton-base: #e8e8ea;
   --skeleton-highlight: #f3f3f4;
@@ -121,6 +123,8 @@
     --composer-vignette: linear-gradient(180deg, rgba(17,16,20,0) 0%, rgba(17,16,20,.72) 34%, rgba(17,16,20,.96) 70%, #111014 100%);
     --empty-mark-gradient: linear-gradient(180deg, #26242b 0%, #1c1b20 100%);
     --approval-gradient: linear-gradient(180deg, #1c1b20 0%, #271a1e 100%);
+    --plan-gradient: linear-gradient(145deg, rgba(117,182,255,.13) 0%, #1c1b20 50%, rgba(85,211,165,.08) 100%);
+    --plan-line: rgba(117,182,255,.3);
     --subagent-gradient: linear-gradient(90deg, rgba(85,211,165,.12) 0%, rgba(85,211,165,.035) 58%, transparent 100%);
     --skeleton-base: #2a282f;
     --skeleton-highlight: #37343d;
@@ -523,6 +527,41 @@ time,
 .approval-card.is-complete { display: flex; align-items: center; gap: 11px; padding: 14px 15px; border-color: var(--green-line); background: var(--surface-success); }
 .approval-complete-icon { display: grid; place-items: center; width: 31px; height: 31px; border-radius: 50%; background: var(--green); color: var(--text-on-green); }
 .approval-card.is-complete p { margin: 3px 0 0; color: var(--text-muted); font-size: var(--type-meta-size); }
+.plan-card { margin: 0 0 22px; overflow: hidden; border: 1px solid var(--plan-line); border-radius: 14px; background: var(--plan-gradient); box-shadow: 0 12px 30px -22px rgba(57,135,221,.38); }
+.plan-card-head { padding: 17px 17px 12px; border-bottom: 1px solid var(--border-subtle); }
+.plan-card-head .eyebrow { color: var(--blue); }
+.plan-card-head h3 { margin: 7px 0 4px; color: var(--text-h); font-size: var(--type-title-size); line-height: var(--type-title-line-height); }
+.plan-card-head p { margin: 0; color: var(--text-muted); font-size: var(--type-meta-size); line-height: var(--type-meta-line-height); }
+.plan-question-list { display: grid; gap: 14px; padding: 15px 17px; }
+.plan-question-fieldset { display: grid; gap: 10px; min-width: 0; margin: 0; padding: 0; border: 0; }
+.plan-question-fieldset legend { display: flex; align-items: flex-start; gap: 9px; color: var(--text-h); font-size: var(--type-ui-small-size); font-weight: 600; line-height: 1.45; }
+.plan-question-fieldset legend > span { display: grid; flex: 0 0 auto; place-items: center; width: 22px; height: 22px; border-radius: 7px; background: var(--surface-info); color: var(--blue); font-family: var(--font-mono); font-size: var(--type-caption-size); }
+.plan-option-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 8px; padding-left: 31px; }
+.plan-option { display: flex; align-items: flex-start; gap: 9px; padding: 10px 11px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-elevated); cursor: pointer; transition: border-color .16s ease, background .16s ease, transform .16s ease; }
+.plan-option:hover { border-color: var(--plan-line); transform: translateY(-1px); }
+.plan-option:has(input:checked) { border-color: var(--blue); background: var(--surface-info); }
+.plan-option input { margin-top: 2px; accent-color: var(--blue); }
+.plan-option span { display: grid; gap: 3px; min-width: 0; }
+.plan-option strong { color: var(--text-strong); font-size: var(--type-meta-size); }
+.plan-option small { color: var(--text-muted); font-size: var(--type-caption-size); line-height: 1.4; }
+.plan-custom-answer, .plan-review-input { display: grid; gap: 6px; padding-left: 31px; color: var(--text-strong); font-size: var(--type-meta-size); font-weight: 600; }
+.plan-custom-answer textarea, .plan-review-input textarea { width: 100%; resize: vertical; padding: 10px 11px; border: 1px solid var(--border); border-radius: 9px; outline: 0; background: var(--surface-subtle); color: var(--form-control-text); font-weight: 400; line-height: 1.5; }
+.plan-custom-answer textarea:focus, .plan-review-input textarea:focus { border-color: var(--blue); box-shadow: 0 0 0 3px var(--focus-ring-soft); }
+.plan-card-error { margin: 0 17px 12px; color: var(--red-strong); font-size: var(--type-meta-size); font-weight: 600; }
+.plan-card-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 17px; border-top: 1px solid var(--border-subtle); color: var(--text-muted); font-size: var(--type-caption-size); }
+.plan-card-footer span { display: inline-flex; align-items: center; gap: 6px; }
+.plan-card-footer button, .plan-review-actions button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 34px; padding: 7px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-elevated); font-size: var(--type-meta-size); font-weight: 600; }
+.plan-card-footer .primary, .plan-review-actions .primary { border-color: var(--button-primary); background: var(--button-primary); color: var(--button-primary-text); }
+.plan-card-footer button:disabled { cursor: default; opacity: .45; }
+.plan-step-list { display: grid; gap: 0; margin: 0; padding: 5px 17px; list-style: none; }
+.plan-step-list li { display: grid; grid-template-columns: 34px 1fr; gap: 10px; padding: 12px 0; border-bottom: 1px solid var(--border-subtle); }
+.plan-step-list li:last-child { border-bottom: 0; }
+.plan-step-list li > span { color: var(--blue); font-family: var(--font-mono); font-size: var(--type-caption-size); font-weight: 700; }
+.plan-step-list strong { color: var(--text-strong); font-size: var(--type-ui-small-size); }
+.plan-step-list p { margin: 4px 0 0; color: var(--text-muted); font-size: var(--type-meta-size); line-height: var(--type-meta-line-height); }
+.plan-review-actions { display: grid; grid-template-columns: repeat(4, 1fr); gap: 7px; padding: 11px 17px 14px; }
+.plan-review-actions button.is-selected { border-color: var(--blue); background: var(--surface-info); color: var(--text-strong); }
+.plan-review-input { margin: 0 17px 14px; padding-left: 0; }
 .error-message { display: flex; gap: 10px; margin: 0 0 20px; padding: 12px 14px; border: 1px solid var(--red-line); border-radius: 10px; background: var(--surface-danger-soft); color: var(--red-strong); }
 .error-message strong { font-size: var(--type-meta-size); }
 .error-markdown { margin-top: 2px; font-size: var(--type-caption-size); line-height: var(--type-caption-line-height); }

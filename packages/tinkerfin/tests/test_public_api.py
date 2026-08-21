@@ -48,6 +48,7 @@ def test_top_level_exposes_the_stateless_runtime_contract() -> None:
         "AgUiNativeStreamInvocation",
         "AgUiEventStream",
         "AgUiResumeBinding",
+        "AgentMode",
         "DeepAgentAgUiRuntime",
         "DeepAgentDefinition",
         "DeepAgentRuntime",
@@ -111,7 +112,7 @@ def test_top_level_exposes_the_stateless_runtime_contract() -> None:
 def test_factory_has_no_application_resource_lifecycle() -> None:
     constructor = inspect.signature(TinkerFin).parameters
 
-    assert tuple(constructor) == ("run_coordinator",)
+    assert tuple(constructor) == ("run_coordinator", "state_schema")
     assert not hasattr(TinkerFin, "__aenter__")
     assert not hasattr(TinkerFin, "__aexit__")
 

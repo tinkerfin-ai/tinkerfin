@@ -16,6 +16,7 @@ packages/
 apps/studio/
 ├── server/                    Studio 服务端
 └── web/                       Studio Web 应用
+docs/                          中文与英文使用文档
 ```
 
 ## 安装
@@ -68,6 +69,12 @@ asyncio.run(main())
 
 - `create_deep_agent(...)` 记录 Deep Agents 建图参数，`new()` / `new_agui()` 创建新
   Graph 和单次使用的 Runtime
+- `TinkerFin(state_schema=...)` 为该 factory 创建的所有 Deep Agent Definition 提供
+  应用级 state；Definition state 与 middleware state 会在不破坏 reducer 和必填语义的
+  前提下自动组合
+- `.plan(enabled=True)` 在不改变 Deep Agents `create_deep_agent(...)` 参数的前提下
+  创建稳定父工作流；每次 `new()` / `new_agui()` 通过 `mode="default"` 或
+  `mode="plan"` 选择本轮路径，并且必须提供具体 checkpointer
 - AG-UI 固定使用 v2 `messages`、`tasks`、`values` 和 `subgraphs=True`，非法参数会在
   迭代及生命周期事件开始前失败
 - Runtime 与 Adapter 负责保证事件顺序、子 Agent 来源、interrupt/resume、推理隐私、

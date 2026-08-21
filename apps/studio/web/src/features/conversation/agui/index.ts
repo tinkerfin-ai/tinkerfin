@@ -3,6 +3,8 @@ export {
   applyHistoryEventEnvelope,
   applyLiveEventEnvelope,
   buildInitialPayload,
+  buildPlanAbandonPayload,
+  buildPlanResumePayload,
   buildResumePayload,
   createRunId,
   markConversationDetached,

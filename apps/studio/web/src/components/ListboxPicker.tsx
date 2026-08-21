@@ -20,6 +20,7 @@ interface ListboxPickerProps<T extends string> {
   triggerClassName: string
   listboxClassName: string
   optionClassName?: string
+  disabled?: boolean
   renderTrigger: (value: T) => ReactNode
   renderOption: (option: T, selected: boolean) => ReactNode
 }
@@ -37,6 +38,7 @@ export function ListboxPicker<T extends string>({
   triggerClassName,
   listboxClassName,
   optionClassName,
+  disabled = false,
   renderTrigger,
   renderOption,
 }: ListboxPickerProps<T>) {
@@ -52,6 +54,10 @@ export function ListboxPicker<T extends string>({
     onOpenChange(false)
     triggerRef.current?.focus()
   }
+
+  useEffect(() => {
+    if (disabled && open) onOpenChange(false)
+  }, [disabled, onOpenChange, open])
 
   useLayoutEffect(() => {
     if (!open) return
@@ -118,6 +124,7 @@ export function ListboxPicker<T extends string>({
         aria-haspopup="listbox"
         aria-expanded={open}
         aria-controls={open ? listboxId : undefined}
+        disabled={disabled}
         onClick={() => onOpenChange(!open)}
       >
         {renderTrigger(value)}

@@ -8,14 +8,40 @@
 
 | API | 什么时候用 | 主要参数或结果 |
 | --- | --- | --- |
-| `TinkerFin(run_coordinator=None)` | 创建统一入口 | 可选共享 coordinator |
+| `TinkerFin(run_coordinator=None, state_schema=None)` | 创建统一入口 | 可选共享 coordinator 和 Definition 级 state |
+| `TinkerFin.plan(...)` | 创建不可变的 Plan-capable factory | 能力开关、请求默认 mode、可选 Gate/Planner 模型 |
 | `TinkerFin.create_deep_agent(...)` | 创建可重复生成 Runtime 的 Agent 定义 | 参数见[创建和运行 Deep Agent](deep-agents.md) |
 | `Identity(threadId=..., runId=...)` | 表示一次框架运行 | 只包含 thread 和 run |
 | `TinkerFin.run(...)` | 运行自己的异步事件源 | `source_factory`、`identity`、`on_part` |
-| `DeepAgentDefinition.new(...)` | 创建原生 Runtime | 必填 `identity`，可选 `on_part` |
-| `DeepAgentDefinition.new_agui(...)` | 创建 AG-UI Runtime | 详见 [AG-UI 入门](../agui/index.md) |
+| `DeepAgentDefinition.new(...)` | 创建原生 Runtime | 必填 `identity`，可选本次请求 `mode` 和 `on_part` |
+| `DeepAgentDefinition.new_agui(...)` | 创建 AG-UI Runtime | 可选本次请求 `mode`；详见 [AG-UI 入门](../agui/index.md) |
 
 `DeepAgentDefinition` 可以重复使用。`DeepAgentRuntime`、`DeepAgentAgUiRuntime`、`TinkerFinRun` 和 `NativeTinkerFinRun` 都是一次性运行对象，不要自行构造。
+
+`.plan(enabled=True)` 只影响从返回 factory 创建的 Definition，不会给
+`create_deep_agent(...)` 增加参数。返回 factory 保留 coordinator 和全局 state schema。
+Plan Definition 必须提供明确模型和具体 `BaseCheckpointSaver`；配置不合法时抛出
+`tinkerfin.plan.PlanModeConfigurationError`。
+
+每次 `new()` 或 `new_agui()` 通过 `mode="default"` 或 `mode="plan"` 选择当前路径；省略时
+使用 `.plan(default_mode=...)`。Plan-capable Definition 在两种 mode 下保持同一 topology
+和 state schema，因此同一 checkpoint thread 可以在后续请求切换。普通 Definition 只接受
+`default`。mode 是框架请求控制数据，不会进入调用方 state；覆盖框架保留 configurable 会在
+流开始前失败。
+
+## Plan Mode 数据
+
+顶层包导出 `AgentMode`。`tinkerfin.plan` 导出 `PlanStep`、`PlanDraft`、
+`ConfirmedPlan`、`ClarificationOption`、`ClarificationQuestion`、
+`RequirementAnswer`、`PlanState`、`PlanStatus`、`PlanRoute` 和 `PlanReviewAction`。
+这些模型不可变。根 Graph 状态把完整 JSON 数据以 camel case 保存在
+`tinkerfin_plan` 字段。
+
+`TinkerFin(state_schema=...)` 为该 factory 创建的每个 Deep Agent Definition 提供应用级
+state，并与 `create_deep_agent(state_schema=...)`、middleware 的公开扩展、Deep Agents
+文件字段和 Todo 字段组合。reducer、`Required` / `NotRequired` 和 schema metadata 会保留；
+同名字段合同不兼容时在创建 Definition 时失败。运行时 `context_schema` 仍是独立且不进入
+checkpoint 的 context 合同。
 
 ## 流对象
 
@@ -92,6 +118,7 @@
 | API | 什么时候遇到 |
 | --- | --- |
 | `AgUiResumeBinding` | 恢复被 interrupt 暂停的 AG-UI 运行 |
+| `tinkerfin.plan.PlanModeConfigurationError` | Plan Definition 缺少具体 saver 或明确模型、state schema 不兼容，或使用了非 sync durability |
 | `AgUiSettlementTimeoutError` | 调用方停止等待，但 Runtime 的清理仍未在限定时间内完成 |
 | `AgUiNativeStreamConfigurationError` | 原生流配置不符合 AG-UI 转换要求 |
 

@@ -16,6 +16,7 @@ from deepagents.graph import create_deep_agent
 from langgraph.graph.state import CompiledStateGraph
 
 from tinkerfin.deep_agent import DeepAgentDefinition
+from tinkerfin.runtime import TinkerFin as RuntimeTinkerFin
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 _REPOSITORY_ROOT = _PACKAGE_ROOT.parents[1]
@@ -118,6 +119,7 @@ from typing_extensions import Unpack
 from tinkerfin_agui_adapter import Identity
 
 from .agui_resume import AgUiResumeBinding
+from .plan import AgentMode
 from .runtime import AgUiEventStream, EventObserver, NativeGraphRunStream, PartObserver
 
 class DeepAgentRuntime(Generic[ContextT]):
@@ -173,6 +175,7 @@ from .errors import TinkerFinError as TinkerFinError
 from .errors import TinkerFinErrorCode as TinkerFinErrorCode
 from .errors import TinkerFinLifecycleError as TinkerFinLifecycleError
 from .errors import TinkerFinStreamProtocolError as TinkerFinStreamProtocolError
+from .plan import AgentMode as AgentMode
 from .runtime import AgUiEventStream as AgUiEventStream
 from .runtime import AgUiNativeStreamConfig as AgUiNativeStreamConfig
 from .runtime import AgUiNativeStreamConfigurationError as AgUiNativeStreamConfigurationError
@@ -193,6 +196,7 @@ from .runtime import TinkerFin as _RuntimeTinkerFin
 from .runtime import TinkerFinRun as TinkerFinRun
 
 class TinkerFin(_RuntimeTinkerFin):
+{_method(RuntimeTinkerFin.plan, return_type="TinkerFin")}
 {_method(create_deep_agent, add_self=True, return_type="DeepAgentDefinition[ContextT]")}
 
 __all__: list[str]

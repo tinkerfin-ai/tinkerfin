@@ -16,6 +16,7 @@ class TinkerFinErrorCode(StrEnum):
     ERROR = "tinkerfin.error"
     LIFECYCLE_ERROR = "tinkerfin.lifecycle_error"
     STREAM_PROTOCOL_ERROR = "tinkerfin.stream_protocol_error"
+    PLAN_MODE_CONFIGURATION = "tinkerfin.plan_mode_configuration"
     AGUI_NATIVE_STREAM_CONFIGURATION = "tinkerfin.agui_native_stream_configuration"
     AGUI_SETTLEMENT_TIMEOUT = "tinkerfin.agui_settlement_timeout"
     RUN_COORDINATION_FAILED = "tinkerfin.run_coordination_failed"

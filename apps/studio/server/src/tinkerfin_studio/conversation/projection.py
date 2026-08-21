@@ -157,7 +157,10 @@ class ConversationProjector:
         thread.snapshot_json = snapshot
         thread.last_run_id = envelope.identity.run_id
         thread.status = self._thread_status(snapshot)
-        thread.has_pending_interrupt = snapshot.get("approval") is not None
+        pending_interrupts = snapshot.get("interrupts")
+        thread.has_pending_interrupt = bool(
+            isinstance(pending_interrupts, list) and pending_interrupts
+        )
         thread.message_count = sum(
             1
             for message in cast(list[dict[str, object]], snapshot["messages"])

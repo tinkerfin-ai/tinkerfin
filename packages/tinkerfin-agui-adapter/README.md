@@ -87,6 +87,9 @@ ownership.
   and value. The terminal boundary publishes root state, then a root-first
   namespace-scoped message snapshot, then one interrupt outcome. A replay of the same
   child interrupt set must carry the identical message snapshot for that namespace.
+- Versioned `RuntimeInterruptEnvelope` values map to AG-UI interrupts without a Tool
+  ID. Their trusted envelope, response schema, and native ID are persisted for generic
+  resume translation; one batch cannot mix runtime and Tool interrupts.
 - `prior_tool_call_ids` accepts complete `tf:tool:...` scoped IDs and lets a resumed
   host publish a child Tool result without synthesizing another start/args/end.
 - Conversion pulls with bounded lookahead and closes an upstream iterator exposing
@@ -102,6 +105,12 @@ checkpointer. Never pass client-supplied interrupt payloads to that method.
 Both paths distinguish resolved, abandoned, and mixed decisions and never convert
 cancellation into rejection. `encode_sse(event, event_id=...)` encodes one event;
 delivery, persistence, retries, and transport cancellation remain caller-owned.
+
+`RuntimeInterruptEnvelope` is intended for framework workflows such as Plan review.
+`ResumeMapper` validates trusted persisted correlation and full resume coverage, then
+passes the resolved JSON object through as native `Command(resume=...)` data. The graph
+that emitted the envelope remains responsible for domain validation such as revision
+checks.
 
 ## Documentation
 

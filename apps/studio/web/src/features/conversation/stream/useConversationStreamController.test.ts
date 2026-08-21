@@ -57,6 +57,7 @@ const conversation = (overrides: Partial<Conversation> = {}): Conversation => ({
   lastSeq: 0,
   isHydrated: true,
   ...overrides,
+  mode: overrides.mode ?? 'default',
 })
 
 async function* streamItems(

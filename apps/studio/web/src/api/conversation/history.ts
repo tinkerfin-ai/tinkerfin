@@ -1,9 +1,11 @@
 import type {
   ApprovalAllowedDecision,
   ApprovalState,
+  AgentMode,
   ConversationRunStatus,
   JsonObject,
   Message,
+  PlanInteraction,
   TodoItem,
 } from '../../types'
 import { requestJson } from '../shared/http'
@@ -35,7 +37,9 @@ export interface ConversationSnapshotJson {
   snapshotVersion: 2
   messages: Message[]
   todos: TodoItem[]
+  mode: AgentMode
   approval: ApprovalState | null
+  planInteraction?: PlanInteraction | null
   runStatus: ConversationRunStatus
   activeRunId?: string | null
   serverState: JsonObject
@@ -69,6 +73,8 @@ export interface ConversationSnapshotInterrupt {
   reason: string
   toolCallId?: string | null
   message?: string | null
+  responseSchema?: JsonObject | null
+  metadata?: JsonObject | null
   toolName?: string | null
   allowedDecisions: ApprovalAllowedDecision[]
   originalArgs: JsonObject

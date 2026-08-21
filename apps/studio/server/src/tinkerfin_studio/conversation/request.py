@@ -23,7 +23,7 @@ class ConversationForwardedProps(BaseModel):
 
     model: str = Field(min_length=1, max_length=64, description="数据库模型稳定 ID")
     mode: Literal["default", "plan"] = Field(
-        default="default", description="前端 Agent 模式，仅透传不参与业务分支"
+        default="default", description="当前请求使用的 Agent 运行模式"
     )
 
 

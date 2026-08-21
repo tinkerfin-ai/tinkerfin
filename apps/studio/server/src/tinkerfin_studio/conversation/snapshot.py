@@ -18,6 +18,7 @@ def empty_snapshot() -> dict[str, object]:
         "snapshotVersion": 2,
         "messages": [],
         "todos": [],
+        "mode": "default",
         "approval": None,
         "runStatus": "idle",
         "activeRunId": None,
@@ -267,6 +268,14 @@ def reduce_snapshot(
             snapshot["runStatus"] = "streaming"
             snapshot["activeRunId"] = event_run_id
             if run_input is not None:
+                forwarded_props = run_input.get("forwardedProps")
+                mode = (
+                    forwarded_props.get("mode")
+                    if isinstance(forwarded_props, dict)
+                    else None
+                )
+                if mode in {"default", "plan"}:
+                    snapshot["mode"] = mode
                 messages = run_input.get("messages")
                 if isinstance(messages, list):
                     for item in messages:
@@ -452,25 +461,32 @@ def reduce_snapshot(
                     if isinstance(interrupts, list)
                     else []
                 )
-                items = [
-                    {
-                        "id": str(item.get("id", "")),
-                        "interruptId": str(item.get("id", "")),
-                        "toolCallId": item.get("toolCallId"),
-                        "toolName": _tool_name(item),
-                        "params": str(_tool_args(item)),
-                        "input": str(_tool_args(item)),
-                        "description": str(item.get("message", "")),
-                        "originalArgs": _tool_args(item),
-                        "allowedDecisions": _allowed_decisions(item),
+                plan_reasons = {"plan_clarification", "plan_review"}
+                is_plan_interrupt = bool(public_interrupts) and all(
+                    item.get("reason") in plan_reasons for item in public_interrupts
+                )
+                if is_plan_interrupt:
+                    snapshot["approval"] = None
+                else:
+                    items = [
+                        {
+                            "id": str(item.get("id", "")),
+                            "interruptId": str(item.get("id", "")),
+                            "toolCallId": item.get("toolCallId"),
+                            "toolName": _tool_name(item),
+                            "params": str(_tool_args(item)),
+                            "input": str(_tool_args(item)),
+                            "description": str(item.get("message", "")),
+                            "originalArgs": _tool_args(item),
+                            "allowedDecisions": _allowed_decisions(item),
+                        }
+                        for item in public_interrupts
+                    ]
+                    snapshot["approval"] = {
+                        "items": items,
+                        "activeIndex": 0,
+                        "submitted": False,
                     }
-                    for item in public_interrupts
-                ]
-                snapshot["approval"] = {
-                    "items": items,
-                    "activeIndex": 0,
-                    "submitted": False,
-                }
                 snapshot["interrupts"] = public_interrupts
                 snapshot["runStatus"] = "waiting_approval"
             else:

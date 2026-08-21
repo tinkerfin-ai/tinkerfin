@@ -58,6 +58,7 @@ Do not inject a complete frontend history into a Graph that already has checkpoi
 | Parameter | Default | Purpose |
 | --- | --- | --- |
 | `identity` | required | Thread and run identity |
+| `mode` | Definition default | `default` or `plan`; mode controls only this Runtime request |
 | `on_part` | `None` | Observe each LangGraph v2 part before conversion |
 | `timeout` | `None` | Total native-stream deadline |
 | `settlement_timeout` | `None` | Caller wait limit for protected cancellation cleanup |

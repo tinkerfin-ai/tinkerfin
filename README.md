@@ -69,6 +69,12 @@ Use `agent.new()` for native LangGraph objects. Both Runtime types expose the in
 
 - `create_deep_agent(...)` records the installed Deep Agents build call;
   `new()` / `new_agui()` creates a fresh Graph and a single-use Runtime.
+- `TinkerFin(state_schema=...)` contributes application state to every Deep Agent
+  Definition created by that factory; Definition state and middleware state are merged
+  without weakening reducers or requiredness.
+- `.plan(enabled=True)` adds one stable parent workflow without changing the installed
+  `create_deep_agent(...)` signature. Choose `mode="default"` or `mode="plan"` on each
+  `new()` / `new_agui()` request; a concrete checkpointer is required.
 - AG-UI uses v2 `messages`, `tasks`, and `values` with `subgraphs=True`; invalid stream
   options fail before iteration or lifecycle events.
 - Runtime and Adapter enforce event ordering, subagent provenance, interrupt/resume,

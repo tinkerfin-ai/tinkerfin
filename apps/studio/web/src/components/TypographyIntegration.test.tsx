@@ -12,6 +12,7 @@ const conversationWithApproval = (activeIndex: number): Conversation => ({
   pinned: false,
   updatedAt: '2026-08-09T00:00:00.000Z',
   model: 'GPT-5.5',
+  mode: 'default',
   messages: [],
   todos: [],
   plan: null,

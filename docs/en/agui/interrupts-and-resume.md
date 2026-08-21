@@ -25,6 +25,40 @@ agent = TinkerFin().create_deep_agent(
 
 Without a checkpointer there is no reliable paused Graph state to resume.
 
+## Plan clarification and review
+
+An Agent created through `TinkerFin().plan(enabled=True)` can pause for two
+runtime-owned reasons. Select `mode="plan"` when creating that request's Runtime:
+
+```python
+runtime = agent.new_agui(identity=identity, mode="plan")
+```
+
+| Reason | Expected resolved payload |
+| --- | --- |
+| `plan_clarification` | `{"type":"respond","answers":[{"questionId":"...","answer":"...","optionId":"..."}]}`; `optionId` is omitted for a custom answer |
+| `plan_review` | `approve`, `edit`, `respond`, or `reject`, each with the current `baseRevision` |
+
+A Plan interrupt has no `toolCallId`. It carries a versioned trusted runtime envelope,
+its response JSON Schema, and Plan metadata. The root `tinkerfin_plan` state is
+published before the interrupt terminal. On a resumed request, the synchronized
+snapshot may be followed by RFC 6902 state deltas as the Plan moves through
+`executing` and `completed`.
+
+The same `ResumeMapper.map_agui(...)` and `AgUiResumeBinding` flow handles Plan
+interrupts without a separate API. `ResumeMapper` verifies the persisted envelope and
+exact pending coverage; the parent Graph validates the response contract and rejects a
+stale `baseRevision`. Use a new `runId` with the same `threadId` for every resume.
+
+A pending batch cannot mix Plan and Tool interrupts. A Tool review can still occur
+later, after Plan approval, and its original scoped Tool ID remains continuous across
+that later resume.
+
+Cancelling a Plan clarification or review abandons that Plan request without fabricating
+`reject`. A later ordinary input can use `mode="default"` on the same Plan-capable
+Definition and checkpoint thread. Changing the future mode never approves, rejects, or
+cancels a pending Tool/Filesystem review.
+
 ## Resume entries from the frontend
 
 Each entry corresponds to one pending interrupt:
@@ -103,6 +137,7 @@ Resolved reviews need complete messages for safe tool correlation. Do not match 
 | `custom` | Resolved and cancelled decisions are mixed | Handle explicitly; do not force a lossy native resume |
 
 Cancellation means abandoning this resume attempt. It is not a tool rejection.
+The same rule applies to Plan review: cancellation does not fabricate a Plan rejection.
 
 ## Retry and concurrency
 

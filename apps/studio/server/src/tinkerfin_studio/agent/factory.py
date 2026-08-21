@@ -139,6 +139,7 @@ class ConversationAgentFactory:
                     partial(
                         definition.new_agui,
                         identity=prepared.identity,
+                        mode=prepared.mode,
                         resume=resume,
                         expose_reasoning_events=False,
                         expose_subagent_events=True,
@@ -241,7 +242,7 @@ class ConversationAgentFactory:
                 },
             ),
         )
-        return self._tinkerfin.create_deep_agent(
+        return self._tinkerfin.plan(enabled=True).create_deep_agent(
             model=model,
             tools=[web_search],
             system_prompt=_SYSTEM_PROMPT,

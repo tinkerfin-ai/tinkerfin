@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import os
 from dataclasses import dataclass
-from time import monotonic
 
 import pytest
 from sqlalchemy import event, inspect, text
@@ -18,48 +17,27 @@ from tinkerfin_sandbox import (
 
 @dataclass(frozen=True, slots=True)
 class _MySQLServer:
-    label: str
     url: str
-    expected_version_prefix: tuple[int, int]
-    supports_skip_locked: bool
 
 
-def _configured_mysql_servers() -> tuple[_MySQLServer, ...]:
-    configured: list[_MySQLServer] = []
-    mysql57_url = os.environ.get("TINKERFIN_TEST_MYSQL57_URL")
-    if mysql57_url:
-        configured.append(
-            _MySQLServer(
-                label="mysql57",
-                url=mysql57_url,
-                expected_version_prefix=(5, 7),
-                supports_skip_locked=False,
-            )
-        )
+def _configured_mysql8_server() -> _MySQLServer | None:
     mysql8_url = os.environ.get("TINKERFIN_TEST_MYSQL8_URL")
-    if mysql8_url:
-        configured.append(
-            _MySQLServer(
-                label="mysql8",
-                url=mysql8_url,
-                expected_version_prefix=(8, 0),
-                supports_skip_locked=True,
-            )
-        )
-    return tuple(configured)
+    return None if not mysql8_url else _MySQLServer(url=mysql8_url)
 
 
-_MYSQL_SERVERS = _configured_mysql_servers()
-_MYSQL_PARAMS = tuple(
-    pytest.param(server, id=server.label) for server in _MYSQL_SERVERS
-) or (
-    pytest.param(
-        None,
-        marks=pytest.mark.skip(
-            reason="disposable MySQL 5.7/8 URLs were not configured"
+_MYSQL8_SERVER = _configured_mysql8_server()
+_MYSQL_PARAMS = (
+    (pytest.param(_MYSQL8_SERVER, id="mysql8"),)
+    if _MYSQL8_SERVER is not None
+    else (
+        pytest.param(
+            None,
+            marks=pytest.mark.skip(
+                reason="a disposable MySQL 8 URL was not configured"
+            ),
+            id="unconfigured",
         ),
-        id="unconfigured",
-    ),
+    )
 )
 
 
@@ -122,7 +100,7 @@ async def _reset_and_apply_exported_schema(server: _MySQLServer) -> None:
 
 @pytest.mark.mysql_integration
 @pytest.mark.parametrize("server", _MYSQL_PARAMS)
-async def test_mysql_export_and_runtime_claims_are_cross_version_compatible(
+async def test_mysql8_export_and_runtime_claims_are_compatible(
     server: _MySQLServer | None,
 ) -> None:
     assert server is not None
@@ -130,14 +108,14 @@ async def test_mysql_export_and_runtime_claims_are_cross_version_compatible(
     observed_sql: list[str] = []
     first = SQLAlchemyOpenSandboxState(
         url=server.url,
-        namespace=f"integration-{server.label}",
+        namespace="integration-mysql8",
         lease_ttl=1.0,
         poll_interval=0.01,
         sqlite_retry_timeout=0,
     )
     second = SQLAlchemyOpenSandboxState(
         url=server.url,
-        namespace=f"integration-{server.label}",
+        namespace="integration-mysql8",
         lease_ttl=1.0,
         poll_interval=0.01,
         sqlite_retry_timeout=0,
@@ -162,8 +140,8 @@ async def test_mysql_export_and_runtime_claims_are_cross_version_compatible(
             second.start(warm_pool_size=2),
         )
         capabilities = first._require_capabilities()
-        assert capabilities.server_version[:2] == server.expected_version_prefix
-        assert capabilities.supports_skip_locked is server.supports_skip_locked
+        assert capabilities.server_version[:2] == (8, 0)
+        assert capabilities.supports_skip_locked is True
 
         initial_owner = await first.acquire_owner("serialized-owner")
         waiting_owner = asyncio.create_task(second.acquire_owner("serialized-owner"))
@@ -297,156 +275,4 @@ async def test_mysql_export_and_runtime_claims_are_cross_version_compatible(
     assert claim_sql
     assert any("TINKERFIN_OPENSANDBOX_WARM_SLOTS" in sql for sql in claim_sql)
     assert any("TINKERFIN_OPENSANDBOX_CLEANUP" in sql for sql in claim_sql)
-    if server.supports_skip_locked:
-        assert any("FOR UPDATE SKIP LOCKED" in sql for sql in claim_sql)
-    else:
-        assert all("SKIP LOCKED" not in sql for sql in claim_sql)
-
-
-@pytest.mark.mysql_integration
-@pytest.mark.parametrize(
-    "server",
-    tuple(
-        pytest.param(server, id=server.label)
-        for server in _MYSQL_SERVERS
-        if server.expected_version_prefix == (5, 7)
-    )
-    or (
-        pytest.param(
-            None,
-            marks=pytest.mark.skip(reason="a disposable MySQL 5.7 URL is required"),
-            id="unconfigured",
-        ),
-    ),
-)
-async def test_mysql57_cancelled_lock_wait_rolls_back_and_releases_connection(
-    server: _MySQLServer | None,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    assert server is not None
-    await _reset_and_apply_exported_schema(server)
-    state = SQLAlchemyOpenSandboxState(
-        url=server.url,
-        namespace="cancel-mysql57",
-        lease_ttl=1.0,
-        poll_interval=0.01,
-    )
-    blocker_engine = create_async_engine(server.url)
-    await state.start(warm_pool_size=1)
-    query_started = asyncio.Event()
-
-    def observe_waiting_query(
-        connection: object,
-        cursor: object,
-        statement: str,
-        parameters: object,
-        context: object,
-        executemany: bool,
-    ) -> None:
-        del connection, cursor, parameters, context, executemany
-        if (
-            "TINKERFIN_OPENSANDBOX_WARM_SLOTS" in statement.upper()
-            and "FOR UPDATE" in statement.upper()
-        ):
-            query_started.set()
-
-    try:
-        async with blocker_engine.connect() as blocker:
-            transaction = await blocker.begin()
-            await blocker.execute(
-                text(
-                    "SELECT slot FROM tinkerfin_opensandbox_warm_slots "
-                    "WHERE namespace = :namespace AND slot = 0 FOR UPDATE"
-                ),
-                {"namespace": "cancel-mysql57"},
-            )
-            event.listen(
-                state._engine.sync_engine,
-                "before_cursor_execute",
-                observe_waiting_query,
-            )
-            claiming = asyncio.create_task(state.claim_warm_slot())
-            try:
-                await asyncio.wait_for(query_started.wait(), timeout=1)
-                await asyncio.sleep(0.05)
-                assert not claiming.done()
-                claiming.cancel()
-                with pytest.raises(asyncio.CancelledError):
-                    await claiming
-            finally:
-                event.remove(
-                    state._engine.sync_engine,
-                    "before_cursor_execute",
-                    observe_waiting_query,
-                )
-                if not claiming.done():
-                    claiming.cancel()
-                    await asyncio.gather(claiming, return_exceptions=True)
-                await transaction.rollback()
-
-        recovered = await state.claim_warm_slot()
-        assert recovered is not None
-        await state.release_warm(recovered)
-        pool_errors = [
-            record
-            for record in caplog.records
-            if record.name.startswith("sqlalchemy.pool") and record.levelno >= 40
-        ]
-        assert pool_errors == []
-    finally:
-        await state.aclose()
-        await blocker_engine.dispose()
-
-
-@pytest.mark.mysql_integration
-@pytest.mark.parametrize(
-    "server",
-    tuple(
-        pytest.param(server, id=server.label)
-        for server in _MYSQL_SERVERS
-        if server.expected_version_prefix == (5, 7)
-    )
-    or (
-        pytest.param(
-            None,
-            marks=pytest.mark.skip(reason="a disposable MySQL 5.7 URL is required"),
-            id="unconfigured",
-        ),
-    ),
-)
-async def test_mysql57_lock_timeout_reports_the_claim_as_unavailable(
-    server: _MySQLServer | None,
-) -> None:
-    assert server is not None
-    await _reset_and_apply_exported_schema(server)
-    state = SQLAlchemyOpenSandboxState(
-        url=server.url,
-        namespace="timeout-mysql57",
-        lease_ttl=2.0,
-        poll_interval=0.01,
-    )
-    blocker_engine = create_async_engine(server.url)
-    await state.start(warm_pool_size=1)
-    try:
-        async with blocker_engine.connect() as blocker:
-            transaction = await blocker.begin()
-            await blocker.execute(
-                text(
-                    "SELECT slot FROM tinkerfin_opensandbox_warm_slots "
-                    "WHERE namespace = :namespace AND slot = 0 FOR UPDATE"
-                ),
-                {"namespace": "timeout-mysql57"},
-            )
-            started_at = monotonic()
-            unavailable = await state.claim_warm_slot()
-            elapsed = monotonic() - started_at
-            await transaction.rollback()
-
-        assert unavailable is None
-        assert 0.8 <= elapsed < 2.5
-        recovered = await state.claim_warm_slot()
-        assert recovered is not None
-        await state.release_warm(recovered)
-    finally:
-        await state.aclose()
-        await blocker_engine.dispose()
+    assert any("FOR UPDATE SKIP LOCKED" in sql for sql in claim_sql)

@@ -15,6 +15,8 @@ from contextvars import ContextVar
 from typing import Generic, TypeAlias, TypeVar, cast, overload
 
 from ag_ui.core import BaseEvent
+from deepagents.graph import DeepAgentState
+from langchain_core.language_models import BaseChatModel
 
 from tinkerfin_agui_adapter import (
     AgUiLifecycleEventFactory,
@@ -26,6 +28,7 @@ from tinkerfin_agui_adapter import (
 from . import _runtime_agui, _runtime_streams
 from ._runtime_agui import _AgUiStreamDeadlineExceeded
 from ._runtime_streams import _validate_timeout
+from ._state_schema import validate_state_schema
 from .agui_native import (
     AgUiNativeStreamConfig,
     AgUiNativeStreamConfigurationError,
@@ -38,6 +41,7 @@ from .errors import (
     TinkerFinLifecycleError,
 )
 from .native import NativeStreamPart
+from .plan._config import AgentMode, PlanOptions, validate_agent_mode
 from .sse import (
     SseBody,
     SseEventIdResolver,
@@ -591,9 +595,9 @@ class NativeTinkerFinRun(
 
 
 class TinkerFin:
-    """Globally shareable stateless factory for single-use source bindings."""
+    """Globally shareable factory for single-use source and Agent definitions."""
 
-    __slots__ = ("_run_coordinator",)
+    __slots__ = ("_plan_options", "_run_coordinator", "_state_schema")
 
     create_deep_agent = CREATE_DEEP_AGENT
 
@@ -601,10 +605,74 @@ class TinkerFin:
         self,
         *,
         run_coordinator: RunCoordinator | None = None,
+        state_schema: type[DeepAgentState] | None = None,
     ) -> None:
         if run_coordinator is not None and not callable(run_coordinator):
             raise TypeError("run_coordinator must be callable or None")
+        validate_state_schema(state_schema, source="TinkerFin state_schema")
         self._run_coordinator = run_coordinator
+        self._state_schema = state_schema
+        self._plan_options: PlanOptions | None = None
+
+    def plan(
+        self,
+        *,
+        enabled: bool = True,
+        default_mode: AgentMode = "default",
+        gate_model: str | BaseChatModel | None = None,
+        planner_model: str | BaseChatModel | None = None,
+    ) -> TinkerFin:
+        """Return a factory with immutable Plan-capability options.
+
+        The returned factory borrows the same coordinator and global state schema.
+        Existing Definitions and this source factory are unchanged.
+
+        Args:
+            enabled: Whether subsequent Deep Agent Definitions support Plan runs.
+            default_mode: Run mode used when ``new`` or ``new_agui`` omits one.
+            gate_model: Optional model dedicated to conservative request routing.
+            planner_model: Optional model dedicated to read-only Plan drafting.
+
+        Returns:
+            A separate configured TinkerFin factory.
+
+        Raises:
+            TypeError: ``enabled`` or a model value has the wrong type.
+            PlanModeConfigurationError: A mode or disabled configuration is invalid.
+        """
+
+        if type(enabled) is not bool:
+            raise TypeError("enabled must be a bool")
+        mode = validate_agent_mode(default_mode, name="default_mode")
+        for name, model in (
+            ("gate_model", gate_model),
+            ("planner_model", planner_model),
+        ):
+            if model is not None and not isinstance(model, (str, BaseChatModel)):
+                raise TypeError(
+                    f"{name} must be a model string, BaseChatModel, or None"
+                )
+            if isinstance(model, str) and not model.strip():
+                raise ValueError(f"{name} must not be blank")
+        if not enabled and (
+            mode != "default" or gate_model is not None or planner_model is not None
+        ):
+            from .plan.errors import PlanModeConfigurationError
+
+            raise PlanModeConfigurationError(
+                "disabled Plan capability cannot configure a mode or Plan model"
+            )
+        configured = TinkerFin(
+            run_coordinator=self._run_coordinator,
+            state_schema=self._state_schema,
+        )
+        if enabled:
+            configured._plan_options = PlanOptions(
+                default_mode=mode,
+                gate_model=gate_model,
+                planner_model=planner_model,
+            )
+        return configured
 
     @overload
     def run(
@@ -687,7 +755,7 @@ class TinkerFin:
         identity: Identity | None,
         on_part: object | None,
     ) -> None:
-        """校验一次请求绑定，不创建 Graph、source 或协调上下文"""
+        """Validate a request binding without opening Graph or source resources."""
 
         coordinator = self._run_coordinator
         if identity is not None and not isinstance(identity, Identity):

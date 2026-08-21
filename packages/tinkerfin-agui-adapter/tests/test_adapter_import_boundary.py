@@ -37,8 +37,8 @@ expected_exports = {
     "DeepAgentAgUiAdapter", "HitlActionRequest", "HitlCorrelationError",
     "HitlNoMatchError", "HitlRequest", "HitlReviewConfig", "Identity",
     "ResumeMapper", "ResumeMappingError",
-    "ResumeTranslation", "ScopedIdCodec", "SseEventId", "astream_events", "encode_sse",
-    "micro_batch",
+    "ResumeTranslation", "RuntimeInterruptEnvelope", "ScopedIdCodec", "SseEventId",
+    "astream_events", "encode_sse", "micro_batch",
 }
 assert set(tinkerfin_agui_adapter.__all__) == expected_exports
 for export in expected_exports:

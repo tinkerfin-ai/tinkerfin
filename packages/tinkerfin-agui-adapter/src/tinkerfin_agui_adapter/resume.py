@@ -1,4 +1,4 @@
-"""Pure mapping from AG-UI resume entries to Deep Agents decision data."""
+"""Pure mapping from AG-UI resume entries to native LangGraph resume data."""
 
 from __future__ import annotations
 
@@ -182,6 +182,23 @@ class ResumeMapper:
                 allowed.
         """
 
+        from .runtime_resume import (
+            classify_native_runtime_interrupts,
+            translate_native_runtime_resume,
+        )
+
+        runtime_kind = classify_native_runtime_interrupts(interrupts)
+        if runtime_kind == "mixed":
+            raise ResumeMappingError(
+                AgUiAdapterErrorCode.RESUME_INTERRUPT_UNSUPPORTED,
+                "runtime and Tool interrupts cannot share one resume batch",
+            )
+        if runtime_kind == "runtime":
+            return translate_native_runtime_resume(
+                entries=entries,
+                interrupts=interrupts,
+            )
+
         pending, action_groups = self._pending_actions(interrupts)
         group_ids = tuple(
             dict.fromkeys(action.interrupt_id for action in pending.values())
@@ -228,6 +245,23 @@ class ResumeMapper:
             ResumeMappingError: Interrupt correlation is incomplete, inconsistent, or
                 cannot be validated without weakening native resume semantics.
         """
+
+        from .runtime_resume import (
+            classify_ag_ui_runtime_interrupts,
+            translate_ag_ui_runtime_resume,
+        )
+
+        runtime_kind = classify_ag_ui_runtime_interrupts(interrupts)
+        if runtime_kind == "mixed":
+            raise ResumeMappingError(
+                AgUiAdapterErrorCode.RESUME_INTERRUPT_UNSUPPORTED,
+                "runtime and Tool interrupts cannot share one resume batch",
+            )
+        if runtime_kind == "runtime":
+            return translate_ag_ui_runtime_resume(
+                entries=entries,
+                interrupts=interrupts,
+            )
 
         pending, tool_ids_by_group = self._pending_agui_actions(interrupts)
 

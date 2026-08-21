@@ -10,6 +10,7 @@ const conversation = (threadId: string): Conversation => ({
   pinned: false,
   updatedAt: '2026-08-17T00:00:00.000Z',
   model: 'GPT-5.5',
+  mode: 'default',
   messages: [],
   todos: [{ id: 'todo-1', content: '执行任务', status: 'running' }],
   plan: {

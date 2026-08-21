@@ -24,7 +24,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.types import Command
 from pydantic import BaseModel, ConfigDict, JsonValue, ValidationError, model_validator
 
-from tinkerfin import AgUiResumeBinding, Identity
+from tinkerfin import AgentMode, AgUiResumeBinding, Identity
 from tinkerfin_agui_adapter.resume import ResumeMapper, ResumeMappingError
 from tinkerfin_messaging import (
     FiniteMessageSource,
@@ -75,6 +75,7 @@ class PreparedRunRequest:
     identity: Identity
     graph_config: RunnableConfig
     message_ids: tuple[str, ...]
+    mode: AgentMode
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,6 +187,7 @@ def prepare_run_request(
         identity=identity,
         graph_config=graph_config,
         message_ids=message_ids,
+        mode=request.forwarded_props.mode,
     )
 
 

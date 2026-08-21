@@ -8,6 +8,7 @@ import type {
   ConversationHistoryDetail,
   ConversationHistoryListItem,
   ConversationHistoryListResponse,
+  ConversationSnapshotJson,
 } from './api/conversation/history'
 import type { ChatRequestPayload, ConversationAgUiEvent } from './api/conversation/types'
 import type { AgentModelCatalog } from './api/models/types'
@@ -162,6 +163,23 @@ function historyDetail(overrides: Partial<ConversationHistoryDetail> & { threadI
     updatedAt: BASE_TIME,
     ...rest,
     pinned: rest.pinned ?? false,
+  }
+}
+
+function emptyHistorySnapshot(mode: 'default' | 'plan'): ConversationSnapshotJson {
+  return {
+    snapshotSeq: 0,
+    snapshotVersion: 2,
+    messages: [],
+    todos: [],
+    mode,
+    approval: null,
+    runStatus: 'idle',
+    activeRunId: null,
+    serverState: {},
+    runs: {},
+    activities: [],
+    interrupts: [],
   }
 }
 
@@ -507,6 +525,132 @@ describe('App', () => {
     expect(request.forwardedProps).toEqual({ model: 'GPT-5.5', mode: 'plan' })
   })
 
+  it('disables Agent mode changes until an active stream is cancelled and cleaned up', async () => {
+    installFetchMock({
+      streams: [[{ type: 'RUN_STARTED', threadId: THREAD_ID, runId: FIRST_RUN_ID }]],
+      keepOpen: true,
+    })
+    render(<App />)
+
+    await sendMessage('保持流运行')
+    const presetButton = screen.getByRole('button', { name: '当前 Agent 预设' })
+    await waitFor(() => expect(presetButton).toBeDisabled())
+    expect(screen.queryByRole('listbox', { name: 'Agent 预设选项' })).not.toBeInTheDocument()
+
+    await userEvent.setup().click(await screen.findByRole('button', { name: '停止任务' }))
+    await waitFor(() => expect(presetButton).toBeEnabled())
+  })
+
+  it('abandons a pending Plan before switching the thread to default', async () => {
+    const fetchMock = installFetchMock({
+      streams: [
+        [
+          { type: 'RUN_STARTED', threadId: THREAD_ID, runId: FIRST_RUN_ID },
+          {
+            type: 'RUN_FINISHED',
+            threadId: THREAD_ID,
+            runId: FIRST_RUN_ID,
+            outcome: {
+              type: 'interrupt',
+              interrupts: [{
+                id: 'plan-review-app',
+                reason: 'plan_review',
+                message: '请确认 Plan',
+                metadata: {
+                  runtimeInterrupt: {
+                    envelope: {
+                      metadata: {
+                        planRevision: 1,
+                        draft: {
+                          revision: 1,
+                          goal: '实现模式切换',
+                          steps: [{ id: 'step-1', title: '实现', description: '保持父图稳定' }],
+                        },
+                      },
+                    },
+                  },
+                },
+              }],
+            },
+          },
+        ],
+        [
+          { type: 'RUN_STARTED', threadId: THREAD_ID, runId: SECOND_RUN_ID },
+          {
+            type: 'RUN_ERROR',
+            rawEvent: { runId: SECOND_RUN_ID },
+            message: '审批已取消',
+            code: 'resume_cancelled',
+          },
+        ],
+      ],
+    })
+    const user = userEvent.setup()
+    render(<App />)
+    const presetButton = screen.getByRole('button', { name: '当前 Agent 预设' })
+    await user.click(presetButton)
+    await user.click(screen.getByRole('option', { name: 'plan' }))
+    await sendMessage('先生成计划')
+    expect(await screen.findByLabelText('Plan 审阅')).toBeInTheDocument()
+
+    await user.click(presetButton)
+    await user.click(screen.getByRole('option', { name: 'default' }))
+    const dialog = await screen.findByRole('dialog', { name: '关闭当前 Plan？' })
+    expect(within(dialog).getByText(/Tool\/Filesystem 审批不受影响/)).toBeInTheDocument()
+    await user.click(within(dialog).getByRole('button', { name: '关闭 Plan' }))
+
+    await waitFor(() => expect(chatRequestAt(fetchMock, 1)).toBeDefined())
+    const abandonRequest = JSON.parse(String(chatRequestAt(fetchMock, 1)?.body)) as ChatRequestPayload
+    expect(abandonRequest.forwardedProps).toEqual({ model: 'GPT-5.5', mode: 'default' })
+    expect(abandonRequest.resume).toEqual([{
+      interruptId: 'plan-review-app',
+      status: 'cancelled',
+    }])
+    expect(presetButton).toHaveTextContent('default')
+  })
+
+  it('changes the future mode without cancelling a pending Tool approval', async () => {
+    const fetchMock = installFetchMock({
+      streams: [[
+        { type: 'RUN_STARTED', threadId: THREAD_ID, runId: FIRST_RUN_ID },
+        {
+          type: 'RUN_FINISHED',
+          threadId: THREAD_ID,
+          runId: FIRST_RUN_ID,
+          outcome: {
+            type: 'interrupt',
+            interrupts: [{
+              id: INTERRUPT_ID,
+              reason: 'tool_call',
+              message: '确认写入',
+              toolCallId: WRITE_FILE_CALL_ID,
+              metadata: {
+                deepagents: {
+                  toolName: 'write_file',
+                  allowedDecisions: ['approve', 'reject'],
+                  originalArgs: originalWriteArgs,
+                },
+              },
+            }],
+          },
+        },
+      ]],
+    })
+    const user = userEvent.setup()
+    render(<App />)
+    await sendMessage('等待 Tool 审批')
+    expect(await screen.findByText('确认写入')).toBeInTheDocument()
+
+    const presetButton = screen.getByRole('button', { name: '当前 Agent 预设' })
+    await user.click(presetButton)
+    await user.click(screen.getByRole('option', { name: 'plan' }))
+
+    expect(presetButton).toHaveTextContent('plan')
+    expect(screen.getByText('确认写入')).toBeInTheDocument()
+    expect(screen.queryByRole('dialog', { name: '关闭当前 Plan？' })).not.toBeInTheDocument()
+    expect(chatRequestAt(fetchMock, 1)).toBeUndefined()
+  })
+
   it('uses the backend model catalog instead of a hardcoded frontend list', async () => {
     const fetchMock = installFetchMock({
       streams: [[]],
@@ -619,8 +763,16 @@ describe('App', () => {
         nextCursor: null,
       }],
       historyDetails: {
-        [THREAD_ID]: historyDetail({ threadId: THREAD_ID, title: '第一条会话' }),
-        [SECOND_THREAD_ID]: historyDetail({ threadId: SECOND_THREAD_ID, title: '第二条会话' }),
+        [THREAD_ID]: historyDetail({
+          threadId: THREAD_ID,
+          title: '第一条会话',
+          snapshot: emptyHistorySnapshot('plan'),
+        }),
+        [SECOND_THREAD_ID]: historyDetail({
+          threadId: SECOND_THREAD_ID,
+          title: '第二条会话',
+          snapshot: emptyHistorySnapshot('default'),
+        }),
       },
     })
 
@@ -628,8 +780,13 @@ describe('App', () => {
     render(<App />)
 
     expect(await screen.findByText('来自 第一条会话 的历史回复')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '当前 Agent 预设' })).toHaveTextContent('plan')
     await user.click(screen.getByRole('button', { name: '打开会话：第二条会话' }))
     expect(await screen.findByText('来自 第二条会话 的历史回复')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '当前 Agent 预设' })).toHaveTextContent('default')
+    await user.click(screen.getByRole('button', { name: '打开会话：第一条会话' }))
+    expect(await screen.findByText('来自 第一条会话 的历史回复')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '当前 Agent 预设' })).toHaveTextContent('plan')
   })
 
   it('cancels stale hydration when switching threads and disables the composer meanwhile', async () => {
@@ -1835,6 +1992,7 @@ describe('App', () => {
         snapshotVersion: 2,
         messages: [],
         todos: [{ id: 'todo-read-url', content: '读取 url.json', status: 'running' }],
+        mode: 'default',
         approval: null,
         runStatus: 'idle',
         serverState: {},

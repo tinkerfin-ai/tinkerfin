@@ -1,6 +1,6 @@
-import type { JsonObject, JsonValue } from "../../types"
+import type { AgentMode, JsonObject, JsonValue } from "../../types"
 
-export type AgentMode = "default" | "plan"
+export type { AgentMode }
 
 export interface ChatMessageInput {
   id: string
@@ -15,6 +15,18 @@ export type ChatResumePayload =
     type: "edit"
     edited_action: { name: string; args: JsonObject }
   }
+  | {
+    type: "respond"
+    answers: Array<{
+      questionId: string
+      answer: string
+      optionId?: string
+    }>
+  }
+  | { type: "approve"; baseRevision: number }
+  | { type: "edit"; baseRevision: number; draft: JsonObject }
+  | { type: "respond"; baseRevision: number; message: string }
+  | { type: "reject"; baseRevision: number; message?: string }
 
 export interface ChatResumeEntry {
   interruptId: string

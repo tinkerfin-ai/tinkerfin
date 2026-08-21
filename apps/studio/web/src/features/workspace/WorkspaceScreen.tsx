@@ -21,12 +21,16 @@ import { ConversationNotice, MessageBlock, ToolCallBatch } from '../../component
 import { ListboxPicker } from '../../components/ListboxPicker'
 import { ModalDialog } from '../../components/ModalDialog'
 import { OverflowMarquee } from '../../components/OverflowMarquee'
+import { PlanQuestionCard } from '../../components/PlanQuestionCard'
+import { PlanReviewCard } from '../../components/PlanReviewCard'
 import { Sidebar } from '../../components/Sidebar'
 import { TaskDrawer } from '../../components/TaskDrawer'
 import { ThemePicker } from '../../components/ThemePicker'
 import type { ToastKind } from '../../components/ToastViewport'
 import {
   buildInitialPayload,
+  buildPlanAbandonPayload,
+  buildPlanResumePayload,
   buildResumePayload,
   prepareResumeSubmission,
   restoreConversationFromHistory,
@@ -45,7 +49,14 @@ import {
   upsertConversation,
 } from '../../lib/workspace'
 import { readThreadFromLocation, writeThreadToLocation } from '../../lib/threadRoute'
-import type { ApprovalState, Conversation, WorkspaceState } from '../../types'
+import type {
+  ApprovalState,
+  Conversation,
+  PlanInteraction,
+  PlanQuestionState,
+  PlanReviewState,
+  WorkspaceState,
+} from '../../types'
 
 const AGENT_MODES = ['default', 'plan'] as const satisfies readonly AgentMode[]
 const HISTORY_PAGE_SIZE = 5
@@ -100,8 +111,10 @@ type AppDialog =
   | { kind: 'delete'; threadId: string; title: string; isRunning: boolean; restoreFocusTo?: HTMLElement | null }
   | { kind: 'detach-select'; threadId: string }
   | { kind: 'detach-new' }
+  | { kind: 'disable-plan'; threadId: string }
 
 interface PendingResume {
+  kind: 'tool' | 'plan'
   threadId: string
   payload: ChatRequestPayload
   expectedInterruptIds: readonly string[]
@@ -132,6 +145,7 @@ const conversationFromHistoryItem = (
   pinned: item.pinned,
   updatedAt: item.updatedAt,
   model: item.lastModel ?? fallbackModel,
+  mode: 'default',
   messages: [],
   todos: [],
   plan: null,
@@ -203,7 +217,6 @@ export function WorkspaceScreen({
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [isModelPickerOpen, setModelPickerOpen] = useState(false)
-  const [agentMode, setAgentMode] = useState<AgentMode>('default')
   const [isAgentPresetPickerOpen, setAgentPresetPickerOpen] = useState(false)
   const [showScrollToBottom, setShowScrollToBottom] = useState(false)
   const [fadeScrollToBottom, setFadeScrollToBottom] = useState(false)
@@ -308,6 +321,23 @@ export function WorkspaceScreen({
       : { ...workspace, conversations: [conversation, ...workspace.conversations] }
   ), [conversation, workspace])
   const isRunning = conversation.runStatus === 'streaming'
+  const selectAgentMode = useCallback((mode: AgentMode) => {
+    if (isRunning || mode === conversation.mode) return
+    if (mode === 'default' && conversation.planInteraction) {
+      setDialogError(undefined)
+      setDialog({ kind: 'disable-plan', threadId: conversation.threadId })
+      return
+    }
+    if (!workspace.currentThreadId) {
+      setDraftConversation((current) => ({ ...(current ?? conversation), mode }))
+      return
+    }
+    setWorkspace((state) => updateConversation(
+      state,
+      workspace.currentThreadId,
+      (current) => ({ ...current, mode }),
+    ))
+  }, [conversation, isRunning, workspace.currentThreadId])
   const isConversationHydrating = Boolean(
     workspace.currentThreadId
     && selectedConversation
@@ -806,8 +836,9 @@ export function WorkspaceScreen({
       const nextConversation = buildEmptyConversation({
         now,
         model: draftConversation?.model ?? draftModel,
+        mode: draftConversation?.mode ?? conversation.mode,
       })
-      const payload = buildInitialPayload(nextConversation, trimmed, agentMode)
+      const payload = buildInitialPayload(nextConversation, trimmed)
       const seededConversation: Conversation = {
         ...nextConversation,
         activeRunId: payload.runId,
@@ -839,11 +870,14 @@ export function WorkspaceScreen({
       setWorkspace((state) => updateConversation(state, currentConversation.threadId, (item) => ({
         ...item,
         approval: item.approval ? { ...item.approval, error: '请先处理当前审批后再发送新消息。' } : item.approval,
+        planInteraction: item.planInteraction
+          ? { ...item.planInteraction, error: '请先处理当前 Plan 请求后再发送新消息。' }
+          : item.planInteraction,
       })))
       return
     }
 
-    const payload = buildInitialPayload(currentConversation, trimmed, agentMode)
+    const payload = buildInitialPayload(currentConversation, trimmed)
     scrollConversationToBottomImmediately()
     setWorkspace((state) => {
       return updateConversation(state, currentConversation.threadId, (item) => ({
@@ -860,21 +894,24 @@ export function WorkspaceScreen({
     })
     void streamRun(currentConversation.threadId, payload, 'start')
     setDraft('')
-  }, [agentMode, conversation.model, draftConversation, draftModel, hydrateConversation, isRunning, scrollConversationToBottomImmediately, streamRun, workspace.conversations, workspace.currentThreadId])
+  }, [conversation.mode, conversation.model, draftConversation, draftModel, hydrateConversation, isRunning, scrollConversationToBottomImmediately, streamRun, workspace.conversations, workspace.currentThreadId])
 
   useEffect(() => {
     if (!pendingResume) return
     const claimedConversation = workspace.conversations.find(
       (item) => item.threadId === pendingResume.threadId,
     )
-    const isExpectedGroup = claimedConversation?.approval?.items.length
-      === pendingResume.expectedInterruptIds.length
-      && claimedConversation.approval.items.every(
-        (item, index) => item.interruptId === pendingResume.expectedInterruptIds[index],
-      )
+    const isExpectedGroup = pendingResume.kind === 'tool'
+      ? claimedConversation?.approval?.items.length === pendingResume.expectedInterruptIds.length
+        && claimedConversation.approval.items.every(
+          (item, index) => item.interruptId === pendingResume.expectedInterruptIds[index],
+        )
+      : claimedConversation?.planInteraction?.interruptId === pendingResume.expectedInterruptIds[0]
     const isClaimed = claimedConversation?.runStatus === 'streaming'
       && claimedConversation.activeRunId === pendingResume.payload.runId
-      && claimedConversation.approval?.submitted === true
+      && (pendingResume.kind === 'tool'
+        ? claimedConversation.approval?.submitted === true
+        : claimedConversation.planInteraction?.submitted === true)
       && isExpectedGroup
     setPendingResume(null)
     if (!isClaimed || startedResumeRunIds.current.has(pendingResume.payload.runId)) return
@@ -911,7 +948,6 @@ export function WorkspaceScreen({
     try {
       payload = buildResumePayload(
         authoritativeConversation,
-        agentMode,
         expectedInterruptIds,
       )
     } catch {
@@ -928,11 +964,71 @@ export function WorkspaceScreen({
       },
     ))
     setPendingResume({
+      kind: 'tool',
       threadId: authoritativeConversation.threadId,
       payload,
       expectedInterruptIds: [...expectedInterruptIds],
     })
-  }, [agentMode, conversation.threadId, updateCurrent, workspace.currentThreadId])
+  }, [conversation.threadId, updateCurrent, workspace.currentThreadId])
+
+  const submitPlanInteraction = useCallback(() => {
+    const authoritative = latestWorkspace.current.conversations.find(
+      (item) => item.threadId === conversation.threadId,
+    )
+    if (!authoritative?.planInteraction || authoritative.runStatus === 'streaming') return
+    let payload: ChatRequestPayload
+    try {
+      payload = buildPlanResumePayload(authoritative)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Plan 请求无法提交'
+      updateCurrent((item) => ({
+        ...item,
+        planInteraction: item.planInteraction
+          ? { ...item.planInteraction, error: message }
+          : item.planInteraction,
+      }))
+      return
+    }
+    const interruptId = authoritative.planInteraction.interruptId
+    setWorkspace((state) => updateConversation(state, authoritative.threadId, (item) => ({
+      ...item,
+      runStatus: 'streaming',
+      activeRunId: payload.runId,
+      planInteraction: item.planInteraction
+        ? { ...item.planInteraction, submitted: true, error: undefined }
+        : item.planInteraction,
+    })))
+    setPendingResume({
+      kind: 'plan',
+      threadId: authoritative.threadId,
+      payload,
+      expectedInterruptIds: [interruptId],
+    })
+  }, [conversation.threadId, updateCurrent])
+
+  const abandonPlanInteraction = useCallback((threadId: string) => {
+    const authoritative = latestWorkspace.current.conversations.find(
+      (item) => item.threadId === threadId,
+    )
+    if (!authoritative?.planInteraction || authoritative.runStatus === 'streaming') return
+    const payload = buildPlanAbandonPayload(authoritative)
+    const interruptId = authoritative.planInteraction.interruptId
+    setWorkspace((state) => updateConversation(state, threadId, (item) => ({
+      ...item,
+      mode: 'default',
+      runStatus: 'streaming',
+      activeRunId: payload.runId,
+      planInteraction: item.planInteraction
+        ? { ...item.planInteraction, submitted: true, error: undefined }
+        : item.planInteraction,
+    })))
+    setPendingResume({
+      kind: 'plan',
+      threadId,
+      payload,
+      expectedInterruptIds: [interruptId],
+    })
+  }, [])
 
   const send = () => beginSend(draft.trim())
 
@@ -943,6 +1039,17 @@ export function WorkspaceScreen({
     setWorkspace((state) => updateConversation(state, threadId, (item) => (
       item.approval
         ? { ...item, approval: updater(item.approval) }
+        : item
+    )))
+  }, [])
+
+  const changePlanInteraction = useCallback((
+    threadId: string,
+    updater: (interaction: PlanInteraction) => PlanInteraction,
+  ) => {
+    setWorkspace((state) => updateConversation(state, threadId, (item) => (
+      item.planInteraction
+        ? { ...item, planInteraction: updater(item.planInteraction) }
         : item
     )))
   }, [])
@@ -1032,6 +1139,9 @@ export function WorkspaceScreen({
           setWorkspace((state) => updateConversation(state, dialog.threadId, (item) => ({ ...item, title })))
           pushToast('success', '会话已重命名')
         }
+      } else if (dialog.kind === 'disable-plan') {
+        abandonPlanInteraction(dialog.threadId)
+        pushToast('info', '已关闭 Plan，下一条消息将使用 default 模式')
       } else if (dialog.kind === 'delete') {
         if (dialog.isRunning) {
           await cancelActiveRun()
@@ -1131,14 +1241,15 @@ export function WorkspaceScreen({
           <div className="header-actions">
             <ThemePicker />
             <ListboxPicker
-              value={agentMode}
+              value={conversation.mode}
               options={AGENT_MODES}
               open={isAgentPresetPickerOpen}
               onOpenChange={(open) => {
                 setAgentPresetPickerOpen(open)
                 if (open) setModelPickerOpen(false)
               }}
-              onChange={setAgentMode}
+              onChange={selectAgentMode}
+              disabled={isRunning}
               triggerLabel="当前 Agent 预设"
               listboxLabel="Agent 预设选项"
               rootClassName="agent-preset-picker"
@@ -1181,6 +1292,30 @@ export function WorkspaceScreen({
                   conversation={conversation}
                   onChange={(updater) => changeApproval(conversation.threadId, updater)}
                   onSubmit={submitApproval}
+                />
+              )}
+              {conversation.planInteraction?.kind === 'questions' && !conversation.planInteraction.submitted && (
+                <PlanQuestionCard
+                  interaction={conversation.planInteraction}
+                  onChange={(updater) => changePlanInteraction(
+                    conversation.threadId,
+                    (current) => current.kind === 'questions'
+                      ? updater(current as PlanQuestionState)
+                      : current,
+                  )}
+                  onSubmit={submitPlanInteraction}
+                />
+              )}
+              {conversation.planInteraction?.kind === 'review' && !conversation.planInteraction.submitted && (
+                <PlanReviewCard
+                  interaction={conversation.planInteraction}
+                  onChange={(updater) => changePlanInteraction(
+                    conversation.threadId,
+                    (current) => current.kind === 'review'
+                      ? updater(current as PlanReviewState)
+                      : current,
+                  )}
+                  onSubmit={submitPlanInteraction}
                 />
               )}
               <div ref={messageEnd} />
@@ -1253,6 +1388,18 @@ export function WorkspaceScreen({
           isPending={dialogPending}
           error={dialogError}
           restoreFocusTo={dialog.restoreFocusTo}
+          onConfirm={confirmDialog}
+          onCancel={closeDialog}
+        />
+      )}
+      {dialog?.kind === 'disable-plan' && (
+        <ModalDialog
+          open
+          title="关闭当前 Plan？"
+          description="当前 Plan 澄清或审阅将被取消，不会执行旧计划。Tool/Filesystem 审批不受影响。"
+          confirmLabel="关闭 Plan"
+          isPending={dialogPending}
+          error={dialogError}
           onConfirm={confirmDialog}
           onCancel={closeDialog}
         />

@@ -25,6 +25,36 @@ agent = TinkerFin().create_deep_agent(
 
 没有 checkpointer 时，暂停后的 Graph 没有可靠状态可以恢复。
 
+## Plan 需求澄清和审批
+
+通过 `TinkerFin().plan(enabled=True)` 创建的 Agent 还会因为两类 Runtime 原因暂停。本次
+请求需要在创建 Runtime 时选择 `mode="plan"`：
+
+```python
+runtime = agent.new_agui(identity=identity, mode="plan")
+```
+
+| `reason` | `resolved` 时的 payload |
+| --- | --- |
+| `plan_clarification` | `{"type":"respond","answers":[{"questionId":"...","answer":"...","optionId":"..."}]}`；自由输入时省略 `optionId` |
+| `plan_review` | `approve`、`edit`、`respond` 或 `reject`，并携带当前 `baseRevision` |
+
+Plan interrupt 没有 `toolCallId`，其中包含带版本的可信 Runtime envelope、响应 JSON Schema
+和 Plan metadata。根状态的 `tinkerfin_plan` 会在 interrupt 终止事件前发布。恢复请求先同步
+snapshot，随后可以用 RFC 6902 state delta 表示 Plan 进入 `executing` 和 `completed`。
+
+Plan interrupt 使用同一套 `ResumeMapper.map_agui(...)` 和 `AgUiResumeBinding`，不需要
+另一套恢复 API。`ResumeMapper` 校验已保存 envelope 和待处理项的完整覆盖，父 Graph 校验
+响应契约，并拒绝过期的 `baseRevision`。每次恢复使用新的 `runId`，同时保持原
+`threadId`。
+
+同一待处理批次不能混合 Plan interrupt 与 Tool interrupt。Plan 批准后仍可能在执行阶段
+产生 Tool 审批；后续恢复会继续使用原来的 scoped Tool ID。
+
+取消 Plan 澄清或审阅表示放弃当前 Plan 请求，不能伪造成 `reject`。后续普通输入可以在
+同一个 Plan-capable Definition 和 checkpoint thread 上使用 `mode="default"`。修改未来
+mode 不会批准、拒绝或取消待处理的 Tool/Filesystem 审批。
+
 ## 前端提交恢复决定
 
 恢复请求的 `resume` 是一个列表。每一项对应一个待处理 interrupt。
@@ -103,6 +133,7 @@ translation = ResumeMapper().map(
 | `custom` | 解决和取消混合，原生恢复不能无损表达 | 由应用决定如何处理；不要强行继续 |
 
 取消表示用户放弃这次恢复，不等于拒绝工具。把取消改成拒绝会改变业务语义。
+Plan 审批同样如此：取消不能伪造成拒绝计划。
 
 ## 重试和并发
 

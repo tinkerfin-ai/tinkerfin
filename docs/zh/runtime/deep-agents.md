@@ -51,11 +51,72 @@ agent = tinkerfin.create_deep_agent(
 
 审批必须配合 checkpointer，否则暂停后无法可靠恢复。使用依赖 store 的 backend 或 middleware 时，也要同时提供 `store`。
 
+## 执行前审批计划
+
+当请求可能需要补充信息，或需要先确认多步计划时，可以启用 Plan Mode。这个能力属于
+TinkerFin，不会改变 Deep Agents 的建图参数。
+
+```python
+from langgraph.checkpoint.memory import MemorySaver
+from tinkerfin import TinkerFin
+
+
+tinkerfin = TinkerFin(state_schema=AppState)
+agent = tinkerfin.plan(
+    enabled=True,
+    default_mode="default",
+    gate_model="openai:gpt-5.4-mini",
+    planner_model="openai:gpt-5.4",
+).create_deep_agent(
+    model="openai:gpt-5.4",
+    tools=[search_orders],
+    checkpointer=MemorySaver(),
+)
+```
+
+`.plan(...)` 返回新的 TinkerFin 对象，不会修改 `tinkerfin`。新对象继续使用同一个 run
+coordinator 和全局 state schema，每个 Definition 固定采用创建它的 factory 能力配置。
+`gate_model` 和 `planner_model` 都可省略；省略时分别使用 Deep Agent 的执行模型。
+
+Plan Mode 按下面的边界处理请求：
+
+1. 保守 Gate 在直接执行、需求澄清和规划之间选择
+2. Planner 只能使用 `ls`、`read_file`、`glob` 和 `grep`
+3. 澄清问题可以包含模型动态生成的单选项，并按问题决定是否允许自由输入；需求澄清和
+   计划审批通过 LangGraph interrupt 暂停
+4. 用户批准后生成不可变的 `ConfirmedPlan`，并通过 system request 交给原 Deep Agent
+
+Plan Mode 必须提供明确模型和具体 `BaseCheckpointSaver`。父 Plan 工作流挂载调用方传入的
+checkpointer、store 和 cache，所有子图从父图继承。恢复时必须保持同一个
+`Identity.threadId`。Plan 状态位于根状态的 `tinkerfin_plan` 字段，`PlanDraft`、
+`ConfirmedPlan`、`PlanState` 等公开模型从 `tinkerfin.plan` 导入。
+
+Plan Mode 固定使用 `sync` checkpoint durability。通常省略 `durability` 即可；显式传入
+`sync` 也可以，`async` 和 `exit` 会在事件流开始前报错。
+
+在创建 Runtime 时选择本次请求的 mode：
+
+```python
+plan_runtime = agent.new(
+    identity=Identity(threadId="project-7", runId="run-1"),
+    mode="plan",
+)
+default_runtime = agent.new_agui(
+    identity=Identity(threadId="project-7", runId="run-2"),
+    mode="default",
+)
+```
+
+两次请求使用同一份 Plan-capable topology 和 state schema。`default` 绕过 Gate，`plan`
+进入 Gate；同一 checkpoint thread 的后续请求可以再次选择任一 mode。mode 不会成为应用
+state 字段。不能用普通 Definition 恢复 Plan-capable checkpoint。
+
 ## 创建一次原生 Runtime
 
 ```python
 runtime = agent.new(
     identity=Identity(threadId="project-7", runId="run-1"),
+    mode="default",
     on_part=None,
 )
 ```
@@ -63,6 +124,7 @@ runtime = agent.new(
 | 参数 | 默认值 | 作用 |
 | --- | --- | --- |
 | `identity` | 必填 | 本次运行的 `threadId` 与 `runId`，也用于 checkpoint 和并发协调 |
+| `mode` | Definition 默认值 | `default` 或 `plan`；普通 Definition 只接受 `default` |
 | `on_part` | `None` | 每条原生数据返回给调用方之前执行的观察函数 |
 
 ## 启动运行
@@ -100,7 +162,7 @@ stream = runtime.astream(
 | --- | --- | --- |
 | `interrupt_before` | `None` | 在指定节点执行前暂停 |
 | `interrupt_after` | `None` | 在指定节点执行后暂停 |
-| `durability` | `None` | 控制 checkpoint 的持久化时机 |
+| `durability` | `None` | 控制 checkpoint 的持久化时机；Plan Mode 必须使用 `sync` |
 | `control` | `None` | 传入 LangGraph 运行控制信息 |
 | 其他关键字参数 | 无 | 兼容当前 LangGraph 支持的附加运行参数 |
 

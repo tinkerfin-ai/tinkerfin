@@ -21,6 +21,7 @@ from .models import AgentRuntimeInterrupt as AgentRuntimeInterrupt
 from .resume import ResumeMapper as ResumeMapper
 from .resume import ResumeMappingError as ResumeMappingError
 from .resume import ResumeTranslation as ResumeTranslation
+from .runtime_interrupts import RuntimeInterruptEnvelope as RuntimeInterruptEnvelope
 from .sse import SseEventId as SseEventId
 from .sse import encode_sse as encode_sse
 from .stream import astream_events as astream_events
@@ -45,6 +46,7 @@ __all__ = [
     "ResumeMapper",
     "ResumeMappingError",
     "ResumeTranslation",
+    "RuntimeInterruptEnvelope",
     "ScopedIdCodec",
     "SseEventId",
     "astream_events",

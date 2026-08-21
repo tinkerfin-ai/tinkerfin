@@ -31,6 +31,7 @@ function conversation(
     pinned,
     updatedAt,
     model: 'GPT-5.5',
+    mode: 'default' as const,
     messages: content
       ? [
           {

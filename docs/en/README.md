@@ -20,6 +20,7 @@ If this is your first time using TinkerFin, read these sections in order.
 | Agent | A program that uses a model and tools to complete a task |
 | Graph | The workflow that actually executes the agent |
 | Runtime | The control object for one Graph run |
+| Plan Mode | An optional parent workflow that clarifies and reviews a Plan before Deep Agent execution |
 | stream | Data produced continuously while a run is active |
 | Identity | Framework identity containing only a stable `threadId` and one `runId` |
 | thread | A continuing conversation identified by `Identity.threadId` |

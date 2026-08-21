@@ -107,6 +107,36 @@ def _persisted_tool_interrupt(
     }
 
 
+def _persisted_plan_interrupt(
+    *,
+    interrupt_id: str,
+    kind: str = "plan_review",
+) -> dict[str, object]:
+    """构造 adapter 已验证并由服务端持久化的 Plan interrupt"""
+
+    envelope = {
+        "schema": "tinkerfin.runtime-interrupt.v1",
+        "kind": kind,
+        "message": "请确认 Plan",
+        "responseSchema": {"type": "object"},
+        "metadata": {"origin": "plan", "planRevision": 1},
+    }
+    return {
+        "id": interrupt_id,
+        "reason": kind,
+        "message": "请确认 Plan",
+        "responseSchema": {"type": "object"},
+        "metadata": {
+            "langgraphValue": envelope,
+            "runtimeInterrupt": {
+                "schema": "tinkerfin.runtime-interrupt.v1",
+                "nativeInterruptId": interrupt_id,
+                "envelope": envelope,
+            },
+        },
+    }
+
+
 def _patch_agent_graph(
     monkeypatch,
     graph,
@@ -210,6 +240,56 @@ def test_persisted_resume_rejects_malformed_prior_tool_call_ids(
         )
 
     assert raised.value.error_code is ConversationErrorCode.RESUME_REQUIRED
+
+
+def test_prepare_resume_abandons_plan_without_creating_a_graph_command() -> None:
+    """关闭 Plan 只记录 cancelled，不伪造 reject 或 Command"""
+
+    interrupt_id = "plan-interrupt-1"
+    request = ChatRequest.model_validate(
+        {
+            "threadId": "thread-1",
+            "runId": "run-disable-plan",
+            "state": {},
+            "messages": [],
+            "tools": [],
+            "context": [],
+            "forwardedProps": {"model": "main", "mode": "default"},
+            "resume": [
+                {
+                    "interruptId": interrupt_id,
+                    "status": "cancelled",
+                }
+            ],
+        }
+    )
+    now = datetime.now(UTC).replace(tzinfo=None)
+    pending = ConversationInterrupt(
+        conversation_thread_id=1,
+        run_id="run-plan",
+        resolved_run_id=None,
+        interrupt_id=interrupt_id,
+        status="pending",
+        reason="plan_review",
+        message="请确认 Plan",
+        request_json=_persisted_plan_interrupt(interrupt_id=interrupt_id),
+        resume_json=None,
+        created_at=now,
+        resolved_at=None,
+        updated_at=now,
+    )
+
+    prepared = prepare_resume(
+        request,
+        identity=conversation_identity(7, "thread-1", "run-disable-plan"),
+        existing_config=None,
+        interrupts=(pending,),
+    )
+
+    assert prepared.graph_input is None
+    assert prepared.binding is None
+    assert prepared.persisted_config == {"resume_abandoned": True}
+    assert prepared.claimed_interrupt_ids == frozenset({interrupt_id})
 
 
 async def test_non_empty_thread_id_must_belong_to_the_current_user(
@@ -783,6 +863,157 @@ async def test_concurrent_resume_claims_one_interrupt_for_exactly_one_run(
     assert stored_interrupt.resolved_run_id == winner_run_id
     assert [run.run_id for run in stored_runs] == [winner_run_id]
     assert all(run.run_id != loser_run_id for run in stored_runs)
+
+
+async def test_plan_abandon_claim_blocks_a_competing_resolved_resume(
+    database: Database,
+) -> None:
+    """Plan abandon 与正常恢复竞争时只能有一个 run 获得 interrupt"""
+
+    user = UserContext(
+        user_id=7,
+        username="alice",
+        display_name="Alice",
+        roles=(),
+        disabled=False,
+    )
+    thread_id = "thread-plan-abandon-race"
+    interrupt_id = "plan-interrupt-race"
+    now = datetime.now(UTC).replace(tzinfo=None)
+    async with database.session() as setup_session:
+        await AgentModelService(AgentModelRepository(setup_session)).upsert(
+            AgentModelWrite(
+                model_id="main",
+                display_name="Main",
+                provider="openai",
+                model_name="provider-main",
+                base_url="https://models.example.test/v1",
+                api_key=SecretStr("secret"),
+                enabled=True,
+                is_default=True,
+            )
+        )
+        repository = ConversationRepository(setup_session)
+        thread = await repository.create_thread(
+            user_id=user.user_id,
+            thread_id=thread_id,
+            title="Plan abandon 竞争",
+            model_id="main",
+        )
+        setup_session.add(
+            ConversationInterrupt(
+                conversation_thread_id=thread.id,
+                run_id="run-plan",
+                resolved_run_id=None,
+                interrupt_id=interrupt_id,
+                status="pending",
+                reason="plan_review",
+                message="请确认 Plan",
+                request_json=_persisted_plan_interrupt(interrupt_id=interrupt_id),
+                resume_json=None,
+                created_at=now,
+                resolved_at=None,
+                updated_at=now,
+            )
+        )
+        await repository.commit()
+
+    def resume_request(*, run_id: str, cancelled: bool) -> ChatRequest:
+        entry: dict[str, object] = {
+            "interruptId": interrupt_id,
+            "status": "cancelled" if cancelled else "resolved",
+        }
+        if not cancelled:
+            entry["payload"] = {"type": "approve", "baseRevision": 1}
+        return ChatRequest.model_validate(
+            {
+                "threadId": thread_id,
+                "runId": run_id,
+                "state": {},
+                "messages": [],
+                "tools": [],
+                "context": [],
+                "forwardedProps": {
+                    "model": "main",
+                    "mode": "default" if cancelled else "plan",
+                },
+                "resume": [entry],
+            }
+        )
+
+    abandon = resume_request(run_id="run-abandon", cancelled=True)
+    approve = resume_request(run_id="run-approve", cancelled=False)
+    async with Messaging(backend=MemoryBackend()) as messaging:
+        resources = cast(
+            ApplicationResources,
+            SimpleNamespace(
+                settings=SimpleNamespace(tavily_api_key=None),
+                agent_persistence=object(),
+                sandbox_manager=object(),
+                tinkerfin=TinkerFin(
+                    run_coordinator=InMemoryRunCoordinator(
+                        key_resolver=lambda identity: identity.thread_id
+                    )
+                ),
+                conversation_channel=messaging.channel(
+                    name="studio-conversation-agui",
+                    codec=AgUiCodec(),
+                ),
+                conversation_projector=ProjectionProbe(),
+            ),
+        )
+        async with (
+            database.session() as abandon_session,
+            database.session() as approve_session,
+        ):
+            prepared = await ConversationChatService(
+                abandon_session,
+                user=user,
+                resources=resources,
+            ).start(abandon, last_event_id="0")
+            frames = await _collect_frames(prepared.body)
+            with pytest.raises(BusinessException) as raised:
+                await ConversationChatService(
+                    approve_session,
+                    user=user,
+                    resources=resources,
+                ).start(approve, last_event_id="0")
+
+    events = [json.loads(frame.split(b"data: ", 1)[1]) for frame in frames]
+    assert [event["type"] for event in events] == ["RUN_STARTED", "RUN_ERROR"]
+    assert events[-1]["code"] == "resume_cancelled"
+    assert raised.value.error_code is ConversationErrorCode.RESUME_ALREADY_CLAIMED
+    async with database.session() as verification_session:
+        repository = ConversationRepository(verification_session)
+        stored_thread = await repository.get_thread(
+            user_id=user.user_id,
+            thread_id=thread_id,
+        )
+        assert stored_thread is not None
+        stored_interrupt = await verification_session.scalar(
+            select(ConversationInterrupt).where(
+                ConversationInterrupt.conversation_thread_id == stored_thread.id,
+                ConversationInterrupt.interrupt_id == interrupt_id,
+            )
+        )
+        abandon_run = await repository.get_run(
+            thread_pk=stored_thread.id,
+            run_id=abandon.run_id,
+        )
+        approve_run = await repository.get_run(
+            thread_pk=stored_thread.id,
+            run_id=approve.run_id,
+        )
+    assert stored_interrupt is not None
+    assert stored_interrupt.resolved_run_id == abandon.run_id
+    assert abandon_run is not None
+    abandon_config = abandon_run.config_json
+    assert abandon_config is not None
+    assert abandon_config["thread_id"] == (f"users/{user.user_id}/threads/{thread_id}")
+    assert abandon_config["model_id"] == "main"
+    assert abandon_config["resume_abandoned"] is True
+    assert "resume_data" not in abandon_config
+    assert approve_run is None
 
 
 async def test_concurrent_same_run_resume_attaches_without_reopening_agent(

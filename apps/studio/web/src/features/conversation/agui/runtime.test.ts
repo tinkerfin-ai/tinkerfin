@@ -3,8 +3,8 @@ import { describe, expect, it } from 'vitest'
 import type { ConversationAgUiEvent, InterruptEvent } from '../../../api/conversation/types'
 import type { ConversationEventEnvelope, ConversationHistoryDetail } from '../../../api/conversation/history'
 import { buildEmptyConversation } from '../../../lib/workspace'
-import type { ApprovalItem, Conversation, Message, WorkspaceState } from '../../../types'
-import { applyConversationEvent, applyHistoryEventEnvelope, buildResumePayload, markConversationDetached, normalizeWorkspace, prepareResumeSubmission, restoreConversationFromHistory } from './runtime'
+import type { ApprovalItem, Conversation, Message, PlanReviewState, WorkspaceState } from '../../../types'
+import { applyConversationEvent, applyHistoryEventEnvelope, buildPlanAbandonPayload, buildPlanResumePayload, buildResumePayload, markConversationDetached, normalizeWorkspace, prepareResumeSubmission, restoreConversationFromHistory } from './runtime'
 
 const THREAD_ID = 'thread-order-check'
 const RUN_ID = 'run-order-check'
@@ -1058,7 +1058,7 @@ describe('AG-UI runtime reducer', () => {
       ...interrupted,
       threadId: THREAD_ID,
       approval: approval ? { ...approval, items } : approval,
-    }, 'default')
+    })
 
     expect(payload.forwardedProps).toEqual({ model: 'GPT-5.5', mode: 'default' })
     expect(payload.resume?.map((entry) => entry.interruptId)).toEqual([
@@ -1148,7 +1148,7 @@ describe('AG-UI runtime reducer', () => {
       model: 'GPT-5.5',
     })
 
-    expect(() => buildResumePayload({ ...current, approval }, 'default')).toThrow()
+    expect(() => buildResumePayload({ ...current, approval })).toThrow()
   })
 
   it('rejects a resume payload when the authoritative interrupt group has changed', () => {
@@ -1175,7 +1175,6 @@ describe('AG-UI runtime reducer', () => {
 
     expect(() => buildResumePayload(
       { ...current, approval },
-      'default',
       ['interrupt-old'],
     )).toThrow('审批状态已更新')
   })
@@ -1677,6 +1676,7 @@ describe('AG-UI runtime reducer', () => {
             targetMessageId: 'tool-write-todos-v2',
           },
         ],
+        mode: 'plan',
         approval: null,
         runStatus: 'idle',
         activeRunId: null,
@@ -1717,6 +1717,7 @@ describe('AG-UI runtime reducer', () => {
     expect(subagent?.meta?.input).toBe('对比 A 与 B，并给出处')
     expect(assistant?.content).toBe('已有内容')
     expect(restored.messages.filter((message) => message.id === 'assistant-v2')).toHaveLength(1)
+    expect(restored.mode).toBe('plan')
     expect(restored.lastSeq).toBe(12)
     expect(restored.runStatus).toBe('idle')
   })
@@ -1889,5 +1890,175 @@ describe('AG-UI runtime reducer', () => {
     expect(() => applyHistoryEventEnvelope(initial, gap)).toThrow(
       '会话事件序号不连续: expected=2, actual=3',
     )
+  })
+
+  it('maps Plan clarification options without creating a Tool approval', () => {
+    const current = buildEmptyConversation({
+      threadId: THREAD_ID,
+      now: '2026-08-05T08:00:00.000Z',
+      model: 'GPT-5.5',
+      mode: 'plan',
+    })
+    const interrupted = applyConversationEvent(current, {
+      type: 'RUN_FINISHED',
+      threadId: THREAD_ID,
+      runId: RUN_ID,
+      outcome: {
+        type: 'interrupt',
+        interrupts: [{
+          id: 'plan-question-1',
+          reason: 'plan_clarification',
+          metadata: {
+            runtimeInterrupt: {
+              envelope: {
+                metadata: {
+                  questions: [{
+                    id: 'environment',
+                    prompt: '部署到哪个环境？',
+                    options: [{ id: 'staging', label: '预发布', description: '先验证' }],
+                    allowCustomAnswer: true,
+                  }],
+                },
+              },
+            },
+          },
+        }],
+      },
+    })
+
+    expect(interrupted.approval).toBeUndefined()
+    expect(interrupted.planInteraction?.kind).toBe('questions')
+    if (interrupted.planInteraction?.kind !== 'questions') throw new Error('missing questions')
+    const ready = {
+      ...interrupted,
+      planInteraction: {
+        ...interrupted.planInteraction,
+        questions: interrupted.planInteraction.questions.map((question) => ({
+          ...question,
+          selectedOptionId: 'staging',
+        })),
+      },
+    }
+    const payload = buildPlanResumePayload(ready)
+    expect(payload.forwardedProps.mode).toBe('plan')
+    expect(payload.resume?.[0]).toMatchObject({
+      interruptId: 'plan-question-1',
+      status: 'resolved',
+      payload: {
+        type: 'respond',
+        answers: [{
+          questionId: 'environment',
+          answer: '预发布',
+          optionId: 'staging',
+        }],
+      },
+    })
+  })
+
+  it('maps Plan review decisions and abandons only the Plan request', () => {
+    const current = buildEmptyConversation({
+      threadId: THREAD_ID,
+      now: '2026-08-05T08:00:00.000Z',
+      model: 'GPT-5.5',
+      mode: 'plan',
+    })
+    const interrupted = applyConversationEvent(current, {
+      type: 'RUN_FINISHED',
+      threadId: THREAD_ID,
+      runId: RUN_ID,
+      outcome: {
+        type: 'interrupt',
+        interrupts: [{
+          id: 'plan-review-1',
+          reason: 'plan_review',
+          metadata: {
+            runtimeInterrupt: {
+              envelope: {
+                metadata: {
+                  planRevision: 2,
+                  draft: {
+                    revision: 2,
+                    goal: '实现模式切换',
+                    steps: [{ id: 'step-1', title: '实现', description: '完成实现' }],
+                  },
+                },
+              },
+            },
+          },
+        }],
+      },
+    })
+    expect(interrupted.planInteraction?.kind).toBe('review')
+    if (interrupted.planInteraction?.kind !== 'review') throw new Error('missing review')
+    const approved = {
+      ...interrupted,
+      planInteraction: { ...interrupted.planInteraction, action: 'approve' as const },
+    }
+
+    expect(buildPlanResumePayload(approved).resume?.[0]?.payload).toEqual({
+      type: 'approve',
+      baseRevision: 2,
+    })
+    expect(buildPlanAbandonPayload(interrupted)).toMatchObject({
+      messages: [],
+      forwardedProps: { model: 'GPT-5.5', mode: 'default' },
+      resume: [{ interruptId: 'plan-review-1', status: 'cancelled' }],
+    })
+  })
+
+  it('builds every fixed Plan review action without changing the action vocabulary', () => {
+    const base = buildEmptyConversation({
+      threadId: THREAD_ID,
+      now: '2026-08-05T08:00:00.000Z',
+      model: 'GPT-5.5',
+      mode: 'plan',
+    })
+    const interaction: PlanReviewState = {
+      kind: 'review',
+      interruptId: 'plan-review-actions',
+      revision: 4,
+      submitted: false,
+      draft: {
+        schemaVersion: 1,
+        revision: 4,
+        goal: '实现四种动作',
+        steps: [{ id: 'step-1', title: '实现', description: '实现合同' }],
+      },
+    }
+    const payloadFor = (patch: Partial<PlanReviewState>) => buildPlanResumePayload({
+      ...base,
+      planInteraction: { ...interaction, ...patch },
+    })
+
+    expect(payloadFor({ action: 'approve' }).resume?.[0]?.payload).toEqual({
+      type: 'approve',
+      baseRevision: 4,
+    })
+    expect(payloadFor({
+      action: 'edit',
+      editedDraft: JSON.stringify({
+        schemaVersion: 1,
+        revision: 99,
+        goal: '编辑后',
+        steps: [{ id: 'step-1', title: '编辑', description: '编辑合同' }],
+      }),
+    }).resume?.[0]?.payload).toEqual({
+      type: 'edit',
+      baseRevision: 4,
+      draft: {
+        goal: '编辑后',
+        steps: [{ id: 'step-1', title: '编辑', description: '编辑合同' }],
+      },
+    })
+    expect(payloadFor({ action: 'respond', message: '补充回归验证' }).resume?.[0]?.payload).toEqual({
+      type: 'respond',
+      baseRevision: 4,
+      message: '补充回归验证',
+    })
+    expect(payloadFor({ action: 'reject', message: '目标不再需要' }).resume?.[0]?.payload).toEqual({
+      type: 'reject',
+      baseRevision: 4,
+      message: '目标不再需要',
+    })
   })
 })

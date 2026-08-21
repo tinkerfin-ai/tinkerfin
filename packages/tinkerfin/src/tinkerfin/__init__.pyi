@@ -28,6 +28,7 @@ from .errors import TinkerFinError as TinkerFinError
 from .errors import TinkerFinErrorCode as TinkerFinErrorCode
 from .errors import TinkerFinLifecycleError as TinkerFinLifecycleError
 from .errors import TinkerFinStreamProtocolError as TinkerFinStreamProtocolError
+from .plan import AgentMode as AgentMode
 from .runtime import AgUiEventStream as AgUiEventStream
 from .runtime import AgUiNativeStreamConfig as AgUiNativeStreamConfig
 from .runtime import (
@@ -50,6 +51,14 @@ from .runtime import TinkerFin as _RuntimeTinkerFin
 from .runtime import TinkerFinRun as TinkerFinRun
 
 class TinkerFin(_RuntimeTinkerFin):
+    def plan(
+        self,
+        *,
+        enabled: bool = True,
+        default_mode: AgentMode = "default",
+        gate_model: str | BaseChatModel | None = None,
+        planner_model: str | BaseChatModel | None = None,
+    ) -> TinkerFin: ...
     def create_deep_agent(
         self,
         model: str | BaseChatModel | None = None,

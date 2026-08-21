@@ -48,7 +48,7 @@ def _model_config() -> AgentModelConfig:
     )
 
 
-def _run_input() -> RunAgentInput:
+def _run_input(*, mode: str = "default") -> RunAgentInput:
     return RunAgentInput.model_validate(
         {
             "threadId": "thread-1",
@@ -57,17 +57,21 @@ def _run_input() -> RunAgentInput:
             "messages": [],
             "tools": [],
             "context": [],
-            "forwardedProps": {"model": "main", "mode": "default"},
+            "forwardedProps": {"model": "main", "mode": mode},
         }
     )
 
 
-def _prepared():
+def _prepared(*, mode: str = "default"):
     return prepare_run_request(
-        ChatRequest.from_agui(_run_input()),
+        ChatRequest.from_agui(_run_input(mode=mode)),
         user_id=7,
         thread_id="thread-1",
     )
+
+
+def test_prepare_run_request_preserves_the_selected_agent_mode() -> None:
+    assert _prepared(mode="plan").mode == "plan"
 
 
 async def test_create_agui_events_defers_definition_and_enriches_main_start(
@@ -77,6 +81,7 @@ async def test_create_agui_events_defers_definition_and_enriches_main_start(
 
     definition_calls = 0
     runtime_calls = 0
+    runtime_options: dict[str, object] = {}
 
     class Runtime:
         def astream(self, graph_input, config=None):
@@ -93,7 +98,7 @@ async def test_create_agui_events_defers_definition_and_enriches_main_start(
 
     class Definition:
         def new_agui(self, **kwargs):
-            del kwargs
+            runtime_options.update(kwargs)
             return Runtime()
 
     async def create_definition(_factory, *, user_id, model_config):
@@ -132,6 +137,7 @@ async def test_create_agui_events_defers_definition_and_enriches_main_start(
 
     assert definition_calls == 1
     assert runtime_calls == 1
+    assert runtime_options["mode"] == "default"
     assert len(emitted) == 1
     started = emitted[0]
     assert isinstance(started, RunStartedEvent)

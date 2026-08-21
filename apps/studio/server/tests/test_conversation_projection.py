@@ -152,6 +152,101 @@ async def test_projection_builds_tool_todo_and_interrupt_snapshot(
     assert await repository.count_events(thread.id) == len(events)
 
 
+async def test_projection_preserves_plan_mode_and_pending_plan_interrupt(
+    session: AsyncSession,
+) -> None:
+    """Plan 暂停必须通过同一 v2 快照恢复 mode 与交互，不伪造 Tool 审批"""
+
+    repository = ConversationRepository(session)
+    thread = await repository.create_thread(
+        user_id=7,
+        thread_id="thread-1",
+        title="Plan 投影",
+        model_id="main",
+    )
+    await repository.create_main_run(
+        thread_id=thread.id,
+        run_id="run-1",
+        model_id="main",
+        input_json={
+            "messages": [],
+            "forwardedProps": {"model": "main", "mode": "plan"},
+        },
+        config_json={},
+    )
+    await session.commit()
+    projector = ConversationProjector(session)
+    events = [
+        {
+            "type": "RUN_STARTED",
+            "threadId": "thread-1",
+            "runId": "run-1",
+        },
+        {
+            "type": "RUN_FINISHED",
+            "threadId": "thread-1",
+            "runId": "run-1",
+            "outcome": {
+                "type": "interrupt",
+                "interrupts": [
+                    {
+                        "id": "plan-interrupt-1",
+                        "reason": "plan_clarification",
+                        "message": "请补充部署环境",
+                        "responseSchema": {"type": "object"},
+                        "metadata": {
+                            "runtimeInterrupt": {
+                                "schema": "tinkerfin.runtime-interrupt.v1",
+                                "nativeInterruptId": "plan-interrupt-1",
+                                "envelope": {
+                                    "schema": "tinkerfin.runtime-interrupt.v1",
+                                    "kind": "plan_clarification",
+                                    "message": "请补充部署环境",
+                                    "responseSchema": {"type": "object"},
+                                    "metadata": {
+                                        "origin": "plan",
+                                        "source": "gate",
+                                        "questionIds": ["environment"],
+                                        "questions": [
+                                            {
+                                                "id": "environment",
+                                                "prompt": "部署到哪里？",
+                                                "options": [
+                                                    {
+                                                        "id": "staging",
+                                                        "label": "测试环境",
+                                                        "description": None,
+                                                    }
+                                                ],
+                                                "allowCustomAnswer": False,
+                                            }
+                                        ],
+                                    },
+                                },
+                            }
+                        },
+                    }
+                ],
+            },
+        },
+    ]
+
+    for seq, event in enumerate(events, start=1):
+        envelope, parsed = _envelope(seq, event)
+        await projector.project(thread_pk=thread.id, envelope=envelope, event=parsed)
+    await session.commit()
+
+    refreshed = await repository.get_thread_by_pk(thread.id)
+    assert refreshed is not None
+    assert refreshed.status == "waiting_approval"
+    assert refreshed.has_pending_interrupt is True
+    snapshot = refreshed.snapshot_json
+    assert snapshot is not None
+    assert snapshot["mode"] == "plan"
+    assert snapshot["approval"] is None
+    assert snapshot["interrupts"] == events[-1]["outcome"]["interrupts"]
+
+
 async def test_projection_is_idempotent_and_rejects_same_seq_with_other_payload(
     session: AsyncSession,
 ) -> None:

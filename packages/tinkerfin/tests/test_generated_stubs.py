@@ -115,6 +115,7 @@ def test_generated_stubs_match_both_upstream_parameter_lists() -> None:
 
 
 def test_generated_stub_declares_precise_facade_return_types() -> None:
+    plan = _stub_method(_INIT_STUB, "TinkerFin", "plan")
     create = _stub_method(_INIT_STUB, "TinkerFin", "create_deep_agent")
     native_new = _stub_method(_DEEP_AGENT_STUB, "DeepAgentDefinition", "new")
     agui_new = _stub_method(
@@ -133,6 +134,7 @@ def test_generated_stub_declares_precise_facade_return_types() -> None:
         "astream",
     )
 
+    assert _return_type(plan) == "TinkerFin"
     assert _return_type(create) == "DeepAgentDefinition[ContextT]"
     assert _return_type(native_new) == "DeepAgentRuntime[ContextT]"
     assert _return_type(agui_new) == "DeepAgentAgUiRuntime[ContextT]"
@@ -165,6 +167,7 @@ def test_built_wheel_contains_the_generated_stubs(tmp_path: Path) -> None:
 
     assert "tinkerfin/py.typed" in names
     assert "tinkerfin/agui_resume.py" in names
+    assert "tinkerfin/plan/__init__.py" in names
     assert "tinkerfin/__init__.pyi" in names
     assert "tinkerfin/deep_agent.pyi" in names
 

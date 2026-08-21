@@ -245,7 +245,6 @@ async def test_sqlite_export_initializes_a_runtime_compatible_empty_database(
     ("dialect_name", "server_version", "supports_skip_locked"),
     [
         ("sqlite", (3, 49, 1), False),
-        ("mysql", (5, 7, 44), False),
         ("mysql", (8, 0, 41), True),
         ("mysql", (8, 4, 6), True),
     ],
@@ -271,8 +270,8 @@ def test_runtime_dialect_capabilities_distinguish_supported_servers(
 @pytest.mark.parametrize(
     ("dialect_name", "server_version", "is_mariadb", "match"),
     [
-        ("mysql", (5, 6, 51), False, "5.7.*8.x"),
-        ("mysql", (9, 0, 0), False, "5.7.*8.x"),
+        ("mysql", (5, 6, 51), False, "supports MySQL"),
+        ("mysql", (9, 0, 0), False, "supports MySQL"),
         ("mysql", (10, 11, 0), True, "MariaDB"),
         ("sqlite", (), False, "version"),
     ],
@@ -304,14 +303,9 @@ def test_runtime_dialect_capabilities_reject_unverified_servers(
         select(sqlalchemy_lifecycle._cleanup),
     ],
 )
-def test_mysql_claim_lock_sql_is_selected_from_server_capabilities(
+def test_mysql8_claim_lock_sql_uses_skip_locked(
     statement: Select[tuple[object, ...]],
 ) -> None:
-    mysql57 = sqlalchemy_lifecycle._resolve_dialect_capabilities(
-        dialect_name="mysql",
-        server_version=(5, 7, 44),
-        is_mariadb=False,
-    )
     mysql8 = sqlalchemy_lifecycle._resolve_dialect_capabilities(
         dialect_name="mysql",
         server_version=(8, 0, 41),
@@ -319,12 +313,6 @@ def test_mysql_claim_lock_sql_is_selected_from_server_capabilities(
     )
     compiler = mysql_dialect.dialect()
 
-    mysql57_sql = str(
-        sqlalchemy_lifecycle._apply_claim_lock(
-            statement,
-            capabilities=mysql57,
-        ).compile(dialect=compiler)
-    )
     mysql8_sql = str(
         sqlalchemy_lifecycle._apply_claim_lock(
             statement,
@@ -332,6 +320,4 @@ def test_mysql_claim_lock_sql_is_selected_from_server_capabilities(
         ).compile(dialect=compiler)
     )
 
-    assert mysql57_sql.endswith("FOR UPDATE")
-    assert "SKIP LOCKED" not in mysql57_sql
     assert mysql8_sql.endswith("FOR UPDATE SKIP LOCKED")

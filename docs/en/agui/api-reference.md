@@ -61,11 +61,16 @@ See [AG-UI basics](index.md) for Runtime parameters and [Interrupts and resume](
 | Model | Fields |
 | --- | --- |
 | `AgentRuntimeInterrupt` | Non-empty `id`, JSON `value` |
+| `RuntimeInterruptEnvelope` | Versioned `schema`, non-empty `kind`, optional `message`, response JSON Schema, and trusted metadata |
 | `HitlActionRequest` | Non-empty `name`, object `args`, optional `description` |
 | `HitlReviewConfig` | `actionName`, non-empty `allowedDecisions`, optional `argsSchema` |
 | `HitlRequest` | Equally sized, non-empty `actionRequests` and `reviewConfigs` |
 
 Allowed decisions are `approve`, `edit`, `reject`, and `respond`. Action and review entries pair by position.
+
+`RuntimeInterruptEnvelope` supports non-Tool workflow pauses. It maps `kind` to the
+AG-UI interrupt reason and leaves domain validation of the resolved JSON object to the
+emitting graph. Runtime and Tool interrupts cannot share one pending batch.
 
 ## IDs and errors
 

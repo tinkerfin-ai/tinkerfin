@@ -10,6 +10,7 @@ from langchain_core.language_models.fake_chat_models import FakeMessagesListChat
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import Runnable
 from langchain_core.tools import BaseTool
+from langgraph.checkpoint.memory import InMemorySaver
 
 from tinkerfin import (
     AgUiEventStream,
@@ -47,11 +48,25 @@ if TYPE_CHECKING:
     )
     assert_type(definition, DeepAgentDefinition[_Context])
 
+    planned = tinkerfin.plan(enabled=True)
+    assert_type(planned, TinkerFin)
+    planned_definition = planned.create_deep_agent(
+        model=_FakeModel(responses=[AIMessage(content="ok")]),
+        tools=[],
+        context_schema=_Context,
+        checkpointer=InMemorySaver(),
+    )
+    assert_type(planned_definition, DeepAgentDefinition[_Context])
+
     identity = Identity(threadId="thread-1", runId="run-1")
     native = definition.new(identity=identity)
     agui = definition.new_agui(identity=identity)
+    planned_native = planned_definition.new(identity=identity, mode="plan")
+    planned_agui = planned_definition.new_agui(identity=identity, mode="default")
     assert_type(native, DeepAgentRuntime[_Context])
     assert_type(agui, DeepAgentAgUiRuntime[_Context])
+    assert_type(planned_native, DeepAgentRuntime[_Context])
+    assert_type(planned_agui, DeepAgentAgUiRuntime[_Context])
 
     graph_input = cast(InputAgentState, {"messages": []})
     assert_type(

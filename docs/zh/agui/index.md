@@ -60,6 +60,7 @@ asyncio.run(main())
 ```python
 runtime = agent.new_agui(
     identity=identity,
+    mode="default",
     on_part=None,
     timeout=None,
     settlement_timeout=None,
@@ -73,6 +74,7 @@ runtime = agent.new_agui(
 | 参数 | 默认值 | 作用 |
 | --- | --- | --- |
 | `identity` | 必填 | 本次运行的 thread 和 run 身份 |
+| `mode` | Definition 默认值 | `default` 或 `plan`，只控制当前 Runtime 请求 |
 | `on_part` | `None` | 转换前观察每条 LangGraph v2 数据 |
 | `timeout` | `None` | 整条原生数据流的总时限 |
 | `settlement_timeout` | `None` | 调用方等待取消清理的时限；超时不会遗弃清理任务 |

@@ -63,11 +63,16 @@
 | 模型 | 字段 |
 | --- | --- |
 | `AgentRuntimeInterrupt` | 非空 `id`、JSON `value` |
+| `RuntimeInterruptEnvelope` | 带版本的 `schema`、非空 `kind`、可选 `message`、响应 JSON Schema 和可信 metadata |
 | `HitlActionRequest` | 非空 `name`、对象 `args`、可选 `description` |
 | `HitlReviewConfig` | `actionName`、非空 `allowedDecisions`、可选 `argsSchema` |
 | `HitlRequest` | 等长且非空的 `actionRequests` 与 `reviewConfigs` |
 
 允许的决定为 `approve`、`edit`、`reject`、`respond`。同一请求中的 action 和 review config 按位置配对。
+
+`RuntimeInterruptEnvelope` 用于非 Tool 工作流暂停。Adapter 把 `kind` 映射为 AG-UI
+interrupt reason，发出该 envelope 的 Graph 负责校验恢复 JSON 的业务语义。一个待处理批次
+不能同时包含 Runtime interrupt 和 Tool interrupt。
 
 ## ID 与错误
 

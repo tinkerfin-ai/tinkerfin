@@ -8,14 +8,43 @@ This page groups the public Runtime capabilities by how you use them. Most appli
 
 | API | When to use it | Main input or result |
 | --- | --- | --- |
-| `TinkerFin(run_coordinator=None)` | Create the main entry point | Optional shared coordinator |
+| `TinkerFin(run_coordinator=None, state_schema=None)` | Create the main entry point | Optional shared coordinator and Definition-wide state |
+| `TinkerFin.plan(...)` | Create an immutable Plan-capable factory | Capability default, request default mode, optional Gate/Planner models |
 | `TinkerFin.create_deep_agent(...)` | Create a reusable agent definition | See [Create and run a Deep Agent](deep-agents.md) |
 | `Identity(threadId=..., runId=...)` | Identify one framework run | Thread and run only |
 | `TinkerFin.run(...)` | Run a custom async source | `source_factory`, `identity`, `on_part` |
-| `DeepAgentDefinition.new(...)` | Create a native Runtime | Required `identity`, optional `on_part` |
-| `DeepAgentDefinition.new_agui(...)` | Create an AG-UI Runtime | See [AG-UI basics](../agui/index.md) |
+| `DeepAgentDefinition.new(...)` | Create a native Runtime | Required `identity`, optional request `mode` and `on_part` |
+| `DeepAgentDefinition.new_agui(...)` | Create an AG-UI Runtime | Optional request `mode`; see [AG-UI basics](../agui/index.md) |
 
 Reuse `DeepAgentDefinition`. Treat `DeepAgentRuntime`, `DeepAgentAgUiRuntime`, `TinkerFinRun`, and `NativeTinkerFinRun` as single-use values returned by the entry points rather than constructing them directly.
+
+`.plan(enabled=True)` affects only definitions created from the returned factory. It
+does not add a parameter to `create_deep_agent(...)`. The returned factory retains its
+coordinator and global state schema. Plan definitions require an explicit model and a
+concrete `BaseCheckpointSaver`; invalid configuration raises
+`tinkerfin.plan.PlanModeConfigurationError`.
+
+Choose the current request path with `mode="default"` or `mode="plan"` on `new()` or
+`new_agui()`. Omitting it uses `.plan(default_mode=...)`. A Plan-capable Definition keeps
+one topology and state schema across both modes, so the same checkpoint thread can
+switch on a later request. An ordinary Definition accepts only `default`. Mode is
+framework request control and is not added to caller state; attempting to override the
+reserved configurable key fails before streaming.
+
+## Plan Mode values
+
+The top-level package exports `AgentMode`. The `tinkerfin.plan` package exports
+`PlanStep`, `PlanDraft`, `ConfirmedPlan`, `ClarificationOption`,
+`ClarificationQuestion`, `RequirementAnswer`, `PlanState`, `PlanStatus`, `PlanRoute`,
+and `PlanReviewAction`. The models are frozen. The root Graph state stores their
+camel-case JSON representation at `tinkerfin_plan`.
+
+`TinkerFin(state_schema=...)` contributes application state to every Deep Agent
+Definition created by that factory. It is composed with the Definition's
+`create_deep_agent(state_schema=...)`, public middleware additions, and stable Deep
+Agents filesystem/Todo fields. Reducers, `Required` / `NotRequired`, and schema metadata
+are retained; incompatible same-name fields fail during Definition creation. Runtime
+`context_schema` remains a separate non-checkpointed context contract.
 
 ## Stream objects
 
@@ -92,6 +121,7 @@ See [Custom sources and run coordination](extensions.md#use-a-renewable-redis-le
 | API | When it appears |
 | --- | --- |
 | `AgUiResumeBinding` | Resuming an interrupted AG-UI run |
+| `tinkerfin.plan.PlanModeConfigurationError` | A Plan definition lacks a concrete saver or explicit model, has an incompatible state schema, or requests non-sync durability |
 | `AgUiSettlementTimeoutError` | Caller wait ended before protected Runtime cleanup settled |
 | `AgUiNativeStreamConfigurationError` | Native options do not satisfy the AG-UI profile |
 

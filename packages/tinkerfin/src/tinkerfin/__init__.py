@@ -25,6 +25,7 @@ from .errors import TinkerFinError as TinkerFinError
 from .errors import TinkerFinErrorCode as TinkerFinErrorCode
 from .errors import TinkerFinLifecycleError as TinkerFinLifecycleError
 from .errors import TinkerFinStreamProtocolError as TinkerFinStreamProtocolError
+from .plan import AgentMode as AgentMode
 from .runtime import AgUiEventStream as AgUiEventStream
 from .runtime import AgUiNativeStreamConfig as AgUiNativeStreamConfig
 from .runtime import (
@@ -53,6 +54,7 @@ __all__ = [
     "AgUiNativeStreamInvocation",
     "AgUiResumeBinding",
     "AgUiSettlementTimeoutError",
+    "AgentMode",
     "DeepAgentAgUiRuntime",
     "DeepAgentDefinition",
     "DeepAgentRuntime",

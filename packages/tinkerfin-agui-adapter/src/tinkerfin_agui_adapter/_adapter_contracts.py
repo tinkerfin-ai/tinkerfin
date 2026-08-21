@@ -48,6 +48,11 @@ from .reasoning import (
     normalize_operational_data,
     sanitize_public_data,
 )
+from .runtime_interrupts import (
+    RuntimeInterruptEnvelope,
+    parse_runtime_interrupt,
+    prepare_runtime_ag_ui_interrupt,
+)
 
 if TYPE_CHECKING:
     from .adapter import DeepAgentAgUiAdapter
@@ -646,9 +651,24 @@ def _prepare_ag_ui_interrupts(
 
     if not native_interrupts:
         return []
-    parsed: list[tuple[AgentRuntimeInterrupt, HitlRequest | None]] = []
+    parsed: list[
+        tuple[
+            AgentRuntimeInterrupt,
+            HitlRequest | None,
+            RuntimeInterruptEnvelope | None,
+        ]
+    ] = []
     action_groups: list[Sequence[HitlActionRequest]] = []
     for interrupt in native_interrupts:
+        try:
+            runtime_envelope = parse_runtime_interrupt(interrupt.value)
+        except ValidationError as error:
+            raise HitlCorrelationError(
+                f"invalid TinkerFin runtime interrupt: {interrupt.id}"
+            ) from error
+        if runtime_envelope is not None:
+            parsed.append((interrupt, None, runtime_envelope))
+            continue
         try:
             request = HitlRequest.model_validate(interrupt.value)
         except ValidationError as error:
@@ -660,9 +680,16 @@ def _prepare_ag_ui_interrupts(
                     f"invalid Deep Agents HITL interrupt: {interrupt.id}"
                 ) from error
             request = None
-        parsed.append((interrupt, request))
+        parsed.append((interrupt, request, None))
         if request is not None:
             action_groups.append(request.action_requests)
+
+    if any(request is not None for _, request, _ in parsed) and any(
+        runtime is not None for _, _, runtime in parsed
+    ):
+        raise HitlCorrelationError(
+            "runtime and Deep Agents Tool interrupts cannot share one batch"
+        )
 
     matched_id_groups = self._tool_call_id_groups_for_actions(
         source.namespace,
@@ -671,7 +698,16 @@ def _prepare_ag_ui_interrupts(
     )
     matched_group_index = 0
     prepared: list[AgUiInterrupt] = []
-    for interrupt, request in parsed:
+    for interrupt, request, runtime_envelope in parsed:
+        if runtime_envelope is not None:
+            prepared.append(
+                prepare_runtime_ag_ui_interrupt(
+                    interrupt,
+                    runtime_envelope,
+                    source=source.model_dump(mode="json", by_alias=True),
+                )
+            )
+            continue
         if request is None:
             prepared.append(
                 AgUiInterrupt(

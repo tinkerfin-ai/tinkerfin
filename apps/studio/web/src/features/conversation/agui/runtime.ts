@@ -156,6 +156,90 @@ const approvalItemsFromInterrupts = (interrupts: InterruptEvent[]): ApprovalItem
     }
   })
 
+interface PlanInterruptLike {
+  id: string
+  reason: string
+  message?: string | null
+  responseSchema?: JsonObject | null
+  metadata?: JsonObject | null
+}
+
+const runtimeEnvelopeMetadata = (interrupt: PlanInterruptLike): JsonObject | null => {
+  const runtimeInterrupt = interrupt.metadata?.runtimeInterrupt
+  if (!runtimeInterrupt || typeof runtimeInterrupt !== 'object' || Array.isArray(runtimeInterrupt)) return null
+  const envelope = runtimeInterrupt.envelope
+  if (!envelope || typeof envelope !== 'object' || Array.isArray(envelope)) return null
+  const metadata = envelope.metadata
+  return metadata && typeof metadata === 'object' && !Array.isArray(metadata)
+    ? metadata as JsonObject
+    : null
+}
+
+const planInteractionFromInterrupts = (
+  interrupts: readonly PlanInterruptLike[],
+): Conversation['planInteraction'] => {
+  if (interrupts.length !== 1) return undefined
+  const interrupt = interrupts[0]
+  if (!interrupt) return undefined
+  const metadata = runtimeEnvelopeMetadata(interrupt)
+  if (!metadata) return undefined
+
+  if (interrupt.reason === 'plan_clarification') {
+    if (!Array.isArray(metadata.questions)) return undefined
+    const questions = metadata.questions.flatMap((rawQuestion) => {
+      if (!rawQuestion || typeof rawQuestion !== 'object' || Array.isArray(rawQuestion)) return []
+      const question = rawQuestion as JsonObject
+      if (typeof question.id !== 'string' || typeof question.prompt !== 'string') return []
+      const options = Array.isArray(question.options)
+        ? question.options.flatMap((rawOption) => {
+            if (!rawOption || typeof rawOption !== 'object' || Array.isArray(rawOption)) return []
+            const option = rawOption as JsonObject
+            if (typeof option.id !== 'string' || typeof option.label !== 'string') return []
+            return [{
+              id: option.id,
+              label: option.label,
+              description: typeof option.description === 'string' ? option.description : undefined,
+            }]
+          })
+        : []
+      return [{
+        id: question.id,
+        prompt: question.prompt,
+        options,
+        allowCustomAnswer: question.allowCustomAnswer !== false,
+      }]
+    })
+    if (questions.length !== metadata.questions.length || questions.length === 0) return undefined
+    return {
+      kind: 'questions',
+      interruptId: interrupt.id,
+      questions,
+      submitted: false,
+    }
+  }
+
+  if (interrupt.reason === 'plan_review') {
+    const revision = metadata.planRevision
+    const draft = metadata.draft
+    if (
+      typeof revision !== 'number'
+      || !Number.isInteger(revision)
+      || !draft
+      || typeof draft !== 'object'
+      || Array.isArray(draft)
+    ) return undefined
+    return {
+      kind: 'review',
+      interruptId: interrupt.id,
+      revision,
+      draft: draft as JsonObject,
+      submitted: false,
+    }
+  }
+
+  return undefined
+}
+
 const attachApproval = (conversation: Conversation, interrupts: InterruptEvent[]) => ({
   ...conversation,
   approval: {
@@ -475,10 +559,12 @@ type PersistedConversation = Partial<Conversation> & {
   pinned?: unknown
   updatedAt?: unknown
   model?: unknown
+  mode?: unknown
   messages?: unknown
   todos?: unknown
   plan?: unknown
   approval?: unknown
+  planInteraction?: unknown
   runStatus?: unknown
   activeRunId?: unknown
   serverState?: unknown
@@ -493,6 +579,9 @@ type PersistedWorkspaceState = {
 
 const isConversationRunStatus = (value: unknown): value is Conversation["runStatus"] =>
   value === "idle" || value === "streaming" || value === "waiting_approval" || value === "detached" || value === "error"
+
+const isAgentMode = (value: unknown): value is AgentMode =>
+  value === "default" || value === "plan"
 
 const legacyConversationIdFromPersistedConversation = (conversation: PersistedConversation): string =>
   typeof conversation.id === "string" ? conversation.id : ""
@@ -518,10 +607,12 @@ export const normalizeWorkspace = (workspace: PersistedWorkspaceState): Workspac
         pinned: Boolean(conversation.pinned),
         updatedAt: typeof conversation.updatedAt === "string" ? conversation.updatedAt : nowIso(),
         model: typeof conversation.model === "string" && conversation.model ? conversation.model : "GPT-5.5",
+        mode: isAgentMode(conversation.mode) ? conversation.mode : "default",
         messages: normalizeConversationMessages(Array.isArray(conversation.messages) ? conversation.messages as Message[] : []),
         todos: Array.isArray(conversation.todos) ? conversation.todos as TodoItem[] : [],
         plan: (conversation.plan as Conversation["plan"] | undefined) ?? null,
         approval: conversation.approval as Conversation["approval"],
+        planInteraction: conversation.planInteraction as Conversation["planInteraction"],
         runStatus: isConversationRunStatus(conversation.runStatus) ? conversation.runStatus : "idle",
         activeRunId: typeof conversation.activeRunId === "string" ? conversation.activeRunId : undefined,
         serverState:
@@ -565,7 +656,6 @@ export const normalizeWorkspace = (workspace: PersistedWorkspaceState): Workspac
 export const buildInitialPayload = (
   conversation: Conversation,
   content: string,
-  mode: AgentMode,
 ): ChatRequestPayload => {
   const runId = createRunId()
   return {
@@ -583,7 +673,7 @@ export const buildInitialPayload = (
     context: [],
     forwardedProps: {
       model: conversation.model,
-      mode,
+      mode: conversation.mode,
     },
   }
 }
@@ -601,7 +691,6 @@ const matchesApprovalGroup = (
 
 export const buildResumePayload = (
   conversation: Conversation,
-  mode: AgentMode,
   expectedInterruptIds?: readonly string[],
 ): ChatRequestPayload => {
   const approval = conversation.approval
@@ -669,9 +758,105 @@ export const buildResumePayload = (
     context: [],
     forwardedProps: {
       model: conversation.model,
-      mode,
+      mode: conversation.mode,
     },
     resume,
+  }
+}
+
+export const buildPlanResumePayload = (
+  conversation: Conversation,
+): ChatRequestPayload => {
+  const interaction = conversation.planInteraction
+  if (!interaction) throw new Error("当前会话没有待处理的 Plan 请求")
+  if (interaction.submitted) throw new Error("当前 Plan 请求已经提交")
+
+  let payload: ChatResumeEntry['payload']
+  if (interaction.kind === 'questions') {
+    const answers = interaction.questions.map((question) => {
+      const option = question.options.find((item) => item.id === question.selectedOptionId)
+      const customAnswer = question.customAnswer?.trim() ?? ''
+      if (!option && !customAnswer) throw new Error("请回答所有 Plan 澄清问题")
+      if (!option && !question.allowCustomAnswer) throw new Error("该问题必须选择一个选项")
+      return {
+        questionId: question.id,
+        answer: option?.label ?? customAnswer,
+        ...(option ? { optionId: option.id } : {}),
+      }
+    })
+    payload = { type: 'respond', answers }
+  } else {
+    if (!interaction.action) throw new Error("请选择 Plan 处理方式")
+    if (interaction.action === 'approve') {
+      payload = { type: 'approve', baseRevision: interaction.revision }
+    } else if (interaction.action === 'edit') {
+      const draft = parseJsonObject(interaction.editedDraft ?? '')
+      if (!draft) throw new Error("编辑后的 Plan 必须是 JSON 对象")
+      const content = structuredClone(draft)
+      delete content.schemaVersion
+      delete content.revision
+      payload = {
+        type: 'edit',
+        baseRevision: interaction.revision,
+        draft: content,
+      }
+    } else if (interaction.action === 'respond') {
+      const message = interaction.message?.trim()
+      if (!message) throw new Error("请填写 Plan 修改意见")
+      payload = {
+        type: 'respond',
+        baseRevision: interaction.revision,
+        message,
+      }
+    } else {
+      const message = interaction.message?.trim()
+      payload = {
+        type: 'reject',
+        baseRevision: interaction.revision,
+        ...(message ? { message } : {}),
+      }
+    }
+  }
+
+  return {
+    threadId: conversation.threadId,
+    runId: createRunId(),
+    state: {},
+    messages: [],
+    tools: [],
+    context: [],
+    forwardedProps: {
+      model: conversation.model,
+      mode: conversation.mode,
+    },
+    resume: [{
+      interruptId: interaction.interruptId,
+      status: 'resolved',
+      payload,
+    }],
+  }
+}
+
+export const buildPlanAbandonPayload = (
+  conversation: Conversation,
+): ChatRequestPayload => {
+  const interaction = conversation.planInteraction
+  if (!interaction) throw new Error("当前会话没有可取消的 Plan 请求")
+  return {
+    threadId: conversation.threadId,
+    runId: createRunId(),
+    state: {},
+    messages: [],
+    tools: [],
+    context: [],
+    forwardedProps: {
+      model: conversation.model,
+      mode: 'default',
+    },
+    resume: [{
+      interruptId: interaction.interruptId,
+      status: 'cancelled',
+    }],
   }
 }
 
@@ -805,14 +990,19 @@ export const applyConversationEvent = (
           createdAt: nowIso(),
         }))
       const isResume = (event.input?.resume?.length ?? 0) > 0
+      const mode = isAgentMode(event.input?.forwardedProps?.mode)
+        ? event.input.forwardedProps.mode
+        : conversation.mode
       return {
         ...conversation,
         threadId: event.threadId,
         title: event.title?.trim() || conversation.title,
+        mode,
         activeRunId: event.runId,
         runStatus: "streaming",
         notice: undefined,
         approval: isResume ? undefined : conversation.approval,
+        planInteraction: undefined,
         messages: (
           persistedUserMessages.length > 0
             ? [...conversation.messages, ...persistedUserMessages]
@@ -1129,6 +1319,17 @@ export const applyConversationEvent = (
         }
 
       if (outcome.type === "interrupt") {
+        const planInteraction = planInteractionFromInterrupts(outcome.interrupts)
+        if (planInteraction) {
+          return {
+            ...conversation,
+            threadId: event.threadId,
+            runStatus: "waiting_approval",
+            activeRunId: undefined,
+            approval: undefined,
+            planInteraction,
+          }
+        }
         return attachApproval(
           markInterruptedToolCards(
             {
@@ -1150,6 +1351,7 @@ export const applyConversationEvent = (
         runStatus: "idle",
         activeRunId: undefined,
         approval: undefined,
+        planInteraction: undefined,
       }
       }
 
@@ -1176,6 +1378,8 @@ export const applyConversationEvent = (
             ...conversation,
             runStatus: isCancelled ? "idle" : "error",
             activeRunId: undefined,
+            approval: undefined,
+            planInteraction: undefined,
             messages: conversation.messages.map((message) => (
               (message.role === "tool" || message.role === "subagent")
                 && (message.meta?.status === "running" || message.meta?.status === "paused")
@@ -1230,12 +1434,16 @@ export const restoreConversationFromHistory = (
   const hasTrustedV2Snapshot = detail.snapshotVersion === 2
     && snapshot?.snapshotVersion === 2
     && snapshot.snapshotSeq === detail.snapshotSeq
+  const snapshotPlanInteraction = hasTrustedV2Snapshot
+    ? planInteractionFromInterrupts(snapshot?.interrupts ?? [])
+    : undefined
   const baseline: Conversation = {
     threadId: detail.threadId,
     title: detail.title,
     pinned: detail.pinned,
     updatedAt: detail.updatedAt,
     model: options.model,
+    mode: hasTrustedV2Snapshot && snapshot?.mode === "plan" ? "plan" : "default",
     messages: hasTrustedV2Snapshot ? messagesFromSnapshot(snapshot) : [],
     todos: hasTrustedV2Snapshot
       ? snapshot.todos.map((todo) => {
@@ -1245,9 +1453,10 @@ export const restoreConversationFromHistory = (
         })
       : [],
     plan: null,
-    approval: hasTrustedV2Snapshot && snapshot.approval
+    approval: hasTrustedV2Snapshot && !snapshotPlanInteraction && snapshot.approval
       ? snapshot.approval
       : undefined,
+    planInteraction: snapshotPlanInteraction,
     runStatus: ((): Conversation["runStatus"] => {
       switch (detail.status) {
         // 历史水化不拥有原始 SSE 连接；服务端仍在运行时，本地应标记为断连并通过
@@ -1277,6 +1486,7 @@ export const restoreConversationFromHistory = (
   return {
     ...restored,
     approval: hasAuthoritativeApproval ? restored.approval : undefined,
+    planInteraction: hasAuthoritativeApproval ? restored.planInteraction : undefined,
     runStatus: detail.status === "running"
       ? "detached"
       : hasAuthoritativeApproval

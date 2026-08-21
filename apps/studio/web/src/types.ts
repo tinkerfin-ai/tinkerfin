@@ -4,6 +4,7 @@ export type ApprovalDecision = 'approved' | 'rejected'
 export type ConversationRunStatus = 'idle' | 'streaming' | 'waiting_approval' | 'detached' | 'error'
 export type ApprovalMode = 'options' | 'edit' | 'reject'
 export type ApprovalAllowedDecision = 'approve' | 'edit' | 'reject' | 'respond'
+export type AgentMode = 'default' | 'plan'
 
 export interface JsonObject {
   [key: string]: JsonValue
@@ -87,17 +88,56 @@ export interface ApprovalState {
   error?: string
 }
 
+export interface PlanQuestionOption {
+  id: string
+  label: string
+  description?: string | null
+}
+
+export interface PlanQuestionItem {
+  id: string
+  prompt: string
+  options: PlanQuestionOption[]
+  allowCustomAnswer: boolean
+  selectedOptionId?: string
+  customAnswer?: string
+}
+
+export interface PlanQuestionState {
+  kind: 'questions'
+  interruptId: string
+  questions: PlanQuestionItem[]
+  submitted: boolean
+  error?: string
+}
+
+export interface PlanReviewState {
+  kind: 'review'
+  interruptId: string
+  revision: number
+  draft: JsonObject
+  action?: 'approve' | 'edit' | 'respond' | 'reject'
+  editedDraft?: string
+  message?: string
+  submitted: boolean
+  error?: string
+}
+
+export type PlanInteraction = PlanQuestionState | PlanReviewState
+
 export interface Conversation {
   threadId: string
   title: string
   pinned: boolean
   updatedAt: string
   model: string
+  mode: AgentMode
   messages: Message[]
   notice?: ConversationNotice
   todos: TodoItem[]
   plan: Plan | null
   approval?: ApprovalState
+  planInteraction?: PlanInteraction
   runStatus: ConversationRunStatus
   activeRunId?: string
   serverState?: JsonObject
