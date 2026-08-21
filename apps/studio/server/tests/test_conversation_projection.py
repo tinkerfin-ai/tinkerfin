@@ -1,3 +1,4 @@
+import json
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import cast
@@ -111,13 +112,11 @@ async def test_projection_builds_tool_todo_and_interrupt_snapshot(
                         "message": "确认写入",
                         "toolCallId": "tool-write",
                         "metadata": {
-                            "action_request": {
-                                "name": "write_file",
-                                "args": {"file_path": "/result.txt"},
-                            },
-                            "review_config": {
-                                "allowed_decisions": ["approve", "edit", "reject"]
-                            },
+                            "deepagents": {
+                                "toolName": "write_file",
+                                "originalArgs": {"file_path": "/result.txt"},
+                                "allowedDecisions": ["approve", "edit", "reject"],
+                            }
                         },
                     }
                 ],
@@ -147,7 +146,12 @@ async def test_projection_builds_tool_todo_and_interrupt_snapshot(
     messages = snapshot["messages"]
     assert isinstance(approval, dict)
     assert isinstance(messages, list)
-    assert approval["items"][0]["toolName"] == "write_file"
+    item = approval["items"][0]
+    assert item["toolName"] == "write_file"
+    assert item["toolCallId"] == "tool-write"
+    assert item["originalArgs"] == {"file_path": "/result.txt"}
+    assert item["allowedDecisions"] == ["approve", "edit", "reject"]
+    assert json.loads(item["params"]) == {"file_path": "/result.txt"}
     assert messages[0]["id"] == "user-1"
     assert await repository.count_events(thread.id) == len(events)
 
@@ -206,21 +210,28 @@ async def test_projection_preserves_plan_mode_and_pending_plan_interrupt(
                                     "metadata": {
                                         "origin": "plan",
                                         "source": "gate",
-                                        "questionIds": ["environment"],
-                                        "questions": [
-                                            {
-                                                "id": "environment",
-                                                "prompt": "部署到哪里？",
-                                                "options": [
+                                        "clarification": {
+                                            "schema": "tinkerfin.plan-clarification.v1",
+                                            "form": {
+                                                "schemaVersion": 1,
+                                                "questions": [
                                                     {
-                                                        "id": "staging",
-                                                        "label": "测试环境",
-                                                        "description": None,
+                                                        "id": "environment",
+                                                        "prompt": "部署到哪里？",
+                                                        "options": [
+                                                            {
+                                                                "id": "staging",
+                                                                "label": "测试环境",
+                                                                "description": None,
+                                                                "attributes": None,
+                                                            }
+                                                        ],
+                                                        "allowFreeText": False,
+                                                        "attributes": None,
                                                     }
                                                 ],
-                                                "allowCustomAnswer": False,
-                                            }
-                                        ],
+                                            },
+                                        },
                                     },
                                 },
                             }
@@ -245,6 +256,140 @@ async def test_projection_preserves_plan_mode_and_pending_plan_interrupt(
     assert snapshot["mode"] == "plan"
     assert snapshot["approval"] is None
     assert snapshot["interrupts"] == events[-1]["outcome"]["interrupts"]
+
+
+@pytest.mark.parametrize(
+    ("resume_status", "resume_payload", "error_code", "interrupt_status"),
+    (
+        ("resolved", {"type": "approve"}, "cancelled", "resolved"),
+        ("cancelled", None, "resume_cancelled", "cancelled"),
+    ),
+)
+async def test_resume_started_clears_pending_snapshot_before_later_error(
+    session: AsyncSession,
+    resume_status: str,
+    resume_payload: dict[str, str] | None,
+    error_code: str,
+    interrupt_status: str,
+) -> None:
+    """RUN_STARTED 后已处理审批不得因 resumed run 终止而重新 pending"""
+
+    repository = ConversationRepository(session)
+    thread = await repository.create_thread(
+        user_id=7,
+        thread_id="thread-resume-snapshot",
+        title="恢复快照",
+        model_id="main",
+    )
+    await repository.create_main_run(
+        thread_id=thread.id,
+        run_id="run-interrupted",
+        model_id="main",
+        input_json={"messages": []},
+        config_json={},
+    )
+    await session.commit()
+    projector = ConversationProjector(session)
+    interrupted_events = (
+        {
+            "type": "RUN_STARTED",
+            "threadId": thread.thread_id,
+            "runId": "run-interrupted",
+        },
+        {
+            "type": "RUN_FINISHED",
+            "threadId": thread.thread_id,
+            "runId": "run-interrupted",
+            "outcome": {
+                "type": "interrupt",
+                "interrupts": [
+                    {
+                        "id": "interrupt-resume",
+                        "reason": "tool_call",
+                        "message": "确认写入",
+                        "toolCallId": "tool-resume",
+                        "metadata": {
+                            "deepagents": {
+                                "toolName": "write_file",
+                                "originalArgs": {"file_path": "/resume.txt"},
+                                "allowedDecisions": ["approve", "reject"],
+                            }
+                        },
+                    }
+                ],
+            },
+        },
+    )
+    for seq, value in enumerate(interrupted_events, start=1):
+        envelope, event = _envelope(seq, value, run="run-interrupted")
+        await projector.project(thread_pk=thread.id, envelope=envelope, event=event)
+    await session.commit()
+
+    resume_entry = {
+        "interruptId": "interrupt-resume",
+        "status": resume_status,
+        "payload": resume_payload,
+    }
+    await repository.create_main_run(
+        thread_id=thread.id,
+        run_id="run-resumed",
+        model_id="main",
+        input_json={"messages": [], "resume": [resume_entry]},
+        config_json={},
+    )
+    claimed = await session.scalar(
+        select(ConversationInterrupt).where(
+            ConversationInterrupt.conversation_thread_id == thread.id,
+            ConversationInterrupt.interrupt_id == "interrupt-resume",
+        )
+    )
+    assert claimed is not None
+    claimed.resolved_run_id = "run-resumed"
+    await session.commit()
+
+    envelope, event = _envelope(
+        3,
+        {
+            "type": "RUN_STARTED",
+            "threadId": thread.thread_id,
+            "runId": "run-resumed",
+        },
+        run="run-resumed",
+    )
+    await projector.project(thread_pk=thread.id, envelope=envelope, event=event)
+    await session.flush()
+
+    started = await repository.get_thread_by_pk(thread.id)
+    assert started is not None
+    assert started.status == "running"
+    assert started.has_pending_interrupt is False
+    assert started.snapshot_json is not None
+    assert started.snapshot_json["approval"] is None
+    assert started.snapshot_json["interrupts"] == []
+
+    envelope, event = _envelope(
+        4,
+        {
+            "type": "RUN_ERROR",
+            "rawEvent": {"runId": "run-resumed"},
+            "message": "恢复运行已终止",
+            "code": error_code,
+        },
+        run="run-resumed",
+    )
+    await projector.project(thread_pk=thread.id, envelope=envelope, event=event)
+    await session.commit()
+
+    refreshed = await repository.get_thread_by_pk(thread.id)
+    assert refreshed is not None
+    assert refreshed.status == "idle"
+    assert refreshed.has_pending_interrupt is False
+    assert refreshed.snapshot_json is not None
+    assert refreshed.snapshot_json["approval"] is None
+    assert refreshed.snapshot_json["interrupts"] == []
+    await session.refresh(claimed)
+    assert claimed.status == interrupt_status
+    assert claimed.resume_json == resume_entry
 
 
 async def test_projection_is_idempotent_and_rejects_same_seq_with_other_payload(

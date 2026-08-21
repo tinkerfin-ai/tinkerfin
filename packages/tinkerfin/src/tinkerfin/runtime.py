@@ -41,7 +41,9 @@ from .errors import (
     TinkerFinLifecycleError,
 )
 from .native import NativeStreamPart
+from .plan._clarification import create_clarification_binding
 from .plan._config import AgentMode, PlanOptions, validate_agent_mode
+from .plan.clarification import ClarificationFormBase, DefaultClarificationForm
 from .sse import (
     SseBody,
     SseEventIdResolver,
@@ -621,6 +623,7 @@ class TinkerFin:
         default_mode: AgentMode = "default",
         gate_model: str | BaseChatModel | None = None,
         planner_model: str | BaseChatModel | None = None,
+        clarification_schema: type[ClarificationFormBase] = DefaultClarificationForm,
     ) -> TinkerFin:
         """Return a factory with immutable Plan-capability options.
 
@@ -632,6 +635,7 @@ class TinkerFin:
             default_mode: Run mode used when ``new`` or ``new_agui`` omits one.
             gate_model: Optional model dedicated to conservative request routing.
             planner_model: Optional model dedicated to read-only Plan drafting.
+            clarification_schema: Concrete host form used by Gate and Planner.
 
         Returns:
             A separate configured TinkerFin factory.
@@ -655,12 +659,15 @@ class TinkerFin:
             if isinstance(model, str) and not model.strip():
                 raise ValueError(f"{name} must not be blank")
         if not enabled and (
-            mode != "default" or gate_model is not None or planner_model is not None
+            mode != "default"
+            or gate_model is not None
+            or planner_model is not None
+            or clarification_schema is not DefaultClarificationForm
         ):
             from .plan.errors import PlanModeConfigurationError
 
             raise PlanModeConfigurationError(
-                "disabled Plan capability cannot configure a mode or Plan model"
+                "disabled Plan capability cannot configure a mode, model, or form"
             )
         configured = TinkerFin(
             run_coordinator=self._run_coordinator,
@@ -668,6 +675,7 @@ class TinkerFin:
         )
         if enabled:
             configured._plan_options = PlanOptions(
+                clarification=create_clarification_binding(clarification_schema),
                 default_mode=mode,
                 gate_model=gate_model,
                 planner_model=planner_model,

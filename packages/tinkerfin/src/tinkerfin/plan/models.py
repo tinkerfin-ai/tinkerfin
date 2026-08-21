@@ -9,6 +9,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    JsonValue,
     StringConstraints,
     model_validator,
 )
@@ -126,65 +127,48 @@ class ConfirmedPlan(PlanDraft):
         )
 
 
-class ClarificationOption(_PlanModel):
-    """One model-generated answer choice for a blocking question."""
-
-    id: PlanStepId = Field(description="Stable option ID within one question")
-    label: NonBlankText = Field(description="Concise choice shown to the user")
-    description: NonBlankText | None = Field(
-        default=None,
-        description="Optional consequence or tradeoff for this choice",
-    )
-
-
-class ClarificationQuestion(_PlanModel):
-    """One blocking question the user must answer before routing again."""
-
-    id: PlanStepId = Field(description="Stable question ID within the request")
-    prompt: NonBlankText = Field(description="Question shown to the user")
-    options: tuple[ClarificationOption, ...] = Field(
-        default=(),
-        description="Model-generated single-select choices",
-    )
-    allow_custom_answer: bool = Field(
-        default=True,
-        description="Whether the user may answer without selecting an option",
-    )
-
-    @model_validator(mode="after")
-    def options_are_usable(self) -> ClarificationQuestion:
-        """Require stable choices whenever free-form answers are disabled."""
-
-        option_ids = tuple(option.id for option in self.options)
-        if len(option_ids) != len(set(option_ids)):
-            raise ValueError("Clarification option IDs must be unique")
-        if not self.allow_custom_answer and not self.options:
-            raise ValueError(
-                "Clarification questions without custom answers require options"
-            )
-        return self
-
-
 class RequirementAnswer(_PlanModel):
     """One trusted answer captured from a clarification interrupt."""
 
     question_id: PlanStepId = Field(description="Question ID being answered")
-    answer: NonBlankText = Field(description="User-provided requirement detail")
+    answer: NonBlankText = Field(
+        description="Trusted free text or checkpoint-derived option label"
+    )
     option_id: PlanStepId | None = Field(
         default=None,
         description="Selected option ID, or None for a custom answer",
     )
 
 
+class PendingClarification(_PlanModel):
+    """Concrete form waiting for trusted user input at one interrupt."""
+
+    source: Literal["gate", "planner"] = Field(
+        description="Workflow node that must receive the resolved form"
+    )
+    form: dict[str, JsonValue] = Field(
+        description="JSON-only form validated before checkpoint persistence"
+    )
+
+
+class ClarificationExchange(PendingClarification):
+    """Resolved form and normalized answers retained as trusted Plan context."""
+
+    answers: tuple[RequirementAnswer, ...] = Field(
+        min_length=1,
+        description="Answers normalized against the checkpoint form",
+    )
+
+
 class PlanState(_PlanModel):
     """Complete parent-workflow state projected through the AG-UI state channel."""
 
-    workflow_version: Literal["tinkerfin.plan.v1"] = "tinkerfin.plan.v1"
+    workflow_version: Literal["tinkerfin.plan.v2"] = "tinkerfin.plan.v2"
     status: PlanStatus = PlanStatus.PLANNING
     route: PlanRoute | None = None
     goal: NonBlankText | None = None
-    questions: tuple[ClarificationQuestion, ...] = ()
-    requirements: tuple[RequirementAnswer, ...] = ()
+    pending_clarification: PendingClarification | None = None
+    clarification_history: tuple[ClarificationExchange, ...] = ()
     draft: PlanDraft | None = None
     confirmed_plan: ConfirmedPlan | None = None
     feedback: tuple[NonBlankText, ...] = ()
@@ -193,9 +177,9 @@ class PlanState(_PlanModel):
 
 
 __all__ = [
-    "ClarificationOption",
-    "ClarificationQuestion",
+    "ClarificationExchange",
     "ConfirmedPlan",
+    "PendingClarification",
     "PlanDraft",
     "PlanReviewAction",
     "PlanRoute",

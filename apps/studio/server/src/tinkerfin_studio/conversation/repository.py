@@ -190,6 +190,38 @@ class ConversationRepository:
         )
         return list(result)
 
+    async def list_pending_interrupts(
+        self,
+        *,
+        thread_pk: int,
+    ) -> list[ConversationInterrupt]:
+        """按投影顺序读取会话当前全部 pending interrupt"""
+
+        result = await self._session.scalars(
+            select(ConversationInterrupt)
+            .where(
+                ConversationInterrupt.conversation_thread_id == thread_pk,
+                ConversationInterrupt.status == "pending",
+            )
+            .order_by(ConversationInterrupt.id)
+        )
+        return list(result)
+
+    async def repair_history_snapshot(
+        self,
+        thread: ConversationThread,
+        *,
+        snapshot: dict[str, object] | None,
+        status: str,
+        has_pending_interrupt: bool,
+    ) -> None:
+        """原地修复不改变事实序号和会话排序的历史派生字段"""
+
+        thread.snapshot_json = snapshot
+        thread.status = status
+        thread.has_pending_interrupt = has_pending_interrupt
+        await self._session.flush()
+
     async def release_pending_interrupt_claims(
         self,
         *,

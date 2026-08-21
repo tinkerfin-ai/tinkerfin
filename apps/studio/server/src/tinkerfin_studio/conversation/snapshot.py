@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 from datetime import datetime
 from typing import cast
@@ -180,31 +181,100 @@ def _source(raw_event: object) -> dict[str, object]:
     )
 
 
-def _tool_name(interrupt: dict[str, object]) -> str:
+def _tool_review(
+    interrupt: dict[str, object],
+) -> tuple[str, dict[str, object], list[str]]:
+    """读取 adapter 公开的 Deep Agents Tool 审批契约"""
+
     metadata = interrupt.get("metadata")
     if not isinstance(metadata, dict):
-        return "tool"
-    action = metadata.get("action_request")
-    if not isinstance(action, dict):
-        return "tool"
-    name = action.get("name")
-    return name if isinstance(name, str) else "tool"
+        raise TypeError("tool_call interrupt 缺少 metadata")
+    deepagents = metadata.get("deepagents")
+    if not isinstance(deepagents, dict):
+        raise TypeError("tool_call interrupt 缺少 metadata.deepagents")
+    name = deepagents.get("toolName")
+    args = deepagents.get("originalArgs")
+    decisions = deepagents.get("allowedDecisions")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("tool_call interrupt 的 toolName 无效")
+    if not isinstance(args, dict):
+        raise TypeError("tool_call interrupt 的 originalArgs 必须是 object")
+    if not isinstance(decisions, list) or not all(
+        isinstance(value, str) and value for value in decisions
+    ):
+        raise ValueError("tool_call interrupt 的 allowedDecisions 必须是字符串数组")
+    return name, args, list(decisions)
 
 
-def _tool_args(interrupt: dict[str, object]) -> dict[str, object]:
-    metadata = interrupt.get("metadata")
-    action = metadata.get("action_request") if isinstance(metadata, dict) else None
-    args = action.get("args") if isinstance(action, dict) else None
-    return args if isinstance(args, dict) else {}
+def _approval_item(interrupt: dict[str, object]) -> dict[str, object]:
+    """把一个公开 Tool interrupt 转为可刷新恢复的审批项"""
+
+    interrupt_id = interrupt.get("id")
+    tool_call_id = interrupt.get("toolCallId")
+    if not isinstance(interrupt_id, str) or not interrupt_id:
+        raise ValueError("tool_call interrupt 缺少 id")
+    if not isinstance(tool_call_id, str) or not tool_call_id:
+        raise ValueError("tool_call interrupt 缺少 toolCallId")
+    name, args, decisions = _tool_review(interrupt)
+    params = json.dumps(args, ensure_ascii=False, indent=2)
+    return {
+        "id": interrupt_id,
+        "interruptId": interrupt_id,
+        "toolCallId": tool_call_id,
+        "toolName": name,
+        "params": params,
+        "input": params,
+        "description": str(interrupt.get("message", "")),
+        "originalArgs": args,
+        "allowedDecisions": decisions,
+    }
 
 
-def _allowed_decisions(interrupt: dict[str, object]) -> list[str]:
-    metadata = interrupt.get("metadata")
-    review = metadata.get("review_config") if isinstance(metadata, dict) else None
-    decisions = review.get("allowed_decisions") if isinstance(review, dict) else None
-    if not isinstance(decisions, list):
-        return []
-    return [value for value in decisions if isinstance(value, str)]
+def _project_pending_interrupts(
+    snapshot: dict[str, object],
+    interrupts: list[dict[str, object]],
+) -> None:
+    """用当前完整 pending 组更新快照中的交互投影"""
+
+    projected = deepcopy(interrupts)
+    snapshot["interrupts"] = projected
+    if not projected:
+        snapshot["approval"] = None
+        return
+    reasons = {item.get("reason") for item in projected}
+    plan_reasons = {"plan_clarification", "plan_review"}
+    if reasons <= plan_reasons:
+        snapshot["approval"] = None
+        return
+    if reasons != {"tool_call"}:
+        raise ValueError("pending interrupt 不能混合 Plan、Tool 或未知 reason")
+    snapshot["approval"] = {
+        "items": [_approval_item(item) for item in projected],
+        "activeIndex": 0,
+        "submitted": False,
+    }
+
+
+def repair_pending_interrupt_snapshot(
+    snapshot: dict[str, object] | None,
+    interrupts: list[dict[str, object]],
+) -> dict[str, object] | None:
+    """以 interrupt 明细事实修复既有 v2 快照的派生审批状态"""
+
+    if snapshot is None:
+        if interrupts:
+            raise ValueError("存在 pending interrupt 时历史快照不能为空")
+        return None
+    repaired = deepcopy(snapshot)
+    was_waiting_approval = repaired.get("runStatus") == "waiting_approval"
+    _project_pending_interrupts(repaired, interrupts)
+    if interrupts:
+        repaired["activeRunId"] = None
+        repaired["runStatus"] = "waiting_approval"
+    elif was_waiting_approval:
+        repaired["activeRunId"] = None
+        repaired["runStatus"] = "idle"
+    return repaired
 
 
 def _project_todos(snapshot: dict[str, object], state: dict[str, object]) -> None:
@@ -268,6 +338,12 @@ def reduce_snapshot(
             snapshot["runStatus"] = "streaming"
             snapshot["activeRunId"] = event_run_id
             if run_input is not None:
+                resume = run_input.get("resume")
+                if isinstance(resume, list) and resume:
+                    # Run 注册要求 resume 完整覆盖待处理组；RUN_STARTED 持久化后，
+                    # 即使 resumed run 随后失败或取消，原 interrupt 也不再 pending
+                    snapshot["approval"] = None
+                    snapshot["interrupts"] = []
                 forwarded_props = run_input.get("forwardedProps")
                 mode = (
                     forwarded_props.get("mode")
@@ -461,33 +537,7 @@ def reduce_snapshot(
                     if isinstance(interrupts, list)
                     else []
                 )
-                plan_reasons = {"plan_clarification", "plan_review"}
-                is_plan_interrupt = bool(public_interrupts) and all(
-                    item.get("reason") in plan_reasons for item in public_interrupts
-                )
-                if is_plan_interrupt:
-                    snapshot["approval"] = None
-                else:
-                    items = [
-                        {
-                            "id": str(item.get("id", "")),
-                            "interruptId": str(item.get("id", "")),
-                            "toolCallId": item.get("toolCallId"),
-                            "toolName": _tool_name(item),
-                            "params": str(_tool_args(item)),
-                            "input": str(_tool_args(item)),
-                            "description": str(item.get("message", "")),
-                            "originalArgs": _tool_args(item),
-                            "allowedDecisions": _allowed_decisions(item),
-                        }
-                        for item in public_interrupts
-                    ]
-                    snapshot["approval"] = {
-                        "items": items,
-                        "activeIndex": 0,
-                        "submitted": False,
-                    }
-                snapshot["interrupts"] = public_interrupts
+                _project_pending_interrupts(snapshot, public_interrupts)
                 snapshot["runStatus"] = "waiting_approval"
             else:
                 snapshot["approval"] = None

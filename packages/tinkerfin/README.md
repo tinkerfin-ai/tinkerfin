@@ -88,17 +88,73 @@ default_runtime = agent.new_agui(
 ```
 
 Plan Mode requires an explicit model and a concrete `BaseCheckpointSaver`. The parent
-workflow is the only graph configured with the supplied checkpointer, store, and cache;
-its Gate, Planner, and Deep Agent subgraphs inherit those runtime resources. The host
-still owns the resources and their shutdown lifecycle. Plan streams use synchronous
-checkpoint durability, and an explicit non-`sync` durability value is rejected.
+workflow is the only graph configured with the supplied durable checkpointer. Gate and
+Planner are stateless, non-interrupting subgraphs with child checkpointing disabled, so
+only JSON-validated Plan state crosses the parent durability boundary. The Deep Agent
+subgraph inherits the parent checkpointer for Tool/Filesystem HITL. All child graphs
+still use the parent runtime store and cache, and the host owns their shutdown
+lifecycle. Plan streams use synchronous checkpoint durability, and an explicit
+non-`sync` durability value is rejected.
 
 Only `ls`, `read_file`, `glob`, and `grep` are available to the Planner. Clarification
 questions can contain model-generated single-select options and can optionally allow a
-custom answer. Approval freezes a `ConfirmedPlan` and injects it into the Deep Agent
-system request without adding hidden conversation messages. The public Plan state and
-value models are available from `tinkerfin.plan` and are emitted under the root state
-key `tinkerfin_plan`.
+free-text answer. Selecting an option submits only its stable ID; the parent workflow
+derives the trusted label from the checkpointed form. Approval freezes a `ConfirmedPlan`
+and injects it into the Deep Agent system request without adding hidden conversation
+messages. The public Plan state and value models are available from `tinkerfin.plan` and
+are emitted under the root state key `tinkerfin_plan`.
+
+The default clarification form requires no application models. A host that needs typed,
+user-visible metadata can define one concrete Pydantic form and freeze it on the Plan
+factory:
+
+```python
+from tinkerfin.plan import (
+    ClarificationForm,
+    ClarificationModel,
+    ClarificationOption,
+    ClarificationQuestion,
+)
+
+
+class AppQuestionAttributes(ClarificationModel):
+    help_text: str
+
+
+class AppOptionAttributes(ClarificationModel):
+    priority: int
+
+
+class AppOption(ClarificationOption[AppOptionAttributes]):
+    pass
+
+
+class AppQuestion(ClarificationQuestion[AppQuestionAttributes, AppOptionAttributes]):
+    options: tuple[AppOption, ...] = ()
+
+
+class AppClarificationForm(ClarificationForm[AppQuestion]):
+    pass
+
+
+agent = (
+    TinkerFin()
+    .plan(
+        clarification_schema=AppClarificationForm,
+    )
+    .create_deep_agent(
+        model="openai:gpt-5.4",
+        checkpointer=MemorySaver(),
+    )
+)
+```
+
+Question and option attributes must inherit `ClarificationModel`; arbitrary dictionary
+attributes are rejected. Host models may add discriminant fields, but framework-owned
+IDs, display text, answer-path fields, and tuple containers cannot be redefined. The
+attributes are model-generated public context whose structure is validated, not
+authoritative data for permissions, billing, or compliance. A pending clarification
+must resume with the same Definition-bound form schema.
 
 `.plan(...)` returns a separate TinkerFin factory while retaining the configured run
 coordinator and global state schema. Every Definition freezes the capability options of

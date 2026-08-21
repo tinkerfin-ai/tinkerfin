@@ -67,7 +67,9 @@ def build_lifespan():
         try:
             await stack.enter_async_context(database)
             stack.push_async_callback(redis.aclose)
-            http_client = await stack.enter_async_context(httpx.AsyncClient())
+            http_client = await stack.enter_async_context(
+                httpx.AsyncClient(trust_env=False)
+            )
             if not await cast(Awaitable[bool], redis.ping()):
                 raise RuntimeError("Redis PING 未返回成功")
 

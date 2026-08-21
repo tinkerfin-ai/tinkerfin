@@ -21,6 +21,12 @@ from tinkerfin import (
     NativeGraphRunStream,
     TinkerFin,
 )
+from tinkerfin.plan import (
+    ClarificationForm,
+    ClarificationModel,
+    ClarificationOption,
+    ClarificationQuestion,
+)
 
 
 class _FakeModel(FakeMessagesListChatModel):
@@ -37,6 +43,26 @@ class _FakeModel(FakeMessagesListChatModel):
 
 class _Context(TypedDict):
     tenant: str
+
+
+class _QuestionAttributes(ClarificationModel):
+    category: str
+
+
+class _OptionAttributes(ClarificationModel):
+    priority: int
+
+
+class _Option(ClarificationOption[_OptionAttributes]):
+    pass
+
+
+class _Question(ClarificationQuestion[_QuestionAttributes, _OptionAttributes]):
+    options: tuple[_Option, ...] = ()
+
+
+class _Form(ClarificationForm[_Question]):
+    pass
 
 
 if TYPE_CHECKING:
@@ -57,6 +83,11 @@ if TYPE_CHECKING:
         checkpointer=InMemorySaver(),
     )
     assert_type(planned_definition, DeepAgentDefinition[_Context])
+
+    custom_planned = tinkerfin.plan(clarification_schema=_Form)
+    assert_type(custom_planned, TinkerFin)
+    custom_option = _Option(id="option", label="Option", attributes=None)
+    assert_type(custom_option.attributes, _OptionAttributes | None)
 
     identity = Identity(threadId="thread-1", runId="run-1")
     native = definition.new(identity=identity)

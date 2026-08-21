@@ -47,7 +47,7 @@ export function PlanQuestionCard({
                 ))}
               </div>
             )}
-            {question.allowCustomAnswer && (
+            {question.allowFreeText && (
               <label className="plan-custom-answer">
                 <span>{question.options.length ? '或填写其他答案' : '你的答案'}</span>
                 <textarea

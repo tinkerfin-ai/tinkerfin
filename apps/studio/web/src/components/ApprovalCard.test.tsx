@@ -114,4 +114,47 @@ describe('ApprovalCard', () => {
     expect(authoritativeApproval.items[0]?.interruptId).toBe('interrupt-new')
     expect(authoritativeApproval.items[0]?.decision).toBeUndefined()
   })
+
+  it('renders restored arguments and every allowed Tool decision', () => {
+    const originalArgs = {
+      file_path: '/history-result.txt',
+      content: 'HISTORY_APPROVAL_OK',
+    }
+    const conversation: Conversation = {
+      ...buildEmptyConversation({
+        threadId: 'thread-history-approval',
+        now: '2026-08-17T00:00:00.000Z',
+        model: 'GPT-5.5',
+      }),
+      runStatus: 'waiting_approval',
+      approval: {
+        activeIndex: 0,
+        submitted: false,
+        items: [{
+          id: 'history-approval',
+          interruptId: 'history-interrupt#0',
+          toolCallId: 'history-tool-call',
+          toolName: 'write_file',
+          params: JSON.stringify(originalArgs, null, 2),
+          input: JSON.stringify(originalArgs, null, 2),
+          description: '确认历史写入',
+          originalArgs,
+          allowedDecisions: ['approve', 'edit', 'reject'],
+        }],
+      },
+    }
+    render(
+      <ApprovalCard
+        conversation={conversation}
+        onChange={vi.fn()}
+        onSubmit={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByText('/history-result.txt')).toBeInTheDocument()
+    expect(screen.getByText('HISTORY_APPROVAL_OK')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '允许' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '编辑' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '拒绝' })).toBeInTheDocument()
+  })
 })

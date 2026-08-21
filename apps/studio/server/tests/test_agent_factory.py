@@ -7,8 +7,10 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from types import SimpleNamespace
 from typing import cast
 
+import pytest
 from ag_ui.core import BaseEvent, RunAgentInput, RunErrorEvent, RunStartedEvent
 from langchain.agents.middleware.types import InputAgentState
+from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from pydantic import SecretStr
 
 from tinkerfin import AgUiEventStream, TinkerFin
@@ -16,7 +18,8 @@ from tinkerfin_agui_adapter import AgUiLifecycleEventFactory
 from tinkerfin_messaging import FiniteMessageSource, MemoryBackend, Messaging
 from tinkerfin_messaging.agui import AgUiCodec
 from tinkerfin_sandbox.lifecycle.manager import OpenSandboxManager
-from tinkerfin_studio.agent.factory import ConversationAgentFactory
+from tinkerfin_studio.agent import factory as factory_module
+from tinkerfin_studio.agent.factory import ConversationAgentFactory, _create_model
 from tinkerfin_studio.agent.persistence import AgentPersistence
 from tinkerfin_studio.conversation.request import ChatRequest
 from tinkerfin_studio.conversation.run_preparation import prepare_run_request
@@ -72,6 +75,125 @@ def _prepared(*, mode: str = "default"):
 
 def test_prepare_run_request_preserves_the_selected_agent_mode() -> None:
     assert _prepared(mode="plan").mode == "plan"
+
+
+@pytest.mark.parametrize(
+    ("reasoning_enabled", "thinking_type", "has_reasoning_effort"),
+    ((True, "enabled", True), (False, "disabled", False)),
+)
+def test_create_deepseek_model_explicitly_controls_thinking(
+    monkeypatch,
+    reasoning_enabled: bool,
+    thinking_type: str,
+    has_reasoning_effort: bool,
+) -> None:
+    """DeepSeek 的 reasoning 开关必须转换为显式 provider 参数"""
+
+    captured: dict[str, object] = {}
+    model = FakeListChatModel(responses=["unused"])
+
+    def init_model(model_name: str, **kwargs: object):
+        captured["model_name"] = model_name
+        captured.update(kwargs)
+        return model
+
+    monkeypatch.setattr(factory_module, "init_chat_model", init_model)
+    config = _model_config().model_copy(
+        update={
+            "provider": "deepseek",
+            "model_name": "deepseek-v4-pro",
+            "reasoning_enabled": reasoning_enabled,
+        }
+    )
+
+    assert _create_model(config) is model
+    assert captured["extra_body"] == {"thinking": {"type": thinking_type}}
+    assert ("reasoning_effort" in captured) is has_reasoning_effort
+
+
+async def test_create_definition_uses_non_reasoning_models_for_plan(
+    monkeypatch,
+) -> None:
+    """主 Agent 保留 reasoning，Plan Gate 与 Planner 使用可结构化输出的模型"""
+
+    root_model = FakeListChatModel(responses=["root"])
+    plan_model = FakeListChatModel(responses=["plan"])
+    reasoning_overrides: list[bool | None] = []
+
+    def create_model(
+        config: AgentModelConfig,
+        *,
+        reasoning_enabled: bool | None = None,
+    ):
+        del config
+        reasoning_overrides.append(reasoning_enabled)
+        return root_model if reasoning_enabled is None else plan_model
+
+    class SandboxManager:
+        async def get(self, key: str) -> object:
+            assert key == "users/7"
+            return object()
+
+        def build_agent_middleware(self, backend: object) -> tuple[()]:
+            del backend
+            return ()
+
+    class RecordingTinkerFin:
+        def __init__(self) -> None:
+            self.plan_options: dict[str, object] = {}
+            self.definition_options: dict[str, object] = {}
+
+        def plan(self, **options: object):
+            self.plan_options = options
+            return self
+
+        def create_deep_agent(self, **options: object):
+            self.definition_options = options
+            return SimpleNamespace()
+
+    monkeypatch.setattr(factory_module, "_create_model", create_model)
+    monkeypatch.setattr(
+        factory_module,
+        "CompositeBackend",
+        lambda **_kwargs: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        factory_module,
+        "StoreBackend",
+        lambda **_kwargs: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        factory_module,
+        "_read_subagents",
+        lambda: factory_module._SubagentFile.model_validate({}),
+    )
+    tinkerfin = RecordingTinkerFin()
+    factory = ConversationAgentFactory(
+        persistence=cast(
+            AgentPersistence,
+            SimpleNamespace(checkpointer=object(), store=object()),
+        ),
+        sandbox_manager=cast(OpenSandboxManager[str], SandboxManager()),
+        tinkerfin=cast(TinkerFin, tinkerfin),
+        tavily_api_key=None,
+    )
+    config = _model_config().model_copy(
+        update={
+            "provider": "deepseek",
+            "model_name": "deepseek-v4-pro",
+            "reasoning_enabled": True,
+        }
+    )
+
+    await factory._create_definition(user_id=7, model_config=config)
+
+    assert reasoning_overrides == [None, False]
+    assert tinkerfin.plan_options == {
+        "enabled": True,
+        "gate_model": plan_model,
+        "planner_model": plan_model,
+    }
+    assert tinkerfin.definition_options["model"] is root_model
 
 
 async def test_create_agui_events_defers_definition_and_enriches_main_start(

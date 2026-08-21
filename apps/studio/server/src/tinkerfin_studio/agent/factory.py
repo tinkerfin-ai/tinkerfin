@@ -73,19 +73,38 @@ def _read_subagents() -> _SubagentFile:
     return _SubagentFile.model_validate(payload)
 
 
-def _create_model(config: AgentModelConfig) -> BaseChatModel:
-    if config.provider == "deepseek" and config.reasoning_enabled:
-        model = init_chat_model(
-            config.model_name,
-            model_provider=config.provider,
-            api_key=config.api_key.get_secret_value(),
-            base_url=config.base_url,
-            streaming=True,
-            timeout=600,
-            max_tokens=25_000,
-            extra_body={"thinking": {"type": "enabled"}},
-            reasoning_effort="high",
-        )
+def _create_model(
+    config: AgentModelConfig,
+    *,
+    reasoning_enabled: bool | None = None,
+) -> BaseChatModel:
+    enable_reasoning = (
+        config.reasoning_enabled if reasoning_enabled is None else reasoning_enabled
+    )
+    if config.provider == "deepseek":
+        if enable_reasoning:
+            model = init_chat_model(
+                config.model_name,
+                model_provider=config.provider,
+                api_key=config.api_key.get_secret_value(),
+                base_url=config.base_url,
+                streaming=True,
+                timeout=600,
+                max_tokens=25_000,
+                extra_body={"thinking": {"type": "enabled"}},
+                reasoning_effort="high",
+            )
+        else:
+            model = init_chat_model(
+                config.model_name,
+                model_provider=config.provider,
+                api_key=config.api_key.get_secret_value(),
+                base_url=config.base_url,
+                streaming=True,
+                timeout=600,
+                max_tokens=25_000,
+                extra_body={"thinking": {"type": "disabled"}},
+            )
     else:
         model = init_chat_model(
             config.model_name,
@@ -207,6 +226,11 @@ class ConversationAgentFactory:
             },
         )
         model = _create_model(model_config)
+        plan_model = (
+            _create_model(model_config, reasoning_enabled=False)
+            if model_config.provider == "deepseek" and model_config.reasoning_enabled
+            else model
+        )
         web_search = build_web_search_tool(self._tavily_api_key)
         tool_registry: dict[str, BaseTool] = {web_search.name: web_search}
         definitions = await to_thread.run_sync(_read_subagents)
@@ -242,7 +266,11 @@ class ConversationAgentFactory:
                 },
             ),
         )
-        return self._tinkerfin.plan(enabled=True).create_deep_agent(
+        return self._tinkerfin.plan(
+            enabled=True,
+            gate_model=plan_model,
+            planner_model=plan_model,
+        ).create_deep_agent(
             model=model,
             tools=[web_search],
             system_prompt=_SYSTEM_PROMPT,

@@ -34,6 +34,9 @@ from tinkerfin_studio.conversation.schemas import (
     ConversationHistoryListItem,
     ConversationHistoryListResponse,
 )
+from tinkerfin_studio.conversation.snapshot import (
+    repair_pending_interrupt_snapshot,
+)
 
 _HISTORY_PAGE_SIZE_MAX = 100
 _EVENT_LIMIT_MAX = 1000
@@ -132,6 +135,36 @@ class ConversationHistoryService:
         thread = await self._require_thread(thread_id)
         await self._reconcile(thread)
         refreshed = await self._require_thread(thread_id)
+        pending_interrupts = await self._repository.list_pending_interrupts(
+            thread_pk=refreshed.id
+        )
+        pending_values = [
+            dict(interrupt.request_json) for interrupt in pending_interrupts
+        ]
+        snapshot = repair_pending_interrupt_snapshot(
+            refreshed.snapshot_json,
+            pending_values,
+        )
+        has_pending_interrupt = bool(pending_interrupts)
+        status = (
+            "waiting_approval"
+            if has_pending_interrupt
+            else "idle"
+            if refreshed.status == "waiting_approval"
+            else refreshed.status
+        )
+        if (
+            snapshot != refreshed.snapshot_json
+            or has_pending_interrupt != refreshed.has_pending_interrupt
+            or status != refreshed.status
+        ):
+            await self._repository.repair_history_snapshot(
+                refreshed,
+                snapshot=snapshot,
+                status=status,
+                has_pending_interrupt=has_pending_interrupt,
+            )
+            await self._repository.commit()
         events = await self._repository.list_events(
             thread_pk=refreshed.id,
             after_seq=refreshed.snapshot_seq,
@@ -141,7 +174,7 @@ class ConversationHistoryService:
             id=refreshed.id,
             threadId=refreshed.thread_id,
             title=refreshed.title,
-            status=refreshed.status,
+            status=status,
             lastRunId=refreshed.last_run_id,
             lastModel=refreshed.last_model,
             lastSeq=refreshed.last_seq,
@@ -149,9 +182,9 @@ class ConversationHistoryService:
             snapshotVersion=refreshed.snapshot_version,
             messageCount=refreshed.message_count,
             toolCallCount=refreshed.tool_call_count,
-            hasPendingInterrupt=refreshed.has_pending_interrupt,
+            hasPendingInterrupt=has_pending_interrupt,
             pinned=refreshed.pinned,
-            snapshot=cast(dict[str, JsonValue] | None, refreshed.snapshot_json),
+            snapshot=cast(dict[str, JsonValue] | None, snapshot),
             events=[_event_envelope(event) for event in events],
             createdAt=refreshed.created_at,
             updatedAt=refreshed.updated_at,

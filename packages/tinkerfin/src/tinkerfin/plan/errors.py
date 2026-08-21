@@ -9,4 +9,10 @@ class PlanModeConfigurationError(TinkerFinError, ValueError):
     code = TinkerFinErrorCode.PLAN_MODE_CONFIGURATION
 
 
-__all__ = ["PlanModeConfigurationError"]
+class PlanStructuredOutputError(TinkerFinError, RuntimeError):
+    """A model result cannot satisfy the configured Plan response contract."""
+
+    code = TinkerFinErrorCode.PLAN_STRUCTURED_OUTPUT
+
+
+__all__ = ["PlanModeConfigurationError", "PlanStructuredOutputError"]

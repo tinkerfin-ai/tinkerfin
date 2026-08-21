@@ -176,6 +176,8 @@ from .errors import TinkerFinErrorCode as TinkerFinErrorCode
 from .errors import TinkerFinLifecycleError as TinkerFinLifecycleError
 from .errors import TinkerFinStreamProtocolError as TinkerFinStreamProtocolError
 from .plan import AgentMode as AgentMode
+from .plan import ClarificationFormBase as _ClarificationFormBase
+from .plan import DefaultClarificationForm as _DefaultClarificationForm
 from .runtime import AgUiEventStream as AgUiEventStream
 from .runtime import AgUiNativeStreamConfig as AgUiNativeStreamConfig
 from .runtime import AgUiNativeStreamConfigurationError as AgUiNativeStreamConfigurationError
@@ -196,7 +198,16 @@ from .runtime import TinkerFin as _RuntimeTinkerFin
 from .runtime import TinkerFinRun as TinkerFinRun
 
 class TinkerFin(_RuntimeTinkerFin):
-{_method(RuntimeTinkerFin.plan, return_type="TinkerFin")}
+{
+        _method(
+            RuntimeTinkerFin.plan,
+            replacements={
+                "ClarificationFormBase": "_ClarificationFormBase",
+                "DefaultClarificationForm": "_DefaultClarificationForm",
+            },
+            return_type="TinkerFin",
+        )
+    }
 {_method(create_deep_agent, add_self=True, return_type="DeepAgentDefinition[ContextT]")}
 
 __all__: list[str]

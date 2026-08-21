@@ -1418,6 +1418,82 @@ describe('AG-UI runtime reducer', () => {
     expect(restored.messages[1]?.content).toBe('回放内容')
   })
 
+  it('restores current Tool approval data from a trusted v2 snapshot', () => {
+    const interruptId = 'history-tool-interrupt#0'
+    const toolCallId = 'history-tool-call'
+    const originalArgs = {
+      file_path: '/history-result.txt',
+      content: 'HISTORY_APPROVAL_OK',
+    }
+    const params = JSON.stringify(originalArgs, null, 2)
+    const detail: ConversationHistoryDetail = {
+      id: 2,
+      threadId: THREAD_ID,
+      title: '待处理 Tool 审批',
+      status: 'waiting_approval',
+      lastRunId: RUN_ID,
+      lastSeq: 7,
+      snapshotSeq: 7,
+      snapshotVersion: 2,
+      messageCount: 0,
+      toolCallCount: 1,
+      hasPendingInterrupt: true,
+      pinned: false,
+      snapshot: {
+        snapshotSeq: 7,
+        snapshotVersion: 2,
+        messages: [],
+        todos: [],
+        mode: 'default',
+        approval: {
+          items: [{
+            id: interruptId,
+            interruptId,
+            toolCallId,
+            toolName: 'write_file',
+            params,
+            input: params,
+            description: '确认历史写入',
+            originalArgs,
+            allowedDecisions: ['approve', 'edit', 'reject'],
+          }],
+          activeIndex: 0,
+          submitted: false,
+        },
+        runStatus: 'waiting_approval',
+        activeRunId: null,
+        serverState: {},
+        runs: {},
+        activities: [],
+        interrupts: [{
+          id: interruptId,
+          reason: 'tool_call',
+          toolCallId,
+          message: '确认历史写入',
+          metadata: {
+            deepagents: {
+              toolName: 'write_file',
+              originalArgs,
+              allowedDecisions: ['approve', 'edit', 'reject'],
+            },
+          },
+          toolName: 'write_file',
+          allowedDecisions: ['approve', 'edit', 'reject'],
+          originalArgs,
+        }],
+      },
+      events: [],
+      createdAt: '2026-08-05T00:00:00.000Z',
+      updatedAt: '2026-08-05T00:00:00.000Z',
+    }
+
+    const restored = restoreConversationFromHistory(detail, { model: 'GPT-5.5' })
+
+    expect(restored.runStatus).toBe('waiting_approval')
+    expect(restored.approval).toEqual(detail.snapshot?.approval)
+    expect(JSON.parse(restored.approval?.items[0]?.params ?? '')).toEqual(originalArgs)
+  })
+
   it('clears replayed approval when authoritative history has no pending interrupt', () => {
     const detail: ConversationHistoryDetail = {
       id: 2,
@@ -1912,12 +1988,27 @@ describe('AG-UI runtime reducer', () => {
             runtimeInterrupt: {
               envelope: {
                 metadata: {
-                  questions: [{
-                    id: 'environment',
-                    prompt: '部署到哪个环境？',
-                    options: [{ id: 'staging', label: '预发布', description: '先验证' }],
-                    allowCustomAnswer: true,
-                  }],
+                  origin: 'plan',
+                  source: 'gate',
+                  clarification: {
+                    schema: 'tinkerfin.plan-clarification.v1',
+                    form: {
+                      schemaVersion: 1,
+                      businessTag: 'preserved',
+                      questions: [{
+                        id: 'environment',
+                        prompt: '部署到哪个环境？',
+                        options: [{
+                          id: 'staging',
+                          label: '预发布',
+                          description: '先验证',
+                          attributes: { priority: 1 },
+                        }],
+                        allowFreeText: true,
+                        attributes: { category: 'target' },
+                      }],
+                    },
+                  },
                 },
               },
             },
@@ -1929,6 +2020,9 @@ describe('AG-UI runtime reducer', () => {
     expect(interrupted.approval).toBeUndefined()
     expect(interrupted.planInteraction?.kind).toBe('questions')
     if (interrupted.planInteraction?.kind !== 'questions') throw new Error('missing questions')
+    expect(interrupted.planInteraction.form.businessTag).toBe('preserved')
+    expect(interrupted.planInteraction.questions[0]?.attributes).toEqual({ category: 'target' })
+    expect(interrupted.planInteraction.questions[0]?.options[0]?.attributes).toEqual({ priority: 1 })
     const ready = {
       ...interrupted,
       planInteraction: {
@@ -1948,10 +2042,24 @@ describe('AG-UI runtime reducer', () => {
         type: 'respond',
         answers: [{
           questionId: 'environment',
-          answer: '预发布',
           optionId: 'staging',
         }],
       },
+    })
+    const freeTextReady = {
+      ...interrupted,
+      planInteraction: {
+        ...interrupted.planInteraction,
+        questions: interrupted.planInteraction.questions.map((question) => ({
+          ...question,
+          customAnswer: '隔离环境',
+        })),
+      },
+    }
+    const freeTextPayload = buildPlanResumePayload(freeTextReady)
+    expect(freeTextPayload.resume?.[0]?.payload).toEqual({
+      type: 'respond',
+      answers: [{ questionId: 'environment', answer: '隔离环境' }],
     })
   })
 

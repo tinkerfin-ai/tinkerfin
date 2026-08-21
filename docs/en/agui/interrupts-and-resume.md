@@ -36,14 +36,23 @@ runtime = agent.new_agui(identity=identity, mode="plan")
 
 | Reason | Expected resolved payload |
 | --- | --- |
-| `plan_clarification` | `{"type":"respond","answers":[{"questionId":"...","answer":"...","optionId":"..."}]}`; `optionId` is omitted for a custom answer |
+| `plan_clarification` | `{"type":"respond","answers":[{"questionId":"...","optionId":"..."}]}` for an option, or `{"type":"respond","answers":[{"questionId":"...","answer":"..."}]}` for free text |
 | `plan_review` | `approve`, `edit`, `respond`, or `reject`, each with the current `baseRevision` |
 
 A Plan interrupt has no `toolCallId`. It carries a versioned trusted runtime envelope,
-its response JSON Schema, and Plan metadata. The root `tinkerfin_plan` state is
+its response JSON Schema, and `tinkerfin.plan-clarification.v1` metadata containing the
+complete public Form. Python `allow_free_text` is serialized as `allowFreeText`.
+Question and option attributes are preserved as public, non-authoritative planning
+context. Internal schema fingerprints remain in checkpoint state and are not part of
+any public AG-UI event. The root `tinkerfin_plan` state is
 published before the interrupt terminal. On a resumed request, the synchronized
 snapshot may be followed by RFC 6902 state deltas as the Plan moves through
 `executing` and `completed`.
+
+Clients must not return the Form, labels, descriptions, or attributes. The parent Graph
+restores the trusted checkpoint Form and derives the selected option label. Supplying
+both `optionId` and `answer`, omitting required answers, or using unknown IDs fails the
+resume.
 
 The same `ResumeMapper.map_agui(...)` and `AgUiResumeBinding` flow handles Plan
 interrupts without a separate API. `ResumeMapper` verifies the persisted envelope and

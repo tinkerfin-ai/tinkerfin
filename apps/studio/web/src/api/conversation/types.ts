@@ -17,11 +17,10 @@ export type ChatResumePayload =
   }
   | {
     type: "respond"
-    answers: Array<{
-      questionId: string
-      answer: string
-      optionId?: string
-    }>
+    answers: Array<
+      | { questionId: string; optionId: string }
+      | { questionId: string; answer: string }
+    >
   }
   | { type: "approve"; baseRevision: number }
   | { type: "edit"; baseRevision: number; draft: JsonObject }

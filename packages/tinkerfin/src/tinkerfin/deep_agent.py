@@ -393,7 +393,7 @@ class _EnhancedDeepAgentFactory(Generic[CreateP, GraphT, AstreamT]):
         ) -> DeepAgentDefinition[GraphT, AstreamT]:
             bound = self._signature.bind(*args, **kwargs)
             bound.apply_defaults()
-            definition_kwargs = cast(dict[str, object], dict(kwargs))
+            definition_kwargs = dict(kwargs)
             definition_state = cast(
                 type[DeepAgentState] | None,
                 bound.arguments.get("state_schema"),
@@ -411,7 +411,7 @@ class _EnhancedDeepAgentFactory(Generic[CreateP, GraphT, AstreamT]):
                 factory = cast(
                     Callable[..., GraphT],
                     prepare_plan_factory(
-                        cast(Callable[..., object], _native_create_deep_agent),
+                        _native_create_deep_agent,
                         self._signature,
                         bound,
                         instance._plan_options,

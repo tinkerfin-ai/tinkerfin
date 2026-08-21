@@ -144,6 +144,34 @@ def test_generated_stub_declares_precise_facade_return_types() -> None:
     assert "ParamSpec" not in _DEEP_AGENT_STUB.read_text(encoding="utf-8")
 
 
+def test_root_stub_keeps_plan_annotation_dependencies_private() -> None:
+    module = ast.parse(_INIT_STUB.read_text(encoding="utf-8"))
+    aliases = {
+        alias.name: alias.asname
+        for node in module.body
+        if isinstance(node, ast.ImportFrom) and node.module == "plan"
+        for alias in node.names
+        if alias.name != "AgentMode"
+    }
+
+    assert aliases == {
+        "ClarificationFormBase": "_ClarificationFormBase",
+        "DefaultClarificationForm": "_DefaultClarificationForm",
+    }
+    plan = _stub_method(_INIT_STUB, "TinkerFin", "plan")
+    index = next(
+        index
+        for index, argument in enumerate(plan.args.kwonlyargs)
+        if argument.arg == "clarification_schema"
+    )
+    assert ast.unparse(plan.args.kwonlyargs[index].annotation) == (
+        "type[_ClarificationFormBase]"
+    )
+    default = plan.args.kw_defaults[index]
+    assert isinstance(default, ast.Name)
+    assert default.id == "_DefaultClarificationForm"
+
+
 def test_built_wheel_contains_the_generated_stubs(tmp_path: Path) -> None:
     output = tmp_path / "dist"
     subprocess.run(
@@ -168,6 +196,7 @@ def test_built_wheel_contains_the_generated_stubs(tmp_path: Path) -> None:
     assert "tinkerfin/py.typed" in names
     assert "tinkerfin/agui_resume.py" in names
     assert "tinkerfin/plan/__init__.py" in names
+    assert "tinkerfin/plan/clarification.py" in names
     assert "tinkerfin/__init__.pyi" in names
     assert "tinkerfin/deep_agent.pyi" in names
 

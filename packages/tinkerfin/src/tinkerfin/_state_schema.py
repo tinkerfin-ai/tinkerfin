@@ -32,8 +32,14 @@ def _schema_hints(schema: type, *, source: str) -> dict[str, Any]:
         raise StateSchemaCompositionError(
             f"could not resolve state schema from {source}"
         ) from error
-    required = cast(frozenset[str], getattr(schema, "__required_keys__", frozenset()))
-    optional = cast(frozenset[str], getattr(schema, "__optional_keys__", frozenset()))
+    required = cast(
+        frozenset[str],
+        getattr(schema, "__required_keys__", frozenset[str]()),
+    )
+    optional = cast(
+        frozenset[str],
+        getattr(schema, "__optional_keys__", frozenset[str]()),
+    )
     normalized: dict[str, Any] = {}
     for field_name, field_type in hints.items():
         if get_origin(field_type) in (Required, NotRequired):

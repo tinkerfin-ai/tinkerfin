@@ -6,7 +6,7 @@ import asyncio
 import inspect
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
-from typing import Any, cast
+from typing import Annotated, Any, Literal, TypedDict, cast
 
 import pytest
 from ag_ui.core import (
@@ -23,6 +23,9 @@ from deepagents.backends import StoreBackend
 from deepagents.backends.utils import create_file_data
 from deepagents.graph import DeepAgentState
 from langchain.agents.middleware import TodoListMiddleware, wrap_model_call
+from langchain.agents.middleware.model_call_limit import (
+    ModelCallLimitExceededError,
+)
 from langchain.tools import ToolRuntime, tool
 from langchain_core.callbacks.manager import CallbackManagerForLLMRun
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
@@ -39,18 +42,27 @@ from langchain_core.runnables.base import Runnable
 from langchain_core.tools import BaseTool
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+from langgraph.runtime import get_runtime
 from langgraph.store.memory import InMemoryStore
 from langgraph.types import Command, Interrupt
-from pydantic import PrivateAttr, ValidationError
+from pydantic import Field, PrivateAttr, ValidationError, field_serializer
 
+import tinkerfin.plan as plan_api
 from tinkerfin import AgUiResumeBinding, Identity, TinkerFin
 from tinkerfin.plan import (
+    ClarificationForm,
+    ClarificationFormBase,
+    ClarificationModel,
     ClarificationOption,
+    ClarificationOptionBase,
     ClarificationQuestion,
+    ClarificationQuestionBase,
+    DefaultClarificationForm,
     PlanDraft,
     PlanModeConfigurationError,
     PlanState,
     PlanStep,
+    PlanStructuredOutputError,
 )
 from tinkerfin_agui_adapter import ResumeMapper
 
@@ -110,6 +122,150 @@ class _DefinitionState(DeepAgentState):
     definition_marker: str
 
 
+class _RuntimeContext(TypedDict):
+    tenant: str
+
+
+class _ContextAwareFakeModel(_FakeModel):
+    _runtime_contexts: list[_RuntimeContext] = PrivateAttr(default_factory=list)
+
+    @property
+    def runtime_contexts(self) -> tuple[_RuntimeContext, ...]:
+        return tuple(self._runtime_contexts)
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        context = get_runtime(_RuntimeContext).context
+        assert context is not None
+        self._runtime_contexts.append(context)
+        return super()._generate(
+            messages,
+            stop=stop,
+            run_manager=run_manager,
+            **kwargs,
+        )
+
+
+class _CustomQuestionAttributes(ClarificationModel):
+    category: str
+
+
+class _CustomOptionAttributes(ClarificationModel):
+    priority: int
+
+
+class _CustomOption(ClarificationOption[_CustomOptionAttributes]):
+    pass
+
+
+class _CustomQuestion(
+    ClarificationQuestion[_CustomQuestionAttributes, _CustomOptionAttributes]
+):
+    options: tuple[_CustomOption, ...] = ()
+
+
+class _CustomClarificationForm(ClarificationForm[_CustomQuestion]):
+    pass
+
+
+class _DictOption(ClarificationOptionBase):
+    attributes: dict[str, str] | None = None
+
+
+class _DictQuestion(ClarificationQuestionBase):
+    options: tuple[_DictOption, ...] = ()
+
+
+class _DictClarificationForm(ClarificationForm[_DictQuestion]):
+    pass
+
+
+class _AnyOption(ClarificationOptionBase):
+    attributes: Any = None
+
+
+class _AnyQuestion(ClarificationQuestionBase):
+    options: tuple[_AnyOption, ...] = ()
+
+
+class _AnyClarificationForm(ClarificationForm[_AnyQuestion]):
+    pass
+
+
+class _BadCoreOption(ClarificationOptionBase):
+    id: int
+
+
+class _BadCoreOptionQuestion(ClarificationQuestionBase):
+    options: tuple[_BadCoreOption, ...] = ()
+
+
+class _BadCoreOptionForm(ClarificationForm[_BadCoreOptionQuestion]):
+    pass
+
+
+class _BadCoreQuestion(ClarificationQuestionBase):
+    id: int
+
+
+class _BadCoreQuestionForm(ClarificationForm[_BadCoreQuestion]):
+    pass
+
+
+class _ListQuestionForm(ClarificationFormBase):
+    questions: list[_CustomQuestion]
+
+
+class _ListOptionQuestion(ClarificationQuestionBase):
+    options: list[_CustomOption] = Field(default_factory=list)
+
+
+class _ListOptionForm(ClarificationForm[_ListOptionQuestion]):
+    pass
+
+
+class _CustomQuestionA(_CustomQuestion):
+    type: Literal["a"] = "a"
+
+
+class _CustomQuestionB(_CustomQuestion):
+    type: Literal["b"] = "b"
+
+
+_CustomQuestionUnion = Annotated[
+    _CustomQuestionA | _CustomQuestionB,
+    Field(discriminator="type"),
+]
+
+
+class _MixedClarificationForm(ClarificationFormBase):
+    questions: tuple[_CustomQuestionUnion, ...]
+
+
+class _OpaqueQuestionAttributes(ClarificationModel):
+    token: str
+
+    @field_serializer("token")
+    def serialize_token(self, value: str) -> object:
+        del value
+        return object()
+
+
+class _OpaqueQuestion(
+    ClarificationQuestion[_OpaqueQuestionAttributes, ClarificationModel]
+):
+    pass
+
+
+class _OpaqueClarificationForm(ClarificationForm[_OpaqueQuestion]):
+    pass
+
+
 def _identity(run_id: str) -> Identity:
     return Identity(threadId="plan-thread", runId=run_id)
 
@@ -127,7 +283,11 @@ def _gate(
                 "args": {
                     "route": route,
                     "goal": "Implement feature",
-                    "questions": questions or [],
+                    "clarification": (
+                        None
+                        if questions is None
+                        else {"schema_version": 1, "questions": questions}
+                    ),
                 },
                 "id": f"gate-{route}",
                 "type": "tool_call",
@@ -144,7 +304,7 @@ def _planner(*, suffix: str = "") -> AIMessage:
                 "name": "PlannerOutcome",
                 "args": {
                     "type": "draft",
-                    "questions": [],
+                    "clarification": None,
                     "draft": {
                         "goal": f"Implement feature{suffix}",
                         "assumptions": [],
@@ -174,28 +334,93 @@ def _planner_clarification() -> AIMessage:
                 "name": "PlannerOutcome",
                 "args": {
                     "type": "clarify",
-                    "questions": [
-                        {
-                            "id": "planner-q-1",
-                            "prompt": "Which environment?",
-                            "options": [
-                                {
-                                    "id": "staging",
-                                    "label": "Staging",
-                                    "description": "Use the test environment",
-                                },
-                                {
-                                    "id": "production",
-                                    "label": "Production",
-                                    "description": "Use the live environment",
-                                },
-                            ],
-                            "allow_custom_answer": False,
-                        }
-                    ],
+                    "clarification": {
+                        "schema_version": 1,
+                        "questions": [
+                            {
+                                "id": "planner-q-1",
+                                "prompt": "Which environment?",
+                                "options": [
+                                    {
+                                        "id": "staging",
+                                        "label": "Staging",
+                                        "description": "Use the test environment",
+                                    },
+                                    {
+                                        "id": "production",
+                                        "label": "Production",
+                                        "description": "Use the live environment",
+                                    },
+                                ],
+                                "allow_free_text": False,
+                            }
+                        ],
+                    },
                     "draft": None,
                 },
                 "id": "planner-clarification",
+                "type": "tool_call",
+            }
+        ],
+    )
+
+
+def _custom_gate_clarification(*, priority: object = 1) -> AIMessage:
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "GateDecision",
+                "args": {
+                    "route": "clarify",
+                    "goal": "Implement feature",
+                    "clarification": {
+                        "schema_version": 1,
+                        "questions": [
+                            {
+                                "id": "custom-q-1",
+                                "prompt": "Choose the target",
+                                "attributes": {"category": "target"},
+                                "options": [
+                                    {
+                                        "id": "custom-option-a",
+                                        "label": "Target A",
+                                        "description": "Use target A",
+                                        "attributes": {"priority": priority},
+                                    }
+                                ],
+                                "allow_free_text": False,
+                            }
+                        ],
+                    },
+                },
+                "id": "gate-custom-clarification",
+                "type": "tool_call",
+            }
+        ],
+    )
+
+
+def _opaque_gate_clarification() -> AIMessage:
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "GateDecision",
+                "args": {
+                    "route": "clarify",
+                    "goal": "Implement feature",
+                    "clarification": {
+                        "questions": [
+                            {
+                                "id": "opaque-q",
+                                "prompt": "Choose",
+                                "attributes": {"token": "secret"},
+                            }
+                        ]
+                    },
+                },
+                "id": "gate-opaque-clarification",
                 "type": "tool_call",
             }
         ],
@@ -210,6 +435,7 @@ async def _parts(
     config: Mapping[str, object],
     durability: str | None = None,
     mode: str | None = None,
+    context: object | None = None,
 ) -> list[Mapping[str, object]]:
     runtime = cast(Any, definition).new(identity=_identity(run_id), mode=mode)
     kwargs: dict[str, object] = {
@@ -219,6 +445,8 @@ async def _parts(
     }
     if durability is not None:
         kwargs["durability"] = durability
+    if context is not None:
+        kwargs["context"] = context
     return [part async for part in runtime.astream(graph_input, **kwargs)]
 
 
@@ -298,6 +526,34 @@ def test_plan_configuration_is_immutable_and_preserves_upstream_signature() -> N
         planned.create_deep_agent(model=_FakeModel(responses=[AIMessage(content="ok")]))
 
 
+def test_plan_package_exports_the_complete_clarification_contract() -> None:
+    expected = {
+        "AgentMode",
+        "ClarificationExchange",
+        "ClarificationForm",
+        "ClarificationFormBase",
+        "ClarificationModel",
+        "ClarificationOption",
+        "ClarificationOptionBase",
+        "ClarificationQuestion",
+        "ClarificationQuestionBase",
+        "ConfirmedPlan",
+        "DefaultClarificationForm",
+        "PendingClarification",
+        "PlanDraft",
+        "PlanModeConfigurationError",
+        "PlanReviewAction",
+        "PlanRoute",
+        "PlanState",
+        "PlanStatus",
+        "PlanStep",
+        "PlanStructuredOutputError",
+        "RequirementAnswer",
+    }
+
+    assert set(plan_api.__all__) == expected
+
+
 @pytest.mark.asyncio
 async def test_plan_configuration_preserves_coordinator_and_definition_topology() -> (
     None
@@ -342,6 +598,67 @@ def test_plan_configuration_validates_disabled_options_and_modes() -> None:
         TinkerFin().plan(enabled=False, default_mode="plan")
     with pytest.raises(PlanModeConfigurationError, match="default_mode"):
         TinkerFin().plan(default_mode=cast(Any, "automatic"))
+    with pytest.raises(PlanModeConfigurationError, match="disabled Plan capability"):
+        TinkerFin().plan(
+            enabled=False,
+            clarification_schema=_CustomClarificationForm,
+        )
+
+
+@pytest.mark.parametrize(
+    ("schema", "message"),
+    [
+        (ClarificationModel, "ClarificationFormBase subclass"),
+        (ClarificationForm, "unbound generics"),
+        (_DictClarificationForm, "ClarificationModel"),
+        (_AnyClarificationForm, "ClarificationModel"),
+        (_BadCoreOptionForm, "core fields unchanged"),
+        (_BadCoreQuestionForm, "core fields unchanged"),
+        (_ListQuestionForm, "variadic tuple"),
+        (_ListOptionForm, "variadic tuple"),
+    ],
+)
+def test_plan_configuration_rejects_invalid_clarification_schemas(
+    schema: object,
+    message: str,
+) -> None:
+    with pytest.raises(PlanModeConfigurationError, match=message):
+        TinkerFin().plan(clarification_schema=cast(Any, schema))
+
+
+def test_plan_configuration_accepts_a_concrete_discriminated_question_union() -> None:
+    configured = TinkerFin().plan(clarification_schema=_MixedClarificationForm)
+    form = _MixedClarificationForm.model_validate(
+        {
+            "questions": [
+                {
+                    "type": "a",
+                    "id": "question-a",
+                    "prompt": "Choose",
+                    "attributes": {"category": "target"},
+                }
+            ]
+        }
+    )
+
+    assert configured is not None
+    assert isinstance(form.questions[0], _CustomQuestionA)
+
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        _CustomClarificationForm.model_validate(
+            {
+                "questions": [
+                    {
+                        "id": "question",
+                        "prompt": "Choose",
+                        "attributes": {
+                            "category": "target",
+                            "unknown": "rejected",
+                        },
+                    }
+                ]
+            }
+        )
 
 
 def test_plain_definition_rejects_plan_runs() -> None:
@@ -563,7 +880,7 @@ def test_clarification_options_are_dynamic_and_validated() -> None:
                 description="Deploy to the test environment",
             ),
         ),
-        allow_custom_answer=False,
+        allow_free_text=False,
     )
 
     assert question.options[0].id == "staging"
@@ -571,8 +888,53 @@ def test_clarification_options_are_dynamic_and_validated() -> None:
         ClarificationQuestion(
             id="deployment",
             prompt="Where should this deploy?",
-            allow_custom_answer=False,
+            allow_free_text=False,
         )
+
+    option = ClarificationOption(id="duplicate", label="Duplicate")
+    with pytest.raises(ValidationError, match="option IDs must be unique"):
+        ClarificationQuestion(
+            id="deployment",
+            prompt="Where should this deploy?",
+            options=(option, option),
+        )
+    with pytest.raises(ValidationError, match="question IDs must be unique"):
+        DefaultClarificationForm.model_validate(
+            {
+                "questions": [
+                    {"id": "duplicate", "prompt": "First question"},
+                    {"id": "duplicate", "prompt": "Second question"},
+                ]
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_gate_and_deep_agent_preserve_the_parent_runtime_context() -> None:
+    model = _ContextAwareFakeModel(
+        responses=[_gate("direct"), AIMessage(content="done")]
+    )
+    definition = (
+        TinkerFin()
+        .plan(enabled=True, default_mode="plan")
+        .create_deep_agent(
+            model=model,
+            tools=[],
+            context_schema=_RuntimeContext,
+            checkpointer=InMemorySaver(),
+        )
+    )
+    context: _RuntimeContext = {"tenant": "tenant-1"}
+
+    await _parts(
+        definition,
+        {"messages": [HumanMessage(content="Implement")]},
+        run_id="runtime-context",
+        config={"configurable": {"thread_id": "plan-thread"}},
+        context=context,
+    )
+
+    assert model.runtime_contexts == (context, context)
 
 
 def test_plan_mode_requires_an_explicit_model_and_concrete_saver() -> None:
@@ -706,8 +1068,8 @@ async def test_plan_review_approve_executes_child_with_json_checkpoint_state() -
         for checkpoint in saver.list(config)
     }
     assert "" in namespaces
-    assert any(namespace.startswith("plan_gate:") for namespace in namespaces)
-    assert any(namespace.startswith("create_plan:") for namespace in namespaces)
+    assert not any(namespace.startswith("plan_gate:") for namespace in namespaces)
+    assert not any(namespace.startswith("create_plan:") for namespace in namespaces)
     assert any(namespace.startswith("execute_deep_agent:") for namespace in namespaces)
     planner_bindings = [
         set(names) for names in model.bound_tool_names if "PlannerOutcome" in names
@@ -780,6 +1142,44 @@ async def test_read_only_planner_inherits_the_parent_store() -> None:
         for message in tool_messages
     )
     assert _root_interrupts(parts)[0].value["kind"] == "plan_review"
+
+
+@pytest.mark.asyncio
+async def test_read_only_planner_has_a_bounded_model_call_budget() -> None:
+    repeated_inspection = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "ls",
+                    "args": {"path": "/"},
+                    "id": f"planner-ls-{index}",
+                    "type": "tool_call",
+                }
+            ],
+        )
+        for index in range(6)
+    ]
+    model = _FakeModel(responses=[_gate("plan"), *repeated_inspection])
+    definition = (
+        TinkerFin()
+        .plan(enabled=True, default_mode="plan")
+        .create_deep_agent(
+            model=model,
+            tools=[],
+            checkpointer=InMemorySaver(),
+        )
+    )
+
+    with pytest.raises(ModelCallLimitExceededError, match=r"run limit \(6/6\)"):
+        await _parts(
+            definition,
+            {"messages": [HumanMessage(content="Inspect forever")]},
+            run_id="planner-model-call-limit",
+            config={"configurable": {"thread_id": "plan-thread"}},
+        )
+
+    assert len(model.model_inputs) == 7
 
 
 @pytest.mark.asyncio
@@ -858,7 +1258,415 @@ async def test_clarification_answers_are_required_before_planning() -> None:
     )
     assert _root_interrupts(second)[0].value["kind"] == "plan_review"
     plan = PlanState.model_validate(_root_values(second)[-1]["tinkerfin_plan"])
-    assert plan.requirements[0].answer == "Target A"
+    assert plan.clarification_history[0].answers[0].answer == "Target A"
+
+
+@pytest.mark.asyncio
+async def test_custom_clarification_form_round_trips_attributes_and_option_id() -> None:
+    model = _FakeModel(
+        responses=[
+            _custom_gate_clarification(),
+            _gate("plan"),
+            _planner(),
+        ]
+    )
+    saver = InMemorySaver(
+        serde=JsonPlusSerializer(pickle_fallback=False),
+    )
+    definition = (
+        TinkerFin()
+        .plan(
+            enabled=True,
+            default_mode="plan",
+            clarification_schema=_CustomClarificationForm,
+        )
+        .create_deep_agent(
+            model=model,
+            tools=[],
+            checkpointer=saver,
+        )
+    )
+    config = {"configurable": {"thread_id": "plan-thread"}}
+
+    interrupted = await _parts(
+        definition,
+        {"messages": [HumanMessage(content="Implement")]},
+        run_id="custom-form-1",
+        config=config,
+    )
+    pending = PlanState.model_validate(
+        _root_values(interrupted)[-1]["tinkerfin_plan"]
+    ).pending_clarification
+    assert pending is not None
+    question = cast(Sequence[Mapping[str, object]], pending.form["questions"])[0]
+    assert question["attributes"] == {"category": "target"}
+    option = cast(Sequence[Mapping[str, object]], question["options"])[0]
+    assert option["attributes"] == {"priority": 1}
+
+    native_interrupt = _root_interrupts(interrupted)[0]
+    metadata = cast(Mapping[str, object], native_interrupt.value["metadata"])
+    clarification = cast(Mapping[str, object], metadata["clarification"])
+    assert "schemaFingerprint" not in clarification
+
+    reviewed = await _parts(
+        definition,
+        Command(
+            resume={
+                "type": "respond",
+                "answers": [
+                    {
+                        "questionId": "custom-q-1",
+                        "optionId": "custom-option-a",
+                    }
+                ],
+            }
+        ),
+        run_id="custom-form-2",
+        config=config,
+    )
+    plan = PlanState.model_validate(_root_values(reviewed)[-1]["tinkerfin_plan"])
+    exchange = plan.clarification_history[0]
+    assert exchange.answers[0].answer == "Target A"
+    assert exchange.answers[0].option_id == "custom-option-a"
+    assert exchange.form == pending.form
+    assert any(
+        '"priority": 1' in str(message.content)
+        for model_input in model.model_inputs
+        for message in model_input
+        if isinstance(message, HumanMessage)
+    )
+
+
+@pytest.mark.asyncio
+async def test_ag_ui_custom_form_preserves_attributes_without_internal_fingerprint() -> (
+    None
+):
+    definition = (
+        TinkerFin()
+        .plan(
+            enabled=True,
+            default_mode="plan",
+            clarification_schema=_CustomClarificationForm,
+        )
+        .create_deep_agent(
+            model=_FakeModel(responses=[_custom_gate_clarification()]),
+            tools=[],
+            checkpointer=InMemorySaver(),
+        )
+    )
+
+    events = await _agui_events(
+        definition,
+        {"messages": [HumanMessage(content="Implement")]},
+        run_id="custom-form-agui",
+        config={"configurable": {"thread_id": "plan-thread"}},
+    )
+
+    terminal = _terminal(events)
+    assert terminal.outcome is not None and terminal.outcome.type == "interrupt"
+    interrupt = terminal.outcome.interrupts[0]
+    persisted = cast(Mapping[str, object], interrupt.metadata)["runtimeInterrupt"]
+    envelope = cast(Mapping[str, object], persisted)["envelope"]
+    metadata = cast(Mapping[str, object], envelope)["metadata"]
+    clarification = cast(Mapping[str, object], metadata)["clarification"]
+    form = cast(Mapping[str, object], clarification)["form"]
+    question = cast(
+        Sequence[Mapping[str, object]], cast(Mapping[str, object], form)["questions"]
+    )[0]
+    option = cast(Sequence[Mapping[str, object]], question["options"])[0]
+    assert question["attributes"] == {"category": "target"}
+    assert option["attributes"] == {"priority": 1}
+    assert "schemaFingerprint" not in cast(Mapping[str, object], clarification)
+    snapshots = [event for event in events if isinstance(event, StateSnapshotEvent)]
+    assert snapshots
+    assert all(
+        "_tinkerfin_plan_clarification_schema" not in snapshot.snapshot
+        for snapshot in snapshots
+    )
+    assert all(
+        "_tinkerfin_plan_clarification_schema"
+        not in event.model_dump_json(by_alias=True)
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_concrete_tool_strategy_retries_invalid_custom_attributes() -> None:
+    model = _FakeModel(
+        responses=[
+            _custom_gate_clarification(priority="invalid"),
+            _custom_gate_clarification(priority=1),
+        ]
+    )
+    definition = (
+        TinkerFin()
+        .plan(
+            enabled=True,
+            default_mode="plan",
+            clarification_schema=_CustomClarificationForm,
+        )
+        .create_deep_agent(
+            model=model,
+            tools=[],
+            checkpointer=InMemorySaver(),
+        )
+    )
+
+    parts = await _parts(
+        definition,
+        {"messages": [HumanMessage(content="Implement")]},
+        run_id="custom-retry",
+        config={"configurable": {"thread_id": "plan-thread"}},
+    )
+
+    assert _root_interrupts(parts)[0].value["kind"] == "plan_clarification"
+    assert len(model.model_inputs) == 2
+    assert any(
+        isinstance(message, ToolMessage)
+        and "Failed to parse structured output" in str(message.content)
+        for message in model.model_inputs[1]
+    )
+
+
+@pytest.mark.asyncio
+async def test_clarification_fails_before_checkpoint_on_invalid_json_serializer() -> (
+    None
+):
+    definition = (
+        TinkerFin()
+        .plan(
+            enabled=True,
+            default_mode="plan",
+            clarification_schema=_OpaqueClarificationForm,
+        )
+        .create_deep_agent(
+            model=_FakeModel(responses=[_opaque_gate_clarification()]),
+            tools=[],
+            checkpointer=InMemorySaver(),
+        )
+    )
+
+    with pytest.raises(PlanStructuredOutputError, match="JSON checkpoint round-trip"):
+        await _parts(
+            definition,
+            {"messages": [HumanMessage(content="Implement")]},
+            run_id="opaque-form",
+            config={"configurable": {"thread_id": "plan-thread"}},
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {"questionId": "q-1", "optionId": "a", "answer": "tampered"},
+        {"questionId": "q-1", "optionId": "a", "answer": None},
+        {"questionId": "q-1", "optionId": None, "answer": "custom"},
+        {"questionId": "q-1"},
+    ],
+)
+async def test_clarification_response_schema_enforces_two_exact_answer_shapes(
+    answer: dict[str, object],
+) -> None:
+    config = {"configurable": {"thread_id": "plan-thread"}}
+    definition = (
+        TinkerFin()
+        .plan(enabled=True, default_mode="plan")
+        .create_deep_agent(
+            model=_FakeModel(
+                responses=[
+                    _gate(
+                        "clarify",
+                        questions=[
+                            {
+                                "id": "q-1",
+                                "prompt": "Which target?",
+                                "options": [
+                                    {"id": "a", "label": "A"},
+                                ],
+                            }
+                        ],
+                    )
+                ]
+            ),
+            tools=[],
+            checkpointer=InMemorySaver(),
+        )
+    )
+    interrupted = await _parts(
+        definition,
+        {"messages": [HumanMessage(content="Implement")]},
+        run_id="exclusive-answer-1",
+        config=config,
+    )
+    response_schema = _root_interrupts(interrupted)[0].value["responseSchema"]
+    definitions = response_schema["$defs"]
+    answer_shapes = {
+        frozenset(answer_definition["required"])
+        for answer_definition in definitions.values()
+    }
+    assert answer_shapes == {
+        frozenset({"questionId", "optionId"}),
+        frozenset({"questionId", "answer"}),
+    }
+    assert all(
+        answer_definition["additionalProperties"] is False
+        for answer_definition in definitions.values()
+    )
+
+    with pytest.raises(ValidationError):
+        await _parts(
+            definition,
+            Command(
+                resume={
+                    "type": "respond",
+                    "answers": [answer],
+                }
+            ),
+            run_id="exclusive-answer-2",
+            config=config,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("answers", "message"),
+    [
+        (
+            [{"questionId": "q-option", "optionId": "a"}],
+            "every pending question",
+        ),
+        (
+            [
+                {"questionId": "q-option", "optionId": "a"},
+                {"questionId": "old-question", "answer": "stale"},
+            ],
+            "every pending question",
+        ),
+        (
+            [
+                {"questionId": "q-option", "optionId": "a"},
+                {"questionId": "q-option", "optionId": "a"},
+                {"questionId": "q-text", "answer": "details"},
+            ],
+            "question IDs must be unique",
+        ),
+        (
+            [
+                {"questionId": "q-option", "optionId": "old-option"},
+                {"questionId": "q-text", "answer": "details"},
+            ],
+            "unknown option",
+        ),
+        (
+            [
+                {"questionId": "q-option", "answer": "custom"},
+                {"questionId": "q-text", "answer": "details"},
+            ],
+            "requires an option",
+        ),
+    ],
+)
+async def test_clarification_rejects_incomplete_duplicate_and_stale_answers(
+    answers: list[dict[str, str]],
+    message: str,
+) -> None:
+    config = {"configurable": {"thread_id": "plan-thread"}}
+    definition = (
+        TinkerFin()
+        .plan(enabled=True, default_mode="plan")
+        .create_deep_agent(
+            model=_FakeModel(
+                responses=[
+                    _gate(
+                        "clarify",
+                        questions=[
+                            {
+                                "id": "q-option",
+                                "prompt": "Choose a target",
+                                "options": [{"id": "a", "label": "Target A"}],
+                                "allow_free_text": False,
+                            },
+                            {
+                                "id": "q-text",
+                                "prompt": "Add details",
+                            },
+                        ],
+                    )
+                ]
+            ),
+            tools=[],
+            checkpointer=InMemorySaver(),
+        )
+    )
+    await _parts(
+        definition,
+        {"messages": [HumanMessage(content="Implement")]},
+        run_id="invalid-answer-1",
+        config=config,
+    )
+
+    with pytest.raises((ValidationError, ValueError), match=message):
+        await _parts(
+            definition,
+            Command(resume={"type": "respond", "answers": answers}),
+            run_id="invalid-answer-2",
+            config=config,
+        )
+
+
+@pytest.mark.asyncio
+async def test_pending_clarification_rejects_definition_schema_drift() -> None:
+    saver = InMemorySaver()
+    config = {"configurable": {"thread_id": "plan-thread"}}
+    original = (
+        TinkerFin()
+        .plan(enabled=True, default_mode="plan")
+        .create_deep_agent(
+            model=_FakeModel(
+                responses=[
+                    _gate(
+                        "clarify",
+                        questions=[{"id": "q-1", "prompt": "Which target?"}],
+                    )
+                ]
+            ),
+            tools=[],
+            checkpointer=saver,
+        )
+    )
+    await _parts(
+        original,
+        {"messages": [HumanMessage(content="Implement")]},
+        run_id="schema-drift-1",
+        config=config,
+    )
+    changed = (
+        TinkerFin()
+        .plan(
+            enabled=True,
+            default_mode="plan",
+            clarification_schema=_CustomClarificationForm,
+        )
+        .create_deep_agent(
+            model=_FakeModel(responses=[AIMessage(content="unused")]),
+            tools=[],
+            checkpointer=saver,
+        )
+    )
+
+    with pytest.raises(PlanModeConfigurationError, match="does not match"):
+        await _parts(
+            changed,
+            Command(
+                resume={
+                    "type": "respond",
+                    "answers": [{"questionId": "q-1", "answer": "A"}],
+                }
+            ),
+            run_id="schema-drift-2",
+            config=config,
+        )
 
 
 @pytest.mark.asyncio
@@ -889,30 +1697,40 @@ async def test_planner_can_request_clarification_before_creating_a_draft() -> No
     interrupt_value = _root_interrupts(clarification)[0].value
     assert interrupt_value["kind"] == "plan_clarification"
     assert interrupt_value["metadata"]["source"] == "planner"
-    assert interrupt_value["metadata"]["questions"] == [
-        {
-            "id": "planner-q-1",
-            "prompt": "Which environment?",
-            "options": [
-                {
-                    "id": "staging",
-                    "label": "Staging",
-                    "description": "Use the test environment",
-                },
-                {
-                    "id": "production",
-                    "label": "Production",
-                    "description": "Use the live environment",
-                },
-            ],
-            "allowCustomAnswer": False,
-        }
-    ]
+    clarification_metadata = interrupt_value["metadata"]["clarification"]
+    assert clarification_metadata["schema"] == "tinkerfin.plan-clarification.v1"
+    assert "schemaFingerprint" not in clarification_metadata
+    assert clarification_metadata["form"] == {
+        "schemaVersion": 1,
+        "questions": [
+            {
+                "id": "planner-q-1",
+                "prompt": "Which environment?",
+                "options": [
+                    {
+                        "id": "staging",
+                        "label": "Staging",
+                        "description": "Use the test environment",
+                        "attributes": None,
+                    },
+                    {
+                        "id": "production",
+                        "label": "Production",
+                        "description": "Use the live environment",
+                        "attributes": None,
+                    },
+                ],
+                "allowFreeText": False,
+                "attributes": None,
+            }
+        ],
+    }
     pending = PlanState.model_validate(
         _root_values(clarification)[-1]["tinkerfin_plan"]
     )
     assert pending.revision == 0
     assert pending.draft is None
+    assert pending.pending_clarification is not None
 
     review = await _parts(
         definition,
@@ -923,7 +1741,6 @@ async def test_planner_can_request_clarification_before_creating_a_draft() -> No
                     {
                         "questionId": "planner-q-1",
                         "optionId": "staging",
-                        "answer": "Staging",
                     }
                 ],
             }
@@ -935,8 +1752,9 @@ async def test_planner_can_request_clarification_before_creating_a_draft() -> No
     assert _root_interrupts(review)[0].value["kind"] == "plan_review"
     plan = PlanState.model_validate(_root_values(review)[-1]["tinkerfin_plan"])
     assert plan.revision == 1
-    assert plan.requirements[0].option_id == "staging"
-    assert plan.requirements[0].answer == "Staging"
+    answer = plan.clarification_history[0].answers[0]
+    assert answer.option_id == "staging"
+    assert answer.answer == "Staging"
 
 
 @pytest.mark.asyncio
@@ -965,6 +1783,14 @@ async def test_ag_ui_planner_clarification_preserves_options_and_resume_path() -
     )
 
     terminal = _terminal(clarification_events)
+    state_snapshots = [
+        event for event in clarification_events if isinstance(event, StateSnapshotEvent)
+    ]
+    assert state_snapshots
+    assert all(
+        "_tinkerfin_plan_clarification_schema" not in event.snapshot
+        for event in state_snapshots
+    )
     assert terminal.outcome is not None and terminal.outcome.type == "interrupt"
     interrupt = terminal.outcome.interrupts[0]
     assert interrupt.reason == "plan_clarification"
@@ -973,18 +1799,24 @@ async def test_ag_ui_planner_clarification_preserves_options_and_resume_path() -
     envelope = cast(Mapping[str, object], correlation["envelope"])
     plan_metadata = cast(Mapping[str, object], envelope["metadata"])
     assert plan_metadata["source"] == "planner"
-    questions = cast(Sequence[Mapping[str, object]], plan_metadata["questions"])
-    assert questions[0]["allowCustomAnswer"] is False
+    clarification_metadata = cast(Mapping[str, object], plan_metadata["clarification"])
+    assert clarification_metadata["schema"] == "tinkerfin.plan-clarification.v1"
+    assert "schemaFingerprint" not in clarification_metadata
+    form = cast(Mapping[str, object], clarification_metadata["form"])
+    questions = cast(Sequence[Mapping[str, object]], form["questions"])
+    assert questions[0]["allowFreeText"] is False
     assert questions[0]["options"] == [
         {
             "id": "staging",
             "label": "Staging",
             "description": "Use the test environment",
+            "attributes": None,
         },
         {
             "id": "production",
             "label": "Production",
             "description": "Use the live environment",
+            "attributes": None,
         },
     ]
     event_types = [event.type.value for event in clarification_events]
@@ -1003,7 +1835,6 @@ async def test_ag_ui_planner_clarification_preserves_options_and_resume_path() -
                         {
                             "questionId": "planner-q-1",
                             "optionId": "staging",
-                            "answer": "Staging",
                         }
                     ],
                 },

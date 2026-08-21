@@ -70,6 +70,63 @@ def test_state_rejects_non_finite_floats_without_committing_previous_state(
     assert snapshot.snapshot == {"value": 1}
 
 
+def test_state_omits_the_internal_plan_schema_fingerprint() -> None:
+    events = _adapter().process(
+        {
+            "type": "values",
+            "ns": (),
+            "data": {
+                "value": 1,
+                "_tinkerfin_plan_clarification_schema": "internal",
+            },
+            "interrupts": (),
+        }
+    )
+
+    snapshot = next(event for event in events if isinstance(event, StateSnapshotEvent))
+    assert snapshot.snapshot == {"value": 1}
+
+
+def test_task_state_boundaries_omit_only_the_top_level_plan_fingerprint() -> None:
+    adapter = _adapter()
+    internal_key = "_tinkerfin_plan_clarification_schema"
+    nested = {internal_key: "business-value"}
+    started = adapter.process(
+        {
+            "type": "tasks",
+            "ns": (),
+            "data": {
+                "id": "plan-node",
+                "name": "plan_gate",
+                "input": {internal_key: "internal", "nested": nested},
+                "triggers": ("branch:to:plan_gate",),
+            },
+        }
+    )
+    completed = adapter.process(
+        {
+            "type": "tasks",
+            "ns": (),
+            "data": {
+                "id": "plan-node",
+                "name": "plan_gate",
+                "error": None,
+                "interrupts": [],
+                "result": {internal_key: "internal", "nested": nested},
+            },
+        }
+    )
+
+    for event, field in ((started[0], "input"), (completed[0], "result")):
+        assert isinstance(event, RawEvent)
+        data = event.event["data"]
+        assert isinstance(data, dict)
+        state = data[field]
+        assert isinstance(state, dict)
+        assert internal_key not in state
+        assert state["nested"] == nested
+
+
 def test_task_start_rejects_non_finite_input_and_allows_same_key_retry(
     non_finite: float,
 ) -> None:

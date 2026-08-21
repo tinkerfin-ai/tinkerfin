@@ -82,14 +82,26 @@ Plan Mode 按下面的边界处理请求：
 
 1. 保守 Gate 在直接执行、需求澄清和规划之间选择
 2. Planner 只能使用 `ls`、`read_file`、`glob` 和 `grep`
-3. 澄清问题可以包含模型动态生成的单选项，并按问题决定是否允许自由输入；需求澄清和
+3. 澄清问题可以包含模型动态生成的单选项，并通过 `allow_free_text` 决定是否允许自由输入；需求澄清和
    计划审批通过 LangGraph interrupt 暂停
 4. 用户批准后生成不可变的 `ConfirmedPlan`，并通过 system request 交给原 Deep Agent
 
-Plan Mode 必须提供明确模型和具体 `BaseCheckpointSaver`。父 Plan 工作流挂载调用方传入的
-checkpointer、store 和 cache，所有子图从父图继承。恢复时必须保持同一个
+Plan Mode 必须提供明确模型和具体 `BaseCheckpointSaver`。父 Plan 工作流持有调用方传入的
+durable checkpointer。Gate 和 Planner 不产生 interrupt，关闭子图 checkpoint，并把完成
+JSON 校验的状态交回父图；Deep Agent 继续继承父 saver，以支持 Tool/Filesystem HITL。
+所有子图继续使用父 runtime 的 store 和 cache。恢复时必须保持同一个
 `Identity.threadId`。Plan 状态位于根状态的 `tinkerfin_plan` 字段，`PlanDraft`、
 `ConfirmedPlan`、`PlanState` 等公开模型从 `tinkerfin.plan` 导入。
+
+`.plan(...)` 省略 `clarification_schema` 时使用内置 `DefaultClarificationForm`。需要为问题
+或选项增加强类型 metadata 的宿主，可以在应用代码中定义具体 `ClarificationForm`，再把该
+类型传给 `.plan(...)`。Schema 固定在返回的 factory 上，不能通过 `new()`、`new_agui()`
+或 resume 替换。attributes 必须使用具体 `ClarificationModel` 子类；这些数据会公开给用户，
+属于模型生成的规划参考，不能直接作为权限、计费或合规依据。
+
+Python 字段使用 `allow_free_text`，JSON 边界使用 `allowFreeText`。选择 Option 时只提交
+`questionId` 和 `optionId`；自由输入时只提交 `questionId` 和 `answer`。工作流从 checkpoint
+恢复可信 Form 并派生 Option label，混合、缺失、未知或过期回答都会被拒绝。
 
 Plan Mode 固定使用 `sync` checkpoint durability。通常省略 `durability` 即可；显式传入
 `sync` 也可以，`async` 和 `exit` 会在事件流开始前报错。

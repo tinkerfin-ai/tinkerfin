@@ -92,13 +92,15 @@ export interface PlanQuestionOption {
   id: string
   label: string
   description?: string | null
+  attributes?: JsonObject | null
 }
 
 export interface PlanQuestionItem {
   id: string
   prompt: string
   options: PlanQuestionOption[]
-  allowCustomAnswer: boolean
+  allowFreeText: boolean
+  attributes?: JsonObject | null
   selectedOptionId?: string
   customAnswer?: string
 }
@@ -106,6 +108,7 @@ export interface PlanQuestionItem {
 export interface PlanQuestionState {
   kind: 'questions'
   interruptId: string
+  form: JsonObject
   questions: PlanQuestionItem[]
   submitted: boolean
   error?: string

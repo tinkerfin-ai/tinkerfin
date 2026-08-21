@@ -9,7 +9,7 @@ This page groups the public Runtime capabilities by how you use them. Most appli
 | API | When to use it | Main input or result |
 | --- | --- | --- |
 | `TinkerFin(run_coordinator=None, state_schema=None)` | Create the main entry point | Optional shared coordinator and Definition-wide state |
-| `TinkerFin.plan(...)` | Create an immutable Plan-capable factory | Capability default, request default mode, optional Gate/Planner models |
+| `TinkerFin.plan(...)` | Create an immutable Plan-capable factory | Capability default, request default mode, optional Gate/Planner models and clarification schema |
 | `TinkerFin.create_deep_agent(...)` | Create a reusable agent definition | See [Create and run a Deep Agent](deep-agents.md) |
 | `Identity(threadId=..., runId=...)` | Identify one framework run | Thread and run only |
 | `TinkerFin.run(...)` | Run a custom async source | `source_factory`, `identity`, `on_part` |
@@ -34,10 +34,19 @@ reserved configurable key fails before streaming.
 ## Plan Mode values
 
 The top-level package exports `AgentMode`. The `tinkerfin.plan` package exports
-`PlanStep`, `PlanDraft`, `ConfirmedPlan`, `ClarificationOption`,
-`ClarificationQuestion`, `RequirementAnswer`, `PlanState`, `PlanStatus`, `PlanRoute`,
-and `PlanReviewAction`. The models are frozen. The root Graph state stores their
-camel-case JSON representation at `tinkerfin_plan`.
+`ClarificationModel`, the `ClarificationOption` / `ClarificationQuestion` /
+`ClarificationForm` base and generic types, `DefaultClarificationForm`, `PlanStep`,
+`PlanDraft`, `ConfirmedPlan`, `RequirementAnswer`, `PendingClarification`,
+`ClarificationExchange`, `PlanState`, `PlanStatus`, `PlanRoute`, `PlanReviewAction`, and
+the Plan error types. The models are frozen. The root Graph state stores their camel-case
+JSON representation at `tinkerfin_plan`.
+
+`.plan(clarification_schema=...)` accepts one fully concrete `ClarificationFormBase`
+subclass defined by the host. Omitting it uses `DefaultClarificationForm`. Python uses
+`allow_free_text`; the JSON contract uses `allowFreeText`. Option answers contain only
+`questionId` and `optionId`; free-text answers contain only `questionId` and `answer`.
+Host models can add typed attributes and discriminants but cannot redefine the
+framework-owned core fields or the tuple shape of questions and options.
 
 `TinkerFin(state_schema=...)` contributes application state to every Deep Agent
 Definition created by that factory. It is composed with the Definition's

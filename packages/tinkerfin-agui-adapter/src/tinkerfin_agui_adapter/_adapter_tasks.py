@@ -50,6 +50,21 @@ from .subagent import SubagentTaskInput
 if TYPE_CHECKING:
     from .adapter import DeepAgentAgUiAdapter
 
+_INTERNAL_STATE_KEYS = frozenset({"_tinkerfin_plan_clarification_schema"})
+
+
+def _without_internal_state_keys(value: object) -> object:
+    """Remove reserved channels only from a known state-mapping boundary."""
+
+    if not isinstance(value, Mapping):
+        return value
+    mapping = cast(Mapping[object, object], value)
+    return {
+        key: item
+        for key, item in mapping.items()
+        if not isinstance(key, str) or key not in _INTERNAL_STATE_KEYS
+    }
+
 
 def _public_task_error(error: object | None) -> object | None:
     """Project a native task error into a stable public shape without traceback."""
@@ -69,6 +84,8 @@ def _safe_checkpoint_task(value: object) -> dict[str, JsonValue]:
     projected: dict[str, object] = {
         key: mapping[key] for key in allowed if key in mapping
     }
+    if "result" in projected:
+        projected["result"] = _without_internal_state_keys(projected["result"])
     if "error" in mapping:
         projected["error"] = _public_task_error(mapping["error"])
     normalized = sanitize_public_data(projected)
@@ -88,6 +105,8 @@ def _safe_debug_task_start(value: object) -> dict[str, JsonValue]:
         for key in ("id", "name", "input", "triggers")
         if key in mapping
     }
+    if "input" in projected:
+        projected["input"] = _without_internal_state_keys(projected["input"])
     normalized = sanitize_public_data(projected)
     if not isinstance(normalized, dict):
         raise TypeError("debug task projection must be a JSON object")
@@ -134,6 +153,8 @@ def _safe_checkpoint_snapshot(value: object) -> dict[str, JsonValue]:
     projected: dict[str, object] = {
         key: mapping[key] for key in ("values", "next") if key in mapping
     }
+    if "values" in projected:
+        projected["values"] = _without_internal_state_keys(projected["values"])
     metadata = mapping.get("metadata")
     if metadata is not None:
         if not isinstance(metadata, Mapping):
@@ -332,7 +353,7 @@ def _process_task_start(
         data={
             "id": payload.id,
             "name": payload.name,
-            "input": payload.input,
+            "input": _without_internal_state_keys(payload.input),
             "triggers": payload.triggers,
             **(
                 {
@@ -429,7 +450,7 @@ def _process_task_result(
             "name": payload.name,
             "error": public_error,
             "interrupts": payload.interrupts,
-            "result": payload.result,
+            "result": _without_internal_state_keys(payload.result),
         },
     )
     self._task_result_fingerprints[key] = fingerprint
@@ -523,7 +544,9 @@ def _emit_values_part(
     # Messages have a dedicated AG-UI channel. Keeping LangChain messages in
     # `STATE_*` would duplicate data, so state events contain non-message state.
     raw_current = {
-        key: value for key, value in part.data.items() if key != _MESSAGE_STATE_KEY
+        key: value
+        for key, value in part.data.items()
+        if key != _MESSAGE_STATE_KEY and key not in _INTERNAL_STATE_KEYS
     }
     current_value = sanitize_public_data(raw_current)
     if not isinstance(current_value, dict):

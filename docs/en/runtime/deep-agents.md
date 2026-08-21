@@ -82,16 +82,31 @@ Plan Mode routes a request through these boundaries:
 
 1. A conservative Gate chooses direct execution, clarification, or planning.
 2. The Planner can use only `ls`, `read_file`, `glob`, and `grep`.
-3. Clarification can provide model-generated single-select options and an optional
-   custom answer; clarification and plan review pause through LangGraph interrupts.
+3. Clarification can provide model-generated single-select options and optional free
+   text; clarification and plan review pause through LangGraph interrupts.
 4. Approval freezes a `ConfirmedPlan` and passes it to the configured Deep Agent in its
    system request.
 
 A concrete `BaseCheckpointSaver` and an explicit model are required. The parent Plan
-workflow attaches the supplied checkpointer, store, and cache; all child graphs inherit
-them. Keep the same `Identity.threadId` when resuming. Plan state appears at the root
+workflow owns the supplied durable checkpointer. Gate and Planner disable child
+checkpointing and return JSON-validated state to the parent; the Deep Agent inherits the
+parent saver for Tool/Filesystem HITL. Child graphs continue to use the parent runtime
+store and cache. Keep the same `Identity.threadId` when resuming. Plan state appears at the root
 `tinkerfin_plan` key, and public models such as `PlanDraft`, `ConfirmedPlan`, and
 `PlanState` are exported from `tinkerfin.plan`.
+
+The built-in `DefaultClarificationForm` is used when `.plan(...)` omits
+`clarification_schema`. Hosts that need typed question or option metadata can define a
+concrete `ClarificationForm` in application code and pass that type to `.plan(...)`.
+The schema is frozen on the returned factory and cannot be replaced by `new()`,
+`new_agui()`, or resume calls. Attributes must use concrete `ClarificationModel`
+subclasses; they are public, model-generated planning context rather than authoritative
+permission, billing, or compliance data.
+
+Each question uses `allow_free_text` (`allowFreeText` on the JSON boundary). An option
+answer sends only `questionId` and `optionId`; a free-text answer sends only
+`questionId` and `answer`. The workflow restores the checkpointed form, derives an
+option's trusted label, and rejects mixed, incomplete, unknown, or stale answers.
 
 Plan Mode fixes checkpoint durability to `sync`. Omitting `durability` is recommended;
 passing `sync` is also accepted, while `async` and `exit` fail before streaming.

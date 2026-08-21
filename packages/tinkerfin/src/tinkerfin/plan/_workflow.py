@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from typing import Generic, Literal, TypeVar, cast
+import json
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from typing import Generic, Literal, Protocol, TypeAlias, TypeVar, cast
 
 from deepagents.backends import StateBackend
 from deepagents.backends.protocol import BackendProtocol
@@ -24,6 +25,7 @@ from pydantic import JsonValue, TypeAdapter
 
 from tinkerfin_agui_adapter import RuntimeInterruptEnvelope
 
+from ._clarification import restore_form, serialize_form
 from ._config import (
     PLAN_MODE_CONFIG_KEY,
     PlanOptions,
@@ -33,7 +35,11 @@ from ._contracts import (
     CLARIFICATION_RESPONSE,
     PLAN_REVIEW_RESPONSE,
     ApprovePlan,
+    ClarificationFreeTextAnswer,
+    ClarificationOptionAnswer,
     EditPlan,
+    PlanClarificationMetadata,
+    PlanClarificationPayload,
     RejectPlan,
     RespondToPlan,
 )
@@ -41,6 +47,7 @@ from ._gate import create_gate_agent, invoke_gate
 from ._middleware import ConfirmedPlanMiddleware
 from ._planner import create_planner_agent, invoke_planner
 from ._state import (
+    PLAN_SCHEMA_FINGERPRINT_KEY,
     PlanWorkflowNodeState,
     create_plan_state_schema,
     plan_state_update,
@@ -48,36 +55,149 @@ from ._state import (
 )
 from .errors import PlanModeConfigurationError
 from .models import (
+    ClarificationExchange,
     ConfirmedPlan,
+    PendingClarification,
     PlanDraft,
     PlanReviewAction,
     PlanRoute,
     PlanState,
     PlanStatus,
+    RequirementAnswer,
 )
 
 _NativeFactory = Callable[..., object]
-_GraphAstream = Callable[..., AsyncIterator[Mapping[str, object]]]
+_CheckpointSaver: TypeAlias = (
+    BaseCheckpointSaver[int] | BaseCheckpointSaver[float] | BaseCheckpointSaver[str]
+)
 _SchemaT = TypeVar("_SchemaT")
 _JSON_OBJECT = TypeAdapter(dict[str, JsonValue])
+
+
+class _CompiledPlanRuntime(Protocol):
+    """Typed subset of the locked CompiledStateGraph used by Plan."""
+
+    checkpointer: object
+    store: BaseStore | None
+
+    def astream(
+        self,
+        *args: object,
+        **kwargs: object,
+    ) -> AsyncIterator[Mapping[str, object]]: ...
+
+
+_SyncPlanNode: TypeAlias = Callable[
+    [PlanWorkflowNodeState],
+    dict[str, object],
+]
+_ConfigPlanNode: TypeAlias = Callable[
+    [PlanWorkflowNodeState, RunnableConfig],
+    dict[str, object],
+]
+_AsyncConfigPlanNode: TypeAlias = Callable[
+    [PlanWorkflowNodeState, RunnableConfig],
+    Awaitable[dict[str, object]],
+]
+_PlanNode: TypeAlias = (
+    _SyncPlanNode | _ConfigPlanNode | _AsyncConfigPlanNode | _CompiledPlanRuntime
+)
+_PlanPath: TypeAlias = (
+    Callable[[PlanWorkflowNodeState], str]
+    | Callable[[PlanWorkflowNodeState, RunnableConfig], str]
+)
+
+
+class _PlanGraphBuilder(Protocol):
+    """Typed subset of StateGraph isolated from third-party unknown generics."""
+
+    def add_node(self, node: str, action: _PlanNode) -> object: ...
+
+    def add_edge(self, start_key: str, end_key: str) -> object: ...
+
+    def add_conditional_edges(
+        self,
+        source: str,
+        path: _PlanPath,
+        path_map: Mapping[str, str],
+    ) -> object: ...
+
+    def compile(
+        self,
+        *,
+        checkpointer: _CheckpointSaver,
+        store: BaseStore | None,
+        cache: BaseCache[object] | None,
+        name: str,
+    ) -> _CompiledPlanRuntime: ...
+
+
+class _SignatureCallable(Protocol):
+    def __call__(self, *args: object, **kwargs: object) -> object: ...
+
+
+_COMPILED_ASTREAM = cast(
+    _SignatureCallable,
+    CompiledStateGraph.astream,  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType]
+)
 
 
 def _messages(state: Mapping[str, object]) -> tuple[BaseMessage, ...]:
     value = state.get("messages")
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
         raise TypeError("Plan workflow state requires a message sequence")
-    messages = tuple(item for item in value if isinstance(item, BaseMessage))
-    if len(messages) != len(value):
+    sequence = cast(Sequence[object], value)
+    messages = tuple(item for item in sequence if isinstance(item, BaseMessage))
+    if len(messages) != len(sequence):
         raise TypeError("Plan workflow messages must be LangChain message objects")
     return messages
 
 
-def _requirement_summary(plan: PlanState) -> str | None:
-    if not plan.requirements:
+def _clarification_context(
+    plan: PlanState,
+    options: PlanOptions,
+) -> tuple[dict[str, JsonValue], ...]:
+    context: list[dict[str, JsonValue]] = []
+    for exchange in plan.clarification_history:
+        form = restore_form(
+            options.clarification,
+            exchange.form,
+        )
+        context.append(
+            _JSON_OBJECT.validate_python(
+                {
+                    "source": exchange.source,
+                    "form": form.model_dump(
+                        mode="json",
+                        by_alias=True,
+                        exclude_none=False,
+                    ),
+                    "answers": [
+                        answer.model_dump(mode="json", by_alias=True)
+                        for answer in exchange.answers
+                    ],
+                }
+            )
+        )
+    return tuple(context)
+
+
+def _clarification_summary(
+    context: Sequence[Mapping[str, object]],
+) -> str | None:
+    if not context:
         return None
-    return "\n".join(
-        f"- {answer.question_id}: {answer.answer}" for answer in plan.requirements
-    )
+    return json.dumps(list(context), ensure_ascii=False, indent=2)
+
+
+def _require_schema_fingerprint(
+    state: Mapping[str, object],
+    options: PlanOptions,
+) -> None:
+    if state.get(PLAN_SCHEMA_FINGERPRINT_KEY) != options.clarification.fingerprint:
+        raise PlanModeConfigurationError(
+            "checkpoint clarification schema does not match this Definition"
+        )
 
 
 def _json_schema(adapter: TypeAdapter[_SchemaT]) -> dict[str, JsonValue]:
@@ -96,6 +216,22 @@ def _runtime_interrupt_value(
     )
 
 
+def _checkpoint_saver(value: object) -> _CheckpointSaver:
+    if not isinstance(value, BaseCheckpointSaver):
+        raise PlanModeConfigurationError(
+            "Plan Mode requires a concrete BaseCheckpointSaver"
+        )
+    return cast(_CheckpointSaver, value)
+
+
+def _optional_cache(value: object) -> BaseCache[object] | None:
+    if value is None:
+        return None
+    if not isinstance(value, BaseCache):
+        raise PlanModeConfigurationError("Plan Mode cache must be a BaseCache or None")
+    return cast(BaseCache[object], value)
+
+
 class PlanWorkflowGraph(Generic[ContextT]):
     """Compiled parent workflow with a mandatory synchronous durability boundary."""
 
@@ -103,20 +239,15 @@ class PlanWorkflowGraph(Generic[ContextT]):
 
     def __init__(
         self,
-        graph: CompiledStateGraph[
-            DeepAgentState,
-            ContextT,
-            DeepAgentState,
-            DeepAgentState,
-        ],
+        graph: _CompiledPlanRuntime,
     ) -> None:
         self._graph = graph
 
     @property
-    def checkpointer(self) -> BaseCheckpointSaver:
+    def checkpointer(self) -> _CheckpointSaver:
         """Return the concrete checkpointer owned by the parent graph."""
 
-        return cast(BaseCheckpointSaver, self._graph.checkpointer)
+        return _checkpoint_saver(self._graph.checkpointer)
 
     @property
     def store(self) -> BaseStore | None:
@@ -134,14 +265,13 @@ class PlanWorkflowGraph(Generic[ContextT]):
         if durability not in (None, "sync"):
             raise PlanModeConfigurationError("Plan Mode requires durability='sync'")
         options["durability"] = "sync"
-        stream = cast(_GraphAstream, self._graph.astream)
-        return stream(*args, **options)
+        return self._graph.astream(*args, **options)
 
 
 setattr(
     PlanWorkflowGraph.astream,
     "__signature__",
-    inspect.signature(CompiledStateGraph.astream),
+    inspect.signature(_COMPILED_ASTREAM),
 )
 
 
@@ -176,11 +306,7 @@ class _PlanGraphFactory(Generic[ContextT]):
             isinstance(model, str) and not model.strip()
         ):
             raise PlanModeConfigurationError("Plan Mode requires an explicit model")
-        checkpointer = arguments.get("checkpointer")
-        if not isinstance(checkpointer, BaseCheckpointSaver):
-            raise PlanModeConfigurationError(
-                "Plan Mode requires a concrete BaseCheckpointSaver"
-            )
+        _checkpoint_saver(arguments.get("checkpointer"))
 
     def _build(
         self,
@@ -226,24 +352,34 @@ class _PlanGraphFactory(Generic[ContextT]):
         deep_agent = self._native_factory(*args, **child_kwargs)
         if not isinstance(deep_agent, CompiledStateGraph):
             raise TypeError("Deep Agent factory did not return a CompiledStateGraph")
+        deep_agent_runtime = cast(_CompiledPlanRuntime, deep_agent)
 
         gate = create_gate_agent(
             self._options.gate_model or model,
+            clarification=self._options.clarification,
             context_schema=context_schema,
         )
         planner = create_planner_agent(
             self._options.planner_model or model,
             backend=backend,
+            clarification=self._options.clarification,
             context_schema=context_schema,
         )
 
-        async def gate_node(state: PlanWorkflowNodeState) -> dict[str, object]:
+        async def gate_node(
+            state: PlanWorkflowNodeState,
+            config: RunnableConfig,
+        ) -> dict[str, object]:
             mapped = cast(Mapping[str, object], state)
+            _require_schema_fingerprint(mapped, self._options)
             current = read_plan_state(mapped)
+            clarification_context = _clarification_context(current, self._options)
             decision = await invoke_gate(
                 gate,
                 _messages(mapped),
-                requirement_summary=_requirement_summary(current),
+                clarification=self._options.clarification,
+                config=config,
+                requirement_summary=_clarification_summary(clarification_context),
             )
             status = (
                 PlanStatus.EXECUTING
@@ -254,32 +390,57 @@ class _PlanGraphFactory(Generic[ContextT]):
                     else PlanStatus.PLANNING
                 )
             )
+            pending: PendingClarification | None = None
+            if decision.route is PlanRoute.CLARIFY:
+                _, form_payload = serialize_form(
+                    self._options.clarification,
+                    decision.clarification,
+                )
+                pending = PendingClarification(
+                    source="gate",
+                    form=form_payload,
+                )
             updated = current.model_copy(
                 update={
                     "status": status,
                     "route": decision.route,
                     "goal": decision.goal,
-                    "questions": decision.questions,
+                    "pending_clarification": pending,
                     "review_action": None,
                 }
             )
             return plan_state_update(updated)
 
-        async def planner_node(state: PlanWorkflowNodeState) -> dict[str, object]:
+        async def planner_node(
+            state: PlanWorkflowNodeState,
+            config: RunnableConfig,
+        ) -> dict[str, object]:
             mapped = cast(Mapping[str, object], state)
+            _require_schema_fingerprint(mapped, self._options)
             current = read_plan_state(mapped)
+            clarification_context = _clarification_context(current, self._options)
             outcome = await invoke_planner(
                 planner,
                 _messages(mapped),
                 current,
+                clarification=self._options.clarification,
+                clarification_history=clarification_context,
+                config=config,
                 files=mapped.get("files"),
             )
             if outcome.type == "clarify":
+                _, form_payload = serialize_form(
+                    self._options.clarification,
+                    outcome.clarification,
+                )
                 updated = current.model_copy(
                     update={
                         "status": PlanStatus.AWAITING_CLARIFICATION,
                         "route": PlanRoute.PLAN,
-                        "questions": outcome.questions,
+                        "pending_clarification": PendingClarification(
+                            source="planner",
+                            form=form_payload,
+                        ),
                         "review_action": None,
                     }
                 )
@@ -295,7 +456,7 @@ class _PlanGraphFactory(Generic[ContextT]):
                         "status": PlanStatus.AWAITING_REVIEW,
                         "route": PlanRoute.PLAN,
                         "goal": draft.goal,
-                        "questions": (),
+                        "pending_clarification": None,
                         "draft": draft,
                         "revision": revision,
                         "review_action": None,
@@ -305,7 +466,10 @@ class _PlanGraphFactory(Generic[ContextT]):
 
         def initialize_node(state: PlanWorkflowNodeState) -> dict[str, object]:
             del state
-            return plan_state_update(PlanState())
+            return {
+                **plan_state_update(PlanState()),
+                PLAN_SCHEMA_FINGERPRINT_KEY: self._options.clarification.fingerprint,
+            }
 
         def mode_path(
             state: PlanWorkflowNodeState,
@@ -324,54 +488,90 @@ class _PlanGraphFactory(Generic[ContextT]):
             *,
             source: Literal["gate", "planner"],
         ) -> dict[str, object]:
-            current = read_plan_state(cast(Mapping[str, object], state))
+            mapped = cast(Mapping[str, object], state)
+            _require_schema_fingerprint(mapped, self._options)
+            current = read_plan_state(mapped)
+            pending = current.pending_clarification
+            if pending is None:
+                raise RuntimeError("Plan clarification requires a pending form")
+            if pending.source != source:
+                raise RuntimeError("Plan clarification resumed at the wrong source")
+            form = restore_form(
+                self._options.clarification,
+                pending.form,
+            )
+            metadata = PlanClarificationMetadata(
+                source=source,
+                clarification=PlanClarificationPayload(form=pending.form),
+            )
             envelope = RuntimeInterruptEnvelope(
                 kind="plan_clarification",
                 message="Answer the blocking questions before planning continues.",
                 response_schema=_json_schema(CLARIFICATION_RESPONSE),
-                metadata={
-                    "origin": "plan",
-                    "source": source,
-                    "questionIds": [question.id for question in current.questions],
-                    "questions": [
-                        question.model_dump(
-                            mode="json",
-                            by_alias=True,
-                            exclude_none=False,
-                        )
-                        for question in current.questions
-                    ],
-                },
+                metadata=_JSON_OBJECT.validate_python(
+                    metadata.model_dump(
+                        mode="json",
+                        by_alias=True,
+                        exclude_none=False,
+                    )
+                ),
             )
             raw_response = interrupt(_runtime_interrupt_value(envelope))
             response = CLARIFICATION_RESPONSE.validate_python(raw_response)
             answers = {answer.question_id: answer for answer in response.answers}
-            expected = tuple(question.id for question in current.questions)
+            expected = tuple(question.id for question in form.questions)
             if set(answers) != set(expected) or len(answers) != len(expected):
                 raise ValueError(
                     "clarification response must answer every pending question exactly once"
                 )
-            ordered_answers = []
-            for question in current.questions:
+            ordered_answers: list[RequirementAnswer] = []
+            for question in form.questions:
                 answer = answers[question.id]
-                option_ids = {option.id for option in question.options}
-                if answer.option_id is not None:
-                    if answer.option_id not in option_ids:
+                if isinstance(answer, ClarificationOptionAnswer):
+                    selected = next(
+                        (
+                            option
+                            for option in question.options
+                            if option.id == answer.option_id
+                        ),
+                        None,
+                    )
+                    if selected is None:
                         raise ValueError(
                             f"clarification answer selected an unknown option for {question.id!r}"
                         )
-                elif not question.allow_custom_answer:
-                    raise ValueError(
-                        f"clarification question {question.id!r} requires an option"
+                    normalized = RequirementAnswer(
+                        question_id=question.id,
+                        option_id=selected.id,
+                        answer=selected.label,
                     )
-                ordered_answers.append(answer)
+                elif isinstance(answer, ClarificationFreeTextAnswer):
+                    if not question.allow_free_text:
+                        raise ValueError(
+                            f"clarification question {question.id!r} requires an option"
+                        )
+                    normalized = RequirementAnswer(
+                        question_id=question.id,
+                        answer=answer.answer,
+                    )
+                else:  # pragma: no cover - Pydantic union is exhaustive
+                    raise TypeError("unsupported clarification answer")
+                ordered_answers.append(normalized)
             ordered = tuple(ordered_answers)
+            exchange = ClarificationExchange(
+                source=pending.source,
+                form=pending.form,
+                answers=ordered,
+            )
             updated = current.model_copy(
                 update={
                     "status": PlanStatus.PLANNING,
                     "route": (None if source == "gate" else PlanRoute.PLAN),
-                    "questions": (),
-                    "requirements": (*current.requirements, *ordered),
+                    "pending_clarification": None,
+                    "clarification_history": (
+                        *current.clarification_history,
+                        exchange,
+                    ),
                 }
             )
             return plan_state_update(updated)
@@ -387,7 +587,9 @@ class _PlanGraphFactory(Generic[ContextT]):
             return answer_clarification(state, source="planner")
 
         def review_node(state: PlanWorkflowNodeState) -> dict[str, object]:
-            current = read_plan_state(cast(Mapping[str, object], state))
+            mapped = cast(Mapping[str, object], state)
+            _require_schema_fingerprint(mapped, self._options)
+            current = read_plan_state(mapped)
             draft = current.draft
             if draft is None:
                 raise RuntimeError("Plan review requires a current draft")
@@ -472,7 +674,7 @@ class _PlanGraphFactory(Generic[ContextT]):
 
         def planner_path(state: PlanWorkflowNodeState) -> str:
             current = read_plan_state(cast(Mapping[str, object], state))
-            return "clarify" if current.questions else "review"
+            return "clarify" if current.pending_clarification is not None else "review"
 
         def review_path(state: PlanWorkflowNodeState) -> str:
             action = read_plan_state(cast(Mapping[str, object], state)).review_action
@@ -480,14 +682,17 @@ class _PlanGraphFactory(Generic[ContextT]):
                 raise RuntimeError("Plan review did not record an action")
             return action.value
 
-        builder = StateGraph(state_schema, context_schema=context_schema)
+        builder = cast(
+            _PlanGraphBuilder,
+            StateGraph(state_schema, context_schema=context_schema),
+        )
         builder.add_node("initialize_plan", initialize_node)
         builder.add_node("plan_gate", gate_node)
         builder.add_node("clarify_gate", clarify_gate_node)
         builder.add_node("create_plan", planner_node)
         builder.add_node("clarify_planner", clarify_planner_node)
         builder.add_node("review_plan", review_node)
-        builder.add_node("execute_deep_agent", deep_agent)
+        builder.add_node("execute_deep_agent", deep_agent_runtime)
         builder.add_node("complete_plan", complete_node)
         builder.add_edge(START, "initialize_plan")
         builder.add_conditional_edges(
@@ -527,16 +732,16 @@ class _PlanGraphFactory(Generic[ContextT]):
         builder.add_edge("execute_deep_agent", "complete_plan")
         builder.add_edge("complete_plan", END)
 
-        checkpointer = cast(BaseCheckpointSaver, arguments["checkpointer"])
+        checkpointer = _checkpoint_saver(arguments["checkpointer"])
         store = cast(BaseStore | None, arguments.get("store"))
-        cache = cast(BaseCache | None, arguments.get("cache"))  # pyright: ignore[reportMissingTypeArgument]
+        cache = _optional_cache(arguments.get("cache"))
         parent = builder.compile(
             checkpointer=checkpointer,
             store=store,
             cache=cache,
             name="tinkerfin_plan_workflow",
         )
-        return PlanWorkflowGraph(parent)
+        return PlanWorkflowGraph[ContextT](parent)
 
 
 def prepare_plan_factory(

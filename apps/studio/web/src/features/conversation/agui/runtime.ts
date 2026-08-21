@@ -185,20 +185,42 @@ const planInteractionFromInterrupts = (
   if (!metadata) return undefined
 
   if (interrupt.reason === 'plan_clarification') {
-    if (!Array.isArray(metadata.questions)) return undefined
-    const questions = metadata.questions.flatMap((rawQuestion) => {
+    const clarification = metadata.clarification
+    if (!clarification || typeof clarification !== 'object' || Array.isArray(clarification)) return undefined
+    if (clarification.schema !== 'tinkerfin.plan-clarification.v1') return undefined
+    const form = clarification.form
+    if (!form || typeof form !== 'object' || Array.isArray(form)) return undefined
+    if (form.schemaVersion !== 1 || !Array.isArray(form.questions)) return undefined
+    const questions = form.questions.flatMap((rawQuestion) => {
       if (!rawQuestion || typeof rawQuestion !== 'object' || Array.isArray(rawQuestion)) return []
       const question = rawQuestion as JsonObject
-      if (typeof question.id !== 'string' || typeof question.prompt !== 'string') return []
+      if (
+        typeof question.id !== 'string'
+        || typeof question.prompt !== 'string'
+        || typeof question.allowFreeText !== 'boolean'
+      ) return []
+      const questionAttributes = question.attributes
+      if (
+        questionAttributes !== undefined
+        && questionAttributes !== null
+        && (typeof questionAttributes !== 'object' || Array.isArray(questionAttributes))
+      ) return []
       const options = Array.isArray(question.options)
         ? question.options.flatMap((rawOption) => {
             if (!rawOption || typeof rawOption !== 'object' || Array.isArray(rawOption)) return []
             const option = rawOption as JsonObject
             if (typeof option.id !== 'string' || typeof option.label !== 'string') return []
+            const optionAttributes = option.attributes
+            if (
+              optionAttributes !== undefined
+              && optionAttributes !== null
+              && (typeof optionAttributes !== 'object' || Array.isArray(optionAttributes))
+            ) return []
             return [{
               id: option.id,
               label: option.label,
-              description: typeof option.description === 'string' ? option.description : undefined,
+              description: typeof option.description === 'string' ? option.description : null,
+              attributes: optionAttributes as JsonObject | null | undefined,
             }]
           })
         : []
@@ -206,13 +228,15 @@ const planInteractionFromInterrupts = (
         id: question.id,
         prompt: question.prompt,
         options,
-        allowCustomAnswer: question.allowCustomAnswer !== false,
+        allowFreeText: question.allowFreeText,
+        attributes: questionAttributes as JsonObject | null | undefined,
       }]
     })
-    if (questions.length !== metadata.questions.length || questions.length === 0) return undefined
+    if (questions.length !== form.questions.length || questions.length === 0) return undefined
     return {
       kind: 'questions',
       interruptId: interrupt.id,
+      form: structuredClone(form as JsonObject),
       questions,
       submitted: false,
     }
@@ -777,12 +801,10 @@ export const buildPlanResumePayload = (
       const option = question.options.find((item) => item.id === question.selectedOptionId)
       const customAnswer = question.customAnswer?.trim() ?? ''
       if (!option && !customAnswer) throw new Error("请回答所有 Plan 澄清问题")
-      if (!option && !question.allowCustomAnswer) throw new Error("该问题必须选择一个选项")
-      return {
-        questionId: question.id,
-        answer: option?.label ?? customAnswer,
-        ...(option ? { optionId: option.id } : {}),
-      }
+      if (!option && !question.allowFreeText) throw new Error("该问题必须选择一个选项")
+      return option
+        ? { questionId: question.id, optionId: option.id }
+        : { questionId: question.id, answer: customAnswer }
     })
     payload = { type: 'respond', answers }
   } else {

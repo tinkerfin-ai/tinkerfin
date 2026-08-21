@@ -9,12 +9,13 @@ describe('PlanQuestionCard', () => {
     let current: PlanQuestionState = {
       kind: 'questions',
       interruptId: 'plan-question-1',
+      form: { schemaVersion: 1, questions: [] },
       submitted: false,
       questions: [{
         id: 'environment',
         prompt: '部署到哪个环境？',
         options: [{ id: 'staging', label: '预发布', description: '先验证再上线' }],
-        allowCustomAnswer: true,
+        allowFreeText: true,
       }],
     }
     const submit = vi.fn()
@@ -39,12 +40,13 @@ describe('PlanQuestionCard', () => {
     let current: PlanQuestionState = {
       kind: 'questions',
       interruptId: 'plan-question-custom',
+      form: { schemaVersion: 1, questions: [] },
       submitted: false,
       questions: [{
         id: 'environment',
         prompt: '部署到哪个环境？',
         options: [{ id: 'staging', label: '预发布' }],
-        allowCustomAnswer: true,
+        allowFreeText: true,
       }],
     }
     const view = render(

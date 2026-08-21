@@ -1216,12 +1216,12 @@ async def test_sqlite_state_renews_owner_and_warm_claims(tmp_path: Path) -> None
     state = state_type(
         url=_sqlite_url(tmp_path / "renew.db"),
         namespace="test",
-        lease_ttl=0.12,
+        lease_ttl=0.6,
     )
     await state.start(warm_pool_size=1)
 
     assert state.persistent is True
-    assert state.lease_renew_interval == pytest.approx(0.04)
+    assert state.lease_renew_interval == pytest.approx(0.2)
 
     owner = await state.acquire_owner("user-A")
     warm = await state.claim_warm_slot()
@@ -1229,11 +1229,13 @@ async def test_sqlite_state_renews_owner_and_warm_claims(tmp_path: Path) -> None
     await state.enqueue_cleanup("orphan-sandbox")
     cleanup = await state.claim_cleanup()
     assert cleanup is not None
-    await asyncio.sleep(0.08)
+    # The two waits cross the initial lease window while retaining room for
+    # SQLite I/O and event-loop scheduling before every ownership check.
+    await asyncio.sleep(0.35)
     assert await state.renew_owner(owner) is True
     assert await state.renew_warm(warm) is True
     assert await state.renew_cleanup(cleanup) is True
-    await asyncio.sleep(0.08)
+    await asyncio.sleep(0.35)
 
     binding = await state.bind_owner(owner, "bound-sandbox")
     await state.publish_warm(warm, "warm-sandbox")

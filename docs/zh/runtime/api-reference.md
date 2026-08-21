@@ -9,7 +9,7 @@
 | API | 什么时候用 | 主要参数或结果 |
 | --- | --- | --- |
 | `TinkerFin(run_coordinator=None, state_schema=None)` | 创建统一入口 | 可选共享 coordinator 和 Definition 级 state |
-| `TinkerFin.plan(...)` | 创建不可变的 Plan-capable factory | 能力开关、请求默认 mode、可选 Gate/Planner 模型 |
+| `TinkerFin.plan(...)` | 创建不可变的 Plan-capable factory | 能力开关、请求默认 mode、可选 Gate/Planner 模型与 clarification schema |
 | `TinkerFin.create_deep_agent(...)` | 创建可重复生成 Runtime 的 Agent 定义 | 参数见[创建和运行 Deep Agent](deep-agents.md) |
 | `Identity(threadId=..., runId=...)` | 表示一次框架运行 | 只包含 thread 和 run |
 | `TinkerFin.run(...)` | 运行自己的异步事件源 | `source_factory`、`identity`、`on_part` |
@@ -31,11 +31,19 @@ Plan Definition 必须提供明确模型和具体 `BaseCheckpointSaver`；配置
 
 ## Plan Mode 数据
 
-顶层包导出 `AgentMode`。`tinkerfin.plan` 导出 `PlanStep`、`PlanDraft`、
-`ConfirmedPlan`、`ClarificationOption`、`ClarificationQuestion`、
-`RequirementAnswer`、`PlanState`、`PlanStatus`、`PlanRoute` 和 `PlanReviewAction`。
-这些模型不可变。根 Graph 状态把完整 JSON 数据以 camel case 保存在
-`tinkerfin_plan` 字段。
+顶层包导出 `AgentMode`。`tinkerfin.plan` 导出 `ClarificationModel`、
+`ClarificationOption` / `ClarificationQuestion` / `ClarificationForm` 的 Base 与泛型类型、
+`DefaultClarificationForm`、`PlanStep`、`PlanDraft`、`ConfirmedPlan`、
+`RequirementAnswer`、`PendingClarification`、`ClarificationExchange`、`PlanState`、
+`PlanStatus`、`PlanRoute`、`PlanReviewAction` 和 Plan 错误类型。这些模型不可变。根 Graph
+状态把完整 JSON 数据以 camel case 保存在 `tinkerfin_plan` 字段。
+
+`.plan(clarification_schema=...)` 接受宿主定义的一个完全具体的
+`ClarificationFormBase` 子类；省略时使用 `DefaultClarificationForm`。Python 使用
+`allow_free_text`，JSON 使用 `allowFreeText`。Option 回答只包含 `questionId` 和
+`optionId`；自由文本回答只包含 `questionId` 和 `answer`。宿主模型可以增加强类型
+attributes 和 discriminant，但不能重新定义框架核心字段，也不能改变 questions/options
+的 tuple 结构。
 
 `TinkerFin(state_schema=...)` 为该 factory 创建的每个 Deep Agent Definition 提供应用级
 state，并与 `create_deep_agent(state_schema=...)`、middleware 的公开扩展、Deep Agents

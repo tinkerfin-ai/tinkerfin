@@ -7,6 +7,7 @@ from typing import Literal, TypeAlias
 
 from langchain_core.language_models import BaseChatModel
 
+from ._clarification import ClarificationSchemaBinding
 from .errors import PlanModeConfigurationError
 
 AgentMode: TypeAlias = Literal["default", "plan"]
@@ -17,6 +18,7 @@ PLAN_MODE_CONFIG_KEY = "tinkerfin_plan_mode"
 class PlanOptions:
     """Definition-level options shared by every run of one Plan-capable agent."""
 
+    clarification: ClarificationSchemaBinding
     default_mode: AgentMode = "default"
     gate_model: str | BaseChatModel | None = None
     planner_model: str | BaseChatModel | None = None

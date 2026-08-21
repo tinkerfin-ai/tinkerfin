@@ -177,7 +177,7 @@ class Settings(BaseSettings):
     )
 
     auth_token_expire_seconds: int = Field(
-        default=1800, ge=60, description="访问令牌有效秒数"
+        default=86400, ge=60, description="访问令牌有效秒数"
     )
     tavily_api_key: SecretStr | None = Field(
         default=None, repr=False, description="Tavily API 密钥"
