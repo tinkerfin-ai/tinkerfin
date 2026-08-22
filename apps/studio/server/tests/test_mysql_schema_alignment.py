@@ -10,7 +10,9 @@ from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
 import pytest
+from ag_ui.core import BaseEvent, Event
 from langgraph.store.mysql.asyncmy import AsyncMyStore
+from pydantic import TypeAdapter
 from sqlalchemy import inspect, text
 from sqlalchemy.engine import URL, Connection, make_url
 from sqlalchemy.ext.asyncio import (
@@ -19,6 +21,8 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from tinkerfin import Identity
+from tinkerfin_messaging.models import MessageEnvelope
 from tinkerfin_sandbox import get_sqlalchemy_opensandbox_state_schema
 from tinkerfin_studio.auth.models import User
 from tinkerfin_studio.conversation.models import (
@@ -28,6 +32,7 @@ from tinkerfin_studio.conversation.models import (
     ConversationRun,
     ConversationThread,
 )
+from tinkerfin_studio.conversation.projection import ConversationProjector
 from tinkerfin_studio.conversation.repository import ConversationRepository
 from tinkerfin_studio.infrastructure.database import Base
 from tinkerfin_studio.models.entity import AgentModel
@@ -62,6 +67,29 @@ _BUSINESS_MODELS = (
     ConversationInterrupt,
     ConversationMessage,
 )
+_EVENT_ADAPTER = TypeAdapter(Event)
+
+
+def _projection_event(
+    seq: int,
+    value: dict[str, object],
+) -> tuple[MessageEnvelope, BaseEvent]:
+    event = cast(BaseEvent, _EVENT_ADAPTER.validate_python(value))
+    return (
+        MessageEnvelope(
+            channel="studio-conversation-agui",
+            identity=Identity(
+                threadId="users/1/threads/thread-projection-lock",
+                runId="run-projection-lock",
+            ),
+            seq=seq,
+            message_id=f"run-projection-lock:{seq}",
+            codec="agui.event.v1",
+            payload=event.model_dump_json(by_alias=True, exclude_none=True).encode(),
+            created_at=datetime(2026, 8, 22, 2, seq, tzinfo=UTC),
+        ),
+        event,
+    )
 
 
 class _ReflectedColumn(TypedDict):
@@ -91,6 +119,7 @@ class _TableSignature:
     primary_key: tuple[str, ...]
     indexes: dict[str, tuple[tuple[str, ...], bool]]
     unique_constraints: dict[str, tuple[str, ...]]
+    check_constraints: dict[str, str]
     foreign_keys: tuple[tuple[str, ...], ...]
 
 
@@ -152,6 +181,10 @@ def _column_signature(column: _ReflectedColumn) -> _ColumnSignature:
     )
 
 
+def _normalize_check_sql(value: object) -> str:
+    return re.sub(r"[\s`()]+", "", str(value)).casefold()
+
+
 def _reflect_schema(connection: Connection) -> _SchemaReflection:
     inspector = inspect(connection)
     table_names = sorted(inspector.get_table_names())
@@ -185,6 +218,13 @@ def _reflect_schema(connection: Connection) -> _SchemaReflection:
                     cast(list[str], constraint.get("column_names", []))
                 )
                 for constraint in inspector.get_unique_constraints(table_name)
+                if constraint.get("name") is not None
+            },
+            check_constraints={
+                str(constraint["name"]): _normalize_check_sql(
+                    constraint.get("sqltext", "")
+                )
+                for constraint in inspector.get_check_constraints(table_name)
                 if constraint.get("name") is not None
             },
             foreign_keys=tuple(
@@ -300,6 +340,12 @@ async def test_full_schema_sql_matches_runtime_generated_mysql_schema() -> None:
         assert set(sql_schema.tables) == _EXPECTED_TABLES
         assert set(runtime_schema.tables) == _EXPECTED_TABLES
         assert sql_schema.tables == runtime_schema.tables
+        assert sql_schema.tables["conversation_threads"].check_constraints == {
+            "ck_conversation_threads_snapshot_version": "snapshot_version=3"
+        }
+        assert sql_schema.tables["conversation_events"].check_constraints == {
+            "ck_conversation_events_schema_version": "schema_version=3"
+        }
         business_table_names = {model.__tablename__ for model in _BUSINESS_MODELS}
         assert {
             table_name: sql_schema.table_comments[table_name]
@@ -418,6 +464,112 @@ async def test_concurrent_same_run_resume_claim_uses_current_mysql_row() -> None
 
         assert owners == ["run-same", "run-same"]
     finally:
+        if engine is not None:
+            await engine.dispose()
+        if created:
+            await _drop_database(admin_engine, database_name)
+        await admin_engine.dispose()
+
+
+@pytest.mark.studio_mysql_integration
+async def test_concurrent_projectors_serialize_on_the_mysql_thread_row() -> None:
+    """MySQL 行锁必须让相邻事件按提交后的最新 snapshot 序号串行投影"""
+
+    admin_url = _configured_url()
+    database_name = f"tinkerfin_schema_{secrets.token_hex(8)}_runtime"
+    database_url = _database_url(admin_url, database_name)
+    admin_engine = create_async_engine(admin_url)
+    engine: AsyncEngine | None = None
+    second_task: asyncio.Task[None] | None = None
+    created = False
+    try:
+        await _create_database(admin_engine, database_name)
+        created = True
+        engine = create_async_engine(database_url)
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        sessions = async_sessionmaker(
+            engine,
+            expire_on_commit=False,
+            autoflush=False,
+        )
+        async with sessions() as setup_session:
+            repository = ConversationRepository(setup_session)
+            thread = await repository.create_thread(
+                user_id=1,
+                thread_id="thread-projection-lock",
+                title="投影行锁",
+                model_id="main",
+            )
+            await repository.create_main_run(
+                thread_id=thread.id,
+                run_id="run-projection-lock",
+                model_id="main",
+                input_json={"messages": []},
+                config_json={},
+            )
+            await repository.commit()
+            thread_pk = thread.id
+
+        first_envelope, first_event = _projection_event(
+            1,
+            {
+                "type": "RUN_STARTED",
+                "threadId": "thread-projection-lock",
+                "runId": "run-projection-lock",
+            },
+        )
+        second_envelope, second_event = _projection_event(
+            2,
+            {
+                "type": "RUN_FINISHED",
+                "threadId": "thread-projection-lock",
+                "runId": "run-projection-lock",
+                "outcome": {"type": "success"},
+            },
+        )
+        second_attempted = asyncio.Event()
+
+        async def project_second() -> None:
+            async with sessions() as second_session:
+                second_attempted.set()
+                await ConversationProjector(second_session).project(
+                    thread_pk=thread_pk,
+                    envelope=second_envelope,
+                    event=second_event,
+                )
+                await second_session.commit()
+
+        async with sessions() as first_session:
+            await ConversationProjector(first_session).project(
+                thread_pk=thread_pk,
+                envelope=first_envelope,
+                event=first_event,
+            )
+            second_task = asyncio.create_task(
+                project_second(),
+                name="test-concurrent-mysql-projector",
+            )
+            await second_attempted.wait()
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(second_task), timeout=0.2)
+            await first_session.commit()
+        await asyncio.wait_for(second_task, timeout=5)
+
+        async with sessions() as verification_session:
+            repository = ConversationRepository(verification_session)
+            stored = await repository.get_thread_by_pk(thread_pk)
+            assert stored is not None
+            assert stored.last_seq == 2
+            assert stored.snapshot_seq == 2
+            assert stored.snapshot_json is not None
+            assert stored.snapshot_json["snapshotSeq"] == stored.snapshot_seq
+            assert stored.status == "idle"
+            assert await repository.count_events(thread_pk) == 2
+    finally:
+        if second_task is not None and not second_task.done():
+            second_task.cancel()
+            await asyncio.gather(second_task, return_exceptions=True)
         if engine is not None:
             await engine.dispose()
         if created:

@@ -36,10 +36,13 @@ from langchain_core.tools import BaseTool
 from pydantic import ValidationError
 
 from tinkerfin_agui_adapter import (
+    TOOL_REVIEW_SCHEMA,
     AgUiAdapterErrorCode,
     AgUiStreamContractError,
     HitlCorrelationError,
     Identity,
+    create_subagent_provenance,
+    parse_tool_review_interrupt,
 )
 from tinkerfin_agui_adapter.adapter import DeepAgentAgUiAdapter
 from tinkerfin_agui_adapter.ids import ScopedIdCodec
@@ -232,13 +235,15 @@ def test_task_start_emits_sanitized_raw_with_subagent_correlation() -> None:
             "agentName": "main",
             "namespace": [],
             "subagents": [
-                {
-                    "namespace": ["tools:graph-a"],
-                    "graphTaskId": "graph-a",
-                    "agentName": "researcher",
-                    "parentToolCallId": _tool_id((), "call-parent-a"),
-                    "description": "并行任务 A",
-                }
+                create_subagent_provenance(
+                    identity=_identity(),
+                    namespace=("tools:graph-a",),
+                    parent_namespace=(),
+                    graph_task_id="graph-a",
+                    agent_name="researcher",
+                    parent_tool_call_id=_tool_id((), "call-parent-a"),
+                    description="并行任务 A",
+                ).model_dump(mode="json", by_alias=True)
             ],
         },
     }
@@ -532,13 +537,15 @@ def test_nested_task_start_keeps_full_parent_and_child_namespace() -> None:
     assert provenance["namespace"] == ["tools:outer"]
     assert provenance["graphTaskId"] == "outer"
     assert provenance["subagents"] == [
-        {
-            "namespace": ["tools:outer", "tools:inner"],
-            "graphTaskId": "inner",
-            "agentName": "analyst",
-            "parentToolCallId": _tool_id(("tools:outer",), "call-inner"),
-            "description": "内层任务",
-        }
+        create_subagent_provenance(
+            identity=_identity(),
+            namespace=("tools:outer", "tools:inner"),
+            parent_namespace=("tools:outer",),
+            graph_task_id="inner",
+            agent_name="analyst",
+            parent_tool_call_id=_tool_id(("tools:outer",), "call-inner"),
+            description="内层任务",
+        ).model_dump(mode="json", by_alias=True)
     ]
 
 
@@ -1739,12 +1746,14 @@ def test_hitl_operational_args_remain_exact_under_reasoning_privacy(
     assert json.loads(assistant.tool_calls[0].function.arguments) == args
     interrupt = adapter.main_outcome().interrupts[0]
     assert interrupt.metadata is not None
+    assert interrupt.metadata["deepagents"]["schema"] == TOOL_REVIEW_SCHEMA
     assert interrupt.metadata["deepagents"]["originalArgs"] == args
     assert interrupt.metadata["deepagents"]["nativeInterruptId"] == (
         "interrupt-operational"
     )
     assert interrupt.metadata["deepagents"]["actionIndex"] == 0
     assert interrupt.metadata["langgraphValue"]["action_requests"][0]["args"] == args
+    assert parse_tool_review_interrupt(interrupt).original_args.root == args
 
 
 def test_interrupt_emits_closed_stream_and_authoritative_snapshots_in_order() -> None:

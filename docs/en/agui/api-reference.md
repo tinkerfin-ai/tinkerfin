@@ -17,8 +17,8 @@ See [AG-UI basics](index.md) for Runtime parameters and [Interrupts and resume](
 
 | API | Main parameters | When to use it |
 | --- | --- | --- |
-| `astream_events(...)` | `parts`, `identity`, visibility flags, prior IDs | Automatic complete lifecycle around an existing native stream |
-| `DeepAgentAgUiAdapter(...)` | `identity`, prior IDs, visibility flags | A custom orchestrator owns the main lifecycle |
+| `astream_events(...)` | `parts`, `identity`, visibility flags, prior IDs, private state keys | Automatic complete lifecycle around an existing native stream |
+| `DeepAgentAgUiAdapter(...)` | `identity`, prior IDs, visibility flags, private state keys | A custom orchestrator owns the main lifecycle |
 | `encode_sse(...)` | `event`, optional `event_id` | Render one AG-UI event as SSE |
 | `micro_batch(...)` | `events`, optional batcher | Combine adjacent small deltas |
 
@@ -65,6 +65,9 @@ See [AG-UI basics](index.md) for Runtime parameters and [Interrupts and resume](
 | `HitlActionRequest` | Non-empty `name`, object `args`, optional `description` |
 | `HitlReviewConfig` | `actionName`, non-empty `allowedDecisions`, optional `argsSchema` |
 | `HitlRequest` | Equally sized, non-empty `actionRequests` and `reviewConfigs` |
+| `ToolReviewInterruptMetadata` | Versioned native group, action position, Tool name, decisions, and original arguments |
+| `SubagentProvenance` | Stable invocation ID, full namespaces, graph task, parent Tool, Agent, description, and current request run |
+| `ToolResultCorrelation` | Original scoped Tool and parent-message IDs for a parent-completed child Tool |
 
 Allowed decisions are `approve`, `edit`, `reject`, and `respond`. Action and review entries pair by position.
 
@@ -72,14 +75,19 @@ Allowed decisions are `approve`, `edit`, `reject`, and `respond`. Action and rev
 AG-UI interrupt reason and leaves domain validation of the resolved JSON object to the
 emitting graph. Runtime and Tool interrupts cannot share one pending batch.
 
+`parse_tool_review_interrupt(interrupt)` validates a complete trusted Tool interrupt
+against `tinkerfin.deepagents.tool-review.v1`. `subagent_invocation_id(...)` and
+`create_subagent_provenance(...)` implement the fixed
+`tinkerfin.subagent-provenance.v1` identity contract.
+
 ## IDs and errors
 
 | API | Use |
 | --- | --- |
 | `ScopedIdCodec.encode(...)` | Builds an ID from kind, full namespace, and raw ID |
 | `ScopedIdCodec.decode(...)` | Restores those three components |
-| `InterruptCorrelationError` | Native interrupt cannot be correlated safely |
 | `HitlCorrelationError` | Review action cannot be correlated with tool messages |
+| `ToolReviewContractError` | A complete Tool review interrupt violates the versioned public contract |
 | `SseEventId` | String or integer ID accepted by `encode_sse()` |
 
 Parallel tools, subagents, and resumed results require complete scoped IDs. Never correlate them by arrival order.

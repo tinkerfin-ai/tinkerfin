@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator, Awaitable
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
@@ -31,6 +32,8 @@ from tinkerfin_studio.health import ReadinessService
 from tinkerfin_studio.infrastructure.database import Database
 from tinkerfin_studio.infrastructure.redis_client import create_redis_client
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True, slots=True)
 class ApplicationResources:
@@ -54,6 +57,10 @@ def build_lifespan():
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         settings = get_settings()
+        logger.info(
+            "认证访问令牌固定有效期：%s 秒",
+            settings.auth_token_expire_seconds,
+        )
         database_settings = settings.database
         database = Database(
             database_settings.url,

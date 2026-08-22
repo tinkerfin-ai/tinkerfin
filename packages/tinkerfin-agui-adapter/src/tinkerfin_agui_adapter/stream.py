@@ -44,6 +44,7 @@ async def _astream_events(
     expose_reasoning_events: bool = False,
     expose_subagent_events: bool = True,
     prior_tool_call_ids: frozenset[str] = frozenset(),
+    private_state_keys: frozenset[str] = frozenset(),
 ) -> AsyncIterator[BaseEvent]:
     """Convert a caller-supplied Deep Agents v2 stream into one AG-UI lifecycle.
 
@@ -75,6 +76,8 @@ async def _astream_events(
         expose_reasoning_events: Emit supported reasoning events when true.
         expose_subagent_events: Emit events derived from non-root namespaces when true.
         prior_tool_call_ids: Native Tool call IDs already emitted before resume.
+        private_state_keys: Top-level state channels omitted at known public state
+            mapping boundaries. Nested same-named business fields remain visible.
 
     Yields:
         Validated AG-UI events in protocol order.
@@ -91,6 +94,7 @@ async def _astream_events(
         expose_reasoning_events=expose_reasoning_events,
         expose_subagent_events=expose_subagent_events,
         prior_tool_call_ids=prior_tool_call_ids,
+        private_state_keys=private_state_keys,
     )
     upstream = aiter(parts)
 
@@ -178,6 +182,7 @@ def astream_events(
     expose_reasoning_events: bool = False,
     expose_subagent_events: bool = True,
     prior_tool_call_ids: frozenset[str] = frozenset(),
+    private_state_keys: frozenset[str] = frozenset(),
 ) -> AsyncIterator[BaseEvent]:
     """Bind one canonical identity before returning the conversion stream."""
 
@@ -188,4 +193,5 @@ def astream_events(
         expose_reasoning_events=expose_reasoning_events,
         expose_subagent_events=expose_subagent_events,
         prior_tool_call_ids=prior_tool_call_ids,
+        private_state_keys=private_state_keys,
     )

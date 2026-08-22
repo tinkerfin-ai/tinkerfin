@@ -33,7 +33,7 @@ class LoginResult:
     """成功登录后返回给 HTTP 边界的结果"""
 
     access_token: str
-    expires_in: int
+    expires_at: datetime
     user: UserContext
 
 
@@ -74,7 +74,7 @@ class AuthService:
             raise SystemException(AuthErrorCode.SERVICE_UNAVAILABLE) from error
         return LoginResult(
             access_token=token,
-            expires_in=self._token_expire_seconds,
+            expires_at=expires_at,
             user=self._context(user),
         )
 
@@ -102,6 +102,7 @@ class AuthService:
             token=token,
             is_authenticated=True,
             user=self._context(user),
+            expires_at=record.expires_at,
         )
 
     async def logout(self, token: str) -> None:

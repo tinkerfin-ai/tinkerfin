@@ -80,6 +80,7 @@ from .reasoning import (
     normalize_operational_data,
     sanitize_public_data,
 )
+from .tool_result import TOOL_RESULT_CORRELATION_KEY, ToolResultCorrelation
 
 if TYPE_CHECKING:
     from .adapter import DeepAgentAgUiAdapter
@@ -224,13 +225,19 @@ def _process_message_part(
 ) -> list[BaseEvent]:
     metadata = part.data.metadata
     agent_name = metadata.lc_agent_name
-    source = self._source(part.ns)
-    self._require_started_source(source)
-    self._record_agent_name(part.ns, agent_name)
-    source = self._source(part.ns)
-    events: list[BaseEvent] = []
     message = part.data.message
+    source_namespace = (
+        _correlated_tool_result_namespace(self, message, part.ns)
+        if isinstance(message, ToolMessage)
+        else part.ns
+    )
+    source = self._source(source_namespace)
+    self._require_started_source(source)
+    self._record_agent_name(source_namespace, agent_name)
+    source = self._source(source_namespace)
+    events: list[BaseEvent] = []
     related_namespace: tuple[str, ...] | None = None
+    related_subagent_invocation_id: str | None = None
     if isinstance(message, ToolMessage):
         scoped_tool_call_id = self._tool_call_id(
             part.ns,
@@ -243,11 +250,21 @@ def _process_message_part(
             related_namespace = self._sub_namespaces_by_parent_tool_call.get(
                 (part.ns, str(message.tool_call_id))
             )
+            invocation = (
+                None
+                if related_namespace is None
+                else self._subagent_invocations.get(related_namespace)
+            )
+            if invocation is not None:
+                related_subagent_invocation_id = (
+                    invocation.provenance.subagent_invocation_id
+                )
     raw_event = self._event_context(
         "messages",
         source,
         langgraph_node=metadata.langgraph_node,
         related_namespace=related_namespace,
+        related_subagent_invocation_id=related_subagent_invocation_id,
         tool_result_status=(
             message.status if isinstance(message, ToolMessage) else None
         ),
@@ -262,6 +279,44 @@ def _process_message_part(
     elif isinstance(message, ToolMessage):
         events.extend(self._process_tool_result(message, source, raw_event))
     return events
+
+
+def _tool_result_correlation(
+    message: ToolMessage,
+) -> ToolResultCorrelation | None:
+    raw = message.additional_kwargs.get(TOOL_RESULT_CORRELATION_KEY)
+    if raw is None:
+        return None
+    return ToolResultCorrelation.model_validate(raw)
+
+
+def _correlated_tool_result_namespace(
+    self: DeepAgentAgUiAdapter,
+    message: ToolMessage,
+    envelope_namespace: tuple[str, ...],
+) -> tuple[str, ...]:
+    correlation = _tool_result_correlation(message)
+    if correlation is None:
+        return envelope_namespace
+    tool_kind, tool_namespace, raw_tool_id = self._ids.decode(correlation.tool_call_id)
+    message_kind, message_namespace, _raw_message_id = self._ids.decode(
+        correlation.parent_message_id
+    )
+    if (
+        tool_kind != "tool"
+        or message_kind != "message"
+        or tool_namespace != message_namespace
+        or raw_tool_id != str(message.tool_call_id)
+    ):
+        raise ValueError("Tool result correlation contains inconsistent scoped IDs")
+    if not any(
+        call.tool_call_id == correlation.tool_call_id
+        and call.parent_message_id == correlation.parent_message_id
+        for history in self._tool_history.values()
+        for call in history
+    ):
+        raise ValueError("Tool result correlation does not match a streamed Tool call")
+    return tool_namespace
 
 
 def _process_ai_chunk(
@@ -745,6 +800,7 @@ def _source(
             ),
             parent_tool_call_id=invocation.parent_tool_call_id,
             subagent_input=invocation.subagent_input,
+            subagent_invocation_id=(invocation.provenance.subagent_invocation_id),
         )
     scope = self._graph_scopes.get(namespace)
     if scope is None:
@@ -772,6 +828,7 @@ def _event_context(
     langgraph_node: str | None = None,
     interrupt_id: str | None = None,
     related_namespace: tuple[str, ...] | None = None,
+    related_subagent_invocation_id: str | None = None,
     parent_tool_call_id: str | None = None,
     tool_result_status: Literal["success", "error"] | None = None,
 ) -> dict[str, JsonValue]:
@@ -780,6 +837,7 @@ def _event_context(
         source=source,
         run_id=self._run_id_for(source),
         related_namespace=related_namespace,
+        related_subagent_invocation_id=related_subagent_invocation_id,
         parent_tool_call_id=parent_tool_call_id,
         langgraph_node=langgraph_node,
         interrupt_id=interrupt_id,
@@ -832,6 +890,21 @@ def _convert_messages(
     ):
         raise TypeError("values messages must be a sequence")
     messages = cast(Sequence[object], raw_messages)
+    correlations: dict[str, ToolResultCorrelation] = {}
+    for message in messages:
+        if not isinstance(message, ToolMessage):
+            continue
+        correlation = _tool_result_correlation(message)
+        if correlation is None:
+            continue
+        _correlated_tool_result_namespace(self, message, namespace)
+        raw_tool_id = str(message.tool_call_id)
+        previous = correlations.get(raw_tool_id)
+        if previous is not None and previous != correlation:
+            raise ValueError(
+                f"conflicting Tool result correlation for raw ID: {raw_tool_id}"
+            )
+        correlations[raw_tool_id] = correlation
     converted: list[Message] = []
     for index, message in enumerate(messages):
         if not isinstance(message, BaseMessage):
@@ -841,7 +914,41 @@ def _convert_messages(
             if isinstance(message, AIMessage)
             else str(message.id or f"state-message-{index}")
         )
-        message_id = self._message_id(namespace, raw_message_id)
+        message_namespace = namespace
+        if isinstance(message, AIMessage):
+            message_correlations = [
+                correlations[str(call_id)]
+                for call in message.tool_calls
+                if (call_id := call.get("id")) is not None
+                and str(call_id) in correlations
+            ]
+            if message_correlations:
+                decoded = [
+                    self._ids.decode(correlation.parent_message_id)
+                    for correlation in message_correlations
+                ]
+                if any(
+                    kind != "message" or raw_id != raw_message_id
+                    for kind, _source_namespace, raw_id in decoded
+                ):
+                    raise ValueError(
+                        "Tool result correlation does not match its assistant message"
+                    )
+                source_namespaces = {
+                    source_namespace for _kind, source_namespace, _raw_id in decoded
+                }
+                if len(source_namespaces) != 1:
+                    raise ValueError(
+                        "one assistant message cannot span Tool result namespaces"
+                    )
+                message_namespace = next(iter(source_namespaces))
+        elif isinstance(message, ToolMessage):
+            correlation = correlations.get(str(message.tool_call_id))
+            if correlation is not None:
+                _kind, message_namespace, _raw_id = self._ids.decode(
+                    correlation.tool_call_id
+                )
+        message_id = self._message_id(message_namespace, raw_message_id)
         if isinstance(message, HumanMessage):
             converted.append(
                 UserMessage(
@@ -861,13 +968,18 @@ def _convert_messages(
             )
             continue
         if isinstance(message, ToolMessage):
+            correlation = correlations.get(str(message.tool_call_id))
             converted.append(
                 AgUiToolMessage(
                     id=message_id,
                     content=_normalize_tool_content(message.content),
-                    tool_call_id=self._tool_call_id(
-                        namespace,
-                        str(message.tool_call_id),
+                    tool_call_id=(
+                        correlation.tool_call_id
+                        if correlation is not None
+                        else self._tool_call_id(
+                            message_namespace,
+                            str(message.tool_call_id),
+                        )
                     ),
                 )
             )
@@ -888,7 +1000,14 @@ def _convert_messages(
                 )
                 tool_calls.append(
                     ToolCall(
-                        id=self._tool_call_id(namespace, str(raw_call_id)),
+                        id=(
+                            correlations[str(raw_call_id)].tool_call_id
+                            if str(raw_call_id) in correlations
+                            else self._tool_call_id(
+                                message_namespace,
+                                str(raw_call_id),
+                            )
+                        ),
                         function=FunctionCall(
                             name=name,
                             arguments=arguments,

@@ -1,9 +1,8 @@
 import type { ApiError } from '../shared/http'
 import { AuthError, requestJson } from '../shared/http'
-import type { LoginRequest, LoginResponse } from './types'
+import type { AuthSessionResponse, LoginRequest, LoginResponse } from './types'
 import type { AuthSession } from '../../auth/session'
-import { getAuthorizationHeader, getAuthSession, updateAuthUser } from '../../auth/session'
-import type { AuthUser } from './types'
+import { getAuthorizationHeader, getAuthSession, updateAuthSession } from '../../auth/session'
 
 export interface BootstrapAuthResult {
   status: 'authenticated' | 'unauthenticated' | 'stale'
@@ -24,8 +23,8 @@ export function login(input: LoginRequest, signal?: AbortSignal) {
   })
 }
 
-export function getCurrentUser(signal?: AbortSignal, options?: { suppressAuthFailure?: boolean }) {
-  return requestJson<AuthUser>('/api/auth/me', {
+export function getCurrentSession(signal?: AbortSignal, options?: { suppressAuthFailure?: boolean }) {
+  return requestJson<AuthSessionResponse>('/api/auth/me', {
     signal,
     suppressGlobalError: true,
     suppressAuthFailure: options?.suppressAuthFailure ?? false,
@@ -52,12 +51,18 @@ export function bootstrapAuthSession(): Promise<BootstrapAuthResult> {
   if (bootstrapPromise && bootstrapToken === session.token) return bootstrapPromise
   bootstrapToken = session.token
 
-  bootstrapPromise = getCurrentUser(undefined, { suppressAuthFailure: true })
-    .then((user) => {
-      updateAuthUser(user)
+  bootstrapPromise = getCurrentSession(undefined, { suppressAuthFailure: true })
+    .then((payload) => {
+      const updated = updateAuthSession(payload)
+      if (!updated) {
+        return {
+          status: 'unauthenticated' as const,
+          session: null,
+        }
+      }
       return {
         status: 'authenticated' as const,
-        session: getAuthSession(),
+        session: updated,
       }
     })
     .catch((error) => {

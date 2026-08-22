@@ -53,6 +53,8 @@ from .runtime_interrupts import (
     parse_runtime_interrupt,
     prepare_runtime_ag_ui_interrupt,
 )
+from .subagent import SubagentProvenance
+from .tool_review import TOOL_REVIEW_SCHEMA, ToolReviewInterruptMetadata
 
 if TYPE_CHECKING:
     from .adapter import DeepAgentAgUiAdapter
@@ -293,6 +295,11 @@ class AgentSource(_ProtocolModel):
         default=None,
         description="Complete task description supplied to a Deep Agents delegate",
     )
+    subagent_invocation_id: str | None = Field(
+        default=None,
+        min_length=1,
+        description="Logical subagent invocation ID stable across resume",
+    )
 
 
 class EventContext(_ProtocolModel):
@@ -303,6 +310,11 @@ class EventContext(_ProtocolModel):
     run_id: str = Field(min_length=1, description="Main AG-UI run ID for the request")
     related_namespace: tuple[str, ...] | None = Field(
         default=None, description="Complete native namespace related to the event"
+    )
+    related_subagent_invocation_id: str | None = Field(
+        default=None,
+        min_length=1,
+        description="Logical subagent invocation completed by this event",
     )
     parent_tool_call_id: str | None = Field(
         default=None,
@@ -364,6 +376,9 @@ class SubagentInvocation(_ProtocolModel):
     subagent_input: str = Field(description="Complete task.description content")
     agent_name: str = Field(
         min_length=1, description="Subagent name selected by task.subagent_type"
+    )
+    provenance: SubagentProvenance = Field(
+        description="Versioned public provenance for this logical invocation"
     )
 
 
@@ -755,6 +770,14 @@ def _prepare_ag_ui_interrupts(
             )
         ):
             public_id = f"{interrupt.id}#{index}" if multi_action else interrupt.id
+            review_metadata = ToolReviewInterruptMetadata(
+                schema=TOOL_REVIEW_SCHEMA,
+                nativeInterruptId=interrupt.id,
+                actionIndex=index,
+                toolName=action.name,
+                allowedDecisions=tuple(review.allowed_decisions),
+                originalArgs=action.args,
+            )
             prepared.append(
                 AgUiInterrupt(
                     id=public_id,
@@ -778,13 +801,10 @@ def _prepare_ag_ui_interrupts(
                             mode="json",
                             by_alias=True,
                         ),
-                        "deepagents": {
-                            "nativeInterruptId": interrupt.id,
-                            "actionIndex": index,
-                            "toolName": action.name,
-                            "allowedDecisions": list(review.allowed_decisions),
-                            "originalArgs": action.args.root,
-                        },
+                        "deepagents": review_metadata.model_dump(
+                            mode="json",
+                            by_alias=True,
+                        ),
                     },
                 )
             )

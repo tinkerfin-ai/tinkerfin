@@ -1,4 +1,4 @@
-"""AG-UI 事件到前端 v2 快照的纯数据归约"""
+"""AG-UI 事件到前端 v3 快照的纯数据归约"""
 
 from __future__ import annotations
 
@@ -9,14 +9,17 @@ from typing import cast
 
 import jsonpatch
 from ag_ui.core import BaseEvent
+from ag_ui.core import Interrupt as AgUiInterrupt
+
+from tinkerfin_agui_adapter import SubagentProvenance, parse_tool_review_interrupt
 
 
 def empty_snapshot() -> dict[str, object]:
-    """创建一个可直接返回前端的空 v2 快照"""
+    """创建一个可直接返回前端的空 v3 快照"""
 
     return {
         "snapshotSeq": 0,
-        "snapshotVersion": 2,
+        "snapshotVersion": 3,
         "messages": [],
         "todos": [],
         "mode": "default",
@@ -61,7 +64,8 @@ def _ensure_subagent(
     snapshot: dict[str, object],
     *,
     run_id: str,
-    parent_run_id: str,
+    origin_main_run_id: str,
+    last_main_run_id: str,
     agent_name: str,
     graph_task_id: str,
     parent_tool_call_id: str,
@@ -70,6 +74,20 @@ def _ensure_subagent(
 ) -> dict[str, object]:
     existing = _find_subagent(snapshot, run_id)
     if existing is not None:
+        meta = existing.get("meta")
+        if not isinstance(meta, dict):
+            raise TypeError("子 Agent 卡片缺少 meta")
+        if (
+            meta.get("originMainRunId") != origin_main_run_id
+            or meta.get("agentName") != agent_name
+            or meta.get("graphTaskId") != graph_task_id
+            or meta.get("toolCallId") != parent_tool_call_id
+            or meta.get("input") != description
+        ):
+            raise ValueError(f"子 Agent 快照身份冲突: {run_id}")
+        meta["lastMainRunId"] = last_main_run_id
+        meta["status"] = "running"
+        meta["completedAt"] = None
         return existing
     message: dict[str, object] = {
         "id": run_id,
@@ -84,7 +102,8 @@ def _ensure_subagent(
             "toolCallId": parent_tool_call_id,
             "subRunId": run_id,
             "runId": run_id,
-            "parentRunId": parent_run_id,
+            "originMainRunId": origin_main_run_id,
+            "lastMainRunId": last_main_run_id,
             "graphTaskId": graph_task_id,
         },
     }
@@ -120,52 +139,54 @@ def _project_raw_subagents(
     runs = cast(dict[str, dict[str, object]], snapshot["runs"])
     for descriptor in descriptors:
         if not isinstance(descriptor, dict):
-            continue
-        run_id = descriptor.get("runId")
-        parent_run_id = descriptor.get("parentAgentRunId")
-        agent_name = descriptor.get("agentName")
-        graph_task_id = descriptor.get("graphTaskId")
-        parent_tool_call_id = descriptor.get("parentToolCallId")
-        description = descriptor.get("description")
-        if not all(
-            isinstance(value, str) and value
-            for value in (
-                run_id,
-                parent_run_id,
-                agent_name,
-                graph_task_id,
-                parent_tool_call_id,
-                description,
-            )
-        ):
-            continue
-        run_id = cast(str, run_id)
-        parent_run_id = cast(str, parent_run_id)
-        agent_name = cast(str, agent_name)
-        graph_task_id = cast(str, graph_task_id)
-        parent_tool_call_id = cast(str, parent_tool_call_id)
-        description = cast(str, description)
-        runs.setdefault(
-            run_id,
-            {
-                "runId": run_id,
+            raise TypeError("RAW task subagents 项必须是对象")
+        provenance = SubagentProvenance.model_validate(descriptor)
+        run_id = provenance.subagent_invocation_id
+        existing_run = runs.get(run_id)
+        if existing_run is None:
+            runs[run_id] = {
+                "runId": provenance.subagent_invocation_id,
                 "status": "running",
-                "parentRunId": parent_run_id,
+                "originMainRunId": provenance.request_run_id,
+                "lastMainRunId": provenance.request_run_id,
                 "agentType": "subagent",
-                "agentName": agent_name,
-                "graphTaskId": graph_task_id,
+                "agentName": provenance.agent_name,
+                "graphTaskId": provenance.graph_task_id,
+                "namespace": list(provenance.namespace),
+                "parentToolCallId": provenance.parent_tool_call_id,
+                "description": provenance.description,
                 "startedAt": now,
                 "completedAt": None,
-            },
-        )
+            }
+        else:
+            stable = {
+                "agentName": existing_run.get("agentName"),
+                "graphTaskId": existing_run.get("graphTaskId"),
+                "namespace": existing_run.get("namespace"),
+                "parentToolCallId": existing_run.get("parentToolCallId"),
+                "description": existing_run.get("description"),
+            }
+            expected = {
+                "agentName": provenance.agent_name,
+                "graphTaskId": provenance.graph_task_id,
+                "namespace": list(provenance.namespace),
+                "parentToolCallId": provenance.parent_tool_call_id,
+                "description": provenance.description,
+            }
+            if stable != expected:
+                raise ValueError(f"子 Agent 快照身份冲突: {run_id}")
+            existing_run["lastMainRunId"] = provenance.request_run_id
+            existing_run["status"] = "running"
+            existing_run["completedAt"] = None
         _ensure_subagent(
             snapshot,
             run_id=run_id,
-            parent_run_id=parent_run_id,
-            agent_name=agent_name,
-            graph_task_id=graph_task_id,
-            parent_tool_call_id=parent_tool_call_id,
-            description=description,
+            origin_main_run_id=cast(str, runs[run_id]["originMainRunId"]),
+            last_main_run_id=provenance.request_run_id,
+            agent_name=provenance.agent_name,
+            graph_task_id=provenance.graph_task_id,
+            parent_tool_call_id=provenance.parent_tool_call_id,
+            description=provenance.description,
             now=now,
         )
 
@@ -181,52 +202,26 @@ def _source(raw_event: object) -> dict[str, object]:
     )
 
 
-def _tool_review(
-    interrupt: dict[str, object],
-) -> tuple[str, dict[str, object], list[str]]:
-    """读取 adapter 公开的 Deep Agents Tool 审批契约"""
-
-    metadata = interrupt.get("metadata")
-    if not isinstance(metadata, dict):
-        raise TypeError("tool_call interrupt 缺少 metadata")
-    deepagents = metadata.get("deepagents")
-    if not isinstance(deepagents, dict):
-        raise TypeError("tool_call interrupt 缺少 metadata.deepagents")
-    name = deepagents.get("toolName")
-    args = deepagents.get("originalArgs")
-    decisions = deepagents.get("allowedDecisions")
-    if not isinstance(name, str) or not name.strip():
-        raise ValueError("tool_call interrupt 的 toolName 无效")
-    if not isinstance(args, dict):
-        raise TypeError("tool_call interrupt 的 originalArgs 必须是 object")
-    if not isinstance(decisions, list) or not all(
-        isinstance(value, str) and value for value in decisions
-    ):
-        raise ValueError("tool_call interrupt 的 allowedDecisions 必须是字符串数组")
-    return name, args, list(decisions)
-
-
 def _approval_item(interrupt: dict[str, object]) -> dict[str, object]:
     """把一个公开 Tool interrupt 转为可刷新恢复的审批项"""
 
-    interrupt_id = interrupt.get("id")
-    tool_call_id = interrupt.get("toolCallId")
-    if not isinstance(interrupt_id, str) or not interrupt_id:
-        raise ValueError("tool_call interrupt 缺少 id")
-    if not isinstance(tool_call_id, str) or not tool_call_id:
-        raise ValueError("tool_call interrupt 缺少 toolCallId")
-    name, args, decisions = _tool_review(interrupt)
+    public_interrupt = AgUiInterrupt.model_validate(interrupt)
+    review = parse_tool_review_interrupt(public_interrupt)
+    interrupt_id = public_interrupt.id
+    tool_call_id = public_interrupt.tool_call_id
+    assert tool_call_id is not None
+    args = review.original_args.root
     params = json.dumps(args, ensure_ascii=False, indent=2)
     return {
         "id": interrupt_id,
         "interruptId": interrupt_id,
         "toolCallId": tool_call_id,
-        "toolName": name,
+        "toolName": review.tool_name,
         "params": params,
         "input": params,
-        "description": str(interrupt.get("message", "")),
+        "description": public_interrupt.message or "",
         "originalArgs": args,
-        "allowedDecisions": decisions,
+        "allowedDecisions": list(review.allowed_decisions),
     }
 
 
@@ -253,28 +248,6 @@ def _project_pending_interrupts(
         "activeIndex": 0,
         "submitted": False,
     }
-
-
-def repair_pending_interrupt_snapshot(
-    snapshot: dict[str, object] | None,
-    interrupts: list[dict[str, object]],
-) -> dict[str, object] | None:
-    """以 interrupt 明细事实修复既有 v2 快照的派生审批状态"""
-
-    if snapshot is None:
-        if interrupts:
-            raise ValueError("存在 pending interrupt 时历史快照不能为空")
-        return None
-    repaired = deepcopy(snapshot)
-    was_waiting_approval = repaired.get("runStatus") == "waiting_approval"
-    _project_pending_interrupts(repaired, interrupts)
-    if interrupts:
-        repaired["activeRunId"] = None
-        repaired["runStatus"] = "waiting_approval"
-    elif was_waiting_approval:
-        repaired["activeRunId"] = None
-        repaired["runStatus"] = "idle"
-    return repaired
 
 
 def _project_todos(snapshot: dict[str, object], state: dict[str, object]) -> None:
@@ -318,6 +291,17 @@ def reduce_snapshot(
     source_agent_type = source.get("agentType", "main")
     source_agent_name = source.get("agentName", "main")
     now = created_at.isoformat()
+    resume = run_input.get("resume") if run_input is not None else None
+    initialization_failed = (
+        isinstance(raw_event, dict) and raw_event.get("initializationFailed") is True
+    )
+    preserve_pending_after_initialization_failure = (
+        initialization_failed
+        and isinstance(resume, list)
+        and bool(resume)
+        and isinstance(snapshot.get("interrupts"), list)
+        and bool(snapshot["interrupts"])
+    )
 
     if event_type == "RAW":
         _project_raw_subagents(snapshot, payload, now)
@@ -335,11 +319,15 @@ def reduce_snapshot(
             "completedAt": None,
         }
         if source_agent_type == "main":
-            snapshot["runStatus"] = "streaming"
-            snapshot["activeRunId"] = event_run_id
+            if not preserve_pending_after_initialization_failure:
+                snapshot["runStatus"] = "streaming"
+                snapshot["activeRunId"] = event_run_id
             if run_input is not None:
-                resume = run_input.get("resume")
-                if isinstance(resume, list) and resume:
+                if (
+                    not preserve_pending_after_initialization_failure
+                    and isinstance(resume, list)
+                    and resume
+                ):
                     # Run 注册要求 resume 完整覆盖待处理组；RUN_STARTED 持久化后，
                     # 即使 resumed run 随后失败或取消，原 interrupt 也不再 pending
                     snapshot["approval"] = None
@@ -374,7 +362,7 @@ def reduce_snapshot(
                             )
 
     elif event_type == "TEXT_MESSAGE_START":
-        child_run_id = raw_event.get("runId") if isinstance(raw_event, dict) else None
+        child_run_id = source.get("subagentInvocationId")
         if (
             source_agent_type == "subagent"
             and isinstance(child_run_id, str)
@@ -393,14 +381,11 @@ def reduce_snapshot(
                     "meta": {
                         "status": "running",
                         "agentName": source_agent_name,
-                        "runId": run_id,
-                        "subRunId": (
-                            run_id if source_agent_type == "subagent" else None
+                        "runId": (
+                            child_run_id if source_agent_type == "subagent" else run_id
                         ),
-                        "parentRunId": (
-                            raw_event.get("parentAgentRunId")
-                            if isinstance(raw_event, dict)
-                            else None
+                        "subRunId": (
+                            child_run_id if source_agent_type == "subagent" else None
                         ),
                         "graphTaskId": source.get("graphTaskId"),
                         "input": source.get("subagentInput"),
@@ -408,8 +393,8 @@ def reduce_snapshot(
                 }
             )
     elif event_type == "TEXT_MESSAGE_CONTENT":
-        if source_agent_type == "subagent" and isinstance(raw_event, dict):
-            child_run_id = raw_event.get("runId")
+        if source_agent_type == "subagent":
+            child_run_id = source.get("subagentInvocationId")
             message = (
                 _find_subagent(snapshot, child_run_id)
                 if isinstance(child_run_id, str)
@@ -451,7 +436,22 @@ def reduce_snapshot(
                         "input": "",
                         "status": "running",
                         "toolCallId": tool_id,
-                        "runId": run_id,
+                        "runId": (
+                            source.get("subagentInvocationId")
+                            if source_agent_type == "subagent"
+                            else run_id
+                        ),
+                        "subRunId": (
+                            source.get("subagentInvocationId")
+                            if source_agent_type == "subagent"
+                            else None
+                        ),
+                        "lastMainRunId": (
+                            raw_event.get("runId")
+                            if source_agent_type == "subagent"
+                            and isinstance(raw_event, dict)
+                            else None
+                        ),
                         "agentName": source_agent_name,
                         "sourceAgentName": (
                             source_agent_name
@@ -482,7 +482,9 @@ def reduce_snapshot(
             meta["status"] = "failed" if tool_result_status == "error" else "completed"
             meta["completedAt"] = now
         related_run_id = (
-            raw_event.get("relatedRunId") if isinstance(raw_event, dict) else None
+            raw_event.get("relatedSubagentInvocationId")
+            if isinstance(raw_event, dict)
+            else None
         )
         related_result_status = tool_result_status
         if isinstance(related_run_id, str):
@@ -550,47 +552,64 @@ def reduce_snapshot(
             payload.get("runId")
             or (raw_event.get("runId") if isinstance(raw_event, dict) else run_id)
         )
+        snapshot_run_id = (
+            str(source.get("subagentInvocationId"))
+            if source_agent_type == "subagent"
+            and isinstance(source.get("subagentInvocationId"), str)
+            else event_run_id
+        )
         terminal_status = (
             "cancelled"
             if payload.get("code") in {"cancelled", "resume_cancelled"}
             else "error"
         )
-        if event_run_id in runs:
-            runs[event_run_id]["status"] = terminal_status
-            runs[event_run_id]["completedAt"] = now
+        if snapshot_run_id in runs:
+            runs[snapshot_run_id]["status"] = terminal_status
+            runs[snapshot_run_id]["completedAt"] = now
         if source_agent_type == "subagent":
             for message in _messages(snapshot):
                 meta = message.get("meta")
                 if (
                     message.get("role") == "subagent"
                     and isinstance(meta, dict)
-                    and meta.get("runId") == event_run_id
+                    and meta.get("runId") == snapshot_run_id
                 ):
                     meta["status"] = "failed"
                     meta["completedAt"] = now
         else:
             snapshot["activeRunId"] = None
-            snapshot["runStatus"] = (
-                "idle" if terminal_status == "cancelled" else "error"
-            )
-            for run in runs.values():
-                if (
-                    run.get("agentType") == "subagent"
-                    and run.get("status") == "running"
-                ):
-                    run["status"] = terminal_status
-                    run["completedAt"] = now
-            for message in _messages(snapshot):
-                meta = message.get("meta")
-                if (
-                    message.get("role") in {"tool", "subagent"}
-                    and isinstance(meta, dict)
-                    and meta.get("status") in {"running", "paused"}
-                ):
-                    meta["status"] = "failed"
-                    if message.get("role") == "tool" or not meta.get("result"):
-                        meta["result"] = error_message
-                    meta["completedAt"] = now
+            if preserve_pending_after_initialization_failure:
+                snapshot["runStatus"] = "waiting_approval"
+            else:
+                snapshot["runStatus"] = (
+                    "idle" if terminal_status == "cancelled" else "error"
+                )
+                for run in runs.values():
+                    if (
+                        run.get("agentType") == "subagent"
+                        and run.get("status") == "running"
+                        and run.get("lastMainRunId") == event_run_id
+                    ):
+                        run["status"] = terminal_status
+                        run["completedAt"] = now
+                for message in _messages(snapshot):
+                    meta = message.get("meta")
+                    if (
+                        message.get("role") in {"tool", "subagent"}
+                        and isinstance(meta, dict)
+                        and meta.get("status") in {"running", "paused"}
+                        and (
+                            (
+                                message.get("role") == "tool"
+                                and meta.get("subRunId") is None
+                            )
+                            or meta.get("lastMainRunId") == event_run_id
+                        )
+                    ):
+                        meta["status"] = "failed"
+                        if message.get("role") == "tool" or not meta.get("result"):
+                            meta["result"] = error_message
+                        meta["completedAt"] = now
             _messages(snapshot).append(
                 {
                     "id": f"error-{seq}",
@@ -605,5 +624,5 @@ def reduce_snapshot(
 
 def _finish_snapshot(snapshot: dict[str, object], seq: int) -> dict[str, object]:
     snapshot["snapshotSeq"] = seq
-    snapshot["snapshotVersion"] = 2
+    snapshot["snapshotVersion"] = 3
     return snapshot

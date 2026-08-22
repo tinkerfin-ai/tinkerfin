@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -60,18 +60,47 @@ async def test_login_resolve_and_logout_use_one_token_record(
         token_expire_seconds=1800,
     )
 
+    issued_after = datetime.now(UTC)
     login = await service.login("alice", "secret-pass")
     resolved = await service.resolve_token(login.access_token)
     await service.logout(login.access_token)
     revoked = await service.resolve_token(login.access_token)
 
-    assert login.expires_in == 1800
+    assert issued_after + timedelta(seconds=1800) <= login.expires_at
     assert login.user.username == "alice"
     assert resolved.is_authenticated is True
     assert resolved.user == login.user
+    assert resolved.expires_at == login.expires_at
     assert revoked.is_authenticated is False
     assert revoked.failure_reason == "revoked_token"
-    assert tokens.records[login.access_token].expires_at > datetime.now(UTC)
+    assert tokens.records[login.access_token].expires_at == login.expires_at
+
+
+async def test_expired_token_is_rejected_without_changing_its_deadline(
+    session: AsyncSession,
+) -> None:
+    """固定到期的 token 在重复校验时不得续期"""
+
+    expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    tokens = TokenMemoryStore()
+    tokens.records["expired-token"] = TokenRecord(
+        token="expired-token",
+        user_id=1,
+        expires_at=expires_at,
+    )
+    service = AuthService(
+        UserRepository(session),
+        tokens,
+        token_expire_seconds=86400,
+    )
+
+    first = await service.resolve_token("expired-token")
+    second = await service.resolve_token("expired-token")
+
+    assert first.is_authenticated is False
+    assert first.failure_reason == "expired_token"
+    assert second.failure_reason == "expired_token"
+    assert tokens.records["expired-token"].expires_at == expires_at
 
 
 async def test_login_hides_bad_username_and_bad_password_difference(

@@ -63,6 +63,14 @@ A pending batch cannot mix Plan and Tool interrupts. A Tool review can still occ
 later, after Plan approval, and its original scoped Tool ID remains continuous across
 that later resume.
 
+Tool reviews carry `metadata.deepagents` with schema
+`tinkerfin.deepagents.tool-review.v1`. The required fields are
+`nativeInterruptId`, `actionIndex`, `toolName`, `allowedDecisions`, and
+`originalArgs`. Hosts should parse the complete trusted interrupt with
+`parse_tool_review_interrupt()` and persist it unchanged. Missing fields, unknown
+fields, an invalid decision, or disagreement with `metadata.langgraphValue` fails
+closed; there is no unversioned metadata shape.
+
 Cancelling a Plan clarification or review abandons that Plan request without fabricating
 `reject`. A later ordinary input can use `mode="default"` on the same Plan-capable
 Definition and checkpoint thread. Changing the future mode never approves, rejects, or
@@ -110,6 +118,8 @@ if translation.mode == "command":
 ```
 
 `persisted_interrupts` must come from a trusted server event log, not the client payload.
+`ResumeMapper.map_agui()` applies the same Tool review v1 parser used at the public
+inspection boundary.
 
 Then pass both the binding and its command:
 

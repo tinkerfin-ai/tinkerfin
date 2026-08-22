@@ -58,6 +58,12 @@ Plan interrupt 使用同一套 `ResumeMapper.map_agui(...)` 和 `AgUiResumeBindi
 同一待处理批次不能混合 Plan interrupt 与 Tool interrupt。Plan 批准后仍可能在执行阶段
 产生 Tool 审批；后续恢复会继续使用原来的 scoped Tool ID。
 
+Tool 审批的 `metadata.deepagents` 使用
+`tinkerfin.deepagents.tool-review.v1`，必填字段为 `nativeInterruptId`、
+`actionIndex`、`toolName`、`allowedDecisions` 和 `originalArgs`。宿主应使用
+`parse_tool_review_interrupt()` 解析服务端保存的完整 interrupt，并原样持久化。缺失字段、未知
+字段、非法决定或与 `metadata.langgraphValue` 不一致都会失败关闭；不存在无版本 metadata 形状。
+
 取消 Plan 澄清或审阅表示放弃当前 Plan 请求，不能伪造成 `reject`。后续普通输入可以在
 同一个 Plan-capable Definition 和 checkpoint thread 上使用 `mode="default"`。修改未来
 mode 不会批准、拒绝或取消待处理的 Tool/Filesystem 审批。
@@ -104,6 +110,7 @@ if translation.mode == "command":
 ```
 
 `persisted_interrupts` 必须来自服务端可信的事件记录，不能使用客户端重新提交的 interrupt 详情。
+`ResumeMapper.map_agui()` 与公开解析入口复用同一个 Tool review v1 校验。
 
 接着创建 Runtime，并把恢复命令作为 Graph 输入：
 

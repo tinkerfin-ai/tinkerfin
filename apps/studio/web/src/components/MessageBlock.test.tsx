@@ -19,7 +19,8 @@ const subagentMessage: Message = {
     status: 'completed',
     subRunId: 'sub-run-researcher-1',
     runId: 'sub-run-researcher-1',
-    parentRunId: 'main-run-1',
+    originMainRunId: 'main-run-1',
+    lastMainRunId: 'main-run-1',
     durationMs: 4210,
   },
 }

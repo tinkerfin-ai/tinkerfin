@@ -46,6 +46,10 @@ async for event in events:
 | `expose_reasoning_events` | `False` | 是否产生支持的推理事件 |
 | `expose_subagent_events` | `True` | 是否交付子 Agent 事件 |
 | `prior_tool_call_ids` | `frozenset()` | 恢复前已经完整发送过的 scoped Tool ID |
+| `private_state_keys` | `frozenset()` | 在已知公开投影边界排除的顶层 state channel |
+
+独立转换器无法推断宿主的私有字段，因此 `private_state_keys` 需要显式提供，并且只过滤顶层
+channel，不会递归删除嵌套同名业务字段。TinkerFin Plan Definition 会自动提供自己的内部 key。
 
 ## 编码成 SSE
 
@@ -129,5 +133,26 @@ kind, namespace, raw_id = codec.decode(public_id)
 ```
 
 不要截断 scoped ID，也不要只保存原始 Tool ID；不同 namespace 中可能出现相同原始 ID。
+
+## 解析框架扩展
+
+Tool 审批 metadata 使用 `ToolReviewInterruptMetadata`，schema 固定为
+`tinkerfin.deepagents.tool-review.v1`：
+
+```python
+from tinkerfin_agui_adapter import parse_tool_review_interrupt
+
+
+review = parse_tool_review_interrupt(persisted_interrupt)
+print(review.tool_name, review.original_args.root)
+```
+
+解析器校验完整 interrupt、原生 action 分组、位置、决策策略、参数和 scoped Tool ID。未带版本、
+字段冲突或来自客户端的 interrupt metadata 都不能作为可信恢复依据。
+
+Deep Agents `task` 调用发布 `tinkerfin.subagent-provenance.v1` 形状的
+`SubagentProvenance`。`subagentInvocationId` 跨 resume 稳定，`requestRunId` 表示当前承载事件的
+主请求；父 task Result 使用 `relatedSubagentInvocationId`。这些字段表达 Agent 嵌套，标准
+AG-UI `parentRunId` 继续只表达分支和时间旅行谱系。
 
 下一篇：[AG-UI 使用参考](api-reference.md)。

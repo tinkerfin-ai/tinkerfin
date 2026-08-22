@@ -5,19 +5,22 @@ from __future__ import annotations
 import inspect
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from typing import Generic, Literal, Protocol, TypeAlias, TypeVar, cast
+from typing import Any, Generic, Literal, Protocol, TypeAlias, TypeVar, cast
 
 from deepagents.backends import StateBackend
 from deepagents.backends.protocol import BackendProtocol
 from deepagents.graph import DeepAgentState
+from langchain.agents.middleware.todo import TodoListMiddleware
 from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import BaseMessage
-from langchain_core.runnables import RunnableConfig
+from langchain_core.runnables import Runnable, RunnableConfig
+from langchain_core.tools import BaseTool
 from langgraph.cache.base import BaseCache
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
+from langgraph.prebuilt import ToolNode
 from langgraph.store.base import BaseStore
 from langgraph.types import interrupt
 from langgraph.typing import ContextT
@@ -44,9 +47,10 @@ from ._contracts import (
     RespondToPlan,
 )
 from ._gate import create_gate_agent, invoke_gate
-from ._middleware import ConfirmedPlanMiddleware
+from ._middleware import ConfirmedPlanMiddleware, ParentStateTodoListMiddleware
 from ._planner import create_planner_agent, invoke_planner
 from ._state import (
+    PLAN_EXECUTION_YIELD_KEY,
     PLAN_SCHEMA_FINGERPRINT_KEY,
     PlanWorkflowNodeState,
     create_plan_state_schema,
@@ -100,7 +104,11 @@ _AsyncConfigPlanNode: TypeAlias = Callable[
     Awaitable[dict[str, object]],
 ]
 _PlanNode: TypeAlias = (
-    _SyncPlanNode | _ConfigPlanNode | _AsyncConfigPlanNode | _CompiledPlanRuntime
+    _SyncPlanNode
+    | _ConfigPlanNode
+    | _AsyncConfigPlanNode
+    | _CompiledPlanRuntime
+    | Runnable[object, object]
 )
 _PlanPath: TypeAlias = (
     Callable[[PlanWorkflowNodeState], str]
@@ -330,19 +338,32 @@ class _PlanGraphFactory(Generic[ContextT]):
             arguments.get("state_schema"),
         )
         caller_middleware = cast(
-            Sequence[AgentMiddleware],  # pyright: ignore[reportMissingTypeArgument]
+            Sequence[AgentMiddleware[Any, Any, Any]],
             arguments.get("middleware", ()),
         )
         state_schema = create_plan_state_schema(
             base_state_schema,
             middleware=caller_middleware,
         )
+        execution_middleware: list[AgentMiddleware[Any, Any, Any]] = []
+        parent_todo_tools: list[BaseTool] = []
+        for item in caller_middleware:
+            if isinstance(item, TodoListMiddleware):
+                projected = ParentStateTodoListMiddleware(item)
+                execution_middleware.append(projected)
+                parent_todo_tools.append(projected.parent_tool)
+            else:
+                execution_middleware.append(item)
+        if len(parent_todo_tools) > 1:
+            raise PlanModeConfigurationError(
+                "Plan Mode accepts at most one TodoListMiddleware"
+            )
 
         child_kwargs = dict(kwargs)
         child_kwargs.update(
             {
                 "backend": backend,
-                "middleware": (*caller_middleware, ConfirmedPlanMiddleware()),
+                "middleware": (*execution_middleware, ConfirmedPlanMiddleware()),
                 "state_schema": state_schema,
                 "checkpointer": None,
                 "store": None,
@@ -666,6 +687,18 @@ class _PlanGraphFactory(Generic[ContextT]):
                 current.model_copy(update={"status": PlanStatus.COMPLETED})
             )
 
+        def unavailable_todo_commit_node(
+            state: PlanWorkflowNodeState,
+        ) -> dict[str, object]:
+            del state
+            raise RuntimeError("Plan execution yielded without TodoListMiddleware")
+
+        def execution_path(state: PlanWorkflowNodeState) -> str:
+            yielded = state.get(PLAN_EXECUTION_YIELD_KEY, False)
+            if not isinstance(yielded, bool):
+                raise TypeError("Plan execution yield state must be a bool")
+            return "continue" if yielded else "complete"
+
         def gate_path(state: PlanWorkflowNodeState) -> str:
             route = read_plan_state(cast(Mapping[str, object], state)).route
             if route is None:
@@ -693,6 +726,12 @@ class _PlanGraphFactory(Generic[ContextT]):
         builder.add_node("clarify_planner", clarify_planner_node)
         builder.add_node("review_plan", review_node)
         builder.add_node("execute_deep_agent", deep_agent_runtime)
+        todo_commit_node: _PlanNode = (
+            ToolNode(parent_todo_tools)
+            if parent_todo_tools
+            else unavailable_todo_commit_node
+        )
+        builder.add_node("continue_deep_agent", todo_commit_node)
         builder.add_node("complete_plan", complete_node)
         builder.add_edge(START, "initialize_plan")
         builder.add_conditional_edges(
@@ -729,7 +768,15 @@ class _PlanGraphFactory(Generic[ContextT]):
                 "reject": END,
             },
         )
-        builder.add_edge("execute_deep_agent", "complete_plan")
+        builder.add_conditional_edges(
+            "execute_deep_agent",
+            execution_path,
+            {
+                "continue": "continue_deep_agent",
+                "complete": "complete_plan",
+            },
+        )
+        builder.add_edge("continue_deep_agent", "execute_deep_agent")
         builder.add_edge("complete_plan", END)
 
         checkpointer = _checkpoint_saver(arguments["checkpointer"])

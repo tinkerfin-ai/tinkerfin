@@ -24,6 +24,15 @@ uv run python -m tinkerfin_studio --host 127.0.0.1 --port 8090 --reload
 本地进程使用应用目录的 `.env`，其中 MySQL、Redis 和 OpenSandbox 地址必须能从宿主机
 访问。MySQL 空库结构见 [database/mysql/schema.sql](database/mysql/schema.sql)。
 
+## 认证会话
+
+`AUTH_TOKEN_EXPIRE_SECONDS` 控制访问令牌从签发时刻起的固定有效期，默认值为 `86400`。
+请求和用户操作不会延长到期时间。`POST /api/auth/login` 返回访问令牌、UTC `expires_at`
+和用户信息；`GET /api/auth/me` 返回同一 `expires_at` 和当前用户。后端在每个认证请求上以
+Redis 记录及其固定到期时间为准，过期、撤销或无效令牌统一返回 401。
+
+配置只作用于服务重新加载后签发的令牌，已有令牌保持签发时确定的到期时间。
+
 ## 对话请求边界
 
 `POST /api/conversation/chat` 接收标准 AG-UI `RunAgentInput`，并返回可回放的 AG-UI SSE。HTTP 层先完成协议校验，再由 `ChatRequest.from_agui()` 增加 Studio 的模型、会话归属、请求模式和恢复校验；Service 不接收未经转换的请求。

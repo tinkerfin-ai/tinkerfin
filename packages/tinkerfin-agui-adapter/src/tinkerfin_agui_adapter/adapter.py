@@ -78,6 +78,7 @@ class DeepAgentAgUiAdapter:
         prior_tool_call_ids: frozenset[str] = frozenset(),
         expose_reasoning_events: bool = False,
         expose_subagent_events: bool = True,
+        private_state_keys: frozenset[str] = frozenset(),
     ) -> None:
         if not isinstance(identity, Identity):
             raise TypeError("identity must be an Identity")
@@ -85,9 +86,19 @@ class DeepAgentAgUiAdapter:
             raise TypeError("expose_reasoning_events must be a bool")
         if not isinstance(expose_subagent_events, bool):
             raise TypeError("expose_subagent_events must be a bool")
+        if not isinstance(private_state_keys, frozenset):
+            raise TypeError("private_state_keys must be a frozenset")
+        if any(
+            not isinstance(key, str) or not key or key != key.strip()
+            for key in private_state_keys
+        ):
+            raise ValueError(
+                "private_state_keys must contain canonical non-empty strings"
+            )
         self._identity = identity
         self._expose_reasoning_events = expose_reasoning_events
         self._expose_subagent_events = expose_subagent_events
+        self._private_state_keys = private_state_keys
         self._ids = ScopedIdCodec()
         self._active_messages: dict[tuple[str, ...], str] = {}
         self._active_reasoning: dict[tuple[str, str], ActiveReasoning] = {}
@@ -217,6 +228,13 @@ class DeepAgentAgUiAdapter:
         """Validate stable message and Tool-fragment IDs before mutating state."""
 
         message = part.data.message
+        if isinstance(message, ToolMessage):
+            _adapter_messages._correlated_tool_result_namespace(
+                self,
+                message,
+                part.ns,
+            )
+            return
         if not isinstance(message, AIMessage):
             return
         raw_message_id = self._stable_message_id(message)
@@ -626,6 +644,7 @@ class DeepAgentAgUiAdapter:
         langgraph_node: str | None = None,
         interrupt_id: str | None = None,
         related_namespace: tuple[str, ...] | None = None,
+        related_subagent_invocation_id: str | None = None,
         parent_tool_call_id: str | None = None,
         tool_result_status: Literal["success", "error"] | None = None,
     ) -> dict[str, JsonValue]:
@@ -636,6 +655,7 @@ class DeepAgentAgUiAdapter:
             langgraph_node=langgraph_node,
             interrupt_id=interrupt_id,
             related_namespace=related_namespace,
+            related_subagent_invocation_id=related_subagent_invocation_id,
             parent_tool_call_id=parent_tool_call_id,
             tool_result_status=tool_result_status,
         )

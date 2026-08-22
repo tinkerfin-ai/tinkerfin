@@ -34,7 +34,7 @@ export interface ConversationHistoryListResponse {
 
 export interface ConversationSnapshotJson {
   snapshotSeq: number
-  snapshotVersion: 2
+  snapshotVersion: 3
   messages: Message[]
   todos: TodoItem[]
   mode: AgentMode
@@ -52,7 +52,8 @@ export interface ConversationSnapshotRun {
   runId: string
   status: 'running' | 'success' | 'interrupt' | 'error'
   parentRunId?: string | null
-  parentAgentRunId?: string | null
+  originMainRunId?: string | null
+  lastMainRunId?: string | null
   agentType: 'main' | 'subagent'
   agentName?: string | null
   graphTaskId?: string | null
@@ -98,7 +99,7 @@ export interface ConversationHistoryDetail {
   lastModel?: string
   lastSeq: number
   snapshotSeq: number
-  snapshotVersion: 2
+  snapshotVersion: 3
   messageCount: number
   toolCallCount: number
   hasPendingInterrupt: boolean

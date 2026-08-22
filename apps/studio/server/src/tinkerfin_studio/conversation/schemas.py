@@ -1,6 +1,7 @@
 """会话历史、命令和取消接口模型"""
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
@@ -48,7 +49,7 @@ class ConversationEventEnvelope(BaseModel):
 
 
 class ConversationHistoryDetail(BaseModel):
-    """单个会话的 v2 快照和尾部事件"""
+    """单个会话的 v3 快照和尾部事件"""
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -60,7 +61,7 @@ class ConversationHistoryDetail(BaseModel):
     last_model: str | None = Field(default=None, alias="lastModel")
     last_seq: int = Field(alias="lastSeq", ge=0)
     snapshot_seq: int = Field(alias="snapshotSeq", ge=0)
-    snapshot_version: int = Field(alias="snapshotVersion")
+    snapshot_version: Literal[3] = Field(alias="snapshotVersion")
     message_count: int = Field(alias="messageCount", ge=0)
     tool_call_count: int = Field(alias="toolCallCount", ge=0)
     has_pending_interrupt: bool = Field(alias="hasPendingInterrupt")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import (
     AsyncIterable,
     AsyncIterator,
@@ -53,6 +54,8 @@ from .sse import (
 )
 
 PartT = TypeVar("PartT")
+
+logger = logging.getLogger(__name__)
 
 PartObserver: TypeAlias = Callable[[PartT], Awaitable[None]]
 EventObserver = Callable[[BaseEvent], Awaitable[None]]
@@ -238,6 +241,7 @@ class AgUiEventStream:
             expose_reasoning_events=False,
             expose_subagent_events=True,
             prior_tool_call_ids=frozenset(),
+            private_state_keys=frozenset(),
             timeout=None,
             settlement_timeout=None,
             on_event=None,
@@ -254,6 +258,7 @@ class AgUiEventStream:
         expose_reasoning_events: bool,
         expose_subagent_events: bool,
         prior_tool_call_ids: frozenset[str],
+        private_state_keys: frozenset[str] = frozenset(),
         timeout: float | None,
         settlement_timeout: float | None = None,
         on_event: EventObserver | None,
@@ -274,6 +279,7 @@ class AgUiEventStream:
             expose_reasoning_events=expose_reasoning_events,
             expose_subagent_events=expose_subagent_events,
             prior_tool_call_ids=prior_tool_call_ids,
+            private_state_keys=private_state_keys,
         )
         self._source = aiter(micro_batch(self._convert()))
         self._on_event = on_event
@@ -423,13 +429,25 @@ class AgUiEventStream:
         except GeneratorExit as error:
             primary = error
             raise
-        except Exception as error:  # noqa: BLE001 - protocol error terminal
+        except Exception as error:
             self.error = error
             primary = error
             error_code = (
                 "stream_timeout"
                 if isinstance(error, _AgUiStreamDeadlineExceeded)
                 else self._runtime_error_code
+            )
+            # The public terminal stays client-safe; trusted host logs retain the
+            # causal exception before cleanup can add secondary failure notes.
+            logger.error(
+                "AG-UI runtime conversion failed",
+                extra={
+                    "thread_id": self._identity.thread_id,
+                    "run_id": self._identity.run_id,
+                    "error_code": error_code,
+                    "error_type": type(error).__name__,
+                },
+                exc_info=(type(error), error, error.__traceback__),
             )
             try:
                 await self._close_upstream(error)
@@ -539,6 +557,7 @@ class TinkerFinRun(Generic[PartT]):
         expose_reasoning_events: bool = False,
         expose_subagent_events: bool = True,
         prior_tool_call_ids: frozenset[str] = frozenset(),
+        private_state_keys: frozenset[str] = frozenset(),
         on_event: EventObserver | None = None,
     ) -> AgUiEventStream:
         """Claim the native source and convert it to one AG-UI event stream.
@@ -550,6 +569,7 @@ class TinkerFinRun(Generic[PartT]):
             expose_reasoning_events: Whether verified public reasoning emits events.
             expose_subagent_events: Whether validated non-root events are emitted.
             prior_tool_call_ids: Scoped Tool call IDs already emitted before resume.
+            private_state_keys: Top-level state channels omitted from public output.
             on_event: Optional async observer awaited before each event is delivered.
 
         Returns:
@@ -573,6 +593,7 @@ class TinkerFinRun(Generic[PartT]):
             expose_reasoning_events=expose_reasoning_events,
             expose_subagent_events=expose_subagent_events,
             prior_tool_call_ids=prior_tool_call_ids,
+            private_state_keys=private_state_keys,
             on_event=on_event,
         )
 

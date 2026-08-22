@@ -10,7 +10,17 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tinkerfin import Identity
+from tinkerfin_agui_adapter import (
+    ScopedIdCodec,
+    SubagentProvenance,
+    ToolReviewContractError,
+    create_subagent_provenance,
+)
 from tinkerfin_messaging.models import MessageEnvelope
+from tinkerfin_studio.conversation.coordinator import (
+    ConversationProjectionCoordinator,
+)
+from tinkerfin_studio.conversation.history import ConversationHistoryService
 from tinkerfin_studio.conversation.models import (
     ConversationEvent,
     ConversationInterrupt,
@@ -47,10 +57,50 @@ def _envelope(
     )
 
 
+def _subagent_provenance(
+    *,
+    thread_id: str,
+    request_run_id: str,
+    graph_task_id: str,
+    parent_tool_raw_id: str,
+    agent_name: str = "researcher",
+    description: str = "检索 LangGraph",
+    parent_namespace: tuple[str, ...] = (),
+) -> SubagentProvenance:
+    return create_subagent_provenance(
+        identity=Identity(
+            threadId=f"users/7/threads/{thread_id}",
+            runId=request_run_id,
+        ),
+        namespace=(*parent_namespace, f"tools:{graph_task_id}"),
+        parent_namespace=parent_namespace,
+        graph_task_id=graph_task_id,
+        agent_name=agent_name,
+        parent_tool_call_id=ScopedIdCodec().encode(
+            "tool", parent_namespace, parent_tool_raw_id
+        ),
+        description=description,
+    )
+
+
+def _subagent_source(provenance: SubagentProvenance) -> dict[str, object]:
+    return {
+        "kind": "deep_agent_subagent",
+        "agentType": "subagent",
+        "agentName": provenance.agent_name,
+        "namespace": list(provenance.namespace),
+        "parentNamespace": list(provenance.parent_namespace),
+        "graphTaskId": provenance.graph_task_id,
+        "parentToolCallId": provenance.parent_tool_call_id,
+        "subagentInput": provenance.description,
+        "subagentInvocationId": provenance.subagent_invocation_id,
+    }
+
+
 async def test_projection_builds_tool_todo_and_interrupt_snapshot(
     session: AsyncSession,
 ) -> None:
-    """已提交事件应同时更新事实表、明细投影和 v2 快照"""
+    """已提交事件应同时更新事实表、明细投影和 v3 快照"""
 
     repository = ConversationRepository(session)
     thread = await repository.create_thread(
@@ -110,13 +160,34 @@ async def test_projection_builds_tool_todo_and_interrupt_snapshot(
                         "id": "interrupt-1",
                         "reason": "tool_call",
                         "message": "确认写入",
-                        "toolCallId": "tool-write",
+                        "toolCallId": ScopedIdCodec().encode("tool", (), "tool-write"),
                         "metadata": {
+                            "langgraphValue": {
+                                "action_requests": [
+                                    {
+                                        "name": "write_file",
+                                        "args": {"file_path": "/result.txt"},
+                                    }
+                                ],
+                                "review_configs": [
+                                    {
+                                        "action_name": "write_file",
+                                        "allowed_decisions": [
+                                            "approve",
+                                            "edit",
+                                            "reject",
+                                        ],
+                                    }
+                                ],
+                            },
                             "deepagents": {
+                                "schema": "tinkerfin.deepagents.tool-review.v1",
+                                "nativeInterruptId": "interrupt-1",
+                                "actionIndex": 0,
                                 "toolName": "write_file",
                                 "originalArgs": {"file_path": "/result.txt"},
                                 "allowedDecisions": ["approve", "edit", "reject"],
-                            }
+                            },
                         },
                     }
                 ],
@@ -148,7 +219,7 @@ async def test_projection_builds_tool_todo_and_interrupt_snapshot(
     assert isinstance(messages, list)
     item = approval["items"][0]
     assert item["toolName"] == "write_file"
-    assert item["toolCallId"] == "tool-write"
+    assert item["toolCallId"] == ScopedIdCodec().encode("tool", (), "tool-write")
     assert item["originalArgs"] == {"file_path": "/result.txt"}
     assert item["allowedDecisions"] == ["approve", "edit", "reject"]
     assert json.loads(item["params"]) == {"file_path": "/result.txt"}
@@ -156,10 +227,95 @@ async def test_projection_builds_tool_todo_and_interrupt_snapshot(
     assert await repository.count_events(thread.id) == len(events)
 
 
+async def test_projection_rejects_tool_interrupt_without_v1_metadata(
+    session: AsyncSession,
+) -> None:
+    """Studio 不得为缺失框架契约的 Tool interrupt 制造默认审批"""
+
+    repository = ConversationRepository(session)
+    thread = await repository.create_thread(
+        user_id=7,
+        thread_id="thread-invalid-tool-review",
+        title="无效 Tool 审批",
+        model_id="main",
+    )
+    await repository.create_main_run(
+        thread_id=thread.id,
+        run_id="run-invalid-tool-review",
+        model_id="main",
+        input_json={"messages": []},
+        config_json={},
+    )
+    await repository.commit()
+    thread_pk = thread.id
+    projector = ConversationProjector(session)
+    envelope, event = _envelope(
+        1,
+        {
+            "type": "RUN_STARTED",
+            "threadId": thread.thread_id,
+            "runId": "run-invalid-tool-review",
+        },
+        run="run-invalid-tool-review",
+    )
+    await projector.project(thread_pk=thread.id, envelope=envelope, event=event)
+    await repository.commit()
+    envelope, event = _envelope(
+        2,
+        {
+            "type": "RUN_FINISHED",
+            "threadId": thread.thread_id,
+            "runId": "run-invalid-tool-review",
+            "outcome": {
+                "type": "interrupt",
+                "interrupts": [
+                    {
+                        "id": "invalid-tool-review",
+                        "reason": "tool_call",
+                        "toolCallId": ScopedIdCodec().encode(
+                            "tool", (), "invalid-tool-review"
+                        ),
+                        "metadata": {
+                            "langgraphValue": {
+                                "action_requests": [{"name": "write_file", "args": {}}],
+                                "review_configs": [
+                                    {
+                                        "action_name": "write_file",
+                                        "allowed_decisions": ["approve"],
+                                    }
+                                ],
+                            },
+                            "deepagents": {
+                                "nativeInterruptId": "invalid-tool-review",
+                                "actionIndex": 0,
+                                "toolName": "write_file",
+                                "allowedDecisions": ["approve"],
+                                "originalArgs": {},
+                            },
+                        },
+                    }
+                ],
+            },
+        },
+        run="run-invalid-tool-review",
+    )
+
+    with pytest.raises(ToolReviewContractError):
+        await projector.project(thread_pk=thread.id, envelope=envelope, event=event)
+    await repository.rollback()
+
+    stored = await repository.get_thread_by_pk(thread_pk)
+    assert stored is not None
+    assert stored.last_seq == 1
+    assert stored.snapshot_seq == 1
+    assert stored.has_pending_interrupt is False
+    assert await repository.count_events(thread_pk) == 1
+
+
 async def test_projection_preserves_plan_mode_and_pending_plan_interrupt(
     session: AsyncSession,
 ) -> None:
-    """Plan 暂停必须通过同一 v2 快照恢复 mode 与交互，不伪造 Tool 审批"""
+    """Plan 暂停必须通过同一 v3 快照恢复 mode 与交互，不伪造 Tool 审批"""
 
     repository = ConversationRepository(session)
     thread = await repository.create_thread(
@@ -307,13 +463,30 @@ async def test_resume_started_clears_pending_snapshot_before_later_error(
                         "id": "interrupt-resume",
                         "reason": "tool_call",
                         "message": "确认写入",
-                        "toolCallId": "tool-resume",
+                        "toolCallId": ScopedIdCodec().encode("tool", (), "tool-resume"),
                         "metadata": {
+                            "langgraphValue": {
+                                "action_requests": [
+                                    {
+                                        "name": "write_file",
+                                        "args": {"file_path": "/resume.txt"},
+                                    }
+                                ],
+                                "review_configs": [
+                                    {
+                                        "action_name": "write_file",
+                                        "allowed_decisions": ["approve", "reject"],
+                                    }
+                                ],
+                            },
                             "deepagents": {
+                                "schema": "tinkerfin.deepagents.tool-review.v1",
+                                "nativeInterruptId": "interrupt-resume",
+                                "actionIndex": 0,
                                 "toolName": "write_file",
                                 "originalArgs": {"file_path": "/resume.txt"},
                                 "allowedDecisions": ["approve", "reject"],
-                            }
+                            },
                         },
                     }
                 ],
@@ -530,6 +703,69 @@ async def test_initialization_error_releases_resume_claim_without_consuming_it(
         title="初始化失败",
         model_id="main",
     )
+    pending_request = {
+        "id": "interrupt-init-failure",
+        "reason": "tool_call",
+        "message": "确认写入",
+        "toolCallId": ScopedIdCodec().encode("tool", (), "tool-init-failure"),
+        "metadata": {
+            "langgraphValue": {
+                "action_requests": [
+                    {
+                        "name": "write_file",
+                        "args": {"file_path": "/init-failure.txt"},
+                    }
+                ],
+                "review_configs": [
+                    {
+                        "action_name": "write_file",
+                        "allowed_decisions": ["approve", "reject"],
+                    }
+                ],
+            },
+            "deepagents": {
+                "schema": "tinkerfin.deepagents.tool-review.v1",
+                "nativeInterruptId": "interrupt-init-failure",
+                "actionIndex": 0,
+                "toolName": "write_file",
+                "originalArgs": {"file_path": "/init-failure.txt"},
+                "allowedDecisions": ["approve", "reject"],
+            },
+        },
+    }
+    approval = {
+        "items": [
+            {
+                "id": "interrupt-init-failure",
+                "interruptId": "interrupt-init-failure",
+                "toolCallId": ScopedIdCodec().encode("tool", (), "tool-init-failure"),
+                "toolName": "write_file",
+                "params": '{"file_path":"/init-failure.txt"}',
+                "input": '{"file_path":"/init-failure.txt"}',
+                "description": "确认写入",
+                "originalArgs": {"file_path": "/init-failure.txt"},
+                "allowedDecisions": ["approve", "reject"],
+            }
+        ],
+        "activeIndex": 0,
+        "submitted": False,
+    }
+    thread.status = "waiting_approval"
+    thread.has_pending_interrupt = True
+    thread.snapshot_json = {
+        "snapshotSeq": 0,
+        "snapshotVersion": 3,
+        "messages": [],
+        "todos": [{"id": "todo-pending", "status": "running"}],
+        "mode": "default",
+        "approval": approval,
+        "runStatus": "waiting_approval",
+        "activeRunId": None,
+        "serverState": {"todos": [{"id": "todo-pending"}]},
+        "runs": {},
+        "activities": [],
+        "interrupts": [pending_request],
+    }
     run = await repository.create_main_run(
         thread_id=thread.id,
         run_id="run-init-failure",
@@ -556,7 +792,7 @@ async def test_initialization_error_releases_resume_claim_without_consuming_it(
             status="pending",
             reason="tool_call",
             message="确认写入",
-            request_json={"id": "interrupt-init-failure", "reason": "tool_call"},
+            request_json=pending_request,
             resume_json=None,
             created_at=created_at,
             resolved_at=None,
@@ -604,68 +840,45 @@ async def test_initialization_error_releases_resume_claim_without_consuming_it(
     assert stored.resume_json is None
     assert stored.resolved_at is None
     assert run.status == run_status
+    await session.refresh(thread)
+    assert thread.status == "waiting_approval"
+    assert thread.has_pending_interrupt is True
+    assert thread.last_seq == 2
+    assert thread.snapshot_seq == 2
+    assert thread.snapshot_json is not None
+    assert thread.snapshot_json["snapshotSeq"] == thread.snapshot_seq
+    assert thread.snapshot_json["runStatus"] == "waiting_approval"
+    assert thread.snapshot_json["activeRunId"] is None
+    assert thread.snapshot_json["approval"] == approval
+    assert thread.snapshot_json["interrupts"] == [pending_request]
+    assert thread.snapshot_json["todos"] == [
+        {"id": "todo-pending", "status": "running"}
+    ]
 
+    class NoopProjector(ConversationProjectionCoordinator):
+        def __init__(self) -> None:
+            pass
 
-async def test_subagent_terminal_does_not_finish_the_main_run(
-    session: AsyncSession,
-) -> None:
-    """子 Agent 生命周期必须写入独立 run，不能抢占主 run 终态"""
+        async def reconcile(self, *, thread_pk: int, identity: Identity) -> int:
+            del identity
+            assert thread_pk == thread.id
+            return 2
 
-    repository = ConversationRepository(session)
-    thread = await repository.create_thread(
+    history = ConversationHistoryService(
+        repository,
         user_id=7,
-        thread_id="thread-subagent",
-        title="子 Agent",
-        model_id="main",
+        projector=NoopProjector(),
     )
-    main_run = await repository.create_main_run(
-        thread_id=thread.id,
-        run_id="run-1",
-        model_id="main",
-        input_json={"messages": []},
-        config_json={},
-    )
-    await session.commit()
-    projector = ConversationProjector(session)
-    raw_event = {
-        "streamMode": "tasks",
-        "source": {
-            "agentType": "subagent",
-            "agentName": "researcher",
-            "namespace": ["tools:task-1"],
-            "graphTaskId": "task-1",
-        },
-        "runId": "sub-run-1",
-        "parentAgentRunId": "run-1",
-    }
-    events = (
-        {
-            "type": "RUN_STARTED",
-            "threadId": "thread-subagent",
-            "runId": "sub-run-1",
-            "rawEvent": raw_event,
-        },
-        {
-            "type": "RUN_FINISHED",
-            "threadId": "thread-subagent",
-            "runId": "sub-run-1",
-            "outcome": {"type": "success"},
-            "rawEvent": raw_event,
-        },
-    )
-
-    for seq, value in enumerate(events, start=1):
-        envelope, event = _envelope(seq, value)
-        await projector.project(thread_pk=thread.id, envelope=envelope, event=event)
-    await session.commit()
-
-    await session.refresh(main_run)
-    sub_run = await repository.get_run(thread_pk=thread.id, run_id="sub-run-1")
-    assert main_run.status == "running"
-    assert sub_run is not None
-    assert sub_run.agent_type == "subagent"
-    assert sub_run.agent_name == "researcher"
-    assert sub_run.status == "success"
+    history_list = await history.list_history(page_size=10, cursor=None)
+    assert len(history_list.items) == 1
+    assert history_list.items[0].status == "waiting_approval"
+    assert history_list.items[0].has_pending_interrupt is True
+    detail = await history.get_detail(thread.thread_id)
+    assert detail.status == "waiting_approval"
+    assert detail.has_pending_interrupt is True
+    assert detail.last_seq == 2
+    assert detail.snapshot_seq == 2
+    assert detail.snapshot == thread.snapshot_json
 
 
 async def test_real_task_provenance_projects_subagent_run_and_inner_tool(
@@ -691,15 +904,14 @@ async def test_real_task_provenance_projects_subagent_run_and_inner_tool(
     )
     await session.commit()
     projector = ConversationProjector(session)
-    source = {
-        "kind": "deep_agent_subagent",
-        "agentType": "subagent",
-        "agentName": "researcher",
-        "namespace": ["tools:graph-task"],
-        "graphTaskId": "graph-task",
-        "parentToolCallId": "tool-task",
-        "subagentInput": "检索 LangGraph",
-    }
+    provenance = _subagent_provenance(
+        thread_id=thread.thread_id,
+        request_run_id="run-1",
+        graph_task_id="graph-task",
+        parent_tool_raw_id="tool-task",
+    )
+    source = _subagent_source(provenance)
+    child_tool_id = ScopedIdCodec().encode("tool", provenance.namespace, "tool-search")
     events = (
         {"type": "RUN_STARTED", "threadId": thread.thread_id, "runId": "run-1"},
         {
@@ -713,62 +925,48 @@ async def test_real_task_provenance_projects_subagent_run_and_inner_tool(
                     "namespace": [],
                     "agentType": "main",
                     "agentName": "main",
-                    "subagents": [
-                        {
-                            "namespace": ["tools:graph-task"],
-                            "graphTaskId": "graph-task",
-                            "agentName": "researcher",
-                            "parentToolCallId": "tool-task",
-                            "description": "检索 LangGraph",
-                            "runId": "subrun-server",
-                            "parentAgentRunId": "run-1",
-                        }
-                    ],
+                    "subagents": [provenance.model_dump(mode="json", by_alias=True)],
                 },
             },
         },
         {
             "type": "TOOL_CALL_START",
-            "toolCallId": "tool-search",
+            "toolCallId": child_tool_id,
             "toolCallName": "web_search",
             "rawEvent": {
                 "streamMode": "messages",
-                "runId": "subrun-server",
-                "parentAgentRunId": "run-1",
+                "runId": "run-1",
                 "source": source,
             },
         },
         {
             "type": "TOOL_CALL_ARGS",
-            "toolCallId": "tool-search",
+            "toolCallId": child_tool_id,
             "delta": '{"query":"LangGraph"}',
             "rawEvent": {
                 "streamMode": "messages",
-                "runId": "subrun-server",
-                "parentAgentRunId": "run-1",
+                "runId": "run-1",
                 "source": source,
             },
         },
         {
             "type": "TOOL_CALL_END",
-            "toolCallId": "tool-search",
+            "toolCallId": child_tool_id,
             "rawEvent": {
                 "streamMode": "messages",
-                "runId": "subrun-server",
-                "parentAgentRunId": "run-1",
+                "runId": "run-1",
                 "source": source,
             },
         },
         {
             "type": "TOOL_CALL_RESULT",
             "messageId": "message-search",
-            "toolCallId": "tool-search",
+            "toolCallId": child_tool_id,
             "content": "搜索结果",
             "role": "tool",
             "rawEvent": {
                 "streamMode": "messages",
-                "runId": "subrun-server",
-                "parentAgentRunId": "run-1",
+                "runId": "run-1",
                 "toolResultStatus": "success",
                 "source": source,
             },
@@ -776,13 +974,13 @@ async def test_real_task_provenance_projects_subagent_run_and_inner_tool(
         {
             "type": "TOOL_CALL_RESULT",
             "messageId": "message-task",
-            "toolCallId": "tool-task",
+            "toolCallId": provenance.parent_tool_call_id,
             "content": "子 Agent 完成",
             "role": "tool",
             "rawEvent": {
                 "streamMode": "messages",
                 "runId": "run-1",
-                "relatedRunId": "subrun-server",
+                "relatedSubagentInvocationId": provenance.subagent_invocation_id,
                 "toolResultStatus": "success",
                 "source": {
                     "kind": "root",
@@ -813,17 +1011,21 @@ async def test_real_task_provenance_projects_subagent_run_and_inner_tool(
 
     await session.refresh(main_run)
     refreshed = await repository.get_thread_by_pk(thread.id)
-    sub_run = await repository.get_run(thread_pk=thread.id, run_id="subrun-server")
+    sub_run = await repository.get_run(
+        thread_pk=thread.id,
+        run_id=provenance.subagent_invocation_id,
+    )
     assert refreshed is not None
     assert main_run.status == "running"
     assert sub_run is not None
-    assert sub_run.parent_agent_run_id == "run-1"
+    assert sub_run.origin_main_run_id == "run-1"
+    assert sub_run.last_main_run_id == "run-1"
     assert sub_run.agent_name == "researcher"
     assert sub_run.graph_task_id == "graph-task"
     assert sub_run.input_json == {
         "description": "检索 LangGraph",
         "subagent_type": "researcher",
-        "parent_tool_call_id": "tool-task",
+        "parent_tool_call_id": provenance.parent_tool_call_id,
         "namespace": ["tools:graph-task"],
     }
     assert sub_run.status == "success"
@@ -833,7 +1035,9 @@ async def test_real_task_provenance_projects_subagent_run_and_inner_tool(
         message for message in messages if message.get("role") == "subagent"
     )
     subagent_meta = cast(dict[str, object], subagent["meta"])
-    assert subagent_meta["subRunId"] == "subrun-server"
+    assert subagent_meta["subRunId"] == provenance.subagent_invocation_id
+    assert subagent_meta["originMainRunId"] == "run-1"
+    assert subagent_meta["lastMainRunId"] == "run-1"
     assert subagent_meta["status"] == "completed"
     assert subagent_meta["input"] == "检索 LangGraph"
     assert subagent_meta["result"] == "子 Agent 完成"
@@ -841,10 +1045,10 @@ async def test_real_task_provenance_projects_subagent_run_and_inner_tool(
         message
         for message in messages
         if cast(dict[str, object], message.get("meta", {})).get("toolCallId")
-        == "tool-search"
+        == child_tool_id
     )
     child_meta = cast(dict[str, object], child_tool["meta"])
-    assert child_meta["runId"] == "subrun-server"
+    assert child_meta["runId"] == provenance.subagent_invocation_id
     assert child_meta["sourceAgentName"] == "researcher"
 
 
@@ -952,7 +1156,14 @@ async def test_subagent_identity_survives_a_new_main_resume_run(
     await session.commit()
     projector = ConversationProjector(session)
 
-    def raw_task_start(parent_run_id: str) -> dict[str, object]:
+    def raw_task_start(request_run_id: str) -> dict[str, object]:
+        provenance = _subagent_provenance(
+            thread_id=thread.thread_id,
+            request_run_id=request_run_id,
+            graph_task_id="graph-resume",
+            parent_tool_raw_id="tool-task-resume",
+            description="继续研究",
+        )
         return {
             "type": "RAW",
             "source": "langgraph.tasks",
@@ -964,17 +1175,7 @@ async def test_subagent_identity_survives_a_new_main_resume_run(
                     "namespace": [],
                     "agentType": "main",
                     "agentName": "main",
-                    "subagents": [
-                        {
-                            "namespace": ["tools:graph-resume"],
-                            "graphTaskId": "graph-resume",
-                            "agentName": "researcher",
-                            "parentToolCallId": "tool-task-resume",
-                            "description": "继续研究",
-                            "runId": "subrun-stable",
-                            "parentAgentRunId": parent_run_id,
-                        }
-                    ],
+                    "subagents": [provenance.model_dump(mode="json", by_alias=True)],
                 },
             },
         }
@@ -1017,11 +1218,29 @@ async def test_subagent_identity_survives_a_new_main_resume_run(
             )
         )
     )
+    expected = _subagent_provenance(
+        thread_id=thread.thread_id,
+        request_run_id="run-1",
+        graph_task_id="graph-resume",
+        parent_tool_raw_id="tool-task-resume",
+        description="继续研究",
+    )
     assert len(projected) == 1
-    assert projected[0].run_id == "subrun-stable"
-    assert projected[0].parent_agent_run_id == "run-1"
+    assert projected[0].run_id == expected.subagent_invocation_id
+    assert projected[0].origin_main_run_id == "run-1"
+    assert projected[0].last_main_run_id == "run-resume"
     assert projected[0].status == "cancelled"
     assert projected[0].finished_at is not None
+    await session.refresh(thread)
+    assert thread.snapshot_json is not None
+    runs = cast(dict[str, dict[str, object]], thread.snapshot_json["runs"])
+    assert runs[expected.subagent_invocation_id]["originMainRunId"] == "run-1"
+    assert runs[expected.subagent_invocation_id]["lastMainRunId"] == "run-resume"
+    messages = cast(list[dict[str, object]], thread.snapshot_json["messages"])
+    subagent = next(message for message in messages if message["role"] == "subagent")
+    meta = cast(dict[str, object], subagent["meta"])
+    assert meta["originMainRunId"] == "run-1"
+    assert meta["lastMainRunId"] == "run-resume"
 
 
 @pytest.mark.parametrize(
@@ -1055,15 +1274,17 @@ async def test_main_error_terminates_discovered_subagent_runs(
     )
     await session.commit()
     projector = ConversationProjector(session)
-    source = {
-        "kind": "deep_agent_subagent",
-        "agentType": "subagent",
-        "agentName": "researcher",
-        "namespace": ["tools:graph-error"],
-        "graphTaskId": "graph-error",
-        "parentToolCallId": "tool-task-error",
-        "subagentInput": "执行研究",
-    }
+    provenance = _subagent_provenance(
+        thread_id=thread.thread_id,
+        request_run_id="run-1",
+        graph_task_id="graph-error",
+        parent_tool_raw_id="tool-task-error",
+        description="执行研究",
+    )
+    source = _subagent_source(provenance)
+    child_tool_id = ScopedIdCodec().encode(
+        "tool", provenance.namespace, "tool-child-running"
+    )
     events = (
         {"type": "RUN_STARTED", "threadId": thread.thread_id, "runId": "run-1"},
         {
@@ -1077,28 +1298,17 @@ async def test_main_error_terminates_discovered_subagent_runs(
                     "namespace": [],
                     "agentType": "main",
                     "agentName": "main",
-                    "subagents": [
-                        {
-                            "namespace": ["tools:graph-error"],
-                            "graphTaskId": "graph-error",
-                            "agentName": "researcher",
-                            "parentToolCallId": "tool-task-error",
-                            "description": "执行研究",
-                            "runId": "subrun-error",
-                            "parentAgentRunId": "run-1",
-                        }
-                    ],
+                    "subagents": [provenance.model_dump(mode="json", by_alias=True)],
                 },
             },
         },
         {
             "type": "TOOL_CALL_START",
-            "toolCallId": "tool-child-running",
+            "toolCallId": child_tool_id,
             "toolCallName": "web_search",
             "rawEvent": {
                 "streamMode": "messages",
-                "runId": "subrun-error",
-                "parentAgentRunId": "run-1",
+                "runId": "run-1",
                 "source": source,
             },
         },
@@ -1116,7 +1326,10 @@ async def test_main_error_terminates_discovered_subagent_runs(
 
     await session.refresh(main_run)
     refreshed = await repository.get_thread_by_pk(thread.id)
-    sub_run = await repository.get_run(thread_pk=thread.id, run_id="subrun-error")
+    sub_run = await repository.get_run(
+        thread_pk=thread.id,
+        run_id=provenance.subagent_invocation_id,
+    )
     assert refreshed is not None and refreshed.snapshot_json is not None
     assert main_run.status == expected_run_status
     assert sub_run is not None
@@ -1124,17 +1337,114 @@ async def test_main_error_terminates_discovered_subagent_runs(
     assert sub_run.finished_at is not None
     assert refreshed.status == expected_thread_status
     runs = cast(dict[str, dict[str, object]], refreshed.snapshot_json["runs"])
-    assert runs["subrun-error"]["status"] == expected_run_status
+    assert runs[provenance.subagent_invocation_id]["status"] == expected_run_status
     messages = cast(list[dict[str, object]], refreshed.snapshot_json["messages"])
     subagent = next(message for message in messages if message["role"] == "subagent")
     child_tool = next(
         message
         for message in messages
         if cast(dict[str, object], message.get("meta", {})).get("toolCallId")
-        == "tool-child-running"
+        == child_tool_id
     )
     assert cast(dict[str, object], subagent["meta"])["status"] == "failed"
     assert cast(dict[str, object], child_tool["meta"])["status"] == "failed"
+
+
+async def test_main_error_only_terminates_subagents_owned_by_that_request(
+    session: AsyncSession,
+) -> None:
+    """并存子执行只由最近承载其事件的主请求终结"""
+
+    repository = ConversationRepository(session)
+    thread = await repository.create_thread(
+        user_id=7,
+        thread_id="thread-main-owner-isolation",
+        title="主请求归属隔离",
+        model_id="main",
+    )
+    for run_id in ("run-a", "run-b"):
+        await repository.create_main_run(
+            thread_id=thread.id,
+            run_id=run_id,
+            model_id="main",
+            input_json={"messages": []},
+            config_json={},
+        )
+    await repository.commit()
+    provenance_a = _subagent_provenance(
+        thread_id=thread.thread_id,
+        request_run_id="run-a",
+        graph_task_id="graph-a",
+        parent_tool_raw_id="task-a",
+        description="任务 A",
+    )
+    provenance_b = _subagent_provenance(
+        thread_id=thread.thread_id,
+        request_run_id="run-b",
+        graph_task_id="graph-b",
+        parent_tool_raw_id="task-b",
+        description="任务 B",
+    )
+
+    def descriptor_event(provenance: SubagentProvenance) -> dict[str, object]:
+        return {
+            "type": "RAW",
+            "source": "langgraph.tasks",
+            "rawEvent": {"type": "tasks", "phase": "start", "ns": []},
+            "event": {
+                "data": {"id": provenance.graph_task_id, "name": "tools"},
+                "provenance": {
+                    "kind": "root",
+                    "namespace": [],
+                    "agentType": "main",
+                    "agentName": "main",
+                    "subagents": [provenance.model_dump(mode="json", by_alias=True)],
+                },
+            },
+        }
+
+    values = (
+        (
+            "run-a",
+            {"type": "RUN_STARTED", "threadId": thread.thread_id, "runId": "run-a"},
+        ),
+        ("run-a", descriptor_event(provenance_a)),
+        (
+            "run-b",
+            {"type": "RUN_STARTED", "threadId": thread.thread_id, "runId": "run-b"},
+        ),
+        ("run-b", descriptor_event(provenance_b)),
+        (
+            "run-b",
+            {
+                "type": "RUN_ERROR",
+                "message": "run-b 失败",
+                "code": "runtime_error",
+                "rawEvent": {"runId": "run-b"},
+            },
+        ),
+    )
+    projector = ConversationProjector(session)
+    for seq, (run_id, value) in enumerate(values, start=1):
+        envelope, event = _envelope(seq, value, run=run_id)
+        await projector.project(thread_pk=thread.id, envelope=envelope, event=event)
+    await session.commit()
+
+    subagent_a = await repository.get_run(
+        thread_pk=thread.id,
+        run_id=provenance_a.subagent_invocation_id,
+    )
+    subagent_b = await repository.get_run(
+        thread_pk=thread.id,
+        run_id=provenance_b.subagent_invocation_id,
+    )
+    assert subagent_a is not None and subagent_a.status == "running"
+    assert subagent_b is not None and subagent_b.status == "error"
+    await session.refresh(thread)
+    assert thread.snapshot_json is not None
+    runs = cast(dict[str, dict[str, object]], thread.snapshot_json["runs"])
+    assert runs[provenance_a.subagent_invocation_id]["status"] == "running"
+    assert runs[provenance_b.subagent_invocation_id]["status"] == "error"
 
 
 async def test_subagent_error_is_preserved_in_history_snapshot(
@@ -1158,39 +1468,68 @@ async def test_subagent_error_is_preserved_in_history_snapshot(
     )
     await session.commit()
     projector = ConversationProjector(session)
-    raw_event = {
-        "streamMode": "tasks",
-        "source": {
-            "agentType": "subagent",
-            "agentName": "researcher",
-            "namespace": ["tools:task-error"],
-            "graphTaskId": "task-error",
-        },
-        "runId": "sub-run-error",
-        "parentAgentRunId": "run-main",
-    }
+    provenance = _subagent_provenance(
+        thread_id=thread.thread_id,
+        request_run_id="run-main",
+        graph_task_id="task-error",
+        parent_tool_raw_id="task-error-call",
+        description="执行研究",
+    )
+    source = _subagent_source(provenance)
     events = (
         {
             "type": "RUN_STARTED",
             "threadId": "thread-subagent-error",
-            "runId": "sub-run-error",
-            "rawEvent": raw_event,
+            "runId": "run-main",
         },
         {
-            "type": "TEXT_MESSAGE_START",
+            "type": "RAW",
+            "source": "langgraph.tasks",
+            "rawEvent": {"type": "tasks", "phase": "start", "ns": []},
+            "event": {
+                "data": {"id": "task-error", "name": "tools"},
+                "provenance": {
+                    "kind": "root",
+                    "namespace": [],
+                    "agentType": "main",
+                    "agentName": "main",
+                    "subagents": [provenance.model_dump(mode="json", by_alias=True)],
+                },
+            },
+        },
+        {
+            "type": "TEXT_MESSAGE_CONTENT",
             "messageId": "subagent-message",
-            "role": "assistant",
-            "rawEvent": raw_event,
+            "delta": "部分结果",
+            "rawEvent": {
+                "streamMode": "messages",
+                "runId": "run-main",
+                "source": source,
+            },
         },
         {
-            "type": "RUN_ERROR",
-            "message": "子 Agent 运行失败",
-            "code": "runtime_error",
-            "rawEvent": raw_event,
+            "type": "TOOL_CALL_RESULT",
+            "messageId": "task-error-result",
+            "toolCallId": provenance.parent_tool_call_id,
+            "content": "子 Agent 运行失败",
+            "role": "tool",
+            "rawEvent": {
+                "streamMode": "messages",
+                "runId": "run-main",
+                "relatedSubagentInvocationId": provenance.subagent_invocation_id,
+                "relatedNamespace": list(provenance.namespace),
+                "toolResultStatus": "error",
+                "source": {
+                    "kind": "root",
+                    "agentType": "main",
+                    "agentName": "main",
+                    "namespace": [],
+                },
+            },
         },
     )
     for seq, value in enumerate(events, start=1):
-        envelope, event = _envelope(seq, value)
+        envelope, event = _envelope(seq, value, run="run-main")
         await projector.project(thread_pk=thread.id, envelope=envelope, event=event)
     await session.commit()
 
@@ -1198,7 +1537,7 @@ async def test_subagent_error_is_preserved_in_history_snapshot(
     await session.refresh(thread)
     sub_run = await repository.get_run(
         thread_pk=thread.id,
-        run_id="sub-run-error",
+        run_id=provenance.subagent_invocation_id,
     )
     assert main_run.status == "running"
     assert sub_run is not None
@@ -1207,13 +1546,15 @@ async def test_subagent_error_is_preserved_in_history_snapshot(
     assert snapshot is not None
     runs = snapshot["runs"]
     assert isinstance(runs, dict)
-    assert runs["sub-run-error"]["status"] == "error"
+    assert runs[provenance.subagent_invocation_id]["status"] == "error"
     messages = snapshot["messages"]
     assert isinstance(messages, list)
     subagent_message = next(
         message
         for message in messages
-        if isinstance(message, dict) and message.get("id") == "subagent-message"
+        if isinstance(message, dict)
+        and cast(dict[str, object], message.get("meta", {})).get("subRunId")
+        == provenance.subagent_invocation_id
     )
     meta = subagent_message["meta"]
     assert isinstance(meta, dict)

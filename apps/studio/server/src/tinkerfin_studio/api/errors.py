@@ -79,6 +79,7 @@ class ConversationErrorCode(ErrorCode):
     RUN_CANCEL_FAILED = (1_001_004_025, 500, "取消会话运行失败")
     RESUME_ALREADY_CLAIMED = (1_001_004_026, 409, "该审批已被另一次恢复运行认领")
     MESSAGING_FAILURE = (1_001_004_027, 500, "会话消息处理失败")
+    HISTORY_SCHEMA_MISMATCH = (1_001_004_028, 500, "会话历史数据不符合当前版本")
 
 
 class ApplicationException(Exception):

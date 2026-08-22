@@ -38,7 +38,12 @@ expected_exports = {
     "HitlNoMatchError", "HitlRequest", "HitlReviewConfig", "Identity",
     "ResumeMapper", "ResumeMappingError",
     "ResumeTranslation", "RuntimeInterruptEnvelope", "ScopedIdCodec", "SseEventId",
-    "astream_events", "encode_sse", "micro_batch",
+    "SUBAGENT_PROVENANCE_SCHEMA", "SubagentProvenance",
+    "TOOL_RESULT_CORRELATION_KEY", "TOOL_RESULT_CORRELATION_SCHEMA",
+    "TOOL_REVIEW_SCHEMA", "ToolResultCorrelation", "ToolReviewContractError",
+    "ToolReviewDecision", "ToolReviewInterruptMetadata", "astream_events",
+    "create_subagent_provenance", "encode_sse", "micro_batch",
+    "parse_tool_review_interrupt", "subagent_invocation_id",
 }
 assert set(tinkerfin_agui_adapter.__all__) == expected_exports
 for export in expected_exports:

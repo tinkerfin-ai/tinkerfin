@@ -45,15 +45,16 @@ from ._adapter_contracts import (
 )
 from ._adapter_messages import _json_patch
 from .reasoning import normalize_operational_data, sanitize_public_data
-from .subagent import SubagentTaskInput
+from .subagent import SubagentTaskInput, create_subagent_provenance
 
 if TYPE_CHECKING:
     from .adapter import DeepAgentAgUiAdapter
 
-_INTERNAL_STATE_KEYS = frozenset({"_tinkerfin_plan_clarification_schema"})
 
-
-def _without_internal_state_keys(value: object) -> object:
+def _without_private_state_keys(
+    value: object,
+    private_state_keys: frozenset[str],
+) -> object:
     """Remove reserved channels only from a known state-mapping boundary."""
 
     if not isinstance(value, Mapping):
@@ -62,7 +63,7 @@ def _without_internal_state_keys(value: object) -> object:
     return {
         key: item
         for key, item in mapping.items()
-        if not isinstance(key, str) or key not in _INTERNAL_STATE_KEYS
+        if not isinstance(key, str) or key not in private_state_keys
     }
 
 
@@ -74,7 +75,10 @@ def _public_task_error(error: object | None) -> object | None:
     return error
 
 
-def _safe_checkpoint_task(value: object) -> dict[str, JsonValue]:
+def _safe_checkpoint_task(
+    value: object,
+    private_state_keys: frozenset[str],
+) -> dict[str, JsonValue]:
     """Project one checkpoint task without its resumable runtime state."""
 
     if not isinstance(value, Mapping):
@@ -85,7 +89,10 @@ def _safe_checkpoint_task(value: object) -> dict[str, JsonValue]:
         key: mapping[key] for key in allowed if key in mapping
     }
     if "result" in projected:
-        projected["result"] = _without_internal_state_keys(projected["result"])
+        projected["result"] = _without_private_state_keys(
+            projected["result"],
+            private_state_keys,
+        )
     if "error" in mapping:
         projected["error"] = _public_task_error(mapping["error"])
     normalized = sanitize_public_data(projected)
@@ -94,7 +101,10 @@ def _safe_checkpoint_task(value: object) -> dict[str, JsonValue]:
     return normalized
 
 
-def _safe_debug_task_start(value: object) -> dict[str, JsonValue]:
+def _safe_debug_task_start(
+    value: object,
+    private_state_keys: frozenset[str],
+) -> dict[str, JsonValue]:
     """Project a debug task start without runtime configuration metadata."""
 
     if not isinstance(value, Mapping):
@@ -106,14 +116,20 @@ def _safe_debug_task_start(value: object) -> dict[str, JsonValue]:
         if key in mapping
     }
     if "input" in projected:
-        projected["input"] = _without_internal_state_keys(projected["input"])
+        projected["input"] = _without_private_state_keys(
+            projected["input"],
+            private_state_keys,
+        )
     normalized = sanitize_public_data(projected)
     if not isinstance(normalized, dict):
         raise TypeError("debug task projection must be a JSON object")
     return normalized
 
 
-def _safe_checkpoint_payload(value: object) -> JsonValue:
+def _safe_checkpoint_payload(
+    value: object,
+    private_state_keys: frozenset[str],
+) -> JsonValue:
     """Remove checkpoint configuration from checkpoint and debug payloads."""
 
     if not isinstance(value, Mapping):
@@ -125,11 +141,11 @@ def _safe_checkpoint_payload(value: object) -> JsonValue:
             raise ValueError("debug stream data has an unsupported event type")
         payload = mapping.get("payload")
         if debug_type == "checkpoint":
-            safe_payload = _safe_checkpoint_snapshot(payload)
+            safe_payload = _safe_checkpoint_snapshot(payload, private_state_keys)
         elif debug_type == "task":
-            safe_payload = _safe_debug_task_start(payload)
+            safe_payload = _safe_debug_task_start(payload, private_state_keys)
         else:
-            safe_payload = _safe_checkpoint_task(payload)
+            safe_payload = _safe_checkpoint_task(payload, private_state_keys)
         normalized = sanitize_public_data(
             {
                 key: mapping[key]
@@ -141,10 +157,13 @@ def _safe_checkpoint_payload(value: object) -> JsonValue:
         if not isinstance(normalized, dict):
             raise TypeError("debug stream projection must be a JSON object")
         return normalized
-    return _safe_checkpoint_snapshot(mapping)
+    return _safe_checkpoint_snapshot(mapping, private_state_keys)
 
 
-def _safe_checkpoint_snapshot(value: object) -> dict[str, JsonValue]:
+def _safe_checkpoint_snapshot(
+    value: object,
+    private_state_keys: frozenset[str],
+) -> dict[str, JsonValue]:
     """Whitelist stable checkpoint fields and sanitize nested task results."""
 
     if not isinstance(value, Mapping):
@@ -154,7 +173,10 @@ def _safe_checkpoint_snapshot(value: object) -> dict[str, JsonValue]:
         key: mapping[key] for key in ("values", "next") if key in mapping
     }
     if "values" in projected:
-        projected["values"] = _without_internal_state_keys(projected["values"])
+        projected["values"] = _without_private_state_keys(
+            projected["values"],
+            private_state_keys,
+        )
     metadata = mapping.get("metadata")
     if metadata is not None:
         if not isinstance(metadata, Mapping):
@@ -169,7 +191,8 @@ def _safe_checkpoint_snapshot(value: object) -> dict[str, JsonValue]:
         ):
             raise TypeError("checkpoint tasks must be a sequence")
         projected["tasks"] = [
-            _safe_checkpoint_task(task) for task in cast(Sequence[object], tasks)
+            _safe_checkpoint_task(task, private_state_keys)
+            for task in cast(Sequence[object], tasks)
         ]
     normalized = sanitize_public_data(projected)
     if not isinstance(normalized, dict):
@@ -315,6 +338,15 @@ def _process_task_start(
                 parent_namespace,
                 task_call.id,
             )
+            provenance = create_subagent_provenance(
+                identity=self._identity,
+                namespace=child_namespace,
+                parent_namespace=parent_namespace,
+                graph_task_id=payload.id,
+                agent_name=descriptor.subagent_type,
+                parent_tool_call_id=parent_tool_call_id,
+                description=descriptor.description,
+            )
             invocation = SubagentInvocation(
                 parent_namespace=parent_namespace,
                 child_namespace=child_namespace,
@@ -322,6 +354,7 @@ def _process_task_start(
                 parent_tool_call_id=parent_tool_call_id,
                 subagent_input=descriptor.description,
                 agent_name=descriptor.subagent_type,
+                provenance=provenance,
             )
             existing = staged_subagent_invocations.get(child_namespace)
             if existing is not None:
@@ -338,13 +371,10 @@ def _process_task_start(
                 staged_sub_namespaces[parent_key] = child_namespace
                 staged_agent_names[child_namespace] = descriptor.subagent_type
             subagents.append(
-                {
-                    "namespace": list(child_namespace),
-                    "graphTaskId": payload.id,
-                    "agentName": descriptor.subagent_type,
-                    "parentToolCallId": parent_tool_call_id,
-                    "description": descriptor.description,
-                }
+                provenance.model_dump(
+                    mode="json",
+                    by_alias=True,
+                )
             )
     event = self._task_raw_event(
         namespace=parent_namespace,
@@ -353,7 +383,10 @@ def _process_task_start(
         data={
             "id": payload.id,
             "name": payload.name,
-            "input": _without_internal_state_keys(payload.input),
+            "input": _without_private_state_keys(
+                payload.input,
+                self._private_state_keys,
+            ),
             "triggers": payload.triggers,
             **(
                 {
@@ -450,7 +483,10 @@ def _process_task_result(
             "name": payload.name,
             "error": public_error,
             "interrupts": payload.interrupts,
-            "result": _without_internal_state_keys(payload.result),
+            "result": _without_private_state_keys(
+                payload.result,
+                self._private_state_keys,
+            ),
         },
     )
     self._task_result_fingerprints[key] = fingerprint
@@ -510,7 +546,7 @@ def _process_extra_part(
     source = self._source(part.ns)
     self._require_started_source(source)
     data = (
-        _safe_checkpoint_payload(part.data)
+        _safe_checkpoint_payload(part.data, self._private_state_keys)
         if part.type in {"checkpoints", "debug"}
         else sanitize_public_data(part.data)
     )
@@ -546,7 +582,7 @@ def _emit_values_part(
     raw_current = {
         key: value
         for key, value in part.data.items()
-        if key != _MESSAGE_STATE_KEY and key not in _INTERNAL_STATE_KEYS
+        if key != _MESSAGE_STATE_KEY and key not in self._private_state_keys
     }
     current_value = sanitize_public_data(raw_current)
     if not isinstance(current_value, dict):

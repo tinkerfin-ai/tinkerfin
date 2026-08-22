@@ -143,6 +143,7 @@ See [Custom sources and run coordination](extensions.md#use-a-renewable-redis-le
 | `expose_reasoning_events` | `False` | Deliver supported reasoning events |
 | `expose_subagent_events` | `True` | Deliver subagent events |
 | `prior_tool_call_ids` | `frozenset()` | Complete scoped tool IDs emitted before resume |
+| `private_state_keys` | `frozenset()` | Host-owned top-level state channels omitted from public projection |
 | `on_event` | `None` | Observer called before AG-UI event delivery |
 
 Identity is already bound by `TinkerFin.run(..., identity=...)`; `astream_agui()` does not accept duplicate IDs.

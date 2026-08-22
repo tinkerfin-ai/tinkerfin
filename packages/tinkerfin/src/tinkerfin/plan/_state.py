@@ -23,6 +23,15 @@ from .models import PlanState
 
 PLAN_STATE_KEY = "tinkerfin_plan"
 PLAN_SCHEMA_FINGERPRINT_KEY = "_tinkerfin_plan_clarification_schema"
+PLAN_EXECUTION_YIELD_KEY = "_tinkerfin_plan_execution_yield"
+PLAN_TODO_CORRELATION_KEY = "_tinkerfin_plan_todo_correlation"
+PLAN_PRIVATE_STATE_KEYS = frozenset(
+    {
+        PLAN_SCHEMA_FINGERPRINT_KEY,
+        PLAN_EXECUTION_YIELD_KEY,
+        PLAN_TODO_CORRELATION_KEY,
+    }
+)
 
 
 class PlanWorkflowNodeState(DeepAgentState, total=False):
@@ -30,6 +39,8 @@ class PlanWorkflowNodeState(DeepAgentState, total=False):
 
     tinkerfin_plan: NotRequired[dict[str, JsonValue]]
     _tinkerfin_plan_clarification_schema: NotRequired[str]
+    _tinkerfin_plan_execution_yield: NotRequired[bool]
+    _tinkerfin_plan_todo_correlation: NotRequired[dict[str, JsonValue] | None]
 
 
 def create_plan_state_schema(
@@ -108,8 +119,11 @@ def plan_state_update(plan: PlanState) -> dict[str, object]:
 
 
 __all__ = [
+    "PLAN_EXECUTION_YIELD_KEY",
+    "PLAN_PRIVATE_STATE_KEYS",
     "PLAN_SCHEMA_FINGERPRINT_KEY",
     "PLAN_STATE_KEY",
+    "PLAN_TODO_CORRELATION_KEY",
     "PlanWorkflowNodeState",
     "create_plan_state_schema",
     "plan_state_update",

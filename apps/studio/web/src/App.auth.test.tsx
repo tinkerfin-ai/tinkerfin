@@ -33,16 +33,26 @@ function loginPayload(accessToken = 'fresh-token') {
   return {
     access_token: accessToken,
     token_type: 'Bearer',
-    expires_in: 3600,
+    expires_at: '2099-01-01T00:00:00.000Z',
     user,
   }
 }
 
-function seedSession(token = 'token-123') {
+function sessionPayload(expiresAt = '2099-01-01T00:00:00.000Z') {
+  return {
+    expires_at: expiresAt,
+    user,
+  }
+}
+
+function seedSession(
+  token = 'token-123',
+  expiresAt = '2099-01-01T00:00:00.000Z',
+) {
   saveAuthSession({
     token,
     tokenType: 'Bearer',
-    expiresAt: '2099-01-01T00:00:00.000Z',
+    expiresAt,
     user,
   })
 }
@@ -54,6 +64,7 @@ describe('App authentication boundary', () => {
     clearActiveRunSession()
     window.history.replaceState(null, '', '/')
     vi.unstubAllGlobals()
+    vi.useRealTimers()
   })
 
   it('shows the login screen without mounting the workspace when no session exists', async () => {
@@ -98,7 +109,7 @@ describe('App authentication boundary', () => {
     seedSession()
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = new URL(input instanceof Request ? input.url : String(input), 'http://localhost')
-      if (url.pathname.endsWith('/api/auth/me')) return envelope(user)
+      if (url.pathname.endsWith('/api/auth/me')) return envelope(sessionPayload())
       if (url.pathname.endsWith('/api/conversation/history')) {
         return envelope({ items: [], nextCursor: null })
       }
@@ -112,12 +123,88 @@ describe('App authentication boundary', () => {
     expect(screen.queryByRole('heading', { name: '欢迎回来' })).not.toBeInTheDocument()
   })
 
+  it('keeps the session blocked and retries when /me is temporarily unavailable', async () => {
+    seedSession('retry-token')
+    let sessionRequests = 0
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(input instanceof Request ? input.url : String(input), 'http://localhost')
+      if (url.pathname.endsWith('/api/auth/me')) {
+        sessionRequests += 1
+        return sessionRequests === 1
+          ? new Response(null, { status: 503 })
+          : envelope(sessionPayload())
+      }
+      if (url.pathname.endsWith('/api/conversation/history')) {
+        return envelope({ items: [], nextCursor: null })
+      }
+      throw new Error(`unexpected request: ${url.pathname}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    render(<App />)
+
+    expect(await screen.findByLabelText('正在重新验证登录状态')).toBeInTheDocument()
+    expect(window.localStorage.getItem(AUTH_SESSION_STORAGE_KEY)).not.toBeNull()
+    expect(screen.queryByLabelText('对话内容')).not.toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    await waitFor(() => expect(screen.getByLabelText('对话内容')).toBeInTheDocument(), {
+      timeout: 2500,
+    })
+    expect(sessionRequests).toBe(2)
+  })
+
+  it('retries a network verification failure immediately when connectivity returns', async () => {
+    seedSession('network-retry-token')
+    let sessionRequests = 0
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(input instanceof Request ? input.url : String(input), 'http://localhost')
+      if (url.pathname.endsWith('/api/auth/me')) {
+        sessionRequests += 1
+        if (sessionRequests === 1) throw new TypeError('Failed to fetch')
+        return envelope(sessionPayload())
+      }
+      if (url.pathname.endsWith('/api/conversation/history')) {
+        return envelope({ items: [], nextCursor: null })
+      }
+      throw new Error(`unexpected request: ${url.pathname}`)
+    }))
+
+    render(<App />)
+
+    expect(await screen.findByLabelText('正在重新验证登录状态')).toBeInTheDocument()
+    window.dispatchEvent(new Event('online'))
+    await waitFor(() => expect(screen.getByLabelText('对话内容')).toBeInTheDocument())
+    expect(sessionRequests).toBe(2)
+    expect(window.localStorage.getItem(AUTH_SESSION_STORAGE_KEY)).not.toBeNull()
+  })
+
+  it('silently leaves the workspace when the fixed deadline is reached', async () => {
+    const expiresAt = new Date(Date.now() + 1000).toISOString()
+    seedSession('expiring-token', expiresAt)
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(input instanceof Request ? input.url : String(input), 'http://localhost')
+      if (url.pathname.endsWith('/api/auth/me')) return envelope(sessionPayload(expiresAt))
+      if (url.pathname.endsWith('/api/conversation/history')) {
+        return envelope({ items: [], nextCursor: null })
+      }
+      throw new Error(`unexpected request: ${url.pathname}`)
+    }))
+
+    render(<App />)
+
+    expect(await screen.findByLabelText('对话内容')).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: '欢迎回来' }, { timeout: 2500 }))
+      .toBeInTheDocument()
+    expect(window.localStorage.getItem(AUTH_SESSION_STORAGE_KEY)).toBeNull()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
   it('silently unmounts an active workspace when an authenticated request returns 401', async () => {
     seedSession()
     window.history.replaceState(null, '', '/?thread=private-thread')
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = new URL(input instanceof Request ? input.url : String(input), 'http://localhost')
-      if (url.pathname.endsWith('/api/auth/me')) return envelope(user)
+      if (url.pathname.endsWith('/api/auth/me')) return envelope(sessionPayload())
       if (url.pathname.endsWith('/api/conversation/history')) {
         return envelope(null, 401, 1_001_001_000, '登录已过期')
       }
@@ -140,7 +227,7 @@ describe('App authentication boundary', () => {
       const request = input instanceof Request ? input : new Request(input)
       const url = new URL(request.url)
       if (url.pathname.endsWith('/api/auth/login')) return envelope(loginPayload())
-      if (url.pathname.endsWith('/api/auth/me')) return envelope(user)
+      if (url.pathname.endsWith('/api/auth/me')) return envelope(sessionPayload())
       if (url.pathname.endsWith('/api/conversation/history')) return envelope({ items: [], nextCursor: null })
       throw new Error(`unexpected request: ${url.pathname}`)
     })
@@ -214,7 +301,7 @@ describe('App authentication boundary', () => {
     await browserUser.type(screen.getByLabelText('密码'), 'password')
     await browserUser.click(screen.getByRole('button', { name: '登录' }))
 
-    expect(screen.getByRole('button', { name: '登录中...' })).toBeDisabled()
+    expect(screen.getByLabelText('正在检查登录状态')).toBeInTheDocument()
     expect(screen.queryByLabelText('正在进入工作区')).not.toBeInTheDocument()
     expect(screen.queryByLabelText('对话内容')).not.toBeInTheDocument()
   })
@@ -235,7 +322,7 @@ describe('App authentication boundary', () => {
       const request = input instanceof Request ? input : new Request(input)
       const url = new URL(request.url)
       if (url.pathname.endsWith('/api/auth/login')) return envelope(loginPayload())
-      if (url.pathname.endsWith('/api/auth/me')) return envelope(user)
+      if (url.pathname.endsWith('/api/auth/me')) return envelope(sessionPayload())
       if (url.pathname.endsWith('/api/conversation/history')) return envelope({ items: [], nextCursor: null })
       throw new Error(`unexpected request: ${url.pathname}`)
     }))
@@ -256,7 +343,7 @@ describe('App authentication boundary', () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const request = input instanceof Request ? input : new Request(input)
       const url = new URL(request.url)
-      if (url.pathname.endsWith('/api/auth/me')) return envelope(user)
+      if (url.pathname.endsWith('/api/auth/me')) return envelope(sessionPayload())
       if (url.pathname.endsWith('/api/auth/logout')) return envelope(null)
       if (url.pathname.endsWith('/api/conversation/history')) return envelope({ items: [], nextCursor: null })
       if (url.pathname.endsWith('/api/conversation/private-thread/history')) {
@@ -267,7 +354,7 @@ describe('App authentication boundary', () => {
           status: 'idle',
           lastSeq: 0,
           snapshotSeq: 0,
-          snapshotVersion: 2,
+          snapshotVersion: 3,
           messageCount: 0,
           toolCallCount: 0,
           hasPendingInterrupt: false,
@@ -318,7 +405,7 @@ describe('App authentication boundary', () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const request = input instanceof Request ? input : new Request(input)
       const url = new URL(request.url)
-      if (url.pathname.endsWith('/api/auth/me')) return envelope(user)
+      if (url.pathname.endsWith('/api/auth/me')) return envelope(sessionPayload())
       if (url.pathname.endsWith('/api/conversation/history')) {
         return envelope({ items: [], nextCursor: null })
       }

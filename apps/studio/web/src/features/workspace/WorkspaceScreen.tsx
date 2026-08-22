@@ -450,6 +450,17 @@ export function WorkspaceScreen({
           : Promise.resolve(undefined),
       ])
       if (options.signal?.aborted) return
+      const activeSession = readActiveRunSession()
+      const preferredExists = preferredThreadId
+        ? Boolean(preferredDetail || response.items.some((item) => item.threadId === preferredThreadId))
+        : true
+      if (
+        (response.items.length === 0 && !preferredDetail)
+        || (
+          !preferredExists
+          && activeSession?.threadId === preferredThreadId
+        )
+      ) clearActiveRunSession(activeSession?.payload.runId)
       if (preferredDetail) prefetchedHistoryDetails.current.set(preferredThreadId, preferredDetail)
       setHistoryCursor(response.nextCursor ?? null)
       setWorkspace((state) => {

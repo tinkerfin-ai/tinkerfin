@@ -139,6 +139,7 @@ checkpoint 的 context 合同。
 | `expose_reasoning_events` | `False` | 是否交付支持的推理事件 |
 | `expose_subagent_events` | `True` | 是否交付子 Agent 事件 |
 | `prior_tool_call_ids` | `frozenset()` | 恢复前已经发送完成的 scoped Tool ID |
+| `private_state_keys` | `frozenset()` | 不进入公开投影的宿主顶层 state channel |
 | `on_event` | `None` | AG-UI 事件交付前的观察函数 |
 
 运行身份已经在 `TinkerFin.run(..., identity=...)` 中绑定，`astream_agui()` 不再重复接收 ID。

@@ -1,13 +1,13 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 
 import {
-  bootstrapAuthSession,
   login,
   logout as logoutApi,
 } from './api/auth/client'
 import { AuthScreen } from './features/auth/AuthScreen'
 import { LoginTransition } from './features/auth/LoginTransition'
+import { useAuthVerification } from './features/auth/useAuthVerification'
 import { WorkspaceScreen } from './features/workspace/WorkspaceScreen'
 import { ApiError, AuthError, subscribeApiErrors } from './api/shared/http'
 import { ToastViewport } from './components/ToastViewport'
@@ -17,12 +17,14 @@ import {
   createAuthSession,
   getAuthSession,
   saveAuthSession,
+  startAuthSessionLifecycle,
   subscribeAuthSession,
 } from './auth/session'
 import { writeThreadToLocation } from './lib/threadRoute'
 import { clearActiveRunSession } from './features/conversation/stream/activeRunSession'
 
 type AuthPhase = 'checking' | 'signedOut' | 'transitioning' | 'signedIn'
+type AuthEntry = 'restore' | 'manual'
 let toastSequence = 0
 
 export default function App() {
@@ -31,7 +33,27 @@ export default function App() {
   ))
   const [loginError, setLoginError] = useState<string>()
   const [isLoginPending, setLoginPending] = useState(false)
+  const [authCheckVersion, setAuthCheckVersion] = useState(0)
   const [toasts, setToasts] = useState<ToastItem[]>([])
+  const authEntry = useRef<AuthEntry>('restore')
+  const isAuthRetrying = useAuthVerification({
+    enabled: phase === 'checking',
+    version: authCheckVersion,
+    onAuthenticated: () => {
+      const entry = authEntry.current
+      authEntry.current = 'restore'
+      setPhase(
+        entry === 'manual'
+          && !window.matchMedia('(prefers-reduced-motion: reduce)').matches
+          ? 'transitioning'
+          : 'signedIn',
+      )
+    },
+    onUnauthenticated: () => {
+      clearAuthSession()
+      setPhase('signedOut')
+    },
+  })
 
   const pushToast = useCallback((kind: ToastKind, message: string) => {
     toastSequence += 1
@@ -45,31 +67,21 @@ export default function App() {
     pushToast('error', error.message)
   }), [pushToast])
 
-  useEffect(() => {
-    if (phase !== 'checking') return
-    let isActive = true
-    void bootstrapAuthSession().then((result) => {
-      if (!isActive) return
-      if (result.status === 'authenticated') {
-        setPhase('signedIn')
-        return
-      }
-      clearAuthSession()
-      writeThreadToLocation('')
-      if (result.error) pushToast('error', result.error.message)
-      setPhase('signedOut')
-    })
-    return () => {
-      isActive = false
-    }
-  }, [phase, pushToast])
-
   useEffect(() => subscribeAuthSession((session) => {
     if (session) return
+    authEntry.current = 'restore'
     clearActiveRunSession()
     setToasts([])
     writeThreadToLocation('')
     setPhase('signedOut')
+  }), [])
+
+  useEffect(() => startAuthSessionLifecycle({
+    onExternalSession: () => {
+      authEntry.current = 'restore'
+      setPhase((current) => current === 'signedOut' ? current : 'checking')
+      setAuthCheckVersion((current) => current + 1)
+    },
   }), [])
 
   useEffect(() => {
@@ -80,7 +92,10 @@ export default function App() {
 
   if (phase === 'checking') {
     content = (
-      <main className="auth-checking" aria-label="正在检查登录状态">
+      <main
+        className="auth-checking"
+        aria-label={isAuthRetrying ? '正在重新验证登录状态' : '正在检查登录状态'}
+      >
         <span className="auth-checking__mark" aria-hidden="true" />
       </main>
     )
@@ -94,16 +109,10 @@ export default function App() {
           setLoginError(undefined)
           try {
             const payload = await login(credentials)
+            authEntry.current = 'manual'
             saveAuthSession(createAuthSession(payload))
-            const verification = await bootstrapAuthSession()
-            if (verification.status !== 'authenticated') {
-              clearAuthSession()
-              if (verification.error) pushToast('error', verification.error.message)
-              return
-            }
-            setPhase(window.matchMedia('(prefers-reduced-motion: reduce)').matches
-              ? 'signedIn'
-              : 'transitioning')
+            setPhase('checking')
+            setAuthCheckVersion((current) => current + 1)
           } catch (error) {
             if (error instanceof AuthError) {
               setLoginError(error.message)

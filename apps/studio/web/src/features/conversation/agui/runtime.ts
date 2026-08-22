@@ -23,17 +23,12 @@ import type {
   Message,
   TodoItem,
   TodoStatus,
-  WorkspaceState,
 } from "../../../types"
-
-const LEGACY_SEED_CONVERSATION_IDS = new Set([
-  "new-conversation",
-  "cashflow-review",
-  "approval-demo",
-  "market-notes",
-  "deepagent-demo",
-])
-const DEFAULT_ALLOWED_DECISIONS: ApprovalAllowedDecision[] = ["approve", "edit", "reject"]
+import { parseToolReviewInterrupt } from "./toolReviewContract"
+import {
+  parseSubagentProvenance,
+  type SubagentProvenance,
+} from "./subagentProvenanceContract"
 
 export const createRunId = () =>
   `run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
@@ -71,9 +66,6 @@ const isStateTodo = (value: JsonValue): value is { content: string; status: "pen
 
 const toTodoStatus = (status: "pending" | "in_progress" | "completed"): TodoStatus =>
   status === "in_progress" ? "running" : status
-
-const isTransientMessage = (message: Message) =>
-  message.role === "process" || message.role === "approval"
 
 const findMessageIndex = (
   conversation: Conversation,
@@ -128,20 +120,12 @@ const approvalInputFromArgs = (args: JsonObject, fallback: string | undefined) =
   return fallback ?? "请确认该操作"
 }
 
-const isAllowedDecision = (value: JsonValue): value is ApprovalAllowedDecision =>
-  value === "approve" || value === "edit" || value === "reject" || value === "respond"
-
 const approvalItemsFromInterrupts = (interrupts: InterruptEvent[]): ApprovalItem[] =>
   interrupts.map((interrupt) => {
-    const metadata = (interrupt.metadata ?? {}) as JsonObject
-    const deepagents = ((metadata.deepagents ?? {}) as JsonObject)
-    const originalArgs = ((deepagents.originalArgs ?? {}) as JsonObject)
-    const allowedDecisions: ApprovalAllowedDecision[] = Array.isArray(deepagents.allowedDecisions)
-      ? deepagents.allowedDecisions.filter(isAllowedDecision)
-      : DEFAULT_ALLOWED_DECISIONS
-    const toolName = typeof deepagents.toolName === "string"
-      ? deepagents.toolName
-      : "tool"
+    const review = parseToolReviewInterrupt(interrupt)
+    const originalArgs = review.originalArgs
+    const allowedDecisions: ApprovalAllowedDecision[] = [...review.allowedDecisions]
+    const toolName = review.toolName
 
     return {
       id: interrupt.id,
@@ -333,8 +317,6 @@ const parseTaskDescriptor = (params: string) => {
   }
 }
 
-const graphTaskIdFromRunId = (runId: string) => runId.split(":sub:")[1]
-
 type ResolvedRawEventContext = RawEventContext & Required<
   Pick<RawEventContext, "streamMode" | "source">
 >
@@ -342,7 +324,12 @@ type ResolvedRawEventContext = RawEventContext & Required<
 const runIdForSource = (
   conversation: Conversation,
   rawEvent: ResolvedRawEventContext,
-) => rawEvent.runId ?? conversation.messages.find(
+) => (
+  rawEvent.source.agentType === "subagent"
+  && rawEvent.source.subagentInvocationId
+    ? rawEvent.source.subagentInvocationId
+    : rawEvent.runId
+) ?? conversation.messages.find(
   (message) =>
     message.role === "subagent"
     && rawEvent.source.graphTaskId != null
@@ -365,15 +352,37 @@ const rawEventOrMain = (
 
 const startSubagentRun = (
   conversation: Conversation,
-  subRunId: string,
-  parentRunId: string,
-  rawEvent: ResolvedRawEventContext,
+  provenance: SubagentProvenance,
 ): Conversation => {
-  if (conversation.messages.some(
+  const subRunId = provenance.subagentInvocationId
+  const existing = conversation.messages.find(
     (message) => message.role === "subagent" && message.meta?.subRunId === subRunId,
-  )) return conversation
+  )
+  if (existing) {
+    if (
+      existing.meta?.originMainRunId == null
+      || existing.meta?.agentName !== provenance.agentName
+      || existing.meta?.graphTaskId !== provenance.graphTaskId
+      || existing.meta?.toolCallId !== provenance.parentToolCallId
+      || existing.meta?.input !== provenance.description
+    ) throw new Error(`子 Agent 身份冲突: ${subRunId}`)
+    return updateMessage(
+      conversation,
+      (message) => message.id === existing.id,
+      (message) => ({
+        ...message,
+        meta: {
+          ...message.meta,
+          status: "running",
+          lastMainRunId: provenance.requestRunId,
+          completedAt: undefined,
+          durationMs: undefined,
+        },
+      }),
+    )
+  }
 
-  const graphTaskId = rawEvent.source.graphTaskId ?? undefined
+  const graphTaskId = provenance.graphTaskId
   const pendingTasks = conversation.messages.filter(
     (message) =>
       message.role === "tool"
@@ -381,9 +390,9 @@ const startSubagentRun = (
       && message.meta?.status === "running"
       && !message.meta?.subRunId,
   )
-  const task = rawEvent.parentToolCallId
-    ? pendingTasks.find((message) => message.meta?.toolCallId === rawEvent.parentToolCallId)
-    : undefined
+  const task = pendingTasks.find(
+    (message) => message.meta?.toolCallId === provenance.parentToolCallId,
+  )
   const createdAt = nowIso()
   const subagentMessage: Message = {
     id: subRunId,
@@ -391,14 +400,15 @@ const startSubagentRun = (
     content: task?.content ?? "子智能体运行",
     createdAt,
     meta: {
-      agentName: task?.meta?.agentName ?? rawEvent.source.agentName ?? "subagent",
-      input: rawEvent.subagentInput ?? task?.meta?.input ?? "",
+      agentName: provenance.agentName,
+      input: provenance.description,
       result: "",
       status: "running",
-      toolCallId: rawEvent.parentToolCallId ?? task?.meta?.toolCallId,
+      toolCallId: provenance.parentToolCallId,
       subRunId,
       runId: subRunId,
-      parentRunId,
+      originMainRunId: provenance.requestRunId,
+      lastMainRunId: provenance.requestRunId,
       graphTaskId,
     },
   }
@@ -520,162 +530,8 @@ const applyStateDelta = (current: JsonObject | undefined, delta: { path: string;
   return next && typeof next === "object" && !Array.isArray(next) ? next : {}
 }
 
-const normalizeConversationMessages = (messages: Message[]): Message[] => {
-  const stableMessages = messages.filter((message) => !isTransientMessage(message))
-  const explicitSubagentRunIds = new Set(
-    stableMessages.flatMap((message) => (
-      message.role === "subagent"
-      && message.meta?.toolName !== "task"
-      && message.meta?.subRunId
-        ? [message.meta.subRunId]
-        : []
-    )),
-  )
-  const seenSubagentRunIds = new Set<string>()
-
-  return stableMessages.flatMap((message): Message[] => {
-    const isTaskDerivedSubagent = message.role === "subagent" && message.meta?.toolName === "task"
-    const sourceMessage: Message = (
-      isTaskDerivedSubagent
-      && message.meta?.subRunId
-      && explicitSubagentRunIds.has(message.meta.subRunId)
-        // 持久化工作区可能把委派任务本身表示为子智能体卡片；这里恢复原始工具角色，
-        // 在显示独立嵌套运行卡片的同时保留完整 AG-UI 工具历史
-        ? { ...message, role: "tool" }
-        : message
-    )
-    const subRunId = sourceMessage.meta?.subRunId
-
-    const normalizedMessage: Message = (
-      sourceMessage.role === "tool"
-      && sourceMessage.meta?.toolName === "task"
-      && sourceMessage.meta?.agentName
-      && subRunId
-      && !explicitSubagentRunIds.has(subRunId)
-        ? {
-            ...sourceMessage,
-            role: "subagent",
-            meta: {
-              ...sourceMessage.meta,
-              runId: subRunId,
-              graphTaskId:
-                sourceMessage.meta.graphTaskId
-                ?? graphTaskIdFromRunId(subRunId),
-            },
-          }
-        : sourceMessage
-    )
-
-    const normalizedSubRunId = normalizedMessage.meta?.subRunId
-    if (normalizedMessage.role === "subagent" && normalizedSubRunId) {
-      if (seenSubagentRunIds.has(normalizedSubRunId)) return []
-      seenSubagentRunIds.add(normalizedSubRunId)
-    }
-
-    return [normalizedMessage]
-  })
-}
-
-type PersistedConversation = Partial<Conversation> & {
-  id?: unknown
-  threadId?: unknown
-  title?: unknown
-  pinned?: unknown
-  updatedAt?: unknown
-  model?: unknown
-  mode?: unknown
-  messages?: unknown
-  todos?: unknown
-  plan?: unknown
-  approval?: unknown
-  planInteraction?: unknown
-  runStatus?: unknown
-  activeRunId?: unknown
-  serverState?: unknown
-  lastSeq?: unknown
-}
-
-type PersistedWorkspaceState = {
-  conversations?: PersistedConversation[]
-  currentThreadId?: unknown
-  currentConversationId?: unknown
-}
-
-const isConversationRunStatus = (value: unknown): value is Conversation["runStatus"] =>
-  value === "idle" || value === "streaming" || value === "waiting_approval" || value === "detached" || value === "error"
-
 const isAgentMode = (value: unknown): value is AgentMode =>
   value === "default" || value === "plan"
-
-const legacyConversationIdFromPersistedConversation = (conversation: PersistedConversation): string =>
-  typeof conversation.id === "string" ? conversation.id : ""
-
-const threadIdFromPersistedConversation = (conversation: PersistedConversation): string => {
-  if (typeof conversation.threadId === "string" && conversation.threadId) {
-    return conversation.threadId
-  }
-  return legacyConversationIdFromPersistedConversation(conversation)
-}
-
-const legacyCurrentThreadIdFromPersistedWorkspace = (workspace: PersistedWorkspaceState): string =>
-  typeof workspace.currentConversationId === "string" ? workspace.currentConversationId : ""
-
-export const normalizeWorkspace = (workspace: PersistedWorkspaceState): WorkspaceState => {
-  const persistedConversations = Array.isArray(workspace.conversations) ? workspace.conversations : []
-  const conversations = persistedConversations
-    .filter((conversation) => !LEGACY_SEED_CONVERSATION_IDS.has(threadIdFromPersistedConversation(conversation)))
-    .map((conversation) => {
-      let nextConversation: Conversation = {
-        threadId: threadIdFromPersistedConversation(conversation),
-        title: typeof conversation.title === "string" && conversation.title ? conversation.title : "新会话",
-        pinned: Boolean(conversation.pinned),
-        updatedAt: typeof conversation.updatedAt === "string" ? conversation.updatedAt : nowIso(),
-        model: typeof conversation.model === "string" && conversation.model ? conversation.model : "GPT-5.5",
-        mode: isAgentMode(conversation.mode) ? conversation.mode : "default",
-        messages: normalizeConversationMessages(Array.isArray(conversation.messages) ? conversation.messages as Message[] : []),
-        todos: Array.isArray(conversation.todos) ? conversation.todos as TodoItem[] : [],
-        plan: (conversation.plan as Conversation["plan"] | undefined) ?? null,
-        approval: conversation.approval as Conversation["approval"],
-        planInteraction: conversation.planInteraction as Conversation["planInteraction"],
-        runStatus: isConversationRunStatus(conversation.runStatus) ? conversation.runStatus : "idle",
-        activeRunId: typeof conversation.activeRunId === "string" ? conversation.activeRunId : undefined,
-        serverState:
-          conversation.serverState && typeof conversation.serverState === "object" && !Array.isArray(conversation.serverState)
-            ? conversation.serverState as JsonObject
-            : undefined,
-        lastSeq: typeof conversation.lastSeq === "number" ? conversation.lastSeq : undefined,
-      }
-
-      if (nextConversation.runStatus === "streaming") {
-        nextConversation = setConversationNotice(
-          {
-            ...nextConversation,
-            runStatus: "detached",
-            activeRunId: undefined,
-            approval: nextConversation.approval
-              ? { ...nextConversation.approval, submitted: false }
-              : nextConversation.approval,
-          },
-          "页面已刷新。此前的实时输出连接已断开，如需继续请重新发起任务或处理当前审批。",
-          "info",
-        )
-      }
-
-      return nextConversation
-    })
-
-  const persistedCurrentThreadId = typeof workspace.currentThreadId === "string" && workspace.currentThreadId
-    ? workspace.currentThreadId
-    : legacyCurrentThreadIdFromPersistedWorkspace(workspace)
-  const currentThreadId = conversations.some((conversation) => conversation.threadId === persistedCurrentThreadId)
-    ? persistedCurrentThreadId
-    : (conversations[0]?.threadId ?? "")
-
-  return {
-    conversations,
-    currentThreadId: currentThreadId || conversations[0]?.threadId || "",
-  }
-}
 
 export const buildInitialPayload = (
   conversation: Conversation,
@@ -933,6 +789,43 @@ export const prepareResumeSubmission = (
   }
 }
 
+const restorePendingInteraction = (conversation: Conversation): Conversation => {
+  const approval = conversation.approval
+    ? { ...conversation.approval, submitted: false }
+    : undefined
+  if (approval) delete approval.error
+  const planInteraction = conversation.planInteraction
+    ? { ...conversation.planInteraction, submitted: false }
+    : undefined
+  if (planInteraction) delete planInteraction.error
+  const interruptByToolId = new Map<string, string>()
+  for (const item of approval?.items ?? []) {
+    if (item.toolCallId) interruptByToolId.set(item.toolCallId, item.interruptId)
+  }
+  return {
+    ...conversation,
+    runStatus: "waiting_approval",
+    activeRunId: undefined,
+    approval,
+    planInteraction,
+    messages: conversation.messages.map((message) => {
+      const toolCallId = message.meta?.toolCallId
+      const interruptId = toolCallId
+        ? interruptByToolId.get(toolCallId)
+        : undefined
+      if (message.role !== "tool" || !interruptId) return message
+      return {
+        ...message,
+        meta: {
+          ...message.meta,
+          status: "paused",
+          interruptId,
+        },
+      }
+    }),
+  }
+}
+
 export const applyConversationEvent = (
   conversation: Conversation,
   event: ConversationAgUiEvent,
@@ -953,55 +846,12 @@ export const applyConversationEvent = (
       const subagents = provenanceValue.subagents
       if (!Array.isArray(subagents)) return conversation
       return subagents.reduce((current, value) => {
-        if (!value || typeof value !== "object" || Array.isArray(value)) return current
-        const namespace = value.namespace
-        const graphTaskId = value.graphTaskId
-        const agentName = value.agentName
-        const parentToolCallId = value.parentToolCallId
-        const description = value.description
-        const runId = value.runId
-        const parentAgentRunId = value.parentAgentRunId
-        if (
-          !Array.isArray(namespace)
-          || !namespace.every((item): item is string => typeof item === "string" && Boolean(item))
-          || typeof graphTaskId !== "string"
-          || !graphTaskId
-          || typeof agentName !== "string"
-          || !agentName
-          || typeof parentToolCallId !== "string"
-          || !parentToolCallId
-          || typeof description !== "string"
-          || !description
-          || typeof runId !== "string"
-          || !runId
-          || typeof parentAgentRunId !== "string"
-          || !parentAgentRunId
-        ) return current
-        return startSubagentRun(current, runId, parentAgentRunId, {
-          streamMode: "tasks",
-          runId,
-          parentAgentRunId,
-          parentToolCallId,
-          subagentInput: description,
-          source: {
-            agentType: "subagent",
-            agentName,
-            namespace,
-            graphTaskId,
-          },
-        })
+        const provenance = parseSubagentProvenance(value)
+        return startSubagentRun(current, provenance)
       }, conversation)
     }
 
     case "RUN_STARTED": {
-      // 子智能体身份以项目 AG-UI 扩展 `rawEvent.source.agentType === "subagent"`
-      // 为准，不能用表示主运行分支或时间旅行谱系的标准字段 `parentRunId` 推断
-      const rawEvent = rawEventOrMain(conversation, event.rawEvent)
-      const isSubagent = rawEvent.source.agentType === "subagent"
-      if (isSubagent) {
-        const parentRunId = rawEvent.parentAgentRunId ?? event.parentRunId ?? ""
-        return startSubagentRun(conversation, event.runId, parentRunId, rawEvent)
-      }
       const persistedUserMessages: Message[] = (event.input?.messages ?? [])
         .filter((message) => message.role === "user" && typeof message.content === "string")
         .filter((message) => !conversation.messages.some((existing) => existing.id === message.id))
@@ -1012,25 +862,31 @@ export const applyConversationEvent = (
           createdAt: nowIso(),
         }))
       const isResume = (event.input?.resume?.length ?? 0) > 0
+      const initializationFailed = event.rawEvent?.initializationFailed === true
+      const preservePending = initializationFailed
+        && Boolean(conversation.approval || conversation.planInteraction)
+      const pending = preservePending
+        ? restorePendingInteraction(conversation)
+        : conversation
       const mode = isAgentMode(event.input?.forwardedProps?.mode)
         ? event.input.forwardedProps.mode
         : conversation.mode
       return {
-        ...conversation,
+        ...pending,
         threadId: event.threadId,
         title: event.title?.trim() || conversation.title,
         mode,
-        activeRunId: event.runId,
-        runStatus: "streaming",
+        activeRunId: preservePending ? undefined : event.runId,
+        runStatus: preservePending ? "waiting_approval" : "streaming",
         notice: undefined,
-        approval: isResume ? undefined : conversation.approval,
-        planInteraction: undefined,
+        approval: isResume && !preservePending ? undefined : pending.approval,
+        planInteraction: preservePending ? pending.planInteraction : undefined,
         messages: (
           persistedUserMessages.length > 0
-            ? [...conversation.messages, ...persistedUserMessages]
-            : conversation.messages
+            ? [...pending.messages, ...persistedUserMessages]
+            : pending.messages
         ).map((message) => (
-          isResume && message.meta?.status === "paused"
+          isResume && !preservePending && message.meta?.status === "paused"
             ? {
                 ...message,
                 meta: {
@@ -1261,10 +1117,11 @@ export const applyConversationEvent = (
             && message.meta?.toolCallId === event.toolCallId
             && message.meta?.toolName === "task",
         )
-        const relatedRunId = rawEvent.relatedRunId ?? taskMessage?.meta?.subRunId
-        if (taskMessage && relatedRunId) {
+        const relatedSubagentInvocationId = rawEvent.relatedSubagentInvocationId
+        if (taskMessage && relatedSubagentInvocationId) {
           const relatedSubagent = next.messages.find(
-            (message) => message.role === "subagent" && message.meta?.subRunId === relatedRunId,
+            (message) => message.role === "subagent"
+              && message.meta?.subRunId === relatedSubagentInvocationId,
           )
           const graphTaskId = relatedSubagent?.meta?.graphTaskId
           next = updateMessage(
@@ -1274,14 +1131,15 @@ export const applyConversationEvent = (
               ...message,
               meta: {
                 ...message.meta,
-                subRunId: relatedRunId,
+                subRunId: relatedSubagentInvocationId,
                 graphTaskId,
               },
             }),
           )
           next = updateMessage(
             next,
-            (message) => message.role === "subagent" && message.meta?.subRunId === relatedRunId,
+            (message) => message.role === "subagent"
+              && message.meta?.subRunId === relatedSubagentInvocationId,
             (message) => ({
               ...message,
               content: taskMessage.content,
@@ -1315,27 +1173,6 @@ export const applyConversationEvent = (
     case "RUN_FINISHED":
       {
         const outcome = event.outcome ?? { type: "success" as const }
-        const subagentMessage = conversation.messages.find(
-          (message) => message.role === "subagent" && message.meta?.subRunId === event.runId,
-        )
-        if (subagentMessage) {
-          const completedAt = nowIso()
-          return updateMessage(
-            conversation,
-            (message) => message.id === subagentMessage.id,
-            (message) => ({
-              ...message,
-              meta: {
-                ...message.meta,
-                status: outcome.type === "interrupt" ? "paused" : "completed",
-                completedAt,
-                durationMs: elapsedMs(message.createdAt, completedAt),
-              },
-            }),
-          )
-        }
-
-        // 嵌套运行会先于父任务结果结束；未知的非主运行不能终结整个会话
         if (conversation.activeRunId && event.runId !== conversation.activeRunId) {
           return conversation
         }
@@ -1380,21 +1217,20 @@ export const applyConversationEvent = (
     case "RUN_ERROR":
       {
         const rawEvent = rawEventOrMain(conversation, event.rawEvent)
-        if (rawEvent.source.agentType === "subagent") {
-          const completedAt = nowIso()
-          return updateSubagentRun(conversation, rawEvent, (message) => ({
-            ...message,
-            meta: {
-              ...message.meta,
-              status: "failed",
-              completedAt,
-              durationMs: elapsedMs(message.createdAt, completedAt),
-            },
-          }))
-        }
         const completedAt = nowIso()
         const errorMessage = event.message ?? "对话运行失败。"
         const isCancelled = event.code === "cancelled" || event.code === "resume_cancelled"
+        const errorRunId = rawEvent.runId ?? conversation.activeRunId
+        if (
+          rawEvent.initializationFailed === true
+          && (conversation.approval || conversation.planInteraction)
+        ) {
+          return setConversationNotice(
+            restorePendingInteraction(conversation),
+            errorMessage,
+            "error",
+          )
+        }
         return setConversationNotice(
           {
             ...conversation,
@@ -1405,6 +1241,10 @@ export const applyConversationEvent = (
             messages: conversation.messages.map((message) => (
               (message.role === "tool" || message.role === "subagent")
                 && (message.meta?.status === "running" || message.meta?.status === "paused")
+                && (
+                  message.meta?.subRunId == null
+                  || message.meta.lastMainRunId === errorRunId
+                )
                 ? {
                     ...message,
                     meta: {
@@ -1431,8 +1271,33 @@ export const applyConversationEvent = (
 }
 
 // ---------------------------------------------------------------------------
-// 历史恢复：v2 快照与严格有序的尾部事件
+// 历史恢复：v3 快照与严格有序的尾部事件
 // ---------------------------------------------------------------------------
+
+const currentSnapshot = (
+  detail: ConversationHistoryDetail,
+): ConversationSnapshotJson | null => {
+  if (detail.snapshotVersion !== 3) {
+    throw new Error("会话历史只接受 snapshotVersion=3")
+  }
+  if (detail.lastSeq < detail.snapshotSeq) {
+    throw new Error("会话历史 lastSeq 不能小于 snapshotSeq")
+  }
+  const snapshot = detail.snapshot ?? null
+  if (snapshot == null) {
+    if (detail.snapshotSeq !== 0) {
+      throw new Error("空会话快照必须对应 snapshotSeq=0")
+    }
+    return null
+  }
+  if (snapshot.snapshotVersion !== 3) {
+    throw new Error("会话历史快照只接受 snapshotVersion=3")
+  }
+  if (snapshot.snapshotSeq !== detail.snapshotSeq) {
+    throw new Error("会话历史快照序号与详情不一致")
+  }
+  return snapshot
+}
 
 const messagesFromSnapshot = (snapshot: ConversationSnapshotJson | null | undefined): Message[] => {
   if (!snapshot) return []
@@ -1445,19 +1310,17 @@ const messagesFromSnapshot = (snapshot: ConversationSnapshotJson | null | undefi
 /**
  * 按版本化历史契约恢复持久化会话
  *
- * 可信 v2 快照包含完整 UI 投影，只回放 `snapshotSeq` 之后的事件；
- * 没有可信快照时，后端返回完整事件日志并从序号零开始回放
+ * v3 快照包含完整 UI 投影，只回放 `snapshotSeq` 之后的事件；新会话允许
+ * `snapshot=null` 与 `snapshotSeq=0`，其他版本或序号矛盾直接拒绝
  */
 export const restoreConversationFromHistory = (
   detail: ConversationHistoryDetail,
   options: { model: string },
 ): Conversation => {
-  const snapshot = detail.snapshot ?? null
-  const hasTrustedV2Snapshot = detail.snapshotVersion === 2
-    && snapshot?.snapshotVersion === 2
-    && snapshot.snapshotSeq === detail.snapshotSeq
-  const snapshotPlanInteraction = hasTrustedV2Snapshot
-    ? planInteractionFromInterrupts(snapshot?.interrupts ?? [])
+  const snapshot = currentSnapshot(detail)
+  const hasSnapshot = snapshot != null
+  const snapshotPlanInteraction = hasSnapshot
+    ? planInteractionFromInterrupts(snapshot.interrupts)
     : undefined
   const baseline: Conversation = {
     threadId: detail.threadId,
@@ -1465,9 +1328,9 @@ export const restoreConversationFromHistory = (
     pinned: detail.pinned,
     updatedAt: detail.updatedAt,
     model: options.model,
-    mode: hasTrustedV2Snapshot && snapshot?.mode === "plan" ? "plan" : "default",
-    messages: hasTrustedV2Snapshot ? messagesFromSnapshot(snapshot) : [],
-    todos: hasTrustedV2Snapshot
+    mode: hasSnapshot && snapshot.mode === "plan" ? "plan" : "default",
+    messages: hasSnapshot ? messagesFromSnapshot(snapshot) : [],
+    todos: hasSnapshot
       ? snapshot.todos.map((todo) => {
           const restoredTodo = { ...todo }
           delete restoredTodo.targetMessageId
@@ -1475,7 +1338,7 @@ export const restoreConversationFromHistory = (
         })
       : [],
     plan: null,
-    approval: hasTrustedV2Snapshot && !snapshotPlanInteraction && snapshot.approval
+    approval: hasSnapshot && !snapshotPlanInteraction && snapshot.approval
       ? snapshot.approval
       : undefined,
     planInteraction: snapshotPlanInteraction,
@@ -1489,11 +1352,11 @@ export const restoreConversationFromHistory = (
         default: return "idle"
       }
     })(),
-    activeRunId: hasTrustedV2Snapshot
+    activeRunId: hasSnapshot
       ? snapshot.activeRunId ?? undefined
       : undefined,
-    serverState: hasTrustedV2Snapshot ? snapshot.serverState : {},
-    lastSeq: hasTrustedV2Snapshot ? detail.snapshotSeq : 0,
+    serverState: hasSnapshot ? snapshot.serverState : {},
+    lastSeq: hasSnapshot ? detail.snapshotSeq : 0,
   }
 
   const restored = detail.events.reduce<Conversation>(

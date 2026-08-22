@@ -46,6 +46,11 @@ async for event in events:
 | `expose_reasoning_events` | `False` | Emits supported reasoning events |
 | `expose_subagent_events` | `True` | Delivers subagent events |
 | `prior_tool_call_ids` | `frozenset()` | Complete scoped tool IDs emitted before resume |
+| `private_state_keys` | `frozenset()` | Top-level state channels omitted at known public projection boundaries |
+
+`private_state_keys` is explicit for the standalone converter because it cannot infer
+which host fields are private. It never deletes nested same-named fields. TinkerFin
+Plan Definitions provide their internal keys automatically.
 
 ## Encode events as SSE
 
@@ -127,5 +132,28 @@ kind, namespace, raw_id = codec.decode(public_id)
 ```
 
 Store the complete scoped ID. Raw tool IDs may repeat in different namespaces.
+
+## Parse framework extensions
+
+Tool approval metadata is fixed by `ToolReviewInterruptMetadata` and schema
+`tinkerfin.deepagents.tool-review.v1`:
+
+```python
+from tinkerfin_agui_adapter import parse_tool_review_interrupt
+
+
+review = parse_tool_review_interrupt(persisted_interrupt)
+print(review.tool_name, review.original_args.root)
+```
+
+The parser validates the complete interrupt, native action group, action index,
+decision policy, arguments, and scoped Tool ID. It does not accept unversioned shapes
+or client-supplied interrupt metadata.
+
+Deep Agents `task` calls publish `SubagentProvenance` with schema
+`tinkerfin.subagent-provenance.v1`. Its `subagentInvocationId` is stable across resume;
+`requestRunId` identifies the main request carrying the current event. Parent task
+results expose `relatedSubagentInvocationId`. These fields describe Agent nesting;
+standard AG-UI `parentRunId` retains branch and time-travel lineage semantics.
 
 Next: [AG-UI usage reference](api-reference.md).

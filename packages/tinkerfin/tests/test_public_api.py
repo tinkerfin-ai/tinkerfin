@@ -136,6 +136,7 @@ def test_source_binding_keeps_graph_arguments_at_the_factory_call_site() -> None
         "expose_reasoning_events",
         "expose_subagent_events",
         "prior_tool_call_ids",
+        "private_state_keys",
         "on_event",
     )
     assert not hasattr(TinkerFin, "run_agui")

@@ -150,6 +150,7 @@ def _wrap_agui_astream(
     settlement_timeout: float | None,
     expose_reasoning_events: bool,
     expose_subagent_events: bool,
+    private_state_keys: frozenset[str],
     resume: AgUiResumeBinding | None,
     on_event: EventObserver | None,
 ) -> AstreamT:
@@ -191,6 +192,7 @@ def _wrap_agui_astream(
             prior_tool_call_ids=(
                 frozenset() if resume is None else resume.prior_tool_call_ids
             ),
+            private_state_keys=private_state_keys,
             on_event=on_event,
         )
         claim.claim()
@@ -239,6 +241,7 @@ class DeepAgentAgUiRuntime(Generic[AstreamT]):
         settlement_timeout: float | None,
         expose_reasoning_events: bool,
         expose_subagent_events: bool,
+        private_state_keys: frozenset[str],
         resume: AgUiResumeBinding | None,
         on_event: EventObserver | None,
     ) -> None:
@@ -252,6 +255,7 @@ class DeepAgentAgUiRuntime(Generic[AstreamT]):
             settlement_timeout=settlement_timeout,
             expose_reasoning_events=expose_reasoning_events,
             expose_subagent_events=expose_subagent_events,
+            private_state_keys=private_state_keys,
             resume=resume,
             on_event=on_event,
         )
@@ -266,6 +270,7 @@ class DeepAgentDefinition(Generic[GraphT, AstreamT]):
         "_get_astream",
         "_kwargs",
         "_plan_options",
+        "_private_state_keys",
         "_tinkerfin",
     )
 
@@ -278,6 +283,7 @@ class DeepAgentDefinition(Generic[GraphT, AstreamT]):
         kwargs: dict[str, object],
         get_astream: Callable[[GraphT], AstreamT],
         plan_options: PlanOptions | None,
+        private_state_keys: frozenset[str],
     ) -> None:
         self._tinkerfin = tinkerfin
         self._factory = factory
@@ -285,6 +291,7 @@ class DeepAgentDefinition(Generic[GraphT, AstreamT]):
         self._kwargs = kwargs
         self._get_astream = get_astream
         self._plan_options = plan_options
+        self._private_state_keys = private_state_keys
 
     def new(
         self,
@@ -342,6 +349,7 @@ class DeepAgentDefinition(Generic[GraphT, AstreamT]):
             settlement_timeout=settlement_timeout,
             expose_reasoning_events=expose_reasoning_events,
             expose_subagent_events=expose_subagent_events,
+            private_state_keys=self._private_state_keys,
             resume=resume,
             on_event=on_event,
         )
@@ -405,7 +413,9 @@ class _EnhancedDeepAgentFactory(Generic[CreateP, GraphT, AstreamT]):
             if composed_state is not None:
                 definition_kwargs["state_schema"] = composed_state
             factory = cast(Callable[..., GraphT], _native_create_deep_agent)
+            private_state_keys: frozenset[str]
             if instance._plan_options is not None:
+                from .plan._state import PLAN_PRIVATE_STATE_KEYS
                 from .plan._workflow import prepare_plan_factory
 
                 factory = cast(
@@ -417,6 +427,9 @@ class _EnhancedDeepAgentFactory(Generic[CreateP, GraphT, AstreamT]):
                         instance._plan_options,
                     ),
                 )
+                private_state_keys = PLAN_PRIVATE_STATE_KEYS
+            else:
+                private_state_keys = frozenset()
             return DeepAgentDefinition(
                 tinkerfin=instance,
                 factory=factory,
@@ -424,6 +437,7 @@ class _EnhancedDeepAgentFactory(Generic[CreateP, GraphT, AstreamT]):
                 kwargs=definition_kwargs,
                 get_astream=self._get_astream,
                 plan_options=instance._plan_options,
+                private_state_keys=private_state_keys,
             )
 
         return create

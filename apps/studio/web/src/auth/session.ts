@@ -1,13 +1,16 @@
-import type { LoginResponse } from '../api/auth/types'
-import type { AuthUser } from '../api/auth/types'
+import type { AuthSessionResponse, AuthUser, LoginResponse } from '../api/auth/types'
 
 export const AUTH_SESSION_STORAGE_KEY = 'tinkerfin.auth.session.v1'
 
 export interface AuthSession {
   token: string
   tokenType: string
-  expiresAt: string | null
+  expiresAt: string
   user: AuthUser
+}
+
+export interface AuthSessionLifecycleOptions {
+  onExternalSession?: (session: AuthSession) => void
 }
 
 export interface AuthFailureEvent {
@@ -23,6 +26,25 @@ const failureListeners = new Set<FailureListener>()
 
 let currentSession: AuthSession | null | undefined
 
+function normalizeExpiresAt(value: string): string {
+  const timestamp = Date.parse(value)
+  if (!Number.isFinite(timestamp)) throw new TypeError('登录接口返回的固定到期时间无效')
+  return new Date(timestamp).toISOString()
+}
+
+function sessionsEqual(first: AuthSession | null | undefined, second: AuthSession | null) {
+  if (first == null || second == null) return first == null && second == null
+  return first.token === second.token
+    && first.tokenType === second.tokenType
+    && first.expiresAt === second.expiresAt
+    && first.user.user_id === second.user.user_id
+    && first.user.username === second.user.username
+    && first.user.display_name === second.user.display_name
+    && first.user.disabled === second.user.disabled
+    && first.user.roles.length === second.user.roles.length
+    && first.user.roles.every((role, index) => role === second.user.roles[index])
+}
+
 function canUseStorage() {
   return typeof window !== 'undefined' && typeof window.localStorage !== 'undefined'
 }
@@ -34,6 +56,7 @@ function isAuthUser(value: unknown): value is AuthUser {
     && typeof candidate.username === 'string'
     && typeof candidate.display_name === 'string'
     && Array.isArray(candidate.roles)
+    && candidate.roles.every((role) => typeof role === 'string')
     && typeof candidate.disabled === 'boolean'
 }
 
@@ -43,8 +66,13 @@ function isAuthSession(value: unknown): value is AuthSession {
   return typeof candidate.token === 'string'
     && candidate.token.length > 0
     && typeof candidate.tokenType === 'string'
-    && (typeof candidate.expiresAt === 'string' || candidate.expiresAt === null)
+    && typeof candidate.expiresAt === 'string'
+    && Number.isFinite(Date.parse(candidate.expiresAt))
     && isAuthUser(candidate.user)
+}
+
+export function isAuthSessionExpired(session: AuthSession, now = Date.now()): boolean {
+  return now >= Date.parse(session.expiresAt)
 }
 
 function readStoredSession(): AuthSession | null {
@@ -53,8 +81,16 @@ function readStoredSession(): AuthSession | null {
   if (!raw) return null
   try {
     const parsed = JSON.parse(raw) as unknown
-    return isAuthSession(parsed) ? parsed : null
+    if (!isAuthSession(parsed) || isAuthSessionExpired(parsed)) {
+      window.localStorage.removeItem(AUTH_SESSION_STORAGE_KEY)
+      return null
+    }
+    return {
+      ...parsed,
+      expiresAt: normalizeExpiresAt(parsed.expiresAt),
+    }
   } catch {
+    window.localStorage.removeItem(AUTH_SESSION_STORAGE_KEY)
     return null
   }
 }
@@ -74,25 +110,44 @@ function notifySessionListeners(session: AuthSession | null) {
 
 export function getAuthSession(): AuthSession | null {
   if (currentSession === undefined) currentSession = readStoredSession()
+  if (currentSession && isAuthSessionExpired(currentSession)) {
+    clearAuthSession()
+    return null
+  }
   return currentSession
 }
 
 export function saveAuthSession(session: AuthSession) {
-  currentSession = session
-  persistSession(session)
-  notifySessionListeners(session)
+  const normalized = {
+    ...session,
+    expiresAt: normalizeExpiresAt(session.expiresAt),
+  }
+  if (isAuthSessionExpired(normalized)) {
+    clearAuthSession()
+    return
+  }
+  currentSession = normalized
+  persistSession(normalized)
+  notifySessionListeners(normalized)
 }
 
 export function clearAuthSession() {
+  const hadSession = currentSession != null
+    || (canUseStorage() && window.localStorage.getItem(AUTH_SESSION_STORAGE_KEY) != null)
   currentSession = null
   persistSession(null)
-  notifySessionListeners(null)
+  if (hadSession) notifySessionListeners(null)
 }
 
-export function updateAuthUser(user: AuthUser) {
+export function updateAuthSession(payload: AuthSessionResponse): AuthSession | null {
   const session = getAuthSession()
-  if (!session) return
-  saveAuthSession({ ...session, user })
+  if (!session) return null
+  saveAuthSession({
+    ...session,
+    expiresAt: normalizeExpiresAt(payload.expires_at),
+    user: payload.user,
+  })
+  return getAuthSession()
 }
 
 export function subscribeAuthSession(listener: SessionListener) {
@@ -123,9 +178,62 @@ export function createAuthSession(payload: LoginResponse): AuthSession {
   return {
     token: payload.access_token,
     tokenType: payload.token_type || 'Bearer',
-    expiresAt: payload.expires_in > 0
-      ? new Date(Date.now() + payload.expires_in * 1000).toISOString()
-      : null,
+    expiresAt: normalizeExpiresAt(payload.expires_at),
     user: payload.user,
+  }
+}
+
+export function startAuthSessionLifecycle(
+  options: AuthSessionLifecycleOptions = {},
+): () => void {
+  let expiryTimer: number | null = null
+
+  const clearExpiryTimer = () => {
+    if (expiryTimer == null) return
+    window.clearTimeout(expiryTimer)
+    expiryTimer = null
+  }
+
+  const scheduleExpiry = (session: AuthSession | null) => {
+    clearExpiryTimer()
+    if (!session) return
+    const delay = Date.parse(session.expiresAt) - Date.now()
+    if (delay <= 0) {
+      clearAuthSession()
+      return
+    }
+    expiryTimer = window.setTimeout(() => {
+      expiryTimer = null
+      const current = getAuthSession()
+      if (current) scheduleExpiry(current)
+    }, Math.min(delay, 2_147_483_647))
+  }
+
+  const recheckExpiry = () => scheduleExpiry(getAuthSession())
+  const handleVisibilityChange = () => {
+    if (document.visibilityState === 'visible') recheckExpiry()
+  }
+  const handleStorage = (event: StorageEvent) => {
+    if (event.key !== AUTH_SESSION_STORAGE_KEY) return
+    const previous = currentSession
+    const next = readStoredSession()
+    if (sessionsEqual(previous, next)) return
+    currentSession = next
+    notifySessionListeners(next)
+    if (next) options.onExternalSession?.(next)
+  }
+
+  const unsubscribe = subscribeAuthSession(scheduleExpiry)
+  window.addEventListener('focus', recheckExpiry)
+  window.addEventListener('storage', handleStorage)
+  document.addEventListener('visibilitychange', handleVisibilityChange)
+  scheduleExpiry(getAuthSession())
+
+  return () => {
+    clearExpiryTimer()
+    unsubscribe()
+    window.removeEventListener('focus', recheckExpiry)
+    window.removeEventListener('storage', handleStorage)
+    document.removeEventListener('visibilitychange', handleVisibilityChange)
   }
 }

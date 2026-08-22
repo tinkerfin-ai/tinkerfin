@@ -1,8 +1,10 @@
 """认证和用户 HTTP 边界模型"""
 
+from datetime import datetime
+
 from pydantic import BaseModel, ConfigDict, Field
 
-from tinkerfin_studio.auth.types import UserContext
+from tinkerfin_studio.auth.types import AuthenticatedSession, UserContext
 
 
 class UserRead(BaseModel):
@@ -30,10 +32,24 @@ class LoginRequest(BaseModel):
     password: str = Field(min_length=1, max_length=1024, description="明文登录密码")
 
 
-class LoginResponse(BaseModel):
+class AuthSessionRead(BaseModel):
+    """后端已确认且具有固定到期时间的登录会话"""
+
+    expires_at: datetime = Field(description="访问令牌的 UTC 固定到期时间")
+    user: UserRead = Field(description="当前登录用户")
+
+    @classmethod
+    def from_context(cls, context: AuthenticatedSession) -> "AuthSessionRead":
+        """从可信认证会话构造响应"""
+
+        return cls(
+            expires_at=context.expires_at,
+            user=UserRead.from_context(context.user),
+        )
+
+
+class LoginResponse(AuthSessionRead):
     """登录成功响应"""
 
     access_token: str = Field(description="访问令牌")
     token_type: str = Field(default="Bearer", description="令牌类型")
-    expires_in: int = Field(ge=1, description="剩余有效秒数")
-    user: UserRead = Field(description="当前登录用户")

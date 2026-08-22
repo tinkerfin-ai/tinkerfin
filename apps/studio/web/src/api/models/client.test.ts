@@ -12,7 +12,7 @@ it('loads the safe backend model catalog with authentication', async () => {
   saveAuthSession({
     token: 'model-token',
     tokenType: 'Bearer',
-    expiresAt: null,
+    expiresAt: '2099-01-01T00:00:00.000Z',
     user: { user_id: 7, username: 'alice', display_name: 'Alice', roles: [], disabled: false },
   })
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {

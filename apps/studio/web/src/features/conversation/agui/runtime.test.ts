@@ -3,20 +3,35 @@ import { describe, expect, it } from 'vitest'
 import type { ConversationAgUiEvent, InterruptEvent } from '../../../api/conversation/types'
 import type { ConversationEventEnvelope, ConversationHistoryDetail } from '../../../api/conversation/history'
 import { buildEmptyConversation } from '../../../lib/workspace'
-import type { ApprovalItem, Conversation, Message, PlanReviewState, WorkspaceState } from '../../../types'
-import { applyConversationEvent, applyHistoryEventEnvelope, buildPlanAbandonPayload, buildPlanResumePayload, buildResumePayload, markConversationDetached, normalizeWorkspace, prepareResumeSubmission, restoreConversationFromHistory } from './runtime'
+import type { ApprovalAllowedDecision, ApprovalItem, Conversation, PlanReviewState } from '../../../types'
+import { applyConversationEvent, applyHistoryEventEnvelope, buildPlanAbandonPayload, buildPlanResumePayload, buildResumePayload, markConversationDetached, prepareResumeSubmission, restoreConversationFromHistory } from './runtime'
 
 const THREAD_ID = 'thread-order-check'
 const RUN_ID = 'run-order-check'
 
 function nativeContractEvents(): ConversationAgUiEvent[] {
-  const subRunId = `${RUN_ID}:sub:graph-research`
+  const subRunId = 'subagent-11111111-1111-5111-8111-111111111111'
   const mainSource = { agentType: 'main' as const, agentName: 'main', namespace: [] }
+  const provenance = {
+    schema: 'tinkerfin.subagent-provenance.v1' as const,
+    subagentInvocationId: subRunId,
+    namespace: ['tools:graph-research'],
+    parentNamespace: [],
+    graphTaskId: 'graph-research',
+    agentName: 'researcher',
+    parentToolCallId: 'call-task',
+    description: '研究百度与 Google',
+    requestRunId: RUN_ID,
+  }
   const subSource = {
     agentType: 'subagent' as const,
     agentName: 'researcher',
-    namespace: ['tools:graph-research'],
+    namespace: [...provenance.namespace],
+    parentNamespace: [],
     graphTaskId: 'graph-research',
+    parentToolCallId: 'call-task',
+    subagentInput: provenance.description,
+    subagentInvocationId: subRunId,
   }
   return [
     { type: 'RUN_STARTED', threadId: THREAD_ID, runId: RUN_ID },
@@ -58,23 +73,25 @@ function nativeContractEvents(): ConversationAgUiEvent[] {
       rawEvent: { streamMode: 'messages', source: mainSource, runId: RUN_ID },
     },
     {
-      type: 'RUN_STARTED',
-      threadId: THREAD_ID,
-      runId: subRunId,
-      rawEvent: {
-        streamMode: 'tasks',
-        source: subSource,
-        runId: subRunId,
-        parentAgentRunId: RUN_ID,
-        parentToolCallId: 'call-task',
-        subagentInput: '研究百度与 Google',
+      type: 'RAW',
+      source: 'langgraph.tasks',
+      rawEvent: { type: 'tasks', phase: 'start', ns: [] },
+      event: {
+        data: { id: 'graph-research', name: 'tools' },
+        provenance: {
+          kind: 'root',
+          namespace: [],
+          agentType: 'main',
+          agentName: 'main',
+          subagents: [provenance],
+        },
       },
     },
     {
       type: 'TOOL_CALL_START',
       toolCallId: 'call-read',
       toolCallName: 'read_file',
-      rawEvent: { streamMode: 'messages', source: subSource, runId: subRunId },
+      rawEvent: { streamMode: 'messages', source: subSource, runId: RUN_ID },
     },
     {
       type: 'TOOL_CALL_RESULT',
@@ -82,14 +99,7 @@ function nativeContractEvents(): ConversationAgUiEvent[] {
       messageId: 'message-read',
       content: '百度与 Google 调研资料',
       role: 'tool',
-      rawEvent: { streamMode: 'messages', source: subSource, runId: subRunId },
-    },
-    {
-      type: 'RUN_FINISHED',
-      threadId: THREAD_ID,
-      runId: subRunId,
-      outcome: { type: 'success' },
-      rawEvent: { streamMode: 'messages', source: subSource, runId: subRunId },
+      rawEvent: { streamMode: 'messages', source: subSource, runId: RUN_ID },
     },
     {
       type: 'TOOL_CALL_RESULT',
@@ -101,7 +111,7 @@ function nativeContractEvents(): ConversationAgUiEvent[] {
         streamMode: 'messages',
         source: mainSource,
         runId: RUN_ID,
-        relatedRunId: subRunId,
+        relatedSubagentInvocationId: subRunId,
       },
     },
     { type: 'TEXT_MESSAGE_START', messageId: 'message-final', role: 'assistant' },
@@ -118,20 +128,32 @@ function nativeContractEvents(): ConversationAgUiEvent[] {
 function interrupt(
   overrides: Partial<InterruptEvent> & Pick<InterruptEvent, 'id'>,
 ): InterruptEvent {
+  const originalArgs = {
+    file_path: `${overrides.id}.txt`,
+    content: overrides.id,
+  }
+  const allowedDecisions: ApprovalAllowedDecision[] = ['approve', 'edit', 'reject']
   return {
     id: overrides.id,
     reason: overrides.reason ?? 'tool_call',
     message: overrides.message ?? `审批 ${overrides.id}`,
-    toolCallId: overrides.toolCallId,
+    toolCallId: overrides.toolCallId ?? `scoped-tool:${overrides.id}`,
     responseSchema: overrides.responseSchema,
     metadata: overrides.metadata ?? {
+      langgraphValue: {
+        action_requests: [{ name: 'write_file', args: originalArgs }],
+        review_configs: [{
+          action_name: 'write_file',
+          allowed_decisions: allowedDecisions,
+        }],
+      },
       deepagents: {
+        schema: 'tinkerfin.deepagents.tool-review.v1',
+        nativeInterruptId: overrides.id,
+        actionIndex: 0,
         toolName: 'write_file',
-        allowedDecisions: ['approve', 'edit', 'reject'],
-        originalArgs: {
-          file_path: `${overrides.id}.txt`,
-          content: overrides.id,
-        },
+        allowedDecisions,
+        originalArgs,
       },
     },
   }
@@ -139,13 +161,17 @@ function interrupt(
 
 describe('AG-UI runtime reducer', () => {
   it('uses server-owned RAW task identities for live subagent cards and child tools', () => {
-    const subRunId = 'subrun-server-owned'
+    const subRunId = 'subagent-22222222-2222-5222-8222-222222222222'
     const mainSource = { agentType: 'main' as const, agentName: 'main', namespace: [] }
     const subSource = {
       agentType: 'subagent' as const,
       agentName: 'researcher',
       namespace: ['tools:graph-server'],
       graphTaskId: 'graph-server',
+      parentNamespace: [],
+      parentToolCallId: 'call-task-server',
+      subagentInput: '检索 LangGraph',
+      subagentInvocationId: subRunId,
     }
     const events: ConversationAgUiEvent[] = [
       { type: 'RUN_STARTED', threadId: THREAD_ID, runId: RUN_ID },
@@ -176,13 +202,15 @@ describe('AG-UI runtime reducer', () => {
             agentType: 'main',
             agentName: 'main',
             subagents: [{
+              schema: 'tinkerfin.subagent-provenance.v1',
+              subagentInvocationId: subRunId,
               namespace: ['tools:graph-server'],
+              parentNamespace: [],
               graphTaskId: 'graph-server',
               agentName: 'researcher',
               parentToolCallId: 'call-task-server',
               description: '检索 LangGraph',
-              runId: subRunId,
-              parentAgentRunId: RUN_ID,
+              requestRunId: RUN_ID,
             }],
           },
         },
@@ -194,10 +222,7 @@ describe('AG-UI runtime reducer', () => {
         rawEvent: {
           streamMode: 'messages',
           source: subSource,
-          runId: subRunId,
-          parentAgentRunId: RUN_ID,
-          parentToolCallId: 'call-task-server',
-          subagentInput: '检索 LangGraph',
+          runId: RUN_ID,
         },
       },
       {
@@ -209,10 +234,7 @@ describe('AG-UI runtime reducer', () => {
         rawEvent: {
           streamMode: 'messages',
           source: subSource,
-          runId: subRunId,
-          parentAgentRunId: RUN_ID,
-          parentToolCallId: 'call-task-server',
-          subagentInput: '检索 LangGraph',
+          runId: RUN_ID,
           toolResultStatus: 'success',
         },
       },
@@ -226,7 +248,7 @@ describe('AG-UI runtime reducer', () => {
           streamMode: 'messages',
           source: mainSource,
           runId: RUN_ID,
-          relatedRunId: subRunId,
+          relatedSubagentInvocationId: subRunId,
           toolResultStatus: 'success',
         },
       },
@@ -253,7 +275,8 @@ describe('AG-UI runtime reducer', () => {
       result: '子 Agent 完成',
       status: 'completed',
       runId: subRunId,
-      parentRunId: RUN_ID,
+      originMainRunId: RUN_ID,
+      lastMainRunId: RUN_ID,
       graphTaskId: 'graph-server',
     })
     expect(childTool?.meta).toMatchObject({
@@ -267,17 +290,95 @@ describe('AG-UI runtime reducer', () => {
     expect(task?.meta?.subRunId).toBe(subRunId)
   })
 
+  it('keeps one subagent card while a resumed descriptor updates its current main run', () => {
+    const subRunId = 'subagent-cccccccc-cccc-5ccc-8ccc-cccccccccccc'
+    const graphTaskId = 'graph-resume'
+    const parentToolCallId = 'call-task-resume'
+    const descriptor = (requestRunId: string) => ({
+      schema: 'tinkerfin.subagent-provenance.v1' as const,
+      subagentInvocationId: subRunId,
+      namespace: [`tools:${graphTaskId}`],
+      parentNamespace: [],
+      graphTaskId,
+      agentName: 'researcher',
+      parentToolCallId,
+      description: '继续研究',
+      requestRunId,
+    })
+    const rawStart = (requestRunId: string): ConversationAgUiEvent => ({
+      type: 'RAW',
+      source: 'langgraph.tasks',
+      rawEvent: { type: 'tasks', phase: 'start', ns: [] },
+      event: {
+        data: { id: graphTaskId, name: 'tools' },
+        provenance: {
+          kind: 'root',
+          namespace: [],
+          agentType: 'main',
+          agentName: 'main',
+          subagents: [descriptor(requestRunId)],
+        },
+      },
+    })
+    let current = buildEmptyConversation({
+      threadId: THREAD_ID,
+      model: 'main',
+      now: '2026-08-18T00:00:00.000Z',
+    })
+    for (const event of [
+      { type: 'RUN_STARTED', threadId: THREAD_ID, runId: 'run-origin' },
+      {
+        type: 'TOOL_CALL_START',
+        toolCallId: parentToolCallId,
+        toolCallName: 'task',
+      },
+      rawStart('run-origin'),
+      { type: 'RUN_STARTED', threadId: THREAD_ID, runId: 'run-resume' },
+      rawStart('run-resume'),
+      {
+        type: 'TOOL_CALL_RESULT',
+        toolCallId: parentToolCallId,
+        messageId: 'task-resume-result',
+        content: '完成',
+        role: 'tool',
+        rawEvent: {
+          streamMode: 'messages',
+          source: { agentType: 'main', agentName: 'main', namespace: [] },
+          runId: 'run-resume',
+          relatedSubagentInvocationId: subRunId,
+          toolResultStatus: 'success',
+        },
+      },
+    ] as ConversationAgUiEvent[]) current = applyConversationEvent(current, event)
+
+    const subagents = current.messages.filter((message) => message.role === 'subagent')
+    expect(subagents).toHaveLength(1)
+    expect(subagents[0].meta).toMatchObject({
+      subRunId,
+      originMainRunId: 'run-origin',
+      lastMainRunId: 'run-resume',
+      status: 'completed',
+      result: '完成',
+    })
+  })
+
   it('isolates parallel server subruns that share one graph task id', () => {
     const mainSource = { agentType: 'main' as const, agentName: 'main', namespace: [] }
     const graphTaskId = 'shared-graph-task'
-    const descriptors = ['a', 'b'].map((suffix) => ({
+    const invocationIds = {
+      a: 'subagent-77777777-7777-5777-8777-777777777777',
+      b: 'subagent-88888888-8888-5888-8888-888888888888',
+    } as const
+    const descriptors = (['a', 'b'] as const).map((suffix) => ({
+      schema: 'tinkerfin.subagent-provenance.v1' as const,
+      subagentInvocationId: invocationIds[suffix],
       namespace: [`tools:${graphTaskId}:${suffix}`],
+      parentNamespace: [],
       graphTaskId,
       agentName: 'researcher',
       parentToolCallId: `call-task-${suffix}`,
       description: `研究任务 ${suffix.toUpperCase()}`,
-      runId: `subrun-server-${suffix}`,
-      parentAgentRunId: RUN_ID,
+      requestRunId: RUN_ID,
     }))
     const rawStart: ConversationAgUiEvent = {
       type: 'RAW',
@@ -323,28 +424,30 @@ describe('AG-UI runtime reducer', () => {
         agentName: descriptor.agentName,
         namespace: descriptor.namespace,
         graphTaskId,
+        parentNamespace: [],
+        parentToolCallId: descriptor.parentToolCallId,
+        subagentInput: descriptor.description,
+        subagentInvocationId: descriptor.subagentInvocationId,
       }
       return [
         {
           type: 'TEXT_MESSAGE_START',
-          messageId: `message-${descriptor.runId}`,
+          messageId: `message-${descriptor.subagentInvocationId}`,
           role: 'assistant',
           rawEvent: {
             streamMode: 'messages',
             source,
-            runId: descriptor.runId,
-            parentAgentRunId: RUN_ID,
+            runId: RUN_ID,
           },
         },
         {
           type: 'TEXT_MESSAGE_CONTENT',
-          messageId: `message-${descriptor.runId}`,
-          delta: `结果 ${descriptor.runId}`,
+          messageId: `message-${descriptor.subagentInvocationId}`,
+          delta: `结果 ${descriptor.subagentInvocationId}`,
           rawEvent: {
             streamMode: 'messages',
             source,
-            runId: descriptor.runId,
-            parentAgentRunId: RUN_ID,
+            runId: RUN_ID,
           },
         },
       ]
@@ -353,19 +456,23 @@ describe('AG-UI runtime reducer', () => {
 
     expect(subagents).toHaveLength(2)
     expect(subagents.map((message) => [message.meta?.subRunId, message.meta?.result])).toEqual([
-      ['subrun-server-a', '结果 subrun-server-a'],
-      ['subrun-server-b', '结果 subrun-server-b'],
+      [invocationIds.a, `结果 ${invocationIds.a}`],
+      [invocationIds.b, `结果 ${invocationIds.b}`],
     ])
   })
 
   it('fails a discovered subrun and its child tools when the main run errors', () => {
-    const subRunId = 'subrun-main-error'
+    const subRunId = 'subagent-33333333-3333-5333-8333-333333333333'
     const mainSource = { agentType: 'main' as const, agentName: 'main', namespace: [] }
     const subSource = {
       agentType: 'subagent' as const,
       agentName: 'researcher',
       namespace: ['tools:graph-main-error'],
       graphTaskId: 'graph-main-error',
+      parentNamespace: [],
+      parentToolCallId: 'call-task-main-error',
+      subagentInput: '执行研究',
+      subagentInvocationId: subRunId,
     }
     const events: ConversationAgUiEvent[] = [
       { type: 'RUN_STARTED', threadId: THREAD_ID, runId: RUN_ID },
@@ -387,13 +494,15 @@ describe('AG-UI runtime reducer', () => {
             agentType: 'main',
             agentName: 'main',
             subagents: [{
+              schema: 'tinkerfin.subagent-provenance.v1',
+              subagentInvocationId: subRunId,
               namespace: subSource.namespace,
+              parentNamespace: [],
               graphTaskId: subSource.graphTaskId,
               agentName: subSource.agentName,
               parentToolCallId: 'call-task-main-error',
               description: '执行研究',
-              runId: subRunId,
-              parentAgentRunId: RUN_ID,
+              requestRunId: RUN_ID,
             }],
           },
         },
@@ -405,8 +514,7 @@ describe('AG-UI runtime reducer', () => {
         rawEvent: {
           streamMode: 'messages',
           source: subSource,
-          runId: subRunId,
-          parentAgentRunId: RUN_ID,
+          runId: RUN_ID,
         },
       },
       {
@@ -725,23 +833,27 @@ describe('AG-UI runtime reducer', () => {
     expect(afterMainReasoning).toBe(initial)
     expect(afterMainReasoning.messages).toHaveLength(0)
 
-    const subRunId = `${RUN_ID}:sub:graph-reasoning`
-    const withSubagent = applyConversationEvent(initial, {
-      type: 'RUN_STARTED',
-      threadId: THREAD_ID,
-      runId: subRunId,
-      rawEvent: {
-        streamMode: 'messages',
-        source: {
-          agentType: 'subagent',
+    const subRunId = 'subagent-44444444-4444-5444-8444-444444444444'
+    const withSubagent: Conversation = {
+      ...initial,
+      messages: [{
+        id: subRunId,
+        role: 'subagent',
+        content: '研究任务',
+        createdAt: '2026-08-18T00:00:00.000Z',
+        meta: {
           agentName: 'researcher',
-          namespace: ['tools:graph-reasoning'],
+          input: '研究任务',
+          result: '',
+          status: 'running',
+          subRunId,
+          runId: subRunId,
+          originMainRunId: RUN_ID,
+          lastMainRunId: RUN_ID,
           graphTaskId: 'graph-reasoning',
         },
-        runId: subRunId,
-        parentAgentRunId: RUN_ID,
-      },
-    })
+      }],
+    }
     const subRawEvent = {
       streamMode: 'messages' as const,
       source: {
@@ -749,8 +861,9 @@ describe('AG-UI runtime reducer', () => {
         agentName: 'researcher',
         namespace: ['tools:graph-reasoning'],
         graphTaskId: 'graph-reasoning',
+        subagentInvocationId: subRunId,
       },
-      runId: subRunId,
+      runId: RUN_ID,
     }
     const subReasoning: ConversationAgUiEvent[] = [
       { type: 'REASONING_START', rawEvent: subRawEvent, messageId: 'reasoning-sub' },
@@ -828,11 +941,19 @@ describe('AG-UI runtime reducer', () => {
       current = applyConversationEvent(current, event)
     }
     const mainSource = { agentType: 'main' as const, agentName: 'main', namespace: [] }
-    const subSource = (graphTaskId: string) => ({
+    const subRunIds = {
+      a: 'subagent-aaaaaaaa-aaaa-5aaa-8aaa-aaaaaaaaaaaa',
+      b: 'subagent-bbbbbbbb-bbbb-5bbb-8bbb-bbbbbbbbbbbb',
+    } as const
+    const subSource = (suffix: 'a' | 'b') => ({
       agentType: 'subagent' as const,
       agentName: 'researcher',
-      namespace: [`tools:${graphTaskId}`],
-      graphTaskId,
+      namespace: [`tools:graph-${suffix}`],
+      parentNamespace: [],
+      graphTaskId: `graph-${suffix}`,
+      parentToolCallId: `task-${suffix}`,
+      subagentInput: `研究任务 ${suffix.toUpperCase()}`,
+      subagentInvocationId: subRunIds[suffix],
     })
 
     apply({ type: 'RUN_STARTED', threadId: THREAD_ID, runId: RUN_ID })
@@ -855,29 +976,40 @@ describe('AG-UI runtime reducer', () => {
       })
     }
 
-    for (const suffix of ['a', 'b']) {
+    for (const suffix of ['a', 'b'] as const) {
       const graphTaskId = `graph-${suffix}`
-      const subRunId = `${RUN_ID}:sub:${graphTaskId}`
-      const subRunContext = {
-        streamMode: 'messages' as const,
-        source: subSource(graphTaskId),
-        runId: subRunId,
-        parentAgentRunId: RUN_ID,
-        parentToolCallId: `task-${suffix}`,
-        subagentInput: `研究任务 ${suffix.toUpperCase()}`,
-      }
+      const subRunId = subRunIds[suffix]
       apply({
-        type: 'RUN_STARTED',
-        threadId: THREAD_ID,
-        runId: subRunId,
-        rawEvent: subRunContext,
+        type: 'RAW',
+        source: 'langgraph.tasks',
+        rawEvent: { type: 'tasks', phase: 'start', ns: [] },
+        event: {
+          data: { id: graphTaskId, name: 'tools' },
+          provenance: {
+            kind: 'root',
+            namespace: [],
+            agentType: 'main',
+            agentName: 'main',
+            subagents: [{
+              schema: 'tinkerfin.subagent-provenance.v1',
+              subagentInvocationId: subRunId,
+              namespace: [`tools:${graphTaskId}`],
+              parentNamespace: [],
+              graphTaskId,
+              agentName: 'researcher',
+              parentToolCallId: `task-${suffix}`,
+              description: `研究任务 ${suffix.toUpperCase()}`,
+              requestRunId: RUN_ID,
+            }],
+          },
+        },
       })
       apply({
         type: 'TOOL_CALL_START',
         rawEvent: {
           streamMode: 'messages',
-          source: subSource(graphTaskId),
-          runId: subRunId,
+          source: subSource(suffix),
+          runId: RUN_ID,
         },
         toolCallId: `child-tool-${suffix}`,
         toolCallName: 'web_search',
@@ -886,8 +1018,8 @@ describe('AG-UI runtime reducer', () => {
     }
 
     const runningSubagents = current.messages.filter((message) => message.role === 'subagent')
-    const runningSubagentA = runningSubagents.find((message) => message.meta?.subRunId?.endsWith('graph-a'))
-    const runningSubagentB = runningSubagents.find((message) => message.meta?.subRunId?.endsWith('graph-b'))
+    const runningSubagentA = runningSubagents.find((message) => message.meta?.subRunId === subRunIds.a)
+    const runningSubagentB = runningSubagents.find((message) => message.meta?.subRunId === subRunIds.b)
     const runningTaskA = current.messages.find((message) => message.meta?.toolCallId === 'task-a')
     const runningTaskB = current.messages.find((message) => message.meta?.toolCallId === 'task-b')
 
@@ -895,25 +1027,17 @@ describe('AG-UI runtime reducer', () => {
     expect(runningSubagentA?.meta?.toolCallId).toBe('task-a')
     expect(runningSubagentB?.meta?.input).toBe('研究任务 B')
     expect(runningSubagentB?.meta?.toolCallId).toBe('task-b')
-    expect(runningTaskA?.meta?.subRunId).toBe(`${RUN_ID}:sub:graph-a`)
-    expect(runningTaskB?.meta?.subRunId).toBe(`${RUN_ID}:sub:graph-b`)
+    expect(runningTaskA?.meta?.subRunId).toBe(subRunIds.a)
+    expect(runningTaskB?.meta?.subRunId).toBe(subRunIds.b)
 
-    apply({
-      type: 'RUN_FINISHED',
-      threadId: THREAD_ID,
-      runId: `${RUN_ID}:sub:graph-b`,
-      outcome: { type: 'success' },
-    })
-    expect(current.runStatus).toBe('streaming')
-
-    for (const suffix of ['b', 'a']) {
+    for (const suffix of ['b', 'a'] as const) {
       apply({
         type: 'TOOL_CALL_RESULT',
         rawEvent: {
           streamMode: 'messages',
           source: mainSource,
           runId: RUN_ID,
-          relatedRunId: `${RUN_ID}:sub:graph-${suffix}`,
+          relatedSubagentInvocationId: subRunIds[suffix],
         },
         messageId: `task-result-${suffix}`,
         toolCallId: `task-${suffix}`,
@@ -923,8 +1047,8 @@ describe('AG-UI runtime reducer', () => {
     }
 
     const subagents = current.messages.filter((message) => message.role === 'subagent')
-    const subagentA = subagents.find((message) => message.meta?.subRunId?.endsWith('graph-a'))
-    const subagentB = subagents.find((message) => message.meta?.subRunId?.endsWith('graph-b'))
+    const subagentA = subagents.find((message) => message.meta?.subRunId === subRunIds.a)
+    const subagentB = subagents.find((message) => message.meta?.subRunId === subRunIds.b)
     const childToolA = current.messages.find((message) => message.meta?.toolCallId === 'child-tool-a')
     const childToolB = current.messages.find((message) => message.meta?.toolCallId === 'child-tool-b')
 
@@ -935,73 +1059,6 @@ describe('AG-UI runtime reducer', () => {
     expect(subagentB?.meta?.result).toBe('最终结果 B')
     expect(childToolA?.meta?.runId).toBe(subagentA?.meta?.subRunId)
     expect(childToolB?.meta?.runId).toBe(subagentB?.meta?.subRunId)
-  })
-
-  it('keeps subagent normalization idempotent across refreshes and preserves sibling runs', () => {
-    const conversation = buildEmptyConversation({
-      threadId: 'thread-refresh-subagents',
-      now: '2026-08-05T00:00:00.000Z',
-      model: 'GPT-5.5',
-    })
-    const messages = ['a', 'b'].flatMap<Message>((suffix) => {
-      const subRunId = `${RUN_ID}:sub:graph-${suffix}`
-      const sharedMeta = {
-        agentName: 'researcher',
-        subRunId,
-        runId: subRunId,
-        parentRunId: RUN_ID,
-        graphTaskId: `graph-${suffix}`,
-        status: 'completed' as const,
-      }
-      return [
-        {
-          id: `legacy-task-card-${suffix}`,
-          role: 'subagent',
-          content: `研究任务 ${suffix.toUpperCase()}`,
-          createdAt: `2026-08-05T00:00:0${suffix === 'a' ? '1' : '3'}.000Z`,
-          meta: {
-            ...sharedMeta,
-            toolName: 'task',
-            toolCallId: `task-${suffix}`,
-          },
-        },
-        {
-          id: `subagent-${subRunId}`,
-          role: 'subagent',
-          content: `研究任务 ${suffix.toUpperCase()}`,
-          createdAt: `2026-08-05T00:00:0${suffix === 'a' ? '2' : '4'}.000Z`,
-          meta: {
-            ...sharedMeta,
-            input: `研究任务 ${suffix.toUpperCase()}`,
-            result: `最终结果 ${suffix.toUpperCase()}`,
-          },
-        },
-      ]
-    })
-    const workspace: WorkspaceState = {
-      conversations: [{ ...conversation, messages }],
-      currentThreadId: conversation.threadId,
-    }
-
-    const once = normalizeWorkspace(workspace)
-    const twice = normalizeWorkspace(JSON.parse(JSON.stringify(once)) as WorkspaceState)
-    const subagents = twice.conversations[0].messages.filter((message) => message.role === 'subagent')
-    const taskTools = twice.conversations[0].messages.filter(
-      (message) => message.role === 'tool' && message.meta?.toolName === 'task',
-    )
-
-    expect(subagents).toHaveLength(2)
-    expect(taskTools).toHaveLength(2)
-    expect(taskTools.map((message) => message.meta?.subRunId)).toEqual([
-      `${RUN_ID}:sub:graph-a`,
-      `${RUN_ID}:sub:graph-b`,
-    ])
-    expect(subagents.map((message) => message.id)).toEqual([
-      `subagent-${RUN_ID}:sub:graph-a`,
-      `subagent-${RUN_ID}:sub:graph-b`,
-    ])
-    expect(new Set(subagents.map((message) => message.meta?.subRunId)).size).toBe(2)
-    expect(twice).toEqual(once)
   })
 
   it('keeps interrupt order stable when preparing multi-item resume payloads', () => {
@@ -1285,7 +1342,73 @@ describe('AG-UI runtime reducer', () => {
     expect(confirmedByServer.runStatus).toBe('streaming')
   })
 
-  it('marks only the failed subagent when a nested RUN_ERROR arrives', () => {
+  it('preserves pending approval when a resumed Runtime fails during initialization', () => {
+    const started = applyConversationEvent(
+      buildEmptyConversation({
+        threadId: THREAD_ID,
+        now: '2026-08-05T00:00:00.000Z',
+        model: 'GPT-5.5',
+      }),
+      { type: 'RUN_STARTED', threadId: THREAD_ID, runId: RUN_ID },
+    )
+    const withTool = applyConversationEvent(started, {
+      type: 'TOOL_CALL_START',
+      toolCallId: 'call-init-failure',
+      toolCallName: 'write_file',
+    })
+    const interrupted = applyConversationEvent(withTool, {
+      type: 'RUN_FINISHED',
+      threadId: THREAD_ID,
+      runId: RUN_ID,
+      outcome: {
+        type: 'interrupt',
+        interrupts: [interrupt({
+          id: 'interrupt-init-failure',
+          toolCallId: 'call-init-failure',
+        })],
+      },
+    })
+    const submitted = prepareResumeSubmission(
+      interrupted,
+      ['interrupt-init-failure'],
+    )
+    expect(submitted.approval?.submitted).toBe(true)
+    expect(submitted.messages.find(
+      (message) => message.meta?.toolCallId === 'call-init-failure',
+    )?.meta?.status).toBe('running')
+    const initializationStarted = applyConversationEvent(submitted, {
+      type: 'RUN_STARTED',
+      threadId: THREAD_ID,
+      runId: `${RUN_ID}-resume`,
+      rawEvent: { runId: `${RUN_ID}-resume`, initializationFailed: true },
+      input: {
+        threadId: THREAD_ID,
+        runId: `${RUN_ID}-resume`,
+        resume: [{
+          interruptId: 'interrupt-init-failure',
+          status: 'resolved',
+          payload: { type: 'approve' },
+        }],
+      },
+    })
+    const failed = applyConversationEvent(initializationStarted, {
+      type: 'RUN_ERROR',
+      message: 'Runtime 初始化失败',
+      code: 'runtime_initialization_error',
+      rawEvent: { runId: `${RUN_ID}-resume`, initializationFailed: true },
+    })
+
+    expect(initializationStarted.runStatus).toBe('waiting_approval')
+    expect(initializationStarted.approval).toEqual(interrupted.approval)
+    expect(failed.runStatus).toBe('waiting_approval')
+    expect(failed.approval).toEqual(interrupted.approval)
+    expect(failed.messages.find(
+      (message) => message.meta?.toolCallId === 'call-init-failure',
+    )?.meta?.status).toBe('paused')
+    expect(failed.notice).toEqual({ kind: 'error', content: 'Runtime 初始化失败' })
+  })
+
+  it('marks only the related subagent when its parent task result fails', () => {
     const initial = applyConversationEvent(
       buildEmptyConversation({
         threadId: THREAD_ID,
@@ -1304,39 +1427,45 @@ describe('AG-UI runtime reducer', () => {
         runId: RUN_ID,
       },
     })
-    const subRunId = `${RUN_ID}:sub:graph-error`
+    const subRunId = 'subagent-55555555-5555-5555-8555-555555555555'
     const running = applyConversationEvent(task, {
-      type: 'RUN_STARTED',
-      threadId: THREAD_ID,
-      runId: subRunId,
-      rawEvent: {
-        streamMode: 'tasks',
-        source: {
-          agentType: 'subagent',
-          agentName: 'researcher',
-          namespace: ['tools:graph-error'],
-          graphTaskId: 'graph-error',
+      type: 'RAW',
+      source: 'langgraph.tasks',
+      rawEvent: { type: 'tasks', phase: 'start', ns: [] },
+      event: {
+        data: { id: 'graph-error', name: 'tools' },
+        provenance: {
+          kind: 'root',
+          namespace: [],
+          agentType: 'main',
+          agentName: 'main',
+          subagents: [{
+            schema: 'tinkerfin.subagent-provenance.v1',
+            subagentInvocationId: subRunId,
+            namespace: ['tools:graph-error'],
+            parentNamespace: [],
+            graphTaskId: 'graph-error',
+            agentName: 'researcher',
+            parentToolCallId: 'call-subagent-error',
+            description: '失败任务',
+            requestRunId: RUN_ID,
+          }],
         },
-        runId: subRunId,
-        parentAgentRunId: RUN_ID,
-        parentToolCallId: 'call-subagent-error',
-        subagentInput: '失败任务',
       },
     })
 
     const failed = applyConversationEvent(running, {
-      type: 'RUN_ERROR',
-      message: '子智能体运行失败',
-      code: 'task_error',
+      type: 'TOOL_CALL_RESULT',
+      toolCallId: 'call-subagent-error',
+      messageId: 'call-subagent-error-result',
+      content: '子智能体运行失败',
+      role: 'tool',
       rawEvent: {
-        streamMode: 'tasks',
-        source: {
-          agentType: 'subagent',
-          agentName: 'researcher',
-          namespace: ['tools:graph-error'],
-          graphTaskId: 'graph-error',
-        },
-        runId: subRunId,
+        streamMode: 'messages',
+        source: { agentType: 'main', agentName: 'main', namespace: [] },
+        runId: RUN_ID,
+        relatedSubagentInvocationId: subRunId,
+        toolResultStatus: 'error',
       },
     })
 
@@ -1358,7 +1487,7 @@ describe('AG-UI runtime reducer', () => {
       lastRunId: RUN_ID,
       lastSeq: 3,
       snapshotSeq: 0,
-      snapshotVersion: 2,
+      snapshotVersion: 3,
       messageCount: 2,
       toolCallCount: 0,
       hasPendingInterrupt: false,
@@ -1434,14 +1563,14 @@ describe('AG-UI runtime reducer', () => {
       lastRunId: RUN_ID,
       lastSeq: 7,
       snapshotSeq: 7,
-      snapshotVersion: 2,
+      snapshotVersion: 3,
       messageCount: 0,
       toolCallCount: 1,
       hasPendingInterrupt: true,
       pinned: false,
       snapshot: {
         snapshotSeq: 7,
-        snapshotVersion: 2,
+        snapshotVersion: 3,
         messages: [],
         todos: [],
         mode: 'default',
@@ -1471,7 +1600,17 @@ describe('AG-UI runtime reducer', () => {
           toolCallId,
           message: '确认历史写入',
           metadata: {
+            langgraphValue: {
+              action_requests: [{ name: 'write_file', args: originalArgs }],
+              review_configs: [{
+                action_name: 'write_file',
+                allowed_decisions: ['approve', 'edit', 'reject'],
+              }],
+            },
             deepagents: {
+              schema: 'tinkerfin.deepagents.tool-review.v1',
+              nativeInterruptId: interruptId,
+              actionIndex: 0,
               toolName: 'write_file',
               originalArgs,
               allowedDecisions: ['approve', 'edit', 'reject'],
@@ -1503,7 +1642,7 @@ describe('AG-UI runtime reducer', () => {
       lastRunId: RUN_ID,
       lastSeq: 1,
       snapshotSeq: 0,
-      snapshotVersion: 2,
+      snapshotVersion: 3,
       messageCount: 0,
       toolCallCount: 0,
       hasPendingInterrupt: false,
@@ -1536,7 +1675,7 @@ describe('AG-UI runtime reducer', () => {
   })
 
   it('replays the full event log to restore tool cards, sub-agent cards and resolved HITL state', () => {
-    const SUB_RUN_ID = `${RUN_ID}:sub:task-0`
+    const SUB_RUN_ID = 'subagent-66666666-6666-5666-8666-666666666666'
     const events: ConversationEventEnvelope[] = [
       {
         seq: 1,
@@ -1625,16 +1764,30 @@ describe('AG-UI runtime reducer', () => {
       {
         seq: 6,
         eventId: 'evt-sub-start',
-        eventType: 'RUN_STARTED',
+        eventType: 'RAW',
         event: {
-          type: 'RUN_STARTED',
-          threadId: THREAD_ID,
-          runId: SUB_RUN_ID,
-          rawEvent: {
-            streamMode: 'messages',
-            source: { agentType: 'subagent', agentName: 'researcher', namespace: ['task'], graphTaskId: 'task-0' },
-            runId: SUB_RUN_ID,
-            parentAgentRunId: RUN_ID,
+          type: 'RAW',
+          source: 'langgraph.tasks',
+          rawEvent: { type: 'tasks', phase: 'start', ns: [] },
+          event: {
+            data: { id: 'task-0', name: 'tools' },
+            provenance: {
+              kind: 'root',
+              namespace: [],
+              agentType: 'main',
+              agentName: 'main',
+              subagents: [{
+                schema: 'tinkerfin.subagent-provenance.v1',
+                subagentInvocationId: SUB_RUN_ID,
+                namespace: ['tools:task-0'],
+                parentNamespace: [],
+                graphTaskId: 'task-0',
+                agentName: 'researcher',
+                parentToolCallId: 'tool-task',
+                description: '帮我搜索',
+                requestRunId: RUN_ID,
+              }],
+            },
           },
         },
         createdAt: '2026-08-05T00:00:00.000Z',
@@ -1678,7 +1831,7 @@ describe('AG-UI runtime reducer', () => {
       status: 'idle',
       lastSeq: 9,
       snapshotSeq: 0,
-      snapshotVersion: 2,
+      snapshotVersion: 3,
       messageCount: 1,
       toolCallCount: 1,
       hasPendingInterrupt: false,
@@ -1708,29 +1861,29 @@ describe('AG-UI runtime reducer', () => {
     expect(restored.approval).toBeUndefined()
   })
 
-  it('hydrates a v2 UI snapshot with complete sub-agent input and applies only tail events', () => {
+  it('hydrates the v3 UI snapshot with complete sub-agent input and applies only tail events', () => {
     const snapshotCreatedAt = '2026-08-05T00:00:00.000Z'
     const tailCreatedAt = '2026-08-05T00:00:01.000Z'
     const detail: ConversationHistoryDetail = {
       id: 4,
       threadId: THREAD_ID,
-      title: 'v2 快照',
+      title: 'v3 快照',
       status: 'idle',
       lastRunId: RUN_ID,
       lastSeq: 12,
       snapshotSeq: 10,
-      snapshotVersion: 2,
+      snapshotVersion: 3,
       messageCount: 3,
       toolCallCount: 1,
       hasPendingInterrupt: false,
       pinned: false,
       snapshot: {
         snapshotSeq: 10,
-        snapshotVersion: 2,
+        snapshotVersion: 3,
         messages: [
-          { id: 'user-v2', role: 'user', content: '研究一下', createdAt: snapshotCreatedAt },
+          { id: 'user-v3', role: 'user', content: '研究一下', createdAt: snapshotCreatedAt },
           {
-            id: 'subagent-v2',
+            id: 'subagent-v3',
             role: 'subagent',
             content: '研究任务',
             createdAt: snapshotCreatedAt,
@@ -1738,18 +1891,18 @@ describe('AG-UI runtime reducer', () => {
               agentName: 'researcher',
               input: '对比 A 与 B，并给出处',
               status: 'completed',
-              subRunId: `${RUN_ID}:sub:task-v2`,
-              graphTaskId: 'task-v2',
+              subRunId: `${RUN_ID}:sub:task-v3`,
+              graphTaskId: 'task-v3',
             },
           },
-          { id: 'assistant-v2', role: 'assistant', content: '已有', createdAt: snapshotCreatedAt },
+          { id: 'assistant-v3', role: 'assistant', content: '已有', createdAt: snapshotCreatedAt },
         ],
         todos: [
           {
-            id: 'todo-v2',
+            id: 'todo-v3',
             content: '历史 Todo',
             status: 'completed',
-            targetMessageId: 'tool-write-todos-v2',
+            targetMessageId: 'tool-write-todos-v3',
           },
         ],
         mode: 'plan',
@@ -1768,7 +1921,7 @@ describe('AG-UI runtime reducer', () => {
           eventType: 'TEXT_MESSAGE_CONTENT',
           event: {
             type: 'TEXT_MESSAGE_CONTENT',
-            messageId: 'assistant-v2',
+            messageId: 'assistant-v3',
             delta: '内容',
           },
           createdAt: tailCreatedAt,
@@ -1786,16 +1939,74 @@ describe('AG-UI runtime reducer', () => {
     }
 
     const restored = restoreConversationFromHistory(detail, { model: 'GPT-5.5' })
-    const subagent = restored.messages.find((message) => message.id === 'subagent-v2')
+    const subagent = restored.messages.find((message) => message.id === 'subagent-v3')
     expect(restored.todos[0]?.targetMessageId).toBeUndefined()
-    const assistant = restored.messages.find((message) => message.id === 'assistant-v2')
+    const assistant = restored.messages.find((message) => message.id === 'assistant-v3')
 
     expect(subagent?.meta?.input).toBe('对比 A 与 B，并给出处')
     expect(assistant?.content).toBe('已有内容')
-    expect(restored.messages.filter((message) => message.id === 'assistant-v2')).toHaveLength(1)
+    expect(restored.messages.filter((message) => message.id === 'assistant-v3')).toHaveLength(1)
     expect(restored.mode).toBe('plan')
     expect(restored.lastSeq).toBe(12)
     expect(restored.runStatus).toBe('idle')
+  })
+
+  it('rejects non-v3 and internally inconsistent history snapshots', () => {
+    const detail: ConversationHistoryDetail = {
+      id: 40,
+      threadId: THREAD_ID,
+      title: '严格 v3 快照',
+      status: 'idle',
+      lastSeq: 1,
+      snapshotSeq: 1,
+      snapshotVersion: 3,
+      messageCount: 0,
+      toolCallCount: 0,
+      hasPendingInterrupt: false,
+      pinned: false,
+      snapshot: {
+        snapshotSeq: 1,
+        snapshotVersion: 3,
+        messages: [],
+        todos: [],
+        mode: 'default',
+        approval: null,
+        runStatus: 'idle',
+        activeRunId: null,
+        serverState: {},
+        runs: {},
+        activities: [],
+        interrupts: [],
+      },
+      events: [],
+      createdAt: '2026-08-05T00:00:00.000Z',
+      updatedAt: '2026-08-05T00:00:00.000Z',
+    }
+    const nonCurrentDetail = {
+      ...detail,
+      snapshotVersion: 2,
+    } as unknown as ConversationHistoryDetail
+    const nonCurrentSnapshot = {
+      ...detail,
+      snapshot: { ...detail.snapshot!, snapshotVersion: 2 },
+    } as unknown as ConversationHistoryDetail
+    const mismatchedSequence = {
+      ...detail,
+      snapshot: { ...detail.snapshot!, snapshotSeq: 0 },
+    } as ConversationHistoryDetail
+    const missingSnapshot = {
+      ...detail,
+      snapshot: null,
+    } as ConversationHistoryDetail
+
+    expect(() => restoreConversationFromHistory(nonCurrentDetail, { model: 'GPT-5.5' }))
+      .toThrow('会话历史只接受 snapshotVersion=3')
+    expect(() => restoreConversationFromHistory(nonCurrentSnapshot, { model: 'GPT-5.5' }))
+      .toThrow('会话历史快照只接受 snapshotVersion=3')
+    expect(() => restoreConversationFromHistory(mismatchedSequence, { model: 'GPT-5.5' }))
+      .toThrow('会话历史快照序号与详情不一致')
+    expect(() => restoreConversationFromHistory(missingSnapshot, { model: 'GPT-5.5' }))
+      .toThrow('空会话快照必须对应 snapshotSeq=0')
   })
 
   it('uses persisted event timestamps for restored message timing', () => {
@@ -1808,7 +2019,7 @@ describe('AG-UI runtime reducer', () => {
       status: 'idle',
       lastSeq: 4,
       snapshotSeq: 0,
-      snapshotVersion: 2,
+      snapshotVersion: 3,
       messageCount: 1,
       toolCallCount: 1,
       hasPendingInterrupt: false,
@@ -1870,7 +2081,7 @@ describe('AG-UI runtime reducer', () => {
       lastRunId: RUN_ID,
       lastSeq: 1,
       snapshotSeq: 0,
-      snapshotVersion: 2,
+      snapshotVersion: 3,
       messageCount: 0,
       toolCallCount: 0,
       hasPendingInterrupt: false,

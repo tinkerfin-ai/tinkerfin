@@ -41,7 +41,6 @@ from tinkerfin_studio.conversation.run_preparation import (
     PreparedRunRequest,
     enrich_main_event,
 )
-from tinkerfin_studio.conversation.subagent_events import SubagentRunEventEnricher
 from tinkerfin_studio.models.schemas import AgentModelConfig
 
 _SUBAGENTS_PATH = Path(__file__).with_name("subagents.yaml")
@@ -177,16 +176,9 @@ class ConversationAgentFactory:
                     identity=prepared.identity,
                 )
 
-            enrich_subagent_runs = SubagentRunEventEnricher(
-                user_id=user_id,
-                thread_id=prepared.protocol_input.thread_id,
-                main_run_id=prepared.identity.run_id,
-            )
-
             def attach_run_metadata(event: BaseEvent) -> BaseEvent:
-                """发布服务端会话元数据与子 Agent 身份"""
+                """发布服务端会话元数据"""
 
-                event = enrich_subagent_runs(event)
                 return enrich_main_event(event, prepared=prepared, title=title)
 
             return MessageSourceBinding(

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 
 import pytest
-from ag_ui.core import BaseEvent, RunErrorEvent, RunStartedEvent
+from ag_ui.core import BaseEvent, RunErrorEvent, RunStartedEvent, StateSnapshotEvent
 from langchain_core.messages import AIMessageChunk
 from pydantic import ValidationError
 
@@ -78,6 +79,33 @@ async def test_low_level_agui_stream_keeps_its_immutable_identity() -> None:
     assert stream.messaging_identity is identity
     assert started.input is None
     await stream.aclose()
+
+
+@pytest.mark.asyncio
+async def test_low_level_agui_applies_explicit_top_level_private_state_policy() -> None:
+    private_key = "_host_private"
+
+    async def parts() -> AsyncIterator[object]:
+        yield {
+            "type": "values",
+            "ns": (),
+            "data": {
+                private_key: "internal",
+                "nested": {private_key: "business-value"},
+            },
+            "interrupts": (),
+        }
+
+    events = [
+        event
+        async for event in TinkerFin()
+        .run(parts, identity=_identity())
+        .astream_agui(private_state_keys=frozenset({private_key}))
+    ]
+    snapshot = next(event for event in events if isinstance(event, StateSnapshotEvent))
+    assert snapshot.snapshot == {
+        "nested": {private_key: "business-value"},
+    }
 
 
 @pytest.mark.asyncio
@@ -342,17 +370,30 @@ async def test_agui_abort_from_terminal_observer_is_an_idempotent_noop() -> None
 
 
 @pytest.mark.asyncio
-async def test_agui_records_conversion_error_and_emits_one_error_terminal() -> None:
+async def test_agui_records_conversion_error_and_emits_one_error_terminal(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     async def parts() -> AsyncIterator[object]:
         yield {"type": "not-a-stream-mode", "ns": (), "data": {}}
 
     stream = TinkerFin().run(parts, identity=_identity()).astream_agui()
-    events = [event async for event in stream]
+    with caplog.at_level(logging.ERROR, logger="tinkerfin.runtime"):
+        events = [event async for event in stream]
 
     terminals = [event for event in events if isinstance(event, RunErrorEvent)]
     assert len(terminals) == 1
+    assert terminals[0].message == "Agent run failed"
     assert isinstance(stream.error, AgUiStreamContractError)
     assert isinstance(stream.error.cause, ValidationError)
+    record = next(
+        item
+        for item in caplog.records
+        if item.getMessage() == "AG-UI runtime conversion failed"
+    )
+    assert record.__dict__["thread_id"] == "thread-1"
+    assert record.__dict__["run_id"] == "run-1"
+    assert record.__dict__["error_code"] == "runtime_error"
+    assert record.__dict__["error_type"] == "AgUiStreamContractError"
 
 
 @pytest.mark.asyncio

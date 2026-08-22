@@ -97,6 +97,7 @@ def _persisted_tool_interrupt(
         "metadata": {
             "langgraphValue": langgraph_value,
             "deepagents": {
+                "schema": "tinkerfin.deepagents.tool-review.v1",
                 "nativeInterruptId": interrupt_id,
                 "actionIndex": 0,
                 "toolName": tool_name,

@@ -95,6 +95,23 @@ store and cache. Keep the same `Identity.threadId` when resuming. Plan state app
 `tinkerfin_plan` key, and public models such as `PlanDraft`, `ConfirmedPlan`, and
 `PlanState` are exported from `tinkerfin.plan`.
 
+When the configured main execution middleware includes `TodoListMiddleware`, each
+`write_todos` call commits the current Todo list to the authoritative parent state and
+parent checkpoint before later execution Tools run. The normal Tool Start/Args/End and
+Result lifecycle remains intact. A Tool interrupt snapshot and the first resumed
+snapshot therefore contain the same latest Todos. Todo telemetry is not a replacement
+for `ConfirmedPlan` steps or acceptance criteria. Ordinary `task` subagents and unknown
+compiled subgraphs cannot overwrite this root projection. Files remain part of the
+root-visible Deep Agent state and are synchronized when execution returns or crosses a
+Todo parent boundary.
+
+The Planner has only read-only filesystem tools for optional workspace inspection.
+That restricted list is not the execution Deep Agent's capability list: the Planner
+can include user-requested execution tools in a draft but never calls or tests them
+itself. Approving a Plan starts execution immediately without another general Plan
+approval request. Tool-specific human review, such as a configured `write_file`
+interrupt, still applies during execution.
+
 The built-in `DefaultClarificationForm` is used when `.plan(...)` omits
 `clarification_schema`. Hosts that need typed question or option metadata can define a
 concrete `ClarificationForm` in application code and pass that type to `.plan(...)`.

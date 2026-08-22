@@ -43,6 +43,7 @@ def _translation() -> ResumeTranslation:
                 ],
             },
             "deepagents": {
+                "schema": "tinkerfin.deepagents.tool-review.v1",
                 "nativeInterruptId": "interrupt-1",
                 "actionIndex": 0,
                 "toolName": "write_file",

@@ -679,6 +679,33 @@ describe('useConversationStreamController', () => {
     expect(wasAborted).toBe(true)
   })
 
+  it('aborts an active stream on unmount without cancelling the durable run', async () => {
+    let streamSignal: AbortSignal | undefined
+    clientMocks.start.mockImplementation(async function* (
+      _payload: ChatRequestPayload,
+      signal?: AbortSignal,
+    ): AsyncGenerator<StreamedAgUiEvent> {
+      streamSignal = signal
+      await new Promise<void>((resolve) => {
+        if (signal?.aborted) resolve()
+        else signal?.addEventListener('abort', () => resolve(), { once: true })
+      })
+      yield* []
+    })
+    const { result, unmount } = renderHook(() => useControllerHarness(conversation()))
+    let running: Promise<void>
+    act(() => {
+      running = result.current.controller.streamRun(THREAD_ID, payload, 'start')
+    })
+    await waitFor(() => expect(result.current.controller.hasActiveStream()).toBe(true))
+
+    unmount()
+    await act(async () => running)
+
+    expect(streamSignal?.aborted).toBe(true)
+    expect(clientMocks.cancel).not.toHaveBeenCalled()
+  })
+
   it('clears delayed catch-up after unmount', async () => {
     vi.useFakeTimers()
     clientMocks.start.mockImplementation(() => streamItems([]))

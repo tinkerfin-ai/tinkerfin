@@ -821,6 +821,7 @@ async def test_plan_parent_exposes_files_and_todos_on_the_default_route() -> Non
             AIMessage(content="done"),
         ]
     )
+    saver = InMemorySaver()
     definition = (
         TinkerFin()
         .plan(enabled=True)
@@ -828,21 +829,184 @@ async def test_plan_parent_exposes_files_and_todos_on_the_default_route() -> Non
             model=model,
             tools=[],
             middleware=(TodoListMiddleware(),),
-            checkpointer=InMemorySaver(),
+            checkpointer=saver,
         )
     )
-
-    parts = await _parts(
-        definition,
-        {"messages": [HumanMessage(content="Create the result")]},
-        run_id="root-files-todos",
-        config={"configurable": {"thread_id": "plan-thread"}},
+    config: RunnableConfig = {"configurable": {"thread_id": "plan-thread"}}
+    runtime = definition.new(
+        identity=_identity("root-files-todos"),
         mode="default",
     )
+    parts: list[Mapping[str, object]] = []
+    todo_result_index: int | None = None
+    durable_root_todos: object = None
+    async for part in runtime.astream(
+        {"messages": [HumanMessage(content="Create the result")]},
+        config=config,
+        stream_mode=["messages", "tasks", "values"],
+        subgraphs=True,
+    ):
+        parts.append(part)
+        if part["type"] == "messages" and part["ns"] == ():
+            message, _metadata = cast(tuple[BaseMessage, object], part["data"])
+            if isinstance(message, ToolMessage) and message.tool_call_id == "todos-1":
+                assert todo_result_index is None
+                todo_result_index = len(parts) - 1
+        if (
+            todo_result_index is not None
+            and durable_root_todos is None
+            and part["type"] == "values"
+            and part["ns"] == ()
+        ):
+            state = cast(Mapping[str, object], part["data"])
+            if state.get("todos") is not None:
+                checkpoint_tuple = await saver.aget_tuple(config)
+                assert checkpoint_tuple is not None
+                checkpoint = cast(Mapping[str, object], checkpoint_tuple.checkpoint)
+                channels = cast(Mapping[str, object], checkpoint["channel_values"])
+                durable_root_todos = channels.get("todos")
+
+    assert todo_result_index is not None
+    write_file_index: int | None = None
+    for index, part in enumerate(parts):
+        if part["type"] != "messages":
+            continue
+        message, _metadata = cast(tuple[BaseMessage, object], part["data"])
+        if isinstance(message, AIMessage) and any(
+            call.get("name") == "write_file" for call in message.tool_calls
+        ):
+            write_file_index = index
+            break
+    assert write_file_index is not None
+    assert todo_result_index < write_file_index
+    assert durable_root_todos == [{"content": "Record output", "status": "in_progress"}]
 
     final = _root_values(parts)[-1]
     assert final["todos"] == [{"content": "Record output", "status": "in_progress"}]
     assert "/result.txt" in cast(Mapping[str, object], final["files"])
+
+
+@pytest.mark.asyncio
+async def test_plan_repeated_todo_updates_replace_durable_root_across_requests() -> (
+    None
+):
+    first = [{"content": "First", "status": "in_progress"}]
+    second = [{"content": "Second", "status": "in_progress"}]
+    next_request = [{"content": "Next request", "status": "in_progress"}]
+    model = _FakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "write_todos",
+                        "args": {"todos": first},
+                        "id": "todos-first",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "write_todos",
+                        "args": {"todos": second},
+                        "id": "todos-second",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="first request done"),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "write_todos",
+                        "args": {"todos": next_request},
+                        "id": "todos-next-request",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="next request done"),
+        ]
+    )
+    saver = InMemorySaver()
+    definition = (
+        TinkerFin()
+        .plan(enabled=True)
+        .create_deep_agent(
+            model=model,
+            tools=[],
+            middleware=(TodoListMiddleware(),),
+            checkpointer=saver,
+        )
+    )
+    config: RunnableConfig = {"configurable": {"thread_id": "plan-thread"}}
+
+    initial = await _parts(
+        definition,
+        {"messages": [HumanMessage(content="First request")]},
+        run_id="todo-repeat-first",
+        config=config,
+        mode="default",
+    )
+    root_todo_updates = [
+        state["todos"]
+        for state in _root_values(initial)
+        if state.get("todos") is not None
+    ]
+    assert first in root_todo_updates
+    assert root_todo_updates[-1] == second
+    initial_results = [
+        cast(tuple[BaseMessage, object], part["data"])[0]
+        for part in initial
+        if part["type"] == "messages" and part["ns"] == ()
+    ]
+    assert [
+        message.tool_call_id
+        for message in initial_results
+        if isinstance(message, ToolMessage)
+        and message.tool_call_id in {"todos-first", "todos-second"}
+    ] == ["todos-first", "todos-second"]
+
+    following = await _parts(
+        definition,
+        {"messages": [HumanMessage(content="Next request")]},
+        run_id="todo-repeat-next",
+        config=config,
+        mode="default",
+    )
+    next_result_index = next(
+        index
+        for index, part in enumerate(following)
+        if part["type"] == "messages"
+        and part["ns"] == ()
+        and isinstance(
+            cast(tuple[BaseMessage, object], part["data"])[0],
+            ToolMessage,
+        )
+        and cast(
+            ToolMessage,
+            cast(tuple[BaseMessage, object], part["data"])[0],
+        ).tool_call_id
+        == "todos-next-request"
+    )
+    subsequent_todos = [
+        cast(Mapping[str, object], part["data"])["todos"]
+        for part in following[next_result_index + 1 :]
+        if part["type"] == "values"
+        and part["ns"] == ()
+        and "todos" in cast(Mapping[str, object], part["data"])
+    ]
+    assert subsequent_todos
+    assert all(value == next_request for value in subsequent_todos)
+    checkpoint_tuple = await saver.aget_tuple(config)
+    assert checkpoint_tuple is not None
+    checkpoint = cast(Mapping[str, object], checkpoint_tuple.checkpoint)
+    channels = cast(Mapping[str, object], checkpoint["channel_values"])
+    assert channels["todos"] == next_request
 
 
 def test_runtime_rejects_overriding_its_bound_mode() -> None:
@@ -1058,8 +1222,23 @@ async def test_plan_review_approve_executes_child_with_json_checkpoint_state() -
         for message in model.model_inputs[-1]
         if isinstance(message, SystemMessage)
     )
-    assert "user-approved Plan" in str(execution_system.content)
-    assert '"goal": "Implement feature"' in str(execution_system.content)
+    planner_system = next(
+        message
+        for model_input in model.model_inputs
+        for message in model_input
+        if isinstance(message, SystemMessage)
+        and "read-only Planner" in str(message.content)
+    )
+    planner_prompt = " ".join(str(planner_system.content).split())
+    execution_prompt = " ".join(str(execution_system.content).split())
+    assert "separate execution Deep Agent" in planner_prompt
+    assert "neither describes nor limits the execution Agent's tools" in planner_prompt
+    assert "Never call, simulate, or test an execution tool" in planner_prompt
+    assert "user-approved Plan" in execution_prompt
+    assert "approval has already been granted" in execution_prompt
+    assert "Do not restate the draft, ask for Plan approval again" in execution_prompt
+    assert "Tool-specific human review" in execution_prompt
+    assert '"goal": "Implement feature"' in execution_prompt
     namespaces = {
         cast(
             str,
@@ -2348,19 +2527,296 @@ async def test_ag_ui_plan_review_resumes_to_one_success_terminal() -> None:
 
 
 @pytest.mark.asyncio
-async def test_ag_ui_execution_error_emits_one_error_terminal() -> None:
-    @wrap_model_call
-    def fail_execution(_request: Any, _handler: Any) -> Any:
-        raise RuntimeError("execution failed")
-
+async def test_plan_todos_persist_through_tool_interrupt_and_resume() -> None:
+    todos = [{"content": "Execute approved action", "status": "in_progress"}]
+    model = _FakeModel(
+        responses=[
+            _gate("plan"),
+            _planner(),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "write_todos",
+                        "args": {"todos": todos},
+                        "id": "plan-todos-call",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "approved_tool",
+                        "args": {"value": "ok"},
+                        "id": "plan-approved-call",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="done"),
+        ]
+    )
     definition = (
         TinkerFin()
         .plan(enabled=True, default_mode="plan")
         .create_deep_agent(
-            model=_FakeModel(responses=[_gate("plan"), _planner()]),
-            tools=[],
-            middleware=[fail_execution],
+            model=model,
+            tools=[approved_tool],
+            middleware=(TodoListMiddleware(),),
+            interrupt_on={"approved_tool": {"allowed_decisions": ["approve"]}},
             checkpointer=InMemorySaver(),
+        )
+    )
+    config: RunnableConfig = {"configurable": {"thread_id": "plan-thread"}}
+    review_events = await _agui_events(
+        definition,
+        {"messages": [HumanMessage(content="Implement")]},
+        run_id="todo-plan-review",
+        config=config,
+    )
+    review_terminal = _terminal(review_events)
+    assert review_terminal.outcome is not None
+    review_interrupt = review_terminal.outcome.interrupts[0]
+    review_translation = ResumeMapper().map_agui(
+        entries=(
+            _resume_entry(
+                review_interrupt.id,
+                {"type": "approve", "baseRevision": 1},
+            ),
+        ),
+        interrupts=review_terminal.outcome.interrupts,
+    )
+    execution_identity = _identity("todo-plan-execution")
+    review_binding = AgUiResumeBinding.from_translation(
+        identity=execution_identity,
+        translation=review_translation,
+    )
+
+    interrupted_events = await _agui_events(
+        definition,
+        review_binding.command,
+        run_id=execution_identity.run_id,
+        config=config,
+        resume=review_binding,
+    )
+    interrupted_terminal = _terminal(interrupted_events)
+    assert interrupted_terminal.outcome is not None
+    assert interrupted_terminal.outcome.type == "interrupt"
+    tool_interrupt = interrupted_terminal.outcome.interrupts[0]
+    assert tool_interrupt.reason == "tool_call"
+    assert tool_interrupt.tool_call_id is not None
+    todo_starts = [
+        event
+        for event in interrupted_events
+        if isinstance(event, ToolCallStartEvent)
+        and event.tool_call_name == "write_todos"
+    ]
+    todo_results = [
+        event
+        for event in interrupted_events
+        if isinstance(event, ToolCallResultEvent)
+        and todo_starts
+        and event.tool_call_id == todo_starts[0].tool_call_id
+    ]
+    assert len(todo_starts) == 1
+    assert len(todo_results) == 1
+    interrupt_snapshots = [
+        event for event in interrupted_events if isinstance(event, StateSnapshotEvent)
+    ]
+    assert interrupt_snapshots[-1].snapshot["todos"] == todos
+    assert all(
+        not any(key.startswith("_tinkerfin_plan_") for key in event.snapshot)
+        for event in interrupt_snapshots
+    )
+    assert all(
+        "_tinkerfin_plan_" not in event.model_dump_json(by_alias=True)
+        for event in interrupted_events
+    )
+
+    tool_translation = ResumeMapper().map_agui(
+        entries=(_resume_entry(tool_interrupt.id, {"type": "approve"}),),
+        interrupts=interrupted_terminal.outcome.interrupts,
+    )
+    resume_identity = _identity("todo-plan-tool-resume")
+    tool_binding = AgUiResumeBinding.from_translation(
+        identity=resume_identity,
+        translation=tool_translation,
+    )
+    completed_events = await _agui_events(
+        definition,
+        tool_binding.command,
+        run_id=resume_identity.run_id,
+        config=config,
+        resume=tool_binding,
+    )
+
+    completed_terminal = _terminal(completed_events)
+    assert completed_terminal.outcome is not None
+    assert completed_terminal.outcome.type == "success"
+    resumed_snapshots = [
+        event for event in completed_events if isinstance(event, StateSnapshotEvent)
+    ]
+    assert resumed_snapshots[0].snapshot["todos"] == todos
+    assert not any(
+        isinstance(event, ToolCallStartEvent)
+        and event.tool_call_id == tool_interrupt.tool_call_id
+        for event in completed_events
+    )
+    resumed_results = [
+        event
+        for event in completed_events
+        if isinstance(event, ToolCallResultEvent)
+        and event.tool_call_id == tool_interrupt.tool_call_id
+    ]
+    assert len(resumed_results) == 1
+    assert all(
+        "_tinkerfin_plan_" not in event.model_dump_json(by_alias=True)
+        for event in completed_events
+    )
+
+
+@pytest.mark.parametrize(
+    "decision",
+    (
+        {"type": "approve"},
+        {
+            "type": "edit",
+            "edited_action": {"name": "approved_tool", "args": {"value": "edited"}},
+        },
+        {"type": "reject", "message": "Do not execute"},
+    ),
+    ids=("approve", "edit", "reject"),
+)
+@pytest.mark.asyncio
+async def test_default_plan_todos_survive_each_tool_review_decision(
+    decision: dict[str, object],
+) -> None:
+    todos = [{"content": "Review action", "status": "in_progress"}]
+    definition = (
+        TinkerFin()
+        .plan(enabled=True)
+        .create_deep_agent(
+            model=_FakeModel(
+                responses=[
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "write_todos",
+                                "args": {"todos": todos},
+                                "id": "decision-todos",
+                                "type": "tool_call",
+                            }
+                        ],
+                    ),
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "approved_tool",
+                                "args": {"value": "original"},
+                                "id": "decision-tool",
+                                "type": "tool_call",
+                            }
+                        ],
+                    ),
+                    AIMessage(content="done"),
+                ]
+            ),
+            tools=[approved_tool],
+            middleware=(TodoListMiddleware(),),
+            interrupt_on={
+                "approved_tool": {"allowed_decisions": ["approve", "edit", "reject"]}
+            },
+            checkpointer=InMemorySaver(),
+        )
+    )
+    config: RunnableConfig = {"configurable": {"thread_id": "plan-thread"}}
+    interrupted = await _agui_events(
+        definition,
+        {"messages": [HumanMessage(content="Review the action")]},
+        run_id=f"decision-{decision['type']}-pending",
+        config=config,
+        mode="default",
+    )
+    interrupted_terminal = _terminal(interrupted)
+    assert interrupted_terminal.outcome is not None
+    interrupt = interrupted_terminal.outcome.interrupts[0]
+    assert interrupt.reason == "tool_call"
+    assert [
+        event.snapshot["todos"]
+        for event in interrupted
+        if isinstance(event, StateSnapshotEvent) and "todos" in event.snapshot
+    ][-1] == todos
+    translation = ResumeMapper().map_agui(
+        entries=(_resume_entry(interrupt.id, decision),),
+        interrupts=interrupted_terminal.outcome.interrupts,
+    )
+    resume_identity = _identity(f"decision-{decision['type']}-resume")
+    binding = AgUiResumeBinding.from_translation(
+        identity=resume_identity,
+        translation=translation,
+    )
+
+    completed = await _agui_events(
+        definition,
+        binding.command,
+        run_id=resume_identity.run_id,
+        config=config,
+        resume=binding,
+        mode="default",
+    )
+
+    completed_terminal = _terminal(completed)
+    assert completed_terminal.outcome is not None
+    assert completed_terminal.outcome.type == "success"
+    first_snapshot = next(
+        event for event in completed if isinstance(event, StateSnapshotEvent)
+    )
+    assert first_snapshot.snapshot["todos"] == todos
+
+
+@pytest.mark.asyncio
+async def test_ag_ui_execution_error_emits_one_error_terminal() -> None:
+    execution_calls = 0
+
+    @wrap_model_call
+    async def fail_execution(request: Any, handler: Any) -> Any:
+        nonlocal execution_calls
+        execution_calls += 1
+        if execution_calls == 2:
+            raise RuntimeError("execution failed")
+        return await handler(request)
+
+    todos = [{"content": "Persist before error", "status": "in_progress"}]
+    saver = InMemorySaver()
+    definition = (
+        TinkerFin()
+        .plan(enabled=True, default_mode="plan")
+        .create_deep_agent(
+            model=_FakeModel(
+                responses=[
+                    _gate("plan"),
+                    _planner(),
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "write_todos",
+                                "args": {"todos": todos},
+                                "id": "todos-before-error",
+                                "type": "tool_call",
+                            }
+                        ],
+                    ),
+                    AIMessage(content="unused"),
+                ]
+            ),
+            tools=[],
+            middleware=[TodoListMiddleware(), fail_execution],
+            checkpointer=saver,
         )
     )
     config = {"configurable": {"thread_id": "plan-thread"}}
@@ -2402,15 +2858,32 @@ async def test_ag_ui_execution_error_emits_one_error_terminal() -> None:
     assert event_types[-1] == "RUN_ERROR"
     assert event_types.count("RUN_ERROR") == 1
     assert "RUN_FINISHED" not in event_types
+    assert any(
+        isinstance(event, StateDeltaEvent)
+        and {"op": "add", "path": "/todos", "value": todos} in event.delta
+        for event in error_events
+    )
+    checkpoint_tuple = await saver.aget_tuple(config)
+    assert checkpoint_tuple is not None
+    checkpoint = cast(Mapping[str, object], checkpoint_tuple.checkpoint)
+    channels = cast(Mapping[str, object], checkpoint["channel_values"])
+    assert channels["todos"] == todos
+    assert channels.get("_tinkerfin_plan_execution_yield") is False
+    assert channels.get("_tinkerfin_plan_todo_correlation") is None
 
 
 @pytest.mark.asyncio
 async def test_cancellation_propagates_into_the_execution_subgraph() -> None:
     entered = asyncio.Event()
     cancelled = asyncio.Event()
+    execution_calls = 0
 
     @wrap_model_call
-    async def block_execution(_request: Any, _handler: Any) -> Any:
+    async def block_execution(request: Any, handler: Any) -> Any:
+        nonlocal execution_calls
+        execution_calls += 1
+        if execution_calls == 1:
+            return await handler(request)
         entered.set()
         try:
             await asyncio.Event().wait()
@@ -2418,14 +2891,33 @@ async def test_cancellation_propagates_into_the_execution_subgraph() -> None:
             cancelled.set()
             raise
 
+    todos = [{"content": "Persist before cancel", "status": "in_progress"}]
+    saver = InMemorySaver()
     definition = (
         TinkerFin()
         .plan(enabled=True, default_mode="plan")
         .create_deep_agent(
-            model=_FakeModel(responses=[_gate("plan"), _planner()]),
+            model=_FakeModel(
+                responses=[
+                    _gate("plan"),
+                    _planner(),
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "write_todos",
+                                "args": {"todos": todos},
+                                "id": "todos-before-cancel",
+                                "type": "tool_call",
+                            }
+                        ],
+                    ),
+                    AIMessage(content="unused"),
+                ]
+            ),
             tools=[],
-            middleware=[block_execution],
-            checkpointer=InMemorySaver(),
+            middleware=[TodoListMiddleware(), block_execution],
+            checkpointer=saver,
         )
     )
     config = {"configurable": {"thread_id": "plan-thread"}}
@@ -2453,6 +2945,13 @@ async def test_cancellation_propagates_into_the_execution_subgraph() -> None:
         await consumer
     await asyncio.wait_for(cancelled.wait(), timeout=2)
     await stream.aclose()
+    checkpoint_tuple = await saver.aget_tuple(config)
+    assert checkpoint_tuple is not None
+    checkpoint = cast(Mapping[str, object], checkpoint_tuple.checkpoint)
+    channels = cast(Mapping[str, object], checkpoint["channel_values"])
+    assert channels["todos"] == todos
+    assert channels.get("_tinkerfin_plan_execution_yield") is False
+    assert channels.get("_tinkerfin_plan_todo_correlation") is None
 
 
 @pytest.mark.asyncio

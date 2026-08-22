@@ -44,7 +44,14 @@ RUN_FINISHED
 
 `expose_subagent_events=True` 会发送子 Agent 的公开事件。设置为 `False` 时，转换器仍会检查这些数据，但不把对应事件交给前端。
 
-框架不会用 `parentRunId` 表示 LangGraph 子图，也不会自动生成该字段。子图来源由 namespace 和事件关联信息表示；业务需要父子关系时应使用自己的可信映射。
+框架不会用 `parentRunId` 表示 LangGraph 子图，也不会自动生成该字段。经过校验的 Deep Agents
+委派会在 task RAW descriptor 中携带 `tinkerfin.subagent-provenance.v1`：
+`subagentInvocationId` 跨 resume 稳定，`requestRunId` 表示当前主请求，子事件 source 重复该
+invocation ID，父 task Result 使用 `relatedSubagentInvocationId`。
+
+descriptor 只从 Deep Agents `task` 的有效字段读取 Agent 名称和任务描述。经过安全处理的 RAW
+task 数据仍保留原生校验前输入；模型额外生成的参数既不会改变子 Agent 身份，也不会让 Deep
+Agents 原本可执行的 task 在转换阶段失败。
 
 ## 推理事件
 

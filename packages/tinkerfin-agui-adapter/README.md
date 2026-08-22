@@ -79,6 +79,14 @@ ownership.
 - Task and non-root values diagnostics use `source="langgraph.tasks"` and
   `source="langgraph.values"`. A LangGraph task is not automatically a subagent, and
   subgraph provenance never uses AG-UI `parentRunId`.
+- Verified Deep Agents delegates publish `SubagentProvenance` with schema
+  `tinkerfin.subagent-provenance.v1`. `subagentInvocationId` is derived from the
+  thread and complete scoped parent `task` Tool ID, so it remains stable when a new
+  request run resumes the same checkpointed invocation.
+- Delegate provenance uses the effective Deep Agents `task` fields `description` and
+  `subagent_type`. The sanitized task RAW event retains the complete native
+  pre-validation input, but additional model-produced arguments do not change the
+  delegate identity or invalidate an otherwise executable task.
 - Provider-private reasoning is removed from task, state, raw, message, and terminal
   payloads. `expose_reasoning_events=True` enables only verified event sources.
 - `expose_subagent_events=False` suppresses public subgraph events while preserving
@@ -92,6 +100,14 @@ ownership.
   resume translation; one batch cannot mix runtime and Tool interrupts.
 - `prior_tool_call_ids` accepts complete `tf:tool:...` scoped IDs and lets a resumed
   host publish a child Tool result without synthesizing another start/args/end.
+- Tool reviews publish strict `metadata.deepagents` schema
+  `tinkerfin.deepagents.tool-review.v1`. Use `parse_tool_review_interrupt()` on the
+  complete persisted interrupt; missing, unknown, or inconsistent fields fail closed.
+- `private_state_keys` removes only named top-level channels at known state projection
+  boundaries. Nested same-named business fields remain visible. TinkerFin Plan
+  Runtimes supply their private channels automatically.
+- `ToolResultCorrelation` preserves original scoped IDs when a parent graph completes
+  a Tool lifecycle that began in a compiled child graph.
 - Conversion pulls with bounded lookahead and closes an upstream iterator exposing
   `aclose()` on cancellation or early consumer exit.
 

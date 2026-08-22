@@ -96,6 +96,13 @@ still use the parent runtime store and cache, and the host owns their shutdown
 lifecycle. Plan streams use synchronous checkpoint durability, and an explicit
 non-`sync` durability value is rejected.
 
+With `TodoListMiddleware`, Plan main execution commits every `write_todos` update to
+the authoritative parent state and checkpoint before later Tools run. Tool HITL and
+resume snapshots retain that Todo progress, while ordinary delegated subagents remain
+isolated from the root projection. The standard `write_todos` Tool lifecycle is still
+emitted once with one scoped ID. Files synchronize when main execution returns or
+crosses a Todo parent boundary.
+
 Only `ls`, `read_file`, `glob`, and `grep` are available to the Planner. Clarification
 questions can contain model-generated single-select options and can optionally allow a
 free-text answer. Selecting an option submits only its stable ID; the parent workflow
@@ -220,6 +227,11 @@ The returned `AgUiEventStream` uses `RUN_STARTED.input=None`, keeps the
 event, interrupt/resume, subagent, reasoning privacy, cancellation, and cleanup
 semantics, and can be passed directly to SSE or Messaging. Resumed runs use
 `AgUiResumeBinding`; high-level callers do not pass Tool IDs separately.
+
+Plan Runtimes automatically remove their internal top-level state channels at every
+public state boundary. Low-level `TinkerFinRun.astream_agui(...)` accepts an explicit
+`private_state_keys` frozenset for host-owned channels and preserves nested same-named
+business data.
 
 ### Ownership
 

@@ -20,9 +20,13 @@ from tinkerfin_agui_adapter.reasoning import normalize_operational_data
 from tinkerfin_agui_adapter.sse import encode_sse
 
 
-def _adapter() -> DeepAgentAgUiAdapter:
+def _adapter(
+    *,
+    private_state_keys: frozenset[str] = frozenset(),
+) -> DeepAgentAgUiAdapter:
     return DeepAgentAgUiAdapter(
-        identity=Identity(threadId="thread-json", runId="run-json")
+        identity=Identity(threadId="thread-json", runId="run-json"),
+        private_state_keys=private_state_keys,
     )
 
 
@@ -71,13 +75,14 @@ def test_state_rejects_non_finite_floats_without_committing_previous_state(
 
 
 def test_state_omits_the_internal_plan_schema_fingerprint() -> None:
-    events = _adapter().process(
+    internal_key = "_tinkerfin_plan_clarification_schema"
+    events = _adapter(private_state_keys=frozenset({internal_key})).process(
         {
             "type": "values",
             "ns": (),
             "data": {
                 "value": 1,
-                "_tinkerfin_plan_clarification_schema": "internal",
+                internal_key: "internal",
             },
             "interrupts": (),
         }
@@ -87,9 +92,26 @@ def test_state_omits_the_internal_plan_schema_fingerprint() -> None:
     assert snapshot.snapshot == {"value": 1}
 
 
-def test_task_state_boundaries_omit_only_the_top_level_plan_fingerprint() -> None:
-    adapter = _adapter()
+def test_standalone_adapter_preserves_state_without_an_explicit_private_policy() -> (
+    None
+):
     internal_key = "_tinkerfin_plan_clarification_schema"
+    events = _adapter().process(
+        {
+            "type": "values",
+            "ns": (),
+            "data": {internal_key: "host-business-value"},
+            "interrupts": (),
+        }
+    )
+
+    snapshot = next(event for event in events if isinstance(event, StateSnapshotEvent))
+    assert snapshot.snapshot == {internal_key: "host-business-value"}
+
+
+def test_task_state_boundaries_omit_only_the_top_level_plan_fingerprint() -> None:
+    internal_key = "_tinkerfin_plan_clarification_schema"
+    adapter = _adapter(private_state_keys=frozenset({internal_key}))
     nested = {internal_key: "business-value"}
     started = adapter.process(
         {

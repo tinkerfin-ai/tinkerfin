@@ -9,6 +9,7 @@ from ag_ui.core import BaseEvent
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from tinkerfin_agui_adapter import SubagentProvenance
 from tinkerfin_messaging.models import MessageEnvelope
 from tinkerfin_studio.conversation.models import (
     ConversationEvent,
@@ -92,14 +93,7 @@ class ConversationProjector:
             )
         )
         if run is None and event_type == "RUN_STARTED":
-            run = self._new_subagent_run(
-                thread_pk=thread_pk,
-                event_run_id=event_run_id,
-                main_run=main_run,
-                event=event_json,
-                created_at=created_at,
-            )
-            self._session.add(run)
+            raise RuntimeError(f"RUN_STARTED 缺少已注册 run: {event_run_id}")
         run_input = (
             main_run.input_json
             if main_run is not None and event_run_id == envelope.identity.run_id
@@ -120,7 +114,7 @@ class ConversationProjector:
                 seq=envelope.seq,
                 event_id=envelope.message_id,
                 event_type=event_type,
-                schema_version=2,
+                schema_version=3,
                 protocol_version="ag-ui-protocol@0.1.19",
                 event_json=event_json,
                 event_text=event_text,
@@ -181,59 +175,6 @@ class ConversationProjector:
         return raw_run_id if isinstance(raw_run_id, str) and raw_run_id else fallback
 
     @staticmethod
-    def _new_subagent_run(
-        *,
-        thread_pk: int,
-        event_run_id: str,
-        main_run: ConversationRun | None,
-        event: dict[str, object],
-        created_at: datetime,
-    ) -> ConversationRun:
-        raw_event = event.get("rawEvent")
-        source = raw_event.get("source") if isinstance(raw_event, dict) else None
-        parent_agent_run_id = (
-            raw_event.get("parentAgentRunId") if isinstance(raw_event, dict) else None
-        )
-        return ConversationRun(
-            conversation_thread_id=thread_pk,
-            run_id=event_run_id,
-            parent_run_id=(
-                event.get("parentRunId")
-                if isinstance(event.get("parentRunId"), str)
-                else None
-            ),
-            parent_agent_run_id=(
-                parent_agent_run_id
-                if isinstance(parent_agent_run_id, str)
-                else (None if main_run is None else main_run.run_id)
-            ),
-            agent_type=(
-                str(source.get("agentType", "subagent"))
-                if isinstance(source, dict)
-                else "subagent"
-            ),
-            agent_name=(
-                str(source.get("agentName"))
-                if isinstance(source, dict) and source.get("agentName") is not None
-                else None
-            ),
-            graph_task_id=(
-                str(source.get("graphTaskId"))
-                if isinstance(source, dict) and source.get("graphTaskId") is not None
-                else None
-            ),
-            model_id=None if main_run is None else main_run.model_id,
-            status="running",
-            input_json=None,
-            config_json=None,
-            outcome_json=None,
-            started_at=created_at,
-            finished_at=None,
-            created_at=created_at,
-            updated_at=created_at,
-        )
-
-    @staticmethod
     def _thread_status(snapshot: dict[str, object]) -> str:
         statuses = {
             "streaming": "running",
@@ -274,61 +215,47 @@ class ConversationProjector:
         for descriptor in descriptors:
             if not isinstance(descriptor, dict):
                 raise TypeError("RAW task subagents 项必须是对象")
-            run_id = descriptor.get("runId")
-            parent_run_id = descriptor.get("parentAgentRunId")
-            graph_task_id = descriptor.get("graphTaskId")
-            agent_name = descriptor.get("agentName")
-            parent_tool_call_id = descriptor.get("parentToolCallId")
-            description = descriptor.get("description")
-            namespace = descriptor.get("namespace")
-            if (
-                not all(
-                    isinstance(value, str) and value
-                    for value in (
-                        run_id,
-                        parent_run_id,
-                        graph_task_id,
-                        agent_name,
-                        parent_tool_call_id,
-                        description,
-                    )
-                )
-                or not isinstance(namespace, list)
-                or not all(isinstance(value, str) and value for value in namespace)
-            ):
-                raise ValueError("RAW task 子 Agent 描述不完整")
-            if main_run is None or parent_run_id != main_run.run_id:
-                raise RuntimeError("RAW task 子 Agent 的父 run 不一致")
+            provenance = SubagentProvenance.model_validate(descriptor)
+            if main_run is None or provenance.request_run_id != main_run.run_id:
+                raise RuntimeError("RAW task 子 Agent 的当前主 run 不一致")
             input_json: dict[str, object] = {
-                "description": description,
-                "subagent_type": agent_name,
-                "parent_tool_call_id": parent_tool_call_id,
-                "namespace": namespace,
+                "description": provenance.description,
+                "subagent_type": provenance.agent_name,
+                "parent_tool_call_id": provenance.parent_tool_call_id,
+                "namespace": list(provenance.namespace),
             }
             existing = await self._session.scalar(
                 select(ConversationRun).where(
                     ConversationRun.conversation_thread_id == thread_pk,
-                    ConversationRun.run_id == run_id,
+                    ConversationRun.run_id == provenance.subagent_invocation_id,
                 )
             )
             if existing is not None:
                 if (
                     existing.agent_type != "subagent"
-                    or existing.agent_name != agent_name
-                    or existing.graph_task_id != graph_task_id
+                    or existing.agent_name != provenance.agent_name
+                    or existing.graph_task_id != provenance.graph_task_id
                     or existing.input_json != input_json
                 ):
-                    raise RuntimeError(f"子 Agent run 身份冲突: {run_id}")
+                    raise RuntimeError(
+                        f"子 Agent run 身份冲突: {provenance.subagent_invocation_id}"
+                    )
+                existing.last_main_run_id = provenance.request_run_id
+                existing.status = "running"
+                existing.outcome_json = None
+                existing.finished_at = None
+                existing.updated_at = created_at
                 continue
             self._session.add(
                 ConversationRun(
                     conversation_thread_id=thread_pk,
-                    run_id=run_id,
+                    run_id=provenance.subagent_invocation_id,
                     parent_run_id=None,
-                    parent_agent_run_id=parent_run_id,
+                    origin_main_run_id=provenance.request_run_id,
+                    last_main_run_id=provenance.request_run_id,
                     agent_type="subagent",
-                    agent_name=agent_name,
-                    graph_task_id=graph_task_id,
+                    agent_name=provenance.agent_name,
+                    graph_task_id=provenance.graph_task_id,
                     model_id=main_run.model_id,
                     status="running",
                     input_json=input_json,
@@ -356,7 +283,7 @@ class ConversationProjector:
         raw_event = event.get("rawEvent")
         if not isinstance(raw_event, dict):
             return
-        related_run_id = raw_event.get("relatedRunId")
+        related_run_id = raw_event.get("relatedSubagentInvocationId")
         result_status = raw_event.get("toolResultStatus")
         if not isinstance(related_run_id, str) or result_status not in {
             "success",
@@ -393,17 +320,23 @@ class ConversationProjector:
             or event_run_id != main_run.run_id
         ):
             return
+        raw_event = event.get("rawEvent")
+        if (
+            isinstance(raw_event, dict)
+            and raw_event.get("initializationFailed") is True
+        ):
+            return
         status = (
             "cancelled"
             if event.get("code") in {"cancelled", "resume_cancelled"}
             else "error"
         )
-        # resume 会更换主请求 run ID，子 run 保留首次父级，因此按会话关闭当前全部运行项
         subagents = await self._session.scalars(
             select(ConversationRun).where(
                 ConversationRun.conversation_thread_id == thread_pk,
                 ConversationRun.agent_type == "subagent",
                 ConversationRun.status == "running",
+                ConversationRun.last_main_run_id == main_run.run_id,
             )
         )
         for subagent in subagents:

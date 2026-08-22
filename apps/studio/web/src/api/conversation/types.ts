@@ -49,21 +49,24 @@ export interface EventSourceInfo {
   agentName: string
   namespace: string[]
   graphTaskId?: string | null
+  parentNamespace?: string[] | null
+  parentToolCallId?: string | null
+  subagentInput?: string | null
+  subagentInvocationId?: string | null
 }
 
 export interface RawEventContext {
   streamMode?: "messages" | "tasks" | "values"
   source?: EventSourceInfo
   runId?: string
-  relatedRunId?: string
-  /** Project extension: the main run that spawned this sub-agent run. */
-  parentAgentRunId?: string
+  relatedSubagentInvocationId?: string
   /** Project extension: the parent task tool call that spawned this sub-agent. */
   parentToolCallId?: string
   /** Project extension: the validated task description for this sub-agent. */
   subagentInput?: string
   langgraphNode?: string
   interruptId?: string
+  initializationFailed?: boolean
   /** Project extension preserving LangChain ToolMessage.status. */
   toolResultStatus?: "success" | "error"
 }

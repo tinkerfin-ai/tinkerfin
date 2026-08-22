@@ -27,6 +27,7 @@ from .models import (
     JsonObject,
 )
 from .reasoning import json_values_equal, normalize_operational_data
+from .tool_review import _parse_tool_review_interrupt
 
 
 class ResumeMappingError(AgUiAdapterError, ValueError):
@@ -99,44 +100,6 @@ class _PendingInterruptAction(BaseModel):
     )
     allowed_decisions: list[Literal["approve", "edit", "reject", "respond"]] = Field(
         description="Decisions allowed for this action"
-    )
-
-
-class _PersistedDeepAgentCorrelation(BaseModel):
-    """Validated resume correlation persisted inside an AG-UI interrupt."""
-
-    model_config = ConfigDict(
-        alias_generator=None,
-        extra="allow",
-        populate_by_name=True,
-        strict=True,
-    )
-
-    tool_name: str = Field(
-        alias="toolName",
-        min_length=1,
-        description="Reviewed Deep Agents Tool name",
-    )
-    allowed_decisions: list[Literal["approve", "edit", "reject", "respond"]] = Field(
-        alias="allowedDecisions",
-        min_length=1,
-        description="Decisions allowed for the reviewed action",
-    )
-    original_args: JsonObject = Field(
-        alias="originalArgs",
-        description="Original reviewed Tool arguments",
-    )
-    native_interrupt_id: str | None = Field(
-        default=None,
-        alias="nativeInterruptId",
-        min_length=1,
-        description="Native LangGraph interrupt group ID",
-    )
-    action_index: int | None = Field(
-        default=None,
-        alias="actionIndex",
-        ge=0,
-        description="Action position within the native interrupt group",
     )
 
 
@@ -429,44 +392,19 @@ class ResumeMapper:
 
         for interrupt in interrupts:
             try:
-                if interrupt.reason != "tool_call":
-                    raise ValueError("interrupt reason is not tool_call")
+                parsed = _parse_tool_review_interrupt(interrupt)
+                request = parsed.request
+                correlation = parsed.metadata
                 tool_call_id = interrupt.tool_call_id
-                if not isinstance(tool_call_id, str) or not tool_call_id:
-                    raise ValueError("interrupt does not contain a Tool call ID")
-                kind, _namespace, _raw_id = codec.decode(tool_call_id)
-                if kind != "tool":
-                    raise ValueError("interrupt ID does not identify a Tool call")
+                assert isinstance(tool_call_id, str)
                 if tool_call_id in seen_tool_ids:
                     raise ValueError("interrupts reuse a scoped Tool call ID")
-
-                metadata = interrupt.metadata
-                if not isinstance(metadata, Mapping):
-                    raise TypeError("interrupt metadata must be an object")
-                request = HitlRequest.model_validate(metadata.get("langgraphValue"))
-                correlation = _PersistedDeepAgentCorrelation.model_validate(
-                    metadata.get("deepagents")
-                )
-                native_id, action_index = cls._agui_action_position(
-                    interrupt=interrupt,
-                    request=request,
-                    correlation=correlation,
-                )
+                kind, _namespace, _raw_id = codec.decode(tool_call_id)
+                assert kind == "tool"
+                native_id = correlation.native_interrupt_id
+                action_index = correlation.action_index
                 action = request.action_requests[action_index]
                 review = request.review_configs[action_index]
-                if correlation.tool_name != action.name:
-                    raise ValueError("persisted Tool name does not match native action")
-                if correlation.allowed_decisions != review.allowed_decisions:
-                    raise ValueError(
-                        "persisted decisions do not match native review policy"
-                    )
-                if not json_values_equal(
-                    correlation.original_args.root,
-                    action.args.root,
-                ):
-                    raise ValueError(
-                        "persisted Tool arguments do not match native action"
-                    )
             except (TypeError, ValueError, ValidationError) as error:
                 raise ResumeMappingError(
                     AgUiAdapterErrorCode.RESUME_INTERRUPT_UNSUPPORTED,
@@ -505,7 +443,7 @@ class ResumeMapper:
                 interrupt_id=native_id,
                 action_index=action_index,
                 action_name=action.name,
-                allowed_decisions=review.allowed_decisions,
+                allowed_decisions=list(review.allowed_decisions),
             )
 
         ordered_pending: dict[str, _PendingInterruptAction] = {}
@@ -524,47 +462,6 @@ class ResumeMapper:
                 cast(str, tool_id) for tool_id in slots
             )
         return ordered_pending, tool_ids_by_group
-
-    @staticmethod
-    def _agui_action_position(
-        *,
-        interrupt: AgUiInterrupt,
-        request: HitlRequest,
-        correlation: _PersistedDeepAgentCorrelation,
-    ) -> tuple[str, int]:
-        native_id = correlation.native_interrupt_id
-        action_index = correlation.action_index
-        if (native_id is None) != (action_index is None):
-            raise ValueError(
-                "nativeInterruptId and actionIndex must be persisted together"
-            )
-        if native_id is None:
-            if len(request.action_requests) == 1:
-                native_id = interrupt.id
-                action_index = 0
-            else:
-                native_id, separator, raw_index = interrupt.id.rpartition("#")
-                if (
-                    not separator
-                    or not native_id
-                    or not raw_index.isascii()
-                    or not raw_index.isdecimal()
-                ):
-                    raise ValueError("multi-action interrupt ID has no action index")
-                action_index = int(raw_index)
-                if str(action_index) != raw_index:
-                    raise ValueError("multi-action interrupt index is not canonical")
-        assert action_index is not None
-        expected_id = (
-            native_id
-            if len(request.action_requests) == 1
-            else f"{native_id}#{action_index}"
-        )
-        if interrupt.id != expected_id or action_index >= len(request.action_requests):
-            raise ValueError(
-                "persisted interrupt ID does not match its action position"
-            )
-        return native_id, action_index
 
     @staticmethod
     def _prior_tool_call_ids(

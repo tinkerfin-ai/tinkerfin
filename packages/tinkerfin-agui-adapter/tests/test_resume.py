@@ -93,15 +93,15 @@ def _entry(
     )
 
 
-def _public_interrupts(
-    *,
-    include_explicit_correlation: bool = True,
-) -> tuple[AgUiInterrupt, ...]:
+def _public_interrupts() -> tuple[AgUiInterrupt, ...]:
     native_value = _interrupts()[0].value
     codec = ScopedIdCodec()
     interrupts: list[AgUiInterrupt] = []
     for index, raw_tool_call_id in enumerate(("call-main-a", "call-main-b")):
         deepagents = {
+            "schema": "tinkerfin.deepagents.tool-review.v1",
+            "nativeInterruptId": "interrupt-main",
+            "actionIndex": index,
             "toolName": "write_file",
             "allowedDecisions": ["approve", "edit", "reject", "respond"],
             "originalArgs": {
@@ -109,13 +109,6 @@ def _public_interrupts(
                 "content": "A" if index == 0 else "B",
             },
         }
-        if include_explicit_correlation:
-            deepagents.update(
-                {
-                    "nativeInterruptId": "interrupt-main",
-                    "actionIndex": index,
-                }
-            )
         interrupts.append(
             AgUiInterrupt(
                 id=f"interrupt-main#{index}",
@@ -130,18 +123,13 @@ def _public_interrupts(
     return tuple(interrupts)
 
 
-@pytest.mark.parametrize("include_explicit_correlation", [True, False])
-def test_resume_mapper_uses_persisted_agui_tool_ids_without_checkpoint(
-    include_explicit_correlation: bool,
-) -> None:
+def test_resume_mapper_uses_persisted_agui_tool_ids_without_checkpoint() -> None:
     translation = ResumeMapper().map_agui(
         entries=(
             _entry("interrupt-main#1", payload={"type": "approve"}),
             _entry("interrupt-main#0", payload={"type": "reject"}),
         ),
-        interrupts=_public_interrupts(
-            include_explicit_correlation=include_explicit_correlation
-        ),
+        interrupts=_public_interrupts(),
     )
 
     assert translation.root == {"decisions": [{"type": "reject"}, {"type": "approve"}]}
@@ -189,6 +177,7 @@ def test_resume_mapper_restores_multiple_persisted_agui_groups() -> None:
                 ],
             },
             "deepagents": {
+                "schema": "tinkerfin.deepagents.tool-review.v1",
                 "nativeInterruptId": "interrupt-secondary",
                 "actionIndex": 0,
                 "toolName": "ask_user",

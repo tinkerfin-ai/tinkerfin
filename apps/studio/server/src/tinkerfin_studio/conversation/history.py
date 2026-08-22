@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 import json
 from datetime import datetime
-from typing import cast
+from typing import NoReturn, cast
 
 from pydantic import (
     BaseModel,
@@ -34,12 +34,12 @@ from tinkerfin_studio.conversation.schemas import (
     ConversationHistoryListItem,
     ConversationHistoryListResponse,
 )
-from tinkerfin_studio.conversation.snapshot import (
-    repair_pending_interrupt_snapshot,
-)
 
 _HISTORY_PAGE_SIZE_MAX = 100
 _EVENT_LIMIT_MAX = 1000
+_SNAPSHOT_VERSION = 3
+_EVENT_SCHEMA_VERSION = 3
+_PROTOCOL_VERSION = "ag-ui-protocol@0.1.19"
 
 
 class _HistoryCursorPayload(BaseModel):
@@ -81,7 +81,41 @@ def _history_item(thread: ConversationThread) -> ConversationHistoryListItem:
     )
 
 
+def _history_schema_mismatch(reason: str) -> NoReturn:
+    raise SystemException(
+        ConversationErrorCode.HISTORY_SCHEMA_MISMATCH
+    ) from ValueError(reason)
+
+
+def _validated_snapshot(thread: ConversationThread) -> dict[str, JsonValue] | None:
+    snapshot = thread.snapshot_json
+    if thread.snapshot_version != _SNAPSHOT_VERSION:
+        _history_schema_mismatch(
+            f"thread snapshot_version={thread.snapshot_version}, expected=3"
+        )
+    if snapshot is None:
+        if thread.snapshot_seq != 0:
+            _history_schema_mismatch(
+                f"empty snapshot with snapshot_seq={thread.snapshot_seq}"
+            )
+        return None
+    if snapshot.get("snapshotVersion") != _SNAPSHOT_VERSION:
+        _history_schema_mismatch("snapshot JSON version is not 3")
+    if snapshot.get("snapshotSeq") != thread.snapshot_seq:
+        _history_schema_mismatch("snapshot JSON sequence does not match snapshot_seq")
+    return cast(dict[str, JsonValue], snapshot)
+
+
 def _event_envelope(event: ConversationEvent) -> ConversationEventEnvelope:
+    if event.schema_version != _EVENT_SCHEMA_VERSION:
+        _history_schema_mismatch(
+            f"event schema_version={event.schema_version}, expected=3"
+        )
+    if event.protocol_version != _PROTOCOL_VERSION:
+        _history_schema_mismatch(
+            f"event protocol_version={event.protocol_version!r}, "
+            f"expected={_PROTOCOL_VERSION!r}"
+        )
     return ConversationEventEnvelope(
         seq=event.seq,
         eventId=event.event_id,
@@ -134,37 +168,8 @@ class ConversationHistoryService:
 
         thread = await self._require_thread(thread_id)
         await self._reconcile(thread)
-        refreshed = await self._require_thread(thread_id)
-        pending_interrupts = await self._repository.list_pending_interrupts(
-            thread_pk=refreshed.id
-        )
-        pending_values = [
-            dict(interrupt.request_json) for interrupt in pending_interrupts
-        ]
-        snapshot = repair_pending_interrupt_snapshot(
-            refreshed.snapshot_json,
-            pending_values,
-        )
-        has_pending_interrupt = bool(pending_interrupts)
-        status = (
-            "waiting_approval"
-            if has_pending_interrupt
-            else "idle"
-            if refreshed.status == "waiting_approval"
-            else refreshed.status
-        )
-        if (
-            snapshot != refreshed.snapshot_json
-            or has_pending_interrupt != refreshed.has_pending_interrupt
-            or status != refreshed.status
-        ):
-            await self._repository.repair_history_snapshot(
-                refreshed,
-                snapshot=snapshot,
-                status=status,
-                has_pending_interrupt=has_pending_interrupt,
-            )
-            await self._repository.commit()
+        refreshed = await self._require_thread(thread_id, reload=True)
+        snapshot = _validated_snapshot(refreshed)
         events = await self._repository.list_events(
             thread_pk=refreshed.id,
             after_seq=refreshed.snapshot_seq,
@@ -174,17 +179,17 @@ class ConversationHistoryService:
             id=refreshed.id,
             threadId=refreshed.thread_id,
             title=refreshed.title,
-            status=status,
+            status=refreshed.status,
             lastRunId=refreshed.last_run_id,
             lastModel=refreshed.last_model,
             lastSeq=refreshed.last_seq,
             snapshotSeq=refreshed.snapshot_seq,
-            snapshotVersion=refreshed.snapshot_version,
+            snapshotVersion=_SNAPSHOT_VERSION,
             messageCount=refreshed.message_count,
             toolCallCount=refreshed.tool_call_count,
-            hasPendingInterrupt=has_pending_interrupt,
+            hasPendingInterrupt=refreshed.has_pending_interrupt,
             pinned=refreshed.pinned,
-            snapshot=cast(dict[str, JsonValue] | None, snapshot),
+            snapshot=snapshot,
             events=[_event_envelope(event) for event in events],
             createdAt=refreshed.created_at,
             updatedAt=refreshed.updated_at,
@@ -229,11 +234,17 @@ class ConversationHistoryService:
                 ConversationErrorCode.EVENT_PROJECTION_UNAVAILABLE
             ) from error
 
-    async def _require_thread(self, thread_id: str) -> ConversationThread:
-        thread = await self._repository.get_thread(
-            user_id=self._user_id,
-            thread_id=thread_id,
-        )
+    async def _require_thread(
+        self,
+        thread_id: str,
+        *,
+        reload: bool = False,
+    ) -> ConversationThread:
+        if reload:
+            query = self._repository.reload_thread
+        else:
+            query = self._repository.get_thread
+        thread = await query(user_id=self._user_id, thread_id=thread_id)
         if thread is None:
             raise BusinessException(ConversationErrorCode.NOT_FOUND)
         return thread

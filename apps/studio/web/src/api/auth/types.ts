@@ -11,9 +11,12 @@ export interface LoginRequest {
   password: string
 }
 
-export interface LoginResponse {
+export interface AuthSessionResponse {
+  expires_at: string
+  user: AuthUser
+}
+
+export interface LoginResponse extends AuthSessionResponse {
   access_token: string
   token_type: string
-  expires_in: number
-  user: AuthUser
 }

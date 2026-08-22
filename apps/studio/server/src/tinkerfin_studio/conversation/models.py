@@ -6,6 +6,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     Index,
     Integer,
@@ -52,6 +53,10 @@ class ConversationThread(Base):
             "updated_at",
             "id",
         ),
+        CheckConstraint(
+            "snapshot_version = 3",
+            name="ck_conversation_threads_snapshot_version",
+        ),
         {"comment": "用户会话元信息与最新可信前端快照"},
     )
 
@@ -81,10 +86,10 @@ class ConversationThread(Base):
         BigInteger, nullable=False, default=0, comment="Messaging 会话流最新已投影序号"
     )
     snapshot_seq: Mapped[int] = mapped_column(
-        BigInteger, nullable=False, default=0, comment="v2 快照覆盖到的序号"
+        BigInteger, nullable=False, default=0, comment="v3 快照覆盖到的序号"
     )
     snapshot_version: Mapped[int] = mapped_column(
-        Integer, nullable=False, default=2, comment="快照结构版本，当前固定为 2"
+        Integer, nullable=False, default=3, comment="快照结构版本，当前固定为 3"
     )
     message_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, comment="user 与 assistant 消息数量"
@@ -132,6 +137,12 @@ class ConversationRun(Base):
             "status",
             "updated_at",
         ),
+        Index(
+            "ix_conversation_runs_thread_last_main_status",
+            "conversation_thread_id",
+            "last_main_run_id",
+            "status",
+        ),
         {"comment": "主 Agent 与子 Agent 运行投影"},
     )
 
@@ -142,13 +153,16 @@ class ConversationRun(Base):
         BigInteger, nullable=False, comment="所属会话主键，由应用层保证存在"
     )
     run_id: Mapped[str] = mapped_column(
-        String(128), nullable=False, comment="AG-UI run ID"
+        String(128), nullable=False, comment="主请求 runId 或 subagentInvocationId"
     )
     parent_run_id: Mapped[str | None] = mapped_column(
         String(128), nullable=True, comment="标准 AG-UI parentRunId"
     )
-    parent_agent_run_id: Mapped[str | None] = mapped_column(
-        String(128), nullable=True, comment="扩展的父 Agent run ID"
+    origin_main_run_id: Mapped[str | None] = mapped_column(
+        String(128), nullable=True, comment="首次发现子执行的主请求 run ID"
+    )
+    last_main_run_id: Mapped[str | None] = mapped_column(
+        String(128), nullable=True, comment="最近承载子执行事件的主请求 run ID"
     )
     agent_type: Mapped[str] = mapped_column(
         String(32), nullable=False, comment="运行主体：main 或 subagent"
@@ -210,6 +224,10 @@ class ConversationEvent(Base):
             "run_id",
             "seq",
         ),
+        CheckConstraint(
+            "schema_version = 3",
+            name="ck_conversation_events_schema_version",
+        ),
         {"comment": "Redis Messaging 已提交 AG-UI 事件的 MySQL 事实副本"},
     )
 
@@ -232,7 +250,7 @@ class ConversationEvent(Base):
         String(64), nullable=False, comment="AG-UI 事件类型"
     )
     schema_version: Mapped[int] = mapped_column(
-        Integer, nullable=False, default=2, comment="Studio 事件结构版本"
+        Integer, nullable=False, default=3, comment="Studio 事件结构版本，当前固定为 3"
     )
     protocol_version: Mapped[str] = mapped_column(
         String(32),

@@ -68,4 +68,58 @@ describe('PlanQuestionCard', () => {
     expect(current.questions[0]?.selectedOptionId).toBeUndefined()
     expect(current.questions[0]?.customAnswer).toBe('隔离的性能测试环境')
   })
+
+  it('keeps mixed answers independent and submits the complete question list once', () => {
+    let current: PlanQuestionState = {
+      kind: 'questions',
+      interruptId: 'plan-question-list',
+      form: { schemaVersion: 1, questions: [] },
+      submitted: false,
+      questions: [
+        {
+          id: 'environment',
+          prompt: '部署到哪个环境？',
+          options: [{ id: 'staging', label: '预发布' }],
+          allowFreeText: true,
+        },
+        {
+          id: 'deadline',
+          prompt: '交付时间有什么约束？',
+          options: [{ id: 'week', label: '一周内' }],
+          allowFreeText: true,
+        },
+      ],
+    }
+    const submit = vi.fn()
+    const change = (updater: (value: PlanQuestionState) => PlanQuestionState) => {
+      current = updater(current)
+    }
+    const view = render(
+      <PlanQuestionCard interaction={current} onChange={change} onSubmit={submit} />,
+    )
+
+    fireEvent.click(screen.getByRole('radio', { name: '预发布' }))
+    view.rerender(
+      <PlanQuestionCard interaction={current} onChange={change} onSubmit={submit} />,
+    )
+    fireEvent.change(screen.getAllByPlaceholderText('输入会影响方案的具体要求…')[1], {
+      target: { value: '下周三前完成' },
+    })
+    view.rerender(
+      <PlanQuestionCard interaction={current} onChange={change} onSubmit={submit} />,
+    )
+
+    expect(current.questions[0]).toMatchObject({
+      id: 'environment',
+      selectedOptionId: 'staging',
+      customAnswer: '',
+    })
+    expect(current.questions[1]).toMatchObject({
+      id: 'deadline',
+      selectedOptionId: undefined,
+      customAnswer: '下周三前完成',
+    })
+    fireEvent.click(screen.getByRole('button', { name: '提交并继续规划' }))
+    expect(submit).toHaveBeenCalledOnce()
+  })
 })

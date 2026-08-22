@@ -10,6 +10,7 @@ from tinkerfin_agui_adapter import (
     AgUiStreamContractError,
     HitlCorrelationError,
     ResumeMappingError,
+    ToolReviewContractError,
 )
 
 
@@ -59,3 +60,21 @@ def test_resume_code_must_belong_to_resume_family() -> None:
             AgUiAdapterErrorCode.CONVERSION_FAILED,
             "wrong category",
         )
+
+
+def test_tool_review_contract_error_has_its_own_public_code() -> None:
+    cause = ValueError("private detail")
+    error = ToolReviewContractError(
+        "invalid Tool review interrupt",
+        context={"interrupt_id": "interrupt-1"},
+        diagnostic_context={"field": "metadata.deepagents"},
+        cause=cause,
+    )
+
+    assert isinstance(error, AgUiAdapterError)
+    assert isinstance(error, ValueError)
+    assert error.code is AgUiAdapterErrorCode.TOOL_REVIEW_CONTRACT_INVALID
+    assert error.cause is cause
+    assert error.__cause__ is cause
+    assert dict(error.context) == {"interrupt_id": "interrupt-1"}
+    assert dict(error.diagnostic_context) == {"field": "metadata.deepagents"}

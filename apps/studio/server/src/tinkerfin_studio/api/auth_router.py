@@ -4,11 +4,15 @@ from fastapi import APIRouter
 
 from tinkerfin_studio.api.dependencies import (
     AuthServiceDep,
-    RawTokenDep,
-    UserContextDep,
+    AuthSessionDep,
 )
 from tinkerfin_studio.api.responses import ApiResponse
-from tinkerfin_studio.auth.schemas import LoginRequest, LoginResponse, UserRead
+from tinkerfin_studio.auth.schemas import (
+    AuthSessionRead,
+    LoginRequest,
+    LoginResponse,
+    UserRead,
+)
 
 router = APIRouter(prefix="/auth", tags=["认证"])
 
@@ -24,28 +28,25 @@ async def login(
     return ApiResponse.success(
         LoginResponse(
             access_token=result.access_token,
-            expires_in=result.expires_in,
+            expires_at=result.expires_at,
             user=UserRead.from_context(result.user),
         )
     )
 
 
-@router.get("/me", response_model=ApiResponse[UserRead], summary="当前用户")
-async def me(user: UserContextDep) -> ApiResponse[UserRead]:
-    """返回当前登录用户"""
+@router.get("/me", response_model=ApiResponse[AuthSessionRead], summary="当前会话")
+async def me(auth_session: AuthSessionDep) -> ApiResponse[AuthSessionRead]:
+    """返回当前登录用户及固定到期时间"""
 
-    return ApiResponse.success(UserRead.from_context(user))
+    return ApiResponse.success(AuthSessionRead.from_context(auth_session))
 
 
 @router.post("/logout", response_model=ApiResponse[None], summary="登出")
 async def logout(
-    user: UserContextDep,
-    token: RawTokenDep,
+    auth_session: AuthSessionDep,
     auth_service: AuthServiceDep,
 ) -> ApiResponse[None]:
     """撤销当前访问令牌"""
 
-    del user
-    if token is not None:
-        await auth_service.logout(token)
+    await auth_service.logout(auth_session.token)
     return ApiResponse.success()

@@ -44,11 +44,8 @@ members = [
 target-version = "py311"
 line-length = 88
 src = [
-    "packages/tinkerfin/src",
-    "packages/tinkerfin-agui-adapter/src",
-    "packages/tinkerfin-messaging/src",
-    "packages/tinkerfin-sandbox/src",
-    "apps/studio/server/src",
+    "packages/*/src",
+    "apps/*/*/src",
 ]
 
 [tool.ruff.lint]

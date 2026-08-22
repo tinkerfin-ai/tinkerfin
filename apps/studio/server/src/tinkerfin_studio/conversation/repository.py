@@ -45,7 +45,7 @@ class ConversationRepository:
             last_model=model_id,
             last_seq=0,
             snapshot_seq=0,
-            snapshot_version=2,
+            snapshot_version=3,
             message_count=0,
             tool_call_count=0,
             has_pending_interrupt=False,
@@ -76,7 +76,8 @@ class ConversationRepository:
             conversation_thread_id=thread_id,
             run_id=run_id,
             parent_run_id=parent_run_id,
-            parent_agent_run_id=None,
+            origin_main_run_id=None,
+            last_main_run_id=None,
             agent_type="main",
             agent_name=None,
             graph_task_id=None,
@@ -109,6 +110,21 @@ class ConversationRepository:
                 ConversationThread.thread_id == thread_id,
                 ConversationThread.deleted_at.is_(None),
             )
+        )
+
+    async def reload_thread(
+        self, *, user_id: int, thread_id: str
+    ) -> ConversationThread | None:
+        """强制覆盖 Session 中已加载的会话属性并重新校验归属"""
+
+        return await self._session.scalar(
+            select(ConversationThread)
+            .where(
+                ConversationThread.user_id == user_id,
+                ConversationThread.thread_id == thread_id,
+                ConversationThread.deleted_at.is_(None),
+            )
+            .execution_options(populate_existing=True)
         )
 
     async def get_run(self, *, thread_pk: int, run_id: str) -> ConversationRun | None:
@@ -189,38 +205,6 @@ class ConversationRepository:
             .with_for_update()
         )
         return list(result)
-
-    async def list_pending_interrupts(
-        self,
-        *,
-        thread_pk: int,
-    ) -> list[ConversationInterrupt]:
-        """按投影顺序读取会话当前全部 pending interrupt"""
-
-        result = await self._session.scalars(
-            select(ConversationInterrupt)
-            .where(
-                ConversationInterrupt.conversation_thread_id == thread_pk,
-                ConversationInterrupt.status == "pending",
-            )
-            .order_by(ConversationInterrupt.id)
-        )
-        return list(result)
-
-    async def repair_history_snapshot(
-        self,
-        thread: ConversationThread,
-        *,
-        snapshot: dict[str, object] | None,
-        status: str,
-        has_pending_interrupt: bool,
-    ) -> None:
-        """原地修复不改变事实序号和会话排序的历史派生字段"""
-
-        thread.snapshot_json = snapshot
-        thread.status = status
-        thread.has_pending_interrupt = has_pending_interrupt
-        await self._session.flush()
 
     async def release_pending_interrupt_claims(
         self,

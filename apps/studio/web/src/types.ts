@@ -37,7 +37,8 @@ export interface Message {
     toolCallId?: string
     parentMessageId?: string
     subRunId?: string
-    parentRunId?: string
+    originMainRunId?: string
+    lastMainRunId?: string
     graphTaskId?: string
     runId?: string
     completedAt?: string

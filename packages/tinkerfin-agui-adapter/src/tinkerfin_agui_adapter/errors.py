@@ -20,6 +20,7 @@ class AgUiAdapterErrorCode(StrEnum):
     LIFECYCLE_ERROR = "agui.lifecycle_error"
     HITL_CORRELATION_FAILED = "agui.hitl.correlation_failed"
     HITL_NO_MATCH = "agui.hitl.no_match"
+    TOOL_REVIEW_CONTRACT_INVALID = "agui.tool_review.contract_invalid"
     RESUME_INTERRUPT_UNSUPPORTED = "agui.resume.interrupt_unsupported"
     RESUME_DUPLICATE_PENDING_INTERRUPT_ID = "agui.resume.duplicate_pending_interrupt_id"
     RESUME_DECISION_NOT_ALLOWED = "agui.resume.decision_not_allowed"

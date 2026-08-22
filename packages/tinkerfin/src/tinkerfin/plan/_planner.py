@@ -30,6 +30,13 @@ _READ_ONLY_TOOLS: list[FsToolName] = [
 _PLANNER_MODEL_CALL_LIMIT = 6
 _PLANNER_PROMPT = """You are the read-only Planner for a user-reviewed workflow.
 
+You create a Plan for a separate execution Deep Agent. Your deliberately restricted
+tool list exists only for optional workspace inspection; it neither describes nor
+limits the execution Agent's tools. Preserve explicitly requested execution tools and
+capabilities in the draft even when they are absent here. Never call, simulate, or test
+an execution tool yourself, and never claim it is unavailable merely because the
+Planner does not bind it.
+
 Use read-only filesystem tools only when existing workspace evidence can materially
 change the Plan. Start with one targeted listing, read, or search. If that inspection
 shows no relevant artifact, stop inspecting; do not broaden the search, repeat an

@@ -93,6 +93,17 @@ JSON 校验的状态交回父图；Deep Agent 继续继承父 saver，以支持 
 `Identity.threadId`。Plan 状态位于根状态的 `tinkerfin_plan` 字段，`PlanDraft`、
 `ConfirmedPlan`、`PlanState` 等公开模型从 `tinkerfin.plan` 导入。
 
+主执行 middleware 包含 `TodoListMiddleware` 时，每次 `write_todos` 都会在后续执行 Tool 前把
+当前 Todo 提交到父图权威 state 和父 checkpoint，同时保留正常的 Tool
+Start/Args/End/Result 生命周期。因此 Tool interrupt 前的根 snapshot 与恢复请求首个 snapshot
+包含同一份最新 Todo。Todo 只是执行遥测，不替代 `ConfirmedPlan` step 或验收标准；普通
+`task` 子 Agent 和未知 compiled subgraph 不能覆盖该根投影。files 仍属于根可见 Deep Agent
+state，在主执行返回或跨越 Todo 父边界时同步。
+
+Planner 只拥有用于按需检查 workspace 的只读文件工具；这份受限列表不是执行 Deep Agent 的能力
+列表。Planner 可以把用户要求的执行 Tool 写入计划，但不会亲自调用或试运行。Plan 批准后会立即
+开始执行，不会再次索要通用 Plan 审批；执行过程中仍保留 `write_file` 等 Tool 自身配置的人工审批。
+
 `.plan(...)` 省略 `clarification_schema` 时使用内置 `DefaultClarificationForm`。需要为问题
 或选项增加强类型 metadata 的宿主，可以在应用代码中定义具体 `ClarificationForm`，再把该
 类型传给 `.plan(...)`。Schema 固定在返回的 factory 上，不能通过 `new()`、`new_agui()`

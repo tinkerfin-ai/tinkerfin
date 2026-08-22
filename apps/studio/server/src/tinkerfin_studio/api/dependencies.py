@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from tinkerfin_studio.api.errors import BusinessException, GlobalErrorCode
 from tinkerfin_studio.auth.repository import RedisTokenRepository, UserRepository
 from tinkerfin_studio.auth.service import AuthService
-from tinkerfin_studio.auth.types import UserContext
+from tinkerfin_studio.auth.types import AuthenticatedSession, UserContext
 from tinkerfin_studio.conversation.repository import ConversationRepository
 from tinkerfin_studio.conversation.service import (
     ConversationCommandService,
@@ -65,24 +65,36 @@ async def get_raw_token(
 RawTokenDep = Annotated[str | None, Depends(get_raw_token)]
 
 
-async def require_login(
+async def get_auth_session(
     token: RawTokenDep,
     auth_service: AuthServiceDep,
-) -> UserContext:
-    """要求访问令牌对应一个当前可用用户"""
+) -> AuthenticatedSession:
+    """要求访问令牌对应一个尚未到期的当前会话"""
 
     auth_state = await auth_service.resolve_token(token)
-    if not auth_state.is_authenticated or auth_state.user is None:
+    if (
+        not auth_state.is_authenticated
+        or auth_state.token is None
+        or auth_state.user is None
+        or auth_state.expires_at is None
+    ):
         raise BusinessException(GlobalErrorCode.UNAUTHORIZED)
-    return auth_state.user
+    return AuthenticatedSession(
+        token=auth_state.token,
+        expires_at=auth_state.expires_at,
+        user=auth_state.user,
+    )
+
+
+AuthSessionDep = Annotated[AuthenticatedSession, Depends(get_auth_session)]
 
 
 async def get_user_context(
-    user: Annotated[UserContext, Depends(require_login)],
+    auth_session: AuthSessionDep,
 ) -> UserContext:
-    """返回已通过 require_login 校验的用户上下文"""
+    """返回已通过固定会话校验的用户上下文"""
 
-    return user
+    return auth_session.user
 
 
 UserContextDep = Annotated[UserContext, Depends(get_user_context)]

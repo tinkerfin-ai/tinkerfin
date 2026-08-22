@@ -44,7 +44,16 @@ Subagents run in non-root namespaces. The converter preserves full namespaces an
 
 `expose_subagent_events=True` delivers their public events. With `False`, the converter still validates their input but suppresses corresponding public events.
 
-The framework does not use or generate `parentRunId` for LangGraph subgraphs. Namespace and trusted correlation fields describe graph scope.
+The framework does not use or generate `parentRunId` for LangGraph subgraphs. A
+verified Deep Agents delegate carries `tinkerfin.subagent-provenance.v1` in the task
+RAW descriptor. `subagentInvocationId` stays stable across resume, `requestRunId`
+identifies the current main request, child event sources repeat the invocation ID, and
+the parent task Result carries `relatedSubagentInvocationId`.
+
+The descriptor derives its agent name and description from the effective Deep Agents
+`task` fields. The sanitized RAW task data still preserves the complete native
+pre-validation input; additional model-produced arguments neither change subagent
+identity nor invalidate a task that Deep Agents accepts.
 
 ## Reasoning events
 

@@ -1,13 +1,16 @@
+from datetime import UTC, datetime
+
 from httpx import ASGITransport, AsyncClient
 
 from tinkerfin_studio.api.dependencies import (
     get_auth_service,
+    get_auth_session,
     get_model_service,
     get_user_context,
 )
 from tinkerfin_studio.application import create_application
 from tinkerfin_studio.auth.service import LoginResult
-from tinkerfin_studio.auth.types import UserContext
+from tinkerfin_studio.auth.types import AuthenticatedSession, UserContext
 from tinkerfin_studio.models.schemas import (
     AgentModelCatalog,
     AgentModelCatalogItem,
@@ -23,7 +26,11 @@ class RouteAuthService:
 
     async def login(self, username: str, password: str) -> LoginResult:
         assert (username, password) == ("alice", "secret")
-        return LoginResult(access_token="token-1", expires_in=1800, user=self.user)
+        return LoginResult(
+            access_token="token-1",
+            expires_at=datetime(2026, 8, 23, 10, 0, tzinfo=UTC),
+            user=self.user,
+        )
 
     async def logout(self, token: str) -> None:
         self.logged_out.append(token)
@@ -60,8 +67,14 @@ async def test_auth_user_and_model_routes_keep_the_public_contract() -> None:
         disabled=False,
     )
     auth = RouteAuthService(user)
+    auth_session = AuthenticatedSession(
+        token="token-1",
+        expires_at=datetime(2026, 8, 23, 10, 0, tzinfo=UTC),
+        user=user,
+    )
     application = create_application(lifespan=None)
     application.dependency_overrides[get_auth_service] = lambda: auth
+    application.dependency_overrides[get_auth_session] = lambda: auth_session
     application.dependency_overrides[get_user_context] = lambda: user
     application.dependency_overrides[get_model_service] = RouteModelService
 
@@ -84,7 +97,7 @@ async def test_auth_user_and_model_routes_keep_the_public_contract() -> None:
     assert login.json()["data"] == {
         "access_token": "token-1",
         "token_type": "Bearer",
-        "expires_in": 1800,
+        "expires_at": "2026-08-23T10:00:00Z",
         "user": {
             "user_id": 7,
             "username": "alice",
@@ -93,7 +106,10 @@ async def test_auth_user_and_model_routes_keep_the_public_contract() -> None:
             "disabled": False,
         },
     }
-    assert me.json()["data"] == login.json()["data"]["user"]
+    assert me.json()["data"] == {
+        "expires_at": "2026-08-23T10:00:00Z",
+        "user": login.json()["data"]["user"],
+    }
     assert lookup.json()["data"] == login.json()["data"]["user"]
     assert models.json()["data"] == {
         "items": [

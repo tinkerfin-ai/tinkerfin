@@ -150,7 +150,7 @@ function historyDetail(overrides: Partial<ConversationHistoryDetail> & { threadI
     lastModel: 'GPT-5.5',
     lastSeq: 5,
     snapshotSeq: 0,
-    snapshotVersion: 2,
+    snapshotVersion: 3,
     messageCount: 1,
     toolCallCount: 0,
     hasPendingInterrupt: false,
@@ -169,7 +169,7 @@ function historyDetail(overrides: Partial<ConversationHistoryDetail> & { threadI
 function emptyHistorySnapshot(mode: 'default' | 'plan'): ConversationSnapshotJson {
   return {
     snapshotSeq: 0,
-    snapshotVersion: 2,
+    snapshotVersion: 3,
     messages: [],
     todos: [],
     mode,
@@ -446,7 +446,7 @@ describe('App', () => {
     saveAuthSession({
       token: 'workspace-token',
       tokenType: 'Bearer',
-      expiresAt: null,
+      expiresAt: '2099-01-01T00:00:00.000Z',
       user: TEST_USER,
     })
   })
@@ -467,6 +467,31 @@ describe('App', () => {
     expect(screen.queryByRole('button', { name: '模型设置' })).not.toBeInTheDocument()
     expect(screen.queryByText('研究助手')).not.toBeInTheDocument()
     expect(screen.queryByText('季度现金流分析与风险建议')).not.toBeInTheDocument()
+  })
+
+  it('clears a deleted thread and active-run session after conversation data reset', async () => {
+    window.history.replaceState(null, '', '/?thread=deleted-thread')
+    writeActiveRunSession({
+      threadId: 'deleted-thread',
+      mode: 'start',
+      lastSeq: 12,
+      payload: {
+        threadId: 'deleted-thread',
+        runId: 'deleted-run',
+        state: {},
+        messages: [{ id: 'deleted-message', role: 'user', content: 'stale' }],
+        tools: [],
+        context: [],
+        forwardedProps: { mode: 'default', model: 'GPT-5.5' },
+      },
+    })
+    installFetchMock({ historyLists: [{ items: [], nextCursor: null }] })
+
+    render(<App />)
+
+    expect(await screen.findByText('发送一条消息，开始新的真实对话流。')).toBeInTheDocument()
+    await waitFor(() => expect(readActiveRunSession()).toBeNull())
+    await waitFor(() => expect(window.location.search).toBe(''))
   })
 
   it('uses the shared overflow marquee before the selected model indicator', async () => {
@@ -625,7 +650,17 @@ describe('App', () => {
               message: '确认写入',
               toolCallId: WRITE_FILE_CALL_ID,
               metadata: {
+                langgraphValue: {
+                  action_requests: [{ name: 'write_file', args: originalWriteArgs }],
+                  review_configs: [{
+                    action_name: 'write_file',
+                    allowed_decisions: ['approve', 'reject'],
+                  }],
+                },
                 deepagents: {
+                  schema: 'tinkerfin.deepagents.tool-review.v1',
+                  nativeInterruptId: INTERRUPT_ID,
+                  actionIndex: 0,
                   toolName: 'write_file',
                   allowedDecisions: ['approve', 'reject'],
                   originalArgs: originalWriteArgs,
@@ -1989,7 +2024,7 @@ describe('App', () => {
       events: [],
       snapshot: {
         snapshotSeq: 0,
-        snapshotVersion: 2,
+        snapshotVersion: 3,
         messages: [],
         todos: [{ id: 'todo-read-url', content: '读取 url.json', status: 'running' }],
         mode: 'default',
@@ -2095,7 +2130,17 @@ describe('App', () => {
                     required: ['approved'],
                   },
                   metadata: {
+                    langgraphValue: {
+                      action_requests: [{ name: 'write_file', args: originalWriteArgs }],
+                      review_configs: [{
+                        action_name: 'write_file',
+                        allowed_decisions: ['approve', 'edit', 'reject'],
+                      }],
+                    },
                     deepagents: {
+                      schema: 'tinkerfin.deepagents.tool-review.v1',
+                      nativeInterruptId: INTERRUPT_ID,
+                      actionIndex: 0,
                       toolName: 'write_file',
                       allowedDecisions: ['approve', 'edit', 'reject'],
                       originalArgs: originalWriteArgs,

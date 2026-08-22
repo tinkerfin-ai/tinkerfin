@@ -17,8 +17,8 @@
 
 | API | 主要参数 | 什么时候使用 |
 | --- | --- | --- |
-| `astream_events(...)` | `parts`、`identity`、两个公开开关、`prior_tool_call_ids` | 已有原生异步流，希望自动管理完整生命周期 |
-| `DeepAgentAgUiAdapter(...)` | `identity`、旧 Tool ID、两个公开开关 | 需要自己管理主开始和终止事件 |
+| `astream_events(...)` | `parts`、`identity`、公开开关、旧 Tool ID、私有 state key | 已有原生异步流，希望自动管理完整生命周期 |
+| `DeepAgentAgUiAdapter(...)` | `identity`、旧 Tool ID、公开开关、私有 state key | 需要自己管理主开始和终止事件 |
 | `encode_sse(...)` | `event`、可选 `event_id` | 把单个 AG-UI 事件编码为 SSE |
 | `micro_batch(...)` | `events`、可选 batcher | 合并连续的小增量 |
 
@@ -67,6 +67,9 @@
 | `HitlActionRequest` | 非空 `name`、对象 `args`、可选 `description` |
 | `HitlReviewConfig` | `actionName`、非空 `allowedDecisions`、可选 `argsSchema` |
 | `HitlRequest` | 等长且非空的 `actionRequests` 与 `reviewConfigs` |
+| `ToolReviewInterruptMetadata` | 带版本的原生分组、action 位置、Tool 名称、决定与原始参数 |
+| `SubagentProvenance` | 稳定 invocation ID、完整 namespace、graph task、父 Tool、Agent、描述和当前请求 run |
+| `ToolResultCorrelation` | 父图完成子图 Tool 时使用的原 scoped Tool 与父消息 ID |
 
 允许的决定为 `approve`、`edit`、`reject`、`respond`。同一请求中的 action 和 review config 按位置配对。
 
@@ -74,14 +77,19 @@
 interrupt reason，发出该 envelope 的 Graph 负责校验恢复 JSON 的业务语义。一个待处理批次
 不能同时包含 Runtime interrupt 和 Tool interrupt。
 
+`parse_tool_review_interrupt(interrupt)` 按
+`tinkerfin.deepagents.tool-review.v1` 校验完整可信 Tool interrupt。
+`subagent_invocation_id(...)` 和 `create_subagent_provenance(...)` 实现固定的
+`tinkerfin.subagent-provenance.v1` 身份契约。
+
 ## ID 与错误
 
 | API | 作用 |
 | --- | --- |
 | `ScopedIdCodec.encode(...)` | 由类型、完整 namespace、原始 ID 创建 scoped ID |
 | `ScopedIdCodec.decode(...)` | 还原 scoped ID 的三部分 |
-| `InterruptCorrelationError` | 原生 interrupt 无法与运行数据可靠关联 |
 | `HitlCorrelationError` | 审批动作与 Tool 消息无法可靠关联 |
+| `ToolReviewContractError` | 完整 Tool review interrupt 不符合带版本的公开契约 |
 | `SseEventId` | `encode_sse()` 接受的字符串或整数 ID 类型 |
 
 并行工具、子 Agent 和恢复流程都必须使用完整 scoped ID，不能按事件到达顺序关联。

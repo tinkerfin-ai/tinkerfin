@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pytest
-from ag_ui.core import RawEvent
+from ag_ui.core import RawEvent, StateSnapshotEvent
 from langchain_core.messages import AIMessageChunk
 from pydantic_core import PydanticSerializationError
 
@@ -80,7 +80,12 @@ def test_extra_modes_emit_sanitized_raw_events() -> None:
 
 
 def test_checkpoint_projection_drops_runtime_configuration_and_task_state() -> None:
-    adapter = DeepAgentAgUiAdapter(identity=_identity())
+    private_key = "_framework_private"
+    nested = {private_key: "business-value"}
+    adapter = DeepAgentAgUiAdapter(
+        identity=_identity(),
+        private_state_keys=frozenset({private_key}),
+    )
 
     event = adapter.process(
         {
@@ -94,13 +99,21 @@ def test_checkpoint_projection_drops_runtime_configuration_and_task_state() -> N
                     "source": "loop",
                     "parents": {"child": "secret-checkpoint"},
                 },
-                "values": {"answer": 42},
+                "values": {
+                    "answer": 42,
+                    private_key: "internal",
+                    "nested": nested,
+                },
                 "next": ["model"],
                 "tasks": [
                     {
                         "id": "task-1",
                         "name": "model",
-                        "result": {"answer": 42},
+                        "result": {
+                            "answer": 42,
+                            private_key: "internal",
+                            "nested": nested,
+                        },
                         "interrupts": [],
                         "state": {"configurable": {"checkpoint_id": "secret-child"}},
                     }
@@ -112,18 +125,103 @@ def test_checkpoint_projection_drops_runtime_configuration_and_task_state() -> N
     assert isinstance(event, RawEvent)
     assert event.event["data"] == {
         "step": 3,
-        "values": {"answer": 42},
+        "values": {"answer": 42, "nested": nested},
         "next": ["model"],
         "tasks": [
             {
                 "id": "task-1",
                 "name": "model",
-                "result": {"answer": 42},
+                "result": {"answer": 42, "nested": nested},
                 "interrupts": [],
             }
         ],
     }
     assert "secret" not in event.model_dump_json()
+
+
+def test_private_state_policy_covers_subgraphs_debug_and_interrupt_snapshot() -> None:
+    private_key = "_framework_private"
+    nested = {private_key: "business-value"}
+    adapter = DeepAgentAgUiAdapter(
+        identity=_identity(),
+        private_state_keys=frozenset({private_key}),
+    )
+    adapter.process(_task_start())
+    child = adapter.process(
+        {
+            "type": "values",
+            "ns": ("tools:graph-task-1",),
+            "data": {private_key: "internal", "nested": nested},
+            "interrupts": (),
+        }
+    )[0]
+    assert isinstance(child, RawEvent)
+    assert child.event["state"] == {"nested": nested}
+
+    debug_parts = (
+        {
+            "type": "checkpoint",
+            "payload": {
+                "values": {private_key: "internal", "nested": nested},
+                "next": [],
+            },
+        },
+        {
+            "type": "task",
+            "payload": {
+                "id": "debug-task",
+                "name": "model",
+                "input": {private_key: "internal", "nested": nested},
+                "triggers": [],
+            },
+        },
+        {
+            "type": "task_result",
+            "payload": {
+                "id": "debug-task",
+                "name": "model",
+                "error": None,
+                "interrupts": [],
+                "result": {private_key: "internal", "nested": nested},
+            },
+        },
+    )
+    for step, data in enumerate(debug_parts):
+        event = adapter.process(
+            {
+                "type": "debug",
+                "ns": (),
+                "data": {"step": step, **data},
+            }
+        )[0]
+        assert isinstance(event, RawEvent)
+        serialized = event.model_dump_json(by_alias=True)
+        assert '"internal"' not in serialized
+        assert '"business-value"' in serialized
+
+    interrupt_events = adapter.process(
+        {
+            "type": "values",
+            "ns": (),
+            "data": {private_key: "internal", "nested": nested, "messages": []},
+            "interrupts": (
+                {
+                    "id": "runtime-pause",
+                    "value": {
+                        "schema": "tinkerfin.runtime-interrupt.v1",
+                        "kind": "pause",
+                        "message": "Continue?",
+                        "responseSchema": {"type": "object"},
+                        "metadata": {},
+                    },
+                },
+            ),
+        }
+    )
+    snapshot = next(
+        event for event in interrupt_events if isinstance(event, StateSnapshotEvent)
+    )
+    assert snapshot.snapshot == {"nested": nested}
 
 
 def test_checkpoint_projection_normalizes_task_exceptions() -> None:
