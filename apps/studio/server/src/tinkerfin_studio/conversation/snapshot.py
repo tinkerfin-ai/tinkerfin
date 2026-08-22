@@ -28,7 +28,6 @@ def empty_snapshot() -> dict[str, object]:
         "activeRunId": None,
         "serverState": {},
         "runs": {},
-        "activities": [],
         "interrupts": [],
     }
 
@@ -267,6 +266,17 @@ def _project_todos(snapshot: dict[str, object], state: dict[str, object]) -> Non
             }
         )
     snapshot["todos"] = converted
+
+
+def _project_effective_mode(
+    snapshot: dict[str, object], state: dict[str, object]
+) -> None:
+    """采用框架 PlanState 公布的当前有效执行模式"""
+
+    plan = state.get("tinkerfin_plan")
+    mode = plan.get("effectiveMode") if isinstance(plan, dict) else None
+    if mode in {"default", "plan"}:
+        snapshot["mode"] = mode
 
 
 def reduce_snapshot(
@@ -508,6 +518,7 @@ def reduce_snapshot(
         if isinstance(state, dict):
             snapshot["serverState"] = state
             _project_todos(snapshot, state)
+            _project_effective_mode(snapshot, state)
     elif event_type == "STATE_DELTA":
         operations = payload.get("delta")
         server_state = snapshot.get("serverState")
@@ -520,6 +531,7 @@ def reduce_snapshot(
                 raise TypeError("STATE_DELTA 必须保留 object 根状态")
             snapshot["serverState"] = patched
             _project_todos(snapshot, patched)
+            _project_effective_mode(snapshot, patched)
     elif event_type == "RUN_FINISHED":
         event_run_id = str(payload.get("runId", run_id))
         outcome = payload.get("outcome")

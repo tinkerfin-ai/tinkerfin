@@ -12,11 +12,9 @@ from tinkerfin_studio.api.errors import BusinessException, GlobalErrorCode
 from tinkerfin_studio.auth.repository import RedisTokenRepository, UserRepository
 from tinkerfin_studio.auth.service import AuthService
 from tinkerfin_studio.auth.types import AuthenticatedSession, UserContext
+from tinkerfin_studio.conversation.command import ConversationCommandService
+from tinkerfin_studio.conversation.history import ConversationHistoryService
 from tinkerfin_studio.conversation.repository import ConversationRepository
-from tinkerfin_studio.conversation.service import (
-    ConversationCommandService,
-    ConversationHistoryService,
-)
 from tinkerfin_studio.models.repository import AgentModelRepository
 from tinkerfin_studio.models.service import AgentModelService
 from tinkerfin_studio.resources import get_resources

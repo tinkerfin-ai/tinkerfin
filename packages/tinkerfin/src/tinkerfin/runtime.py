@@ -642,7 +642,6 @@ class TinkerFin:
         *,
         enabled: bool = True,
         default_mode: AgentMode = "default",
-        gate_model: str | BaseChatModel | None = None,
         planner_model: str | BaseChatModel | None = None,
         clarification_schema: type[ClarificationFormBase] = DefaultClarificationForm,
     ) -> TinkerFin:
@@ -654,9 +653,8 @@ class TinkerFin:
         Args:
             enabled: Whether subsequent Deep Agent Definitions support Plan runs.
             default_mode: Run mode used when ``new`` or ``new_agui`` omits one.
-            gate_model: Optional model dedicated to conservative request routing.
-            planner_model: Optional model dedicated to read-only Plan drafting.
-            clarification_schema: Concrete host form used by Gate and Planner.
+            planner_model: Optional model dedicated to read-only planning.
+            clarification_schema: Concrete host form used by the Planner.
 
         Returns:
             A separate configured TinkerFin factory.
@@ -669,10 +667,7 @@ class TinkerFin:
         if type(enabled) is not bool:
             raise TypeError("enabled must be a bool")
         mode = validate_agent_mode(default_mode, name="default_mode")
-        for name, model in (
-            ("gate_model", gate_model),
-            ("planner_model", planner_model),
-        ):
+        for name, model in (("planner_model", planner_model),):
             if model is not None and not isinstance(model, (str, BaseChatModel)):
                 raise TypeError(
                     f"{name} must be a model string, BaseChatModel, or None"
@@ -681,7 +676,6 @@ class TinkerFin:
                 raise ValueError(f"{name} must not be blank")
         if not enabled and (
             mode != "default"
-            or gate_model is not None
             or planner_model is not None
             or clarification_schema is not DefaultClarificationForm
         ):
@@ -698,7 +692,6 @@ class TinkerFin:
             configured._plan_options = PlanOptions(
                 clarification=create_clarification_binding(clarification_schema),
                 default_mode=mode,
-                gate_model=gate_model,
                 planner_model=planner_model,
             )
         return configured

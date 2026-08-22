@@ -260,7 +260,6 @@ class ConversationAgentFactory:
         )
         return self._tinkerfin.plan(
             enabled=True,
-            gate_model=plan_model,
             planner_model=plan_model,
         ).create_deep_agent(
             model=model,

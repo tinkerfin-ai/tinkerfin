@@ -385,12 +385,7 @@ async def test_native_runtime_forwards_the_bound_call_lazily_and_is_single_use(
         (
             (
                 graph_input,
-                {
-                    "configurable": {
-                        "thread_id": "thread-1",
-                        "tinkerfin_plan_mode": "default",
-                    }
-                },
+                {"configurable": {"thread_id": "thread-1"}},
             ),
             {
                 "context": {"tenant": "tenant-1"},
@@ -429,12 +424,7 @@ async def test_native_invalid_binding_does_not_claim_the_runtime(
     assert await anext(stream) is part
     await stream.aclose()
     assert len(graphs[0].calls) == 1
-    assert graphs[0].calls[0][0][1] == {
-        "configurable": {
-            "thread_id": "thread-1",
-            "tinkerfin_plan_mode": "default",
-        }
-    }
+    assert graphs[0].calls[0][0][1] == {"configurable": {"thread_id": "thread-1"}}
     assert graphs[0].calls[0][1]["version"] == "v2"
 
 

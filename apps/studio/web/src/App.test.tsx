@@ -178,7 +178,6 @@ function emptyHistorySnapshot(mode: 'default' | 'plan'): ConversationSnapshotJso
     activeRunId: null,
     serverState: {},
     runs: {},
-    activities: [],
     interrupts: [],
   }
 }
@@ -634,7 +633,7 @@ describe('App', () => {
     expect(presetButton).toHaveTextContent('default')
   })
 
-  it('changes the future mode without cancelling a pending Tool approval', async () => {
+  it('disables mode changes while a Tool approval is pending', async () => {
     const fetchMock = installFetchMock({
       streams: [[
         { type: 'RUN_STARTED', threadId: THREAD_ID, runId: FIRST_RUN_ID },
@@ -671,18 +670,15 @@ describe('App', () => {
         },
       ]],
     })
-    const user = userEvent.setup()
     render(<App />)
     await sendMessage('等待 Tool 审批')
     expect(await screen.findByText('确认写入')).toBeInTheDocument()
 
     const presetButton = screen.getByRole('button', { name: '当前 Agent 预设' })
-    await user.click(presetButton)
-    await user.click(screen.getByRole('option', { name: 'plan' }))
-
-    expect(presetButton).toHaveTextContent('plan')
+    expect(presetButton).toBeDisabled()
+    expect(screen.queryByRole('listbox', { name: 'Agent 预设选项' })).not.toBeInTheDocument()
+    expect(presetButton).toHaveTextContent('default')
     expect(screen.getByText('确认写入')).toBeInTheDocument()
-    expect(screen.queryByRole('dialog', { name: '关闭当前 Plan？' })).not.toBeInTheDocument()
     expect(chatRequestAt(fetchMock, 1)).toBeUndefined()
   })
 
@@ -2032,7 +2028,6 @@ describe('App', () => {
         runStatus: 'idle',
         serverState: {},
         runs: {},
-        activities: [],
         interrupts: [],
       },
     })

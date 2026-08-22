@@ -365,7 +365,6 @@ async def test_projection_preserves_plan_mode_and_pending_plan_interrupt(
                                     "responseSchema": {"type": "object"},
                                     "metadata": {
                                         "origin": "plan",
-                                        "source": "gate",
                                         "clarification": {
                                             "schema": "tinkerfin.plan-clarification.v1",
                                             "form": {
@@ -763,7 +762,6 @@ async def test_initialization_error_releases_resume_claim_without_consuming_it(
         "activeRunId": None,
         "serverState": {"todos": [{"id": "todo-pending"}]},
         "runs": {},
-        "activities": [],
         "interrupts": [pending_request],
     }
     run = await repository.create_main_run(
@@ -845,15 +843,14 @@ async def test_initialization_error_releases_resume_claim_without_consuming_it(
     assert thread.has_pending_interrupt is True
     assert thread.last_seq == 2
     assert thread.snapshot_seq == 2
-    assert thread.snapshot_json is not None
-    assert thread.snapshot_json["snapshotSeq"] == thread.snapshot_seq
-    assert thread.snapshot_json["runStatus"] == "waiting_approval"
-    assert thread.snapshot_json["activeRunId"] is None
-    assert thread.snapshot_json["approval"] == approval
-    assert thread.snapshot_json["interrupts"] == [pending_request]
-    assert thread.snapshot_json["todos"] == [
-        {"id": "todo-pending", "status": "running"}
-    ]
+    snapshot = thread.snapshot_json
+    assert snapshot is not None
+    assert snapshot["snapshotSeq"] == thread.snapshot_seq
+    assert snapshot["runStatus"] == "waiting_approval"
+    assert snapshot["activeRunId"] is None
+    assert snapshot["approval"] == approval
+    assert snapshot["interrupts"] == [pending_request]
+    assert snapshot["todos"] == [{"id": "todo-pending", "status": "running"}]
 
     class NoopProjector(ConversationProjectionCoordinator):
         def __init__(self) -> None:
@@ -1667,8 +1664,23 @@ async def test_state_delta_updates_server_state_and_todo_projection(
         (
             {"type": "RUN_STARTED", "threadId": "thread-delta", "runId": "run-1"},
             {
+                "type": "STATE_SNAPSHOT",
+                "snapshot": {
+                    "tinkerfin_plan": {
+                        "workflowVersion": "tinkerfin.plan.v3",
+                        "effectiveMode": "plan",
+                    },
+                    "todos": [],
+                },
+            },
+            {
                 "type": "STATE_DELTA",
                 "delta": [
+                    {
+                        "op": "replace",
+                        "path": "/tinkerfin_plan/effectiveMode",
+                        "value": "default",
+                    },
                     {
                         "op": "add",
                         "path": "/todos",
@@ -1678,7 +1690,7 @@ async def test_state_delta_updates_server_state_and_todo_projection(
                                 "status": "in_progress",
                             }
                         ],
-                    }
+                    },
                 ],
             },
         ),
@@ -1692,8 +1704,13 @@ async def test_state_delta_updates_server_state_and_todo_projection(
     snapshot = thread.snapshot_json
     assert snapshot is not None
     assert snapshot["serverState"] == {
-        "todos": [{"content": "验证 todo 实时输出", "status": "in_progress"}]
+        "tinkerfin_plan": {
+            "workflowVersion": "tinkerfin.plan.v3",
+            "effectiveMode": "default",
+        },
+        "todos": [{"content": "验证 todo 实时输出", "status": "in_progress"}],
     }
+    assert snapshot["mode"] == "default"
     assert snapshot["todos"] == [
         {
             "id": "todo-0",

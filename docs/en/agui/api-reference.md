@@ -67,7 +67,6 @@ See [AG-UI basics](index.md) for Runtime parameters and [Interrupts and resume](
 | `HitlRequest` | Equally sized, non-empty `actionRequests` and `reviewConfigs` |
 | `ToolReviewInterruptMetadata` | Versioned native group, action position, Tool name, decisions, and original arguments |
 | `SubagentProvenance` | Stable invocation ID, full namespaces, graph task, parent Tool, Agent, description, and current request run |
-| `ToolResultCorrelation` | Original scoped Tool and parent-message IDs for a parent-completed child Tool |
 
 Allowed decisions are `approve`, `edit`, `reject`, and `respond`. Action and review entries pair by position.
 

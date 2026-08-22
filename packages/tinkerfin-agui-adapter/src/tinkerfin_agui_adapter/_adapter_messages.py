@@ -80,7 +80,6 @@ from .reasoning import (
     normalize_operational_data,
     sanitize_public_data,
 )
-from .tool_result import TOOL_RESULT_CORRELATION_KEY, ToolResultCorrelation
 
 if TYPE_CHECKING:
     from .adapter import DeepAgentAgUiAdapter
@@ -226,11 +225,7 @@ def _process_message_part(
     metadata = part.data.metadata
     agent_name = metadata.lc_agent_name
     message = part.data.message
-    source_namespace = (
-        _correlated_tool_result_namespace(self, message, part.ns)
-        if isinstance(message, ToolMessage)
-        else part.ns
-    )
+    source_namespace = part.ns
     source = self._source(source_namespace)
     self._require_started_source(source)
     self._record_agent_name(source_namespace, agent_name)
@@ -279,44 +274,6 @@ def _process_message_part(
     elif isinstance(message, ToolMessage):
         events.extend(self._process_tool_result(message, source, raw_event))
     return events
-
-
-def _tool_result_correlation(
-    message: ToolMessage,
-) -> ToolResultCorrelation | None:
-    raw = message.additional_kwargs.get(TOOL_RESULT_CORRELATION_KEY)
-    if raw is None:
-        return None
-    return ToolResultCorrelation.model_validate(raw)
-
-
-def _correlated_tool_result_namespace(
-    self: DeepAgentAgUiAdapter,
-    message: ToolMessage,
-    envelope_namespace: tuple[str, ...],
-) -> tuple[str, ...]:
-    correlation = _tool_result_correlation(message)
-    if correlation is None:
-        return envelope_namespace
-    tool_kind, tool_namespace, raw_tool_id = self._ids.decode(correlation.tool_call_id)
-    message_kind, message_namespace, _raw_message_id = self._ids.decode(
-        correlation.parent_message_id
-    )
-    if (
-        tool_kind != "tool"
-        or message_kind != "message"
-        or tool_namespace != message_namespace
-        or raw_tool_id != str(message.tool_call_id)
-    ):
-        raise ValueError("Tool result correlation contains inconsistent scoped IDs")
-    if not any(
-        call.tool_call_id == correlation.tool_call_id
-        and call.parent_message_id == correlation.parent_message_id
-        for history in self._tool_history.values()
-        for call in history
-    ):
-        raise ValueError("Tool result correlation does not match a streamed Tool call")
-    return tool_namespace
 
 
 def _process_ai_chunk(
@@ -890,21 +847,6 @@ def _convert_messages(
     ):
         raise TypeError("values messages must be a sequence")
     messages = cast(Sequence[object], raw_messages)
-    correlations: dict[str, ToolResultCorrelation] = {}
-    for message in messages:
-        if not isinstance(message, ToolMessage):
-            continue
-        correlation = _tool_result_correlation(message)
-        if correlation is None:
-            continue
-        _correlated_tool_result_namespace(self, message, namespace)
-        raw_tool_id = str(message.tool_call_id)
-        previous = correlations.get(raw_tool_id)
-        if previous is not None and previous != correlation:
-            raise ValueError(
-                f"conflicting Tool result correlation for raw ID: {raw_tool_id}"
-            )
-        correlations[raw_tool_id] = correlation
     converted: list[Message] = []
     for index, message in enumerate(messages):
         if not isinstance(message, BaseMessage):
@@ -914,41 +856,7 @@ def _convert_messages(
             if isinstance(message, AIMessage)
             else str(message.id or f"state-message-{index}")
         )
-        message_namespace = namespace
-        if isinstance(message, AIMessage):
-            message_correlations = [
-                correlations[str(call_id)]
-                for call in message.tool_calls
-                if (call_id := call.get("id")) is not None
-                and str(call_id) in correlations
-            ]
-            if message_correlations:
-                decoded = [
-                    self._ids.decode(correlation.parent_message_id)
-                    for correlation in message_correlations
-                ]
-                if any(
-                    kind != "message" or raw_id != raw_message_id
-                    for kind, _source_namespace, raw_id in decoded
-                ):
-                    raise ValueError(
-                        "Tool result correlation does not match its assistant message"
-                    )
-                source_namespaces = {
-                    source_namespace for _kind, source_namespace, _raw_id in decoded
-                }
-                if len(source_namespaces) != 1:
-                    raise ValueError(
-                        "one assistant message cannot span Tool result namespaces"
-                    )
-                message_namespace = next(iter(source_namespaces))
-        elif isinstance(message, ToolMessage):
-            correlation = correlations.get(str(message.tool_call_id))
-            if correlation is not None:
-                _kind, message_namespace, _raw_id = self._ids.decode(
-                    correlation.tool_call_id
-                )
-        message_id = self._message_id(message_namespace, raw_message_id)
+        message_id = self._message_id(namespace, raw_message_id)
         if isinstance(message, HumanMessage):
             converted.append(
                 UserMessage(
@@ -968,18 +876,13 @@ def _convert_messages(
             )
             continue
         if isinstance(message, ToolMessage):
-            correlation = correlations.get(str(message.tool_call_id))
             converted.append(
                 AgUiToolMessage(
                     id=message_id,
                     content=_normalize_tool_content(message.content),
-                    tool_call_id=(
-                        correlation.tool_call_id
-                        if correlation is not None
-                        else self._tool_call_id(
-                            message_namespace,
-                            str(message.tool_call_id),
-                        )
+                    tool_call_id=self._tool_call_id(
+                        namespace,
+                        str(message.tool_call_id),
                     ),
                 )
             )
@@ -1000,14 +903,7 @@ def _convert_messages(
                 )
                 tool_calls.append(
                     ToolCall(
-                        id=(
-                            correlations[str(raw_call_id)].tool_call_id
-                            if str(raw_call_id) in correlations
-                            else self._tool_call_id(
-                                message_namespace,
-                                str(raw_call_id),
-                            )
-                        ),
+                        id=self._tool_call_id(namespace, str(raw_call_id)),
                         function=FunctionCall(
                             name=name,
                             arguments=arguments,

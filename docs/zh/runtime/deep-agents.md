@@ -57,7 +57,6 @@ agent = tinkerfin.create_deep_agent(
 TinkerFin，不会改变 Deep Agents 的建图参数。
 
 ```python
-from langgraph.checkpoint.memory import MemorySaver
 from tinkerfin import TinkerFin
 
 
@@ -65,40 +64,34 @@ tinkerfin = TinkerFin(state_schema=AppState)
 agent = tinkerfin.plan(
     enabled=True,
     default_mode="default",
-    gate_model="openai:gpt-5.4-mini",
     planner_model="openai:gpt-5.4",
 ).create_deep_agent(
     model="openai:gpt-5.4",
     tools=[search_orders],
-    checkpointer=MemorySaver(),
+    checkpointer=production_checkpointer,
 )
 ```
 
 `.plan(...)` 返回新的 TinkerFin 对象，不会修改 `tinkerfin`。新对象继续使用同一个 run
 coordinator 和全局 state schema，每个 Definition 固定采用创建它的 factory 能力配置。
-`gate_model` 和 `planner_model` 都可省略；省略时分别使用 Deep Agent 的执行模型。
+`planner_model` 可省略；省略时使用显式配置的 Deep Agent 执行模型。
 
 Plan Mode 按下面的边界处理请求：
 
-1. 保守 Gate 在直接执行、需求澄清和规划之间选择
+1. 一个只读 Planner 判断意图和约束是否充分
 2. Planner 只能使用 `ls`、`read_file`、`glob` 和 `grep`
 3. 澄清问题可以包含模型动态生成的单选项，并通过 `allow_free_text` 决定是否允许自由输入；需求澄清和
    计划审批通过 LangGraph interrupt 暂停
-4. 用户批准后生成不可变的 `ConfirmedPlan`，并通过 system request 交给原 Deep Agent
+4. 用户批准后冻结 `ConfirmedPlan`，以原用户消息 ID 提交确定性的 v3 handoff，并立即启动原生 Deep Agent
 
-Plan Mode 必须提供明确模型和具体 `BaseCheckpointSaver`。父 Plan 工作流持有调用方传入的
-durable checkpointer。Gate 和 Planner 不产生 interrupt，关闭子图 checkpoint，并把完成
-JSON 校验的状态交回父图；Deep Agent 继续继承父 saver，以支持 Tool/Filesystem HITL。
-所有子图继续使用父 runtime 的 store 和 cache。恢复时必须保持同一个
-`Identity.threadId`。Plan 状态位于根状态的 `tinkerfin_plan` 字段，`PlanDraft`、
-`ConfirmedPlan`、`PlanState` 等公开模型从 `tinkerfin.plan` 导入。
+选择 Plan 时必须提供明确 Planner 模型和具体 `BaseCheckpointSaver`。TinkerFin 不会自动创建
+进程内 saver，也不会静默降低 durability；生产环境必须提供生产级 saver。Planning 与原生
+Deep Agent 借用同一个 saver、Store、cache、backend 和 runtime context。恢复时必须保持同一个
+`Identity.threadId`。Plan 状态位于根状态的 `tinkerfin_plan` 字段，`PlanContent`、
+`PlanDraft`、`ConfirmedPlan`、`PlanHandoff`、`PlanState` 等模型从 `tinkerfin.plan` 导入。
 
-主执行 middleware 包含 `TodoListMiddleware` 时，每次 `write_todos` 都会在后续执行 Tool 前把
-当前 Todo 提交到父图权威 state 和父 checkpoint，同时保留正常的 Tool
-Start/Args/End/Result 生命周期。因此 Tool interrupt 前的根 snapshot 与恢复请求首个 snapshot
-包含同一份最新 Todo。Todo 只是执行遥测，不替代 `ConfirmedPlan` step 或验收标准；普通
-`task` 子 Agent 和未知 compiled subgraph 不能覆盖该根投影。files 仍属于根可见 Deep Agent
-state，在主执行返回或跨越 Todo 父边界时同步。
+`mode="default"` 直接运行原生 Deep Agent Graph，不进入 Planning、不追加 middleware、不替换
+state schema，也不创建父 Graph。Todo、Tool/Filesystem HITL、子 Agent、取消和异常语义保持原生行为。
 
 Planner 只拥有用于按需检查 workspace 的只读文件工具；这份受限列表不是执行 Deep Agent 的能力
 列表。Planner 可以把用户要求的执行 Tool 写入计划，但不会亲自调用或试运行。Plan 批准后会立即
@@ -110,9 +103,14 @@ Planner 只拥有用于按需检查 workspace 的只读文件工具；这份受�
 或 resume 替换。attributes 必须使用具体 `ClarificationModel` 子类；这些数据会公开给用户，
 属于模型生成的规划参考，不能直接作为权限、计费或合规依据。
 
-Python 字段使用 `allow_free_text`，JSON 边界使用 `allowFreeText`。选择 Option 时只提交
+Python 字段使用 `allow_free_text`，JSON 边界使用 `allowFreeText`。每轮包含 1～3 个阻塞问题，
+用户填写后整组提交。选择 Option 时只提交
 `questionId` 和 `optionId`；自由输入时只提交 `questionId` 和 `answer`。工作流从 checkpoint
-恢复可信 Form 并派生 Option label，混合、缺失、未知或过期回答都会被拒绝。
+恢复可信 Form 并派生 Option label，混合、缺失、未知或过期回答都会被拒绝。信息仍不足时，
+Planner 会继续下一轮澄清。
+
+完整编辑后的草稿是用户权威约束。Planner 只能继续澄清或接受该草稿，不得静默替换。澄清期间
+revision 不变；只有形成完整可审阅草稿时才递增一次。
 
 Plan Mode 固定使用 `sync` checkpoint durability。通常省略 `durability` 即可；显式传入
 `sync` 也可以，`async` 和 `exit` 会在事件流开始前报错。
@@ -130,9 +128,9 @@ default_runtime = agent.new_agui(
 )
 ```
 
-两次请求使用同一份 Plan-capable topology 和 state schema。`default` 绕过 Gate，`plan`
-进入 Gate；同一 checkpoint thread 的后续请求可以再次选择任一 mode。mode 不会成为应用
-state 字段。不能用普通 Definition 恢复 Plan-capable checkpoint。
+`default` 使用原生 topology 和 state schema，`plan` 使用独立 Planning Graph。批准后在原生执行前
+把有效 mode 切为 `default`。同一 checkpoint thread 的后续请求可以再次选择 Plan；Plan resume
+回到 Planning，Tool 与子 Agent resume 直接回到原生 Graph。
 
 ## 创建一次原生 Runtime
 
@@ -185,9 +183,9 @@ stream = runtime.astream(
 | --- | --- | --- |
 | `interrupt_before` | `None` | 在指定节点执行前暂停 |
 | `interrupt_after` | `None` | 在指定节点执行后暂停 |
-| `durability` | `None` | 控制 checkpoint 的持久化时机；Plan Mode 必须使用 `sync` |
+| `durability` | `None` | 控制 checkpoint 持久化时机；Planning 与 handoff 必须使用 `sync` |
 | `control` | `None` | 传入 LangGraph 运行控制信息 |
-| 其他关键字参数 | 无 | 兼容当前 LangGraph 支持的附加运行参数 |
+| 其他关键字参数 | 无 | 沿用当前 LangGraph 支持的附加运行参数 |
 
 如果只想读取最终状态，可以使用 `stream_mode="values"`。如果要自己观察完整的 v2 运行数据，通常组合 `messages`、`tasks`、`values`，并启用 `subgraphs=True`。
 

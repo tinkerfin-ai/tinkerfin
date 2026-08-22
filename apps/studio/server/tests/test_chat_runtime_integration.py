@@ -24,6 +24,7 @@ from tinkerfin_messaging.messaging import Messaging
 from tinkerfin_studio.agent.factory import ConversationAgentFactory
 from tinkerfin_studio.api.errors import BusinessException, ConversationErrorCode
 from tinkerfin_studio.auth.types import UserContext
+from tinkerfin_studio.conversation.command import ConversationCommandService
 from tinkerfin_studio.conversation.coordinator import (
     ConversationProjectionCoordinator,
 )
@@ -37,10 +38,7 @@ from tinkerfin_studio.conversation.run_preparation import (
     conversation_identity,
     prepare_resume,
 )
-from tinkerfin_studio.conversation.service import (
-    ConversationChatService,
-    ConversationCommandService,
-)
+from tinkerfin_studio.conversation.service import ConversationChatService
 from tinkerfin_studio.infrastructure.database import Database
 from tinkerfin_studio.models.repository import AgentModelRepository
 from tinkerfin_studio.models.schemas import AgentModelWrite

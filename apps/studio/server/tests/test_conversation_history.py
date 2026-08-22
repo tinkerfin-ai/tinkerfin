@@ -16,9 +16,9 @@ from tinkerfin_studio.api.errors import (
 from tinkerfin_studio.conversation.coordinator import (
     ConversationProjectionCoordinator,
 )
+from tinkerfin_studio.conversation.history import ConversationHistoryService
 from tinkerfin_studio.conversation.models import ConversationInterrupt
 from tinkerfin_studio.conversation.repository import ConversationRepository
-from tinkerfin_studio.conversation.service import ConversationHistoryService
 from tinkerfin_studio.conversation.snapshot import empty_snapshot
 from tinkerfin_studio.infrastructure.database import Database
 
@@ -504,7 +504,6 @@ async def test_get_detail_does_not_reinterpret_persisted_tool_approval(
         "activeRunId": None,
         "serverState": {},
         "runs": {},
-        "activities": [],
         "interrupts": [request_json],
     }
     thread.snapshot_json = persisted_snapshot
@@ -576,7 +575,6 @@ async def test_get_detail_does_not_repair_stale_interrupt_snapshot(
         "activeRunId": None,
         "serverState": {},
         "runs": {},
-        "activities": [],
         "interrupts": [
             {
                 "id": "resolved-plan",
@@ -645,7 +643,6 @@ async def test_get_detail_preserves_running_snapshot_without_pending_interrupts(
                 "agentType": "main",
             }
         },
-        "activities": [],
         "interrupts": [],
     }
     thread.snapshot_json = running_snapshot

@@ -1,4 +1,4 @@
-"""Read-only Planner agent used by the parent Plan workflow."""
+"""Read-only Planner agent used by the standalone Planning workflow."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from langchain.agents import create_agent  # pyright: ignore[reportUnknownVariab
 from langchain.agents.middleware import AgentMiddleware, ModelCallLimitMiddleware
 from langchain.agents.structured_output import ToolStrategy
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.typing import ContextT
 
@@ -28,7 +28,7 @@ _READ_ONLY_TOOLS: list[FsToolName] = [
     "grep",
 ]
 _PLANNER_MODEL_CALL_LIMIT = 6
-_PLANNER_PROMPT = """You are the read-only Planner for a user-reviewed workflow.
+_PLANNER_PROMPT = """You are the single read-only Planner for a user-reviewed workflow.
 
 You create a Plan for a separate execution Deep Agent. Your deliberately restricted
 tool list exists only for optional workspace inspection; it neither describes nor
@@ -44,12 +44,22 @@ equivalent query, or guess file paths. State the resulting assumption in the dra
 Spend no more than three model turns on filesystem inspection, then return the
 structured outcome.
 
-Never claim to have modified state and never request a write or execution tool. Return
-either one clarification form or one complete structured draft with ordered,
-independently verifiable steps and final acceptance criteria. Do not expose private
-chain-of-thought. For each blocking question, generate concise single-select options
-when they can cover the likely choices, and decide whether free-text input is also safe
-and useful.
+First decide whether the user's intent and constraints are sufficient for an executable
+Plan. When material information is missing, return one clarification form containing
+one to three blocking questions. Reassess sufficiency after every complete answer batch;
+multiple clarification rounds are allowed.
+
+The trusted context can contain an authoritativeEdit. It is user-authored and must never
+be silently rewritten. When an authoritativeEdit is present, return clarify if it is
+still insufficient, or accept_edit when it is sufficient. Do not return a replacement
+draft for an authoritative edit. Without an authoritativeEdit, return clarify or one
+complete structured draft with ordered, independently verifiable steps and final
+acceptance criteria.
+
+Never claim to have modified state and never request a write or execution tool. Do not
+expose private chain-of-thought. For each blocking question, generate concise
+single-select options when they cover likely choices, and allow free text whenever it
+can safely express a valid alternative.
 """
 
 
@@ -59,6 +69,29 @@ class _StructuredAgent(Protocol):
         input: Mapping[str, object],
         config: RunnableConfig | None = None,
     ) -> Mapping[str, object]: ...
+
+
+def _invalid_structured_call_messages(
+    result: Mapping[str, object],
+) -> tuple[BaseMessage, ...] | None:
+    """Return validated state only for a provider-invalid Planner tool call."""
+
+    raw_messages = result.get("messages")
+    if not isinstance(raw_messages, Sequence) or isinstance(raw_messages, (str, bytes)):
+        return None
+    values = cast(Sequence[object], raw_messages)
+    messages = tuple(item for item in values if isinstance(item, BaseMessage))
+    if len(messages) != len(values):
+        return None
+    last_ai = next(
+        (message for message in reversed(messages) if isinstance(message, AIMessage)),
+        None,
+    )
+    if last_ai is None or not any(
+        call.get("name") == "PlannerOutcome" for call in last_ai.invalid_tool_calls
+    ):
+        return None
+    return messages
 
 
 def create_planner_agent(
@@ -121,6 +154,11 @@ async def invoke_planner(
     context = {
         "goal": plan.goal,
         "clarifications": list(clarification_history),
+        "authoritativeEdit": (
+            None
+            if plan.edited_draft is None
+            else plan.edited_draft.model_dump(mode="json", by_alias=True)
+        ),
         "previousDraft": (
             None
             if plan.draft is None
@@ -145,11 +183,38 @@ async def invoke_planner(
         config=stateless_child_config(config),
     )
     response = result.get("structured_response")
-    if not isinstance(response, clarification.planner_response_type):
-        raise PlanStructuredOutputError(
-            "Planner did not return the configured structured response type"
+    if isinstance(response, clarification.planner_response_type):
+        return response
+
+    invalid_messages = _invalid_structured_call_messages(result)
+    if invalid_messages is not None:
+        retry_input: dict[str, object] = {
+            "messages": [
+                *invalid_messages,
+                HumanMessage(
+                    content=(
+                        "Your previous PlannerOutcome tool call had invalid JSON "
+                        "arguments and was not executed. Return exactly one valid "
+                        "PlannerOutcome tool call for the same planning decision. "
+                        "Use strict JSON without trailing commas or comments."
+                    )
+                ),
+            ]
+        }
+        retry_files = result.get("files", files)
+        if retry_files is not None:
+            retry_input["files"] = retry_files
+        result = await agent.ainvoke(
+            retry_input,
+            config=stateless_child_config(config),
         )
-    return response
+        response = result.get("structured_response")
+        if isinstance(response, clarification.planner_response_type):
+            return response
+
+    raise PlanStructuredOutputError(
+        "Planner did not return the configured structured response type"
+    )
 
 
 __all__ = ["create_planner_agent", "invoke_planner"]

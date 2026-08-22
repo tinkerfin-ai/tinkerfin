@@ -56,12 +56,11 @@ single-use Runtime; the Graph iterator starts on first pull.
 
 ### Plan Mode
 
-Plan Mode adds a conservative Gate, a read-only Planner, and user review before a
-complex task reaches the configured Deep Agent. Enable the capability on an immutable
+Plan Mode adds a standalone read-only Planning workflow and user review before an
+approved task reaches the configured Deep Agent. Enable the capability on an immutable
 TinkerFin factory; the installed Deep Agents factory signature does not change.
 
 ```python
-from langgraph.checkpoint.memory import MemorySaver
 from tinkerfin import TinkerFin
 
 
@@ -69,12 +68,11 @@ tinkerfin = TinkerFin()
 agent = tinkerfin.plan(
     enabled=True,
     default_mode="default",
-    gate_model="openai:gpt-5.4-mini",
     planner_model="openai:gpt-5.4",
 ).create_deep_agent(
     model="openai:gpt-5.4",
     tools=[],
-    checkpointer=MemorySaver(),
+    checkpointer=production_checkpointer,
 )
 
 plan_runtime = agent.new(
@@ -87,29 +85,26 @@ default_runtime = agent.new_agui(
 )
 ```
 
-Plan Mode requires an explicit model and a concrete `BaseCheckpointSaver`. The parent
-workflow is the only graph configured with the supplied durable checkpointer. Gate and
-Planner are stateless, non-interrupting subgraphs with child checkpointing disabled, so
-only JSON-validated Plan state crosses the parent durability boundary. The Deep Agent
-subgraph inherits the parent checkpointer for Tool/Filesystem HITL. All child graphs
-still use the parent runtime store and cache, and the host owns their shutdown
-lifecycle. Plan streams use synchronous checkpoint durability, and an explicit
-non-`sync` durability value is rejected.
+Selecting `mode="plan"` requires an explicit Planner model and a concrete
+`BaseCheckpointSaver`. TinkerFin never creates an in-process saver or silently weakens
+durability. Production hosts must supply a production-grade saver; the same saver,
+Store, cache, backend, and runtime context are borrowed by Planning and native
+execution. Planning and handoff boundaries use synchronous checkpoint durability, and
+an explicit non-`sync` value is rejected.
 
-With `TodoListMiddleware`, Plan main execution commits every `write_todos` update to
-the authoritative parent state and checkpoint before later Tools run. Tool HITL and
-resume snapshots retain that Todo progress, while ordinary delegated subagents remain
-isolated from the root projection. The standard `write_todos` Tool lifecycle is still
-emitted once with one scoped ID. Files synchronize when main execution returns or
-crosses a Todo parent boundary.
+`mode="default"` calls the unmodified native Deep Agent Graph directly. It does not run
+Planning, add middleware, replace the state schema, or create a parent Graph. Native
+`write_todos`, Tool/Filesystem review, subagents, cancellation, and error semantics are
+therefore identical for ordinary and Plan-capable Definitions.
 
 Only `ls`, `read_file`, `glob`, and `grep` are available to the Planner. Clarification
 questions can contain model-generated single-select options and can optionally allow a
-free-text answer. Selecting an option submits only its stable ID; the parent workflow
+free-text answer. Selecting an option submits only its stable ID; the Planning workflow
 derives the trusted label from the checkpointed form. Approval freezes a `ConfirmedPlan`
-and injects it into the Deep Agent system request without adding hidden conversation
-messages. The public Plan state and value models are available from `tinkerfin.plan` and
-are emitted under the root state key `tinkerfin_plan`.
+and commits a deterministic v3 handoff bound to the original user message ID. TinkerFin
+then starts the native Deep Agent in the same request; the effective mode becomes
+`default` before execution. The public Plan state and value models are available from
+`tinkerfin.plan` and are emitted under the root state key `tinkerfin_plan`.
 
 The default clarification form requires no application models. A host that needs typed,
 user-visible metadata can define one concrete Pydantic form and freeze it on the Plan
@@ -151,7 +146,7 @@ agent = (
     )
     .create_deep_agent(
         model="openai:gpt-5.4",
-        checkpointer=MemorySaver(),
+        checkpointer=production_checkpointer,
     )
 )
 ```
@@ -165,10 +160,10 @@ must resume with the same Definition-bound form schema.
 
 `.plan(...)` returns a separate TinkerFin factory while retaining the configured run
 coordinator and global state schema. Every Definition freezes the capability options of
-its source factory. A Plan-capable Definition always uses one topology and state schema;
-`mode="default"` bypasses the Gate, while `mode="plan"` enters it. The same checkpoint
-thread can select either mode on later requests. An ordinary Definition accepts only
-`mode="default"` and cannot resume a Plan-capable checkpoint.
+its source factory. `mode="default"` directly selects the native Graph, while
+`mode="plan"` selects the standalone Planning Graph. A Plan approval is handed to the
+native Graph automatically. The same checkpoint thread can select Plan again on a later
+request. An ordinary Definition accepts only `mode="default"`.
 
 Application state shared by all Definitions can be supplied once:
 
@@ -177,14 +172,15 @@ tinkerfin = TinkerFin(state_schema=AppState)
 agent = tinkerfin.plan().create_deep_agent(
     model="openai:gpt-5.4",
     state_schema=AgentState,
-    checkpointer=MemorySaver(),
+    checkpointer=production_checkpointer,
 )
 ```
 
-TinkerFin combines the application, Definition, middleware, filesystem, Todo, and Plan
-state contracts. A conflicting field fails during Definition creation. Runtime context
-continues to use Deep Agents `context_schema`; it is not merged into state or stored in
-the checkpoint.
+The native Graph still combines only the application, Definition, and upstream
+middleware state contracts. The standalone Planning Graph composes the fields it needs
+without changing native default topology. A conflicting field fails before a Plan run.
+Runtime context continues to use Deep Agents `context_schema`; it is not merged into
+state or stored in the checkpoint.
 
 ## Core concepts
 

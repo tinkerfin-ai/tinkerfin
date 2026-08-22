@@ -58,7 +58,6 @@ class TinkerFin(_RuntimeTinkerFin):
         *,
         enabled: bool = True,
         default_mode: AgentMode = "default",
-        gate_model: str | BaseChatModel | None = None,
         planner_model: str | BaseChatModel | None = None,
         clarification_schema: type[_ClarificationFormBase] = _DefaultClarificationForm,
     ) -> TinkerFin: ...

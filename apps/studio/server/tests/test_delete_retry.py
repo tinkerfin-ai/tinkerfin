@@ -9,8 +9,8 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tinkerfin import Identity
+from tinkerfin_studio.conversation.command import ConversationCommandService
 from tinkerfin_studio.conversation.repository import ConversationRepository
-from tinkerfin_studio.conversation.service import ConversationCommandService
 from tinkerfin_studio.resources import ApplicationResources
 
 

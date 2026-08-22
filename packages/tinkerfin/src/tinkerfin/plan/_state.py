@@ -23,24 +23,15 @@ from .models import PlanState
 
 PLAN_STATE_KEY = "tinkerfin_plan"
 PLAN_SCHEMA_FINGERPRINT_KEY = "_tinkerfin_plan_clarification_schema"
-PLAN_EXECUTION_YIELD_KEY = "_tinkerfin_plan_execution_yield"
-PLAN_TODO_CORRELATION_KEY = "_tinkerfin_plan_todo_correlation"
-PLAN_PRIVATE_STATE_KEYS = frozenset(
-    {
-        PLAN_SCHEMA_FINGERPRINT_KEY,
-        PLAN_EXECUTION_YIELD_KEY,
-        PLAN_TODO_CORRELATION_KEY,
-    }
-)
+PLAN_CHECKPOINT_RUN_ID = "tinkerfin-plan-v3"
+PLAN_PRIVATE_STATE_KEYS = frozenset({PLAN_SCHEMA_FINGERPRINT_KEY})
 
 
-class PlanWorkflowNodeState(DeepAgentState, total=False):
-    """Stable node-input subset shared by every parent workflow node."""
+class PlanningWorkflowNodeState(DeepAgentState, total=False):
+    """Stable node-input subset shared by standalone Planning nodes."""
 
     tinkerfin_plan: NotRequired[dict[str, JsonValue]]
     _tinkerfin_plan_clarification_schema: NotRequired[str]
-    _tinkerfin_plan_execution_yield: NotRequired[bool]
-    _tinkerfin_plan_todo_correlation: NotRequired[dict[str, JsonValue] | None]
 
 
 def create_plan_state_schema(
@@ -48,7 +39,7 @@ def create_plan_state_schema(
     *,
     middleware: Sequence[AgentMiddleware],  # pyright: ignore[reportMissingTypeArgument]
 ) -> type[DeepAgentState]:
-    """Compose the stable parent state without compiled-graph introspection."""
+    """Compose standalone Planning state without compiled-graph introspection."""
 
     base = DeepAgentState if base_schema is None else base_schema
     try:
@@ -79,7 +70,7 @@ def create_plan_state_schema(
                 ),
                 StateSchemaSource(
                     "TinkerFin Plan state",
-                    PlanWorkflowNodeState,
+                    PlanningWorkflowNodeState,
                     deep_agent_fields,
                 ),
             )
@@ -119,12 +110,11 @@ def plan_state_update(plan: PlanState) -> dict[str, object]:
 
 
 __all__ = [
-    "PLAN_EXECUTION_YIELD_KEY",
+    "PLAN_CHECKPOINT_RUN_ID",
     "PLAN_PRIVATE_STATE_KEYS",
     "PLAN_SCHEMA_FINGERPRINT_KEY",
     "PLAN_STATE_KEY",
-    "PLAN_TODO_CORRELATION_KEY",
-    "PlanWorkflowNodeState",
+    "PlanningWorkflowNodeState",
     "create_plan_state_schema",
     "plan_state_update",
     "read_plan_state",

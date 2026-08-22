@@ -533,6 +533,16 @@ const applyStateDelta = (current: JsonObject | undefined, delta: { path: string;
 const isAgentMode = (value: unknown): value is AgentMode =>
   value === "default" || value === "plan"
 
+const syncEffectiveModeFromState = (
+  conversation: Conversation,
+  state: JsonObject,
+): Conversation => {
+  const plan = state.tinkerfin_plan
+  if (!plan || typeof plan !== "object" || Array.isArray(plan)) return conversation
+  const mode = plan.effectiveMode
+  return isAgentMode(mode) ? { ...conversation, mode } : conversation
+}
+
 export const buildInitialPayload = (
   conversation: Conversation,
   content: string,
@@ -705,7 +715,9 @@ export const buildPlanResumePayload = (
     context: [],
     forwardedProps: {
       model: conversation.model,
-      mode: conversation.mode,
+      mode: interaction.kind === 'review' && (
+        interaction.action === 'approve' || interaction.action === 'reject'
+      ) ? 'default' : 'plan',
     },
     resume: [{
       interruptId: interaction.interruptId,
@@ -919,18 +931,18 @@ export const applyConversationEvent = (
       }
 
     case "STATE_SNAPSHOT":
-      return syncTodosFromState({
+      return syncEffectiveModeFromState(syncTodosFromState({
         ...conversation,
         serverState: event.snapshot,
-      }, event.snapshot)
+      }, event.snapshot), event.snapshot)
 
     case "STATE_DELTA":
       {
         const nextState = applyStateDelta(conversation.serverState, event.delta)
-        return syncTodosFromState({
+        return syncEffectiveModeFromState(syncTodosFromState({
           ...conversation,
           serverState: nextState,
-        }, nextState)
+        }, nextState), nextState)
       }
 
     case "TEXT_MESSAGE_START": {

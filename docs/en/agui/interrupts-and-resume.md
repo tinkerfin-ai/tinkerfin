@@ -47,16 +47,16 @@ context. Internal schema fingerprints remain in checkpoint state and are not par
 any public AG-UI event. The root `tinkerfin_plan` state is
 published before the interrupt terminal. On a resumed request, the synchronized
 snapshot may be followed by RFC 6902 state deltas as the Plan moves through
-`executing` and `completed`.
+`approved` and publishes `effectiveMode=default` before native execution.
 
-Clients must not return the Form, labels, descriptions, or attributes. The parent Graph
+Clients must not return the Form, labels, descriptions, or attributes. The Planning Graph
 restores the trusted checkpoint Form and derives the selected option label. Supplying
 both `optionId` and `answer`, omitting required answers, or using unknown IDs fails the
 resume.
 
 The same `ResumeMapper.map_agui(...)` and `AgUiResumeBinding` flow handles Plan
 interrupts without a separate API. `ResumeMapper` verifies the persisted envelope and
-exact pending coverage; the parent Graph validates the response contract and rejects a
+exact pending coverage; the Planning Graph validates the response contract and rejects a
 stale `baseRevision`. Use a new `runId` with the same `threadId` for every resume.
 
 A pending batch cannot mix Plan and Tool interrupts. A Tool review can still occur

@@ -43,12 +43,9 @@ _PUBLIC_EXPORTS = {
     "SseEventId",
     "SubagentProvenance",
     "TOOL_REVIEW_SCHEMA",
-    "TOOL_RESULT_CORRELATION_KEY",
-    "TOOL_RESULT_CORRELATION_SCHEMA",
     "ToolReviewContractError",
     "ToolReviewDecision",
     "ToolReviewInterruptMetadata",
-    "ToolResultCorrelation",
     "astream_events",
     "create_subagent_provenance",
     "encode_sse",
@@ -122,7 +119,7 @@ def test_private_state_policy_requires_an_immutable_canonical_key_set() -> None:
     with pytest.raises(TypeError, match="frozenset"):
         constructor(
             identity=Identity(threadId="thread-1", runId="run-1"),
-            private_state_keys={"private"},
+            private_state_keys={"private"},  # pyright: ignore[reportArgumentType]
         )
     for value in ("", " private"):
         with pytest.raises(ValueError, match="canonical"):
@@ -143,7 +140,6 @@ def test_public_adapter_schema_and_resume_errors_are_english() -> None:
                 "RuntimeInterruptEnvelope",
                 "SubagentProvenance",
                 "ToolReviewInterruptMetadata",
-                "ToolResultCorrelation",
                 "HitlActionRequest",
                 "HitlRequest",
                 "HitlReviewConfig",

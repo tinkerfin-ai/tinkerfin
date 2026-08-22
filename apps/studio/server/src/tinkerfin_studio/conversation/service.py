@@ -1,4 +1,4 @@
-"""会话 chat、取消与兼容导出入口"""
+"""会话 chat 与取消服务"""
 
 from __future__ import annotations
 
@@ -26,12 +26,6 @@ from tinkerfin_studio.api.errors import (
     SystemException,
 )
 from tinkerfin_studio.auth.types import UserContext
-from tinkerfin_studio.conversation.command import (
-    ConversationCommandService as ConversationCommandService,
-)
-from tinkerfin_studio.conversation.history import (
-    ConversationHistoryService as ConversationHistoryService,
-)
 from tinkerfin_studio.conversation.repository import ConversationRepository
 from tinkerfin_studio.conversation.request import ChatRequest
 from tinkerfin_studio.conversation.run_preparation import (
@@ -475,8 +469,6 @@ class ConversationChatService:
 
 __all__ = [
     "ConversationChatService",
-    "ConversationCommandService",
-    "ConversationHistoryService",
     "PreparedChat",
     "conversation_stream_key",
     "parse_last_event_id",

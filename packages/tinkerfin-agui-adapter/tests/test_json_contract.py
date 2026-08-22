@@ -119,9 +119,9 @@ def test_task_state_boundaries_omit_only_the_top_level_plan_fingerprint() -> Non
             "ns": (),
             "data": {
                 "id": "plan-node",
-                "name": "plan_gate",
+                "name": "planning_node",
                 "input": {internal_key: "internal", "nested": nested},
-                "triggers": ("branch:to:plan_gate",),
+                "triggers": ("branch:to:planning_node",),
             },
         }
     )
@@ -131,7 +131,7 @@ def test_task_state_boundaries_omit_only_the_top_level_plan_fingerprint() -> Non
             "ns": (),
             "data": {
                 "id": "plan-node",
-                "name": "plan_gate",
+                "name": "planning_node",
                 "error": None,
                 "interrupts": [],
                 "result": {internal_key: "internal", "nested": nested},

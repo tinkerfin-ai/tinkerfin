@@ -44,14 +44,15 @@ Plan interrupt 没有 `toolCallId`，其中包含带版本的可信 Runtime enve
 `allow_free_text` 在 JSON 中表示为 `allowFreeText`。Question/Option attributes 会作为公开、
 非权威的规划参考原样保留；内部 Schema fingerprint 只存在于 checkpoint，不属于公开
 AG-UI 事件。根状态的 `tinkerfin_plan` 会在 interrupt 终止事件前发布。恢复请求先同步
-snapshot，随后可以用 RFC 6902 state delta 表示 Plan 进入 `executing` 和 `completed`。
+snapshot，随后可以用 RFC 6902 state delta 表示 Plan 进入 `approved`，并在原生执行前发布
+`effectiveMode=default`。
 
-客户端不能回传 Form、label、description 或 attributes。父 Graph 从 checkpoint 恢复可信
+客户端不能回传 Form、label、description 或 attributes。Planning Graph 从 checkpoint 恢复可信
 Form 并派生所选 Option label；同时提交 `optionId` 与 `answer`、缺少必答项或使用未知 ID
 都会导致恢复失败。
 
 Plan interrupt 使用同一套 `ResumeMapper.map_agui(...)` 和 `AgUiResumeBinding`，不需要
-另一套恢复 API。`ResumeMapper` 校验已保存 envelope 和待处理项的完整覆盖，父 Graph 校验
+另一套恢复 API。`ResumeMapper` 校验已保存 envelope 和待处理项的完整覆盖，Planning Graph 校验
 响应契约，并拒绝过期的 `baseRevision`。每次恢复使用新的 `runId`，同时保持原
 `threadId`。
 

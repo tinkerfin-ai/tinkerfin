@@ -164,9 +164,9 @@ def test_root_stub_keeps_plan_annotation_dependencies_private() -> None:
         for index, argument in enumerate(plan.args.kwonlyargs)
         if argument.arg == "clarification_schema"
     )
-    assert ast.unparse(plan.args.kwonlyargs[index].annotation) == (
-        "type[_ClarificationFormBase]"
-    )
+    annotation = plan.args.kwonlyargs[index].annotation
+    assert annotation is not None
+    assert ast.unparse(annotation) == "type[_ClarificationFormBase]"
     default = plan.args.kw_defaults[index]
     assert isinstance(default, ast.Name)
     assert default.id == "_DefaultClarificationForm"

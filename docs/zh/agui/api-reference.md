@@ -9,7 +9,7 @@
 | `DeepAgentDefinition.new_agui(...)` | 创建一次 AG-UI Runtime |
 | `DeepAgentAgUiRuntime.astream(...)` | 运行 Graph 并得到 `AgUiEventStream` |
 | `AgUiEventStream` | 迭代、取消、关闭或转成 SSE |
-| `AgUiResumeBinding` | 把恢复请求、原生命令和旧 Tool ID 绑定在一起 |
+| `AgUiResumeBinding` | 把恢复请求、原生命令和此前已发出的 Tool ID 绑定在一起 |
 
 完整 Runtime 参数见 [AG-UI 入门](index.md)，恢复参数见 [interrupt 与恢复](interrupts-and-resume.md)。
 
@@ -17,8 +17,8 @@
 
 | API | 主要参数 | 什么时候使用 |
 | --- | --- | --- |
-| `astream_events(...)` | `parts`、`identity`、公开开关、旧 Tool ID、私有 state key | 已有原生异步流，希望自动管理完整生命周期 |
-| `DeepAgentAgUiAdapter(...)` | `identity`、旧 Tool ID、公开开关、私有 state key | 需要自己管理主开始和终止事件 |
+| `astream_events(...)` | `parts`、`identity`、公开开关、此前已发出的 Tool ID、私有 state key | 已有原生异步流，希望自动管理完整生命周期 |
+| `DeepAgentAgUiAdapter(...)` | `identity`、此前已发出的 Tool ID、公开开关、私有 state key | 需要自己管理主开始和终止事件 |
 | `encode_sse(...)` | `event`、可选 `event_id` | 把单个 AG-UI 事件编码为 SSE |
 | `micro_batch(...)` | `events`、可选 batcher | 合并连续的小增量 |
 
@@ -52,7 +52,7 @@
 | --- | --- |
 | `ResumeMapper.map(...)` | 从原生 interrupt 和 checkpoint 消息转换恢复请求 |
 | `ResumeMapper.map_agui(...)` | 从服务端保存的 AG-UI interrupt 转换恢复请求 |
-| `ResumeTranslation` | 保存 `mode`、恢复数据、取消 ID、旧 Tool ID 和逐 interrupt 决定 |
+| `ResumeTranslation` | 保存 `mode`、恢复数据、取消 ID、此前已发出的 Tool ID 和逐 interrupt 决定 |
 | `ResumeMappingError` | 恢复请求无法无损映射 |
 | `ResumeMappingFailure` | 稳定的失败类别 |
 
@@ -69,7 +69,6 @@
 | `HitlRequest` | 等长且非空的 `actionRequests` 与 `reviewConfigs` |
 | `ToolReviewInterruptMetadata` | 带版本的原生分组、action 位置、Tool 名称、决定与原始参数 |
 | `SubagentProvenance` | 稳定 invocation ID、完整 namespace、graph task、父 Tool、Agent、描述和当前请求 run |
-| `ToolResultCorrelation` | 父图完成子图 Tool 时使用的原 scoped Tool 与父消息 ID |
 
 允许的决定为 `approve`、`edit`、`reject`、`respond`。同一请求中的 action 和 review config 按位置配对。
 

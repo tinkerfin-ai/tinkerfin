@@ -15,7 +15,7 @@ from pydantic import (
 from pydantic.alias_generators import to_camel
 
 from .clarification import ClarificationFormBase
-from .models import NonBlankText, PlanRoute, PlanStep, PlanStepId
+from .models import NonBlankText, PlanContent, PlanStepId
 
 
 class _ContractModel(BaseModel):
@@ -27,58 +27,27 @@ class _ContractModel(BaseModel):
     )
 
 
-class GateDecisionBase(_ContractModel):
-    """Structured conservative route selected before any Plan work begins."""
-
-    route: PlanRoute
-    goal: NonBlankText
-    clarification: ClarificationFormBase | None = None
-
-    @model_validator(mode="after")
-    def clarification_matches_route(self) -> GateDecisionBase:
-        """Require one form only for the clarification route."""
-
-        if self.route is PlanRoute.CLARIFY and self.clarification is None:
-            raise ValueError("clarify route requires a clarification form")
-        if self.route is not PlanRoute.CLARIFY and self.clarification is not None:
-            raise ValueError("only clarify route may contain a clarification form")
-        return self
-
-
-class PlanContent(_ContractModel):
-    """Plan content before the parent workflow assigns a revision."""
-
-    goal: NonBlankText
-    assumptions: tuple[NonBlankText, ...] = ()
-    steps: tuple[PlanStep, ...] = Field(min_length=1)
-    acceptance_criteria: tuple[NonBlankText, ...] = Field(min_length=1)
-
-    @model_validator(mode="after")
-    def step_ids_are_unique(self) -> PlanContent:
-        """Require unique step IDs before constructing a public draft."""
-
-        ids = tuple(step.id for step in self.steps)
-        if len(ids) != len(set(ids)):
-            raise ValueError("Plan step IDs must be unique")
-        return self
-
-
 class PlannerOutcomeBase(_ContractModel):
-    """Structured result from the read-only Planner agent."""
+    """Structured result from the single read-only Planner agent."""
 
-    type: Literal["clarify", "draft"]
+    type: Literal["clarify", "draft", "accept_edit"]
     clarification: ClarificationFormBase | None = None
     draft: PlanContent | None = None
 
     @model_validator(mode="after")
     def payload_matches_type(self) -> PlannerOutcomeBase:
-        """Require exactly one Planner outcome payload."""
+        """Require exactly the payload owned by the selected Planner outcome."""
 
         if self.type == "clarify":
             if self.clarification is None or self.draft is not None:
                 raise ValueError("clarify outcome requires a form and no draft")
-        elif self.clarification is not None or self.draft is None:
-            raise ValueError("draft outcome requires a draft and no clarification form")
+        elif self.type == "draft":
+            if self.clarification is not None or self.draft is None:
+                raise ValueError(
+                    "draft outcome requires a draft and no clarification form"
+                )
+        elif self.clarification is not None or self.draft is not None:
+            raise ValueError("accept_edit outcome cannot contain a form or draft")
         return self
 
 
@@ -126,10 +95,9 @@ class PlanClarificationPayload(_ContractModel):
 
 
 class PlanClarificationMetadata(_ContractModel):
-    """Versioned public metadata for one Plan clarification interrupt."""
+    """Versioned public metadata for one Planner clarification interrupt."""
 
     origin: Literal["plan"] = "plan"
-    source: Literal["gate", "planner"]
     clarification: PlanClarificationPayload
 
 
@@ -176,10 +144,8 @@ __all__ = [
     "ClarificationOptionAnswer",
     "ClarificationResponse",
     "EditPlan",
-    "GateDecisionBase",
     "PlanClarificationMetadata",
     "PlanClarificationPayload",
-    "PlanContent",
     "PlannerOutcomeBase",
     "RejectPlan",
     "RespondToPlan",

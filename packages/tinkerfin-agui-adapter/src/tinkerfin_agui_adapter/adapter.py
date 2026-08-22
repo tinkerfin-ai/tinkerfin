@@ -229,11 +229,6 @@ class DeepAgentAgUiAdapter:
 
         message = part.data.message
         if isinstance(message, ToolMessage):
-            _adapter_messages._correlated_tool_result_namespace(
-                self,
-                message,
-                part.ns,
-            )
             return
         if not isinstance(message, AIMessage):
             return

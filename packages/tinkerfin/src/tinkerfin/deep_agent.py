@@ -5,7 +5,16 @@ from __future__ import annotations
 import inspect
 from collections.abc import AsyncIterator, Callable, Mapping
 from functools import wraps
-from typing import TYPE_CHECKING, Generic, ParamSpec, Protocol, TypeVar, cast, overload
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Generic,
+    ParamSpec,
+    Protocol,
+    TypeVar,
+    cast,
+    overload,
+)
 
 from deepagents import graph as _deepagents_graph
 from deepagents.graph import DeepAgentState
@@ -17,7 +26,6 @@ from .agui_native import _bind_agui_graph_astream, _bind_graph_identity
 from .agui_resume import AgUiResumeBinding
 from .errors import TinkerFinLifecycleError
 from .plan._config import (
-    PLAN_MODE_CONFIG_KEY,
     AgentMode,
     PlanOptions,
     resolve_agent_mode,
@@ -41,6 +49,16 @@ class _GraphWithAstream(Protocol):
     astream: Callable[..., object]
 
 
+class _PlanNativeGraph(Protocol):
+    checkpointer: object
+
+    def astream(
+        self,
+        *args: object,
+        **kwargs: object,
+    ) -> AsyncIterator[Mapping[str, object]]: ...
+
+
 _native_create_deep_agent = cast(
     Callable[..., object],
     _deepagents_graph.create_deep_agent,  # pyright: ignore[reportUnknownMemberType]
@@ -51,37 +69,6 @@ def _graph_astream(graph: object) -> Callable[..., object]:
     """Read the callable stream boundary from one compiled upstream graph."""
 
     return cast(_GraphWithAstream, graph).astream
-
-
-def _bind_graph_mode(
-    bound: inspect.BoundArguments,
-    *,
-    mode: AgentMode,
-) -> inspect.BoundArguments:
-    """Bind one immutable run mode to the Graph's reserved configurable key."""
-
-    raw_config = bound.arguments.get("config")
-    if raw_config is None:
-        config: dict[str, object] = {}
-    elif isinstance(raw_config, Mapping):
-        config = dict(cast(Mapping[str, object], raw_config))
-    else:
-        raise TypeError("config must be a mapping or None")
-    raw_configurable = config.get("configurable")
-    if raw_configurable is None:
-        configurable: dict[str, object] = {}
-    elif isinstance(raw_configurable, Mapping):
-        configurable = dict(cast(Mapping[str, object], raw_configurable))
-    else:
-        raise TypeError("config.configurable must be a mapping")
-    if PLAN_MODE_CONFIG_KEY in configurable:
-        raise ValueError(
-            f"config.configurable reserves {PLAN_MODE_CONFIG_KEY!r} for TinkerFin"
-        )
-    configurable[PLAN_MODE_CONFIG_KEY] = mode
-    config["configurable"] = configurable
-    bound.arguments["config"] = config
-    return bound
 
 
 class _StreamClaim:
@@ -106,7 +93,6 @@ def _wrap_native_astream(
     *,
     tinkerfin: TinkerFin,
     identity: Identity,
-    mode: AgentMode,
     on_part: PartObserver[object] | None,
 ) -> AstreamT:
     signature = inspect.signature(astream)
@@ -121,7 +107,6 @@ def _wrap_native_astream(
             identity=identity,
             require_v2=True,
         )
-        bound = _bind_graph_mode(bound, mode=mode)
         claim.claim()
 
         def source() -> AsyncIterator[Mapping[str, object]]:
@@ -144,7 +129,6 @@ def _wrap_agui_astream(
     *,
     tinkerfin: TinkerFin,
     identity: Identity,
-    mode: AgentMode,
     on_part: PartObserver[Mapping[str, object]] | None,
     timeout: float | None,
     settlement_timeout: float | None,
@@ -170,7 +154,6 @@ def _wrap_agui_astream(
             identity=identity,
             require_v2=False,
         )
-        bound = _bind_graph_mode(bound, mode=mode)
         claim.ensure_available()
         if resume is not None:
             graph_input = args[0] if args else kwargs.get("input")
@@ -212,14 +195,12 @@ class DeepAgentRuntime(Generic[AstreamT]):
         astream: AstreamT,
         tinkerfin: TinkerFin,
         identity: Identity,
-        mode: AgentMode,
         on_part: PartObserver[object] | None,
     ) -> None:
         self.astream = _wrap_native_astream(
             astream,
             tinkerfin=tinkerfin,
             identity=identity,
-            mode=mode,
             on_part=on_part,
         )
 
@@ -235,7 +216,6 @@ class DeepAgentAgUiRuntime(Generic[AstreamT]):
         astream: AstreamT,
         tinkerfin: TinkerFin,
         identity: Identity,
-        mode: AgentMode,
         on_part: PartObserver[Mapping[str, object]] | None,
         timeout: float | None,
         settlement_timeout: float | None,
@@ -249,7 +229,6 @@ class DeepAgentAgUiRuntime(Generic[AstreamT]):
             astream,
             tinkerfin=tinkerfin,
             identity=identity,
-            mode=mode,
             on_part=on_part,
             timeout=timeout,
             settlement_timeout=settlement_timeout,
@@ -269,6 +248,7 @@ class DeepAgentDefinition(Generic[GraphT, AstreamT]):
         "_factory",
         "_get_astream",
         "_kwargs",
+        "_plan_factory",
         "_plan_options",
         "_private_state_keys",
         "_tinkerfin",
@@ -282,6 +262,7 @@ class DeepAgentDefinition(Generic[GraphT, AstreamT]):
         args: tuple[object, ...],
         kwargs: dict[str, object],
         get_astream: Callable[[GraphT], AstreamT],
+        plan_factory: Callable[..., object] | None,
         plan_options: PlanOptions | None,
         private_state_keys: frozenset[str],
     ) -> None:
@@ -290,8 +271,31 @@ class DeepAgentDefinition(Generic[GraphT, AstreamT]):
         self._args = args
         self._kwargs = kwargs
         self._get_astream = get_astream
+        self._plan_factory = plan_factory
         self._plan_options = plan_options
         self._private_state_keys = private_state_keys
+
+    def _build_astream(self, mode: AgentMode) -> AstreamT:
+        """Build the native Graph and add only request-local Plan routing."""
+
+        native = self._factory(*self._args, **self._kwargs)
+        native_astream = self._get_astream(native)
+        plan_factory = self._plan_factory
+        if plan_factory is None:
+            return native_astream
+
+        from .plan._runtime import PlanCapableGraphRuntime
+        from .plan._workflow import PlanningWorkflowGraph
+
+        runtime = PlanCapableGraphRuntime(
+            native=cast(_PlanNativeGraph, native),
+            planning_factory=lambda: cast(
+                PlanningWorkflowGraph[Any],
+                plan_factory(*self._args, **self._kwargs),
+            ),
+            prefer_plan=mode == "plan",
+        )
+        return cast(AstreamT, runtime.astream)
 
     def new(
         self,
@@ -307,12 +311,10 @@ class DeepAgentDefinition(Generic[GraphT, AstreamT]):
             on_part=on_part,
         )
         resolved_mode = resolve_agent_mode(mode, options=self._plan_options)
-        graph = self._factory(*self._args, **self._kwargs)
         return DeepAgentRuntime(
-            astream=self._get_astream(graph),
+            astream=self._build_astream(resolved_mode),
             tinkerfin=self._tinkerfin,
             identity=identity,
-            mode=resolved_mode,
             on_part=on_part,
         )
 
@@ -338,12 +340,10 @@ class DeepAgentDefinition(Generic[GraphT, AstreamT]):
         if resume is not None:
             resume.validate_identity(identity)
         resolved_mode = resolve_agent_mode(mode, options=self._plan_options)
-        graph = self._factory(*self._args, **self._kwargs)
         return DeepAgentAgUiRuntime(
-            astream=self._get_astream(graph),
+            astream=self._build_astream(resolved_mode),
             tinkerfin=self._tinkerfin,
             identity=identity,
-            mode=resolved_mode,
             on_part=on_part,
             timeout=timeout,
             settlement_timeout=settlement_timeout,
@@ -413,19 +413,15 @@ class _EnhancedDeepAgentFactory(Generic[CreateP, GraphT, AstreamT]):
             if composed_state is not None:
                 definition_kwargs["state_schema"] = composed_state
             factory = cast(Callable[..., GraphT], _native_create_deep_agent)
+            plan_factory: Callable[..., object] | None = None
             private_state_keys: frozenset[str]
             if instance._plan_options is not None:
                 from .plan._state import PLAN_PRIVATE_STATE_KEYS
                 from .plan._workflow import prepare_plan_factory
 
-                factory = cast(
-                    Callable[..., GraphT],
-                    prepare_plan_factory(
-                        _native_create_deep_agent,
-                        self._signature,
-                        bound,
-                        instance._plan_options,
-                    ),
+                plan_factory = prepare_plan_factory(
+                    self._signature,
+                    instance._plan_options,
                 )
                 private_state_keys = PLAN_PRIVATE_STATE_KEYS
             else:
@@ -436,6 +432,7 @@ class _EnhancedDeepAgentFactory(Generic[CreateP, GraphT, AstreamT]):
                 args=cast(tuple[object, ...], args),
                 kwargs=definition_kwargs,
                 get_astream=self._get_astream,
+                plan_factory=plan_factory,
                 plan_options=instance._plan_options,
                 private_state_keys=private_state_keys,
             )

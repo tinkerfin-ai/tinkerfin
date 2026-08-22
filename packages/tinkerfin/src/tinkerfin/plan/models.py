@@ -24,25 +24,17 @@ PlanStepId = Annotated[
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
     ),
 ]
+PlanDigest = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 
 
 class PlanStatus(StrEnum):
-    """Observable phase of the parent Plan workflow."""
+    """Observable phase of the standalone Planning workflow."""
 
     PLANNING = "planning"
     AWAITING_CLARIFICATION = "awaiting_clarification"
     AWAITING_REVIEW = "awaiting_review"
-    EXECUTING = "executing"
-    COMPLETED = "completed"
+    APPROVED = "approved"
     CANCELLED = "cancelled"
-
-
-class PlanRoute(StrEnum):
-    """Conservative Gate route recorded in Plan state."""
-
-    DIRECT = "direct"
-    CLARIFY = "clarify"
-    PLAN = "plan"
 
 
 class PlanReviewAction(StrEnum):
@@ -77,18 +69,9 @@ class PlanStep(_PlanModel):
     )
 
 
-class PlanDraft(_PlanModel):
-    """Versioned Plan proposed for human review."""
+class PlanContent(_PlanModel):
+    """Complete Plan content before the workflow assigns a revision."""
 
-    schema_version: Literal[1] = Field(
-        default=1,
-        description="Plan serialization schema version",
-    )
-    revision: int = Field(
-        ge=1,
-        strict=True,
-        description="Monotonic draft revision",
-    )
     goal: NonBlankText = Field(description="Operational goal of the Plan")
     assumptions: tuple[NonBlankText, ...] = Field(
         default=(),
@@ -104,8 +87,8 @@ class PlanDraft(_PlanModel):
     )
 
     @model_validator(mode="after")
-    def step_ids_are_unique(self) -> PlanDraft:
-        """Require stable, unambiguous step addressing within one revision."""
+    def step_ids_are_unique(self) -> PlanContent:
+        """Require stable, unambiguous step addressing within one Plan."""
 
         step_ids = tuple(step.id for step in self.steps)
         if len(step_ids) != len(set(step_ids)):
@@ -113,8 +96,22 @@ class PlanDraft(_PlanModel):
         return self
 
 
+class PlanDraft(PlanContent):
+    """Versioned Plan proposed for human review."""
+
+    schema_version: Literal[1] = Field(
+        default=1,
+        description="Plan serialization schema version",
+    )
+    revision: int = Field(
+        ge=1,
+        strict=True,
+        description="Monotonic draft revision",
+    )
+
+
 class ConfirmedPlan(PlanDraft):
-    """Immutable Plan revision approved for Deep Agent execution."""
+    """Immutable Plan revision approved for native Deep Agent execution."""
 
     @classmethod
     def from_draft(cls, draft: PlanDraft) -> ConfirmedPlan:
@@ -125,6 +122,25 @@ class ConfirmedPlan(PlanDraft):
         return cls.model_validate(
             draft.model_dump(mode="python", by_alias=False, exclude_none=False)
         )
+
+
+class PlanHandoff(_PlanModel):
+    """Deterministic boundary from an approved Plan to native execution."""
+
+    schema_version: Literal[1] = Field(
+        default=1,
+        description="Handoff serialization schema version",
+    )
+    message_id: NonBlankText = Field(
+        description="Original user message ID reused for native execution"
+    )
+    digest: PlanDigest = Field(
+        description="SHA-256 of the approved Plan and bound message identity"
+    )
+    dispatched: bool = Field(
+        default=False,
+        description="Whether the native handoff boundary was synchronously committed",
+    )
 
 
 class RequirementAnswer(_PlanModel):
@@ -143,9 +159,6 @@ class RequirementAnswer(_PlanModel):
 class PendingClarification(_PlanModel):
     """Concrete form waiting for trusted user input at one interrupt."""
 
-    source: Literal["gate", "planner"] = Field(
-        description="Workflow node that must receive the resolved form"
-    )
     form: dict[str, JsonValue] = Field(
         description="JSON-only form validated before checkpoint persistence"
     )
@@ -161,16 +174,19 @@ class ClarificationExchange(PendingClarification):
 
 
 class PlanState(_PlanModel):
-    """Complete parent-workflow state projected through the AG-UI state channel."""
+    """Complete standalone Planning state projected through the AG-UI channel."""
 
-    workflow_version: Literal["tinkerfin.plan.v2"] = "tinkerfin.plan.v2"
+    workflow_version: Literal["tinkerfin.plan.v3"] = "tinkerfin.plan.v3"
     status: PlanStatus = PlanStatus.PLANNING
-    route: PlanRoute | None = None
+    effective_mode: Literal["default", "plan"] = "plan"
+    request_message_id: NonBlankText | None = None
     goal: NonBlankText | None = None
     pending_clarification: PendingClarification | None = None
     clarification_history: tuple[ClarificationExchange, ...] = ()
     draft: PlanDraft | None = None
+    edited_draft: PlanContent | None = None
     confirmed_plan: ConfirmedPlan | None = None
+    handoff: PlanHandoff | None = None
     feedback: tuple[NonBlankText, ...] = ()
     revision: int = Field(default=0, ge=0, strict=True)
     review_action: PlanReviewAction | None = None
@@ -180,9 +196,10 @@ __all__ = [
     "ClarificationExchange",
     "ConfirmedPlan",
     "PendingClarification",
+    "PlanContent",
     "PlanDraft",
+    "PlanHandoff",
     "PlanReviewAction",
-    "PlanRoute",
     "PlanState",
     "PlanStatus",
     "PlanStep",

@@ -9,7 +9,7 @@
 | API | 什么时候用 | 主要参数或结果 |
 | --- | --- | --- |
 | `TinkerFin(run_coordinator=None, state_schema=None)` | 创建统一入口 | 可选共享 coordinator 和 Definition 级 state |
-| `TinkerFin.plan(...)` | 创建不可变的 Plan-capable factory | 能力开关、请求默认 mode、可选 Gate/Planner 模型与 clarification schema |
+| `TinkerFin.plan(...)` | 创建不可变的 Plan-capable factory | 能力开关、请求默认 mode、可选 Planner 模型与 clarification schema |
 | `TinkerFin.create_deep_agent(...)` | 创建可重复生成 Runtime 的 Agent 定义 | 参数见[创建和运行 Deep Agent](deep-agents.md) |
 | `Identity(threadId=..., runId=...)` | 表示一次框架运行 | 只包含 thread 和 run |
 | `TinkerFin.run(...)` | 运行自己的异步事件源 | `source_factory`、`identity`、`on_part` |
@@ -20,23 +20,23 @@
 
 `.plan(enabled=True)` 只影响从返回 factory 创建的 Definition，不会给
 `create_deep_agent(...)` 增加参数。返回 factory 保留 coordinator 和全局 state schema。
-Plan Definition 必须提供明确模型和具体 `BaseCheckpointSaver`；配置不合法时抛出
-`tinkerfin.plan.PlanModeConfigurationError`。
+真正选择 Plan 时必须提供明确 Planner 模型和具体生产级 checkpointer；default 保持上游要求。
+Plan 配置不合法时抛出 `tinkerfin.plan.PlanModeConfigurationError`。
 
 每次 `new()` 或 `new_agui()` 通过 `mode="default"` 或 `mode="plan"` 选择当前路径；省略时
-使用 `.plan(default_mode=...)`。Plan-capable Definition 在两种 mode 下保持同一 topology
-和 state schema，因此同一 checkpoint thread 可以在后续请求切换。普通 Definition 只接受
-`default`。mode 是框架请求控制数据，不会进入调用方 state；覆盖框架保留 configurable 会在
-流开始前失败。
+使用 `.plan(default_mode=...)`。default 直接运行原生 Deep Agent；plan 运行独立 Planning
+Graph，并在批准后自动交给原生执行。同一 checkpoint thread 后续可以再次选择 Plan。普通
+Definition 只接受 `default`。
 
 ## Plan Mode 数据
 
 顶层包导出 `AgentMode`。`tinkerfin.plan` 导出 `ClarificationModel`、
 `ClarificationOption` / `ClarificationQuestion` / `ClarificationForm` 的 Base 与泛型类型、
 `DefaultClarificationForm`、`PlanStep`、`PlanDraft`、`ConfirmedPlan`、
-`RequirementAnswer`、`PendingClarification`、`ClarificationExchange`、`PlanState`、
-`PlanStatus`、`PlanRoute`、`PlanReviewAction` 和 Plan 错误类型。这些模型不可变。根 Graph
-状态把完整 JSON 数据以 camel case 保存在 `tinkerfin_plan` 字段。
+`RequirementAnswer`、`PendingClarification`、`ClarificationExchange`、`PlanContent`、
+`PlanState`、`PlanStatus`、`PlanHandoff`、`PlanReviewAction` 和 Plan 错误类型。这些模型不可变。
+Planning 状态以 camel case JSON 保存在 `tinkerfin_plan`；批准 handoff 提交后
+`effectiveMode` 为 `default`。
 
 `.plan(clarification_schema=...)` 接受宿主定义的一个完全具体的
 `ClarificationFormBase` 子类；省略时使用 `DefaultClarificationForm`。Python 使用
@@ -45,11 +45,10 @@ Plan Definition 必须提供明确模型和具体 `BaseCheckpointSaver`；配置
 attributes 和 discriminant，但不能重新定义框架核心字段，也不能改变 questions/options
 的 tuple 结构。
 
-`TinkerFin(state_schema=...)` 为该 factory 创建的每个 Deep Agent Definition 提供应用级
-state，并与 `create_deep_agent(state_schema=...)`、middleware 的公开扩展、Deep Agents
-文件字段和 Todo 字段组合。reducer、`Required` / `NotRequired` 和 schema metadata 会保留；
-同名字段合同不兼容时在创建 Definition 时失败。运行时 `context_schema` 仍是独立且不进入
-checkpoint 的 context 合同。
+`TinkerFin(state_schema=...)` 为该 factory 创建的每个原生 Deep Agent Definition 提供应用级
+state。独立 Planning Graph 组合自己的所需视图，不改变原生 default topology 或 middleware。
+reducer、`Required` / `NotRequired` 和 schema metadata 会保留；同名字段合同不兼容时在 Plan
+运行前失败。运行时 `context_schema` 仍是独立且不进入 checkpoint 的 context 合同。
 
 ## 流对象
 

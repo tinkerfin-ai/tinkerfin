@@ -44,7 +44,6 @@ export interface ConversationSnapshotJson {
   activeRunId?: string | null
   serverState: JsonObject
   runs: Record<string, ConversationSnapshotRun>
-  activities: ConversationSnapshotActivity[]
   interrupts: ConversationSnapshotInterrupt[]
 }
 
@@ -59,14 +58,6 @@ export interface ConversationSnapshotRun {
   graphTaskId?: string | null
   startedAt?: string | null
   completedAt?: string | null
-}
-
-export interface ConversationSnapshotActivity {
-  id: string
-  kind: string
-  createdAt: string
-  title?: string | null
-  detail?: string | null
 }
 
 export interface ConversationSnapshotInterrupt {

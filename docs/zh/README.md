@@ -20,7 +20,7 @@ TinkerFin 用来运行 Deep Agents、把运行过程转换成 AG-UI 事件、可
 | Agent | 调用模型和工具完成任务的程序 |
 | Graph | Agent 实际执行的工作流 |
 | Runtime | 一次 Graph 运行的控制对象 |
-| Plan Mode | Deep Agent 执行前负责澄清需求和审批计划的可选父工作流 |
+| Plan Mode | 独立完成需求澄清与计划审批，并在批准后交给原生 Deep Agent 执行的工作流 |
 | stream | 运行过程中连续产生的数据 |
 | Identity | 只包含稳定 `threadId` 与一次运行 `runId` 的框架身份 |
 | thread | 一段可继续的会话，对应 `Identity.threadId` |

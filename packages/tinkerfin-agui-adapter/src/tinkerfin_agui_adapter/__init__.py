@@ -29,11 +29,6 @@ from .subagent import SUBAGENT_PROVENANCE_SCHEMA as SUBAGENT_PROVENANCE_SCHEMA
 from .subagent import SubagentProvenance as SubagentProvenance
 from .subagent import create_subagent_provenance as create_subagent_provenance
 from .subagent import subagent_invocation_id as subagent_invocation_id
-from .tool_result import TOOL_RESULT_CORRELATION_KEY as TOOL_RESULT_CORRELATION_KEY
-from .tool_result import (
-    TOOL_RESULT_CORRELATION_SCHEMA as TOOL_RESULT_CORRELATION_SCHEMA,
-)
-from .tool_result import ToolResultCorrelation as ToolResultCorrelation
 from .tool_review import TOOL_REVIEW_SCHEMA as TOOL_REVIEW_SCHEMA
 from .tool_review import ToolReviewContractError as ToolReviewContractError
 from .tool_review import ToolReviewDecision as ToolReviewDecision
@@ -42,8 +37,6 @@ from .tool_review import parse_tool_review_interrupt as parse_tool_review_interr
 
 __all__ = [
     "SUBAGENT_PROVENANCE_SCHEMA",
-    "TOOL_RESULT_CORRELATION_KEY",
-    "TOOL_RESULT_CORRELATION_SCHEMA",
     "TOOL_REVIEW_SCHEMA",
     "AgUiAdapterError",
     "AgUiAdapterErrorCode",
@@ -68,7 +61,6 @@ __all__ = [
     "ScopedIdCodec",
     "SseEventId",
     "SubagentProvenance",
-    "ToolResultCorrelation",
     "ToolReviewContractError",
     "ToolReviewDecision",
     "ToolReviewInterruptMetadata",

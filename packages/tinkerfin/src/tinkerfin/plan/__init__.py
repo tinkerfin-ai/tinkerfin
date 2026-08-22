@@ -14,9 +14,10 @@ from .errors import PlanStructuredOutputError as PlanStructuredOutputError
 from .models import ClarificationExchange as ClarificationExchange
 from .models import ConfirmedPlan as ConfirmedPlan
 from .models import PendingClarification as PendingClarification
+from .models import PlanContent as PlanContent
 from .models import PlanDraft as PlanDraft
+from .models import PlanHandoff as PlanHandoff
 from .models import PlanReviewAction as PlanReviewAction
-from .models import PlanRoute as PlanRoute
 from .models import PlanState as PlanState
 from .models import PlanStatus as PlanStatus
 from .models import PlanStep as PlanStep
@@ -35,10 +36,11 @@ __all__ = [
     "ConfirmedPlan",
     "DefaultClarificationForm",
     "PendingClarification",
+    "PlanContent",
     "PlanDraft",
+    "PlanHandoff",
     "PlanModeConfigurationError",
     "PlanReviewAction",
-    "PlanRoute",
     "PlanState",
     "PlanStatus",
     "PlanStep",

@@ -190,7 +190,6 @@ async def test_create_definition_uses_non_reasoning_models_for_plan(
     assert reasoning_overrides == [None, False]
     assert tinkerfin.plan_options == {
         "enabled": True,
-        "gate_model": plan_model,
         "planner_model": plan_model,
     }
     assert tinkerfin.definition_options["model"] is root_model

@@ -56,7 +56,6 @@ capability belongs to TinkerFin, so the Deep Agents factory keeps its installed
 parameter list.
 
 ```python
-from langgraph.checkpoint.memory import MemorySaver
 from tinkerfin import TinkerFin
 
 
@@ -64,46 +63,39 @@ tinkerfin = TinkerFin(state_schema=AppState)
 agent = tinkerfin.plan(
     enabled=True,
     default_mode="default",
-    gate_model="openai:gpt-5.4-mini",
     planner_model="openai:gpt-5.4",
 ).create_deep_agent(
     model="openai:gpt-5.4",
     tools=[search_orders],
-    checkpointer=MemorySaver(),
+    checkpointer=production_checkpointer,
 )
 ```
 
 `.plan(...)` returns a new TinkerFin factory and does not modify `tinkerfin`. It retains
 the same run coordinator and global state schema, and every Definition freezes the
-capability options of the factory that created it. `gate_model` and `planner_model` are
-optional; each falls back to the Deep Agent model when omitted.
+capability options of the factory that created it. `planner_model` is optional and
+falls back to the explicit Deep Agent model when omitted.
 
 Plan Mode routes a request through these boundaries:
 
-1. A conservative Gate chooses direct execution, clarification, or planning.
+1. One read-only Planner judges whether intent and constraints are sufficient.
 2. The Planner can use only `ls`, `read_file`, `glob`, and `grep`.
 3. Clarification can provide model-generated single-select options and optional free
    text; clarification and plan review pause through LangGraph interrupts.
-4. Approval freezes a `ConfirmedPlan` and passes it to the configured Deep Agent in its
-   system request.
+4. Approval freezes a `ConfirmedPlan`, commits a deterministic v3 handoff using the
+   original user message ID, and immediately starts the native Deep Agent.
 
-A concrete `BaseCheckpointSaver` and an explicit model are required. The parent Plan
-workflow owns the supplied durable checkpointer. Gate and Planner disable child
-checkpointing and return JSON-validated state to the parent; the Deep Agent inherits the
-parent saver for Tool/Filesystem HITL. Child graphs continue to use the parent runtime
-store and cache. Keep the same `Identity.threadId` when resuming. Plan state appears at the root
-`tinkerfin_plan` key, and public models such as `PlanDraft`, `ConfirmedPlan`, and
-`PlanState` are exported from `tinkerfin.plan`.
+Selecting Plan requires a concrete `BaseCheckpointSaver` and an explicit Planner model.
+TinkerFin never creates an in-process saver or silently weakens durability. Production
+applications must provide a production-grade saver. Planning and the native Deep Agent
+borrow the same saver, Store, cache, backend, and runtime context. Keep the same
+`Identity.threadId` when resuming. Plan state appears at the root `tinkerfin_plan` key;
+`PlanContent`, `PlanDraft`, `ConfirmedPlan`, `PlanHandoff`, and `PlanState` are exported
+from `tinkerfin.plan`.
 
-When the configured main execution middleware includes `TodoListMiddleware`, each
-`write_todos` call commits the current Todo list to the authoritative parent state and
-parent checkpoint before later execution Tools run. The normal Tool Start/Args/End and
-Result lifecycle remains intact. A Tool interrupt snapshot and the first resumed
-snapshot therefore contain the same latest Todos. Todo telemetry is not a replacement
-for `ConfirmedPlan` steps or acceptance criteria. Ordinary `task` subagents and unknown
-compiled subgraphs cannot overwrite this root projection. Files remain part of the
-root-visible Deep Agent state and are synchronized when execution returns or crosses a
-Todo parent boundary.
+`mode="default"` directly runs the native Deep Agent Graph. It does not execute
+Planning, add middleware, replace state schema, or create a parent Graph. Native Todo,
+Tool/Filesystem HITL, subagent, cancellation, and error semantics remain unchanged.
 
 The Planner has only read-only filesystem tools for optional workspace inspection.
 That restricted list is not the execution Deep Agent's capability list: the Planner
@@ -120,10 +112,16 @@ The schema is frozen on the returned factory and cannot be replaced by `new()`,
 subclasses; they are public, model-generated planning context rather than authoritative
 permission, billing, or compliance data.
 
-Each question uses `allow_free_text` (`allowFreeText` on the JSON boundary). An option
+Each question uses `allow_free_text` (`allowFreeText` on the JSON boundary). Every round
+contains one to three blocking questions and is submitted as one complete batch. An option
 answer sends only `questionId` and `optionId`; a free-text answer sends only
 `questionId` and `answer`. The workflow restores the checkpointed form, derives an
-option's trusted label, and rejects mixed, incomplete, unknown, or stale answers.
+option's trusted label, and rejects mixed, incomplete, unknown, or stale answers. The
+Planner can ask another round before producing a draft.
+
+A complete user edit is authoritative. The Planner either asks for missing information
+or accepts that exact edit; it cannot silently replace it. Clarification does not change
+the revision. The revision increments only when a complete draft becomes reviewable.
 
 Plan Mode fixes checkpoint durability to `sync`. Omitting `durability` is recommended;
 passing `sync` is also accepted, while `async` and `exit` fail before streaming.
@@ -141,10 +139,10 @@ default_runtime = agent.new_agui(
 )
 ```
 
-Both requests use the same Plan-capable topology and state schema. `default` bypasses
-the Gate, while `plan` enters it. A later request on the same checkpoint thread can
-choose either mode. Mode does not become an application state field. Do not resume a
-Plan-capable checkpoint with an ordinary Definition.
+`default` uses the original native topology and state schema; `plan` uses the standalone
+Planning Graph. Approval changes the effective mode to `default` before native execution.
+A later request on the same checkpoint thread can select Plan again. Plan resumes are
+routed to Planning, while Tool and subagent resumes go directly to the native Graph.
 
 ## Create one native Runtime
 
@@ -197,7 +195,7 @@ You normally omit `configurable.thread_id`. An explicitly equal value is accepte
 | --- | --- | --- |
 | `interrupt_before` | `None` | Pauses before selected nodes |
 | `interrupt_after` | `None` | Pauses after selected nodes |
-| `durability` | `None` | Controls checkpoint persistence timing; Plan Mode requires `sync` |
+| `durability` | `None` | Controls checkpoint timing; Planning and handoff require `sync` |
 | `control` | `None` | Supplies LangGraph run control data |
 | Extra keyword arguments | none | Current additional LangGraph run options |
 

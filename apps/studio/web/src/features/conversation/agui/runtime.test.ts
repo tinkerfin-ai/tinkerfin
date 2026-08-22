@@ -700,6 +700,10 @@ describe('AG-UI runtime reducer', () => {
     const afterState = applyConversationEvent(afterResult, {
       type: 'STATE_SNAPSHOT',
       snapshot: {
+        tinkerfin_plan: {
+          workflowVersion: 'tinkerfin.plan.v3',
+          effectiveMode: 'plan',
+        },
         todos: [
           { content: '读取 url.json', status: 'completed' },
           { content: '写入 result.txt', status: 'in_progress' },
@@ -708,7 +712,10 @@ describe('AG-UI runtime reducer', () => {
     })
     const afterDelta = applyConversationEvent(afterState, {
       type: 'STATE_DELTA',
-      delta: [{ op: 'replace', path: '/todos/1/status', value: 'completed' }],
+      delta: [
+        { op: 'replace', path: '/todos/1/status', value: 'completed' },
+        { op: 'replace', path: '/tinkerfin_plan/effectiveMode', value: 'default' },
+      ],
     })
     const completedTool = afterDelta.messages.find(
       (item) => item.role === 'tool' && item.meta?.toolCallId === 'call-write-todos-test',
@@ -716,6 +723,8 @@ describe('AG-UI runtime reducer', () => {
 
     expect(completedTool?.meta?.status).toBe('completed')
     expect(completedTool?.meta?.result).toBe(rawContent)
+    expect(afterState.mode).toBe('plan')
+    expect(afterDelta.mode).toBe('default')
     expect(afterDelta.todos.map((todo) => todo.status)).toEqual(['completed', 'completed'])
     expect(afterDelta.todos.every((todo) => todo.targetMessageId == null)).toBe(true)
   })
@@ -1593,7 +1602,6 @@ describe('AG-UI runtime reducer', () => {
         activeRunId: null,
         serverState: {},
         runs: {},
-        activities: [],
         interrupts: [{
           id: interruptId,
           reason: 'tool_call',
@@ -1911,7 +1919,6 @@ describe('AG-UI runtime reducer', () => {
         activeRunId: null,
         serverState: {},
         runs: {},
-        activities: [],
         interrupts: [],
       },
       events: [
@@ -1975,7 +1982,6 @@ describe('AG-UI runtime reducer', () => {
         activeRunId: null,
         serverState: {},
         runs: {},
-        activities: [],
         interrupts: [],
       },
       events: [],
@@ -2200,7 +2206,6 @@ describe('AG-UI runtime reducer', () => {
               envelope: {
                 metadata: {
                   origin: 'plan',
-                  source: 'gate',
                   clarification: {
                     schema: 'tinkerfin.plan-clarification.v1',
                     form: {
@@ -2314,7 +2319,9 @@ describe('AG-UI runtime reducer', () => {
       planInteraction: { ...interrupted.planInteraction, action: 'approve' as const },
     }
 
-    expect(buildPlanResumePayload(approved).resume?.[0]?.payload).toEqual({
+    const approvalPayload = buildPlanResumePayload(approved)
+    expect(approvalPayload.forwardedProps.mode).toBe('default')
+    expect(approvalPayload.resume?.[0]?.payload).toEqual({
       type: 'approve',
       baseRevision: 2,
     })

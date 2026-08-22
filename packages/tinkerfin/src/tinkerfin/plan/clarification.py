@@ -121,6 +121,7 @@ class ClarificationFormBase(ClarificationModel):
     )
     questions: tuple[ClarificationQuestionBase, ...] = Field(
         min_length=1,
+        max_length=3,
         description="Blocking questions that must all be answered",
     )
 
@@ -131,6 +132,8 @@ class ClarificationFormBase(ClarificationModel):
         question_ids = tuple(question.id for question in self.questions)
         if len(question_ids) != len(set(question_ids)):
             raise ValueError("Clarification question IDs must be unique")
+        if len(question_ids) > 3:
+            raise ValueError("Clarification forms may contain at most three questions")
         return self
 
 
@@ -143,6 +146,7 @@ class ClarificationForm(ClarificationFormBase, Generic[QuestionT]):
     # Pydantic freezes this tuple field, so narrowing its item type is covariant.
     questions: tuple[QuestionT, ...] = Field(  # pyright: ignore[reportIncompatibleVariableOverride]
         min_length=1,
+        max_length=3,
         description="Blocking questions that must all be answered",
     )
 

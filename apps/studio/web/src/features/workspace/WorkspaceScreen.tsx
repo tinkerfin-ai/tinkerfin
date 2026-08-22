@@ -1260,7 +1260,7 @@ export function WorkspaceScreen({
                 if (open) setModelPickerOpen(false)
               }}
               onChange={selectAgentMode}
-              disabled={isRunning}
+              disabled={isRunning || conversation.approval != null}
               triggerLabel="当前 Agent 预设"
               listboxLabel="Agent 预设选项"
               rootClassName="agent-preset-picker"

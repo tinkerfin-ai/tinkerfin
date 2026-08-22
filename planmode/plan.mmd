@@ -1,0 +1,60 @@
+flowchart LR
+    subgraph API["1 · 框架接入与请求路由"]
+        direction LR
+        ENTRY(["TinkerFin.plan(enabled=True)"]) --> DEFINITION["create_deep_agent<br/>复用原有 model / backend / store / checkpointer"]
+        DEFINITION --> REQUEST["new / new_agui<br/>identity + mode"]
+        REQUEST --> ROUTE{"mode / resume 来源"}
+        ROUTE -->|"default 或 Tool / 子 Agent resume"| OVERLAY["读取可公开的 approved / cancelled v3 PlanState<br/>若存在，仅叠加到流投影"]
+        OVERLAY --> NATIVE_ENTRY(["转 3 · 原生执行"])
+        ROUTE -->|"plan 或 Plan resume"| SAVER{"具体 checkpointer？"}
+        SAVER -->|"否"| CONFIG_ERROR(["PlanModeConfigurationError<br/>不自动降级为 MemorySaver"])
+        SAVER -->|"是"| PLAN_ENTRY(["转 2 · 独立规划"])
+    end
+
+    subgraph PLANNING["2 · 独立 Planning Graph · durability=sync"]
+        direction TB
+        INIT["初始化 tinkerfin.plan.v3<br/>绑定当前 HumanMessage ID"] --> PLANNER["唯一只读 Planner<br/>仅 ls / read_file / glob / grep"]
+        PLANNER --> SUFFICIENT{"目标与约束是否充分？"}
+
+        SUFFICIENT -->|"否"| FORM["生成 1～3 个阻塞问题<br/>每题支持 option / free text"]
+        FORM --> CLARIFY_INT["Plan Clarification Interrupt"]
+        CLARIFY_INT --> CLARIFY_DECISION{"用户处理"}
+        CLARIFY_DECISION -->|"整组 respond"| ANSWERS["按问题顺序保存可信答案<br/>revision 不变"]
+        ANSWERS --> PLANNER
+        CLARIFY_DECISION -->|"abandon"| ABANDON(["AG-UI status=cancelled<br/>不构造 Graph Command<br/>RUN_ERROR resume_cancelled"])
+
+        SUFFICIENT -->|"是"| DRAFT["生成 PlanDraft<br/>revision + 1"]
+        DRAFT --> REVIEW_INT["Plan Review Interrupt<br/>携带 baseRevision"]
+        REVIEW_INT --> REVIEW_DECISION{"approve / edit / respond / reject"}
+        REVIEW_DECISION -->|"edit"| EDIT["校验 baseRevision<br/>保存用户权威完整草稿"]
+        EDIT --> PLANNER
+        REVIEW_DECISION -->|"respond"| FEEDBACK["保存自然语言反馈"]
+        FEEDBACK --> PLANNER
+        REVIEW_DECISION -->|"reject"| REJECT(["PlanStatus=CANCELLED<br/>effectiveMode=default"])
+        REVIEW_DECISION -->|"approve"| CONFIRMED["冻结 ConfirmedPlan<br/>原 HumanMessage ID + SHA-256 digest"]
+        CONFIRMED --> DISPATCHED{"handoff.dispatched？"}
+        DISPATCHED -->|"是"| IDEMPOTENT(["只回放 v3 PlanState<br/>不重复启动原生执行"])
+        DISPATCHED -->|"否"| COMMIT["同步提交 dispatched=true"]
+        COMMIT --> EFFECTIVE["effectiveMode=default<br/>转 3 · 原生执行"]
+    end
+
+    subgraph EXECUTION["3 · 原生 DeepAgent · 无 Plan 父 Graph"]
+        direction TB
+        NATIVE["原生 DeepAgent Graph"] --> CAPABILITIES["原生 write_todos / task / Filesystem / Tools"]
+        CAPABILITIES --> NATIVE_HITL{"Tool / Filesystem / 子 Agent HITL？"}
+        NATIVE_HITL -->|"是"| NATIVE_INT["Deep Agents 原生 Interrupt"]
+        NATIVE_INT -->|"Command resume · 同一 thread_id"| NATIVE
+        NATIVE_HITL -->|"否"| RESULT(["完成 / 异常 / 取消终态<br/>同一 thread 下一轮可重新选择 mode"])
+    end
+
+    subgraph DELIVERY["4 · AG-UI、持久化与连接生命周期"]
+        direction TB
+        STREAM["Planning 与原生 DeepAgent 的 LangGraph v2 对象流<br/>messages / tasks / values · subgraphs=true<br/>Plan RuntimeInterruptEnvelope + Deep Agents 原生 HITL"] --> AGUI["TinkerFin AG-UI Adapter<br/>稳定 ID、顺序、唯一 terminal"]
+        AGUI --> MESSAGING["Messaging 持久化事件<br/>producer 独立于 SSE subscriber"]
+        MESSAGING --> UI["Studio 实时 UI / 历史快照<br/>Todo 与 Plan / Tool / 子 Agent pending 根投影"]
+        LIFECYCLE["SSE 断开：仅 subscriber detach，服务存活时 producer 继续<br/>重连：Last-Event-ID 追赶，不重复 terminal<br/>刷新：事件游标 + snapshot 恢复 pending<br/>取消：停止 producer / 活动协程，保留最后 checkpoint<br/>交互：pending Tool 时禁切 mode；pending Plan 切 default 前先 abandon"]
+        MESSAGING -. "连接与取消语义" .-> LIFECYCLE
+        UI -. "交互约束" .-> LIFECYCLE
+    end
+
+    API ~~~ PLANNING ~~~ EXECUTION ~~~ DELIVERY

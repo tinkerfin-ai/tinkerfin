@@ -11,7 +11,6 @@ from ._clarification import ClarificationSchemaBinding
 from .errors import PlanModeConfigurationError
 
 AgentMode: TypeAlias = Literal["default", "plan"]
-PLAN_MODE_CONFIG_KEY = "tinkerfin_plan_mode"
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,7 +19,6 @@ class PlanOptions:
 
     clarification: ClarificationSchemaBinding
     default_mode: AgentMode = "default"
-    gate_model: str | BaseChatModel | None = None
     planner_model: str | BaseChatModel | None = None
 
 
@@ -51,7 +49,6 @@ def resolve_agent_mode(
 
 
 __all__ = [
-    "PLAN_MODE_CONFIG_KEY",
     "AgentMode",
     "PlanOptions",
     "resolve_agent_mode",

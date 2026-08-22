@@ -106,8 +106,6 @@ ownership.
 - `private_state_keys` removes only named top-level channels at known state projection
   boundaries. Nested same-named business fields remain visible. TinkerFin Plan
   Runtimes supply their private channels automatically.
-- `ToolResultCorrelation` preserves original scoped IDs when a parent graph completes
-  a Tool lifecycle that began in a compiled child graph.
 - Conversion pulls with bounded lookahead and closes an upstream iterator exposing
   `aclose()` on cancellation or early consumer exit.
 

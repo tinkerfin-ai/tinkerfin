@@ -12,7 +12,7 @@ from typing import Annotated, Any, cast, get_args, get_origin
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, JsonValue, TypeAdapter, create_model
 
-from ._contracts import GateDecisionBase, PlannerOutcomeBase
+from ._contracts import PlannerOutcomeBase
 from .clarification import (
     ClarificationFormBase,
     ClarificationModel,
@@ -31,7 +31,6 @@ class ClarificationSchemaBinding:
 
     form_schema: type[ClarificationFormBase]
     fingerprint: str
-    gate_response_type: type[GateDecisionBase]
     planner_response_type: type[PlannerOutcomeBase]
 
 
@@ -215,11 +214,6 @@ def create_clarification_binding(
 
     form_schema = validate_clarification_schema(schema)
     fingerprint = _schema_fingerprint(form_schema)
-    gate_type = create_model(
-        "GateDecision",
-        __base__=GateDecisionBase,
-        clarification=(form_schema | None, None),
-    )
     planner_type = create_model(
         "PlannerOutcome",
         __base__=PlannerOutcomeBase,
@@ -228,7 +222,6 @@ def create_clarification_binding(
     return ClarificationSchemaBinding(
         form_schema=form_schema,
         fingerprint=fingerprint,
-        gate_response_type=gate_type,
         planner_response_type=planner_type,
     )
 
