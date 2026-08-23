@@ -214,6 +214,12 @@ class RedisBackend(MessagingBackend):
 
         return self._lease_ttl / 3
 
+    @property
+    def lease_timeout(self) -> float:
+        """Return the Redis ownership expiry budget for trusted diagnostics."""
+
+        return self._lease_ttl
+
     async def delete_stream(self, *, channel: str, identity: Identity) -> None:
         """Delete one stream through a leased, generation-fenced cleanup."""
 

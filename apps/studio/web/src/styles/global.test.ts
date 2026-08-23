@@ -2,215 +2,272 @@ import { describe, expect, it } from 'vitest'
 
 import indexHtml from '../../index.html?raw'
 import mainEntry from '../main.tsx?raw'
-import globalStyles from './global.css?raw'
+import tokensStyles from './tokens.css?raw'
 import typographyStyles from './typography.css?raw'
 
-const typographySource = `${typographyStyles}\n${globalStyles}`
+const cssFiles = import.meta.glob('../**/*.css', {
+  eager: true,
+  import: 'default',
+  query: '?raw',
+}) as Record<string, string>
+
+const componentStyles = Object.entries(cssFiles)
+  .filter(([path]) => !path.endsWith('/tokens.css'))
+  .map(([, source]) => source)
+  .join('\n')
+
+const declarations = (block: string) => new Map(
+  [...block.matchAll(/(--[\w-]+):\s*([^;]+);/g)].map((match) => [match[1], match[2].trim()]),
+)
+
+const themeBlocks = () => {
+  const light = tokensStyles.match(/:root\s*{([^}]*)}/s)?.[1] ?? ''
+  const dark = tokensStyles.match(/:root\[data-theme='dark'\]\s*{([^}]*)}/s)?.[1] ?? ''
+  const lightTokens = declarations(light)
+  const darkTokens = new Map([...lightTokens, ...declarations(dark)])
+  return [lightTokens, darkTokens]
+}
+
+const resolveToken = (tokens: Map<string, string>, name: string, seen = new Set<string>()): string => {
+  if (seen.has(name)) throw new Error(`令牌循环引用：${name}`)
+  const value = tokens.get(name)
+  expect(value, `缺少令牌 ${name}`).toBeDefined()
+  const reference = value?.match(/^var\((--[\w-]+)\)$/)?.[1]
+  if (!reference) return value ?? ''
+  seen.add(name)
+  return resolveToken(tokens, reference, seen)
+}
 
 const relativeLuminance = (hexColor: string) => {
-  const normalized = hexColor.slice(1)
-  const channels = (normalized.length === 3
-    ? normalized.split('').map((channel) => channel.repeat(2))
-    : normalized.match(/.{2}/g) ?? []
-  ).map((channel) => Number.parseInt(channel, 16) / 255)
+  const channels = (hexColor.slice(1).match(/.{2}/g) ?? [])
+    .map((channel) => Number.parseInt(channel, 16) / 255)
     .map((channel) => channel <= 0.04045
       ? channel / 12.92
       : ((channel + 0.055) / 1.055) ** 2.4)
-
   return (0.2126 * channels[0]) + (0.7152 * channels[1]) + (0.0722 * channels[2])
 }
 
 const contrastRatio = (firstColor: string, secondColor: string) => {
-  const firstLuminance = relativeLuminance(firstColor)
-  const secondLuminance = relativeLuminance(secondColor)
-  return (Math.max(firstLuminance, secondLuminance) + 0.05)
-    / (Math.min(firstLuminance, secondLuminance) + 0.05)
+  const first = relativeLuminance(firstColor)
+  const second = relativeLuminance(secondColor)
+  return (Math.max(first, second) + 0.05) / (Math.min(first, second) + 0.05)
 }
 
-const themeHexValue = (themeBlock: string, token: string) => {
-  const match = themeBlock.match(new RegExp(`${token}:\\s*(#[0-9a-f]{3,6});`, 'i'))
-  expect(match, `${token} must be a hex color token`).not.toBeNull()
-  return match![1]
-}
-
-describe('global typography', () => {
-  it('loads all self-hosted font families before the typography and component layers', () => {
+describe('前端视觉契约', () => {
+  it('按既定顺序加载自托管字体、令牌、排版和基础样式', () => {
     const imports = [
-      "@fontsource-variable/geist",
-      "@fontsource-variable/noto-sans-sc",
-      "@fontsource-variable/geist-mono",
+      '@fontsource-variable/inter',
+      '@fontsource-variable/inter/wght-italic.css',
+      '@fontsource-variable/noto-sans-sc',
+      '@fontsource-variable/jetbrains-mono',
+      './styles/tokens.css',
       './styles/typography.css',
       './styles/global.css',
+      './components/ui/ui.css',
     ].map((path) => mainEntry.indexOf(`import '${path}'`))
 
     expect(imports.every((index) => index >= 0)).toBe(true)
     expect(imports).toEqual([...imports].sort((left, right) => left - right))
+    expect(mainEntry).not.toContain('@fontsource-variable/geist')
   })
 
-  it('defines the approved family roles and eight-level type scale', () => {
+  it('定义 Inter、Noto Sans SC、JetBrains Mono 和四级字重', () => {
     expect(typographyStyles).toContain(
-      "--font-ui: 'Geist Variable', 'Noto Sans SC Variable', 'PingFang SC', 'Microsoft YaHei', sans-serif;",
+      "--font-ui: 'Inter Variable', 'Noto Sans SC Variable', 'PingFang SC', 'Microsoft YaHei UI', system-ui, sans-serif;",
     )
     expect(typographyStyles).toContain(
-      "--font-mono: 'Geist Mono Variable', 'SFMono-Regular', Consolas, monospace;",
+      "--font-code: 'JetBrains Mono Variable', 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;",
     )
-
-    expect(typographyStyles).toMatch(/--type-caption-size:\s*11px;/)
-    expect(typographyStyles).toMatch(/--type-meta-size:\s*12px;/)
-    expect(typographyStyles).toMatch(/--type-ui-small-size:\s*13px;/)
-    expect(typographyStyles).toMatch(/--type-ui-size:\s*14px;/)
-    expect(typographyStyles).toMatch(/--type-body-small-size:\s*15px;/)
-    expect(typographyStyles).toMatch(/--type-body-size:\s*16px;/)
-    expect(typographyStyles).toMatch(/--type-title-size:\s*18px;/)
-    expect(typographyStyles).toMatch(/--type-display-size:\s*clamp\(28px,\s*3\.4vw,\s*40px\);/)
+    for (const weight of [400, 500, 600, 700]) {
+      expect(typographyStyles).toContain(`: ${weight};`)
+    }
+    expect(typographyStyles).toMatch(/--type-body-size:\s*16px;[\s\S]*--type-body-line:\s*28px;/)
+    expect(typographyStyles).toMatch(/--type-h1-size:\s*24px;[\s\S]*--type-h1-line:\s*34px;/)
   })
 
-  it('limits explicit font sizes and weights to the shared typography contract', () => {
-    const fontSizes = [...typographySource.matchAll(/font-size:\s*([^;]+);/g)]
+  it('锁定布局、控件、圆角、层级与 100/200/300ms 动效尺度', () => {
+    for (const declaration of [
+      '--layout-sidebar-expanded: 261px;',
+      '--layout-sidebar-rail: 56px;',
+      '--layout-content-wide: 840px;',
+      '--layout-task-drawer: 348px;',
+      '--control-lg: 44px;',
+      '--layer-local: 1;',
+      '--layer-local-raised: 2;',
+      '--motion-fast: 100ms;',
+      '--motion-normal: 200ms;',
+      '--motion-slow: 300ms;',
+      '--motion-loading-cycle: 1000ms;',
+      '--shadow-focus: 0 0 0 3px var(--color-focus-soft);',
+    ]) expect(tokensStyles).toContain(declaration)
+  })
+
+  it('浅色和深色普通文本、辅助文本及状态文本均达到 4.5:1', () => {
+    for (const tokens of themeBlocks()) {
+      for (const [foreground, background] of [
+        ['--color-text-primary', '--color-canvas'],
+        ['--color-text-secondary', '--color-canvas'],
+        ['--color-text-tertiary', '--color-canvas'],
+        ['--color-text-caption', '--color-canvas'],
+        ['--color-placeholder', '--color-layer-2'],
+        ['--color-brand-text', '--color-brand-soft'],
+        ['--color-danger-text', '--color-danger-soft'],
+        ['--color-success-text', '--color-success-soft'],
+        ['--color-warning-text', '--color-warning-soft'],
+      ]) {
+        const foregroundColor = resolveToken(tokens, foreground)
+        const backgroundColor = resolveToken(tokens, background)
+        expect(foregroundColor).toMatch(/^#[0-9a-f]{6}$/i)
+        expect(backgroundColor).toMatch(/^#[0-9a-f]{6}$/i)
+        expect(contrastRatio(foregroundColor, backgroundColor)).toBeGreaterThanOrEqual(4.5)
+      }
+    }
+  })
+
+  it('所有功能 CSS 入口都受扫描且不直接声明十六进制色或原始色令牌', () => {
+    expect(Object.keys(cssFiles)).toEqual(expect.arrayContaining([
+      '../components/ui/ui.css',
+      '../features/auth/auth.css',
+      '../features/conversation/conversation.css',
+      '../features/workspace/workspace.css',
+      './global.css',
+      './tokens.css',
+      './typography.css',
+    ]))
+    expect(componentStyles).not.toMatch(/#[0-9a-f]{3,8}\b/i)
+    expect(componentStyles).not.toMatch(/var\(--primitive-/)
+
+    const unregisteredRadii = [...componentStyles.matchAll(/border-radius:\s*([^;]+);/g)]
       .map((match) => match[1].trim())
-      .filter((value) => !value.startsWith('var(--type-'))
-    const fontWeights = [...typographySource.matchAll(/font-weight:\s*(\d+);/g)]
-      .map((match) => Number(match[1]))
+      .filter((value) => !value.includes('var(--radius-') && !['0', 'inherit'].includes(value))
+    const unregisteredShadows = [...componentStyles.matchAll(/box-shadow:\s*([^;]+);/g)]
+      .map((match) => match[1].trim())
+      .filter((value) => value !== 'none' && !value.includes('var(--shadow-'))
+    const unregisteredLayers = [...componentStyles.matchAll(/z-index:\s*([^;]+);/g)]
+      .map((match) => match[1].trim())
+      .filter((value) => !value.includes('var(--layer-'))
+    const breakpointValues = [...new Set(
+      [...componentStyles.matchAll(/@media \((?:min|max)-width:\s*(\d+)px\)/g)]
+        .map((match) => match[1]),
+    )].sort((left, right) => Number(left) - Number(right))
+    const ownerLocalMotionValues = [...new Set(
+      [...componentStyles.matchAll(/(?<![-\w.])(?:\d*\.)?\d+(?:ms|s)\b/g)]
+        .map((match) => match[0]),
+    )].sort()
 
-    expect(fontSizes).toEqual([])
-    expect(new Set(fontWeights)).toEqual(new Set([400, 500, 600, 700]))
+    expect(unregisteredRadii).toEqual([])
+    expect(unregisteredShadows).toEqual([])
+    expect(unregisteredLayers).toEqual([])
+    expect(breakpointValues).toEqual(['440', '767', '1023', '1600'])
+    expect(ownerLocalMotionValues).toEqual([])
   })
 
-  it('uses intentional tracking, tabular numbers, and the mono family by role', () => {
-    expect(typographyStyles).toMatch(/body\s*{[^}]*letter-spacing:\s*0;/s)
-    expect(typographyStyles).toMatch(/\.typography-heading\s*{[^}]*letter-spacing:\s*-\.025em;/s)
-    expect(typographyStyles).toMatch(/\.typography-label\s*{[^}]*letter-spacing:\s*\.06em;/s)
-    expect(globalStyles).toMatch(/font-variant-numeric:\s*tabular-nums;/)
-    expect(globalStyles).toMatch(/font-family:\s*var\(--font-mono\);/)
-    expect(globalStyles).not.toContain('letter-spacing: .18px')
+  it('字号和字重通过排版角色消费，不在功能样式中形成第二套尺度', () => {
+    const explicitFontSizes = [...componentStyles.matchAll(/font-size:\s*([^;]+);/g)]
+      .map((match) => match[1].trim())
+      .filter((value) => !['0', 'inherit'].includes(value) && !value.startsWith('var(--type-'))
+    const explicitFontWeights = [...componentStyles.matchAll(/font-weight:\s*([^;]+);/g)]
+      .map((match) => match[1].trim())
+      .filter((value) => !value.startsWith('var(--weight-'))
+    const interactiveCaptionSelectors = [...componentStyles.matchAll(
+      /([^{}]+)\{[^{}]*font-size:\s*var\(--type-caption-size\);/g,
+    )]
+      .map((match) => match[1].trim())
+      .filter((selector) => /button|\.ui-button|input|textarea|select|\[role=/.test(selector))
+
+    expect(explicitFontSizes).toEqual([])
+    expect(explicitFontWeights).toEqual([])
+    expect(interactiveCaptionSelectors).toEqual([])
+    expect(typographyStyles).toMatch(/button,[\s\S]*select\s*{\s*font-size:\s*inherit;/)
   })
 
-  it('keeps editable controls regular inside emphasized form fields', () => {
-    const styles = document.createElement('style')
-    styles.textContent = globalStyles
-    const field = document.createElement('div')
-    field.style.fontWeight = '700'
-    field.innerHTML = `
-      <input aria-label="文本输入">
-      <textarea aria-label="多行输入"></textarea>
-      <select aria-label="下拉选择"><option>选项</option></select>
-      <input aria-label="复选输入" type="checkbox">
-    `
-    document.head.append(styles)
-    document.body.append(field)
+  it('共享与业务按钮都声明完整交互状态', () => {
+    const contracts = [
+      [cssFiles['../features/auth/auth.css'], '.auth-brand'],
+      [cssFiles['../components/ui/ui.css'], '.toast-card > button'],
+      [cssFiles['../features/conversation/conversation.css'], '.subagent-trace-head button'],
+      [cssFiles['../features/workspace/workspace.css'], '.conversation-main'],
+      [cssFiles['../features/workspace/workspace.css'], '.user-card'],
+      [cssFiles['../features/workspace/workspace.css'], '.model-select'],
+      [cssFiles['../features/workspace/workspace.css'], '.agent-preset'],
+      [cssFiles['../features/workspace/workspace.css'], '.scroll-to-bottom'],
+      [cssFiles['../features/workspace/workspace.css'], '.todo-item'],
+    ] as const
 
-    try {
-      const controlWeight = (label: string) => getComputedStyle(
-        field.querySelector(`[aria-label="${label}"]`)!,
-      ).fontWeight
-
-      expect(controlWeight('文本输入')).toBe('400')
-      expect(controlWeight('多行输入')).toBe('400')
-      expect(controlWeight('下拉选择')).toBe('400')
-      expect(controlWeight('复选输入')).not.toBe('400')
-    } finally {
-      field.remove()
-      styles.remove()
+    for (const [source, selector] of contracts) {
+      for (const state of ['hover', 'active', 'focus-visible', 'disabled']) {
+        expect(source, `${selector} 缺少 ${state}`).toContain(`${selector}:${state}`)
+      }
     }
   })
 
-  it('targets the actual empty heading and keeps short CJK user messages horizontal', () => {
-    expect(globalStyles).toMatch(/\.empty-conversation h2\s*{/)
-    expect(globalStyles).not.toMatch(/\.empty-conversation h1\s*{/)
-    expect(globalStyles).toMatch(/\.user-message \.message-markdown\s*{[^}]*padding:\s*10px 15px;[^}]*font-size:\s*var\(--type-body-small-size\);[^}]*line-height:\s*var\(--type-body-small-line-height\);/s)
-    expect(globalStyles).toMatch(/\.user-message \.message-markdown\s*{[^}]*word-break:\s*keep-all;[^}]*overflow-wrap:\s*break-word;/s)
-    expect(globalStyles).toMatch(/@media \(max-width: 480px\)[\s\S]*\.user-message \.message-markdown\s*{[^}]*max-width:\s*88%;/)
+  it('Markdown 使用编辑型表格并具备完整文章语义和显式 compact variant', () => {
+    const markdownStyles = cssFiles['../features/conversation/conversation.css']
+    expect(markdownStyles).toMatch(/\.markdown-content h1[\s\S]*\.markdown-content h4/)
+    expect(markdownStyles).toMatch(/\.markdown-content li > ul[\s\S]*padding-inline-start/)
+    expect(markdownStyles).toMatch(/\.markdown-table-wrap[\s\S]*overflow-x:\s*auto/)
+    expect(markdownStyles).toMatch(/\.markdown-content th,[\s\S]*border-bottom:\s*1px solid var\(--color-border\)/)
+    expect(markdownStyles).toContain('.markdown-content--compact')
+    expect(markdownStyles).not.toMatch(/tbody tr:nth-child|tbody tr:hover/)
   })
 
-  it('defines explicit light and dark theme roots for every foundational surface', () => {
-    expect(globalStyles).toMatch(/:root\s*{[^}]*color-scheme:\s*light;/s)
-    expect(globalStyles).toMatch(/:root\[data-theme=['"]dark['"]\]\s*{[^}]*color-scheme:\s*dark;/s)
-    expect(globalStyles).toMatch(/:root\[data-theme=['"]dark['"]\][\s\S]*--bg:/)
-    expect(globalStyles).toMatch(/\.sidebar\s*{[^}]*background:\s*var\(--surface-sidebar\);/s)
-    expect(globalStyles).toMatch(/\.tool-card\s*{[^}]*background:\s*var\(--surface-elevated\);/s)
-    expect(globalStyles).toMatch(/\.modal-dialog\s*{[^}]*background:\s*var\(--surface-elevated\);/s)
-    expect(globalStyles).toMatch(/\.composer\s*{[^}]*background:\s*var\(--surface-elevated\);/s)
+  it('三态侧栏、inline search、任务抽屉与必要断点均由 workspace 所有', () => {
+    const workspaceStyles = cssFiles['../features/workspace/workspace.css']
+    expect(workspaceStyles).toMatch(/grid-template-columns:\s*var\(--layout-sidebar-expanded\)/)
+    expect(workspaceStyles).toMatch(/data-sidebar-mode='rail'[\s\S]*var\(--layout-sidebar-rail\)/)
+    expect(workspaceStyles).toContain('.history-toolbar.is-search-open')
+    expect(workspaceStyles).toMatch(/@media \(max-width:\s*767px\)/)
+    expect(workspaceStyles).toMatch(/@media \(min-width:\s*1600px\)/)
+    expect(workspaceStyles).toContain('scrollbar-gutter: stable')
   })
 
-  it('keeps semantic status foregrounds accessible in both color schemes', () => {
-    const lightTheme = globalStyles.match(/^:root\s*{([^}]*)}/s)?.[1] ?? ''
-    const darkTheme = globalStyles.match(/:root\[data-theme=['"]dark['"]\]\s*{([^}]*)}/s)?.[1] ?? ''
-
-    for (const theme of [lightTheme, darkTheme]) {
-      expect(contrastRatio(
-        themeHexValue(theme, '--red'),
-        themeHexValue(theme, '--text-on-red'),
-      )).toBeGreaterThanOrEqual(4.5)
-      expect(contrastRatio(
-        themeHexValue(theme, '--green'),
-        themeHexValue(theme, '--text-on-green'),
-      )).toBeGreaterThanOrEqual(4.5)
-      expect(contrastRatio(
-        themeHexValue(theme, '--green-strong'),
-        themeHexValue(theme, '--surface-elevated'),
-      )).toBeGreaterThanOrEqual(4.5)
-    }
-
-    expect(globalStyles).toMatch(/\.approval-form \.danger\s*{[^}]*color:\s*var\(--text-on-red\);/s)
-    expect(globalStyles).toMatch(/\.subagent-trace-marker\s*{[^}]*color:\s*var\(--text-on-green\);/s)
-    expect(globalStyles).toMatch(/\.tool-status\s*{[^}]*color:\s*var\(--green-strong\);/s)
+  it('回到底部使用独立操作轨道、44px 命中区和较小视觉圆面，不覆盖滚动正文', () => {
+    const workspaceStyles = cssFiles['../features/workspace/workspace.css']
+    expect(workspaceStyles).toMatch(
+      /\.conversation-region\s*\{[^}]*display:\s*grid;[^}]*grid-template-rows:\s*minmax\(0, 1fr\) var\(--control-lg\);/s,
+    )
+    expect(workspaceStyles).toMatch(
+      /\.conversation-scroll-action\s*\{[^}]*height:\s*var\(--control-lg\);[^}]*padding:\s*0 var\(--space-10\);/s,
+    )
+    expect(workspaceStyles).toMatch(
+      /\.scroll-to-bottom\s*\{[^}]*width:\s*var\(--control-lg\);[^}]*height:\s*var\(--control-lg\);/s,
+    )
+    expect(workspaceStyles).toMatch(
+      /\.scroll-to-bottom::before\s*\{[^}]*width:\s*var\(--control-sm\);[^}]*height:\s*var\(--control-sm\);/s,
+    )
+    expect(workspaceStyles).not.toMatch(
+      /\.scroll-to-bottom\s*\{[^}]*(?:position:\s*(?:absolute|fixed)|bottom:|right:)/s,
+    )
   })
 
-  it('uses theme-aware borders and focus treatments on elevated controls', () => {
-    expect(globalStyles).toMatch(/\.conversation-pane\s*{[^}]*scrollbar-color:\s*var\(--scroll-thumb\) transparent;/s)
-    expect(globalStyles).toMatch(/\.scroll-to-bottom\s*{[^}]*border:\s*1px solid var\(--border\);/s)
-    expect(globalStyles).toMatch(/\.subagent-card\s*{[^}]*border:\s*1px solid var\(--green-line\);/s)
-    expect(globalStyles).toMatch(/\.subagent-card-body\s*{[^}]*border-top:\s*1px solid var\(--border-subtle\);/s)
-    expect(globalStyles).toMatch(/\.composer\s*{[^}]*border:\s*1px solid var\(--border\);/s)
-    expect(globalStyles).toMatch(/\.composer:focus-within\s*{[^}]*border-color:\s*var\(--border-strong\);/s)
-    expect(globalStyles).toMatch(/\.modal-dialog\s*{[^}]*border:\s*1px solid var\(--border\);/s)
-    expect(globalStyles).toMatch(/\.toast-card\s*{[^}]*border:\s*1px solid var\(--border\);/s)
-    expect(globalStyles).toMatch(/\.drawer-splitter:focus-visible\s*{[^}]*var\(--surface-elevated\)[^}]*var\(--focus\);/s)
+  it('Header 模型、Agent 和任务计数保持同一行且具有稳定可读宽度', () => {
+    const workspaceStyles = cssFiles['../features/workspace/workspace.css']
+    expect(workspaceStyles).toMatch(/\.model-picker\s*\{\s*width:\s*176px;/)
+    expect(workspaceStyles).toMatch(/\.agent-preset-picker\s*\{\s*width:\s*124px;/)
+    expect(workspaceStyles).toMatch(
+      /\.drawer-toggle \.ui-button__label\s*\{[^}]*display:\s*inline-flex;[^}]*white-space:\s*nowrap;/s,
+    )
+    expect(workspaceStyles).toMatch(
+      /\.drawer-toggle b\s*\{[^}]*display:\s*inline-grid;[^}]*place-items:\s*center;/s,
+    )
   })
 
-  it('centers compact toasts and sizes each card to its own message', () => {
-    expect(globalStyles).toMatch(/\.toast-viewport\s*{[^}]*position:\s*fixed;[^}]*top:\s*max\(12px,\s*env\(safe-area-inset-top\)\);[^}]*left:\s*50%;[^}]*width:\s*min\(calc\(100vw - 24px\),\s*420px\);[^}]*transform:\s*translateX\(-50%\);/s)
-    expect(globalStyles).toMatch(/\.toast-card\s*{[^}]*display:\s*inline-flex;[^}]*width:\s*max-content;[^}]*max-width:\s*min\(calc\(100vw - 24px\),\s*420px\);[^}]*min-height:\s*42px;/s)
-    expect(globalStyles).toMatch(/\.toast-card p\s*{[^}]*flex:\s*0 1 auto;[^}]*overflow-wrap:\s*anywhere;/s)
-    expect(globalStyles).not.toMatch(/\.toast-card\s*{[^}]*(?:width:\s*390px|animation:\s*toastIn)/s)
-    expect(globalStyles).not.toContain('@keyframes toastIn')
+  it('共享控件覆盖焦点、禁用、触控、forced-colors 与 reduced-motion', () => {
+    const uiStyles = cssFiles['../components/ui/ui.css']
+    expect(uiStyles).toMatch(/\.ui-button:focus-visible[\s\S]*outline:/)
+    expect(uiStyles).toMatch(/\.ui-button:disabled[\s\S]*opacity:/)
+    expect(uiStyles).toMatch(/@media \(hover: none\), \(pointer: coarse\)[\s\S]*--control-lg/)
+    expect(componentStyles).toContain('@media (forced-colors: active)')
+    expect(componentStyles).toContain('@media (prefers-reduced-motion: reduce)')
   })
 
-  it('anchors the compact theme circle and expands its three choices to the left', () => {
-    expect(globalStyles).toMatch(/\.theme-switcher\s*{[^}]*width:\s*34px;[^}]*min-width:\s*34px;/s)
-    expect(globalStyles).toMatch(/\.theme-switcher-panel\s*{[^}]*position:\s*absolute;[^}]*right:\s*0;[^}]*width:\s*102px;/s)
-    expect(globalStyles).toMatch(/\.theme-switcher-circle\s*{[^}]*right:\s*0;[^}]*width:\s*34px;[^}]*height:\s*34px;[^}]*border-radius:\s*50%;/s)
-    expect(globalStyles).toMatch(/\.theme-switcher-surface\s*{[^}]*right:\s*0;[^}]*width:\s*34px;[^}]*height:\s*34px;[^}]*border-radius:\s*999px;/s)
-    expect(globalStyles).not.toMatch(/\.theme-switcher-surface\s*{[^}]*scaleX/s)
-    expect(globalStyles).toMatch(/\.theme-switcher:not\(\.is-expanded\)[^}]*\.theme-switcher-option:not\(\.is-selected\)[^}]*{[^}]*pointer-events:\s*none;/s)
-  })
-
-  it('uses one collapsed theme outline and keeps the chat header in its own workspace row', () => {
-    expect(globalStyles).not.toContain('--header-bg:')
-    expect(globalStyles).toMatch(/\.workspace-main\s*{[^}]*grid-template-rows:\s*58px minmax\(0,\s*1fr\);/s)
-    expect(globalStyles).toMatch(/\.chat-header\s*{[^}]*position:\s*relative;[^}]*background:\s*var\(--bg\);/s)
-    expect(globalStyles).not.toMatch(/\.chat-header\s*{[^}]*(?:border-bottom|pointer-events):/s)
-    expect(globalStyles).not.toMatch(/\.header-left,\s*\.header-actions\s*{[^}]*pointer-events:/s)
-    expect(globalStyles).not.toMatch(/\.header-left\s*>\s*\*,\s*\.header-actions\s*>\s*\*\s*{/s)
-    expect(globalStyles).toMatch(/\.theme-switcher\.is-expanded \.theme-switcher-input:checked \+ \.theme-switcher-visual\s*{[^}]*box-shadow:/s)
-    expect(globalStyles).toMatch(/\.theme-switcher:not\(\.is-expanded\):has\(\.theme-switcher-input:focus-visible\) \.theme-switcher-circle\s*{[^}]*box-shadow:/s)
-  })
-
-  it('compacts the right header controls and insets the task count', () => {
-    expect(globalStyles).toMatch(/\.agent-preset\s*{[^}]*width:\s*104px;[^}]*min-width:\s*104px;[^}]*padding:\s*0 8px;/s)
-    expect(globalStyles).toMatch(/\.agent-preset-options\s*{[^}]*width:\s*104px;/s)
-    expect(globalStyles).toMatch(/\.drawer-toggle\s*{[^}]*gap:\s*5px;[^}]*padding:\s*0 10px 0 7px;/s)
-    expect(globalStyles).toMatch(/\.drawer-toggle b\s*{[^}]*position:\s*relative;[^}]*right:\s*2px;/s)
-  })
-
-  it('resolves the persisted preference before the application module loads', () => {
+  it('保留页面缩放并在应用执行前解析主题', () => {
     const bootstrapPosition = indexHtml.indexOf('tinkerfin:theme')
     const applicationPosition = indexHtml.indexOf('/src/main.tsx')
-
+    expect(indexHtml).toContain('width=device-width, initial-scale=1.0')
+    expect(indexHtml).not.toContain('user-scalable=no')
     expect(bootstrapPosition).toBeGreaterThan(-1)
     expect(bootstrapPosition).toBeLessThan(applicationPosition)
-    expect(indexHtml).toContain("let preference = 'light'")
-    expect(indexHtml).toContain('(prefers-color-scheme: dark)')
-    expect(indexHtml).toContain('data-theme-preference')
+    expect(indexHtml).toContain("'#151517'")
   })
 })

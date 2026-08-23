@@ -61,7 +61,7 @@ channel = messaging.channel(
 
 Canonical TinkerFin streams include immutable codec and Identity profiles, so a name-only channel infers both. Custom sources need an explicit codec and Identity.
 
-RedisBackend reads persistent schema 4 only. Schema 3 records are incompatible; use a new `key_prefix` or remove records you no longer need before switching.
+RedisBackend reads persistent schema 5 only. Schema 4 records are incompatible; use a new `key_prefix` or remove records you no longer need before switching. Schema 5 stores the current and immediately previous owner's successful lease-renewal counts and UTC timestamps for trusted postmortem diagnostics. It does not expose owner tokens, payloads, or those fields through MessageEnvelope.
 
 ## Define a custom message format
 
@@ -130,7 +130,7 @@ Implement `MessagingBackend` only when another shared store is required. A compl
 - ordered appends, stable sequence numbers, and message ID deduplication;
 - history reads and continuing follow;
 - run completion, failure, and cancellation signals;
-- producer leases, fencing, and ownership-loss detection;
+- producer lease renewal interval, expiry budget, fencing, and ownership-loss detection;
 - stream generation isolation and deletion.
 
 All backend operations are asynchronous. Do not block the event loop with synchronous database or network clients. Match the public behavior of `MemoryBackend` when implementing another backend.

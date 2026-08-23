@@ -113,8 +113,9 @@ subclasses; they are public, model-generated planning context rather than author
 permission, billing, or compliance data.
 
 Each question uses `allow_free_text` (`allowFreeText` on the JSON boundary). Every round
-contains one to three blocking questions and is submitted as one complete batch. An option
-answer sends only `questionId` and `optionId`; a free-text answer sends only
+contains the non-empty set of blocking questions allowed by the bound clarification
+schema and is submitted as one complete batch. An option answer sends only `questionId`
+and `optionId`; a free-text answer sends only
 `questionId` and `answer`. The workflow restores the checkpointed form, derives an
 option's trusted label, and rejects mixed, incomplete, unknown, or stale answers. The
 Planner can ask another round before producing a draft.

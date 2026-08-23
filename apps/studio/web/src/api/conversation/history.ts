@@ -155,7 +155,7 @@ export const fetchConversationEvents = (
   )
 }
 
-/** 重命名或置顶会话；仅传需要改的字段。返回更新后的会话摘要。 */
+/** 重命名或置顶会话，仅传需要修改的字段并返回更新后的会话摘要 */
 export const patchConversation = (
   threadId: string,
   body: { title?: string; pinned?: boolean },
@@ -169,7 +169,7 @@ export const patchConversation = (
     },
   )
 
-/** 删除会话数据库投影。 */
+/** 删除会话数据库投影 */
 export const deleteConversation = async (threadId: string): Promise<void> => {
   await requestJson<void>(`${CONVERSATION_API_PATH}/${encodeURIComponent(threadId)}`, {
     method: 'DELETE',

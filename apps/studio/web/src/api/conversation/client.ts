@@ -1,5 +1,6 @@
 import type { ChatRequestPayload, ConversationAgUiEvent } from './types'
 import { conversationChatUrl } from './config'
+import { parseConversationAgUiEvent } from './eventParser'
 import { requestEventStream, requestJson } from '../shared/http'
 
 export interface StreamedAgUiEvent {
@@ -96,12 +97,13 @@ function parseFrame(lines: string[]): StreamedAgUiEvent | null {
     }
   }
   if (dataLines.length === 0) return null
-  let event: ConversationAgUiEvent
+  let parsedValue: unknown
   try {
-    event = JSON.parse(dataLines.join('\n')) as ConversationAgUiEvent
+    parsedValue = JSON.parse(dataLines.join('\n')) as unknown
   } catch {
     throw new Error('事件流包含无法解析的数据')
   }
+  const event = parseConversationAgUiEvent(parsedValue)
   return { event, seq }
 }
 

@@ -95,7 +95,7 @@ backend = RedisBackend(redis, key_prefix="my-app:messaging")
 messaging = Messaging(backend=backend)
 ```
 
-Redis persistent schema 4 is the only readable format. Schema 3 records require a new prefix or explicit cleanup before use.
+Redis persistent schema 5 is the only readable format. Schema 4 records require a new prefix or explicit cleanup before use. Schema 5 keeps trusted per-owner lease renewal counts and timestamps for postmortem diagnostics; these fields never enter envelopes or client output.
 
 ## Built-in codecs
 

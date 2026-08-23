@@ -1,9 +1,0 @@
-[data-validation-feedback='invalid'] { will-change: transform; }
-
-.validated-field-error {
-  margin: var(--validated-field-error-margin, 0);
-  color: var(--validated-field-error-color, var(--red-strong));
-  font-size: var(--validated-field-error-font-size, var(--type-caption-size));
-  font-weight: var(--validated-field-error-font-weight, 500);
-  line-height: var(--validated-field-error-line-height, 1.35);
-}

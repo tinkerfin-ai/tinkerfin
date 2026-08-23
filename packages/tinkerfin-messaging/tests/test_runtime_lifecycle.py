@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from typing import ClassVar, Literal, cast
 
@@ -124,6 +126,77 @@ class _LeasedMemoryBackend(MemoryBackend):
     @property
     def lease_renew_interval(self) -> float:
         return 0.01
+
+
+class _DiagnosticLeaseBackend(MemoryBackend):
+    def __init__(
+        self,
+        *,
+        behavior: Literal["exception", "reject", "success"],
+        timeout: float = 0.03,
+    ) -> None:
+        super().__init__()
+        self.behavior = behavior
+        self.timeout = timeout
+        self.expires_at = time.monotonic() + timeout
+        self.renew_calls = 0
+
+    @property
+    def lease_renew_interval(self) -> float:
+        return self.timeout / 3
+
+    @property
+    def lease_timeout(self) -> float:
+        return self.timeout
+
+    async def prepare(
+        self,
+        *,
+        channel: str,
+        identity: Identity,
+        codec: str,
+        after: int | None,
+        cancellable: bool,
+        recoverable: bool,
+    ) -> PreparedRun:
+        prepared = await super().prepare(
+            channel=channel,
+            identity=identity,
+            codec=codec,
+            after=after,
+            cancellable=cancellable,
+            recoverable=recoverable,
+        )
+        if prepared.is_owner:
+            self.expires_at = time.monotonic() + self.timeout
+        return prepared
+
+    async def renew(self, handle: BackendRunHandle) -> bool:
+        self.renew_calls += 1
+        if self.behavior == "exception":
+            raise RuntimeError("diagnostic backend renew failed")
+        if self.behavior == "reject" or time.monotonic() >= self.expires_at:
+            return False
+        self.expires_at = time.monotonic() + self.timeout
+        return await super().renew(handle)
+
+
+class _BlockingEventLoopSource(_Source):
+    def __init__(self, *, block_seconds: float) -> None:
+        super().__init__(release=asyncio.Event())
+        self.block_seconds = block_seconds
+
+    def __aiter__(self) -> AsyncIterator[str]:
+        async def iterate() -> AsyncGenerator[str, None]:
+            self.started.set()
+            time.sleep(self.block_seconds)
+            assert self.release is not None
+            await self.release.wait()
+            if False:  # pragma: no cover - preserves the async generator shape
+                yield "unreachable"
+
+        self._iterator = iterate()
+        return self._iterator
 
 
 class _BlockingPrepareBackend(MemoryBackend):
@@ -434,6 +507,139 @@ async def test_backend_subscription_closes_on_producer_failure() -> None:
             await anext(delivery)
 
     assert backend.follow_close_calls == 1
+
+
+async def test_cooperative_source_silence_keeps_renewing_without_failure_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    backend = _DiagnosticLeaseBackend(behavior="success")
+    release = asyncio.Event()
+    source = _Source(release=release)
+
+    with caplog.at_level(logging.ERROR, logger="tinkerfin_messaging.messaging"):
+        async with Messaging(backend=backend) as messaging:
+            subscription = await messaging.channel(
+                name="events",
+                codec=_TextCodec(),
+            ).wrap(
+                source,
+                identity=_identity(),
+                after=0,
+            )
+            await asyncio.wait_for(source.started.wait(), timeout=1)
+            await asyncio.sleep(0.08)
+            release.set()
+            assert await _data(subscription) == []
+
+    assert backend.renew_calls >= 5
+    assert not any(
+        record.getMessage() == "Messaging producer lease renewal failed"
+        for record in caplog.records
+    )
+    assert not any(
+        task.get_name().startswith("tinkerfin-messaging-lease:")
+        for task in asyncio.all_tasks()
+        if task is not asyncio.current_task() and not task.done()
+    )
+
+
+@pytest.mark.parametrize(
+    ("behavior", "outcome", "error_type"),
+    [
+        (
+            "exception",
+            "backend_exception",
+            "tinkerfin_messaging.errors.UnexpectedMessagingBackendError",
+        ),
+        (
+            "reject",
+            "ownership_rejected",
+            "tinkerfin_messaging.errors.BackendOwnershipLost",
+        ),
+    ],
+)
+async def test_lease_failure_log_classifies_backend_outcomes(
+    caplog: pytest.LogCaptureFixture,
+    behavior: Literal["exception", "reject"],
+    outcome: str,
+    error_type: str,
+) -> None:
+    backend = _DiagnosticLeaseBackend(behavior=behavior)
+    source = _Source(release=asyncio.Event())
+
+    with caplog.at_level(logging.ERROR, logger="tinkerfin_messaging.messaging"):
+        async with Messaging(backend=backend) as messaging:
+            subscription = await messaging.channel(
+                name="events",
+                codec=_TextCodec(),
+            ).wrap(
+                source,
+                identity=_identity(),
+                after=0,
+            )
+            with pytest.raises(RunProducerFailed):
+                await asyncio.wait_for(anext(aiter(subscription)), timeout=1)
+
+    records = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "Messaging producer lease renewal failed"
+    ]
+    assert len(records) == 1
+    fields = vars(records[0])
+    assert fields["channel"] == "events"
+    assert fields["thread_id"] == "conversation-1"
+    assert fields["run_id"] == "run-1"
+    assert fields["renewal_phase"] == "producer"
+    assert fields["renewal_outcome"] == outcome
+    assert fields["attempt"] == 1
+    assert fields["deadline_elapsed"] is False
+    assert fields["error_type"] == error_type
+    assert fields["scheduler_delay_seconds"] >= 0
+    assert fields["command_duration_seconds"] >= 0
+    assert fields["seconds_since_last_success"] >= 0
+    assert fields["lease_timeout_seconds"] == backend.timeout
+    assert "owner_token" not in fields
+    assert "fence" not in fields
+    assert "payload" not in fields
+    assert source.closed.is_set()
+    assert not any(
+        task.get_name().startswith("tinkerfin-messaging-lease:")
+        for task in asyncio.all_tasks()
+        if task is not asyncio.current_task() and not task.done()
+    )
+
+
+async def test_event_loop_block_is_distinguished_from_on_time_renewal_rejection(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    backend = _DiagnosticLeaseBackend(behavior="success")
+    source = _BlockingEventLoopSource(block_seconds=0.08)
+
+    with caplog.at_level(logging.ERROR, logger="tinkerfin_messaging.messaging"):
+        async with Messaging(backend=backend) as messaging:
+            subscription = await messaging.channel(
+                name="events",
+                codec=_TextCodec(),
+            ).wrap(
+                source,
+                identity=_identity(),
+                after=0,
+            )
+            with pytest.raises(RunProducerFailed):
+                await asyncio.wait_for(anext(aiter(subscription)), timeout=1)
+
+    record = next(
+        record
+        for record in caplog.records
+        if record.getMessage() == "Messaging producer lease renewal failed"
+    )
+    fields = vars(record)
+    assert fields["renewal_outcome"] == "ownership_rejected"
+    assert fields["deadline_elapsed"] is True
+    assert fields["scheduler_delay_seconds"] >= backend.timeout
+    assert fields["seconds_since_last_success"] >= backend.timeout
+    assert source.closed.is_set()
 
 
 async def test_wrap_cancellation_closes_an_unclaimed_source() -> None:

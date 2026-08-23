@@ -145,9 +145,9 @@ export interface Conversation {
   runStatus: ConversationRunStatus
   activeRunId?: string
   serverState?: JsonObject
-  /** Last persisted AG-UI event seq; used for afterSeq resumption. */
+  /** 最后一条已持久化 AG-UI 事件序号，用于 afterSeq 续传 */
   lastSeq?: number
-  /** True when the full conversation detail has been restored from backend history. */
+  /** 完整会话详情是否已从后端历史恢复 */
   isHydrated?: boolean
 }
 

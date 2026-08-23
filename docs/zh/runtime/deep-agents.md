@@ -103,8 +103,8 @@ Planner 只拥有用于按需检查 workspace 的只读文件工具；这份受�
 或 resume 替换。attributes 必须使用具体 `ClarificationModel` 子类；这些数据会公开给用户，
 属于模型生成的规划参考，不能直接作为权限、计费或合规依据。
 
-Python 字段使用 `allow_free_text`，JSON 边界使用 `allowFreeText`。每轮包含 1～3 个阻塞问题，
-用户填写后整组提交。选择 Option 时只提交
+Python 字段使用 `allow_free_text`，JSON 边界使用 `allowFreeText`。每轮问题数量由绑定的
+clarification schema 约束，表单必须非空，用户填写后整组提交。选择 Option 时只提交
 `questionId` 和 `optionId`；自由输入时只提交 `questionId` 和 `answer`。工作流从 checkpoint
 恢复可信 Form 并派生 Option label，混合、缺失、未知或过期回答都会被拒绝。信息仍不足时，
 Planner 会继续下一轮澄清。

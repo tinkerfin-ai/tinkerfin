@@ -23,6 +23,7 @@ from tinkerfin_agui_adapter import Identity
 
 from ._identity import required_identifier, required_identity
 from ._redis_control import (
+    _PERSISTENT_SCHEMA_VERSION,
     _SNAPSHOT_PAGE_SIZE,
     _redis_call,
     _redis_protocol_error,
@@ -115,6 +116,13 @@ async def prepare(
         if code == "INVALID_CONTROL_STATE":
             raise _redis_protocol_error(
                 f"Redis stream control has invalid state: {self._text(response[1])!r}"
+            )
+        if code == "SCHEMA_MISMATCH":
+            record_kind = self._text(response[1])
+            schema_version = self._text(response[2])
+            raise _redis_protocol_error(
+                f"Redis {record_kind} uses unsupported persistent schema version "
+                f"{schema_version!r}; expected {_PERSISTENT_SCHEMA_VERSION!r}"
             )
         break
     if code == "INVALID_CURSOR":
@@ -570,4 +578,12 @@ def _qualified_name(value: BaseException) -> str:
 def _remote_error(snapshot: _RunSnapshot) -> RuntimeError:
     error_class = snapshot.error_class or "builtins.RuntimeError"
     message = snapshot.error_message or "remote producer failed"
-    return RuntimeError(f"{error_class}: {message}")
+    error = RuntimeError(f"{error_class}: {message}")
+    error.add_note(
+        "Redis lease evidence: "
+        f"renew_count={snapshot.lease_renew_count}, "
+        "last_success="
+        f"{snapshot.lease_last_success_seconds}."
+        f"{snapshot.lease_last_success_microseconds:06d} UTC"
+    )
+    return error

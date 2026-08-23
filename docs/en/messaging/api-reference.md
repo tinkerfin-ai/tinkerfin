@@ -65,7 +65,7 @@ Identity is optional only when the source advertises an immutable profile.
 | `NativeStreamPartCodec` | Base-install native v2 codec and renderer |
 | `NativeStreamPart` | Native v2 replay value |
 | `MemoryBackend` | In-process implementation |
-| `RedisBackend` | `[redis]` multi-process implementation; persistent schema 4 |
+| `RedisBackend` | `[redis]` multi-process implementation; persistent schema 5 |
 | `MessagingBackend` | Custom backend protocol |
 
 ### Backend operations
@@ -78,7 +78,7 @@ Identity is optional only when the source advertises an immutable profile.
 | `latest_seq()` / `read()` | Channel, Identity, and pagination |
 | `bind_follow()` / `follow()` | Bind an authoritative generation and read it |
 | cancellation methods | Request, wait, and retrieve failure |
-| `renew(handle)` | Confirm producer lease ownership |
+| `lease_renew_interval` / `lease_timeout` / `renew(handle)` | Describe and renew producer lease ownership |
 | `delete_stream(...)` | Delete an inactive thread generation |
 
 `BackendRunHandle` contains channel, Identity, owner token, fence, and generation. `PreparedRun` adds the cursor, owner decision, checkpoint, and recovery flag.

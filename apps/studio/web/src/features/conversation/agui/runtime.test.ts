@@ -2279,6 +2279,73 @@ describe('AG-UI runtime reducer', () => {
     })
   })
 
+  it('preserves and submits every question in a larger Plan clarification form', () => {
+    const questions = Array.from({ length: 4 }, (_, index) => ({
+      id: `question-${index}`,
+      prompt: `第 ${index + 1} 个问题？`,
+      options: index % 2 === 0
+        ? [{ id: `option-${index}`, label: `选项 ${index + 1}` }]
+        : [],
+      allowFreeText: true,
+    }))
+    const current = buildEmptyConversation({
+      threadId: THREAD_ID,
+      now: '2026-08-05T08:00:00.000Z',
+      model: 'GPT-5.5',
+      mode: 'plan',
+    })
+    const interrupted = applyConversationEvent(current, {
+      type: 'RUN_FINISHED',
+      threadId: THREAD_ID,
+      runId: RUN_ID,
+      outcome: {
+        type: 'interrupt',
+        interrupts: [{
+          id: 'plan-question-large',
+          reason: 'plan_clarification',
+          metadata: {
+            runtimeInterrupt: {
+              envelope: {
+                metadata: {
+                  origin: 'plan',
+                  clarification: {
+                    schema: 'tinkerfin.plan-clarification.v1',
+                    form: { schemaVersion: 1, questions },
+                  },
+                },
+              },
+            },
+          },
+        }],
+      },
+    })
+
+    expect(interrupted.planInteraction?.kind).toBe('questions')
+    if (interrupted.planInteraction?.kind !== 'questions') throw new Error('missing questions')
+    expect(interrupted.planInteraction.questions).toHaveLength(4)
+    const ready: Conversation = {
+      ...interrupted,
+      planInteraction: {
+        ...interrupted.planInteraction,
+        questions: interrupted.planInteraction.questions.map((question, index) => ({
+          ...question,
+          selectedOptionId: index % 2 === 0 ? `option-${index}` : undefined,
+          customAnswer: index % 2 === 0 ? '' : `答案 ${index + 1}`,
+        })),
+      },
+    }
+    const payload = buildPlanResumePayload(ready)
+    expect(payload.resume?.[0]?.payload).toEqual({
+      type: 'respond',
+      answers: [
+        { questionId: 'question-0', optionId: 'option-0' },
+        { questionId: 'question-1', answer: '答案 2' },
+        { questionId: 'question-2', optionId: 'option-2' },
+        { questionId: 'question-3', answer: '答案 4' },
+      ],
+    })
+  })
+
   it('maps Plan review decisions and abandons only the Plan request', () => {
     const current = buildEmptyConversation({
       threadId: THREAD_ID,

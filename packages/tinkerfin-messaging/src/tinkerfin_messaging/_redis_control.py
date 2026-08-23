@@ -66,6 +66,7 @@ if TYPE_CHECKING:
 _SNAPSHOT_PAGE_SIZE = 100
 _MAX_WAIT_BLOCK_MS = 5_000
 _SOCKET_TIMEOUT_SAFETY_RATIO = 0.9
+_PERSISTENT_SCHEMA_VERSION = "5"
 
 _RedisScriptValue: TypeAlias = bytes | list["_RedisScriptValue"]
 _RedisStreamEntry: TypeAlias = tuple[bytes, dict[bytes, bytes]]
@@ -243,6 +244,9 @@ class _RunSnapshot:
     error_message: str
     signal_cursor: int
     lease_ttl_ms: int
+    lease_renew_count: int
+    lease_last_success_seconds: int
+    lease_last_success_microseconds: int
     messages: tuple[MessageEnvelope, ...]
 
     @property
@@ -396,7 +400,7 @@ async def renew(self: RedisBackend, handle: BackendRunHandle) -> bool:
     expected = f"{handle.owner_token}:{handle.fence}"
     response = await self._eval(
         _RENEW_SCRIPT,
-        [keys.control, keys.lease_key],
+        [keys.control, keys.run_key, keys.lease_key],
         [str(generation), expected, str(self._lease_ms)],
     )
     code = self._text(response[0])
@@ -404,8 +408,23 @@ async def renew(self: RedisBackend, handle: BackendRunHandle) -> bool:
         self._raise_stream_deleted(handle)
     if code == "OWNERSHIP_LOST":
         return False
-    if code != "RENEWED":
+    if code != "RENEWED" or len(response) != 4:
         raise _redis_protocol_error(f"unexpected Redis renew response: {code}")
+    self._snapshot_integer(
+        response[1],
+        field="lease renew count",
+        minimum=1,
+    )
+    self._snapshot_integer(
+        response[2],
+        field="lease last success seconds",
+        minimum=0,
+    )
+    self._snapshot_integer(
+        response[3],
+        field="lease last success microseconds",
+        minimum=0,
+    )
     return True
 
 
@@ -607,6 +626,12 @@ async def _read_control(
         ) from error
     if generation < 1:
         raise _redis_protocol_error("Redis stream control has invalid generation")
+    schema_version = decoded.get("schema_version")
+    if schema_version != _PERSISTENT_SCHEMA_VERSION:
+        raise _redis_protocol_error(
+            "Redis stream control uses unsupported persistent schema version "
+            f"{schema_version!r}; expected {_PERSISTENT_SCHEMA_VERSION!r}"
+        )
     return _StreamControl(
         generation=generation,
         state=cast(_ControlState, state),
@@ -681,6 +706,13 @@ async def _run_snapshot(
     if not response:
         raise _redis_protocol_error("Redis run snapshot returned an empty response")
     code = self._snapshot_text(response[0], field="response code")
+    if code == "SCHEMA_MISMATCH":
+        record_kind = self._snapshot_text(response[1], field="record kind")
+        schema_version = self._snapshot_text(response[2], field="schema version")
+        raise _redis_protocol_error(
+            f"Redis {record_kind} uses unsupported persistent schema version "
+            f"{schema_version!r}; expected {_PERSISTENT_SCHEMA_VERSION!r}"
+        )
     if code == "STREAM_DELETED":
         raise StreamDeleted(
             channel=keys.channel,
@@ -702,7 +734,7 @@ async def _run_snapshot(
         raise _redis_protocol_error(
             "Redis run snapshot has an invalid message boundary"
         )
-    if code != "OK" or len(response) != 8:
+    if code != "OK" or len(response) != 11:
         raise _redis_protocol_error(f"unexpected Redis run snapshot response: {code}")
 
     status_text = self._snapshot_text(response[1], field="status")
@@ -734,8 +766,23 @@ async def _run_snapshot(
         field="lease TTL",
         minimum=-2,
     )
-    messages = self._snapshot_messages(
+    lease_renew_count = self._snapshot_integer(
         response[7],
+        field="lease renew count",
+        minimum=0,
+    )
+    lease_last_success_seconds = self._snapshot_integer(
+        response[8],
+        field="lease last success seconds",
+        minimum=0,
+    )
+    lease_last_success_microseconds = self._snapshot_integer(
+        response[9],
+        field="lease last success microseconds",
+        minimum=0,
+    )
+    messages = self._snapshot_messages(
+        response[10],
         channel=keys.channel,
         identity=keys.identity,
         after=after,
@@ -748,6 +795,9 @@ async def _run_snapshot(
         error_message=error_message,
         signal_cursor=signal_cursor,
         lease_ttl_ms=lease_ttl_ms,
+        lease_renew_count=lease_renew_count,
+        lease_last_success_seconds=lease_last_success_seconds,
+        lease_last_success_microseconds=lease_last_success_microseconds,
         messages=messages,
     )
 

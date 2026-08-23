@@ -16,8 +16,15 @@ Object.defineProperty(window, 'localStorage', {
 
 Object.defineProperty(window, 'matchMedia', {
   configurable: true,
-  value: (query: string) => ({
-    matches: false,
+  value: (query: string) => {
+    const minWidth = query.match(/min-width:\s*(\d+)px/)?.[1]
+    const maxWidth = query.match(/max-width:\s*(\d+)px/)?.[1]
+    const matches = query.includes('prefers-')
+      ? false
+      : (!minWidth || window.innerWidth >= Number(minWidth))
+        && (!maxWidth || window.innerWidth <= Number(maxWidth))
+    return {
+    matches,
     media: query,
     onchange: null,
     addEventListener: vi.fn(),
@@ -25,7 +32,8 @@ Object.defineProperty(window, 'matchMedia', {
     addListener: vi.fn(),
     removeListener: vi.fn(),
     dispatchEvent: vi.fn(() => true),
-  }),
+  }
+  },
 })
 
 beforeEach(() => {

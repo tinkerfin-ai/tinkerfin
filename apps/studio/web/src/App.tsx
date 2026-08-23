@@ -1,17 +1,15 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 
 import {
   login,
   logout as logoutApi,
 } from './api/auth/client'
-import { AuthScreen } from './features/auth/AuthScreen'
 import { LoginTransition } from './features/auth/LoginTransition'
 import { useAuthVerification } from './features/auth/useAuthVerification'
-import { WorkspaceScreen } from './features/workspace/WorkspaceScreen'
 import { ApiError, AuthError, subscribeApiErrors } from './api/shared/http'
-import { ToastViewport } from './components/ToastViewport'
-import type { ToastItem, ToastKind } from './components/ToastViewport'
+import { ToastViewport } from './components/ui/ToastViewport'
+import type { ToastItem, ToastKind } from './components/ui/ToastViewport'
 import {
   clearAuthSession,
   createAuthSession,
@@ -26,6 +24,13 @@ import { clearActiveRunSession } from './features/conversation/stream/activeRunS
 type AuthPhase = 'checking' | 'signedOut' | 'transitioning' | 'signedIn'
 type AuthEntry = 'restore' | 'manual'
 let toastSequence = 0
+
+const AuthScreen = lazy(async () => ({
+  default: (await import('./features/auth/AuthScreen')).AuthScreen,
+}))
+const WorkspaceScreen = lazy(async () => ({
+  default: (await import('./features/workspace/WorkspaceScreen')).WorkspaceScreen,
+}))
 
 export default function App() {
   const [phase, setPhase] = useState<AuthPhase>(() => (
@@ -144,7 +149,14 @@ export default function App() {
 
   return (
     <>
-      {content}
+      <a className="skip-link" href="#main-content">跳到主要内容</a>
+      <Suspense fallback={(
+        <main id="main-content" className="auth-checking" aria-label="正在加载界面">
+          <span className="auth-checking__mark" aria-hidden="true" />
+        </main>
+      )}>
+        {content}
+      </Suspense>
       <ToastViewport
         toasts={toasts}
         onDismiss={(id) => setToasts((current) => current.filter((toast) => toast.id !== id))}

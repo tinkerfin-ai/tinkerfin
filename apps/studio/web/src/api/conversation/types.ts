@@ -60,14 +60,14 @@ export interface RawEventContext {
   source?: EventSourceInfo
   runId?: string
   relatedSubagentInvocationId?: string
-  /** Project extension: the parent task tool call that spawned this sub-agent. */
+  /** 项目扩展：创建该子智能体的父级 task 工具调用 */
   parentToolCallId?: string
-  /** Project extension: the validated task description for this sub-agent. */
+  /** 项目扩展：已校验的子智能体任务描述 */
   subagentInput?: string
   langgraphNode?: string
   interruptId?: string
   initializationFailed?: boolean
-  /** Project extension preserving LangChain ToolMessage.status. */
+  /** 项目扩展：保留 LangChain ToolMessage.status */
   toolResultStatus?: "success" | "error"
 }
 
@@ -100,11 +100,11 @@ export interface RunStartedEvent {
   threadId: string
   runId: string
   parentRunId?: string
-  /** Project extension carrying sub-agent provenance for synthesized runs. */
+  /** 项目扩展：合成运行的子智能体来源信息 */
   rawEvent?: RawEventContext
   /** Studio 扩展：服务端已持久化的权威会话标题 */
   title?: string
-  /** Present only on client-initiated main runs; absent on synthesized sub-agent runs. */
+  /** 仅客户端发起的主运行携带，合成子智能体运行不携带 */
   input?: RunStartedInput
 }
 
@@ -122,7 +122,7 @@ export interface MessagesSnapshotEvent {
 
 export interface StateSnapshotEvent {
   type: "STATE_SNAPSHOT"
-  /** Optional project extension; standard AG-UI producers may omit it. */
+  /** 可选项目扩展，标准 AG-UI 生产端可以省略 */
   rawEvent?: RawEventContext
   snapshot: JsonObject
 }
@@ -259,7 +259,7 @@ export interface RunFinishedEvent {
   rawEvent?: RawEventContext
   threadId: string
   runId: string
-  /** ag-ui-protocol permits producers to omit outcome; omission means success. */
+  /** ag-ui-protocol 允许生产端省略 outcome，省略表示成功 */
   outcome?: RunFinishedSuccessOutcome | RunFinishedInterruptOutcome
 }
 

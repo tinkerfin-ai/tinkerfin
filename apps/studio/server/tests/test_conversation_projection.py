@@ -383,7 +383,17 @@ async def test_projection_preserves_plan_mode_and_pending_plan_interrupt(
                                                         ],
                                                         "allowFreeText": False,
                                                         "attributes": None,
-                                                    }
+                                                    },
+                                                    *[
+                                                        {
+                                                            "id": f"question-{index}",
+                                                            "prompt": f"第 {index + 1} 个问题？",
+                                                            "options": [],
+                                                            "allowFreeText": True,
+                                                            "attributes": None,
+                                                        }
+                                                        for index in range(1, 4)
+                                                    ],
                                                 ],
                                             },
                                         },
@@ -411,6 +421,15 @@ async def test_projection_preserves_plan_mode_and_pending_plan_interrupt(
     assert snapshot["mode"] == "plan"
     assert snapshot["approval"] is None
     assert snapshot["interrupts"] == events[-1]["outcome"]["interrupts"]
+    questions = snapshot["interrupts"][0]["metadata"]["runtimeInterrupt"]["envelope"][
+        "metadata"
+    ]["clarification"]["form"]["questions"]
+    assert [question["id"] for question in questions] == [
+        "environment",
+        "question-1",
+        "question-2",
+        "question-3",
+    ]
 
 
 @pytest.mark.parametrize(

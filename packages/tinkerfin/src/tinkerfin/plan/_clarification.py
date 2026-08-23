@@ -26,12 +26,21 @@ _LANGGRAPH_DURABILITY_CONFIG_KEY = "__pregel_durability"
 
 
 @dataclass(frozen=True, slots=True)
+class ClarificationQuestionCount:
+    """Model-visible question count bounds derived from one host form schema."""
+
+    minimum: int
+    maximum: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class ClarificationSchemaBinding:
     """Concrete form and structured response types frozen for one Definition."""
 
     form_schema: type[ClarificationFormBase]
     fingerprint: str
     planner_response_type: type[PlannerOutcomeBase]
+    question_count: ClarificationQuestionCount
 
 
 def stateless_child_config(config: RunnableConfig) -> RunnableConfig:
@@ -141,9 +150,55 @@ def _validate_attributes(model: type[BaseModel], *, source: str) -> None:
     )
 
 
-def validate_clarification_schema(
+def _validate_questions_json_schema(
+    model: type[BaseModel], *, source: str
+) -> ClarificationQuestionCount:
+    """Require model-visible, satisfiable clarification cardinality constraints."""
+
+    field = model.model_fields["questions"]
+    if not field.is_required():
+        raise PlanModeConfigurationError(f"{source}.questions must be required")
+    try:
+        schema = _JSON_OBJECT.validate_python(model.model_json_schema(by_alias=True))
+    except Exception as error:
+        raise PlanModeConfigurationError(
+            f"{source} could not produce a JSON Schema",
+            cause=error,
+        ) from error
+    properties_value = schema.get("properties")
+    properties = (
+        cast(Mapping[str, JsonValue], properties_value)
+        if isinstance(properties_value, Mapping)
+        else None
+    )
+    questions_value = properties.get("questions") if properties is not None else None
+    if not isinstance(questions_value, Mapping):
+        raise PlanModeConfigurationError(
+            f"{source}.questions must expose the stable JSON array field 'questions'"
+        )
+    questions = cast(Mapping[str, JsonValue], questions_value)
+    if questions.get("type") != "array":
+        raise PlanModeConfigurationError(
+            f"{source}.questions must expose the stable JSON array field 'questions'"
+        )
+    minimum = questions.get("minItems")
+    if isinstance(minimum, bool) or not isinstance(minimum, int) or minimum < 1:
+        raise PlanModeConfigurationError(
+            f"{source}.questions JSON Schema must declare minItems >= 1"
+        )
+    maximum = questions.get("maxItems")
+    if maximum is not None and (
+        isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < minimum
+    ):
+        raise PlanModeConfigurationError(
+            f"{source}.questions JSON Schema maxItems must be >= minItems"
+        )
+    return ClarificationQuestionCount(minimum=minimum, maximum=maximum)
+
+
+def _validate_clarification_schema(
     value: object,
-) -> type[ClarificationFormBase]:
+) -> tuple[type[ClarificationFormBase], ClarificationQuestionCount]:
     """Validate one fully concrete host form using public typing metadata."""
 
     if not isinstance(value, type) or not issubclass(value, ClarificationFormBase):
@@ -163,6 +218,10 @@ def validate_clarification_schema(
         expected=ClarificationQuestionBase,
         source="clarification_schema",
         variadic_tuple=True,
+    )
+    question_count = _validate_questions_json_schema(
+        value,
+        source="clarification_schema",
     )
     for question_type in question_types:
         _require_inherited_core_fields(
@@ -187,14 +246,7 @@ def validate_clarification_schema(
                 source=option_type.__name__,
             )
             _validate_attributes(option_type, source=option_type.__name__)
-    try:
-        value.model_json_schema(by_alias=True)
-    except Exception as error:
-        raise PlanModeConfigurationError(
-            "clarification_schema could not produce a JSON Schema",
-            cause=error,
-        ) from error
-    return value
+    return value, question_count
 
 
 def _schema_fingerprint(schema: type[ClarificationFormBase]) -> str:
@@ -212,7 +264,7 @@ def create_clarification_binding(
 ) -> ClarificationSchemaBinding:
     """Create immutable concrete response types for one validated form schema."""
 
-    form_schema = validate_clarification_schema(schema)
+    form_schema, question_count = _validate_clarification_schema(schema)
     fingerprint = _schema_fingerprint(form_schema)
     planner_type = create_model(
         "PlannerOutcome",
@@ -223,6 +275,7 @@ def create_clarification_binding(
         form_schema=form_schema,
         fingerprint=fingerprint,
         planner_response_type=planner_type,
+        question_count=question_count,
     )
 
 

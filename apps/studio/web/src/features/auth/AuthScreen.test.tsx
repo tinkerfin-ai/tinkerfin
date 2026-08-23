@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import { AuthScreen } from './AuthScreen'
 import authStyles from './auth.css?raw'
-import globalStyles from '../../styles/global.css?raw'
+import uiStyles from '../../components/ui/ui.css?raw'
 
 describe('AuthScreen', () => {
   it('submits only the real username and password login to the caller', async () => {
@@ -27,22 +27,13 @@ describe('AuthScreen', () => {
     expect(passwordInput.closest('label')).toBeNull()
   })
 
-  it('keeps credential values at regular weight beneath emphasized labels', () => {
-    const styles = document.createElement('style')
-    styles.textContent = `${globalStyles}\n${authStyles}`
-    document.head.append(styles)
+  it('uses the shared TextField contract with semibold labels and regular input text', () => {
+    render(<AuthScreen onLogin={vi.fn()} />)
 
-    try {
-      render(<AuthScreen onLogin={vi.fn()} />)
-
-      const usernameInput = screen.getByLabelText('用户名')
-      const usernameField = usernameInput.closest('[data-validation-field]')
-
-      expect(getComputedStyle(usernameField!).fontWeight).toBe('680')
-      expect(getComputedStyle(usernameInput).fontWeight).toBe('400')
-    } finally {
-      styles.remove()
-    }
+    const usernameInput = screen.getByLabelText('用户名')
+    expect(usernameInput.closest('.ui-text-field')).toHaveClass('ui-text-field--capsule')
+    expect(uiStyles).toMatch(/\.ui-text-field__label\s*{[^}]*font-weight:\s*var\(--weight-semibold\)/s)
+    expect(uiStyles).toMatch(/\.ui-text-field__control input\s*{[^}]*font-weight:\s*var\(--weight-regular\)/s)
   })
 
   it('moves through login credentials before password recovery', async () => {
@@ -98,30 +89,23 @@ describe('AuthScreen', () => {
   })
 
   it('keeps short viewport forms inside a definite scroll container', () => {
-    expect(authStyles).toMatch(/\.auth-page\s*{[^}]*height:\s*100dvh;[^}]*overflow:\s*hidden;/s)
-    expect(authStyles).toMatch(/\.auth-panel\s*{[^}]*height:\s*100dvh;[^}]*overflow-y:\s*auto;/s)
-    expect(authStyles).toMatch(/@media \(max-width:\s*900px\)[\s\S]*\.auth-page\s*{[^}]*overflow-y:\s*auto;/s)
+    expect(authStyles).toMatch(/\.auth-page\s*{[^}]*min-height:\s*100dvh;[^}]*overflow:\s*hidden;/s)
+    expect(authStyles).toMatch(/@media \(max-width:\s*1023px\)[\s\S]*\.auth-page\s*{[^}]*overflow-y:\s*auto;/s)
+    expect(authStyles).toMatch(/\.auth-form-stage\s*{[^}]*calc\(100vw - var\(--space-8\)\)/s)
   })
 
-  it('keeps the focused password field free of an outer focus halo', () => {
-    const styles = document.createElement('style')
-    styles.textContent = `${globalStyles}\n${authStyles}`
-    document.head.append(styles)
+  it('applies the shared focus ring to the password control instead of the input', () => {
     render(<AuthScreen onLogin={vi.fn()} />)
 
     const passwordInput = screen.getByLabelText('密码')
-    passwordInput.focus()
-    const focusedStyle = getComputedStyle(passwordInput)
-
-    expect(focusedStyle.boxShadow).toContain('inset')
-    expect(focusedStyle.boxShadow).not.toMatch(/0px 0px 0px 3px/)
-    styles.remove()
+    expect(passwordInput.closest('.ui-text-field__control')).not.toBeNull()
+    expect(uiStyles).toMatch(/\.ui-text-field__control:focus-within\s*{[^}]*box-shadow:\s*var\(--shadow-focus\)/s)
+    expect(uiStyles).toMatch(/\.ui-text-field__control input\s*{[^}]*outline:\s*0/s)
   })
 
-  it('keeps transparent auth buttons free of hover fills', () => {
-    expect(authStyles).toMatch(
-      /\.auth-brand:hover,\s*\.auth-back:hover,\s*\.auth-password-toggle:hover\s*{[^}]*background:\s*transparent;/s,
-    )
+  it('uses visible hover feedback and the shared motion scale for auth controls', () => {
+    expect(authStyles).toMatch(/\.auth-brand:hover\s*{[^}]*background:\s*var\(--color-hover\)/s)
+    expect(uiStyles).toMatch(/\.ui-button\s*{[^}]*var\(--motion-fast\)/s)
   })
 
   it('completes registration with demo code 123456 and returns to login without creating a session', async () => {
@@ -165,30 +149,18 @@ describe('AuthScreen', () => {
     expect(screen.getByText('请输入邮箱地址')).toBeInTheDocument()
   })
 
-  it('keeps registration feedback from expanding field rows', async () => {
-    const styles = document.createElement('style')
-    styles.textContent = `${globalStyles}\n${authStyles}`
-    document.head.append(styles)
+  it('keeps registration feedback next to its field in normal document flow', async () => {
+    const user = userEvent.setup()
+    render(<AuthScreen onLogin={vi.fn()} />)
 
-    try {
-      const user = userEvent.setup()
-      render(<AuthScreen onLogin={vi.fn()} />)
+    await user.click(screen.getByRole('button', { name: '免费注册' }))
+    await user.click(screen.getByRole('button', { name: '创建账号' }))
 
-      await user.click(screen.getByRole('button', { name: '免费注册' }))
-      await user.click(screen.getByRole('button', { name: '创建账号' }))
-
-      const nameField = screen.getByLabelText('你的称呼').closest('[data-validation-field]')
-      const termsField = screen.getByLabelText('同意服务条款与隐私政策').closest('[data-validation-field]')
-      const nameError = screen.getByText('请输入称呼')
-      const termsError = screen.getByText('请先同意服务条款与隐私政策')
-
-      expect(getComputedStyle(nameField!).position).toBe('relative')
-      expect(getComputedStyle(termsField!).position).toBe('relative')
-      expect(getComputedStyle(nameError).position).toBe('absolute')
-      expect(getComputedStyle(termsError).position).toBe('absolute')
-    } finally {
-      styles.remove()
-    }
+    const nameError = screen.getByText('请输入称呼')
+    const termsError = screen.getByText('请先同意服务条款与隐私政策')
+    expect(nameError.closest('[data-validation-field]')).toContainElement(screen.getByLabelText('你的称呼'))
+    expect(termsError.closest('[data-validation-field]')).toContainElement(screen.getByLabelText('同意服务条款与隐私政策'))
+    expect(authStyles).not.toMatch(/\.validated-field-error\s*{[^}]*position:\s*absolute/s)
   })
 
   it('reports registration email and password constraints without native bubbles', async () => {
@@ -338,13 +310,14 @@ describe('AuthScreen', () => {
       .getByRole('button', { name: '使用 Apple 登录' })
       .querySelector('.auth-provider-apple-background')
     expect(appleBackground).not.toBeNull()
-    expect(getComputedStyle(appleBackground!).fill).toBe('transparent')
+    expect(appleBackground).toHaveClass('auth-provider-apple-background')
+    expect(authStyles).toMatch(/\.auth-provider-apple-background\s*{\s*fill:\s*transparent;/)
   })
 
-  it('keeps legal links visible but disabled', () => {
+  it('renders unavailable legal destinations as visible non-interactive text', () => {
     render(<AuthScreen onLogin={vi.fn()} />)
 
-    expect(screen.getByRole('button', { name: '服务条款' })).toBeDisabled()
-    expect(screen.getByRole('button', { name: '隐私政策' })).toBeDisabled()
+    expect(screen.getByText('服务条款').tagName).toBe('SPAN')
+    expect(screen.getByText('隐私政策').tagName).toBe('SPAN')
   })
 })

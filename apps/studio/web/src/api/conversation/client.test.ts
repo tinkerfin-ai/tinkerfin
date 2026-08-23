@@ -190,6 +190,18 @@ describe('conversation stream client', () => {
   })
 
   it.each([
+    ['未知事件', { type: 'STEP_STARTED', stepName: 'model' }],
+    ['缺少必填字段', { type: 'RUN_STARTED', runId: 'run-conflict' }],
+    ['字段类型错误', { type: 'TEXT_MESSAGE_CONTENT', messageId: 'message-1', delta: 1 }],
+  ])('rejects structurally invalid %s JSON before it reaches the reducer', async (_name, event) => {
+    vi.stubGlobal('fetch', vi.fn(async () => sseResponse(
+      `data: ${JSON.stringify(event)}\n\n`,
+    )))
+
+    await expect(consumeStream()).rejects.toThrow('事件流包含无效的 AG-UI 事件')
+  })
+
+  it.each([
     ['/backend', '/backend/api/conversation/chat'],
     ['backend', '/backend/api/conversation/chat'],
     ['https://api.example.test/backend', 'https://api.example.test/backend/api/conversation/chat'],

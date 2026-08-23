@@ -6,7 +6,7 @@ export type ResolvedTheme = Exclude<ThemePreference, 'system'>
 
 const THEME_COLORS: Record<ResolvedTheme, string> = {
   light: '#ffffff',
-  dark: '#111014',
+  dark: '#151517',
 }
 
 const isThemePreference = (value: string | null): value is ThemePreference => (

@@ -18,6 +18,26 @@ local owner_token = ARGV[7]
 local lease_ms = ARGV[8]
 local requested_channel = ARGV[9]
 local requested_stream = ARGV[10]
+local schema_version = '5'
+
+local function schema_mismatch(key, kind)
+    if redis.call('EXISTS', key) == 0 then
+        return nil
+    end
+    local stored = redis.call('HGET', key, 'schema_version')
+    if stored ~= schema_version then
+        return {kind, stored or ''}
+    end
+    return nil
+end
+
+local mismatched = schema_mismatch(channel_meta, 'channel metadata')
+    or schema_mismatch(control, 'stream control')
+    or schema_mismatch(meta, 'generation metadata')
+    or schema_mismatch(run_key, 'run record')
+if mismatched then
+    return {'SCHEMA_MISMATCH', mismatched[1], mismatched[2]}
+end
 
 local function write_signal(kind, signal_run)
     local signal_seq = redis.call('HINCRBY', control, 'signal_seq', 1)
@@ -26,6 +46,22 @@ local function write_signal(kind, signal_run)
         'kind', kind,
         'generation', tostring(requested_generation),
         'run', signal_run)
+end
+
+local function initialize_lease_diagnostics()
+    local lease_now = redis.call('TIME')
+    redis.call('HSET', run_key,
+        'lease_renew_count', '0',
+        'lease_last_success_seconds', lease_now[1],
+        'lease_last_success_microseconds', lease_now[2])
+end
+
+local function archive_lease_diagnostics()
+    redis.call('HSET', run_key,
+        'lease_previous_fence', redis.call('HGET', run_key, 'fence') or '',
+        'lease_previous_renew_count', redis.call('HGET', run_key, 'lease_renew_count') or '',
+        'lease_previous_last_success_seconds', redis.call('HGET', run_key, 'lease_last_success_seconds') or '',
+        'lease_previous_last_success_microseconds', redis.call('HGET', run_key, 'lease_last_success_microseconds') or '')
 end
 
 local control_state = redis.call('HGET', control, 'state')
@@ -68,7 +104,7 @@ if not stored_codec then
     redis.call('HSET', channel_meta,
         'channel', requested_channel,
         'codec', requested_codec,
-        'schema_version', '4')
+        'schema_version', schema_version)
 end
 
 if activate_generation then
@@ -77,7 +113,7 @@ if activate_generation then
         'stream', requested_stream,
         'generation', tostring(requested_generation),
         'state', 'active',
-        'schema_version', '4')
+        'schema_version', schema_version)
     redis.call('HSETNX', control, 'signal_seq', '0')
 end
 
@@ -86,7 +122,7 @@ redis.call('HSET', meta,
     'stream', requested_stream,
     'generation', tostring(requested_generation),
     'seq', tostring(latest),
-    'schema_version', '4')
+    'schema_version', schema_version)
 redis.call('SADD', key_index, meta)
 
 if redis.call('EXISTS', run_key) == 1 then
@@ -118,6 +154,7 @@ if redis.call('EXISTS', run_key) == 1 then
         if status == 'cancel_requested' then
             recovered_status = 'cancel_requested'
         end
+        archive_lease_diagnostics()
         redis.call('HSET', run_key,
             'status', recovered_status,
             'settling', '0',
@@ -130,6 +167,7 @@ if redis.call('EXISTS', run_key) == 1 then
             'active_run', requested_run,
             'active_key', run_key,
             'active_lease', lease_key)
+        initialize_lease_diagnostics()
         redis.call('SET', lease_key, owner_token .. ':' .. tostring(fence), 'PX', lease_ms)
         write_signal('recover', requested_run)
         return {
@@ -171,6 +209,7 @@ local fence = redis.call('HINCRBY', meta, 'fence_counter', 1)
 redis.call('SADD', key_index, run_key, lease_key)
 redis.call('HSET', run_key,
     'run', requested_run,
+    'schema_version', schema_version,
     'status', 'running',
     'settling', '0',
     'start_seq', tostring(latest),
@@ -186,6 +225,7 @@ redis.call('HSET', meta,
     'active_run', requested_run,
     'active_key', run_key,
     'active_lease', lease_key)
+initialize_lease_diagnostics()
 redis.call('SET', lease_key, owner_token .. ':' .. tostring(fence), 'PX', lease_ms)
 return {'START', tostring(cursor), tostring(fence)}
 """
@@ -410,6 +450,7 @@ local messages = KEYS[5]
 local signals = KEYS[6]
 local generation = ARGV[1]
 local requested_after = ARGV[2]
+local schema_version = '5'
 
 local function write_signal(kind, signal_run)
     local signal_seq = redis.call('HINCRBY', control, 'signal_seq', 1)
@@ -425,6 +466,18 @@ if redis.call('HGET', control, 'state') ~= 'active' or redis.call('HGET', contro
 end
 if redis.call('EXISTS', run_key) == 0 then
     return {'NOT_FOUND'}
+end
+local control_schema = redis.call('HGET', control, 'schema_version')
+if control_schema ~= schema_version then
+    return {'SCHEMA_MISMATCH', 'stream control', control_schema or ''}
+end
+local metadata_schema = redis.call('HGET', meta, 'schema_version')
+if metadata_schema ~= schema_version then
+    return {'SCHEMA_MISMATCH', 'generation metadata', metadata_schema or ''}
+end
+local run_schema = redis.call('HGET', run_key, 'schema_version')
+if run_schema ~= schema_version then
+    return {'SCHEMA_MISMATCH', 'run record', run_schema or ''}
 end
 local status = redis.call('HGET', run_key, 'status')
 if status ~= 'running' and status ~= 'cancel_requested' and status ~= 'completed' and status ~= 'cancelled' and status ~= 'failed' and status ~= 'owner_lost' then
@@ -484,6 +537,9 @@ return {
     redis.call('HGET', run_key, 'error_message') or '',
     tostring(redis.call('HGET', control, 'signal_seq') or '0'),
     tostring(lease_ttl_ms),
+    redis.call('HGET', run_key, 'lease_renew_count') or '',
+    redis.call('HGET', run_key, 'lease_last_success_seconds') or '',
+    redis.call('HGET', run_key, 'lease_last_success_microseconds') or '',
     page
 }
 """
@@ -491,18 +547,24 @@ return {
 
 _RENEW_SCRIPT = r"""
 local control = KEYS[1]
-local lease_key = KEYS[2]
+local run_key = KEYS[2]
+local lease_key = KEYS[3]
 local generation = ARGV[1]
 local expected_owner = ARGV[2]
 local lease_ms = ARGV[3]
 if redis.call('HGET', control, 'state') ~= 'active' or redis.call('HGET', control, 'generation') ~= generation then
     return {'STREAM_DELETED'}
 end
-if redis.call('GET', lease_key) ~= expected_owner then
+if redis.call('EXISTS', run_key) == 0 or redis.call('GET', lease_key) ~= expected_owner then
     return {'OWNERSHIP_LOST'}
 end
+local lease_now = redis.call('TIME')
+local renew_count = redis.call('HINCRBY', run_key, 'lease_renew_count', 1)
+redis.call('HSET', run_key,
+    'lease_last_success_seconds', lease_now[1],
+    'lease_last_success_microseconds', lease_now[2])
 redis.call('PEXPIRE', lease_key, lease_ms)
-return {'RENEWED'}
+return {'RENEWED', tostring(renew_count), lease_now[1], lease_now[2]}
 """
 
 

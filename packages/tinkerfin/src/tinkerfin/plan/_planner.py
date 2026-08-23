@@ -45,9 +45,10 @@ Spend no more than three model turns on filesystem inspection, then return the
 structured outcome.
 
 First decide whether the user's intent and constraints are sufficient for an executable
-Plan. When material information is missing, return one clarification form containing
-one to three blocking questions. Reassess sufficiency after every complete answer batch;
-multiple clarification rounds are allowed.
+Plan. When material information is missing, return one non-empty clarification form that
+contains the blocking questions and conforms to the configured structured response
+schema. Reassess sufficiency after every complete answer batch; multiple clarification
+rounds are allowed.
 
 The trusted context can contain an authoritativeEdit. It is user-authored and must never
 be silently rewritten. When an authoritativeEdit is present, return clarify if it is
@@ -69,6 +70,31 @@ class _StructuredAgent(Protocol):
         input: Mapping[str, object],
         config: RunnableConfig | None = None,
     ) -> Mapping[str, object]: ...
+
+
+def _planner_system_prompt(clarification: ClarificationSchemaBinding) -> str:
+    """Add question count guidance derived from the validated response schema."""
+
+    count = clarification.question_count
+    if count.maximum is None:
+        cardinality = (
+            f"at least {count.minimum} "
+            f"{'question' if count.minimum == 1 else 'questions'} and sets no maximum"
+        )
+    elif count.minimum == count.maximum:
+        cardinality = (
+            f"exactly {count.minimum} "
+            f"{'question' if count.minimum == 1 else 'questions'}"
+        )
+    else:
+        cardinality = (
+            f"between {count.minimum} and {count.maximum} questions, inclusive"
+        )
+    instruction = (
+        "Whenever you return clarify, the configured clarification schema requires "
+        f"{cardinality}."
+    )
+    return f"{_PLANNER_PROMPT.rstrip()}\n\n{instruction}"
 
 
 def _invalid_structured_call_messages(
@@ -124,7 +150,7 @@ def create_planner_agent(
         create_agent(
             model=model,
             tools=(),
-            system_prompt=_PLANNER_PROMPT,
+            system_prompt=_planner_system_prompt(clarification),
             middleware=middleware,
             response_format=ToolStrategy(
                 clarification.planner_response_type,

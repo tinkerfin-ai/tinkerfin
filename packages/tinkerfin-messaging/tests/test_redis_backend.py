@@ -48,9 +48,9 @@ _REDIS_SCRIPT_DIGESTS = {
     "_DELETE_BATCH_SCRIPT": "e0a233eb4d17f70abb3ef4f2afda18007e267c065d7b62dc413ea0c80f37cc82",
     "_FINALIZE_DELETE_SCRIPT": "60dba88f869c6584a5c9d9eb036c3aa9336010238a892da2e2fca6ff8008782c",
     "_FINISH_SCRIPT": "7e020d232d28d30e75551c5661e30ad3b5abc04c6e169a7028abd5f3484b687e",
-    "_PREPARE_SCRIPT": "29f779580895f7d11e072bef8bf20f52907eca097f6e117ad147f3b9c1f611d0",
-    "_RENEW_SCRIPT": "52da64b825db95f104586e642bb614f2cf74f06834d695ba1c1272ccb8800865",
-    "_RUN_SNAPSHOT_SCRIPT": "6fd0be00eefe236c70f540a84d08be6bd757c4b4dde0728eaa25718633f5d94f",
+    "_PREPARE_SCRIPT": "25db105c1513c8deb41904b7d8e57351441850e00809c358d821cfc5c5b9baa9",
+    "_RENEW_SCRIPT": "90a2c24ed5f4e9c64f84a41fa6b4bc69e03206c5df48c5f75ec4b66be6c62113",
+    "_RUN_SNAPSHOT_SCRIPT": "819a51a0d3701da3d65578a3ddc30bac30610581e02abca437557a54bc272dce",
 }
 
 
@@ -1279,7 +1279,7 @@ async def test_real_redis_persists_channel_and_stream_metadata_separately(
     assert channel_meta == {
         b"channel": b"events",
         b"codec": b"test.bytes.v1",
-        b"schema_version": b"4",
+        b"schema_version": b"5",
     }
     controls = [
         await cast(Awaitable[dict[bytes, bytes]], client.hgetall(key))
@@ -1292,7 +1292,7 @@ async def test_real_redis_persists_channel_and_stream_metadata_separately(
     assert all(control[b"channel"] == b"events" for control in controls)
     assert all(control[b"generation"] == b"1" for control in controls)
     assert all(control[b"state"] == b"active" for control in controls)
-    assert all(control[b"schema_version"] == b"4" for control in controls)
+    assert all(control[b"schema_version"] == b"5" for control in controls)
     assert all(control[b"signal_seq"] == b"1" for control in controls)
     stream_metadata = [
         await cast(Awaitable[dict[bytes, bytes]], client.hgetall(key))
@@ -1305,7 +1305,7 @@ async def test_real_redis_persists_channel_and_stream_metadata_separately(
     assert all(metadata[b"channel"] == b"events" for metadata in stream_metadata)
     assert all(metadata[b"generation"] == b"1" for metadata in stream_metadata)
     assert all(metadata[b"seq"] == b"1" for metadata in stream_metadata)
-    assert all(metadata[b"schema_version"] == b"4" for metadata in stream_metadata)
+    assert all(metadata[b"schema_version"] == b"5" for metadata in stream_metadata)
 
     run_metadata = [
         await cast(Awaitable[dict[bytes, bytes]], client.hgetall(key))
@@ -1313,6 +1313,15 @@ async def test_real_redis_persists_channel_and_stream_metadata_separately(
     ]
     assert {metadata[b"status"] for metadata in run_metadata} == {b"completed"}
     assert {metadata[b"run"] for metadata in run_metadata} == {b"run-1", b"run-2"}
+    assert all(metadata[b"schema_version"] == b"5" for metadata in run_metadata)
+    assert all(metadata[b"lease_renew_count"] == b"0" for metadata in run_metadata)
+    assert all(
+        int(metadata[b"lease_last_success_seconds"]) > 0 for metadata in run_metadata
+    )
+    assert all(
+        0 <= int(metadata[b"lease_last_success_microseconds"]) < 1_000_000
+        for metadata in run_metadata
+    )
     for key in index_keys:
         indexed = {
             _redis_text(member)
@@ -1338,6 +1347,78 @@ async def test_real_redis_persists_channel_and_stream_metadata_separately(
         assert fields[b"kind"] == b"finish"
         assert fields[b"generation"] == b"1"
         assert fields[b"run"] in {b"run-1", b"run-2"}
+
+
+@pytest.mark.parametrize(
+    ("record_kind", "key_pattern"),
+    (
+        ("channel", "tfmsg:test:*:channel"),
+        ("control", "tfmsg:test:*:control"),
+        ("metadata", "tfmsg:test:*:generation:1:meta"),
+        ("run", "tfmsg:test:*:generation:1:run:*"),
+    ),
+)
+@pytest.mark.parametrize("stored_schema", ("4", None), ids=("schema-4", "missing"))
+async def test_real_redis_rejects_incompatible_schema_without_mutation(
+    redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+    record_kind: str,
+    key_pattern: str,
+    stored_schema: str | None,
+) -> None:
+    backend, _, client = redis_backends
+    prepared = await backend.prepare(
+        channel="events",
+        identity=_identity(),
+        codec="test.bytes.v1",
+        after=0,
+        cancellable=False,
+        recoverable=False,
+    )
+    await backend.finish(prepared.handle, status="completed")
+    records = [key async for key in client.scan_iter(match=key_pattern)]
+    assert len(records) == 1
+    if stored_schema is None:
+        await cast(Awaitable[int], client.hdel(records[0], "schema_version"))
+    else:
+        await cast(
+            Awaitable[int],
+            client.hset(records[0], "schema_version", stored_schema),
+        )
+    hash_keys = {
+        key
+        async for key in client.scan_iter(match="tfmsg:test:*")
+        if await cast(Awaitable[bytes], client.type(key)) == b"hash"
+    }
+    hashes_before = {
+        key: await cast(Awaitable[dict[bytes, bytes]], client.hgetall(key))
+        for key in hash_keys
+    }
+    requested_identity = (
+        _identity()
+        if record_kind == "run"
+        else Identity(threadId="conversation-1", runId="run-2")
+    )
+
+    with pytest.raises(
+        MessagingBackendProtocolError,
+        match="invalid protocol response",
+    ) as captured:
+        await backend.prepare(
+            channel="events",
+            identity=requested_identity,
+            codec="test.bytes.v1",
+            after=0,
+            cancellable=False,
+            recoverable=False,
+        )
+
+    detail = str(captured.value.diagnostic_context["detail"])
+    assert "unsupported persistent schema version" in detail
+    assert "expected '5'" in detail
+    assert {
+        key: await cast(Awaitable[dict[bytes, bytes]], client.hgetall(key))
+        for key in hash_keys
+    } == hashes_before
 
 
 @pytest.mark.parametrize(
@@ -2212,14 +2293,19 @@ async def test_real_redis_follower_observes_nonrecoverable_lease_expiry(
     replay = follower.follow(prepared.handle, after=0)
 
     assert (await anext(replay)).payload == b"committed"
-    with pytest.raises(RunProducerFailed, match="run-1"):
+    with pytest.raises(RunProducerFailed, match="run-1") as captured:
         await asyncio.wait_for(anext(replay), timeout=2)
+    cause = captured.value.cause
+    assert cause is not None
+    notes = "\n".join(getattr(cause, "__notes__", ()))
+    assert "Redis lease evidence: renew_count=0" in notes
+    assert "last_success=" in notes
 
 
 async def test_real_redis_messaging_renews_the_owner_lease(
     redis_backends: tuple[RedisBackend, RedisBackend, Redis],
 ) -> None:
-    owner_backend, follower_backend, _ = redis_backends
+    owner_backend, follower_backend, client = redis_backends
     release = asyncio.Event()
     source = _Source(
         "before-renewal",
@@ -2242,7 +2328,20 @@ async def test_real_redis_messaging_renews_the_owner_lease(
             after=0,
         )
         await asyncio.wait_for(source.started.wait(), timeout=1)
+        run_keys = [
+            key
+            async for key in client.scan_iter(match="tfmsg:test:*:generation:1:run:*")
+        ]
+        assert len(run_keys) == 1
+        initial_evidence = await cast(
+            Awaitable[dict[bytes, bytes]],
+            client.hgetall(run_keys[0]),
+        )
         await asyncio.sleep(1.3)
+        renewed_evidence = await cast(
+            Awaitable[dict[bytes, bytes]],
+            client.hgetall(run_keys[0]),
+        )
         release.set()
         await asyncio.wait_for(source.closed.wait(), timeout=1)
 
@@ -2256,12 +2355,25 @@ async def test_real_redis_messaging_renews_the_owner_lease(
         assert await _data(subscription) == ["before-renewal", "after-renewal"]
         assert await _data(attached) == ["before-renewal", "after-renewal"]
         assert unused.close_calls == 1
+        initial_count = int(initial_evidence[b"lease_renew_count"])
+        renewed_count = int(renewed_evidence[b"lease_renew_count"])
+        initial_time = (
+            int(initial_evidence[b"lease_last_success_seconds"]),
+            int(initial_evidence[b"lease_last_success_microseconds"]),
+        )
+        renewed_time = (
+            int(renewed_evidence[b"lease_last_success_seconds"]),
+            int(renewed_evidence[b"lease_last_success_microseconds"]),
+        )
+        assert renewed_count > initial_count
+        assert renewed_count >= 5
+        assert renewed_time > initial_time
 
 
 async def test_real_redis_recoverable_takeover_uses_checkpoint_and_higher_fence(
     redis_backends: tuple[RedisBackend, RedisBackend, Redis],
 ) -> None:
-    stale, recovering, _ = redis_backends
+    stale, recovering, client = redis_backends
     original = await stale.prepare(
         channel="events",
         identity=_identity(),
@@ -2298,6 +2410,19 @@ async def test_real_redis_recoverable_takeover_uses_checkpoint_and_higher_fence(
     assert recovered.handle.fence is not None
     assert original.handle.fence is not None
     assert recovered.handle.fence > original.handle.fence
+    run_keys = [
+        key async for key in client.scan_iter(match="tfmsg:test:*:generation:1:run:*")
+    ]
+    assert len(run_keys) == 1
+    evidence = await cast(
+        Awaitable[dict[bytes, bytes]],
+        client.hgetall(run_keys[0]),
+    )
+    assert evidence[b"lease_previous_fence"] == str(original.handle.fence).encode()
+    assert evidence[b"lease_previous_renew_count"] == b"0"
+    assert int(evidence[b"lease_previous_last_success_seconds"]) > 0
+    assert 0 <= int(evidence[b"lease_previous_last_success_microseconds"]) < 1_000_000
+    assert evidence[b"lease_renew_count"] == b"0"
     with pytest.raises(BackendOwnershipLost):
         await stale.append(
             original.handle,
@@ -2560,6 +2685,19 @@ async def test_recoverable_source_resumes_after_owner_process_is_killed(
                     )
                 await asyncio.sleep(0.05)
 
+        await asyncio.sleep(0.25)
+        run_keys = [
+            key
+            async for key in client.scan_iter(match=f"{prefix}:*:generation:1:run:*")
+        ]
+        assert len(run_keys) == 1
+        before_kill = await cast(
+            Awaitable[dict[bytes, bytes]],
+            client.hgetall(run_keys[0]),
+        )
+        previous_fence = before_kill[b"fence"]
+        previous_renew_count = before_kill[b"lease_renew_count"]
+        assert int(previous_renew_count) >= 1
         process.kill()
         await asyncio.to_thread(process.join, 5)
         assert process.exitcode is not None and process.exitcode != 0
@@ -2587,6 +2725,13 @@ async def test_recoverable_source_resumes_after_owner_process_is_killed(
                 last_message_id="stable-message-1",
             )
         ]
+        recovered_evidence = await cast(
+            Awaitable[dict[bytes, bytes]],
+            client.hgetall(run_keys[0]),
+        )
+        assert recovered_evidence[b"lease_previous_fence"] == previous_fence
+        assert recovered_evidence[b"lease_previous_renew_count"] == previous_renew_count
+        assert int(recovered_evidence[b"lease_previous_last_success_seconds"]) > 0
     finally:
         if process.is_alive():
             process.kill()
@@ -2627,6 +2772,18 @@ async def test_ordinary_source_is_not_restarted_after_owner_process_is_killed(
                     )
                 await asyncio.sleep(0.05)
 
+        await asyncio.sleep(0.25)
+        run_keys = [
+            key
+            async for key in client.scan_iter(match=f"{prefix}:*:generation:1:run:*")
+        ]
+        assert len(run_keys) == 1
+        before_kill = await cast(
+            Awaitable[dict[bytes, bytes]],
+            client.hgetall(run_keys[0]),
+        )
+        renew_count = int(before_kill[b"lease_renew_count"])
+        assert renew_count >= 1
         process.kill()
         await asyncio.to_thread(process.join, 5)
         assert process.exitcode is not None and process.exitcode != 0
@@ -2642,7 +2799,7 @@ async def test_ordinary_source_is_not_restarted_after_owner_process_is_killed(
             )
             iterator = aiter(subscription)
             first = await anext(iterator)
-            with pytest.raises(RunProducerFailed, match="run-1"):
+            with pytest.raises(RunProducerFailed, match="run-1") as captured:
                 await anext(iterator)
 
         assert first.envelope.seq == 1
@@ -2650,6 +2807,11 @@ async def test_ordinary_source_is_not_restarted_after_owner_process_is_killed(
         assert first.data == "first"
         assert unused.close_calls == 1
         assert not unused.started.is_set()
+        cause = captured.value.cause
+        assert cause is not None
+        notes = "\n".join(getattr(cause, "__notes__", ()))
+        assert f"renew_count={renew_count}" in notes
+        assert "last_success=" in notes
     finally:
         if process.is_alive():
             process.kill()

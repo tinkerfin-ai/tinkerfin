@@ -181,6 +181,12 @@ class MessagingBackend(Protocol):
     @property
     def lease_renew_interval(self) -> float | None: ...
 
+    @property
+    def lease_timeout(self) -> float | None:
+        """Return the ownership expiry budget used only for trusted diagnostics."""
+
+        ...
+
     async def renew(self, handle: BackendRunHandle) -> bool: ...
 
     async def delete_stream(self, *, channel: str, identity: Identity) -> None:
@@ -254,6 +260,12 @@ class MemoryBackend(MessagingBackend):
     @property
     def lease_renew_interval(self) -> float | None:
         """In-process ownership has no expiring external lease."""
+
+        return None
+
+    @property
+    def lease_timeout(self) -> float | None:
+        """In-process ownership has no expiry budget."""
 
         return None
 

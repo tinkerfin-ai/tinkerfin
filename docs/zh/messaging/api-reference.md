@@ -75,7 +75,7 @@ TinkerFin profile source 的 `identity` 可省略；普通自定义 source 必�
 | `NativeStreamPartCodec` | 默认安装可用的 Native v2 codec 与 renderer |
 | `NativeStreamPart` | Native v2 解码结果 |
 | `MemoryBackend` | 单进程实现 |
-| `RedisBackend` | 安装 `[redis]` 后可用的多进程实现，持久 schema 为 4 |
+| `RedisBackend` | 安装 `[redis]` 后可用的多进程实现，持久 schema 为 5 |
 | `MessagingBackend` | 自定义 backend 协议 |
 
 ### `MessagingBackend` 操作
@@ -90,7 +90,7 @@ TinkerFin profile source 的 `identity` 可省略；普通自定义 source 必�
 | `bind_follow(...)` / `follow(...)` | 绑定权威 generation 并持续读取 |
 | `request_cancel()` / `wait_for_cancel()` | 记录或等待取消 |
 | `wait_finished()` / `failure()` | 等待最终状态或读取失败 |
-| `renew(handle)` | 续租并返回是否仍有所有权 |
+| `lease_renew_interval` / `lease_timeout` / `renew(handle)` | 描述续租周期、过期预算并确认所有权 |
 | `delete_stream(...)` | 删除不活跃 thread generation |
 
 `BackendRunHandle` 包含 channel、Identity、owner token、fence 和 generation。`PreparedRun` 还包含游标、`is_owner`、可选 checkpoint 与 `recovered`。

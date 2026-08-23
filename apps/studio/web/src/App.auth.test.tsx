@@ -221,7 +221,7 @@ describe('App authentication boundary', () => {
     expect(window.localStorage.getItem(AUTH_SESSION_STORAGE_KEY)).toBeNull()
   })
 
-  it('shows the global 400ms transition only after a manual login succeeds', async () => {
+  it('shows the global 300ms transition only after a manual login succeeds', async () => {
     const browserUser = userEvent.setup()
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const request = input instanceof Request ? input : new Request(input)

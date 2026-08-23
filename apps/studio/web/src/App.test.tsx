@@ -14,8 +14,8 @@ import type { ChatRequestPayload, ConversationAgUiEvent } from './api/conversati
 import type { AgentModelCatalog } from './api/models/types'
 import { subscribeApiErrors } from './api/shared/http'
 import { AUTH_SESSION_STORAGE_KEY, clearAuthSession, saveAuthSession } from './auth/session'
-import { ToastViewport } from './components/ToastViewport'
-import type { ToastItem, ToastKind } from './components/ToastViewport'
+import { ToastViewport } from './components/ui/ToastViewport'
+import type { ToastItem, ToastKind } from './components/ui/ToastViewport'
 import { WorkspaceScreen } from './features/workspace/WorkspaceScreen'
 import {
   readActiveRunSession,
@@ -155,9 +155,9 @@ function historyDetail(overrides: Partial<ConversationHistoryDetail> & { threadI
     toolCallCount: 0,
     hasPendingInterrupt: false,
     snapshot: null,
-    // 反映「后端返回全量事件」的恢复模型：前端 baseline 只从快照取用户消息，
-    // assistant 文本/工具/HITL 均由回放事件重建。这里给出重建该条 assistant 消息
-    // 的事件序列（与快照里的 assistant 内容一致），使刷新后内容与实时一致。
+    // 反映「后端返回全量事件」的恢复模型：前端 baseline 只从快照取用户消息
+    // assistant 文本、工具和 HITL 均由回放事件重建，这里给出重建该条 assistant 消息
+    // 的事件序列（与快照里的 assistant 内容一致），使刷新后内容与实时一致
     events: assistantHistoryEvents(threadId, FIRST_RUN_ID, `${threadId}-assistant-1`, assistantContent),
     createdAt: BASE_TIME,
     updatedAt: BASE_TIME,
@@ -423,7 +423,9 @@ function installFetchMock(options: FetchMockOptions = {}) {
 async function sendMessage(message: string) {
   const user = userEvent.setup()
   await waitFor(() => expect(screen.getByRole('button', { name: '选择模型' })).not.toHaveTextContent('加载模型…'))
-  await user.type(screen.getByLabelText('消息输入'), message)
+  const input = screen.getByLabelText('消息输入')
+  await waitFor(() => expect(input).toBeEnabled())
+  await user.type(input, message)
   await user.click(screen.getByRole('button', { name: '发送消息' }))
   return user
 }
@@ -702,6 +704,100 @@ describe('App', () => {
     expect(screen.queryByText('GPT-5.5')).not.toBeInTheDocument()
   })
 
+  it('keeps the composer disabled until the initial model and history bootstrap completes', async () => {
+    let resolveModel!: (response: Response) => void
+    const modelResponse = new Promise<Response>((resolve) => {
+      resolveModel = resolve
+    })
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const request = input instanceof Request ? input : new Request(input)
+      const url = new URL(request.url)
+      if (url.pathname.endsWith('/api/models')) return await modelResponse
+      if (url.pathname.endsWith('/api/conversation/history')) {
+        return jsonResponse({ items: [], nextCursor: null })
+      }
+      throw new Error(`unexpected fetch: ${url.pathname}`)
+    }))
+    render(<App />)
+
+    const input = screen.getByLabelText('消息输入')
+    expect(input).toBeDisabled()
+    expect(input).toHaveAttribute('placeholder', '正在加载模型…')
+
+    await act(async () => resolveModel(jsonResponse(DEFAULT_MODEL_CATALOG)))
+
+    expect(await screen.findByRole('heading', { name: '暂无消息' })).toBeInTheDocument()
+    await waitFor(() => expect(input).toBeEnabled())
+  })
+
+  it('shows a local model-catalog error and recovers through its retry action', async () => {
+    let modelRequestCount = 0
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const request = input instanceof Request ? input : new Request(input)
+      const url = new URL(request.url)
+      if (url.pathname.endsWith('/api/models')) {
+        modelRequestCount += 1
+        if (modelRequestCount === 1) {
+          return new Response(JSON.stringify({ code: 503, message: '模型目录暂不可用', data: null }), {
+            status: 503,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        return jsonResponse(DEFAULT_MODEL_CATALOG)
+      }
+      if (url.pathname.endsWith('/api/conversation/history')) {
+        return jsonResponse({ items: [], nextCursor: null })
+      }
+      throw new Error(`unexpected fetch: ${url.pathname}`)
+    }))
+    const user = userEvent.setup()
+    render(<App />)
+
+    const error = await screen.findByText('模型加载失败')
+    const retry = within(error.parentElement!).getByRole('button', { name: '重试' })
+    expect(screen.getByRole('button', { name: '选择模型' })).toBeDisabled()
+    expect(screen.getByLabelText('消息输入')).toBeDisabled()
+    expect(screen.getByLabelText('消息输入')).toHaveAttribute('placeholder', '模型加载失败，请先重试')
+    await user.click(retry)
+
+    await waitFor(() => expect(screen.getByRole('button', { name: '选择模型' })).toHaveTextContent('GPT-5.5'))
+    await waitFor(() => expect(screen.getByLabelText('消息输入')).toBeEnabled())
+    expect(modelRequestCount).toBe(2)
+    expect(screen.queryByText('模型加载失败')).not.toBeInTheDocument()
+  })
+
+  it('shows a local history bootstrap error and retries without reloading the page', async () => {
+    let historyRequestCount = 0
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const request = input instanceof Request ? input : new Request(input)
+      const url = new URL(request.url)
+      if (url.pathname.endsWith('/api/models')) return jsonResponse(DEFAULT_MODEL_CATALOG)
+      if (url.pathname.endsWith('/api/conversation/history')) {
+        historyRequestCount += 1
+        if (historyRequestCount === 1) {
+          return new Response(JSON.stringify({ code: 503, message: '历史服务暂不可用', data: null }), {
+            status: 503,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        return jsonResponse({ items: [], nextCursor: null })
+      }
+      throw new Error(`unexpected fetch: ${url.pathname}`)
+    }))
+    const user = userEvent.setup()
+    render(<App />)
+
+    const title = await screen.findByText('历史会话加载失败')
+    expect(screen.getByLabelText('消息输入')).toBeDisabled()
+    expect(screen.getByLabelText('消息输入')).toHaveAttribute('placeholder', '历史会话加载失败，请先重试')
+    await user.click(within(title.closest('.workspace-status')!).getByRole('button', { name: '重试' }))
+
+    expect(await screen.findByRole('heading', { name: '暂无消息' })).toBeInTheDocument()
+    await waitFor(() => expect(screen.getByLabelText('消息输入')).toBeEnabled())
+    expect(historyRequestCount).toBe(2)
+    expect(screen.queryByText('历史会话加载失败')).not.toBeInTheDocument()
+  })
+
   it('supports the complete keyboard listbox model and returns focus to each trigger', async () => {
     installFetchMock()
     const user = userEvent.setup()
@@ -765,7 +861,7 @@ describe('App', () => {
 
     render(<App />)
 
-    expect(await screen.findByRole('alert')).toHaveTextContent('历史分页游标已失效')
+    expect((await screen.findByText('历史分页游标已失效')).closest('[role="alert"]')).not.toBeNull()
   })
 
   it('does not surface authentication failures through the workspace toast channel', async () => {
@@ -781,7 +877,7 @@ describe('App', () => {
     render(<App />)
 
     await waitFor(() => expect(window.localStorage.getItem(AUTH_SESSION_STORAGE_KEY)).toBeNull())
-    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(screen.queryByText('登录已失效，请重新登录')).not.toBeInTheDocument()
   })
 
   it('hydrates backend history list/detail and switches conversations from the sidebar', async () => {
@@ -861,7 +957,7 @@ describe('App', () => {
     expect(firstDetailSignal?.aborted).toBe(true)
   })
 
-  it('releases the composer after hydration fails and retries without losing the draft', async () => {
+  it('keeps the composer protected after hydration fails and retries explicitly', async () => {
     let detailRequestCount = 0
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
       const request = input instanceof Request ? input : new Request(input)
@@ -895,15 +991,16 @@ describe('App', () => {
 
     await waitFor(() => expect(detailRequestCount).toBe(1))
     const input = screen.getByLabelText('消息输入')
-    await waitFor(() => expect(input).toBeEnabled())
+    expect(input).toBeDisabled()
     expect(await screen.findByText('会话加载失败，请重试')).toBeInTheDocument()
 
-    await user.type(input, '保留的草稿')
-    await user.click(screen.getByRole('button', { name: '发送消息' }))
+    await user.click(screen.getByRole('button', { name: '重试' }))
 
     expect(await screen.findByText('来自 可重试会话 的历史回复')).toBeInTheDocument()
     expect(detailRequestCount).toBe(2)
-    expect(input).toHaveValue('保留的草稿')
+    await waitFor(() => expect(input).toBeEnabled())
+    await user.type(input, '恢复后的草稿')
+    expect(input).toHaveValue('恢复后的草稿')
   })
 
   it('cancels the history bootstrap request when the workspace unmounts', async () => {
@@ -926,7 +1023,7 @@ describe('App', () => {
   })
 
   it('restores the conversation from ?thread= on boot and keeps the URL in sync on switch', async () => {
-    // Simulate a refresh that landed on /?thread=SECOND_THREAD_ID.
+    // 模拟刷新后落在 /?thread=SECOND_THREAD_ID
     window.history.replaceState(null, '', `/?thread=${SECOND_THREAD_ID}`)
     installFetchMock({
       historyLists: [{
@@ -945,11 +1042,11 @@ describe('App', () => {
     const user = userEvent.setup()
     render(<App />)
 
-    // Boot selects the second conversation (from ?thread=), not conversations[0].
+    // 启动时选择 ?thread= 指定的第二条会话，而不是 conversations[0]
     expect(await screen.findByText('来自 第二条会话 的历史回复')).toBeInTheDocument()
     expect(window.location.search).toContain(`thread=${SECOND_THREAD_ID}`)
 
-    // Switching to the first conversation updates the URL.
+    // 切换到第一条会话时同步更新 URL
     await user.click(screen.getByRole('button', { name: '打开会话：第一条会话' }))
     expect(await screen.findByText('来自 第一条会话 的历史回复')).toBeInTheDocument()
     expect(window.location.search).toContain(`thread=${THREAD_ID}`)
@@ -1476,8 +1573,8 @@ describe('App', () => {
     const callbacksAfterFailure = observerCallbacks.length
     await waitFor(() => expect(observerCallbacks.length).toBeGreaterThanOrEqual(callbacksAfterFailure))
 
-    // A newly attached observer may immediately report the still-visible
-    // sentinel again. It must not bypass the explicit retry affordance.
+    // 新挂载的 observer 可能立即再次报告仍可见的 sentinel
+    // 该信号不得绕过显式重试入口
     act(() => observerCallbacks.at(-1)?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver))
     await new Promise((resolve) => window.setTimeout(resolve, 350))
     const listCalls = fetchMock.mock.calls.filter(([input, init]) =>
@@ -1667,7 +1764,7 @@ describe('App', () => {
     expect(screen.queryByRole('button', { name: '回到底部' })).not.toBeInTheDocument()
   })
 
-  it('does not arm scroll-button fade from a frame queued before hover', async () => {
+  it('keeps the scroll-to-bottom control discoverable in a dedicated non-scrolling action rail', async () => {
     const frames = new Map<number, FrameRequestCallback>()
     let nextFrameId = 1
     vi.stubGlobal('requestAnimationFrame', vi.fn((callback: FrameRequestCallback) => {
@@ -1695,14 +1792,19 @@ describe('App', () => {
     fireEvent.scroll(pane)
     flushFrames()
     const scrollButton = await screen.findByRole('button', { name: '回到底部' })
+    const actionRail = scrollButton.closest('.conversation-scroll-action')
+
+    expect(actionRail).not.toBeNull()
+    expect(pane.contains(scrollButton)).toBe(false)
+    expect(actionRail?.previousElementSibling).toBe(pane)
 
     vi.useFakeTimers()
     fireEvent.scroll(pane)
-    fireEvent.mouseEnter(scrollButton)
     flushFrames()
-    act(() => vi.advanceTimersByTime(1500))
+    act(() => vi.advanceTimersByTime(5000))
 
-    expect(scrollButton).not.toHaveClass('is-fading')
+    expect(screen.getByRole('button', { name: '回到底部' })).toBe(scrollButton)
+    expect(scrollButton).toHaveClass('is-visible')
   })
 
   it('jumps to the bottom immediately when Enter sends a message', async () => {
@@ -1994,17 +2096,22 @@ describe('App', () => {
     render(<App />)
 
     expect(screen.getByRole('button', { name: '打开任务抽屉' })).toBeInTheDocument()
-    expect(screen.queryByLabelText('任务抽屉')).not.toBeInTheDocument()
+    expect(screen.getByLabelText('任务抽屉')).toHaveAttribute('aria-hidden', 'true')
+    expect(screen.getByLabelText('任务抽屉')).toHaveAttribute('inert')
 
     await sendMessage('做个计划')
 
-    await waitFor(() => expect(screen.getByLabelText('任务抽屉')).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByLabelText('任务抽屉')).not.toHaveAttribute('aria-hidden'))
+    expect(document.querySelector('.workspace-main')).toHaveAttribute('inert')
+    expect(screen.getByLabelText('会话导航', { selector: 'aside' })).toHaveAttribute('inert')
+    expect(screen.getByRole('button', { name: '关闭任务抽屉遮罩' })).toBeInTheDocument()
+    await waitFor(() => expect(screen.getByRole('button', { name: '关闭任务详情' })).toHaveFocus())
     expect(screen.getAllByText('读取 url.json').length).toBeGreaterThan(0)
     expect(screen.queryByText('write_todos')).not.toBeInTheDocument()
     expect(screen.queryByText('Updated todo list')).not.toBeInTheDocument()
     expect(screen.getByText('read_file')).toBeInTheDocument()
     expect(screen.getByText('Loaded url.json')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: '关闭任务抽屉' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '关闭任务详情' })).toBeInTheDocument()
     const firstTodo = screen.getByRole('button', {
       name: /步骤 1 · 已完成 读取 url\.json/,
     })
@@ -2038,8 +2145,9 @@ describe('App', () => {
     const user = userEvent.setup()
     const firstRender = render(<App />)
 
-    await user.click(await screen.findByRole('button', { name: '关闭任务抽屉' }))
-    expect(screen.queryByLabelText('任务抽屉')).not.toBeInTheDocument()
+    await user.click(await screen.findByRole('button', { name: '关闭任务详情' }))
+    expect(screen.getByLabelText('任务抽屉')).toHaveAttribute('aria-hidden', 'true')
+    expect(screen.getByLabelText('任务抽屉')).toHaveAttribute('inert')
     expect(screen.getByRole('button', { name: '打开任务抽屉' })).toBeInTheDocument()
     expect(window.sessionStorage.getItem(`tinkerfin:task-drawer:${THREAD_ID}`)).toBe('closed')
 
@@ -2047,7 +2155,7 @@ describe('App', () => {
     render(<App />)
 
     expect(await screen.findByRole('button', { name: '打开任务抽屉' })).toBeInTheDocument()
-    expect(screen.queryByLabelText('任务抽屉')).not.toBeInTheDocument()
+    expect(screen.getByLabelText('任务抽屉')).toHaveAttribute('aria-hidden', 'true')
   })
 
   it('keeps the task button visible and restores an opened empty drawer after refresh', async () => {
@@ -2064,14 +2172,20 @@ describe('App', () => {
     await user.click(screen.getByRole('button', { name: '打开任务抽屉' }))
     expect(screen.getByLabelText('任务抽屉')).toBeInTheDocument()
     expect(screen.getByText('暂无待办')).toBeInTheDocument()
+    await waitFor(() => expect(screen.getByRole('button', { name: '关闭任务详情' })).toHaveFocus())
+    expect(document.querySelector('.workspace-main')).toHaveAttribute('inert')
+    expect(screen.getByLabelText('会话导航', { selector: 'aside' })).toHaveAttribute('inert')
     expect(window.sessionStorage.getItem(`tinkerfin:task-drawer:${THREAD_ID}`)).toBe('open')
 
     firstRender.unmount()
     render(<App />)
 
     await screen.findByText('来自 空任务会话 的历史回复')
-    expect(screen.getByRole('button', { name: '关闭任务抽屉' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '关闭任务详情' })).toBeInTheDocument()
     expect(screen.getByLabelText('任务抽屉')).toBeInTheDocument()
+    expect(document.querySelector('.workspace-main')).toHaveAttribute('inert')
+    expect(screen.getByLabelText('会话导航', { selector: 'aside' })).toHaveAttribute('inert')
+    expect(screen.getByRole('button', { name: '关闭任务抽屉遮罩' })).toBeInTheDocument()
   })
 
   it('submits edit approvals through resume[] using the backfilled threadId', async () => {

@@ -34,7 +34,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.store.memory import InMemoryStore
 from langgraph.types import Command, Interrupt
-from pydantic import PrivateAttr, ValidationError, field_serializer
+from pydantic import Field, PrivateAttr, ValidationError, field_serializer
 
 import tinkerfin.plan as plan_api
 from tinkerfin import AgUiResumeBinding, Identity, TinkerFin
@@ -158,6 +158,30 @@ class _CustomForm(ClarificationForm[_CustomQuestion]):
     pass
 
 
+class _BoundedForm(ClarificationForm[_CustomQuestion]):
+    questions: tuple[_CustomQuestion, ...] = Field(min_length=2, max_length=5)
+
+
+class _ExactFourForm(ClarificationForm[_CustomQuestion]):
+    questions: tuple[_CustomQuestion, ...] = Field(min_length=4, max_length=4)
+
+
+class _MissingMinimumForm(ClarificationFormBase):
+    questions: tuple[_CustomQuestion, ...]
+
+
+class _DefaultedQuestionsForm(ClarificationFormBase):
+    questions: tuple[_CustomQuestion, ...] = Field(default=(), min_length=1)
+
+
+class _AliasedQuestionsForm(ClarificationFormBase):
+    questions: tuple[_CustomQuestion, ...] = Field(min_length=1, alias="items")
+
+
+class _ImpossibleRangeForm(ClarificationFormBase):
+    questions: tuple[_CustomQuestion, ...] = Field(min_length=2, max_length=1)
+
+
 class _OpaqueQuestionAttributes(ClarificationModel):
     token: object
 
@@ -251,6 +275,38 @@ def _planner_clarification(
             }
         ],
         id=f"clarify-message-{question_id}",
+    )
+
+
+def _planner_clarification_batch(count: int = 4) -> AIMessage:
+    questions = [
+        {
+            "id": f"question-{index}",
+            "prompt": f"Choose value {index}",
+            "options": (
+                [{"id": f"option-{index}", "label": f"Option {index}"}]
+                if index % 2 == 0
+                else []
+            ),
+            "allow_free_text": True,
+        }
+        for index in range(count)
+    ]
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "PlannerOutcome",
+                "args": {
+                    "type": "clarify",
+                    "draft": None,
+                    "clarification": {"questions": questions},
+                },
+                "id": "clarify-batch",
+                "type": "tool_call",
+            }
+        ],
+        id="clarify-batch-message",
     )
 
 
@@ -529,6 +585,23 @@ def test_plan_configuration_rejects_invalid_clarification_schemas(
         TinkerFin().plan(clarification_schema=cast(Any, schema))
 
 
+@pytest.mark.parametrize(
+    ("schema", "message"),
+    [
+        (_MissingMinimumForm, "minItems >= 1"),
+        (_DefaultedQuestionsForm, "must be required"),
+        (_AliasedQuestionsForm, "stable JSON array field"),
+        (_ImpossibleRangeForm, "maxItems must be >= minItems"),
+    ],
+)
+def test_plan_configuration_rejects_unsafe_question_count_schemas(
+    schema: type[ClarificationFormBase],
+    message: str,
+) -> None:
+    with pytest.raises(PlanModeConfigurationError, match=message):
+        TinkerFin().plan(clarification_schema=schema)
+
+
 def test_plan_contracts_are_frozen_and_reject_duplicate_steps() -> None:
     step = PlanStep(
         id="step-1",
@@ -556,16 +629,99 @@ def test_plan_contracts_are_frozen_and_reject_duplicate_steps() -> None:
     assert PlanState().workflow_version == "tinkerfin.plan.v3"
 
 
-def test_clarification_forms_limit_each_round_to_three_questions() -> None:
-    with pytest.raises(ValidationError, match="at most"):
-        DefaultClarificationForm.model_validate(
+def test_default_clarification_form_is_non_empty_without_an_upper_limit() -> None:
+    schema = DefaultClarificationForm.model_json_schema(by_alias=True)
+    questions_schema = schema["properties"]["questions"]
+    assert questions_schema["minItems"] == 1
+    assert "maxItems" not in questions_schema
+
+    for count in (1, 4, 8):
+        form = DefaultClarificationForm.model_validate(
             {
                 "questions": [
                     {"id": f"question-{index}", "prompt": "Choose"}
-                    for index in range(4)
+                    for index in range(count)
                 ]
             }
         )
+        assert len(form.questions) == count
+    with pytest.raises(ValidationError, match="at least 1 item"):
+        DefaultClarificationForm.model_validate({"questions": []})
+    with pytest.raises(ValidationError, match="at least one question"):
+        _MissingMinimumForm.model_validate({"questions": []})
+
+
+def test_host_schema_owns_question_count_bounds() -> None:
+    bounded_schema = _BoundedForm.model_json_schema(by_alias=True)["properties"][
+        "questions"
+    ]
+    assert bounded_schema["minItems"] == 2
+    assert bounded_schema["maxItems"] == 5
+    TinkerFin().plan(clarification_schema=_BoundedForm)
+
+    def payload(count: int) -> dict[str, list[dict[str, str]]]:
+        return {
+            "questions": [
+                {"id": f"question-{index}", "prompt": "Choose"}
+                for index in range(count)
+            ]
+        }
+
+    assert len(_BoundedForm.model_validate(payload(2)).questions) == 2
+    assert len(_BoundedForm.model_validate(payload(5)).questions) == 5
+    with pytest.raises(ValidationError, match="at least 2 items"):
+        _BoundedForm.model_validate(payload(1))
+    with pytest.raises(ValidationError, match="at most 5 items"):
+        _BoundedForm.model_validate(payload(6))
+
+    TinkerFin().plan(clarification_schema=_ExactFourForm)
+    assert len(_ExactFourForm.model_validate(payload(4)).questions) == 4
+    with pytest.raises(ValidationError):
+        _ExactFourForm.model_validate(payload(3))
+    with pytest.raises(ValidationError):
+        _ExactFourForm.model_validate(payload(5))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("schema", "expected"),
+    [
+        (
+            DefaultClarificationForm,
+            "requires at least 1 question and sets no maximum",
+        ),
+        (_BoundedForm, "requires between 2 and 5 questions, inclusive"),
+        (_ExactFourForm, "requires exactly 4 questions"),
+    ],
+)
+async def test_planner_prompt_derives_question_count_from_the_bound_schema(
+    schema: type[ClarificationFormBase],
+    expected: str,
+) -> None:
+    model = _FakeModel(responses=[_planner()])
+    definition = (
+        TinkerFin()
+        .plan(enabled=True, clarification_schema=schema)
+        .create_deep_agent(
+            model=model,
+            tools=[],
+            checkpointer=InMemorySaver(),
+        )
+    )
+    await _parts(
+        definition,
+        {"messages": [HumanMessage(content="Plan", id="dynamic-count-message")]},
+        run_id="dynamic-count",
+        config={"configurable": {"thread_id": "plan-thread"}},
+        mode="plan",
+    )
+
+    system_message = next(
+        message
+        for message in model.model_inputs[0]
+        if isinstance(message, SystemMessage)
+    )
+    assert expected in str(system_message.content)
 
 
 def test_plain_definition_rejects_plan_runs() -> None:
@@ -1051,6 +1207,130 @@ async def test_multiple_clarification_rounds_do_not_increment_revision() -> None
     assert plan3.revision == 1
     assert len(plan3.clarification_history) == 2
     assert _root_interrupts(third)[0].value["kind"] == "plan_review"
+
+
+@pytest.mark.asyncio
+async def test_four_question_clarification_round_trips_in_one_batch() -> None:
+    model = _FakeModel(responses=[_planner_clarification_batch(), _planner()])
+    definition = (
+        TinkerFin()
+        .plan(enabled=True)
+        .create_deep_agent(
+            model=model,
+            tools=[],
+            checkpointer=InMemorySaver(serde=JsonPlusSerializer(pickle_fallback=False)),
+        )
+    )
+    config = {"configurable": {"thread_id": "plan-thread"}}
+    first = await _parts(
+        definition,
+        {"messages": [HumanMessage(content="Deploy", id="four-question-message")]},
+        run_id="four-question-1",
+        config=config,
+        mode="plan",
+    )
+
+    assert {part["type"] for part in first} == {"messages", "tasks", "values"}
+    interrupts = _root_interrupts(first)
+    assert len(interrupts) == 1
+    assert interrupts[0].value["kind"] == "plan_clarification"
+    metadata = interrupts[0].value["metadata"]
+    form = metadata["clarification"]["form"]
+    assert [question["id"] for question in form["questions"]] == [
+        "question-0",
+        "question-1",
+        "question-2",
+        "question-3",
+    ]
+    pending = PlanState.model_validate(_root_values(first)[-1]["tinkerfin_plan"])
+    assert pending.status is PlanStatus.AWAITING_CLARIFICATION
+    assert pending.pending_clarification is not None
+    assert len(pending.pending_clarification.form["questions"]) == 4
+
+    second = await _parts(
+        definition,
+        Command(
+            resume={
+                "type": "respond",
+                "answers": [
+                    {"questionId": "question-0", "optionId": "option-0"},
+                    {"questionId": "question-1", "answer": "Custom 1"},
+                    {"questionId": "question-2", "optionId": "option-2"},
+                    {"questionId": "question-3", "answer": "Custom 3"},
+                ],
+            }
+        ),
+        run_id="four-question-2",
+        config=config,
+        mode="plan",
+    )
+    reviewed = PlanState.model_validate(_root_values(second)[-1]["tinkerfin_plan"])
+    assert reviewed.status is PlanStatus.AWAITING_REVIEW
+    assert reviewed.revision == 1
+    assert reviewed.pending_clarification is None
+    assert len(reviewed.clarification_history) == 1
+    exchange = reviewed.clarification_history[0]
+    assert tuple(answer.question_id for answer in exchange.answers) == (
+        "question-0",
+        "question-1",
+        "question-2",
+        "question-3",
+    )
+    assert tuple(answer.answer for answer in exchange.answers) == (
+        "Option 0",
+        "Custom 1",
+        "Option 2",
+        "Custom 3",
+    )
+    review_interrupts = _root_interrupts(second)
+    assert len(review_interrupts) == 1
+    assert review_interrupts[0].value["kind"] == "plan_review"
+
+
+@pytest.mark.asyncio
+async def test_agui_preserves_every_question_in_a_large_clarification_form() -> None:
+    definition = (
+        TinkerFin()
+        .plan(enabled=True)
+        .create_deep_agent(
+            model=_FakeModel(responses=[_planner_clarification_batch()]),
+            tools=[],
+            checkpointer=InMemorySaver(),
+        )
+    )
+    events = await _agui_events(
+        definition,
+        {"messages": [HumanMessage(content="Deploy", id="agui-four-message")]},
+        run_id="agui-four",
+        config={"configurable": {"thread_id": "plan-thread"}},
+        mode="plan",
+    )
+
+    assert not any(isinstance(event, RunErrorEvent) for event in events)
+    terminal = _terminal(events)
+    assert terminal.outcome is not None and terminal.outcome.type == "interrupt"
+    assert len(terminal.outcome.interrupts) == 1
+    interrupt = terminal.outcome.interrupts[0]
+    assert interrupt.reason == "plan_clarification"
+    metadata = cast(dict[str, Any], interrupt.metadata)
+    runtime_interrupt = cast(dict[str, Any], metadata["runtimeInterrupt"])
+    envelope = cast(dict[str, Any], runtime_interrupt["envelope"])
+    public_metadata = cast(dict[str, Any], envelope["metadata"])
+    clarification = cast(dict[str, Any], public_metadata["clarification"])
+    form = cast(dict[str, Any], clarification["form"])
+    questions = cast(list[dict[str, Any]], form["questions"])
+    assert [question["id"] for question in questions] == [
+        "question-0",
+        "question-1",
+        "question-2",
+        "question-3",
+    ]
+
+    types = [event.type.value for event in events]
+    state_index = len(types) - 1 - types[::-1].index("STATE_SNAPSHOT")
+    messages_index = len(types) - 1 - types[::-1].index("MESSAGES_SNAPSHOT")
+    terminal_index = len(types) - 1 - types[::-1].index("RUN_FINISHED")
+    assert state_index < messages_index < terminal_index
 
 
 @pytest.mark.asyncio

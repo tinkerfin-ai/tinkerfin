@@ -61,7 +61,7 @@ channel = messaging.channel(
 
 TinkerFin 的规范事件流带有 codec 与 Identity，因此 name-only channel 可以自动选择 codec 和 durable scope。自定义 source 必须显式配置 codec，并在调用时提供 Identity。
 
-RedisBackend 只读取持久 schema 4。Schema 3 记录不兼容；切换前使用新的 `key_prefix`，或清理确认不再需要的旧记录。
+RedisBackend 只读取持久 schema 5。Schema 4 记录不兼容；切换前使用新的 `key_prefix`，或清理确认不再需要的旧记录。Schema 5 保存当前 owner 和上一个 owner 的成功续租次数与 UTC 时间，仅用于可信故障取证；不会保存额外 owner token、Payload，也不会把这些字段放入 MessageEnvelope。
 
 ## 自定义消息格式
 
@@ -132,7 +132,7 @@ class QueueSource:
 - 有序追加、稳定序号和 message ID 去重；
 - 历史读取和持续 follow；
 - run 完成、失败和取消信号；
-- producer lease、fencing 和所有权丢失；
+- producer 续租周期、过期预算、fencing 和所有权丢失；
 - stream 代际隔离与删除。
 
 backend 的方法都是异步协议。不要用同步数据库或同步网络客户端阻塞事件循环。自定义实现应与 `MemoryBackend` 的公开行为保持一致。

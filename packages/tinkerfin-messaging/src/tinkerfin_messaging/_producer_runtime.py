@@ -13,6 +13,7 @@ __all__ = [
 
 import asyncio
 import logging
+import math
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Generic, Literal, TypeAlias, TypeVar, cast
@@ -47,6 +48,11 @@ _ProducerFailureStage: TypeAlias = Literal[
     "source_close",
     "tail",
 ]
+_LeaseRenewalPhase: TypeAlias = Literal["producer", "source_open"]
+_LeaseRenewalOutcome: TypeAlias = Literal[
+    "backend_exception",
+    "ownership_rejected",
+]
 
 logger = logging.getLogger("tinkerfin_messaging.messaging")
 
@@ -71,6 +77,129 @@ class _PendingCommit(Generic[ProducedT]):
     item: ProducedT
     acknowledged: asyncio.Event = field(default_factory=asyncio.Event)
     error: BaseException | None = None
+
+
+def _lease_schedule(self: Messaging) -> tuple[float | None, float | None]:
+    interval_value = _read_backend(
+        "lease_renew_interval",
+        lambda: self.backend.lease_renew_interval,
+    )
+    timeout_value = _read_backend(
+        "lease_timeout",
+        lambda: self.backend.lease_timeout,
+    )
+    if interval_value is None:
+        if timeout_value is not None:
+            raise ValueError("lease_timeout requires lease_renew_interval")
+        return None, None
+    if isinstance(interval_value, bool) or not isinstance(interval_value, int | float):
+        raise TypeError("lease_renew_interval must be numeric or None")
+    interval = float(interval_value)
+    if not math.isfinite(interval) or interval <= 0:
+        raise ValueError("lease_renew_interval must be finite and positive")
+    if timeout_value is None:
+        return interval, None
+    if isinstance(timeout_value, bool) or not isinstance(timeout_value, int | float):
+        raise TypeError("lease_timeout must be numeric or None")
+    timeout = float(timeout_value)
+    if not math.isfinite(timeout) or timeout <= interval:
+        raise ValueError("lease_timeout must be finite and greater than renew interval")
+    return interval, timeout
+
+
+async def _renew_lease_forever(
+    self: Messaging,
+    *,
+    prepared: PreparedRun,
+    phase: _LeaseRenewalPhase,
+    interval: float,
+    timeout: float | None,
+    initial_last_success: float,
+) -> None:
+    """Renew one owner and log the first failure with scheduler-safe evidence."""
+
+    loop = asyncio.get_running_loop()
+    last_success = initial_last_success
+    wake_target = loop.time() + interval
+    attempt = 0
+    while True:
+        expected_target = last_success + interval
+        await asyncio.sleep(max(0.0, wake_target - loop.time()))
+        started = loop.time()
+        attempt += 1
+        try:
+            renewed = await _await_backend(
+                "renew",
+                self.backend.renew(prepared.handle),
+            )
+        except asyncio.CancelledError:
+            raise
+        except BaseException as error:
+            finished = loop.time()
+            _log_lease_failure(
+                prepared=prepared,
+                phase=phase,
+                outcome="backend_exception",
+                attempt=attempt,
+                scheduler_delay=max(0.0, started - expected_target),
+                command_duration=max(0.0, finished - started),
+                since_last_success=max(0.0, finished - last_success),
+                timeout=timeout,
+                error=error,
+            )
+            raise
+        finished = loop.time()
+        if not renewed:
+            error = BackendOwnershipLost(
+                f"Producer for run {prepared.handle.identity.run_id!r} lost its lease"
+            )
+            _log_lease_failure(
+                prepared=prepared,
+                phase=phase,
+                outcome="ownership_rejected",
+                attempt=attempt,
+                scheduler_delay=max(0.0, started - expected_target),
+                command_duration=max(0.0, finished - started),
+                since_last_success=max(0.0, finished - last_success),
+                timeout=timeout,
+                error=error,
+            )
+            raise error
+        last_success = finished
+        wake_target = last_success + interval
+
+
+def _log_lease_failure(
+    *,
+    prepared: PreparedRun,
+    phase: _LeaseRenewalPhase,
+    outcome: _LeaseRenewalOutcome,
+    attempt: int,
+    scheduler_delay: float,
+    command_duration: float,
+    since_last_success: float,
+    timeout: float | None,
+    error: BaseException,
+) -> None:
+    deadline_elapsed = timeout is not None and since_last_success >= timeout
+    logger.error(
+        "Messaging producer lease renewal failed",
+        extra={
+            "channel": prepared.handle.channel,
+            "thread_id": prepared.handle.identity.thread_id,
+            "run_id": prepared.handle.identity.run_id,
+            "renewal_phase": phase,
+            "renewal_outcome": outcome,
+            "attempt": attempt,
+            "scheduler_delay_seconds": scheduler_delay,
+            "command_duration_seconds": command_duration,
+            "seconds_since_last_success": since_last_success,
+            "lease_timeout_seconds": timeout,
+            "deadline_elapsed": deadline_elapsed,
+            "error_type": f"{type(error).__module__}.{type(error).__qualname__}",
+        },
+        exc_info=(type(error), error, error.__traceback__),
+    )
 
 
 def _start_producer(
@@ -107,34 +236,25 @@ async def _open_recoverable_source(
 ) -> MessageSource[RecoverableMessage[SourceT]]:
     """Keep distributed ownership alive while a source rebuilds its state."""
 
-    interval = _read_backend(
-        "lease_renew_interval",
-        lambda: self.backend.lease_renew_interval,
-    )
+    interval, timeout = _lease_schedule(self)
     if interval is None:
         return await source.open(prepared.checkpoint)
 
+    renewal_baseline = asyncio.get_running_loop().time()
     opening = asyncio.create_task(
         source.open(prepared.checkpoint),
         name=(f"tinkerfin-messaging-source-open:{prepared.handle.identity.run_id}"),
     )
 
-    async def renew_until_opened() -> None:
-        while True:
-            await asyncio.sleep(interval)
-            renewed = await _await_backend(
-                "renew",
-                self.backend.renew(prepared.handle),
-            )
-            if not renewed:
-                raise BackendOwnershipLost(
-                    "Producer for run "
-                    f"{prepared.handle.identity.run_id!r} lost its lease "
-                    "while reopening its source"
-                )
-
     renewing = asyncio.create_task(
-        renew_until_opened(),
+        _renew_lease_forever(
+            self,
+            prepared=prepared,
+            phase="source_open",
+            interval=interval,
+            timeout=timeout,
+            initial_last_success=renewal_baseline,
+        ),
         name=(f"tinkerfin-messaging-open-lease:{prepared.handle.identity.run_id}"),
     )
     claimed = False
@@ -243,6 +363,8 @@ def _start_producer_task(
         commit_error: BaseException | None = None
         next_ordinal = 1
         shutdown_requested = False
+        renew_interval, lease_timeout = _lease_schedule(self)
+        renewal_baseline = asyncio.get_running_loop().time()
 
         def retain_secondary_failure(
             *,
@@ -473,37 +595,27 @@ def _start_producer_task(
                 name=(f"tinkerfin-messaging-cancel:{prepared.handle.identity.run_id}"),
             )
 
-        async def renew_lease(interval: float) -> None:
-            while True:
-                await asyncio.sleep(interval)
-                try:
-                    renewed = await _await_backend(
-                        "renew",
-                        self.backend.renew(prepared.handle),
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except BaseException as renew_error:  # noqa: BLE001 - fence safety
-                    state.ownership_lost = True
-                    state.ownership_error = renew_error
-                    source_consumer.cancel()
-                    return
-                if not renewed:
-                    state.ownership_lost = True
-                    state.ownership_error = BackendOwnershipLost(
-                        "Producer for run "
-                        f"{prepared.handle.identity.run_id!r} lost its lease"
-                    )
-                    source_consumer.cancel()
-                    return
+        async def observe_lease() -> None:
+            assert renew_interval is not None
+            try:
+                await _renew_lease_forever(
+                    self,
+                    prepared=prepared,
+                    phase="producer",
+                    interval=renew_interval,
+                    timeout=lease_timeout,
+                    initial_last_success=renewal_baseline,
+                )
+            except asyncio.CancelledError:
+                raise
+            except BaseException as renew_error:  # noqa: BLE001 - fence safety
+                state.ownership_lost = True
+                state.ownership_error = renew_error
+                source_consumer.cancel()
 
-        renew_interval = _read_backend(
-            "lease_renew_interval",
-            lambda: self.backend.lease_renew_interval,
-        )
         if renew_interval is not None:
             lease_renewer = asyncio.create_task(
-                renew_lease(renew_interval),
+                observe_lease(),
                 name=(f"tinkerfin-messaging-lease:{prepared.handle.identity.run_id}"),
             )
         try:

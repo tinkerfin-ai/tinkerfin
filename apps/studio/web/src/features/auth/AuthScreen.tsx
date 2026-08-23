@@ -14,9 +14,10 @@ import {
 import { useRef, useState } from 'react'
 import type { FormEvent, ReactNode } from 'react'
 
-import { BrandMark } from '../../components/BrandMark'
-import { ThemePicker } from '../../components/ThemePicker'
-import { ValidatedField, ValidatedForm } from '../../components/forms/ValidatedForm'
+import { Button, IconButton, MOTION_DURATION_SECONDS, TextField } from '../../components/ui'
+import { BrandMark } from '../../components/ui/BrandMark'
+import { ThemePicker } from '../../components/ui/ThemePicker'
+import { ValidatedField, ValidatedForm } from './components/ValidatedForm'
 import { ProviderBrandLogo } from './ProviderBrandLogo'
 import './auth.css'
 
@@ -84,50 +85,48 @@ function PasswordField({
   const [isVisible, setVisible] = useState(false)
 
   return (
-    <ValidatedField
-      className={className}
-      controlId={id}
-      error={error}
-      fieldName={fieldName}
-      label={label}
-    >
-      {({ controlAria, feedbackAttributes }) => (
-        <>
-          <span className="auth-input-wrap" {...feedbackAttributes}>
-            <LockKeyhole size={17} aria-hidden="true" />
-            <input
-              {...controlAria}
-              id={id}
-              type={isVisible ? 'text' : 'password'}
-              autoComplete={autoComplete}
-              value={value}
-              onChange={(event) => onChange(event.target.value)}
-              placeholder={placeholder}
-              minLength={minLength}
-              required
-            />
-            <button
-              className="auth-password-toggle"
-              type="button"
-              aria-label={isVisible ? '隐藏密码' : '显示密码'}
-              onClick={() => setVisible((current) => !current)}
-            >
-              {isVisible ? <EyeOff size={17} /> : <Eye size={17} />}
-            </button>
-          </span>
-          {fieldAction}
-        </>
-      )}
-    </ValidatedField>
+    <>
+      <TextField
+        rootClassName={className}
+        id={id}
+        name={fieldName}
+        error={error}
+        label={label}
+        shape="capsule"
+        leadingContent={<LockKeyhole size={17} />}
+        trailingContent={(
+          <IconButton
+            className="auth-password-toggle"
+            label={isVisible ? '隐藏密码' : '显示密码'}
+            icon={isVisible ? <EyeOff size={17} /> : <Eye size={17} />}
+            onClick={() => setVisible((current) => !current)}
+          />
+        )}
+        type={isVisible ? 'text' : 'password'}
+        autoComplete={autoComplete}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        placeholder={placeholder}
+        minLength={minLength}
+        required
+      />
+      {fieldAction}
+    </>
   )
 }
 
 function PrimaryButton({ children, pending = false }: { children: ReactNode; pending?: boolean }) {
   return (
-    <button className="auth-primary" type="submit" disabled={pending}>
-      <span>{pending ? '登录中...' : children}</span>
-      {pending ? <span className="auth-button-spinner" aria-hidden="true" /> : <ArrowRight size={17} aria-hidden="true" />}
-    </button>
+    <Button
+      className="auth-primary"
+      type="submit"
+      variant="primary"
+      size="xl"
+      loading={pending}
+      trailingIcon={!pending ? <ArrowRight size={17} /> : undefined}
+    >
+      {pending ? '登录中...' : children}
+    </Button>
   )
 }
 
@@ -232,162 +231,38 @@ export function AuthScreen({ onLogin, pending = false, error, message }: AuthScr
     const root = rootRef.current
     if (!root) return
 
-    const brand = root.querySelector<HTMLElement>('.auth-header')
-    const introHeading = root.querySelector<HTMLElement>('.auth-intro h2')
-    const introCopy = root.querySelector<HTMLElement>('.auth-intro p')
-    const signalField = root.querySelector<HTMLElement>('.auth-signal-field')
-    const panel = root.querySelector<HTMLElement>('.auth-panel')
-    const topGlow = root.querySelector<HTMLElement>('.auth-glow--top')
-    const bottomGlow = root.querySelector<HTMLElement>('.auth-glow--bottom')
-    const staticTargets = [brand, introHeading, introCopy, signalField, panel, topGlow, bottomGlow].filter(
-      (target): target is HTMLElement => target !== null,
-    )
     const motion = gsap.matchMedia()
-
-    motion.add(
-      {
-        isDesktop: '(min-width: 1024px)',
-        isMobile: '(max-width: 1023px)',
-        reduceMotion: '(prefers-reduced-motion: reduce)',
-      },
-      (context) => {
-        const { isDesktop, reduceMotion } = context.conditions as {
-          isDesktop: boolean
-          isMobile: boolean
-          reduceMotion: boolean
-        }
-        const ambient: gsap.core.Animation[] = []
-        const authView = root.querySelector<HTMLElement>('.auth-view')
-        const authItems = authView
-          ? Array.from(authView.querySelectorAll<HTMLElement>(
-              '.auth-heading, .auth-form > *, .auth-divider, .auth-providers > button, .auth-switch',
-            ))
-          : []
-
-        if (reduceMotion) {
-          gsap.set([...staticTargets, ...authItems], { clearProps: 'all' })
-          return
-        }
-
-        const intro = gsap.timeline({ defaults: { ease: 'power3.out' } })
-        if (isDesktop) {
-          if (brand) intro.from(brand, { autoAlpha: 0, y: -8, duration: 0.62 }, 0)
-          if (introHeading) intro.from(introHeading, { autoAlpha: 0, y: 22, duration: 0.86 }, 0.16)
-          if (introCopy) intro.from(introCopy, { autoAlpha: 0, y: 14, duration: 0.7 }, 0.26)
-          if (panel) intro.from(panel, { autoAlpha: 0, x: 24, duration: 0.82 }, 0.26)
-          if (signalField) intro.from(signalField, { autoAlpha: 0, scale: 0.9, duration: 0.94 }, 0.32)
-          if (authItems.length) {
-            intro.fromTo(
-              authItems,
-              { autoAlpha: 0, y: 10 },
-              {
-                autoAlpha: 1,
-                y: 0,
-                duration: 0.42,
-                stagger: 0.035,
-                clearProps: 'opacity,visibility,transform',
-              },
-              0.45,
-            )
-          }
-        } else {
-          if (brand) intro.from(brand, { autoAlpha: 0, y: -7, duration: 0.5 }, 0)
-          if (panel) intro.from(panel, { autoAlpha: 0, y: 14, duration: 0.7 }, 0.08)
-          if (authItems.length) {
-            intro.fromTo(
-              authItems,
-              { autoAlpha: 0, y: 9 },
-              {
-                autoAlpha: 1,
-                y: 0,
-                duration: 0.38,
-                stagger: 0.03,
-                clearProps: 'opacity,visibility,transform',
-              },
-              0.2,
-            )
-          }
-        }
-
-        if (topGlow) {
-          ambient.push(gsap.to(topGlow, {
-            xPercent: 7,
-            yPercent: -4,
-            scale: 1.06,
-            duration: 11,
-            repeat: -1,
-            yoyo: true,
-            ease: 'sine.inOut',
-          }))
-        }
-        if (bottomGlow) {
-          ambient.push(gsap.to(bottomGlow, {
-            xPercent: -6,
-            yPercent: 6,
-            scale: 0.95,
-            duration: 14,
-            repeat: -1,
-            yoyo: true,
-            ease: 'sine.inOut',
-          }))
-        }
-
-        if (isDesktop && signalField) {
-          ambient.push(gsap.to(signalField, {
-            x: 10,
-            y: -8,
-            rotation: 1.5,
-            duration: 9,
-            repeat: -1,
-            yoyo: true,
-            ease: 'sine.inOut',
-          }))
-          const orbitMotion = [
-            ['.auth-signal-orbit--outer', 360, 30],
-            ['.auth-signal-orbit--middle', -360, 38],
-            ['.auth-signal-orbit--inner', 360, 24],
-          ] as const
-          orbitMotion.forEach(([selector, rotation, duration]) => {
-            const orbit = root.querySelector<HTMLElement>(selector)
-            if (orbit) ambient.push(gsap.to(orbit, { rotation, duration, repeat: -1, ease: 'none' }))
-          })
-          const coreItems = root.querySelectorAll<HTMLElement>('.auth-signal-core i')
-          if (coreItems.length) {
-            ambient.push(gsap.to(coreItems, {
-              autoAlpha: 0.5,
-              scale: 0.72,
-              duration: 1.8,
-              stagger: 0.18,
-              repeat: -1,
-              yoyo: true,
-              ease: 'sine.inOut',
-            }))
-          }
-        }
-
-        return () => {
-          intro.kill()
-          ambient.forEach((animation) => animation.kill())
-        }
-      },
-    )
+    motion.add('(prefers-reduced-motion: no-preference)', () => {
+      const targets = root.querySelectorAll<HTMLElement>(
+        '.auth-header, .auth-intro, .auth-signal-field, .auth-panel',
+      )
+      const entrance = gsap.fromTo(targets, {
+        autoAlpha: 0,
+        y: 12,
+      }, {
+        autoAlpha: 1,
+        y: 0,
+        duration: MOTION_DURATION_SECONDS.slow,
+        ease: 'power2.out',
+        stagger: MOTION_DURATION_SECONDS.fast / 3,
+        clearProps: 'opacity,visibility,transform',
+      })
+      return () => entrance.kill()
+    })
 
     return () => motion.revert()
-
   }, { scope: rootRef })
 
   return (
-    <main ref={rootRef} className="auth-page" aria-label="TinkerFin 账户登录">
+    <main id="main-content" ref={rootRef} className="auth-page" aria-label="TinkerFin 账户登录">
+      <h1 className="visually-hidden">TinkerFin Studio 账户</h1>
       <div className="auth-ambient" aria-hidden="true">
-        <span className="auth-glow auth-glow--top" />
-        <span className="auth-glow auth-glow--bottom" />
         <span className="auth-signal-field">
           <span className="auth-signal-orbit auth-signal-orbit--outer"><i /></span>
           <span className="auth-signal-orbit auth-signal-orbit--middle"><i /></span>
           <span className="auth-signal-orbit auth-signal-orbit--inner"><i /></span>
           <span className="auth-signal-core"><i /><i /><i /><i /></span>
         </span>
-        <span className="auth-grain" />
       </div>
 
       <header className="auth-header">
@@ -399,22 +274,22 @@ export function AuthScreen({ onLogin, pending = false, error, message }: AuthScr
       </header>
 
       <section className="auth-intro" aria-label="TinkerFin 产品简介">
-        <h2>让智能体协作，<br />像思考一样自然</h2>
+        <p className="auth-intro-title">让智能体协作，<br />像思考一样自然</p>
         <p>把复杂目标交给一支会协作的智能体团队</p>
       </section>
 
       <section className="auth-panel" aria-live="polite">
         <div className="auth-form-stage" data-auth-view={view}>
           {view !== 'login' && (
-            <button className="auth-back" type="button" onClick={() => returnToLogin()}>
-              <ArrowLeft size={17} />返回登录
-            </button>
+            <Button className="auth-back" variant="text" leadingIcon={<ArrowLeft size={17} />} onClick={() => returnToLogin()}>
+              返回登录
+            </Button>
           )}
 
           {view === 'login' && (
             <div className="auth-view" data-testid="real-login">
               <header className="auth-heading">
-                <h1>欢迎回来</h1>
+                <h2>欢迎回来</h2>
                 <p>登录后继续与你的智能体团队协作。</p>
               </header>
 
@@ -422,27 +297,24 @@ export function AuthScreen({ onLogin, pending = false, error, message }: AuthScr
               {error && <p className="auth-form-error" role="alert">{error}</p>}
 
               <ValidatedForm className="auth-form" errors={validationErrors} validationAttempt={validationAttempt} onSubmit={submitLogin}>
-                <ValidatedField className="auth-field" controlId="login-username" error={validationErrors.loginUsername} fieldName="loginUsername" label="用户名">
-                  {({ controlAria, feedbackAttributes }) => (
-                    <span className="auth-input-wrap" {...feedbackAttributes}>
-                      <UserRound size={17} aria-hidden="true" />
-                      <input
-                        {...controlAria}
-                        id="login-username"
-                        name="username"
-                        autoComplete="username"
-                        value={username}
-                        onChange={(event) => {
-                          setUsername(event.target.value)
-                          clearValidationError('loginUsername')
-                        }}
-                        placeholder="输入用户名"
-                        disabled={pending}
-                        required
-                      />
-                    </span>
-                  )}
-                </ValidatedField>
+                <TextField
+                  rootClassName="auth-field"
+                  id="login-username"
+                  name="loginUsername"
+                  label="用户名"
+                  shape="capsule"
+                  error={validationErrors.loginUsername}
+                  leadingContent={<UserRound size={17} />}
+                  autoComplete="username"
+                  value={username}
+                  onChange={(event) => {
+                    setUsername(event.target.value)
+                    clearValidationError('loginUsername')
+                  }}
+                  placeholder="输入用户名"
+                  disabled={pending}
+                  required
+                />
 
                 <PasswordField
                   id="login-password"
@@ -457,13 +329,14 @@ export function AuthScreen({ onLogin, pending = false, error, message }: AuthScr
                   placeholder="输入密码"
                   error={validationErrors.loginPassword}
                   className="auth-field auth-login-password"
-                  fieldAction={<button
+                  fieldAction={<Button
                     className="auth-forgot-password"
-                    type="button"
+                    variant="text"
+                    size="sm"
                     onClick={() => { setView('forgot'); setDemoMessage(undefined); setValidationErrors({}) }}
                   >
                     忘记密码？
-                  </button>}
+                  </Button>}
                 />
 
                 <PrimaryButton pending={pending}>登录</PrimaryButton>
@@ -471,37 +344,23 @@ export function AuthScreen({ onLogin, pending = false, error, message }: AuthScr
 
               <div className="auth-divider"><span>其他登录方式</span></div>
               <div className="auth-providers">
-                <button type="button" aria-label="使用 Google 登录" onClick={() => showProviderDemo('Google')}><ProviderBrandLogo provider="Google" />Google</button>
-                <button type="button" aria-label="使用 Microsoft 登录" onClick={() => showProviderDemo('Microsoft')}><ProviderBrandLogo provider="Microsoft" />Microsoft</button>
-                <button type="button" aria-label="使用 Apple 登录" onClick={() => showProviderDemo('Apple')}><ProviderBrandLogo provider="Apple" />Apple</button>
+                <Button aria-label="使用 Google 登录" leadingIcon={<ProviderBrandLogo provider="Google" />} onClick={() => showProviderDemo('Google')}>Google</Button>
+                <Button aria-label="使用 Microsoft 登录" leadingIcon={<ProviderBrandLogo provider="Microsoft" />} onClick={() => showProviderDemo('Microsoft')}>Microsoft</Button>
+                <Button aria-label="使用 Apple 登录" leadingIcon={<ProviderBrandLogo provider="Apple" />} onClick={() => showProviderDemo('Apple')}>Apple</Button>
               </div>
-              <p className="auth-switch">还没有账号？ <button type="button" onClick={() => { setView('register'); setDemoMessage(undefined); setValidationErrors({}) }}>免费注册</button></p>
+              <p className="auth-switch">还没有账号？ <Button variant="text" size="sm" onClick={() => { setView('register'); setDemoMessage(undefined); setValidationErrors({}) }}>免费注册</Button></p>
             </div>
           )}
 
           {view === 'register' && (
             <div className="auth-view">
               <header className="auth-heading">
-                <h1>创建你的工作空间</h1>
+                <h2>创建你的工作空间</h2>
                 <p>这是界面演示，不会创建真实账号。</p>
               </header>
               <ValidatedForm className="auth-form" errors={validationErrors} validationAttempt={validationAttempt} onSubmit={submitRegistration}>
-                <ValidatedField className="auth-field" controlId="register-name" error={validationErrors.registerName} fieldName="registerName" label="你的称呼">
-                  {({ controlAria, feedbackAttributes }) => (
-                    <span className="auth-input-wrap" {...feedbackAttributes}>
-                      <UserRound size={17} />
-                      <input {...controlAria} id="register-name" value={displayName} onChange={(event) => { setDisplayName(event.target.value); clearValidationError('registerName') }} placeholder="例如：云杉" required />
-                    </span>
-                  )}
-                </ValidatedField>
-                <ValidatedField className="auth-field" controlId="register-email" error={validationErrors.registerEmail} fieldName="registerEmail" label="邮箱地址">
-                  {({ controlAria, feedbackAttributes }) => (
-                    <span className="auth-input-wrap" {...feedbackAttributes}>
-                      <Mail size={17} />
-                      <input {...controlAria} id="register-email" type="email" value={email} onChange={(event) => { setEmail(event.target.value); clearValidationError('registerEmail') }} placeholder="name@company.com" required />
-                    </span>
-                  )}
-                </ValidatedField>
+                <TextField rootClassName="auth-field" id="register-name" name="registerName" label="你的称呼" shape="capsule" error={validationErrors.registerName} leadingContent={<UserRound size={17} />} value={displayName} onChange={(event) => { setDisplayName(event.target.value); clearValidationError('registerName') }} placeholder="例如：云杉" required />
+                <TextField rootClassName="auth-field" id="register-email" name="registerEmail" label="邮箱地址" shape="capsule" error={validationErrors.registerEmail} leadingContent={<Mail size={17} />} type="email" value={email} onChange={(event) => { setEmail(event.target.value); clearValidationError('registerEmail') }} placeholder="name@company.com" required />
                 <PasswordField id="register-password" fieldName="registerPassword" label="设置密码" value={registerPassword} onChange={(value) => { setRegisterPassword(value); clearValidationError('registerPassword') }} autoComplete="new-password" placeholder="至少 8 位字符" minLength={8} error={validationErrors.registerPassword} />
                 <ValidatedField controlId="accepted-terms" error={validationErrors.acceptedTerms} fieldName="acceptedTerms">
                   {({ controlAria, feedbackAttributes }) => (
@@ -521,7 +380,7 @@ export function AuthScreen({ onLogin, pending = false, error, message }: AuthScr
             <div className="auth-view auth-view--compact">
               <span className="auth-status-icon" aria-hidden="true"><Mail size={24} /></span>
               <header className="auth-heading auth-heading--center">
-                <h1>查看你的邮箱</h1>
+                <h2>查看你的邮箱</h2>
                 <p>验证码已发送至 <strong>{email}</strong>，演示验证码为 123456。</p>
               </header>
               <ValidatedForm className="auth-form" errors={validationErrors} validationAttempt={validationAttempt} onSubmit={submitOtp}>
@@ -539,18 +398,11 @@ export function AuthScreen({ onLogin, pending = false, error, message }: AuthScr
             <div className="auth-view auth-view--compact">
               <span className="auth-status-icon" aria-hidden="true"><KeyRound size={24} /></span>
               <header className="auth-heading auth-heading--center">
-                <h1>找回密码</h1>
+                <h2>找回密码</h2>
                 <p>输入注册邮箱，继续前端演示流程。</p>
               </header>
               <ValidatedForm className="auth-form" errors={validationErrors} validationAttempt={validationAttempt} onSubmit={submitPasswordRecovery}>
-                <ValidatedField className="auth-field" controlId="reset-email" error={validationErrors.resetEmail} fieldName="resetEmail" label="邮箱地址">
-                  {({ controlAria, feedbackAttributes }) => (
-                    <span className="auth-input-wrap" {...feedbackAttributes}>
-                      <Mail size={17} />
-                      <input {...controlAria} id="reset-email" type="email" value={resetEmail} onChange={(event) => { setResetEmail(event.target.value); clearValidationError('resetEmail') }} placeholder="name@company.com" required autoFocus />
-                    </span>
-                  )}
-                </ValidatedField>
+                <TextField rootClassName="auth-field" id="reset-email" name="resetEmail" label="邮箱地址" shape="capsule" error={validationErrors.resetEmail} leadingContent={<Mail size={17} />} type="email" value={resetEmail} onChange={(event) => { setResetEmail(event.target.value); clearValidationError('resetEmail') }} placeholder="name@company.com" required autoFocus />
                 <PrimaryButton>发送重设邮件</PrimaryButton>
               </ValidatedForm>
             </div>
@@ -560,17 +412,17 @@ export function AuthScreen({ onLogin, pending = false, error, message }: AuthScr
             <div className="auth-view auth-view--compact">
               <span className="auth-status-icon" aria-hidden="true"><Mail size={24} /></span>
               <header className="auth-heading auth-heading--center">
-                <h1>邮件已发送</h1>
+                <h2>邮件已发送</h2>
                 <p>演示重设链接已发送至 <strong>{resetEmail}</strong>。</p>
               </header>
-              <button className="auth-primary" type="button" onClick={() => { setView('new-password'); setValidationErrors({}) }}><span>模拟打开邮件</span><ArrowRight size={17} /></button>
+              <Button className="auth-primary" variant="primary" size="xl" trailingIcon={<ArrowRight size={17} />} onClick={() => { setView('new-password'); setValidationErrors({}) }}>模拟打开邮件</Button>
             </div>
           )}
 
           {view === 'new-password' && (
             <div className="auth-view auth-view--compact">
               <header className="auth-heading auth-heading--center">
-                <h1>设置新密码</h1>
+                <h2>设置新密码</h2>
                 <p>此步骤只验证界面，不会修改账号数据。</p>
               </header>
               <ValidatedForm className="auth-form" errors={validationErrors} validationAttempt={validationAttempt} onSubmit={submitNewPassword}>
@@ -583,7 +435,7 @@ export function AuthScreen({ onLogin, pending = false, error, message }: AuthScr
         </div>
 
         <p className="auth-legal">
-          登录即表示你同意 TinkerFin 的 <button type="button" disabled>服务条款</button> 与 <button type="button" disabled>隐私政策</button>
+          登录即表示你同意 TinkerFin 的 <span>服务条款</span> 与 <span>隐私政策</span>
         </p>
       </section>
     </main>

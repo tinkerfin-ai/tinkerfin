@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncGenerator, AsyncIterator
 from typing import ClassVar
 
@@ -185,25 +186,37 @@ async def test_recoverable_factory_failure_settles_run_before_returning(
     assert unused_factory.checkpoints == []
 
 
-async def test_ownership_loss_dominates_a_simultaneous_source_open_failure() -> None:
+async def test_ownership_loss_dominates_a_simultaneous_source_open_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     barrier = asyncio.Barrier(2)
     backend = _ConcurrentRenewalFailureBackend(barrier)
 
-    async with Messaging(backend=backend) as messaging:
-        channel = messaging.channel(name="events", codec=_TextCodec())
+    with caplog.at_level(logging.ERROR, logger="tinkerfin_messaging.messaging"):
+        async with Messaging(backend=backend) as messaging:
+            channel = messaging.channel(name="events", codec=_TextCodec())
 
-        with pytest.raises(
-            BackendOwnershipLost,
-            match="owner lease was lost",
-        ) as captured:
-            await channel.wrap_recoverable(
-                _ConcurrentOpenFailureFactory(barrier),
-                identity=_identity(),
-                after=0,
-            )
+            with pytest.raises(
+                BackendOwnershipLost,
+                match="owner lease was lost",
+            ) as captured:
+                await channel.wrap_recoverable(
+                    _ConcurrentOpenFailureFactory(barrier),
+                    identity=_identity(),
+                    after=0,
+                )
 
     assert isinstance(captured.value.__cause__, RuntimeError)
     assert str(captured.value.__cause__) == "source reconstruction failed"
+    record = next(
+        record
+        for record in caplog.records
+        if record.getMessage() == "Messaging producer lease renewal failed"
+    )
+    fields = vars(record)
+    assert fields["renewal_phase"] == "source_open"
+    assert fields["renewal_outcome"] == "backend_exception"
+    assert fields["error_type"] == ("tinkerfin_messaging.errors.BackendOwnershipLost")
 
 
 def test_recoverable_checkpoint_must_match_the_stable_message_id() -> None:

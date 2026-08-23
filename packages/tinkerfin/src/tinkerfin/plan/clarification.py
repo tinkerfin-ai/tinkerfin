@@ -121,19 +121,18 @@ class ClarificationFormBase(ClarificationModel):
     )
     questions: tuple[ClarificationQuestionBase, ...] = Field(
         min_length=1,
-        max_length=3,
         description="Blocking questions that must all be answered",
     )
 
     @model_validator(mode="after")
-    def question_ids_are_unique(self) -> ClarificationFormBase:
-        """Require stable, unambiguous question addressing within the form."""
+    def questions_are_usable(self) -> ClarificationFormBase:
+        """Require a non-empty form with unambiguous question addressing."""
 
         question_ids = tuple(question.id for question in self.questions)
+        if not question_ids:
+            raise ValueError("Clarification forms must contain at least one question")
         if len(question_ids) != len(set(question_ids)):
             raise ValueError("Clarification question IDs must be unique")
-        if len(question_ids) > 3:
-            raise ValueError("Clarification forms may contain at most three questions")
         return self
 
 
@@ -146,7 +145,6 @@ class ClarificationForm(ClarificationFormBase, Generic[QuestionT]):
     # Pydantic freezes this tuple field, so narrowing its item type is covariant.
     questions: tuple[QuestionT, ...] = Field(  # pyright: ignore[reportIncompatibleVariableOverride]
         min_length=1,
-        max_length=3,
         description="Blocking questions that must all be answered",
     )
 
