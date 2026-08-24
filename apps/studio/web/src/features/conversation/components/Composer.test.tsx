@@ -1,31 +1,63 @@
-import { fireEvent, render, screen } from '@testing-library/react'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { fireEvent, render, screen, within } from '@testing-library/react'
+import { useState } from 'react'
+import { describe, expect, it, vi } from 'vitest'
 
 import { Composer } from './Composer'
 
+const composerChromeProps = () => ({
+  modelControl: <button type="button">测试模型</button>,
+  planActive: false,
+  attachments: [],
+  onExitPlan: vi.fn(),
+  onAddAttachments: vi.fn(),
+  onRemoveAttachment: vi.fn(),
+})
+
 describe('Composer', () => {
-  let scrollHeight = 24
-  let originalScrollHeight: PropertyDescriptor | undefined
-
-  beforeEach(() => {
-    originalScrollHeight = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'scrollHeight')
-    Object.defineProperty(HTMLTextAreaElement.prototype, 'scrollHeight', {
-      configurable: true,
-      get: () => scrollHeight,
+  it('keeps the default composer mounted and inert during a takeover, then restores focus', () => {
+    const animation = vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => {
+      callback(0)
+      return 1
     })
-  })
+    const { container, rerender } = render(
+      <Composer
+        {...composerChromeProps()}
+        takeover={<section aria-label="澄清接管">等待回答</section>}
+        value="保留的草稿"
+        isRunning={false}
+        onChange={vi.fn()}
+        onSend={vi.fn()}
+        onStop={vi.fn()}
+      />,
+    )
 
-  afterEach(() => {
-    if (originalScrollHeight) {
-      Object.defineProperty(HTMLTextAreaElement.prototype, 'scrollHeight', originalScrollHeight)
-    } else {
-      delete (HTMLTextAreaElement.prototype as { scrollHeight?: number }).scrollHeight
-    }
+    const fallback = container.querySelector('.composer-default')
+    const input = screen.getByLabelText('消息输入')
+    expect(fallback).toHaveClass('is-taken-over')
+    expect(fallback).toHaveAttribute('inert')
+    expect(input).toBeInTheDocument()
+    expect(screen.getByRole('region', { name: '澄清接管' })).toBeVisible()
+
+    rerender(
+      <Composer
+        {...composerChromeProps()}
+        value="保留的草稿"
+        isRunning={false}
+        onChange={vi.fn()}
+        onSend={vi.fn()}
+        onStop={vi.fn()}
+      />,
+    )
+    expect(fallback).not.toHaveClass('is-taken-over')
+    expect(input).toHaveFocus()
+    expect(input).toHaveValue('保留的草稿')
+    animation.mockRestore()
   })
 
   it('uses the branded placeholder and polished send icon', () => {
     render(
       <Composer
+        {...composerChromeProps()}
         value=""
         isRunning={false}
         onChange={vi.fn()}
@@ -42,9 +74,85 @@ describe('Composer', () => {
     expect(screen.queryByText(/Shift \+ Enter/)).not.toBeInTheDocument()
   })
 
-  it('focuses the input from the full borderless composer hit area', () => {
+  it('places add and Plan on the left with model and send on the right', () => {
+    const onExitPlan = vi.fn()
+    const { container } = render(
+      <Composer
+        {...composerChromeProps()}
+        modelControl={<button type="button">GPT-5.5</button>}
+        planActive
+        onExitPlan={onExitPlan}
+        value=""
+        isRunning={false}
+        onChange={vi.fn()}
+        onSend={vi.fn()}
+        onStop={vi.fn()}
+      />,
+    )
+
+    const toolbar = container.querySelector('.composer-toolbar')
+    if (!(toolbar instanceof HTMLElement)) throw new Error('missing composer toolbar')
+    expect(within(toolbar).getAllByRole('button').map((button) => button.getAttribute('aria-label') ?? button.textContent)).toEqual([
+      '添加本地附件',
+      'Plan 已开启，点击关闭',
+      'GPT-5.5',
+      '发送消息',
+    ])
+    const planChip = screen.getByRole('button', { name: 'Plan 已开启，点击关闭' })
+    expect(planChip).not.toHaveClass('ui-button')
+    expect(planChip).toHaveAttribute('title', 'Plan 已开启 — 点击关闭')
+    expect(planChip.querySelector('.composer-plan-chip-close svg')).toHaveAttribute('width', '12')
+    expect(planChip.querySelector('.composer-plan-chip-close svg')).toHaveAttribute('height', '12')
+    fireEvent.click(planChip)
+    expect(onExitPlan).toHaveBeenCalledTimes(1)
+  })
+
+  it('selects and removes local-only attachments without changing send behavior', () => {
+    const onAddAttachments = vi.fn()
+    const onRemoveAttachment = vi.fn()
+    const attachment = {
+      id: 'attachment-1',
+      file: new File(['pdf'], 'brief.pdf', { type: 'application/pdf' }),
+      kind: 'pdf' as const,
+    }
+    const { container } = render(
+      <Composer
+        {...composerChromeProps()}
+        attachments={[attachment]}
+        attachmentError="附件总大小不能超过 25MB"
+        onAddAttachments={onAddAttachments}
+        onRemoveAttachment={onRemoveAttachment}
+        value="正文"
+        isRunning={false}
+        onChange={vi.fn()}
+        onSend={vi.fn()}
+        onStop={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByText('brief.pdf')).toBeVisible()
+    const attachmentRow = container.querySelector('.composer-attachments')
+    const inputScroll = container.querySelector('.composer-input-scroll')
+    expect(attachmentRow).not.toBeNull()
+    expect(inputScroll).not.toBeNull()
+    expect(attachmentRow?.compareDocumentPosition(inputScroll as Node)).toBe(Node.DOCUMENT_POSITION_FOLLOWING)
+    expect(container.querySelector('.composer-attachment')).toHaveTextContent('brief.pdf')
+    expect(screen.getByText('附件总大小不能超过 25MB')).toHaveAttribute('aria-live', 'polite')
+    fireEvent.click(screen.getByRole('button', { name: '移除附件：brief.pdf' }))
+    expect(onRemoveAttachment).toHaveBeenCalledWith('attachment-1')
+
+    const fileInput = container.querySelector('input[type="file"]')
+    if (!(fileInput instanceof HTMLInputElement)) throw new Error('missing attachment input')
+    const image = new File(['image'], 'chart.png', { type: 'image/png' })
+    fireEvent.change(fileInput, { target: { files: [image] } })
+    expect(onAddAttachments).toHaveBeenCalledWith([image])
+    expect(screen.getByRole('button', { name: '发送消息' })).toBeEnabled()
+  })
+
+  it('focuses the input from the full composer card hit area', () => {
     render(
       <Composer
+        {...composerChromeProps()}
         value=""
         isRunning={false}
         onChange={vi.fn()}
@@ -54,13 +162,42 @@ describe('Composer', () => {
     )
 
     const input = screen.getByLabelText('消息输入')
-    fireEvent.pointerDown(input.closest('.composer-wrap') as HTMLElement)
+    fireEvent.pointerDown(input.closest('.composer') as HTMLElement)
     expect(input).toHaveFocus()
+  })
+
+  it('forwards wheel input to conversation history unless the input region itself overflows', () => {
+    const onScrollConversation = vi.fn()
+    render(
+      <Composer
+        {...composerChromeProps()}
+        value=""
+        isRunning={false}
+        onChange={vi.fn()}
+        onSend={vi.fn()}
+        onStop={vi.fn()}
+        onScrollConversation={onScrollConversation}
+      />,
+    )
+
+    const input = screen.getByLabelText('消息输入')
+    fireEvent.wheel(input, { deltaY: -120 })
+
+    expect(onScrollConversation).toHaveBeenCalledWith(-120)
+
+    const inputScroll = input.closest('.composer-input-scroll')
+    if (!(inputScroll instanceof HTMLElement)) throw new Error('missing input scroll region')
+    Object.defineProperty(inputScroll, 'scrollHeight', { configurable: true, value: 220 })
+    Object.defineProperty(inputScroll, 'clientHeight', { configurable: true, value: 144 })
+    onScrollConversation.mockClear()
+    fireEvent.wheel(input, { deltaY: 120 })
+    expect(onScrollConversation).not.toHaveBeenCalled()
   })
 
   it('shows the dedicated running stop control', () => {
     render(
       <Composer
+        {...composerChromeProps()}
         value="正在发送"
         isRunning
         onChange={vi.fn()}
@@ -81,6 +218,7 @@ describe('Composer', () => {
     const onSend = vi.fn()
     render(
       <Composer
+        {...composerChromeProps()}
         value="拼音输入"
         isRunning={false}
         onChange={vi.fn()}
@@ -100,6 +238,7 @@ describe('Composer', () => {
   it('disables input and send while the selected history is hydrating', () => {
     render(
       <Composer
+        {...composerChromeProps()}
         value="暂存内容"
         isRunning={false}
         isHydrating
@@ -114,24 +253,208 @@ describe('Composer', () => {
     expect(screen.getByRole('button', { name: '发送消息' })).toBeDisabled()
   })
 
-  it('grows with wrapped content up to six lines, then scrolls internally', () => {
+  it('uses one shared mirror layer for wrapped growth and capped scrolling', () => {
     const props = {
+      ...composerChromeProps(),
       isRunning: false,
       onChange: vi.fn(),
       onSend: vi.fn(),
       onStop: vi.fn(),
     }
-    const { rerender } = render(<Composer {...props} value="一行" />)
+    const { container, rerender } = render(<Composer {...props} value="一行" />)
     const input = screen.getByLabelText('消息输入')
+    const inputScroll = container.querySelector('.composer-input-scroll')
+    const mirror = container.querySelector('.composer-input-mirror')
+    const backdrop = container.querySelector('.composer-input-backdrop')
 
-    expect(input).toHaveStyle({ height: '24px', overflowY: 'hidden' })
+    expect(inputScroll).not.toBeNull()
+    expect(mirror?.textContent).toBe('一行\n')
+    expect(backdrop).toHaveTextContent('一行')
+    expect(input.parentElement).toBe(mirror?.parentElement)
+    expect(input.parentElement).toBe(backdrop?.parentElement)
+    expect(input).not.toHaveAttribute('style')
 
-    scrollHeight = 96
     rerender(<Composer {...props} value={'一\n二\n三\n四'} />)
-    expect(input).toHaveStyle({ height: '96px', overflowY: 'hidden' })
+    expect(mirror?.textContent).toBe('一\n二\n三\n四\n')
 
-    scrollHeight = 220
     rerender(<Composer {...props} value={'一\n二\n三\n四\n五\n六\n七'} />)
-    expect(input).toHaveStyle({ height: '144px', overflowY: 'auto' })
+    expect(mirror?.textContent).toBe('一\n二\n三\n四\n五\n六\n七\n')
+    expect(inputScroll).toHaveClass('composer-input-scroll')
+  })
+
+  it('shows the DSH command and skill inventory with Plan as the only enabled item', () => {
+    const onChange = vi.fn()
+    render(
+      <Composer
+        {...composerChromeProps()}
+        value="/"
+        isRunning={false}
+        onChange={onChange}
+        onSend={vi.fn()}
+        onStop={vi.fn()}
+      />,
+    )
+
+    const menu = screen.getByRole('listbox', { name: '命令和技能建议' })
+    const commandGroup = within(menu).getByRole('group', { name: '命令' })
+    const skillGroup = within(menu).getByRole('group', { name: '技能' })
+    expect(within(commandGroup).getAllByRole('option')).toHaveLength(7)
+    expect(within(skillGroup).getAllByRole('option')).toHaveLength(1)
+
+    const plan = within(commandGroup).getByRole('option', { name: /plan 进入 Plan 模式/ })
+    const disabledOptions = within(menu).getAllByRole('option').filter((option) => option !== plan)
+    expect(plan).toBeEnabled()
+    disabledOptions.forEach((option) => expect(option).toBeDisabled())
+
+    fireEvent.mouseDown(within(commandGroup).getByRole('option', { name: /compact/ }))
+    expect(onChange).not.toHaveBeenCalled()
+    fireEvent.mouseDown(plan)
+    expect(onChange).toHaveBeenCalledWith('/plan ')
+  })
+
+  it('rejects unavailable slash commands and keeps incomplete prefixes non-submittable', () => {
+    function ComposerHarness() {
+      const [value, setValue] = useState('')
+      return (
+        <Composer
+          {...composerChromeProps()}
+          value={value}
+          isRunning={false}
+          onChange={setValue}
+          onSend={vi.fn()}
+          onStop={vi.fn()}
+        />
+      )
+    }
+    render(<ComposerHarness />)
+    const input = screen.getByLabelText('消息输入') as HTMLTextAreaElement
+    const send = screen.getByRole('button', { name: '发送消息' })
+
+    fireEvent.change(input, { target: { value: '/p', selectionStart: 2 } })
+    expect(input).toHaveValue('/p')
+    expect(send).toBeDisabled()
+
+    fireEvent.change(input, { target: { value: '/px', selectionStart: 3 } })
+    expect(input).toHaveValue('/p')
+    fireEvent.change(input, { target: { value: '/compact', selectionStart: 8 } })
+    expect(input).toHaveValue('/p')
+
+    fireEvent.change(input, { target: { value: '/plan', selectionStart: 5 } })
+    expect(input).toHaveValue('/plan')
+    expect(send).toBeEnabled()
+  })
+
+  it.each(['/plan ', '/plan'])('removes the complete %s command with one Backspace', (initialValue) => {
+    function ComposerHarness() {
+      const [value, setValue] = useState(initialValue)
+      return (
+        <Composer
+          {...composerChromeProps()}
+          value={value}
+          isRunning={false}
+          onChange={setValue}
+          onSend={vi.fn()}
+          onStop={vi.fn()}
+        />
+      )
+    }
+    render(<ComposerHarness />)
+    const input = screen.getByLabelText('消息输入') as HTMLTextAreaElement
+    input.focus()
+    input.setSelectionRange(initialValue.length, initialValue.length)
+    fireEvent.keyDown(input, { key: 'Backspace' })
+
+    expect(input).toHaveValue('')
+    expect(input.selectionStart).toBe(0)
+    expect(screen.queryByText('/pla')).not.toBeInTheDocument()
+  })
+
+  it.each(['Enter', 'Tab'])('selects Plan with %s, keeps focus, and decorates the claim', (key) => {
+    const onSend = vi.fn()
+    function ComposerHarness() {
+      const [value, setValue] = useState('')
+      return (
+        <Composer
+          {...composerChromeProps()}
+          value={value}
+          isRunning={false}
+          onChange={setValue}
+          onSend={onSend}
+          onStop={vi.fn()}
+        />
+      )
+    }
+    const { container } = render(<ComposerHarness />)
+    const input = screen.getByLabelText('消息输入') as HTMLTextAreaElement
+    input.focus()
+    fireEvent.change(input, { target: { value: '/', selectionStart: 1 } })
+
+    expect(screen.getByRole('listbox', { name: '命令和技能建议' })).toBeVisible()
+    expect(input).toHaveAttribute('aria-activedescendant', expect.stringContaining('command-plan'))
+    fireEvent.keyDown(input, { key: 'ArrowDown' })
+    fireEvent.keyDown(input, { key })
+
+    expect(input).toHaveValue('/plan ')
+    expect(input.selectionStart).toBe(6)
+    expect(input).toHaveFocus()
+    expect(onSend).not.toHaveBeenCalled()
+    expect(screen.queryByRole('listbox', { name: '命令和技能建议' })).not.toBeInTheDocument()
+    const backdrop = container.querySelector('.composer-input-backdrop')
+    expect(backdrop?.querySelector('mark')?.textContent).toBe('/plan ')
+    expect(backdrop).toHaveTextContent('描述你的任务以生成计划')
+  })
+
+  it('cancels both the slash trigger and suggestions with Escape', () => {
+    function ComposerHarness() {
+      const [value, setValue] = useState('/')
+      return (
+        <Composer
+          {...composerChromeProps()}
+          value={value}
+          isRunning={false}
+          onChange={setValue}
+          onSend={vi.fn()}
+          onStop={vi.fn()}
+        />
+      )
+    }
+    render(<ComposerHarness />)
+
+    const input = screen.getByLabelText('消息输入')
+    input.focus()
+    fireEvent.keyDown(input, { key: 'Escape' })
+    expect(screen.queryByRole('listbox', { name: '命令和技能建议' })).not.toBeInTheDocument()
+    expect(input).toHaveValue('')
+    expect(input).toHaveFocus()
+  })
+
+  it('keeps menu scrolling inside the popup and cancels Slash on an outside pointer', () => {
+    const onScrollConversation = vi.fn()
+    function ComposerHarness() {
+      const [value, setValue] = useState('/')
+      return (
+        <Composer
+          {...composerChromeProps()}
+          value={value}
+          isRunning={false}
+          onChange={setValue}
+          onSend={vi.fn()}
+          onStop={vi.fn()}
+          onScrollConversation={onScrollConversation}
+        />
+      )
+    }
+    render(<ComposerHarness />)
+
+    const menu = screen.getByRole('listbox', { name: '命令和技能建议' })
+    const input = screen.getByLabelText('消息输入')
+    fireEvent.wheel(menu, { deltaY: 120 })
+    expect(onScrollConversation).not.toHaveBeenCalled()
+
+    fireEvent.pointerDown(input)
+    expect(menu).toBeVisible()
+    fireEvent.pointerDown(document.body)
+    expect(screen.queryByRole('listbox', { name: '命令和技能建议' })).not.toBeInTheDocument()
+    expect(input).toHaveValue('')
   })
 })

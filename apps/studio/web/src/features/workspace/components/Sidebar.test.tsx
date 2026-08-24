@@ -1,6 +1,6 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { WorkspaceState } from '../../../types'
 import { Sidebar } from './Sidebar'
@@ -37,6 +37,12 @@ const workspace: WorkspaceState = {
 
 const baseProps = {
   workspace,
+  historyConversations: workspace.conversations,
+  historyDayRanges: [7, 30],
+  historyQuery: '',
+  onHistoryQueryChange: vi.fn(),
+  isHistorySearchActive: false,
+  isHistorySearching: false,
   mode: 'expanded' as const,
   settledMode: 'expanded' as const,
   overlayOpen: false,
@@ -56,11 +62,18 @@ const baseProps = {
     user_id: 7,
     username: 'yunsan',
     display_name: '云杉',
+    avatar_url: null,
     roles: [],
     disabled: false,
   },
+  onOpenSettings: vi.fn(),
   onLogout: vi.fn(),
 }
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+  vi.useRealTimers()
+})
 
 describe('Sidebar', () => {
   it('renders the authenticated display name and performs real logout', () => {
@@ -76,26 +89,40 @@ describe('Sidebar', () => {
     expect(onLogout).toHaveBeenCalledOnce()
   })
 
-  it('用户菜单展开时显示向上箭头并同步触发器语义', () => {
+  it('用户菜单展开时保持无边框的头像与名称栏，并同步触发器语义', () => {
     render(<Sidebar {...baseProps} />)
 
     const trigger = screen.getByRole('button', { name: '打开用户菜单' })
     expect(trigger).toHaveAttribute('aria-expanded', 'false')
-    expect(trigger.querySelector('.lucide-chevron-down')).toBeInTheDocument()
+    expect(trigger.parentElement).toHaveClass('user-account')
+    expect(trigger).toHaveClass('user-card')
+    expect(trigger.querySelector('.lucide-chevron-down')).not.toBeInTheDocument()
 
     fireEvent.click(trigger)
 
     const expandedTrigger = screen.getByRole('button', { name: '关闭用户菜单' })
     expect(expandedTrigger).toHaveAttribute('aria-expanded', 'true')
-    expect(expandedTrigger.querySelector('.lucide-chevron-up')).toBeInTheDocument()
+    expect(expandedTrigger.querySelector('.lucide-chevron-up')).not.toBeInTheDocument()
     expect(expandedTrigger.querySelector('.lucide-chevron-down')).not.toBeInTheDocument()
+  })
+
+  it('从用户菜单打开设置并把稳定的账户按钮作为焦点恢复目标', () => {
+    const onOpenSettings = vi.fn()
+    render(<Sidebar {...baseProps} onOpenSettings={onOpenSettings} />)
+    const accountButton = screen.getByRole('button', { name: '打开用户菜单' })
+
+    fireEvent.click(accountButton)
+    fireEvent.click(screen.getByRole('button', { name: '设置' }))
+
+    expect(onOpenSettings).toHaveBeenCalledWith(accountButton)
+    expect(screen.queryByRole('button', { name: '退出登录' })).not.toBeInTheDocument()
   })
 
   it('用户菜单只在容器外部的指针操作后收起', () => {
     render(<Sidebar {...baseProps} />)
 
     fireEvent.click(screen.getByRole('button', { name: '打开用户菜单' }))
-    fireEvent.pointerDown(screen.getByRole('button', { name: '个人设置' }))
+    fireEvent.pointerDown(screen.getByRole('button', { name: '设置' }))
     expect(screen.getByRole('button', { name: '退出登录' })).toBeInTheDocument()
 
     fireEvent.pointerDown(screen.getByRole('navigation', { name: '工作区功能' }))
@@ -103,7 +130,7 @@ describe('Sidebar', () => {
     expect(screen.queryByRole('button', { name: '退出登录' })).not.toBeInTheDocument()
     const collapsedTrigger = screen.getByRole('button', { name: '打开用户菜单' })
     expect(collapsedTrigger).toHaveAttribute('aria-expanded', 'false')
-    expect(collapsedTrigger.querySelector('.lucide-chevron-down')).toBeInTheDocument()
+    expect(collapsedTrigger.querySelector('.lucide-chevron-down')).not.toBeInTheDocument()
     expect(collapsedTrigger.querySelector('.lucide-chevron-up')).not.toBeInTheDocument()
   })
 
@@ -124,50 +151,126 @@ describe('Sidebar', () => {
     expect(screen.getByText('yunsan')).toBeInTheDocument()
   })
 
-  it('renders the product navigation labels with matching icons', () => {
+  it('仅渲染当前可用的产品导航，并禁用尚不可用的入口', () => {
     render(<Sidebar {...baseProps} />)
 
+    const historyScroll = screen.getByRole('region', { name: '最近对话' })
+    const productNavigation = screen.getByRole('navigation', { name: '工作区功能' })
+    expect(historyScroll).toContainElement(productNavigation)
     expect(screen.getByRole('button', { name: '技能库' }).querySelector('.lucide-book-open-check')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: '智能体' }).querySelector('.lucide-workflow')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: '工作区' }).querySelector('.lucide-panels-top-left')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'MCP管理' }).querySelector('.lucide-cable')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: '智能体' })).toHaveAttribute('aria-current', 'page')
-    for (const label of ['技能库', '工作区', 'MCP管理', '更多']) {
+    const agentButton = screen.getByRole('button', { name: '智能体' })
+    expect(agentButton).not.toHaveAttribute('aria-current')
+    expect(agentButton).not.toHaveAttribute('aria-pressed')
+    expect(agentButton).not.toHaveClass('is-selected')
+    expect(agentButton).toBeDisabled()
+    expect(screen.queryByRole('button', { name: '工作区' })).not.toBeInTheDocument()
+    for (const label of ['技能库', 'MCP管理', '更多']) {
       expect(screen.getByRole('button', { name: label })).toBeDisabled()
     }
 
     fireEvent.click(screen.getByRole('button', { name: '打开用户菜单' }))
-    expect(screen.getByRole('button', { name: '个人设置' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: '设置' })).toBeEnabled()
   })
 
-  it('renders one fixed history heading and marks pinned conversations inline', () => {
+  it('在展开侧栏中把搜索放到收起控件左侧并使用任务抽屉图标', () => {
     render(<Sidebar {...baseProps} />)
 
-    const historyList = screen.getByRole('region', { name: '历史对话' })
-    const historyHeading = screen.getByText('历史对话').parentElement
+    const brand = screen.getByRole('link', { name: 'TinkerFin 首页' })
+    const collapse = screen.getByRole('button', { name: '收起侧边栏' })
+    const actions = collapse.closest('.sidebar-head-actions')
+    expect(brand.querySelector('.brand-mark svg')).toHaveAttribute('width', '30')
+    expect(brand.querySelector('.brand-mark svg')).toHaveAttribute('height', '30')
+    const brandName = within(brand).getByText('TinkerFin')
+    const brandPlus = within(brand).getByText('Plus')
+    expect(brandName).toHaveClass('brand-name')
+    expect(brandName.parentElement).toBe(brand)
+    expect(brandPlus).toHaveClass('brand-plus')
+    expect(brandPlus.parentElement).toBe(brand)
+    expect(collapse.querySelector('.lucide-panel-right')).toBeInTheDocument()
+    expect(within(actions as HTMLElement).getAllByRole('button').map((button) => button.getAttribute('aria-label')))
+      .toEqual(['搜索会话', '收起侧边栏'])
+  })
+
+  it('只固定居中的新会话胶囊，并提供可用的 Command K 快捷键', () => {
+    const onNew = vi.fn()
+    render(<Sidebar {...baseProps} onNew={onNew} />)
+
+    const newChat = screen.getByRole('button', { name: '新会话' })
+    const historyScroll = screen.getByRole('region', { name: '最近对话' })
+    expect(newChat.parentElement).toHaveClass('new-chat-wrap')
+    expect(historyScroll).not.toContainElement(newChat)
+    expect(newChat).toHaveAttribute('aria-keyshortcuts', 'Meta+K')
+    expect(newChat).toHaveAttribute('title', 'Command + K 开启新会话')
+    expect(newChat.querySelector('.new-chat-shortcut')).toHaveTextContent('⌘ K')
+
+    fireEvent.keyDown(document, { key: 'k', metaKey: true })
+
+    expect(onNew).toHaveBeenCalledOnce()
+  })
+
+  it('仅在当前草稿是新会话时选中新会话入口', () => {
+    const { rerender } = render(<Sidebar {...baseProps} />)
+
+    expect(screen.getByRole('button', { name: '新会话' })).not.toHaveClass('is-selected')
+    expect(screen.getByRole('button', { name: '新会话' })).not.toHaveAttribute('aria-pressed')
+
+    rerender(<Sidebar {...baseProps} workspace={{ ...workspace, currentThreadId: '' }} />)
+
+    expect(screen.getByRole('button', { name: '新会话' })).toHaveClass('is-selected')
+    expect(screen.getByRole('button', { name: '新会话' })).toHaveAttribute('aria-pressed', 'true')
+  })
+
+  it('按置顶和本地自然日渲染历史分组，不保留固定标题或行内置顶图标', () => {
+    const today = new Date().toISOString()
+    const conversations = workspace.conversations.map((item) => ({ ...item, updatedAt: today }))
+    render(<Sidebar {...baseProps} historyConversations={conversations} />)
+
+    const historyList = screen.getByRole('region', { name: '最近对话' })
     const historyRegion = historyList.parentElement
-    const historyToolbar = historyHeading?.parentElement
+    expect(historyList).toHaveClass('ui-scrollbar')
+    expect(historyRegion?.querySelector('.ui-scrollbar-overlay')).toBeInTheDocument()
     const pinnedItem = screen.getByRole('button', { name: '打开会话：置顶会话' }).closest('.conversation-item')
     expect(historyRegion).toHaveClass('conversation-history')
-    expect(historyToolbar).toHaveClass('history-toolbar')
-    expect(historyToolbar?.parentElement).toBe(historyRegion)
-    expect(historyList.previousElementSibling).toBe(historyToolbar)
+    expect(screen.queryByText('最近对话')).not.toBeInTheDocument()
+    const pinnedHeading = screen.getByRole('heading', { name: '置顶' })
+    expect(pinnedHeading).toHaveClass('conversation-group-title')
+    expect(pinnedHeading.parentElement).toHaveClass('conversation-groups')
+    expect(pinnedHeading.nextElementSibling).toHaveClass('conversation-group-items')
+    const todayHeading = screen.getByRole('heading', { name: '今天' })
+    expect(todayHeading).toHaveClass('conversation-group-title')
     expect(screen.queryByText('已置顶')).not.toBeInTheDocument()
     expect(screen.queryByText('最近')).not.toBeInTheDocument()
     expect(pinnedItem).toHaveClass('is-pinned')
-    expect(pinnedItem?.querySelector('.conversation-pinned-indicator')).toBeInTheDocument()
+    expect(pinnedItem?.querySelector('.conversation-pinned-indicator')).not.toBeInTheDocument()
     const recentButton = screen.getByRole('button', { name: '打开会话：最近会话' })
     expect(recentButton).not.toHaveAttribute('title')
     expect(recentButton.closest('.conversation-item')).toHaveClass('is-recent')
     expect(recentButton.closest('.conversation-item')).toHaveClass('overflow-marquee-trigger')
     expect(recentButton.querySelector('.conversation-title-marquee')).toHaveClass('overflow-marquee')
     expect(historyList.querySelector('.conversation-item')).toBe(pinnedItem)
+
+    const groupsContainer = historyList.querySelector('.conversation-groups') as HTMLElement
+    Object.defineProperty(groupsContainer, 'offsetTop', { configurable: true, value: 100 })
+    Object.defineProperty(pinnedHeading, 'offsetTop', { configurable: true, value: 0 })
+    Object.defineProperty(todayHeading, 'offsetTop', { configurable: true, value: 200 })
+    historyList.scrollTop = 101
+    const stickyTitle = historyRegion?.querySelector('.conversation-sticky-title')
+
+    fireEvent.scroll(historyList)
+    expect(stickyTitle).toHaveTextContent('置顶')
+    expect(stickyTitle).toHaveClass('is-visible')
+
+    historyList.scrollTop = 301
+    fireEvent.scroll(historyList)
+    expect(stickyTitle).toHaveTextContent('今天')
   })
 
   it('opens the existing management menu from a pinned conversation', () => {
     render(<Sidebar {...baseProps} />)
 
-    const historyList = screen.getByRole('region', { name: '历史对话' })
+    const historyList = screen.getByRole('region', { name: '最近对话' })
     historyList.scrollTop = 48
     fireEvent.click(screen.getByRole('button', { name: '管理会话：置顶会话' }))
 
@@ -203,13 +306,97 @@ describe('Sidebar', () => {
     expect(trigger).toHaveFocus()
   })
 
-  it('renders exactly five loading skeleton rows', () => {
+  it('keeps pagination loading silent and outside the scroll flow', () => {
     render(<Sidebar {...baseProps} isLoadingMore />)
 
-    expect(screen.getAllByTestId('history-skeleton')).toHaveLength(5)
+    const scroll = screen.getByRole('region', { name: '最近对话' })
+    expect(screen.queryByText('正在加载更多历史会话')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('history-skeleton')).not.toBeInTheDocument()
+    expect(scroll.querySelector('.history-load-sentinel')).toBeInTheDocument()
   })
 
-  it('renders a retry tail and suppresses scroll retries until explicitly requested', () => {
+  it('coalesces repeated bottom scroll events into one request per idle-separated burst', () => {
+    vi.useFakeTimers()
+    const onLoadMore = vi.fn()
+    render(<Sidebar {...baseProps} onLoadMore={onLoadMore} />)
+    const scroll = screen.getByRole('region', { name: '最近对话' })
+    Object.defineProperties(scroll, {
+      scrollTop: { configurable: true, writable: true, value: 100 },
+      clientHeight: { configurable: true, value: 200 },
+      scrollHeight: { configurable: true, value: 300 },
+    })
+
+    fireEvent.scroll(scroll)
+    fireEvent.scroll(scroll)
+    expect(onLoadMore).toHaveBeenCalledOnce()
+
+    act(() => vi.advanceTimersByTime(601))
+    fireEvent.scroll(scroll)
+    expect(onLoadMore).toHaveBeenCalledTimes(2)
+  })
+
+  it('loads one page per sentinel entry and rearms only after it leaves', () => {
+    let observerCallback: IntersectionObserverCallback | undefined
+    vi.stubGlobal('IntersectionObserver', class {
+      constructor(callback: IntersectionObserverCallback) { observerCallback = callback }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+      takeRecords() { return [] }
+      readonly root = null
+      readonly rootMargin = ''
+      readonly thresholds = [0]
+    })
+    const onLoadMore = vi.fn()
+    render(<Sidebar {...baseProps} onLoadMore={onLoadMore} />)
+
+    act(() => observerCallback?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver))
+    act(() => observerCallback?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver))
+    expect(onLoadMore).toHaveBeenCalledOnce()
+
+    act(() => observerCallback?.([{ isIntersecting: false } as IntersectionObserverEntry], {} as IntersectionObserver))
+    act(() => observerCallback?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver))
+    expect(onLoadMore).toHaveBeenCalledTimes(2)
+  })
+
+  it('restores the first visible conversation offset after a page changes grouping', () => {
+    let observerCallback: IntersectionObserverCallback | undefined
+    vi.stubGlobal('IntersectionObserver', class {
+      constructor(callback: IntersectionObserverCallback) { observerCallback = callback }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+      takeRecords() { return [] }
+      readonly root = null
+      readonly rootMargin = ''
+      readonly thresholds = [0]
+    })
+    const { rerender } = render(<Sidebar {...baseProps} />)
+    const scroll = screen.getByRole('region', { name: '最近对话' })
+    let anchorTop = 20
+    Object.defineProperties(scroll, {
+      scrollTop: { configurable: true, writable: true, value: 100 },
+      clientHeight: { configurable: true, value: 200 },
+      scrollHeight: { configurable: true, value: 400 },
+      getBoundingClientRect: { configurable: true, value: () => ({ top: 0, bottom: 200 }) },
+    })
+    const anchor = scroll.querySelector<HTMLElement>('[data-history-thread-id="recent"]')
+    Object.defineProperty(anchor, 'getBoundingClientRect', {
+      configurable: true,
+      value: () => ({ top: anchorTop, bottom: anchorTop + 40 }),
+    })
+
+    act(() => observerCallback?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver))
+    scroll.scrollTop = 120
+    anchorTop = 0
+    fireEvent.scroll(scroll)
+    anchorTop = 40
+    rerender(<Sidebar {...baseProps} historyConversations={[...workspace.conversations]} />)
+
+    expect(scroll.scrollTop).toBe(160)
+  })
+
+  it('retries a failed page on the next deliberate bottom scroll without rendering a box', () => {
     const onLoadMore = vi.fn()
     const onRetryLoadMore = vi.fn()
     render(
@@ -221,17 +408,16 @@ describe('Sidebar', () => {
       />,
     )
 
-    const scroll = screen.getByRole('region', { name: '历史对话' })
+    const scroll = screen.getByRole('region', { name: '最近对话' })
     Object.defineProperties(scroll, {
       scrollTop: { configurable: true, value: 100 },
       clientHeight: { configurable: true, value: 200 },
       scrollHeight: { configurable: true, value: 300 },
     })
     fireEvent.scroll(scroll)
-    expect(onLoadMore).not.toHaveBeenCalled()
-
-    fireEvent.click(screen.getByRole('button', { name: '重试加载历史' }))
     expect(onRetryLoadMore).toHaveBeenCalledOnce()
+    expect(onLoadMore).not.toHaveBeenCalled()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
   })
 })
 
@@ -251,7 +437,7 @@ describe('Sidebar rail and inline search', () => {
     const sidebar = screen.getByLabelText('会话导航', { selector: 'aside' })
     expect(sidebar).toHaveAttribute('aria-hidden', 'true')
     expect(sidebar).toHaveAttribute('inert')
-    expect(screen.queryByRole('button', { name: '新聊天' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '新会话' })).not.toBeInTheDocument()
   })
 
   it('moves focus into an opened mobile overlay and Escape restores the opener path', async () => {
@@ -288,14 +474,19 @@ describe('Sidebar rail and inline search', () => {
     )
 
     expect(screen.getByRole('button', { name: '打开侧边栏' })).toHaveAttribute('aria-expanded', 'false')
+    expect(screen.getByRole('tooltip', { name: '打开侧边栏' })).toBeInTheDocument()
+    expect(screen.getByRole('tooltip', { name: '账户' })).toBeInTheDocument()
     expect(screen.queryByRole('link', { name: 'TinkerFin 首页' })).not.toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: '搜索会话' }))
     expect(onRequestExpanded).toHaveBeenCalledOnce()
   })
 
-  it('filters loaded titles and lets Escape clear, close and restore focus', async () => {
+  it('把查询交给后端状态并让 Escape 清空、收起和恢复焦点', async () => {
     const user = userEvent.setup()
-    render(<Sidebar {...baseProps} />)
+    const onHistoryQueryChange = vi.fn()
+    const { rerender } = render(
+      <Sidebar {...baseProps} onHistoryQueryChange={onHistoryQueryChange} />,
+    )
 
     const trigger = screen.getByRole('button', { name: '搜索会话' })
     await user.click(trigger)
@@ -305,7 +496,17 @@ describe('Sidebar rail and inline search', () => {
     fireEvent.pointerDown(document.body)
     expect(trigger).toHaveAttribute('aria-expanded', 'false')
     await user.click(trigger)
-    await user.type(input, '置顶')
+    fireEvent.change(input, { target: { value: '置顶' } })
+    expect(onHistoryQueryChange).toHaveBeenLastCalledWith('置顶')
+    rerender(
+      <Sidebar
+        {...baseProps}
+        historyConversations={[workspace.conversations[0]!]}
+        historyQuery="置顶"
+        onHistoryQueryChange={onHistoryQueryChange}
+        isHistorySearchActive
+      />,
+    )
     expect(screen.getByRole('button', { name: '打开会话：置顶会话' })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: '打开会话：最近会话' })).not.toBeInTheDocument()
 
@@ -316,30 +517,114 @@ describe('Sidebar rail and inline search', () => {
 
     await user.keyboard('{Escape}')
     expect(trigger).toHaveAttribute('aria-expanded', 'false')
+    expect(onHistoryQueryChange).toHaveBeenLastCalledWith('')
     await waitFor(() => expect(trigger).toHaveFocus())
+    rerender(<Sidebar {...baseProps} onHistoryQueryChange={onHistoryQueryChange} />)
     expect(screen.getByRole('button', { name: '打开会话：最近会话' })).toBeInTheDocument()
 
     await user.click(trigger)
-    await user.type(input, '置顶')
+    rerender(
+      <Sidebar
+        {...baseProps}
+        historyQuery="置顶"
+        onHistoryQueryChange={onHistoryQueryChange}
+        isHistorySearchActive
+      />,
+    )
     await user.click(screen.getByRole('button', { name: '清除搜索' }))
     expect(trigger).toHaveAttribute('aria-expanded', 'false')
-    expect(input).toHaveValue('')
+    expect(onHistoryQueryChange).toHaveBeenLastCalledWith('')
   })
 
   it('preserves a non-empty query across rail and expanded presentation changes', async () => {
     const user = userEvent.setup()
-    const { rerender } = render(<Sidebar {...baseProps} />)
+    const onHistoryQueryChange = vi.fn()
+    const { rerender } = render(
+      <Sidebar {...baseProps} onHistoryQueryChange={onHistoryQueryChange} />,
+    )
     await user.click(screen.getByRole('button', { name: '搜索会话' }))
-    await user.type(screen.getByRole('textbox', { name: '搜索会话' }), '置顶')
+    fireEvent.change(screen.getByRole('textbox', { name: '搜索会话' }), { target: { value: '置顶' } })
 
     rerender(
-      <Sidebar {...baseProps} mode="rail" settledMode="rail" wideInteractive={false} railInteractive />,
+      <Sidebar
+        {...baseProps}
+        historyQuery="置顶"
+        onHistoryQueryChange={onHistoryQueryChange}
+        isHistorySearchActive
+        mode="rail"
+        settledMode="rail"
+        wideInteractive={false}
+        railInteractive
+      />,
     )
     expect(screen.getByRole('button', { name: '搜索会话，当前查询：置顶' })).toBeInTheDocument()
 
-    rerender(<Sidebar {...baseProps} />)
+    rerender(
+      <Sidebar
+        {...baseProps}
+        historyConversations={[workspace.conversations[0]!]}
+        historyQuery="置顶"
+        onHistoryQueryChange={onHistoryQueryChange}
+        isHistorySearchActive
+      />,
+    )
     expect(screen.getByRole('textbox', { name: '搜索会话' })).toHaveValue('置顶')
     expect(screen.queryByRole('button', { name: '打开会话：最近会话' })).not.toBeInTheDocument()
+  })
+
+  it('在 Rail 导航中也禁用智能体入口', () => {
+    render(
+      <Sidebar {...baseProps} mode="rail" settledMode="rail" wideInteractive={false} railInteractive />,
+    )
+
+    expect(screen.getByRole('button', { name: '智能体' })).toBeDisabled()
+  })
+
+  it('在 Rail 导航中始终显示用于展开侧边栏的任务抽屉图标', () => {
+    render(
+      <Sidebar {...baseProps} mode="rail" settledMode="rail" wideInteractive={false} railInteractive />,
+    )
+
+    expect(screen.getByRole('button', { name: '打开侧边栏' }).querySelector('.lucide-panel-right')).toBeInTheDocument()
+  })
+
+  it('在 Rail 底部复用真实用户头像并保持点击后仅展开侧边栏', () => {
+    const onRequestExpanded = vi.fn()
+    render(
+      <Sidebar
+        {...baseProps}
+        mode="rail"
+        settledMode="rail"
+        wideInteractive={false}
+        railInteractive
+        user={{ ...baseProps.user, avatar_url: 'https://cdn.example.test/avatar.webp' }}
+        onRequestExpanded={onRequestExpanded}
+      />,
+    )
+
+    const accountTrigger = screen.getByRole('button', { name: '展开侧边栏以查看账户' })
+    expect(accountTrigger.querySelector('img')).toHaveAttribute('src', 'https://cdn.example.test/avatar.webp')
+    expect(accountTrigger.querySelector('.user-avatar')).toBeInTheDocument()
+    expect(accountTrigger.querySelector('.lucide-user-round')).not.toBeInTheDocument()
+
+    fireEvent.click(accountTrigger)
+    expect(onRequestExpanded).toHaveBeenCalledOnce()
+    expect(screen.queryByRole('button', { name: '退出登录' })).not.toBeInTheDocument()
+  })
+
+  it('在 Rail 导航中同步新会话的选中状态', () => {
+    render(
+      <Sidebar
+        {...baseProps}
+        workspace={{ ...workspace, currentThreadId: '' }}
+        mode="rail"
+        settledMode="rail"
+        wideInteractive={false}
+        railInteractive
+      />,
+    )
+
+    expect(screen.getByRole('button', { name: '新会话' })).toHaveClass('is-selected')
   })
 
   it('focuses the input only after a rail expansion settles', async () => {

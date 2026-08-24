@@ -1,6 +1,7 @@
 import { CircleAlert, LoaderCircle, RotateCcw } from 'lucide-react'
 
 import { Button, Surface } from '../../../components/ui'
+import { useI18n } from '../../../i18n'
 
 export function WorkspaceStatus({
   kind,
@@ -15,6 +16,7 @@ export function WorkspaceStatus({
   onRetry?: () => void
   compact?: boolean
 }) {
+  const { t } = useI18n()
   return (
     <Surface
       tone={kind === 'error' ? 'danger' : 'neutral'}
@@ -33,7 +35,7 @@ export function WorkspaceStatus({
         <p>{description}</p>
       </div>
       {kind === 'error' && onRetry && (
-        <Button size="sm" leadingIcon={<RotateCcw size={14} />} onClick={onRetry}>重试</Button>
+        <Button size="sm" leadingIcon={<RotateCcw size={14} />} onClick={onRetry}>{t('重试')}</Button>
       )}
     </Surface>
   )

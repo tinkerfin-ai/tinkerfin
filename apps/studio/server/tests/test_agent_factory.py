@@ -14,6 +14,7 @@ from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from pydantic import SecretStr
 
 from tinkerfin import AgUiEventStream, TinkerFin
+from tinkerfin.plan import MarkdownPlanContent
 from tinkerfin_agui_adapter import AgUiLifecycleEventFactory
 from tinkerfin_messaging import FiniteMessageSource, MemoryBackend, Messaging
 from tinkerfin_messaging.agui import AgUiCodec
@@ -21,6 +22,7 @@ from tinkerfin_sandbox.lifecycle.manager import OpenSandboxManager
 from tinkerfin_studio.agent import factory as factory_module
 from tinkerfin_studio.agent.factory import ConversationAgentFactory, _create_model
 from tinkerfin_studio.agent.persistence import AgentPersistence
+from tinkerfin_studio.agent.plan_clarification import StudioPlanClarificationForm
 from tinkerfin_studio.conversation.request import ChatRequest
 from tinkerfin_studio.conversation.run_preparation import prepare_run_request
 from tinkerfin_studio.models.schemas import AgentModelConfig
@@ -60,7 +62,10 @@ def _run_input(*, mode: str = "default") -> RunAgentInput:
             "messages": [],
             "tools": [],
             "context": [],
-            "forwardedProps": {"model": "main", "mode": mode},
+            "forwardedProps": {
+                "model": "main",
+                "command": {"plan": "on" if mode == "plan" else "off"},
+            },
         }
     )
 
@@ -191,6 +196,8 @@ async def test_create_definition_uses_non_reasoning_models_for_plan(
     assert tinkerfin.plan_options == {
         "enabled": True,
         "planner_model": plan_model,
+        "clarification_schema": StudioPlanClarificationForm,
+        "plan_schema": MarkdownPlanContent,
     }
     assert tinkerfin.definition_options["model"] is root_model
 

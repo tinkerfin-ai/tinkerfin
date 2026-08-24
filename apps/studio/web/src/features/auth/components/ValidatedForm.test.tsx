@@ -3,7 +3,7 @@ import userEvent from '@testing-library/user-event'
 import { useState } from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { ValidatedField, ValidatedForm } from './ValidatedForm'
+import { ValidatedForm } from './ValidatedForm'
 
 const animationMocks = vi.hoisted(() => ({
   add: vi.fn<(query: string, callback: () => void) => void>(),
@@ -49,16 +49,10 @@ function Harness({
         setValidationAttempt((current) => current + 1)
       }}
     >
-      <ValidatedField fieldName="first" controlId="first" label="第一项" error={errors.first}>
-        {({ controlAria, feedbackAttributes }) => (
-          <span {...feedbackAttributes}><input id="first" {...controlAria} /></span>
-        )}
-      </ValidatedField>
-      <ValidatedField fieldName="second" controlId="second" label="第二项" error={errors.second}>
-        {({ controlAria, feedbackAttributes }) => (
-          <span {...feedbackAttributes}><input id="second" {...controlAria} /></span>
-        )}
-      </ValidatedField>
+      <label htmlFor="first">第一项</label>
+      <input id="first" aria-invalid={Boolean(errors.first)} data-validation-feedback={errors.first ? 'invalid' : undefined} />
+      <label htmlFor="second">第二项</label>
+      <input id="second" aria-invalid={Boolean(errors.second)} data-validation-feedback={errors.second ? 'invalid' : undefined} />
       <button type="submit">提交</button>
     </ValidatedForm>
   )
@@ -72,13 +66,11 @@ describe('ValidatedForm', () => {
     animationMocks.revert.mockReset()
   })
 
-  it('suppresses native validation and associates inline field errors', () => {
+  it('suppresses native validation', () => {
     render(<Harness />)
 
     expect(screen.getByRole('form', { name: '测试表单' })).toHaveAttribute('novalidate')
     expect(screen.getByLabelText('第一项')).toHaveAttribute('aria-invalid', 'true')
-    expect(screen.getByLabelText('第一项')).toHaveAccessibleDescription('请输入第一项')
-    expect(screen.getByLabelText('第二项')).toHaveAccessibleDescription('请输入第二项')
   })
 
   it('focuses the first invalid control and repeats feedback on every invalid submit', async () => {

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react'
+import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 
@@ -7,7 +7,7 @@ import '../../../styles/tokens.css'
 import '../../../styles/global.css'
 import '../conversation.css'
 import conversationStyles from '../conversation.css?raw'
-import { MessageBlock } from './MessageBlock'
+import { MessageBlock, ToolCallBatch } from './MessageBlock'
 
 const subagentMessage: Message = {
   id: 'subagent-run-researcher-1',
@@ -57,7 +57,7 @@ const secondChildTool: Message = {
 }
 
 describe('MessageBlock subagent card', () => {
-  it('uses the shared 44px control token for tool and subagent headers', () => {
+  it('matches the 24px Tool row while retaining 44px touch targets', () => {
     const { container } = render(
       <>
         <MessageBlock message={subagentMessage} childTools={[childTool]} />
@@ -72,7 +72,41 @@ describe('MessageBlock subagent card', () => {
 
     expect(subagentHeader).not.toBeNull()
     expect(toolHeader).not.toBeNull()
-    expect(conversationStyles).toMatch(/\.tool-card summary,[\s\S]*\.subagent-card-head\s*{[^}]*min-height:\s*var\(--control-lg\)/s)
+    expect(conversationStyles).toMatch(/\.subagent-card-head\s*{[^}]*height:\s*var\(--type-title-line\);[^}]*overflow:\s*hidden;[^}]*border-radius:\s*var\(--radius-sm\);[^}]*background:\s*transparent;[^}]*box-shadow:\s*none;/s)
+    expect(conversationStyles).toMatch(/\.subagent-card\s*{[^}]*--subagent-avatar-size:\s*var\(--icon-sm\);/s)
+    expect(conversationStyles).toMatch(/\.subagent-card-head:hover,[\s\S]*\.subagent-card-head:active\s*{[^}]*background:\s*transparent;[^}]*box-shadow:\s*none;/s)
+    expect(subagentHeader?.querySelector('.tool-row-leading')).not.toBeNull()
+    expect(subagentHeader?.querySelector('.tool-row-icon')).not.toBeNull()
+    expect(subagentHeader?.querySelector('.tool-row-chevron')).not.toBeNull()
+    expect(subagentHeader?.querySelector('.subagent-card-chevron')).toBeNull()
+    expect(conversationStyles).toMatch(/\.subagent-card\[open\] > \.subagent-card-head \.tool-row-icon\s*\{\s*opacity:\s*0;/s)
+    expect(conversationStyles).toMatch(/\.subagent-card\[open\] > \.subagent-card-head \.tool-row-chevron\s*\{\s*opacity:\s*1;/s)
+    expect(conversationStyles).not.toMatch(/\.subagent-card\[open\] \.tool-row-(?:icon|chevron)/s)
+    expect(conversationStyles).toMatch(/\.subagent-task-line\s*{[^}]*margin:\s*0 0 var\(--space-2\) calc\(var\(--subagent-avatar-size\) \+ var\(--space-1-5\)\);/s)
+    expect(conversationStyles).toMatch(/\.tool-row > summary\s*{[^}]*height:\s*var\(--type-title-line\)/s)
+    expect(conversationStyles).toMatch(/@media \(hover:\s*none\), \(pointer:\s*coarse\)[\s\S]*\.subagent-card-head\s*{\s*height:\s*var\(--control-lg\)/s)
+    expect(conversationStyles).toMatch(/@media \(hover:\s*none\), \(pointer:\s*coarse\)[\s\S]*\.tool-row > summary\s*{\s*height:\s*var\(--control-lg\)/s)
+
+    expect(conversationStyles).toMatch(/\.subagent-task-line > span\s*\{[^}]*font:\s*inherit;[^}]*font-weight:\s*var\(--weight-medium\);/s)
+    expect(conversationStyles).not.toMatch(/\.subagent-task-line > span\s*\{[^}]*font-family:\s*var\(--font-code\)/s)
+    for (const selector of [
+      '.subagent-card-meta',
+      '.subagent-task-line',
+      '.subagent-output-copy > strong',
+      '.subagent-trace-output .markdown-content',
+    ]) {
+      const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      expect(conversationStyles).toMatch(new RegExp(
+        `${escaped}\\s*\\{[^}]*font-size:\\s*var\\(--type-ui-size\\);[^}]*line-height:\\s*var\\(--type-title-line\\);`,
+        's',
+      ))
+    }
+    expect(conversationStyles).toMatch(/\.subagent-output-node\s*\{[^}]*--subagent-output-align-offset:\s*calc\(/s)
+    expect(conversationStyles).toMatch(/\.subagent-output-node\s*\{[^}]*grid-template-columns:\s*calc\(var\(--space-4\) \+ var\(--space-0-5\)\) minmax\(0, 1fr\);[^}]*column-gap:\s*var\(--space-1\);/s)
+    expect(conversationStyles).toMatch(/\.tool-row-leading\s*\{[^}]*width:\s*var\(--icon-sm\);[^}]*margin-right:\s*var\(--space-1-5\);/s)
+    expect(conversationStyles).toMatch(/\.subagent-output-icon\s*\{[^}]*margin-top:\s*var\(--subagent-output-align-offset\);/s)
+    expect(conversationStyles).toMatch(/\.subagent-output-node::before\s*\{[^}]*var\(--subagent-output-align-offset\)/s)
+    expect(conversationStyles).toMatch(/\.subagent-output-node \.subagent-trace-junction\s*\{[^}]*var\(--subagent-output-align-offset\)/s)
 
     subagentCard!.open = true
     toolCard!.open = true
@@ -81,7 +115,7 @@ describe('MessageBlock subagent card', () => {
     expect(toolCard?.open).toBe(true)
   })
 
-  it('groups child tools in a collapsed card without exposing reasoning', async () => {
+  it('renders Task and SubAgent like a Tool row while keeping the Tool count trailing', async () => {
     const user = userEvent.setup()
     const { container } = render(
       <MessageBlock message={subagentMessage} childTools={[childTool]} />,
@@ -90,36 +124,46 @@ describe('MessageBlock subagent card', () => {
     const card = container.querySelector<HTMLDetailsElement>('.subagent-card')
     expect(card).not.toBeNull()
     expect(card?.open).toBe(false)
-    expect(screen.getByText('researcher')).toBeVisible()
-    expect(screen.getByText('1 个工具')).toBeVisible()
-    expect(screen.queryByText('已完成')).not.toBeInTheDocument()
-    expect(screen.getAllByLabelText('已完成')).toHaveLength(2)
+    const header = card?.querySelector('.subagent-card-head')
+    expect(within(header as HTMLElement).getByText('Task')).toHaveClass('tool-row-title')
+    expect(within(header as HTMLElement).getByText('SubAgent')).toHaveClass('tool-row-summary')
+    expect(within(header as HTMLElement).getByText('1 个工具')).toBeVisible()
+    expect(header?.querySelector('.subagent-card-chevron')).toBeNull()
+    expect(header).not.toHaveTextContent('访问两个 URL 并总结业务')
+    expect(card?.querySelector('.tool-row-state-dot')).toBeNull()
+    expect(card?.querySelector('.subagent-visually-hidden')).toHaveTextContent('researcher，已完成')
     expect(screen.queryByText('这段内部思考不应出现在子智能体卡片中')).not.toBeInTheDocument()
 
-    await user.click(screen.getByText('researcher'))
+    await user.click(card!.querySelector('.subagent-card-head')!)
 
     expect(card?.open).toBe(true)
-    expect(screen.getByText('访问两个 URL 并总结业务')).toBeVisible()
-    expect(screen.getByText('公司定位：中国最大的搜索引擎和 AI 科技公司。')).toBeVisible()
-    expect(screen.getByText('read_file')).toBeVisible()
-    expect(screen.getAllByRole('heading', { level: 4 }).map((heading) => heading.textContent)).toEqual([
-      '输入',
-      '工具轨迹 1',
-      '输出摘要',
-    ])
-
-    const expandAllButton = screen.getByRole('button', { name: '展开全部详情' })
-    expect(expandAllButton.querySelector('svg')).toBeNull()
-    await user.click(expandAllButton)
+    const task = container.querySelector('.subagent-task-line')
+    expect(task).toHaveTextContent('researcher访问两个 URL 并总结业务')
+    expect(task).not.toHaveTextContent('TASK')
+    const trace = screen.getByRole('list', { name: 'researcher 工具轨迹' })
+    expect(within(trace).getAllByRole('listitem')).toHaveLength(2)
+    const output = container.querySelector('.subagent-output-node')
+    expect(output).toHaveClass('is-completed')
+    expect(within(output as HTMLElement).getByText('已完成')).toBeVisible()
+    expect(within(output as HTMLElement).getByText('公司定位：中国最大的搜索引擎和 AI 科技公司。')).toBeVisible()
+    expect(screen.getByText('Read')).toBeVisible()
+    expect(screen.getByText('/research/url.json')).toBeVisible()
+    expect(screen.queryByRole('button', { name: '展开全部详情' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '收起全部详情' })).not.toBeInTheDocument()
 
     const toolDetails = container.querySelector<HTMLDetailsElement>('.subagent-tool-row')
-    expect(toolDetails?.querySelector('summary')).toHaveTextContent('read_file')
+    expect(toolDetails).toHaveAttribute('data-tool-name', 'read_file')
+    expect(toolDetails?.querySelector('summary')).toHaveTextContent('Read/research/url.json')
     expect(toolDetails?.querySelector('summary')).not.toHaveTextContent('researcher')
+    expect(toolDetails?.open).toBe(false)
+    await user.click(toolDetails!.querySelector('summary')!)
     expect(toolDetails?.open).toBe(true)
+    expect(container.querySelector('.subagent-trace-marker')).not.toBeInTheDocument()
+    expect(toolDetails?.querySelector('time')).not.toBeInTheDocument()
     expect(screen.getByText('{"file_path":"/research/url.json"}')).toBeVisible()
     expect(screen.getByText('https://www.baidu.com')).toBeVisible()
 
-    fireEvent.click(screen.getByRole('button', { name: '收起全部详情' }))
+    await user.click(toolDetails!.querySelector('summary')!)
     expect(toolDetails?.open).toBe(false)
   })
 
@@ -147,12 +191,104 @@ describe('MessageBlock subagent card', () => {
     expect(screen.queryByText('思考过程')).not.toBeInTheDocument()
   })
 
-  it('shows only the tool name in a standalone tool header', () => {
+  it('maps a standalone file tool to a compact title and parameter summary', () => {
     const { container } = render(<MessageBlock message={childTool} />)
     const summary = container.querySelector('.tool-card > summary')
 
-    expect(summary).toHaveTextContent('read_file')
+    expect(summary).toHaveTextContent('Read/research/url.json')
     expect(summary).not.toHaveTextContent('researcher')
+  })
+
+  it('uses distinct icons for every backend tool and a wrench for unknown tools', () => {
+    const definitions = [
+      ['ls', '{"path":"/"}', 'folder-tree'],
+      ['read_file', '{"file_path":"/a.md"}', 'file-text'],
+      ['write_file', '{"file_path":"/a.md"}', 'file-plus2'],
+      ['edit_file', '{"file_path":"/a.md"}', 'file-pen-line'],
+      ['delete', '{"file_path":"/a.md"}', 'trash2'],
+      ['glob', '{"pattern":"**/*.ts"}', 'folder-search'],
+      ['grep', '{"pattern":"needle"}', 'text-search'],
+      ['execute', '{"command":"pwd"}', 'square-terminal'],
+      ['web_search', '{"query":"LangGraph"}', 'earth'],
+      ['write_todos', '{"todos":[]}', 'list-checks'],
+      ['task', '{"description":"检索资料"}', 'bot'],
+      ['unknown_tool', '{"value":"x"}', 'wrench'],
+    ] as const
+    const { container } = render(<>{definitions.map(([toolName, params]) => (
+      <MessageBlock
+        key={toolName}
+        message={{
+          id: `tool-${toolName}`,
+          role: 'tool',
+          content: '',
+          createdAt: '2026-08-24T00:00:00.000Z',
+          meta: { toolName, params, result: '', status: 'completed' },
+        }}
+      />
+    ))}</>)
+
+    for (const [toolName, , icon] of definitions) {
+      const row = container.querySelector(`[data-tool-name="${toolName}"]`)
+      expect(row).not.toBeNull()
+      expect(row?.querySelector(`.lucide-${icon}`)).not.toBeNull()
+    }
+  })
+
+  it('keeps an expanded row open while streamed arguments and the final result update', async () => {
+    const user = userEvent.setup()
+    const running: Message = {
+      id: 'tool-search-stream',
+      role: 'tool',
+      content: '',
+      createdAt: '2026-08-24T00:00:00.000Z',
+      meta: {
+        toolName: 'web_search',
+        toolCallId: 'tool-search-stream',
+        params: '{"query":"Lang',
+        result: '',
+        status: 'running',
+      },
+    }
+    const { container, rerender } = render(<MessageBlock message={running} />)
+    const row = container.querySelector<HTMLDetailsElement>('.tool-card')!
+
+    await user.click(row.querySelector('summary')!)
+    expect(row.open).toBe(true)
+    const detailSections = row.querySelectorAll('.tool-detail-section')
+    expect(detailSections).toHaveLength(2)
+    expect(detailSections[0]).toHaveClass('tool-detail-section--params')
+    expect(detailSections[1]).toHaveClass('tool-detail-section--result')
+    expect(row.querySelector('.tool-code-field')).toHaveTextContent('{"query":"Lang')
+    expect(screen.getByLabelText('工具字段加载中')).toBeInTheDocument()
+    expect(conversationStyles).toMatch(/\.tool-detail-card\s*\{[^}]*margin:\s*var\(--space-2\) 0 var\(--space-1\) calc\(var\(--icon-sm\) \+ var\(--space-2\)\);[^}]*background:\s*var\(--color-layer-1\);[^}]*font-family:\s*var\(--font-ui\);/s)
+    expect(conversationStyles).toMatch(/\.tool-detail-section\s*\{[^}]*grid-template-columns:\s*calc\(var\(--space-12\) \+ var\(--space-2\)\) minmax\(0, 1fr\);[^}]*column-gap:\s*var\(--space-4\);[^}]*max-height:\s*150px;/s)
+    expect(conversationStyles).toMatch(/\.tool-detail-section--params\s*\{[^}]*background:\s*var\(--color-layer-2\);/s)
+    expect(conversationStyles).toMatch(/\.tool-detail-section--result\s*\{[^}]*background:\s*var\(--color-layer-1\);/s)
+    expect(conversationStyles).toMatch(/\.tool-code-field,[\s\S]*\.tool-rich-field\s*\{[^}]*font-family:\s*var\(--font-code\);[^}]*font-size:\s*var\(--type-caption-size\);/s)
+    expect(conversationStyles).toMatch(/@media \(max-width:\s*440px\)[\s\S]*\.tool-detail-card\s*\{[^}]*margin-left:\s*0;[^}]*\}[\s\S]*\.tool-detail-section\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\);[^}]*row-gap:\s*var\(--space-1-5\);/s)
+
+    rerender(<MessageBlock message={{
+      ...running,
+      meta: {
+        ...running.meta,
+        params: '{"query":"LangGraph"}',
+        result: '**完成** [文档](https://example.com)',
+        status: 'completed',
+      },
+    }} />)
+
+    expect(row.open).toBe(true)
+    expect(row.querySelector('summary')).toHaveTextContent('SearchLangGraph')
+    expect(screen.getByText('{"query":"LangGraph"}')).toBeVisible()
+    expect(screen.getByRole('link', { name: '文档' })).toHaveAttribute('href', 'https://example.com')
+  })
+
+  it('renders a batch as spaced rows without restoring an outer card', () => {
+    const { container } = render(<ToolCallBatch messages={[childTool, secondChildTool]} />)
+
+    expect(container.querySelectorAll('.tool-batch > .tool-card')).toHaveLength(2)
+    expect(conversationStyles).toMatch(/\.tool-batch\s*{[^}]*display:\s*flex;[^}]*gap:\s*var\(--space-4\)/s)
+    expect(conversationStyles).not.toMatch(/\.tool-batch\s*{[^}]*(?:border|box-shadow|background):/s)
   })
 
   it('explains that a paused tool has not executed yet', () => {
@@ -175,24 +311,138 @@ describe('MessageBlock subagent card', () => {
     expect(screen.getByText('等待审批后执行')).toBeInTheDocument()
   })
 
-  it('switches to collapse-all after every child tool is opened individually', async () => {
+  it('replaces a failed row summary with the first result line', () => {
+    const { container } = render(<MessageBlock message={{
+      ...childTool,
+      id: 'tool-read-file-failed',
+      meta: {
+        ...childTool.meta,
+        result: '读取失败\n权限不足',
+        status: 'failed',
+      },
+    }} />)
+
+    const row = container.querySelector('.tool-card')
+    expect(row?.querySelector('summary')).toHaveTextContent('Read读取失败')
+    expect(row?.querySelector('summary')).not.toHaveTextContent('/research/url.json')
+    expect(row?.querySelector('.tool-row-state-dot.is-failed')).not.toBeNull()
+  })
+
+  it('keeps child Tool disclosures independent without an expand-all control', async () => {
     const user = userEvent.setup()
     const { container } = render(
       <MessageBlock message={subagentMessage} childTools={[childTool, secondChildTool]} />,
     )
 
-    await user.click(screen.getByText('researcher'))
+    await user.click(container.querySelector('.subagent-card-head')!)
     const toolRows = Array.from(container.querySelectorAll<HTMLDetailsElement>('.subagent-tool-row'))
 
     await user.click(toolRows[0].querySelector('summary')!)
-    expect(screen.getByRole('button', { name: '展开全部详情' })).toHaveAttribute('aria-expanded', 'false')
+    expect(toolRows[0].open).toBe(true)
+    expect(toolRows[1].open).toBe(false)
 
     await user.click(toolRows[1].querySelector('summary')!)
-    expect(screen.getByRole('button', { name: '收起全部详情' })).toHaveAttribute('aria-expanded', 'true')
+    expect(toolRows.every((row) => row.open)).toBe(true)
 
-    await user.click(screen.getByRole('button', { name: '收起全部详情' }))
-    expect(toolRows.every((row) => !row.open)).toBe(true)
-    expect(screen.getByRole('button', { name: '展开全部详情' })).toHaveAttribute('aria-expanded', 'false')
+    await user.click(toolRows[0].querySelector('summary')!)
+    expect(toolRows[0].open).toBe(false)
+    expect(toolRows[1].open).toBe(true)
+    expect(screen.queryByRole('button', { name: '收起全部详情' })).not.toBeInTheDocument()
+  })
+
+  it('keeps the Agent and child Tool open while streamed Tool and Agent output settle', async () => {
+    const user = userEvent.setup()
+    const runningAgent: Message = {
+      ...subagentMessage,
+      meta: { ...subagentMessage.meta, result: '', status: 'running' },
+    }
+    const runningTool: Message = {
+      ...childTool,
+      meta: {
+        ...childTool.meta,
+        params: '{"file_path":"/research',
+        result: '',
+        status: 'running',
+      },
+    }
+    const { container, rerender } = render(
+      <MessageBlock message={runningAgent} childTools={[runningTool]} />,
+    )
+    const agent = container.querySelector<HTMLDetailsElement>('.subagent-card')!
+
+    await user.click(agent.querySelector('.subagent-card-head')!)
+    const tool = container.querySelector<HTMLDetailsElement>('.subagent-tool-row')!
+    await user.click(tool.querySelector('summary')!)
+    expect(agent.open).toBe(true)
+    expect(tool.open).toBe(true)
+    expect(agent.querySelector('.tool-row-state-dot')).toBeNull()
+
+    rerender(<MessageBlock
+      message={{
+        ...runningAgent,
+        meta: {
+          ...runningAgent.meta,
+          result: '研究完成，查看[报告](https://example.com/report)',
+          status: 'completed',
+        },
+      }}
+      childTools={[{
+        ...runningTool,
+        meta: {
+          ...runningTool.meta,
+          params: '{"file_path":"/research/url.json"}',
+          result: '读取完成',
+          status: 'completed',
+        },
+      }]}
+    />)
+
+    expect(agent.open).toBe(true)
+    expect(tool.open).toBe(true)
+    expect(agent.querySelector('.tool-row-state-dot')).toBeNull()
+    expect(agent.querySelector('.subagent-output-node')).toHaveClass('is-completed')
+    expect(screen.getByText('{"file_path":"/research/url.json"}')).toBeVisible()
+    expect(screen.getByText('读取完成')).toBeVisible()
+    expect(screen.getByRole('link', { name: '报告' })).toHaveAttribute('href', 'https://example.com/report')
+  })
+
+  it('uses a direct terminal node when no Tool exists and exposes every Agent state', async () => {
+    const user = userEvent.setup()
+    const running: Message = {
+      ...subagentMessage,
+      content: '等待研究任务',
+      meta: {
+        ...subagentMessage.meta,
+        input: undefined,
+        result: '',
+        status: 'running',
+      },
+    }
+    const { container, rerender } = render(<MessageBlock message={running} childTools={[]} />)
+    const agent = container.querySelector<HTMLDetailsElement>('.subagent-card')!
+    await user.click(agent.querySelector('.subagent-card-head')!)
+
+    expect(agent.querySelector('.subagent-task-line')).toBeNull()
+    expect(agent.querySelector('.subagent-trace-list')).toHaveClass('is-tool-empty')
+    expect(agent.querySelector('.subagent-tool-node')).toBeNull()
+    expect(agent.querySelector('.subagent-output-node')).toHaveClass('is-running')
+    expect(screen.getByLabelText('正在运行')).toBeInTheDocument()
+
+    rerender(<MessageBlock message={{
+      ...running,
+      meta: { ...running.meta, result: '等待用户确认', status: 'paused' },
+    }} childTools={[]} />)
+    expect(agent.querySelector('.tool-row-state-dot.is-paused')).not.toBeNull()
+    expect(agent.querySelector('.subagent-output-node')).toHaveClass('is-paused')
+
+    rerender(<MessageBlock message={{
+      ...running,
+      meta: { ...running.meta, result: '子 Agent 执行失败', status: 'failed' },
+    }} childTools={[]} />)
+    expect(agent.querySelector('.tool-row-state-dot.is-failed')).not.toBeNull()
+    expect(agent.querySelector('.subagent-output-node')).toHaveClass('is-failed')
+    expect(within(agent.querySelector('.subagent-output-node')!).getByText('执行失败')).toBeVisible()
+    expect(conversationStyles).toMatch(/\.subagent-trace-output\s*{[^}]*max-height:\s*180px;[^}]*overflow:\s*auto;/s)
   })
 })
 

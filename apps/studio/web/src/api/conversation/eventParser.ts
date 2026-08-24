@@ -17,11 +17,16 @@ const isStringArray = (value: unknown): value is string[] => (
 )
 
 const isJsonValue = (value: unknown): value is JsonValue => {
-  const pending: unknown[] = [value]
-  const visited = new Set<object>()
+  const pending: Array<{ value: unknown; leaving: boolean }> = [{
+    value,
+    leaving: false,
+  }]
+  const activeAncestors = new Set<object>()
 
   while (pending.length > 0) {
-    const current = pending.pop()
+    const frame = pending.pop()
+    if (!frame) continue
+    const current = frame.value
     if (
       current === null
       || typeof current === 'string'
@@ -30,11 +35,16 @@ const isJsonValue = (value: unknown): value is JsonValue => {
     ) continue
 
     if (typeof current !== 'object') return false
-    if (visited.has(current)) return false
-    visited.add(current)
+    if (frame.leaving) {
+      activeAncestors.delete(current)
+      continue
+    }
+    if (activeAncestors.has(current)) return false
+    activeAncestors.add(current)
+    pending.push({ value: current, leaving: true })
 
-    if (Array.isArray(current)) pending.push(...current)
-    else pending.push(...Object.values(current))
+    const children = Array.isArray(current) ? current : Object.values(current)
+    for (const child of children) pending.push({ value: child, leaving: false })
   }
 
   return true
@@ -58,16 +68,36 @@ const hasOptionalBoolean = (value: Record<string, unknown>, key: string) => (
 
 const isEventSourceInfo = (value: unknown): value is EventSourceInfo => {
   if (!isRecord(value)) return false
-  return (value.agentType === 'main' || value.agentType === 'subagent')
-    && typeof value.agentName === 'string'
-    && isStringArray(value.namespace)
-    && hasOptionalString(value, 'graphTaskId', true)
+  const namespace = value.namespace
+  if (!isStringArray(namespace)) return false
+  const commonFieldsValid = hasOptionalString(value, 'graphTaskId', true)
+    && hasOptionalString(value, 'nodeName', true)
     && (value.parentNamespace === undefined
       || value.parentNamespace === null
       || isStringArray(value.parentNamespace))
     && hasOptionalString(value, 'parentToolCallId', true)
     && hasOptionalString(value, 'subagentInput', true)
     && hasOptionalString(value, 'subagentInvocationId', true)
+  if (!commonFieldsValid) return false
+
+  switch (value.kind) {
+    case 'root':
+      return namespace.length === 0
+        && value.agentType === 'main'
+        && typeof value.agentName === 'string'
+        && value.agentName.length > 0
+    case 'compiled_subgraph':
+      return namespace.length > 0
+        && value.agentType === undefined
+        && value.agentName === undefined
+    case 'deep_agent_subagent':
+      return namespace.length > 0
+        && value.agentType === 'subagent'
+        && typeof value.agentName === 'string'
+        && value.agentName.length > 0
+    default:
+      return false
+  }
 }
 
 const isRawEventContext = (value: unknown): value is RawEventContext => {

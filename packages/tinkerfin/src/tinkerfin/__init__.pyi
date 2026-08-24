@@ -31,6 +31,8 @@ from .errors import TinkerFinStreamProtocolError as TinkerFinStreamProtocolError
 from .plan import AgentMode as AgentMode
 from .plan import ClarificationFormBase as _ClarificationFormBase
 from .plan import DefaultClarificationForm as _DefaultClarificationForm
+from .plan import PlanContentModel as _PlanContentModel
+from .plan import StructuredPlanContent as _StructuredPlanContent
 from .runtime import AgUiEventStream as AgUiEventStream
 from .runtime import AgUiNativeStreamConfig as AgUiNativeStreamConfig
 from .runtime import (
@@ -60,6 +62,7 @@ class TinkerFin(_RuntimeTinkerFin):
         default_mode: AgentMode = "default",
         planner_model: str | BaseChatModel | None = None,
         clarification_schema: type[_ClarificationFormBase] = _DefaultClarificationForm,
+        plan_schema: type[_PlanContentModel] = _StructuredPlanContent,
     ) -> TinkerFin: ...
     def create_deep_agent(
         self,

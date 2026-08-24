@@ -11,6 +11,7 @@ import {
 } from '../../auth/session'
 import { API_BASE_URL, buildApiUrl } from './config'
 import { GLOBAL_ERROR_CODES } from './errorCodes'
+import { translateCurrent } from '../../i18n'
 
 interface ApiEnvelope<T> {
   code: number
@@ -97,7 +98,7 @@ function handleAuthFailure(error: ApiError, policy: ErrorPolicy) {
   if (!policy.suppressAuthFailure) {
     notifyAuthFailure({
       code: error.code,
-      message: error.message || '登录已失效，请重新登录。',
+      message: error.message || translateCurrent('登录已失效，请重新登录。'),
     })
   }
 }
@@ -117,7 +118,7 @@ function apiErrorFromEnvelope(
 ) {
   const ErrorType = isAuthFailure(status) ? AuthError : ApiError
   return finalizeError(
-    new ErrorType(payload.message || '请求处理失败', {
+    new ErrorType(payload.message || translateCurrent('请求处理失败'), {
       code: payload.code,
       status,
     }),
@@ -128,7 +129,7 @@ function apiErrorFromEnvelope(
 function unwrapApiEnvelope<T>(payload: unknown, status: number, policy: ErrorPolicy): T {
   if (!isApiEnvelope(payload) || payload.code !== GLOBAL_ERROR_CODES.success) {
     throw finalizeError(
-      new ApiError('接口返回格式不合法', {
+      new ApiError(translateCurrent('接口返回格式不合法'), {
         code: GLOBAL_ERROR_CODES.internalServerError,
         status,
       }),
@@ -159,12 +160,12 @@ function requestPolicy(config?: ApiAxiosRequestConfig): ErrorPolicy {
 }
 
 function transportErrorMessage(status: number) {
-  if (status === GLOBAL_ERROR_CODES.unauthorized) return '请先登录'
-  if (status === GLOBAL_ERROR_CODES.forbidden) return '没有该操作权限'
-  if (status === 404) return '请求未找到'
-  if (status === 429) return '请求过于频繁，请稍后重试'
-  if (status >= 500) return '服务暂不可用，请稍后重试。'
-  return `请求失败 (${status})`
+  if (status === GLOBAL_ERROR_CODES.unauthorized) return translateCurrent('请先登录')
+  if (status === GLOBAL_ERROR_CODES.forbidden) return translateCurrent('没有该操作权限')
+  if (status === 404) return translateCurrent('请求未找到')
+  if (status === 429) return translateCurrent('请求过于频繁，请稍后重试')
+  if (status >= 500) return translateCurrent('服务暂不可用，请稍后重试。')
+  return translateCurrent('请求失败 ({status})', { status })
 }
 
 const currentOrigin = typeof window === 'undefined' ? 'http://localhost' : window.location.origin
@@ -187,7 +188,7 @@ apiClient.interceptors.request.use((config) => {
   const authorization = getAuthorizationHeader()
   if (!authorization) {
     return Promise.reject(finalizeError(
-      new AuthError('请先登录', {
+      new AuthError(translateCurrent('请先登录'), {
         code: GLOBAL_ERROR_CODES.unauthorized,
         status: GLOBAL_ERROR_CODES.unauthorized,
       }),
@@ -215,7 +216,7 @@ apiClient.interceptors.response.use(
 
     if (!axios.isAxiosError(reason)) {
       return Promise.reject(finalizeError(
-        new ApiError('网络请求失败，请稍后重试。', { status: 0 }),
+        new ApiError(translateCurrent('网络请求失败，请稍后重试。'), { status: 0 }),
         {},
       ))
     }
@@ -229,7 +230,7 @@ apiClient.interceptors.response.use(
 
     if (status === 0) {
       return Promise.reject(finalizeError(
-        new ApiError('网络请求失败，请稍后重试。', { status: 0 }),
+        new ApiError(translateCurrent('网络请求失败，请稍后重试。'), { status: 0 }),
         policy,
       ))
     }
@@ -268,7 +269,7 @@ function buildStreamHeaders(options: RequestOptions, contentType: string | null)
     const authorization = getAuthorizationHeader()
     if (!authorization) {
       throw finalizeError(
-        new AuthError('请先登录', {
+        new AuthError(translateCurrent('请先登录'), {
           code: GLOBAL_ERROR_CODES.unauthorized,
           status: GLOBAL_ERROR_CODES.unauthorized,
         }),
@@ -296,7 +297,7 @@ async function fetchStreamResponse(path: string, options: RequestOptions) {
   } catch (error) {
     if (error instanceof DOMException && error.name === 'AbortError') throw error
     throw finalizeError(
-      new ApiError('网络请求失败，请稍后重试。', { status: 0 }),
+      new ApiError(translateCurrent('网络请求失败，请稍后重试。'), { status: 0 }),
       options,
     )
   }
@@ -307,7 +308,7 @@ async function parseJsonPayload(response: Response, policy: ErrorPolicy) {
     return await response.json()
   } catch {
     throw finalizeError(
-      new ApiError('接口返回的 JSON 无法解析', {
+      new ApiError(translateCurrent('接口返回的 JSON 无法解析'), {
         code: GLOBAL_ERROR_CODES.internalServerError,
         status: response.status,
       }),
@@ -379,7 +380,7 @@ export async function requestEventStream(path: string, options: RequestOptions =
       return buildStreamHttpError(response, policy)
     }
     throw finalizeError(
-      new ApiError('聊天接口返回了非流式成功响应', {
+      new ApiError(translateCurrent('聊天接口返回了非流式成功响应'), {
         code: response.status || GLOBAL_ERROR_CODES.internalServerError,
         status: response.status,
       }),
@@ -391,7 +392,7 @@ export async function requestEventStream(path: string, options: RequestOptions =
 
   await cancelUnreadBody(response)
   throw finalizeError(
-    new ApiError('聊天接口返回了不支持的响应类型', {
+    new ApiError(translateCurrent('聊天接口返回了不支持的响应类型'), {
       code: response.status || GLOBAL_ERROR_CODES.internalServerError,
       status: response.status,
     }),

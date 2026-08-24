@@ -3,7 +3,7 @@ import { forwardRef } from 'react'
 import type { ButtonHTMLAttributes, ReactNode } from 'react'
 
 export type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger' | 'text'
-export type ButtonSize = 'sm' | 'md' | 'lg' | 'xl'
+export type ButtonSize = 'xs' | 'sm' | 'md' | 'lg' | 'xl'
 export type ButtonShape = 'round' | 'capsule' | 'circle'
 
 export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
@@ -18,7 +18,7 @@ export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
 
 export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button({
   variant = 'secondary',
-  size = 'lg',
+  size = 'xs',
   shape = 'round',
   loading = false,
   selected = false,

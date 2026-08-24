@@ -32,6 +32,11 @@ describe('TaskDrawer', () => {
   it('persists a valid split ratio per thread and restores it after remount', async () => {
     const first = render(<TaskDrawer conversation={conversation('thread-a')} />)
     const drawer = screen.getByLabelText('任务抽屉')
+    expect(Array.from(drawer.querySelectorAll('.panel-scroll'))).toHaveLength(2)
+    for (const scrollRegion of drawer.querySelectorAll('.panel-scroll')) {
+      expect(scrollRegion).toHaveClass('ui-scrollbar')
+    }
+    expect(drawer.querySelectorAll('.ui-scrollbar-overlay')).toHaveLength(2)
     vi.spyOn(drawer, 'getBoundingClientRect').mockReturnValue({
       top: 0,
       height: 800,

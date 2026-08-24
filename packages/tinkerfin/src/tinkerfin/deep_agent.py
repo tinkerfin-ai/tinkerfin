@@ -283,11 +283,15 @@ class DeepAgentDefinition(Generic[GraphT, AstreamT]):
         plan_factory = self._plan_factory
         if plan_factory is None:
             return native_astream
+        plan_options = self._plan_options
+        if plan_options is None:
+            raise RuntimeError("Plan factory requires frozen Plan options")
 
         from .plan._runtime import PlanCapableGraphRuntime
         from .plan._workflow import PlanningWorkflowGraph
 
         runtime = PlanCapableGraphRuntime(
+            content=plan_options.content,
             native=cast(_PlanNativeGraph, native),
             planning_factory=lambda: cast(
                 PlanningWorkflowGraph[Any],

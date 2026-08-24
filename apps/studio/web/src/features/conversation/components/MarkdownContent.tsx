@@ -9,15 +9,18 @@ import {
   useState,
 } from 'react'
 import type { ReactNode } from 'react'
+import type { ComponentPropsWithoutRef } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 
 import { Button } from '../../../components/ui'
 import { COPY_FEEDBACK_DURATION_MS } from './copyFeedback'
+import { useI18n } from '../../../i18n'
 
 export type MarkdownVariant = 'article' | 'compact'
 
 const bareAsciiUrl = /^(https?:\/\/[A-Za-z0-9.-]+(?::\d+)?(?:[/?#][A-Za-z0-9\-._~:/?#[\]@!$&'()*+,;=%]*)?)([\s\S]*)$/i
+const bareUrlClassName = 'markdown-bare-url'
 
 function splitBareUrl(children: ReactNode) {
   const text = typeof children === 'string'
@@ -62,6 +65,7 @@ function textFromNode(node: ReactNode): string {
 type CopyState = 'idle' | 'copied' | 'failed'
 
 function CodeBlock({ children }: { children: ReactNode }) {
+  const { t } = useI18n()
   const child = Children.count(children) === 1
     ? Children.only(children)
     : children
@@ -91,7 +95,7 @@ function CodeBlock({ children }: { children: ReactNode }) {
   return (
     <figure className="markdown-code-block">
       <figcaption className="markdown-code-block__head">
-        <span>{language || '文本'}</span>
+        <span>{language || t('文本')}</span>
         <Button
           variant="ghost"
           size="sm"
@@ -103,7 +107,7 @@ function CodeBlock({ children }: { children: ReactNode }) {
               : <Copy size={14} />}
           onClick={() => void copyCode()}
         >
-          {copyState === 'copied' ? '已复制' : copyState === 'failed' ? '复制失败' : '复制'}
+          {copyState === 'copied' ? t('已复制') : copyState === 'failed' ? t('复制失败') : t('复制')}
         </Button>
       </figcaption>
       <pre>{children}</pre>
@@ -120,17 +124,27 @@ function MarkdownContentView({
   className?: string
   variant?: MarkdownVariant
 }) {
+  const { t } = useI18n()
   const components = useMemo(() => ({
     a({ children, href }: { children?: ReactNode; href?: string }) {
       const bareUrl = splitBareUrl(children)
       if (bareUrl && isLiteralAutolink(href, bareUrl.literal)) {
-        return <><a href={bareUrl.url} {...externalLinkProps(bareUrl.url)}>{bareUrl.url}</a>{bareUrl.suffix}</>
+        return <><a className={bareUrlClassName} href={bareUrl.url} {...externalLinkProps(bareUrl.url)}>{bareUrl.url}</a>{bareUrl.suffix}</>
       }
-      return <a href={href} {...externalLinkProps(href)}>{children}</a>
+      const literal = textFromNode(children)
+      return (
+        <a
+          className={isLiteralAutolink(href, literal) ? bareUrlClassName : undefined}
+          href={href}
+          {...externalLinkProps(href)}
+        >
+          {children}
+        </a>
+      )
     },
     table({ children }: { children?: ReactNode }) {
       return (
-        <div className="markdown-table-wrap" role="region" tabIndex={0} aria-label="可横向滚动的表格">
+        <div className="markdown-table-wrap" role="region" tabIndex={0} aria-label={t('可横向滚动的表格')}>
           <table>{children}</table>
         </div>
       )
@@ -138,7 +152,12 @@ function MarkdownContentView({
     pre({ children }: { children?: ReactNode }) {
       return <CodeBlock>{children}</CodeBlock>
     },
-  }), [])
+    input({ type, ...props }: ComponentPropsWithoutRef<'input'>) {
+      return type === 'checkbox'
+        ? <input {...props} type={type} aria-hidden="true" tabIndex={-1} />
+        : <input {...props} type={type} />
+    },
+  }), [t])
   const classes = [
     'markdown-content',
     `markdown-content--${variant}`,

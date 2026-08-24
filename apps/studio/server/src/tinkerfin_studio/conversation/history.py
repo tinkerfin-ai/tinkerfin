@@ -31,11 +31,13 @@ from tinkerfin_studio.conversation.run_preparation import conversation_identity
 from tinkerfin_studio.conversation.schemas import (
     ConversationEventEnvelope,
     ConversationHistoryDetail,
+    ConversationHistoryGroupConfig,
     ConversationHistoryListItem,
     ConversationHistoryListResponse,
 )
 
 _HISTORY_PAGE_SIZE_MAX = 100
+_HISTORY_DAY_RANGES = (7, 30)
 _EVENT_LIMIT_MAX = 1000
 _SNAPSHOT_VERSION = 3
 _EVENT_SCHEMA_VERSION = 3
@@ -52,6 +54,11 @@ class _HistoryCursorPayload(BaseModel):
         alias="updatedAt", description="游标行的无时区数据库更新时间"
     )
     row_id: int = Field(alias="id", gt=0, description="游标行数据库主键")
+    query: str | None = Field(
+        default=None,
+        max_length=255,
+        description="游标所属的规范化标题查询词",
+    )
 
     @field_validator("updated_at")
     @classmethod
@@ -145,23 +152,36 @@ class ConversationHistoryService:
         *,
         page_size: int,
         cursor: str | None,
+        query: str | None = None,
     ) -> ConversationHistoryListResponse:
-        """按置顶和更新时间稳定分页"""
+        """按标题查询、置顶和更新时间稳定分页"""
 
-        resolved = self._decode_cursor(cursor)
+        resolved_query = (query.strip() or None) if query is not None else None
+        resolved = self._decode_cursor(cursor, query=resolved_query)
         resolved_page_size = min(max(page_size, 1), _HISTORY_PAGE_SIZE_MAX)
         threads = await self._repository.list_threads(
             user_id=self._user_id,
             page_size=resolved_page_size,
             cursor=resolved,
+            query=resolved_query,
         )
         has_more = len(threads) > resolved_page_size
         page = threads[:resolved_page_size]
-        next_cursor = self._encode_cursor(page[-1]) if has_more and page else None
+        next_cursor = (
+            self._encode_cursor(page[-1], query=resolved_query)
+            if has_more and page
+            else None
+        )
         return ConversationHistoryListResponse(
             items=[_history_item(thread) for thread in page],
             nextCursor=next_cursor,
         )
+
+    @staticmethod
+    def group_config() -> ConversationHistoryGroupConfig:
+        """返回前端按本地自然日分组使用的服务端范围"""
+
+        return ConversationHistoryGroupConfig(dayRanges=list(_HISTORY_DAY_RANGES))
 
     async def get_detail(self, thread_id: str) -> ConversationHistoryDetail:
         """追赶事件后返回可信快照和尾部"""
@@ -250,19 +270,28 @@ class ConversationHistoryService:
         return thread
 
     @staticmethod
-    def _encode_cursor(thread: ConversationThread) -> str:
+    def _encode_cursor(
+        thread: ConversationThread,
+        *,
+        query: str | None = None,
+    ) -> str:
         payload = json.dumps(
             {
                 "pinned": thread.pinned,
                 "updatedAt": thread.updated_at.isoformat(),
                 "id": thread.id,
+                "query": query,
             },
             separators=(",", ":"),
         )
         return base64.urlsafe_b64encode(payload.encode()).decode()
 
     @staticmethod
-    def _decode_cursor(value: str | None) -> tuple[bool, datetime, int] | None:
+    def _decode_cursor(
+        value: str | None,
+        *,
+        query: str | None = None,
+    ) -> tuple[bool, datetime, int] | None:
         if value is None:
             return None
         try:
@@ -272,6 +301,8 @@ class ConversationHistoryService:
                 validate=True,
             )
             payload = _HistoryCursorPayload.model_validate_json(decoded, strict=True)
+            if payload.query != query:
+                raise ValueError("游标查询词与当前请求不一致")
             return payload.pinned, payload.updated_at, payload.row_id
         except (ValueError, TypeError, ValidationError):
             raise BusinessException(ConversationErrorCode.INVALID_CURSOR) from None

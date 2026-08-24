@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from typing import Any, Protocol, TypeAlias, cast
 
@@ -12,6 +13,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
 
+from ._content import PlanContentBinding
 from ._state import (
     PLAN_CHECKPOINT_RUN_ID,
     PLAN_STATE_KEY,
@@ -19,7 +21,7 @@ from ._state import (
 )
 from ._workflow import PlanningWorkflowGraph
 from .errors import PlanModeConfigurationError
-from .models import PlanState, PlanStatus
+from .models import MarkdownPlanContent, PlanContentModel, PlanState, PlanStatus
 
 _APPROVED_PLAN_MARKER = "<tinkerfin-approved-plan"
 _CheckpointSaver: TypeAlias = (
@@ -116,11 +118,12 @@ async def _plan_checkpoint_channels(
 async def _native_plan_overlay(
     native: _GraphRuntime,
     config: RunnableConfig,
-) -> PlanState | None:
+    content: PlanContentBinding,
+) -> PlanState[PlanContentModel] | None:
     state = await _plan_checkpoint_channels(native.checkpointer, config)
     if PLAN_STATE_KEY not in state:
         return None
-    plan = read_plan_state(state)
+    plan = read_plan_state(state, content)
     if plan.status is PlanStatus.APPROVED:
         handoff = plan.handoff
         if handoff is None or not handoff.dispatched:
@@ -129,25 +132,42 @@ async def _native_plan_overlay(
     return plan if plan.status is PlanStatus.CANCELLED else None
 
 
-def _handoff_text(plan: PlanState) -> str:
+def _handoff_text(
+    plan: PlanState[PlanContentModel],
+    content_binding: PlanContentBinding,
+) -> str:
     confirmed = plan.confirmed_plan
     handoff = plan.handoff
     if confirmed is None or handoff is None:
         raise RuntimeError("approved Plan state requires a confirmed handoff")
+    if confirmed.content_schema != content_binding.reference:
+        raise RuntimeError("approved Plan content schema does not match the Definition")
+    content = confirmed.content
+    if confirmed.content_schema.media_type == "text/markdown":
+        if not isinstance(content, MarkdownPlanContent):
+            raise RuntimeError("Markdown Plan handoff requires MarkdownPlanContent")
+        rendered = content.markdown
+    else:
+        rendered = json.dumps(
+            content.model_dump(mode="json", by_alias=True, exclude_none=False),
+            ensure_ascii=False,
+            indent=2,
+        )
     return (
-        f'{_APPROVED_PLAN_MARKER} digest="{handoff.digest}">\n'
+        f'{_APPROVED_PLAN_MARKER} digest="{handoff.digest}" '
+        f'content-type="{confirmed.content_schema.media_type}" '
+        f'schema="{confirmed.content_schema.id}" '
+        f'revision="{confirmed.revision}">\n'
         "Plan review is complete and approval has already been granted. Begin native "
         "Deep Agent execution now. Do not restate the Plan or request general Plan "
         "approval again. Tool-specific human review remains mandatory. Treat this "
         "approved Plan as the governing task contract and do not silently change its "
-        "goal, steps, assumptions, or acceptance criteria.\n\n"
-        + confirmed.model_dump_json(by_alias=True, indent=2)
-        + "\n</tinkerfin-approved-plan>"
+        "content.\n\n" + rendered + "\n</tinkerfin-approved-plan>"
     )
 
 
 def _content_contains_handoff(content: object, digest: str) -> bool:
-    marker = f'{_APPROVED_PLAN_MARKER} digest="{digest}">'
+    marker = f'{_APPROVED_PLAN_MARKER} digest="{digest}"'
     if isinstance(content, str):
         return marker in content
     if isinstance(content, Sequence) and not isinstance(content, (str, bytes)):
@@ -163,7 +183,8 @@ def _content_contains_handoff(content: object, digest: str) -> bool:
 
 def _handoff_message(
     state: Mapping[str, object],
-    plan: PlanState,
+    plan: PlanState[PlanContentModel],
+    content_binding: PlanContentBinding,
 ) -> HumanMessage | None:
     handoff = plan.handoff
     if handoff is None:
@@ -181,7 +202,7 @@ def _handoff_message(
     message = matches[0]
     if _content_contains_handoff(message.content, handoff.digest):
         return None
-    instruction = _handoff_text(plan)
+    instruction = _handoff_text(plan, content_binding)
     if isinstance(message.content, str):
         content: object = f"{message.content}\n\n{instruction}"
     elif isinstance(message.content, list):
@@ -193,7 +214,7 @@ def _handoff_message(
 
 def _overlay_plan(
     part: Mapping[str, object],
-    plan: PlanState,
+    plan: PlanState[PlanContentModel],
 ) -> Mapping[str, object]:
     if part.get("type") != "values" or part.get("ns") != ():
         return part
@@ -222,15 +243,23 @@ class PlanCapableGraphRuntime:
     Store, cache, backend, and context.
     """
 
-    __slots__ = ("_native", "_planning_factory", "_prefer_plan", "_signature")
+    __slots__ = (
+        "_content",
+        "_native",
+        "_planning_factory",
+        "_prefer_plan",
+        "_signature",
+    )
 
     def __init__(
         self,
         *,
+        content: PlanContentBinding,
         native: _GraphRuntime,
         planning_factory: Callable[[], PlanningWorkflowGraph[Any]],
         prefer_plan: bool,
     ) -> None:
+        self._content = content
         self._native = native
         self._planning_factory = planning_factory
         self._prefer_plan = prefer_plan
@@ -259,7 +288,11 @@ class PlanCapableGraphRuntime:
         if _is_tool_resume(graph_input) or (
             not self._prefer_plan and not _is_plan_resume(graph_input)
         ):
-            overlay = await _native_plan_overlay(self._native, _config(bound))
+            overlay = await _native_plan_overlay(
+                self._native,
+                _config(bound),
+                self._content,
+            )
             async for part in self._native.astream(*bound.args, **bound.kwargs):
                 yield part if overlay is None else _overlay_plan(part, overlay)
             return
@@ -267,7 +300,7 @@ class PlanCapableGraphRuntime:
         planning = self._planning_factory()
         checkpoint_state = await _checkpoint_state(planning, _config(bound))
         checkpoint_plan = (
-            read_plan_state(checkpoint_state)
+            read_plan_state(checkpoint_state, self._content)
             if PLAN_STATE_KEY in checkpoint_state
             else None
         )
@@ -286,7 +319,7 @@ class PlanCapableGraphRuntime:
                     if not isinstance(data, Mapping):
                         raise TypeError("Planning root values data must be a mapping")
                     final_state = cast(Mapping[str, object], data)
-                    final_plan = read_plan_state(final_state)
+                    final_plan = read_plan_state(final_state, self._content)
                     interrupted = bool(part.get("interrupts", ()))
                 yield part
             if interrupted:
@@ -314,7 +347,7 @@ class PlanCapableGraphRuntime:
                 "interrupts": (),
             }
             return
-        message = _handoff_message(final_state, final_plan)
+        message = _handoff_message(final_state, final_plan, self._content)
         if message is None:
             raise RuntimeError("undispatched Plan already appears in native messages")
         final_plan = await planning.mark_handoff_dispatched(

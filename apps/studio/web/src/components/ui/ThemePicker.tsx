@@ -3,15 +3,10 @@ import gsap from 'gsap'
 import { Monitor, MoonStar, Sun } from 'lucide-react'
 import { useCallback, useEffect, useId, useRef, useState } from 'react'
 
-import {
-  applyThemePreference,
-  persistThemePreference,
-  readThemePreference,
-  subscribeToSystemTheme,
-  THEME_MEDIA_QUERY,
-  type ThemePreference,
-} from '../../theme'
+import type { ThemePreference } from '../../theme'
+import { useI18n } from '../../i18n'
 import { MOTION_DURATION_MS, MOTION_DURATION_SECONDS } from './motion'
+import { useThemePreference } from './useThemePreference'
 
 gsap.registerPlugin(useGSAP)
 
@@ -26,7 +21,8 @@ const THEME_OPTIONS = [
 }>
 
 export function ThemePicker() {
-  const [preference, setPreference] = useState<ThemePreference>(readThemePreference)
+  const { t } = useI18n()
+  const { preference, selectPreference } = useThemePreference()
   const [isExpanded, setIsExpanded] = useState(false)
   const [isExpansionSettled, setExpansionSettled] = useState(false)
   const optionName = useId()
@@ -59,12 +55,6 @@ export function ThemePicker() {
       else animation.reverse()
     })
   }, [])
-
-  useEffect(() => {
-    const mediaQuery = window.matchMedia(THEME_MEDIA_QUERY)
-    applyThemePreference(preference, mediaQuery)
-    return subscribeToSystemTheme(preference, mediaQuery)
-  }, [preference])
 
   useEffect(() => () => {
     if (expansionSettleTimerRef.current != null) {
@@ -142,13 +132,6 @@ export function ThemePicker() {
     revertOnUpdate: true,
   })
 
-  const selectPreference = (nextPreference: ThemePreference) => {
-    persistThemePreference(nextPreference)
-    applyThemePreference(nextPreference)
-    setPreference(nextPreference)
-    updateExpansion(false)
-  }
-
   return (
     <fieldset
       ref={switcherRef}
@@ -179,7 +162,7 @@ export function ThemePicker() {
         if (!event.currentTarget.contains(event.relatedTarget as Node | null)) updateExpansion(false)
       }}
     >
-      <legend className="theme-switcher-legend">主题</legend>
+      <legend className="theme-switcher-legend">{t('主题')}</legend>
       <span className="theme-switcher-panel">
         <span className="theme-switcher-circle" aria-hidden="true" />
         <span className="theme-switcher-surface" aria-hidden="true" />
@@ -193,7 +176,7 @@ export function ThemePicker() {
               className={`theme-switcher-option${isSelected ? ' is-selected' : ''}`}
               data-theme-option={option.value}
               htmlFor={optionId}
-              title={option.label}
+              title={t(option.label)}
             >
               <input
                 id={optionId}
@@ -201,9 +184,12 @@ export function ThemePicker() {
                 type="radio"
                 name={optionName}
                 value={option.value}
-                aria-label={option.label}
+                aria-label={t(option.label)}
                 checked={isSelected}
-                onChange={() => selectPreference(option.value)}
+                onChange={() => {
+                  selectPreference(option.value)
+                  updateExpansion(false)
+                }}
                 onClick={(event) => {
                   if (lastPointerTypeRef.current === 'touch' && !isExpansionSettled) {
                     event.preventDefault()

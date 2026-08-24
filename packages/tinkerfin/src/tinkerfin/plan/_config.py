@@ -8,6 +8,8 @@ from typing import Literal, TypeAlias
 from langchain_core.language_models import BaseChatModel
 
 from ._clarification import ClarificationSchemaBinding
+from ._content import PlanContentBinding
+from ._contracts import PlanContractBinding
 from .errors import PlanModeConfigurationError
 
 AgentMode: TypeAlias = Literal["default", "plan"]
@@ -18,6 +20,8 @@ class PlanOptions:
     """Definition-level options shared by every run of one Plan-capable agent."""
 
     clarification: ClarificationSchemaBinding
+    content: PlanContentBinding
+    contracts: PlanContractBinding
     default_mode: AgentMode = "default"
     planner_model: str | BaseChatModel | None = None
 

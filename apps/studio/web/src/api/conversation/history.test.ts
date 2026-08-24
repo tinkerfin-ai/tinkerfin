@@ -4,6 +4,7 @@ import {
   deleteConversation,
   fetchConversationEvents,
   fetchConversationHistoryDetail,
+  fetchConversationHistoryGroupConfig,
   fetchConversationHistoryList,
   patchConversation,
 } from './history'
@@ -23,7 +24,7 @@ describe('conversation history client', () => {
       token: 'history-token',
       tokenType: 'Bearer',
       expiresAt: '2099-01-01T00:00:00.000Z',
-      user: { user_id: 7, username: 'yunsan', display_name: '云杉', roles: [], disabled: false },
+      user: { user_id: 7, username: 'yunsan', display_name: '云杉', avatar_url: null, roles: [], disabled: false },
     })
   })
 
@@ -34,6 +35,7 @@ describe('conversation history client', () => {
 
   it.each([
     ['list', () => fetchConversationHistoryList()],
+    ['config', () => fetchConversationHistoryGroupConfig()],
     ['events', () => fetchConversationEvents('thread-auth')],
     ['patch', () => patchConversation('thread-auth', { title: '新标题' })],
     ['delete', () => deleteConversation('thread-auth')],
@@ -84,6 +86,34 @@ describe('conversation history client', () => {
     await expect(fetchConversationHistoryList()).resolves.toEqual({
       items: [],
       nextCursor: null,
+    })
+  })
+
+  it('encodes the fuzzy query and opaque cursor in list requests', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const sentRequest = input instanceof Request ? input : new Request(input)
+      const url = new URL(sentRequest.url)
+      expect(url.searchParams.get('pageSize')).toBe('5')
+      expect(url.searchParams.get('cursor')).toBe('opaque-cursor')
+      expect(url.searchParams.get('query')).toBe('目标会话')
+      return envelope({ items: [], nextCursor: null })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await fetchConversationHistoryList({
+      pageSize: 5,
+      cursor: 'opaque-cursor',
+      query: '目标会话',
+    })
+
+    expect(fetchMock).toHaveBeenCalledOnce()
+  })
+
+  it('unwraps history group configuration through the shared client', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => envelope({ dayRanges: [7, 30] })))
+
+    await expect(fetchConversationHistoryGroupConfig()).resolves.toEqual({
+      dayRanges: [7, 30],
     })
   })
 

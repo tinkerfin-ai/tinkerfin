@@ -2,6 +2,8 @@ import { LoaderCircle } from 'lucide-react'
 import { forwardRef, useId } from 'react'
 import type { InputHTMLAttributes, ReactNode } from 'react'
 
+import { useI18n } from '../../i18n'
+
 export type TextFieldSize = 'md' | 'lg'
 export type TextFieldShape = 'round' | 'capsule'
 
@@ -31,6 +33,7 @@ export const TextField = forwardRef<HTMLInputElement, TextFieldProps>(function T
   className,
   ...inputProps
 }, ref) {
+  const { t } = useI18n()
   const generatedId = useId()
   const controlId = id ?? `field-${generatedId}`
   const errorId = `${controlId}-error`
@@ -62,7 +65,7 @@ export const TextField = forwardRef<HTMLInputElement, TextFieldProps>(function T
         />
         {trailingContent && <span className="ui-text-field__trailing">{trailingContent}</span>}
         {loading && (
-          <span className="ui-text-field__spinner" role="status" aria-label="加载中">
+          <span className="ui-text-field__spinner" role="status" aria-label={t('加载中')}>
             <LoaderCircle size={16} aria-hidden="true" />
           </span>
         )}

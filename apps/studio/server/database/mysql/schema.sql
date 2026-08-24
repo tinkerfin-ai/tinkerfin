@@ -4,6 +4,7 @@ CREATE TABLE users (
   id INTEGER NOT NULL AUTO_INCREMENT COMMENT '用户主键',
   username VARCHAR(64) NOT NULL COMMENT '登录用户名',
   display_name VARCHAR(128) NOT NULL COMMENT '展示名称',
+  avatar_url VARCHAR(2048) COMMENT '头像 HTTPS URL',
   password_hash VARCHAR(512) NOT NULL COMMENT '带算法、参数和独立盐值的密码哈希',
   roles JSON NOT NULL COMMENT '用户角色列表',
   disabled BOOL NOT NULL COMMENT '是否禁止登录',

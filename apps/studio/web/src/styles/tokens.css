@@ -7,6 +7,7 @@
     /* 原始色只在语义层中消费，功能样式不得直接引用 */
     --primitive-white: #ffffff;
     --primitive-gray-25: #f9fafb;
+    --primitive-gray-sidebar: #f7f7f9;
     --primitive-gray-50: #f5f6f7;
     --primitive-gray-75: #f1f3f5;
     --primitive-gray-100: #ebeef2;
@@ -14,6 +15,7 @@
     --primitive-gray-600: #61666b;
     --primitive-gray-950: #0f1115;
     --primitive-blue-50: #edf3fe;
+    --primitive-blue-300: #8ca3fe;
     --primitive-blue-600: #3964fe;
     --primitive-blue-700: #3158e6;
     --primitive-red-50: #fef2f2;
@@ -27,7 +29,7 @@
     --primitive-amber-800: #8a4b00;
 
     --color-canvas: var(--primitive-white);
-    --color-sidebar: var(--primitive-gray-25);
+    --color-sidebar: var(--primitive-gray-sidebar);
     --color-layer-1: var(--primitive-white);
     --color-layer-2: var(--primitive-gray-25);
     --color-subtle: var(--primitive-gray-50);
@@ -47,6 +49,8 @@
     --color-brand-soft: var(--primitive-blue-50);
     --color-brand-text: var(--primitive-blue-700);
     --color-on-brand: var(--primitive-white);
+    --color-selection: var(--primitive-blue-300);
+    --color-on-selection: var(--primitive-gray-950);
     --color-danger: var(--primitive-red-600);
     --color-danger-soft: var(--primitive-red-50);
     --color-danger-text: var(--primitive-red-700);
@@ -84,10 +88,13 @@
     --radius-lg: 10px;
     --radius-xl: 12px;
     --radius-2xl: 16px;
+    --radius-composer: 22px;
     --radius-input: 28px;
     --radius-pill: 9999px;
 
     --control-xs: 32px;
+    --control-plan-chip: 24px;
+    --control-composer: 34px;
     --control-sm: 36px;
     --control-md: 40px;
     --control-lg: 44px;
@@ -100,9 +107,14 @@
     --layout-sidebar-expanded: 261px;
     --layout-sidebar-rail: 56px;
     --layout-content-wide: 840px;
+    --layout-conversation-width: 748px;
+    --layout-composer-width: 780px;
     --layout-content-medium: 712px;
     --layout-task-drawer: 348px;
     --layout-header-height: 60px;
+    --layout-settings-dialog: 760px;
+    --layout-settings-nav: 180px;
+    --layout-settings-height: 540px;
 
     --layer-base: 0;
     --layer-behind: -1;
@@ -119,8 +131,9 @@
     --motion-normal: 200ms;
     --motion-slow: 300ms;
     --motion-loading-cycle: 1000ms;
+    --motion-tool-sweep-cycle: 2600ms;
     --motion-tooltip-delay: 500ms;
-    --motion-tooltip-hide-delay: 600ms;
+    --motion-tooltip-hide-delay: 0ms;
     --ease-in: cubic-bezier(.4, 0, 1, 1);
     --ease-out: cubic-bezier(0, 0, .2, 1);
     --ease-in-out: cubic-bezier(.4, 0, .2, 1);
@@ -128,9 +141,6 @@
     --shadow-1: 0 2px 4px rgb(0 0 0 / 5%);
     --shadow-2: 0 4px 12px rgb(0 0 0 / 2%), 0 2px 8px rgb(0 0 0 / 4%);
     --shadow-3: 0 0 1px rgb(0 0 0 / 20%), 0 0 4px rgb(0 0 0 / 2%), 0 12px 32px rgb(0 0 0 / 8%);
-    --shadow-focus: 0 0 0 3px var(--color-focus-soft);
-    --shadow-focus-danger: 0 0 0 3px color-mix(in srgb, var(--color-danger) 18%, transparent);
-    --shadow-focus-inset: inset 0 0 0 1px var(--color-focus);
     --shadow-border: 0 0 0 1px var(--color-border);
   }
 
@@ -157,6 +167,8 @@
     --color-brand-soft: #283142;
     --color-brand-text: #8ab4ff;
     --color-on-brand: #151517;
+    --color-selection: var(--color-brand);
+    --color-on-selection: var(--color-on-brand);
     --color-danger: #f25a5a;
     --color-danger-soft: #3c2426;
     --color-danger-text: #ff8a8a;

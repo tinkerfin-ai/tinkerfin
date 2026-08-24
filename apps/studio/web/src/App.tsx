@@ -20,6 +20,7 @@ import {
 } from './auth/session'
 import { writeThreadToLocation } from './lib/threadRoute'
 import { clearActiveRunSession } from './features/conversation/stream/activeRunSession'
+import { useI18n } from './i18n'
 
 type AuthPhase = 'checking' | 'signedOut' | 'transitioning' | 'signedIn'
 type AuthEntry = 'restore' | 'manual'
@@ -33,6 +34,7 @@ const WorkspaceScreen = lazy(async () => ({
 }))
 
 export default function App() {
+  const { t } = useI18n()
   const [phase, setPhase] = useState<AuthPhase>(() => (
     getAuthSession() ? 'checking' : 'signedOut'
   ))
@@ -99,7 +101,7 @@ export default function App() {
     content = (
       <main
         className="auth-checking"
-        aria-label={isAuthRetrying ? '正在重新验证登录状态' : '正在检查登录状态'}
+        aria-label={isAuthRetrying ? t('正在重新验证登录状态') : t('正在检查登录状态')}
       >
         <span className="auth-checking__mark" aria-hidden="true" />
       </main>
@@ -122,7 +124,7 @@ export default function App() {
             if (error instanceof AuthError) {
               setLoginError(error.message)
             } else if (!(error instanceof ApiError)) {
-              pushToast('error', '登录失败，请稍后重试')
+              pushToast('error', t('登录失败，请稍后重试'))
             }
           } finally {
             setLoginPending(false)
@@ -149,9 +151,9 @@ export default function App() {
 
   return (
     <>
-      <a className="skip-link" href="#main-content">跳到主要内容</a>
+      <a className="skip-link" href="#main-content">{t('跳到主要内容')}</a>
       <Suspense fallback={(
-        <main id="main-content" className="auth-checking" aria-label="正在加载界面">
+        <main id="main-content" className="auth-checking" aria-label={t('正在加载界面')}>
           <span className="auth-checking__mark" aria-hidden="true" />
         </main>
       )}>

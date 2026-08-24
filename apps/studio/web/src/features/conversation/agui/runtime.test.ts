@@ -4,14 +4,14 @@ import type { ConversationAgUiEvent, InterruptEvent } from '../../../api/convers
 import type { ConversationEventEnvelope, ConversationHistoryDetail } from '../../../api/conversation/history'
 import { buildEmptyConversation } from '../../../lib/workspace'
 import type { ApprovalAllowedDecision, ApprovalItem, Conversation, PlanReviewState } from '../../../types'
-import { applyConversationEvent, applyHistoryEventEnvelope, buildPlanAbandonPayload, buildPlanResumePayload, buildResumePayload, markConversationDetached, prepareResumeSubmission, restoreConversationFromHistory } from './runtime'
+import { applyConversationEvent, applyHistoryEventEnvelope, applyLiveEventEnvelope, buildPlanAbandonPayload, buildPlanResumePayload, buildResumePayload, markConversationDetached, prepareResumeSubmission, restoreConversationFromHistory } from './runtime'
 
 const THREAD_ID = 'thread-order-check'
 const RUN_ID = 'run-order-check'
 
 function nativeContractEvents(): ConversationAgUiEvent[] {
   const subRunId = 'subagent-11111111-1111-5111-8111-111111111111'
-  const mainSource = { agentType: 'main' as const, agentName: 'main', namespace: [] }
+  const mainSource = { kind: 'root' as const, agentType: 'main' as const, agentName: 'main', namespace: [] }
   const provenance = {
     schema: 'tinkerfin.subagent-provenance.v1' as const,
     subagentInvocationId: subRunId,
@@ -24,6 +24,7 @@ function nativeContractEvents(): ConversationAgUiEvent[] {
     requestRunId: RUN_ID,
   }
   const subSource = {
+    kind: 'deep_agent_subagent' as const,
     agentType: 'subagent' as const,
     agentName: 'researcher',
     namespace: [...provenance.namespace],
@@ -162,8 +163,9 @@ function interrupt(
 describe('AG-UI runtime reducer', () => {
   it('uses server-owned RAW task identities for live subagent cards and child tools', () => {
     const subRunId = 'subagent-22222222-2222-5222-8222-222222222222'
-    const mainSource = { agentType: 'main' as const, agentName: 'main', namespace: [] }
+    const mainSource = { kind: 'root' as const, agentType: 'main' as const, agentName: 'main', namespace: [] }
     const subSource = {
+      kind: 'deep_agent_subagent' as const,
       agentType: 'subagent' as const,
       agentName: 'researcher',
       namespace: ['tools:graph-server'],
@@ -343,7 +345,7 @@ describe('AG-UI runtime reducer', () => {
         role: 'tool',
         rawEvent: {
           streamMode: 'messages',
-          source: { agentType: 'main', agentName: 'main', namespace: [] },
+          source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
           runId: 'run-resume',
           relatedSubagentInvocationId: subRunId,
           toolResultStatus: 'success',
@@ -363,7 +365,7 @@ describe('AG-UI runtime reducer', () => {
   })
 
   it('isolates parallel server subruns that share one graph task id', () => {
-    const mainSource = { agentType: 'main' as const, agentName: 'main', namespace: [] }
+    const mainSource = { kind: 'root' as const, agentType: 'main' as const, agentName: 'main', namespace: [] }
     const graphTaskId = 'shared-graph-task'
     const invocationIds = {
       a: 'subagent-77777777-7777-5777-8777-777777777777',
@@ -420,6 +422,7 @@ describe('AG-UI runtime reducer', () => {
     )
     const withText = descriptors.flatMap<ConversationAgUiEvent>((descriptor) => {
       const source = {
+        kind: 'deep_agent_subagent' as const,
         agentType: 'subagent' as const,
         agentName: descriptor.agentName,
         namespace: descriptor.namespace,
@@ -463,8 +466,9 @@ describe('AG-UI runtime reducer', () => {
 
   it('fails a discovered subrun and its child tools when the main run errors', () => {
     const subRunId = 'subagent-33333333-3333-5333-8333-333333333333'
-    const mainSource = { agentType: 'main' as const, agentName: 'main', namespace: [] }
+    const mainSource = { kind: 'root' as const, agentType: 'main' as const, agentName: 'main', namespace: [] }
     const subSource = {
+      kind: 'deep_agent_subagent' as const,
       agentType: 'subagent' as const,
       agentName: 'researcher',
       namespace: ['tools:graph-main-error'],
@@ -628,7 +632,7 @@ describe('AG-UI runtime reducer', () => {
         ],
         tools: [],
         context: [],
-        forwardedProps: { model: 'main', mode: 'default' },
+        forwardedProps: { model: 'main', command: { plan: 'off' } },
       },
     })
 
@@ -643,6 +647,47 @@ describe('AG-UI runtime reducer', () => {
     ])
   })
 
+  it('reconciles an optimistic user message with the server-assigned message identity', () => {
+    const draft = {
+      ...buildEmptyConversation({
+        now: '2026-08-18T10:00:00.000Z',
+        model: 'main',
+      }),
+      messages: [{
+        id: 'request-run-from-client',
+        role: 'user' as const,
+        content: '分析本季度现金流',
+        createdAt: '2026-08-18T10:00:00.000Z',
+        meta: { runId: 'run-from-client' },
+      }],
+    }
+
+    const next = applyConversationEvent(draft, {
+      type: 'RUN_STARTED',
+      threadId: 'thread-from-server',
+      runId: 'run-from-client',
+      title: '服务端生成的标题',
+      input: {
+        threadId: 'thread-from-server',
+        runId: 'run-from-client',
+        state: {},
+        messages: [
+          { id: 'message-from-server', role: 'user', content: '分析本季度现金流' },
+        ],
+        tools: [],
+        context: [],
+        forwardedProps: { model: 'main', command: { plan: 'off' } },
+      },
+    })
+
+    expect(next.messages).toEqual([{
+      id: 'message-from-server',
+      role: 'user',
+      content: '分析本季度现金流',
+      createdAt: '2026-08-18T10:00:00.000Z',
+    }])
+  })
+
   it('uses values as Todo truth while the standard tool result completes the tool card', () => {
     const initial = buildEmptyConversation({
       threadId: 'thread-write-todos-end',
@@ -654,7 +699,7 @@ describe('AG-UI runtime reducer', () => {
       type: 'TOOL_CALL_START',
       rawEvent: {
         streamMode: 'messages',
-        source: { agentType: 'main', agentName: 'main', namespace: [] },
+        source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
         langgraphNode: 'model',
       },
       toolCallId: 'call-write-todos-test',
@@ -666,7 +711,7 @@ describe('AG-UI runtime reducer', () => {
       type: 'TOOL_CALL_ARGS',
       rawEvent: {
         streamMode: 'messages',
-        source: { agentType: 'main', agentName: 'main', namespace: [] },
+        source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
         langgraphNode: 'model',
       },
       toolCallId: 'call-write-todos-test',
@@ -677,7 +722,7 @@ describe('AG-UI runtime reducer', () => {
       type: 'TOOL_CALL_END',
       rawEvent: {
         streamMode: 'messages',
-        source: { agentType: 'main', agentName: 'main', namespace: [] },
+        source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
       },
       toolCallId: 'call-write-todos-test',
     })
@@ -701,7 +746,7 @@ describe('AG-UI runtime reducer', () => {
       type: 'STATE_SNAPSHOT',
       snapshot: {
         tinkerfin_plan: {
-          workflowVersion: 'tinkerfin.plan.v3',
+          workflowVersion: 'tinkerfin.plan.v1',
           effectiveMode: 'plan',
         },
         todos: [
@@ -746,7 +791,7 @@ describe('AG-UI runtime reducer', () => {
         parentMessageId: 'assistant-mixed-batch',
         rawEvent: {
           streamMode: 'messages',
-          source: { agentType: 'main', agentName: 'main', namespace: [] },
+          source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
           runId,
         },
       })
@@ -797,7 +842,7 @@ describe('AG-UI runtime reducer', () => {
       toolCallName: 'read_file',
       rawEvent: {
         streamMode: 'messages',
-        source: { agentType: 'main', agentName: 'main', namespace: [] },
+        source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
         runId: RUN_ID,
       },
     })
@@ -810,7 +855,7 @@ describe('AG-UI runtime reducer', () => {
       role: 'tool',
       rawEvent: {
         streamMode: 'messages',
-        source: { agentType: 'main', agentName: 'main', namespace: [] },
+        source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
         runId: RUN_ID,
         toolResultStatus: 'error',
       },
@@ -827,7 +872,7 @@ describe('AG-UI runtime reducer', () => {
     })
     const mainRawEvent = {
       streamMode: 'messages' as const,
-      source: { agentType: 'main' as const, agentName: 'main', namespace: [] },
+      source: { kind: 'root' as const, agentType: 'main' as const, agentName: 'main', namespace: [] },
       runId: RUN_ID,
     }
     const mainReasoning: ConversationAgUiEvent[] = [
@@ -866,6 +911,7 @@ describe('AG-UI runtime reducer', () => {
     const subRawEvent = {
       streamMode: 'messages' as const,
       source: {
+        kind: 'deep_agent_subagent' as const,
         agentType: 'subagent' as const,
         agentName: 'researcher',
         namespace: ['tools:graph-reasoning'],
@@ -949,12 +995,13 @@ describe('AG-UI runtime reducer', () => {
     const apply = (event: ConversationAgUiEvent) => {
       current = applyConversationEvent(current, event)
     }
-    const mainSource = { agentType: 'main' as const, agentName: 'main', namespace: [] }
+    const mainSource = { kind: 'root' as const, agentType: 'main' as const, agentName: 'main', namespace: [] }
     const subRunIds = {
       a: 'subagent-aaaaaaaa-aaaa-5aaa-8aaa-aaaaaaaaaaaa',
       b: 'subagent-bbbbbbbb-bbbb-5bbb-8bbb-bbbbbbbbbbbb',
     } as const
     const subSource = (suffix: 'a' | 'b') => ({
+      kind: 'deep_agent_subagent' as const,
       agentType: 'subagent' as const,
       agentName: 'researcher',
       namespace: [`tools:graph-${suffix}`],
@@ -1126,7 +1173,7 @@ describe('AG-UI runtime reducer', () => {
       approval: approval ? { ...approval, items } : approval,
     })
 
-    expect(payload.forwardedProps).toEqual({ model: 'GPT-5.5', mode: 'default' })
+    expect(payload.forwardedProps).toEqual({ model: 'GPT-5.5', command: { plan: 'off' } })
     expect(payload.resume?.map((entry) => entry.interruptId)).toEqual([
       'interrupt-b',
       'interrupt-a#0',
@@ -1290,7 +1337,7 @@ describe('AG-UI runtime reducer', () => {
           type: 'TOOL_CALL_START',
           rawEvent: {
             streamMode: 'messages',
-            source: { agentType: 'main', agentName: 'main', namespace: [] },
+            source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
             langgraphNode: 'model',
           },
           toolCallId: 'call-write-file-running',
@@ -1432,7 +1479,7 @@ describe('AG-UI runtime reducer', () => {
       toolCallName: 'task',
       rawEvent: {
         streamMode: 'messages',
-        source: { agentType: 'main', agentName: 'main', namespace: [] },
+        source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
         runId: RUN_ID,
       },
     })
@@ -1471,7 +1518,7 @@ describe('AG-UI runtime reducer', () => {
       role: 'tool',
       rawEvent: {
         streamMode: 'messages',
-        source: { agentType: 'main', agentName: 'main', namespace: [] },
+        source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
         runId: RUN_ID,
         relatedSubagentInvocationId: subRunId,
         toolResultStatus: 'error',
@@ -1527,7 +1574,7 @@ describe('AG-UI runtime reducer', () => {
             type: 'TEXT_MESSAGE_CONTENT',
             rawEvent: {
               streamMode: 'messages',
-              source: { agentType: 'main', agentName: 'main', namespace: [] },
+              source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
               runId: RUN_ID,
             },
             messageId: 'assistant-1',
@@ -1710,7 +1757,7 @@ describe('AG-UI runtime reducer', () => {
           type: 'TOOL_CALL_START',
           rawEvent: {
             streamMode: 'messages',
-            source: { agentType: 'main', agentName: 'main', namespace: [] },
+            source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
             runId: RUN_ID,
           },
           toolCallId: 'tool-search',
@@ -1727,7 +1774,7 @@ describe('AG-UI runtime reducer', () => {
           type: 'TOOL_CALL_ARGS',
           rawEvent: {
             streamMode: 'messages',
-            source: { agentType: 'main', agentName: 'main', namespace: [] },
+            source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
             runId: RUN_ID,
           },
           toolCallId: 'tool-search',
@@ -1743,7 +1790,7 @@ describe('AG-UI runtime reducer', () => {
           type: 'TOOL_CALL_END',
           rawEvent: {
             streamMode: 'messages',
-            source: { agentType: 'main', agentName: 'main', namespace: [] },
+            source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
             runId: RUN_ID,
           },
           toolCallId: 'tool-search',
@@ -1758,7 +1805,7 @@ describe('AG-UI runtime reducer', () => {
           type: 'TOOL_CALL_RESULT',
           rawEvent: {
             streamMode: 'messages',
-            source: { agentType: 'main', agentName: 'main', namespace: [] },
+            source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
             runId: RUN_ID,
           },
           toolCallId: 'tool-search',
@@ -2185,6 +2232,72 @@ describe('AG-UI runtime reducer', () => {
     )
   })
 
+  it('uses one source contract for persisted history and live catch-up events', () => {
+    const initial = buildEmptyConversation({
+      threadId: THREAD_ID,
+      now: '2026-08-05T08:00:00.000Z',
+      model: 'GPT-5.5',
+    })
+    const validCompiledSource = {
+      kind: 'compiled_subgraph',
+      nodeName: 'create_plan',
+      namespace: ['create_plan:graph-task-valid'],
+      graphTaskId: 'graph-task-valid',
+      parentNamespace: [],
+    } as const
+    const validCompiledEvent = {
+      type: 'TOOL_CALL_START',
+      toolCallId: 'planner-outcome-valid',
+      toolCallName: 'PlannerOutcome',
+      rawEvent: {
+        streamMode: 'messages',
+        runId: RUN_ID,
+        source: validCompiledSource,
+      },
+    } as unknown as ConversationAgUiEvent
+    const validEnvelope: ConversationEventEnvelope = {
+      seq: 1,
+      eventId: 'evt-compiled-valid',
+      eventType: 'TOOL_CALL_START',
+      event: validCompiledEvent,
+      createdAt: '2026-08-05T08:00:01.000Z',
+    }
+
+    for (const applyEnvelope of [applyHistoryEventEnvelope, applyLiveEventEnvelope]) {
+      const next = applyEnvelope(initial, validEnvelope)
+      const tool = next.messages.find(
+        (message) => message.meta?.toolCallId === 'planner-outcome-valid',
+      )
+      expect(tool?.meta).toMatchObject({
+        toolName: 'PlannerOutcome',
+        graphTaskId: 'graph-task-valid',
+      })
+      expect(tool?.meta?.sourceAgentName).toBeUndefined()
+    }
+
+    const invalidEnvelope: ConversationEventEnvelope = {
+      ...validEnvelope,
+      eventId: 'evt-compiled-invalid',
+      event: {
+        ...validCompiledEvent,
+        rawEvent: {
+          ...validCompiledEvent.rawEvent,
+          source: {
+            ...validCompiledSource,
+            agentType: 'main',
+            agentName: 'main',
+          },
+        },
+      } as unknown as ConversationAgUiEvent,
+    }
+
+    for (const applyEnvelope of [applyHistoryEventEnvelope, applyLiveEventEnvelope]) {
+      expect(() => applyEnvelope(initial, invalidEnvelope)).toThrow(
+        '事件流包含无效的 AG-UI 事件',
+      )
+    }
+  })
+
   it('maps Plan clarification options without creating a Tool approval', () => {
     const current = buildEmptyConversation({
       threadId: THREAD_ID,
@@ -2207,18 +2320,21 @@ describe('AG-UI runtime reducer', () => {
                 metadata: {
                   origin: 'plan',
                   clarification: {
-                    schema: 'tinkerfin.plan-clarification.v1',
+                    schema: 'tinkerfin.plan-clarification.v2',
                     form: {
-                      schemaVersion: 1,
+                      schemaVersion: 2,
+                      title: '确认部署环境',
+                      description: '部署环境会决定后续验证与发布步骤',
                       businessTag: 'preserved',
                       questions: [{
                         id: 'environment',
                         prompt: '部署到哪个环境？',
+                        required: true,
                         options: [{
                           id: 'staging',
                           label: '预发布',
                           description: '先验证',
-                          attributes: { priority: 1 },
+                          attributes: { priority: 1, recommended: true },
                         }],
                         allowFreeText: true,
                         attributes: { category: 'target' },
@@ -2236,9 +2352,15 @@ describe('AG-UI runtime reducer', () => {
     expect(interrupted.approval).toBeUndefined()
     expect(interrupted.planInteraction?.kind).toBe('questions')
     if (interrupted.planInteraction?.kind !== 'questions') throw new Error('missing questions')
+    expect(interrupted.planInteraction.title).toBe('确认部署环境')
+    expect(interrupted.planInteraction.description).toBe('部署环境会决定后续验证与发布步骤')
+    expect(interrupted.planInteraction.activeQuestionIndex).toBe(0)
     expect(interrupted.planInteraction.form.businessTag).toBe('preserved')
     expect(interrupted.planInteraction.questions[0]?.attributes).toEqual({ category: 'target' })
-    expect(interrupted.planInteraction.questions[0]?.options[0]?.attributes).toEqual({ priority: 1 })
+    expect(interrupted.planInteraction.questions[0]?.options[0]).toMatchObject({
+      recommended: true,
+      attributes: { priority: 1, recommended: true },
+    })
     const ready = {
       ...interrupted,
       planInteraction: {
@@ -2250,7 +2372,7 @@ describe('AG-UI runtime reducer', () => {
       },
     }
     const payload = buildPlanResumePayload(ready)
-    expect(payload.forwardedProps.mode).toBe('plan')
+    expect(payload.forwardedProps.command.plan).toBe('on')
     expect(payload.resume?.[0]).toMatchObject({
       interruptId: 'plan-question-1',
       status: 'resolved',
@@ -2283,8 +2405,13 @@ describe('AG-UI runtime reducer', () => {
     const questions = Array.from({ length: 4 }, (_, index) => ({
       id: `question-${index}`,
       prompt: `第 ${index + 1} 个问题？`,
+      required: index === 0,
       options: index % 2 === 0
-        ? [{ id: `option-${index}`, label: `选项 ${index + 1}` }]
+        ? [{
+            id: `option-${index}`,
+            label: `选项 ${index + 1}`,
+            attributes: { recommended: true },
+          }]
         : [],
       allowFreeText: true,
     }))
@@ -2309,8 +2436,13 @@ describe('AG-UI runtime reducer', () => {
                 metadata: {
                   origin: 'plan',
                   clarification: {
-                    schema: 'tinkerfin.plan-clarification.v1',
-                    form: { schemaVersion: 1, questions },
+                    schema: 'tinkerfin.plan-clarification.v2',
+                    form: {
+                      schemaVersion: 2,
+                      title: '确认计划范围',
+                      description: '请回答所有阻塞问题',
+                      questions,
+                    },
                   },
                 },
               },
@@ -2330,7 +2462,7 @@ describe('AG-UI runtime reducer', () => {
         questions: interrupted.planInteraction.questions.map((question, index) => ({
           ...question,
           selectedOptionId: index % 2 === 0 ? `option-${index}` : undefined,
-          customAnswer: index % 2 === 0 ? '' : `答案 ${index + 1}`,
+          customAnswer: index === 3 ? '答案 4' : '',
         })),
       },
     }
@@ -2339,11 +2471,84 @@ describe('AG-UI runtime reducer', () => {
       type: 'respond',
       answers: [
         { questionId: 'question-0', optionId: 'option-0' },
-        { questionId: 'question-1', answer: '答案 2' },
+        { questionId: 'question-1', skipped: true },
         { questionId: 'question-2', optionId: 'option-2' },
         { questionId: 'question-3', answer: '答案 4' },
       ],
     })
+  })
+
+  it.each([
+    ['缺少动态标题', { title: null }],
+    ['标题超过二十个字符', { title: '标'.repeat(21) }],
+    ['缺少动态说明', { description: null }],
+    ['说明超过六十个字符', { description: '说'.repeat(61) }],
+    ['缺少 required', {
+      questions: [{
+        id: 'scope',
+        prompt: '分析范围是什么？',
+        options: [{ id: 'a', label: '范围 A', attributes: { recommended: true } }],
+        allowFreeText: true,
+      }],
+    }],
+    ['推荐项不在第一位', {
+      questions: [{
+        id: 'scope',
+        prompt: '分析范围是什么？',
+        required: true,
+        options: [
+          { id: 'a', label: '范围 A', attributes: { recommended: false } },
+          { id: 'b', label: '范围 B', attributes: { recommended: true } },
+        ],
+        allowFreeText: true,
+      }],
+    }],
+  ])('rejects a Plan clarification form when %s', (_caseName, formPatch) => {
+    const current = buildEmptyConversation({
+      threadId: THREAD_ID,
+      now: '2026-08-05T08:00:00.000Z',
+      model: 'GPT-5.5',
+      mode: 'plan',
+    })
+    const form = {
+      schemaVersion: 2,
+      title: '确认分析范围',
+      description: '分析范围会决定后续计划步骤',
+      questions: [{
+        id: 'scope',
+        prompt: '分析范围是什么？',
+        required: true,
+        options: [{ id: 'a', label: '范围 A', attributes: { recommended: true } }],
+        allowFreeText: true,
+      }],
+      ...formPatch,
+    }
+
+    expect(() => applyConversationEvent(current, {
+      type: 'RUN_FINISHED',
+      threadId: THREAD_ID,
+      runId: RUN_ID,
+      outcome: {
+        type: 'interrupt',
+        interrupts: [{
+          id: 'invalid-plan-question',
+          reason: 'plan_clarification',
+          metadata: {
+            runtimeInterrupt: {
+              envelope: {
+                metadata: {
+                  origin: 'plan',
+                  clarification: {
+                    schema: 'tinkerfin.plan-clarification.v2',
+                    form,
+                  },
+                },
+              },
+            },
+          },
+        }],
+      },
+    })).toThrow('Plan interrupt 载荷不符合 Studio 契约')
   })
 
   it('maps Plan review decisions and abandons only the Plan request', () => {
@@ -2366,11 +2571,19 @@ describe('AG-UI runtime reducer', () => {
             runtimeInterrupt: {
               envelope: {
                 metadata: {
-                  planRevision: 2,
-                  draft: {
-                    revision: 2,
-                    goal: '实现模式切换',
-                    steps: [{ id: 'step-1', title: '实现', description: '完成实现' }],
+                  origin: 'plan',
+                  review: {
+                    schema: 'tinkerfin.plan-review.v1',
+                    draft: {
+                      schemaVersion: 1,
+                      revision: 2,
+                      contentSchema: {
+                        id: 'tinkerfin.plan.markdown.v1',
+                        fingerprint: '0'.repeat(64),
+                        mediaType: 'text/markdown',
+                      },
+                      content: { markdown: '# 实现模式切换\n\n完成实现' },
+                    },
                   },
                 },
               },
@@ -2387,16 +2600,80 @@ describe('AG-UI runtime reducer', () => {
     }
 
     const approvalPayload = buildPlanResumePayload(approved)
-    expect(approvalPayload.forwardedProps.mode).toBe('default')
+    expect(approvalPayload.forwardedProps.command.plan).toBe('off')
     expect(approvalPayload.resume?.[0]?.payload).toEqual({
       type: 'approve',
       baseRevision: 2,
     })
     expect(buildPlanAbandonPayload(interrupted)).toMatchObject({
       messages: [],
-      forwardedProps: { model: 'GPT-5.5', mode: 'default' },
+      forwardedProps: { model: 'GPT-5.5', command: { plan: 'off' } },
       resume: [{ interruptId: 'plan-review-1', status: 'cancelled' }],
     })
+  })
+
+  it('rejects malformed Markdown Plan review contracts without guessing old shapes', () => {
+    const current = buildEmptyConversation({
+      threadId: THREAD_ID,
+      now: '2026-08-05T08:00:00.000Z',
+      model: 'GPT-5.5',
+      mode: 'plan',
+    })
+    const validDraft = {
+      schemaVersion: 1,
+      revision: 1,
+      contentSchema: {
+        id: 'tinkerfin.plan.markdown.v1',
+        fingerprint: '0'.repeat(64),
+        mediaType: 'text/markdown',
+      },
+      content: { markdown: '# Valid Plan' },
+    }
+    const invalidReviews = [
+      { schema: 'tinkerfin.plan-review.v0', draft: validDraft },
+      { schema: 'tinkerfin.plan-review.v1', draft: { ...validDraft, revision: 0 } },
+      {
+        schema: 'tinkerfin.plan-review.v1',
+        draft: {
+          ...validDraft,
+          contentSchema: { ...validDraft.contentSchema, fingerprint: 'invalid' },
+        },
+      },
+      {
+        schema: 'tinkerfin.plan-review.v1',
+        draft: {
+          ...validDraft,
+          contentSchema: {
+            ...validDraft.contentSchema,
+            id: 'tinkerfin.plan.structured.v1',
+          },
+        },
+      },
+      {
+        schema: 'tinkerfin.plan-review.v1',
+        draft: { ...validDraft, content: { markdown: ' \n\t' } },
+      },
+    ]
+
+    for (const review of invalidReviews) {
+      expect(() => applyConversationEvent(current, {
+        type: 'RUN_FINISHED',
+        threadId: THREAD_ID,
+        runId: RUN_ID,
+        outcome: {
+          type: 'interrupt',
+          interrupts: [{
+            id: 'invalid-plan-review',
+            reason: 'plan_review',
+            metadata: {
+              runtimeInterrupt: {
+                envelope: { metadata: { origin: 'plan', review } },
+              },
+            },
+          }],
+        },
+      })).toThrow('Plan interrupt 载荷不符合 Studio 契约')
+    }
   })
 
   it('builds every fixed Plan review action without changing the action vocabulary', () => {
@@ -2414,8 +2691,12 @@ describe('AG-UI runtime reducer', () => {
       draft: {
         schemaVersion: 1,
         revision: 4,
-        goal: '实现四种动作',
-        steps: [{ id: 'step-1', title: '实现', description: '实现合同' }],
+        contentSchema: {
+          id: 'tinkerfin.plan.markdown.v1',
+          fingerprint: '0'.repeat(64),
+          mediaType: 'text/markdown',
+        },
+        content: { markdown: '# 实现四种动作\n\n实现合同' },
       },
     }
     const payloadFor = (patch: Partial<PlanReviewState>) => buildPlanResumePayload({
@@ -2429,19 +2710,11 @@ describe('AG-UI runtime reducer', () => {
     })
     expect(payloadFor({
       action: 'edit',
-      editedDraft: JSON.stringify({
-        schemaVersion: 1,
-        revision: 99,
-        goal: '编辑后',
-        steps: [{ id: 'step-1', title: '编辑', description: '编辑合同' }],
-      }),
+      editedMarkdown: '  # 编辑后\n\n- 编辑合同\n',
     }).resume?.[0]?.payload).toEqual({
       type: 'edit',
       baseRevision: 4,
-      draft: {
-        goal: '编辑后',
-        steps: [{ id: 'step-1', title: '编辑', description: '编辑合同' }],
-      },
+      content: { markdown: '  # 编辑后\n\n- 编辑合同\n' },
     })
     expect(payloadFor({ action: 'respond', message: '补充回归验证' }).resume?.[0]?.payload).toEqual({
       type: 'respond',
@@ -2453,5 +2726,8 @@ describe('AG-UI runtime reducer', () => {
       baseRevision: 4,
       message: '目标不再需要',
     })
+    expect(() => payloadFor({ action: 'edit', editedMarkdown: ' \n\t' })).toThrow(
+      '编辑后的计划不能为空',
+    )
   })
 })

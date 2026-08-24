@@ -59,8 +59,8 @@
   }
 
   ::selection {
-    background: var(--color-brand-soft);
-    color: var(--color-text-primary);
+    background: var(--color-selection);
+    color: var(--color-on-selection);
   }
 
   .visually-hidden {

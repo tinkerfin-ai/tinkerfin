@@ -17,9 +17,10 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.typing import ContextT
 
 from ._clarification import ClarificationSchemaBinding, stateless_child_config
-from ._contracts import PlannerOutcomeBase
+from ._content import PlanContentBinding
+from ._contracts import PlanContractBinding, PlannerOutcomeBase
 from .errors import PlanStructuredOutputError
-from .models import PlanState
+from .models import PlanContentModel, PlanState
 
 _READ_ONLY_TOOLS: list[FsToolName] = [
     "ls",
@@ -45,17 +46,24 @@ Spend no more than three model turns on filesystem inspection, then return the
 structured outcome.
 
 First decide whether the user's intent and constraints are sufficient for an executable
-Plan. When material information is missing, return one non-empty clarification form that
-contains the blocking questions and conforms to the configured structured response
-schema. Reassess sufficiency after every complete answer batch; multiple clarification
-rounds are allowed.
+Plan. When additional information is useful, return one non-empty clarification form
+that conforms to the configured structured response schema. Set required=true only when
+planning cannot safely continue without that answer. Set required=false for useful but
+non-blocking refinements the user may skip. A form may contain only optional questions,
+but do not pause merely to collect low-value detail. Reassess sufficiency after every
+complete answer batch; multiple clarification rounds are allowed.
+
+An explicitly skipped optional question means the user chose not to provide that detail.
+Do not ask the same optional question again in this Plan cycle. Continue from available
+evidence and state any material assumption in the draft unless a different required
+blocker is discovered.
 
 The trusted context can contain an authoritativeEdit. It is user-authored and must never
 be silently rewritten. When an authoritativeEdit is present, return clarify if it is
 still insufficient, or accept_edit when it is sufficient. Do not return a replacement
 draft for an authoritative edit. Without an authoritativeEdit, return clarify or one
-complete structured draft with ordered, independently verifiable steps and final
-acceptance criteria.
+complete draft conforming exactly to the configured Plan content schema. Treat that
+schema and its field descriptions as the authoritative content contract.
 
 Never claim to have modified state and never request a write or execution tool. Do not
 expose private chain-of-thought. For each blocking question, generate concise
@@ -72,8 +80,11 @@ class _StructuredAgent(Protocol):
     ) -> Mapping[str, object]: ...
 
 
-def _planner_system_prompt(clarification: ClarificationSchemaBinding) -> str:
-    """Add question count guidance derived from the validated response schema."""
+def _planner_system_prompt(
+    clarification: ClarificationSchemaBinding,
+    content: PlanContentBinding,
+) -> str:
+    """Add guidance derived from both configured structured response schemas."""
 
     count = clarification.question_count
     if count.maximum is None:
@@ -94,7 +105,19 @@ def _planner_system_prompt(clarification: ClarificationSchemaBinding) -> str:
         "Whenever you return clarify, the configured clarification schema requires "
         f"{cardinality}."
     )
-    return f"{_PLANNER_PROMPT.rstrip()}\n\n{instruction}"
+    if content.reference.media_type == "text/markdown":
+        content_instruction = (
+            "Whenever you return draft, put one complete, executable Markdown Plan in "
+            "the markdown field. Preserve requested implementation boundaries and "
+            "include observable verification and final acceptance conditions in that "
+            "Markdown; do not wrap it in a JSON code fence."
+        )
+    else:
+        content_instruction = (
+            "Whenever you return draft, satisfy every required field and constraint "
+            f"of Plan content schema {content.reference.id!r}."
+        )
+    return f"{_PLANNER_PROMPT.rstrip()}\n\n{instruction}\n\n{content_instruction}"
 
 
 def _invalid_structured_call_messages(
@@ -125,6 +148,8 @@ def create_planner_agent(
     *,
     backend: BackendProtocol,
     clarification: ClarificationSchemaBinding,
+    content: PlanContentBinding,
+    contracts: PlanContractBinding,
     context_schema: type[ContextT] | None,
 ) -> _StructuredAgent:
     """Build a Planner with an explicit read-only filesystem action space."""
@@ -150,10 +175,10 @@ def create_planner_agent(
         create_agent(
             model=model,
             tools=(),
-            system_prompt=_planner_system_prompt(clarification),
+            system_prompt=_planner_system_prompt(clarification, content),
             middleware=middleware,
             response_format=ToolStrategy(
-                clarification.planner_response_type,
+                contracts.planner_response_type,
                 handle_errors=True,
             ),
             context_schema=context_schema,
@@ -168,9 +193,9 @@ def create_planner_agent(
 async def invoke_planner(
     agent: _StructuredAgent,
     messages: Sequence[BaseMessage],
-    plan: PlanState,
+    plan: PlanState[PlanContentModel],
     *,
-    clarification: ClarificationSchemaBinding,
+    contracts: PlanContractBinding,
     clarification_history: Sequence[Mapping[str, object]],
     config: RunnableConfig,
     files: object | None,
@@ -178,17 +203,16 @@ async def invoke_planner(
     """Run the Planner with current requirements and the previous reviewed draft."""
 
     context = {
-        "goal": plan.goal,
         "clarifications": list(clarification_history),
         "authoritativeEdit": (
             None
-            if plan.edited_draft is None
-            else plan.edited_draft.model_dump(mode="json", by_alias=True)
+            if plan.pending_edit is None
+            else plan.pending_edit.model_dump(mode="json", by_alias=True)
         ),
         "previousDraft": (
             None
             if plan.draft is None
-            else plan.draft.model_dump(mode="json", by_alias=True)
+            else plan.draft.content.model_dump(mode="json", by_alias=True)
         ),
         "feedback": list(plan.feedback),
     }
@@ -209,7 +233,7 @@ async def invoke_planner(
         config=stateless_child_config(config),
     )
     response = result.get("structured_response")
-    if isinstance(response, clarification.planner_response_type):
+    if isinstance(response, contracts.planner_response_type):
         return response
 
     invalid_messages = _invalid_structured_call_messages(result)
@@ -235,7 +259,7 @@ async def invoke_planner(
             config=stateless_child_config(config),
         )
         response = result.get("structured_response")
-        if isinstance(response, clarification.planner_response_type):
+        if isinstance(response, contracts.planner_response_type):
             return response
 
     raise PlanStructuredOutputError(

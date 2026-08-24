@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Literal
 
 from ag_ui.core import RunAgentInput
@@ -10,10 +11,25 @@ from ag_ui.core.types import (
     ResumeEntry,
     Tool,
 )
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    field_validator,
+    model_validator,
+)
 
 THREAD_ID_PATTERN = r"^[^:]+\z"
 OPTIONAL_THREAD_ID_PATTERN = r"^[^:]*\z"
+
+
+class ConversationCommand(BaseModel):
+    """前端声明的一次运行命令集合"""
+
+    model_config = ConfigDict(extra="allow")
+
+    plan: Literal["on", "off"] = Field(description="本次运行期望的 Plan 状态")
 
 
 class ConversationForwardedProps(BaseModel):
@@ -22,9 +38,24 @@ class ConversationForwardedProps(BaseModel):
     model_config = ConfigDict(extra="allow", populate_by_name=True)
 
     model: str = Field(min_length=1, max_length=64, description="数据库模型稳定 ID")
-    mode: Literal["default", "plan"] = Field(
-        default="default", description="当前请求使用的 Agent 运行模式"
+    command: ConversationCommand = Field(
+        description="本次运行的命令映射；未知命令仅透传，不由当前业务执行"
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_removed_mode(cls, value: object) -> object:
+        """拒绝已从当前传输契约删除的 mode 字段"""
+
+        if isinstance(value, Mapping) and "mode" in value:
+            raise ValueError("forwardedProps.mode 已删除，请使用 command.plan")
+        return value
+
+    @property
+    def agent_mode(self) -> Literal["default", "plan"]:
+        """把传输命令转换为框架需要的运行模式"""
+
+        return "plan" if self.command.plan == "on" else "default"
 
 
 class ChatRequest(BaseModel):

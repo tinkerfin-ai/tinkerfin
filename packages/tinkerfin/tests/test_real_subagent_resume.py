@@ -180,7 +180,8 @@ async def test_real_subagent_tool_resume_preserves_native_identity() -> None:
     assert any(
         part["type"] == "values"
         and part["ns"] == child_namespace
-        and tuple(part.get("interrupts", ())) == (child_interrupt,)
+        and tuple(cast(Sequence[object], part.get("interrupts", ())))
+        == (child_interrupt,)
         for part in before
     )
     assert any(
@@ -238,8 +239,9 @@ async def test_real_subagent_tool_resume_preserves_native_identity() -> None:
         if isinstance(event, RawEvent)
         and event.source == "langgraph.tasks"
         and isinstance(event.event.get("provenance"), dict)
-        for descriptor in cast(Mapping[str, object], event.event["provenance"]).get(
-            "subagents", []
+        for descriptor in cast(
+            Sequence[object],
+            cast(Mapping[str, object], event.event["provenance"]).get("subagents", []),
         )
     ]
     assert len(descriptors) == 1
@@ -274,8 +276,9 @@ async def test_real_subagent_tool_resume_preserves_native_identity() -> None:
         if isinstance(event, RawEvent)
         and event.source == "langgraph.tasks"
         and isinstance(event.event.get("provenance"), dict)
-        for descriptor in cast(Mapping[str, object], event.event["provenance"]).get(
-            "subagents", []
+        for descriptor in cast(
+            Sequence[object],
+            cast(Mapping[str, object], event.event["provenance"]).get("subagents", []),
         )
     ]
     assert len(resumed_descriptors) == 1
@@ -292,7 +295,11 @@ async def test_real_subagent_tool_resume_preserves_native_identity() -> None:
         and event.tool_call_id == public_interrupt.tool_call_id
     ]
     assert len(child_results) == 1
-    assert child_results[0].raw_event["source"]["subagentInvocationId"] == (
+    child_raw_event = child_results[0].raw_event
+    assert isinstance(child_raw_event, Mapping)
+    child_source = child_raw_event.get("source")
+    assert isinstance(child_source, Mapping)
+    assert child_source["subagentInvocationId"] == (
         before_provenance.subagent_invocation_id
     )
     assert not any(
@@ -304,8 +311,11 @@ async def test_real_subagent_tool_resume_preserves_native_identity() -> None:
         event
         for event in after_events
         if isinstance(event, ToolCallResultEvent)
+        and isinstance(event.raw_event, Mapping)
         and event.raw_event.get("relatedSubagentInvocationId")
         == before_provenance.subagent_invocation_id
     ]
     assert len(parent_results_events) == 1
-    assert parent_results_events[0].raw_event["runId"] == "request-after"
+    parent_raw_event = parent_results_events[0].raw_event
+    assert isinstance(parent_raw_event, Mapping)
+    assert parent_raw_event["runId"] == "request-after"

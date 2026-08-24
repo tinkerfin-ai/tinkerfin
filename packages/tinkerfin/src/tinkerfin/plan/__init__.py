@@ -13,15 +13,18 @@ from .errors import PlanModeConfigurationError as PlanModeConfigurationError
 from .errors import PlanStructuredOutputError as PlanStructuredOutputError
 from .models import ClarificationExchange as ClarificationExchange
 from .models import ConfirmedPlan as ConfirmedPlan
+from .models import MarkdownPlanContent as MarkdownPlanContent
 from .models import PendingClarification as PendingClarification
-from .models import PlanContent as PlanContent
+from .models import PlanContentModel as PlanContentModel
 from .models import PlanDraft as PlanDraft
 from .models import PlanHandoff as PlanHandoff
 from .models import PlanReviewAction as PlanReviewAction
+from .models import PlanSchemaReference as PlanSchemaReference
 from .models import PlanState as PlanState
 from .models import PlanStatus as PlanStatus
-from .models import PlanStep as PlanStep
 from .models import RequirementAnswer as RequirementAnswer
+from .models import StructuredPlanContent as StructuredPlanContent
+from .models import StructuredPlanStep as StructuredPlanStep
 
 __all__ = [
     "AgentMode",
@@ -35,15 +38,18 @@ __all__ = [
     "ClarificationQuestionBase",
     "ConfirmedPlan",
     "DefaultClarificationForm",
+    "MarkdownPlanContent",
     "PendingClarification",
-    "PlanContent",
+    "PlanContentModel",
     "PlanDraft",
     "PlanHandoff",
     "PlanModeConfigurationError",
     "PlanReviewAction",
+    "PlanSchemaReference",
     "PlanState",
     "PlanStatus",
-    "PlanStep",
     "PlanStructuredOutputError",
     "RequirementAnswer",
+    "StructuredPlanContent",
+    "StructuredPlanStep",
 ]

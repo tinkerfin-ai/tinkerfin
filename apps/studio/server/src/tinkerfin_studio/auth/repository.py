@@ -36,6 +36,11 @@ class UserRepository:
 
         self._session.add(user)
 
+    async def commit(self) -> None:
+        """提交当前用户资料事务"""
+
+        await self._session.commit()
+
 
 @dataclass(frozen=True, slots=True)
 class TokenRecord:

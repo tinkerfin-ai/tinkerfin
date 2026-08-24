@@ -21,6 +21,9 @@ class User(Base):
     display_name: Mapped[str] = mapped_column(
         String(128), nullable=False, comment="展示名称"
     )
+    avatar_url: Mapped[str | None] = mapped_column(
+        String(2048), nullable=True, comment="头像 HTTPS URL"
+    )
     password_hash: Mapped[str] = mapped_column(
         String(512), nullable=False, comment="带算法、参数和独立盐值的密码哈希"
     )

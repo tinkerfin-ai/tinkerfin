@@ -32,9 +32,8 @@ export const IconButton = forwardRef<HTMLButtonElement, IconButtonProps>(functio
         shape="circle"
         aria-label={label}
         aria-describedby={tooltip ? tooltipId : undefined}
-      >
-        <span className="ui-icon-button__icon" aria-hidden="true">{icon}</span>
-      </Button>
+        leadingIcon={<span className="ui-icon-button__icon">{icon}</span>}
+      />
       {tooltip && <span id={tooltipId} className="ui-tooltip" role="tooltip">{tooltip}</span>}
     </span>
   )

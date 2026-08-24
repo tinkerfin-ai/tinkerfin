@@ -18,6 +18,7 @@ from tinkerfin_studio.conversation.schemas import (
     CancelRunResponse,
     ConversationEventEnvelope,
     ConversationHistoryDetail,
+    ConversationHistoryGroupConfig,
     ConversationHistoryListItem,
     ConversationHistoryListResponse,
     ConversationThreadUpdate,
@@ -43,12 +44,22 @@ async def list_history(
     service: ConversationHistoryDep,
     page_size: Annotated[int, Query(alias="pageSize", ge=1, le=100)] = 20,
     cursor: Annotated[str | None, Query()] = None,
+    query: Annotated[str | None, Query(max_length=255)] = None,
 ) -> ApiResponse[ConversationHistoryListResponse]:
     """分页返回当前用户历史会话"""
 
     return ApiResponse.success(
-        await service.list_history(page_size=page_size, cursor=cursor)
+        await service.list_history(page_size=page_size, cursor=cursor, query=query)
     )
+
+
+@router.get("/config", response_model=ApiResponse[ConversationHistoryGroupConfig])
+async def get_conversation_config(
+    service: ConversationHistoryDep,
+) -> ApiResponse[ConversationHistoryGroupConfig]:
+    """返回历史会话分组等前端查询配置"""
+
+    return ApiResponse.success(service.group_config())
 
 
 @router.get(

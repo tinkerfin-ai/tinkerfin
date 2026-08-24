@@ -80,15 +80,37 @@ Plan Mode 按下面的边界处理请求：
 
 1. 一个只读 Planner 判断意图和约束是否充分
 2. Planner 只能使用 `ls`、`read_file`、`glob` 和 `grep`
-3. 澄清问题可以包含模型动态生成的单选项，并通过 `allow_free_text` 决定是否允许自由输入；需求澄清和
+3. 澄清问题显式声明 `required`，可以包含模型动态生成的单选项，并通过 `allow_free_text` 决定是否允许自由输入；需求澄清和
    计划审批通过 LangGraph interrupt 暂停
-4. 用户批准后冻结 `ConfirmedPlan`，以原用户消息 ID 提交确定性的 v3 handoff，并立即启动原生 Deep Agent
+4. 用户批准后冻结 `ConfirmedPlan`，以原用户消息 ID 提交确定性 handoff，并立即启动原生 Deep Agent
 
 选择 Plan 时必须提供明确 Planner 模型和具体 `BaseCheckpointSaver`。TinkerFin 不会自动创建
 进程内 saver，也不会静默降低 durability；生产环境必须提供生产级 saver。Planning 与原生
 Deep Agent 借用同一个 saver、Store、cache、backend 和 runtime context。恢复时必须保持同一个
-`Identity.threadId`。Plan 状态位于根状态的 `tinkerfin_plan` 字段，`PlanContent`、
-`PlanDraft`、`ConfirmedPlan`、`PlanHandoff`、`PlanState` 等模型从 `tinkerfin.plan` 导入。
+`Identity.threadId`。Plan 状态位于根状态的 `tinkerfin_plan` 字段，`PlanContentModel`、
+内置结构化与 Markdown 内容类型、`PlanDraft`、`ConfirmedPlan`、`PlanHandoff`、`PlanState`
+等模型从 `tinkerfin.plan` 导入。
+
+计划内容默认使用 `StructuredPlanContent`。需要一份原样 Markdown 或宿主自定义内容契约时，
+在 Plan factory 上选择：
+
+```python
+from tinkerfin.plan import MarkdownPlanContent
+
+
+agent = tinkerfin.plan(
+    planner_model="openai:gpt-5.4",
+    plan_schema=MarkdownPlanContent,
+).create_deep_agent(
+    model="openai:gpt-5.4",
+    tools=[search_orders],
+    checkpointer=production_checkpointer,
+)
+```
+
+自定义内容类型继承 `PlanContentModel`，声明稳定 `schema_id`，并使用精确的 Pydantic 字段。
+Definition 固定采用创建时选中的 Schema；草稿审阅、权威编辑、确认、checkpoint 恢复和执行
+handoff 始终使用同一份已校验内容。
 
 `mode="default"` 直接运行原生 Deep Agent Graph，不进入 Planning、不追加 middleware、不替换
 state schema，也不创建父 Graph。Todo、Tool/Filesystem HITL、子 Agent、取消和异常语义保持原生行为。
@@ -103,11 +125,12 @@ Planner 只拥有用于按需检查 workspace 的只读文件工具；这份受�
 或 resume 替换。attributes 必须使用具体 `ClarificationModel` 子类；这些数据会公开给用户，
 属于模型生成的规划参考，不能直接作为权限、计费或合规依据。
 
-Python 字段使用 `allow_free_text`，JSON 边界使用 `allowFreeText`。每轮问题数量由绑定的
-clarification schema 约束，表单必须非空，用户填写后整组提交。选择 Option 时只提交
-`questionId` 和 `optionId`；自由输入时只提交 `questionId` 和 `answer`。工作流从 checkpoint
-恢复可信 Form 并派生 Option label，混合、缺失、未知或过期回答都会被拒绝。信息仍不足时，
-Planner 会继续下一轮澄清。
+Python 字段使用 `allow_free_text`，JSON 边界使用 `allowFreeText`。每道问题显式提供
+`required`；同一批次可以混合必填与可选题，也可以全部为可选题。表单必须非空，用户填写后整组提交。
+选择 Option 时只提交 `questionId` 和 `optionId`；自由输入时只提交 `questionId` 和 `answer`；
+跳过可选题时只提交 `questionId` 和 `skipped: true`。工作流要求每道 checkpoint 问题都有明确结果，
+从可信 Form 派生 Option label，拒绝跳过必填题，并把 skipped 保留为 Planner 上下文。同一 Plan 周期内，
+Planner 不得重复追问用户已明确跳过的可选题。
 
 完整编辑后的草稿是用户权威约束。Planner 只能继续澄清或接受该草稿，不得静默替换。澄清期间
 revision 不变；只有形成完整可审阅草稿时才递增一次。

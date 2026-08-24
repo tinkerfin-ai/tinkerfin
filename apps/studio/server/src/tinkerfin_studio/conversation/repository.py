@@ -244,13 +244,18 @@ class ConversationRepository:
         user_id: int,
         page_size: int,
         cursor: tuple[bool, datetime, int] | None,
+        query: str | None = None,
     ) -> list[ConversationThread]:
-        """按置顶、更新时间和主键执行稳定 keyset 分页"""
+        """按标题、置顶、更新时间和主键执行稳定 keyset 分页"""
 
         statement = select(ConversationThread).where(
             ConversationThread.user_id == user_id,
             ConversationThread.deleted_at.is_(None),
         )
+        if query is not None:
+            statement = statement.where(
+                ConversationThread.title.icontains(query, autoescape=True)
+            )
         if cursor is not None:
             pinned, updated_at, row_id = cursor
             same_group_tail = or_(

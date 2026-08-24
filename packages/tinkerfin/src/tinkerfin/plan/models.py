@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Annotated, Literal
+from typing import Annotated, ClassVar, Generic, Literal, Self, TypeVar
 
 from pydantic import (
     BaseModel,
@@ -11,6 +11,7 @@ from pydantic import (
     Field,
     JsonValue,
     StringConstraints,
+    field_validator,
     model_validator,
 )
 from pydantic.alias_generators import to_camel
@@ -55,8 +56,15 @@ class _PlanModel(BaseModel):
     )
 
 
-class PlanStep(_PlanModel):
-    """One ordered, independently verifiable step in a user-reviewed Plan."""
+class PlanContentModel(_PlanModel):
+    """Base for one immutable, host-selectable Plan content contract."""
+
+    schema_id: ClassVar[str | None] = None
+    media_type: ClassVar[str] = "application/json"
+
+
+class StructuredPlanStep(_PlanModel):
+    """One ordered, independently verifiable structured Plan step."""
 
     id: PlanStepId = Field(description="Stable step ID within one Plan revision")
     title: NonBlankText = Field(description="Concise step title")
@@ -69,15 +77,17 @@ class PlanStep(_PlanModel):
     )
 
 
-class PlanContent(_PlanModel):
-    """Complete Plan content before the workflow assigns a revision."""
+class StructuredPlanContent(PlanContentModel):
+    """Built-in structured Plan content used when no host schema is selected."""
+
+    schema_id = "tinkerfin.plan.structured.v1"
 
     goal: NonBlankText = Field(description="Operational goal of the Plan")
     assumptions: tuple[NonBlankText, ...] = Field(
         default=(),
         description="Assumptions that materially constrain execution",
     )
-    steps: tuple[PlanStep, ...] = Field(
+    steps: tuple[StructuredPlanStep, ...] = Field(
         min_length=1,
         description="Ordered implementation steps",
     )
@@ -87,7 +97,7 @@ class PlanContent(_PlanModel):
     )
 
     @model_validator(mode="after")
-    def step_ids_are_unique(self) -> PlanContent:
+    def step_ids_are_unique(self) -> StructuredPlanContent:
         """Require stable, unambiguous step addressing within one Plan."""
 
         step_ids = tuple(step.id for step in self.steps)
@@ -96,8 +106,41 @@ class PlanContent(_PlanModel):
         return self
 
 
-class PlanDraft(PlanContent):
-    """Versioned Plan proposed for human review."""
+class MarkdownPlanContent(PlanContentModel):
+    """Built-in Markdown Plan content preserved without whitespace rewriting."""
+
+    schema_id = "tinkerfin.plan.markdown.v1"
+    media_type = "text/markdown"
+
+    markdown: str = Field(description="Complete Markdown Plan shown to the user")
+
+    @field_validator("markdown")
+    @classmethod
+    def markdown_is_not_blank(cls, value: str) -> str:
+        """Reject blank text while preserving the exact accepted Markdown string."""
+
+        if not value.strip():
+            raise ValueError("markdown must not be blank")
+        return value
+
+
+class PlanSchemaReference(_PlanModel):
+    """Stable public identity for the content schema bound to one Plan draft."""
+
+    id: NonBlankText = Field(description="Stable host-selected content schema ID")
+    fingerprint: PlanDigest = Field(
+        description="SHA-256 of the canonical content JSON Schema"
+    )
+    media_type: NonBlankText = Field(
+        description="Media type used for the approved execution handoff"
+    )
+
+
+PlanContentT = TypeVar("PlanContentT", bound=PlanContentModel)
+
+
+class PlanDraft(_PlanModel, Generic[PlanContentT]):
+    """Versioned, schema-bound Plan content proposed for human review."""
 
     schema_version: Literal[1] = Field(
         default=1,
@@ -108,13 +151,17 @@ class PlanDraft(PlanContent):
         strict=True,
         description="Monotonic draft revision",
     )
+    content_schema: PlanSchemaReference = Field(
+        description="Content contract frozen for this Plan cycle"
+    )
+    content: PlanContentT = Field(description="Validated host-selected Plan content")
 
 
-class ConfirmedPlan(PlanDraft):
+class ConfirmedPlan(PlanDraft[PlanContentT], Generic[PlanContentT]):
     """Immutable Plan revision approved for native Deep Agent execution."""
 
     @classmethod
-    def from_draft(cls, draft: PlanDraft) -> ConfirmedPlan:
+    def from_draft(cls, draft: PlanDraft[PlanContentT]) -> Self:
         """Freeze a validated draft without changing its revision or content."""
 
         if not isinstance(draft, PlanDraft):
@@ -144,16 +191,32 @@ class PlanHandoff(_PlanModel):
 
 
 class RequirementAnswer(_PlanModel):
-    """One trusted answer captured from a clarification interrupt."""
+    """One trusted answer or explicit optional skip from a clarification interrupt."""
 
     question_id: PlanStepId = Field(description="Question ID being answered")
-    answer: NonBlankText = Field(
-        description="Trusted free text or checkpoint-derived option label"
+    answer: NonBlankText | None = Field(
+        default=None,
+        description="Trusted free text or checkpoint-derived option label, if answered",
     )
     option_id: PlanStepId | None = Field(
         default=None,
         description="Selected option ID, or None for a custom answer",
     )
+    skipped: bool = Field(
+        default=False,
+        description="Whether the user explicitly skipped an optional question",
+    )
+
+    @model_validator(mode="after")
+    def answer_matches_skip_state(self) -> RequirementAnswer:
+        """Keep answered and skipped history records mutually exclusive."""
+
+        if self.skipped:
+            if self.answer is not None or self.option_id is not None:
+                raise ValueError("skipped clarification answers cannot carry a value")
+        elif self.answer is None:
+            raise ValueError("non-skipped clarification answers require a value")
+        return self
 
 
 class PendingClarification(_PlanModel):
@@ -173,19 +236,18 @@ class ClarificationExchange(PendingClarification):
     )
 
 
-class PlanState(_PlanModel):
+class PlanState(_PlanModel, Generic[PlanContentT]):
     """Complete standalone Planning state projected through the AG-UI channel."""
 
-    workflow_version: Literal["tinkerfin.plan.v3"] = "tinkerfin.plan.v3"
+    workflow_version: Literal["tinkerfin.plan.v1"] = "tinkerfin.plan.v1"
     status: PlanStatus = PlanStatus.PLANNING
     effective_mode: Literal["default", "plan"] = "plan"
     request_message_id: NonBlankText | None = None
-    goal: NonBlankText | None = None
     pending_clarification: PendingClarification | None = None
     clarification_history: tuple[ClarificationExchange, ...] = ()
-    draft: PlanDraft | None = None
-    edited_draft: PlanContent | None = None
-    confirmed_plan: ConfirmedPlan | None = None
+    draft: PlanDraft[PlanContentT] | None = None
+    pending_edit: PlanContentT | None = None
+    confirmed_plan: ConfirmedPlan[PlanContentT] | None = None
     handoff: PlanHandoff | None = None
     feedback: tuple[NonBlankText, ...] = ()
     revision: int = Field(default=0, ge=0, strict=True)
@@ -195,13 +257,17 @@ class PlanState(_PlanModel):
 __all__ = [
     "ClarificationExchange",
     "ConfirmedPlan",
+    "MarkdownPlanContent",
     "PendingClarification",
-    "PlanContent",
+    "PlanContentModel",
+    "PlanContentT",
     "PlanDraft",
     "PlanHandoff",
     "PlanReviewAction",
+    "PlanSchemaReference",
     "PlanState",
     "PlanStatus",
-    "PlanStep",
     "RequirementAnswer",
+    "StructuredPlanContent",
+    "StructuredPlanStep",
 ]

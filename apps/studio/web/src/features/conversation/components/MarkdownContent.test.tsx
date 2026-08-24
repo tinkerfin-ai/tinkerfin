@@ -14,6 +14,7 @@ describe('MarkdownContent links', () => {
     expect(link).toHaveTextContent('https://www.baidu.com')
     expect(link).toHaveAttribute('target', '_blank')
     expect(link).toHaveAttribute('rel', 'noopener noreferrer')
+    expect(link).toHaveClass('markdown-bare-url')
     expect(link).not.toHaveTextContent('了解该网站的主营业务')
     expect(link.parentElement).toHaveTextContent(content)
   })
@@ -23,6 +24,7 @@ describe('MarkdownContent links', () => {
 
     const link = screen.getByRole('link', { name: '百度官网' })
     expect(link).toHaveAttribute('href', 'https://www.baidu.com')
+    expect(link).not.toHaveClass('markdown-bare-url')
     expect(screen.getByRole('link', { name: 'https://www.baidu.com中文说明' })).toHaveAttribute(
       'href',
       'https://example.com',
@@ -101,6 +103,15 @@ describe('MarkdownContent article contract', () => {
     expect(container.querySelector('.markdown-content p code')).toHaveTextContent('const answer = 42')
     expect(container.querySelector('.markdown-code-block__head')).toHaveTextContent('ts')
     expect(container.querySelector('.markdown-code-block pre code')).toHaveTextContent('const value = 42')
+  })
+
+  it('keeps rendered task-list markers decorative instead of exposing disabled controls', () => {
+    const { container } = render(<MarkdownContent content="- [ ] 浏览器回归" />)
+
+    const checkbox = container.querySelector('input[type="checkbox"]')
+    expect(checkbox).toHaveAttribute('aria-hidden', 'true')
+    expect(checkbox).toHaveAttribute('tabindex', '-1')
+    expect(screen.getByText('浏览器回归')).toBeInTheDocument()
   })
 
   it('copies code through the real client-side clipboard action', async () => {

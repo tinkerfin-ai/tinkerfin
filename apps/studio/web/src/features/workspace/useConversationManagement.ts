@@ -7,12 +7,14 @@ import {
 } from '../../api/conversation/history'
 import type { ToastKind } from '../../components/ui/ToastViewport'
 import type { Conversation, WorkspaceState } from '../../types'
+import { clearPlanQuestionCollapsed } from '../conversation/planQuestionCollapse'
 import {
   createNewConversation,
   removeConversation,
   updateConversation,
 } from '../../lib/workspace'
 import type { WorkspaceDialog } from './components/WorkspaceDialogs'
+import { useI18n } from '../../i18n'
 
 export function useConversationManagement({
   workspace,
@@ -29,6 +31,7 @@ export function useConversationManagement({
   hasActiveStream,
   isActiveThread,
   onToast,
+  onConversationBoundary,
 }: {
   workspace: WorkspaceState
   conversation: Conversation
@@ -44,7 +47,9 @@ export function useConversationManagement({
   hasActiveStream: () => boolean
   isActiveThread: (threadId: string) => boolean
   onToast: (kind: ToastKind, message: string) => void
+  onConversationBoundary: () => void
 }) {
+  const { t } = useI18n()
   const [dialog, setDialog] = useState<WorkspaceDialog | null>(null)
   const [dialogPending, setDialogPending] = useState(false)
   const [dialogError, setDialogError] = useState<string>()
@@ -56,6 +61,7 @@ export function useConversationManagement({
   )
 
   const performSelectConversation = (threadId: string) => {
+    if (threadId !== latest.current.workspace.currentThreadId) onConversationBoundary()
     setDraft('')
     setDraftConversation(null)
     setWorkspace((state) => ({ ...state, currentThreadId: threadId }))
@@ -63,6 +69,7 @@ export function useConversationManagement({
   }
 
   const performNewConversation = () => {
+    onConversationBoundary()
     setDraft('')
     setDraftConversation(null)
     setDraftModel(latest.current.conversation.model)
@@ -105,14 +112,14 @@ export function useConversationManagement({
       (item) => ({ ...item, pinned: nextPinned }),
     ))
     void patchConversation(threadId, { pinned: nextPinned }).then(() => {
-      onToast('success', nextPinned ? '会话已置顶' : '已取消置顶')
+      onToast('success', nextPinned ? t('会话已置顶') : t('已取消置顶'))
     }).catch(() => {
       setWorkspace((state) => updateConversation(
         state,
         threadId,
         (item) => ({ ...item, pinned: !nextPinned }),
       ))
-      onToast('error', '置顶状态更新失败，请重试')
+      onToast('error', t('置顶状态更新失败，请重试'))
     })
   }
 
@@ -145,7 +152,7 @@ export function useConversationManagement({
     try {
       if (dialog.kind === 'rename') {
         const title = value?.trim()
-        if (!title) throw new Error('会话名称不能为空')
+        if (!title) throw new Error(t('会话名称不能为空'))
         if (title !== dialog.initialValue) {
           await patchConversation(dialog.threadId, { title })
           setWorkspace((state) => updateConversation(
@@ -153,16 +160,20 @@ export function useConversationManagement({
             dialog.threadId,
             (item) => ({ ...item, title }),
           ))
-          onToast('success', '会话已重命名')
+          onToast('success', t('会话已重命名'))
         }
       } else if (dialog.kind === 'disable-plan') {
         abandonPlanInteraction(dialog.threadId)
-        onToast('info', '已关闭 Plan，下一条消息将使用 default 模式')
+        onToast('info', t('已关闭 Plan，下一条消息将使用 default 模式'))
       } else if (dialog.kind === 'delete') {
         if (dialog.isRunning) await cancelActiveRun()
         await deleteConversationApi(dialog.threadId)
+        clearPlanQuestionCollapsed(dialog.threadId)
+        if (dialog.threadId === latest.current.workspace.currentThreadId) {
+          onConversationBoundary()
+        }
         setWorkspace((state) => removeConversation(state, dialog.threadId))
-        onToast('success', '会话已删除')
+        onToast('success', t('会话已删除'))
       } else {
         if (hasActiveStream()) {
           const runningThreadId = getActiveThreadId()
@@ -170,19 +181,19 @@ export function useConversationManagement({
           detachThreadStream(
             runningThreadId,
             dialog.kind === 'detach-new'
-              ? '已新建会话，之前会话的实时输出连接已断开。'
-              : '已切换到其他会话，当前会话的实时输出连接已断开。',
+              ? t('已新建会话，之前会话的实时输出连接已断开。')
+              : t('已切换到其他会话，当前会话的实时输出连接已断开。'),
           )
         }
         if (dialog.kind === 'detach-new') performNewConversation()
         else performSelectConversation(dialog.threadId)
-        onToast('info', '已断开当前会话的实时输出')
+        onToast('info', t('已断开当前会话的实时输出'))
       }
       setDialog(null)
     } catch (error) {
       setDialogError(error instanceof Error && error.message
         ? error.message
-        : '操作失败，请稍后重试')
+        : t('操作失败，请稍后重试'))
     } finally {
       setDialogPending(false)
     }

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Literal, TypeAlias
+from dataclasses import dataclass
+from typing import Annotated, Literal, TypeAlias, cast
 
 from pydantic import (
     BaseModel,
@@ -10,12 +11,15 @@ from pydantic import (
     Field,
     JsonValue,
     TypeAdapter,
+    create_model,
     model_validator,
 )
 from pydantic.alias_generators import to_camel
 
+from ._clarification import ClarificationSchemaBinding
+from ._content import PlanContentBinding
 from .clarification import ClarificationFormBase
-from .models import NonBlankText, PlanContent, PlanStepId
+from .models import NonBlankText, PlanContentModel, PlanStepId
 
 
 class _ContractModel(BaseModel):
@@ -32,7 +36,7 @@ class PlannerOutcomeBase(_ContractModel):
 
     type: Literal["clarify", "draft", "accept_edit"]
     clarification: ClarificationFormBase | None = None
-    draft: PlanContent | None = None
+    draft: PlanContentModel | None = None
 
     @model_validator(mode="after")
     def payload_matches_type(self) -> PlannerOutcomeBase:
@@ -65,7 +69,16 @@ class ClarificationFreeTextAnswer(_ContractModel):
     answer: NonBlankText
 
 
-ClarificationAnswer: TypeAlias = ClarificationOptionAnswer | ClarificationFreeTextAnswer
+class ClarificationSkippedAnswer(_ContractModel):
+    """One explicit skip for a checkpointed optional clarification question."""
+
+    question_id: PlanStepId
+    skipped: Literal[True]
+
+
+ClarificationAnswer: TypeAlias = (
+    ClarificationOptionAnswer | ClarificationFreeTextAnswer | ClarificationSkippedAnswer
+)
 
 
 class ClarificationResponse(_ContractModel):
@@ -87,8 +100,8 @@ class ClarificationResponse(_ContractModel):
 class PlanClarificationPayload(_ContractModel):
     """Public Plan clarification payload projected through runtime metadata."""
 
-    contract: Literal["tinkerfin.plan-clarification.v1"] = Field(
-        default="tinkerfin.plan-clarification.v1",
+    contract: Literal["tinkerfin.plan-clarification.v2"] = Field(
+        default="tinkerfin.plan-clarification.v2",
         alias="schema",
     )
     form: dict[str, JsonValue]
@@ -106,10 +119,9 @@ class ApprovePlan(_ContractModel):
     base_revision: int = Field(ge=1, strict=True)
 
 
-class EditPlan(_ContractModel):
+class EditPlanBase(_ContractModel):
     type: Literal["edit"]
     base_revision: int = Field(ge=1, strict=True)
-    draft: PlanContent
 
 
 class RespondToPlan(_ContractModel):
@@ -124,29 +136,93 @@ class RejectPlan(_ContractModel):
     message: NonBlankText | None = None
 
 
-PlanReviewResponse = Annotated[
-    ApprovePlan | EditPlan | RespondToPlan | RejectPlan,
-    Field(discriminator="type"),
-]
+class PlanReviewPayloadBase(_ContractModel):
+    """Versioned review payload specialized with one concrete draft type."""
+
+    contract: Literal["tinkerfin.plan-review.v1"] = Field(
+        default="tinkerfin.plan-review.v1",
+        alias="schema",
+    )
+
+
+class PlanReviewMetadataBase(_ContractModel):
+    """Public metadata wrapper specialized with one concrete review payload."""
+
+    origin: Literal["plan"] = "plan"
+
+
+@dataclass(frozen=True, slots=True)
+class PlanContractBinding:
+    """Dynamic Planner and review contracts frozen for one Definition."""
+
+    planner_response_type: type[PlannerOutcomeBase]
+    review_response: TypeAdapter[object]
+    review_payload_type: type[_ContractModel]
+    review_metadata_type: type[_ContractModel]
+
+
+def create_plan_contract_binding(
+    clarification: ClarificationSchemaBinding,
+    content: PlanContentBinding,
+) -> PlanContractBinding:
+    """Bind one clarification form and one Plan content schema atomically."""
+
+    planner_type = create_model(
+        "PlannerOutcome",
+        __base__=PlannerOutcomeBase,
+        clarification=(clarification.form_schema | None, None),
+        draft=(content.schema | None, None),
+    )
+    edit_type = create_model(
+        "EditPlan",
+        __base__=EditPlanBase,
+        content=(content.schema, ...),
+    )
+    review_union = ApprovePlan | edit_type | RespondToPlan | RejectPlan
+    review_annotation = Annotated[
+        review_union,
+        Field(discriminator="type"),
+    ]  # pyright: ignore[reportInvalidTypeForm]
+    review_response = TypeAdapter(review_annotation)
+    review_payload_type = create_model(
+        "PlanReviewPayload",
+        __base__=PlanReviewPayloadBase,
+        draft=(content.draft_type, ...),
+    )
+    review_metadata_type = create_model(
+        "PlanReviewMetadata",
+        __base__=PlanReviewMetadataBase,
+        review=(review_payload_type, ...),
+    )
+    return PlanContractBinding(
+        planner_response_type=planner_type,
+        review_response=cast(TypeAdapter[object], review_response),
+        review_payload_type=review_payload_type,
+        review_metadata_type=review_metadata_type,
+    )
+
 
 CLARIFICATION_RESPONSE: TypeAdapter[ClarificationResponse] = TypeAdapter(
     ClarificationResponse
 )
-PLAN_REVIEW_RESPONSE: TypeAdapter[PlanReviewResponse] = TypeAdapter(PlanReviewResponse)
 
 
 __all__ = [
     "CLARIFICATION_RESPONSE",
-    "PLAN_REVIEW_RESPONSE",
     "ApprovePlan",
     "ClarificationAnswer",
     "ClarificationFreeTextAnswer",
     "ClarificationOptionAnswer",
     "ClarificationResponse",
-    "EditPlan",
+    "ClarificationSkippedAnswer",
+    "EditPlanBase",
     "PlanClarificationMetadata",
     "PlanClarificationPayload",
+    "PlanContractBinding",
+    "PlanReviewMetadataBase",
+    "PlanReviewPayloadBase",
     "PlannerOutcomeBase",
     "RejectPlan",
     "RespondToPlan",
+    "create_plan_contract_binding",
 ]

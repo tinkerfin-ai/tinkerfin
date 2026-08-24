@@ -18,13 +18,17 @@ from .._state_schema import (
     middleware_state_sources,
     state_schema_field_names,
 )
+from ._content import PlanContentBinding
 from .errors import PlanModeConfigurationError
-from .models import PlanState
+from .models import PlanContentModel, PlanState
 
 PLAN_STATE_KEY = "tinkerfin_plan"
 PLAN_SCHEMA_FINGERPRINT_KEY = "_tinkerfin_plan_clarification_schema"
-PLAN_CHECKPOINT_RUN_ID = "tinkerfin-plan-v3"
-PLAN_PRIVATE_STATE_KEYS = frozenset({PLAN_SCHEMA_FINGERPRINT_KEY})
+PLAN_CONTENT_SCHEMA_FINGERPRINT_KEY = "_tinkerfin_plan_content_schema"
+PLAN_CHECKPOINT_RUN_ID = "tinkerfin-plan-v1"
+PLAN_PRIVATE_STATE_KEYS = frozenset(
+    {PLAN_SCHEMA_FINGERPRINT_KEY, PLAN_CONTENT_SCHEMA_FINGERPRINT_KEY}
+)
 
 
 class PlanningWorkflowNodeState(DeepAgentState, total=False):
@@ -32,6 +36,7 @@ class PlanningWorkflowNodeState(DeepAgentState, total=False):
 
     tinkerfin_plan: NotRequired[dict[str, JsonValue]]
     _tinkerfin_plan_clarification_schema: NotRequired[str]
+    _tinkerfin_plan_content_schema: NotRequired[str]
 
 
 def create_plan_state_schema(
@@ -86,16 +91,19 @@ def create_plan_state_schema(
         ) from error
 
 
-def read_plan_state(state: Mapping[str, object]) -> PlanState:
+def read_plan_state(
+    state: Mapping[str, object],
+    content: PlanContentBinding,
+) -> PlanState[PlanContentModel]:
     """Return the validated Plan state stored at the reserved root key."""
 
     value = state.get(PLAN_STATE_KEY)
     if value is None:
-        return PlanState()
-    return PlanState.model_validate(value)
+        return content.state_type()
+    return content.state_type.model_validate(value)
 
 
-def plan_state_update(plan: PlanState) -> dict[str, object]:
+def plan_state_update(plan: PlanState[PlanContentModel]) -> dict[str, object]:
     """Serialize Plan state to the JSON-only durable checkpoint contract."""
 
     if not isinstance(plan, PlanState):
@@ -111,6 +119,7 @@ def plan_state_update(plan: PlanState) -> dict[str, object]:
 
 __all__ = [
     "PLAN_CHECKPOINT_RUN_ID",
+    "PLAN_CONTENT_SCHEMA_FINGERPRINT_KEY",
     "PLAN_PRIVATE_STATE_KEYS",
     "PLAN_SCHEMA_FINGERPRINT_KEY",
     "PLAN_STATE_KEY",

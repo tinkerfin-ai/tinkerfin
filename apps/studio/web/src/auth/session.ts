@@ -40,6 +40,7 @@ function sessionsEqual(first: AuthSession | null | undefined, second: AuthSessio
     && first.user.user_id === second.user.user_id
     && first.user.username === second.user.username
     && first.user.display_name === second.user.display_name
+    && first.user.avatar_url === second.user.avatar_url
     && first.user.disabled === second.user.disabled
     && first.user.roles.length === second.user.roles.length
     && first.user.roles.every((role, index) => role === second.user.roles[index])
@@ -49,26 +50,42 @@ function canUseStorage() {
   return typeof window !== 'undefined' && typeof window.localStorage !== 'undefined'
 }
 
-function isAuthUser(value: unknown): value is AuthUser {
-  if (!value || typeof value !== 'object') return false
+function normalizeAuthUser(value: unknown): AuthUser | null {
+  if (!value || typeof value !== 'object') return null
   const candidate = value as Partial<AuthUser>
-  return typeof candidate.user_id === 'number'
+  if (!(typeof candidate.user_id === 'number'
     && typeof candidate.username === 'string'
     && typeof candidate.display_name === 'string'
+    && (candidate.avatar_url == null || typeof candidate.avatar_url === 'string')
     && Array.isArray(candidate.roles)
     && candidate.roles.every((role) => typeof role === 'string')
-    && typeof candidate.disabled === 'boolean'
+    && typeof candidate.disabled === 'boolean')) return null
+  return {
+    user_id: candidate.user_id,
+    username: candidate.username,
+    display_name: candidate.display_name,
+    avatar_url: candidate.avatar_url ?? null,
+    roles: candidate.roles,
+    disabled: candidate.disabled,
+  }
 }
 
-function isAuthSession(value: unknown): value is AuthSession {
-  if (!value || typeof value !== 'object') return false
+function normalizeAuthSession(value: unknown): AuthSession | null {
+  if (!value || typeof value !== 'object') return null
   const candidate = value as Partial<AuthSession>
-  return typeof candidate.token === 'string'
+  const user = normalizeAuthUser(candidate.user)
+  if (!(typeof candidate.token === 'string'
     && candidate.token.length > 0
     && typeof candidate.tokenType === 'string'
     && typeof candidate.expiresAt === 'string'
     && Number.isFinite(Date.parse(candidate.expiresAt))
-    && isAuthUser(candidate.user)
+    && user != null)) return null
+  return {
+    token: candidate.token,
+    tokenType: candidate.tokenType,
+    expiresAt: candidate.expiresAt,
+    user,
+  }
 }
 
 export function isAuthSessionExpired(session: AuthSession, now = Date.now()): boolean {
@@ -81,13 +98,14 @@ function readStoredSession(): AuthSession | null {
   if (!raw) return null
   try {
     const parsed = JSON.parse(raw) as unknown
-    if (!isAuthSession(parsed) || isAuthSessionExpired(parsed)) {
+    const normalized = normalizeAuthSession(parsed)
+    if (!normalized || isAuthSessionExpired(normalized)) {
       window.localStorage.removeItem(AUTH_SESSION_STORAGE_KEY)
       return null
     }
     return {
-      ...parsed,
-      expiresAt: normalizeExpiresAt(parsed.expiresAt),
+      ...normalized,
+      expiresAt: normalizeExpiresAt(normalized.expiresAt),
     }
   } catch {
     window.localStorage.removeItem(AUTH_SESSION_STORAGE_KEY)

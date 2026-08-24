@@ -13,6 +13,7 @@ class UserContext:
     display_name: str
     roles: tuple[str, ...]
     disabled: bool
+    avatar_url: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

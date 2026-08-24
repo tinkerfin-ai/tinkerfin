@@ -93,35 +93,58 @@ export interface PlanQuestionOption {
   id: string
   label: string
   description?: string | null
+  recommended: boolean
   attributes?: JsonObject | null
 }
 
 export interface PlanQuestionItem {
   id: string
   prompt: string
+  required: boolean
   options: PlanQuestionOption[]
   allowFreeText: boolean
   attributes?: JsonObject | null
   selectedOptionId?: string
   customAnswer?: string
+  skipped?: boolean
 }
 
 export interface PlanQuestionState {
   kind: 'questions'
   interruptId: string
+  title: string
+  description: string
+  activeQuestionIndex: number
   form: JsonObject
   questions: PlanQuestionItem[]
   submitted: boolean
   error?: string
 }
 
+export interface PlanContentSchemaReference extends JsonObject {
+  id: 'tinkerfin.plan.markdown.v1'
+  fingerprint: string
+  mediaType: 'text/markdown'
+}
+
+export interface MarkdownPlanContent extends JsonObject {
+  markdown: string
+}
+
+export interface MarkdownPlanDraft extends JsonObject {
+  schemaVersion: 1
+  revision: number
+  contentSchema: PlanContentSchemaReference
+  content: MarkdownPlanContent
+}
+
 export interface PlanReviewState {
   kind: 'review'
   interruptId: string
   revision: number
-  draft: JsonObject
+  draft: MarkdownPlanDraft
   action?: 'approve' | 'edit' | 'respond' | 'reject'
-  editedDraft?: string
+  editedMarkdown?: string
   message?: string
   submitted: boolean
   error?: string

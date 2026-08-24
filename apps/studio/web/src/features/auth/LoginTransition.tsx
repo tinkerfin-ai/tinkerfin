@@ -4,10 +4,12 @@ import { useRef } from 'react'
 
 import { BrandMark } from '../../components/ui/BrandMark'
 import { MOTION_DURATION_SECONDS } from '../../components/ui/motion'
+import { useI18n } from '../../i18n'
 
 gsap.registerPlugin(useGSAP)
 
 export function LoginTransition({ onComplete }: { onComplete: () => void }) {
+  const { t } = useI18n()
   const rootRef = useRef<HTMLElement>(null)
   const onCompleteRef = useRef(onComplete)
   onCompleteRef.current = onComplete
@@ -29,7 +31,7 @@ export function LoginTransition({ onComplete }: { onComplete: () => void }) {
   }, { scope: rootRef })
 
   return (
-    <main id="main-content" ref={rootRef} className="login-transition" aria-label="正在进入工作区">
+    <main id="main-content" ref={rootRef} className="login-transition" aria-label={t('正在进入工作区')}>
       <span className="login-transition__mark" aria-hidden="true"><BrandMark size={28} /></span>
     </main>
   )

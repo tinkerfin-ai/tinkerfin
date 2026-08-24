@@ -330,7 +330,7 @@ async def test_projection_preserves_plan_mode_and_pending_plan_interrupt(
         model_id="main",
         input_json={
             "messages": [],
-            "forwardedProps": {"model": "main", "mode": "plan"},
+            "forwardedProps": {"model": "main", "command": {"plan": "on"}},
         },
         config_json={},
     )
@@ -366,13 +366,14 @@ async def test_projection_preserves_plan_mode_and_pending_plan_interrupt(
                                     "metadata": {
                                         "origin": "plan",
                                         "clarification": {
-                                            "schema": "tinkerfin.plan-clarification.v1",
+                                            "schema": "tinkerfin.plan-clarification.v2",
                                             "form": {
-                                                "schemaVersion": 1,
+                                                "schemaVersion": 2,
                                                 "questions": [
                                                     {
                                                         "id": "environment",
                                                         "prompt": "部署到哪里？",
+                                                        "required": True,
                                                         "options": [
                                                             {
                                                                 "id": "staging",
@@ -388,6 +389,7 @@ async def test_projection_preserves_plan_mode_and_pending_plan_interrupt(
                                                         {
                                                             "id": f"question-{index}",
                                                             "prompt": f"第 {index + 1} 个问题？",
+                                                            "required": False,
                                                             "options": [],
                                                             "allowFreeText": True,
                                                             "attributes": None,
@@ -421,9 +423,14 @@ async def test_projection_preserves_plan_mode_and_pending_plan_interrupt(
     assert snapshot["mode"] == "plan"
     assert snapshot["approval"] is None
     assert snapshot["interrupts"] == events[-1]["outcome"]["interrupts"]
-    questions = snapshot["interrupts"][0]["metadata"]["runtimeInterrupt"]["envelope"][
-        "metadata"
-    ]["clarification"]["form"]["questions"]
+    interrupts = cast(list[dict[str, object]], snapshot["interrupts"])
+    public_metadata = cast(dict[str, object], interrupts[0]["metadata"])
+    runtime_interrupt = cast(dict[str, object], public_metadata["runtimeInterrupt"])
+    envelope = cast(dict[str, object], runtime_interrupt["envelope"])
+    metadata = cast(dict[str, object], envelope["metadata"])
+    clarification = cast(dict[str, object], metadata["clarification"])
+    form = cast(dict[str, object], clarification["form"])
+    questions = cast(list[dict[str, object]], form["questions"])
     assert [question["id"] for question in questions] == [
         "environment",
         "question-1",
@@ -1686,7 +1693,7 @@ async def test_state_delta_updates_server_state_and_todo_projection(
                 "type": "STATE_SNAPSHOT",
                 "snapshot": {
                     "tinkerfin_plan": {
-                        "workflowVersion": "tinkerfin.plan.v3",
+                        "workflowVersion": "tinkerfin.plan.v1",
                         "effectiveMode": "plan",
                     },
                     "todos": [],
@@ -1724,7 +1731,7 @@ async def test_state_delta_updates_server_state_and_todo_projection(
     assert snapshot is not None
     assert snapshot["serverState"] == {
         "tinkerfin_plan": {
-            "workflowVersion": "tinkerfin.plan.v3",
+            "workflowVersion": "tinkerfin.plan.v1",
             "effectiveMode": "default",
         },
         "todos": [{"content": "验证 todo 实时输出", "status": "in_progress"}],

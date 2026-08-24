@@ -187,7 +187,7 @@ def prepare_run_request(
         identity=identity,
         graph_config=graph_config,
         message_ids=message_ids,
-        mode=request.forwarded_props.mode,
+        mode=request.forwarded_props.agent_mode,
     )
 
 

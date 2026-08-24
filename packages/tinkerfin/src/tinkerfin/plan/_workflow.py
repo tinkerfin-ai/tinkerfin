@@ -28,13 +28,14 @@ from tinkerfin_agui_adapter import RuntimeInterruptEnvelope
 
 from ._clarification import restore_form, serialize_form
 from ._config import PlanOptions
+from ._content import serialize_plan_content
 from ._contracts import (
     CLARIFICATION_RESPONSE,
-    PLAN_REVIEW_RESPONSE,
     ApprovePlan,
     ClarificationFreeTextAnswer,
     ClarificationOptionAnswer,
-    EditPlan,
+    ClarificationSkippedAnswer,
+    EditPlanBase,
     PlanClarificationMetadata,
     PlanClarificationPayload,
     RejectPlan,
@@ -43,6 +44,7 @@ from ._contracts import (
 from ._planner import create_planner_agent, invoke_planner
 from ._state import (
     PLAN_CHECKPOINT_RUN_ID,
+    PLAN_CONTENT_SCHEMA_FINGERPRINT_KEY,
     PLAN_SCHEMA_FINGERPRINT_KEY,
     PlanningWorkflowNodeState,
     create_plan_state_schema,
@@ -54,7 +56,7 @@ from .models import (
     ClarificationExchange,
     ConfirmedPlan,
     PendingClarification,
-    PlanDraft,
+    PlanContentModel,
     PlanHandoff,
     PlanReviewAction,
     PlanState,
@@ -171,7 +173,7 @@ def _request_message_id(messages: Sequence[BaseMessage]) -> str:
 
 
 def _clarification_context(
-    plan: PlanState,
+    plan: PlanState[PlanContentModel],
     options: PlanOptions,
 ) -> tuple[dict[str, JsonValue], ...]:
     context: list[dict[str, JsonValue]] = []
@@ -195,13 +197,20 @@ def _clarification_context(
     return tuple(context)
 
 
-def _require_schema_fingerprint(
+def _require_schema_fingerprints(
     state: Mapping[str, object],
     options: PlanOptions,
 ) -> None:
     if state.get(PLAN_SCHEMA_FINGERPRINT_KEY) != options.clarification.fingerprint:
         raise PlanModeConfigurationError(
             "checkpoint clarification schema does not match this Definition"
+        )
+    if (
+        state.get(PLAN_CONTENT_SCHEMA_FINGERPRINT_KEY)
+        != options.content.reference.fingerprint
+    ):
+        raise PlanModeConfigurationError(
+            "checkpoint Plan content schema does not match this Definition"
         )
 
 
@@ -261,7 +270,10 @@ def _planning_config(value: object) -> RunnableConfig:
     return config
 
 
-def _create_handoff(confirmed: ConfirmedPlan, message_id: str) -> PlanHandoff:
+def _create_handoff(
+    confirmed: ConfirmedPlan[PlanContentModel],
+    message_id: str,
+) -> PlanHandoff:
     payload = {
         "schemaVersion": 1,
         "messageId": message_id,
@@ -320,8 +332,8 @@ class PlanningWorkflowGraph(Generic[ContextT]):
     async def mark_handoff_dispatched(
         self,
         config: RunnableConfig,
-        plan: PlanState,
-    ) -> PlanState:
+        plan: PlanState[PlanContentModel],
+    ) -> PlanState[PlanContentModel]:
         """Synchronously commit the exactly-once native dispatch boundary."""
 
         handoff = plan.handoff
@@ -407,15 +419,22 @@ class _PlanningGraphFactory(Generic[ContextT]):
             self._options.planner_model or model,
             backend=backend,
             clarification=self._options.clarification,
+            content=self._options.content,
+            contracts=self._options.contracts,
             context_schema=context_schema,
         )
 
         def initialize_node(state: PlanningWorkflowNodeState) -> dict[str, object]:
             messages = _messages(cast(Mapping[str, object], state))
-            plan = PlanState(request_message_id=_request_message_id(messages))
+            plan = self._options.content.state_type(
+                request_message_id=_request_message_id(messages)
+            )
             return {
                 **plan_state_update(plan),
                 PLAN_SCHEMA_FINGERPRINT_KEY: self._options.clarification.fingerprint,
+                PLAN_CONTENT_SCHEMA_FINGERPRINT_KEY: (
+                    self._options.content.reference.fingerprint
+                ),
             }
 
         async def planner_node(
@@ -423,13 +442,13 @@ class _PlanningGraphFactory(Generic[ContextT]):
             config: RunnableConfig,
         ) -> dict[str, object]:
             mapped = cast(Mapping[str, object], state)
-            _require_schema_fingerprint(mapped, self._options)
-            current = read_plan_state(mapped)
+            _require_schema_fingerprints(mapped, self._options)
+            current = read_plan_state(mapped, self._options.content)
             outcome = await invoke_planner(
                 planner,
                 _messages(mapped),
                 current,
-                clarification=self._options.clarification,
+                contracts=self._options.contracts,
                 clarification_history=_clarification_context(
                     current,
                     self._options,
@@ -454,32 +473,37 @@ class _PlanningGraphFactory(Generic[ContextT]):
                 )
                 return plan_state_update(updated)
 
-            if current.edited_draft is not None:
+            if current.pending_edit is not None:
                 if outcome.type != "accept_edit":
                     raise PlanStructuredOutputError(
                         "Planner must clarify or accept the authoritative edited draft"
                     )
-                content = current.edited_draft
+                raw_content = current.pending_edit
             else:
                 if outcome.type != "draft" or outcome.draft is None:
                     raise PlanStructuredOutputError(
                         "Planner cannot accept an edit when no edited draft exists"
                     )
-                content = outcome.draft
+                raw_content = outcome.draft
+
+            content, _ = serialize_plan_content(
+                self._options.content,
+                raw_content,
+            )
 
             revision = current.revision + 1
-            draft = PlanDraft(
+            draft = self._options.content.draft_type(
                 revision=revision,
-                **content.model_dump(mode="python", by_alias=False),
+                content_schema=self._options.content.reference,
+                content=content,
             )
             updated = current.model_copy(
                 update={
                     "status": PlanStatus.AWAITING_REVIEW,
                     "effective_mode": "plan",
-                    "goal": draft.goal,
                     "pending_clarification": None,
                     "draft": draft,
-                    "edited_draft": None,
+                    "pending_edit": None,
                     "confirmed_plan": None,
                     "handoff": None,
                     "revision": revision,
@@ -492,8 +516,8 @@ class _PlanningGraphFactory(Generic[ContextT]):
             state: PlanningWorkflowNodeState,
         ) -> dict[str, object]:
             mapped = cast(Mapping[str, object], state)
-            _require_schema_fingerprint(mapped, self._options)
-            current = read_plan_state(mapped)
+            _require_schema_fingerprints(mapped, self._options)
+            current = read_plan_state(mapped, self._options.content)
             pending = current.pending_clarification
             if pending is None:
                 raise RuntimeError("Plan clarification requires a pending form")
@@ -503,7 +527,7 @@ class _PlanningGraphFactory(Generic[ContextT]):
             )
             envelope = RuntimeInterruptEnvelope(
                 kind="plan_clarification",
-                message="Answer the blocking questions before planning continues.",
+                message="Answer required questions and optionally refine the Plan.",
                 response_schema=_json_schema(CLARIFICATION_RESPONSE),
                 metadata=_JSON_OBJECT.validate_python(
                     metadata.model_dump(
@@ -525,7 +549,16 @@ class _PlanningGraphFactory(Generic[ContextT]):
             ordered_answers: list[RequirementAnswer] = []
             for question in form.questions:
                 answer = answers[question.id]
-                if isinstance(answer, ClarificationOptionAnswer):
+                if isinstance(answer, ClarificationSkippedAnswer):
+                    if question.required:
+                        raise ValueError(
+                            f"required clarification question {question.id!r} cannot be skipped"
+                        )
+                    normalized = RequirementAnswer(
+                        question_id=question.id,
+                        skipped=True,
+                    )
+                elif isinstance(answer, ClarificationOptionAnswer):
                     selected = next(
                         (
                             option
@@ -575,27 +608,36 @@ class _PlanningGraphFactory(Generic[ContextT]):
 
         def review_node(state: PlanningWorkflowNodeState) -> dict[str, object]:
             mapped = cast(Mapping[str, object], state)
-            _require_schema_fingerprint(mapped, self._options)
-            current = read_plan_state(mapped)
+            _require_schema_fingerprints(mapped, self._options)
+            current = read_plan_state(mapped, self._options.content)
             draft = current.draft
             if draft is None:
                 raise RuntimeError("Plan review requires a current draft")
+            review_payload = self._options.contracts.review_payload_type.model_validate(
+                {"draft": draft}
+            )
+            review_metadata = (
+                self._options.contracts.review_metadata_type.model_validate(
+                    {"review": review_payload}
+                )
+            )
             envelope = RuntimeInterruptEnvelope(
                 kind="plan_review",
                 message="Review the proposed Plan before execution begins.",
-                response_schema=_json_schema(PLAN_REVIEW_RESPONSE),
-                metadata={
-                    "origin": "plan",
-                    "planRevision": draft.revision,
-                    "draft": draft.model_dump(
+                response_schema=_json_schema(self._options.contracts.review_response),
+                metadata=_JSON_OBJECT.validate_python(
+                    review_metadata.model_dump(
                         mode="json",
                         by_alias=True,
                         exclude_none=False,
-                    ),
-                },
+                    )
+                ),
             )
-            response = PLAN_REVIEW_RESPONSE.validate_python(
-                interrupt(_runtime_interrupt_value(envelope))
+            response = cast(
+                ApprovePlan | EditPlanBase | RespondToPlan | RejectPlan,
+                self._options.contracts.review_response.validate_python(
+                    interrupt(_runtime_interrupt_value(envelope))
+                ),
             )
             if response.base_revision != draft.revision:
                 raise ValueError("Plan review baseRevision is stale")
@@ -604,7 +646,7 @@ class _PlanningGraphFactory(Generic[ContextT]):
                 message_id = current.request_message_id
                 if message_id is None:
                     raise RuntimeError("Plan approval requires its request message ID")
-                confirmed = ConfirmedPlan.from_draft(draft)
+                confirmed = self._options.content.confirmed_type.from_draft(draft)
                 updated = current.model_copy(
                     update={
                         "status": PlanStatus.APPROVED,
@@ -614,13 +656,17 @@ class _PlanningGraphFactory(Generic[ContextT]):
                         "review_action": PlanReviewAction.APPROVE,
                     }
                 )
-            elif isinstance(response, EditPlan):
+            elif isinstance(response, EditPlanBase):
+                edited = getattr(response, "content", None)
+                if not isinstance(edited, self._options.content.schema):
+                    raise TypeError(
+                        "Plan edit did not use the configured content schema"
+                    )
                 updated = current.model_copy(
                     update={
                         "status": PlanStatus.PLANNING,
                         "effective_mode": "plan",
-                        "goal": response.draft.goal,
-                        "edited_draft": response.draft,
+                        "pending_edit": edited,
                         "review_action": PlanReviewAction.EDIT,
                     }
                 )
@@ -629,7 +675,7 @@ class _PlanningGraphFactory(Generic[ContextT]):
                     update={
                         "status": PlanStatus.PLANNING,
                         "effective_mode": "plan",
-                        "edited_draft": None,
+                        "pending_edit": None,
                         "feedback": (*current.feedback, response.message),
                         "review_action": PlanReviewAction.RESPOND,
                     }
@@ -653,11 +699,17 @@ class _PlanningGraphFactory(Generic[ContextT]):
             return plan_state_update(updated)
 
         def planner_path(state: PlanningWorkflowNodeState) -> str:
-            current = read_plan_state(cast(Mapping[str, object], state))
+            current = read_plan_state(
+                cast(Mapping[str, object], state),
+                self._options.content,
+            )
             return "clarify" if current.pending_clarification is not None else "review"
 
         def review_path(state: PlanningWorkflowNodeState) -> str:
-            action = read_plan_state(cast(Mapping[str, object], state)).review_action
+            action = read_plan_state(
+                cast(Mapping[str, object], state),
+                self._options.content,
+            ).review_action
             if action is None:
                 raise RuntimeError("Plan review did not record an action")
             return action.value

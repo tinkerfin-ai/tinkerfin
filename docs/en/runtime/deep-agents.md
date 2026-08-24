@@ -82,7 +82,7 @@ Plan Mode routes a request through these boundaries:
 2. The Planner can use only `ls`, `read_file`, `glob`, and `grep`.
 3. Clarification can provide model-generated single-select options and optional free
    text; clarification and plan review pause through LangGraph interrupts.
-4. Approval freezes a `ConfirmedPlan`, commits a deterministic v3 handoff using the
+4. Approval freezes a `ConfirmedPlan`, commits a deterministic handoff using the
    original user message ID, and immediately starts the native Deep Agent.
 
 Selecting Plan requires a concrete `BaseCheckpointSaver` and an explicit Planner model.
@@ -90,8 +90,30 @@ TinkerFin never creates an in-process saver or silently weakens durability. Prod
 applications must provide a production-grade saver. Planning and the native Deep Agent
 borrow the same saver, Store, cache, backend, and runtime context. Keep the same
 `Identity.threadId` when resuming. Plan state appears at the root `tinkerfin_plan` key;
-`PlanContent`, `PlanDraft`, `ConfirmedPlan`, `PlanHandoff`, and `PlanState` are exported
-from `tinkerfin.plan`.
+`PlanContentModel`, the built-in structured and Markdown content types, `PlanDraft`,
+`ConfirmedPlan`, `PlanHandoff`, and `PlanState` are exported from `tinkerfin.plan`.
+
+Plan content defaults to `StructuredPlanContent`. Select one exact Markdown document or
+a host-defined content contract on the Plan factory:
+
+```python
+from tinkerfin.plan import MarkdownPlanContent
+
+
+agent = tinkerfin.plan(
+    planner_model="openai:gpt-5.4",
+    plan_schema=MarkdownPlanContent,
+).create_deep_agent(
+    model="openai:gpt-5.4",
+    tools=[search_orders],
+    checkpointer=production_checkpointer,
+)
+```
+
+A custom content type inherits `PlanContentModel`, declares a stable `schema_id`, and
+uses precise Pydantic fields. The selected schema is immutable for the Definition and
+the same validated content is used for draft review, authoritative edits, confirmation,
+checkpoint recovery, and execution handoff.
 
 `mode="default"` directly runs the native Deep Agent Graph. It does not execute
 Planning, add middleware, replace state schema, or create a parent Graph. Native Todo,
@@ -112,13 +134,14 @@ The schema is frozen on the returned factory and cannot be replaced by `new()`,
 subclasses; they are public, model-generated planning context rather than authoritative
 permission, billing, or compliance data.
 
-Each question uses `allow_free_text` (`allowFreeText` on the JSON boundary). Every round
-contains the non-empty set of blocking questions allowed by the bound clarification
-schema and is submitted as one complete batch. An option answer sends only `questionId`
-and `optionId`; a free-text answer sends only
-`questionId` and `answer`. The workflow restores the checkpointed form, derives an
-option's trusted label, and rejects mixed, incomplete, unknown, or stale answers. The
-Planner can ask another round before producing a draft.
+Each question explicitly sets `required` and uses `allow_free_text` (`allowFreeText` on
+the JSON boundary). A round can contain required questions, optional refinements, or only
+optional questions, and is submitted as one complete batch. An option answer sends only
+`questionId` and `optionId`; a free-text answer sends only `questionId` and `answer`; an
+optional skip sends only `questionId` and `skipped: true`. The workflow requires one
+explicit result for every checkpointed question, derives trusted option labels, rejects a
+skip for a required question, and retains skipped answers as Planner context. A Planner
+must not repeat an optional question the user explicitly skipped in the same Plan cycle.
 
 A complete user edit is authoritative. The Planner either asks for missing information
 or accepts that exact edit; it cannot silently replace it. Clarification does not change

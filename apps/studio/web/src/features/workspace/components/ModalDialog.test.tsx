@@ -13,7 +13,6 @@ function DialogHarness({ onConfirm = vi.fn() }: { onConfirm?: (value?: string) =
       <ModalDialog
         open={open}
         title="重命名会话"
-        description="输入新的会话名称。"
         inputLabel="会话名称"
         initialValue="旧标题"
         confirmLabel="保存"
@@ -60,6 +59,8 @@ describe('ModalDialog', () => {
     await user.click(opener)
     const dialog = screen.getByRole('dialog', { name: '重命名会话' })
     const input = screen.getByRole('textbox', { name: '会话名称' })
+    expect(dialog).toHaveClass('modal-dialog--action', 'has-input', 'is-default')
+    expect(screen.getByText('会话名称')).toHaveClass('visually-hidden')
     expect(input).toHaveFocus()
 
     screen.getByRole('button', { name: '关闭对话框' }).focus()
@@ -89,7 +90,7 @@ describe('ModalDialog', () => {
 
     await user.click(screen.getByRole('button', { name: '删除' }))
     expect(onConfirm).toHaveBeenCalledWith(undefined)
-    expect(screen.getByRole('dialog')).toBeInTheDocument()
+    expect(screen.getByRole('dialog')).toHaveClass('modal-dialog--action', 'is-danger')
     expect(screen.getByRole('alert')).toHaveTextContent('删除失败，请重试')
 
     rerender(

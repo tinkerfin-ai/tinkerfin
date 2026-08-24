@@ -38,6 +38,7 @@ describe('AG-UI 事件边界解析', () => {
         streamMode: 'tasks',
         runId: 'run-1',
         source: {
+          kind: 'deep_agent_subagent',
           agentType: 'subagent',
           agentName: 'researcher',
           namespace: ['tools:task-1'],
@@ -79,6 +80,76 @@ describe('AG-UI 事件边界解析', () => {
   })
 
   it.each([
+    ['TOOL_CALL_START', {
+      type: 'TOOL_CALL_START',
+      toolCallId: 'planner-outcome-1',
+      toolCallName: 'PlannerOutcome',
+      parentMessageId: 'planner-message-1',
+    }],
+    ['TOOL_CALL_ARGS', {
+      type: 'TOOL_CALL_ARGS',
+      toolCallId: 'planner-outcome-1',
+      delta: '{',
+    }],
+    ['TOOL_CALL_END', {
+      type: 'TOOL_CALL_END',
+      toolCallId: 'planner-outcome-1',
+    }],
+    ['TOOL_CALL_RESULT', {
+      type: 'TOOL_CALL_RESULT',
+      toolCallId: 'planner-outcome-1',
+      messageId: 'planner-result-1',
+      content: 'Returning structured response',
+      role: 'tool',
+    }],
+  ])('接受 compiled subgraph 的 %s', (_name, event) => {
+    const source = {
+      kind: 'compiled_subgraph',
+      nodeName: 'create_plan',
+      namespace: ['create_plan:graph-task-1'],
+      graphTaskId: 'graph-task-1',
+      parentNamespace: [],
+    }
+    const value = {
+      ...event,
+      rawEvent: {
+        streamMode: 'messages',
+        runId: 'run-plan-1',
+        langgraphNode: 'model',
+        source,
+      },
+    }
+
+    expect(parseConversationAgUiEvent(value)).toBe(value)
+  })
+
+  it('接受重复引用的 JSON 子值并拒绝真实循环', () => {
+    const shared = { file_path: '/reports/result.txt' }
+    const event = {
+      type: 'RUN_FINISHED',
+      threadId: 'thread-shared-json',
+      runId: 'run-shared-json',
+      outcome: {
+        type: 'interrupt',
+        interrupts: [{
+          id: 'interrupt-shared-json',
+          reason: 'tool_call',
+          metadata: { action: shared, projection: shared },
+        }],
+      },
+    }
+    const cycle: Record<string, unknown> = {}
+    cycle.self = cycle
+
+    expect(parseConversationAgUiEvent(event)).toBe(event)
+    expect(() => parseConversationAgUiEvent({
+      type: 'CUSTOM',
+      name: 'cycle',
+      value: cycle,
+    })).toThrow('事件流包含无效的 AG-UI 事件')
+  })
+
+  it.each([
     ['非对象', null],
     ['数组', []],
     ['缺少 type', { runId: 'run-1' }],
@@ -91,7 +162,46 @@ describe('AG-UI 事件边界解析', () => {
     ['来源 namespace 非字符串数组', {
       type: 'RUN_ERROR',
       rawEvent: {
-        source: { agentType: 'main', agentName: 'main', namespace: [1] },
+        source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [1] },
+      },
+    }],
+    ['来源 kind 未知', {
+      type: 'TOOL_CALL_START',
+      toolCallId: 'tool-unknown-kind',
+      toolCallName: 'read_file',
+      rawEvent: {
+        source: {
+          kind: 'unknown_graph',
+          agentType: 'main',
+          agentName: 'main',
+          namespace: [],
+        },
+      },
+    }],
+    ['compiled subgraph 伪造主 Agent 身份', {
+      type: 'TOOL_CALL_START',
+      toolCallId: 'tool-compiled-main',
+      toolCallName: 'PlannerOutcome',
+      rawEvent: {
+        source: {
+          kind: 'compiled_subgraph',
+          agentType: 'main',
+          agentName: 'main',
+          namespace: ['create_plan:graph-task-1'],
+        },
+      },
+    }],
+    ['Deep Agent 子 Agent 使用主 Agent 身份', {
+      type: 'TOOL_CALL_START',
+      toolCallId: 'tool-subagent-main',
+      toolCallName: 'web_search',
+      rawEvent: {
+        source: {
+          kind: 'deep_agent_subagent',
+          agentType: 'main',
+          agentName: 'researcher',
+          namespace: ['tools:graph-task-1'],
+        },
       },
     }],
     ['interrupt outcome 为空', {

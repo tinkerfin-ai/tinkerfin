@@ -8,7 +8,7 @@ import {
   type ReactNode,
 } from 'react'
 
-interface ListboxPickerProps<T extends string> {
+export interface ListboxPickerProps<T extends string> {
   value: T
   options: readonly T[]
   open: boolean
@@ -25,7 +25,7 @@ interface ListboxPickerProps<T extends string> {
   renderOption: (option: T, selected: boolean) => ReactNode
 }
 
-/** 为模型和 Agent 预设提供一致的 ARIA listbox 键盘与焦点模型 */
+/** 为不同业务选择器提供一致的 ARIA listbox 键盘与焦点模型 */
 export function ListboxPicker<T extends string>({
   value,
   options,

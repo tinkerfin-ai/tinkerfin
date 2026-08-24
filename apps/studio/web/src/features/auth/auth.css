@@ -100,13 +100,7 @@
     color: var(--color-text-primary);
     font-size: var(--type-title-size);
     font-weight: var(--weight-bold);
-    cursor: pointer;
   }
-
-  .auth-brand:hover { background: var(--color-hover); }
-  .auth-brand:active { background: var(--color-active); }
-  .auth-brand:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 2px; }
-  .auth-brand:disabled { cursor: not-allowed; opacity: .48; }
 
   .auth-intro {
     position: relative;
@@ -156,14 +150,6 @@
     animation: auth-view-in var(--motion-normal) var(--ease-out) both;
   }
 
-  .auth-view--compact {
-    text-align: center;
-  }
-
-  .auth-back {
-    margin: 0 0 var(--space-4) calc(var(--space-2) * -1);
-  }
-
   .auth-heading {
     margin-bottom: var(--space-6);
   }
@@ -184,18 +170,47 @@
     line-height: var(--type-ui-line);
   }
 
-  .auth-heading--center {
-    text-align: center;
-  }
-
   .auth-form {
     display: grid;
     gap: var(--space-3);
   }
 
   .auth-field {
-    --validated-field-error-color: var(--color-danger-text);
     min-width: 0;
+  }
+
+  .auth-field .ui-text-field__control {
+    background: transparent;
+  }
+
+  .auth-field .ui-text-field__control input:-webkit-autofill,
+  .auth-field .ui-text-field__control input:-webkit-autofill:hover,
+  .auth-field .ui-text-field__control input:-webkit-autofill:focus,
+  .auth-field .ui-text-field__control input:-webkit-autofill:active {
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: var(--color-text-primary);
+    caret-color: var(--color-text-primary);
+  }
+
+  .auth-header .theme-switcher-circle,
+  .auth-header .theme-switcher-surface {
+    border-color: transparent;
+    background: transparent;
+  }
+
+  .auth-header .theme-switcher-visual,
+  .auth-page .ui-button {
+    box-shadow: none;
+  }
+
+  .auth-page .ui-button--text:hover:not(:disabled),
+  .auth-page .ui-button--text:active:not(:disabled) {
+    transform: none;
+    background: transparent;
+    box-shadow: none;
+    color: var(--color-text-primary);
+    text-decoration: underline;
+    text-underline-offset: 2px;
   }
 
   .auth-forgot-password {
@@ -271,92 +286,16 @@
     line-height: var(--type-meta-line);
   }
 
-  .auth-demo-message,
   .auth-form-error {
     margin: 0 0 var(--space-4);
     padding: var(--space-3);
-    border: 1px solid color-mix(in srgb, var(--color-brand) 28%, transparent);
+    border: 1px solid color-mix(in srgb, var(--color-danger) 28%, transparent);
     border-radius: var(--radius-md);
-    background: var(--color-brand-soft);
-    color: var(--color-text-primary);
+    background: var(--color-danger-soft);
+    color: var(--color-danger-text);
     font-size: var(--type-meta-size);
     line-height: var(--type-meta-line);
   }
-
-  .auth-form-error {
-    border-color: color-mix(in srgb, var(--color-danger) 28%, transparent);
-    background: var(--color-danger-soft);
-    color: var(--color-danger-text);
-  }
-
-  .auth-check {
-    position: relative;
-    display: grid;
-    grid-template-columns: var(--control-lg) minmax(0, 1fr);
-    align-items: center;
-    min-height: var(--control-lg);
-    color: var(--color-text-secondary);
-    cursor: pointer;
-  }
-
-  .auth-check input {
-    position: absolute;
-    top: 0;
-    left: 0;
-    width: var(--control-lg);
-    height: var(--control-lg);
-    margin: 0;
-    opacity: 0;
-    cursor: pointer;
-  }
-
-  .auth-check > span {
-    display: grid;
-    width: var(--icon-lg);
-    height: var(--icon-lg);
-    margin-left: var(--space-3);
-    place-items: center;
-    border: 1px solid var(--color-border-strong);
-    border-radius: var(--radius-sm);
-    background: var(--color-layer-1);
-  }
-
-  .auth-check > span svg { opacity: 0; }
-  .auth-check input:checked + span { border-color: var(--color-brand); background: var(--color-brand); color: var(--color-on-brand); }
-  .auth-check input:checked + span svg { opacity: 1; }
-  .auth-check input:focus-visible + span { outline: 2px solid var(--color-focus); outline-offset: 2px; }
-  .auth-check small { font-size: var(--type-caption-size); line-height: var(--type-caption-line); }
-
-  .auth-status-icon {
-    display: grid;
-    width: 54px;
-    height: 54px;
-    margin: 0 auto var(--space-5);
-    place-items: center;
-    border: 1px solid var(--color-border);
-    border-radius: var(--radius-2xl);
-    background: var(--color-brand-soft);
-    color: var(--color-brand-text);
-  }
-
-  .auth-otp {
-    width: 100%;
-    min-height: var(--control-xl);
-    padding: 0 var(--space-4);
-    border: 1px solid var(--color-border);
-    border-radius: var(--radius-xl);
-    outline: 0;
-    background: var(--color-layer-1);
-    color: var(--color-text-primary);
-    text-align: center;
-    font-family: var(--font-code);
-    font-size: var(--type-h3-size);
-    font-weight: var(--weight-semibold);
-    letter-spacing: .45em;
-    text-indent: .45em;
-  }
-
-  .auth-otp:focus { border-color: var(--color-focus); box-shadow: var(--shadow-focus); }
 
   .auth-legal {
     position: absolute;
@@ -377,15 +316,6 @@
 
   [data-validation-feedback='invalid'] {
     will-change: transform;
-  }
-
-  .validated-field-error {
-    display: block;
-    margin-top: var(--space-1-5);
-    color: var(--color-danger-text);
-    font-size: var(--type-caption-size);
-    font-weight: var(--weight-medium);
-    line-height: var(--type-caption-line);
   }
 
   @keyframes auth-view-in {
@@ -447,8 +377,7 @@
       font-size: var(--type-meta-size);
     }
 
-    .ui-text-field__control input,
-    .auth-otp {
+    .ui-text-field__control input {
       font-size: var(--type-body-size);
     }
   }
@@ -472,16 +401,14 @@
     .auth-page,
     .auth-panel,
     .auth-signal-core,
-    .auth-demo-message,
-    .auth-form-error,
-    .auth-otp {
+    .auth-form-error {
       background: Canvas;
       color: CanvasText;
     }
 
     .auth-signal-orbit,
     .auth-signal-core,
-    .auth-otp {
+    .auth-field .ui-text-field__control {
       border-color: ButtonText;
     }
   }
@@ -489,6 +416,10 @@
   @media (prefers-reduced-motion: reduce) {
     .auth-view {
       animation: none;
+    }
+
+    .auth-field .ui-text-field__control {
+      transition: none;
     }
   }
 }

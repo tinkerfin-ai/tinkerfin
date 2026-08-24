@@ -32,6 +32,10 @@ export interface ConversationHistoryListResponse {
   nextCursor?: string | null
 }
 
+export interface ConversationHistoryGroupConfig {
+  dayRanges: number[]
+}
+
 export interface ConversationSnapshotJson {
   snapshotSeq: number
   snapshotVersion: 3
@@ -107,6 +111,7 @@ export const fetchConversationHistoryList = (
   params: {
     pageSize?: number
     cursor?: string | null
+    query?: string | null
     signal?: AbortSignal
     suppressGlobalError?: boolean
   } = {},
@@ -114,6 +119,7 @@ export const fetchConversationHistoryList = (
   const search = new URLSearchParams()
   if (params.pageSize) search.set('pageSize', String(params.pageSize))
   if (params.cursor) search.set('cursor', params.cursor)
+  if (params.query) search.set('query', params.query)
   const query = search.toString() ? `?${search.toString()}` : ''
   return requestJson<ConversationHistoryListResponse>(
     `${CONVERSATION_API_PATH}/history${query}`,
@@ -123,6 +129,13 @@ export const fetchConversationHistoryList = (
     },
   )
 }
+
+export const fetchConversationHistoryGroupConfig = (
+  options: { signal?: AbortSignal; suppressGlobalError?: boolean } = {},
+): Promise<ConversationHistoryGroupConfig> => requestJson<ConversationHistoryGroupConfig>(
+  `${CONVERSATION_API_PATH}/config`,
+  options,
+)
 
 export const fetchConversationHistoryDetail = (
   threadId: string,

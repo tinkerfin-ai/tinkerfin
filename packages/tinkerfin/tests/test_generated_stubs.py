@@ -157,6 +157,8 @@ def test_root_stub_keeps_plan_annotation_dependencies_private() -> None:
     assert aliases == {
         "ClarificationFormBase": "_ClarificationFormBase",
         "DefaultClarificationForm": "_DefaultClarificationForm",
+        "PlanContentModel": "_PlanContentModel",
+        "StructuredPlanContent": "_StructuredPlanContent",
     }
     plan = _stub_method(_INIT_STUB, "TinkerFin", "plan")
     index = next(
@@ -170,6 +172,17 @@ def test_root_stub_keeps_plan_annotation_dependencies_private() -> None:
     default = plan.args.kw_defaults[index]
     assert isinstance(default, ast.Name)
     assert default.id == "_DefaultClarificationForm"
+    plan_schema_index = next(
+        index
+        for index, argument in enumerate(plan.args.kwonlyargs)
+        if argument.arg == "plan_schema"
+    )
+    plan_schema_annotation = plan.args.kwonlyargs[plan_schema_index].annotation
+    assert plan_schema_annotation is not None
+    assert ast.unparse(plan_schema_annotation) == "type[_PlanContentModel]"
+    plan_schema_default = plan.args.kw_defaults[plan_schema_index]
+    assert isinstance(plan_schema_default, ast.Name)
+    assert plan_schema_default.id == "_StructuredPlanContent"
 
 
 def test_built_wheel_contains_the_generated_stubs(tmp_path: Path) -> None:

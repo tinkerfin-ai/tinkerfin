@@ -118,7 +118,22 @@ def _persisted_plan_interrupt(
         "kind": kind,
         "message": "请确认 Plan",
         "responseSchema": {"type": "object"},
-        "metadata": {"origin": "plan", "planRevision": 1},
+        "metadata": {
+            "origin": "plan",
+            "review": {
+                "schema": "tinkerfin.plan-review.v1",
+                "draft": {
+                    "schemaVersion": 1,
+                    "revision": 1,
+                    "contentSchema": {
+                        "id": "tinkerfin.plan.markdown.v1",
+                        "fingerprint": "0" * 64,
+                        "mediaType": "text/markdown",
+                    },
+                    "content": {"markdown": "# 执行计划"},
+                },
+            },
+        },
     }
     return {
         "id": interrupt_id,
@@ -213,7 +228,7 @@ def test_persisted_resume_rejects_malformed_prior_tool_call_ids(
             "messages": [],
             "tools": [],
             "context": [],
-            "forwardedProps": {"model": "main", "mode": "default"},
+            "forwardedProps": {"model": "main", "command": {"plan": "off"}},
             "resume": [
                 {
                     "interruptId": "interrupt-1",
@@ -253,7 +268,7 @@ def test_prepare_resume_abandons_plan_without_creating_a_graph_command() -> None
             "messages": [],
             "tools": [],
             "context": [],
-            "forwardedProps": {"model": "main", "mode": "default"},
+            "forwardedProps": {"model": "main", "command": {"plan": "off"}},
             "resume": [
                 {
                     "interruptId": interrupt_id,
@@ -333,7 +348,7 @@ async def test_non_empty_thread_id_must_belong_to_the_current_user(
                     "messages": [{"role": "user", "content": "继续"}],
                     "tools": [],
                     "context": [],
-                    "forwardedProps": {"model": "main", "mode": "default"},
+                    "forwardedProps": {"model": "main", "command": {"plan": "off"}},
                 }
             ),
             last_event_id=None,
@@ -425,7 +440,7 @@ async def test_chat_does_not_filter_optional_deep_agent_state_channels(
                 "messages": [{"role": "user", "content": "你好"}],
                 "tools": [],
                 "context": [],
-                "forwardedProps": {"model": "main", "mode": "plan"},
+                "forwardedProps": {"model": "main", "command": {"plan": "on"}},
             }
         )
         prepared = await service.start(
@@ -509,7 +524,7 @@ async def test_concurrent_empty_thread_retries_share_one_thread_and_run(
             "messages": [{"role": "user", "content": "并发重试"}],
             "tools": [],
             "context": [],
-            "forwardedProps": {"model": "main", "mode": "default"},
+            "forwardedProps": {"model": "main", "command": {"plan": "off"}},
         }
     )
     user = UserContext(
@@ -773,7 +788,7 @@ async def test_concurrent_resume_claims_one_interrupt_for_exactly_one_run(
                 "messages": [],
                 "tools": [],
                 "context": [],
-                "forwardedProps": {"model": "main", "mode": "default"},
+                "forwardedProps": {"model": "main", "command": {"plan": "off"}},
                 "resume": [
                     {
                         "interruptId": public_interrupt_id,
@@ -934,7 +949,7 @@ async def test_plan_abandon_claim_blocks_a_competing_resolved_resume(
                 "context": [],
                 "forwardedProps": {
                     "model": "main",
-                    "mode": "default" if cancelled else "plan",
+                    "command": {"plan": "off" if cancelled else "on"},
                 },
                 "resume": [entry],
             }
@@ -1200,7 +1215,7 @@ async def test_concurrent_same_run_resume_attaches_without_reopening_agent(
             "messages": [],
             "tools": [],
             "context": [],
-            "forwardedProps": {"model": "main", "mode": "default"},
+            "forwardedProps": {"model": "main", "command": {"plan": "off"}},
             "resume": [
                 {
                     "interruptId": interrupt_id,
@@ -1373,7 +1388,7 @@ async def test_resume_preflight_failure_releases_interrupt_claim(
             "messages": [],
             "tools": [],
             "context": [],
-            "forwardedProps": {"model": "main", "mode": "default"},
+            "forwardedProps": {"model": "main", "command": {"plan": "off"}},
             "resume": [
                 {
                     "interruptId": interrupt_id,
@@ -1518,7 +1533,7 @@ async def test_resume_requires_every_pending_interrupt_before_creating_run(
             "messages": [],
             "tools": [],
             "context": [],
-            "forwardedProps": {"model": "main", "mode": "default"},
+            "forwardedProps": {"model": "main", "command": {"plan": "off"}},
             "resume": [
                 {
                     "interruptId": first_id,
@@ -1583,7 +1598,7 @@ async def test_resume_requires_every_pending_interrupt_before_creating_run(
             "messages": [],
             "tools": [],
             "context": [],
-            "forwardedProps": {"model": "main", "mode": "default"},
+            "forwardedProps": {"model": "main", "command": {"plan": "off"}},
             "resume": [
                 {
                     "interruptId": second_id,
@@ -1766,7 +1781,7 @@ async def test_cancelled_preflight_waits_for_a_definitive_messaging_outcome(
             "messages": [],
             "tools": [],
             "context": [],
-            "forwardedProps": {"model": "main", "mode": "default"},
+            "forwardedProps": {"model": "main", "command": {"plan": "off"}},
             "resume": [
                 {
                     "interruptId": interrupt_id,
@@ -1920,7 +1935,7 @@ async def test_delete_rejects_a_committed_run_before_messaging_preflight(
             "messages": [{"role": "user", "content": "等待预握手"}],
             "tools": [],
             "context": [],
-            "forwardedProps": {"model": "main", "mode": "default"},
+            "forwardedProps": {"model": "main", "command": {"plan": "off"}},
         }
     )
     async with database.session() as chat_session, database.session() as delete_session:
@@ -1990,7 +2005,7 @@ async def test_completed_run_attachment_preflight_does_not_hold_the_thread_trans
             "messages": [{"role": "user", "content": "重放完成 run"}],
             "tools": [],
             "context": [],
-            "forwardedProps": {"model": "main", "mode": "default"},
+            "forwardedProps": {"model": "main", "command": {"plan": "off"}},
         }
     )
     async with database.session() as setup_session:
@@ -2294,7 +2309,7 @@ async def test_immediate_resume_reconciles_committed_interrupt_before_claim(
                         "messages": [{"role": "user", "content": "写入文件"}],
                         "tools": [],
                         "context": [],
-                        "forwardedProps": {"model": "main", "mode": "default"},
+                        "forwardedProps": {"model": "main", "command": {"plan": "off"}},
                     }
                 ),
                 last_event_id="0",
@@ -2373,7 +2388,7 @@ async def test_immediate_resume_reconciles_committed_interrupt_before_claim(
                             "context": [],
                             "forwardedProps": {
                                 "model": "main",
-                                "mode": "default",
+                                "command": {"plan": "off"},
                             },
                             "resume": [
                                 {
@@ -2508,7 +2523,7 @@ async def test_cancel_waits_for_the_durable_cancelled_terminal(
                     "messages": [{"role": "user", "content": "等待"}],
                     "tools": [],
                     "context": [],
-                    "forwardedProps": {"model": "main", "mode": "default"},
+                    "forwardedProps": {"model": "main", "command": {"plan": "off"}},
                 }
             ),
             last_event_id=None,

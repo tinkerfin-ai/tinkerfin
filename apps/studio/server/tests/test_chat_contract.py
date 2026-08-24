@@ -13,8 +13,8 @@ from tinkerfin_studio.conversation.run_preparation import (
 from tinkerfin_studio.conversation.service import parse_last_event_id
 
 
-def test_chat_request_preserves_plan_mode_without_interpreting_it() -> None:
-    """plan 模式应留在 forwardedProps，而不是改变请求结构"""
+def test_chat_request_preserves_command_extensions_and_derives_plan_mode() -> None:
+    """command 扩展应完整保留，plan 状态只在运行准备边界解释"""
 
     request = ChatRequest.from_agui(
         RunAgentInput.model_validate(
@@ -27,7 +27,11 @@ def test_chat_request_preserves_plan_mode_without_interpreting_it() -> None:
                 ],
                 "tools": [],
                 "context": [],
-                "forwardedProps": {"model": "main", "mode": "plan", "trace": "x"},
+                "forwardedProps": {
+                    "model": "main",
+                    "command": {"plan": "on", "compact": "保留这段命令输入"},
+                    "trace": "x",
+                },
             }
         )
     )
@@ -48,9 +52,40 @@ def test_chat_request_preserves_plan_mode_without_interpreting_it() -> None:
     ]
     assert payload["forwardedProps"] == {
         "model": "main",
-        "mode": "plan",
+        "command": {"plan": "on", "compact": "保留这段命令输入"},
         "trace": "x",
     }
+    prepared = prepare_run_request(request, user_id=7, thread_id="thread-1")
+    assert prepared.mode == "plan"
+
+
+@pytest.mark.parametrize(
+    "forwarded_props",
+    (
+        {"model": "main", "mode": "plan"},
+        {"model": "main", "command": {"plan": "invalid"}},
+        {"model": "main", "command": {}},
+    ),
+)
+def test_chat_request_rejects_removed_or_invalid_plan_commands(
+    forwarded_props: dict[str, object],
+) -> None:
+    """当前请求必须只使用精确的 command.plan 契约"""
+
+    with pytest.raises(ValidationError):
+        ChatRequest.from_agui(
+            RunAgentInput.model_validate(
+                {
+                    "threadId": "",
+                    "runId": "run-invalid-command",
+                    "state": {},
+                    "messages": [],
+                    "tools": [],
+                    "context": [],
+                    "forwardedProps": forwarded_props,
+                }
+            )
+        )
 
 
 def test_chat_request_drops_the_protocol_message_id() -> None:
@@ -67,7 +102,7 @@ def test_chat_request_drops_the_protocol_message_id() -> None:
                 ],
                 "tools": [],
                 "context": [],
-                "forwardedProps": {"model": "main", "mode": "default"},
+                "forwardedProps": {"model": "main", "command": {"plan": "off"}},
             }
         )
     )
@@ -152,7 +187,7 @@ def test_from_agui_preserves_standard_roles_multimodal_content_and_extensions() 
             "context": [{"description": "tenant", "value": "acme", "vendor": "kept"}],
             "forwardedProps": {
                 "model": "main",
-                "mode": "default",
+                "command": {"plan": "off"},
                 "trace": {"sampled": True},
             },
         }
@@ -207,7 +242,7 @@ def test_multimodal_start_maps_only_the_selected_user_input_to_graph() -> None:
                 ],
                 "tools": [],
                 "context": [],
-                "forwardedProps": {"model": "main", "mode": "default"},
+                "forwardedProps": {"model": "main", "command": {"plan": "off"}},
             }
         )
     )
@@ -240,7 +275,7 @@ def test_client_message_id_does_not_change_the_canonical_business_snapshot() -> 
                     ],
                     "tools": [],
                     "context": [],
-                    "forwardedProps": {"model": "main", "mode": "default"},
+                    "forwardedProps": {"model": "main", "command": {"plan": "off"}},
                 }
             )
         )
@@ -273,7 +308,7 @@ def test_chat_request_rejects_noncanonical_run_id(run_id: str) -> None:
                 "messages": [{"role": "user", "content": "执行任务"}],
                 "tools": [],
                 "context": [],
-                "forwardedProps": {"model": "main", "mode": "default"},
+                "forwardedProps": {"model": "main", "command": {"plan": "off"}},
             }
         )
 
@@ -289,12 +324,23 @@ def test_last_event_id_rejects_noncanonical_values(value: str) -> None:
 
 
 def test_conversation_routes_are_registered_with_the_locked_paths() -> None:
-    """应用 OpenAPI 应暴露旧接口和新增取消接口"""
+    """应用 OpenAPI 应暴露固定的会话查询与运行接口"""
 
     paths = create_application(lifespan=None).openapi()["paths"]
 
     assert "/api/conversation/chat" in paths
     assert "/api/conversation/history" in paths
+    assert "/api/conversation/config" in paths
     assert "/api/conversation/{thread_id}/history" in paths
     assert "/api/conversation/{thread_id}/events" in paths
     assert "/api/conversation/{thread_id}/runs/{run_id}/cancel" in paths
+    history_parameters = paths["/api/conversation/history"]["get"]["parameters"]
+    assert {
+        parameter["name"]
+        for parameter in history_parameters
+        if parameter["in"] == "query"
+    } == {
+        "pageSize",
+        "cursor",
+        "query",
+    }

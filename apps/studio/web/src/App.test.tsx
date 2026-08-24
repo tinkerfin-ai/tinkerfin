@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type {
   ConversationEventEnvelope,
   ConversationHistoryDetail,
+  ConversationHistoryGroupConfig,
   ConversationHistoryListItem,
   ConversationHistoryListResponse,
   ConversationSnapshotJson,
@@ -21,12 +22,14 @@ import {
   readActiveRunSession,
   writeActiveRunSession,
 } from './features/conversation/stream/activeRunSession'
+import { planQuestionCollapseKey } from './features/conversation/planQuestionCollapse'
 import { normalizeAppLocation } from './lib/threadRoute'
 
 const TEST_USER = {
   user_id: 7,
   username: 'yunsan',
   display_name: '云杉',
+  avatar_url: null,
   roles: [],
   disabled: false,
 }
@@ -190,7 +193,7 @@ function assistantHistoryEvents(
 ): ConversationEventEnvelope[] {
   const mainRawEvent = {
     streamMode: 'messages' as const,
-    source: { agentType: 'main' as const, agentName: 'main', namespace: [] },
+    source: { kind: 'root' as const, agentType: 'main' as const, agentName: 'main', namespace: [] },
     runId,
   }
   return [
@@ -241,8 +244,13 @@ type FetchMockOptions = {
   streams?: ConversationAgUiEvent[][]
   keepOpen?: boolean
   historyLists?: ConversationHistoryListResponse[]
-  historyListResolver?: (requestIndex: number, chatRequestCount: number) => ConversationHistoryListResponse
+  historyListResolver?: (
+    requestIndex: number,
+    chatRequestCount: number,
+    url: URL,
+  ) => ConversationHistoryListResponse
   historyDetails?: Record<string, ConversationHistoryDetail>
+  historyGroupConfig?: ConversationHistoryGroupConfig
   eventEnvelopes?: Record<string, ConversationEventEnvelope[]>
   eventEnvelopeResolver?: (
     threadId: string,
@@ -268,6 +276,7 @@ function installFetchMock(options: FetchMockOptions = {}) {
     historyLists = [{ items: [], nextCursor: null }],
     historyListResolver,
     historyDetails = {},
+    historyGroupConfig = { dayRanges: [7, 30] },
     eventEnvelopes = {},
     eventEnvelopeResolver,
     modelCatalog = DEFAULT_MODEL_CATALOG,
@@ -295,6 +304,10 @@ function installFetchMock(options: FetchMockOptions = {}) {
 
     if (url.pathname.endsWith('/api/models')) {
       return jsonResponse(modelCatalog)
+    }
+
+    if (url.pathname.endsWith('/api/conversation/config')) {
+      return jsonResponse(historyGroupConfig)
     }
 
     if (method === 'POST' && /\/api\/conversation\/[^/]+\/runs\/[^/]+\/cancel$/.test(url.pathname)) {
@@ -357,7 +370,7 @@ function installFetchMock(options: FetchMockOptions = {}) {
 
     if (url.pathname.endsWith('/api/conversation/history')) {
       const response = historyListResolver
-        ? historyListResolver(historyListIndex, streamIndex)
+        ? historyListResolver(historyListIndex, streamIndex, url)
         : historyLists[Math.min(historyListIndex, historyLists.length - 1)] ?? { items: [], nextCursor: null }
       historyListIndex += 1
       return jsonResponse(response)
@@ -439,6 +452,30 @@ function chatRequestAt(fetchMock: ReturnType<typeof installFetchMock>, index: nu
   return chatCalls[index]?.[1]
 }
 
+function chatRequests(fetchMock: ReturnType<typeof installFetchMock>): ChatRequestPayload[] {
+  return fetchMock.mock.calls
+    .filter(([input, init]) => (
+      fetchCallMethod(input, init) === 'POST'
+      && new URL(fetchCallUrl(input), 'http://localhost').pathname.endsWith('/api/conversation/chat')
+    ))
+    .map(([, init]) => JSON.parse(String(init?.body)) as ChatRequestPayload)
+}
+
+function installHistoryIntersectionObserver() {
+  const callbacks: IntersectionObserverCallback[] = []
+  vi.stubGlobal('IntersectionObserver', class {
+    readonly root = null
+    readonly rootMargin = ''
+    readonly thresholds = [0]
+    constructor(callback: IntersectionObserverCallback) { callbacks.push(callback) }
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+    takeRecords() { return [] }
+  })
+  return callbacks
+}
+
 describe('App', () => {
   beforeEach(() => {
     window.localStorage.clear()
@@ -463,7 +500,15 @@ describe('App', () => {
 
     render(<App />)
 
-    expect(await screen.findByText('发送一条消息，开始新的真实对话流。')).toBeInTheDocument()
+    expect(await screen.findByText('发送一条消息，开始新的真实对话流。')).toHaveClass('visually-hidden')
+    const emptyBrand = document.querySelector<HTMLElement>('.empty-brand-lockup')
+    expect(emptyBrand).toHaveTextContent('TinkerFinPlus')
+    expect(emptyBrand?.querySelector('.brand-mark svg')).toHaveAttribute('width', '34')
+    expect(emptyBrand?.closest('.composer-dock')).toHaveClass('is-hero')
+    const conversationPane = screen.getByRole('region', { name: '对话内容' })
+    expect(conversationPane).toHaveClass('ui-scrollbar')
+    expect(conversationPane.parentElement?.querySelector('.ui-scrollbar-overlay')).toBeInTheDocument()
+    expect(conversationPane).not.toContainElement(emptyBrand)
     expect(screen.queryByRole('button', { name: '回到底部' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: '模型设置' })).not.toBeInTheDocument()
     expect(screen.queryByText('研究助手')).not.toBeInTheDocument()
@@ -483,7 +528,7 @@ describe('App', () => {
         messages: [{ id: 'deleted-message', role: 'user', content: 'stale' }],
         tools: [],
         context: [],
-        forwardedProps: { mode: 'default', model: 'GPT-5.5' },
+        forwardedProps: { model: 'GPT-5.5', command: { plan: 'off' } },
       },
     })
     installFetchMock({ historyLists: [{ items: [], nextCursor: null }] })
@@ -526,45 +571,78 @@ describe('App', () => {
 
     expect(longLabel).toHaveClass('is-overflowing')
     expect(longLabel.style.getPropertyValue('--overflow-marquee-distance')).toBe('36px')
-    expect(longLabel.style.getPropertyValue('--overflow-marquee-pause-duration')).toBe('800ms')
-    expect(longLabel.style.getPropertyValue('--overflow-marquee-travel-duration')).toBe('1000ms')
+    expect(longLabel.style.getPropertyValue('--overflow-marquee-travel-duration')).toBe('1125ms')
   })
 
-  it('uses lowercase Agent modes and forwards the selected plan mode', async () => {
+  it('enables Plan through /plan and forwards command.plan on the next message', async () => {
     const fetchMock = installFetchMock({ streams: [[]] })
-    const user = userEvent.setup()
     render(<App />)
 
-    const presetButton = screen.getByRole('button', { name: '当前 Agent 预设' })
-    await user.click(presetButton)
-
-    expect(screen.getByRole('option', { name: 'default' })).toHaveAttribute('aria-selected', 'true')
-    await user.click(screen.getByRole('option', { name: 'plan' }))
-
-    expect(presetButton).toHaveTextContent('plan')
-    expect(within(presetButton).getByText('plan')).toHaveClass('agent-preset-label')
-    expect(presetButton).toHaveAttribute('aria-expanded', 'false')
-    expect(screen.queryByRole('listbox', { name: 'Agent 预设选项' })).not.toBeInTheDocument()
+    await sendMessage('/plan')
+    expect(screen.getByRole('button', { name: 'Plan 已开启，点击关闭' })).toBeEnabled()
+    expect(chatRequestAt(fetchMock, 0)).toBeUndefined()
+    expect(screen.queryByRole('button', { name: '当前 Agent 预设' })).not.toBeInTheDocument()
 
     await sendMessage('按计划处理')
     const request = JSON.parse(String(chatRequestAt(fetchMock, 0)?.body)) as ChatRequestPayload
-    expect(request.forwardedProps).toEqual({ model: 'GPT-5.5', mode: 'plan' })
+    expect(request.forwardedProps).toEqual({ model: 'GPT-5.5', command: { plan: 'on' } })
   })
 
-  it('disables Agent mode changes until an active stream is cancelled and cleaned up', async () => {
+  it('strips /plan from a plan message and reserves closing for the Plan chip', async () => {
+    const fetchMock = installFetchMock({ streams: [[]] })
+    render(<App />)
+
+    await sendMessage('/plan 生成发布清单')
+    const request = JSON.parse(String(chatRequestAt(fetchMock, 0)?.body)) as ChatRequestPayload
+    expect(request.messages[0]?.content).toBe('生成发布清单')
+    expect(request.forwardedProps.command.plan).toBe('on')
+    expect(screen.getByRole('button', { name: 'Plan 已开启，点击关闭' })).toBeInTheDocument()
+
+    await waitFor(() => expect(screen.getByLabelText('消息输入')).toBeEnabled())
+    await userEvent.setup().type(screen.getByLabelText('消息输入'), '/plan off')
+    await userEvent.setup().click(screen.getByRole('button', { name: '发送消息' }))
+    expect(chatRequestAt(fetchMock, 1)).toBeUndefined()
+    expect(screen.getByText('请点击输入框中的 Plan 按钮关闭')).toBeInTheDocument()
+  })
+
+  it('keeps local attachments across text sends without adding them to the request', async () => {
+    const fetchMock = installFetchMock({ streams: [[]] })
+    const user = userEvent.setup()
+    render(<App />)
+    await waitFor(() => expect(screen.getByLabelText('消息输入')).toBeEnabled())
+
+    const fileInput = document.querySelector('input[type="file"]')
+    if (!(fileInput instanceof HTMLInputElement)) throw new Error('缺少本地附件输入')
+    const documentFile = new File(['pdf'], 'local-only.pdf', { type: 'application/pdf' })
+    fireEvent.change(fileInput, { target: { files: [documentFile] } })
+    expect(screen.getByText('local-only.pdf')).toBeInTheDocument()
+
+    await sendMessage('只发送这段文字')
+    const request = JSON.parse(String(chatRequestAt(fetchMock, 0)?.body)) as ChatRequestPayload
+    expect(request.messages).toEqual([
+      expect.objectContaining({ role: 'user', content: '只发送这段文字' }),
+    ])
+    expect(JSON.stringify(request)).not.toContain('local-only.pdf')
+    expect(screen.getByText('local-only.pdf')).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: '新会话' }))
+    expect(screen.queryByText('local-only.pdf')).not.toBeInTheDocument()
+  })
+
+  it('locks the active Plan chip until an active stream is cancelled and cleaned up', async () => {
     installFetchMock({
       streams: [[{ type: 'RUN_STARTED', threadId: THREAD_ID, runId: FIRST_RUN_ID }]],
       keepOpen: true,
     })
     render(<App />)
 
+    await sendMessage('/plan')
     await sendMessage('保持流运行')
-    const presetButton = screen.getByRole('button', { name: '当前 Agent 预设' })
-    await waitFor(() => expect(presetButton).toBeDisabled())
-    expect(screen.queryByRole('listbox', { name: 'Agent 预设选项' })).not.toBeInTheDocument()
+    const planButton = screen.getByRole('button', { name: 'Plan 已开启，点击关闭' })
+    await waitFor(() => expect(planButton).toBeDisabled())
 
     await userEvent.setup().click(await screen.findByRole('button', { name: '停止任务' }))
-    await waitFor(() => expect(presetButton).toBeEnabled())
+    await waitFor(() => expect(planButton).toBeEnabled())
   })
 
   it('abandons a pending Plan before switching the thread to default', async () => {
@@ -586,11 +664,19 @@ describe('App', () => {
                   runtimeInterrupt: {
                     envelope: {
                       metadata: {
-                        planRevision: 1,
-                        draft: {
-                          revision: 1,
-                          goal: '实现模式切换',
-                          steps: [{ id: 'step-1', title: '实现', description: '保持父图稳定' }],
+                        origin: 'plan',
+                        review: {
+                          schema: 'tinkerfin.plan-review.v1',
+                          draft: {
+                            schemaVersion: 1,
+                            revision: 1,
+                            contentSchema: {
+                              id: 'tinkerfin.plan.markdown.v1',
+                              fingerprint: '0'.repeat(64),
+                              mediaType: 'text/markdown',
+                            },
+                            content: { markdown: '# 实现模式切换\n\n保持父图稳定' },
+                          },
                         },
                       },
                     },
@@ -613,29 +699,33 @@ describe('App', () => {
     })
     const user = userEvent.setup()
     render(<App />)
-    const presetButton = screen.getByRole('button', { name: '当前 Agent 预设' })
-    await user.click(presetButton)
-    await user.click(screen.getByRole('option', { name: 'plan' }))
-    await sendMessage('先生成计划')
+    await sendMessage('/plan 先生成计划')
     expect(await screen.findByLabelText('Plan 审阅')).toBeInTheDocument()
 
-    await user.click(presetButton)
-    await user.click(screen.getByRole('option', { name: 'default' }))
+    await user.click(screen.getByRole('button', { name: 'Plan 已开启，点击关闭' }))
     const dialog = await screen.findByRole('dialog', { name: '关闭当前 Plan？' })
     expect(within(dialog).getByText(/Tool\/Filesystem 审批不受影响/)).toBeInTheDocument()
     await user.click(within(dialog).getByRole('button', { name: '关闭 Plan' }))
 
-    await waitFor(() => expect(chatRequestAt(fetchMock, 1)).toBeDefined())
-    const abandonRequest = JSON.parse(String(chatRequestAt(fetchMock, 1)?.body)) as ChatRequestPayload
-    expect(abandonRequest.forwardedProps).toEqual({ model: 'GPT-5.5', mode: 'default' })
+    await waitFor(() => expect(chatRequests(fetchMock).some(
+      (request) => request.resume?.some((item) => item.status === 'cancelled'),
+    )).toBe(true))
+    const requests = chatRequests(fetchMock)
+    expect(requests.filter((request) => request.messages.length > 0 && request.forwardedProps.command.plan === 'on')).toHaveLength(1)
+    const abandonRequest = requests.find(
+      (request) => request.resume?.some((item) => item.status === 'cancelled'),
+    )
+    expect(abandonRequest).toBeDefined()
+    if (!abandonRequest) throw new Error('缺少取消 Plan 请求')
+    expect(abandonRequest.forwardedProps).toEqual({ model: 'GPT-5.5', command: { plan: 'off' } })
     expect(abandonRequest.resume).toEqual([{
       interruptId: 'plan-review-app',
       status: 'cancelled',
     }])
-    expect(presetButton).toHaveTextContent('default')
+    expect(screen.queryByRole('button', { name: 'Plan 已开启，点击关闭' })).not.toBeInTheDocument()
   })
 
-  it('disables mode changes while a Tool approval is pending', async () => {
+  it('does not expose the removed mode selector while a Tool approval is pending', async () => {
     const fetchMock = installFetchMock({
       streams: [[
         { type: 'RUN_STARTED', threadId: THREAD_ID, runId: FIRST_RUN_ID },
@@ -676,10 +766,8 @@ describe('App', () => {
     await sendMessage('等待 Tool 审批')
     expect(await screen.findByText('确认写入')).toBeInTheDocument()
 
-    const presetButton = screen.getByRole('button', { name: '当前 Agent 预设' })
-    expect(presetButton).toBeDisabled()
-    expect(screen.queryByRole('listbox', { name: 'Agent 预设选项' })).not.toBeInTheDocument()
-    expect(presetButton).toHaveTextContent('default')
+    expect(screen.queryByRole('button', { name: '当前 Agent 预设' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Plan 已开启，点击关闭' })).not.toBeInTheDocument()
     expect(screen.getByText('确认写入')).toBeInTheDocument()
     expect(chatRequestAt(fetchMock, 1)).toBeUndefined()
   })
@@ -700,7 +788,7 @@ describe('App', () => {
     await sendMessage('使用数据库模型')
     const request = JSON.parse(String(chatRequestAt(fetchMock, 0)?.body)) as ChatRequestPayload
 
-    expect(request.forwardedProps).toEqual({ model: 'database-main', mode: 'default' })
+    expect(request.forwardedProps).toEqual({ model: 'database-main', command: { plan: 'off' } })
     expect(screen.queryByText('GPT-5.5')).not.toBeInTheDocument()
   })
 
@@ -713,6 +801,7 @@ describe('App', () => {
       const request = input instanceof Request ? input : new Request(input)
       const url = new URL(request.url)
       if (url.pathname.endsWith('/api/models')) return await modelResponse
+      if (url.pathname.endsWith('/api/conversation/config')) return jsonResponse({ dayRanges: [7, 30] })
       if (url.pathname.endsWith('/api/conversation/history')) {
         return jsonResponse({ items: [], nextCursor: null })
       }
@@ -745,6 +834,7 @@ describe('App', () => {
         }
         return jsonResponse(DEFAULT_MODEL_CATALOG)
       }
+      if (url.pathname.endsWith('/api/conversation/config')) return jsonResponse({ dayRanges: [7, 30] })
       if (url.pathname.endsWith('/api/conversation/history')) {
         return jsonResponse({ items: [], nextCursor: null })
       }
@@ -755,7 +845,8 @@ describe('App', () => {
 
     const error = await screen.findByText('模型加载失败')
     const retry = within(error.parentElement!).getByRole('button', { name: '重试' })
-    expect(screen.getByRole('button', { name: '选择模型' })).toBeDisabled()
+    expect(error.closest('.composer')).not.toBeNull()
+    expect(screen.queryByRole('button', { name: '选择模型' })).not.toBeInTheDocument()
     expect(screen.getByLabelText('消息输入')).toBeDisabled()
     expect(screen.getByLabelText('消息输入')).toHaveAttribute('placeholder', '模型加载失败，请先重试')
     await user.click(retry)
@@ -772,6 +863,7 @@ describe('App', () => {
       const request = input instanceof Request ? input : new Request(input)
       const url = new URL(request.url)
       if (url.pathname.endsWith('/api/models')) return jsonResponse(DEFAULT_MODEL_CATALOG)
+      if (url.pathname.endsWith('/api/conversation/config')) return jsonResponse({ dayRanges: [7, 30] })
       if (url.pathname.endsWith('/api/conversation/history')) {
         historyRequestCount += 1
         if (historyRequestCount === 1) {
@@ -798,11 +890,13 @@ describe('App', () => {
     expect(screen.queryByText('历史会话加载失败')).not.toBeInTheDocument()
   })
 
-  it('supports the complete keyboard listbox model and returns focus to each trigger', async () => {
+  it('keeps the model listbox in Composer with complete keyboard and focus behavior', async () => {
     installFetchMock()
     const user = userEvent.setup()
     render(<App />)
     const modelTrigger = screen.getByRole('button', { name: '选择模型' })
+    expect(modelTrigger.closest('.composer')).not.toBeNull()
+    expect(modelTrigger.closest('.chat-header')).toBeNull()
 
     await user.click(modelTrigger)
     const modelListbox = screen.getByRole('listbox', { name: '模型选项' })
@@ -825,39 +919,49 @@ describe('App', () => {
     fireEvent.keyDown(screen.getByRole('listbox', { name: '模型选项' }), { key: 'Escape' })
     expect(screen.queryByRole('listbox', { name: '模型选项' })).not.toBeInTheDocument()
     expect(modelTrigger).toHaveFocus()
-
-    const presetTrigger = screen.getByRole('button', { name: '当前 Agent 预设' })
-    await user.click(presetTrigger)
-    const presetListbox = screen.getByRole('listbox', { name: 'Agent 预设选项' })
-    fireEvent.keyDown(presetListbox, { key: 'ArrowUp' })
-    fireEvent.keyDown(presetListbox, { key: ' ' })
-    expect(presetTrigger).toHaveTextContent('plan')
-    expect(presetTrigger).toHaveFocus()
   })
 
-  it('places the persisted three-segment theme switcher before the Agent preset', async () => {
+  it('moves the persisted theme controls from Header into Settings', async () => {
     installFetchMock()
     render(<App />)
 
-    const themeSwitcher = screen.getByRole('group', { name: '主题' })
-    const presetButton = screen.getByRole('button', { name: '当前 Agent 预设' })
-    const relativePosition = themeSwitcher.compareDocumentPosition(presetButton)
+    expect(screen.queryByRole('group', { name: '主题' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '打开任务抽屉' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '当前 Agent 预设' })).not.toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: '打开用户菜单' }))
+    await userEvent.click(screen.getByRole('button', { name: '设置' }))
 
-    expect(relativePosition & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(screen.getByRole('dialog', { name: '设置' })).toBeInTheDocument()
+    expect(document.querySelector('.app-shell')).toHaveAttribute('inert')
+    expect(document.querySelector('.app-shell')).toHaveAttribute('aria-hidden', 'true')
+    await userEvent.click(screen.getByRole('button', { name: '通用' }))
     expect(screen.getByRole('radio', { name: '跟随系统' })).not.toBeChecked()
     expect(screen.getByRole('radio', { name: '浅色' })).toBeChecked()
     expect(screen.getByRole('radio', { name: '深色' })).not.toBeChecked()
+
+    await userEvent.click(screen.getByRole('button', { name: '关闭对话框' }))
+    expect(document.querySelector('.app-shell')).not.toHaveAttribute('inert')
+    expect(screen.getByRole('button', { name: '打开用户菜单' })).toHaveFocus()
   })
 
   it('shows non-success business codes through the global error toast', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => new Response(
-      JSON.stringify({
-        code: 1_001_004_001,
-        message: '历史分页游标已失效',
-        data: null,
-      }),
-      { status: 422, headers: { 'Content-Type': 'application/json' } },
-    )))
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const request = input instanceof Request ? input : new Request(input)
+      const url = new URL(request.url)
+      if (url.pathname.endsWith('/api/models')) return jsonResponse(DEFAULT_MODEL_CATALOG)
+      if (url.pathname.endsWith('/api/conversation/config')) return jsonResponse({ dayRanges: [7, 30] })
+      if (url.pathname.endsWith('/api/conversation/history')) {
+        return new Response(
+          JSON.stringify({
+            code: 1_001_004_001,
+            message: '历史分页游标已失效',
+            data: null,
+          }),
+          { status: 422, headers: { 'Content-Type': 'application/json' } },
+        )
+      }
+      throw new Error(`unexpected fetch: ${url.pathname}`)
+    }))
 
     render(<App />)
 
@@ -907,13 +1011,17 @@ describe('App', () => {
     render(<App />)
 
     expect(await screen.findByText('来自 第一条会话 的历史回复')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: '当前 Agent 预设' })).toHaveTextContent('plan')
+    expect(document.querySelector('.composer-dock')).not.toHaveClass('is-hero')
+    expect(document.title).toBe('第一条会话')
+    expect(screen.getByRole('button', { name: 'Plan 已开启，点击关闭' })).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: '打开会话：第二条会话' }))
     expect(await screen.findByText('来自 第二条会话 的历史回复')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: '当前 Agent 预设' })).toHaveTextContent('default')
+    expect(document.title).toBe('第二条会话')
+    expect(screen.queryByRole('button', { name: 'Plan 已开启，点击关闭' })).not.toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: '打开会话：第一条会话' }))
     expect(await screen.findByText('来自 第一条会话 的历史回复')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: '当前 Agent 预设' })).toHaveTextContent('plan')
+    expect(document.title).toBe('第一条会话')
+    expect(screen.getByRole('button', { name: 'Plan 已开启，点击关闭' })).toBeInTheDocument()
   })
 
   it('cancels stale hydration when switching threads and disables the composer meanwhile', async () => {
@@ -922,6 +1030,7 @@ describe('App', () => {
       const request = input instanceof Request ? input : new Request(input)
       const url = new URL(request.url)
       if (url.pathname.endsWith('/api/models')) return jsonResponse(DEFAULT_MODEL_CATALOG)
+      if (url.pathname.endsWith('/api/conversation/config')) return jsonResponse({ dayRanges: [7, 30] })
       if (url.pathname.endsWith('/api/conversation/history')) {
         return jsonResponse({
           items: [
@@ -963,6 +1072,7 @@ describe('App', () => {
       const request = input instanceof Request ? input : new Request(input)
       const url = new URL(request.url)
       if (url.pathname.endsWith('/api/models')) return jsonResponse(DEFAULT_MODEL_CATALOG)
+      if (url.pathname.endsWith('/api/conversation/config')) return jsonResponse({ dayRanges: [7, 30] })
       if (url.pathname.endsWith('/api/conversation/history')) {
         return jsonResponse({
           items: [historyListItem({ threadId: THREAD_ID, title: '可重试会话' })],
@@ -1061,7 +1171,7 @@ describe('App', () => {
       messages: [{ id: 'request-first-run', role: 'user', content: '刷新后继续' }],
       tools: [],
       context: [],
-      forwardedProps: { model: 'GPT-5.5', mode: 'default' },
+      forwardedProps: { model: 'GPT-5.5', command: { plan: 'off' } },
     }
     writeActiveRunSession({
       threadId: THREAD_ID,
@@ -1071,7 +1181,7 @@ describe('App', () => {
     })
     const rawEvent = {
       streamMode: 'messages' as const,
-      source: { agentType: 'main' as const, agentName: 'main', namespace: [] },
+      source: { kind: 'root' as const, agentType: 'main' as const, agentName: 'main', namespace: [] },
       runId: FIRST_RUN_ID,
     }
     const fetchMock = installFetchMock({
@@ -1269,22 +1379,26 @@ describe('App', () => {
     })
 
     pane.scrollTop = 240
+    fireEvent.wheel(pane, { deltaY: -120 })
     fireEvent.scroll(pane)
     expect(window.sessionStorage.getItem(`tinkerfin:conversation-scroll:${THREAD_ID}`)).toBe('240')
 
     await user.click(screen.getByRole('button', { name: '打开会话：第二条滚动会话' }))
     await screen.findByText('来自 第二条滚动会话 的历史回复')
     pane.scrollTop = 420
+    fireEvent.wheel(pane, { deltaY: -120 })
     fireEvent.scroll(pane)
     expect(window.sessionStorage.getItem(`tinkerfin:conversation-scroll:${SECOND_THREAD_ID}`)).toBe('420')
 
     await user.click(screen.getByRole('button', { name: '打开会话：第一条滚动会话' }))
     await screen.findByText('来自 第一条滚动会话 的历史回复')
     await waitFor(() => expect(pane.scrollTop).toBe(240))
+    expect(screen.queryByRole('button', { name: '回到底部' })).not.toBeInTheDocument()
 
     await user.click(screen.getByRole('button', { name: '打开会话：第二条滚动会话' }))
     await screen.findByText('来自 第二条滚动会话 的历史回复')
     await waitFor(() => expect(pane.scrollTop).toBe(420))
+    expect(screen.queryByRole('button', { name: '回到底部' })).not.toBeInTheDocument()
   })
 
   it('pins a conversation through the sidebar context menu (PATCH + pinned group)', async () => {
@@ -1312,7 +1426,7 @@ describe('App', () => {
     await waitFor(() => {
       expect(fetchMock.patchCalls).toContainEqual({ threadId: THREAD_ID, body: { pinned: true } })
     })
-    expect(await screen.findByRole('img', { name: '已置顶' })).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: '置顶' })).toBeInTheDocument()
   })
 
   it('renames a conversation with the custom dialog and reports success through a toast', async () => {
@@ -1333,6 +1447,8 @@ describe('App', () => {
     await user.click(screen.getByRole('button', { name: '重命名' }))
 
     const dialog = await screen.findByRole('dialog', { name: '重命名会话' })
+    expect(dialog).toHaveClass('modal-dialog--action', 'has-input')
+    expect(within(dialog).queryByText('输入一个便于在历史记录中识别的名称。')).not.toBeInTheDocument()
     const input = within(dialog).getByRole('textbox', { name: '会话名称' })
     await user.clear(input)
     await user.type(input, '新名称')
@@ -1342,6 +1458,7 @@ describe('App', () => {
       expect(fetchMock.patchCalls).toContainEqual({ threadId: THREAD_ID, body: { title: '新名称' } })
     })
     expect(await screen.findByRole('button', { name: '打开会话：新名称' })).toBeInTheDocument()
+    expect(document.title).toBe('新名称')
     expect(await screen.findByText('会话已重命名')).toBeInTheDocument()
   })
 
@@ -1381,6 +1498,7 @@ describe('App', () => {
         [SECOND_THREAD_ID]: historyDetail({ threadId: SECOND_THREAD_ID, title: '第二条会话' }),
       },
     })
+    window.sessionStorage.setItem(planQuestionCollapseKey(SECOND_THREAD_ID), 'collapsed')
     const user = userEvent.setup()
     render(<App />)
 
@@ -1397,9 +1515,11 @@ describe('App', () => {
       expect(screen.queryByRole('button', { name: '打开会话：第二条会话' })).not.toBeInTheDocument()
     })
     expect(await screen.findByText('会话已删除')).toBeInTheDocument()
+    expect(window.sessionStorage.getItem(planQuestionCollapseKey(SECOND_THREAD_ID))).toBeNull()
   })
 
   it('loads the next history page when scrolling the sidebar list to the bottom', async () => {
+    const observerCallbacks = installHistoryIntersectionObserver()
     const THIRD_THREAD_ID = 'thread-scroll-3'
     const fetchMock = installFetchMock({
       historyListResolver: (requestIndex) =>
@@ -1427,12 +1547,14 @@ describe('App', () => {
     expect(screen.getByRole('button', { name: '打开会话：会话2' })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: '打开会话：会话3' })).not.toBeInTheDocument()
 
-    const scrollEl = document.querySelector('.conversation-scroll') as HTMLElement
-    expect(scrollEl).toBeTruthy()
-    fireEvent.scroll(scrollEl)
-    fireEvent.scroll(scrollEl)
+    await waitFor(() => expect(observerCallbacks.length).toBeGreaterThan(0))
+    act(() => observerCallbacks.at(-1)?.(
+      [{ isIntersecting: true } as IntersectionObserverEntry],
+      {} as IntersectionObserver,
+    ))
 
-    expect(await screen.findAllByTestId('history-skeleton')).toHaveLength(5)
+    expect(screen.queryByText('正在加载更多历史会话')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('history-skeleton')).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: '打开会话：会话3' })).not.toBeInTheDocument()
     expect(await screen.findByRole('button', { name: '打开会话：会话3' })).toBeInTheDocument()
     const listCalls = fetchMock.mock.calls.filter(([input, init]) =>
@@ -1440,6 +1562,69 @@ describe('App', () => {
       && fetchCallMethod(input, init) === 'GET')
     expect(listCalls).toHaveLength(2)
 
+  })
+
+  it('使用后端模糊搜索独立分页，并在清空后恢复普通历史缓存', async () => {
+    const observerCallbacks = installHistoryIntersectionObserver()
+    const SEARCH_THREAD_1 = 'thread-search-1'
+    const SEARCH_THREAD_2 = 'thread-search-2'
+    const fetchMock = installFetchMock({
+      historyListResolver: (_requestIndex, _chatRequestCount, url) => {
+        const query = url.searchParams.get('query')
+        const cursor = url.searchParams.get('cursor')
+        if (!query) {
+          return {
+            items: [historyListItem({ threadId: THREAD_ID, title: '普通缓存会话' })],
+            nextCursor: null,
+          }
+        }
+        if (query !== '目标') throw new Error(`unexpected history query: ${query}`)
+        if (!cursor) {
+          return {
+            items: [historyListItem({ id: 11, threadId: SEARCH_THREAD_1, title: '目标会话一' })],
+            nextCursor: 'search-cursor-2',
+          }
+        }
+        if (cursor === 'search-cursor-2') {
+          return {
+            items: [historyListItem({ id: 12, threadId: SEARCH_THREAD_2, title: '目标会话二' })],
+            nextCursor: null,
+          }
+        }
+        throw new Error(`unexpected history cursor: ${cursor}`)
+      },
+      historyDetails: {
+        [THREAD_ID]: historyDetail({ threadId: THREAD_ID, title: '普通缓存会话' }),
+      },
+    })
+    const user = userEvent.setup()
+    render(<App />)
+
+    expect(await screen.findByRole('button', { name: '打开会话：普通缓存会话' })).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: '搜索会话' }))
+    await user.type(screen.getByRole('textbox', { name: '搜索会话' }), '目标')
+
+    expect(await screen.findByRole('button', { name: '打开会话：目标会话一' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '打开会话：普通缓存会话' })).not.toBeInTheDocument()
+
+    await waitFor(() => expect(observerCallbacks.length).toBeGreaterThan(1))
+    act(() => observerCallbacks.at(-1)?.(
+      [{ isIntersecting: true } as IntersectionObserverEntry],
+      {} as IntersectionObserver,
+    ))
+    expect(await screen.findByRole('button', { name: '打开会话：目标会话二' })).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: '清除搜索' }))
+    expect(screen.getByRole('button', { name: '打开会话：普通缓存会话' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '打开会话：目标会话一' })).not.toBeInTheDocument()
+
+    const listUrls = fetchMock.mock.calls
+      .map(([input]) => new URL(fetchCallUrl(input), 'http://localhost'))
+      .filter((url) => url.pathname.endsWith('/api/conversation/history'))
+    expect(listUrls.filter((url) => !url.searchParams.has('query'))).toHaveLength(1)
+    expect(listUrls.filter((url) => url.searchParams.get('query') === '目标').map((url) => (
+      url.searchParams.get('cursor')
+    ))).toEqual([null, 'search-cursor-2'])
   })
 
   it('loads each successful history cursor only once when the sentinel stays visible', async () => {
@@ -1477,7 +1662,7 @@ describe('App', () => {
 
     act(() => observerCallbacks.at(-1)?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver))
     expect(await screen.findByRole('button', { name: '打开会话：会话3' })).toBeInTheDocument()
-    await waitFor(() => expect(screen.queryByLabelText('正在加载更多历史会话')).not.toBeInTheDocument())
+    await waitFor(() => expect(screen.queryByText('正在加载更多历史会话')).not.toBeInTheDocument())
 
     act(() => observerCallbacks.at(-1)?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver))
     await new Promise((resolve) => window.setTimeout(resolve, 350))
@@ -1489,6 +1674,7 @@ describe('App', () => {
   })
 
   it('does not advance a hydrated event cursor from a newer history-list summary', async () => {
+    const observerCallbacks = installHistoryIntersectionObserver()
     const THIRD_THREAD_ID = 'thread-cursor-3'
     const fetchMock = installFetchMock({
       historyListResolver: (requestIndex) =>
@@ -1519,7 +1705,11 @@ describe('App', () => {
     render(<App />)
     expect(await screen.findByText('来自 游标会话 的历史回复')).toBeInTheDocument()
 
-    fireEvent.scroll(document.querySelector('.conversation-scroll') as HTMLElement)
+    await waitFor(() => expect(observerCallbacks.length).toBeGreaterThan(0))
+    act(() => observerCallbacks.at(-1)?.(
+      [{ isIntersecting: true } as IntersectionObserverEntry],
+      {} as IntersectionObserver,
+    ))
     expect(await screen.findByRole('button', { name: '打开会话：第三条会话' })).toBeInTheDocument()
 
     await user.click(screen.getByRole('button', { name: '打开会话：切换会话' }))
@@ -1535,7 +1725,7 @@ describe('App', () => {
     })
   })
 
-  it('does not auto-retry a failed visible pagination sentinel until the retry button is used', async () => {
+  it('keeps pagination failures silent and retries on the next deliberate bottom scroll', async () => {
     const observerCallbacks: IntersectionObserverCallback[] = []
     vi.stubGlobal('IntersectionObserver', class {
       readonly root = null
@@ -1568,21 +1758,24 @@ describe('App', () => {
     await waitFor(() => expect(observerCallbacks.length).toBeGreaterThan(0))
 
     act(() => observerCallbacks.at(-1)?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver))
-    expect(await screen.findByText('历史记录加载失败')).toBeInTheDocument()
+    await waitFor(() => {
+      const failedCalls = fetchMock.mock.calls.filter(([input, init]) =>
+        fetchCallUrl(input).includes('/api/conversation/history')
+        && fetchCallMethod(input, init) === 'GET')
+      expect(failedCalls).toHaveLength(2)
+    })
+    expect(screen.queryByText('历史记录加载失败')).not.toBeInTheDocument()
     expect(screen.queryByText('网络请求失败，请稍后重试。')).not.toBeInTheDocument()
-    const callbacksAfterFailure = observerCallbacks.length
-    await waitFor(() => expect(observerCallbacks.length).toBeGreaterThanOrEqual(callbacksAfterFailure))
 
-    // 新挂载的 observer 可能立即再次报告仍可见的 sentinel
-    // 该信号不得绕过显式重试入口
+    // Observer 仍可见不会自动重试，必须等待下一次用户滚动批次
     act(() => observerCallbacks.at(-1)?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver))
-    await new Promise((resolve) => window.setTimeout(resolve, 350))
+    await new Promise((resolve) => window.setTimeout(resolve, 550))
     const listCalls = fetchMock.mock.calls.filter(([input, init]) =>
       fetchCallUrl(input).includes('/api/conversation/history')
       && fetchCallMethod(input, init) === 'GET')
     expect(listCalls).toHaveLength(2)
 
-    await userEvent.setup().click(screen.getByRole('button', { name: '重试加载历史' }))
+    fireEvent.scroll(screen.getByRole('region', { name: '最近对话' }))
     await waitFor(() => {
       const retriedCalls = fetchMock.mock.calls.filter(([input, init]) =>
         fetchCallUrl(input).includes('/api/conversation/history')
@@ -1659,7 +1852,7 @@ describe('App', () => {
   it('paginates detached event catch-up until a batch is shorter than the server limit', async () => {
     const rawEvent = {
       streamMode: 'messages' as const,
-      source: { agentType: 'main' as const, agentName: 'main', namespace: [] },
+      source: { kind: 'root' as const, agentType: 'main' as const, agentName: 'main', namespace: [] },
       runId: FIRST_RUN_ID,
     }
     const firstBatch: ConversationEventEnvelope[] = Array.from({ length: 1000 }, (_, index) => ({
@@ -1752,6 +1945,7 @@ describe('App', () => {
     const scrollTo = vi.fn()
     Object.defineProperty(pane, 'scrollTo', { configurable: true, value: scrollTo })
 
+    fireEvent.wheel(pane, { deltaY: -120 })
     fireEvent.scroll(pane)
     const scrollButton = await screen.findByRole('button', { name: '回到底部' })
     await user.click(scrollButton)
@@ -1764,7 +1958,7 @@ describe('App', () => {
     expect(screen.queryByRole('button', { name: '回到底部' })).not.toBeInTheDocument()
   })
 
-  it('keeps the scroll-to-bottom control discoverable in a dedicated non-scrolling action rail', async () => {
+  it('keeps the centered text scroll-to-bottom pill discoverable outside the scroll pane', async () => {
     const frames = new Map<number, FrameRequestCallback>()
     let nextFrameId = 1
     vi.stubGlobal('requestAnimationFrame', vi.fn((callback: FrameRequestCallback) => {
@@ -1789,19 +1983,19 @@ describe('App', () => {
       scrollHeight: { configurable: true, value: 1200 },
       scrollTop: { configurable: true, writable: true, value: 100 },
     })
+    fireEvent.wheel(pane, { deltaY: -120 })
     fireEvent.scroll(pane)
     flushFrames()
     const scrollButton = await screen.findByRole('button', { name: '回到底部' })
     const actionRail = scrollButton.closest('.conversation-scroll-action')
 
     expect(actionRail).not.toBeNull()
+    expect(scrollButton).toHaveTextContent('回到底部')
+    expect(scrollButton.querySelector('.lucide-arrow-down')).toBeInTheDocument()
     expect(pane.contains(scrollButton)).toBe(false)
-    expect(actionRail?.previousElementSibling).toBe(pane)
-
-    vi.useFakeTimers()
-    fireEvent.scroll(pane)
-    flushFrames()
-    act(() => vi.advanceTimersByTime(5000))
+    const scrollbarOverlay = actionRail?.previousElementSibling
+    expect(scrollbarOverlay).toHaveClass('ui-scrollbar-overlay')
+    expect(scrollbarOverlay?.previousElementSibling).toBe(pane)
 
     expect(screen.getByRole('button', { name: '回到底部' })).toBe(scrollButton)
     expect(scrollButton).toHaveClass('is-visible')
@@ -1834,6 +2028,7 @@ describe('App', () => {
       },
       scrollTop: { configurable: true, writable: true, value: 100 },
     })
+    fireEvent.wheel(pane, { deltaY: -120 })
     fireEvent.scroll(pane)
     await screen.findByRole('button', { name: '回到底部' })
 
@@ -1845,7 +2040,7 @@ describe('App', () => {
     expect(screen.queryByRole('button', { name: '回到底部' })).not.toBeInTheDocument()
   })
 
-  it('shows a transient new-session row and sends only the client-generated runId', async () => {
+  it('keeps a new draft out of history and renders its first user message before the backend confirms it', async () => {
     const fetchMock = installFetchMock({
       historyListResolver: (_requestIndex, chatRequestCount) =>
         chatRequestCount === 0
@@ -1862,13 +2057,7 @@ describe('App', () => {
       historyDetails: {
         [THREAD_ID]: historyDetail({ threadId: THREAD_ID, title: '后端真实会话' }),
       },
-      streams: [[
-        {
-          type: 'RUN_STARTED',
-          threadId: THREAD_ID,
-          runId: FIRST_RUN_ID,
-        },
-      ]],
+      streams: [[]],
       keepOpen: true,
     })
 
@@ -1879,11 +2068,16 @@ describe('App', () => {
       </StrictMode>,
     )
 
-    expect(await screen.findByRole('button', { name: '打开会话：新会话' })).toBeInTheDocument()
-    await user.click(screen.getByRole('button', { name: '新聊天' }))
-    expect(screen.getByRole('button', { name: '打开会话：新会话' })).toBeInTheDocument()
+    await waitFor(() => expect(screen.getByRole('button', { name: '新会话' })).toBeEnabled())
+    expect(screen.queryByRole('button', { name: '打开会话：新会话' })).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: '新会话' }))
+    expect(screen.queryByRole('button', { name: '打开会话：新会话' })).not.toBeInTheDocument()
+    expect(document.title).toBe('TinkerFin')
 
     await sendMessage('你好')
+
+    expect(screen.getByText('你好')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '打开会话：新会话' })).not.toBeInTheDocument()
 
     await waitFor(() => {
       const chatCalls = fetchMock.mock.calls.filter(
@@ -1898,7 +2092,7 @@ describe('App', () => {
     expect(request.messages).toEqual([
       { id: `request-${request.runId}`, role: 'user', content: '你好' },
     ])
-    expect(request.forwardedProps).toEqual({ model: 'GPT-5.5', mode: 'default' })
+    expect(request.forwardedProps).toEqual({ model: 'GPT-5.5', command: { plan: 'off' } })
   })
 
   it('promotes the draft into the sidebar on first RUN_STARTED without re-fetching the list', async () => {
@@ -1922,7 +2116,7 @@ describe('App', () => {
             ],
             tools: [],
             context: [],
-            forwardedProps: { model: 'GPT-5.5', mode: 'default' },
+            forwardedProps: { model: 'GPT-5.5', command: { plan: 'off' } },
           },
         },
       ]],
@@ -1931,10 +2125,12 @@ describe('App', () => {
 
     render(<App />)
 
-    expect(await screen.findByRole('button', { name: '打开会话：新会话' })).toBeInTheDocument()
+    await waitFor(() => expect(screen.getByRole('button', { name: '新会话' })).toBeEnabled())
+    expect(screen.queryByRole('button', { name: '打开会话：新会话' })).not.toBeInTheDocument()
     await sendMessage('你好')
     expect(await screen.findByRole('button', { name: '打开会话：后端真实会话' })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: '打开会话：新会话' })).not.toBeInTheDocument()
+    expect(document.title).toBe('后端真实会话')
     const listCalls = fetchMock.mock.calls.filter(([input, init]) =>
       fetchCallUrl(input).includes('/api/conversation/history')
       && fetchCallMethod(input, init) === 'GET')
@@ -1957,6 +2153,7 @@ describe('App', () => {
     await user.click(screen.getByRole('button', { name: '删除' }))
 
     const dialog = await screen.findByRole('dialog', { name: '删除会话' })
+    expect(dialog).toHaveClass('modal-dialog--action', 'is-danger')
     expect(within(dialog).getByText(/仍在接收实时输出/)).toBeInTheDocument()
     expect(fetchMock.deleteCalls).toHaveLength(0)
     expect(screen.getByRole('button', { name: '停止任务' })).toBeInTheDocument()
@@ -1978,7 +2175,7 @@ describe('App', () => {
           type: 'TOOL_CALL_START',
           rawEvent: {
             streamMode: 'messages',
-            source: { agentType: 'main', agentName: 'main', namespace: [] },
+            source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
             langgraphNode: 'model',
           },
           toolCallId: WRITE_TODOS_CALL_ID,
@@ -2017,7 +2214,7 @@ describe('App', () => {
           type: 'TOOL_CALL_START',
           rawEvent: {
             streamMode: 'messages',
-            source: { agentType: 'main', agentName: 'main', namespace: [] },
+            source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
             langgraphNode: 'model',
           },
           toolCallId: WRITE_TODOS_CALL_ID,
@@ -2028,7 +2225,7 @@ describe('App', () => {
           type: 'TOOL_CALL_ARGS',
           rawEvent: {
             streamMode: 'messages',
-            source: { agentType: 'main', agentName: 'main', namespace: [] },
+            source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
             langgraphNode: 'model',
           },
           toolCallId: WRITE_TODOS_CALL_ID,
@@ -2042,7 +2239,7 @@ describe('App', () => {
           role: 'tool',
           rawEvent: {
             streamMode: 'messages',
-            source: { agentType: 'main', agentName: 'main', namespace: [] },
+            source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
             langgraphNode: 'tools',
           },
         },
@@ -2050,7 +2247,7 @@ describe('App', () => {
           type: 'TOOL_CALL_START',
           rawEvent: {
             streamMode: 'messages',
-            source: { agentType: 'main', agentName: 'main', namespace: [] },
+            source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
             langgraphNode: 'model',
           },
           toolCallId: 'call-read-file-with-todos',
@@ -2068,7 +2265,7 @@ describe('App', () => {
           type: 'STATE_SNAPSHOT',
           rawEvent: {
             streamMode: 'values',
-            source: { agentType: 'main', agentName: 'main', namespace: [] },
+            source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
           },
           snapshot: {
             todos: [
@@ -2095,13 +2292,16 @@ describe('App', () => {
 
     render(<App />)
 
-    expect(screen.getByRole('button', { name: '打开任务抽屉' })).toBeInTheDocument()
+    const drawerTrigger = screen.getByRole('button', { name: '打开任务抽屉' })
+    expect(drawerTrigger).toBeInTheDocument()
+    expect(drawerTrigger.querySelector('.lucide-panel-right')).not.toBeInTheDocument()
     expect(screen.getByLabelText('任务抽屉')).toHaveAttribute('aria-hidden', 'true')
     expect(screen.getByLabelText('任务抽屉')).toHaveAttribute('inert')
 
     await sendMessage('做个计划')
 
     await waitFor(() => expect(screen.getByLabelText('任务抽屉')).not.toHaveAttribute('aria-hidden'))
+    expect(screen.queryByRole('button', { name: '打开任务抽屉' })).not.toBeInTheDocument()
     expect(document.querySelector('.workspace-main')).toHaveAttribute('inert')
     expect(screen.getByLabelText('会话导航', { selector: 'aside' })).toHaveAttribute('inert')
     expect(screen.getByRole('button', { name: '关闭任务抽屉遮罩' })).toBeInTheDocument()
@@ -2109,7 +2309,8 @@ describe('App', () => {
     expect(screen.getAllByText('读取 url.json').length).toBeGreaterThan(0)
     expect(screen.queryByText('write_todos')).not.toBeInTheDocument()
     expect(screen.queryByText('Updated todo list')).not.toBeInTheDocument()
-    expect(screen.getByText('read_file')).toBeInTheDocument()
+    expect(document.querySelector('[data-tool-name="read_file"]')).not.toBeNull()
+    expect(screen.getByText('Read')).toBeInTheDocument()
     expect(screen.getByText('Loaded url.json')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: '关闭任务详情' })).toBeInTheDocument()
     const firstTodo = screen.getByRole('button', {
@@ -2158,7 +2359,7 @@ describe('App', () => {
     expect(screen.getByLabelText('任务抽屉')).toHaveAttribute('aria-hidden', 'true')
   })
 
-  it('keeps the task button visible and restores an opened empty drawer after refresh', async () => {
+  it('hides the task button while restoring an opened empty drawer after refresh', async () => {
     installFetchMock({
       historyLists: [{ items: [historyListItem({ title: '空任务会话' })], nextCursor: null }],
       historyDetails: {
@@ -2170,6 +2371,7 @@ describe('App', () => {
 
     await screen.findByText('来自 空任务会话 的历史回复')
     await user.click(screen.getByRole('button', { name: '打开任务抽屉' }))
+    expect(screen.queryByRole('button', { name: '打开任务抽屉' })).not.toBeInTheDocument()
     expect(screen.getByLabelText('任务抽屉')).toBeInTheDocument()
     expect(screen.getByText('暂无待办')).toBeInTheDocument()
     await waitFor(() => expect(screen.getByRole('button', { name: '关闭任务详情' })).toHaveFocus())
@@ -2181,6 +2383,7 @@ describe('App', () => {
     render(<App />)
 
     await screen.findByText('来自 空任务会话 的历史回复')
+    expect(screen.queryByRole('button', { name: '打开任务抽屉' })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: '关闭任务详情' })).toBeInTheDocument()
     expect(screen.getByLabelText('任务抽屉')).toBeInTheDocument()
     expect(document.querySelector('.workspace-main')).toHaveAttribute('inert')
@@ -2201,7 +2404,7 @@ describe('App', () => {
             type: 'TOOL_CALL_START',
             rawEvent: {
               streamMode: 'messages',
-              source: { agentType: 'main', agentName: 'main', namespace: [] },
+              source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
               langgraphNode: 'model',
             },
             toolCallId: WRITE_FILE_CALL_ID,
@@ -2212,7 +2415,7 @@ describe('App', () => {
             type: 'TOOL_CALL_ARGS',
             rawEvent: {
               streamMode: 'messages',
-              source: { agentType: 'main', agentName: 'main', namespace: [] },
+              source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
               langgraphNode: 'model',
             },
             toolCallId: WRITE_FILE_CALL_ID,
@@ -2270,7 +2473,7 @@ describe('App', () => {
             type: 'TOOL_CALL_RESULT',
             rawEvent: {
               streamMode: 'messages',
-              source: { agentType: 'main', agentName: 'main', namespace: [] },
+              source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
               langgraphNode: 'tools',
             },
             messageId: 'tool-result-write-file',
@@ -2317,8 +2520,9 @@ describe('App', () => {
     const resumeRequestInit = chatRequestAt(fetchMock, 1)
     const resumeRequest = JSON.parse(String(resumeRequestInit?.body)) as ChatRequestPayload
     expect(resumeRequest.threadId).toBe(THREAD_ID)
-    expect(resumeRequest.forwardedProps).toEqual({ model: 'GPT-5.5', mode: 'default' })
-    expect(await screen.findByText('write_file')).toBeInTheDocument()
+    expect(resumeRequest.forwardedProps).toEqual({ model: 'GPT-5.5', command: { plan: 'off' } })
+    await waitFor(() => expect(document.querySelector('[data-tool-name="write_file"]')).not.toBeNull())
+    expect(screen.getByText('Write')).toBeInTheDocument()
     expect(resumeRequest.resume).toEqual([
       {
         interruptId: INTERRUPT_ID,

@@ -39,7 +39,7 @@ const payload: ChatRequestPayload = {
   messages: [],
   tools: [],
   context: [],
-  forwardedProps: {},
+  forwardedProps: { model: 'main', command: { plan: 'off' } },
 }
 
 const conversation = (overrides: Partial<Conversation> = {}): Conversation => ({

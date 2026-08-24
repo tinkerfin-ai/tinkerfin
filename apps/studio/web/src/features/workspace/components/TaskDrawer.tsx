@@ -12,15 +12,10 @@ import { useEffect, useRef, useState } from 'react'
 import type { CSSProperties, KeyboardEvent, PointerEvent } from 'react'
 
 import { IconButton } from '../../../components/ui'
+import { TransientScrollbar } from '../../../components/ui/TransientScrollbar'
 import type { Conversation, TodoStatus } from '../../../types'
 import { MarkdownContent } from '../../conversation/components/MarkdownContent'
-
-const statusLabel: Record<TodoStatus, string> = {
-  pending: '待执行',
-  running: '执行中',
-  completed: '已完成',
-  failed: '失败',
-}
+import { useI18n } from '../../../i18n'
 
 const SPLITTER_SIZE = 10
 const DRAWER_PADDING = 12
@@ -64,8 +59,17 @@ export function TaskDrawer({
   onClose?: () => void
   focusOnOpen?: boolean
 }) {
+  const { t } = useI18n()
+  const statusLabel: Record<TodoStatus, string> = {
+    pending: t('待执行'),
+    running: t('执行中'),
+    completed: t('已完成'),
+    failed: t('失败'),
+  }
   const drawerRef = useRef<HTMLElement>(null)
   const closeButtonRef = useRef<HTMLButtonElement>(null)
+  const planScrollRef = useRef<HTMLDivElement>(null)
+  const todoScrollRef = useRef<HTMLDivElement>(null)
   const resizeMeasurement = useRef<{ top: number; contentHeight: number } | null>(null)
   const pendingPointerY = useRef<number | null>(null)
   const resizeFrame = useRef<number | null>(null)
@@ -170,21 +174,21 @@ export function TaskDrawer({
       ref={drawerRef}
       id="task-drawer"
       className={`task-drawer${open ? ' is-open' : ''}${isResizing ? ' is-resizing' : ''}${hasPlan ? '' : ' is-todo-only'}`}
-      aria-label="任务抽屉"
+      aria-label={t('任务抽屉')}
       aria-hidden={!open || undefined}
       inert={!open || undefined}
       style={{ '--split-ratio': splitRatio } as CSSProperties}
     >
       <header className="task-drawer-head">
-        <h2>任务详情</h2>
-        {onClose && <IconButton ref={closeButtonRef} label="关闭任务详情" icon={<X size={18} />} onClick={onClose} />}
+        <h2>{t('任务详情')}</h2>
+        {onClose && <IconButton ref={closeButtonRef} label={t('关闭任务详情')} icon={<X size={18} />} onClick={onClose} />}
       </header>
       {hasPlan && (
-        <section className="drawer-panel plan-panel" aria-label="计划">
+        <section className="drawer-panel plan-panel" aria-label={t('计划')}>
           <header className="panel-head">
-            <div className="panel-title"><ListChecks size={20} /><h3>计划</h3></div>
+            <div className="panel-title"><ListChecks size={20} /><h3>{t('计划')}</h3></div>
           </header>
-          <div className="panel-scroll">
+          <div ref={planScrollRef} className="panel-scroll ui-scrollbar">
             <div className="stacked-plan">
               <p className="plan-summary">{conversation.plan?.goal}</p>
               <ol>
@@ -196,6 +200,7 @@ export function TaskDrawer({
               </ol>
             </div>
           </div>
+          <TransientScrollbar viewportRef={planScrollRef} />
         </section>
       )}
 
@@ -203,12 +208,12 @@ export function TaskDrawer({
         <div
           className="drawer-splitter"
           role="separator"
-          aria-label="调整计划和待办区域高度"
+          aria-label={t('调整计划和待办区域高度')}
           aria-orientation="horizontal"
           aria-valuemin={20}
           aria-valuemax={80}
           aria-valuenow={Math.round(splitRatio)}
-          aria-valuetext={`计划区域占比 ${Math.round(splitRatio)}%`}
+          aria-valuetext={t('计划区域占比 {ratio}%', { ratio: Math.round(splitRatio) })}
           tabIndex={0}
           onKeyDown={resizeFromKeyboard}
           onPointerDown={(event) => {
@@ -239,30 +244,30 @@ export function TaskDrawer({
         </div>
       )}
 
-      <section className="drawer-panel todo-panel" aria-label="待办清单">
+      <section className="drawer-panel todo-panel" aria-label={t('待办清单')}>
         <header className="panel-head">
-          <div className="panel-title"><ClipboardList size={20} /><h3>待办清单</h3></div>
+          <div className="panel-title"><ClipboardList size={20} /><h3>{t('待办清单')}</h3></div>
         </header>
-        <p className="panel-description">Agent 执行任务的实时进度。</p>
-        <div className="panel-scroll todo-panel-scroll">
+        <div ref={todoScrollRef} className="panel-scroll todo-panel-scroll ui-scrollbar">
           {conversation.todos.length ? (
             <div className="todo-list">
               <div className="progress-card">
-                <div><span>任务进度</span><strong>{completedCount}/{conversation.todos.length}{runningCount > 0 ? ' · 执行中' : ''}</strong></div>
+                <div><span>{t('任务进度')}</span><strong>{completedCount}/{conversation.todos.length}{runningCount > 0 ? ` · ${t('执行中')}` : ''}</strong></div>
                 <div className="progress-track"><span style={{ width: `${progress}%` }} /></div>
               </div>
               {conversation.todos.map((todo, index) => (
                 <button type="button" key={todo.id} className={`todo-item is-${todo.status}`} onClick={() => goToMessage(todo.targetMessageId)}>
                   <span className="todo-state">{todo.status === 'completed' ? <Check size={14} /> : todo.status === 'running' ? <LoaderCircle className="spin" size={14} /> : todo.status === 'failed' ? <X size={14} /> : <Circle size={13} />}</span>
-                  <span className="todo-copy"><small>步骤 {index + 1} · {statusLabel[todo.status]}</small><strong>{todo.content}</strong>{todo.result && <div className="todo-result"><MarkdownContent content={todo.result} variant="compact" /></div>}</span>
+                  <span className="todo-copy"><small>{t('步骤 {number} · {status}', { number: index + 1, status: statusLabel[todo.status] })}</small><strong>{todo.content}</strong>{todo.result && <div className="todo-result"><MarkdownContent content={todo.result} variant="compact" /></div>}</span>
                   {todo.targetMessageId && <ArrowRight size={15} className="todo-arrow" />}
                 </button>
               ))}
             </div>
           ) : (
-            <div className="panel-empty"><ClipboardList size={20} /><h3>暂无待办</h3><p>Agent 生成的执行任务会显示在这里。</p></div>
+            <div className="panel-empty"><ClipboardList size={20} /><h3>{t('暂无待办')}</h3><p>{t('Agent 生成的执行任务会显示在这里。')}</p></div>
           )}
         </div>
+        <TransientScrollbar viewportRef={todoScrollRef} />
       </section>
     </aside>
   )

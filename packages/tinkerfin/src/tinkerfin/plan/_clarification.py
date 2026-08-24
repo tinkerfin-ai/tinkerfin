@@ -10,9 +10,8 @@ from types import NoneType
 from typing import Annotated, Any, cast, get_args, get_origin
 
 from langchain_core.runnables import RunnableConfig
-from pydantic import BaseModel, JsonValue, TypeAdapter, create_model
+from pydantic import BaseModel, JsonValue, TypeAdapter
 
-from ._contracts import PlannerOutcomeBase
 from .clarification import (
     ClarificationFormBase,
     ClarificationModel,
@@ -35,11 +34,10 @@ class ClarificationQuestionCount:
 
 @dataclass(frozen=True, slots=True)
 class ClarificationSchemaBinding:
-    """Concrete form and structured response types frozen for one Definition."""
+    """Concrete form contract frozen for one Definition."""
 
     form_schema: type[ClarificationFormBase]
     fingerprint: str
-    planner_response_type: type[PlannerOutcomeBase]
     question_count: ClarificationQuestionCount
 
 
@@ -227,7 +225,7 @@ def _validate_clarification_schema(
         _require_inherited_core_fields(
             question_type,
             base=ClarificationQuestionBase,
-            field_names=frozenset({"allow_free_text", "id", "prompt"}),
+            field_names=frozenset({"allow_free_text", "id", "prompt", "required"}),
             source=question_type.__name__,
         )
         _validate_attributes(question_type, source=question_type.__name__)
@@ -249,7 +247,7 @@ def _validate_clarification_schema(
     return value, question_count
 
 
-def _schema_fingerprint(schema: type[ClarificationFormBase]) -> str:
+def _schema_fingerprint(schema: type[BaseModel]) -> str:
     canonical = json.dumps(
         schema.model_json_schema(by_alias=True),
         ensure_ascii=False,
@@ -266,15 +264,9 @@ def create_clarification_binding(
 
     form_schema, question_count = _validate_clarification_schema(schema)
     fingerprint = _schema_fingerprint(form_schema)
-    planner_type = create_model(
-        "PlannerOutcome",
-        __base__=PlannerOutcomeBase,
-        clarification=(form_schema | None, None),
-    )
     return ClarificationSchemaBinding(
         form_schema=form_schema,
         fingerprint=fingerprint,
-        planner_response_type=planner_type,
         question_count=question_count,
     )
 

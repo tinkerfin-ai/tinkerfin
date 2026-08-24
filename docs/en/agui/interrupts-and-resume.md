@@ -36,12 +36,13 @@ runtime = agent.new_agui(identity=identity, mode="plan")
 
 | Reason | Expected resolved payload |
 | --- | --- |
-| `plan_clarification` | `{"type":"respond","answers":[{"questionId":"...","optionId":"..."}]}` for an option, or `{"type":"respond","answers":[{"questionId":"...","answer":"..."}]}` for free text |
+| `plan_clarification` | `{"type":"respond","answers":[{"questionId":"...","optionId":"..."}]}` for an option, `{"type":"respond","answers":[{"questionId":"...","answer":"..."}]}` for free text, or `{"type":"respond","answers":[{"questionId":"...","skipped":true}]}` for an optional skip |
 | `plan_review` | `approve`, `edit`, `respond`, or `reject`, each with the current `baseRevision` |
 
 A Plan interrupt has no `toolCallId`. It carries a versioned trusted runtime envelope,
-its response JSON Schema, and `tinkerfin.plan-clarification.v1` metadata containing the
-complete public Form. Python `allow_free_text` is serialized as `allowFreeText`.
+its response JSON Schema, and `tinkerfin.plan-clarification.v2` metadata containing the
+complete public Form with `schemaVersion: 2`. Python `allow_free_text` is serialized as
+`allowFreeText`; every question also carries an explicit `required` flag.
 Question and option attributes are preserved as public, non-authoritative planning
 context. Internal schema fingerprints remain in checkpoint state and are not part of
 any public AG-UI event. The root `tinkerfin_plan` state is
@@ -50,9 +51,9 @@ snapshot may be followed by RFC 6902 state deltas as the Plan moves through
 `approved` and publishes `effectiveMode=default` before native execution.
 
 Clients must not return the Form, labels, descriptions, or attributes. The Planning Graph
-restores the trusted checkpoint Form and derives the selected option label. Supplying
-both `optionId` and `answer`, omitting required answers, or using unknown IDs fails the
-resume.
+restores the trusted checkpoint Form and derives the selected option label. Resume must
+cover every question exactly once. Supplying mixed answer fields, skipping a required
+question, omitting a question result, or using unknown IDs fails the resume.
 
 The same `ResumeMapper.map_agui(...)` and `AgUiResumeBinding` flow handles Plan
 interrupts without a separate API. `ResumeMapper` verifies the persisted envelope and

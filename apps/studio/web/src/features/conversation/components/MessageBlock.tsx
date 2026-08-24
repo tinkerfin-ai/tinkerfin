@@ -1,13 +1,12 @@
 import {
   Bot,
-  CheckCircle2,
   Check,
   ChevronDown,
   CircleAlert,
   Copy,
-  FileText,
+  Pause,
   TriangleAlert,
-  Zap,
+  X,
 } from 'lucide-react'
 import { memo, useEffect, useRef, useState } from 'react'
 
@@ -16,17 +15,20 @@ import type { ConversationNotice as ConversationNoticeType, Message } from '../.
 import { normalizeEscapedText } from '../../../lib/text'
 import { ActivityDots } from './ActivityDots'
 import { MarkdownContent } from './MarkdownContent'
+import { ToolCallRow } from './ToolCallRow'
 import { COPY_FEEDBACK_DURATION_MS } from './copyFeedback'
+import { useI18n } from '../../../i18n'
 
 type MessageStatus = NonNullable<Message['meta']>['status']
 
-const loadingField = <span className="tool-skeleton" aria-label="工具字段加载中" aria-busy="true" />
-
 function PlaceholderField({ status }: { status?: MessageStatus }) {
+  const { t } = useI18n()
   if (status === 'paused') {
-    return <span className="tool-field-placeholder">等待审批后执行</span>
+    return <span className="tool-field-placeholder">{t('等待审批后执行')}</span>
   }
-  return status === 'running' ? loadingField : <span className="tool-field-placeholder">—</span>
+  return status === 'running'
+    ? <span className="tool-skeleton" aria-label={t('工具字段加载中')} aria-busy="true" />
+    : <span className="tool-field-placeholder">—</span>
 }
 
 function CodeField({ value, status }: { value?: string; status?: MessageStatus }) {
@@ -41,7 +43,25 @@ function RichField({ value, status, className = 'tool-rich-field' }: { value?: s
     : <PlaceholderField status={status} />
 }
 
+function ToolDetails({ message }: { message: Message }) {
+  const { t } = useI18n()
+  return (
+    <div className="tool-detail-card">
+      <div className="tool-detail-section tool-detail-section--params">
+        <span className="tool-field-label">{t('参数')}</span>
+        <CodeField value={message.meta?.params} status={message.meta?.status} />
+      </div>
+      <span className="tool-detail-divider" aria-hidden="true" />
+      <div className="tool-detail-section tool-detail-section--result">
+        <span className="tool-field-label">{t('结果')}</span>
+        <RichField value={message.meta?.result} status={message.meta?.status} />
+      </div>
+    </div>
+  )
+}
+
 function MessageActionRow({ content }: { content: string }) {
+  const { t } = useI18n()
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle')
   const resetTimer = useRef<number | null>(null)
 
@@ -61,13 +81,13 @@ function MessageActionRow({ content }: { content: string }) {
   }
 
   const label = copyState === 'copied'
-    ? '回答已复制'
+    ? t('回答已复制')
     : copyState === 'failed'
-      ? '复制回答失败'
-      : '复制回答'
+      ? t('复制回答失败')
+      : t('复制回答')
 
   return (
-    <footer className="message-action-row" role="group" aria-label="回答操作">
+    <footer className="message-action-row" role="group" aria-label={t('回答操作')}>
       <IconButton
         label={label}
         tooltip={label}
@@ -79,76 +99,82 @@ function MessageActionRow({ content }: { content: string }) {
         onClick={() => void copyMessage()}
       />
       <span className="message-action-status" aria-live="polite">
-        {copyState === 'copied' ? '已复制' : copyState === 'failed' ? '复制失败，请重试' : ''}
+        {copyState === 'copied' ? t('已复制') : copyState === 'failed' ? t('复制失败，请重试') : ''}
       </span>
     </footer>
   )
 }
 
-const statusLabel = (status?: MessageStatus) => {
-  if (status === 'failed') return '执行失败'
-  if (status === 'paused') return '等待审批'
-  if (status === 'running') return <ActivityDots label="正在运行" />
-  return <CheckCircle2 className="completed-status-icon" size={14} aria-label="已完成" />
-}
-
-const formatClock = (iso: string) => new Date(iso).toLocaleTimeString('zh-CN', {
-  hour12: false,
-  hour: '2-digit',
-  minute: '2-digit',
-  second: '2-digit',
-})
-
-const formatDuration = (durationMs: number | undefined) => {
-  if (durationMs == null) return '—'
-  if (durationMs < 1000) return `${Math.round(durationMs)}ms`
-  return `${(durationMs / 1000).toFixed(durationMs < 10000 ? 2 : 1)}s`
-}
-
 function SubagentToolTraceRow({
   message,
-  index,
   open,
   onOpenChange,
 }: {
   message: Message
-  index: number
   open: boolean
   onOpenChange: (open: boolean) => void
 }) {
   return (
-    <div className="subagent-trace-item">
-      <span className="subagent-trace-marker" aria-hidden="true">{index + 1}</span>
-      <details
-        className={`subagent-tool-row ${message.meta?.status ?? ''}`}
-        open={open}
-        onToggle={(event) => onOpenChange(event.currentTarget.open)}
-      >
-        <summary>
-          <span className="subagent-tool-title">
-            <span className="subagent-tool-icon"><FileText size={14} /></span>
-            <strong>{message.meta?.toolName ?? 'tool'}</strong>
-          </span>
-          <span className="subagent-tool-meta">
-            <time dateTime={message.createdAt}>{formatClock(message.createdAt)}</time>
-            {message.meta?.status !== 'running' && <span>{formatDuration(message.meta?.durationMs)}</span>}
-            <span className="tool-status">{statusLabel(message.meta?.status)}</span>
-            <ChevronDown size={14} />
-          </span>
-        </summary>
-        <div className="tool-grid subagent-tool-detail">
-          <span className="tool-field-label">参数</span><CodeField value={message.meta?.params} status={message.meta?.status} />
-          <span className="tool-field-label">结果</span><RichField value={message.meta?.result} status={message.meta?.status} />
-        </div>
-      </details>
-    </div>
+    <ToolCallRow
+      message={message}
+      className="subagent-tool-row"
+      open={open}
+      onOpenChange={onOpenChange}
+    >
+      <ToolDetails message={message} />
+    </ToolCallRow>
+  )
+}
+
+function SubagentOutputNode({ message }: { message: Message }) {
+  const { t } = useI18n()
+  const status = message.meta?.status ?? 'completed'
+  const result = message.meta?.result
+  const label = status === 'running'
+    ? t('执行中')
+    : status === 'failed'
+      ? t('执行失败')
+      : status === 'paused'
+        ? t('等待审批')
+        : t('已完成')
+
+  return (
+    <li className={`subagent-trace-node subagent-output-node is-${status}`}>
+      <span className="subagent-trace-junction" aria-hidden="true" />
+      <span className="subagent-output-icon" aria-hidden="true">
+        {status === 'completed'
+          ? <Check size={12} strokeWidth={2.5} />
+          : status === 'failed'
+            ? <X size={12} strokeWidth={2.5} />
+            : status === 'paused'
+              ? <Pause size={11} strokeWidth={2.5} />
+              : <span className="subagent-output-pulse" />}
+      </span>
+      <div className="subagent-output-copy">
+        <strong>{label}</strong>
+        {result
+          ? <RichField value={result} status={status} className="subagent-trace-output" />
+          : status === 'running'
+            ? <ActivityDots label={t('正在运行')} />
+            : null}
+      </div>
+    </li>
   )
 }
 
 function SubagentCard({ message, childTools }: { message: Message; childTools: Message[] }) {
+  const { t } = useI18n()
   const [openToolIds, setOpenToolIds] = useState<Set<string>>(() => new Set())
-  const allToolsExpanded = childTools.length > 0
-    && childTools.every((tool) => openToolIds.has(tool.id))
+  const status = message.meta?.status ?? 'completed'
+  const input = message.meta?.input
+  const agentName = message.meta?.agentName ?? 'subagent'
+  const statusLabel = status === 'running'
+    ? t('正在运行')
+    : status === 'failed'
+      ? t('执行失败')
+      : status === 'paused'
+        ? t('等待审批')
+        : t('已完成')
 
   const setToolOpen = (toolId: string, open: boolean) => {
     setOpenToolIds((current) => {
@@ -160,56 +186,48 @@ function SubagentCard({ message, childTools }: { message: Message; childTools: M
     })
   }
 
-  const toggleAllTools = () => {
-    setOpenToolIds(allToolsExpanded
-      ? new Set()
-      : new Set(childTools.map((tool) => tool.id)))
-  }
-
   return (
-    <details id={message.id} className={`subagent-card ${message.meta?.status ?? ''}`}>
+    <details id={message.id} className={`subagent-card ${status}`}>
       <summary className="subagent-card-head">
-        <span className="subagent-identity">
-          <span className="tool-kind-badge">子智能体</span>
-          <span className="subagent-avatar"><Bot size={15} /></span>
-          <strong>{message.meta?.agentName ?? 'subagent'}</strong>
+        <span className="tool-row-leading" aria-hidden="true">
+          <span className="tool-row-icon">
+            {status === 'failed' || status === 'paused'
+              ? <span className={`tool-row-state-dot is-${status}`} />
+              : <Bot size={14} strokeWidth={2} />}
+          </span>
+          <ChevronDown className="tool-row-chevron" size={14} strokeWidth={2} />
         </span>
+        <span className="tool-row-title">Task</span>
+        <span className="tool-row-separator" aria-hidden="true" />
+        <span className="tool-row-summary">SubAgent</span>
         <span className="subagent-card-meta">
-          <span className="subagent-tool-count">{childTools.length} 个工具</span>
-          <span className="subagent-status">{statusLabel(message.meta?.status)}</span>
-          <ChevronDown className="subagent-card-chevron" size={16} />
+          <span className="subagent-tool-count">{t('{count} 个工具', { count: childTools.length })}</span>
         </span>
+        <span className="subagent-visually-hidden">{agentName}，{statusLabel}</span>
       </summary>
       <div className="subagent-card-body">
-        <section className="subagent-section">
-          <h4><span aria-hidden="true" />输入</h4>
-          <RichField value={message.meta?.input} status={message.meta?.status} className="subagent-rich-field" />
-        </section>
-        <section className="subagent-section subagent-trace-section">
-          <div className="subagent-trace-head">
-            <h4><span aria-hidden="true" />工具轨迹 <b>{childTools.length}</b></h4>
-            {childTools.length > 0 && (
-              <button type="button" aria-expanded={allToolsExpanded} onClick={toggleAllTools}>
-                {allToolsExpanded ? '收起全部详情' : '展开全部详情'}
-              </button>
-            )}
+        {input && (
+          <div className="subagent-task-line">
+            <span>{agentName}</span>
+            <p>{normalizeEscapedText(input)}</p>
           </div>
-          {childTools.length > 0
-            ? <div className="subagent-trace-list">{childTools.map((tool, index) => (
-                <SubagentToolTraceRow
-                  key={tool.id}
-                  message={tool}
-                  index={index}
-                  open={openToolIds.has(tool.id)}
-                  onOpenChange={(open) => setToolOpen(tool.id, open)}
-                />
-              ))}</div>
-            : <p className="subagent-empty-trace">暂未调用工具</p>}
-        </section>
-        <section className="subagent-section">
-          <h4><span aria-hidden="true" />输出摘要</h4>
-          <RichField value={message.meta?.result} status={message.meta?.status} className="subagent-rich-field subagent-output" />
-        </section>
+        )}
+        <ol
+          className={`subagent-trace-list${childTools.length === 0 ? ' is-tool-empty' : ''}`}
+          aria-label={`${agentName} ${t('工具轨迹')}`}
+        >
+          {childTools.map((tool) => (
+            <li key={tool.id} className="subagent-trace-node subagent-tool-node">
+              <span className="subagent-trace-junction" aria-hidden="true" />
+              <SubagentToolTraceRow
+                message={tool}
+                open={openToolIds.has(tool.id)}
+                onOpenChange={(open) => setToolOpen(tool.id, open)}
+              />
+            </li>
+          ))}
+          <SubagentOutputNode message={message} />
+        </ol>
       </div>
     </details>
   )
@@ -222,6 +240,7 @@ function MessageBlockView({
   message: Message
   childTools?: Message[]
 }) {
+  const { t } = useI18n()
   if (message.role === 'user') {
     return <article id={message.id} className="message user-message"><MarkdownContent content={message.content} className="message-markdown" /></article>
   }
@@ -235,7 +254,7 @@ function MessageBlockView({
     return <ToolCallCard message={message} />
   }
   if (message.role === 'error') {
-    return <article id={message.id} className="error-message"><CircleAlert size={17} /><div><strong>任务遇到问题</strong><MarkdownContent content={message.content} className="error-markdown" variant="compact" /></div></article>
+    return <article id={message.id} className="error-message"><CircleAlert size={17} /><div><strong>{t('任务遇到问题')}</strong><MarkdownContent content={message.content} className="error-markdown" variant="compact" /></div></article>
   }
   return (
     <article id={message.id} className="message assistant-message">
@@ -246,7 +265,7 @@ function MessageBlockView({
           </>
         : message.meta?.status === 'running'
           ? null
-          : <p className="streaming-indicator"><ActivityDots label="正在回复" /></p>}
+          : <p className="streaming-indicator"><ActivityDots label={t('正在回复')} /></p>}
     </article>
   )
 }
@@ -261,11 +280,12 @@ export const MessageBlock = memo(
 )
 
 export function ConversationNotice({ notice }: { notice: ConversationNoticeType }) {
+  const { t } = useI18n()
   return (
     <article className={`error-message conversation-notice is-${notice.kind}`} role={notice.kind === 'error' ? 'alert' : 'status'}>
       <CircleAlert size={17} />
       <div>
-        <strong>{notice.kind === 'error' ? '任务遇到问题' : '连接状态'}</strong>
+        <strong>{notice.kind === 'error' ? t('任务遇到问题') : t('连接状态')}</strong>
         <MarkdownContent content={notice.content} className="error-markdown" />
       </div>
     </article>
@@ -274,23 +294,17 @@ export function ConversationNotice({ notice }: { notice: ConversationNoticeType 
 
 export function ToolCallCard({ message }: { message: Message }) {
   return (
-    <details id={message.id} className={`tool-card ${message.meta?.status ?? ''}`}>
-      <summary>
-        <span><span className="tool-kind-badge">工具</span><Zap size={16} />{message.meta?.toolName}</span>
-        <span className="tool-card-meta"><span className="tool-status">{statusLabel(message.meta?.status)}</span><ChevronDown size={15} /></span>
-      </summary>
-      <div className="tool-grid">
-        <span className="tool-field-label">参数</span><CodeField value={message.meta?.params} status={message.meta?.status} />
-        <span className="tool-field-label">结果</span><RichField value={message.meta?.result} status={message.meta?.status} />
-      </div>
-    </details>
+    <ToolCallRow message={message} className="tool-card">
+      <ToolDetails message={message} />
+    </ToolCallRow>
   )
 }
 
 function ToolCallBatchView({ messages }: { messages: Message[] }) {
+  const { t } = useI18n()
   if (messages.length === 1) return <ToolCallCard message={messages[0]} />
   return (
-    <section className="tool-batch" aria-label="工具调用批次">
+    <section className="tool-batch" aria-label={t('工具调用批次')}>
       {messages.map((message) => <ToolCallCard key={message.id} message={message} />)}
     </section>
   )

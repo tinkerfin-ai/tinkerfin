@@ -2,15 +2,22 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 
 import type { AgentMode, ChatRequestPayload } from '../../api/conversation/types'
 import type { AuthUser } from '../../api/auth/types'
-import { Button, ErrorBoundary } from '../../components/ui'
+import { Button, ErrorBoundary, useThemePreference } from '../../components/ui'
 import type { ToastKind } from '../../components/ui/ToastViewport'
+import { useI18n } from '../../i18n'
 import { Composer } from '../conversation/components/Composer'
+import { PlanQuestionComposer } from '../conversation/components/PlanQuestionComposer'
+import { parseComposerSubmission } from '../conversation/composerCommand'
+import { useLocalAttachments } from '../conversation/useLocalAttachments'
+import { ComposerModelPicker } from './components/ComposerModelPicker'
 import { Sidebar } from './components/Sidebar'
 import { TaskDrawer } from './components/TaskDrawer'
 import { ConversationViewport } from './components/ConversationViewport'
+import { EmptyConversationBrand } from './components/EmptyConversation'
 import { WorkspaceDialogs } from './components/WorkspaceDialogs'
 import { WorkspaceHeader } from './components/WorkspaceHeader'
 import { WorkspaceStatus } from './components/WorkspaceStatus'
+import { SettingsDialog } from '../settings/SettingsDialog'
 import { useWorkspaceNavigation } from './useWorkspaceNavigation'
 import { useModelCatalog } from './useModelCatalog'
 import { useWorkspaceHistory } from './useWorkspaceHistory'
@@ -41,6 +48,7 @@ import type {
   ApprovalState,
   Conversation,
   PlanInteraction,
+  PlanQuestionState,
   WorkspaceState,
 } from '../../types'
 
@@ -60,13 +68,16 @@ export function WorkspaceScreen({
   onLogout: () => void
   onToast: (kind: ToastKind, message: string) => void
 }) {
+  const { t } = useI18n()
   const [workspace, setWorkspace] = useState<WorkspaceState>(createEmptyWorkspace)
   const [draftConversation, setDraftConversation] = useState<Conversation | null>(null)
   const [draftModel, setDraftModel] = useState('')
   const [draft, setDraft] = useState('')
   const [isModelPickerOpen, setModelPickerOpen] = useState(false)
-  const [isAgentPresetPickerOpen, setAgentPresetPickerOpen] = useState(false)
   const [pendingResume, setPendingResume] = useState<PendingResume | null>(null)
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const settingsRestoreFocus = useRef<HTMLElement | null>(null)
+  const theme = useThemePreference()
   const navigation = useWorkspaceNavigation()
   const {
     status: modelCatalogStatus,
@@ -75,6 +86,7 @@ export function WorkspaceScreen({
     displayName: modelDisplayName,
     retry: retryModelCatalog,
   } = useModelCatalog()
+  const localAttachments = useLocalAttachments()
   const appShell = useRef<HTMLDivElement>(null)
   const latestWorkspace = useRef(workspace)
   const startedResumeRunIds = useRef(new Set<string>())
@@ -100,14 +112,20 @@ export function WorkspaceScreen({
     setDraftConversation,
   })
   const {
+    historyConversations,
+    historyDayRanges,
+    historyQuery,
+    setHistoryQuery,
+    isHistorySearchActive,
+    isHistorySearching,
     historyCursor,
     isHistoryLoadingMore,
     historyLoadError,
     isHistoryBootstrapped,
     historyBootstrapStatus,
     hydrationState,
-    historyLoadSentinel,
     loadMoreHistory,
+    retryHistoryLoad,
     retryHistoryBootstrap,
     hydrateConversation,
   } = useWorkspaceHistory({
@@ -134,24 +152,34 @@ export function WorkspaceScreen({
     }
     return draftConversation ?? buildEmptyConversation({ now: new Date().toISOString(), model: draftModel })
   }, [draftConversation, draftModel, selectedConversation, workspace.currentThreadId])
+
+  useEffect(() => {
+    document.title = conversation.threadId && conversation.title.trim()
+      ? conversation.title.trim()
+      : 'TinkerFin'
+  }, [conversation.threadId, conversation.title])
+
+  useEffect(() => () => {
+    document.title = 'TinkerFin'
+  }, [])
+
   const taskDrawer = useTaskDrawerState({
     threadId: conversation.threadId,
     todoCount: conversation.todos.length,
   })
-  const sidebarWorkspace = useMemo<WorkspaceState>(() => (
-    workspace.currentThreadId
-      ? workspace
-      : { ...workspace, conversations: [conversation, ...workspace.conversations] }
-  ), [conversation, workspace])
   const isRunning = conversation.runStatus === 'streaming'
   const {
     paneRef: conversationPane,
     messageEndRef: messageEnd,
     showScrollToBottom,
+    fadeScrollToBottom,
     handleScroll: handleConversationScroll,
     scrollToBottomImmediately: scrollConversationToBottomImmediately,
     markUserScrollIntent,
+    scrollBy: scrollConversationBy,
     scrollToBottom: scrollConversationToBottom,
+    pauseScrollToBottomFade,
+    resumeScrollToBottomFade,
   } = useConversationScroll({ conversation, isRunning })
   const isConversationHydrating = Boolean(
     workspace.currentThreadId
@@ -170,6 +198,13 @@ export function WorkspaceScreen({
   const isInitialHistoryUnavailable = historyBootstrapStatus === 'error'
     && workspace.conversations.length === 0
     && !draftConversation
+  const showConversationHero = conversation.messages.length === 0
+    && !conversation.notice
+    && isHistoryBootstrapped
+    && historyBootstrapStatus === 'ready'
+    && !isConversationHydrating
+    && !isConversationHydrationFailed
+    && !isInitialHistoryUnavailable
   const hiddenApprovalToolCallIds = useMemo(() => {
     if (!conversation.approval || conversation.approval.submitted) return new Set<string>()
     return new Set(
@@ -185,7 +220,7 @@ export function WorkspaceScreen({
 
   useLayoutEffect(() => {
     const shell = appShell.current
-    const composer = shell?.querySelector<HTMLElement>('.composer-wrap')
+    const composer = shell?.querySelector<HTMLElement>('.composer-dock')
     if (!shell || !composer) return
     const measure = () => shell.style.setProperty(
       '--composer-height',
@@ -274,6 +309,7 @@ export function WorkspaceScreen({
     .filter((message) => {
       if (message.role !== 'tool') return true
       if (message.meta?.toolName === 'write_todos') return false
+      if (message.meta?.toolName === 'PlannerOutcome') return false
       const toolCallId = message.meta?.toolCallId
       if (toolCallId && hiddenApprovalToolCallIds.has(toolCallId)) return false
       if (message.meta?.sourceAgentName) return false
@@ -291,20 +327,30 @@ export function WorkspaceScreen({
       return groups
     }, []), [conversation.messages, hiddenApprovalToolCallIds])
 
-  const beginSend = useCallback((content: string) => {
+  const beginSend = useCallback((content: string, modeOverride?: AgentMode) => {
     const trimmed = content.trim()
     if (!trimmed || isRunning || !conversation.model) return
+    const effectiveMode = modeOverride ?? conversation.mode
 
     const now = new Date().toISOString()
     if (!workspace.currentThreadId) {
       const nextConversation = buildEmptyConversation({
         now,
         model: draftConversation?.model ?? draftModel,
-        mode: draftConversation?.mode ?? conversation.mode,
+        mode: effectiveMode,
       })
       const payload = buildInitialPayload(nextConversation, trimmed)
+      const requestMessage = payload.messages.at(0)
+      if (!requestMessage) return
       const seededConversation: Conversation = {
         ...nextConversation,
+        messages: [{
+          id: requestMessage.id,
+          role: 'user',
+          content: requestMessage.content,
+          createdAt: now,
+          meta: { runId: payload.runId },
+        }],
         activeRunId: payload.runId,
         runStatus: 'streaming',
         notice: undefined,
@@ -333,19 +379,25 @@ export function WorkspaceScreen({
     if (currentConversation.runStatus === 'waiting_approval') {
       setWorkspace((state) => updateConversation(state, currentConversation.threadId, (item) => ({
         ...item,
-        approval: item.approval ? { ...item.approval, error: '请先处理当前审批后再发送新消息。' } : item.approval,
+        approval: item.approval ? { ...item.approval, error: t('请先处理当前审批后再发送新消息。') } : item.approval,
         planInteraction: item.planInteraction
-          ? { ...item.planInteraction, error: '请先处理当前 Plan 请求后再发送新消息。' }
+          ? { ...item.planInteraction, error: t('请先处理当前 Plan 请求后再发送新消息。') }
           : item.planInteraction,
       })))
       return
     }
 
-    const payload = buildInitialPayload(currentConversation, trimmed)
+    const sendingConversation = currentConversation.mode === effectiveMode
+      ? currentConversation
+      : { ...currentConversation, mode: effectiveMode }
+    const payload = buildInitialPayload(sendingConversation, trimmed)
+    const requestMessage = payload.messages.at(0)
+    if (!requestMessage) return
     scrollConversationToBottomImmediately()
     setWorkspace((state) => {
       return updateConversation(state, currentConversation.threadId, (item) => ({
         ...item,
+        mode: effectiveMode,
         updatedAt: now,
         activeRunId: payload.runId,
         runStatus: 'streaming',
@@ -354,11 +406,18 @@ export function WorkspaceScreen({
         todos: [],
         plan: null,
         serverState: {},
+        messages: [...item.messages, {
+          id: requestMessage.id,
+          role: 'user',
+          content: requestMessage.content,
+          createdAt: now,
+          meta: { runId: payload.runId },
+        }],
       }))
     })
     void streamRun(currentConversation.threadId, payload, 'start')
     setDraft('')
-  }, [conversation.mode, conversation.model, draftConversation, draftModel, hydrateConversation, isRunning, scrollConversationToBottomImmediately, streamRun, workspace.conversations, workspace.currentThreadId])
+  }, [conversation.mode, conversation.model, draftConversation?.model, draftModel, hydrateConversation, isRunning, scrollConversationToBottomImmediately, streamRun, t, workspace.conversations, workspace.currentThreadId])
 
   useEffect(() => {
     if (!pendingResume) return
@@ -403,7 +462,7 @@ export function WorkspaceScreen({
     if (incomplete) {
       updateCurrent((item) => ({
         ...item,
-        approval: item.approval ? { ...item.approval, error: '请先处理所有待审批项。' } : item.approval,
+        approval: item.approval ? { ...item.approval, error: t('请先处理所有待审批项。') } : item.approval,
       }))
       return
     }
@@ -433,7 +492,7 @@ export function WorkspaceScreen({
       payload,
       expectedInterruptIds: [...expectedInterruptIds],
     })
-  }, [conversation.threadId, updateCurrent, workspace.currentThreadId])
+  }, [conversation.threadId, t, updateCurrent, workspace.currentThreadId])
 
   const submitPlanInteraction = useCallback(() => {
     const authoritative = latestWorkspace.current.conversations.find(
@@ -444,7 +503,7 @@ export function WorkspaceScreen({
     try {
       payload = buildPlanResumePayload(authoritative)
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Plan 请求无法提交'
+      const message = error instanceof Error ? error.message : t('Plan 请求无法提交')
       updateCurrent((item) => ({
         ...item,
         planInteraction: item.planInteraction
@@ -468,7 +527,7 @@ export function WorkspaceScreen({
       payload,
       expectedInterruptIds: [interruptId],
     })
-  }, [conversation.threadId, updateCurrent])
+  }, [conversation.threadId, t, updateCurrent])
 
   const abandonPlanInteraction = useCallback((threadId: string) => {
     const authoritative = latestWorkspace.current.conversations.find(
@@ -493,8 +552,6 @@ export function WorkspaceScreen({
       expectedInterruptIds: [interruptId],
     })
   }, [])
-
-  const send = () => beginSend(draft.trim())
 
   const changeApproval = useCallback((
     threadId: string,
@@ -545,14 +602,11 @@ export function WorkspaceScreen({
     hasActiveStream,
     isActiveThread,
     onToast: pushToast,
+    onConversationBoundary: localAttachments.clearAttachments,
   })
 
-  const selectAgentMode = useCallback((mode: AgentMode) => {
-    if (isRunning || mode === conversation.mode) return
-    if (mode === 'default' && conversation.planInteraction) {
-      requestDisablePlan(conversation.threadId)
-      return
-    }
+  const setAgentMode = useCallback((mode: AgentMode) => {
+    if (mode === conversation.mode) return
     if (!workspace.currentThreadId) {
       setDraftConversation((current) => ({ ...(current ?? conversation), mode }))
       return
@@ -562,15 +616,25 @@ export function WorkspaceScreen({
       workspace.currentThreadId,
       (current) => ({ ...current, mode }),
     ))
-  }, [conversation, isRunning, requestDisablePlan, workspace.currentThreadId])
+  }, [conversation, workspace.currentThreadId])
+
+  const exitPlanMode = useCallback(() => {
+    if (isRunning || conversation.mode !== 'plan') return
+    if (conversation.planInteraction) {
+      requestDisablePlan(conversation.threadId)
+      return
+    }
+    setAgentMode('default')
+    pushToast('info', t('已关闭 Plan'))
+  }, [conversation.mode, conversation.planInteraction, conversation.threadId, isRunning, pushToast, requestDisablePlan, setAgentMode, t])
 
   const stop = async () => {
     if (!hasActiveStream()) return
     try {
       const cancelled = await cancelActiveRun()
-      pushToast('info', cancelled ? '任务已停止' : '任务已经结束')
+      pushToast('info', cancelled ? t('任务已停止') : t('任务已经结束'))
     } catch {
-      pushToast('error', '停止任务失败，请重试')
+      pushToast('error', t('停止任务失败，请重试'))
     }
   }
 
@@ -585,12 +649,33 @@ export function WorkspaceScreen({
     setModelPickerOpen(false)
   }
 
+  const send = () => {
+    const submission = parseComposerSubmission(draft)
+    if (submission.kind === 'plan-off-unsupported') {
+      pushToast('info', t('请点击输入框中的 Plan 按钮关闭'))
+      return
+    }
+    if (submission.kind === 'plan-enable') {
+      setAgentMode('plan')
+      setDraft('')
+      pushToast('info', conversation.mode === 'plan' ? t('Plan 已开启') : t('已开启 Plan'))
+      return
+    }
+    if (submission.kind === 'plan-message') {
+      beginSend(submission.content, 'plan')
+      return
+    }
+    beginSend(submission.content)
+  }
+
   return (
     <div
       ref={appShell}
       className={`app-shell ${taskDrawer.open ? 'has-drawer' : ''}`}
       id="top"
       data-sidebar-mode={navigation.mode}
+      aria-hidden={settingsOpen || undefined}
+      inert={settingsOpen || undefined}
       onTransitionEnd={(event) => {
         if (event.target === event.currentTarget) {
           navigation.handleShellTransitionEnd(event.propertyName)
@@ -598,7 +683,13 @@ export function WorkspaceScreen({
       }}
     >
       <Sidebar
-        workspace={sidebarWorkspace}
+        workspace={workspace}
+        historyConversations={historyConversations}
+        historyDayRanges={historyDayRanges}
+        historyQuery={historyQuery}
+        onHistoryQueryChange={setHistoryQuery}
+        isHistorySearchActive={isHistorySearchActive}
+        isHistorySearching={isHistorySearching}
         mode={navigation.mode}
         settledMode={navigation.settledMode}
         overlayOpen={navigation.overlayOpen}
@@ -616,11 +707,15 @@ export function WorkspaceScreen({
         onLoadMore={loadMoreHistory}
         isLoadingMore={isHistoryLoadingMore}
         loadMoreError={historyLoadError ?? undefined}
-        onRetryLoadMore={() => loadMoreHistory(true)}
-        loadMoreSentinelRef={historyLoadSentinel}
+        onRetryLoadMore={retryHistoryLoad}
         user={user}
+        onOpenSettings={(restoreFocusTo) => {
+          taskDrawer.close()
+          settingsRestoreFocus.current = restoreFocusTo ?? null
+          setSettingsOpen(true)
+        }}
         onLogout={onLogout}
-        backgroundInert={taskDrawer.modalActive}
+        backgroundInert={taskDrawer.modalActive || settingsOpen}
       />
       <main
         id="main-content"
@@ -630,32 +725,12 @@ export function WorkspaceScreen({
       >
         <WorkspaceHeader
           conversationTitle={conversation.title}
-          model={conversation.model}
-          modelIds={modelIds}
-          defaultModelId={defaultModelId}
-          modelDisplayName={modelDisplayName}
-          modelCatalogStatus={modelCatalogStatus}
-          isModelPickerOpen={isModelPickerOpen}
-          onModelPickerOpenChange={(open) => {
-            setModelPickerOpen(open)
-            if (open) setAgentPresetPickerOpen(false)
-          }}
-          onSelectModel={selectModel}
-          mode={conversation.mode}
-          isAgentPresetPickerOpen={isAgentPresetPickerOpen}
-          onAgentPresetPickerOpenChange={(open) => {
-            setAgentPresetPickerOpen(open)
-            if (open) setModelPickerOpen(false)
-          }}
-          onSelectAgentMode={selectAgentMode}
-          agentPresetDisabled={isRunning || conversation.approval != null}
           drawerOpen={taskDrawer.open}
           todoCount={conversation.todos.length}
           drawerToggleRef={taskDrawer.toggleRef}
           overlayTriggerRef={navigation.overlayTriggerRef}
           onOpenOverlay={navigation.openOverlay}
           onToggleDrawer={taskDrawer.toggle}
-          onRetryModels={retryModelCatalog}
         />
         <ConversationViewport
           conversation={conversation}
@@ -670,6 +745,7 @@ export function WorkspaceScreen({
           isHydrationFailed={isConversationHydrationFailed}
           isRunning={isRunning}
           showScrollToBottom={showScrollToBottom}
+          fadeScrollToBottom={fadeScrollToBottom}
           onScroll={handleConversationScroll}
           onUserScrollIntent={markUserScrollIntent}
           onRetryHistory={retryHistoryBootstrap}
@@ -679,35 +755,76 @@ export function WorkspaceScreen({
           onChangePlan={(updater) => changePlanInteraction(conversation.threadId, updater)}
           onSubmitPlan={submitPlanInteraction}
           onScrollToBottom={scrollConversationToBottom}
+          onScrollToBottomPointerEnter={pauseScrollToBottomFade}
+          onScrollToBottomPointerLeave={resumeScrollToBottomFade}
         />
         <Composer
           value={draft}
           isRunning={isRunning}
           canStop={Boolean(conversation.threadId)}
           isHydrating={isConversationHydrating}
+          hero={showConversationHero ? <EmptyConversationBrand /> : undefined}
+          takeover={conversation.planInteraction?.kind === 'questions'
+            && !conversation.planInteraction.submitted
+            ? (
+              <PlanQuestionComposer
+                threadId={conversation.threadId}
+                interaction={conversation.planInteraction}
+                onChange={(updater) => changePlanInteraction(
+                  conversation.threadId,
+                  (current) => current.kind === 'questions'
+                    ? updater(current as PlanQuestionState)
+                    : current,
+                )}
+                onSubmit={submitPlanInteraction}
+                onAbandon={exitPlanMode}
+              />
+            )
+            : undefined}
+          modelControl={(
+            <ComposerModelPicker
+              model={conversation.model}
+              modelIds={modelIds}
+              defaultModelId={defaultModelId}
+              modelDisplayName={modelDisplayName}
+              status={modelCatalogStatus}
+              open={isModelPickerOpen}
+              onOpenChange={setModelPickerOpen}
+              onSelectModel={selectModel}
+              onRetry={retryModelCatalog}
+            />
+          )}
+          planActive={conversation.mode === 'plan'}
+          planLocked={isRunning}
+          attachments={localAttachments.attachments}
+          attachmentError={localAttachments.error}
           disabledReason={isConversationHydrationFailed
-            ? '会话加载失败，请先重试'
+            ? t('会话加载失败，请先重试')
             : modelCatalogStatus === 'loading'
-              ? '正在加载模型…'
+              ? t('正在加载模型…')
               : modelCatalogStatus === 'error'
-                ? '模型加载失败，请先重试'
+                ? t('模型加载失败，请先重试')
                 : !isHistoryBootstrapped || historyBootstrapStatus === 'loading'
-                  ? '正在加载历史会话…'
+                  ? t('正在加载历史会话…')
                   : isInitialHistoryUnavailable
-                    ? '历史会话加载失败，请先重试'
+                    ? t('历史会话加载失败，请先重试')
                     : undefined}
           onChange={setDraft}
           onSend={send}
           onStop={() => void stop()}
+          onExitPlan={exitPlanMode}
+          onAddAttachments={localAttachments.addFiles}
+          onRemoveAttachment={localAttachments.removeAttachment}
+          onScrollConversation={scrollConversationBy}
         />
       </main>
-      {taskDrawer.modalActive && <button type="button" className="task-drawer-scrim" aria-label="关闭任务抽屉遮罩" onClick={taskDrawer.close} />}
+      {taskDrawer.modalActive && <button type="button" className="task-drawer-scrim" aria-label={t('关闭任务抽屉遮罩')} onClick={taskDrawer.close} />}
       <ErrorBoundary
         resetKey={`${conversation.threadId || 'draft'}:${taskDrawer.open ? 'open' : 'closed'}`}
         fallback={({ reset }) => taskDrawer.open ? (
-          <aside id="task-drawer" className="task-drawer is-open task-drawer-error" aria-label="任务抽屉渲染错误">
-            <WorkspaceStatus kind="error" title="任务抽屉无法显示" description="对话内容未受影响，可以重试或关闭抽屉。" onRetry={reset} compact />
-            <Button onClick={taskDrawer.close}>关闭抽屉</Button>
+          <aside id="task-drawer" className="task-drawer is-open task-drawer-error" aria-label={t('任务抽屉渲染错误')}>
+            <WorkspaceStatus kind="error" title={t('任务抽屉无法显示')} description={t('对话内容未受影响，可以重试或关闭抽屉。')} onRetry={reset} compact />
+            <Button onClick={taskDrawer.close}>{t('关闭抽屉')}</Button>
           </aside>
         ) : null}
       >
@@ -724,6 +841,14 @@ export function WorkspaceScreen({
         error={dialogError}
         onConfirm={confirmDialog}
         onCancel={closeDialog}
+      />
+      <SettingsDialog
+        open={settingsOpen}
+        user={user}
+        themePreference={theme.preference}
+        restoreFocusTo={settingsRestoreFocus.current}
+        onThemePreferenceChange={theme.selectPreference}
+        onClose={() => setSettingsOpen(false)}
       />
     </div>
   )

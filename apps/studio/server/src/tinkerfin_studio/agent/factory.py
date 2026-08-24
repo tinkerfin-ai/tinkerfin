@@ -29,6 +29,7 @@ from tinkerfin import (
     DeepAgentDefinition,
     TinkerFin,
 )
+from tinkerfin.plan import MarkdownPlanContent
 from tinkerfin_messaging import (
     MessageSourceBinding,
     ProfiledDeferredMessageSource,
@@ -36,6 +37,7 @@ from tinkerfin_messaging import (
 )
 from tinkerfin_sandbox.lifecycle.manager import OpenSandboxManager
 from tinkerfin_studio.agent.persistence import AgentPersistence
+from tinkerfin_studio.agent.plan_clarification import StudioPlanClarificationForm
 from tinkerfin_studio.agent.tools import build_web_search_tool
 from tinkerfin_studio.conversation.run_preparation import (
     PreparedRunRequest,
@@ -47,9 +49,9 @@ _SUBAGENTS_PATH = Path(__file__).with_name("subagents.yaml")
 logger = logging.getLogger(__name__)
 _SYSTEM_PROMPT = """你是 TinkerFin Studio 的主 Agent。
 
-处理复杂任务时使用 write_todos 维护清单，使用 task 委派适合的独立研究任务，
-使用文件工具在用户 Sandbox 中读写结果。调用 write_todos 时，该模型消息只能包含
-write_todos 一个 Tool 调用；等待 ToolMessage 返回后再调用其他 Tool。
+处理复杂任务时使用 write_todos 维护清单，
+使用 task 委派适合的独立研究任务，
+使用文件工具在用户 Sandbox 中读写结果。
 """
 
 
@@ -261,6 +263,8 @@ class ConversationAgentFactory:
         return self._tinkerfin.plan(
             enabled=True,
             planner_model=plan_model,
+            clarification_schema=StudioPlanClarificationForm,
+            plan_schema=MarkdownPlanContent,
         ).create_deep_agent(
             model=model,
             tools=[web_search],

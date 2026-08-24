@@ -2,7 +2,14 @@
 
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import (
+    AnyHttpUrl,
+    BaseModel,
+    ConfigDict,
+    Field,
+    TypeAdapter,
+    field_validator,
+)
 
 from tinkerfin_studio.auth.types import AuthenticatedSession, UserContext
 
@@ -15,6 +22,7 @@ class UserRead(BaseModel):
     user_id: int = Field(ge=1, description="用户 ID")
     username: str = Field(description="登录用户名")
     display_name: str = Field(description="展示名称")
+    avatar_url: str | None = Field(description="头像 HTTPS URL")
     roles: list[str] = Field(default_factory=list, description="用户角色列表")
     disabled: bool = Field(description="是否禁止登录")
 
@@ -23,6 +31,42 @@ class UserRead(BaseModel):
         """从可信用户上下文构造响应"""
 
         return cls.model_validate(context)
+
+
+class UserUpdate(BaseModel):
+    """当前用户可修改的资料字段"""
+
+    display_name: str | None = Field(default=None, min_length=1, max_length=128)
+    avatar_url: str | None = Field(
+        default=None,
+        max_length=2048,
+        description="头像 HTTPS URL；传入 null 时清空头像",
+    )
+
+    @field_validator("display_name")
+    @classmethod
+    def validate_display_name(cls, value: str | None) -> str:
+        """拒绝把必需的展示名称显式清空"""
+
+        if value is None:
+            raise ValueError("展示名称不能为 null")
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("展示名称不能为空")
+        return normalized
+
+    @field_validator("avatar_url")
+    @classmethod
+    def validate_avatar_url(cls, value: str | None) -> str | None:
+        """只接受浏览器可直接加载的完整 HTTPS URL"""
+
+        if value is None:
+            return None
+        normalized = value.strip()
+        parsed = TypeAdapter(AnyHttpUrl).validate_python(normalized)
+        if parsed.scheme != "https":
+            raise ValueError("头像 URL 必须使用 HTTPS")
+        return str(parsed)
 
 
 class LoginRequest(BaseModel):

@@ -82,4 +82,31 @@ describe('前端源码契约', () => {
     }
     expect(invalidComments).toEqual([])
   })
+
+  it('生产 JSX 的用户可见中文必须通过语言资源渲染', () => {
+    const untranslated: string[] = []
+    const hasHan = (value: string) => /[\u3400-\u9fff]/.test(value)
+    for (const [path, source] of productionSources) {
+      if (path.includes('/i18n/')) continue
+      const file = parse(path, source)
+      const visit = (node: ts.Node) => {
+        if (ts.isJsxText(node) && hasHan(node.text.trim())) {
+          const line = file.getLineAndCharacterOfPosition(node.getStart(file)).line + 1
+          untranslated.push(`${path}:${line}:${node.text.trim()}`)
+        }
+        if (
+          ts.isJsxAttribute(node)
+          && node.initializer
+          && ts.isStringLiteral(node.initializer)
+          && hasHan(node.initializer.text)
+        ) {
+          const line = file.getLineAndCharacterOfPosition(node.getStart(file)).line + 1
+          untranslated.push(`${path}:${line}:${node.initializer.text}`)
+        }
+        ts.forEachChild(node, visit)
+      }
+      visit(file)
+    }
+    expect(untranslated).toEqual([])
+  })
 })

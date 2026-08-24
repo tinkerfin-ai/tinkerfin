@@ -15,6 +15,7 @@
     --type-meta-line: 20px;
     --type-ui-size: 14px;
     --type-ui-line: 22px;
+    --type-composer-line: 24px;
     --type-table-size: 15px;
     --type-table-line: 25px;
     --type-body-size: 16px;
@@ -29,6 +30,8 @@
     --type-h2-line: 32px;
     --type-h1-size: 24px;
     --type-h1-line: 34px;
+    --type-brand-size: 26px;
+    --type-brand-line: 32px;
     --type-hero-size: clamp(40px, 5vw, 64px);
     --type-hero-line: 1.08;
     --type-inline-code-size: 14px;

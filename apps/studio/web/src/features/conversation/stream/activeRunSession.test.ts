@@ -14,7 +14,7 @@ const payload: ChatRequestPayload = {
   messages: [{ id: 'request-run-active', role: 'user', content: '继续输出' }],
   tools: [],
   context: [],
-  forwardedProps: { model: 'main', mode: 'default' },
+  forwardedProps: { model: 'main', command: { plan: 'off' } },
 }
 
 describe('active run session', () => {

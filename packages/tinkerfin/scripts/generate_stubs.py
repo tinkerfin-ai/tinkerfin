@@ -178,6 +178,8 @@ from .errors import TinkerFinStreamProtocolError as TinkerFinStreamProtocolError
 from .plan import AgentMode as AgentMode
 from .plan import ClarificationFormBase as _ClarificationFormBase
 from .plan import DefaultClarificationForm as _DefaultClarificationForm
+from .plan import PlanContentModel as _PlanContentModel
+from .plan import StructuredPlanContent as _StructuredPlanContent
 from .runtime import AgUiEventStream as AgUiEventStream
 from .runtime import AgUiNativeStreamConfig as AgUiNativeStreamConfig
 from .runtime import AgUiNativeStreamConfigurationError as AgUiNativeStreamConfigurationError
@@ -204,6 +206,8 @@ class TinkerFin(_RuntimeTinkerFin):
             replacements={
                 "ClarificationFormBase": "_ClarificationFormBase",
                 "DefaultClarificationForm": "_DefaultClarificationForm",
+                "PlanContentModel": "_PlanContentModel",
+                "StructuredPlanContent": "_StructuredPlanContent",
             },
             return_type="TinkerFin",
         )

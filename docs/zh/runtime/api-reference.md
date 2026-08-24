@@ -9,7 +9,7 @@
 | API | 什么时候用 | 主要参数或结果 |
 | --- | --- | --- |
 | `TinkerFin(run_coordinator=None, state_schema=None)` | 创建统一入口 | 可选共享 coordinator 和 Definition 级 state |
-| `TinkerFin.plan(...)` | 创建不可变的 Plan-capable factory | 能力开关、请求默认 mode、可选 Planner 模型与 clarification schema |
+| `TinkerFin.plan(...)` | 创建不可变的 Plan-capable factory | 能力和 mode 默认值、可选 Planner 模型、澄清表单与计划内容 Schema |
 | `TinkerFin.create_deep_agent(...)` | 创建可重复生成 Runtime 的 Agent 定义 | 参数见[创建和运行 Deep Agent](deep-agents.md) |
 | `Identity(threadId=..., runId=...)` | 表示一次框架运行 | 只包含 thread 和 run |
 | `TinkerFin.run(...)` | 运行自己的异步事件源 | `source_factory`、`identity`、`on_part` |
@@ -32,16 +32,23 @@ Definition 只接受 `default`。
 
 顶层包导出 `AgentMode`。`tinkerfin.plan` 导出 `ClarificationModel`、
 `ClarificationOption` / `ClarificationQuestion` / `ClarificationForm` 的 Base 与泛型类型、
-`DefaultClarificationForm`、`PlanStep`、`PlanDraft`、`ConfirmedPlan`、
-`RequirementAnswer`、`PendingClarification`、`ClarificationExchange`、`PlanContent`、
+`DefaultClarificationForm`、`PlanContentModel`、`StructuredPlanStep`、
+`StructuredPlanContent`、`MarkdownPlanContent`、`PlanSchemaReference`、`PlanDraft`、
+`ConfirmedPlan`、`RequirementAnswer`、`PendingClarification`、`ClarificationExchange`、
 `PlanState`、`PlanStatus`、`PlanHandoff`、`PlanReviewAction` 和 Plan 错误类型。这些模型不可变。
 Planning 状态以 camel case JSON 保存在 `tinkerfin_plan`；批准 handoff 提交后
 `effectiveMode` 为 `default`。
 
+`.plan(plan_schema=...)` 接受一个具体 `PlanContentModel` 子类。省略时使用
+`StructuredPlanContent`；`MarkdownPlanContent` 原样保留一段非空 Markdown，不改写空白。
+宿主 Schema 声明稳定 `schema_id`；运行时校验并计算 JSON Schema fingerprint，在恢复时拒绝
+Schema 漂移。被审阅的草稿与 `ConfirmedPlan` 始终使用同一个冻结内容 Schema。
+
 `.plan(clarification_schema=...)` 接受宿主定义的一个完全具体的
 `ClarificationFormBase` 子类；省略时使用 `DefaultClarificationForm`。Python 使用
-`allow_free_text`，JSON 使用 `allowFreeText`。Option 回答只包含 `questionId` 和
-`optionId`；自由文本回答只包含 `questionId` 和 `answer`。宿主模型可以增加强类型
+`allow_free_text`，JSON 使用 `allowFreeText`，每道问题都显式提供 `required`。Option 回答只包含
+`questionId` 和 `optionId`；自由文本回答只包含 `questionId` 和 `answer`；跳过可选题时只包含
+`questionId` 和 `skipped: true`。宿主模型可以增加强类型
 attributes 和 discriminant，但不能重新定义框架核心字段，也不能改变 questions/options
 的 tuple 结构。
 

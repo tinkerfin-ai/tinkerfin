@@ -1,6 +1,17 @@
-import type { AgentMode, JsonObject, JsonValue } from "../../types"
+import type { AgentMode, JsonObject, JsonValue, MarkdownPlanContent } from "../../types"
 
 export type { AgentMode }
+
+export type ConversationPlanCommand = "on" | "off"
+
+export interface ConversationCommandMap extends JsonObject {
+  plan: ConversationPlanCommand
+}
+
+export interface ConversationForwardedProps extends JsonObject {
+  model: string
+  command: ConversationCommandMap
+}
 
 export interface ChatMessageInput {
   id: string
@@ -20,10 +31,11 @@ export type ChatResumePayload =
     answers: Array<
       | { questionId: string; optionId: string }
       | { questionId: string; answer: string }
+      | { questionId: string; skipped: true }
     >
   }
   | { type: "approve"; baseRevision: number }
-  | { type: "edit"; baseRevision: number; draft: JsonObject }
+  | { type: "edit"; baseRevision: number; content: MarkdownPlanContent }
   | { type: "respond"; baseRevision: number; message: string }
   | { type: "reject"; baseRevision: number; message?: string }
 
@@ -40,20 +52,43 @@ export interface ChatRequestPayload {
   messages: ChatMessageInput[]
   tools: JsonValue[]
   context: JsonValue[]
-  forwardedProps: JsonObject
+  forwardedProps: ConversationForwardedProps
   resume?: ChatResumeEntry[]
 }
 
-export interface EventSourceInfo {
-  agentType: "main" | "subagent"
-  agentName: string
+interface EventSourceInfoBase {
+  kind: "root" | "compiled_subgraph" | "deep_agent_subagent"
   namespace: string[]
   graphTaskId?: string | null
+  nodeName?: string | null
   parentNamespace?: string[] | null
   parentToolCallId?: string | null
   subagentInput?: string | null
   subagentInvocationId?: string | null
 }
+
+interface RootEventSourceInfo extends EventSourceInfoBase {
+  kind: "root"
+  agentType: "main"
+  agentName: string
+}
+
+interface CompiledSubgraphEventSourceInfo extends EventSourceInfoBase {
+  kind: "compiled_subgraph"
+  agentType?: never
+  agentName?: never
+}
+
+interface DeepAgentSubagentEventSourceInfo extends EventSourceInfoBase {
+  kind: "deep_agent_subagent"
+  agentType: "subagent"
+  agentName: string
+}
+
+export type EventSourceInfo =
+  | RootEventSourceInfo
+  | CompiledSubgraphEventSourceInfo
+  | DeepAgentSubagentEventSourceInfo
 
 export interface RawEventContext {
   streamMode?: "messages" | "tasks" | "values"

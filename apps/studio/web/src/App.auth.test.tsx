@@ -18,6 +18,7 @@ const user = {
   user_id: 7,
   username: 'yunsan',
   display_name: '云杉',
+  avatar_url: null,
   roles: [],
   disabled: false,
 }
@@ -110,6 +111,7 @@ describe('App authentication boundary', () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = new URL(input instanceof Request ? input.url : String(input), 'http://localhost')
       if (url.pathname.endsWith('/api/auth/me')) return envelope(sessionPayload())
+      if (url.pathname.endsWith('/api/conversation/config')) return envelope({ dayRanges: [7, 30] })
       if (url.pathname.endsWith('/api/conversation/history')) {
         return envelope({ items: [], nextCursor: null })
       }
@@ -134,6 +136,7 @@ describe('App authentication boundary', () => {
           ? new Response(null, { status: 503 })
           : envelope(sessionPayload())
       }
+      if (url.pathname.endsWith('/api/conversation/config')) return envelope({ dayRanges: [7, 30] })
       if (url.pathname.endsWith('/api/conversation/history')) {
         return envelope({ items: [], nextCursor: null })
       }
@@ -163,6 +166,7 @@ describe('App authentication boundary', () => {
         if (sessionRequests === 1) throw new TypeError('Failed to fetch')
         return envelope(sessionPayload())
       }
+      if (url.pathname.endsWith('/api/conversation/config')) return envelope({ dayRanges: [7, 30] })
       if (url.pathname.endsWith('/api/conversation/history')) {
         return envelope({ items: [], nextCursor: null })
       }
@@ -184,6 +188,7 @@ describe('App authentication boundary', () => {
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
       const url = new URL(input instanceof Request ? input.url : String(input), 'http://localhost')
       if (url.pathname.endsWith('/api/auth/me')) return envelope(sessionPayload(expiresAt))
+      if (url.pathname.endsWith('/api/conversation/config')) return envelope({ dayRanges: [7, 30] })
       if (url.pathname.endsWith('/api/conversation/history')) {
         return envelope({ items: [], nextCursor: null })
       }
@@ -205,6 +210,7 @@ describe('App authentication boundary', () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = new URL(input instanceof Request ? input.url : String(input), 'http://localhost')
       if (url.pathname.endsWith('/api/auth/me')) return envelope(sessionPayload())
+      if (url.pathname.endsWith('/api/conversation/config')) return envelope({ dayRanges: [7, 30] })
       if (url.pathname.endsWith('/api/conversation/history')) {
         return envelope(null, 401, 1_001_001_000, '登录已过期')
       }
@@ -228,6 +234,7 @@ describe('App authentication boundary', () => {
       const url = new URL(request.url)
       if (url.pathname.endsWith('/api/auth/login')) return envelope(loginPayload())
       if (url.pathname.endsWith('/api/auth/me')) return envelope(sessionPayload())
+      if (url.pathname.endsWith('/api/conversation/config')) return envelope({ dayRanges: [7, 30] })
       if (url.pathname.endsWith('/api/conversation/history')) return envelope({ items: [], nextCursor: null })
       throw new Error(`unexpected request: ${url.pathname}`)
     })
@@ -323,6 +330,7 @@ describe('App authentication boundary', () => {
       const url = new URL(request.url)
       if (url.pathname.endsWith('/api/auth/login')) return envelope(loginPayload())
       if (url.pathname.endsWith('/api/auth/me')) return envelope(sessionPayload())
+      if (url.pathname.endsWith('/api/conversation/config')) return envelope({ dayRanges: [7, 30] })
       if (url.pathname.endsWith('/api/conversation/history')) return envelope({ items: [], nextCursor: null })
       throw new Error(`unexpected request: ${url.pathname}`)
     }))
@@ -345,6 +353,7 @@ describe('App authentication boundary', () => {
       const url = new URL(request.url)
       if (url.pathname.endsWith('/api/auth/me')) return envelope(sessionPayload())
       if (url.pathname.endsWith('/api/auth/logout')) return envelope(null)
+      if (url.pathname.endsWith('/api/conversation/config')) return envelope({ dayRanges: [7, 30] })
       if (url.pathname.endsWith('/api/conversation/history')) return envelope({ items: [], nextCursor: null })
       if (url.pathname.endsWith('/api/conversation/private-thread/history')) {
         return envelope({
@@ -380,7 +389,7 @@ describe('App authentication boundary', () => {
         messages: [{ id: 'request-private-run', role: 'user', content: 'private prompt' }],
         tools: [],
         context: [],
-        forwardedProps: {},
+        forwardedProps: { model: 'main', command: { plan: 'off' } },
       },
       mode: 'start',
       lastSeq: 7,
@@ -406,6 +415,7 @@ describe('App authentication boundary', () => {
       const request = input instanceof Request ? input : new Request(input)
       const url = new URL(request.url)
       if (url.pathname.endsWith('/api/auth/me')) return envelope(sessionPayload())
+      if (url.pathname.endsWith('/api/conversation/config')) return envelope({ dayRanges: [7, 30] })
       if (url.pathname.endsWith('/api/conversation/history')) {
         return envelope({ items: [], nextCursor: null })
       }

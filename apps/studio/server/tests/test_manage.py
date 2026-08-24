@@ -37,3 +37,13 @@ def test_management_parser_keeps_secrets_out_of_required_arguments() -> None:
     assert user.password is None
     assert model.api_key is None
     assert model.is_default is True
+
+
+def test_forwarded_command_migration_is_dry_run_by_default() -> None:
+    """数据迁移必须显式传入 apply 才允许写入"""
+
+    dry_run = parse_args(["data", "migrate-forwarded-commands"])
+    apply = parse_args(["data", "migrate-forwarded-commands", "--apply"])
+
+    assert dry_run.apply is False
+    assert apply.apply is True

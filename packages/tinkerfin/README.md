@@ -97,14 +97,22 @@ Planning, add middleware, replace the state schema, or create a parent Graph. Na
 `write_todos`, Tool/Filesystem review, subagents, cancellation, and error semantics are
 therefore identical for ordinary and Plan-capable Definitions.
 
-Only `ls`, `read_file`, `glob`, and `grep` are available to the Planner. Clarification
-questions can contain model-generated single-select options and can optionally allow a
-free-text answer. Selecting an option submits only its stable ID; the Planning workflow
-derives the trusted label from the checkpointed form. Approval freezes a `ConfirmedPlan`
-and commits a deterministic v3 handoff bound to the original user message ID. TinkerFin
+Only `ls`, `read_file`, `glob`, and `grep` are available to the Planner. Every
+clarification question explicitly declares whether it is required. Questions can contain
+model-generated single-select options, can optionally allow a free-text answer, and an
+optional question can be explicitly skipped. Selecting an option submits only its stable
+ID; the Planning workflow derives the trusted label from the checkpointed form. A skipped
+answer remains explicit trusted Plan context rather than an omitted payload. Approval freezes a `ConfirmedPlan`
+and commits a deterministic handoff bound to the original user message ID. The runtime
 then starts the native Deep Agent in the same request; the effective mode becomes
 `default` before execution. The public Plan state and value models are available from
 `tinkerfin.plan` and are emitted under the root state key `tinkerfin_plan`.
+
+Plan content is independently configurable. Omitting `plan_schema` uses
+`StructuredPlanContent`; pass `MarkdownPlanContent` for one exact Markdown document, or
+provide a concrete `PlanContentModel` subclass with a stable `schema_id`. The selected
+schema is frozen on the returned factory, validated before checkpoint persistence, and
+used for Planner output, edits, review, confirmed content, and native handoff.
 
 The default clarification form requires no application models. A host that needs typed,
 user-visible metadata can define one concrete Pydantic form and freeze it on the Plan

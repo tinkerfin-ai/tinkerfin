@@ -45,6 +45,31 @@ def test_history_cursor_rejects_noncanonical_payloads(
         ConversationHistoryService._decode_cursor(cursor)
 
 
+def test_history_cursor_rejects_a_different_search_query() -> None:
+    """搜索游标不得被其他查询词复用"""
+
+    cursor = base64.urlsafe_b64encode(
+        json.dumps(
+            {
+                "pinned": False,
+                "updatedAt": "2026-08-18T10:00:00",
+                "id": 1,
+                "query": "目标",
+            },
+            separators=(",", ":"),
+        ).encode()
+    ).decode()
+
+    with pytest.raises(BusinessException):
+        ConversationHistoryService._decode_cursor(cursor, query="其他")
+
+
+def test_history_group_config_exposes_server_day_ranges() -> None:
+    """前端时间分组只消费服务端公开的有序范围"""
+
+    assert ConversationHistoryService.group_config().day_ranges == [7, 30]
+
+
 async def test_list_threads_pages_across_pinned_and_recent_groups(
     session: AsyncSession,
 ) -> None:
@@ -90,6 +115,44 @@ async def test_list_threads_pages_across_pinned_and_recent_groups(
         "thread-recent-new",
         "thread-recent-old",
     ]
+
+
+async def test_list_threads_searches_a_literal_title_substring_for_current_user(
+    session: AsyncSession,
+) -> None:
+    """标题模糊查询必须限制用户并把 SQL 通配符作为普通字符"""
+
+    repository = ConversationRepository(session)
+    values = (
+        (7, "thread-percent", "进度 100% 完成"),
+        (7, "thread-target", "服务端目标会话"),
+        (7, "thread-other", "其他会话"),
+        (8, "thread-other-user", "服务端目标会话"),
+    )
+    for user_id, thread_id, title in values:
+        await repository.create_thread(
+            user_id=user_id,
+            thread_id=thread_id,
+            title=title,
+            model_id="main",
+        )
+    await repository.commit()
+
+    literal_percent = await repository.list_threads(
+        user_id=7,
+        page_size=10,
+        cursor=None,
+        query="%",
+    )
+    target = await repository.list_threads(
+        user_id=7,
+        page_size=10,
+        cursor=None,
+        query="目标",
+    )
+
+    assert [thread.thread_id for thread in literal_percent] == ["thread-percent"]
+    assert [thread.thread_id for thread in target] == ["thread-target"]
 
 
 async def test_get_detail_releases_read_transaction_before_projection(

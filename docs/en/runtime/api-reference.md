@@ -9,7 +9,7 @@ This page groups the public Runtime capabilities by how you use them. Most appli
 | API | When to use it | Main input or result |
 | --- | --- | --- |
 | `TinkerFin(run_coordinator=None, state_schema=None)` | Create the main entry point | Optional shared coordinator and Definition-wide state |
-| `TinkerFin.plan(...)` | Create an immutable Plan-capable factory | Capability default, request default mode, optional Planner model and clarification schema |
+| `TinkerFin.plan(...)` | Create an immutable Plan-capable factory | Capability and mode defaults, optional Planner model, clarification form, and Plan content schema |
 | `TinkerFin.create_deep_agent(...)` | Create a reusable agent definition | See [Create and run a Deep Agent](deep-agents.md) |
 | `Identity(threadId=..., runId=...)` | Identify one framework run | Thread and run only |
 | `TinkerFin.run(...)` | Run a custom async source | `source_factory`, `identity`, `on_part` |
@@ -34,17 +34,26 @@ later request. An ordinary Definition accepts only `default`.
 
 The top-level package exports `AgentMode`. The `tinkerfin.plan` package exports
 `ClarificationModel`, the `ClarificationOption` / `ClarificationQuestion` /
-`ClarificationForm` base and generic types, `DefaultClarificationForm`, `PlanStep`,
-`PlanDraft`, `ConfirmedPlan`, `RequirementAnswer`, `PendingClarification`,
-`ClarificationExchange`, `PlanContent`, `PlanState`, `PlanStatus`, `PlanHandoff`,
-`PlanReviewAction`, and the Plan error types. The models are frozen. Planning state uses
-the camel-case JSON representation at `tinkerfin_plan`; `effectiveMode` becomes
-`default` when approval commits the handoff.
+`ClarificationForm` base and generic types, `DefaultClarificationForm`,
+`PlanContentModel`, `StructuredPlanStep`, `StructuredPlanContent`,
+`MarkdownPlanContent`, `PlanSchemaReference`, `PlanDraft`, `ConfirmedPlan`,
+`RequirementAnswer`, `PendingClarification`, `ClarificationExchange`, `PlanState`,
+`PlanStatus`, `PlanHandoff`, `PlanReviewAction`, and the Plan error types. The models are
+frozen. Planning state uses the camel-case JSON representation at `tinkerfin_plan`;
+`effectiveMode` becomes `default` when approval commits the handoff.
+
+`.plan(plan_schema=...)` accepts one concrete `PlanContentModel` subclass. Omitting it
+uses `StructuredPlanContent`; `MarkdownPlanContent` preserves one non-blank Markdown
+string without whitespace rewriting. A host schema declares a stable `schema_id`; the
+runtime validates and fingerprints its JSON Schema and rejects schema drift on resume.
+The reviewed draft and `ConfirmedPlan` always use the same frozen content schema.
 
 `.plan(clarification_schema=...)` accepts one fully concrete `ClarificationFormBase`
 subclass defined by the host. Omitting it uses `DefaultClarificationForm`. Python uses
-`allow_free_text`; the JSON contract uses `allowFreeText`. Option answers contain only
-`questionId` and `optionId`; free-text answers contain only `questionId` and `answer`.
+`allow_free_text`; the JSON contract uses `allowFreeText`. Every question explicitly
+sets `required`. Option answers contain only `questionId` and `optionId`; free-text
+answers contain only `questionId` and `answer`; an optional skip contains
+`questionId` and `skipped: true`.
 Host models can add typed attributes and discriminants but cannot redefine the
 framework-owned core fields or the tuple shape of questions and options.
 

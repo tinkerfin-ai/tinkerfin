@@ -65,10 +65,16 @@ class ClarificationOption(
 
 
 class ClarificationQuestionBase(ClarificationModel):
-    """Core fields shared by every blocking clarification question."""
+    """Core fields shared by every clarification question."""
 
     id: ClarificationId = Field(description="Stable question ID within one form")
     prompt: ClarificationText = Field(description="Question shown to the user")
+    required: bool = Field(
+        description=(
+            "Whether planning must stop until the user answers this question; "
+            "optional questions may be explicitly skipped"
+        )
+    )
     options: tuple[ClarificationOptionBase, ...] = Field(
         default=(),
         description="Model-generated single-select options",
@@ -115,13 +121,13 @@ class ClarificationQuestion(
 class ClarificationFormBase(ClarificationModel):
     """Core form accepted by the Plan clarification workflow."""
 
-    schema_version: Literal[1] = Field(
-        default=1,
+    schema_version: Literal[2] = Field(
+        default=2,
         description="Clarification form serialization schema version",
     )
     questions: tuple[ClarificationQuestionBase, ...] = Field(
         min_length=1,
-        description="Blocking questions that must all be answered",
+        description="Questions that must each be answered or explicitly skipped",
     )
 
     @model_validator(mode="after")
@@ -145,7 +151,7 @@ class ClarificationForm(ClarificationFormBase, Generic[QuestionT]):
     # Pydantic freezes this tuple field, so narrowing its item type is covariant.
     questions: tuple[QuestionT, ...] = Field(  # pyright: ignore[reportIncompatibleVariableOverride]
         min_length=1,
-        description="Blocking questions that must all be answered",
+        description="Questions that must each be answered or explicitly skipped",
     )
 
 

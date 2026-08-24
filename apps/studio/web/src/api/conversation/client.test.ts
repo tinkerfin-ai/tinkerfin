@@ -11,7 +11,7 @@ const requestPayload: ChatRequestPayload = {
   messages: [{ id: 'request-run-conflict', role: 'user', content: '继续执行' }],
   tools: [],
   context: [],
-  forwardedProps: {},
+  forwardedProps: { model: 'main', command: { plan: 'off' } },
 }
 
 async function consumeStream(): Promise<void> {
@@ -34,7 +34,7 @@ describe('conversation stream client', () => {
       token: 'conversation-token',
       tokenType: 'Bearer',
       expiresAt: '2099-01-01T00:00:00.000Z',
-      user: { user_id: 7, username: 'yunsan', display_name: '云杉', roles: [], disabled: false },
+      user: { user_id: 7, username: 'yunsan', display_name: '云杉', avatar_url: null, roles: [], disabled: false },
     })
   })
 
@@ -199,6 +199,63 @@ describe('conversation stream client', () => {
     )))
 
     await expect(consumeStream()).rejects.toThrow('事件流包含无效的 AG-UI 事件')
+  })
+
+  it('streams the complete compiled-subgraph Tool lifecycle', async () => {
+    const source = {
+      kind: 'compiled_subgraph',
+      nodeName: 'create_plan',
+      namespace: ['create_plan:graph-task-1'],
+      graphTaskId: 'graph-task-1',
+      parentNamespace: [],
+    }
+    const events = [
+      {
+        type: 'TOOL_CALL_START',
+        toolCallId: 'planner-outcome-1',
+        toolCallName: 'PlannerOutcome',
+        parentMessageId: 'planner-message-1',
+      },
+      {
+        type: 'TOOL_CALL_ARGS',
+        toolCallId: 'planner-outcome-1',
+        delta: '{',
+      },
+      {
+        type: 'TOOL_CALL_END',
+        toolCallId: 'planner-outcome-1',
+      },
+      {
+        type: 'TOOL_CALL_RESULT',
+        toolCallId: 'planner-outcome-1',
+        messageId: 'planner-result-1',
+        content: 'Returning structured response',
+        role: 'tool',
+      },
+    ].map((event) => ({
+      ...event,
+      rawEvent: {
+        streamMode: 'messages',
+        runId: 'run-conflict',
+        langgraphNode: 'model',
+        source,
+      },
+    }))
+    vi.stubGlobal('fetch', vi.fn(async () => sseResponse(
+      events.map((event, index) => (
+        `id: ${index + 11}\ndata: ${JSON.stringify(event)}\n\n`
+      )).join(''),
+    )))
+
+    const received = []
+    for await (const item of startConversationRun(requestPayload)) received.push(item)
+
+    expect(received.map(({ seq, event }) => [seq, event.type])).toEqual([
+      [11, 'TOOL_CALL_START'],
+      [12, 'TOOL_CALL_ARGS'],
+      [13, 'TOOL_CALL_END'],
+      [14, 'TOOL_CALL_RESULT'],
+    ])
   })
 
   it.each([

@@ -44,7 +44,10 @@ from .errors import (
 from .native import NativeStreamPart
 from .plan._clarification import create_clarification_binding
 from .plan._config import AgentMode, PlanOptions, validate_agent_mode
+from .plan._content import create_plan_content_binding
+from .plan._contracts import create_plan_contract_binding
 from .plan.clarification import ClarificationFormBase, DefaultClarificationForm
+from .plan.models import PlanContentModel, StructuredPlanContent
 from .sse import (
     SseBody,
     SseEventIdResolver,
@@ -644,6 +647,7 @@ class TinkerFin:
         default_mode: AgentMode = "default",
         planner_model: str | BaseChatModel | None = None,
         clarification_schema: type[ClarificationFormBase] = DefaultClarificationForm,
+        plan_schema: type[PlanContentModel] = StructuredPlanContent,
     ) -> TinkerFin:
         """Return a factory with immutable Plan-capability options.
 
@@ -655,6 +659,7 @@ class TinkerFin:
             default_mode: Run mode used when ``new`` or ``new_agui`` omits one.
             planner_model: Optional model dedicated to read-only planning.
             clarification_schema: Concrete host form used by the Planner.
+            plan_schema: Concrete content model used for drafts and confirmed Plans.
 
         Returns:
             A separate configured TinkerFin factory.
@@ -678,19 +683,25 @@ class TinkerFin:
             mode != "default"
             or planner_model is not None
             or clarification_schema is not DefaultClarificationForm
+            or plan_schema is not StructuredPlanContent
         ):
             from .plan.errors import PlanModeConfigurationError
 
             raise PlanModeConfigurationError(
-                "disabled Plan capability cannot configure a mode, model, or form"
+                "disabled Plan capability cannot configure a mode, model, form, "
+                "or content schema"
             )
         configured = TinkerFin(
             run_coordinator=self._run_coordinator,
             state_schema=self._state_schema,
         )
         if enabled:
+            clarification = create_clarification_binding(clarification_schema)
+            content = create_plan_content_binding(plan_schema)
             configured._plan_options = PlanOptions(
-                clarification=create_clarification_binding(clarification_schema),
+                clarification=clarification,
+                content=content,
+                contracts=create_plan_contract_binding(clarification, content),
                 default_mode=mode,
                 planner_model=planner_model,
             )

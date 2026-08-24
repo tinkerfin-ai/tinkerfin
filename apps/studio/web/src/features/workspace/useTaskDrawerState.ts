@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 const TASK_DRAWER_PREFERENCE_KEY_PREFIX = 'tinkerfin:task-drawer:'
-const DRAWER_OVERLAY_QUERY = '(max-width: 1599px)'
+const DRAWER_OVERLAY_QUERY = '(max-width: 1280px)'
 
 const taskDrawerPreferenceKey = (threadId: string) => `${TASK_DRAWER_PREFERENCE_KEY_PREFIX}${threadId}`
 

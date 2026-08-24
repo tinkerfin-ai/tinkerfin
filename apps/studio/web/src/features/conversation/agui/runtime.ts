@@ -7,6 +7,7 @@ import type {
   InterruptEvent,
   RawEventContext,
 } from "../../../api/conversation/types"
+import { parseConversationAgUiEvent } from "../../../api/conversation/eventParser"
 import type {
   ConversationEventEnvelope,
   ConversationHistoryDetail,
@@ -20,10 +21,12 @@ import type {
   ConversationNotice,
   JsonObject,
   JsonValue,
+  MarkdownPlanDraft,
   Message,
   TodoItem,
   TodoStatus,
 } from "../../../types"
+import { translateCurrent } from "../../../i18n"
 import { parseToolReviewInterrupt } from "./toolReviewContract"
 import {
   parseSubagentProvenance,
@@ -117,7 +120,7 @@ const markInterruptedToolCards = (
 const approvalInputFromArgs = (args: JsonObject, fallback: string | undefined) => {
   const filePath = args.file_path
   if (typeof filePath === "string" && filePath) return filePath
-  return fallback ?? "请确认该操作"
+  return fallback ?? ""
 }
 
 const approvalItemsFromInterrupts = (interrupts: InterruptEvent[]): ApprovalItem[] =>
@@ -134,7 +137,7 @@ const approvalItemsFromInterrupts = (interrupts: InterruptEvent[]): ApprovalItem
       toolName,
       params: JSON.stringify(originalArgs, null, 2),
       input: approvalInputFromArgs(originalArgs, interrupt.message),
-      description: interrupt.message ?? `请确认工具 ${toolName}`,
+      description: interrupt.message ?? "",
       originalArgs,
       allowedDecisions,
     }
@@ -159,28 +162,49 @@ const runtimeEnvelopeMetadata = (interrupt: PlanInterruptLike): JsonObject | nul
     : null
 }
 
+const isStringWithinLength = (value: unknown, maximum: number): value is string => {
+  if (typeof value !== 'string') return false
+  const length = Array.from(value).length
+  return length >= 1 && length <= maximum
+}
+
+const invalidPlanInteraction = (): never => {
+  throw new Error('Plan interrupt 载荷不符合 Studio 契约')
+}
+
 const planInteractionFromInterrupts = (
   interrupts: readonly PlanInterruptLike[],
 ): Conversation['planInteraction'] => {
-  if (interrupts.length !== 1) return undefined
-  const interrupt = interrupts[0]
-  if (!interrupt) return undefined
+  const planInterrupts = interrupts.filter((interrupt) => (
+    interrupt.reason === 'plan_clarification' || interrupt.reason === 'plan_review'
+  ))
+  if (planInterrupts.length === 0) return undefined
+  if (interrupts.length !== 1 || planInterrupts.length !== 1) return invalidPlanInteraction()
+  const interrupt = planInterrupts[0]
+  if (!interrupt) return invalidPlanInteraction()
   const metadata = runtimeEnvelopeMetadata(interrupt)
-  if (!metadata) return undefined
+  if (!metadata) return invalidPlanInteraction()
+  if (metadata.origin !== 'plan') return invalidPlanInteraction()
 
   if (interrupt.reason === 'plan_clarification') {
     const clarification = metadata.clarification
-    if (!clarification || typeof clarification !== 'object' || Array.isArray(clarification)) return undefined
-    if (clarification.schema !== 'tinkerfin.plan-clarification.v1') return undefined
+    if (!clarification || typeof clarification !== 'object' || Array.isArray(clarification)) return invalidPlanInteraction()
+    if (clarification.schema !== 'tinkerfin.plan-clarification.v2') return invalidPlanInteraction()
     const form = clarification.form
-    if (!form || typeof form !== 'object' || Array.isArray(form)) return undefined
-    if (form.schemaVersion !== 1 || !Array.isArray(form.questions)) return undefined
+    if (!form || typeof form !== 'object' || Array.isArray(form)) return invalidPlanInteraction()
+    if (
+      form.schemaVersion !== 2
+      || !isStringWithinLength(form.title, 20)
+      || !isStringWithinLength(form.description, 60)
+      || !Array.isArray(form.questions)
+    ) return invalidPlanInteraction()
     const questions = form.questions.flatMap((rawQuestion) => {
       if (!rawQuestion || typeof rawQuestion !== 'object' || Array.isArray(rawQuestion)) return []
       const question = rawQuestion as JsonObject
       if (
         typeof question.id !== 'string'
         || typeof question.prompt !== 'string'
+        || typeof question.required !== 'boolean'
         || typeof question.allowFreeText !== 'boolean'
       ) return []
       const questionAttributes = question.attributes
@@ -196,30 +220,40 @@ const planInteractionFromInterrupts = (
             if (typeof option.id !== 'string' || typeof option.label !== 'string') return []
             const optionAttributes = option.attributes
             if (
-              optionAttributes !== undefined
-              && optionAttributes !== null
-              && (typeof optionAttributes !== 'object' || Array.isArray(optionAttributes))
+              !optionAttributes
+              || typeof optionAttributes !== 'object'
+              || Array.isArray(optionAttributes)
+              || typeof optionAttributes.recommended !== 'boolean'
             ) return []
             return [{
               id: option.id,
               label: option.label,
               description: typeof option.description === 'string' ? option.description : null,
-              attributes: optionAttributes as JsonObject | null | undefined,
+              recommended: optionAttributes.recommended,
+              attributes: optionAttributes as JsonObject,
             }]
           })
         : []
+      if (
+        options.length > 0
+        && (!options[0]?.recommended || options.slice(1).some((option) => option.recommended))
+      ) return []
       return [{
         id: question.id,
         prompt: question.prompt,
+        required: question.required,
         options,
         allowFreeText: question.allowFreeText,
         attributes: questionAttributes as JsonObject | null | undefined,
       }]
     })
-    if (questions.length !== form.questions.length || questions.length === 0) return undefined
+    if (questions.length !== form.questions.length || questions.length === 0) return invalidPlanInteraction()
     return {
       kind: 'questions',
       interruptId: interrupt.id,
+      title: form.title,
+      description: form.description,
+      activeQuestionIndex: 0,
       form: structuredClone(form as JsonObject),
       questions,
       submitted: false,
@@ -227,20 +261,44 @@ const planInteractionFromInterrupts = (
   }
 
   if (interrupt.reason === 'plan_review') {
-    const revision = metadata.planRevision
-    const draft = metadata.draft
+    const review = metadata.review
     if (
-      typeof revision !== 'number'
-      || !Number.isInteger(revision)
-      || !draft
+      !review
+      || typeof review !== 'object'
+      || Array.isArray(review)
+      || review.schema !== 'tinkerfin.plan-review.v1'
+    ) return invalidPlanInteraction()
+    const draft = review.draft
+    if (
+      !draft
       || typeof draft !== 'object'
       || Array.isArray(draft)
-    ) return undefined
+    ) return invalidPlanInteraction()
+    const contentSchema = draft.contentSchema
+    const content = draft.content
+    if (
+      draft.schemaVersion !== 1
+      || typeof draft.revision !== 'number'
+      || !Number.isInteger(draft.revision)
+      || draft.revision < 1
+      || !contentSchema
+      || typeof contentSchema !== 'object'
+      || Array.isArray(contentSchema)
+      || contentSchema.id !== 'tinkerfin.plan.markdown.v1'
+      || contentSchema.mediaType !== 'text/markdown'
+      || typeof contentSchema.fingerprint !== 'string'
+      || !/^[0-9a-f]{64}$/.test(contentSchema.fingerprint)
+      || !content
+      || typeof content !== 'object'
+      || Array.isArray(content)
+      || typeof content.markdown !== 'string'
+      || !content.markdown.trim()
+    ) return invalidPlanInteraction()
     return {
       kind: 'review',
       interruptId: interrupt.id,
-      revision,
-      draft: draft as JsonObject,
+      revision: draft.revision,
+      draft: structuredClone(draft) as unknown as MarkdownPlanDraft,
       submitted: false,
     }
   }
@@ -343,6 +401,7 @@ const rawEventOrMain = (
   ...rawEvent,
   streamMode: rawEvent?.streamMode ?? "messages",
   source: rawEvent?.source ?? {
+    kind: "root",
     agentType: "main",
     agentName: "main",
     namespace: [],
@@ -397,7 +456,7 @@ const startSubagentRun = (
   const subagentMessage: Message = {
     id: subRunId,
     role: "subagent",
-    content: task?.content ?? "子智能体运行",
+    content: task?.content ?? "",
     createdAt,
     meta: {
       agentName: provenance.agentName,
@@ -533,6 +592,21 @@ const applyStateDelta = (current: JsonObject | undefined, delta: { path: string;
 const isAgentMode = (value: unknown): value is AgentMode =>
   value === "default" || value === "plan"
 
+const forwardedPropsFor = (
+  model: string,
+  mode: AgentMode,
+): ChatRequestPayload["forwardedProps"] => ({
+  model,
+  command: { plan: mode === "plan" ? "on" : "off" },
+})
+
+const agentModeFromForwardedProps = (value: JsonValue | undefined): AgentMode | undefined => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
+  const command = value.command
+  if (!command || typeof command !== "object" || Array.isArray(command)) return undefined
+  return command.plan === "on" ? "plan" : command.plan === "off" ? "default" : undefined
+}
+
 const syncEffectiveModeFromState = (
   conversation: Conversation,
   state: JsonObject,
@@ -561,10 +635,7 @@ export const buildInitialPayload = (
     ],
     tools: [],
     context: [],
-    forwardedProps: {
-      model: conversation.model,
-      mode: conversation.mode,
-    },
+    forwardedProps: forwardedPropsFor(conversation.model, conversation.mode),
   }
 }
 
@@ -646,10 +717,7 @@ export const buildResumePayload = (
     messages: [],
     tools: [],
     context: [],
-    forwardedProps: {
-      model: conversation.model,
-      mode: conversation.mode,
-    },
+    forwardedProps: forwardedPropsFor(conversation.model, conversation.mode),
     resume,
   }
 }
@@ -666,11 +734,13 @@ export const buildPlanResumePayload = (
     const answers = interaction.questions.map((question) => {
       const option = question.options.find((item) => item.id === question.selectedOptionId)
       const customAnswer = question.customAnswer?.trim() ?? ''
-      if (!option && !customAnswer) throw new Error("请回答所有 Plan 澄清问题")
-      if (!option && !question.allowFreeText) throw new Error("该问题必须选择一个选项")
+      if (!option && !customAnswer && question.required) throw new Error("请回答所有必填的 Plan 澄清问题")
+      if (customAnswer && !question.allowFreeText) throw new Error("该问题必须选择一个选项")
       return option
         ? { questionId: question.id, optionId: option.id }
-        : { questionId: question.id, answer: customAnswer }
+        : customAnswer
+          ? { questionId: question.id, answer: customAnswer }
+          : { questionId: question.id, skipped: true as const }
     })
     payload = { type: 'respond', answers }
   } else {
@@ -678,15 +748,12 @@ export const buildPlanResumePayload = (
     if (interaction.action === 'approve') {
       payload = { type: 'approve', baseRevision: interaction.revision }
     } else if (interaction.action === 'edit') {
-      const draft = parseJsonObject(interaction.editedDraft ?? '')
-      if (!draft) throw new Error("编辑后的 Plan 必须是 JSON 对象")
-      const content = structuredClone(draft)
-      delete content.schemaVersion
-      delete content.revision
+      const markdown = interaction.editedMarkdown ?? ''
+      if (!markdown.trim()) throw new Error("编辑后的计划不能为空")
       payload = {
         type: 'edit',
         baseRevision: interaction.revision,
-        draft: content,
+        content: { markdown },
       }
     } else if (interaction.action === 'respond') {
       const message = interaction.message?.trim()
@@ -713,12 +780,12 @@ export const buildPlanResumePayload = (
     messages: [],
     tools: [],
     context: [],
-    forwardedProps: {
-      model: conversation.model,
-      mode: interaction.kind === 'review' && (
+    forwardedProps: forwardedPropsFor(
+      conversation.model,
+      interaction.kind === 'review' && (
         interaction.action === 'approve' || interaction.action === 'reject'
       ) ? 'default' : 'plan',
-    },
+    ),
     resume: [{
       interruptId: interaction.interruptId,
       status: 'resolved',
@@ -739,10 +806,7 @@ export const buildPlanAbandonPayload = (
     messages: [],
     tools: [],
     context: [],
-    forwardedProps: {
-      model: conversation.model,
-      mode: 'default',
-    },
+    forwardedProps: forwardedPropsFor(conversation.model, 'default'),
     resume: [{
       interruptId: interaction.interruptId,
       status: 'cancelled',
@@ -752,7 +816,7 @@ export const buildPlanAbandonPayload = (
 
 export const markConversationDetached = (
   conversation: Conversation,
-  reason = "已停止接收实时输出，后端任务可能仍在继续。",
+  reason = translateCurrent('已停止接收实时输出，后端任务可能仍在继续。'),
 ): Conversation => {
   if (conversation.runStatus !== "streaming") return conversation
   return setConversationNotice(
@@ -866,7 +930,6 @@ export const applyConversationEvent = (
     case "RUN_STARTED": {
       const persistedUserMessages: Message[] = (event.input?.messages ?? [])
         .filter((message) => message.role === "user" && typeof message.content === "string")
-        .filter((message) => !conversation.messages.some((existing) => existing.id === message.id))
         .map((message) => ({
           id: message.id,
           role: "user",
@@ -880,9 +943,33 @@ export const applyConversationEvent = (
       const pending = preservePending
         ? restorePendingInteraction(conversation)
         : conversation
-      const mode = isAgentMode(event.input?.forwardedProps?.mode)
-        ? event.input.forwardedProps.mode
-        : conversation.mode
+      const mode = agentModeFromForwardedProps(event.input?.forwardedProps)
+        ?? conversation.mode
+      const reconciledServerMessageIndexes = new Set<number>()
+      const reconciledMessages = pending.messages.map((message) => {
+        if (message.role !== "user" || message.meta?.runId !== event.runId) return message
+        const serverMessageIndex = persistedUserMessages.findIndex(
+          (serverMessage, index) => (
+            !reconciledServerMessageIndexes.has(index)
+            && serverMessage.content === message.content
+          ),
+        )
+        if (serverMessageIndex < 0) return message
+        reconciledServerMessageIndexes.add(serverMessageIndex)
+        const meta = { ...message.meta }
+        delete meta.runId
+        return {
+          ...message,
+          id: persistedUserMessages[serverMessageIndex]?.id ?? message.id,
+          meta: Object.keys(meta).length > 0 ? meta : undefined,
+        }
+      })
+      const missingPersistedUserMessages = persistedUserMessages.filter(
+        (message, index) => (
+          !reconciledServerMessageIndexes.has(index)
+          && !reconciledMessages.some((existing) => existing.id === message.id)
+        ),
+      )
       return {
         ...pending,
         threadId: event.threadId,
@@ -893,11 +980,7 @@ export const applyConversationEvent = (
         notice: undefined,
         approval: isResume && !preservePending ? undefined : pending.approval,
         planInteraction: preservePending ? pending.planInteraction : undefined,
-        messages: (
-          persistedUserMessages.length > 0
-            ? [...pending.messages, ...persistedUserMessages]
-            : pending.messages
-        ).map((message) => (
+        messages: [...reconciledMessages, ...missingPersistedUserMessages].map((message) => (
           isResume && !preservePending && message.meta?.status === "paused"
             ? {
                 ...message,
@@ -1230,7 +1313,7 @@ export const applyConversationEvent = (
       {
         const rawEvent = rawEventOrMain(conversation, event.rawEvent)
         const completedAt = nowIso()
-        const errorMessage = event.message ?? "对话运行失败。"
+        const errorMessage = event.message ?? translateCurrent('对话运行失败。')
         const isCancelled = event.code === "cancelled" || event.code === "resume_cancelled"
         const errorRunId = rawEvent.runId ?? conversation.activeRunId
         if (
@@ -1416,7 +1499,7 @@ const applyPersistedEventEnvelope = (
       `会话事件序号不连续: expected=${lastSeq + 1}, actual=${envelope.seq}`,
     )
   }
-  const event = envelope.event as unknown as ConversationAgUiEvent
+  const event = parseConversationAgUiEvent(envelope.event)
   const next = applyConversationEvent(conversation, event)
   const previousById = new Map(conversation.messages.map((message) => [message.id, message]))
   const timestampedMessages = next.messages.map((message) => {

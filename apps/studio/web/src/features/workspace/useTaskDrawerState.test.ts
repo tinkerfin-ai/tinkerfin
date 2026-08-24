@@ -13,7 +13,7 @@ const createMediaController = (initialMatches: boolean): MediaController => {
   const listeners = new Set<(event: MediaQueryListEvent) => void>()
   const mediaQuery = {
     get matches() { return matches },
-    media: '(max-width: 1599px)',
+    media: '(max-width: 1280px)',
     onchange: null,
     addEventListener: vi.fn((_type: string, listener: (event: MediaQueryListEvent) => void) => listeners.add(listener)),
     removeEventListener: vi.fn((_type: string, listener: (event: MediaQueryListEvent) => void) => listeners.delete(listener)),

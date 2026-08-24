@@ -15,6 +15,7 @@ const user = {
   user_id: 7,
   username: 'yunsan',
   display_name: '云杉',
+  avatar_url: null,
   roles: [],
   disabled: false,
 }
@@ -44,6 +45,26 @@ describe('auth session lifecycle', () => {
     const session = createAuthSession(loginPayload('2026-08-23T10:00:00Z'))
 
     expect(session.expiresAt).toBe('2026-08-23T10:00:00.000Z')
+  })
+
+  it('normalizes a stored v1 session without avatar_url instead of signing out', () => {
+    const legacy = createAuthSession(loginPayload('2099-01-01T00:00:00Z'))
+    const legacyUser = { ...legacy.user } as Partial<typeof legacy.user>
+    delete legacyUser.avatar_url
+    const serialized = JSON.stringify({
+      ...legacy,
+      user: legacyUser,
+    })
+    const stop = startAuthSessionLifecycle()
+    window.localStorage.setItem(AUTH_SESSION_STORAGE_KEY, serialized)
+    window.dispatchEvent(new StorageEvent('storage', {
+      key: AUTH_SESSION_STORAGE_KEY,
+      newValue: serialized,
+    }))
+
+    expect(getAuthSession()?.user.avatar_url).toBeNull()
+    expect(window.localStorage.getItem(AUTH_SESSION_STORAGE_KEY)).not.toBeNull()
+    stop()
   })
 
   it('rejects a login response without a valid absolute deadline', () => {

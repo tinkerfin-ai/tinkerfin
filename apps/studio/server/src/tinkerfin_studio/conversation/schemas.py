@@ -35,6 +35,18 @@ class ConversationHistoryListResponse(BaseModel):
     next_cursor: str | None = Field(default=None, alias="nextCursor")
 
 
+class ConversationHistoryGroupConfig(BaseModel):
+    """历史会话时间分组配置"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    day_ranges: list[int] = Field(
+        alias="dayRanges",
+        min_length=1,
+        description="非今日会话使用的升序最大自然日差",
+    )
+
+
 class ConversationEventEnvelope(BaseModel):
     """历史读取接口返回的已提交事件"""
 

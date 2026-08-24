@@ -2,6 +2,7 @@ export interface AuthUser {
   user_id: number
   username: string
   display_name: string
+  avatar_url: string | null
   roles: string[]
   disabled: boolean
 }

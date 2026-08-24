@@ -343,13 +343,14 @@ def reduce_snapshot(
                     snapshot["approval"] = None
                     snapshot["interrupts"] = []
                 forwarded_props = run_input.get("forwardedProps")
-                mode = (
-                    forwarded_props.get("mode")
+                command = (
+                    forwarded_props.get("command")
                     if isinstance(forwarded_props, dict)
                     else None
                 )
-                if mode in {"default", "plan"}:
-                    snapshot["mode"] = mode
+                plan = command.get("plan") if isinstance(command, dict) else None
+                if plan in {"on", "off"}:
+                    snapshot["mode"] = "plan" if plan == "on" else "default"
                 messages = run_input.get("messages")
                 if isinstance(messages, list):
                     for item in messages:

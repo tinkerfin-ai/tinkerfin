@@ -10,12 +10,13 @@ import { Button, IconButton, Surface } from '../../../components/ui'
 import type { ApprovalDecision, ApprovalState, Conversation, JsonValue } from '../../../types'
 import { normalizeEscapedText } from '../../../lib/text'
 import { MarkdownContent } from './MarkdownContent'
+import { useI18n } from '../../../i18n'
 
-const descriptionParts = (description: string) => {
+const descriptionParts = (description: string, fallback: string) => {
   const normalized = normalizeEscapedText(description).trim()
   const [title, ...rest] = normalized.split(/\n\s*\n/).filter(Boolean)
   return {
-    title: title || '请确认本次操作',
+    title: title || fallback,
     detail: rest.join('\n\n'),
   }
 }
@@ -36,6 +37,7 @@ export function ApprovalCard({
   onChange: (updater: (approval: ApprovalState) => ApprovalState) => void
   onSubmit: (interruptIds: readonly string[]) => void
 }) {
+  const { t } = useI18n()
   const approval = conversation.approval
   if (!approval) return null
   const active = approval.items[approval.activeIndex]
@@ -45,7 +47,7 @@ export function ApprovalCard({
   const canReject = active.allowedDecisions.includes('reject')
   const args = active.editedArgs ?? active.originalArgs
   const argEntries = Object.entries(args)
-  const description = descriptionParts(active.description)
+  const description = descriptionParts(active.description, t('请确认本次操作'))
   const interruptIds = approval.items.map((item) => item.interruptId)
 
   const updateApproval = (updater: (current: ApprovalState) => ApprovalState) => {
@@ -119,7 +121,7 @@ export function ApprovalCard({
     } catch {
       updateApproval((current) => ({
         ...current,
-        error: '编辑后的参数必须是合法 JSON 对象。',
+        error: t('编辑后的参数必须是合法 JSON 对象。'),
       }))
     }
   }
@@ -157,13 +159,13 @@ export function ApprovalCard({
     <Surface as="section" tone="danger" elevation={1} className="approval-card">
       <div className="approval-head">
         <div>
-          <span className="eyebrow"><CircleAlert size={14} />等待你的确认…</span>
+          <span className="eyebrow"><CircleAlert size={14} />{t('等待你的确认…')}</span>
           <h3 key={active.interruptId}>{description.title}</h3>
         </div>
         <div className="approval-pager">
-          <IconButton label="上一项审批" icon={<ArrowLeft size={15} />} disabled={approval.activeIndex === 0} onClick={() => updateApproval((current) => ({ ...current, activeIndex: Math.max(0, current.activeIndex - 1) }))} />
+          <IconButton label={t('上一项审批')} icon={<ArrowLeft size={15} />} disabled={approval.activeIndex === 0} onClick={() => updateApproval((current) => ({ ...current, activeIndex: Math.max(0, current.activeIndex - 1) }))} />
           <span>{approval.activeIndex + 1} / {approval.items.length}</span>
-          <IconButton label="下一项审批" icon={<ArrowRight size={15} />} disabled={approval.activeIndex === approval.items.length - 1} onClick={() => updateApproval((current) => ({ ...current, activeIndex: Math.min(current.items.length - 1, current.activeIndex + 1) }))} />
+          <IconButton label={t('下一项审批')} icon={<ArrowRight size={15} />} disabled={approval.activeIndex === approval.items.length - 1} onClick={() => updateApproval((current) => ({ ...current, activeIndex: Math.min(current.items.length - 1, current.activeIndex + 1) }))} />
         </div>
       </div>
       <div className="approval-operation">
@@ -177,8 +179,8 @@ export function ApprovalCard({
             <table className="approval-args-table">
               <thead>
                 <tr>
-                  <th scope="col">输入参数</th>
-                  <th scope="col">值</th>
+                  <th scope="col">{t('输入参数')}</th>
+                  <th scope="col">{t('值')}</th>
                 </tr>
               </thead>
               <tbody>
@@ -193,42 +195,42 @@ export function ApprovalCard({
               </tbody>
             </table>
           ) : (
-            <div className="approval-empty-value">无输入参数</div>
+            <div className="approval-empty-value">{t('无输入参数')}</div>
           )}
         </div>
       </div>
       {approval.error && <p className="approval-question danger-text">{approval.error}</p>}
       {active.decision ? (
-        <div className="decision-made"><CheckCircle2 size={16} />当前项已决定：{active.decision === 'approved' ? '允许' : '拒绝'}</div>
+        <div className="decision-made"><CheckCircle2 size={16} />{t('当前项已决定：{decision}', { decision: active.decision === 'approved' ? t('允许') : t('拒绝') })}</div>
       ) : approval.mode === 'edit' ? (
         <form className="approval-form" onSubmit={saveEditedApproval}>
-          <label htmlFor={`approval-params-${active.id}`}>编辑参数（JSON 对象）</label>
+          <label htmlFor={`approval-params-${active.id}`}>{t('编辑参数（JSON 对象）')}</label>
           <textarea id={`approval-params-${active.id}`} name="params" defaultValue={active.editedParams ?? active.params} rows={4} />
-          <div><Button onClick={() => setMode('options')}>取消</Button><Button type="submit" variant="primary">保存并允许</Button></div>
+          <div><Button onClick={() => setMode('options')}>{t('取消')}</Button><Button type="submit" variant="primary">{t('保存并允许')}</Button></div>
         </form>
       ) : approval.mode === 'reject' ? (
         <form className="approval-form" onSubmit={confirmRejection}>
-          <label htmlFor={`approval-reason-${active.id}`}>拒绝原因（可选）</label>
-          <textarea id={`approval-reason-${active.id}`} name="reason" defaultValue={active.rejectionReason} rows={3} placeholder="说明拒绝此操作的原因…" />
-          <div><Button onClick={() => setMode('options')}>取消</Button><Button type="submit" variant="danger">确认拒绝</Button></div>
+          <label htmlFor={`approval-reason-${active.id}`}>{t('拒绝原因（可选）')}</label>
+          <textarea id={`approval-reason-${active.id}`} name="reason" defaultValue={active.rejectionReason} rows={3} placeholder={t('说明拒绝此操作的原因…')} />
+          <div><Button onClick={() => setMode('options')}>{t('取消')}</Button><Button type="submit" variant="danger">{t('确认拒绝')}</Button></div>
         </form>
       ) : (
         <>
-          <p className="approval-question">允许此操作？</p>
+          <p className="approval-question">{t('允许此操作？')}</p>
           <div className="approval-actions">
-            {canReject && <Button className="danger-text" onClick={() => setMode('reject')}>拒绝</Button>}
-            {canEdit && <Button leadingIcon={<Pencil size={14} />} onClick={() => setMode('edit')}>编辑</Button>}
-            {canApprove && <Button variant="primary" onClick={() => decide('approved')}>允许</Button>}
+            {canReject && <Button className="danger-text" onClick={() => setMode('reject')}>{t('拒绝')}</Button>}
+            {canEdit && <Button leadingIcon={<Pencil size={14} />} onClick={() => setMode('edit')}>{t('编辑')}</Button>}
+            {canApprove && <Button variant="primary" onClick={() => decide('approved')}>{t('允许')}</Button>}
           </div>
         </>
       )}
       <div className="approval-batch">
-        <span>已处理 {decided} / {approval.items.length}</span>
+        <span>{t('已处理 {decided} / {total}', { decided, total: approval.items.length })}</span>
         <div>{decided === approval.items.length
-          ? <Button variant="primary" size="sm" className="submit-approval" onClick={submitApproval}>批量提交</Button>
+          ? <Button variant="primary" size="sm" className="submit-approval" onClick={submitApproval}>{t('批量提交')}</Button>
           : <>
-              {approval.items.every((item) => item.allowedDecisions.includes('reject')) && <Button variant="text" size="sm" onClick={() => decideAll('rejected')}>全部拒绝</Button>}
-              {approval.items.every((item) => item.allowedDecisions.includes('approve')) && <Button variant="text" size="sm" onClick={() => decideAll('approved')}>全部允许</Button>}
+              {approval.items.every((item) => item.allowedDecisions.includes('reject')) && <Button variant="text" size="sm" onClick={() => decideAll('rejected')}>{t('全部拒绝')}</Button>}
+              {approval.items.every((item) => item.allowedDecisions.includes('approve')) && <Button variant="text" size="sm" onClick={() => decideAll('approved')}>{t('全部允许')}</Button>}
             </>}</div>
       </div>
     </Surface>

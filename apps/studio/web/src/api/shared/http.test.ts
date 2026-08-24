@@ -15,6 +15,7 @@ import {
   subscribeApiErrors,
   type ApiAxiosRequestConfig,
 } from './http'
+import { LANGUAGE_STORAGE_KEY } from '../../i18n'
 
 function jsonResponse(data: unknown, code = 0, message = 'success', status = 200) {
   return new Response(
@@ -41,6 +42,7 @@ function seedAuthSession(token = 'token-123') {
       user_id: 7,
       username: 'yunsan',
       display_name: 'Yunsan',
+      avatar_url: null,
       roles: [],
       disabled: false,
     },
@@ -62,6 +64,19 @@ describe('shared HTTP client', () => {
       requiresAuth: false,
     })).resolves.toEqual({ id: 7 })
     expect(fetchMock).toHaveBeenCalledOnce()
+  })
+
+  it('preserves backend messages verbatim while the frontend language is English', async () => {
+    window.localStorage.setItem(LANGUAGE_STORAGE_KEY, 'en')
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(
+      null,
+      1_001_004_003,
+      '后端原始消息：会话仍在运行',
+      409,
+    )))
+
+    await expect(requestJson('/api/conversation/thread-1', { requiresAuth: false }))
+      .rejects.toMatchObject({ message: '后端原始消息：会话仍在运行' })
   })
 
   it('adds the stored authorization header in the request interceptor', async () => {

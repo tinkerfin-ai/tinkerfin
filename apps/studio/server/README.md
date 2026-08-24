@@ -31,6 +31,10 @@ uv run python -m tinkerfin_studio --host 127.0.0.1 --port 8090 --reload
 和用户信息；`GET /api/auth/me` 返回同一 `expires_at` 和当前用户。后端在每个认证请求上以
 Redis 记录及其固定到期时间为准，过期、撤销或无效令牌统一返回 401。
 
+登录、`/api/auth/me` 和用户查询响应中的 `avatar_url` 为可空 HTTPS 头像地址。
+`PATCH /api/user/me` 修改当前登录用户资料：`display_name` 必须是 1～128 个字符，
+`avatar_url` 最大 2048 个字符且必须使用 HTTPS，传入 `null` 可清空头像。
+
 配置只作用于服务重新加载后签发的令牌，已有令牌保持签发时确定的到期时间。
 
 ## 对话请求边界
@@ -46,10 +50,15 @@ Redis 记录及其固定到期时间为准，过期、撤销或无效令牌统�
 | `messages` | 保留标准角色、多模态内容和扩展字段；Graph 只接收业务选中的本次输入 |
 | `tools` | 仅保留客户端工具描述，不授予服务端工具执行权限 |
 | `context` | 保留在标准请求快照中，由业务决定是否使用 |
-| `forwardedProps` | `model` 必填，`mode` 默认为 `default`；未知扩展字段完整保留 |
+| `forwardedProps` | `model` 与 `command.plan` 必填；Plan 只接受 `on/off`，未知 command 与其他扩展字段完整保留 |
 | `resume` | 必须完整覆盖当前待处理 interrupt，并通过原子认领与重试一致性校验 |
 
 每条标准 AG-UI 消息必须带非空客户端 ID。该 ID 只用于通过 HTTP 协议校验，不参与权限、幂等、Graph 关联或持久化身份；Service 会为 canonical `RUN_STARTED.input.messages` 分配权威消息 ID。
+
+请求边界不接受 `forwardedProps.mode`。`command.plan=on` 在 run 准备阶段转换为内部
+`AgentMode.plan`，`command.plan=off` 转换为 `AgentMode.default`；Conversation 快照和框架
+`new_agui(mode=...)` 继续使用内部模式，不把该字段重新暴露到 HTTP 契约。command 对象允许
+保留未来命令字段，但当前服务端只解释 `plan`。
 
 ## 单机部署
 
@@ -83,6 +92,21 @@ Studio、MySQL、Redis、OpenSandbox 和一次性数据库初始化服务，只�
 
 密码和模型 API key 缺省使用隐藏交互输入，不进入命令历史。模型 API key 当前以明文
 保存在 `agent_models` 表，必须限制数据库账号、日志和备份访问。
+
+切换到 command 契约前，停止新 run，并先执行数据迁移 dry-run：
+
+```bash
+uv run python -m tinkerfin_studio.manage data migrate-forwarded-commands
+```
+
+确认受影响的 run、RUN_STARTED 事件和活跃 run 数量后，在数据库备份完成的维护窗口写入：
+
+```bash
+uv run python -m tinkerfin_studio.manage data migrate-forwarded-commands --apply
+```
+
+迁移会在同一事务中更新 `conversation_runs.input_json`、`conversation_events.event_json` 和
+`conversation_events.event_text`；存在活跃 run、未知旧值或 JSON/text 不一致时拒绝写入。
 
 ## 外部依赖模式
 

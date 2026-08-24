@@ -4,6 +4,7 @@ import { CheckCircle2, CircleAlert, Info, X } from 'lucide-react'
 import { useCallback, useEffect, useRef } from 'react'
 
 import { MOTION_DURATION_SECONDS } from './motion'
+import { useI18n } from '../../i18n'
 
 gsap.registerPlugin(useGSAP)
 
@@ -34,6 +35,7 @@ function ToastCard({
   toast: ToastItem
   onDismiss: (id: string) => void
 }) {
+  const { t } = useI18n()
   const duration = TOAST_DURATION_MS[toast.kind]
   const cardRef = useRef<HTMLLIElement>(null)
   const timerRef = useRef<number | null>(null)
@@ -143,7 +145,7 @@ function ToastCard({
     >
       <span className="toast-icon" aria-hidden="true"><Icon size={16} /></span>
       <p role={toast.kind === 'error' ? 'alert' : 'status'}>{message}</p>
-      <button type="button" aria-label={`关闭提示：${message}`} onClick={() => requestDismissRef.current()}>
+      <button type="button" aria-label={t('关闭提示：{message}', { message })} onClick={() => requestDismissRef.current()}>
         <X size={13} />
       </button>
     </li>
@@ -157,10 +159,11 @@ export function ToastViewport({
   toasts: ToastItem[]
   onDismiss: (id: string) => void
 }) {
+  const { t } = useI18n()
   if (toasts.length === 0) return null
 
   return (
-    <ol className="toast-viewport" aria-live="polite" aria-label="系统提示">
+    <ol className="toast-viewport" aria-live="polite" aria-label={t('系统提示')}>
       {toasts.map((toast) => <ToastCard key={toast.id} toast={toast} onDismiss={onDismiss} />)}
     </ol>
   )
