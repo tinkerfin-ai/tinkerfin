@@ -189,11 +189,25 @@ class SQLAlchemyOpenSandboxState(OpenSandboxState):
         poll_interval: float = 0.05,
         sqlite_retry_timeout: float = 5.0,
     ) -> None:
+        """Initialize owned SQLAlchemy persistence without opening the engine.
+
+        The State owns the asynchronous engine created from ``url``. Timing values
+        are validated before any connection, task, or schema mutation occurs.
+        """
+
         if len(namespace) > 64:
             raise ValueError("namespace must contain at most 64 characters")
-        if not math.isfinite(lease_ttl) or lease_ttl <= 0:
+        if isinstance(lease_ttl, bool) or not isinstance(lease_ttl, int | float):
+            raise TypeError("lease_ttl must be a number")
+        if isinstance(poll_interval, bool) or not isinstance(
+            poll_interval, int | float
+        ):
+            raise TypeError("poll_interval must be a number")
+        resolved_lease_ttl = float(lease_ttl)
+        resolved_poll_interval = float(poll_interval)
+        if not math.isfinite(resolved_lease_ttl) or resolved_lease_ttl <= 0:
             raise ValueError("lease_ttl must be a finite positive number")
-        if not math.isfinite(poll_interval) or poll_interval <= 0:
+        if not math.isfinite(resolved_poll_interval) or resolved_poll_interval <= 0:
             raise ValueError("poll_interval must be a finite positive number")
         if isinstance(sqlite_retry_timeout, bool) or not isinstance(
             sqlite_retry_timeout, int | float
@@ -206,11 +220,11 @@ class SQLAlchemyOpenSandboxState(OpenSandboxState):
         ):
             raise ValueError("sqlite_retry_timeout must be finite and non-negative")
         self._namespace = namespace
-        self._lease_ttl = lease_ttl
-        self._poll_interval = poll_interval
+        self._lease_ttl = resolved_lease_ttl
+        self._poll_interval = resolved_poll_interval
         self._sqlite_retry_timeout = resolved_sqlite_retry_timeout
         self._worker_id = uuid4().hex
-        self._worker_lease_ttl = lease_ttl
+        self._worker_lease_ttl = resolved_lease_ttl
         self._worker_renew_task: asyncio.Task[None] | None = None
         self._worker_failure: Exception | None = None
         self._engine: AsyncEngine = create_async_engine(url)

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useRef, useState } from 'react'
 import { useI18n } from '../../i18n'
 
 const MAX_ATTACHMENT_COUNT = 5
@@ -19,7 +19,6 @@ export interface LocalAttachment {
   id: string
   file: File
   kind: LocalAttachmentKind
-  previewUrl?: string
 }
 
 const attachmentKind = (file: File): LocalAttachmentKind | undefined => {
@@ -32,20 +31,12 @@ const attachmentKind = (file: File): LocalAttachmentKind | undefined => {
   return undefined
 }
 
-const release = (attachment: LocalAttachment) => {
-  if (attachment.previewUrl) URL.revokeObjectURL(attachment.previewUrl)
-}
-
 export function useLocalAttachments() {
   const { t } = useI18n()
   const [attachments, setAttachments] = useState<LocalAttachment[]>([])
   const [error, setError] = useState<string>()
   const latest = useRef(attachments)
   latest.current = attachments
-
-  useEffect(() => () => {
-    latest.current.forEach(release)
-  }, [])
 
   const addFiles = useCallback((files: readonly File[]) => {
     const accepted: LocalAttachment[] = []
@@ -75,7 +66,6 @@ export function useLocalAttachments() {
         id: crypto.randomUUID(),
         file,
         kind,
-        ...(kind === 'image' ? { previewUrl: URL.createObjectURL(file) } : {}),
       })
       nextCount += 1
       nextBytes += file.size
@@ -86,16 +76,11 @@ export function useLocalAttachments() {
   }, [t])
 
   const removeAttachment = useCallback((id: string) => {
-    setAttachments((current) => {
-      const removed = current.find((item) => item.id === id)
-      if (removed) release(removed)
-      return current.filter((item) => item.id !== id)
-    })
+    setAttachments((current) => current.filter((item) => item.id !== id))
     setError(undefined)
   }, [])
 
   const clearAttachments = useCallback(() => {
-    latest.current.forEach(release)
     latest.current = []
     setAttachments([])
     setError(undefined)

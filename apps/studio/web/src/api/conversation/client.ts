@@ -1,5 +1,6 @@
 import type { ChatRequestPayload, ConversationAgUiEvent } from './types'
 import { conversationChatUrl } from './config'
+import { ConversationError } from './errors'
 import { parseConversationAgUiEvent } from './eventParser'
 import { requestEventStream, requestJson } from '../shared/http'
 
@@ -8,6 +9,11 @@ export interface StreamedAgUiEvent {
   /** SSE `id:` 行提供的持久化事件序号；生产端省略时为 null */
   seq: number | null
 }
+
+const MAX_SSE_LINE_BYTES = 1024 * 1024
+const MAX_SSE_FRAME_BYTES = 4 * 1024 * 1024
+const MAX_SSE_DATA_BYTES = 4 * 1024 * 1024
+const MAX_SSE_FRAME_LINES = 4096
 
 /**
  * 将 SSE 流解析为 AG-UI 事件，并保留 `id:` 供调用方维护续传所需的 `lastSeq`
@@ -20,67 +26,119 @@ async function* parseAgUiSseStream(
   signal?: AbortSignal,
 ): AsyncGenerator<StreamedAgUiEvent> {
   const decoder = new TextDecoder('utf-8', { fatal: false })
+  const encoder = new TextEncoder()
   const reader = body.getReader()
   let currentLine = ''
+  let currentLineBytes = 0
   let frameLines: string[] = []
+  let frameBytes = 0
+  let frameDataBytes = 0
   let previousWasCarriageReturn = false
   let aborted = false
+  let naturalEof = false
+  let cancelTask: Promise<void> | null = null
+
+  const cancelReader = (reason: unknown) => {
+    cancelTask ??= reader.cancel(reason).then(() => undefined).catch(() => undefined)
+    return cancelTask
+  }
   const onAbort = () => {
     aborted = true
-    reader.cancel().catch(() => undefined)
+    void cancelReader(signal?.reason)
   }
-  signal?.addEventListener('abort', onAbort)
+  if (signal?.aborted) onAbort()
+  else signal?.addEventListener('abort', onAbort)
+
+  const rejectLimit = (): never => {
+    throw new ConversationError('stream_limit_exceeded')
+  }
+
+  const appendLineText = (text: string) => {
+    if (!text) return
+    currentLine += text
+    currentLineBytes += encoder.encode(text).byteLength
+    if (currentLineBytes > MAX_SSE_LINE_BYTES) rejectLimit()
+  }
 
   const finishLine = () => {
     if (currentLine === '') {
       const parsed = frameLines.length > 0 ? parseFrame(frameLines) : null
       frameLines = []
+      frameBytes = 0
+      frameDataBytes = 0
       return parsed
+    }
+    if (frameLines.length >= MAX_SSE_FRAME_LINES) rejectLimit()
+    frameBytes += currentLineBytes + 2
+    if (frameBytes > MAX_SSE_FRAME_BYTES) rejectLimit()
+    if (currentLine.startsWith('data:')) {
+      const data = currentLine.slice(5).replace(/^ /, '')
+      frameDataBytes += encoder.encode(data).byteLength
+        + (frameDataBytes > 0 ? 1 : 0)
+      if (frameDataBytes > MAX_SSE_DATA_BYTES) rejectLimit()
     }
     frameLines.push(currentLine)
     currentLine = ''
+    currentLineBytes = 0
     return null
   }
 
-  const consumeText = (text: string) => {
-    const parsedEvents: StreamedAgUiEvent[] = []
-    for (const character of text) {
+  function* consumeText(text: string): Generator<StreamedAgUiEvent> {
+    let segmentStart = 0
+    for (let index = 0; index < text.length; index += 1) {
+      const character = text[index]
       if (previousWasCarriageReturn) {
         previousWasCarriageReturn = false
-        if (character === '\n') continue
+        if (character === '\n') {
+          segmentStart = index + 1
+          continue
+        }
       }
       if (character === '\r') {
+        appendLineText(text.slice(segmentStart, index))
         const parsed = finishLine()
-        if (parsed) parsedEvents.push(parsed)
+        if (parsed) yield parsed
         previousWasCarriageReturn = true
+        segmentStart = index + 1
       } else if (character === '\n') {
+        appendLineText(text.slice(segmentStart, index))
         const parsed = finishLine()
-        if (parsed) parsedEvents.push(parsed)
-      } else {
-        currentLine += character
+        if (parsed) yield parsed
+        segmentStart = index + 1
       }
     }
-    return parsedEvents
+    appendLineText(text.slice(segmentStart))
   }
 
   try {
     while (true) {
       if (aborted) break
       const { done, value } = await reader.read()
-      if (done) break
-      const parsedEvents = consumeText(decoder.decode(value, { stream: true }))
-      for (const parsed of parsedEvents) yield parsed
+      if (done) {
+        naturalEof = !aborted
+        break
+      }
+      for (const parsed of consumeText(decoder.decode(value, { stream: true }))) yield parsed
     }
+    if (aborted) return
     for (const parsed of consumeText(decoder.decode())) yield parsed
     previousWasCarriageReturn = false
-    if (currentLine !== '') frameLines.push(currentLine)
+    if (currentLine !== '') finishLine()
     if (frameLines.length > 0) {
       const parsed = parseFrame(frameLines)
       if (parsed) yield parsed
     }
+  } catch (error) {
+    await cancelReader(error)
+    throw error
   } finally {
     signal?.removeEventListener('abort', onAbort)
-    reader.releaseLock?.()
+    if (!naturalEof) {
+      await cancelReader(signal?.reason ?? new Error('事件流消费在 EOF 前结束'))
+    } else if (cancelTask) {
+      await cancelTask
+    }
+    reader.releaseLock()
   }
 }
 
@@ -100,11 +158,15 @@ function parseFrame(lines: string[]): StreamedAgUiEvent | null {
   let parsedValue: unknown
   try {
     parsedValue = JSON.parse(dataLines.join('\n')) as unknown
-  } catch {
-    throw new Error('事件流包含无法解析的数据')
+  } catch (error) {
+    throw new ConversationError('stream_data_invalid', error)
   }
-  const event = parseConversationAgUiEvent(parsedValue)
-  return { event, seq }
+  try {
+    const event = parseConversationAgUiEvent(parsedValue)
+    return { event, seq }
+  } catch (error) {
+    throw new ConversationError('stream_event_invalid', error)
+  }
 }
 
 async function* streamConversationEvents(
@@ -121,7 +183,7 @@ async function* streamConversationEvents(
       : { 'Last-Event-ID': String(afterSeq) },
     suppressGlobalError: true,
   })
-  if (!response.body) throw new Error('chat 接口没有返回事件流')
+  if (!response.body) throw new ConversationError('stream_body_missing')
   for await (const item of parseAgUiSseStream(response.body, signal)) {
     yield item
   }

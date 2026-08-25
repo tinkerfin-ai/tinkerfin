@@ -51,9 +51,15 @@ export function useConversationScroll({
   const scrollingToBottom = useRef(false)
   const followScrollFrame = useRef<number | null>(null)
   const scrollMeasureFrame = useRef<number | null>(null)
+  const scrollPersistenceFrame = useRef<number | null>(null)
+  const pendingScrollPersistence = useRef<{
+    threadId: string
+    scrollTop: number
+  } | null>(null)
   const scrollButtonFadeTimeout = useRef<number | null>(null)
   const scrollButtonHideTimeout = useRef<number | null>(null)
   const scrollButtonHovered = useRef(false)
+  const scrollButtonFocused = useRef(false)
   const scrollButtonPhase = useRef<ScrollButtonPhase>('hidden')
   const previousScrollTop = useRef<number | null>(null)
   const pendingUserScrollIntent = useRef(false)
@@ -77,6 +83,29 @@ export function useConversationScroll({
     }
   }, [])
 
+  const commitPendingScrollPersistence = useCallback(() => {
+    const pending = pendingScrollPersistence.current
+    pendingScrollPersistence.current = null
+    if (pending) writeConversationScrollTop(pending.threadId, pending.scrollTop)
+  }, [])
+
+  const flushScrollPersistence = useCallback(() => {
+    if (scrollPersistenceFrame.current != null) {
+      window.cancelAnimationFrame(scrollPersistenceFrame.current)
+      scrollPersistenceFrame.current = null
+    }
+    commitPendingScrollPersistence()
+  }, [commitPendingScrollPersistence])
+
+  const scheduleScrollPersistence = useCallback((threadId: string, scrollTop: number) => {
+    pendingScrollPersistence.current = { threadId, scrollTop }
+    if (scrollPersistenceFrame.current != null) return
+    scrollPersistenceFrame.current = window.requestAnimationFrame(() => {
+      scrollPersistenceFrame.current = null
+      commitPendingScrollPersistence()
+    })
+  }, [commitPendingScrollPersistence])
+
   const armScrollButtonFade = useCallback(() => {
     clearScrollButtonTimers()
     scrollButtonFadeTimeout.current = window.setTimeout(() => {
@@ -88,7 +117,9 @@ export function useConversationScroll({
   }, [clearScrollButtonTimers, setScrollButtonPhase])
 
   const handleScroll = useCallback((pane: HTMLElement) => {
-    if (conversation.threadId) writeConversationScrollTop(conversation.threadId, pane.scrollTop)
+    if (conversation.threadId) {
+      scheduleScrollPersistence(conversation.threadId, pane.scrollTop)
+    }
     if (followScrollFrame.current != null) {
       window.cancelAnimationFrame(followScrollFrame.current)
       followScrollFrame.current = null
@@ -117,10 +148,10 @@ export function useConversationScroll({
         setScrollButtonPhase('hidden')
       } else if (!isScrollingTowardBottom || scrollButtonPhase.current === 'visible') {
         setScrollButtonPhase('visible')
-        if (!scrollButtonHovered.current) armScrollButtonFade()
+        if (!scrollButtonHovered.current && !scrollButtonFocused.current) armScrollButtonFade()
       }
     })
-  }, [armScrollButtonFade, clearScrollButtonTimers, conversation.threadId, setScrollButtonPhase])
+  }, [armScrollButtonFade, clearScrollButtonTimers, conversation.threadId, scheduleScrollPersistence, setScrollButtonPhase])
 
   const scrollToBottomImmediately = useCallback(() => {
     pendingImmediateScroll.current = true
@@ -139,11 +170,13 @@ export function useConversationScroll({
     const pane = paneRef.current
     if (pane) {
       pane.scrollTop = pane.scrollHeight
-      if (conversation.threadId) writeConversationScrollTop(conversation.threadId, pane.scrollTop)
+      if (conversation.threadId) {
+        scheduleScrollPersistence(conversation.threadId, pane.scrollTop)
+      }
     } else {
       messageEndRef.current?.scrollIntoView?.({ behavior: 'auto', block: 'end' })
     }
-  }, [clearScrollButtonTimers, conversation.threadId, setScrollButtonPhase])
+  }, [clearScrollButtonTimers, conversation.threadId, scheduleScrollPersistence, setScrollButtonPhase])
 
   const markUserScrollIntent = useCallback(() => {
     scrollingToBottom.current = false
@@ -151,6 +184,8 @@ export function useConversationScroll({
   }, [])
 
   const scrollToBottom = useCallback(() => {
+    // 操作完成后按钮会退出可访问树，焦点必须交给仍可继续阅读的对话区域
+    paneRef.current?.focus({ preventScroll: true })
     followLatest.current = true
     scrollingToBottom.current = true
     clearScrollButtonTimers()
@@ -173,7 +208,18 @@ export function useConversationScroll({
 
   const resumeScrollToBottomFade = useCallback(() => {
     scrollButtonHovered.current = false
-    if (!followLatest.current) armScrollButtonFade()
+    if (!scrollButtonFocused.current && !followLatest.current) armScrollButtonFade()
+  }, [armScrollButtonFade])
+
+  const focusScrollToBottom = useCallback(() => {
+    scrollButtonFocused.current = true
+    clearScrollButtonTimers()
+    setScrollButtonPhase('visible')
+  }, [clearScrollButtonTimers, setScrollButtonPhase])
+
+  const blurScrollToBottom = useCallback(() => {
+    scrollButtonFocused.current = false
+    if (!scrollButtonHovered.current && !followLatest.current) armScrollButtonFade()
   }, [armScrollButtonFade])
 
   const scrollBy = useCallback((deltaY: number) => {
@@ -185,6 +231,8 @@ export function useConversationScroll({
   }, [handleScroll, markUserScrollIntent])
 
   useLayoutEffect(() => {
+    // 会话切换前先提交旧会话最后一次滚动位置，避免新线程覆盖待写状态
+    flushScrollPersistence()
     const savedScrollTop = conversation.threadId
       ? readConversationScrollTop(conversation.threadId)
       : null
@@ -207,7 +255,8 @@ export function useConversationScroll({
     clearScrollButtonTimers()
     setScrollButtonPhase('hidden')
     scrollButtonHovered.current = false
-  }, [clearScrollButtonTimers, conversation.threadId, setScrollButtonPhase])
+    scrollButtonFocused.current = false
+  }, [clearScrollButtonTimers, conversation.threadId, flushScrollPersistence, setScrollButtonPhase])
 
   useLayoutEffect(() => {
     const pane = paneRef.current
@@ -217,7 +266,9 @@ export function useConversationScroll({
       followLatest.current = true
       if (pane) {
         pane.scrollTop = pane.scrollHeight
-        if (conversation.threadId) writeConversationScrollTop(conversation.threadId, pane.scrollTop)
+        if (conversation.threadId) {
+          scheduleScrollPersistence(conversation.threadId, pane.scrollTop)
+        }
       } else {
         messageEndRef.current?.scrollIntoView?.({ behavior: 'auto', block: 'end' })
       }
@@ -259,6 +310,7 @@ export function useConversationScroll({
     handleScroll,
     isRunning,
     setScrollButtonPhase,
+    scheduleScrollPersistence,
   ])
 
   useEffect(() => {
@@ -269,11 +321,21 @@ export function useConversationScroll({
     return () => window.removeEventListener('resize', measure)
   }, [handleScroll])
 
+  useEffect(() => {
+    const handlePageHide = () => flushScrollPersistence()
+    window.addEventListener('pagehide', handlePageHide)
+    return () => {
+      window.removeEventListener('pagehide', handlePageHide)
+      flushScrollPersistence()
+    }
+  }, [flushScrollPersistence])
+
   useEffect(() => () => {
     clearScrollButtonTimers()
     if (followScrollFrame.current != null) window.cancelAnimationFrame(followScrollFrame.current)
     if (scrollMeasureFrame.current != null) window.cancelAnimationFrame(scrollMeasureFrame.current)
-  }, [clearScrollButtonTimers])
+    flushScrollPersistence()
+  }, [clearScrollButtonTimers, flushScrollPersistence])
 
   return {
     paneRef,
@@ -287,5 +349,7 @@ export function useConversationScroll({
     scrollToBottom,
     pauseScrollToBottomFade,
     resumeScrollToBottomFade,
+    focusScrollToBottom,
+    blurScrollToBottom,
   }
 }

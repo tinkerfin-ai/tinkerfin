@@ -30,7 +30,10 @@ describe('SettingsDialog', () => {
     expect(screen.getByRole('dialog', { name: '设置' })).toBeInTheDocument()
     const settingsContent = document.querySelector('.settings-content')
     expect(settingsContent).toHaveClass('ui-scrollbar')
-    expect(settingsContent?.parentElement?.querySelector('.ui-scrollbar-overlay')).toBeInTheDocument()
+    expect(settingsContent).toHaveAttribute('role', 'region')
+    expect(settingsContent).toHaveAttribute('tabindex', '0')
+    expect(settingsContent?.parentElement?.querySelector('.ui-scrollbar-overlay')).not.toBeInTheDocument()
+    expect(settingsContent?.parentElement?.querySelector('.ui-overlay-scrollbar')).toHaveAttribute('data-visibility', 'transient')
     expect(screen.getByText('云杉')).toBeInTheDocument()
     expect(screen.getByText('@yunsan')).toBeInTheDocument()
     expect(screen.queryByText(/用户 ID|角色|禁用/)).not.toBeInTheDocument()
@@ -78,5 +81,28 @@ describe('SettingsDialog', () => {
     unmount()
     expect(trigger).toHaveFocus()
     trigger.remove()
+  })
+
+  it('只让最上层语言列表处理 Escape，不连带关闭设置', async () => {
+    const onClose = vi.fn()
+    render(<LocaleProvider>
+      <SettingsDialog
+        open
+        user={user}
+        themePreference="light"
+        onThemePreferenceChange={vi.fn()}
+        onClose={onClose}
+      />
+    </LocaleProvider>)
+
+    await userEvent.click(screen.getByRole('button', { name: '通用' }))
+    await userEvent.click(screen.getByRole('button', { name: '界面语言' }))
+    const listbox = screen.getByRole('listbox', { name: '界面语言' })
+
+    fireEvent.keyDown(listbox, { key: 'Escape' })
+
+    expect(screen.queryByRole('listbox', { name: '界面语言' })).not.toBeInTheDocument()
+    expect(screen.getByRole('dialog', { name: '设置' })).toBeInTheDocument()
+    expect(onClose).not.toHaveBeenCalled()
   })
 })

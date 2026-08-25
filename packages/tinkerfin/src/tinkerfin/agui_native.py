@@ -228,7 +228,7 @@ def _bind_agui_graph_astream(  # pyright: ignore[reportUnusedFunction]
     *args: object,
     **options: object,
 ) -> AgUiNativeStreamInvocation:
-    """校验原生 astream 保留参数并创建严格的 AG-UI 调用"""
+    """Validate preserved native arguments and build a strict AG-UI invocation."""
 
     forwarded = dict(options)
     if "stream_mode" not in forwarded:

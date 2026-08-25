@@ -21,6 +21,7 @@ from .errors import MessagingClosed as MessagingClosed
 from .errors import MessagingError as MessagingError
 from .errors import MessagingErrorCode as MessagingErrorCode
 from .errors import MessagingNotStarted as MessagingNotStarted
+from .errors import MessagingQuotaExceeded as MessagingQuotaExceeded
 from .errors import MessagingSettlementTimeout as MessagingSettlementTimeout
 from .errors import RecoveryUnsupported as RecoveryUnsupported
 from .errors import RunAlreadyActive as RunAlreadyActive
@@ -31,6 +32,7 @@ from .errors import SseRenderingUnsupported as SseRenderingUnsupported
 from .errors import StreamDeleteConflict as StreamDeleteConflict
 from .errors import StreamDeleted as StreamDeleted
 from .errors import UnexpectedMessagingBackendError as UnexpectedMessagingBackendError
+from .limits import MessagingLimits as MessagingLimits
 from .messaging import CancelCallback as CancelCallback
 from .messaging import CancelContext as CancelContext
 from .messaging import CommittedCallback as CommittedCallback
@@ -90,7 +92,9 @@ __all__ = [
     "MessagingClosed",
     "MessagingError",
     "MessagingErrorCode",
+    "MessagingLimits",
     "MessagingNotStarted",
+    "MessagingQuotaExceeded",
     "MessagingSettlementTimeout",
     "NativeStreamPart",
     "NativeStreamPartCodec",

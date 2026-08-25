@@ -2,6 +2,7 @@ import {
   useCallback,
   useEffect,
   useRef,
+  useState,
   type Dispatch,
   type SetStateAction,
 } from 'react'
@@ -12,10 +13,16 @@ import {
   startConversationRun,
 } from '../../../api/conversation/client'
 import {
+  ConversationError,
+  conversationErrorMessage,
+  hasConversationErrorCode,
+} from '../../../api/conversation/errors'
+import {
   fetchConversationEvents,
   type ConversationEventEnvelope,
 } from '../../../api/conversation/history'
 import type { ChatRequestPayload } from '../../../api/conversation/types'
+import { translateCurrent } from '../../../i18n'
 import type { Conversation, WorkspaceState } from '../../../types'
 import {
   applyConversationEvent,
@@ -23,14 +30,18 @@ import {
   applyLiveEventEnvelope,
   markConversationDetached,
 } from '../agui'
+import { InvalidStateDeltaError } from '../agui/jsonPatch'
 import { updateConversation, upsertConversation } from '../../../lib/workspace'
 import {
   clearActiveRunSession,
   writeActiveRunSession,
+  type ActiveRunSession,
 } from './activeRunSession'
 
 const HISTORY_CATCH_UP_PAGE_SIZE = 1000
 const RECONNECT_MAX_DELAY_MS = 5000
+const ACTIVE_RUN_PERSIST_INTERVAL_MS = 250
+const TEXT_RENDER_INTERVAL_MS = 50
 
 const waitForReconnect = (delay: number, signal: AbortSignal): Promise<void> => (
   new Promise((resolve) => {
@@ -72,6 +83,7 @@ export interface ConversationStreamController {
   catchUpDetachedConversation: (threadId: string) => Promise<void>
   detachThreadStream: (threadId: string, reason: string) => void
   cancelActiveRun: () => Promise<boolean>
+  cancelPendingRunId: string | null
   hasActiveStream: () => boolean
   getActiveThreadId: () => string | null
   isActiveThread: (threadId: string) => boolean
@@ -91,13 +103,19 @@ export function useConversationStreamController({
   const activeAbortController = useRef<AbortController | null>(null)
   const activeThreadId = useRef<string | null>(null)
   const activeRunId = useRef<string | null>(null)
+  const cancelRequest = useRef<{
+    runId: string
+    promise: Promise<boolean>
+  } | null>(null)
+  const cancelPendingRunIdRef = useRef<string | null>(null)
+  const [cancelPendingRunId, setCancelPendingRunId] = useState<string | null>(null)
   const activeStreamEpoch = useRef(0)
-  const workspaceFrame = useRef<number | null>(null)
+  const workspaceUpdateTimer = useRef<number | null>(null)
   const workspaceFrameUpdates = useRef<Array<{
     epoch: number
     update: (state: WorkspaceState) => WorkspaceState
   }>>([])
-  const draftFrame = useRef<number | null>(null)
+  const draftUpdateTimer = useRef<number | null>(null)
   const pendingDraftFrameValue = useRef<{
     epoch: number
     value: Conversation | null
@@ -106,38 +124,123 @@ export function useConversationStreamController({
   const catchUpRequests = useRef(new Set<string>())
   const catchUpControllers = useRef(new Map<string, AbortController>())
   const delayedCatchUpTimers = useRef(new Set<number>())
+  const activeRunPersistence = useRef<{
+    runId: string
+    session: ActiveRunSession
+    timer: number | null
+  } | null>(null)
   const isMounted = useRef(true)
   latestWorkspace.current = workspace
+
+  const clearCancelPending = useCallback((runId: string) => {
+    if (cancelPendingRunIdRef.current !== runId) return
+    cancelPendingRunIdRef.current = null
+    if (isMounted.current) setCancelPendingRunId(null)
+  }, [])
+
+  const flushActiveRunPersistence = useCallback((runId?: string) => {
+    const owner = activeRunPersistence.current
+    if (!owner || (runId && owner.runId !== runId)) return
+    if (owner.timer != null) {
+      window.clearTimeout(owner.timer)
+      owner.timer = null
+    }
+    writeActiveRunSession(owner.session)
+  }, [])
+
+  const scheduleActiveRunPersistence = useCallback((
+    session: ActiveRunSession,
+    immediate = false,
+  ) => {
+    const runId = session.payload.runId
+    let owner = activeRunPersistence.current
+    if (!owner || owner.runId !== runId) {
+      if (owner?.timer != null) window.clearTimeout(owner.timer)
+      owner = { runId, session, timer: null }
+      activeRunPersistence.current = owner
+    } else {
+      owner.session = session
+    }
+
+    if (immediate) {
+      flushActiveRunPersistence(runId)
+      return
+    }
+    if (owner.timer != null) return
+    owner.timer = window.setTimeout(() => {
+      if (activeRunPersistence.current !== owner) return
+      owner.timer = null
+      writeActiveRunSession(owner.session)
+    }, ACTIVE_RUN_PERSIST_INTERVAL_MS)
+  }, [flushActiveRunPersistence])
+
+  const clearActiveRunPersistence = useCallback((runId: string) => {
+    const owner = activeRunPersistence.current
+    if (owner?.runId === runId) {
+      if (owner.timer != null) window.clearTimeout(owner.timer)
+      activeRunPersistence.current = null
+    }
+    clearActiveRunSession(runId)
+  }, [])
+
+  const flushWorkspaceUpdates = useCallback(() => {
+    if (workspaceUpdateTimer.current != null) {
+      window.clearTimeout(workspaceUpdateTimer.current)
+      workspaceUpdateTimer.current = null
+    }
+    const currentEpoch = activeStreamEpoch.current
+    const updates = workspaceFrameUpdates.current
+      .splice(0)
+      .filter((entry) => entry.epoch === currentEpoch)
+    if (updates.length === 0) return
+    setWorkspace((state) => updates.reduce((next, entry) => entry.update(next), state))
+  }, [setWorkspace])
 
   const enqueueWorkspaceUpdate = useCallback((
     epoch: number,
     updater: (state: WorkspaceState) => WorkspaceState,
+    deferTextRender = false,
   ) => {
     workspaceFrameUpdates.current.push({ epoch, update: updater })
-    if (workspaceFrame.current != null) return
-    workspaceFrame.current = window.requestAnimationFrame(() => {
-      workspaceFrame.current = null
-      const currentEpoch = activeStreamEpoch.current
-      const updates = workspaceFrameUpdates.current
-        .splice(0)
-        .filter((entry) => entry.epoch === currentEpoch)
-      if (updates.length === 0) return
-      setWorkspace((state) => updates.reduce((next, entry) => entry.update(next), state))
-    })
-  }, [setWorkspace])
+    if (!deferTextRender) {
+      flushWorkspaceUpdates()
+      return
+    }
+    if (workspaceUpdateTimer.current != null) return
+    workspaceUpdateTimer.current = window.setTimeout(
+      flushWorkspaceUpdates,
+      TEXT_RENDER_INTERVAL_MS,
+    )
+  }, [flushWorkspaceUpdates])
 
-  const enqueueDraftUpdate = useCallback((epoch: number, value: Conversation | null) => {
-    pendingDraftFrameValue.current = { epoch, value }
-    if (draftFrame.current != null) return
-    draftFrame.current = window.requestAnimationFrame(() => {
-      draftFrame.current = null
-      const pending = pendingDraftFrameValue.current
-      pendingDraftFrameValue.current = undefined
-      if (pending?.epoch === activeStreamEpoch.current) {
-        setDraftConversation(pending.value)
-      }
-    })
+  const flushDraftUpdate = useCallback(() => {
+    if (draftUpdateTimer.current != null) {
+      window.clearTimeout(draftUpdateTimer.current)
+      draftUpdateTimer.current = null
+    }
+    const pending = pendingDraftFrameValue.current
+    pendingDraftFrameValue.current = undefined
+    if (pending?.epoch === activeStreamEpoch.current) {
+      setDraftConversation(pending.value)
+    }
   }, [setDraftConversation])
+
+  const enqueueDraftUpdate = useCallback((
+    epoch: number,
+    value: Conversation | null,
+    deferTextRender = false,
+  ) => {
+    pendingDraftFrameValue.current = { epoch, value }
+    if (!deferTextRender) {
+      flushDraftUpdate()
+      return
+    }
+    if (draftUpdateTimer.current != null) return
+    draftUpdateTimer.current = window.setTimeout(
+      flushDraftUpdate,
+      TEXT_RENDER_INTERVAL_MS,
+    )
+  }, [flushDraftUpdate])
 
   const detachThreadStream = useCallback((threadId: string, reason: string) => {
     if (
@@ -145,15 +248,18 @@ export function useConversationStreamController({
       || activeThreadId.current !== threadId
     ) return
     const detachedEpoch = activeStreamEpoch.current
+    const detachedRunId = activeRunId.current
     activeStreamEpoch.current += 1
+    if (detachedRunId) flushActiveRunPersistence(detachedRunId)
     activeAbortController.current?.abort()
     activeAbortController.current = null
     activeThreadId.current = null
     activeRunId.current = null
+    if (detachedRunId) clearCancelPending(detachedRunId)
 
-    if (workspaceFrame.current != null) {
-      window.cancelAnimationFrame(workspaceFrame.current)
-      workspaceFrame.current = null
+    if (workspaceUpdateTimer.current != null) {
+      window.clearTimeout(workspaceUpdateTimer.current)
+      workspaceUpdateTimer.current = null
     }
     const queuedWorkspaceUpdates = workspaceFrameUpdates.current
       .splice(0)
@@ -170,9 +276,9 @@ export function useConversationStreamController({
       )
     })
 
-    if (draftFrame.current != null) {
-      window.cancelAnimationFrame(draftFrame.current)
-      draftFrame.current = null
+    if (draftUpdateTimer.current != null) {
+      window.clearTimeout(draftUpdateTimer.current)
+      draftUpdateTimer.current = null
     }
     const queuedDraft = pendingDraftFrameValue.current?.epoch === detachedEpoch
       ? pendingDraftFrameValue.current.value
@@ -186,7 +292,7 @@ export function useConversationStreamController({
         ? markConversationDetached(candidate, reason)
         : candidate
     })
-  }, [setDraftConversation, setWorkspace])
+  }, [clearCancelPending, flushActiveRunPersistence, setDraftConversation, setWorkspace])
 
   const catchUpDetachedConversation = useCallback(async (threadId: string) => {
     if (!isMounted.current) return
@@ -244,7 +350,8 @@ export function useConversationStreamController({
         || !isMounted.current
         || (activeAbortController.current && activeThreadId.current === threadId)
       ) return
-      const message = error instanceof Error ? error.message : '历史事件补拉失败'
+      // 补拉失败保留原进度，界面只展示稳定恢复提示，内部响应不得成为用户文案
+      const message = conversationErrorMessage(error, 'stream_recovery_failed')
       setWorkspace((state) => {
         if (
           controller.signal.aborted
@@ -255,7 +362,7 @@ export function useConversationStreamController({
           ...item,
           notice: {
             kind: 'error',
-            content: `事件恢复失败：${message}`,
+            content: message,
           },
         }))
       })
@@ -293,6 +400,11 @@ export function useConversationStreamController({
     let target = options.target
     let targetThreadId = threadIdToStream
     let draftTarget = options.initialConversation
+    let validationTarget = target === 'workspace'
+      ? latestWorkspace.current.conversations.find(
+          (item) => item.threadId === targetThreadId,
+        )
+      : draftTarget
     let receivedEvent = false
     let mainTerminalReceived = false
     let requestPayload: ChatRequestPayload = { ...payload }
@@ -305,13 +417,14 @@ export function useConversationStreamController({
             (item) => item.threadId === targetThreadId,
           )?.lastSeq)
     ) ?? 0
-    const persistActiveRun = () => writeActiveRunSession({
+    const persistActiveRun = (immediate = false) => scheduleActiveRunPersistence({
       threadId: targetThreadId,
       payload: requestPayload,
       mode,
       lastSeq: lastAppliedSeq,
-    })
-    persistActiveRun()
+    }, immediate)
+    // 首次写入建立刷新恢复所有权，不能等待第一个节流周期
+    persistActiveRun(true)
 
     const fetchMissingEvents = async (
       threadId: string,
@@ -327,16 +440,18 @@ export function useConversationStreamController({
           suppressGlobalError: true,
         })
         if (!envelopes.length) {
-          throw new Error(
-            `无法补齐会话事件: expected=${cursor + 1}, actual=${currentSeq}`,
+          throw new ConversationError(
+            'stream_sequence_invalid',
+            `expected=${cursor + 1}, actual=${currentSeq}`,
           )
         }
         let progressed = false
         for (const envelope of envelopes) {
           if (envelope.seq <= cursor) continue
           if (envelope.seq !== cursor + 1) {
-            throw new Error(
-              `会话事件序号不连续: expected=${cursor + 1}, actual=${envelope.seq}`,
+            throw new ConversationError(
+              'stream_sequence_invalid',
+              `expected=${cursor + 1}, actual=${envelope.seq}`,
             )
           }
           if (envelope.seq >= currentSeq) break
@@ -345,8 +460,9 @@ export function useConversationStreamController({
           progressed = true
         }
         if (!progressed && cursor + 1 < currentSeq) {
-          throw new Error(
-            `无法补齐会话事件: expected=${cursor + 1}, actual=${currentSeq}`,
+          throw new ConversationError(
+            'stream_sequence_invalid',
+            `expected=${cursor + 1}, actual=${currentSeq}`,
           )
         }
       }
@@ -365,6 +481,8 @@ export function useConversationStreamController({
         const reportedThreadId: string = 'threadId' in event && typeof event.threadId === 'string'
           ? event.threadId
           : (activeThreadId.current ?? targetThreadId)
+        const canonicalIdentityChanged = targetThreadId !== reportedThreadId
+          || requestPayload.threadId !== reportedThreadId
         activeThreadId.current = reportedThreadId
         targetThreadId = reportedThreadId
         if (requestPayload.threadId !== reportedThreadId) {
@@ -379,12 +497,14 @@ export function useConversationStreamController({
           lastAppliedSeq = missingEnvelopes.at(-1)?.seq ?? lastAppliedSeq
         }
         if (seq != null && seq !== lastAppliedSeq + 1) {
-          throw new Error(
-            `会话事件序号不连续: expected=${lastAppliedSeq + 1}, actual=${seq}`,
+          throw new ConversationError(
+            'stream_sequence_invalid',
+            `expected=${lastAppliedSeq + 1}, actual=${seq}`,
           )
         }
 
         if (target === 'draft' && draftTarget) {
+          const deferTextRender = event.type === 'TEXT_MESSAGE_CONTENT'
           const caughtUpDraft = missingEnvelopes.reduce(
             applyLiveEventEnvelope,
             draftTarget,
@@ -408,10 +528,11 @@ export function useConversationStreamController({
             }))
             enqueueDraftUpdate(streamEpoch, null)
             draftTarget = undefined
+            validationTarget = candidateConversation
             target = 'workspace'
             targetThreadId = reportedThreadId
           } else {
-            enqueueDraftUpdate(streamEpoch, nextDraft)
+            enqueueDraftUpdate(streamEpoch, nextDraft, deferTextRender)
             if (event.type === 'RUN_FINISHED' || event.type === 'RUN_ERROR') {
               enqueueWorkspaceUpdate(
                 streamEpoch,
@@ -420,9 +541,22 @@ export function useConversationStreamController({
               enqueueDraftUpdate(streamEpoch, null)
             }
           }
-          persistActiveRun()
+          persistActiveRun(canonicalIdentityChanged)
           continue
         }
+
+        // 先在顺序投影中验证协议事件，避免 Patch 等异常延迟到 React updater 后逃逸
+        if (!validationTarget) {
+          throw new ConversationError('stream_event_invalid', '缺少事件验证目标会话')
+        }
+        const caughtUpValidation = missingEnvelopes.reduce(
+          applyLiveEventEnvelope,
+          validationTarget,
+        )
+        const validated = applyConversationEvent(caughtUpValidation, event)
+        validationTarget = seq == null
+          ? { ...validated, isHydrated: true }
+          : { ...validated, lastSeq: seq, isHydrated: true }
 
         enqueueWorkspaceUpdate(streamEpoch, (state) => {
           const targetConversationId = state.conversations.some(
@@ -441,9 +575,9 @@ export function useConversationStreamController({
             && reportedThreadId !== targetConversationId
             ? { ...nextState, currentThreadId: reportedThreadId }
             : nextState
-        })
+        }, event.type === 'TEXT_MESSAGE_CONTENT')
         if (seq != null) lastAppliedSeq = seq
-        persistActiveRun()
+        persistActiveRun(canonicalIdentityChanged)
         if (
           (event.type === 'RUN_FINISHED' && event.runId === payload.runId)
           || (
@@ -455,14 +589,17 @@ export function useConversationStreamController({
           )
         ) {
           mainTerminalReceived = true
-          clearActiveRunSession(payload.runId)
+          clearActiveRunPersistence(payload.runId)
         }
           }
           if (mainTerminalReceived || !receivedEvent) break
-          throw new TypeError('实时输出连接在主终态前断开')
+          throw new ConversationError('stream_disconnected')
         } catch (error) {
           if (controller.signal.aborted) return
-          const canRetry = error instanceof TypeError
+          const canRetry = (
+            error instanceof TypeError
+            || hasConversationErrorCode(error, 'stream_disconnected')
+          )
             && (receivedEvent || options.initialAfterSeq != null)
           if (!canRetry) throw error
           reconnectAttempt += 1
@@ -475,7 +612,14 @@ export function useConversationStreamController({
       }
     } catch (error) {
       if (controller.signal.aborted) return
-      const message = error instanceof Error ? error.message : 'chat 接口请求失败'
+      const stableError = error instanceof InvalidStateDeltaError
+        ? new ConversationError('state_patch_invalid', error)
+        : error
+      // 协议诊断留在错误对象中，notice 只使用稳定错误码对应的恢复文案
+      const message = conversationErrorMessage(
+        stableError,
+        receivedEvent ? 'stream_event_invalid' : 'run_request_failed',
+      )
 
       if (target === 'draft' && draftTarget) {
         const erroredConversation: Conversation = {
@@ -494,11 +638,11 @@ export function useConversationStreamController({
           currentTargetThreadId,
           (item) => markConversationDetached(
             item,
-            `实时事件处理失败：${message}。将从已持久化事件继续恢复。`,
+            message,
           ),
         ))
       } else {
-        if (!receivedEvent) clearActiveRunSession(payload.runId)
+        if (!receivedEvent) clearActiveRunPersistence(payload.runId)
         const currentTargetThreadId = activeThreadId.current ?? targetThreadId
         enqueueWorkspaceUpdate(
           streamEpoch,
@@ -511,8 +655,10 @@ export function useConversationStreamController({
         )
       }
     } finally {
-      if (mainTerminalReceived) clearActiveRunSession(payload.runId)
+      clearCancelPending(payload.runId)
+      if (mainTerminalReceived) clearActiveRunPersistence(payload.runId)
       if (activeAbortController.current === controller) {
+        if (!mainTerminalReceived) flushActiveRunPersistence(payload.runId)
         const currentTargetThreadId = activeThreadId.current ?? targetThreadId
         activeAbortController.current = null
         activeThreadId.current = null
@@ -523,7 +669,7 @@ export function useConversationStreamController({
             streamEpoch,
             markConversationDetached(
               draftTarget,
-              '实时输出连接已断开，后端任务可能仍在继续。',
+              translateCurrent('已停止接收实时输出，后端任务可能仍在继续'),
             ),
           )
         } else {
@@ -534,7 +680,7 @@ export function useConversationStreamController({
               currentTargetThreadId,
               (item) => markConversationDetached(
                 item,
-                '实时输出连接已断开，后端任务可能仍在继续。',
+                translateCurrent('已停止接收实时输出，后端任务可能仍在继续'),
               ),
             ),
           )
@@ -551,8 +697,12 @@ export function useConversationStreamController({
     }
   }, [
     catchUpDetachedConversation,
+    clearActiveRunPersistence,
+    clearCancelPending,
     enqueueDraftUpdate,
     enqueueWorkspaceUpdate,
+    flushActiveRunPersistence,
+    scheduleActiveRunPersistence,
   ])
 
   const hasActiveStream = useCallback(
@@ -560,19 +710,44 @@ export function useConversationStreamController({
     [],
   )
   const getActiveThreadId = useCallback(() => activeThreadId.current, [])
-  const cancelActiveRun = useCallback(async () => {
+  const cancelActiveRun = useCallback(() => {
     const threadId = activeThreadId.current
     const runId = activeRunId.current
-    if (!threadId || runId == null) return false
-    const result = await cancelConversationRun(threadId, runId)
-    return result.cancelled
-  }, [])
+    if (!threadId || runId == null) return Promise.resolve(false)
+    const existing = cancelRequest.current
+    if (existing?.runId === runId) return existing.promise
+    // 停止请求成功只代表后端已受理，按钮所有权要保留到流真正进入终态
+    if (cancelPendingRunIdRef.current === runId) return Promise.resolve(true)
+
+    cancelPendingRunIdRef.current = runId
+    setCancelPendingRunId(runId)
+    const promise = cancelConversationRun(threadId, runId).then((result) => result.cancelled)
+    const owner = { runId, promise }
+    cancelRequest.current = owner
+    void promise.then(
+      (cancelled) => {
+        if (cancelRequest.current === owner) cancelRequest.current = null
+        if (!cancelled) clearCancelPending(runId)
+      },
+      () => {
+        if (cancelRequest.current === owner) cancelRequest.current = null
+        clearCancelPending(runId)
+      },
+    )
+    return promise
+  }, [clearCancelPending])
   const isActiveThread = useCallback(
     (threadId: string) => (
       activeAbortController.current != null && activeThreadId.current === threadId
     ),
     [],
   )
+
+  useEffect(() => {
+    const handlePageHide = () => flushActiveRunPersistence(activeRunId.current ?? undefined)
+    window.addEventListener('pagehide', handlePageHide)
+    return () => window.removeEventListener('pagehide', handlePageHide)
+  }, [flushActiveRunPersistence])
 
   useEffect(() => {
     const controllers = catchUpControllers.current
@@ -582,29 +757,36 @@ export function useConversationStreamController({
     return () => {
       isMounted.current = false
       activeStreamEpoch.current += 1
+      flushActiveRunPersistence(activeRunId.current ?? undefined)
       activeAbortController.current?.abort()
       activeAbortController.current = null
       activeThreadId.current = null
       activeRunId.current = null
+      const persistenceOwner = activeRunPersistence.current
+      if (persistenceOwner?.timer != null) window.clearTimeout(persistenceOwner.timer)
+      activeRunPersistence.current = null
+      cancelRequest.current = null
+      cancelPendingRunIdRef.current = null
       for (const controller of controllers.values()) controller.abort()
       controllers.clear()
       requests.clear()
       for (const timer of timers) window.clearTimeout(timer)
       timers.clear()
-      if (workspaceFrame.current != null) window.cancelAnimationFrame(workspaceFrame.current)
-      if (draftFrame.current != null) window.cancelAnimationFrame(draftFrame.current)
-      workspaceFrame.current = null
-      draftFrame.current = null
+      if (workspaceUpdateTimer.current != null) window.clearTimeout(workspaceUpdateTimer.current)
+      if (draftUpdateTimer.current != null) window.clearTimeout(draftUpdateTimer.current)
+      workspaceUpdateTimer.current = null
+      draftUpdateTimer.current = null
       workspaceFrameUpdates.current = []
       pendingDraftFrameValue.current = undefined
     }
-  }, [])
+  }, [flushActiveRunPersistence])
 
   return {
     streamRun,
     catchUpDetachedConversation,
     detachThreadStream,
     cancelActiveRun,
+    cancelPendingRunId,
     hasActiveStream,
     getActiveThreadId,
     isActiveThread,

@@ -20,14 +20,12 @@ from tinkerfin_agui_adapter import Identity
 from . import _message_channel, _messaging_boundary, _producer_runtime
 from ._identity import required_identifier, required_identity
 from ._messaging_boundary import (
-    _await_backend,
-    _close_async_iterator,
+    _invoke_cancel as _invoke_cancel,
+)
+from ._messaging_boundary import (
     _iterate_backend,
     _join_owned_task,
     _read_backend,
-)
-from ._messaging_boundary import (
-    _invoke_cancel as _invoke_cancel,
 )
 from ._messaging_boundary import (
     _normalize_cancel_callback as _normalize_cancel_callback,
@@ -69,6 +67,8 @@ class CancelContext:
     identity: Identity
 
     def __post_init__(self) -> None:
+        """Validate the durable channel and run identity before callback use."""
+
         required_identifier("channel", self.channel)
         required_identity(self.identity)
 
@@ -97,6 +97,8 @@ class MessageSubscription(Generic[ReplayT]):
         codec: MessageCodec[object, ReplayT],
         renderer: SseRenderer[ReplayT] | None,
     ) -> None:
+        """Initialize a lazy single-use decoder over one prepared run."""
+
         self._backend = backend
         self._prepared = prepared
         self._codec = codec
@@ -104,8 +106,12 @@ class MessageSubscription(Generic[ReplayT]):
         self._claimed = False
         self._delivery: AsyncIterator[DecodedMessage[ReplayT]] | None = None
         self._backend_iterator: AsyncIterator[object] | None = None
+        self._backend_close_task: asyncio.Task[None] | None = None
+        self._close_task: asyncio.Task[None] | None = None
 
     def __aiter__(self) -> AsyncIterator[DecodedMessage[ReplayT]]:
+        """Claim and return the subscription's one decoded iterator."""
+
         return _messaging_boundary.__aiter__(
             self,
         )
@@ -137,18 +143,14 @@ class MessageSubscription(Generic[ReplayT]):
             raise
         finally:
             try:
-                await _await_backend(
-                    "follow close",
-                    _close_async_iterator(
-                        cast(AsyncIterator[object], backend_iterator)
-                    ),
+                await _messaging_boundary._close_backend_iterator(
+                    self,
+                    cast(AsyncIterator[object], backend_iterator),
                 )
             except BaseException as close_error:
                 if primary is None:
                     raise
                 primary.add_note(f"Messaging follow cleanup also failed: {close_error}")
-            finally:
-                self._backend_iterator = None
 
     def sse(self) -> AsyncIterator[bytes]:
         """Render committed messages while preserving their durable sequences."""
@@ -176,6 +178,8 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         codec: MessageCodec[SourceT, ReplayT] | None,
         renderer: SseRenderer[ReplayT] | None,
     ) -> None:
+        """Initialize a named facade that borrows its parent Messaging lifecycle."""
+
         self._messaging = messaging
         self.name = required_identifier("channel name", name)
         if codec is None and renderer is not None:
@@ -361,6 +365,8 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         ) = None,
         on_committed: CommittedCallback | None = None,
     ) -> MessageSubscription[ReplayT] | MessageSubscription[ProfileReplayT]:
+        """Start or attach one source and return its run-bounded subscription."""
+
         return await _message_channel.wrap(
             self,
             source,
@@ -613,6 +619,8 @@ class Messaging:
         return self._backend
 
     async def __aenter__(self) -> Self:
+        """Open this single-use Messaging lifecycle."""
+
         if self._state == "closed":
             raise MessagingClosed("Messaging is closed")
         if self._state != "new":
@@ -626,6 +634,8 @@ class Messaging:
         exc: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
+        """Close Messaging while preserving the active scope's primary failure."""
+
         del exc_type, traceback
         try:
             await self.aclose()
@@ -692,12 +702,20 @@ class Messaging:
 
         primary: BaseException | None = None
         try:
+            # A cancellation preflight can be waiting for the producer's durable
+            # terminal. Signal existing producers before joining preflights so close,
+            # cancel, and settlement cannot form a wait cycle.
+            for producer in tuple(self._producer_tasks):
+                if not producer.done() and producer not in self._settling_producers:
+                    producer.cancel()
             preflights = tuple(
                 task for task in self._preflight_tasks if task is not initiating_caller
             )
             if preflights:
                 await asyncio.gather(*preflights, return_exceptions=True)
 
+            # A startup preflight may have published a producer before observing the
+            # closing state. Re-snapshot after it settles and cancel any such owner.
             producers = tuple(self._producer_tasks)
             for producer in producers:
                 if not producer.done() and producer not in self._settling_producers:

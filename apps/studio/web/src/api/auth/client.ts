@@ -10,8 +10,7 @@ export interface BootstrapAuthResult {
   error?: ApiError
 }
 
-let bootstrapPromise: Promise<BootstrapAuthResult> | null = null
-let bootstrapToken: string | null = null
+const bootstrapRequests = new Map<string, Promise<BootstrapAuthResult>>()
 
 export function login(input: LoginRequest, signal?: AbortSignal) {
   return requestJson<LoginResponse>('/api/auth/login', {
@@ -23,9 +22,15 @@ export function login(input: LoginRequest, signal?: AbortSignal) {
   })
 }
 
-export function getCurrentSession(signal?: AbortSignal, options?: { suppressAuthFailure?: boolean }) {
+export function getCurrentSession(
+  signal?: AbortSignal,
+  options?: { suppressAuthFailure?: boolean; authorization?: string },
+) {
   return requestJson<AuthSessionResponse>('/api/auth/me', {
     signal,
+    headers: options?.authorization
+      ? { Authorization: options.authorization }
+      : undefined,
     suppressGlobalError: true,
     suppressAuthFailure: options?.suppressAuthFailure ?? false,
   })
@@ -48,17 +53,24 @@ export function bootstrapAuthSession(): Promise<BootstrapAuthResult> {
     return Promise.resolve({ status: 'unauthenticated', session: null })
   }
 
-  if (bootstrapPromise && bootstrapToken === session.token) return bootstrapPromise
-  bootstrapToken = session.token
+  const requestToken = session.token
+  const requestAuthorization = `${session.tokenType || 'Bearer'} ${requestToken}`
+  const inFlight = bootstrapRequests.get(requestToken)
+  if (inFlight) return inFlight
 
-  bootstrapPromise = getCurrentSession(undefined, { suppressAuthFailure: true })
+  const staleResult = (): BootstrapAuthResult => ({
+    status: 'stale',
+    session: getAuthSession(),
+  })
+  const request = getCurrentSession(undefined, {
+    suppressAuthFailure: true,
+    authorization: requestAuthorization,
+  })
     .then((payload) => {
-      const updated = updateAuthSession(payload)
+      if (getAuthSession()?.token !== requestToken) return staleResult()
+      const updated = updateAuthSession(payload, requestToken)
       if (!updated) {
-        return {
-          status: 'unauthenticated' as const,
-          session: null,
-        }
+        return staleResult()
       }
       return {
         status: 'authenticated' as const,
@@ -66,6 +78,7 @@ export function bootstrapAuthSession(): Promise<BootstrapAuthResult> {
       }
     })
     .catch((error) => {
+      if (getAuthSession()?.token !== requestToken) return staleResult()
       if (error instanceof AuthError) {
         return {
           status: 'unauthenticated' as const,
@@ -75,16 +88,18 @@ export function bootstrapAuthSession(): Promise<BootstrapAuthResult> {
 
       return {
         status: 'stale' as const,
-        session,
+        session: getAuthSession(),
         error: error as ApiError,
       }
     })
     .finally(() => {
       queueMicrotask(() => {
-        bootstrapPromise = null
-        bootstrapToken = null
+        if (bootstrapRequests.get(requestToken) === request) {
+          bootstrapRequests.delete(requestToken)
+        }
       })
     })
 
-  return bootstrapPromise
+  bootstrapRequests.set(requestToken, request)
+  return request
 }

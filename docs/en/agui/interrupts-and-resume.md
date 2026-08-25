@@ -36,8 +36,8 @@ runtime = agent.new_agui(identity=identity, mode="plan")
 
 | Reason | Expected resolved payload |
 | --- | --- |
-| `plan_clarification` | `{"type":"respond","answers":[{"questionId":"...","optionId":"..."}]}` for an option, `{"type":"respond","answers":[{"questionId":"...","answer":"..."}]}` for free text, or `{"type":"respond","answers":[{"questionId":"...","skipped":true}]}` for an optional skip |
-| `plan_review` | `approve`, `edit`, `respond`, or `reject`, each with the current `baseRevision` |
+| `tinkerfin:plan_clarification` | `{"type":"respond","answers":[{"questionId":"...","optionId":"..."}]}` for an option, `{"type":"respond","answers":[{"questionId":"...","answer":"..."}]}` for free text, or `{"type":"respond","answers":[{"questionId":"...","skipped":true}]}` for an optional skip |
+| `tinkerfin:plan_review` | `approve`, `edit`, `respond`, or `reject`, each with the current `baseRevision` |
 
 A Plan interrupt has no `toolCallId`. It carries a versioned trusted runtime envelope,
 its response JSON Schema, and `tinkerfin.plan-clarification.v2` metadata containing the
@@ -55,10 +55,10 @@ restores the trusted checkpoint Form and derives the selected option label. Resu
 cover every question exactly once. Supplying mixed answer fields, skipping a required
 question, omitting a question result, or using unknown IDs fails the resume.
 
-The same `ResumeMapper.map_agui(...)` and `AgUiResumeBinding` flow handles Plan
-interrupts without a separate API. `ResumeMapper` verifies the persisted envelope and
-exact pending coverage; the Planning Graph validates the response contract and rejects a
-stale `baseRevision`. Use a new `runId` with the same `threadId` for every resume.
+The same `AgUiResumeBinding.from_agui(...)` flow handles Plan interrupts without a
+separate API. The binding verifies the persisted envelope and exact pending coverage;
+the Planning Graph validates the response contract and rejects a stale `baseRevision`.
+Use a new `runId` with the same `threadId` for every resume.
 
 A pending batch cannot mix Plan and Tool interrupts. A Tool review can still occur
 later, after Plan approval, and its original scoped Tool ID remains continuous across
@@ -103,36 +103,34 @@ When the server saved the complete interrupts emitted by the earlier terminal, r
 
 ```python
 from tinkerfin import AgUiResumeBinding
-from tinkerfin_agui_adapter import ResumeMapper
 
 
-translation = ResumeMapper().map_agui(
+binding = AgUiResumeBinding.from_agui(
     entries=resume_entries,
     interrupts=persisted_interrupts,
 )
-
-if translation.mode == "command":
-    binding = AgUiResumeBinding.from_translation(
-        identity=identity,
-        translation=translation,
-    )
 ```
 
 `persisted_interrupts` must come from a trusted server event log, not the client payload.
-`ResumeMapper.map_agui()` applies the same Tool review v1 parser used at the public
-inspection boundary.
+`from_agui()` applies the same Tool review v1 parser used at the public inspection
+boundary and returns a binding for full resume, mixed cancellation, or abandonment.
 
-Then pass both the binding and its command:
+Pass the binding once. The Runtime owns native command construction:
 
 ```python
 runtime = agent.new_agui(
     identity=identity,
+    parent_run_id=parent_run_id,
     resume=binding,
+    on_resume_checkpointed=record_checkpoint_idempotently,
 )
-events = runtime.astream(binding.command)
+events = runtime.astream(config=config)
 ```
 
-`AgUiResumeBinding` binds the `Identity`, a pure `Command(resume=...)`, and the scoped Tool IDs emitted before the interrupt. The application still validates authorization and the complete HTTP request.
+`AgUiResumeBinding` stores native interrupt groups, scoped Tool IDs, cancellation, and
+verified subagent sources. It has a stable JSON round trip but stores no identity or
+parent and exposes no `Command`. The application still validates authorization and the
+complete HTTP request.
 
 ## Resume from native checkpoint data
 
@@ -147,31 +145,46 @@ translation = ResumeMapper().map(
 ```
 
 Resolved reviews need complete messages for safe tool correlation. Do not match parallel or repeated tool names by arrival order.
+This is an adapter-level inspection path. The high-level Runtime uses persisted AG-UI
+interrupts with `AgUiResumeBinding.from_agui(...)` so callers do not translate or pass a
+native command.
 
-## Three translation modes
+## Three resume modes
 
-| Mode | Meaning | Application action |
+| Mode | Meaning | Runtime action |
 | --- | --- | --- |
-| `command` | All decisions map to a native resume command | Create a binding and continue the Graph |
-| `abandon` | All entries were cancelled | End the business flow without fabricating rejection |
-| `custom` | Resolved and cancelled decisions are mixed | Handle explicitly; do not force a lossy native resume |
+| fully resolved | All entries map to native resume data | Checkpoint once and continue the Graph |
+| all cancelled | Every entry was abandoned | Emit a finite cancelled lifecycle without invoking the Graph |
+| mixed | Resolved and cancelled entries share a Tool batch | Execute resolved Tools and settle cancelled slots without executing them |
 
-Cancellation means abandoning this resume attempt. It is not a tool rejection.
-The same rule applies to Plan review: cancellation does not fabricate a Plan rejection.
+Cancellation is never converted to rejection. In a mixed Tool batch, TinkerFin executes
+resolved calls and creates a deterministic, non-executed error `ToolMessage` for each
+cancelled call. Main, general-purpose, declarative subagents, and permission-generated
+reviews receive the same adapter. Mixed generic runtime interrupts are not Tool decisions
+and are rejected by `AgUiResumeBinding`.
+
+The framework checkpoints the native resume and a private marker atomically. It invokes
+`on_resume_checkpointed` only after that marker is readable and before exposing the first
+resumed native event. A retry may receive the same `AgUiResumeCheckpoint`; consume it
+idempotently. Marker retry and `None` continuation remain internal and never require the
+caller to pass a second input.
 
 ## Retry and concurrency
 
 - Use a new `runId` for the resume request and keep the same `threadId`;
 - atomically claim the complete pending set in application storage;
-- persist translated resume data and full tool IDs for idempotent retries;
+- persist the original AG-UI entries and complete trusted interrupts, or the binding's
+  complete stable JSON model; never persist selected internal fields separately;
+- resolve application approvals only from `on_resume_checkpointed`, never from
+  `RUN_STARTED`;
 - preserve original tool IDs when results continue after resume.
 
 ## Common errors
 
 | Error | Likely cause |
 | --- | --- |
-| `ResumeMappingError` | Unknown ID, incomplete coverage, disallowed decision, or missing tool evidence |
-| `ValueError` | Empty resume, impure command, or incomplete scoped tool ID |
+| `AgUiResumeBindingError` | Unknown ID, incomplete coverage, disallowed decision, invalid Schema payload, or missing Tool evidence |
+| `ValueError` | Invalid binding mode, unsupported mixed runtime cancellation, or incomplete scoped Tool ID |
 | State cannot be resumed | Changed `Identity.threadId` or missing checkpointer |
 | Action runs twice | Pending interrupts were not claimed atomically or retry data changed |
 

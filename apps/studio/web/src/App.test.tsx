@@ -141,27 +141,59 @@ function historyListItem(overrides: Partial<ConversationHistoryListResponse['ite
   }
 }
 
-function historyDetail(overrides: Partial<ConversationHistoryDetail> & { threadId: string; title: string }): ConversationHistoryDetail {
-  const { threadId, title, ...rest } = overrides
+function historyDetail(
+  overrides: Partial<ConversationHistoryDetail> & {
+    threadId: string
+    title: string
+    snapshotMode?: 'default' | 'plan'
+  },
+): ConversationHistoryDetail {
+  const {
+    threadId,
+    title,
+    lastSeq = 5,
+    snapshotSeq = lastSeq,
+    snapshot,
+    events,
+    status = 'idle',
+    lastRunId = FIRST_RUN_ID,
+    snapshotMode = 'default',
+    ...rest
+  } = overrides
   const assistantContent = `来自 ${title} 的历史回复`
+  const currentSnapshot: ConversationSnapshotJson = {
+    snapshotSeq,
+    snapshotVersion: 3,
+    messages: [{
+      id: `${threadId}-assistant-1`,
+      role: 'assistant',
+      content: assistantContent,
+      createdAt: BASE_TIME,
+    }],
+    todos: [],
+    mode: snapshotMode,
+    approval: null,
+    runStatus: status === 'running' ? 'streaming' : status === 'error' ? 'error' : 'idle',
+    activeRunId: status === 'running' ? lastRunId ?? null : null,
+    serverState: {},
+    runs: {},
+    interrupts: [],
+  }
   return {
     id: 1,
     threadId,
     title,
-    status: 'idle',
-    lastRunId: FIRST_RUN_ID,
+    status,
+    lastRunId,
     lastModel: 'GPT-5.5',
-    lastSeq: 5,
-    snapshotSeq: 0,
+    lastSeq,
+    snapshotSeq,
     snapshotVersion: 3,
     messageCount: 1,
     toolCallCount: 0,
     hasPendingInterrupt: false,
-    snapshot: null,
-    // 反映「后端返回全量事件」的恢复模型：前端 baseline 只从快照取用户消息
-    // assistant 文本、工具和 HITL 均由回放事件重建，这里给出重建该条 assistant 消息
-    // 的事件序列（与快照里的 assistant 内容一致），使刷新后内容与实时一致
-    events: assistantHistoryEvents(threadId, FIRST_RUN_ID, `${threadId}-assistant-1`, assistantContent),
+    snapshot: snapshot === undefined ? currentSnapshot : snapshot,
+    events: events ?? [],
     createdAt: BASE_TIME,
     updatedAt: BASE_TIME,
     ...rest,
@@ -169,79 +201,9 @@ function historyDetail(overrides: Partial<ConversationHistoryDetail> & { threadI
   }
 }
 
-function emptyHistorySnapshot(mode: 'default' | 'plan'): ConversationSnapshotJson {
-  return {
-    snapshotSeq: 0,
-    snapshotVersion: 3,
-    messages: [],
-    todos: [],
-    mode,
-    approval: null,
-    runStatus: 'idle',
-    activeRunId: null,
-    serverState: {},
-    runs: {},
-    interrupts: [],
-  }
-}
-
-function assistantHistoryEvents(
-  threadId: string,
-  runId: string,
-  messageId: string,
-  content: string,
-): ConversationEventEnvelope[] {
-  const mainRawEvent = {
-    streamMode: 'messages' as const,
-    source: { kind: 'root' as const, agentType: 'main' as const, agentName: 'main', namespace: [] },
-    runId,
-  }
-  return [
-    {
-      seq: 1,
-      eventId: `${messageId}-run-start`,
-      eventType: 'RUN_STARTED',
-      runId,
-      event: { type: 'RUN_STARTED', threadId, runId },
-      createdAt: BASE_TIME,
-    },
-    {
-      seq: 2,
-      eventId: `${messageId}-msg-start`,
-      eventType: 'TEXT_MESSAGE_START',
-      runId,
-      event: { type: 'TEXT_MESSAGE_START', rawEvent: mainRawEvent, messageId, role: 'assistant' },
-      createdAt: BASE_TIME,
-    },
-    {
-      seq: 3,
-      eventId: `${messageId}-msg-content`,
-      eventType: 'TEXT_MESSAGE_CONTENT',
-      runId,
-      event: { type: 'TEXT_MESSAGE_CONTENT', rawEvent: mainRawEvent, messageId, delta: content },
-      createdAt: BASE_TIME,
-    },
-    {
-      seq: 4,
-      eventId: `${messageId}-msg-end`,
-      eventType: 'TEXT_MESSAGE_END',
-      runId,
-      event: { type: 'TEXT_MESSAGE_END', rawEvent: mainRawEvent, messageId },
-      createdAt: BASE_TIME,
-    },
-    {
-      seq: 5,
-      eventId: `${messageId}-run-finish`,
-      eventType: 'RUN_FINISHED',
-      runId,
-      event: { type: 'RUN_FINISHED', threadId, runId, outcome: { type: 'success' } },
-      createdAt: BASE_TIME,
-    },
-  ]
-}
-
 type FetchMockOptions = {
   streams?: ConversationAgUiEvent[][]
+  onChatRequest?: (request: ChatRequestPayload, requestIndex: number) => void
   keepOpen?: boolean
   historyLists?: ConversationHistoryListResponse[]
   historyListResolver?: (
@@ -260,6 +222,14 @@ type FetchMockOptions = {
   modelCatalog?: AgentModelCatalog
 }
 
+function deferred<T>() {
+  let resolve: (value: T) => void = () => undefined
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise
+  })
+  return { promise, resolve }
+}
+
 const DEFAULT_MODEL_CATALOG: AgentModelCatalog = {
   items: [
     { modelId: 'GPT-5.5', displayName: 'GPT-5.5', reasoningEnabled: false, isDefault: true },
@@ -272,6 +242,7 @@ const DEFAULT_MODEL_CATALOG: AgentModelCatalog = {
 function installFetchMock(options: FetchMockOptions = {}) {
   const {
     streams = [],
+    onChatRequest,
     keepOpen = false,
     historyLists = [{ items: [], nextCursor: null }],
     historyListResolver,
@@ -338,6 +309,7 @@ function installFetchMock(options: FetchMockOptions = {}) {
       const chatRequest = rawBody
         ? JSON.parse(rawBody) as ChatRequestPayload
         : null
+      if (chatRequest) onChatRequest?.(chatRequest, streamIndex - 1)
       const runId = chatRequest?.runId ?? FIRST_RUN_ID
       const serverEvents = chatRequest
         ? events.map((event) => {
@@ -354,14 +326,6 @@ function installFetchMock(options: FetchMockOptions = {}) {
             return {
               ...event,
               ...(title ? { title } : {}),
-              input: event.input ?? {
-                ...chatRequest,
-                threadId: event.threadId,
-                messages: chatRequest.messages.map((message, index) => ({
-                  ...message,
-                  id: `message-server-${runId}-${index}`,
-                })),
-              },
             }
           })
         : events
@@ -369,10 +333,11 @@ function installFetchMock(options: FetchMockOptions = {}) {
     }
 
     if (url.pathname.endsWith('/api/conversation/history')) {
-      const response = historyListResolver
-        ? historyListResolver(historyListIndex, streamIndex, url)
-        : historyLists[Math.min(historyListIndex, historyLists.length - 1)] ?? { items: [], nextCursor: null }
+      const requestIndex = historyListIndex
       historyListIndex += 1
+      const response = historyListResolver
+        ? historyListResolver(requestIndex, streamIndex, url)
+        : historyLists[Math.min(requestIndex, historyLists.length - 1)] ?? { items: [], nextCursor: null }
       return jsonResponse(response)
     }
 
@@ -500,14 +465,16 @@ describe('App', () => {
 
     render(<App />)
 
-    expect(await screen.findByText('发送一条消息，开始新的真实对话流。')).toHaveClass('visually-hidden')
+    expect(await screen.findByText('发送一条消息，开始新的真实对话流')).toHaveClass('visually-hidden')
     const emptyBrand = document.querySelector<HTMLElement>('.empty-brand-lockup')
     expect(emptyBrand).toHaveTextContent('TinkerFinPlus')
     expect(emptyBrand?.querySelector('.brand-mark svg')).toHaveAttribute('width', '34')
     expect(emptyBrand?.closest('.composer-dock')).toHaveClass('is-hero')
     const conversationPane = screen.getByRole('region', { name: '对话内容' })
     expect(conversationPane).toHaveClass('ui-scrollbar')
-    expect(conversationPane.parentElement?.querySelector('.ui-scrollbar-overlay')).toBeInTheDocument()
+    expect(conversationPane).toHaveAttribute('tabindex', '0')
+    expect(conversationPane.parentElement?.querySelector('.ui-scrollbar-overlay')).not.toBeInTheDocument()
+    expect(conversationPane.parentElement?.querySelector('.ui-overlay-scrollbar')).toHaveAttribute('data-visibility', 'persistent')
     expect(conversationPane).not.toContainElement(emptyBrand)
     expect(screen.queryByRole('button', { name: '回到底部' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: '模型设置' })).not.toBeInTheDocument()
@@ -535,7 +502,7 @@ describe('App', () => {
 
     render(<App />)
 
-    expect(await screen.findByText('发送一条消息，开始新的真实对话流。')).toBeInTheDocument()
+    expect(await screen.findByText('发送一条消息，开始新的真实对话流')).toBeInTheDocument()
     await waitFor(() => expect(readActiveRunSession()).toBeNull())
     await waitFor(() => expect(window.location.search).toBe(''))
   })
@@ -646,6 +613,7 @@ describe('App', () => {
   })
 
   it('abandons a pending Plan before switching the thread to default', async () => {
+    const secondChatRequest = deferred<ChatRequestPayload>()
     const fetchMock = installFetchMock({
       streams: [
         [
@@ -658,7 +626,7 @@ describe('App', () => {
               type: 'interrupt',
               interrupts: [{
                 id: 'plan-review-app',
-                reason: 'plan_review',
+                reason: 'tinkerfin:plan_review',
                 message: '请确认 Plan',
                 metadata: {
                   runtimeInterrupt: {
@@ -696,6 +664,9 @@ describe('App', () => {
           },
         ],
       ],
+      onChatRequest: (request, requestIndex) => {
+        if (requestIndex === 1) secondChatRequest.resolve(request)
+      },
     })
     const user = userEvent.setup()
     render(<App />)
@@ -707,16 +678,10 @@ describe('App', () => {
     expect(within(dialog).getByText(/Tool\/Filesystem 审批不受影响/)).toBeInTheDocument()
     await user.click(within(dialog).getByRole('button', { name: '关闭 Plan' }))
 
-    await waitFor(() => expect(chatRequests(fetchMock).some(
-      (request) => request.resume?.some((item) => item.status === 'cancelled'),
-    )).toBe(true))
+    const abandonRequest = await secondChatRequest.promise
     const requests = chatRequests(fetchMock)
     expect(requests.filter((request) => request.messages.length > 0 && request.forwardedProps.command.plan === 'on')).toHaveLength(1)
-    const abandonRequest = requests.find(
-      (request) => request.resume?.some((item) => item.status === 'cancelled'),
-    )
-    expect(abandonRequest).toBeDefined()
-    if (!abandonRequest) throw new Error('缺少取消 Plan 请求')
+    expect(abandonRequest.resume?.some((item) => item.status === 'cancelled')).toBe(true)
     expect(abandonRequest.forwardedProps).toEqual({ model: 'GPT-5.5', command: { plan: 'off' } })
     expect(abandonRequest.resume).toEqual([{
       interruptId: 'plan-review-app',
@@ -790,6 +755,23 @@ describe('App', () => {
 
     expect(request.forwardedProps).toEqual({ model: 'database-main', command: { plan: 'off' } })
     expect(screen.queryByText('GPT-5.5')).not.toBeInTheDocument()
+  })
+
+  it('blocks composition with a recoverable empty model catalog state', async () => {
+    installFetchMock({
+      modelCatalog: { items: [], defaultModelId: null },
+    })
+    render(<App />)
+
+    expect(await screen.findByText('未配置可用模型')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '重试' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '选择模型' })).not.toBeInTheDocument()
+    expect(screen.getByLabelText('消息输入')).toBeDisabled()
+    expect(screen.getByLabelText('消息输入')).toHaveAttribute(
+      'placeholder',
+      '未配置可用模型，请联系管理员或重试',
+    )
+    expect(screen.getByRole('button', { name: '发送消息' })).toBeDisabled()
   })
 
   it('keeps the composer disabled until the initial model and history bootstrap completes', async () => {
@@ -929,7 +911,7 @@ describe('App', () => {
     expect(screen.getByRole('button', { name: '打开任务抽屉' })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: '当前 Agent 预设' })).not.toBeInTheDocument()
     await userEvent.click(screen.getByRole('button', { name: '打开用户菜单' }))
-    await userEvent.click(screen.getByRole('button', { name: '设置' }))
+    await userEvent.click(screen.getByRole('menuitem', { name: '设置' }))
 
     expect(screen.getByRole('dialog', { name: '设置' })).toBeInTheDocument()
     expect(document.querySelector('.app-shell')).toHaveAttribute('inert')
@@ -997,12 +979,12 @@ describe('App', () => {
         [THREAD_ID]: historyDetail({
           threadId: THREAD_ID,
           title: '第一条会话',
-          snapshot: emptyHistorySnapshot('plan'),
+          snapshotMode: 'plan',
         }),
         [SECOND_THREAD_ID]: historyDetail({
           threadId: SECOND_THREAD_ID,
           title: '第二条会话',
-          snapshot: emptyHistorySnapshot('default'),
+          snapshotMode: 'default',
         }),
       },
     })
@@ -1202,50 +1184,29 @@ describe('App', () => {
           status: 'running',
           lastRunId: FIRST_RUN_ID,
           lastSeq: 3,
-          events: [
-            {
-              seq: 1,
-              eventId: 'refresh-run-start',
-              eventType: 'RUN_STARTED',
-              runId: FIRST_RUN_ID,
-              event: {
-                type: 'RUN_STARTED',
-                threadId: THREAD_ID,
-                runId: FIRST_RUN_ID,
-                input: {
-                  ...activePayload,
-                  messages: [{ id: 'server-user', role: 'user', content: '刷新后继续' }],
-                },
-              },
-              createdAt: BASE_TIME,
-            },
-            {
-              seq: 2,
-              eventId: 'refresh-text-start',
-              eventType: 'TEXT_MESSAGE_START',
-              runId: FIRST_RUN_ID,
-              event: {
-                type: 'TEXT_MESSAGE_START',
-                rawEvent,
-                messageId: 'refresh-assistant',
+          snapshot: {
+            snapshotSeq: 3,
+            snapshotVersion: 3,
+            messages: [
+              { id: 'server-user', role: 'user', content: '刷新后继续', createdAt: BASE_TIME },
+              {
+                id: 'refresh-assistant',
                 role: 'assistant',
+                content: '刷新前',
+                createdAt: BASE_TIME,
+                meta: { status: 'running', runId: FIRST_RUN_ID },
               },
-              createdAt: BASE_TIME,
-            },
-            {
-              seq: 3,
-              eventId: 'refresh-text-content',
-              eventType: 'TEXT_MESSAGE_CONTENT',
-              runId: FIRST_RUN_ID,
-              event: {
-                type: 'TEXT_MESSAGE_CONTENT',
-                rawEvent,
-                messageId: 'refresh-assistant',
-                delta: '刷新前',
-              },
-              createdAt: BASE_TIME,
-            },
-          ],
+            ],
+            todos: [],
+            mode: 'default',
+            approval: null,
+            runStatus: 'streaming',
+            activeRunId: FIRST_RUN_ID,
+            serverState: {},
+            runs: {},
+            interrupts: [],
+          },
+          events: [],
         }),
       },
       streams: [[
@@ -1281,6 +1242,117 @@ describe('App', () => {
     expect(screen.queryByRole('button', { name: '停止任务' })).not.toBeInTheDocument()
   })
 
+  it('reattaches the same restored run again after an explicit detach and reselect', async () => {
+    window.history.replaceState(null, '', `/?thread=${THREAD_ID}`)
+    const activePayload: ChatRequestPayload = {
+      threadId: THREAD_ID,
+      runId: FIRST_RUN_ID,
+      state: {},
+      messages: [{ id: 'request-first-run', role: 'user', content: '继续运行' }],
+      tools: [],
+      context: [],
+      forwardedProps: { model: 'GPT-5.5', command: { plan: 'off' } },
+    }
+    writeActiveRunSession({
+      threadId: THREAD_ID,
+      payload: activePayload,
+      mode: 'start',
+      lastSeq: 3,
+    })
+    const rawEvent = {
+      streamMode: 'messages' as const,
+      source: { kind: 'root' as const, agentType: 'main' as const, agentName: 'main', namespace: [] },
+      runId: FIRST_RUN_ID,
+    }
+    const firstDetail = historyDetail({
+      threadId: THREAD_ID,
+      title: '可重复附着',
+      status: 'running',
+      lastRunId: FIRST_RUN_ID,
+      lastSeq: 3,
+      events: [
+        {
+          seq: 1,
+          eventId: 'repeat-attach-start',
+          eventType: 'RUN_STARTED',
+          runId: FIRST_RUN_ID,
+          event: { type: 'RUN_STARTED', threadId: THREAD_ID, runId: FIRST_RUN_ID },
+          createdAt: BASE_TIME,
+        },
+        {
+          seq: 2,
+          eventId: 'repeat-attach-text-start',
+          eventType: 'TEXT_MESSAGE_START',
+          runId: FIRST_RUN_ID,
+          event: {
+            type: 'TEXT_MESSAGE_START',
+            rawEvent,
+            messageId: 'history-message',
+            role: 'assistant',
+          },
+          createdAt: BASE_TIME,
+        },
+        {
+          seq: 3,
+          eventId: 'repeat-attach-text-content',
+          eventType: 'TEXT_MESSAGE_CONTENT',
+          runId: FIRST_RUN_ID,
+          event: {
+            type: 'TEXT_MESSAGE_CONTENT',
+            rawEvent,
+            messageId: 'history-message',
+            delta: '历史内容',
+          },
+          createdAt: BASE_TIME,
+        },
+      ],
+    })
+    const fetchMock = installFetchMock({
+      historyLists: [{
+        items: [
+          historyListItem({
+            threadId: THREAD_ID,
+            title: '可重复附着',
+            status: 'running',
+            lastRunId: FIRST_RUN_ID,
+            lastSeq: 3,
+          }),
+          historyListItem({ id: 2, threadId: SECOND_THREAD_ID, title: '其他会话' }),
+        ],
+        nextCursor: null,
+      }],
+      historyDetails: {
+        [THREAD_ID]: firstDetail,
+        [SECOND_THREAD_ID]: historyDetail({
+          threadId: SECOND_THREAD_ID,
+          title: '其他会话',
+        }),
+      },
+      streams: [
+        [{ type: 'TEXT_MESSAGE_CONTENT', rawEvent, messageId: 'history-message', delta: '第一次附着' }],
+        [{ type: 'TEXT_MESSAGE_CONTENT', rawEvent, messageId: 'history-message', delta: '第二次附着' }],
+      ],
+      keepOpen: true,
+    })
+    const user = userEvent.setup()
+
+    render(<App />)
+
+    await waitFor(() => expect(chatRequests(fetchMock)).toHaveLength(1))
+    await user.click(screen.getByRole('button', { name: '打开会话：其他会话' }))
+    const dialog = await screen.findByRole('dialog', { name: '断开实时输出？' })
+    await user.click(within(dialog).getByRole('button', { name: '断开并切换' }))
+    expect(await screen.findByText('来自 其他会话 的历史回复')).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: '打开会话：可重复附着' }))
+
+    await waitFor(() => expect(chatRequests(fetchMock)).toHaveLength(2))
+    expect(readActiveRunSession()).toMatchObject({
+      threadId: THREAD_ID,
+      payload: { runId: FIRST_RUN_ID },
+    })
+  })
+
   it('restores a routed conversation that is outside the first history page', async () => {
     window.history.replaceState(null, '', `/?thread=${SECOND_THREAD_ID}`)
     const fetchMock = installFetchMock({
@@ -1299,7 +1371,7 @@ describe('App', () => {
     expect(window.location.search).toContain(`thread=${SECOND_THREAD_ID}`)
     expect(screen.getByRole('button', { name: '打开会话：首屏之外的会话' })).toBeInTheDocument()
     const requestUrls = fetchMock.mock.calls.map(([input]) => fetchCallUrl(input))
-    expect(requestUrls.filter((url) => url.endsWith('/api/conversation/history?pageSize=5'))).toHaveLength(1)
+    expect(requestUrls.filter((url) => url.endsWith('/api/conversation/history?pageSize=100'))).toHaveLength(1)
     expect(requestUrls.filter((url) => url.endsWith(`/api/conversation/${SECOND_THREAD_ID}/history`))).toHaveLength(1)
   })
 
@@ -1381,17 +1453,19 @@ describe('App', () => {
     pane.scrollTop = 240
     fireEvent.wheel(pane, { deltaY: -120 })
     fireEvent.scroll(pane)
-    expect(window.sessionStorage.getItem(`tinkerfin:conversation-scroll:${THREAD_ID}`)).toBe('240')
+    expect(window.sessionStorage.getItem(`tinkerfin:conversation-scroll:${THREAD_ID}`)).toBeNull()
 
     await user.click(screen.getByRole('button', { name: '打开会话：第二条滚动会话' }))
     await screen.findByText('来自 第二条滚动会话 的历史回复')
+    expect(window.sessionStorage.getItem(`tinkerfin:conversation-scroll:${THREAD_ID}`)).toBe('240')
     pane.scrollTop = 420
     fireEvent.wheel(pane, { deltaY: -120 })
     fireEvent.scroll(pane)
-    expect(window.sessionStorage.getItem(`tinkerfin:conversation-scroll:${SECOND_THREAD_ID}`)).toBe('420')
+    expect(window.sessionStorage.getItem(`tinkerfin:conversation-scroll:${SECOND_THREAD_ID}`)).toBeNull()
 
     await user.click(screen.getByRole('button', { name: '打开会话：第一条滚动会话' }))
     await screen.findByText('来自 第一条滚动会话 的历史回复')
+    expect(window.sessionStorage.getItem(`tinkerfin:conversation-scroll:${SECOND_THREAD_ID}`)).toBe('420')
     await waitFor(() => expect(pane.scrollTop).toBe(240))
     expect(screen.queryByRole('button', { name: '回到底部' })).not.toBeInTheDocument()
 
@@ -1399,6 +1473,72 @@ describe('App', () => {
     await screen.findByText('来自 第二条滚动会话 的历史回复')
     await waitFor(() => expect(pane.scrollTop).toBe(420))
     expect(screen.queryByRole('button', { name: '回到底部' })).not.toBeInTheDocument()
+  })
+
+  it('长会话每次只向前展开 100 条并保持滚动锚点与按钮焦点', async () => {
+    const messages = Array.from({ length: 250 }, (_, index) => ({
+      id: `history-message-${index + 1}`,
+      role: 'assistant' as const,
+      content: `历史消息 ${index + 1}`,
+      createdAt: BASE_TIME,
+    }))
+    installFetchMock({
+      historyLists: [{
+        items: [historyListItem({
+          threadId: THREAD_ID,
+          title: '二百五十条会话',
+          lastSeq: 250,
+          messageCount: 250,
+        })],
+        nextCursor: null,
+      }],
+      historyDetails: {
+        [THREAD_ID]: historyDetail({
+          threadId: THREAD_ID,
+          title: '二百五十条会话',
+          lastSeq: 250,
+          snapshotSeq: 250,
+          messageCount: 250,
+          events: [],
+          snapshot: {
+            snapshotSeq: 250,
+            snapshotVersion: 3,
+            messages,
+            todos: [],
+            mode: 'default',
+            approval: null,
+            runStatus: 'idle',
+            activeRunId: null,
+            serverState: {},
+            runs: {},
+            interrupts: [],
+          },
+        }),
+      },
+    })
+    const user = userEvent.setup()
+    render(<App />)
+
+    expect(await screen.findByText('历史消息 250')).toBeInTheDocument()
+    expect(screen.queryByText('历史消息 150')).not.toBeInTheDocument()
+    expect(screen.getByText('历史消息 151')).toBeInTheDocument()
+    const pane = screen.getByRole('region', { name: '对话内容' })
+    Object.defineProperties(pane, {
+      clientHeight: { configurable: true, value: 500 },
+      scrollHeight: {
+        configurable: true,
+        get: () => document.querySelectorAll('.message-list > .message').length * 40,
+      },
+      scrollTop: { configurable: true, writable: true, value: 200 },
+    })
+    const loadEarlier = screen.getByRole('button', { name: '加载更早消息' })
+
+    await user.click(loadEarlier)
+
+    expect(await screen.findByText('历史消息 51')).toBeInTheDocument()
+    expect(screen.queryByText('历史消息 50')).not.toBeInTheDocument()
+    expect(loadEarlier).toHaveFocus()
+    expect(pane.scrollTop).toBe(4200)
   })
 
   it('pins a conversation through the sidebar context menu (PATCH + pinned group)', async () => {
@@ -1448,6 +1588,8 @@ describe('App', () => {
 
     const dialog = await screen.findByRole('dialog', { name: '重命名会话' })
     expect(dialog).toHaveClass('modal-dialog--action', 'has-input')
+    expect(document.querySelector('.app-shell')).toHaveAttribute('inert')
+    expect(document.querySelector('.app-shell')).toHaveAttribute('aria-hidden', 'true')
     expect(within(dialog).queryByText('输入一个便于在历史记录中识别的名称。')).not.toBeInTheDocument()
     const input = within(dialog).getByRole('textbox', { name: '会话名称' })
     await user.clear(input)
@@ -1548,20 +1690,109 @@ describe('App', () => {
     expect(screen.queryByRole('button', { name: '打开会话：会话3' })).not.toBeInTheDocument()
 
     await waitFor(() => expect(observerCallbacks.length).toBeGreaterThan(0))
+    const historyListCalls = () => fetchMock.mock.calls.filter(([input, init]) =>
+      fetchCallUrl(input).includes('/api/conversation/history')
+      && fetchCallMethod(input, init) === 'GET')
+    expect(historyListCalls()).toHaveLength(1)
+    await act(async () => {
+      observerCallbacks.at(-1)?.(
+        [{ isIntersecting: true } as IntersectionObserverEntry],
+        {} as IntersectionObserver,
+      )
+      await Promise.resolve()
+    })
+
+    expect(screen.queryByTestId('history-skeleton')).not.toBeInTheDocument()
+    expect(historyListCalls()).toHaveLength(2)
+    expect(await screen.findByRole('button', { name: '打开会话：会话3' })).toBeInTheDocument()
+    expect(historyListCalls()).toHaveLength(2)
+    expect(new URL(fetchCallUrl(historyListCalls()[1]![0])).searchParams.get('pageSize')).toBe('100')
+  })
+
+  it('keeps 300ms between consecutive cursor requests without delaying the first page', async () => {
+    const observerCallbacks = installHistoryIntersectionObserver()
+    const THIRD_THREAD_ID = 'thread-throttle-3'
+    const FOURTH_THREAD_ID = 'thread-throttle-4'
+    const FIFTH_THREAD_ID = 'thread-throttle-5'
+    const fetchMock = installFetchMock({
+      historyListResolver: (requestIndex) => {
+        if (requestIndex === 0) {
+          return {
+            items: [historyListItem({ threadId: THREAD_ID, title: '会话1' })],
+            nextCursor: 'cursor-throttle-2',
+          }
+        }
+        if (requestIndex === 1) {
+          return {
+            items: [historyListItem({ id: 3, threadId: THIRD_THREAD_ID, title: '会话3' })],
+            nextCursor: 'cursor-throttle-3',
+          }
+        }
+        if (requestIndex === 2) {
+          return {
+            items: [historyListItem({ id: 4, threadId: FOURTH_THREAD_ID, title: '会话4' })],
+            nextCursor: 'cursor-throttle-4',
+          }
+        }
+        return {
+          items: [historyListItem({ id: 5, threadId: FIFTH_THREAD_ID, title: '会话5' })],
+          nextCursor: null,
+        }
+      },
+      historyDetails: {
+        [THREAD_ID]: historyDetail({ threadId: THREAD_ID, title: '会话1' }),
+      },
+    })
+
+    const view = render(<App />)
+    expect(await screen.findByRole('button', { name: '打开会话：会话1' })).toBeInTheDocument()
+    await waitFor(() => expect(observerCallbacks.length).toBeGreaterThan(0))
+    const historyListCalls = () => fetchMock.mock.calls.filter(([input, init]) =>
+      fetchCallUrl(input).includes('/api/conversation/history')
+      && fetchCallMethod(input, init) === 'GET')
+
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] })
+    await act(async () => {
+      observerCallbacks.at(-1)?.(
+        [{ isIntersecting: true } as IntersectionObserverEntry],
+        {} as IntersectionObserver,
+      )
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(historyListCalls()).toHaveLength(2)
+    expect(screen.getByRole('button', { name: '打开会话：会话3' })).toBeInTheDocument()
+
+    act(() => observerCallbacks.at(-1)?.(
+      [{ isIntersecting: false } as IntersectionObserverEntry],
+      {} as IntersectionObserver,
+    ))
+    await act(async () => {
+      observerCallbacks.at(-1)?.(
+        [{ isIntersecting: true } as IntersectionObserverEntry],
+        {} as IntersectionObserver,
+      )
+      await Promise.resolve()
+    })
+    expect(screen.getByText('正在加载更多历史会话')).toBeInTheDocument()
+    await act(async () => { await vi.advanceTimersByTimeAsync(299) })
+    expect(historyListCalls()).toHaveLength(2)
+    await act(async () => { await vi.advanceTimersByTimeAsync(1) })
+    expect(historyListCalls()).toHaveLength(3)
+    expect(screen.getByRole('button', { name: '打开会话：会话4' })).toBeInTheDocument()
+
+    act(() => observerCallbacks.at(-1)?.(
+      [{ isIntersecting: false } as IntersectionObserverEntry],
+      {} as IntersectionObserver,
+    ))
     act(() => observerCallbacks.at(-1)?.(
       [{ isIntersecting: true } as IntersectionObserverEntry],
       {} as IntersectionObserver,
     ))
-
-    expect(screen.queryByText('正在加载更多历史会话')).not.toBeInTheDocument()
-    expect(screen.queryByTestId('history-skeleton')).not.toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: '打开会话：会话3' })).not.toBeInTheDocument()
-    expect(await screen.findByRole('button', { name: '打开会话：会话3' })).toBeInTheDocument()
-    const listCalls = fetchMock.mock.calls.filter(([input, init]) =>
-      fetchCallUrl(input).includes('/api/conversation/history')
-      && fetchCallMethod(input, init) === 'GET')
-    expect(listCalls).toHaveLength(2)
-
+    expect(screen.getByText('正在加载更多历史会话')).toBeInTheDocument()
+    view.unmount()
+    await act(async () => { await vi.advanceTimersByTimeAsync(300) })
+    expect(historyListCalls()).toHaveLength(3)
+    vi.useRealTimers()
   })
 
   it('使用后端模糊搜索独立分页，并在清空后恢复普通历史缓存', async () => {
@@ -1588,6 +1819,12 @@ describe('App', () => {
         if (cursor === 'search-cursor-2') {
           return {
             items: [historyListItem({ id: 12, threadId: SEARCH_THREAD_2, title: '目标会话二' })],
+            nextCursor: 'search-cursor-3',
+          }
+        }
+        if (cursor === 'search-cursor-3') {
+          return {
+            items: [historyListItem({ id: 13, threadId: 'thread-search-3', title: '不应加载的会话' })],
             nextCursor: null,
           }
         }
@@ -1598,7 +1835,7 @@ describe('App', () => {
       },
     })
     const user = userEvent.setup()
-    render(<App />)
+    const view = render(<App />)
 
     expect(await screen.findByRole('button', { name: '打开会话：普通缓存会话' })).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: '搜索会话' }))
@@ -1608,23 +1845,47 @@ describe('App', () => {
     expect(screen.queryByRole('button', { name: '打开会话：普通缓存会话' })).not.toBeInTheDocument()
 
     await waitFor(() => expect(observerCallbacks.length).toBeGreaterThan(1))
+    const historyListCalls = () => fetchMock.mock.calls.filter(([input, init]) =>
+      fetchCallUrl(input).includes('/api/conversation/history')
+      && fetchCallMethod(input, init) === 'GET')
+    expect(historyListCalls()).toHaveLength(2)
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] })
+    await act(async () => {
+      observerCallbacks.at(-1)?.(
+        [{ isIntersecting: true } as IntersectionObserverEntry],
+        {} as IntersectionObserver,
+      )
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(historyListCalls()).toHaveLength(3)
+    expect(screen.getByRole('button', { name: '打开会话：目标会话二' })).toBeInTheDocument()
+
+    act(() => observerCallbacks.at(-1)?.(
+      [{ isIntersecting: false } as IntersectionObserverEntry],
+      {} as IntersectionObserver,
+    ))
     act(() => observerCallbacks.at(-1)?.(
       [{ isIntersecting: true } as IntersectionObserverEntry],
       {} as IntersectionObserver,
     ))
-    expect(await screen.findByRole('button', { name: '打开会话：目标会话二' })).toBeInTheDocument()
+    expect(screen.getByText('正在加载更多历史会话')).toBeInTheDocument()
 
-    await user.click(screen.getByRole('button', { name: '清除搜索' }))
+    fireEvent.click(screen.getByRole('button', { name: '清除搜索' }))
+    await act(async () => { await vi.advanceTimersByTimeAsync(300) })
     expect(screen.getByRole('button', { name: '打开会话：普通缓存会话' })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: '打开会话：目标会话一' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '打开会话：不应加载的会话' })).not.toBeInTheDocument()
 
     const listUrls = fetchMock.mock.calls
       .map(([input]) => new URL(fetchCallUrl(input), 'http://localhost'))
       .filter((url) => url.pathname.endsWith('/api/conversation/history'))
+    expect(listUrls.map((url) => url.searchParams.get('pageSize'))).toEqual(['100', '100', '100'])
     expect(listUrls.filter((url) => !url.searchParams.has('query'))).toHaveLength(1)
     expect(listUrls.filter((url) => url.searchParams.get('query') === '目标').map((url) => (
       url.searchParams.get('cursor')
     ))).toEqual([null, 'search-cursor-2'])
+    view.unmount()
+    vi.useRealTimers()
   })
 
   it('loads each successful history cursor only once when the sentinel stays visible', async () => {
@@ -1725,7 +1986,7 @@ describe('App', () => {
     })
   })
 
-  it('keeps pagination failures silent and retries on the next deliberate bottom scroll', async () => {
+  it('shows pagination progress and recovers through the explicit retry action', async () => {
     const observerCallbacks: IntersectionObserverCallback[] = []
     vi.stubGlobal('IntersectionObserver', class {
       readonly root = null
@@ -1746,42 +2007,37 @@ describe('App', () => {
             nextCursor: 'cursor-failing',
           }
         }
-        throw new Error('page failed')
+        if (requestIndex === 1) throw new Error('page failed')
+        return {
+          items: [historyListItem({ id: 2, threadId: SECOND_THREAD_ID, title: '会话2' })],
+          nextCursor: null,
+        }
       },
       historyDetails: {
         [THREAD_ID]: historyDetail({ threadId: THREAD_ID, title: '会话1' }),
       },
     })
 
+    const user = userEvent.setup()
     render(<App />)
     expect(await screen.findByRole('button', { name: '打开会话：会话1' })).toBeInTheDocument()
     await waitFor(() => expect(observerCallbacks.length).toBeGreaterThan(0))
 
     act(() => observerCallbacks.at(-1)?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver))
+    expect(screen.getByText('正在加载更多历史会话')).toBeInTheDocument()
     await waitFor(() => {
       const failedCalls = fetchMock.mock.calls.filter(([input, init]) =>
         fetchCallUrl(input).includes('/api/conversation/history')
         && fetchCallMethod(input, init) === 'GET')
       expect(failedCalls).toHaveLength(2)
     })
-    expect(screen.queryByText('历史记录加载失败')).not.toBeInTheDocument()
-    expect(screen.queryByText('网络请求失败，请稍后重试。')).not.toBeInTheDocument()
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('历史记录加载失败')
 
-    // Observer 仍可见不会自动重试，必须等待下一次用户滚动批次
-    act(() => observerCallbacks.at(-1)?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver))
-    await new Promise((resolve) => window.setTimeout(resolve, 550))
-    const listCalls = fetchMock.mock.calls.filter(([input, init]) =>
-      fetchCallUrl(input).includes('/api/conversation/history')
-      && fetchCallMethod(input, init) === 'GET')
-    expect(listCalls).toHaveLength(2)
+    await user.click(within(alert).getByRole('button', { name: '重试加载历史' }))
 
-    fireEvent.scroll(screen.getByRole('region', { name: '最近对话' }))
-    await waitFor(() => {
-      const retriedCalls = fetchMock.mock.calls.filter(([input, init]) =>
-        fetchCallUrl(input).includes('/api/conversation/history')
-        && fetchCallMethod(input, init) === 'GET')
-      expect(retriedCalls).toHaveLength(3)
-    })
+    expect(await screen.findByRole('button', { name: '打开会话：会话2' })).toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
   })
 
   it('drains and invalidates queued stream frames before detaching', async () => {
@@ -1832,7 +2088,9 @@ describe('App', () => {
     await user.click(await screen.findByRole('button', { name: '停止任务' }))
 
     await waitFor(() => expect(screen.queryByRole('button', { name: '停止任务' })).not.toBeInTheDocument())
-    expect(screen.getAllByText(/聊天生成已取消/).length).toBeGreaterThan(0)
+    expect(document.querySelector('.conversation-notice.is-info')).toHaveTextContent('任务已停止')
+    expect(document.querySelector('.conversation-notice.is-error')).toBeNull()
+    expect(screen.queryByText('聊天生成已取消')).not.toBeInTheDocument()
   })
 
   it('does not offer an invalid cancel before the backend reports threadId', async () => {
@@ -1975,7 +2233,7 @@ describe('App', () => {
     }
     installFetchMock()
     render(<App />)
-    await screen.findByText('发送一条消息，开始新的真实对话流。')
+    await screen.findByText('发送一条消息，开始新的真实对话流')
     flushFrames()
     const pane = screen.getByLabelText('对话内容')
     Object.defineProperties(pane, {
@@ -1993,9 +2251,9 @@ describe('App', () => {
     expect(scrollButton).toHaveTextContent('回到底部')
     expect(scrollButton.querySelector('.lucide-arrow-down')).toBeInTheDocument()
     expect(pane.contains(scrollButton)).toBe(false)
-    const scrollbarOverlay = actionRail?.previousElementSibling
-    expect(scrollbarOverlay).toHaveClass('ui-scrollbar-overlay')
-    expect(scrollbarOverlay?.previousElementSibling).toBe(pane)
+    const scrollbar = actionRail?.previousElementSibling
+    expect(scrollbar).toHaveClass('ui-overlay-scrollbar')
+    expect(scrollbar?.previousElementSibling).toBe(pane)
 
     expect(screen.getByRole('button', { name: '回到底部' })).toBe(scrollButton)
     expect(scrollButton).toHaveClass('is-visible')
@@ -2107,17 +2365,6 @@ describe('App', () => {
           threadId: THREAD_ID,
           runId: FIRST_RUN_ID,
           title: '后端真实会话',
-          input: {
-            threadId: THREAD_ID,
-            runId: FIRST_RUN_ID,
-            state: {},
-            messages: [
-              { id: 'message-from-server', role: 'user', content: '你好' },
-            ],
-            tools: [],
-            context: [],
-            forwardedProps: { model: 'GPT-5.5', command: { plan: 'off' } },
-          },
         },
       ]],
       keepOpen: true,
@@ -2156,7 +2403,8 @@ describe('App', () => {
     expect(dialog).toHaveClass('modal-dialog--action', 'is-danger')
     expect(within(dialog).getByText(/仍在接收实时输出/)).toBeInTheDocument()
     expect(fetchMock.deleteCalls).toHaveLength(0)
-    expect(screen.getByRole('button', { name: '停止任务' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '停止任务' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '停止任务', hidden: true })).toBeInTheDocument()
 
     await user.click(within(dialog).getByRole('button', { name: '取消' }))
     expect(screen.queryByRole('dialog', { name: '删除会话' })).not.toBeInTheDocument()
@@ -2313,10 +2561,9 @@ describe('App', () => {
     expect(screen.getByText('Read')).toBeInTheDocument()
     expect(screen.getByText('Loaded url.json')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: '关闭任务详情' })).toBeInTheDocument()
-    const firstTodo = screen.getByRole('button', {
-      name: /步骤 1 · 已完成 读取 url\.json/,
-    })
-    expect(firstTodo.querySelector('.todo-arrow')).toBeNull()
+    const firstTodo = screen.getByLabelText('步骤 1 · 已完成').closest('.todo-item')
+    expect(firstTodo?.tagName).toBe('DIV')
+    expect(firstTodo?.querySelector('button')).toBeNull()
     expect(screen.queryByLabelText('计划')).not.toBeInTheDocument()
   })
 

@@ -97,6 +97,19 @@ messaging = Messaging(backend=backend)
 
 Redis persistent schema 5 is the only readable format. Schema 4 records require a new prefix or explicit cleanup before use. Schema 5 keeps trusted per-owner lease renewal counts and timestamps for postmortem diagnostics; these fields never enter envelopes or client output.
 
+## Capacity limits
+
+`MessagingLimits` is immutable and enforced by both built-in backends before durable
+mutation. Defaults are 16 MiB per encoded message, 1 MiB per checkpoint, 100,000
+messages per thread generation, and 1 GiB of encoded payload per thread generation.
+`delete_stream()` starts a new generation with empty counters.
+
+Redis stores the complete limits fingerprint in channel metadata and tracks
+`payload_bytes` atomically with append and idempotency. Every worker sharing a key prefix
+and channel must use the same limits. A mismatch fails without changing existing state;
+an idempotent retry of an already committed message succeeds even when the thread is now
+at its quota.
+
 ## Built-in codecs
 
 | API | Live input | Replay output |
@@ -112,6 +125,15 @@ A cancel callback accepts zero arguments or one `CancelContext(channel, identity
 
 `Messaging(settlement_timeout=...)` limits only the caller's wait. Protected producer, commit, callback, and close tasks remain owned and can be awaited again with `aclose()`.
 
+`cancel()` participates in the Messaging preflight lifecycle. Shutdown signals current
+producers before waiting for cancellation preflights, then settles producers and closes
+the borrowed backend boundary without leaving a control task to outlive the facade.
+Closing mapped and subscribed sources retains the underlying close task across caller
+cancellation.
+
+`read()` and `follow()` reject a cursor greater than the current generation tail with
+`InvalidCursor`; they never reinterpret it as an empty page or a future wait.
+
 ## Documentation
 
 - [Messaging basics](https://github.com/tinkerfin-ai/tinkerfin/blob/main/docs/en/messaging/index.md)
@@ -120,4 +142,5 @@ A cancel callback accepts zero arguments or one `CancelContext(channel, identity
 
 ## License
 
-Apache License 2.0. See the repository license.
+Apache License 2.0. See the
+[repository license](https://github.com/tinkerfin-ai/tinkerfin/blob/main/LICENSE).

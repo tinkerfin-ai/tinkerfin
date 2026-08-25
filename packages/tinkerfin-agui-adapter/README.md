@@ -58,8 +58,8 @@ asyncio.run(main())
 <!-- adapter-quick-start:end -->
 
 Production graph integration supplies `messages`, `tasks`, and `values` with
-`version="v2"` and `subgraphs=True`. `RUN_STARTED.input` is `None`; applications may
-enrich it with their own validated request. Graph input remains caller-owned.
+`version="v2"` and `subgraphs=True`. `RUN_STARTED.input` is omitted; transport input and
+Graph input remain caller-owned boundaries rather than duplicated event payloads.
 One conversion exclusively consumes and closes the supplied iterator.
 `astream_events()` already creates the main lifecycle, including its unique terminal;
 `AgUiLifecycleEventFactory` is for custom orchestrators that do not use this stream
@@ -117,8 +117,21 @@ reuses their already verified scoped `toolCallId` values and does not query a gr
 checkpointer. Never pass client-supplied interrupt payloads to that method.
 
 Both paths distinguish resolved, abandoned, and mixed decisions and never convert
-cancellation into rejection. `encode_sse(event, event_id=...)` encodes one event;
-delivery, persistence, retries, and transport cancellation remain caller-owned.
+cancellation into rejection. `ResumeTranslation.kind` distinguishes Tool review from a
+generic runtime interrupt. A `custom` Tool translation preserves every native group and
+cancelled slot for a cancellation-aware executor; stock Deep Agents cannot execute that
+shape. Persisted AG-UI Tool reviews also retain every scoped Tool ID and verified
+subagent source name needed by that executor. A `custom` generic runtime translation is
+not a Tool decision and must not be sent through Tool cancellation middleware.
+
+Edited Tool arguments are validated against the persisted `args_schema` using JSON
+Schema Draft 2020-12 before native resume data is produced. Custom runtime reasons must
+be a core reason or a namespaced extension such as `tinkerfin:plan_review` or
+`vendor:approval`; unknown unnamespaced reasons fail validation. Generic LangGraph
+interrupts use `langgraph:interrupt`.
+
+`encode_sse(event, event_id=...)` encodes one event; delivery, persistence, retries,
+custom mixed execution, and transport cancellation remain caller-owned.
 
 `RuntimeInterruptEnvelope` is intended for framework workflows such as Plan review.
 `ResumeMapper` validates trusted persisted correlation and full resume coverage, then

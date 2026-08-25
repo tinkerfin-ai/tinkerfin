@@ -115,6 +115,8 @@ class RecoverableMessage(Generic[ReplayT]):
     checkpoint: RecoveryCheckpoint
 
     def __post_init__(self) -> None:
+        """Require the checkpoint to name this exact recoverable message."""
+
         required_identifier("message_id", self.message_id)
         if self.checkpoint.last_message_id != self.message_id:
             raise ValueError("checkpoint.last_message_id must match message_id")

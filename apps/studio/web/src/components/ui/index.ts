@@ -10,11 +10,16 @@ export { Surface } from './Surface'
 export type { SurfaceElevation, SurfaceProps, SurfaceTone } from './Surface'
 export { TextField } from './TextField'
 export type { TextFieldProps, TextFieldShape, TextFieldSize } from './TextField'
-export { TransientScrollbar } from './TransientScrollbar'
-export type { TransientScrollbarProps } from './TransientScrollbar'
 export { MOTION_DURATION_MS, MOTION_DURATION_SECONDS } from './motion'
 export { Dialog } from './Dialog'
 export type { DialogProps } from './Dialog'
 export { UserAvatar } from './UserAvatar'
 export type { UserAvatarProps } from './UserAvatar'
+export { OverlayScrollbar } from './OverlayScrollbar'
+export type {
+  OverlayScrollbarAxis,
+  OverlayScrollbarProps,
+  OverlayScrollbarSize,
+  OverlayScrollbarVisibility,
+} from './OverlayScrollbar'
 export { useThemePreference } from './useThemePreference'

@@ -8,6 +8,7 @@ from uuid import NAMESPACE_URL, uuid5
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from tinkerfin import AgUiResumeBinding
 from tinkerfin_messaging import MessagingError
 from tinkerfin_studio.api.errors import BusinessException, ConversationErrorCode
 from tinkerfin_studio.conversation.coordinator import (
@@ -21,7 +22,6 @@ from tinkerfin_studio.conversation.models import (
 from tinkerfin_studio.conversation.repository import ConversationRepository
 from tinkerfin_studio.conversation.request import ChatRequest
 from tinkerfin_studio.conversation.run_preparation import (
-    PreparedResume,
     PreparedRunRequest,
     RegisteredRun,
     ResumeChatIntent,
@@ -37,7 +37,7 @@ class PreparedExecution:
 
     thread: ConversationThread
     registered: RegisteredRun
-    resume: PreparedResume | None
+    resume: AgUiResumeBinding | None
 
 
 class ConversationRunPreparer:
@@ -75,7 +75,7 @@ class ConversationRunPreparer:
             return thread
         if not isinstance(intent, StartChatIntent):
             raise BusinessException(ConversationErrorCode.USER_MESSAGE_REQUIRED)
-        # 公开 thread ID 保持现有确定性格式，内部 Identity 仍由用户 scope 隔离
+        # 服务端生成的 opaque thread 同时作为公开与持久执行身份
         generated_thread_id = "thread-" + str(
             uuid5(
                 NAMESPACE_URL,
@@ -151,14 +151,17 @@ class ConversationRunPreparer:
                     prepared=prepared,
                     thread=thread,
                 )
+            elif isinstance(intent, ResumeChatIntent):
+                claimed_ids = frozenset(entry.interrupt_id for entry in intent.entries)
+                claimed_interrupts = await self._existing_resume_interrupts(
+                    intent,
+                    prepared=prepared,
+                    thread=thread,
+                )
 
             resume = (
                 prepare_resume(
                     request,
-                    identity=prepared.identity,
-                    existing_config=(
-                        None if existing is None else existing.config_json
-                    ),
                     interrupts=claimed_interrupts,
                 )
                 if isinstance(intent, ResumeChatIntent)
@@ -167,20 +170,10 @@ class ConversationRunPreparer:
             created = False
             if existing is None:
                 existing, created = await self._create_run(
-                    request,
                     prepared=prepared,
                     model=model,
                     thread=thread,
-                    resume=resume,
                 )
-                if not created and isinstance(intent, ResumeChatIntent):
-                    claimed_ids = frozenset()
-                    resume = prepare_resume(
-                        request,
-                        identity=prepared.identity,
-                        existing_config=existing.config_json,
-                        interrupts=(),
-                    )
             self._require_same_input(existing, prepared)
             if created:
                 thread.last_model = model.model_id
@@ -234,6 +227,16 @@ class ConversationRunPreparer:
             thread_pk=thread.id
         )
         if claimed_ids != frozenset(entity.interrupt_id for entity in pending):
+            requested = await self._repository.list_interrupts_for_update(
+                thread_pk=thread.id,
+                interrupt_ids=claimed_ids,
+            )
+            if len(requested) == len(claimed_ids) and any(
+                entity.status != "pending"
+                or entity.resolved_run_id not in (None, prepared.identity.run_id)
+                for entity in requested
+            ):
+                raise BusinessException(ConversationErrorCode.RESUME_ALREADY_CLAIMED)
             raise BusinessException(
                 ConversationErrorCode.RESUME_REQUIRED,
                 message="resume 必须完整覆盖当前全部待审批项",
@@ -261,29 +264,65 @@ class ConversationRunPreparer:
             raise BusinessException(ConversationErrorCode.RESUME_ALREADY_CLAIMED)
         return claimed_ids, tuple(claimed), raced
 
+    async def _existing_resume_interrupts(
+        self,
+        intent: ResumeChatIntent,
+        *,
+        prepared: PreparedRunRequest,
+        thread: ConversationThread,
+    ) -> tuple[ConversationInterrupt, ...]:
+        """为同 run 重试读取原始审批事实并复核业务结算状态"""
+
+        interrupt_ids = frozenset(entry.interrupt_id for entry in intent.entries)
+        entities = await self._repository.list_interrupts_for_update(
+            thread_pk=thread.id,
+            interrupt_ids=interrupt_ids,
+        )
+        if {entity.interrupt_id for entity in entities} != interrupt_ids:
+            raise BusinessException(
+                ConversationErrorCode.RESUME_REQUIRED,
+                message="恢复 run 缺少完整的原始审批记录",
+            )
+        entries = {entry.interrupt_id: entry for entry in intent.entries}
+        for entity in entities:
+            if entity.resolved_run_id != prepared.identity.run_id:
+                raise BusinessException(ConversationErrorCode.RESUME_ALREADY_CLAIMED)
+            if entity.status == "pending":
+                continue
+            entry = entries[entity.interrupt_id]
+            expected_status = "cancelled" if entry.status == "cancelled" else "resolved"
+            expected_resume = entry.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude_none=False,
+            )
+            if (
+                entity.status != expected_status
+                or entity.resume_json != expected_resume
+            ):
+                raise BusinessException(ConversationErrorCode.RESUME_ALREADY_CLAIMED)
+        return tuple(entities)
+
     async def _create_run(
         self,
-        request: ChatRequest,
         *,
         prepared: PreparedRunRequest,
         model: AgentModelConfig,
         thread: ConversationThread,
-        resume: PreparedResume | None,
     ) -> tuple[ConversationRun, bool]:
-        public_thread_id = thread.thread_id
+        thread_id = thread.thread_id
         try:
             async with self._session.begin_nested():
                 created = await self._repository.create_main_run(
                     thread_id=thread.id,
                     run_id=prepared.identity.run_id,
-                    parent_run_id=request.parent_run_id,
+                    parent_run_id=prepared.parent_run_id,
                     model_id=model.model_id,
                     input_json=prepared.input_json,
                     config_json={
                         "thread_id": prepared.identity.thread_id,
                         "model_id": model.model_id,
                         "model_updated_at": model.updated_at,
-                        **({} if resume is None else resume.persisted_config),
                     },
                 )
                 return created, True
@@ -291,7 +330,7 @@ class ConversationRunPreparer:
             await self._repository.rollback()
             refreshed = await self._repository.get_thread(
                 user_id=self._user_id,
-                thread_id=public_thread_id,
+                thread_id=thread_id,
             )
             if refreshed is None:
                 raise

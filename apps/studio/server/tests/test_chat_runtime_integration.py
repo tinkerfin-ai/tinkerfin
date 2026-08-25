@@ -9,12 +9,20 @@ import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, MessagesState, StateGraph
-from langgraph.types import interrupt
+from langgraph.types import Command, interrupt
 from pydantic import SecretStr
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from tinkerfin import AgUiNativeStreamConfig, AgUiResumeBinding, Identity, TinkerFin
+from tinkerfin import (
+    AgUiEventStream,
+    AgUiNativeStreamConfig,
+    AgUiResumeBinding,
+    AgUiResumeCheckpoint,
+    Identity,
+    TinkerFin,
+)
 from tinkerfin.coordination import InMemoryRunCoordinator
 from tinkerfin_agui_adapter.ids import ScopedIdCodec
 from tinkerfin_messaging.agui import AgUiCodec
@@ -49,8 +57,9 @@ from tinkerfin_studio.resources import ApplicationResources
 class ProjectionProbe:
     """记录 chat 是否注册后台投影"""
 
-    def __init__(self) -> None:
+    def __init__(self, database: Database | None = None) -> None:
         self.runs: list[str] = []
+        self._database = database
 
     def ensure(self, *, thread_pk: int, identity: Identity) -> None:
         del thread_pk
@@ -59,6 +68,20 @@ class ProjectionProbe:
     async def reconcile(self, *, thread_pk: int, identity: Identity) -> int:
         del thread_pk, identity
         return 0
+
+    async def settle_resume(self, *, thread_pk, entries, checkpoint) -> None:
+        """在测试数据库中模拟生产 coordinator 的独立业务结算事务"""
+
+        if self._database is None:
+            return
+        async with self._database.session() as session:
+            await ConversationRepository(session).settle_claimed_interrupts(
+                thread_pk=thread_pk,
+                run_id=checkpoint.identity.run_id,
+                entries=entries,
+                resolution_id=checkpoint.marker_id,
+            )
+            await session.commit()
 
 
 def _persisted_tool_interrupt(
@@ -109,7 +132,7 @@ def _persisted_tool_interrupt(
 def _persisted_plan_interrupt(
     *,
     interrupt_id: str,
-    kind: str = "plan_review",
+    kind: str = "tinkerfin:plan_review",
 ) -> dict[str, object]:
     """构造 adapter 已验证并由服务端持久化的 Plan interrupt"""
 
@@ -172,7 +195,9 @@ def _patch_agent_graph(
         def new_agui(
             *,
             identity: Identity,
+            parent_run_id: str | None = None,
             resume: AgUiResumeBinding | None = None,
+            on_resume_checkpointed=None,
             expose_reasoning_events: bool = False,
             expose_subagent_events: bool = True,
             **options,
@@ -180,17 +205,60 @@ def _patch_agent_graph(
             del options
 
             class Runtime:
-                def astream(self, graph_input, config=None):
+                def astream(self, graph_input=None, config=None):
+                    if resume is not None and resume.mode == "abandon":
+
+                        async def empty_parts():
+                            if False:  # pragma: no cover - 保持异步迭代器形状
+                                yield {}
+
+                        stream = AgUiEventStream(
+                            parts=empty_parts(),
+                            identity=identity,
+                            parent_run_id=parent_run_id,
+                            expose_reasoning_events=expose_reasoning_events,
+                            expose_subagent_events=expose_subagent_events,
+                            prior_tool_call_ids=frozenset(),
+                            timeout=None,
+                            on_event=None,
+                        )
+                        stream._resume_abandoned = True
+                        return stream
                     if resume is not None:
-                        resume.validate_command(graph_input)
+                        if graph_input is not None:
+                            raise AssertionError("Resume Runtime 不接收 Graph input")
+                        graph_input = Command(resume=resume.resume_data)
                     invocation = AgUiNativeStreamConfig().bind(
                         graph.astream,
                         graph_input,
                         config=config,
                     )
+                    settlement_sent = False
+
+                    async def observe_part(_part) -> None:
+                        nonlocal settlement_sent
+                        if (
+                            settlement_sent
+                            or resume is None
+                            or on_resume_checkpointed is None
+                        ):
+                            return
+                        settlement_sent = True
+                        await on_resume_checkpointed(
+                            AgUiResumeCheckpoint(
+                                identity=identity,
+                                parent_run_id=parent_run_id,
+                                marker_id=f"test-checkpoint:{identity.run_id}",
+                                native_interrupt_ids=frozenset(
+                                    resume.native_interrupt_ids
+                                ),
+                            )
+                        )
+
                     run = factory._tinkerfin.run(
                         invocation,
                         identity=identity,
+                        on_part=observe_part,
                     )
                     return run.astream_agui(
                         expose_reasoning_events=expose_reasoning_events,
@@ -198,8 +266,9 @@ def _patch_agent_graph(
                         prior_tool_call_ids=(
                             frozenset()
                             if resume is None
-                            else resume.prior_tool_call_ids
+                            else frozenset(resume.prior_tool_call_ids)
                         ),
+                        parent_run_id=parent_run_id,
                     )
 
             return Runtime()
@@ -213,13 +282,9 @@ def _patch_agent_graph(
     )
 
 
-@pytest.mark.parametrize(
-    "prior_tool_call_ids",
-    [None, "not-a-list", ["tf:tool:valid-looking", 7]],
-)
-def test_persisted_resume_rejects_malformed_prior_tool_call_ids(
-    prior_tool_call_ids: object,
-) -> None:
+def test_prepare_resume_rejects_corrupt_persisted_interrupt_correlation() -> None:
+    """恢复只信任数据库保存的完整公开 interrupt"""
+
     request = ChatRequest.model_validate(
         {
             "threadId": "thread-1",
@@ -238,19 +303,35 @@ def test_persisted_resume_rejects_malformed_prior_tool_call_ids(
             ],
         }
     )
+    now = datetime.now(UTC).replace(tzinfo=None)
+    persisted = ConversationInterrupt(
+        conversation_thread_id=1,
+        run_id="run-review",
+        resolved_run_id="run-resume",
+        interrupt_id="interrupt-1",
+        status="pending",
+        reason="tool_call",
+        message="确认写入",
+        request_json={
+            **_persisted_tool_interrupt(
+                interrupt_id="interrupt-1",
+                tool_call_id="call-1",
+                tool_name="write_file",
+                args={"file_path": "/a.txt", "content": "a"},
+                allowed_decisions=["approve"],
+                message="确认写入",
+            ),
+            "toolCallId": "unscoped-call",
+        },
+        resume_json=None,
+        created_at=now,
+        resolved_at=None,
+        updated_at=now,
+    )
     with pytest.raises(BusinessException) as raised:
         prepare_resume(
             request,
-            identity=conversation_identity(7, "thread-1", "run-resume"),
-            existing_config={
-                "resume_data": {"decisions": [{"type": "approve"}]},
-                **(
-                    {}
-                    if prior_tool_call_ids is None
-                    else {"prior_tool_call_ids": prior_tool_call_ids}
-                ),
-            },
-            interrupts=(),
+            interrupts=(persisted,),
         )
 
     assert raised.value.error_code is ConversationErrorCode.RESUME_REQUIRED
@@ -284,7 +365,7 @@ def test_prepare_resume_abandons_plan_without_creating_a_graph_command() -> None
         resolved_run_id=None,
         interrupt_id=interrupt_id,
         status="pending",
-        reason="plan_review",
+        reason="tinkerfin:plan_review",
         message="请确认 Plan",
         request_json=_persisted_plan_interrupt(interrupt_id=interrupt_id),
         resume_json=None,
@@ -295,15 +376,79 @@ def test_prepare_resume_abandons_plan_without_creating_a_graph_command() -> None
 
     prepared = prepare_resume(
         request,
-        identity=conversation_identity(7, "thread-1", "run-disable-plan"),
-        existing_config=None,
         interrupts=(pending,),
     )
 
-    assert prepared.graph_input is None
-    assert prepared.binding is None
-    assert prepared.persisted_config == {"resume_abandoned": True}
-    assert prepared.claimed_interrupt_ids == frozenset({interrupt_id})
+    assert prepared.mode == "abandon"
+    assert prepared.resume_data is None
+    assert prepared.native_interrupt_ids == (interrupt_id,)
+
+
+def test_prepare_resume_accepts_mixed_tool_decisions_without_loss() -> None:
+    """Studio 只持久化框架 binding，不再固定拒绝标准 mixed resume"""
+
+    now = datetime.now(UTC).replace(tzinfo=None)
+    first_id = "mixed-first"
+    second_id = "mixed-second"
+    pending = tuple(
+        ConversationInterrupt(
+            conversation_thread_id=1,
+            run_id="run-interrupted",
+            resolved_run_id=None,
+            interrupt_id=interrupt_id,
+            status="pending",
+            reason="tool_call",
+            message="确认写入",
+            request_json=_persisted_tool_interrupt(
+                interrupt_id=interrupt_id,
+                tool_call_id=tool_call_id,
+                tool_name="write_file",
+                args={"file_path": path, "content": path},
+                allowed_decisions=["approve", "reject"],
+                message="确认写入",
+            ),
+            resume_json=None,
+            created_at=now,
+            resolved_at=None,
+            updated_at=now,
+        )
+        for interrupt_id, tool_call_id, path in (
+            (first_id, "call-first", "/first.txt"),
+            (second_id, "call-second", "/second.txt"),
+        )
+    )
+    request = ChatRequest.model_validate(
+        {
+            "threadId": "thread-1",
+            "runId": "run-mixed",
+            "state": {},
+            "messages": [],
+            "tools": [],
+            "context": [],
+            "forwardedProps": {"model": "main", "command": {"plan": "off"}},
+            "resume": [
+                {"interruptId": second_id, "status": "cancelled"},
+                {
+                    "interruptId": first_id,
+                    "status": "resolved",
+                    "payload": {"type": "approve"},
+                },
+            ],
+        }
+    )
+
+    prepared = prepare_resume(
+        request,
+        interrupts=pending,
+    )
+
+    assert prepared.contains_cancellations is True
+    assert prepared.resume_data == {
+        first_id: {"decisions": [{"type": "approve"}]},
+        second_id: {"decisions": [{"type": "tinkerfin_cancel"}]},
+    }
+    assert prepared.native_interrupt_ids == (first_id, second_id)
+    assert len(prepared.prior_tool_call_ids) == 2
 
 
 async def test_non_empty_thread_id_must_belong_to_the_current_user(
@@ -363,6 +508,35 @@ async def test_non_empty_thread_id_must_belong_to_the_current_user(
         )
         is None
     )
+
+
+async def test_canonical_thread_id_is_globally_unique_across_users(
+    session: AsyncSession,
+) -> None:
+    """公开 thread 作为 checkpoint 身份时不得在不同用户之间重复"""
+
+    repository = ConversationRepository(session)
+    await repository.create_thread(
+        user_id=7,
+        thread_id="thread-global",
+        title="用户一",
+        model_id="main",
+    )
+    await repository.commit()
+
+    with pytest.raises(IntegrityError):
+        await repository.create_thread(
+            user_id=8,
+            thread_id="thread-global",
+            title="用户二",
+            model_id="main",
+        )
+    await repository.rollback()
+
+    first = await repository.get_thread(user_id=7, thread_id="thread-global")
+    second = await repository.get_thread(user_id=8, thread_id="thread-global")
+    assert first is not None
+    assert second is None
 
 
 async def test_chat_does_not_filter_optional_deep_agent_state_channels(
@@ -476,13 +650,7 @@ async def test_chat_does_not_filter_optional_deep_agent_state_channels(
     assert [thread.thread_id for thread in stored_threads] == [prepared.thread_id]
     assert events[0]["threadId"] == prepared.thread_id
     assert events[0]["title"] == "你好"
-    assert events[0]["input"]["threadId"] == prepared.thread_id
-    assert len(events[0]["input"]["messages"]) == 1
-    started_user_message = events[0]["input"]["messages"][0]
-    assert set(started_user_message) == {"id", "role", "content"}
-    assert started_user_message["role"] == "user"
-    assert started_user_message["content"] == "你好"
-    assert started_user_message["id"].startswith("message-")
+    assert "input" not in events[0]
 
 
 async def test_concurrent_empty_thread_retries_share_one_thread_and_run(
@@ -607,7 +775,7 @@ async def test_concurrent_resume_claims_one_interrupt_for_exactly_one_run(
         disabled=False,
     )
     thread_id = "thread-concurrent-resume"
-    stream = f"users/{user.user_id}/threads/{thread_id}"
+    stream = thread_id
     now = datetime.now(UTC).replace(tzinfo=None)
     async with database.session() as setup_session:
         await AgentModelService(AgentModelRepository(setup_session)).upsert(
@@ -800,7 +968,7 @@ async def test_concurrent_resume_claims_one_interrupt_for_exactly_one_run(
         )
         for run_id in ("run-resume-a", "run-resume-b")
     )
-    probe = ProjectionProbe()
+    probe = ProjectionProbe(database)
     async with Messaging(backend=MemoryBackend()) as messaging:
         resources = cast(
             ApplicationResources,
@@ -881,6 +1049,7 @@ async def test_concurrent_resume_claims_one_interrupt_for_exactly_one_run(
 
 async def test_plan_abandon_claim_blocks_a_competing_resolved_resume(
     database: Database,
+    monkeypatch,
 ) -> None:
     """Plan abandon 与正常恢复竞争时只能有一个 run 获得 interrupt"""
 
@@ -921,7 +1090,7 @@ async def test_plan_abandon_claim_blocks_a_competing_resolved_resume(
                 resolved_run_id=None,
                 interrupt_id=interrupt_id,
                 status="pending",
-                reason="plan_review",
+                reason="tinkerfin:plan_review",
                 message="请确认 Plan",
                 request_json=_persisted_plan_interrupt(interrupt_id=interrupt_id),
                 resume_json=None,
@@ -957,6 +1126,13 @@ async def test_plan_abandon_claim_blocks_a_competing_resolved_resume(
 
     abandon = resume_request(run_id="run-abandon", cancelled=True)
     approve = resume_request(run_id="run-approve", cancelled=False)
+
+    async def unused_stream(*args, **kwargs):
+        del args, kwargs
+        if False:  # pragma: no cover - abandon 不调用 Graph
+            yield {}
+
+    _patch_agent_graph(monkeypatch, SimpleNamespace(astream=unused_stream))
     async with Messaging(backend=MemoryBackend()) as messaging:
         resources = cast(
             ApplicationResources,
@@ -1023,10 +1199,16 @@ async def test_plan_abandon_claim_blocks_a_competing_resolved_resume(
     assert abandon_run is not None
     abandon_config = abandon_run.config_json
     assert abandon_config is not None
-    assert abandon_config["thread_id"] == (f"users/{user.user_id}/threads/{thread_id}")
+    assert abandon_config["thread_id"] == thread_id
     assert abandon_config["model_id"] == "main"
-    assert abandon_config["resume_abandoned"] is True
-    assert "resume_data" not in abandon_config
+    assert not {
+        "resume_abandoned",
+        "resume_data",
+        "prior_tool_call_ids",
+        "native_interrupt_ids",
+        "source_agent_names",
+        "unidentified_external_source",
+    }.intersection(abandon_config)
     assert approve_run is None
 
 
@@ -1044,7 +1226,7 @@ async def test_concurrent_same_run_resume_attaches_without_reopening_agent(
         disabled=False,
     )
     thread_id = "thread-concurrent-same-resume"
-    stream = f"users/{user.user_id}/threads/{thread_id}"
+    stream = thread_id
     async with database.session() as setup_session:
         await AgentModelService(AgentModelRepository(setup_session)).upsert(
             AgentModelWrite(
@@ -1225,7 +1407,7 @@ async def test_concurrent_same_run_resume_attaches_without_reopening_agent(
             ],
         }
     )
-    probe = ProjectionProbe()
+    probe = ProjectionProbe(database)
     async with Messaging(backend=MemoryBackend()) as messaging:
         resources = cast(
             ApplicationResources,
@@ -1283,9 +1465,18 @@ async def test_concurrent_same_run_resume_attaches_without_reopening_agent(
     assert len(stored_runs) == 1
 
 
+@pytest.mark.parametrize(
+    "resume_entry",
+    (
+        {"status": "resolved", "payload": {"type": "approve"}},
+        {"status": "cancelled"},
+    ),
+    ids=("resolved", "abandoned"),
+)
 async def test_resume_preflight_failure_releases_interrupt_claim(
     session: AsyncSession,
     monkeypatch,
+    resume_entry: dict[str, object],
 ) -> None:
     """Messaging 拒绝启动时不得遗留无主 run 的审批认领"""
 
@@ -1354,12 +1545,10 @@ async def test_resume_preflight_failure_releases_interrupt_claim(
             del args, kwargs
             raise RunAlreadyActive(
                 active_identity=conversation_identity(
-                    7,
                     "thread-preflight-failure",
                     "run-active",
                 ),
                 requested_identity=conversation_identity(
-                    7,
                     "thread-preflight-failure",
                     "run-preflight",
                 ),
@@ -1392,8 +1581,7 @@ async def test_resume_preflight_failure_releases_interrupt_claim(
             "resume": [
                 {
                     "interruptId": interrupt_id,
-                    "status": "resolved",
-                    "payload": {"type": "approve"},
+                    **resume_entry,
                 }
             ],
         }
@@ -1647,10 +1835,13 @@ async def test_resume_requires_every_pending_interrupt_before_creating_run(
     )
     assert complete_run is not None
     assert complete_run.config_json is not None
-    assert complete_run.config_json["resume_data"] == {
-        first_id: {"decisions": [{"type": "reject"}]},
-        second_id: {"decisions": [{"type": "approve"}]},
-    }
+    assert not {
+        "resume_data",
+        "prior_tool_call_ids",
+        "native_interrupt_ids",
+        "source_agent_names",
+        "unidentified_external_source",
+    }.intersection(complete_run.config_json)
 
 
 @pytest.mark.parametrize(
@@ -2036,15 +2227,11 @@ async def test_completed_run_attachment_preflight_does_not_hold_the_thread_trans
             thread_id=thread.id,
             run_id=request.run_id,
             model_id="main",
-            input_json=request.normalized(
+            input_json=request.normalized_json(
                 thread_id=thread_id,
                 message_ids=(message_id,),
-            ).model_dump(
-                mode="json",
-                by_alias=True,
-                exclude_none=False,
             ),
-            config_json={"thread_id": f"users/{user.user_id}/threads/{thread_id}"},
+            config_json={"thread_id": thread_id},
         )
         run.status = "success"
         run.finished_at = datetime.now(UTC).replace(tzinfo=None)
@@ -2274,7 +2461,7 @@ async def test_immediate_resume_reconciles_committed_interrupt_before_claim(
 
     _patch_agent_graph(monkeypatch, graph)
     backend = MemoryBackend()
-    probe = ProjectionProbe()
+    probe = ProjectionProbe(database)
     async with Messaging(backend=backend) as messaging:
         channel = messaging.channel(
             name="studio-conversation-agui",
@@ -2370,6 +2557,7 @@ async def test_immediate_resume_reconciles_committed_interrupt_before_claim(
                         conversation_projector=SimpleNamespace(
                             ensure=projector.ensure,
                             reconcile=reconcile_without_transaction,
+                            settle_resume=projector.settle_resume,
                         ),
                     ),
                 )

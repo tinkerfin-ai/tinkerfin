@@ -20,12 +20,19 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.store.base import BaseStore
-from langgraph.types import interrupt
+from langgraph.types import StateSnapshot, interrupt
 from langgraph.typing import ContextT
 from pydantic import JsonValue, TypeAdapter
 
-from tinkerfin_agui_adapter import RuntimeInterruptEnvelope
+from tinkerfin_agui_adapter import Identity, RuntimeInterruptEnvelope
 
+from .._agui_lineage import (
+    CHECKPOINT_ROLE_METADATA_KEY,
+    PARENT_RUN_ID_METADATA_KEY,
+    PLANNING_CHECKPOINT_ROLE,
+    RUN_ID_METADATA_KEY,
+)
+from .._agui_lineage_state import lineage_state_update
 from ._clarification import restore_form, serialize_form
 from ._config import PlanOptions
 from ._content import serialize_plan_content
@@ -58,6 +65,7 @@ from .models import (
     PendingClarification,
     PlanContentModel,
     PlanHandoff,
+    PlanHandoffPhase,
     PlanReviewAction,
     PlanState,
     PlanStatus,
@@ -91,6 +99,13 @@ class _CompiledPlanningRuntime(Protocol):
         as_node: str | None = None,
         task_id: str | None = None,
     ) -> RunnableConfig: ...
+
+    async def aget_state(
+        self,
+        config: RunnableConfig,
+        *,
+        subgraphs: bool = False,
+    ) -> StateSnapshot: ...
 
 
 _SyncPlanNode: TypeAlias = Callable[
@@ -261,13 +276,46 @@ def _planning_config(value: object) -> RunnableConfig:
     else:
         raise TypeError("config.configurable must be a mapping")
     existing = configurable.get("run_id")
-    if existing not in (None, PLAN_CHECKPOINT_RUN_ID):
+    semantic_run_id = configurable.get(RUN_ID_METADATA_KEY)
+    if semantic_run_id is None and existing not in (None, PLAN_CHECKPOINT_RUN_ID):
         raise PlanModeConfigurationError(
             "Plan Mode reserves config.configurable['run_id'] for Planning checkpoints"
         )
+    if semantic_run_id is not None and (
+        not isinstance(semantic_run_id, str) or not semantic_run_id
+    ):
+        raise PlanModeConfigurationError(
+            "Plan Mode requires a canonical AG-UI semantic run ID"
+        )
     configurable["run_id"] = PLAN_CHECKPOINT_RUN_ID
+    configurable[CHECKPOINT_ROLE_METADATA_KEY] = PLANNING_CHECKPOINT_ROLE
     config["configurable"] = configurable
     return config
+
+
+def _planning_lineage_update(config: RunnableConfig) -> dict[str, object]:
+    configurable = config.get("configurable", {})
+    run_id = configurable.get(RUN_ID_METADATA_KEY)
+    if run_id is None:
+        return {}
+    thread_id = configurable.get("thread_id")
+    parent_run_id = configurable.get(PARENT_RUN_ID_METADATA_KEY)
+    if not isinstance(thread_id, str) or not isinstance(run_id, str):
+        raise PlanModeConfigurationError(
+            "Plan Mode requires canonical AG-UI lineage identifiers"
+        )
+    if parent_run_id is not None and not isinstance(parent_run_id, str):
+        raise PlanModeConfigurationError(
+            "Plan Mode requires a canonical AG-UI parent run ID"
+        )
+    return cast(
+        dict[str, object],
+        lineage_state_update(
+            identity=Identity(threadId=thread_id, runId=run_id),
+            parent_run_id=parent_run_id,
+            role="planning",
+        ),
+    )
 
 
 def _create_handoff(
@@ -329,24 +377,52 @@ class PlanningWorkflowGraph(Generic[ContextT]):
         bound.arguments["config"] = _planning_config(bound.arguments.get("config"))
         return self._graph.astream(*bound.args, **bound.kwargs)
 
-    async def mark_handoff_dispatched(
+    async def aget_state(self, config: RunnableConfig) -> StateSnapshot:
+        """Read the current Planning checkpoint without changing ownership."""
+
+        return await self._graph.aget_state(_planning_config(config))
+
+    async def mark_handoff_phase(
         self,
         config: RunnableConfig,
         plan: PlanState[PlanContentModel],
+        *,
+        phase: PlanHandoffPhase,
+        native_checkpoint_id: str,
+        completed_checkpoint_id: str | None = None,
     ) -> PlanState[PlanContentModel]:
-        """Synchronously commit the exactly-once native dispatch boundary."""
+        """Synchronously commit verified native checkpoint progress."""
 
         handoff = plan.handoff
         if plan.status is not PlanStatus.APPROVED or handoff is None:
-            raise RuntimeError("only an approved Plan can dispatch a native handoff")
-        if handoff.dispatched:
+            raise RuntimeError("only an approved Plan can advance a native handoff")
+        if handoff.phase is phase:
             return plan
+        expected = {
+            PlanHandoffPhase.PENDING: PlanHandoffPhase.ACCEPTED,
+            PlanHandoffPhase.ACCEPTED: PlanHandoffPhase.COMPLETED,
+        }.get(handoff.phase)
+        if phase is not expected:
+            raise RuntimeError(
+                f"invalid Plan handoff transition: {handoff.phase} -> {phase}"
+            )
         updated = plan.model_copy(
-            update={"handoff": handoff.model_copy(update={"dispatched": True})}
+            update={
+                "handoff": handoff.model_copy(
+                    update={
+                        "phase": phase,
+                        "native_checkpoint_id": native_checkpoint_id,
+                        "completed_checkpoint_id": completed_checkpoint_id,
+                    }
+                )
+            }
         )
         await self._graph.aupdate_state(
             _planning_config(config),
-            plan_state_update(updated),
+            {
+                **plan_state_update(updated),
+                **_planning_lineage_update(config),
+            },
             as_node="review_plan",
         )
         return updated
@@ -526,7 +602,7 @@ class _PlanningGraphFactory(Generic[ContextT]):
                 clarification=PlanClarificationPayload(form=pending.form),
             )
             envelope = RuntimeInterruptEnvelope(
-                kind="plan_clarification",
+                kind="tinkerfin:plan_clarification",
                 message="Answer required questions and optionally refine the Plan.",
                 response_schema=_json_schema(CLARIFICATION_RESPONSE),
                 metadata=_JSON_OBJECT.validate_python(
@@ -622,7 +698,7 @@ class _PlanningGraphFactory(Generic[ContextT]):
                 )
             )
             envelope = RuntimeInterruptEnvelope(
-                kind="plan_review",
+                kind="tinkerfin:plan_review",
                 message="Review the proposed Plan before execution begins.",
                 response_schema=_json_schema(self._options.contracts.review_response),
                 metadata=_JSON_OBJECT.validate_python(

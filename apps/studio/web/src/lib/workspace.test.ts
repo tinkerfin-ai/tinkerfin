@@ -43,7 +43,6 @@ function conversation(
         ]
       : [],
     todos: [],
-    plan: null,
     runStatus: 'idle' as const,
     isHydrated: true,
   }

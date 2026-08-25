@@ -17,6 +17,7 @@ import {
   saveAuthSession,
   startAuthSessionLifecycle,
   subscribeAuthSession,
+  AuthSessionStorageError,
 } from './auth/session'
 import { writeThreadToLocation } from './lib/threadRoute'
 import { clearActiveRunSession } from './features/conversation/stream/activeRunSession'
@@ -123,6 +124,8 @@ export default function App() {
           } catch (error) {
             if (error instanceof AuthError) {
               setLoginError(error.message)
+            } else if (error instanceof AuthSessionStorageError) {
+              setLoginError(t('浏览器无法保存登录状态，请检查隐私或存储设置后重试'))
             } else if (!(error instanceof ApiError)) {
               pushToast('error', t('登录失败，请稍后重试'))
             }

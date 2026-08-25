@@ -31,6 +31,10 @@ cancelled = await channel.cancel(identity=identity)
 
 TinkerFin 的 AG-UI 流已经提供取消能力，直接把该流交给 Messaging 时通常不用传 `cancel=`。
 
+`cancel()` 属于 Messaging preflight 生命周期，不能越过 facade 关闭后继续访问 borrowed backend。
+关闭时，Messaging 会先通知当前 producer，再等待 cancel preflight 与 producer settlement，避免两条
+路径形成等待环。
+
 | 结果或错误 | 含义 |
 | --- | --- |
 | `True` | 已请求取消活跃生产者 |
@@ -120,6 +124,9 @@ mapped = map_source(source, enrich)
 `FiniteMessageSource` 适合已知的有限事件。`map_source()` 可以使用同步或异步转换函数，并保持原 source 的顺序、背压、取消尾部和关闭行为。
 
 转换后类型可能改变，因此 `map_source()` 的结果不会继续声明原来的内置 codec；使用它时给 channel 显式配置 codec。
+
+mapped source 或 subscription 关闭时，即使调用方被取消，底层 close task 仍由对象持有。后续
+`aclose()` 会等待同一 task；backend iterator 不会在 close 尚未完成时丢失。
 
 ## 进程失效后恢复 source
 

@@ -443,6 +443,8 @@ async def start(self: SQLAlchemyOpenSandboxState, *, warm_pool_size: int) -> Non
         OpenSandboxStateError: The State is closed or cannot initialize safely.
         ValueError: The capacity is negative.
     """
+    if isinstance(warm_pool_size, bool) or not isinstance(warm_pool_size, int):
+        raise TypeError("warm_pool_size must be an integer")
     if warm_pool_size < 0:
         raise ValueError("warm_pool_size must not be negative")
     async with self._start_lock:

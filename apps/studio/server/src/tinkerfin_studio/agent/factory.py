@@ -19,13 +19,12 @@ from langchain.agents.middleware.types import InputAgentState
 from langchain.chat_models.base import init_chat_model
 from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import BaseTool
-from langgraph.types import Command
 from pydantic import BaseModel, ConfigDict, Field, RootModel
 
 from tinkerfin import (
     AgUiEventStream,
     AgUiResumeBinding,
-    DeepAgentAgUiRuntime,
+    AgUiResumeCheckpointObserver,
     DeepAgentDefinition,
     TinkerFin,
 )
@@ -41,7 +40,7 @@ from tinkerfin_studio.agent.plan_clarification import StudioPlanClarificationFor
 from tinkerfin_studio.agent.tools import build_web_search_tool
 from tinkerfin_studio.conversation.run_preparation import (
     PreparedRunRequest,
-    enrich_main_event,
+    decorate_main_event,
 )
 from tinkerfin_studio.models.schemas import AgentModelConfig
 
@@ -142,10 +141,11 @@ class ConversationAgentFactory:
         *,
         user_id: int,
         model_config: AgentModelConfig,
-        graph_input: InputAgentState | Command,
+        graph_input: InputAgentState | None,
         prepared: PreparedRunRequest,
         resume: AgUiResumeBinding | None,
         title: str,
+        on_resume_checkpointed: AgUiResumeCheckpointObserver | None = None,
     ) -> ProfiledDeferredMessageSource[BaseEvent, BaseEvent]:
         """返回仅由 Messaging producer owner 打开的 AG-UI 事件源"""
 
@@ -155,20 +155,37 @@ class ConversationAgentFactory:
                     user_id=user_id,
                     model_config=model_config,
                 )
-                runtime: DeepAgentAgUiRuntime[None] = await to_thread.run_sync(
-                    partial(
-                        definition.new_agui,
-                        identity=prepared.identity,
-                        mode=prepared.mode,
-                        resume=resume,
-                        expose_reasoning_events=False,
-                        expose_subagent_events=True,
+                if resume is None:
+                    if graph_input is None:
+                        raise RuntimeError("普通运行缺少 Graph 输入")
+                    ordinary_runtime = await to_thread.run_sync(
+                        partial(
+                            definition.new_agui,
+                            identity=prepared.identity,
+                            parent_run_id=prepared.parent_run_id,
+                            mode=prepared.mode,
+                            expose_reasoning_events=False,
+                            expose_subagent_events=True,
+                        )
                     )
-                )
-                agent_events = runtime.astream(
-                    graph_input,
-                    config=prepared.graph_config,
-                )
+                    agent_events = ordinary_runtime.astream(
+                        graph_input,
+                        config=prepared.graph_config,
+                    )
+                else:
+                    resume_runtime = await to_thread.run_sync(
+                        partial(
+                            definition.new_agui,
+                            identity=prepared.identity,
+                            parent_run_id=prepared.parent_run_id,
+                            mode=prepared.mode,
+                            resume=resume,
+                            on_resume_checkpointed=on_resume_checkpointed,
+                            expose_reasoning_events=False,
+                            expose_subagent_events=True,
+                        )
+                    )
+                    agent_events = resume_runtime.astream(config=prepared.graph_config)
             except asyncio.CancelledError:
                 raise
             except Exception as error:
@@ -176,12 +193,13 @@ class ConversationAgentFactory:
                 agent_events = AgUiEventStream.from_initialization_error(
                     error,
                     identity=prepared.identity,
+                    parent_run_id=prepared.parent_run_id,
                 )
 
             def attach_run_metadata(event: BaseEvent) -> BaseEvent:
                 """发布服务端会话元数据"""
 
-                return enrich_main_event(event, prepared=prepared, title=title)
+                return decorate_main_event(event, prepared=prepared, title=title)
 
             return MessageSourceBinding(
                 source=map_source(agent_events, attach_run_metadata),

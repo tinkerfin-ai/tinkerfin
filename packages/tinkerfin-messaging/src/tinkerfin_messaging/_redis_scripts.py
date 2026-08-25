@@ -18,6 +18,10 @@ local owner_token = ARGV[7]
 local lease_ms = ARGV[8]
 local requested_channel = ARGV[9]
 local requested_stream = ARGV[10]
+local max_message_payload_bytes = ARGV[11]
+local max_checkpoint_bytes = ARGV[12]
+local max_thread_messages = ARGV[13]
+local max_thread_payload_bytes = ARGV[14]
 local schema_version = '5'
 
 local function schema_mismatch(key, kind)
@@ -104,7 +108,16 @@ if not stored_codec then
     redis.call('HSET', channel_meta,
         'channel', requested_channel,
         'codec', requested_codec,
+        'max_message_payload_bytes', max_message_payload_bytes,
+        'max_checkpoint_bytes', max_checkpoint_bytes,
+        'max_thread_messages', max_thread_messages,
+        'max_thread_payload_bytes', max_thread_payload_bytes,
         'schema_version', schema_version)
+elseif redis.call('HGET', channel_meta, 'max_message_payload_bytes') ~= max_message_payload_bytes
+    or redis.call('HGET', channel_meta, 'max_checkpoint_bytes') ~= max_checkpoint_bytes
+    or redis.call('HGET', channel_meta, 'max_thread_messages') ~= max_thread_messages
+    or redis.call('HGET', channel_meta, 'max_thread_payload_bytes') ~= max_thread_payload_bytes then
+    return {'LIMITS_MISMATCH'}
 end
 
 if activate_generation then
@@ -123,6 +136,7 @@ redis.call('HSET', meta,
     'generation', tostring(requested_generation),
     'seq', tostring(latest),
     'schema_version', schema_version)
+redis.call('HSETNX', meta, 'payload_bytes', '0')
 redis.call('SADD', key_index, meta)
 
 if redis.call('EXISTS', run_key) == 1 then
@@ -251,6 +265,8 @@ local signature = ARGV[8]
 local checkpoint_present = ARGV[9]
 local checkpoint_position = ARGV[10]
 local checkpoint_message_id = ARGV[11]
+local max_thread_messages = tonumber(ARGV[12])
+local max_thread_payload_bytes = tonumber(ARGV[13])
 local expected_owner = owner_token .. ':' .. fence
 
 if redis.call('HGET', control, 'state') ~= 'active' or redis.call('HGET', control, 'generation') ~= generation then
@@ -285,7 +301,17 @@ if existing_signature then
     }
 end
 
+local latest = tonumber(redis.call('HGET', meta, 'seq') or '0')
+local payload_bytes = tonumber(redis.call('HGET', meta, 'payload_bytes') or '0')
+if latest >= max_thread_messages then
+    return {'QUOTA_EXCEEDED', 'thread_messages', tostring(max_thread_messages)}
+end
+if payload_bytes + string.len(payload) > max_thread_payload_bytes then
+    return {'QUOTA_EXCEEDED', 'thread_payload_bytes', tostring(max_thread_payload_bytes)}
+end
+
 local seq = redis.call('HINCRBY', meta, 'seq', 1)
+redis.call('HINCRBY', meta, 'payload_bytes', string.len(payload))
 local now = redis.call('TIME')
 local created_seconds = now[1]
 local created_microseconds = now[2]

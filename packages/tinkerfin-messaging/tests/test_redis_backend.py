@@ -25,6 +25,8 @@ from tinkerfin_messaging import (
     MessageSubscription,
     Messaging,
     MessagingBackendProtocolError,
+    MessagingLimits,
+    MessagingQuotaExceeded,
     PreparedRun,
     RecoverableMessage,
     RecoveryCheckpoint,
@@ -41,14 +43,14 @@ _XReadResponse = list[tuple[bytes, list[_RedisStreamEntry]]]
 _RedisT = TypeVar("_RedisT", bound=Redis)
 
 _REDIS_SCRIPT_DIGESTS = {
-    "_APPEND_SCRIPT": "8bdd4bf46ac3554501e679a4d4c55caea17af9560a3254ef98a77314b5222868",
+    "_APPEND_SCRIPT": "34b6443e16fd55fe6cb0cfcc11ab893f4ac18c8cccf34be80e26651602b60525",
     "_BEGIN_DELETE_SCRIPT": "3a22ee94dd7437c196a2bbd5d7ab30f597144d0dd39075a25fdc86470fc9e6e5",
     "_BEGIN_SETTLEMENT_SCRIPT": "554621573ed7a50c3b5ea0be5bb7166f051d2fdba213db0493423a84f5423414",
     "_CANCEL_SCRIPT": "c4d82de1405dffc62a13ec7efbc11790e5bcab99c746b02fb8cb397ad59fce09",
     "_DELETE_BATCH_SCRIPT": "e0a233eb4d17f70abb3ef4f2afda18007e267c065d7b62dc413ea0c80f37cc82",
     "_FINALIZE_DELETE_SCRIPT": "60dba88f869c6584a5c9d9eb036c3aa9336010238a892da2e2fca6ff8008782c",
     "_FINISH_SCRIPT": "7e020d232d28d30e75551c5661e30ad3b5abc04c6e169a7028abd5f3484b687e",
-    "_PREPARE_SCRIPT": "25db105c1513c8deb41904b7d8e57351441850e00809c358d821cfc5c5b9baa9",
+    "_PREPARE_SCRIPT": "1c130f5909648c72f120f1ea618b1f9379047d800c326b929da9f9c0ebe0ab09",
     "_RENEW_SCRIPT": "90a2c24ed5f4e9c64f84a41fa6b4bc69e03206c5df48c5f75ec4b66be6c62113",
     "_RUN_SNAPSHOT_SCRIPT": "819a51a0d3701da3d65578a3ddc30bac30610581e02abca437557a54bc272dce",
 }
@@ -1279,6 +1281,10 @@ async def test_real_redis_persists_channel_and_stream_metadata_separately(
     assert channel_meta == {
         b"channel": b"events",
         b"codec": b"test.bytes.v1",
+        b"max_checkpoint_bytes": b"1048576",
+        b"max_message_payload_bytes": b"16777216",
+        b"max_thread_messages": b"100000",
+        b"max_thread_payload_bytes": b"1073741824",
         b"schema_version": b"5",
     }
     controls = [
@@ -1305,6 +1311,7 @@ async def test_real_redis_persists_channel_and_stream_metadata_separately(
     assert all(metadata[b"channel"] == b"events" for metadata in stream_metadata)
     assert all(metadata[b"generation"] == b"1" for metadata in stream_metadata)
     assert all(metadata[b"seq"] == b"1" for metadata in stream_metadata)
+    assert all(metadata[b"payload_bytes"] == b"9" for metadata in stream_metadata)
     assert all(metadata[b"schema_version"] == b"5" for metadata in stream_metadata)
 
     run_metadata = [
@@ -1347,6 +1354,172 @@ async def test_real_redis_persists_channel_and_stream_metadata_separately(
         assert fields[b"kind"] == b"finish"
         assert fields[b"generation"] == b"1"
         assert fields[b"run"] in {b"run-1", b"run-2"}
+
+
+async def test_real_redis_enforces_thread_quotas_after_idempotency(
+    redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+) -> None:
+    _, _, client = redis_backends
+    message_prefix = f"tfmsg:quota-messages:{uuid4().hex}"
+    payload_prefix = f"tfmsg:quota-payload:{uuid4().hex}"
+    try:
+        message_backend = RedisBackend(
+            client,
+            key_prefix=message_prefix,
+            limits=MessagingLimits(
+                max_message_payload_bytes=4,
+                max_checkpoint_bytes=2,
+                max_thread_messages=2,
+                max_thread_payload_bytes=6,
+            ),
+        )
+        prepared = await message_backend.prepare(
+            channel="events",
+            identity=_identity(),
+            codec="test.bytes.v1",
+            after=0,
+            cancellable=False,
+            recoverable=False,
+        )
+        first = await message_backend.append(
+            prepared.handle,
+            message_id="first",
+            codec="test.bytes.v1",
+            payload=b"1234",
+        )
+        await message_backend.append(
+            prepared.handle,
+            message_id="second",
+            codec="test.bytes.v1",
+            payload=b"12",
+        )
+        assert (
+            await message_backend.append(
+                prepared.handle,
+                message_id="first",
+                codec="test.bytes.v1",
+                payload=b"1234",
+            )
+            == first
+        )
+        with pytest.raises(MessagingQuotaExceeded) as message_error:
+            await message_backend.append(
+                prepared.handle,
+                message_id="third",
+                codec="test.bytes.v1",
+                payload=b"",
+            )
+        assert message_error.value.resource == "thread_messages"
+        assert (
+            await message_backend.latest_seq(
+                channel="events",
+                identity=_identity(),
+            )
+            == 2
+        )
+
+        payload_backend = RedisBackend(
+            client,
+            key_prefix=payload_prefix,
+            limits=MessagingLimits(
+                max_message_payload_bytes=4,
+                max_checkpoint_bytes=2,
+                max_thread_messages=10,
+                max_thread_payload_bytes=5,
+            ),
+        )
+        payload_run = await payload_backend.prepare(
+            channel="events",
+            identity=_identity(thread_id="payload-thread"),
+            codec="test.bytes.v1",
+            after=0,
+            cancellable=False,
+            recoverable=False,
+        )
+        await payload_backend.append(
+            payload_run.handle,
+            message_id="first",
+            codec="test.bytes.v1",
+            payload=b"1234",
+        )
+        with pytest.raises(MessagingQuotaExceeded) as payload_error:
+            await payload_backend.append(
+                payload_run.handle,
+                message_id="second",
+                codec="test.bytes.v1",
+                payload=b"12",
+            )
+        assert payload_error.value.resource == "thread_payload_bytes"
+        assert (
+            await payload_backend.latest_seq(
+                channel="events",
+                identity=_identity(thread_id="payload-thread"),
+            )
+            == 1
+        )
+    finally:
+        await _delete_prefix(client, message_prefix)
+        await _delete_prefix(client, payload_prefix)
+
+
+async def test_real_redis_rejects_limits_mismatch_without_mutation(
+    redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+) -> None:
+    _, _, client = redis_backends
+    prefix = f"tfmsg:limits-mismatch:{uuid4().hex}"
+    first_limits = MessagingLimits(
+        max_message_payload_bytes=4,
+        max_checkpoint_bytes=2,
+        max_thread_messages=10,
+        max_thread_payload_bytes=20,
+    )
+    second_limits = MessagingLimits(
+        max_message_payload_bytes=5,
+        max_checkpoint_bytes=2,
+        max_thread_messages=10,
+        max_thread_payload_bytes=20,
+    )
+    first = RedisBackend(client, key_prefix=prefix, limits=first_limits)
+    second = RedisBackend(client, key_prefix=prefix, limits=second_limits)
+    try:
+        prepared = await first.prepare(
+            channel="events",
+            identity=_identity(),
+            codec="test.bytes.v1",
+            after=0,
+            cancellable=False,
+            recoverable=False,
+        )
+        await first.finish(prepared.handle, status="completed")
+        records = [key async for key in client.scan_iter(match=f"{prefix}:*")]
+        hashes_before = {
+            key: await cast(Awaitable[dict[bytes, bytes]], client.hgetall(key))
+            for key in records
+            if await cast(Awaitable[bytes], client.type(key)) == b"hash"
+        }
+
+        with pytest.raises(
+            MessagingBackendProtocolError,
+            match="invalid protocol response",
+        ) as captured:
+            await second.prepare(
+                channel="events",
+                identity=_identity(run_id="run-2"),
+                codec="test.bytes.v1",
+                after=0,
+                cancellable=False,
+                recoverable=False,
+            )
+
+        assert "different MessagingLimits" in str(
+            captured.value.diagnostic_context["detail"]
+        )
+        assert {
+            key: await cast(Awaitable[dict[bytes, bytes]], client.hgetall(key))
+            for key in hashes_before
+        } == hashes_before
+    finally:
+        await _delete_prefix(client, prefix)
 
 
 @pytest.mark.parametrize(

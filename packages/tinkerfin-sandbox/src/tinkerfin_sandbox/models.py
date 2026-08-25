@@ -108,6 +108,7 @@ class OpenSandboxConfig(BaseModel):
     command_timeout: int = Field(
         default=60 * 60,
         ge=0,
+        strict=True,
         description="Default command timeout in seconds; zero disables the limit.",
     )
     workspace_root: str | None = Field(
@@ -126,6 +127,7 @@ class OpenSandboxConfig(BaseModel):
     warm_pool_size: int = Field(
         default=1,
         ge=0,
+        strict=True,
         description="Target number of unbound warm sandboxes maintained by the manager.",
     )
     command_env: dict[str, str] = Field(

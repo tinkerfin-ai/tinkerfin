@@ -25,6 +25,13 @@ describe('Button', () => {
     expect(button.querySelector('.ui-button__spinner')).not.toBeNull()
   })
 
+  it('distinguishes an explicit unselected toggle from a regular button', () => {
+    render(<><Button selected={false}>未选筛选</Button><Button>普通操作</Button></>)
+
+    expect(screen.getByRole('button', { name: '未选筛选' })).toHaveAttribute('aria-pressed', 'false')
+    expect(screen.getByRole('button', { name: '普通操作' })).not.toHaveAttribute('aria-pressed')
+  })
+
   it('does not invoke a disabled action', () => {
     const onClick = vi.fn()
     render(<Button disabled onClick={onClick}>不可用</Button>)

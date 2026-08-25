@@ -110,7 +110,7 @@ describe('PlanQuestionComposer', () => {
     const change = (updater: (value: PlanQuestionState) => PlanQuestionState) => {
       current = updater(current)
     }
-    render(
+    const view = render(
       <PlanQuestionComposer threadId="thread-a" interaction={current} onChange={change} onSubmit={vi.fn()} onAbandon={vi.fn()} />,
     )
 
@@ -123,8 +123,12 @@ describe('PlanQuestionComposer', () => {
     fireEvent.click(screen.getByRole('button', { name: /查看第 3 题/ }))
     expect(current.activeQuestionIndex).toBe(2)
     expect(current.questions[0]?.customAnswer).toBe('保留这个草稿')
+    view.rerender(
+      <PlanQuestionComposer threadId="thread-a" interaction={current} onChange={change} onSubmit={vi.fn()} onAbandon={vi.fn()} />,
+    )
     fireEvent.click(screen.getByRole('button', { name: '点击标题区域展开问题卡片' }))
-    expect(screen.getByRole('radiogroup')).toBeInTheDocument()
+    expect(screen.queryByRole('radiogroup')).not.toBeInTheDocument()
+    expect(screen.getByRole('textbox', { name: '自定义回答：还有其他补充吗？' })).toBeInTheDocument()
   })
 
   it('restores collapse state after remount and isolates it by conversation', async () => {
@@ -164,6 +168,7 @@ describe('PlanQuestionComposer', () => {
       </div>,
     )
     const body = container.querySelector<HTMLElement>('.plan-question-composer-body')!
+    expect(container.querySelector('.ui-overlay-scrollbar')).toHaveAttribute('data-visibility', 'transient')
     Object.defineProperties(body, {
       clientHeight: { configurable: true, value: 220 },
       scrollHeight: { configurable: true, value: 220 },
@@ -207,16 +212,21 @@ describe('PlanQuestionComposer', () => {
     expect(conversationStyles).toMatch(/\.composer-dock\s*{[^}]*min-width:\s*0;/s)
     expect(conversationStyles).toMatch(/\.plan-question-composer\s*{[^}]*font-family:\s*var\(--font-ui\);/s)
     expect(conversationStyles).toMatch(/\.plan-question-composer-heading h2\s*{[^}]*font-size:\s*var\(--type-title-size\);[^}]*line-height:\s*var\(--type-title-line\);/s)
-    expect(conversationStyles).toMatch(/\.plan-question-composer-body > h3\s*{[^}]*font-size:\s*var\(--type-ui-size\);[^}]*line-height:\s*var\(--type-title-line\);/s)
+    expect(conversationStyles).toMatch(/\.plan-question-composer-body > h3\s*{[^}]*align-items:\s*flex-start;[^}]*font-size:\s*var\(--type-ui-size\);[^}]*line-height:\s*var\(--type-title-line\);/s)
+    expect(conversationStyles).toMatch(/\.plan-question-composer-body > h3 small\s*{[^}]*min-height:\s*var\(--type-title-line\);[^}]*align-items:\s*center;[^}]*line-height:\s*var\(--type-title-line\);/s)
     expect(conversationStyles).toMatch(/\.plan-question-option-copy strong\s*{[^}]*font-size:\s*var\(--type-ui-size\);/s)
     expect(conversationStyles).toMatch(/\.plan-question-option-copy small\s*{[^}]*font-size:\s*var\(--type-ui-size\);/s)
-    expect(conversationStyles).toMatch(/\.plan-question-option-recommended\s*{[^}]*align-self:\s*center;/s)
+    expect(conversationStyles).toMatch(/\.plan-question-option-copy\s*{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\) auto;[^}]*align-items:\s*baseline;/s)
+    expect(conversationStyles).toMatch(/\.plan-question-option-recommended\s*{[^}]*min-height:\s*var\(--type-title-line\);[^}]*grid-column:\s*3;[^}]*line-height:\s*var\(--type-title-line\);/s)
+    expect(conversationStyles).not.toContain('--plan-question-option-inline-padding')
+    expect(conversationStyles).not.toMatch(/\.plan-question-(?:option-recommended|composer-body > h3 small)[^{]*{[^}]*translateY/s)
     expect(conversationStyles).toMatch(/\.plan-question-custom textarea\s*{[^}]*height:\s*var\(--type-title-line\);[^}]*max-height:\s*calc\(var\(--type-title-line\) \* 3\);[^}]*overflow-y:\s*hidden;[^}]*font-size:\s*var\(--type-ui-size\);/s)
     expect(conversationStyles).not.toMatch(/\.plan-question-(?:option:focus-visible|custom:focus-within) \.plan-question-option-index/)
+    expect(conversationStyles).toMatch(/\.plan-question-option:focus-visible,[\s\S]*\.plan-question-custom:focus-within\s*{[^}]*outline:\s*0;[^}]*background:\s*var\(--color-hover\);/s)
     expect(conversationStyles).toMatch(/@media \(forced-colors: active\)[\s\S]*\.plan-question-option:focus-visible,[\s\S]*outline:\s*2px solid Highlight;/s)
     expect(conversationStyles).toMatch(/\.plan-question-composer-pager > span\s*{[^}]*font-size:\s*var\(--type-ui-size\);/s)
     expect(conversationStyles).toMatch(/\.plan-question-pager-button\s*{[^}]*width:\s*var\(--control-plan-chip\);[^}]*height:\s*var\(--control-plan-chip\);/s)
-    expect(conversationStyles).toMatch(/@media \(hover: none\), \(pointer: coarse\)[\s\S]*\.plan-question-pager-button\s*{[^}]*min-width:\s*var\(--control-lg\);[^}]*min-height:\s*var\(--control-lg\);/s)
+    expect(conversationStyles).toMatch(/@media \(any-hover: none\), \(any-pointer: coarse\)[\s\S]*\.plan-question-pager-button\s*{[^}]*min-width:\s*var\(--control-lg\);[^}]*min-height:\s*var\(--control-lg\);/s)
     expect(conversationStyles).toMatch(/@media \(prefers-reduced-motion: reduce\)[\s\S]*\.plan-question-pager-button \.ui-icon-button__icon\s*{\s*transition:\s*none;/s)
   })
 
@@ -257,5 +267,21 @@ describe('PlanQuestionComposer', () => {
     fireEvent.change(textarea, { target: { value: '第一行\n第二行\n第三行\n第四行' } })
     expect(textarea.style.height).toBe('72px')
     expect(textarea.style.overflowY).toBe('auto')
+  })
+
+  it('focuses the named free-text answer when a question has no options', async () => {
+    render(
+      <PlanQuestionComposer
+        threadId="thread-a"
+        interaction={{ ...interaction(), activeQuestionIndex: 2 }}
+        onChange={vi.fn()}
+        onSubmit={vi.fn()}
+        onAbandon={vi.fn()}
+      />,
+    )
+
+    const answer = screen.getByRole('textbox', { name: '自定义回答：还有其他补充吗？' })
+    await waitFor(() => expect(answer).toHaveFocus())
+    expect(screen.queryByRole('radiogroup')).not.toBeInTheDocument()
   })
 })

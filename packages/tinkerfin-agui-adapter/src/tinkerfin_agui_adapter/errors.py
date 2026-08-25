@@ -57,6 +57,8 @@ class AgUiAdapterError(Exception):
         diagnostic_context: Mapping[str, _ContextValue] | None = None,
         cause: BaseException | None = None,
     ) -> None:
+        """Initialize safe public context and trusted diagnostic evidence."""
+
         self.message = message
         self.context: Mapping[str, _ContextValue] = MappingProxyType(
             dict(context or {})

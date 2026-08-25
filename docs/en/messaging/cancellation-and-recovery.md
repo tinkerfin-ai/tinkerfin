@@ -31,6 +31,11 @@ The callback may take no arguments or one `CancelContext`. It may return a finit
 
 TinkerFin AG-UI streams already declare cancellation. Do not also pass `cancel=` when the source owns that callback.
 
+`cancel()` is a Messaging preflight operation: it cannot outlive the facade and continue
+against a closed borrowed backend. During shutdown, Messaging first signals current
+producers, then joins cancel preflights and producer settlement so the two paths cannot
+form a wait cycle.
+
 | Result or error | Meaning |
 | --- | --- |
 | `True` | Cancellation was requested from the active producer |
@@ -118,6 +123,10 @@ mapped = map_source(source, enrich)
 ```
 
 `map_source()` accepts a synchronous or asynchronous transform and preserves order, backpressure, cancellation tails, and close behavior.
+
+Closing a mapped source or subscription retains the underlying close task across caller
+cancellation. A later `aclose()` joins the same task; the backend iterator is not dropped
+while its close is incomplete.
 
 A transform may change the data type, so the mapped source no longer claims the original built-in codec profile. Configure the channel codec explicitly.
 

@@ -117,8 +117,9 @@ async def _run_default_agui(
             checkpointer=InMemorySaver(),
         )
     )
+    identity = Identity(threadId=thread_id, runId=f"run-{thread_id}")
     runtime = definition.new_agui(
-        identity=Identity(threadId=thread_id, runId=f"run-{thread_id}"),
+        identity=identity,
         mode="default",
         on_part=observe,
     )
@@ -338,8 +339,9 @@ async def test_external_abort_stays_cancelled_and_cleans_the_subagent() -> None:
             checkpointer=InMemorySaver(),
         )
     )
+    identity = Identity(threadId="external-abort", runId="run-external-abort")
     runtime = definition.new_agui(
-        identity=Identity(threadId="external-abort", runId="run-external-abort"),
+        identity=identity,
         mode="default",
     )
     stream = runtime.astream(

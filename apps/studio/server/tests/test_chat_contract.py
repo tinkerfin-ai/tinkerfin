@@ -36,18 +36,20 @@ def test_chat_request_preserves_command_extensions_and_derives_plan_mode() -> No
         )
     )
 
-    normalized = request.normalized(
+    normalized = request.normalized_json(
         thread_id="thread-1",
         message_ids=("message-server-1",),
     )
 
-    payload = normalized.model_dump(mode="json", by_alias=True, exclude_none=True)
+    payload = normalized
     assert payload["threadId"] == "thread-1"
     assert payload["messages"] == [
         {
             "id": "message-server-1",
             "role": "user",
             "content": "执行任务",
+            "name": None,
+            "encryptedValue": None,
         }
     ]
     assert payload["forwardedProps"] == {
@@ -110,11 +112,30 @@ def test_chat_request_drops_the_protocol_message_id() -> None:
     assert request.messages == [
         {"role": "user", "content": "执行任务", "name": None, "encryptedValue": None}
     ]
-    normalized = request.normalized(
+    normalized = request.normalized_json(
         thread_id="thread-1",
         message_ids=("message-server-1",),
     )
-    assert normalized.messages[0].id == "message-server-1"
+    normalized_model = RunAgentInput.model_validate(normalized)
+    assert normalized_model.messages[0].id == "message-server-1"
+
+
+def test_chat_request_rejects_self_referential_parent_run() -> None:
+    """parentRunId 必须选择已有分支点，不能引用当前 run"""
+
+    with pytest.raises(ValidationError, match="parentRunId"):
+        ChatRequest.model_validate(
+            {
+                "threadId": "thread-1",
+                "runId": "run-1",
+                "parentRunId": "run-1",
+                "state": {},
+                "messages": [],
+                "tools": [],
+                "context": [],
+                "forwardedProps": {"model": "main", "command": {"plan": "off"}},
+            }
+        )
 
 
 def test_from_agui_preserves_standard_roles_multimodal_content_and_extensions() -> None:
@@ -194,10 +215,11 @@ def test_from_agui_preserves_standard_roles_multimodal_content_and_extensions() 
     )
 
     request = ChatRequest.from_agui(protocol_input)
-    normalized = request.normalized(
+    normalized = request.normalized_json(
         thread_id="thread-1",
         message_ids=tuple(f"server-{index}" for index in range(7)),
     )
+    normalized_model = RunAgentInput.model_validate(normalized)
 
     assert [message["role"] for message in request.messages] == [
         "developer",
@@ -209,10 +231,10 @@ def test_from_agui_preserves_standard_roles_multimodal_content_and_extensions() 
         "reasoning",
     ]
     assert all("id" not in message for message in request.messages)
-    assert normalized.messages[3].content == protocol_input.messages[3].content
-    assert normalized.forwarded_props["trace"] == {"sampled": True}
-    assert normalized.tools[0].model_extra == {"vendor": "kept"}
-    assert normalized.context[0].model_extra == {"vendor": "kept"}
+    assert normalized_model.messages[3].content == protocol_input.messages[3].content
+    assert normalized_model.forwarded_props["trace"] == {"sampled": True}
+    assert normalized_model.tools[0].model_extra == {"vendor": "kept"}
+    assert normalized_model.context[0].model_extra == {"vendor": "kept"}
 
 
 def test_multimodal_start_maps_only_the_selected_user_input_to_graph() -> None:

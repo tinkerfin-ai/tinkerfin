@@ -23,6 +23,7 @@ export function Composer({
   value,
   isRunning,
   canStop = true,
+  stopPending = false,
   isHydrating = false,
   disabledReason,
   hero,
@@ -43,6 +44,7 @@ export function Composer({
   value: string
   isRunning: boolean
   canStop?: boolean
+  stopPending?: boolean
   isHydrating?: boolean
   disabledReason?: string
   hero?: ReactNode
@@ -284,9 +286,10 @@ export function Composer({
             {isRunning ? (
               <IconButton
                 className="send-button stop"
-                label={canStop ? t('停止任务') : t('正在创建会话')}
+                label={stopPending ? t('正在停止任务') : canStop ? t('停止任务') : t('正在创建会话')}
                 icon={<Square size={13} fill="currentColor" />}
-                disabled={!canStop}
+                loading={stopPending}
+                disabled={!canStop || stopPending}
                 onClick={onStop}
               />
             ) : (
@@ -295,7 +298,7 @@ export function Composer({
           </div>
         </div>
         </div>
-        <p className="composer-note">{t('TinkerFin 可能会犯错，请核对重要信息。')}</p>
+        <p className="composer-note">{t('TinkerFin 可能会犯错，请核对重要信息')}</p>
       </div>
       {takeover && <div className="composer-takeover">{takeover}</div>}
     </footer>

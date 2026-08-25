@@ -71,7 +71,10 @@ identity = Identity(threadId="user-42-support", runId="run-20260820-1")
 | `threadId` | Required, non-empty, no surrounding whitespace | Continuing conversation and Graph checkpoint thread |
 | `runId` | Required, non-empty, no surrounding whitespace | Idempotent ID for one semantic run in the thread |
 
-An `Identity` is immutable and rejects extra fields. It does not contain `parentRunId`, user authentication data, or request content.
+An `Identity` is immutable and rejects extra fields. It does not contain parent lineage,
+user authentication data, or request content. `new_agui(parent_run_id=...)` accepts
+lineage only when needed. The same canonical Identity is used by public events, the
+Graph, checkpoints, coordination, and durable delivery.
 
 Reuse `threadId` for one continuing conversation. Use a new `runId` for new semantic input, and reuse it only for retries or attachment.
 

@@ -290,6 +290,7 @@ async def follow(
             self._messaging.backend.bind_follow(
                 channel=self.name,
                 identity=identity,
+                after=after,
             ),
         )
         self._messaging._require_open()
@@ -679,33 +680,36 @@ async def cancel(self: MessageChannel[SourceT, ReplayT], *, identity: Identity) 
         RunProducerFailed: The callback, encoding, append, or producer failed.
     """
 
-    self._messaging._require_open()
-    required_identity(identity)
-    handle = BackendRunHandle(
-        channel=self.name,
-        identity=identity,
-        owner_token=None,
-        fence=None,
-    )
-    initiated = await _await_backend(
-        "request_cancel",
-        self._messaging.backend.request_cancel(handle),
-    )
-    status = await _await_backend(
-        "wait_finished",
-        self._messaging.backend.wait_finished(handle),
-    )
-    if status in {"failed", "owner_lost"}:
-        cause = await _await_backend(
-            "failure",
-            self._messaging.backend.failure(handle),
-        )
-        raise RunProducerFailed(
+    preflight = self._messaging._begin_preflight()
+    try:
+        required_identity(identity)
+        handle = BackendRunHandle(
+            channel=self.name,
             identity=identity,
-            cause=cause
-            or RuntimeError(f"Producer for run {identity.run_id!r} stopped"),
+            owner_token=None,
+            fence=None,
         )
-    return initiated and status == "cancelled"
+        initiated = await _await_backend(
+            "request_cancel",
+            self._messaging.backend.request_cancel(handle),
+        )
+        status = await _await_backend(
+            "wait_finished",
+            self._messaging.backend.wait_finished(handle),
+        )
+        if status in {"failed", "owner_lost"}:
+            cause = await _await_backend(
+                "failure",
+                self._messaging.backend.failure(handle),
+            )
+            raise RunProducerFailed(
+                identity=identity,
+                cause=cause
+                or RuntimeError(f"Producer for run {identity.run_id!r} stopped"),
+            )
+        return initiated and status == "cancelled"
+    finally:
+        self._messaging._finish_preflight(preflight)
 
 
 async def delete_stream(

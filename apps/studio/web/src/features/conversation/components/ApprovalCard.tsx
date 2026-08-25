@@ -5,15 +5,15 @@ import {
   CircleAlert,
   Pencil,
 } from 'lucide-react'
+import { useState } from 'react'
 
 import { Button, IconButton, Surface } from '../../../components/ui'
 import type { ApprovalDecision, ApprovalState, Conversation, JsonValue } from '../../../types'
-import { normalizeEscapedText } from '../../../lib/text'
 import { MarkdownContent } from './MarkdownContent'
 import { useI18n } from '../../../i18n'
 
 const descriptionParts = (description: string, fallback: string) => {
-  const normalized = normalizeEscapedText(description).trim()
+  const normalized = description.trim()
   const [title, ...rest] = normalized.split(/\n\s*\n/).filter(Boolean)
   return {
     title: title || fallback,
@@ -39,6 +39,10 @@ export function ApprovalCard({
 }) {
   const { t } = useI18n()
   const approval = conversation.approval
+  const [drafts, setDrafts] = useState<Record<string, {
+    params?: string
+    rejectionReason?: string
+  }>>({})
   if (!approval) return null
   const active = approval.items[approval.activeIndex]
   const decided = approval.items.filter((item) => item.decision).length
@@ -49,6 +53,15 @@ export function ApprovalCard({
   const argEntries = Object.entries(args)
   const description = descriptionParts(active.description, t('请确认本次操作'))
   const interruptIds = approval.items.map((item) => item.interruptId)
+  const activeDraft = drafts[active.interruptId]
+
+  // 编辑内容属于具体审批项，分页只切换视图，不能把上一项草稿提交给下一项
+  const updateActiveDraft = (patch: { params?: string; rejectionReason?: string }) => {
+    setDrafts((current) => ({
+      ...current,
+      [active.interruptId]: { ...current[active.interruptId], ...patch },
+    }))
+  }
 
   const updateApproval = (updater: (current: ApprovalState) => ApprovalState) => {
     onChange((current) => {
@@ -97,8 +110,7 @@ export function ApprovalCard({
 
   const saveEditedApproval = (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
-    const data = new FormData(event.currentTarget)
-    const editedParams = String(data.get('params') ?? '')
+    const editedParams = activeDraft?.params ?? active.editedParams ?? active.params
     try {
       const editedArgs = JSON.parse(editedParams)
       if (!editedArgs || typeof editedArgs !== 'object' || Array.isArray(editedArgs)) {
@@ -121,7 +133,7 @@ export function ApprovalCard({
     } catch {
       updateApproval((current) => ({
         ...current,
-        error: t('编辑后的参数必须是合法 JSON 对象。'),
+        error: t('编辑后的参数必须是合法 JSON 对象'),
       }))
     }
   }
@@ -138,11 +150,11 @@ export function ApprovalCard({
 
   const confirmRejection = (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
-    const data = new FormData(event.currentTarget)
+    const rejectionReason = activeDraft?.rejectionReason ?? active.rejectionReason ?? ''
     updateApproval((current) => {
       const activeIndex = currentActiveIndex(current)
       const items = current.items.map((item, index) => index === activeIndex
-        ? { ...item, rejectionReason: String(data.get('reason') ?? ''), decision: 'rejected' as const }
+        ? { ...item, rejectionReason, decision: 'rejected' as const }
         : item)
       const nextUndecided = items.findIndex((item) => !item.decision)
       return {
@@ -199,19 +211,19 @@ export function ApprovalCard({
           )}
         </div>
       </div>
-      {approval.error && <p className="approval-question danger-text">{approval.error}</p>}
+      {approval.error && <p className="approval-question danger-text" role="alert">{approval.error}</p>}
       {active.decision ? (
         <div className="decision-made"><CheckCircle2 size={16} />{t('当前项已决定：{decision}', { decision: active.decision === 'approved' ? t('允许') : t('拒绝') })}</div>
       ) : approval.mode === 'edit' ? (
-        <form className="approval-form" onSubmit={saveEditedApproval}>
+        <form key={`edit:${active.interruptId}`} className="approval-form" onSubmit={saveEditedApproval}>
           <label htmlFor={`approval-params-${active.id}`}>{t('编辑参数（JSON 对象）')}</label>
-          <textarea id={`approval-params-${active.id}`} name="params" defaultValue={active.editedParams ?? active.params} rows={4} />
+          <textarea id={`approval-params-${active.id}`} name="params" value={activeDraft?.params ?? active.editedParams ?? active.params} rows={4} onChange={(event) => updateActiveDraft({ params: event.currentTarget.value })} />
           <div><Button onClick={() => setMode('options')}>{t('取消')}</Button><Button type="submit" variant="primary">{t('保存并允许')}</Button></div>
         </form>
       ) : approval.mode === 'reject' ? (
-        <form className="approval-form" onSubmit={confirmRejection}>
+        <form key={`reject:${active.interruptId}`} className="approval-form" onSubmit={confirmRejection}>
           <label htmlFor={`approval-reason-${active.id}`}>{t('拒绝原因（可选）')}</label>
-          <textarea id={`approval-reason-${active.id}`} name="reason" defaultValue={active.rejectionReason} rows={3} placeholder={t('说明拒绝此操作的原因…')} />
+          <textarea id={`approval-reason-${active.id}`} name="reason" value={activeDraft?.rejectionReason ?? active.rejectionReason ?? ''} rows={3} placeholder={t('说明拒绝此操作的原因…')} onChange={(event) => updateActiveDraft({ rejectionReason: event.currentTarget.value })} />
           <div><Button onClick={() => setMode('options')}>{t('取消')}</Button><Button type="submit" variant="danger">{t('确认拒绝')}</Button></div>
         </form>
       ) : (

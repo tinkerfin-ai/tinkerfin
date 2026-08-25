@@ -126,7 +126,7 @@ export function AuthScreen({ onLogin, pending = false, error }: AuthScreenProps)
           <div className="auth-view" data-testid="real-login">
             <header className="auth-heading">
               <h2>{t('欢迎回来')}</h2>
-              <p>{t('登录后继续与你的智能体团队协作。')}</p>
+              <p>{t('登录后继续与你的智能体团队协作')}</p>
             </header>
 
             {error && <p className="auth-form-error" role="alert">{error}</p>}

@@ -11,6 +11,7 @@ from langchain.agents.middleware.todo import PlanningState
 from langchain.agents.middleware.types import AgentMiddleware, AgentState
 from pydantic import JsonValue
 
+from .._agui_lineage_state import PLANNING_CHECKPOINT_RUN_ID
 from .._state_schema import (
     StateSchemaCompositionError,
     StateSchemaSource,
@@ -25,7 +26,7 @@ from .models import PlanContentModel, PlanState
 PLAN_STATE_KEY = "tinkerfin_plan"
 PLAN_SCHEMA_FINGERPRINT_KEY = "_tinkerfin_plan_clarification_schema"
 PLAN_CONTENT_SCHEMA_FINGERPRINT_KEY = "_tinkerfin_plan_content_schema"
-PLAN_CHECKPOINT_RUN_ID = "tinkerfin-plan-v1"
+PLAN_CHECKPOINT_RUN_ID = PLANNING_CHECKPOINT_RUN_ID
 PLAN_PRIVATE_STATE_KEYS = frozenset(
     {PLAN_SCHEMA_FINGERPRINT_KEY, PLAN_CONTENT_SCHEMA_FINGERPRINT_KEY}
 )

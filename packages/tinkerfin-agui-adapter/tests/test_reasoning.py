@@ -1,4 +1,4 @@
-"""模型思考内容不得进入 AG-UI 事件的隐私契约"""
+"""Privacy contracts preventing model reasoning from leaking into AG-UI events."""
 
 from __future__ import annotations
 

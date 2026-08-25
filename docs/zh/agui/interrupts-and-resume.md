@@ -36,8 +36,8 @@ runtime = agent.new_agui(identity=identity, mode="plan")
 
 | `reason` | `resolved` 时的 payload |
 | --- | --- |
-| `plan_clarification` | 选择 Option 时使用 `{"type":"respond","answers":[{"questionId":"...","optionId":"..."}]}`；自由输入时使用 `{"type":"respond","answers":[{"questionId":"...","answer":"..."}]}`；跳过可选题时使用 `{"type":"respond","answers":[{"questionId":"...","skipped":true}]}` |
-| `plan_review` | `approve`、`edit`、`respond` 或 `reject`，并携带当前 `baseRevision` |
+| `tinkerfin:plan_clarification` | 选择 Option 时使用 `{"type":"respond","answers":[{"questionId":"...","optionId":"..."}]}`；自由输入时使用 `{"type":"respond","answers":[{"questionId":"...","answer":"..."}]}`；跳过可选题时使用 `{"type":"respond","answers":[{"questionId":"...","skipped":true}]}` |
+| `tinkerfin:plan_review` | `approve`、`edit`、`respond` 或 `reject`，并携带当前 `baseRevision` |
 
 Plan interrupt 没有 `toolCallId`，其中包含带版本的可信 Runtime envelope、响应 JSON Schema
 和携带完整公开 Form 的 `tinkerfin.plan-clarification.v2` metadata；Form 使用 `schemaVersion: 2`。
@@ -52,10 +52,9 @@ snapshot，随后可以用 RFC 6902 state delta 表示 Plan 进入 `approved`，
 Form 并派生所选 Option label。Resume 必须完整覆盖每道问题；混合回答字段、跳过必填题、漏传问题
 或使用未知 ID 都会导致恢复失败。
 
-Plan interrupt 使用同一套 `ResumeMapper.map_agui(...)` 和 `AgUiResumeBinding`，不需要
-另一套恢复 API。`ResumeMapper` 校验已保存 envelope 和待处理项的完整覆盖，Planning Graph 校验
-响应契约，并拒绝过期的 `baseRevision`。每次恢复使用新的 `runId`，同时保持原
-`threadId`。
+Plan interrupt 使用同一套 `AgUiResumeBinding.from_agui(...)`，不需要另一套恢复 API。
+Binding 校验已保存 envelope 和待处理项的完整覆盖，Planning Graph 校验响应契约，并拒绝过期
+的 `baseRevision`。每次恢复使用新的 `runId`，同时保持原 `threadId`。
 
 同一待处理批次不能混合 Plan interrupt 与 Tool interrupt。Plan 批准后仍可能在执行阶段
 产生 Tool 审批；后续恢复会继续使用原来的 scoped Tool ID。
@@ -96,35 +95,33 @@ mode 不会批准、拒绝或取消待处理的 Tool/Filesystem 审批。
 
 ```python
 from tinkerfin import AgUiResumeBinding
-from tinkerfin_agui_adapter import ResumeMapper
 
 
-translation = ResumeMapper().map_agui(
+binding = AgUiResumeBinding.from_agui(
     entries=resume_entries,
     interrupts=persisted_interrupts,
 )
-
-if translation.mode == "command":
-    binding = AgUiResumeBinding.from_translation(
-        identity=identity,
-        translation=translation,
-    )
 ```
 
 `persisted_interrupts` 必须来自服务端可信的事件记录，不能使用客户端重新提交的 interrupt 详情。
-`ResumeMapper.map_agui()` 与公开解析入口复用同一个 Tool review v1 校验。
+`from_agui()` 与公开解析入口复用同一个 Tool review v1 校验，并为完整恢复、混合取消或全部
+放弃返回一个 Binding。
 
-接着创建 Runtime，并把恢复命令作为 Graph 输入：
+Binding 只传一次，原生 Command 由 Runtime 管理：
 
 ```python
 runtime = agent.new_agui(
     identity=identity,
+    parent_run_id=parent_run_id,
     resume=binding,
+    on_resume_checkpointed=record_checkpoint_idempotently,
 )
-events = runtime.astream(binding.command)
+events = runtime.astream(config=config)
 ```
 
-`AgUiResumeBinding` 绑定 `Identity`、纯 `Command(resume=...)` 和之前已经发出的 scoped Tool ID。完整 HTTP 请求的幂等与权限仍由应用校验。
+`AgUiResumeBinding` 保存原生 interrupt group、scoped Tool ID、取消和已验证的子 Agent 来源。
+它具有稳定 JSON 往返，但不保存 identity 或 parent，也不暴露 `Command`。完整 HTTP 请求的幂等
+与权限仍由应用校验。
 
 ## 使用原生 checkpoint 数据恢复
 
@@ -139,31 +136,42 @@ translation = ResumeMapper().map(
 ```
 
 已处理的决定需要完整消息来关联 Tool。多个同名工具或并行工具不能按到达顺序匹配。
+这是 Adapter 层的检查入口。高层 Runtime 使用已保存 AG-UI interrupt 和
+`AgUiResumeBinding.from_agui(...)`，调用方不需要翻译或传入原生 Command。
 
-## 三种转换结果
+## 三种恢复模式
 
-| `translation.mode` | 含义 | 应用怎么做 |
+| 模式 | 含义 | Runtime 行为 |
 | --- | --- | --- |
-| `command` | 所有决定都能转换成原生恢复命令 | 创建 binding 并继续 Graph |
-| `abandon` | 所有项都被取消 | 结束本次业务流程，不伪造拒绝 |
-| `custom` | 解决和取消混合，原生恢复不能无损表达 | 由应用决定如何处理；不要强行继续 |
+| 全部 resolved | 所有项都能转换成原生恢复数据 | checkpoint 一次并继续 Graph |
+| 全部 cancelled | 所有项都被放弃 | 不调用 Graph，输出有限 cancelled 生命周期 |
+| mixed | 同时有 resolved 与 cancelled | 执行 resolved Tool，结算但不执行 cancelled slot |
 
-取消表示用户放弃这次恢复，不等于拒绝工具。把取消改成拒绝会改变业务语义。
-Plan 审批同样如此：取消不能伪造成拒绝计划。
+`cancelled` 永远不会转成 reject。Tool 混合批次中，TinkerFin 会执行 resolved Tool，并为每个
+cancelled Tool 生成确定性的未执行 error `ToolMessage`。main、general-purpose、声明式子 Agent
+和权限生成的审批使用同一适配器。通用 Runtime 的 mixed interrupt 不是 Tool decision，
+`AgUiResumeBinding` 会拒绝它。
+
+框架会把原生 resume 与私有 marker 原子写入 checkpoint。只有 marker 可读后，才会在首条
+恢复后原生事件公开前调用 `on_resume_checkpointed`。重试可能再次收到相同
+`AgUiResumeCheckpoint`，因此回调必须幂等。marker retry 和 `None` continuation 都留在框架
+内部，调用方不需要第二次传入 input。
 
 ## 重试和并发
 
 - 为恢复请求使用新的 `runId`，但保持相同 `threadId`；
 - 在业务存储中原子地认领待处理 interrupt，避免两个请求同时恢复；
-- 保存转换后的恢复数据和完整 Tool ID，重试时重建同一个 binding；
+- 保存原始 AG-UI entries 和完整可信 interrupt，或保存 Binding 的完整稳定 JSON；不能选择性
+  保存内部字段；
+- 只根据 `on_resume_checkpointed` 解决业务审批，不能根据 `RUN_STARTED`；
 - 恢复后的 Tool 结果沿用原 Tool ID，不重复发送 Tool start、args 和 end。
 
 ## 常见错误
 
 | 错误 | 常见原因 |
 | --- | --- |
-| `ResumeMappingError` | ID 不存在、覆盖不完整、决定不允许或缺少 Tool 关联数据 |
-| `ValueError` | binding 使用了空 resume、非纯恢复命令或不完整 Tool ID |
+| `AgUiResumeBindingError` | ID 不存在、覆盖不完整、决定不允许、Schema payload 非法或缺少 Tool 关联数据 |
+| `ValueError` | binding 模式非法、通用 Runtime mixed cancellation 不支持或 Tool ID 不完整 |
 | 恢复后找不到状态 | `Identity.threadId` 改变，或没有配置 checkpointer |
 | 同一个操作执行两次 | 应用没有原子认领 interrupt，或重试没有复用已保存的恢复数据 |
 

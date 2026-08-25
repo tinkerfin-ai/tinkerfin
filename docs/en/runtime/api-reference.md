@@ -14,9 +14,11 @@ This page groups the public Runtime capabilities by how you use them. Most appli
 | `Identity(threadId=..., runId=...)` | Identify one framework run | Thread and run only |
 | `TinkerFin.run(...)` | Run a custom async source | `source_factory`, `identity`, `on_part` |
 | `DeepAgentDefinition.new(...)` | Create a native Runtime | Required `identity`, optional request `mode` and `on_part` |
-| `DeepAgentDefinition.new_agui(...)` | Create an AG-UI Runtime | Optional request `mode`; see [AG-UI basics](../agui/index.md) |
+| `DeepAgentDefinition.new_agui(...)` | Create an AG-UI Runtime | Required canonical `identity`; optional parent, mode, resume, checkpoint callback, and observers |
 
-Reuse `DeepAgentDefinition`. Treat `DeepAgentRuntime`, `DeepAgentAgUiRuntime`, `TinkerFinRun`, and `NativeTinkerFinRun` as single-use values returned by the entry points rather than constructing them directly.
+Reuse `DeepAgentDefinition`. Treat `DeepAgentRuntime`, `DeepAgentAgUiRuntime`,
+`DeepAgentAgUiResumeRuntime`, `TinkerFinRun`, and `NativeTinkerFinRun` as single-use
+values returned by the entry points rather than constructing them directly.
 
 `.plan(enabled=True)` affects only definitions created from the returned factory. It
 does not add a parameter to `create_deep_agent(...)`. The returned factory retains its
@@ -38,9 +40,14 @@ The top-level package exports `AgentMode`. The `tinkerfin.plan` package exports
 `PlanContentModel`, `StructuredPlanStep`, `StructuredPlanContent`,
 `MarkdownPlanContent`, `PlanSchemaReference`, `PlanDraft`, `ConfirmedPlan`,
 `RequirementAnswer`, `PendingClarification`, `ClarificationExchange`, `PlanState`,
-`PlanStatus`, `PlanHandoff`, `PlanReviewAction`, and the Plan error types. The models are
-frozen. Planning state uses the camel-case JSON representation at `tinkerfin_plan`;
+`PlanStatus`, `PlanHandoff`, `PlanHandoffPhase`, `PlanReviewAction`, and the Plan error
+types. The models are frozen. Planning state uses the camel-case JSON representation at `tinkerfin_plan`;
 `effectiveMode` becomes `default` when approval commits the handoff.
+
+`PlanHandoffPhase` advances `pending → accepted → completed`. Accepted records include
+the native checkpoint that contains the deterministic handoff message; completed records
+also include terminal native checkpoint evidence. Retries reconcile these checkpoints
+instead of redispatching the approved Plan.
 
 `.plan(plan_schema=...)` accepts one concrete `PlanContentModel` subclass. Omitting it
 uses `StructuredPlanContent`; `MarkdownPlanContent` preserves one non-blank Markdown
@@ -139,6 +146,7 @@ See [Custom sources and run coordination](extensions.md#use-a-renewable-redis-le
 | API | When it appears |
 | --- | --- |
 | `AgUiResumeBinding` | Resuming an interrupted AG-UI run |
+| `AgUiResumeCheckpoint` | Stable callback value after the resume marker is durable |
 | `tinkerfin.plan.PlanModeConfigurationError` | A Plan definition lacks a concrete saver or explicit model, has an incompatible state schema, or requests non-sync durability |
 | `AgUiSettlementTimeoutError` | Caller wait ended before protected Runtime cleanup settled |
 | `AgUiNativeStreamConfigurationError` | Native options do not satisfy the AG-UI profile |
@@ -154,9 +162,13 @@ See [Custom sources and run coordination](extensions.md#use-a-renewable-redis-le
 | `prior_tool_call_ids` | `frozenset()` | Complete scoped tool IDs emitted before resume |
 | `private_state_keys` | `frozenset()` | Host-owned top-level state channels omitted from public projection |
 | `on_event` | `None` | Observer called before AG-UI event delivery |
+| `parent_run_id` | `None` | Optional checkpoint lineage exposed on `RUN_STARTED` |
 
 Identity is already bound by `TinkerFin.run(..., identity=...)`; `astream_agui()` does not accept duplicate IDs.
 
-`AgUiResumeBinding.from_translation(...)` binds an Identity and translation. `validate_identity(...)` and `validate_command(...)` let a custom host check the target early.
+`AgUiResumeBinding.from_agui(...)` validates complete trusted AG-UI interrupts and
+entries, including native groups, cancellation mode, Tool IDs, and source agents. The
+binding stores no identity or parent and exposes no native command. It can be persisted
+and restored as one complete Pydantic model.
 
 See [Interrupts and resume](../agui/interrupts-and-resume.md) for the complete resume flow.

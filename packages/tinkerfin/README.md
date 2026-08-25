@@ -92,10 +92,12 @@ Store, cache, backend, and runtime context are borrowed by Planning and native
 execution. Planning and handoff boundaries use synchronous checkpoint durability, and
 an explicit non-`sync` value is rejected.
 
-`mode="default"` calls the unmodified native Deep Agent Graph directly. It does not run
-Planning, add middleware, replace the state schema, or create a parent Graph. Native
-`write_todos`, Tool/Filesystem review, subagents, cancellation, and error semantics are
-therefore identical for ordinary and Plan-capable Definitions.
+`mode="default"` calls the native Deep Agent Graph directly without running Planning or
+creating a parent Graph. Every Definition includes a private resume marker channel.
+Definitions with Tool review also replace the existing Deep Agents patch middleware slot
+with a version-bound adapter that preserves patch behavior and delegates
+approve/edit/reject/respond to LangChain unchanged. Its only extension is an internal
+cancel decision used for mixed AG-UI resume batches.
 
 Only `ls`, `read_file`, `glob`, and `grep` are available to the Planner. Every
 clarification question explicitly declares whether it is required. Questions can contain
@@ -184,9 +186,10 @@ agent = tinkerfin.plan().create_deep_agent(
 )
 ```
 
-The native Graph still combines only the application, Definition, and upstream
-middleware state contracts. The standalone Planning Graph composes the fields it needs
-without changing native default topology. A conflicting field fails before a Plan run.
+The native Graph combines the private resume marker, application, Definition, and
+upstream middleware state contracts. The standalone Planning Graph composes the fields
+it needs without changing native default topology. A conflicting field fails before a
+Plan run.
 Runtime context continues to use Deep Agents `context_schema`; it is not merged into
 state or stored in the checkpoint.
 
@@ -212,8 +215,12 @@ backpressure, errors, cancellation, coordination, observer ordering, and cleanup
 ### AG-UI Runtime
 
 ```python
+from tinkerfin import AgUiResumeBinding, Identity
+
+
 runtime = agent.new_agui(
-    identity=identity,
+    identity=Identity(threadId="thread-1", runId="run-1"),
+    parent_run_id=parent_run_id,
     mode="default",
     on_part=on_part,
     on_event=on_event,
@@ -227,10 +234,46 @@ When omitted, the AG-UI Runtime fixes `stream_mode` to `messages/tasks/values`,
 extra modes are `updates`, `checkpoints`, `debug`, and `custom`. Invalid options fail
 before stream side effects.
 
-The returned `AgUiEventStream` uses `RUN_STARTED.input=None`, keeps the
-event, interrupt/resume, subagent, reasoning privacy, cancellation, and cleanup
-semantics, and can be passed directly to SSE or Messaging. Resumed runs use
-`AgUiResumeBinding`; high-level callers do not pass Tool IDs separately.
+`Identity` is the one canonical identity used by AG-UI lifecycle events, the Graph,
+checkpoints, coordination, and Messaging. `RUN_STARTED.input` is omitted because Graph
+input is already explicit. A non-empty `parent_run_id` resolves the unique completed
+checkpoint leaf for that run in the same thread, so A→B followed by a request with parent
+A creates A→C. Missing, cross-thread, active, failed, ambiguous, or improperly resumed
+parents fail before Graph execution.
+
+The returned `AgUiEventStream` preserves event, interrupt/resume, subagent, reasoning
+privacy, cancellation, and cleanup semantics and can be passed directly to SSE or
+Messaging. Build resumed runs once from trusted, server-persisted AG-UI facts:
+
+```python
+binding = AgUiResumeBinding.from_agui(
+    entries=resume_entries,
+    interrupts=persisted_interrupts,
+)
+runtime = agent.new_agui(
+    identity=Identity(threadId="thread-1", runId="run-resume"),
+    parent_run_id=parent_run_id,
+    resume=binding,
+    on_resume_checkpointed=record_checkpoint_idempotently,
+)
+events = runtime.astream(config=config, context=context)
+```
+
+The binding owns validated native resume, Tool correlation, cancellation, and provenance
+facts and has a stable JSON round trip. It owns no identity or parent and exposes no
+native `Command`. The framework atomically checkpoints a private marker with the native
+decision. `on_resume_checkpointed` runs only after that marker is readable and may receive
+the same `AgUiResumeCheckpoint` again on retry, so hosts must consume it idempotently.
+The retry continuation remains internal and never resubmits the decision. An entirely
+cancelled binding emits a finite cancelled lifecycle without creating or invoking a Graph.
+
+AG-UI batches may mix resolved and cancelled Tool reviews. Resolved Tools retain native
+behavior; cancelled Tools are removed from execution and receive a deterministic error
+`ToolMessage` with `outcome="cancelled"` and `executed=False`. Main, automatic
+general-purpose, declarative subagents, and permission-generated reviews use this
+contract automatically. An externally compiled or remote subagent that can emit these
+reviews must declare
+`tinkerfin_hitl_contract=TINKERFIN_HITL_CONTRACT` in its subagent spec.
 
 Plan Runtimes automatically remove their internal top-level state channels at every
 public state boundary. Low-level `TinkerFinRun.astream_agui(...)` accepts an explicit

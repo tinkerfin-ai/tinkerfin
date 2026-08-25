@@ -69,7 +69,7 @@ export function ThemePicker() {
       updateExpansion(false)
     }
     const handleEscape = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return
+      if (event.defaultPrevented || event.key !== 'Escape') return
       event.preventDefault()
       updateExpansion(false)
     }
@@ -97,7 +97,7 @@ export function ThemePicker() {
       const duration = context.conditions?.reduceMotion ? 0 : MOTION_DURATION_SECONDS.normal
       const animations = [
         gsap.to(surface, {
-          width: '100%',
+          scaleX: 1,
           autoAlpha: 1,
           duration,
           ease: 'power2.out',

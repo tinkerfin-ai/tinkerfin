@@ -11,6 +11,7 @@ from typing import Literal
 from langchain_core.messages import AIMessage, BaseMessage
 from pydantic import Field, JsonValue, ValidationError, model_validator
 
+from ._json_schema import SchemaError, require_valid_schema
 from .errors import HitlCorrelationError, HitlNoMatchError
 from .models import JsonObject, RuntimeModel
 from .reasoning import json_values_equal
@@ -73,6 +74,13 @@ class HitlRequest(RuntimeModel):
                 raise ValueError(
                     f"allowed_decisions contains duplicates at index {index}"
                 )
+            if review.args_schema is not None:
+                try:
+                    require_valid_schema(review.args_schema.root)
+                except SchemaError as error:
+                    raise ValueError(
+                        f"args_schema is invalid at index {index}"
+                    ) from error
         return self
 
 

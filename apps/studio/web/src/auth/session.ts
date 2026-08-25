@@ -26,6 +26,14 @@ const failureListeners = new Set<FailureListener>()
 
 let currentSession: AuthSession | null | undefined
 
+/** 浏览器无法持久化登录会话 */
+export class AuthSessionStorageError extends Error {
+  constructor(cause?: unknown) {
+    super('浏览器无法保存登录状态，请检查隐私或存储设置后重试', { cause })
+    this.name = 'AuthSessionStorageError'
+  }
+}
+
 function normalizeExpiresAt(value: string): string {
   const timestamp = Date.parse(value)
   if (!Number.isFinite(timestamp)) throw new TypeError('登录接口返回的固定到期时间无效')
@@ -46,8 +54,13 @@ function sessionsEqual(first: AuthSession | null | undefined, second: AuthSessio
     && first.user.roles.every((role, index) => role === second.user.roles[index])
 }
 
-function canUseStorage() {
-  return typeof window !== 'undefined' && typeof window.localStorage !== 'undefined'
+function getLocalStorage(): Storage | null {
+  if (typeof window === 'undefined') return null
+  try {
+    return window.localStorage
+  } catch {
+    return null
+  }
 }
 
 function normalizeAuthUser(value: unknown): AuthUser | null {
@@ -93,14 +106,15 @@ export function isAuthSessionExpired(session: AuthSession, now = Date.now()): bo
 }
 
 function readStoredSession(): AuthSession | null {
-  if (!canUseStorage()) return null
-  const raw = window.localStorage.getItem(AUTH_SESSION_STORAGE_KEY)
-  if (!raw) return null
+  const storage = getLocalStorage()
+  if (!storage) return null
   try {
+    const raw = storage.getItem(AUTH_SESSION_STORAGE_KEY)
+    if (!raw) return null
     const parsed = JSON.parse(raw) as unknown
     const normalized = normalizeAuthSession(parsed)
     if (!normalized || isAuthSessionExpired(normalized)) {
-      window.localStorage.removeItem(AUTH_SESSION_STORAGE_KEY)
+      storage.removeItem(AUTH_SESSION_STORAGE_KEY)
       return null
     }
     return {
@@ -108,17 +122,22 @@ function readStoredSession(): AuthSession | null {
       expiresAt: normalizeExpiresAt(normalized.expiresAt),
     }
   } catch {
-    window.localStorage.removeItem(AUTH_SESSION_STORAGE_KEY)
+    try {
+      storage.removeItem(AUTH_SESSION_STORAGE_KEY)
+    } catch {
+      // 存储不可用时按未登录处理，不让页面初始化失败
+    }
     return null
   }
 }
 
-function persistSession(session: AuthSession | null) {
-  if (!canUseStorage()) return
-  if (session) {
-    window.localStorage.setItem(AUTH_SESSION_STORAGE_KEY, JSON.stringify(session))
-  } else {
-    window.localStorage.removeItem(AUTH_SESSION_STORAGE_KEY)
+function persistSession(session: AuthSession) {
+  const storage = getLocalStorage()
+  if (!storage) throw new AuthSessionStorageError()
+  try {
+    storage.setItem(AUTH_SESSION_STORAGE_KEY, JSON.stringify(session))
+  } catch (error) {
+    throw new AuthSessionStorageError(error)
   }
 }
 
@@ -144,22 +163,33 @@ export function saveAuthSession(session: AuthSession) {
     clearAuthSession()
     return
   }
-  currentSession = normalized
   persistSession(normalized)
+  currentSession = normalized
   notifySessionListeners(normalized)
 }
 
 export function clearAuthSession() {
-  const hadSession = currentSession != null
-    || (canUseStorage() && window.localStorage.getItem(AUTH_SESSION_STORAGE_KEY) != null)
+  const storage = getLocalStorage()
+  let hadStoredSession = false
+  if (storage) {
+    try {
+      hadStoredSession = storage.getItem(AUTH_SESSION_STORAGE_KEY) != null
+      storage.removeItem(AUTH_SESSION_STORAGE_KEY)
+    } catch {
+      // 当前页面仍必须立即退出，持久层清理失败不得保留内存 token
+    }
+  }
+  const hadSession = currentSession != null || hadStoredSession
   currentSession = null
-  persistSession(null)
   if (hadSession) notifySessionListeners(null)
 }
 
-export function updateAuthSession(payload: AuthSessionResponse): AuthSession | null {
+export function updateAuthSession(
+  payload: AuthSessionResponse,
+  expectedToken?: string,
+): AuthSession | null {
   const session = getAuthSession()
-  if (!session) return null
+  if (!session || (expectedToken != null && session.token !== expectedToken)) return null
   saveAuthSession({
     ...session,
     expiresAt: normalizeExpiresAt(payload.expires_at),

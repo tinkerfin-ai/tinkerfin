@@ -20,9 +20,15 @@ RecoverableSourceT = TypeVar("RecoverableSourceT")
 class MessageSource(Protocol[SourceT_co]):
     """Single-use asynchronous source whose close operation is idempotent."""
 
-    def __aiter__(self) -> AsyncIterator[SourceT_co]: ...
+    def __aiter__(self) -> AsyncIterator[SourceT_co]:
+        """Return the source's single-use asynchronous iterator."""
 
-    async def aclose(self) -> None: ...
+        ...
+
+    async def aclose(self) -> None:
+        """Close the source and settle owned upstream cleanup idempotently."""
+
+        ...
 
 
 @runtime_checkable
@@ -37,16 +43,28 @@ class ProfiledMessageSource(
     """
 
     @property
-    def messaging_codec_profile(self) -> str: ...
+    def messaging_codec_profile(self) -> str:
+        """Return the registered codec profile for durable serialization."""
+
+        ...
 
     @property
-    def messaging_identity(self) -> Identity: ...
+    def messaging_identity(self) -> Identity:
+        """Return the immutable durable thread and run identity."""
+
+        ...
 
     @property
-    def messaging_source_type(self) -> type[SourceT_co]: ...
+    def messaging_source_type(self) -> type[SourceT_co]:
+        """Return the live item type consumed by the profile codec."""
+
+        ...
 
     @property
-    def messaging_replay_type(self) -> type[ReplayT_co]: ...
+    def messaging_replay_type(self) -> type[ReplayT_co]:
+        """Return the decoded item type yielded during replay."""
+
+        ...
 
 
 @runtime_checkable
@@ -56,7 +74,10 @@ class RecoverableSource(Protocol[RecoverableSourceT]):
     async def open(
         self,
         checkpoint: RecoveryCheckpoint | None,
-    ) -> MessageSource[RecoverableMessage[RecoverableSourceT]]: ...
+    ) -> MessageSource[RecoverableMessage[RecoverableSourceT]]:
+        """Open a new source at the last durably committed checkpoint."""
+
+        ...
 
 
 @runtime_checkable
@@ -65,13 +86,22 @@ class MessageCodec(Protocol[SourceT_contra, ReplayT_co]):
 
     codec_id: ClassVar[str]
 
-    def encode(self, item: SourceT_contra) -> bytes: ...
+    def encode(self, item: SourceT_contra) -> bytes:
+        """Encode one live item into the profile's stable byte schema."""
 
-    def decode(self, payload: bytes) -> ReplayT_co: ...
+        ...
+
+    def decode(self, payload: bytes) -> ReplayT_co:
+        """Decode one committed payload into its replay type."""
+
+        ...
 
 
 @runtime_checkable
 class SseRenderer(Protocol[ReplayT_contra]):
     """Render one decoded payload with its durable sequence as an SSE frame."""
 
-    def render(self, *, seq: int, payload: ReplayT_contra) -> bytes: ...
+    def render(self, *, seq: int, payload: ReplayT_contra) -> bytes:
+        """Render one decoded payload and durable sequence as an SSE frame."""
+
+        ...

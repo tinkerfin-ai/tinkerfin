@@ -83,6 +83,13 @@ class SseBody(Generic[ChunkT_co]):
         source_factory: Callable[[], AsyncIterator[ChunkT_co]],
         close: Callable[[], Awaitable[None]],
     ) -> None:
+        """Initialize a lazy single-use body and its owned close callback.
+
+        Args:
+            source_factory: Factory invoked only by the first response pull.
+            close: Idempotent asynchronous cleanup for the upstream stream.
+        """
+
         self._source_factory = source_factory
         self._close = close
         self._source: AsyncIterator[ChunkT_co] | None = None
@@ -115,9 +122,13 @@ class SseBody(Generic[ChunkT_co]):
             raise
 
     def __aiter__(self) -> SseBody[ChunkT_co]:
+        """Return this single-use asynchronous response body."""
+
         return self
 
     async def __anext__(self) -> ChunkT_co:
+        """Return the next body chunk while enforcing one active operation."""
+
         if self._closed:
             raise StopAsyncIteration
         current = cast(asyncio.Task[object] | None, asyncio.current_task())

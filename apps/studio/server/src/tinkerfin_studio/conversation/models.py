@@ -28,9 +28,7 @@ class ConversationThread(Base):
 
     __tablename__ = "conversation_threads"
     __table_args__ = (
-        UniqueConstraint(
-            "user_id", "thread_id", name="uq_conversation_threads_user_thread"
-        ),
+        UniqueConstraint("thread_id", name="uq_conversation_threads_thread"),
         Index(
             "ix_conversation_threads_user_updated",
             "user_id",

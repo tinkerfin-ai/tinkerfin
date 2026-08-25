@@ -17,7 +17,6 @@ const workspace: WorkspaceState = {
       mode: 'default',
       messages: [],
       todos: [],
-      plan: null,
       runStatus: 'idle',
     },
     {
@@ -29,7 +28,6 @@ const workspace: WorkspaceState = {
       mode: 'default',
       messages: [],
       todos: [],
-      plan: null,
       runStatus: 'idle',
     },
   ],
@@ -84,7 +82,7 @@ describe('Sidebar', () => {
     expect(screen.queryByText('Yunsan')).not.toBeInTheDocument()
     expect(screen.queryByText('Pro 工作区')).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: '打开用户菜单' }))
-    fireEvent.click(screen.getByRole('button', { name: '退出登录' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: '退出登录' }))
 
     expect(onLogout).toHaveBeenCalledOnce()
   })
@@ -112,22 +110,22 @@ describe('Sidebar', () => {
     const accountButton = screen.getByRole('button', { name: '打开用户菜单' })
 
     fireEvent.click(accountButton)
-    fireEvent.click(screen.getByRole('button', { name: '设置' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: '设置' }))
 
     expect(onOpenSettings).toHaveBeenCalledWith(accountButton)
-    expect(screen.queryByRole('button', { name: '退出登录' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('menuitem', { name: '退出登录' })).not.toBeInTheDocument()
   })
 
   it('用户菜单只在容器外部的指针操作后收起', () => {
     render(<Sidebar {...baseProps} />)
 
     fireEvent.click(screen.getByRole('button', { name: '打开用户菜单' }))
-    fireEvent.pointerDown(screen.getByRole('button', { name: '设置' }))
-    expect(screen.getByRole('button', { name: '退出登录' })).toBeInTheDocument()
+    fireEvent.pointerDown(screen.getByRole('menuitem', { name: '设置' }))
+    expect(screen.getByRole('menuitem', { name: '退出登录' })).toBeInTheDocument()
 
     fireEvent.pointerDown(screen.getByRole('navigation', { name: '工作区功能' }))
 
-    expect(screen.queryByRole('button', { name: '退出登录' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('menuitem', { name: '退出登录' })).not.toBeInTheDocument()
     const collapsedTrigger = screen.getByRole('button', { name: '打开用户菜单' })
     expect(collapsedTrigger).toHaveAttribute('aria-expanded', 'false')
     expect(collapsedTrigger.querySelector('.lucide-chevron-down')).not.toBeInTheDocument()
@@ -141,8 +139,31 @@ describe('Sidebar', () => {
     fireEvent.keyDown(document, { key: 'Escape' })
 
     const trigger = screen.getByRole('button', { name: '打开用户菜单' })
-    expect(screen.queryByRole('button', { name: '退出登录' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('menuitem', { name: '退出登录' })).not.toBeInTheDocument()
     expect(trigger).toHaveFocus()
+  })
+
+  it('用户菜单进入第一项并支持方向键与 Tab 离开', async () => {
+    const user = userEvent.setup()
+    render(
+      <>
+        <Sidebar {...baseProps} />
+        <button type="button" aria-label="打开任务抽屉" />
+      </>,
+    )
+
+    await user.click(screen.getByRole('button', { name: '打开用户菜单' }))
+    const settings = screen.getByRole('menuitem', { name: '设置' })
+    const logout = screen.getByRole('menuitem', { name: '退出登录' })
+    expect(settings).toHaveFocus()
+
+    await user.keyboard('{ArrowDown}')
+    expect(logout).toHaveFocus()
+    await user.keyboard('{Home}')
+    expect(settings).toHaveFocus()
+    await user.tab()
+    expect(screen.queryByRole('menu', { name: '账户' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '打开任务抽屉' })).toHaveFocus()
   })
 
   it('falls back to the username when the display name is empty', () => {
@@ -171,7 +192,7 @@ describe('Sidebar', () => {
     }
 
     fireEvent.click(screen.getByRole('button', { name: '打开用户菜单' }))
-    expect(screen.getByRole('button', { name: '设置' })).toBeEnabled()
+    expect(screen.getByRole('menuitem', { name: '设置' })).toBeEnabled()
   })
 
   it('在展开侧栏中把搜索放到收起控件左侧并使用任务抽屉图标', () => {
@@ -210,11 +231,20 @@ describe('Sidebar', () => {
     expect(onNew).toHaveBeenCalledOnce()
   })
 
+  it('modal 隔离期间不响应工作区全局快捷键', () => {
+    const onNew = vi.fn()
+    render(<Sidebar {...baseProps} backgroundInert onNew={onNew} />)
+
+    fireEvent.keyDown(document, { key: 'k', metaKey: true })
+
+    expect(onNew).not.toHaveBeenCalled()
+  })
+
   it('仅在当前草稿是新会话时选中新会话入口', () => {
     const { rerender } = render(<Sidebar {...baseProps} />)
 
     expect(screen.getByRole('button', { name: '新会话' })).not.toHaveClass('is-selected')
-    expect(screen.getByRole('button', { name: '新会话' })).not.toHaveAttribute('aria-pressed')
+    expect(screen.getByRole('button', { name: '新会话' })).toHaveAttribute('aria-pressed', 'false')
 
     rerender(<Sidebar {...baseProps} workspace={{ ...workspace, currentThreadId: '' }} />)
 
@@ -230,7 +260,9 @@ describe('Sidebar', () => {
     const historyList = screen.getByRole('region', { name: '最近对话' })
     const historyRegion = historyList.parentElement
     expect(historyList).toHaveClass('ui-scrollbar')
-    expect(historyRegion?.querySelector('.ui-scrollbar-overlay')).toBeInTheDocument()
+    expect(historyList).toHaveAttribute('tabindex', '0')
+    expect(historyRegion?.querySelector('.ui-scrollbar-overlay')).not.toBeInTheDocument()
+    expect(historyRegion?.querySelector('.ui-overlay-scrollbar')).toHaveAttribute('data-visibility', 'transient')
     const pinnedItem = screen.getByRole('button', { name: '打开会话：置顶会话' }).closest('.conversation-item')
     expect(historyRegion).toHaveClass('conversation-history')
     expect(screen.queryByText('最近对话')).not.toBeInTheDocument()
@@ -306,13 +338,25 @@ describe('Sidebar', () => {
     expect(trigger).toHaveFocus()
   })
 
-  it('keeps pagination loading silent and outside the scroll flow', () => {
-    render(<Sidebar {...baseProps} isLoadingMore />)
-
+  it('reserves one stable pagination slot while loading and error content changes', () => {
+    const { rerender } = render(<Sidebar {...baseProps} />)
     const scroll = screen.getByRole('region', { name: '最近对话' })
-    expect(screen.queryByText('正在加载更多历史会话')).not.toBeInTheDocument()
+    const slot = scroll.querySelector('.history-pagination-slot')
+    expect(slot).toBeInTheDocument()
+    expect(slot).toBeEmptyDOMElement()
+
+    rerender(<Sidebar {...baseProps} isLoadingMore />)
+    expect(scroll.querySelector('.history-pagination-slot')).toBe(slot)
+    expect(screen.getByText('正在加载更多历史会话')).toHaveAttribute('role', 'status')
     expect(screen.queryByTestId('history-skeleton')).not.toBeInTheDocument()
     expect(scroll.querySelector('.history-load-sentinel')).toBeInTheDocument()
+
+    rerender(<Sidebar {...baseProps} loadMoreError="加载历史失败" />)
+    expect(scroll.querySelector('.history-pagination-slot')).toBe(slot)
+    expect(screen.getByRole('alert')).toHaveTextContent('加载历史失败')
+
+    rerender(<Sidebar {...baseProps} hasMore={false} />)
+    expect(scroll.querySelector('.history-pagination-slot')).not.toBeInTheDocument()
   })
 
   it('coalesces repeated bottom scroll events into one request per idle-separated burst', () => {
@@ -330,15 +374,20 @@ describe('Sidebar', () => {
     fireEvent.scroll(scroll)
     expect(onLoadMore).toHaveBeenCalledOnce()
 
-    act(() => vi.advanceTimersByTime(601))
+    act(() => vi.advanceTimersByTime(121))
     fireEvent.scroll(scroll)
     expect(onLoadMore).toHaveBeenCalledTimes(2)
   })
 
-  it('loads one page per sentinel entry and rearms only after it leaves', () => {
+  it('prevents the sentinel from loading another page during the same scroll burst', () => {
+    vi.useFakeTimers()
     let observerCallback: IntersectionObserverCallback | undefined
+    let observerRootMargin = ''
     vi.stubGlobal('IntersectionObserver', class {
-      constructor(callback: IntersectionObserverCallback) { observerCallback = callback }
+      constructor(callback: IntersectionObserverCallback, options?: IntersectionObserverInit) {
+        observerCallback = callback
+        observerRootMargin = options?.rootMargin ?? ''
+      }
       observe() {}
       unobserve() {}
       disconnect() {}
@@ -349,12 +398,27 @@ describe('Sidebar', () => {
     })
     const onLoadMore = vi.fn()
     render(<Sidebar {...baseProps} onLoadMore={onLoadMore} />)
+    const scroll = screen.getByRole('region', { name: '最近对话' })
+    Object.defineProperties(scroll, {
+      scrollTop: { configurable: true, writable: true, value: 100 },
+      clientHeight: { configurable: true, value: 200 },
+      scrollHeight: { configurable: true, value: 300 },
+    })
 
+    fireEvent.scroll(scroll)
     act(() => observerCallback?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver))
+    expect(onLoadMore).toHaveBeenCalledOnce()
+    expect(observerRootMargin).toBe('0px 0px 320px')
+
+    act(() => observerCallback?.([{ isIntersecting: false } as IntersectionObserverEntry], {} as IntersectionObserver))
+    act(() => vi.advanceTimersByTime(100))
+    fireEvent.wheel(scroll, { deltaY: 120 })
+    act(() => vi.advanceTimersByTime(100))
     act(() => observerCallback?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver))
     expect(onLoadMore).toHaveBeenCalledOnce()
 
     act(() => observerCallback?.([{ isIntersecting: false } as IntersectionObserverEntry], {} as IntersectionObserver))
+    act(() => vi.advanceTimersByTime(121))
     act(() => observerCallback?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver))
     expect(onLoadMore).toHaveBeenCalledTimes(2)
   })
@@ -396,7 +460,8 @@ describe('Sidebar', () => {
     expect(scroll.scrollTop).toBe(160)
   })
 
-  it('retries a failed page on the next deliberate bottom scroll without rendering a box', () => {
+  it('renders a failed page with an explicit retry while retaining deliberate-scroll recovery', async () => {
+    const user = userEvent.setup()
     const onLoadMore = vi.fn()
     const onRetryLoadMore = vi.fn()
     render(
@@ -417,7 +482,9 @@ describe('Sidebar', () => {
     fireEvent.scroll(scroll)
     expect(onRetryLoadMore).toHaveBeenCalledOnce()
     expect(onLoadMore).not.toHaveBeenCalled()
-    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(screen.getByRole('alert')).toHaveTextContent('加载历史失败')
+    await user.click(screen.getByRole('button', { name: '重试加载历史' }))
+    expect(onRetryLoadMore).toHaveBeenCalledTimes(2)
   })
 })
 
@@ -609,7 +676,7 @@ describe('Sidebar rail and inline search', () => {
 
     fireEvent.click(accountTrigger)
     expect(onRequestExpanded).toHaveBeenCalledOnce()
-    expect(screen.queryByRole('button', { name: '退出登录' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('menuitem', { name: '退出登录' })).not.toBeInTheDocument()
   })
 
   it('在 Rail 导航中同步新会话的选中状态', () => {

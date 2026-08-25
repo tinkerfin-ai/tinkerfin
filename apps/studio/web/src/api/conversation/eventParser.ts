@@ -3,10 +3,10 @@ import type {
   ConversationAgUiEvent,
   EventSourceInfo,
   RawEventContext,
-  RunStartedInput,
 } from './types'
 
 const INVALID_EVENT_MESSAGE = '事件流包含无效的 AG-UI 事件'
+const MAX_JSON_DEPTH = 64
 
 const isRecord = (value: unknown): value is Record<string, unknown> => (
   value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -17,9 +17,10 @@ const isStringArray = (value: unknown): value is string[] => (
 )
 
 const isJsonValue = (value: unknown): value is JsonValue => {
-  const pending: Array<{ value: unknown; leaving: boolean }> = [{
+  const pending: Array<{ value: unknown; leaving: boolean; depth: number }> = [{
     value,
     leaving: false,
+    depth: 1,
   }]
   const activeAncestors = new Set<object>()
 
@@ -35,16 +36,19 @@ const isJsonValue = (value: unknown): value is JsonValue => {
     ) continue
 
     if (typeof current !== 'object') return false
+    if (frame.depth > MAX_JSON_DEPTH) return false
     if (frame.leaving) {
       activeAncestors.delete(current)
       continue
     }
     if (activeAncestors.has(current)) return false
     activeAncestors.add(current)
-    pending.push({ value: current, leaving: true })
+    pending.push({ value: current, leaving: true, depth: frame.depth })
 
     const children = Array.isArray(current) ? current : Object.values(current)
-    for (const child of children) pending.push({ value: child, leaving: false })
+    for (const child of children) {
+      pending.push({ value: child, leaving: false, depth: frame.depth + 1 })
+    }
   }
 
   return true
@@ -123,36 +127,6 @@ const hasOptionalRawEvent = (value: Record<string, unknown>) => (
   value.rawEvent === undefined || isRawEventContext(value.rawEvent)
 )
 
-const isRunStartedInput = (value: unknown): value is RunStartedInput => {
-  if (!isRecord(value)) return false
-  const messagesValid = value.messages === undefined || (
-    Array.isArray(value.messages)
-    && value.messages.every((message) => isRecord(message)
-      && typeof message.id === 'string'
-      && typeof message.role === 'string'
-      && typeof message.content === 'string')
-  )
-  const resumeValid = value.resume === undefined || (
-    Array.isArray(value.resume)
-    && value.resume.every((entry) => isRecord(entry)
-      && typeof entry.interruptId === 'string'
-      && (entry.status === 'resolved' || entry.status === 'cancelled')
-      && (entry.payload === undefined || isJsonValue(entry.payload)))
-  )
-
-  return typeof value.threadId === 'string'
-    && typeof value.runId === 'string'
-    && hasOptionalString(value, 'parentRunId')
-    && (value.state === undefined || isJsonObject(value.state))
-    && messagesValid
-    && (value.tools === undefined
-      || (Array.isArray(value.tools) && value.tools.every(isJsonValue)))
-    && (value.context === undefined
-      || (Array.isArray(value.context) && value.context.every(isJsonValue)))
-    && (value.forwardedProps === undefined || isJsonObject(value.forwardedProps))
-    && resumeValid
-}
-
 const isMessageSnapshot = (value: unknown) => (
   isRecord(value)
   && typeof value.id === 'string'
@@ -160,12 +134,29 @@ const isMessageSnapshot = (value: unknown) => (
   && (value.content === undefined || isJsonValue(value.content))
 )
 
-const isStateDeltaOperation = (value: unknown) => (
-  isRecord(value)
-  && (value.op === 'add' || value.op === 'remove' || value.op === 'replace')
-  && typeof value.path === 'string'
-  && (value.value === undefined || isJsonValue(value.value))
-)
+const isJsonPointer = (value: string) => {
+  if (value === '') return true
+  if (!value.startsWith('/')) return false
+  for (let index = 1; index < value.length; index += 1) {
+    if (value[index] !== '~') continue
+    const escaped = value[index + 1]
+    if (escaped !== '0' && escaped !== '1') return false
+    index += 1
+  }
+  return true
+}
+
+const isStateDeltaOperation = (value: unknown) => {
+  if (!isRecord(value) || typeof value.path !== 'string' || !isJsonPointer(value.path)) {
+    return false
+  }
+  if (value.op === 'remove') {
+    return value.value === undefined || isJsonValue(value.value)
+  }
+  return (value.op === 'add' || value.op === 'replace')
+    && Object.hasOwn(value, 'value')
+    && isJsonValue(value.value)
+}
 
 const isInterrupt = (value: unknown) => (
   isRecord(value)
@@ -196,7 +187,7 @@ const isConversationAgUiEvent = (value: unknown): value is ConversationAgUiEvent
         && hasOptionalString(value, 'parentRunId')
         && hasOptionalString(value, 'title')
         && hasOptionalRawEvent(value)
-        && (value.input === undefined || isRunStartedInput(value.input))
+        && value.input === undefined
 
     case 'MESSAGES_SNAPSHOT':
       return hasOptionalRawEvent(value)

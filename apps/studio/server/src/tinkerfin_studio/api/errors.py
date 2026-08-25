@@ -75,11 +75,11 @@ class ConversationErrorCode(ErrorCode):
     RUN_IDENTITY_CONFLICT = (1_001_004_021, 409, "相同 runId 的请求内容不一致")
     RUN_CANCEL_UNSUPPORTED = (1_001_004_022, 409, "当前运行不支持取消")
     EVENT_PROJECTION_UNAVAILABLE = (1_001_004_023, 503, "会话事件投影暂不可用")
-    MIXED_RESUME_UNSUPPORTED = (1_001_004_024, 422, "不支持混合已解决和已取消的 resume")
     RUN_CANCEL_FAILED = (1_001_004_025, 500, "取消会话运行失败")
     RESUME_ALREADY_CLAIMED = (1_001_004_026, 409, "该审批已被另一次恢复运行认领")
     MESSAGING_FAILURE = (1_001_004_027, 500, "会话消息处理失败")
     HISTORY_SCHEMA_MISMATCH = (1_001_004_028, 500, "会话历史数据不符合当前版本")
+    MESSAGING_QUOTA_EXCEEDED = (1_001_004_029, 413, "会话事件超过持久化容量限制")
 
 
 class ApplicationException(Exception):

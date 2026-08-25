@@ -2,12 +2,19 @@
 
 from tinkerfin_agui_adapter import Identity as Identity
 
+from ._hitl import TINKERFIN_HITL_CONTRACT as TINKERFIN_HITL_CONTRACT
 from .agui_resume import AgUiResumeBinding as AgUiResumeBinding
+from .agui_resume import AgUiResumeCheckpoint as AgUiResumeCheckpoint
+from .agui_resume import (
+    AgUiResumeCheckpointObserver as AgUiResumeCheckpointObserver,
+)
 from .coordination import InMemoryRunCoordinator as InMemoryRunCoordinator
 from .coordination import RunCoordinator as RunCoordinator
+from .deep_agent import DeepAgentAgUiResumeRuntime as DeepAgentAgUiResumeRuntime
 from .deep_agent import DeepAgentAgUiRuntime as DeepAgentAgUiRuntime
 from .deep_agent import DeepAgentDefinition as DeepAgentDefinition
 from .deep_agent import DeepAgentRuntime as DeepAgentRuntime
+from .errors import AgUiResumeBindingError as AgUiResumeBindingError
 from .errors import RedisLeaseError as RedisLeaseError
 from .errors import RedisLeaseLifecycleError as RedisLeaseLifecycleError
 from .errors import RedisLeaseProtocolError as RedisLeaseProtocolError
@@ -48,13 +55,18 @@ from .runtime import TinkerFin as TinkerFin
 from .runtime import TinkerFinRun as TinkerFinRun
 
 __all__ = [
+    "TINKERFIN_HITL_CONTRACT",
     "AgUiEventStream",
     "AgUiNativeStreamConfig",
     "AgUiNativeStreamConfigurationError",
     "AgUiNativeStreamInvocation",
     "AgUiResumeBinding",
+    "AgUiResumeBindingError",
+    "AgUiResumeCheckpoint",
+    "AgUiResumeCheckpointObserver",
     "AgUiSettlementTimeoutError",
     "AgentMode",
+    "DeepAgentAgUiResumeRuntime",
     "DeepAgentAgUiRuntime",
     "DeepAgentDefinition",
     "DeepAgentRuntime",

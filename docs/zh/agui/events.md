@@ -8,7 +8,7 @@
 
 | 事件 | 前端通常怎么用 |
 | --- | --- |
-| `RUN_STARTED` | 建立运行状态；纯框架事件的 `input` 为 `None`，应用可补充权威请求 |
+| `RUN_STARTED` | 建立运行状态；Graph 输入已经显式提供，因此 `input` 缺省 |
 | `TEXT_MESSAGE_START` | 创建一条新的 Agent 消息 |
 | `TEXT_MESSAGE_CONTENT` | 追加回答文字 |
 | `TEXT_MESSAGE_END` | 结束这条消息 |
@@ -44,7 +44,8 @@ RUN_FINISHED
 
 `expose_subagent_events=True` 会发送子 Agent 的公开事件。设置为 `False` 时，转换器仍会检查这些数据，但不把对应事件交给前端。
 
-框架不会用 `parentRunId` 表示 LangGraph 子图，也不会自动生成该字段。经过校验的 Deep Agents
+框架不会用 `parentRunId` 表示 LangGraph 子图。高层 Runtime 显式接收 `parent_run_id`，并且只把它
+用于 checkpoint 分支。经过校验的 Deep Agents
 委派会在 task RAW descriptor 中携带 `tinkerfin.subagent-provenance.v1`：
 `subagentInvocationId` 跨 resume 稳定，`requestRunId` 表示当前主请求，子事件 source 重复该
 invocation ID，父 task Result 使用 `relatedSubagentInvocationId`。

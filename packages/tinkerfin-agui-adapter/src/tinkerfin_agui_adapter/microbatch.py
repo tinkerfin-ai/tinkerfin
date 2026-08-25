@@ -23,6 +23,14 @@ class ContentBatcher:
         time_threshold_seconds: float = TIME_THRESHOLD_SECONDS,
         now: Callable[[], float] = monotonic,
     ) -> None:
+        """Initialize an in-memory batch with bounded size and elapsed time.
+
+        Args:
+            char_threshold: Maximum buffered character count before a flush.
+            time_threshold_seconds: Maximum age of a non-empty batch in seconds.
+            now: Monotonic clock used to calculate the remaining wait.
+        """
+
         self._char_threshold = char_threshold
         self._time_threshold = time_threshold_seconds
         self._now = now

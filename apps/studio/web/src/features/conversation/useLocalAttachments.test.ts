@@ -12,10 +12,6 @@ const file = (name: string, type: string, size = 128) => {
 describe('useLocalAttachments', () => {
   beforeEach(() => {
     vi.stubGlobal('crypto', { randomUUID: vi.fn(() => `attachment-${Math.random()}`) })
-    vi.stubGlobal('URL', {
-      createObjectURL: vi.fn((value: File) => `blob:${value.name}`),
-      revokeObjectURL: vi.fn(),
-    })
   })
 
   afterEach(() => {
@@ -23,7 +19,7 @@ describe('useLocalAttachments', () => {
     vi.unstubAllGlobals()
   })
 
-  it('accepts images and PDF while keeping previews local', () => {
+  it('accepts image and PDF files without allocating unused preview resources', () => {
     const { result } = renderHook(() => useLocalAttachments())
 
     act(() => result.current.addFiles([
@@ -32,10 +28,8 @@ describe('useLocalAttachments', () => {
     ]))
 
     expect(result.current.attachments).toHaveLength(2)
-    expect(result.current.attachments[0]).toMatchObject({
-      kind: 'image',
-      previewUrl: 'blob:chart.png',
-    })
+    expect(result.current.attachments[0]).toMatchObject({ kind: 'image' })
+    expect(result.current.attachments[0]).not.toHaveProperty('previewUrl')
     expect(result.current.attachments[1]).toMatchObject({ kind: 'pdf' })
     expect(result.current.error).toBeUndefined()
   })
@@ -57,21 +51,18 @@ describe('useLocalAttachments', () => {
     expect(result.current.error).toBe('最多添加 5 个附件')
   })
 
-  it('releases image URLs on removal, clear and unmount', () => {
-    const { result, unmount } = renderHook(() => useLocalAttachments())
+  it('removes and clears attachments without a separate resource lifecycle', () => {
+    const { result } = renderHook(() => useLocalAttachments())
 
     act(() => result.current.addFiles([file('one.png', 'image/png')]))
     const first = result.current.attachments[0]
     if (!first) throw new Error('missing first attachment')
     act(() => result.current.removeAttachment(first.id))
-    expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:one.png')
+    expect(result.current.attachments).toHaveLength(0)
 
     act(() => result.current.addFiles([file('two.png', 'image/png')]))
     act(() => result.current.clearAttachments())
-    expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:two.png')
-
-    act(() => result.current.addFiles([file('three.png', 'image/png')]))
-    unmount()
-    expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:three.png')
+    expect(result.current.attachments).toHaveLength(0)
+    expect(result.current.error).toBeUndefined()
   })
 })

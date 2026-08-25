@@ -16,7 +16,7 @@ export function EmptyConversation() {
   return (
     <div className="empty-conversation">
       <h2 className="visually-hidden">{t('暂无消息')}</h2>
-      <p className="visually-hidden">{t('发送一条消息，开始新的真实对话流。')}</p>
+      <p className="visually-hidden">{t('发送一条消息，开始新的真实对话流')}</p>
     </div>
   )
 }

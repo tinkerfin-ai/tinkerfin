@@ -15,7 +15,7 @@ import {
   type KeyboardEvent,
 } from 'react'
 
-import { Button, IconButton } from '../../../components/ui'
+import { Button, IconButton, OverlayScrollbar } from '../../../components/ui'
 import type { PlanQuestionItem, PlanQuestionState } from '../../../types'
 import { useI18n } from '../../../i18n'
 import { ActivityDots } from './ActivityDots'
@@ -80,7 +80,6 @@ export function PlanQuestionComposer({
     interaction.questions.length - 1,
   )
   const question = interaction.questions[activeIndex]
-  const answerCount = (question?.options.length ?? 0) + (question?.allowFreeText ? 1 : 0)
   useEffect(() => {
     setMinimized(readPlanQuestionCollapsed(threadId))
   }, [threadId])
@@ -90,10 +89,13 @@ export function PlanQuestionComposer({
   }, [activeIndex])
 
   useEffect(() => {
-    if (minimized || answerCount === 0) return
-    const frame = window.requestAnimationFrame(() => optionRefs.current[0]?.focus())
+    if (minimized) return
+    // 选项为空时，自由文本就是该问题唯一可回答入口
+    const frame = window.requestAnimationFrame(() => (
+      optionRefs.current[0] ?? customAnswerRef.current
+    )?.focus())
     return () => window.cancelAnimationFrame(frame)
-  }, [activeIndex, answerCount, minimized])
+  }, [activeIndex, minimized])
 
   useEffect(() => {
     if (minimized) return
@@ -148,11 +150,14 @@ export function PlanQuestionComposer({
   }
 
   const moveAnswerFocus = (direction: 1 | -1) => {
-    if (answerCount === 0) return
-    const next = (focusedAnswerIndex + direction + answerCount) % answerCount
+    if (question.options.length === 0) return
+    const next = (
+      focusedAnswerIndex
+      + direction
+      + question.options.length
+    ) % question.options.length
     setFocusedAnswerIndex(next)
-    if (next < question.options.length) optionRefs.current[next]?.focus()
-    else customAnswerRef.current?.focus()
+    optionRefs.current[next]?.focus()
   }
 
   const handleAnswerKeyDown = (
@@ -172,8 +177,11 @@ export function PlanQuestionComposer({
 
   const continueFromCustom = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === 'ArrowUp' && event.currentTarget.value === '') {
-      event.preventDefault()
-      moveAnswerFocus(-1)
+      const lastOption = optionRefs.current.at(-1)
+      if (lastOption) {
+        event.preventDefault()
+        lastOption.focus()
+      }
       return
     }
     if (
@@ -304,17 +312,20 @@ export function PlanQuestionComposer({
 
       {!minimized && (
         <>
-          <div ref={bodyRef} className="plan-question-composer-body ui-scrollbar">
+          <div
+            ref={bodyRef}
+            className="plan-question-composer-body ui-scrollbar"
+            role="region"
+            aria-label={question.prompt}
+          >
             <h3>
               <span>{question.prompt}</span>
               {!question.required && <small>{t('可选')}</small>}
             </h3>
-            <div
-              className="plan-question-options"
-              role="radiogroup"
-              aria-label={question.prompt}
-            >
-              {question.options.map((option, optionIndex) => (
+            <div className="plan-question-options">
+              {question.options.length > 0 && (
+                <div className="plan-question-choice-list" role="radiogroup" aria-label={question.prompt}>
+                  {question.options.map((option, optionIndex) => (
                 <button
                   key={option.id}
                   ref={(node) => { optionRefs.current[optionIndex] = node }}
@@ -332,22 +343,25 @@ export function PlanQuestionComposer({
                   </span>
                   <span className="plan-question-option-copy">
                     <strong>{option.label}</strong>
+                    {option.description && <small>{option.description}</small>}
                     {option.recommended && (
                       <span className="plan-question-option-recommended">{t('推荐')}</span>
                     )}
-                    {option.description && <small>{option.description}</small>}
                   </span>
                 </button>
-              ))}
+                  ))}
+                </div>
+              )}
               {question.allowFreeText && (
                 <label className={`plan-question-custom${question.customAnswer ? ' is-active' : ''}`}>
+                  <span className="visually-hidden">{t('自定义回答：{question}', { question: question.prompt })}</span>
                   <span className="plan-question-option-index" aria-hidden="true">
                     <MessageSquareText size={13} />
                   </span>
                   <textarea
                     ref={customAnswerRef}
+                    id={`plan-question-custom-${interaction.interruptId}-${question.id}`}
                     rows={1}
-                    tabIndex={focusedAnswerIndex === question.options.length ? 0 : -1}
                     value={question.customAnswer ?? ''}
                     placeholder={t('输入你的答案')}
                     onFocus={() => setFocusedAnswerIndex(question.options.length)}
@@ -368,6 +382,7 @@ export function PlanQuestionComposer({
             </div>
           </div>
 
+          <OverlayScrollbar viewportRef={bodyRef} />
           <footer className="plan-question-composer-footer">
             <div className="plan-question-composer-pager">
               <IconButton

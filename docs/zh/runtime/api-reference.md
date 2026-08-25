@@ -14,9 +14,11 @@
 | `Identity(threadId=..., runId=...)` | 表示一次框架运行 | 只包含 thread 和 run |
 | `TinkerFin.run(...)` | 运行自己的异步事件源 | `source_factory`、`identity`、`on_part` |
 | `DeepAgentDefinition.new(...)` | 创建原生 Runtime | 必填 `identity`，可选本次请求 `mode` 和 `on_part` |
-| `DeepAgentDefinition.new_agui(...)` | 创建 AG-UI Runtime | 可选本次请求 `mode`；详见 [AG-UI 入门](../agui/index.md) |
+| `DeepAgentDefinition.new_agui(...)` | 创建 AG-UI Runtime | 必填 canonical `identity`；可选 parent、mode、resume、checkpoint callback 与 observer |
 
-`DeepAgentDefinition` 可以重复使用。`DeepAgentRuntime`、`DeepAgentAgUiRuntime`、`TinkerFinRun` 和 `NativeTinkerFinRun` 都是一次性运行对象，不要自行构造。
+`DeepAgentDefinition` 可以重复使用。`DeepAgentRuntime`、`DeepAgentAgUiRuntime`、
+`DeepAgentAgUiResumeRuntime`、`TinkerFinRun` 和 `NativeTinkerFinRun` 都是一次性运行对象，
+不要自行构造。
 
 `.plan(enabled=True)` 只影响从返回 factory 创建的 Definition，不会给
 `create_deep_agent(...)` 增加参数。返回 factory 保留 coordinator 和全局 state schema。
@@ -35,9 +37,13 @@ Definition 只接受 `default`。
 `DefaultClarificationForm`、`PlanContentModel`、`StructuredPlanStep`、
 `StructuredPlanContent`、`MarkdownPlanContent`、`PlanSchemaReference`、`PlanDraft`、
 `ConfirmedPlan`、`RequirementAnswer`、`PendingClarification`、`ClarificationExchange`、
-`PlanState`、`PlanStatus`、`PlanHandoff`、`PlanReviewAction` 和 Plan 错误类型。这些模型不可变。
+`PlanState`、`PlanStatus`、`PlanHandoff`、`PlanHandoffPhase`、`PlanReviewAction` 和 Plan 错误类型。这些模型不可变。
 Planning 状态以 camel case JSON 保存在 `tinkerfin_plan`；批准 handoff 提交后
 `effectiveMode` 为 `default`。
+
+`PlanHandoffPhase` 按 `pending → accepted → completed` 推进。accepted 会记录包含确定性 handoff
+消息的原生 checkpoint；completed 还会记录原生终止 checkpoint。重试会对账这些 checkpoint，
+不会重新派发已经批准的 Plan。
 
 `.plan(plan_schema=...)` 接受一个具体 `PlanContentModel` 子类。省略时使用
 `StructuredPlanContent`；`MarkdownPlanContent` 原样保留一段非空 Markdown，不改写空白。
@@ -132,6 +138,7 @@ reducer、`Required` / `NotRequired` 和 schema metadata 会保留；同名字�
 | API | 什么时候遇到 |
 | --- | --- |
 | `AgUiResumeBinding` | 恢复被 interrupt 暂停的 AG-UI 运行 |
+| `AgUiResumeCheckpoint` | resume marker 持久化后的稳定回调值 |
 | `tinkerfin.plan.PlanModeConfigurationError` | Plan Definition 缺少具体 saver 或明确模型、state schema 不兼容，或使用了非 sync durability |
 | `AgUiSettlementTimeoutError` | 调用方停止等待，但 Runtime 的清理仍未在限定时间内完成 |
 | `AgUiNativeStreamConfigurationError` | 原生流配置不符合 AG-UI 转换要求 |
@@ -147,9 +154,12 @@ reducer、`Required` / `NotRequired` 和 schema metadata 会保留；同名字�
 | `prior_tool_call_ids` | `frozenset()` | 恢复前已经发送完成的 scoped Tool ID |
 | `private_state_keys` | `frozenset()` | 不进入公开投影的宿主顶层 state channel |
 | `on_event` | `None` | AG-UI 事件交付前的观察函数 |
+| `parent_run_id` | `None` | `RUN_STARTED` 暴露的可选 checkpoint 谱系 |
 
 运行身份已经在 `TinkerFin.run(..., identity=...)` 中绑定，`astream_agui()` 不再重复接收 ID。
 
-`AgUiResumeBinding.from_translation(...)` 接收 `identity` 和转换结果；`validate_identity(...)` 与 `validate_command(...)` 可在自定义入口提前检查恢复目标。一般 Deep Agents 使用者直接走 `new_agui()`。
+`AgUiResumeBinding.from_agui(...)` 校验完整可信 AG-UI interrupt 与 entries，包括原生分组、
+取消模式、Tool ID 与来源 Agent。Binding 不保存 identity 或 parent，也不公开原生 command；宿主可把
+它作为一个完整 Pydantic 模型持久化和恢复。
 
 恢复流程见 [interrupt 与恢复](../agui/interrupts-and-resume.md)。

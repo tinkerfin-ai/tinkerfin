@@ -113,6 +113,17 @@ replacement call waits for that retirement before returning. Creation, health
 checking, replacement, reset, destroy, and shutdown retain cleanup ownership when the
 calling task is cancelled.
 
+`OpenSandboxClient.destroy()` uses one retained task per Sandbox ID. Concurrent callers
+join the same kill and local-close lifecycle. Caller cancellation waits for that owned
+settlement and then propagates; a confirmed remote kill is not reported as failed only
+because the SDK close step also fails. `aclose()` waits for every active destroy task
+before closing the owned transport.
+
+Warm-pool capacities are strict integers, and command timeouts are strict finite numeric
+values; booleans are rejected before State startup or task creation. State and
+SQLAlchemy constructors apply the same boundary so invalid capacity cannot fail later
+inside warmup.
+
 With `InMemoryOpenSandboxState`, shutdown destroys remote Sandboxes owned only by that
 process because no later worker can recover them. Persistent state keeps committed
 bindings, warm slots, and durable cleanup work available to other workers.

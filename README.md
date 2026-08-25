@@ -74,16 +74,17 @@ Use `agent.new()` for native LangGraph objects. Both Runtime types expose the in
   without weakening reducers or requiredness.
 - `.plan(enabled=True)` adds one stable parent workflow without changing the installed
   `create_deep_agent(...)` signature. Choose `mode="default"` or `mode="plan"` on each
-  `new()` / `new_agui()` request; a concrete checkpointer is required.
+  `new()` / `new_agui()` request; selecting Plan requires a concrete checkpointer.
 - AG-UI uses v2 `messages`, `tasks`, and `values` with `subgraphs=True`; invalid stream
   options fail before iteration or lifecycle events.
 - Runtime and Adapter enforce event ordering, subagent provenance, interrupt/resume,
   reasoning privacy, cancellation, backpressure, and cleanup.
 - Object streams provide direct SSE and can be passed unencoded to Messaging for
   persistence, replay, attachment, and remote cancellation.
-- Runtime accepts one `Identity` and injects its Graph thread. Framework
-  `RUN_STARTED.input` is `None`; applications may add a validated canonical request.
-- Resume uses `AgUiResumeBinding` to bind Identity, one native Command, and scoped Tool IDs.
+- AG-UI Runtime uses one `Identity` for public events, Graph execution, checkpoints, and
+  durable delivery; optional `parent_run_id` creates a real checkpoint branch.
+- Resume uses `AgUiResumeBinding.from_agui(...)`; the Runtime owns native commands, Tool
+  correlation, cancellation, and durable checkpoint evidence.
 - `TinkerFin.run(...)` runs custom asynchronous sources.
 
 ## Documentation

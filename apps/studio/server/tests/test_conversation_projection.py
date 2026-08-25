@@ -5,6 +5,7 @@ from typing import cast
 
 import pytest
 from ag_ui.core import BaseEvent, Event
+from ag_ui.core.types import ResumeEntry
 from pydantic import TypeAdapter
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -351,7 +352,7 @@ async def test_projection_preserves_plan_mode_and_pending_plan_interrupt(
                 "interrupts": [
                     {
                         "id": "plan-interrupt-1",
-                        "reason": "plan_clarification",
+                        "reason": "tinkerfin:plan_clarification",
                         "message": "请补充部署环境",
                         "responseSchema": {"type": "object"},
                         "metadata": {
@@ -360,7 +361,7 @@ async def test_projection_preserves_plan_mode_and_pending_plan_interrupt(
                                 "nativeInterruptId": "plan-interrupt-1",
                                 "envelope": {
                                     "schema": "tinkerfin.runtime-interrupt.v1",
-                                    "kind": "plan_clarification",
+                                    "kind": "tinkerfin:plan_clarification",
                                     "message": "请补充部署环境",
                                     "responseSchema": {"type": "object"},
                                     "metadata": {
@@ -446,14 +447,14 @@ async def test_projection_preserves_plan_mode_and_pending_plan_interrupt(
         ("cancelled", None, "resume_cancelled", "cancelled"),
     ),
 )
-async def test_resume_started_clears_pending_snapshot_before_later_error(
+async def test_resume_settlement_clears_pending_snapshot_before_later_error(
     session: AsyncSession,
     resume_status: str,
     resume_payload: dict[str, str] | None,
     error_code: str,
     interrupt_status: str,
 ) -> None:
-    """RUN_STARTED 后已处理审批不得因 resumed run 终止而重新 pending"""
+    """RUN_STARTED 不消费审批，durable settlement 后才清理 pending"""
 
     repository = ConversationRepository(session)
     thread = await repository.create_thread(
@@ -560,10 +561,19 @@ async def test_resume_started_clears_pending_snapshot_before_later_error(
     started = await repository.get_thread_by_pk(thread.id)
     assert started is not None
     assert started.status == "running"
-    assert started.has_pending_interrupt is False
+    assert started.has_pending_interrupt is True
     assert started.snapshot_json is not None
-    assert started.snapshot_json["approval"] is None
-    assert started.snapshot_json["interrupts"] == []
+    assert started.snapshot_json["approval"] is not None
+    assert started.snapshot_json["interrupts"]
+
+    if resume_status == "resolved":
+        await repository.settle_claimed_interrupts(
+            thread_pk=thread.id,
+            run_id="run-resumed",
+            entries=(ResumeEntry.model_validate(resume_entry),),
+            resolution_id="resume-checkpoint-marker",
+        )
+        await session.commit()
 
     envelope, event = _envelope(
         4,

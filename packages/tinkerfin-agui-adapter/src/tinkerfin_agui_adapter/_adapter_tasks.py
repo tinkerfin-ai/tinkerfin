@@ -40,6 +40,7 @@ from ._adapter_contracts import (
     TasksStreamPart,
     TaskStartFingerprint,
     TaskStartPayload,
+    UpdatesStreamPart,
     ValuesStreamPart,
     _to_json_value,
 )
@@ -539,17 +540,23 @@ def _process_values_part(
 
 
 def _process_extra_part(
-    self: DeepAgentAgUiAdapter, part: ExtraStreamPart
+    self: DeepAgentAgUiAdapter, part: ExtraStreamPart | UpdatesStreamPart
 ) -> list[BaseEvent]:
     """Project an additional native mode without exposing runtime config."""
 
     source = self._source(part.ns)
     self._require_started_source(source)
-    data = (
-        _safe_checkpoint_payload(part.data, self._private_state_keys)
-        if part.type in {"checkpoints", "debug"}
-        else sanitize_public_data(part.data)
-    )
+    if isinstance(part, UpdatesStreamPart):
+        data = sanitize_public_data(
+            {
+                node: _without_private_state_keys(update, self._private_state_keys)
+                for node, update in part.data.items()
+            }
+        )
+    elif part.type in {"checkpoints", "debug"}:
+        data = _safe_checkpoint_payload(part.data, self._private_state_keys)
+    else:
+        data = sanitize_public_data(part.data)
     public_event = sanitize_public_data(
         {
             "data": data,

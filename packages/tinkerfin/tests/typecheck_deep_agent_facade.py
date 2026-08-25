@@ -14,6 +14,8 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from tinkerfin import (
     AgUiEventStream,
+    AgUiResumeBinding,
+    DeepAgentAgUiResumeRuntime,
     DeepAgentAgUiRuntime,
     DeepAgentDefinition,
     DeepAgentRuntime,
@@ -92,10 +94,22 @@ if TYPE_CHECKING:
     identity = Identity(threadId="thread-1", runId="run-1")
     native = definition.new(identity=identity)
     agui = definition.new_agui(identity=identity)
+    resumed_agui = definition.new_agui(
+        identity=identity,
+        resume=AgUiResumeBinding(
+            mode="resume",
+            resume_data={"decisions": [{"type": "approve"}]},
+            native_interrupt_ids=("interrupt-1",),
+        ),
+    )
     planned_native = planned_definition.new(identity=identity, mode="plan")
-    planned_agui = planned_definition.new_agui(identity=identity, mode="default")
+    planned_agui = planned_definition.new_agui(
+        identity=identity,
+        mode="default",
+    )
     assert_type(native, DeepAgentRuntime[_Context])
     assert_type(agui, DeepAgentAgUiRuntime[_Context])
+    assert_type(resumed_agui, DeepAgentAgUiResumeRuntime[_Context])
     assert_type(planned_native, DeepAgentRuntime[_Context])
     assert_type(planned_agui, DeepAgentAgUiRuntime[_Context])
 
@@ -108,6 +122,11 @@ if TYPE_CHECKING:
         agui.astream(graph_input, context={"tenant": "tenant-1"}),
         AgUiEventStream,
     )
+    assert_type(
+        resumed_agui.astream(context={"tenant": "tenant-1"}),
+        AgUiEventStream,
+    )
     reveal_type(tinkerfin.create_deep_agent)
     reveal_type(native.astream)
     reveal_type(agui.astream)
+    reveal_type(resumed_agui.astream)

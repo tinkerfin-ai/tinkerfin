@@ -7,9 +7,12 @@
 | API | 用途 |
 | --- | --- |
 | `DeepAgentDefinition.new_agui(...)` | 创建一次 AG-UI Runtime |
-| `DeepAgentAgUiRuntime.astream(...)` | 运行 Graph 并得到 `AgUiEventStream` |
+| `DeepAgentAgUiRuntime.astream(graph_input, ...)` | 执行普通 Graph 请求 |
+| `DeepAgentAgUiResumeRuntime.astream(...)` | 执行已绑定恢复，不接收调用方 input |
 | `AgUiEventStream` | 迭代、取消、关闭或转成 SSE |
-| `AgUiResumeBinding` | 把恢复请求、原生命令和此前已发出的 Tool ID 绑定在一起 |
+| `AgUiResumeBinding.from_agui(...)` | 校验已保存 interrupt、决定、取消、Tool ID 与来源 |
+| `AgUiResumeCheckpoint` | 原生 resume marker 已持久化的稳定证据 |
+| `TINKERFIN_HITL_CONTRACT` | 外部 mixed-cancellation 子 Agent 的契约声明 |
 
 完整 Runtime 参数见 [AG-UI 入门](index.md)，恢复参数见 [interrupt 与恢复](interrupts-and-resume.md)。
 
@@ -37,9 +40,9 @@
 
 | 方法 | 参数 | 结果 |
 | --- | --- | --- |
-| `started(...)` | `identity` | `RUN_STARTED`，`input=None` |
-| `finished(...)` | `identity`、`outcome` | `RUN_FINISHED` |
-| `failed(...)` | `identity`、`message`、`code` | `RUN_ERROR` |
+| `started(...)` | `identity`、可选 `parent_run_id` | `RUN_STARTED`，input 缺省 |
+| `finished(...)` | `identity`、`outcome` | 使用 canonical identity 的 `RUN_FINISHED` |
+| `failed(...)` | `identity`、`message`、`code`、可选 `parent_run_id` | 使用 canonical identity 的 `RUN_ERROR` |
 | `is_main_lifecycle(...)` | `event`、`identity` | 判断事件是否占用该主生命周期 |
 | `event_run_id(event)` | 事件 | 读取可验证的 run ID |
 | `validate_identity(...)` | `identity` | 提前验证运行身份类型 |
@@ -50,13 +53,17 @@
 
 | API | 用途 |
 | --- | --- |
+| `AgUiResumeBinding.from_agui(...)` | 从可信已保存 AG-UI interrupt 构造高层 Binding |
+| `AgUiResumeBinding.model_validate(...)` | 恢复完整稳定 Binding JSON 模型 |
+| `AgUiResumeBindingError` | 高层 Binding 无法无损保留恢复语义 |
 | `ResumeMapper.map(...)` | 从原生 interrupt 和 checkpoint 消息转换恢复请求 |
 | `ResumeMapper.map_agui(...)` | 从服务端保存的 AG-UI interrupt 转换恢复请求 |
-| `ResumeTranslation` | 保存 `mode`、恢复数据、取消 ID、此前已发出的 Tool ID 和逐 interrupt 决定 |
-| `ResumeMappingError` | 恢复请求无法无损映射 |
-| `ResumeMappingFailure` | 稳定的失败类别 |
+| `ResumeTranslation` | 保存 kind、mode、恢复数据、取消项、Tool ID、来源与原生决定 |
+| `ResumeMappingError` | Adapter 低层数据无法无损映射 |
 
-`ResumeTranslation.mode` 只能是 `command`、`abandon` 或 `custom`。
+`ResumeTranslation` 是 Adapter 的低层结果。高层 Runtime 使用
+`AgUiResumeBinding.from_agui(...)`；Binding 内部表示全部 resolved、Tool mixed cancellation
+或全部 cancelled abandonment，不公开原生 command。
 
 ## interrupt 数据模型
 
@@ -70,10 +77,13 @@
 | `ToolReviewInterruptMetadata` | 带版本的原生分组、action 位置、Tool 名称、决定与原始参数 |
 | `SubagentProvenance` | 稳定 invocation ID、完整 namespace、graph task、父 Tool、Agent、描述和当前请求 run |
 
-允许的决定为 `approve`、`edit`、`reject`、`respond`。同一请求中的 action 和 review config 按位置配对。
+公开决定为 `approve`、`edit`、`reject`、`respond`。同一请求中的 action 和 review config
+按位置配对。Adapter 在返回转换结果前，使用 JSON Schema Draft 2020-12 按 `argsSchema` 校验
+编辑后的参数。
 
 `RuntimeInterruptEnvelope` 用于非 Tool 工作流暂停。Adapter 把 `kind` 映射为 AG-UI
-interrupt reason，发出该 envelope 的 Graph 负责校验恢复 JSON 的业务语义。一个待处理批次
+interrupt reason，发出该 envelope 的 Graph 负责校验恢复 JSON 的业务语义。扩展 kind 必须带
+命名空间。一个待处理批次
 不能同时包含 Runtime interrupt 和 Tool interrupt。
 
 `parse_tool_review_interrupt(interrupt)` 按

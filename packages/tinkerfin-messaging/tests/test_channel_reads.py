@@ -11,6 +11,7 @@ from tinkerfin import Identity
 from tinkerfin_messaging import (
     CodecMismatch,
     FiniteMessageSource,
+    InvalidCursor,
     MemoryBackend,
     MessageChannel,
     Messaging,
@@ -100,6 +101,23 @@ async def test_channel_empty_committed_stream_returns_zero_and_empty_page(
         empty = _identity(thread_id="empty")
         assert await channel.latest_seq(identity=empty) == 0
         assert await channel.read(identity=empty, after=0, limit=100) == ()
+
+
+async def test_channel_read_and_follow_reject_cursors_beyond_thread_tail(
+    messaging_backend: MessagingBackend,
+) -> None:
+    """Direct read and follow must enforce the same strict cursor contract."""
+
+    async with Messaging(backend=messaging_backend) as messaging:
+        channel = await _commit(messaging, "first")
+
+        with pytest.raises(InvalidCursor) as read_error:
+            await channel.read(identity=_identity(), after=999)
+        with pytest.raises(InvalidCursor) as follow_error:
+            await channel.follow(identity=_identity(), after=999)
+
+        assert read_error.value.latest == 1
+        assert follow_error.value.latest == 1
 
 
 @pytest.mark.parametrize(

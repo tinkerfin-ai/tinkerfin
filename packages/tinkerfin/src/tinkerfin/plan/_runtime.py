@@ -10,9 +10,22 @@ from typing import Any, Protocol, TypeAlias, cast
 from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.graph import START
 from langgraph.graph.state import CompiledStateGraph
-from langgraph.types import Command
+from langgraph.types import Command, StateSnapshot
 
+from .._agui_lineage import (
+    NATIVE_CHECKPOINT_ROLE,
+    PLANNING_CHECKPOINT_ROLE,
+    RUN_ID_METADATA_KEY,
+    resolve_agui_native_run_head,
+    resolve_agui_thread_head,
+)
+from .._agui_lineage_state import (
+    LINEAGE_STATE_KEY,
+    LineageRole,
+    lineage_marker_with_role,
+)
 from ._content import PlanContentBinding
 from ._state import (
     PLAN_CHECKPOINT_RUN_ID,
@@ -20,8 +33,14 @@ from ._state import (
     read_plan_state,
 )
 from ._workflow import PlanningWorkflowGraph
-from .errors import PlanModeConfigurationError
-from .models import MarkdownPlanContent, PlanContentModel, PlanState, PlanStatus
+from .errors import PlanModeConfigurationError, PlanStateConflictError
+from .models import (
+    MarkdownPlanContent,
+    PlanContentModel,
+    PlanHandoffPhase,
+    PlanState,
+    PlanStatus,
+)
 
 _APPROVED_PLAN_MARKER = "<tinkerfin-approved-plan"
 _CheckpointSaver: TypeAlias = (
@@ -30,13 +49,29 @@ _CheckpointSaver: TypeAlias = (
 
 
 class _GraphRuntime(Protocol):
-    checkpointer: object
+    @property
+    def checkpointer(self) -> object: ...
 
     def astream(
         self,
         *args: object,
         **kwargs: object,
     ) -> AsyncIterator[Mapping[str, object]]: ...
+
+    async def aget_state(
+        self,
+        config: RunnableConfig,
+        *,
+        subgraphs: bool = False,
+    ) -> StateSnapshot: ...
+
+    async def aupdate_state(
+        self,
+        config: RunnableConfig,
+        values: Mapping[str, object],
+        as_node: str | None = None,
+        task_id: str | None = None,
+    ) -> RunnableConfig: ...
 
 
 class _SignatureCallable(Protocol):
@@ -49,37 +84,6 @@ _COMPILED_ASTREAM = cast(
 )
 
 
-def _resume_data(value: object) -> Mapping[object, object] | None:
-    if not isinstance(value, Command):
-        return None
-    command = cast(Command[object], value)
-    raw_resume = cast(object, command.resume)
-    if not isinstance(raw_resume, Mapping):
-        return None
-    return cast(Mapping[object, object], raw_resume)
-
-
-def _contains_decisions(value: object) -> bool:
-    if not isinstance(value, Mapping):
-        return False
-    mapping = cast(Mapping[object, object], value)
-    decisions = cast(object, mapping.get("decisions"))
-    return isinstance(decisions, Sequence) and not isinstance(decisions, (str, bytes))
-
-
-def _is_tool_resume(value: object) -> bool:
-    resume = _resume_data(value)
-    if resume is None:
-        return False
-    if _contains_decisions(resume):
-        return True
-    return bool(resume) and all(_contains_decisions(item) for item in resume.values())
-
-
-def _is_plan_resume(value: object) -> bool:
-    return _resume_data(value) is not None and not _is_tool_resume(value)
-
-
 def _config(bound: inspect.BoundArguments) -> RunnableConfig:
     value = bound.arguments.get("config")
     if value is None:
@@ -87,6 +91,106 @@ def _config(bound: inspect.BoundArguments) -> RunnableConfig:
     if not isinstance(value, Mapping):
         raise TypeError("config must be a mapping or None")
     return cast(RunnableConfig, dict(cast(Mapping[str, object], value)))
+
+
+def _select_checkpoint(
+    config: RunnableConfig,
+    checkpoint_id: str,
+) -> RunnableConfig:
+    selected = cast(RunnableConfig, dict(config))
+    configurable = dict(selected.get("configurable", {}))
+    configurable["checkpoint_id"] = checkpoint_id
+    selected["configurable"] = configurable
+    return selected
+
+
+def _native_checkpoint_id_for_plan(
+    plan: PlanState[PlanContentModel] | None,
+) -> str | None:
+    handoff = None if plan is None else plan.handoff
+    return (
+        None
+        if handoff is None
+        else handoff.completed_checkpoint_id or handoff.native_checkpoint_id
+    )
+
+
+async def _native_snapshot_for_plan(
+    native: _GraphRuntime,
+    config: RunnableConfig,
+    plan: PlanState[PlanContentModel] | None,
+) -> tuple[StateSnapshot, RunnableConfig]:
+    checkpoint_id = _native_checkpoint_id_for_plan(plan)
+    selected = (
+        config
+        if checkpoint_id is None
+        else _select_checkpoint(
+            config,
+            checkpoint_id,
+        )
+    )
+    return await native.aget_state(selected), selected
+
+
+def _lineage_update_for_role(
+    state: Mapping[str, object],
+    *,
+    role: LineageRole,
+    required: bool,
+) -> dict[str, object]:
+    raw_marker = state.get(LINEAGE_STATE_KEY)
+    if raw_marker is None:
+        if required:
+            raise PlanStateConflictError("Plan state lost its private lineage marker")
+        return {}
+    try:
+        marker = lineage_marker_with_role(raw_marker, role=role)
+    except ValueError as error:
+        raise PlanStateConflictError(
+            "Plan state has an invalid lineage marker"
+        ) from error
+    return {LINEAGE_STATE_KEY: marker}
+
+
+def _input_with_lineage_role(
+    value: object,
+    *,
+    role: LineageRole,
+    required: bool,
+) -> object:
+    if value is None:
+        return None
+    if isinstance(value, Command):
+        command = cast(Command[object], value)
+        raw_update = command.update
+        if not isinstance(raw_update, Mapping):
+            if required:
+                raise PlanStateConflictError(
+                    "Plan resume command requires a private state update"
+                )
+            return command
+        update = {
+            **cast(Mapping[str, object], raw_update),
+            **_lineage_update_for_role(
+                cast(Mapping[str, object], raw_update),
+                role=role,
+                required=required,
+            ),
+        }
+        updated_command: Command[object] = Command(
+            graph=command.graph,
+            update=update,
+            resume=command.resume,
+            goto=command.goto,
+        )
+        return updated_command
+    if isinstance(value, Mapping):
+        state = cast(Mapping[str, object], value)
+        return {
+            **state,
+            **_lineage_update_for_role(state, role=role, required=required),
+        }
+    raise TypeError("Plan Graph input must be a mapping, Command, or None")
 
 
 async def _checkpoint_state(
@@ -126,8 +230,10 @@ async def _native_plan_overlay(
     plan = read_plan_state(state, content)
     if plan.status is PlanStatus.APPROVED:
         handoff = plan.handoff
-        if handoff is None or not handoff.dispatched:
-            raise RuntimeError("approved Plan has not committed its native dispatch")
+        if handoff is None or handoff.phase is PlanHandoffPhase.PENDING:
+            raise PlanStateConflictError(
+                "approved Plan has no native checkpoint evidence"
+            )
         return plan
     return plan if plan.status is PlanStatus.CANCELLED else None
 
@@ -233,6 +339,70 @@ def _overlay_plan(
     return updated
 
 
+def _checkpoint_id(snapshot: StateSnapshot) -> str:
+    value = snapshot.config.get("configurable", {}).get("checkpoint_id")
+    if not isinstance(value, str) or not value:
+        raise PlanStateConflictError("native checkpoint has no stable checkpoint_id")
+    return value
+
+
+def _snapshot_handoff_message(
+    snapshot: StateSnapshot,
+    plan: PlanState[PlanContentModel],
+    *,
+    allow_unmarked_original: bool = False,
+) -> HumanMessage | None:
+    handoff = plan.handoff
+    if handoff is None:
+        raise PlanStateConflictError("approved Plan has no handoff metadata")
+    raw_messages = snapshot.values.get("messages")
+    if raw_messages is None:
+        return None
+    if not isinstance(raw_messages, Sequence) or isinstance(raw_messages, (str, bytes)):
+        raise PlanStateConflictError("native checkpoint messages are not a sequence")
+    matches = [
+        message
+        for message in cast(Sequence[object], raw_messages)
+        if isinstance(message, HumanMessage) and message.id == handoff.message_id
+    ]
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise PlanStateConflictError("native checkpoint duplicates the Plan handoff")
+    message = matches[0]
+    if not _content_contains_handoff(message.content, handoff.digest):
+        if allow_unmarked_original:
+            return None
+        raise PlanStateConflictError("native checkpoint handoff content conflicts")
+    return message
+
+
+def _is_resume_command(value: object) -> bool:
+    return (
+        isinstance(value, Command) and cast(Command[object], value).resume is not None
+    )
+
+
+def _plan_values_part(
+    plan: PlanState[PlanContentModel],
+    *,
+    native_values: Mapping[str, object] | None = None,
+) -> Mapping[str, object]:
+    return {
+        "type": "values",
+        "ns": (),
+        "data": {
+            **({} if native_values is None else native_values),
+            PLAN_STATE_KEY: plan.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude_none=False,
+            ),
+        },
+        "interrupts": (),
+    }
+
+
 class PlanCapableGraphRuntime:
     """Route one request without wrapping or modifying the native Deep Agent graph.
 
@@ -271,6 +441,19 @@ class PlanCapableGraphRuntime:
 
         return self._native.checkpointer
 
+    async def _tinkerfin_lineage_state(
+        self,
+        config: RunnableConfig,
+        role: str,
+    ) -> StateSnapshot:
+        """Read an exact native or Planning checkpoint for lineage validation."""
+
+        if role == NATIVE_CHECKPOINT_ROLE:
+            return await self._native.aget_state(config)
+        if role == PLANNING_CHECKPOINT_ROLE:
+            return await self._planning_factory().aget_state(config)
+        raise PlanStateConflictError("checkpoint lineage has an unknown graph role")
+
     def astream(
         self, *args: object, **kwargs: object
     ) -> AsyncIterator[Mapping[str, object]]:
@@ -285,25 +468,123 @@ class PlanCapableGraphRuntime:
     ) -> AsyncIterator[Mapping[str, object]]:
         bound = self._signature.bind(*args, **kwargs)
         graph_input = bound.arguments.get("input")
-        if _is_tool_resume(graph_input) or (
-            not self._prefer_plan and not _is_plan_resume(graph_input)
+        config = _config(bound)
+        configurable = config.get("configurable", {})
+        lineage_required = RUN_ID_METADATA_KEY in configurable
+        if (
+            not self._prefer_plan
+            and not _is_resume_command(graph_input)
+            and not isinstance(self._native.checkpointer, BaseCheckpointSaver)
         ):
-            overlay = await _native_plan_overlay(
-                self._native,
-                _config(bound),
-                self._content,
-            )
             async for part in self._native.astream(*bound.args, **bound.kwargs):
-                yield part if overlay is None else _overlay_plan(part, overlay)
+                yield part
             return
-
         planning = self._planning_factory()
-        checkpoint_state = await _checkpoint_state(planning, _config(bound))
+        checkpoint_state = await _checkpoint_state(planning, config)
         checkpoint_plan = (
             read_plan_state(checkpoint_state, self._content)
             if PLAN_STATE_KEY in checkpoint_state
             else None
         )
+
+        use_planning = self._prefer_plan
+        if _is_resume_command(graph_input):
+            if lineage_required:
+                thread_id = configurable.get("thread_id")
+                if not isinstance(thread_id, str):
+                    raise PlanStateConflictError(
+                        "resume routing requires a canonical AG-UI thread ID"
+                    )
+                head = await resolve_agui_thread_head(
+                    self.checkpointer,
+                    thread_id=thread_id,
+                )
+                if head is None:
+                    raise PlanStateConflictError(
+                        "resume input has no canonical thread checkpoint"
+                    )
+                planning_pending = False
+                native_pending = False
+                if head.role == PLANNING_CHECKPOINT_ROLE:
+                    planning_snapshot = await planning.aget_state(head.config)
+                    planning_pending = bool(planning_snapshot.next)
+                    if _native_checkpoint_id_for_plan(checkpoint_plan) is not None:
+                        (
+                            native_snapshot,
+                            _native_config,
+                        ) = await _native_snapshot_for_plan(
+                            self._native,
+                            config,
+                            checkpoint_plan,
+                        )
+                        native_pending = bool(native_snapshot.next)
+                else:
+                    native_snapshot = await self._native.aget_state(head.config)
+                    native_pending = bool(native_snapshot.next)
+            else:
+                planning_snapshot = await planning.aget_state(config)
+                native_snapshot, _native_config = await _native_snapshot_for_plan(
+                    self._native,
+                    config,
+                    checkpoint_plan,
+                )
+                planning_pending = bool(planning_snapshot.next)
+                native_pending = bool(native_snapshot.next)
+            if planning_pending and native_pending:
+                raise PlanStateConflictError(
+                    "Planning and native Graphs both contain pending work"
+                )
+            if planning_pending:
+                use_planning = True
+            elif native_pending:
+                use_planning = bool(
+                    checkpoint_plan is not None
+                    and checkpoint_plan.status is PlanStatus.APPROVED
+                    and checkpoint_plan.handoff is not None
+                    and checkpoint_plan.handoff.phase is PlanHandoffPhase.PENDING
+                )
+            elif checkpoint_plan is not None and checkpoint_plan.status in {
+                PlanStatus.APPROVED,
+                PlanStatus.CANCELLED,
+            }:
+                yield _plan_values_part(checkpoint_plan)
+                return
+            else:
+                raise PlanStateConflictError(
+                    "resume input has no pending Planning or native checkpoint"
+                )
+
+        if not use_planning:
+            overlay = await _native_plan_overlay(
+                self._native,
+                config,
+                self._content,
+            )
+            native_interrupted = False
+            async for part in self._native.astream(*bound.args, **bound.kwargs):
+                if part.get("type") == "values" and part.get("ns") == ():
+                    native_interrupted = bool(part.get("interrupts", ()))
+                yield part if overlay is None else _overlay_plan(part, overlay)
+            if (
+                overlay is not None
+                and overlay.handoff is not None
+                and overlay.handoff.phase is PlanHandoffPhase.ACCEPTED
+            ):
+                snapshot = await self._native.aget_state(config)
+                if not native_interrupted:
+                    overlay = await planning.mark_handoff_phase(
+                        config,
+                        overlay,
+                        phase=PlanHandoffPhase.COMPLETED,
+                        native_checkpoint_id=overlay.handoff.native_checkpoint_id
+                        or _checkpoint_id(snapshot),
+                        completed_checkpoint_id=_checkpoint_id(snapshot),
+                    )
+                    yield _plan_values_part(
+                        overlay,
+                        native_values=cast(Mapping[str, object], snapshot.values),
+                    )
+            return
 
         final_state: Mapping[str, object] = checkpoint_state
         final_plan = checkpoint_plan
@@ -313,7 +594,16 @@ class PlanCapableGraphRuntime:
             or checkpoint_plan.status not in {PlanStatus.APPROVED, PlanStatus.CANCELLED}
         ):
             interrupted = False
-            async for part in planning.astream(*bound.args, **bound.kwargs):
+            planning_bound = self._signature.bind(*bound.args, **bound.kwargs)
+            planning_bound.arguments["input"] = _input_with_lineage_role(
+                cast(object, graph_input),
+                role="planning",
+                required=lineage_required,
+            )
+            async for part in planning.astream(
+                *planning_bound.args,
+                **planning_bound.kwargs,
+            ):
                 if part.get("type") == "values" and part.get("ns") == ():
                     data = part.get("data")
                     if not isinstance(data, Mapping):
@@ -333,39 +623,142 @@ class PlanCapableGraphRuntime:
             )
         if final_plan.handoff is None:
             raise RuntimeError("approved Plan state requires handoff metadata")
-        if final_plan.handoff.dispatched:
-            yield {
-                "type": "values",
-                "ns": (),
-                "data": {
-                    PLAN_STATE_KEY: final_plan.model_dump(
-                        mode="json",
-                        by_alias=True,
-                        exclude_none=False,
-                    )
-                },
-                "interrupts": (),
-            }
-            return
-        message = _handoff_message(final_state, final_plan, self._content)
-        if message is None:
-            raise RuntimeError("undispatched Plan already appears in native messages")
-        final_plan = await planning.mark_handoff_dispatched(
-            _config(bound),
+        native_snapshot, native_config = await _native_snapshot_for_plan(
+            self._native,
+            config,
             final_plan,
         )
+        existing_message = _snapshot_handoff_message(
+            native_snapshot,
+            final_plan,
+            allow_unmarked_original=(
+                final_plan.handoff.phase is PlanHandoffPhase.PENDING
+            ),
+        )
+        accepted_this_call = False
+        if final_plan.handoff.phase is PlanHandoffPhase.PENDING:
+            if existing_message is None:
+                if native_snapshot.next:
+                    raise PlanStateConflictError(
+                        "native Graph has pending work before Plan handoff"
+                    )
+                message = _handoff_message(final_state, final_plan, self._content)
+                if message is None:
+                    raise PlanStateConflictError(
+                        "Planning checkpoint already contains a native handoff marker"
+                    )
+                native_config = await self._native.aupdate_state(
+                    config,
+                    {
+                        "messages": [message],
+                        **_lineage_update_for_role(
+                            final_state,
+                            role="native",
+                            required=lineage_required,
+                        ),
+                    },
+                    as_node=START,
+                )
+                native_checkpoint_id = cast(
+                    str,
+                    native_config.get("configurable", {}).get("checkpoint_id"),
+                )
+                if not native_checkpoint_id:
+                    raise PlanStateConflictError(
+                        "native handoff update returned no checkpoint_id"
+                    )
+                native_snapshot = await self._native.aget_state(native_config)
+            else:
+                native_checkpoint_id = _checkpoint_id(native_snapshot)
+                native_config = _select_checkpoint(config, native_checkpoint_id)
+            final_plan = await planning.mark_handoff_phase(
+                config,
+                final_plan,
+                phase=PlanHandoffPhase.ACCEPTED,
+                native_checkpoint_id=native_checkpoint_id,
+            )
+            accepted_this_call = True
+        elif existing_message is None:
+            raise PlanStateConflictError(
+                "accepted Plan handoff is missing from the native checkpoint"
+            )
+
+        handoff = final_plan.handoff
+        if handoff is None:
+            raise PlanStateConflictError("approved Plan lost handoff metadata")
+        if handoff.phase is PlanHandoffPhase.COMPLETED:
+            yield _plan_values_part(
+                final_plan,
+                native_values=cast(Mapping[str, object], native_snapshot.values),
+            )
+            return
+        if not native_snapshot.next and not accepted_this_call:
+            final_plan = await planning.mark_handoff_phase(
+                config,
+                final_plan,
+                phase=PlanHandoffPhase.COMPLETED,
+                native_checkpoint_id=handoff.native_checkpoint_id
+                or _checkpoint_id(native_snapshot),
+                completed_checkpoint_id=_checkpoint_id(native_snapshot),
+            )
+            yield _plan_values_part(
+                final_plan,
+                native_values=cast(Mapping[str, object], native_snapshot.values),
+            )
+            return
+        if native_snapshot.interrupts:
+            yield _plan_values_part(
+                final_plan,
+                native_values=cast(Mapping[str, object], native_snapshot.values),
+            )
+            return
 
         native_bound = self._signature.bind(*bound.args, **bound.kwargs)
-        native_bound.arguments["input"] = {"messages": [message]}
+        native_bound.arguments["input"] = None
+        native_bound.arguments["config"] = native_config
         durability = native_bound.arguments.get("durability")
         if durability not in (None, "sync"):
             raise PlanModeConfigurationError("Plan handoff requires durability='sync'")
         native_bound.arguments["durability"] = "sync"
+        native_interrupted = False
         async for part in self._native.astream(
             *native_bound.args,
             **native_bound.kwargs,
         ):
+            if part.get("type") == "values" and part.get("ns") == ():
+                native_interrupted = bool(part.get("interrupts", ()))
             yield _overlay_plan(part, final_plan)
+        if lineage_required:
+            thread_id = configurable.get("thread_id")
+            semantic_run_id = configurable.get(RUN_ID_METADATA_KEY)
+            if not isinstance(thread_id, str) or not isinstance(semantic_run_id, str):
+                raise PlanStateConflictError(
+                    "native completion requires canonical AG-UI lineage identifiers"
+                )
+            native_head = await resolve_agui_native_run_head(
+                self.checkpointer,
+                thread_id=thread_id,
+                run_id=semantic_run_id,
+            )
+            native_snapshot = await self._native.aget_state(native_head.config)
+        else:
+            native_snapshot = await self._native.aget_state(config)
+        if not native_interrupted:
+            handoff = final_plan.handoff
+            if handoff is None:
+                raise PlanStateConflictError("approved Plan lost handoff metadata")
+            final_plan = await planning.mark_handoff_phase(
+                config,
+                final_plan,
+                phase=PlanHandoffPhase.COMPLETED,
+                native_checkpoint_id=handoff.native_checkpoint_id
+                or _checkpoint_id(native_snapshot),
+                completed_checkpoint_id=_checkpoint_id(native_snapshot),
+            )
+            yield _plan_values_part(
+                final_plan,
+                native_values=cast(Mapping[str, object], native_snapshot.values),
+            )
 
 
 setattr(

@@ -31,10 +31,13 @@ export function LocaleProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     const handleStorage = (event: StorageEvent) => {
-      if (event.key === LANGUAGE_STORAGE_KEY) setPreferenceState(readLanguagePreference())
+      if (event.key !== LANGUAGE_STORAGE_KEY) return
+      const nextPreference = readLanguagePreference()
+      if (nextPreference === 'system') setSystemLanguage(resolveSystemLanguage())
+      setPreferenceState(nextPreference)
     }
     const handleLanguageChange = () => {
-      if (preference === 'system') setSystemLanguage(resolveSystemLanguage())
+      setSystemLanguage(resolveSystemLanguage())
     }
     window.addEventListener('storage', handleStorage)
     window.addEventListener('languagechange', handleLanguageChange)
@@ -42,10 +45,11 @@ export function LocaleProvider({ children }: { children: ReactNode }) {
       window.removeEventListener('storage', handleStorage)
       window.removeEventListener('languagechange', handleLanguageChange)
     }
-  }, [preference])
+  }, [])
 
   const setPreference = useCallback((next: LanguagePreference) => {
     persistLanguagePreference(next)
+    if (next === 'system') setSystemLanguage(resolveSystemLanguage())
     setPreferenceState(next)
   }, [])
   const t = useCallback(

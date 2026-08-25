@@ -16,7 +16,6 @@ const conversation = (
   mode: 'default',
   messages: [],
   todos: [],
-  plan: null,
   runStatus: 'idle',
 })
 

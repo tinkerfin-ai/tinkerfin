@@ -83,6 +83,26 @@ describe('前端源码契约', () => {
     expect(invalidComments).toEqual([])
   })
 
+  it('前端产品提示不以全角句号结尾', () => {
+    const invalidCopy: string[] = []
+    for (const [path, source] of productionSources) {
+      const file = parse(path, source)
+      const visit = (node: ts.Node) => {
+        if (
+          (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node))
+          && /[\u3400-\u9fff]/.test(node.text)
+          && /。$/.test(node.text)
+        ) {
+          const line = file.getLineAndCharacterOfPosition(node.getStart(file)).line + 1
+          invalidCopy.push(`${path}:${line}:${node.text}`)
+        }
+        ts.forEachChild(node, visit)
+      }
+      visit(file)
+    }
+    expect(invalidCopy).toEqual([])
+  })
+
   it('生产 JSX 的用户可见中文必须通过语言资源渲染', () => {
     const untranslated: string[] = []
     const hasHan = (value: string) => /[\u3400-\u9fff]/.test(value)

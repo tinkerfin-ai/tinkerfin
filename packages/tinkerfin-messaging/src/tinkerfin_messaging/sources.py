@@ -11,6 +11,7 @@ from typing import Generic, Protocol, TypeVar, cast, overload
 from tinkerfin_agui_adapter import Identity
 
 from ._identity import required_identifier, required_identity
+from ._messaging_boundary import _join_owned_task
 from .messaging import (
     CancelCallback,
     CancelContext,
@@ -33,7 +34,10 @@ class CancellableMessageSource(
     """Message source that explicitly publishes its producer cancellation callback."""
 
     @property
-    def messaging_cancel_callback(self) -> CancelCallback[SourceT_co] | None: ...
+    def messaging_cancel_callback(self) -> CancelCallback[SourceT_co] | None:
+        """Return the source-owned producer cancellation callback, if supported."""
+
+        ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +80,8 @@ class DeferredMessageSource(Generic[SourceT]):
         cancellable: bool,
         cancel_after_first_item: bool = False,
     ) -> None:
+        """Initialize deferred ownership without invoking the opener."""
+
         if not callable(opener):
             raise TypeError("opener must be an async callable")
         if not isinstance(cancellable, bool):
@@ -111,6 +117,8 @@ class DeferredMessageSource(Generic[SourceT]):
         return callback == self.cancel
 
     def __aiter__(self) -> DeferredMessageSource[SourceT]:
+        """Claim and return this source's single-use asynchronous iterator."""
+
         if self._claimed:
             raise RuntimeError("a deferred source can only be consumed once")
         if self._closed:
@@ -119,6 +127,8 @@ class DeferredMessageSource(Generic[SourceT]):
         return self
 
     async def __anext__(self) -> SourceT:
+        """Open lazily and return the next item under one active-pull invariant."""
+
         if self._closed or self._exhausted:
             raise StopAsyncIteration
         current = cast(asyncio.Task[object] | None, asyncio.current_task())
@@ -293,6 +303,8 @@ class ProfiledDeferredMessageSource(
         cancellable: bool,
         cancel_after_first_item: bool = False,
     ) -> None:
+        """Initialize deferred ownership and an immutable built-in codec profile."""
+
         super().__init__(
             opener,
             cancellable=cancellable,
@@ -339,6 +351,8 @@ class FiniteMessageSource(Generic[SourceT]):
     """Expose a fixed event snapshot as one asynchronous source."""
 
     def __init__(self, events: Iterable[SourceT]) -> None:
+        """Snapshot a finite iterable without borrowing its mutable container."""
+
         self._events = tuple(events)
         self._claimed = False
         self._closed = False
@@ -361,6 +375,8 @@ class FiniteMessageSource(Generic[SourceT]):
         return cls(events)
 
     def __aiter__(self) -> AsyncIterator[SourceT]:
+        """Claim and return the finite source's one asynchronous iterator."""
+
         if self._claimed:
             raise RuntimeError("a finite source can only be consumed once")
         if self._closed:
@@ -407,8 +423,8 @@ class _MappedMessageSource(Generic[SourceT, MappedT]):
         )
         self._claimed = False
         self._closed = False
-        self._close_lock = asyncio.Lock()
         self._delivery: AsyncGenerator[MappedT, None] | None = None
+        self._close_task: asyncio.Task[None] | None = None
 
     def __aiter__(self) -> AsyncIterator[MappedT]:
         if self._claimed:
@@ -466,18 +482,46 @@ class _MappedMessageSource(Generic[SourceT, MappedT]):
     async def aclose(self) -> None:
         """Close active delivery and the borrowed source exactly once."""
 
+        task = self._close_task
+        if task is None:
+            self._closed = True
+            task = asyncio.create_task(
+                self._close_once(),
+                name="tinkerfin-messaging-mapped-source-close",
+            )
+            self._close_task = task
+            task.add_done_callback(self._close_finished)
+        await _join_owned_task(task)
+
+    async def _close_once(self) -> None:
+        primary: BaseException | None = None
         delivery = self._delivery
         if delivery is not None:
-            await delivery.aclose()
-            self._delivery = None
-        await self._close_source()
-
-    async def _close_source(self) -> None:
-        async with self._close_lock:
-            if self._closed:
-                return
-            self._closed = True
+            try:
+                await delivery.aclose()
+            except BaseException as error:  # noqa: BLE001 - settle cancellation safely
+                primary = error
+            finally:
+                self._delivery = None
+        try:
             await self._source.aclose()
+        except BaseException as error:  # noqa: BLE001 - preserve close outcome
+            if primary is None:
+                primary = error
+            else:
+                primary.add_note(
+                    "Mapped source upstream close also failed: "
+                    f"{type(error).__name__}: {error}"
+                )
+        if primary is not None:
+            raise primary.with_traceback(primary.__traceback__)
+
+    @staticmethod
+    def _close_finished(task: asyncio.Task[None]) -> None:
+        """Consume a retained close failure when no caller waits again."""
+
+        if not task.cancelled():
+            task.exception()
 
 
 @overload

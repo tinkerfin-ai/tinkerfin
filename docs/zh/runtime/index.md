@@ -71,7 +71,9 @@ identity = Identity(threadId="user-42-support", runId="run-20260820-1")
 | `threadId` | 必填、非空、不能有首尾空白 | 一段可继续的会话，也是 Graph checkpoint thread |
 | `runId` | 必填、非空、不能有首尾空白 | thread 中一次语义运行的幂等 ID |
 
-`Identity` 创建后不可修改，也不接受额外字段。`parentRunId`、用户身份和请求正文都不属于它。
+`Identity` 创建后不可修改，也不接受额外字段。parent 谱系、用户身份和请求正文都不属于它。
+只有需要谱系时才向 `new_agui(parent_run_id=...)` 传入。公开事件、Graph、checkpoint、协调和
+持久投递共同使用这一个 canonical Identity。
 
 同一段连续会话复用 `threadId`，每次新的语义运行使用新的 `runId`。网络重试或重新附着同一次运行时复用原来的 `runId`。
 

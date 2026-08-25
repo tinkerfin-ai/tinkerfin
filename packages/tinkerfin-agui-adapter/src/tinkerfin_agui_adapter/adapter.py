@@ -35,6 +35,7 @@ from ._adapter_contracts import (
     TaskStartFingerprint,
     TaskStartPayload,
     ToolResultFingerprint,
+    UpdatesStreamPart,
     ValuesStreamPart,
 )
 from ._adapter_messages import _complete_ai_message_to_chunk
@@ -80,6 +81,20 @@ class DeepAgentAgUiAdapter:
         expose_subagent_events: bool = True,
         private_state_keys: frozenset[str] = frozenset(),
     ) -> None:
+        """Initialize request-scoped correlation without opening runtime resources.
+
+        Args:
+            identity: Public thread and run identity for emitted child events.
+            prior_tool_call_ids: Scoped Tool IDs already emitted before a resume.
+            expose_reasoning_events: Whether verified reasoning paths emit events.
+            expose_subagent_events: Whether validated non-root events are emitted.
+            private_state_keys: Top-level runtime channels excluded from all output.
+
+        Raises:
+            TypeError: An option has the wrong container or scalar type.
+            ValueError: A private key or prior Tool ID is not canonical.
+        """
+
         if not isinstance(identity, Identity):
             raise TypeError("identity must be an Identity")
         if not isinstance(expose_reasoning_events, bool):
@@ -382,7 +397,9 @@ class DeepAgentAgUiAdapter:
             part,
         )
 
-    def _process_extra_part(self, part: ExtraStreamPart) -> list[BaseEvent]:
+    def _process_extra_part(
+        self, part: ExtraStreamPart | UpdatesStreamPart
+    ) -> list[BaseEvent]:
         """Project an additional native mode without exposing runtime config."""
 
         return _adapter_tasks._process_extra_part(

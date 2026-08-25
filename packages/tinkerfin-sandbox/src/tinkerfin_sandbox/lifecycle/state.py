@@ -73,40 +73,79 @@ class OpenSandboxState(Protocol):
     """
 
     @property
-    def persistent(self) -> bool: ...
+    def persistent(self) -> bool:
+        """Return whether bindings survive State shutdown and process exit."""
+
+        ...
 
     @property
-    def lease_renew_interval(self) -> float | None: ...
+    def lease_renew_interval(self) -> float | None:
+        """Return the claim renewal interval, or ``None`` for non-expiring claims."""
 
-    async def start(self, *, warm_pool_size: int) -> None: ...
+        ...
 
-    async def acquire_owner(self, owner_key: str) -> OpenSandboxOwnerClaim: ...
+    async def start(self, *, warm_pool_size: int) -> None:
+        """Open State with one immutable warm-pool capacity."""
 
-    async def renew_owner(self, claim: OpenSandboxOwnerClaim) -> bool: ...
+        ...
+
+    async def acquire_owner(self, owner_key: str) -> OpenSandboxOwnerClaim:
+        """Acquire the exclusive fencing claim for one owner key."""
+
+        ...
+
+    async def renew_owner(self, claim: OpenSandboxOwnerClaim) -> bool:
+        """Renew an owner claim and return whether it still owns the fence."""
+
+        ...
 
     async def bind_owner(
         self,
         claim: OpenSandboxOwnerClaim,
         sandbox_id: str,
-    ) -> OpenSandboxBinding: ...
+    ) -> OpenSandboxBinding:
+        """Commit a remote Sandbox as the claimed owner's authoritative binding."""
 
-    async def unbind_owner(self, claim: OpenSandboxOwnerClaim) -> None: ...
+        ...
 
-    async def read_binding(self, owner_key: str) -> OpenSandboxBinding | None: ...
+    async def unbind_owner(self, claim: OpenSandboxOwnerClaim) -> None:
+        """Remove the binding protected by an active owner claim."""
 
-    async def release_owner(self, claim: OpenSandboxOwnerClaim) -> None: ...
+        ...
 
-    async def claim_warm_slot(self) -> OpenSandboxWarmClaim | None: ...
+    async def read_binding(self, owner_key: str) -> OpenSandboxBinding | None:
+        """Read the current authoritative binding without acquiring ownership."""
+
+        ...
+
+    async def release_owner(self, claim: OpenSandboxOwnerClaim) -> None:
+        """Release an owner claim without changing its committed binding."""
+
+        ...
+
+    async def claim_warm_slot(self) -> OpenSandboxWarmClaim | None:
+        """Claim one empty warm slot, or return ``None`` when none is available."""
+
+        ...
 
     async def publish_warm(
         self,
         claim: OpenSandboxWarmClaim,
         sandbox_id: str,
-    ) -> None: ...
+    ) -> None:
+        """Publish a created Sandbox into the claimed warm slot."""
 
-    async def renew_warm(self, claim: OpenSandboxWarmClaim) -> bool: ...
+        ...
 
-    async def release_warm(self, claim: OpenSandboxWarmClaim) -> None: ...
+    async def renew_warm(self, claim: OpenSandboxWarmClaim) -> bool:
+        """Renew a warm-slot claim and report whether its fence remains current."""
+
+        ...
+
+    async def release_warm(self, claim: OpenSandboxWarmClaim) -> None:
+        """Release a warm-slot claim without consuming its published Sandbox."""
+
+        ...
 
     async def consume_warm(
         self,
@@ -120,19 +159,40 @@ class OpenSandboxState(Protocol):
 
         ...
 
-    async def enqueue_cleanup(self, sandbox_id: str) -> None: ...
+    async def enqueue_cleanup(self, sandbox_id: str) -> None:
+        """Idempotently enqueue an orphaned remote Sandbox for destruction."""
 
-    async def claim_cleanup(self) -> OpenSandboxCleanupClaim | None: ...
+        ...
 
-    async def renew_cleanup(self, claim: OpenSandboxCleanupClaim) -> bool: ...
+    async def claim_cleanup(self) -> OpenSandboxCleanupClaim | None:
+        """Claim one pending cleanup item, or return ``None`` when empty."""
 
-    async def complete_cleanup(self, claim: OpenSandboxCleanupClaim) -> None: ...
+        ...
 
-    async def release_cleanup(self, claim: OpenSandboxCleanupClaim) -> None: ...
+    async def renew_cleanup(self, claim: OpenSandboxCleanupClaim) -> bool:
+        """Renew a cleanup claim and report whether its fence remains current."""
 
-    async def shutdown_sandbox_ids(self) -> tuple[str, ...]: ...
+        ...
 
-    async def aclose(self) -> None: ...
+    async def complete_cleanup(self, claim: OpenSandboxCleanupClaim) -> None:
+        """Remove a cleanup item after confirmed remote destruction."""
+
+        ...
+
+    async def release_cleanup(self, claim: OpenSandboxCleanupClaim) -> None:
+        """Release a cleanup claim so another worker can retry it."""
+
+        ...
+
+    async def shutdown_sandbox_ids(self) -> tuple[str, ...]:
+        """Return process-local Sandbox IDs that this State must destroy on close."""
+
+        ...
+
+    async def aclose(self) -> None:
+        """Close State resources after active manager operations have settled."""
+
+        ...
 
 
 async def _call_state(
@@ -190,6 +250,8 @@ class _OpenSandboxStateBoundary(  # pyright: ignore[reportUnusedClass]
             raise translated from error
 
     async def start(self, *, warm_pool_size: int) -> None:
+        if isinstance(warm_pool_size, bool) or not isinstance(warm_pool_size, int):
+            raise TypeError("warm_pool_size must be an integer")
         await _call_state(
             self._state,
             "start",
@@ -386,6 +448,8 @@ class InMemoryOpenSandboxState(OpenSandboxState):
     """Keep owner allocation state inside one Python process."""
 
     def __init__(self, *, namespace: str = "") -> None:
+        """Initialize process-local owner, warm-slot, and cleanup records."""
+
         self._namespace = namespace
         self._records: dict[str, _MemoryOwnerRecord] = {}
         self._records_guard = asyncio.Lock()
@@ -407,6 +471,8 @@ class InMemoryOpenSandboxState(OpenSandboxState):
 
     async def start(self, *, warm_pool_size: int) -> None:
         """Open the state; repeated calls require the original warm-pool capacity."""
+        if isinstance(warm_pool_size, bool) or not isinstance(warm_pool_size, int):
+            raise TypeError("warm_pool_size must be an integer")
         if warm_pool_size < 0:
             raise ValueError("warm_pool_size must not be negative")
         if self._closed:

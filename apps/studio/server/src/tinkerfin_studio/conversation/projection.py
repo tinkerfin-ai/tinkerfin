@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from typing import cast
 
 from ag_ui.core import BaseEvent
+from ag_ui.core.types import ResumeEntry
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -18,6 +19,7 @@ from tinkerfin_studio.conversation.models import (
     ConversationRun,
     ConversationThread,
 )
+from tinkerfin_studio.conversation.repository import ConversationRepository
 from tinkerfin_studio.conversation.snapshot import reduce_snapshot
 
 
@@ -99,6 +101,17 @@ class ConversationProjector:
             if main_run is not None and event_run_id == envelope.identity.run_id
             else None
         )
+        await self._settle_abandoned_resume(
+            thread_pk=thread_pk,
+            main_run=main_run,
+            event=event_json,
+            run_input=run_input,
+        )
+        resume_settled = await self._resume_is_settled(
+            thread_pk=thread_pk,
+            run_id=envelope.identity.run_id,
+            run_input=run_input,
+        )
         snapshot = reduce_snapshot(
             thread.snapshot_json,
             seq=envelope.seq,
@@ -106,6 +119,7 @@ class ConversationProjector:
             run_id=event_run_id,
             created_at=envelope.created_at,
             run_input=run_input,
+            resume_settled=resume_settled,
         )
         self._session.add(
             ConversationEvent(
@@ -413,38 +427,16 @@ class ConversationProjector:
                         ConversationInterrupt.interrupt_id == interrupt_id,
                     )
                 )
-                if entity is None or entity.resolved_run_id != run_id:
+                if (
+                    entity is None
+                    or entity.resolved_run_id != run_id
+                    or entity.status != "pending"
+                ):
                     continue
                 entity.status = "pending"
                 entity.resolved_run_id = None
                 entity.resume_json = None
                 entity.resolved_at = None
-                entity.updated_at = created_at
-            return
-        if event_type == "RUN_STARTED" and run_input is not None:
-            if initialization_failed:
-                return
-            for entry in resume_entries:
-                if not isinstance(entry, dict):
-                    continue
-                interrupt_id = entry.get("interruptId")
-                if not isinstance(interrupt_id, str):
-                    continue
-                entity = await self._session.scalar(
-                    select(ConversationInterrupt).where(
-                        ConversationInterrupt.conversation_thread_id == thread_pk,
-                        ConversationInterrupt.interrupt_id == interrupt_id,
-                    )
-                )
-                if entity is None:
-                    continue
-                if entity.resolved_run_id != run_id:
-                    continue
-                entity.status = (
-                    "cancelled" if entry.get("status") == "cancelled" else "resolved"
-                )
-                entity.resume_json = entry
-                entity.resolved_at = created_at
                 entity.updated_at = created_at
             return
         if event_type != "RUN_FINISHED":
@@ -477,6 +469,67 @@ class ConversationProjector:
             entity.message = message if isinstance(message, str) else None
             entity.request_json = value
             entity.updated_at = created_at
+
+    async def _resume_is_settled(
+        self,
+        *,
+        thread_pk: int,
+        run_id: str,
+        run_input: dict[str, object] | None,
+    ) -> bool:
+        """只在框架 settlement 已落库时允许快照移除 pending 审批"""
+
+        resume = run_input.get("resume") if run_input is not None else None
+        if not isinstance(resume, list) or not resume:
+            return False
+        interrupt_ids = {
+            entry.get("interruptId")
+            for entry in resume
+            if isinstance(entry, dict) and isinstance(entry.get("interruptId"), str)
+        }
+        if len(interrupt_ids) != len(resume):
+            raise RuntimeError("已注册 resume 缺少完整 interruptId")
+        entities = await self._session.scalars(
+            select(ConversationInterrupt).where(
+                ConversationInterrupt.conversation_thread_id == thread_pk,
+                ConversationInterrupt.interrupt_id.in_(interrupt_ids),
+            )
+        )
+        resolved = list(entities)
+        return len(resolved) == len(interrupt_ids) and all(
+            entity.resolved_run_id == run_id
+            and entity.status in {"resolved", "cancelled"}
+            for entity in resolved
+        )
+
+    async def _settle_abandoned_resume(
+        self,
+        *,
+        thread_pk: int,
+        main_run: ConversationRun | None,
+        event: dict[str, object],
+        run_input: dict[str, object] | None,
+    ) -> None:
+        """在框架放弃终态持久提交后结算无 Graph 的 cancelled resume"""
+
+        if (
+            main_run is None
+            or event.get("type") != "RUN_ERROR"
+            or event.get("code") != "resume_cancelled"
+        ):
+            return
+        raw_entries = run_input.get("resume") if run_input is not None else None
+        if not isinstance(raw_entries, list) or not raw_entries:
+            raise RuntimeError("审批放弃终态缺少 resume 输入")
+        entries = tuple(ResumeEntry.model_validate(entry) for entry in raw_entries)
+        if any(entry.status != "cancelled" for entry in entries):
+            raise RuntimeError("审批放弃终态包含非 cancelled 条目")
+        await ConversationRepository(self._session).settle_claimed_interrupts(
+            thread_pk=thread_pk,
+            run_id=main_run.run_id,
+            entries=entries,
+            resolution_id=f"abandon:{main_run.run_id}",
+        )
 
     async def _project_messages(
         self,

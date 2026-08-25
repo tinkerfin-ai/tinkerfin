@@ -68,6 +68,29 @@ describe('ToastViewport', () => {
     expect(onDismiss).toHaveBeenCalledWith('info')
   })
 
+  it('pauses the remaining timeout while keyboard focus stays inside', () => {
+    vi.useFakeTimers()
+    useReducedMotion()
+    const onDismiss = vi.fn()
+    render(
+      <ToastViewport
+        toasts={[{ id: 'info-focus', kind: 'info', message: '等待用户确认' }]}
+        onDismiss={onDismiss}
+      />,
+    )
+
+    const close = screen.getByRole('button', { name: '关闭提示：等待用户确认' })
+    fireEvent.focus(close)
+    act(() => vi.advanceTimersByTime(5000))
+    expect(onDismiss).not.toHaveBeenCalled()
+
+    fireEvent.blur(close, { relatedTarget: document.body })
+    act(() => vi.advanceTimersByTime(3999))
+    expect(onDismiss).not.toHaveBeenCalled()
+    act(() => vi.advanceTimersByTime(1))
+    expect(onDismiss).toHaveBeenCalledWith('info-focus')
+  })
+
   it('requests dismissal only once when a manual close races the timeout', () => {
     vi.useFakeTimers()
     useReducedMotion()

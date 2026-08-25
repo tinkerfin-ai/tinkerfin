@@ -28,11 +28,12 @@ describe('AG-UI 事件边界解析', () => {
     expect(parseConversationAgUiEvent(event)).toBe(event)
   })
 
-  it('接受当前服务端使用的来源、输入和中断扩展', () => {
+  it('接受当前服务端使用的来源、标题和中断扩展', () => {
     const event = {
       type: 'RUN_STARTED',
       threadId: 'thread-1',
       runId: 'run-1',
+      parentRunId: 'run-parent',
       title: '权威标题',
       rawEvent: {
         streamMode: 'tasks',
@@ -48,16 +49,6 @@ describe('AG-UI 事件边界解析', () => {
           subagentInput: '研究问题',
           subagentInvocationId: 'invocation-1',
         },
-      },
-      input: {
-        threadId: 'thread-1',
-        runId: 'run-1',
-        state: {},
-        messages: [{ id: 'request-1', role: 'user', content: '开始' }],
-        tools: [],
-        context: [],
-        forwardedProps: { model: 'deepseek-v4-pro' },
-        resume: [{ interruptId: 'interrupt-1', status: 'resolved', payload: { type: 'approve' } }],
       },
     }
 
@@ -77,6 +68,15 @@ describe('AG-UI 事件边界解析', () => {
         }],
       },
     }).type).toBe('RUN_FINISHED')
+  })
+
+  it('拒绝重新携带已由 Graph 显式提供的 RUN_STARTED.input', () => {
+    expect(() => parseConversationAgUiEvent({
+      type: 'RUN_STARTED',
+      threadId: 'thread-1',
+      runId: 'run-1',
+      input: { threadId: 'thread-1', runId: 'run-1' },
+    })).toThrow('事件流包含无效的 AG-UI 事件')
   })
 
   it.each([
@@ -158,6 +158,10 @@ describe('AG-UI 事件边界解析', () => {
     ['消息 ID 类型错误', { type: 'TEXT_MESSAGE_CONTENT', messageId: 1, delta: '内容' }],
     ['状态根不是对象', { type: 'STATE_SNAPSHOT', snapshot: [] }],
     ['JSON Patch op 非法', { type: 'STATE_DELTA', delta: [{ op: 'move', path: '/a' }] }],
+    ['JSON Patch path 不是 Pointer', { type: 'STATE_DELTA', delta: [{ op: 'remove', path: 'a' }] }],
+    ['JSON Patch Pointer 转义非法', { type: 'STATE_DELTA', delta: [{ op: 'remove', path: '/a~2b' }] }],
+    ['JSON Patch add 缺少 value', { type: 'STATE_DELTA', delta: [{ op: 'add', path: '/a' }] }],
+    ['JSON Patch replace 缺少 value', { type: 'STATE_DELTA', delta: [{ op: 'replace', path: '/a' }] }],
     ['工具结果缺 role', { type: 'TOOL_CALL_RESULT', messageId: 'message-1', toolCallId: 'tool-1', content: '完成' }],
     ['来源 namespace 非字符串数组', {
       type: 'RUN_ERROR',
@@ -213,5 +217,15 @@ describe('AG-UI 事件边界解析', () => {
     ['RAW event 不是对象', { type: 'RAW', event: 'task' }],
   ])('拒绝%s', (_name, event) => {
     expect(() => parseConversationAgUiEvent(event)).toThrow('事件流包含无效的 AG-UI 事件')
+  })
+
+  it('rejects JSON payloads deeper than the supported stream boundary', () => {
+    let nested: unknown = 'leaf'
+    for (let depth = 0; depth < 65; depth += 1) nested = { nested }
+
+    expect(() => parseConversationAgUiEvent({
+      type: 'STATE_SNAPSHOT',
+      snapshot: nested,
+    })).toThrow('事件流包含无效的 AG-UI 事件')
   })
 })

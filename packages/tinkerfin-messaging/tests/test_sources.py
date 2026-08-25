@@ -76,6 +76,18 @@ class _InvalidCancelSource(_TrackedSource):
         return None
 
 
+class _BlockingCloseSource(_TrackedSource):
+    def __init__(self) -> None:
+        super().__init__()
+        self.close_started = asyncio.Event()
+        self.close_release = asyncio.Event()
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+        self.close_started.set()
+        await self.close_release.wait()
+
+
 async def test_deferred_source_closed_before_claim_never_opens() -> None:
     """An attach-only caller must not execute an unused source opener."""
 
@@ -456,6 +468,25 @@ async def test_map_source_cancellation_closes_upstream() -> None:
     with pytest.raises(asyncio.CancelledError):
         await consuming
     assert source.close_calls == 0
+    await mapped.aclose()
+    assert source.close_calls == 1
+
+
+async def test_map_source_close_survives_caller_cancellation() -> None:
+    """A cancelled waiter must not cancel or orphan the retained upstream close."""
+
+    source = _BlockingCloseSource()
+    mapped = map_source(source, lambda item: item)
+    closing = asyncio.create_task(mapped.aclose())
+    await asyncio.wait_for(source.close_started.wait(), timeout=1)
+
+    closing.cancel("caller stopped waiting")
+    await asyncio.sleep(0)
+    assert not closing.done()
+    source.close_release.set()
+    with pytest.raises(asyncio.CancelledError, match="caller stopped waiting"):
+        await asyncio.wait_for(closing, timeout=1)
+
     await mapped.aclose()
     assert source.close_calls == 1
 

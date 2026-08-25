@@ -227,7 +227,7 @@ async def test_get_detail_reloads_thread_after_independent_projection(
         if before_status == "waiting_approval":
             before_interrupt = {
                 "id": old_interrupt_id,
-                "reason": "plan_review",
+                "reason": "tinkerfin:plan_review",
                 "message": "确认旧 Plan",
             }
             before_snapshot["interrupts"] = [before_interrupt]
@@ -239,7 +239,7 @@ async def test_get_detail_reloads_thread_after_independent_projection(
                     resolved_run_id=None,
                     interrupt_id=old_interrupt_id,
                     status="pending",
-                    reason="plan_review",
+                    reason="tinkerfin:plan_review",
                     message="确认旧 Plan",
                     request_json=before_interrupt,
                     resume_json=None,
@@ -292,7 +292,7 @@ async def test_get_detail_reloads_thread_after_independent_projection(
                     if has_pending:
                         pending_interrupt = {
                             "id": "interrupt-after",
-                            "reason": "plan_review",
+                            "reason": "tinkerfin:plan_review",
                             "message": "确认新 Plan",
                         }
                         after_snapshot["interrupts"] = [pending_interrupt]
@@ -304,7 +304,7 @@ async def test_get_detail_reloads_thread_after_independent_projection(
                                 resolved_run_id=None,
                                 interrupt_id="interrupt-after",
                                 status="pending",
-                                reason="plan_review",
+                                reason="tinkerfin:plan_review",
                                 message="确认新 Plan",
                                 request_json=pending_interrupt,
                                 resume_json=None,
@@ -641,7 +641,7 @@ async def test_get_detail_does_not_repair_stale_interrupt_snapshot(
         "interrupts": [
             {
                 "id": "resolved-plan",
-                "reason": "plan_review",
+                "reason": "tinkerfin:plan_review",
                 "message": "确认 Plan",
             }
         ],

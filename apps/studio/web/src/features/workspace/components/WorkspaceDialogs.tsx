@@ -47,8 +47,8 @@ export function WorkspaceDialogs({
         open
         title={t('删除会话')}
         description={dialog.isRunning
-          ? t('“{title}”仍在接收实时输出。继续会先断开连接，并永久删除全部历史记录。', { title: dialog.title })
-          : t('将永久删除“{title}”及其全部历史记录，此操作不可撤销。', { title: dialog.title })}
+          ? t('“{title}”仍在接收实时输出。继续会先断开连接，并永久删除全部历史记录', { title: dialog.title })
+          : t('将永久删除“{title}”及其全部历史记录，此操作不可撤销', { title: dialog.title })}
         confirmLabel={t('删除')}
         tone="danger"
         isPending={pending}
@@ -65,7 +65,7 @@ export function WorkspaceDialogs({
       <ModalDialog
         open
         title={t('关闭当前 Plan？')}
-        description={t('当前 Plan 澄清或审阅将被取消，不会执行旧计划。Tool/Filesystem 审批不受影响。')}
+        description={t('当前 Plan 澄清或审阅将被取消，不会执行旧计划。Tool/Filesystem 审批不受影响')}
         confirmLabel={t('关闭 Plan')}
         isPending={pending}
         error={error}
@@ -80,8 +80,8 @@ export function WorkspaceDialogs({
       open
       title={t('断开实时输出？')}
       description={dialog.kind === 'detach-new'
-        ? t('新建会话会断开当前实时输出，但后端任务可能仍会继续。')
-        : t('切换会话会断开当前实时输出，但后端任务可能仍会继续。')}
+        ? t('新建会话会断开当前实时输出，但后端任务可能仍会继续')
+        : t('切换会话会断开当前实时输出，但后端任务可能仍会继续')}
       confirmLabel={dialog.kind === 'detach-new' ? t('断开并新建') : t('断开并切换')}
       isPending={pending}
       error={error}

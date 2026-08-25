@@ -48,6 +48,7 @@ export interface ChatResumeEntry {
 export interface ChatRequestPayload {
   threadId: string
   runId: string
+  parentRunId?: string
   state: JsonObject
   messages: ChatMessageInput[]
   tools: JsonValue[]
@@ -106,30 +107,6 @@ export interface RawEventContext {
   toolResultStatus?: "success" | "error"
 }
 
-export interface RunStartedInputMessage {
-  id: string
-  role: string
-  content: string
-}
-
-export interface RunStartedResumeEntry {
-  interruptId: string
-  status: "resolved" | "cancelled"
-  payload?: JsonValue
-}
-
-export interface RunStartedInput {
-  threadId: string
-  runId: string
-  state?: JsonObject
-  messages?: RunStartedInputMessage[]
-  tools?: JsonValue[]
-  context?: JsonValue[]
-  forwardedProps?: JsonObject
-  resume?: RunStartedResumeEntry[]
-  parentRunId?: string
-}
-
 export interface RunStartedEvent {
   type: "RUN_STARTED"
   threadId: string
@@ -139,8 +116,6 @@ export interface RunStartedEvent {
   rawEvent?: RawEventContext
   /** Studio 扩展：服务端已持久化的权威会话标题 */
   title?: string
-  /** 仅客户端发起的主运行携带，合成子智能体运行不携带 */
-  input?: RunStartedInput
 }
 
 export interface MessageSnapshotItem {
@@ -162,11 +137,9 @@ export interface StateSnapshotEvent {
   snapshot: JsonObject
 }
 
-export interface StateDeltaOperation {
-  op: "add" | "remove" | "replace"
-  path: string
-  value?: JsonValue
-}
+export type StateDeltaOperation =
+  | { op: "add" | "replace"; path: string; value: JsonValue }
+  | { op: "remove"; path: string; value?: never }
 
 export interface StateDeltaEvent {
   type: "STATE_DELTA"

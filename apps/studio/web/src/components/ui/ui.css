@@ -156,6 +156,7 @@
 
   .ui-icon-button:focus-visible {
     outline: 0;
+    background: var(--color-hover);
     box-shadow: none;
     color: var(--color-text-primary);
   }
@@ -321,33 +322,71 @@
   .user-avatar__fallback { font-size: var(--type-meta-size); font-weight: var(--weight-semibold); line-height: var(--type-meta-line); }
   .user-avatar--lg .user-avatar__fallback { font-size: var(--type-h2-size); line-height: var(--type-h2-line); }
 
-  .ui-scrollbar { scrollbar-width: none; }
-  .ui-scrollbar::-webkit-scrollbar { display: none; width: 0; height: 0; }
+  .ui-scrollbar {
+    scrollbar-width: none;
+  }
+  .ui-scrollbar::-webkit-scrollbar { display: none; }
+  .ui-scrollbar:focus-visible { outline: 0; }
 
-  .ui-scrollbar-overlay {
+  .ui-overlay-scrollbar {
     position: absolute;
     z-index: var(--layer-local-raised);
-    right: 0;
-    display: none;
-    width: var(--space-2);
     opacity: 0;
     pointer-events: none;
-    transition: opacity var(--motion-normal) var(--ease-out);
+    transition: opacity var(--motion-fast) var(--ease-out);
   }
 
-  .ui-scrollbar-overlay[data-scrollable='true'] { display: block; }
-  .ui-scrollbar-overlay.is-visible { opacity: 1; pointer-events: auto; }
-  .ui-scrollbar-overlay__thumb {
+  .ui-overlay-scrollbar[data-scrollable='true'].is-visible { opacity: 1; }
+
+  .ui-overlay-scrollbar__thumb {
     position: absolute;
     top: 0;
-    right: 1px;
-    width: var(--space-1-5);
-    min-height: var(--space-8);
-    border-radius: var(--radius-pill);
-    background: var(--color-scroll-thumb);
-    cursor: pointer;
+    left: 0;
+    display: block;
+    pointer-events: none;
     touch-action: none;
     will-change: transform;
+  }
+
+  .ui-overlay-scrollbar[data-scrollable='true'].is-visible .ui-overlay-scrollbar__thumb {
+    pointer-events: auto;
+  }
+
+  .ui-overlay-scrollbar__thumb::after {
+    position: absolute;
+    border-radius: var(--radius-pill);
+    background: var(--color-scroll-thumb);
+    content: '';
+    transition:
+      background-color var(--motion-fast) var(--ease-out),
+      width var(--motion-fast) var(--ease-out),
+      height var(--motion-fast) var(--ease-out);
+  }
+
+  .ui-overlay-scrollbar--vertical .ui-overlay-scrollbar__thumb::after {
+    top: 0;
+    right: 0;
+    width: 100%;
+    height: 100%;
+  }
+
+  .ui-overlay-scrollbar--horizontal .ui-overlay-scrollbar__thumb::after {
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+  }
+
+  .ui-overlay-scrollbar--vertical .ui-overlay-scrollbar__thumb:hover::after,
+  .ui-overlay-scrollbar--vertical .ui-overlay-scrollbar__thumb:active::after {
+    width: calc(100% + var(--space-0-5));
+    background: var(--color-scroll-thumb-hover);
+  }
+
+  .ui-overlay-scrollbar--horizontal .ui-overlay-scrollbar__thumb:hover::after,
+  .ui-overlay-scrollbar--horizontal .ui-overlay-scrollbar__thumb:active::after {
+    height: calc(100% + var(--space-0-5));
+    background: var(--color-scroll-thumb-hover);
   }
 
   .modal-backdrop {
@@ -428,7 +467,7 @@
     .modal-dialog--action .modal-dialog-head { padding: var(--space-5) var(--space-5) 0; }
   }
 
-  @media (hover: none), (pointer: coarse) {
+  @media (any-hover: none), (any-pointer: coarse) {
     .ui-button {
       min-width: var(--control-lg);
       min-height: var(--control-lg);
@@ -449,6 +488,7 @@
     }
 
     .ui-button:focus-visible,
+    .ui-icon-button:focus-visible,
     .ui-text-field__control:focus-within {
       outline: 2px solid Highlight;
       outline-offset: 2px;
@@ -526,7 +566,6 @@
     position: absolute;
     top: 0;
     right: 0;
-    width: var(--control-lg);
     height: var(--control-lg);
     border: 1px solid var(--color-border);
     border-radius: var(--radius-pill);
@@ -535,6 +574,7 @@
   }
 
   .theme-switcher-circle {
+    width: var(--control-lg);
     opacity: 1;
     visibility: visible;
   }
@@ -542,9 +582,12 @@
   .theme-switcher.is-expanded .theme-switcher-circle { opacity: 0; visibility: hidden; }
 
   .theme-switcher-surface {
+    width: calc(var(--control-lg) * 3);
+    transform: scaleX(0.333333);
+    transform-origin: right center;
     opacity: 0;
     visibility: hidden;
-    will-change: width, opacity;
+    will-change: transform, opacity;
   }
 
   .theme-switcher-option {
@@ -678,7 +721,10 @@
   .toast-card > button:disabled { cursor: not-allowed; opacity: .48; }
 
   @media (forced-colors: active) {
-    .ui-scrollbar-overlay__thumb { background: ButtonText; }
+    .ui-scrollbar { scrollbar-width: auto; scrollbar-color: auto; }
+    .ui-scrollbar::-webkit-scrollbar { display: block; width: auto; height: auto; }
+    .ui-scrollbar:focus-visible { outline: 2px solid Highlight; outline-offset: -2px; }
+    .ui-overlay-scrollbar { display: none; }
 
     .theme-switcher-circle,
     .theme-switcher-surface,
@@ -690,13 +736,14 @@
   }
 
   @media (prefers-reduced-motion: reduce) {
-    .ui-scrollbar-overlay,
+    .ui-overlay-scrollbar,
+    .ui-overlay-scrollbar__thumb::after,
     .theme-switcher-visual {
       transition: none;
     }
   }
 
-  @media (hover: none), (pointer: coarse) {
-    .ui-scrollbar-overlay[data-scrollable='true'] { opacity: 1; }
+  @media (any-pointer: coarse) {
+    .ui-overlay-scrollbar__thumb { pointer-events: none !important; }
   }
 }

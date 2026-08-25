@@ -252,17 +252,65 @@ def sse(self: MessageSubscription[ReplayT]) -> AsyncIterator[bytes]:
 
 
 async def aclose(self: MessageSubscription[ReplayT]) -> None:
-    """Detach this subscriber without affecting the producer."""
+    """Detach this subscriber through one cancellation-safe close task."""
 
+    task = self._close_task
+    if task is None:
+        task = asyncio.create_task(
+            _close_subscription_once(self),
+            name="tinkerfin-messaging-subscription-close",
+        )
+        self._close_task = task
+        task.add_done_callback(_close_task_finished)
+    await _join_owned_task(task)
+
+
+async def _close_subscription_once(self: MessageSubscription[ReplayT]) -> None:
+    primary: BaseException | None = None
     delivery = self._delivery
     if delivery is not None:
-        await _close_async_iterator(cast(AsyncIterator[object], delivery))
-        self._delivery = None
-        return
+        try:
+            await _close_async_iterator(cast(AsyncIterator[object], delivery))
+        except BaseException as error:  # noqa: BLE001 - settle cancellation and failure
+            primary = error
+        finally:
+            self._delivery = None
+
     backend_iterator = self._backend_iterator
     if backend_iterator is not None:
-        await _await_backend(
-            "follow close",
-            _close_async_iterator(backend_iterator),
+        try:
+            await _close_backend_iterator(self, backend_iterator)
+        except BaseException as error:  # noqa: BLE001 - preserve primary close outcome
+            if primary is None:
+                primary = error
+            else:
+                primary.add_note(
+                    "Messaging backend iterator close also failed: "
+                    f"{type(error).__name__}: {error}"
+                )
+    if primary is not None:
+        raise primary.with_traceback(primary.__traceback__)
+
+
+async def _close_backend_iterator(
+    self: MessageSubscription[ReplayT],
+    iterator: AsyncIterator[object],
+) -> None:
+    task = self._backend_close_task
+    if task is None:
+        task = asyncio.create_task(
+            _await_backend("follow close", _close_async_iterator(iterator)),
+            name="tinkerfin-messaging-backend-follower-close",
         )
+        self._backend_close_task = task
+        task.add_done_callback(_close_task_finished)
+    await _join_owned_task(task)
+    if self._backend_iterator is iterator:
         self._backend_iterator = None
+
+
+def _close_task_finished(task: asyncio.Task[None]) -> None:
+    """Consume a retained close failure when no caller waits again."""
+
+    if not task.cancelled():
+        task.exception()

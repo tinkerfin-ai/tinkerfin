@@ -66,4 +66,16 @@ describe('PlanReviewCard', () => {
     fireEvent.change(textarea, { target: { value: '  # 修改后\n\n```ts\nconst ok = true\n```\n' } })
     expect(current.editedMarkdown).toBe('  # 修改后\n\n```ts\nconst ok = true\n```\n')
   })
+
+  it('announces a dynamic submission error', () => {
+    render(
+      <PlanReviewCard
+        interaction={{ ...interaction(), error: '计划版本已经更新' }}
+        onChange={vi.fn()}
+        onSubmit={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByRole('alert')).toHaveTextContent('计划版本已经更新')
+  })
 })

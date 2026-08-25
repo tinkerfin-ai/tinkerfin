@@ -35,6 +35,42 @@ logger = logging.getLogger(__name__)
 _CREATE_TOKEN_METADATA_KEY = "tinkerfin.ai/create-token"
 
 
+async def _join_owned_task(task: asyncio.Task[None]) -> None:
+    """Settle one owned task before propagating cancellation of its waiter."""
+
+    current = asyncio.current_task()
+    cancel_count = current.cancelling() if current is not None else 0
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as error:
+            next_count = current.cancelling() if current is not None else 0
+            if next_count > cancel_count:
+                cancellation = cancellation or error
+                cancel_count = next_count
+                continue
+            if task.done():
+                break
+            raise
+        except BaseException:  # noqa: BLE001 - inspect the retained task below
+            break
+    task_error: BaseException | None = None
+    try:
+        task.result()
+    except BaseException as error:  # noqa: BLE001 - preserve exact task outcome
+        task_error = error
+    if cancellation is not None:
+        if task_error is not None:
+            cancellation.add_note(
+                "OpenSandbox destruction also failed: "
+                f"{type(task_error).__name__}: {task_error}"
+            )
+        raise cancellation.with_traceback(cancellation.__traceback__)
+    if task_error is not None:
+        raise task_error.with_traceback(task_error.__traceback__)
+
+
 def _backend_error(
     operation: str,
     error: Exception,
@@ -111,6 +147,7 @@ class OpenSandboxClient(_SandboxClient):
         self.connection_config = self._resolve_connection_config(connection_config)
         self._initializers = tuple(initializers)
         self._cleanup_tasks: set[asyncio.Task[None]] = set()
+        self._destroy_tasks: dict[str, asyncio.Task[None]] = {}
 
     def _resolve_connection_config(
         self,
@@ -497,8 +534,9 @@ class OpenSandboxClient(_SandboxClient):
                     operation="read-only inspection",
                 )
 
-    async def destroy(self, sandbox_id: str) -> None:
-        """Idempotently destroy one remote Sandbox by ID."""
+    async def _destroy_once(self, sandbox_id: str) -> None:
+        """Connect, kill, and close one Sandbox while preserving the kill outcome."""
+
         try:
             sandbox = await Sandbox.connect(
                 sandbox_id,
@@ -511,21 +549,52 @@ class OpenSandboxClient(_SandboxClient):
                 return
             translated = _backend_error("destroy lookup", exc)
             raise translated from exc
+        kill_error: Exception | None = None
         try:
             await sandbox.kill()
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001 - preserve SDK kill failure through close
+            kill_error = error
+        finally:
             await self._close_sdk_quietly(
                 sandbox,
                 sandbox_id=sandbox_id,
-                operation="failed destruction",
+                operation=(
+                    "failed destruction" if kill_error is not None else "destruction"
+                ),
             )
+        if kill_error is not None:
+            error = kill_error
             translated = _backend_error("destroy", error)
             raise translated from error
-        else:
-            await sandbox.close()
+
+    async def destroy(self, sandbox_id: str) -> None:
+        """Idempotently destroy one remote Sandbox through a retained task.
+
+        Caller cancellation stops no remote work. The method waits for the shared kill
+        and local close settlement, then preserves the caller's cancellation signal.
+        Concurrent calls for the same ID join one task.
+        """
+
+        task = self._destroy_tasks.get(sandbox_id)
+        if task is None:
+            task = asyncio.create_task(
+                self._destroy_once(sandbox_id),
+                name=f"tinkerfin-opensandbox-destroy:{sandbox_id}",
+            )
+            self._destroy_tasks[sandbox_id] = task
+
+            def discard(completed: asyncio.Task[None]) -> None:
+                if self._destroy_tasks.get(sandbox_id) is completed:
+                    self._destroy_tasks.pop(sandbox_id, None)
+
+            task.add_done_callback(discard)
+        await _join_owned_task(task)
 
     async def aclose(self) -> None:
         """Finish cancellation cleanup and close the owned asynchronous transport."""
+        while self._destroy_tasks:
+            tasks = tuple(self._destroy_tasks.values())
+            await asyncio.gather(*tasks, return_exceptions=True)
         while self._cleanup_tasks:
             tasks = tuple(self._cleanup_tasks)
             await asyncio.gather(*tasks, return_exceptions=True)

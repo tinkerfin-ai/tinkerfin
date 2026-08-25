@@ -84,8 +84,8 @@ describe('MessageBlock subagent card', () => {
     expect(conversationStyles).not.toMatch(/\.subagent-card\[open\] \.tool-row-(?:icon|chevron)/s)
     expect(conversationStyles).toMatch(/\.subagent-task-line\s*{[^}]*margin:\s*0 0 var\(--space-2\) calc\(var\(--subagent-avatar-size\) \+ var\(--space-1-5\)\);/s)
     expect(conversationStyles).toMatch(/\.tool-row > summary\s*{[^}]*height:\s*var\(--type-title-line\)/s)
-    expect(conversationStyles).toMatch(/@media \(hover:\s*none\), \(pointer:\s*coarse\)[\s\S]*\.subagent-card-head\s*{\s*height:\s*var\(--control-lg\)/s)
-    expect(conversationStyles).toMatch(/@media \(hover:\s*none\), \(pointer:\s*coarse\)[\s\S]*\.tool-row > summary\s*{\s*height:\s*var\(--control-lg\)/s)
+    expect(conversationStyles).toMatch(/@media \(any-hover:\s*none\), \(any-pointer:\s*coarse\)[\s\S]*\.subagent-card-head\s*{\s*height:\s*var\(--control-lg\)/s)
+    expect(conversationStyles).toMatch(/@media \(any-hover:\s*none\), \(any-pointer:\s*coarse\)[\s\S]*\.tool-row > summary\s*{\s*height:\s*var\(--control-lg\)/s)
 
     expect(conversationStyles).toMatch(/\.subagent-task-line > span\s*\{[^}]*font:\s*inherit;[^}]*font-weight:\s*var\(--weight-medium\);/s)
     expect(conversationStyles).not.toMatch(/\.subagent-task-line > span\s*\{[^}]*font-family:\s*var\(--font-code\)/s)
@@ -104,6 +104,7 @@ describe('MessageBlock subagent card', () => {
     expect(conversationStyles).toMatch(/\.subagent-output-node\s*\{[^}]*--subagent-output-align-offset:\s*calc\(/s)
     expect(conversationStyles).toMatch(/\.subagent-output-node\s*\{[^}]*grid-template-columns:\s*calc\(var\(--space-4\) \+ var\(--space-0-5\)\) minmax\(0, 1fr\);[^}]*column-gap:\s*var\(--space-1\);/s)
     expect(conversationStyles).toMatch(/\.tool-row-leading\s*\{[^}]*width:\s*var\(--icon-sm\);[^}]*margin-right:\s*var\(--space-1-5\);/s)
+    expect(conversationStyles).toMatch(/\.tool-row-icon,[\s\S]*\.tool-row-chevron\s*\{[^}]*justify-content:\s*flex-start;/s)
     expect(conversationStyles).toMatch(/\.subagent-output-icon\s*\{[^}]*margin-top:\s*var\(--subagent-output-align-offset\);/s)
     expect(conversationStyles).toMatch(/\.subagent-output-node::before\s*\{[^}]*var\(--subagent-output-align-offset\)/s)
     expect(conversationStyles).toMatch(/\.subagent-output-node \.subagent-trace-junction\s*\{[^}]*var\(--subagent-output-align-offset\)/s)
@@ -287,6 +288,8 @@ describe('MessageBlock subagent card', () => {
     const { container } = render(<ToolCallBatch messages={[childTool, secondChildTool]} />)
 
     expect(container.querySelectorAll('.tool-batch > .tool-card')).toHaveLength(2)
+    expect(conversationStyles).toMatch(/\.subagent-card\s*\{[^}]*margin:\s*0 0 var\(--space-6\);/s)
+    expect(conversationStyles).toMatch(/\.tool-card,\s*\.tool-batch\s*\{\s*margin:\s*0 0 var\(--space-6\);/s)
     expect(conversationStyles).toMatch(/\.tool-batch\s*{[^}]*display:\s*flex;[^}]*gap:\s*var\(--space-4\)/s)
     expect(conversationStyles).not.toMatch(/\.tool-batch\s*{[^}]*(?:border|box-shadow|background):/s)
   })
@@ -326,6 +329,26 @@ describe('MessageBlock subagent card', () => {
     expect(row?.querySelector('summary')).toHaveTextContent('Read读取失败')
     expect(row?.querySelector('summary')).not.toHaveTextContent('/research/url.json')
     expect(row?.querySelector('.tool-row-state-dot.is-failed')).not.toBeNull()
+  })
+
+  it('preserves literal JSON escapes in Tool parameters', async () => {
+    const params = '{"content":"line1\\nline2","path":"C:\\\\temp\\\\result.txt"}'
+    const { container } = render(<MessageBlock message={{
+      ...childTool,
+      id: 'tool-literal-escapes',
+      meta: {
+        ...childTool.meta,
+        params,
+      },
+    }} />)
+    const row = container.querySelector<HTMLDetailsElement>('.tool-card')
+    if (!row) throw new Error('缺少 Tool 行')
+
+    await userEvent.click(row.querySelector('summary')!)
+    const rendered = row.querySelector('.tool-code-field code')?.textContent
+
+    expect(rendered).toBe(params)
+    expect(() => JSON.parse(rendered ?? '')).not.toThrow()
   })
 
   it('keeps child Tool disclosures independent without an expand-all control', async () => {
@@ -447,6 +470,22 @@ describe('MessageBlock subagent card', () => {
 })
 
 describe('MessageBlock assistant composition', () => {
+  it('renders answer actions only when the message list marks the assistant as final', () => {
+    const message: Message = {
+      id: 'assistant-stage',
+      role: 'assistant',
+      content: '阶段性回答',
+      createdAt: '2026-08-23T00:00:00Z',
+      meta: { status: 'completed' },
+    }
+    const { container, rerender } = render(<MessageBlock message={message} showActions={false} />)
+
+    expect(container.querySelector('.message-action-row')).toBeNull()
+
+    rerender(<MessageBlock message={message} showActions />)
+    expect(screen.getByRole('group', { name: '回答操作' })).toBeInTheDocument()
+  })
+
   it('places the copy action after Markdown without fabricating sources or citations', async () => {
     const user = userEvent.setup()
     const writeText = vi.spyOn(navigator.clipboard, 'writeText')
@@ -467,6 +506,9 @@ describe('MessageBlock assistant composition', () => {
     expect(screen.getByRole('group', { name: '回答操作' })).toBe(actionRow)
     expect(markdown!.compareDocumentPosition(actionRow!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     expect(container.querySelector('.source-summary, .citation')).toBeNull()
+    expect(conversationStyles).toMatch(/\.message-action-row\s*\{[^}]*align-items:\s*flex-start;[^}]*margin-top:\s*var\(--space-1\);/s)
+    expect(conversationStyles).toMatch(/\.message-action-row \.ui-icon-button-wrap\s*\{[^}]*width:\s*var\(--icon-sm\);/s)
+    expect(conversationStyles).toMatch(/\.message-action-row \.ui-icon-button\s*\{[^}]*margin-inline:\s*calc\(\(var\(--control-xs\) - var\(--icon-sm\)\) \/ -2\);/s)
 
     await user.click(screen.getByRole('button', { name: '复制回答' }))
     expect(writeText).toHaveBeenCalledWith('这是**最终回答**')

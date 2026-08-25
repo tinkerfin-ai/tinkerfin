@@ -53,7 +53,7 @@ CREATE TABLE conversation_threads (
   deleted_at DATETIME COMMENT '软删除时间',
   CONSTRAINT pk_conversation_threads PRIMARY KEY (id),
   CONSTRAINT ck_conversation_threads_snapshot_version CHECK (snapshot_version = 3),
-  CONSTRAINT uq_conversation_threads_user_thread UNIQUE (user_id, thread_id),
+  CONSTRAINT uq_conversation_threads_thread UNIQUE (thread_id),
   KEY ix_conversation_threads_user_pinned_updated (user_id, deleted_at, pinned, updated_at, id),
   KEY ix_conversation_threads_user_status_updated (user_id, status, updated_at, id),
   KEY ix_conversation_threads_user_updated (user_id, deleted_at, updated_at, id)

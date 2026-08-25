@@ -7,9 +7,12 @@
 | API | Use |
 | --- | --- |
 | `DeepAgentDefinition.new_agui(...)` | Creates one AG-UI Runtime |
-| `DeepAgentAgUiRuntime.astream(...)` | Runs the Graph and returns `AgUiEventStream` |
+| `DeepAgentAgUiRuntime.astream(graph_input, ...)` | Runs an ordinary Graph request |
+| `DeepAgentAgUiResumeRuntime.astream(...)` | Runs a bound resume without caller input |
 | `AgUiEventStream` | Iterates, aborts, closes, or renders AG-UI events |
-| `AgUiResumeBinding` | Binds a resume request to its native command and previous tool IDs |
+| `AgUiResumeBinding.from_agui(...)` | Validates persisted interrupts, decisions, cancellation, Tool IDs, and sources |
+| `AgUiResumeCheckpoint` | Stable evidence that a native resume marker is durable |
+| `TINKERFIN_HITL_CONTRACT` | Contract declaration for external mixed-cancellation subagents |
 
 See [AG-UI basics](index.md) for Runtime parameters and [Interrupts and resume](interrupts-and-resume.md) for binding use.
 
@@ -35,9 +38,9 @@ See [AG-UI basics](index.md) for Runtime parameters and [Interrupts and resume](
 
 | Method | Parameters | Result |
 | --- | --- | --- |
-| `started(...)` | `identity` | `RUN_STARTED` with `input=None` |
-| `finished(...)` | `identity`, `outcome` | `RUN_FINISHED` |
-| `failed(...)` | `identity`, `message`, `code` | `RUN_ERROR` |
+| `started(...)` | `identity`, optional `parent_run_id` | `RUN_STARTED` with omitted input |
+| `finished(...)` | `identity`, `outcome` | `RUN_FINISHED` with canonical identity |
+| `failed(...)` | `identity`, `message`, `code`, optional `parent_run_id` | `RUN_ERROR` with canonical identity |
 | `is_main_lifecycle(...)` | `event`, `identity` | Whether the event occupies this main lifecycle |
 | `event_run_id(event)` | event | Validated run ID when available |
 | `validate_identity(...)` | `identity` | Early shared identity validation |
@@ -48,13 +51,17 @@ See [AG-UI basics](index.md) for Runtime parameters and [Interrupts and resume](
 
 | API | Use |
 | --- | --- |
+| `AgUiResumeBinding.from_agui(...)` | Build the high-level binding from trusted persisted AG-UI interrupts |
+| `AgUiResumeBinding.model_validate(...)` | Restore the complete stable binding JSON model |
+| `AgUiResumeBindingError` | High-level binding cannot preserve the supplied resume semantics |
 | `ResumeMapper.map(...)` | Map from native interrupts and checkpoint messages |
 | `ResumeMapper.map_agui(...)` | Map from trusted persisted AG-UI interrupts |
-| `ResumeTranslation` | Holds mode, resume data, cancelled IDs, prior tool IDs, and per-interrupt decisions |
-| `ResumeMappingError` | Resume data cannot be mapped without losing semantics |
-| `ResumeMappingFailure` | Stable failure category |
+| `ResumeTranslation` | Holds kind, mode, resume data, cancellations, Tool IDs, sources, and native decisions |
+| `ResumeMappingError` | Low-level Adapter data cannot be mapped without losing semantics |
 
-`ResumeTranslation.mode` is `command`, `abandon`, or `custom`.
+`ResumeTranslation` is the lower-level Adapter result. High-level Runtime callers use
+`AgUiResumeBinding.from_agui(...)`; the binding internally represents fully resolved,
+mixed Tool cancellation, or all-cancelled abandonment without exposing a native command.
 
 ## Interrupt data
 
@@ -68,11 +75,14 @@ See [AG-UI basics](index.md) for Runtime parameters and [Interrupts and resume](
 | `ToolReviewInterruptMetadata` | Versioned native group, action position, Tool name, decisions, and original arguments |
 | `SubagentProvenance` | Stable invocation ID, full namespaces, graph task, parent Tool, Agent, description, and current request run |
 
-Allowed decisions are `approve`, `edit`, `reject`, and `respond`. Action and review entries pair by position.
+Allowed public decisions are `approve`, `edit`, `reject`, and `respond`. Action and
+review entries pair by position. Edited arguments are validated against `argsSchema`
+with JSON Schema Draft 2020-12 before translation returns.
 
 `RuntimeInterruptEnvelope` supports non-Tool workflow pauses. It maps `kind` to the
 AG-UI interrupt reason and leaves domain validation of the resolved JSON object to the
-emitting graph. Runtime and Tool interrupts cannot share one pending batch.
+emitting graph. Extension kinds must be namespaced, and Runtime and Tool interrupts
+cannot share one pending batch.
 
 `parse_tool_review_interrupt(interrupt)` validates a complete trusted Tool interrupt
 against `tinkerfin.deepagents.tool-review.v1`. `subagent_invocation_id(...)` and

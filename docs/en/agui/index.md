@@ -2,7 +2,9 @@
 
 [Documentation](../README.md) · [中文](../../zh/agui/index.md)
 
-AG-UI represents agent text, tool calls, state, approvals, and run outcomes as frontend-friendly events. Framework execution needs only `Identity`; whether an HTTP endpoint accepts a complete `RunAgentInput` is an application choice.
+AG-UI represents agent text, tool calls, state, approvals, and outcomes as
+frontend-friendly events. TinkerFin uses one canonical `Identity` for public lifecycle
+events, Graph execution, checkpoints, coordination, and durable delivery.
 
 ## Your first AG-UI Runtime
 
@@ -19,12 +21,12 @@ agent = TinkerFin().create_deep_agent(
 
 
 async def main() -> None:
-    identity = Identity(threadId="conversation-1", runId="run-1")
-    runtime = agent.new_agui(identity=identity)
+    runtime = agent.new_agui(
+        identity=Identity(threadId="conversation-1", runId="run-1"),
+    )
     events = runtime.astream(
         {"messages": [{"role": "user", "content": "Hello"}]},
     )
-
     async for event in events:
         print(event.type)
 
@@ -32,65 +34,86 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-- `Identity.threadId` becomes the Graph checkpoint thread automatically.
-- `Identity.runId` identifies this semantic run.
+- `Identity.threadId` is the canonical thread used by every runtime and durable boundary.
+- `Identity.runId` identifies one semantic run and is reused only for an idempotent retry.
 - The first `runtime.astream(...)` argument is the explicit Graph input.
-- Framework-owned `RUN_STARTED.input` is always `None`.
+- `RUN_STARTED.input` is omitted; the Runtime does not fabricate or duplicate Graph input.
 
-When a frontend sends standard `RunAgentInput`, validate it at the HTTP boundary, then create the `Identity` and Graph input in application code:
+## HTTP input and Graph input
 
-| `RunAgentInput` field | Protocol | Application responsibility | Automatically sent to the Graph |
-| --- | --- | --- | --- |
-| `threadId` | Required | Build `Identity` with `runId`; also identifies the checkpoint thread | Only as `configurable.thread_id` |
-| `runId` | Required | Identify this semantic run; use a new value for new input and reuse it for retries | No |
-| `parentRunId` | Optional | Persist and interpret run lineage when the application needs it | No |
-| `state` | Required | Validate, persist, or translate according to the application's trust boundary | No |
-| `messages` | Required | Preserve standard roles, multimodal content, and extension fields, then select this Graph invocation's input | No; complete history is not injected |
-| `tools` | Required | Preserve client tool descriptions without granting server execution permission | No |
-| `context` | Required | Translate to Graph context only when the application chooses to | No |
-| `forwardedProps` | Required | Preserve application extensions such as model or UI mode | No |
-| `resume` | Optional | Validate pending interrupts, then translate to `Command(resume=...)` | No |
+A frontend can still send standard `RunAgentInput`. Validate it at the HTTP boundary,
+then map only the application-approved facts:
 
-Do not inject a complete frontend history into a Graph that already has checkpoint state; the same message could execute twice.
+| `RunAgentInput` field | Application responsibility | Framework call |
+| --- | --- | --- |
+| `threadId` / `runId` | Authenticate, authorize, and select one canonical identity | `Identity(...)` |
+| `parentRunId` | Authorize a branch or resume source in the same thread | `parent_run_id=...` |
+| `state` / `messages` | Validate and map to the concrete Graph state schema | `astream(graph_input)` |
+| `tools` | Treat as client descriptions, not server execution permission | Not automatic |
+| `context` | Translate only when the host explicitly supports it | Graph `context=...` |
+| `forwardedProps` | Apply product policy such as model or mode selection | Host-owned |
+| `resume` | Pair with trusted server-persisted interrupts | `AgUiResumeBinding.from_agui(...)` |
+
+Do not inject a complete frontend history into a Graph that already has checkpoint state;
+the same message could execute twice.
+
+## Resume
+
+```python
+from tinkerfin import AgUiResumeBinding, Identity
+
+
+binding = AgUiResumeBinding.from_agui(
+    entries=resume_entries,
+    interrupts=trusted_persisted_interrupts,
+)
+runtime = agent.new_agui(
+    identity=Identity(threadId="conversation-1", runId="run-resume"),
+    parent_run_id=parent_run_id,
+    resume=binding,
+    on_resume_checkpointed=record_checkpoint_idempotently,
+)
+events = runtime.astream(config=config)
+```
+
+The binding validates complete coverage, native grouping, decision order, JSON Schema,
+Tool correlation, cancellation, and subagent provenance. It has a stable JSON round trip
+but owns no identity, parent, Graph, or I/O resource. Native `Command` construction stays
+inside the Runtime. Entirely cancelled batches emit a finite cancelled lifecycle without
+invoking a Graph.
+
+`on_resume_checkpointed` runs after the private marker is readable and before resumed
+native output. A retry can deliver the same `AgUiResumeCheckpoint` again, so the callback
+must be idempotent. It does not mean a Tool or run has completed.
 
 ## `new_agui()` parameters
 
 | Parameter | Default | Purpose |
 | --- | --- | --- |
-| `identity` | required | Thread and run identity |
-| `mode` | Definition default | `default` or `plan`; mode controls only this Runtime request |
-| `on_part` | `None` | Observe each LangGraph v2 part before conversion |
+| `identity` | required | Canonical thread and run identity |
+| `parent_run_id` | `None` | Optional checkpoint branch or resume source |
+| `mode` | Definition default | `default` or `plan` for this Runtime only |
+| `on_part` | `None` | Observe each validated LangGraph v2 part |
 | `timeout` | `None` | Total native-stream deadline |
-| `settlement_timeout` | `None` | Caller wait limit for protected cancellation cleanup |
+| `settlement_timeout` | `None` | Caller wait limit for protected stream cleanup |
 | `expose_reasoning_events` | `False` | Emit supported public reasoning events |
-| `expose_subagent_events` | `True` | Emit subagent events |
+| `expose_subagent_events` | `True` | Emit validated subagent events |
 | `resume` | `None` | Validated `AgUiResumeBinding` |
+| `on_resume_checkpointed` | `None` | Idempotent callback after durable resume acceptance |
 | `on_event` | `None` | Async observer before each AG-UI event is delivered |
 
-The reasoning switch does not expose private provider metadata.
+The reasoning switch never exposes private provider metadata.
 
 ## Fixed stream settings
 
-AG-UI conversion requires:
+AG-UI conversion requires `messages/tasks/values`, `version="v2"`, and
+`subgraphs=True`. Usually omit them. You may add `updates`, `checkpoints`, `debug`, or
+`custom`. Missing required modes, v1, or `subgraphs=False` fails before Graph iteration.
 
-```python
-stream_mode = ("messages", "tasks", "values")
-version = "v2"
-subgraphs = True
-```
-
-Usually omit them. You may add `updates`, `checkpoints`, `debug`, or `custom`. Missing required modes, v1, or `subgraphs=False` fails before Graph iteration.
-
-## Echo a complete application request when needed
-
-The framework cannot decide which frontend fields are trusted, so it does not copy `state`, `messages`, `tools`, `context`, or `forwardedProps` into the start event. An application may enrich the main start event:
-
-```python
-if event.type == "RUN_STARTED" and event.run_id == identity.run_id:
-    event = event.model_copy(update={"input": canonical_run_input})
-```
-
-Use a validated application snapshot—such as one with server-assigned message IDs—not raw untrusted JSON.
+`parent_run_id` is not subagent provenance. It selects the unique valid checkpoint leaf
+for that run in the same canonical thread. Missing, cross-thread, active, failed,
+ambiguous, self-referential, and interrupted-without-matching-resume parents fail before
+Graph execution.
 
 ## Next steps
 

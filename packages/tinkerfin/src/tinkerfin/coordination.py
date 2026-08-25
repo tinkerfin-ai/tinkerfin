@@ -20,13 +20,18 @@ class RunCoordinator(Protocol):
         self,
         identity: Identity,
         /,
-    ) -> AbstractAsyncContextManager[None]: ...
+    ) -> AbstractAsyncContextManager[None]:
+        """Return an exclusive asynchronous scope for ``identity``."""
+
+        ...
 
 
 class _LockEntry:
     __slots__ = ("lock", "users")
 
     def __init__(self) -> None:
+        """Initialize one lock entry with no current users."""
+
         self.lock = asyncio.Lock()
         self.users = 0
 
@@ -42,6 +47,8 @@ class InMemoryRunCoordinator:
     """
 
     def __init__(self, *, key_resolver: Callable[[Identity], str]) -> None:
+        """Initialize process-local coordination for one event loop."""
+
         if not callable(key_resolver):
             raise TypeError("key_resolver must be callable")
         self._key_resolver = key_resolver
@@ -54,6 +61,8 @@ class InMemoryRunCoordinator:
         identity: Identity,
         /,
     ) -> AbstractAsyncContextManager[None]:
+        """Return the lazy exclusive scope for one validated run identity."""
+
         return self._coordinate(identity)
 
     @asynccontextmanager  # pyright: ignore[reportDeprecated]

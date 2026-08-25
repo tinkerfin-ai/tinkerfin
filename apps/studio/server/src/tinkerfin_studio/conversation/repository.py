@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import cast
 
+from ag_ui.core.types import ResumeEntry
 from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -206,6 +207,27 @@ class ConversationRepository:
         )
         return list(result)
 
+    async def list_interrupts_for_update(
+        self,
+        *,
+        thread_pk: int,
+        interrupt_ids: frozenset[str],
+    ) -> list[ConversationInterrupt]:
+        """锁定并返回请求点名的全部审批，不改变认领状态"""
+
+        if not interrupt_ids:
+            return []
+        result = await self._session.scalars(
+            select(ConversationInterrupt)
+            .where(
+                ConversationInterrupt.conversation_thread_id == thread_pk,
+                ConversationInterrupt.interrupt_id.in_(interrupt_ids),
+            )
+            .order_by(ConversationInterrupt.id)
+            .with_for_update()
+        )
+        return list(result)
+
     async def release_pending_interrupt_claims(
         self,
         *,
@@ -227,6 +249,58 @@ class ConversationRepository:
             )
             .values(resolved_run_id=None, updated_at=_now())
         )
+
+    async def settle_claimed_interrupts(
+        self,
+        *,
+        thread_pk: int,
+        run_id: str,
+        entries: tuple[ResumeEntry, ...],
+        resolution_id: str,
+    ) -> None:
+        """按 durable checkpoint 或取消终态幂等完成全部审批"""
+
+        run = await self.get_run_for_update(thread_pk=thread_pk, run_id=run_id)
+        if run is None:
+            raise LookupError(f"恢复 run 不存在: {run_id}")
+        config = dict(run.config_json or {})
+        existing_resolution = config.get("resume_resolution_id")
+        if existing_resolution not in (None, resolution_id):
+            raise RuntimeError("同一恢复 run 出现不同 resolution 证据")
+
+        interrupt_ids = tuple(entry.interrupt_id for entry in entries)
+        entities = await self._session.scalars(
+            select(ConversationInterrupt)
+            .where(
+                ConversationInterrupt.conversation_thread_id == thread_pk,
+                ConversationInterrupt.interrupt_id.in_(interrupt_ids),
+            )
+            .order_by(ConversationInterrupt.id)
+            .with_for_update()
+        )
+        by_id = {entity.interrupt_id: entity for entity in entities}
+        if set(by_id) != set(interrupt_ids):
+            raise RuntimeError("durable resolution 找不到完整审批集合")
+        now = _now()
+        for entry in entries:
+            entity = by_id[entry.interrupt_id]
+            if entity.resolved_run_id != run_id:
+                raise RuntimeError("durable resolution 不拥有审批 claim")
+            expected_status = "cancelled" if entry.status == "cancelled" else "resolved"
+            resume_json = cast(
+                dict[str, object],
+                entry.model_dump(mode="json", by_alias=True, exclude_none=False),
+            )
+            if entity.status not in {"pending", expected_status}:
+                raise RuntimeError("审批已由不一致的业务状态结算")
+            if entity.status == expected_status and entity.resume_json != resume_json:
+                raise RuntimeError("审批 resolution 的 resume 内容不一致")
+            entity.status = expected_status
+            entity.resume_json = resume_json
+            entity.resolved_at = entity.resolved_at or now
+            entity.updated_at = now
+        config["resume_resolution_id"] = resolution_id
+        run.config_json = config
 
     async def count_events(self, thread_pk: int) -> int:
         return int(

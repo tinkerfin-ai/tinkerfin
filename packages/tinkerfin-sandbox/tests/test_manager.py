@@ -329,7 +329,7 @@ class _LeakingState(_FakeState):
 
 
 class _CleanupObservedSQLState(SQLAlchemyOpenSandboxState):
-    """暴露真实 cleanup 提交完成点，避免测试依赖事件循环时序"""
+    """Expose cleanup submission so tests do not depend on loop scheduling."""
 
     def __init__(self, *, url: str, namespace: str) -> None:
         super().__init__(url=url, namespace=namespace)
@@ -998,7 +998,7 @@ class OpenSandboxManagerTest(unittest.IsolatedAsyncioTestCase):
         old_backend.execute_gate.set()
         await execute_task
 
-        # 模拟 task 已结束但 done callback 尚未从跟踪集合移除的调度窗口
+        # Model the window after task completion but before its callback removes it.
         stale_cleanup_task = asyncio.create_task(asyncio.sleep(0))
         await stale_cleanup_task
         manager._cleanup_tasks.add(stale_cleanup_task)
@@ -1463,7 +1463,7 @@ class _BlockingCloseFailingCreateClient(_FailingCreateClient):
 
 
 class _ResettableLocalBackend(LocalShellBackend):
-    """在临时目录执行真实清理命令，同时模拟远端生命周期扩展"""
+    """Run real cleanup commands while emulating the remote lifecycle extension."""
 
     enable_capture_offload = False
 
@@ -1902,7 +1902,7 @@ async def test_reset_requires_a_managed_key() -> None:
 
 @pytest.mark.asyncio
 async def test_strict_startup_warmup_propagates_creation_failure() -> None:
-    """严格预热失败必须阻止管理器进入可用状态"""
+    """Require strict warmup failure to prevent the manager becoming available."""
 
     manager = _new_manager(
         client=_FailingCreateClient(),
@@ -2329,7 +2329,7 @@ async def test_close_after_cancelled_startup_still_closes_state_and_client() -> 
 
 @pytest.mark.asyncio
 async def test_shared_state_prevents_cross_manager_duplicate_create() -> None:
-    """两个进程级 manager 竞争同一 owner 时只能有一个创建者"""
+    """Allow one creator when two process-level managers contend for an owner."""
 
     client = _ReconnectableFakeClient()
     store = _FakeState()
@@ -2633,7 +2633,7 @@ async def test_manager_renews_sql_cleanup_claim_during_slow_destroy(
 
 @pytest.mark.asyncio
 async def test_state_get_adopts_authoritative_binding_change() -> None:
-    """Manager 必须采用 State 权威绑定，而不是返回健康但陈旧的本地缓存"""
+    """Use the State binding instead of returning a healthy but stale local cache."""
 
     client = _ReconnectableFakeClient()
     store = _FakeState()
@@ -2662,7 +2662,7 @@ async def test_state_get_adopts_authoritative_binding_change() -> None:
 
 @pytest.mark.asyncio
 async def test_state_recreate_cleans_cached_and_authoritative_old_ids() -> None:
-    """跨进程改绑后 recreate 必须回收本地旧实例和持久化权威旧实例"""
+    """Reclaim local and authoritative stale instances after cross-process rebinding."""
 
     client = _ReconnectableFakeClient()
     store = _FakeState()

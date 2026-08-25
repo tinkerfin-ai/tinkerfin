@@ -139,6 +139,66 @@ def test_resume_mapper_uses_persisted_agui_tool_ids_without_checkpoint() -> None
     )
 
 
+def test_resume_mapper_revalidates_edited_args_against_persisted_schema() -> None:
+    interrupt = AgentRuntimeInterrupt(
+        id="schema-review",
+        value={
+            "action_requests": [
+                {"name": "write_file", "args": {"file_path": "/workspace/a.txt"}}
+            ],
+            "review_configs": [
+                {
+                    "action_name": "write_file",
+                    "allowed_decisions": ["edit"],
+                    "args_schema": {
+                        "type": "object",
+                        "required": ["file_path"],
+                        "properties": {
+                            "file_path": {
+                                "type": "string",
+                                "pattern": "^/workspace/",
+                            }
+                        },
+                        "additionalProperties": False,
+                    },
+                }
+            ],
+        },
+    )
+    message = AIMessage(
+        id="schema-message",
+        content="",
+        tool_calls=[
+            {
+                "name": "write_file",
+                "args": {"file_path": "/workspace/a.txt"},
+                "id": "schema-call",
+                "type": "tool_call",
+            }
+        ],
+    )
+
+    with pytest.raises(ResumeMappingError) as captured:
+        ResumeMapper().map(
+            entries=(
+                _entry(
+                    "schema-review",
+                    payload={
+                        "type": "edit",
+                        "edited_action": {
+                            "name": "write_file",
+                            "args": {"file_path": "/etc/passwd"},
+                        },
+                    },
+                ),
+            ),
+            interrupts=(interrupt,),
+            messages_by_namespace={(): (message,)},
+        )
+
+    assert captured.value.code is AgUiAdapterErrorCode.RESUME_PAYLOAD_INVALID
+
+
 def test_resume_mapper_rejects_tampered_persisted_agui_correlation() -> None:
     interrupts = list(_public_interrupts())
     metadata = dict(interrupts[0].metadata or {})
@@ -210,7 +270,7 @@ def test_resume_mapper_restores_multiple_persisted_agui_groups() -> None:
     )
 
 
-def test_resume_mapper_uses_only_resolved_persisted_tool_ids_for_mixed_resume() -> None:
+def test_resume_mapper_preserves_all_persisted_tool_ids_for_mixed_resume() -> None:
     translation = ResumeMapper().map_agui(
         entries=(
             _entry("interrupt-main#1", status="cancelled"),
@@ -223,6 +283,7 @@ def test_resume_mapper_uses_only_resolved_persisted_tool_ids_for_mixed_resume() 
     assert translation.cancelled_interrupt_ids == ("interrupt-main#1",)
     assert translation.prior_tool_call_ids == (
         ScopedIdCodec().encode("tool", (), "call-main-a"),
+        ScopedIdCodec().encode("tool", (), "call-main-b"),
     )
 
 

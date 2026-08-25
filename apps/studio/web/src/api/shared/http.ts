@@ -98,7 +98,7 @@ function handleAuthFailure(error: ApiError, policy: ErrorPolicy) {
   if (!policy.suppressAuthFailure) {
     notifyAuthFailure({
       code: error.code,
-      message: error.message || translateCurrent('登录已失效，请重新登录。'),
+      message: error.message || translateCurrent('登录已失效，请重新登录'),
     })
   }
 }
@@ -164,7 +164,7 @@ function transportErrorMessage(status: number) {
   if (status === GLOBAL_ERROR_CODES.forbidden) return translateCurrent('没有该操作权限')
   if (status === 404) return translateCurrent('请求未找到')
   if (status === 429) return translateCurrent('请求过于频繁，请稍后重试')
-  if (status >= 500) return translateCurrent('服务暂不可用，请稍后重试。')
+  if (status >= 500) return translateCurrent('服务暂不可用，请稍后重试')
   return translateCurrent('请求失败 ({status})', { status })
 }
 
@@ -216,7 +216,7 @@ apiClient.interceptors.response.use(
 
     if (!axios.isAxiosError(reason)) {
       return Promise.reject(finalizeError(
-        new ApiError(translateCurrent('网络请求失败，请稍后重试。'), { status: 0 }),
+        new ApiError(translateCurrent('网络请求失败，请稍后重试'), { status: 0 }),
         {},
       ))
     }
@@ -230,7 +230,7 @@ apiClient.interceptors.response.use(
 
     if (status === 0) {
       return Promise.reject(finalizeError(
-        new ApiError(translateCurrent('网络请求失败，请稍后重试。'), { status: 0 }),
+        new ApiError(translateCurrent('网络请求失败，请稍后重试'), { status: 0 }),
         policy,
       ))
     }
@@ -297,7 +297,7 @@ async function fetchStreamResponse(path: string, options: RequestOptions) {
   } catch (error) {
     if (error instanceof DOMException && error.name === 'AbortError') throw error
     throw finalizeError(
-      new ApiError(translateCurrent('网络请求失败，请稍后重试。'), { status: 0 }),
+      new ApiError(translateCurrent('网络请求失败，请稍后重试'), { status: 0 }),
       options,
     )
   }

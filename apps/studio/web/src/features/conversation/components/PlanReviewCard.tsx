@@ -47,7 +47,7 @@ export function PlanReviewCard({
           <textarea rows={3} value={interaction.message ?? ''} placeholder={interaction.action === 'respond' ? t('说明需要修改的范围和原因…') : t('说明为什么不执行这份计划…')} onChange={(event) => update({ message: event.currentTarget.value })} />
         </label>
       )}
-      {interaction.error && <p className="plan-card-error">{interaction.error}</p>}
+      {interaction.error && <p className="plan-card-error" role="alert">{interaction.error}</p>}
       <footer className="plan-card-footer">
         <span>Markdown</span>
         <Button variant="primary" disabled={!interaction.action || interaction.submitted} onClick={onSubmit}>

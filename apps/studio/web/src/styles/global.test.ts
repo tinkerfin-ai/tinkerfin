@@ -3,8 +3,10 @@ import { describe, expect, it } from 'vitest'
 import faviconSvg from '../../public/tinkerfin-favicon.svg?raw'
 import indexHtml from '../../index.html?raw'
 import mainEntry from '../main.tsx?raw'
+import workspaceLayoutAnimation from '../features/workspace/useWorkspaceLayoutAnimation.ts?raw'
 import tokensStyles from './tokens.css?raw'
 import typographyStyles from './typography.css?raw'
+import fontsStyles from './fonts.css?raw'
 
 const cssFiles = import.meta.glob('../**/*.css', {
   eager: true,
@@ -13,7 +15,7 @@ const cssFiles = import.meta.glob('../**/*.css', {
 }) as Record<string, string>
 
 const componentStyles = Object.entries(cssFiles)
-  .filter(([path]) => !path.endsWith('/tokens.css'))
+  .filter(([path]) => !path.endsWith('/tokens.css') && !path.endsWith('/fonts.css'))
   .map(([, source]) => source)
   .join('\n')
 
@@ -55,6 +57,29 @@ const contrastRatio = (firstColor: string, secondColor: string) => {
 }
 
 describe('前端视觉契约', () => {
+  it('每个 CSS owner 恰好归属一个预声明 layer', () => {
+    const layerOrder = tokensStyles.match(/@layer\s+([^;]+);/)?.[1]
+      .split(',')
+      .map((layer) => layer.trim()) ?? []
+    expect(layerOrder).toEqual([
+      'tokens',
+      'base',
+      'ui',
+      'auth',
+      'conversation',
+      'workspace',
+      'settings',
+      'utilities',
+    ])
+
+    for (const [path, source] of Object.entries(cssFiles)) {
+      const owners = [...source.matchAll(/@layer\s+([\w-]+)\s*\{/g)]
+        .map((match) => match[1])
+      expect([...new Set(owners)], `${path} 必须只有一个 owner layer`).toHaveLength(1)
+      expect(layerOrder, `${path} 使用了未预声明 layer`).toContain(owners[0])
+    }
+  })
+
   it('网站标题与菜单品牌使用同一 Blocks 几何', () => {
     expect(indexHtml).toContain('href="/tinkerfin-favicon.svg?v=10"')
     expect(faviconSvg).toContain('<rect width="7" height="7" x="14" y="3" rx="1" />')
@@ -64,10 +89,8 @@ describe('前端视觉契约', () => {
 
   it('按既定顺序加载自托管字体、令牌、排版和基础样式', () => {
     const imports = [
-      '@fontsource-variable/inter',
-      '@fontsource-variable/inter/wght-italic.css',
+      './styles/fonts.css',
       '@fontsource-variable/noto-sans-sc',
-      '@fontsource-variable/jetbrains-mono',
       './styles/tokens.css',
       './styles/typography.css',
       './styles/global.css',
@@ -93,6 +116,15 @@ describe('前端视觉契约', () => {
     expect(typographyStyles).toContain('--type-composer-line: 24px;')
     expect(typographyStyles).toMatch(/--type-h1-size:\s*24px;[\s\S]*--type-h1-line:\s*34px;/)
     expect(typographyStyles).toMatch(/--type-brand-size:\s*26px;[\s\S]*--type-brand-line:\s*32px;/)
+  })
+
+  it('只为西文字体声明实际使用的 Latin 变量文件', () => {
+    expect(fontsStyles.match(/@font-face/g)).toHaveLength(3)
+    expect(fontsStyles).toContain('inter-latin-wght-normal.woff2')
+    expect(fontsStyles).toContain('inter-latin-wght-italic.woff2')
+    expect(fontsStyles).toContain('jetbrains-mono-latin-wght-normal.woff2')
+    expect(fontsStyles).not.toMatch(/latin-ext|cyrillic|greek|vietnamese/)
+    expect(mainEntry).toContain("import '@fontsource-variable/noto-sans-sc'")
   })
 
   it('锁定布局、控件、圆角、层级与 100/200/300ms 动效尺度', () => {
@@ -130,7 +162,14 @@ describe('前端视觉契约', () => {
     expect(uiStyles).toMatch(/\.modal-dialog--action \.modal-dialog-error \+ \.modal-dialog-actions\s*\{[^}]*margin-top:\s*var\(--space-3\);/s)
     expect(uiStyles).toMatch(/\.modal-dialog--action\.has-input \.modal-dialog-actions\s*\{[^}]*margin-top:\s*var\(--space-6\);/s)
     expect(uiStyles).not.toMatch(/\.modal-dialog--action \.modal-dialog-actions \.ui-button\s*\{/s)
-    expect(uiStyles).toMatch(/@media \(hover: none\), \(pointer: coarse\)[\s\S]*\.ui-button\s*\{[^}]*min-width:\s*var\(--control-lg\);[^}]*min-height:\s*var\(--control-lg\);/s)
+    expect(uiStyles).toMatch(/@media \(any-hover: none\), \(any-pointer: coarse\)[\s\S]*\.ui-button\s*\{[^}]*min-width:\s*var\(--control-lg\);[^}]*min-height:\s*var\(--control-lg\);/s)
+  })
+
+  it('ThemePicker 以固定完整宽度和 scaleX 展开表面', () => {
+    const uiStyles = cssFiles['../components/ui/ui.css']
+
+    expect(uiStyles).toMatch(/\.theme-switcher-surface\s*\{[^}]*width:\s*calc\(var\(--control-lg\) \* 3\);[^}]*transform:\s*scaleX\(0\.333333\);[^}]*transform-origin:\s*right center;[^}]*will-change:\s*transform, opacity;/s)
+    expect(uiStyles).not.toMatch(/\.theme-switcher-surface\s*\{[^}]*will-change:\s*width/s)
   })
 
   it('共享 Button 与 TextField 使用统一桌面尺度和单一中性焦点边', () => {
@@ -143,7 +182,9 @@ describe('前端视觉契约', () => {
     expect(uiStyles).toMatch(/\.ui-text-field--lg \.ui-text-field__control\s*\{[^}]*min-height:\s*var\(--control-lg\);/s)
     expect(uiStyles).toMatch(/\.ui-text-field__control:focus-within\s*\{[^}]*border-color:\s*var\(--color-border-strong\);[^}]*box-shadow:\s*none;/s)
     expect(tokensStyles).not.toContain('--shadow-focus')
-    expect(conversationStyles).toMatch(/\.approval-form textarea:focus,[\s\S]*\.plan-review-input textarea:focus\s*\{[^}]*border-color:\s*var\(--color-border-strong\);[^}]*box-shadow:\s*none;/s)
+    expect(conversationStyles).toMatch(/\.approval-form textarea:focus,[\s\S]*\.plan-review-input textarea:focus\s*\{[^}]*border-color:\s*var\(--color-border-strong\);[^}]*outline:\s*0;[^}]*box-shadow:\s*none;/s)
+    expect(conversationStyles).not.toMatch(/\.approval-form textarea:focus-visible,[\s\S]*\.plan-review-input textarea:focus-visible\s*\{[^}]*var\(--color-focus\)/s)
+    expect(conversationStyles).toMatch(/@media \(forced-colors:\s*active\)[\s\S]*\.approval-form textarea:focus-visible,[\s\S]*\.plan-review-input textarea:focus-visible,[\s\S]*\.composer-attachment-remove:focus-visible\s*\{[^}]*outline:\s*2px solid Highlight;/s)
   })
 
   it('带边框控件使用单一焦点边且鼠标焦点不触发主题选项轮廓', () => {
@@ -194,6 +235,9 @@ describe('前端视觉契约', () => {
         ['--color-danger-text', '--color-danger-soft'],
         ['--color-success-text', '--color-success-soft'],
         ['--color-warning-text', '--color-warning-soft'],
+        ['--color-text-caption-on-layer', '--color-layer-1'],
+        ['--color-text-caption-on-layer', '--color-layer-2'],
+        ['--color-text-caption-on-layer', '--color-code-surface'],
       ]) {
         const foregroundColor = resolveToken(tokens, foreground)
         const backgroundColor = resolveToken(tokens, background)
@@ -272,7 +316,7 @@ describe('前端视觉契约', () => {
     expect(explicitFontSizes).toEqual([])
     expect(explicitFontWeights).toEqual([])
     expect(interactiveCaptionSelectors).toEqual([])
-    expect(typographyStyles).toMatch(/button,[\s\S]*select\s*{\s*font-size:\s*inherit;/)
+    expect(cssFiles['./global.css']).toMatch(/button,[\s\S]*select\s*{\s*font-size:\s*inherit;/)
   })
 
   it('共享与业务按钮都声明完整交互状态', () => {
@@ -282,7 +326,6 @@ describe('前端视觉契约', () => {
       [cssFiles['../features/workspace/workspace.css'], '.user-card'],
       [cssFiles['../features/conversation/conversation.css'], '.composer-model-select'],
       [cssFiles['../features/workspace/workspace.css'], '.scroll-to-bottom'],
-      [cssFiles['../features/workspace/workspace.css'], '.todo-item'],
     ] as const
 
     for (const [source, selector] of contracts) {
@@ -290,6 +333,14 @@ describe('前端视觉契约', () => {
         expect(source, `${selector} 缺少 ${state}`).toContain(`${selector}:${state}`)
       }
     }
+  })
+
+  it('Todo 状态项不声明虚假的按钮交互样式', () => {
+    const workspaceStyles = cssFiles['../features/workspace/workspace.css']
+    expect(workspaceStyles).toContain('.todo-item {')
+    expect(workspaceStyles).not.toContain('.todo-item:hover')
+    expect(workspaceStyles).not.toContain('.todo-item:active')
+    expect(workspaceStyles).not.toContain('.todo-item:focus-visible')
   })
 
   it('Markdown 使用编辑型表格并具备完整文章语义和显式 compact variant', () => {
@@ -317,21 +368,29 @@ describe('前端视觉契约', () => {
     expect(workspaceStyles).not.toContain('.brand > span')
     expect(workspaceStyles).toMatch(/\.sidebar-head \.brand-plus\s*\{[^}]*padding-inline:\s*var\(--space-1\);[^}]*font-size:\s*var\(--type-micro-size\);[^}]*line-height:\s*var\(--type-micro-line\);/s)
     expect(workspaceStyles).toMatch(/\.sidebar-head-actions \.ui-icon-button\s*\{[^}]*width:\s*var\(--control-xs\);[^}]*min-height:\s*var\(--control-xs\);[^}]*height:\s*var\(--control-xs\);/s)
-    expect(workspaceStyles).toMatch(/@media \(hover:\s*none\), \(pointer:\s*coarse\)[\s\S]*\.sidebar-head-actions \.ui-icon-button\s*\{[^}]*width:\s*var\(--control-lg\);[^}]*min-width:\s*var\(--control-lg\);[^}]*height:\s*var\(--control-lg\);/s)
-    expect(workspaceStyles).toMatch(/@media \(hover:\s*none\), \(pointer:\s*coarse\)[\s\S]*\.sidebar-head\s*\{[^}]*gap:\s*var\(--space-1\);[^}]*\}[\s\S]*\.sidebar-head-actions\s*\{[^}]*gap:\s*var\(--space-0\);[^}]*\}[\s\S]*\.brand\s*\{[^}]*gap:\s*var\(--space-0-5\);/s)
-    expect(workspaceStyles).toMatch(/@media \(hover:\s*none\), \(pointer:\s*coarse\)[\s\S]*\.brand \.brand-mark svg\s*\{[^}]*width:\s*28px;[^}]*height:\s*28px;/s)
-    expect(workspaceStyles).toMatch(/@media \(hover:\s*none\), \(pointer:\s*coarse\)[\s\S]*\.sidebar-head \.brand-plus\s*\{[^}]*padding-inline:\s*var\(--space-0\);[^}]*font-size:\s*var\(--type-micro-size\);/s)
+    expect(workspaceStyles).toMatch(/@media \(any-hover:\s*none\), \(any-pointer:\s*coarse\)[\s\S]*\.sidebar-head-actions \.ui-icon-button\s*\{[^}]*width:\s*var\(--control-lg\);[^}]*min-width:\s*var\(--control-lg\);[^}]*height:\s*var\(--control-lg\);/s)
+    expect(workspaceStyles).toMatch(/@media \(any-hover:\s*none\), \(any-pointer:\s*coarse\)[\s\S]*\.sidebar-head\s*\{[^}]*gap:\s*var\(--space-1\);[^}]*\}[\s\S]*\.sidebar-head-actions\s*\{[^}]*gap:\s*var\(--space-0\);[^}]*\}[\s\S]*\.brand\s*\{[^}]*gap:\s*var\(--space-0-5\);/s)
+    expect(workspaceStyles).toMatch(/@media \(any-hover:\s*none\), \(any-pointer:\s*coarse\)[\s\S]*\.brand \.brand-mark svg\s*\{[^}]*width:\s*28px;[^}]*height:\s*28px;/s)
+    expect(workspaceStyles).toMatch(/@media \(any-hover:\s*none\), \(any-pointer:\s*coarse\)[\s\S]*\.sidebar-head \.brand-plus\s*\{[^}]*padding-inline:\s*var\(--space-0\);[^}]*font-size:\s*var\(--type-micro-size\);/s)
     expect(workspaceStyles).toMatch(/\.brand:hover,[\s\S]*\.brand:active\s*{[^}]*background:\s*transparent;[^}]*box-shadow:\s*none;[^}]*color:\s*var\(--color-text-primary\);/s)
     expect(workspaceStyles).toMatch(/\.sidebar-head-actions \.ui-tooltip\s*\{[^}]*right:\s*0;[^}]*left:\s*auto;/s)
-    expect(workspaceStyles).toMatch(/\.sidebar-rail \.ui-tooltip\s*\{[^}]*top:\s*50%;[^}]*left:\s*calc\(100% \+ var\(--space-2\)\);[^}]*transform:\s*translate\(var\(--space-0-5\), -50%\);/s)
+    expect(workspaceStyles).toMatch(/\.sidebar-rail \.ui-tooltip\s*\{[^}]*top:\s*50%;[^}]*left:\s*calc\(100% \+ var\(--space-5\)\);[^}]*transform:\s*translate\(var\(--space-0-5\), -50%\);/s)
     expect(workspaceStyles).toMatch(/\.sidebar-rail \.ui-icon-button-wrap:hover \.ui-tooltip,[\s\S]*\.sidebar-rail \.ui-icon-button:focus-visible \+ \.ui-tooltip\s*\{[^}]*transform:\s*translate\(0, -50%\);/s)
     expect(workspaceStyles).toMatch(/@media \(max-width:\s*767px\)/)
     expect(workspaceStyles).toMatch(/@media \(min-width:\s*1281px\)/)
-    expect(workspaceStyles).toMatch(/\.workspace-main\s*\{[^}]*transition:\s*margin-right/s)
+    expect(workspaceStyles).not.toMatch(/\.app-shell\s*\{[^}]*transition:\s*grid-template-columns/s)
+    expect(workspaceStyles).not.toMatch(/\.workspace-main\s*\{[^}]*transition:\s*margin-right/s)
     expect(workspaceStyles).toMatch(/\.app-shell\.has-drawer \.workspace-main\s*\{[^}]*margin-right:\s*var\(--layout-task-drawer\)/s)
     expect(workspaceStyles).toMatch(/\.task-drawer\s*\{[^}]*position:\s*fixed;[^}]*box-shadow:\s*var\(--shadow-3\)/s)
+    expect(workspaceStyles).not.toMatch(/\.task-drawer\s*\{[^}]*transition:/s)
+    expect(workspaceStyles).toMatch(/\[data-workspace-layout-target\]\.is-layout-flipping\s*\{[^}]*will-change:\s*transform, opacity;/s)
+    expect(workspaceLayoutAnimation).toContain('Flip.getState')
+    expect(workspaceLayoutAnimation).toContain('Flip.from')
+    expect(workspaceLayoutAnimation).toContain("'(prefers-reduced-motion: reduce)'")
+    expect(workspaceLayoutAnimation).toContain('Flip.killFlipsOf')
     expect(workspaceStyles).toMatch(/@media \(prefers-reduced-motion:\s*reduce\)[\s\S]*\.workspace-main,[\s\S]*transition:\s*none;/s)
-    expect(cssFiles['../components/ui/ui.css']).toContain('.ui-scrollbar-overlay')
+    expect(cssFiles['../components/ui/ui.css']).not.toContain('.ui-scrollbar-overlay')
+    expect(cssFiles['../components/ui/ui.css']).toContain('.ui-overlay-scrollbar')
   })
 
   it('回到底部使用文字胶囊、历史间距和滚动内容安全内边距', () => {
@@ -359,12 +418,17 @@ describe('前端视觉契约', () => {
     const uiStyles = cssFiles['../components/ui/ui.css']
 
     expect(conversationStyles).not.toContain('.composer-wrap')
+    expect(conversationStyles).toMatch(/\.tool-row\.running > summary::after\s*\{[^}]*left:\s*0;[^}]*transform:\s*translateX\(-100%\);/s)
+    expect(conversationStyles).not.toContain('.subagent-card.running > summary::after')
+    expect(conversationStyles).toMatch(/@keyframes conversation-tool-row-sweep\s*\{[\s\S]*?0%\s*\{[^}]*transform:\s*translateX\(-100%\);[\s\S]*?90%, 100%\s*\{[^}]*transform:\s*translateX\(calc\(100vw \+ 100%\)\);/s)
+    expect(conversationStyles).not.toMatch(/@keyframes conversation-tool-row-sweep\s*\{[^}]*left:/s)
     expect(conversationStyles).toMatch(/\.composer-dock\s*\{[^}]*grid-row:\s*2;[^}]*grid-column:\s*1;[^}]*align-self:\s*end;[^}]*pointer-events:\s*none;[^}]*background:\s*transparent;/s)
     expect(conversationStyles).toMatch(/\.composer-dock::before\s*\{[^}]*height:\s*calc\(100% \+ var\(--space-16\)\);[^}]*linear-gradient\(to bottom, transparent, var\(--color-canvas\)\);/s)
     expect(conversationStyles).toMatch(/\.composer-dock\.is-hero\s*\{[^}]*align-self:\s*center;[^}]*display:\s*flex;[^}]*padding-bottom:\s*max\(calc\(var\(--space-8\) \+ var\(--type-composer-line\) \+ var\(--type-composer-line\) \+ var\(--type-composer-line\)\), env\(safe-area-inset-bottom\)\);[^}]*flex-direction:\s*column;/s)
     expect(conversationStyles).toMatch(/\.composer-dock\.is-hero::before\s*\{\s*display:\s*none;/s)
     expect(conversationStyles).toMatch(/\.composer-hero\s*\{[^}]*width:\s*min\(100%, var\(--layout-composer-width\)\);[^}]*margin:\s*0 auto var\(--type-composer-line\);[^}]*place-items:\s*center;/s)
-    expect(conversationStyles).toMatch(/\.composer-dock\.is-hero \.composer-input-mirror\s*\{\s*min-height:\s*52px;/s)
+    expect(conversationStyles).toMatch(/\.composer-input-mirror\s*\{[^}]*min-height:\s*28px;/s)
+    expect(conversationStyles).not.toMatch(/\.composer-dock\.is-hero \.composer-input-mirror\s*\{/s)
     expect(workspaceStyles).toMatch(/\.sidebar-wide\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\);[^}]*grid-template-rows:\s*auto auto minmax\(0, 1fr\) auto;/s)
     expect(workspaceStyles).toMatch(/\.sidebar-head\s*\{[^}]*z-index:\s*var\(--layer-dropdown\);[^}]*overflow:\s*visible;/s)
     expect(workspaceStyles).toMatch(/\.new-chat\s*\{[^}]*min-height:\s*var\(--control-lg\);[^}]*justify-content:\s*center;[^}]*box-shadow:\s*var\(--shadow-1\);/s)
@@ -385,26 +449,31 @@ describe('前端视觉契约', () => {
     expect(workspaceStyles).not.toContain('.conversation-more::before')
     expect(workspaceStyles).not.toContain('.conversation-item:focus-within')
     expect(workspaceStyles).toMatch(/\.conversation-item:has\(:focus-visible\) \.conversation-more,[\s\S]*\.conversation-more\.is-selected,[\s\S]*\.conversation-item\.is-active \.conversation-more\s*\{[^}]*opacity:\s*1;/s)
-    expect(workspaceStyles).toMatch(/@media \(hover: none\), \(pointer: coarse\)[\s\S]*\.conversation-main\s*\{[^}]*padding-right:\s*calc\(var\(--control-lg\) \+ var\(--space-1\)\);/s)
+    expect(workspaceStyles).toMatch(/@media \(any-hover: none\), \(any-pointer: coarse\)[\s\S]*\.conversation-main\s*\{[^}]*padding-right:\s*calc\(var\(--control-lg\) \+ var\(--space-1\)\);/s)
     expect(workspaceStyles).toMatch(/\.conversation-scroll\s*\{[^}]*padding-bottom:\s*var\(--space-6\);/s)
     expect(workspaceStyles).toMatch(/\.conversation-history\s*\{[^}]*margin-right:\s*calc\(var\(--space-3\) \* -1\);/s)
     expect(workspaceStyles).toMatch(/\.conversation-scroll\s*\{[^}]*padding-right:\s*var\(--space-3\);/s)
     expect(workspaceStyles).not.toContain('--sidebar-scrollbar-thumb')
+    expect(tokensStyles).toContain('--color-scroll-thumb: #e5e5e5;')
+    expect(tokensStyles).toContain('--color-scroll-thumb-hover: #d4d4d4;')
+    expect(tokensStyles).toContain('--color-scroll-thumb: #3c3c3d;')
+    expect(tokensStyles).toContain('--color-scroll-thumb-hover: #545557;')
     expect(uiStyles).toMatch(/\.ui-scrollbar\s*\{[^}]*scrollbar-width:\s*none;/s)
-    expect(uiStyles).toMatch(/\.ui-scrollbar::-webkit-scrollbar\s*\{[^}]*display:\s*none;[^}]*width:\s*0;[^}]*height:\s*0;/s)
-    expect(uiStyles).toMatch(/\.ui-scrollbar-overlay\s*\{[^}]*position:\s*absolute;[^}]*right:\s*0;[^}]*width:\s*var\(--space-2\);[^}]*opacity:\s*0;[^}]*transition:\s*opacity var\(--motion-normal\) var\(--ease-out\);/s)
-    expect(uiStyles).toMatch(/\.ui-scrollbar-overlay\.is-visible\s*\{[^}]*opacity:\s*1;/s)
-    expect(uiStyles).toMatch(/\.ui-scrollbar-overlay__thumb\s*\{[^}]*right:\s*1px;[^}]*width:\s*var\(--space-1-5\);[^}]*background:\s*var\(--color-scroll-thumb\);/s)
-    expect(uiStyles).toMatch(/@media \(prefers-reduced-motion:\s*reduce\)[\s\S]*\.ui-scrollbar-overlay,[\s\S]*transition:\s*none;/s)
+    expect(uiStyles).toMatch(/\.ui-scrollbar::-webkit-scrollbar\s*\{[^}]*display:\s*none;/s)
+    expect(uiStyles).toMatch(/\.ui-scrollbar:focus-visible\s*\{[^}]*outline:\s*0;/s)
+    expect(uiStyles).toMatch(/@media \(forced-colors:\s*active\)[\s\S]*\.ui-scrollbar:focus-visible\s*\{[^}]*outline:\s*2px solid Highlight;[^}]*outline-offset:\s*-2px;/s)
+    expect(uiStyles).toMatch(/\.ui-overlay-scrollbar__thumb::after\s*\{[^}]*border-radius:\s*var\(--radius-pill\);[^}]*background:\s*var\(--color-scroll-thumb\);[^}]*transition:[^}]*width var\(--motion-fast\) var\(--ease-out\)[,;]/s)
+    expect(uiStyles).toMatch(/\.ui-overlay-scrollbar--vertical \.ui-overlay-scrollbar__thumb:hover::after,[\s\S]*\.ui-overlay-scrollbar--vertical \.ui-overlay-scrollbar__thumb:active::after\s*\{[^}]*width:\s*calc\(100% \+ var\(--space-0-5\)\);[^}]*background:\s*var\(--color-scroll-thumb-hover\);/s)
+    expect(uiStyles).not.toContain('is-geometry-transitioning')
     expect(workspaceStyles).toMatch(/\.conversation-scroll\s*\{[^}]*overflow-anchor:\s*none;/s)
     expect(workspaceStyles).toMatch(/\.history-load-sentinel\s*\{[^}]*height:\s*1px;[^}]*overflow:\s*hidden;/s)
-    expect(workspaceStyles).not.toContain('.history-pagination-status')
-    expect(workspaceStyles).not.toContain('.history-load-more-tail')
+    expect(workspaceStyles).toMatch(/\.history-pagination-slot\s*\{[^}]*height:\s*var\(--control-lg\);/s)
+    expect(workspaceStyles).toMatch(/\.history-pagination-status\s*\{[^}]*height:\s*100%;[^}]*padding:\s*0 var\(--space-2\);/s)
     expect(workspaceStyles).toMatch(/@media \(forced-colors:\s*active\)[\s\S]*\.conversation-history::after\s*{\s*display:\s*none;/s)
     expect(workspaceStyles).toMatch(/\.user-account\s*\{[^}]*min-height:\s*var\(--space-16\);[^}]*border:\s*0;/s)
     expect(uiStyles).toMatch(/\.user-avatar--sm\s*\{[^}]*width:\s*var\(--control-xs\);[^}]*height:\s*var\(--control-xs\);/s)
     expect(workspaceStyles).toMatch(/\.conversation-item\.is-active \.conversation-more\s*\{[^}]*opacity:\s*1;/s)
-    expect(workspaceStyles).toMatch(/@media \(hover: none\), \(pointer: coarse\)[\s\S]*\.conversation-main,[\s\S]*min-height:\s*var\(--control-lg\);/s)
+    expect(workspaceStyles).toMatch(/@media \(any-hover: none\), \(any-pointer: coarse\)[\s\S]*\.conversation-main,[\s\S]*min-height:\s*var\(--control-lg\);/s)
   })
 
   it('图标按钮全透明无阴影，标准输入框统一描边，Composer 保留独立弱边框', () => {
@@ -415,12 +484,17 @@ describe('前端视觉契约', () => {
     expect(uiStyles).not.toContain('.ui-icon-button::before')
     expect(uiStyles).toMatch(/\.ui-icon-button\s*\{[^}]*background:\s*transparent;/s)
     expect(uiStyles).toMatch(/\.ui-icon-button:hover:not\(:disabled\),[\s\S]*\.ui-icon-button:disabled\s*\{[^}]*background:\s*transparent;[^}]*box-shadow:\s*none;/s)
-    expect(uiStyles).toMatch(/\.ui-icon-button:focus-visible\s*\{[^}]*box-shadow:\s*none;/s)
+    expect(uiStyles).toMatch(/\.ui-icon-button:focus-visible\s*\{[^}]*outline:\s*0;[^}]*background:\s*var\(--color-hover\);[^}]*box-shadow:\s*none;/s)
+    expect(uiStyles).toMatch(/@media \(forced-colors:\s*active\)[\s\S]*\.ui-button:focus-visible,[\s\S]*\.ui-icon-button:focus-visible,[\s\S]*\.ui-text-field__control:focus-within\s*\{[^}]*outline:\s*2px solid Highlight;[^}]*outline-offset:\s*2px;/s)
     expect(uiStyles).toMatch(/\.ui-text-field__control\s*\{[^}]*border:\s*1px solid var\(--color-border\);[^}]*background:\s*var\(--color-layer-1\);/s)
     expect(uiStyles).toMatch(/\.ui-text-field__control:focus-within\s*\{[^}]*border-color:\s*var\(--color-border-strong\);[^}]*box-shadow:\s*none;/s)
-    expect(workspaceStyles).toMatch(/\.sidebar-search:focus-within\s*\{[^}]*border:\s*0;[^}]*box-shadow:\s*none;/s)
+    expect(workspaceStyles).toMatch(/\.sidebar-search\s*\{[^}]*top:\s*50%;[^}]*right:\s*0;[^}]*left:\s*0;[^}]*height:\s*var\(--control-lg\);[^}]*transform:\s*translateY\(-50%\) scaleX\(\.28\);/s)
+    expect(workspaceStyles).toMatch(/\.sidebar-head\.is-search-open \.sidebar-search\s*\{[^}]*transform:\s*translateY\(-50%\) scaleX\(1\);/s)
+    expect(workspaceStyles).toMatch(/\.sidebar-search:focus-within\s*\{[^}]*border:\s*0;[^}]*outline:\s*0;[^}]*box-shadow:\s*none;/s)
+    expect(workspaceStyles).toMatch(/@media \(forced-colors:\s*active\)[\s\S]*\.sidebar-search:focus-within\s*\{[^}]*outline:\s*2px solid Highlight;[^}]*outline-offset:\s*-2px;/s)
     expect(conversationStyles).toMatch(/\.composer\s*\{[^}]*border:\s*1px solid var\(--color-border\);/s)
     expect(conversationStyles).toMatch(/\.composer:focus-within\s*\{[^}]*border-color:\s*var\(--color-border-strong\);[^}]*box-shadow:\s*var\(--shadow-2\)/s)
+    expect(conversationStyles).toMatch(/\.composer-attachment-remove:focus-visible\s*\{[^}]*outline:\s*0;/s)
     expect(conversationStyles).not.toMatch(/\.message-list :is\([^}]*\.subagent-card[^}]*\)/s)
     expect(conversationStyles).toMatch(/\.tool-row-title\s*\{[^}]*font-weight:\s*var\(--weight-regular\)/s)
     expect(workspaceStyles).toMatch(/\.task-drawer :is\([^}]*\.todo-item[^}]*\) \*\s*\{[^}]*font-weight:\s*var\(--weight-regular\)/s)
@@ -467,7 +541,8 @@ describe('前端视觉契约', () => {
     expect(conversationStyles).toMatch(/\.composer-add-button\s*\{[^}]*border:\s*0;[^}]*background:\s*transparent;[^}]*box-shadow:\s*none;/s)
     expect(conversationStyles).toMatch(/\.composer-plan-chip\s*\{[^}]*gap:\s*var\(--space-1\);[^}]*min-width:\s*var\(--control-composer\);[^}]*height:\s*var\(--control-plan-chip\);[^}]*padding:\s*2px var\(--space-2\);[^}]*background:\s*var\(--color-warning-soft\);[^}]*font-size:\s*var\(--type-meta-size\);[^}]*line-height:\s*var\(--type-meta-line\);[^}]*box-shadow:\s*none;[^}]*transform:\s*none;/s)
     expect(conversationStyles).toMatch(/\.composer-plan-chip-close\s*\{[^}]*width:\s*var\(--space-3\);[^}]*height:\s*var\(--space-3\);/s)
-    expect(conversationStyles).toMatch(/@media \(hover: none\), \(pointer: coarse\)[\s\S]*\.composer-plan-chip,[\s\S]*min-height:\s*var\(--control-lg\);[^}]*height:\s*var\(--control-lg\);/s)
+    expect(conversationStyles).toMatch(/@media \(any-hover: none\), \(any-pointer: coarse\)[\s\S]*\.composer-plan-chip,[\s\S]*min-height:\s*var\(--control-lg\);[^}]*height:\s*var\(--control-lg\);/s)
+    expect(conversationStyles).toMatch(/@media \(any-hover: none\), \(any-pointer: coarse\)[\s\S]*\.plan-question-option,[\s\S]*\.composer-suggestion-item\s*\{[^}]*min-height:\s*var\(--control-lg\);/s)
     expect(conversationStyles).toMatch(/\.composer-attachment\s*\{[^}]*height:\s*var\(--control-xs\);/s)
     expect(conversationStyles).toMatch(/\.composer-model-select\s*\{[^}]*height:\s*var\(--control-composer\);[^}]*background:\s*transparent;[^}]*box-shadow:\s*none;/s)
     expect(conversationStyles).toMatch(/\.composer-model-select:hover:not\(:disabled\)\s*\{[^}]*box-shadow:\s*var\(--shadow-1\);/s)
@@ -484,7 +559,7 @@ describe('前端视觉契约', () => {
     expect(uiStyles).toMatch(/\.ui-tooltip\s*\{[^}]*opacity:\s*0;[^}]*opacity var\(--motion-instant\) linear var\(--motion-tooltip-hide-delay\)/s)
     expect(uiStyles).toMatch(/\.ui-button:focus-visible[\s\S]*outline:/)
     expect(uiStyles).toMatch(/\.ui-button:disabled[\s\S]*opacity:/)
-    expect(uiStyles).toMatch(/@media \(hover: none\), \(pointer: coarse\)[\s\S]*--control-lg/)
+    expect(uiStyles).toMatch(/@media \(any-hover: none\), \(any-pointer: coarse\)[\s\S]*--control-lg/)
     expect(componentStyles).toContain('@media (forced-colors: active)')
     expect(componentStyles).toContain('@media (prefers-reduced-motion: reduce)')
   })

@@ -2,8 +2,7 @@ import { Check, ChevronDown, Monitor, MoonStar, Settings2, Sun, UserRound } from
 import { useId, useRef, useState } from 'react'
 
 import type { AuthUser } from '../../api/auth/types'
-import { Dialog, ListboxPicker, UserAvatar } from '../../components/ui'
-import { TransientScrollbar } from '../../components/ui/TransientScrollbar'
+import { Dialog, ListboxPicker, OverlayScrollbar, UserAvatar } from '../../components/ui'
 import { useI18n, type LanguagePreference } from '../../i18n'
 import type { ThemePreference } from '../../theme'
 import './settings.css'
@@ -77,7 +76,13 @@ export function SettingsDialog({
             {t('通用')}
           </button>
         </nav>
-        <div ref={contentRef} className="settings-content ui-scrollbar">
+        <div
+          ref={contentRef}
+          className="settings-content ui-scrollbar"
+          role="region"
+          aria-label={t('设置')}
+          tabIndex={0}
+        >
           {activeSection === 'user' && <section className="settings-section" aria-labelledby="settings-account-title">
             <h3 id="settings-account-title">{t('用户信息')}</h3>
             <div className="settings-profile">
@@ -157,7 +162,7 @@ export function SettingsDialog({
           </section>
           </>}
         </div>
-        <TransientScrollbar viewportRef={contentRef} />
+        <OverlayScrollbar viewportRef={contentRef} />
       </div>
     </Dialog>
   )

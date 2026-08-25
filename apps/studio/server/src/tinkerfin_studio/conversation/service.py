@@ -9,10 +9,9 @@ from typing import TypeVar
 
 from ag_ui.core import BaseEvent
 from langchain.agents.middleware.types import InputAgentState
-from langgraph.types import Command
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from tinkerfin_agui_adapter.lifecycle import AgUiLifecycleEventFactory
+from tinkerfin import AgUiResumeCheckpoint
 from tinkerfin_messaging.errors import (
     MessagingError,
     MessagingErrorCode,
@@ -35,8 +34,6 @@ from tinkerfin_studio.conversation.run_preparation import (
     bind_start_graph_input,
     classify_intent,
     conversation_identity,
-    enrich_main_event,
-    finite_agui_events,
     prepare_run_request,
 )
 from tinkerfin_studio.conversation.run_registration import (
@@ -81,6 +78,10 @@ _MESSAGING_ERRORS: dict[
     ),
     MessagingErrorCode.MESSAGE_ID_CONFLICT: (
         ConversationErrorCode.RUN_IDENTITY_CONFLICT,
+        True,
+    ),
+    MessagingErrorCode.QUOTA_EXCEEDED: (
+        ConversationErrorCode.MESSAGING_QUOTA_EXCEEDED,
         True,
     ),
     MessagingErrorCode.RUN_ALREADY_ACTIVE: (
@@ -147,12 +148,6 @@ async def _settle_owned_task(task: asyncio.Task[_TaskResult]) -> _TaskResult:
         except asyncio.CancelledError:
             continue
     return task.result()
-
-
-def conversation_stream_key(user_id: int, thread_id: str) -> str:
-    """生成用户隔离的 Messaging、checkpoint 与协调键"""
-
-    return conversation_identity(user_id, thread_id, "scope").thread_id
 
 
 def parse_last_event_id(value: str | None) -> int | None:
@@ -297,36 +292,15 @@ class ConversationChatService:
     ) -> ProfiledMessageSource[BaseEvent, BaseEvent]:
         """创建普通、恢复或审批放弃使用的统一 profile source"""
 
-        graph_input: InputAgentState | Command | None
+        graph_input: InputAgentState | None
         resume_binding = None
         if isinstance(intent, StartChatIntent):
             graph_input = bind_start_graph_input(intent, prepared)
         else:
             if execution.resume is None:
-                raise RuntimeError("恢复请求缺少 PreparedResume")
-            graph_input = execution.resume.graph_input
-            resume_binding = execution.resume.binding
-        if graph_input is None:
-            lifecycle = AgUiLifecycleEventFactory()
-            events = (
-                lifecycle.started(identity=prepared.identity),
-                lifecycle.failed(
-                    identity=prepared.identity,
-                    message="审批已取消",
-                    code="resume_cancelled",
-                ),
-            )
-            return finite_agui_events(
-                tuple(
-                    enrich_main_event(
-                        event,
-                        prepared=prepared,
-                        title=execution.thread.title,
-                    )
-                    for event in events
-                ),
-                identity=prepared.identity,
-            )
+                raise RuntimeError("恢复请求缺少 AgUiResumeBinding")
+            graph_input = None
+            resume_binding = execution.resume
         factory = ConversationAgentFactory(
             persistence=self._resources.agent_persistence,
             sandbox_manager=self._resources.sandbox_manager,
@@ -337,12 +311,25 @@ class ConversationChatService:
                 else self._resources.settings.tavily_api_key.get_secret_value()
             ),
         )
+
+        async def record_resume_checkpoint(checkpoint: AgUiResumeCheckpoint) -> None:
+            if not isinstance(intent, ResumeChatIntent):
+                raise TypeError("普通运行不应收到 resume checkpoint")
+            await self._resources.conversation_projector.settle_resume(
+                thread_pk=execution.thread.id,
+                entries=intent.entries,
+                checkpoint=checkpoint,
+            )
+
         return factory.create_agui_events(
             user_id=self._user.user_id,
             model_config=model,
             graph_input=graph_input,
             prepared=prepared,
             resume=resume_binding,
+            on_resume_checkpointed=(
+                record_resume_checkpoint if resume_binding is not None else None
+            ),
             title=execution.thread.title,
         )
 
@@ -435,11 +422,7 @@ class ConversationChatService:
         # 提交隐式只读事务可释放连接，并保留活跃流仍会读取的 thread 事实
         await self._repository.commit()
         try:
-            identity = conversation_identity(
-                self._user.user_id,
-                thread_id,
-                run_id,
-            )
+            identity = conversation_identity(thread_id, run_id)
             cancelled = await self._resources.conversation_channel.cancel(
                 identity=identity,
             )
@@ -470,6 +453,5 @@ class ConversationChatService:
 __all__ = [
     "ConversationChatService",
     "PreparedChat",
-    "conversation_stream_key",
     "parse_last_event_id",
 ]

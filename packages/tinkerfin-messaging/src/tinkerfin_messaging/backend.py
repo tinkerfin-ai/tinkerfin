@@ -18,12 +18,14 @@ from .errors import (
     CodecMismatch,
     InvalidCursor,
     MessageIdConflict,
+    MessagingQuotaExceeded,
     RunAlreadyActive,
     RunNotFound,
     RunProducerFailed,
     StreamDeleteConflict,
     StreamDeleted,
 )
+from .limits import DEFAULT_MESSAGING_LIMITS, MessagingLimits
 from .models import MessageEnvelope, RecoveryCheckpoint
 
 RunStatus = Literal[
@@ -61,6 +63,7 @@ def _validate_append_input(
     codec: str,
     payload: bytes,
     checkpoint: RecoveryCheckpoint | None,
+    limits: MessagingLimits,
 ) -> None:
     """Reject caller-controlled values before a backend can mutate state."""
 
@@ -76,6 +79,19 @@ def _validate_append_input(
         raise TypeError("checkpoint must be a RecoveryCheckpoint or None")
     if checkpoint is not None and checkpoint.last_message_id != message_id:
         raise ValueError("checkpoint.last_message_id must match message_id")
+    if len(payload) > limits.max_message_payload_bytes:
+        raise MessagingQuotaExceeded(
+            resource="message_payload_bytes",
+            limit=limits.max_message_payload_bytes,
+        )
+    if (
+        checkpoint is not None
+        and len(checkpoint.position) > limits.max_checkpoint_bytes
+    ):
+        raise MessagingQuotaExceeded(
+            resource="checkpoint_bytes",
+            limit=limits.max_checkpoint_bytes,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +109,12 @@ class PreparedRun:
 class MessagingBackend(Protocol):
     """Replaceable persistence, replay, and distributed run boundary."""
 
+    @property
+    def limits(self) -> MessagingLimits:
+        """Return immutable capacity limits enforced before durable mutation."""
+
+        ...
+
     async def prepare(
         self,
         *,
@@ -102,7 +124,10 @@ class MessagingBackend(Protocol):
         after: int | None,
         cancellable: bool,
         recoverable: bool,
-    ) -> PreparedRun: ...
+    ) -> PreparedRun:
+        """Atomically start, recover, or attach to one durable semantic run."""
+
+        ...
 
     async def append(
         self,
@@ -112,7 +137,10 @@ class MessagingBackend(Protocol):
         codec: str,
         payload: bytes,
         checkpoint: RecoveryCheckpoint | None = None,
-    ) -> MessageEnvelope: ...
+    ) -> MessageEnvelope:
+        """Idempotently commit one encoded message under the producer fence."""
+
+        ...
 
     async def begin_settlement(self, handle: BackendRunHandle) -> bool:
         """Atomically claim finalization and report an accepted cancellation.
@@ -140,9 +168,15 @@ class MessagingBackend(Protocol):
         *,
         status: FinalRunStatus,
         error: BaseException | None = None,
-    ) -> None: ...
+    ) -> None:
+        """Commit one terminal run status and release producer ownership."""
 
-    async def latest_seq(self, *, channel: str, identity: Identity) -> int: ...
+        ...
+
+    async def latest_seq(self, *, channel: str, identity: Identity) -> int:
+        """Return the current generation's last committed sequence."""
+
+        ...
 
     async def read(
         self,
@@ -151,15 +185,19 @@ class MessagingBackend(Protocol):
         identity: Identity,
         after: int = 0,
         limit: int = 100,
-    ) -> tuple[MessageEnvelope, ...]: ...
+    ) -> tuple[MessageEnvelope, ...]:
+        """Read a bounded page strictly after a validated thread cursor."""
+
+        ...
 
     async def bind_follow(
         self,
         *,
         channel: str,
         identity: Identity,
+        after: int,
     ) -> BackendRunHandle:
-        """Bind a read-only follower to the run's authoritative generation."""
+        """Atomically bind a follower and validate its thread cursor."""
 
         ...
 
@@ -168,18 +206,36 @@ class MessagingBackend(Protocol):
         handle: BackendRunHandle,
         *,
         after: int,
-    ) -> AsyncIterator[MessageEnvelope]: ...
+    ) -> AsyncIterator[MessageEnvelope]:
+        """Return an ordered follower bound to the handle's exact generation."""
 
-    async def request_cancel(self, handle: BackendRunHandle) -> bool: ...
+        ...
 
-    async def wait_for_cancel(self, handle: BackendRunHandle) -> bool: ...
+    async def request_cancel(self, handle: BackendRunHandle) -> bool:
+        """Durably request producer cancellation if the run still accepts it."""
 
-    async def wait_finished(self, handle: BackendRunHandle) -> RunStatus: ...
+        ...
 
-    async def failure(self, handle: BackendRunHandle) -> BaseException | None: ...
+    async def wait_for_cancel(self, handle: BackendRunHandle) -> bool:
+        """Wait until cancellation is requested or the run becomes terminal."""
+
+        ...
+
+    async def wait_finished(self, handle: BackendRunHandle) -> RunStatus:
+        """Wait for and return the durable terminal run status."""
+
+        ...
+
+    async def failure(self, handle: BackendRunHandle) -> BaseException | None:
+        """Return the trusted producer failure associated with a terminal run."""
+
+        ...
 
     @property
-    def lease_renew_interval(self) -> float | None: ...
+    def lease_renew_interval(self) -> float | None:
+        """Return the producer lease renewal interval, or ``None`` if unneeded."""
+
+        ...
 
     @property
     def lease_timeout(self) -> float | None:
@@ -187,7 +243,10 @@ class MessagingBackend(Protocol):
 
         ...
 
-    async def renew(self, handle: BackendRunHandle) -> bool: ...
+    async def renew(self, handle: BackendRunHandle) -> bool:
+        """Renew producer ownership and report whether its fence remains current."""
+
+        ...
 
     async def delete_stream(self, *, channel: str, identity: Identity) -> None:
         """Delete one inactive stream and all of its durable run data.
@@ -241,6 +300,7 @@ class _StreamState:
         ] = {}
         self.runs: dict[str, _RunRecord] = {}
         self.active_identity: Identity | None = None
+        self.payload_bytes = 0
 
 
 class _ChannelState:
@@ -254,8 +314,19 @@ class _ChannelState:
 class MemoryBackend(MessagingBackend):
     """Keep ordered logs and run coordination in one event loop process."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, limits: MessagingLimits = DEFAULT_MESSAGING_LIMITS) -> None:
+        """Initialize process-local streams with immutable capacity limits."""
+
+        if not isinstance(limits, MessagingLimits):
+            raise TypeError("limits must be a MessagingLimits")
         self._channels: dict[str, _ChannelState] = {}
+        self._limits = limits
+
+    @property
+    def limits(self) -> MessagingLimits:
+        """Return the immutable limits applied to every in-memory generation."""
+
+        return self._limits
 
     @property
     def lease_renew_interval(self) -> float | None:
@@ -339,6 +410,8 @@ class MemoryBackend(MessagingBackend):
         cancellable: bool,
         recoverable: bool,
     ) -> PreparedRun:
+        """Start, recover, or attach to one in-memory semantic run atomically."""
+
         required_identifier("channel", channel)
         required_identity(identity)
         required_identifier("codec", codec)
@@ -415,12 +488,15 @@ class MemoryBackend(MessagingBackend):
         payload: bytes,
         checkpoint: RecoveryCheckpoint | None = None,
     ) -> MessageEnvelope:
+        """Idempotently append one message after ownership and quota checks."""
+
         _validate_append_input(
             handle,
             message_id=message_id,
             codec=codec,
             payload=payload,
             checkpoint=checkpoint,
+            limits=self._limits,
         )
         state = self._state_for_handle(handle)
         channel_state = self._channel(handle.channel)
@@ -438,6 +514,20 @@ class MemoryBackend(MessagingBackend):
                     )
                 return existing.model_copy(deep=True)
 
+            if len(state.messages) >= self._limits.max_thread_messages:
+                raise MessagingQuotaExceeded(
+                    resource="thread_messages",
+                    limit=self._limits.max_thread_messages,
+                )
+            if (
+                state.payload_bytes + len(payload)
+                > self._limits.max_thread_payload_bytes
+            ):
+                raise MessagingQuotaExceeded(
+                    resource="thread_payload_bytes",
+                    limit=self._limits.max_thread_payload_bytes,
+                )
+
             envelope = MessageEnvelope(
                 channel=handle.channel,
                 identity=handle.identity,
@@ -450,6 +540,7 @@ class MemoryBackend(MessagingBackend):
             state.messages.append(envelope)
             state.by_message_id[message_id] = envelope
             state.signatures[message_id] = signature
+            state.payload_bytes += len(payload)
             record.end_seq = envelope.seq
             record.checkpoint = checkpoint
             state.condition.notify_all()
@@ -484,6 +575,8 @@ class MemoryBackend(MessagingBackend):
         status: FinalRunStatus,
         error: BaseException | None = None,
     ) -> None:
+        """Commit the producer terminal state and release its active identity."""
+
         state = self._state_for_handle(handle)
         async with state.condition:
             record = self._owned_record(state, handle)
@@ -537,12 +630,19 @@ class MemoryBackend(MessagingBackend):
             raise ValueError("limit must be between 1 and 1000")
         channel_state = self._channels.get(channel)
         if channel_state is None:
+            if after > 0:
+                raise InvalidCursor(after=after, latest=0)
             return ()
         async with channel_state.lock:
             state = channel_state.streams.get(identity.thread_id)
             if state is None:
+                if after > 0:
+                    raise InvalidCursor(after=after, latest=0)
                 return ()
             async with state.condition:
+                latest = len(state.messages)
+                if after > latest:
+                    raise InvalidCursor(after=after, latest=latest)
                 return tuple(
                     message.model_copy(deep=True)
                     for message in state.messages[after : after + limit]
@@ -553,11 +653,16 @@ class MemoryBackend(MessagingBackend):
         *,
         channel: str,
         identity: Identity,
+        after: int,
     ) -> BackendRunHandle:
-        """Bind one follower without creating a stream or attaching a producer."""
+        """Bind one follower after validating its cursor under the stream lock."""
 
         required_identifier("channel", channel)
         required_identity(identity)
+        if isinstance(after, bool) or not isinstance(after, int):
+            raise TypeError("after must be an integer")
+        if after < 0:
+            raise ValueError("after must be greater than or equal to zero")
         channel_state = self._channels.get(channel)
         if channel_state is None:
             raise RunNotFound(identity=identity)
@@ -574,6 +679,9 @@ class MemoryBackend(MessagingBackend):
                     )
                 if identity.run_id not in state.runs:
                     raise RunNotFound(identity=identity)
+                latest = len(state.messages)
+                if after > latest:
+                    raise InvalidCursor(after=after, latest=latest)
                 return BackendRunHandle(
                     channel=channel,
                     identity=identity,
@@ -588,6 +696,8 @@ class MemoryBackend(MessagingBackend):
         *,
         after: int,
     ) -> AsyncIterator[MessageEnvelope]:
+        """Follow committed messages until this exact run reaches a terminal state."""
+
         async def iterate() -> AsyncGenerator[MessageEnvelope, None]:
             state = self._state_for_handle(handle)
             cursor = after
@@ -636,6 +746,8 @@ class MemoryBackend(MessagingBackend):
         return iterate()
 
     async def request_cancel(self, handle: BackendRunHandle) -> bool:
+        """Request cancellation unless settlement or termination already won."""
+
         state = self._state_for_handle(handle)
         async with state.condition:
             self._require_generation(state, handle)
@@ -655,6 +767,8 @@ class MemoryBackend(MessagingBackend):
             return True
 
     async def wait_for_cancel(self, handle: BackendRunHandle) -> bool:
+        """Wait for cancellation or return ``False`` after terminal settlement."""
+
         state = self._state_for_handle(handle)
         async with state.condition:
             while True:
@@ -674,6 +788,8 @@ class MemoryBackend(MessagingBackend):
                 await state.condition.wait()
 
     async def wait_finished(self, handle: BackendRunHandle) -> RunStatus:
+        """Wait for and return this run's terminal in-memory status."""
+
         state = self._state_for_handle(handle)
         async with state.condition:
             while True:

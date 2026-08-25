@@ -1,4 +1,4 @@
-"""沙箱默认运行时配置契约"""
+"""Default Sandbox runtime configuration contracts."""
 
 import pytest
 from opensandbox.models.sandboxes import PVC, Volume
@@ -71,3 +71,9 @@ def test_config_rejects_framework_reserved_metadata_keys() -> None:
                 "tinkerfin.ai/owner": "forged-owner",
             }
         )
+
+
+@pytest.mark.parametrize("field", ("command_timeout", "warm_pool_size"))
+def test_integer_capacity_and_timeout_fields_reject_booleans(field: str) -> None:
+    with pytest.raises(ValidationError):
+        OpenSandboxConfig(**{field: True})

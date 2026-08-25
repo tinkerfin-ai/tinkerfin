@@ -151,7 +151,7 @@ default_runtime = agent.new_agui(
 )
 ```
 
-`default` 使用原生 topology 和 state schema，`plan` 使用独立 Planning Graph。批准后在原生执行前
+`default` 使用原生 topology，并包含 TinkerFin 私有 resume marker；`plan` 使用独立 Planning Graph。批准后在原生执行前
 把有效 mode 切为 `default`。同一 checkpoint thread 的后续请求可以再次选择 Plan；Plan resume
 回到 Planning，Tool 与子 Agent resume 直接回到原生 Graph。
 

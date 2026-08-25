@@ -47,6 +47,14 @@ class PlanReviewAction(StrEnum):
     REJECT = "reject"
 
 
+class PlanHandoffPhase(StrEnum):
+    """Durable progress from approval to native Graph completion."""
+
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    COMPLETED = "completed"
+
+
 class _PlanModel(BaseModel):
     model_config = ConfigDict(
         alias_generator=to_camel,
@@ -184,10 +192,41 @@ class PlanHandoff(_PlanModel):
     digest: PlanDigest = Field(
         description="SHA-256 of the approved Plan and bound message identity"
     )
-    dispatched: bool = Field(
-        default=False,
-        description="Whether the native handoff boundary was synchronously committed",
+    phase: PlanHandoffPhase = Field(
+        default=PlanHandoffPhase.PENDING,
+        description="Verified durable progress of the native handoff",
     )
+    native_checkpoint_id: NonBlankText | None = Field(
+        default=None,
+        description="Native checkpoint containing the approved handoff marker",
+    )
+    completed_checkpoint_id: NonBlankText | None = Field(
+        default=None,
+        description="Terminal native checkpoint after handoff execution",
+    )
+
+    @model_validator(mode="after")
+    def checkpoint_evidence_matches_phase(self) -> PlanHandoff:
+        """Require checkpoint evidence for accepted and completed phases."""
+
+        if self.phase is PlanHandoffPhase.PENDING:
+            if (
+                self.native_checkpoint_id is not None
+                or self.completed_checkpoint_id is not None
+            ):
+                raise ValueError(
+                    "pending handoff cannot contain native checkpoint evidence"
+                )
+        elif self.native_checkpoint_id is None:
+            raise ValueError("accepted handoff requires native checkpoint evidence")
+        if self.phase is PlanHandoffPhase.COMPLETED:
+            if self.completed_checkpoint_id is None:
+                raise ValueError(
+                    "completed handoff requires terminal checkpoint evidence"
+                )
+        elif self.completed_checkpoint_id is not None:
+            raise ValueError("only completed handoff can contain terminal evidence")
+        return self
 
 
 class RequirementAnswer(_PlanModel):
@@ -263,6 +302,7 @@ __all__ = [
     "PlanContentT",
     "PlanDraft",
     "PlanHandoff",
+    "PlanHandoffPhase",
     "PlanReviewAction",
     "PlanSchemaReference",
     "PlanState",

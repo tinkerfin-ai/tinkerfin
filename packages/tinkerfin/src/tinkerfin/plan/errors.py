@@ -15,4 +15,14 @@ class PlanStructuredOutputError(TinkerFinError, RuntimeError):
     code = TinkerFinErrorCode.PLAN_STRUCTURED_OUTPUT
 
 
-__all__ = ["PlanModeConfigurationError", "PlanStructuredOutputError"]
+class PlanStateConflictError(TinkerFinError, RuntimeError):
+    """Planning and native checkpoints cannot identify one safe next action."""
+
+    code = TinkerFinErrorCode.PLAN_STATE_CONFLICT
+
+
+__all__ = [
+    "PlanModeConfigurationError",
+    "PlanStateConflictError",
+    "PlanStructuredOutputError",
+]

@@ -139,10 +139,6 @@ export function useWorkspaceNavigation() {
     if (mode !== 'expanded') changeMode('expanded')
   }, [band, changeMode, mode, openOverlay])
 
-  const handleShellTransitionEnd = useCallback((propertyName: string) => {
-    if (propertyName === 'grid-template-columns') settle()
-  }, [settle])
-
   return {
     band,
     mode,
@@ -155,6 +151,5 @@ export function useWorkspaceNavigation() {
     openOverlay,
     closeOverlay,
     requestExpanded,
-    handleShellTransitionEnd,
   }
 }

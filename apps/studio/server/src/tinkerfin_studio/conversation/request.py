@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Literal
+from typing import Literal, cast
 
 from ag_ui.core import RunAgentInput
 from ag_ui.core.types import (
@@ -112,6 +112,14 @@ class ChatRequest(BaseModel):
             raise ValueError("ChatRequest.messages 不得保留客户端消息 ID")
         return value
 
+    @model_validator(mode="after")
+    def parent_is_a_distinct_run(self) -> ChatRequest:
+        """拒绝无法形成分支的自引用 parentRunId"""
+
+        if self.parent_run_id == self.run_id:
+            raise ValueError("parentRunId 必须与 runId 不同")
+        return self
+
     @classmethod
     def from_agui(cls, value: RunAgentInput) -> ChatRequest:
         """保留标准 AG-UI 数据并增加 Studio 必需的业务校验"""
@@ -130,13 +138,13 @@ class ChatRequest(BaseModel):
         ]
         return cls.model_validate(payload)
 
-    def normalized(
+    def normalized_json(
         self,
         *,
         thread_id: str,
         message_ids: tuple[str, ...],
-    ) -> RunAgentInput:
-        """返回绑定服务端会话与权威消息 ID 的标准 AG-UI 输入"""
+    ) -> dict[str, JsonValue]:
+        """返回绑定服务端会话与权威消息 ID 的标准请求快照"""
 
         if len(message_ids) != len(self.messages) or any(
             not value for value in message_ids
@@ -152,4 +160,12 @@ class ChatRequest(BaseModel):
             }
             for message_id, message in zip(message_ids, self.messages, strict=True)
         ]
-        return RunAgentInput.model_validate(payload)
+        normalized = RunAgentInput.model_validate(payload)
+        return cast(
+            dict[str, JsonValue],
+            normalized.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude_none=False,
+            ),
+        )

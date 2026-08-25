@@ -1,4 +1,4 @@
-@layer tokens, base, ui, auth, conversation, workspace, utilities;
+@layer tokens, base, ui, auth, conversation, workspace, settings, utilities;
 
 @layer tokens {
   :root {
@@ -40,6 +40,7 @@
     --color-text-secondary: var(--primitive-gray-600);
     --color-text-tertiary: var(--primitive-gray-500);
     --color-text-caption: var(--primitive-gray-500);
+    --color-text-caption-on-layer: var(--color-text-secondary);
     --color-placeholder: var(--primitive-gray-500);
     --color-border-subtle: rgb(0 0 0 / 4%);
     --color-border: rgb(0 0 0 / 10%);
@@ -66,7 +67,8 @@
     --color-focus: var(--primitive-blue-600);
     --color-focus-soft: rgb(57 100 254 / 18%);
     --color-code-surface: #f3f4f6;
-    --color-scroll-thumb: rgb(97 102 107 / 38%);
+    --color-scroll-thumb: #e5e5e5;
+    --color-scroll-thumb-hover: #d4d4d4;
 
     --space-0: 0;
     --space-0-5: 2px;
@@ -158,6 +160,7 @@
     --color-text-secondary: #cfd3d6;
     --color-text-tertiary: #adb2b8;
     --color-text-caption: #81858c;
+    --color-text-caption-on-layer: #979da6;
     --color-placeholder: #979da6;
     --color-border-subtle: rgb(255 255 255 / 8%);
     --color-border: rgb(255 255 255 / 15%);
@@ -184,7 +187,8 @@
     --color-focus: #8ab4ff;
     --color-focus-soft: rgb(103 158 254 / 24%);
     --color-code-surface: #23262b;
-    --color-scroll-thumb: rgb(207 211 214 / 34%);
+    --color-scroll-thumb: #3c3c3d;
+    --color-scroll-thumb-hover: #545557;
     --shadow-1: 0 2px 4px rgb(0 0 0 / 24%);
     --shadow-2: 0 4px 12px rgb(0 0 0 / 18%), 0 2px 8px rgb(0 0 0 / 24%);
     --shadow-3: 0 0 1px rgb(255 255 255 / 14%), 0 12px 32px rgb(0 0 0 / 38%);

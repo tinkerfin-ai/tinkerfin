@@ -3,12 +3,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { LoginResponse } from '../api/auth/types'
 import {
   AUTH_SESSION_STORAGE_KEY,
+  AuthSessionStorageError,
   clearAuthSession,
   createAuthSession,
   getAuthorizationHeader,
   getAuthSession,
   saveAuthSession,
   startAuthSessionLifecycle,
+  subscribeAuthSession,
 } from './session'
 
 const user = {
@@ -152,5 +154,35 @@ describe('auth session lifecycle', () => {
 
     expect(getAuthSession()).toBeNull()
     stop()
+  })
+
+  it('does not commit memory state or notify listeners when persistence fails', () => {
+    const original = createAuthSession(loginPayload('2099-01-01T00:00:00Z'))
+    saveAuthSession(original)
+    const listener = vi.fn()
+    const unsubscribe = subscribeAuthSession(listener)
+    vi.spyOn(window.localStorage, 'setItem').mockImplementation(() => {
+      throw new DOMException('storage disabled', 'SecurityError')
+    })
+
+    const replacement = {
+      ...createAuthSession(loginPayload('2099-02-01T00:00:00Z')),
+      token: 'replacement-token',
+    }
+
+    expect(() => saveAuthSession(replacement)).toThrow(AuthSessionStorageError)
+    expect(getAuthSession()).toEqual(original)
+    expect(listener).not.toHaveBeenCalled()
+    unsubscribe()
+  })
+
+  it('clears the in-memory session even when persistent removal is unavailable', () => {
+    saveAuthSession(createAuthSession(loginPayload('2099-01-01T00:00:00Z')))
+    vi.spyOn(window.localStorage, 'removeItem').mockImplementation(() => {
+      throw new DOMException('storage disabled', 'SecurityError')
+    })
+
+    expect(() => clearAuthSession()).not.toThrow()
+    expect(getAuthSession()).toBeNull()
   })
 })

@@ -12,7 +12,6 @@ import { memo, useEffect, useRef, useState } from 'react'
 
 import { IconButton } from '../../../components/ui'
 import type { ConversationNotice as ConversationNoticeType, Message } from '../../../types'
-import { normalizeEscapedText } from '../../../lib/text'
 import { ActivityDots } from './ActivityDots'
 import { MarkdownContent } from './MarkdownContent'
 import { ToolCallRow } from './ToolCallRow'
@@ -33,13 +32,13 @@ function PlaceholderField({ status }: { status?: MessageStatus }) {
 
 function CodeField({ value, status }: { value?: string; status?: MessageStatus }) {
   return value
-    ? <pre className="tool-code-field"><code>{normalizeEscapedText(value)}</code></pre>
+    ? <pre className="tool-code-field"><code>{value}</code></pre>
     : <PlaceholderField status={status} />
 }
 
 function RichField({ value, status, className = 'tool-rich-field' }: { value?: string; status?: MessageStatus; className?: string }) {
   return value
-    ? <div className={className}><MarkdownContent content={normalizeEscapedText(value)} variant="compact" /></div>
+    ? <div className={className}><MarkdownContent content={value} variant="compact" /></div>
     : <PlaceholderField status={status} />
 }
 
@@ -134,6 +133,8 @@ function SubagentOutputNode({ message }: { message: Message }) {
     ? t('执行中')
     : status === 'failed'
       ? t('执行失败')
+      : status === 'cancelled'
+        ? t('已取消')
       : status === 'paused'
         ? t('等待审批')
         : t('已完成')
@@ -144,7 +145,7 @@ function SubagentOutputNode({ message }: { message: Message }) {
       <span className="subagent-output-icon" aria-hidden="true">
         {status === 'completed'
           ? <Check size={12} strokeWidth={2.5} />
-          : status === 'failed'
+          : status === 'failed' || status === 'cancelled'
             ? <X size={12} strokeWidth={2.5} />
             : status === 'paused'
               ? <Pause size={11} strokeWidth={2.5} />
@@ -172,6 +173,8 @@ function SubagentCard({ message, childTools }: { message: Message; childTools: M
     ? t('正在运行')
     : status === 'failed'
       ? t('执行失败')
+      : status === 'cancelled'
+        ? t('已取消')
       : status === 'paused'
         ? t('等待审批')
         : t('已完成')
@@ -191,7 +194,7 @@ function SubagentCard({ message, childTools }: { message: Message; childTools: M
       <summary className="subagent-card-head">
         <span className="tool-row-leading" aria-hidden="true">
           <span className="tool-row-icon">
-            {status === 'failed' || status === 'paused'
+            {status === 'failed' || status === 'paused' || status === 'cancelled'
               ? <span className={`tool-row-state-dot is-${status}`} />
               : <Bot size={14} strokeWidth={2} />}
           </span>
@@ -209,7 +212,7 @@ function SubagentCard({ message, childTools }: { message: Message; childTools: M
         {input && (
           <div className="subagent-task-line">
             <span>{agentName}</span>
-            <p>{normalizeEscapedText(input)}</p>
+            <p>{input}</p>
           </div>
         )}
         <ol
@@ -236,9 +239,11 @@ function SubagentCard({ message, childTools }: { message: Message; childTools: M
 function MessageBlockView({
   message,
   childTools = [],
+  showActions = true,
 }: {
   message: Message
   childTools?: Message[]
+  showActions?: boolean
 }) {
   const { t } = useI18n()
   if (message.role === 'user') {
@@ -261,7 +266,7 @@ function MessageBlockView({
       {message.content
         ? <>
             <MarkdownContent content={message.content} className="message-markdown" />
-            {message.meta?.status !== 'running' && <MessageActionRow content={message.content} />}
+            {showActions && message.meta?.status !== 'running' && <MessageActionRow content={message.content} />}
           </>
         : message.meta?.status === 'running'
           ? null
@@ -276,7 +281,8 @@ const sameMessageReferences = (left: Message[], right: Message[]) =>
 export const MessageBlock = memo(
   MessageBlockView,
   (previous, next) => previous.message === next.message
-    && sameMessageReferences(previous.childTools ?? [], next.childTools ?? []),
+    && sameMessageReferences(previous.childTools ?? [], next.childTools ?? [])
+    && (previous.showActions ?? true) === (next.showActions ?? true),
 )
 
 export function ConversationNotice({ notice }: { notice: ConversationNoticeType }) {

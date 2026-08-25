@@ -25,7 +25,11 @@ class RuntimeInterruptEnvelope(RuntimeModel):
     )
     kind: Annotated[
         str,
-        StringConstraints(strip_whitespace=True, min_length=1),
+        StringConstraints(
+            strip_whitespace=True,
+            min_length=1,
+            pattern=r"^(?:tool_call|input_required|confirmation|[a-z][a-z0-9._-]*:[a-z][a-z0-9._-]*)$",
+        ),
     ] = Field(
         description="Stable reason published as the AG-UI interrupt reason",
     )

@@ -1,109 +1,103 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { fireEvent, render, screen } from '@testing-library/react'
+import { describe, expect, it, vi } from 'vitest'
 
-import type { Conversation } from '../../../types'
+import type { Conversation, ConversationRunStatus } from '../../../types'
 import { TaskDrawer } from './TaskDrawer'
 
-const conversation = (threadId: string): Conversation => ({
-  threadId,
+const conversation = (
+  todos: Conversation['todos'],
+  runStatus: ConversationRunStatus = 'streaming',
+): Conversation => ({
+  threadId: 'thread-a',
   title: '任务抽屉',
   pinned: false,
   updatedAt: '2026-08-17T00:00:00.000Z',
   model: 'GPT-5.5',
   mode: 'default',
   messages: [],
-  todos: [{ id: 'todo-1', content: '执行任务', status: 'running' }],
-  plan: {
-    goal: '完成任务',
-    steps: [{ title: '第一步', detail: '执行第一步' }],
-  },
-  runStatus: 'streaming',
+  todos,
+  runStatus,
 })
 
 describe('TaskDrawer', () => {
-  beforeEach(() => {
-    window.sessionStorage.clear()
+  it('renders the production Todo contract without dead Plan or splitter UI', () => {
+    const { container } = render(<TaskDrawer conversation={conversation([
+      { id: 'todo-1', content: '执行任务', status: 'running' },
+    ])} />)
+
+    expect(screen.getByRole('complementary', { name: '任务抽屉' })).toBeInTheDocument()
+    expect(screen.getByRole('region', { name: '待办清单' })).toHaveAttribute('tabindex', '0')
+    expect(container.querySelectorAll('.panel-scroll')).toHaveLength(1)
+    expect(container.querySelector('.ui-overlay-scrollbar')).toHaveAttribute('data-visibility', 'transient')
+    expect(container.querySelector('.plan-panel')).toBeNull()
+    expect(screen.queryByRole('separator')).not.toBeInTheDocument()
   })
 
-  afterEach(() => {
-    vi.unstubAllGlobals()
+  it('renders Todo state as non-interactive content', () => {
+    const { container } = render(<TaskDrawer conversation={conversation([
+      { id: 'todo-1', content: '等待执行', status: 'pending' },
+      { id: 'todo-2', content: '用户已取消', status: 'cancelled' },
+    ])} />)
+
+    expect(container.querySelectorAll('.todo-item')).toHaveLength(2)
+    expect(container.querySelectorAll('.todo-item button')).toHaveLength(0)
+    expect(screen.getByLabelText('步骤 1 · 待执行')).toBeInTheDocument()
+    expect(screen.getByLabelText('步骤 2 · 已取消')).toBeInTheDocument()
   })
 
-  it('persists a valid split ratio per thread and restores it after remount', async () => {
-    const first = render(<TaskDrawer conversation={conversation('thread-a')} />)
-    const drawer = screen.getByLabelText('任务抽屉')
-    expect(Array.from(drawer.querySelectorAll('.panel-scroll'))).toHaveLength(2)
-    for (const scrollRegion of drawer.querySelectorAll('.panel-scroll')) {
-      expect(scrollRegion).toHaveClass('ui-scrollbar')
-    }
-    expect(drawer.querySelectorAll('.ui-scrollbar-overlay')).toHaveLength(2)
-    vi.spyOn(drawer, 'getBoundingClientRect').mockReturnValue({
-      top: 0,
-      height: 800,
-    } as DOMRect)
-    const separator = screen.getByRole('separator')
-
-    fireEvent.keyDown(separator, { key: 'ArrowDown' })
-    await waitFor(() => expect(Number(window.sessionStorage.getItem(
-      'tinkerfin:task-drawer-split:thread-a',
-    ))).toBeGreaterThan(50))
-    const savedRatio = Number(window.sessionStorage.getItem(
-      'tinkerfin:task-drawer-split:thread-a',
-    ))
-    expect(savedRatio).toBeGreaterThan(50)
-    first.unmount()
-
-    render(<TaskDrawer conversation={conversation('thread-a')} />)
-    expect(screen.getByRole('separator')).toHaveAttribute(
-      'aria-valuenow',
-      String(Math.round(savedRatio)),
+  it('renders an in-progress Todo as unfinished after a successful run ends', () => {
+    const todos: Conversation['todos'] = [
+      { id: 'todo-1', content: '检查需求', status: 'running' },
+      { id: 'todo-2', content: '执行验证', status: 'pending' },
+    ]
+    const { container } = render(
+      <TaskDrawer conversation={conversation(todos, 'idle')} />,
     )
+
+    expect(screen.getByText('0/2')).toBeInTheDocument()
+    expect(screen.getByLabelText('步骤 1 · 未完成')).toBeInTheDocument()
+    expect(container.querySelector('.todo-item.is-unfinished')).toBeInTheDocument()
+    expect(container.querySelector('.todo-state .spin')).toBeNull()
+    expect(container.querySelector('.progress-track span')).toHaveStyle({ width: '0%' })
+    expect(todos[0]?.status).toBe('running')
   })
 
-  it('ignores a stored ratio outside the supported 20 to 80 range', () => {
-    window.sessionStorage.setItem('tinkerfin:task-drawer-split:thread-a', '95')
+  it.each([
+    ['waiting_approval', 'paused', '等待审批'],
+    ['detached', 'background', '后台执行中'],
+    ['error', 'failed', '失败'],
+  ] as const)(
+    'derives %s Todo presentation without mutating persisted state',
+    (runStatus, viewStatus, label) => {
+      const todo = { id: 'todo-1', content: '执行任务', status: 'running' as const }
+      const { container } = render(
+        <TaskDrawer conversation={conversation([todo], runStatus)} />,
+      )
 
-    render(<TaskDrawer conversation={conversation('thread-a')} />)
+      expect(screen.getByLabelText(`步骤 1 · ${label}`)).toBeInTheDocument()
+      expect(container.querySelector(`.todo-item.is-${viewStatus}`)).toBeInTheDocument()
+      expect(todo.status).toBe('running')
+    },
+  )
 
-    expect(screen.getByRole('separator')).toHaveAttribute('aria-valuenow', '50')
+  it('keeps active Todo progress animated only while the run is streaming', () => {
+    const { container } = render(<TaskDrawer conversation={conversation([
+      { id: 'todo-1', content: '已完成', status: 'completed' },
+      { id: 'todo-2', content: '执行任务', status: 'running' },
+    ])} />)
+
+    expect(container.querySelector('.todo-state .spin')).toBeInTheDocument()
+    expect(container.querySelector('.progress-track span')).toHaveStyle({ width: '75%' })
   })
 
-  it('measures once and coalesces pointer moves to the latest animation frame', () => {
-    let frameCallback: FrameRequestCallback | undefined
-    const requestFrame = vi.fn((callback: FrameRequestCallback) => {
-      frameCallback = callback
-      return 71
-    })
-    const cancelFrame = vi.fn()
-    vi.stubGlobal('requestAnimationFrame', requestFrame)
-    vi.stubGlobal('cancelAnimationFrame', cancelFrame)
-    const view = render(<TaskDrawer conversation={conversation('thread-a')} />)
-    const drawer = screen.getByLabelText('任务抽屉')
-    const measure = vi.spyOn(drawer, 'getBoundingClientRect').mockReturnValue({
-      top: 100,
-      height: 800,
-    } as DOMRect)
-    const separator = screen.getByRole('separator')
-    const dispatchPointer = (type: string, clientY: number) => {
-      const event = new Event(type, { bubbles: true, cancelable: true })
-      Object.defineProperties(event, {
-        clientY: { value: clientY },
-        pointerId: { value: 1 },
-      })
-      fireEvent(separator, event)
-    }
+  it('does not close from an Escape already handled by a higher overlay', () => {
+    const onClose = vi.fn()
+    render(<TaskDrawer conversation={conversation([])} onClose={onClose} />)
+    const event = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })
+    event.preventDefault()
 
-    dispatchPointer('pointerdown', 300)
-    dispatchPointer('pointermove', 400)
-    dispatchPointer('pointermove', 600)
+    fireEvent(document, event)
 
-    expect(measure).toHaveBeenCalledOnce()
-    expect(requestFrame).toHaveBeenCalledOnce()
-    act(() => frameCallback?.(performance.now()))
-    expect(separator).toHaveAttribute('aria-valuenow', '63')
-
-    dispatchPointer('pointermove', 500)
-    view.unmount()
-    expect(cancelFrame).toHaveBeenCalledWith(71)
+    expect(onClose).not.toHaveBeenCalled()
   })
 })

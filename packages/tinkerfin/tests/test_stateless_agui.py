@@ -5,7 +5,12 @@ import logging
 from collections.abc import AsyncIterator
 
 import pytest
-from ag_ui.core import BaseEvent, RunErrorEvent, RunStartedEvent, StateSnapshotEvent
+from ag_ui.core import (
+    BaseEvent,
+    RunErrorEvent,
+    RunStartedEvent,
+    StateSnapshotEvent,
+)
 from langchain_core.messages import AIMessageChunk
 from pydantic import ValidationError
 
@@ -130,6 +135,28 @@ async def test_initialization_failure_uses_the_standard_complete_lifecycle() -> 
         "runId": "run-1",
         "initializationFailed": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_initialization_failure_marker_uses_canonical_identity_and_parent() -> (
+    None
+):
+    identity = _identity(thread_id="thread-1")
+    stream = AgUiEventStream.from_initialization_error(
+        RuntimeError("cannot initialize runtime"),
+        identity=identity,
+        parent_run_id="run-parent",
+    )
+
+    events = [event async for event in stream]
+
+    assert events[0].raw_event == {
+        "threadId": "thread-1",
+        "runId": "run-1",
+        "parentRunId": "run-parent",
+        "initializationFailed": True,
+    }
+    assert events[-1].raw_event == events[0].raw_event
 
 
 @pytest.mark.asyncio

@@ -9,8 +9,15 @@ from typing import Literal, Never, cast
 from ag_ui.core.types import Interrupt as AgUiInterrupt
 from ag_ui.core.types import ResumeEntry
 from langchain_core.messages import AIMessage, BaseMessage
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
+from pydantic import JsonValue, ValidationError
 
+from ._json_schema import (
+    SchemaError,
+    validate_json_schema_instance,
+)
+from ._json_schema import (
+    ValidationError as JsonSchemaValidationError,
+)
 from .errors import (
     AgUiAdapterError,
     AgUiAdapterErrorCode,
@@ -40,6 +47,17 @@ class ResumeMappingError(AgUiAdapterError, ValueError):
         *,
         cause: BaseException | None = None,
     ) -> None:
+        """Initialize a stable resume failure with its original cause.
+
+        Args:
+            code: Machine-readable resume error category.
+            message: Client-safe failure description.
+            cause: Original validation or correlation failure for trusted logs.
+
+        Raises:
+            ValueError: ``code`` is not a resume error category.
+        """
+
         if not code.name.startswith("RESUME_"):
             raise ValueError("code must identify an AG-UI resume failure")
         self.code = code
@@ -66,9 +84,12 @@ class ResumeTranslation:
     """
 
     mode: Literal["command", "abandon", "custom"]
+    kind: Literal["tool", "runtime"]
     resume_data: JsonObject | None
     cancelled_interrupt_ids: tuple[str, ...] = ()
     prior_tool_call_ids: tuple[str, ...] = ()
+    source_agent_names: tuple[str, ...] = ()
+    unidentified_external_source: bool = False
     decisions_by_interrupt: Mapping[
         str,
         tuple[dict[str, object] | None, ...],
@@ -83,24 +104,16 @@ class ResumeTranslation:
         return self.resume_data.root
 
 
-class _PendingInterruptAction(BaseModel):
+@dataclass(frozen=True, slots=True)
+class _PendingInterruptAction:
     """One review action extracted from a runtime interrupt."""
 
-    model_config = ConfigDict(extra="forbid")
-
-    ag_ui_interrupt_id: str = Field(min_length=1, description="AG-UI interrupt ID")
-    interrupt_id: str = Field(min_length=1, description="runtime interrupt ID")
-    action_index: int = Field(
-        ge=0,
-        description="Action position within the native interrupt batch",
-    )
-    action_name: str = Field(
-        min_length=1,
-        description="Name of the action under review",
-    )
-    allowed_decisions: list[Literal["approve", "edit", "reject", "respond"]] = Field(
-        description="Decisions allowed for this action"
-    )
+    ag_ui_interrupt_id: str
+    interrupt_id: str
+    action_index: int
+    action_name: str
+    allowed_decisions: tuple[Literal["approve", "edit", "reject", "respond"], ...]
+    args_schema: dict[str, JsonValue] | None
 
 
 _PriorToolCallIdResolver = Callable[
@@ -227,6 +240,9 @@ class ResumeMapper:
             )
 
         pending, tool_ids_by_group = self._pending_agui_actions(interrupts)
+        source_agent_names, unidentified_external_source = self._tool_sources(
+            interrupts
+        )
 
         def resolve_prior_tool_call_ids(
             selected: Mapping[str, Sequence[bool]] | None,
@@ -253,7 +269,41 @@ class ResumeMapper:
             entries=entries,
             pending=pending,
             resolve_prior_tool_call_ids=resolve_prior_tool_call_ids,
+            source_agent_names=source_agent_names,
+            unidentified_external_source=unidentified_external_source,
+            include_cancelled_tool_ids=True,
         )
+
+    @staticmethod
+    def _tool_sources(
+        interrupts: Sequence[AgUiInterrupt],
+    ) -> tuple[tuple[str, ...], bool]:
+        """Read trusted subagent provenance needed by custom execution policy."""
+
+        names: list[str] = []
+        unidentified = False
+        for interrupt in interrupts:
+            metadata = interrupt.metadata
+            if not isinstance(metadata, Mapping):
+                continue
+            source = cast(Mapping[object, object], metadata).get("source")
+            if not isinstance(source, Mapping):
+                continue
+            source_mapping = cast(Mapping[object, object], source)
+            agent_type = source_mapping.get("agentType")
+            agent_name = source_mapping.get("agentName")
+            kind = source_mapping.get("kind")
+            if agent_type == "subagent":
+                if not isinstance(agent_name, str) or not agent_name:
+                    raise ResumeMappingError(
+                        AgUiAdapterErrorCode.RESUME_INTERRUPT_UNSUPPORTED,
+                        "subagent Tool interrupt has no stable agent name",
+                    )
+                if agent_name not in names:
+                    names.append(agent_name)
+            elif kind == "compiled_subgraph":
+                unidentified = True
+        return tuple(names), unidentified
 
     def _translate(
         self,
@@ -261,6 +311,9 @@ class ResumeMapper:
         entries: Sequence[ResumeEntry],
         pending: Mapping[str, _PendingInterruptAction],
         resolve_prior_tool_call_ids: _PriorToolCallIdResolver,
+        source_agent_names: tuple[str, ...] = (),
+        unidentified_external_source: bool = False,
+        include_cancelled_tool_ids: bool = False,
     ) -> ResumeTranslation:
         if not pending:
             raise ResumeMappingError(
@@ -317,8 +370,11 @@ class ResumeMapper:
         if cancelled_interrupt_ids and len(cancelled_interrupt_ids) == len(pending):
             return ResumeTranslation(
                 mode="abandon",
+                kind="tool",
                 resume_data=None,
                 cancelled_interrupt_ids=tuple(cancelled_interrupt_ids),
+                source_agent_names=source_agent_names,
+                unidentified_external_source=unidentified_external_source,
                 decisions_by_interrupt={
                     interrupt_id: tuple(decisions)
                     for interrupt_id, decisions in grouped_decisions.items()
@@ -326,18 +382,23 @@ class ResumeMapper:
             )
 
         if cancelled_interrupt_ids:
-            resolved_slots = {
-                interrupt_id: tuple(decision is not None for decision in decisions)
-                for interrupt_id, decisions in grouped_decisions.items()
-            }
-            prior_tool_call_ids = resolve_prior_tool_call_ids(
-                resolved_slots,
+            selected = (
+                None
+                if include_cancelled_tool_ids
+                else {
+                    interrupt_id: tuple(decision is not None for decision in decisions)
+                    for interrupt_id, decisions in grouped_decisions.items()
+                }
             )
+            prior_tool_call_ids = resolve_prior_tool_call_ids(selected)
             return ResumeTranslation(
                 mode="custom",
+                kind="tool",
                 resume_data=None,
                 cancelled_interrupt_ids=tuple(cancelled_interrupt_ids),
                 prior_tool_call_ids=prior_tool_call_ids,
+                source_agent_names=source_agent_names,
+                unidentified_external_source=unidentified_external_source,
                 decisions_by_interrupt={
                     interrupt_id: tuple(decisions)
                     for interrupt_id, decisions in grouped_decisions.items()
@@ -366,8 +427,11 @@ class ResumeMapper:
         prior_tool_call_ids = resolve_prior_tool_call_ids(None)
         return ResumeTranslation(
             mode="command",
+            kind="tool",
             resume_data=resume_data,
             prior_tool_call_ids=prior_tool_call_ids,
+            source_agent_names=source_agent_names,
+            unidentified_external_source=unidentified_external_source,
             decisions_by_interrupt={
                 interrupt_id: tuple(decisions)
                 for interrupt_id, decisions in grouped_decisions.items()
@@ -443,7 +507,12 @@ class ResumeMapper:
                 interrupt_id=native_id,
                 action_index=action_index,
                 action_name=action.name,
-                allowed_decisions=list(review.allowed_decisions),
+                allowed_decisions=tuple(review.allowed_decisions),
+                args_schema=(
+                    None
+                    if review.args_schema is None
+                    else dict(review.args_schema.root)
+                ),
             )
 
         ordered_pending: dict[str, _PendingInterruptAction] = {}
@@ -567,7 +636,12 @@ class ResumeMapper:
                     interrupt_id=interrupt.id,
                     action_index=index,
                     action_name=action.name,
-                    allowed_decisions=review.allowed_decisions,
+                    allowed_decisions=tuple(review.allowed_decisions),
+                    args_schema=(
+                        None
+                        if review.args_schema is None
+                        else dict(review.args_schema.root)
+                    ),
                 )
         return pending, action_groups
 
@@ -624,7 +698,17 @@ class ResumeMapper:
             try:
                 normalized = normalize_operational_data(args_mapping)
                 normalized_args = JsonObject.model_validate(normalized).root
-            except (TypeError, ValueError) as error:
+                if pending.args_schema is not None:
+                    validate_json_schema_instance(
+                        normalized_args,
+                        pending.args_schema,
+                    )
+            except (
+                TypeError,
+                ValueError,
+                SchemaError,
+                JsonSchemaValidationError,
+            ) as error:
                 raise ResumeMappingError(
                     AgUiAdapterErrorCode.RESUME_PAYLOAD_INVALID,
                     f"interruptId={entry.interrupt_id} has an invalid payload",

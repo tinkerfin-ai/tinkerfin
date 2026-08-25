@@ -223,7 +223,7 @@ class TasksStreamPart(_ProtocolModel):
 class ExtraStreamPart(_ProtocolModel):
     """Validated v2 envelope for modes projected as safe AG-UI RAW events."""
 
-    type: Literal["updates", "checkpoints", "debug", "custom"] = Field(
+    type: Literal["checkpoints", "debug", "custom"] = Field(
         description="Native stream mode projected as a RAW event"
     )
     ns: tuple[str, ...] = Field(
@@ -231,6 +231,29 @@ class ExtraStreamPart(_ProtocolModel):
         description="Full graph namespace for the native stream part",
     )
     data: object = Field(description="Native payload validated before publication")
+
+
+class UpdatesStreamPart(_ProtocolModel):
+    """Validated node-to-state-update mapping from LangGraph updates mode."""
+
+    type: Literal["updates"] = Field(description="Stream-part type, fixed to updates")
+    ns: tuple[str, ...] = Field(
+        strict=True,
+        description="Full graph namespace for the native stream part",
+    )
+    data: dict[str, object] = Field(description="Node names mapped to state updates")
+
+    @field_validator("data", mode="before")
+    @classmethod
+    def validate_updates(cls, value: object) -> object:
+        """Require the documented node-name mapping without coercing update values."""
+
+        if not isinstance(value, Mapping):
+            raise TypeError("updates stream data must be a node mapping")
+        mapping = cast(Mapping[object, object], value)
+        if any(not isinstance(key, str) or not key for key in mapping):
+            raise TypeError("updates stream node names must be non-empty strings")
+        return dict(mapping)
 
 
 class NativeToolCall(_ProtocolModel):
@@ -249,7 +272,11 @@ class NativeToolCallList(RootModel[list[NativeToolCall]]):
 
 
 DeepAgentStreamPart = Annotated[
-    MessageStreamPart | TasksStreamPart | ValuesStreamPart | ExtraStreamPart,
+    MessageStreamPart
+    | TasksStreamPart
+    | ValuesStreamPart
+    | UpdatesStreamPart
+    | ExtraStreamPart,
     Field(discriminator="type"),
 ]
 
@@ -333,53 +360,40 @@ class EventContext(_ProtocolModel):
     )
 
 
-class ActiveToolCall(_ProtocolModel):
+@dataclass(slots=True)
+class ActiveToolCall:
     """Correlation state for one streamed model Tool call."""
 
-    tool_call_id: str = Field(min_length=1, description="Tool call ID")
-    tool_name: str = Field(min_length=1, description="Tool name")
-    parent_message_id: str | None = Field(
-        default=None, description="Parent message ID that proposed the Tool call"
-    )
-    namespace: tuple[str, ...] = Field(description="Namespace of the Tool call")
-    index: int | None = Field(
-        default=None, description="Tool call position within the current message"
-    )
-    arguments: str = Field(default="", description="Accumulated Tool argument text")
+    tool_call_id: str
+    tool_name: str
+    parent_message_id: str | None
+    namespace: tuple[str, ...]
+    index: int | None
+    arguments: str = ""
 
 
-class ActiveReasoning(_ProtocolModel):
+@dataclass(frozen=True, slots=True)
+class ActiveReasoning:
     """Correlation state for one visible reasoning stream."""
 
-    run_id: str = Field(min_length=1, description="Owning run ID")
-    source_message_id: str = Field(
-        min_length=1, description="Source message ID that started the reasoning stream"
-    )
-    reasoning_id: str = Field(min_length=1, description="AG-UI reasoning phase ID")
-    message_id: str = Field(min_length=1, description="AG-UI reasoning message ID")
-    namespace: tuple[str, ...] = Field(description="Reasoning stream namespace")
+    run_id: str
+    source_message_id: str
+    reasoning_id: str
+    message_id: str
+    namespace: tuple[str, ...]
 
 
-class SubagentInvocation(_ProtocolModel):
+@dataclass(frozen=True, slots=True)
+class SubagentInvocation:
     """Subagent correlation established by a native task-start part."""
 
-    parent_namespace: tuple[str, ...] = Field(
-        description="Parent agent namespace that started the task"
-    )
-    child_namespace: tuple[str, ...] = Field(
-        description="Child namespace derived from the graph task ID"
-    )
-    graph_task_id: str = Field(min_length=1, description="LangGraph task ID")
-    parent_tool_call_id: str = Field(
-        min_length=1, description="Parent agent task Tool call ID"
-    )
-    subagent_input: str = Field(description="Complete task.description content")
-    agent_name: str = Field(
-        min_length=1, description="Subagent name selected by task.subagent_type"
-    )
-    provenance: SubagentProvenance = Field(
-        description="Versioned public provenance for this logical invocation"
-    )
+    parent_namespace: tuple[str, ...]
+    child_namespace: tuple[str, ...]
+    graph_task_id: str
+    parent_tool_call_id: str
+    subagent_input: str
+    agent_name: str
+    provenance: SubagentProvenance
 
 
 @dataclass(frozen=True, slots=True)
@@ -422,15 +436,14 @@ class TaskResultFingerprint:
     result_json: str
 
 
-class ToolResultFingerprint(_ProtocolModel):
+@dataclass(frozen=True, slots=True)
+class ToolResultFingerprint:
     """Stable deduplication fingerprint for a published Tool result."""
 
-    message_id: str = Field(
-        min_length=1, description="Complete scoped result message ID"
-    )
-    tool_name: str = Field(min_length=1, description="Tool name")
-    content: str = Field(description="Normalized result content preserving semantics")
-    status: Literal["success", "error"] = Field(description="Native ToolMessage status")
+    message_id: str
+    tool_name: str
+    content: str
+    status: Literal["success", "error"]
 
 
 class JsonPatchOperation(_ProtocolModel):
@@ -727,7 +740,7 @@ def _prepare_ag_ui_interrupts(
             prepared.append(
                 AgUiInterrupt(
                     id=interrupt.id,
-                    reason="langgraph_interrupt",
+                    reason="langgraph:interrupt",
                     metadata={
                         "langgraphValue": sanitize_public_data(interrupt.value),
                         "source": source.model_dump(

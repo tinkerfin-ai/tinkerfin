@@ -1,5 +1,5 @@
 export type MessageRole = 'user' | 'assistant' | 'process' | 'tool' | 'subagent' | 'approval' | 'error'
-export type TodoStatus = 'pending' | 'running' | 'completed' | 'failed'
+export type TodoStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled'
 export type ApprovalDecision = 'approved' | 'rejected'
 export type ConversationRunStatus = 'idle' | 'streaming' | 'waiting_approval' | 'detached' | 'error'
 export type ApprovalMode = 'options' | 'edit' | 'reject'
@@ -30,7 +30,7 @@ export interface Message {
     input?: string
     result?: string
     reasoning?: string
-    status?: 'running' | 'completed' | 'failed' | 'paused'
+    status?: 'running' | 'completed' | 'failed' | 'paused' | 'cancelled'
     batchId?: string
     agentName?: string
     sourceAgentName?: string
@@ -57,12 +57,6 @@ export interface TodoItem {
   content: string
   status: TodoStatus
   result?: string
-  targetMessageId?: string
-}
-
-export interface Plan {
-  goal: string
-  steps: Array<{ title: string; detail: string }>
 }
 
 export interface ApprovalItem {
@@ -162,7 +156,6 @@ export interface Conversation {
   messages: Message[]
   notice?: ConversationNotice
   todos: TodoItem[]
-  plan: Plan | null
   approval?: ApprovalState
   planInteraction?: PlanInteraction
   runStatus: ConversationRunStatus

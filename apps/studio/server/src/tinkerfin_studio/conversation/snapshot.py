@@ -236,7 +236,7 @@ def _project_pending_interrupts(
         snapshot["approval"] = None
         return
     reasons = {item.get("reason") for item in projected}
-    plan_reasons = {"plan_clarification", "plan_review"}
+    plan_reasons = {"tinkerfin:plan_clarification", "tinkerfin:plan_review"}
     if reasons <= plan_reasons:
         snapshot["approval"] = None
         return
@@ -287,6 +287,7 @@ def reduce_snapshot(
     run_id: str,
     created_at: datetime,
     run_input: dict[str, object] | None,
+    resume_settled: bool = False,
 ) -> dict[str, object]:
     """按一个已提交事件生成下一份可信快照"""
 
@@ -312,6 +313,9 @@ def reduce_snapshot(
         and isinstance(snapshot.get("interrupts"), list)
         and bool(snapshot["interrupts"])
     )
+    if resume_settled and isinstance(resume, list) and resume:
+        snapshot["approval"] = None
+        snapshot["interrupts"] = []
 
     if event_type == "RAW":
         _project_raw_subagents(snapshot, payload, now)
@@ -333,15 +337,6 @@ def reduce_snapshot(
                 snapshot["runStatus"] = "streaming"
                 snapshot["activeRunId"] = event_run_id
             if run_input is not None:
-                if (
-                    not preserve_pending_after_initialization_failure
-                    and isinstance(resume, list)
-                    and resume
-                ):
-                    # Run 注册要求 resume 完整覆盖待处理组；RUN_STARTED 持久化后，
-                    # 即使 resumed run 随后失败或取消，原 interrupt 也不再 pending
-                    snapshot["approval"] = None
-                    snapshot["interrupts"] = []
                 forwarded_props = run_input.get("forwardedProps")
                 command = (
                     forwarded_props.get("command")

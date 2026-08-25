@@ -163,8 +163,8 @@ default_runtime = agent.new_agui(
 )
 ```
 
-`default` uses the original native topology and state schema; `plan` uses the standalone
-Planning Graph. Approval changes the effective mode to `default` before native execution.
+`default` uses the native topology with TinkerFin's private resume marker; `plan` uses
+the standalone Planning Graph. Approval changes the effective mode to `default` before native execution.
 A later request on the same checkpoint thread can select Plan again. Plan resumes are
 routed to Planning, while Tool and subagent resumes go directly to the native Graph.
 

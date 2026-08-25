@@ -13,6 +13,10 @@ import type {
   ConversationHistoryDetail,
   ConversationSnapshotJson,
 } from "../../../api/conversation/history"
+import {
+  ConversationError,
+  conversationErrorMessage,
+} from "../../../api/conversation/errors"
 import type {
   ApprovalAllowedDecision,
   ApprovalItem,
@@ -28,6 +32,7 @@ import type {
 } from "../../../types"
 import { translateCurrent } from "../../../i18n"
 import { parseToolReviewInterrupt } from "./toolReviewContract"
+import { applyStateDelta } from "./jsonPatch"
 import {
   parseSubagentProvenance,
   type SubagentProvenance,
@@ -176,7 +181,7 @@ const planInteractionFromInterrupts = (
   interrupts: readonly PlanInterruptLike[],
 ): Conversation['planInteraction'] => {
   const planInterrupts = interrupts.filter((interrupt) => (
-    interrupt.reason === 'plan_clarification' || interrupt.reason === 'plan_review'
+    interrupt.reason === 'tinkerfin:plan_clarification' || interrupt.reason === 'tinkerfin:plan_review'
   ))
   if (planInterrupts.length === 0) return undefined
   if (interrupts.length !== 1 || planInterrupts.length !== 1) return invalidPlanInteraction()
@@ -186,7 +191,7 @@ const planInteractionFromInterrupts = (
   if (!metadata) return invalidPlanInteraction()
   if (metadata.origin !== 'plan') return invalidPlanInteraction()
 
-  if (interrupt.reason === 'plan_clarification') {
+  if (interrupt.reason === 'tinkerfin:plan_clarification') {
     const clarification = metadata.clarification
     if (!clarification || typeof clarification !== 'object' || Array.isArray(clarification)) return invalidPlanInteraction()
     if (clarification.schema !== 'tinkerfin.plan-clarification.v2') return invalidPlanInteraction()
@@ -260,7 +265,7 @@ const planInteractionFromInterrupts = (
     }
   }
 
-  if (interrupt.reason === 'plan_review') {
+  if (interrupt.reason === 'tinkerfin:plan_review') {
     const review = metadata.review
     if (
       !review
@@ -539,54 +544,7 @@ const syncTodosFromState = (
   return {
     ...conversation,
     todos: nextTodos,
-    plan: null,
   }
-}
-
-const applyStateDelta = (current: JsonObject | undefined, delta: { path: string; value?: JsonValue; op: "add" | "remove" | "replace" }[]) => {
-  let next: JsonValue = structuredClone(current ?? {})
-  for (const operation of delta) {
-    const pathParts = operation.path.split("/").slice(1)
-      .map((part) => part.replaceAll("~1", "/").replaceAll("~0", "~"))
-    if (!pathParts.length) {
-      next = operation.op === "remove" ? {} : structuredClone(operation.value ?? null)
-      continue
-    }
-    let target: JsonObject | JsonValue[] | null = (
-      next && typeof next === "object" ? next : null
-    ) as JsonObject | JsonValue[] | null
-    for (const part of pathParts.slice(0, -1)) {
-      if (target == null) break
-      const key = Array.isArray(target) ? Number.parseInt(part, 10) : part
-      if (Array.isArray(target) && !Number.isInteger(key)) {
-        target = null
-        break
-      }
-      const value = target[key as never]
-      if (!value || typeof value !== "object") {
-        target[key as never] = {} as never
-      }
-      target = target[key as never] as JsonObject | JsonValue[]
-    }
-    const finalPart = pathParts.at(-1)
-    if (target == null || finalPart == null) continue
-    if (Array.isArray(target)) {
-      const index = finalPart === "-" ? target.length : Number.parseInt(finalPart, 10)
-      if (!Number.isInteger(index) || index < 0) continue
-      if (operation.op === "remove") {
-        if (index < target.length) target.splice(index, 1)
-      } else if (operation.op === "add") {
-        if (index <= target.length) target.splice(index, 0, operation.value ?? null)
-      } else if (index < target.length) {
-        target[index] = operation.value ?? null
-      }
-    } else if (operation.op === "remove") {
-      delete target[finalPart]
-    } else {
-      target[finalPart] = operation.value ?? null
-    }
-  }
-  return next && typeof next === "object" && !Array.isArray(next) ? next : {}
 }
 
 const isAgentMode = (value: unknown): value is AgentMode =>
@@ -599,13 +557,6 @@ const forwardedPropsFor = (
   model,
   command: { plan: mode === "plan" ? "on" : "off" },
 })
-
-const agentModeFromForwardedProps = (value: JsonValue | undefined): AgentMode | undefined => {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
-  const command = value.command
-  if (!command || typeof command !== "object" || Array.isArray(command)) return undefined
-  return command.plan === "on" ? "plan" : command.plan === "off" ? "default" : undefined
-}
 
 const syncEffectiveModeFromState = (
   conversation: Conversation,
@@ -656,29 +607,29 @@ export const buildResumePayload = (
 ): ChatRequestPayload => {
   const approval = conversation.approval
   if (!approval || approval.items.length === 0) {
-    throw new Error("当前会话没有可提交的审批项")
+    throw new ConversationError("approval_stale")
   }
-  if (approval.submitted) throw new Error("当前审批已经提交")
+  if (approval.submitted) throw new ConversationError("approval_stale")
   if (
     expectedInterruptIds
     && !matchesApprovalGroup(approval, expectedInterruptIds)
-  ) throw new Error("审批状态已更新")
+  ) throw new ConversationError("approval_stale")
 
   const seenInterruptIds = new Set<string>()
   for (const item of approval.items) {
-    if (!item.interruptId.trim()) throw new Error("审批项缺少 interruptId")
-    if (seenInterruptIds.has(item.interruptId)) throw new Error("审批项 interruptId 重复")
+    if (!item.interruptId.trim()) throw new ConversationError("approval_stale")
+    if (seenInterruptIds.has(item.interruptId)) throw new ConversationError("approval_stale")
     seenInterruptIds.add(item.interruptId)
-    if (!item.decision) throw new Error("请先处理所有待审批项")
+    if (!item.decision) throw new ConversationError("approval_incomplete")
     if (item.decision === "rejected") {
       if (!item.allowedDecisions.includes("reject")) {
-        throw new Error("审批项不允许拒绝")
+        throw new ConversationError("approval_stale")
       }
       continue
     }
     const requiredDecision = item.editedArgs ? "edit" : "approve"
     if (!item.allowedDecisions.includes(requiredDecision)) {
-      throw new Error(`审批项不允许${requiredDecision === "edit" ? "编辑" : "批准"}`)
+      throw new ConversationError("approval_stale")
     }
   }
 
@@ -726,16 +677,20 @@ export const buildPlanResumePayload = (
   conversation: Conversation,
 ): ChatRequestPayload => {
   const interaction = conversation.planInteraction
-  if (!interaction) throw new Error("当前会话没有待处理的 Plan 请求")
-  if (interaction.submitted) throw new Error("当前 Plan 请求已经提交")
+  if (!interaction) throw new ConversationError("plan_stale")
+  if (interaction.submitted) throw new ConversationError("plan_already_submitted")
 
   let payload: ChatResumeEntry['payload']
   if (interaction.kind === 'questions') {
     const answers = interaction.questions.map((question) => {
       const option = question.options.find((item) => item.id === question.selectedOptionId)
       const customAnswer = question.customAnswer?.trim() ?? ''
-      if (!option && !customAnswer && question.required) throw new Error("请回答所有必填的 Plan 澄清问题")
-      if (customAnswer && !question.allowFreeText) throw new Error("该问题必须选择一个选项")
+      if (!option && !customAnswer && question.required) {
+        throw new ConversationError("plan_required_answers_missing")
+      }
+      if (customAnswer && !question.allowFreeText) {
+        throw new ConversationError("plan_option_required")
+      }
       return option
         ? { questionId: question.id, optionId: option.id }
         : customAnswer
@@ -744,12 +699,12 @@ export const buildPlanResumePayload = (
     })
     payload = { type: 'respond', answers }
   } else {
-    if (!interaction.action) throw new Error("请选择 Plan 处理方式")
+    if (!interaction.action) throw new ConversationError("plan_action_required")
     if (interaction.action === 'approve') {
       payload = { type: 'approve', baseRevision: interaction.revision }
     } else if (interaction.action === 'edit') {
       const markdown = interaction.editedMarkdown ?? ''
-      if (!markdown.trim()) throw new Error("编辑后的计划不能为空")
+      if (!markdown.trim()) throw new ConversationError("plan_edit_empty")
       payload = {
         type: 'edit',
         baseRevision: interaction.revision,
@@ -757,7 +712,7 @@ export const buildPlanResumePayload = (
       }
     } else if (interaction.action === 'respond') {
       const message = interaction.message?.trim()
-      if (!message) throw new Error("请填写 Plan 修改意见")
+      if (!message) throw new ConversationError("plan_feedback_required")
       payload = {
         type: 'respond',
         baseRevision: interaction.revision,
@@ -798,7 +753,7 @@ export const buildPlanAbandonPayload = (
   conversation: Conversation,
 ): ChatRequestPayload => {
   const interaction = conversation.planInteraction
-  if (!interaction) throw new Error("当前会话没有可取消的 Plan 请求")
+  if (!interaction) throw new ConversationError("plan_stale")
   return {
     threadId: conversation.threadId,
     runId: createRunId(),
@@ -816,14 +771,13 @@ export const buildPlanAbandonPayload = (
 
 export const markConversationDetached = (
   conversation: Conversation,
-  reason = translateCurrent('已停止接收实时输出，后端任务可能仍在继续。'),
+  reason = translateCurrent('已停止接收实时输出，后端任务可能仍在继续'),
 ): Conversation => {
   if (conversation.runStatus !== "streaming") return conversation
   return setConversationNotice(
     {
       ...conversation,
       runStatus: "detached",
-      activeRunId: undefined,
       approval: conversation.approval ? { ...conversation.approval, submitted: false } : conversation.approval,
     },
     reason,
@@ -928,59 +882,26 @@ export const applyConversationEvent = (
     }
 
     case "RUN_STARTED": {
-      const persistedUserMessages: Message[] = (event.input?.messages ?? [])
-        .filter((message) => message.role === "user" && typeof message.content === "string")
-        .map((message) => ({
-          id: message.id,
-          role: "user",
-          content: message.content,
-          createdAt: nowIso(),
-        }))
-      const isResume = (event.input?.resume?.length ?? 0) > 0
+      const isResume = Boolean(
+        conversation.approval?.submitted
+        || conversation.planInteraction?.submitted,
+      )
       const initializationFailed = event.rawEvent?.initializationFailed === true
       const preservePending = initializationFailed
         && Boolean(conversation.approval || conversation.planInteraction)
       const pending = preservePending
         ? restorePendingInteraction(conversation)
         : conversation
-      const mode = agentModeFromForwardedProps(event.input?.forwardedProps)
-        ?? conversation.mode
-      const reconciledServerMessageIndexes = new Set<number>()
-      const reconciledMessages = pending.messages.map((message) => {
-        if (message.role !== "user" || message.meta?.runId !== event.runId) return message
-        const serverMessageIndex = persistedUserMessages.findIndex(
-          (serverMessage, index) => (
-            !reconciledServerMessageIndexes.has(index)
-            && serverMessage.content === message.content
-          ),
-        )
-        if (serverMessageIndex < 0) return message
-        reconciledServerMessageIndexes.add(serverMessageIndex)
-        const meta = { ...message.meta }
-        delete meta.runId
-        return {
-          ...message,
-          id: persistedUserMessages[serverMessageIndex]?.id ?? message.id,
-          meta: Object.keys(meta).length > 0 ? meta : undefined,
-        }
-      })
-      const missingPersistedUserMessages = persistedUserMessages.filter(
-        (message, index) => (
-          !reconciledServerMessageIndexes.has(index)
-          && !reconciledMessages.some((existing) => existing.id === message.id)
-        ),
-      )
       return {
         ...pending,
         threadId: event.threadId,
         title: event.title?.trim() || conversation.title,
-        mode,
         activeRunId: preservePending ? undefined : event.runId,
         runStatus: preservePending ? "waiting_approval" : "streaming",
         notice: undefined,
         approval: isResume && !preservePending ? undefined : pending.approval,
         planInteraction: preservePending ? pending.planInteraction : undefined,
-        messages: [...reconciledMessages, ...missingPersistedUserMessages].map((message) => (
+        messages: pending.messages.map((message) => (
           isResume && !preservePending && message.meta?.status === "paused"
             ? {
                 ...message,
@@ -1313,8 +1234,14 @@ export const applyConversationEvent = (
       {
         const rawEvent = rawEventOrMain(conversation, event.rawEvent)
         const completedAt = nowIso()
-        const errorMessage = event.message ?? translateCurrent('对话运行失败。')
+        const errorMessage = conversationErrorMessage(
+          new ConversationError('run_failed', event.message),
+          'run_failed',
+        )
         const isCancelled = event.code === "cancelled" || event.code === "resume_cancelled"
+        const visibleMessage = isCancelled
+          ? translateCurrent(event.code === "resume_cancelled" ? '已取消' : '任务已停止')
+          : errorMessage
         const errorRunId = rawEvent.runId ?? conversation.activeRunId
         if (
           rawEvent.initializationFailed === true
@@ -1322,10 +1249,14 @@ export const applyConversationEvent = (
         ) {
           return setConversationNotice(
             restorePendingInteraction(conversation),
-            errorMessage,
+            conversationErrorMessage(
+              new ConversationError('resume_failed', event.message),
+              'resume_failed',
+            ),
             "error",
           )
         }
+        // 用户主动停止是正常业务终态，不能把未完成工作渲染成系统故障
         return setConversationNotice(
           {
             ...conversation,
@@ -1344,19 +1275,24 @@ export const applyConversationEvent = (
                     ...message,
                     meta: {
                       ...message.meta,
-                      status: "failed" as const,
+                      status: isCancelled ? "cancelled" as const : "failed" as const,
                       result: message.role === "subagent"
-                        ? message.meta?.result || errorMessage
-                        : errorMessage,
+                        ? message.meta?.result || visibleMessage
+                        : visibleMessage,
                       completedAt,
                       durationMs: elapsedMs(message.createdAt, completedAt),
                     },
                   }
                 : message
             )),
+            todos: conversation.todos.map((todo) => (
+              isCancelled && todo.status === "running"
+                ? { ...todo, status: "cancelled" as const }
+                : todo
+            )),
           },
-          errorMessage,
-          "error",
+          visibleMessage,
+          isCancelled ? "info" : "error",
         )
       }
 
@@ -1380,8 +1316,8 @@ const currentSnapshot = (
   }
   const snapshot = detail.snapshot ?? null
   if (snapshot == null) {
-    if (detail.snapshotSeq !== 0) {
-      throw new Error("空会话快照必须对应 snapshotSeq=0")
+    if (detail.snapshotSeq !== 0 || detail.lastSeq !== 0) {
+      throw new Error("只有无事件的新会话可以缺少快照")
     }
     return null
   }
@@ -1425,14 +1361,7 @@ export const restoreConversationFromHistory = (
     model: options.model,
     mode: hasSnapshot && snapshot.mode === "plan" ? "plan" : "default",
     messages: hasSnapshot ? messagesFromSnapshot(snapshot) : [],
-    todos: hasSnapshot
-      ? snapshot.todos.map((todo) => {
-          const restoredTodo = { ...todo }
-          delete restoredTodo.targetMessageId
-          return restoredTodo
-        })
-      : [],
-    plan: null,
+    todos: hasSnapshot ? snapshot.todos.map((todo) => ({ ...todo })) : [],
     approval: hasSnapshot && !snapshotPlanInteraction && snapshot.approval
       ? snapshot.approval
       : undefined,

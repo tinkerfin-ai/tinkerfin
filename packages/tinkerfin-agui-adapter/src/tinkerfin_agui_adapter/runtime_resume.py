@@ -9,6 +9,13 @@ from ag_ui.core import Interrupt as AgUiInterrupt
 from ag_ui.core.types import ResumeEntry
 from pydantic import JsonValue, ValidationError
 
+from ._json_schema import (
+    SchemaError,
+    validate_json_schema_instance,
+)
+from ._json_schema import (
+    ValidationError as JsonSchemaValidationError,
+)
 from .errors import AgUiAdapterErrorCode
 from .models import AgentRuntimeInterrupt, JsonObject
 from .reasoning import json_values_equal, normalize_operational_data
@@ -162,8 +169,13 @@ def _translate(
             cancelled.append(public_id)
             continue
         try:
-            resolved[public_id] = JsonObject.model_validate(entry.payload)
-        except ValidationError as error:
+            payload = JsonObject.model_validate(entry.payload)
+            validate_json_schema_instance(
+                payload.root,
+                pending[public_id][1].response_schema,
+            )
+            resolved[public_id] = payload
+        except (ValidationError, SchemaError, JsonSchemaValidationError) as error:
             raise ResumeMappingError(
                 AgUiAdapterErrorCode.RESUME_PAYLOAD_INVALID,
                 f"interruptId={public_id} requires a JSON object payload",
@@ -195,6 +207,7 @@ def _translate(
     if cancelled and len(cancelled) == len(pending):
         return ResumeTranslation(
             mode="abandon",
+            kind="runtime",
             resume_data=None,
             cancelled_interrupt_ids=tuple(cancelled),
             decisions_by_interrupt=decisions_by_interrupt,
@@ -202,6 +215,7 @@ def _translate(
     if cancelled:
         return ResumeTranslation(
             mode="custom",
+            kind="runtime",
             resume_data=None,
             cancelled_interrupt_ids=tuple(cancelled),
             decisions_by_interrupt=decisions_by_interrupt,
@@ -214,6 +228,7 @@ def _translate(
     )
     return ResumeTranslation(
         mode="command",
+        kind="runtime",
         resume_data=resume_data,
         decisions_by_interrupt=decisions_by_interrupt,
     )

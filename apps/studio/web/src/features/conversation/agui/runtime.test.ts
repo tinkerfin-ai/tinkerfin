@@ -544,6 +544,8 @@ describe('AG-UI runtime reducer', () => {
     )
 
     expect(current.runStatus).toBe('error')
+    expect(current.notice).toEqual({ kind: 'error', content: '对话运行失败' })
+    expect(current.notice?.content).not.toContain('主 run 失败')
     expect(subagent?.meta?.status).toBe('failed')
     expect(childTool?.meta?.status).toBe('failed')
   })
@@ -569,6 +571,7 @@ describe('AG-UI runtime reducer', () => {
           runId: RUN_ID,
         },
       }],
+      todos: [{ id: 'todo-running', content: '正在执行', status: 'running' as const }],
     }
 
     const next = applyConversationEvent(conversation, {
@@ -581,15 +584,16 @@ describe('AG-UI runtime reducer', () => {
     expect(next.runStatus).toBe('idle')
     expect(next.activeRunId).toBeUndefined()
     expect(next.notice).toEqual({
-      kind: 'error',
-      content: '聊天生成已取消',
+      kind: 'info',
+      content: '任务已停止',
     })
     expect(next.messages).toHaveLength(1)
     expect(next.messages.some((message) => message.id.includes('client-notice'))).toBe(false)
     expect(next.messages[0]?.meta).toMatchObject({
-      status: 'failed',
-      result: '聊天生成已取消',
+      status: 'cancelled',
+      result: '任务已停止',
     })
+    expect(next.todos).toEqual([{ id: 'todo-running', content: '正在执行', status: 'cancelled' }])
   })
 
   it('stores a detached connection notice outside protocol messages', () => {
@@ -609,10 +613,11 @@ describe('AG-UI runtime reducer', () => {
       kind: 'info',
       content: '实时连接已断开',
     })
+    expect(detached.activeRunId).toBe(RUN_ID)
     expect(detached.messages).toEqual([])
   })
 
-  it('replaces the draft identity and title from the main RUN_STARTED event', () => {
+  it('replaces draft identity and title without duplicating Graph input', () => {
     const draft = buildEmptyConversation({
       now: '2026-08-18T10:00:00.000Z',
       model: 'main',
@@ -622,32 +627,17 @@ describe('AG-UI runtime reducer', () => {
       type: 'RUN_STARTED',
       threadId: 'thread-from-server',
       runId: 'run-from-client',
+      parentRunId: 'run-parent',
       title: '服务端生成的标题',
-      input: {
-        threadId: 'thread-from-server',
-        runId: 'run-from-client',
-        state: {},
-        messages: [
-          { id: 'message-from-server', role: 'user', content: '分析本季度现金流' },
-        ],
-        tools: [],
-        context: [],
-        forwardedProps: { model: 'main', command: { plan: 'off' } },
-      },
     })
 
     expect(next.threadId).toBe('thread-from-server')
+    expect(next.activeRunId).toBe('run-from-client')
     expect(next.title).toBe('服务端生成的标题')
-    expect(next.messages).toEqual([
-      expect.objectContaining({
-        id: 'message-from-server',
-        role: 'user',
-        content: '分析本季度现金流',
-      }),
-    ])
+    expect(next.messages).toEqual([])
   })
 
-  it('reconciles an optimistic user message with the server-assigned message identity', () => {
+  it('keeps the optimistic user message until an authoritative history snapshot arrives', () => {
     const draft = {
       ...buildEmptyConversation({
         now: '2026-08-18T10:00:00.000Z',
@@ -667,24 +657,14 @@ describe('AG-UI runtime reducer', () => {
       threadId: 'thread-from-server',
       runId: 'run-from-client',
       title: '服务端生成的标题',
-      input: {
-        threadId: 'thread-from-server',
-        runId: 'run-from-client',
-        state: {},
-        messages: [
-          { id: 'message-from-server', role: 'user', content: '分析本季度现金流' },
-        ],
-        tools: [],
-        context: [],
-        forwardedProps: { model: 'main', command: { plan: 'off' } },
-      },
     })
 
     expect(next.messages).toEqual([{
-      id: 'message-from-server',
+      id: 'request-run-from-client',
       role: 'user',
       content: '分析本季度现金流',
       createdAt: '2026-08-18T10:00:00.000Z',
+      meta: { runId: 'run-from-client' },
     }])
   })
 
@@ -771,7 +751,6 @@ describe('AG-UI runtime reducer', () => {
     expect(afterState.mode).toBe('plan')
     expect(afterDelta.mode).toBe('default')
     expect(afterDelta.todos.map((todo) => todo.status)).toEqual(['completed', 'completed'])
-    expect(afterDelta.todos.every((todo) => todo.targetMessageId == null)).toBe(true)
   })
 
   it('pauses every unresolved tool in the interrupted main run without inventing interrupt bindings', () => {
@@ -966,7 +945,6 @@ describe('AG-UI runtime reducer', () => {
     expect(finalConversation.threadId).toBe(expectedThreadId)
     expect(finalConversation.runStatus).toBe('idle')
     expect(finalConversation.approval).toBeUndefined()
-    expect(finalConversation.plan).toBeNull()
     expect(finalConversation.todos).toHaveLength(3)
     expect(finalConversation.todos.every((todo) => todo.status === 'completed')).toBe(true)
     expect(writeTodoMessages).toHaveLength(1)
@@ -1289,7 +1267,7 @@ describe('AG-UI runtime reducer', () => {
     expect(() => buildResumePayload(
       { ...current, approval },
       ['interrupt-old'],
-    )).toThrow('审批状态已更新')
+    )).toThrow('approval_stale')
   })
 
   it('does not claim a replacement approval group for an old resume submission', () => {
@@ -1381,17 +1359,6 @@ describe('AG-UI runtime reducer', () => {
       type: 'RUN_STARTED',
       threadId: THREAD_ID,
       runId: `${RUN_ID}-resume`,
-      input: {
-        threadId: THREAD_ID,
-        runId: `${RUN_ID}-resume`,
-        resume: [
-          {
-            interruptId: 'interrupt-running',
-            status: 'resolved',
-            payload: { type: 'approve' },
-          },
-        ],
-      },
     })
 
     expect(confirmedByServer.approval).toBeUndefined()
@@ -1437,15 +1404,6 @@ describe('AG-UI runtime reducer', () => {
       threadId: THREAD_ID,
       runId: `${RUN_ID}-resume`,
       rawEvent: { runId: `${RUN_ID}-resume`, initializationFailed: true },
-      input: {
-        threadId: THREAD_ID,
-        runId: `${RUN_ID}-resume`,
-        resume: [{
-          interruptId: 'interrupt-init-failure',
-          status: 'resolved',
-          payload: { type: 'approve' },
-        }],
-      },
     })
     const failed = applyConversationEvent(initializationStarted, {
       type: 'RUN_ERROR',
@@ -1461,7 +1419,7 @@ describe('AG-UI runtime reducer', () => {
     expect(failed.messages.find(
       (message) => message.meta?.toolCallId === 'call-init-failure',
     )?.meta?.status).toBe('paused')
-    expect(failed.notice).toEqual({ kind: 'error', content: 'Runtime 初始化失败' })
+    expect(failed.notice).toEqual({ kind: 'error', content: '继续任务失败，请重新提交' })
   })
 
   it('marks only the related subagent when its parent task result fails', () => {
@@ -1534,7 +1492,7 @@ describe('AG-UI runtime reducer', () => {
     expect(failed.messages.some((message) => message.role === 'error')).toBe(false)
   })
 
-  it('replays the full event log when no snapshot is available', () => {
+  it('rejects persisted event history that has no v3 snapshot', () => {
     const detail: ConversationHistoryDetail = {
       id: 1,
       threadId: THREAD_ID,
@@ -1558,11 +1516,6 @@ describe('AG-UI runtime reducer', () => {
             type: 'RUN_STARTED',
             threadId: THREAD_ID,
             runId: RUN_ID,
-            input: {
-              threadId: THREAD_ID,
-              runId: RUN_ID,
-              messages: [{ id: 'user-1', role: 'user', content: '你好' }],
-            },
           },
           createdAt: '2026-08-05T00:00:00.000Z',
         },
@@ -1594,13 +1547,9 @@ describe('AG-UI runtime reducer', () => {
       updatedAt: '2026-08-05T00:00:00.000Z',
     }
 
-    const restored = restoreConversationFromHistory(detail, { model: 'GPT-5.5' })
-    expect(restored.threadId).toBe(THREAD_ID)
-    expect(restored.runStatus).toBe('idle')
-    expect(restored.lastSeq).toBe(3)
-    // 完整事件日志同时重建用户消息和助手消息
-    expect(restored.messages.map((message) => message.id)).toEqual(['user-1', 'assistant-1'])
-    expect(restored.messages[1]?.content).toBe('回放内容')
+    expect(() => restoreConversationFromHistory(detail, { model: 'GPT-5.5' })).toThrow(
+      '只有无事件的新会话可以缺少快照',
+    )
   })
 
   it('restores current Tool approval data from a trusted v2 snapshot', () => {
@@ -1702,7 +1651,19 @@ describe('AG-UI runtime reducer', () => {
       toolCallCount: 0,
       hasPendingInterrupt: false,
       pinned: false,
-      snapshot: null,
+      snapshot: {
+        snapshotSeq: 0,
+        snapshotVersion: 3,
+        messages: [],
+        todos: [],
+        mode: 'default',
+        approval: null,
+        runStatus: 'idle',
+        activeRunId: null,
+        serverState: {},
+        runs: {},
+        interrupts: [],
+      },
       events: [{
         seq: 1,
         eventId: 'evt-stale-interrupt',
@@ -1740,11 +1701,6 @@ describe('AG-UI runtime reducer', () => {
           type: 'RUN_STARTED',
           threadId: THREAD_ID,
           runId: RUN_ID,
-          input: {
-            threadId: THREAD_ID,
-            runId: RUN_ID,
-            messages: [{ id: 'user-1', role: 'user', content: '帮我搜索' }],
-          },
         },
         createdAt: '2026-08-05T00:00:00.000Z',
       },
@@ -1885,14 +1841,31 @@ describe('AG-UI runtime reducer', () => {
       title: '工具+子Agent+HITL会话',
       status: 'idle',
       lastSeq: 9,
-      snapshotSeq: 0,
+      snapshotSeq: 1,
       snapshotVersion: 3,
       messageCount: 1,
       toolCallCount: 1,
       hasPendingInterrupt: false,
       pinned: false,
-      snapshot: null,
-      events,
+      snapshot: {
+        snapshotSeq: 1,
+        snapshotVersion: 3,
+        messages: [{
+          id: 'user-1',
+          role: 'user',
+          content: '帮我搜索',
+          createdAt: '2026-08-05T00:00:00.000Z',
+        }],
+        todos: [],
+        mode: 'default',
+        approval: null,
+        runStatus: 'streaming',
+        activeRunId: RUN_ID,
+        serverState: {},
+        runs: {},
+        interrupts: [],
+      },
+      events: events.slice(1),
       createdAt: '2026-08-05T00:00:00.000Z',
       updatedAt: '2026-08-05T00:00:00.000Z',
     }
@@ -1957,7 +1930,6 @@ describe('AG-UI runtime reducer', () => {
             id: 'todo-v3',
             content: '历史 Todo',
             status: 'completed',
-            targetMessageId: 'tool-write-todos-v3',
           },
         ],
         mode: 'plan',
@@ -1994,7 +1966,6 @@ describe('AG-UI runtime reducer', () => {
 
     const restored = restoreConversationFromHistory(detail, { model: 'GPT-5.5' })
     const subagent = restored.messages.find((message) => message.id === 'subagent-v3')
-    expect(restored.todos[0]?.targetMessageId).toBeUndefined()
     const assistant = restored.messages.find((message) => message.id === 'assistant-v3')
 
     expect(subagent?.meta?.input).toBe('对比 A 与 B，并给出处')
@@ -2059,7 +2030,7 @@ describe('AG-UI runtime reducer', () => {
     expect(() => restoreConversationFromHistory(mismatchedSequence, { model: 'GPT-5.5' }))
       .toThrow('会话历史快照序号与详情不一致')
     expect(() => restoreConversationFromHistory(missingSnapshot, { model: 'GPT-5.5' }))
-      .toThrow('空会话快照必须对应 snapshotSeq=0')
+      .toThrow('只有无事件的新会话可以缺少快照')
   })
 
   it('uses persisted event timestamps for restored message timing', () => {
@@ -2077,7 +2048,19 @@ describe('AG-UI runtime reducer', () => {
       toolCallCount: 1,
       hasPendingInterrupt: false,
       pinned: false,
-      snapshot: null,
+      snapshot: {
+        snapshotSeq: 0,
+        snapshotVersion: 3,
+        messages: [],
+        todos: [],
+        mode: 'default',
+        approval: null,
+        runStatus: 'idle',
+        activeRunId: null,
+        serverState: {},
+        runs: {},
+        interrupts: [],
+      },
       events: [
         {
           seq: 1,
@@ -2133,31 +2116,26 @@ describe('AG-UI runtime reducer', () => {
       status: 'running',
       lastRunId: RUN_ID,
       lastSeq: 1,
-      snapshotSeq: 0,
+      snapshotSeq: 1,
       snapshotVersion: 3,
       messageCount: 0,
       toolCallCount: 0,
       hasPendingInterrupt: false,
       pinned: false,
-      snapshot: null,
-      events: [
-        {
-          seq: 1,
-          eventId: 'evt-running-start',
-          eventType: 'RUN_STARTED',
-          event: {
-            type: 'RUN_STARTED',
-            threadId: THREAD_ID,
-            runId: RUN_ID,
-            input: {
-              threadId: THREAD_ID,
-              runId: RUN_ID,
-              messages: [{ id: 'user-running', role: 'user', content: '仍在处理吗？' }],
-            },
-          },
-          createdAt: '2026-08-05T08:00:00.000Z',
-        },
-      ],
+      snapshot: {
+        snapshotSeq: 1,
+        snapshotVersion: 3,
+        messages: [],
+        todos: [],
+        mode: 'default',
+        approval: null,
+        runStatus: 'streaming',
+        activeRunId: RUN_ID,
+        serverState: {},
+        runs: {},
+        interrupts: [],
+      },
+      events: [],
       createdAt: '2026-08-05T08:00:00.000Z',
       updatedAt: '2026-08-05T08:00:00.000Z',
     }
@@ -2186,11 +2164,6 @@ describe('AG-UI runtime reducer', () => {
         type: 'RUN_STARTED',
         threadId: THREAD_ID,
         runId: RUN_ID,
-        input: {
-          threadId: THREAD_ID,
-          runId: RUN_ID,
-          messages: [{ id: 'user-catch-up', role: 'user', content: '继续执行' }],
-        },
       },
       createdAt: '2026-08-05T08:01:00.000Z',
     })
@@ -2313,7 +2286,7 @@ describe('AG-UI runtime reducer', () => {
         type: 'interrupt',
         interrupts: [{
           id: 'plan-question-1',
-          reason: 'plan_clarification',
+          reason: 'tinkerfin:plan_clarification',
           metadata: {
             runtimeInterrupt: {
               envelope: {
@@ -2429,7 +2402,7 @@ describe('AG-UI runtime reducer', () => {
         type: 'interrupt',
         interrupts: [{
           id: 'plan-question-large',
-          reason: 'plan_clarification',
+          reason: 'tinkerfin:plan_clarification',
           metadata: {
             runtimeInterrupt: {
               envelope: {
@@ -2532,7 +2505,7 @@ describe('AG-UI runtime reducer', () => {
         type: 'interrupt',
         interrupts: [{
           id: 'invalid-plan-question',
-          reason: 'plan_clarification',
+          reason: 'tinkerfin:plan_clarification',
           metadata: {
             runtimeInterrupt: {
               envelope: {
@@ -2566,7 +2539,7 @@ describe('AG-UI runtime reducer', () => {
         type: 'interrupt',
         interrupts: [{
           id: 'plan-review-1',
-          reason: 'plan_review',
+          reason: 'tinkerfin:plan_review',
           metadata: {
             runtimeInterrupt: {
               envelope: {
@@ -2664,7 +2637,7 @@ describe('AG-UI runtime reducer', () => {
           type: 'interrupt',
           interrupts: [{
             id: 'invalid-plan-review',
-            reason: 'plan_review',
+            reason: 'tinkerfin:plan_review',
             metadata: {
               runtimeInterrupt: {
                 envelope: { metadata: { origin: 'plan', review } },
@@ -2727,7 +2700,7 @@ describe('AG-UI runtime reducer', () => {
       message: '目标不再需要',
     })
     expect(() => payloadFor({ action: 'edit', editedMarkdown: ' \n\t' })).toThrow(
-      '编辑后的计划不能为空',
+      'plan_edit_empty',
     )
   })
 })

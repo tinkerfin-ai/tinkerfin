@@ -56,6 +56,8 @@ export function Dialog({
   if (!open) return null
 
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    // 内层列表框等浮层先处理键盘事件时，外层对话框必须保持不变
+    if (event.defaultPrevented) return
     if (event.key === 'Escape' && !closeDisabled) {
       event.preventDefault()
       onClose()
@@ -86,12 +88,16 @@ export function Dialog({
   }
 
   return createPortal(
+    // 遮罩只处理对话框外部的指针取消，不进入键盘顺序，键盘关闭由对话框自身负责
+    // eslint-disable-next-line jsx-a11y/no-static-element-interactions
     <div
       className="modal-backdrop"
       onMouseDown={(event) => {
         if (event.target === event.currentTarget && !closeDisabled) onClose()
       }}
     >
+      {/* 对话框通过此键盘入口维护 Escape 和 Tab 焦点循环 */}
+      {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions */}
       <div
         ref={dialogRef}
         className={`modal-dialog${className ? ` ${className}` : ''}`}

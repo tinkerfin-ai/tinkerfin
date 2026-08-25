@@ -74,15 +74,16 @@ asyncio.run(main())
   前提下自动组合
 - `.plan(enabled=True)` 在不改变 Deep Agents `create_deep_agent(...)` 参数的前提下
   创建稳定父工作流；每次 `new()` / `new_agui()` 通过 `mode="default"` 或
-  `mode="plan"` 选择本轮路径，并且必须提供具体 checkpointer
+  `mode="plan"` 选择本轮路径；选择 Plan 时必须提供具体 checkpointer
 - AG-UI 固定使用 v2 `messages`、`tasks`、`values` 和 `subgraphs=True`，非法参数会在
   迭代及生命周期事件开始前失败
 - Runtime 与 Adapter 负责保证事件顺序、子 Agent 来源、interrupt/resume、推理隐私、
   取消、背压和清理语义
 - 对象流可以直接输出 SSE，也可以交给 Messaging 持久化、回放、附着和远程取消
-- Runtime 只接收 `Identity`，并自动注入 Graph thread；纯框架
-  `RUN_STARTED.input` 为 `None`，应用可补充自己的权威请求
-- 恢复请求通过 `AgUiResumeBinding` 绑定 Identity、原生 Command 和完整 Tool ID
+- AG-UI Runtime 使用一个 `Identity` 统一公开事件、Graph、checkpoint 与持久投递；可选
+  `parent_run_id` 会创建真实 checkpoint 分支
+- 恢复请求通过 `AgUiResumeBinding.from_agui(...)` 构造；Runtime 自己管理原生 Command、
+  Tool 关联、取消与持久 checkpoint 证据
 - `TinkerFin.run(...)` 用于自定义异步源
 
 ## 文档

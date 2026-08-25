@@ -23,10 +23,20 @@ import { readThreadFromLocation } from '../../lib/threadRoute'
 import { upsertConversation } from '../../lib/workspace'
 import type { Conversation, WorkspaceState } from '../../types'
 import { useI18n } from '../../i18n'
+import type { ModelCatalogStatus } from './useModelCatalog'
+import { pruneSearchOnlyConversations } from './workspaceHistoryCache'
 
-const HISTORY_PAGE_SIZE = 5
-const HISTORY_LOAD_DEBOUNCE_MS = 500
+// 单页覆盖一次惯性滑动的浏览距离，避免用户在同一批数据内反复触底
+const HISTORY_PAGE_SIZE = 100
+// 历史分页限制相邻请求的启动间隔，首次命中有效游标时不增加人工等待
+const HISTORY_LOAD_THROTTLE_MS = 300
 const HISTORY_SEARCH_DEBOUNCE_MS = 300
+
+const getHistoryLoadThrottleDelay = (lastStartedAt: number | null) => (
+  lastStartedAt == null
+    ? 0
+    : Math.max(0, HISTORY_LOAD_THROTTLE_MS - (Date.now() - lastStartedAt))
+)
 
 const sortConversations = (conversations: Conversation[]) =>
   [...conversations].sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))
@@ -73,7 +83,6 @@ const conversationFromHistoryItem = (
   mode: 'default',
   messages: [],
   todos: [],
-  plan: null,
   runStatus: historyStatusToRunStatus(item.status),
   activeRunId: item.lastRunId,
   serverState: {},
@@ -122,7 +131,7 @@ export function useWorkspaceHistory({
   workspace: WorkspaceState
   setWorkspace: Dispatch<SetStateAction<WorkspaceState>>
   defaultModelId: string
-  modelCatalogStatus: 'loading' | 'ready' | 'error'
+  modelCatalogStatus: ModelCatalogStatus
   catchUpDetachedConversation: (threadId: string) => void | Promise<void>
   onToast: (kind: 'error', message: string) => void
 }) {
@@ -153,12 +162,14 @@ export function useWorkspaceHistory({
   const hasHistoryBootstrapStarted = useRef(false)
   const historyBootstrapAbortController = useRef<AbortController | null>(null)
   const historyLoadingRef = useRef(false)
-  const historyLoadTimer = useRef<number | null>(null)
+  const historyLoadThrottleTimer = useRef<number | null>(null)
+  const historyLastLoadStartedAt = useRef<number | null>(null)
   const historyInFlightCursor = useRef<string | null>(null)
   const loadedHistoryCursors = useRef(new Set<string>())
   const historyAbortController = useRef<AbortController | null>(null)
   const historySearchDebounceTimer = useRef<number | null>(null)
-  const historySearchLoadTimer = useRef<number | null>(null)
+  const historySearchLoadThrottleTimer = useRef<number | null>(null)
+  const historySearchLastLoadStartedAt = useRef<number | null>(null)
   const historySearchAbortController = useRef<AbortController | null>(null)
   const historySearchGeneration = useRef(0)
   const historySearchLoadingRef = useRef(false)
@@ -205,6 +216,7 @@ export function useWorkspaceHistory({
       setHistoryThreadIds(nextThreadIds)
       for (const threadId of nextThreadIds) searchOnlyThreadIds.current.delete(threadId)
       loadedHistoryCursors.current.clear()
+      historyLastLoadStartedAt.current = null
       setHistoryCursor(response.nextCursor ?? null)
       setHistoryDayRanges(groupConfig.dayRanges)
       setWorkspace((state) => {
@@ -265,15 +277,31 @@ export function useWorkspaceHistory({
       window.clearTimeout(historySearchDebounceTimer.current)
       historySearchDebounceTimer.current = null
     }
-    if (historySearchLoadTimer.current != null) {
-      window.clearTimeout(historySearchLoadTimer.current)
-      historySearchLoadTimer.current = null
+    if (historySearchLoadThrottleTimer.current != null) {
+      window.clearTimeout(historySearchLoadThrottleTimer.current)
+      historySearchLoadThrottleTimer.current = null
     }
+    historySearchLastLoadStartedAt.current = null
     historySearchAbortController.current?.abort()
     historySearchAbortController.current = null
     historySearchLoadingRef.current = false
     historySearchInFlightCursor.current = null
     loadedSearchCursors.current.clear()
+    if (searchOnlyThreadIds.current.size > 0) {
+      const searchOnly = searchOnlyThreadIds.current
+      const normal = new Set(historyThreadIdsRef.current)
+      const retained = pruneSearchOnlyConversations(
+        latestWorkspace.current,
+        searchOnly,
+        normal,
+      )
+      searchOnlyThreadIds.current = retained.retainedSearchOnlyThreadIds
+      setWorkspace((state) => pruneSearchOnlyConversations(
+        state,
+        searchOnly,
+        normal,
+      ).state)
+    }
     setSearchThreadIds([])
     setSearchCursor(null)
     setSearchLoadError(null)
@@ -357,7 +385,7 @@ export function useWorkspaceHistory({
   }, [refreshHistoryList])
 
   const loadMoreNormalHistory = useCallback((isExplicitRetry = false) => {
-    if (historyLoadingRef.current || historyLoadTimer.current != null) return
+    if (historyLoadingRef.current || historyLoadThrottleTimer.current != null) return
     if (historyLoadError && !isExplicitRetry) return
     const cursor = historyCursor
     if (!cursor || loadedHistoryCursors.current.has(cursor)) return
@@ -365,8 +393,9 @@ export function useWorkspaceHistory({
     historyInFlightCursor.current = cursor
     setHistoryLoadingMore(true)
     setHistoryLoadError(null)
-    historyLoadTimer.current = window.setTimeout(() => {
-      historyLoadTimer.current = null
+    const startRequest = () => {
+      historyLoadThrottleTimer.current = null
+      historyLastLoadStartedAt.current = Date.now()
       const controller = new AbortController()
       historyAbortController.current = controller
       void fetchConversationHistoryList({
@@ -396,6 +425,11 @@ export function useWorkspaceHistory({
         }))
       }).catch(() => {
         if (!controller.signal.aborted && historyInFlightCursor.current === cursor) {
+          // 错误一旦对用户可见，重试所有权必须同时释放，不能留下不可观察的忙碌窗口
+          historyAbortController.current = null
+          historyInFlightCursor.current = null
+          historyLoadingRef.current = false
+          setHistoryLoadingMore(false)
           setHistoryLoadError(t('历史记录加载失败'))
         }
       }).finally(() => {
@@ -405,11 +439,17 @@ export function useWorkspaceHistory({
         historyLoadingRef.current = false
         if (!controller.signal.aborted) setHistoryLoadingMore(false)
       })
-    }, HISTORY_LOAD_DEBOUNCE_MS)
+    }
+    const delay = getHistoryLoadThrottleDelay(historyLastLoadStartedAt.current)
+    if (delay === 0) startRequest()
+    else historyLoadThrottleTimer.current = window.setTimeout(startRequest, delay)
   }, [defaultModelId, historyCursor, historyLoadError, setWorkspace, t])
 
   const loadMoreSearchHistory = useCallback((isExplicitRetry = false) => {
-    if (historySearchLoadingRef.current || historySearchLoadTimer.current != null) return
+    if (
+      historySearchLoadingRef.current
+      || historySearchLoadThrottleTimer.current != null
+    ) return
     if (searchLoadError && !isExplicitRetry) return
     const cursor = searchCursor
     const query = normalizedHistoryQuery
@@ -422,8 +462,9 @@ export function useWorkspaceHistory({
     historySearchInFlightCursor.current = cursor
     setSearchLoadingMore(true)
     setSearchLoadError(null)
-    historySearchLoadTimer.current = window.setTimeout(() => {
-      historySearchLoadTimer.current = null
+    const startRequest = () => {
+      historySearchLoadThrottleTimer.current = null
+      historySearchLastLoadStartedAt.current = Date.now()
       const controller = new AbortController()
       historySearchAbortController.current = controller
       void fetchConversationHistoryList({
@@ -461,7 +502,13 @@ export function useWorkspaceHistory({
           !controller.signal.aborted
           && historySearchInFlightCursor.current === cursor
           && normalizedHistoryQueryRef.current === query
-        ) setSearchLoadError(t('搜索会话失败'))
+        ) {
+          historySearchAbortController.current = null
+          historySearchInFlightCursor.current = null
+          historySearchLoadingRef.current = false
+          setSearchLoadingMore(false)
+          setSearchLoadError(t('搜索会话失败'))
+        }
       }).finally(() => {
         if (historySearchInFlightCursor.current !== cursor) return
         historySearchAbortController.current = null
@@ -469,7 +516,10 @@ export function useWorkspaceHistory({
         historySearchLoadingRef.current = false
         if (!controller.signal.aborted) setSearchLoadingMore(false)
       })
-    }, HISTORY_LOAD_DEBOUNCE_MS)
+    }
+    const delay = getHistoryLoadThrottleDelay(historySearchLastLoadStartedAt.current)
+    if (delay === 0) startRequest()
+    else historySearchLoadThrottleTimer.current = window.setTimeout(startRequest, delay)
   }, [defaultModelId, normalizedHistoryQuery, searchCursor, searchLoadError, setWorkspace, t])
 
   const loadMoreHistory = useCallback((isExplicitRetry = false) => {
@@ -593,9 +643,13 @@ export function useWorkspaceHistory({
   }, [hydrateConversation, selectedConversation, workspace.currentThreadId])
 
   useEffect(() => () => {
-    if (historyLoadTimer.current != null) window.clearTimeout(historyLoadTimer.current)
+    if (historyLoadThrottleTimer.current != null) {
+      window.clearTimeout(historyLoadThrottleTimer.current)
+    }
     if (historySearchDebounceTimer.current != null) window.clearTimeout(historySearchDebounceTimer.current)
-    if (historySearchLoadTimer.current != null) window.clearTimeout(historySearchLoadTimer.current)
+    if (historySearchLoadThrottleTimer.current != null) {
+      window.clearTimeout(historySearchLoadThrottleTimer.current)
+    }
     historyAbortController.current?.abort()
     historySearchAbortController.current?.abort()
     historyBootstrapAbortController.current?.abort()

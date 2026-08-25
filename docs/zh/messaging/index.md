@@ -85,6 +85,8 @@ async with Messaging(backend=backend) as messaging:
     await serve_application(channel)
 ```
 
+关闭时会先通知当前生产者，再等待取消 preflight、producer settlement 和清理完成。
+
 ## 下一步
 
 - [投递、回放和 SSE](delivery-and-replay.md)

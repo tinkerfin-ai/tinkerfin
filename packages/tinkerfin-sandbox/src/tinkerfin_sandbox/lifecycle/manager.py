@@ -100,6 +100,10 @@ class OpenSandboxManager(Generic[KeyT]):
         resolved_warm_size = (
             client.config.warm_pool_size if warm_pool_size is None else warm_pool_size
         )
+        if isinstance(resolved_warm_size, bool) or not isinstance(
+            resolved_warm_size, int
+        ):
+            raise TypeError("warm_pool_size must be an integer or None")
         if resolved_warm_size < 0:
             raise ValueError("warm_pool_size must not be negative")
         if not callable(key_resolver):

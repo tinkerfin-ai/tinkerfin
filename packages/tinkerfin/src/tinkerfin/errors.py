@@ -17,8 +17,10 @@ class TinkerFinErrorCode(StrEnum):
     LIFECYCLE_ERROR = "tinkerfin.lifecycle_error"
     STREAM_PROTOCOL_ERROR = "tinkerfin.stream_protocol_error"
     PLAN_MODE_CONFIGURATION = "tinkerfin.plan_mode_configuration"
+    PLAN_STATE_CONFLICT = "tinkerfin.plan_state_conflict"
     PLAN_STRUCTURED_OUTPUT = "tinkerfin.plan_structured_output"
     AGUI_NATIVE_STREAM_CONFIGURATION = "tinkerfin.agui_native_stream_configuration"
+    AGUI_RESUME_BINDING_INVALID = "tinkerfin.agui_resume_binding_invalid"
     AGUI_SETTLEMENT_TIMEOUT = "tinkerfin.agui_settlement_timeout"
     RUN_COORDINATION_FAILED = "tinkerfin.run_coordination_failed"
     RUN_COORDINATION_UNAVAILABLE = "tinkerfin.run_coordination_unavailable"
@@ -56,6 +58,8 @@ class TinkerFinError(Exception):
         diagnostic_context: Mapping[str, _ContextValue] | None = None,
         cause: BaseException | None = None,
     ) -> None:
+        """Initialize client-safe context and trusted diagnostic evidence."""
+
         self.message = message
         self.context: Mapping[str, _ContextValue] = MappingProxyType(
             dict(context or {})
@@ -87,12 +91,20 @@ class AgUiNativeStreamConfigurationError(TinkerFinError, ValueError):
     code = TinkerFinErrorCode.AGUI_NATIVE_STREAM_CONFIGURATION
 
 
+class AgUiResumeBindingError(TinkerFinError, ValueError):
+    """Trusted AG-UI resume facts cannot form a lossless Runtime binding."""
+
+    code = TinkerFinErrorCode.AGUI_RESUME_BINDING_INVALID
+
+
 class AgUiSettlementTimeoutError(TinkerFinError, TimeoutError):
     """The caller stopped waiting while AG-UI close settlement remains owned."""
 
     code = TinkerFinErrorCode.AGUI_SETTLEMENT_TIMEOUT
 
     def __init__(self, *, timeout: float) -> None:
+        """Initialize a timeout failure with its caller wait budget."""
+
         self.timeout = timeout
         super().__init__(
             f"AG-UI settlement timed out after {timeout:g} seconds",
@@ -156,6 +168,7 @@ class RedisLeaseLifecycleError(RedisLeaseError):
 
 __all__ = [
     "AgUiNativeStreamConfigurationError",
+    "AgUiResumeBindingError",
     "AgUiSettlementTimeoutError",
     "RedisLeaseError",
     "RedisLeaseLifecycleError",

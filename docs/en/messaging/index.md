@@ -68,6 +68,8 @@ The same Identity always means the same semantic run. Reuse it for retries and a
 | `0` | Replay from the first retained message |
 | `N` | Return messages where `seq > N` |
 
+Negative cursors and cursors beyond the current generation tail raise `InvalidCursor`.
+
 ## Application lifecycle
 
 ```python
@@ -76,7 +78,8 @@ async with Messaging(backend=backend) as messaging:
     await serve_application(channel)
 ```
 
-Closing waits for owned producer settlement and cleanup.
+Closing signals current producers before waiting for cancellation preflights, then waits
+for owned producer settlement and cleanup.
 
 ## Next steps
 

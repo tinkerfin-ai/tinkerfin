@@ -363,7 +363,7 @@ describe('shared HTTP client', () => {
     }))
 
     await expect(requestJson('/api/user/7', { requiresAuth: false })).rejects.toMatchObject({
-      message: '网络请求失败，请稍后重试。',
+      message: '网络请求失败，请稍后重试',
       status: 0,
     })
     expect(listener).toHaveBeenCalledOnce()
@@ -380,7 +380,7 @@ describe('shared HTTP client', () => {
     )))
 
     await expect(requestJson('/api/user/7', { requiresAuth: false })).rejects.toMatchObject({
-      message: '服务暂不可用，请稍后重试。',
+      message: '服务暂不可用，请稍后重试',
       code: 502,
       status: 502,
     })
@@ -401,7 +401,7 @@ describe('shared HTTP client', () => {
     await expect(requestEventStream('/api/conversation/chat', {
       requiresAuth: false,
     })).rejects.toMatchObject({
-      message: '服务暂不可用，请稍后重试。',
+      message: '服务暂不可用，请稍后重试',
       code: 502,
       status: 502,
     })

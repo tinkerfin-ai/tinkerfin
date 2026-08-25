@@ -2,13 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
+import logging
+import os
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from typing import Any, TypedDict, cast
+from uuid import uuid4
 
 import pytest
-from ag_ui.core import BaseEvent, RunErrorEvent, RunFinishedEvent, StateSnapshotEvent
+from ag_ui.core import (
+    BaseEvent,
+    RunErrorEvent,
+    RunFinishedEvent,
+    StateDeltaEvent,
+    StateSnapshotEvent,
+)
 from ag_ui.core.types import ResumeEntry
 from deepagents import create_deep_agent
 from deepagents.backends import StoreBackend
@@ -16,6 +26,7 @@ from deepagents.backends.utils import create_file_data
 from deepagents.graph import DeepAgentState
 from langchain.agents.middleware import TodoListMiddleware
 from langchain.agents.middleware.model_call_limit import ModelCallLimitExceededError
+from langchain.agents.middleware.types import AgentMiddleware, AgentState
 from langchain.tools import tool
 from langchain_core.callbacks.manager import CallbackManagerForLLMRun
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
@@ -31,13 +42,17 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.runnables.base import Runnable
 from langchain_core.tools import BaseTool
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.redis.aio import AsyncRedisSaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+from langgraph.runtime import Runtime
 from langgraph.store.memory import InMemoryStore
-from langgraph.types import Command, Interrupt
+from langgraph.types import Command, Interrupt, interrupt
 from pydantic import Field, PrivateAttr, ValidationError, field_serializer
+from redis.asyncio import Redis
+from redis.exceptions import ResponseError
 
 import tinkerfin.plan as plan_api
-from tinkerfin import AgUiResumeBinding, Identity, TinkerFin
+from tinkerfin import AgUiResumeBinding, AgUiResumeCheckpoint, Identity, TinkerFin
 from tinkerfin.plan import (
     ClarificationForm,
     ClarificationFormBase,
@@ -48,6 +63,7 @@ from tinkerfin.plan import (
     MarkdownPlanContent,
     PlanContentModel,
     PlanDraft,
+    PlanHandoffPhase,
     PlanModeConfigurationError,
     PlanSchemaReference,
     PlanState,
@@ -56,7 +72,12 @@ from tinkerfin.plan import (
     StructuredPlanContent,
     StructuredPlanStep,
 )
-from tinkerfin_agui_adapter import ResumeMapper, ScopedIdCodec
+from tinkerfin.plan._workflow import PlanningWorkflowGraph
+from tinkerfin_agui_adapter import (
+    ResumeMapper,
+    RuntimeInterruptEnvelope,
+    ScopedIdCodec,
+)
 
 
 class _FakeModel(FakeMessagesListChatModel):
@@ -531,21 +552,24 @@ async def _agui_events(
     *,
     run_id: str,
     config: Mapping[str, object],
+    thread_id: str = "plan-thread",
     mode: str | None = None,
     resume: AgUiResumeBinding | None = None,
+    parent_run_id: str | None = None,
 ) -> list[BaseEvent]:
+    identity = _identity(run_id, thread_id=thread_id)
     runtime = cast(Any, definition).new_agui(
-        identity=_identity(run_id),
+        identity=identity,
+        parent_run_id=parent_run_id,
         mode=mode,
         resume=resume,
     )
-    return [
-        event
-        async for event in runtime.astream(
-            graph_input,
-            config=config,
-        )
-    ]
+    stream = (
+        runtime.astream(config=config)
+        if resume is not None
+        else runtime.astream(graph_input, config=config)
+    )
+    return [event async for event in stream]
 
 
 def _root_values(parts: Sequence[Mapping[str, object]]) -> list[Mapping[str, object]]:
@@ -584,18 +608,13 @@ def _resume_entry(interrupt_id: str, payload: Mapping[str, object]) -> ResumeEnt
 def _plan_binding(
     terminal: RunFinishedEvent,
     *,
-    run_id: str,
     payload: Mapping[str, object],
 ) -> AgUiResumeBinding:
     assert terminal.outcome is not None and terminal.outcome.type == "interrupt"
     interrupt = terminal.outcome.interrupts[0]
-    translation = ResumeMapper().map_agui(
+    return AgUiResumeBinding.from_agui(
         entries=(_resume_entry(interrupt.id, payload),),
         interrupts=terminal.outcome.interrupts,
-    )
-    return AgUiResumeBinding.from_translation(
-        identity=_identity(run_id),
-        translation=translation,
     )
 
 
@@ -631,10 +650,12 @@ def test_plan_package_exports_only_the_v1_contract() -> None:
         "PlanContentModel",
         "PlanDraft",
         "PlanHandoff",
+        "PlanHandoffPhase",
         "PlanModeConfigurationError",
         "PlanReviewAction",
         "PlanSchemaReference",
         "PlanState",
+        "PlanStateConflictError",
         "PlanStatus",
         "PlanStructuredOutputError",
         "RequirementAnswer",
@@ -1019,7 +1040,7 @@ async def test_planner_creates_review_without_a_deep_agent_parent_graph() -> Non
     )
     interrupt = _root_interrupts(parts)[0]
     plan = _structured_plan_state(_root_values(parts)[-1]["tinkerfin_plan"])
-    assert interrupt.value["kind"] == "plan_review"
+    assert interrupt.value["kind"] == "tinkerfin:plan_review"
     review = interrupt.value["metadata"]["review"]
     assert review["schema"] == "tinkerfin.plan-review.v1"
     assert review["draft"]["revision"] == 1
@@ -1171,7 +1192,7 @@ async def test_planner_retries_one_provider_invalid_json_tool_call() -> None:
         config={"configurable": {"thread_id": "plan-thread"}},
         mode="plan",
     )
-    assert _root_interrupts(parts)[0].value["kind"] == "plan_review"
+    assert _root_interrupts(parts)[0].value["kind"] == "tinkerfin:plan_review"
     assert len(model.model_inputs) == 2
     assert any(
         isinstance(message, HumanMessage)
@@ -1233,7 +1254,100 @@ async def test_plan_approval_hands_off_to_native_with_the_same_message_id() -> N
         "execute_deep_agent:" not in "|".join(cast(tuple[str, ...], part["ns"]))
         for part in completed
     )
-    assert _root_interrupts(first)[0].value["kind"] == "plan_review"
+    assert _root_interrupts(first)[0].value["kind"] == "tinkerfin:plan_review"
+
+
+@pytest.mark.asyncio
+@pytest.mark.redis_e2e
+async def test_real_redis_plan_approval_executes_native_handoff() -> None:
+    redis_url = os.getenv("TINKERFIN_TEST_REDIS_URL")
+    if not redis_url:
+        pytest.skip("real Redis configuration is missing: TINKERFIN_TEST_REDIS_URL")
+
+    token = uuid4().hex
+    thread_id = f"tinkerfin-plan-handoff-{token}"
+    checkpoint_prefix = f"tinkerfin:test:plan:{token}:checkpoint"
+    write_prefix = f"tinkerfin:test:plan:{token}:write"
+    client = Redis.from_url(
+        redis_url,
+        decode_responses=False,
+        socket_connect_timeout=5,
+        socket_timeout=5,
+    )
+    saver = AsyncRedisSaver(
+        redis_client=client,
+        checkpoint_prefix=checkpoint_prefix,
+        checkpoint_write_prefix=write_prefix,
+    )
+    try:
+        await saver.asetup()
+        model = _FakeModel(responses=[_planner(), AIMessage(content="native done")])
+        definition = (
+            TinkerFin()
+            .plan(enabled=True)
+            .create_deep_agent(model=model, tools=[], checkpointer=saver)
+        )
+        config = {"configurable": {"thread_id": thread_id}}
+        review = await _agui_events(
+            definition,
+            {"messages": [HumanMessage(content="Implement", id="request-redis")]},
+            run_id="redis-review",
+            config=config,
+            thread_id=thread_id,
+            mode="plan",
+        )
+        binding = _plan_binding(
+            _terminal(review),
+            payload={"type": "approve", "baseRevision": 1},
+        )
+        completed = await _agui_events(
+            definition,
+            None,
+            run_id="redis-execution",
+            config=config,
+            thread_id=thread_id,
+            mode="default",
+            resume=binding,
+        )
+
+        assert _terminal(completed).outcome.type == "success"
+        assert len(model.model_inputs) == 2
+        assert any(
+            getattr(event, "delta", None) == "native done" for event in completed
+        )
+        execution_input = model.model_inputs[-1]
+        assert any(
+            isinstance(message, HumanMessage)
+            and message.id == "request-redis"
+            and "<tinkerfin-approved-plan" in str(message.content)
+            for message in execution_input
+        )
+    finally:
+        try:
+            await saver.adelete_thread(thread_id)
+        finally:
+            registry_keys = [
+                key
+                async for key in client.scan_iter(
+                    match=f"write_keys_zset:{thread_id}:*",
+                    count=100,
+                )
+            ]
+            latest_keys = [
+                key
+                async for key in client.scan_iter(
+                    match=f"{checkpoint_prefix}_latest:{thread_id}:*",
+                    count=100,
+                )
+            ]
+            if registry_keys or latest_keys:
+                await client.unlink(*registry_keys, *latest_keys)
+            for index_name in (checkpoint_prefix, write_prefix):
+                try:
+                    await client.execute_command("FT.DROPINDEX", index_name, "DD")
+                except ResponseError:
+                    pass
+            await client.aclose()
 
 
 @pytest.mark.asyncio
@@ -1278,6 +1392,300 @@ async def test_duplicate_plan_approval_does_not_execute_native_twice() -> None:
         _structured_plan_state(_root_values(duplicate)[0]["tinkerfin_plan"]).status
         is PlanStatus.APPROVED
     )
+
+
+@pytest.mark.asyncio
+async def test_plan_handoff_recovers_after_native_checkpoint_precedes_plan_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retry must continue a durably accepted handoff without losing execution."""
+
+    model = _FakeModel(responses=[_planner(), AIMessage(content="native done")])
+    definition = (
+        TinkerFin()
+        .plan(enabled=True)
+        .create_deep_agent(
+            model=model,
+            tools=[],
+            checkpointer=InMemorySaver(),
+        )
+    )
+    config = {"configurable": {"thread_id": "plan-thread"}}
+    await _parts(
+        definition,
+        {"messages": [HumanMessage(content="Implement", id="message")]},
+        run_id="handoff-crash-1",
+        config=config,
+        mode="plan",
+    )
+    original = PlanningWorkflowGraph.mark_handoff_phase
+
+    async def cancel_after_native_checkpoint(
+        self: PlanningWorkflowGraph[Any],
+        *args: object,
+        **kwargs: object,
+    ) -> PlanState[PlanContentModel]:
+        phase = kwargs.get("phase")
+        if phase is PlanHandoffPhase.ACCEPTED:
+            raise asyncio.CancelledError
+        return await original(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        PlanningWorkflowGraph,
+        "mark_handoff_phase",
+        cancel_after_native_checkpoint,
+    )
+    command = Command(resume={"type": "approve", "baseRevision": 1})
+    with pytest.raises(asyncio.CancelledError):
+        await _parts(
+            definition,
+            command,
+            run_id="handoff-crash-2",
+            config=config,
+            mode="default",
+        )
+    monkeypatch.setattr(PlanningWorkflowGraph, "mark_handoff_phase", original)
+
+    retry = await _parts(
+        definition,
+        command,
+        run_id="handoff-crash-3",
+        config=config,
+        mode="default",
+    )
+    final = _structured_plan_state(_root_values(retry)[-1]["tinkerfin_plan"])
+    assert len(model.model_inputs) == 2
+    assert final.handoff is not None
+    assert final.handoff.phase is PlanHandoffPhase.COMPLETED
+    assert any("native done" in str(part.get("data")) for part in retry)
+
+
+@pytest.mark.asyncio
+async def test_agui_plan_resume_checkpoints_durably_and_retries_without_reexecution() -> (
+    None
+):
+    model = _FakeModel(responses=[_planner(), AIMessage(content="native done")])
+    definition = (
+        TinkerFin()
+        .plan(enabled=True)
+        .create_deep_agent(
+            model=model,
+            tools=[],
+            checkpointer=InMemorySaver(),
+        )
+    )
+    config = {"configurable": {"thread_id": "plan-thread"}}
+    review = await _agui_events(
+        definition,
+        {"messages": [HumanMessage(content="Implement", id="message")]},
+        run_id="settlement-review",
+        config=config,
+        mode="plan",
+    )
+    terminal = _terminal(review)
+    payload = {"type": "approve", "baseRevision": 1}
+    binding = _plan_binding(
+        terminal,
+        payload=payload,
+    )
+    identity = _identity("settlement-execution")
+    checkpoints: list[AgUiResumeCheckpoint] = []
+
+    async def checkpointed(value: AgUiResumeCheckpoint) -> None:
+        checkpoints.append(value)
+
+    runtime = cast(Any, definition).new_agui(
+        identity=identity,
+        mode="default",
+        resume=binding,
+        on_resume_checkpointed=checkpointed,
+    )
+    events = [
+        event
+        async for event in runtime.astream(
+            config=config,
+        )
+    ]
+    calls = len(model.model_inputs)
+
+    assert _terminal(events).outcome.type == "success"
+    assert len(checkpoints) == 1
+    assert all(
+        "_tinkerfin_resume" not in event.snapshot
+        and "_tinkerfin_lineage" not in event.snapshot
+        for event in events
+        if isinstance(event, StateSnapshotEvent)
+    )
+
+    retry = cast(Any, definition).new_agui(
+        identity=identity,
+        mode="default",
+        resume=binding,
+        on_resume_checkpointed=checkpointed,
+    )
+    retried = [
+        event
+        async for event in retry.astream(
+            config=config,
+        )
+    ]
+
+    assert _terminal(retried).outcome.type == "success"
+    assert len(model.model_inputs) == calls
+    assert len(checkpoints) == 2
+    assert checkpoints[0] == checkpoints[1]
+
+
+@pytest.mark.asyncio
+async def test_plan_capable_runtime_routes_plan_shaped_generic_resume_to_native() -> (
+    None
+):
+    resumed_payloads: list[object] = []
+    envelope = RuntimeInterruptEnvelope(
+        kind="vendor:approval",
+        message="Review vendor action",
+        response_schema={
+            "type": "object",
+            "properties": {
+                "type": {"const": "approve"},
+                "baseRevision": {"type": "integer"},
+                "vendor": {"type": "string"},
+            },
+            "required": ["type", "baseRevision", "vendor"],
+            "additionalProperties": False,
+        },
+        metadata={"source": "generic-native-fixture"},
+    )
+
+    class _GenericNativeInterrupt(AgentMiddleware):
+        def after_model(
+            self,
+            state: AgentState[Any],
+            runtime: Runtime[None],
+        ) -> dict[str, object] | None:
+            del state, runtime
+            resumed_payloads.append(
+                interrupt(
+                    envelope.model_dump(
+                        mode="json",
+                        by_alias=True,
+                        exclude_none=False,
+                    )
+                )
+            )
+            return None
+
+    definition = (
+        TinkerFin()
+        .plan(enabled=True)
+        .create_deep_agent(
+            model=_FakeModel(responses=[AIMessage(content="native done")]),
+            tools=[],
+            middleware=(_GenericNativeInterrupt(),),
+            checkpointer=InMemorySaver(),
+        )
+    )
+    config = {"configurable": {"thread_id": "plan-thread"}}
+    review = await _agui_events(
+        definition,
+        {"messages": [HumanMessage(content="Run native", id="message")]},
+        run_id="generic-review",
+        config=config,
+        mode="default",
+    )
+    terminal = _terminal(review)
+    assert terminal.outcome.type == "interrupt"
+    public_interrupt = terminal.outcome.interrupts[0]
+    payload = {"type": "approve", "baseRevision": 999, "vendor": "native"}
+    entry = _resume_entry(public_interrupt.id, payload)
+    translation = ResumeMapper().map_agui(
+        entries=(entry,),
+        interrupts=(public_interrupt,),
+    )
+    assert translation.kind == "runtime"
+    identity = _identity("generic-resume")
+    binding = AgUiResumeBinding.from_agui(
+        entries=(entry,),
+        interrupts=(public_interrupt,),
+    )
+    runtime = cast(Any, definition).new_agui(
+        identity=identity,
+        mode="plan",
+        resume=binding,
+    )
+    resumed = [
+        event
+        async for event in runtime.astream(
+            config=config,
+        )
+    ]
+
+    assert _terminal(resumed).outcome.type == "success"
+    assert resumed_payloads == [payload]
+
+
+@pytest.mark.asyncio
+async def test_parent_run_id_branches_from_completed_plan_lineage() -> None:
+    model = _FakeModel(
+        responses=[
+            _planner(),
+            AIMessage(content="planned execution"),
+            AIMessage(content="head continuation"),
+            AIMessage(content="branched continuation"),
+        ]
+    )
+    definition = (
+        TinkerFin()
+        .plan(enabled=True)
+        .create_deep_agent(
+            model=model,
+            tools=[],
+            checkpointer=InMemorySaver(),
+        )
+    )
+    config = {"configurable": {"thread_id": "plan-thread"}}
+    review = await _agui_events(
+        definition,
+        {"messages": [HumanMessage(content="Plan", id="plan-user")]},
+        run_id="plan-lineage-review",
+        config=config,
+        mode="plan",
+    )
+    binding = _plan_binding(
+        _terminal(review),
+        payload={"type": "approve", "baseRevision": 1},
+    )
+    await _agui_events(
+        definition,
+        None,
+        run_id="plan-lineage-execution",
+        config=config,
+        mode="default",
+        resume=binding,
+    )
+    await _agui_events(
+        definition,
+        {"messages": [HumanMessage(content="Head", id="head-user")]},
+        run_id="plan-lineage-head",
+        config=config,
+        mode="default",
+    )
+    branched = await _agui_events(
+        definition,
+        {"messages": [HumanMessage(content="Branch", id="branch-user")]},
+        run_id="plan-lineage-branch",
+        parent_run_id="plan-lineage-execution",
+        config=config,
+        mode="default",
+    )
+
+    assert _terminal(branched).outcome.type == "success"
+    latest_input = model.model_inputs[-1]
+    human_ids = {
+        message.id for message in latest_input if isinstance(message, HumanMessage)
+    }
+    assert "branch-user" in human_ids
+    assert "head-user" not in human_ids
 
 
 @pytest.mark.asyncio
@@ -1366,12 +1774,11 @@ async def test_plan_default_plan_with_todos_regresses_historical_correlation_fai
     )
     binding = _plan_binding(
         _terminal(review),
-        run_id="first-execution",
         payload={"type": "approve", "baseRevision": 1},
     )
     executed = await _agui_events(
         definition,
-        binding.command,
+        None,
         run_id="first-execution",
         config=config,
         mode="default",
@@ -1397,7 +1804,7 @@ async def test_plan_default_plan_with_todos_regresses_historical_correlation_fai
     assert executed_outcome is not None and executed_outcome.type == "success"
     assert default_outcome is not None and default_outcome.type == "success"
     assert second_outcome is not None and second_outcome.type == "interrupt"
-    assert second_outcome.interrupts[0].reason == "plan_review"
+    assert second_outcome.interrupts[0].reason == "tinkerfin:plan_review"
     assert not any(isinstance(event, RunErrorEvent) for event in second)
 
 
@@ -1463,7 +1870,7 @@ async def test_multiple_clarification_rounds_do_not_increment_revision() -> None
     plan3 = _structured_plan_state(_root_values(third)[-1]["tinkerfin_plan"])
     assert plan3.revision == 1
     assert len(plan3.clarification_history) == 2
-    assert _root_interrupts(third)[0].value["kind"] == "plan_review"
+    assert _root_interrupts(third)[0].value["kind"] == "tinkerfin:plan_review"
 
 
 @pytest.mark.asyncio
@@ -1490,7 +1897,7 @@ async def test_four_question_clarification_round_trips_in_one_batch() -> None:
     assert {part["type"] for part in first} == {"messages", "tasks", "values"}
     interrupts = _root_interrupts(first)
     assert len(interrupts) == 1
-    assert interrupts[0].value["kind"] == "plan_clarification"
+    assert interrupts[0].value["kind"] == "tinkerfin:plan_clarification"
     metadata = interrupts[0].value["metadata"]
     form = metadata["clarification"]["form"]
     assert [question["id"] for question in form["questions"]] == [
@@ -1543,7 +1950,7 @@ async def test_four_question_clarification_round_trips_in_one_batch() -> None:
     )
     review_interrupts = _root_interrupts(second)
     assert len(review_interrupts) == 1
-    assert review_interrupts[0].value["kind"] == "plan_review"
+    assert review_interrupts[0].value["kind"] == "tinkerfin:plan_review"
 
 
 @pytest.mark.asyncio
@@ -1570,7 +1977,7 @@ async def test_agui_preserves_every_question_in_a_large_clarification_form() -> 
     assert terminal.outcome is not None and terminal.outcome.type == "interrupt"
     assert len(terminal.outcome.interrupts) == 1
     interrupt = terminal.outcome.interrupts[0]
-    assert interrupt.reason == "plan_clarification"
+    assert interrupt.reason == "tinkerfin:plan_clarification"
     metadata = cast(dict[str, Any], interrupt.metadata)
     runtime_interrupt = cast(dict[str, Any], metadata["runtimeInterrupt"])
     envelope = cast(dict[str, Any], runtime_interrupt["envelope"])
@@ -2095,12 +2502,11 @@ async def test_plan_handoff_tool_interrupt_resumes_as_native_default() -> None:
     )
     plan_binding = _plan_binding(
         _terminal(review),
-        run_id="tool-execution",
         payload={"type": "approve", "baseRevision": 1},
     )
     interrupted = await _agui_events(
         definition,
-        plan_binding.command,
+        None,
         run_id="tool-execution",
         config=config,
         mode="default",
@@ -2114,17 +2520,13 @@ async def test_plan_handoff_tool_interrupt_resumes_as_native_default() -> None:
     assert tool_interrupt.tool_call_id is not None
     kind, namespace, raw_id = ScopedIdCodec().decode(tool_interrupt.tool_call_id)
     assert (kind, namespace, raw_id) == ("tool", (), "approved-call")
-    translation = ResumeMapper().map_agui(
+    resume_binding = AgUiResumeBinding.from_agui(
         entries=(_resume_entry(tool_interrupt.id, {"type": "approve"}),),
         interrupts=tool_outcome.interrupts,
     )
-    resume_binding = AgUiResumeBinding.from_translation(
-        identity=_identity("tool-resume"),
-        translation=translation,
-    )
     completed = await _agui_events(
         definition,
-        resume_binding.command,
+        None,
         run_id="tool-resume",
         config=config,
         mode="default",
@@ -2137,11 +2539,102 @@ async def test_plan_handoff_tool_interrupt_resumes_as_native_default() -> None:
     ]
     assert completed_snapshots
     resumed_plan = _structured_plan_state(
-        completed_snapshots[0].snapshot["tinkerfin_plan"]
+        completed_snapshots[-1].snapshot["tinkerfin_plan"]
     )
     assert resumed_plan.status is PlanStatus.APPROVED
     assert resumed_plan.effective_mode == "default"
-    assert resumed_plan.handoff is not None and resumed_plan.handoff.dispatched
+    assert resumed_plan.handoff is not None
+    assert resumed_plan.handoff.phase is PlanHandoffPhase.ACCEPTED
+    assert any(
+        operation.get("path", "").endswith("/handoff/phase")
+        and operation.get("value") == PlanHandoffPhase.COMPLETED.value
+        for event in completed
+        if isinstance(event, StateDeltaEvent)
+        for operation in event.delta
+    )
+
+
+@pytest.mark.asyncio
+async def test_plan_enabled_default_subagent_resume_uses_only_the_native_head(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    model = _FakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "task",
+                        "args": {
+                            "description": "Run the reviewed child tool",
+                            "subagent_type": "general-purpose",
+                        },
+                        "id": "parent-task-call",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "approved_tool",
+                        "args": {"value": "child"},
+                        "id": "child-approved-call",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="child done"),
+            AIMessage(content="root done"),
+        ]
+    )
+    definition = (
+        TinkerFin()
+        .plan(enabled=True)
+        .create_deep_agent(
+            model=model,
+            tools=[approved_tool],
+            interrupt_on={"approved_tool": {"allowed_decisions": ["approve"]}},
+            checkpointer=InMemorySaver(),
+        )
+    )
+    thread_id = "plan-enabled-subagent-resume"
+    config = {"configurable": {"thread_id": thread_id}}
+    review = await _agui_events(
+        definition,
+        {"messages": [HumanMessage(content="Delegate", id="message")]},
+        run_id="subagent-review",
+        config=config,
+        thread_id=thread_id,
+        mode="default",
+    )
+    outcome = _terminal(review).outcome
+    assert outcome is not None and outcome.type == "interrupt"
+    interrupt = outcome.interrupts[0]
+    assert interrupt.tool_call_id is not None
+    assert ScopedIdCodec().decode(interrupt.tool_call_id)[1]
+    binding = AgUiResumeBinding.from_agui(
+        entries=(_resume_entry(interrupt.id, {"type": "approve"}),),
+        interrupts=outcome.interrupts,
+    )
+
+    caplog.clear()
+    caplog.set_level(logging.WARNING, logger="langgraph")
+    completed = await _agui_events(
+        definition,
+        None,
+        run_id="subagent-resume",
+        config=config,
+        thread_id=thread_id,
+        mode="default",
+        resume=binding,
+    )
+
+    assert _terminal(completed).outcome.type == "success"
+    assert not any(
+        "Ignoring unknown node name" in record.getMessage() for record in caplog.records
+    )
 
 
 @pytest.mark.asyncio

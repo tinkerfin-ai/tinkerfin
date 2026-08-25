@@ -1445,6 +1445,63 @@ class OpenSandboxClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(str(captured.exception.cause), "kill failed")
         self.assertTrue(sandbox.closed)
 
+    async def test_destroy_retains_kill_and_close_after_caller_cancellation(
+        self,
+    ) -> None:
+        sandbox = _FakeSandbox("existing")
+        kill_started = asyncio.Event()
+        kill_release = asyncio.Event()
+
+        async def delayed_kill() -> None:
+            kill_started.set()
+            await kill_release.wait()
+            sandbox.killed = True
+
+        sandbox.kill = delayed_kill
+        client = OpenSandboxClient(
+            connection_config=self.connection_config,
+            config=self.config,
+        )
+
+        with patch(
+            "tinkerfin_sandbox.lifecycle.client.Sandbox.connect",
+            return_value=sandbox,
+        ):
+            destroying = asyncio.create_task(client.destroy("existing"))
+            await asyncio.wait_for(kill_started.wait(), timeout=1)
+            destroying.cancel("caller stopped waiting")
+            await asyncio.sleep(0)
+            self.assertFalse(destroying.done())
+            kill_release.set()
+            with self.assertRaisesRegex(
+                asyncio.CancelledError,
+                "caller stopped waiting",
+            ):
+                await asyncio.wait_for(destroying, timeout=1)
+
+        self.assertTrue(sandbox.killed)
+        self.assertTrue(sandbox.closed)
+
+    async def test_destroy_logs_local_close_failure_after_confirmed_kill(self) -> None:
+        sandbox = _FakeSandbox("existing")
+        sandbox.close_error = RuntimeError("close failed")
+        client = OpenSandboxClient(
+            connection_config=self.connection_config,
+            config=self.config,
+        )
+
+        with (
+            patch(
+                "tinkerfin_sandbox.lifecycle.client.Sandbox.connect",
+                return_value=sandbox,
+            ),
+            self.assertLogs("tinkerfin_sandbox.lifecycle.client", level="WARNING"),
+        ):
+            await client.destroy("existing")
+
+        self.assertTrue(sandbox.killed)
+        self.assertTrue(sandbox.closed)
+
     async def test_destroy_treats_missing_remote_sandbox_as_already_deleted(
         self,
     ) -> None:

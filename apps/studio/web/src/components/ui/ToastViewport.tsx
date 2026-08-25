@@ -42,6 +42,8 @@ function ToastCard({
   const startedAtRef = useRef(0)
   const remainingRef = useRef(duration)
   const isDismissingRef = useRef(false)
+  const isPointerInsideRef = useRef(false)
+  const hasFocusWithinRef = useRef(false)
   const requestDismissRef = useRef<() => void>(() => undefined)
   const dismissRef = useRef(onDismiss)
   dismissRef.current = onDismiss
@@ -120,6 +122,25 @@ function ToastCard({
     }, remainingRef.current)
   }, [])
 
+  const pauseDismiss = useCallback(() => {
+    if (timerRef.current === null) return
+    remainingRef.current = Math.max(
+      0,
+      remainingRef.current - (Date.now() - startedAtRef.current),
+    )
+    clearTimer()
+  }, [clearTimer])
+
+  const resumeDismiss = useCallback(() => {
+    if (
+      isPointerInsideRef.current
+      || hasFocusWithinRef.current
+      || timerRef.current !== null
+      || isDismissingRef.current
+    ) return
+    scheduleDismiss()
+  }, [scheduleDismiss])
+
   useEffect(() => {
     isDismissingRef.current = false
     remainingRef.current = duration
@@ -135,12 +156,23 @@ function ToastCard({
       ref={cardRef}
       className={`toast-card is-${toast.kind}`}
       onMouseEnter={() => {
-        if (timerRef.current === null) return
-        remainingRef.current = Math.max(0, remainingRef.current - (Date.now() - startedAtRef.current))
-        clearTimer()
+        isPointerInsideRef.current = true
+        pauseDismiss()
       }}
       onMouseLeave={() => {
-        if (timerRef.current === null) scheduleDismiss()
+        isPointerInsideRef.current = false
+        resumeDismiss()
+      }}
+      onFocusCapture={() => {
+        hasFocusWithinRef.current = true
+        pauseDismiss()
+      }}
+      onBlurCapture={(event) => {
+        if (event.relatedTarget instanceof Node && event.currentTarget.contains(event.relatedTarget)) {
+          return
+        }
+        hasFocusWithinRef.current = false
+        resumeDismiss()
       }}
     >
       <span className="toast-icon" aria-hidden="true"><Icon size={16} /></span>

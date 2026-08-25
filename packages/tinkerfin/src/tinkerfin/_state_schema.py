@@ -7,7 +7,18 @@ from dataclasses import dataclass
 from typing import Any, NotRequired, Required, cast, get_origin, get_type_hints
 
 from deepagents.graph import DeepAgentState
+from pydantic import JsonValue
 from typing_extensions import TypedDict, is_typeddict
+
+from ._agui_lineage_state import LINEAGE_STATE_KEY
+from .agui_resume import RESUME_MARKER_STATE_KEY
+
+
+class TinkerFinRuntimeState(DeepAgentState, total=False):
+    """Deep Agent state with framework-owned durable lifecycle evidence."""
+
+    _tinkerfin_lineage: NotRequired[dict[str, JsonValue]]
+    _tinkerfin_resume: NotRequired[dict[str, JsonValue]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,15 +114,18 @@ def compose_deep_agent_base_schema(
     global_schema: type[DeepAgentState] | None,
     definition_schema: type[DeepAgentState] | None,
 ) -> type[DeepAgentState] | None:
-    """Merge global and Definition state while preserving the native fast path."""
+    """Merge framework, global, and Definition state without field precedence."""
 
-    if global_schema is None:
-        validate_state_schema(
-            definition_schema, source="create_deep_agent state_schema"
-        )
-        return definition_schema
-    sources = [StateSchemaSource("DeepAgentState", DeepAgentState)]
-    sources.append(StateSchemaSource("TinkerFin state_schema", global_schema))
+    if RESUME_MARKER_STATE_KEY not in TinkerFinRuntimeState.__annotations__:
+        raise RuntimeError("TinkerFin Runtime state lost its reserved resume channel")
+    if LINEAGE_STATE_KEY not in TinkerFinRuntimeState.__annotations__:
+        raise RuntimeError("TinkerFin Runtime state lost its reserved lineage channel")
+    sources = [
+        StateSchemaSource("DeepAgentState", DeepAgentState),
+        StateSchemaSource("TinkerFin Runtime state", TinkerFinRuntimeState),
+    ]
+    if global_schema is not None:
+        sources.append(StateSchemaSource("TinkerFin state_schema", global_schema))
     if definition_schema is not None:
         sources.append(
             StateSchemaSource("create_deep_agent state_schema", definition_schema)
@@ -147,6 +161,7 @@ def middleware_state_sources(
 __all__ = [
     "StateSchemaCompositionError",
     "StateSchemaSource",
+    "TinkerFinRuntimeState",
     "compose_deep_agent_base_schema",
     "compose_state_schema",
     "middleware_state_sources",

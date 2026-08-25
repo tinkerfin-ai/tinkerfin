@@ -16,6 +16,7 @@ from tinkerfin import (
     AgUiNativeStreamConfig,
     AgUiNativeStreamConfigurationError,
     AgUiNativeStreamInvocation,
+    AgUiResumeBindingError,
     AgUiSettlementTimeoutError,
     GraphRunStream,
     Identity,
@@ -48,8 +49,12 @@ def test_top_level_exposes_the_stateless_runtime_contract() -> None:
         "AgUiNativeStreamInvocation",
         "AgUiEventStream",
         "AgUiResumeBinding",
+        "AgUiResumeBindingError",
+        "AgUiResumeCheckpoint",
+        "AgUiResumeCheckpointObserver",
         "AgentMode",
         "DeepAgentAgUiRuntime",
+        "DeepAgentAgUiResumeRuntime",
         "DeepAgentDefinition",
         "DeepAgentRuntime",
         "EventObserver",
@@ -76,6 +81,7 @@ def test_top_level_exposes_the_stateless_runtime_contract() -> None:
         "SsePayload",
         "SsePreflight",
         "TinkerFin",
+        "TINKERFIN_HITL_CONTRACT",
         "TinkerFinError",
         "TinkerFinErrorCode",
         "TinkerFinLifecycleError",
@@ -90,6 +96,7 @@ def test_top_level_exposes_the_stateless_runtime_contract() -> None:
         for value in (
             AgUiNativeStreamConfig,
             AgUiNativeStreamConfigurationError,
+            AgUiResumeBindingError,
             AgUiNativeStreamInvocation,
             AgUiSettlementTimeoutError,
             AgUiEventStream,
@@ -138,6 +145,7 @@ def test_source_binding_keeps_graph_arguments_at_the_factory_call_site() -> None
         "prior_tool_call_ids",
         "private_state_keys",
         "on_event",
+        "parent_run_id",
     )
     assert not hasattr(TinkerFin, "run_agui")
     assert not hasattr(TinkerFinRun, "agui")

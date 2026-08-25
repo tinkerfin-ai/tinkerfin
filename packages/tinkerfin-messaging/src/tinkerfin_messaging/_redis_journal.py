@@ -37,6 +37,7 @@ from .errors import (
     CodecMismatch,
     InvalidCursor,
     MessageIdConflict,
+    MessagingQuotaExceeded,
     RunAlreadyActive,
     RunNotFound,
     RunProducerFailed,
@@ -102,6 +103,10 @@ async def prepare(
                 str(self._lease_ms),
                 channel,
                 identity.thread_id,
+                str(self._limits.max_message_payload_bytes),
+                str(self._limits.max_checkpoint_bytes),
+                str(self._limits.max_thread_messages),
+                str(self._limits.max_thread_payload_bytes),
             ],
         )
         code = self._text(response[0])
@@ -123,6 +128,10 @@ async def prepare(
             raise _redis_protocol_error(
                 f"Redis {record_kind} uses unsupported persistent schema version "
                 f"{schema_version!r}; expected {_PERSISTENT_SCHEMA_VERSION!r}"
+            )
+        if code == "LIMITS_MISMATCH":
+            raise _redis_protocol_error(
+                "Redis channel was opened with different MessagingLimits"
             )
         break
     if code == "INVALID_CURSOR":
@@ -196,6 +205,7 @@ async def append(
         codec=codec,
         payload=payload,
         checkpoint=checkpoint,
+        limits=self._limits,
     )
     generation = handle.generation
     if handle.owner_token is None or handle.fence is None or generation is None:
@@ -241,6 +251,8 @@ async def append(
             ""
             if checkpoint is None or checkpoint.last_message_id is None
             else checkpoint.last_message_id,
+            str(self._limits.max_thread_messages),
+            str(self._limits.max_thread_payload_bytes),
         ],
     )
     code = self._text(response[0])
@@ -259,6 +271,11 @@ async def append(
         raise MessageIdConflict(
             identity=handle.identity,
             message_id=message_id,
+        )
+    if code == "QUOTA_EXCEEDED":
+        raise MessagingQuotaExceeded(
+            resource=self._text(response[1]),
+            limit=int(self._text(response[2])),
         )
     if code not in {"APPENDED", "IDEMPOTENT"}:
         raise _redis_protocol_error(f"unexpected Redis append response: {code}")
@@ -321,22 +338,33 @@ async def read(
     while True:
         control = await self._read_control(scope)
         if control is None or control.state != "active":
+            if after > 0:
+                raise InvalidCursor(after=after, latest=0)
             return ()
         keys = self._keys(
             channel,
             identity,
             generation=control.generation,
         )
-        entries = await _redis_call(
-            "message read",
-            self._client.xrange(
-                keys.messages,
-                min=f"({after}-0",
-                max="+",
-                count=limit,
-            ),
+        latest_value = await _redis_call(
+            "message tail lookup",
+            self._client.hget(keys.meta, "seq"),
         )
+        latest = 0 if latest_value is None else int(self._text(latest_value))
+        entries = ()
+        if after <= latest:
+            entries = await _redis_call(
+                "message read",
+                self._client.xrange(
+                    keys.messages,
+                    min=f"({after}-0",
+                    max="+",
+                    count=limit,
+                ),
+            )
         if await self._is_current_generation(keys):
+            if after > latest:
+                raise InvalidCursor(after=after, latest=latest)
             return tuple(
                 self._decode_entry(channel, identity, entry)
                 for entry in cast(
@@ -351,35 +379,49 @@ async def bind_follow(
     *,
     channel: str,
     identity: Identity,
+    after: int,
 ) -> BackendRunHandle:
-    """Resolve one read-only follower to an authoritative Redis generation."""
+    """Resolve one follower and validate its cursor against one generation."""
 
     required_identifier("channel", channel)
     required_identity(identity)
-    unresolved = BackendRunHandle(
-        channel=channel,
-        identity=identity,
-        owner_token=None,
-        fence=None,
-    )
-    keys = await self._keys_for_handle(unresolved)
-    if not await _redis_call(
-        "run existence lookup",
-        self._client.exists(keys.run_key),
-    ):
+    if isinstance(after, bool) or not isinstance(after, int):
+        raise TypeError("after must be an integer")
+    if after < 0:
+        raise ValueError("after must be greater than or equal to zero")
+    scope = self._scope(channel, identity)
+    while True:
+        control = await self._read_control(scope)
+        if control is None or control.state != "active":
+            raise RunNotFound(identity=identity)
+        unresolved = BackendRunHandle(
+            channel=channel,
+            identity=identity,
+            owner_token=None,
+            fence=None,
+            generation=control.generation,
+        )
+        keys = self._keys(
+            channel,
+            identity,
+            generation=control.generation,
+        )
+        exists = await _redis_call(
+            "run existence lookup",
+            self._client.exists(keys.run_key),
+        )
+        latest_value = await _redis_call(
+            "message tail lookup",
+            self._client.hget(keys.meta, "seq"),
+        )
         if not await self._is_current_generation(keys):
-            self._raise_stream_deleted(
-                unresolved,
-                generation=keys.generation,
-            )
-        raise RunNotFound(identity=identity)
-    return BackendRunHandle(
-        channel=channel,
-        identity=identity,
-        owner_token=None,
-        fence=None,
-        generation=keys.generation,
-    )
+            continue
+        if not exists:
+            raise RunNotFound(identity=identity)
+        latest = 0 if latest_value is None else int(self._text(latest_value))
+        if after > latest:
+            raise InvalidCursor(after=after, latest=latest)
+        return unresolved
 
 
 def follow(

@@ -186,7 +186,89 @@ describe('conversation stream client', () => {
   it('reports malformed AG-UI data with a stable user-facing error', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => sseResponse('data: ping\n\n')))
 
-    await expect(consumeStream()).rejects.toThrow('事件流包含无法解析的数据')
+    await expect(consumeStream()).rejects.toMatchObject({
+      code: 'stream_data_invalid',
+    })
+  })
+
+  it('cancels the underlying stream after malformed data aborts consumption', async () => {
+    const cancel = vi.fn()
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('data: ping\n\n'))
+      },
+      cancel,
+    })
+    vi.stubGlobal('fetch', vi.fn(async () => sseResponse(body)))
+
+    await expect(consumeStream()).rejects.toMatchObject({
+      code: 'stream_data_invalid',
+    })
+    expect(cancel).toHaveBeenCalledOnce()
+    expect(cancel.mock.calls[0]?.[0]).toBeInstanceOf(Error)
+  })
+
+  it('cancels the underlying stream when the consumer returns before EOF', async () => {
+    const cancel = vi.fn()
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(
+          'data: {"type":"RUN_STARTED","threadId":"thread-conflict","runId":"run-conflict"}\n\n',
+        ))
+      },
+      cancel,
+    })
+    vi.stubGlobal('fetch', vi.fn(async () => sseResponse(body)))
+    const iterator = startConversationRun(requestPayload)[Symbol.asyncIterator]()
+
+    await expect(iterator.next()).resolves.toMatchObject({
+      done: false,
+      value: { event: { type: 'RUN_STARTED' } },
+    })
+    await iterator.return?.(undefined)
+
+    expect(cancel).toHaveBeenCalledOnce()
+  })
+
+  it('does not cancel the underlying stream after natural EOF', async () => {
+    const cancel = vi.fn()
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(
+          'data: {"type":"RUN_STARTED","threadId":"thread-conflict","runId":"run-conflict"}\n\n',
+        ))
+        controller.close()
+      },
+      cancel,
+    })
+    vi.stubGlobal('fetch', vi.fn(async () => sseResponse(body)))
+
+    await consumeStream()
+
+    expect(cancel).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['single line', `data: ${'x'.repeat((1024 * 1024) + 1)}`],
+    ['frame line count', `${'x:\n'.repeat(4097)}\n`],
+    ['frame data bytes', `${Array.from(
+      { length: 5 },
+      () => `data: ${'x'.repeat(900 * 1024)}`,
+    ).join('\n')}\n\n`],
+  ])('bounds %s and cancels the stream', async (_name, content) => {
+    const cancel = vi.fn()
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(content))
+      },
+      cancel,
+    })
+    vi.stubGlobal('fetch', vi.fn(async () => sseResponse(body)))
+
+    await expect(consumeStream()).rejects.toMatchObject({
+      code: 'stream_limit_exceeded',
+    })
+    expect(cancel).toHaveBeenCalledOnce()
   })
 
   it.each([
@@ -198,7 +280,9 @@ describe('conversation stream client', () => {
       `data: ${JSON.stringify(event)}\n\n`,
     )))
 
-    await expect(consumeStream()).rejects.toThrow('事件流包含无效的 AG-UI 事件')
+    await expect(consumeStream()).rejects.toMatchObject({
+      code: 'stream_event_invalid',
+    })
   })
 
   it('streams the complete compiled-subgraph Tool lifecycle', async () => {

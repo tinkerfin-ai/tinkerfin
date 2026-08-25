@@ -236,7 +236,6 @@ class ConversationHistoryService:
     async def _reconcile(self, thread: ConversationThread) -> None:
         thread_pk = thread.id
         identity = conversation_identity(
-            self._user_id,
             thread.thread_id,
             thread.last_run_id or "projection-read",
         )

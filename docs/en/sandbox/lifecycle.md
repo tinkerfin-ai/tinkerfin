@@ -26,6 +26,9 @@ manager = OpenSandboxManager(
 | `fail_on_startup_warmup_error` | `False` | Makes `start()` fail if initial warmup fails |
 | `settlement_timeout` | `None` | Maximum caller wait for manager close |
 
+Warm-pool sizes are strict integers. Command and lifecycle timeouts are finite numeric
+values; booleans are rejected before State startup or task creation.
+
 ## Common operations
 
 | Method | Behavior | Does the remote ID normally change? |
@@ -76,6 +79,12 @@ In-flight operations finish against the backend they acquired. The old instance 
 
 After creation, health checking, replacement, reset, destroy, or close begins, the manager retains cleanup responsibility even if the requesting task is cancelled. A caller receiving cancellation does not mean remote cleanup has finished.
 
+`OpenSandboxClient.destroy()` retains one task per Sandbox ID. Concurrent callers join
+that same remote kill and local close. Caller cancellation waits for settlement and then
+propagates. Once kill succeeds, an SDK close failure is logged as cleanup evidence rather
+than reported as a remote destruction failure. Client close waits for all active destroy
+tasks before closing its owned transport.
+
 ## Inspect details
 
 ```python
@@ -89,4 +98,3 @@ if details is not None:
 `None` means no known binding. When `available=False`, `unavailable_reason` is `not_found` or `unreachable`.
 
 Next: [Rooted files and commands](rooted-filesystem.md).
-

@@ -18,6 +18,10 @@ jobs:
         run: uv run ruff format --check packages
       - name: Lint packages
         run: uv run ruff check packages
+      - name: Check public API docstrings
+        run: >-
+          uv run ruff check packages/*/src
+          --select D100,D101,D102,D103,D104,D105,D106,D107
       - name: Check repository types
         run: uv run pyright
       - name: Check package source types strictly

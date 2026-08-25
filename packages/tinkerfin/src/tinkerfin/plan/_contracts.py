@@ -183,7 +183,10 @@ def create_plan_contract_binding(
         review_union,
         Field(discriminator="type"),
     ]  # pyright: ignore[reportInvalidTypeForm]
-    review_response = TypeAdapter(review_annotation)
+    review_response = cast(
+        TypeAdapter[object],
+        TypeAdapter(review_annotation),
+    )
     review_payload_type = create_model(
         "PlanReviewPayload",
         __base__=PlanReviewPayloadBase,
@@ -196,7 +199,7 @@ def create_plan_contract_binding(
     )
     return PlanContractBinding(
         planner_response_type=planner_type,
-        review_response=cast(TypeAdapter[object], review_response),
+        review_response=review_response,
         review_payload_type=review_payload_type,
         review_metadata_type=review_metadata_type,
     )

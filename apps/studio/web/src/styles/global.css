@@ -1,4 +1,38 @@
 @layer base {
+  body,
+  button,
+  input,
+  textarea,
+  select {
+    font-family: var(--font-ui);
+  }
+
+  button,
+  input,
+  textarea,
+  select {
+    font-size: inherit;
+  }
+
+  body {
+    color: var(--color-text-primary);
+    font-size: var(--type-ui-size);
+    font-weight: var(--weight-regular);
+    line-height: var(--type-ui-line);
+    letter-spacing: 0;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  code,
+  kbd,
+  pre,
+  samp {
+    font-family: var(--font-code);
+    font-variant-ligatures: none;
+  }
+
   *,
   *::before,
   *::after {

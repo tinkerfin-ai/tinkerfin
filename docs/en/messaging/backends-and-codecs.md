@@ -12,7 +12,7 @@ pip install "tinkerfin-messaging[redis]"
 
 ```python
 from redis.asyncio import Redis
-from tinkerfin_messaging import Messaging, RedisBackend
+from tinkerfin_messaging import Messaging, MessagingLimits, RedisBackend
 
 
 redis = Redis.from_url(
@@ -24,6 +24,7 @@ backend = RedisBackend(
     key_prefix="my-app:tinkerfin",
     lease_ttl=15.0,
     poll_interval=0.1,
+    limits=MessagingLimits(),
 )
 messaging = Messaging(backend=backend)
 ```
@@ -34,6 +35,7 @@ messaging = Messaging(backend=backend)
 | `key_prefix` | `tinkerfin-messaging` | Prefix reserved for this application |
 | `lease_ttl` | `15.0` | Producer ownership lease in seconds |
 | `poll_interval` | `0.1` | Delete-lease contention interval |
+| `limits` | `MessagingLimits()` | Encoded payload, checkpoint, message-count, and thread-byte limits |
 
 The caller owns the Redis client and closes it during application shutdown. Size the connection pool for blocked followers, cancellation waiters, and ordinary commands.
 
@@ -61,7 +63,18 @@ channel = messaging.channel(
 
 Canonical TinkerFin streams include immutable codec and Identity profiles, so a name-only channel infers both. Custom sources need an explicit codec and Identity.
 
-RedisBackend reads persistent schema 5 only. Schema 4 records are incompatible; use a new `key_prefix` or remove records you no longer need before switching. Schema 5 stores the current and immediately previous owner's successful lease-renewal counts and UTC timestamps for trusted postmortem diagnostics. It does not expose owner tokens, payloads, or those fields through MessageEnvelope.
+RedisBackend reads persistent schema 5 only. Schema 4 records are incompatible; use a
+new `key_prefix` or remove records you no longer need before switching. Schema 5 stores
+the complete limits fingerprint, per-generation `payload_bytes`, and the current and
+immediately previous owner's successful lease-renewal counts and UTC timestamps for
+trusted postmortem diagnostics. Workers sharing a channel must use identical limits.
+Quota checks and counters are atomic with append after message-ID idempotency. These
+fields never enter `MessageEnvelope`.
+
+Default limits are 16 MiB per encoded message, 1 MiB per checkpoint, 100,000 messages
+per thread generation, and 1 GiB of encoded payload per thread generation. Custom
+backends expose the same immutable `limits` property and must reject quota overflow
+before mutation.
 
 ## Define a custom message format
 

@@ -17,7 +17,6 @@ import {
 import type { ReactNode } from 'react'
 
 import type { Message } from '../../../types'
-import { normalizeEscapedText } from '../../../lib/text'
 import { useI18n } from '../../../i18n'
 
 type MessageStatus = NonNullable<Message['meta']>['status']
@@ -92,6 +91,7 @@ const toolSummary = (
 
 const statusText = (status: MessageStatus | undefined, t: ReturnType<typeof useI18n>['t']) => {
   if (status === 'failed') return t('执行失败')
+  if (status === 'cancelled') return t('已取消')
   if (status === 'paused') return t('等待审批')
   if (status === 'running') return t('正在运行')
   return t('已完成')
@@ -116,7 +116,7 @@ export function ToolCallRow({
   const ToolIcon = presentation?.icon ?? Wrench
   const status = message.meta?.status ?? 'completed'
   const failure = status === 'failed' && Boolean(message.meta?.result)
-    ? firstLine(normalizeEscapedText(message.meta?.result ?? ''))
+    ? firstLine(message.meta?.result ?? '')
     : ''
   const summary = failure || toolSummary(message, toolName, presentation)
 
@@ -134,7 +134,7 @@ export function ToolCallRow({
         <span className="tool-row-visually-hidden">{statusText(status, t)}</span>
         <span className="tool-row-leading" aria-hidden="true">
           <span className="tool-row-icon">
-            {status === 'failed' || status === 'paused'
+            {status === 'failed' || status === 'paused' || status === 'cancelled'
               ? <span className={`tool-row-state-dot is-${status}`} />
               : <ToolIcon size={14} strokeWidth={2} />}
           </span>

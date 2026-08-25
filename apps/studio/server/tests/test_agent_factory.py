@@ -202,7 +202,7 @@ async def test_create_definition_uses_non_reasoning_models_for_plan(
     assert tinkerfin.definition_options["model"] is root_model
 
 
-async def test_create_agui_events_defers_definition_and_enriches_main_start(
+async def test_create_agui_events_defers_definition_and_preserves_framework_start(
     monkeypatch,
 ) -> None:
     """未拉取时不得建图，owner 拉取后应交付完整主运行元数据"""
@@ -220,6 +220,7 @@ async def test_create_agui_events_defers_definition_and_enriches_main_start(
                 (
                     AgUiLifecycleEventFactory().started(
                         identity=_prepared().identity,
+                        parent_run_id=_prepared().parent_run_id,
                     ),
                 )
             )
@@ -266,14 +267,15 @@ async def test_create_agui_events_defers_definition_and_enriches_main_start(
     assert definition_calls == 1
     assert runtime_calls == 1
     assert runtime_options["mode"] == "default"
+    assert runtime_options["identity"] == prepared.identity
+    assert runtime_options["parent_run_id"] is None
+    assert "on_resume_checkpointed" not in runtime_options
+    assert "run_input" not in runtime_options
     assert len(emitted) == 1
     started = emitted[0]
     assert isinstance(started, RunStartedEvent)
     started_payload = started.model_dump(mode="python", by_alias=False)
-    assert started_payload["input"] == prepared.protocol_input.model_dump(
-        mode="python",
-        by_alias=False,
-    )
+    assert started_payload["input"] is None
     assert started_payload["title"] == "会话标题"
 
 

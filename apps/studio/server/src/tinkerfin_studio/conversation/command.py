@@ -50,7 +50,6 @@ class ConversationCommandService:
         thread = await self._require_thread(thread_id)
         thread_pk = thread.id
         identity = conversation_identity(
-            self._user_id,
             thread_id,
             thread.last_run_id or "delete",
         )

@@ -3,6 +3,7 @@ import { Check, ChevronDown } from 'lucide-react'
 import { Button, ListboxPicker } from '../../../components/ui'
 import { OverflowMarquee } from './OverflowMarquee'
 import { useI18n } from '../../../i18n'
+import type { ModelCatalogStatus } from '../useModelCatalog'
 
 function ModelOption({ label, selected }: { label: string; selected: boolean }) {
   return (
@@ -28,7 +29,7 @@ export function ComposerModelPicker({
   modelIds: string[]
   defaultModelId: string
   modelDisplayName: (modelId: string) => string
-  status: 'loading' | 'ready' | 'error'
+  status: ModelCatalogStatus
   open: boolean
   onOpenChange: (open: boolean) => void
   onSelectModel: (model: string) => void
@@ -39,6 +40,15 @@ export function ComposerModelPicker({
     return (
       <div className="composer-model-error" role="alert">
         <span>{t('模型加载失败')}</span>
+        <Button size="sm" variant="text" onClick={onRetry}>{t('重试')}</Button>
+      </div>
+    )
+  }
+
+  if (status === 'empty') {
+    return (
+      <div className="composer-model-error" role="status">
+        <span>{t('未配置可用模型')}</span>
         <Button size="sm" variant="text" onClick={onRetry}>{t('重试')}</Button>
       </div>
     )

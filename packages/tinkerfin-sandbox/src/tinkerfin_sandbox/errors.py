@@ -59,6 +59,8 @@ class OpenSandboxError(Exception):
         diagnostic_context: Mapping[str, _ContextValue] | None = None,
         cause: BaseException | None = None,
     ) -> None:
+        """Initialize client-safe context and trusted diagnostic evidence."""
+
         self.message = message
         self.context: Mapping[str, _ContextValue] = MappingProxyType(
             dict(context or {})
@@ -194,6 +196,8 @@ class OpenSandboxSettlementTimeoutError(OpenSandboxError, TimeoutError):
     code = OpenSandboxErrorCode.SETTLEMENT_TIMEOUT
 
     def __init__(self, *, timeout: float) -> None:
+        """Initialize a timeout failure with its caller settlement budget."""
+
         self.timeout = timeout
         super().__init__(
             f"OpenSandbox settlement timed out after {timeout:g} seconds",

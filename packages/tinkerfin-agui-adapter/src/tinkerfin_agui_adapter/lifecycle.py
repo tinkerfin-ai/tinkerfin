@@ -17,7 +17,7 @@ from .contracts import AgentRunOutcome, Identity
 
 
 class AgUiLifecycleEventFactory:
-    """Build exactly-one-owner main lifecycle events from complete caller input.
+    """Build exactly-one-owner events from one canonical run identity.
 
     The factory is stateless: it does not decide terminal ownership, access a
     graph or checkpointer, or send events over a transport. Callers must emit a
@@ -29,14 +29,29 @@ class AgUiLifecycleEventFactory:
         self,
         *,
         identity: Identity,
+        parent_run_id: str | None = None,
     ) -> BaseEvent:
-        """Build the main start event from the canonical runtime identity."""
+        """Build the main start event without fabricating protocol input.
+
+        Args:
+            identity: Canonical public, Graph, checkpoint, and delivery identity.
+            parent_run_id: Optional completed or resumable parent run in the same
+                canonical thread.
+
+        Returns:
+            A validated AG-UI start event whose optional input is omitted.
+
+        Raises:
+            TypeError: The identity or parent identifier has the wrong type.
+            ValueError: The parent identifier is empty, non-canonical, or self-referential.
+        """
 
         self.validate_identity(identity)
+        self.validate_parent_run_id(parent_run_id, identity=identity)
         return RunStartedEvent(
             thread_id=identity.thread_id,
             run_id=identity.run_id,
-            input=None,
+            parent_run_id=parent_run_id,
         )
 
     @staticmethod
@@ -45,6 +60,23 @@ class AgUiLifecycleEventFactory:
 
         if not isinstance(identity, Identity):
             raise TypeError("identity must be an Identity")
+
+    @staticmethod
+    def validate_parent_run_id(
+        parent_run_id: str | None,
+        *,
+        identity: Identity,
+    ) -> None:
+        """Require an optional canonical parent distinct from the current run."""
+
+        if parent_run_id is None:
+            return
+        if not isinstance(parent_run_id, str):
+            raise TypeError("parent_run_id must be a string or None")
+        if not parent_run_id or parent_run_id != parent_run_id.strip():
+            raise ValueError("parent_run_id must be a canonical non-empty string")
+        if parent_run_id == identity.run_id:
+            raise ValueError("parent_run_id must differ from identity.run_id")
 
     def finished(
         self,
@@ -73,17 +105,22 @@ class AgUiLifecycleEventFactory:
         identity: Identity,
         message: str,
         code: str,
+        parent_run_id: str | None = None,
     ) -> BaseEvent:
         """Build a main error terminal from the canonical runtime identity."""
 
         self.validate_identity(identity)
+        self.validate_parent_run_id(parent_run_id, identity=identity)
+        raw_event = {
+            "threadId": identity.thread_id,
+            "runId": identity.run_id,
+        }
+        if parent_run_id is not None:
+            raw_event["parentRunId"] = parent_run_id
         return RunErrorEvent(
             message=message,
             code=code,
-            raw_event={
-                "threadId": identity.thread_id,
-                "runId": identity.run_id,
-            },
+            raw_event=raw_event,
         )
 
     def is_main_lifecycle(self, event: BaseEvent, *, identity: Identity) -> bool:

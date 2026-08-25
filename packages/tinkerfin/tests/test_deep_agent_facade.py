@@ -24,12 +24,14 @@ from tinkerfin import (
     AgUiEventStream,
     AgUiNativeStreamConfigurationError,
     AgUiResumeBinding,
+    DeepAgentAgUiResumeRuntime,
     DeepAgentAgUiRuntime,
     DeepAgentDefinition,
     DeepAgentRuntime,
     Identity,
     NativeGraphRunStream,
     TinkerFin,
+    TinkerFinLifecycleError,
 )
 
 
@@ -154,10 +156,11 @@ def _resume_identity(*, run_id: str = "run-resume") -> Identity:
     return _identity(run_id=run_id)
 
 
-def _resume_binding(identity: Identity) -> AgUiResumeBinding:
+def _resume_binding() -> AgUiResumeBinding:
     return AgUiResumeBinding(
-        identity=identity,
-        command=Command(resume={"decisions": [{"type": "approve"}]}),
+        mode="resume",
+        resume_data={"decisions": [{"type": "approve"}]},
+        native_interrupt_ids=("interrupt-1",),
     )
 
 
@@ -222,27 +225,31 @@ def test_new_agui_rejects_invalid_identity_before_building_graph(
     definition = _definition(TinkerFin())
 
     with pytest.raises(ValueError, match="surrounding whitespace"):
-        definition.new_agui(identity=_identity(thread_id=" thread-1"))
+        definition.new_agui(
+            identity=_identity(thread_id=" thread-1"),
+        )
 
     assert calls == []
 
 
-def test_new_agui_rejects_binding_for_other_identity_before_building_graph(
+def test_new_agui_rejects_self_parent_before_building_graph(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls, _ = _install_builder(monkeypatch)
     definition = _definition(TinkerFin())
     identity = _resume_identity()
-    other_binding = _resume_binding(_resume_identity(run_id="run-other"))
 
-    with pytest.raises(ValueError, match="different identity"):
-        definition.new_agui(identity=identity, resume=other_binding)
+    with pytest.raises(ValueError, match="must differ"):
+        definition.new_agui(
+            identity=identity,
+            parent_run_id=identity.run_id,
+        )
 
     assert calls == []
 
 
 @pytest.mark.asyncio
-async def test_resume_command_mismatch_does_not_consume_runtime(
+async def test_resume_runtime_rejects_graph_input_without_consuming_runtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _, graphs = _install_builder(monkeypatch, parts=(_state_part(),))
@@ -252,25 +259,61 @@ async def test_resume_command_mismatch_does_not_consume_runtime(
         observed.append(part)
 
     identity = _resume_identity()
-    binding = _resume_binding(identity)
+    binding = _resume_binding()
     runtime = _definition(TinkerFin()).new_agui(
         identity=identity,
         resume=binding,
         on_part=on_part,
     )
 
-    with pytest.raises(ValueError, match="resume binding command"):
+    with pytest.raises(TypeError):
         runtime.astream(Command(resume={"decisions": [{"type": "reject"}]}))
 
     assert graphs[0].calls == []
     assert observed == []
 
-    events = [event async for event in runtime.astream(binding.command)]
+    stream = runtime.astream()
+    events = [event async for event in stream]
 
-    assert graphs[0].calls
-    assert observed == [_state_part()]
-    assert events[0].type.value == "RUN_STARTED"
-    assert events[-1].type.value == "RUN_FINISHED"
+    assert graphs[0].calls == []
+    assert observed == []
+    assert [event.type.value for event in events] == ["RUN_STARTED", "RUN_ERROR"]
+    assert isinstance(stream.error, TinkerFinLifecycleError)
+
+
+@pytest.mark.asyncio
+async def test_all_cancelled_resume_uses_a_finite_runtime_without_building_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls, _graphs = _install_builder(monkeypatch)
+    observed_checkpoints: list[object] = []
+
+    async def checkpointed(value: object) -> None:
+        observed_checkpoints.append(value)
+
+    runtime = _definition(TinkerFin()).new_agui(
+        identity=_resume_identity(),
+        parent_run_id="run-parent",
+        resume=AgUiResumeBinding(
+            mode="abandon",
+            native_interrupt_ids=("interrupt-1",),
+        ),
+        on_resume_checkpointed=checkpointed,
+    )
+
+    assert isinstance(runtime, DeepAgentAgUiResumeRuntime)
+    assert calls == []
+    with pytest.raises(AgUiNativeStreamConfigurationError, match="version"):
+        runtime.astream(version="v1")
+    events = [event async for event in runtime.astream(config=_graph_config())]
+
+    assert [event.type.value for event in events] == ["RUN_STARTED", "RUN_ERROR"]
+    started = cast(RunStartedEvent, events[0])
+    assert started.thread_id == "thread-1"
+    assert started.parent_run_id == "run-parent"
+    assert started.input is None
+    assert events[-1].code == "resume_cancelled"
+    assert observed_checkpoints == []
 
 
 @pytest.mark.asyncio
@@ -278,14 +321,17 @@ async def test_agui_runtime_keeps_identity_before_graph_stream_creation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _install_builder(monkeypatch, parts=(_state_part(),))
-    identity = _identity()
-    runtime = _definition(TinkerFin()).new_agui(identity=identity)
+    identity = _identity(thread_id="public-thread")
+    runtime = _definition(TinkerFin()).new_agui(
+        identity=identity,
+    )
 
     stream = runtime.astream(_graph_input())
     started = await anext(stream)
 
     assert isinstance(started, RunStartedEvent)
     assert stream.messaging_identity is identity
+    assert started.thread_id == "public-thread"
     assert started.input is None
     await stream.aclose()
 
@@ -308,7 +354,10 @@ def test_create_deep_agent_defers_and_reuses_fresh_graph_builds(
     assert calls == []
 
     native = definition.new(identity=_identity(run_id="native-run"))
-    agui = definition.new_agui(identity=_identity(run_id="agui-run"))
+    agui_identity = _identity(run_id="agui-run")
+    agui = definition.new_agui(
+        identity=agui_identity,
+    )
 
     assert isinstance(native, DeepAgentRuntime)
     assert isinstance(agui, DeepAgentAgUiRuntime)
@@ -455,7 +504,10 @@ async def test_agui_runtime_defaults_reserved_options_and_stays_lazy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _, graphs = _install_builder(monkeypatch, parts=(_state_part(),))
-    runtime = _definition(TinkerFin()).new_agui(identity=_identity())
+    identity = _identity()
+    runtime = _definition(TinkerFin()).new_agui(
+        identity=identity,
+    )
     stream = runtime.astream(
         _graph_input(),
         _graph_config(),
@@ -479,7 +531,10 @@ async def test_agui_runtime_normalizes_explicit_modes_and_forwards_other_options
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _, graphs = _install_builder(monkeypatch, parts=(_state_part(),))
-    runtime = _definition(TinkerFin()).new_agui(identity=_identity())
+    identity = _identity()
+    runtime = _definition(TinkerFin()).new_agui(
+        identity=identity,
+    )
     stream = runtime.astream(
         _graph_input(),
         stream_mode=("custom", "values", "messages", "debug", "tasks"),
@@ -572,8 +627,9 @@ async def test_agui_runtime_preserves_observer_order_and_error_terminal(
         parts=(_state_part(),),
         source_error=RuntimeError("native failed"),
     )
+    identity = _identity()
     runtime = _definition(TinkerFin()).new_agui(
-        identity=_identity(),
+        identity=identity,
         on_part=on_part,
         on_event=on_event,
     )
@@ -614,7 +670,10 @@ def test_runtime_wrappers_preserve_upstream_parameter_information(
     tinkerfin = TinkerFin()
     definition = _definition(tinkerfin)
     native = definition.new(identity=_identity(run_id="native-run"))
-    agui = definition.new_agui(identity=_identity(run_id="agui-run"))
+    agui_identity = _identity(run_id="agui-run")
+    agui = definition.new_agui(
+        identity=agui_identity,
+    )
     upstream = inspect.signature(CompiledStateGraph.astream)
     bound_upstream = upstream.replace(
         parameters=tuple(upstream.parameters.values())[1:]
@@ -633,7 +692,10 @@ def test_runtime_astream_is_single_use_for_agui(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _install_builder(monkeypatch)
-    runtime = _definition(TinkerFin()).new_agui(identity=_identity())
+    identity = _identity()
+    runtime = _definition(TinkerFin()).new_agui(
+        identity=identity,
+    )
     stream = runtime.astream(_graph_input())
 
     assert isinstance(stream, AgUiEventStream)

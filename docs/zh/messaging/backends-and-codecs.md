@@ -12,7 +12,7 @@ pip install "tinkerfin-messaging[redis]"
 
 ```python
 from redis.asyncio import Redis
-from tinkerfin_messaging import Messaging, RedisBackend
+from tinkerfin_messaging import Messaging, MessagingLimits, RedisBackend
 
 
 redis = Redis.from_url(
@@ -24,6 +24,7 @@ backend = RedisBackend(
     key_prefix="my-app:tinkerfin",
     lease_ttl=15.0,
     poll_interval=0.1,
+    limits=MessagingLimits(),
 )
 messaging = Messaging(backend=backend)
 ```
@@ -34,6 +35,7 @@ messaging = Messaging(backend=backend)
 | `key_prefix` | `tinkerfin-messaging` | 当前应用独占的 Redis key 前缀 |
 | `lease_ttl` | `15.0` | 生产者所有权租约秒数 |
 | `poll_interval` | `0.1` | 删除时等待活跃租约的轮询间隔 |
+| `limits` | `MessagingLimits()` | 编码 Payload、checkpoint、消息数和 thread 字节上限 |
 
 Redis client 是调用方提供的资源，应用关闭时自行关闭。连接池容量要覆盖同时等待消息、等待取消和普通命令的连接数。
 
@@ -61,7 +63,15 @@ channel = messaging.channel(
 
 TinkerFin 的规范事件流带有 codec 与 Identity，因此 name-only channel 可以自动选择 codec 和 durable scope。自定义 source 必须显式配置 codec，并在调用时提供 Identity。
 
-RedisBackend 只读取持久 schema 5。Schema 4 记录不兼容；切换前使用新的 `key_prefix`，或清理确认不再需要的旧记录。Schema 5 保存当前 owner 和上一个 owner 的成功续租次数与 UTC 时间，仅用于可信故障取证；不会保存额外 owner token、Payload，也不会把这些字段放入 MessageEnvelope。
+RedisBackend 只读取持久 schema 5。Schema 4 记录不兼容；切换前使用新的 `key_prefix`，或清理确认
+不再需要的旧记录。Schema 5 保存完整 limits fingerprint、每个 generation 的 `payload_bytes`，以及
+当前 owner 和上一个 owner 的成功续租次数与 UTC 时间，仅用于可信故障取证。共享同一 channel 的
+worker 必须使用完全相同的 limits。配额检查与计数会在 message ID 幂等检查后，与 append 原子完成；
+这些字段不会进入 `MessageEnvelope`。
+
+默认上限为：单条编码消息 16 MiB、checkpoint 1 MiB、每个 thread generation 100,000 条消息，
+以及每个 thread generation 1 GiB 编码 Payload。自定义 backend 也必须提供同一不可变 `limits`
+属性，并在修改数据前拒绝超额写入。
 
 ## 自定义消息格式
 

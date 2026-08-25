@@ -1,4 +1,5 @@
 import { fireEvent, render, screen } from '@testing-library/react'
+import { useState } from 'react'
 import { describe, expect, it, vi } from 'vitest'
 
 import { buildEmptyConversation } from '../../../lib/workspace'
@@ -156,5 +157,101 @@ describe('ApprovalCard', () => {
     expect(screen.getByRole('button', { name: '允许' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: '编辑' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: '拒绝' })).toBeInTheDocument()
+  })
+
+  it('keeps edit drafts bound to each interrupt while paging', () => {
+    const firstArgs = { file_path: '/first.txt' }
+    const secondArgs = { file_path: '/second.txt' }
+    const initial: ApprovalState = {
+      activeIndex: 0,
+      submitted: false,
+      mode: 'options',
+      items: [
+        {
+          id: 'approval-first',
+          interruptId: 'interrupt-first',
+          toolName: 'write_file',
+          params: JSON.stringify(firstArgs),
+          input: JSON.stringify(firstArgs),
+          description: '写入第一份文件',
+          originalArgs: firstArgs,
+          allowedDecisions: ['approve', 'edit', 'reject'],
+        },
+        {
+          id: 'approval-second',
+          interruptId: 'interrupt-second',
+          toolName: 'write_file',
+          params: JSON.stringify(secondArgs),
+          input: JSON.stringify(secondArgs),
+          description: '写入第二份文件',
+          originalArgs: secondArgs,
+          allowedDecisions: ['approve', 'edit', 'reject'],
+        },
+      ],
+    }
+
+    function Harness() {
+      const [approval, setApproval] = useState(initial)
+      const conversation: Conversation = {
+        ...buildEmptyConversation({
+          threadId: 'thread-drafts',
+          now: '2026-08-25T00:00:00.000Z',
+          model: 'GPT-5.5',
+        }),
+        runStatus: 'waiting_approval',
+        approval,
+      }
+      return <ApprovalCard conversation={conversation} onChange={setApproval} onSubmit={vi.fn()} />
+    }
+
+    render(<Harness />)
+    fireEvent.click(screen.getByRole('button', { name: '编辑' }))
+    const editor = screen.getByLabelText('编辑参数（JSON 对象）')
+    fireEvent.change(editor, { target: { value: '{"file_path":"/edited-first.txt"}' } })
+
+    fireEvent.click(screen.getByRole('button', { name: '下一项审批' }))
+    expect(screen.getByLabelText('编辑参数（JSON 对象）')).toHaveValue(
+      JSON.stringify(secondArgs),
+    )
+    fireEvent.change(screen.getByLabelText('编辑参数（JSON 对象）'), {
+      target: { value: '{"file_path":"/edited-second.txt"}' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: '保存并允许' }))
+
+    expect(screen.getByText('写入第一份文件')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '编辑' }))
+    expect(screen.getByLabelText('编辑参数（JSON 对象）')).toHaveValue(
+      '{"file_path":"/edited-first.txt"}',
+    )
+  })
+
+  it('announces a dynamic approval error', () => {
+    const conversation: Conversation = {
+      ...buildEmptyConversation({
+        threadId: 'thread-error',
+        now: '2026-08-25T00:00:00.000Z',
+        model: 'GPT-5.5',
+      }),
+      runStatus: 'waiting_approval',
+      approval: {
+        activeIndex: 0,
+        submitted: false,
+        error: '审批状态已经更新',
+        items: [{
+          id: 'approval-error',
+          interruptId: 'interrupt-error',
+          toolName: 'write_file',
+          params: '{}',
+          input: '{}',
+          description: '确认操作',
+          originalArgs: {},
+          allowedDecisions: ['approve'],
+        }],
+      },
+    }
+
+    render(<ApprovalCard conversation={conversation} onChange={vi.fn()} onSubmit={vi.fn()} />)
+
+    expect(screen.getByRole('alert')).toHaveTextContent('审批状态已经更新')
   })
 })

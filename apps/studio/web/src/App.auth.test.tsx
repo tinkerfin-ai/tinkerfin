@@ -65,6 +65,7 @@ describe('App authentication boundary', () => {
     clearActiveRunSession()
     window.history.replaceState(null, '', '/')
     vi.unstubAllGlobals()
+    vi.restoreAllMocks()
     vi.useRealTimers()
   })
 
@@ -291,6 +292,32 @@ describe('App authentication boundary', () => {
     expect(document.querySelector('.toast-card')).toBeNull()
   })
 
+  it('rejects login atomically when the browser cannot persist the session', async () => {
+    const browserUser = userEvent.setup()
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const request = input instanceof Request ? input : new Request(input)
+      if (new URL(request.url).pathname.endsWith('/api/auth/login')) {
+        return envelope(loginPayload())
+      }
+      throw new Error(`unexpected request: ${request.url}`)
+    }))
+    render(<App />)
+    vi.spyOn(window.localStorage, 'setItem').mockImplementation(() => {
+      throw new DOMException('storage disabled', 'SecurityError')
+    })
+
+    await browserUser.type(screen.getByLabelText('用户名'), 'yunsan')
+    await browserUser.type(screen.getByLabelText('密码'), 'password')
+    await browserUser.click(screen.getByRole('button', { name: '登录' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      '浏览器无法保存登录状态，请检查隐私或存储设置后重试',
+    )
+    expect(screen.getByRole('alert')).toHaveClass('auth-form-error')
+    expect(screen.queryByLabelText('正在检查登录状态')).not.toBeInTheDocument()
+    expect(window.localStorage.getItem(AUTH_SESSION_STORAGE_KEY)).toBeNull()
+  })
+
   it('keeps the workspace and transition unmounted while a fresh login is verified by /me', async () => {
     const browserUser = userEvent.setup()
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
@@ -396,7 +423,7 @@ describe('App authentication boundary', () => {
     })
     expect(readActiveRunSession()).not.toBeNull()
     await browserUser.click(screen.getByRole('button', { name: '打开用户菜单' }))
-    await browserUser.click(screen.getByRole('button', { name: '退出登录' }))
+    await browserUser.click(screen.getByRole('menuitem', { name: '退出登录' }))
 
     expect(await screen.findByRole('heading', { name: '欢迎回来' })).toBeInTheDocument()
     expect(screen.queryByLabelText('对话内容')).not.toBeInTheDocument()
@@ -429,7 +456,7 @@ describe('App authentication boundary', () => {
     render(<App />)
     await waitFor(() => expect(screen.getByLabelText('对话内容')).toBeInTheDocument())
     await browserUser.click(screen.getByRole('button', { name: '打开用户菜单' }))
-    await browserUser.click(screen.getByRole('button', { name: '退出登录' }))
+    await browserUser.click(screen.getByRole('menuitem', { name: '退出登录' }))
 
     expect(await screen.findByRole('heading', { name: '欢迎回来' })).toBeInTheDocument()
     const logoutRequest = fetchMock.mock.calls

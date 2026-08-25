@@ -33,7 +33,7 @@ def _entry(
 
 def _envelope() -> RuntimeInterruptEnvelope:
     return RuntimeInterruptEnvelope(
-        kind="plan_review",
+        kind="tinkerfin:plan_review",
         message="Review Plan",
         response_schema={"type": "object"},
         metadata={"planRevision": 1},
@@ -72,7 +72,7 @@ def test_runtime_interrupt_maps_to_ag_ui_and_resumes_without_tool_ids() -> None:
         "MESSAGES_SNAPSHOT",
     ]
     interrupt = outcome.interrupts[0]
-    assert interrupt.reason == "plan_review"
+    assert interrupt.reason == "tinkerfin:plan_review"
     assert interrupt.tool_call_id is None
     assert interrupt.response_schema == {"type": "object"}
     translation = ResumeMapper().map_agui(
@@ -147,7 +147,7 @@ def test_persisted_runtime_response_schema_cannot_change_before_resume() -> None
 def test_runtime_interrupt_cancellation_is_abandonment() -> None:
     interrupt = AgUiInterrupt(
         id="plan-1",
-        reason="plan_review",
+        reason="tinkerfin:plan_review",
         response_schema={"type": "object"},
         metadata={
             "langgraphValue": _envelope().model_dump(mode="json", by_alias=True),

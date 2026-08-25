@@ -21,7 +21,7 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
   size = 'xs',
   shape = 'round',
   loading = false,
-  selected = false,
+  selected,
   leadingIcon,
   trailingIcon,
   type = 'button',
@@ -35,7 +35,7 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
     `ui-button--${variant}`,
     `ui-button--${size}`,
     `ui-button--${shape}`,
-    selected ? 'is-selected' : '',
+    selected === true ? 'is-selected' : '',
     className,
   ].filter(Boolean).join(' ')
 
@@ -47,7 +47,7 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
       type={type}
       disabled={disabled || loading}
       aria-busy={loading || undefined}
-      aria-pressed={buttonProps['aria-pressed'] ?? (selected ? true : undefined)}
+      aria-pressed={buttonProps['aria-pressed'] ?? selected}
     >
       {loading
         ? <LoaderCircle className="ui-button__spinner" size={16} aria-hidden="true" />

@@ -75,6 +75,13 @@ class GraphRunStream(Generic[PartT]):
         on_part: PartObserver[PartT] | None,
         identity: Identity | None = None,
     ) -> None:
+        """Initialize a lazy, single-use native stream.
+
+        The stream owns the iterator returned by ``source_factory`` and its
+        coordination scope, but it never owns the optional observer or identity.
+        External close cancels an active pull and retains cleanup until settlement.
+        """
+
         self._source_factory = source_factory
         self._coordination_factory = coordination_factory
         self._on_part = on_part
@@ -92,9 +99,13 @@ class GraphRunStream(Generic[PartT]):
         self._finish_task: asyncio.Task[None] | None = None
 
     def __aiter__(self) -> GraphRunStream[PartT]:
+        """Return this single-use asynchronous iterator."""
+
         return self
 
     async def __anext__(self) -> PartT:
+        """Pull, observe, and return the next native part."""
+
         return await _runtime_streams.__anext__(
             self,
         )
@@ -227,6 +238,7 @@ class AgUiEventStream:
         error: Exception,
         *,
         identity: Identity,
+        parent_run_id: str | None = None,
     ) -> AgUiEventStream:
         """Create one standard lifecycle for an owner-only Runtime setup failure."""
 
@@ -241,6 +253,7 @@ class AgUiEventStream:
         stream = cls(
             parts=failed_parts(),
             identity=identity,
+            parent_run_id=parent_run_id,
             expose_reasoning_events=False,
             expose_subagent_events=True,
             prior_tool_call_ids=frozenset(),
@@ -265,10 +278,20 @@ class AgUiEventStream:
         timeout: float | None,
         settlement_timeout: float | None = None,
         on_event: EventObserver | None,
+        parent_run_id: str | None = None,
     ) -> None:
+        """Initialize one owned AG-UI conversion stream.
+
+        ``parts`` is owned and closed exactly once. Identity, parent lineage, and
+        callbacks are borrowed. Timeouts bound caller waits without
+        abandoning the retained upstream close task.
+        """
+
         self._lifecycle = AgUiLifecycleEventFactory()
         self._lifecycle.validate_identity(identity)
+        self._lifecycle.validate_parent_run_id(parent_run_id, identity=identity)
         self._identity = identity
+        self._parent_run_id = parent_run_id
         self._timeout = _validate_timeout(timeout)
         self._settlement_timeout = _validate_timeout(
             settlement_timeout,
@@ -301,12 +324,17 @@ class AgUiEventStream:
         self._secondary_error_notes: list[str] = []
         self._runtime_error_code = "runtime_error"
         self._initialization_failed = False
+        self._resume_abandoned = False
         self.error: Exception | None = None
 
     def __aiter__(self) -> AgUiEventStream:
+        """Return this single-use AG-UI asynchronous iterator."""
+
         return self
 
     async def __anext__(self) -> BaseEvent:
+        """Return the next observed and lifecycle-safe AG-UI event."""
+
         return await _runtime_agui.__anext__(
             self,
         )
@@ -405,7 +433,10 @@ class AgUiEventStream:
         try:
             self._main_started = True
             yield self._decorate_initialization_event(
-                self._lifecycle.started(identity=self._identity)
+                self._lifecycle.started(
+                    identity=self._identity,
+                    parent_run_id=self._parent_run_id,
+                )
             )
             while True:
                 try:
@@ -417,6 +448,16 @@ class AgUiEventStream:
                 for event in self._adapter.process(part):
                     yield event
             await self._close_upstream(None)
+            if self._resume_abandoned:
+                self._completed = True
+                terminal = True
+                yield self._lifecycle.failed(
+                    identity=self._identity,
+                    message="Agent resume cancelled",
+                    code="resume_cancelled",
+                    parent_run_id=self._parent_run_id,
+                )
+                return
             for event in self._adapter.finish():
                 yield event
             outcome = self._adapter.main_outcome()
@@ -467,6 +508,7 @@ class AgUiEventStream:
                         identity=self._identity,
                         message="Agent run failed",
                         code=error_code,
+                        parent_run_id=self._parent_run_id,
                     )
                 )
         except BaseException as error:
@@ -508,6 +550,8 @@ class TinkerFinRun(Generic[PartT]):
         identity: Identity | None,
         on_part: PartObserver[PartT] | None,
     ) -> None:
+        """Initialize a lazy run binding without opening its source."""
+
         self._source_factory = source_factory
         self._run_coordinator = run_coordinator
         self._identity = identity
@@ -562,6 +606,7 @@ class TinkerFinRun(Generic[PartT]):
         prior_tool_call_ids: frozenset[str] = frozenset(),
         private_state_keys: frozenset[str] = frozenset(),
         on_event: EventObserver | None = None,
+        parent_run_id: str | None = None,
     ) -> AgUiEventStream:
         """Claim the native source and convert it to one AG-UI event stream.
 
@@ -574,6 +619,7 @@ class TinkerFinRun(Generic[PartT]):
             prior_tool_call_ids: Scoped Tool call IDs already emitted before resume.
             private_state_keys: Top-level state channels omitted from public output.
             on_event: Optional async observer awaited before each event is delivered.
+            parent_run_id: Optional branch lineage exposed on the main start event.
 
         Returns:
             A single-use observed AG-UI object stream.
@@ -598,6 +644,7 @@ class TinkerFinRun(Generic[PartT]):
             prior_tool_call_ids=prior_tool_call_ids,
             private_state_keys=private_state_keys,
             on_event=on_event,
+            parent_run_id=parent_run_id,
         )
 
 
@@ -633,6 +680,17 @@ class TinkerFin:
         run_coordinator: RunCoordinator | None = None,
         state_schema: type[DeepAgentState] | None = None,
     ) -> None:
+        """Initialize a shareable factory that borrows global integrations.
+
+        Args:
+            run_coordinator: Optional exclusive scope provider for run identities.
+            state_schema: Optional global Deep Agent TypedDict contribution.
+
+        Raises:
+            TypeError: The coordinator is not callable.
+            StateSchemaCompositionError: The state schema is not a valid TypedDict.
+        """
+
         if run_coordinator is not None and not callable(run_coordinator):
             raise TypeError("run_coordinator must be callable or None")
         validate_state_schema(state_schema, source="TinkerFin state_schema")
@@ -803,7 +861,7 @@ class TinkerFin:
         source_factory: Callable[[], AsyncIterator[Mapping[str, object]]],
         *,
         identity: Identity,
-        on_part: PartObserver[object] | None,
+        on_part: PartObserver[Mapping[str, object]] | None,
     ) -> NativeTinkerFinRun:
         """Bind a validated canonical v2 source without changing public low-level API."""
 
@@ -812,7 +870,7 @@ class TinkerFin:
             source_factory=source_factory,
             run_coordinator=self._run_coordinator,
             identity=identity,
-            on_part=cast(PartObserver[Mapping[str, object]] | None, on_part),
+            on_part=on_part,
         )
 
 

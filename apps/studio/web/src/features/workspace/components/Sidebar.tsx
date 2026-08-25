@@ -24,12 +24,11 @@ import {
   useRef,
   useState,
 } from 'react'
-import type { MouseEvent } from 'react'
+import type { KeyboardEvent as ReactKeyboardEvent, MouseEvent } from 'react'
 
 import type { AuthUser } from '../../../api/auth/types'
 import { BrandMark } from '../../../components/ui/BrandMark'
-import { Button, IconButton, UserAvatar } from '../../../components/ui'
-import { TransientScrollbar } from '../../../components/ui/TransientScrollbar'
+import { Button, IconButton, OverlayScrollbar, UserAvatar } from '../../../components/ui'
 import { TRANSIENT_THREAD_ID } from '../../../lib/workspace'
 import { useI18n } from '../../../i18n'
 import type { Conversation, WorkspaceState } from '../../../types'
@@ -37,8 +36,10 @@ import { groupConversationHistory } from '../historyGroups'
 import type { SidebarMode } from '../useWorkspaceNavigation'
 import { OverflowMarquee } from './OverflowMarquee'
 
-const HISTORY_OBSERVER_MARGIN_PX = 80
-const HISTORY_SCROLL_BURST_IDLE_MS = 600
+// 提前一段可滚动距离发起分页，让 300ms 防刷等待尽量落在用户持续浏览期间
+const HISTORY_PAGE_PRELOAD_DISTANCE_PX = 320
+// 连续 wheel 通常逐帧到达，短静默即可区分下一次独立滑动
+const HISTORY_SCROLL_BURST_IDLE_MS = 120
 
 export function ConversationItem({
   conversation,
@@ -96,6 +97,7 @@ export interface SidebarProps {
   onNew: () => void
   onSelect: (threadId: string) => void
   onPin: (threadId: string) => void
+  pinPendingThreadIds?: ReadonlySet<string>
   onRename: (threadId: string, restoreFocusTo?: HTMLElement | null) => void
   onDelete: (threadId: string, restoreFocusTo?: HTMLElement | null) => void
   hasMore: boolean
@@ -128,6 +130,7 @@ export function Sidebar({
   onNew,
   onSelect,
   onPin,
+  pinPendingThreadIds = new Set(),
   onRename,
   onDelete,
   hasMore,
@@ -153,6 +156,7 @@ export function Sidebar({
   const rootRef = useRef<HTMLElement>(null)
   const menuRef = useRef<HTMLDivElement>(null)
   const userMenuRef = useRef<HTMLDivElement>(null)
+  const userMenuPopupRef = useRef<HTMLDivElement>(null)
   const userMenuButtonRef = useRef<HTMLButtonElement>(null)
   const historyScrollRef = useRef<HTMLDivElement>(null)
   const searchInputRef = useRef<HTMLInputElement>(null)
@@ -227,6 +231,31 @@ export function Sidebar({
       : state.onLoadMore
     load()
   }, [capturePaginationAnchor])
+
+  const sustainPaginationScrollBurst = useCallback(() => {
+    if (paginationScrollBurstTimerRef.current != null) {
+      window.clearTimeout(paginationScrollBurstTimerRef.current)
+    }
+    paginationScrollBurstTimerRef.current = window.setTimeout(() => {
+      paginationRequestedInScrollBurstRef.current = false
+      paginationScrollBurstTimerRef.current = null
+    }, HISTORY_SCROLL_BURST_IDLE_MS)
+  }, [])
+
+  const requestHistoryPageFromViewport = useCallback((element: HTMLElement) => {
+    const nearBottom = (
+      element.scrollTop + element.clientHeight
+      >= element.scrollHeight - HISTORY_PAGE_PRELOAD_DISTANCE_PX
+    )
+    if (!nearBottom) {
+      paginationArmedRef.current = true
+      return
+    }
+    if (paginationRequestedInScrollBurstRef.current) return
+    paginationRequestedInScrollBurstRef.current = true
+    paginationArmedRef.current = true
+    requestHistoryPage(true)
+  }, [requestHistoryPage])
 
   const updateStickyHistoryTitle = useCallback((scrollElement: HTMLElement) => {
     const groupsElement = scrollElement.querySelector<HTMLElement>('.conversation-groups')
@@ -316,13 +345,13 @@ export function Sidebar({
     if (mode !== 'overlay' || !overlayOpen || !wideInteractive) return
     window.requestAnimationFrame(() => overlayCloseButtonRef.current?.focus())
     const handleEscape = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return
+      if (event.defaultPrevented || backgroundInert || event.key !== 'Escape') return
       event.preventDefault()
       onCloseOverlay()
     }
     document.addEventListener('keydown', handleEscape)
     return () => document.removeEventListener('keydown', handleEscape)
-  }, [mode, onCloseOverlay, overlayOpen, wideInteractive])
+  }, [backgroundInert, mode, onCloseOverlay, overlayOpen, wideInteractive])
 
   useEffect(() => {
     if (!openMenu) return
@@ -332,7 +361,7 @@ export function Sidebar({
       setOpenMenu(null)
     }
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return
+      if (event.defaultPrevented || event.key !== 'Escape') return
       event.preventDefault()
       openMenu.trigger.focus()
       setOpenMenu(null)
@@ -385,10 +414,12 @@ export function Sidebar({
         paginationArmedRef.current = true
         return
       }
+      // 同一滑动批次由 wheel 和 scroll 共用请求所有权，哨兵仅处理无滚动的布局变化
+      if (paginationRequestedInScrollBurstRef.current) return
       requestHistoryPage()
     }, {
       root,
-      rootMargin: `0px 0px ${HISTORY_OBSERVER_MARGIN_PX}px`,
+      rootMargin: `0px 0px ${HISTORY_PAGE_PRELOAD_DISTANCE_PX}px`,
       threshold: 0.01,
     })
     observer.observe(sentinel)
@@ -403,7 +434,7 @@ export function Sidebar({
       || isLoadingMore
       || loadMoreError
       || !hasMore
-      || root.scrollHeight > root.clientHeight + HISTORY_OBSERVER_MARGIN_PX
+      || root.scrollHeight > root.clientHeight + HISTORY_PAGE_PRELOAD_DISTANCE_PX
     ) return
     paginationArmedRef.current = true
     const frame = window.requestAnimationFrame(() => requestHistoryPage())
@@ -422,7 +453,7 @@ export function Sidebar({
       setUserMenu(false)
     }
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return
+      if (event.defaultPrevented || backgroundInert || event.key !== 'Escape') return
       event.preventDefault()
       setUserMenu(false)
       userMenuButtonRef.current?.focus()
@@ -433,7 +464,36 @@ export function Sidebar({
       document.removeEventListener('pointerdown', handleOutsidePointerDown)
       document.removeEventListener('keydown', handleKeyDown)
     }
+  }, [backgroundInert, userMenu])
+
+  useLayoutEffect(() => {
+    if (!userMenu) return
+    // 账户菜单打开后直接进入首项，让键盘用户无需额外 Tab 即可开始操作
+    userMenuPopupRef.current?.querySelector<HTMLElement>('[role="menuitem"]')?.focus()
   }, [userMenu])
+
+  const handleUserMenuKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    // 方向键只在账户菜单内循环，Tab 仍沿页面自然顺序离开并触发菜单收起
+    const items = Array.from(
+      userMenuPopupRef.current?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]') ?? [],
+    )
+    if (items.length === 0) return
+    const currentIndex = Math.max(0, items.indexOf(document.activeElement as HTMLButtonElement))
+    let nextIndex: number | undefined
+    if (event.key === 'ArrowDown') nextIndex = (currentIndex + 1) % items.length
+    else if (event.key === 'ArrowUp') nextIndex = (currentIndex - 1 + items.length) % items.length
+    else if (event.key === 'Home') nextIndex = 0
+    else if (event.key === 'End') nextIndex = items.length - 1
+    else if (event.key === 'Escape') {
+      event.preventDefault()
+      setUserMenu(false)
+      userMenuButtonRef.current?.focus()
+      return
+    }
+    if (nextIndex == null) return
+    event.preventDefault()
+    items[nextIndex]?.focus()
+  }
 
   useEffect(() => () => {
     if (paginationScrollBurstTimerRef.current != null) {
@@ -443,13 +503,18 @@ export function Sidebar({
 
   useEffect(() => {
     const handleNewConversationShortcut = (event: KeyboardEvent) => {
-      if (!event.metaKey || event.key.toLocaleLowerCase('en-US') !== 'k') return
+      if (
+        event.defaultPrevented
+        || backgroundInert
+        || !event.metaKey
+        || event.key.toLocaleLowerCase('en-US') !== 'k'
+      ) return
       event.preventDefault()
       onNew()
     }
     document.addEventListener('keydown', handleNewConversationShortcut)
     return () => document.removeEventListener('keydown', handleNewConversationShortcut)
-  }, [onNew])
+  }, [backgroundInert, onNew])
 
   const selectConversation = (threadId: string) => {
     closeMenu()
@@ -477,6 +542,7 @@ export function Sidebar({
       )}
       <aside
         ref={rootRef}
+        data-workspace-layout-target="sidebar"
         id="workspace-sidebar"
         className={`workspace-sidebar is-${mode}${overlayOpen ? ' is-overlay-open' : ''}`}
         data-sidebar-mode={mode}
@@ -567,34 +633,22 @@ export function Sidebar({
               className={`conversation-scroll ui-scrollbar${openMenu ? ' is-scroll-locked' : ''}`}
               role="region"
               aria-label={t('最近对话')}
+              tabIndex={0}
               onScroll={(event) => {
                 const element = event.currentTarget
                 updateStickyHistoryTitle(element)
                 if (paginationAnchorRef.current) capturePaginationAnchor()
-                if (paginationScrollBurstTimerRef.current != null) {
-                  window.clearTimeout(paginationScrollBurstTimerRef.current)
-                }
-                paginationScrollBurstTimerRef.current = window.setTimeout(() => {
-                  paginationRequestedInScrollBurstRef.current = false
-                  paginationScrollBurstTimerRef.current = null
-                }, HISTORY_SCROLL_BURST_IDLE_MS)
+                sustainPaginationScrollBurst()
                 if (openMenu) {
                   element.scrollTop = lockedHistoryScrollTop.current
                   return
                 }
-                const nearBottom = (
-                  element.scrollTop + element.clientHeight
-                  >= element.scrollHeight - HISTORY_OBSERVER_MARGIN_PX
-                )
-                if (!nearBottom) {
-                  paginationArmedRef.current = true
-                  return
-                }
-                if (!paginationRequestedInScrollBurstRef.current) {
-                  paginationRequestedInScrollBurstRef.current = true
-                  paginationArmedRef.current = true
-                  requestHistoryPage(true)
-                }
+                requestHistoryPageFromViewport(element)
+              }}
+              onWheel={(event) => {
+                sustainPaginationScrollBurst()
+                if (openMenu || event.deltaY <= 0) return
+                requestHistoryPageFromViewport(event.currentTarget)
               }}
             >
               <nav className="primary-nav" aria-label={t('工作区功能')}>
@@ -628,34 +682,40 @@ export function Sidebar({
               {!isHistorySearching && groups.length === 0 && !loadMoreError && (
                 <p className="no-search-result">{historyQuery.trim() ? t('没有匹配的对话') : t('暂无最近对话')}</p>
               )}
+              {/* 尾部槽位在可分页期间保持固定高度，loading 切换不再改变原生滚动条几何 */}
+              {(hasMore || isLoadingMore || loadMoreError) && (
+                <div className="history-pagination-slot">
+                  {isLoadingMore ? (
+                    <div className="history-pagination-status" role="status">
+                      {t('正在加载更多历史会话')}
+                    </div>
+                  ) : loadMoreError ? (
+                    <div className="history-pagination-status is-error" role="alert">
+                      <span>{loadMoreError}</span>
+                      {onRetryLoadMore && (
+                        <Button size="sm" variant="text" onClick={onRetryLoadMore}>
+                          {t('重试加载历史')}
+                        </Button>
+                      )}
+                    </div>
+                  ) : null}
+                </div>
+              )}
               <div ref={historyLoadSentinelRef} className="history-load-sentinel" aria-hidden="true" />
               </div>
             </div>
-            <TransientScrollbar viewportRef={historyScrollRef} />
+            <OverlayScrollbar viewportRef={historyScrollRef} />
           </div>
 
           <div ref={userMenuRef} className="user-account">
-            {userMenu && (
-              <div className="user-menu">
-                <Button
-                  variant="ghost"
-                  leadingIcon={<Settings2 size={16} />}
-                  onClick={() => {
-                    setUserMenu(false)
-                    onOpenSettings(userMenuButtonRef.current)
-                  }}
-                >
-                  {t('设置')}
-                </Button>
-                <Button variant="ghost" leadingIcon={<LogOut size={16} />} onClick={onLogout}>{t('退出登录')}</Button>
-              </div>
-            )}
             <button
               ref={userMenuButtonRef}
               type="button"
               className="user-card"
               aria-label={userMenu ? t('关闭用户菜单') : t('打开用户菜单')}
               aria-expanded={userMenu}
+              aria-haspopup="menu"
+              aria-controls="user-account-menu"
               onClick={() => setUserMenu((value) => !value)}
             >
               <UserAvatar
@@ -665,6 +725,35 @@ export function Sidebar({
               />
               <strong className="user-name">{user.display_name.trim() || user.username}</strong>
             </button>
+            {userMenu && (
+              <div
+                ref={userMenuPopupRef}
+                id="user-account-menu"
+                className="user-menu"
+                role="menu"
+                tabIndex={-1}
+                aria-label={t('账户')}
+                onKeyDown={handleUserMenuKeyDown}
+                onBlur={(event) => {
+                  if (event.relatedTarget instanceof Node && userMenuRef.current?.contains(event.relatedTarget)) return
+                  setUserMenu(false)
+                }}
+              >
+                <Button
+                  role="menuitem"
+                  tabIndex={-1}
+                  variant="ghost"
+                  leadingIcon={<Settings2 size={16} />}
+                  onClick={() => {
+                    setUserMenu(false)
+                    onOpenSettings(userMenuButtonRef.current)
+                  }}
+                >
+                  {t('设置')}
+                </Button>
+                <Button role="menuitem" tabIndex={-1} variant="ghost" leadingIcon={<LogOut size={16} />} onClick={onLogout}>{t('退出登录')}</Button>
+              </div>
+            )}
           </div>
         </div>
 
@@ -673,26 +762,29 @@ export function Sidebar({
           aria-hidden={!railInteractive || undefined}
           inert={!railInteractive || undefined}
         >
+          {/* 侧栏形态切换期间 Rail 仍会保留，非交互形态必须主动退出键盘路径 */}
           <IconButton
             className="rail-brand-toggle"
             label={t('打开侧边栏')}
             tooltip={t('打开侧边栏')}
             icon={<PanelRight size={17} />}
+            tabIndex={railInteractive ? 0 : -1}
             aria-controls="workspace-sidebar"
             aria-expanded="false"
             onClick={onToggleMode}
           />
-          <IconButton label={t('新会话')} tooltip={t('新会话')} icon={<SquarePen size={18} />} selected={isNewConversation} onClick={onNew} />
+          <IconButton label={t('新会话')} tooltip={t('新会话')} icon={<SquarePen size={18} />} selected={isNewConversation} tabIndex={railInteractive ? 0 : -1} onClick={onNew} />
           <IconButton
             label={historyQuery ? t('搜索会话，当前查询：{query}', { query: historyQuery }) : t('搜索会话')}
             tooltip={t('搜索会话')}
             icon={<Search size={18} />}
             selected={isSearchOpen || isHistorySearchActive}
+            tabIndex={railInteractive ? 0 : -1}
             aria-expanded={isSearchOpen}
             aria-controls="sidebar-search"
             onClick={() => openSearch(true)}
           />
-          <IconButton label={t('智能体')} tooltip={t('智能体')} icon={<Workflow size={18} />} disabled />
+          <IconButton label={t('智能体')} tooltip={t('智能体')} icon={<Workflow size={18} />} tabIndex={railInteractive ? 0 : -1} disabled />
           <span className="rail-spacer" />
           <IconButton
             label={t('展开侧边栏以查看账户')}
@@ -704,13 +796,14 @@ export function Sidebar({
                 username={user.username}
               />
             )}
+            tabIndex={railInteractive ? 0 : -1}
             onClick={onRequestExpanded}
           />
         </div>
 
         {menuConversation && openMenu && wideInteractive && (
           <div ref={menuRef} className="conversation-menu conversation-menu-floating" style={{ top: openMenu.top, left: openMenu.left }}>
-            <Button variant="ghost" leadingIcon={menuConversation.pinned ? <PinOff size={15} /> : <Pin size={15} />} onClick={() => { onPin(menuConversation.threadId); closeMenu(true) }}>
+            <Button loading={pinPendingThreadIds.has(menuConversation.threadId)} disabled={pinPendingThreadIds.has(menuConversation.threadId)} variant="ghost" leadingIcon={menuConversation.pinned ? <PinOff size={15} /> : <Pin size={15} />} onClick={() => { onPin(menuConversation.threadId); closeMenu(true) }}>
               {menuConversation.pinned ? t('取消置顶') : t('置顶')}
             </Button>
             <Button variant="ghost" leadingIcon={<Pencil size={15} />} onClick={() => { onRename(menuConversation.threadId, openMenu.trigger); closeMenu() }}>{t('重命名')}</Button>

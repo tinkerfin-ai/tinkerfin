@@ -1,6 +1,6 @@
 # TinkerFin Studio Web 客户端
 
-该目录包含 React 19 与 TypeScript 客户端，已实现登录、会话列表、AG-UI SSE 对话、
+该目录包含 React 19 与 TypeScript 客户端，提供登录、会话列表、AG-UI SSE 对话、
 历史恢复、任务与 Tool 状态、子 Agent 展示和 HITL 中断恢复。
 
 ## 本地运行
@@ -33,14 +33,18 @@ canonical threadId、原 runId 和最后一条持久化序号自动重连。
 登录页。页面启动校验遇到网络错误或服务端暂不可用时，会保持业务界面未挂载并自动重试，
 不会清除仍可能有效的会话。一个标签页退出或到期后，其他同源标签页同步退出。
 
+登录会话必须先成功写入 `localStorage` 才会进入内存状态。浏览器隐私策略、配额或存储异常
+导致写入失败时，登录会被拒绝，页面显示可恢复提示；不会建立只在当前内存中有效的半会话。
+
 侧栏账户区使用认证响应中的 `avatar_url` 显示头像；地址为空或图片加载失败时显示稳定的
 名称首字符占位。账户菜单中的“设置”展示头像、展示名和用户名，并提供跟随系统、浅色、
-深色三种外观选项。会话页头部不再重复显示外观入口，登录页仍保留主题切换。
+深色三种外观选项。会话页头部只保留全局工作区操作，外观入口位于设置与登录页。
 
 设置分为“账号管理”和“通用”。通用设置提供简体中文、English 和跟随系统三种语言偏好，
 缺省使用简体中文，选择后立即作用于当前浏览器并同步同源标签页。跟随系统把所有中文变体
 解析为简体中文，英语解析为 English，其他系统语言回退 English。语言切换只作用于前端
 自有界面文案；后端响应、会话标题、消息、Plan、Todo、工具内容和代码始终保持原文。
+语言偏好无法写入本地存储时，选择仍在当前页面生效，但刷新后不会保留。
 
 新会话在侧栏以“新会话”显示，首个 chat 请求发送空 `threadId`。客户端生成本次请求的
 `runId`，并给 user 消息填写 `request-${runId}`，以满足标准 AG-UI 消息校验。后端不把
@@ -57,12 +61,16 @@ canonical threadId、原 runId 和最后一条持久化序号自动重连。
 关闭 Plan 的唯一入口，`/plan off` 不作为关闭指令执行。
 
 本地附件入口支持 PNG、JPEG、WebP、GIF 和 PDF，最多 5 个、单个不超过 10MB、合计不超过
-25MB。附件只用于浏览器本地预览，不进入 chat、resume 或其他 AG-UI 请求；发送文字后仍保留
-在当前会话的输入区，切换、新建或删除当前会话时清空。
+25MB。附件只保留在浏览器当前页面的本地选择列表，不进入 chat、resume 或其他 AG-UI
+请求；发送文字后仍保留在当前会话的输入区，切换、新建或删除当前会话时清空。
 
 每次 start 与 resume 请求都使用 `forwardedProps.command.plan` 声明有效 Plan 状态：`on`
-对应内部 `plan` 模式，`off` 对应内部 `default` 模式。HTTP 请求不再发送
-`forwardedProps.mode`。
+对应内部 `plan` 模式，`off` 对应内部 `default` 模式。HTTP 请求的模式字段只有
+`forwardedProps.command.plan`。
+
+会话消息保留浏览器原生滚动语义，并使用全局统一的视觉滑块。历史较长时初始显示最新
+100 个条目，“加载更早消息”每次向前增加 100 个，并保持当前阅读位置。实时新增内容会
+追加到已展开窗口，不会重新裁掉已加载内容。
 
 默认代理目标是 `http://127.0.0.1:8090`。需要临时连接其他本地端口时设置：
 
@@ -76,7 +84,24 @@ VITE_API_PROXY_TARGET=http://127.0.0.1:8092 pnpm dev
 pnpm test
 pnpm lint
 pnpm build
+pnpm test:browser
 ```
+
+浏览器测试固定使用 `@playwright/test@1.62.1` 与对应 Chromium。首次运行前安装浏览器：
+
+```bash
+pnpm exec playwright install chromium
+```
+
+浏览器门禁覆盖 320、768、1024、1440px，浅色与深色主题、键盘焦点、touch/coarse pointer、
+`prefers-reduced-motion`、forced colors 和页面级横向溢出。Vite 生产构建使用其 Baseline
+Widely Available 默认目标；真实发布仍应按目标用户浏览器矩阵执行兼容性验证。
+
+## 第三方许可证
+
+工程核验记录见 [`THIRD_PARTY_LICENSES.md`](./THIRD_PARTY_LICENSES.md)。`pnpm build` 会在
+`dist/third-party-licenses.md` 生成实际进入浏览器制品的依赖许可证清单。GSAP 当前仅用于
+Studio 界面状态动效，适用边界以官方 Standard License 原文为准。
 
 ## 安全限制
 

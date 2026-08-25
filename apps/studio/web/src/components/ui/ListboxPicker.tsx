@@ -146,6 +146,7 @@ export function ListboxPicker<T extends string>({
               id={`${listboxId}-option-${index}`}
               className={optionClassName}
               role="option"
+              tabIndex={-1}
               aria-selected={value === option}
               data-active={activeIndex === index}
               onClick={() => choose(index)}

@@ -122,6 +122,41 @@ class _TrackingBackend(MemoryBackend):
         )
 
 
+class _BlockingCloseIterator(_TrackingIterator):
+    def __init__(
+        self,
+        iterator: AsyncIterator[MessageEnvelope],
+        backend: _BlockingFollowerBackend,
+    ) -> None:
+        super().__init__(iterator, backend)
+        self._blocking_backend = backend
+
+    async def aclose(self) -> None:
+        self._blocking_backend.close_started.set()
+        await self._blocking_backend.close_release.wait()
+        await super().aclose()
+        self._blocking_backend.close_finished.set()
+
+
+class _BlockingFollowerBackend(_TrackingBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.close_started = asyncio.Event()
+        self.close_release = asyncio.Event()
+        self.close_finished = asyncio.Event()
+
+    def follow(
+        self,
+        handle: BackendRunHandle,
+        *,
+        after: int,
+    ) -> AsyncIterator[MessageEnvelope]:
+        return _BlockingCloseIterator(
+            MemoryBackend.follow(self, handle, after=after),
+            self,
+        )
+
+
 class _LeasedMemoryBackend(MemoryBackend):
     @property
     def lease_renew_interval(self) -> float:
@@ -467,6 +502,34 @@ async def test_backend_subscription_closes_on_early_detach() -> None:
         await subscription.aclose()
         assert backend.follow_close_calls == 1
         assert not source.closed.is_set()
+        release.set()
+        await asyncio.wait_for(source.closed.wait(), timeout=1)
+
+
+async def test_subscription_close_survives_caller_cancellation() -> None:
+    """A cancelled waiter must not orphan or forget the backend follower close."""
+
+    backend = _BlockingFollowerBackend()
+    release = asyncio.Event()
+    source = _Source("one", release=release)
+
+    async with Messaging(backend=backend) as messaging:
+        channel = messaging.channel(name="events", codec=_TextCodec())
+        subscription = await channel.wrap(source, identity=_identity(), after=0)
+        assert (await anext(aiter(subscription))).data == "one"
+
+        closing = asyncio.create_task(subscription.aclose())
+        await asyncio.wait_for(backend.close_started.wait(), timeout=1)
+        closing.cancel("subscriber stopped waiting")
+        await asyncio.sleep(0)
+        assert not closing.done()
+        backend.close_release.set()
+        with pytest.raises(asyncio.CancelledError, match="subscriber stopped waiting"):
+            await asyncio.wait_for(closing, timeout=1)
+
+        await subscription.aclose()
+        assert backend.close_finished.is_set()
+        assert backend.follow_close_calls == 1
         release.set()
         await asyncio.wait_for(source.closed.wait(), timeout=1)
 

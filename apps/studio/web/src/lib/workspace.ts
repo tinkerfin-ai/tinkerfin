@@ -16,7 +16,6 @@ export const buildEmptyConversation = (
   mode: options.mode ?? 'default',
   messages: [],
   todos: [],
-  plan: null,
   runStatus: 'idle',
   isHydrated: true,
 })

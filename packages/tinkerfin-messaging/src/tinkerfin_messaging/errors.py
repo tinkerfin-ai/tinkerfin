@@ -23,6 +23,7 @@ class MessagingErrorCode(StrEnum):
     CODEC_MISMATCH = "messaging.codec_mismatch"
     SOURCE_PROFILE_MISMATCH = "messaging.source_profile_mismatch"
     MESSAGE_ID_CONFLICT = "messaging.message_id_conflict"
+    QUOTA_EXCEEDED = "messaging.quota_exceeded"
     RUN_ALREADY_ACTIVE = "messaging.run_already_active"
     RUN_NOT_FOUND = "messaging.run_not_found"
     RUN_PRODUCER_FAILED = "messaging.run_producer_failed"
@@ -69,6 +70,8 @@ class MessagingError(Exception):
         diagnostic_context: Mapping[str, _ContextValue] | None = None,
         cause: BaseException | None = None,
     ) -> None:
+        """Initialize public context and trusted diagnostic evidence."""
+
         self.message = message
         self.context: Mapping[str, _ContextValue] = MappingProxyType(
             dict(context or {})
@@ -102,6 +105,8 @@ class MessagingSettlementTimeout(MessagingError):
     code = MessagingErrorCode.SETTLEMENT_TIMEOUT
 
     def __init__(self, *, timeout: float) -> None:
+        """Initialize a timeout failure with its caller settlement budget."""
+
         self.timeout = timeout
         super().__init__(
             f"Messaging settlement timed out after {timeout:g} seconds",
@@ -121,6 +126,8 @@ class InvalidCursor(MessagingError):
     code = MessagingErrorCode.INVALID_CURSOR
 
     def __init__(self, *, after: int, latest: int) -> None:
+        """Initialize an invalid cursor failure with the retained range."""
+
         self.after = after
         self.latest = latest
         super().__init__(
@@ -135,6 +142,8 @@ class CodecMismatch(MessagingError):
     code = MessagingErrorCode.CODEC_MISMATCH
 
     def __init__(self, *, expected: str, actual: str) -> None:
+        """Initialize a durable codec mismatch with both codec identifiers."""
+
         self.expected = expected
         self.actual = actual
         super().__init__(
@@ -149,6 +158,8 @@ class SourceProfileMismatch(MessagingError):
     code = MessagingErrorCode.SOURCE_PROFILE_MISMATCH
 
     def __init__(self, *, profile: str, reason: str) -> None:
+        """Initialize a source profile failure with its safe incompatibility reason."""
+
         self.profile = profile
         self.reason = reason
         super().__init__(
@@ -163,12 +174,30 @@ class MessageIdConflict(MessagingError):
     code = MessagingErrorCode.MESSAGE_ID_CONFLICT
 
     def __init__(self, *, identity: Identity, message_id: str) -> None:
+        """Initialize a conflicting idempotency-key failure."""
+
         self.identity = identity
         self.message_id = message_id
         super().__init__(
             f"Message {message_id!r} already exists in thread "
             f"{identity.thread_id!r} with different content",
             context={**_identity_context(identity), "message_id": message_id},
+        )
+
+
+class MessagingQuotaExceeded(MessagingError):
+    """A commit would exceed one configured durable capacity boundary."""
+
+    code = MessagingErrorCode.QUOTA_EXCEEDED
+
+    def __init__(self, *, resource: str, limit: int) -> None:
+        """Initialize a capacity failure with the exceeded resource and limit."""
+
+        self.resource = resource
+        self.limit = limit
+        super().__init__(
+            f"Messaging {resource} limit of {limit} was exceeded",
+            context={"resource": resource, "limit": limit},
         )
 
 
@@ -183,6 +212,8 @@ class RunAlreadyActive(MessagingError):
         active_identity: Identity,
         requested_identity: Identity,
     ) -> None:
+        """Initialize an ownership conflict with active and requested runs."""
+
         self.active_identity = active_identity
         self.requested_identity = requested_identity
         super().__init__(
@@ -202,6 +233,8 @@ class RunNotFound(MessagingError):
     code = MessagingErrorCode.RUN_NOT_FOUND
 
     def __init__(self, *, identity: Identity) -> None:
+        """Initialize a missing-run failure for one durable identity."""
+
         self.identity = identity
         super().__init__(
             f"Run {identity.run_id!r} was not found",
@@ -215,6 +248,8 @@ class RunProducerFailed(MessagingError):
     code = MessagingErrorCode.RUN_PRODUCER_FAILED
 
     def __init__(self, *, identity: Identity, cause: BaseException) -> None:
+        """Initialize a producer failure while preserving its original cause."""
+
         self.identity = identity
         super().__init__(
             f"Producer for run {identity.run_id!r} failed",
@@ -229,6 +264,8 @@ class CancellationUnsupported(MessagingError):
     code = MessagingErrorCode.CANCELLATION_UNSUPPORTED
 
     def __init__(self, *, identity: Identity) -> None:
+        """Initialize an unsupported cancellation failure for one run."""
+
         self.identity = identity
         super().__init__(
             f"Run {identity.run_id!r} does not support cancellation",
@@ -266,6 +303,8 @@ class StreamDeleted(MessagingError):
         identity: Identity,
         generation: int | None,
     ) -> None:
+        """Initialize a stale-generation failure for one deleted stream."""
+
         self.channel = channel
         self.identity = identity
         self.generation = generation
@@ -297,6 +336,8 @@ class StreamDeleteConflict(MessagingError):
         identity: Identity,
         active_identity: Identity,
     ) -> None:
+        """Initialize a deletion conflict with the active producer identity."""
+
         self.channel = channel
         self.identity = identity
         self.active_identity = active_identity
@@ -355,6 +396,7 @@ __all__ = [
     "MessagingError",
     "MessagingErrorCode",
     "MessagingNotStarted",
+    "MessagingQuotaExceeded",
     "MessagingSettlementTimeout",
     "RecoveryUnsupported",
     "RunAlreadyActive",

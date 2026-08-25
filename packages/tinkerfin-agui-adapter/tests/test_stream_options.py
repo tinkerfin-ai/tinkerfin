@@ -79,6 +79,39 @@ def test_extra_modes_emit_sanitized_raw_events() -> None:
     }
 
 
+def test_updates_drop_only_top_level_private_state_channels_per_node() -> None:
+    private_key = "_framework_private"
+    nested = {private_key: "business-value"}
+    adapter = DeepAgentAgUiAdapter(
+        identity=_identity(),
+        private_state_keys=frozenset({private_key}),
+    )
+
+    event = adapter.process(
+        {
+            "type": "updates",
+            "ns": (),
+            "data": {
+                "first": {private_key: "internal", "nested": nested},
+                "second": "non-mapping-update",
+            },
+        }
+    )[0]
+
+    assert isinstance(event, RawEvent)
+    assert event.event["data"] == {
+        "first": {"nested": nested},
+        "second": "non-mapping-update",
+    }
+
+
+def test_updates_require_a_node_mapping() -> None:
+    adapter = DeepAgentAgUiAdapter(identity=_identity())
+
+    with pytest.raises(AgUiStreamContractError, match="node mapping"):
+        adapter.process({"type": "updates", "ns": (), "data": ["invalid"]})
+
+
 def test_checkpoint_projection_drops_runtime_configuration_and_task_state() -> None:
     private_key = "_framework_private"
     nested = {private_key: "business-value"}
@@ -209,7 +242,7 @@ def test_private_state_policy_covers_subgraphs_debug_and_interrupt_snapshot() ->
                     "id": "runtime-pause",
                     "value": {
                         "schema": "tinkerfin.runtime-interrupt.v1",
-                        "kind": "pause",
+                        "kind": "tinkerfin:pause",
                         "message": "Continue?",
                         "responseSchema": {"type": "object"},
                         "metadata": {},

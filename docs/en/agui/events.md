@@ -8,7 +8,7 @@ A normal run begins with `RUN_STARTED` and ends with one `RUN_FINISHED` or `RUN_
 
 | Event | Typical frontend action |
 | --- | --- |
-| `RUN_STARTED` | Create run state; framework `input` is `None`, and applications may enrich it |
+| `RUN_STARTED` | Create run state; `input` is omitted because Graph input is explicit |
 | `TEXT_MESSAGE_START` | Create a new assistant message |
 | `TEXT_MESSAGE_CONTENT` | Append text |
 | `TEXT_MESSAGE_END` | Close the message |
@@ -44,7 +44,8 @@ Subagents run in non-root namespaces. The converter preserves full namespaces an
 
 `expose_subagent_events=True` delivers their public events. With `False`, the converter still validates their input but suppresses corresponding public events.
 
-The framework does not use or generate `parentRunId` for LangGraph subgraphs. A
+The framework never uses `parentRunId` for LangGraph subgraphs. High-level Runtime takes
+`parent_run_id` explicitly and uses it only for checkpoint branching. A
 verified Deep Agents delegate carries `tinkerfin.subagent-provenance.v1` in the task
 RAW descriptor. `subagentInvocationId` stays stable across resume, `requestRunId`
 identifies the current main request, child event sources repeat the invocation ID, and

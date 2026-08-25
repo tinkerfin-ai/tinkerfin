@@ -42,6 +42,26 @@ def _stub_method(
     )
 
 
+def _stub_methods(
+    path: Path,
+    class_name: str,
+    method_name: str,
+) -> list[ast.FunctionDef]:
+    """Return every overload for one generated class method."""
+
+    module = ast.parse(path.read_text(encoding="utf-8"))
+    class_node = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.ClassDef) and node.name == class_name
+    )
+    return [
+        node
+        for node in class_node.body
+        if isinstance(node, ast.FunctionDef) and node.name == method_name
+    ]
+
+
 def _upstream_function(
     function: Callable[..., object],
 ) -> ast.FunctionDef | ast.AsyncFunctionDef:
@@ -92,7 +112,7 @@ def test_generated_stubs_exist_and_the_generator_reports_no_drift() -> None:
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
-def test_generated_stubs_match_both_upstream_parameter_lists() -> None:
+def test_generated_stubs_preserve_upstream_options_with_explicit_agui_inputs() -> None:
     create_arguments = copy.deepcopy(
         _stub_method(_INIT_STUB, "TinkerFin", "create_deep_agent").args
     )
@@ -106,19 +126,50 @@ def test_generated_stubs_match_both_upstream_parameter_lists() -> None:
         _upstream_function(CompiledStateGraph.astream).args
     )
     _RenameAstreamTypes().visit(expected_astream)
-    for runtime_name in ("DeepAgentRuntime", "DeepAgentAgUiRuntime"):
-        actual = _stub_method(_DEEP_AGENT_STUB, runtime_name, "astream")
-        assert ast.dump(actual.args, include_attributes=False) == ast.dump(
-            expected_astream,
-            include_attributes=False,
-        )
+    native = _stub_method(_DEEP_AGENT_STUB, "DeepAgentRuntime", "astream")
+    assert ast.dump(native.args, include_attributes=False) == ast.dump(
+        expected_astream,
+        include_attributes=False,
+    )
+
+    ordinary = _stub_method(_DEEP_AGENT_STUB, "DeepAgentAgUiRuntime", "astream")
+    expected_ordinary = copy.deepcopy(expected_astream)
+    expected_ordinary.args[1].annotation = ast.Name(
+        id="InputAgentState",
+        ctx=ast.Load(),
+    )
+    assert ast.dump(ordinary.args, include_attributes=False) == ast.dump(
+        expected_ordinary,
+        include_attributes=False,
+    )
+
+    resumed = _stub_method(
+        _DEEP_AGENT_STUB,
+        "DeepAgentAgUiResumeRuntime",
+        "astream",
+    )
+    assert [argument.arg for argument in resumed.args.args] == ["self"]
+    assert [argument.arg for argument in resumed.args.kwonlyargs] == [
+        "config",
+        "context",
+        "stream_mode",
+        "print_mode",
+        "output_keys",
+        "interrupt_before",
+        "interrupt_after",
+        "durability",
+        "control",
+        "subgraphs",
+        "debug",
+        "version",
+    ]
 
 
 def test_generated_stub_declares_precise_facade_return_types() -> None:
     plan = _stub_method(_INIT_STUB, "TinkerFin", "plan")
     create = _stub_method(_INIT_STUB, "TinkerFin", "create_deep_agent")
     native_new = _stub_method(_DEEP_AGENT_STUB, "DeepAgentDefinition", "new")
-    agui_new = _stub_method(
+    agui_new, resume_new = _stub_methods(
         _DEEP_AGENT_STUB,
         "DeepAgentDefinition",
         "new_agui",
@@ -133,13 +184,20 @@ def test_generated_stub_declares_precise_facade_return_types() -> None:
         "DeepAgentAgUiRuntime",
         "astream",
     )
+    resume_astream = _stub_method(
+        _DEEP_AGENT_STUB,
+        "DeepAgentAgUiResumeRuntime",
+        "astream",
+    )
 
     assert _return_type(plan) == "TinkerFin"
     assert _return_type(create) == "DeepAgentDefinition[ContextT]"
     assert _return_type(native_new) == "DeepAgentRuntime[ContextT]"
     assert _return_type(agui_new) == "DeepAgentAgUiRuntime[ContextT]"
+    assert _return_type(resume_new) == "DeepAgentAgUiResumeRuntime[ContextT]"
     assert _return_type(native_astream) == "NativeGraphRunStream"
     assert _return_type(agui_astream) == "AgUiEventStream"
+    assert _return_type(resume_astream) == "AgUiEventStream"
     assert "ParamSpec" not in _INIT_STUB.read_text(encoding="utf-8")
     assert "ParamSpec" not in _DEEP_AGENT_STUB.read_text(encoding="utf-8")
 
@@ -215,11 +273,25 @@ def test_built_wheel_contains_the_generated_stubs(tmp_path: Path) -> None:
 
 
 def test_definition_stub_methods_follow_the_runtime_implementation() -> None:
-    for method_name in ("new", "new_agui"):
-        stub = _stub_method(_DEEP_AGENT_STUB, "DeepAgentDefinition", method_name)
-        runtime_method = getattr(DeepAgentDefinition, method_name)
-        expected = _upstream_function(runtime_method)
-        assert ast.dump(stub.args, include_attributes=False) == ast.dump(
-            expected.args,
-            include_attributes=False,
-        )
+    stub = _stub_method(_DEEP_AGENT_STUB, "DeepAgentDefinition", "new")
+    expected = _upstream_function(DeepAgentDefinition.new)
+    assert ast.dump(stub.args, include_attributes=False) == ast.dump(
+        expected.args,
+        include_attributes=False,
+    )
+
+    runtime = _upstream_function(DeepAgentDefinition.new_agui)
+    runtime_names = [argument.arg for argument in runtime.args.kwonlyargs]
+    overloads = _stub_methods(
+        _DEEP_AGENT_STUB,
+        "DeepAgentDefinition",
+        "new_agui",
+    )
+    assert len(overloads) == 2
+    assert all(
+        [argument.arg for argument in overload.args.kwonlyargs] == runtime_names
+        for overload in overloads
+    )
+    assert "run_input" not in runtime_names
+    assert "parent_run_id" in runtime_names
+    assert "on_resume_checkpointed" in runtime_names

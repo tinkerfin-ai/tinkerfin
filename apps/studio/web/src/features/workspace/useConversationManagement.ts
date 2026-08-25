@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { Dispatch, SetStateAction } from 'react'
 
 import {
@@ -53,8 +53,17 @@ export function useConversationManagement({
   const [dialog, setDialog] = useState<WorkspaceDialog | null>(null)
   const [dialogPending, setDialogPending] = useState(false)
   const [dialogError, setDialogError] = useState<string>()
+  const [pinPendingThreadIds, setPinPendingThreadIds] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  )
+  const pinRequests = useRef(new Set<string>())
+  const isMounted = useRef(true)
   const latest = useRef({ workspace, conversation })
   latest.current = { workspace, conversation }
+
+  useEffect(() => () => {
+    isMounted.current = false
+  }, [])
 
   const findConversation = (threadId: string) => (
     latest.current.workspace.conversations.find((item) => item.threadId === threadId)
@@ -105,21 +114,45 @@ export function useConversationManagement({
 
   const pinConversation = (threadId: string) => {
     const target = findConversation(threadId)
+    if (!target || pinRequests.current.has(threadId)) return
+    pinRequests.current.add(threadId)
+    setPinPendingThreadIds((current) => new Set(current).add(threadId))
+    const previousPinned = target.pinned
     const nextPinned = !target?.pinned
     setWorkspace((state) => updateConversation(
       state,
       threadId,
       (item) => ({ ...item, pinned: nextPinned }),
     ))
-    void patchConversation(threadId, { pinned: nextPinned }).then(() => {
-      onToast('success', nextPinned ? t('会话已置顶') : t('已取消置顶'))
-    }).catch(() => {
+    // 同一会话只允许一个置顶 mutation 在途，响应才能安全提交或回滚其乐观值
+    void patchConversation(threadId, { pinned: nextPinned }).then((summary) => {
+      if (!isMounted.current) return
       setWorkspace((state) => updateConversation(
         state,
         threadId,
-        (item) => ({ ...item, pinned: !nextPinned }),
+        (item) => item.pinned === nextPinned
+          ? { ...item, pinned: summary.pinned }
+          : item,
+      ))
+      onToast('success', nextPinned ? t('会话已置顶') : t('已取消置顶'))
+    }).catch(() => {
+      if (!isMounted.current) return
+      setWorkspace((state) => updateConversation(
+        state,
+        threadId,
+        (item) => item.pinned === nextPinned
+          ? { ...item, pinned: previousPinned }
+          : item,
       ))
       onToast('error', t('置顶状态更新失败，请重试'))
+    }).finally(() => {
+      pinRequests.current.delete(threadId)
+      if (!isMounted.current) return
+      setPinPendingThreadIds((current) => {
+        const next = new Set(current)
+        next.delete(threadId)
+        return next
+      })
     })
   }
 
@@ -181,8 +214,8 @@ export function useConversationManagement({
           detachThreadStream(
             runningThreadId,
             dialog.kind === 'detach-new'
-              ? t('已新建会话，之前会话的实时输出连接已断开。')
-              : t('已切换到其他会话，当前会话的实时输出连接已断开。'),
+              ? t('已新建会话，之前会话的实时输出连接已断开')
+              : t('已切换到其他会话，当前会话的实时输出连接已断开'),
           )
         }
         if (dialog.kind === 'detach-new') performNewConversation()
@@ -208,6 +241,7 @@ export function useConversationManagement({
     selectConversation,
     newConversation,
     pinConversation,
+    pinPendingThreadIds,
     renameConversation,
     deleteConversation,
     requestDisablePlan,

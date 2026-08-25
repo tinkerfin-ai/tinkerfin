@@ -28,6 +28,7 @@ from .backend import (
     PreparedRun,
     RunStatus,
 )
+from .limits import DEFAULT_MESSAGING_LIMITS, MessagingLimits
 from .models import MessageEnvelope, RecoveryCheckpoint
 
 
@@ -45,12 +46,37 @@ class RedisBackend(MessagingBackend):
         key_prefix: str = "tinkerfin-messaging",
         lease_ttl: float = 15.0,
         poll_interval: float = 0.1,
+        limits: MessagingLimits = DEFAULT_MESSAGING_LIMITS,
     ) -> None:
+        """Initialize a backend that borrows one binary Redis client.
+
+        Args:
+            client: Open asynchronous Redis client with response decoding disabled.
+            key_prefix: Deployment namespace for every durable key.
+            lease_ttl: Producer ownership expiry in seconds.
+            poll_interval: Maximum fallback polling interval in seconds.
+            limits: Immutable payload and per-thread capacity contract.
+
+        Raises:
+            TypeError: A timing or limits value has the wrong type.
+            ValueError: An identifier, timing value, or client mode is invalid.
+        """
+
         required_identifier("key_prefix", key_prefix)
-        if not math.isfinite(lease_ttl) or lease_ttl <= 0:
+        if isinstance(lease_ttl, bool) or not isinstance(lease_ttl, int | float):
+            raise TypeError("lease_ttl must be a number")
+        if isinstance(poll_interval, bool) or not isinstance(
+            poll_interval, int | float
+        ):
+            raise TypeError("poll_interval must be a number")
+        resolved_lease_ttl = float(lease_ttl)
+        resolved_poll_interval = float(poll_interval)
+        if not math.isfinite(resolved_lease_ttl) or resolved_lease_ttl <= 0:
             raise ValueError("lease_ttl must be a finite positive number")
-        if not math.isfinite(poll_interval) or poll_interval <= 0:
+        if not math.isfinite(resolved_poll_interval) or resolved_poll_interval <= 0:
             raise ValueError("poll_interval must be a finite positive number")
+        if not isinstance(limits, MessagingLimits):
+            raise TypeError("limits must be a MessagingLimits")
         connection_options = cast(
             Mapping[str, object],
             client.get_connection_kwargs(),
@@ -59,13 +85,20 @@ class RedisBackend(MessagingBackend):
             raise ValueError("RedisBackend requires decode_responses=False")
         self._client = cast(_AsyncRedisClient, client)
         self._prefix = key_prefix
-        self._lease_ttl = lease_ttl
-        self._lease_ms = max(1, math.ceil(lease_ttl * 1000))
-        self._poll_interval = poll_interval
+        self._lease_ttl = resolved_lease_ttl
+        self._lease_ms = max(1, math.ceil(resolved_lease_ttl * 1000))
+        self._poll_interval = resolved_poll_interval
         self._socket_timeout_budget_ms = self._socket_timeout_budget(
             connection_options.get("socket_timeout")
         )
         self._worker_id = uuid4().hex
+        self._limits = limits
+
+    @property
+    def limits(self) -> MessagingLimits:
+        """Return the immutable limits shared by this Redis deployment."""
+
+        return self._limits
 
     async def prepare(
         self,
@@ -77,6 +110,8 @@ class RedisBackend(MessagingBackend):
         cancellable: bool,
         recoverable: bool,
     ) -> PreparedRun:
+        """Atomically start, recover, or attach to one Redis-backed run."""
+
         return await _redis_journal.prepare(
             self,
             channel=channel,
@@ -96,6 +131,8 @@ class RedisBackend(MessagingBackend):
         payload: bytes,
         checkpoint: RecoveryCheckpoint | None = None,
     ) -> MessageEnvelope:
+        """Idempotently append one message under lease, fence, and quota checks."""
+
         return await _redis_journal.append(
             self,
             handle,
@@ -120,6 +157,8 @@ class RedisBackend(MessagingBackend):
         status: FinalRunStatus,
         error: BaseException | None = None,
     ) -> None:
+        """Commit a terminal run status and release its Redis lease."""
+
         return await _redis_control.finish(
             self,
             handle,
@@ -128,6 +167,8 @@ class RedisBackend(MessagingBackend):
         )
 
     async def latest_seq(self, *, channel: str, identity: Identity) -> int:
+        """Return the active generation's latest committed sequence."""
+
         return await _redis_journal.latest_seq(
             self,
             channel=channel,
@@ -142,6 +183,8 @@ class RedisBackend(MessagingBackend):
         after: int = 0,
         limit: int = 100,
     ) -> tuple[MessageEnvelope, ...]:
+        """Read a bounded Redis page after a strictly validated cursor."""
+
         return await _redis_journal.read(
             self,
             channel=channel,
@@ -155,13 +198,15 @@ class RedisBackend(MessagingBackend):
         *,
         channel: str,
         identity: Identity,
+        after: int,
     ) -> BackendRunHandle:
-        """Resolve one read-only follower to an authoritative Redis generation."""
+        """Resolve one follower and validate its cursor against the bound generation."""
 
         return await _redis_journal.bind_follow(
             self,
             channel=channel,
             identity=identity,
+            after=after,
         )
 
     def follow(
@@ -170,6 +215,8 @@ class RedisBackend(MessagingBackend):
         *,
         after: int,
     ) -> AsyncGenerator[MessageEnvelope, None]:
+        """Follow one fenced generation until its run becomes terminal."""
+
         return _redis_journal.follow(
             self,
             handle,
@@ -177,24 +224,32 @@ class RedisBackend(MessagingBackend):
         )
 
     async def request_cancel(self, handle: BackendRunHandle) -> bool:
+        """Durably request cancellation while the run still accepts it."""
+
         return await _redis_control.request_cancel(
             self,
             handle,
         )
 
     async def wait_for_cancel(self, handle: BackendRunHandle) -> bool:
+        """Wait for a cancellation signal or terminal run state."""
+
         return await _redis_control.wait_for_cancel(
             self,
             handle,
         )
 
     async def wait_finished(self, handle: BackendRunHandle) -> RunStatus:
+        """Wait for and return the durable terminal status."""
+
         return await _redis_control.wait_finished(
             self,
             handle,
         )
 
     async def failure(self, handle: BackendRunHandle) -> BaseException | None:
+        """Reconstruct the trusted producer failure for a terminal run."""
+
         return await _redis_control.failure(
             self,
             handle,

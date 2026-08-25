@@ -4,33 +4,21 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import cast
 from uuid import NAMESPACE_URL, uuid5
 
 from ag_ui.core import (
     BaseEvent,
-    RunAgentInput,
     RunErrorEvent,
-    RunFinishedEvent,
     RunStartedEvent,
 )
-from ag_ui.core import (
-    Interrupt as AgUiInterrupt,
-)
+from ag_ui.core import Interrupt as AgUiInterrupt
 from ag_ui.core.types import ResumeEntry
 from langchain.agents.middleware.types import InputAgentState
 from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
-from langgraph.types import Command
-from pydantic import BaseModel, ConfigDict, JsonValue, ValidationError, model_validator
+from pydantic import JsonValue, ValidationError
 
-from tinkerfin import AgentMode, AgUiResumeBinding, Identity
-from tinkerfin_agui_adapter.resume import ResumeMapper, ResumeMappingError
-from tinkerfin_messaging import (
-    FiniteMessageSource,
-    MessageSourceBinding,
-    ProfiledDeferredMessageSource,
-)
+from tinkerfin import AgentMode, AgUiResumeBinding, AgUiResumeBindingError, Identity
 from tinkerfin_studio.api.errors import BusinessException, ConversationErrorCode
 from tinkerfin_studio.conversation.models import ConversationInterrupt
 from tinkerfin_studio.conversation.request import ChatRequest
@@ -38,13 +26,10 @@ from tinkerfin_studio.conversation.request import ChatRequest
 _DEFAULT_TITLE = "新会话"
 
 
-def conversation_identity(user_id: int, thread_id: str, run_id: str) -> Identity:
-    """创建用户隔离的 Graph、Messaging 与 checkpoint 运行身份"""
+def conversation_identity(thread_id: str, run_id: str) -> Identity:
+    """创建公开生命周期与持久执行共用的会话身份"""
 
-    return Identity(
-        threadId=f"users/{user_id}/threads/{thread_id}",
-        runId=run_id,
-    )
+    return Identity(threadId=thread_id, runId=run_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,22 +55,12 @@ ChatIntent = StartChatIntent | ResumeChatIntent
 class PreparedRunRequest:
     """数据库、Messaging、Graph 与主开始事件共用的权威请求事实"""
 
-    protocol_input: RunAgentInput
     input_json: dict[str, JsonValue]
     identity: Identity
+    parent_run_id: str | None
     graph_config: RunnableConfig
     message_ids: tuple[str, ...]
     mode: AgentMode
-
-
-@dataclass(frozen=True, slots=True)
-class PreparedResume:
-    """互斥且经过校验的恢复执行结果"""
-
-    graph_input: Command | None
-    binding: AgUiResumeBinding | None
-    persisted_config: dict[str, JsonValue]
-    claimed_interrupt_ids: frozenset[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,24 +70,6 @@ class RegisteredRun:
     run_id: int
     created: bool
     claimed_interrupt_ids: frozenset[str]
-
-
-class _PersistedResumeConfig(BaseModel):
-    """数据库中与恢复执行相关的精确配置片段"""
-
-    model_config = ConfigDict(extra="allow", strict=True)
-
-    resume_abandoned: bool = False
-    resume_data: dict[str, JsonValue] | None = None
-    prior_tool_call_ids: list[str] | None = None
-
-    @model_validator(mode="after")
-    def resume_modes_are_exclusive(self) -> _PersistedResumeConfig:
-        if self.resume_abandoned and self.resume_data is not None:
-            raise ValueError("abandoned 与 command 恢复状态不能同时存在")
-        if self.resume_data is not None and self.prior_tool_call_ids is None:
-            raise ValueError("command 恢复状态缺少 prior_tool_call_ids")
-        return self
 
 
 def classify_intent(request: ChatRequest) -> ChatIntent:
@@ -159,19 +116,11 @@ def prepare_run_request(
         )
         for index in range(len(request.messages))
     )
-    protocol_input = request.normalized(
+    input_json = request.normalized_json(
         thread_id=thread_id,
         message_ids=message_ids,
     )
-    input_json = cast(
-        dict[str, JsonValue],
-        protocol_input.model_dump(
-            mode="json",
-            by_alias=True,
-            exclude_none=False,
-        ),
-    )
-    identity = conversation_identity(user_id, thread_id, request.run_id)
+    identity = conversation_identity(thread_id, request.run_id)
     graph_config: RunnableConfig = {
         "configurable": {
             "thread_id": identity.thread_id,
@@ -182,9 +131,9 @@ def prepare_run_request(
         }
     }
     return PreparedRunRequest(
-        protocol_input=protocol_input,
         input_json=input_json,
         identity=identity,
+        parent_run_id=request.parent_run_id,
         graph_config=graph_config,
         message_ids=message_ids,
         mode=request.forwarded_props.agent_mode,
@@ -206,137 +155,50 @@ def bind_start_graph_input(
 def prepare_resume(
     request: ChatRequest,
     *,
-    identity: Identity,
-    existing_config: dict[str, object] | None,
     interrupts: Sequence[ConversationInterrupt],
-) -> PreparedResume:
-    """解析持久恢复状态或从可信 interrupt 生成新的恢复命令"""
-
-    claimed_ids = frozenset(entry.interrupt_id for entry in request.resume or ())
-    if existing_config is not None:
-        try:
-            persisted = _PersistedResumeConfig.model_validate(existing_config)
-        except ValidationError as error:
-            raise BusinessException(
-                ConversationErrorCode.RESUME_REQUIRED,
-                message="服务端保存的审批状态无法恢复",
-            ) from error
-        if persisted.resume_abandoned:
-            return PreparedResume(None, None, {"resume_abandoned": True}, claimed_ids)
-        if persisted.resume_data is not None:
-            command = Command(resume=persisted.resume_data)
-            try:
-                binding = AgUiResumeBinding(
-                    identity=identity,
-                    command=command,
-                    prior_tool_call_ids=frozenset(persisted.prior_tool_call_ids or ()),
-                )
-            except (TypeError, ValueError) as error:
-                raise BusinessException(
-                    ConversationErrorCode.RESUME_REQUIRED,
-                    message="服务端保存的审批状态无法恢复",
-                ) from error
-            return PreparedResume(
-                binding.command,
-                binding,
-                {
-                    "resume_data": persisted.resume_data,
-                    "prior_tool_call_ids": list(persisted.prior_tool_call_ids or ()),
-                },
-                claimed_ids,
-            )
+) -> AgUiResumeBinding:
+    """从业务层保存的公开审批事实构造框架恢复 Binding"""
 
     try:
-        translation = ResumeMapper().map_agui(
+        return AgUiResumeBinding.from_agui(
             entries=request.resume or (),
             interrupts=tuple(
                 AgUiInterrupt.model_validate(entity.request_json)
                 for entity in interrupts
             ),
         )
-    except (ResumeMappingError, ValidationError) as error:
+    except (AgUiResumeBindingError, ValidationError) as error:
         message = (
             error.message
-            if isinstance(error, ResumeMappingError)
+            if isinstance(error, AgUiResumeBindingError)
             else "服务端保存的审批状态无法恢复"
         )
         raise BusinessException(
             ConversationErrorCode.RESUME_REQUIRED,
             message=message,
         ) from error
-    if translation.mode == "custom":
-        raise BusinessException(ConversationErrorCode.MIXED_RESUME_UNSUPPORTED)
-    if translation.mode == "abandon":
-        return PreparedResume(None, None, {"resume_abandoned": True}, claimed_ids)
-    binding = AgUiResumeBinding.from_translation(
-        identity=identity,
-        translation=translation,
-    )
-    return PreparedResume(
-        binding.command,
-        binding,
-        {
-            "resume_data": translation.root,
-            "prior_tool_call_ids": list(translation.prior_tool_call_ids),
-        },
-        claimed_ids,
-    )
 
 
-def enrich_main_event(
+def decorate_main_event(
     event: BaseEvent,
     *,
     prepared: PreparedRunRequest,
     title: str,
 ) -> BaseEvent:
-    """统一补充主运行公开 thread、canonical input、标题和取消文案"""
+    """只补充 Studio 产品标题和取消文案，不重写框架协议字段"""
 
     run_id = prepared.identity.run_id
-    public_thread_id = prepared.protocol_input.thread_id
     if isinstance(event, RunStartedEvent) and event.run_id == run_id:
-        raw_event = dict(event.raw_event) if isinstance(event.raw_event, dict) else None
-        if raw_event is not None:
-            raw_event.update({"threadId": public_thread_id, "runId": run_id})
-        return event.model_copy(
-            update={
-                "thread_id": public_thread_id,
-                "input": prepared.protocol_input,
-                "title": title,
-                "raw_event": raw_event,
-            }
-        )
-    if isinstance(event, RunFinishedEvent) and event.run_id == run_id:
-        return event.model_copy(update={"thread_id": public_thread_id})
+        return event.model_copy(update={"title": title})
     if isinstance(event, RunErrorEvent):
-        raw_event = dict(event.raw_event) if isinstance(event.raw_event, dict) else {}
+        raw_event = event.raw_event
+        if not isinstance(raw_event, dict):
+            return event
         if raw_event.get("runId") != run_id:
             return event
-        raw_event.update({"threadId": public_thread_id, "runId": run_id})
-        update: dict[str, object] = {"raw_event": raw_event}
         if event.code == "cancelled":
-            update["message"] = "聊天生成已取消"
-        return event.model_copy(update=update)
+            return event.model_copy(update={"message": "聊天生成已取消"})
     return event
-
-
-def finite_agui_events(
-    events: Sequence[BaseEvent],
-    *,
-    identity: Identity,
-) -> ProfiledDeferredMessageSource[BaseEvent, BaseEvent]:
-    """把有限主生命周期发布为无需重复身份参数的 AG-UI profile source"""
-
-    async def open_events() -> MessageSourceBinding[BaseEvent]:
-        return MessageSourceBinding(source=FiniteMessageSource.from_events(events))
-
-    return ProfiledDeferredMessageSource(
-        open_events,
-        identity=identity,
-        codec_profile="agui.event.v1",
-        source_type=BaseEvent,
-        replay_type=BaseEvent,
-        cancellable=False,
-    )
 
 
 def _title_from_content(content: JsonValue | None) -> str:
@@ -403,7 +265,6 @@ def _langchain_user_content(
 
 __all__ = [
     "ChatIntent",
-    "PreparedResume",
     "PreparedRunRequest",
     "RegisteredRun",
     "ResumeChatIntent",
@@ -411,8 +272,7 @@ __all__ = [
     "bind_start_graph_input",
     "classify_intent",
     "conversation_identity",
-    "enrich_main_event",
-    "finite_agui_events",
+    "decorate_main_event",
     "prepare_resume",
     "prepare_run_request",
 ]

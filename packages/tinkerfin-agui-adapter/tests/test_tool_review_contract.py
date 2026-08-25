@@ -160,7 +160,7 @@ def test_parser_rejects_missing_unknown_or_tampered_metadata(
 @pytest.mark.parametrize(
     "update",
     (
-        {"reason": "langgraph_interrupt"},
+        {"reason": "langgraph:interrupt"},
         {"tool_call_id": "not-scoped"},
         {"id": "wrong-public-id"},
         {"metadata": {"deepagents": {}}},

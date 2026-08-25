@@ -124,6 +124,7 @@ async def abort(self: AgUiEventStream) -> list[BaseEvent]:
                     identity=self._identity,
                     message="Agent run cancelled",
                     code="cancelled",
+                    parent_run_id=self._parent_run_id,
                 )
             )
         )
@@ -365,6 +366,8 @@ def _decorate_initialization_event(
             "runId": self._identity.run_id,
         }
     )
+    if self._parent_run_id is not None:
+        raw_event["parentRunId"] = self._parent_run_id
     raw_event["initializationFailed"] = True
     return event.model_copy(update={"raw_event": raw_event})
 
