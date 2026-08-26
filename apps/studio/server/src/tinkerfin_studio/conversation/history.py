@@ -51,7 +51,7 @@ class _HistoryCursorPayload(BaseModel):
 
     pinned: bool = Field(description="游标行是否置顶")
     updated_at: datetime = Field(
-        alias="updatedAt", description="游标行的无时区数据库更新时间"
+        alias="updatedAt", description="游标行的无时区最近会话活动时间"
     )
     row_id: int = Field(alias="id", gt=0, description="游标行数据库主键")
     query: str | None = Field(
@@ -154,7 +154,7 @@ class ConversationHistoryService:
         cursor: str | None,
         query: str | None = None,
     ) -> ConversationHistoryListResponse:
-        """按标题查询、置顶和更新时间稳定分页"""
+        """按标题查询、置顶和最近会话活动时间稳定分页"""
 
         resolved_query = (query.strip() or None) if query is not None else None
         resolved = self._decode_cursor(cursor, query=resolved_query)

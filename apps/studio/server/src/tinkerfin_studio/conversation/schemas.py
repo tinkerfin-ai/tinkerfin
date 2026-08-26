@@ -23,7 +23,10 @@ class ConversationHistoryListItem(BaseModel):
     has_pending_interrupt: bool = Field(alias="hasPendingInterrupt")
     pinned: bool
     created_at: datetime = Field(alias="createdAt")
-    updated_at: datetime = Field(alias="updatedAt")
+    updated_at: datetime = Field(
+        alias="updatedAt",
+        description="用于历史排序的最近会话活动时间，元信息修改不改变该值",
+    )
 
 
 class ConversationHistoryListResponse(BaseModel):
@@ -81,7 +84,10 @@ class ConversationHistoryDetail(BaseModel):
     snapshot: dict[str, JsonValue] | None
     events: list[ConversationEventEnvelope]
     created_at: datetime = Field(alias="createdAt")
-    updated_at: datetime = Field(alias="updatedAt")
+    updated_at: datetime = Field(
+        alias="updatedAt",
+        description="用于历史排序的最近会话活动时间，元信息修改不改变该值",
+    )
 
 
 class ConversationThreadUpdate(BaseModel):

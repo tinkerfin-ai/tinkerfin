@@ -341,6 +341,116 @@ async def test_large_legal_user_message_persists_only_in_authoritative_history(
     assert await repository.count_events(thread.id) == 2
 
 
+async def test_metadata_updates_preserve_order_until_the_next_conversation_event(
+    session: AsyncSession,
+) -> None:
+    """重命名和置顶不得冒充聊天活动刷新历史顺序"""
+
+    repository = ConversationRepository(session)
+    older = await repository.create_thread(
+        user_id=7,
+        thread_id="thread-1",
+        title="较旧会话",
+        model_id="main",
+    )
+    newer = await repository.create_thread(
+        user_id=7,
+        thread_id="thread-newer",
+        title="较新会话",
+        model_id="main",
+    )
+    await repository.create_main_run(
+        thread_id=older.id,
+        run_id="run-1",
+        model_id="main",
+        input_json={
+            "messages": [{"id": "user-1", "role": "user", "content": "继续聊天"}]
+        },
+        config_json={},
+    )
+    older_activity_at = datetime(2026, 8, 18, 0, 0)
+    newer_activity_at = datetime(2026, 8, 18, 1, 0)
+    older.updated_at = older_activity_at
+    newer.updated_at = newer_activity_at
+    await repository.commit()
+
+    await repository.update_thread_meta(
+        thread_pk=older.id,
+        title=None,
+        pinned=None,
+    )
+    await repository.update_thread_meta(
+        thread_pk=older.id,
+        title="已重命名会话",
+        pinned=None,
+    )
+    await repository.commit()
+
+    renamed = await repository.reload_thread(user_id=7, thread_id=older.thread_id)
+    assert renamed is not None
+    assert renamed.title == "已重命名会话"
+    assert renamed.updated_at == older_activity_at
+    unpinned_order = await repository.list_threads(
+        user_id=7,
+        page_size=10,
+        cursor=None,
+    )
+    assert [thread.thread_id for thread in unpinned_order] == [
+        newer.thread_id,
+        older.thread_id,
+    ]
+
+    await repository.update_thread_meta(
+        thread_pk=newer.id,
+        title=None,
+        pinned=True,
+    )
+    await repository.update_thread_meta(
+        thread_pk=older.id,
+        title=None,
+        pinned=True,
+    )
+    await repository.commit()
+
+    pinned = await repository.reload_thread(user_id=7, thread_id=older.thread_id)
+    assert pinned is not None
+    assert pinned.pinned is True
+    assert pinned.updated_at == older_activity_at
+    pinned_order = await repository.list_threads(
+        user_id=7,
+        page_size=10,
+        cursor=None,
+    )
+    assert [thread.thread_id for thread in pinned_order] == [
+        newer.thread_id,
+        older.thread_id,
+    ]
+
+    envelope, event = _envelope(
+        1,
+        {"type": "RUN_STARTED", "threadId": older.thread_id, "runId": "run-1"},
+    )
+    await ConversationProjector(session).project(
+        thread_pk=older.id,
+        envelope=envelope,
+        event=event,
+    )
+    await repository.commit()
+
+    active = await repository.reload_thread(user_id=7, thread_id=older.thread_id)
+    assert active is not None
+    assert active.updated_at == datetime(2026, 8, 18, 1, 1)
+    active_order = await repository.list_threads(
+        user_id=7,
+        page_size=10,
+        cursor=None,
+    )
+    assert [thread.thread_id for thread in active_order] == [
+        older.thread_id,
+        newer.thread_id,
+    ]
+
+
 async def test_projection_builds_tool_todo_and_interrupt_snapshot(
     session: AsyncSession,
 ) -> None:

@@ -392,13 +392,15 @@ class ConversationRepository:
         title: str | None,
         pinned: bool | None,
     ) -> None:
-        """只更新调用方明确提交的会话元信息"""
+        """更新明确提交的元信息，并保留历史排序使用的活动时间"""
 
-        values: dict[str, object] = {"updated_at": _now()}
+        values: dict[str, object] = {}
         if title is not None:
             values["title"] = title
         if pinned is not None:
             values["pinned"] = pinned
+        if not values:
+            return
         await self._session.execute(
             update(ConversationThread)
             .where(ConversationThread.id == thread_pk)
