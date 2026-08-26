@@ -41,7 +41,7 @@
     color: var(--color-text-primary);
     font-size: var(--type-conversation-user-size);
     line-height: var(--type-conversation-user-line);
-    word-break: keep-all;
+    word-break: normal;
     overflow-wrap: break-word;
   }
 

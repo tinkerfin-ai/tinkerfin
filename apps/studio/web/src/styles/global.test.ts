@@ -566,6 +566,7 @@ describe('前端视觉契约', () => {
 
     expect(workspaceStyles).toMatch(/\.new-chat\s*\{[^}]*border-radius:\s*var\(--radius-lg\);[^}]*background:\s*var\(--color-layer-1\);/s)
     expect(conversationStyles).toMatch(/\.user-message \.message-markdown\s*\{[^}]*border-radius:\s*var\(--radius-3xl\);/s)
+    expect(conversationStyles).toMatch(/\.user-message \.message-markdown\s*\{[^}]*word-break:\s*normal;[^}]*overflow-wrap:\s*break-word;/s)
     expect(conversationStyles).toMatch(/\.markdown-code-block\s*\{[^}]*border-radius:\s*var\(--radius-3xl\);/s)
     expect(conversationStyles).toMatch(/\.composer\s*\{[^}]*border-radius:\s*var\(--radius-3xl\);/s)
     expect(conversationStyles).toMatch(/\.approval-composer,[\s\S]*\.plan-review-composer\s*\{[^}]*border-radius:\s*var\(--radius-3xl\);/s)
