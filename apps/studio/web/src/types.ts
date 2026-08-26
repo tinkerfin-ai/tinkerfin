@@ -2,7 +2,7 @@ export type MessageRole = 'user' | 'assistant' | 'process' | 'tool' | 'subagent'
 export type TodoStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled'
 export type ApprovalDecision = 'approved' | 'rejected'
 export type ConversationRunStatus = 'idle' | 'streaming' | 'waiting_approval' | 'detached' | 'error'
-export type ApprovalMode = 'options' | 'edit' | 'reject'
+export type ApprovalMode = 'options' | 'reject'
 export type ApprovalAllowedDecision = 'approve' | 'edit' | 'reject' | 'respond'
 export type AgentMode = 'default' | 'plan'
 
@@ -70,8 +70,6 @@ export interface ApprovalItem {
   originalArgs: JsonObject
   allowedDecisions: ApprovalAllowedDecision[]
   decision?: ApprovalDecision
-  editedArgs?: JsonObject
-  editedParams?: string
   rejectionReason?: string
 }
 
@@ -137,8 +135,7 @@ export interface PlanReviewState {
   interruptId: string
   revision: number
   draft: MarkdownPlanDraft
-  action?: 'approve' | 'edit' | 'respond' | 'reject'
-  editedMarkdown?: string
+  action?: 'approve' | 'respond' | 'reject'
   message?: string
   submitted: boolean
   error?: string

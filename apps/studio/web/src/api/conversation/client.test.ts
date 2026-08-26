@@ -248,8 +248,33 @@ describe('conversation stream client', () => {
     expect(cancel).not.toHaveBeenCalled()
   })
 
+  it('accepts one valid event whose JSON data is exactly 4 MiB', async () => {
+    const limit = 4 * 1024 * 1024
+    const empty = JSON.stringify({
+      type: 'TEXT_MESSAGE_CONTENT',
+      messageId: 'message-large',
+      delta: '',
+    })
+    const event = JSON.stringify({
+      type: 'TEXT_MESSAGE_CONTENT',
+      messageId: 'message-large',
+      delta: 'x'.repeat(limit - new TextEncoder().encode(empty).byteLength),
+    })
+    expect(new TextEncoder().encode(event).byteLength).toBe(limit)
+    vi.stubGlobal('fetch', vi.fn(async () => sseResponse(`data: ${event}\n\n`)))
+
+    const received = []
+    for await (const item of startConversationRun(requestPayload)) received.push(item)
+
+    expect(received).toHaveLength(1)
+    expect(received[0]?.event).toMatchObject({
+      type: 'TEXT_MESSAGE_CONTENT',
+      messageId: 'message-large',
+    })
+  })
+
   it.each([
-    ['single line', `data: ${'x'.repeat((1024 * 1024) + 1)}`],
+    ['single line', `data: ${'x'.repeat((4 * 1024 * 1024) + 1)}`],
     ['frame line count', `${'x:\n'.repeat(4097)}\n`],
     ['frame data bytes', `${Array.from(
       { length: 5 },

@@ -134,7 +134,7 @@ export function ToolCallRow({
         <span className="tool-row-visually-hidden">{statusText(status, t)}</span>
         <span className="tool-row-leading" aria-hidden="true">
           <span className="tool-row-icon">
-            {status === 'failed' || status === 'paused' || status === 'cancelled'
+            {status === 'failed' || status === 'cancelled'
               ? <span className={`tool-row-state-dot is-${status}`} />
               : <ToolIcon size={14} strokeWidth={2} />}
           </span>

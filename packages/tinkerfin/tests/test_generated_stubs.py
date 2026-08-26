@@ -202,6 +202,24 @@ def test_generated_stub_declares_precise_facade_return_types() -> None:
     assert "ParamSpec" not in _DEEP_AGENT_STUB.read_text(encoding="utf-8")
 
 
+def test_root_stub_does_not_export_low_level_source_contracts() -> None:
+    module = ast.parse(_INIT_STUB.read_text(encoding="utf-8"))
+    imported = {
+        alias.asname or alias.name
+        for node in module.body
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+    }
+
+    assert {
+        "AgUiNativeStreamConfig",
+        "AgUiNativeStreamInvocation",
+        "GraphRunStream",
+        "NativeTinkerFinRun",
+        "TinkerFinRun",
+    }.isdisjoint(imported)
+
+
 def test_root_stub_keeps_plan_annotation_dependencies_private() -> None:
     module = ast.parse(_INIT_STUB.read_text(encoding="utf-8"))
     aliases = {
@@ -216,6 +234,7 @@ def test_root_stub_keeps_plan_annotation_dependencies_private() -> None:
         "ClarificationFormBase": "_ClarificationFormBase",
         "DefaultClarificationForm": "_DefaultClarificationForm",
         "PlanContentModel": "_PlanContentModel",
+        "PlanReviewAction": "_PlanReviewAction",
         "StructuredPlanContent": "_StructuredPlanContent",
     }
     plan = _stub_method(_INIT_STUB, "TinkerFin", "plan")
@@ -241,6 +260,17 @@ def test_root_stub_keeps_plan_annotation_dependencies_private() -> None:
     plan_schema_default = plan.args.kw_defaults[plan_schema_index]
     assert isinstance(plan_schema_default, ast.Name)
     assert plan_schema_default.id == "_StructuredPlanContent"
+    review_actions_index = next(
+        index
+        for index, argument in enumerate(plan.args.kwonlyargs)
+        if argument.arg == "review_actions"
+    )
+    review_actions_annotation = plan.args.kwonlyargs[review_actions_index].annotation
+    assert review_actions_annotation is not None
+    assert ast.unparse(review_actions_annotation) == "Sequence[_PlanReviewAction]"
+    review_actions_default = plan.args.kw_defaults[review_actions_index]
+    assert isinstance(review_actions_default, ast.Name)
+    assert review_actions_default.id == "_DEFAULT_PLAN_REVIEW_ACTIONS"
 
 
 def test_built_wheel_contains_the_generated_stubs(tmp_path: Path) -> None:

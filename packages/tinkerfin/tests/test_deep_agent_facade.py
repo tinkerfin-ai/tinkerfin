@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from typing import Any, TypedDict, cast
 
 import pytest
-from ag_ui.core import BaseEvent, RunStartedEvent
+from ag_ui.core import BaseEvent, RunErrorEvent, RunStartedEvent
 from langchain.agents.middleware.types import InputAgentState
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
@@ -123,6 +123,13 @@ def _install_builder(
         raising=False,
     )
     return calls, graphs
+
+
+def _call_with_positional_input(
+    operation: Callable[..., object],
+    graph_input: object,
+) -> object:
+    return operation(graph_input)
 
 
 def _definition(
@@ -265,9 +272,11 @@ async def test_resume_runtime_rejects_graph_input_without_consuming_runtime(
         resume=binding,
         on_part=on_part,
     )
-
     with pytest.raises(TypeError):
-        runtime.astream(Command(resume={"decisions": [{"type": "reject"}]}))
+        _call_with_positional_input(
+            runtime.astream,
+            Command(resume={"decisions": [{"type": "reject"}]}),
+        )
 
     assert graphs[0].calls == []
     assert observed == []
@@ -312,7 +321,9 @@ async def test_all_cancelled_resume_uses_a_finite_runtime_without_building_graph
     assert started.thread_id == "thread-1"
     assert started.parent_run_id == "run-parent"
     assert started.input is None
-    assert events[-1].code == "resume_cancelled"
+    terminal = events[-1]
+    assert isinstance(terminal, RunErrorEvent)
+    assert terminal.code == "resume_cancelled"
     assert observed_checkpoints == []
 
 

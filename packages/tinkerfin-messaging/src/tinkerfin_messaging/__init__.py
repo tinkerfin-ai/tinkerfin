@@ -8,6 +8,7 @@ from .backend import BackendRunHandle as BackendRunHandle
 from .backend import MemoryBackend as MemoryBackend
 from .backend import MessagingBackend as MessagingBackend
 from .backend import PreparedRun as PreparedRun
+from .backend import RunStatus as RunStatus
 from .errors import BackendOwnershipLost as BackendOwnershipLost
 from .errors import CancellationUnsupported as CancellationUnsupported
 from .errors import CodecMismatch as CodecMismatch
@@ -109,6 +110,7 @@ __all__ = [
     "RunAlreadyActive",
     "RunNotFound",
     "RunProducerFailed",
+    "RunStatus",
     "SourceProfileMismatch",
     "SseRenderer",
     "SseRenderingUnsupported",

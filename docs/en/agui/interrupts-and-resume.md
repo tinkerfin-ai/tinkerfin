@@ -37,7 +37,7 @@ runtime = agent.new_agui(identity=identity, mode="plan")
 | Reason | Expected resolved payload |
 | --- | --- |
 | `tinkerfin:plan_clarification` | `{"type":"respond","answers":[{"questionId":"...","optionId":"..."}]}` for an option, `{"type":"respond","answers":[{"questionId":"...","answer":"..."}]}` for free text, or `{"type":"respond","answers":[{"questionId":"...","skipped":true}]}` for an optional skip |
-| `tinkerfin:plan_review` | `approve`, `edit`, `respond`, or `reject`, each with the current `baseRevision` |
+| `tinkerfin:plan_review` | One decision permitted by the interrupt response Schema, with the current `baseRevision`; the default is `approve`, `respond`, or `reject`, while `edit` requires explicit host configuration |
 
 A Plan interrupt has no `toolCallId`. It carries a versioned trusted runtime envelope,
 its response JSON Schema, and `tinkerfin.plan-clarification.v2` metadata containing the

@@ -19,7 +19,6 @@ const conversationErrorMessageKeys = {
   plan_required_answers_missing: '请回答所有必填的 Plan 澄清问题',
   plan_option_required: '该问题必须选择一个选项',
   plan_action_required: '请选择 Plan 处理方式',
-  plan_edit_empty: '编辑后的计划不能为空',
   plan_feedback_required: '请填写 Plan 修改意见',
   plan_submit_failed: 'Plan 请求无法提交',
 } as const satisfies Record<string, TranslationKey>

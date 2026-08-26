@@ -1,7 +1,7 @@
 import { act, renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { Conversation } from '../../types'
+import type { ApprovalState, Conversation } from '../../types'
 import { useConversationScroll } from './useConversationScroll'
 
 const conversation: Conversation = {
@@ -15,6 +15,23 @@ const conversation: Conversation = {
   todos: [],
   runStatus: 'idle',
   isHydrated: true,
+}
+
+const pendingApproval: ApprovalState = {
+  activeIndex: 0,
+  submitted: false,
+  mode: 'options',
+  items: [{
+    id: 'approval-scroll',
+    interruptId: 'interrupt-scroll',
+    toolCallId: 'tool-scroll',
+    toolName: 'write_file',
+    params: '{"file_path":"/scroll.txt"}',
+    input: '/scroll.txt',
+    description: '等待写入文件',
+    originalArgs: { file_path: '/scroll.txt' },
+    allowedDecisions: ['approve', 'reject'],
+  }],
 }
 
 describe('useConversationScroll', () => {
@@ -262,5 +279,53 @@ describe('useConversationScroll', () => {
 
     expect(pane.scrollTop).toBe(180)
     expect(result.current.showScrollToBottom).toBe(true)
+  })
+
+  it('待审批出现时仅一次滚到底部，之后保留用户手动位置', () => {
+    const { result, rerender } = renderHook(
+      ({ currentConversation }) => useConversationScroll({
+        conversation: currentConversation,
+        isRunning: false,
+      }),
+      { initialProps: { currentConversation: conversation } },
+    )
+    const pane = document.createElement('section')
+    Object.defineProperties(pane, {
+      clientHeight: { configurable: true, value: 400 },
+      scrollHeight: { configurable: true, value: 1200 },
+      scrollTop: { configurable: true, writable: true, value: 180 },
+    })
+    result.current.paneRef.current = pane
+    window.sessionStorage.setItem('tinkerfin:conversation-scroll:thread-scroll', '180')
+
+    const approvalConversation: Conversation = {
+      ...conversation,
+      runStatus: 'waiting_approval',
+      approval: pendingApproval,
+    }
+    rerender({ currentConversation: approvalConversation })
+    act(() => vi.advanceTimersByTime(0))
+    expect(pane.scrollTop).toBe(1200)
+
+    pane.scrollTop = 260
+    act(() => {
+      result.current.markUserScrollIntent()
+      result.current.handleScroll(pane)
+    })
+    act(() => vi.advanceTimersByTime(0))
+
+    rerender({
+      currentConversation: {
+        ...approvalConversation,
+        messages: [{
+          id: 'approval-tail-update',
+          role: 'process',
+          content: '',
+          createdAt: '2026-08-24T00:00:01Z',
+        }],
+      },
+    })
+    act(() => vi.advanceTimersByTime(0))
+    expect(pane.scrollTop).toBe(260)
   })
 })

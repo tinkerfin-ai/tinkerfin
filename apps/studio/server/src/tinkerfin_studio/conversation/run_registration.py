@@ -32,12 +32,21 @@ from tinkerfin_studio.models.schemas import AgentModelConfig
 
 
 @dataclass(frozen=True, slots=True)
+class ResolvedThread:
+    """返回解析后的 thread 及其是否由当前请求创建"""
+
+    thread: ConversationThread
+    created: bool
+
+
+@dataclass(frozen=True, slots=True)
 class PreparedExecution:
     """外部流启动前已经提交的 thread、run 与恢复状态"""
 
     thread: ConversationThread
     registered: RegisteredRun
     resume: AgUiResumeBinding | None
+    thread_created: bool = False
 
 
 class ConversationRunPreparer:
@@ -60,8 +69,7 @@ class ConversationRunPreparer:
         request: ChatRequest,
         *,
         intent: StartChatIntent | ResumeChatIntent,
-        model_id: str,
-    ) -> ConversationThread:
+    ) -> ResolvedThread:
         """解析已有会话，或按 run 幂等创建新会话"""
 
         thread_id = request.thread_id.strip()
@@ -72,7 +80,7 @@ class ConversationRunPreparer:
             )
             if thread is None:
                 raise BusinessException(ConversationErrorCode.NOT_FOUND)
-            return thread
+            return ResolvedThread(thread=thread, created=False)
         if not isinstance(intent, StartChatIntent):
             raise BusinessException(ConversationErrorCode.USER_MESSAGE_REQUIRED)
         # 服务端生成的 opaque thread 同时作为公开与持久执行身份
@@ -87,15 +95,17 @@ class ConversationRunPreparer:
             thread_id=generated_thread_id,
         )
         if thread is not None:
-            return thread
+            return ResolvedThread(thread=thread, created=False)
+        created = False
         try:
             async with self._session.begin_nested():
                 thread = await self._repository.create_thread(
                     user_id=self._user_id,
                     thread_id=generated_thread_id,
                     title=intent.title,
-                    model_id=model_id,
+                    model_id=None,
                 )
+                created = True
         except IntegrityError:
             await self._repository.rollback()
             thread = await self._repository.get_thread(
@@ -105,7 +115,7 @@ class ConversationRunPreparer:
             if thread is None:
                 raise
         await self._repository.commit()
-        return thread
+        return ResolvedThread(thread=thread, created=created)
 
     async def register(
         self,
@@ -115,6 +125,7 @@ class ConversationRunPreparer:
         prepared: PreparedRunRequest,
         model: AgentModelConfig,
         thread: ConversationThread,
+        thread_created: bool = False,
     ) -> PreparedExecution:
         """原子认领 resume 并持久化或确认同身份主 run"""
 
@@ -158,6 +169,13 @@ class ConversationRunPreparer:
                     prepared=prepared,
                     thread=thread,
                 )
+            elif existing is None:
+                # 多标签页或直接 API 也必须先完成当前审批，不能只依赖前端禁用输入框
+                pending = await self._repository.list_pending_interrupts_for_update(
+                    thread_pk=thread.id
+                )
+                if pending:
+                    raise BusinessException(ConversationErrorCode.PENDING_INTERRUPT)
 
             resume = (
                 prepare_resume(
@@ -175,8 +193,6 @@ class ConversationRunPreparer:
                     thread=thread,
                 )
             self._require_same_input(existing, prepared)
-            if created:
-                thread.last_model = model.model_id
             await self._repository.commit()
             return PreparedExecution(
                 thread=thread,
@@ -186,6 +202,7 @@ class ConversationRunPreparer:
                     claimed_interrupt_ids=claimed_ids,
                 ),
                 resume=resume,
+                thread_created=thread_created,
             )
         except BaseException:
             await self._repository.rollback()
@@ -197,18 +214,19 @@ class ConversationRunPreparer:
         thread_pk: int,
         identity_run_id: str,
         registered: RegisteredRun,
+        thread_created: bool,
     ) -> None:
         """幂等释放未消费 claim，并删除尚未启动的数据库 run"""
 
         if not registered.created:
             await self._repository.rollback()
             return
-        await self._repository.release_pending_interrupt_claims(
+        await self._repository.delete_unstarted_run(
             thread_pk=thread_pk,
+            run_pk=registered.run_id,
             run_id=identity_run_id,
-            interrupt_ids=registered.claimed_interrupt_ids,
+            delete_empty_thread=thread_created,
         )
-        await self._repository.delete_run(registered.run_id)
         await self._repository.commit()
 
     async def _claim_resume(
@@ -352,4 +370,4 @@ class ConversationRunPreparer:
             raise BusinessException(ConversationErrorCode.RUN_IDENTITY_CONFLICT)
 
 
-__all__ = ["ConversationRunPreparer", "PreparedExecution"]
+__all__ = ["ConversationRunPreparer", "PreparedExecution", "ResolvedThread"]

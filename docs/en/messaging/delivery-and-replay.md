@@ -34,6 +34,7 @@ The resolver runs once before durable preparation. Committed sequence numbers be
 latest = await channel.latest_seq(identity=identity)
 page = await channel.read(identity=identity, after=100, limit=200)
 subscription = await channel.follow(identity=identity, after=100)
+status = await channel.get_run_status(identity=identity)
 ```
 
 | API | Scope | Result |
@@ -41,8 +42,13 @@ subscription = await channel.follow(identity=identity, after=100)
 | `latest_seq()` | whole thread | Current maximum seq, or 0 |
 | `read()` | whole thread | Finite ascending page |
 | `follow()` | selected run | Replay, then wait for its terminal state |
+| `get_run_status()` | selected run | Current durable run status without ownership |
 
 Thread-level methods use `identity.threadId`, but still accept the complete Identity so extensions never flatten thread and run into separate parameters.
+
+`get_run_status()` can atomically archive an expired producer lease as `owner_lost`.
+It raises `RunNotFound` when no durable record exists and never creates or recovers a
+producer.
 
 ## Envelope v2
 

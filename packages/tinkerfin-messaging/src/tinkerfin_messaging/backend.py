@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from abc import abstractmethod
 from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -175,6 +176,21 @@ class MessagingBackend(Protocol):
 
     async def latest_seq(self, *, channel: str, identity: Identity) -> int:
         """Return the current generation's last committed sequence."""
+
+        ...
+
+    @abstractmethod
+    async def get_run_status(
+        self,
+        *,
+        channel: str,
+        identity: Identity,
+    ) -> RunStatus:
+        """Return one durable run's current authoritative status.
+
+        A backend may atomically settle an expired producer lease as
+        ``owner_lost`` while obtaining this status.
+        """
 
         ...
 
@@ -607,6 +623,29 @@ class MemoryBackend(MessagingBackend):
                 return 0
             async with state.condition:
                 return len(state.messages)
+
+    async def get_run_status(
+        self,
+        *,
+        channel: str,
+        identity: Identity,
+    ) -> RunStatus:
+        """Return the current in-memory status for one exact semantic run."""
+
+        required_identifier("channel", channel)
+        required_identity(identity)
+        channel_state = self._channels.get(channel)
+        if channel_state is None:
+            raise RunNotFound(identity=identity)
+        async with channel_state.lock:
+            state = channel_state.streams.get(identity.thread_id)
+            if state is None:
+                raise RunNotFound(identity=identity)
+            async with state.condition:
+                record = state.runs.get(identity.run_id)
+                if record is None:
+                    raise RunNotFound(identity=identity)
+                return record.status
 
     async def read(
         self,

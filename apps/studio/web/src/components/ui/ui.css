@@ -218,7 +218,7 @@
     min-width: 0;
     padding-inline: var(--space-3);
     border: 1px solid var(--color-border);
-    border-radius: var(--radius-xl);
+    border-radius: var(--radius-3xl);
     background: var(--color-layer-1);
     color: var(--color-text-tertiary);
     transition:
@@ -229,7 +229,7 @@
 
   .ui-text-field--md .ui-text-field__control { min-height: var(--control-md); }
   .ui-text-field--lg .ui-text-field__control { min-height: var(--control-lg); }
-  .ui-text-field--capsule .ui-text-field__control { border-radius: var(--radius-input); }
+  .ui-text-field--capsule .ui-text-field__control { border-radius: var(--radius-3xl); }
 
   .ui-text-field__control:focus-within {
     border-color: var(--color-border-strong);
@@ -404,7 +404,7 @@
     width: min(100%, 440px);
     overflow: hidden;
     border: 1px solid var(--color-border);
-    border-radius: var(--radius-2xl);
+    border-radius: var(--radius-3xl);
     outline: 0;
     background: var(--color-layer-1);
     box-shadow: var(--shadow-3);
@@ -443,7 +443,7 @@
   .modal-dialog--action form { padding: var(--space-6) var(--space-5) var(--space-5); }
   .modal-dialog--action .modal-dialog-field { gap: 0; }
   .modal-dialog--action .modal-dialog-field .ui-text-field__control {
-    border-radius: var(--radius-lg);
+    border-radius: var(--radius-3xl);
   }
   .modal-dialog--action .modal-dialog-field .ui-text-field__control:has(input:disabled) {
     background: var(--color-subtle);

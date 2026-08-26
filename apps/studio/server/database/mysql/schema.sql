@@ -70,7 +70,7 @@ CREATE TABLE conversation_runs (
   agent_name VARCHAR(128) COMMENT '运行主体名称',
   graph_task_id VARCHAR(128) COMMENT '子图 runtime task ID',
   model_id VARCHAR(64) COMMENT '主 run 使用的稳定模型 ID',
-  status VARCHAR(32) NOT NULL COMMENT 'run 状态：running/success/interrupt/error/cancelled',
+  status VARCHAR(32) NOT NULL COMMENT 'run 状态：preparing/running/success/interrupt/error/cancelled',
   input_json JSON COMMENT '主 run 的完整请求输入',
   config_json JSON COMMENT 'checkpoint、模型与 resume 配置投影',
   outcome_json JSON COMMENT '最终 AG-UI outcome 或 error',
@@ -122,24 +122,6 @@ CREATE TABLE conversation_interrupts (
   CONSTRAINT uq_conversation_interrupts_thread_interrupt UNIQUE (conversation_thread_id, interrupt_id),
   KEY ix_conversation_interrupts_thread_status (conversation_thread_id, status, updated_at)
 ) COMMENT='前端可恢复的 HITL interrupt 投影';
-
-CREATE TABLE conversation_messages (
-  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '消息投影主键',
-  conversation_thread_id BIGINT NOT NULL COMMENT '所属会话主键，由应用层保证存在',
-  run_id VARCHAR(128) COMMENT '消息所属 run ID',
-  message_id VARCHAR(255) NOT NULL COMMENT 'AG-UI message ID',
-  `role` VARCHAR(32) NOT NULL COMMENT 'user/assistant/tool/subagent/process/error',
-  content TEXT NOT NULL COMMENT '聚合后的可见文本',
-  status VARCHAR(32) NOT NULL COMMENT 'streaming/completed/failed/paused',
-  meta_json JSON COMMENT 'Tool、Agent 与运行关联元数据',
-  first_seq BIGINT NOT NULL COMMENT '首次出现的事件序号',
-  last_seq BIGINT NOT NULL COMMENT '最后更新的事件序号',
-  created_at DATETIME NOT NULL COMMENT '创建时间',
-  updated_at DATETIME NOT NULL COMMENT '更新时间',
-  CONSTRAINT pk_conversation_messages PRIMARY KEY (id),
-  CONSTRAINT uq_conversation_messages_thread_message UNIQUE (conversation_thread_id, message_id),
-  KEY ix_conversation_messages_thread_role_updated (conversation_thread_id, `role`, updated_at, id)
-) COMMENT='用于历史恢复、检索和审计的消息聚合投影';
 
 CREATE TABLE store_migrations (
   v INTEGER NOT NULL COMMENT 'Store migration 版本',

@@ -22,11 +22,22 @@ type MessageStatus = NonNullable<Message['meta']>['status']
 
 function PlaceholderField({ status }: { status?: MessageStatus }) {
   const { t } = useI18n()
-  if (status === 'paused') {
-    return <span className="tool-field-placeholder">{t('等待审批后执行')}</span>
-  }
-  return status === 'running'
-    ? <span className="tool-skeleton" aria-label={t('工具字段加载中')} aria-busy="true" />
+  const pendingLabel = status === 'paused'
+    ? t('等待审批后执行')
+    : status === 'running'
+      ? t('工具字段加载中')
+      : undefined
+  return pendingLabel
+    ? (
+      <span
+        className="tool-field-pending"
+        role="status"
+        aria-label={pendingLabel}
+        aria-busy={status === 'running' ? true : undefined}
+      >
+        <i aria-hidden="true" />
+      </span>
+      )
     : <span className="tool-field-placeholder">—</span>
 }
 
@@ -47,19 +58,21 @@ function ToolDetails({ message }: { message: Message }) {
   return (
     <div className="tool-detail-card">
       <div className="tool-detail-section tool-detail-section--params">
-        <span className="tool-field-label">{t('参数')}</span>
+        <span className="tool-field-label">{t('输入')}</span>
         <CodeField value={message.meta?.params} status={message.meta?.status} />
       </div>
       <span className="tool-detail-divider" aria-hidden="true" />
       <div className="tool-detail-section tool-detail-section--result">
-        <span className="tool-field-label">{t('结果')}</span>
+        <span className="tool-field-label">{t('输出')}</span>
         <RichField value={message.meta?.result} status={message.meta?.status} />
       </div>
     </div>
   )
 }
 
-function MessageActionRow({ content }: { content: string }) {
+type MessageActionKind = 'user' | 'assistant'
+
+function MessageActionRow({ content, kind }: { content: string; kind: MessageActionKind }) {
   const { t } = useI18n()
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle')
   const resetTimer = useRef<number | null>(null)
@@ -79,22 +92,35 @@ function MessageActionRow({ content }: { content: string }) {
     resetTimer.current = window.setTimeout(() => setCopyState('idle'), COPY_FEEDBACK_DURATION_MS)
   }
 
-  const label = copyState === 'copied'
-    ? t('回答已复制')
-    : copyState === 'failed'
-      ? t('复制回答失败')
-      : t('复制回答')
+  const labels = kind === 'user'
+    ? {
+        copied: t('消息已复制'),
+        failed: t('复制消息失败'),
+        idle: t('复制消息'),
+        group: t('消息操作'),
+      }
+    : {
+        copied: t('回答已复制'),
+        failed: t('复制回答失败'),
+        idle: t('复制回答'),
+        group: t('回答操作'),
+      }
+  const label = labels[copyState]
 
   return (
-    <footer className="message-action-row" role="group" aria-label={t('回答操作')}>
+    <footer
+      className={`message-action-row message-action-row--${kind}`}
+      role="group"
+      aria-label={labels.group}
+    >
       <IconButton
         label={label}
         tooltip={label}
         icon={copyState === 'copied'
-          ? <Check size={16} />
+          ? <Check size={20} />
           : copyState === 'failed'
-            ? <TriangleAlert size={16} />
-            : <Copy size={16} />}
+            ? <TriangleAlert size={20} />
+            : <Copy size={20} />}
         onClick={() => void copyMessage()}
       />
       <span className="message-action-status" aria-live="polite">
@@ -153,11 +179,7 @@ function SubagentOutputNode({ message }: { message: Message }) {
       </span>
       <div className="subagent-output-copy">
         <strong>{label}</strong>
-        {result
-          ? <RichField value={result} status={status} className="subagent-trace-output" />
-          : status === 'running'
-            ? <ActivityDots label={t('正在运行')} />
-            : null}
+        {result ? <RichField value={result} status={status} className="subagent-trace-output" /> : null}
       </div>
     </li>
   )
@@ -247,7 +269,12 @@ function MessageBlockView({
 }) {
   const { t } = useI18n()
   if (message.role === 'user') {
-    return <article id={message.id} className="message user-message"><MarkdownContent content={message.content} className="message-markdown" /></article>
+    return (
+      <article id={message.id} className="message user-message">
+        <MarkdownContent content={message.content} className="message-markdown" />
+        <MessageActionRow content={message.content} kind="user" />
+      </article>
+    )
   }
   if (message.role === 'process') {
     return null
@@ -266,7 +293,7 @@ function MessageBlockView({
       {message.content
         ? <>
             <MarkdownContent content={message.content} className="message-markdown" />
-            {showActions && message.meta?.status !== 'running' && <MessageActionRow content={message.content} />}
+            {showActions && message.meta?.status !== 'running' && <MessageActionRow content={message.content} kind="assistant" />}
           </>
         : message.meta?.status === 'running'
           ? null
@@ -298,9 +325,9 @@ export function ConversationNotice({ notice }: { notice: ConversationNoticeType 
   )
 }
 
-export function ToolCallCard({ message }: { message: Message }) {
+export function ToolCallCard({ message, className }: { message: Message; className?: string }) {
   return (
-    <ToolCallRow message={message} className="tool-card">
+    <ToolCallRow message={message} className={`tool-card${className ? ` ${className}` : ''}`}>
       <ToolDetails message={message} />
     </ToolCallRow>
   )

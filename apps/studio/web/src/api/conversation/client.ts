@@ -10,9 +10,9 @@ export interface StreamedAgUiEvent {
   seq: number | null
 }
 
-const MAX_SSE_LINE_BYTES = 1024 * 1024
-const MAX_SSE_FRAME_BYTES = 4 * 1024 * 1024
 const MAX_SSE_DATA_BYTES = 4 * 1024 * 1024
+const MAX_SSE_LINE_BYTES = MAX_SSE_DATA_BYTES + 'data: '.length
+const MAX_SSE_FRAME_BYTES = MAX_SSE_LINE_BYTES + 64
 const MAX_SSE_FRAME_LINES = 4096
 
 /**

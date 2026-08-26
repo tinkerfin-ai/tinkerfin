@@ -28,7 +28,7 @@ from tinkerfin import (
     DeepAgentDefinition,
     TinkerFin,
 )
-from tinkerfin.plan import MarkdownPlanContent
+from tinkerfin.plan import MarkdownPlanContent, PlanReviewAction
 from tinkerfin_messaging import (
     MessageSourceBinding,
     ProfiledDeferredMessageSource,
@@ -268,21 +268,28 @@ class ConversationAgentFactory:
                     ),
                 )
             )
+        # 文件审批只提供拒绝与允许，恢复仍按框架原生决策提交
         interrupt = cast(
             InterruptOnConfig,
             cast(
                 object,
                 {
-                    "allowed_decisions": ["approve", "edit", "reject"],
+                    "allowed_decisions": ["approve", "reject"],
                     "description": "需要人工审批：Agent 正准备写入文件",
                 },
             ),
         )
+        # Studio 计划草稿只允许批准、反馈和拒绝，避免客户端与恢复 Schema 漂移
         return self._tinkerfin.plan(
             enabled=True,
             planner_model=plan_model,
             clarification_schema=StudioPlanClarificationForm,
             plan_schema=MarkdownPlanContent,
+            review_actions=(
+                PlanReviewAction.APPROVE,
+                PlanReviewAction.RESPOND,
+                PlanReviewAction.REJECT,
+            ),
         ).create_deep_agent(
             model=model,
             tools=[web_search],

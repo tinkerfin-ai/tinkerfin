@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import os
 import subprocess
 import sys
 from collections import Counter
@@ -24,8 +23,6 @@ from tinkerfin.redis import (
     RedisLeaseLost,
     RedisLeaseUnavailableError,
 )
-
-_REDIS_URL_ENV = "TINKERFIN_TEST_REDIS_URL"
 
 
 class _LeaseRedis:
@@ -489,10 +486,8 @@ async def test_from_url_owns_its_client(
 
 
 @pytest.mark.asyncio
-async def test_real_redis_renews_and_fences_takeover() -> None:
-    redis_url = os.getenv(_REDIS_URL_ENV)
-    if not redis_url:
-        pytest.skip(f"real Redis configuration is missing: {_REDIS_URL_ENV}")
+@pytest.mark.redis_e2e
+async def test_real_redis_renews_and_fences_takeover(redis_url: str) -> None:
     client = Redis.from_url(
         redis_url,
         decode_responses=False,

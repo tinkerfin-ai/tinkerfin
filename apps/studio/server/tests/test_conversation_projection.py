@@ -25,11 +25,11 @@ from tinkerfin_studio.conversation.history import ConversationHistoryService
 from tinkerfin_studio.conversation.models import (
     ConversationEvent,
     ConversationInterrupt,
-    ConversationMessage,
     ConversationRun,
 )
 from tinkerfin_studio.conversation.projection import ConversationProjector
 from tinkerfin_studio.conversation.repository import ConversationRepository
+from tinkerfin_studio.conversation.snapshot import reduce_snapshot
 
 _EVENT_ADAPTER = TypeAdapter(Event)
 
@@ -56,6 +56,197 @@ def _envelope(
         ),
         parsed,
     )
+
+
+def _tool_review_interrupt(
+    *,
+    interrupt_id: str,
+    tool_call_id: str,
+    args: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "id": interrupt_id,
+        "reason": "tool_call",
+        "message": "确认写入",
+        "toolCallId": tool_call_id,
+        "metadata": {
+            "langgraphValue": {
+                "action_requests": [
+                    {
+                        "name": "write_file",
+                        "args": args,
+                        "description": "确认写入",
+                    }
+                ],
+                "review_configs": [
+                    {
+                        "action_name": "write_file",
+                        "allowed_decisions": ["approve", "reject"],
+                    }
+                ],
+            },
+            "deepagents": {
+                "schema": "tinkerfin.deepagents.tool-review.v1",
+                "nativeInterruptId": interrupt_id,
+                "actionIndex": 0,
+                "toolName": "write_file",
+                "originalArgs": args,
+                "allowedDecisions": ["approve", "reject"],
+            },
+        },
+    }
+
+
+def test_tool_interrupt_snapshot_matches_live_pause_and_resume_semantics() -> None:
+    """历史快照必须与实时 Tool interrupt 状态机一致"""
+
+    main_run_id = "run-tool-interrupt"
+    resume_run_id = "run-tool-resume"
+    reviewed_id = ScopedIdCodec().encode("tool", (), "reviewed")
+    unreviewed_id = ScopedIdCodec().encode("tool", (), "unreviewed")
+    completed_id = ScopedIdCodec().encode("tool", (), "completed")
+    child_id = ScopedIdCodec().encode("tool", ("tools:child",), "child")
+    interrupt_id = "interrupt-tool-review#0"
+    args: dict[str, object] = {"file_path": "/result.txt", "content": "ok"}
+    interrupt = _tool_review_interrupt(
+        interrupt_id=interrupt_id,
+        tool_call_id=reviewed_id,
+        args=args,
+    )
+    raw_events: tuple[dict[str, object], ...] = (
+        {"type": "RUN_STARTED", "threadId": "thread-tool", "runId": main_run_id},
+        {
+            "type": "TOOL_CALL_START",
+            "toolCallId": reviewed_id,
+            "toolCallName": "write_file",
+        },
+        {"type": "TOOL_CALL_END", "toolCallId": reviewed_id},
+        {
+            "type": "TOOL_CALL_START",
+            "toolCallId": unreviewed_id,
+            "toolCallName": "write_todos",
+        },
+        {"type": "TOOL_CALL_END", "toolCallId": unreviewed_id},
+        {
+            "type": "TOOL_CALL_START",
+            "toolCallId": completed_id,
+            "toolCallName": "read_file",
+        },
+        {
+            "type": "TOOL_CALL_RESULT",
+            "messageId": "message-completed",
+            "toolCallId": completed_id,
+            "content": "done",
+            "role": "tool",
+        },
+        {
+            "type": "TOOL_CALL_START",
+            "toolCallId": child_id,
+            "toolCallName": "web_search",
+            "rawEvent": {
+                "streamMode": "messages",
+                "runId": main_run_id,
+                "source": {
+                    "agentType": "subagent",
+                    "agentName": "researcher",
+                    "subagentInvocationId": "subagent-child",
+                    "namespace": ["tools:child"],
+                },
+            },
+        },
+        {
+            "type": "RUN_FINISHED",
+            "threadId": "thread-tool",
+            "runId": main_run_id,
+            "outcome": {"type": "interrupt", "interrupts": [interrupt]},
+        },
+    )
+    snapshot: dict[str, object] | None = None
+    created_at = datetime(2026, 8, 26, tzinfo=UTC)
+    for seq, raw_event in enumerate(raw_events, start=1):
+        event = cast(BaseEvent, _EVENT_ADAPTER.validate_python(raw_event))
+        snapshot = reduce_snapshot(
+            snapshot,
+            seq=seq,
+            event=event,
+            run_id=main_run_id,
+            created_at=created_at,
+            run_input={"messages": []},
+        )
+    assert snapshot is not None
+
+    def tool_meta(value: dict[str, object], tool_id: str) -> dict[str, object]:
+        messages = cast(list[dict[str, object]], value["messages"])
+        message = next(item for item in messages if item.get("id") == tool_id)
+        return cast(dict[str, object], message["meta"])
+
+    reviewed = tool_meta(snapshot, reviewed_id)
+    unreviewed = tool_meta(snapshot, unreviewed_id)
+    completed = tool_meta(snapshot, completed_id)
+    child = tool_meta(snapshot, child_id)
+    assert reviewed["status"] == "paused"
+    assert reviewed["interruptId"] == interrupt_id
+    assert unreviewed["status"] == "paused"
+    assert "interruptId" not in unreviewed
+    assert completed["status"] == "completed"
+    assert child["status"] == "running"
+
+    resume_input = {
+        "messages": [],
+        "resume": [
+            {
+                "interruptId": interrupt_id,
+                "status": "resolved",
+                "payload": {"type": "approve"},
+            }
+        ],
+    }
+    resumed = reduce_snapshot(
+        snapshot,
+        seq=len(raw_events) + 1,
+        event=cast(
+            BaseEvent,
+            _EVENT_ADAPTER.validate_python(
+                {
+                    "type": "RUN_STARTED",
+                    "threadId": "thread-tool",
+                    "runId": resume_run_id,
+                }
+            ),
+        ),
+        run_id=resume_run_id,
+        created_at=created_at,
+        run_input=resume_input,
+    )
+    assert tool_meta(resumed, reviewed_id)["status"] == "running"
+    assert "interruptId" not in tool_meta(resumed, reviewed_id)
+    assert tool_meta(resumed, unreviewed_id)["status"] == "running"
+    assert tool_meta(resumed, completed_id)["status"] == "completed"
+    assert tool_meta(resumed, child_id)["status"] == "running"
+
+    initialization_failed = reduce_snapshot(
+        snapshot,
+        seq=len(raw_events) + 1,
+        event=cast(
+            BaseEvent,
+            _EVENT_ADAPTER.validate_python(
+                {
+                    "type": "RUN_STARTED",
+                    "threadId": "thread-tool",
+                    "runId": resume_run_id,
+                    "rawEvent": {
+                        "runId": resume_run_id,
+                        "initializationFailed": True,
+                    },
+                }
+            ),
+        ),
+        run_id=resume_run_id,
+        created_at=created_at,
+        run_input=resume_input,
+    )
+    assert tool_meta(initialization_failed, reviewed_id)["status"] == "paused"
+    assert tool_meta(initialization_failed, reviewed_id)["interruptId"] == interrupt_id
 
 
 def _subagent_provenance(
@@ -96,6 +287,58 @@ def _subagent_source(provenance: SubagentProvenance) -> dict[str, object]:
         "subagentInput": provenance.description,
         "subagentInvocationId": provenance.subagent_invocation_id,
     }
+
+
+async def test_large_legal_user_message_persists_only_in_authoritative_history(
+    session: AsyncSession,
+) -> None:
+    """超过 MySQL TEXT 的合法文本不得再被无消费方副本阻断投影"""
+
+    content = "x" * 70_000
+    repository = ConversationRepository(session)
+    thread = await repository.create_thread(
+        user_id=7,
+        thread_id="thread-large-message",
+        title="大消息",
+        model_id="main",
+    )
+    await repository.create_main_run(
+        thread_id=thread.id,
+        run_id="run-large-message",
+        model_id="main",
+        input_json={
+            "messages": [{"id": "user-large", "role": "user", "content": content}]
+        },
+        config_json={},
+    )
+    await session.commit()
+    projector = ConversationProjector(session)
+    for seq, raw_event in enumerate(
+        (
+            {
+                "type": "RUN_STARTED",
+                "threadId": "thread-large-message",
+                "runId": "run-large-message",
+            },
+            {
+                "type": "RUN_FINISHED",
+                "threadId": "thread-large-message",
+                "runId": "run-large-message",
+                "outcome": {"type": "success"},
+            },
+        ),
+        start=1,
+    ):
+        envelope, event = _envelope(seq, raw_event, run="run-large-message")
+        await projector.project(thread_pk=thread.id, envelope=envelope, event=event)
+    await session.commit()
+
+    refreshed = await repository.get_thread_by_pk(thread.id)
+    assert refreshed is not None
+    assert refreshed.snapshot_json is not None
+    messages = cast(list[dict[str, object]], refreshed.snapshot_json["messages"])
+    assert messages[0]["content"] == content
+    assert await repository.count_events(thread.id) == 2
 
 
 async def test_projection_builds_tool_todo_and_interrupt_snapshot(
@@ -1028,16 +1271,6 @@ async def test_real_task_provenance_projects_subagent_run_and_inner_tool(
     for seq, value in enumerate(events[:-1], start=1):
         envelope, event = _envelope(seq, value)
         await projector.project(thread_pk=thread.id, envelope=envelope, event=event)
-    await session.flush()
-    user_message = await session.scalar(
-        select(ConversationMessage).where(
-            ConversationMessage.conversation_thread_id == thread.id,
-            ConversationMessage.message_id == "user-real",
-        )
-    )
-    assert user_message is not None
-    assert user_message.run_id == "run-1"
-
     envelope, event = _envelope(len(events), events[-1])
     await projector.project(thread_pk=thread.id, envelope=envelope, event=event)
     await session.commit()
@@ -1150,14 +1383,6 @@ async def test_tool_error_status_survives_the_persisted_snapshot(
     )
     meta = cast(dict[str, object], tool["meta"])
     assert meta["status"] == "failed"
-    stored = await session.scalar(
-        select(ConversationMessage).where(
-            ConversationMessage.conversation_thread_id == thread.id,
-            ConversationMessage.message_id == "tool-error",
-        )
-    )
-    assert stored is not None
-    assert stored.status == "failed"
 
 
 async def test_subagent_identity_survives_a_new_main_resume_run(

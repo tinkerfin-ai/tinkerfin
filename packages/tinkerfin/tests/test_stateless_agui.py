@@ -1,20 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from contextvars import ContextVar
 
 import pytest
 from ag_ui.core import (
     BaseEvent,
     RunErrorEvent,
     RunStartedEvent,
-    StateSnapshotEvent,
 )
+from langchain.agents.middleware.types import InputAgentState
 from langchain_core.messages import AIMessageChunk
+from langgraph.graph.state import CompiledStateGraph
 from pydantic import ValidationError
 
-from tinkerfin import AgUiEventStream, Identity, TinkerFin
+from tinkerfin import AgUiEventStream, DeepAgentDefinition, Identity
 from tinkerfin_agui_adapter import AgUiStreamContractError
 
 
@@ -26,17 +29,68 @@ def _identity(
     return Identity(threadId=thread_id, runId=run_id)
 
 
-def test_agui_rejects_noncanonical_identity_at_construction() -> None:
-    async def parts() -> AsyncIterator[object]:
-        if False:  # pragma: no cover - only supplies the asynchronous source shape
-            yield None
+class _SourceGraph:
+    def __init__(self, source_factory: Callable[[], AsyncIterator[object]]) -> None:
+        self._source_factory = source_factory
 
+    def astream(
+        self,
+        *_args: object,
+        **_options: object,
+    ) -> AsyncIterator[object]:
+        return self._source_factory()
+
+
+setattr(
+    _SourceGraph.astream,
+    "__signature__",
+    inspect.signature(CompiledStateGraph.astream),
+)
+
+_DEFINITION_FACTORY: ContextVar[Callable[..., DeepAgentDefinition[None]] | None] = (
+    ContextVar("tinkerfin_test_definition_factory", default=None)
+)
+
+
+@pytest.fixture(autouse=True)
+def _bind_definition_factory(
+    definition_factory: Callable[..., DeepAgentDefinition[None]],
+) -> Iterator[None]:
+    token = _DEFINITION_FACTORY.set(definition_factory)
+    try:
+        yield
+    finally:
+        _DEFINITION_FACTORY.reset(token)
+
+
+def _agui_stream(
+    source_factory: Callable[[], AsyncIterator[object]],
+    *,
+    identity: Identity | None = None,
+    timeout: float | None = None,
+    settlement_timeout: float | None = None,
+    expose_reasoning_events: bool = False,
+    expose_subagent_events: bool = True,
+    on_event: Callable[[BaseEvent], Awaitable[None]] | None = None,
+) -> AgUiEventStream:
+    definition_factory = _DEFINITION_FACTORY.get()
+    assert definition_factory is not None
+    runtime = definition_factory(_SourceGraph(source_factory)).new_agui(
+        identity=_identity() if identity is None else identity,
+        timeout=timeout,
+        settlement_timeout=settlement_timeout,
+        expose_reasoning_events=expose_reasoning_events,
+        expose_subagent_events=expose_subagent_events,
+        on_event=on_event,
+    )
+    return runtime.astream(InputAgentState(messages=[]))
+
+
+def test_agui_rejects_noncanonical_identity_at_construction() -> None:
     with pytest.raises(ValidationError):
-        TinkerFin().run(parts, identity=_identity(thread_id=" "))
+        _identity(thread_id=" ")
     with pytest.raises(ValidationError):
-        TinkerFin().run(parts, identity=_identity(run_id=""))
-    with pytest.raises(ValueError, match="requires an Identity"):
-        TinkerFin().run(parts).astream_agui()
+        _identity(run_id="")
 
 
 def test_agui_rejects_infinite_total_timeout() -> None:
@@ -45,9 +99,7 @@ def test_agui_rejects_infinite_total_timeout() -> None:
             yield None
 
     with pytest.raises(ValueError, match="finite and non-negative"):
-        TinkerFin().run(parts, identity=_identity()).astream_agui(
-            timeout=float("inf"),
-        )
+        _agui_stream(parts, timeout=float("inf"))
 
 
 @pytest.mark.asyncio
@@ -58,7 +110,7 @@ async def test_agui_stream_publishes_its_idempotent_cancel_callback() -> None:
             yield None
 
     identity = _identity()
-    stream = TinkerFin().run(parts, identity=identity).astream_agui()
+    stream = _agui_stream(parts, identity=identity)
 
     assert stream.messaging_identity is identity
     assert stream.messaging_cancel_callback == stream.abort
@@ -70,13 +122,13 @@ async def test_agui_stream_publishes_its_idempotent_cancel_callback() -> None:
 
 
 @pytest.mark.asyncio
-async def test_low_level_agui_stream_keeps_its_immutable_identity() -> None:
+async def test_agui_stream_keeps_its_immutable_identity() -> None:
     async def parts() -> AsyncIterator[object]:
         if False:  # pragma: no cover - supplies the async iterator shape
             yield None
 
     identity = _identity()
-    stream = TinkerFin().run(parts, identity=identity).astream_agui()
+    stream = _agui_stream(parts, identity=identity)
 
     started = await anext(stream)
 
@@ -84,33 +136,6 @@ async def test_low_level_agui_stream_keeps_its_immutable_identity() -> None:
     assert stream.messaging_identity is identity
     assert started.input is None
     await stream.aclose()
-
-
-@pytest.mark.asyncio
-async def test_low_level_agui_applies_explicit_top_level_private_state_policy() -> None:
-    private_key = "_host_private"
-
-    async def parts() -> AsyncIterator[object]:
-        yield {
-            "type": "values",
-            "ns": (),
-            "data": {
-                private_key: "internal",
-                "nested": {private_key: "business-value"},
-            },
-            "interrupts": (),
-        }
-
-    events = [
-        event
-        async for event in TinkerFin()
-        .run(parts, identity=_identity())
-        .astream_agui(private_state_keys=frozenset({private_key}))
-    ]
-    snapshot = next(event for event in events if isinstance(event, StateSnapshotEvent))
-    assert snapshot.snapshot == {
-        "nested": {private_key: "business-value"},
-    }
 
 
 @pytest.mark.asyncio
@@ -202,13 +227,7 @@ async def test_agui_observes_converted_events_before_delivery() -> None:
     async def on_event(event: BaseEvent) -> None:
         order.append(("observed", event.type.value))
 
-    stream = (
-        TinkerFin()
-        .run(parts, identity=_identity())
-        .astream_agui(
-            on_event=on_event,
-        )
-    )
+    stream = _agui_stream(parts, on_event=on_event)
     events: list[BaseEvent] = []
     async for event in stream:
         events.append(event)
@@ -244,13 +263,7 @@ async def test_agui_abort_rejects_reentry_from_its_event_observer() -> None:
         assert stream is not None
         await stream.abort()
 
-    stream = (
-        TinkerFin()
-        .run(parts, identity=_identity())
-        .astream_agui(
-            on_event=on_event,
-        )
-    )
+    stream = _agui_stream(parts, on_event=on_event)
 
     with pytest.raises(RuntimeError, match="from its on_event callback"):
         await anext(stream)
@@ -272,13 +285,7 @@ async def test_agui_abort_rejects_child_task_reentry_from_event_observer() -> No
             abort_task = asyncio.create_task(stream.abort())
             await asyncio.sleep(0)
 
-    stream = (
-        TinkerFin()
-        .run(parts, identity=_identity())
-        .astream_agui(
-            on_event=on_event,
-        )
-    )
+    stream = _agui_stream(parts, on_event=on_event)
     consumer = asyncio.create_task(anext(stream))
     try:
         consumer_outcome = (await asyncio.gather(consumer, return_exceptions=True))[0]
@@ -309,13 +316,7 @@ async def test_agui_abort_allows_external_task_while_event_observer_is_active() 
             observer_started.set()
             await hold_observer.wait()
 
-    stream = (
-        TinkerFin()
-        .run(parts, identity=_identity())
-        .astream_agui(
-            on_event=on_event,
-        )
-    )
+    stream = _agui_stream(parts, on_event=on_event)
     consumer = asyncio.create_task(anext(stream))
     await observer_started.wait()
 
@@ -346,13 +347,7 @@ async def test_agui_aclose_from_observer_child_task_preserves_current_event() ->
             close_task = asyncio.create_task(stream.aclose())
             await asyncio.sleep(0)
 
-    stream = (
-        TinkerFin()
-        .run(parts, identity=_identity())
-        .astream_agui(
-            on_event=on_event,
-        )
-    )
+    stream = _agui_stream(parts, on_event=on_event)
     consumer = asyncio.create_task(anext(stream))
     try:
         consumer_outcome = (await asyncio.gather(consumer, return_exceptions=True))[0]
@@ -383,13 +378,7 @@ async def test_agui_abort_from_terminal_observer_is_an_idempotent_noop() -> None
             assert stream is not None
             abort_tail = await stream.abort()
 
-    stream = (
-        TinkerFin()
-        .run(parts, identity=_identity())
-        .astream_agui(
-            on_event=on_event,
-        )
-    )
+    stream = _agui_stream(parts, on_event=on_event)
     events = [event async for event in stream]
 
     assert [event.type.value for event in events] == ["RUN_STARTED", "RUN_FINISHED"]
@@ -403,7 +392,7 @@ async def test_agui_records_conversion_error_and_emits_one_error_terminal(
     async def parts() -> AsyncIterator[object]:
         yield {"type": "not-a-stream-mode", "ns": (), "data": {}}
 
-    stream = TinkerFin().run(parts, identity=_identity()).astream_agui()
+    stream = _agui_stream(parts)
     with caplog.at_level(logging.ERROR, logger="tinkerfin.runtime"):
         events = [event async for event in stream]
 
@@ -428,7 +417,7 @@ async def test_agui_abort_after_error_terminal_does_not_emit_another_terminal() 
     async def parts() -> AsyncIterator[object]:
         yield {"type": "not-a-stream-mode", "ns": (), "data": {}}
 
-    stream = TinkerFin().run(parts, identity=_identity()).astream_agui()
+    stream = _agui_stream(parts)
     events = [event async for event in stream]
 
     assert len([event for event in events if isinstance(event, RunErrorEvent)]) == 1
@@ -655,7 +644,7 @@ async def test_agui_conversion_error_survives_two_upstream_close_failures() -> N
 @pytest.mark.asyncio
 async def test_agui_caller_cancellation_keeps_conversion_and_cleanup_evidence() -> None:
     parts = _CancelledFailingCloseParts()
-    stream = TinkerFin().run(lambda: parts, identity=_identity()).astream_agui()
+    stream = _agui_stream(lambda: parts)
     assert (await anext(stream)).type.value == "RUN_STARTED"
     consumer = asyncio.create_task(anext(stream))
     await parts.close_started.wait()
@@ -683,21 +672,13 @@ def test_agui_rejects_invalid_settlement_timeout() -> None:
 
     for invalid in (-1, float("inf"), float("nan")):
         with pytest.raises(ValueError, match="finite and non-negative"):
-            TinkerFin().run(parts, identity=_identity()).astream_agui(
-                settlement_timeout=invalid,
-            )
+            _agui_stream(parts, settlement_timeout=invalid)
 
 
 @pytest.mark.asyncio
 async def test_agui_settlement_timeout_retains_close_for_a_second_waiter() -> None:
     parts = _BudgetedClosingParts()
-    stream = (
-        TinkerFin()
-        .run(lambda: parts, identity=_identity())
-        .astream_agui(
-            settlement_timeout=0.01,
-        )
-    )
+    stream = _agui_stream(lambda: parts, settlement_timeout=0.01)
     assert (await anext(stream)).type.value == "RUN_STARTED"
     active_pull = asyncio.create_task(anext(stream))
     await parts.pull_started.wait()
@@ -730,13 +711,7 @@ async def test_agui_abort_cancels_active_pull_and_returns_observed_tail_once() -
     async def on_event(event: BaseEvent) -> None:
         observed.append(event.type.value)
 
-    stream = (
-        TinkerFin()
-        .run(lambda: parts, identity=_identity())
-        .astream_agui(
-            on_event=on_event,
-        )
-    )
+    stream = _agui_stream(lambda: parts, on_event=on_event)
     started = await anext(stream)
     assert started.type.value == "RUN_STARTED"
     pending = asyncio.create_task(anext(stream))
@@ -769,13 +744,7 @@ async def test_agui_zero_timeout_starts_lifecycle_without_pulling_parts() -> Non
         pulls += 1
         yield {"type": "values", "ns": (), "data": {}, "interrupts": ()}
 
-    stream = (
-        TinkerFin()
-        .run(parts, identity=_identity())
-        .astream_agui(
-            timeout=0,
-        )
-    )
+    stream = _agui_stream(parts, timeout=0)
     events = [event async for event in stream]
 
     assert [event.type.value for event in events] == ["RUN_STARTED", "RUN_ERROR"]
@@ -791,13 +760,7 @@ async def test_agui_total_deadline_closes_text_before_timeout_terminal() -> None
     parts = _DeadlineParts(
         [_message_part(AIMessageChunk(id="message-timeout", content="partial"))]
     )
-    stream = (
-        TinkerFin()
-        .run(lambda: parts, identity=_identity())
-        .astream_agui(
-            timeout=0.01,
-        )
-    )
+    stream = _agui_stream(lambda: parts, timeout=0.01)
 
     events = await _collect_events(stream)
 
@@ -845,13 +808,7 @@ async def test_agui_total_deadline_closes_parallel_tools_before_timeout_terminal
             )
         ]
     )
-    stream = (
-        TinkerFin()
-        .run(lambda: parts, identity=_identity())
-        .astream_agui(
-            timeout=0.01,
-        )
-    )
+    stream = _agui_stream(lambda: parts, timeout=0.01)
 
     events = await _collect_events(stream)
     event_types = [event.type.value for event in events]
@@ -875,13 +832,7 @@ async def test_agui_total_deadline_closes_parallel_tools_before_timeout_terminal
 @pytest.mark.asyncio
 async def test_agui_total_deadline_before_interrupt_uses_timeout_terminal() -> None:
     parts = _DeadlineParts()
-    stream = (
-        TinkerFin()
-        .run(lambda: parts, identity=_identity())
-        .astream_agui(
-            timeout=0.01,
-        )
-    )
+    stream = _agui_stream(lambda: parts, timeout=0.01)
 
     events = await _collect_events(stream)
 
@@ -903,13 +854,7 @@ async def test_agui_total_deadline_after_interrupt_does_not_finish_the_run() -> 
             }
         ]
     )
-    stream = (
-        TinkerFin()
-        .run(lambda: parts, identity=_identity())
-        .astream_agui(
-            timeout=0.01,
-        )
-    )
+    stream = _agui_stream(lambda: parts, timeout=0.01)
 
     events = await _collect_events(stream)
     event_types = [event.type.value for event in events]
@@ -929,13 +874,7 @@ async def test_agui_total_deadline_after_interrupt_does_not_finish_the_run() -> 
 @pytest.mark.asyncio
 async def test_agui_timeout_waits_for_owned_upstream_close_before_terminal() -> None:
     parts = _DeadlineParts(block_close=True)
-    stream = (
-        TinkerFin()
-        .run(lambda: parts, identity=_identity())
-        .astream_agui(
-            timeout=0.01,
-        )
-    )
+    stream = _agui_stream(lambda: parts, timeout=0.01)
     collecting = asyncio.create_task(_collect_events(stream))
     await asyncio.wait_for(parts.close_started.wait(), timeout=1)
 
@@ -961,13 +900,7 @@ async def test_upstream_timeout_error_remains_a_runtime_error() -> None:
         raise TimeoutError("provider request timed out")
         yield  # pragma: no cover - keeps the function an async generator
 
-    stream = (
-        TinkerFin()
-        .run(parts, identity=_identity())
-        .astream_agui(
-            timeout=1,
-        )
-    )
+    stream = _agui_stream(parts, timeout=1)
 
     events = await _collect_events(stream)
 
@@ -989,13 +922,7 @@ async def test_agui_waits_for_cleanup_when_consumer_is_cancelled_during_failure(
         if event.type.value == "STATE_SNAPSHOT":
             raise RuntimeError("event observer failed")
 
-    stream = (
-        TinkerFin()
-        .run(lambda: parts, identity=_identity())
-        .astream_agui(
-            on_event=on_event,
-        )
-    )
+    stream = _agui_stream(lambda: parts, on_event=on_event)
     assert (await anext(stream)).type.value == "RUN_STARTED"
     consumer = asyncio.create_task(anext(stream))
     await parts.close_started.wait()
@@ -1021,7 +948,7 @@ async def test_agui_waits_for_cleanup_when_consumer_is_cancelled_during_failure(
 @pytest.mark.asyncio
 async def test_agui_cancelled_terminal_pull_waits_for_upstream_close() -> None:
     parts = _InterruptedClosingParts()
-    stream = TinkerFin().run(lambda: parts, identity=_identity()).astream_agui()
+    stream = _agui_stream(lambda: parts)
     assert (await anext(stream)).type.value == "RUN_STARTED"
     terminal_pull = asyncio.create_task(anext(stream))
     await parts.close_started.wait()

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any, TypedDict, cast
 from uuid import uuid4
 
@@ -20,8 +19,6 @@ from tinkerfin._agui_lineage_state import (
     parse_lineage_marker,
 )
 
-_REDIS_URL_ENV = "TINKERFIN_TEST_REDIS_URL"
-
 
 class _RedisResumeState(TypedDict, total=False):
     _tinkerfin_lineage: dict[str, object]
@@ -33,17 +30,14 @@ class _RedisResumeState(TypedDict, total=False):
 @pytest.mark.redis_e2e
 async def test_real_redis_saver_indexes_run_id_and_resumes_once(
     monkeypatch: pytest.MonkeyPatch,
+    redis_checkpoint_url: str,
 ) -> None:
-    redis_url = os.getenv(_REDIS_URL_ENV)
-    if not redis_url:
-        pytest.skip(f"real Redis configuration is missing: {_REDIS_URL_ENV}")
-
     token = uuid4().hex
     thread_id = f"tinkerfin-agui-lineage-{token}"
     checkpoint_prefix = f"tinkerfin:test:agui-lineage:{token}:checkpoint"
     write_prefix = f"tinkerfin:test:agui-lineage:{token}:write"
     client = Redis.from_url(
-        redis_url,
+        redis_checkpoint_url,
         decode_responses=False,
         socket_connect_timeout=5,
         socket_timeout=5,
@@ -57,7 +51,8 @@ async def test_real_redis_saver_indexes_run_id_and_resumes_once(
     executions: list[object] = []
 
     def build(*_args: object, **_kwargs: object):
-        async def reviewed(_state: _RedisResumeState) -> dict[str, object]:
+        async def reviewed(state: _RedisResumeState) -> dict[str, object]:
+            del state
             answer = interrupt({"question": "continue?"})
             executions.append(answer)
             return {"result": "done"}

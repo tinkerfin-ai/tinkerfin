@@ -4,7 +4,6 @@ from tinkerfin_studio.auth.models import User
 from tinkerfin_studio.conversation.models import (
     ConversationEvent,
     ConversationInterrupt,
-    ConversationMessage,
     ConversationRun,
     ConversationThread,
 )
@@ -22,7 +21,6 @@ def test_business_schema_contains_no_foreign_keys() -> None:
         ConversationRun,
         ConversationEvent,
         ConversationInterrupt,
-        ConversationMessage,
     )
     assert {model.__tablename__ for model in registered} == set(Base.metadata.tables)
     assert Base.metadata.tables
@@ -41,5 +39,4 @@ def test_business_schema_exposes_the_complete_current_table_set() -> None:
         "conversation_runs",
         "conversation_events",
         "conversation_interrupts",
-        "conversation_messages",
     }

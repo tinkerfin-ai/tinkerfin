@@ -2,6 +2,7 @@ import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 
+import conversationStyles from '../conversation.css?raw'
 import { MarkdownContent } from './MarkdownContent'
 
 describe('MarkdownContent links', () => {
@@ -53,6 +54,10 @@ const completeFixture = `# 一级标题
 
 #### 四级标题
 
+##### 五级标题
+
+###### 六级标题
+
 1. 第一项
    - 二级项目
      1. 三级项目
@@ -82,6 +87,8 @@ describe('MarkdownContent article contract', () => {
     expect(screen.getByRole('heading', { level: 2, name: '二级标题' })).toBeInTheDocument()
     expect(screen.getByRole('heading', { level: 3, name: '三级标题' })).toBeInTheDocument()
     expect(screen.getByRole('heading', { level: 4, name: '四级标题' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { level: 5, name: '五级标题' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { level: 6, name: '六级标题' })).toBeInTheDocument()
     const paragraphs = container.querySelectorAll('.markdown-content > p')
     expect(paragraphs).toHaveLength(4)
     expect(paragraphs[0]).toHaveTextContent('第一段正文')
@@ -127,5 +134,27 @@ describe('MarkdownContent article contract', () => {
   it('exposes compact content as an explicit variant', () => {
     const { container } = render(<MarkdownContent content="**工具结果**" variant="compact" />)
     expect(container.firstElementChild).toHaveClass('markdown-content--compact')
+  })
+
+  it('owns the measured article rhythm while keeping compact Markdown isolated', () => {
+    render(<MarkdownContent content={'第一段\n\n第二段'} />)
+
+    expect(conversationStyles).toMatch(/\.markdown-content--article\s*\{[^}]*font-size:\s*var\(--type-conversation-body-size\);[^}]*line-height:\s*var\(--type-conversation-body-line\);/s)
+    expect(conversationStyles).toMatch(/\.markdown-content--article p\s*\{\s*margin:\s*var\(--space-4\) 0 var\(--space-1\);/s)
+    expect(conversationStyles).toMatch(/\.markdown-content--article h1\s*\{[^}]*font-size:\s*var\(--type-conversation-h1-size\);[^}]*line-height:\s*var\(--type-conversation-h1-line\);/s)
+    expect(conversationStyles).toMatch(/\.markdown-content--article h2\s*\{[^}]*font-size:\s*var\(--type-conversation-h2-size\);[^}]*line-height:\s*var\(--type-conversation-h2-line\);/s)
+    expect(conversationStyles).toMatch(/\.markdown-content--article h3\s*\{[^}]*font-size:\s*var\(--type-conversation-h3-size\);[^}]*line-height:\s*var\(--type-conversation-h3-line\);/s)
+    expect(conversationStyles).toMatch(/\.markdown-content--article h4\s*\{[^}]*font-size:\s*var\(--type-conversation-h4-size\);[^}]*line-height:\s*var\(--type-conversation-h4-line\);/s)
+    expect(conversationStyles).toMatch(/\.markdown-content--article h5\s*\{[^}]*font-size:\s*var\(--type-conversation-body-size\);[^}]*line-height:\s*var\(--type-conversation-body-line\);/s)
+    expect(conversationStyles).toMatch(/\.markdown-content--article h6\s*\{[^}]*font-size:\s*var\(--type-conversation-body-size\);[^}]*font-weight:\s*var\(--weight-regular\);[^}]*line-height:\s*var\(--type-conversation-body-line\);/s)
+    expect(conversationStyles).toMatch(/\.markdown-content--article blockquote\s*\{[^}]*margin:\s*0 0 var\(--space-2\);[^}]*padding:\s*var\(--space-2\) 0 var\(--space-2\) var\(--space-6\);[^}]*border-left:\s*0;/s)
+    expect(conversationStyles).toMatch(/\.markdown-content--article :not\(pre\) > code\s*\{[^}]*padding:\s*2\.4px 4\.8px;[^}]*font-size:\s*var\(--type-conversation-code-size\);[^}]*line-height:\s*var\(--type-conversation-code-line\);/s)
+    expect(conversationStyles).toMatch(/\.markdown-code-block\s*\{[^}]*border-radius:\s*var\(--radius-3xl\);/s)
+    expect(conversationStyles).not.toMatch(/\.markdown-content--article \.markdown-code-block\s*\{[^}]*border-radius:/s)
+    expect(conversationStyles).toMatch(/\.markdown-content--article \.markdown-table-wrap\s*\{[^}]*max-width:\s*none;[^}]*margin:\s*0 calc\(var\(--space-4\) \* -1\);[^}]*padding-inline:\s*var\(--space-4\);/s)
+    expect(conversationStyles).toMatch(/\.markdown-content--article th\s*\{[^}]*padding-top:\s*var\(--space-2\);[^}]*font-size:\s*var\(--type-conversation-table-size\);[^}]*line-height:\s*var\(--type-conversation-table-head-line\);/s)
+    expect(conversationStyles).toMatch(/\.markdown-content--article td\s*\{[^}]*padding-top:\s*10px;[^}]*font-size:\s*var\(--type-conversation-table-size\);[^}]*line-height:\s*var\(--type-conversation-table-line\);/s)
+    expect(conversationStyles).toMatch(/\.markdown-content--compact h1,[\s\S]*\.markdown-content--compact h6\s*\{/s)
+    expect(conversationStyles).toMatch(/\.tool-rich-field \.markdown-content :is\(h1, h2, h3, h4, h5, h6\)/s)
   })
 })

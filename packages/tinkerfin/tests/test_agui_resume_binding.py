@@ -93,7 +93,9 @@ def test_from_agui_converts_adapter_failures_to_the_core_error_family() -> None:
         )
 
     assert isinstance(raised.value.cause, ResumeMappingError)
-    assert raised.value.context["adapter_code"].startswith("agui.resume.")
+    adapter_code = raised.value.context["adapter_code"]
+    assert isinstance(adapter_code, str)
+    assert adapter_code.startswith("agui.resume.")
 
 
 def test_binding_has_a_strict_stable_json_round_trip() -> None:

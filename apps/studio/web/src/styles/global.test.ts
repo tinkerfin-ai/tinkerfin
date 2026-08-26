@@ -136,17 +136,20 @@ describe('前端视觉契约', () => {
       '--layout-settings-dialog: 760px;',
       '--layout-settings-nav: 180px;',
       '--layout-settings-height: 540px;',
+      '--layout-composer-surface-height: 94px;',
       '--control-lg: 44px;',
       '--control-plan-chip: 24px;',
       '--control-composer: 34px;',
-      '--radius-composer: 22px;',
+      '--radius-3xl: 22px;',
       '--layer-local: 1;',
       '--layer-local-raised: 2;',
       '--motion-fast: 100ms;',
       '--motion-normal: 200ms;',
       '--motion-slow: 300ms;',
       '--motion-loading-cycle: 1000ms;',
+      '--motion-tool-result-cycle: 1450ms;',
       '--motion-tool-sweep-cycle: 2600ms;',
+      '--motion-attention-cycle: 1800ms;',
       '--layout-sidebar-expanded: 261px;',
     ]) expect(tokensStyles).toContain(declaration)
   })
@@ -182,9 +185,10 @@ describe('前端视觉契约', () => {
     expect(uiStyles).toMatch(/\.ui-text-field--lg \.ui-text-field__control\s*\{[^}]*min-height:\s*var\(--control-lg\);/s)
     expect(uiStyles).toMatch(/\.ui-text-field__control:focus-within\s*\{[^}]*border-color:\s*var\(--color-border-strong\);[^}]*box-shadow:\s*none;/s)
     expect(tokensStyles).not.toContain('--shadow-focus')
-    expect(conversationStyles).toMatch(/\.approval-form textarea:focus,[\s\S]*\.plan-review-input textarea:focus\s*\{[^}]*border-color:\s*var\(--color-border-strong\);[^}]*outline:\s*0;[^}]*box-shadow:\s*none;/s)
-    expect(conversationStyles).not.toMatch(/\.approval-form textarea:focus-visible,[\s\S]*\.plan-review-input textarea:focus-visible\s*\{[^}]*var\(--color-focus\)/s)
-    expect(conversationStyles).toMatch(/@media \(forced-colors:\s*active\)[\s\S]*\.approval-form textarea:focus-visible,[\s\S]*\.plan-review-input textarea:focus-visible,[\s\S]*\.composer-attachment-remove:focus-visible\s*\{[^}]*outline:\s*2px solid Highlight;/s)
+    expect(conversationStyles).toMatch(/\.approval-rejection-form textarea:focus\s*\{[^}]*border-color:\s*var\(--color-border-strong\);[^}]*outline:\s*0;[^}]*box-shadow:\s*none;/s)
+    expect(conversationStyles).toMatch(/\.plan-review-input textarea:focus\s*\{[^}]*border-color:\s*var\(--color-border-strong\);[^}]*outline:\s*0;[^}]*box-shadow:\s*none;/s)
+    expect(conversationStyles).not.toMatch(/\.approval-rejection-form textarea:focus-visible[^{]*\{[^}]*var\(--color-focus\)/s)
+    expect(conversationStyles).toMatch(/@media \(forced-colors:\s*active\)[\s\S]*\.approval-rejection-form textarea:focus-visible,[\s\S]*\.plan-review-input textarea:focus-visible,[\s\S]*\.composer-attachment-remove:focus-visible\s*\{[^}]*outline:\s*2px solid Highlight;/s)
   })
 
   it('带边框控件使用单一焦点边且鼠标焦点不触发主题选项轮廓', () => {
@@ -204,13 +208,20 @@ describe('前端视觉契约', () => {
 
     expect(tokensStyles).toContain('--layout-conversation-width: 748px;')
     expect(tokensStyles).toContain('--layout-composer-width: 780px;')
+    expect(tokensStyles).toContain('--layout-composer-surface-height: 94px;')
     expect(workspaceStyles).toMatch(/\.conversation-pane\s*\{[^}]*padding-inline:\s*var\(--space-8\);/s)
     expect(workspaceStyles).toMatch(/\.message-list\s*\{[^}]*width:\s*min\(100%, var\(--layout-conversation-width\)\)/s)
     expect(workspaceStyles).toMatch(/\.message-list\s*\{[^}]*padding:\s*var\(--space-8\) 0 var\(--composer-height\);/s)
     expect(workspaceStyles).not.toMatch(/\.message-list\s*\{[^}]*padding-(?:right|left):/s)
     expect(workspaceStyles).toMatch(/@media \(max-width:\s*767px\)[\s\S]*\.conversation-pane\s*\{[^}]*padding-inline:\s*var\(--space-4\);[^}]*\}[\s\S]*\.message-list\s*\{[^}]*padding-top:\s*var\(--space-6\);/s)
     expect(workspaceStyles).toMatch(/@media \(max-width:\s*440px\)[\s\S]*\.conversation-pane\s*\{[^}]*padding-inline:\s*var\(--space-3\);/s)
-    expect(conversationStyles).toMatch(/\.composer\s*\{[^}]*width:\s*min\(100%, var\(--layout-composer-width\)\)/s)
+    expect(conversationStyles).toMatch(/\.composer\s*\{[^}]*width:\s*min\(100%, var\(--layout-composer-width\)\);[^}]*min-height:\s*var\(--layout-composer-surface-height\);/s)
+    expect(conversationStyles).toMatch(/\.approval-composer,[\s\S]*\.plan-review-composer\s*\{[^}]*width:\s*min\(100%, var\(--layout-composer-width\)\);/s)
+    expect(conversationStyles).toMatch(/\.approval-composer\.is-minimized,[\s\S]*\.plan-review-composer\.is-minimized\s*\{[^}]*min-height:\s*var\(--layout-composer-surface-height\);[^}]*max-height:\s*none;/s)
+    const minimizedSurfaceRule = conversationStyles.match(
+      /\.approval-composer\.is-minimized,[\s\S]*?\.plan-review-composer\.is-minimized\s*\{[^}]*\}/s,
+    )?.[0] ?? ''
+    expect(minimizedSurfaceRule).not.toMatch(/(?:^|\n)\s*height:/)
   })
 
   it('空会话使用横向品牌组合，并在窄屏收紧字号与间距', () => {
@@ -345,7 +356,8 @@ describe('前端视觉契约', () => {
 
   it('Markdown 使用编辑型表格并具备完整文章语义和显式 compact variant', () => {
     const markdownStyles = cssFiles['../features/conversation/conversation.css']
-    expect(markdownStyles).toMatch(/\.markdown-content h1[\s\S]*\.markdown-content h4/)
+    expect(markdownStyles).toMatch(/\.markdown-content h1[\s\S]*\.markdown-content h6/)
+    expect(markdownStyles).toMatch(/\.markdown-content--article p\s*\{[^}]*margin:\s*var\(--space-4\) 0 var\(--space-1\);/s)
     expect(markdownStyles).toMatch(/\.markdown-content li > ul[\s\S]*padding-inline-start/)
     expect(markdownStyles).toMatch(/\.markdown-table-wrap[\s\S]*overflow-x:\s*auto/)
     expect(markdownStyles).toMatch(/\.markdown-content th,[\s\S]*border-bottom:\s*1px solid var\(--color-border\)/)
@@ -360,6 +372,8 @@ describe('前端视觉契约', () => {
     expect(workspaceStyles).toMatch(/data-sidebar-mode='rail'[\s\S]*var\(--layout-sidebar-rail\)/)
     expect(workspaceStyles).toContain('.sidebar-head.is-search-open')
     expect(workspaceStyles).toMatch(/\.workspace-sidebar\s*\{[^}]*overflow:\s*visible;/s)
+    expect(workspaceStyles).toMatch(/\.sidebar-rail\s*\{[^}]*gap:\s*var\(--space-3\);[^}]*padding:\s*var\(--space-5\) var\(--space-1-5\) var\(--space-3\);/s)
+    expect(workspaceStyles).toMatch(/\.sidebar-rail \.ui-icon-button\s*\{[^}]*width:\s*var\(--control-sm\);[^}]*min-width:\s*var\(--control-sm\);[^}]*min-height:\s*var\(--control-sm\);[^}]*height:\s*var\(--control-sm\);/s)
     expect(workspaceStyles).toMatch(/\.sidebar-head\s*\{[^}]*align-items:\s*center;[^}]*gap:\s*var\(--space-2\);[^}]*min-height:\s*calc\(var\(--control-xl\) \+ var\(--space-4\)\);[^}]*margin-bottom:\s*var\(--space-1\);/s)
     expect(workspaceStyles).toMatch(/\.sidebar-head-actions\s*\{[^}]*margin-left:\s*auto;[^}]*flex:\s*0 0 auto;[^}]*align-items:\s*center;[^}]*gap:\s*var\(--space-1\);/s)
     expect(workspaceStyles).toMatch(/\.brand\s*\{[^}]*overflow:\s*hidden;[^}]*flex:\s*1 1 auto;[^}]*padding:\s*0;/s)
@@ -369,11 +383,15 @@ describe('前端视觉契约', () => {
     expect(workspaceStyles).toMatch(/\.sidebar-head \.brand-plus\s*\{[^}]*padding-inline:\s*var\(--space-1\);[^}]*font-size:\s*var\(--type-micro-size\);[^}]*line-height:\s*var\(--type-micro-line\);/s)
     expect(workspaceStyles).toMatch(/\.sidebar-head-actions \.ui-icon-button\s*\{[^}]*width:\s*var\(--control-xs\);[^}]*min-height:\s*var\(--control-xs\);[^}]*height:\s*var\(--control-xs\);/s)
     expect(workspaceStyles).toMatch(/@media \(any-hover:\s*none\), \(any-pointer:\s*coarse\)[\s\S]*\.sidebar-head-actions \.ui-icon-button\s*\{[^}]*width:\s*var\(--control-lg\);[^}]*min-width:\s*var\(--control-lg\);[^}]*height:\s*var\(--control-lg\);/s)
+    expect(workspaceStyles).toMatch(/@media \(any-hover:\s*none\), \(any-pointer:\s*coarse\)[\s\S]*\.sidebar-rail\s*\{[^}]*gap:\s*var\(--space-2\);[^}]*padding-top:\s*var\(--space-4\);/s)
+    expect(workspaceStyles).toMatch(/@media \(any-hover:\s*none\), \(any-pointer:\s*coarse\)[\s\S]*\.sidebar-rail \.ui-icon-button\s*\{[^}]*width:\s*var\(--control-lg\);[^}]*min-width:\s*var\(--control-lg\);[^}]*min-height:\s*var\(--control-lg\);[^}]*height:\s*var\(--control-lg\);/s)
     expect(workspaceStyles).toMatch(/@media \(any-hover:\s*none\), \(any-pointer:\s*coarse\)[\s\S]*\.sidebar-head\s*\{[^}]*gap:\s*var\(--space-1\);[^}]*\}[\s\S]*\.sidebar-head-actions\s*\{[^}]*gap:\s*var\(--space-0\);[^}]*\}[\s\S]*\.brand\s*\{[^}]*gap:\s*var\(--space-0-5\);/s)
     expect(workspaceStyles).toMatch(/@media \(any-hover:\s*none\), \(any-pointer:\s*coarse\)[\s\S]*\.brand \.brand-mark svg\s*\{[^}]*width:\s*28px;[^}]*height:\s*28px;/s)
     expect(workspaceStyles).toMatch(/@media \(any-hover:\s*none\), \(any-pointer:\s*coarse\)[\s\S]*\.sidebar-head \.brand-plus\s*\{[^}]*padding-inline:\s*var\(--space-0\);[^}]*font-size:\s*var\(--type-micro-size\);/s)
     expect(workspaceStyles).toMatch(/\.brand:hover,[\s\S]*\.brand:active\s*{[^}]*background:\s*transparent;[^}]*box-shadow:\s*none;[^}]*color:\s*var\(--color-text-primary\);/s)
     expect(workspaceStyles).toMatch(/\.sidebar-head-actions \.ui-tooltip\s*\{[^}]*right:\s*0;[^}]*left:\s*auto;/s)
+    expect(workspaceStyles).toMatch(/\.sidebar-head-actions \.sidebar-mode-toggle \+ \.ui-tooltip\s*\{[^}]*top:\s*50%;[^}]*right:\s*auto;[^}]*left:\s*calc\(100% \+ var\(--space-3\)\);[^}]*transform:\s*translate\(var\(--space-0-5\), -50%\);/s)
+    expect(workspaceStyles).toMatch(/\.sidebar-head-actions \.ui-icon-button-wrap:hover \.sidebar-mode-toggle \+ \.ui-tooltip,[\s\S]*\.sidebar-head-actions \.sidebar-mode-toggle:focus-visible \+ \.ui-tooltip\s*\{[^}]*transform:\s*translate\(0, -50%\);/s)
     expect(workspaceStyles).toMatch(/\.sidebar-rail \.ui-tooltip\s*\{[^}]*top:\s*50%;[^}]*left:\s*calc\(100% \+ var\(--space-5\)\);[^}]*transform:\s*translate\(var\(--space-0-5\), -50%\);/s)
     expect(workspaceStyles).toMatch(/\.sidebar-rail \.ui-icon-button-wrap:hover \.ui-tooltip,[\s\S]*\.sidebar-rail \.ui-icon-button:focus-visible \+ \.ui-tooltip\s*\{[^}]*transform:\s*translate\(0, -50%\);/s)
     expect(workspaceStyles).toMatch(/@media \(max-width:\s*767px\)/)
@@ -418,10 +436,26 @@ describe('前端视觉契约', () => {
     const uiStyles = cssFiles['../components/ui/ui.css']
 
     expect(conversationStyles).not.toContain('.composer-wrap')
-    expect(conversationStyles).toMatch(/\.tool-row\.running > summary::after\s*\{[^}]*left:\s*0;[^}]*transform:\s*translateX\(-100%\);/s)
-    expect(conversationStyles).not.toContain('.subagent-card.running > summary::after')
-    expect(conversationStyles).toMatch(/@keyframes conversation-tool-row-sweep\s*\{[\s\S]*?0%\s*\{[^}]*transform:\s*translateX\(-100%\);[\s\S]*?90%, 100%\s*\{[^}]*transform:\s*translateX\(calc\(100vw \+ 100%\)\);/s)
-    expect(conversationStyles).not.toMatch(/@keyframes conversation-tool-row-sweep\s*\{[^}]*left:/s)
+    expect(conversationStyles).toMatch(/\.tool-row\.running > summary::after,\s*\.tool-row\.paused > summary::after,\s*\.subagent-card\.running > summary::after,\s*\.subagent-card\.paused > summary::after\s*\{[^}]*left:\s*0;[^}]*width:\s*300px;[^}]*color-mix\(in srgb, var\(--color-canvas\) 60%, transparent\) 55%,[^}]*animation:\s*conversation-tool-row-sweep var\(--motion-tool-sweep-cycle\) ease-out infinite;/s)
+    expect(conversationStyles).toMatch(/@keyframes conversation-tool-row-sweep\s*\{[\s\S]*?0%\s*\{[^}]*left:\s*-300px;[\s\S]*?90%, 100%\s*\{[^}]*left:\s*100%;/s)
+    expect(conversationStyles).toMatch(/@media \(prefers-reduced-motion: reduce\)[\s\S]*\.tool-row\.running > summary::after,\s*\.tool-row\.paused > summary::after,\s*\.subagent-card\.running > summary::after,\s*\.subagent-card\.paused > summary::after,[\s\S]*animation:\s*none;/s)
+    expect(conversationStyles).toMatch(/\.tool-field-pending\s*\{[^}]*width:\s*var\(--space-12\);[^}]*overflow:\s*hidden;/s)
+    expect(conversationStyles).toMatch(/@keyframes conversation-tool-result-pulse\s*\{[\s\S]*?0%\s*\{[^}]*opacity:\s*0;[\s\S]*?100%\s*\{[^}]*translate\(calc\(var\(--space-12\) \+ 10px\), -50%\);[^}]*opacity:\s*0;/s)
+    expect(workspaceStyles).toMatch(/\.message-list\s*\{[^}]*--conversation-flow-gap:\s*var\(--space-4\);/s)
+    expect(workspaceStyles).not.toContain('--conversation-flow-gap-surface')
+    expect(workspaceStyles).not.toContain('--conversation-flow-gap-mixed')
+    expect(workspaceStyles).not.toContain('--conversation-flow-gap-content')
+    expect(workspaceStyles).toMatch(/\.message-list > :is\([\s\S]*?\.approval-wait-state,[\s\S]*?\.plan-interaction-wait-state,[\s\S]*?\) \+ :is\([\s\S]*?\.approval-wait-state,[\s\S]*?\.plan-interaction-wait-state,[\s\S]*?\)\s*\{[^}]*margin-top:\s*var\(--conversation-flow-gap\);/s)
+    expect(workspaceStyles).toMatch(/\.message-list > \.user-message \+ \.assistant-message\s*\{[^}]*margin-top:\s*0;/s)
+    expect(workspaceStyles).toMatch(/\.message-list > \.assistant-message:has\(> \.message-action-row--assistant\) \+ \.user-message\s*\{[^}]*margin-top:\s*var\(--space-12\);/s)
+    expect(workspaceStyles).toMatch(/\.message-list > :is\([\s\S]*?\.message-history-loader,[\s\S]*?\.message-stream-tail[\s\S]*?\) \+ :is\([\s\S]*?\.message-history-loader,[\s\S]*?\.message-stream-tail/s)
+    expect(workspaceStyles).toMatch(/\.message-history-loader\s*\{[^}]*display:\s*grid;[^}]*place-items:\s*center;[^}]*\}/s)
+    expect(workspaceStyles).not.toMatch(/\.message-history-loader\s*\{[^}]*padding-bottom:/s)
+    expect(conversationStyles).toMatch(/\.streaming-indicator,\s*\.message-stream-tail\s*\{[^}]*margin:\s*0;/s)
+    expect(conversationStyles).not.toContain(':has(+ .approval-wait-state)')
+    expect(tokensStyles).toContain('--optical-activity-dots-inset: 1px;')
+    expect(conversationStyles).toMatch(/\.activity-dots\s*\{[^}]*margin-inline-start:\s*var\(--optical-activity-dots-inset\);/s)
+    expect(conversationStyles).toMatch(/\.approval-wait-state > \.activity-dots,\s*\.plan-interaction-wait-state > \.activity-dots\s*\{[^}]*color:\s*var\(--color-text-tertiary\);/s)
     expect(conversationStyles).toMatch(/\.composer-dock\s*\{[^}]*grid-row:\s*2;[^}]*grid-column:\s*1;[^}]*align-self:\s*end;[^}]*pointer-events:\s*none;[^}]*background:\s*transparent;/s)
     expect(conversationStyles).toMatch(/\.composer-dock::before\s*\{[^}]*height:\s*calc\(100% \+ var\(--space-16\)\);[^}]*linear-gradient\(to bottom, transparent, var\(--color-canvas\)\);/s)
     expect(conversationStyles).toMatch(/\.composer-dock\.is-hero\s*\{[^}]*align-self:\s*center;[^}]*display:\s*flex;[^}]*padding-bottom:\s*max\(calc\(var\(--space-8\) \+ var\(--type-composer-line\) \+ var\(--type-composer-line\) \+ var\(--type-composer-line\)\), env\(safe-area-inset-bottom\)\);[^}]*flex-direction:\s*column;/s)
@@ -437,6 +471,10 @@ describe('前端视觉契约', () => {
     expect(workspaceStyles).toMatch(/\.primary-nav\s*\{[^}]*padding-bottom:\s*var\(--space-4\);[^}]*border:\s*0;/s)
     expect(workspaceStyles).toContain('.new-chat:hover .new-chat-shortcut')
     expect(workspaceStyles).toMatch(/\.conversation-history::after\s*\{[^}]*position:\s*absolute;[^}]*bottom:\s*0;[^}]*height:\s*var\(--space-6\);[^}]*linear-gradient\(to bottom, transparent, var\(--color-sidebar\)\);[^}]*pointer-events:\s*none;/s)
+    expect(workspaceStyles).toMatch(/\.conversation-attention-dot\s*\{[^}]*transform-origin:\s*center;[^}]*animation:\s*workspace-attention-breathe var\(--motion-attention-cycle\)/s)
+    expect(workspaceStyles).toMatch(/\.conversation-attention-dot\.is-approval\s*\{[^}]*color:\s*var\(--color-warning-panel-accent\);/s)
+    expect(workspaceStyles).toMatch(/\.conversation-attention-dot\.is-plan\s*\{[^}]*color:\s*var\(--color-plan-panel-accent\);/s)
+    expect(workspaceStyles).toMatch(/@keyframes workspace-attention-breathe\s*\{[\s\S]*?0%, 100%\s*\{[^}]*transform:\s*scale\(\.88\);[^}]*opacity:\s*\.7;[\s\S]*?50%\s*\{[^}]*transform:\s*scale\(1\);[^}]*opacity:\s*1;/s)
     expect(workspaceStyles).not.toContain('.history-toolbar')
     expect(workspaceStyles).toMatch(/\.conversation-sticky-title\s*\{[^}]*position:\s*absolute;[^}]*top:\s*0;[^}]*right:\s*0;[^}]*left:\s*0;[^}]*height:\s*22px;/s)
     expect(workspaceStyles).toMatch(/\.conversation-group-title,[\s\S]*\.conversation-sticky-title\s*\{[^}]*font-size:\s*var\(--type-caption-size\);/s)
@@ -520,13 +558,24 @@ describe('前端视觉契约', () => {
     expect(workspaceStyles).toMatch(/@media \(max-width:\s*767px\)[\s\S]*\.workspace-title\s*\{[^}]*position:\s*static;[^}]*flex:\s*1 1 auto;[^}]*font-size:\s*var\(--type-title-size\);[^}]*text-overflow:\s*ellipsis;/s)
   })
 
-  it('新会话按控件高度使用与 Composer 一致的视觉弧度，并只通过共享选中态呈现品牌强调', () => {
+  it('大型内容表面共享同一视觉弧度，并只通过共享选中态呈现品牌强调', () => {
     const workspaceStyles = cssFiles['../features/workspace/workspace.css']
     const uiStyles = cssFiles['../components/ui/ui.css']
     const conversationStyles = cssFiles['../features/conversation/conversation.css']
+    const settingsStyles = cssFiles['../features/settings/settings.css']
 
     expect(workspaceStyles).toMatch(/\.new-chat\s*\{[^}]*border-radius:\s*var\(--radius-lg\);[^}]*background:\s*var\(--color-layer-1\);/s)
-    expect(conversationStyles).toMatch(/\.composer\s*\{[^}]*border-radius:\s*var\(--radius-composer\);/s)
+    expect(conversationStyles).toMatch(/\.user-message \.message-markdown\s*\{[^}]*border-radius:\s*var\(--radius-3xl\);/s)
+    expect(conversationStyles).toMatch(/\.markdown-code-block\s*\{[^}]*border-radius:\s*var\(--radius-3xl\);/s)
+    expect(conversationStyles).toMatch(/\.composer\s*\{[^}]*border-radius:\s*var\(--radius-3xl\);/s)
+    expect(conversationStyles).toMatch(/\.approval-composer,[\s\S]*\.plan-review-composer\s*\{[^}]*border-radius:\s*var\(--radius-3xl\);/s)
+    expect(uiStyles).toMatch(/\.ui-text-field__control\s*\{[^}]*border-radius:\s*var\(--radius-3xl\);/s)
+    expect(uiStyles).toMatch(/\.ui-text-field--capsule \.ui-text-field__control\s*\{[^}]*border-radius:\s*var\(--radius-3xl\);/s)
+    expect(uiStyles).toMatch(/\.modal-dialog\s*\{[^}]*border-radius:\s*var\(--radius-3xl\);/s)
+    expect(conversationStyles).toMatch(/\.approval-rejection-form textarea\s*\{[^}]*border-radius:\s*var\(--radius-3xl\);/s)
+    expect(conversationStyles).toMatch(/\.plan-review-input textarea\s*\{[^}]*border-radius:\s*var\(--radius-3xl\);/s)
+    expect(settingsStyles).toMatch(/@media \(max-width:\s*440px\)[\s\S]*\.settings-dialog\s*\{[^}]*border-radius:\s*var\(--radius-3xl\);/s)
+    expect(conversationStyles).not.toMatch(/\.markdown-content--article \.markdown-code-block\s*\{[^}]*border-radius:/s)
     expect(uiStyles).toMatch(/\.ui-button\.is-selected\s*\{[^}]*background:\s*var\(--color-brand-soft\);/s)
     expect(uiStyles).toMatch(/\.ui-button\.is-selected:hover:not\(:disabled\)\s*\{[^}]*background:\s*var\(--color-brand-soft\);/s)
   })
@@ -534,6 +583,7 @@ describe('前端视觉契约', () => {
   it('Composer 锁定命令菜单、附件条和单行工具控件的精修参数', () => {
     const conversationStyles = cssFiles['../features/conversation/conversation.css']
 
+    expect(conversationStyles).toMatch(/\.composer\s*\{[^}]*gap:\s*var\(--space-3\);[^}]*padding:\s*10px 0 0;/s)
     expect(conversationStyles).toMatch(/\.composer-input-scroll\s*\{[^}]*max-height:\s*144px;[^}]*overflow-y:\s*auto;/s)
     expect(conversationStyles).toMatch(/\.composer-input,[\s\S]*\.composer-input-backdrop\s*\{[^}]*padding:\s*4px 12px 0 16px;[^}]*font-size:\s*var\(--type-body-size\);[^}]*line-height:\s*var\(--type-composer-line\);[^}]*white-space:\s*pre-wrap;/s)
     expect(conversationStyles).toMatch(/\.composer-toolbar\s*\{[^}]*align-items:\s*center;[^}]*min-height:\s*42px;[^}]*padding:\s*2px var\(--space-2\) 6px;/s)

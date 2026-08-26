@@ -16,6 +16,7 @@ from redis.asyncio import Redis
 
 from tinkerfin import TinkerFin
 from tinkerfin.redis import RedisRunCoordinator
+from tinkerfin_messaging import MessagingLimits
 from tinkerfin_messaging.agui import AgUiCodec
 from tinkerfin_messaging.messaging import MessageChannel, Messaging
 from tinkerfin_messaging.redis import RedisBackend
@@ -33,6 +34,9 @@ from tinkerfin_studio.infrastructure.database import Database
 from tinkerfin_studio.infrastructure.redis_client import create_redis_client
 
 logger = logging.getLogger(__name__)
+_STUDIO_MESSAGING_LIMITS = MessagingLimits(
+    max_message_payload_bytes=4 * 1024 * 1024,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,10 +73,10 @@ def build_lifespan():
             max_overflow=database_settings.max_overflow,
             pool_recycle=database_settings.pool_recycle,
         )
-        redis = create_redis_client(settings.redis)
         stack = AsyncExitStack()
         try:
             await stack.enter_async_context(database)
+            redis = create_redis_client(settings.redis)
             stack.push_async_callback(redis.aclose)
             http_client = await stack.enter_async_context(
                 httpx.AsyncClient(trust_env=False)
@@ -120,6 +124,7 @@ def build_lifespan():
             messaging_backend = RedisBackend(
                 redis,
                 key_prefix=settings.redis.messaging_key_prefix,
+                limits=_STUDIO_MESSAGING_LIMITS,
             )
             messaging = await stack.enter_async_context(
                 Messaging(backend=messaging_backend)
@@ -133,6 +138,7 @@ def build_lifespan():
                 channel=channel,
             )
             stack.push_async_callback(projector.aclose)
+            await projector.recover_preparing()
             application.state.resources = ApplicationResources(
                 settings=settings,
                 database=database,

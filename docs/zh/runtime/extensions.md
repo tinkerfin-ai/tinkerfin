@@ -1,75 +1,16 @@
-# 自定义事件源与并发协调
+# 运行协调与 Redis 租约
 
 [事件流与 SSE](streams-and-sse.md) · [English](../../en/runtime/extensions.md)
 
-大多数 Deep Agents 应用只需要 `create_deep_agent()`。如果你已经有自己的异步数据源，或者需要限制同一业务身份的并发运行，可以使用本页的能力。
-
-## 运行自己的异步事件源
-
-事件源必须是一个每次调用都会返回新异步迭代器的函数。
-
-```python
-import asyncio
-from collections.abc import AsyncIterator
-
-from tinkerfin import Identity, TinkerFin
-
-
-async def source() -> AsyncIterator[dict[str, object]]:
-    yield {"step": 1, "message": "started"}
-    await asyncio.sleep(0.1)
-    yield {"step": 2, "message": "finished"}
-
-
-run = TinkerFin().run(source)
-stream = run.astream()
-
-async for item in stream:
-    print(item)
-```
-
-### `TinkerFin.run()` 参数
-
-| 参数 | 默认值 | 作用 |
-| --- | --- | --- |
-| `source_factory` | 必填 | 创建异步迭代器的函数，或通过 `AgUiNativeStreamConfig.bind()` 得到的调用对象 |
-| `identity` | `None` | 自定义无状态 source 可省略；需要 coordinator、AG-UI 或 Messaging 时提供 |
-| `on_part` | `None` | 每条数据交付前执行的观察函数 |
-
-不要把已经开始消费的同一个异步生成器重复传给多个运行。
-
-## 把原生 v2 数据转换成 AG-UI
-
-如果你的事件源就是 LangGraph v2 数据，可以先声明它遵循 AG-UI 所需的模式：
-
-```python
-from tinkerfin import AgUiNativeStreamConfig, TinkerFin
-
-
-invocation = AgUiNativeStreamConfig().bind(
-    graph.astream,
-    graph_input,
-    config,
-)
-identity = Identity(threadId="thread-1", runId="run-1")
-run = TinkerFin().run(invocation, identity=identity)
-events = run.astream_agui()
-```
-
-`AgUiNativeStreamConfig` 默认要求 `messages`、`tasks`、`values`、`version="v2"` 和 `subgraphs=True`。`extra_modes` 可以增加 `updates`、`checkpoints`、`debug` 或 `custom`：
-
-```python
-config = AgUiNativeStreamConfig(extra_modes=("custom",))
-```
-
-不匹配的流参数会在开始运行前报错。
+需要限制相同业务身份并发执行时，为 TinkerFin factory 配置 run coordinator。该
+coordinator 会作用于这个 factory 创建的每个 Runtime。
 
 ## 限制同一身份的并发运行
 
 如果同一用户、项目或会话不能同时运行两个任务，可以配置 coordinator。
 
 ```python
-from tinkerfin import InMemoryRunCoordinator, TinkerFin
+from tinkerfin import Identity, InMemoryRunCoordinator, TinkerFin
 
 
 coordinator = InMemoryRunCoordinator(
@@ -78,10 +19,13 @@ coordinator = InMemoryRunCoordinator(
 tinkerfin = TinkerFin(run_coordinator=coordinator)
 
 identity = Identity(threadId="tenant-7/user-42", runId="run-1")
-run = tinkerfin.run(source, identity=identity)
+agent = tinkerfin.create_deep_agent(model=model, tools=tools)
+runtime = agent.new(identity=identity)
+stream = runtime.astream(graph_input)
 ```
 
-有 coordinator 时必须提供 `Identity`。自定义 source 没有 coordinator 时可以省略，但省略后不会声明可供 Messaging 自动识别的运行身份。
+每个 Runtime 都有 `Identity`。coordinator 接收同一个完整值，并在 Native 或 AG-UI
+事件流的整个生命周期内持有协调作用域。
 
 内存 coordinator 只协调当前进程。如果应用有多个进程，可以实现 `RunCoordinator`，把锁放到共享系统中：
 

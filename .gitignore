@@ -39,7 +39,6 @@ build/
 htmlcov/
 .mypy_cache/
 .ruff_cache/
-/tests/
 
 # Local databases
 *.db

@@ -627,8 +627,7 @@ export const buildResumePayload = (
       }
       continue
     }
-    const requiredDecision = item.editedArgs ? "edit" : "approve"
-    if (!item.allowedDecisions.includes(requiredDecision)) {
+    if (!item.allowedDecisions.includes("approve")) {
       throw new ConversationError("approval_stale")
     }
   }
@@ -649,15 +648,7 @@ export const buildResumePayload = (
     return {
       interruptId: item.interruptId,
       status: "resolved",
-      payload: item.editedArgs
-        ? {
-          type: "edit",
-          edited_action: {
-            name: item.toolName,
-            args: item.editedArgs,
-          },
-        }
-        : { type: "approve" },
+      payload: { type: "approve" },
     }
   })
 
@@ -702,14 +693,6 @@ export const buildPlanResumePayload = (
     if (!interaction.action) throw new ConversationError("plan_action_required")
     if (interaction.action === 'approve') {
       payload = { type: 'approve', baseRevision: interaction.revision }
-    } else if (interaction.action === 'edit') {
-      const markdown = interaction.editedMarkdown ?? ''
-      if (!markdown.trim()) throw new ConversationError("plan_edit_empty")
-      payload = {
-        type: 'edit',
-        baseRevision: interaction.revision,
-        content: { markdown },
-      }
     } else if (interaction.action === 'respond') {
       const message = interaction.message?.trim()
       if (!message) throw new ConversationError("plan_feedback_required")
@@ -832,6 +815,20 @@ const restorePendingInteraction = (conversation: Conversation): Conversation => 
   for (const item of approval?.items ?? []) {
     if (item.toolCallId) interruptByToolId.set(item.toolCallId, item.interruptId)
   }
+  const interruptedRunIds = new Set(
+    conversation.messages.flatMap((message) => {
+      const meta = message.meta
+      if (
+        message.role !== "tool"
+        || !meta
+        || meta.subRunId != null
+        || typeof meta.runId !== "string"
+        || typeof meta.toolCallId !== "string"
+        || !interruptByToolId.has(meta.toolCallId)
+      ) return []
+      return [meta.runId]
+    }),
+  )
   return {
     ...conversation,
     runStatus: "waiting_approval",
@@ -843,7 +840,13 @@ const restorePendingInteraction = (conversation: Conversation): Conversation => 
       const interruptId = toolCallId
         ? interruptByToolId.get(toolCallId)
         : undefined
-      if (message.role !== "tool" || !interruptId) return message
+      if (
+        message.role !== "tool"
+        || (message.meta?.status !== "running" && message.meta?.status !== "paused")
+        || message.meta.subRunId != null
+        || typeof message.meta.runId !== "string"
+        || !interruptedRunIds.has(message.meta.runId)
+      ) return message
       return {
         ...message,
         meta: {
@@ -1392,7 +1395,7 @@ export const restoreConversationFromHistory = (
   // 已水化历史停在 `streaming` 并暴露无效停止按钮，详情状态才是权威服务端状态
   const hasAuthoritativeApproval = detail.status === "waiting_approval"
     && detail.hasPendingInterrupt
-  return {
+  const authoritative: Conversation = {
     ...restored,
     approval: hasAuthoritativeApproval ? restored.approval : undefined,
     planInteraction: hasAuthoritativeApproval ? restored.planInteraction : undefined,
@@ -1404,6 +1407,9 @@ export const restoreConversationFromHistory = (
           ? "error"
           : "idle",
   }
+  return hasAuthoritativeApproval
+    ? restorePendingInteraction(authoritative)
+    : authoritative
 }
 
 export const applyHistoryEventEnvelope = (

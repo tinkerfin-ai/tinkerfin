@@ -11,6 +11,7 @@ dev = [
     "aiosqlite>=0.22,<1",
     "asyncmy>=0.2.11,<1",
     "deepagents>=0.7.1,<0.8.0",
+    "docker>=7.2,<8",
     "langgraph>=1.2.10,<2",
     "langgraph-checkpoint>=4.1,<5",
     "pyright>=1.1.411,<2.0.0",
@@ -19,6 +20,7 @@ dev = [
     "pytest-cov>=7,<8",
     "ruff>=0.16.1,<0.17.0",
     "sqlalchemy[asyncio]>=2.0.48,<3",
+    "testcontainers>=4.15,<5",
 ]
 [tool.uv]
 package = false
@@ -68,10 +70,18 @@ select = [
 
 [tool.pyright]
 include = [
-    "packages/*/src",
-    "packages/*/tests",
-    "apps/*/*/src",
-    "apps/*/*/tests",
+    "conftest.py",
+    "tests",
+    "packages/tinkerfin/src",
+    "packages/tinkerfin/tests",
+    "packages/tinkerfin-agui-adapter/src",
+    "packages/tinkerfin-agui-adapter/tests",
+    "packages/tinkerfin-messaging/src",
+    "packages/tinkerfin-messaging/tests",
+    "packages/tinkerfin-sandbox/src",
+    "packages/tinkerfin-sandbox/tests",
+    "apps/studio/server/src",
+    "apps/studio/server/tests",
 ]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
@@ -84,15 +94,17 @@ executionEnvironments = [{ root = "." }]
 asyncio_mode = "auto"
 required_plugins = ["pytest-asyncio"]
 markers = [
-    "opensandbox_e2e: requires the real OpenSandbox Server at 127.0.0.1:8091",
-    "mysql_integration: requires an explicit disposable MySQL test database",
+    "docker_integration: uses repository-owned disposable Docker services",
+    "opensandbox_e2e: uses a test-owned disposable OpenSandbox Server and Sandbox",
+    "mysql_integration: uses a test-owned disposable MySQL database",
     "packaging_e2e: builds and installs wheels in isolated environments",
-    "redis_e2e: requires a real Redis service configured by TINKERFIN_TEST_REDIS_URL",
-    "studio_mysql_integration: requires an explicit disposable Studio MySQL database",
+    "redis_e2e: uses a test-owned disposable Redis Stack service",
+    "studio_mysql_integration: uses test-owned disposable Studio MySQL databases",
     "studio_e2e: requires the real Studio dependencies and explicit E2E configuration",
 ]
 
 testpaths = [
+    "tests",
     "packages",
     "apps/studio/server",
 ]
@@ -100,6 +112,8 @@ testpaths = [
 addopts = [
     "--strict-config",
     "--strict-markers",
+    "-m",
+    "not docker_integration",
 ]
 
 [tool.coverage.run]

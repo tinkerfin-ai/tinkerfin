@@ -1,4 +1,4 @@
-"""Stateless Graph binding and native asynchronous streaming."""
+"""Request-scoped Deep Agents native and AG-UI streaming."""
 
 from __future__ import annotations
 
@@ -10,10 +10,11 @@ from collections.abc import (
     Awaitable,
     Callable,
     Mapping,
+    Sequence,
 )
 from contextlib import AbstractAsyncContextManager
 from contextvars import ContextVar
-from typing import Generic, TypeAlias, TypeVar, cast, overload
+from typing import Generic, TypeAlias, TypeVar
 
 from ag_ui.core import BaseEvent
 from deepagents.graph import DeepAgentState
@@ -30,24 +31,25 @@ from . import _runtime_agui, _runtime_streams
 from ._runtime_agui import _AgUiStreamDeadlineExceeded
 from ._runtime_streams import _validate_timeout
 from ._state_schema import validate_state_schema
-from .agui_native import (
-    AgUiNativeStreamConfig,
-    AgUiNativeStreamConfigurationError,
-    AgUiNativeStreamInvocation,
-)
 from .coordination import RunCoordinator
 from .deep_agent import CREATE_DEEP_AGENT
 from .errors import (
+    AgUiNativeStreamConfigurationError,
     AgUiSettlementTimeoutError,
-    TinkerFinLifecycleError,
 )
 from .native import NativeStreamPart
 from .plan._clarification import create_clarification_binding
-from .plan._config import AgentMode, PlanOptions, validate_agent_mode
+from .plan._config import (
+    DEFAULT_PLAN_REVIEW_ACTIONS,
+    AgentMode,
+    PlanOptions,
+    validate_agent_mode,
+    validate_plan_review_actions,
+)
 from .plan._content import create_plan_content_binding
 from .plan._contracts import create_plan_contract_binding
 from .plan.clarification import ClarificationFormBase, DefaultClarificationForm
-from .plan.models import PlanContentModel, StructuredPlanContent
+from .plan.models import PlanContentModel, PlanReviewAction, StructuredPlanContent
 from .sse import (
     SseBody,
     SseEventIdResolver,
@@ -64,8 +66,8 @@ PartObserver: TypeAlias = Callable[[PartT], Awaitable[None]]
 EventObserver = Callable[[BaseEvent], Awaitable[None]]
 
 
-class GraphRunStream(Generic[PartT]):
-    """Single-use native stream with deterministic upstream cleanup."""
+class _GraphRunStream(Generic[PartT]):
+    """Internal single-use stream with deterministic upstream cleanup."""
 
     def __init__(
         self,
@@ -73,7 +75,7 @@ class GraphRunStream(Generic[PartT]):
         source_factory: Callable[[], AsyncIterator[PartT]],
         coordination_factory: (Callable[[], AbstractAsyncContextManager[None]] | None),
         on_part: PartObserver[PartT] | None,
-        identity: Identity | None = None,
+        identity: Identity,
     ) -> None:
         """Initialize a lazy, single-use native stream.
 
@@ -98,7 +100,7 @@ class GraphRunStream(Generic[PartT]):
         self._active_observers = 0
         self._finish_task: asyncio.Task[None] | None = None
 
-    def __aiter__(self) -> GraphRunStream[PartT]:
+    def __aiter__(self) -> _GraphRunStream[PartT]:
         """Return this single-use asynchronous iterator."""
 
         return self
@@ -161,17 +163,14 @@ class GraphRunStream(Generic[PartT]):
         )
 
 
-class NativeGraphRunStream(GraphRunStream[Mapping[str, object]]):
+class NativeGraphRunStream(_GraphRunStream[Mapping[str, object]]):
     """Canonical LangGraph v2 stream with a complete durable codec profile."""
 
     @property
     def messaging_identity(self) -> Identity:
         """Return the immutable durable run identity."""
 
-        identity = self._identity
-        if identity is None:
-            raise TinkerFinLifecycleError("a native stream requires an Identity")
-        return identity
+        return self._identity
 
     @property
     def messaging_codec_profile(self) -> str:
@@ -531,144 +530,8 @@ class AgUiEventStream:
         )
 
 
-class TinkerFinRun(Generic[PartT]):
-    """Single-use binding of one native source factory and optional Identity."""
-
-    __slots__ = (
-        "_on_part",
-        "_identity",
-        "_run_coordinator",
-        "_source_factory",
-        "_stream_claimed",
-    )
-
-    def __init__(
-        self,
-        *,
-        source_factory: Callable[[], AsyncIterator[PartT]],
-        run_coordinator: RunCoordinator | None,
-        identity: Identity | None,
-        on_part: PartObserver[PartT] | None,
-    ) -> None:
-        """Initialize a lazy run binding without opening its source."""
-
-        self._source_factory = source_factory
-        self._run_coordinator = run_coordinator
-        self._identity = identity
-        self._on_part = on_part
-        self._stream_claimed = False
-
-    def astream(self) -> GraphRunStream[PartT]:
-        """Claim and create the run's one native object stream."""
-
-        source_factory, coordination_factory, on_part = self._claim_stream_inputs()
-        return GraphRunStream(
-            source_factory=source_factory,
-            coordination_factory=coordination_factory,
-            on_part=on_part,
-            identity=self._identity,
-        )
-
-    def _claim_stream_inputs(
-        self,
-    ) -> tuple[
-        Callable[[], AsyncIterator[PartT]],
-        Callable[[], AbstractAsyncContextManager[None]] | None,
-        PartObserver[PartT] | None,
-    ]:
-        """Claim the binding and return the inputs for exactly one stream type."""
-
-        if self._stream_claimed:
-            raise TinkerFinLifecycleError(
-                "a TinkerFin run can create only one object stream"
-            )
-        self._stream_claimed = True
-        coordinator = self._run_coordinator
-        identity = self._identity
-        coordination_factory = (
-            None
-            if coordinator is None
-            else lambda: coordinator(cast(Identity, identity))
-        )
-        return (
-            self._source_factory,
-            coordination_factory,
-            self._on_part,
-        )
-
-    def astream_agui(
-        self,
-        *,
-        timeout: float | None = None,
-        settlement_timeout: float | None = None,
-        expose_reasoning_events: bool = False,
-        expose_subagent_events: bool = True,
-        prior_tool_call_ids: frozenset[str] = frozenset(),
-        private_state_keys: frozenset[str] = frozenset(),
-        on_event: EventObserver | None = None,
-        parent_run_id: str | None = None,
-    ) -> AgUiEventStream:
-        """Claim the native source and convert it to one AG-UI event stream.
-
-        Args:
-            timeout: Optional total native-part pull deadline in seconds.
-            settlement_timeout: Optional per-caller close-settlement wait in seconds.
-                Expiry never cancels the retained close task.
-            expose_reasoning_events: Whether verified public reasoning emits events.
-            expose_subagent_events: Whether validated non-root events are emitted.
-            prior_tool_call_ids: Scoped Tool call IDs already emitted before resume.
-            private_state_keys: Top-level state channels omitted from public output.
-            on_event: Optional async observer awaited before each event is delivered.
-            parent_run_id: Optional branch lineage exposed on the main start event.
-
-        Returns:
-            A single-use observed AG-UI object stream.
-
-        Raises:
-            TypeError: An identifier, callback, timeout, or option has the wrong type.
-            ValueError: An identifier or timeout value is invalid.
-        """
-
-        identity = self._identity
-        if identity is None:
-            raise ValueError("AG-UI streaming requires an Identity")
-        if on_event is not None and not callable(on_event):
-            raise TypeError("on_event must be an async callable or None")
-        return AgUiEventStream(
-            parts=self.astream(),
-            identity=identity,
-            timeout=timeout,
-            settlement_timeout=settlement_timeout,
-            expose_reasoning_events=expose_reasoning_events,
-            expose_subagent_events=expose_subagent_events,
-            prior_tool_call_ids=prior_tool_call_ids,
-            private_state_keys=private_state_keys,
-            on_event=on_event,
-            parent_run_id=parent_run_id,
-        )
-
-
-class NativeTinkerFinRun(
-    TinkerFinRun[Mapping[str, object]],
-):
-    """Single-use binding whose object stream is canonical LangGraph v2 data."""
-
-    __slots__ = ()
-
-    def astream(self) -> NativeGraphRunStream:
-        """Claim and create one profiled canonical native stream."""
-
-        source_factory, coordination_factory, on_part = self._claim_stream_inputs()
-        return NativeGraphRunStream(
-            source_factory=source_factory,
-            coordination_factory=coordination_factory,
-            on_part=on_part,
-            identity=self._identity,
-        )
-
-
 class TinkerFin:
-    """Globally shareable factory for single-use source and Agent definitions."""
+    """Globally shareable factory for request-scoped Deep Agent definitions."""
 
     __slots__ = ("_plan_options", "_run_coordinator", "_state_schema")
 
@@ -706,6 +569,7 @@ class TinkerFin:
         planner_model: str | BaseChatModel | None = None,
         clarification_schema: type[ClarificationFormBase] = DefaultClarificationForm,
         plan_schema: type[PlanContentModel] = StructuredPlanContent,
+        review_actions: Sequence[PlanReviewAction] = DEFAULT_PLAN_REVIEW_ACTIONS,
     ) -> TinkerFin:
         """Return a factory with immutable Plan-capability options.
 
@@ -718,18 +582,20 @@ class TinkerFin:
             planner_model: Optional model dedicated to read-only planning.
             clarification_schema: Concrete host form used by the Planner.
             plan_schema: Concrete content model used for drafts and confirmed Plans.
+            review_actions: Ordered decisions accepted for each Plan draft review.
 
         Returns:
             A separate configured TinkerFin factory.
 
         Raises:
-            TypeError: ``enabled`` or a model value has the wrong type.
+            TypeError: ``enabled``, a model, or a review action has the wrong type.
             PlanModeConfigurationError: A mode or disabled configuration is invalid.
         """
 
         if type(enabled) is not bool:
             raise TypeError("enabled must be a bool")
         mode = validate_agent_mode(default_mode, name="default_mode")
+        actions = validate_plan_review_actions(review_actions)
         for name, model in (("planner_model", planner_model),):
             if model is not None and not isinstance(model, (str, BaseChatModel)):
                 raise TypeError(
@@ -742,12 +608,13 @@ class TinkerFin:
             or planner_model is not None
             or clarification_schema is not DefaultClarificationForm
             or plan_schema is not StructuredPlanContent
+            or actions != DEFAULT_PLAN_REVIEW_ACTIONS
         ):
             from .plan.errors import PlanModeConfigurationError
 
             raise PlanModeConfigurationError(
                 "disabled Plan capability cannot configure a mode, model, form, "
-                "or content schema"
+                "content schema, or review actions"
             )
         configured = TinkerFin(
             run_coordinator=self._run_coordinator,
@@ -759,86 +626,16 @@ class TinkerFin:
             configured._plan_options = PlanOptions(
                 clarification=clarification,
                 content=content,
-                contracts=create_plan_contract_binding(clarification, content),
+                contracts=create_plan_contract_binding(
+                    clarification,
+                    content,
+                    review_actions=actions,
+                ),
+                review_actions=actions,
                 default_mode=mode,
                 planner_model=planner_model,
             )
         return configured
-
-    @overload
-    def run(
-        self,
-        source_factory: AgUiNativeStreamInvocation,
-        *,
-        identity: Identity,
-        on_part: PartObserver[Mapping[str, object]] | None = None,
-    ) -> NativeTinkerFinRun: ...
-
-    @overload
-    def run(
-        self,
-        source_factory: Callable[[], AsyncIterator[PartT]],
-        *,
-        identity: Identity | None = None,
-        on_part: PartObserver[PartT] | None = None,
-    ) -> TinkerFinRun[PartT]: ...
-
-    def run(
-        self,
-        source_factory: (
-            AgUiNativeStreamInvocation | Callable[[], AsyncIterator[PartT]]
-        ),
-        *,
-        identity: Identity | None = None,
-        on_part: (
-            PartObserver[Mapping[str, object]] | PartObserver[PartT] | None
-        ) = None,
-    ) -> NativeTinkerFinRun | TinkerFinRun[PartT]:
-        """Bind one lazy generic source or preflighted AG-UI native invocation.
-
-        Args:
-            source_factory: A zero-argument asynchronous source factory, or a native
-                invocation created by ``AgUiNativeStreamConfig.bind``.
-            identity: Optional thread and run identity. Strict native invocations and
-                configured coordinators require it.
-            on_part: Optional asynchronous observer awaited before native delivery or
-                AG-UI conversion.
-
-        Returns:
-            A single-use generic run, or a profiled native run for a strict invocation.
-
-        Raises:
-            TypeError: The source or observer is not callable.
-            ValueError: ``identity`` is missing when required.
-            AgUiNativeStreamConfigurationError: A strict invocation is invalid.
-        """
-
-        strict_invocation = isinstance(source_factory, AgUiNativeStreamInvocation)
-        if strict_invocation:
-            source_factory._validate()
-        if not callable(source_factory):
-            raise TypeError("source_factory must be callable")
-        self._validate_run_binding(identity=identity, on_part=on_part)
-        coordinator = self._run_coordinator
-        if strict_invocation:
-            if identity is None:
-                raise ValueError("a strict native invocation requires an Identity")
-            invocation = source_factory._bind_identity(identity)
-            return NativeTinkerFinRun(
-                source_factory=invocation,
-                run_coordinator=coordinator,
-                identity=identity,
-                on_part=cast(
-                    PartObserver[Mapping[str, object]] | None,
-                    on_part,
-                ),
-            )
-        return TinkerFinRun(
-            source_factory=source_factory,
-            run_coordinator=coordinator,
-            identity=identity,
-            on_part=cast(PartObserver[PartT] | None, on_part),
-        )
 
     def _validate_run_binding(
         self,
@@ -862,29 +659,64 @@ class TinkerFin:
         *,
         identity: Identity,
         on_part: PartObserver[Mapping[str, object]] | None,
-    ) -> NativeTinkerFinRun:
-        """Bind a validated canonical v2 source without changing public low-level API."""
+    ) -> NativeGraphRunStream:
+        """Create one validated canonical v2 stream for a request Runtime."""
 
         self._validate_run_binding(identity=identity, on_part=on_part)
-        return NativeTinkerFinRun(
+        coordinator = self._run_coordinator
+        return NativeGraphRunStream(
             source_factory=source_factory,
-            run_coordinator=self._run_coordinator,
+            coordination_factory=(
+                None if coordinator is None else lambda: coordinator(identity)
+            ),
             identity=identity,
             on_part=on_part,
+        )
+
+    def _run_agui(
+        self,
+        source_factory: Callable[[], AsyncIterator[Mapping[str, object]]],
+        *,
+        identity: Identity,
+        parent_run_id: str | None,
+        on_part: PartObserver[Mapping[str, object]] | None,
+        timeout: float | None,
+        settlement_timeout: float | None,
+        expose_reasoning_events: bool,
+        expose_subagent_events: bool,
+        prior_tool_call_ids: frozenset[str],
+        private_state_keys: frozenset[str],
+        on_event: EventObserver | None,
+    ) -> AgUiEventStream:
+        """Convert one framework-bound native source into an AG-UI event stream."""
+
+        if on_event is not None and not callable(on_event):
+            raise TypeError("on_event must be an async callable or None")
+        return AgUiEventStream(
+            parts=self._run_native(
+                source_factory,
+                identity=identity,
+                on_part=on_part,
+            ),
+            identity=identity,
+            timeout=timeout,
+            settlement_timeout=settlement_timeout,
+            expose_reasoning_events=expose_reasoning_events,
+            expose_subagent_events=expose_subagent_events,
+            prior_tool_call_ids=prior_tool_call_ids,
+            private_state_keys=private_state_keys,
+            on_event=on_event,
+            parent_run_id=parent_run_id,
         )
 
 
 __all__ = [
     "AgUiEventStream",
-    "AgUiNativeStreamConfig",
     "AgUiNativeStreamConfigurationError",
-    "AgUiNativeStreamInvocation",
     "AgUiSettlementTimeoutError",
     "EventObserver",
-    "GraphRunStream",
     "NativeGraphRunStream",
     "NativeStreamPart",
-    "NativeTinkerFinRun",
     "PartObserver",
     "SseBody",
     "SseEventIdResolver",
@@ -892,5 +724,4 @@ __all__ = [
     "SsePayload",
     "SsePreflight",
     "TinkerFin",
-    "TinkerFinRun",
 ]

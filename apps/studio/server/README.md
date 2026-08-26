@@ -22,7 +22,7 @@ uv run python -m tinkerfin_studio --host 127.0.0.1 --port 8090 --reload
 ```
 
 本地进程使用应用目录的 `.env`，其中 MySQL、Redis 和 OpenSandbox 地址必须能从宿主机
-访问。MySQL 空库结构见 [database/mysql/schema.sql](database/mysql/schema.sql)。
+访问，数据库应先由部署流程自动准备。
 
 ## 认证会话
 
@@ -93,21 +93,6 @@ Studio、MySQL、Redis、OpenSandbox 和一次性数据库初始化服务，只�
 密码和模型 API key 缺省使用隐藏交互输入，不进入命令历史。模型 API key 当前以明文
 保存在 `agent_models` 表，必须限制数据库账号、日志和备份访问。
 
-切换到 command 契约前，停止新 run，并先执行数据迁移 dry-run：
-
-```bash
-uv run python -m tinkerfin_studio.manage data migrate-forwarded-commands
-```
-
-确认受影响的 run、RUN_STARTED 事件和活跃 run 数量后，在数据库备份完成的维护窗口写入：
-
-```bash
-uv run python -m tinkerfin_studio.manage data migrate-forwarded-commands --apply
-```
-
-迁移会在同一事务中更新 `conversation_runs.input_json`、`conversation_events.event_json` 和
-`conversation_events.event_text`；存在活跃 run、未知旧值或 JSON/text 不一致时拒绝写入。
-
 ## 外部依赖模式
 
 编辑 `deploy/.env` 与 `deploy/secrets/`，把数据库 URL、Redis 地址和 OpenSandbox 地址
@@ -117,15 +102,7 @@ uv run python -m tinkerfin_studio.manage data migrate-forwarded-commands --apply
 ./apps/studio/server/deploy/deploy.sh --external
 ```
 
-外部空库可使用 Compose 工具服务执行全量初始化；如果数据库只存在部分 Studio 表，
-初始化会拒绝继续，不会覆盖数据：
-
-```bash
-docker compose \
-  --env-file apps/studio/server/deploy/.env \
-  -f apps/studio/server/deploy/docker-compose.yaml \
-  --profile tools run --rm database-init
-```
+部署命令会自动初始化空数据库；已有数据库保持不变。
 
 ## 运行约束
 

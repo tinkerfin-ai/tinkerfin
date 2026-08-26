@@ -31,7 +31,7 @@ from ._messaging_boundary import (
     _normalize_cancel_callback as _normalize_cancel_callback,
 )
 from ._producer_runtime import _ProducedMessage
-from .backend import MemoryBackend, MessagingBackend, PreparedRun
+from .backend import MemoryBackend, MessagingBackend, PreparedRun, RunStatus
 from .errors import (
     CodecMismatch,
     MessagingClosed,
@@ -266,6 +266,29 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         """Return the greatest committed sequence, or zero for an empty stream."""
 
         return await _message_channel.latest_seq(
+            self,
+            identity=identity,
+        )
+
+    async def get_run_status(self, *, identity: Identity) -> RunStatus:
+        """Return one durable run's current authoritative status.
+
+        The lookup has no producer ownership. A leased backend may atomically
+        classify an expired producer as ``owner_lost`` before returning.
+
+        Args:
+            identity: Exact thread and run identity to inspect.
+
+        Returns:
+            The durable running, cancellation, success, or failure status.
+
+        Raises:
+            RunNotFound: No durable record exists for the requested run.
+            MessagingError: Messaging is closed or the backend lookup fails.
+            ValueError: The identity is not canonical.
+        """
+
+        return await _message_channel.get_run_status(
             self,
             identity=identity,
         )
@@ -589,7 +612,7 @@ class Messaging:
                 the caller's wait and never cancels the shared close task.
 
         Raises:
-            TypeError: ``settlement_timeout`` is not numeric or is a boolean.
+            TypeError: The backend contract or ``settlement_timeout`` is invalid.
             ValueError: ``settlement_timeout`` is negative or non-finite.
         """
 
@@ -604,7 +627,11 @@ class Messaging:
             resolved_timeout = float(settlement_timeout)
             if not math.isfinite(resolved_timeout) or resolved_timeout < 0:
                 raise ValueError("settlement_timeout must be finite and non-negative")
-        self._backend: MessagingBackend = backend or MemoryBackend()
+        if backend is not None and not isinstance(backend, MessagingBackend):
+            raise TypeError("backend must implement MessagingBackend")
+        self._backend: MessagingBackend = (
+            MemoryBackend() if backend is None else backend
+        )
         self._settlement_timeout = resolved_timeout
         self._state = "new"
         self._preflight_tasks: set[asyncio.Task[object]] = set()

@@ -67,6 +67,7 @@ _ROOTED_TRANSFER_HOLD_SECONDS = 30
 _ROOTED_TRANSFER_READY_SECONDS = 5.0
 _ROOTED_TRANSFER_SETTLE_SECONDS = 5.0
 _ROOTED_TRANSFER_POLL_SECONDS = 0.01
+_ROOTED_TRANSFER_TERMINAL_LOG_SECONDS = 0.5
 _ROOTED_TRANSFER_MAX_LOG_BYTES = 64 * 1024
 _ROOTED_OFFLOAD_MAX_CAPTURE_BYTES = 10 * 1024 * 1024
 _ASYNC_ONLY_MESSAGE = (
@@ -81,6 +82,23 @@ class _RootedTransferOperationError(Exception):
     def __init__(self, error: _RootedError) -> None:
         super().__init__(error.message)
         self.error = error
+
+
+def _rooted_transfer_descriptor(
+    content: str,
+    *,
+    request: _RootedTransferCommand,
+) -> str | None:
+    """Parse accumulated helper logs into one descriptor or confirmed error."""
+
+    if len(content.encode("utf-8")) > _ROOTED_TRANSFER_MAX_LOG_BYTES:
+        raise ValueError("rooted transfer handshake exceeded log limit")
+    record = _parse_rooted_transfer_handshake(content, request=request)
+    if isinstance(record, _RootedError):
+        raise _RootedTransferOperationError(record)
+    if isinstance(record, _RootedTransferHandshake):
+        return f"/proc/{record.pid}/fd/{record.fd}"
+    return None
 
 
 def _join_output_messages(messages: Iterable[OutputMessage | str]) -> str:
@@ -359,13 +377,9 @@ class OpenSandboxBackend(BaseSandbox):
             )
             if logs.content:
                 content += logs.content
-                if len(content.encode("utf-8")) > _ROOTED_TRANSFER_MAX_LOG_BYTES:
-                    raise ValueError("rooted transfer handshake exceeded log limit")
-                record = _parse_rooted_transfer_handshake(content, request=request)
-                if isinstance(record, _RootedError):
-                    raise _RootedTransferOperationError(record)
-                if isinstance(record, _RootedTransferHandshake):
-                    return f"/proc/{record.pid}/fd/{record.fd}"
+                descriptor = _rooted_transfer_descriptor(content, request=request)
+                if descriptor is not None:
+                    return descriptor
             cursor = logs.cursor
             remaining = deadline - loop.time()
             if remaining <= 0:
@@ -377,6 +391,41 @@ class OpenSandboxBackend(BaseSandbox):
             if status.running is False or (
                 status.running is None and status.exit_code is not None
             ):
+                # OpenSandbox 0.1.14 can publish terminal command status before
+                # the final log cursor is visible. Drain only that cursor within
+                # a bounded grace period; the contract is fixed by
+                # test_rooted_descriptor_drains_final_logs_after_terminal_status.
+                terminal_deadline = min(
+                    deadline,
+                    loop.time() + _ROOTED_TRANSFER_TERMINAL_LOG_SECONDS,
+                )
+                while loop.time() < terminal_deadline:
+                    await asyncio.sleep(
+                        min(
+                            _ROOTED_TRANSFER_POLL_SECONDS,
+                            max(terminal_deadline - loop.time(), 0),
+                        )
+                    )
+                    terminal_remaining = terminal_deadline - loop.time()
+                    if terminal_remaining <= 0:
+                        break
+                    final_logs = await asyncio.wait_for(
+                        self._sandbox.commands.get_background_command_logs(
+                            execution_id,
+                            cursor=cursor,
+                        ),
+                        timeout=terminal_remaining,
+                    )
+                    cursor = final_logs.cursor
+                    if not final_logs.content:
+                        continue
+                    content += final_logs.content
+                    descriptor = _rooted_transfer_descriptor(
+                        content,
+                        request=request,
+                    )
+                    if descriptor is not None:
+                        return descriptor
                 raise ValueError("rooted transfer helper exited before handshake")
             await asyncio.sleep(
                 min(_ROOTED_TRANSFER_POLL_SECONDS, max(deadline - loop.time(), 0))

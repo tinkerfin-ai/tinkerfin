@@ -6,7 +6,13 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any, cast
 
 import pytest
-from ag_ui.core import BaseEvent, RunFinishedEvent, ToolCallResultEvent
+from ag_ui.core import (
+    BaseEvent,
+    RunFinishedEvent,
+    RunFinishedInterruptOutcome,
+    RunFinishedSuccessOutcome,
+    ToolCallResultEvent,
+)
 from ag_ui.core.types import ResumeEntry
 from deepagents.middleware.filesystem import FilesystemPermission
 from langchain.tools import tool
@@ -43,6 +49,18 @@ def _terminal(events: Sequence[BaseEvent]) -> RunFinishedEvent:
     terminals = [event for event in events if isinstance(event, RunFinishedEvent)]
     assert len(terminals) == 1
     return terminals[0]
+
+
+def _interrupt_outcome(
+    events: Sequence[BaseEvent],
+) -> RunFinishedInterruptOutcome:
+    outcome = _terminal(events).outcome
+    assert isinstance(outcome, RunFinishedInterruptOutcome)
+    return outcome
+
+
+def _assert_success(events: Sequence[BaseEvent]) -> None:
+    assert isinstance(_terminal(events).outcome, RunFinishedSuccessOutcome)
 
 
 @pytest.mark.asyncio
@@ -105,7 +123,7 @@ async def test_mixed_resume_executes_resolved_tool_and_settles_cancelled_tool_on
             {"messages": [HumanMessage(content="Run both tools")]}
         )
     ]
-    interrupts = tuple(_terminal(first_events).outcome.interrupts)
+    interrupts = tuple(_interrupt_outcome(first_events).interrupts)
     assert len(interrupts) == 2
 
     entries = (
@@ -149,7 +167,7 @@ async def test_mixed_resume_executes_resolved_tool_and_settles_cancelled_tool_on
     )
     resumed_events = [event async for event in resume_runtime.astream()]
 
-    assert _terminal(resumed_events).outcome.type == "success"
+    _assert_success(resumed_events)
     assert approved_calls == ["A"]
     assert cancelled_calls == []
     results = [
@@ -180,7 +198,7 @@ async def test_mixed_resume_executes_resolved_tool_and_settles_cancelled_tool_on
         resume=binding,
     )
     retry_events = [event async for event in retry_runtime.astream()]
-    assert _terminal(retry_events).outcome.type == "success"
+    _assert_success(retry_events)
     assert approved_calls == ["A"]
     assert cancelled_calls == []
 
@@ -272,11 +290,11 @@ async def test_mixed_resume_is_injected_into_supported_subagents(
             {"messages": [HumanMessage(content="Delegate the work")]}
         )
     ]
-    interrupts = tuple(_terminal(review_events).outcome.interrupts)
+    interrupts = tuple(_interrupt_outcome(review_events).interrupts)
     assert len(interrupts) == 2
-    assert all(
-        ScopedIdCodec().decode(interrupt.tool_call_id)[1] for interrupt in interrupts
-    )
+    for pending_interrupt in interrupts:
+        assert pending_interrupt.tool_call_id is not None
+        assert ScopedIdCodec().decode(pending_interrupt.tool_call_id)[1]
 
     entries = (
         ResumeEntry.model_validate(
@@ -305,7 +323,7 @@ async def test_mixed_resume_is_injected_into_supported_subagents(
     )
     resumed = [event async for event in resume_runtime.astream()]
 
-    assert _terminal(resumed).outcome.type == "success"
+    _assert_success(resumed)
     assert approved_calls == ["A"]
     assert cancelled_calls == []
 
@@ -369,11 +387,15 @@ async def test_permission_interrupt_uses_the_same_mixed_cancellation_contract() 
             {"messages": [HumanMessage(content="Write and run peer")]}
         )
     ]
-    interrupts = tuple(_terminal(review_events).outcome.interrupts)
-    by_name = {
-        interrupt.metadata["deepagents"]["toolName"]: interrupt
-        for interrupt in interrupts
-    }
+    interrupts = tuple(_interrupt_outcome(review_events).interrupts)
+    by_name = {}
+    for pending_interrupt in interrupts:
+        assert isinstance(pending_interrupt.metadata, Mapping)
+        deepagents_metadata = pending_interrupt.metadata.get("deepagents")
+        assert isinstance(deepagents_metadata, Mapping)
+        tool_name = deepagents_metadata.get("toolName")
+        assert isinstance(tool_name, str)
+        by_name[tool_name] = pending_interrupt
     assert set(by_name) == {"write_file", "permission_peer"}
     entries = (
         ResumeEntry.model_validate(
@@ -407,7 +429,7 @@ async def test_permission_interrupt_uses_the_same_mixed_cancellation_contract() 
     )
     resumed = [event async for event in resume_runtime.astream()]
 
-    assert _terminal(resumed).outcome.type == "success"
+    _assert_success(resumed)
     assert approved_calls == ["approved"]
     root_values = [
         data
@@ -421,8 +443,12 @@ async def test_permission_interrupt_uses_the_same_mixed_cancellation_contract() 
 
 
 def _external_subagent(*, declared: bool) -> dict[str, object]:
+    def done(state: MessagesState) -> dict[str, list[AIMessage]]:
+        del state
+        return {"messages": [AIMessage(content="done")]}
+
     builder = StateGraph(MessagesState)
-    builder.add_node("done", lambda _state: {"messages": [AIMessage(content="done")]})
+    builder.add_node("done", done)
     builder.add_edge(START, "done")
     builder.add_edge("done", END)
     spec: dict[str, object] = {

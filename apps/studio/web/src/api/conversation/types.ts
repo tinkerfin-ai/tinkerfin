@@ -1,4 +1,4 @@
-import type { AgentMode, JsonObject, JsonValue, MarkdownPlanContent } from "../../types"
+import type { AgentMode, JsonObject, JsonValue } from "../../types"
 
 export type { AgentMode }
 
@@ -35,7 +35,6 @@ export type ChatResumePayload =
     >
   }
   | { type: "approve"; baseRevision: number }
-  | { type: "edit"; baseRevision: number; content: MarkdownPlanContent }
   | { type: "respond"; baseRevision: number; message: string }
   | { type: "reject"; baseRevision: number; message?: string }
 

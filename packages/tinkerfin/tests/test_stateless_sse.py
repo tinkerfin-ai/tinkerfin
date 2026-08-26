@@ -1,26 +1,52 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import cast
 
 import pytest
 from ag_ui.core import BaseEvent
+from langchain.agents.middleware.types import InputAgentState
+from langgraph.graph.state import CompiledStateGraph
 from pydantic import ValidationError
 
 from tinkerfin import (
+    DeepAgentDefinition,
     Identity,
     NativeStreamPart,
     SseBody,
     SseMapper,
     SsePayload,
-    TinkerFin,
 )
 
 
 def _identity() -> Identity:
     return Identity(threadId="thread-1", runId="run-1")
+
+
+def _graph_input() -> InputAgentState:
+    return InputAgentState(messages=[])
+
+
+class _SourceGraph:
+    def __init__(self, source_factory: Callable[[], AsyncIterator[object]]) -> None:
+        self._source_factory = source_factory
+
+    def astream(
+        self,
+        *_args: object,
+        **_options: object,
+    ) -> AsyncIterator[object]:
+        return self._source_factory()
+
+
+setattr(
+    _SourceGraph.astream,
+    "__signature__",
+    inspect.signature(CompiledStateGraph.astream),
+)
 
 
 class _CountingParts:
@@ -66,7 +92,9 @@ class _BlockingParts:
 
 
 @pytest.mark.asyncio
-async def test_prepare_does_not_observe_or_resolve_an_event_id() -> None:
+async def test_prepare_does_not_observe_or_resolve_an_event_id(
+    definition_factory: Callable[..., DeepAgentDefinition[None]],
+) -> None:
     parts = _CountingParts()
     order: list[str] = []
 
@@ -81,11 +109,12 @@ async def test_prepare_does_not_observe_or_resolve_an_event_id() -> None:
         return f"event-{len(order)}"
 
     body = (
-        TinkerFin()
-        .run(lambda: parts, identity=_identity())
-        .astream_agui(
+        definition_factory(_SourceGraph(lambda: parts))
+        .new_agui(
+            identity=_identity(),
             on_event=on_event,
         )
+        .astream(_graph_input())
         .to_sse(event_id_resolver=event_id_resolver)
     )
 
@@ -112,9 +141,9 @@ async def test_prepare_does_not_observe_or_resolve_an_event_id() -> None:
 
 
 @pytest.mark.asyncio
-async def test_preflight_failure_closes_the_claimed_body_without_calling_factory() -> (
-    None
-):
+async def test_preflight_failure_closes_the_claimed_body_without_calling_factory(
+    definition_factory: Callable[..., DeepAgentDefinition[None]],
+) -> None:
     factory_calls = 0
 
     async def source() -> AsyncIterator[object]:
@@ -123,7 +152,12 @@ async def test_preflight_failure_closes_the_claimed_body_without_calling_factory
         if False:  # pragma: no cover - preflight must not open this source
             yield None
 
-    body = TinkerFin().run(source).astream().to_sse()
+    body = (
+        definition_factory(_SourceGraph(source))
+        .new(identity=_identity())
+        .astream(_graph_input())
+        .to_sse()
+    )
 
     async def preflight() -> None:
         raise RuntimeError("request is no longer authorized")
@@ -137,7 +171,9 @@ async def test_preflight_failure_closes_the_claimed_body_without_calling_factory
 
 
 @pytest.mark.asyncio
-async def test_native_custom_mapper_filters_and_controls_payload_fields() -> None:
+async def test_native_custom_mapper_filters_and_controls_payload_fields(
+    definition_factory: Callable[..., DeepAgentDefinition[None]],
+) -> None:
     async def source() -> AsyncIterator[object]:
         yield {"type": "values", "ns": (), "data": {"value": 1}, "interrupts": ()}
         yield {"type": "values", "ns": (), "data": {"value": 2}, "interrupts": ()}
@@ -152,9 +188,9 @@ async def test_native_custom_mapper_filters_and_controls_payload_fields() -> Non
         return 7
 
     body = (
-        TinkerFin()
-        .run(source)
-        .astream()
+        definition_factory(_SourceGraph(source))
+        .new(identity=_identity())
+        .astream(_graph_input())
         .to_sse(
             mapper=mapper,
             event_id_resolver=event_id_resolver,
@@ -181,6 +217,7 @@ async def test_native_custom_mapper_filters_and_controls_payload_fields() -> Non
 async def test_custom_sse_data_preserves_exact_sse_line_semantics(
     data: str,
     expected_frame: str,
+    definition_factory: Callable[..., DeepAgentDefinition[None]],
 ) -> None:
     async def source() -> AsyncIterator[object]:
         yield {"type": "values", "ns": (), "data": {}, "interrupts": ()}
@@ -188,7 +225,12 @@ async def test_custom_sse_data_preserves_exact_sse_line_semantics(
     async def mapper(_part: NativeStreamPart) -> SsePayload:
         return SsePayload(data=data)
 
-    body = TinkerFin().run(source).astream().to_sse(mapper=mapper)
+    body = (
+        definition_factory(_SourceGraph(source))
+        .new(identity=_identity())
+        .astream(_graph_input())
+        .to_sse(mapper=mapper)
+    )
 
     assert [frame async for frame in body] == [expected_frame]
 
@@ -201,7 +243,9 @@ def test_sse_payload_rejects_boolean_retry_and_multiline_event_name() -> None:
 
 
 @pytest.mark.asyncio
-async def test_custom_mapper_must_be_async_and_return_sse_payload() -> None:
+async def test_custom_mapper_must_be_async_and_return_sse_payload(
+    definition_factory: Callable[..., DeepAgentDefinition[None]],
+) -> None:
     async def source() -> AsyncIterator[object]:
         yield {"type": "values", "ns": (), "data": {}, "interrupts": ()}
 
@@ -209,9 +253,9 @@ async def test_custom_mapper_must_be_async_and_return_sse_payload() -> None:
         return SsePayload(data="invalid")
 
     body = (
-        TinkerFin()
-        .run(source)
-        .astream()
+        definition_factory(_SourceGraph(source))
+        .new(identity=_identity())
+        .astream(_graph_input())
         .to_sse(mapper=cast(SseMapper[NativeStreamPart], synchronous_mapper))
     )
 
@@ -220,7 +264,9 @@ async def test_custom_mapper_must_be_async_and_return_sse_payload() -> None:
 
 
 @pytest.mark.asyncio
-async def test_agui_mapper_receives_validated_event_objects() -> None:
+async def test_agui_mapper_receives_validated_event_objects(
+    definition_factory: Callable[..., DeepAgentDefinition[None]],
+) -> None:
     async def source() -> AsyncIterator[object]:
         if False:
             yield None
@@ -232,9 +278,9 @@ async def test_agui_mapper_receives_validated_event_objects() -> None:
         return SsePayload(data=json.dumps({"kind": event.type.value}))
 
     body: SseBody[str] = (
-        TinkerFin()
-        .run(source, identity=_identity())
-        .astream_agui()
+        definition_factory(_SourceGraph(source))
+        .new_agui(identity=_identity())
+        .astream(_graph_input())
         .to_sse(mapper=mapper)
     )
 
@@ -250,6 +296,7 @@ async def test_agui_mapper_receives_validated_event_objects() -> None:
 @pytest.mark.parametrize("event_id", [True, "bad\nid", "bad\x00id", object()])
 async def test_event_id_resolver_rejects_unsafe_or_unsupported_ids(
     event_id: object,
+    definition_factory: Callable[..., DeepAgentDefinition[None]],
 ) -> None:
     parts = _CountingParts()
 
@@ -259,9 +306,9 @@ async def test_event_id_resolver_rejects_unsafe_or_unsupported_ids(
         return cast(str | int | None, event_id)
 
     body = (
-        TinkerFin()
-        .run(lambda: parts)
-        .astream()
+        definition_factory(_SourceGraph(lambda: parts))
+        .new(identity=_identity())
+        .astream(_graph_input())
         .to_sse(
             event_id_resolver=event_id_resolver,
         )
@@ -276,7 +323,9 @@ async def test_event_id_resolver_rejects_unsafe_or_unsupported_ids(
 
 
 @pytest.mark.asyncio
-async def test_native_sse_timeout_covers_mapper_and_closes_upstream() -> None:
+async def test_native_sse_timeout_covers_mapper_and_closes_upstream(
+    definition_factory: Callable[..., DeepAgentDefinition[None]],
+) -> None:
     parts = _CountingParts()
 
     async def mapper(_part: NativeStreamPart) -> SsePayload:
@@ -284,9 +333,9 @@ async def test_native_sse_timeout_covers_mapper_and_closes_upstream() -> None:
         return SsePayload(data="too late")
 
     body = (
-        TinkerFin()
-        .run(lambda: parts)
-        .astream()
+        definition_factory(_SourceGraph(lambda: parts))
+        .new(identity=_identity())
+        .astream(_graph_input())
         .to_sse(
             timeout=0.001,
             mapper=mapper,
@@ -300,9 +349,16 @@ async def test_native_sse_timeout_covers_mapper_and_closes_upstream() -> None:
 
 
 @pytest.mark.asyncio
-async def test_external_sse_close_cancels_an_active_pull_and_is_idempotent() -> None:
+async def test_external_sse_close_cancels_an_active_pull_and_is_idempotent(
+    definition_factory: Callable[..., DeepAgentDefinition[None]],
+) -> None:
     parts = _BlockingParts()
-    body = TinkerFin().run(lambda: parts).astream().to_sse()
+    body = (
+        definition_factory(_SourceGraph(lambda: parts))
+        .new(identity=_identity())
+        .astream(_graph_input())
+        .to_sse()
+    )
     pull = asyncio.create_task(anext(body))
     await parts.pull_started.wait()
 
@@ -317,13 +373,20 @@ async def test_external_sse_close_cancels_an_active_pull_and_is_idempotent() -> 
 
 
 @pytest.mark.asyncio
-async def test_mapper_failure_closes_upstream_and_preserves_the_primary_error() -> None:
+async def test_mapper_failure_closes_upstream_and_preserves_the_primary_error(
+    definition_factory: Callable[..., DeepAgentDefinition[None]],
+) -> None:
     parts = _CountingParts()
 
     async def mapper(_part: NativeStreamPart) -> SsePayload:
         raise LookupError("cannot map part")
 
-    body = TinkerFin().run(lambda: parts).astream().to_sse(mapper=mapper)
+    body = (
+        definition_factory(_SourceGraph(lambda: parts))
+        .new(identity=_identity())
+        .astream(_graph_input())
+        .to_sse(mapper=mapper)
+    )
 
     with pytest.raises(LookupError, match="cannot map part"):
         await anext(body)

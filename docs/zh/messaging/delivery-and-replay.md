@@ -48,6 +48,8 @@ subscription = await channel.follow(
     identity=identity,
     after=100,
 )
+
+status = await channel.get_run_status(identity=identity)
 ```
 
 | API | 范围 | 结果 |
@@ -55,8 +57,12 @@ subscription = await channel.follow(
 | `latest_seq()` | 整个 thread | 当前最大 seq，空日志为 0 |
 | `read()` | 整个 thread | 一页 `DecodedMessage`，不会等待新消息 |
 | `follow()` | 指定 run | 先回放，再等待该 run 的权威终止 |
+| `get_run_status()` | 指定 run | 不取得 owner 的当前 durable 状态 |
 
 虽然 thread 级 API 只使用 `identity.threadId` 定位日志，接口仍统一接收完整 `Identity`，避免 thread/run 在不同层重复平铺。
+
+`get_run_status()` 可原子把过期 producer lease 归档为 `owner_lost`。没有 durable
+run 时抛出 `RunNotFound`，且不会创建或恢复 producer。
 
 ## Envelope v2
 

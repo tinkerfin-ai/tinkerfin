@@ -106,4 +106,4 @@ If preflight fails, the HTTP layer can still return a normal error response beca
 
 Direct SSE does not save history. Use [Messaging SSE](../messaging/delivery-and-replay.md) when a client must reconnect and replay events.
 
-Next: [Custom sources and run coordination](extensions.md).
+Next: [Run coordination and Redis leases](extensions.md).

@@ -1,6 +1,7 @@
 """会话事务与历史查询数据访问"""
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import cast
 
@@ -11,7 +12,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from tinkerfin_studio.conversation.models import (
     ConversationEvent,
     ConversationInterrupt,
-    ConversationMessage,
     ConversationRun,
     ConversationThread,
 )
@@ -19,6 +19,14 @@ from tinkerfin_studio.conversation.models import (
 
 def _now() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
+
+
+@dataclass(frozen=True, slots=True)
+class UnstartedRunCleanup:
+    """描述未启动 run 及其空 thread 是否被安全删除"""
+
+    run_deleted: bool
+    thread_deleted: bool
 
 
 class ConversationRepository:
@@ -83,7 +91,7 @@ class ConversationRepository:
             agent_name=None,
             graph_task_id=None,
             model_id=model_id,
-            status="running",
+            status="preparing",
             input_json=dict(input_json),
             config_json=config_json,
             outcome_json=None,
@@ -407,24 +415,118 @@ class ConversationRepository:
         )
 
     async def has_running_run(self, thread_pk: int) -> bool:
-        """锁定并判断会话是否仍有尚未投影首事件的运行"""
+        """锁定并判断会话是否仍有准备中或正在执行的运行"""
 
         run_pk = await self._session.scalar(
             select(ConversationRun.id)
             .where(
                 ConversationRun.conversation_thread_id == thread_pk,
-                ConversationRun.status == "running",
+                ConversationRun.status.in_(("preparing", "running")),
             )
             .limit(1)
             .with_for_update()
         )
         return run_pk is not None
 
+    async def list_stale_preparing_runs(
+        self,
+        *,
+        older_than: datetime,
+        thread_pk: int | None = None,
+    ) -> list[ConversationRun]:
+        """返回超过恢复宽限且尚未投影首事件的主 run"""
+
+        statement = select(ConversationRun).where(
+            ConversationRun.agent_type == "main",
+            ConversationRun.status == "preparing",
+            ConversationRun.updated_at <= older_than,
+        )
+        if thread_pk is not None:
+            statement = statement.where(
+                ConversationRun.conversation_thread_id == thread_pk
+            )
+        result = await self._session.scalars(statement.order_by(ConversationRun.id))
+        return list(result)
+
+    async def delete_unstarted_run(
+        self,
+        *,
+        thread_pk: int,
+        run_pk: int,
+        run_id: str,
+        delete_empty_thread: bool,
+    ) -> UnstartedRunCleanup:
+        """只删除仍为 preparing 且没有已提交事件的精确 run"""
+
+        thread = await self.lock_thread(thread_pk)
+        if thread is None:
+            return UnstartedRunCleanup(run_deleted=False, thread_deleted=False)
+        run = await self._session.scalar(
+            select(ConversationRun)
+            .where(
+                ConversationRun.id == run_pk,
+                ConversationRun.conversation_thread_id == thread_pk,
+                ConversationRun.run_id == run_id,
+            )
+            .with_for_update()
+        )
+        if run is None or run.status != "preparing":
+            return UnstartedRunCleanup(run_deleted=False, thread_deleted=False)
+        event_count = int(
+            await self._session.scalar(
+                select(func.count(ConversationEvent.id)).where(
+                    ConversationEvent.conversation_thread_id == thread_pk,
+                    ConversationEvent.run_id == run_id,
+                )
+            )
+            or 0
+        )
+        if event_count:
+            return UnstartedRunCleanup(run_deleted=False, thread_deleted=False)
+        await self._session.execute(
+            update(ConversationInterrupt)
+            .where(
+                ConversationInterrupt.conversation_thread_id == thread_pk,
+                ConversationInterrupt.status == "pending",
+                ConversationInterrupt.resolved_run_id == run_id,
+            )
+            .values(resolved_run_id=None, updated_at=_now())
+        )
+        await self._session.delete(run)
+        await self._session.flush()
+        if not delete_empty_thread:
+            return UnstartedRunCleanup(run_deleted=True, thread_deleted=False)
+        remaining_runs = int(
+            await self._session.scalar(
+                select(func.count(ConversationRun.id)).where(
+                    ConversationRun.conversation_thread_id == thread_pk
+                )
+            )
+            or 0
+        )
+        remaining_interrupts = int(
+            await self._session.scalar(
+                select(func.count(ConversationInterrupt.id)).where(
+                    ConversationInterrupt.conversation_thread_id == thread_pk
+                )
+            )
+            or 0
+        )
+        if (
+            remaining_runs == 0
+            and remaining_interrupts == 0
+            and thread.last_seq == 0
+            and thread.snapshot_seq == 0
+            and thread.snapshot_json is None
+        ):
+            await self._session.delete(thread)
+            return UnstartedRunCleanup(run_deleted=True, thread_deleted=True)
+        return UnstartedRunCleanup(run_deleted=True, thread_deleted=False)
+
     async def delete_thread_cascade(self, thread_pk: int) -> None:
         """按应用维护的关联顺序删除会话全部 MySQL 数据"""
 
         for entity in (
-            ConversationMessage,
             ConversationInterrupt,
             ConversationEvent,
             ConversationRun,
@@ -434,13 +536,6 @@ class ConversationRepository:
             )
         await self._session.execute(
             delete(ConversationThread).where(ConversationThread.id == thread_pk)
-        )
-
-    async def delete_run(self, run_pk: int) -> None:
-        """删除尚未产生事件的失败预握手 run"""
-
-        await self._session.execute(
-            delete(ConversationRun).where(ConversationRun.id == run_pk)
         )
 
     async def commit(self) -> None:

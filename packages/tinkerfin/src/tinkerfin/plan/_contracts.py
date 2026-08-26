@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import UnionType
 from typing import Annotated, Literal, TypeAlias, cast
 
 from pydantic import (
@@ -19,7 +20,7 @@ from pydantic.alias_generators import to_camel
 from ._clarification import ClarificationSchemaBinding
 from ._content import PlanContentBinding
 from .clarification import ClarificationFormBase
-from .models import NonBlankText, PlanContentModel, PlanStepId
+from .models import NonBlankText, PlanContentModel, PlanReviewAction, PlanStepId
 
 
 class _ContractModel(BaseModel):
@@ -161,9 +162,24 @@ class PlanContractBinding:
     review_metadata_type: type[_ContractModel]
 
 
+def _review_model_union(
+    review_types: tuple[type[BaseModel], ...],
+) -> type[BaseModel] | UnionType:
+    """Combine configured review models into one runtime type expression."""
+
+    if len(review_types) == 1:
+        return review_types[0]
+    review_union = review_types[0] | review_types[1]
+    for review_type in review_types[2:]:
+        review_union = review_union | review_type
+    return review_union
+
+
 def create_plan_contract_binding(
     clarification: ClarificationSchemaBinding,
     content: PlanContentBinding,
+    *,
+    review_actions: tuple[PlanReviewAction, ...],
 ) -> PlanContractBinding:
     """Bind one clarification form and one Plan content schema atomically."""
 
@@ -178,11 +194,24 @@ def create_plan_contract_binding(
         __base__=EditPlanBase,
         content=(content.schema, ...),
     )
-    review_union = ApprovePlan | edit_type | RespondToPlan | RejectPlan
-    review_annotation = Annotated[
-        review_union,
-        Field(discriminator="type"),
-    ]  # pyright: ignore[reportInvalidTypeForm]
+    review_types = tuple(
+        {
+            PlanReviewAction.APPROVE: ApprovePlan,
+            PlanReviewAction.EDIT: edit_type,
+            PlanReviewAction.RESPOND: RespondToPlan,
+            PlanReviewAction.REJECT: RejectPlan,
+        }[action]
+        for action in review_actions
+    )
+    review_union = _review_model_union(review_types)
+    review_annotation = (
+        Annotated[
+            review_union,
+            Field(discriminator="type"),
+        ]  # pyright: ignore[reportInvalidTypeForm]
+        if len(review_types) > 1
+        else review_union
+    )
     review_response = cast(
         TypeAdapter[object],
         TypeAdapter(review_annotation),

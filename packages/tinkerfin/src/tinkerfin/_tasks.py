@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 from typing import TypeVar
 
+__all__ = ["join_task"]
+
 _TaskResult = TypeVar("_TaskResult")
 
 
@@ -17,16 +19,16 @@ async def join_task(
     """Join an owned task without losing cancellation of the joining caller.
 
     Args:
-        task: Runtime-owned task that must settle before this call returns
-        cancel: Request task cancellation before joining
-        suppress_task_cancellation: Treat the owned task's cancellation as expected
+        task: Runtime-owned task that must settle before this call returns.
+        cancel: Whether to request task cancellation before joining.
+        suppress_task_cancellation: Whether owned task cancellation is expected.
 
     Returns:
-        The owned task result, or `None` for an expected task cancellation
+        The owned task result, or ``None`` for an expected task cancellation.
 
     Raises:
-        asyncio.CancelledError: The joining caller receives cancellation
-        BaseException: The owned task fails and no caller cancellation outranks it
+        asyncio.CancelledError: The caller or owned task is cancelled.
+        BaseException: The owned task fails and no caller cancellation outranks it.
     """
 
     if cancel and not task.done():

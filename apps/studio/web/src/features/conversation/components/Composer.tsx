@@ -298,9 +298,9 @@ export function Composer({
           </div>
         </div>
         </div>
-        <p className="composer-note">{t('TinkerFin 可能会犯错，请核对重要信息')}</p>
       </div>
       {takeover && <div className="composer-takeover">{takeover}</div>}
+      <p className="composer-note">{t('TinkerFin 可能会犯错，请核对重要信息')}</p>
     </footer>
   )
 }

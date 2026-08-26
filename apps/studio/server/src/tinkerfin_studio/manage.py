@@ -13,9 +13,6 @@ from tinkerfin_studio.auth.models import User
 from tinkerfin_studio.auth.passwords import hash_password
 from tinkerfin_studio.auth.repository import UserRepository
 from tinkerfin_studio.config.settings import get_settings
-from tinkerfin_studio.conversation.command_migration import (
-    migrate_forwarded_commands,
-)
 from tinkerfin_studio.infrastructure.database import Database
 from tinkerfin_studio.models.repository import AgentModelRepository
 from tinkerfin_studio.models.schemas import AgentModelWrite
@@ -53,17 +50,6 @@ def parse_args(args: Sequence[str] | None = None) -> Namespace:
     upsert_model.add_argument("--sort-order", type=int, default=0)
     model_commands.add_parser("list", help="列出安全模型目录")
 
-    data = resources.add_parser("data", help="管理当前部署的数据契约")
-    data_commands = data.add_subparsers(dest="command", required=True)
-    migrate_commands = data_commands.add_parser(
-        "migrate-forwarded-commands",
-        help="把 forwardedProps.mode 转换为 command.plan",
-    )
-    migrate_commands.add_argument(
-        "--apply",
-        action="store_true",
-        help="写入已校验的转换；缺省只执行 dry-run",
-    )
     return parser.parse_args(args)
 
 
@@ -94,19 +80,6 @@ async def _run(options: Namespace) -> None:
             )
             await session.commit()
             print(f"已创建用户: {options.username}")
-            return
-
-        if options.resource == "data":
-            result = await migrate_forwarded_commands(session, apply=options.apply)
-            if options.apply:
-                await session.commit()
-            else:
-                await session.rollback()
-            action = "已迁移" if options.apply else "可迁移"
-            print(
-                f"{action} run={result.runs} event={result.events} "
-                f"active_run={result.active_runs}"
-            )
             return
 
         service = AgentModelService(AgentModelRepository(session))

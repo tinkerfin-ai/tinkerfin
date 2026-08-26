@@ -51,9 +51,10 @@
     display: flex;
     flex-direction: column;
     align-items: center;
-    gap: var(--space-1);
+    gap: var(--space-3);
     width: var(--layout-sidebar-rail);
-    padding: var(--space-2) var(--space-1-5) var(--space-3);
+    /* 首个 Rail 控件与展开态头部控件共用纵向中心 */
+    padding: var(--space-5) var(--space-1-5) var(--space-3);
     transform: translateX(48px);
     opacity: 0;
     visibility: hidden;
@@ -70,6 +71,13 @@
     visibility: visible;
     pointer-events: auto;
     transition-delay: var(--motion-fast), var(--motion-fast), var(--motion-instant);
+  }
+
+  .sidebar-rail .ui-icon-button {
+    width: var(--control-sm);
+    min-width: var(--control-sm);
+    min-height: var(--control-sm);
+    height: var(--control-sm);
   }
 
   .sidebar-rail .ui-tooltip {
@@ -125,9 +133,21 @@
     transform: translateY(-2px);
   }
 
+  .sidebar-head-actions .sidebar-mode-toggle + .ui-tooltip {
+    top: 50%;
+    right: auto;
+    left: calc(100% + var(--space-3));
+    transform: translate(var(--space-0-5), -50%);
+  }
+
   .sidebar-head-actions .ui-icon-button-wrap:hover .ui-tooltip,
   .sidebar-head-actions .ui-icon-button:focus-visible + .ui-tooltip {
     transform: translateY(0);
+  }
+
+  .sidebar-head-actions .ui-icon-button-wrap:hover .sidebar-mode-toggle + .ui-tooltip,
+  .sidebar-head-actions .sidebar-mode-toggle:focus-visible + .ui-tooltip {
+    transform: translate(0, -50%);
   }
 
   .brand {
@@ -378,6 +398,38 @@
   .conversation-item:has(:focus-visible) .conversation-main,
   .conversation-item:has(.conversation-more.is-selected) .conversation-main,
   .conversation-item.is-active .conversation-main { padding-right: var(--control-sm); }
+  .conversation-status-slot {
+    display: inline-flex;
+    width: var(--icon-sm);
+    height: var(--icon-sm);
+    flex: 0 0 auto;
+    align-items: center;
+    justify-content: center;
+    margin-right: var(--space-1);
+  }
+  .conversation-attention-dot {
+    position: relative;
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    flex: 0 0 auto;
+    transform-origin: center;
+    animation: workspace-attention-breathe var(--motion-attention-cycle) var(--ease-in-out) infinite;
+  }
+  .conversation-attention-dot.is-approval { color: var(--color-warning-panel-accent); }
+  .conversation-attention-dot.is-plan { color: var(--color-plan-panel-accent); }
+  .conversation-attention-dot::before,
+  .conversation-attention-dot::after {
+    position: absolute;
+    border-radius: var(--radius-pill);
+    background: currentColor;
+    content: '';
+  }
+  .conversation-attention-dot::before {
+    inset: 0;
+    opacity: .1;
+  }
+  .conversation-attention-dot::after { inset: 20%; }
   .conversation-title-marquee { flex: 1; min-width: 0; }
   .conversation-title-marquee .overflow-marquee-content { font-size: var(--type-meta-size); font-weight: var(--weight-regular); line-height: var(--type-meta-line); }
   .conversation-item.is-active .conversation-title-marquee .overflow-marquee-content { font-weight: var(--weight-medium); }
@@ -590,15 +642,13 @@
 
   .conversation-pane.is-empty { overflow: hidden; }
   .message-list {
-    --conversation-flow-gap-surface: var(--space-6);
-    --conversation-flow-gap-mixed: var(--space-5);
-    --conversation-flow-gap-content: var(--space-4);
+    --conversation-flow-gap: var(--space-4);
     width: min(100%, var(--layout-conversation-width));
     margin: 0 auto;
     padding: var(--space-8) 0 var(--composer-height);
   }
 
-  /* 消息列表统一拥有相邻内容节奏，组件内部只负责自身布局 */
+  /* 卡片和状态内容默认共用16px，业务操作区由消息组件计入自身边界 */
   .message-list > :is(
     .user-message,
     .assistant-message,
@@ -606,9 +656,9 @@
     .tool-card,
     .tool-batch,
     .error-message,
-    .approval-card,
-    .plan-card,
-    .plan-question-status-row,
+    .approval-wait-state,
+    .plan-interaction-wait-state,
+    .message-history-loader,
     .message-stream-tail
   ) {
     margin-block: 0;
@@ -621,9 +671,9 @@
     .tool-card,
     .tool-batch,
     .error-message,
-    .approval-card,
-    .plan-card,
-    .plan-question-status-row,
+    .approval-wait-state,
+    .plan-interaction-wait-state,
+    .message-history-loader,
     .message-stream-tail
   ) + :is(
     .user-message,
@@ -632,61 +682,24 @@
     .tool-card,
     .tool-batch,
     .error-message,
-    .approval-card,
-    .plan-card,
-    .plan-question-status-row,
+    .approval-wait-state,
+    .plan-interaction-wait-state,
+    .message-history-loader,
     .message-stream-tail
   ) {
-    margin-top: var(--conversation-flow-gap-surface);
+    margin-top: var(--conversation-flow-gap);
   }
 
-  .message-list > :is(
-    .user-message,
-    .error-message,
-    .approval-card,
-    .plan-card
-  ) + :is(
-    .assistant-message,
-    .subagent-card,
-    .tool-card,
-    .tool-batch,
-    .plan-question-status-row,
-    .message-stream-tail
-  ),
-  .message-list > :is(
-    .assistant-message,
-    .subagent-card,
-    .tool-card,
-    .tool-batch,
-    .plan-question-status-row,
-    .message-stream-tail
-  ) + :is(
-    .user-message,
-    .error-message,
-    .approval-card,
-    .plan-card
-  ) {
-    margin-top: var(--conversation-flow-gap-mixed);
+  /* 普通轮次复用参考会话节奏，Tool、Task 和反馈卡片仍走默认16px */
+  .message-list > .user-message + .assistant-message {
+    margin-top: 0;
   }
 
-  .message-list > :is(
-    .assistant-message,
-    .subagent-card,
-    .tool-card,
-    .tool-batch,
-    .plan-question-status-row,
-    .message-stream-tail
-  ) + :is(
-    .assistant-message,
-    .subagent-card,
-    .tool-card,
-    .tool-batch,
-    .plan-question-status-row,
-    .message-stream-tail
-  ) {
-    margin-top: var(--conversation-flow-gap-content);
+  .message-list > .assistant-message:has(> .message-action-row--assistant) + .user-message {
+    margin-top: var(--space-12);
   }
-  .message-history-loader { display: grid; place-items: center; padding-bottom: var(--space-3); }
+
+  .message-history-loader { display: grid; place-items: center; }
   .message-history-loader .ui-button { min-height: var(--control-lg); }
 
   .empty-conversation,
@@ -875,6 +888,10 @@
   .spin { animation: workspace-spin var(--motion-loading-cycle) linear infinite; }
 
   @keyframes workspace-pulse { from { opacity: .45; } to { opacity: 1; } }
+  @keyframes workspace-attention-breathe {
+    0%, 100% { transform: scale(.88); opacity: .7; }
+    50% { transform: scale(1); opacity: 1; }
+  }
   @keyframes workspace-spin { to { transform: rotate(360deg); } }
 
   @media (min-width: 1281px) {
@@ -932,6 +949,16 @@
   }
 
   @media (any-hover: none), (any-pointer: coarse) {
+    .sidebar-rail {
+      gap: var(--space-2);
+      padding-top: var(--space-4);
+    }
+    .sidebar-rail .ui-icon-button {
+      width: var(--control-lg);
+      min-width: var(--control-lg);
+      min-height: var(--control-lg);
+      height: var(--control-lg);
+    }
     .sidebar-head { gap: var(--space-1); }
     .sidebar-head-actions { gap: var(--space-0); }
     .brand { gap: var(--space-0-5); }
@@ -982,6 +1009,7 @@
     .scroll-to-bottom { color: CanvasText; }
     .sidebar-search:focus-within { outline: 2px solid Highlight; outline-offset: -2px; }
     .conversation-title-marquee { -webkit-mask-image: none; mask-image: none; }
+    .conversation-attention-dot { color: ButtonText; transform: none; opacity: 1; animation: none; }
     .sidebar-scrim,
     .task-drawer-scrim { background: Canvas; opacity: .68; }
     .conversation-history::after { display: none; }
@@ -1008,6 +1036,7 @@
     }
 
     .history-skeleton span,
-    .spin { animation: none; }
+    .spin,
+    .conversation-attention-dot { animation: none; }
   }
 }

@@ -1,7 +1,7 @@
 [project]
 name = "tinkerfin"
 version = "0.1.0"
-description = "Stateless native, AG-UI, and SSE streaming for LangGraph graphs."
+description = "Request-scoped native, AG-UI, and SSE streaming for Deep Agents."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"

@@ -1,34 +1,24 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from typing import TypedDict
 
 import pytest
+from langchain.agents.middleware.types import InputAgentState
 from langchain_core.runnables import RunnableConfig
 from langgraph.runtime import RunControl
 from langgraph.types import StreamMode
 
-import tinkerfin.coordination as coordination
-from tinkerfin import GraphRunStream, Identity, TinkerFin
+from tinkerfin import DeepAgentDefinition, Identity, NativeGraphRunStream, TinkerFin
 
 
 def _identity() -> Identity:
     return Identity(threadId="thread-1", runId="run-1")
 
 
-class _GraphState(TypedDict, total=False):
-    messages: list[object]
-    n: int
-
-
-class _GraphContext(TypedDict, total=False):
-    tenant: str
-
-
-class _GraphInput(TypedDict, total=False):
-    messages: list[object]
+def _graph_input() -> InputAgentState:
+    return InputAgentState(messages=[])
 
 
 class RecordingGraph:
@@ -97,9 +87,9 @@ class RecordingGraph:
 
 
 @pytest.mark.asyncio
-async def test_run_stream_forwards_native_arguments_and_observes_before_delivery() -> (
-    None
-):
+async def test_run_stream_forwards_native_arguments_and_observes_before_delivery(
+    definition_factory: Callable[..., DeepAgentDefinition[None]],
+) -> None:
     graph = RecordingGraph([{"type": "values", "ns": (), "data": {"n": 1}}])
     order: list[tuple[str, object]] = []
 
@@ -108,28 +98,26 @@ async def test_run_stream_forwards_native_arguments_and_observes_before_delivery
 
     config: RunnableConfig = {"configurable": {"thread_id": "thread-1"}}
     control = RunControl()
-    runtime = TinkerFin().run(
-        lambda: graph.astream(
-            {"messages": []},
-            config,
-            context={"tenant": "tenant-1"},
-            stream_mode=("messages", "tasks", "values"),
-            print_mode="debug",
-            output_keys=("messages",),
-            interrupt_before=("agent",),
-            interrupt_after=("tools",),
-            durability="sync",
-            control=control,
-            subgraphs=True,
-            debug=False,
-            version="v2",
-            custom_flag="preserved",
-        ),
+    runtime = definition_factory(graph).new(
+        identity=_identity(),
         on_part=on_part,
     )
+    stream = runtime.astream(
+        _graph_input(),
+        config,
+        stream_mode=("messages", "tasks", "values"),
+        print_mode="debug",
+        output_keys=("messages",),
+        interrupt_before=("agent",),
+        interrupt_after=("tools",),
+        durability="sync",
+        control=control,
+        subgraphs=True,
+        debug=False,
+        version="v2",
+    )
 
-    assert type(runtime).__name__ == "TinkerFinRun"
-    stream = runtime.astream()
+    assert isinstance(stream, NativeGraphRunStream)
     part = await anext(stream)
     order.append(("delivered", part))
     await stream.aclose()
@@ -139,7 +127,7 @@ async def test_run_stream_forwards_native_arguments_and_observes_before_delivery
         {
             "input": {"messages": []},
             "config": config,
-            "context": {"tenant": "tenant-1"},
+            "context": None,
             "stream_mode": ("messages", "tasks", "values"),
             "print_mode": "debug",
             "output_keys": ("messages",),
@@ -150,16 +138,18 @@ async def test_run_stream_forwards_native_arguments_and_observes_before_delivery
             "subgraphs": True,
             "debug": False,
             "version": "v2",
-            "kwargs": {"custom_flag": "preserved"},
+            "kwargs": {},
         }
     ]
     assert graph.closed.is_set()
 
 
 @pytest.mark.asyncio
-async def test_graph_aclose_from_observer_child_task_preserves_current_part() -> None:
+async def test_graph_aclose_from_observer_child_task_preserves_current_part(
+    definition_factory: Callable[..., DeepAgentDefinition[None]],
+) -> None:
     graph = RecordingGraph([{"type": "values", "ns": (), "data": {"n": 1}}])
-    stream: GraphRunStream[object] | None = None
+    stream: NativeGraphRunStream | None = None
     close_task: asyncio.Task[None] | None = None
 
     async def on_part(_: object) -> None:
@@ -170,12 +160,15 @@ async def test_graph_aclose_from_observer_child_task_preserves_current_part() ->
             await asyncio.sleep(0)
 
     stream = (
-        TinkerFin()
-        .run(
-            lambda: graph.astream({}, version="v2"),
+        definition_factory(graph)
+        .new(
+            identity=_identity(),
             on_part=on_part,
         )
-        .astream()
+        .astream(
+            _graph_input(),
+            version="v2",
+        )
     )
     consumer = asyncio.create_task(anext(stream))
     try:
@@ -194,24 +187,19 @@ async def test_graph_aclose_from_observer_child_task_preserves_current_part() ->
     assert graph.closed.is_set()
 
 
-def test_identity_contract_matches_coordinator_configuration() -> None:
+def test_native_stream_exposes_the_requested_identity(
+    definition_factory: Callable[..., DeepAgentDefinition[None]],
+) -> None:
     graph = RecordingGraph([])
-    plain = TinkerFin()
+    stream = definition_factory(graph).new(identity=_identity()).astream(_graph_input())
 
-    run = plain.run(lambda: graph.astream({}, version="v2"), identity=_identity())
-    assert run._identity == _identity()
-
-    coordinated = TinkerFin(
-        run_coordinator=coordination.InMemoryRunCoordinator(
-            key_resolver=lambda value: value.thread_id
-        )
-    )
-    with pytest.raises(ValueError, match="identity"):
-        coordinated.run(lambda: graph.astream({}, version="v2"))
+    assert stream.messaging_identity == _identity()
 
 
 @pytest.mark.asyncio
-async def test_coordinator_is_lazy_and_released_when_stream_closes() -> None:
+async def test_coordinator_is_lazy_and_released_when_stream_closes(
+    definition_factory: Callable[..., DeepAgentDefinition[None]],
+) -> None:
     entered = asyncio.Event()
     released = asyncio.Event()
 
@@ -226,9 +214,12 @@ async def test_coordinator_is_lazy_and_released_when_stream_closes() -> None:
 
     graph = RecordingGraph([{"type": "values", "ns": (), "data": {}}])
     stream = (
-        TinkerFin(run_coordinator=coordinate)
-        .run(lambda: graph.astream({}, version="v2"), identity=_identity())
-        .astream()
+        definition_factory(
+            graph,
+            tinkerfin=TinkerFin(run_coordinator=coordinate),
+        )
+        .new(identity=_identity())
+        .astream(_graph_input())
     )
 
     assert not entered.is_set()
@@ -244,7 +235,9 @@ async def test_coordinator_is_lazy_and_released_when_stream_closes() -> None:
 
 
 @pytest.mark.asyncio
-async def test_closing_stream_cancels_an_active_graph_pull_before_releasing() -> None:
+async def test_closing_stream_cancels_an_active_graph_pull_before_releasing(
+    definition_factory: Callable[..., DeepAgentDefinition[None]],
+) -> None:
     released = asyncio.Event()
 
     @asynccontextmanager
@@ -260,9 +253,12 @@ async def test_closing_stream_cancels_an_active_graph_pull_before_releasing() ->
         pull_gate=asyncio.Event(),
     )
     stream = (
-        TinkerFin(run_coordinator=coordinate)
-        .run(lambda: graph.astream({}, version="v2"), identity=_identity())
-        .astream()
+        definition_factory(
+            graph,
+            tinkerfin=TinkerFin(run_coordinator=coordinate),
+        )
+        .new(identity=_identity())
+        .astream(_graph_input())
     )
     pull = asyncio.create_task(anext(stream))
     await graph.started.wait()
@@ -280,13 +276,15 @@ async def test_closing_stream_cancels_an_active_graph_pull_before_releasing() ->
 
 
 @pytest.mark.asyncio
-async def test_concurrent_close_waits_for_the_same_upstream_cleanup() -> None:
+async def test_concurrent_close_waits_for_the_same_upstream_cleanup(
+    definition_factory: Callable[..., DeepAgentDefinition[None]],
+) -> None:
     close_gate = asyncio.Event()
     graph = RecordingGraph(
         [{"type": "values", "ns": (), "data": {}}],
         close_gate=close_gate,
     )
-    stream = TinkerFin().run(lambda: graph.astream({}, version="v2")).astream()
+    stream = definition_factory(graph).new(identity=_identity()).astream(_graph_input())
     await anext(stream)
 
     first_close = asyncio.create_task(stream.aclose())
@@ -303,7 +301,9 @@ async def test_concurrent_close_waits_for_the_same_upstream_cleanup() -> None:
 
 
 @pytest.mark.asyncio
-async def test_upstream_failure_is_not_replaced_by_source_close_failure() -> None:
+async def test_upstream_failure_is_not_replaced_by_source_close_failure(
+    definition_factory: Callable[..., DeepAgentDefinition[None]],
+) -> None:
     class FailingSource:
         def __aiter__(self) -> FailingSource:
             return self
@@ -314,20 +314,34 @@ async def test_upstream_failure_is_not_replaced_by_source_close_failure() -> Non
         async def aclose(self) -> None:
             raise RuntimeError("source close failed")
 
-    stream = TinkerFin().run(FailingSource).astream()
+    class FailingGraph:
+        def astream(
+            self,
+            *_args: object,
+            **_options: object,
+        ) -> AsyncIterator[object]:
+            return FailingSource()
+
+    stream = (
+        definition_factory(FailingGraph())
+        .new(identity=_identity())
+        .astream(_graph_input())
+    )
 
     with pytest.raises(ValueError, match="graph failed"):
         await anext(stream)
 
 
 @pytest.mark.asyncio
-async def test_graph_stream_waits_for_cleanup_when_close_caller_is_cancelled() -> None:
+async def test_graph_stream_waits_for_cleanup_when_close_caller_is_cancelled(
+    definition_factory: Callable[..., DeepAgentDefinition[None]],
+) -> None:
     close_gate = asyncio.Event()
     graph = RecordingGraph(
         [{"type": "values", "ns": (), "data": {}}],
         close_gate=close_gate,
     )
-    stream = TinkerFin().run(lambda: graph.astream({}, version="v2")).astream()
+    stream = definition_factory(graph).new(identity=_identity()).astream(_graph_input())
     await anext(stream)
     closing = asyncio.create_task(stream.aclose())
     await graph.close_started.wait()

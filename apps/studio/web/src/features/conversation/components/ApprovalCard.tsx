@@ -1,16 +1,36 @@
-import {
-  ArrowLeft,
-  ArrowRight,
-  CheckCircle2,
-  CircleAlert,
-  Pencil,
-} from 'lucide-react'
-import { useState } from 'react'
+import { ChevronDown, ChevronUp } from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
 
-import { Button, IconButton, Surface } from '../../../components/ui'
-import type { ApprovalDecision, ApprovalState, Conversation, JsonValue } from '../../../types'
-import { MarkdownContent } from './MarkdownContent'
+import { Button, IconButton, OverlayScrollbar } from '../../../components/ui'
+import type {
+  ApprovalDecision,
+  ApprovalState,
+  Conversation,
+  Message,
+} from '../../../types'
 import { useI18n } from '../../../i18n'
+import {
+  readApprovalCollapsed,
+  writeApprovalCollapsed,
+} from '../planQuestionCollapse'
+import { MarkdownContent } from './MarkdownContent'
+import { ToolCallCard } from './MessageBlock'
+import { ActivityDots } from './ActivityDots'
+
+export interface ApprovalSubmissionDecision {
+  interruptId: string
+  decision: ApprovalDecision
+  rejectionReason?: string
+}
+
+export function ApprovalStatusRow() {
+  const { t } = useI18n()
+  return (
+    <div className="approval-wait-state">
+      <ActivityDots label={t('等待处理')} />
+    </div>
+  )
+}
 
 const descriptionParts = (description: string, fallback: string) => {
   const normalized = description.trim()
@@ -21,11 +41,39 @@ const descriptionParts = (description: string, fallback: string) => {
   }
 }
 
-const valueLabel = (value: JsonValue) => {
-  if (typeof value === 'string') return value
-  if (value == null) return 'null'
-  if (typeof value === 'object') return JSON.stringify(value, null, 2)
-  return String(value)
+const matchesApprovalGroup = (
+  approval: ApprovalState,
+  interruptIds: readonly string[],
+) => approval.items.length === interruptIds.length
+  && approval.items.every(
+    (item, index) => item.interruptId === interruptIds[index],
+  )
+
+const decideItem = (
+  approval: ApprovalState,
+  decision: ApprovalSubmissionDecision,
+) => {
+  const activeIndex = approval.items.findIndex(
+    (item) => item.interruptId === decision.interruptId,
+  )
+  if (activeIndex < 0) return approval
+  const items = approval.items.map((item, index) => index === activeIndex
+    ? {
+        ...item,
+        decision: decision.decision,
+        rejectionReason: decision.decision === 'rejected'
+          ? decision.rejectionReason
+          : undefined,
+      }
+    : item)
+  const nextUndecided = items.findIndex((item) => !item.decision)
+  return {
+    ...approval,
+    items,
+    activeIndex: nextUndecided < 0 ? activeIndex : nextUndecided,
+    mode: 'options' as const,
+    error: undefined,
+  }
 }
 
 export function ApprovalCard({
@@ -35,216 +83,219 @@ export function ApprovalCard({
 }: {
   conversation: Conversation
   onChange: (updater: (approval: ApprovalState) => ApprovalState) => void
-  onSubmit: (interruptIds: readonly string[]) => void
+  onSubmit: (
+    interruptIds: readonly string[],
+    finalDecision?: ApprovalSubmissionDecision,
+  ) => void
 }) {
   const { t } = useI18n()
   const approval = conversation.approval
-  const [drafts, setDrafts] = useState<Record<string, {
-    params?: string
-    rejectionReason?: string
-  }>>({})
-  if (!approval) return null
-  const active = approval.items[approval.activeIndex]
-  const decided = approval.items.filter((item) => item.decision).length
-  const canApprove = active.allowedDecisions.includes('approve')
-  const canEdit = active.allowedDecisions.includes('edit')
-  const canReject = active.allowedDecisions.includes('reject')
-  const args = active.editedArgs ?? active.originalArgs
-  const argEntries = Object.entries(args)
-  const description = descriptionParts(active.description, t('请确认本次操作'))
-  const interruptIds = approval.items.map((item) => item.interruptId)
-  const activeDraft = drafts[active.interruptId]
+  const bodyRef = useRef<HTMLDivElement>(null)
+  const [minimized, setMinimized] = useState(() => readApprovalCollapsed(conversation.threadId))
+  const [rejectionDrafts, setRejectionDrafts] = useState<Record<string, string>>({})
 
-  // 编辑内容属于具体审批项，分页只切换视图，不能把上一项草稿提交给下一项
-  const updateActiveDraft = (patch: { params?: string; rejectionReason?: string }) => {
-    setDrafts((current) => ({
-      ...current,
-      [active.interruptId]: { ...current[active.interruptId], ...patch },
-    }))
+  useEffect(() => {
+    setMinimized(readApprovalCollapsed(conversation.threadId))
+  }, [conversation.threadId])
+
+  if (!approval || approval.items.length === 0) return null
+
+  const activeIndex = Math.max(0, Math.min(
+    approval.activeIndex,
+    approval.items.length - 1,
+  ))
+  const active = approval.items[activeIndex]
+  if (!active) return null
+  const interruptIds = approval.items.map((item) => item.interruptId)
+  const description = descriptionParts(active.description, t('请确认本次操作'))
+  const canApprove = active.allowedDecisions.includes('approve')
+  const canReject = active.allowedDecisions.includes('reject')
+  const allDecided = approval.items.every((item) => Boolean(item.decision))
+  const rejectionReason = rejectionDrafts[active.interruptId]
+    ?? active.rejectionReason
+    ?? ''
+  const rejectionFormId = `approval-rejection-${active.id}`
+  const toolMessage: Message = {
+    id: `approval-tool-${active.interruptId}`,
+    role: 'tool',
+    content: active.toolName,
+    createdAt: conversation.updatedAt,
+    meta: {
+      toolName: active.toolName,
+      params: active.params,
+      status: 'paused',
+      toolCallId: active.toolCallId,
+      interruptId: active.interruptId,
+    },
   }
 
   const updateApproval = (updater: (current: ApprovalState) => ApprovalState) => {
-    onChange((current) => {
-      const isSameGroup = current.items.length === interruptIds.length
-        && current.items.every((item, index) => item.interruptId === interruptIds[index])
-      return isSameGroup ? updater(current) : current
-    })
+    onChange((current) => matchesApprovalGroup(current, interruptIds)
+      ? updater(current)
+      : current)
   }
 
-  const activeInterruptId = active.interruptId
-  const currentActiveIndex = (current: ApprovalState) => {
-    const matchingIndex = current.items.findIndex(
-      (item) => item.interruptId === activeInterruptId,
-    )
-    return matchingIndex >= 0 ? matchingIndex : current.activeIndex
-  }
-
-  const setMode = (mode: NonNullable<typeof approval.mode>) => updateApproval((current) => ({
-    ...current,
-    mode,
-  }))
-
-  const decide = (decision: ApprovalDecision) => {
-    updateApproval((current) => {
-      const activeIndex = currentActiveIndex(current)
-      const items = current.items.map((item, index) =>
-        index === activeIndex ? { ...item, decision } : item,
-      )
-      const nextUndecided = items.findIndex((item) => !item.decision)
-      return {
-        ...current,
-        items,
-        activeIndex: nextUndecided < 0 ? activeIndex : nextUndecided,
-        mode: 'options',
-      }
-    })
-  }
-
-  const decideAll = (decision: ApprovalDecision) => {
-    updateApproval((current) => ({
-      ...current,
-      items: current.items.map((item) => ({ ...item, decision })),
-      error: undefined,
-    }))
-  }
-
-  const saveEditedApproval = (event: React.FormEvent<HTMLFormElement>) => {
-    event.preventDefault()
-    const editedParams = activeDraft?.params ?? active.editedParams ?? active.params
-    try {
-      const editedArgs = JSON.parse(editedParams)
-      if (!editedArgs || typeof editedArgs !== 'object' || Array.isArray(editedArgs)) {
-        throw new Error('editedArgs 必须是 JSON 对象')
-      }
-      updateApproval((current) => {
-        const activeIndex = currentActiveIndex(current)
-        const items = current.items.map((item, index) => index === activeIndex
-          ? { ...item, editedParams, editedArgs, decision: 'approved' as const }
-          : item)
-        const nextUndecided = items.findIndex((item) => !item.decision)
-        return {
-          ...current,
-          items,
-          activeIndex: nextUndecided < 0 ? activeIndex : nextUndecided,
-          mode: 'options',
-          error: undefined,
-        }
-      })
-    } catch {
-      updateApproval((current) => ({
-        ...current,
-        error: t('编辑后的参数必须是合法 JSON 对象'),
-      }))
+  const recordDecision = (decision: ApprovalSubmissionDecision) => {
+    const completesGroup = approval.items.every((item) => (
+      Boolean(item.decision) || item.interruptId === decision.interruptId
+    ))
+    if (completesGroup) {
+      // 最后一项由提交所有者合并到权威会话，避免先 setState 再读取造成遗漏
+      onSubmit(interruptIds, decision)
+      return
     }
-  }
-
-  const submitApproval = () => {
-    if (decided !== approval.items.length) return
-    updateApproval((current) => ({
-      ...current,
-      submitted: true,
-      error: undefined,
-    }))
-    onSubmit(interruptIds)
+    updateApproval((current) => decideItem(current, decision))
   }
 
   const confirmRejection = (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
-    const rejectionReason = activeDraft?.rejectionReason ?? active.rejectionReason ?? ''
-    updateApproval((current) => {
-      const activeIndex = currentActiveIndex(current)
-      const items = current.items.map((item, index) => index === activeIndex
-        ? { ...item, rejectionReason, decision: 'rejected' as const }
-        : item)
-      const nextUndecided = items.findIndex((item) => !item.decision)
-      return {
-        ...current,
-        items,
-        activeIndex: nextUndecided < 0 ? activeIndex : nextUndecided,
-        mode: 'options',
-        error: undefined,
-      }
+    recordDecision({
+      interruptId: active.interruptId,
+      decision: 'rejected',
+      rejectionReason,
+    })
+  }
+
+  const setMode = (mode: NonNullable<ApprovalState['mode']>) => {
+    updateApproval((current) => ({ ...current, mode, error: undefined }))
+  }
+
+  const toggleMinimized = () => {
+    // 收起只保存当前会话的展示偏好，不改变审批状态或触发恢复
+    setMinimized((current) => {
+      const next = !current
+      writeApprovalCollapsed(conversation.threadId, next)
+      return next
     })
   }
 
   return (
-    <Surface as="section" tone="danger" elevation={1} className="approval-card">
-      <div className="approval-head">
-        <div>
-          <span className="eyebrow"><CircleAlert size={14} />{t('等待你的确认…')}</span>
-          <h3 key={active.interruptId}>{description.title}</h3>
+    <section
+      className={`approval-composer${minimized ? ' is-minimized' : ''}`}
+      aria-label={t('等待审批')}
+      onWheel={(event) => {
+        const body = bodyRef.current
+        if (!body || body.scrollHeight <= body.clientHeight) {
+          event.preventDefault()
+          event.stopPropagation()
+          return
+        }
+        if (!body.contains(event.target as Node)) {
+          event.preventDefault()
+          event.stopPropagation()
+          body.scrollTop += event.deltaY
+        }
+      }}
+    >
+      <header className="approval-composer-head">
+        <button
+          type="button"
+          className="approval-toggle-surface"
+          aria-label={minimized ? t('展开审批卡片') : t('收起审批卡片')}
+          onClick={toggleMinimized}
+        />
+        <div className="approval-composer-heading">
+          <h2>
+            <span className="approval-status-dot" aria-hidden="true" />
+            <span>{t('等待审批')}</span>
+          </h2>
+          <p>{description.title}</p>
         </div>
-        <div className="approval-pager">
-          <IconButton label={t('上一项审批')} icon={<ArrowLeft size={15} />} disabled={approval.activeIndex === 0} onClick={() => updateApproval((current) => ({ ...current, activeIndex: Math.max(0, current.activeIndex - 1) }))} />
-          <span>{approval.activeIndex + 1} / {approval.items.length}</span>
-          <IconButton label={t('下一项审批')} icon={<ArrowRight size={15} />} disabled={approval.activeIndex === approval.items.length - 1} onClick={() => updateApproval((current) => ({ ...current, activeIndex: Math.min(current.items.length - 1, current.activeIndex + 1) }))} />
+        <div className="approval-composer-head-actions">
+          <IconButton
+            size="sm"
+            className="approval-composer-head-button"
+            label={minimized ? t('展开审批卡片') : t('收起审批卡片')}
+            tooltip={minimized ? t('展开审批卡片') : t('收起审批卡片')}
+            icon={minimized ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+            aria-expanded={!minimized}
+            onClick={toggleMinimized}
+          />
         </div>
-      </div>
-      <div className="approval-operation">
-        {description.detail && (
-          <div className="approval-rich-field approval-detail-field">
-          <MarkdownContent content={description.detail} variant="compact" />
-          </div>
-        )}
-        <div className="approval-args-shell">
-          {argEntries.length ? (
-            <table className="approval-args-table">
-              <thead>
-                <tr>
-                  <th scope="col">{t('输入参数')}</th>
-                  <th scope="col">{t('值')}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {argEntries.map(([key, value]) => (
-                  <tr key={key}>
-                    <th scope="row">{key}</th>
-                    <td>
-                      <pre className="approval-value-field"><code>{valueLabel(value)}</code></pre>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          ) : (
-            <div className="approval-empty-value">{t('无输入参数')}</div>
-          )}
-        </div>
-      </div>
-      {approval.error && <p className="approval-question danger-text" role="alert">{approval.error}</p>}
-      {active.decision ? (
-        <div className="decision-made"><CheckCircle2 size={16} />{t('当前项已决定：{decision}', { decision: active.decision === 'approved' ? t('允许') : t('拒绝') })}</div>
-      ) : approval.mode === 'edit' ? (
-        <form key={`edit:${active.interruptId}`} className="approval-form" onSubmit={saveEditedApproval}>
-          <label htmlFor={`approval-params-${active.id}`}>{t('编辑参数（JSON 对象）')}</label>
-          <textarea id={`approval-params-${active.id}`} name="params" value={activeDraft?.params ?? active.editedParams ?? active.params} rows={4} onChange={(event) => updateActiveDraft({ params: event.currentTarget.value })} />
-          <div><Button onClick={() => setMode('options')}>{t('取消')}</Button><Button type="submit" variant="primary">{t('保存并允许')}</Button></div>
-        </form>
-      ) : approval.mode === 'reject' ? (
-        <form key={`reject:${active.interruptId}`} className="approval-form" onSubmit={confirmRejection}>
-          <label htmlFor={`approval-reason-${active.id}`}>{t('拒绝原因（可选）')}</label>
-          <textarea id={`approval-reason-${active.id}`} name="reason" value={activeDraft?.rejectionReason ?? active.rejectionReason ?? ''} rows={3} placeholder={t('说明拒绝此操作的原因…')} onChange={(event) => updateActiveDraft({ rejectionReason: event.currentTarget.value })} />
-          <div><Button onClick={() => setMode('options')}>{t('取消')}</Button><Button type="submit" variant="danger">{t('确认拒绝')}</Button></div>
-        </form>
-      ) : (
+      </header>
+
+      {!minimized && (
         <>
-          <p className="approval-question">{t('允许此操作？')}</p>
-          <div className="approval-actions">
-            {canReject && <Button className="danger-text" onClick={() => setMode('reject')}>{t('拒绝')}</Button>}
-            {canEdit && <Button leadingIcon={<Pencil size={14} />} onClick={() => setMode('edit')}>{t('编辑')}</Button>}
-            {canApprove && <Button variant="primary" onClick={() => decide('approved')}>{t('允许')}</Button>}
+          <div ref={bodyRef} className="approval-composer-body ui-scrollbar">
+            {description.detail && (
+              <div className="approval-composer-detail">
+                <MarkdownContent content={description.detail} variant="compact" />
+              </div>
+            )}
+            <ToolCallCard message={toolMessage} className="approval-tool-card" />
+            {approval.mode === 'reject' && (
+              <form
+                id={rejectionFormId}
+                key={active.interruptId}
+                className="approval-rejection-form"
+                onSubmit={confirmRejection}
+              >
+                <label htmlFor={`approval-reason-${active.id}`}>
+                  {t('拒绝原因（可选）')}
+                </label>
+                <textarea
+                  id={`approval-reason-${active.id}`}
+                  name="reason"
+                  value={rejectionReason}
+                  rows={3}
+                  placeholder={t('说明拒绝此操作的原因…')}
+                  onChange={(event) => {
+                    const value = event.currentTarget.value
+                    setRejectionDrafts((current) => ({
+                      ...current,
+                      [active.interruptId]: value,
+                    }))
+                  }}
+                />
+              </form>
+            )}
           </div>
+          <OverlayScrollbar viewportRef={bodyRef} />
+          <footer className="approval-composer-footer">
+            <p className="approval-composer-feedback" role="alert">
+              {approval.error ?? ''}
+            </p>
+            <div className="approval-composer-actions">
+              {approval.mode === 'reject' ? (
+                <>
+                  <Button size="sm" onClick={() => setMode('options')}>{t('取消')}</Button>
+                  <Button size="sm" type="submit" form={rejectionFormId} variant="danger">
+                    {t('确认拒绝')}
+                  </Button>
+                </>
+              ) : allDecided ? (
+                <Button
+                  size="sm"
+                  className="approval-allow-button"
+                  onClick={() => onSubmit(interruptIds)}
+                >
+                  {t('重新提交')}
+                </Button>
+              ) : (
+                <>
+                  {canReject && (
+                    <Button size="sm" className="approval-reject-button" onClick={() => setMode('reject')}>
+                      {t('拒绝')}
+                    </Button>
+                  )}
+                  {canApprove && (
+                    <Button
+                      size="sm"
+                      className="approval-allow-button"
+                      onClick={() => recordDecision({
+                        interruptId: active.interruptId,
+                        decision: 'approved',
+                      })}
+                    >
+                      {t('允许')}
+                    </Button>
+                  )}
+                </>
+              )}
+            </div>
+          </footer>
         </>
       )}
-      <div className="approval-batch">
-        <span>{t('已处理 {decided} / {total}', { decided, total: approval.items.length })}</span>
-        <div>{decided === approval.items.length
-          ? <Button variant="primary" size="sm" className="submit-approval" onClick={submitApproval}>{t('批量提交')}</Button>
-          : <>
-              {approval.items.every((item) => item.allowedDecisions.includes('reject')) && <Button variant="text" size="sm" onClick={() => decideAll('rejected')}>{t('全部拒绝')}</Button>}
-              {approval.items.every((item) => item.allowedDecisions.includes('approve')) && <Button variant="text" size="sm" onClick={() => decideAll('approved')}>{t('全部允许')}</Button>}
-            </>}</div>
-      </div>
-    </Surface>
+    </section>
   )
 }

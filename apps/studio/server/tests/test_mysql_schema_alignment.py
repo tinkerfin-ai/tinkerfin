@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import re
 import secrets
 from dataclasses import dataclass
@@ -28,7 +27,6 @@ from tinkerfin_studio.auth.models import User
 from tinkerfin_studio.conversation.models import (
     ConversationEvent,
     ConversationInterrupt,
-    ConversationMessage,
     ConversationRun,
     ConversationThread,
 )
@@ -37,7 +35,6 @@ from tinkerfin_studio.conversation.repository import ConversationRepository
 from tinkerfin_studio.infrastructure.database import Base
 from tinkerfin_studio.models.entity import AgentModel
 
-_TEST_URL_ENV = "TINKERFIN_STUDIO_TEST_MYSQL_URL"
 _SCHEMA_PATH = Path(__file__).parents[1] / "database" / "mysql" / "schema.sql"
 _DATABASE_NAME_PATTERN = re.compile(r"\Atinkerfin_schema_[a-f0-9]{16}_(sql|runtime)\Z")
 _EXPECTED_TABLES = frozenset(
@@ -48,7 +45,6 @@ _EXPECTED_TABLES = frozenset(
         "conversation_runs",
         "conversation_events",
         "conversation_interrupts",
-        "conversation_messages",
         "store_migrations",
         "store",
         "tinkerfin_opensandbox_schema_versions",
@@ -65,7 +61,6 @@ _BUSINESS_MODELS = (
     ConversationRun,
     ConversationEvent,
     ConversationInterrupt,
-    ConversationMessage,
 )
 _EVENT_ADAPTER = TypeAdapter(Event)
 
@@ -128,18 +123,6 @@ class _SchemaReflection:
     tables: dict[str, _TableSignature]
     table_comments: dict[str, str]
     column_comments: dict[str, dict[str, str]]
-
-
-def _configured_url() -> URL:
-    value = os.environ.get(_TEST_URL_ENV)
-    if value is None:
-        pytest.skip(f"未配置专用 MySQL URL：{_TEST_URL_ENV}")
-    url = make_url(value)
-    if not url.drivername.startswith("mysql"):
-        pytest.fail(f"{_TEST_URL_ENV} 必须使用 MySQL URL")
-    if url.database is None:
-        pytest.fail(f"{_TEST_URL_ENV} 必须指定可连接的管理数据库")
-    return url.set(drivername="mysql+asyncmy")
 
 
 def _database_url(admin_url: URL, database_name: str) -> URL:
@@ -288,10 +271,12 @@ async def _drop_database(admin_engine: AsyncEngine, database_name: str) -> None:
 
 
 @pytest.mark.studio_mysql_integration
-async def test_full_schema_sql_matches_runtime_generated_mysql_schema() -> None:
+async def test_full_schema_sql_matches_runtime_generated_mysql_schema(
+    mysql_admin_url: str,
+) -> None:
     """全量脚本必须与三个运行时 schema 来源逐项一致"""
 
-    admin_url = _configured_url()
+    admin_url = make_url(mysql_admin_url)
     token = secrets.token_hex(8)
     sql_database = f"tinkerfin_schema_{token}_sql"
     runtime_database = f"tinkerfin_schema_{token}_runtime"
@@ -386,10 +371,12 @@ async def test_full_schema_sql_matches_runtime_generated_mysql_schema() -> None:
 
 
 @pytest.mark.studio_mysql_integration
-async def test_concurrent_same_run_resume_claim_uses_current_mysql_row() -> None:
+async def test_concurrent_same_run_resume_claim_uses_current_mysql_row(
+    mysql_admin_url: str,
+) -> None:
     """同 runId 并发认领必须在 MySQL 默认隔离级别下保持幂等"""
 
-    admin_url = _configured_url()
+    admin_url = make_url(mysql_admin_url)
     database_name = f"tinkerfin_schema_{secrets.token_hex(8)}_runtime"
     database_url = _database_url(admin_url, database_name)
     admin_engine = create_async_engine(admin_url)
@@ -472,10 +459,12 @@ async def test_concurrent_same_run_resume_claim_uses_current_mysql_row() -> None
 
 
 @pytest.mark.studio_mysql_integration
-async def test_concurrent_projectors_serialize_on_the_mysql_thread_row() -> None:
+async def test_concurrent_projectors_serialize_on_the_mysql_thread_row(
+    mysql_admin_url: str,
+) -> None:
     """MySQL 行锁必须让相邻事件按提交后的最新 snapshot 序号串行投影"""
 
-    admin_url = _configured_url()
+    admin_url = make_url(mysql_admin_url)
     database_name = f"tinkerfin_schema_{secrets.token_hex(8)}_runtime"
     database_url = _database_url(admin_url, database_name)
     admin_engine = create_async_engine(admin_url)

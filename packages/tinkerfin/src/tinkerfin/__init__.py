@@ -1,8 +1,9 @@
-"""Stateless Graph runtime with native, AG-UI, and SSE streams."""
+"""Request-scoped Deep Agents runtime with native, AG-UI, and SSE streams."""
 
 from tinkerfin_agui_adapter import Identity as Identity
 
 from ._hitl import TINKERFIN_HITL_CONTRACT as TINKERFIN_HITL_CONTRACT
+from ._tasks import join_task as join_task
 from .agui_resume import AgUiResumeBinding as AgUiResumeBinding
 from .agui_resume import AgUiResumeCheckpoint as AgUiResumeCheckpoint
 from .agui_resume import (
@@ -14,6 +15,9 @@ from .deep_agent import DeepAgentAgUiResumeRuntime as DeepAgentAgUiResumeRuntime
 from .deep_agent import DeepAgentAgUiRuntime as DeepAgentAgUiRuntime
 from .deep_agent import DeepAgentDefinition as DeepAgentDefinition
 from .deep_agent import DeepAgentRuntime as DeepAgentRuntime
+from .errors import (
+    AgUiNativeStreamConfigurationError as AgUiNativeStreamConfigurationError,
+)
 from .errors import AgUiResumeBindingError as AgUiResumeBindingError
 from .errors import RedisLeaseError as RedisLeaseError
 from .errors import RedisLeaseLifecycleError as RedisLeaseLifecycleError
@@ -34,17 +38,10 @@ from .errors import TinkerFinLifecycleError as TinkerFinLifecycleError
 from .errors import TinkerFinStreamProtocolError as TinkerFinStreamProtocolError
 from .plan import AgentMode as AgentMode
 from .runtime import AgUiEventStream as AgUiEventStream
-from .runtime import AgUiNativeStreamConfig as AgUiNativeStreamConfig
-from .runtime import (
-    AgUiNativeStreamConfigurationError as AgUiNativeStreamConfigurationError,
-)
-from .runtime import AgUiNativeStreamInvocation as AgUiNativeStreamInvocation
 from .runtime import AgUiSettlementTimeoutError as AgUiSettlementTimeoutError
 from .runtime import EventObserver as EventObserver
-from .runtime import GraphRunStream as GraphRunStream
 from .runtime import NativeGraphRunStream as NativeGraphRunStream
 from .runtime import NativeStreamPart as NativeStreamPart
-from .runtime import NativeTinkerFinRun as NativeTinkerFinRun
 from .runtime import PartObserver as PartObserver
 from .runtime import SseBody as SseBody
 from .runtime import SseEventIdResolver as SseEventIdResolver
@@ -52,14 +49,11 @@ from .runtime import SseMapper as SseMapper
 from .runtime import SsePayload as SsePayload
 from .runtime import SsePreflight as SsePreflight
 from .runtime import TinkerFin as TinkerFin
-from .runtime import TinkerFinRun as TinkerFinRun
 
 __all__ = [
     "TINKERFIN_HITL_CONTRACT",
     "AgUiEventStream",
-    "AgUiNativeStreamConfig",
     "AgUiNativeStreamConfigurationError",
-    "AgUiNativeStreamInvocation",
     "AgUiResumeBinding",
     "AgUiResumeBindingError",
     "AgUiResumeCheckpoint",
@@ -71,12 +65,10 @@ __all__ = [
     "DeepAgentDefinition",
     "DeepAgentRuntime",
     "EventObserver",
-    "GraphRunStream",
     "Identity",
     "InMemoryRunCoordinator",
     "NativeGraphRunStream",
     "NativeStreamPart",
-    "NativeTinkerFinRun",
     "PartObserver",
     "RedisLeaseError",
     "RedisLeaseLifecycleError",
@@ -97,6 +89,6 @@ __all__ = [
     "TinkerFinError",
     "TinkerFinErrorCode",
     "TinkerFinLifecycleError",
-    "TinkerFinRun",
     "TinkerFinStreamProtocolError",
+    "join_task",
 ]

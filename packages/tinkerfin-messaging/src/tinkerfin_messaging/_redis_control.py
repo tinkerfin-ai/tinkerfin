@@ -19,6 +19,7 @@ __all__ = [
     "_socket_timeout_budget",
     "_wait_block_ms",
     "_wait_for_snapshot_change",
+    "get_run_status",
 ]
 
 import asyncio
@@ -376,6 +377,35 @@ async def wait_finished(self: RedisBackend, handle: BackendRunHandle) -> RunStat
         if snapshot.terminal:
             return snapshot.status
         await self._wait_for_snapshot_change(keys, snapshot)
+
+
+async def get_run_status(
+    self: RedisBackend,
+    *,
+    channel: str,
+    identity: Identity,
+) -> RunStatus:
+    """Return current status while atomically archiving an expired owner lease."""
+
+    required_identifier("channel", channel)
+    required_identity(identity)
+    scope = self._scope(channel, identity)
+    while True:
+        control = await self._read_control(scope)
+        if control is None or control.state != "active":
+            raise RunNotFound(identity=identity)
+        keys = self._keys(
+            channel,
+            identity,
+            generation=control.generation,
+        )
+        try:
+            snapshot = await self._settled_run_snapshot(keys, identity)
+        except StreamDeleted:
+            # Identity-only lookups follow the current generation. A stale bound
+            # handle still receives StreamDeleted through _keys_for_handle().
+            continue
+        return snapshot.status
 
 
 async def failure(self: RedisBackend, handle: BackendRunHandle) -> BaseException | None:

@@ -10,7 +10,6 @@ Runtime 负责启动一次 Agent 运行，并把运行过程作为异步数据�
 | --- | --- |
 | 直接处理 LangGraph 原生数据 | `agent.new()` |
 | 给前端发送 AG-UI 事件 | `agent.new_agui()` |
-| 运行自己的异步事件源 | `TinkerFin.run()` |
 
 第一次使用时，先从 `agent.new()` 开始。
 
@@ -92,5 +91,5 @@ Definition 可以重复使用；Runtime 只代表一次运行。
 
 - [创建和运行 Deep Agent](deep-agents.md)
 - [事件流与 SSE](streams-and-sse.md)
-- [自定义事件源与并发协调](extensions.md)
+- [运行协调与 Redis 租约](extensions.md)
 - [Runtime 使用参考](api-reference.md)

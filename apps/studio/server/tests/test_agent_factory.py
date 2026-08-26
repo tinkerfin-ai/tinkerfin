@@ -14,7 +14,7 @@ from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from pydantic import SecretStr
 
 from tinkerfin import AgUiEventStream, TinkerFin
-from tinkerfin.plan import MarkdownPlanContent
+from tinkerfin.plan import MarkdownPlanContent, PlanReviewAction
 from tinkerfin_agui_adapter import AgUiLifecycleEventFactory
 from tinkerfin_messaging import FiniteMessageSource, MemoryBackend, Messaging
 from tinkerfin_messaging.agui import AgUiCodec
@@ -59,7 +59,9 @@ def _run_input(*, mode: str = "default") -> RunAgentInput:
             "threadId": "thread-1",
             "runId": "run-1",
             "state": {},
-            "messages": [],
+            "messages": [
+                {"id": "client-message-1", "role": "user", "content": "执行任务"}
+            ],
             "tools": [],
             "context": [],
             "forwardedProps": {
@@ -116,10 +118,10 @@ def test_create_deepseek_model_explicitly_controls_thinking(
     assert ("reasoning_effort" in captured) is has_reasoning_effort
 
 
-async def test_create_definition_uses_non_reasoning_models_for_plan(
+async def test_create_definition_configures_plan_models_and_product_hitl_decisions(
     monkeypatch,
 ) -> None:
-    """主 Agent 保留 reasoning，Plan Gate 与 Planner 使用可结构化输出的模型"""
+    """主 Agent 保留 reasoning，并为 Plan 与 Tool 审批装配产品配置"""
 
     root_model = FakeListChatModel(responses=["root"])
     plan_model = FakeListChatModel(responses=["plan"])
@@ -198,8 +200,19 @@ async def test_create_definition_uses_non_reasoning_models_for_plan(
         "planner_model": plan_model,
         "clarification_schema": StudioPlanClarificationForm,
         "plan_schema": MarkdownPlanContent,
+        "review_actions": (
+            PlanReviewAction.APPROVE,
+            PlanReviewAction.RESPOND,
+            PlanReviewAction.REJECT,
+        ),
     }
     assert tinkerfin.definition_options["model"] is root_model
+    assert tinkerfin.definition_options["interrupt_on"] == {
+        "write_file": {
+            "allowed_decisions": ["approve", "reject"],
+            "description": "需要人工审批：Agent 正准备写入文件",
+        }
+    }
 
 
 async def test_create_agui_events_defers_definition_and_preserves_framework_start(

@@ -19,6 +19,7 @@
 | `wrap_recoverable(...)` | recoverable source, optional Identity, after, cancel, on_committed | Recoverable subscription |
 | `read(...)` | Identity, `after=0`, `limit=100` | Ascending finite page |
 | `follow(...)` | Identity, `after=0` | Follow a run to its terminal state |
+| `get_run_status(...)` | Identity | Current authoritative run status |
 | `latest_seq(...)` | Identity | Current thread tail |
 | `validate_cursor(...)` | Identity, after | Read-only cursor validation |
 | `cancel(...)` | Identity | Request cancellation and wait for settlement |
@@ -75,6 +76,7 @@ Identity is optional only when the source advertises an immutable profile.
 | `prepare(...)` | Channel, Identity, codec, cursor, cancellation/recovery flags; returns `PreparedRun` |
 | `append(...)` | Handle, message ID, codec, bytes, optional checkpoint; returns Envelope |
 | `begin_settlement()` / `finish()` | Atomically claim and record finalization |
+| `get_run_status()` | Channel and Identity; may atomically classify an expired lease as `owner_lost` |
 | `latest_seq()` / `read()` | Channel, Identity, and pagination |
 | `bind_follow()` / `follow()` | Bind an authoritative generation and read it |
 | cancellation methods | Request, wait, and retrieve failure |

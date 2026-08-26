@@ -12,6 +12,7 @@ If this is your first time using TinkerFin, read these sections in order.
 | 2 | [AG-UI](agui/index.md) | Send an agent run to a chat interface |
 | 3 | [Messaging](messaging/index.md) | Persist, replay, resume, and cancel streams |
 | 4 | [Sandbox](sandbox/index.md) | Let an agent work with files and commands in isolation |
+| 5 | [Repository testing](development/testing.md) | Run ordinary and disposable Docker integration tests |
 
 ## A few terms first
 

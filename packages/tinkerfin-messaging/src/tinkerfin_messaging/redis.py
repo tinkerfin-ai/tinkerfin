@@ -175,6 +175,20 @@ class RedisBackend(MessagingBackend):
             identity=identity,
         )
 
+    async def get_run_status(
+        self,
+        *,
+        channel: str,
+        identity: Identity,
+    ) -> RunStatus:
+        """Return one run status after atomically settling an expired lease."""
+
+        return await _redis_control.get_run_status(
+            self,
+            channel=channel,
+            identity=identity,
+        )
+
     async def read(
         self,
         *,

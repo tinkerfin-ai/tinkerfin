@@ -1,23 +1,24 @@
 import asyncio
 import json
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import cast
 from uuid import NAMESPACE_URL, uuid5
 
 import pytest
+from ag_ui.core import Event
 from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.types import Command, interrupt
-from pydantic import SecretStr
+from pydantic import SecretStr, TypeAdapter
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tinkerfin import (
     AgUiEventStream,
-    AgUiNativeStreamConfig,
     AgUiResumeBinding,
     AgUiResumeCheckpoint,
     Identity,
@@ -68,6 +69,23 @@ class ProjectionProbe:
     async def reconcile(self, *, thread_pk: int, identity: Identity) -> int:
         del thread_pk, identity
         return 0
+
+    async def recover_preparing(
+        self,
+        *,
+        thread_pk: int | None = None,
+    ) -> frozenset[int]:
+        del thread_pk
+        return frozenset()
+
+    async def reconcile_and_settle(
+        self,
+        *,
+        thread_pk: int,
+        identity: Identity,
+    ):
+        await self.reconcile(thread_pk=thread_pk, identity=identity)
+        return "completed"
 
     async def settle_resume(self, *, thread_pk, entries, checkpoint) -> None:
         """在测试数据库中模拟生产 coordinator 的独立业务结算事务"""
@@ -228,39 +246,51 @@ def _patch_agent_graph(
                         if graph_input is not None:
                             raise AssertionError("Resume Runtime 不接收 Graph input")
                         graph_input = Command(resume=resume.resume_data)
-                    invocation = AgUiNativeStreamConfig().bind(
-                        graph.astream,
-                        graph_input,
-                        config=config,
-                    )
                     settlement_sent = False
 
-                    async def observe_part(_part) -> None:
+                    async def native_parts():
                         nonlocal settlement_sent
-                        if (
-                            settlement_sent
-                            or resume is None
-                            or on_resume_checkpointed is None
-                        ):
-                            return
-                        settlement_sent = True
-                        await on_resume_checkpointed(
-                            AgUiResumeCheckpoint(
-                                identity=identity,
-                                parent_run_id=parent_run_id,
-                                marker_id=f"test-checkpoint:{identity.run_id}",
-                                native_interrupt_ids=frozenset(
-                                    resume.native_interrupt_ids
-                                ),
-                            )
+                        native = graph.astream(
+                            graph_input,
+                            config=config,
+                            stream_mode=("messages", "tasks", "values"),
+                            version="v2",
+                            subgraphs=True,
                         )
+                        try:
+                            async for part in native:
+                                if (
+                                    not settlement_sent
+                                    and resume is not None
+                                    and on_resume_checkpointed is not None
+                                ):
+                                    settlement_sent = True
+                                    await on_resume_checkpointed(
+                                        AgUiResumeCheckpoint(
+                                            identity=identity,
+                                            parent_run_id=parent_run_id,
+                                            marker_id=(
+                                                f"test-checkpoint:{identity.run_id}"
+                                            ),
+                                            native_interrupt_ids=frozenset(
+                                                resume.native_interrupt_ids
+                                            ),
+                                        )
+                                    )
+                                yield part
+                        finally:
+                            close = getattr(native, "aclose", None)
+                            if callable(close):
+                                await cast(
+                                    Callable[[], Awaitable[object]],
+                                    close,
+                                )()
 
-                    run = factory._tinkerfin.run(
-                        invocation,
+                    # 测试替身只复现公开事件协议，不调用框架私有 Runtime 入口
+                    return AgUiEventStream(
+                        parts=native_parts(),
                         identity=identity,
-                        on_part=observe_part,
-                    )
-                    return run.astream_agui(
+                        parent_run_id=parent_run_id,
                         expose_reasoning_events=expose_reasoning_events,
                         expose_subagent_events=expose_subagent_events,
                         prior_tool_call_ids=(
@@ -268,7 +298,9 @@ def _patch_agent_graph(
                             if resume is None
                             else frozenset(resume.prior_tool_call_ids)
                         ),
-                        parent_run_id=parent_run_id,
+                        timeout=None,
+                        settlement_timeout=None,
+                        on_event=None,
                     )
 
             return Runtime()
@@ -1844,15 +1876,205 @@ async def test_resume_requires_every_pending_interrupt_before_creating_run(
     }.intersection(complete_run.config_json)
 
 
+async def test_ordinary_run_rejects_a_pending_interrupt_without_side_effects(
+    session: AsyncSession,
+) -> None:
+    """普通消息不得绕过服务端已持久化的待审批状态"""
+
+    await AgentModelService(AgentModelRepository(session)).upsert(
+        AgentModelWrite(
+            model_id="main",
+            display_name="Main",
+            provider="openai",
+            model_name="provider-main",
+            base_url="https://models.example.test/v1",
+            api_key=SecretStr("secret"),
+            enabled=True,
+            is_default=True,
+        )
+    )
+    repository = ConversationRepository(session)
+    thread = await repository.create_thread(
+        user_id=7,
+        thread_id="thread-pending-ordinary",
+        title="待审批普通消息",
+        model_id="main",
+    )
+    now = datetime.now(UTC).replace(tzinfo=None)
+    session.add(
+        ConversationInterrupt(
+            conversation_thread_id=thread.id,
+            run_id="run-interrupted",
+            resolved_run_id=None,
+            interrupt_id="interrupt-pending-ordinary",
+            status="pending",
+            reason="tool_call",
+            message="确认写入",
+            request_json=_persisted_tool_interrupt(
+                interrupt_id="interrupt-pending-ordinary",
+                tool_call_id="call-pending-ordinary",
+                tool_name="write_file",
+                args={"file_path": "/pending.txt", "content": "pending"},
+                allowed_decisions=["approve", "reject"],
+                message="确认写入",
+            ),
+            resume_json=None,
+            created_at=now,
+            resolved_at=None,
+            updated_at=now,
+        )
+    )
+    await repository.commit()
+    thread_pk = thread.id
+
+    class UnexpectedChannel:
+        async def sse(self, *args, **kwargs):
+            del args, kwargs
+            raise AssertionError("pending 普通消息不得进入 Messaging")
+
+    request = ChatRequest.model_validate(
+        {
+            "threadId": thread.thread_id,
+            "runId": "run-pending-ordinary",
+            "state": {},
+            "messages": [{"role": "user", "content": "绕过审批"}],
+            "tools": [],
+            "context": [],
+            "forwardedProps": {"model": "main", "command": {"plan": "off"}},
+        }
+    )
+    resources = cast(
+        ApplicationResources,
+        SimpleNamespace(
+            conversation_channel=UnexpectedChannel(),
+            conversation_projector=ProjectionProbe(),
+        ),
+    )
+
+    with pytest.raises(BusinessException) as caught:
+        await ConversationChatService(
+            session,
+            user=UserContext(
+                user_id=7,
+                username="alice",
+                display_name="Alice",
+                roles=(),
+                disabled=False,
+            ),
+            resources=resources,
+        ).start(request, last_event_id="0")
+
+    assert caught.value.error_code is ConversationErrorCode.PENDING_INTERRUPT
+    assert await repository.get_run(thread_pk=thread_pk, run_id=request.run_id) is None
+    stored_interrupt = await session.scalar(
+        select(ConversationInterrupt).where(
+            ConversationInterrupt.conversation_thread_id == thread_pk,
+            ConversationInterrupt.interrupt_id == "interrupt-pending-ordinary",
+        )
+    )
+    assert stored_interrupt is not None
+    assert stored_interrupt.status == "pending"
+    assert stored_interrupt.resolved_run_id is None
+
+
 @pytest.mark.parametrize(
-    ("sse_succeeds", "close_fails"),
-    [(True, False), (True, True), (False, False)],
+    "preflight_error",
+    [
+        RuntimeError("new thread preflight failed"),
+        asyncio.CancelledError("new thread preflight cancelled itself"),
+    ],
+    ids=["ordinary-failure", "owned-task-cancellation"],
+)
+async def test_new_thread_preflight_failure_removes_only_its_empty_registration(
+    session: AsyncSession,
+    preflight_error: BaseException,
+) -> None:
+    """首发预握手失败不得留下调用方无法获知的空 thread"""
+
+    await AgentModelService(AgentModelRepository(session)).upsert(
+        AgentModelWrite(
+            model_id="main",
+            display_name="Main",
+            provider="openai",
+            model_name="provider-main",
+            base_url="https://models.example.test/v1",
+            api_key=SecretStr("secret"),
+            enabled=True,
+            is_default=True,
+        )
+    )
+
+    class FailingChannel:
+        async def sse(self, *args, **kwargs):
+            del args, kwargs
+            raise preflight_error
+
+    resources = cast(
+        ApplicationResources,
+        SimpleNamespace(
+            settings=SimpleNamespace(tavily_api_key=None),
+            agent_persistence=object(),
+            sandbox_manager=object(),
+            tinkerfin=TinkerFin(
+                run_coordinator=InMemoryRunCoordinator(
+                    key_resolver=lambda identity: identity.thread_id
+                )
+            ),
+            conversation_channel=FailingChannel(),
+            conversation_projector=ProjectionProbe(),
+        ),
+    )
+    request = ChatRequest.model_validate(
+        {
+            "threadId": "",
+            "runId": "run-new-thread-failure",
+            "state": {},
+            "messages": [{"role": "user", "content": "失败首发"}],
+            "tools": [],
+            "context": [],
+            "forwardedProps": {"model": "main", "command": {"plan": "off"}},
+        }
+    )
+
+    with pytest.raises(type(preflight_error), match=str(preflight_error)):
+        await ConversationChatService(
+            session,
+            user=UserContext(
+                user_id=7,
+                username="alice",
+                display_name="Alice",
+                roles=(),
+                disabled=False,
+            ),
+            resources=resources,
+        ).start(request, last_event_id="0")
+
+    assert (
+        await ConversationRepository(session).list_threads(
+            user_id=7,
+            page_size=10,
+            cursor=None,
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize(
+    ("sse_succeeds", "close_fails", "repeat_cancel"),
+    [
+        (True, False, False),
+        (True, True, False),
+        (False, False, False),
+        (True, False, True),
+        (False, False, True),
+    ],
 )
 async def test_cancelled_preflight_waits_for_a_definitive_messaging_outcome(
     session: AsyncSession,
     monkeypatch,
     sse_succeeds: bool,
     close_fails: bool,
+    repeat_cancel: bool,
 ) -> None:
     """HTTP 取消不得中断 Messaging 所有权判定或误删已启动 run"""
 
@@ -2001,6 +2223,10 @@ async def test_cancelled_preflight_waits_for_a_definitive_messaging_outcome(
     start_task.cancel()
     await asyncio.sleep(0)
     assert not start_task.done()
+    if repeat_cancel:
+        start_task.cancel("shutdown cancellation")
+        await asyncio.sleep(0)
+        assert not start_task.done()
     release.set()
     result = (await asyncio.gather(start_task, return_exceptions=True))[0]
 
@@ -2144,7 +2370,7 @@ async def test_delete_rejects_a_committed_run_before_messaging_preflight(
                 thread_pk=thread.id,
                 run_id=request.run_id,
             )
-        assert running is not None and running.status == "running"
+        assert running is not None and running.status == "preparing"
 
         try:
             with pytest.raises(BusinessException) as caught:
@@ -2557,6 +2783,8 @@ async def test_immediate_resume_reconciles_committed_interrupt_before_claim(
                         conversation_projector=SimpleNamespace(
                             ensure=projector.ensure,
                             reconcile=reconcile_without_transaction,
+                            reconcile_and_settle=projector.reconcile_and_settle,
+                            recover_preparing=projector.recover_preparing,
                             settle_resume=projector.settle_resume,
                         ),
                     ),
@@ -2616,6 +2844,153 @@ async def test_immediate_resume_reconciles_committed_interrupt_before_claim(
     assert projected_interrupt.status == "resolved"
     assert projected_interrupt.resolved_run_id == "run-immediate-resume"
     assert reconcile_transaction_states == [False]
+
+
+async def test_new_ordinary_run_reconciles_a_committed_interrupt_before_admission(
+    database: Database,
+) -> None:
+    """投影尚未追上 interrupt 时，普通消息也必须先看到并保留审批"""
+
+    user = UserContext(
+        user_id=7,
+        username="alice",
+        display_name="Alice",
+        roles=(),
+        disabled=False,
+    )
+    previous_identity = Identity(
+        threadId="thread-lagged-interrupt",
+        runId="run-interrupted",
+    )
+    async with database.session() as setup_session:
+        await AgentModelService(AgentModelRepository(setup_session)).upsert(
+            AgentModelWrite(
+                model_id="main",
+                display_name="Main",
+                provider="openai",
+                model_name="provider-main",
+                base_url="https://models.example.test/v1",
+                api_key=SecretStr("secret"),
+                enabled=True,
+                is_default=True,
+            )
+        )
+        repository = ConversationRepository(setup_session)
+        thread = await repository.create_thread(
+            user_id=user.user_id,
+            thread_id=previous_identity.thread_id,
+            title="投影延迟审批",
+            model_id="main",
+        )
+        previous_run = await repository.create_main_run(
+            thread_id=thread.id,
+            run_id=previous_identity.run_id,
+            model_id="main",
+            input_json={},
+            config_json={},
+        )
+        previous_run.status = "running"
+        thread.status = "running"
+        thread.last_run_id = previous_run.run_id
+        await repository.commit()
+        thread_pk = thread.id
+
+    backend = MemoryBackend()
+    codec = AgUiCodec()
+    prepared = await backend.prepare(
+        channel="studio-conversation-agui",
+        identity=previous_identity,
+        codec=codec.codec_id,
+        after=0,
+        cancellable=True,
+        recoverable=False,
+    )
+    event_adapter = TypeAdapter(Event)
+    interrupt_payload = _persisted_plan_interrupt(
+        interrupt_id="interrupt-lagged",
+        kind="tinkerfin:plan_review",
+    )
+    raw_events = (
+        {
+            "type": "RUN_STARTED",
+            "threadId": previous_identity.thread_id,
+            "runId": previous_identity.run_id,
+        },
+        {"type": "STATE_SNAPSHOT", "snapshot": {}},
+        {"type": "MESSAGES_SNAPSHOT", "messages": []},
+        {
+            "type": "RUN_FINISHED",
+            "threadId": previous_identity.thread_id,
+            "runId": previous_identity.run_id,
+            "outcome": {
+                "type": "interrupt",
+                "interrupts": [interrupt_payload],
+            },
+        },
+    )
+    for index, raw_event in enumerate(raw_events, start=1):
+        event = event_adapter.validate_python(raw_event)
+        await backend.append(
+            prepared.handle,
+            message_id=f"run-interrupted:{index}",
+            codec=codec.codec_id,
+            payload=codec.encode(event),
+        )
+    await backend.finish(prepared.handle, status="completed")
+
+    async with Messaging(backend=backend) as messaging:
+        coordinator = ConversationProjectionCoordinator(
+            database=database,
+            channel=messaging.channel(
+                name="studio-conversation-agui",
+                codec=codec,
+            ),
+        )
+        resources = cast(
+            ApplicationResources,
+            SimpleNamespace(
+                conversation_projector=coordinator,
+            ),
+        )
+        request = ChatRequest.model_validate(
+            {
+                "threadId": previous_identity.thread_id,
+                "runId": "run-ordinary-after-interrupt",
+                "state": {},
+                "messages": [{"role": "user", "content": "继续"}],
+                "tools": [],
+                "context": [],
+                "forwardedProps": {"model": "main", "command": {"plan": "off"}},
+            }
+        )
+        async with database.session() as request_session:
+            with pytest.raises(BusinessException) as caught:
+                await ConversationChatService(
+                    request_session,
+                    user=user,
+                    resources=resources,
+                ).start(request, last_event_id="0")
+        await coordinator.aclose()
+
+    assert caught.value.error_code is ConversationErrorCode.PENDING_INTERRUPT
+    async with database.session() as verification_session:
+        repository = ConversationRepository(verification_session)
+        stored_thread = await repository.get_thread_by_pk(thread_pk)
+        pending = await repository.list_pending_interrupts_for_update(
+            thread_pk=thread_pk
+        )
+        assert stored_thread is not None
+        assert stored_thread.status == "waiting_approval"
+        assert stored_thread.last_seq == len(raw_events)
+        assert len(pending) == 1
+        assert pending[0].interrupt_id == "interrupt-lagged"
+        assert (
+            await repository.get_run(
+                thread_pk=thread_pk,
+                run_id=request.run_id,
+            )
+            is None
+        )
 
 
 async def test_cancel_waits_for_the_durable_cancelled_terminal(
@@ -2680,6 +3055,17 @@ async def test_cancel_waits_for_the_durable_cancelled_terminal(
             external_transaction_states.append(("reconcile", session.in_transaction()))
             return await probe.reconcile(thread_pk=thread_pk, identity=identity)
 
+        async def reconcile_and_settle_without_transaction(
+            *,
+            thread_pk: int,
+            identity: Identity,
+        ):
+            external_transaction_states.append(("reconcile", session.in_transaction()))
+            return await probe.reconcile_and_settle(
+                thread_pk=thread_pk,
+                identity=identity,
+            )
+
         resources = cast(
             ApplicationResources,
             SimpleNamespace(
@@ -2698,6 +3084,8 @@ async def test_cancel_waits_for_the_durable_cancelled_terminal(
                 conversation_projector=SimpleNamespace(
                     ensure=probe.ensure,
                     reconcile=reconcile_without_transaction,
+                    reconcile_and_settle=reconcile_and_settle_without_transaction,
+                    recover_preparing=probe.recover_preparing,
                 ),
             ),
         )
@@ -2736,6 +3124,117 @@ async def test_cancel_waits_for_the_durable_cancelled_terminal(
         ("cancel", False),
         ("reconcile", False),
     ]
+
+
+async def test_cancel_owner_lost_run_returns_idempotent_result_and_converges_history(
+    database: Database,
+) -> None:
+    """停止一个已失去 producer 的 run 应返回未发起取消并清除运行中状态"""
+
+    identity = Identity(threadId="thread-cancel-owner-loss", runId="run-owner-loss")
+    user = UserContext(
+        user_id=7,
+        username="alice",
+        display_name="Alice",
+        roles=(),
+        disabled=False,
+    )
+    async with database.session() as setup_session:
+        repository = ConversationRepository(setup_session)
+        thread = await repository.create_thread(
+            user_id=user.user_id,
+            thread_id=identity.thread_id,
+            title="取消 owner loss",
+            model_id="main",
+        )
+        run = await repository.create_main_run(
+            thread_id=thread.id,
+            run_id=identity.run_id,
+            model_id="main",
+            input_json={},
+            config_json={},
+        )
+        run.status = "running"
+        snapshot = {
+            "snapshotSeq": 0,
+            "snapshotVersion": 3,
+            "messages": [],
+            "todos": [],
+            "mode": "default",
+            "approval": None,
+            "runStatus": "streaming",
+            "activeRunId": run.run_id,
+            "serverState": {},
+            "runs": {
+                run.run_id: {
+                    "runId": run.run_id,
+                    "status": "running",
+                    "agentType": "main",
+                }
+            },
+            "interrupts": [],
+        }
+        thread.status = "running"
+        thread.last_run_id = run.run_id
+        thread.snapshot_json = snapshot
+        await repository.commit()
+        thread_pk = thread.id
+
+    backend = MemoryBackend()
+    prepared = await backend.prepare(
+        channel="studio-conversation-agui",
+        identity=identity,
+        codec=AgUiCodec.codec_id,
+        after=0,
+        cancellable=True,
+        recoverable=False,
+    )
+    await backend.finish(
+        prepared.handle,
+        status="owner_lost",
+        error=RuntimeError("owner lost"),
+    )
+    async with Messaging(backend=backend) as messaging:
+        channel = messaging.channel(
+            name="studio-conversation-agui",
+            codec=AgUiCodec(),
+        )
+        coordinator = ConversationProjectionCoordinator(
+            database=database,
+            channel=channel,
+        )
+        resources = cast(
+            ApplicationResources,
+            SimpleNamespace(
+                conversation_channel=channel,
+                conversation_projector=coordinator,
+            ),
+        )
+        async with database.session() as request_session:
+            result = await ConversationChatService(
+                request_session,
+                user=user,
+                resources=resources,
+            ).cancel(
+                thread_id=identity.thread_id,
+                run_id=identity.run_id,
+            )
+        await coordinator.aclose()
+
+    assert result.cancelled is False
+    async with database.session() as verification_session:
+        repository = ConversationRepository(verification_session)
+        stored_thread = await repository.get_thread_by_pk(thread_pk)
+        stored_run = await repository.get_run(
+            thread_pk=thread_pk,
+            run_id=identity.run_id,
+        )
+        assert stored_thread is not None
+        assert stored_run is not None
+        assert stored_thread.status == "error"
+        assert stored_thread.snapshot_json is not None
+        assert stored_thread.snapshot_json["activeRunId"] is None
+        assert stored_run.status == "error"
 
 
 async def _collect_frames(body) -> list[bytes]:

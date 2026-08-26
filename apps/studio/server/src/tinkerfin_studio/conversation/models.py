@@ -177,8 +177,8 @@ class ConversationRun(Base):
     status: Mapped[str] = mapped_column(
         String(32),
         nullable=False,
-        default="running",
-        comment="run 状态：running/success/interrupt/error/cancelled",
+        default="preparing",
+        comment="run 状态：preparing/running/success/interrupt/error/cancelled",
     )
     input_json: Mapped[dict[str, object] | None] = mapped_column(
         JSON, nullable=True, comment="主 run 的完整请求输入"
@@ -324,64 +324,6 @@ class ConversationInterrupt(Base):
     )
     resolved_at: Mapped[datetime | None] = mapped_column(
         DateTime(), nullable=True, comment="解决时间"
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(), nullable=False, comment="更新时间"
-    )
-
-
-class ConversationMessage(Base):
-    """用于检索和审计的消息聚合投影"""
-
-    __tablename__ = "conversation_messages"
-    __table_args__ = (
-        UniqueConstraint(
-            "conversation_thread_id",
-            "message_id",
-            name="uq_conversation_messages_thread_message",
-        ),
-        Index(
-            "ix_conversation_messages_thread_role_updated",
-            "conversation_thread_id",
-            "role",
-            "updated_at",
-            "id",
-        ),
-        {"comment": "用于历史恢复、检索和审计的消息聚合投影"},
-    )
-
-    id: Mapped[int] = mapped_column(
-        _PRIMARY_KEY, primary_key=True, autoincrement=True, comment="消息投影主键"
-    )
-    conversation_thread_id: Mapped[int] = mapped_column(
-        BigInteger, nullable=False, comment="所属会话主键，由应用层保证存在"
-    )
-    run_id: Mapped[str | None] = mapped_column(
-        String(128), nullable=True, comment="消息所属 run ID"
-    )
-    message_id: Mapped[str] = mapped_column(
-        String(255), nullable=False, comment="AG-UI message ID"
-    )
-    role: Mapped[str] = mapped_column(
-        String(32), nullable=False, comment="user/assistant/tool/subagent/process/error"
-    )
-    content: Mapped[str] = mapped_column(
-        Text, nullable=False, default="", comment="聚合后的可见文本"
-    )
-    status: Mapped[str] = mapped_column(
-        String(32), nullable=False, comment="streaming/completed/failed/paused"
-    )
-    meta_json: Mapped[dict[str, object] | None] = mapped_column(
-        JSON, nullable=True, comment="Tool、Agent 与运行关联元数据"
-    )
-    first_seq: Mapped[int] = mapped_column(
-        BigInteger, nullable=False, comment="首次出现的事件序号"
-    )
-    last_seq: Mapped[int] = mapped_column(
-        BigInteger, nullable=False, comment="最后更新的事件序号"
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(), nullable=False, comment="创建时间"
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(), nullable=False, comment="更新时间"

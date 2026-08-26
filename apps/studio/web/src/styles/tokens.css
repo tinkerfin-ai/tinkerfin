@@ -25,8 +25,11 @@
     --primitive-green-600: #22c55e;
     --primitive-green-700: #167a3c;
     --primitive-amber-50: #fff8e8;
+    --primitive-amber-100: #fef5e7;
+    --primitive-amber-400: #f7ad31;
     --primitive-amber-500: #f59e0b;
     --primitive-amber-800: #8a4b00;
+    --primitive-amber-900: #27241f;
 
     --color-canvas: var(--primitive-white);
     --color-sidebar: var(--primitive-gray-sidebar);
@@ -50,6 +53,9 @@
     --color-brand-soft: var(--primitive-blue-50);
     --color-brand-text: var(--primitive-blue-700);
     --color-on-brand: var(--primitive-white);
+    --color-plan-panel-accent: var(--color-brand);
+    --color-plan-panel-border: var(--primitive-blue-300);
+    --color-plan-panel-background: var(--primitive-blue-50);
     --color-selection: var(--primitive-blue-300);
     --color-on-selection: var(--primitive-gray-950);
     --color-danger: var(--primitive-red-600);
@@ -64,6 +70,9 @@
     --color-warning-soft: var(--primitive-amber-50);
     --color-warning-text: var(--primitive-amber-800);
     --color-on-warning: var(--primitive-gray-950);
+    --color-warning-panel-accent: var(--primitive-amber-500);
+    --color-warning-panel-border: var(--primitive-amber-400);
+    --color-warning-panel-background: var(--primitive-amber-100);
     --color-focus: var(--primitive-blue-600);
     --color-focus-soft: rgb(57 100 254 / 18%);
     --color-code-surface: #f3f4f6;
@@ -90,8 +99,7 @@
     --radius-lg: 10px;
     --radius-xl: 12px;
     --radius-2xl: 16px;
-    --radius-composer: 22px;
-    --radius-input: 28px;
+    --radius-3xl: 22px;
     --radius-pill: 9999px;
 
     --control-xs: 32px;
@@ -106,11 +114,13 @@
     --icon-md: 18px;
     --icon-lg: 20px;
     --icon-xl: 24px;
+    --optical-activity-dots-inset: 1px;
     --layout-sidebar-expanded: 261px;
     --layout-sidebar-rail: 56px;
     --layout-content-wide: 840px;
     --layout-conversation-width: 748px;
     --layout-composer-width: 780px;
+    --layout-composer-surface-height: 94px;
     --layout-content-medium: 712px;
     --layout-task-drawer: 348px;
     --layout-header-height: 60px;
@@ -133,7 +143,9 @@
     --motion-normal: 200ms;
     --motion-slow: 300ms;
     --motion-loading-cycle: 1000ms;
+    --motion-tool-result-cycle: 1450ms;
     --motion-tool-sweep-cycle: 2600ms;
+    --motion-attention-cycle: 1800ms;
     --motion-tooltip-delay: 500ms;
     --motion-tooltip-hide-delay: 0ms;
     --ease-in: cubic-bezier(.4, 0, 1, 1);
@@ -144,6 +156,7 @@
     --shadow-2: 0 4px 12px rgb(0 0 0 / 2%), 0 2px 8px rgb(0 0 0 / 4%);
     --shadow-3: 0 0 1px rgb(0 0 0 / 20%), 0 0 4px rgb(0 0 0 / 2%), 0 12px 32px rgb(0 0 0 / 8%);
     --shadow-border: 0 0 0 1px var(--color-border);
+    --shadow-tool-pulse: 0 0 var(--space-2) color-mix(in srgb, currentColor 55%, transparent);
   }
 
   :root[data-theme='dark'] {
@@ -170,6 +183,8 @@
     --color-brand-soft: #283142;
     --color-brand-text: #8ab4ff;
     --color-on-brand: #151517;
+    --color-plan-panel-border: var(--color-brand);
+    --color-plan-panel-background: var(--color-brand-soft);
     --color-selection: var(--color-brand);
     --color-on-selection: var(--color-on-brand);
     --color-danger: #f25a5a;
@@ -184,6 +199,9 @@
     --color-warning-soft: #3c3020;
     --color-warning-text: #ffc869;
     --color-on-warning: #151517;
+    --color-warning-panel-accent: var(--primitive-amber-500);
+    --color-warning-panel-border: var(--primitive-amber-400);
+    --color-warning-panel-background: var(--primitive-amber-900);
     --color-focus: #8ab4ff;
     --color-focus-soft: rgb(103 158 254 / 24%);
     --color-code-surface: #23262b;

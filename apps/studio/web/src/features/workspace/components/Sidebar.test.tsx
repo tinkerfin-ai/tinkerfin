@@ -2,7 +2,7 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import type { WorkspaceState } from '../../../types'
+import type { Conversation, WorkspaceState } from '../../../types'
 import { Sidebar } from './Sidebar'
 
 const workspace: WorkspaceState = {
@@ -297,6 +297,89 @@ describe('Sidebar', () => {
     historyList.scrollTop = 301
     fireEvent.scroll(historyList)
     expect(stickyTitle).toHaveTextContent('今天')
+  })
+
+  it('按审批或 Plan 状态绑定待处理颜色并同步可访问名称', () => {
+    const waiting = workspace.conversations.map((item): Conversation => item.threadId === 'recent'
+      ? { ...item, runStatus: 'waiting_approval' as const }
+      : item)
+    const { rerender } = render(
+      <Sidebar
+        {...baseProps}
+        workspace={{ ...workspace, conversations: waiting }}
+        historyConversations={waiting}
+      />,
+    )
+
+    const waitingButton = screen.getByRole('button', { name: '打开会话：最近会话，等待处理' })
+    expect(waitingButton.querySelector('.conversation-status-slot')).toBeInTheDocument()
+    expect(waitingButton.querySelector('.conversation-attention-dot')).toHaveClass('is-approval')
+    expect(screen.getByRole('button', { name: '打开会话：置顶会话' }).querySelector('.conversation-attention-dot')).toBeNull()
+
+    const planWaiting = waiting.map((item): Conversation => item.threadId === 'recent'
+      ? {
+          ...item,
+          planInteraction: {
+            kind: 'questions',
+            interruptId: 'plan-question',
+            title: '确认范围',
+            description: '确认回归范围',
+            activeQuestionIndex: 0,
+            form: {},
+            questions: [{
+              id: 'scope',
+              prompt: '回归范围是什么？',
+              required: true,
+              options: [],
+              allowFreeText: true,
+            }],
+            submitted: false,
+          },
+        }
+      : item)
+    rerender(
+      <Sidebar
+        {...baseProps}
+        workspace={{ ...workspace, conversations: planWaiting }}
+        historyConversations={planWaiting}
+      />,
+    )
+    expect(screen.getByRole('button', { name: '打开会话：最近会话，等待处理' })
+      .querySelector('.conversation-attention-dot')).toHaveClass('is-plan')
+
+    const reviewWaiting = planWaiting.map((item): Conversation => item.threadId === 'recent'
+      ? {
+          ...item,
+          planInteraction: {
+            kind: 'review',
+            interruptId: 'plan-review',
+            revision: 1,
+            submitted: false,
+            draft: {
+              schemaVersion: 1,
+              revision: 1,
+              contentSchema: {
+                id: 'tinkerfin.plan.markdown.v1',
+                fingerprint: '0'.repeat(64),
+                mediaType: 'text/markdown',
+              },
+              content: { markdown: '# 计划草稿' },
+            },
+          },
+        }
+      : item)
+    rerender(
+      <Sidebar
+        {...baseProps}
+        workspace={{ ...workspace, conversations: reviewWaiting }}
+        historyConversations={reviewWaiting}
+      />,
+    )
+    expect(screen.getByRole('button', { name: '打开会话：最近会话，等待处理' })
+      .querySelector('.conversation-attention-dot')).toHaveClass('is-approval')
+
+    rerender(<Sidebar {...baseProps} />)
+    expect(screen.getByRole('button', { name: '打开会话：最近会话' }).querySelector('.conversation-attention-dot')).toBeNull()
   })
 
   it('opens the existing management menu from a pinned conversation', () => {

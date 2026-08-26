@@ -106,4 +106,4 @@ await sse.prepare(preflight=authorize)
 
 直接 SSE 不保存历史。客户端重连后想继续读取之前的事件，应使用 [Messaging 的 SSE](../messaging/delivery-and-replay.md)。
 
-下一篇：[自定义事件源与并发协调](extensions.md)。
+下一篇：[运行协调与 Redis 租约](extensions.md)。

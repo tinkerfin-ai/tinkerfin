@@ -85,7 +85,6 @@ Use `agent.new()` for native LangGraph objects. Both Runtime types expose the in
   durable delivery; optional `parent_run_id` creates a real checkpoint branch.
 - Resume uses `AgUiResumeBinding.from_agui(...)`; the Runtime owns native commands, Tool
   correlation, cancellation, and durable checkpoint evidence.
-- `TinkerFin.run(...)` runs custom asynchronous sources.
 
 ## Documentation
 
@@ -94,6 +93,7 @@ Use `agent.new()` for native LangGraph objects. Both Runtime types expose the in
 - [AG-UI](docs/en/agui/index.md)
 - [Messaging](docs/en/messaging/index.md)
 - [Sandbox](docs/en/sandbox/index.md)
+- [Repository testing](docs/en/development/testing.md)
 - [Core package](packages/tinkerfin/README.md)
 - [AG-UI adapter](packages/tinkerfin-agui-adapter/README.md)
 - [Studio server](apps/studio/server/README.md)

@@ -1132,14 +1132,6 @@ describe('AG-UI runtime reducer', () => {
         return {
           ...item,
           decision: 'approved',
-          editedArgs: {
-            file_path: 'edited-a0.txt',
-            content: 'edited-a0',
-          },
-          editedParams: JSON.stringify({
-            file_path: 'edited-a0.txt',
-            content: 'edited-a0',
-          }),
         }
       }
       return { ...item, decision: 'rejected', rejectionReason: 'skip' }
@@ -1166,16 +1158,7 @@ describe('AG-UI runtime reducer', () => {
       {
         interruptId: 'interrupt-a#0',
         status: 'resolved',
-        payload: {
-          type: 'edit',
-          edited_action: {
-            name: 'write_file',
-            args: {
-              file_path: 'edited-a0.txt',
-              content: 'edited-a0',
-            },
-          },
-        },
+        payload: { type: 'approve' },
       },
       {
         interruptId: 'interrupt-a#1',
@@ -1576,7 +1559,44 @@ describe('AG-UI runtime reducer', () => {
       snapshot: {
         snapshotSeq: 7,
         snapshotVersion: 3,
-        messages: [],
+        messages: [
+          {
+            id: toolCallId,
+            role: 'tool',
+            content: '',
+            createdAt: '2026-08-05T00:00:00.000Z',
+            meta: {
+              status: 'running',
+              runId: RUN_ID,
+              toolCallId,
+              toolName: 'write_file',
+            },
+          },
+          {
+            id: 'history-unreviewed-tool',
+            role: 'tool',
+            content: '',
+            createdAt: '2026-08-05T00:00:00.000Z',
+            meta: {
+              status: 'running',
+              runId: RUN_ID,
+              toolCallId: 'history-unreviewed-tool',
+              toolName: 'write_todos',
+            },
+          },
+          {
+            id: 'history-other-run-tool',
+            role: 'tool',
+            content: '',
+            createdAt: '2026-08-05T00:00:00.000Z',
+            meta: {
+              status: 'running',
+              runId: 'run-other',
+              toolCallId: 'history-other-run-tool',
+              toolName: 'read_file',
+            },
+          },
+        ],
         todos: [],
         mode: 'default',
         approval: {
@@ -1635,6 +1655,19 @@ describe('AG-UI runtime reducer', () => {
     expect(restored.runStatus).toBe('waiting_approval')
     expect(restored.approval).toEqual(detail.snapshot?.approval)
     expect(JSON.parse(restored.approval?.items[0]?.params ?? '')).toEqual(originalArgs)
+    expect(restored.messages.find((message) => message.id === toolCallId)?.meta).toMatchObject({
+      status: 'paused',
+      interruptId,
+    })
+    expect(restored.messages.find(
+      (message) => message.id === 'history-unreviewed-tool',
+    )?.meta).toMatchObject({ status: 'paused' })
+    expect(restored.messages.find(
+      (message) => message.id === 'history-unreviewed-tool',
+    )?.meta?.interruptId).toBeUndefined()
+    expect(restored.messages.find(
+      (message) => message.id === 'history-other-run-tool',
+    )?.meta?.status).toBe('running')
   })
 
   it('clears replayed approval when authoritative history has no pending interrupt', () => {
@@ -2649,7 +2682,7 @@ describe('AG-UI runtime reducer', () => {
     }
   })
 
-  it('builds every fixed Plan review action without changing the action vocabulary', () => {
+  it('builds the fixed Studio Plan review actions without an edit payload', () => {
     const base = buildEmptyConversation({
       threadId: THREAD_ID,
       now: '2026-08-05T08:00:00.000Z',
@@ -2669,7 +2702,7 @@ describe('AG-UI runtime reducer', () => {
           fingerprint: '0'.repeat(64),
           mediaType: 'text/markdown',
         },
-        content: { markdown: '# 实现四种动作\n\n实现合同' },
+        content: { markdown: '# 实现三种动作\n\n实现合同' },
       },
     }
     const payloadFor = (patch: Partial<PlanReviewState>) => buildPlanResumePayload({
@@ -2681,14 +2714,6 @@ describe('AG-UI runtime reducer', () => {
       type: 'approve',
       baseRevision: 4,
     })
-    expect(payloadFor({
-      action: 'edit',
-      editedMarkdown: '  # 编辑后\n\n- 编辑合同\n',
-    }).resume?.[0]?.payload).toEqual({
-      type: 'edit',
-      baseRevision: 4,
-      content: { markdown: '  # 编辑后\n\n- 编辑合同\n' },
-    })
     expect(payloadFor({ action: 'respond', message: '补充回归验证' }).resume?.[0]?.payload).toEqual({
       type: 'respond',
       baseRevision: 4,
@@ -2699,8 +2724,5 @@ describe('AG-UI runtime reducer', () => {
       baseRevision: 4,
       message: '目标不再需要',
     })
-    expect(() => payloadFor({ action: 'edit', editedMarkdown: ' \n\t' })).toThrow(
-      'plan_edit_empty',
-    )
   })
 })

@@ -19,6 +19,7 @@ from tinkerfin_messaging import (
     MessagingBackend,
     MessagingClosed,
     PreparedRun,
+    RunNotFound,
     StreamDeleted,
 )
 
@@ -269,6 +270,11 @@ async def test_delete_removes_an_empty_terminal_stream_across_backends(
         identity=_identity(),
     )
 
+    with pytest.raises(RunNotFound):
+        await messaging_backend.get_run_status(
+            channel="events",
+            identity=_identity(),
+        )
     assert (
         await messaging_backend.latest_seq(
             channel="events",

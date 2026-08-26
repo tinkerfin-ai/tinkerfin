@@ -12,6 +12,7 @@ TinkerFin 用来运行 Deep Agents、把运行过程转换成 AG-UI 事件、可
 | 2 | [AG-UI](agui/index.md) | 把 Agent 的运行过程发送给聊天界面 |
 | 3 | [Messaging](messaging/index.md) | 保存、回放、续传和取消事件流 |
 | 4 | [Sandbox](sandbox/index.md) | 让 Agent 在隔离环境中读写文件和执行命令 |
+| 5 | [仓库测试](development/testing.md) | 运行普通测试和临时 Docker 集成测试 |
 
 ## 先认识几个词
 

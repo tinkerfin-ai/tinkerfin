@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import UTC, datetime
 from typing import cast
 
@@ -11,16 +12,20 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tinkerfin_agui_adapter import SubagentProvenance
+from tinkerfin_messaging import RunStatus
 from tinkerfin_messaging.models import MessageEnvelope
 from tinkerfin_studio.conversation.models import (
     ConversationEvent,
     ConversationInterrupt,
-    ConversationMessage,
     ConversationRun,
     ConversationThread,
 )
 from tinkerfin_studio.conversation.repository import ConversationRepository
-from tinkerfin_studio.conversation.snapshot import reduce_snapshot
+from tinkerfin_studio.conversation.snapshot import (
+    empty_snapshot,
+    reduce_snapshot,
+    synchronize_pending_interrupts,
+)
 
 
 class ConversationProjector:
@@ -156,10 +161,6 @@ class ConversationProjector:
             created_at,
             run_input,
         )
-        await self._project_messages(
-            thread_pk, event_run_id, snapshot, envelope.seq, created_at
-        )
-
         thread.last_seq = envelope.seq
         thread.snapshot_seq = envelope.seq
         thread.snapshot_json = snapshot
@@ -176,7 +177,101 @@ class ConversationProjector:
         )
         if event_type == "TOOL_CALL_START":
             thread.tool_call_count += 1
+        if event_type == "RUN_STARTED" and main_run is not None:
+            thread.last_model = main_run.model_id
         thread.updated_at = created_at
+        await self._session.flush()
+
+    async def settle_messaging_terminal(
+        self,
+        *,
+        thread_pk: int,
+        identity_run_id: str,
+        durable_status: RunStatus,
+    ) -> None:
+        """在没有 AG-UI terminal 时收敛 Messaging 已确认的业务终态"""
+
+        if durable_status not in {"completed", "cancelled", "failed", "owner_lost"}:
+            raise ValueError("只有 durable 终态可以收敛业务运行")
+        thread = await self._session.scalar(
+            select(ConversationThread)
+            .where(ConversationThread.id == thread_pk)
+            .with_for_update()
+        )
+        if thread is None:
+            raise LookupError(f"会话不存在: {thread_pk}")
+        run = await self._session.scalar(
+            select(ConversationRun)
+            .where(
+                ConversationRun.conversation_thread_id == thread_pk,
+                ConversationRun.run_id == identity_run_id,
+            )
+            .with_for_update()
+        )
+        if run is None or run.status not in {"preparing", "running"}:
+            return
+
+        now = datetime.now(UTC).replace(tzinfo=None)
+        if durable_status == "cancelled":
+            run_status = "cancelled"
+            code = "messaging_cancelled_without_agui_terminal"
+        else:
+            run_status = "error"
+            code = {
+                "completed": "messaging_terminal_without_agui_terminal",
+                "failed": "messaging_producer_failed",
+                "owner_lost": "messaging_owner_lost",
+            }[durable_status]
+        run.status = run_status
+        run.outcome_json = {
+            "type": run_status,
+            "code": code,
+            "durableStatus": durable_status,
+        }
+        run.finished_at = now
+        run.updated_at = now
+
+        repository = ConversationRepository(self._session)
+        pending = await repository.list_pending_interrupts_for_update(
+            thread_pk=thread_pk
+        )
+        # checkpoint 前失败应让用户再次审批；已经结算的审批不能因运行失败重新出现
+        for interrupt in pending:
+            if interrupt.resolved_run_id == identity_run_id:
+                interrupt.resolved_run_id = None
+                interrupt.updated_at = now
+        snapshot = (
+            deepcopy(thread.snapshot_json)
+            if thread.snapshot_json is not None
+            else empty_snapshot()
+        )
+        synchronize_pending_interrupts(
+            snapshot,
+            [dict(interrupt.request_json) for interrupt in pending],
+        )
+        runs = snapshot.get("runs")
+        if isinstance(runs, dict):
+            snapshot_run = runs.get(identity_run_id)
+            if isinstance(snapshot_run, dict):
+                snapshot_run["status"] = run_status
+                snapshot_run["completedAt"] = now.isoformat()
+        if snapshot.get("activeRunId") == identity_run_id:
+            snapshot["activeRunId"] = None
+        # 不伪造模型错误消息，只把历史页和刷新后的控制状态收敛为可理解的终态
+        has_pending = bool(pending)
+        snapshot["runStatus"] = (
+            "waiting_approval"
+            if has_pending
+            else ("idle" if run_status == "cancelled" else "error")
+        )
+        thread.snapshot_json = snapshot
+        thread.has_pending_interrupt = has_pending
+        thread.status = (
+            "waiting_approval"
+            if has_pending
+            else ("idle" if run_status == "cancelled" else "error")
+        )
+        thread.updated_at = max(thread.updated_at, now)
         await self._session.flush()
 
     @staticmethod
@@ -530,48 +625,3 @@ class ConversationProjector:
             entries=entries,
             resolution_id=f"abandon:{main_run.run_id}",
         )
-
-    async def _project_messages(
-        self,
-        thread_pk: int,
-        run_id: str,
-        snapshot: dict[str, object],
-        seq: int,
-        created_at: datetime,
-    ) -> None:
-        messages = cast(list[dict[str, object]], snapshot["messages"])
-        for value in messages:
-            message_id = value.get("id")
-            if not isinstance(message_id, str):
-                continue
-            meta = value.get("meta")
-            message_run_id = (
-                meta.get("runId")
-                if isinstance(meta, dict) and isinstance(meta.get("runId"), str)
-                else run_id
-            )
-            entity = await self._session.scalar(
-                select(ConversationMessage).where(
-                    ConversationMessage.conversation_thread_id == thread_pk,
-                    ConversationMessage.message_id == message_id,
-                )
-            )
-            if entity is None:
-                entity = ConversationMessage(
-                    conversation_thread_id=thread_pk,
-                    run_id=message_run_id,
-                    message_id=message_id,
-                    first_seq=seq,
-                    created_at=created_at,
-                )
-                self._session.add(entity)
-            entity.role = str(value.get("role", "assistant"))
-            entity.content = str(value.get("content", ""))
-            entity.meta_json = meta if isinstance(meta, dict) else None
-            entity.status = (
-                str(meta.get("status", "completed"))
-                if isinstance(meta, dict)
-                else "completed"
-            )
-            entity.last_seq = seq
-            entity.updated_at = created_at

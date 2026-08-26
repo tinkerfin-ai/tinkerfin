@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from functools import wraps
@@ -28,6 +29,7 @@ from ._agui_lineage import bind_agui_lineage, verify_agui_resume_marker
 from ._agui_lineage_state import LINEAGE_STATE_KEY, lineage_state_update
 from ._hitl import prepare_hitl_factory_overrides
 from ._state_schema import compose_deep_agent_base_schema
+from ._tasks import join_task
 from .agui_native import _bind_agui_graph_astream, _bind_graph_identity
 from .agui_resume import (
     RESUME_MARKER_STATE_KEY,
@@ -144,7 +146,7 @@ def _wrap_native_astream(
             source,
             identity=identity,
             on_part=on_part,
-        ).astream()
+        )
 
     return cast(AstreamT, wrapped)
 
@@ -261,13 +263,22 @@ def _create_graph_agui_stream(
         finally:
             close = getattr(native, "aclose", None)
             if callable(close):
-                await cast(Callable[[], Awaitable[object]], close)()
+                # The Graph iterator is owned by this request source. Settle its close
+                # independently so cancellation of the consumer cannot leak it.
+                async def close_native() -> None:
+                    await cast(Callable[[], Awaitable[object]], close)()
 
-    stream = tinkerfin._run_native(
+                close_task = asyncio.create_task(
+                    close_native(),
+                    name="tinkerfin-deep-agent-native-close",
+                )
+                await join_task(close_task)
+
+    stream = tinkerfin._run_agui(
         source,
         identity=identity,
+        parent_run_id=parent_run_id,
         on_part=on_part,
-    ).astream_agui(
         timeout=timeout,
         settlement_timeout=settlement_timeout,
         expose_reasoning_events=expose_reasoning_events,
@@ -277,7 +288,6 @@ def _create_graph_agui_stream(
         ),
         private_state_keys=private_state_keys,
         on_event=on_event,
-        parent_run_id=parent_run_id,
     )
     claim.claim()
     return stream
@@ -445,11 +455,11 @@ def _wrap_agui_resume_astream(
                 if False:  # pragma: no cover - supplies the async iterator shape
                     yield {}
 
-            stream = tinkerfin._run_native(
+            stream = tinkerfin._run_agui(
                 empty_source,
                 identity=identity,
+                parent_run_id=parent_run_id,
                 on_part=on_part,
-            ).astream_agui(
                 timeout=timeout,
                 settlement_timeout=settlement_timeout,
                 expose_reasoning_events=expose_reasoning_events,
@@ -457,7 +467,6 @@ def _wrap_agui_resume_astream(
                 prior_tool_call_ids=frozenset(),
                 private_state_keys=private_state_keys,
                 on_event=on_event,
-                parent_run_id=parent_run_id,
             )
             stream._resume_abandoned = True
             claim.claim()

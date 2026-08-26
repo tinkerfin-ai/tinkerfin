@@ -1,13 +1,18 @@
+from typing import cast
+
 import pytest
 from ag_ui.core import RunAgentInput
+from fastapi import Request
+from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from tinkerfin_studio.api.errors import BusinessException
+from tinkerfin_studio.api.conversation_router import chat
+from tinkerfin_studio.api.errors import BusinessException, ConversationErrorCode
 from tinkerfin_studio.application import create_application
-from tinkerfin_studio.conversation.request import ChatRequest
+from tinkerfin_studio.auth.types import UserContext
+from tinkerfin_studio.conversation.request import MAX_USER_MESSAGE_BYTES, ChatRequest
 from tinkerfin_studio.conversation.run_preparation import (
-    StartChatIntent,
-    classify_intent,
     prepare_run_request,
 )
 from tinkerfin_studio.conversation.service import parse_last_event_id
@@ -90,6 +95,34 @@ def test_chat_request_rejects_removed_or_invalid_plan_commands(
         )
 
 
+async def test_chat_route_maps_studio_secondary_validation_to_safe_422() -> None:
+    protocol_input = RunAgentInput.model_validate(
+        {
+            "threadId": "",
+            "runId": "run-invalid-studio-contract",
+            "state": {},
+            "messages": [
+                {"id": "client-invalid", "role": "user", "content": "执行任务"}
+            ],
+            "tools": [],
+            "context": [],
+            "forwardedProps": {"model": "main", "command": {}},
+        }
+    )
+
+    with pytest.raises(RequestValidationError) as caught:
+        await chat(
+            input_data=protocol_input,
+            request=cast(Request, object()),
+            session=cast(AsyncSession, object()),
+            user=cast(UserContext, object()),
+            last_event_id=None,
+        )
+
+    assert caught.value.errors()
+    assert all("input" not in error for error in caught.value.errors())
+
+
 def test_chat_request_drops_the_protocol_message_id() -> None:
     """HTTP 要求客户端 ID，但业务快照只使用服务端权威 ID"""
 
@@ -120,6 +153,89 @@ def test_chat_request_drops_the_protocol_message_id() -> None:
     assert normalized_model.messages[0].id == "message-server-1"
 
 
+def test_chat_request_enforces_the_utf8_user_message_capacity_before_side_effects() -> (
+    None
+):
+    def protocol_input(content: str) -> RunAgentInput:
+        return RunAgentInput.model_validate(
+            {
+                "threadId": "",
+                "runId": "run-capacity",
+                "state": {},
+                "messages": [
+                    {"id": "client-capacity", "role": "user", "content": content}
+                ],
+                "tools": [],
+                "context": [],
+                "forwardedProps": {"model": "main", "command": {"plan": "off"}},
+            }
+        )
+
+    accepted = ChatRequest.from_agui(protocol_input("a" * MAX_USER_MESSAGE_BYTES))
+    assert len(str(accepted.messages[0]["content"]).encode()) == MAX_USER_MESSAGE_BYTES
+    multibyte = ChatRequest.from_agui(
+        protocol_input("你" * (MAX_USER_MESSAGE_BYTES // 3))
+    )
+    assert len(str(multibyte.messages[0]["content"]).encode()) <= MAX_USER_MESSAGE_BYTES
+
+    with pytest.raises(BusinessException) as caught:
+        ChatRequest.from_agui(protocol_input("a" * (MAX_USER_MESSAGE_BYTES + 1)))
+    assert caught.value.error_code is ConversationErrorCode.REQUEST_TOO_LARGE
+
+
+@pytest.mark.parametrize("content", ["\ud800", "\udfff"])
+async def test_chat_rejects_an_unpaired_unicode_surrogate_as_invalid_input(
+    content: str,
+) -> None:
+    """不能编码为 UTF-8 的 JSON 文本必须在业务副作用前返回校验失败"""
+
+    protocol_input = RunAgentInput.model_validate(
+        {
+            "threadId": "",
+            "runId": "run-invalid-unicode",
+            "state": {},
+            "messages": [
+                {"id": "client-invalid-unicode", "role": "user", "content": content}
+            ],
+            "tools": [],
+            "context": [],
+            "forwardedProps": {"model": "main", "command": {"plan": "off"}},
+        }
+    )
+
+    with pytest.raises(RequestValidationError) as caught:
+        await chat(
+            input_data=protocol_input,
+            request=cast(Request, object()),
+            session=cast(AsyncSession, object()),
+            user=cast(UserContext, object()),
+            last_event_id=None,
+        )
+
+    assert any("有效 UTF-8" in str(error["ctx"]) for error in caught.value.errors())
+
+
+def test_resume_request_rejects_an_unexecuted_user_message() -> None:
+    with pytest.raises(ValidationError, match="恢复运行不得同时提交新消息"):
+        ChatRequest.model_validate(
+            {
+                "threadId": "thread-1",
+                "runId": "run-resume-with-message",
+                "state": {},
+                "messages": [{"role": "user", "content": "不应执行"}],
+                "tools": [],
+                "context": [],
+                "forwardedProps": {"model": "main", "command": {"plan": "off"}},
+                "resume": [
+                    {
+                        "interruptId": "interrupt-1",
+                        "status": "cancelled",
+                    }
+                ],
+            }
+        )
+
+
 def test_chat_request_rejects_self_referential_parent_run() -> None:
     """parentRunId 必须选择已有分支点，不能引用当前 run"""
 
@@ -138,7 +254,9 @@ def test_chat_request_rejects_self_referential_parent_run() -> None:
         )
 
 
-def test_from_agui_preserves_standard_roles_multimodal_content_and_extensions() -> None:
+def test_from_agui_rejects_full_history_and_multimodal_content_for_current_ui() -> None:
+    """当前 UI 尚未提供附件历史时不得执行后再静默丢失输入"""
+
     protocol_input = RunAgentInput.model_validate(
         {
             "threadId": "thread-1",
@@ -214,74 +332,44 @@ def test_from_agui_preserves_standard_roles_multimodal_content_and_extensions() 
         }
     )
 
-    request = ChatRequest.from_agui(protocol_input)
-    normalized = request.normalized_json(
-        thread_id="thread-1",
-        message_ids=tuple(f"server-{index}" for index in range(7)),
-    )
-    normalized_model = RunAgentInput.model_validate(normalized)
-
-    assert [message["role"] for message in request.messages] == [
-        "developer",
-        "system",
-        "assistant",
-        "user",
-        "tool",
-        "activity",
-        "reasoning",
-    ]
-    assert all("id" not in message for message in request.messages)
-    assert normalized_model.messages[3].content == protocol_input.messages[3].content
-    assert normalized_model.forwarded_props["trace"] == {"sampled": True}
-    assert normalized_model.tools[0].model_extra == {"vendor": "kept"}
-    assert normalized_model.context[0].model_extra == {"vendor": "kept"}
+    with pytest.raises(ValidationError, match="一条文本 user 消息"):
+        ChatRequest.from_agui(protocol_input)
 
 
-def test_multimodal_start_maps_only_the_selected_user_input_to_graph() -> None:
-    request = ChatRequest.from_agui(
-        RunAgentInput.model_validate(
-            {
-                "threadId": "",
-                "runId": "run-multimodal",
-                "state": {},
-                "messages": [
-                    {"id": "system-1", "role": "system", "content": "不注入"},
-                    {
-                        "id": "user-1",
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": "分析附件"},
-                            {
-                                "type": "image",
-                                "source": {
-                                    "type": "url",
-                                    "value": "https://example.test/chart.png",
-                                    "mimeType": "image/png",
+def test_multimodal_start_is_rejected_until_history_support_is_complete() -> None:
+    with pytest.raises(ValidationError, match="非空文本 user 消息"):
+        ChatRequest.from_agui(
+            RunAgentInput.model_validate(
+                {
+                    "threadId": "",
+                    "runId": "run-multimodal",
+                    "state": {},
+                    "messages": [
+                        {
+                            "id": "user-1",
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "分析附件"},
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "url",
+                                        "value": "https://example.test/chart.png",
+                                        "mimeType": "image/png",
+                                    },
                                 },
-                            },
-                        ],
+                            ],
+                        },
+                    ],
+                    "tools": [],
+                    "context": [],
+                    "forwardedProps": {
+                        "model": "main",
+                        "command": {"plan": "off"},
                     },
-                ],
-                "tools": [],
-                "context": [],
-                "forwardedProps": {"model": "main", "command": {"plan": "off"}},
-            }
+                }
+            )
         )
-    )
-
-    intent = classify_intent(request)
-
-    assert isinstance(intent, StartChatIntent)
-    assert intent.message_index == 1
-    assert intent.title == "分析附件"
-    assert intent.graph_message.content == [
-        {"type": "text", "text": "分析附件"},
-        {
-            "type": "image",
-            "url": "https://example.test/chart.png",
-            "mime_type": "image/png",
-        },
-    ]
 
 
 def test_client_message_id_does_not_change_the_canonical_business_snapshot() -> None:

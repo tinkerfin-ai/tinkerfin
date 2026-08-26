@@ -3,7 +3,6 @@
 set -eu
 
 PASSWORD=$(cat /run/secrets/mysql_password)
-EXPECTED_TABLES='agent_models conversation_events conversation_interrupts conversation_messages conversation_runs conversation_threads store store_migrations tinkerfin_opensandbox_cleanup tinkerfin_opensandbox_owners tinkerfin_opensandbox_schema_versions tinkerfin_opensandbox_warm_slots tinkerfin_opensandbox_workers users'
 
 mysql_command() {
     MYSQL_PWD="${PASSWORD}" mysql \
@@ -24,13 +23,10 @@ until mysql_command --execute 'SELECT 1' >/dev/null 2>&1; do
     sleep 2
 done
 
-actual=$(mysql_command --batch --skip-column-names --execute 'SHOW TABLES' | sort | tr '\n' ' ' | sed 's/ $//')
-if [ -z "${actual}" ]; then
+first_table=$(mysql_command --batch --skip-column-names --execute 'SHOW TABLES' | sed -n '1p')
+if [ -z "${first_table}" ]; then
     mysql_command < /opt/tinkerfin/schema.sql
     printf '已初始化 Studio 数据库结构\n'
-elif [ "${actual}" = "${EXPECTED_TABLES}" ]; then
-    printf 'Studio 数据库结构已存在\n'
 else
-    printf 'ERROR: 数据库不是空库且与当前完整结构不一致\n' >&2
-    exit 1
+    printf 'Studio 数据库已存在，跳过初始化\n'
 fi

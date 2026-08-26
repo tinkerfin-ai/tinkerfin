@@ -9,16 +9,14 @@
 | API | 什么时候用 | 主要参数或结果 |
 | --- | --- | --- |
 | `TinkerFin(run_coordinator=None, state_schema=None)` | 创建统一入口 | 可选共享 coordinator 和 Definition 级 state |
-| `TinkerFin.plan(...)` | 创建不可变的 Plan-capable factory | 能力和 mode 默认值、可选 Planner 模型、澄清表单与计划内容 Schema |
+| `TinkerFin.plan(...)` | 创建不可变的 Plan-capable factory | 能力和 mode 默认值、可选 Planner 模型、澄清表单、计划内容 Schema 与审阅动作 |
 | `TinkerFin.create_deep_agent(...)` | 创建可重复生成 Runtime 的 Agent 定义 | 参数见[创建和运行 Deep Agent](deep-agents.md) |
 | `Identity(threadId=..., runId=...)` | 表示一次框架运行 | 只包含 thread 和 run |
-| `TinkerFin.run(...)` | 运行自己的异步事件源 | `source_factory`、`identity`、`on_part` |
 | `DeepAgentDefinition.new(...)` | 创建原生 Runtime | 必填 `identity`，可选本次请求 `mode` 和 `on_part` |
 | `DeepAgentDefinition.new_agui(...)` | 创建 AG-UI Runtime | 必填 canonical `identity`；可选 parent、mode、resume、checkpoint callback 与 observer |
 
-`DeepAgentDefinition` 可以重复使用。`DeepAgentRuntime`、`DeepAgentAgUiRuntime`、
-`DeepAgentAgUiResumeRuntime`、`TinkerFinRun` 和 `NativeTinkerFinRun` 都是一次性运行对象，
-不要自行构造。
+`DeepAgentDefinition` 可以重复使用。`DeepAgentRuntime`、`DeepAgentAgUiRuntime` 和
+`DeepAgentAgUiResumeRuntime` 都是一次性运行对象，不要自行构造。
 
 `.plan(enabled=True)` 只影响从返回 factory 创建的 Definition，不会给
 `create_deep_agent(...)` 增加参数。返回 factory 保留 coordinator 和全局 state schema。
@@ -50,6 +48,10 @@ Planning 状态以 camel case JSON 保存在 `tinkerfin_plan`；批准 handoff �
 宿主 Schema 声明稳定 `schema_id`；运行时校验并计算 JSON Schema fingerprint，在恢复时拒绝
 Schema 漂移。被审阅的草稿与 `ConfirmedPlan` 始终使用同一个冻结内容 Schema。
 
+`.plan(review_actions=...)` 接受一组有序、非空且不重复的 `PlanReviewAction`。默认动作为
+`APPROVE`、`RESPOND` 和 `REJECT`，interrupt 的响应 Schema 只包含实际配置的动作。只有宿主
+提供可信计划编辑器时才应显式加入 `EDIT`。
+
 `.plan(clarification_schema=...)` 接受宿主定义的一个完全具体的
 `ClarificationFormBase` 子类；省略时使用 `DefaultClarificationForm`。Python 使用
 `allow_free_text`，JSON 使用 `allowFreeText`，每道问题都显式提供 `required`。Option 回答只包含
@@ -67,7 +69,6 @@ reducer、`Required` / `NotRequired` 和 schema metadata 会保留；同名字�
 
 | API | 用法 |
 | --- | --- |
-| `GraphRunStream` | 异步迭代普通对象；支持 `aclose()` 和 `to_sse()` |
 | `NativeGraphRunStream` | 异步迭代规范化的 LangGraph v2 数据，可直接交给 Messaging |
 | `AgUiEventStream` | 异步迭代 AG-UI 事件；支持 `abort()`、`aclose()` 和 `to_sse()` |
 | `SseBody` | 异步迭代 SSE 字符串；先 `prepare()`，结束时 `aclose()` |
@@ -94,15 +95,13 @@ reducer、`Required` / `NotRequired` 和 schema metadata 会保留；同名字�
 
 通常由 Runtime 自动创建，不需要手工拼装。
 
-## AG-UI 原生流配置
+## AG-UI 流预检
 
-| API | 参数 | 作用 |
-| --- | --- | --- |
-| `AgUiNativeStreamConfig` | `extra_modes=()` | 声明 AG-UI 基础模式之外允许的额外模式 |
-| `.bind(astream, *args, **options)` | 流函数及其调用参数 | 生成一次绑定好的原生流调用 |
-| `AgUiNativeStreamInvocation` | 无需手工创建 | 交给 `TinkerFin.run()` |
-
-配置错误会抛出 `AgUiNativeStreamConfigurationError`。
+`new_agui()` 固定使用 `messages`、`tasks`、`values`、`version="v2"` 和
+`subgraphs=True`。调用方可以通过 Runtime 的 `astream(stream_mode=...)` 增加
+`updates`、`checkpoints`、`debug` 或 `custom`。缺少必需 mode、重复或不支持的 mode、
+冲突的 version、关闭 subgraphs 都会在 Graph 或 coordinator 产生副作用前抛出
+`AgUiNativeStreamConfigurationError`。
 
 ## SSE 类型
 
@@ -119,6 +118,7 @@ reducer、`Required` / `NotRequired` 和 schema metadata 会保留；同名字�
 | --- | --- |
 | `PartObserver` | 观察原生数据的异步函数 |
 | `EventObserver` | 观察 AG-UI 事件的异步函数 |
+| `join_task(task, cancel=False, suppress_task_cancellation=False)` | owned task 完整结算后再传播调用方取消 |
 | `RunCoordinator` | 自定义运行互斥边界 |
 | `InMemoryRunCoordinator(key_resolver=...)` | 当前进程内按业务 key 串行运行 |
 
@@ -131,7 +131,7 @@ reducer、`Required` / `NotRequired` 和 schema metadata 会保留；同名字�
 | `RedisLease` | `hold()` 返回的不可变资源 key 与 fencing token |
 | `RedisLeaseLost` | 续期不确定、租约过期或所有权丢失 |
 
-构造参数、默认值和连接池要求见[自定义事件源与并发协调](extensions.md#如果需要通用-redis-租约锁)。
+构造参数、默认值和连接池要求见[运行协调与 Redis 租约](extensions.md#如果需要通用-redis-租约锁)。
 
 ## 恢复和错误
 
@@ -143,20 +143,23 @@ reducer、`Required` / `NotRequired` 和 schema metadata 会保留；同名字�
 | `AgUiSettlementTimeoutError` | 调用方停止等待，但 Runtime 的清理仍未在限定时间内完成 |
 | `AgUiNativeStreamConfigurationError` | 原生流配置不符合 AG-UI 转换要求 |
 
-`TinkerFinRun.astream_agui(...)` 和 `NativeTinkerFinRun.astream_agui(...)` 用于把低层 source 转成 AG-UI。
+`DeepAgentDefinition.new_agui(...)` 使用以下请求级参数：
 
 | 参数 | 默认值 | 作用 |
 | --- | --- | --- |
+| `identity` | 必填 | canonical thread 与 run 身份 |
+| `parent_run_id` | `None` | `RUN_STARTED` 暴露的可选 checkpoint 谱系 |
+| `mode` | Definition 默认值 | 为本次请求选择原生 default 或 Plan 路径 |
 | `timeout` | `None` | 等待原生数据的总时限 |
 | `settlement_timeout` | `None` | 调用方等待安全清理的时限 |
 | `expose_reasoning_events` | `False` | 是否交付支持的推理事件 |
 | `expose_subagent_events` | `True` | 是否交付子 Agent 事件 |
-| `prior_tool_call_ids` | `frozenset()` | 恢复前已经发送完成的 scoped Tool ID |
-| `private_state_keys` | `frozenset()` | 不进入公开投影的宿主顶层 state channel |
+| `resume` | `None` | 恢复请求使用的完整可信 `AgUiResumeBinding` |
+| `on_resume_checkpointed` | `None` | 确切 resume marker 可读取后的幂等 callback |
 | `on_event` | `None` | AG-UI 事件交付前的观察函数 |
-| `parent_run_id` | `None` | `RUN_STARTED` 暴露的可选 checkpoint 谱系 |
 
-运行身份已经在 `TinkerFin.run(..., identity=...)` 中绑定，`astream_agui()` 不再重复接收 ID。
+返回的 Runtime 保留已安装 Graph 的 `astream(...)` 参数形状。框架会把同一个 `Identity`
+写入 Graph 配置，`astream()` 不再接收第二套 Runtime 身份。
 
 `AgUiResumeBinding.from_agui(...)` 校验完整可信 AG-UI interrupt 与 entries，包括原生分组、
 取消模式、Tool ID 与来源 Agent。Binding 不保存 identity 或 parent，也不公开原生 command；宿主可把

@@ -1,0 +1,134 @@
+import { ChevronDown, ChevronUp } from 'lucide-react'
+import type { ReactNode, RefObject } from 'react'
+
+import { IconButton } from '../../../components/ui'
+import { ActivityDots } from './ActivityDots'
+
+type PlanInteractionKind = 'question' | 'review'
+
+const namespaceFor = (kind: PlanInteractionKind) => (
+  kind === 'question' ? 'plan-question-composer' : 'plan-review-composer'
+)
+
+export function PlanInteractionStatusRow({
+  kind,
+  icon,
+  label,
+  pendingStatus,
+  submittedStatus,
+  submitted,
+}: {
+  kind: PlanInteractionKind
+  icon: ReactNode
+  label: string
+  pendingStatus: string
+  submittedStatus: string
+  submitted: boolean
+}) {
+  const namespace = kind === 'question' ? 'plan-question' : 'plan-review'
+  const status = submitted ? submittedStatus : pendingStatus
+  return (
+    <div className={`plan-interaction-wait-state ${namespace}-wait-state`}>
+      <div
+        className={`plan-interaction-status-row ${namespace}-status-row`}
+        role={submitted ? 'status' : undefined}
+      >
+        {icon}
+        <span className="plan-interaction-status-label">{label}</span>
+        <span
+          className={`plan-interaction-status-separator ${namespace}-status-separator`}
+          aria-hidden="true"
+        />
+        <span>{status}</span>
+      </div>
+      {!submitted && <ActivityDots label={pendingStatus} />}
+    </div>
+  )
+}
+
+export function PlanInteractionCard({
+  kind,
+  ariaLabel,
+  minimized,
+  icon,
+  title,
+  titleMeta,
+  description,
+  toggleSurfaceLabel,
+  toggleLabel,
+  onToggle,
+  bodyRef,
+  headerAction,
+  minimizedContent,
+  children,
+}: {
+  kind: PlanInteractionKind
+  ariaLabel: string
+  minimized: boolean
+  icon: ReactNode
+  title: ReactNode
+  titleMeta?: ReactNode
+  description: ReactNode
+  toggleSurfaceLabel: string
+  toggleLabel: string
+  onToggle: () => void
+  bodyRef: RefObject<HTMLDivElement | null>
+  headerAction?: ReactNode
+  minimizedContent?: ReactNode
+  children: ReactNode
+}) {
+  const namespace = namespaceFor(kind)
+  const toggleSurfaceClass = kind === 'question'
+    ? 'plan-question-toggle-surface'
+    : 'plan-review-toggle-surface'
+  return (
+    <section
+      className={`plan-interaction-card ${namespace}${minimized ? ' is-minimized' : ''}`}
+      aria-label={ariaLabel}
+      onWheel={(event) => {
+        // 卡片接管输入区后，外部滚轮只驱动卡片正文，避免误滚动会话历史
+        const body = bodyRef.current
+        if (!body || body.scrollHeight <= body.clientHeight) {
+          event.preventDefault()
+          event.stopPropagation()
+          return
+        }
+        if (!body.contains(event.target as Node)) {
+          event.preventDefault()
+          event.stopPropagation()
+          body.scrollTop += event.deltaY
+        }
+      }}
+    >
+      <header className={`plan-interaction-card-head ${namespace}-head`}>
+        <button
+          type="button"
+          className={`plan-interaction-toggle-surface ${toggleSurfaceClass}`}
+          aria-label={toggleSurfaceLabel}
+          onClick={onToggle}
+        />
+        <div className={`plan-interaction-card-heading ${namespace}-heading`}>
+          <h2>
+            {icon}
+            <span>{title}</span>
+            {titleMeta && <small>{titleMeta}</small>}
+          </h2>
+          <p>{description}</p>
+        </div>
+        <div className={`plan-interaction-card-head-actions ${namespace}-head-actions`}>
+          <IconButton
+            size="sm"
+            className={`plan-interaction-card-head-button ${namespace}-head-button`}
+            label={toggleLabel}
+            tooltip={toggleLabel}
+            icon={minimized ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+            aria-expanded={!minimized}
+            onClick={onToggle}
+          />
+          {headerAction}
+        </div>
+      </header>
+      {minimized ? minimizedContent : children}
+    </section>
+  )
+}

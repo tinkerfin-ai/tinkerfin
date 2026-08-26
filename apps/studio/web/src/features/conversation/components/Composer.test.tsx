@@ -33,10 +33,14 @@ describe('Composer', () => {
 
     const fallback = container.querySelector('.composer-default')
     const input = screen.getByLabelText('消息输入')
+    const note = screen.getByText('TinkerFin 可能会犯错，请核对重要信息')
     expect(fallback).toHaveClass('is-taken-over')
     expect(fallback).toHaveAttribute('inert')
     expect(input).toBeInTheDocument()
     expect(screen.getByRole('region', { name: '澄清接管' })).toBeVisible()
+    expect(note).toBeVisible()
+    expect(fallback).not.toContainElement(note)
+    expect(container.querySelector('.composer-takeover')).not.toContainElement(note)
 
     rerender(
       <Composer
@@ -51,6 +55,7 @@ describe('Composer', () => {
     expect(fallback).not.toHaveClass('is-taken-over')
     expect(input).toHaveFocus()
     expect(input).toHaveValue('保留的草稿')
+    expect(screen.getByText('TinkerFin 可能会犯错，请核对重要信息')).toBe(note)
     animation.mockRestore()
   })
 

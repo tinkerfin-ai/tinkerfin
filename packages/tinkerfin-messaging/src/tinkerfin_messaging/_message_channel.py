@@ -10,6 +10,7 @@ __all__ = [
     "_validate_page",
     "_validate_profile_types",
     "_wrap",
+    "get_run_status",
 ]
 
 from collections.abc import AsyncIterator, Callable
@@ -24,11 +25,12 @@ from ._messaging_boundary import (
     _normalize_cancel_callback,
     _validate_optional_cursor,
 )
-from .backend import BackendRunHandle, PreparedRun
+from .backend import BackendRunHandle, PreparedRun, RunStatus
 from .errors import (
     BackendOwnershipLost,
     CodecMismatch,
     InvalidCursor,
+    MessagingBackendProtocolError,
     RunProducerFailed,
     SourceProfileMismatch,
 )
@@ -53,6 +55,9 @@ SourceT = TypeVar("SourceT")
 ReplayT = TypeVar("ReplayT")
 ProfileSourceT = TypeVar("ProfileSourceT")
 ProfileReplayT = TypeVar("ProfileReplayT")
+_RUN_STATUSES = frozenset(
+    {"running", "cancel_requested", "completed", "cancelled", "failed", "owner_lost"}
+)
 
 
 def _resolve_identity(source: object, identity: Identity | None) -> Identity:
@@ -221,6 +226,38 @@ async def latest_seq(
         )
         self._messaging._require_open()
         return latest
+    finally:
+        self._messaging._finish_preflight(preflight)
+
+
+async def get_run_status(
+    self: MessageChannel[SourceT, ReplayT],
+    *,
+    identity: Identity,
+) -> RunStatus:
+    """Return one durable run's current authoritative status."""
+
+    preflight = self._messaging._begin_preflight()
+    try:
+        required_identity(identity)
+        self._messaging._require_open()
+        status: object = await _await_backend(
+            "get_run_status",
+            self._messaging.backend.get_run_status(
+                channel=self.name,
+                identity=identity,
+            ),
+        )
+        self._messaging._require_open()
+        if not isinstance(status, str) or status not in _RUN_STATUSES:
+            raise MessagingBackendProtocolError(
+                "Messaging backend returned an invalid run status",
+                diagnostic_context={
+                    "operation": "get_run_status",
+                    "actual_type": type(status).__name__,
+                },
+            )
+        return status
     finally:
         self._messaging._finish_preflight(preflight)
 

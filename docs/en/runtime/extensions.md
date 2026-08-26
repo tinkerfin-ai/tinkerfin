@@ -1,73 +1,14 @@
-# Custom sources and run coordination
+# Run coordination and Redis leases
 
 [Streams and SSE](streams-and-sse.md) · [中文](../../zh/runtime/extensions.md)
 
-Most Deep Agents applications only need `create_deep_agent()`. Use the lower-level features here when you already have an asynchronous source or must serialize runs for one business identity.
-
-## Run your own asynchronous source
-
-The source factory must return a new asynchronous iterator each time it is called.
-
-```python
-import asyncio
-from collections.abc import AsyncIterator
-
-from tinkerfin import Identity, TinkerFin
-
-
-async def source() -> AsyncIterator[dict[str, object]]:
-    yield {"step": 1, "message": "started"}
-    await asyncio.sleep(0.1)
-    yield {"step": 2, "message": "finished"}
-
-
-run = TinkerFin().run(source)
-stream = run.astream()
-
-async for item in stream:
-    print(item)
-```
-
-### `TinkerFin.run()` parameters
-
-| Parameter | Default | Purpose |
-| --- | --- | --- |
-| `source_factory` | required | Creates an async iterator, or is a bound `AgUiNativeStreamInvocation` |
-| `identity` | `None` | Optional for stateless custom sources; required for coordination, AG-UI, or Messaging |
-| `on_part` | `None` | Observer called before each item is delivered |
-
-Do not reuse an async generator that has already started.
-
-## Convert a native v2 source to AG-UI
-
-If your source already emits LangGraph v2 parts, bind it to the required AG-UI stream profile:
-
-```python
-from tinkerfin import AgUiNativeStreamConfig, TinkerFin
-
-
-invocation = AgUiNativeStreamConfig().bind(
-    graph.astream,
-    graph_input,
-    config,
-)
-identity = Identity(threadId="thread-1", runId="run-1")
-run = TinkerFin().run(invocation, identity=identity)
-events = run.astream_agui()
-```
-
-`AgUiNativeStreamConfig` requires `messages`, `tasks`, `values`, `version="v2"`, and `subgraphs=True`. Add supported diagnostic modes when needed:
-
-```python
-config = AgUiNativeStreamConfig(extra_modes=("custom",))
-```
-
-Conflicting stream options fail before the run starts.
+Configure a run coordinator when matching business identities must not execute at the
+same time. The coordinator applies to every Runtime created by that TinkerFin factory.
 
 ## Serialize runs for one identity
 
 ```python
-from tinkerfin import InMemoryRunCoordinator, TinkerFin
+from tinkerfin import Identity, InMemoryRunCoordinator, TinkerFin
 
 
 coordinator = InMemoryRunCoordinator(
@@ -76,10 +17,13 @@ coordinator = InMemoryRunCoordinator(
 tinkerfin = TinkerFin(run_coordinator=coordinator)
 
 identity = Identity(threadId="tenant-7/user-42", runId="run-1")
-run = tinkerfin.run(source, identity=identity)
+agent = tinkerfin.create_deep_agent(model=model, tools=tools)
+runtime = agent.new(identity=identity)
+stream = runtime.astream(graph_input)
 ```
 
-Every coordinated run needs an `Identity`. A custom source without a coordinator may omit it, but then it has no durable identity profile for Messaging.
+Every Runtime has an `Identity`. The coordinator receives that same complete value and
+holds its scope for the lifetime of the native or AG-UI stream.
 
 The built-in coordinator only covers the current process. If several processes must share locks, implement `RunCoordinator` with a shared lock service:
 

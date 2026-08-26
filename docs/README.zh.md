@@ -84,7 +84,6 @@ asyncio.run(main())
   `parent_run_id` 会创建真实 checkpoint 分支
 - 恢复请求通过 `AgUiResumeBinding.from_agui(...)` 构造；Runtime 自己管理原生 Command、
   Tool 关联、取消与持久 checkpoint 证据
-- `TinkerFin.run(...)` 用于自定义异步源
 
 ## 文档
 
@@ -93,6 +92,7 @@ asyncio.run(main())
 - [AG-UI](zh/agui/index.md)
 - [Messaging](zh/messaging/index.md)
 - [Sandbox](zh/sandbox/index.md)
+- [仓库测试](zh/development/testing.md)
 - [核心包](../packages/tinkerfin/README.md)
 - [AG-UI adapter](../packages/tinkerfin-agui-adapter/README.md)
 - [Studio 服务端](../apps/studio/server/README.md)

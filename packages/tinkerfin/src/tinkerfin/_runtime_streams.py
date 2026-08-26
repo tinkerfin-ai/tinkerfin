@@ -28,7 +28,7 @@ from .sse import (
 )
 
 if TYPE_CHECKING:
-    from .runtime import GraphRunStream
+    from .runtime import _GraphRunStream
 
 PartT = TypeVar("PartT")
 
@@ -120,7 +120,7 @@ async def _resolve_sse_event_id(
     return await resolved
 
 
-async def __anext__(self: GraphRunStream[PartT]) -> PartT:
+async def __anext__(self: _GraphRunStream[PartT]) -> PartT:
     if self._closed:
         raise StopAsyncIteration
     current = cast(asyncio.Task[object] | None, asyncio.current_task())
@@ -154,7 +154,7 @@ async def __anext__(self: GraphRunStream[PartT]) -> PartT:
             self._active_task = None
 
 
-async def aclose(self: GraphRunStream[PartT]) -> None:
+async def aclose(self: _GraphRunStream[PartT]) -> None:
     """Close the native source and release coordination idempotently.
 
     Closure requested from a part-observer call chain preserves delivery of the
@@ -178,7 +178,7 @@ async def aclose(self: GraphRunStream[PartT]) -> None:
 
 
 def to_sse(
-    self: GraphRunStream[PartT],
+    self: _GraphRunStream[PartT],
     *,
     timeout: float | None = None,
     mapper: SseMapper[NativeStreamPart] | None = None,
@@ -250,7 +250,7 @@ def to_sse(
     return SseBody(source_factory=frames, close=self.aclose)
 
 
-async def _observe(self: GraphRunStream[PartT], part: PartT) -> None:
+async def _observe(self: _GraphRunStream[PartT], part: PartT) -> None:
     observer = self._on_part
     if observer is None:
         return
@@ -266,7 +266,7 @@ async def _observe(self: GraphRunStream[PartT], part: PartT) -> None:
         self._active_observers -= 1
 
 
-async def _start(self: GraphRunStream[PartT]) -> None:
+async def _start(self: _GraphRunStream[PartT]) -> None:
     coordination_factory = self._coordination_factory
     if coordination_factory is not None:
         try:
@@ -287,7 +287,7 @@ async def _start(self: GraphRunStream[PartT]) -> None:
     self._started = True
 
 
-async def _finish(self: GraphRunStream[PartT], error: BaseException | None) -> None:
+async def _finish(self: _GraphRunStream[PartT], error: BaseException | None) -> None:
     task = self._finish_task
     if task is None:
         self._closed = True
@@ -300,7 +300,7 @@ async def _finish(self: GraphRunStream[PartT], error: BaseException | None) -> N
 
 
 async def _finish_once(
-    self: GraphRunStream[PartT], error: BaseException | None
+    self: _GraphRunStream[PartT], error: BaseException | None
 ) -> None:
     source = self._source
     self._source = None

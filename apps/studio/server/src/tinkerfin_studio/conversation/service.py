@@ -5,16 +5,18 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import TypeVar
 
 from ag_ui.core import BaseEvent
 from langchain.agents.middleware.types import InputAgentState
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from tinkerfin import AgUiResumeCheckpoint
+from tinkerfin import AgUiResumeCheckpoint, join_task
 from tinkerfin_messaging.errors import (
     MessagingError,
     MessagingErrorCode,
+    RunNotFound,
+    RunProducerFailed,
+    StreamDeleted,
 )
 from tinkerfin_messaging.models import MessageEnvelope
 from tinkerfin_messaging.protocols import ProfiledMessageSource
@@ -47,8 +49,6 @@ from tinkerfin_studio.models.repository import AgentModelRepository
 from tinkerfin_studio.models.schemas import AgentModelConfig
 from tinkerfin_studio.models.service import AgentModelService
 from tinkerfin_studio.resources import ApplicationResources
-
-_TaskResult = TypeVar("_TaskResult")
 
 _MESSAGING_ERRORS: dict[
     MessagingErrorCode,
@@ -137,17 +137,6 @@ _MESSAGING_ERRORS: dict[
         False,
     ),
 }
-
-
-async def _settle_owned_task(task: asyncio.Task[_TaskResult]) -> _TaskResult:
-    """在已有主异常后忽略重复取消，直到受保护任务完成"""
-
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            continue
-    return task.result()
 
 
 def parse_last_event_id(value: str | None) -> int | None:
@@ -241,11 +230,43 @@ class ConversationChatService:
             user_id=self._user.user_id,
             projector=self._resources.conversation_projector,
         )
-        thread = await run_preparer.resolve_thread(
+        resolved_thread = await run_preparer.resolve_thread(
             request,
             intent=intent,
-            model_id=model.model_id,
         )
+        thread = resolved_thread.thread
+        # 释放 thread 查询产生的只读事务，恢复检查不得占用请求连接或数据库锁
+        await self._repository.commit()
+        deleted_threads = (
+            await self._resources.conversation_projector.recover_preparing(
+                thread_pk=thread.id,
+            )
+        )
+        if thread.id in deleted_threads:
+            if request.thread_id:
+                raise BusinessException(ConversationErrorCode.NOT_FOUND)
+            resolved_thread = await run_preparer.resolve_thread(
+                request,
+                intent=intent,
+            )
+            thread = resolved_thread.thread
+        if thread.last_run_id and thread.last_run_id != request.run_id:
+            # 用户发送下一条消息前先追上上一 run 的最终审批，避免投影延迟绕过卡片
+            previous_identity = conversation_identity(
+                thread.thread_id,
+                thread.last_run_id,
+            )
+            try:
+                previous_status = (
+                    await self._resources.conversation_projector.reconcile_and_settle(
+                        thread_pk=thread.id,
+                        identity=previous_identity,
+                    )
+                )
+            except (RunNotFound, StreamDeleted):
+                previous_status = None
+            if previous_status in {"running", "cancel_requested"}:
+                raise BusinessException(ConversationErrorCode.RUN_CONFLICT)
         prepared = prepare_run_request(
             request,
             user_id=self._user.user_id,
@@ -258,6 +279,7 @@ class ConversationChatService:
                 prepared=prepared,
                 model=model,
                 thread=thread,
+                thread_created=resolved_thread.created,
             )
         except MessagingError as error:
             raise self._messaging_error(error) from error
@@ -277,10 +299,11 @@ class ConversationChatService:
                 thread_pk=execution.thread.id,
                 identity_run_id=prepared.identity.run_id,
                 registered=execution.registered,
+                thread_created=execution.thread_created,
             ),
             name=f"studio-conversation-cleanup:{prepared.identity.run_id}",
         )
-        await _settle_owned_task(task)
+        await join_task(task)
 
     def _create_events(
         self,
@@ -360,10 +383,34 @@ class ConversationChatService:
                         thread_pk=execution.thread.id,
                         identity_run_id=prepared.identity.run_id,
                         registered=execution.registered,
+                        thread_created=execution.thread_created,
                     ),
                     name=f"studio-conversation-cleanup:{prepared.identity.run_id}",
                 )
-            await _settle_owned_task(cleanup_task)
+            await join_task(cleanup_task)
+
+        async def settle_interrupted_preflight() -> BaseException | None:
+            """完成预握手的业务清理或关闭，并返回次要失败"""
+
+            try:
+                interrupted_body = await preflight
+            except BaseException as preflight_error:  # noqa: BLE001 - owned task 终态
+                try:
+                    await cleanup()
+                except BaseException as cleanup_error:  # noqa: BLE001 - 保留两项失败
+                    preflight_error.add_note(
+                        "会话预握手清理同时失败: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                return preflight_error
+            close = getattr(interrupted_body, "aclose", None)
+            if close is None:
+                return None
+            try:
+                await close()
+            except BaseException as close_error:  # noqa: BLE001 - 返回给原取消附注
+                return close_error
+            return None
 
         preflight = asyncio.create_task(
             self._resources.conversation_channel.sse(
@@ -373,37 +420,45 @@ class ConversationChatService:
             ),
             name=f"studio-conversation-preflight:{prepared.identity.run_id}",
         )
+        current = asyncio.current_task()
         try:
             body = await asyncio.shield(preflight)
         except asyncio.CancelledError as cancellation:
+            caller_cancelled = current is not None and current.cancelling() > 0
+            settlement = asyncio.create_task(
+                settle_interrupted_preflight(),
+                name=f"studio-conversation-preflight-settlement:{prepared.identity.run_id}",
+            )
             try:
-                body = await _settle_owned_task(preflight)
-            except Exception as preflight_error:  # noqa: BLE001 - 预握手失败必须释放未启动 run
-                await cleanup()
+                settlement_error = await join_task(settlement)
+            except asyncio.CancelledError as repeated_cancellation:
+                # join_task 已保证 settlement 完成；这里保留首次取消作为请求主因
+                settlement_error = settlement.result()
                 cancellation.add_note(
-                    "Messaging 预握手在 HTTP 取消后失败: "
-                    f"{type(preflight_error).__name__}"
+                    f"等待会话预握手结算期间再次收到调用方取消: {repeated_cancellation}"
                 )
-            else:
-                close = getattr(body, "aclose", None)
-                if close is not None:
-                    try:
-
-                        async def close_body() -> None:
-                            await close()
-
-                        close_task = asyncio.create_task(close_body())
-                        await _settle_owned_task(close_task)
-                    except Exception as close_error:  # noqa: BLE001 - 调用方取消优先于订阅关闭失败
-                        cancellation.add_note(
-                            f"SSE 订阅关闭失败: {type(close_error).__name__}"
-                        )
+            if settlement_error is not None:
+                stage = "HTTP 取消后" if caller_cancelled else "owned task 取消后"
+                cancellation.add_note(
+                    f"Messaging 预握手在{stage}结算失败: "
+                    f"{type(settlement_error).__name__}: {settlement_error}"
+                )
             raise cancellation
-        except MessagingError as error:
-            await cleanup()
-            raise self._messaging_error(error) from error
-        except (TypeError, ValueError):
-            await cleanup()
+        except BaseException as error:
+            try:
+                await cleanup()
+            except asyncio.CancelledError as cleanup_cancellation:
+                cleanup_cancellation.add_note(
+                    f"会话预握手同时失败: {type(error).__name__}: {error}"
+                )
+                raise
+            except BaseException as cleanup_error:  # noqa: BLE001 - 主失败必须保留
+                error.add_note(
+                    "会话预握手清理同时失败: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            if isinstance(error, MessagingError):
+                raise self._messaging_error(error) from error
             raise
         return body
 
@@ -426,9 +481,16 @@ class ConversationChatService:
             cancelled = await self._resources.conversation_channel.cancel(
                 identity=identity,
             )
+        except RunProducerFailed:
+            # run 已经失败时“停止”是幂等确认，用户应回到可重试状态而不是看到 500
+            await self._resources.conversation_projector.reconcile_and_settle(
+                thread_pk=thread_pk,
+                identity=identity,
+            )
+            return CancelRunResponse(cancelled=False)
         except MessagingError as error:
             raise self._messaging_error(error, operation="cancel") from error
-        await self._resources.conversation_projector.reconcile(
+        await self._resources.conversation_projector.reconcile_and_settle(
             thread_pk=thread_pk,
             identity=identity,
         )

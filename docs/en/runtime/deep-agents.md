@@ -85,6 +85,11 @@ Plan Mode routes a request through these boundaries:
 4. Approval freezes a `ConfirmedPlan`, commits a deterministic handoff using the
    original user message ID, and immediately starts the native Deep Agent.
 
+Plan review defaults to `PlanReviewAction.APPROVE`, `RESPOND`, and `REJECT`.
+Pass a non-empty, duplicate-free `review_actions` sequence to change the accepted
+decisions. The response Schema contains exactly that sequence; `EDIT` is available only
+when the host explicitly enables it and provides a trusted draft editor.
+
 Selecting Plan requires a concrete `BaseCheckpointSaver` and an explicit Planner model.
 TinkerFin never creates an in-process saver or silently weakens durability. Production
 applications must provide a production-grade saver. Planning and the native Deep Agent
@@ -112,8 +117,8 @@ agent = tinkerfin.plan(
 
 A custom content type inherits `PlanContentModel`, declares a stable `schema_id`, and
 uses precise Pydantic fields. The selected schema is immutable for the Definition and
-the same validated content is used for draft review, authoritative edits, confirmation,
-checkpoint recovery, and execution handoff.
+the same validated content is used for draft review, any explicitly enabled edit,
+confirmation, checkpoint recovery, and execution handoff.
 
 `mode="default"` directly runs the native Deep Agent Graph. It does not execute
 Planning, add middleware, replace state schema, or create a parent Graph. Native Todo,
@@ -143,9 +148,10 @@ explicit result for every checkpointed question, derives trusted option labels, 
 skip for a required question, and retains skipped answers as Planner context. A Planner
 must not repeat an optional question the user explicitly skipped in the same Plan cycle.
 
-A complete user edit is authoritative. The Planner either asks for missing information
-or accepts that exact edit; it cannot silently replace it. Clarification does not change
-the revision. The revision increments only when a complete draft becomes reviewable.
+When `PlanReviewAction.EDIT` is configured, a complete user edit is authoritative. The
+Planner either asks for missing information or accepts that exact edit; it cannot
+silently replace it. Clarification does not change the revision. The revision increments
+only when a complete draft becomes reviewable.
 
 Plan Mode fixes checkpoint durability to `sync`. Omitting `durability` is recommended;
 passing `sync` is also accepted, while `async` and `exit` fail before streaming.

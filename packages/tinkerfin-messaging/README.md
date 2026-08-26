@@ -60,6 +60,7 @@ A custom source must receive one explicit Identity. A profiled source may omit i
 | `wrap(source, identity=..., after=...)` | Start or attach and return decoded messages |
 | `sse(source, identity=..., after=...)` | Start or attach and return SSE bytes |
 | `wrap_recoverable(...)` | Rebuild a lost owner from a committed checkpoint |
+| `get_run_status(identity=...)` | Read one run's authoritative durable status |
 | `latest_seq(identity=...)` | Read the thread tail |
 | `read(identity=..., after=..., limit=...)` | Read a finite thread page |
 | `follow(identity=..., after=...)` | Follow one run to its terminal state |
@@ -68,6 +69,10 @@ A custom source must receive one explicit Identity. A profiled source may omit i
 | `delete_stream(identity=...)` | Delete an inactive thread generation |
 
 `Identity.runId` is the caller's idempotency key. Messaging does not store or compare business request bodies. Reuse an Identity only for retry, replay, or attachment to the same semantic run.
+
+`get_run_status()` returns `running`, `cancel_requested`, `completed`, `cancelled`,
+`failed`, or `owner_lost`. A leased backend can atomically classify an expired owner as
+`owner_lost` during this lookup; the method never grants producer ownership.
 
 ## Durable values
 

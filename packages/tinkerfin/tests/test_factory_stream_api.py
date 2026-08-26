@@ -1,20 +1,48 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+import inspect
+from collections.abc import AsyncIterator, Callable
 from typing import cast
 
 import pytest
 from ag_ui.core import BaseEvent
+from langchain.agents.middleware.types import InputAgentState
+from langgraph.graph.state import CompiledStateGraph
 
-from tinkerfin import Identity, TinkerFin
+from tinkerfin import DeepAgentDefinition, Identity
 
 
 def _identity() -> Identity:
     return Identity(threadId="thread-1", runId="run-1")
 
 
+def _graph_input() -> InputAgentState:
+    return InputAgentState(messages=[])
+
+
+class _SourceGraph:
+    def __init__(self, source_factory: Callable[[], AsyncIterator[object]]) -> None:
+        self._source_factory = source_factory
+
+    def astream(
+        self,
+        *_args: object,
+        **_options: object,
+    ) -> AsyncIterator[object]:
+        return self._source_factory()
+
+
+setattr(
+    _SourceGraph.astream,
+    "__signature__",
+    inspect.signature(CompiledStateGraph.astream),
+)
+
+
 @pytest.mark.asyncio
-async def test_run_binds_one_lazy_zero_argument_source_factory() -> None:
+async def test_native_facade_binds_one_lazy_graph_source(
+    definition_factory: Callable[..., DeepAgentDefinition[None]],
+) -> None:
     calls = 0
     closed = False
     observed: list[object] = []
@@ -36,8 +64,11 @@ async def test_run_binds_one_lazy_zero_argument_source_factory() -> None:
     async def on_part(value: object) -> None:
         observed.append(value)
 
-    run = TinkerFin().run(source, on_part=on_part)
-    stream = run.astream()
+    runtime = definition_factory(_SourceGraph(source)).new(
+        identity=_identity(),
+        on_part=on_part,
+    )
+    stream = runtime.astream(_graph_input())
 
     assert calls == 0
     assert await anext(stream) is part
@@ -49,23 +80,25 @@ async def test_run_binds_one_lazy_zero_argument_source_factory() -> None:
     assert closed is True
 
 
-def test_run_allows_exactly_one_object_stream_claim() -> None:
+def test_native_facade_allows_exactly_one_stream_claim(
+    definition_factory: Callable[..., DeepAgentDefinition[None]],
+) -> None:
     async def source() -> AsyncIterator[object]:
         if False:  # pragma: no cover - provides the source shape only
             yield None
 
-    run = TinkerFin().run(source)
+    runtime = definition_factory(_SourceGraph(source)).new(identity=_identity())
 
-    run.astream()
+    runtime.astream(_graph_input())
 
     with pytest.raises(RuntimeError, match="one object stream"):
-        run.astream()
+        runtime.astream(_graph_input())
 
 
 @pytest.mark.asyncio
-async def test_astream_agui_converts_the_bound_factory_without_a_parts_argument() -> (
-    None
-):
+async def test_astream_agui_converts_the_bound_factory_without_a_parts_argument(
+    definition_factory: Callable[..., DeepAgentDefinition[None]],
+) -> None:
     async def source() -> AsyncIterator[object]:
         yield {
             "type": "values",
@@ -79,13 +112,11 @@ async def test_astream_agui_converts_the_bound_factory_without_a_parts_argument(
     async def on_event(event: BaseEvent) -> None:
         observed.append(event)
 
-    events = (
-        TinkerFin()
-        .run(source, identity=_identity())
-        .astream_agui(
-            on_event=on_event,
-        )
+    runtime = definition_factory(_SourceGraph(source)).new_agui(
+        identity=_identity(),
+        on_event=on_event,
     )
+    events = runtime.astream(_graph_input())
     delivered = [event async for event in events]
 
     assert [event.type.value for event in delivered] == [
@@ -97,11 +128,17 @@ async def test_astream_agui_converts_the_bound_factory_without_a_parts_argument(
 
 
 @pytest.mark.asyncio
-async def test_run_rejects_a_factory_result_without_async_iteration() -> None:
+async def test_native_facade_rejects_a_graph_result_without_async_iteration(
+    definition_factory: Callable[..., DeepAgentDefinition[None]],
+) -> None:
     def source() -> AsyncIterator[object]:
         return cast(AsyncIterator[object], object())
 
-    stream = TinkerFin().run(source).astream()
+    stream = (
+        definition_factory(_SourceGraph(source))
+        .new(identity=_identity())
+        .astream(_graph_input())
+    )
 
     with pytest.raises(
         TypeError,

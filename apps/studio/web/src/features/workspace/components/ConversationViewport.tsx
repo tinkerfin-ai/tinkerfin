@@ -3,17 +3,14 @@ import { useMemo, type RefObject } from 'react'
 
 import { Button, ErrorBoundary, OverlayScrollbar } from '../../../components/ui'
 import type {
-  ApprovalState,
   Conversation,
   Message,
-  PlanInteraction,
-  PlanReviewState,
 } from '../../../types'
 import { ActivityDots } from '../../conversation/components/ActivityDots'
-import { ApprovalCard } from '../../conversation/components/ApprovalCard'
+import { ApprovalStatusRow } from '../../conversation/components/ApprovalCard'
 import { ConversationNotice, MessageBlock, ToolCallBatch } from '../../conversation/components/MessageBlock'
 import { PlanQuestionStatusRow } from '../../conversation/components/PlanQuestionComposer'
-import { PlanReviewCard } from '../../conversation/components/PlanReviewCard'
+import { PlanReviewStatusRow } from '../../conversation/components/PlanReviewCard'
 import { EmptyConversation } from './EmptyConversation'
 import { WorkspaceStatus } from './WorkspaceStatus'
 import { useI18n } from '../../../i18n'
@@ -73,10 +70,6 @@ export function ConversationViewport({
   onUserScrollIntent,
   onRetryHistory,
   onRetryHydration,
-  onChangeApproval,
-  onSubmitApproval,
-  onChangePlan,
-  onSubmitPlan,
   onLoadEarlierMessages,
   onScrollToBottom,
   onScrollToBottomPointerEnter,
@@ -102,10 +95,6 @@ export function ConversationViewport({
   onUserScrollIntent: () => void
   onRetryHistory: () => void
   onRetryHydration: () => void
-  onChangeApproval: (updater: (approval: ApprovalState) => ApprovalState) => void
-  onSubmitApproval: (expectedInterruptIds: readonly string[]) => void
-  onChangePlan: (updater: (interaction: PlanInteraction) => PlanInteraction) => void
-  onSubmitPlan: () => void
   onLoadEarlierMessages: (trigger: HTMLButtonElement) => void
   onScrollToBottom: () => void
   onScrollToBottomPointerEnter: () => void
@@ -171,27 +160,15 @@ export function ConversationViewport({
                     ? childToolsByRunId.get(entry.message.meta.subRunId) ?? []
                     : []}
                 />)}
+            {conversation.approval && !conversation.approval.submitted && <ApprovalStatusRow />}
             {conversation.planInteraction?.kind === 'questions' && (
               <PlanQuestionStatusRow interaction={conversation.planInteraction} />
             )}
+            {conversation.planInteraction?.kind === 'review' && (
+              <PlanReviewStatusRow interaction={conversation.planInteraction} />
+            )}
             {conversation.notice && <ConversationNotice notice={conversation.notice} />}
             {isRunning && <p className="message-stream-tail stream-pending-tail"><ActivityDots label={t('任务仍在继续')} /></p>}
-            {conversation.approval && !conversation.approval.submitted && (
-              <ApprovalCard
-                conversation={conversation}
-                onChange={onChangeApproval}
-                onSubmit={onSubmitApproval}
-              />
-            )}
-            {conversation.planInteraction?.kind === 'review' && !conversation.planInteraction.submitted && (
-              <PlanReviewCard
-                interaction={conversation.planInteraction}
-                onChange={(updater) => onChangePlan((current) => current.kind === 'review'
-                  ? updater(current as PlanReviewState)
-                  : current)}
-                onSubmit={onSubmitPlan}
-              />
-            )}
             <div ref={messageEndRef} />
           </div>
         )}

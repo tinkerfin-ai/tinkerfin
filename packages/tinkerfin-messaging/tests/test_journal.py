@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable
 from dataclasses import replace
 from typing import cast
@@ -26,8 +25,6 @@ from tinkerfin_messaging import (
     RedisBackend,
     RunProducerFailed,
 )
-
-_REDIS_URL_ENV = "TINKERFIN_TEST_REDIS_URL"
 
 
 def _identity(
@@ -52,7 +49,16 @@ async def _delete_prefix(client: Redis, prefix: str) -> None:
             return
 
 
-@pytest.fixture(params=("memory", "redis"))
+@pytest.fixture(
+    params=(
+        pytest.param("memory", id="memory"),
+        pytest.param(
+            "redis",
+            marks=(pytest.mark.docker_integration, pytest.mark.redis_e2e),
+            id="redis",
+        ),
+    )
+)
 async def backend(
     request: pytest.FixtureRequest,
 ) -> AsyncGenerator[MessagingBackend, None]:
@@ -60,9 +66,8 @@ async def backend(
         yield MemoryBackend()
         return
 
-    redis_url = os.getenv(_REDIS_URL_ENV)
-    if not redis_url:
-        pytest.skip(f"real Redis configuration is missing: {_REDIS_URL_ENV}")
+    redis_url = request.getfixturevalue("redis_url")
+    assert isinstance(redis_url, str)
     client = Redis.from_url(
         redis_url,
         decode_responses=False,

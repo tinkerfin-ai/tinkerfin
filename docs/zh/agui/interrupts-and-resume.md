@@ -37,7 +37,7 @@ runtime = agent.new_agui(identity=identity, mode="plan")
 | `reason` | `resolved` 时的 payload |
 | --- | --- |
 | `tinkerfin:plan_clarification` | 选择 Option 时使用 `{"type":"respond","answers":[{"questionId":"...","optionId":"..."}]}`；自由输入时使用 `{"type":"respond","answers":[{"questionId":"...","answer":"..."}]}`；跳过可选题时使用 `{"type":"respond","answers":[{"questionId":"...","skipped":true}]}` |
-| `tinkerfin:plan_review` | `approve`、`edit`、`respond` 或 `reject`，并携带当前 `baseRevision` |
+| `tinkerfin:plan_review` | 使用 interrupt 响应 Schema 允许的动作并携带当前 `baseRevision`；默认是 `approve`、`respond` 或 `reject`，`edit` 需要宿主显式配置 |
 
 Plan interrupt 没有 `toolCallId`，其中包含带版本的可信 Runtime envelope、响应 JSON Schema
 和携带完整公开 Form 的 `tinkerfin.plan-clarification.v2` metadata；Form 使用 `schemaVersion: 2`。

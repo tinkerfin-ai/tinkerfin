@@ -22,7 +22,11 @@ import {
   readActiveRunSession,
   writeActiveRunSession,
 } from './features/conversation/stream/activeRunSession'
-import { planQuestionCollapseKey } from './features/conversation/planQuestionCollapse'
+import {
+  approvalCollapseKey,
+  planQuestionCollapseKey,
+  planReviewCollapseKey,
+} from './features/conversation/planQuestionCollapse'
 import { normalizeAppLocation } from './lib/threadRoute'
 
 const TEST_USER = {
@@ -69,11 +73,6 @@ const BASE_TIME = '2026-08-03T09:00:00.000Z'
 const originalWriteArgs = {
   file_path: 'result.txt',
   content: '原始写入内容',
-}
-
-const editedWriteArgs = {
-  file_path: 'result.txt',
-  content: '编辑后的写入内容',
 }
 
 function sseResponse(
@@ -612,7 +611,7 @@ describe('App', () => {
     await waitFor(() => expect(planButton).toBeEnabled())
   })
 
-  it('abandons a pending Plan before switching the thread to default', async () => {
+  it('requires an explicit review decision without exposing a close action', async () => {
     const secondChatRequest = deferred<ChatRequestPayload>()
     const fetchMock = installFetchMock({
       streams: [
@@ -656,12 +655,7 @@ describe('App', () => {
         ],
         [
           { type: 'RUN_STARTED', threadId: THREAD_ID, runId: SECOND_RUN_ID },
-          {
-            type: 'RUN_ERROR',
-            rawEvent: { runId: SECOND_RUN_ID },
-            message: '审批已取消',
-            code: 'resume_cancelled',
-          },
+          { type: 'RUN_FINISHED', threadId: THREAD_ID, runId: SECOND_RUN_ID, outcome: { type: 'success' } },
         ],
       ],
       onChatRequest: (request, requestIndex) => {
@@ -671,23 +665,21 @@ describe('App', () => {
     const user = userEvent.setup()
     render(<App />)
     await sendMessage('/plan 先生成计划')
-    expect(await screen.findByLabelText('Plan 审阅')).toBeInTheDocument()
+    const review = await screen.findByLabelText('Plan 审阅')
+    expect(screen.queryByRole('button', { name: 'Plan 已开启，点击关闭' })).not.toBeInTheDocument()
+    expect(within(review).queryByRole('button', { name: /关闭|放弃/ })).not.toBeInTheDocument()
+    await user.click(within(review).getByRole('button', { name: '拒绝' }))
+    await user.click(within(review).getByRole('button', { name: '提交决定' }))
 
-    await user.click(screen.getByRole('button', { name: 'Plan 已开启，点击关闭' }))
-    const dialog = await screen.findByRole('dialog', { name: '关闭当前 Plan？' })
-    expect(within(dialog).getByText(/Tool\/Filesystem 审批不受影响/)).toBeInTheDocument()
-    await user.click(within(dialog).getByRole('button', { name: '关闭 Plan' }))
-
-    const abandonRequest = await secondChatRequest.promise
+    const decisionRequest = await secondChatRequest.promise
     const requests = chatRequests(fetchMock)
     expect(requests.filter((request) => request.messages.length > 0 && request.forwardedProps.command.plan === 'on')).toHaveLength(1)
-    expect(abandonRequest.resume?.some((item) => item.status === 'cancelled')).toBe(true)
-    expect(abandonRequest.forwardedProps).toEqual({ model: 'GPT-5.5', command: { plan: 'off' } })
-    expect(abandonRequest.resume).toEqual([{
+    expect(decisionRequest.forwardedProps).toEqual({ model: 'GPT-5.5', command: { plan: 'off' } })
+    expect(decisionRequest.resume).toEqual([{
       interruptId: 'plan-review-app',
-      status: 'cancelled',
+      status: 'resolved',
+      payload: { type: 'reject', baseRevision: 1 },
     }])
-    expect(screen.queryByRole('button', { name: 'Plan 已开启，点击关闭' })).not.toBeInTheDocument()
   })
 
   it('does not expose the removed mode selector while a Tool approval is pending', async () => {
@@ -729,11 +721,11 @@ describe('App', () => {
     })
     render(<App />)
     await sendMessage('等待 Tool 审批')
-    expect(await screen.findByText('确认写入')).toBeInTheDocument()
+    expect(await screen.findByRole('region', { name: '等待审批' })).toHaveTextContent('确认写入')
 
     expect(screen.queryByRole('button', { name: '当前 Agent 预设' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Plan 已开启，点击关闭' })).not.toBeInTheDocument()
-    expect(screen.getByText('确认写入')).toBeInTheDocument()
+    expect(screen.getByRole('region', { name: '等待审批' })).toHaveTextContent('确认写入')
     expect(chatRequestAt(fetchMock, 1)).toBeUndefined()
   })
 
@@ -1640,7 +1632,9 @@ describe('App', () => {
         [SECOND_THREAD_ID]: historyDetail({ threadId: SECOND_THREAD_ID, title: '第二条会话' }),
       },
     })
+    window.sessionStorage.setItem(approvalCollapseKey(SECOND_THREAD_ID), 'collapsed')
     window.sessionStorage.setItem(planQuestionCollapseKey(SECOND_THREAD_ID), 'collapsed')
+    window.sessionStorage.setItem(planReviewCollapseKey(SECOND_THREAD_ID), 'collapsed')
     const user = userEvent.setup()
     render(<App />)
 
@@ -1657,7 +1651,9 @@ describe('App', () => {
       expect(screen.queryByRole('button', { name: '打开会话：第二条会话' })).not.toBeInTheDocument()
     })
     expect(await screen.findByText('会话已删除')).toBeInTheDocument()
+    expect(window.sessionStorage.getItem(approvalCollapseKey(SECOND_THREAD_ID))).toBeNull()
     expect(window.sessionStorage.getItem(planQuestionCollapseKey(SECOND_THREAD_ID))).toBeNull()
+    expect(window.sessionStorage.getItem(planReviewCollapseKey(SECOND_THREAD_ID))).toBeNull()
   })
 
   it('loads the next history page when scrolling the sidebar list to the bottom', async () => {
@@ -2638,7 +2634,20 @@ describe('App', () => {
     expect(screen.getByRole('button', { name: '关闭任务抽屉遮罩' })).toBeInTheDocument()
   })
 
-  it('submits edit approvals through resume[] using the backfilled threadId', async () => {
+  it('submits sequential Tool approvals once through the ordered resume[] group', async () => {
+    const secondWriteCallId = 'call-write-file-second'
+    const secondWriteArgs = {
+      file_path: 'second-result.txt',
+      content: '第二份写入内容',
+    }
+    const nativeRequests = [
+      { name: 'write_file', args: originalWriteArgs },
+      { name: 'write_file', args: secondWriteArgs },
+    ]
+    const nativePolicies = nativeRequests.map(() => ({
+      action_name: 'write_file',
+      allowed_decisions: ['approve', 'reject'],
+    }))
     const fetchMock = installFetchMock({
       streams: [
         [
@@ -2669,6 +2678,27 @@ describe('App', () => {
             delta: JSON.stringify(originalWriteArgs),
           },
           {
+            type: 'TOOL_CALL_START',
+            rawEvent: {
+              streamMode: 'messages',
+              source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
+              langgraphNode: 'model',
+            },
+            toolCallId: secondWriteCallId,
+            toolCallName: 'write_file',
+            parentMessageId: 'parent-write-file',
+          },
+          {
+            type: 'TOOL_CALL_ARGS',
+            rawEvent: {
+              streamMode: 'messages',
+              source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
+              langgraphNode: 'model',
+            },
+            toolCallId: secondWriteCallId,
+            delta: JSON.stringify(secondWriteArgs),
+          },
+          {
             type: 'RUN_FINISHED',
             threadId: THREAD_ID,
             runId: FIRST_RUN_ID,
@@ -2676,33 +2706,42 @@ describe('App', () => {
               type: 'interrupt',
               interrupts: [
                 {
-                  id: INTERRUPT_ID,
+                  id: `${INTERRUPT_ID}#0`,
                   reason: 'tool_call',
-                  message: '需要人工审批：agent 正准备写入文件。',
+                  message: '需要人工审批：Agent 正准备写入第一份文件',
                   toolCallId: WRITE_FILE_CALL_ID,
-                  responseSchema: {
-                    type: 'object',
-                    properties: {
-                      approved: { type: 'boolean' },
-                      editedArgs: { type: 'object' },
-                    },
-                    required: ['approved'],
-                  },
                   metadata: {
                     langgraphValue: {
-                      action_requests: [{ name: 'write_file', args: originalWriteArgs }],
-                      review_configs: [{
-                        action_name: 'write_file',
-                        allowed_decisions: ['approve', 'edit', 'reject'],
-                      }],
+                      action_requests: nativeRequests,
+                      review_configs: nativePolicies,
                     },
                     deepagents: {
                       schema: 'tinkerfin.deepagents.tool-review.v1',
                       nativeInterruptId: INTERRUPT_ID,
                       actionIndex: 0,
                       toolName: 'write_file',
-                      allowedDecisions: ['approve', 'edit', 'reject'],
+                      allowedDecisions: ['approve', 'reject'],
                       originalArgs: originalWriteArgs,
+                    },
+                  },
+                },
+                {
+                  id: `${INTERRUPT_ID}#1`,
+                  reason: 'tool_call',
+                  message: '需要人工审批：Agent 正准备写入第二份文件',
+                  toolCallId: secondWriteCallId,
+                  metadata: {
+                    langgraphValue: {
+                      action_requests: nativeRequests,
+                      review_configs: nativePolicies,
+                    },
+                    deepagents: {
+                      schema: 'tinkerfin.deepagents.tool-review.v1',
+                      nativeInterruptId: INTERRUPT_ID,
+                      actionIndex: 1,
+                      toolName: 'write_file',
+                      allowedDecisions: ['approve', 'reject'],
+                      originalArgs: secondWriteArgs,
                     },
                   },
                 },
@@ -2729,6 +2768,18 @@ describe('App', () => {
             role: 'tool',
           },
           {
+            type: 'TOOL_CALL_RESULT',
+            rawEvent: {
+              streamMode: 'messages',
+              source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
+              langgraphNode: 'tools',
+            },
+            messageId: 'tool-result-write-file-second',
+            toolCallId: secondWriteCallId,
+            content: 'Skipped file second-result.txt',
+            role: 'tool',
+          },
+          {
             type: 'RUN_FINISHED',
             threadId: THREAD_ID,
             runId: SECOND_RUN_ID,
@@ -2749,14 +2800,16 @@ describe('App', () => {
 
     const user = await sendMessage('请写入结果')
 
-    await waitFor(() => expect(screen.getByText('需要人工审批：agent 正准备写入文件。')).toBeInTheDocument())
-    expect(screen.queryByText('write_file')).not.toBeInTheDocument()
+    expect(await screen.findByRole('region', { name: '等待审批' })).toHaveTextContent('result.txt')
+    expect(document.querySelectorAll('.message-list [data-tool-name="write_file"]')).toHaveLength(2)
+    expect(screen.queryByRole('button', { name: '编辑' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '批量提交' })).not.toBeInTheDocument()
 
-    await user.click(screen.getByRole('button', { name: '编辑' }))
-    const textarea = screen.getByLabelText('编辑参数（JSON 对象）')
-    fireEvent.change(textarea, { target: { value: JSON.stringify(editedWriteArgs) } })
-    await user.click(screen.getByRole('button', { name: '保存并允许' }))
-    await user.click(screen.getByRole('button', { name: '批量提交' }))
+    await user.click(screen.getByRole('button', { name: '允许' }))
+    expect(screen.getByRole('region', { name: '等待审批' })).toHaveTextContent('second-result.txt')
+    await user.click(screen.getByRole('button', { name: '拒绝' }))
+    await user.type(screen.getByLabelText('拒绝原因（可选）'), '不写入第二份文件')
+    await user.click(screen.getByRole('button', { name: '确认拒绝' }))
 
     await waitFor(() => {
       const chatCalls = fetchMock.mock.calls.filter(
@@ -2769,18 +2822,17 @@ describe('App', () => {
     expect(resumeRequest.threadId).toBe(THREAD_ID)
     expect(resumeRequest.forwardedProps).toEqual({ model: 'GPT-5.5', command: { plan: 'off' } })
     await waitFor(() => expect(document.querySelector('[data-tool-name="write_file"]')).not.toBeNull())
-    expect(screen.getByText('Write')).toBeInTheDocument()
+    expect(screen.getAllByText('Write').length).toBeGreaterThanOrEqual(2)
     expect(resumeRequest.resume).toEqual([
       {
-        interruptId: INTERRUPT_ID,
+        interruptId: `${INTERRUPT_ID}#0`,
         status: 'resolved',
-        payload: {
-          type: 'edit',
-          edited_action: {
-            name: 'write_file',
-            args: editedWriteArgs,
-          },
-        },
+        payload: { type: 'approve' },
+      },
+      {
+        interruptId: `${INTERRUPT_ID}#1`,
+        status: 'resolved',
+        payload: { type: 'reject', message: '不写入第二份文件' },
       },
     ])
   })

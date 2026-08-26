@@ -20,8 +20,18 @@ from pydantic import (
     model_validator,
 )
 
+from tinkerfin_studio.api.errors import BusinessException, ConversationErrorCode
+
 THREAD_ID_PATTERN = r"^[^:]+\z"
 OPTIONAL_THREAD_ID_PATTERN = r"^[^:]*\z"
+MAX_USER_MESSAGE_BYTES = 256 * 1024
+
+
+def _utf8_byte_length(value: str) -> int:
+    try:
+        return len(value.encode("utf-8"))
+    except UnicodeEncodeError as error:
+        raise ValueError("用户消息必须是有效 UTF-8 文本") from error
 
 
 class ConversationCommand(BaseModel):
@@ -120,12 +130,43 @@ class ChatRequest(BaseModel):
             raise ValueError("parentRunId 必须与 runId 不同")
         return self
 
+    @model_validator(mode="after")
+    def messages_follow_the_current_delta_contract(self) -> ChatRequest:
+        """限制为当前产品实际执行的一条文本增量或无消息恢复"""
+
+        if self.resume is not None:
+            if self.messages:
+                raise ValueError("恢复运行不得同时提交新消息")
+            return self
+        if len(self.messages) != 1:
+            raise ValueError("普通运行必须且只能提交一条文本 user 消息")
+        message = self.messages[0]
+        content = message.get("content")
+        if (
+            message.get("role") != "user"
+            or not isinstance(content, str)
+            or not content.strip()
+        ):
+            raise ValueError("当前普通运行只接受非空文本 user 消息")
+        if _utf8_byte_length(content) > MAX_USER_MESSAGE_BYTES:
+            raise ValueError("用户消息超过当前 UTF-8 字节上限")
+        return self
+
     @classmethod
     def from_agui(cls, value: RunAgentInput) -> ChatRequest:
         """保留标准 AG-UI 数据并增加 Studio 必需的业务校验"""
 
         if not isinstance(value, RunAgentInput):
             raise TypeError("value 必须是 RunAgentInput")
+        if value.resume is None and len(value.messages) == 1:
+            content = value.messages[0].content
+            if isinstance(content, str):
+                try:
+                    content_size = _utf8_byte_length(content)
+                except ValueError:
+                    content_size = None
+                if content_size is not None and content_size > MAX_USER_MESSAGE_BYTES:
+                    raise BusinessException(ConversationErrorCode.REQUEST_TOO_LARGE)
         payload = value.model_dump(mode="json", by_alias=True, exclude_none=False)
         payload["messages"] = [
             message.model_dump(

@@ -9,16 +9,15 @@ This page groups the public Runtime capabilities by how you use them. Most appli
 | API | When to use it | Main input or result |
 | --- | --- | --- |
 | `TinkerFin(run_coordinator=None, state_schema=None)` | Create the main entry point | Optional shared coordinator and Definition-wide state |
-| `TinkerFin.plan(...)` | Create an immutable Plan-capable factory | Capability and mode defaults, optional Planner model, clarification form, and Plan content schema |
+| `TinkerFin.plan(...)` | Create an immutable Plan-capable factory | Capability and mode defaults, optional Planner model, clarification form, Plan content schema, and review actions |
 | `TinkerFin.create_deep_agent(...)` | Create a reusable agent definition | See [Create and run a Deep Agent](deep-agents.md) |
 | `Identity(threadId=..., runId=...)` | Identify one framework run | Thread and run only |
-| `TinkerFin.run(...)` | Run a custom async source | `source_factory`, `identity`, `on_part` |
 | `DeepAgentDefinition.new(...)` | Create a native Runtime | Required `identity`, optional request `mode` and `on_part` |
 | `DeepAgentDefinition.new_agui(...)` | Create an AG-UI Runtime | Required canonical `identity`; optional parent, mode, resume, checkpoint callback, and observers |
 
-Reuse `DeepAgentDefinition`. Treat `DeepAgentRuntime`, `DeepAgentAgUiRuntime`,
-`DeepAgentAgUiResumeRuntime`, `TinkerFinRun`, and `NativeTinkerFinRun` as single-use
-values returned by the entry points rather than constructing them directly.
+Reuse `DeepAgentDefinition`. Treat `DeepAgentRuntime`, `DeepAgentAgUiRuntime`, and
+`DeepAgentAgUiResumeRuntime` as single-use values returned by the entry points rather
+than constructing them directly.
 
 `.plan(enabled=True)` affects only definitions created from the returned factory. It
 does not add a parameter to `create_deep_agent(...)`. The returned factory retains its
@@ -55,6 +54,11 @@ string without whitespace rewriting. A host schema declares a stable `schema_id`
 runtime validates and fingerprints its JSON Schema and rejects schema drift on resume.
 The reviewed draft and `ConfirmedPlan` always use the same frozen content schema.
 
+`.plan(review_actions=...)` accepts an ordered, non-empty sequence of distinct
+`PlanReviewAction` members. The default is `APPROVE`, `RESPOND`, and `REJECT`; the
+interrupt response Schema contains exactly the configured decisions. Include `EDIT`
+explicitly only when the host provides a trusted draft editor.
+
 `.plan(clarification_schema=...)` accepts one fully concrete `ClarificationFormBase`
 subclass defined by the host. Omitting it uses `DefaultClarificationForm`. Python uses
 `allow_free_text`; the JSON contract uses `allowFreeText`. Every question explicitly
@@ -75,7 +79,6 @@ non-checkpointed context contract.
 
 | API | Use |
 | --- | --- |
-| `GraphRunStream` | Iterates ordinary objects; supports `aclose()` and `to_sse()` |
 | `NativeGraphRunStream` | Iterates normalized LangGraph v2 parts and can go directly to Messaging |
 | `AgUiEventStream` | Iterates AG-UI events; supports `abort()`, `aclose()`, and `to_sse()` |
 | `SseBody` | Iterates SSE strings; call `prepare()` first and `aclose()` when done |
@@ -102,15 +105,13 @@ Creates a valid failed AG-UI stream when initialization failed before Graph iter
 
 The Runtime normally creates these objects for you.
 
-## Native AG-UI stream binding
+## AG-UI stream preflight
 
-| API | Parameter | Use |
-| --- | --- | --- |
-| `AgUiNativeStreamConfig` | `extra_modes=()` | Declares additional modes beyond the AG-UI base profile |
-| `.bind(astream, *args, **options)` | Stream callable and invocation arguments | Produces one bound native invocation |
-| `AgUiNativeStreamInvocation` | Do not construct directly | Pass to `TinkerFin.run()` |
-
-Invalid combinations raise `AgUiNativeStreamConfigurationError`.
+`new_agui()` fixes the native profile to `messages`, `tasks`, and `values` with
+`version="v2"` and `subgraphs=True`. Callers may add `updates`, `checkpoints`, `debug`,
+or `custom` through the Runtime `astream(stream_mode=...)` argument. Missing required
+modes, duplicates, unsupported modes, a conflicting version, or disabled subgraphs
+raise `AgUiNativeStreamConfigurationError` before Graph or coordinator side effects.
 
 ## SSE types
 
@@ -127,6 +128,7 @@ Invalid combinations raise `AgUiNativeStreamConfigurationError`.
 | --- | --- |
 | `PartObserver` | Asynchronously observes native parts |
 | `EventObserver` | Asynchronously observes AG-UI events |
+| `join_task(task, cancel=False, suppress_task_cancellation=False)` | Settle a host-owned task before propagating caller cancellation |
 | `RunCoordinator` | Extension boundary for run exclusion |
 | `InMemoryRunCoordinator(key_resolver=...)` | Serializes business keys within one process |
 
@@ -139,7 +141,7 @@ After installing `tinkerfin[redis]`:
 | `RedisLease` | Immutable resource key and fencing token yielded by `hold()` |
 | `RedisLeaseLost` | Report uncertain, expired, or lost ownership |
 
-See [Custom sources and run coordination](extensions.md#use-a-renewable-redis-lease-when-needed) for constructor defaults and connection-pool guidance.
+See [Run coordination and Redis leases](extensions.md#use-a-renewable-redis-lease-when-needed) for constructor defaults and connection-pool guidance.
 
 ## Resume and errors
 
@@ -151,20 +153,24 @@ See [Custom sources and run coordination](extensions.md#use-a-renewable-redis-le
 | `AgUiSettlementTimeoutError` | Caller wait ended before protected Runtime cleanup settled |
 | `AgUiNativeStreamConfigurationError` | Native options do not satisfy the AG-UI profile |
 
-`TinkerFinRun.astream_agui(...)` and `NativeTinkerFinRun.astream_agui(...)` convert lower-level sources to AG-UI.
+`DeepAgentDefinition.new_agui(...)` creates one request Runtime with these options:
 
 | Parameter | Default | Purpose |
 | --- | --- | --- |
+| `identity` | required | Canonical thread and run identity |
+| `parent_run_id` | `None` | Optional checkpoint lineage exposed on `RUN_STARTED` |
+| `mode` | Definition default | Select native default or Plan routing for this request |
 | `timeout` | `None` | Overall native-stream wait limit |
 | `settlement_timeout` | `None` | Caller wait limit for protected cleanup |
 | `expose_reasoning_events` | `False` | Deliver supported reasoning events |
 | `expose_subagent_events` | `True` | Deliver subagent events |
-| `prior_tool_call_ids` | `frozenset()` | Complete scoped tool IDs emitted before resume |
-| `private_state_keys` | `frozenset()` | Host-owned top-level state channels omitted from public projection |
+| `resume` | `None` | Complete trusted `AgUiResumeBinding` for a resumed request |
+| `on_resume_checkpointed` | `None` | Idempotent callback after the exact resume marker is readable |
 | `on_event` | `None` | Observer called before AG-UI event delivery |
-| `parent_run_id` | `None` | Optional checkpoint lineage exposed on `RUN_STARTED` |
 
-Identity is already bound by `TinkerFin.run(..., identity=...)`; `astream_agui()` does not accept duplicate IDs.
+The returned Runtime preserves the installed Graph `astream(...)` parameter shape. It
+injects the same `Identity` into Graph configuration and does not accept another Runtime
+identity at `astream()`.
 
 `AgUiResumeBinding.from_agui(...)` validates complete trusted AG-UI interrupts and
 entries, including native groups, cancellation mode, Tool IDs, and source agents. The

@@ -65,6 +65,10 @@ export function useConversationScroll({
   const pendingUserScrollIntent = useRef(false)
   const userHasScrolled = useRef(false)
   const pendingConversationScroll = useRef<{ threadId: string; scrollTop: number | null } | null>(null)
+  const lastForcedApprovalIdentity = useRef<string | null>(null)
+  const pendingApprovalKey = conversation.approval && !conversation.approval.submitted
+    ? conversation.approval.items.map((item) => item.interruptId).join('\u0000')
+    : null
 
   const setScrollButtonPhase = useCallback((phase: ScrollButtonPhase) => {
     scrollButtonPhase.current = phase
@@ -178,6 +182,13 @@ export function useConversationScroll({
     }
   }, [clearScrollButtonTimers, conversation.threadId, scheduleScrollPersistence, setScrollButtonPhase])
 
+  const syncToBottomIfFollowing = useCallback(() => {
+    if (!followLatest.current) return
+    const pane = paneRef.current
+    if (!pane) return
+    pane.scrollTop = pane.scrollHeight
+  }, [])
+
   const markUserScrollIntent = useCallback(() => {
     scrollingToBottom.current = false
     pendingUserScrollIntent.current = true
@@ -239,6 +250,7 @@ export function useConversationScroll({
     pendingConversationScroll.current = conversation.threadId
       ? { threadId: conversation.threadId, scrollTop: savedScrollTop }
       : null
+    lastForcedApprovalIdentity.current = null
     followLatest.current = savedScrollTop == null
     scrollingToBottom.current = false
     if (followScrollFrame.current != null) {
@@ -257,6 +269,20 @@ export function useConversationScroll({
     scrollButtonHovered.current = false
     scrollButtonFocused.current = false
   }, [clearScrollButtonTimers, conversation.threadId, flushScrollPersistence, setScrollButtonPhase])
+
+  useLayoutEffect(() => {
+    if (!conversation.threadId || !conversation.isHydrated || !pendingApprovalKey) return
+    const identity = `${conversation.threadId}:${pendingApprovalKey}`
+    if (lastForcedApprovalIdentity.current === identity) return
+    lastForcedApprovalIdentity.current = identity
+    // 待审批会话需要先让用户看到对话尾部状态，但只能覆盖缓存位置一次
+    scrollToBottomImmediately()
+  }, [
+    conversation.isHydrated,
+    conversation.threadId,
+    pendingApprovalKey,
+    scrollToBottomImmediately,
+  ])
 
   useLayoutEffect(() => {
     const pane = paneRef.current
@@ -344,6 +370,7 @@ export function useConversationScroll({
     fadeScrollToBottom,
     handleScroll,
     scrollToBottomImmediately,
+    syncToBottomIfFollowing,
     markUserScrollIntent,
     scrollBy,
     scrollToBottom,

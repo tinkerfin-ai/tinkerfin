@@ -2,21 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import ClassVar, Never, TypeVar, assert_type, cast
+from typing import ClassVar, Generic, Never, TypeVar, assert_type, cast
 
 import pytest
 from pydantic import BaseModel
 
-import tinkerfin
 import tinkerfin_messaging
 from tinkerfin import (
-    AgUiNativeStreamConfig,
+    AgUiEventStream,
     Identity,
-    NativeGraphRunStream,
     NativeStreamPart,
-    TinkerFin,
 )
 from tinkerfin_messaging import (
     BackendRunHandle,
@@ -33,6 +30,7 @@ from tinkerfin_messaging import (
 from tinkerfin_messaging.protocols import ProfiledMessageSource
 
 CollectedT = TypeVar("CollectedT")
+SourceValueT = TypeVar("SourceValueT")
 
 
 def _identity(
@@ -190,51 +188,81 @@ class _UnrelatedProfileTextSource(_CustomSource):
     messaging_replay_type: ClassVar[type[int]] = int
 
 
+class _ObjectSource(Generic[SourceValueT]):
+    def __init__(
+        self,
+        *items: SourceValueT,
+        on_pull: Callable[[], None] | None = None,
+    ) -> None:
+        self._items = iter(items)
+        self._on_pull = on_pull
+
+    def __aiter__(self) -> _ObjectSource[SourceValueT]:
+        return self
+
+    async def __anext__(self) -> SourceValueT:
+        if self._on_pull is not None:
+            self._on_pull()
+        try:
+            return next(self._items)
+        except StopIteration:
+            raise StopAsyncIteration from None
+
+    async def aclose(self) -> None:
+        return None
+
+
+class _NativeProfileSource:
+    def __init__(
+        self,
+        value: int | None,
+        *,
+        identity: Identity,
+    ) -> None:
+        self.messaging_identity = identity
+        self._value = value
+        self._yielded = False
+
+    @property
+    def messaging_codec_profile(self) -> str:
+        return "langgraph.stream-part.v2.v1"
+
+    @property
+    def messaging_source_type(self) -> type[Mapping[str, object]]:
+        return Mapping
+
+    @property
+    def messaging_replay_type(self) -> type[NativeStreamPart]:
+        return NativeStreamPart
+
+    def __aiter__(self) -> _NativeProfileSource:
+        return self
+
+    async def __anext__(self) -> Mapping[str, object]:
+        if self._yielded or self._value is None:
+            raise StopAsyncIteration
+        self._yielded = True
+        return {
+            "type": "values",
+            "ns": (),
+            "data": {"value": self._value},
+            "interrupts": (),
+        }
+
+    async def aclose(self) -> None:
+        self._yielded = True
+
+
 def _native_source(
     value: int = 1,
     *,
     identity: Identity | None = None,
-) -> NativeGraphRunStream:
-    resolved_identity = identity or _identity()
-
-    async def parts(
-        *,
-        config: object | None = None,
-        **options: object,
-    ) -> AsyncIterator[Mapping[str, object]]:
-        assert config == {"configurable": {"thread_id": resolved_identity.thread_id}}
-        assert options == {
-            "stream_mode": ("messages", "tasks", "values"),
-            "version": "v2",
-            "subgraphs": True,
-        }
-        yield {
-            "type": "values",
-            "ns": (),
-            "data": {"value": value},
-            "interrupts": (),
-        }
-
-    invocation = AgUiNativeStreamConfig().bind(parts)
-    return TinkerFin().run(invocation, identity=resolved_identity).astream()
+) -> _NativeProfileSource:
+    return _NativeProfileSource(value, identity=identity or _identity())
 
 
-def _empty_native_source(*, identity: Identity) -> NativeGraphRunStream:
-    async def parts(
-        *,
-        config: object | None = None,
-        **options: object,
-    ) -> AsyncIterator[Mapping[str, object]]:
-        assert config == {"configurable": {"thread_id": identity.thread_id}}
-        assert options["version"] == "v2"
-        if False:
-            yield {}
-
-    return (
-        TinkerFin()
-        .run(AgUiNativeStreamConfig().bind(parts), identity=identity)
-        .astream()
-    )
+def _empty_native_source(*, identity: Identity) -> _NativeProfileSource:
+    return _NativeProfileSource(None, identity=identity)
 
 
 async def _collect(
@@ -245,14 +273,8 @@ async def _collect(
 
 @pytest.mark.asyncio
 async def test_generic_dataclass_and_model_streams_require_explicit_codecs() -> None:
-    async def dataclass_values() -> AsyncIterator[_DataclassValue]:
-        yield _DataclassValue(value=1)
-
-    async def model_values() -> AsyncIterator[_ModelValue]:
-        yield _ModelValue(value=2)
-
-    dataclass_source = TinkerFin().run(dataclass_values).astream()
-    model_source = TinkerFin().run(model_values).astream()
+    dataclass_source = _ObjectSource(_DataclassValue(value=1))
+    model_source = _ObjectSource(_ModelValue(value=2))
 
     assert not isinstance(dataclass_source, ProfiledMessageSource)
     assert not isinstance(model_source, ProfiledMessageSource)
@@ -287,9 +309,6 @@ async def test_generic_dataclass_and_model_streams_require_explicit_codecs() -> 
 async def test_native_profile_infers_live_and_replay_types() -> None:
     source = _native_source()
 
-    native_stream_type = getattr(tinkerfin, "NativeGraphRunStream", None)
-    assert native_stream_type is not None
-    assert isinstance(source, native_stream_type)
     assert isinstance(source, ProfiledMessageSource)
     assert source.messaging_codec_profile == "langgraph.stream-part.v2.v1"
     assert source.messaging_source_type is Mapping
@@ -324,13 +343,12 @@ async def test_empty_native_profile_infers_identity_without_a_first_item() -> No
 async def test_generic_object_stream_without_codec_fails_before_prepare() -> None:
     factory_calls = 0
 
-    async def values() -> AsyncIterator[_DataclassValue]:
+    def record_pull() -> None:
         nonlocal factory_calls
         factory_calls += 1
-        yield _DataclassValue(value=1)
 
     backend = _CountingBackend()
-    source = TinkerFin().run(values).astream()
+    source = _ObjectSource(_DataclassValue(value=1), on_pull=record_pull)
     async with Messaging(backend=backend) as messaging:
         with pytest.raises(TypeError, match="provide codec explicitly"):
             await messaging.channel(name="objects").wrap(
@@ -475,10 +493,6 @@ async def test_reused_inferred_channel_revalidates_profile_before_prepare() -> N
 
 @pytest.mark.asyncio
 async def test_name_only_channel_infers_native_and_agui_profiles() -> None:
-    async def empty_parts() -> AsyncIterator[object]:
-        if False:
-            yield None
-
     async with Messaging() as messaging:
         native_channel = messaging.channel(name="native-parts")
         native_frames = await native_channel.sse(
@@ -491,7 +505,10 @@ async def test_name_only_channel_infers_native_and_agui_profiles() -> None:
 
         agui_channel = messaging.channel(name="agui-events")
         agui_identity = _identity()
-        events = TinkerFin().run(empty_parts, identity=agui_identity).astream_agui()
+        events = AgUiEventStream.from_initialization_error(
+            RuntimeError("test initialization failure"),
+            identity=agui_identity,
+        )
         agui_frames = await agui_channel.sse(
             events,
             after=0,
@@ -507,11 +524,11 @@ async def test_name_only_channel_infers_native_and_agui_profiles() -> None:
     assert json.loads(native[0].split(b"data: ", 1)[1])["type"] == "values"
     assert [json.loads(frame.split(b"data: ", 1)[1])["type"] for frame in agui] == [
         "RUN_STARTED",
-        "RUN_FINISHED",
+        "RUN_ERROR",
     ]
     assert [message.data.type.value for message in committed_agui] == [
         "RUN_STARTED",
-        "RUN_FINISHED",
+        "RUN_ERROR",
     ]
 
 
@@ -561,17 +578,9 @@ async def test_name_only_channel_rejects_custom_and_incompatible_sources() -> No
         )
         await _collect(native)
 
-        async def empty_parts() -> AsyncIterator[object]:
-            if False:
-                yield None
-
-        incompatible = (
-            TinkerFin()
-            .run(
-                empty_parts,
-                identity=_identity(thread_id="agui", run_id="agui-run"),
-            )
-            .astream_agui()
+        incompatible = AgUiEventStream.from_initialization_error(
+            RuntimeError("test initialization failure"),
+            identity=_identity(thread_id="agui", run_id="agui-run"),
         )
         with pytest.raises(CodecMismatch):
             await channel.wrap(
@@ -584,15 +593,10 @@ async def test_name_only_channel_rejects_custom_and_incompatible_sources() -> No
 
 @pytest.mark.asyncio
 async def test_preencoded_runtime_sse_is_rejected_before_source_open() -> None:
-    factory_calls = 0
-
-    async def parts() -> AsyncIterator[object]:
-        nonlocal factory_calls
-        factory_calls += 1
-        if False:
-            yield None
-
-    encoded = TinkerFin().run(parts).astream().to_sse()
+    encoded = AgUiEventStream.from_initialization_error(
+        RuntimeError("test initialization failure"),
+        identity=_identity(thread_id="stream-1"),
+    ).to_sse()
     async with Messaging() as messaging:
         channel = messaging.channel(name="native-parts")
         with pytest.raises(TypeError, match="object events, not pre-encoded SSE"):
@@ -600,8 +604,6 @@ async def test_preencoded_runtime_sse_is_rejected_before_source_open() -> None:
                 cast(MessageSource[Never], encoded),
                 identity=_identity(thread_id="stream-1"),
             )
-
-    assert factory_calls == 0
 
 
 @pytest.mark.asyncio

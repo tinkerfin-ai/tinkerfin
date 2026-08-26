@@ -76,4 +76,4 @@ def test_config_rejects_framework_reserved_metadata_keys() -> None:
 @pytest.mark.parametrize("field", ("command_timeout", "warm_pool_size"))
 def test_integer_capacity_and_timeout_fields_reject_booleans(field: str) -> None:
     with pytest.raises(ValidationError):
-        OpenSandboxConfig(**{field: True})
+        OpenSandboxConfig.model_validate({field: True})

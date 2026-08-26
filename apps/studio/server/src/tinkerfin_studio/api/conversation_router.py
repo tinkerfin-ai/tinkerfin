@@ -4,6 +4,8 @@ from typing import Annotated, TypeAlias
 
 from ag_ui.core import RunAgentInput
 from fastapi import APIRouter, Header, Path, Query, Request
+from fastapi.exceptions import RequestValidationError
+from pydantic import ValidationError
 from starlette.responses import StreamingResponse
 
 from tinkerfin_studio.api.dependencies import (
@@ -131,11 +133,15 @@ async def chat(
 ) -> StreamingResponse:
     """创建请求级 Deep Agent graph 并返回 durable AG-UI SSE"""
 
+    try:
+        chat_request = ChatRequest.from_agui(input_data)
+    except ValidationError as error:
+        raise RequestValidationError(error.errors(include_input=False)) from error
     prepared = await ConversationChatService(
         session,
         user=user,
         resources=get_resources(request.app),
-    ).start(ChatRequest.from_agui(input_data), last_event_id=last_event_id)
+    ).start(chat_request, last_event_id=last_event_id)
     return StreamingResponse(
         prepared.body,
         media_type="text/event-stream",

@@ -6,8 +6,13 @@ import type { AuthUser } from '../../api/auth/types'
 import { Button, ErrorBoundary, useThemePreference } from '../../components/ui'
 import type { ToastKind } from '../../components/ui/ToastViewport'
 import { useI18n } from '../../i18n'
+import {
+  ApprovalCard,
+  type ApprovalSubmissionDecision,
+} from '../conversation/components/ApprovalCard'
 import { Composer } from '../conversation/components/Composer'
 import { PlanQuestionComposer } from '../conversation/components/PlanQuestionComposer'
+import { PlanReviewCard } from '../conversation/components/PlanReviewCard'
 import { parseComposerSubmission } from '../conversation/composerCommand'
 import { useLocalAttachments } from '../conversation/useLocalAttachments'
 import { ComposerModelPicker } from './components/ComposerModelPicker'
@@ -54,6 +59,7 @@ import type {
   Conversation,
   PlanInteraction,
   PlanQuestionState,
+  PlanReviewState,
   WorkspaceState,
 } from '../../types'
 
@@ -65,6 +71,43 @@ interface PendingResume {
 }
 
 const MESSAGE_RENDER_BATCH_SIZE = 100
+
+const matchesApprovalGroup = (
+  approval: ApprovalState | undefined,
+  expectedInterruptIds: readonly string[],
+) => Boolean(
+  approval
+  && approval.items.length === expectedInterruptIds.length
+  && approval.items.every(
+    (item, index) => item.interruptId === expectedInterruptIds[index],
+  ),
+)
+
+const withFinalApprovalDecision = (
+  approval: ApprovalState,
+  finalDecision?: ApprovalSubmissionDecision,
+) => {
+  if (!finalDecision) return approval
+  const activeIndex = approval.items.findIndex(
+    (item) => item.interruptId === finalDecision.interruptId,
+  )
+  if (activeIndex < 0) return approval
+  return {
+    ...approval,
+    activeIndex,
+    mode: 'options' as const,
+    error: undefined,
+    items: approval.items.map((item, index) => index === activeIndex
+      ? {
+          ...item,
+          decision: finalDecision.decision,
+          rejectionReason: finalDecision.decision === 'rejected'
+            ? finalDecision.rejectionReason
+            : undefined,
+        }
+      : item),
+  }
+}
 
 export function WorkspaceScreen({
   user,
@@ -196,6 +239,7 @@ export function WorkspaceScreen({
     fadeScrollToBottom,
     handleScroll: handleConversationScroll,
     scrollToBottomImmediately: scrollConversationToBottomImmediately,
+    syncToBottomIfFollowing: syncConversationToBottomIfFollowing,
     markUserScrollIntent,
     scrollBy: scrollConversationBy,
     scrollToBottom: scrollConversationToBottom,
@@ -228,15 +272,6 @@ export function WorkspaceScreen({
     && !isConversationHydrating
     && !isConversationHydrationFailed
     && !isInitialHistoryUnavailable
-  const hiddenApprovalToolCallIds = useMemo(() => {
-    if (!conversation.approval || conversation.approval.submitted) return new Set<string>()
-    return new Set(
-      conversation.approval.items
-        .map((item) => item.toolCallId)
-        .filter((toolCallId): toolCallId is string => Boolean(toolCallId)),
-    )
-  }, [conversation.approval])
-
   const updateCurrent = useCallback((updater: (item: Conversation) => Conversation) => {
     setWorkspace((state) => updateConversation(state, state.currentThreadId, updater))
   }, [])
@@ -245,16 +280,20 @@ export function WorkspaceScreen({
     const shell = appShell.current
     const composer = shell?.querySelector<HTMLElement>('.composer-dock')
     if (!shell || !composer) return
-    const measure = () => shell.style.setProperty(
-      '--composer-height',
-      `${Math.max(80, composer.getBoundingClientRect().height)}px`,
-    )
+    const measure = () => {
+      shell.style.setProperty(
+        '--composer-height',
+        `${Math.max(80, composer.getBoundingClientRect().height)}px`,
+      )
+      // Composer 改变可视高度时只跟随仍停留在底部的会话
+      syncConversationToBottomIfFollowing()
+    }
     measure()
     if (typeof ResizeObserver === 'undefined') return
     const observer = new ResizeObserver(measure)
     observer.observe(composer)
     return () => observer.disconnect()
-  }, [])
+  }, [syncConversationToBottomIfFollowing])
 
   // 当前会话变化时同步进 URL（草稿 currentThreadId==='' → 删除参数），覆盖点击选择、
   // 新建草稿、首条消息后后端回报 reportedThreadId、删除会话等全部来源
@@ -332,8 +371,6 @@ export function WorkspaceScreen({
       if (message.role !== 'tool') return true
       if (message.meta?.toolName === 'write_todos') return false
       if (message.meta?.toolName === 'PlannerOutcome') return false
-      const toolCallId = message.meta?.toolCallId
-      if (toolCallId && hiddenApprovalToolCallIds.has(toolCallId)) return false
       if (message.meta?.sourceAgentName) return false
       if (message.meta?.toolName === 'task') {
         return message.meta.status !== 'running' && !message.meta.subRunId
@@ -347,7 +384,7 @@ export function WorkspaceScreen({
       } else if (message.role === 'tool' && message.meta?.batchId) groups.push({ type: 'tools', messages: [message] })
       else groups.push({ type: 'message', message })
       return groups
-    }, []), [conversation.messages, hiddenApprovalToolCallIds])
+    }, []), [conversation.messages])
 
   const defaultMessageWindowStart = Math.max(
     0,
@@ -530,7 +567,10 @@ export function WorkspaceScreen({
     })
   }, [pendingResume, streamRun, workspace.conversations])
 
-  const submitApproval = useCallback((expectedInterruptIds: readonly string[]) => {
+  const submitApproval = useCallback((
+    expectedInterruptIds: readonly string[],
+    finalDecision?: ApprovalSubmissionDecision,
+  ) => {
     const authoritativeConversation = latestWorkspace.current.conversations.find(
       (item) => item.threadId === conversation.threadId,
     )
@@ -539,7 +579,24 @@ export function WorkspaceScreen({
       || authoritativeConversation.runStatus === 'streaming'
       || !workspace.currentThreadId
     ) return
-    const incomplete = authoritativeConversation.approval.items.some((item) => !item.decision)
+    if (!matchesApprovalGroup(authoritativeConversation.approval, expectedInterruptIds)) {
+      updateCurrent((item) => ({
+        ...item,
+        approval: item.approval
+          ? { ...item.approval, error: t('当前审批已更新，请重新检查') }
+          : item.approval,
+      }))
+      return
+    }
+    const completedApproval = withFinalApprovalDecision(
+      authoritativeConversation.approval,
+      finalDecision,
+    )
+    const completedConversation = {
+      ...authoritativeConversation,
+      approval: completedApproval,
+    }
+    const incomplete = completedApproval.items.some((item) => !item.decision)
     if (incomplete) {
       updateCurrent((item) => ({
         ...item,
@@ -551,17 +608,19 @@ export function WorkspaceScreen({
     let payload: ChatRequestPayload
     try {
       payload = buildResumePayload(
-        authoritativeConversation,
+        completedConversation,
         expectedInterruptIds,
       )
     } catch (error) {
       updateCurrent((item) => ({
         ...item,
         approval: item.approval
-          ? {
-              ...item.approval,
+          ? matchesApprovalGroup(item.approval, expectedInterruptIds)
+            ? {
+              ...completedApproval,
               error: conversationErrorMessage(error, 'approval_stale'),
             }
+            : item.approval
           : item.approval,
       }))
       return
@@ -570,7 +629,11 @@ export function WorkspaceScreen({
       state,
       authoritativeConversation.threadId,
       (item) => {
-        const prepared = prepareResumeSubmission(item, expectedInterruptIds)
+        if (!matchesApprovalGroup(item.approval, expectedInterruptIds)) return item
+        const prepared = prepareResumeSubmission(
+          { ...item, approval: completedApproval },
+          expectedInterruptIds,
+        )
         return prepared === item
           ? item
           : { ...prepared, activeRunId: payload.runId }
@@ -856,10 +919,6 @@ export function WorkspaceScreen({
           onUserScrollIntent={markUserScrollIntent}
           onRetryHistory={retryHistoryBootstrap}
           onRetryHydration={() => void hydrateConversation(conversation.threadId)}
-          onChangeApproval={(updater) => changeApproval(conversation.threadId, updater)}
-          onSubmitApproval={submitApproval}
-          onChangePlan={(updater) => changePlanInteraction(conversation.threadId, updater)}
-          onSubmitPlan={submitPlanInteraction}
           onLoadEarlierMessages={loadEarlierMessages}
           onScrollToBottom={scrollConversationToBottom}
           onScrollToBottomPointerEnter={pauseScrollToBottomFade}
@@ -874,9 +933,18 @@ export function WorkspaceScreen({
           stopPending={cancelPendingRunId === conversation.activeRunId}
           isHydrating={isConversationHydrating}
           hero={showConversationHero ? <EmptyConversationBrand /> : undefined}
-          takeover={conversation.planInteraction?.kind === 'questions'
-            && !conversation.planInteraction.submitted
+          takeover={conversation.approval && !conversation.approval.submitted
             ? (
+              <ApprovalCard
+                key={`${conversation.threadId}:${conversation.approval.items[0]?.interruptId ?? ''}`}
+                conversation={conversation}
+                onChange={(updater) => changeApproval(conversation.threadId, updater)}
+                onSubmit={submitApproval}
+              />
+            )
+            : conversation.planInteraction?.kind === 'questions'
+              && !conversation.planInteraction.submitted
+              ? (
               <PlanQuestionComposer
                 threadId={conversation.threadId}
                 interaction={conversation.planInteraction}
@@ -889,8 +957,24 @@ export function WorkspaceScreen({
                 onSubmit={submitPlanInteraction}
                 onAbandon={exitPlanMode}
               />
-            )
-            : undefined}
+              )
+              : conversation.planInteraction?.kind === 'review'
+                && !conversation.planInteraction.submitted
+                ? (
+                <PlanReviewCard
+                  key={`${conversation.threadId}:${conversation.planInteraction.interruptId}`}
+                  threadId={conversation.threadId}
+                  interaction={conversation.planInteraction}
+                  onChange={(updater) => changePlanInteraction(
+                    conversation.threadId,
+                    (current) => current.kind === 'review'
+                      ? updater(current as PlanReviewState)
+                      : current,
+                  )}
+                  onSubmit={submitPlanInteraction}
+                />
+                )
+                : undefined}
           modelControl={(
             <ComposerModelPicker
               model={conversation.model}

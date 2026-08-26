@@ -10,7 +10,6 @@ The Runtime starts one agent run and exposes its progress as an asynchronous str
 | --- | --- |
 | Consume native LangGraph data | `agent.new()` |
 | Send AG-UI events to a frontend | `agent.new_agui()` |
-| Run your own asynchronous source | `TinkerFin.run()` |
 
 Start with `agent.new()` if you are new to TinkerFin.
 
@@ -93,5 +92,5 @@ The agent definition is reusable; a Runtime represents one execution.
 
 - [Create and run a Deep Agent](deep-agents.md)
 - [Streams and SSE](streams-and-sse.md)
-- [Custom sources and run coordination](extensions.md)
+- [Run coordination and Redis leases](extensions.md)
 - [Runtime usage reference](api-reference.md)

@@ -28,6 +28,7 @@ from tinkerfin.plan import (
     ClarificationModel,
     ClarificationOption,
     ClarificationQuestion,
+    PlanReviewAction,
 )
 
 
@@ -78,6 +79,10 @@ if TYPE_CHECKING:
 
     planned = tinkerfin.plan(enabled=True)
     assert_type(planned, TinkerFin)
+    editable_planned = tinkerfin.plan(
+        review_actions=(PlanReviewAction.APPROVE, PlanReviewAction.EDIT)
+    )
+    assert_type(editable_planned, TinkerFin)
     planned_definition = planned.create_deep_agent(
         model=_FakeModel(responses=[AIMessage(content="ok")]),
         tools=[],

@@ -85,6 +85,12 @@ default_runtime = agent.new_agui(
 )
 ```
 
+Plan review defaults to `PlanReviewAction.APPROVE`, `RESPOND`, and `REJECT`.
+`.plan(review_actions=...)` accepts an ordered, non-empty sequence of distinct
+`PlanReviewAction` values and publishes exactly those decisions in the interrupt
+response Schema. A host with a trusted draft editor can explicitly include
+`PlanReviewAction.EDIT`; editing is not enabled by default.
+
 Selecting `mode="plan"` requires an explicit Planner model and a concrete
 `BaseCheckpointSaver`. TinkerFin never creates an in-process saver or silently weakens
 durability. Production hosts must supply a production-grade saver; the same saver,
@@ -114,7 +120,8 @@ Plan content is independently configurable. Omitting `plan_schema` uses
 `StructuredPlanContent`; pass `MarkdownPlanContent` for one exact Markdown document, or
 provide a concrete `PlanContentModel` subclass with a stable `schema_id`. The selected
 schema is frozen on the returned factory, validated before checkpoint persistence, and
-used for Planner output, edits, review, confirmed content, and native handoff.
+used for Planner output, any explicitly enabled edit, review, confirmed content, and
+native handoff.
 
 The default clarification form requires no application models. A host that needs typed,
 user-visible metadata can define one concrete Pydantic form and freeze it on the Plan
@@ -276,9 +283,7 @@ reviews must declare
 `tinkerfin_hitl_contract=TINKERFIN_HITL_CONTRACT` in its subagent spec.
 
 Plan Runtimes automatically remove their internal top-level state channels at every
-public state boundary. Low-level `TinkerFinRun.astream_agui(...)` accepts an explicit
-`private_state_keys` frozenset for host-owned channels and preserves nested same-named
-business data.
+public state boundary while preserving nested same-named business data.
 
 ### Ownership
 
@@ -289,10 +294,10 @@ their controlled thread boundary around `new()` or `new_agui()` when needed.
 A configured coordinator receives the same complete Identity. Coordination does not
 replace a LangGraph checkpointer.
 
-### Low-level sources
-
-`TinkerFin.run(...)` handles custom asynchronous sources and low-level integrations.
-Deep Agents callers normally use the façade above.
+Hosts that own an asynchronous cleanup or preflight task can use `join_task(task)` to
+wait for its definitive result without letting repeated caller cancellation interrupt
+settlement. Caller cancellation is re-raised after the owned task finishes; an owned
+task failure remains observable when no caller cancellation outranks it.
 
 ## Documentation
 

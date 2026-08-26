@@ -108,6 +108,9 @@ describe('MessageBlock subagent card', () => {
     expect(conversationStyles).toMatch(/\.subagent-output-icon\s*\{[^}]*margin-top:\s*var\(--subagent-output-align-offset\);/s)
     expect(conversationStyles).toMatch(/\.subagent-output-node::before\s*\{[^}]*var\(--subagent-output-align-offset\)/s)
     expect(conversationStyles).toMatch(/\.subagent-output-node \.subagent-trace-junction\s*\{[^}]*var\(--subagent-output-align-offset\)/s)
+    expect(conversationStyles).toMatch(/\.subagent-trace-list::before\s*\{[^}]*bottom:\s*var\(--space-1\);/s)
+    expect(conversationStyles).toMatch(/\.subagent-trace-node:last-child\s*\{\s*padding-bottom:\s*0;/s)
+    expect(conversationStyles).toMatch(/\.subagent-tool-row \.tool-detail-card\s*\{\s*margin-bottom:\s*var\(--space-1\);/s)
 
     subagentCard!.open = true
     toolCard!.open = true
@@ -260,12 +263,17 @@ describe('MessageBlock subagent card', () => {
     expect(detailSections[0]).toHaveClass('tool-detail-section--params')
     expect(detailSections[1]).toHaveClass('tool-detail-section--result')
     expect(row.querySelector('.tool-code-field')).toHaveTextContent('{"query":"Lang')
-    expect(screen.getByLabelText('工具字段加载中')).toBeInTheDocument()
-    expect(conversationStyles).toMatch(/\.tool-detail-card\s*\{[^}]*margin:\s*var\(--space-2\) 0 var\(--space-1\) calc\(var\(--icon-sm\) \+ var\(--space-2\)\);[^}]*background:\s*var\(--color-layer-1\);[^}]*font-family:\s*var\(--font-ui\);/s)
-    expect(conversationStyles).toMatch(/\.tool-detail-section\s*\{[^}]*grid-template-columns:\s*calc\(var\(--space-12\) \+ var\(--space-2\)\) minmax\(0, 1fr\);[^}]*column-gap:\s*var\(--space-4\);[^}]*max-height:\s*150px;/s)
+    expect(screen.getByText('输入')).toBeInTheDocument()
+    expect(screen.getByText('输出')).toBeInTheDocument()
+    expect(screen.getByLabelText('工具字段加载中')).toHaveClass('tool-field-pending')
+    expect(row.querySelector('.tool-skeleton')).toBeNull()
+    expect(conversationStyles).toMatch(/\.tool-detail-card\s*\{[^}]*margin:\s*var\(--space-2\) 0 0 calc\(var\(--icon-sm\) \+ var\(--space-2\)\);[^}]*background:\s*var\(--color-layer-1\);[^}]*font-family:\s*var\(--font-ui\);/s)
+    expect(conversationStyles).toMatch(/\.tool-detail-section\s*\{[^}]*grid-template-columns:\s*calc\(var\(--space-12\) \+ var\(--space-2\)\) minmax\(0, 1fr\);[^}]*column-gap:\s*var\(--space-4\);[^}]*align-items:\s*baseline;[^}]*max-height:\s*150px;/s)
     expect(conversationStyles).toMatch(/\.tool-detail-section--params\s*\{[^}]*background:\s*var\(--color-layer-2\);/s)
     expect(conversationStyles).toMatch(/\.tool-detail-section--result\s*\{[^}]*background:\s*var\(--color-layer-1\);/s)
     expect(conversationStyles).toMatch(/\.tool-code-field,[\s\S]*\.tool-rich-field\s*\{[^}]*font-family:\s*var\(--font-code\);[^}]*font-size:\s*var\(--type-caption-size\);/s)
+    expect(conversationStyles).toMatch(/\.tool-field-label\s*\{[^}]*position:\s*sticky;[^}]*top:\s*0;[^}]*align-self:\s*baseline;/s)
+    expect(conversationStyles).toMatch(/\.tool-field-pending > i\s*\{[^}]*animation:\s*conversation-tool-result-pulse var\(--motion-tool-result-cycle\)/s)
     expect(conversationStyles).toMatch(/@media \(max-width:\s*440px\)[\s\S]*\.tool-detail-card\s*\{[^}]*margin-left:\s*0;[^}]*\}[\s\S]*\.tool-detail-section\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\);[^}]*row-gap:\s*var\(--space-1-5\);/s)
 
     rerender(<MessageBlock message={{
@@ -311,7 +319,9 @@ describe('MessageBlock subagent card', () => {
     )
 
     expect(screen.getByText('等待审批')).toBeInTheDocument()
-    expect(screen.getByText('等待审批后执行')).toBeInTheDocument()
+    expect(screen.getByLabelText('等待审批后执行')).toHaveClass('tool-field-pending')
+    expect(screen.getByLabelText('等待审批后执行')).not.toHaveAttribute('aria-busy')
+    expect(screen.queryByText('等待审批后执行')).not.toBeInTheDocument()
   })
 
   it('replaces a failed row summary with the first result line', () => {
@@ -449,7 +459,9 @@ describe('MessageBlock subagent card', () => {
     expect(agent.querySelector('.subagent-trace-list')).toHaveClass('is-tool-empty')
     expect(agent.querySelector('.subagent-tool-node')).toBeNull()
     expect(agent.querySelector('.subagent-output-node')).toHaveClass('is-running')
-    expect(screen.getByLabelText('正在运行')).toBeInTheDocument()
+    expect(agent.querySelector('.subagent-output-pulse')).not.toBeNull()
+    expect(within(agent.querySelector('.subagent-output-node')!).getByText('执行中')).toBeVisible()
+    expect(agent.querySelector('.subagent-output-node .activity-dots')).toBeNull()
 
     rerender(<MessageBlock message={{
       ...running,
@@ -466,6 +478,49 @@ describe('MessageBlock subagent card', () => {
     expect(agent.querySelector('.subagent-output-node')).toHaveClass('is-failed')
     expect(within(agent.querySelector('.subagent-output-node')!).getByText('执行失败')).toBeVisible()
     expect(conversationStyles).toMatch(/\.subagent-trace-output\s*{[^}]*max-height:\s*180px;[^}]*overflow:\s*auto;/s)
+  })
+})
+
+describe('MessageBlock user composition', () => {
+  it('keeps one copy action after the user bubble and copies the source message', async () => {
+    const user = userEvent.setup()
+    const writeText = vi.spyOn(navigator.clipboard, 'writeText')
+    const { container } = render(<MessageBlock message={{
+      id: 'user-copy',
+      role: 'user',
+      content: '保留 **Markdown** 源文',
+      createdAt: '2026-08-26T00:00:00Z',
+    }} />)
+
+    const markdown = container.querySelector('.message-markdown')
+    const actionRow = screen.getByRole('group', { name: '消息操作' })
+    expect(markdown).not.toBeNull()
+    expect(markdown!.compareDocumentPosition(actionRow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(within(actionRow).getAllByRole('button')).toHaveLength(1)
+    expect(within(actionRow).getByRole('button', { name: '复制消息' }).querySelector('svg')).toHaveAttribute('width', '20')
+    expect(conversationStyles).toMatch(/\.message-action-row--user\s*{[^}]*width:\s*var\(--space-10\);[^}]*min-height:\s*var\(--space-10\);[^}]*padding:\s*var\(--space-1\);/s)
+    expect(conversationStyles).toMatch(/@media \(hover:\s*hover\) and \(pointer:\s*fine\)[\s\S]*\.message-action-row--user\s*{[^}]*opacity:\s*0;[^}]*pointer-events:\s*none;[^}]*transition:\s*opacity var\(--motion-slow\) var\(--ease-in-out\);/s)
+    expect(conversationStyles).toMatch(/\.user-message:hover \.message-action-row--user\s*{[^}]*opacity:\s*1;[^}]*pointer-events:\s*auto;[^}]*transition-delay:\s*var\(--motion-slow\);/s)
+
+    await user.click(within(actionRow).getByRole('button', { name: '复制消息' }))
+    expect(writeText).toHaveBeenCalledWith('保留 **Markdown** 源文')
+    expect(screen.getByText('已复制')).toBeInTheDocument()
+  })
+
+  it('reports a failed user-message copy without adding another visible action', async () => {
+    const user = userEvent.setup()
+    vi.spyOn(navigator.clipboard, 'writeText').mockRejectedValueOnce(new Error('clipboard unavailable'))
+    render(<MessageBlock message={{
+      id: 'user-copy-failure',
+      role: 'user',
+      content: '复制失败样本',
+      createdAt: '2026-08-26T00:00:00Z',
+    }} />)
+
+    await user.click(screen.getByRole('button', { name: '复制消息' }))
+    expect(screen.getByRole('button', { name: '复制消息失败' })).toBeInTheDocument()
+    expect(screen.getByText('复制失败，请重试')).toBeInTheDocument()
+    expect(screen.getAllByRole('button')).toHaveLength(1)
   })
 })
 
@@ -500,15 +555,17 @@ describe('MessageBlock assistant composition', () => {
     )
 
     const markdown = container.querySelector('.message-markdown')
-    const actionRow = container.querySelector('.message-action-row')
+    const actionRow = container.querySelector('.message-action-row--assistant')
     expect(markdown).not.toBeNull()
     expect(actionRow).not.toBeNull()
     expect(screen.getByRole('group', { name: '回答操作' })).toBe(actionRow)
     expect(markdown!.compareDocumentPosition(actionRow!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     expect(container.querySelector('.source-summary, .citation')).toBeNull()
-    expect(conversationStyles).toMatch(/\.message-action-row\s*\{[^}]*align-items:\s*flex-start;[^}]*margin-top:\s*var\(--space-1\);/s)
-    expect(conversationStyles).toMatch(/\.message-action-row \.ui-icon-button-wrap\s*\{[^}]*width:\s*var\(--icon-sm\);/s)
-    expect(conversationStyles).toMatch(/\.message-action-row \.ui-icon-button\s*\{[^}]*margin-inline:\s*calc\(\(var\(--control-xs\) - var\(--icon-sm\)\) \/ -2\);/s)
+    expect(conversationStyles).toMatch(/\.message-action-row\s*\{[^}]*--message-action-control-size:\s*var\(--control-xs\);[^}]*--message-action-icon-size:\s*var\(--icon-lg\);[^}]*align-items:\s*flex-start;/s)
+    expect(conversationStyles).toMatch(/\.message-action-row--assistant\s*\{[^}]*min-height:\s*46px;[^}]*margin-top:\s*0;[^}]*padding-top:\s*5px;/s)
+    expect(conversationStyles).toMatch(/\.message-action-row--assistant \.ui-icon-button-wrap\s*\{[^}]*width:\s*var\(--message-action-icon-size\);/s)
+    expect(conversationStyles).toMatch(/\.message-action-row--assistant \.ui-icon-button\s*\{[^}]*margin-inline:\s*calc\(\(var\(--message-action-control-size\) - var\(--message-action-icon-size\)\) \/ -2\);/s)
+    expect(conversationStyles).toMatch(/@media \(any-hover:\s*none\), \(any-pointer:\s*coarse\)[\s\S]*\.message-action-row\s*\{\s*--message-action-control-size:\s*var\(--control-lg\);/s)
 
     await user.click(screen.getByRole('button', { name: '复制回答' }))
     expect(writeText).toHaveBeenCalledWith('这是**最终回答**')

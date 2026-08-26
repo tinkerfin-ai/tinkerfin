@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-import os
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from typing import Any, TypedDict, cast
@@ -16,6 +15,8 @@ from ag_ui.core import (
     BaseEvent,
     RunErrorEvent,
     RunFinishedEvent,
+    RunFinishedInterruptOutcome,
+    RunFinishedSuccessOutcome,
     StateDeltaEvent,
     StateSnapshotEvent,
 )
@@ -65,6 +66,7 @@ from tinkerfin.plan import (
     PlanDraft,
     PlanHandoffPhase,
     PlanModeConfigurationError,
+    PlanReviewAction,
     PlanSchemaReference,
     PlanState,
     PlanStatus,
@@ -595,6 +597,18 @@ def _terminal(events: Sequence[BaseEvent]) -> RunFinishedEvent:
     return terminals[0]
 
 
+def _interrupt_outcome(
+    events: Sequence[BaseEvent],
+) -> RunFinishedInterruptOutcome:
+    outcome = _terminal(events).outcome
+    assert isinstance(outcome, RunFinishedInterruptOutcome)
+    return outcome
+
+
+def _assert_success(events: Sequence[BaseEvent]) -> None:
+    assert isinstance(_terminal(events).outcome, RunFinishedSuccessOutcome)
+
+
 def _resume_entry(interrupt_id: str, payload: Mapping[str, object]) -> ResumeEntry:
     return ResumeEntry.model_validate(
         {
@@ -691,8 +705,26 @@ def test_plan_configuration_rejects_invalid_clarification_schemas(
 def test_plan_configuration_defaults_to_structured_and_freezes_custom_content() -> None:
     default_options = TinkerFin().plan()._plan_options
     custom_options = TinkerFin().plan(plan_schema=_CustomPlanContent)._plan_options
+    editable_options = (
+        TinkerFin()
+        .plan(
+            plan_schema=_CustomPlanContent,
+            review_actions=(
+                PlanReviewAction.APPROVE,
+                PlanReviewAction.EDIT,
+                PlanReviewAction.RESPOND,
+                PlanReviewAction.REJECT,
+            ),
+        )
+        ._plan_options
+    )
 
     assert default_options is not None
+    assert default_options.review_actions == (
+        PlanReviewAction.APPROVE,
+        PlanReviewAction.RESPOND,
+        PlanReviewAction.REJECT,
+    )
     assert default_options.content.schema is StructuredPlanContent
     assert default_options.content.reference.id == "tinkerfin.plan.structured.v1"
     assert custom_options is not None
@@ -702,11 +734,64 @@ def test_plan_configuration_defaults_to_structured_and_freezes_custom_content() 
         by_alias=True
     )
     assert "_CustomPlanContent" in planner_schema["$defs"]
-    review_schema = custom_options.contracts.review_response.json_schema(by_alias=True)
+    default_review_schema = custom_options.contracts.review_response.json_schema(
+        by_alias=True
+    )
+    assert set(default_review_schema["discriminator"]["mapping"]) == {
+        "approve",
+        "respond",
+        "reject",
+    }
+    with pytest.raises(ValidationError, match="union_tag_invalid"):
+        custom_options.contracts.review_response.validate_python(
+            {
+                "type": "edit",
+                "baseRevision": 1,
+                "content": {"goal": "Not accepted by the default contract"},
+            }
+        )
+    assert editable_options is not None
+    review_schema = editable_options.contracts.review_response.json_schema(
+        by_alias=True
+    )
     assert review_schema["discriminator"]["mapping"]["edit"].endswith("/EditPlan")
     assert review_schema["$defs"]["EditPlan"]["properties"]["content"] == {
         "$ref": "#/$defs/_CustomPlanContent"
     }
+
+
+@pytest.mark.parametrize(
+    "value", [None, "approve", [PlanReviewAction.APPROVE, "reject"]]
+)
+def test_plan_configuration_requires_fixed_review_action_values(value: object) -> None:
+    with pytest.raises(TypeError, match="PlanReviewAction"):
+        TinkerFin().plan(review_actions=cast(Any, value))
+
+
+@pytest.mark.parametrize(
+    "value",
+    [(), (PlanReviewAction.APPROVE, PlanReviewAction.APPROVE)],
+)
+def test_plan_configuration_rejects_empty_or_duplicate_review_actions(
+    value: tuple[PlanReviewAction, ...],
+) -> None:
+    with pytest.raises(PlanModeConfigurationError, match="review_actions"):
+        TinkerFin().plan(review_actions=value)
+
+
+def test_plan_configuration_freezes_a_single_review_action() -> None:
+    configured_actions = [PlanReviewAction.APPROVE]
+    options = TinkerFin().plan(review_actions=configured_actions)._plan_options
+    configured_actions.append(PlanReviewAction.EDIT)
+
+    assert options is not None
+    assert options.review_actions == (PlanReviewAction.APPROVE,)
+    schema = options.contracts.review_response.json_schema(by_alias=True)
+    assert schema["properties"]["type"]["const"] == "approve"
+    with pytest.raises(ValidationError, match="literal_error"):
+        options.contracts.review_response.validate_python(
+            {"type": "edit", "baseRevision": 1, "content": {}}
+        )
 
 
 @pytest.mark.parametrize(
@@ -721,6 +806,11 @@ def test_plan_configuration_rejects_invalid_content_schemas(schema: object) -> N
 def test_disabled_plan_rejects_a_non_default_content_schema() -> None:
     with pytest.raises(PlanModeConfigurationError, match="disabled Plan capability"):
         TinkerFin().plan(enabled=False, plan_schema=MarkdownPlanContent)
+    with pytest.raises(PlanModeConfigurationError, match="disabled Plan capability"):
+        TinkerFin().plan(
+            enabled=False,
+            review_actions=(PlanReviewAction.APPROVE,),
+        )
 
 
 @pytest.mark.parametrize(
@@ -1077,7 +1167,16 @@ async def test_markdown_plan_review_edit_and_handoff_preserve_exact_text() -> No
     )
     definition = (
         TinkerFin()
-        .plan(enabled=True, plan_schema=MarkdownPlanContent)
+        .plan(
+            enabled=True,
+            plan_schema=MarkdownPlanContent,
+            review_actions=(
+                PlanReviewAction.APPROVE,
+                PlanReviewAction.EDIT,
+                PlanReviewAction.RESPOND,
+                PlanReviewAction.REJECT,
+            ),
+        )
         .create_deep_agent(
             model=model,
             tools=[],
@@ -1259,17 +1358,15 @@ async def test_plan_approval_hands_off_to_native_with_the_same_message_id() -> N
 
 @pytest.mark.asyncio
 @pytest.mark.redis_e2e
-async def test_real_redis_plan_approval_executes_native_handoff() -> None:
-    redis_url = os.getenv("TINKERFIN_TEST_REDIS_URL")
-    if not redis_url:
-        pytest.skip("real Redis configuration is missing: TINKERFIN_TEST_REDIS_URL")
-
+async def test_real_redis_plan_approval_executes_native_handoff(
+    redis_checkpoint_url: str,
+) -> None:
     token = uuid4().hex
     thread_id = f"tinkerfin-plan-handoff-{token}"
     checkpoint_prefix = f"tinkerfin:test:plan:{token}:checkpoint"
     write_prefix = f"tinkerfin:test:plan:{token}:write"
     client = Redis.from_url(
-        redis_url,
+        redis_checkpoint_url,
         decode_responses=False,
         socket_connect_timeout=5,
         socket_timeout=5,
@@ -1310,7 +1407,7 @@ async def test_real_redis_plan_approval_executes_native_handoff() -> None:
             resume=binding,
         )
 
-        assert _terminal(completed).outcome.type == "success"
+        _assert_success(completed)
         assert len(model.model_inputs) == 2
         assert any(
             getattr(event, "delta", None) == "native done" for event in completed
@@ -1422,13 +1519,23 @@ async def test_plan_handoff_recovers_after_native_checkpoint_precedes_plan_marke
 
     async def cancel_after_native_checkpoint(
         self: PlanningWorkflowGraph[Any],
-        *args: object,
-        **kwargs: object,
+        config: RunnableConfig,
+        plan: PlanState[PlanContentModel],
+        *,
+        phase: PlanHandoffPhase,
+        native_checkpoint_id: str,
+        completed_checkpoint_id: str | None = None,
     ) -> PlanState[PlanContentModel]:
-        phase = kwargs.get("phase")
         if phase is PlanHandoffPhase.ACCEPTED:
             raise asyncio.CancelledError
-        return await original(self, *args, **kwargs)
+        return await original(
+            self,
+            config,
+            plan,
+            phase=phase,
+            native_checkpoint_id=native_checkpoint_id,
+            completed_checkpoint_id=completed_checkpoint_id,
+        )
 
     monkeypatch.setattr(
         PlanningWorkflowGraph,
@@ -1508,7 +1615,7 @@ async def test_agui_plan_resume_checkpoints_durably_and_retries_without_reexecut
     ]
     calls = len(model.model_inputs)
 
-    assert _terminal(events).outcome.type == "success"
+    _assert_success(events)
     assert len(checkpoints) == 1
     assert all(
         "_tinkerfin_resume" not in event.snapshot
@@ -1530,7 +1637,7 @@ async def test_agui_plan_resume_checkpoints_durably_and_retries_without_reexecut
         )
     ]
 
-    assert _terminal(retried).outcome.type == "success"
+    _assert_success(retried)
     assert len(model.model_inputs) == calls
     assert len(checkpoints) == 2
     assert checkpoints[0] == checkpoints[1]
@@ -1593,9 +1700,8 @@ async def test_plan_capable_runtime_routes_plan_shaped_generic_resume_to_native(
         config=config,
         mode="default",
     )
-    terminal = _terminal(review)
-    assert terminal.outcome.type == "interrupt"
-    public_interrupt = terminal.outcome.interrupts[0]
+    outcome = _interrupt_outcome(review)
+    public_interrupt = outcome.interrupts[0]
     payload = {"type": "approve", "baseRevision": 999, "vendor": "native"}
     entry = _resume_entry(public_interrupt.id, payload)
     translation = ResumeMapper().map_agui(
@@ -1620,7 +1726,7 @@ async def test_plan_capable_runtime_routes_plan_shaped_generic_resume_to_native(
         )
     ]
 
-    assert _terminal(resumed).outcome.type == "success"
+    _assert_success(resumed)
     assert resumed_payloads == [payload]
 
 
@@ -1679,7 +1785,7 @@ async def test_parent_run_id_branches_from_completed_plan_lineage() -> None:
         mode="default",
     )
 
-    assert _terminal(branched).outcome.type == "success"
+    _assert_success(branched)
     latest_input = model.model_inputs[-1]
     human_ids = {
         message.id for message in latest_input if isinstance(message, HumanMessage)
@@ -2274,7 +2380,13 @@ async def test_edit_is_authoritative_and_reenters_sufficiency_checks() -> None:
     model = _FakeModel(responses=[_planner(), _planner_clarification(), _accept_edit()])
     definition = (
         TinkerFin()
-        .plan(enabled=True)
+        .plan(
+            enabled=True,
+            review_actions=(
+                PlanReviewAction.EDIT,
+                PlanReviewAction.RESPOND,
+            ),
+        )
         .create_deep_agent(
             model=model,
             tools=[],
@@ -2631,7 +2743,7 @@ async def test_plan_enabled_default_subagent_resume_uses_only_the_native_head(
         resume=binding,
     )
 
-    assert _terminal(completed).outcome.type == "success"
+    _assert_success(completed)
     assert not any(
         "Ignoring unknown node name" in record.getMessage() for record in caplog.records
     )

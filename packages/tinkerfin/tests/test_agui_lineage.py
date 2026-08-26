@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncGenerator
 from operator import add
 from typing import Annotated, Any, TypedDict, cast
 
@@ -132,8 +132,9 @@ async def test_parent_run_id_creates_a_real_branch_with_one_canonical_identity(
     assert started.run_id == "run-c"
     assert started.parent_run_id == "run-a"
     assert started.input is None
-    assert c_head.metadata[CHECKPOINT_ROLE_METADATA_KEY] == NATIVE_CHECKPOINT_ROLE
-    assert c_head.metadata[PARENT_RUN_ID_METADATA_KEY] == "run-a"
+    metadata = dict[str, object](c_head.metadata)
+    assert metadata[CHECKPOINT_ROLE_METADATA_KEY] == NATIVE_CHECKPOINT_ROLE
+    assert metadata[PARENT_RUN_ID_METADATA_KEY] == "run-a"
 
 
 @pytest.mark.asyncio
@@ -330,7 +331,7 @@ async def test_active_parent_is_rejected(
     cast(Any, definition)._build_astream("default")
     active_graph = graphs[-1]
     active_identity = Identity(threadId="thread-1", runId="run-active")
-    active_stream: AsyncIterator[Mapping[str, object]] = active_graph.astream(
+    active_stream = active_graph.astream(
         {
             "history": ["active"],
             **lineage_state_update(
@@ -350,6 +351,7 @@ async def test_active_parent_is_rejected(
         version="v2",
         durability="sync",
     )
+    assert isinstance(active_stream, AsyncGenerator)
     await anext(active_stream)
     try:
         events, stream = await _run(

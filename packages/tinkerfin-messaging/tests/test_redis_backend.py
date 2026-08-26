@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import multiprocessing
-import os
 from collections import Counter
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Mapping, Sequence
 from multiprocessing.synchronize import Event as ProcessEvent
@@ -37,7 +36,6 @@ from tinkerfin_messaging import (
     _redis_scripts,
 )
 
-_REDIS_URL_ENV = "TINKERFIN_TEST_REDIS_URL"
 _RedisStreamEntry = tuple[bytes, dict[bytes, bytes]]
 _XReadResponse = list[tuple[bytes, list[_RedisStreamEntry]]]
 _RedisT = TypeVar("_RedisT", bound=Redis)
@@ -73,12 +71,10 @@ def _identity(
 
 def _redis_client(
     client_type: type[_RedisT],
+    redis_url: str,
     *,
     max_connections: int | None = None,
 ) -> _RedisT:
-    redis_url = os.getenv(_REDIS_URL_ENV)
-    if not redis_url:
-        pytest.skip(f"real Redis configuration is missing: {_REDIS_URL_ENV}")
     return cast(
         _RedisT,
         client_type.from_url(
@@ -367,11 +363,16 @@ class _GatedXreadRedis(Redis):
         return await cast(Awaitable[_XReadResponse], response)
 
 
-def _run_owner_until_killed(prefix: str, *, recoverable: bool) -> None:
+def _run_owner_until_killed(
+    redis_url: str,
+    prefix: str,
+    *,
+    recoverable: bool,
+) -> None:
     """Own one real Redis run until the parent deliberately kills this process."""
 
     async def run() -> None:
-        client = _redis_client(Redis)
+        client = _redis_client(Redis, redis_url)
         try:
             backend = RedisBackend(
                 client,
@@ -400,7 +401,11 @@ def _run_owner_until_killed(prefix: str, *, recoverable: bool) -> None:
     asyncio.run(run())
 
 
-def _run_delete_until_killed(prefix: str, cleanup_started: ProcessEvent) -> None:
+def _run_delete_until_killed(
+    redis_url: str,
+    prefix: str,
+    cleanup_started: ProcessEvent,
+) -> None:
     """Enter public stream deletion and wait inside one real Redis index read."""
 
     class _HangingDeleteRedis(Redis):
@@ -417,7 +422,7 @@ def _run_delete_until_killed(prefix: str, cleanup_started: ProcessEvent) -> None
             return await cast(Awaitable[object], response)
 
     async def run() -> None:
-        client = _redis_client(_HangingDeleteRedis)
+        client = _redis_client(_HangingDeleteRedis, redis_url)
         try:
             backend = RedisBackend(
                 client,
@@ -464,13 +469,15 @@ def test_redis_backend_uses_the_public_client_configuration_boundary() -> None:
 
 
 @pytest.fixture
-async def redis_backends() -> AsyncGenerator[
+async def redis_backends(
+    redis_url: str,
+) -> AsyncGenerator[
     tuple[RedisBackend, RedisBackend, Redis],
     None,
 ]:
-    first_client = _redis_client(Redis)
-    second_client = _redis_client(Redis)
-    cleanup_client = _redis_client(Redis)
+    first_client = _redis_client(Redis, redis_url)
+    second_client = _redis_client(Redis, redis_url)
+    cleanup_client = _redis_client(Redis, redis_url)
     prefix = f"tfmsg:test:{uuid4().hex}"
     try:
         try:
@@ -505,13 +512,15 @@ async def redis_backends() -> AsyncGenerator[
 
 
 @pytest.fixture
-async def counting_redis_backend() -> AsyncGenerator[
+async def counting_redis_backend(
+    redis_url: str,
+) -> AsyncGenerator[
     tuple[RedisBackend, _CommandCountingRedis, str],
     None,
 ]:
     """Provide one real backend whose command boundary remains observable."""
 
-    client = _redis_client(_CommandCountingRedis)
+    client = _redis_client(_CommandCountingRedis, redis_url)
     client.command_counts = Counter()
     prefix = f"tfmsg:counting:{uuid4().hex}"
     try:
@@ -571,14 +580,16 @@ async def test_channel_follow_binds_generation_across_redis_backend_instances(
 
 
 @pytest.fixture
-async def gated_xread_backends() -> AsyncGenerator[
+async def gated_xread_backends(
+    redis_url: str,
+) -> AsyncGenerator[
     tuple[RedisBackend, RedisBackend, _GatedXreadRedis],
     None,
 ]:
     """Provide separate waiting and state-changing clients for one XREAD race."""
 
-    waiting_client = _redis_client(_GatedXreadRedis)
-    actor_client = _redis_client(Redis)
+    waiting_client = _redis_client(_GatedXreadRedis, redis_url)
+    actor_client = _redis_client(Redis, redis_url)
     waiting_client.xread_entered = asyncio.Event()
     waiting_client.xread_release = asyncio.Event()
     prefix = f"tfmsg:gated-xread:{uuid4().hex}"
@@ -613,11 +624,13 @@ async def gated_xread_backends() -> AsyncGenerator[
 
 
 @pytest.fixture
-async def gated_redis_backend() -> AsyncGenerator[
+async def gated_redis_backend(
+    redis_url: str,
+) -> AsyncGenerator[
     tuple[RedisBackend, _GatedEvalRedis],
     None,
 ]:
-    client = _redis_client(_GatedEvalRedis)
+    client = _redis_client(_GatedEvalRedis, redis_url)
     client.eval_entered = asyncio.Event()
     client.eval_release = asyncio.Event()
     client.eval_returned = asyncio.Event()
@@ -1003,6 +1016,55 @@ async def test_real_redis_nonrecoverable_lease_expiry_uses_its_pttl(
         await _delete_prefix(client, prefix)
 
 
+async def test_real_redis_run_status_atomically_archives_an_expired_owner(
+    redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+) -> None:
+    _, _, client = redis_backends
+    prefix = f"tfmsg:status-expiry:{uuid4().hex}"
+    backend = RedisBackend(
+        client,
+        key_prefix=prefix,
+        lease_ttl=0.15,
+        poll_interval=10,
+    )
+    try:
+        prepared = await backend.prepare(
+            channel="events",
+            identity=_identity(),
+            codec="test.bytes.v1",
+            after=0,
+            cancellable=False,
+            recoverable=False,
+        )
+        assert prepared.is_owner is True
+        assert (
+            await backend.get_run_status(
+                channel="events",
+                identity=prepared.handle.identity,
+            )
+            == "running"
+        )
+
+        await asyncio.sleep(0.2)
+
+        assert (
+            await backend.get_run_status(
+                channel="events",
+                identity=prepared.handle.identity,
+            )
+            == "owner_lost"
+        )
+        assert (
+            await backend.get_run_status(
+                channel="events",
+                identity=prepared.handle.identity,
+            )
+            == "owner_lost"
+        )
+    finally:
+        await _delete_prefix(client, prefix)
+
+
 async def test_real_redis_recoverable_lease_expiry_waits_for_takeover_signal(
     redis_backends: tuple[RedisBackend, RedisBackend, Redis],
 ) -> None:
@@ -1067,8 +1129,14 @@ async def test_real_redis_recoverable_lease_expiry_waits_for_takeover_signal(
         await _delete_prefix(client, prefix)
 
 
-async def test_real_redis_cancelled_block_releases_the_only_connection() -> None:
-    client = _redis_client(_CommandCountingRedis, max_connections=1)
+async def test_real_redis_cancelled_block_releases_the_only_connection(
+    redis_url: str,
+) -> None:
+    client = _redis_client(
+        _CommandCountingRedis,
+        redis_url,
+        max_connections=1,
+    )
     client.command_counts = Counter()
     prefix = f"tfmsg:cancelled-block:{uuid4().hex}"
     waiting = None
@@ -1921,9 +1989,11 @@ async def test_real_redis_concurrent_deletes_converge_after_multiple_batches(
     ] == []
 
 
-async def test_real_redis_cancelled_delete_is_taken_over_after_lease_expiry() -> None:
-    gated_client = _redis_client(_GatedDeleteRedis)
-    takeover_client = _redis_client(Redis)
+async def test_real_redis_cancelled_delete_is_taken_over_after_lease_expiry(
+    redis_url: str,
+) -> None:
+    gated_client = _redis_client(_GatedDeleteRedis, redis_url)
+    takeover_client = _redis_client(Redis, redis_url)
     prefix = f"tfmsg:delete-takeover:{uuid4().hex}"
     gated_client.delete_cleanup_entered = asyncio.Event()
     gated_client.delete_cleanup_release = asyncio.Event()
@@ -2028,6 +2098,7 @@ async def test_real_redis_cancelled_delete_is_taken_over_after_lease_expiry() ->
 
 async def test_real_redis_delete_is_taken_over_after_worker_process_is_killed(
     redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+    redis_url: str,
 ) -> None:
     _, _, client = redis_backends
     prefix = f"tfmsg:delete-process:{uuid4().hex}"
@@ -2056,7 +2127,7 @@ async def test_real_redis_delete_is_taken_over_after_worker_process_is_killed(
     cleanup_started = context.Event()
     process = context.Process(
         target=_run_delete_until_killed,
-        args=(prefix, cleanup_started),
+        args=(redis_url, prefix, cleanup_started),
     )
     try:
         await asyncio.to_thread(process.start)
@@ -2827,13 +2898,14 @@ async def test_wrap_recoverable_reopens_from_the_last_real_redis_checkpoint(
 
 async def test_recoverable_source_resumes_after_owner_process_is_killed(
     redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+    redis_url: str,
 ) -> None:
     _, _, client = redis_backends
     prefix = f"tfmsg:process:{uuid4().hex}"
     context = multiprocessing.get_context("spawn")
     process = context.Process(
         target=_run_owner_until_killed,
-        args=(prefix,),
+        args=(redis_url, prefix),
         kwargs={"recoverable": True},
     )
     recovering = RedisBackend(
@@ -2914,13 +2986,14 @@ async def test_recoverable_source_resumes_after_owner_process_is_killed(
 
 async def test_ordinary_source_is_not_restarted_after_owner_process_is_killed(
     redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+    redis_url: str,
 ) -> None:
     _, _, client = redis_backends
     prefix = f"tfmsg:process:{uuid4().hex}"
     context = multiprocessing.get_context("spawn")
     process = context.Process(
         target=_run_owner_until_killed,
-        args=(prefix,),
+        args=(redis_url, prefix),
         kwargs={"recoverable": False},
     )
     observer = RedisBackend(

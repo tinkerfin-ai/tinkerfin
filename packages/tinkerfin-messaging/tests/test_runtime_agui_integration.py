@@ -1,21 +1,25 @@
-"""Structural integration with stateless TinkerFin Graph streams."""
+"""Structural integration with request-scoped TinkerFin Deep Agent streams."""
 
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator, Callable, Sequence
-from typing import Any, TypedDict
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any
 
 from ag_ui.core import BaseEvent, RawEvent
-from deepagents import create_deep_agent
+from langchain.agents.middleware.types import InputAgentState
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import Runnable
-from langchain_core.tools import BaseTool
+from langchain_core.tools import BaseTool, tool
 from langgraph.config import get_stream_writer
-from langgraph.graph import END, START, StateGraph
 
-from tinkerfin import AgUiNativeStreamConfig, Identity, TinkerFin
+from tinkerfin import (
+    DeepAgentDefinition,
+    Identity,
+    NativeGraphRunStream,
+    TinkerFin,
+)
 from tinkerfin_messaging import (
     MessageSubscription,
     Messaging,
@@ -57,45 +61,63 @@ async def _events(
     return [message.data async for message in subscription]
 
 
-def _graph():
+def _definition(*, custom: bool = False) -> DeepAgentDefinition[None]:
     model = _ToolBindingFakeModel(
         responses=[
-            AIMessage(content="native answer"),
-            AIMessage(content="agui answer"),
+            *(
+                [
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "emit_progress",
+                                "args": {"value": 1},
+                                "id": "call-progress",
+                                "type": "tool_call",
+                            }
+                        ],
+                    )
+                ]
+                if custom
+                else []
+            ),
+            AIMessage(content="answer"),
         ]
     )
-    graph = create_deep_agent(
+    return TinkerFin().create_deep_agent(
         model=model,
+        tools=[_emit_progress] if custom else [],
         system_prompt="Answer briefly.",
     )
-    return graph
-
-
-async def _empty_parts() -> AsyncIterator[object]:
-    if False:  # pragma: no cover - defines the async iterator shape
-        yield None
 
 
 async def test_agui_stream_is_a_directly_iterable_message_source() -> None:
-    events = TinkerFin().run(_empty_parts, identity=_identity()).astream_agui()
+    events = (
+        _definition()
+        .new_agui(identity=_identity())
+        .astream(InputAgentState(messages=[HumanMessage(content="AG-UI")]))
+    )
 
     aiter(events)
     await events.aclose()
 
 
 async def test_native_and_agui_streams_wrap_without_runtime_parameters() -> None:
-    graph = _graph()
+    definition = _definition()
 
     async with Messaging() as messaging:
         native_channel = messaging.channel(name="native-events")
         native_identity = _identity(thread_id="native-thread", run_id="native-run")
-        native_invocation = AgUiNativeStreamConfig().bind(
-            graph.astream,
-            {"messages": [{"role": "user", "content": "Native"}]},
+        native_source = definition.new(identity=native_identity).astream(
+            InputAgentState(messages=[HumanMessage(content="Native")]),
+            stream_mode=("messages", "tasks", "values"),
+            subgraphs=True,
         )
-        native_source = (
-            TinkerFin().run(native_invocation, identity=native_identity).astream()
-        )
+        assert isinstance(native_source, NativeGraphRunStream)
+        assert native_source.messaging_identity is native_identity
+        assert native_source.messaging_codec_profile == "langgraph.stream-part.v2.v1"
+        assert native_source.messaging_source_type is Mapping
+        assert native_source.messaging_replay_type is NativeStreamPart
         native = await native_channel.wrap(
             native_source,
             after=0,
@@ -103,20 +125,11 @@ async def test_native_and_agui_streams_wrap_without_runtime_parameters() -> None
 
         agui_channel = messaging.channel(name="agui-events")
         agui_identity = _identity(thread_id="agui-thread")
-        event_source = (
-            TinkerFin()
-            .run(
-                lambda: graph.astream(
-                    {"messages": [{"role": "user", "content": "AG-UI"}]},
-                    config={"configurable": {"thread_id": "agui-thread"}},
-                    stream_mode=("messages", "tasks", "values"),
-                    version="v2",
-                    subgraphs=True,
-                ),
-                identity=agui_identity,
-            )
-            .astream_agui()
+        event_source = definition.new_agui(identity=agui_identity).astream(
+            InputAgentState(messages=[HumanMessage(content="AG-UI")])
         )
+        assert event_source.messaging_identity is agui_identity
+        assert event_source.messaging_codec_profile == "agui.event.v1"
         agui = await agui_channel.wrap(
             event_source,
             after=0,
@@ -131,36 +144,32 @@ async def test_native_and_agui_streams_wrap_without_runtime_parameters() -> None
     assert agui_events[-1].type == "RUN_FINISHED"
 
 
-class _CustomState(TypedDict):
-    value: int
+@tool("emit_progress")
+def _emit_progress(value: int) -> str:
+    """Emit one custom progress record for the active Deep Agent run."""
 
-
-def _emit_custom(state: _CustomState) -> dict[str, int]:
-    get_stream_writer()({"progress": state["value"]})
-    return {"value": state["value"] + 1}
+    get_stream_writer()({"progress": value})
+    return f"emitted {value}"
 
 
 async def test_real_custom_stream_is_consistent_across_all_consumers() -> None:
-    builder = StateGraph(_CustomState)
-    builder.add_node("emit_custom", _emit_custom)
-    builder.add_edge(START, "emit_custom")
-    builder.add_edge("emit_custom", END)
-    graph = builder.compile()
-
-    def strict_run():
-        identity = _identity(thread_id="custom-thread", run_id="custom-run")
-        invocation = AgUiNativeStreamConfig(extra_modes=("custom",)).bind(
-            graph.astream,
-            {"value": 1},
+    def native_source(*, run_id: str):
+        return (
+            _definition(custom=True)
+            .new(identity=_identity(thread_id="custom-thread", run_id=run_id))
+            .astream(
+                InputAgentState(messages=[HumanMessage(content="Report progress")]),
+                stream_mode=("messages", "tasks", "values", "custom"),
+                subgraphs=True,
+            )
         )
-        return TinkerFin().run(invocation, identity=identity)
 
-    direct = [part async for part in strict_run().astream()]
+    direct = [part async for part in native_source(run_id="custom-direct")]
     assert any(
         part["type"] == "custom" and part["data"] == {"progress": 1} for part in direct
     )
 
-    frames = [frame async for frame in strict_run().astream().to_sse()]
+    frames = [frame async for frame in native_source(run_id="custom-sse").to_sse()]
     frame_payloads = [
         json.loads(frame.split("data: ", maxsplit=1)[1]) for frame in frames
     ]
@@ -171,7 +180,7 @@ async def test_real_custom_stream_is_consistent_across_all_consumers() -> None:
 
     async with Messaging() as messaging:
         subscription = await messaging.channel(name="custom-native").wrap(
-            strict_run().astream(),
+            native_source(run_id="custom-messaging"),
         )
         replay = await _native_parts(subscription)
 
@@ -179,7 +188,15 @@ async def test_real_custom_stream_is_consistent_across_all_consumers() -> None:
         part.mode == "custom" and part.data == {"progress": 1} for part in replay
     )
 
-    events = [event async for event in strict_run().astream_agui()]
+    events = [
+        event
+        async for event in _definition(custom=True)
+        .new_agui(identity=_identity(thread_id="custom-thread", run_id="custom-agui"))
+        .astream(
+            InputAgentState(messages=[HumanMessage(content="Report progress")]),
+            stream_mode=("messages", "tasks", "values", "custom"),
+        )
+    ]
     raw_events = [
         event
         for event in events

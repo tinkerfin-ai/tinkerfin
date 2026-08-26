@@ -15,71 +15,143 @@ from tinkerfin_studio.api.responses import ApiResponse
 logger = logging.getLogger(__name__)
 
 
+class _ErrorCodeValue(int):
+    """在创建整数枚举成员前携带响应元数据"""
+
+    http_status: int
+    message: str
+
+    def __new__(
+        cls,
+        code: int,
+        http_status: int,
+        message: str,
+    ) -> _ErrorCodeValue:
+        value = int.__new__(cls, code)
+        value.http_status = http_status
+        value.message = message
+        return value
+
+
 class ErrorCode(IntEnum):
     """同时携带 HTTP 状态与安全消息的业务错误码"""
 
     http_status: int
     message: str
 
-    def __new__(cls, code: int, http_status: int, message: str) -> ErrorCode:
-        member = int.__new__(cls, code)
-        member._value_ = code
-        member.http_status = http_status
-        member.message = message
+    def __new__(cls, value: _ErrorCodeValue) -> ErrorCode:
+        member = int.__new__(cls, int(value))
+        member._value_ = int(value)
+        member.http_status = value.http_status
+        member.message = value.message
         return member
 
 
 class GlobalErrorCode(ErrorCode):
     """跨模块通用错误"""
 
-    BAD_REQUEST = (400, 400, "请求参数不正确")
-    UNAUTHORIZED = (401, 401, "请先登录")
-    FORBIDDEN = (403, 403, "没有该操作权限")
-    NOT_FOUND = (404, 404, "请求未找到")
-    METHOD_NOT_ALLOWED = (405, 405, "请求方法不正确")
-    CONFLICT = (409, 409, "请求状态冲突")
-    VALIDATION_FAILED = (422, 422, "请求参数校验失败")
-    INTERNAL_SERVER_ERROR = (500, 500, "系统异常")
-    SERVICE_UNAVAILABLE = (503, 503, "服务暂不可用")
+    BAD_REQUEST = _ErrorCodeValue(400, 400, "请求参数不正确")
+    UNAUTHORIZED = _ErrorCodeValue(401, 401, "请先登录")
+    FORBIDDEN = _ErrorCodeValue(403, 403, "没有该操作权限")
+    NOT_FOUND = _ErrorCodeValue(404, 404, "请求未找到")
+    METHOD_NOT_ALLOWED = _ErrorCodeValue(405, 405, "请求方法不正确")
+    CONFLICT = _ErrorCodeValue(409, 409, "请求状态冲突")
+    VALIDATION_FAILED = _ErrorCodeValue(422, 422, "请求参数校验失败")
+    INTERNAL_SERVER_ERROR = _ErrorCodeValue(500, 500, "系统异常")
+    SERVICE_UNAVAILABLE = _ErrorCodeValue(503, 503, "服务暂不可用")
 
 
 class AuthErrorCode(ErrorCode):
     """认证模块错误"""
 
-    BAD_CREDENTIALS = (1_001_001_000, 401, "用户名或密码错误")
-    USER_DISABLED = (1_001_001_001, 403, "用户已被禁用")
-    SERVICE_UNAVAILABLE = (1_001_001_002, 503, "认证服务暂不可用")
+    BAD_CREDENTIALS = _ErrorCodeValue(1_001_001_000, 401, "用户名或密码错误")
+    USER_DISABLED = _ErrorCodeValue(1_001_001_001, 403, "用户已被禁用")
+    SERVICE_UNAVAILABLE = _ErrorCodeValue(1_001_001_002, 503, "认证服务暂不可用")
 
 
 class ModelErrorCode(ErrorCode):
     """模型目录错误"""
 
-    NOT_FOUND = (1_001_005_000, 422, "模型不存在")
-    DISABLED = (1_001_005_001, 409, "模型已停用")
-    CATALOG_UNAVAILABLE = (1_001_005_002, 503, "模型目录暂不可用")
+    NOT_FOUND = _ErrorCodeValue(1_001_005_000, 422, "模型不存在")
+    DISABLED = _ErrorCodeValue(1_001_005_001, 409, "模型已停用")
+    CATALOG_UNAVAILABLE = _ErrorCodeValue(1_001_005_002, 503, "模型目录暂不可用")
 
 
 class ConversationErrorCode(ErrorCode):
     """会话与分布式运行错误"""
 
-    NOT_FOUND = (1_001_004_000, 404, "会话不存在")
-    INVALID_CURSOR = (1_001_004_001, 422, "无效的分页游标")
-    RUN_CONFLICT = (1_001_004_002, 409, "会话当前状态不允许启动新的运行")
-    DELETE_CONFLICT = (1_001_004_003, 409, "会话仍在运行，请先停止并等待运行结束")
-    MESSAGING_UNAVAILABLE = (1_001_004_004, 503, "会话消息服务暂不可用")
-    USER_MESSAGE_REQUIRED = (1_001_004_006, 422, "初次运行必须包含文本 user 消息")
-    RESUME_REQUIRED = (1_001_004_013, 422, "resume 不能为空")
-    RESUME_THREAD_ID_REQUIRED = (1_001_004_017, 422, "恢复运行时 threadId 不能为空")
-    INVALID_LAST_EVENT_ID = (1_001_004_019, 400, "Last-Event-ID 必须是规范非负整数")
-    RUN_NOT_FOUND = (1_001_004_020, 404, "会话运行不存在")
-    RUN_IDENTITY_CONFLICT = (1_001_004_021, 409, "相同 runId 的请求内容不一致")
-    RUN_CANCEL_UNSUPPORTED = (1_001_004_022, 409, "当前运行不支持取消")
-    EVENT_PROJECTION_UNAVAILABLE = (1_001_004_023, 503, "会话事件投影暂不可用")
-    RUN_CANCEL_FAILED = (1_001_004_025, 500, "取消会话运行失败")
-    RESUME_ALREADY_CLAIMED = (1_001_004_026, 409, "该审批已被另一次恢复运行认领")
-    MESSAGING_FAILURE = (1_001_004_027, 500, "会话消息处理失败")
-    HISTORY_SCHEMA_MISMATCH = (1_001_004_028, 500, "会话历史数据不符合当前版本")
-    MESSAGING_QUOTA_EXCEEDED = (1_001_004_029, 413, "会话事件超过持久化容量限制")
+    NOT_FOUND = _ErrorCodeValue(1_001_004_000, 404, "会话不存在")
+    INVALID_CURSOR = _ErrorCodeValue(1_001_004_001, 422, "无效的分页游标")
+    RUN_CONFLICT = _ErrorCodeValue(
+        1_001_004_002,
+        409,
+        "会话当前状态不允许启动新的运行",
+    )
+    DELETE_CONFLICT = _ErrorCodeValue(
+        1_001_004_003,
+        409,
+        "会话仍在运行，请先停止并等待运行结束",
+    )
+    MESSAGING_UNAVAILABLE = _ErrorCodeValue(
+        1_001_004_004,
+        503,
+        "会话消息服务暂不可用",
+    )
+    USER_MESSAGE_REQUIRED = _ErrorCodeValue(
+        1_001_004_006,
+        422,
+        "初次运行必须包含文本 user 消息",
+    )
+    RESUME_REQUIRED = _ErrorCodeValue(1_001_004_013, 422, "resume 不能为空")
+    RESUME_THREAD_ID_REQUIRED = _ErrorCodeValue(
+        1_001_004_017,
+        422,
+        "恢复运行时 threadId 不能为空",
+    )
+    INVALID_LAST_EVENT_ID = _ErrorCodeValue(
+        1_001_004_019,
+        400,
+        "Last-Event-ID 必须是规范非负整数",
+    )
+    RUN_NOT_FOUND = _ErrorCodeValue(1_001_004_020, 404, "会话运行不存在")
+    RUN_IDENTITY_CONFLICT = _ErrorCodeValue(
+        1_001_004_021,
+        409,
+        "相同 runId 的请求内容不一致",
+    )
+    RUN_CANCEL_UNSUPPORTED = _ErrorCodeValue(
+        1_001_004_022,
+        409,
+        "当前运行不支持取消",
+    )
+    EVENT_PROJECTION_UNAVAILABLE = _ErrorCodeValue(
+        1_001_004_023,
+        503,
+        "会话事件投影暂不可用",
+    )
+    RUN_CANCEL_FAILED = _ErrorCodeValue(1_001_004_025, 500, "取消会话运行失败")
+    RESUME_ALREADY_CLAIMED = _ErrorCodeValue(
+        1_001_004_026,
+        409,
+        "该审批已被另一次恢复运行认领",
+    )
+    MESSAGING_FAILURE = _ErrorCodeValue(1_001_004_027, 500, "会话消息处理失败")
+    HISTORY_SCHEMA_MISMATCH = _ErrorCodeValue(
+        1_001_004_028,
+        500,
+        "会话历史数据不符合当前版本",
+    )
+    MESSAGING_QUOTA_EXCEEDED = _ErrorCodeValue(
+        1_001_004_029,
+        413,
+        "会话事件超过持久化容量限制",
+    )
+    PENDING_INTERRUPT = _ErrorCodeValue(1_001_004_030, 409, "请先处理当前待审批项")
+    REQUEST_TOO_LARGE = _ErrorCodeValue(
+        1_001_004_031,
+        413,
+        "用户消息超过当前容量限制",
+    )
 
 
 class ApplicationException(Exception):

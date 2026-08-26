@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
-from dataclasses import dataclass
 
 import pytest
 from sqlalchemy import event, inspect, text
@@ -12,32 +10,6 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from tinkerfin_sandbox import (
     SQLAlchemyOpenSandboxState,
     get_sqlalchemy_opensandbox_state_schema,
-)
-
-
-@dataclass(frozen=True, slots=True)
-class _MySQLServer:
-    url: str
-
-
-def _configured_mysql8_server() -> _MySQLServer | None:
-    mysql8_url = os.environ.get("TINKERFIN_TEST_MYSQL8_URL")
-    return None if not mysql8_url else _MySQLServer(url=mysql8_url)
-
-
-_MYSQL8_SERVER = _configured_mysql8_server()
-_MYSQL_PARAMS = (
-    (pytest.param(_MYSQL8_SERVER, id="mysql8"),)
-    if _MYSQL8_SERVER is not None
-    else (
-        pytest.param(
-            None,
-            marks=pytest.mark.skip(
-                reason="a disposable MySQL 8 URL was not configured"
-            ),
-            id="unconfigured",
-        ),
-    )
 )
 
 
@@ -85,9 +57,9 @@ def _reflect_mysql_schema(
     return table_names, index_names, table_comments, column_comments
 
 
-async def _reset_and_apply_exported_schema(server: _MySQLServer) -> None:
+async def _reset_and_apply_exported_schema(mysql_url: str) -> None:
     schema = get_sqlalchemy_opensandbox_state_schema(dialect="mysql")
-    engine = create_async_engine(server.url)
+    engine = create_async_engine(mysql_url)
     try:
         async with engine.begin() as connection:
             for table_name in reversed(schema.table_names):
@@ -99,22 +71,20 @@ async def _reset_and_apply_exported_schema(server: _MySQLServer) -> None:
 
 
 @pytest.mark.mysql_integration
-@pytest.mark.parametrize("server", _MYSQL_PARAMS)
 async def test_mysql8_export_and_runtime_claims_are_compatible(
-    server: _MySQLServer | None,
+    mysql_sandbox_url: str,
 ) -> None:
-    assert server is not None
-    await _reset_and_apply_exported_schema(server)
+    await _reset_and_apply_exported_schema(mysql_sandbox_url)
     observed_sql: list[str] = []
     first = SQLAlchemyOpenSandboxState(
-        url=server.url,
+        url=mysql_sandbox_url,
         namespace="integration-mysql8",
         lease_ttl=1.0,
         poll_interval=0.01,
         sqlite_retry_timeout=0,
     )
     second = SQLAlchemyOpenSandboxState(
-        url=server.url,
+        url=mysql_sandbox_url,
         namespace="integration-mysql8",
         lease_ttl=1.0,
         poll_interval=0.01,
@@ -140,7 +110,7 @@ async def test_mysql8_export_and_runtime_claims_are_compatible(
             second.start(warm_pool_size=2),
         )
         capabilities = first._require_capabilities()
-        assert capabilities.server_version[:2] == (8, 0)
+        assert capabilities.server_version[:2] == (8, 4)
         assert capabilities.supports_skip_locked is True
 
         initial_owner = await first.acquire_owner("serialized-owner")
@@ -244,7 +214,7 @@ async def test_mysql8_export_and_runtime_claims_are_compatible(
         event.remove(second._engine.sync_engine, "before_cursor_execute", capture_sql)
         await asyncio.gather(first.aclose(), second.aclose())
 
-    engine = create_async_engine(server.url)
+    engine = create_async_engine(mysql_sandbox_url)
     try:
         async with engine.connect() as connection:
             reflected = await connection.run_sync(_reflect_mysql_schema)

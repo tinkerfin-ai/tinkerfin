@@ -780,6 +780,41 @@ async def test_rooted_descriptor_detects_helper_exit_before_handshake() -> None:
 
 
 @pytest.mark.asyncio
+async def test_rooted_descriptor_drains_final_logs_after_terminal_status() -> None:
+    class DelayedTerminalLogs(_FakeDescriptorCommands):
+        async def get_background_command_logs(
+            self,
+            execution_id: str,
+            cursor: int | None = None,
+        ) -> object:
+            self.log_calls.append((execution_id, cursor))
+            if len(self.log_calls) == 1:
+                return SimpleNamespace(content="", cursor=0)
+            return SimpleNamespace(content=self._handshake + "\n", cursor=1)
+
+    sandbox = _FakeSandbox()
+    commands = DelayedTerminalLogs()
+    commands.helper_error = ("invalid_path", "confirmed delayed target error")
+    sandbox.commands = commands
+    backend = OpenSandboxBackend(sandbox=cast(Sandbox, sandbox))
+
+    response = await backend._aupload_rooted_file(
+        root="/workspace",
+        path="/target.bin",
+        content=b"content",
+    )
+
+    assert response.error == INVALID_PATH
+    assert sandbox.files.write_calls == []
+    assert commands.log_calls == [
+        (commands.execution_id, None),
+        (commands.execution_id, 0),
+    ]
+    assert commands.status_calls == [commands.execution_id, commands.execution_id]
+    assert commands.interrupt_calls == []
+
+
+@pytest.mark.asyncio
 async def test_rooted_descriptor_readiness_budget_bounds_hung_log_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

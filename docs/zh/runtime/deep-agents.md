@@ -84,6 +84,10 @@ Plan Mode 按下面的边界处理请求：
    计划审批通过 LangGraph interrupt 暂停
 4. 用户批准后冻结 `ConfirmedPlan`，以原用户消息 ID 提交确定性 handoff，并立即启动原生 Deep Agent
 
+Plan 审阅默认允许 `PlanReviewAction.APPROVE`、`RESPOND` 和 `REJECT`。如需改变允许动作，
+通过 `review_actions` 传入非空且不重复的有序集合；响应 Schema 只包含实际配置的动作。只有宿主
+提供可信计划编辑器时才应显式启用 `EDIT`。
+
 选择 Plan 时必须提供明确 Planner 模型和具体 `BaseCheckpointSaver`。TinkerFin 不会自动创建
 进程内 saver，也不会静默降低 durability；生产环境必须提供生产级 saver。Planning 与原生
 Deep Agent 借用同一个 saver、Store、cache、backend 和 runtime context。恢复时必须保持同一个
@@ -109,8 +113,8 @@ agent = tinkerfin.plan(
 ```
 
 自定义内容类型继承 `PlanContentModel`，声明稳定 `schema_id`，并使用精确的 Pydantic 字段。
-Definition 固定采用创建时选中的 Schema；草稿审阅、权威编辑、确认、checkpoint 恢复和执行
-handoff 始终使用同一份已校验内容。
+Definition 固定采用创建时选中的 Schema；草稿审阅、显式启用的编辑、确认、checkpoint 恢复和
+执行 handoff 始终使用同一份已校验内容。
 
 `mode="default"` 直接运行原生 Deep Agent Graph，不进入 Planning、不追加 middleware、不替换
 state schema，也不创建父 Graph。Todo、Tool/Filesystem HITL、子 Agent、取消和异常语义保持原生行为。
@@ -132,8 +136,8 @@ Python 字段使用 `allow_free_text`，JSON 边界使用 `allowFreeText`。每�
 从可信 Form 派生 Option label，拒绝跳过必填题，并把 skipped 保留为 Planner 上下文。同一 Plan 周期内，
 Planner 不得重复追问用户已明确跳过的可选题。
 
-完整编辑后的草稿是用户权威约束。Planner 只能继续澄清或接受该草稿，不得静默替换。澄清期间
-revision 不变；只有形成完整可审阅草稿时才递增一次。
+配置 `PlanReviewAction.EDIT` 后，完整编辑的草稿是用户权威约束。Planner 只能继续澄清或接受
+该草稿，不得静默替换。澄清期间 revision 不变；只有形成完整可审阅草稿时才递增一次。
 
 Plan Mode 固定使用 `sync` checkpoint durability。通常省略 `durability` 即可；显式传入
 `sync` 也可以，`async` 和 `exit` 会在事件流开始前报错。

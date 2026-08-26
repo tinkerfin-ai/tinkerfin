@@ -43,7 +43,8 @@ def _install_resume_graph(
     executions: list[object] = []
 
     def build(*_args: object, **_kwargs: object):
-        async def reviewed(_state: _ResumeState) -> dict[str, object]:
+        async def reviewed(state: _ResumeState) -> dict[str, object]:
+            del state
             answer = interrupt({"question": "continue?"})
             executions.append(answer)
             return {"result": "done"}

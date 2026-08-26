@@ -1,8 +1,6 @@
 import {
-  ChevronDown,
   ChevronLeft,
   ChevronRight,
-  ChevronUp,
   CircleHelp,
   MessageSquareText,
   X,
@@ -18,7 +16,7 @@ import {
 import { Button, IconButton, OverlayScrollbar } from '../../../components/ui'
 import type { PlanQuestionItem, PlanQuestionState } from '../../../types'
 import { useI18n } from '../../../i18n'
-import { ActivityDots } from './ActivityDots'
+import { PlanInteractionCard, PlanInteractionStatusRow } from './PlanInteractionCard'
 import {
   readPlanQuestionCollapsed,
   writePlanQuestionCollapsed,
@@ -44,15 +42,14 @@ const resizeCustomAnswer = (textarea: HTMLTextAreaElement | null) => {
 export function PlanQuestionStatusRow({ interaction }: { interaction: PlanQuestionState }) {
   const { t } = useI18n()
   return (
-    <div className="plan-question-wait-state">
-      <div className="plan-question-status-row" role={interaction.submitted ? 'status' : undefined}>
-        <CircleHelp size={14} aria-hidden="true" />
-        <strong>{t('提问')}</strong>
-        <span className="plan-question-status-separator" aria-hidden="true" />
-        <span>{interaction.submitted ? t('正在继续规划') : t('等待回答')}</span>
-      </div>
-      {!interaction.submitted && <ActivityDots label={t('等待回答')} />}
-    </div>
+    <PlanInteractionStatusRow
+      kind="question"
+      icon={<CircleHelp size={14} aria-hidden="true" />}
+      label={t('提问')}
+      pendingStatus={t('等待回答')}
+      submittedStatus={t('正在继续规划')}
+      submitted={interaction.submitted}
+    />
   )
 }
 
@@ -232,65 +229,34 @@ export function PlanQuestionComposer({
   }
 
   return (
-    <section
-      className={`plan-question-composer${minimized ? ' is-minimized' : ''}`}
-      aria-label={t('Plan 澄清问题')}
-      onWheel={(event) => {
-        const body = bodyRef.current
-        if (!body || body.scrollHeight <= body.clientHeight) {
-          event.preventDefault()
-          event.stopPropagation()
-          return
-        }
-        if (!body.contains(event.target as Node)) {
-          event.preventDefault()
-          event.stopPropagation()
-          body.scrollTop += event.deltaY
-        }
-      }}
-    >
-      <header className="plan-question-composer-head">
-        <button
-          type="button"
-          className="plan-question-toggle-surface"
-          aria-label={minimized
-            ? t('点击标题区域展开问题卡片')
-            : t('点击标题区域收起问题卡片')}
-          onClick={toggleMinimized}
+    <PlanInteractionCard
+      kind="question"
+      ariaLabel={t('Plan 澄清问题')}
+      minimized={minimized}
+      icon={<CircleHelp size={16} aria-hidden="true" />}
+      title={interaction.title}
+      titleMeta={minimized ? <>· {t('第 {current} / {total} 题', {
+        current: activeIndex + 1,
+        total: interaction.questions.length,
+      })}</> : undefined}
+      description={minimized ? question.prompt : interaction.description}
+      toggleSurfaceLabel={minimized
+        ? t('点击标题区域展开问题卡片')
+        : t('点击标题区域收起问题卡片')}
+      toggleLabel={minimized ? t('展开问题卡片') : t('收起问题卡片')}
+      onToggle={toggleMinimized}
+      bodyRef={bodyRef}
+      headerAction={(
+        <IconButton
+          size="sm"
+          className="plan-interaction-card-head-button plan-question-composer-head-button"
+          label={t('放弃本次 Plan 澄清')}
+          tooltip={t('放弃本次 Plan 澄清')}
+          icon={<X size={15} />}
+          onClick={onAbandon}
         />
-        <div className="plan-question-composer-heading">
-          <h2>
-            <CircleHelp size={16} aria-hidden="true" />
-            <span>{interaction.title}</span>
-            {minimized && <small>· {t('第 {current} / {total} 题', {
-              current: activeIndex + 1,
-              total: interaction.questions.length,
-            })}</small>}
-          </h2>
-          <p>{minimized ? question.prompt : interaction.description}</p>
-        </div>
-        <div className="plan-question-composer-head-actions">
-          <IconButton
-            size="sm"
-            className="plan-question-composer-head-button"
-            label={minimized ? t('展开问题卡片') : t('收起问题卡片')}
-            tooltip={minimized ? t('展开问题卡片') : t('收起问题卡片')}
-            icon={minimized ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
-            aria-expanded={!minimized}
-            onClick={toggleMinimized}
-          />
-          <IconButton
-            size="sm"
-            className="plan-question-composer-head-button"
-            label={t('放弃本次 Plan 澄清')}
-            tooltip={t('放弃本次 Plan 澄清')}
-            icon={<X size={15} />}
-            onClick={onAbandon}
-          />
-        </div>
-      </header>
-
-      {minimized && (
+      )}
+      minimizedContent={(
         <nav className="plan-question-progress" aria-label={t('问题进度')}>
           {progress.map((item) => (
             <button
@@ -309,9 +275,8 @@ export function PlanQuestionComposer({
           ))}
         </nav>
       )}
-
-      {!minimized && (
-        <>
+    >
+      <>
           <div
             ref={bodyRef}
             className="plan-question-composer-body ui-scrollbar"
@@ -432,8 +397,7 @@ export function PlanQuestionComposer({
               )}
             </div>
           </footer>
-        </>
-      )}
-    </section>
+      </>
+    </PlanInteractionCard>
   )
 }

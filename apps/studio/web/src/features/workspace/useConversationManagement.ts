@@ -7,7 +7,7 @@ import {
 } from '../../api/conversation/history'
 import type { ToastKind } from '../../components/ui/ToastViewport'
 import type { Conversation, WorkspaceState } from '../../types'
-import { clearPlanQuestionCollapsed } from '../conversation/planQuestionCollapse'
+import { clearInteractionCardCollapsed } from '../conversation/planQuestionCollapse'
 import {
   createNewConversation,
   removeConversation,
@@ -201,7 +201,7 @@ export function useConversationManagement({
       } else if (dialog.kind === 'delete') {
         if (dialog.isRunning) await cancelActiveRun()
         await deleteConversationApi(dialog.threadId)
-        clearPlanQuestionCollapsed(dialog.threadId)
+        clearInteractionCardCollapsed(dialog.threadId)
         if (dialog.threadId === latest.current.workspace.currentThreadId) {
           onConversationBoundary()
         }

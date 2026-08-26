@@ -249,6 +249,87 @@ def _project_pending_interrupts(
     }
 
 
+def _tool_approval_bindings(snapshot: dict[str, object]) -> dict[str, str]:
+    """返回当前 Tool approval 的 scoped Tool 与 interrupt 绑定"""
+
+    approval = snapshot.get("approval")
+    items = approval.get("items") if isinstance(approval, dict) else None
+    if not isinstance(items, list):
+        return {}
+    bindings: dict[str, str] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        tool_call_id = item.get("toolCallId")
+        interrupt_id = item.get("interruptId")
+        if isinstance(tool_call_id, str) and isinstance(interrupt_id, str):
+            bindings[tool_call_id] = interrupt_id
+    return bindings
+
+
+def _pause_interrupted_tools(snapshot: dict[str, object], *, run_id: str) -> None:
+    """暂停 interrupted 主 run 中仍未结束的根 Tool"""
+
+    bindings = _tool_approval_bindings(snapshot)
+    for message in _messages(snapshot):
+        meta = message.get("meta")
+        if (
+            message.get("role") != "tool"
+            or not isinstance(meta, dict)
+            or meta.get("status") != "running"
+            or meta.get("runId") != run_id
+            or meta.get("subRunId") is not None
+        ):
+            continue
+        meta["status"] = "paused"
+        tool_call_id = meta.get("toolCallId")
+        interrupt_id = (
+            bindings.get(tool_call_id) if isinstance(tool_call_id, str) else None
+        )
+        if interrupt_id is None:
+            meta.pop("interruptId", None)
+        else:
+            meta["interruptId"] = interrupt_id
+
+
+def _resume_pending_tools(snapshot: dict[str, object]) -> None:
+    """恢复当前 approval 所属主 run 的全部暂停根 Tool"""
+
+    reviewed_tool_ids = set(_tool_approval_bindings(snapshot))
+    if not reviewed_tool_ids:
+        return
+    interrupted_run_ids = {
+        meta["runId"]
+        for message in _messages(snapshot)
+        if message.get("role") == "tool"
+        and isinstance((meta := message.get("meta")), dict)
+        and meta.get("subRunId") is None
+        and meta.get("toolCallId") in reviewed_tool_ids
+        and isinstance(meta.get("runId"), str)
+    }
+    for message in _messages(snapshot):
+        meta = message.get("meta")
+        if (
+            message.get("role") != "tool"
+            or not isinstance(meta, dict)
+            or meta.get("status") != "paused"
+            or meta.get("subRunId") is not None
+            or meta.get("runId") not in interrupted_run_ids
+        ):
+            continue
+        meta["status"] = "running"
+        meta.pop("interruptId", None)
+
+
+def synchronize_pending_interrupts(
+    snapshot: dict[str, object],
+    interrupts: list[dict[str, object]],
+) -> None:
+    """按数据库当前 pending 事实重建可恢复交互投影"""
+
+    _project_pending_interrupts(snapshot, interrupts)
+
+
 def _project_todos(snapshot: dict[str, object], state: dict[str, object]) -> None:
     todos = state.get("todos")
     if not isinstance(todos, list):
@@ -313,6 +394,14 @@ def reduce_snapshot(
         and isinstance(snapshot.get("interrupts"), list)
         and bool(snapshot["interrupts"])
     )
+    if (
+        event_type == "RUN_STARTED"
+        and source_agent_type == "main"
+        and isinstance(resume, list)
+        and bool(resume)
+        and not initialization_failed
+    ):
+        _resume_pending_tools(snapshot)
     if resume_settled and isinstance(resume, list) and resume:
         snapshot["approval"] = None
         snapshot["interrupts"] = []
@@ -548,6 +637,7 @@ def reduce_snapshot(
                     else []
                 )
                 _project_pending_interrupts(snapshot, public_interrupts)
+                _pause_interrupted_tools(snapshot, run_id=event_run_id)
                 snapshot["runStatus"] = "waiting_approval"
             else:
                 snapshot["approval"] = None

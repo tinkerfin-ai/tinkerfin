@@ -8,6 +8,7 @@ from deepagents.graph import *
 from tinkerfin_agui_adapter import Identity as Identity
 
 from ._hitl import TINKERFIN_HITL_CONTRACT as TINKERFIN_HITL_CONTRACT
+from ._tasks import join_task as join_task
 from .agui_resume import AgUiResumeBinding as AgUiResumeBinding
 from .agui_resume import AgUiResumeCheckpoint as AgUiResumeCheckpoint
 from .agui_resume import AgUiResumeCheckpointObserver as AgUiResumeCheckpointObserver
@@ -17,6 +18,9 @@ from .deep_agent import DeepAgentAgUiResumeRuntime as DeepAgentAgUiResumeRuntime
 from .deep_agent import DeepAgentAgUiRuntime as DeepAgentAgUiRuntime
 from .deep_agent import DeepAgentDefinition as DeepAgentDefinition
 from .deep_agent import DeepAgentRuntime as DeepAgentRuntime
+from .errors import (
+    AgUiNativeStreamConfigurationError as AgUiNativeStreamConfigurationError,
+)
 from .errors import AgUiResumeBindingError as AgUiResumeBindingError
 from .errors import RedisLeaseError as RedisLeaseError
 from .errors import RedisLeaseLifecycleError as RedisLeaseLifecycleError
@@ -37,19 +41,14 @@ from .plan import AgentMode as AgentMode
 from .plan import ClarificationFormBase as _ClarificationFormBase
 from .plan import DefaultClarificationForm as _DefaultClarificationForm
 from .plan import PlanContentModel as _PlanContentModel
+from .plan import PlanReviewAction as _PlanReviewAction
 from .plan import StructuredPlanContent as _StructuredPlanContent
+from .plan._config import DEFAULT_PLAN_REVIEW_ACTIONS as _DEFAULT_PLAN_REVIEW_ACTIONS
 from .runtime import AgUiEventStream as AgUiEventStream
-from .runtime import AgUiNativeStreamConfig as AgUiNativeStreamConfig
-from .runtime import (
-    AgUiNativeStreamConfigurationError as AgUiNativeStreamConfigurationError,
-)
-from .runtime import AgUiNativeStreamInvocation as AgUiNativeStreamInvocation
 from .runtime import AgUiSettlementTimeoutError as AgUiSettlementTimeoutError
 from .runtime import EventObserver as EventObserver
-from .runtime import GraphRunStream as GraphRunStream
 from .runtime import NativeGraphRunStream as NativeGraphRunStream
 from .runtime import NativeStreamPart as NativeStreamPart
-from .runtime import NativeTinkerFinRun as NativeTinkerFinRun
 from .runtime import PartObserver as PartObserver
 from .runtime import SseBody as SseBody
 from .runtime import SseEventIdResolver as SseEventIdResolver
@@ -57,7 +56,6 @@ from .runtime import SseMapper as SseMapper
 from .runtime import SsePayload as SsePayload
 from .runtime import SsePreflight as SsePreflight
 from .runtime import TinkerFin as _RuntimeTinkerFin
-from .runtime import TinkerFinRun as TinkerFinRun
 
 class TinkerFin(_RuntimeTinkerFin):
     def plan(
@@ -68,6 +66,7 @@ class TinkerFin(_RuntimeTinkerFin):
         planner_model: str | BaseChatModel | None = None,
         clarification_schema: type[_ClarificationFormBase] = _DefaultClarificationForm,
         plan_schema: type[_PlanContentModel] = _StructuredPlanContent,
+        review_actions: Sequence[_PlanReviewAction] = _DEFAULT_PLAN_REVIEW_ACTIONS,
     ) -> TinkerFin: ...
     def create_deep_agent(
         self,

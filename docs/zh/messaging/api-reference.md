@@ -21,6 +21,7 @@
 | `wrap_recoverable(...)` | recoverable source、可选 `identity`、after、cancel、on_committed | 可恢复 subscription |
 | `read(...)` | `identity`、`after=0`、`limit=100` | 升序历史元组 |
 | `follow(...)` | `identity`、`after=0` | 跟随该 run 到终止 |
+| `get_run_status(...)` | `identity` | 当前权威 run 状态 |
 | `latest_seq(...)` | `identity` | thread 当前最后序号 |
 | `validate_cursor(...)` | `identity`、after | 只读校验游标 |
 | `cancel(...)` | `identity` | 请求取消并等待最终状态 |
@@ -86,6 +87,7 @@ TinkerFin profile source 的 `identity` 可省略；普通自定义 source 必�
 | `append(...)` | handle、message ID、codec、bytes、可选 checkpoint；返回 Envelope |
 | `begin_settlement(handle)` | 原子进入收尾，返回是否已有取消请求 |
 | `finish(...)` | handle、最终状态、可选 error |
+| `get_run_status(...)` | channel 与 Identity；可原子把过期 lease 判定为 `owner_lost` |
 | `latest_seq(...)` / `read(...)` | channel、Identity 与分页参数 |
 | `bind_follow(...)` / `follow(...)` | 绑定权威 generation 并持续读取 |
 | `request_cancel()` / `wait_for_cancel()` | 记录或等待取消 |

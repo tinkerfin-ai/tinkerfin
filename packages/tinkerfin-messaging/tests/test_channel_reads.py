@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import AsyncGenerator, AsyncIterator
-from typing import ClassVar
+from typing import ClassVar, cast
 
 import pytest
 
@@ -16,8 +17,12 @@ from tinkerfin_messaging import (
     MessageChannel,
     Messaging,
     MessagingBackend,
+    MessagingBackendProtocolError,
+    MessagingClosed,
+    MessagingErrorCode,
     RunNotFound,
     RunProducerFailed,
+    RunStatus,
     StreamDeleted,
 )
 
@@ -61,6 +66,21 @@ class _FailingSource:
             await self._iterator.aclose()
 
 
+class _MissingRunStatusBackend(MessagingBackend):
+    """Model an explicit backend subclass that omitted the new operation."""
+
+
+class _InvalidRunStatusBackend(MemoryBackend):
+    async def get_run_status(self, *, channel: str, identity: Identity) -> RunStatus:
+        del channel, identity
+        return cast(RunStatus, "corrupted")
+
+
+class _FalseyBackend(MemoryBackend):
+    def __bool__(self) -> bool:
+        return False
+
+
 async def _commit(messaging: Messaging, *items: str) -> MessageChannel[str, str]:
     channel = messaging.channel(name="events", codec=_TextCodec())
     subscription = await channel.wrap(
@@ -101,6 +121,115 @@ async def test_channel_empty_committed_stream_returns_zero_and_empty_page(
         empty = _identity(thread_id="empty")
         assert await channel.latest_seq(identity=empty) == 0
         assert await channel.read(identity=empty, after=0, limit=100) == ()
+
+
+async def test_channel_run_status_exposes_every_durable_state(
+    messaging_backend: MessagingBackend,
+) -> None:
+    """Hosts can reconcile durable state without probing a blocking follower."""
+
+    async with Messaging(backend=messaging_backend) as messaging:
+        channel = messaging.channel(name="events", codec=_TextCodec())
+        missing = _identity(run_id="run-missing")
+        with pytest.raises(RunNotFound):
+            await channel.get_run_status(identity=missing)
+
+        running = await messaging_backend.prepare(
+            channel=channel.name,
+            identity=_identity(run_id="run-running"),
+            codec=_TextCodec.codec_id,
+            after=0,
+            cancellable=True,
+            recoverable=False,
+        )
+        assert (
+            await channel.get_run_status(identity=running.handle.identity) == "running"
+        )
+        await messaging_backend.finish(running.handle, status="completed")
+
+        cancelling = await messaging_backend.prepare(
+            channel=channel.name,
+            identity=_identity(run_id="run-cancelling"),
+            codec=_TextCodec.codec_id,
+            after=0,
+            cancellable=True,
+            recoverable=False,
+        )
+        assert await messaging_backend.request_cancel(cancelling.handle) is True
+        assert (
+            await channel.get_run_status(identity=cancelling.handle.identity)
+            == "cancel_requested"
+        )
+        await messaging_backend.finish(cancelling.handle, status="cancelled")
+
+        for final_status in ("completed", "cancelled", "failed", "owner_lost"):
+            prepared = await messaging_backend.prepare(
+                channel=channel.name,
+                identity=_identity(run_id=f"run-{final_status}"),
+                codec=_TextCodec.codec_id,
+                after=0,
+                cancellable=True,
+                recoverable=False,
+            )
+            failure = (
+                RuntimeError(final_status)
+                if final_status in {"failed", "owner_lost"}
+                else None
+            )
+            await messaging_backend.finish(
+                prepared.handle,
+                status=final_status,
+                error=failure,
+            )
+            assert (
+                await channel.get_run_status(identity=prepared.handle.identity)
+                == final_status
+            )
+
+
+async def test_channel_run_status_rejects_calls_after_messaging_closes() -> None:
+    messaging = Messaging(backend=MemoryBackend())
+    async with messaging:
+        channel = messaging.channel(name="events", codec=_TextCodec())
+
+    with pytest.raises(MessagingClosed):
+        await channel.get_run_status(identity=_identity())
+
+
+def test_messaging_rejects_a_backend_missing_the_status_contract() -> None:
+    """Explicit and structural backends must implement the complete contract."""
+
+    assert inspect.isabstract(_MissingRunStatusBackend)
+    with pytest.raises(TypeError, match="backend must implement MessagingBackend"):
+        Messaging(backend=cast(MessagingBackend, object()))
+
+
+def test_messaging_keeps_a_valid_falsey_backend() -> None:
+    """Backend ownership is based on explicit presence rather than truthiness."""
+
+    backend = _FalseyBackend()
+
+    assert Messaging(backend=backend).backend is backend
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [_InvalidRunStatusBackend()],
+    ids=["invalid-status"],
+)
+async def test_channel_run_status_rejects_invalid_backend_results(
+    backend: MessagingBackend,
+) -> None:
+    """Replaceable backends cannot silently violate the public status contract."""
+
+    async with Messaging(backend=backend) as messaging:
+        channel = messaging.channel(name="events", codec=_TextCodec())
+
+        with pytest.raises(MessagingBackendProtocolError) as caught:
+            await channel.get_run_status(identity=_identity())
+
+    assert caught.value.code is MessagingErrorCode.BACKEND_PROTOCOL_ERROR
+    assert caught.value.diagnostic_context["operation"] == "get_run_status"
 
 
 async def test_channel_read_and_follow_reject_cursors_beyond_thread_tail(

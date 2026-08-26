@@ -55,12 +55,28 @@ export function ConversationItem({
   onToggleMenu?: (event: MouseEvent<HTMLButtonElement>) => void
 }) {
   const { t } = useI18n()
+  const requiresAttention = conversation.runStatus === 'waiting_approval'
+  // 状态点跟随当前接管输入区的业务交互，未水化摘要沿用审批色作为安全默认
+  const attentionTone = conversation.approval && !conversation.approval.submitted
+    ? 'approval'
+    : conversation.planInteraction && !conversation.planInteraction.submitted
+      ? conversation.planInteraction.kind === 'review' ? 'approval' : 'plan'
+      : 'approval'
+  const openLabel = t('打开会话：{title}', { title: conversation.title })
   return (
     <div
       className={`conversation-item overflow-marquee-trigger ${conversation.pinned ? 'is-pinned' : 'is-recent'} ${isActive ? 'is-active' : ''}`}
       data-history-thread-id={conversation.threadId}
     >
-      <button type="button" className="conversation-main" aria-label={t('打开会话：{title}', { title: conversation.title })} onClick={onSelect}>
+      <button
+        type="button"
+        className="conversation-main"
+        aria-label={requiresAttention ? `${openLabel}，${t('等待处理')}` : openLabel}
+        onClick={onSelect}
+      >
+        <span className="conversation-status-slot" aria-hidden="true">
+          {requiresAttention && <span className={`conversation-attention-dot is-${attentionTone}`} />}
+        </span>
         <OverflowMarquee className="conversation-title-marquee" endRevealInset={12}>{`${conversation.title}\u200b`}</OverflowMarquee>
       </button>
       {onToggleMenu && (
@@ -577,6 +593,7 @@ export function Sidebar({
                 <IconButton ref={overlayCloseButtonRef} label={t('关闭导航')} icon={<X size={18} />} onClick={() => onCloseOverlay()} />
               ) : (
                 <IconButton
+                  className="sidebar-mode-toggle"
                   size="sm"
                   label={t('收起侧边栏')}
                   tooltip={t('收起侧边栏')}
