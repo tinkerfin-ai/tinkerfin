@@ -134,7 +134,6 @@ export function useConversationManagement({
           ? { ...item, pinned: summary.pinned }
           : item,
       ))
-      onToast('success', nextPinned ? t('会话已置顶') : t('已取消置顶'))
     }).catch(() => {
       if (!isMounted.current) return
       setWorkspace((state) => updateConversation(
@@ -193,7 +192,6 @@ export function useConversationManagement({
             dialog.threadId,
             (item) => ({ ...item, title }),
           ))
-          onToast('success', t('会话已重命名'))
         }
       } else if (dialog.kind === 'disable-plan') {
         abandonPlanInteraction(dialog.threadId)
@@ -206,7 +204,6 @@ export function useConversationManagement({
           onConversationBoundary()
         }
         setWorkspace((state) => removeConversation(state, dialog.threadId))
-        onToast('success', t('会话已删除'))
       } else {
         if (hasActiveStream()) {
           const runningThreadId = getActiveThreadId()

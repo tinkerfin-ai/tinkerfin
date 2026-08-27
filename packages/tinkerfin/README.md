@@ -86,7 +86,7 @@ default_runtime = agent.new_agui(
 ```
 
 Plan review defaults to `PlanReviewAction.APPROVE`, `RESPOND`, and `REJECT`.
-`.plan(review_actions=...)` accepts an ordered, non-empty sequence of distinct
+`.plan(allowed_review_actions=...)` accepts an ordered, non-empty sequence of distinct
 `PlanReviewAction` values and publishes exactly those decisions in the interrupt
 response Schema. A host with a trusted draft editor can explicitly include
 `PlanReviewAction.EDIT`; editing is not enabled by default.
@@ -101,26 +101,27 @@ an explicit non-`sync` value is rejected.
 `mode="default"` calls the native Deep Agent Graph directly without running Planning or
 creating a parent Graph. Every Definition includes a private resume marker channel.
 Definitions with Tool review also replace the existing Deep Agents patch middleware slot
-with a version-bound adapter that preserves patch behavior and delegates
+with a locked-dependency adapter that preserves patch behavior and delegates
 approve/edit/reject/respond to LangChain unchanged. Its only extension is an internal
 cancel decision used for mixed AG-UI resume batches.
 
 Only `ls`, `read_file`, `glob`, and `grep` are available to the Planner. Every
-clarification question explicitly declares whether it is required. Questions can contain
-model-generated single-select options, can optionally allow a free-text answer, and an
-optional question can be explicitly skipped. Selecting an option submits only its stable
-ID; the Planning workflow derives the trusted label from the checkpointed form. A skipped
-answer remains explicit trusted Plan context rather than an omitted payload. Approval freezes a `ConfirmedPlan`
+clarification question explicitly declares whether it is required and selects one semantic
+answer type: `single_choice`, `multiple_choice`, `text`, or `date`. Choice questions can
+accept one custom alternative, and optional questions can be explicitly skipped. Clients
+submit stable option IDs or typed values under the checkpoint question ID; Planning derives
+trusted option labels and canonical values from the checkpointed form. A skipped answer
+remains explicit trusted Plan context rather than an omitted payload. Approval freezes a `ConfirmedPlan`
 and commits a deterministic handoff bound to the original user message ID. The runtime
 then starts the native Deep Agent in the same request; the effective mode becomes
 `default` before execution. The public Plan state and value models are available from
 `tinkerfin.plan` and are emitted under the root state key `tinkerfin_plan`.
 
-Plan content is independently configurable. Omitting `plan_schema` uses
+Plan content is independently configurable. Omitting `content_schema` uses
 `StructuredPlanContent`; pass `MarkdownPlanContent` for one exact Markdown document, or
-provide a concrete `PlanContentModel` subclass with a stable `schema_id`. The selected
-schema is frozen on the returned factory, validated before checkpoint persistence, and
-used for Planner output, any explicitly enabled edit, review, confirmed content, and
+provide a concrete `PlanContentModel` subclass. The selected schema is frozen on the
+returned factory, fingerprinted automatically, validated before checkpoint persistence,
+and used for Planner output, any explicitly enabled edit, review, confirmed content, and
 native handoff.
 
 The default clarification form requires no application models. A host that needs typed,
@@ -129,10 +130,9 @@ factory:
 
 ```python
 from tinkerfin.plan import (
-    ClarificationForm,
+    BuiltInClarificationForm,
     ClarificationModel,
-    ClarificationOption,
-    ClarificationQuestion,
+    ClarificationOptionBase,
 )
 
 
@@ -144,15 +144,11 @@ class AppOptionAttributes(ClarificationModel):
     priority: int
 
 
-class AppOption(ClarificationOption[AppOptionAttributes]):
-    pass
+class AppOption(ClarificationOptionBase):
+    attributes: AppOptionAttributes
 
 
-class AppQuestion(ClarificationQuestion[AppQuestionAttributes, AppOptionAttributes]):
-    options: tuple[AppOption, ...] = ()
-
-
-class AppClarificationForm(ClarificationForm[AppQuestion]):
+class AppClarificationForm(BuiltInClarificationForm[AppQuestionAttributes, AppOption]):
     pass
 
 
@@ -169,11 +165,58 @@ agent = (
 ```
 
 Question and option attributes must inherit `ClarificationModel`; arbitrary dictionary
-attributes are rejected. Host models may add discriminant fields, but framework-owned
-IDs, display text, answer-path fields, and tuple containers cannot be redefined. The
-attributes are model-generated public context whose structure is validated, not
-authoritative data for permissions, billing, or compliance. A pending clarification
-must resume with the same Definition-bound form schema.
+attributes are rejected. Inherit `ClarificationOptionBase` and declare `attributes` as
+shown when metadata is required, or use `ClarificationOption[AppOptionAttributes]` when
+it is optional. The configured Form union can include only a subset of the built-in
+question types. The attributes are model-generated public context whose structure is
+validated, not authoritative data for permissions, billing, or compliance. A pending
+clarification resumes only after its exact Form and response Schema pass the
+Definition-bound preflight.
+
+A host-defined semantic answer type is one immutable registration unit:
+
+```python
+from typing import Literal
+
+from pydantic import Field
+from tinkerfin.plan import (
+    ClarificationQuestionBase,
+    ClarificationResponseBase,
+    clarification_type,
+)
+
+
+class RatingQuestion(ClarificationQuestionBase):
+    answer_type: Literal["acme:rating.v1"] = "acme:rating.v1"
+
+
+class RatingResponse(ClarificationResponseBase):
+    answer_type: Literal["acme:rating.v1"] = "acme:rating.v1"
+    rating: int = Field(ge=1, le=5)
+
+
+rating_type = clarification_type(
+    type_id="acme:rating.v1",
+    description="Use for one bounded integer rating.",
+    question_model=RatingQuestion,
+    response_model=RatingResponse,
+    normalize=lambda _question, response: {"rating": response.rating},
+)
+
+agent = (
+    TinkerFin()
+    .plan(clarification_types=(rating_type,))
+    .create_deep_agent(
+        model="openai:gpt-5.4",
+        checkpointer=production_checkpointer,
+    )
+)
+```
+
+Custom type IDs are versioned and namespaced. Their callbacks are synchronous,
+deterministic, and free of external I/O. The host client supplies a renderer for each
+custom type it enables. Changing a per-question Schema, validator, or normalizer requires
+a new type ID version so an existing checkpoint cannot acquire different semantics.
 
 `.plan(...)` returns a separate TinkerFin factory while retaining the configured run
 coordinator and global state schema. Every Definition freezes the capability options of

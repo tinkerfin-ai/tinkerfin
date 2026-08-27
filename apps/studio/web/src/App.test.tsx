@@ -133,6 +133,7 @@ function historyListItem(overrides: Partial<ConversationHistoryListResponse['ite
     messageCount: 1,
     toolCallCount: 0,
     hasPendingInterrupt: false,
+    pendingInteractionKind: null,
     pinned: false,
     createdAt: BASE_TIME,
     updatedAt: BASE_TIME,
@@ -162,7 +163,6 @@ function historyDetail(
   const assistantContent = `来自 ${title} 的历史回复`
   const currentSnapshot: ConversationSnapshotJson = {
     snapshotSeq,
-    snapshotVersion: 3,
     messages: [{
       id: `${threadId}-assistant-1`,
       role: 'assistant',
@@ -187,10 +187,10 @@ function historyDetail(
     lastModel: 'GPT-5.5',
     lastSeq,
     snapshotSeq,
-    snapshotVersion: 3,
     messageCount: 1,
     toolCallCount: 0,
     hasPendingInterrupt: false,
+    pendingInteractionKind: null,
     snapshot: snapshot === undefined ? currentSnapshot : snapshot,
     events: events ?? [],
     createdAt: BASE_TIME,
@@ -627,22 +627,28 @@ describe('App', () => {
                 id: 'plan-review-app',
                 reason: 'tinkerfin:plan_review',
                 message: '请确认 Plan',
+                responseSchema: { type: 'object' },
                 metadata: {
                   runtimeInterrupt: {
+                    schema: 'tinkerfin.runtime-interrupt',
+                    nativeInterruptId: 'plan-review-app',
                     envelope: {
+                      schema: 'tinkerfin.runtime-interrupt',
+                      kind: 'tinkerfin:plan_review',
+                      responseSchema: { type: 'object' },
                       metadata: {
                         origin: 'plan',
                         review: {
-                          schema: 'tinkerfin.plan-review.v1',
                           draft: {
-                            schemaVersion: 1,
                             revision: 1,
                             contentSchema: {
-                              id: 'tinkerfin.plan.markdown.v1',
                               fingerprint: '0'.repeat(64),
                               mediaType: 'text/markdown',
                             },
-                            content: { markdown: '# 实现模式切换\n\n保持父图稳定' },
+                            content: {
+                              description: '切换实现模式并保持父图稳定',
+                              markdown: '# 实现模式切换\n\n保持父图稳定',
+                            },
                           },
                         },
                       },
@@ -706,7 +712,7 @@ describe('App', () => {
                   }],
                 },
                 deepagents: {
-                  schema: 'tinkerfin.deepagents.tool-review.v1',
+                  schema: 'tinkerfin.deepagents.tool-review',
                   nativeInterruptId: INTERRUPT_ID,
                   actionIndex: 0,
                   toolName: 'write_file',
@@ -998,6 +1004,101 @@ describe('App', () => {
     expect(screen.getByRole('button', { name: 'Plan 已开启，点击关闭' })).toBeInTheDocument()
   })
 
+  it('keeps a Plan clarification blue from the initial summary through detail hydration', async () => {
+    const responseSchema = { type: 'object' } as const
+    const planSnapshot: ConversationSnapshotJson = {
+      snapshotSeq: 6,
+      messages: [],
+      todos: [],
+      mode: 'plan',
+      approval: null,
+      runStatus: 'waiting_approval',
+      activeRunId: null,
+      serverState: {},
+      runs: {},
+      interrupts: [{
+        id: 'plan-summary-interrupt',
+        reason: 'tinkerfin:plan_clarification',
+        responseSchema,
+        metadata: {
+          runtimeInterrupt: {
+            schema: 'tinkerfin.runtime-interrupt',
+            nativeInterruptId: 'plan-summary-interrupt',
+            envelope: {
+              schema: 'tinkerfin.runtime-interrupt',
+              kind: 'tinkerfin:plan_clarification',
+              responseSchema,
+              metadata: {
+                origin: 'plan',
+                clarification: {
+                  form: {
+                    title: '确认范围',
+                    description: '确认本次回归范围',
+                    questions: [{
+                      id: 'scope',
+                      answerType: 'text',
+                      prompt: '需要覆盖哪些路径？',
+                      required: true,
+                    }],
+                  },
+                },
+              },
+            },
+          },
+        },
+        allowedDecisions: [],
+        originalArgs: {},
+      }],
+    }
+    installFetchMock({
+      historyLists: [{
+        items: [
+          historyListItem({ threadId: THREAD_ID, title: '普通会话' }),
+          historyListItem({
+            id: 2,
+            threadId: SECOND_THREAD_ID,
+            title: 'Plan 澄清会话',
+            status: 'waiting_approval',
+            lastRunId: 'run-plan-summary',
+            lastSeq: 6,
+            messageCount: 0,
+            hasPendingInterrupt: true,
+            pendingInteractionKind: 'plan_clarification',
+          }),
+        ],
+        nextCursor: null,
+      }],
+      historyDetails: {
+        [THREAD_ID]: historyDetail({ threadId: THREAD_ID, title: '普通会话' }),
+        [SECOND_THREAD_ID]: historyDetail({
+          threadId: SECOND_THREAD_ID,
+          title: 'Plan 澄清会话',
+          status: 'waiting_approval',
+          lastRunId: 'run-plan-summary',
+          lastSeq: 6,
+          snapshotSeq: 6,
+          messageCount: 0,
+          hasPendingInterrupt: true,
+          pendingInteractionKind: 'plan_clarification',
+          snapshot: planSnapshot,
+        }),
+      },
+    })
+
+    const user = userEvent.setup()
+    render(<App />)
+
+    expect(await screen.findByText('来自 普通会话 的历史回复')).toBeInTheDocument()
+    const planButton = screen.getByRole('button', { name: '打开会话：Plan 澄清会话，等待处理' })
+    expect(planButton.querySelector('.conversation-attention-dot')).toHaveClass('is-plan')
+
+    await user.click(planButton)
+
+    expect(await screen.findByRole('region', { name: 'Plan 澄清问题' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '打开会话：Plan 澄清会话，等待处理' })
+      .querySelector('.conversation-attention-dot')).toHaveClass('is-plan')
+  })
+
   it('cancels stale hydration when switching threads and disables the composer meanwhile', async () => {
     let firstDetailSignal: AbortSignal | undefined
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
@@ -1178,7 +1279,6 @@ describe('App', () => {
           lastSeq: 3,
           snapshot: {
             snapshotSeq: 3,
-            snapshotVersion: 3,
             messages: [
               { id: 'server-user', role: 'user', content: '刷新后继续', createdAt: BASE_TIME },
               {
@@ -1494,7 +1594,6 @@ describe('App', () => {
           events: [],
           snapshot: {
             snapshotSeq: 250,
-            snapshotVersion: 3,
             messages,
             todos: [],
             mode: 'default',
@@ -1559,9 +1658,10 @@ describe('App', () => {
       expect(fetchMock.patchCalls).toContainEqual({ threadId: THREAD_ID, body: { pinned: true } })
     })
     expect(await screen.findByRole('heading', { name: '置顶' })).toBeInTheDocument()
+    expect(screen.queryByText('会话已置顶')).not.toBeInTheDocument()
   })
 
-  it('renames a conversation with the custom dialog and reports success through a toast', async () => {
+  it('renames a conversation with the custom dialog without a success toast', async () => {
     const fetchMock = installFetchMock({
       historyLists: [{
         items: [historyListItem({ threadId: THREAD_ID, title: '旧名称' })],
@@ -1593,7 +1693,7 @@ describe('App', () => {
     })
     expect(await screen.findByRole('button', { name: '打开会话：新名称' })).toBeInTheDocument()
     expect(document.title).toBe('新名称')
-    expect(await screen.findByText('会话已重命名')).toBeInTheDocument()
+    expect(screen.queryByText('会话已重命名')).not.toBeInTheDocument()
   })
 
   it('returns focus to the conversation menu trigger when rename is cancelled', async () => {
@@ -1650,7 +1750,7 @@ describe('App', () => {
     await waitFor(() => {
       expect(screen.queryByRole('button', { name: '打开会话：第二条会话' })).not.toBeInTheDocument()
     })
-    expect(await screen.findByText('会话已删除')).toBeInTheDocument()
+    expect(screen.queryByText('会话已删除')).not.toBeInTheDocument()
     expect(window.sessionStorage.getItem(approvalCollapseKey(SECOND_THREAD_ID))).toBeNull()
     expect(window.sessionStorage.getItem(planQuestionCollapseKey(SECOND_THREAD_ID))).toBeNull()
     expect(window.sessionStorage.getItem(planReviewCollapseKey(SECOND_THREAD_ID))).toBeNull()
@@ -2571,12 +2671,12 @@ describe('App', () => {
       events: [],
       snapshot: {
         snapshotSeq: 0,
-        snapshotVersion: 3,
         messages: [],
         todos: [{ id: 'todo-read-url', content: '读取 url.json', status: 'running' }],
         mode: 'default',
         approval: null,
         runStatus: 'idle',
+        activeRunId: null,
         serverState: {},
         runs: {},
         interrupts: [],
@@ -2716,7 +2816,7 @@ describe('App', () => {
                       review_configs: nativePolicies,
                     },
                     deepagents: {
-                      schema: 'tinkerfin.deepagents.tool-review.v1',
+                      schema: 'tinkerfin.deepagents.tool-review',
                       nativeInterruptId: INTERRUPT_ID,
                       actionIndex: 0,
                       toolName: 'write_file',
@@ -2736,7 +2836,7 @@ describe('App', () => {
                       review_configs: nativePolicies,
                     },
                     deepagents: {
-                      schema: 'tinkerfin.deepagents.tool-review.v1',
+                      schema: 'tinkerfin.deepagents.tool-review',
                       nativeInterruptId: INTERRUPT_ID,
                       actionIndex: 1,
                       toolName: 'write_file',
@@ -2801,12 +2901,17 @@ describe('App', () => {
     const user = await sendMessage('请写入结果')
 
     expect(await screen.findByRole('region', { name: '等待审批' })).toHaveTextContent('result.txt')
-    expect(document.querySelectorAll('.message-list [data-tool-name="write_file"]')).toHaveLength(2)
+    expect(document.querySelectorAll('.message-list [data-tool-name="write_file"]')).toHaveLength(1)
+    expect(document.querySelector('.message-list [data-tool-name="write_file"]'))
+      .toHaveTextContent('result.txt')
     expect(screen.queryByRole('button', { name: '编辑' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: '批量提交' })).not.toBeInTheDocument()
 
     await user.click(screen.getByRole('button', { name: '允许' }))
     expect(screen.getByRole('region', { name: '等待审批' })).toHaveTextContent('second-result.txt')
+    expect(document.querySelectorAll('.message-list [data-tool-name="write_file"]')).toHaveLength(1)
+    expect(document.querySelector('.message-list [data-tool-name="write_file"]'))
+      .toHaveTextContent('second-result.txt')
     await user.click(screen.getByRole('button', { name: '拒绝' }))
     await user.type(screen.getByLabelText('拒绝原因（可选）'), '不写入第二份文件')
     await user.click(screen.getByRole('button', { name: '确认拒绝' }))
@@ -2821,7 +2926,9 @@ describe('App', () => {
     const resumeRequest = JSON.parse(String(resumeRequestInit?.body)) as ChatRequestPayload
     expect(resumeRequest.threadId).toBe(THREAD_ID)
     expect(resumeRequest.forwardedProps).toEqual({ model: 'GPT-5.5', command: { plan: 'off' } })
-    await waitFor(() => expect(document.querySelector('[data-tool-name="write_file"]')).not.toBeNull())
+    await waitFor(() => {
+      expect(document.querySelectorAll('.message-list [data-tool-name="write_file"]')).toHaveLength(2)
+    })
     expect(screen.getAllByText('Write').length).toBeGreaterThanOrEqual(2)
     expect(resumeRequest.resume).toEqual([
       {

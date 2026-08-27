@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from .contracts import Identity
 from .ids import ScopedIdCodec
 
-SUBAGENT_PROVENANCE_SCHEMA = "tinkerfin.subagent-provenance.v1"
+SUBAGENT_PROVENANCE_SCHEMA = "tinkerfin.subagent-provenance"
 
 
 class SubagentTaskInput(BaseModel):
@@ -45,7 +45,7 @@ class SubagentProvenance(BaseModel):
         populate_by_name=True,
     )
 
-    schema_id: Literal["tinkerfin.subagent-provenance.v1"] = Field(
+    schema_id: Literal["tinkerfin.subagent-provenance"] = Field(
         alias="schema",
         description="Exact TinkerFin subagent provenance schema",
     )
@@ -122,7 +122,7 @@ def subagent_invocation_id(
     identity: Identity,
     parent_tool_call_id: str,
 ) -> str:
-    """Return the canonical v1 logical invocation ID.
+    """Return the canonical logical invocation ID.
 
     Args:
         identity: Current request identity; only its stable thread ID participates.

@@ -80,13 +80,14 @@ Plan Mode routes a request through these boundaries:
 
 1. One read-only Planner judges whether intent and constraints are sufficient.
 2. The Planner can use only `ls`, `read_file`, `glob`, and `grep`.
-3. Clarification can provide model-generated single-select options and optional free
-   text; clarification and plan review pause through LangGraph interrupts.
+3. Each clarification question uses a Planner-selected `single_choice`,
+   `multiple_choice`, `text`, or `date` answer type; clarification and plan review pause
+   through LangGraph interrupts.
 4. Approval freezes a `ConfirmedPlan`, commits a deterministic handoff using the
    original user message ID, and immediately starts the native Deep Agent.
 
 Plan review defaults to `PlanReviewAction.APPROVE`, `RESPOND`, and `REJECT`.
-Pass a non-empty, duplicate-free `review_actions` sequence to change the accepted
+Pass a non-empty, duplicate-free `allowed_review_actions` sequence to change the accepted
 decisions. The response Schema contains exactly that sequence; `EDIT` is available only
 when the host explicitly enables it and provides a trusted draft editor.
 
@@ -107,7 +108,7 @@ from tinkerfin.plan import MarkdownPlanContent
 
 agent = tinkerfin.plan(
     planner_model="openai:gpt-5.4",
-    plan_schema=MarkdownPlanContent,
+    content_schema=MarkdownPlanContent,
 ).create_deep_agent(
     model="openai:gpt-5.4",
     tools=[search_orders],
@@ -115,9 +116,9 @@ agent = tinkerfin.plan(
 )
 ```
 
-A custom content type inherits `PlanContentModel`, declares a stable `schema_id`, and
-uses precise Pydantic fields. The selected schema is immutable for the Definition and
-the same validated content is used for draft review, any explicitly enabled edit,
+A custom content type inherits `PlanContentModel` and uses precise Pydantic fields. The
+selected schema is immutable and automatically fingerprinted for the Definition; the
+same validated content is used for draft review, any explicitly enabled edit,
 confirmation, checkpoint recovery, and execution handoff.
 
 `mode="default"` directly runs the native Deep Agent Graph. It does not execute
@@ -132,21 +133,28 @@ approval request. Tool-specific human review, such as a configured `write_file`
 interrupt, still applies during execution.
 
 The built-in `DefaultClarificationForm` is used when `.plan(...)` omits
-`clarification_schema`. Hosts that need typed question or option metadata can define a
-concrete `ClarificationForm` in application code and pass that type to `.plan(...)`.
-The schema is frozen on the returned factory and cannot be replaced by `new()`,
-`new_agui()`, or resume calls. Attributes must use concrete `ClarificationModel`
-subclasses; they are public, model-generated planning context rather than authoritative
-permission, billing, or compliance data.
+`clarification_schema`. `BuiltInClarificationForm[QuestionAttributes, OptionModel]`
+applies shared strongly typed metadata to all four built-in types without per-type
+subclasses. A host can also provide a concrete `ClarificationForm` union containing only
+the answer types its client supports. Attributes are public, model-generated planning
+context rather than authoritative permission, billing, or compliance data.
 
-Each question explicitly sets `required` and uses `allow_free_text` (`allowFreeText` on
-the JSON boundary). A round can contain required questions, optional refinements, or only
-optional questions, and is submitted as one complete batch. An option answer sends only
-`questionId` and `optionId`; a free-text answer sends only `questionId` and `answer`; an
-optional skip sends only `questionId` and `skipped: true`. The workflow requires one
-explicit result for every checkpointed question, derives trusted option labels, rejects a
-skip for a required question, and retains skipped answers as Planner context. A Planner
-must not repeat an optional question the user explicitly skipped in the same Plan cycle.
+Choice questions use `allow_free_text` (`allowFreeText` on JSON). Multiple choice also
+declares `min_selections` and an optional `max_selections`; selected option IDs and one
+custom answer may coexist. Text answers are non-blank, and dates use `YYYY-MM-DD` without
+a time or time zone. A complete response is keyed by checkpoint question ID. Each value
+has `status: answered` plus its `answerType`, or `status: skipped` for an optional
+question. Planning validates the exact pending response Schema before Graph resume,
+derives trusted option labels, canonicalizes answer order, and retains explicit skips as
+Planner context.
+
+Use `clarification_type(...)` to register a host-defined semantic answer type. One frozen
+descriptor supplies its versioned namespaced ID, model-facing description, Question and
+Response models, optional per-question Schema and validator, and a canonical JSON
+normalizer. All callbacks are synchronous, deterministic, and free of external I/O. A
+host client must provide a renderer for every custom type included in its Form. Any
+change to per-question Schema, validation, or normalization semantics requires a new
+type ID version.
 
 When `PlanReviewAction.EDIT` is configured, a complete user edit is authoritative. The
 Planner either asks for missing information or accepts that exact edit; it cannot

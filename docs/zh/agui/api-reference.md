@@ -70,11 +70,11 @@
 | 模型 | 字段 |
 | --- | --- |
 | `AgentRuntimeInterrupt` | 非空 `id`、JSON `value` |
-| `RuntimeInterruptEnvelope` | 带版本的 `schema`、非空 `kind`、可选 `message`、响应 JSON Schema 和可信 metadata |
+| `RuntimeInterruptEnvelope` | 当前 `schema`、非空 `kind`、可选 `message`、响应 JSON Schema 和可信 metadata |
 | `HitlActionRequest` | 非空 `name`、对象 `args`、可选 `description` |
 | `HitlReviewConfig` | `actionName`、非空 `allowedDecisions`、可选 `argsSchema` |
 | `HitlRequest` | 等长且非空的 `actionRequests` 与 `reviewConfigs` |
-| `ToolReviewInterruptMetadata` | 带版本的原生分组、action 位置、Tool 名称、决定与原始参数 |
+| `ToolReviewInterruptMetadata` | 当前原生分组、action 位置、Tool 名称、决定与原始参数 |
 | `SubagentProvenance` | 稳定 invocation ID、完整 namespace、graph task、父 Tool、Agent、描述和当前请求 run |
 
 公开决定为 `approve`、`edit`、`reject`、`respond`。同一请求中的 action 和 review config
@@ -82,14 +82,15 @@
 编辑后的参数。
 
 `RuntimeInterruptEnvelope` 用于非 Tool 工作流暂停。Adapter 把 `kind` 映射为 AG-UI
-interrupt reason，发出该 envelope 的 Graph 负责校验恢复 JSON 的业务语义。扩展 kind 必须带
-命名空间。一个待处理批次
-不能同时包含 Runtime interrupt 和 Tool interrupt。
+interrupt reason。`require_valid_schema(...)` 在发布前检查 Draft 2020-12 Schema，
+`validate_json_schema_instance(...)` 在原生转换前使用 format checker 校验恢复 JSON；发出该
+envelope 的 Graph 继续负责业务语义。扩展 kind 必须带命名空间，一个待处理批次不能同时包含
+Runtime interrupt 和 Tool interrupt。
 
 `parse_tool_review_interrupt(interrupt)` 按
-`tinkerfin.deepagents.tool-review.v1` 校验完整可信 Tool interrupt。
+`tinkerfin.deepagents.tool-review` 校验完整可信 Tool interrupt。
 `subagent_invocation_id(...)` 和 `create_subagent_provenance(...)` 实现固定的
-`tinkerfin.subagent-provenance.v1` 身份契约。
+`tinkerfin.subagent-provenance` 身份契约。
 
 ## ID 与错误
 
@@ -98,7 +99,7 @@ interrupt reason，发出该 envelope 的 Graph 负责校验恢复 JSON 的业�
 | `ScopedIdCodec.encode(...)` | 由类型、完整 namespace、原始 ID 创建 scoped ID |
 | `ScopedIdCodec.decode(...)` | 还原 scoped ID 的三部分 |
 | `HitlCorrelationError` | 审批动作与 Tool 消息无法可靠关联 |
-| `ToolReviewContractError` | 完整 Tool review interrupt 不符合带版本的公开契约 |
+| `ToolReviewContractError` | 完整 Tool review interrupt 不符合当前公开契约 |
 | `SseEventId` | `encode_sse()` 接受的字符串或整数 ID 类型 |
 
 并行工具、子 Agent 和恢复流程都必须使用完整 scoped ID，不能按事件到达顺序关联。

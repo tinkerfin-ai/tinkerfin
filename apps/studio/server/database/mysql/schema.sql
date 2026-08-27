@@ -41,8 +41,7 @@ CREATE TABLE conversation_threads (
   last_run_id VARCHAR(128) COMMENT '最近主 run ID',
   last_model VARCHAR(64) COMMENT '最近主 run 使用的稳定模型 ID',
   last_seq BIGINT NOT NULL COMMENT 'Messaging 会话流最新已投影序号',
-  snapshot_seq BIGINT NOT NULL COMMENT 'v3 快照覆盖到的序号',
-  snapshot_version INTEGER NOT NULL COMMENT '快照结构版本，当前固定为 3',
+  snapshot_seq BIGINT NOT NULL COMMENT '当前快照覆盖到的序号',
   message_count INTEGER NOT NULL COMMENT 'user 与 assistant 消息数量',
   tool_call_count INTEGER NOT NULL COMMENT 'Tool 调用开始事件累计数',
   has_pending_interrupt BOOL NOT NULL COMMENT '是否存在待处理审批',
@@ -52,7 +51,6 @@ CREATE TABLE conversation_threads (
   updated_at DATETIME NOT NULL COMMENT '更新时间',
   deleted_at DATETIME COMMENT '软删除时间',
   CONSTRAINT pk_conversation_threads PRIMARY KEY (id),
-  CONSTRAINT ck_conversation_threads_snapshot_version CHECK (snapshot_version = 3),
   CONSTRAINT uq_conversation_threads_thread UNIQUE (thread_id),
   KEY ix_conversation_threads_user_pinned_updated (user_id, deleted_at, pinned, updated_at, id),
   KEY ix_conversation_threads_user_status_updated (user_id, status, updated_at, id),
@@ -92,13 +90,11 @@ CREATE TABLE conversation_events (
   seq BIGINT NOT NULL COMMENT '与 SSE id 一致的严格递增序号',
   event_id VARCHAR(255) NOT NULL COMMENT 'Messaging 幂等 message ID',
   event_type VARCHAR(64) NOT NULL COMMENT 'AG-UI 事件类型',
-  schema_version INTEGER NOT NULL COMMENT 'Studio 事件结构版本，当前固定为 3',
   protocol_version VARCHAR(32) NOT NULL COMMENT 'AG-UI 协议版本',
   event_json JSON NOT NULL COMMENT 'AG-UI 事件 JSON',
   event_text LONGTEXT NOT NULL COMMENT '与 SSE data 完全一致的 UTF-8 JSON',
   created_at DATETIME NOT NULL COMMENT 'Redis 首次提交时间',
   CONSTRAINT pk_conversation_events PRIMARY KEY (id),
-  CONSTRAINT ck_conversation_events_schema_version CHECK (schema_version = 3),
   CONSTRAINT uq_conversation_events_thread_seq UNIQUE (conversation_thread_id, seq),
   CONSTRAINT uq_conversation_events_thread_event UNIQUE (conversation_thread_id, event_id),
   KEY ix_conversation_events_thread_run_seq (conversation_thread_id, run_id, seq)
@@ -139,12 +135,6 @@ CREATE TABLE store (
 ) COMMENT='Deep Agents 长期 memory Store';
 
 INSERT INTO store_migrations (v) VALUES (0), (1);
-
-CREATE TABLE tinkerfin_opensandbox_schema_versions (
-  component VARCHAR(64) NOT NULL COMMENT '持久化组件名称',
-  version INTEGER NOT NULL COMMENT '最新完整提交的 schema 版本',
-  CONSTRAINT pk_tinkerfin_opensandbox_schema_versions PRIMARY KEY (component)
-) COMMENT='OpenSandbox State schema 版本';
 
 CREATE TABLE tinkerfin_opensandbox_owners (
   namespace VARCHAR(64) NOT NULL COMMENT 'OpenSandbox State 逻辑部署命名空间',
@@ -193,6 +183,3 @@ CREATE TABLE tinkerfin_opensandbox_cleanup (
   CONSTRAINT pk_tinkerfin_opensandbox_cleanup PRIMARY KEY (namespace, sandbox_id),
   KEY ix_tinkerfin_opensandbox_cleanup_lease (namespace, lease_expires_at)
 ) COMMENT='失败 Sandbox 销毁任务的持久化重试队列';
-
-INSERT INTO tinkerfin_opensandbox_schema_versions (component, version)
-VALUES ('opensandbox-state', 2);

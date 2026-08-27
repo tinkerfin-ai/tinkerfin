@@ -19,6 +19,23 @@ export interface ChatMessageInput {
   content: string
 }
 
+export type PlanClarificationAnswer =
+  | { status: "skipped" }
+  | {
+    status: "answered"
+    answerType: "single_choice"
+    optionId?: string
+    customAnswer?: string
+  }
+  | {
+    status: "answered"
+    answerType: "multiple_choice"
+    optionIds: string[]
+    customAnswer?: string
+  }
+  | { status: "answered"; answerType: "text"; answer: string }
+  | { status: "answered"; answerType: "date"; date: string }
+
 export type ChatResumePayload =
   | { type: "approve" }
   | { type: "reject"; message?: string }
@@ -28,11 +45,7 @@ export type ChatResumePayload =
   }
   | {
     type: "respond"
-    answers: Array<
-      | { questionId: string; optionId: string }
-      | { questionId: string; answer: string }
-      | { questionId: string; skipped: true }
-    >
+    answers: Record<string, PlanClarificationAnswer>
   }
   | { type: "approve"; baseRevision: number }
   | { type: "respond"; baseRevision: number; message: string }

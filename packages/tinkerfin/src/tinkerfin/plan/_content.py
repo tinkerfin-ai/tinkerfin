@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import cast
 
-from pydantic import JsonValue, TypeAdapter, create_model
+from pydantic import ConfigDict, JsonValue, TypeAdapter, create_model
 
 from ._clarification import _require_concrete_model, _schema_fingerprint
 from .errors import PlanModeConfigurationError, PlanStructuredOutputError
@@ -19,8 +18,10 @@ from .models import (
     PlanState,
 )
 
-_SCHEMA_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-_JSON_OBJECT = TypeAdapter(dict[str, JsonValue])
+_JSON_OBJECT = TypeAdapter(
+    dict[str, JsonValue],
+    config=ConfigDict(allow_inf_nan=False),
+)
 _SUPPORTED_MEDIA_TYPES = frozenset({"application/json", "text/markdown"})
 
 
@@ -35,51 +36,46 @@ class PlanContentBinding:
     state_type: type[PlanState[PlanContentModel]]
 
 
-def _validate_plan_schema(value: object) -> type[PlanContentModel]:
+def _validate_content_schema(value: object) -> type[PlanContentModel]:
     if not isinstance(value, type) or not issubclass(value, PlanContentModel):
         raise PlanModeConfigurationError(
-            "plan_schema must be a PlanContentModel subclass"
+            "content_schema must be a PlanContentModel subclass"
         )
     if value is PlanContentModel:
-        raise PlanModeConfigurationError("plan_schema must be a concrete content model")
-    _require_concrete_model(value, source="plan_schema")
-    schema_id = value.schema_id
-    if not isinstance(schema_id, str) or not _SCHEMA_ID.fullmatch(schema_id):
         raise PlanModeConfigurationError(
-            "plan_schema.schema_id must be a stable non-empty identifier"
+            "content_schema must be a concrete content model"
         )
+    _require_concrete_model(value, source="content_schema")
     media_type = value.media_type
     if media_type not in _SUPPORTED_MEDIA_TYPES:
         raise PlanModeConfigurationError(
-            "plan_schema.media_type must be 'application/json' or 'text/markdown'"
+            "content_schema.media_type must be 'application/json' or 'text/markdown'"
         )
     if media_type == "text/markdown" and not issubclass(value, MarkdownPlanContent):
         raise PlanModeConfigurationError(
-            "text/markdown plan_schema must inherit MarkdownPlanContent"
+            "text/markdown content_schema must inherit MarkdownPlanContent"
         )
     if value.model_config.get("extra") != "forbid" or not value.model_config.get(
         "frozen"
     ):
         raise PlanModeConfigurationError(
-            "plan_schema must preserve frozen=True and extra='forbid'"
+            "content_schema must preserve frozen=True and extra='forbid'"
         )
     try:
         _JSON_OBJECT.validate_python(value.model_json_schema(by_alias=True))
     except Exception as error:
         raise PlanModeConfigurationError(
-            "plan_schema could not produce a JSON object Schema",
+            "content_schema could not produce a JSON object Schema",
             cause=error,
         ) from error
     return value
 
 
-def create_plan_content_binding(schema: object) -> PlanContentBinding:
+def create_plan_content_binding(content_schema: object) -> PlanContentBinding:
     """Validate one content schema and build its immutable runtime model family."""
 
-    content_type = _validate_plan_schema(schema)
-    schema_id = cast(str, content_type.schema_id)
+    content_type = _validate_content_schema(content_schema)
     reference = PlanSchemaReference(
-        id=schema_id,
         fingerprint=_schema_fingerprint(content_type),
         media_type=content_type.media_type,
     )
@@ -117,7 +113,7 @@ def serialize_plan_content(
 
     if not isinstance(value, binding.schema):
         raise PlanStructuredOutputError(
-            "structured draft did not use the configured plan_schema"
+            "structured draft did not use the configured content_schema"
         )
     try:
         payload = _JSON_OBJECT.validate_python(

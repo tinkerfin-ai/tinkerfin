@@ -28,6 +28,17 @@ from tinkerfin._agui_lineage_state import (
 from tinkerfin.errors import TinkerFinLifecycleError
 
 
+def test_lineage_marker_uses_the_current_unversioned_contract() -> None:
+    payload = lineage_state_update(
+        identity=Identity(threadId="thread-1", runId="run-1"),
+        parent_run_id=None,
+        role="native",
+    )["_tinkerfin_lineage"]
+
+    assert PLANNING_CHECKPOINT_RUN_ID == "tinkerfin-plan"
+    assert set(payload) == {"threadId", "runId", "parentRunId", "role"}
+
+
 class _BranchState(TypedDict, total=False):
     history: Annotated[list[str], add]
     _tinkerfin_lineage: dict[str, object]

@@ -554,6 +554,10 @@
     background: var(--color-canvas);
   }
 
+  .workspace-main:has(.composer-dock.is-taken-over) {
+    grid-template-rows: var(--layout-header-height) minmax(0, 1fr) auto;
+  }
+
   .chat-header {
     position: relative;
     z-index: var(--layer-sticky);
@@ -646,6 +650,10 @@
     width: min(100%, var(--layout-conversation-width));
     margin: 0 auto;
     padding: var(--space-8) 0 var(--composer-height);
+  }
+
+  .workspace-main:has(.composer-dock.is-taken-over) .message-list {
+    padding-bottom: var(--space-4);
   }
 
   /* 卡片和状态内容默认共用16px，业务操作区由消息组件计入自身边界 */
@@ -774,6 +782,10 @@
     height: var(--control-lg);
     transform: translateX(-50%);
     pointer-events: none;
+  }
+
+  .workspace-main:has(.composer-dock.is-taken-over) .conversation-scroll-action {
+    bottom: var(--space-3);
   }
 
   .scroll-to-bottom {

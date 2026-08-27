@@ -1,4 +1,4 @@
-"""Public subagent provenance v1 and Adapter event contracts."""
+"""Public subagent provenance and Adapter event contracts."""
 
 from __future__ import annotations
 
@@ -32,15 +32,13 @@ def test_subagent_invocation_id_has_a_frozen_known_vector() -> None:
     identity = Identity(threadId="thread-known", runId="run-known")
     parent_tool_call_id = _parent_tool_id()
 
-    assert parent_tool_call_id == (
-        "tf:tool:WzEsWyJ0b29sczpwYXJlbnQiXSwiY2FsbC10YXNrIl0"
-    )
+    assert parent_tool_call_id == ("tf:tool:W1sidG9vbHM6cGFyZW50Il0sImNhbGwtdGFzayJd")
     assert (
         subagent_invocation_id(
             identity=identity,
             parent_tool_call_id=parent_tool_call_id,
         )
-        == "subagent-cf085c34-b86a-5545-a9ce-8d1372adb914"
+        == "subagent-2594398b-b209-5a61-a9f0-8a4d6100bbcd"
     )
     resumed = create_subagent_provenance(
         identity=Identity(threadId="thread-known", runId="run-resumed"),
@@ -52,7 +50,7 @@ def test_subagent_invocation_id_has_a_frozen_known_vector() -> None:
         description="Research",
     )
     assert resumed.subagent_invocation_id == (
-        "subagent-cf085c34-b86a-5545-a9ce-8d1372adb914"
+        "subagent-2594398b-b209-5a61-a9f0-8a4d6100bbcd"
     )
     assert resumed.request_run_id == "run-resumed"
     assert (
@@ -242,7 +240,7 @@ def test_python_and_web_subagent_fixtures_are_identical_and_valid() -> None:
         / "src"
         / "tinkerfin_agui_adapter"
         / "contracts"
-        / "subagent-provenance-v1.fixture.json"
+        / "subagent-provenance.fixture.json"
     )
     web_path = (
         _REPOSITORY_ROOT
@@ -254,7 +252,7 @@ def test_python_and_web_subagent_fixtures_are_identical_and_valid() -> None:
         / "conversation"
         / "agui"
         / "contracts"
-        / "subagent-provenance-v1.fixture.json"
+        / "subagent-provenance.fixture.json"
     )
     package_text = package_path.read_text(encoding="utf-8")
     assert web_path.read_text(encoding="utf-8") == package_text

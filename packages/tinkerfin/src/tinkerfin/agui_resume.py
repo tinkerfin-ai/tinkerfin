@@ -56,7 +56,6 @@ class _ResumeMarker(BaseModel):
         strict=True,
     )
 
-    schema_version: Literal[1] = 1
     digest: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     thread_id: str = Field(min_length=1)
     run_id: str = Field(min_length=1)
@@ -130,10 +129,6 @@ class AgUiResumeBinding(BaseModel):
         strict=True,
     )
 
-    schema_version: Literal[1] = Field(
-        default=1,
-        description="Version of the complete persisted binding model",
-    )
     mode: Literal["resume", "abandon"] = Field(
         description="Whether the Graph resumes or the complete batch is abandoned"
     )
@@ -354,7 +349,6 @@ class AgUiResumeBinding(BaseModel):
         if resume_data is None:  # pragma: no cover - protected by model validation
             raise RuntimeError("resume binding lost its native data")
         digest_payload = {
-            "schemaVersion": 1,
             "threadId": identity.thread_id,
             "runId": identity.run_id,
             "parentRunId": parent_run_id,

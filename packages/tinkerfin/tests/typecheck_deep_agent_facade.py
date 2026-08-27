@@ -3,7 +3,15 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING, Any, TypedDict, assert_type, cast, reveal_type
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Literal,
+    TypedDict,
+    assert_type,
+    cast,
+    reveal_type,
+)
 
 from langchain.agents.middleware.types import InputAgentState
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
@@ -27,8 +35,12 @@ from tinkerfin.plan import (
     ClarificationForm,
     ClarificationModel,
     ClarificationOption,
-    ClarificationQuestion,
+    ClarificationQuestionBase,
+    ClarificationResponseBase,
+    ClarificationType,
     PlanReviewAction,
+    SingleChoiceQuestion,
+    clarification_type,
 )
 
 
@@ -60,12 +72,22 @@ class _Option(ClarificationOption[_OptionAttributes]):
     pass
 
 
-class _Question(ClarificationQuestion[_QuestionAttributes, _OptionAttributes]):
-    options: tuple[_Option, ...] = ()
+class _Question(SingleChoiceQuestion[_QuestionAttributes, _Option]):
+    pass
 
 
 class _Form(ClarificationForm[_Question]):
     pass
+
+
+class _RatingQuestion(ClarificationQuestionBase):
+    answer_type: Literal["acme:rating.v1"] = "acme:rating.v1"
+    maximum: int
+
+
+class _RatingResponse(ClarificationResponseBase):
+    answer_type: Literal["acme:rating.v1"] = "acme:rating.v1"
+    rating: int
 
 
 if TYPE_CHECKING:
@@ -80,7 +102,7 @@ if TYPE_CHECKING:
     planned = tinkerfin.plan(enabled=True)
     assert_type(planned, TinkerFin)
     editable_planned = tinkerfin.plan(
-        review_actions=(PlanReviewAction.APPROVE, PlanReviewAction.EDIT)
+        allowed_review_actions=(PlanReviewAction.APPROVE, PlanReviewAction.EDIT)
     )
     assert_type(editable_planned, TinkerFin)
     planned_definition = planned.create_deep_agent(
@@ -95,6 +117,18 @@ if TYPE_CHECKING:
     assert_type(custom_planned, TinkerFin)
     custom_option = _Option(id="option", label="Option", attributes=None)
     assert_type(custom_option.attributes, _OptionAttributes | None)
+    rating_type = clarification_type(
+        type_id="acme:rating.v1",
+        description="Use for one bounded integer rating.",
+        question_model=_RatingQuestion,
+        response_model=_RatingResponse,
+        normalize=lambda _question, response: {"rating": response.rating},
+    )
+    assert_type(
+        rating_type,
+        ClarificationType[_RatingQuestion, _RatingResponse],
+    )
+    assert_type(tinkerfin.plan(clarification_types=(rating_type,)), TinkerFin)
 
     identity = Identity(threadId="thread-1", runId="run-1")
     native = definition.new(identity=identity)

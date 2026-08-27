@@ -47,7 +47,6 @@ _EXPECTED_TABLES = frozenset(
         "conversation_interrupts",
         "store_migrations",
         "store",
-        "tinkerfin_opensandbox_schema_versions",
         "tinkerfin_opensandbox_owners",
         "tinkerfin_opensandbox_workers",
         "tinkerfin_opensandbox_warm_slots",
@@ -79,7 +78,7 @@ def _projection_event(
             ),
             seq=seq,
             message_id=f"run-projection-lock:{seq}",
-            codec="agui.event.v1",
+            codec="agui.event",
             payload=event.model_dump_json(by_alias=True, exclude_none=True).encode(),
             created_at=datetime(2026, 8, 22, 2, seq, tzinfo=UTC),
         ),
@@ -302,12 +301,6 @@ async def test_full_schema_sql_matches_runtime_generated_mysql_schema(
                     text("SELECT v FROM store_migrations ORDER BY v")
                 )
             )
-            sql_sandbox_version = await connection.scalar(
-                text(
-                    "SELECT version FROM tinkerfin_opensandbox_schema_versions "
-                    "WHERE component = 'opensandbox-state'"
-                )
-            )
         async with runtime_engine.connect() as connection:
             runtime_schema = await connection.run_sync(_reflect_schema)
             runtime_store_versions = tuple(
@@ -315,22 +308,12 @@ async def test_full_schema_sql_matches_runtime_generated_mysql_schema(
                     text("SELECT v FROM store_migrations ORDER BY v")
                 )
             )
-            runtime_sandbox_version = await connection.scalar(
-                text(
-                    "SELECT version FROM tinkerfin_opensandbox_schema_versions "
-                    "WHERE component = 'opensandbox-state'"
-                )
-            )
 
         assert set(sql_schema.tables) == _EXPECTED_TABLES
         assert set(runtime_schema.tables) == _EXPECTED_TABLES
         assert sql_schema.tables == runtime_schema.tables
-        assert sql_schema.tables["conversation_threads"].check_constraints == {
-            "ck_conversation_threads_snapshot_version": "snapshot_version=3"
-        }
-        assert sql_schema.tables["conversation_events"].check_constraints == {
-            "ck_conversation_events_schema_version": "schema_version=3"
-        }
+        assert sql_schema.tables["conversation_threads"].check_constraints == {}
+        assert sql_schema.tables["conversation_events"].check_constraints == {}
         business_table_names = {model.__tablename__ for model in _BUSINESS_MODELS}
         assert {
             table_name: sql_schema.table_comments[table_name]
@@ -358,8 +341,6 @@ async def test_full_schema_sql_matches_runtime_generated_mysql_schema(
         assert missing_column_comments == []
         assert sql_store_versions == (0, 1)
         assert runtime_store_versions == (0, 1)
-        assert sql_sandbox_version == 2
-        assert runtime_sandbox_version == 2
     finally:
         if sql_engine is not None:
             await sql_engine.dispose()

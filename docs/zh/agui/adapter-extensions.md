@@ -137,7 +137,7 @@ kind, namespace, raw_id = codec.decode(public_id)
 ## 解析框架扩展
 
 Tool 审批 metadata 使用 `ToolReviewInterruptMetadata`，schema 固定为
-`tinkerfin.deepagents.tool-review.v1`：
+`tinkerfin.deepagents.tool-review`：
 
 ```python
 from tinkerfin_agui_adapter import parse_tool_review_interrupt
@@ -147,10 +147,10 @@ review = parse_tool_review_interrupt(persisted_interrupt)
 print(review.tool_name, review.original_args.root)
 ```
 
-解析器校验完整 interrupt、原生 action 分组、位置、决策策略、参数和 scoped Tool ID。未带版本、
-字段冲突或来自客户端的 interrupt metadata 都不能作为可信恢复依据。
+解析器校验完整 interrupt、原生 action 分组、位置、决策策略、参数和 scoped Tool ID。字段冲突、
+未知字段或来自客户端的 interrupt metadata 都不能作为可信恢复依据。
 
-Deep Agents `task` 调用发布 `tinkerfin.subagent-provenance.v1` 形状的
+Deep Agents `task` 调用发布 `tinkerfin.subagent-provenance` 形状的
 `SubagentProvenance`。`subagentInvocationId` 跨 resume 稳定，`requestRunId` 表示当前承载事件的
 主请求；父 task Result 使用 `relatedSubagentInvocationId`。这些字段表达 Agent 嵌套，标准
 AG-UI `parentRunId` 继续只表达分支和时间旅行谱系。

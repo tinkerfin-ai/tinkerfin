@@ -80,7 +80,7 @@ ownership.
   `source="langgraph.values"`. A LangGraph task is not automatically a subagent, and
   subgraph provenance never uses AG-UI `parentRunId`.
 - Verified Deep Agents delegates publish `SubagentProvenance` with schema
-  `tinkerfin.subagent-provenance.v1`. `subagentInvocationId` is derived from the
+  `tinkerfin.subagent-provenance`. `subagentInvocationId` is derived from the
   thread and complete scoped parent `task` Tool ID, so it remains stable when a new
   request run resumes the same checkpointed invocation.
 - Delegate provenance uses the effective Deep Agents `task` fields `description` and
@@ -95,13 +95,13 @@ ownership.
   and value. The terminal boundary publishes root state, then a root-first
   namespace-scoped message snapshot, then one interrupt outcome. A replay of the same
   child interrupt set must carry the identical message snapshot for that namespace.
-- Versioned `RuntimeInterruptEnvelope` values map to AG-UI interrupts without a Tool
+- Declared `RuntimeInterruptEnvelope` values map to AG-UI interrupts without a Tool
   ID. Their trusted envelope, response schema, and native ID are persisted for generic
   resume translation; one batch cannot mix runtime and Tool interrupts.
 - `prior_tool_call_ids` accepts complete `tf:tool:...` scoped IDs and lets a resumed
   host publish a child Tool result without synthesizing another start/args/end.
 - Tool reviews publish strict `metadata.deepagents` schema
-  `tinkerfin.deepagents.tool-review.v1`. Use `parse_tool_review_interrupt()` on the
+  `tinkerfin.deepagents.tool-review`. Use `parse_tool_review_interrupt()` on the
   complete persisted interrupt; missing, unknown, or inconsistent fields fail closed.
 - `private_state_keys` removes only named top-level channels at known state projection
   boundaries. Nested same-named business fields remain visible. TinkerFin Plan
@@ -134,10 +134,12 @@ interrupts use `langgraph:interrupt`.
 custom mixed execution, and transport cancellation remain caller-owned.
 
 `RuntimeInterruptEnvelope` is intended for framework workflows such as Plan review.
-`ResumeMapper` validates trusted persisted correlation and full resume coverage, then
-passes the resolved JSON object through as native `Command(resume=...)` data. The graph
-that emitted the envelope remains responsible for domain validation such as revision
-checks.
+The envelope rejects malformed Draft 2020-12 response Schemas before publication.
+`ResumeMapper` validates trusted persisted correlation, full resume coverage, and the
+resolved JSON object with format checking before producing native `Command(resume=...)`
+data. `require_valid_schema(...)` and `validate_json_schema_instance(...)` expose the
+same generic validation boundary to framework integrations. The graph that emitted the
+envelope remains responsible for domain validation such as revision checks.
 
 ## Documentation
 

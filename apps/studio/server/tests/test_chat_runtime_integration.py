@@ -136,7 +136,7 @@ def _persisted_tool_interrupt(
         "metadata": {
             "langgraphValue": langgraph_value,
             "deepagents": {
-                "schema": "tinkerfin.deepagents.tool-review.v1",
+                "schema": "tinkerfin.deepagents.tool-review",
                 "nativeInterruptId": interrupt_id,
                 "actionIndex": 0,
                 "toolName": tool_name,
@@ -155,23 +155,23 @@ def _persisted_plan_interrupt(
     """构造 adapter 已验证并由服务端持久化的 Plan interrupt"""
 
     envelope = {
-        "schema": "tinkerfin.runtime-interrupt.v1",
+        "schema": "tinkerfin.runtime-interrupt",
         "kind": kind,
         "message": "请确认 Plan",
         "responseSchema": {"type": "object"},
         "metadata": {
             "origin": "plan",
             "review": {
-                "schema": "tinkerfin.plan-review.v1",
                 "draft": {
-                    "schemaVersion": 1,
                     "revision": 1,
                     "contentSchema": {
-                        "id": "tinkerfin.plan.markdown.v1",
                         "fingerprint": "0" * 64,
                         "mediaType": "text/markdown",
                     },
-                    "content": {"markdown": "# 执行计划"},
+                    "content": {
+                        "description": "按确认后的范围实施并验证",
+                        "markdown": "# 执行计划",
+                    },
                 },
             },
         },
@@ -184,7 +184,7 @@ def _persisted_plan_interrupt(
         "metadata": {
             "langgraphValue": envelope,
             "runtimeInterrupt": {
-                "schema": "tinkerfin.runtime-interrupt.v1",
+                "schema": "tinkerfin.runtime-interrupt",
                 "nativeInterruptId": interrupt_id,
                 "envelope": envelope,
             },
@@ -3157,7 +3157,6 @@ async def test_cancel_owner_lost_run_returns_idempotent_result_and_converges_his
         run.status = "running"
         snapshot = {
             "snapshotSeq": 0,
-            "snapshotVersion": 3,
             "messages": [],
             "todos": [],
             "mode": "default",

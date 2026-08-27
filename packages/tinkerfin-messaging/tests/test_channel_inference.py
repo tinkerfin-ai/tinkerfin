@@ -225,7 +225,7 @@ class _NativeProfileSource:
 
     @property
     def messaging_codec_profile(self) -> str:
-        return "langgraph.stream-part.v2.v1"
+        return "langgraph.stream-part.v2"
 
     @property
     def messaging_source_type(self) -> type[Mapping[str, object]]:
@@ -310,7 +310,7 @@ async def test_native_profile_infers_live_and_replay_types() -> None:
     source = _native_source()
 
     assert isinstance(source, ProfiledMessageSource)
-    assert source.messaging_codec_profile == "langgraph.stream-part.v2.v1"
+    assert source.messaging_codec_profile == "langgraph.stream-part.v2"
     assert source.messaging_source_type is Mapping
     assert source.messaging_replay_type is NativeStreamPart
 
@@ -412,7 +412,7 @@ async def test_incomplete_native_profile_fails_before_prepare(
 ) -> None:
     backend = _CountingBackend()
     source = _DeclaredProfileSource(
-        profile="langgraph.stream-part.v2.v1",
+        profile="langgraph.stream-part.v2",
         source_type=source_type,
         replay_type=replay_type,
     )
@@ -472,7 +472,7 @@ async def test_reused_inferred_channel_revalidates_profile_before_prepare() -> N
         baseline_append = backend.append_calls
 
         malformed = _DeclaredProfileSource(
-            profile="langgraph.stream-part.v2.v1",
+            profile="langgraph.stream-part.v2",
             source_type=str,
             replay_type=NativeStreamPart,
         )

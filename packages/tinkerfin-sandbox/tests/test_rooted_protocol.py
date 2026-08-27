@@ -34,7 +34,7 @@ def test_rooted_helper_resource_remains_byte_stable() -> None:
     )
     assert resource == _rooted_protocol._ROOTED_HELPER_SCRIPT
     assert sha256(resource.encode()).hexdigest() == (
-        "ea71852d53a8421258a00874a2d60bdcee6be49742cc049cdffa357a970dfa08"
+        "2b96bbd079876b54ad1cba19ec8b9ba4357357d20f9769914820dcad8ec272c4"
     )
 
 
@@ -1371,7 +1371,6 @@ def test_rooted_response_rejects_mismatched_request_id(tmp_path: Path) -> None:
         arguments={"path": "/inside.txt"},
     )
     payload = {
-        "version": request.version,
         "request_id": "different-request",
         "operation": request.operation,
         "status": "ok",
@@ -1395,7 +1394,6 @@ def test_rooted_response_rejects_mismatched_operation(tmp_path: Path) -> None:
         arguments={"path": "/inside.txt"},
     )
     payload = {
-        "version": request.version,
         "request_id": request.request_id,
         "operation": "read",
         "status": "ok",

@@ -125,15 +125,11 @@ class SQLAlchemyOpenSandboxStateSchema:
     """Describe one complete deployable OpenSandbox State database schema.
 
     Attributes:
-        component: Persistent component identified by the schema version row.
-        version: Exact schema version represented by the DDL.
         dialect: SQL dialect accepted by the deployment script.
         table_names: Complete table set in deterministic creation order.
-        ddl: Full empty-database DDL including indexes and version initialization.
+        ddl: Full empty-database DDL including indexes.
     """
 
-    component: Literal["opensandbox-state"]
-    version: int
     dialect: Literal["mysql", "sqlite"]
     table_names: tuple[str, ...]
     ddl: str

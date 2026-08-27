@@ -111,11 +111,11 @@ def _resolve_binding(
         assert codec is not None
         self._validate_profile_types(source=source, profile=profile, codec=codec)
         return codec, self._renderer, profile
-    if profile == "agui.event.v1":
+    if profile == "agui.event":
         from .agui import AgUiCodec
 
         built_in = AgUiCodec()
-    elif profile == "langgraph.stream-part.v2.v1":
+    elif profile == "langgraph.stream-part.v2":
         from .native import NativeStreamPartCodec
 
         built_in = NativeStreamPartCodec()

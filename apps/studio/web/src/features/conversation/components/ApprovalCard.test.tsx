@@ -91,6 +91,61 @@ describe('ApprovalCard', () => {
     }
   })
 
+  it('moves focus into rejection details and restores the rejection trigger on cancel', async () => {
+    const user = userEvent.setup()
+
+    function Harness() {
+      const [approval, setApproval] = useState<ApprovalState>({
+        activeIndex: 0,
+        submitted: false,
+        mode: 'options',
+        items: [approvalItem('focus-reject', '/focus-reject.txt')],
+      })
+      return (
+        <ApprovalCard
+          conversation={conversationWithApproval(approval)}
+          onChange={setApproval}
+          onSubmit={vi.fn()}
+        />
+      )
+    }
+
+    render(<Harness />)
+
+    await user.click(screen.getByRole('button', { name: '拒绝' }))
+    await waitFor(() => expect(screen.getByLabelText('拒绝原因（可选）')).toHaveFocus())
+    await user.click(screen.getByRole('button', { name: '取消' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: '拒绝' })).toHaveFocus())
+  })
+
+  it('moves focus to the next approval decision after the active item changes', async () => {
+    const user = userEvent.setup()
+
+    function Harness() {
+      const [approval, setApproval] = useState<ApprovalState>({
+        activeIndex: 0,
+        submitted: false,
+        mode: 'options',
+        items: [
+          approvalItem('approve-only', '/approve-only.txt', { allowedDecisions: ['approve'] }),
+          approvalItem('reject-only', '/reject-only.txt', { allowedDecisions: ['reject'] }),
+        ],
+      })
+      return (
+        <ApprovalCard
+          conversation={conversationWithApproval(approval)}
+          onChange={setApproval}
+          onSubmit={vi.fn()}
+        />
+      )
+    }
+
+    render(<Harness />)
+    await user.click(screen.getByRole('button', { name: '允许' }))
+
+    await waitFor(() => expect(screen.getByRole('button', { name: '拒绝' })).toHaveFocus())
+  })
+
   it('updates only approval state and preserves a concurrent conversation message', () => {
     const initial = conversationWithApproval({
       activeIndex: 0,
@@ -196,12 +251,21 @@ describe('ApprovalCard', () => {
     const view = render(<ApprovalCard conversation={conversation} onChange={vi.fn()} onSubmit={vi.fn()} />)
 
     expect(screen.getAllByText('写入 /collapse.txt')).toHaveLength(1)
+    expect(screen.getByRole('separator', { name: '调整交互卡片高度' })).toBeInTheDocument()
+
+    for (const toggle of screen.getAllByRole('button', { name: '收起审批卡片' })) {
+      expect(toggle).toHaveAttribute('aria-expanded', 'true')
+    }
 
     await user.click(screen.getAllByRole('button', { name: '收起审批卡片' }).at(-1)!)
+    expect(screen.queryByRole('separator', { name: '调整交互卡片高度' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: '允许' })).not.toBeInTheDocument()
     expect(screen.getByRole('region', { name: '等待审批' })).not.toHaveTextContent('1 / 1')
     expect(window.sessionStorage.getItem('tinkerfin:approval-collapse:thread-approval'))
       .toBe('collapsed')
+    for (const toggle of screen.getAllByRole('button', { name: '展开审批卡片' })) {
+      expect(toggle).toHaveAttribute('aria-expanded', 'false')
+    }
 
     view.rerender(
       <ApprovalCard
@@ -217,6 +281,7 @@ describe('ApprovalCard', () => {
 
     await user.click(screen.getAllByRole('button', { name: '展开审批卡片' }).at(-1)!)
     expect(screen.getByRole('button', { name: '允许' })).toBeInTheDocument()
+    expect(screen.getByRole('separator', { name: '调整交互卡片高度' })).toBeInTheDocument()
   })
 
   it('announces an error and exposes an explicit retry for a completed group', () => {

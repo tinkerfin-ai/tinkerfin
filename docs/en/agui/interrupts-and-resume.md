@@ -36,13 +36,14 @@ runtime = agent.new_agui(identity=identity, mode="plan")
 
 | Reason | Expected resolved payload |
 | --- | --- |
-| `tinkerfin:plan_clarification` | `{"type":"respond","answers":[{"questionId":"...","optionId":"..."}]}` for an option, `{"type":"respond","answers":[{"questionId":"...","answer":"..."}]}` for free text, or `{"type":"respond","answers":[{"questionId":"...","skipped":true}]}` for an optional skip |
+| `tinkerfin:plan_clarification` | `{"type":"respond","answers":{"question-id":{"status":"answered","answerType":"single_choice","optionId":"option-id"}}}`; each question value follows the exact interrupt response Schema, while an optional skip is `{"status":"skipped"}` |
 | `tinkerfin:plan_review` | One decision permitted by the interrupt response Schema, with the current `baseRevision`; the default is `approve`, `respond`, or `reject`, while `edit` requires explicit host configuration |
 
-A Plan interrupt has no `toolCallId`. It carries a versioned trusted runtime envelope,
-its response JSON Schema, and `tinkerfin.plan-clarification.v2` metadata containing the
-complete public Form with `schemaVersion: 2`. Python `allow_free_text` is serialized as
-`allowFreeText`; every question also carries an explicit `required` flag.
+A Plan interrupt has no `toolCallId`. It carries a declared trusted runtime envelope,
+its exact response JSON Schema, and Plan clarification metadata containing the complete
+public Form. Every question carries `answerType` and
+an explicit `required` flag. Built-in answer types are `single_choice`,
+`multiple_choice`, `text`, and `date`.
 Question and option attributes are preserved as public, non-authoritative planning
 context. Internal schema fingerprints remain in checkpoint state and are not part of
 any public AG-UI event. The root `tinkerfin_plan` state is
@@ -51,9 +52,11 @@ snapshot may be followed by RFC 6902 state deltas as the Plan moves through
 `approved` and publishes `effectiveMode=default` before native execution.
 
 Clients must not return the Form, labels, descriptions, or attributes. The Planning Graph
-restores the trusted checkpoint Form and derives the selected option label. Resume must
-cover every question exactly once. Supplying mixed answer fields, skipping a required
-question, omitting a question result, or using unknown IDs fails the resume.
+restores the trusted checkpoint Form and derives selected option labels. The `answers`
+object must contain every checkpoint question ID exactly once and no unknown keys.
+Supplying fields for a different `answerType`, violating multiple-choice bounds, using an
+invalid date, skipping a required question, or using unknown option IDs fails before the
+Graph consumes the resume.
 
 The same `AgUiResumeBinding.from_agui(...)` flow handles Plan interrupts without a
 separate API. The binding verifies the persisted envelope and exact pending coverage;
@@ -65,12 +68,12 @@ later, after Plan approval, and its original scoped Tool ID remains continuous a
 that later resume.
 
 Tool reviews carry `metadata.deepagents` with schema
-`tinkerfin.deepagents.tool-review.v1`. The required fields are
+`tinkerfin.deepagents.tool-review`. The required fields are
 `nativeInterruptId`, `actionIndex`, `toolName`, `allowedDecisions`, and
 `originalArgs`. Hosts should parse the complete trusted interrupt with
 `parse_tool_review_interrupt()` and persist it unchanged. Missing fields, unknown
 fields, an invalid decision, or disagreement with `metadata.langgraphValue` fails
-closed; there is no unversioned metadata shape.
+closed.
 
 Cancelling a Plan clarification or review abandons that Plan request without fabricating
 `reject`. A later ordinary input can use `mode="default"` on the same Plan-capable

@@ -39,11 +39,14 @@ from .errors import TinkerFinLifecycleError as TinkerFinLifecycleError
 from .errors import TinkerFinStreamProtocolError as TinkerFinStreamProtocolError
 from .plan import AgentMode as AgentMode
 from .plan import ClarificationFormBase as _ClarificationFormBase
+from .plan import ClarificationType as _ClarificationType
 from .plan import DefaultClarificationForm as _DefaultClarificationForm
 from .plan import PlanContentModel as _PlanContentModel
 from .plan import PlanReviewAction as _PlanReviewAction
 from .plan import StructuredPlanContent as _StructuredPlanContent
-from .plan._config import DEFAULT_PLAN_REVIEW_ACTIONS as _DEFAULT_PLAN_REVIEW_ACTIONS
+from .plan._config import (
+    DEFAULT_ALLOWED_REVIEW_ACTIONS as _DEFAULT_ALLOWED_REVIEW_ACTIONS,
+)
 from .runtime import AgUiEventStream as AgUiEventStream
 from .runtime import AgUiSettlementTimeoutError as AgUiSettlementTimeoutError
 from .runtime import EventObserver as EventObserver
@@ -65,8 +68,11 @@ class TinkerFin(_RuntimeTinkerFin):
         default_mode: AgentMode = "default",
         planner_model: str | BaseChatModel | None = None,
         clarification_schema: type[_ClarificationFormBase] = _DefaultClarificationForm,
-        plan_schema: type[_PlanContentModel] = _StructuredPlanContent,
-        review_actions: Sequence[_PlanReviewAction] = _DEFAULT_PLAN_REVIEW_ACTIONS,
+        clarification_types: Sequence[_ClarificationType[Any, Any]] = (),
+        content_schema: type[_PlanContentModel] = _StructuredPlanContent,
+        allowed_review_actions: Sequence[
+            _PlanReviewAction
+        ] = _DEFAULT_ALLOWED_REVIEW_ACTIONS,
     ) -> TinkerFin: ...
     def create_deep_agent(
         self,

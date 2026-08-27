@@ -72,7 +72,7 @@ Synchronous remote methods fail explicitly; use the asynchronous forms.
 | `InMemoryOpenSandboxState(namespace="")` | Current-process state |
 | `SQLAlchemyOpenSandboxState(...)` | Shared SQLite or MySQL state |
 | `get_sqlalchemy_opensandbox_state_schema(dialect=...)` | Generate complete schema DDL |
-| `SQLAlchemyOpenSandboxStateSchema` | Immutable component, version, dialect, table names, and DDL |
+| `SQLAlchemyOpenSandboxStateSchema` | Immutable dialect, table names, and DDL |
 
 `OpenSandboxInitializer` is the asynchronous initializer callable type that receives a newly ready backend.
 

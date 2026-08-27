@@ -50,7 +50,7 @@ def _envelope(
             ),
             seq=seq,
             message_id=f"{run}:{seq}",
-            codec="agui.event.v1",
+            codec="agui.event",
             payload=parsed.model_dump_json(by_alias=True, exclude_none=True).encode(),
             created_at=datetime(2026, 8, 18, 1, seq, tzinfo=UTC),
         ),
@@ -86,7 +86,7 @@ def _tool_review_interrupt(
                 ],
             },
             "deepagents": {
-                "schema": "tinkerfin.deepagents.tool-review.v1",
+                "schema": "tinkerfin.deepagents.tool-review",
                 "nativeInterruptId": interrupt_id,
                 "actionIndex": 0,
                 "toolName": "write_file",
@@ -454,7 +454,7 @@ async def test_metadata_updates_preserve_order_until_the_next_conversation_event
 async def test_projection_builds_tool_todo_and_interrupt_snapshot(
     session: AsyncSession,
 ) -> None:
-    """已提交事件应同时更新事实表、明细投影和 v3 快照"""
+    """已提交事件应同时更新事实表、明细投影和当前快照"""
 
     repository = ConversationRepository(session)
     thread = await repository.create_thread(
@@ -535,7 +535,7 @@ async def test_projection_builds_tool_todo_and_interrupt_snapshot(
                                 ],
                             },
                             "deepagents": {
-                                "schema": "tinkerfin.deepagents.tool-review.v1",
+                                "schema": "tinkerfin.deepagents.tool-review",
                                 "nativeInterruptId": "interrupt-1",
                                 "actionIndex": 0,
                                 "toolName": "write_file",
@@ -669,7 +669,7 @@ async def test_projection_rejects_tool_interrupt_without_v1_metadata(
 async def test_projection_preserves_plan_mode_and_pending_plan_interrupt(
     session: AsyncSession,
 ) -> None:
-    """Plan 暂停必须通过同一 v3 快照恢复 mode 与交互，不伪造 Tool 审批"""
+    """Plan 暂停必须通过同一当前快照恢复 mode 与交互，不伪造 Tool 审批"""
 
     repository = ConversationRepository(session)
     thread = await repository.create_thread(
@@ -710,22 +710,23 @@ async def test_projection_preserves_plan_mode_and_pending_plan_interrupt(
                         "responseSchema": {"type": "object"},
                         "metadata": {
                             "runtimeInterrupt": {
-                                "schema": "tinkerfin.runtime-interrupt.v1",
+                                "schema": "tinkerfin.runtime-interrupt",
                                 "nativeInterruptId": "plan-interrupt-1",
                                 "envelope": {
-                                    "schema": "tinkerfin.runtime-interrupt.v1",
+                                    "schema": "tinkerfin.runtime-interrupt",
                                     "kind": "tinkerfin:plan_clarification",
                                     "message": "请补充部署环境",
                                     "responseSchema": {"type": "object"},
                                     "metadata": {
                                         "origin": "plan",
                                         "clarification": {
-                                            "schema": "tinkerfin.plan-clarification.v2",
                                             "form": {
-                                                "schemaVersion": 2,
+                                                "title": "确认部署环境",
+                                                "description": "部署环境会决定后续验证步骤",
                                                 "questions": [
                                                     {
                                                         "id": "environment",
+                                                        "answerType": "single_choice",
                                                         "prompt": "部署到哪里？",
                                                         "required": True,
                                                         "options": [
@@ -733,7 +734,9 @@ async def test_projection_preserves_plan_mode_and_pending_plan_interrupt(
                                                                 "id": "staging",
                                                                 "label": "测试环境",
                                                                 "description": None,
-                                                                "attributes": None,
+                                                                "attributes": {
+                                                                    "recommended": True
+                                                                },
                                                             }
                                                         ],
                                                         "allowFreeText": False,
@@ -742,10 +745,9 @@ async def test_projection_preserves_plan_mode_and_pending_plan_interrupt(
                                                     *[
                                                         {
                                                             "id": f"question-{index}",
+                                                            "answerType": "text",
                                                             "prompt": f"第 {index + 1} 个问题？",
                                                             "required": False,
-                                                            "options": [],
-                                                            "allowFreeText": True,
                                                             "attributes": None,
                                                         }
                                                         for index in range(1, 4)
@@ -859,7 +861,7 @@ async def test_resume_settlement_clears_pending_snapshot_before_later_error(
                                 ],
                             },
                             "deepagents": {
-                                "schema": "tinkerfin.deepagents.tool-review.v1",
+                                "schema": "tinkerfin.deepagents.tool-review",
                                 "nativeInterruptId": "interrupt-resume",
                                 "actionIndex": 0,
                                 "toolName": "write_file",
@@ -1000,6 +1002,72 @@ async def test_projection_is_idempotent_and_rejects_same_seq_with_other_payload(
     assert stored.event_type == "RUN_STARTED"
 
 
+async def test_projection_rejects_reused_interrupt_id_with_different_contract(
+    session: AsyncSession,
+) -> None:
+    repository = ConversationRepository(session)
+    thread = await repository.create_thread(
+        user_id=7,
+        thread_id="thread-interrupt-conflict",
+        title="中断冲突",
+        model_id="main",
+    )
+    await repository.create_main_run(
+        thread_id=thread.id,
+        run_id="run-1",
+        model_id="main",
+        input_json={"messages": []},
+        config_json={},
+    )
+    await session.commit()
+    projector = ConversationProjector(session)
+    first, first_event = _envelope(
+        1,
+        {
+            "type": "RUN_FINISHED",
+            "threadId": "thread-interrupt-conflict",
+            "runId": "run-1",
+            "outcome": {
+                "type": "interrupt",
+                "interrupts": [
+                    {
+                        "id": "shared-interrupt",
+                        "reason": "tinkerfin:plan_review",
+                        "responseSchema": {"type": "object"},
+                    }
+                ],
+            },
+        },
+    )
+    await projector.project(thread_pk=thread.id, envelope=first, event=first_event)
+    await session.commit()
+    conflicting, conflicting_event = _envelope(
+        2,
+        {
+            "type": "RUN_FINISHED",
+            "threadId": "thread-interrupt-conflict",
+            "runId": "run-1",
+            "outcome": {
+                "type": "interrupt",
+                "interrupts": [
+                    {
+                        "id": "shared-interrupt",
+                        "reason": "tinkerfin:plan_review",
+                        "responseSchema": {"type": "array"},
+                    }
+                ],
+            },
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="interruptId.*内容不一致"):
+        await projector.project(
+            thread_pk=thread.id,
+            envelope=conflicting,
+            event=conflicting_event,
+        )
+
+
 async def test_resume_projection_cannot_take_another_run_claim(
     session: AsyncSession,
 ) -> None:
@@ -1112,7 +1180,7 @@ async def test_initialization_error_releases_resume_claim_without_consuming_it(
                 ],
             },
             "deepagents": {
-                "schema": "tinkerfin.deepagents.tool-review.v1",
+                "schema": "tinkerfin.deepagents.tool-review",
                 "nativeInterruptId": "interrupt-init-failure",
                 "actionIndex": 0,
                 "toolName": "write_file",
@@ -1142,7 +1210,6 @@ async def test_initialization_error_releases_resume_claim_without_consuming_it(
     thread.has_pending_interrupt = True
     thread.snapshot_json = {
         "snapshotSeq": 0,
-        "snapshotVersion": 3,
         "messages": [],
         "todos": [{"id": "todo-pending", "status": "running"}],
         "mode": "default",
@@ -2038,7 +2105,6 @@ async def test_state_delta_updates_server_state_and_todo_projection(
                 "type": "STATE_SNAPSHOT",
                 "snapshot": {
                     "tinkerfin_plan": {
-                        "workflowVersion": "tinkerfin.plan.v1",
                         "effectiveMode": "plan",
                     },
                     "todos": [],
@@ -2076,7 +2142,6 @@ async def test_state_delta_updates_server_state_and_todo_projection(
     assert snapshot is not None
     assert snapshot["serverState"] == {
         "tinkerfin_plan": {
-            "workflowVersion": "tinkerfin.plan.v1",
             "effectiveMode": "default",
         },
         "todos": [{"content": "验证 todo 实时输出", "status": "in_progress"}],

@@ -1,4 +1,4 @@
-"""Resume translation for generic versioned runtime interrupts."""
+"""Resume translation for generic runtime interrupts."""
 
 from __future__ import annotations
 

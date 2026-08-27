@@ -88,7 +88,7 @@ from ag_ui.core import BaseEvent
 source = ProfiledDeferredMessageSource(
     open_events,
     identity=identity,
-    codec_profile="agui.event.v1",
+    codec_profile="agui.event",
     source_type=BaseEvent,
     replay_type=BaseEvent,
     cancellable=True,

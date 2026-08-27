@@ -11,6 +11,6 @@
     "content": "fixture",
     "file_path": "/workspace/report.md"
   },
-  "schema": "tinkerfin.deepagents.tool-review.v1",
+  "schema": "tinkerfin.deepagents.tool-review",
   "toolName": "write_file"
 }

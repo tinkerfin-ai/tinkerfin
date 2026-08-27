@@ -22,7 +22,7 @@ from ..errors import (
 )
 from ._lease_lock import RedisLeaseLock, RedisLeaseLost
 
-_DEFAULT_KEY_PREFIX = "tinkerfin:run:v2:"
+_DEFAULT_KEY_PREFIX = "tinkerfin:run:"
 _DEFAULT_LEASE_TTL_SECONDS = 30.0
 _DEFAULT_WAIT_POLL_SECONDS = 0.1
 

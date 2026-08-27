@@ -46,7 +46,7 @@ Subagents run in non-root namespaces. The converter preserves full namespaces an
 
 The framework never uses `parentRunId` for LangGraph subgraphs. High-level Runtime takes
 `parent_run_id` explicitly and uses it only for checkpoint branching. A
-verified Deep Agents delegate carries `tinkerfin.subagent-provenance.v1` in the task
+verified Deep Agents delegate carries `tinkerfin.subagent-provenance` in the task
 RAW descriptor. `subagentInvocationId` stays stable across resume, `requestRunId`
 identifies the current main request, child event sources repeat the invocation ID, and
 the parent task Result carries `relatedSubagentInvocationId`.

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-__all__ = ["_validate_schema"]
+__all__ = ["_initialize_schema", "_validate_schema"]
 
 from typing import TYPE_CHECKING, Literal
 
@@ -16,7 +16,6 @@ from sqlalchemy import (
     PrimaryKeyConstraint,
     String,
     Table,
-    insert,
     text,
 )
 from sqlalchemy import inspect as sa_inspect
@@ -30,29 +29,7 @@ from ..errors import OpenSandboxStateError
 if TYPE_CHECKING:
     from .sqlalchemy import SQLAlchemyOpenSandboxStateSchema
 
-_SCHEMA_VERSION = 2
-
-
 _metadata = MetaData()
-
-
-_schema_versions = Table(
-    "tinkerfin_opensandbox_schema_versions",
-    _metadata,
-    Column(
-        "component",
-        String(64),
-        primary_key=True,
-        comment="Persistent component whose schema version is recorded",
-    ),
-    Column(
-        "version",
-        Integer,
-        nullable=False,
-        comment="Latest fully committed forward migration",
-    ),
-    comment="Internal OpenSandbox State schema version",
-)
 
 
 _owners = Table(
@@ -153,6 +130,15 @@ def _validate_schema(sync_connection: Connection) -> None:
     """Reject existing tables that do not match the internal State schema."""
     inspector = sa_inspect(sync_connection)
     issues: list[str] = []
+    expected_tables = {str(table.name) for table in _metadata.sorted_tables}
+    actual_tables = {
+        str(name)
+        for name in inspector.get_table_names()
+        if str(name).startswith("tinkerfin_opensandbox_")
+    }
+    unexpected_tables = sorted(actual_tables - expected_tables)
+    if unexpected_tables:
+        issues.append(f"unexpected tables={unexpected_tables}")
     for table in _metadata.sorted_tables:
         if not inspector.has_table(table.name):
             issues.append(f"{table.name}: missing table")
@@ -217,6 +203,20 @@ def _validate_schema(sync_connection: Connection) -> None:
         raise OpenSandboxStateError(
             "OpenSandbox State schema is incompatible: " + "; ".join(issues)
         )
+
+
+def _initialize_schema(sync_connection: Connection) -> None:
+    """Create an empty current schema or reject any non-current owned structure."""
+
+    inspector = sa_inspect(sync_connection)
+    owned_tables = {
+        str(name)
+        for name in inspector.get_table_names()
+        if str(name).startswith("tinkerfin_opensandbox_")
+    }
+    if not owned_tables:
+        _metadata.create_all(sync_connection)
+    _validate_schema(sync_connection)
 
 
 _workers = Table(
@@ -426,25 +426,11 @@ def get_sqlalchemy_opensandbox_state_schema(
     statements.extend(
         str(CreateIndex(index).compile(dialect=compiler)).strip() for index in indexes
     )
-    version_insert = insert(_schema_versions).values(
-        component="opensandbox-state",
-        version=_SCHEMA_VERSION,
-    )
-    statements.append(
-        str(
-            version_insert.compile(
-                dialect=compiler,
-                compile_kwargs={"literal_binds": True},
-            )
-        ).strip()
-    )
     normalized = tuple(
         "\n".join(line.rstrip() for line in statement.splitlines())
         for statement in statements
     )
     return SQLAlchemyOpenSandboxStateSchema(
-        component="opensandbox-state",
-        version=_SCHEMA_VERSION,
         dialect=dialect,
         table_names=tuple(str(table.name) for table in tables),
         ddl=";\n\n".join(normalized) + ";\n",

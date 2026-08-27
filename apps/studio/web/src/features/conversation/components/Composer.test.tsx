@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, within } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { useState } from 'react'
 import { describe, expect, it, vi } from 'vitest'
 
@@ -171,6 +171,118 @@ describe('Composer', () => {
     expect(input).toHaveFocus()
   })
 
+  it('supports macOS Control+U without affecting Command+U', () => {
+    const platform = vi.spyOn(window.navigator, 'platform', 'get').mockReturnValue('MacIntel')
+    try {
+      function ComposerHarness() {
+        const [value, setValue] = useState('第一行\n第二行内容')
+        return (
+          <Composer
+            {...composerChromeProps()}
+            value={value}
+            isRunning={false}
+            onChange={setValue}
+            onSend={vi.fn()}
+            onStop={vi.fn()}
+          />
+        )
+      }
+      render(<ComposerHarness />)
+      const input = screen.getByLabelText('消息输入') as HTMLTextAreaElement
+      input.focus()
+      input.setSelectionRange(input.value.length, input.value.length)
+
+      fireEvent.keyDown(input, { key: 'u', code: 'KeyU', ctrlKey: true })
+
+      expect(input).toHaveValue('第一行\n')
+      expect(input.selectionStart).toBe('第一行\n'.length)
+
+      fireEvent.change(input, { target: { value: '/plan 任务' } })
+      input.setSelectionRange(3, 3)
+      fireEvent.keyDown(input, { key: 'u', code: 'KeyU', ctrlKey: true })
+      expect(input).toHaveValue('任务')
+
+      fireEvent.change(input, { target: { value: '保留内容', selectionStart: 4 } })
+      fireEvent.keyDown(input, { key: 'u', code: 'KeyU', metaKey: true })
+      expect(input).toHaveValue('保留内容')
+    } finally {
+      platform.mockRestore()
+    }
+  })
+
+  it('does not override Control+U outside macOS or during IME composition', () => {
+    const platform = vi.spyOn(window.navigator, 'platform', 'get')
+    try {
+      function ComposerHarness() {
+        const [value, setValue] = useState('保留内容')
+        return (
+          <Composer
+            {...composerChromeProps()}
+            value={value}
+            isRunning={false}
+            onChange={setValue}
+            onSend={vi.fn()}
+            onStop={vi.fn()}
+          />
+        )
+      }
+      const view = render(<ComposerHarness />)
+      const input = screen.getByLabelText('消息输入') as HTMLTextAreaElement
+      input.focus()
+      input.setSelectionRange(input.value.length, input.value.length)
+
+      platform.mockReturnValue('Win32')
+      fireEvent.keyDown(input, { key: 'u', code: 'KeyU', ctrlKey: true })
+      expect(input).toHaveValue('保留内容')
+
+      platform.mockReturnValue('MacIntel')
+      fireEvent.keyDown(input, {
+        key: 'u',
+        code: 'KeyU',
+        ctrlKey: true,
+        isComposing: true,
+      })
+      expect(input).toHaveValue('保留内容')
+      view.unmount()
+    } finally {
+      platform.mockRestore()
+    }
+  })
+
+  it('keeps a leading Slash insertion at the caret and cancels only that token', async () => {
+    function ComposerHarness() {
+      const [value, setValue] = useState('已有内容')
+      return (
+        <Composer
+          {...composerChromeProps()}
+          value={value}
+          isRunning={false}
+          onChange={setValue}
+          onSend={vi.fn()}
+          onStop={vi.fn()}
+        />
+      )
+    }
+    render(<ComposerHarness />)
+    const input = screen.getByLabelText('消息输入') as HTMLTextAreaElement
+    input.focus()
+    input.setSelectionRange(0, 0)
+    fireEvent.select(input)
+
+    fireEvent.change(input, { target: { value: '/已有内容', selectionStart: 1 } })
+    expect(input).toHaveValue('/已有内容')
+    expect(input.selectionStart).toBe(1)
+    expect(screen.getByRole('listbox', { name: '命令和技能建议' })).toBeVisible()
+
+    fireEvent.change(input, { target: { value: '/x已有内容', selectionStart: 2 } })
+    expect(input).toHaveValue('/已有内容')
+    await waitFor(() => expect(input.selectionStart).toBe(1))
+
+    fireEvent.keyDown(input, { key: 'Escape' })
+    expect(input).toHaveValue('已有内容')
+    expect(input.selectionStart).toBe(0)
+  })
+
   it('forwards wheel input to conversation history unless the input region itself overflows', () => {
     const onScrollConversation = vi.fn()
     render(
@@ -238,6 +350,26 @@ describe('Composer', () => {
     })
 
     expect(onSend).not.toHaveBeenCalled()
+  })
+
+  it('sends with Enter while leaving Shift+Enter to native multiline editing', () => {
+    const onSend = vi.fn()
+    render(
+      <Composer
+        {...composerChromeProps()}
+        value="可发送内容"
+        isRunning={false}
+        onChange={vi.fn()}
+        onSend={onSend}
+        onStop={vi.fn()}
+      />,
+    )
+    const input = screen.getByLabelText('消息输入')
+
+    expect(fireEvent.keyDown(input, { key: 'Enter', shiftKey: true })).toBe(true)
+    expect(onSend).not.toHaveBeenCalled()
+    expect(fireEvent.keyDown(input, { key: 'Enter' })).toBe(false)
+    expect(onSend).toHaveBeenCalledOnce()
   })
 
   it('disables input and send while the selected history is hydrating', () => {
@@ -433,7 +565,7 @@ describe('Composer', () => {
     expect(input).toHaveFocus()
   })
 
-  it('keeps menu scrolling inside the popup and cancels Slash on an outside pointer', () => {
+  it('keeps menu scrolling inside the popup and restores input focus after a blank outside pointer', async () => {
     const onScrollConversation = vi.fn()
     function ComposerHarness() {
       const [value, setValue] = useState('/')
@@ -452,14 +584,46 @@ describe('Composer', () => {
     render(<ComposerHarness />)
 
     const menu = screen.getByRole('listbox', { name: '命令和技能建议' })
-    const input = screen.getByLabelText('消息输入')
+    const input = screen.getByLabelText('消息输入') as HTMLTextAreaElement
+    input.focus()
+    input.setSelectionRange(1, 1)
+    fireEvent.select(input)
     fireEvent.wheel(menu, { deltaY: 120 })
     expect(onScrollConversation).not.toHaveBeenCalled()
 
     fireEvent.pointerDown(input)
     expect(menu).toBeVisible()
-    fireEvent.pointerDown(document.body)
+    fireEvent.mouseDown(document.body)
     expect(screen.queryByRole('listbox', { name: '命令和技能建议' })).not.toBeInTheDocument()
     expect(input).toHaveValue('')
+    await waitFor(() => expect(input).toHaveFocus())
+    expect(input.selectionStart).toBe(0)
+  })
+
+  it('allows focus to move to an interactive target when outside pointer dismisses suggestions', () => {
+    function ComposerHarness() {
+      const [value, setValue] = useState('/')
+      return (
+        <>
+          <Composer
+            {...composerChromeProps()}
+            value={value}
+            isRunning={false}
+            onChange={setValue}
+            onSend={vi.fn()}
+            onStop={vi.fn()}
+          />
+          <button type="button">外部操作</button>
+        </>
+      )
+    }
+    render(<ComposerHarness />)
+    const target = screen.getByRole('button', { name: '外部操作' })
+
+    fireEvent.mouseDown(target)
+    target.focus()
+
+    expect(screen.queryByRole('listbox', { name: '命令和技能建议' })).not.toBeInTheDocument()
+    expect(target).toHaveFocus()
   })
 })

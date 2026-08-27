@@ -70,5 +70,10 @@ describe('composerSuggestions', () => {
     expect(cancelComposerSuggestion('/pla')).toEqual({ value: '', caret: 0 })
     expect(cancelComposerSuggestion('  /p')).toEqual({ value: '', caret: 0 })
     expect(cancelComposerSuggestion('普通消息')).toEqual({ value: '普通消息', caret: 4 })
+    expect(cancelComposerSuggestion('/已有内容', {
+      start: 0,
+      end: 1,
+      query: '',
+    })).toEqual({ value: '已有内容', caret: 0 })
   })
 })

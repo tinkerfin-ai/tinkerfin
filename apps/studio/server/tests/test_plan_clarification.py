@@ -7,9 +7,10 @@ from tinkerfin import TinkerFin
 from tinkerfin_studio.agent.plan_clarification import StudioPlanClarificationForm
 
 
-def _form_payload(
+def _choice_form_payload(
     *,
-    recommendations: tuple[bool, ...],
+    answer_type: str = "single_choice",
+    recommendations: tuple[bool, ...] = (True, False),
     required: bool = True,
 ) -> dict[str, object]:
     return {
@@ -18,6 +19,7 @@ def _form_payload(
         "questions": [
             {
                 "id": "topic",
+                "answerType": answer_type,
                 "prompt": "这份分析的主题是什么？",
                 "required": required,
                 "options": [
@@ -33,11 +35,14 @@ def _form_payload(
     }
 
 
-def test_studio_plan_form_exposes_required_model_fields() -> None:
+def test_studio_plan_form_exposes_all_builtin_question_types() -> None:
     schema = StudioPlanClarificationForm.model_json_schema(by_alias=True)
 
     assert set(schema["required"]) == {"questions", "title", "description"}
-    assert schema["properties"]["schemaVersion"]["const"] == 2
+    assert "schemaVersion" not in schema["properties"]
+    assert set(
+        schema["properties"]["questions"]["items"]["discriminator"]["mapping"]
+    ) == {"single_choice", "multiple_choice", "text", "date"}
     assert schema["properties"]["title"] == {
         "description": "根据本次澄清问题生成简洁、用户可见的表单标题",
         "maxLength": 20,
@@ -55,21 +60,19 @@ def test_studio_plan_form_exposes_required_model_fields() -> None:
     option_attributes = schema["$defs"]["StudioPlanOptionAttributes"]
     assert option_attributes["required"] == ["recommended"]
     assert option_attributes["properties"]["recommended"]["type"] == "boolean"
-    question_schema = schema["$defs"]["StudioPlanClarificationQuestion"]
-    assert "required" in question_schema["required"]
 
     TinkerFin().plan(clarification_schema=StudioPlanClarificationForm)
 
 
-def test_studio_plan_form_accepts_only_the_first_option_as_recommended() -> None:
+def test_studio_single_choice_requires_only_the_first_option_as_recommended() -> None:
     form = StudioPlanClarificationForm.model_validate(
-        _form_payload(recommendations=(True, False, False))
+        _choice_form_payload(recommendations=(True, False, False))
     )
 
-    assert form.questions[0].options[0].attributes.recommended is True
-    assert all(
-        not option.attributes.recommended for option in form.questions[0].options[1:]
-    )
+    question = form.questions[0]
+    assert question.answer_type == "single_choice"
+    assert question.options[0].attributes.recommended is True
+    assert all(not option.attributes.recommended for option in question.options[1:])
 
 
 @pytest.mark.parametrize(
@@ -77,26 +80,54 @@ def test_studio_plan_form_accepts_only_the_first_option_as_recommended() -> None
     [
         ((False, False), "第一个选项必须是推荐项"),
         ((False, True), "第一个选项必须是推荐项"),
-        ((True, True), "除第一个选项外不得标记其他推荐项"),
+        ((True, True), "只能标记第一个选项为推荐项"),
     ],
 )
-def test_studio_plan_form_rejects_invalid_recommendation_order(
+def test_studio_single_choice_rejects_invalid_recommendation_order(
     recommendations: tuple[bool, ...],
     message: str,
 ) -> None:
     with pytest.raises(ValidationError, match=message):
         StudioPlanClarificationForm.model_validate(
-            _form_payload(recommendations=recommendations)
+            _choice_form_payload(recommendations=recommendations)
         )
 
 
-def test_studio_plan_form_allows_a_free_text_only_question() -> None:
+def test_studio_multiple_choice_allows_several_recommendations() -> None:
     form = StudioPlanClarificationForm.model_validate(
-        _form_payload(recommendations=(), required=False)
+        _choice_form_payload(
+            answer_type="multiple_choice",
+            recommendations=(True, False, True),
+        )
     )
 
-    assert form.questions[0].options == ()
-    assert form.questions[0].allow_free_text is True
+    question = form.questions[0]
+    assert question.answer_type == "multiple_choice"
+    assert [option.attributes.recommended for option in question.options] == [
+        True,
+        False,
+        True,
+    ]
+
+
+@pytest.mark.parametrize("answer_type", ["text", "date"])
+def test_studio_plan_form_accepts_non_choice_questions(answer_type: str) -> None:
+    form = StudioPlanClarificationForm.model_validate(
+        {
+            "title": "确认分析方向",
+            "description": "请先补充本次分析所需信息",
+            "questions": [
+                {
+                    "id": "detail",
+                    "answerType": answer_type,
+                    "prompt": "请补充信息",
+                    "required": False,
+                }
+            ],
+        }
+    )
+
+    assert form.questions[0].answer_type == answer_type
     assert form.questions[0].required is False
 
 
@@ -113,7 +144,7 @@ def test_studio_plan_form_rejects_invalid_visible_copy_lengths(
     field: str,
     value: str,
 ) -> None:
-    payload = _form_payload(recommendations=(True, False))
+    payload = _choice_form_payload()
     payload[field] = value
 
     with pytest.raises(ValidationError):

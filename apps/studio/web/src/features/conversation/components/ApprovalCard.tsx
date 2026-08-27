@@ -1,5 +1,5 @@
 import { ChevronDown, ChevronUp } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useId, useRef, useState } from 'react'
 
 import { Button, IconButton, OverlayScrollbar } from '../../../components/ui'
 import type {
@@ -16,6 +16,7 @@ import {
 import { MarkdownContent } from './MarkdownContent'
 import { ToolCallCard } from './MessageBlock'
 import { ActivityDots } from './ActivityDots'
+import { InteractionCardResizeHandle } from './InteractionCardResizeHandle'
 
 export interface ApprovalSubmissionDecision {
   interruptId: string
@@ -90,7 +91,14 @@ export function ApprovalCard({
 }) {
   const { t } = useI18n()
   const approval = conversation.approval
+  const cardId = useId()
+  const cardRef = useRef<HTMLElement>(null)
   const bodyRef = useRef<HTMLDivElement>(null)
+  const rejectionTextareaRef = useRef<HTMLTextAreaElement>(null)
+  const rejectButtonRef = useRef<HTMLButtonElement>(null)
+  const approveButtonRef = useRef<HTMLButtonElement>(null)
+  const retryButtonRef = useRef<HTMLButtonElement>(null)
+  const restoreRejectFocusRef = useRef(false)
   const [minimized, setMinimized] = useState(() => readApprovalCollapsed(conversation.threadId))
   const [rejectionDrafts, setRejectionDrafts] = useState<Record<string, string>>({})
 
@@ -98,13 +106,38 @@ export function ApprovalCard({
     setMinimized(readApprovalCollapsed(conversation.threadId))
   }, [conversation.threadId])
 
-  if (!approval || approval.items.length === 0) return null
-
   const activeIndex = Math.max(0, Math.min(
-    approval.activeIndex,
-    approval.items.length - 1,
+    approval?.activeIndex ?? 0,
+    (approval?.items.length ?? 1) - 1,
   ))
-  const active = approval.items[activeIndex]
+  const active = approval?.items[activeIndex]
+  const activeInterruptId = active?.interruptId
+  const previousActiveInterruptIdRef = useRef(activeInterruptId)
+
+  useEffect(() => {
+    const previous = previousActiveInterruptIdRef.current
+    previousActiveInterruptIdRef.current = activeInterruptId
+    if (!activeInterruptId || !previous || previous === activeInterruptId || minimized) return
+    const frame = window.requestAnimationFrame(() => (
+      rejectButtonRef.current ?? approveButtonRef.current ?? retryButtonRef.current
+    )?.focus())
+    return () => window.cancelAnimationFrame(frame)
+  }, [activeInterruptId, minimized])
+
+  useEffect(() => {
+    if (!activeInterruptId || approval?.mode !== 'reject' || minimized) return
+    const frame = window.requestAnimationFrame(() => rejectionTextareaRef.current?.focus())
+    return () => window.cancelAnimationFrame(frame)
+  }, [activeInterruptId, approval?.mode, minimized])
+
+  useEffect(() => {
+    if (!restoreRejectFocusRef.current || approval?.mode === 'reject' || minimized) return
+    restoreRejectFocusRef.current = false
+    const frame = window.requestAnimationFrame(() => rejectButtonRef.current?.focus())
+    return () => window.cancelAnimationFrame(frame)
+  }, [activeInterruptId, approval?.mode, minimized])
+
+  if (!approval || approval.items.length === 0) return null
   if (!active) return null
   const interruptIds = approval.items.map((item) => item.interruptId)
   const description = descriptionParts(active.description, t('请确认本次操作'))
@@ -160,6 +193,11 @@ export function ApprovalCard({
     updateApproval((current) => ({ ...current, mode, error: undefined }))
   }
 
+  const cancelRejection = () => {
+    restoreRejectFocusRef.current = true
+    setMode('options')
+  }
+
   const toggleMinimized = () => {
     // 收起只保存当前会话的展示偏好，不改变审批状态或触发恢复
     setMinimized((current) => {
@@ -171,6 +209,8 @@ export function ApprovalCard({
 
   return (
     <section
+      ref={cardRef}
+      id={cardId}
       className={`approval-composer${minimized ? ' is-minimized' : ''}`}
       aria-label={t('等待审批')}
       onWheel={(event) => {
@@ -187,11 +227,13 @@ export function ApprovalCard({
         }
       }}
     >
+      {!minimized && <InteractionCardResizeHandle cardRef={cardRef} controls={cardId} />}
       <header className="approval-composer-head">
         <button
           type="button"
           className="approval-toggle-surface"
           aria-label={minimized ? t('展开审批卡片') : t('收起审批卡片')}
+          aria-expanded={!minimized}
           onClick={toggleMinimized}
         />
         <div className="approval-composer-heading">
@@ -234,6 +276,7 @@ export function ApprovalCard({
                   {t('拒绝原因（可选）')}
                 </label>
                 <textarea
+                  ref={rejectionTextareaRef}
                   id={`approval-reason-${active.id}`}
                   name="reason"
                   value={rejectionReason}
@@ -258,13 +301,14 @@ export function ApprovalCard({
             <div className="approval-composer-actions">
               {approval.mode === 'reject' ? (
                 <>
-                  <Button size="sm" onClick={() => setMode('options')}>{t('取消')}</Button>
+                  <Button size="sm" onClick={cancelRejection}>{t('取消')}</Button>
                   <Button size="sm" type="submit" form={rejectionFormId} variant="danger">
                     {t('确认拒绝')}
                   </Button>
                 </>
               ) : allDecided ? (
                 <Button
+                  ref={retryButtonRef}
                   size="sm"
                   className="approval-allow-button"
                   onClick={() => onSubmit(interruptIds)}
@@ -274,12 +318,18 @@ export function ApprovalCard({
               ) : (
                 <>
                   {canReject && (
-                    <Button size="sm" className="approval-reject-button" onClick={() => setMode('reject')}>
+                    <Button
+                      ref={rejectButtonRef}
+                      size="sm"
+                      className="approval-reject-button"
+                      onClick={() => setMode('reject')}
+                    >
                       {t('拒绝')}
                     </Button>
                   )}
                   {canApprove && (
                     <Button
+                      ref={approveButtonRef}
                       size="sm"
                       className="approval-allow-button"
                       onClick={() => recordDecision({

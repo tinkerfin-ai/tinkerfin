@@ -1,4 +1,4 @@
-"""Versioned public contract for Deep Agents Tool review interrupts."""
+"""Public contract for Deep Agents Tool review interrupts."""
 
 from __future__ import annotations
 
@@ -22,12 +22,12 @@ from .ids import ScopedIdCodec
 from .models import JsonObject
 from .reasoning import json_values_equal, normalize_operational_data
 
-TOOL_REVIEW_SCHEMA = "tinkerfin.deepagents.tool-review.v1"
+TOOL_REVIEW_SCHEMA = "tinkerfin.deepagents.tool-review"
 ToolReviewDecision = Literal["approve", "edit", "reject", "respond"]
 
 
 class ToolReviewContractError(AgUiConversionError):
-    """A complete AG-UI interrupt violates the Tool review v1 contract."""
+    """A complete AG-UI interrupt violates the current Tool review contract."""
 
     code = AgUiAdapterErrorCode.TOOL_REVIEW_CONTRACT_INVALID
 
@@ -46,7 +46,7 @@ class ToolReviewInterruptMetadata(BaseModel):
         populate_by_name=True,
     )
 
-    schema_id: Literal["tinkerfin.deepagents.tool-review.v1"] = Field(
+    schema_id: Literal["tinkerfin.deepagents.tool-review"] = Field(
         alias="schema", description="Exact TinkerFin Tool review metadata schema"
     )
     native_interrupt_id: str = Field(
@@ -177,11 +177,11 @@ def parse_tool_review_interrupt(
         interrupt: Trusted complete interrupt persisted from an Adapter terminal.
 
     Returns:
-        The immutable v1 metadata after cross-checking the native HITL request,
+        The immutable current metadata after cross-checking the native HITL request,
         public interrupt ID, action position, policy, arguments, and scoped Tool ID.
 
     Raises:
-        ToolReviewContractError: The interrupt is not a valid Tool review v1 value.
+        ToolReviewContractError: The interrupt is not a valid Tool review value.
     """
 
     return _parse_tool_review_interrupt(interrupt).metadata

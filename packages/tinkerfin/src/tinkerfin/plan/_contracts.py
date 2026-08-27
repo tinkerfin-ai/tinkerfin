@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import UnionType
-from typing import Annotated, Literal, TypeAlias, cast
+from typing import Annotated, Literal, cast
 
 from pydantic import (
     BaseModel,
@@ -20,7 +20,7 @@ from pydantic.alias_generators import to_camel
 from ._clarification import ClarificationSchemaBinding
 from ._content import PlanContentBinding
 from .clarification import ClarificationFormBase
-from .models import NonBlankText, PlanContentModel, PlanReviewAction, PlanStepId
+from .models import NonBlankText, PlanContentModel, PlanReviewAction
 
 
 class _ContractModel(BaseModel):
@@ -56,60 +56,14 @@ class PlannerOutcomeBase(_ContractModel):
         return self
 
 
-class ClarificationOptionAnswer(_ContractModel):
-    """One untrusted client answer selecting a checkpointed option by ID."""
-
-    question_id: PlanStepId
-    option_id: PlanStepId
-
-
-class ClarificationFreeTextAnswer(_ContractModel):
-    """One untrusted client answer containing only non-blank free text."""
-
-    question_id: PlanStepId
-    answer: NonBlankText
-
-
-class ClarificationSkippedAnswer(_ContractModel):
-    """One explicit skip for a checkpointed optional clarification question."""
-
-    question_id: PlanStepId
-    skipped: Literal[True]
-
-
-ClarificationAnswer: TypeAlias = (
-    ClarificationOptionAnswer | ClarificationFreeTextAnswer | ClarificationSkippedAnswer
-)
-
-
-class ClarificationResponse(_ContractModel):
-    """Complete user response to one clarification interrupt."""
-
-    type: Literal["respond"]
-    answers: tuple[ClarificationAnswer, ...] = Field(min_length=1)
-
-    @model_validator(mode="after")
-    def question_ids_are_unique(self) -> ClarificationResponse:
-        """Reject ambiguous duplicate answers before checkpoint comparison."""
-
-        question_ids = tuple(answer.question_id for answer in self.answers)
-        if len(question_ids) != len(set(question_ids)):
-            raise ValueError("clarification response question IDs must be unique")
-        return self
-
-
 class PlanClarificationPayload(_ContractModel):
     """Public Plan clarification payload projected through runtime metadata."""
 
-    contract: Literal["tinkerfin.plan-clarification.v2"] = Field(
-        default="tinkerfin.plan-clarification.v2",
-        alias="schema",
-    )
     form: dict[str, JsonValue]
 
 
 class PlanClarificationMetadata(_ContractModel):
-    """Versioned public metadata for one Planner clarification interrupt."""
+    """Public metadata for one Planner clarification interrupt."""
 
     origin: Literal["plan"] = "plan"
     clarification: PlanClarificationPayload
@@ -138,12 +92,7 @@ class RejectPlan(_ContractModel):
 
 
 class PlanReviewPayloadBase(_ContractModel):
-    """Versioned review payload specialized with one concrete draft type."""
-
-    contract: Literal["tinkerfin.plan-review.v1"] = Field(
-        default="tinkerfin.plan-review.v1",
-        alias="schema",
-    )
+    """Review payload specialized with one concrete draft type."""
 
 
 class PlanReviewMetadataBase(_ContractModel):
@@ -179,7 +128,7 @@ def create_plan_contract_binding(
     clarification: ClarificationSchemaBinding,
     content: PlanContentBinding,
     *,
-    review_actions: tuple[PlanReviewAction, ...],
+    allowed_review_actions: tuple[PlanReviewAction, ...],
 ) -> PlanContractBinding:
     """Bind one clarification form and one Plan content schema atomically."""
 
@@ -201,7 +150,7 @@ def create_plan_contract_binding(
             PlanReviewAction.RESPOND: RespondToPlan,
             PlanReviewAction.REJECT: RejectPlan,
         }[action]
-        for action in review_actions
+        for action in allowed_review_actions
     )
     review_union = _review_model_union(review_types)
     review_annotation = (
@@ -234,19 +183,8 @@ def create_plan_contract_binding(
     )
 
 
-CLARIFICATION_RESPONSE: TypeAdapter[ClarificationResponse] = TypeAdapter(
-    ClarificationResponse
-)
-
-
 __all__ = [
-    "CLARIFICATION_RESPONSE",
     "ApprovePlan",
-    "ClarificationAnswer",
-    "ClarificationFreeTextAnswer",
-    "ClarificationOptionAnswer",
-    "ClarificationResponse",
-    "ClarificationSkippedAnswer",
     "EditPlanBase",
     "PlanClarificationMetadata",
     "PlanClarificationPayload",

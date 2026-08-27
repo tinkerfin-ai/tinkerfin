@@ -99,7 +99,7 @@ def _public_interrupts() -> tuple[AgUiInterrupt, ...]:
     interrupts: list[AgUiInterrupt] = []
     for index, raw_tool_call_id in enumerate(("call-main-a", "call-main-b")):
         deepagents = {
-            "schema": "tinkerfin.deepagents.tool-review.v1",
+            "schema": "tinkerfin.deepagents.tool-review",
             "nativeInterruptId": "interrupt-main",
             "actionIndex": index,
             "toolName": "write_file",
@@ -237,7 +237,7 @@ def test_resume_mapper_restores_multiple_persisted_agui_groups() -> None:
                 ],
             },
             "deepagents": {
-                "schema": "tinkerfin.deepagents.tool-review.v1",
+                "schema": "tinkerfin.deepagents.tool-review",
                 "nativeInterruptId": "interrupt-secondary",
                 "actionIndex": 0,
                 "toolName": "ask_user",

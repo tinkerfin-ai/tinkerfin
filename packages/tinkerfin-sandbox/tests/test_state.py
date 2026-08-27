@@ -919,55 +919,35 @@ async def test_sqlite_warm_consume_requires_the_slot_clear_to_commit(
         await state.aclose()
 
 
-async def test_sqlite_state_migrates_v1_schema_and_preserves_bindings(
+async def test_sqlite_state_rejects_removed_version_state(
     tmp_path: Path,
 ) -> None:
     state_type = _public_type("SQLAlchemyOpenSandboxState")
-    database_path = tmp_path / "migration.db"
+    state_error = _public_type("OpenSandboxStateError")
+    database_path = tmp_path / "removed-version-state.db"
     url = _sqlite_url(database_path)
 
     seeded = state_type(url=url, namespace="test")
     await seeded.start(warm_pool_size=0)
-    claim = await seeded.acquire_owner("user-A")
-    committed = await seeded.bind_owner(claim, "sandbox-1")
-    await seeded.release_owner(claim)
     await seeded.aclose()
 
     async with aiosqlite.connect(database_path) as connection:
         await connection.execute(
             """
-            UPDATE tinkerfin_opensandbox_schema_versions
-            SET version = 1
-            WHERE component = 'opensandbox-state'
+            CREATE TABLE tinkerfin_opensandbox_schema_versions (
+                component VARCHAR(64) PRIMARY KEY,
+                version INTEGER NOT NULL
+            )
             """
         )
-        await connection.execute("DROP TABLE tinkerfin_opensandbox_workers")
         await connection.commit()
 
-    migrated = state_type(url=url, namespace="test")
-    await migrated.start(warm_pool_size=0)
+    current = state_type(url=url, namespace="test")
     try:
-        assert await migrated.read_binding("user-A") == committed
-        async with aiosqlite.connect(database_path) as connection:
-            cursor = await connection.execute(
-                """
-                SELECT version
-                FROM tinkerfin_opensandbox_schema_versions
-                WHERE component = 'opensandbox-state'
-                """
-            )
-            assert await cursor.fetchone() == (2,)
-            cursor = await connection.execute(
-                """
-                SELECT COUNT(*)
-                FROM sqlite_master
-                WHERE type = 'table'
-                  AND name = 'tinkerfin_opensandbox_workers'
-                """
-            )
-            assert await cursor.fetchone() == (1,)
+        with pytest.raises(state_error, match="schema"):
+            await current.start(warm_pool_size=0)
     finally:
-        await migrated.aclose()
+        await current.aclose()
 
 
 async def test_sqlite_state_rejects_an_incompatible_existing_schema(

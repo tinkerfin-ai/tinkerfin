@@ -1,4 +1,4 @@
-"""AG-UI 事件到前端 v3 快照的纯数据归约"""
+"""AG-UI 事件到前端当前快照的纯数据归约"""
 
 from __future__ import annotations
 
@@ -15,11 +15,10 @@ from tinkerfin_agui_adapter import SubagentProvenance, parse_tool_review_interru
 
 
 def empty_snapshot() -> dict[str, object]:
-    """创建一个可直接返回前端的空 v3 快照"""
+    """创建一个可直接返回前端的空快照"""
 
     return {
         "snapshotSeq": 0,
-        "snapshotVersion": 3,
         "messages": [],
         "todos": [],
         "mode": "default",
@@ -722,5 +721,4 @@ def reduce_snapshot(
 
 def _finish_snapshot(snapshot: dict[str, object], seq: int) -> dict[str, object]:
     snapshot["snapshotSeq"] = seq
-    snapshot["snapshotVersion"] = 3
     return snapshot

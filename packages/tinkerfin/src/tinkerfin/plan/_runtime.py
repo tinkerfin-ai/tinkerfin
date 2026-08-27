@@ -26,9 +26,16 @@ from .._agui_lineage_state import (
     LineageRole,
     lineage_marker_with_role,
 )
+from ._clarification import (
+    pending_contract_digest,
+    restore_form,
+    validate_and_normalize_response,
+)
+from ._config import PlanOptions
 from ._content import PlanContentBinding
 from ._state import (
     PLAN_CHECKPOINT_RUN_ID,
+    PLAN_SCHEMA_FINGERPRINT_KEY,
     PLAN_STATE_KEY,
     read_plan_state,
 )
@@ -262,7 +269,6 @@ def _handoff_text(
     return (
         f'{_APPROVED_PLAN_MARKER} digest="{handoff.digest}" '
         f'content-type="{confirmed.content_schema.media_type}" '
-        f'schema="{confirmed.content_schema.id}" '
         f'revision="{confirmed.revision}">\n'
         "Plan review is complete and approval has already been granted. Begin native "
         "Deep Agent execution now. Do not restate the Plan or request general Plan "
@@ -416,6 +422,7 @@ class PlanCapableGraphRuntime:
     __slots__ = (
         "_content",
         "_native",
+        "_options",
         "_planning_factory",
         "_prefer_plan",
         "_signature",
@@ -424,12 +431,13 @@ class PlanCapableGraphRuntime:
     def __init__(
         self,
         *,
-        content: PlanContentBinding,
+        options: PlanOptions,
         native: _GraphRuntime,
         planning_factory: Callable[[], PlanningWorkflowGraph[Any]],
         prefer_plan: bool,
     ) -> None:
-        self._content = content
+        self._options = options
+        self._content = options.content
         self._native = native
         self._planning_factory = planning_factory
         self._prefer_plan = prefer_plan
@@ -489,6 +497,7 @@ class PlanCapableGraphRuntime:
 
         use_planning = self._prefer_plan
         if _is_resume_command(graph_input):
+            planning_snapshot: StateSnapshot | None = None
             if lineage_required:
                 thread_id = configurable.get("thread_id")
                 if not isinstance(thread_id, str):
@@ -507,6 +516,15 @@ class PlanCapableGraphRuntime:
                 native_pending = False
                 if head.role == PLANNING_CHECKPOINT_ROLE:
                     planning_snapshot = await planning.aget_state(head.config)
+                    planning_values = cast(
+                        Mapping[str, object], planning_snapshot.values
+                    )
+                    checkpoint_state = dict(planning_values)
+                    checkpoint_plan = (
+                        read_plan_state(checkpoint_state, self._content)
+                        if PLAN_STATE_KEY in checkpoint_state
+                        else None
+                    )
                     planning_pending = bool(planning_snapshot.next)
                     if _native_checkpoint_id_for_plan(checkpoint_plan) is not None:
                         (
@@ -535,6 +553,39 @@ class PlanCapableGraphRuntime:
                     "Planning and native Graphs both contain pending work"
                 )
             if planning_pending:
+                if planning_snapshot is None or PLAN_STATE_KEY not in checkpoint_state:
+                    raise PlanStateConflictError(
+                        "pending Planning checkpoint has no Plan state"
+                    )
+                checkpoint_plan = read_plan_state(checkpoint_state, self._content)
+                if checkpoint_plan.status is PlanStatus.AWAITING_CLARIFICATION:
+                    if (
+                        checkpoint_state.get(PLAN_SCHEMA_FINGERPRINT_KEY)
+                        != self._options.clarification.fingerprint
+                    ):
+                        raise PlanModeConfigurationError(
+                            "checkpoint clarification schema does not match this Definition"
+                        )
+                    pending = checkpoint_plan.pending_clarification
+                    if pending is None:
+                        raise PlanStateConflictError(
+                            "clarification resume has no pending form"
+                        )
+                    if pending.contract_digest != pending_contract_digest(
+                        pending.form,
+                        pending.response_schema,
+                    ):
+                        raise PlanStateConflictError(
+                            "clarification resume has an invalid contract digest"
+                        )
+                    command = cast(Command[object], graph_input)
+                    form = restore_form(self._options.clarification, pending.form)
+                    validate_and_normalize_response(
+                        self._options.clarification,
+                        form,
+                        pending.response_schema,
+                        command.resume,
+                    )
                 use_planning = True
             elif native_pending:
                 use_planning = bool(

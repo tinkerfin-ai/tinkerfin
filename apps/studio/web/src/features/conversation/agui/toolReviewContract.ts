@@ -1,6 +1,6 @@
 import type { JsonObject, JsonValue } from "../../../types"
 
-export const TOOL_REVIEW_SCHEMA = "tinkerfin.deepagents.tool-review.v1" as const
+export const TOOL_REVIEW_SCHEMA = "tinkerfin.deepagents.tool-review" as const
 
 export type ToolReviewDecision = "approve" | "edit" | "reject" | "respond"
 
@@ -137,7 +137,7 @@ export const parseToolReviewInterrupt = (
   if (!metadata) throw new ToolReviewContractError("Tool review 缺少 metadata")
   const deepagents = metadata.deepagents
   if (!isJsonObject(deepagents) || !hasOnlyKeys(deepagents, METADATA_KEYS)) {
-    throw new ToolReviewContractError("metadata.deepagents 不符合 v1 契约")
+    throw new ToolReviewContractError("metadata.deepagents 不符合当前契约")
   }
   if (
     deepagents.schema !== TOOL_REVIEW_SCHEMA

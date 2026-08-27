@@ -5,6 +5,8 @@ from __future__ import annotations
 import pytest
 from ag_ui.core import Interrupt as AgUiInterrupt
 from ag_ui.core.types import ResumeEntry
+from jsonschema.exceptions import SchemaError
+from pydantic import ValidationError
 
 from tinkerfin_agui_adapter import (
     DeepAgentAgUiAdapter,
@@ -14,6 +16,7 @@ from tinkerfin_agui_adapter import (
     RuntimeInterruptEnvelope,
 )
 from tinkerfin_agui_adapter.models import AgentRuntimeInterrupt
+from tinkerfin_agui_adapter.runtime_interrupts import prepare_runtime_ag_ui_interrupt
 
 
 def _entry(
@@ -103,9 +106,81 @@ def test_native_runtime_interrupt_resume_uses_the_same_payload() -> None:
     assert translation.root == {"type": "respond", "message": "x"}
 
 
-def test_unknown_runtime_interrupt_schema_version_fails_closed() -> None:
+def test_runtime_interrupt_rejects_an_invalid_response_schema_before_publication() -> (
+    None
+):
+    with pytest.raises(ValidationError, match="not valid"):
+        RuntimeInterruptEnvelope(
+            kind="input_required",
+            response_schema={"type": "unknown"},
+        )
+
+
+def test_runtime_interrupt_revalidates_and_copies_schema_at_publication() -> None:
+    invalid = _envelope()
+    invalid.response_schema["type"] = "unknown"
+    with pytest.raises(SchemaError):
+        prepare_runtime_ag_ui_interrupt(
+            _native(
+                "plan-1",
+                invalid.model_dump(mode="json", by_alias=True),
+            ),
+            invalid,
+            source={},
+        )
+
+    envelope = _envelope()
+    published = prepare_runtime_ag_ui_interrupt(
+        _native(
+            "plan-1",
+            envelope.model_dump(mode="json", by_alias=True),
+        ),
+        envelope,
+        source={},
+    )
+    envelope.response_schema["type"] = "array"
+
+    assert published.response_schema == {"type": "object"}
+
+
+def test_runtime_interrupt_schema_requires_finite_json() -> None:
+    with pytest.raises(ValidationError, match="not valid"):
+        RuntimeInterruptEnvelope(
+            kind="input_required",
+            response_schema={"type": "number", "maximum": float("nan")},
+        )
+
+
+def test_runtime_resume_validates_calendar_date_formats() -> None:
+    envelope = RuntimeInterruptEnvelope(
+        kind="input_required",
+        response_schema={
+            "type": "object",
+            "required": ["date"],
+            "additionalProperties": False,
+            "properties": {"date": {"type": "string", "format": "date"}},
+        },
+    )
+    interrupt = _native(
+        "date-1",
+        envelope.model_dump(mode="json", by_alias=True),
+    )
+
+    with pytest.raises(ResumeMappingError, match="payload"):
+        ResumeMapper().map(
+            entries=(_entry("date-1", payload={"date": "2026-02-29"}),),
+            interrupts=(interrupt,),
+        )
+    translation = ResumeMapper().map(
+        entries=(_entry("date-1", payload={"date": "2028-02-29"}),),
+        interrupts=(interrupt,),
+    )
+    assert translation.root == {"date": "2028-02-29"}
+
+
+def test_unknown_runtime_interrupt_contract_fails_closed() -> None:
     value = _envelope().model_dump(mode="json", by_alias=True)
-    value["schema"] = "tinkerfin.runtime-interrupt.v2"
+    value["schema"] = "tinkerfin.runtime-interrupt.unsupported"
 
     with pytest.raises(ResumeMappingError, match="invalid"):
         ResumeMapper().map(
@@ -152,7 +227,7 @@ def test_runtime_interrupt_cancellation_is_abandonment() -> None:
         metadata={
             "langgraphValue": _envelope().model_dump(mode="json", by_alias=True),
             "runtimeInterrupt": {
-                "schema": "tinkerfin.runtime-interrupt.v1",
+                "schema": "tinkerfin.runtime-interrupt",
                 "nativeInterruptId": "plan-1",
                 "envelope": _envelope().model_dump(mode="json", by_alias=True),
             },

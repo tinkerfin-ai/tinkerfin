@@ -1,4 +1,4 @@
-"""Versioned finite JSON projection for verified LangGraph v2 stream parts."""
+"""Finite JSON projection for verified LangGraph v2 stream parts."""
 
 from __future__ import annotations
 
@@ -40,15 +40,10 @@ _NATIVE_MODES: frozenset[str] = frozenset(
 
 
 class NativeStreamPart(BaseModel):
-    """Finite replay and direct-SSE representation of one v2 stream part."""
+    """Current replay and direct-SSE representation of one v2 stream part."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
 
-    schema_version: Literal[1] = Field(
-        default=1,
-        alias="schemaVersion",
-        description="Version of the finite native stream schema.",
-    )
     mode: NativeMode = Field(
         alias="type",
         description="Verified LangGraph v2 stream mode.",

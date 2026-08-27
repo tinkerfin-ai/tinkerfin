@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
 from tinkerfin_agui_adapter import Identity
 
 LINEAGE_STATE_KEY = "_tinkerfin_lineage"
-PLANNING_CHECKPOINT_RUN_ID = "tinkerfin-plan-v1"
+PLANNING_CHECKPOINT_RUN_ID = "tinkerfin-plan"
 
 LineageRole: TypeAlias = Literal["native", "planning"]
 
@@ -32,7 +32,6 @@ class LineageMarker(BaseModel):
         strict=True,
     )
 
-    schema_version: Literal[1] = 1
     thread_id: str = Field(min_length=1)
     run_id: str = Field(min_length=1)
     parent_run_id: str | None = Field(default=None, min_length=1)

@@ -36,6 +36,15 @@ Object.defineProperty(window, 'matchMedia', {
   },
 })
 
+Object.defineProperty(globalThis, 'ResizeObserver', {
+  configurable: true,
+  value: class {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  },
+})
+
 beforeEach(() => {
   window.localStorage.clear()
 })

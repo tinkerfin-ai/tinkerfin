@@ -46,7 +46,7 @@ RUN_FINISHED
 
 框架不会用 `parentRunId` 表示 LangGraph 子图。高层 Runtime 显式接收 `parent_run_id`，并且只把它
 用于 checkpoint 分支。经过校验的 Deep Agents
-委派会在 task RAW descriptor 中携带 `tinkerfin.subagent-provenance.v1`：
+委派会在 task RAW descriptor 中携带 `tinkerfin.subagent-provenance`：
 `subagentInvocationId` 跨 resume 稳定，`requestRunId` 表示当前主请求，子事件 source 重复该
 invocation ID，父 task Result 使用 `relatedSubagentInvocationId`。
 

@@ -44,7 +44,7 @@ def _artifacts() -> dict[Path, str]:
     tool_schema["$id"] = (
         "https://github.com/tinkerfin-ai/tinkerfin/blob/main/"
         "packages/tinkerfin-agui-adapter/src/tinkerfin_agui_adapter/"
-        "contracts/tool-review-v1.schema.json"
+        "contracts/tool-review.schema.json"
     )
     tool_fixture = ToolReviewInterruptMetadata(
         schema=TOOL_REVIEW_SCHEMA,
@@ -65,7 +65,7 @@ def _artifacts() -> dict[Path, str]:
     subagent_schema["$id"] = (
         "https://github.com/tinkerfin-ai/tinkerfin/blob/main/"
         "packages/tinkerfin-agui-adapter/src/tinkerfin_agui_adapter/"
-        "contracts/subagent-provenance-v1.schema.json"
+        "contracts/subagent-provenance.schema.json"
     )
     parent_namespace = ("tools:parent",)
     parent_tool_call_id = ScopedIdCodec().encode("tool", parent_namespace, "call-task")
@@ -81,15 +81,14 @@ def _artifacts() -> dict[Path, str]:
     assert subagent_fixture["schema"] == SUBAGENT_PROVENANCE_SCHEMA
     subagent_fixture_text = _serialized(subagent_fixture)
     return {
-        _CONTRACT_ROOT / "tool-review-v1.schema.json": _serialized(tool_schema),
-        _CONTRACT_ROOT / "tool-review-v1.fixture.json": tool_fixture_text,
-        _WEB_CONTRACT_ROOT / "tool-review-v1.fixture.json": tool_fixture_text,
-        _CONTRACT_ROOT / "subagent-provenance-v1.schema.json": _serialized(
+        _CONTRACT_ROOT / "tool-review.schema.json": _serialized(tool_schema),
+        _CONTRACT_ROOT / "tool-review.fixture.json": tool_fixture_text,
+        _WEB_CONTRACT_ROOT / "tool-review.fixture.json": tool_fixture_text,
+        _CONTRACT_ROOT / "subagent-provenance.schema.json": _serialized(
             subagent_schema
         ),
-        _CONTRACT_ROOT / "subagent-provenance-v1.fixture.json": subagent_fixture_text,
-        _WEB_CONTRACT_ROOT
-        / "subagent-provenance-v1.fixture.json": subagent_fixture_text,
+        _CONTRACT_ROOT / "subagent-provenance.fixture.json": subagent_fixture_text,
+        _WEB_CONTRACT_ROOT / "subagent-provenance.fixture.json": subagent_fixture_text,
     }
 
 

@@ -11,10 +11,10 @@ import pytest
 from ag_ui.core import BaseEvent, RunAgentInput, RunErrorEvent, RunStartedEvent
 from langchain.agents.middleware.types import InputAgentState
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 
 from tinkerfin import AgUiEventStream, TinkerFin
-from tinkerfin.plan import MarkdownPlanContent, PlanReviewAction
+from tinkerfin.plan import PlanReviewAction
 from tinkerfin_agui_adapter import AgUiLifecycleEventFactory
 from tinkerfin_messaging import FiniteMessageSource, MemoryBackend, Messaging
 from tinkerfin_messaging.agui import AgUiCodec
@@ -23,6 +23,7 @@ from tinkerfin_studio.agent import factory as factory_module
 from tinkerfin_studio.agent.factory import ConversationAgentFactory, _create_model
 from tinkerfin_studio.agent.persistence import AgentPersistence
 from tinkerfin_studio.agent.plan_clarification import StudioPlanClarificationForm
+from tinkerfin_studio.agent.plan_content import StudioMarkdownPlanContent
 from tinkerfin_studio.conversation.request import ChatRequest
 from tinkerfin_studio.conversation.run_preparation import prepare_run_request
 from tinkerfin_studio.models.schemas import AgentModelConfig
@@ -82,6 +83,20 @@ def _prepared(*, mode: str = "default"):
 
 def test_prepare_run_request_preserves_the_selected_agent_mode() -> None:
     assert _prepared(mode="plan").mode == "plan"
+
+
+def test_studio_plan_content_requires_dynamic_description_and_markdown() -> None:
+    schema = StudioMarkdownPlanContent.model_json_schema(by_alias=True)
+
+    assert set(schema["required"]) == {"description", "markdown"}
+    assert schema["properties"]["description"]["maxLength"] == 80
+    content = StudioMarkdownPlanContent(
+        description="先澄清范围，再按步骤实现并验证",
+        markdown="# Plan\n\n1. Clarify\n2. Implement",
+    )
+    assert content.description == "先澄清范围，再按步骤实现并验证"
+    with pytest.raises(ValidationError):
+        StudioMarkdownPlanContent(description="", markdown="# Plan")
 
 
 @pytest.mark.parametrize(
@@ -199,8 +214,8 @@ async def test_create_definition_configures_plan_models_and_product_hitl_decisio
         "enabled": True,
         "planner_model": plan_model,
         "clarification_schema": StudioPlanClarificationForm,
-        "plan_schema": MarkdownPlanContent,
-        "review_actions": (
+        "content_schema": StudioMarkdownPlanContent,
+        "allowed_review_actions": (
             PlanReviewAction.APPROVE,
             PlanReviewAction.RESPOND,
             PlanReviewAction.REJECT,

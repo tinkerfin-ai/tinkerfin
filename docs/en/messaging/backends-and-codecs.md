@@ -63,11 +63,10 @@ channel = messaging.channel(
 
 Canonical TinkerFin streams include immutable codec and Identity profiles, so a name-only channel infers both. Custom sources need an explicit codec and Identity.
 
-RedisBackend reads persistent schema 5 only. Schema 4 records are incompatible; use a
-new `key_prefix` or remove records you no longer need before switching. Schema 5 stores
-the complete limits fingerprint, per-generation `payload_bytes`, and the current and
-immediately previous owner's successful lease-renewal counts and UTC timestamps for
-trusted postmortem diagnostics. Workers sharing a channel must use identical limits.
+RedisBackend stores the complete limits fingerprint, per-generation `payload_bytes`,
+and the current and immediately previous owner's successful lease-renewal counts and UTC
+timestamps for trusted postmortem diagnostics. Workers sharing a channel must use
+identical limits.
 Quota checks and counters are atomic with append after message-ID idempotency. These
 fields never enter `MessageEnvelope`.
 

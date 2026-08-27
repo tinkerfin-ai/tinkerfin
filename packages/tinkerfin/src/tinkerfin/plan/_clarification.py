@@ -1,27 +1,60 @@
-"""Definition-bound clarification schema validation and JSON persistence."""
+"""Definition-bound clarification contracts, persistence, and response validation."""
 
 from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from types import NoneType
+from types import MappingProxyType, NoneType
 from typing import Annotated, Any, cast, get_args, get_origin
 
 from langchain_core.runnables import RunnableConfig
-from pydantic import BaseModel, JsonValue, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, create_model
+
+from tinkerfin_agui_adapter import (
+    require_valid_schema,
+    validate_json_schema_instance,
+)
 
 from .clarification import (
     ClarificationFormBase,
     ClarificationModel,
     ClarificationOptionBase,
     ClarificationQuestionBase,
+    DateQuestion,
+    MultipleChoiceQuestion,
+    MultipleChoiceResponse,
+    SingleChoiceQuestion,
+    SingleChoiceResponse,
+    SkippedResponse,
+    TextQuestion,
 )
-from .errors import PlanModeConfigurationError, PlanStructuredOutputError
+from .clarification_types import (
+    BUILTIN_CLARIFICATION_TYPES,
+    ClarificationType,
+    _validate_descriptor,
+)
+from .errors import (
+    PlanClarificationResponseError,
+    PlanModeConfigurationError,
+    PlanStructuredOutputError,
+)
+from .models import RequirementAnswer
 
-_JSON_OBJECT = TypeAdapter(dict[str, JsonValue])
+_JSON_OBJECT = TypeAdapter(
+    dict[str, JsonValue],
+    config=ConfigDict(allow_inf_nan=False),
+)
 _LANGGRAPH_DURABILITY_CONFIG_KEY = "__pregel_durability"
+_NON_BLANK_PATTERN = r"\S"
+_BUILTIN_IDS = frozenset(item.type_id for item in BUILTIN_CLARIFICATION_TYPES)
+_BUILTIN_QUESTION_BASES: dict[str, type[ClarificationQuestionBase]] = {
+    "single_choice": SingleChoiceQuestion,
+    "multiple_choice": MultipleChoiceQuestion,
+    "text": TextQuestion,
+    "date": DateQuestion,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,11 +67,39 @@ class ClarificationQuestionCount:
 
 @dataclass(frozen=True, slots=True)
 class ClarificationSchemaBinding:
-    """Concrete form contract frozen for one Definition."""
+    """Complete immutable clarification contract frozen for one Definition."""
 
     form_schema: type[ClarificationFormBase]
     fingerprint: str
     question_count: ClarificationQuestionCount
+    types: Mapping[str, ClarificationType[Any, Any]]
+    question_models: Mapping[str, type[ClarificationQuestionBase]]
+
+
+def _form_questions(
+    form: ClarificationFormBase,
+) -> tuple[ClarificationQuestionBase, ...]:
+    value = getattr(form, "questions", None)
+    if not isinstance(value, tuple):
+        raise TypeError("clarification form questions must be a concrete tuple")
+    items = cast(tuple[object, ...], value)
+    if not all(isinstance(question, ClarificationQuestionBase) for question in items):
+        raise TypeError("clarification form questions must be a concrete tuple")
+    return cast(tuple[ClarificationQuestionBase, ...], items)
+
+
+def _question_answer_type(question: ClarificationQuestionBase) -> str:
+    value = getattr(question, "answer_type", None)
+    if not isinstance(value, str) or not value:
+        raise TypeError("clarification question must have one answer_type")
+    return value
+
+
+def _response_answer_type(response: BaseModel) -> str:
+    value = getattr(response, "answer_type", None)
+    if not isinstance(value, str) or not value:
+        raise TypeError("clarification response must have one answer_type")
+    return value
 
 
 def stateless_child_config(config: RunnableConfig) -> RunnableConfig:
@@ -148,8 +209,31 @@ def _validate_attributes(model: type[BaseModel], *, source: str) -> None:
     )
 
 
+def _answer_type_const(model: type[BaseModel], *, source: str) -> str:
+    try:
+        schema = _JSON_OBJECT.validate_python(model.model_json_schema(by_alias=True))
+    except Exception as error:
+        raise PlanModeConfigurationError(
+            f"{source} could not produce a JSON Schema",
+            cause=error,
+        ) from error
+    properties = schema.get("properties")
+    answer_type = (
+        cast(Mapping[str, JsonValue], properties).get("answerType")
+        if isinstance(properties, Mapping)
+        else None
+    )
+    if not isinstance(answer_type, Mapping) or not isinstance(
+        answer_type.get("const"), str
+    ):
+        raise PlanModeConfigurationError(
+            f"{source}.answer_type must be one string Literal"
+        )
+    return cast(str, answer_type["const"])
+
+
 def _validate_questions_json_schema(
-    model: type[BaseModel], *, source: str
+    model: type[ClarificationFormBase], *, source: str
 ) -> ClarificationQuestionCount:
     """Require model-visible, satisfiable clarification cardinality constraints."""
 
@@ -170,21 +254,19 @@ def _validate_questions_json_schema(
         else None
     )
     questions_value = properties.get("questions") if properties is not None else None
-    if not isinstance(questions_value, Mapping):
+    if (
+        not isinstance(questions_value, Mapping)
+        or questions_value.get("type") != "array"
+    ):
         raise PlanModeConfigurationError(
             f"{source}.questions must expose the stable JSON array field 'questions'"
         )
-    questions = cast(Mapping[str, JsonValue], questions_value)
-    if questions.get("type") != "array":
-        raise PlanModeConfigurationError(
-            f"{source}.questions must expose the stable JSON array field 'questions'"
-        )
-    minimum = questions.get("minItems")
+    minimum = questions_value.get("minItems")
     if isinstance(minimum, bool) or not isinstance(minimum, int) or minimum < 1:
         raise PlanModeConfigurationError(
             f"{source}.questions JSON Schema must declare minItems >= 1"
         )
-    maximum = questions.get("maxItems")
+    maximum = questions_value.get("maxItems")
     if maximum is not None and (
         isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < minimum
     ):
@@ -194,46 +276,25 @@ def _validate_questions_json_schema(
     return ClarificationQuestionCount(minimum=minimum, maximum=maximum)
 
 
-def _validate_clarification_schema(
-    value: object,
-) -> tuple[type[ClarificationFormBase], ClarificationQuestionCount]:
-    """Validate one fully concrete host form using public typing metadata."""
-
-    if not isinstance(value, type) or not issubclass(value, ClarificationFormBase):
-        raise PlanModeConfigurationError(
-            "clarification_schema must be a ClarificationFormBase subclass"
-        )
-    _require_concrete_model(value, source="clarification_schema")
+def _validate_question_model(
+    question_type: type[ClarificationQuestionBase],
+    *,
+    source: str,
+) -> str:
     _require_inherited_core_fields(
-        value,
-        base=ClarificationFormBase,
-        field_names=frozenset({"schema_version"}),
-        source="clarification_schema",
+        question_type,
+        base=ClarificationQuestionBase,
+        field_names=frozenset({"id", "prompt", "required"}),
+        source=source,
     )
-    question_types = _field_model_types(
-        value,
-        "questions",
-        expected=ClarificationQuestionBase,
-        source="clarification_schema",
-        variadic_tuple=True,
-    )
-    question_count = _validate_questions_json_schema(
-        value,
-        source="clarification_schema",
-    )
-    for question_type in question_types:
-        _require_inherited_core_fields(
-            question_type,
-            base=ClarificationQuestionBase,
-            field_names=frozenset({"allow_free_text", "id", "prompt", "required"}),
-            source=question_type.__name__,
-        )
-        _validate_attributes(question_type, source=question_type.__name__)
+    type_id = _answer_type_const(question_type, source=source)
+    _validate_attributes(question_type, source=source)
+    if issubclass(question_type, (SingleChoiceQuestion, MultipleChoiceQuestion)):
         option_types = _field_model_types(
-            question_type,
+            cast(type[BaseModel], question_type),
             "options",
             expected=ClarificationOptionBase,
-            source=question_type.__name__,
+            source=source,
             variadic_tuple=True,
         )
         for option_type in option_types:
@@ -244,30 +305,163 @@ def _validate_clarification_schema(
                 source=option_type.__name__,
             )
             _validate_attributes(option_type, source=option_type.__name__)
-    return value, question_count
+    return type_id
 
 
-def _schema_fingerprint(schema: type[BaseModel]) -> str:
-    canonical = json.dumps(
-        schema.model_json_schema(by_alias=True),
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
+def _validate_form_schema(
+    value: object,
+) -> tuple[
+    type[ClarificationFormBase],
+    ClarificationQuestionCount,
+    dict[str, type[ClarificationQuestionBase]],
+]:
+    if not isinstance(value, type) or not issubclass(value, ClarificationFormBase):
+        raise PlanModeConfigurationError(
+            "clarification_schema must be a ClarificationFormBase subclass"
+        )
+    _require_concrete_model(value, source="clarification_schema")
+    raw_question_types = _field_model_types(
+        value,
+        "questions",
+        expected=ClarificationQuestionBase,
+        source="clarification_schema",
+        variadic_tuple=True,
     )
+    question_count = _validate_questions_json_schema(
+        value,
+        source="clarification_schema",
+    )
+    question_models: dict[str, type[ClarificationQuestionBase]] = {}
+    for raw_type in raw_question_types:
+        question_type = cast(type[ClarificationQuestionBase], raw_type)
+        type_id = _validate_question_model(
+            question_type,
+            source=question_type.__name__,
+        )
+        if type_id in question_models:
+            raise PlanModeConfigurationError(
+                f"clarification form contains duplicate answer_type: {type_id}"
+            )
+        question_models[type_id] = question_type
+    return value, question_count, question_models
+
+
+def _compose_form_schema(
+    form_schema: type[ClarificationFormBase],
+    question_count: ClarificationQuestionCount,
+    question_models: Sequence[type[ClarificationQuestionBase]],
+) -> type[ClarificationFormBase]:
+    union: Any = question_models[0]
+    for question_model in question_models[1:]:
+        union = union | question_model
+    question = Annotated[union, Field(discriminator="answer_type")]
+    annotation = tuple[question, ...]
+    bound = create_model(
+        f"{form_schema.__name__}Bound",
+        __base__=form_schema,
+        __module__=form_schema.__module__,
+        questions=(
+            annotation,
+            Field(
+                min_length=question_count.minimum,
+                max_length=question_count.maximum,
+                description="Questions that must each be answered or explicitly skipped",
+            ),
+        ),
+    )
+    return bound
+
+
+def _schema_fingerprint(value: object) -> str:
+    payload: object = value
+    if isinstance(value, type) and issubclass(value, BaseModel):
+        payload = value.model_json_schema(by_alias=True)
+    try:
+        canonical = json.dumps(
+            payload,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (TypeError, ValueError) as error:
+        raise PlanModeConfigurationError(
+            "clarification contract must contain canonical finite JSON",
+            cause=error,
+        ) from error
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def create_clarification_binding(
     schema: object,
+    *,
+    custom_types: Sequence[ClarificationType[Any, Any]] = (),
 ) -> ClarificationSchemaBinding:
-    """Create immutable concrete response types for one validated form schema."""
+    """Create one immutable complete clarification contract for a Definition."""
 
-    form_schema, question_count = _validate_clarification_schema(schema)
-    fingerprint = _schema_fingerprint(form_schema)
+    form_schema, question_count, question_models = _validate_form_schema(schema)
+    descriptors: dict[str, ClarificationType[Any, Any]] = {
+        item.type_id: item for item in BUILTIN_CLARIFICATION_TYPES
+    }
+    for descriptor in custom_types:
+        if not isinstance(descriptor, ClarificationType):
+            raise TypeError("clarification_types must contain ClarificationType values")
+        _validate_descriptor(descriptor, allow_builtin=False)
+        if descriptor.type_id in descriptors:
+            raise PlanModeConfigurationError(
+                f"clarification type is already registered: {descriptor.type_id}"
+            )
+        descriptors[descriptor.type_id] = descriptor
+        question_models.setdefault(descriptor.type_id, descriptor.question_model)
+
+    for type_id, question_model in question_models.items():
+        descriptor = descriptors.get(type_id)
+        if descriptor is None:
+            raise PlanModeConfigurationError(
+                f"clarification form contains an unregistered answer_type: {type_id}"
+            )
+        expected = (
+            _BUILTIN_QUESTION_BASES[type_id]
+            if type_id in _BUILTIN_IDS
+            else descriptor.question_model
+        )
+        if not issubclass(question_model, expected):
+            raise PlanModeConfigurationError(
+                f"question model does not match clarification type: {type_id}"
+            )
+
+    if custom_types:
+        form_schema = _compose_form_schema(
+            form_schema,
+            question_count,
+            tuple(question_models.values()),
+        )
+        form_schema, question_count, question_models = _validate_form_schema(
+            form_schema
+        )
+
+    reachable = {type_id: descriptors[type_id] for type_id in question_models}
+    fingerprint_payload = {
+        "domain": "tinkerfin.plan-clarification-binding",
+        "form": form_schema.model_json_schema(by_alias=True),
+        "types": [
+            {
+                "typeId": type_id,
+                "description": reachable[type_id].description,
+                "question": question_models[type_id].model_json_schema(by_alias=True),
+                "response": reachable[type_id].response_model.model_json_schema(
+                    by_alias=True
+                ),
+            }
+            for type_id in sorted(reachable)
+        ],
+    }
     return ClarificationSchemaBinding(
         form_schema=form_schema,
-        fingerprint=fingerprint,
+        fingerprint=_schema_fingerprint(fingerprint_payload),
         question_count=question_count,
+        types=MappingProxyType(dict(reachable)),
+        question_models=MappingProxyType(dict(question_models)),
     )
 
 
@@ -298,7 +492,7 @@ def restore_form(
     binding: ClarificationSchemaBinding,
     payload: object,
 ) -> ClarificationFormBase:
-    """Restore one checkpoint form with the current Definition schema."""
+    """Restore one checkpoint form with the current Definition contract."""
 
     try:
         return binding.form_schema.model_validate(payload)
@@ -309,10 +503,344 @@ def restore_form(
         ) from error
 
 
+def _string_schema() -> dict[str, JsonValue]:
+    return {"type": "string", "minLength": 1, "pattern": _NON_BLANK_PATTERN}
+
+
+def _answered_schema(question: ClarificationQuestionBase) -> dict[str, JsonValue]:
+    type_id = _question_answer_type(question)
+    base: dict[str, JsonValue] = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["status", "answerType"],
+        "properties": {
+            "status": {"const": "answered"},
+            "answerType": {"const": type_id},
+        },
+    }
+    properties = cast(dict[str, JsonValue], base["properties"])
+    required = cast(list[JsonValue], base["required"])
+    if isinstance(question, SingleChoiceQuestion):
+        single = cast(
+            SingleChoiceQuestion[ClarificationModel, ClarificationOptionBase],
+            question,
+        )
+        properties["optionId"] = {
+            "type": "string",
+            "enum": [option.id for option in single.options],
+        }
+        if single.allow_free_text:
+            properties["customAnswer"] = _string_schema()
+            base["oneOf"] = [
+                {
+                    "required": ["optionId"],
+                    "not": {"required": ["customAnswer"]},
+                },
+                {
+                    "required": ["customAnswer"],
+                    "not": {"required": ["optionId"]},
+                },
+            ]
+        else:
+            required.append("optionId")
+    elif isinstance(question, MultipleChoiceQuestion):
+        multiple = cast(
+            MultipleChoiceQuestion[ClarificationModel, ClarificationOptionBase],
+            question,
+        )
+        option_ids: dict[str, JsonValue] = {
+            "type": "array",
+            "items": {
+                "type": "string",
+                "enum": [option.id for option in multiple.options],
+            },
+            "uniqueItems": True,
+        }
+        properties["optionIds"] = option_ids
+        required.append("optionIds")
+        maximum = multiple.max_selections or (
+            len(multiple.options) + int(multiple.allow_free_text)
+        )
+        if multiple.allow_free_text:
+            properties["customAnswer"] = _string_schema()
+            base["oneOf"] = [
+                {
+                    "required": ["customAnswer"],
+                    "properties": {
+                        "optionIds": {
+                            **option_ids,
+                            "minItems": max(0, multiple.min_selections - 1),
+                            "maxItems": max(0, maximum - 1),
+                        }
+                    },
+                },
+                {
+                    "not": {"required": ["customAnswer"]},
+                    "properties": {
+                        "optionIds": {
+                            **option_ids,
+                            "minItems": multiple.min_selections,
+                            "maxItems": maximum,
+                        }
+                    },
+                },
+            ]
+        else:
+            option_ids["minItems"] = multiple.min_selections
+            option_ids["maxItems"] = maximum
+    elif isinstance(question, TextQuestion):
+        properties["answer"] = _string_schema()
+        required.append("answer")
+    elif isinstance(question, DateQuestion):
+        properties["date"] = {"type": "string", "format": "date"}
+        required.append("date")
+    else:
+        raise TypeError(
+            "custom clarification questions require their registered Schema"
+        )
+    return base
+
+
+def _rewrite_schema_refs(
+    value: JsonValue,
+    *,
+    renames: Mapping[str, str],
+) -> JsonValue:
+    if isinstance(value, list):
+        return [_rewrite_schema_refs(item, renames=renames) for item in value]
+    if not isinstance(value, dict):
+        return value
+    rewritten: dict[str, JsonValue] = {}
+    for key, child in value.items():
+        if key == "$ref" and isinstance(child, str) and child.startswith("#/$defs/"):
+            pointer = child.removeprefix("#/$defs/")
+            original = pointer.replace("~1", "/").replace("~0", "~")
+            renamed = renames.get(original)
+            if renamed is None:
+                rewritten[key] = child
+            else:
+                escaped = renamed.replace("~", "~0").replace("/", "~1")
+                rewritten[key] = f"#/$defs/{escaped}"
+        elif key != "$defs":
+            rewritten[key] = _rewrite_schema_refs(child, renames=renames)
+    return rewritten
+
+
+def _scope_custom_schema(
+    schema: dict[str, JsonValue],
+    *,
+    type_id: str,
+    question_id: str,
+    definitions: dict[str, JsonValue],
+) -> dict[str, JsonValue]:
+    scope = hashlib.sha256(f"{type_id}\0{question_id}".encode()).hexdigest()
+    prefix = f"custom_{scope}"
+    raw_defs = schema.get("$defs")
+    local_defs = (
+        cast(dict[str, JsonValue], raw_defs) if isinstance(raw_defs, dict) else {}
+    )
+    renames = {name: f"{prefix}_{name}" for name in local_defs}
+    for name, child in local_defs.items():
+        scoped_name = renames[name]
+        if scoped_name in definitions:
+            raise PlanModeConfigurationError(
+                "custom clarification response Schema definition collision"
+            )
+        definitions[scoped_name] = _rewrite_schema_refs(child, renames=renames)
+    return cast(dict[str, JsonValue], _rewrite_schema_refs(schema, renames=renames))
+
+
+def build_response_schema(
+    binding: ClarificationSchemaBinding,
+    form: ClarificationFormBase,
+) -> dict[str, JsonValue]:
+    """Build the exact Draft 2020-12 response Schema for one concrete form."""
+
+    answers: dict[str, JsonValue] = {}
+    definitions: dict[str, JsonValue] = {}
+    for question in _form_questions(form):
+        type_id = _question_answer_type(question)
+        descriptor = binding.types[type_id]
+        if type_id in _BUILTIN_IDS:
+            answered = _answered_schema(question)
+        else:
+            raw = (
+                descriptor.bind_response_schema(question)
+                if descriptor.bind_response_schema is not None
+                else descriptor.response_model.model_json_schema(by_alias=True)
+            )
+            scoped = _scope_custom_schema(
+                _JSON_OBJECT.validate_python(raw),
+                type_id=type_id,
+                question_id=question.id,
+                definitions=definitions,
+            )
+            answered = {
+                "allOf": [
+                    scoped,
+                    {
+                        "type": "object",
+                        "required": ["status", "answerType"],
+                        "properties": {
+                            "status": {"const": "answered"},
+                            "answerType": {"const": type_id},
+                        },
+                    },
+                ]
+            }
+        answers[question.id] = cast(
+            JsonValue,
+            answered
+            if question.required
+            else {
+                "oneOf": [
+                    answered,
+                    SkippedResponse.model_json_schema(by_alias=True),
+                ]
+            },
+        )
+    schema: dict[str, JsonValue] = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["type", "answers"],
+        "properties": {
+            "type": {"const": "respond"},
+            "answers": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [question.id for question in _form_questions(form)],
+                "properties": answers,
+            },
+        },
+    }
+    if definitions:
+        schema["$defs"] = definitions
+    require_valid_schema(schema)
+    return schema
+
+
+def pending_contract_digest(
+    form: Mapping[str, JsonValue],
+    response_schema: Mapping[str, JsonValue],
+) -> str:
+    """Return the exact canonical digest for one pending clarification."""
+
+    return _schema_fingerprint(
+        {
+            "domain": "tinkerfin.plan-clarification-pending",
+            "form": dict(form),
+            "responseSchema": dict(response_schema),
+        }
+    )
+
+
+def _validate_builtin_response(
+    question: ClarificationQuestionBase,
+    response: BaseModel,
+) -> None:
+    if isinstance(question, SingleChoiceQuestion):
+        single = cast(
+            SingleChoiceQuestion[ClarificationModel, ClarificationOptionBase],
+            question,
+        )
+        if not isinstance(response, SingleChoiceResponse):
+            raise TypeError("single-choice question received a different answer type")
+        if response.option_id is not None and response.option_id not in {
+            option.id for option in single.options
+        }:
+            raise ValueError("single-choice response selected an unknown option")
+        if response.custom_answer is not None and not single.allow_free_text:
+            raise ValueError("single-choice question does not allow a custom answer")
+    elif isinstance(question, MultipleChoiceQuestion):
+        multiple = cast(
+            MultipleChoiceQuestion[ClarificationModel, ClarificationOptionBase],
+            question,
+        )
+        if not isinstance(response, MultipleChoiceResponse):
+            raise TypeError("multiple-choice question received a different answer type")
+        known = {option.id for option in multiple.options}
+        if not set(response.option_ids) <= known:
+            raise ValueError("multiple-choice response selected an unknown option")
+        if response.custom_answer is not None and not multiple.allow_free_text:
+            raise ValueError("multiple-choice question does not allow a custom answer")
+        count = len(response.option_ids) + int(response.custom_answer is not None)
+        maximum = multiple.max_selections or (
+            len(multiple.options) + int(multiple.allow_free_text)
+        )
+        if count < multiple.min_selections or count > maximum:
+            raise ValueError("multiple-choice response violates selection bounds")
+
+
+def validate_and_normalize_response(
+    binding: ClarificationSchemaBinding,
+    form: ClarificationFormBase,
+    response_schema: dict[str, JsonValue],
+    value: object,
+) -> tuple[RequirementAnswer, ...]:
+    """Validate one complete response and return deterministic trusted answers."""
+
+    try:
+        payload = _JSON_OBJECT.validate_python(value)
+        validate_json_schema_instance(payload, response_schema)
+        raw_answers = payload.get("answers")
+        if not isinstance(raw_answers, Mapping):
+            raise TypeError("clarification response answers must be an object")
+        answers = cast(Mapping[str, object], raw_answers)
+        normalized: list[RequirementAnswer] = []
+        for question in _form_questions(form):
+            type_id = _question_answer_type(question)
+            raw = answers[question.id]
+            raw_mapping = (
+                cast(Mapping[object, object], raw) if isinstance(raw, Mapping) else None
+            )
+            if raw_mapping is not None and raw_mapping.get("status") == "skipped":
+                if question.required:
+                    raise ValueError(
+                        "required clarification question cannot be skipped"
+                    )
+                normalized.append(
+                    RequirementAnswer(
+                        question_id=question.id,
+                        answer_type=type_id,
+                        skipped=True,
+                    )
+                )
+                continue
+            descriptor = binding.types[type_id]
+            response = descriptor.response_model.model_validate(raw)
+            if _response_answer_type(response) != type_id:
+                raise ValueError("clarification response answer type does not match")
+            _validate_builtin_response(question, response)
+            if descriptor.validate is not None:
+                descriptor.validate(question, response)
+            trusted = _JSON_OBJECT.validate_python(
+                descriptor.normalize(question, response)
+            )
+            normalized.append(
+                RequirementAnswer(
+                    question_id=question.id,
+                    answer_type=type_id,
+                    value=trusted,
+                )
+            )
+        return tuple(normalized)
+    except PlanClarificationResponseError:
+        raise
+    except Exception as error:
+        raise PlanClarificationResponseError(
+            "clarification response does not match the pending form",
+            cause=error,
+        ) from error
+
+
 __all__ = [
     "ClarificationSchemaBinding",
+    "build_response_schema",
     "create_clarification_binding",
+    "pending_contract_digest",
     "restore_form",
     "serialize_form",
     "stateless_child_config",
+    "validate_and_normalize_response",
 ]

@@ -1,6 +1,6 @@
 import type { JsonObject } from "../../../types"
 
-export const SUBAGENT_PROVENANCE_SCHEMA = "tinkerfin.subagent-provenance.v1" as const
+export const SUBAGENT_PROVENANCE_SCHEMA = "tinkerfin.subagent-provenance" as const
 
 export interface SubagentProvenance {
   readonly schema: typeof SUBAGENT_PROVENANCE_SCHEMA
@@ -53,7 +53,7 @@ export const parseSubagentProvenance = (value: unknown): SubagentProvenance => {
   if (
     actualKeys.length !== expectedKeys.length
     || !actualKeys.every((key, index) => key === expectedKeys[index])
-  ) throw new SubagentProvenanceContractError("subagent provenance 字段不符合 v1 契约")
+  ) throw new SubagentProvenanceContractError("subagent provenance 字段不符合当前契约")
   const parentNamespace = namespace(value.parentNamespace, "parentNamespace")
   const childNamespace = namespace(value.namespace, "namespace")
   if (

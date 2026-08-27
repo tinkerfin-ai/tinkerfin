@@ -232,6 +232,7 @@ def test_root_stub_keeps_plan_annotation_dependencies_private() -> None:
 
     assert aliases == {
         "ClarificationFormBase": "_ClarificationFormBase",
+        "ClarificationType": "_ClarificationType",
         "DefaultClarificationForm": "_DefaultClarificationForm",
         "PlanContentModel": "_PlanContentModel",
         "PlanReviewAction": "_PlanReviewAction",
@@ -249,28 +250,32 @@ def test_root_stub_keeps_plan_annotation_dependencies_private() -> None:
     default = plan.args.kw_defaults[index]
     assert isinstance(default, ast.Name)
     assert default.id == "_DefaultClarificationForm"
-    plan_schema_index = next(
+    content_schema_index = next(
         index
         for index, argument in enumerate(plan.args.kwonlyargs)
-        if argument.arg == "plan_schema"
+        if argument.arg == "content_schema"
     )
-    plan_schema_annotation = plan.args.kwonlyargs[plan_schema_index].annotation
-    assert plan_schema_annotation is not None
-    assert ast.unparse(plan_schema_annotation) == "type[_PlanContentModel]"
-    plan_schema_default = plan.args.kw_defaults[plan_schema_index]
-    assert isinstance(plan_schema_default, ast.Name)
-    assert plan_schema_default.id == "_StructuredPlanContent"
-    review_actions_index = next(
+    content_schema_annotation = plan.args.kwonlyargs[content_schema_index].annotation
+    assert content_schema_annotation is not None
+    assert ast.unparse(content_schema_annotation) == "type[_PlanContentModel]"
+    content_schema_default = plan.args.kw_defaults[content_schema_index]
+    assert isinstance(content_schema_default, ast.Name)
+    assert content_schema_default.id == "_StructuredPlanContent"
+    allowed_review_actions_index = next(
         index
         for index, argument in enumerate(plan.args.kwonlyargs)
-        if argument.arg == "review_actions"
+        if argument.arg == "allowed_review_actions"
     )
-    review_actions_annotation = plan.args.kwonlyargs[review_actions_index].annotation
-    assert review_actions_annotation is not None
-    assert ast.unparse(review_actions_annotation) == "Sequence[_PlanReviewAction]"
-    review_actions_default = plan.args.kw_defaults[review_actions_index]
-    assert isinstance(review_actions_default, ast.Name)
-    assert review_actions_default.id == "_DEFAULT_PLAN_REVIEW_ACTIONS"
+    allowed_review_actions_annotation = plan.args.kwonlyargs[
+        allowed_review_actions_index
+    ].annotation
+    assert allowed_review_actions_annotation is not None
+    assert ast.unparse(allowed_review_actions_annotation) == (
+        "Sequence[_PlanReviewAction]"
+    )
+    allowed_review_actions_default = plan.args.kw_defaults[allowed_review_actions_index]
+    assert isinstance(allowed_review_actions_default, ast.Name)
+    assert allowed_review_actions_default.id == "_DEFAULT_ALLOWED_REVIEW_ACTIONS"
 
 
 def test_built_wheel_contains_the_generated_stubs(tmp_path: Path) -> None:

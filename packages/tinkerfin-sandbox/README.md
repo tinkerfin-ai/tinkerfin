@@ -244,7 +244,8 @@ SQLite, MySQL 5.7, and MySQL 8.x. MariaDB and other MySQL server versions are re
 until their transaction behavior is verified. MySQL 8.x uses `SKIP LOCKED`; MySQL 5.7
 uses a bounded row-lock wait with the same claim, fencing, and lease semantics.
 
-`start()` creates and validates its internal tables and supported forward schema. The
+`start()` creates the complete schema in an empty database and otherwise validates the
+existing TinkerFin-owned tables against the current exact structure. The
 database account needs DDL and DML permissions when workers initialize the database.
 Workers in one database namespace must use the same warm-pool size.
 
@@ -261,12 +262,10 @@ Path("schema.sql").write_text(schema.ddl, encoding="utf-8")
 ```
 
 Use `dialect="sqlite"` for SQLite. One MySQL script targets both MySQL 5.7 and 8.x and
-contains every table, explicit index, comment, and the current schema-version row.
-After that script is applied, `start()` validates the deployed structure before it
-registers a worker. The descriptor is immutable; `component`, `version`,
-`table_names`, and `ddl` can be recorded by deployment tooling. A future schema version
-must be deployed with the corresponding package before a DML-only runtime account is
-started.
+contains every current table, explicit index, and comment. After that script is applied,
+`start()` validates the deployed structure before it registers a worker. The descriptor
+is immutable and exposes `dialect`, `table_names`, and `ddl`. Non-current owned tables or
+columns fail startup and must be rebuilt before a DML-only runtime account is started.
 
 Persistent state coordinates allocation, binding, warm slots, owner fencing, and
 cleanup. It does not serialize complete graph runs; use an application run coordinator

@@ -80,12 +80,11 @@ Plan Mode 按下面的边界处理请求：
 
 1. 一个只读 Planner 判断意图和约束是否充分
 2. Planner 只能使用 `ls`、`read_file`、`glob` 和 `grep`
-3. 澄清问题显式声明 `required`，可以包含模型动态生成的单选项，并通过 `allow_free_text` 决定是否允许自由输入；需求澄清和
-   计划审批通过 LangGraph interrupt 暂停
+3. 每道澄清问题由 Planner 选择 `single_choice`、`multiple_choice`、`text` 或 `date`，需求澄清和计划审批通过 LangGraph interrupt 暂停
 4. 用户批准后冻结 `ConfirmedPlan`，以原用户消息 ID 提交确定性 handoff，并立即启动原生 Deep Agent
 
 Plan 审阅默认允许 `PlanReviewAction.APPROVE`、`RESPOND` 和 `REJECT`。如需改变允许动作，
-通过 `review_actions` 传入非空且不重复的有序集合；响应 Schema 只包含实际配置的动作。只有宿主
+通过 `allowed_review_actions` 传入非空且不重复的有序集合；响应 Schema 只包含实际配置的动作。只有宿主
 提供可信计划编辑器时才应显式启用 `EDIT`。
 
 选择 Plan 时必须提供明确 Planner 模型和具体 `BaseCheckpointSaver`。TinkerFin 不会自动创建
@@ -104,7 +103,7 @@ from tinkerfin.plan import MarkdownPlanContent
 
 agent = tinkerfin.plan(
     planner_model="openai:gpt-5.4",
-    plan_schema=MarkdownPlanContent,
+    content_schema=MarkdownPlanContent,
 ).create_deep_agent(
     model="openai:gpt-5.4",
     tools=[search_orders],
@@ -112,8 +111,8 @@ agent = tinkerfin.plan(
 )
 ```
 
-自定义内容类型继承 `PlanContentModel`，声明稳定 `schema_id`，并使用精确的 Pydantic 字段。
-Definition 固定采用创建时选中的 Schema；草稿审阅、显式启用的编辑、确认、checkpoint 恢复和
+自定义内容类型继承 `PlanContentModel`，并使用精确的 Pydantic 字段。运行时自动为 Definition
+固定并计算所选 Schema 的 fingerprint；草稿审阅、显式启用的编辑、确认、checkpoint 恢复和
 执行 handoff 始终使用同一份已校验内容。
 
 `mode="default"` 直接运行原生 Deep Agent Graph，不进入 Planning、不追加 middleware、不替换
@@ -123,18 +122,23 @@ Planner 只拥有用于按需检查 workspace 的只读文件工具；这份受�
 列表。Planner 可以把用户要求的执行 Tool 写入计划，但不会亲自调用或试运行。Plan 批准后会立即
 开始执行，不会再次索要通用 Plan 审批；执行过程中仍保留 `write_file` 等 Tool 自身配置的人工审批。
 
-`.plan(...)` 省略 `clarification_schema` 时使用内置 `DefaultClarificationForm`。需要为问题
-或选项增加强类型 metadata 的宿主，可以在应用代码中定义具体 `ClarificationForm`，再把该
-类型传给 `.plan(...)`。Schema 固定在返回的 factory 上，不能通过 `new()`、`new_agui()`
-或 resume 替换。attributes 必须使用具体 `ClarificationModel` 子类；这些数据会公开给用户，
-属于模型生成的规划参考，不能直接作为权限、计费或合规依据。
+`.plan(...)` 省略 `clarification_schema` 时使用内置 `DefaultClarificationForm`。
+`BuiltInClarificationForm[QuestionAttributes, OptionModel]` 可以一次为四类内置题型增加共享强类型
+metadata，不需要分别创建题型子类。宿主也可以提供只包含客户端已支持题型的具体
+`ClarificationForm` 联合。attributes 会公开给用户，属于模型生成的规划参考，不能直接作为权限、
+计费或合规依据。
 
-Python 字段使用 `allow_free_text`，JSON 边界使用 `allowFreeText`。每道问题显式提供
-`required`；同一批次可以混合必填与可选题，也可以全部为可选题。表单必须非空，用户填写后整组提交。
-选择 Option 时只提交 `questionId` 和 `optionId`；自由输入时只提交 `questionId` 和 `answer`；
-跳过可选题时只提交 `questionId` 和 `skipped: true`。工作流要求每道 checkpoint 问题都有明确结果，
-从可信 Form 派生 Option label，拒绝跳过必填题，并把 skipped 保留为 Planner 上下文。同一 Plan 周期内，
-Planner 不得重复追问用户已明确跳过的可选题。
+Choice 题在 Python 使用 `allow_free_text`，JSON 使用 `allowFreeText`。多选题还声明
+`min_selections` 和可选 `max_selections`，已选 Option ID 可以和一个自定义答案共存。文本答案必须
+非空；日期固定使用不含时间和时区的 `YYYY-MM-DD`。完整回答以 checkpoint question ID 为 key，
+每个 value 使用 `status: answered` 和对应 `answerType`，可选题跳过时使用 `status: skipped`。
+Planning 在 Graph resume 前校验 pending 的精确响应 Schema，从可信 Form 派生 Option label、规范化
+答案顺序，并把明确跳过保留为 Planner 上下文。
+
+完全自定义语义题型通过 `clarification_type(...)` 注册。一个冻结描述符同时提供带版本的 namespaced
+ID、模型选择说明、Question/Response Model、可选的逐题 Schema 与校验器，以及 canonical JSON
+normalizer。所有 callback 必须同步、确定性且不执行外部 I/O；宿主客户端必须为 Form 中的每个自定义
+题型提供 renderer。逐题 Schema、校验或规范化语义发生变化时，必须升级 type ID 的版本。
 
 配置 `PlanReviewAction.EDIT` 后，完整编辑的草稿是用户权威约束。Planner 只能继续澄清或接受
 该草稿，不得静默替换。澄清期间 revision 不变；只有形成完整可审阅草稿时才递增一次。

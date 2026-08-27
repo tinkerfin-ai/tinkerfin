@@ -15,7 +15,7 @@ from .errors import PlanModeConfigurationError
 from .models import PlanReviewAction
 
 AgentMode: TypeAlias = Literal["default", "plan"]
-DEFAULT_PLAN_REVIEW_ACTIONS = (
+DEFAULT_ALLOWED_REVIEW_ACTIONS = (
     PlanReviewAction.APPROVE,
     PlanReviewAction.RESPOND,
     PlanReviewAction.REJECT,
@@ -29,7 +29,7 @@ class PlanOptions:
     clarification: ClarificationSchemaBinding
     content: PlanContentBinding
     contracts: PlanContractBinding
-    review_actions: tuple[PlanReviewAction, ...]
+    allowed_review_actions: tuple[PlanReviewAction, ...]
     default_mode: AgentMode = "default"
     planner_model: str | BaseChatModel | None = None
 
@@ -38,7 +38,7 @@ def _is_object_sequence(value: object) -> TypeGuard[Sequence[object]]:
     return isinstance(value, Sequence)
 
 
-def validate_plan_review_actions(
+def validate_allowed_review_actions(
     value: object,
 ) -> tuple[PlanReviewAction, ...]:
     """Freeze one ordered, non-empty Plan review action configuration.
@@ -55,17 +55,23 @@ def validate_plan_review_actions(
     """
 
     if isinstance(value, (str, bytes)) or not _is_object_sequence(value):
-        raise TypeError("review_actions must be a sequence of PlanReviewAction values")
+        raise TypeError(
+            "allowed_review_actions must be a sequence of PlanReviewAction values"
+        )
     normalized: list[PlanReviewAction] = []
     for action in value:
         if not isinstance(action, PlanReviewAction):
-            raise TypeError("review_actions must contain only PlanReviewAction values")
+            raise TypeError(
+                "allowed_review_actions must contain only PlanReviewAction values"
+            )
         normalized.append(action)
     actions = tuple(normalized)
     if not actions:
-        raise PlanModeConfigurationError("review_actions must not be empty")
+        raise PlanModeConfigurationError("allowed_review_actions must not be empty")
     if len(actions) != len(set(actions)):
-        raise PlanModeConfigurationError("review_actions must not contain duplicates")
+        raise PlanModeConfigurationError(
+            "allowed_review_actions must not contain duplicates"
+        )
     return actions
 
 
@@ -96,10 +102,10 @@ def resolve_agent_mode(
 
 
 __all__ = [
-    "DEFAULT_PLAN_REVIEW_ACTIONS",
+    "DEFAULT_ALLOWED_REVIEW_ACTIONS",
     "AgentMode",
     "PlanOptions",
     "resolve_agent_mode",
     "validate_agent_mode",
-    "validate_plan_review_actions",
+    "validate_allowed_review_actions",
 ]

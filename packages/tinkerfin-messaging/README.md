@@ -76,9 +76,10 @@ A custom source must receive one explicit Identity. A profiled source may omit i
 
 ## Durable values
 
-`MessageEnvelope` schema 2 contains channel, nested Identity, sequence, message ID, codec, payload bytes, and UTC creation time. Envelope v1 is intentionally incompatible.
+`MessageEnvelope` contains channel, nested Identity, sequence, message ID, codec,
+payload bytes, and UTC creation time.
 
-`RecoveryCheckpoint` schema 1 contains an opaque source position plus the last stable message ID.
+`RecoveryCheckpoint` contains an opaque source position plus the last stable message ID.
 
 ## Deferred and recoverable sources
 
@@ -100,7 +101,8 @@ backend = RedisBackend(redis, key_prefix="my-app:messaging")
 messaging = Messaging(backend=backend)
 ```
 
-Redis persistent schema 5 is the only readable format. Schema 4 records require a new prefix or explicit cleanup before use. Schema 5 keeps trusted per-owner lease renewal counts and timestamps for postmortem diagnostics; these fields never enter envelopes or client output.
+Redis keeps trusted per-owner lease renewal counts and timestamps for postmortem
+diagnostics; these fields never enter envelopes or client output.
 
 ## Capacity limits
 

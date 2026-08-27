@@ -242,11 +242,12 @@ from .errors import TinkerFinLifecycleError as TinkerFinLifecycleError
 from .errors import TinkerFinStreamProtocolError as TinkerFinStreamProtocolError
 from .plan import AgentMode as AgentMode
 from .plan import ClarificationFormBase as _ClarificationFormBase
+from .plan import ClarificationType as _ClarificationType
 from .plan import DefaultClarificationForm as _DefaultClarificationForm
 from .plan import PlanContentModel as _PlanContentModel
 from .plan import PlanReviewAction as _PlanReviewAction
 from .plan import StructuredPlanContent as _StructuredPlanContent
-from .plan._config import DEFAULT_PLAN_REVIEW_ACTIONS as _DEFAULT_PLAN_REVIEW_ACTIONS
+from .plan._config import DEFAULT_ALLOWED_REVIEW_ACTIONS as _DEFAULT_ALLOWED_REVIEW_ACTIONS
 from .runtime import AgUiEventStream as AgUiEventStream
 from .runtime import AgUiSettlementTimeoutError as AgUiSettlementTimeoutError
 from .runtime import EventObserver as EventObserver
@@ -266,11 +267,12 @@ class TinkerFin(_RuntimeTinkerFin):
             RuntimeTinkerFin.plan,
             replacements={
                 "ClarificationFormBase": "_ClarificationFormBase",
+                "ClarificationType": "_ClarificationType",
                 "DefaultClarificationForm": "_DefaultClarificationForm",
                 "PlanContentModel": "_PlanContentModel",
                 "PlanReviewAction": "_PlanReviewAction",
                 "StructuredPlanContent": "_StructuredPlanContent",
-                "DEFAULT_PLAN_REVIEW_ACTIONS": "_DEFAULT_PLAN_REVIEW_ACTIONS",
+                "DEFAULT_ALLOWED_REVIEW_ACTIONS": "_DEFAULT_ALLOWED_REVIEW_ACTIONS",
             },
             return_type="TinkerFin",
         )

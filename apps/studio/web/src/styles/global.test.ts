@@ -183,7 +183,7 @@ describe('前端视觉契约', () => {
     expect(uiStyles).toMatch(/\.ui-button--circle\s*\{[^}]*width:\s*var\(--button-control-size\);[^}]*min-width:\s*var\(--button-control-size\);/s)
     expect(uiStyles).toMatch(/\.ui-text-field--md \.ui-text-field__control\s*\{[^}]*min-height:\s*var\(--control-md\);/s)
     expect(uiStyles).toMatch(/\.ui-text-field--lg \.ui-text-field__control\s*\{[^}]*min-height:\s*var\(--control-lg\);/s)
-    expect(uiStyles).toMatch(/\.ui-text-field__control:focus-within\s*\{[^}]*border-color:\s*var\(--color-border-strong\);[^}]*box-shadow:\s*none;/s)
+    expect(uiStyles).toMatch(/\.ui-text-field__control:focus-within,\s*\.ui-date-picker__trigger:focus-visible\s*\{[^}]*border-color:\s*var\(--color-border-strong\);[^}]*box-shadow:\s*none;/s)
     expect(tokensStyles).not.toContain('--shadow-focus')
     expect(conversationStyles).toMatch(/\.approval-rejection-form textarea:focus\s*\{[^}]*border-color:\s*var\(--color-border-strong\);[^}]*outline:\s*0;[^}]*box-shadow:\s*none;/s)
     expect(conversationStyles).toMatch(/\.plan-review-input textarea:focus\s*\{[^}]*border-color:\s*var\(--color-border-strong\);[^}]*outline:\s*0;[^}]*box-shadow:\s*none;/s)
@@ -202,6 +202,17 @@ describe('前端视觉契约', () => {
     expect(settingsStyles).toMatch(/\.settings-language-trigger:focus-visible\s*\{[^}]*outline:\s*2px solid var\(--color-focus\);[^}]*outline-offset:\s*0;/s)
   })
 
+  it('会话卡片键盘焦点不使用品牌蓝色边框', () => {
+    const conversationStyles = cssFiles['../features/conversation/conversation.css']
+    const uiStyles = cssFiles['../components/ui/ui.css']
+    expect(conversationStyles).toMatch(/\.subagent-card-head:focus-visible\s*\{[^}]*outline:\s*2px solid var\(--color-border-strong\);/s)
+    expect(conversationStyles).toMatch(/\.tool-row > summary:focus-visible\s*\{[^}]*outline:\s*2px solid var\(--color-border-strong\);/s)
+    expect(conversationStyles).toMatch(/\.approval-toggle-surface:focus-visible,[\s\S]*\.plan-interaction-toggle-surface:focus-visible\s*\{[^}]*outline:\s*2px solid var\(--color-border-strong\);/s)
+    expect(conversationStyles).toMatch(/\.plan-question-progress-step:focus-visible\s*\{[^}]*outline:\s*2px solid var\(--color-border-strong\);/s)
+    expect(uiStyles).toMatch(/\.ui-text-field__control:focus-within,\s*\.ui-date-picker__trigger:focus-visible\s*\{[^}]*border-color:\s*var\(--color-border-strong\);[^}]*outline:\s*0;/s)
+    expect(conversationStyles).toMatch(/:is\(\.approval-composer, \.plan-question-composer, \.plan-review-composer\)[\s\S]*\.ui-button:not\(\.ui-icon-button\):focus-visible\s*\{[^}]*outline:\s*2px solid var\(--color-border-strong\);/s)
+  })
+
   it('会话正文与输入卡片使用独立的 DSH 对齐宽度', () => {
     const workspaceStyles = cssFiles['../features/workspace/workspace.css']
     const conversationStyles = cssFiles['../features/conversation/conversation.css']
@@ -209,19 +220,63 @@ describe('前端视觉契约', () => {
     expect(tokensStyles).toContain('--layout-conversation-width: 748px;')
     expect(tokensStyles).toContain('--layout-composer-width: 780px;')
     expect(tokensStyles).toContain('--layout-composer-surface-height: 94px;')
+    expect(tokensStyles).toContain('--layout-interaction-card-min-height: clamp(260px, 32dvh, 320px);')
+    expect(tokensStyles).toContain('--layout-interaction-card-context-reserve: 120px;')
+    expect(tokensStyles).toContain('--layout-interaction-card-max-cap: 680px;')
+    expect(tokensStyles).toContain('--layout-interaction-card-max-height: clamp(var(--layout-interaction-card-min-height), calc(100dvh - var(--layout-header-height) - var(--layout-interaction-card-context-reserve) - var(--space-10)), var(--layout-interaction-card-max-cap));')
+    expect(tokensStyles).toContain('--layout-interaction-card-gap: var(--space-6);')
+    expect(tokensStyles).not.toContain('--layout-interaction-card-height:')
     expect(workspaceStyles).toMatch(/\.conversation-pane\s*\{[^}]*padding-inline:\s*var\(--space-8\);/s)
     expect(workspaceStyles).toMatch(/\.message-list\s*\{[^}]*width:\s*min\(100%, var\(--layout-conversation-width\)\)/s)
     expect(workspaceStyles).toMatch(/\.message-list\s*\{[^}]*padding:\s*var\(--space-8\) 0 var\(--composer-height\);/s)
+    expect(workspaceStyles).toMatch(/\.workspace-main:has\(\.composer-dock\.is-taken-over\)\s*\{[^}]*grid-template-rows:\s*var\(--layout-header-height\) minmax\(0, 1fr\) auto;/s)
+    expect(workspaceStyles).toMatch(/\.workspace-main:has\(\.composer-dock\.is-taken-over\) \.message-list\s*\{[^}]*padding-bottom:\s*var\(--space-4\);/s)
+    expect(workspaceStyles).toMatch(/\.workspace-main:has\(\.composer-dock\.is-taken-over\) \.conversation-scroll-action\s*\{[^}]*bottom:\s*var\(--space-3\);/s)
     expect(workspaceStyles).not.toMatch(/\.message-list\s*\{[^}]*padding-(?:right|left):/s)
     expect(workspaceStyles).toMatch(/@media \(max-width:\s*767px\)[\s\S]*\.conversation-pane\s*\{[^}]*padding-inline:\s*var\(--space-4\);[^}]*\}[\s\S]*\.message-list\s*\{[^}]*padding-top:\s*var\(--space-6\);/s)
     expect(workspaceStyles).toMatch(/@media \(max-width:\s*440px\)[\s\S]*\.conversation-pane\s*\{[^}]*padding-inline:\s*var\(--space-3\);/s)
     expect(conversationStyles).toMatch(/\.composer\s*\{[^}]*width:\s*min\(100%, var\(--layout-composer-width\)\);[^}]*min-height:\s*var\(--layout-composer-surface-height\);/s)
     expect(conversationStyles).toMatch(/\.approval-composer,[\s\S]*\.plan-review-composer\s*\{[^}]*width:\s*min\(100%, var\(--layout-composer-width\)\);/s)
-    expect(conversationStyles).toMatch(/\.approval-composer\.is-minimized,[\s\S]*\.plan-review-composer\.is-minimized\s*\{[^}]*min-height:\s*var\(--layout-composer-surface-height\);[^}]*max-height:\s*none;/s)
+    expect(conversationStyles).toMatch(/\.approval-composer,[\s\S]*\.plan-review-composer\s*\{[^}]*height:\s*var\(--interaction-card-height, var\(--layout-interaction-card-min-height\)\);[^}]*min-height:\s*var\(--layout-interaction-card-min-height\);[^}]*max-height:\s*var\(--layout-interaction-card-max-height\);/s)
+    expect(conversationStyles).toMatch(/\.composer-dock\.is-taken-over\s*\{[^}]*grid-row:\s*3;[^}]*padding-top:\s*var\(--layout-interaction-card-gap\);/s)
+    expect(conversationStyles).toMatch(/\.composer-dock\.is-taken-over::before\s*\{[^}]*display:\s*none;/s)
+    expect(conversationStyles).toMatch(/\.approval-composer\.is-minimized,[\s\S]*\.plan-review-composer\.is-minimized\s*\{[^}]*height:\s*auto;[^}]*min-height:\s*var\(--layout-composer-surface-height\);[^}]*max-height:\s*none;/s)
     const minimizedSurfaceRule = conversationStyles.match(
       /\.approval-composer\.is-minimized,[\s\S]*?\.plan-review-composer\.is-minimized\s*\{[^}]*\}/s,
     )?.[0] ?? ''
-    expect(minimizedSurfaceRule).not.toMatch(/(?:^|\n)\s*height:/)
+    expect(minimizedSurfaceRule).toMatch(/(?:^|\n)\s*height:\s*auto;/)
+  })
+
+  it('交互卡片无外边框且上边框悬浮只改变拖拽光标', () => {
+    const conversationStyles = cssFiles['../features/conversation/conversation.css']
+
+    expect(conversationStyles).toMatch(/\.approval-composer,\s*\.plan-question-composer,\s*\.plan-review-composer\s*\{[^}]*border:\s*0;/s)
+    expect(tokensStyles).not.toContain('--color-plan-panel-border')
+    expect(tokensStyles).not.toContain('--color-warning-panel-border')
+    expect(conversationStyles).toMatch(/\.interaction-card-resize-handle\s*\{[^}]*display:\s*none;[^}]*top:\s*-1px;[^}]*height:\s*var\(--space-3\);[^}]*cursor:\s*ns-resize;[^}]*touch-action:\s*none;/s)
+    expect(conversationStyles).toMatch(/@media \(hover:\s*hover\) and \(pointer:\s*fine\)[\s\S]*\.interaction-card-resize-handle\s*\{\s*display:\s*block;/s)
+    expect(conversationStyles).not.toContain('.interaction-card-resize-handle:hover::after')
+    expect(conversationStyles).not.toMatch(/\.is-resizing[\s\S]*> \.interaction-card-resize-handle::after/s)
+    expect(conversationStyles).toMatch(/\.interaction-card-resize-handle:focus-visible::after\s*\{\s*opacity:\s*1;/s)
+    expect(conversationStyles).toMatch(/@media \(forced-colors:\s*active\)[\s\S]*\.interaction-card-resize-handle:focus-visible::after\s*\{[^}]*background:\s*Highlight;/s)
+    expect(conversationStyles).toMatch(/@media \(forced-colors:\s*active\)[\s\S]*:is\(\.approval-composer, \.plan-question-composer, \.plan-review-composer\)\s*\{[^}]*outline:\s*1px solid ButtonText;/s)
+    expect(conversationStyles).toMatch(/@media \(prefers-reduced-motion:\s*reduce\)[\s\S]*\.interaction-card-resize-handle::after,[\s\S]*transition:\s*none;/s)
+    for (const selector of [
+      '.approval-composer-body',
+      '.approval-composer-footer',
+      '.plan-review-composer-body',
+      '.plan-review-actions',
+      '.plan-review-composer-footer',
+      '.plan-question-composer-body',
+      '.plan-question-composer-footer',
+    ]) {
+      const rule = conversationStyles.match(new RegExp(
+        `${selector.replaceAll('.', '\\.')}\\s*\\{[^}]*\\}`,
+        's',
+      ))?.[0] ?? ''
+      expect(rule).not.toBe('')
+      expect(rule).not.toMatch(/border-(?:top|bottom|block)|border:/)
+    }
   })
 
   it('空会话使用横向品牌组合，并在窄屏收紧字号与间距', () => {
@@ -523,9 +578,9 @@ describe('前端视觉契约', () => {
     expect(uiStyles).toMatch(/\.ui-icon-button\s*\{[^}]*background:\s*transparent;/s)
     expect(uiStyles).toMatch(/\.ui-icon-button:hover:not\(:disabled\),[\s\S]*\.ui-icon-button:disabled\s*\{[^}]*background:\s*transparent;[^}]*box-shadow:\s*none;/s)
     expect(uiStyles).toMatch(/\.ui-icon-button:focus-visible\s*\{[^}]*outline:\s*0;[^}]*background:\s*var\(--color-hover\);[^}]*box-shadow:\s*none;/s)
-    expect(uiStyles).toMatch(/@media \(forced-colors:\s*active\)[\s\S]*\.ui-button:focus-visible,[\s\S]*\.ui-icon-button:focus-visible,[\s\S]*\.ui-text-field__control:focus-within\s*\{[^}]*outline:\s*2px solid Highlight;[^}]*outline-offset:\s*2px;/s)
-    expect(uiStyles).toMatch(/\.ui-text-field__control\s*\{[^}]*border:\s*1px solid var\(--color-border\);[^}]*background:\s*var\(--color-layer-1\);/s)
-    expect(uiStyles).toMatch(/\.ui-text-field__control:focus-within\s*\{[^}]*border-color:\s*var\(--color-border-strong\);[^}]*box-shadow:\s*none;/s)
+    expect(uiStyles).toMatch(/@media \(forced-colors:\s*active\)[\s\S]*\.ui-button:focus-visible,[\s\S]*\.ui-date-picker__trigger:focus-visible,[\s\S]*\.ui-icon-button:focus-visible,[\s\S]*\.ui-text-field__control:focus-within\s*\{[^}]*outline:\s*2px solid Highlight;[^}]*outline-offset:\s*2px;/s)
+    expect(uiStyles).toMatch(/\.ui-text-field__control,\s*\.ui-date-picker__trigger\s*\{[^}]*border:\s*1px solid var\(--color-border\);[^}]*background:\s*var\(--color-layer-1\);/s)
+    expect(uiStyles).toMatch(/\.ui-text-field__control:focus-within,\s*\.ui-date-picker__trigger:focus-visible\s*\{[^}]*border-color:\s*var\(--color-border-strong\);[^}]*box-shadow:\s*none;/s)
     expect(workspaceStyles).toMatch(/\.sidebar-search\s*\{[^}]*top:\s*50%;[^}]*right:\s*0;[^}]*left:\s*0;[^}]*height:\s*var\(--control-lg\);[^}]*transform:\s*translateY\(-50%\) scaleX\(\.28\);/s)
     expect(workspaceStyles).toMatch(/\.sidebar-head\.is-search-open \.sidebar-search\s*\{[^}]*transform:\s*translateY\(-50%\) scaleX\(1\);/s)
     expect(workspaceStyles).toMatch(/\.sidebar-search:focus-within\s*\{[^}]*border:\s*0;[^}]*outline:\s*0;[^}]*box-shadow:\s*none;/s)

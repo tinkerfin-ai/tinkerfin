@@ -63,10 +63,9 @@ channel = messaging.channel(
 
 TinkerFin 的规范事件流带有 codec 与 Identity，因此 name-only channel 可以自动选择 codec 和 durable scope。自定义 source 必须显式配置 codec，并在调用时提供 Identity。
 
-RedisBackend 只读取持久 schema 5。Schema 4 记录不兼容；切换前使用新的 `key_prefix`，或清理确认
-不再需要的旧记录。Schema 5 保存完整 limits fingerprint、每个 generation 的 `payload_bytes`，以及
-当前 owner 和上一个 owner 的成功续租次数与 UTC 时间，仅用于可信故障取证。共享同一 channel 的
-worker 必须使用完全相同的 limits。配额检查与计数会在 message ID 幂等检查后，与 append 原子完成；
+RedisBackend 保存完整 limits fingerprint、每个 generation 的 `payload_bytes`，以及当前 owner 和
+上一个 owner 的成功续租次数与 UTC 时间，仅用于可信故障取证。共享同一 channel 的 worker 必须
+使用完全相同的 limits。配额检查与计数会在 message ID 幂等检查后，与 append 原子完成；
 这些字段不会进入 `MessageEnvelope`。
 
 默认上限为：单条编码消息 16 MiB、checkpoint 1 MiB、每个 thread generation 100,000 条消息，

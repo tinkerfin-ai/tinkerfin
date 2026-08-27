@@ -36,12 +36,13 @@ runtime = agent.new_agui(identity=identity, mode="plan")
 
 | `reason` | `resolved` 时的 payload |
 | --- | --- |
-| `tinkerfin:plan_clarification` | 选择 Option 时使用 `{"type":"respond","answers":[{"questionId":"...","optionId":"..."}]}`；自由输入时使用 `{"type":"respond","answers":[{"questionId":"...","answer":"..."}]}`；跳过可选题时使用 `{"type":"respond","answers":[{"questionId":"...","skipped":true}]}` |
+| `tinkerfin:plan_clarification` | 使用 `{"type":"respond","answers":{"question-id":{"status":"answered","answerType":"single_choice","optionId":"option-id"}}}`；每道题的 value 服从 interrupt 的精确响应 Schema，可选题跳过使用 `{"status":"skipped"}` |
 | `tinkerfin:plan_review` | 使用 interrupt 响应 Schema 允许的动作并携带当前 `baseRevision`；默认是 `approve`、`respond` 或 `reject`，`edit` 需要宿主显式配置 |
 
-Plan interrupt 没有 `toolCallId`，其中包含带版本的可信 Runtime envelope、响应 JSON Schema
-和携带完整公开 Form 的 `tinkerfin.plan-clarification.v2` metadata；Form 使用 `schemaVersion: 2`。
-Python 的 `allow_free_text` 在 JSON 中表示为 `allowFreeText`，每道问题还会显式携带 `required`。
+Plan interrupt 没有 `toolCallId`，其中包含已声明的可信 Runtime envelope、响应 JSON Schema
+和携带完整公开 Form 的 Plan clarification metadata。
+每道问题显式携带 `answerType` 和 `required`；内置题型为 `single_choice`、
+`multiple_choice`、`text` 和 `date`。
 Question/Option attributes 会作为公开、
 非权威的规划参考原样保留；内部 Schema fingerprint 只存在于 checkpoint，不属于公开
 AG-UI 事件。根状态的 `tinkerfin_plan` 会在 interrupt 终止事件前发布。恢复请求先同步
@@ -49,8 +50,9 @@ snapshot，随后可以用 RFC 6902 state delta 表示 Plan 进入 `approved`，
 `effectiveMode=default`。
 
 客户端不能回传 Form、label、description 或 attributes。Planning Graph 从 checkpoint 恢复可信
-Form 并派生所选 Option label。Resume 必须完整覆盖每道问题；混合回答字段、跳过必填题、漏传问题
-或使用未知 ID 都会导致恢复失败。
+Form 并派生所选 Option label。`answers` object 必须完整覆盖每个 checkpoint question ID，且不能
+包含未知 key。提交其他 `answerType` 的字段、违反多选数量、无效日期、跳过必填题或使用未知 Option
+ID 都会在 Graph 消费 resume 前失败。
 
 Plan interrupt 使用同一套 `AgUiResumeBinding.from_agui(...)`，不需要另一套恢复 API。
 Binding 校验已保存 envelope 和待处理项的完整覆盖，Planning Graph 校验响应契约，并拒绝过期
@@ -60,10 +62,10 @@ Binding 校验已保存 envelope 和待处理项的完整覆盖，Planning Graph
 产生 Tool 审批；后续恢复会继续使用原来的 scoped Tool ID。
 
 Tool 审批的 `metadata.deepagents` 使用
-`tinkerfin.deepagents.tool-review.v1`，必填字段为 `nativeInterruptId`、
+`tinkerfin.deepagents.tool-review`，必填字段为 `nativeInterruptId`、
 `actionIndex`、`toolName`、`allowedDecisions` 和 `originalArgs`。宿主应使用
 `parse_tool_review_interrupt()` 解析服务端保存的完整 interrupt，并原样持久化。缺失字段、未知
-字段、非法决定或与 `metadata.langgraphValue` 不一致都会失败关闭；不存在无版本 metadata 形状。
+字段、非法决定或与 `metadata.langgraphValue` 不一致都会失败关闭。
 
 取消 Plan 澄清或审阅表示放弃当前 Plan 请求，不能伪造成 `reject`。后续普通输入可以在
 同一个 Plan-capable Definition 和 checkpoint thread 上使用 `mode="default"`。修改未来

@@ -1,13 +1,13 @@
 import { describe, expect, it } from "vitest"
 
-import fixture from "./contracts/subagent-provenance-v1.fixture.json"
+import fixture from "./contracts/subagent-provenance.fixture.json"
 import {
   SUBAGENT_PROVENANCE_SCHEMA,
   SubagentProvenanceContractError,
   parseSubagentProvenance,
 } from "./subagentProvenanceContract"
 
-describe("Subagent provenance v1 contract", () => {
+describe("Subagent provenance current contract", () => {
   it("parses the generated cross-language fixture", () => {
     expect(parseSubagentProvenance(fixture)).toEqual(fixture)
     expect(fixture.schema).toBe(SUBAGENT_PROVENANCE_SCHEMA)

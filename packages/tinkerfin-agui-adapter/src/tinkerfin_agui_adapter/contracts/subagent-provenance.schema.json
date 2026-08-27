@@ -1,5 +1,5 @@
 {
-  "$id": "https://github.com/tinkerfin-ai/tinkerfin/blob/main/packages/tinkerfin-agui-adapter/src/tinkerfin_agui_adapter/contracts/subagent-provenance-v1.schema.json",
+  "$id": "https://github.com/tinkerfin-ai/tinkerfin/blob/main/packages/tinkerfin-agui-adapter/src/tinkerfin_agui_adapter/contracts/subagent-provenance.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "description": "Stable identity and native provenance for one logical subagent invocation.",
@@ -52,7 +52,7 @@
       "type": "string"
     },
     "schema": {
-      "const": "tinkerfin.subagent-provenance.v1",
+      "const": "tinkerfin.subagent-provenance",
       "description": "Exact TinkerFin subagent provenance schema",
       "title": "Schema",
       "type": "string"

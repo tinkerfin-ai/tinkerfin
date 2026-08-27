@@ -48,9 +48,9 @@ _REDIS_SCRIPT_DIGESTS = {
     "_DELETE_BATCH_SCRIPT": "e0a233eb4d17f70abb3ef4f2afda18007e267c065d7b62dc413ea0c80f37cc82",
     "_FINALIZE_DELETE_SCRIPT": "60dba88f869c6584a5c9d9eb036c3aa9336010238a892da2e2fca6ff8008782c",
     "_FINISH_SCRIPT": "7e020d232d28d30e75551c5661e30ad3b5abc04c6e169a7028abd5f3484b687e",
-    "_PREPARE_SCRIPT": "1c130f5909648c72f120f1ea618b1f9379047d800c326b929da9f9c0ebe0ab09",
+    "_PREPARE_SCRIPT": "7d0feb23b17a864afc5828dc95be5314193fb001425af188286a265d63f5d69e",
     "_RENEW_SCRIPT": "90a2c24ed5f4e9c64f84a41fa6b4bc69e03206c5df48c5f75ec4b66be6c62113",
-    "_RUN_SNAPSHOT_SCRIPT": "819a51a0d3701da3d65578a3ddc30bac30610581e02abca437557a54bc272dce",
+    "_RUN_SNAPSHOT_SCRIPT": "974988f01916e9e05931ae3b5b180e4cd8988b2d72d34d2517ecc96a25f64a20",
 }
 
 
@@ -1353,7 +1353,6 @@ async def test_real_redis_persists_channel_and_stream_metadata_separately(
         b"max_message_payload_bytes": b"16777216",
         b"max_thread_messages": b"100000",
         b"max_thread_payload_bytes": b"1073741824",
-        b"schema_version": b"5",
     }
     controls = [
         await cast(Awaitable[dict[bytes, bytes]], client.hgetall(key))
@@ -1366,7 +1365,6 @@ async def test_real_redis_persists_channel_and_stream_metadata_separately(
     assert all(control[b"channel"] == b"events" for control in controls)
     assert all(control[b"generation"] == b"1" for control in controls)
     assert all(control[b"state"] == b"active" for control in controls)
-    assert all(control[b"schema_version"] == b"5" for control in controls)
     assert all(control[b"signal_seq"] == b"1" for control in controls)
     stream_metadata = [
         await cast(Awaitable[dict[bytes, bytes]], client.hgetall(key))
@@ -1380,7 +1378,6 @@ async def test_real_redis_persists_channel_and_stream_metadata_separately(
     assert all(metadata[b"generation"] == b"1" for metadata in stream_metadata)
     assert all(metadata[b"seq"] == b"1" for metadata in stream_metadata)
     assert all(metadata[b"payload_bytes"] == b"9" for metadata in stream_metadata)
-    assert all(metadata[b"schema_version"] == b"5" for metadata in stream_metadata)
 
     run_metadata = [
         await cast(Awaitable[dict[bytes, bytes]], client.hgetall(key))
@@ -1388,7 +1385,6 @@ async def test_real_redis_persists_channel_and_stream_metadata_separately(
     ]
     assert {metadata[b"status"] for metadata in run_metadata} == {b"completed"}
     assert {metadata[b"run"] for metadata in run_metadata} == {b"run-1", b"run-2"}
-    assert all(metadata[b"schema_version"] == b"5" for metadata in run_metadata)
     assert all(metadata[b"lease_renew_count"] == b"0" for metadata in run_metadata)
     assert all(
         int(metadata[b"lease_last_success_seconds"]) > 0 for metadata in run_metadata
@@ -1588,78 +1584,6 @@ async def test_real_redis_rejects_limits_mismatch_without_mutation(
         } == hashes_before
     finally:
         await _delete_prefix(client, prefix)
-
-
-@pytest.mark.parametrize(
-    ("record_kind", "key_pattern"),
-    (
-        ("channel", "tfmsg:test:*:channel"),
-        ("control", "tfmsg:test:*:control"),
-        ("metadata", "tfmsg:test:*:generation:1:meta"),
-        ("run", "tfmsg:test:*:generation:1:run:*"),
-    ),
-)
-@pytest.mark.parametrize("stored_schema", ("4", None), ids=("schema-4", "missing"))
-async def test_real_redis_rejects_incompatible_schema_without_mutation(
-    redis_backends: tuple[RedisBackend, RedisBackend, Redis],
-    record_kind: str,
-    key_pattern: str,
-    stored_schema: str | None,
-) -> None:
-    backend, _, client = redis_backends
-    prepared = await backend.prepare(
-        channel="events",
-        identity=_identity(),
-        codec="test.bytes.v1",
-        after=0,
-        cancellable=False,
-        recoverable=False,
-    )
-    await backend.finish(prepared.handle, status="completed")
-    records = [key async for key in client.scan_iter(match=key_pattern)]
-    assert len(records) == 1
-    if stored_schema is None:
-        await cast(Awaitable[int], client.hdel(records[0], "schema_version"))
-    else:
-        await cast(
-            Awaitable[int],
-            client.hset(records[0], "schema_version", stored_schema),
-        )
-    hash_keys = {
-        key
-        async for key in client.scan_iter(match="tfmsg:test:*")
-        if await cast(Awaitable[bytes], client.type(key)) == b"hash"
-    }
-    hashes_before = {
-        key: await cast(Awaitable[dict[bytes, bytes]], client.hgetall(key))
-        for key in hash_keys
-    }
-    requested_identity = (
-        _identity()
-        if record_kind == "run"
-        else Identity(threadId="conversation-1", runId="run-2")
-    )
-
-    with pytest.raises(
-        MessagingBackendProtocolError,
-        match="invalid protocol response",
-    ) as captured:
-        await backend.prepare(
-            channel="events",
-            identity=requested_identity,
-            codec="test.bytes.v1",
-            after=0,
-            cancellable=False,
-            recoverable=False,
-        )
-
-    detail = str(captured.value.diagnostic_context["detail"])
-    assert "unsupported persistent schema version" in detail
-    assert "expected '5'" in detail
-    assert {
-        key: await cast(Awaitable[dict[bytes, bytes]], client.hgetall(key))
-        for key in hash_keys
-    } == hashes_before
 
 
 @pytest.mark.parametrize(

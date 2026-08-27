@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 
-import fixture from "./contracts/tool-review-v1.fixture.json"
+import fixture from "./contracts/tool-review.fixture.json"
 import {
   TOOL_REVIEW_SCHEMA,
   ToolReviewContractError,
@@ -26,7 +26,7 @@ const validInterrupt = () => ({
   },
 })
 
-describe("Tool review v1 contract", () => {
+describe("Tool review current contract", () => {
   it("parses the generated cross-language fixture", () => {
     expect(parseToolReviewInterrupt(validInterrupt())).toEqual(fixture)
     expect(fixture.schema).toBe(TOOL_REVIEW_SCHEMA)

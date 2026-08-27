@@ -75,7 +75,16 @@ export const isSubmittableComposerDraft = (value: string) => {
     && (command.remainder === '' || /^\s/.test(command.remainder))
 }
 
-export const cancelComposerSuggestion = (value: string): ComposerDraftEdit => {
+export const cancelComposerSuggestion = (
+  value: string,
+  hit?: SlashTokenHit,
+): ComposerDraftEdit => {
+  if (hit) {
+    return {
+      value: `${value.slice(0, hit.start)}${value.slice(hit.end)}`,
+      caret: hit.start,
+    }
+  }
   const slashToken = /^\s*\/[^\s/]*/.exec(value)?.[0]
   if (!slashToken) return { value, caret: value.length }
   return {

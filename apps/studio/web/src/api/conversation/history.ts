@@ -5,6 +5,7 @@ import type {
   ConversationRunStatus,
   JsonObject,
   Message,
+  PendingInteractionKind,
   PlanInteraction,
   TodoItem,
 } from '../../types'
@@ -22,6 +23,7 @@ export interface ConversationHistoryListItem {
   messageCount: number
   toolCallCount: number
   hasPendingInterrupt: boolean
+  pendingInteractionKind: PendingInteractionKind | null
   pinned: boolean
   createdAt: string
   updatedAt: string
@@ -38,7 +40,6 @@ export interface ConversationHistoryGroupConfig {
 
 export interface ConversationSnapshotJson {
   snapshotSeq: number
-  snapshotVersion: 3
   messages: Message[]
   todos: TodoItem[]
   mode: AgentMode
@@ -94,10 +95,10 @@ export interface ConversationHistoryDetail {
   lastModel?: string
   lastSeq: number
   snapshotSeq: number
-  snapshotVersion: 3
   messageCount: number
   toolCallCount: number
   hasPendingInterrupt: boolean
+  pendingInteractionKind: PendingInteractionKind | null
   pinned: boolean
   snapshot?: ConversationSnapshotJson | null
   events: ConversationEventEnvelope[]

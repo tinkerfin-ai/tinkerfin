@@ -49,13 +49,13 @@ describe('auth session lifecycle', () => {
     expect(session.expiresAt).toBe('2026-08-23T10:00:00.000Z')
   })
 
-  it('normalizes a stored v1 session without avatar_url instead of signing out', () => {
-    const legacy = createAuthSession(loginPayload('2099-01-01T00:00:00Z'))
-    const legacyUser = { ...legacy.user } as Partial<typeof legacy.user>
-    delete legacyUser.avatar_url
+  it('rejects a stored session that does not match the current user shape', () => {
+    const stored = createAuthSession(loginPayload('2099-01-01T00:00:00Z'))
+    const incompleteUser = { ...stored.user } as Partial<typeof stored.user>
+    delete incompleteUser.avatar_url
     const serialized = JSON.stringify({
-      ...legacy,
-      user: legacyUser,
+      ...stored,
+      user: incompleteUser,
     })
     const stop = startAuthSessionLifecycle()
     window.localStorage.setItem(AUTH_SESSION_STORAGE_KEY, serialized)
@@ -64,8 +64,8 @@ describe('auth session lifecycle', () => {
       newValue: serialized,
     }))
 
-    expect(getAuthSession()?.user.avatar_url).toBeNull()
-    expect(window.localStorage.getItem(AUTH_SESSION_STORAGE_KEY)).not.toBeNull()
+    expect(getAuthSession()).toBeNull()
+    expect(window.localStorage.getItem(AUTH_SESSION_STORAGE_KEY)).toBeNull()
     stop()
   })
 

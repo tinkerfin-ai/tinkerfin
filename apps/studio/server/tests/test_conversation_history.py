@@ -70,6 +70,112 @@ def test_history_group_config_exposes_server_day_ranges() -> None:
     assert ConversationHistoryService.group_config().day_ranges == [7, 30]
 
 
+@pytest.mark.parametrize(
+    ("reasons", "expected_kind"),
+    (
+        ((), None),
+        (("tool_call",), "tool_approval"),
+        (("tool_call", "tool_call"), "tool_approval"),
+        (("tinkerfin:plan_clarification",), "plan_clarification"),
+        (("tinkerfin:plan_review",), "plan_review"),
+    ),
+)
+async def test_history_list_exposes_pending_interaction_kind(
+    session: AsyncSession,
+    reasons: tuple[str, ...],
+    expected_kind: str | None,
+) -> None:
+    """列表摘要必须携带无需详情水化即可展示的待处理交互类型"""
+
+    repository = ConversationRepository(session)
+    thread = await repository.create_thread(
+        user_id=7,
+        thread_id=f"thread-pending-kind-{expected_kind or 'none'}-{len(reasons)}",
+        title="待处理类型摘要",
+        model_id="main",
+    )
+    if reasons:
+        snapshot = empty_snapshot()
+        snapshot["snapshotSeq"] = 1
+        snapshot["runStatus"] = "waiting_approval"
+        snapshot["interrupts"] = [
+            {"id": f"interrupt-{index}", "reason": reason}
+            for index, reason in enumerate(reasons)
+        ]
+        thread.status = "waiting_approval"
+        thread.last_seq = 1
+        thread.snapshot_seq = 1
+        thread.has_pending_interrupt = True
+        thread.snapshot_json = snapshot
+    await repository.commit()
+
+    service = ConversationHistoryService(
+        repository,
+        user_id=7,
+        projector=ConversationProjectionCoordinator.__new__(
+            ConversationProjectionCoordinator
+        ),
+    )
+
+    response = await service.list_history(page_size=10, cursor=None)
+
+    assert len(response.items) == 1
+    assert response.items[0].pending_interaction_kind == expected_kind
+    assert response.items[0].model_dump(by_alias=True)["pendingInteractionKind"] == (
+        expected_kind
+    )
+
+
+@pytest.mark.parametrize(
+    "reasons",
+    (
+        ("unknown",),
+        ("tool_call", "tinkerfin:plan_clarification"),
+        ("tinkerfin:plan_clarification", "tinkerfin:plan_review"),
+        ("tinkerfin:plan_review", "tinkerfin:plan_review"),
+    ),
+)
+async def test_history_list_rejects_ambiguous_pending_interaction_kind(
+    session: AsyncSession,
+    reasons: tuple[str, ...],
+) -> None:
+    """损坏或混合的 pending 组不得被列表摘要猜测成任一交互"""
+
+    repository = ConversationRepository(session)
+    thread = await repository.create_thread(
+        user_id=7,
+        thread_id=f"thread-invalid-pending-kind-{len(reasons)}-{'-'.join(reasons)}",
+        title="无效待处理类型",
+        model_id="main",
+    )
+    snapshot = empty_snapshot()
+    snapshot["snapshotSeq"] = 1
+    snapshot["runStatus"] = "waiting_approval"
+    snapshot["interrupts"] = [
+        {"id": f"interrupt-{index}", "reason": reason}
+        for index, reason in enumerate(reasons)
+    ]
+    thread.status = "waiting_approval"
+    thread.last_seq = 1
+    thread.snapshot_seq = 1
+    thread.has_pending_interrupt = True
+    thread.snapshot_json = snapshot
+    await repository.commit()
+
+    service = ConversationHistoryService(
+        repository,
+        user_id=7,
+        projector=ConversationProjectionCoordinator.__new__(
+            ConversationProjectionCoordinator
+        ),
+    )
+
+    with pytest.raises(SystemException) as captured:
+        await service.list_history(page_size=10, cursor=None)
+
+    assert captured.value.error_code is ConversationErrorCode.HISTORY_SCHEMA_MISMATCH
+
+
 async def test_list_threads_pages_across_pinned_and_recent_groups(
     session: AsyncSession,
 ) -> None:
@@ -334,6 +440,9 @@ async def test_get_detail_reloads_thread_after_independent_projection(
         assert detail.snapshot["snapshotSeq"] == 8
         assert detail.status == after_status
         assert detail.has_pending_interrupt is has_pending
+        assert detail.pending_interaction_kind == (
+            "plan_review" if has_pending else None
+        )
         assert detail.last_run_id == "run-after"
 
         async with database.session() as verification_session:
@@ -439,8 +548,8 @@ async def test_stale_history_reader_cannot_overwrite_new_projection(
     ("snapshot_seq", "snapshot_json"),
     (
         (1, None),
-        (1, {"snapshotVersion": 2, "snapshotSeq": 1}),
-        (1, {"snapshotVersion": 3, "snapshotSeq": 0}),
+        (1, {"snapshotVersion": 3, "snapshotSeq": 1}),
+        (1, {"snapshotSeq": 0}),
     ),
 )
 async def test_get_detail_rejects_noncurrent_or_inconsistent_snapshot(
@@ -448,7 +557,7 @@ async def test_get_detail_rejects_noncurrent_or_inconsistent_snapshot(
     snapshot_seq: int,
     snapshot_json: dict[str, object] | None,
 ) -> None:
-    """历史详情不得把非 v3 或序号矛盾的快照降级为事件回放"""
+    """历史详情不得把旧字段或序号矛盾的快照降级为事件回放"""
 
     async with database.session() as session:
         repository = ConversationRepository(session)
@@ -525,7 +634,7 @@ async def test_get_detail_does_not_reinterpret_persisted_tool_approval(
                 ],
             },
             "deepagents": {
-                "schema": "tinkerfin.deepagents.tool-review.v1",
+                "schema": "tinkerfin.deepagents.tool-review",
                 "nativeInterruptId": "history-interrupt#0",
                 "actionIndex": 0,
                 "toolName": "write_file",
@@ -540,7 +649,6 @@ async def test_get_detail_does_not_reinterpret_persisted_tool_approval(
     thread.has_pending_interrupt = True
     persisted_snapshot: dict[str, object] = {
         "snapshotSeq": 7,
-        "snapshotVersion": 3,
         "messages": [],
         "todos": [],
         "mode": "default",
@@ -606,6 +714,7 @@ async def test_get_detail_does_not_reinterpret_persisted_tool_approval(
 
     assert detail.status == "waiting_approval"
     assert detail.has_pending_interrupt is True
+    assert detail.pending_interaction_kind == "tool_approval"
     assert detail.snapshot == persisted_snapshot
     await session.refresh(thread)
     assert thread.snapshot_json == persisted_snapshot
@@ -629,7 +738,6 @@ async def test_get_detail_does_not_repair_stale_interrupt_snapshot(
     thread.has_pending_interrupt = True
     persisted_snapshot: dict[str, object] = {
         "snapshotSeq": 3,
-        "snapshotVersion": 3,
         "messages": [],
         "todos": [],
         "mode": "plan",
@@ -691,7 +799,6 @@ async def test_get_detail_preserves_running_snapshot_without_pending_interrupts(
     thread.has_pending_interrupt = False
     running_snapshot: dict[str, object] = {
         "snapshotSeq": 1,
-        "snapshotVersion": 3,
         "messages": [],
         "todos": [],
         "mode": "default",

@@ -22,7 +22,7 @@ from wcmatch import glob as wcglob
 from .errors import TinkerFinLifecycleError
 
 CANCEL_DECISION_TYPE = "tinkerfin_cancel"
-HITL_CONTRACT_ID = "tinkerfin.deepagents.hitl-cancel.v1"
+HITL_CONTRACT_ID = "tinkerfin.deepagents.hitl-cancel"
 TINKERFIN_HITL_CONTRACT = HITL_CONTRACT_ID
 
 _SUPPORTED_DEEPAGENTS_VERSION = "0.7.5"

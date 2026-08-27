@@ -34,14 +34,27 @@ from tinkerfin_studio.conversation.schemas import (
     ConversationHistoryGroupConfig,
     ConversationHistoryListItem,
     ConversationHistoryListResponse,
+    PendingInteractionKind,
 )
 
 _HISTORY_PAGE_SIZE_MAX = 100
 _HISTORY_DAY_RANGES = (7, 30)
 _EVENT_LIMIT_MAX = 1000
-_SNAPSHOT_VERSION = 3
-_EVENT_SCHEMA_VERSION = 3
 _PROTOCOL_VERSION = "ag-ui-protocol@0.1.19"
+_SNAPSHOT_FIELDS = frozenset(
+    {
+        "snapshotSeq",
+        "messages",
+        "todos",
+        "mode",
+        "approval",
+        "runStatus",
+        "activeRunId",
+        "serverState",
+        "runs",
+        "interrupts",
+    }
+)
 
 
 class _HistoryCursorPayload(BaseModel):
@@ -82,6 +95,7 @@ def _history_item(thread: ConversationThread) -> ConversationHistoryListItem:
         messageCount=thread.message_count,
         toolCallCount=thread.tool_call_count,
         hasPendingInterrupt=thread.has_pending_interrupt,
+        pendingInteractionKind=_pending_interaction_kind(thread),
         pinned=thread.pinned,
         createdAt=thread.created_at,
         updatedAt=thread.updated_at,
@@ -96,28 +110,51 @@ def _history_schema_mismatch(reason: str) -> NoReturn:
 
 def _validated_snapshot(thread: ConversationThread) -> dict[str, JsonValue] | None:
     snapshot = thread.snapshot_json
-    if thread.snapshot_version != _SNAPSHOT_VERSION:
-        _history_schema_mismatch(
-            f"thread snapshot_version={thread.snapshot_version}, expected=3"
-        )
     if snapshot is None:
         if thread.snapshot_seq != 0:
             _history_schema_mismatch(
                 f"empty snapshot with snapshot_seq={thread.snapshot_seq}"
             )
         return None
-    if snapshot.get("snapshotVersion") != _SNAPSHOT_VERSION:
-        _history_schema_mismatch("snapshot JSON version is not 3")
+    if set(snapshot) != _SNAPSHOT_FIELDS:
+        _history_schema_mismatch("snapshot fields do not match the current contract")
     if snapshot.get("snapshotSeq") != thread.snapshot_seq:
         _history_schema_mismatch("snapshot JSON sequence does not match snapshot_seq")
     return cast(dict[str, JsonValue], snapshot)
 
 
+def _pending_interaction_kind(
+    thread: ConversationThread,
+) -> PendingInteractionKind | None:
+    """从当前可信快照生成历史列表使用的待处理交互类型"""
+
+    if not thread.has_pending_interrupt:
+        return None
+    snapshot = _validated_snapshot(thread)
+    if snapshot is None:
+        _history_schema_mismatch("pending interrupt requires a current snapshot")
+    raw_interrupts = snapshot.get("interrupts")
+    if not isinstance(raw_interrupts, list) or not raw_interrupts:
+        _history_schema_mismatch("pending interrupt summary requires interrupts")
+    reasons: list[str] = []
+    for raw_interrupt in raw_interrupts:
+        if not isinstance(raw_interrupt, dict):
+            _history_schema_mismatch("snapshot interrupt must be an object")
+        reason = raw_interrupt.get("reason")
+        if not isinstance(reason, str):
+            _history_schema_mismatch("snapshot interrupt reason must be a string")
+        reasons.append(reason)
+    unique_reasons = set(reasons)
+    if unique_reasons == {"tool_call"}:
+        return "tool_approval"
+    if len(reasons) == 1 and reasons[0] == "tinkerfin:plan_clarification":
+        return "plan_clarification"
+    if len(reasons) == 1 and reasons[0] == "tinkerfin:plan_review":
+        return "plan_review"
+    _history_schema_mismatch("pending interrupt reasons do not form one interaction")
+
+
 def _event_envelope(event: ConversationEvent) -> ConversationEventEnvelope:
-    if event.schema_version != _EVENT_SCHEMA_VERSION:
-        _history_schema_mismatch(
-            f"event schema_version={event.schema_version}, expected=3"
-        )
     if event.protocol_version != _PROTOCOL_VERSION:
         _history_schema_mismatch(
             f"event protocol_version={event.protocol_version!r}, "
@@ -204,10 +241,10 @@ class ConversationHistoryService:
             lastModel=refreshed.last_model,
             lastSeq=refreshed.last_seq,
             snapshotSeq=refreshed.snapshot_seq,
-            snapshotVersion=_SNAPSHOT_VERSION,
             messageCount=refreshed.message_count,
             toolCallCount=refreshed.tool_call_count,
             hasPendingInterrupt=refreshed.has_pending_interrupt,
+            pendingInteractionKind=_pending_interaction_kind(refreshed),
             pinned=refreshed.pinned,
             snapshot=snapshot,
             events=[_event_envelope(event) for event in events],

@@ -490,7 +490,7 @@
   }
 
   .subagent-card-head:focus-visible {
-    outline: 2px solid var(--color-focus);
+    outline: 2px solid var(--color-border-strong);
     outline-offset: 2px;
   }
 
@@ -547,7 +547,7 @@
   .tool-row > summary::-webkit-details-marker { display: none; }
 
   .tool-row > summary:focus-visible {
-    outline: 2px solid var(--color-focus);
+    outline: 2px solid var(--color-border-strong);
     outline-offset: 2px;
   }
 
@@ -986,9 +986,12 @@
     position: relative;
     display: flex;
     width: min(100%, var(--layout-composer-width));
-    max-height: min(60vh, 520px);
+    height: var(--interaction-card-height, var(--layout-interaction-card-min-height));
+    min-height: var(--layout-interaction-card-min-height);
+    max-height: var(--layout-interaction-card-max-height);
     overflow: hidden;
     flex-direction: column;
+    border: 0;
     border-radius: var(--radius-3xl);
     color: var(--color-text-primary);
     font-family: var(--font-ui);
@@ -997,16 +1000,55 @@
 
   .approval-composer,
   .plan-review-composer {
-    border: 1px solid var(--color-warning-panel-border);
     background: var(--color-layer-1);
   }
 
-  .plan-question-composer { border: 1px solid var(--color-plan-panel-border); background: var(--color-layer-1); }
+  .plan-question-composer { background: var(--color-layer-1); }
+
+  .interaction-card-resize-handle {
+    display: none;
+    position: absolute;
+    z-index: calc(var(--layer-local-raised) + 1);
+    top: -1px;
+    right: var(--radius-2xl);
+    left: var(--radius-2xl);
+    height: var(--space-3);
+    outline: 0;
+    cursor: ns-resize;
+    touch-action: none;
+    user-select: none;
+  }
+
+  .interaction-card-resize-handle::after {
+    position: absolute;
+    top: 0;
+    right: 0;
+    left: 0;
+    height: var(--space-0-5);
+    border-radius: var(--radius-pill);
+    background: var(--color-border-strong);
+    content: '';
+    opacity: 0;
+    transition: opacity var(--motion-fast) var(--ease-out);
+  }
+
+  @media (hover: hover) and (pointer: fine) {
+    .interaction-card-resize-handle { display: block; }
+  }
+
+  .interaction-card-resize-handle:focus-visible::after { opacity: 1; }
+
+  html.is-resizing-interaction-card,
+  html.is-resizing-interaction-card * {
+    cursor: ns-resize !important;
+    user-select: none !important;
+  }
 
   /* 收起态复用标准输入表面的基准高度，内容或触控热区需要时允许自然撑开 */
   .approval-composer.is-minimized,
   .plan-question-composer.is-minimized,
   .plan-review-composer.is-minimized {
+    height: auto;
     min-height: var(--layout-composer-surface-height);
     max-height: none;
   }
@@ -1030,14 +1072,14 @@
 
   .approval-composer.is-minimized .approval-composer-head,
   .plan-review-composer.is-minimized .plan-review-composer-head {
-    min-height: calc(var(--layout-composer-surface-height) - var(--space-0-5));
+    min-height: var(--layout-composer-surface-height);
     align-items: center;
     padding-top: var(--space-3);
     padding-bottom: var(--space-3);
   }
 
   .plan-question-composer.is-minimized .plan-question-composer-head {
-    min-height: calc(var(--layout-composer-surface-height) - var(--control-plan-chip) - var(--space-0-5));
+    min-height: calc(var(--layout-composer-surface-height) - var(--control-plan-chip));
     flex: 0 0 auto;
     align-items: center;
     padding-top: 0;
@@ -1057,7 +1099,7 @@
   }
 
   .approval-toggle-surface:focus-visible,
-  .plan-interaction-toggle-surface:focus-visible { outline: 2px solid var(--color-focus); outline-offset: -2px; }
+  .plan-interaction-toggle-surface:focus-visible { outline: 2px solid var(--color-border-strong); outline-offset: -2px; }
 
   .approval-composer-heading,
   .plan-question-composer-heading,
@@ -1090,6 +1132,12 @@
   .plan-review-composer-head-button:hover:not(:disabled),
   .plan-review-composer-head-button:active:not(:disabled) { border: 0; background: var(--color-hover); color: var(--color-text-primary); box-shadow: none; }
 
+  :is(.approval-composer, .plan-question-composer, .plan-review-composer)
+  .ui-button:not(.ui-icon-button):focus-visible {
+    outline: 2px solid var(--color-border-strong);
+    outline-offset: 0;
+  }
+
   .approval-status-dot {
     display: grid;
     width: var(--icon-sm);
@@ -1108,13 +1156,13 @@
 
   .approval-composer-body {
     display: grid;
+    align-content: start;
     min-height: 0;
     gap: var(--space-3);
-    flex: 0 1 auto;
+    flex: 1 1 auto;
     padding: var(--space-3) 12px var(--space-4);
     overflow-y: auto;
     overscroll-behavior: contain;
-    border-top: 1px solid var(--color-border-subtle);
   }
 
   .approval-composer-detail {
@@ -1173,7 +1221,6 @@
     flex: 0 0 auto;
     min-height: var(--control-xl);
     padding: var(--space-2) 12px var(--space-2) 18px;
-    border-top: 1px solid var(--color-border-subtle);
   }
 
   .approval-composer-feedback {
@@ -1211,11 +1258,11 @@
 
   .plan-review-composer-body {
     display: grid;
+    align-content: start;
     min-height: 0;
-    flex: 0 1 auto;
+    flex: 1 1 auto;
     overflow-y: auto;
     overscroll-behavior: contain;
-    border-top: 1px solid var(--color-border-subtle);
   }
 
   .plan-review-content {
@@ -1231,7 +1278,6 @@
     gap: var(--space-2);
     margin: 0 22px;
     padding: var(--space-3) 0;
-    border-top: 1px solid var(--color-border-subtle);
   }
 
   .plan-review-reject-button { color: var(--color-danger-text); }
@@ -1281,7 +1327,6 @@
     flex: 0 0 auto;
     min-height: var(--control-xl);
     padding: var(--space-2) 12px var(--space-2) 18px;
-    border-top: 1px solid var(--color-border-subtle);
   }
 
   .plan-review-composer-feedback {
@@ -1323,18 +1368,17 @@
   }
 
   .plan-question-progress-step:hover > span { height: var(--space-1-5); background: color-mix(in srgb, var(--color-brand) 42%, var(--color-border)); }
-  .plan-question-progress-step:focus-visible { outline: 2px solid var(--color-focus); outline-offset: -8px; }
+  .plan-question-progress-step:focus-visible { outline: 2px solid var(--color-border-strong); outline-offset: -8px; }
   .plan-question-progress-step.is-current > span { background: var(--color-brand); }
   .plan-question-progress-step.is-answered > span { background: color-mix(in srgb, var(--color-brand) 48%, var(--color-border)); }
   .plan-question-progress-step.is-skipped > span { background: var(--color-border-strong); }
 
   .plan-question-composer-body {
     min-height: 0;
-    flex: 0 1 auto;
+    flex: 1 1 auto;
     padding: var(--space-3) 12px var(--space-1);
     overflow-y: auto;
     overscroll-behavior: contain;
-    border-top: 1px solid var(--color-border-subtle);
   }
 
   .plan-question-composer-body > h3 { display: flex; align-items: flex-start; gap: var(--space-2); margin: 0 10px var(--space-2); font-size: var(--type-ui-size); font-weight: var(--weight-semibold); line-height: var(--type-title-line); }
@@ -1342,9 +1386,11 @@
   .plan-question-composer-body > h3 small { display: inline-flex; min-height: var(--type-title-line); flex: 0 0 auto; align-items: center; padding: 0 var(--space-1-5); border-radius: var(--radius-sm); background: var(--color-subtle); color: var(--color-text-secondary); font-size: var(--type-micro-size); font-weight: var(--weight-semibold); line-height: var(--type-title-line); white-space: nowrap; }
 
   .plan-question-options { display: grid; gap: 1px; width: 100%; }
+  .plan-question-selection-hint { margin: 0 10px var(--space-1); color: var(--color-text-secondary); }
   .plan-question-choice-list { display: grid; gap: 1px; width: 100%; }
   .plan-question-option,
-  .plan-question-custom {
+  .plan-question-custom,
+  .plan-question-date {
     display: grid;
     grid-template-columns: 20px minmax(0, 1fr);
     align-items: start;
@@ -1363,12 +1409,27 @@
     transition: background-color var(--motion-fast) var(--ease-out);
   }
 
-  .plan-question-option:hover,
+  label.plan-question-option { position: relative; }
+  .plan-question-native-control { position: absolute; z-index: var(--layer-local); inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+  .plan-question-option.is-disabled { color: var(--color-text-caption); cursor: not-allowed; }
+  .plan-question-option.is-disabled .plan-question-native-control { cursor: not-allowed; }
+  .plan-question-custom.is-disabled { color: var(--color-text-caption); cursor: not-allowed; }
+
+  .plan-question-option:hover:not(.is-disabled),
   .plan-question-option.is-selected,
-  .plan-question-custom:hover,
-  .plan-question-custom.is-active { border: 0; background: var(--color-hover); box-shadow: none; }
+  .plan-question-custom:hover:not(.is-disabled),
+  .plan-question-custom.is-active,
+  .plan-question-date:hover,
+  .plan-question-date.is-active { border: 0; background: var(--color-hover); box-shadow: none; }
   .plan-question-option:focus-visible,
-  .plan-question-custom:focus-within { border: 0; outline: 0; background: var(--color-hover); box-shadow: none; }
+  .plan-question-option:has(.plan-question-native-control:focus-visible) {
+    border: 0;
+    outline: 0;
+    background: var(--color-active);
+    box-shadow: none;
+  }
+  .plan-question-custom:focus-within,
+  .plan-question-date:focus-within { border: 0; outline: 0; background: var(--color-hover); box-shadow: none; }
 
   .plan-question-option-index {
     display: grid;
@@ -1393,6 +1454,17 @@
   .plan-question-custom { cursor: text; }
   .plan-question-custom textarea { width: 100%; height: var(--type-title-line); min-height: var(--type-title-line); max-height: calc(var(--type-title-line) * 3); padding: 0; resize: none; overflow-y: hidden; border: 0; outline: 0; background: transparent; color: var(--color-text-primary); font-size: var(--type-ui-size); line-height: var(--type-title-line); }
   .plan-question-custom textarea::placeholder { color: var(--color-placeholder); }
+  .plan-question-date {
+    align-items: center;
+    height: var(--control-md);
+    padding-top: 0;
+    padding-bottom: 0;
+    cursor: pointer;
+  }
+  .plan-question-date > .plan-question-option-index { margin-top: 0; }
+  .plan-question-date-copy { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: var(--space-3); font-size: var(--type-ui-size); line-height: var(--type-title-line); }
+  .plan-question-date-label { color: var(--color-text-secondary); }
+  .plan-question-date .ui-date-picker__trigger { min-width: 150px; }
 
   .plan-question-composer-footer {
     display: grid;
@@ -1402,7 +1474,6 @@
     flex: 0 0 auto;
     min-height: var(--control-xl);
     padding: var(--space-2) 12px var(--space-2) 18px;
-    border-top: 1px solid var(--color-border-subtle);
   }
 
   .plan-question-composer-pager,
@@ -1442,6 +1513,11 @@
     background: transparent;
   }
 
+  .composer-dock.is-taken-over {
+    grid-row: 3;
+    padding-top: var(--layout-interaction-card-gap);
+  }
+
   .composer-dock::before {
     position: absolute;
     z-index: var(--layer-behind);
@@ -1453,6 +1529,8 @@
     content: '';
     pointer-events: none;
   }
+
+  .composer-dock.is-taken-over::before { display: none; }
 
   .composer-dock.is-hero {
     align-self: center;
@@ -1614,7 +1692,7 @@
     .composer textarea { font-size: var(--type-body-size); }
     .approval-composer,
     .plan-question-composer,
-    .plan-review-composer { max-height: min(70vh, 560px); border-radius: var(--radius-3xl); }
+    .plan-review-composer { border-radius: var(--radius-3xl); }
     .approval-composer-head,
     .plan-question-composer-head,
     .plan-review-composer-head { padding: var(--space-3) var(--space-2) var(--space-1-5) var(--space-4); }
@@ -1669,8 +1747,10 @@
     .tool-row > summary { height: var(--control-lg); }
     .plan-question-option,
     .plan-question-custom,
+    .plan-question-date,
     .composer-model-options [role='option'],
     .composer-suggestion-item { min-height: var(--control-lg); }
+    .plan-question-date { height: var(--control-lg); }
     .plan-question-composer.is-minimized .plan-question-progress,
     .plan-question-composer.is-minimized .plan-question-progress-step { height: var(--control-lg); }
     .approval-composer-head-button,
@@ -1684,6 +1764,7 @@
     .plan-question-progress-step > span,
     .plan-question-option,
     .plan-question-custom,
+    .plan-question-date,
     .approval-toggle-surface,
     .approval-composer-head-button .ui-icon-button__icon,
     .plan-interaction-toggle-surface,
@@ -1693,11 +1774,20 @@
   }
 
   @media (forced-colors: active) {
+    .subagent-card-head:focus-visible,
+    .tool-row > summary:focus-visible,
+    .approval-toggle-surface:focus-visible,
+    .plan-interaction-toggle-surface:focus-visible,
+    .plan-question-progress-step:focus-visible,
+    :is(.approval-composer, .plan-question-composer, .plan-review-composer)
+    .ui-button:not(.ui-icon-button):focus-visible { outline: 2px solid Highlight; }
+
     .approval-rejection-form textarea:focus-visible,
     .plan-review-input textarea:focus-visible,
     .composer-attachment-remove:focus-visible { outline: 2px solid Highlight; outline-offset: 2px; }
 
     .plan-question-option:focus-visible,
+    .plan-question-option:has(.plan-question-native-control:focus-visible),
     .plan-question-custom:focus-within { outline: 2px solid Highlight; outline-offset: -2px; }
 
     .user-message .message-markdown,
@@ -1719,6 +1809,11 @@
     .approval-composer-head,
     .plan-question-composer-head,
     .plan-review-composer-head { background: Canvas; }
+    :is(.approval-composer, .plan-question-composer, .plan-review-composer) {
+      outline: 1px solid ButtonText;
+      outline-offset: -1px;
+    }
+    .interaction-card-resize-handle:focus-visible::after { background: Highlight; }
     .approval-status-dot::before { background: ButtonText; }
     .approval-allow-button { border-color: ButtonText; background: ButtonText; color: Canvas; }
 
@@ -1756,6 +1851,7 @@
     .tool-row-icon,
     .tool-row-chevron,
     .plan-option,
+    .interaction-card-resize-handle::after,
     .composer {
       transition: none;
     }

@@ -281,6 +281,34 @@ describe('useConversationScroll', () => {
     expect(result.current.showScrollToBottom).toBe(true)
   })
 
+  it('布局缩小会话视口时保持底部跟随，只有用户滚动才能退出', () => {
+    const { result } = renderHook(() => useConversationScroll({ conversation, isRunning: false }))
+    const pane = document.createElement('section')
+    Object.defineProperties(pane, {
+      clientHeight: { configurable: true, value: 400 },
+      scrollHeight: { configurable: true, value: 1200 },
+      scrollTop: { configurable: true, writable: true, value: 800 },
+    })
+    result.current.paneRef.current = pane
+
+    act(() => result.current.handleScroll(pane))
+    act(() => vi.advanceTimersByTime(0))
+    Object.defineProperty(pane, 'clientHeight', { configurable: true, value: 200 })
+    act(() => result.current.handleScroll(pane))
+    act(() => vi.advanceTimersByTime(0))
+    act(() => result.current.syncToBottomIfFollowing())
+    expect(pane.scrollTop).toBe(1200)
+
+    pane.scrollTop = 600
+    act(() => {
+      result.current.markUserScrollIntent()
+      result.current.handleScroll(pane)
+    })
+    act(() => vi.advanceTimersByTime(0))
+    act(() => result.current.syncToBottomIfFollowing())
+    expect(pane.scrollTop).toBe(600)
+  })
+
   it('待审批出现时仅一次滚到底部，之后保留用户手动位置', () => {
     const { result, rerender } = renderHook(
       ({ currentConversation }) => useConversationScroll({

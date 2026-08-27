@@ -1,4 +1,4 @@
-"""Generic, versioned runtime interrupts that map losslessly to AG-UI."""
+"""Generic runtime interrupts that map losslessly to AG-UI."""
 
 from __future__ import annotations
 
@@ -6,22 +6,23 @@ from collections.abc import Mapping
 from typing import Annotated, Literal, cast
 
 from ag_ui.core import Interrupt as AgUiInterrupt
-from pydantic import Field, JsonValue, StringConstraints
+from pydantic import Field, JsonValue, StringConstraints, field_validator
 
+from ._json_schema import SchemaError, require_valid_schema
 from .models import AgentRuntimeInterrupt, RuntimeModel
 from .reasoning import sanitize_public_data
 
-RUNTIME_INTERRUPT_SCHEMA = "tinkerfin.runtime-interrupt.v1"
-_RUNTIME_INTERRUPT_SCHEMA_PREFIX = "tinkerfin.runtime-interrupt."
+RUNTIME_INTERRUPT_SCHEMA = "tinkerfin.runtime-interrupt"
+_RUNTIME_INTERRUPT_SCHEMA_FAMILY = f"{RUNTIME_INTERRUPT_SCHEMA}."
 
 
 class RuntimeInterruptEnvelope(RuntimeModel):
     """Serializable human-input request emitted by a framework workflow."""
 
-    schema_id: Literal["tinkerfin.runtime-interrupt.v1"] = Field(
+    schema_id: Literal["tinkerfin.runtime-interrupt"] = Field(
         default=RUNTIME_INTERRUPT_SCHEMA,
         alias="schema",
-        description="Runtime interrupt envelope schema version",
+        description="Current runtime interrupt envelope contract",
     )
     kind: Annotated[
         str,
@@ -45,14 +46,28 @@ class RuntimeInterruptEnvelope(RuntimeModel):
         description="Trusted workflow metadata needed to validate a resume",
     )
 
+    @field_validator("response_schema")
+    @classmethod
+    def response_schema_is_valid(
+        cls,
+        value: dict[str, JsonValue],
+    ) -> dict[str, JsonValue]:
+        """Reject malformed response contracts before publishing an interrupt."""
+
+        try:
+            require_valid_schema(value)
+        except SchemaError as error:
+            raise ValueError("response_schema is not valid") from error
+        return value
+
 
 class PersistedRuntimeInterrupt(RuntimeModel):
     """Correlation persisted in an AG-UI interrupt for a later request."""
 
-    schema_id: Literal["tinkerfin.runtime-interrupt.v1"] = Field(
+    schema_id: Literal["tinkerfin.runtime-interrupt"] = Field(
         default=RUNTIME_INTERRUPT_SCHEMA,
         alias="schema",
-        description="Persisted runtime correlation schema version",
+        description="Current persisted runtime correlation contract",
     )
     native_interrupt_id: str = Field(
         min_length=1,
@@ -70,8 +85,9 @@ def parse_runtime_interrupt(value: JsonValue) -> RuntimeInterruptEnvelope | None
         return None
     mapping = cast(Mapping[object, object], value)
     schema = mapping.get("schema")
-    if not isinstance(schema, str) or not schema.startswith(
-        _RUNTIME_INTERRUPT_SCHEMA_PREFIX
+    if not isinstance(schema, str) or (
+        schema != RUNTIME_INTERRUPT_SCHEMA
+        and not schema.startswith(_RUNTIME_INTERRUPT_SCHEMA_FAMILY)
     ):
         return None
     return RuntimeInterruptEnvelope.model_validate(value)
@@ -85,20 +101,22 @@ def prepare_runtime_ag_ui_interrupt(
 ) -> AgUiInterrupt:
     """Project one validated runtime envelope to one resumable AG-UI interrupt."""
 
+    published = envelope.model_copy(deep=True)
+    require_valid_schema(published.response_schema)
     public_value = sanitize_public_data(
-        envelope.model_dump(mode="python", by_alias=True, exclude_none=False)
+        published.model_dump(mode="python", by_alias=True, exclude_none=False)
     )
     if not isinstance(public_value, dict):
         raise TypeError("runtime interrupt envelope must serialize to an object")
     correlation = PersistedRuntimeInterrupt(
         native_interrupt_id=native.id,
-        envelope=envelope,
+        envelope=published,
     )
     return AgUiInterrupt(
         id=native.id,
-        reason=envelope.kind,
-        message=envelope.message,
-        response_schema=envelope.response_schema,
+        reason=published.kind,
+        message=published.message,
+        response_schema=published.response_schema,
         metadata={
             "langgraphValue": public_value,
             "source": dict(source),

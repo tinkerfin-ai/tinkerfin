@@ -5,6 +5,12 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
+PendingInteractionKind = Literal[
+    "tool_approval",
+    "plan_clarification",
+    "plan_review",
+]
+
 
 class ConversationHistoryListItem(BaseModel):
     """历史列表中的会话摘要"""
@@ -21,6 +27,10 @@ class ConversationHistoryListItem(BaseModel):
     message_count: int = Field(alias="messageCount", ge=0)
     tool_call_count: int = Field(alias="toolCallCount", ge=0)
     has_pending_interrupt: bool = Field(alias="hasPendingInterrupt")
+    pending_interaction_kind: PendingInteractionKind | None = Field(
+        alias="pendingInteractionKind",
+        description="待处理交互的业务类型；无待处理 interrupt 时为 null",
+    )
     pinned: bool
     created_at: datetime = Field(alias="createdAt")
     updated_at: datetime = Field(
@@ -64,7 +74,7 @@ class ConversationEventEnvelope(BaseModel):
 
 
 class ConversationHistoryDetail(BaseModel):
-    """单个会话的 v3 快照和尾部事件"""
+    """单个会话的当前快照和尾部事件"""
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -76,10 +86,13 @@ class ConversationHistoryDetail(BaseModel):
     last_model: str | None = Field(default=None, alias="lastModel")
     last_seq: int = Field(alias="lastSeq", ge=0)
     snapshot_seq: int = Field(alias="snapshotSeq", ge=0)
-    snapshot_version: Literal[3] = Field(alias="snapshotVersion")
     message_count: int = Field(alias="messageCount", ge=0)
     tool_call_count: int = Field(alias="toolCallCount", ge=0)
     has_pending_interrupt: bool = Field(alias="hasPendingInterrupt")
+    pending_interaction_kind: PendingInteractionKind | None = Field(
+        alias="pendingInteractionKind",
+        description="待处理交互的业务类型；无待处理 interrupt 时为 null",
+    )
     pinned: bool
     snapshot: dict[str, JsonValue] | None
     events: list[ConversationEventEnvelope]

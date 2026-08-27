@@ -133,7 +133,6 @@ class ConversationProjector:
                 seq=envelope.seq,
                 event_id=envelope.message_id,
                 event_type=event_type,
-                schema_version=3,
                 protocol_version="ag-ui-protocol@0.1.19",
                 event_json=event_json,
                 event_text=event_text,
@@ -555,15 +554,21 @@ class ConversationProjector:
                     conversation_thread_id=thread_pk,
                     run_id=run_id,
                     interrupt_id=interrupt_id,
+                    status="pending",
+                    reason=str(value.get("reason", "tool_call")),
+                    message=(
+                        value.get("message")
+                        if isinstance(value.get("message"), str)
+                        else None
+                    ),
+                    request_json=value,
                     created_at=created_at,
+                    updated_at=created_at,
                 )
                 self._session.add(entity)
-            entity.status = "pending"
-            entity.reason = str(value.get("reason", "tool_call"))
-            message = value.get("message")
-            entity.message = message if isinstance(message, str) else None
-            entity.request_json = value
-            entity.updated_at = created_at
+                continue
+            if entity.run_id != run_id or entity.request_json != value:
+                raise RuntimeError("同一 interruptId 的公开请求内容不一致")
 
     async def _resume_is_settled(
         self,

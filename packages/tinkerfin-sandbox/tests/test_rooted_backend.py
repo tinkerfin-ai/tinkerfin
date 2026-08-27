@@ -108,7 +108,7 @@ class _RecordingBackend:
         *,
         timeout: int | None = None,
     ) -> ExecuteResponse:
-        if "tinkerfin.rooted.v1" in command:
+        if "invalid_request" in command:
             return self._rooted_helper_response(command, is_async=False)
         if self.guard_results and "commonpath" in command:
             self.guard_commands.append(command)
@@ -246,7 +246,6 @@ class _RecordingBackend:
         return ExecuteResponse(
             output=json.dumps(
                 {
-                    "version": request["version"],
                     "request_id": request["request_id"],
                     "operation": operation,
                     "status": status,
@@ -276,7 +275,7 @@ class _RecordingBackend:
         timeout: int | None = None,
     ) -> ExecuteResponse:
         self.async_execute_calls.append((command, timeout))
-        if "tinkerfin.rooted.v1" in command:
+        if "invalid_request" in command:
             return self._rooted_helper_response(command, is_async=True)
         return self.execute(command, timeout=timeout)
 

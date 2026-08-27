@@ -115,7 +115,7 @@ async def test_native_and_agui_streams_wrap_without_runtime_parameters() -> None
         )
         assert isinstance(native_source, NativeGraphRunStream)
         assert native_source.messaging_identity is native_identity
-        assert native_source.messaging_codec_profile == "langgraph.stream-part.v2.v1"
+        assert native_source.messaging_codec_profile == "langgraph.stream-part.v2"
         assert native_source.messaging_source_type is Mapping
         assert native_source.messaging_replay_type is NativeStreamPart
         native = await native_channel.wrap(
@@ -129,7 +129,7 @@ async def test_native_and_agui_streams_wrap_without_runtime_parameters() -> None
             InputAgentState(messages=[HumanMessage(content="AG-UI")])
         )
         assert event_source.messaging_identity is agui_identity
-        assert event_source.messaging_codec_profile == "agui.event.v1"
+        assert event_source.messaging_codec_profile == "agui.event"
         agui = await agui_channel.wrap(
             event_source,
             after=0,

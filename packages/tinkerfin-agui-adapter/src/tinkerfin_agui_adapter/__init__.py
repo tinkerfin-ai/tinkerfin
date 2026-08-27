@@ -1,5 +1,9 @@
 """Deep Agents v2 to AG-UI 0.1.19 conversion primitives."""
 
+from ._json_schema import require_valid_schema as require_valid_schema
+from ._json_schema import (
+    validate_json_schema_instance as validate_json_schema_instance,
+)
 from .adapter import DeepAgentAgUiAdapter as DeepAgentAgUiAdapter
 from .contracts import AgentRunOutcome as AgentRunOutcome
 from .contracts import Identity as Identity
@@ -69,5 +73,7 @@ __all__ = [
     "encode_sse",
     "micro_batch",
     "parse_tool_review_interrupt",
+    "require_valid_schema",
     "subagent_invocation_id",
+    "validate_json_schema_instance",
 ]

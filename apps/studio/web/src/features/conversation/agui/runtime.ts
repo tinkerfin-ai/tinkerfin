@@ -5,6 +5,7 @@ import type {
   ChatResumeEntry,
   ConversationAgUiEvent,
   InterruptEvent,
+  PlanClarificationAnswer,
   RawEventContext,
 } from "../../../api/conversation/types"
 import { parseConversationAgUiEvent } from "../../../api/conversation/eventParser"
@@ -27,6 +28,7 @@ import type {
   JsonValue,
   MarkdownPlanDraft,
   Message,
+  PlanQuestionItem,
   TodoItem,
   TodoStatus,
 } from "../../../types"
@@ -156,15 +158,43 @@ interface PlanInterruptLike {
   metadata?: JsonObject | null
 }
 
+const jsonValuesEqual = (left: unknown, right: unknown): boolean => {
+  if (left === null || right === null || typeof left !== 'object' || typeof right !== 'object') {
+    return Object.is(left, right)
+  }
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return Array.isArray(left)
+      && Array.isArray(right)
+      && left.length === right.length
+      && left.every((item, index) => jsonValuesEqual(item, right[index]))
+  }
+  const leftObject = left as Record<string, unknown>
+  const rightObject = right as Record<string, unknown>
+  const leftKeys = Object.keys(leftObject)
+  const rightKeys = Object.keys(rightObject)
+  return leftKeys.length === rightKeys.length
+    && leftKeys.every((key) => Object.hasOwn(rightObject, key)
+      && jsonValuesEqual(leftObject[key], rightObject[key]))
+}
+
 const runtimeEnvelopeMetadata = (interrupt: PlanInterruptLike): JsonObject | null => {
   const runtimeInterrupt = interrupt.metadata?.runtimeInterrupt
-  if (!runtimeInterrupt || typeof runtimeInterrupt !== 'object' || Array.isArray(runtimeInterrupt)) return null
+  if (!isJsonObject(runtimeInterrupt)) return null
+  if (
+    runtimeInterrupt.schema !== 'tinkerfin.runtime-interrupt'
+    || runtimeInterrupt.nativeInterruptId !== interrupt.id
+  ) return null
   const envelope = runtimeInterrupt.envelope
-  if (!envelope || typeof envelope !== 'object' || Array.isArray(envelope)) return null
+  if (!isJsonObject(envelope)) return null
+  if (
+    envelope.schema !== 'tinkerfin.runtime-interrupt'
+    || envelope.kind !== interrupt.reason
+    || !isJsonObject(envelope.responseSchema)
+    || !isJsonObject(interrupt.responseSchema)
+    || !jsonValuesEqual(envelope.responseSchema, interrupt.responseSchema)
+  ) return null
   const metadata = envelope.metadata
-  return metadata && typeof metadata === 'object' && !Array.isArray(metadata)
-    ? metadata as JsonObject
-    : null
+  return isJsonObject(metadata) ? metadata : null
 }
 
 const isStringWithinLength = (value: unknown, maximum: number): value is string => {
@@ -175,6 +205,146 @@ const isStringWithinLength = (value: unknown, maximum: number): value is string 
 
 const invalidPlanInteraction = (): never => {
   throw new Error('Plan interrupt 载荷不符合 Studio 契约')
+}
+
+const isJsonObject = (value: unknown): value is JsonObject => (
+  Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+)
+
+const hasOnlyKeys = (value: JsonObject, keys: readonly string[]) => {
+  const actual = Object.keys(value).sort()
+  const expected = [...keys].sort()
+  return actual.length === expected.length
+    && actual.every((key, index) => key === expected[index])
+}
+
+const hasNoUnknownKeys = (value: object, keys: readonly string[]) => {
+  const allowed = new Set(keys)
+  return Object.keys(value).every((key) => allowed.has(key))
+}
+
+const CLARIFICATION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
+const isClarificationId = (value: unknown): value is string => (
+  typeof value === 'string' && CLARIFICATION_ID.test(value)
+)
+const isNonBlankString = (value: unknown): value is string => (
+  typeof value === 'string' && value.trim().length > 0
+)
+
+const parsePlanQuestionOptions = (value: unknown) => {
+  if (!Array.isArray(value)) return null
+  const options = value.flatMap((rawOption) => {
+    if (!isJsonObject(rawOption)) return []
+    if (!isClarificationId(rawOption.id) || !isNonBlankString(rawOption.label)) return []
+    if (
+      rawOption.description !== null
+      && rawOption.description !== undefined
+      && !isNonBlankString(rawOption.description)
+    ) return []
+    const attributes = rawOption.attributes
+    if (!isJsonObject(attributes) || typeof attributes.recommended !== 'boolean') return []
+    return [{
+      id: rawOption.id,
+      label: rawOption.label,
+      description: typeof rawOption.description === 'string' ? rawOption.description : null,
+      recommended: attributes.recommended,
+      attributes,
+    }]
+  })
+  return options.length === value.length
+    && new Set(options.map((option) => option.id)).size === options.length
+    ? options
+    : null
+}
+
+const parsePlanQuestions = (value: unknown): PlanQuestionItem[] | null => {
+  if (!Array.isArray(value)) return null
+  const questions = value.flatMap<PlanQuestionItem>((rawQuestion) => {
+    if (!isJsonObject(rawQuestion)) return []
+    if (
+      !isClarificationId(rawQuestion.id)
+      || !isNonBlankString(rawQuestion.prompt)
+      || typeof rawQuestion.required !== 'boolean'
+      || typeof rawQuestion.answerType !== 'string'
+    ) return []
+    const attributes = rawQuestion.attributes
+    if (attributes !== undefined && attributes !== null && !isJsonObject(attributes)) return []
+    const common = {
+      id: rawQuestion.id,
+      prompt: rawQuestion.prompt,
+      required: rawQuestion.required,
+      attributes: attributes as JsonObject | null | undefined,
+    }
+    if (rawQuestion.answerType === 'single_choice') {
+      const options = parsePlanQuestionOptions(rawQuestion.options)
+      if (
+        !options
+        || options.length === 0
+        || typeof rawQuestion.allowFreeText !== 'boolean'
+        || !options[0]?.recommended
+        || options.slice(1).some((option) => option.recommended)
+      ) return []
+      return [{
+        ...common,
+        answerType: 'single_choice',
+        options,
+        allowFreeText: rawQuestion.allowFreeText,
+      }]
+    }
+    if (rawQuestion.answerType === 'multiple_choice') {
+      const options = parsePlanQuestionOptions(rawQuestion.options)
+      const minimum = rawQuestion.minSelections
+      const maximum = rawQuestion.maxSelections
+      if (
+        !options
+        || options.length < 2
+        || typeof rawQuestion.allowFreeText !== 'boolean'
+        || !Number.isInteger(minimum)
+        || (minimum as number) < 1
+        || (maximum !== null && maximum !== undefined && !Number.isInteger(maximum))
+      ) return []
+      const capacity = options.length + Number(rawQuestion.allowFreeText)
+      if (
+        (minimum as number) > capacity
+        || (maximum !== null && maximum !== undefined && (
+          (maximum as number) < (minimum as number) || (maximum as number) > capacity
+        ))
+      ) return []
+      return [{
+        ...common,
+        answerType: 'multiple_choice',
+        options,
+        allowFreeText: rawQuestion.allowFreeText,
+        minSelections: minimum as number,
+        maxSelections: maximum as number | null | undefined,
+        selectedOptionIds: [],
+      }]
+    }
+    if (rawQuestion.answerType === 'text') {
+      return [{ ...common, answerType: 'text' }]
+    }
+    if (rawQuestion.answerType === 'date') {
+      return [{ ...common, answerType: 'date' }]
+    }
+    return []
+  })
+  return questions.length === value.length
+    && questions.length > 0
+    && new Set(questions.map((question) => question.id)).size === questions.length
+    ? questions
+    : null
+}
+
+const isIsoCalendarDate = (value: string) => {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value)
+  if (!match) return false
+  const year = Number(match[1])
+  const month = Number(match[2])
+  const day = Number(match[3])
+  if (year < 1 || month < 1 || month > 12) return false
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0)
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+  return day >= 1 && day <= (daysInMonth[month - 1] ?? 0)
 }
 
 const planInteractionFromInterrupts = (
@@ -194,65 +364,16 @@ const planInteractionFromInterrupts = (
   if (interrupt.reason === 'tinkerfin:plan_clarification') {
     const clarification = metadata.clarification
     if (!clarification || typeof clarification !== 'object' || Array.isArray(clarification)) return invalidPlanInteraction()
-    if (clarification.schema !== 'tinkerfin.plan-clarification.v2') return invalidPlanInteraction()
+    if (!hasOnlyKeys(clarification as JsonObject, ['form'])) return invalidPlanInteraction()
     const form = clarification.form
     if (!form || typeof form !== 'object' || Array.isArray(form)) return invalidPlanInteraction()
     if (
-      form.schemaVersion !== 2
+      !hasOnlyKeys(form as JsonObject, ['description', 'questions', 'title'])
       || !isStringWithinLength(form.title, 20)
       || !isStringWithinLength(form.description, 60)
-      || !Array.isArray(form.questions)
     ) return invalidPlanInteraction()
-    const questions = form.questions.flatMap((rawQuestion) => {
-      if (!rawQuestion || typeof rawQuestion !== 'object' || Array.isArray(rawQuestion)) return []
-      const question = rawQuestion as JsonObject
-      if (
-        typeof question.id !== 'string'
-        || typeof question.prompt !== 'string'
-        || typeof question.required !== 'boolean'
-        || typeof question.allowFreeText !== 'boolean'
-      ) return []
-      const questionAttributes = question.attributes
-      if (
-        questionAttributes !== undefined
-        && questionAttributes !== null
-        && (typeof questionAttributes !== 'object' || Array.isArray(questionAttributes))
-      ) return []
-      const options = Array.isArray(question.options)
-        ? question.options.flatMap((rawOption) => {
-            if (!rawOption || typeof rawOption !== 'object' || Array.isArray(rawOption)) return []
-            const option = rawOption as JsonObject
-            if (typeof option.id !== 'string' || typeof option.label !== 'string') return []
-            const optionAttributes = option.attributes
-            if (
-              !optionAttributes
-              || typeof optionAttributes !== 'object'
-              || Array.isArray(optionAttributes)
-              || typeof optionAttributes.recommended !== 'boolean'
-            ) return []
-            return [{
-              id: option.id,
-              label: option.label,
-              description: typeof option.description === 'string' ? option.description : null,
-              recommended: optionAttributes.recommended,
-              attributes: optionAttributes as JsonObject,
-            }]
-          })
-        : []
-      if (
-        options.length > 0
-        && (!options[0]?.recommended || options.slice(1).some((option) => option.recommended))
-      ) return []
-      return [{
-        id: question.id,
-        prompt: question.prompt,
-        required: question.required,
-        options,
-        allowFreeText: question.allowFreeText,
-        attributes: questionAttributes as JsonObject | null | undefined,
-      }]
-    })
-    if (questions.length !== form.questions.length || questions.length === 0) return invalidPlanInteraction()
+    const questions = parsePlanQuestions(form.questions)
+    if (!questions) return invalidPlanInteraction()
     return {
       kind: 'questions',
       interruptId: interrupt.id,
@@ -271,7 +392,7 @@ const planInteractionFromInterrupts = (
       !review
       || typeof review !== 'object'
       || Array.isArray(review)
-      || review.schema !== 'tinkerfin.plan-review.v1'
+      || !hasOnlyKeys(review as JsonObject, ['draft'])
     ) return invalidPlanInteraction()
     const draft = review.draft
     if (
@@ -282,20 +403,22 @@ const planInteractionFromInterrupts = (
     const contentSchema = draft.contentSchema
     const content = draft.content
     if (
-      draft.schemaVersion !== 1
+      !hasOnlyKeys(draft as JsonObject, ['content', 'contentSchema', 'revision'])
       || typeof draft.revision !== 'number'
       || !Number.isInteger(draft.revision)
       || draft.revision < 1
       || !contentSchema
       || typeof contentSchema !== 'object'
       || Array.isArray(contentSchema)
-      || contentSchema.id !== 'tinkerfin.plan.markdown.v1'
+      || !hasOnlyKeys(contentSchema as JsonObject, ['fingerprint', 'mediaType'])
       || contentSchema.mediaType !== 'text/markdown'
       || typeof contentSchema.fingerprint !== 'string'
       || !/^[0-9a-f]{64}$/.test(contentSchema.fingerprint)
       || !content
       || typeof content !== 'object'
       || Array.isArray(content)
+      || !hasOnlyKeys(content as JsonObject, ['description', 'markdown'])
+      || !isStringWithinLength(content.description, 80)
       || typeof content.markdown !== 'string'
       || !content.markdown.trim()
     ) return invalidPlanInteraction()
@@ -673,20 +796,72 @@ export const buildPlanResumePayload = (
 
   let payload: ChatResumeEntry['payload']
   if (interaction.kind === 'questions') {
-    const answers = interaction.questions.map((question) => {
-      const option = question.options.find((item) => item.id === question.selectedOptionId)
-      const customAnswer = question.customAnswer?.trim() ?? ''
-      if (!option && !customAnswer && question.required) {
-        throw new ConversationError("plan_required_answers_missing")
+    const answers: Record<string, PlanClarificationAnswer> = {}
+    interaction.questions.forEach((question) => {
+      if (question.skipped) {
+        if (question.required) throw new ConversationError("plan_required_answers_missing")
+        answers[question.id] = { status: 'skipped' }
+        return
       }
-      if (customAnswer && !question.allowFreeText) {
-        throw new ConversationError("plan_option_required")
+      if (question.answerType === 'single_choice') {
+        const option = question.options.find((item) => item.id === question.selectedOptionId)
+        const customAnswer = question.customAnswer?.trim() ?? ''
+        if (!option && !customAnswer) {
+          if (question.required) throw new ConversationError("plan_required_answers_missing")
+          answers[question.id] = { status: 'skipped' }
+          return
+        }
+        if (customAnswer && !question.allowFreeText) {
+          throw new ConversationError("plan_option_required")
+        }
+        answers[question.id] = option
+          ? { status: 'answered', answerType: 'single_choice', optionId: option.id }
+          : { status: 'answered', answerType: 'single_choice', customAnswer }
+        return
       }
-      return option
-        ? { questionId: question.id, optionId: option.id }
-        : customAnswer
-          ? { questionId: question.id, answer: customAnswer }
-          : { questionId: question.id, skipped: true as const }
+      if (question.answerType === 'multiple_choice') {
+        const knownIds = new Set(question.options.map((option) => option.id))
+        const optionIds = [...new Set(question.selectedOptionIds)].filter((id) => knownIds.has(id))
+        const customAnswer = question.customAnswer?.trim() ?? ''
+        const count = optionIds.length + Number(Boolean(customAnswer))
+        const maximum = question.maxSelections
+          ?? question.options.length + Number(question.allowFreeText)
+        if (count === 0) {
+          if (question.required) throw new ConversationError("plan_required_answers_missing")
+          answers[question.id] = { status: 'skipped' }
+          return
+        }
+        if (
+          (customAnswer && !question.allowFreeText)
+          || count < question.minSelections
+          || count > maximum
+        ) throw new ConversationError("plan_answer_invalid")
+        answers[question.id] = {
+          status: 'answered',
+          answerType: 'multiple_choice',
+          optionIds,
+          ...(customAnswer ? { customAnswer } : {}),
+        }
+        return
+      }
+      if (question.answerType === 'text') {
+        const answer = question.answer?.trim() ?? ''
+        if (!answer) {
+          if (question.required) throw new ConversationError("plan_required_answers_missing")
+          answers[question.id] = { status: 'skipped' }
+          return
+        }
+        answers[question.id] = { status: 'answered', answerType: 'text', answer }
+        return
+      }
+      const date = question.date?.trim() ?? ''
+      if (!date) {
+        if (question.required) throw new ConversationError("plan_required_answers_missing")
+        answers[question.id] = { status: 'skipped' }
+        return
+      }
+      if (!isIsoCalendarDate(date)) throw new ConversationError("plan_answer_invalid")
+      answers[question.id] = { status: 'answered', answerType: 'date', date }
     })
     payload = { type: 'respond', answers }
   } else {
@@ -761,7 +936,6 @@ export const markConversationDetached = (
     {
       ...conversation,
       runStatus: "detached",
-      approval: conversation.approval ? { ...conversation.approval, submitted: false } : conversation.approval,
     },
     reason,
     "info",
@@ -1305,15 +1479,31 @@ export const applyConversationEvent = (
 }
 
 // ---------------------------------------------------------------------------
-// 历史恢复：v3 快照与严格有序的尾部事件
+// 历史恢复：当前快照与严格有序的尾部事件
 // ---------------------------------------------------------------------------
 
 const currentSnapshot = (
   detail: ConversationHistoryDetail,
 ): ConversationSnapshotJson | null => {
-  if (detail.snapshotVersion !== 3) {
-    throw new Error("会话历史只接受 snapshotVersion=3")
-  }
+  if (!hasNoUnknownKeys(detail, [
+    'createdAt',
+    'events',
+    'hasPendingInterrupt',
+    'id',
+    'lastModel',
+    'lastRunId',
+    'lastSeq',
+    'messageCount',
+    'pendingInteractionKind',
+    'pinned',
+    'snapshot',
+    'snapshotSeq',
+    'status',
+    'threadId',
+    'title',
+    'toolCallCount',
+    'updatedAt',
+  ])) throw new Error("会话历史详情字段不符合当前契约")
   if (detail.lastSeq < detail.snapshotSeq) {
     throw new Error("会话历史 lastSeq 不能小于 snapshotSeq")
   }
@@ -1324,9 +1514,18 @@ const currentSnapshot = (
     }
     return null
   }
-  if (snapshot.snapshotVersion !== 3) {
-    throw new Error("会话历史快照只接受 snapshotVersion=3")
-  }
+  if (!hasOnlyKeys(snapshot as unknown as JsonObject, [
+    'activeRunId',
+    'approval',
+    'interrupts',
+    'messages',
+    'mode',
+    'runStatus',
+    'runs',
+    'serverState',
+    'snapshotSeq',
+    'todos',
+  ])) throw new Error("会话历史快照字段不符合当前契约")
   if (snapshot.snapshotSeq !== detail.snapshotSeq) {
     throw new Error("会话历史快照序号与详情不一致")
   }
@@ -1342,10 +1541,10 @@ const messagesFromSnapshot = (snapshot: ConversationSnapshotJson | null | undefi
 }
 
 /**
- * 按版本化历史契约恢复持久化会话
+ * 按当前历史契约恢复持久化会话
  *
- * v3 快照包含完整 UI 投影，只回放 `snapshotSeq` 之后的事件；新会话允许
- * `snapshot=null` 与 `snapshotSeq=0`，其他版本或序号矛盾直接拒绝
+ * 当前快照包含完整 UI 投影，只回放 `snapshotSeq` 之后的事件；新会话允许
+ * `snapshot=null` 与 `snapshotSeq=0`，字段或序号矛盾直接拒绝
  */
 export const restoreConversationFromHistory = (
   detail: ConversationHistoryDetail,

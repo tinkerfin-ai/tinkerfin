@@ -1,6 +1,6 @@
 import type { AuthSessionResponse, AuthUser, LoginResponse } from '../api/auth/types'
 
-export const AUTH_SESSION_STORAGE_KEY = 'tinkerfin.auth.session.v1'
+export const AUTH_SESSION_STORAGE_KEY = 'tinkerfin.auth.session'
 
 export interface AuthSession {
   token: string
@@ -65,11 +65,19 @@ function getLocalStorage(): Storage | null {
 
 function normalizeAuthUser(value: unknown): AuthUser | null {
   if (!value || typeof value !== 'object') return null
+  if (Object.keys(value).sort().join('\0') !== [
+    'avatar_url',
+    'disabled',
+    'display_name',
+    'roles',
+    'user_id',
+    'username',
+  ].join('\0')) return null
   const candidate = value as Partial<AuthUser>
   if (!(typeof candidate.user_id === 'number'
     && typeof candidate.username === 'string'
     && typeof candidate.display_name === 'string'
-    && (candidate.avatar_url == null || typeof candidate.avatar_url === 'string')
+    && (candidate.avatar_url === null || typeof candidate.avatar_url === 'string')
     && Array.isArray(candidate.roles)
     && candidate.roles.every((role) => typeof role === 'string')
     && typeof candidate.disabled === 'boolean')) return null
@@ -77,7 +85,7 @@ function normalizeAuthUser(value: unknown): AuthUser | null {
     user_id: candidate.user_id,
     username: candidate.username,
     display_name: candidate.display_name,
-    avatar_url: candidate.avatar_url ?? null,
+    avatar_url: candidate.avatar_url,
     roles: candidate.roles,
     disabled: candidate.disabled,
   }
@@ -85,6 +93,12 @@ function normalizeAuthUser(value: unknown): AuthUser | null {
 
 function normalizeAuthSession(value: unknown): AuthSession | null {
   if (!value || typeof value !== 'object') return null
+  if (Object.keys(value).sort().join('\0') !== [
+    'expiresAt',
+    'token',
+    'tokenType',
+    'user',
+  ].join('\0')) return null
   const candidate = value as Partial<AuthSession>
   const user = normalizeAuthUser(candidate.user)
   if (!(typeof candidate.token === 'string'

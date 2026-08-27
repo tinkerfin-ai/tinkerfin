@@ -43,12 +43,24 @@ describe('active run session', () => {
 
   it('rejects a persisted protocol message without its required ID', () => {
     window.sessionStorage.setItem('tinkerfin:active-conversation-run', JSON.stringify({
-      schemaVersion: 1,
       threadId: 'thread-active',
       payload: {
         ...payload,
         messages: [{ role: 'user', content: 'invalid' }],
       },
+      mode: 'start',
+      lastSeq: 1,
+    }))
+
+    expect(readActiveRunSession()).toBeNull()
+    expect(window.sessionStorage.getItem('tinkerfin:active-conversation-run')).toBeNull()
+  })
+
+  it('rejects the removed versioned storage shape', () => {
+    window.sessionStorage.setItem('tinkerfin:active-conversation-run', JSON.stringify({
+      schemaVersion: 1,
+      threadId: 'thread-active',
+      payload,
       mode: 'start',
       lastSeq: 1,
     }))

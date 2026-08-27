@@ -57,6 +57,7 @@ class PlanHandoffPhase(StrEnum):
 
 class _PlanModel(BaseModel):
     model_config = ConfigDict(
+        allow_inf_nan=False,
         alias_generator=to_camel,
         extra="forbid",
         frozen=True,
@@ -67,7 +68,6 @@ class _PlanModel(BaseModel):
 class PlanContentModel(_PlanModel):
     """Base for one immutable, host-selectable Plan content contract."""
 
-    schema_id: ClassVar[str | None] = None
     media_type: ClassVar[str] = "application/json"
 
 
@@ -87,8 +87,6 @@ class StructuredPlanStep(_PlanModel):
 
 class StructuredPlanContent(PlanContentModel):
     """Built-in structured Plan content used when no host schema is selected."""
-
-    schema_id = "tinkerfin.plan.structured.v1"
 
     goal: NonBlankText = Field(description="Operational goal of the Plan")
     assumptions: tuple[NonBlankText, ...] = Field(
@@ -117,7 +115,6 @@ class StructuredPlanContent(PlanContentModel):
 class MarkdownPlanContent(PlanContentModel):
     """Built-in Markdown Plan content preserved without whitespace rewriting."""
 
-    schema_id = "tinkerfin.plan.markdown.v1"
     media_type = "text/markdown"
 
     markdown: str = Field(description="Complete Markdown Plan shown to the user")
@@ -133,9 +130,8 @@ class MarkdownPlanContent(PlanContentModel):
 
 
 class PlanSchemaReference(_PlanModel):
-    """Stable public identity for the content schema bound to one Plan draft."""
+    """Exact current content contract bound to one Plan draft."""
 
-    id: NonBlankText = Field(description="Stable host-selected content schema ID")
     fingerprint: PlanDigest = Field(
         description="SHA-256 of the canonical content JSON Schema"
     )
@@ -148,12 +144,8 @@ PlanContentT = TypeVar("PlanContentT", bound=PlanContentModel)
 
 
 class PlanDraft(_PlanModel, Generic[PlanContentT]):
-    """Versioned, schema-bound Plan content proposed for human review."""
+    """Schema-bound Plan content proposed for human review."""
 
-    schema_version: Literal[1] = Field(
-        default=1,
-        description="Plan serialization schema version",
-    )
     revision: int = Field(
         ge=1,
         strict=True,
@@ -182,10 +174,6 @@ class ConfirmedPlan(PlanDraft[PlanContentT], Generic[PlanContentT]):
 class PlanHandoff(_PlanModel):
     """Deterministic boundary from an approved Plan to native execution."""
 
-    schema_version: Literal[1] = Field(
-        default=1,
-        description="Handoff serialization schema version",
-    )
     message_id: NonBlankText = Field(
         description="Original user message ID reused for native execution"
     )
@@ -230,16 +218,15 @@ class PlanHandoff(_PlanModel):
 
 
 class RequirementAnswer(_PlanModel):
-    """One trusted answer or explicit optional skip from a clarification interrupt."""
+    """One trusted normalized answer or explicit optional skip."""
 
-    question_id: PlanStepId = Field(description="Question ID being answered")
-    answer: NonBlankText | None = Field(
-        default=None,
-        description="Trusted free text or checkpoint-derived option label, if answered",
+    question_id: PlanStepId = Field(description="Checkpoint question being resolved")
+    answer_type: NonBlankText = Field(
+        description="Semantic type derived from the checkpoint question"
     )
-    option_id: PlanStepId | None = Field(
+    value: dict[str, JsonValue] | None = Field(
         default=None,
-        description="Selected option ID, or None for a custom answer",
+        description="Canonical trusted JSON value, or None when explicitly skipped",
     )
     skipped: bool = Field(
         default=False,
@@ -247,14 +234,11 @@ class RequirementAnswer(_PlanModel):
     )
 
     @model_validator(mode="after")
-    def answer_matches_skip_state(self) -> RequirementAnswer:
-        """Keep answered and skipped history records mutually exclusive."""
+    def value_matches_skip_state(self) -> RequirementAnswer:
+        """Keep normalized values and explicit skips mutually exclusive."""
 
-        if self.skipped:
-            if self.answer is not None or self.option_id is not None:
-                raise ValueError("skipped clarification answers cannot carry a value")
-        elif self.answer is None:
-            raise ValueError("non-skipped clarification answers require a value")
+        if self.skipped == (self.value is not None):
+            raise ValueError("exactly one of value or skipped must resolve an answer")
         return self
 
 
@@ -264,11 +248,20 @@ class PendingClarification(_PlanModel):
     form: dict[str, JsonValue] = Field(
         description="JSON-only form validated before checkpoint persistence"
     )
+    response_schema: dict[str, JsonValue] = Field(
+        description="Exact response JSON Schema bound to this form instance"
+    )
+    contract_digest: PlanDigest = Field(
+        description="SHA-256 binding the exact form and response Schema"
+    )
 
 
-class ClarificationExchange(PendingClarification):
+class ClarificationExchange(_PlanModel):
     """Resolved form and normalized answers retained as trusted Plan context."""
 
+    form: dict[str, JsonValue] = Field(
+        description="Resolved form retained as trusted Planner context"
+    )
     answers: tuple[RequirementAnswer, ...] = Field(
         min_length=1,
         description="Answers normalized against the checkpoint form",
@@ -278,7 +271,6 @@ class ClarificationExchange(PendingClarification):
 class PlanState(_PlanModel, Generic[PlanContentT]):
     """Complete standalone Planning state projected through the AG-UI channel."""
 
-    workflow_version: Literal["tinkerfin.plan.v1"] = "tinkerfin.plan.v1"
     status: PlanStatus = PlanStatus.PLANNING
     effective_mode: Literal["default", "plan"] = "plan"
     request_message_id: NonBlankText | None = None

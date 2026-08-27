@@ -83,7 +83,7 @@ lock = RedisLeaseLock.from_url(
 
 | 参数 | 默认值 | 作用 |
 | --- | --- | --- |
-| `key_prefix` | `"tinkerfin:lease:v1:"` | 隔离当前应用的锁 key；非空且不能有首尾空白 |
+| `key_prefix` | `"tinkerfin:lease:"` | 隔离当前应用的锁 key；非空且不能有首尾空白 |
 | `lease_ttl_seconds` | `30.0` | 一次租约的 Redis TTL，必须大于 0 |
 | `renew_interval_seconds` | `None` | `None` 表示 TTL 的三分之一；显式值必须小于 TTL 的一半 |
 | `wait_poll_seconds` | `0.1` | 锁被占用时再次尝试的间隔，必须大于 0 |

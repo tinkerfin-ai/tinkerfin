@@ -18,7 +18,7 @@ class AgUiCodec(
 ):
     """Persist complete AG-UI events under a schema-stable codec identifier."""
 
-    codec_id: ClassVar[str] = "agui.event.v1"
+    codec_id: ClassVar[str] = "agui.event"
     messaging_source_type: ClassVar[type[BaseEvent]] = BaseEvent
     messaging_replay_type: ClassVar[type[BaseEvent]] = BaseEvent
 

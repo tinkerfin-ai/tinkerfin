@@ -15,6 +15,12 @@ class PlanStructuredOutputError(TinkerFinError, RuntimeError):
     code = TinkerFinErrorCode.PLAN_STRUCTURED_OUTPUT
 
 
+class PlanClarificationResponseError(TinkerFinError, ValueError):
+    """A clarification response cannot resolve its checkpointed question form."""
+
+    code = TinkerFinErrorCode.PLAN_CLARIFICATION_RESPONSE_INVALID
+
+
 class PlanStateConflictError(TinkerFinError, RuntimeError):
     """Planning and native checkpoints cannot identify one safe next action."""
 
@@ -22,6 +28,7 @@ class PlanStateConflictError(TinkerFinError, RuntimeError):
 
 
 __all__ = [
+    "PlanClarificationResponseError",
     "PlanModeConfigurationError",
     "PlanStateConflictError",
     "PlanStructuredOutputError",

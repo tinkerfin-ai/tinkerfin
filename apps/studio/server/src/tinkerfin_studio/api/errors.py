@@ -139,7 +139,7 @@ class ConversationErrorCode(ErrorCode):
     HISTORY_SCHEMA_MISMATCH = _ErrorCodeValue(
         1_001_004_028,
         500,
-        "会话历史数据不符合当前版本",
+        "会话历史数据不符合当前结构",
     )
     MESSAGING_QUOTA_EXCEEDED = _ErrorCodeValue(
         1_001_004_029,

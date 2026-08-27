@@ -83,6 +83,7 @@ const conversationFromHistoryItem = (
   mode: 'default',
   messages: [],
   todos: [],
+  pendingInteractionKind: item.pendingInteractionKind ?? undefined,
   runStatus: historyStatusToRunStatus(item.status),
   activeRunId: item.lastRunId,
   serverState: {},
@@ -112,6 +113,9 @@ const mergeHistoryConversations = (
               ? existing.activeRunId
               : summary.activeRunId,
             lastSeq: existing.isHydrated ? existing.lastSeq : summary.lastSeq,
+            pendingInteractionKind: existing.isHydrated
+              ? existing.pendingInteractionKind
+              : summary.pendingInteractionKind,
             runStatus: existing.runStatus === 'streaming' ? existing.runStatus : summary.runStatus,
           }
         : summary,

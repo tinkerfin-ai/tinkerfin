@@ -136,7 +136,7 @@ Store the complete scoped ID. Raw tool IDs may repeat in different namespaces.
 ## Parse framework extensions
 
 Tool approval metadata is fixed by `ToolReviewInterruptMetadata` and schema
-`tinkerfin.deepagents.tool-review.v1`:
+`tinkerfin.deepagents.tool-review`:
 
 ```python
 from tinkerfin_agui_adapter import parse_tool_review_interrupt
@@ -147,11 +147,11 @@ print(review.tool_name, review.original_args.root)
 ```
 
 The parser validates the complete interrupt, native action group, action index,
-decision policy, arguments, and scoped Tool ID. It does not accept unversioned shapes
-or client-supplied interrupt metadata.
+decision policy, arguments, and scoped Tool ID. Unknown fields and client-supplied
+interrupt metadata fail closed.
 
 Deep Agents `task` calls publish `SubagentProvenance` with schema
-`tinkerfin.subagent-provenance.v1`. Its `subagentInvocationId` is stable across resume;
+`tinkerfin.subagent-provenance`. Its `subagentInvocationId` is stable across resume;
 `requestRunId` identifies the main request carrying the current event. Parent task
 results expose `relatedSubagentInvocationId`. These fields describe Agent nesting;
 standard AG-UI `parentRunId` retains branch and time-travel lineage semantics.

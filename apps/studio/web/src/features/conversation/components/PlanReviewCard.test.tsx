@@ -1,4 +1,6 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { useState } from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { PlanReviewState } from '../../../types'
@@ -13,14 +15,13 @@ describe('PlanReviewCard', () => {
     revision: 3,
     submitted: false,
     draft: {
-      schemaVersion: 1,
       revision: 3,
       contentSchema: {
-        id: 'tinkerfin.plan.markdown.v1',
         fingerprint: '0'.repeat(64),
         mediaType: 'text/markdown',
       },
       content: {
+        description: '切换实现模式并保持父图稳定',
         markdown: '# 实现模式切换\n\n- 保持父图稳定',
       },
     },
@@ -46,6 +47,8 @@ describe('PlanReviewCard', () => {
     )
 
     expect(screen.getByRole('heading', { level: 1, name: '实现模式切换' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { level: 2 })).toHaveTextContent(/^Plan/)
+    expect(screen.getByText('切换实现模式并保持父图稳定')).toBeInTheDocument()
     expect(screen.getByText('保持父图稳定')).toBeInTheDocument()
     expect(screen.getByText((content, element) => (
       element?.tagName === 'SMALL' && content.includes('第 3 版')
@@ -96,7 +99,42 @@ describe('PlanReviewCard', () => {
     view.rerender(
       <PlanReviewCard threadId="thread-a" interaction={current} onChange={change} onSubmit={vi.fn()} />,
     )
-    expect(screen.getByRole('textbox', { name: '拒绝原因（可选）' })).toHaveValue('补充移动端验证')
+    const rejectionReason = screen.getByRole('textbox', { name: '拒绝原因（可选）' })
+    expect(rejectionReason).toHaveValue('补充移动端验证')
+    expect(rejectionReason).not.toBeRequired()
+  })
+
+  it('focuses required feedback and disables submission until it is non-blank', async () => {
+    const user = userEvent.setup()
+    const submit = vi.fn()
+
+    function Harness() {
+      const [current, setCurrent] = useState(interaction())
+      return (
+        <PlanReviewCard
+          threadId="thread-a"
+          interaction={current}
+          onChange={setCurrent}
+          onSubmit={submit}
+        />
+      )
+    }
+
+    render(<Harness />)
+    await user.click(screen.getByRole('button', { name: '反馈' }))
+
+    const feedback = screen.getByRole('textbox', { name: '需要调整的内容' })
+    const submitDecision = screen.getByRole('button', { name: '提交决定' })
+    await waitFor(() => expect(feedback).toHaveFocus())
+    expect(feedback).toBeRequired()
+    expect(submitDecision).toBeDisabled()
+
+    await user.type(feedback, '  ')
+    expect(submitDecision).toBeDisabled()
+    await user.type(feedback, '补充异常路径')
+    expect(submitDecision).toBeEnabled()
+    await user.click(submitDecision)
+    expect(submit).toHaveBeenCalledOnce()
   })
 
   it('persists collapse per thread without submitting or changing the review', async () => {
@@ -111,11 +149,15 @@ describe('PlanReviewCard', () => {
       />,
     )
 
+    expect(screen.getByRole('separator', { name: '调整交互卡片高度' })).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: '收起计划草稿' }))
+    expect(screen.queryByRole('separator', { name: '调整交互卡片高度' })).not.toBeInTheDocument()
     expect(screen.queryByRole('region', { name: '计划草稿内容' })).not.toBeInTheDocument()
-    expect(screen.getByText('请审阅计划，批准后开始执行')).toBeInTheDocument()
+    expect(screen.getByText('切换实现模式并保持父图稳定')).toBeInTheDocument()
     expect(screen.queryByText('等待审阅')).not.toBeInTheDocument()
     expect(window.sessionStorage.getItem(planReviewCollapseKey('thread-a'))).toBe('collapsed')
+    expect(screen.getByRole('button', { name: '点击标题区域展开计划草稿' }))
+      .toHaveAttribute('aria-expanded', 'false')
     expect(change).not.toHaveBeenCalled()
     expect(submit).not.toHaveBeenCalled()
 
@@ -141,6 +183,7 @@ describe('PlanReviewCard', () => {
 
   it('shows waiting and submitted conversation statuses', () => {
     const view = render(<PlanReviewStatusRow interaction={interaction()} />)
+    expect(screen.getByText('Plan')).toBeInTheDocument()
     expect(screen.getByText('等待审阅')).toBeInTheDocument()
     expect(view.container.querySelector('.activity-dots')).toBeInTheDocument()
 
@@ -163,11 +206,12 @@ describe('PlanReviewCard', () => {
   })
 
   it('uses the approval palette while preserving the shared interaction shell', () => {
-    expect(conversationStyles).toMatch(/\.approval-composer,\s*\.plan-review-composer\s*\{[^}]*border:\s*1px solid var\(--color-warning-panel-border\);[^}]*background:\s*var\(--color-layer-1\);/s)
+    expect(conversationStyles).toMatch(/\.approval-composer,\s*\.plan-question-composer,\s*\.plan-review-composer\s*\{[^}]*border:\s*0;/s)
+    expect(conversationStyles).toMatch(/\.approval-composer,\s*\.plan-review-composer\s*\{[^}]*background:\s*var\(--color-layer-1\);/s)
     expect(conversationStyles).toMatch(/\.approval-composer-head,\s*\.plan-review-composer-head\s*\{[^}]*background:\s*var\(--color-warning-panel-background\);/s)
     expect(conversationStyles).toMatch(/\.plan-review-composer-heading h2 > svg\s*\{[^}]*color:\s*var\(--color-warning-panel-accent\);/s)
-    expect(conversationStyles).toMatch(/\.plan-review-composer\.is-minimized \.plan-review-composer-head\s*\{[^}]*min-height:\s*calc\(var\(--layout-composer-surface-height\) - var\(--space-0-5\)\);[^}]*align-items:\s*center;[^}]*padding-top:\s*var\(--space-3\);[^}]*padding-bottom:\s*var\(--space-3\);/s)
-    expect(conversationStyles).toMatch(/\.plan-review-composer-body\s*\{[^}]*flex:\s*0 1 auto;[^}]*overflow-y:\s*auto;/s)
+    expect(conversationStyles).toMatch(/\.plan-review-composer\.is-minimized \.plan-review-composer-head\s*\{[^}]*min-height:\s*var\(--layout-composer-surface-height\);[^}]*align-items:\s*center;[^}]*padding-top:\s*var\(--space-3\);[^}]*padding-bottom:\s*var\(--space-3\);/s)
+    expect(conversationStyles).toMatch(/\.plan-review-composer-body\s*\{[^}]*flex:\s*1 1 auto;[^}]*overflow-y:\s*auto;/s)
     expect(conversationStyles).toMatch(/\.plan-review-composer-footer\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) auto;[^}]*min-height:\s*var\(--control-xl\);/s)
     expect(conversationStyles).toMatch(/@media \(max-width:\s*440px\)[\s\S]*\.plan-review-actions\s*\{[^}]*grid-template-columns:\s*repeat\(3, minmax\(0, 1fr\)\);/s)
     expect(conversationStyles).toMatch(/@media \(max-width:\s*440px\)[\s\S]*\.plan-review-actions \.ui-button\s*\{[^}]*padding-inline:\s*var\(--space-1-5\);/s)

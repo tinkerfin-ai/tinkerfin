@@ -366,9 +366,28 @@ export function WorkspaceScreen({
     return grouped
   }, [conversation.messages])
 
-  const displayMessages = useMemo(() => conversation.messages
-    .filter((message) => {
+  const displayMessages = useMemo(() => {
+    const pendingApproval = conversation.approval?.submitted === false
+      ? conversation.approval
+      : undefined
+    const activeApprovalIndex = pendingApproval
+      ? Math.max(0, Math.min(pendingApproval.activeIndex, pendingApproval.items.length - 1))
+      : -1
+    const activeApprovalToolCallId = pendingApproval?.items[activeApprovalIndex]?.toolCallId
+    const approvalToolCallIds = new Set(
+      pendingApproval?.items.flatMap((item) => item.toolCallId ? [item.toolCallId] : []) ?? [],
+    )
+
+    return conversation.messages.filter((message) => {
       if (message.role !== 'tool') return true
+      if (
+        activeApprovalToolCallId
+        && message.meta?.toolCallId === activeApprovalToolCallId
+      ) return true
+      if (
+        message.meta?.toolCallId
+        && approvalToolCallIds.has(message.meta.toolCallId)
+      ) return false
       if (message.meta?.toolName === 'write_todos') return false
       if (message.meta?.toolName === 'PlannerOutcome') return false
       if (message.meta?.sourceAgentName) return false
@@ -384,7 +403,8 @@ export function WorkspaceScreen({
       } else if (message.role === 'tool' && message.meta?.batchId) groups.push({ type: 'tools', messages: [message] })
       else groups.push({ type: 'message', message })
       return groups
-    }, []), [conversation.messages])
+    }, [])
+  }, [conversation.approval, conversation.messages])
 
   const defaultMessageWindowStart = Math.max(
     0,

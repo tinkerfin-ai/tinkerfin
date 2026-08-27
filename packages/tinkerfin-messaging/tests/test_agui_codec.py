@@ -12,7 +12,7 @@ from tinkerfin_messaging import AgUiCodec
 
 
 def test_agui_codec_exposes_schema_id_on_the_codec_class() -> None:
-    assert AgUiCodec.codec_id == "agui.event.v1"
+    assert AgUiCodec.codec_id == "agui.event"
 
 
 def test_agui_codec_exposes_complete_live_and_replay_types() -> None:
@@ -32,7 +32,7 @@ def test_agui_codec_round_trips_the_complete_event() -> None:
     payload = codec.encode(event)
     decoded = codec.decode(payload)
 
-    assert codec.codec_id == "agui.event.v1"
+    assert codec.codec_id == "agui.event"
     assert decoded == event
     assert json.loads(payload) == {
         "type": "RUN_STARTED",

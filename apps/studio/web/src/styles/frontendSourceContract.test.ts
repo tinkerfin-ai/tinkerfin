@@ -64,6 +64,37 @@ describe('前端源码契约', () => {
     expect(sharedPaths.every((path) => path.startsWith('../components/ui/'))).toBe(true)
   })
 
+  it('业务源码只通过共享 UI 组件使用 Zag 交互能力', () => {
+    const directImports: string[] = []
+    for (const [path, source] of productionSources) {
+      if (path.startsWith('../components/ui/')) continue
+      const file = parse(path, source)
+      const visit = (node: ts.Node) => {
+        const moduleName = (
+          (ts.isImportDeclaration(node) || ts.isExportDeclaration(node))
+          && node.moduleSpecifier
+          && ts.isStringLiteral(node.moduleSpecifier)
+        )
+          ? node.moduleSpecifier.text
+          : (
+              ts.isCallExpression(node)
+              && node.expression.kind === ts.SyntaxKind.ImportKeyword
+              && node.arguments.length === 1
+              && ts.isStringLiteral(node.arguments[0])
+            )
+              ? node.arguments[0].text
+              : undefined
+        if (moduleName?.startsWith('@zag-js/')) {
+          const line = file.getLineAndCharacterOfPosition(node.getStart(file)).line + 1
+          directImports.push(`${path}:${line}:${moduleName}`)
+        }
+        ts.forEachChild(node, visit)
+      }
+      visit(file)
+    }
+    expect(directImports).toEqual([])
+  })
+
   it('Studio 单行源码说明不使用全角句号且不存在纯英文 JSDoc', () => {
     const invalidComments: string[] = []
     for (const [path, source] of productionSources) {

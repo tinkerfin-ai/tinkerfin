@@ -50,11 +50,10 @@ Thread-level methods use `identity.threadId`, but still accept the complete Iden
 It raises `RunNotFound` when no durable record exists and never creates or recovers a
 producer.
 
-## Envelope v2
+## Envelope
 
 | Field | Purpose |
 | --- | --- |
-| `schemaVersion` | Fixed at 2 |
 | `channel` | Codec namespace |
 | `identity` | Nested threadId and runId |
 | `seq` | Thread-level committed position |
@@ -63,7 +62,8 @@ producer.
 | `payload` | Encoded bytes |
 | `createdAt` | UTC time allocated on first commit |
 
-Only Envelope v2 is readable. Envelope v1 records cannot be loaded; change the storage prefix or remove records you no longer need before switching formats.
+Messaging stores one current envelope shape. Rebuild records before deploying an
+incompatible application-owned format; runtime decoding does not negotiate formats.
 
 ## Observe owner commits
 

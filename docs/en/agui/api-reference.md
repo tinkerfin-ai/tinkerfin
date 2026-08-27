@@ -68,11 +68,11 @@ mixed Tool cancellation, or all-cancelled abandonment without exposing a native 
 | Model | Fields |
 | --- | --- |
 | `AgentRuntimeInterrupt` | Non-empty `id`, JSON `value` |
-| `RuntimeInterruptEnvelope` | Versioned `schema`, non-empty `kind`, optional `message`, response JSON Schema, and trusted metadata |
+| `RuntimeInterruptEnvelope` | Current `schema`, non-empty `kind`, optional `message`, response JSON Schema, and trusted metadata |
 | `HitlActionRequest` | Non-empty `name`, object `args`, optional `description` |
 | `HitlReviewConfig` | `actionName`, non-empty `allowedDecisions`, optional `argsSchema` |
 | `HitlRequest` | Equally sized, non-empty `actionRequests` and `reviewConfigs` |
-| `ToolReviewInterruptMetadata` | Versioned native group, action position, Tool name, decisions, and original arguments |
+| `ToolReviewInterruptMetadata` | Current native group, action position, Tool name, decisions, and original arguments |
 | `SubagentProvenance` | Stable invocation ID, full namespaces, graph task, parent Tool, Agent, description, and current request run |
 
 Allowed public decisions are `approve`, `edit`, `reject`, and `respond`. Action and
@@ -80,14 +80,16 @@ review entries pair by position. Edited arguments are validated against `argsSch
 with JSON Schema Draft 2020-12 before translation returns.
 
 `RuntimeInterruptEnvelope` supports non-Tool workflow pauses. It maps `kind` to the
-AG-UI interrupt reason and leaves domain validation of the resolved JSON object to the
-emitting graph. Extension kinds must be namespaced, and Runtime and Tool interrupts
-cannot share one pending batch.
+AG-UI interrupt reason. `require_valid_schema(...)` checks Draft 2020-12 contracts before
+publication, and `validate_json_schema_instance(...)` validates resolved JSON with format
+checking before native translation. The emitting graph retains domain validation.
+Extension kinds must be namespaced, and Runtime and Tool interrupts cannot share one
+pending batch.
 
 `parse_tool_review_interrupt(interrupt)` validates a complete trusted Tool interrupt
-against `tinkerfin.deepagents.tool-review.v1`. `subagent_invocation_id(...)` and
+against `tinkerfin.deepagents.tool-review`. `subagent_invocation_id(...)` and
 `create_subagent_provenance(...)` implement the fixed
-`tinkerfin.subagent-provenance.v1` identity contract.
+`tinkerfin.subagent-provenance` identity contract.
 
 ## IDs and errors
 
@@ -96,7 +98,7 @@ against `tinkerfin.deepagents.tool-review.v1`. `subagent_invocation_id(...)` and
 | `ScopedIdCodec.encode(...)` | Builds an ID from kind, full namespace, and raw ID |
 | `ScopedIdCodec.decode(...)` | Restores those three components |
 | `HitlCorrelationError` | Review action cannot be correlated with tool messages |
-| `ToolReviewContractError` | A complete Tool review interrupt violates the versioned public contract |
+| `ToolReviewContractError` | A complete Tool review interrupt violates the current public contract |
 | `SseEventId` | String or integer ID accepted by `encode_sse()` |
 
 Parallel tools, subagents, and resumed results require complete scoped IDs. Never correlate them by arrival order.

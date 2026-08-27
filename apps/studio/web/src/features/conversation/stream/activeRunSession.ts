@@ -13,10 +13,6 @@ export interface ActiveRunSession {
   lastSeq: number
 }
 
-interface PersistedActiveRunSession extends ActiveRunSession {
-  schemaVersion: 1
-}
-
 const isRecord = (value: unknown): value is Record<string, unknown> => (
   value != null && typeof value === 'object' && !Array.isArray(value)
 )
@@ -62,7 +58,9 @@ const isChatRequestPayload = (value: unknown): value is ChatRequestPayload => {
 }
 
 const parseActiveRunSession = (value: unknown): ActiveRunSession | null => {
-  if (!isRecord(value) || value.schemaVersion !== 1) return null
+  if (!isRecord(value)) return null
+  const keys = Object.keys(value).sort()
+  if (keys.join('\0') !== ['lastSeq', 'mode', 'payload', 'threadId'].join('\0')) return null
   if (typeof value.threadId !== 'string') return null
   if (value.mode !== 'start' && value.mode !== 'resume') return null
   if (!Number.isSafeInteger(value.lastSeq) || Number(value.lastSeq) < 0) return null
@@ -94,12 +92,8 @@ export const readActiveRunSession = (): ActiveRunSession | null => {
 }
 
 export const writeActiveRunSession = (session: ActiveRunSession): void => {
-  const persisted: PersistedActiveRunSession = {
-    schemaVersion: 1,
-    ...session,
-  }
   try {
-    window.sessionStorage.setItem(ACTIVE_RUN_STORAGE_KEY, JSON.stringify(persisted))
+    window.sessionStorage.setItem(ACTIVE_RUN_STORAGE_KEY, JSON.stringify(session))
   } catch {
     // 浏览器禁用存储时，当前连接仍可正常工作，只是不具备刷新重连能力
   }

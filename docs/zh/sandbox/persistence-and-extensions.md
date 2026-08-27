@@ -69,7 +69,7 @@ schema = get_sqlalchemy_opensandbox_state_schema(dialect="mysql")
 Path("opensandbox-schema.sql").write_text(schema.ddl, encoding="utf-8")
 ```
 
-`dialect` 可以是 `mysql` 或 `sqlite`。返回值还包含 `component`、`version` 和 `table_names`，部署系统可以记录这些信息。应用启动时仍会检查数据库结构是否匹配。
+`dialect` 可以是 `mysql` 或 `sqlite`。返回值还包含 `table_names`，应用启动时仍会检查数据库结构是否匹配。
 
 ## 预热 Sandbox
 
@@ -103,7 +103,7 @@ client = OpenSandboxClient(
 )
 ```
 
-initializer 在新 Sandbox 可用后执行。它应当可取消、可观察，并在重复创建的新实例上得到一致结果。连接已有 Sandbox 时不会把初始化当作任意迁移系统使用。
+initializer 在新 Sandbox 可用后执行。它应当可取消、可观察，并在重复创建的新实例上得到一致结果；连接已有 Sandbox 时不会再次执行。
 
 ## 如果已有自己的状态存储
 
@@ -122,4 +122,3 @@ initializer 在新 Sandbox 可用后执行。它应当可取消、可观察，�
 `InMemoryOpenSandboxState(namespace=...)` 可以作为行为参考，但它不适合跨进程共享。
 
 下一篇：[Sandbox 使用参考](api-reference.md)。
-

@@ -166,7 +166,7 @@ async def test_from_client_borrows_redis_and_hashes_the_resolved_identity() -> N
     acquire_numkeys, acquire_arguments = client.eval_calls[0]
     assert acquire_numkeys == 2
     generated_keys = tuple(str(value) for value in acquire_arguments[:2])
-    assert all(key.startswith("tinkerfin:run:v2:") for key in generated_keys)
+    assert all(key.startswith("tinkerfin:run:") for key in generated_keys)
     assert all("private-user" not in key for key in generated_keys)
 
 

@@ -22,7 +22,7 @@ def test_native_codec_declares_a_mapping_source_type() -> None:
 
 
 def test_native_codec_exposes_schema_id_on_the_codec_class() -> None:
-    assert NativeStreamPartCodec.codec_id == "langgraph.stream-part.v2.v1"
+    assert NativeStreamPartCodec.codec_id == "langgraph.stream-part.v2"
 
 
 def test_native_codec_exposes_complete_live_and_replay_types() -> None:
@@ -71,7 +71,7 @@ def test_native_codec_normalizes_messages_without_repr_serialization() -> None:
 
     decoded = codec.decode(codec.encode(part))
 
-    assert codec.codec_id == "langgraph.stream-part.v2.v1"
+    assert codec.codec_id == "langgraph.stream-part.v2"
     assert decoded.mode == "messages"
     assert decoded.namespace == ("tools:task-1",)
     assert isinstance(decoded.data, dict)
@@ -174,7 +174,7 @@ def test_native_codec_rejects_list_namespaces() -> None:
         )
 
 
-def test_native_sse_renderer_uses_sequence_and_versioned_json() -> None:
+def test_native_sse_renderer_uses_sequence_and_current_json() -> None:
     codec = NativeStreamPartCodec()
     decoded = codec.decode(
         codec.encode({"type": "values", "ns": (), "data": {"answer": 42}})
@@ -186,7 +186,6 @@ def test_native_sse_renderer_uses_sequence_and_versioned_json() -> None:
     assert frame.endswith(b"\n\n")
     data = json.loads(frame.split(b"data: ", maxsplit=1)[1])
     assert data == {
-        "schemaVersion": 1,
         "type": "values",
         "ns": [],
         "data": {"answer": 42},

@@ -1,6 +1,6 @@
 import { expect, test, type Locator, type Page, type Route } from '@playwright/test'
 import type { ConversationSnapshotInterrupt } from '../../src/api/conversation/history'
-import type { JsonObject, Message } from '../../src/types'
+import type { JsonObject, JsonValue, Message } from '../../src/types'
 
 const THREAD_ID = 'browser-thread'
 const BASE_TIME = '2026-08-25T00:00:00.000Z'
@@ -351,32 +351,131 @@ const approvalItems = [
 })
 
 const planQuestionForm = {
-  schemaVersion: 2,
   title: '确认执行方式',
   description: '这些答案会影响后续规划',
-  questions: [{
-    id: 'browser-plan-question-item',
-    prompt: '是否继续执行？',
-    required: true,
-    options: [
-      { id: 'yes', label: '继续', attributes: { recommended: true } },
-      { id: 'no', label: '停止', attributes: { recommended: false } },
-    ],
-    allowFreeText: true,
-  }],
+  questions: [
+    {
+      id: 'browser-plan-question-item',
+      answerType: 'single_choice',
+      prompt: '主要运行平台是什么？',
+      required: true,
+      options: [
+        { id: 'web', label: 'Web', attributes: { recommended: true } },
+        { id: 'mobile', label: '移动端', attributes: { recommended: false } },
+      ],
+      allowFreeText: true,
+    },
+    {
+      id: 'browser-plan-multiple',
+      answerType: 'multiple_choice',
+      prompt: '需要覆盖哪些平台？',
+      required: true,
+      options: [
+        { id: 'web', label: 'Web', attributes: { recommended: true } },
+        { id: 'mobile', label: '移动端', attributes: { recommended: true } },
+      ],
+      allowFreeText: true,
+      minSelections: 2,
+      maxSelections: 2,
+    },
+    {
+      id: 'browser-plan-text',
+      answerType: 'text',
+      prompt: '还有哪些限制？',
+      required: false,
+    },
+    {
+      id: 'browser-plan-date',
+      answerType: 'date',
+      prompt: '期望完成日期是什么时候？',
+      required: true,
+    },
+  ] as JsonValue[],
 } satisfies JsonObject
 
-const planQuestionInterrupt: ConversationSnapshotInterrupt = {
+const longPlanQuestionForm = {
+  ...planQuestionForm,
+  questions: [{
+    id: 'browser-plan-question-long-item',
+    answerType: 'single_choice',
+    prompt: '主要运行平台是什么？',
+    required: true,
+    options: Array.from({ length: 12 }, (_, index) => ({
+      id: `platform-${index + 1}`,
+      label: `平台选项 ${index + 1}`,
+      attributes: { recommended: index === 0 },
+    })),
+    allowFreeText: true,
+  }] as JsonValue[],
+} satisfies JsonObject
+
+const planQuestionTabOrderForm = {
+  title: '方案规划澄清',
+  description: '回答以下问题将帮助确定本次方案的目标、范围与关键约束',
+  questions: [
+    ...Array.from({ length: 2 }, (_, index) => ({
+      id: `browser-plan-tab-intro-${index + 1}`,
+      answerType: 'single_choice',
+      prompt: `前置问题 ${index + 1}`,
+      required: true,
+      options: [{
+        id: `continue-${index + 1}`,
+        label: `继续 ${index + 1}`,
+        attributes: { recommended: true },
+      }],
+      allowFreeText: false,
+    })),
+    {
+      id: 'browser-plan-tab-multiple',
+      answerType: 'multiple_choice',
+      prompt: '需要覆盖哪些浏览器？',
+      required: true,
+      options: ['Chrome', 'Safari', 'Firefox', 'Edge', 'Opera', 'Arc', 'Brave', 'Vivaldi']
+        .map((label, index) => ({
+          id: `browser-${index + 1}`,
+          label,
+          attributes: { recommended: index === 0 },
+        })),
+      allowFreeText: true,
+      minSelections: 1,
+      maxSelections: 7,
+    },
+    ...Array.from({ length: 5 }, (_, index) => ({
+      id: `browser-plan-tab-tail-${index + 1}`,
+      answerType: 'text',
+      prompt: `后续问题 ${index + 1}`,
+      required: false,
+    })),
+  ] as JsonValue[],
+} satisfies JsonObject
+
+const dateOnlyPlanQuestionForm = {
+  title: '确认发布日期',
+  description: '日期会影响计划安排',
+  questions: [{
+    id: 'browser-plan-date-only',
+    answerType: 'date',
+    prompt: '目标发布日期是哪一天？',
+    required: true,
+  }] as JsonValue[],
+} satisfies JsonObject
+
+const createPlanQuestionInterrupt = (form: JsonObject): ConversationSnapshotInterrupt => ({
   id: 'browser-plan-question',
   reason: 'tinkerfin:plan_clarification',
+  responseSchema: { type: 'object' },
   metadata: {
     runtimeInterrupt: {
+      schema: 'tinkerfin.runtime-interrupt',
+      nativeInterruptId: 'browser-plan-question',
       envelope: {
+        schema: 'tinkerfin.runtime-interrupt',
+        kind: 'tinkerfin:plan_clarification',
+        responseSchema: { type: 'object' },
         metadata: {
           origin: 'plan',
           clarification: {
-            schema: 'tinkerfin.plan-clarification.v2',
-            form: planQuestionForm,
+            form,
           },
         },
       },
@@ -384,27 +483,33 @@ const planQuestionInterrupt: ConversationSnapshotInterrupt = {
   },
   allowedDecisions: [],
   originalArgs: {},
-}
+})
+
+const planQuestionInterrupt = createPlanQuestionInterrupt(planQuestionForm)
 
 const planReviewInterrupt: ConversationSnapshotInterrupt = {
   id: 'browser-plan-review',
   reason: 'tinkerfin:plan_review',
+  responseSchema: { type: 'object' },
   metadata: {
     runtimeInterrupt: {
+      schema: 'tinkerfin.runtime-interrupt',
+      nativeInterruptId: 'browser-plan-review',
       envelope: {
+        schema: 'tinkerfin.runtime-interrupt',
+        kind: 'tinkerfin:plan_review',
+        responseSchema: { type: 'object' },
         metadata: {
           origin: 'plan',
           review: {
-            schema: 'tinkerfin.plan-review.v1',
             draft: {
-              schemaVersion: 1,
               revision: 3,
               contentSchema: {
-                id: 'tinkerfin.plan.markdown.v1',
                 fingerprint: '0'.repeat(64),
                 mediaType: 'text/markdown',
               },
               content: {
+                description: '保持现有会话行为并完成响应式验证',
                 markdown: '# 浏览器计划草稿\n\n- 保持现有会话行为\n- 完成响应式验证',
               },
             },
@@ -435,6 +540,7 @@ interface MockStudioOptions {
   paginationPageCount?: number
   paginationResponseDelayMs?: number
   planQuestion?: boolean
+  planQuestionForm?: JsonObject
   planReview?: boolean
   runError?: boolean
   runningActivity?: boolean
@@ -450,6 +556,7 @@ async function mockStudio(page: Page, {
   paginationPageCount = 2,
   paginationResponseDelayMs = 0,
   planQuestion = false,
+  planQuestionForm: planQuestionFormOverride,
   planReview = false,
   runError = false,
   runningActivity = false,
@@ -470,7 +577,7 @@ async function mockStudio(page: Page, {
   await page.addInitScript(({ storageKey, session }) => {
     window.localStorage.setItem(storageKey, JSON.stringify(session))
   }, {
-    storageKey: 'tinkerfin.auth.session.v1',
+    storageKey: 'tinkerfin.auth.session',
     session: {
       token: 'browser-token',
       tokenType: 'Bearer',
@@ -539,6 +646,13 @@ async function mockStudio(page: Page, {
             messageCount: index === 0 ? historyMessages.length : 0,
             toolCallCount: index === 0 ? 1 : 0,
             hasPendingInterrupt: index === 0 && isWaitingForInput,
+            pendingInteractionKind: index === 0 && isWaitingForInput
+              ? planQuestion
+                ? 'plan_clarification'
+                : planReview
+                  ? 'plan_review'
+                  : 'tool_approval'
+              : null,
             pinned: false,
             createdAt: BASE_TIME,
             updatedAt: BASE_TIME,
@@ -560,14 +674,19 @@ async function mockStudio(page: Page, {
         lastModel: 'GPT-5.5',
         lastSeq: 151,
         snapshotSeq: 151,
-        snapshotVersion: 3,
         messageCount: historyMessages.length,
         toolCallCount: 1,
         hasPendingInterrupt: isWaitingForInput,
+        pendingInteractionKind: isWaitingForInput
+          ? planQuestion
+            ? 'plan_clarification'
+            : planReview
+              ? 'plan_review'
+              : 'tool_approval'
+          : null,
         pinned: false,
         snapshot: {
           snapshotSeq: 151,
-          snapshotVersion: 3,
           messages: historyMessages,
           todos: [],
           mode: planQuestion || planReview ? 'plan' : 'default',
@@ -579,7 +698,9 @@ async function mockStudio(page: Page, {
           serverState: {},
           runs: {},
           interrupts: planQuestion
-            ? [planQuestionInterrupt]
+            ? [planQuestionFormOverride
+                ? createPlanQuestionInterrupt(planQuestionFormOverride)
+                : planQuestionInterrupt]
             : planReview
               ? [planReviewInterrupt]
               : [],
@@ -758,6 +879,251 @@ test('首页与会话态使用相同的输入卡片高度', async ({ page }) => 
   expect(heroHeight).toBe(94)
 })
 
+test('macOS Composer 支持 Control+U 且不接管 Command+U', async ({ page }) => {
+  await mockStudio(page, { emptyHistory: true })
+  expect(await page.evaluate(() => navigator.platform)).toContain('Mac')
+  const input = page.getByRole('textbox', { name: '消息输入' })
+
+  await input.fill('第一行\n第二行内容')
+  await input.evaluate((element) => {
+    const textarea = element as HTMLTextAreaElement
+    textarea.setSelectionRange(textarea.value.length, textarea.value.length)
+  })
+  await input.press('Control+u')
+  await expect(input).toHaveValue('第一行\n')
+
+  await input.fill('保留内容')
+  await input.press('Meta+u')
+  await expect(input).toHaveValue('保留内容')
+
+  await input.fill('换行内容')
+  await input.press('Shift+Enter')
+  await expect(input).toHaveValue('换行内容\n')
+})
+
+test('Composer 在已有文本前插入 Slash 时保持光标并安全取消建议', async ({ page }) => {
+  await mockStudio(page, { emptyHistory: true })
+  const input = page.getByRole('textbox', { name: '消息输入' })
+  await input.fill('已有内容')
+  await input.evaluate((element) => {
+    const textarea = element as HTMLTextAreaElement
+    textarea.setSelectionRange(0, 0)
+  })
+
+  await input.press('/')
+  await expect(input).toHaveValue('/已有内容')
+  expect(await input.evaluate((element) => (element as HTMLTextAreaElement).selectionStart)).toBe(1)
+  await expect(page.getByRole('listbox', { name: '命令和技能建议' })).toBeVisible()
+
+  await input.press('x')
+  await expect(input).toHaveValue('/已有内容')
+  expect(await input.evaluate((element) => (element as HTMLTextAreaElement).selectionStart)).toBe(1)
+
+  await input.press('Escape')
+  await expect(input).toHaveValue('已有内容')
+  expect(await input.evaluate((element) => (element as HTMLTextAreaElement).selectionStart)).toBe(0)
+
+  await input.press('a')
+  await expect(input).toHaveValue('a已有内容')
+  expect(await input.evaluate((element) => (element as HTMLTextAreaElement).selectionStart)).toBe(1)
+
+  await input.fill('已有内容')
+  await input.evaluate((element) => {
+    const textarea = element as HTMLTextAreaElement
+    textarea.setSelectionRange(0, 0)
+  })
+  await input.press('/')
+  await expect(page.getByRole('listbox', { name: '命令和技能建议' })).toBeVisible()
+  await page.locator('.empty-conversation').click({ position: { x: 20, y: 20 } })
+  await expect(page.getByRole('listbox', { name: '命令和技能建议' })).toHaveCount(0)
+  await expect(input).toHaveValue('已有内容')
+  await expect(input).toBeFocused()
+  expect(await input.evaluate((element) => (element as HTMLTextAreaElement).selectionStart)).toBe(0)
+})
+
+test('Plan 澄清按后端题型渲染单选、多选、文本与日期控件', async ({ page }) => {
+  await page.setViewportSize({ width: 1024, height: 900 })
+  await mockStudio(page, { planQuestion: true })
+
+  await expect(page.getByRole('radio', { name: 'Web' })).not.toBeFocused()
+  const singleOptionBounds = await page.locator('.plan-question-option').first().boundingBox()
+  if (!singleOptionBounds) throw new Error('单选项几何不可用')
+  await expect(page.getByRole('button', { name: '浏览下一题' })).toBeDisabled()
+  await expect(page.getByRole('button', { name: '下一题', exact: true })).toBeDisabled()
+  await page.getByRole('radio', { name: 'Web' }).click()
+  await expect(page.getByRole('heading', { name: '需要覆盖哪些平台？' })).toBeVisible()
+  await expect(page.getByRole('checkbox', { name: 'Web' })).not.toBeFocused()
+  await expect(page.getByRole('button', { name: '浏览下一题' })).toBeDisabled()
+  await expect(page.getByRole('button', { name: '下一题', exact: true })).toBeDisabled()
+  await page.getByRole('checkbox', { name: 'Web' }).check()
+  await page.getByRole('textbox', { name: '自定义回答：需要覆盖哪些平台？' }).fill('桌面端')
+  await expect(page.getByRole('checkbox', { name: '移动端' })).toBeDisabled()
+  await expect(page.getByRole('button', { name: '浏览下一题' })).toBeEnabled()
+  await expect(page.getByRole('button', { name: '下一题', exact: true })).toBeEnabled()
+  await page.getByRole('button', { name: '下一题', exact: true }).click()
+
+  const text = page.getByRole('textbox', { name: '自定义回答：还有哪些限制？' })
+  await expect(text).toBeVisible()
+  await expect(text).not.toBeFocused()
+  await expect(page.locator('.plan-question-custom')).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)')
+  await text.fill('必须覆盖离线状态')
+  await page.getByRole('button', { name: '下一题', exact: true }).click()
+
+  const date = page.getByLabel('日期回答：期望完成日期是什么时候？')
+  await expect(date).toHaveAttribute('aria-haspopup', 'grid')
+  await expect(date).not.toBeFocused()
+  const [dateRowBounds, dateIconBounds, dateLabelBounds, dateInputBounds] = await Promise.all([
+    page.locator('.plan-question-date').boundingBox(),
+    page.locator('.plan-question-date > .plan-question-option-index').boundingBox(),
+    page.locator('.plan-question-date-label').boundingBox(),
+    date.boundingBox(),
+  ])
+  if (!dateRowBounds || !dateIconBounds || !dateLabelBounds || !dateInputBounds) {
+    throw new Error('日期选项几何不可用')
+  }
+  const dateRowCenter = dateRowBounds.y + (dateRowBounds.height / 2)
+  expect(dateRowBounds.height).toBeCloseTo(singleOptionBounds.height, 5)
+  expect(dateInputBounds.height).toBeCloseTo(32, 5)
+  for (const bounds of [dateIconBounds, dateLabelBounds, dateInputBounds]) {
+    expect(Math.abs(bounds.y + (bounds.height / 2) - dateRowCenter)).toBeLessThanOrEqual(.5)
+  }
+  const initialDateStyle = await date.evaluate((element) => {
+    const style = getComputedStyle(element)
+    return { backgroundColor: style.backgroundColor, borderColor: style.borderColor }
+  })
+  await date.hover()
+  await expect(date).toHaveCSS('cursor', 'pointer')
+  expect(await date.evaluate((element) => getComputedStyle(element).backgroundColor))
+    .not.toBe(initialDateStyle.backgroundColor)
+  await page.locator('.plan-question-composer-head').hover()
+  await date.focus()
+  expect(await date.evaluate((element) => getComputedStyle(element).borderColor))
+    .not.toBe(initialDateStyle.borderColor)
+  await date.click()
+  const calendar = page.getByRole('application', { name: '选择日期' })
+  await expect(calendar).toBeVisible()
+  await expect(calendar).toHaveCSS('border-radius', '22px')
+  await expect.poll(async () => {
+    const [triggerBounds, calendarBounds] = await Promise.all([
+      date.boundingBox(),
+      calendar.boundingBox(),
+    ])
+    if (!triggerBounds || !calendarBounds) return Number.POSITIVE_INFINITY
+    return Math.abs(
+      triggerBounds.x + triggerBounds.width - calendarBounds.x - calendarBounds.width,
+    )
+  }).toBeLessThanOrEqual(1)
+  const [positionedTriggerBounds, positionedCalendarBounds] = await Promise.all([
+    date.boundingBox(),
+    calendar.boundingBox(),
+  ])
+  if (!positionedTriggerBounds || !positionedCalendarBounds) throw new Error('日期弹层定位几何不可用')
+  const calendarGap = positionedTriggerBounds.y - (
+    positionedCalendarBounds.y + positionedCalendarBounds.height
+  )
+  expect(calendarGap).toBeGreaterThanOrEqual(6.5)
+  expect(calendarGap).toBeLessThanOrEqual(8.5)
+  await expect(page.locator('.plan-question-date input[type="date"]')).toHaveCount(0)
+  const nextMonthValue = await page.evaluate(() => {
+    const now = new Date()
+    const nextMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1)
+    return [
+      String(nextMonth.getFullYear()).padStart(4, '0'),
+      String(nextMonth.getMonth() + 1).padStart(2, '0'),
+      '01',
+    ].join('-')
+  })
+  const [targetYear, targetMonth] = nextMonthValue.split('-').map(Number)
+  await calendar.getByRole('button', { name: '选择月份和年份' }).click()
+  await expect(calendar.locator('[data-month-value]')).toHaveCount(12)
+  await calendar.getByRole('button', { name: '选择年份' }).click()
+  await calendar.locator(`[data-year-value="${targetYear}"]`).click()
+  await calendar.locator(`[data-month-value="${targetMonth}"]`).click()
+  await calendar.locator(`[data-date-value="${nextMonthValue}"]`).click()
+  const expectedDisplay = await page.evaluate((dateValue) => {
+    const [year, month, day] = dateValue.split('-').map(Number)
+    return new Intl.DateTimeFormat('zh-CN', {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(new Date(year, month - 1, day))
+  }, nextMonthValue)
+  await expect(date).toContainText(expectedDisplay)
+  await expect(date).toBeFocused()
+})
+
+test('Plan 澄清切换到长多选题后 Tab 从首项按视觉顺序移动', async ({ page }) => {
+  await page.setViewportSize({ width: 1024, height: 900 })
+  await mockStudio(page, { planQuestion: true, planQuestionForm: planQuestionTabOrderForm })
+
+  await page.getByRole('radio', { name: '继续 1' }).click()
+  await page.getByRole('radio', { name: '继续 2' }).click()
+  await expect(page.getByText('3 / 8')).toBeVisible()
+
+  const options = page.getByRole('checkbox')
+  await expect(options).toHaveCount(8)
+  await page.keyboard.press('Tab')
+  await expect(options.nth(0)).toBeFocused()
+  await page.keyboard.press('Tab')
+  await expect(options.nth(1)).toBeFocused()
+  await page.keyboard.press('Shift+Tab')
+  await expect(options.nth(0)).toBeFocused()
+
+  await options.nth(7).click()
+  await page.getByRole('button', { name: '下一题', exact: true }).click()
+  await expect(page.getByRole('heading', { name: '后续问题 1' })).toBeVisible()
+  await page.getByRole('button', { name: '浏览上一题' }).click()
+  await expect(page.getByText('3 / 8')).toBeVisible()
+  await expect(options.nth(0)).toBeFocused()
+  await page.keyboard.press('Tab')
+  await expect(options.nth(1)).toBeFocused()
+})
+
+test('Plan 澄清返回已作答单选题时保持选中项焦点且移出悬浮项会复原', async ({ page }) => {
+  await page.setViewportSize({ width: 1024, height: 900 })
+  await mockStudio(page, { planQuestion: true })
+
+  await page.getByRole('radio', { name: '移动端' }).click()
+  await expect(page.getByRole('heading', { name: '需要覆盖哪些平台？' })).toBeVisible()
+  await page.getByRole('button', { name: '浏览上一题' }).click()
+
+  const web = page.getByRole('radio', { name: 'Web' })
+  const mobile = page.getByRole('radio', { name: '移动端' })
+  await expect(mobile).toBeFocused()
+  await expect(mobile.locator('.plan-question-option-index svg')).toBeVisible()
+  for (const [colorScheme, hoverBackground, focusBackground] of [
+    ['light', 'rgb(241, 243, 245)', 'rgb(235, 238, 242)'],
+    ['dark', 'rgb(44, 44, 46)', 'rgb(53, 54, 56)'],
+  ] as const) {
+    await page.emulateMedia({ colorScheme })
+    await page.evaluate((theme) => {
+      document.documentElement.dataset.theme = theme
+    }, colorScheme)
+    for (const width of [320, 768, 1024, 1440]) {
+      await page.setViewportSize({ width, height: 900 })
+      await mobile.focus()
+      await page.keyboard.press('Tab')
+      await page.keyboard.press('Shift+Tab')
+      await expect(mobile).toBeFocused()
+      await expect(mobile).toHaveCSS('outline-style', 'none')
+      await expect(mobile).toHaveCSS('background-color', focusBackground)
+      await web.hover()
+      await expect(web).toHaveCSS('background-color', hoverBackground)
+      await page.locator('.plan-question-toggle-surface').hover({ position: { x: 20, y: 20 } })
+      await expect(web).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)')
+      await expect(mobile).toBeFocused()
+      const overflow = await page.evaluate(() => Math.max(
+        document.documentElement.scrollWidth - document.documentElement.clientWidth,
+        document.body.scrollWidth - document.body.clientWidth,
+      ))
+      expect(overflow).toBeLessThanOrEqual(0)
+    }
+  }
+
+  await page.emulateMedia({ colorScheme: 'light', reducedMotion: 'reduce' })
+  await expect(web).toHaveCSS('transition-duration', '0s')
+})
+
 test('收起的审批、Plan 澄清与草稿和标准输入框同高同宽且内部布局同步', async ({ page }) => {
   type Geometry = {
     surface: { x: number; y: number; width: number; height: number }
@@ -882,7 +1248,7 @@ test('收起的审批、Plan 澄清与草稿和标准输入框同高同宽且内
       expect(Math.abs(headingCenter - surfaceCenter)).toBeLessThanOrEqual(1)
       expect(Math.abs(actionsCenter - surfaceCenter)).toBeLessThanOrEqual(1)
       expect(geometry.surface.height).toBeCloseTo(94, 5)
-      expect(geometry.header.height).toBeCloseTo(92, 5)
+      expect(geometry.header.height).toBeCloseTo(94, 5)
     }
 
     if (!question.header || !question.heading || !question.actions || !question.progress || !question.progressBar) {
@@ -896,11 +1262,11 @@ test('收起的审批、Plan 澄清与草稿和标准输入框同高同宽且内
       question.actions.y + (question.actions.height / 2) - questionHeaderCenter,
     )).toBeLessThanOrEqual(1)
     expect(question.surface.height).toBeCloseTo(94, 5)
-    expect(question.header.height).toBeCloseTo(68, 5)
+    expect(question.header.height).toBeCloseTo(70, 5)
     expect(question.progress.height).toBeCloseTo(24, 5)
     expect(question.surface.y + question.surface.height - (
       question.progress.y + question.progress.height
-    )).toBeCloseTo(1, 5)
+    )).toBeCloseTo(0, 5)
     expect(Math.abs(
       question.heading.y - question.surface.y
       - (question.surface.y + question.surface.height
@@ -971,6 +1337,291 @@ test('展开的审批、Plan 澄清与草稿使用一致的标题说明垂直节
       expect(rhythm.titleToDescription).toBeCloseTo(10, 5)
     }
   }
+})
+
+test('展开的审批、Plan 澄清与草稿使用一致最小高度并避开等待状态', async ({ page }) => {
+  type Geometry = {
+    cardHeight: number
+    maxCardHeight: number
+    cardTop: number
+    bodyClientHeight: number
+    bodyScrollHeight: number
+    conversationBottom: number
+    dockTop: number
+    scrollBottomDistance: number
+    waitClearance: number
+    maxConversationGap: number
+    maxScrollBottomDistance: number
+    maxWaitClearance: number
+  }
+  const viewports = [
+    { width: 320, height: 640 },
+    { width: 768, height: 900 },
+    { width: 1024, height: 900 },
+    { width: 1440, height: 900 },
+  ]
+  const collectGeometry = async ({
+    cardSelector,
+    bodySelector,
+    toggleSelector,
+    waitSelector,
+  }: {
+    cardSelector: string
+    bodySelector: string
+    toggleSelector: string
+    waitSelector: string
+  }) => {
+    const result = new Map<string, Geometry>()
+    const card = page.locator(cardSelector)
+    const resizeHandle = page.getByRole('separator', { name: '调整交互卡片高度' })
+    await page.locator(toggleSelector).click()
+    await expect(card).toHaveClass(/is-minimized/)
+    await expect(resizeHandle).toHaveCount(0)
+    await page.locator(toggleSelector).click()
+    await expect(card).not.toHaveClass(/is-minimized/)
+    await expect(resizeHandle).toBeVisible()
+    for (const colorScheme of ['light', 'dark'] as const) {
+      await page.emulateMedia({ colorScheme })
+      await page.evaluate((theme) => {
+        document.documentElement.dataset.theme = theme
+      }, colorScheme)
+      for (const viewport of viewports) {
+        await page.setViewportSize(viewport)
+        const closeNavigation = page.getByRole('button', { name: '关闭导航' })
+        if (await closeNavigation.isVisible()) await closeNavigation.click()
+        await card.evaluate((element) => {
+          const cardElement = element as HTMLElement
+          cardElement.style.removeProperty('--interaction-card-height')
+          window.dispatchEvent(new Event('resize'))
+        })
+        await page.evaluate(() => new Promise<void>((resolve) => {
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+        }))
+        const body = page.locator(bodySelector)
+        const waitDots = page.locator(`${waitSelector} .activity-dots`)
+        const [cardBounds, dotsBounds, conversationBounds, dockBounds, bodyMetrics, paneMetrics] = await Promise.all([
+          card.boundingBox(),
+          waitDots.boundingBox(),
+          page.locator('.conversation-region').boundingBox(),
+          page.locator('.composer-dock').boundingBox(),
+          body.evaluate((element) => ({
+            clientHeight: element.clientHeight,
+            scrollHeight: element.scrollHeight,
+          })),
+          page.locator('.conversation-pane').evaluate((element) => ({
+            clientHeight: element.clientHeight,
+            scrollHeight: element.scrollHeight,
+            scrollTop: element.scrollTop,
+          })),
+        ])
+        if (!cardBounds || !dotsBounds || !conversationBounds || !dockBounds) {
+          throw new Error('交互卡片响应式几何不可用')
+        }
+        const expectedMinHeight = Math.min(320, Math.max(260, viewport.height * .32))
+        const expectedMaxHeight = Math.min(680, Math.max(
+          expectedMinHeight,
+          viewport.height - 60 - 120 - 40,
+        ))
+        await resizeHandle.focus()
+        await page.keyboard.press('End')
+        await expect.poll(async () => (await card.boundingBox())?.height ?? 0)
+          .toBeCloseTo(expectedMaxHeight, 3)
+        const [maxCardBounds, maxConversationBounds, maxWaitBounds, maxPaneMetrics] = await Promise.all([
+          card.boundingBox(),
+          page.locator('.conversation-region').boundingBox(),
+          page.locator(`${waitSelector} .activity-dots`).boundingBox(),
+          page.locator('.conversation-pane').evaluate((element) => ({
+            clientHeight: element.clientHeight,
+            scrollHeight: element.scrollHeight,
+            scrollTop: element.scrollTop,
+          })),
+        ])
+        if (!maxCardBounds || !maxConversationBounds || !maxWaitBounds) {
+          throw new Error('交互卡片最大高度响应式几何不可用')
+        }
+        await page.keyboard.press('Home')
+        await expect.poll(async () => (await card.boundingBox())?.height ?? 0)
+          .toBeCloseTo(expectedMinHeight, 3)
+        result.set(`${colorScheme}-${viewport.width}x${viewport.height}`, {
+          cardHeight: cardBounds.height,
+          maxCardHeight: maxCardBounds.height,
+          cardTop: cardBounds.y,
+          bodyClientHeight: bodyMetrics.clientHeight,
+          bodyScrollHeight: bodyMetrics.scrollHeight,
+          conversationBottom: conversationBounds.y + conversationBounds.height,
+          dockTop: dockBounds.y,
+          scrollBottomDistance: paneMetrics.scrollHeight - paneMetrics.scrollTop - paneMetrics.clientHeight,
+          waitClearance: cardBounds.y - (dotsBounds.y + dotsBounds.height),
+          maxConversationGap: maxCardBounds.y - (
+            maxConversationBounds.y + maxConversationBounds.height
+          ),
+          maxScrollBottomDistance: maxPaneMetrics.scrollHeight
+            - maxPaneMetrics.scrollTop - maxPaneMetrics.clientHeight,
+          maxWaitClearance: maxCardBounds.y - (maxWaitBounds.y + maxWaitBounds.height),
+        })
+      }
+    }
+    return result
+  }
+
+  await mockStudio(page, { approval: true })
+  const approvalGeometry = await collectGeometry({
+    cardSelector: '.approval-composer',
+    bodySelector: '.approval-composer-body',
+    toggleSelector: '.approval-toggle-surface',
+    waitSelector: '.approval-wait-state',
+  })
+
+  await page.evaluate(() => sessionStorage.clear())
+  await page.unroute('**/api/**')
+  await mockStudio(page, { planQuestion: true })
+  const shortQuestionGeometry = await collectGeometry({
+    cardSelector: '.plan-question-composer',
+    bodySelector: '.plan-question-composer-body',
+    toggleSelector: '.plan-question-toggle-surface',
+    waitSelector: '.plan-question-wait-state',
+  })
+
+  await page.evaluate(() => sessionStorage.clear())
+  await page.unroute('**/api/**')
+  await mockStudio(page, { planQuestion: true, planQuestionForm: longPlanQuestionForm })
+  const longQuestionGeometry = await collectGeometry({
+    cardSelector: '.plan-question-composer',
+    bodySelector: '.plan-question-composer-body',
+    toggleSelector: '.plan-question-toggle-surface',
+    waitSelector: '.plan-question-wait-state',
+  })
+
+  await page.evaluate(() => sessionStorage.clear())
+  await page.unroute('**/api/**')
+  await mockStudio(page, { planReview: true })
+  const reviewGeometry = await collectGeometry({
+    cardSelector: '.plan-review-composer',
+    bodySelector: '.plan-review-composer-body',
+    toggleSelector: '.plan-review-toggle-surface',
+    waitSelector: '.plan-review-wait-state',
+  })
+
+  for (const [key, approval] of approvalGeometry) {
+    const shortQuestion = shortQuestionGeometry.get(key)
+    const longQuestion = longQuestionGeometry.get(key)
+    const review = reviewGeometry.get(key)
+    if (!shortQuestion || !longQuestion || !review) throw new Error(`缺少 ${key} 交互卡片几何`)
+    const viewport = viewports.find(({ width, height }) => key.endsWith(`${width}x${height}`))
+    if (!viewport) throw new Error(`缺少 ${key} 视口定义`)
+    const expectedHeight = Math.min(320, Math.max(260, viewport.height * .32))
+    const expectedMaxHeight = Math.min(680, Math.max(
+      expectedHeight,
+      viewport.height - 60 - 120 - 40,
+    ))
+    for (const geometry of [approval, shortQuestion, longQuestion, review]) {
+      expect(geometry.cardHeight).toBeCloseTo(expectedHeight, 3)
+      expect(geometry.maxCardHeight).toBeCloseTo(expectedMaxHeight, 3)
+      expect(geometry.bodyClientHeight).toBeGreaterThan(0)
+      expect(geometry.dockTop).toBeCloseTo(geometry.conversationBottom, 3)
+      expect(geometry.cardTop - geometry.dockTop).toBeCloseTo(24, 3)
+      expect(geometry.scrollBottomDistance).toBeLessThanOrEqual(1)
+      expect(geometry.waitClearance).toBeGreaterThanOrEqual(40)
+      expect(geometry.maxConversationGap).toBeCloseTo(24, 3)
+      expect(geometry.maxScrollBottomDistance).toBeLessThanOrEqual(1)
+      expect(geometry.maxWaitClearance).toBeGreaterThanOrEqual(40)
+    }
+    expect(shortQuestion.cardHeight).toBeCloseTo(longQuestion.cardHeight, 3)
+    expect(longQuestion.bodyScrollHeight).toBeGreaterThan(longQuestion.bodyClientHeight)
+  }
+})
+
+test('三类交互卡片上边框悬浮只启用拖拽光标并共享高度边界', async ({ page }) => {
+  await page.setViewportSize({ width: 1024, height: 900 })
+
+  const auditResize = async ({
+    cardSelector,
+    waitSelector,
+  }: {
+    cardSelector: string
+    waitSelector: string
+  }) => {
+    const card = page.locator(cardSelector)
+    const handle = page.getByRole('separator', { name: '调整交互卡片高度' })
+    await expect(handle).toBeVisible()
+    const initialBounds = await card.boundingBox()
+    const handleBounds = await handle.boundingBox()
+    if (!initialBounds || !handleBounds) throw new Error('交互卡片拖拽几何不可用')
+    expect(initialBounds.height).toBeCloseTo(288, 3)
+    expect(await handle.evaluate((element) => getComputedStyle(element, '::after').opacity)).toBe('0')
+
+    await page.mouse.move(handleBounds.x + (handleBounds.width / 2), handleBounds.y + 2)
+    await expect(handle).toHaveCSS('cursor', 'ns-resize')
+    expect(await handle.evaluate((element) => getComputedStyle(element, '::after').opacity)).toBe('0')
+
+    await page.mouse.down()
+    await page.mouse.move(
+      handleBounds.x + (handleBounds.width / 2),
+      handleBounds.y - 158,
+      { steps: 8 },
+    )
+    await page.mouse.up()
+    await expect.poll(async () => (await card.boundingBox())?.height ?? 0).toBeCloseTo(448, 3)
+    const releasedHeight = (await card.boundingBox())?.height
+    await page.evaluate(() => new Promise<void>((resolve) => {
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+    }))
+    expect((await card.boundingBox())?.height).toBeCloseTo(releasedHeight ?? 0, 5)
+
+    await handle.focus()
+    await page.keyboard.press('End')
+    await expect.poll(async () => (await card.boundingBox())?.height ?? 0).toBeCloseTo(680, 3)
+    await expect(handle).toHaveAttribute('aria-valuemin', '288')
+    await expect(handle).toHaveAttribute('aria-valuemax', '680')
+    await expect(handle).toHaveAttribute('aria-valuenow', '680')
+
+    const [maxCardBounds, conversationBounds, dockBounds, waitBounds, paneMetrics] = await Promise.all([
+      card.boundingBox(),
+      page.locator('.conversation-region').boundingBox(),
+      page.locator('.composer-dock').boundingBox(),
+      page.locator(`${waitSelector} .activity-dots`).boundingBox(),
+      page.locator('.conversation-pane').evaluate((element) => ({
+        clientHeight: element.clientHeight,
+        scrollHeight: element.scrollHeight,
+        scrollTop: element.scrollTop,
+      })),
+    ])
+    if (!maxCardBounds || !conversationBounds || !dockBounds || !waitBounds) {
+      throw new Error('交互卡片最大高度几何不可用')
+    }
+    expect(dockBounds.y).toBeCloseTo(conversationBounds.y + conversationBounds.height, 3)
+    expect(maxCardBounds.y - dockBounds.y).toBeCloseTo(24, 3)
+    expect(maxCardBounds.y - (waitBounds.y + waitBounds.height)).toBeGreaterThanOrEqual(40)
+    expect(paneMetrics.scrollHeight - paneMetrics.scrollTop - paneMetrics.clientHeight)
+      .toBeLessThanOrEqual(1)
+
+    await page.keyboard.press('Home')
+    await expect.poll(async () => (await card.boundingBox())?.height ?? 0).toBeCloseTo(288, 3)
+    await expect(handle).toHaveAttribute('aria-valuenow', '288')
+    await handle.evaluate((element) => (element as HTMLElement).blur())
+    await page.mouse.move(8, 8)
+    await expect.poll(() => handle.evaluate((element) => (
+      getComputedStyle(element, '::after').opacity
+    ))).toBe('0')
+  }
+
+  await mockStudio(page, { approval: true })
+  await auditResize({ cardSelector: '.approval-composer', waitSelector: '.approval-wait-state' })
+
+  await page.evaluate(() => sessionStorage.clear())
+  await page.unroute('**/api/**')
+  await mockStudio(page, { planQuestion: true })
+  await auditResize({ cardSelector: '.plan-question-composer', waitSelector: '.plan-question-wait-state' })
+
+  await page.evaluate(() => sessionStorage.clear())
+  await page.unroute('**/api/**')
+  await mockStudio(page, { planReview: true })
+  await auditResize({ cardSelector: '.plan-review-composer', waitSelector: '.plan-review-wait-state' })
+
+  await page.emulateMedia({ reducedMotion: 'reduce' })
+  expect(await page.getByRole('separator', { name: '调整交互卡片高度' }).evaluate((element) => (
+    getComputedStyle(element, '::after').transitionDuration
+  ))).toBe('0s')
 })
 
 test('普通、审批、Plan 澄清与草稿共用固定说明和下边框基线', async ({ page }) => {
@@ -1064,7 +1715,9 @@ test('Tool 审批按独立卡片顺序接管输入区并保留会话待办状态
   const waitState = page.locator('.approval-wait-state')
   const pausedToolHeader = card.locator('.tool-row.paused > summary')
 
-  await expect(page.locator('.message-list [data-tool-name="write_file"]')).toHaveCount(2)
+  const conversationApprovalTool = page.locator('.message-list [data-tool-name="write_file"]')
+  await expect(conversationApprovalTool).toHaveCount(1)
+  await expect(conversationApprovalTool).toContainText('/first-approval.txt')
   await expect(card.locator('[data-tool-name="write_file"]')).toHaveCount(1)
   await expect(waitState.locator('.activity-dots')).toBeVisible()
   await expect(waitState.locator('.approval-status-row')).toHaveCount(0)
@@ -1080,7 +1733,7 @@ test('Tool 审批按独立卡片顺序接管输入区并保留会话待办状态
     }, colorScheme)
     for (const width of [320, 768, 1024, 1440]) {
       await page.setViewportSize({ width, height: 900 })
-      await expect(card).toHaveCSS('border-color', 'rgb(247, 173, 49)')
+      await expect(card).toHaveCSS('border-top-width', '0px')
       await expect(header).toHaveCSS('background-color', headerBackground)
       expect(await statusDot.evaluate((element) => getComputedStyle(element, '::before').backgroundColor))
         .toBe('rgb(245, 158, 11)')
@@ -1183,8 +1836,17 @@ test('Tool 审批按独立卡片顺序接管输入区并保留会话待办状态
   await expect(card).toContainText('/first-approval.txt')
   await allow.click()
   await expect(card).toContainText('/second-approval.txt')
-  await card.getByRole('button', { name: '拒绝' }).click()
-  await expect(card.getByRole('textbox', { name: '拒绝原因（可选）' })).toBeVisible()
+  await expect(conversationApprovalTool).toHaveCount(1)
+  await expect(conversationApprovalTool).toContainText('/second-approval.txt')
+  const reject = card.getByRole('button', { name: '拒绝' })
+  await expect(reject).toBeFocused()
+  await reject.click()
+  const rejectionReason = card.getByRole('textbox', { name: '拒绝原因（可选）' })
+  await expect(rejectionReason).toBeFocused()
+  await card.getByRole('button', { name: '取消' }).click()
+  await expect(reject).toBeFocused()
+  await reject.click()
+  await expect(rejectionReason).toBeFocused()
   await card.getByRole('button', { name: '收起审批卡片' }).last().click()
   await expect(card.getByRole('button', { name: '确认拒绝' })).toHaveCount(0)
   const collapsedAlignment = await card.evaluate((element) => {
@@ -1560,9 +2222,9 @@ test('提问等待状态与上一条气泡使用公共顶层间距', async ({ pa
   const waitDots = waitState.locator('.activity-dots')
   const messageList = page.locator('.message-list')
 
-  for (const [colorScheme, borderColor, headerBackground, accentColor] of [
-    ['light', 'rgb(140, 163, 254)', 'rgb(237, 243, 254)', 'rgb(57, 100, 254)'],
-    ['dark', 'rgb(103, 158, 254)', 'rgb(40, 49, 66)', 'rgb(103, 158, 254)'],
+  for (const [colorScheme, headerBackground, accentColor] of [
+    ['light', 'rgb(237, 243, 254)', 'rgb(57, 100, 254)'],
+    ['dark', 'rgb(40, 49, 66)', 'rgb(103, 158, 254)'],
   ] as const) {
     await page.emulateMedia({ colorScheme })
     await page.evaluate((theme) => {
@@ -1570,7 +2232,7 @@ test('提问等待状态与上一条气泡使用公共顶层间距', async ({ pa
     }, colorScheme)
     for (const width of [320, 768, 1024, 1440]) {
       await page.setViewportSize({ width, height: 900 })
-      await expect(card).toHaveCSS('border-color', borderColor)
+      await expect(card).toHaveCSS('border-top-width', '0px')
       await expect(header).toHaveCSS('background-color', headerBackground)
       await expect(attentionDot).toHaveClass(/is-plan/)
       await expect(attentionDot).toHaveCSS('color', accentColor)
@@ -1613,8 +2275,11 @@ test('计划草稿以三动作卡片接管输入区并保持 Plan 视觉契约',
 
   await expect(page.locator('.composer-takeover .plan-review-composer')).toHaveCount(1)
   await expect(page.locator('.message-list .plan-review-composer')).toHaveCount(0)
+  await expect(card.locator('.plan-review-composer-heading h2')).toContainText('Plan')
+  await expect(card.locator('.plan-review-composer-heading p'))
+    .toHaveText('保持现有会话行为并完成响应式验证')
   await expect(card.locator('.plan-review-composer-heading small')).toHaveText('· 第 3 版')
-  await expect(waitState).toContainText('计划草稿')
+  await expect(waitState).toContainText('Plan')
   await expect(waitState).toContainText('等待审阅')
   await expect(waitDots).toBeVisible()
   await expect(card.getByRole('button', { name: '拒绝' })).toBeVisible()
@@ -1623,9 +2288,9 @@ test('计划草稿以三动作卡片接管输入区并保持 Plan 视觉契约',
   await expect(card.getByRole('button', { name: '编辑' })).toHaveCount(0)
   await expect(card.getByRole('button', { name: /关闭|放弃/ })).toHaveCount(0)
 
-  for (const [colorScheme, borderColor, headerBackground] of [
-    ['light', 'rgb(247, 173, 49)', 'rgb(254, 245, 231)'],
-    ['dark', 'rgb(247, 173, 49)', 'rgb(39, 36, 31)'],
+  for (const [colorScheme, headerBackground] of [
+    ['light', 'rgb(254, 245, 231)'],
+    ['dark', 'rgb(39, 36, 31)'],
   ] as const) {
     await page.emulateMedia({ colorScheme })
     await page.evaluate((theme) => {
@@ -1637,7 +2302,7 @@ test('计划草稿以三动作卡片接管输入区并保持 Plan 视觉契约',
         const closeNavigation = page.getByRole('button', { name: '关闭导航' })
         if (await closeNavigation.isVisible()) await closeNavigation.click()
       }
-      await expect(card).toHaveCSS('border-color', borderColor)
+      await expect(card).toHaveCSS('border-top-width', '0px')
       await expect(header).toHaveCSS('background-color', headerBackground)
       await expect(statusRow.locator('.plan-interaction-status-label')).toHaveCSS('font-weight', '400')
       const [cardBounds, statusBounds, dotsBounds, messageListBounds] = await Promise.all([
@@ -1662,15 +2327,28 @@ test('计划草稿以三动作卡片接管输入区并保持 Plan 视觉契约',
         if (!bounds) continue
         expect(bounds.x).toBeGreaterThanOrEqual(cardBounds.x)
         expect(bounds.x + bounds.width).toBeLessThanOrEqual(cardBounds.x + cardBounds.width)
+        expect(bounds.height).toBeLessThanOrEqual(44)
       }
     }
   }
 
+  await page.emulateMedia({ colorScheme: 'light' })
+  const feedback = card.getByRole('button', { name: '反馈' })
+  await feedback.click()
+  const feedbackInput = card.getByRole('textbox', { name: '需要调整的内容' })
+  const submitDecision = card.getByRole('button', { name: '提交决定' })
+  await expect(feedbackInput).toBeFocused()
+  await expect(feedbackInput).toHaveAttribute('required', '')
+  await expect(submitDecision).toBeDisabled()
+  await feedbackInput.fill('补充断连恢复验证')
+  await expect(submitDecision).toBeEnabled()
+
   await card.getByRole('button', { name: '收起计划草稿', exact: true }).click()
   await expect(card.getByRole('region', { name: '计划草稿内容' })).toHaveCount(0)
-  await expect(card).toContainText('请审阅计划，批准后开始执行')
+  await expect(card).toContainText('保持现有会话行为并完成响应式验证')
   await expect(card).not.toContainText('等待审阅')
   await expect(card.getByRole('button', { name: '展开计划草稿', exact: true })).toHaveAttribute('aria-expanded', 'false')
+  await expect(card.getByRole('button', { name: '点击标题区域展开计划草稿' })).toHaveAttribute('aria-expanded', 'false')
 })
 
 test('Tool 与回答复制图标严格对齐正文左缘', async ({ page }) => {
@@ -2251,6 +2929,55 @@ test.describe('touch/coarse pointer', () => {
       expect(iconBounds.width).toBeCloseTo(20, 5)
       expect(iconBounds.height).toBeCloseTo(20, 5)
       expect(bubbleBounds.y - (buttonBounds.y + buttonBounds.height)).toBeCloseTo(57, 5)
+    }
+  })
+
+  test('无悬浮能力的触控环境保持交互卡片最小高度且不暴露拖拽边缘', async ({ page }) => {
+    await mockStudio(page, { approval: true })
+    expect(await page.evaluate(() => matchMedia('(any-pointer: coarse)').matches)).toBe(true)
+
+    const card = page.getByRole('region', { name: '等待审批' })
+    const handle = page.locator('.interaction-card-resize-handle')
+    await expect(handle).toHaveCSS('display', 'none')
+    await expect(page.getByRole('separator', { name: '调整交互卡片高度' })).toHaveCount(0)
+    const bounds = await card.boundingBox()
+    if (!bounds) throw new Error('触控审批卡片几何不可用')
+    expect(bounds.height).toBeCloseTo(844 * .32, 2)
+  })
+
+  test('共享日期选择器在触控与浅深主题下保持可用尺寸和视口边界', async ({ page }) => {
+    await mockStudio(page, { planQuestion: true, planQuestionForm: dateOnlyPlanQuestionForm })
+    const closeNavigation = page.getByRole('button', { name: '关闭导航' })
+    if (await closeNavigation.isVisible()) await closeNavigation.click()
+    const trigger = page.getByRole('button', { name: '日期回答：目标发布日期是哪一天？' })
+
+    for (const colorScheme of ['light', 'dark'] as const) {
+      await page.emulateMedia({ colorScheme })
+      await page.evaluate((theme) => {
+        document.documentElement.dataset.theme = theme
+      }, colorScheme)
+      const triggerBounds = await trigger.boundingBox()
+      if (!triggerBounds) throw new Error('触控日期入口几何不可用')
+      expect(triggerBounds.height).toBeGreaterThanOrEqual(44)
+      await expect(trigger).toHaveCSS('cursor', 'pointer')
+      await trigger.click()
+
+      const calendar = page.getByRole('application', { name: '选择日期' })
+      const [calendarBounds, previousBounds, dayBounds] = await Promise.all([
+        calendar.boundingBox(),
+        calendar.getByRole('button', { name: '上个月' }).boundingBox(),
+        calendar.locator('.ui-date-picker__day').first().boundingBox(),
+      ])
+      if (!calendarBounds || !previousBounds || !dayBounds) throw new Error('触控月历几何不可用')
+      expect(calendarBounds.x).toBeGreaterThanOrEqual(0)
+      expect(calendarBounds.y).toBeGreaterThanOrEqual(0)
+      expect(calendarBounds.x + calendarBounds.width).toBeLessThanOrEqual(390)
+      expect(calendarBounds.y + calendarBounds.height).toBeLessThanOrEqual(844)
+      expect(Math.round(previousBounds.width)).toBeGreaterThanOrEqual(44)
+      expect(Math.round(previousBounds.height)).toBeGreaterThanOrEqual(44)
+      expect(Math.round(dayBounds.height)).toBeGreaterThanOrEqual(44)
+      await page.keyboard.press('Escape')
+      await expect(trigger).toBeFocused()
     }
   })
 

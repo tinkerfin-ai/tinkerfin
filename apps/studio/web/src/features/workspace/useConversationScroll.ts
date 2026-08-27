@@ -139,20 +139,25 @@ export function useConversationScroll({
       const isScrollingTowardBottom = lastScrollTop != null && pane.scrollTop > lastScrollTop
       previousScrollTop.current = pane.scrollTop
       const isNearBottom = pane.scrollHeight - pane.scrollTop - pane.clientHeight <= 96
-      followLatest.current = isNearBottom
       if (isNearBottom) {
+        followLatest.current = true
         scrollingToBottom.current = false
         clearScrollButtonTimers()
         setScrollButtonPhase('hidden')
         scrollButtonHovered.current = false
         userHasScrolled.current = false
+      } else if (userHasScrolled.current) {
+        followLatest.current = false
+        if (scrollingToBottom.current) {
+          setScrollButtonPhase('hidden')
+        } else if (!isScrollingTowardBottom || scrollButtonPhase.current === 'visible') {
+          setScrollButtonPhase('visible')
+          if (!scrollButtonHovered.current && !scrollButtonFocused.current) armScrollButtonFade()
+        }
       } else if (scrollingToBottom.current) {
         setScrollButtonPhase('hidden')
-      } else if (!userHasScrolled.current) {
+      } else {
         setScrollButtonPhase('hidden')
-      } else if (!isScrollingTowardBottom || scrollButtonPhase.current === 'visible') {
-        setScrollButtonPhase('visible')
-        if (!scrollButtonHovered.current && !scrollButtonFocused.current) armScrollButtonFade()
       }
     })
   }, [armScrollButtonFade, clearScrollButtonTimers, conversation.threadId, scheduleScrollPersistence, setScrollButtonPhase])

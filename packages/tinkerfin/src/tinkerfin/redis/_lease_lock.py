@@ -28,7 +28,7 @@ from ..errors import (
     TinkerFinErrorCode,
 )
 
-_DEFAULT_KEY_PREFIX = "tinkerfin:lease:v1:"
+_DEFAULT_KEY_PREFIX = "tinkerfin:lease:"
 _DEFAULT_LEASE_TTL_SECONDS = 30.0
 _DEFAULT_WAIT_POLL_SECONDS = 0.1
 _RENEW_COMMAND_DEADLINE_RATIO = 0.8

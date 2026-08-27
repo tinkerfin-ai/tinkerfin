@@ -1,8 +1,9 @@
 import { ChevronDown, ChevronUp } from 'lucide-react'
-import type { ReactNode, RefObject } from 'react'
+import { useId, useRef, type ReactNode, type RefObject } from 'react'
 
 import { IconButton } from '../../../components/ui'
 import { ActivityDots } from './ActivityDots'
+import { InteractionCardResizeHandle } from './InteractionCardResizeHandle'
 
 type PlanInteractionKind = 'question' | 'review'
 
@@ -78,11 +79,15 @@ export function PlanInteractionCard({
   children: ReactNode
 }) {
   const namespace = namespaceFor(kind)
+  const cardId = useId()
+  const cardRef = useRef<HTMLElement>(null)
   const toggleSurfaceClass = kind === 'question'
     ? 'plan-question-toggle-surface'
     : 'plan-review-toggle-surface'
   return (
     <section
+      ref={cardRef}
+      id={cardId}
       className={`plan-interaction-card ${namespace}${minimized ? ' is-minimized' : ''}`}
       aria-label={ariaLabel}
       onWheel={(event) => {
@@ -100,11 +105,13 @@ export function PlanInteractionCard({
         }
       }}
     >
+      {!minimized && <InteractionCardResizeHandle cardRef={cardRef} controls={cardId} />}
       <header className={`plan-interaction-card-head ${namespace}-head`}>
         <button
           type="button"
           className={`plan-interaction-toggle-surface ${toggleSurfaceClass}`}
           aria-label={toggleSurfaceLabel}
+          aria-expanded={!minimized}
           onClick={onToggle}
         />
         <div className={`plan-interaction-card-heading ${namespace}-heading`}>

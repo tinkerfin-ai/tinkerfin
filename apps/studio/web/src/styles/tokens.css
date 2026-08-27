@@ -54,7 +54,6 @@
     --color-brand-text: var(--primitive-blue-700);
     --color-on-brand: var(--primitive-white);
     --color-plan-panel-accent: var(--color-brand);
-    --color-plan-panel-border: var(--primitive-blue-300);
     --color-plan-panel-background: var(--primitive-blue-50);
     --color-selection: var(--primitive-blue-300);
     --color-on-selection: var(--primitive-gray-950);
@@ -71,7 +70,6 @@
     --color-warning-text: var(--primitive-amber-800);
     --color-on-warning: var(--primitive-gray-950);
     --color-warning-panel-accent: var(--primitive-amber-500);
-    --color-warning-panel-border: var(--primitive-amber-400);
     --color-warning-panel-background: var(--primitive-amber-100);
     --color-focus: var(--primitive-blue-600);
     --color-focus-soft: rgb(57 100 254 / 18%);
@@ -121,6 +119,11 @@
     --layout-conversation-width: 748px;
     --layout-composer-width: 780px;
     --layout-composer-surface-height: 94px;
+    --layout-interaction-card-min-height: clamp(260px, 32dvh, 320px);
+    --layout-interaction-card-context-reserve: 120px;
+    --layout-interaction-card-max-cap: 680px;
+    --layout-interaction-card-max-height: clamp(var(--layout-interaction-card-min-height), calc(100dvh - var(--layout-header-height) - var(--layout-interaction-card-context-reserve) - var(--space-10)), var(--layout-interaction-card-max-cap));
+    --layout-interaction-card-gap: var(--space-6);
     --layout-content-medium: 712px;
     --layout-task-drawer: 348px;
     --layout-header-height: 60px;
@@ -183,7 +186,6 @@
     --color-brand-soft: #283142;
     --color-brand-text: #8ab4ff;
     --color-on-brand: #151517;
-    --color-plan-panel-border: var(--color-brand);
     --color-plan-panel-background: var(--color-brand-soft);
     --color-selection: var(--color-brand);
     --color-on-selection: var(--color-on-brand);
@@ -200,7 +202,6 @@
     --color-warning-text: #ffc869;
     --color-on-warning: #151517;
     --color-warning-panel-accent: var(--primitive-amber-500);
-    --color-warning-panel-border: var(--primitive-amber-400);
     --color-warning-panel-background: var(--primitive-amber-900);
     --color-focus: #8ab4ff;
     --color-focus-soft: rgb(103 158 254 / 24%);

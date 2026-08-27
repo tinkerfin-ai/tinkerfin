@@ -19,6 +19,20 @@ import type { LocalAttachment } from '../useLocalAttachments'
 import { ComposerPlanChip } from './ComposerPlanChip'
 import { ComposerSuggestionMenu } from './ComposerSuggestionMenu'
 
+const APPLE_PLATFORM = /Mac|iPhone|iPad|iPod/
+
+const deleteToLogicalLineStart = (
+  value: string,
+  selectionStart: number,
+  selectionEnd: number,
+) => {
+  const lineStart = value.lastIndexOf('\n', Math.max(-1, selectionStart - 1)) + 1
+  return applyAtomicPlanDeletion(value, lineStart, selectionEnd, 'backward') ?? {
+    value: `${value.slice(0, lineStart)}${value.slice(selectionEnd)}`,
+    caret: lineStart,
+  }
+}
+
 export function Composer({
   value,
   isRunning,
@@ -67,6 +81,7 @@ export function Composer({
   const inputScroll = useRef<HTMLDivElement>(null)
   const fileInput = useRef<HTMLInputElement>(null)
   const pendingCaret = useRef<number | null>(null)
+  const acceptedCaret = useRef(value.length)
   const menuId = `composer-suggestions-${useId()}`
   const [caret, setCaret] = useState(value.length)
   const [activeSuggestionId, setActiveSuggestionId] = useState<string>()
@@ -94,16 +109,17 @@ export function Composer({
   const planClaim = planClaimParts(value)
   const canSubmitDraft = Boolean(value.trim()) && isSubmittableComposerDraft(value)
   const cancelSuggestionMenu = useCallback(() => {
-    const cancellation = cancelComposerSuggestion(value)
+    const cancellation = cancelComposerSuggestion(value, slashHit ?? undefined)
     pendingCaret.current = cancellation.caret
     onChange(cancellation.value)
-  }, [onChange, value])
+  }, [onChange, slashHit, value])
 
   useLayoutEffect(() => {
     if (pendingCaret.current == null) return
     const nextCaret = pendingCaret.current
     pendingCaret.current = null
     input.current?.setSelectionRange(nextCaret, nextCaret)
+    acceptedCaret.current = nextCaret
     setCaret(nextCaret)
   }, [value])
 
@@ -147,6 +163,26 @@ export function Composer({
         pickSuggestion(resolvedActiveId)
         return
       }
+    }
+    if (
+      event.key.toLowerCase() === 'u'
+      && event.ctrlKey
+      && !event.metaKey
+      && !event.altKey
+      && !event.shiftKey
+      && APPLE_PLATFORM.test(window.navigator.platform || window.navigator.userAgent)
+      && !event.nativeEvent.isComposing
+      && event.nativeEvent.keyCode !== 229
+    ) {
+      event.preventDefault()
+      const edit = deleteToLogicalLineStart(
+        value,
+        event.currentTarget.selectionStart,
+        event.currentTarget.selectionEnd,
+      )
+      pendingCaret.current = edit.caret
+      onChange(edit.value)
+      return
     }
     if (event.key === 'Backspace' || event.key === 'Delete') {
       const atomicEdit = applyAtomicPlanDeletion(
@@ -244,11 +280,33 @@ export function Composer({
               disabled={isDisabled}
               value={value}
               onChange={(event) => {
-                if (!isAllowedComposerDraft(event.target.value)) return
-                setCaret(event.target.selectionStart)
-                onChange(event.target.value)
+                const nextValue = event.target.value
+                const nextCaret = event.target.selectionStart
+                const nextSlashHit = detectLeadingSlashToken(nextValue, nextCaret)
+                const keepsEnabledSuggestion = Boolean(
+                  nextSlashHit
+                  && enabledSuggestionIds(
+                    filterComposerSuggestionGroups(nextSlashHit.query),
+                  ).length > 0,
+                )
+                if (!isAllowedComposerDraft(nextValue) && !keepsEnabledSuggestion) {
+                  const previousCaret = acceptedCaret.current
+                  window.requestAnimationFrame(() => {
+                    input.current?.setSelectionRange(previousCaret, previousCaret)
+                    setCaret(previousCaret)
+                  })
+                  return
+                }
+                acceptedCaret.current = nextCaret
+                pendingCaret.current = nextCaret
+                setCaret(nextCaret)
+                onChange(nextValue)
               }}
-              onSelect={(event) => setCaret(event.currentTarget.selectionStart)}
+              onSelect={(event) => {
+                const nextCaret = event.currentTarget.selectionStart
+                acceptedCaret.current = nextCaret
+                setCaret(nextCaret)
+              }}
               onKeyDown={handleKeyDown}
               rows={1}
               placeholder={isHydrating ? t('正在加载会话…') : disabledReason ?? t('给 TinkerFin 发消息')}

@@ -67,7 +67,6 @@ if TYPE_CHECKING:
 _SNAPSHOT_PAGE_SIZE = 100
 _MAX_WAIT_BLOCK_MS = 5_000
 _SOCKET_TIMEOUT_SAFETY_RATIO = 0.9
-_PERSISTENT_SCHEMA_VERSION = "5"
 
 _RedisScriptValue: TypeAlias = bytes | list["_RedisScriptValue"]
 _RedisStreamEntry: TypeAlias = tuple[bytes, dict[bytes, bytes]]
@@ -656,12 +655,6 @@ async def _read_control(
         ) from error
     if generation < 1:
         raise _redis_protocol_error("Redis stream control has invalid generation")
-    schema_version = decoded.get("schema_version")
-    if schema_version != _PERSISTENT_SCHEMA_VERSION:
-        raise _redis_protocol_error(
-            "Redis stream control uses unsupported persistent schema version "
-            f"{schema_version!r}; expected {_PERSISTENT_SCHEMA_VERSION!r}"
-        )
     return _StreamControl(
         generation=generation,
         state=cast(_ControlState, state),
@@ -736,13 +729,6 @@ async def _run_snapshot(
     if not response:
         raise _redis_protocol_error("Redis run snapshot returned an empty response")
     code = self._snapshot_text(response[0], field="response code")
-    if code == "SCHEMA_MISMATCH":
-        record_kind = self._snapshot_text(response[1], field="record kind")
-        schema_version = self._snapshot_text(response[2], field="schema version")
-        raise _redis_protocol_error(
-            f"Redis {record_kind} uses unsupported persistent schema version "
-            f"{schema_version!r}; expected {_PERSISTENT_SCHEMA_VERSION!r}"
-        )
     if code == "STREAM_DELETED":
         raise StreamDeleted(
             channel=keys.channel,

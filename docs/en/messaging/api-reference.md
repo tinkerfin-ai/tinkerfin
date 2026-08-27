@@ -31,9 +31,8 @@ Identity is optional only when the source advertises an immutable profile.
 
 `MessageSubscription` yields `DecodedMessage` and supports `sse()` and `aclose()`.
 
-| Envelope v2 field | Meaning |
+| Envelope field | Meaning |
 | --- | --- |
-| `schema_version` | Fixed at 2 |
 | `channel` | Codec namespace |
 | `identity` | Nested shared Identity |
 | `seq` | One-based thread position |
@@ -56,7 +55,7 @@ Identity is optional only when the source advertises an immutable profile.
 | `map_source(...)` | Ordered synchronous or asynchronous transform |
 | `RecoverableSource` | Rebuild from a checkpoint |
 | `RecoverableMessage` | Stable ID, data, and checkpoint |
-| `RecoveryCheckpoint` | Opaque position; schema 1 |
+| `RecoveryCheckpoint` | Opaque position and optional last message ID |
 
 ## Codecs and backends
 
@@ -66,7 +65,7 @@ Identity is optional only when the source advertises an immutable profile.
 | `NativeStreamPartCodec` | Base-install native v2 codec and renderer |
 | `NativeStreamPart` | Native v2 replay value |
 | `MemoryBackend` | In-process implementation |
-| `RedisBackend` | `[redis]` multi-process implementation; persistent schema 5 |
+| `RedisBackend` | `[redis]` multi-process implementation |
 | `MessagingBackend` | Custom backend protocol |
 
 ### Backend operations

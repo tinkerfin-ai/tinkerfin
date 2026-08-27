@@ -88,6 +88,7 @@ def test_internal_cancel_is_non_executable_deterministic_and_auditable() -> None
     assert first_message is not None
     assert first_message.status == "error"
     assert first_message.tool_call_id == "call-1"
+    assert HITL_CONTRACT_ID == "tinkerfin.deepagents.hitl-cancel"
     assert first_message.additional_kwargs["tinkerfin"] == {
         "schema": HITL_CONTRACT_ID,
         "outcome": "cancelled",

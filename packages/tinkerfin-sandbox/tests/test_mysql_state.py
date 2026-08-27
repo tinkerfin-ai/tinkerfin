@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-from sqlalchemy import event, inspect, text
+from sqlalchemy import event, inspect
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -218,12 +218,6 @@ async def test_mysql8_export_and_runtime_claims_are_compatible(
     try:
         async with engine.connect() as connection:
             reflected = await connection.run_sync(_reflect_mysql_schema)
-            version = await connection.scalar(
-                text(
-                    "SELECT version FROM tinkerfin_opensandbox_schema_versions "
-                    "WHERE component = 'opensandbox-state'"
-                )
-            )
     finally:
         await engine.dispose()
 
@@ -236,10 +230,9 @@ async def test_mysql8_export_and_runtime_claims_are_compatible(
         "ix_tinkerfin_opensandbox_warm_slots_available",
         "ix_tinkerfin_opensandbox_workers_lease",
     )
-    assert version == 2
-    assert len(table_comments) == 5
+    assert len(table_comments) == 4
     assert all(table_comments)
-    assert len(column_comments) == 30
+    assert len(column_comments) == 28
     assert all(column_comments)
     claim_sql = tuple(sql for sql in observed_sql if " FOR UPDATE" in sql)
     assert claim_sql

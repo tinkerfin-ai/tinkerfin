@@ -20,15 +20,20 @@ export function ComposerSuggestionMenu({
   const menuRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
-    const handleOutsidePointer = (event: PointerEvent) => {
+    const handleOutsideMouseDown = (event: MouseEvent) => {
       if (!(event.target instanceof Node)) return
       if (menuRef.current?.contains(event.target)) return
       const composer = menuRef.current?.closest('.composer')
       if (composer?.contains(event.target)) return
+      const target = event.target instanceof Element ? event.target : null
+      const movesFocus = Boolean(target?.closest(
+        'a[href], button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [contenteditable="true"], [role="button"], [role="checkbox"], [role="combobox"], [role="link"], [role="menuitem"], [role="option"], [role="radio"], [role="switch"], [role="tab"], [role="textbox"]',
+      ))
+      if (!movesFocus) event.preventDefault()
       onDismiss()
     }
-    document.addEventListener('pointerdown', handleOutsidePointer, true)
-    return () => document.removeEventListener('pointerdown', handleOutsidePointer, true)
+    document.addEventListener('mousedown', handleOutsideMouseDown, true)
+    return () => document.removeEventListener('mousedown', handleOutsideMouseDown, true)
   }, [onDismiss])
 
   return (

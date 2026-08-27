@@ -72,7 +72,7 @@
 | `InMemoryOpenSandboxState(namespace="")` | 当前进程内状态 |
 | `SQLAlchemyOpenSandboxState(...)` | SQLite 或 MySQL 共享状态 |
 | `get_sqlalchemy_opensandbox_state_schema(dialect=...)` | 生成完整建表 SQL |
-| `SQLAlchemyOpenSandboxStateSchema` | 不可变的 component、version、dialect、table names 和 DDL |
+| `SQLAlchemyOpenSandboxStateSchema` | 不可变的 dialect、table names 和 DDL |
 
 `OpenSandboxInitializer` 是新 Sandbox ready 后接收 backend 的异步初始化函数类型。
 

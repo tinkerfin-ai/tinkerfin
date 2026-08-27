@@ -1,5 +1,7 @@
 export { Button } from './Button'
 export type { ButtonProps, ButtonShape, ButtonSize, ButtonVariant } from './Button'
+export { DatePicker } from './DatePicker'
+export type { DatePickerProps, DatePickerSize } from './DatePicker'
 export { ErrorBoundary } from './ErrorBoundary'
 export type { ErrorBoundaryProps, ErrorFallbackArguments } from './ErrorBoundary'
 export { IconButton } from './IconButton'

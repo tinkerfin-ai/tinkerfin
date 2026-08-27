@@ -1,10 +1,10 @@
-"""Versioned public values stored and replayed by messaging backends."""
+"""Public values stored and replayed by messaging backends."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Generic, Literal, TypeVar
+from typing import Generic, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -20,10 +20,6 @@ class MessageEnvelope(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal[2] = Field(
-        default=2,
-        description="Envelope schema version used to decode the durable record.",
-    )
     channel: str = Field(
         min_length=1,
         max_length=1024,
@@ -44,7 +40,7 @@ class MessageEnvelope(BaseModel):
     codec: str = Field(
         min_length=1,
         max_length=1024,
-        description="Stable persisted schema identifier required for decoding.",
+        description="Persisted codec identifier required for decoding.",
     )
     payload: bytes = Field(
         description="Protocol-neutral encoded payload committed by the backend.",
@@ -77,10 +73,6 @@ class RecoveryCheckpoint(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal[1] = Field(
-        default=1,
-        description="Checkpoint envelope schema version.",
-    )
     position: bytes = Field(
         description="Opaque position interpreted only by the source factory.",
     )

@@ -53,15 +53,17 @@ from redis.asyncio import Redis
 from redis.exceptions import ResponseError
 
 import tinkerfin.plan as plan_api
+import tinkerfin.plan._runtime as plan_runtime_module
 from tinkerfin import AgUiResumeBinding, AgUiResumeCheckpoint, Identity, TinkerFin
+from tinkerfin._agui_lineage import RUN_ID_METADATA_KEY
 from tinkerfin.plan import (
     ClarificationForm,
     ClarificationFormBase,
     ClarificationModel,
     ClarificationOption,
-    ClarificationQuestion,
     DefaultClarificationForm,
     MarkdownPlanContent,
+    PlanClarificationResponseError,
     PlanContentModel,
     PlanDraft,
     PlanHandoffPhase,
@@ -71,9 +73,12 @@ from tinkerfin.plan import (
     PlanState,
     PlanStatus,
     PlanStructuredOutputError,
+    SingleChoiceQuestion,
     StructuredPlanContent,
     StructuredPlanStep,
+    TextQuestion,
 )
+from tinkerfin.plan._state import plan_state_update
 from tinkerfin.plan._workflow import PlanningWorkflowGraph
 from tinkerfin_agui_adapter import (
     ResumeMapper,
@@ -176,8 +181,8 @@ class _CustomOption(ClarificationOption[_OptionAttributes]):
     pass
 
 
-class _CustomQuestion(ClarificationQuestion[_QuestionAttributes, _OptionAttributes]):
-    options: tuple[_CustomOption, ...] = ()
+class _CustomQuestion(SingleChoiceQuestion[_QuestionAttributes, _CustomOption]):
+    pass
 
 
 class _CustomForm(ClarificationForm[_CustomQuestion]):
@@ -190,6 +195,10 @@ class _BoundedForm(ClarificationForm[_CustomQuestion]):
 
 class _ExactFourForm(ClarificationForm[_CustomQuestion]):
     questions: tuple[_CustomQuestion, ...] = Field(min_length=4, max_length=4)
+
+
+class _TextOnlyForm(ClarificationForm[TextQuestion[ClarificationModel]]):
+    pass
 
 
 class _MissingMinimumForm(ClarificationFormBase):
@@ -217,9 +226,7 @@ class _OpaqueQuestionAttributes(ClarificationModel):
         return object()
 
 
-class _OpaqueQuestion(
-    ClarificationQuestion[_OpaqueQuestionAttributes, ClarificationModel]
-):
+class _OpaqueQuestion(TextQuestion[_OpaqueQuestionAttributes]):
     pass
 
 
@@ -228,22 +235,15 @@ class _OpaqueForm(ClarificationForm[_OpaqueQuestion]):
 
 
 class _InvalidListForm(ClarificationFormBase):
-    questions: list[ClarificationQuestion] = []
+    questions: list[TextQuestion[ClarificationModel]] = []
 
 
 class _CustomPlanContent(PlanContentModel):
-    schema_id = "example.release-plan.v1"
-
     summary: str
     checks: tuple[str, ...]
 
 
-class _MissingPlanSchemaId(PlanContentModel):
-    value: str
-
-
 class _MarkdownImpostor(PlanContentModel):
-    schema_id = "example.markdown-impostor.v1"
     media_type = "text/markdown"
 
     markdown: str
@@ -345,6 +345,14 @@ def _planner_clarification(
     options: list[dict[str, object]] | None = None,
     required: bool = True,
 ) -> AIMessage:
+    question: dict[str, object] = {
+        "id": question_id,
+        "answer_type": "single_choice" if options else "text",
+        "prompt": prompt,
+        "required": required,
+    }
+    if options:
+        question.update({"options": options, "allow_free_text": True})
     return AIMessage(
         content="",
         tool_calls=[
@@ -353,17 +361,7 @@ def _planner_clarification(
                 "args": {
                     "type": "clarify",
                     "draft": None,
-                    "clarification": {
-                        "questions": [
-                            {
-                                "id": question_id,
-                                "prompt": prompt,
-                                "required": required,
-                                "options": options or [],
-                                "allow_free_text": True,
-                            }
-                        ]
-                    },
+                    "clarification": {"questions": [question]},
                 },
                 "id": f"clarify-{question_id}",
                 "type": "tool_call",
@@ -381,14 +379,17 @@ def _planner_clarification_batch(
     questions = [
         {
             "id": f"question-{index}",
+            "answer_type": "single_choice" if index % 2 == 0 else "text",
             "prompt": f"Choose value {index}",
             "required": required,
-            "options": (
-                [{"id": f"option-{index}", "label": f"Option {index}"}]
+            **(
+                {
+                    "options": [{"id": f"option-{index}", "label": f"Option {index}"}],
+                    "allow_free_text": True,
+                }
                 if index % 2 == 0
-                else []
+                else {}
             ),
-            "allow_free_text": True,
         }
         for index in range(count)
     ]
@@ -423,6 +424,7 @@ def _custom_planner_clarification() -> AIMessage:
                         "questions": [
                             {
                                 "id": "custom-target",
+                                "answer_type": "single_choice",
                                 "prompt": "Choose a target",
                                 "required": True,
                                 "allow_free_text": True,
@@ -460,6 +462,7 @@ def _opaque_planner_clarification() -> AIMessage:
                         "questions": [
                             {
                                 "id": "opaque",
+                                "answer_type": "text",
                                 "prompt": "Choose",
                                 "required": True,
                                 "attributes": {"token": "private"},
@@ -646,21 +649,26 @@ def test_plan_configuration_is_immutable_and_preserves_upstream_signature() -> N
     )
 
 
-def test_plan_package_exports_only_the_v1_contract() -> None:
+def test_plan_package_exports_only_the_current_contract() -> None:
     assert set(plan_api.__all__) == {
         "AgentMode",
+        "BuiltInClarificationForm",
         "ClarificationExchange",
         "ClarificationForm",
         "ClarificationFormBase",
         "ClarificationModel",
         "ClarificationOption",
         "ClarificationOptionBase",
-        "ClarificationQuestion",
         "ClarificationQuestionBase",
+        "ClarificationResponseBase",
+        "ClarificationType",
         "ConfirmedPlan",
+        "DateQuestion",
         "DefaultClarificationForm",
         "MarkdownPlanContent",
+        "MultipleChoiceQuestion",
         "PendingClarification",
+        "PlanClarificationResponseError",
         "PlanContentModel",
         "PlanDraft",
         "PlanHandoff",
@@ -673,8 +681,11 @@ def test_plan_package_exports_only_the_v1_contract() -> None:
         "PlanStatus",
         "PlanStructuredOutputError",
         "RequirementAnswer",
+        "SingleChoiceQuestion",
         "StructuredPlanContent",
         "StructuredPlanStep",
+        "TextQuestion",
+        "clarification_type",
     }
 
 
@@ -704,12 +715,12 @@ def test_plan_configuration_rejects_invalid_clarification_schemas(
 
 def test_plan_configuration_defaults_to_structured_and_freezes_custom_content() -> None:
     default_options = TinkerFin().plan()._plan_options
-    custom_options = TinkerFin().plan(plan_schema=_CustomPlanContent)._plan_options
+    custom_options = TinkerFin().plan(content_schema=_CustomPlanContent)._plan_options
     editable_options = (
         TinkerFin()
         .plan(
-            plan_schema=_CustomPlanContent,
-            review_actions=(
+            content_schema=_CustomPlanContent,
+            allowed_review_actions=(
                 PlanReviewAction.APPROVE,
                 PlanReviewAction.EDIT,
                 PlanReviewAction.RESPOND,
@@ -720,16 +731,16 @@ def test_plan_configuration_defaults_to_structured_and_freezes_custom_content() 
     )
 
     assert default_options is not None
-    assert default_options.review_actions == (
+    assert default_options.allowed_review_actions == (
         PlanReviewAction.APPROVE,
         PlanReviewAction.RESPOND,
         PlanReviewAction.REJECT,
     )
     assert default_options.content.schema is StructuredPlanContent
-    assert default_options.content.reference.id == "tinkerfin.plan.structured.v1"
+    assert default_options.content.reference.media_type == "application/json"
     assert custom_options is not None
     assert custom_options.content.schema is _CustomPlanContent
-    assert custom_options.content.reference.id == "example.release-plan.v1"
+    assert custom_options.content.reference.media_type == "application/json"
     planner_schema = custom_options.contracts.planner_response_type.model_json_schema(
         by_alias=True
     )
@@ -765,27 +776,27 @@ def test_plan_configuration_defaults_to_structured_and_freezes_custom_content() 
 )
 def test_plan_configuration_requires_fixed_review_action_values(value: object) -> None:
     with pytest.raises(TypeError, match="PlanReviewAction"):
-        TinkerFin().plan(review_actions=cast(Any, value))
+        TinkerFin().plan(allowed_review_actions=cast(Any, value))
 
 
 @pytest.mark.parametrize(
     "value",
     [(), (PlanReviewAction.APPROVE, PlanReviewAction.APPROVE)],
 )
-def test_plan_configuration_rejects_empty_or_duplicate_review_actions(
+def test_plan_configuration_rejects_empty_or_duplicate_allowed_review_actions(
     value: tuple[PlanReviewAction, ...],
 ) -> None:
-    with pytest.raises(PlanModeConfigurationError, match="review_actions"):
-        TinkerFin().plan(review_actions=value)
+    with pytest.raises(PlanModeConfigurationError, match="allowed_review_actions"):
+        TinkerFin().plan(allowed_review_actions=value)
 
 
 def test_plan_configuration_freezes_a_single_review_action() -> None:
     configured_actions = [PlanReviewAction.APPROVE]
-    options = TinkerFin().plan(review_actions=configured_actions)._plan_options
+    options = TinkerFin().plan(allowed_review_actions=configured_actions)._plan_options
     configured_actions.append(PlanReviewAction.EDIT)
 
     assert options is not None
-    assert options.review_actions == (PlanReviewAction.APPROVE,)
+    assert options.allowed_review_actions == (PlanReviewAction.APPROVE,)
     schema = options.contracts.review_response.json_schema(by_alias=True)
     assert schema["properties"]["type"]["const"] == "approve"
     with pytest.raises(ValidationError, match="literal_error"):
@@ -796,20 +807,28 @@ def test_plan_configuration_freezes_a_single_review_action() -> None:
 
 @pytest.mark.parametrize(
     "schema",
-    [object, PlanContentModel, _MissingPlanSchemaId, _MarkdownImpostor],
+    [object, PlanContentModel, _MarkdownImpostor],
 )
 def test_plan_configuration_rejects_invalid_content_schemas(schema: object) -> None:
     with pytest.raises(PlanModeConfigurationError):
-        TinkerFin().plan(plan_schema=cast(Any, schema))
+        TinkerFin().plan(content_schema=cast(Any, schema))
+
+
+def test_plan_configuration_does_not_accept_removed_parameter_names() -> None:
+    parameters = inspect.signature(TinkerFin.plan).parameters
+    assert "content_schema" in parameters
+    assert "allowed_review_actions" in parameters
+    assert "plan_schema" not in parameters
+    assert "review_actions" not in parameters
 
 
 def test_disabled_plan_rejects_a_non_default_content_schema() -> None:
     with pytest.raises(PlanModeConfigurationError, match="disabled Plan capability"):
-        TinkerFin().plan(enabled=False, plan_schema=MarkdownPlanContent)
+        TinkerFin().plan(enabled=False, content_schema=MarkdownPlanContent)
     with pytest.raises(PlanModeConfigurationError, match="disabled Plan capability"):
         TinkerFin().plan(
             enabled=False,
-            review_actions=(PlanReviewAction.APPROVE,),
+            allowed_review_actions=(PlanReviewAction.APPROVE,),
         )
 
 
@@ -845,12 +864,14 @@ def test_plan_contracts_are_frozen_and_reject_duplicate_steps() -> None:
     draft = PlanDraft[StructuredPlanContent](
         revision=1,
         content_schema=PlanSchemaReference(
-            id=StructuredPlanContent.schema_id or "",
             fingerprint="0" * 64,
             media_type=StructuredPlanContent.media_type,
         ),
         content=content,
     )
+    draft_payload = draft.model_dump(mode="json", by_alias=True)
+    assert set(draft_payload) == {"revision", "contentSchema", "content"}
+    assert set(draft_payload["contentSchema"]) == {"fingerprint", "mediaType"}
     with pytest.raises(ValidationError):
         draft.revision = 2  # pyright: ignore[reportAttributeAccessIssue]
     with pytest.raises(ValidationError, match="step IDs must be unique"):
@@ -859,7 +880,7 @@ def test_plan_contracts_are_frozen_and_reject_duplicate_steps() -> None:
             steps=(step, step),
             acceptance_criteria=("Works",),
         )
-    assert PlanState().workflow_version == "tinkerfin.plan.v1"
+    assert "workflowVersion" not in PlanState().model_dump(mode="json", by_alias=True)
 
 
 def test_markdown_plan_rejects_blank_text_without_rewriting_content() -> None:
@@ -872,7 +893,7 @@ def test_markdown_plan_rejects_blank_text_without_rewriting_content() -> None:
 
 def test_default_clarification_form_is_non_empty_without_an_upper_limit() -> None:
     schema = DefaultClarificationForm.model_json_schema(by_alias=True)
-    assert schema["properties"]["schemaVersion"]["const"] == 2
+    assert "schemaVersion" not in schema["properties"]
     questions_schema = schema["properties"]["questions"]
     assert questions_schema["minItems"] == 1
     assert "maxItems" not in questions_schema
@@ -883,6 +904,7 @@ def test_default_clarification_form_is_non_empty_without_an_upper_limit() -> Non
                 "questions": [
                     {
                         "id": f"question-{index}",
+                        "answer_type": "text",
                         "prompt": "Choose",
                         "required": True,
                     }
@@ -915,8 +937,16 @@ def test_host_schema_owns_question_count_bounds() -> None:
             "questions": [
                 {
                     "id": f"question-{index}",
+                    "answer_type": "single_choice",
                     "prompt": "Choose",
                     "required": True,
+                    "options": [
+                        {
+                            "id": f"option-{index}",
+                            "label": f"Option {index}",
+                            "attributes": {"priority": index},
+                        }
+                    ],
                 }
                 for index in range(count)
             ]
@@ -977,6 +1007,38 @@ async def test_planner_prompt_derives_question_count_from_the_bound_schema(
         if isinstance(message, SystemMessage)
     )
     assert expected in str(system_message.content)
+
+
+@pytest.mark.asyncio
+async def test_planner_prompt_lists_only_reachable_answer_types() -> None:
+    model = _FakeModel(responses=[_planner()])
+    definition = (
+        TinkerFin()
+        .plan(enabled=True, clarification_schema=_TextOnlyForm)
+        .create_deep_agent(
+            model=model,
+            tools=[],
+            checkpointer=InMemorySaver(),
+        )
+    )
+    await _parts(
+        definition,
+        {"messages": [HumanMessage(content="Plan", id="text-only-message")]},
+        run_id="text-only",
+        config={"configurable": {"thread_id": "plan-thread"}},
+        mode="plan",
+    )
+
+    system_message = next(
+        message
+        for message in model.model_inputs[0]
+        if isinstance(message, SystemMessage)
+    )
+    prompt = str(system_message.content)
+    assert "- text:" in prompt
+    assert "- single_choice:" not in prompt
+    assert "- multiple_choice:" not in prompt
+    assert "- date:" not in prompt
 
 
 def test_plain_definition_rejects_plan_runs() -> None:
@@ -1132,9 +1194,9 @@ async def test_planner_creates_review_without_a_deep_agent_parent_graph() -> Non
     plan = _structured_plan_state(_root_values(parts)[-1]["tinkerfin_plan"])
     assert interrupt.value["kind"] == "tinkerfin:plan_review"
     review = interrupt.value["metadata"]["review"]
-    assert review["schema"] == "tinkerfin.plan-review.v1"
+    assert "schema" not in review
     assert review["draft"]["revision"] == 1
-    assert review["draft"]["contentSchema"]["id"] == ("tinkerfin.plan.structured.v1")
+    assert set(review["draft"]["contentSchema"]) == {"fingerprint", "mediaType"}
     assert review["draft"]["content"]["goal"] == "Implement feature"
     assert plan.status is PlanStatus.AWAITING_REVIEW
     assert plan.revision == 1
@@ -1169,8 +1231,8 @@ async def test_markdown_plan_review_edit_and_handoff_preserve_exact_text() -> No
         TinkerFin()
         .plan(
             enabled=True,
-            plan_schema=MarkdownPlanContent,
-            review_actions=(
+            content_schema=MarkdownPlanContent,
+            allowed_review_actions=(
                 PlanReviewAction.APPROVE,
                 PlanReviewAction.EDIT,
                 PlanReviewAction.RESPOND,
@@ -1193,7 +1255,7 @@ async def test_markdown_plan_review_edit_and_handoff_preserve_exact_text() -> No
     )
     first_interrupt = _root_interrupts(first)[0]
     first_review = first_interrupt.value["metadata"]["review"]
-    assert first_review["schema"] == "tinkerfin.plan-review.v1"
+    assert "schema" not in first_review
     assert first_review["draft"]["contentSchema"]["mediaType"] == "text/markdown"
     assert first_review["draft"]["content"]["markdown"] == initial
 
@@ -1237,6 +1299,7 @@ async def test_markdown_plan_review_edit_and_handoff_preserve_exact_text() -> No
     )
     handoff_text = str(handoff.content)
     assert 'content-type="text/markdown"' in handoff_text
+    assert "schema=" not in handoff_text
     assert edited in handoff_text
     assert "\\r\\n" not in handoff_text
 
@@ -1245,7 +1308,7 @@ async def test_markdown_plan_review_edit_and_handoff_preserve_exact_text() -> No
 async def test_custom_plan_schema_round_trips_through_review_state() -> None:
     definition = (
         TinkerFin()
-        .plan(enabled=True, plan_schema=_CustomPlanContent)
+        .plan(enabled=True, content_schema=_CustomPlanContent)
         .create_deep_agent(
             model=_FakeModel(responses=[_custom_plan_planner()]),
             tools=[],
@@ -1260,7 +1323,7 @@ async def test_custom_plan_schema_round_trips_through_review_state() -> None:
         mode="plan",
     )
     review = _root_interrupts(parts)[0].value["metadata"]["review"]
-    assert review["draft"]["contentSchema"]["id"] == "example.release-plan.v1"
+    assert set(review["draft"]["contentSchema"]) == {"fingerprint", "mediaType"}
     assert review["draft"]["content"] == {
         "summary": "Release safely",
         "checks": ["Targeted tests pass"],
@@ -1951,7 +2014,13 @@ async def test_multiple_clarification_rounds_do_not_increment_revision() -> None
         Command(
             resume={
                 "type": "respond",
-                "answers": [{"questionId": "environment", "optionId": "staging"}],
+                "answers": {
+                    "environment": {
+                        "status": "answered",
+                        "answerType": "single_choice",
+                        "optionId": "staging",
+                    }
+                },
             }
         ),
         run_id="clarify-2",
@@ -1966,7 +2035,13 @@ async def test_multiple_clarification_rounds_do_not_increment_revision() -> None
         Command(
             resume={
                 "type": "respond",
-                "answers": [{"questionId": "region", "answer": "EU"}],
+                "answers": {
+                    "region": {
+                        "status": "answered",
+                        "answerType": "text",
+                        "answer": "EU",
+                    }
+                },
             }
         ),
         run_id="clarify-3",
@@ -1977,6 +2052,131 @@ async def test_multiple_clarification_rounds_do_not_increment_revision() -> None
     assert plan3.revision == 1
     assert len(plan3.clarification_history) == 2
     assert _root_interrupts(third)[0].value["kind"] == "tinkerfin:plan_review"
+
+
+@pytest.mark.asyncio
+async def test_agui_clarification_resume_uses_the_exact_planning_snapshot() -> None:
+    model = _FakeModel(
+        responses=[
+            _planner_clarification(
+                question_id="environment",
+                options=[{"id": "staging", "label": "Staging"}],
+            ),
+            _planner(),
+        ]
+    )
+    definition = (
+        TinkerFin()
+        .plan(enabled=True)
+        .create_deep_agent(
+            model=model,
+            tools=[],
+            checkpointer=InMemorySaver(),
+        )
+    )
+    config = {"configurable": {"thread_id": "plan-thread"}}
+    first = await _agui_events(
+        definition,
+        {"messages": [HumanMessage(content="Deploy", id="agui-clarification")]},
+        run_id="agui-clarification-1",
+        config=config,
+        mode="plan",
+    )
+    binding = _plan_binding(
+        _terminal(first),
+        payload={
+            "type": "respond",
+            "answers": {
+                "environment": {
+                    "status": "answered",
+                    "answerType": "single_choice",
+                    "optionId": "staging",
+                }
+            },
+        },
+    )
+
+    resumed = await _agui_events(
+        definition,
+        None,
+        run_id="agui-clarification-2",
+        config=config,
+        mode="plan",
+        resume=binding,
+    )
+
+    outcome = _interrupt_outcome(resumed)
+    assert outcome.interrupts[0].reason == "tinkerfin:plan_review"
+
+
+@pytest.mark.asyncio
+async def test_completed_resume_uses_the_exact_planning_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    definition = (
+        TinkerFin()
+        .plan(enabled=True)
+        .create_deep_agent(
+            model=_FakeModel(responses=[_planner()]),
+            tools=[],
+            checkpointer=InMemorySaver(),
+        )
+    )
+    config = {"configurable": {"thread_id": "plan-thread"}}
+    first = await _agui_events(
+        definition,
+        {"messages": [HumanMessage(content="Deploy", id="agui-reject")]},
+        run_id="agui-reject-1",
+        config=config,
+        mode="plan",
+    )
+    binding = _plan_binding(
+        _terminal(first),
+        payload={"type": "reject", "baseRevision": 1},
+    )
+    resolved = await _agui_events(
+        definition,
+        None,
+        run_id="agui-reject-2",
+        config=config,
+        mode="plan",
+        resume=binding,
+    )
+    _assert_success(resolved)
+
+    async def stale_checkpoint_state(
+        _planning: object,
+        _config: RunnableConfig,
+    ) -> dict[str, object]:
+        return plan_state_update(PlanState[StructuredPlanContent]())
+
+    monkeypatch.setattr(
+        plan_runtime_module,
+        "_checkpoint_state",
+        stale_checkpoint_state,
+    )
+
+    native_astream = cast(Any, definition)._build_astream("plan")
+    replayed = [
+        part
+        async for part in native_astream(
+            Command(resume={"type": "reject", "baseRevision": 1}),
+            config={
+                "configurable": {
+                    "thread_id": "plan-thread",
+                    RUN_ID_METADATA_KEY: "agui-reject-3",
+                }
+            },
+            stream_mode=["messages", "tasks", "values"],
+            version="v2",
+            subgraphs=True,
+        )
+    ]
+
+    assert (
+        _structured_plan_state(_root_values(replayed)[-1]["tinkerfin_plan"]).status
+        is PlanStatus.CANCELLED
+    )
 
 
 @pytest.mark.asyncio
@@ -2024,12 +2224,28 @@ async def test_four_question_clarification_round_trips_in_one_batch() -> None:
         Command(
             resume={
                 "type": "respond",
-                "answers": [
-                    {"questionId": "question-0", "optionId": "option-0"},
-                    {"questionId": "question-1", "answer": "Custom 1"},
-                    {"questionId": "question-2", "optionId": "option-2"},
-                    {"questionId": "question-3", "answer": "Custom 3"},
-                ],
+                "answers": {
+                    "question-0": {
+                        "status": "answered",
+                        "answerType": "single_choice",
+                        "optionId": "option-0",
+                    },
+                    "question-1": {
+                        "status": "answered",
+                        "answerType": "text",
+                        "answer": "Custom 1",
+                    },
+                    "question-2": {
+                        "status": "answered",
+                        "answerType": "single_choice",
+                        "optionId": "option-2",
+                    },
+                    "question-3": {
+                        "status": "answered",
+                        "answerType": "text",
+                        "answer": "Custom 3",
+                    },
+                },
             }
         ),
         run_id="four-question-2",
@@ -2048,11 +2264,11 @@ async def test_four_question_clarification_round_trips_in_one_batch() -> None:
         "question-2",
         "question-3",
     )
-    assert tuple(answer.answer for answer in exchange.answers) == (
-        "Option 0",
-        "Custom 1",
-        "Option 2",
-        "Custom 3",
+    assert tuple(answer.value for answer in exchange.answers) == (
+        {"option": {"id": "option-0", "label": "Option 0"}},
+        {"answer": "Custom 1"},
+        {"option": {"id": "option-2", "label": "Option 2"}},
+        {"answer": "Custom 3"},
     )
     review_interrupts = _root_interrupts(second)
     assert len(review_interrupts) == 1
@@ -2089,9 +2305,9 @@ async def test_agui_preserves_every_question_in_a_large_clarification_form() -> 
     envelope = cast(dict[str, Any], runtime_interrupt["envelope"])
     public_metadata = cast(dict[str, Any], envelope["metadata"])
     clarification = cast(dict[str, Any], public_metadata["clarification"])
-    assert clarification["schema"] == "tinkerfin.plan-clarification.v2"
+    assert "schema" not in clarification
     form = cast(dict[str, Any], clarification["form"])
-    assert form["schemaVersion"] == 2
+    assert "schemaVersion" not in form
     questions = cast(list[dict[str, Any]], form["questions"])
     assert [question["id"] for question in questions] == [
         "question-0",
@@ -2101,7 +2317,13 @@ async def test_agui_preserves_every_question_in_a_large_clarification_form() -> 
     ]
     assert [question["required"] for question in questions] == [True] * 4
     response_schema = cast(dict[str, Any], interrupt.response_schema)
-    assert "ClarificationSkippedAnswer" in response_schema["$defs"]
+    answers_schema = response_schema["properties"]["answers"]
+    assert answers_schema["required"] == [
+        "question-0",
+        "question-1",
+        "question-2",
+        "question-3",
+    ]
 
     types = [event.type.value for event in events]
     state_index = len(types) - 1 - types[::-1].index("STATE_SNAPSHOT")
@@ -2138,9 +2360,9 @@ async def test_all_optional_clarification_questions_can_be_explicitly_skipped() 
     )
     interrupt = _root_interrupts(first)[0]
     metadata = interrupt.value["metadata"]
-    assert metadata["clarification"]["schema"] == "tinkerfin.plan-clarification.v2"
+    assert "schema" not in metadata["clarification"]
     form = metadata["clarification"]["form"]
-    assert form["schemaVersion"] == 2
+    assert "schemaVersion" not in form
     assert [question["required"] for question in form["questions"]] == [False, False]
 
     second = await _parts(
@@ -2148,10 +2370,10 @@ async def test_all_optional_clarification_questions_can_be_explicitly_skipped() 
         Command(
             resume={
                 "type": "respond",
-                "answers": [
-                    {"questionId": "question-0", "skipped": True},
-                    {"questionId": "question-1", "skipped": True},
-                ],
+                "answers": {
+                    "question-0": {"status": "skipped"},
+                    "question-1": {"status": "skipped"},
+                },
             }
         ),
         run_id="optional-2",
@@ -2167,7 +2389,7 @@ async def test_all_optional_clarification_questions_can_be_explicitly_skipped() 
         "question-1",
     )
     assert all(answer.skipped for answer in answers)
-    assert all(answer.answer is None and answer.option_id is None for answer in answers)
+    assert all(answer.value is None for answer in answers)
     planner_context = "\n".join(
         str(message.content)
         for message in model.model_inputs[1]
@@ -2182,7 +2404,9 @@ async def test_required_clarification_question_cannot_be_skipped() -> None:
         TinkerFin()
         .plan(enabled=True)
         .create_deep_agent(
-            model=_FakeModel(responses=[_planner_clarification(required=True)]),
+            model=_FakeModel(
+                responses=[_planner_clarification(required=True), _planner()]
+            ),
             tools=[],
             checkpointer=InMemorySaver(),
         )
@@ -2196,19 +2420,44 @@ async def test_required_clarification_question_cannot_be_skipped() -> None:
         mode="plan",
     )
 
-    with pytest.raises(ValueError, match="cannot be skipped"):
+    with pytest.raises(
+        PlanClarificationResponseError,
+        match="does not match the pending form",
+    ):
         await _parts(
             definition,
             Command(
                 resume={
                     "type": "respond",
-                    "answers": [{"questionId": "target", "skipped": True}],
+                    "answers": {"target": {"status": "skipped"}},
                 }
             ),
             run_id="required-2",
             config=config,
             mode="plan",
         )
+    retried = await _parts(
+        definition,
+        Command(
+            resume={
+                "type": "respond",
+                "answers": {
+                    "target": {
+                        "status": "answered",
+                        "answerType": "text",
+                        "answer": "Target A",
+                    }
+                },
+            }
+        ),
+        run_id="required-3",
+        config=config,
+        mode="plan",
+    )
+    assert (
+        _structured_plan_state(_root_values(retried)[-1]["tinkerfin_plan"]).status
+        is PlanStatus.AWAITING_REVIEW
+    )
 
 
 @pytest.mark.asyncio
@@ -2247,7 +2496,13 @@ async def test_custom_clarification_preserves_attributes_and_trusted_option_labe
         Command(
             resume={
                 "type": "respond",
-                "answers": [{"questionId": "custom-target", "optionId": "target-a"}],
+                "answers": {
+                    "custom-target": {
+                        "status": "answered",
+                        "answerType": "single_choice",
+                        "optionId": "target-a",
+                    }
+                },
             }
         ),
         run_id="custom-2",
@@ -2259,8 +2514,7 @@ async def test_custom_clarification_preserves_attributes_and_trusted_option_labe
         .clarification_history[0]
         .answers[0]
     )
-    assert answer.option_id == "target-a"
-    assert answer.answer == "Target A"
+    assert answer.value == {"option": {"id": "target-a", "label": "Target A"}}
 
 
 @pytest.mark.asyncio
@@ -2274,7 +2528,8 @@ async def test_clarification_rejects_incomplete_and_unknown_answers() -> None:
                     _planner_clarification(
                         question_id="target",
                         options=[{"id": "a", "label": "A"}],
-                    )
+                    ),
+                    _planner(),
                 ]
             ),
             tools=[],
@@ -2289,19 +2544,50 @@ async def test_clarification_rejects_incomplete_and_unknown_answers() -> None:
         config=config,
         mode="plan",
     )
-    with pytest.raises(ValueError, match="unknown option"):
+    with pytest.raises(
+        PlanClarificationResponseError,
+        match="does not match the pending form",
+    ):
         await _parts(
             definition,
             Command(
                 resume={
                     "type": "respond",
-                    "answers": [{"questionId": "target", "optionId": "unknown"}],
+                    "answers": {
+                        "target": {
+                            "status": "answered",
+                            "answerType": "single_choice",
+                            "optionId": "unknown",
+                        }
+                    },
                 }
             ),
             run_id="invalid-answer-2",
             config=config,
             mode="plan",
         )
+    retried = await _parts(
+        definition,
+        Command(
+            resume={
+                "type": "respond",
+                "answers": {
+                    "target": {
+                        "status": "answered",
+                        "answerType": "single_choice",
+                        "optionId": "a",
+                    }
+                },
+            }
+        ),
+        run_id="invalid-answer-3",
+        config=config,
+        mode="plan",
+    )
+    assert (
+        _structured_plan_state(_root_values(retried)[-1]["tinkerfin_plan"]).status
+        is PlanStatus.AWAITING_REVIEW
+    )
 
 
 @pytest.mark.asyncio
@@ -2366,7 +2652,13 @@ async def test_pending_clarification_rejects_schema_drift() -> None:
             Command(
                 resume={
                     "type": "respond",
-                    "answers": [{"questionId": "target", "answer": "A"}],
+                    "answers": {
+                        "target": {
+                            "status": "answered",
+                            "answerType": "text",
+                            "answer": "A",
+                        }
+                    },
                 }
             ),
             run_id="schema-2",
@@ -2382,7 +2674,7 @@ async def test_edit_is_authoritative_and_reenters_sufficiency_checks() -> None:
         TinkerFin()
         .plan(
             enabled=True,
-            review_actions=(
+            allowed_review_actions=(
                 PlanReviewAction.EDIT,
                 PlanReviewAction.RESPOND,
             ),
@@ -2437,7 +2729,13 @@ async def test_edit_is_authoritative_and_reenters_sufficiency_checks() -> None:
         Command(
             resume={
                 "type": "respond",
-                "answers": [{"questionId": "target", "answer": "Target A"}],
+                "answers": {
+                    "target": {
+                        "status": "answered",
+                        "answerType": "text",
+                        "answer": "Target A",
+                    }
+                },
             }
         ),
         run_id="edit-3",

@@ -22,7 +22,7 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.store.base import BaseStore
 from langgraph.types import StateSnapshot, interrupt
 from langgraph.typing import ContextT
-from pydantic import JsonValue, TypeAdapter
+from pydantic import ConfigDict, JsonValue, TypeAdapter
 
 from tinkerfin_agui_adapter import Identity, RuntimeInterruptEnvelope
 
@@ -33,15 +33,17 @@ from .._agui_lineage import (
     RUN_ID_METADATA_KEY,
 )
 from .._agui_lineage_state import lineage_state_update
-from ._clarification import restore_form, serialize_form
+from ._clarification import (
+    build_response_schema,
+    pending_contract_digest,
+    restore_form,
+    serialize_form,
+    validate_and_normalize_response,
+)
 from ._config import PlanOptions
 from ._content import serialize_plan_content
 from ._contracts import (
-    CLARIFICATION_RESPONSE,
     ApprovePlan,
-    ClarificationFreeTextAnswer,
-    ClarificationOptionAnswer,
-    ClarificationSkippedAnswer,
     EditPlanBase,
     PlanClarificationMetadata,
     PlanClarificationPayload,
@@ -69,7 +71,6 @@ from .models import (
     PlanReviewAction,
     PlanState,
     PlanStatus,
-    RequirementAnswer,
 )
 
 _PlanningFactory = Callable[..., object]
@@ -77,7 +78,10 @@ _CheckpointSaver: TypeAlias = (
     BaseCheckpointSaver[int] | BaseCheckpointSaver[float] | BaseCheckpointSaver[str]
 )
 _SchemaT = TypeVar("_SchemaT")
-_JSON_OBJECT = TypeAdapter(dict[str, JsonValue])
+_JSON_OBJECT = TypeAdapter(
+    dict[str, JsonValue],
+    config=ConfigDict(allow_inf_nan=False),
+)
 
 
 class _CompiledPlanningRuntime(Protocol):
@@ -323,7 +327,6 @@ def _create_handoff(
     message_id: str,
 ) -> PlanHandoff:
     payload = {
-        "schemaVersion": 1,
         "messageId": message_id,
         "confirmedPlan": confirmed.model_dump(
             mode="json",
@@ -533,9 +536,13 @@ class _PlanningGraphFactory(Generic[ContextT]):
                 files=mapped.get("files"),
             )
             if outcome.type == "clarify":
-                _, form_payload = serialize_form(
+                form, form_payload = serialize_form(
                     self._options.clarification,
                     outcome.clarification,
+                )
+                response_schema = build_response_schema(
+                    self._options.clarification,
+                    form,
                 )
                 updated = current.model_copy(
                     update={
@@ -543,6 +550,11 @@ class _PlanningGraphFactory(Generic[ContextT]):
                         "effective_mode": "plan",
                         "pending_clarification": PendingClarification(
                             form=form_payload,
+                            response_schema=response_schema,
+                            contract_digest=pending_contract_digest(
+                                form_payload,
+                                response_schema,
+                            ),
                         ),
                         "review_action": None,
                     }
@@ -598,13 +610,20 @@ class _PlanningGraphFactory(Generic[ContextT]):
             if pending is None:
                 raise RuntimeError("Plan clarification requires a pending form")
             form = restore_form(self._options.clarification, pending.form)
+            if pending.contract_digest != pending_contract_digest(
+                pending.form,
+                pending.response_schema,
+            ):
+                raise PlanModeConfigurationError(
+                    "checkpoint clarification contract digest is invalid"
+                )
             metadata = PlanClarificationMetadata(
                 clarification=PlanClarificationPayload(form=pending.form),
             )
             envelope = RuntimeInterruptEnvelope(
                 kind="tinkerfin:plan_clarification",
                 message="Answer required questions and optionally refine the Plan.",
-                response_schema=_json_schema(CLARIFICATION_RESPONSE),
+                response_schema=pending.response_schema,
                 metadata=_JSON_OBJECT.validate_python(
                     metadata.model_dump(
                         mode="json",
@@ -613,61 +632,15 @@ class _PlanningGraphFactory(Generic[ContextT]):
                     )
                 ),
             )
-            response = CLARIFICATION_RESPONSE.validate_python(
-                interrupt(_runtime_interrupt_value(envelope))
+            ordered_answers = validate_and_normalize_response(
+                self._options.clarification,
+                form,
+                pending.response_schema,
+                interrupt(_runtime_interrupt_value(envelope)),
             )
-            answers = {answer.question_id: answer for answer in response.answers}
-            expected = tuple(question.id for question in form.questions)
-            if set(answers) != set(expected) or len(answers) != len(expected):
-                raise ValueError(
-                    "clarification response must answer every pending question exactly once"
-                )
-            ordered_answers: list[RequirementAnswer] = []
-            for question in form.questions:
-                answer = answers[question.id]
-                if isinstance(answer, ClarificationSkippedAnswer):
-                    if question.required:
-                        raise ValueError(
-                            f"required clarification question {question.id!r} cannot be skipped"
-                        )
-                    normalized = RequirementAnswer(
-                        question_id=question.id,
-                        skipped=True,
-                    )
-                elif isinstance(answer, ClarificationOptionAnswer):
-                    selected = next(
-                        (
-                            option
-                            for option in question.options
-                            if option.id == answer.option_id
-                        ),
-                        None,
-                    )
-                    if selected is None:
-                        raise ValueError(
-                            "clarification answer selected an unknown option for "
-                            f"{question.id!r}"
-                        )
-                    normalized = RequirementAnswer(
-                        question_id=question.id,
-                        option_id=selected.id,
-                        answer=selected.label,
-                    )
-                elif isinstance(answer, ClarificationFreeTextAnswer):
-                    if not question.allow_free_text:
-                        raise ValueError(
-                            f"clarification question {question.id!r} requires an option"
-                        )
-                    normalized = RequirementAnswer(
-                        question_id=question.id,
-                        answer=answer.answer,
-                    )
-                else:  # pragma: no cover - Pydantic union is exhaustive
-                    raise TypeError("unsupported clarification answer")
-                ordered_answers.append(normalized)
             exchange = ClarificationExchange(
                 form=pending.form,
-                answers=tuple(ordered_answers),
+                answers=ordered_answers,
             )
             updated = current.model_copy(
                 update={

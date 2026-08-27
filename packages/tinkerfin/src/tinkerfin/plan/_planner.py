@@ -66,9 +66,9 @@ complete draft conforming exactly to the configured Plan content schema. Treat t
 schema and its field descriptions as the authoritative content contract.
 
 Never claim to have modified state and never request a write or execution tool. Do not
-expose private chain-of-thought. For each blocking question, generate concise
-single-select options when they cover likely choices, and allow free text whenever it
-can safely express a valid alternative.
+expose private chain-of-thought. Choose each question's semantic answer type only from
+the configured types listed below. Choice options must be concise and stable within the
+form. Allow custom text only when it can safely express a valid alternative.
 """
 
 
@@ -115,9 +115,20 @@ def _planner_system_prompt(
     else:
         content_instruction = (
             "Whenever you return draft, satisfy every required field and constraint "
-            f"of Plan content schema {content.reference.id!r}."
+            "of the configured Plan content schema."
         )
-    return f"{_PLANNER_PROMPT.rstrip()}\n\n{instruction}\n\n{content_instruction}"
+    type_descriptions = "\n".join(
+        f"- {type_id}: {clarification.types[type_id].description}"
+        for type_id in sorted(clarification.types)
+    )
+    type_instruction = (
+        "\n\nThe configured form supports only these semantic answer types:\n"
+        f"{type_descriptions}"
+    )
+    return (
+        f"{_PLANNER_PROMPT.rstrip()}\n\n{instruction}\n\n{content_instruction}"
+        f"{type_instruction}"
+    )
 
 
 def _invalid_structured_call_messages(

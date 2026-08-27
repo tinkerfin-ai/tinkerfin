@@ -90,8 +90,8 @@ describe('AuthScreen', () => {
     render(<AuthScreen onLogin={vi.fn()} />)
 
     expect(screen.getByLabelText('密码').closest('.ui-text-field__control')).not.toBeNull()
-    expect(uiStyles).toMatch(/\.ui-text-field__control\s*{[^}]*border:\s*1px solid var\(--color-border\);[^}]*background:\s*var\(--color-layer-1\);/s)
-    expect(uiStyles).toMatch(/\.ui-text-field__control:focus-within\s*{[^}]*border-color:\s*var\(--color-border-strong\);[^}]*box-shadow:\s*none;/s)
+    expect(uiStyles).toMatch(/\.ui-text-field__control,\s*\.ui-date-picker__trigger\s*{[^}]*border:\s*1px solid var\(--color-border\);[^}]*background:\s*var\(--color-layer-1\);/s)
+    expect(uiStyles).toMatch(/\.ui-text-field__control:focus-within,\s*\.ui-date-picker__trigger:focus-visible\s*{[^}]*border-color:\s*var\(--color-border-strong\);[^}]*box-shadow:\s*none;/s)
     expect(authStyles).toMatch(/\.auth-field \.ui-text-field__control\s*{[^}]*background:\s*transparent;/s)
     expect(authStyles).not.toContain('.auth-field .ui-text-field__control:focus-within')
   })

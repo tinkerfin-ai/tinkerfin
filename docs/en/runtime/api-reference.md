@@ -34,8 +34,9 @@ later request. An ordinary Definition accepts only `default`.
 ## Plan Mode values
 
 The top-level package exports `AgentMode`. The `tinkerfin.plan` package exports
-`ClarificationModel`, the `ClarificationOption` / `ClarificationQuestion` /
-`ClarificationForm` base and generic types, `DefaultClarificationForm`,
+`ClarificationModel`, `ClarificationOption`, `ClarificationForm`,
+`BuiltInClarificationForm`, the four built-in Question types,
+`ClarificationType`, `clarification_type`, `DefaultClarificationForm`,
 `PlanContentModel`, `StructuredPlanStep`, `StructuredPlanContent`,
 `MarkdownPlanContent`, `PlanSchemaReference`, `PlanDraft`, `ConfirmedPlan`,
 `RequirementAnswer`, `PendingClarification`, `ClarificationExchange`, `PlanState`,
@@ -48,25 +49,29 @@ the native checkpoint that contains the deterministic handoff message; completed
 also include terminal native checkpoint evidence. Retries reconcile these checkpoints
 instead of redispatching the approved Plan.
 
-`.plan(plan_schema=...)` accepts one concrete `PlanContentModel` subclass. Omitting it
+`.plan(content_schema=...)` accepts one concrete `PlanContentModel` subclass. Omitting it
 uses `StructuredPlanContent`; `MarkdownPlanContent` preserves one non-blank Markdown
-string without whitespace rewriting. A host schema declares a stable `schema_id`; the
-runtime validates and fingerprints its JSON Schema and rejects schema drift on resume.
+string without whitespace rewriting. The runtime validates and fingerprints the selected
+JSON Schema automatically and rejects Definition drift on resume.
 The reviewed draft and `ConfirmedPlan` always use the same frozen content schema.
 
-`.plan(review_actions=...)` accepts an ordered, non-empty sequence of distinct
+`.plan(allowed_review_actions=...)` accepts an ordered, non-empty sequence of distinct
 `PlanReviewAction` members. The default is `APPROVE`, `RESPOND`, and `REJECT`; the
 interrupt response Schema contains exactly the configured decisions. Include `EDIT`
 explicitly only when the host provides a trusted draft editor.
 
-`.plan(clarification_schema=...)` accepts one fully concrete `ClarificationFormBase`
-subclass defined by the host. Omitting it uses `DefaultClarificationForm`. Python uses
-`allow_free_text`; the JSON contract uses `allowFreeText`. Every question explicitly
-sets `required`. Option answers contain only `questionId` and `optionId`; free-text
-answers contain only `questionId` and `answer`; an optional skip contains
-`questionId` and `skipped: true`.
-Host models can add typed attributes and discriminants but cannot redefine the
-framework-owned core fields or the tuple shape of questions and options.
+`.plan(clarification_schema=...)` accepts one concrete `ClarificationFormBase` subclass;
+omitting it uses all four built-in answer types. Shared typed metadata uses
+`BuiltInClarificationForm[QuestionAttributes, OptionModel]`. A host-defined semantic type
+is registered once through `.plan(clarification_types=(clarification_type(...),))`.
+Changing its Schema, validator, or normalizer semantics requires a new type ID version.
+
+Clarification responses use an `answers` object keyed by checkpoint question ID. An
+answered value contains `status: answered`, its `answerType`, and type-specific fields;
+an optional skip contains only `status: skipped`. The exact pending JSON Schema validates
+complete coverage, choice IDs, selection bounds, non-blank text, and calendar dates before
+Graph resume. Host models cannot redefine framework-owned IDs, required/skip semantics,
+or checkpoint ownership.
 
 `TinkerFin(state_schema=...)` contributes application state to every native Deep Agent
 Definition created by that factory. The standalone Planning Graph composes its own
@@ -97,7 +102,6 @@ Creates a valid failed AG-UI stream when initialization failed before Graph iter
 
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `schemaVersion` | `1` | `1` | Data format version |
 | `type` | string | required | `messages`, `tasks`, `values`, `updates`, `checkpoints`, `debug`, or `custom` |
 | `ns` | tuple of strings | required | Graph namespace; empty means root |
 | `data` | JSON value | required | Mode-specific data |

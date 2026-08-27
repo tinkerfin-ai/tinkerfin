@@ -34,7 +34,7 @@ def _interrupts() -> tuple[Interrupt, ...]:
             metadata={
                 "langgraphValue": native_value,
                 "deepagents": {
-                    "schema": "tinkerfin.deepagents.tool-review.v1",
+                    "schema": "tinkerfin.deepagents.tool-review",
                     "nativeInterruptId": "interrupt-1",
                     "actionIndex": index,
                     "toolName": "write_file",
@@ -103,7 +103,6 @@ def test_binding_has_a_strict_stable_json_round_trip() -> None:
     payload = binding.model_dump(mode="json", by_alias=True, exclude_none=True)
 
     assert payload == {
-        "schemaVersion": 1,
         "mode": "resume",
         "resumeData": {"decisions": [{"type": "approve"}, {"type": "approve"}]},
         "nativeInterruptIds": ["interrupt-1"],
@@ -184,7 +183,6 @@ def test_binding_rejects_invalid_persisted_shapes() -> None:
     with pytest.raises(ValidationError, match="requires resumeData"):
         AgUiResumeBinding.model_validate(
             {
-                "schemaVersion": 1,
                 "mode": "resume",
                 "nativeInterruptIds": ["interrupt-1"],
             }
@@ -192,7 +190,6 @@ def test_binding_rejects_invalid_persisted_shapes() -> None:
     with pytest.raises(ValidationError, match="cannot include resumeData"):
         AgUiResumeBinding.model_validate(
             {
-                "schemaVersion": 1,
                 "mode": "abandon",
                 "resumeData": {},
                 "nativeInterruptIds": ["interrupt-1"],
@@ -201,7 +198,6 @@ def test_binding_rejects_invalid_persisted_shapes() -> None:
     with pytest.raises(ValidationError, match="complete scoped Tool IDs"):
         AgUiResumeBinding.model_validate(
             {
-                "schemaVersion": 1,
                 "mode": "resume",
                 "resumeData": {"decisions": []},
                 "nativeInterruptIds": ["interrupt-1"],

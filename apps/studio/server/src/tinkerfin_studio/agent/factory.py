@@ -28,7 +28,7 @@ from tinkerfin import (
     DeepAgentDefinition,
     TinkerFin,
 )
-from tinkerfin.plan import MarkdownPlanContent, PlanReviewAction
+from tinkerfin.plan import PlanReviewAction
 from tinkerfin_messaging import (
     MessageSourceBinding,
     ProfiledDeferredMessageSource,
@@ -37,6 +37,7 @@ from tinkerfin_messaging import (
 from tinkerfin_sandbox.lifecycle.manager import OpenSandboxManager
 from tinkerfin_studio.agent.persistence import AgentPersistence
 from tinkerfin_studio.agent.plan_clarification import StudioPlanClarificationForm
+from tinkerfin_studio.agent.plan_content import StudioMarkdownPlanContent
 from tinkerfin_studio.agent.tools import build_web_search_tool
 from tinkerfin_studio.conversation.run_preparation import (
     PreparedRunRequest,
@@ -208,7 +209,7 @@ class ConversationAgentFactory:
         return ProfiledDeferredMessageSource(
             open_events,
             identity=prepared.identity,
-            codec_profile="agui.event.v1",
+            codec_profile="agui.event",
             source_type=BaseEvent,
             replay_type=BaseEvent,
             cancellable=True,
@@ -284,8 +285,8 @@ class ConversationAgentFactory:
             enabled=True,
             planner_model=plan_model,
             clarification_schema=StudioPlanClarificationForm,
-            plan_schema=MarkdownPlanContent,
-            review_actions=(
+            content_schema=StudioMarkdownPlanContent,
+            allowed_review_actions=(
                 PlanReviewAction.APPROVE,
                 PlanReviewAction.RESPOND,
                 PlanReviewAction.REJECT,

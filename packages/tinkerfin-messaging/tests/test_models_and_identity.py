@@ -34,8 +34,18 @@ def test_envelope_preserves_protocol_neutral_bytes() -> None:
     envelope = _envelope(payload=b"\x00\xffpayload")
 
     assert envelope.payload == b"\x00\xffpayload"
-    assert envelope.schema_version == 2
+    assert "schema_version" not in envelope.model_fields_set
+    assert "schema_version" not in envelope.model_dump(mode="python")
     assert envelope.model_copy(deep=True) == envelope
+
+
+def test_current_envelopes_reject_removed_version_fields() -> None:
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        _envelope(schema_version=2)
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        RecoveryCheckpoint.model_validate(
+            {"schema_version": 1, "position": b"2", "last_message_id": None}
+        )
 
 
 def test_messaging_uses_the_same_identity_type_as_the_framework() -> None:
@@ -74,12 +84,13 @@ def test_recovery_checkpoint_rejects_an_overlong_last_message_id() -> None:
 
 def test_public_schemas_publish_identifier_length_limits() -> None:
     envelope_properties = MessageEnvelope.model_json_schema()["properties"]
+    assert "schema_version" not in envelope_properties
     for field in ("channel", "message_id", "codec"):
         assert envelope_properties[field]["maxLength"] == 1024
 
-    checkpoint_schema = RecoveryCheckpoint.model_json_schema()["properties"][
-        "last_message_id"
-    ]
+    checkpoint_properties = RecoveryCheckpoint.model_json_schema()["properties"]
+    assert "schema_version" not in checkpoint_properties
+    checkpoint_schema = checkpoint_properties["last_message_id"]
     assert checkpoint_schema["anyOf"][0]["maxLength"] == 1024
 
 

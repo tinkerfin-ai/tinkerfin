@@ -69,7 +69,8 @@ schema = get_sqlalchemy_opensandbox_state_schema(dialect="mysql")
 Path("opensandbox-schema.sql").write_text(schema.ddl, encoding="utf-8")
 ```
 
-`dialect` is `mysql` or `sqlite`. The returned value also provides `component`, `version`, and `table_names`. Runtime startup still validates the deployed structure.
+`dialect` is `mysql` or `sqlite`. The returned value also provides `table_names`.
+Runtime startup still validates the deployed structure.
 
 ## Warm capacity
 

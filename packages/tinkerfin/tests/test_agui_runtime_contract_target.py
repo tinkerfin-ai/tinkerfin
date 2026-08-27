@@ -53,7 +53,6 @@ def test_resume_binding_owns_a_strict_stable_persistence_round_trip() -> None:
     assert issubclass(AgUiResumeBinding, BaseModel)
     binding = AgUiResumeBinding.model_validate(
         {
-            "schemaVersion": 1,
             "mode": "resume",
             "resumeData": {"decisions": [{"type": "approve"}]},
             "nativeInterruptIds": ["interrupt-1"],
@@ -75,7 +74,6 @@ def test_resume_binding_round_trips_all_cancelled_abandonment() -> None:
 
     binding = AgUiResumeBinding.model_validate(
         {
-            "schemaVersion": 1,
             "mode": "abandon",
             "nativeInterruptIds": ["interrupt-1"],
             "priorToolCallIds": [],

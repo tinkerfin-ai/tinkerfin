@@ -17,7 +17,7 @@ class NativeStreamPartCodec(
 ):
     """Persist verified LangGraph v2 envelopes using TinkerFin's native schema."""
 
-    codec_id: ClassVar[str] = "langgraph.stream-part.v2.v1"
+    codec_id: ClassVar[str] = "langgraph.stream-part.v2"
     messaging_source_type: ClassVar[type[Mapping[str, object]]] = Mapping
     messaging_replay_type: ClassVar[type[NativeStreamPart]] = NativeStreamPart
 

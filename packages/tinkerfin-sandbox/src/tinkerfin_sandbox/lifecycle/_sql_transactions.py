@@ -25,7 +25,6 @@ from datetime import timedelta
 from typing import TYPE_CHECKING, Literal, TypeVar
 
 from sqlalchemy import delete, insert, select, update
-from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncConnection
@@ -37,10 +36,7 @@ from ..errors import (
     OpenSandboxStateError,
 )
 from ._sql_schema import (
-    _SCHEMA_VERSION,
-    _metadata,
-    _schema_versions,
-    _validate_schema,
+    _initialize_schema,
     _warm_slots,
     _workers,
 )
@@ -154,18 +150,6 @@ def _capabilities_from_connection(
         server_version=normalized_version,
         is_mariadb=bool(getattr(dialect, "is_mariadb", False)),
     )
-
-
-def _has_schema_version_table(sync_connection: Connection) -> bool:
-    """Return whether initialization has created the version table."""
-    return sa_inspect(sync_connection).has_table(str(_schema_versions.name))
-
-
-def _migrate_v1_to_v2(sync_connection: Connection) -> None:
-    """Add Worker capacity and lease state introduced by schema version 2."""
-    _workers.create(sync_connection, checkfirst=True)
-    for index in _workers.indexes:
-        index.create(sync_connection, checkfirst=True)
 
 
 def _is_retryable_mysql_conflict(
@@ -499,41 +483,7 @@ async def _start_once(self: SQLAlchemyOpenSandboxState, *, warm_pool_size: int) 
 
     async def initialize(connection: AsyncConnection) -> None:
         now = self._now()
-        has_version_table = await connection.run_sync(_has_schema_version_table)
-        current = (
-            await connection.scalar(
-                select(_schema_versions.c.version).where(
-                    _schema_versions.c.component == "opensandbox-state"
-                )
-            )
-            if has_version_table
-            else None
-        )
-        if current is None:
-            await connection.run_sync(_metadata.create_all)
-        elif current > _SCHEMA_VERSION:
-            raise OpenSandboxStateError(
-                "OpenSandbox State schema is newer than this package"
-            )
-        elif current == 1:
-            await connection.run_sync(_migrate_v1_to_v2)
-        elif current < 1:
-            raise OpenSandboxStateError("Unsupported OpenSandbox State schema")
-
-        await connection.run_sync(_validate_schema)
-        if current is None:
-            await connection.execute(
-                insert(_schema_versions).values(
-                    component="opensandbox-state",
-                    version=_SCHEMA_VERSION,
-                )
-            )
-        elif current < _SCHEMA_VERSION:
-            await connection.execute(
-                update(_schema_versions)
-                .where(_schema_versions.c.component == "opensandbox-state")
-                .values(version=_SCHEMA_VERSION)
-            )
+        await connection.run_sync(_initialize_schema)
 
         await connection.execute(
             delete(_workers).where(

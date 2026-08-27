@@ -1,5 +1,5 @@
 import { act, renderHook, waitFor } from '@testing-library/react'
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ConversationHistoryListItem } from '../../api/conversation/history'
@@ -38,6 +38,7 @@ const summary = (pinned: boolean): ConversationHistoryListItem => ({
   messageCount: 0,
   toolCallCount: 0,
   hasPendingInterrupt: false,
+  pendingInteractionKind: null,
   pinned,
   createdAt: '2026-08-25T00:00:00.000Z',
   updatedAt: '2026-08-25T00:00:00.000Z',
@@ -53,6 +54,7 @@ function useHarness() {
     conversations: [conversation],
     currentThreadId: conversation.threadId,
   })
+  const onToast = useRef(vi.fn()).current
   const management = useConversationManagement({
     workspace,
     conversation: workspace.conversations[0] ?? conversation,
@@ -67,10 +69,10 @@ function useHarness() {
     getActiveThreadId: vi.fn(() => null),
     hasActiveStream: vi.fn(() => false),
     isActiveThread: vi.fn(() => false),
-    onToast: vi.fn(),
+    onToast,
     onConversationBoundary: vi.fn(),
   })
-  return { management, workspace }
+  return { management, workspace, onToast }
 }
 
 describe('useConversationManagement pin ownership', () => {
@@ -99,6 +101,7 @@ describe('useConversationManagement pin ownership', () => {
       expect(result.current.workspace.conversations[0]?.pinned).toBe(false)
       expect(result.current.management.pinPendingThreadIds.has('thread-pin')).toBe(false)
     })
+    expect(result.current.onToast).not.toHaveBeenCalled()
   })
 
   it('rolls back only the optimistic value owned by the failed request', async () => {
@@ -114,5 +117,7 @@ describe('useConversationManagement pin ownership', () => {
     })
 
     await waitFor(() => expect(result.current.workspace.conversations[0]?.pinned).toBe(false))
+    expect(result.current.onToast).toHaveBeenCalledOnce()
+    expect(result.current.onToast).toHaveBeenCalledWith('error', '置顶状态更新失败，请重试')
   })
 })

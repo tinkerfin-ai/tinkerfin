@@ -1,4 +1,4 @@
-"""Public Tool review metadata v1 contract tests."""
+"""Public Tool review metadata contract tests."""
 
 from __future__ import annotations
 
@@ -94,7 +94,7 @@ def _interrupt(
     )
 
 
-def test_public_parser_returns_frozen_versioned_tool_review_metadata() -> None:
+def test_public_parser_returns_frozen_current_tool_review_metadata() -> None:
     parsed = parse_tool_review_interrupt(_interrupt())
 
     assert parsed.model_dump(mode="json", by_alias=True) == {
@@ -191,7 +191,7 @@ def test_python_and_web_contract_fixtures_are_identical_and_valid() -> None:
         / "src"
         / "tinkerfin_agui_adapter"
         / "contracts"
-        / "tool-review-v1.fixture.json"
+        / "tool-review.fixture.json"
     )
     web_fixture_path = (
         _REPOSITORY_ROOT
@@ -203,7 +203,7 @@ def test_python_and_web_contract_fixtures_are_identical_and_valid() -> None:
         / "conversation"
         / "agui"
         / "contracts"
-        / "tool-review-v1.fixture.json"
+        / "tool-review.fixture.json"
     )
     package_text = package_fixture_path.read_text(encoding="utf-8")
     assert web_fixture_path.read_text(encoding="utf-8") == package_text

@@ -37,11 +37,10 @@ TinkerFin profile source 的 `identity` 可省略；普通自定义 source 必�
 | `DecodedMessage` | `envelope` 与 codec 解码后的 `data` |
 | `MessageEnvelope` | 已提交的不可变持久消息 |
 
-### `MessageEnvelope` v2 字段
+### `MessageEnvelope` 字段
 
 | 字段 | 约束或含义 |
 | --- | --- |
-| `schema_version` | 固定为 2 |
 | `channel` | 非空 channel name |
 | `identity` | 嵌套的共享 `Identity` |
 | `seq` | thread 内从 1 开始的连续位置 |
@@ -64,7 +63,7 @@ TinkerFin profile source 的 `identity` 可省略；普通自定义 source 必�
 | `map_source(...)` | 顺序执行同步或异步转换 |
 | `RecoverableSource` | 根据 checkpoint 重建 source |
 | `RecoverableMessage` | 稳定消息 ID、数据和 checkpoint |
-| `RecoveryCheckpoint` | `position` 与可选 `last_message_id`；schema 为 1 |
+| `RecoveryCheckpoint` | `position` 与可选 `last_message_id` |
 
 ## Codec、renderer 与 backend
 
@@ -76,7 +75,7 @@ TinkerFin profile source 的 `identity` 可省略；普通自定义 source 必�
 | `NativeStreamPartCodec` | 默认安装可用的 Native v2 codec 与 renderer |
 | `NativeStreamPart` | Native v2 解码结果 |
 | `MemoryBackend` | 单进程实现 |
-| `RedisBackend` | 安装 `[redis]` 后可用的多进程实现，持久 schema 为 5 |
+| `RedisBackend` | 安装 `[redis]` 后可用的多进程实现 |
 | `MessagingBackend` | 自定义 backend 协议 |
 
 ### `MessagingBackend` 操作

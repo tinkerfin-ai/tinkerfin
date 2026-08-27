@@ -17,6 +17,9 @@ class TinkerFinErrorCode(StrEnum):
     LIFECYCLE_ERROR = "tinkerfin.lifecycle_error"
     STREAM_PROTOCOL_ERROR = "tinkerfin.stream_protocol_error"
     PLAN_MODE_CONFIGURATION = "tinkerfin.plan_mode_configuration"
+    PLAN_CLARIFICATION_RESPONSE_INVALID = (
+        "tinkerfin.plan_clarification_response_invalid"
+    )
     PLAN_STATE_CONFLICT = "tinkerfin.plan_state_conflict"
     PLAN_STRUCTURED_OUTPUT = "tinkerfin.plan_structured_output"
     AGUI_NATIVE_STREAM_CONFIGURATION = "tinkerfin.agui_native_stream_configuration"

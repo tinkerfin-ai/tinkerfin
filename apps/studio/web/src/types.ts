@@ -2,6 +2,7 @@ export type MessageRole = 'user' | 'assistant' | 'process' | 'tool' | 'subagent'
 export type TodoStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled'
 export type ApprovalDecision = 'approved' | 'rejected'
 export type ConversationRunStatus = 'idle' | 'streaming' | 'waiting_approval' | 'detached' | 'error'
+export type PendingInteractionKind = 'tool_approval' | 'plan_clarification' | 'plan_review'
 export type ApprovalMode = 'options' | 'reject'
 export type ApprovalAllowedDecision = 'approve' | 'edit' | 'reject' | 'respond'
 export type AgentMode = 'default' | 'plan'
@@ -89,17 +90,48 @@ export interface PlanQuestionOption {
   attributes?: JsonObject | null
 }
 
-export interface PlanQuestionItem {
+interface PlanQuestionBase {
   id: string
+  answerType: 'single_choice' | 'multiple_choice' | 'text' | 'date'
   prompt: string
   required: boolean
-  options: PlanQuestionOption[]
-  allowFreeText: boolean
   attributes?: JsonObject | null
-  selectedOptionId?: string
-  customAnswer?: string
   skipped?: boolean
 }
+
+export interface PlanSingleChoiceQuestion extends PlanQuestionBase {
+  answerType: 'single_choice'
+  options: PlanQuestionOption[]
+  allowFreeText: boolean
+  selectedOptionId?: string
+  customAnswer?: string
+}
+
+export interface PlanMultipleChoiceQuestion extends PlanQuestionBase {
+  answerType: 'multiple_choice'
+  options: PlanQuestionOption[]
+  allowFreeText: boolean
+  minSelections: number
+  maxSelections?: number | null
+  selectedOptionIds: string[]
+  customAnswer?: string
+}
+
+export interface PlanTextQuestion extends PlanQuestionBase {
+  answerType: 'text'
+  answer?: string
+}
+
+export interface PlanDateQuestion extends PlanQuestionBase {
+  answerType: 'date'
+  date?: string
+}
+
+export type PlanQuestionItem =
+  | PlanSingleChoiceQuestion
+  | PlanMultipleChoiceQuestion
+  | PlanTextQuestion
+  | PlanDateQuestion
 
 export interface PlanQuestionState {
   kind: 'questions'
@@ -114,17 +146,16 @@ export interface PlanQuestionState {
 }
 
 export interface PlanContentSchemaReference extends JsonObject {
-  id: 'tinkerfin.plan.markdown.v1'
   fingerprint: string
   mediaType: 'text/markdown'
 }
 
 export interface MarkdownPlanContent extends JsonObject {
+  description: string
   markdown: string
 }
 
 export interface MarkdownPlanDraft extends JsonObject {
-  schemaVersion: 1
   revision: number
   contentSchema: PlanContentSchemaReference
   content: MarkdownPlanContent
@@ -155,6 +186,7 @@ export interface Conversation {
   todos: TodoItem[]
   approval?: ApprovalState
   planInteraction?: PlanInteraction
+  pendingInteractionKind?: PendingInteractionKind
   runStatus: ConversationRunStatus
   activeRunId?: string
   serverState?: JsonObject

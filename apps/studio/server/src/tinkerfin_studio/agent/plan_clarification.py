@@ -7,17 +7,17 @@ from typing import Self
 from pydantic import Field, model_validator
 
 from tinkerfin.plan import (
-    ClarificationForm,
+    BuiltInClarificationForm,
     ClarificationModel,
     ClarificationOptionBase,
-    ClarificationQuestionBase,
+    SingleChoiceQuestion,
 )
 
 
 class StudioPlanOptionAttributes(ClarificationModel):
     """Studio 澄清选项的展示属性"""
 
-    recommended: bool = Field(description="是否为当前问题唯一推荐且位于第一位的选项")
+    recommended: bool = Field(description="是否为 Planner 推荐的选项")
 
 
 class StudioPlanClarificationOption(ClarificationOptionBase):
@@ -28,29 +28,9 @@ class StudioPlanClarificationOption(ClarificationOptionBase):
     )
 
 
-class StudioPlanClarificationQuestion(ClarificationQuestionBase):
-    """保证推荐项顺序唯一的 Studio 澄清问题"""
-
-    # 冻结元组仅收窄元素类型，运行时仍遵守框架的不可变字段契约
-    options: tuple[StudioPlanClarificationOption, ...] = Field(  # pyright: ignore[reportIncompatibleVariableOverride]
-        default=(),
-        description="模型生成的单选项；第一项必须是唯一推荐项",
-    )
-
-    @model_validator(mode="after")
-    def recommended_option_is_first(self) -> Self:
-        """确保有选项的问题把唯一推荐项放在第一位"""
-
-        if not self.options:
-            return self
-        if not self.options[0].attributes.recommended:
-            raise ValueError("第一个选项必须是推荐项")
-        if any(option.attributes.recommended for option in self.options[1:]):
-            raise ValueError("除第一个选项外不得标记其他推荐项")
-        return self
-
-
-class StudioPlanClarificationForm(ClarificationForm[StudioPlanClarificationQuestion]):
+class StudioPlanClarificationForm(
+    BuiltInClarificationForm[ClarificationModel, StudioPlanClarificationOption]
+):
     """由 Planner 生成并供 Studio 用户回答的澄清表单"""
 
     title: str = Field(
@@ -63,6 +43,19 @@ class StudioPlanClarificationForm(ClarificationForm[StudioPlanClarificationQuest
         min_length=1,
         max_length=60,
     )
+
+    @model_validator(mode="after")
+    def single_choice_recommendation_is_unique(self) -> Self:
+        """确保单选题把唯一推荐项放在第一位"""
+
+        for question in self.questions:
+            if not isinstance(question, SingleChoiceQuestion):
+                continue
+            if not question.options[0].attributes.recommended:
+                raise ValueError("单选题的第一个选项必须是推荐项")
+            if any(option.attributes.recommended for option in question.options[1:]):
+                raise ValueError("单选题只能标记第一个选项为推荐项")
+        return self
 
 
 __all__ = ["StudioPlanClarificationForm"]

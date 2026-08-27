@@ -94,7 +94,7 @@ def _owner_key(value: str) -> str:
 
 def _owner_metadata_label(owner_digest: str) -> str:
     """Wrap the stable State digest in a valid OpenSandbox label value."""
-    return f"v1.{owner_digest}.v1"
+    return f"owner.{owner_digest}.id"
 
 
 async def _create_for_warm_claim(

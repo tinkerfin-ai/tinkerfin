@@ -21,7 +21,7 @@ from .._state_schema import (
 )
 from ._content import PlanContentBinding
 from .errors import PlanModeConfigurationError
-from .models import PlanContentModel, PlanState
+from .models import PlanContentModel, PlanContentT, PlanState
 
 PLAN_STATE_KEY = "tinkerfin_plan"
 PLAN_SCHEMA_FINGERPRINT_KEY = "_tinkerfin_plan_clarification_schema"
@@ -104,7 +104,7 @@ def read_plan_state(
     return content.state_type.model_validate(value)
 
 
-def plan_state_update(plan: PlanState[PlanContentModel]) -> dict[str, object]:
+def plan_state_update(plan: PlanState[PlanContentT]) -> dict[str, object]:
     """Serialize Plan state to the JSON-only durable checkpoint contract."""
 
     if not isinstance(plan, PlanState):

@@ -14,7 +14,7 @@ from collections.abc import (
 )
 from contextlib import AbstractAsyncContextManager
 from contextvars import ContextVar
-from typing import Generic, TypeAlias, TypeVar
+from typing import Any, Generic, TypeAlias, TypeVar
 
 from ag_ui.core import BaseEvent
 from deepagents.graph import DeepAgentState
@@ -40,15 +40,16 @@ from .errors import (
 from .native import NativeStreamPart
 from .plan._clarification import create_clarification_binding
 from .plan._config import (
-    DEFAULT_PLAN_REVIEW_ACTIONS,
+    DEFAULT_ALLOWED_REVIEW_ACTIONS,
     AgentMode,
     PlanOptions,
     validate_agent_mode,
-    validate_plan_review_actions,
+    validate_allowed_review_actions,
 )
 from .plan._content import create_plan_content_binding
 from .plan._contracts import create_plan_contract_binding
 from .plan.clarification import ClarificationFormBase, DefaultClarificationForm
+from .plan.clarification_types import ClarificationType
 from .plan.models import PlanContentModel, PlanReviewAction, StructuredPlanContent
 from .sse import (
     SseBody,
@@ -176,7 +177,7 @@ class NativeGraphRunStream(_GraphRunStream[Mapping[str, object]]):
     def messaging_codec_profile(self) -> str:
         """Return the canonical native persistence profile."""
 
-        return "langgraph.stream-part.v2.v1"
+        return "langgraph.stream-part.v2"
 
     @property
     def messaging_source_type(self) -> type[Mapping[str, object]]:
@@ -198,7 +199,7 @@ class AgUiEventStream:
     def messaging_codec_profile(self) -> str:
         """Return the canonical AG-UI event persistence profile."""
 
-        return "agui.event.v1"
+        return "agui.event"
 
     @property
     def messaging_source_type(self) -> type[BaseEvent]:
@@ -568,8 +569,11 @@ class TinkerFin:
         default_mode: AgentMode = "default",
         planner_model: str | BaseChatModel | None = None,
         clarification_schema: type[ClarificationFormBase] = DefaultClarificationForm,
-        plan_schema: type[PlanContentModel] = StructuredPlanContent,
-        review_actions: Sequence[PlanReviewAction] = DEFAULT_PLAN_REVIEW_ACTIONS,
+        clarification_types: Sequence[ClarificationType[Any, Any]] = (),
+        content_schema: type[PlanContentModel] = StructuredPlanContent,
+        allowed_review_actions: Sequence[
+            PlanReviewAction
+        ] = DEFAULT_ALLOWED_REVIEW_ACTIONS,
     ) -> TinkerFin:
         """Return a factory with immutable Plan-capability options.
 
@@ -581,8 +585,10 @@ class TinkerFin:
             default_mode: Run mode used when ``new`` or ``new_agui`` omits one.
             planner_model: Optional model dedicated to read-only planning.
             clarification_schema: Concrete host form used by the Planner.
-            plan_schema: Concrete content model used for drafts and confirmed Plans.
-            review_actions: Ordered decisions accepted for each Plan draft review.
+            clarification_types: Additional custom semantic question types.
+            content_schema: Concrete content model used for drafts and confirmed Plans.
+            allowed_review_actions: Ordered decisions accepted for each Plan draft
+                review.
 
         Returns:
             A separate configured TinkerFin factory.
@@ -595,7 +601,12 @@ class TinkerFin:
         if type(enabled) is not bool:
             raise TypeError("enabled must be a bool")
         mode = validate_agent_mode(default_mode, name="default_mode")
-        actions = validate_plan_review_actions(review_actions)
+        actions = validate_allowed_review_actions(allowed_review_actions)
+        if isinstance(clarification_types, (str, bytes)) or not isinstance(
+            clarification_types, Sequence
+        ):
+            raise TypeError("clarification_types must be a sequence")
+        frozen_clarification_types = tuple(clarification_types)
         for name, model in (("planner_model", planner_model),):
             if model is not None and not isinstance(model, (str, BaseChatModel)):
                 raise TypeError(
@@ -607,31 +618,35 @@ class TinkerFin:
             mode != "default"
             or planner_model is not None
             or clarification_schema is not DefaultClarificationForm
-            or plan_schema is not StructuredPlanContent
-            or actions != DEFAULT_PLAN_REVIEW_ACTIONS
+            or frozen_clarification_types
+            or content_schema is not StructuredPlanContent
+            or actions != DEFAULT_ALLOWED_REVIEW_ACTIONS
         ):
             from .plan.errors import PlanModeConfigurationError
 
             raise PlanModeConfigurationError(
                 "disabled Plan capability cannot configure a mode, model, form, "
-                "content schema, or review actions"
+                "clarification types, content schema, or review actions"
             )
         configured = TinkerFin(
             run_coordinator=self._run_coordinator,
             state_schema=self._state_schema,
         )
         if enabled:
-            clarification = create_clarification_binding(clarification_schema)
-            content = create_plan_content_binding(plan_schema)
+            clarification = create_clarification_binding(
+                clarification_schema,
+                custom_types=frozen_clarification_types,
+            )
+            content = create_plan_content_binding(content_schema)
             configured._plan_options = PlanOptions(
                 clarification=clarification,
                 content=content,
                 contracts=create_plan_contract_binding(
                     clarification,
                     content,
-                    review_actions=actions,
+                    allowed_review_actions=actions,
                 ),
-                review_actions=actions,
+                allowed_review_actions=actions,
                 default_mode=mode,
                 planner_model=planner_model,
             )

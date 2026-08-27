@@ -16,7 +16,6 @@ ScopedIdKind: TypeAlias = Literal[
 
 _KINDS = frozenset({"message", "tool", "reasoning", "reasoning-message"})
 _PREFIX = "tf"
-_VERSION = 1
 
 
 class ScopedIdCodec:
@@ -32,7 +31,7 @@ class ScopedIdCodec:
 
         self._validate(kind, namespace, raw_id)
         payload = json.dumps(
-            [_VERSION, list(namespace), raw_id],
+            [list(namespace), raw_id],
             ensure_ascii=False,
             separators=(",", ":"),
         ).encode("utf-8")
@@ -40,7 +39,7 @@ class ScopedIdCodec:
         return f"{_PREFIX}:{kind}:{token}"
 
     def decode(self, value: str) -> tuple[ScopedIdKind, tuple[str, ...], str]:
-        """Decode and validate an ID produced by this codec version."""
+        """Decode and validate an ID produced by this codec."""
 
         if not isinstance(value, str):
             raise TypeError("scoped ID must be a string")
@@ -66,15 +65,14 @@ class ScopedIdCodec:
             )
         payload_items = cast(list[object], payload)
         if (
-            len(payload_items) != 3
-            or payload_items[0] != _VERSION
-            or not isinstance(payload_items[1], list)
-            or not isinstance(payload_items[2], str)
+            len(payload_items) != 2
+            or not isinstance(payload_items[0], list)
+            or not isinstance(payload_items[1], str)
         ):
             raise ValueError("invalid scoped ID")
-        namespace = cast(tuple[str, ...], tuple(cast(list[object], payload_items[1])))
+        namespace = cast(tuple[str, ...], tuple(cast(list[object], payload_items[0])))
         kind = cast(ScopedIdKind, raw_kind)
-        raw_id = payload_items[2]
+        raw_id = payload_items[1]
         self._validate(kind, namespace, raw_id)
         return kind, namespace, raw_id
 

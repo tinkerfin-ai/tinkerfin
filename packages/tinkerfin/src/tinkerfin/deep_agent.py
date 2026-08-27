@@ -662,7 +662,7 @@ class DeepAgentDefinition(Generic[GraphT, AstreamT]):
         from .plan._workflow import PlanningWorkflowGraph
 
         runtime = PlanCapableGraphRuntime(
-            content=plan_options.content,
+            options=plan_options,
             native=cast(_PlanNativeGraph, native),
             planning_factory=lambda: cast(
                 PlanningWorkflowGraph[Any],

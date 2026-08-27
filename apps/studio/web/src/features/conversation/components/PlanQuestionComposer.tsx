@@ -1,4 +1,6 @@
 import {
+  CalendarDays,
+  Check,
   ChevronLeft,
   ChevronRight,
   CircleHelp,
@@ -13,20 +15,89 @@ import {
   type KeyboardEvent,
 } from 'react'
 
-import { Button, IconButton, OverlayScrollbar } from '../../../components/ui'
-import type { PlanQuestionItem, PlanQuestionState } from '../../../types'
+import { Button, DatePicker, IconButton, OverlayScrollbar } from '../../../components/ui'
 import { useI18n } from '../../../i18n'
-import { PlanInteractionCard, PlanInteractionStatusRow } from './PlanInteractionCard'
+import type { PlanQuestionItem, PlanQuestionState } from '../../../types'
 import {
   readPlanQuestionCollapsed,
   writePlanQuestionCollapsed,
 } from '../planQuestionCollapse'
+import { PlanInteractionCard, PlanInteractionStatusRow } from './PlanInteractionCard'
 
-const questionAnswered = (question: PlanQuestionItem) => Boolean(
-  question.selectedOptionId || question.customAnswer?.trim(),
-)
+const multipleSelectionMaximum = (
+  question: Extract<PlanQuestionItem, { answerType: 'multiple_choice' }>,
+) => question.maxSelections
+  ?? question.options.length + Number(question.allowFreeText)
 
-const resizeCustomAnswer = (textarea: HTMLTextAreaElement | null) => {
+const multipleSelectionCount = (
+  question: Extract<PlanQuestionItem, { answerType: 'multiple_choice' }>,
+) => question.selectedOptionIds.length + Number(Boolean(question.customAnswer?.trim()))
+
+const questionAnswerState = (question: PlanQuestionItem): 'answered' | 'missing' | 'invalid' => {
+  if (question.skipped) return question.required ? 'invalid' : 'answered'
+  if (question.answerType === 'single_choice') {
+    return question.selectedOptionId || question.customAnswer?.trim() ? 'answered' : 'missing'
+  }
+  if (question.answerType === 'multiple_choice') {
+    const count = multipleSelectionCount(question)
+    if (count === 0) return 'missing'
+    return count >= question.minSelections && count <= multipleSelectionMaximum(question)
+      ? 'answered'
+      : 'invalid'
+  }
+  if (question.answerType === 'text') return question.answer?.trim() ? 'answered' : 'missing'
+  return question.date ? 'answered' : 'missing'
+}
+
+const questionAnswered = (question: PlanQuestionItem) => {
+  return questionAnswerState(question) === 'answered'
+}
+
+const questionHasDraftAnswer = (question: PlanQuestionItem) => {
+  if (question.answerType === 'single_choice') {
+    return Boolean(question.selectedOptionId || question.customAnswer?.trim())
+  }
+  if (question.answerType === 'multiple_choice') {
+    return question.selectedOptionIds.length > 0 || Boolean(question.customAnswer?.trim())
+  }
+  if (question.answerType === 'text') return Boolean(question.answer?.trim())
+  return Boolean(question.date)
+}
+
+const preferredOptionIndex = (question: PlanQuestionItem | undefined) => {
+  if (question?.answerType === 'single_choice' && question.selectedOptionId) {
+    const selectedIndex = question.options.findIndex((option) => (
+      option.id === question.selectedOptionId
+    ))
+    if (selectedIndex >= 0) return selectedIndex
+  }
+  return 0
+}
+
+const clearQuestionAnswer = (question: PlanQuestionItem): PlanQuestionItem => {
+  if (question.answerType === 'single_choice') {
+    return {
+      ...question,
+      selectedOptionId: undefined,
+      customAnswer: '',
+      skipped: true,
+    }
+  }
+  if (question.answerType === 'multiple_choice') {
+    return {
+      ...question,
+      selectedOptionIds: [],
+      customAnswer: '',
+      skipped: true,
+    }
+  }
+  if (question.answerType === 'text') {
+    return { ...question, answer: '', skipped: true }
+  }
+  return { ...question, date: '', skipped: true }
+}
+
+const resizeTextAnswer = (textarea: HTMLTextAreaElement | null) => {
   if (!textarea) return
   textarea.style.height = 'auto'
   const maxHeight = Number.parseFloat(window.getComputedStyle(textarea).maxHeight)
@@ -69,35 +140,52 @@ export function PlanQuestionComposer({
   const { t } = useI18n()
   const [minimized, setMinimized] = useState(() => readPlanQuestionCollapsed(threadId))
   const [focusedAnswerIndex, setFocusedAnswerIndex] = useState(0)
-  const optionRefs = useRef<Array<HTMLButtonElement | null>>([])
-  const customAnswerRef = useRef<HTMLTextAreaElement | null>(null)
+  const optionRefs = useRef<Array<HTMLElement | null>>([])
+  const textAnswerRef = useRef<HTMLTextAreaElement | null>(null)
+  const dateAnswerRef = useRef<HTMLButtonElement | null>(null)
   const bodyRef = useRef<HTMLDivElement | null>(null)
   const activeIndex = Math.min(
     interaction.activeQuestionIndex,
     interaction.questions.length - 1,
   )
   const question = interaction.questions[activeIndex]
+  const questionRef = useRef(question)
+  questionRef.current = question
+  const questionEntryKey = `${interaction.interruptId}\u0000${activeIndex}\u0000${question?.id ?? ''}`
+  const textValue = question?.answerType === 'text'
+    ? question.answer
+    : question?.answerType === 'single_choice' || question?.answerType === 'multiple_choice'
+      ? question.customAnswer
+      : undefined
+
   useEffect(() => {
     setMinimized(readPlanQuestionCollapsed(threadId))
   }, [threadId])
 
   useEffect(() => {
-    setFocusedAnswerIndex(0)
-  }, [activeIndex])
-
-  useEffect(() => {
-    if (minimized) return
-    // 选项为空时，自由文本就是该问题唯一可回答入口
-    const frame = window.requestAnimationFrame(() => (
-      optionRefs.current[0] ?? customAnswerRef.current
-    )?.focus())
+    const enteredQuestion = questionRef.current
+    const optionIndex = preferredOptionIndex(enteredQuestion)
+    setFocusedAnswerIndex(optionIndex)
+    if (minimized || !enteredQuestion || !questionHasDraftAnswer(enteredQuestion)) return
+    const frame = window.requestAnimationFrame(() => {
+      const target = enteredQuestion.answerType === 'single_choice'
+        ? enteredQuestion.selectedOptionId
+          ? optionRefs.current[optionIndex]
+          : textAnswerRef.current
+        : enteredQuestion.answerType === 'multiple_choice'
+          ? optionRefs.current[0]
+          : enteredQuestion.answerType === 'text'
+            ? textAnswerRef.current
+            : dateAnswerRef.current
+      target?.focus()
+    })
     return () => window.cancelAnimationFrame(frame)
-  }, [activeIndex, minimized])
+  }, [questionEntryKey, minimized])
 
   useEffect(() => {
     if (minimized) return
-    resizeCustomAnswer(customAnswerRef.current)
-  }, [activeIndex, minimized, question?.customAnswer])
+    resizeTextAnswer(textAnswerRef.current)
+  }, [activeIndex, minimized, textValue])
 
   const progress = useMemo(() => interaction.questions.map((item, index) => ({
     index,
@@ -112,12 +200,20 @@ export function PlanQuestionComposer({
 
   if (!question) return null
 
+  const hasNextQuestion = activeIndex < interaction.questions.length - 1
+  const canAdvance = hasNextQuestion && (!question.required || questionAnswered(question))
+
   const setActiveQuestion = (index: number) => {
     onChange((current) => ({
       ...current,
       activeQuestionIndex: Math.max(0, Math.min(index, current.questions.length - 1)),
       error: undefined,
     }))
+  }
+
+  const advanceQuestion = () => {
+    if (!canAdvance) return
+    setActiveQuestion(activeIndex + 1)
   }
 
   const updateQuestion = (
@@ -134,45 +230,79 @@ export function PlanQuestionComposer({
     }))
   }
 
-  const selectOption = (optionId: string) => {
-    const nextIndex = activeIndex < interaction.questions.length - 1
+  const selectSingleOption = (optionId: string, advance = true) => {
+    const nextIndex = advance && activeIndex < interaction.questions.length - 1
       ? activeIndex + 1
       : activeIndex
-    updateQuestion((current) => ({
-      ...current,
-      selectedOptionId: optionId,
-      customAnswer: '',
-      skipped: false,
-    }), nextIndex)
+    updateQuestion((current) => current.answerType === 'single_choice'
+      ? {
+          ...current,
+          selectedOptionId: optionId,
+          customAnswer: '',
+          skipped: false,
+        }
+      : current, nextIndex)
   }
 
-  const moveAnswerFocus = (direction: 1 | -1) => {
-    if (question.options.length === 0) return
-    const next = (
-      focusedAnswerIndex
-      + direction
-      + question.options.length
-    ) % question.options.length
+  const toggleMultipleOption = (optionId: string) => {
+    updateQuestion((current) => {
+      if (current.answerType !== 'multiple_choice') return current
+      const selected = new Set(current.selectedOptionIds)
+      if (selected.has(optionId)) selected.delete(optionId)
+      else {
+        if (multipleSelectionCount(current) >= multipleSelectionMaximum(current)) {
+          return current
+        }
+        selected.add(optionId)
+      }
+      return {
+        ...current,
+        selectedOptionIds: current.options
+          .map((option) => option.id)
+          .filter((id) => selected.has(id)),
+        skipped: false,
+      }
+    })
+  }
+
+  const selectSingleByIndex = (index: number) => {
+    if (question.answerType !== 'single_choice') return
+    const next = (index + question.options.length) % question.options.length
+    const option = question.options[next]
+    if (!option) return
     setFocusedAnswerIndex(next)
+    selectSingleOption(option.id, false)
     optionRefs.current[next]?.focus()
   }
 
-  const handleAnswerKeyDown = (
+  const handleSingleKeyDown = (
     event: KeyboardEvent<HTMLButtonElement>,
     optionId: string,
   ) => {
-    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+    if (question.answerType !== 'single_choice') return
+    if (
+      event.key === 'ArrowDown'
+      || event.key === 'ArrowRight'
+      || event.key === 'ArrowUp'
+      || event.key === 'ArrowLeft'
+    ) {
       event.preventDefault()
-      moveAnswerFocus(event.key === 'ArrowDown' ? 1 : -1)
+      const direction = event.key === 'ArrowDown' || event.key === 'ArrowRight' ? 1 : -1
+      selectSingleByIndex(focusedAnswerIndex + direction)
+      return
+    }
+    if (event.key === 'Home' || event.key === 'End') {
+      event.preventDefault()
+      selectSingleByIndex(event.key === 'Home' ? 0 : question.options.length - 1)
       return
     }
     if (event.key === 'Enter' || event.key === ' ') {
       event.preventDefault()
-      selectOption(optionId)
+      selectSingleOption(optionId)
     }
   }
 
-  const continueFromCustom = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+  const continueFromText = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === 'ArrowUp' && event.currentTarget.value === '') {
       const lastOption = optionRefs.current.at(-1)
       if (lastOption) {
@@ -192,22 +322,61 @@ export function PlanQuestionComposer({
     if (activeIndex < interaction.questions.length - 1) setActiveQuestion(activeIndex + 1)
   }
 
+  const updateTextValue = (value: string) => {
+    updateQuestion((current) => {
+      if (current.answerType === 'single_choice') {
+        return {
+          ...current,
+          selectedOptionId: undefined,
+          customAnswer: value,
+          skipped: false,
+        }
+      }
+      if (current.answerType === 'multiple_choice') {
+        if (
+          value.trim()
+          && !current.customAnswer?.trim()
+          && multipleSelectionCount(current) >= multipleSelectionMaximum(current)
+        ) return current
+        return { ...current, customAnswer: value, skipped: false }
+      }
+      if (current.answerType === 'text') {
+        return { ...current, answer: value, skipped: false }
+      }
+      return current
+    })
+  }
+
   const skipQuestion = () => {
     if (question.required) return
     const nextIndex = activeIndex < interaction.questions.length - 1
       ? activeIndex + 1
       : activeIndex
-    updateQuestion((current) => ({
-      ...current,
-      selectedOptionId: undefined,
-      customAnswer: '',
-      skipped: true,
-    }), nextIndex)
+    updateQuestion(clearQuestionAnswer, nextIndex)
   }
 
   const submit = () => {
+    const focusCurrentAnswer = () => {
+      const optionIndex = preferredOptionIndex(question)
+      if (question.answerType === 'single_choice') setFocusedAnswerIndex(optionIndex)
+      window.requestAnimationFrame(() => (
+        optionRefs.current[optionIndex] ?? textAnswerRef.current ?? dateAnswerRef.current
+      )?.focus())
+    }
+    const firstInvalid = interaction.questions.findIndex((item) => (
+      questionAnswerState(item) === 'invalid'
+    ))
+    if (firstInvalid >= 0) {
+      onChange((current) => ({
+        ...current,
+        activeQuestionIndex: firstInvalid,
+        error: t('Plan 澄清答案超出允许的选择数量'),
+      }))
+      if (firstInvalid === activeIndex) focusCurrentAnswer()
+      return
+    }
     const firstMissing = interaction.questions.findIndex((item) => (
-      item.required && !questionAnswered(item)
+      item.required && questionAnswerState(item) === 'missing'
     ))
     if (firstMissing >= 0) {
       onChange((current) => ({
@@ -215,6 +384,7 @@ export function PlanQuestionComposer({
         activeQuestionIndex: firstMissing,
         error: t('请回答所有必填的 Plan 澄清问题'),
       }))
+      if (firstMissing === activeIndex) focusCurrentAnswer()
       return
     }
     onSubmit()
@@ -227,6 +397,18 @@ export function PlanQuestionComposer({
       return next
     })
   }
+
+  const customAnswerAllowed = (
+    question.answerType === 'single_choice' || question.answerType === 'multiple_choice'
+  ) && question.allowFreeText
+  const customAnswer = question.answerType === 'text'
+    ? question.answer ?? ''
+    : question.answerType === 'single_choice' || question.answerType === 'multiple_choice'
+      ? question.customAnswer ?? ''
+      : ''
+  const customAnswerDisabled = question.answerType === 'multiple_choice'
+    && !question.customAnswer?.trim()
+    && question.selectedOptionIds.length >= multipleSelectionMaximum(question)
 
   return (
     <PlanInteractionCard
@@ -277,126 +459,186 @@ export function PlanQuestionComposer({
       )}
     >
       <>
-          <div
-            ref={bodyRef}
-            className="plan-question-composer-body ui-scrollbar"
-            role="region"
-            aria-label={question.prompt}
-          >
-            <h3>
-              <span>{question.prompt}</span>
-              {!question.required && <small>{t('可选')}</small>}
-            </h3>
-            <div className="plan-question-options">
-              {question.options.length > 0 && (
-                <div className="plan-question-choice-list" role="radiogroup" aria-label={question.prompt}>
-                  {question.options.map((option, optionIndex) => (
-                <button
-                  key={option.id}
-                  ref={(node) => { optionRefs.current[optionIndex] = node }}
-                  type="button"
-                  role="radio"
-                  aria-checked={question.selectedOptionId === option.id}
-                  tabIndex={focusedAnswerIndex === optionIndex ? 0 : -1}
-                  className={`plan-question-option${question.selectedOptionId === option.id ? ' is-selected' : ''}`}
-                  onFocus={() => setFocusedAnswerIndex(optionIndex)}
-                  onClick={() => selectOption(option.id)}
-                  onKeyDown={(event) => handleAnswerKeyDown(event, option.id)}
-                >
-                  <span className="plan-question-option-index" aria-hidden="true">
-                    {optionIndex + 1}
-                  </span>
-                  <span className="plan-question-option-copy">
-                    <strong>{option.label}</strong>
-                    {option.description && <small>{option.description}</small>}
-                    {option.recommended && (
-                      <span className="plan-question-option-recommended">{t('推荐')}</span>
-                    )}
-                  </span>
-                </button>
-                  ))}
+        <div
+          ref={bodyRef}
+          className="plan-question-composer-body ui-scrollbar"
+          role="region"
+          aria-label={question.prompt}
+        >
+          <h3>
+            <span>{question.prompt}</span>
+            {!question.required && <small>{t('可选')}</small>}
+          </h3>
+          <div className="plan-question-options">
+            {question.answerType === 'single_choice' && (
+              <div
+                className="plan-question-choice-list"
+                role="radiogroup"
+                aria-label={question.prompt}
+                aria-required={question.required}
+              >
+                {question.options.map((option, optionIndex) => (
+                  <button
+                    key={option.id}
+                    ref={(node) => { optionRefs.current[optionIndex] = node }}
+                    type="button"
+                    role="radio"
+                    aria-checked={question.selectedOptionId === option.id}
+                    tabIndex={focusedAnswerIndex === optionIndex ? 0 : -1}
+                    className={`plan-question-option${question.selectedOptionId === option.id ? ' is-selected' : ''}`}
+                    onFocus={() => setFocusedAnswerIndex(optionIndex)}
+                    onClick={() => selectSingleOption(option.id)}
+                    onKeyDown={(event) => handleSingleKeyDown(event, option.id)}
+                  >
+                    <span className="plan-question-option-index" aria-hidden="true">
+                      {question.selectedOptionId === option.id
+                        ? <Check size={13} />
+                        : optionIndex + 1}
+                    </span>
+                    <span className="plan-question-option-copy">
+                      <strong>{option.label}</strong>
+                      {option.description && <small>{option.description}</small>}
+                      {option.recommended && (
+                        <span className="plan-question-option-recommended">{t('推荐')}</span>
+                      )}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            )}
+            {question.answerType === 'multiple_choice' && (
+              <>
+                <p className="plan-question-selection-hint">
+                  {t('选择 {minimum} 至 {maximum} 项，自定义回答计作一项', {
+                    minimum: question.minSelections,
+                    maximum: multipleSelectionMaximum(question),
+                  })}
+                </p>
+                <div className="plan-question-choice-list" role="group" aria-label={question.prompt}>
+                  {question.options.map((option, optionIndex) => {
+                    const selected = question.selectedOptionIds.includes(option.id)
+                    const atLimit = multipleSelectionCount(question) >= multipleSelectionMaximum(question)
+                    const disabled = !selected && atLimit
+                    return (
+                      <label
+                        key={option.id}
+                        className={`plan-question-option${selected ? ' is-selected' : ''}${disabled ? ' is-disabled' : ''}`}
+                      >
+                        <input
+                          ref={(node) => { optionRefs.current[optionIndex] = node }}
+                          className="plan-question-native-control"
+                          type="checkbox"
+                          checked={selected}
+                          disabled={disabled}
+                          onChange={() => toggleMultipleOption(option.id)}
+                        />
+                        <span className="plan-question-option-index" aria-hidden="true">
+                          {selected ? <Check size={13} /> : optionIndex + 1}
+                        </span>
+                        <span className="plan-question-option-copy">
+                          <strong>{option.label}</strong>
+                          {option.description && <small>{option.description}</small>}
+                          {option.recommended && (
+                            <span className="plan-question-option-recommended">{t('推荐')}</span>
+                          )}
+                        </span>
+                      </label>
+                    )
+                  })}
                 </div>
-              )}
-              {question.allowFreeText && (
-                <label className={`plan-question-custom${question.customAnswer ? ' is-active' : ''}`}>
-                  <span className="visually-hidden">{t('自定义回答：{question}', { question: question.prompt })}</span>
-                  <span className="plan-question-option-index" aria-hidden="true">
-                    <MessageSquareText size={13} />
-                  </span>
-                  <textarea
-                    ref={customAnswerRef}
-                    id={`plan-question-custom-${interaction.interruptId}-${question.id}`}
-                    rows={1}
-                    value={question.customAnswer ?? ''}
-                    placeholder={t('输入你的答案')}
-                    onFocus={() => setFocusedAnswerIndex(question.options.length)}
-                    onChange={(event) => {
-                      resizeCustomAnswer(event.currentTarget)
-                      const value = event.currentTarget.value
-                      updateQuestion((current) => ({
-                        ...current,
-                        selectedOptionId: undefined,
-                        customAnswer: value,
-                        skipped: false,
-                      }))
+              </>
+            )}
+            {(question.answerType === 'text' || customAnswerAllowed) && (
+              <label className={`plan-question-custom${customAnswer ? ' is-active' : ''}${customAnswerDisabled ? ' is-disabled' : ''}`}>
+                <span className="visually-hidden">{t('自定义回答：{question}', { question: question.prompt })}</span>
+                <span className="plan-question-option-index" aria-hidden="true">
+                  <MessageSquareText size={13} />
+                </span>
+                <textarea
+                  ref={textAnswerRef}
+                  id={`plan-question-text-${interaction.interruptId}-${question.id}`}
+                  rows={1}
+                  value={customAnswer}
+                  placeholder={t('输入你的答案')}
+                  disabled={customAnswerDisabled}
+                  onChange={(event) => {
+                    resizeTextAnswer(event.currentTarget)
+                    updateTextValue(event.currentTarget.value)
+                  }}
+                  onKeyDown={continueFromText}
+                />
+              </label>
+            )}
+            {question.answerType === 'date' && (
+              <div className={`plan-question-date${question.date ? ' is-active' : ''}`}>
+                <span className="plan-question-option-index" aria-hidden="true">
+                  <CalendarDays size={13} />
+                </span>
+                <span className="plan-question-date-copy">
+                  <span className="plan-question-date-label">{t('选择日期')}</span>
+                  <DatePicker
+                    ref={dateAnswerRef}
+                    controlSize="xs"
+                    value={question.date ?? ''}
+                    label={t('日期回答：{question}', { question: question.prompt })}
+                    onChange={(value) => {
+                      updateQuestion((current) => current.answerType === 'date'
+                        ? { ...current, date: value, skipped: false }
+                        : current)
                     }}
-                    onKeyDown={continueFromCustom}
                   />
-                </label>
-              )}
-            </div>
+                </span>
+              </div>
+            )}
           </div>
+        </div>
 
-          <OverlayScrollbar viewportRef={bodyRef} />
-          <footer className="plan-question-composer-footer">
-            <div className="plan-question-composer-pager">
-              <IconButton
+        <OverlayScrollbar viewportRef={bodyRef} />
+        <footer className="plan-question-composer-footer">
+          <div className="plan-question-composer-pager">
+            <IconButton
+              size="sm"
+              className="plan-question-pager-button"
+              label={t('浏览上一题')}
+              icon={<ChevronLeft size={16} />}
+              disabled={activeIndex === 0}
+              onClick={() => setActiveQuestion(activeIndex - 1)}
+            />
+            <span>{activeIndex + 1} / {interaction.questions.length}</span>
+            <IconButton
+              size="sm"
+              className="plan-question-pager-button"
+              label={t('浏览下一题')}
+              icon={<ChevronRight size={16} />}
+              disabled={!canAdvance}
+              onClick={advanceQuestion}
+            />
+          </div>
+          <p className="plan-question-composer-feedback" role="status">
+            {interaction.error ?? ''}
+          </p>
+          <div className="plan-question-composer-actions">
+            {!question.required && (
+              <Button size="sm" variant="secondary" onClick={skipQuestion}>
+                {t('跳过本题')}
+              </Button>
+            )}
+            {hasNextQuestion ? (
+              <Button
                 size="sm"
-                className="plan-question-pager-button"
-                label={t('浏览上一题')}
-                icon={<ChevronLeft size={16} />}
-                disabled={activeIndex === 0}
-                onClick={() => setActiveQuestion(activeIndex - 1)}
-              />
-              <span>{activeIndex + 1} / {interaction.questions.length}</span>
-              <IconButton
-                size="sm"
-                className="plan-question-pager-button"
-                label={t('浏览下一题')}
-                icon={<ChevronRight size={16} />}
-                disabled={activeIndex === interaction.questions.length - 1}
-                onClick={() => setActiveQuestion(activeIndex + 1)}
-              />
-            </div>
-            <p className="plan-question-composer-feedback" role="status">
-              {interaction.error ?? ''}
-            </p>
-            <div className="plan-question-composer-actions">
-              {!question.required && (
-                <Button size="sm" variant="secondary" onClick={skipQuestion}>
-                  {t('跳过本题')}
-                </Button>
-              )}
-              {activeIndex < interaction.questions.length - 1 ? (
-                <Button
-                  size="sm"
-                  variant="primary"
-                  disabled={question.required && !questionAnswered(question)}
-                  onClick={() => setActiveQuestion(activeIndex + 1)}
-                >
-                  {t('下一题')}
-                </Button>
-              ) : (
-                <Button
-                  size="sm"
-                  variant="primary"
-                  onClick={submit}
-                >
-                  {t('提交')}
-                </Button>
-              )}
-            </div>
-          </footer>
+                variant="primary"
+                disabled={!canAdvance}
+                onClick={advanceQuestion}
+              >
+                {t('下一题')}
+              </Button>
+            ) : (
+              <Button size="sm" variant="primary" onClick={submit}>
+                {t('提交')}
+              </Button>
+            )}
+          </div>
+        </footer>
       </>
     </PlanInteractionCard>
   )

@@ -56,12 +56,14 @@ export function ConversationItem({
 }) {
   const { t } = useI18n()
   const requiresAttention = conversation.runStatus === 'waiting_approval'
-  // 状态点跟随当前接管输入区的业务交互，未水化摘要沿用审批色作为安全默认
-  const attentionTone = conversation.approval && !conversation.approval.submitted
-    ? 'approval'
-    : conversation.planInteraction && !conversation.planInteraction.submitted
-      ? conversation.planInteraction.kind === 'review' ? 'approval' : 'plan'
-      : 'approval'
+  // 已水化交互优先，历史摘要保证首次渲染使用同一业务类型
+  const attentionTone = conversation.planInteraction && !conversation.planInteraction.submitted
+    ? conversation.planInteraction.kind === 'review' ? 'approval' : 'plan'
+    : conversation.approval && !conversation.approval.submitted
+      ? 'approval'
+      : conversation.pendingInteractionKind === 'plan_clarification'
+        ? 'plan'
+        : 'approval'
   const openLabel = t('打开会话：{title}', { title: conversation.title })
   return (
     <div

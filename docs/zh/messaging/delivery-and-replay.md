@@ -64,13 +64,12 @@ status = await channel.get_run_status(identity=identity)
 `get_run_status()` 可原子把过期 producer lease 归档为 `owner_lost`。没有 durable
 run 时抛出 `RunNotFound`，且不会创建或恢复 producer。
 
-## Envelope v2
+## Envelope
 
 每条提交结果是 `MessageEnvelope`：
 
 | 字段 | 作用 |
 | --- | --- |
-| `schemaVersion` | 当前固定为 2 |
 | `channel` | codec 命名空间 |
 | `identity` | 嵌套的 `threadId` 与 `runId` |
 | `seq` | thread 内连续位置 |
@@ -79,7 +78,8 @@ run 时抛出 `RunNotFound`，且不会创建或恢复 producer。
 | `payload` | 编码后的 bytes |
 | `createdAt` | 首次提交时分配的 UTC 时间 |
 
-当前只读取 Envelope v2。Envelope v1 记录无法读取；切换格式前应更换存储前缀，或清理确认不再需要的旧记录。
+Messaging 只存储一种当前 Envelope 结构。应用自有格式发生不兼容变化时应先重建记录，
+运行时不会协商或识别多种格式。
 
 ## 提交观察函数
 

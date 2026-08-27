@@ -9,8 +9,8 @@
   "parentNamespace": [
     "tools:parent"
   ],
-  "parentToolCallId": "tf:tool:WzEsWyJ0b29sczpwYXJlbnQiXSwiY2FsbC10YXNrIl0",
+  "parentToolCallId": "tf:tool:W1sidG9vbHM6cGFyZW50Il0sImNhbGwtdGFzayJd",
   "requestRunId": "run-known",
-  "schema": "tinkerfin.subagent-provenance.v1",
-  "subagentInvocationId": "subagent-cf085c34-b86a-5545-a9ce-8d1372adb914"
+  "schema": "tinkerfin.subagent-provenance",
+  "subagentInvocationId": "subagent-2594398b-b209-5a61-a9f0-8a4d6100bbcd"
 }

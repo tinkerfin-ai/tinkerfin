@@ -31,8 +31,8 @@ Definition 只接受 `default`。
 ## Plan Mode 数据
 
 顶层包导出 `AgentMode`。`tinkerfin.plan` 导出 `ClarificationModel`、
-`ClarificationOption` / `ClarificationQuestion` / `ClarificationForm` 的 Base 与泛型类型、
-`DefaultClarificationForm`、`PlanContentModel`、`StructuredPlanStep`、
+`ClarificationOption`、`ClarificationForm`、`BuiltInClarificationForm`、四类内置 Question、
+`ClarificationType`、`clarification_type`、`DefaultClarificationForm`、`PlanContentModel`、`StructuredPlanStep`、
 `StructuredPlanContent`、`MarkdownPlanContent`、`PlanSchemaReference`、`PlanDraft`、
 `ConfirmedPlan`、`RequirementAnswer`、`PendingClarification`、`ClarificationExchange`、
 `PlanState`、`PlanStatus`、`PlanHandoff`、`PlanHandoffPhase`、`PlanReviewAction` 和 Plan 错误类型。这些模型不可变。
@@ -43,22 +43,25 @@ Planning 状态以 camel case JSON 保存在 `tinkerfin_plan`；批准 handoff �
 消息的原生 checkpoint；completed 还会记录原生终止 checkpoint。重试会对账这些 checkpoint，
 不会重新派发已经批准的 Plan。
 
-`.plan(plan_schema=...)` 接受一个具体 `PlanContentModel` 子类。省略时使用
+`.plan(content_schema=...)` 接受一个具体 `PlanContentModel` 子类。省略时使用
 `StructuredPlanContent`；`MarkdownPlanContent` 原样保留一段非空 Markdown，不改写空白。
-宿主 Schema 声明稳定 `schema_id`；运行时校验并计算 JSON Schema fingerprint，在恢复时拒绝
-Schema 漂移。被审阅的草稿与 `ConfirmedPlan` 始终使用同一个冻结内容 Schema。
+运行时自动校验并计算所选 JSON Schema 的 fingerprint，在恢复时拒绝 Definition 漂移。
+被审阅的草稿与 `ConfirmedPlan` 始终使用同一个冻结内容 Schema。
 
-`.plan(review_actions=...)` 接受一组有序、非空且不重复的 `PlanReviewAction`。默认动作为
+`.plan(allowed_review_actions=...)` 接受一组有序、非空且不重复的 `PlanReviewAction`。默认动作为
 `APPROVE`、`RESPOND` 和 `REJECT`，interrupt 的响应 Schema 只包含实际配置的动作。只有宿主
 提供可信计划编辑器时才应显式加入 `EDIT`。
 
-`.plan(clarification_schema=...)` 接受宿主定义的一个完全具体的
-`ClarificationFormBase` 子类；省略时使用 `DefaultClarificationForm`。Python 使用
-`allow_free_text`，JSON 使用 `allowFreeText`，每道问题都显式提供 `required`。Option 回答只包含
-`questionId` 和 `optionId`；自由文本回答只包含 `questionId` 和 `answer`；跳过可选题时只包含
-`questionId` 和 `skipped: true`。宿主模型可以增加强类型
-attributes 和 discriminant，但不能重新定义框架核心字段，也不能改变 questions/options
-的 tuple 结构。
+`.plan(clarification_schema=...)` 接受一个具体 `ClarificationFormBase` 子类；省略时启用四类内置
+answer type。共享强类型 metadata 使用
+`BuiltInClarificationForm[QuestionAttributes, OptionModel]`。完全自定义语义题型通过
+`.plan(clarification_types=(clarification_type(...),))` 一次注册。逐题 Schema、校验或规范化
+语义变化时必须升级 type ID 版本。
+
+澄清响应的 `answers` 是以 checkpoint question ID 为 key 的 object。已回答 value 包含
+`status: answered`、对应 `answerType` 和题型字段；可选题跳过只包含 `status: skipped`。
+pending 的精确 JSON Schema 会在 Graph resume 前验证完整覆盖、Option ID、多选数量、非空文本和
+真实日历日期。宿主模型不能重新定义框架拥有的 ID、required/skip 语义或 checkpoint 所有权。
 
 `TinkerFin(state_schema=...)` 为该 factory 创建的每个原生 Deep Agent Definition 提供应用级
 state。独立 Planning Graph 组合自己的所需视图，不改变原生 default topology 或 middleware。
@@ -87,7 +90,6 @@ reducer、`Required` / `NotRequired` 和 schema metadata 会保留；同名字�
 
 | 字段 | 类型 | 默认值 | 含义 |
 | --- | --- | --- | --- |
-| `schemaVersion` | `1` | `1` | 数据结构版本 |
 | `type` | 字符串 | 必填 | `messages`、`tasks`、`values`、`updates`、`checkpoints`、`debug` 或 `custom` |
 | `ns` | 字符串元组 | 必填 | Graph namespace；空元组表示根 Graph |
 | `data` | JSON 值 | 必填 | 当前模式的数据 |

@@ -158,7 +158,6 @@ class _FakeDescriptorCommands(_FakeCommands):
             code, message = self.helper_error
             self._handshake = json.dumps(
                 {
-                    "version": request["version"],
                     "request_id": request["request_id"],
                     "operation": request["operation"],
                     "status": "error",
@@ -171,7 +170,6 @@ class _FakeDescriptorCommands(_FakeCommands):
         else:
             self._handshake = json.dumps(
                 {
-                    "version": "tinkerfin.rooted.transfer.v1",
                     "token": request["arguments"]["token"],
                     "mode": request["arguments"]["mode"],
                     "pid": 4321,
@@ -230,7 +228,6 @@ class _FakeOffloadCommands(_FakeCommands):
             if self.malformed
             else json.dumps(
                 {
-                    "version": request["version"],
                     "request_id": request["request_id"],
                     "operation": "offload",
                     "status": "ok",
@@ -708,7 +705,6 @@ async def test_rooted_descriptor_rejects_malformed_handshake_and_settles() -> No
     [
         json.dumps(
             {
-                "version": "tinkerfin.rooted.transfer.v1",
                 "token": "wrong-token",
                 "mode": "download",
                 "pid": 4321,
@@ -717,7 +713,6 @@ async def test_rooted_descriptor_rejects_malformed_handshake_and_settles() -> No
         ),
         json.dumps(
             {
-                "version": "tinkerfin.rooted.transfer.v1",
                 "token": "wrong-token",
                 "mode": "upload",
                 "pid": 0,
@@ -728,7 +723,6 @@ async def test_rooted_descriptor_rejects_malformed_handshake_and_settles() -> No
             [
                 json.dumps(
                     {
-                        "version": "tinkerfin.rooted.transfer.v1",
                         "token": "wrong-token",
                         "mode": "download",
                         "pid": 4321,

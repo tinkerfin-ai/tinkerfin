@@ -79,7 +79,7 @@ Both constructors accept the same options:
 
 | Parameter | Default | Purpose |
 | --- | --- | --- |
-| `key_prefix` | `"tinkerfin:lease:v1:"` | Isolates this application's lock keys; must be non-blank without surrounding whitespace |
+| `key_prefix` | `"tinkerfin:lease:"` | Isolates this application's lock keys; must be non-blank without surrounding whitespace |
 | `lease_ttl_seconds` | `30.0` | Redis TTL for one lease; must be positive |
 | `renew_interval_seconds` | `None` | `None` means one third of the TTL; an explicit value must be less than half the TTL |
 | `wait_poll_seconds` | `0.1` | Delay before retrying an occupied resource; must be positive |

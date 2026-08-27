@@ -316,6 +316,34 @@ describe('Sidebar', () => {
     expect(waitingButton.querySelector('.conversation-attention-dot')).toHaveClass('is-approval')
     expect(screen.getByRole('button', { name: '打开会话：置顶会话' }).querySelector('.conversation-attention-dot')).toBeNull()
 
+    const summarizedPlanWaiting = waiting.map((item): Conversation => item.threadId === 'recent'
+      ? { ...item, pendingInteractionKind: 'plan_clarification' }
+      : item)
+    rerender(
+      <Sidebar
+        {...baseProps}
+        workspace={{ ...workspace, conversations: summarizedPlanWaiting }}
+        historyConversations={summarizedPlanWaiting}
+      />,
+    )
+    expect(screen.getByRole('button', { name: '打开会话：最近会话，等待处理' })
+      .querySelector('.conversation-attention-dot')).toHaveClass('is-plan')
+
+    for (const pendingInteractionKind of ['tool_approval', 'plan_review'] as const) {
+      const summarizedApprovalWaiting = waiting.map((item): Conversation => item.threadId === 'recent'
+        ? { ...item, pendingInteractionKind }
+        : item)
+      rerender(
+        <Sidebar
+          {...baseProps}
+          workspace={{ ...workspace, conversations: summarizedApprovalWaiting }}
+          historyConversations={summarizedApprovalWaiting}
+        />,
+      )
+      expect(screen.getByRole('button', { name: '打开会话：最近会话，等待处理' })
+        .querySelector('.conversation-attention-dot')).toHaveClass('is-approval')
+    }
+
     const planWaiting = waiting.map((item): Conversation => item.threadId === 'recent'
       ? {
           ...item,
@@ -328,10 +356,9 @@ describe('Sidebar', () => {
             form: {},
             questions: [{
               id: 'scope',
+              answerType: 'text',
               prompt: '回归范围是什么？',
               required: true,
-              options: [],
-              allowFreeText: true,
             }],
             submitted: false,
           },
@@ -356,14 +383,12 @@ describe('Sidebar', () => {
             revision: 1,
             submitted: false,
             draft: {
-              schemaVersion: 1,
               revision: 1,
               contentSchema: {
-                id: 'tinkerfin.plan.markdown.v1',
                 fingerprint: '0'.repeat(64),
                 mediaType: 'text/markdown',
               },
-              content: { markdown: '# 计划草稿' },
+              content: { description: '完成计划草稿并验证', markdown: '# 计划草稿' },
             },
           },
         }

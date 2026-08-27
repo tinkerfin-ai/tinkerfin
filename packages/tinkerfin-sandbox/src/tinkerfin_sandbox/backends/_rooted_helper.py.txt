@@ -12,9 +12,6 @@ import sys
 import tempfile
 import time
 
-VERSION = "tinkerfin.rooted.v1"
-
-
 class RootedFailure(Exception):
     def __init__(self, code, message):
         super().__init__(message)
@@ -25,7 +22,6 @@ class RootedFailure(Exception):
 def emit(request_id, operation, status, error, result):
     print(json.dumps(
         {
-            "version": VERSION,
             "request_id": request_id,
             "operation": operation,
             "status": status,
@@ -58,14 +54,11 @@ def decode_request(encoded):
     except (UnicodeError, ValueError, binascii.Error, json.JSONDecodeError):
         invalid_request()
     if type(request) is not dict or set(request) != {
-        "version",
         "request_id",
         "operation",
         "root",
         "arguments",
     }:
-        invalid_request()
-    if request["version"] != VERSION:
         invalid_request()
     if type(request["request_id"]) is not str or not request["request_id"]:
         invalid_request()
@@ -1346,7 +1339,6 @@ def transfer_file(root, arguments):
         print(
             json.dumps(
                 {
-                    "version": "tinkerfin.rooted.transfer.v1",
                     "token": token,
                     "mode": mode,
                     "pid": os.getpid(),

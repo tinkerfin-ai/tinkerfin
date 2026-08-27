@@ -39,7 +39,7 @@ setattr(
 
 
 @pytest.mark.asyncio
-async def test_native_object_stream_encodes_default_versioned_sse(
+async def test_native_object_stream_encodes_the_current_sse_contract(
     definition_factory: Callable[..., DeepAgentDefinition[None]],
 ) -> None:
     async def source() -> AsyncIterator[object]:
@@ -62,7 +62,6 @@ async def test_native_object_stream_encodes_default_versioned_sse(
     assert frames[0].startswith("event: stream-part\n")
     payload = json.loads(frames[0].split("data: ", maxsplit=1)[1])
     assert payload == {
-        "schemaVersion": 1,
         "type": "values",
         "ns": ["child:task-1"],
         "data": {"answer": 42},
@@ -101,7 +100,6 @@ async def test_native_object_stream_encodes_every_supported_v2_mode(
     assert len(frames) == 1
     payload = json.loads(frames[0].split("data: ", maxsplit=1)[1])
     assert payload == {
-        "schemaVersion": 1,
         "type": mode,
         "ns": [],
         "data": {"mode": mode},

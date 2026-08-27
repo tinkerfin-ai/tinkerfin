@@ -19,7 +19,6 @@ from tinkerfin_sandbox.lifecycle import sqlalchemy as sqlalchemy_lifecycle
 _TABLE_NAMES = (
     "tinkerfin_opensandbox_cleanup",
     "tinkerfin_opensandbox_owners",
-    "tinkerfin_opensandbox_schema_versions",
     "tinkerfin_opensandbox_warm_slots",
     "tinkerfin_opensandbox_workers",
 )
@@ -47,7 +46,7 @@ async def _sqlite_schema_objects(path: Path, *, kind: str) -> tuple[str, ...]:
 
 
 async def test_sqlite_runtime_schema_characterization(tmp_path: Path) -> None:
-    """Runtime initialization creates the complete version-two schema."""
+    """Runtime initialization creates the complete current schema."""
     database_path = tmp_path / "runtime-schema.db"
     state_type = tinkerfin_sandbox.SQLAlchemyOpenSandboxState
     state = state_type(url=_sqlite_url(database_path), namespace="test")
@@ -56,11 +55,6 @@ async def test_sqlite_runtime_schema_characterization(tmp_path: Path) -> None:
 
     assert await _sqlite_schema_objects(database_path, kind="table") == _TABLE_NAMES
     assert await _sqlite_schema_objects(database_path, kind="index") == _INDEX_NAMES
-    async with aiosqlite.connect(database_path) as connection:
-        cursor = await connection.execute(
-            "SELECT component, version FROM tinkerfin_opensandbox_schema_versions"
-        )
-        assert await cursor.fetchall() == [("opensandbox-state", 2)]
 
 
 def test_public_schema_descriptor_is_frozen_and_stable() -> None:
@@ -68,8 +62,6 @@ def test_public_schema_descriptor_is_frozen_and_stable() -> None:
     assert isinstance(schema_type, type), "Schema descriptor must be public"
     assert is_dataclass(schema_type)
     assert tuple(field.name for field in fields(schema_type)) == (
-        "component",
-        "version",
         "dialect",
         "table_names",
         "ddl",
@@ -80,12 +72,10 @@ def test_public_schema_descriptor_is_frozen_and_stable() -> None:
 
     assert first == second
     assert first is not second
-    assert first.component == "opensandbox-state"
-    assert first.version == 2
     assert first.dialect == "mysql"
     assert first.table_names == _TABLE_NAMES
     with pytest.raises(FrozenInstanceError):
-        setattr(first, "version", 3)
+        setattr(first, "dialect", "sqlite")
 
 
 @pytest.mark.parametrize(
@@ -93,21 +83,20 @@ def test_public_schema_descriptor_is_frozen_and_stable() -> None:
     [
         (
             "mysql",
-            "8f9fc00e74b761a6b9c773f7ea26f788d215ee6725621f21919700b54bb87a8b",
+            "b1f087c300aee2ac9a9d20aa69f2873bcf1242e28e2ad7cc7366d8b3c09cd086",
         ),
         (
             "sqlite",
-            "a40127c3c4108a03db4d5132c49c04f19c23caad022edc5c42c3d8ea066da746",
+            "c1e0868f9ce6f99f4955be2e23af09e31a37c082b87899e9ca986b3a3b1b06b7",
         ),
     ],
 )
-def test_schema_version_identifies_the_exact_ddl(
+def test_schema_descriptor_has_exact_current_ddl(
     dialect: Literal["mysql", "sqlite"],
     digest: str,
 ) -> None:
     schema = tinkerfin_sandbox.get_sqlalchemy_opensandbox_state_schema(dialect=dialect)
 
-    assert schema.version == 2
     assert sha256(schema.ddl.encode()).hexdigest() == digest
 
 
@@ -126,8 +115,8 @@ def test_schema_generation_does_not_create_an_engine(
     assert (
         tinkerfin_sandbox.get_sqlalchemy_opensandbox_state_schema(
             dialect="sqlite"
-        ).version
-        == 2
+        ).dialect
+        == "sqlite"
     )
 
 
@@ -184,29 +173,26 @@ def test_schema_ddl_has_complete_deterministic_statement_order(
     statements = tuple(statement.strip() for statement in schema.ddl.split(";\n\n"))
 
     assert schema.ddl.endswith(";\n")
-    assert len(statements) == 10
-    assert tuple(statement.split("\n", 1)[0] for statement in statements[:5]) == (
+    assert len(statements) == 8
+    assert tuple(statement.split("\n", 1)[0] for statement in statements[:4]) == (
         "CREATE TABLE tinkerfin_opensandbox_cleanup (",
         "CREATE TABLE tinkerfin_opensandbox_owners (",
-        "CREATE TABLE tinkerfin_opensandbox_schema_versions (",
         "CREATE TABLE tinkerfin_opensandbox_warm_slots (",
         "CREATE TABLE tinkerfin_opensandbox_workers (",
     )
     assert (
-        tuple(statement.split(" ", 3)[2] for statement in statements[5:9])
+        tuple(statement.split(" ", 3)[2] for statement in statements[4:])
         == _INDEX_NAMES
     )
-    assert statements[9].startswith("INSERT INTO tinkerfin_opensandbox_schema_versions")
-    assert "opensandbox-state" in statements[9]
-    assert statements[9].endswith(", 2);")
+    assert "tinkerfin_opensandbox_schema_versions" not in schema.ddl
 
 
 def test_mysql_ddl_uses_only_the_common_mysql_57_contract() -> None:
     ddl = tinkerfin_sandbox.get_sqlalchemy_opensandbox_state_schema(dialect="mysql").ddl
 
-    assert ddl.count(" COMMENT ") == 30
-    assert ddl.count(")COMMENT='") == 5
-    assert "COMMENT='Internal OpenSandbox State schema version'" in ddl
+    assert ddl.count(" COMMENT ") == 28
+    assert ddl.count(")COMMENT='") == 4
+    assert "schema version" not in ddl
     assert "COMMENT 'UTC expiry of the current cleanup lease'" in ddl
     assert "IF NOT EXISTS" not in ddl
     assert "COLLATE" not in ddl

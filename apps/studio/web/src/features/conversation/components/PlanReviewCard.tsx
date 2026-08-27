@@ -17,7 +17,7 @@ export function PlanReviewStatusRow({ interaction }: { interaction: PlanReviewSt
     <PlanInteractionStatusRow
       kind="review"
       icon={<Route size={14} aria-hidden="true" />}
-      label={t('计划草稿')}
+      label="Plan"
       pendingStatus={t('等待审阅')}
       submittedStatus={t('正在处理决定')}
       submitted={interaction.submitted}
@@ -38,11 +38,21 @@ export function PlanReviewCard({
 }) {
   const { t } = useI18n()
   const bodyRef = useRef<HTMLDivElement | null>(null)
+  const messageRef = useRef<HTMLTextAreaElement | null>(null)
   const [minimized, setMinimized] = useState(() => readPlanReviewCollapsed(threadId))
 
   useEffect(() => {
     setMinimized(readPlanReviewCollapsed(threadId))
   }, [threadId])
+
+  useEffect(() => {
+    if (
+      minimized
+      || (interaction.action !== 'respond' && interaction.action !== 'reject')
+    ) return
+    const frame = window.requestAnimationFrame(() => messageRef.current?.focus())
+    return () => window.cancelAnimationFrame(frame)
+  }, [interaction.action, interaction.interruptId, minimized])
 
   const update = (patch: Partial<PlanReviewState>) => onChange((current) => ({
     ...current,
@@ -58,6 +68,9 @@ export function PlanReviewCard({
       return next
     })
   }
+  const canSubmit = Boolean(interaction.action)
+    && !interaction.submitted
+    && (interaction.action !== 'respond' || Boolean(interaction.message?.trim()))
 
   return (
     <PlanInteractionCard
@@ -65,9 +78,9 @@ export function PlanReviewCard({
       ariaLabel={t('Plan 审阅')}
       minimized={minimized}
       icon={<Route size={16} aria-hidden="true" />}
-      title={t('计划草稿')}
+      title="Plan"
       titleMeta={<>· {t('第 {revision} 版', { revision: interaction.revision })}</>}
-      description={t('请审阅计划，批准后开始执行')}
+      description={interaction.draft.content.description}
       toggleSurfaceLabel={minimized
         ? t('点击标题区域展开计划草稿')
         : t('点击标题区域收起计划草稿')}
@@ -124,8 +137,10 @@ export function PlanReviewCard({
                   : t('拒绝原因（可选）')}
               </span>
               <textarea
+                ref={messageRef}
                 rows={3}
                 value={interaction.message ?? ''}
+                required={interaction.action === 'respond'}
                 placeholder={interaction.action === 'respond'
                   ? t('说明需要修改的范围和原因…')
                   : t('说明为什么不执行这份计划…')}
@@ -142,7 +157,7 @@ export function PlanReviewCard({
           <Button
             size="sm"
             variant="primary"
-            disabled={!interaction.action || interaction.submitted}
+            disabled={!canSubmit}
             onClick={onSubmit}
           >
             {t('提交决定')}

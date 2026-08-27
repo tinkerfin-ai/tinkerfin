@@ -241,7 +241,7 @@ def test_private_state_policy_covers_subgraphs_debug_and_interrupt_snapshot() ->
                 {
                     "id": "runtime-pause",
                     "value": {
-                        "schema": "tinkerfin.runtime-interrupt.v1",
+                        "schema": "tinkerfin.runtime-interrupt",
                         "kind": "tinkerfin:pause",
                         "message": "Continue?",
                         "responseSchema": {"type": "object"},

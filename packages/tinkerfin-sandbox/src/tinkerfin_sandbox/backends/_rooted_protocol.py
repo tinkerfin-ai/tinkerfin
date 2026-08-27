@@ -1,4 +1,4 @@
-"""Private versioned protocol for descriptor-confined Rooted operations."""
+"""Private protocol for descriptor-confined Rooted operations."""
 
 from __future__ import annotations
 
@@ -20,8 +20,6 @@ from typing import Annotated, Literal, TypeAlias
 from deepagents.backends.protocol import ExecuteResponse
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 from typing_extensions import TypedDict
-
-_ROOTED_PROTOCOL_VERSION = "tinkerfin.rooted.v1"
 
 _RootedOperation: TypeAlias = Literal[
     "probe",
@@ -46,7 +44,6 @@ class _RootedCommand:
     command: str
     request_id: str
     operation: _RootedOperation
-    version: Literal["tinkerfin.rooted.v1"] = _ROOTED_PROTOCOL_VERSION
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,9 +61,6 @@ class _RootedTransferHandshake(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    version: Literal["tinkerfin.rooted.transfer.v1"] = Field(
-        description="Descriptor-transfer handshake version."
-    )
     token: str = Field(min_length=1, description="Transfer correlation secret.")
     mode: Literal["upload", "download"] = Field(
         description="Direction supported by the pinned descriptor."
@@ -186,9 +180,6 @@ class _RootedResponseBase(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    version: Literal["tinkerfin.rooted.v1"] = Field(
-        description="Rooted helper protocol version."
-    )
     request_id: str = Field(description="Opaque request correlation identifier.")
 
 
@@ -407,7 +398,6 @@ def _build_rooted_command(
     payload = base64.b64encode(
         json.dumps(
             {
-                "version": _ROOTED_PROTOCOL_VERSION,
                 "request_id": request_id,
                 "operation": operation,
                 "root": root,
@@ -502,8 +492,6 @@ def _parse_rooted_response(
         parsed = _ROOTED_RESPONSE_ADAPTER.validate_json(response.output)
     except ValueError as exc:
         raise ValueError("rooted helper response malformed") from exc
-    if parsed.version != request.version:
-        raise ValueError("rooted helper response version mismatch")
     if parsed.request_id != request.request_id:
         raise ValueError("rooted helper response request mismatch")
     if parsed.operation != request.operation:

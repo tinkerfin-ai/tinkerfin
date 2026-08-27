@@ -22,26 +22,6 @@ local max_message_payload_bytes = ARGV[11]
 local max_checkpoint_bytes = ARGV[12]
 local max_thread_messages = ARGV[13]
 local max_thread_payload_bytes = ARGV[14]
-local schema_version = '5'
-
-local function schema_mismatch(key, kind)
-    if redis.call('EXISTS', key) == 0 then
-        return nil
-    end
-    local stored = redis.call('HGET', key, 'schema_version')
-    if stored ~= schema_version then
-        return {kind, stored or ''}
-    end
-    return nil
-end
-
-local mismatched = schema_mismatch(channel_meta, 'channel metadata')
-    or schema_mismatch(control, 'stream control')
-    or schema_mismatch(meta, 'generation metadata')
-    or schema_mismatch(run_key, 'run record')
-if mismatched then
-    return {'SCHEMA_MISMATCH', mismatched[1], mismatched[2]}
-end
 
 local function write_signal(kind, signal_run)
     local signal_seq = redis.call('HINCRBY', control, 'signal_seq', 1)
@@ -111,8 +91,7 @@ if not stored_codec then
         'max_message_payload_bytes', max_message_payload_bytes,
         'max_checkpoint_bytes', max_checkpoint_bytes,
         'max_thread_messages', max_thread_messages,
-        'max_thread_payload_bytes', max_thread_payload_bytes,
-        'schema_version', schema_version)
+        'max_thread_payload_bytes', max_thread_payload_bytes)
 elseif redis.call('HGET', channel_meta, 'max_message_payload_bytes') ~= max_message_payload_bytes
     or redis.call('HGET', channel_meta, 'max_checkpoint_bytes') ~= max_checkpoint_bytes
     or redis.call('HGET', channel_meta, 'max_thread_messages') ~= max_thread_messages
@@ -125,8 +104,7 @@ if activate_generation then
         'channel', requested_channel,
         'stream', requested_stream,
         'generation', tostring(requested_generation),
-        'state', 'active',
-        'schema_version', schema_version)
+        'state', 'active')
     redis.call('HSETNX', control, 'signal_seq', '0')
 end
 
@@ -134,8 +112,7 @@ redis.call('HSET', meta,
     'channel', requested_channel,
     'stream', requested_stream,
     'generation', tostring(requested_generation),
-    'seq', tostring(latest),
-    'schema_version', schema_version)
+    'seq', tostring(latest))
 redis.call('HSETNX', meta, 'payload_bytes', '0')
 redis.call('SADD', key_index, meta)
 
@@ -223,7 +200,6 @@ local fence = redis.call('HINCRBY', meta, 'fence_counter', 1)
 redis.call('SADD', key_index, run_key, lease_key)
 redis.call('HSET', run_key,
     'run', requested_run,
-    'schema_version', schema_version,
     'status', 'running',
     'settling', '0',
     'start_seq', tostring(latest),
@@ -476,7 +452,6 @@ local messages = KEYS[5]
 local signals = KEYS[6]
 local generation = ARGV[1]
 local requested_after = ARGV[2]
-local schema_version = '5'
 
 local function write_signal(kind, signal_run)
     local signal_seq = redis.call('HINCRBY', control, 'signal_seq', 1)
@@ -492,18 +467,6 @@ if redis.call('HGET', control, 'state') ~= 'active' or redis.call('HGET', contro
 end
 if redis.call('EXISTS', run_key) == 0 then
     return {'NOT_FOUND'}
-end
-local control_schema = redis.call('HGET', control, 'schema_version')
-if control_schema ~= schema_version then
-    return {'SCHEMA_MISMATCH', 'stream control', control_schema or ''}
-end
-local metadata_schema = redis.call('HGET', meta, 'schema_version')
-if metadata_schema ~= schema_version then
-    return {'SCHEMA_MISMATCH', 'generation metadata', metadata_schema or ''}
-end
-local run_schema = redis.call('HGET', run_key, 'schema_version')
-if run_schema ~= schema_version then
-    return {'SCHEMA_MISMATCH', 'run record', run_schema or ''}
 end
 local status = redis.call('HGET', run_key, 'status')
 if status ~= 'running' and status ~= 'cancel_requested' and status ~= 'completed' and status ~= 'cancelled' and status ~= 'failed' and status ~= 'owner_lost' then

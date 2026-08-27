@@ -54,7 +54,6 @@ class ConversationRepository:
             last_model=model_id,
             last_seq=0,
             snapshot_seq=0,
-            snapshot_version=3,
             message_count=0,
             tool_call_count=0,
             has_pending_interrupt=False,
