@@ -42,7 +42,7 @@ TinkerFin profile source 的 `identity` 可省略；普通自定义 source 必�
 | 字段 | 约束或含义 |
 | --- | --- |
 | `channel` | 非空 channel name |
-| `identity` | 嵌套的共享 `Identity` |
+| `identity` | 嵌套的共享 `RunIdentity` |
 | `seq` | thread 内从 1 开始的连续位置 |
 | `message_id` | thread 内稳定幂等 ID |
 | `codec` | 持久格式 ID |
@@ -55,10 +55,11 @@ TinkerFin profile source 的 `identity` 可省略；普通自定义 source 必�
 | --- | --- |
 | `MessageSource` | 单次异步 source 协议 |
 | `CancellableMessageSource` | 自己声明取消 callback 的 source |
-| `ProfiledMessageSource` | 声明 codec、Identity、live type 和 replay type |
+| `ProfiledMessageSource` | 声明 codec、RunIdentity、live type 和 replay type |
 | `MessageSourceBinding` | deferred opener 返回的 source 与可选取消函数 |
-| `DeferredMessageSource` | owner 确定后才创建普通 source |
-| `ProfiledDeferredMessageSource` | 延迟创建且在打开前可推断 codec 与 Identity |
+| `DeferredMessageSource` | owner 确定后才创建普通 source，可在 producer 前执行 owner preflight |
+| `ProfiledDeferredMessageSource` | 延迟创建且在打开前可推断 codec 与 RunIdentity，并使用相同 owner-preflight fence |
+| `MessageCodecInputSource` | 由 source 把一条 live item 转成推断 codec 接受的有限输入 |
 | `FiniteMessageSource` | 把有限 iterable 变成 source |
 | `map_source(...)` | 顺序执行同步或异步转换 |
 | `RecoverableSource` | 根据 checkpoint 重建 source |
@@ -71,37 +72,39 @@ TinkerFin profile source 的 `identity` 可省略；普通自定义 source 必�
 | --- | --- |
 | `MessageCodec` | `encode()`、`decode()` 和稳定 `codec_id` |
 | `SseRenderer` | `render(seq=..., payload=...) -> bytes` |
-| `AgUiCodec` | 默认安装可用的 AG-UI codec 与 renderer |
-| `NativeStreamPartCodec` | 默认安装可用的 Native v2 codec 与 renderer |
-| `NativeStreamPart` | Native v2 解码结果 |
+| `AgUiCodec` | 安装 `[agui]` 后可用的 AG-UI codec 与 renderer |
+| `NativeStreamPartCodec` | 安装 `[native]` 后可用的 canonical Native replay codec 与 renderer |
+| `NativeStreamPart` | 安装 `[native]` 后可用的有限 canonical Native replay 值 |
 | `MemoryBackend` | 单进程实现 |
 | `RedisBackend` | 安装 `[redis]` 后可用的多进程实现 |
 | `MessagingBackend` | 自定义 backend 协议 |
+| `MessagingRetentionPolicy` | 关闭或配置正数秒的终态重播窗口 |
 
 ### `MessagingBackend` 操作
 
 | 操作 | 参数与结果 |
 | --- | --- |
-| `prepare(...)` | channel、Identity、codec、after、是否可取消/恢复；返回 `PreparedRun` |
+| `prepare(...)` | channel、RunIdentity、codec、after、是否可取消/恢复；返回 `PreparedRun` |
 | `append(...)` | handle、message ID、codec、bytes、可选 checkpoint；返回 Envelope |
 | `begin_settlement(handle)` | 原子进入收尾，返回是否已有取消请求 |
 | `finish(...)` | handle、最终状态、可选 error |
-| `get_run_status(...)` | channel 与 Identity；可原子把过期 lease 判定为 `owner_lost` |
-| `latest_seq(...)` / `read(...)` | channel、Identity 与分页参数 |
+| `get_run_status(...)` | channel 与 RunIdentity；可原子把过期 lease 判定为 `owner_lost` |
+| `latest_seq(...)` / `read(...)` | channel、RunIdentity 与分页参数 |
 | `bind_follow(...)` / `follow(...)` | 绑定权威 generation 并持续读取 |
 | `request_cancel()` / `wait_for_cancel()` | 记录或等待取消 |
 | `wait_finished()` / `failure()` | 等待最终状态或读取失败 |
 | `lease_renew_interval` / `lease_timeout` / `renew(handle)` | 描述续租周期、过期预算并确认所有权 |
+| `retention_policy` | 所有 backend worker 必须一致的不可变终态重播策略 |
 | `delete_stream(...)` | 删除不活跃 thread generation |
 
-`BackendRunHandle` 包含 channel、Identity、owner token、fence 和 generation。`PreparedRun` 还包含游标、`is_owner`、可选 checkpoint 与 `recovered`。
+`BackendRunHandle` 包含 channel、RunIdentity、owner token、fence 和 generation。`PreparedRun` 还包含游标、`is_owner`、可选 checkpoint 与 `recovered`。
 
 ## Callback
 
 | API | 作用 |
 | --- | --- |
 | `CancelCallback` | 无参数或接收 `CancelContext`，可返回有限取消尾部 |
-| `CancelContext` | 不可变的 channel 与 Identity |
+| `CancelContext` | 不可变的 channel 与 RunIdentity |
 | `CommittedCallback` | owner 提交后接收完整 Envelope |
 
 ## 常见错误
@@ -119,6 +122,7 @@ TinkerFin profile source 的 `identity` 可省略；普通自定义 source 必�
 | `RunProducerFailed` | 生产、编码、提交或取消失败 |
 | `CancellationUnsupported` | run 没有取消 callback |
 | `BackendOwnershipLost` | 过期 producer 失去所有权 |
+| `StreamExpired` | 终态 generation 已超出重播保留窗口 |
 | `StreamDeleted` / `StreamDeleteConflict` | generation 已删除或有活跃 producer |
 
 Messaging 不读取或比较请求正文。同一个 `runId` 的请求事实一致性由调用方负责。

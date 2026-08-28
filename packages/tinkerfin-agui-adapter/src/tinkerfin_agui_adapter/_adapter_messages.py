@@ -22,7 +22,6 @@ __all__ = [
     "_reasoning_deltas",
     "_record_agent_name",
     "_require_started_source",
-    "_run_id_for",
     "_source",
     "_stable_message_id",
     "_tool_call_id",
@@ -64,14 +63,15 @@ from langchain_core.messages import (
 )
 from pydantic import JsonValue
 
+from tinkerfin_native_stream import NativeMessageStreamPart as MessageStreamPart
+from tinkerfin_native_stream import NativeStreamMode as StreamMode
+
 from ._adapter_contracts import (
     ActiveReasoning,
     ActiveToolCall,
     AgentSource,
     EventContext,
     JsonPatchOperation,
-    MessageStreamPart,
-    StreamMode,
     ToolResultFingerprint,
     _to_json_value,
 )
@@ -222,6 +222,13 @@ def _complete_ai_message_to_chunk(message: AIMessage) -> AIMessageChunk:
 def _process_message_part(
     self: DeepAgentAgUiAdapter, part: MessageStreamPart
 ) -> list[BaseEvent]:
+    """Route one validated message through its namespace-aware lifecycle.
+
+    Native task-start evidence must establish every non-root source before message
+    delivery. Tool results also recover their verified subagent invocation so public
+    provenance never guesses parentage from arrival order or ``parentRunId``.
+    """
+
     metadata = part.data.metadata
     agent_name = metadata.lc_agent_name
     message = part.data.message
@@ -282,6 +289,13 @@ def _process_ai_chunk(
     source: AgentSource,
     raw_event: dict[str, JsonValue],
 ) -> list[BaseEvent]:
+    """Emit balanced reasoning, text, and Tool events for one AI message frame.
+
+    Provider-final frames are hard boundaries even when empty. Reasoning closes before
+    visible text, text closes before Tool fragments, and every final frame closes any
+    provider stream left open without requiring a synthetic upstream chunk.
+    """
+
     events: list[BaseEvent] = []
     visible_content = _visible_ai_content(chunk)
     reasoning_events = self._convert_reasoning_events(
@@ -362,6 +376,13 @@ def _process_tool_chunk(
     source: AgentSource,
     raw_event: dict[str, JsonValue],
 ) -> list[BaseEvent]:
+    """Correlate one Tool fragment by full scope, message ID, and chunk index.
+
+    Later provider fragments may omit both Tool name and ID, so the previously opened
+    scoped slot is authoritative. Every non-empty argument fragment, including the
+    first, is appended exactly once; a conflicting ID closes the old slot first.
+    """
+
     index = tool_chunk.get("index")
     raw_source_message_id = self._stable_message_id(chunk)
     source_message_id = self._message_id(
@@ -432,6 +453,14 @@ def _process_tool_result(
     source: AgentSource,
     raw_event: dict[str, JsonValue],
 ) -> list[BaseEvent]:
+    """Complete one scoped Tool call with replay-safe result idempotency.
+
+    Exact result replays emit nothing and conflicting replays fail closed. A resumed
+    result may legitimately arrive after its proposal lifecycle was emitted by an
+    earlier request; unknown result-only sources receive one complete synthetic start
+    and end before the result rather than an orphan event.
+    """
+
     tool_call_id = self._tool_call_id(
         source.namespace,
         str(message.tool_call_id),
@@ -541,12 +570,19 @@ def _emit_reasoning(
     source: AgentSource,
     raw_event: dict[str, JsonValue],
 ) -> list[BaseEvent]:
+    """Emit one opt-in reasoning delta under a message-scoped balanced lifecycle.
+
+    A new source message closes the prior reasoning stream in the same namespace.
+    Reasoning IDs are separate from visible message IDs, while raw provider metadata is
+    still removed independently by the public sanitizer.
+    """
+
     raw_source_message_id = self._stable_message_id(chunk)
     source_message_id = self._message_id(
         source.namespace,
         raw_source_message_id,
     )
-    run_id = self._run_id_for(source)
+    run_id = self._identity.run_id
     key = (run_id, source_message_id)
     events = self._close_message(source.namespace, raw_event)
     active = self._active_reasoning.get(key)
@@ -736,6 +772,13 @@ def _source(
     self: DeepAgentAgUiAdapter,
     namespace: tuple[str, ...],
 ) -> AgentSource:
+    """Resolve graph provenance only from previously correlated Native task facts.
+
+    Root, verified Deep Agents delegation, and ordinary compiled subgraphs remain
+    distinct. An unknown non-root namespace is represented conservatively and is never
+    promoted to a subagent solely because its namespace is non-empty.
+    """
+
     if not namespace:
         return AgentSource(
             kind="root",
@@ -771,12 +814,6 @@ def _source(
     )
 
 
-def _run_id_for(self: DeepAgentAgUiAdapter, source: AgentSource) -> str:
-    """Return the caller-declared main AG-UI run ID for every graph source."""
-
-    return self._identity.run_id
-
-
 def _event_context(
     self: DeepAgentAgUiAdapter,
     stream_mode: StreamMode,
@@ -789,10 +826,16 @@ def _event_context(
     parent_tool_call_id: str | None = None,
     tool_result_status: Literal["success", "error"] | None = None,
 ) -> dict[str, JsonValue]:
+    """Build the finite raw-event provenance shared by every emitted AG-UI event.
+
+    The context retains full namespaces and correlation IDs but never serializes live
+    LangGraph objects or repurposes AG-UI branch lineage for subagent relationships.
+    """
+
     context = EventContext(
         stream_mode=stream_mode,
         source=source,
-        run_id=self._run_id_for(source),
+        run_id=self._identity.run_id,
         related_namespace=related_namespace,
         related_subagent_invocation_id=related_subagent_invocation_id,
         parent_tool_call_id=parent_tool_call_id,

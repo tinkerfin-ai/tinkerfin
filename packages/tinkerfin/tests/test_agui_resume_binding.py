@@ -4,14 +4,21 @@ from __future__ import annotations
 
 import pytest
 from ag_ui.core.types import Interrupt, ResumeEntry
+from langchain_core.messages import AIMessage
 from pydantic import ValidationError
 
-from tinkerfin import AgUiResumeBinding, AgUiResumeBindingError, Identity
+from tinkerfin import (
+    AgUiResumeBinding,
+    AgUiResumeBindingError,
+    AgUiResumeRequest,
+    RunIdentity,
+)
 from tinkerfin_agui_adapter import ResumeMappingError, ResumeTranslation, ScopedIdCodec
+from tinkerfin_native_stream import NativeRuntimeInterrupt
 
 
-def _identity(*, run_id: str = "run-resume") -> Identity:
-    return Identity(threadId="thread-1", runId=run_id)
+def _identity(*, run_id: str = "run-resume") -> RunIdentity:
+    return RunIdentity(threadId="thread-1", runId=run_id)
 
 
 def _interrupts() -> tuple[Interrupt, ...]:
@@ -85,6 +92,69 @@ def test_from_agui_builds_one_identity_free_resume_binding() -> None:
     assert not hasattr(binding, "command")
 
 
+def test_resume_request_builds_binding_from_native_checkpoint_evidence() -> None:
+    request = AgUiResumeRequest(
+        entries=(_entry("interrupt-1#1"), _entry("interrupt-1#0")),
+    )
+    message = AIMessage(
+        id="message-review",
+        content="",
+        tool_calls=[
+            {
+                "name": "write_file",
+                "args": {"path": "a"},
+                "id": "call-0",
+                "type": "tool_call",
+            },
+            {
+                "name": "write_file",
+                "args": {"path": "b"},
+                "id": "call-1",
+                "type": "tool_call",
+            },
+        ],
+    )
+    binding = AgUiResumeBinding.from_native(
+        request=request,
+        interrupts=(
+            NativeRuntimeInterrupt(
+                id="interrupt-1",
+                value={
+                    "action_requests": [
+                        {"name": "write_file", "args": {"path": "a"}},
+                        {"name": "write_file", "args": {"path": "b"}},
+                    ],
+                    "review_configs": [
+                        {
+                            "action_name": "write_file",
+                            "allowed_decisions": ["approve"],
+                        },
+                        {
+                            "action_name": "write_file",
+                            "allowed_decisions": ["approve"],
+                        },
+                    ],
+                },
+            ),
+        ),
+        messages_by_namespace={(): (message,)},
+    )
+
+    assert binding.native_interrupt_ids == ("interrupt-1",)
+    assert binding.prior_tool_call_ids == (
+        ScopedIdCodec().encode("tool", (), "call-0"),
+        ScopedIdCodec().encode("tool", (), "call-1"),
+    )
+    assert binding.resume_data == {
+        "decisions": [{"type": "approve"}, {"type": "approve"}]
+    }
+
+
+def test_resume_request_rejects_duplicate_client_interrupt_ids() -> None:
+    with pytest.raises(ValidationError, match="unique interrupt IDs"):
+        AgUiResumeRequest(entries=(_entry("interrupt-1"), _entry("interrupt-1")))
+
+
 def test_from_agui_converts_adapter_failures_to_the_core_error_family() -> None:
     with pytest.raises(AgUiResumeBindingError) as raised:
         AgUiResumeBinding.from_agui(
@@ -144,6 +214,22 @@ def test_mixed_resume_preserves_cancelled_slots_without_fabricating_reject() -> 
             {"type": "tinkerfin_cancel"},
         ]
     }
+    summaries = binding._observation_summaries()
+    assert summaries[0].status == "cancelled"
+    assert summaries[0].decision is None
+
+
+def test_single_decision_observation_summary_preserves_the_public_action() -> None:
+    binding = AgUiResumeBinding(
+        mode="resume",
+        resume_data={"decisions": [{"type": "approve"}]},
+        native_interrupt_ids=("interrupt-1",),
+    )
+
+    summary = binding._observation_summaries()[0]
+
+    assert summary.status == "resolved"
+    assert summary.decision == "approve"
 
 
 def test_all_cancelled_resume_is_a_round_trippable_abandonment() -> None:

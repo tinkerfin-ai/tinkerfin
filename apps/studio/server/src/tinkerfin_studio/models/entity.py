@@ -52,6 +52,11 @@ class AgentModel(Base):
         default=False,
         comment="是否启用已验证的 provider reasoning 参数",
     )
+    runtime_profile: Mapped[str] = mapped_column(
+        String(128),
+        nullable=False,
+        comment="Worker 创建与恢复 Run 使用的 Runtime Profile",
+    )
     enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, comment="是否允许创建新 run"
     )

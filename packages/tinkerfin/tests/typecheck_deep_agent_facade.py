@@ -27,8 +27,8 @@ from tinkerfin import (
     DeepAgentAgUiRuntime,
     DeepAgentDefinition,
     DeepAgentRuntime,
-    Identity,
     NativeGraphRunStream,
+    RunIdentity,
     TinkerFin,
 )
 from tinkerfin.plan import (
@@ -42,6 +42,7 @@ from tinkerfin.plan import (
     SingleChoiceQuestion,
     clarification_type,
 )
+from tinkerfin_contracts import RuntimeObserver
 
 
 class _FakeModel(FakeMessagesListChatModel):
@@ -81,17 +82,26 @@ class _Form(ClarificationForm[_Question]):
 
 
 class _RatingQuestion(ClarificationQuestionBase):
-    answer_type: Literal["acme:rating.v1"] = "acme:rating.v1"
+    answer_type: Literal["acme:rating"] = "acme:rating"
     maximum: int
 
 
 class _RatingResponse(ClarificationResponseBase):
-    answer_type: Literal["acme:rating.v1"] = "acme:rating.v1"
+    answer_type: Literal["acme:rating"] = "acme:rating"
     rating: int
 
 
 if TYPE_CHECKING:
     tinkerfin = TinkerFin()
+    observer = cast(RuntimeObserver, object())
+    observed = tinkerfin.observe(observer)
+    assert_type(observed, TinkerFin)
+    observed_definition = observed.create_deep_agent(
+        model=_FakeModel(responses=[AIMessage(content="ok")]),
+        tools=[],
+        context_schema=_Context,
+    )
+    assert_type(observed_definition, DeepAgentDefinition[_Context])
     definition = tinkerfin.create_deep_agent(
         model=_FakeModel(responses=[AIMessage(content="ok")]),
         tools=[],
@@ -118,7 +128,7 @@ if TYPE_CHECKING:
     custom_option = _Option(id="option", label="Option", attributes=None)
     assert_type(custom_option.attributes, _OptionAttributes | None)
     rating_type = clarification_type(
-        type_id="acme:rating.v1",
+        type_id="acme:rating",
         description="Use for one bounded integer rating.",
         question_model=_RatingQuestion,
         response_model=_RatingResponse,
@@ -130,7 +140,7 @@ if TYPE_CHECKING:
     )
     assert_type(tinkerfin.plan(clarification_types=(rating_type,)), TinkerFin)
 
-    identity = Identity(threadId="thread-1", runId="run-1")
+    identity = RunIdentity(threadId="thread-1", runId="run-1")
     native = definition.new(identity=identity)
     agui = definition.new_agui(identity=identity)
     resumed_agui = definition.new_agui(

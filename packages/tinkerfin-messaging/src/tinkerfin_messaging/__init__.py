@@ -32,6 +32,7 @@ from .errors import SourceProfileMismatch as SourceProfileMismatch
 from .errors import SseRenderingUnsupported as SseRenderingUnsupported
 from .errors import StreamDeleteConflict as StreamDeleteConflict
 from .errors import StreamDeleted as StreamDeleted
+from .errors import StreamExpired as StreamExpired
 from .errors import UnexpectedMessagingBackendError as UnexpectedMessagingBackendError
 from .limits import MessagingLimits as MessagingLimits
 from .messaging import CancelCallback as CancelCallback
@@ -45,10 +46,12 @@ from .models import MessageEnvelope as MessageEnvelope
 from .models import RecoverableMessage as RecoverableMessage
 from .models import RecoveryCheckpoint as RecoveryCheckpoint
 from .protocols import MessageCodec as MessageCodec
+from .protocols import MessageCodecInputSource as MessageCodecInputSource
 from .protocols import MessageSource as MessageSource
 from .protocols import ProfiledMessageSource as ProfiledMessageSource
 from .protocols import RecoverableSource as RecoverableSource
 from .protocols import SseRenderer as SseRenderer
+from .retention import MessagingRetentionPolicy as MessagingRetentionPolicy
 from .sources import CancellableMessageSource as CancellableMessageSource
 from .sources import DeferredMessageSource as DeferredMessageSource
 from .sources import FiniteMessageSource as FiniteMessageSource
@@ -79,6 +82,7 @@ __all__ = [
     "MemoryBackend",
     "MessageChannel",
     "MessageCodec",
+    "MessageCodecInputSource",
     "MessageEnvelope",
     "MessageIdConflict",
     "MessageSource",
@@ -96,6 +100,7 @@ __all__ = [
     "MessagingLimits",
     "MessagingNotStarted",
     "MessagingQuotaExceeded",
+    "MessagingRetentionPolicy",
     "MessagingSettlementTimeout",
     "NativeStreamPart",
     "NativeStreamPartCodec",
@@ -116,6 +121,7 @@ __all__ = [
     "SseRenderingUnsupported",
     "StreamDeleteConflict",
     "StreamDeleted",
+    "StreamExpired",
     "UnexpectedMessagingBackendError",
     "map_source",
 ]
@@ -143,12 +149,28 @@ def __getattr__(name: str) -> object:
     """Load optional integrations only when their public symbol is requested."""
 
     if name == "AgUiCodec":
-        from .agui import AgUiCodec
+        try:
+            from .agui import AgUiCodec
+        except ModuleNotFoundError as error:
+            _raise_missing_extra(
+                error,
+                symbol=name,
+                extra="agui",
+                packages=("ag_ui",),
+            )
 
         globals()[name] = AgUiCodec
         return AgUiCodec
     if name in {"NativeStreamPart", "NativeStreamPartCodec"}:
-        from .native import NativeStreamPart, NativeStreamPartCodec
+        try:
+            from .native import NativeStreamPart, NativeStreamPartCodec
+        except ModuleNotFoundError as error:
+            _raise_missing_extra(
+                error,
+                symbol=name,
+                extra="native",
+                packages=("tinkerfin_native_stream",),
+            )
 
         globals()["NativeStreamPart"] = NativeStreamPart
         globals()["NativeStreamPartCodec"] = NativeStreamPartCodec

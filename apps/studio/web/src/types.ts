@@ -1,8 +1,14 @@
+import type { ConversationHistoryDetail } from './api/conversation/history'
+
 export type MessageRole = 'user' | 'assistant' | 'process' | 'tool' | 'subagent' | 'approval' | 'error'
 export type TodoStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled'
 export type ApprovalDecision = 'approved' | 'rejected'
 export type ConversationRunStatus = 'idle' | 'streaming' | 'waiting_approval' | 'detached' | 'error'
-export type PendingInteractionKind = 'tool_approval' | 'plan_clarification' | 'plan_review'
+export type PendingInteractionKind =
+  | 'tool_approval'
+  | 'plan_clarification'
+  | 'plan_review'
+  | 'input_required'
 export type ApprovalMode = 'options' | 'reject'
 export type ApprovalAllowedDecision = 'approve' | 'edit' | 'reject' | 'respond'
 export type AgentMode = 'default' | 'plan'
@@ -192,6 +198,8 @@ export interface Conversation {
   serverState?: JsonObject
   /** 最后一条已持久化 AG-UI 事件序号，用于 afterSeq 续传 */
   lastSeq?: number
+  /** Trace 历史或 detached follow 使用的唯一权威语义视图 */
+  trace?: ConversationHistoryDetail
   /** 完整会话详情是否已从后端历史恢复 */
   isHydrated?: boolean
 }

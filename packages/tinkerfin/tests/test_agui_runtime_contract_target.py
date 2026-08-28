@@ -27,6 +27,7 @@ def test_target_public_surface_removes_context_and_exposes_checkpoint_semantics(
     assert "AgUiResumeSettlementObserver" not in tinkerfin.__all__
     assert "AgUiResumeCheckpoint" in tinkerfin.__all__
     assert "AgUiResumeCheckpointObserver" in tinkerfin.__all__
+    assert "AgUiResumeInitializationFailureObserver" in tinkerfin.__all__
     assert "DeepAgentAgUiResumeRuntime" in tinkerfin.__all__
     assert AgUiResumeCheckpoint is not None
     assert DeepAgentAgUiResumeRuntime is not None
@@ -43,6 +44,7 @@ def test_target_new_agui_signature_has_no_protocol_input_or_settlement_callback(
     assert "parent_run_id" in parameters
     assert "resume" in parameters
     assert "on_resume_checkpointed" in parameters
+    assert "on_resume_initialization_failed" in parameters
     assert "run_input" not in parameters
     assert "on_resume_settled" not in parameters
 

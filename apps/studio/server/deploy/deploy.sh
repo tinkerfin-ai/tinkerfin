@@ -3,10 +3,14 @@
 set -Eeuo pipefail
 
 readonly -a PROJECT_PATHS=(
-    "packages/tinkerfin"
+    "packages/tinkerfin-contracts"
+    "packages/tinkerfin-native-stream"
     "packages/tinkerfin-agui-adapter"
+    "packages/tinkerfin"
     "packages/tinkerfin-messaging"
+    "packages/tinkerfin-tracing"
     "packages/tinkerfin-sandbox"
+    "packages/tinkerfin-langgraph-mysql"
     "apps/studio/server"
 )
 readonly MINIMUM_COMPOSE_VERSION="2.24.0"
@@ -155,7 +159,8 @@ validate_environment() {
         "$SCRIPT_DIR/secrets/database_url" \
         "$SCRIPT_DIR/secrets/mysql_password" \
         "$SCRIPT_DIR/secrets/mysql_root_password" \
-        "$SCRIPT_DIR/secrets/redis_password" \
+        "$SCRIPT_DIR/secrets/redis_control_password" \
+        "$SCRIPT_DIR/secrets/redis_runtime_password" \
         "$SCRIPT_DIR/secrets/opensandbox_api_key"; do
         [[ -f "$required" ]] || fail "缺少部署文件：$required"
     done
@@ -217,5 +222,3 @@ CURRENT_STAGE="完成"
 CURRENT_COMMAND=""
 printf '\n🚀 Studio 后端部署完成，版本 %s（总耗时 %ds）\n' \
     "$APP_VERSION" "$((SECONDS - DEPLOY_STARTED_AT))"
-printf '创建管理员：%s user create --username admin --display-name Admin\n' \
-    "$SCRIPT_DIR/manage.sh"

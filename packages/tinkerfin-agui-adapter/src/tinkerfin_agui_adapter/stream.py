@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable
 from contextlib import aclosing
 from functools import wraps
@@ -12,11 +11,9 @@ from typing import cast
 from ag_ui.core import BaseEvent
 
 from .adapter import DeepAgentAgUiAdapter
-from .contracts import Identity
+from .contracts import RunIdentity
 from .lifecycle import AgUiLifecycleEventFactory
 from .microbatch import micro_batch
-
-logger = logging.getLogger(__name__)
 
 
 async def _close_upstream(
@@ -40,7 +37,7 @@ async def _close_upstream(
 async def _astream_events(
     parts: AsyncIterable[object],
     *,
-    identity: Identity,
+    identity: RunIdentity,
     expose_reasoning_events: bool = False,
     expose_subagent_events: bool = True,
     prior_tool_call_ids: frozenset[str] = frozenset(),
@@ -140,20 +137,16 @@ async def _astream_events(
         except GeneratorExit as error:
             primary = error
             raise
-        except Exception as error:
-            logger.exception("Deep Agents to AG-UI stream conversion failed")
+        except Exception as error:  # noqa: BLE001 - Adapter owns the error terminal
             try:
                 await close_upstream(None)
-            except Exception as close_error:
+            except Exception as close_error:  # noqa: BLE001 - preserve primary failure
                 # Both the stream and its cleanup share one public error terminal.
                 error.add_note(
                     "upstream close also failed: "
                     f"{type(close_error).__name__}: {close_error}"
                 )
-                logger.exception(
-                    "Closing the upstream after AG-UI conversion failure also failed"
-                )
-            for event in adapter.abort(code="runtime_error"):
+            for event in adapter.abort():
                 yield event
             if started and not terminal:
                 terminal = True
@@ -178,7 +171,7 @@ async def _astream_events(
 def astream_events(
     parts: AsyncIterable[object],
     *,
-    identity: Identity,
+    identity: RunIdentity,
     expose_reasoning_events: bool = False,
     expose_subagent_events: bool = True,
     prior_tool_call_ids: frozenset[str] = frozenset(),

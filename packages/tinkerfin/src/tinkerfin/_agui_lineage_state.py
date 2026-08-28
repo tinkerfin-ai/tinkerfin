@@ -6,10 +6,17 @@ from typing import Literal, TypeAlias, cast
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
 
-from tinkerfin_agui_adapter import Identity
+from tinkerfin_contracts import RunIdentity
 
 LINEAGE_STATE_KEY = "_tinkerfin_lineage"
+RESUME_MARKER_STATE_KEY = "_tinkerfin_resume"
 PLANNING_CHECKPOINT_RUN_ID = "tinkerfin-plan"
+RUN_ID_METADATA_KEY = "_tinkerfin_run_id"
+CHECKPOINT_ROLE_METADATA_KEY = "_tinkerfin_checkpoint_role"
+PARENT_RUN_ID_METADATA_KEY = "_tinkerfin_parent_run_id"
+RUNTIME_PROFILE_METADATA_KEY = "_tinkerfin_runtime_profile"
+NATIVE_CHECKPOINT_ROLE = "native"
+PLANNING_CHECKPOINT_ROLE = "planning"
 
 LineageRole: TypeAlias = Literal["native", "planning"]
 
@@ -35,9 +42,10 @@ class LineageMarker(BaseModel):
     thread_id: str = Field(min_length=1)
     run_id: str = Field(min_length=1)
     parent_run_id: str | None = Field(default=None, min_length=1)
+    runtime_profile: str = Field(min_length=1)
     role: LineageRole
 
-    @field_validator("thread_id", "run_id", "parent_run_id")
+    @field_validator("thread_id", "run_id", "parent_run_id", "runtime_profile")
     @classmethod
     def identifiers_are_canonical(cls, value: str | None) -> str | None:
         """Reject identifiers that cannot produce stable lineage evidence."""
@@ -49,8 +57,9 @@ class LineageMarker(BaseModel):
 
 def lineage_marker(
     *,
-    identity: Identity,
+    identity: RunIdentity,
     parent_run_id: str | None,
+    runtime_profile: str,
     role: LineageRole,
 ) -> LineageMarker:
     """Build the private marker for one canonical Graph invocation."""
@@ -59,14 +68,16 @@ def lineage_marker(
         thread_id=identity.thread_id,
         run_id=identity.run_id,
         parent_run_id=parent_run_id,
+        runtime_profile=runtime_profile,
         role=role,
     )
 
 
 def lineage_state_update(
     *,
-    identity: Identity,
+    identity: RunIdentity,
     parent_run_id: str | None,
+    runtime_profile: str,
     role: LineageRole,
 ) -> dict[str, dict[str, JsonValue]]:
     """Return one JSON-safe private state update for a Graph input."""
@@ -74,6 +85,7 @@ def lineage_state_update(
     marker = lineage_marker(
         identity=identity,
         parent_run_id=parent_run_id,
+        runtime_profile=runtime_profile,
         role=role,
     )
     return {
@@ -105,8 +117,15 @@ def lineage_marker_with_role(
 
 
 __all__ = [
+    "CHECKPOINT_ROLE_METADATA_KEY",
     "LINEAGE_STATE_KEY",
+    "NATIVE_CHECKPOINT_ROLE",
+    "PARENT_RUN_ID_METADATA_KEY",
+    "PLANNING_CHECKPOINT_ROLE",
     "PLANNING_CHECKPOINT_RUN_ID",
+    "RESUME_MARKER_STATE_KEY",
+    "RUNTIME_PROFILE_METADATA_KEY",
+    "RUN_ID_METADATA_KEY",
     "LineageMarker",
     "LineageRole",
     "lineage_marker",

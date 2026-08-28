@@ -18,7 +18,7 @@ import {
   clearActiveRunSession,
   readActiveRunSession,
 } from '../conversation/stream/activeRunSession'
-import { restoreConversationFromHistory } from '../conversation/agui'
+import { restoreConversationFromTrace } from '../conversation/trace/runtime'
 import { readThreadFromLocation } from '../../lib/threadRoute'
 import { upsertConversation } from '../../lib/workspace'
 import type { Conversation, WorkspaceState } from '../../types'
@@ -31,6 +31,25 @@ const HISTORY_PAGE_SIZE = 100
 // 历史分页限制相邻请求的启动间隔，首次命中有效游标时不增加人工等待
 const HISTORY_LOAD_THROTTLE_MS = 300
 const HISTORY_SEARCH_DEBOUNCE_MS = 300
+
+interface TracePageRequestIdentity {
+  asOfSeq: number
+  headRunId: string
+  historyCursor: string
+  runStatus: Conversation['runStatus']
+  activeRunId?: string
+}
+
+const ownsTracePageRequest = (
+  conversation: Conversation | undefined,
+  request: TracePageRequestIdentity,
+) => (
+  conversation?.trace?.asOfSeq === request.asOfSeq
+  && conversation.trace.headRunId === request.headRunId
+  && conversation.trace.historyCursor === request.historyCursor
+  && conversation.runStatus === request.runStatus
+  && conversation.activeRunId === request.activeRunId
+)
 
 const getHistoryLoadThrottleDelay = (lastStartedAt: number | null) => (
   lastStartedAt == null
@@ -71,6 +90,48 @@ const historyStatusToRunStatus = (status: string): Conversation['runStatus'] => 
   }
 }
 
+export const historyItemFromDetail = (
+  detail: ConversationHistoryDetail,
+): ConversationHistoryListItem => {
+  const pending = detail.interactions.filter((interaction) => interaction.status === 'pending')
+  const pendingKinds = new Set(pending.map((interaction) => (
+    interaction.kind === 'tinkerfin:plan_clarification'
+      ? 'plan_clarification'
+      : interaction.kind === 'tinkerfin:plan_review'
+        ? 'plan_review'
+        : interaction.kind === 'tool_approval'
+          ? 'tool_approval'
+          : 'input_required'
+  )))
+  const pendingKind = pendingKinds.size === 0
+    ? null
+    : pendingKinds.size === 1
+      ? [...pendingKinds][0] ?? null
+      : 'input_required'
+  const status = detail.status.execution === 'running'
+    ? 'running'
+    : detail.status.execution === 'waiting'
+      ? 'waiting_approval'
+      : detail.status.execution === 'failed' || detail.status.execution === 'unknown'
+        ? 'error'
+        : 'idle'
+  return {
+    id: detail.id,
+    threadId: detail.threadId,
+    title: detail.title,
+    status,
+    lastRunId: detail.headRunId,
+    lastModel: detail.lastModel,
+    messageCount: detail.messageCount,
+    toolCallCount: detail.toolCallCount,
+    hasPendingInterrupt: pending.length > 0,
+    pendingInteractionKind: pendingKind,
+    pinned: detail.pinned,
+    createdAt: detail.createdAt,
+    updatedAt: detail.updatedAt,
+  }
+}
+
 const conversationFromHistoryItem = (
   item: ConversationHistoryListItem,
   fallbackModel: string,
@@ -85,13 +146,12 @@ const conversationFromHistoryItem = (
   todos: [],
   pendingInteractionKind: item.pendingInteractionKind ?? undefined,
   runStatus: historyStatusToRunStatus(item.status),
-  activeRunId: item.lastRunId,
+  activeRunId: item.lastRunId ?? undefined,
   serverState: {},
-  lastSeq: item.lastSeq,
   isHydrated: false,
 })
 
-const mergeHistoryConversations = (
+export const mergeHistoryConversations = (
   current: Conversation[],
   incoming: ConversationHistoryListItem[],
   fallbackModel: string,
@@ -100,26 +160,24 @@ const mergeHistoryConversations = (
   for (const item of incoming) {
     const existing = byId.get(item.threadId)
     const summary = conversationFromHistoryItem(item, fallbackModel)
-    byId.set(
-      item.threadId,
-      existing
-        ? {
-            ...existing,
-            title: item.title,
-            pinned: item.pinned,
-            updatedAt: item.updatedAt,
-            model: summary.model,
-            activeRunId: existing.runStatus === 'streaming'
-              ? existing.activeRunId
-              : summary.activeRunId,
-            lastSeq: existing.isHydrated ? existing.lastSeq : summary.lastSeq,
-            pendingInteractionKind: existing.isHydrated
-              ? existing.pendingInteractionKind
-              : summary.pendingInteractionKind,
-            runStatus: existing.runStatus === 'streaming' ? existing.runStatus : summary.runStatus,
-          }
-        : summary,
-    )
+    if (!existing) {
+      byId.set(item.threadId, summary)
+      continue
+    }
+    // Trace 水化与 follow 拥有运行状态；列表和搜索只能更新产品元数据，不能回退语义视图
+    const preserveRuntime = existing.isHydrated || existing.runStatus === 'streaming'
+    byId.set(item.threadId, {
+      ...existing,
+      title: item.title,
+      pinned: item.pinned,
+      updatedAt: preserveRuntime ? existing.updatedAt : item.updatedAt,
+      model: preserveRuntime ? existing.model : summary.model,
+      activeRunId: preserveRuntime ? existing.activeRunId : summary.activeRunId,
+      pendingInteractionKind: existing.isHydrated
+        ? existing.pendingInteractionKind
+        : summary.pendingInteractionKind,
+      runStatus: preserveRuntime ? existing.runStatus : summary.runStatus,
+    })
   }
   return sortConversations([...byId.values()])
 }
@@ -129,14 +187,14 @@ export function useWorkspaceHistory({
   setWorkspace,
   defaultModelId,
   modelCatalogStatus,
-  catchUpDetachedConversation,
+  followDetachedConversation,
   onToast,
 }: {
   workspace: WorkspaceState
   setWorkspace: Dispatch<SetStateAction<WorkspaceState>>
   defaultModelId: string
   modelCatalogStatus: ModelCatalogStatus
-  catchUpDetachedConversation: (threadId: string) => void | Promise<void>
+  followDetachedConversation: (threadId: string) => void | Promise<void>
   onToast: (kind: 'error', message: string) => void
 }) {
   const { t } = useI18n()
@@ -181,6 +239,7 @@ export function useWorkspaceHistory({
   const loadedSearchCursors = useRef(new Set<string>())
   const prefetchedHistoryDetails = useRef(new Map<string, ConversationHistoryDetail>())
   const hydrationRequests = useRef(new Map<string, AbortController>())
+  const olderTraceRequests = useRef(new Map<string, AbortController>())
   const initialThreadId = useRef(readThreadFromLocation())
   const latestWorkspace = useRef(workspace)
   latestWorkspace.current = workspace
@@ -213,7 +272,7 @@ export function useWorkspaceHistory({
       ) clearActiveRunSession(activeSession?.payload.runId)
       if (preferredDetail) prefetchedHistoryDetails.current.set(preferredThreadId, preferredDetail)
       const historyItems = preferredDetail && !response.items.some((item) => item.threadId === preferredThreadId)
-        ? [...response.items, preferredDetail]
+        ? [...response.items, historyItemFromDetail(preferredDetail)]
         : response.items
       const nextThreadIds = historyItems.map((item) => item.threadId)
       historyThreadIdsRef.current = nextThreadIds
@@ -547,7 +606,7 @@ export function useWorkspaceHistory({
     const target = latestWorkspace.current.conversations.find((item) => item.threadId === threadId)
     if (!target) return
     if (target.isHydrated) {
-      void catchUpDetachedConversation(threadId)
+      void followDetachedConversation(threadId)
       return
     }
     const existingRequest = hydrationRequests.current.get(threadId)
@@ -568,13 +627,13 @@ export function useWorkspaceHistory({
         || hydrationRequests.current.get(threadId) !== controller
       ) return
       prefetchedHistoryDetails.current.delete(threadId)
-      const restored = restoreConversationFromHistory(detail, {
+      const restored = restoreConversationFromTrace(detail, {
         model: detail.lastModel ?? target.model,
       })
       setHydrationState((current) => current?.threadId === threadId ? null : current)
       setWorkspace((state) => upsertConversation(state, { ...restored, isHydrated: true }))
-      if (restored.runStatus === 'detached' || restored.runStatus === 'idle') {
-        if (!controller.signal.aborted) void catchUpDetachedConversation(threadId)
+      if (restored.runStatus === 'detached') {
+        if (!controller.signal.aborted) void followDetachedConversation(threadId)
       }
     } catch {
       if (!controller.signal.aborted && hydrationRequests.current.get(threadId) === controller) {
@@ -586,7 +645,61 @@ export function useWorkspaceHistory({
         hydrationRequests.current.delete(threadId)
       }
     }
-  }, [catchUpDetachedConversation, onToast, setWorkspace, t])
+  }, [followDetachedConversation, onToast, setWorkspace, t])
+
+  const loadOlderTrace = useCallback(async (threadId: string) => {
+    const target = latestWorkspace.current.conversations.find(
+      (item) => item.threadId === threadId,
+    )
+    const trace = target?.trace
+    const cursor = trace?.historyCursor
+    if (!target || !trace || !cursor || olderTraceRequests.current.has(threadId)) return false
+    const requestIdentity: TracePageRequestIdentity = {
+      asOfSeq: trace.asOfSeq,
+      headRunId: trace.headRunId,
+      historyCursor: cursor,
+      runStatus: target.runStatus,
+      activeRunId: target.activeRunId,
+    }
+    const controller = new AbortController()
+    olderTraceRequests.current.set(threadId, controller)
+    try {
+      const detail = await fetchConversationHistoryDetail(threadId, {
+        historyCursor: cursor,
+        limit: 100,
+        signal: controller.signal,
+        suppressGlobalError: true,
+      })
+      if (controller.signal.aborted || olderTraceRequests.current.get(threadId) !== controller) {
+        return false
+      }
+      const latest = latestWorkspace.current.conversations.find(
+        (item) => item.threadId === threadId,
+      )
+      if (
+        !ownsTracePageRequest(latest, requestIdentity)
+        || detail.asOfSeq !== requestIdentity.asOfSeq
+        || detail.headRunId !== requestIdentity.headRunId
+      ) return false
+      setWorkspace((state) => {
+        const current = state.conversations.find((item) => item.threadId === threadId)
+        // follow 已推进权威前缀时丢弃旧分页，不能让 fixed-as-of 响应回退新状态
+        if (!ownsTracePageRequest(current, requestIdentity)) return state
+        const restored = restoreConversationFromTrace(detail, {
+          model: current?.model ?? target.model,
+        })
+        return upsertConversation(state, restored)
+      })
+      return true
+    } catch {
+      if (!controller.signal.aborted) onToast('error', t('会话加载失败，请重试'))
+      return false
+    } finally {
+      if (olderTraceRequests.current.get(threadId) === controller) {
+        olderTraceRequests.current.delete(threadId)
+      }
+    }
+  }, [onToast, setWorkspace, t])
 
   const activeHistoryThreadIds = normalizedHistoryQuery
     ? searchThreadIds
@@ -659,6 +772,8 @@ export function useWorkspaceHistory({
     historyBootstrapAbortController.current?.abort()
     for (const controller of hydrationRequests.current.values()) controller.abort()
     hydrationRequests.current.clear()
+    for (const controller of olderTraceRequests.current.values()) controller.abort()
+    olderTraceRequests.current.clear()
   }, [])
 
   return {
@@ -678,5 +793,6 @@ export function useWorkspaceHistory({
     retryHistoryLoad,
     retryHistoryBootstrap,
     hydrateConversation,
+    loadOlderTrace,
   }
 }

@@ -22,7 +22,6 @@ __all__ = [
     "_restore_error",
 ]
 
-import logging
 import secrets
 import shlex
 from dataclasses import dataclass
@@ -48,9 +47,6 @@ from .sdk import OpenSandboxBackend
 
 if TYPE_CHECKING:
     from .rooted import RootedOpenSandboxBackend
-
-logger = logging.getLogger("tinkerfin_sandbox.backends.rooted")
-
 
 _ROOTED_BINARY_READ_SUFFIXES = frozenset(
     {
@@ -248,15 +244,9 @@ def _cleanup_edit_staging(
 ) -> None:
     """Best-effort cleanup without replaying the target edit."""
     try:
-        cleanup = backend.execute(self._edit_cleanup_command(old_path, new_path))
-    except Exception:
-        logger.warning("Failed to clean up staged Rooted edit payload", exc_info=True)
+        backend.execute(self._edit_cleanup_command(old_path, new_path))
+    except Exception:  # noqa: BLE001 - staging cleanup is best effort
         return
-    if cleanup.exit_code != 0:
-        logger.warning(
-            "Failed to clean up staged Rooted edit payload: %s",
-            cleanup.output[:200],
-        )
 
 
 async def _acleanup_edit_staging(
@@ -268,15 +258,9 @@ async def _acleanup_edit_staging(
 ) -> None:
     """Asynchronously clean generated staging paths without replaying edit."""
     try:
-        cleanup = await backend.aexecute(self._edit_cleanup_command(old_path, new_path))
-    except Exception:
-        logger.warning("Failed to clean up staged Rooted edit payload", exc_info=True)
+        await backend.aexecute(self._edit_cleanup_command(old_path, new_path))
+    except Exception:  # noqa: BLE001 - staging cleanup is best effort
         return
-    if cleanup.exit_code != 0:
-        logger.warning(
-            "Failed to clean up staged Rooted edit payload: %s",
-            cleanup.output[:200],
-        )
 
 
 def _project_delete_response(

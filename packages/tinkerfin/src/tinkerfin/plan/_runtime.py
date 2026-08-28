@@ -18,11 +18,13 @@ from .._agui_lineage import (
     NATIVE_CHECKPOINT_ROLE,
     PLANNING_CHECKPOINT_ROLE,
     RUN_ID_METADATA_KEY,
+    RUNTIME_PROFILE_METADATA_KEY,
     resolve_agui_native_run_head,
     resolve_agui_thread_head,
 )
 from .._agui_lineage_state import (
     LINEAGE_STATE_KEY,
+    RESUME_MARKER_STATE_KEY,
     LineageRole,
     lineage_marker_with_role,
 )
@@ -145,6 +147,8 @@ def _lineage_update_for_role(
     role: LineageRole,
     required: bool,
 ) -> dict[str, object]:
+    """Change Graph role while carrying an accepted resume marker across handoff."""
+
     raw_marker = state.get(LINEAGE_STATE_KEY)
     if raw_marker is None:
         if required:
@@ -156,7 +160,10 @@ def _lineage_update_for_role(
         raise PlanStateConflictError(
             "Plan state has an invalid lineage marker"
         ) from error
-    return {LINEAGE_STATE_KEY: marker}
+    update: dict[str, object] = {LINEAGE_STATE_KEY: marker}
+    if RESUME_MARKER_STATE_KEY in state:
+        update[RESUME_MARKER_STATE_KEY] = state[RESUME_MARKER_STATE_KEY]
+    return update
 
 
 def _input_with_lineage_role(
@@ -165,16 +172,20 @@ def _input_with_lineage_role(
     role: LineageRole,
     required: bool,
 ) -> object:
+    """Rewrite only the private lineage role on state or resume input.
+
+    Command routing, resume payload, and every host state field remain unchanged. A
+    decision-only Command is valid after the two-phase Runtime has durably staged the
+    role marker; Commands that still carry a state update must contain an existing
+    marker rather than asking this router to invent lineage.
+    """
+
     if value is None:
         return None
     if isinstance(value, Command):
         command = cast(Command[object], value)
         raw_update = command.update
         if not isinstance(raw_update, Mapping):
-            if required:
-                raise PlanStateConflictError(
-                    "Plan resume command requires a private state update"
-                )
             return command
         update = {
             **cast(Mapping[str, object], raw_update),
@@ -211,11 +222,17 @@ async def _plan_checkpoint_channels(
     checkpointer: object,
     config: RunnableConfig,
 ) -> dict[str, object]:
+    """Read the canonical Planning head independently of native checkpoint selection."""
+
     if not isinstance(checkpointer, BaseCheckpointSaver):
         return {}
     saver = cast(_CheckpointSaver, checkpointer)
+    planning_config = cast(RunnableConfig, dict(config))
+    configurable = dict(planning_config.get("configurable", {}))
+    configurable.pop("checkpoint_id", None)
+    planning_config["configurable"] = configurable
     async for checkpoint in saver.alist(
-        config,
+        planning_config,
         filter={"run_id": PLAN_CHECKPOINT_RUN_ID},
         limit=1,
     ):
@@ -249,6 +266,13 @@ def _handoff_text(
     plan: PlanState[PlanContentModel],
     content_binding: PlanContentBinding,
 ) -> str:
+    """Render the deterministic, digest-bound instruction appended to user input.
+
+    The marker lets retries recognize the exact approved handoff. Content is rendered
+    according to the frozen media type and explicitly preserves later Tool-specific
+    review instead of treating Plan approval as blanket execution permission.
+    """
+
     confirmed = plan.confirmed_plan
     handoff = plan.handoff
     if confirmed is None or handoff is None:
@@ -298,6 +322,12 @@ def _handoff_message(
     plan: PlanState[PlanContentModel],
     content_binding: PlanContentBinding,
 ) -> HumanMessage | None:
+    """Append the approved Plan to exactly one checkpointed user message.
+
+    Message ID, digest marker, and original content shape make the operation idempotent.
+    Missing or duplicate targets fail before native state mutation.
+    """
+
     handoff = plan.handoff
     if handoff is None:
         raise RuntimeError("approved Plan state requires handoff metadata")
@@ -358,6 +388,12 @@ def _snapshot_handoff_message(
     *,
     allow_unmarked_original: bool = False,
 ) -> HumanMessage | None:
+    """Verify whether a native checkpoint contains the exact approved handoff.
+
+    ``allow_unmarked_original`` is limited to the pre-update checkpoint used during the
+    atomic handoff transition; every later checkpoint must retain the digest marker.
+    """
+
     handoff = plan.handoff
     if handoff is None:
         raise PlanStateConflictError("approved Plan has no handoff metadata")
@@ -436,6 +472,8 @@ class PlanCapableGraphRuntime:
         planning_factory: Callable[[], PlanningWorkflowGraph[Any]],
         prefer_plan: bool,
     ) -> None:
+        """Bind borrowed native and lazily created Planning graphs to one router."""
+
         self._options = options
         self._content = options.content
         self._native = native
@@ -453,13 +491,18 @@ class PlanCapableGraphRuntime:
         self,
         config: RunnableConfig,
         role: str,
+        *,
+        subgraphs: bool = False,
     ) -> StateSnapshot:
         """Read an exact native or Planning checkpoint for lineage validation."""
 
         if role == NATIVE_CHECKPOINT_ROLE:
-            return await self._native.aget_state(config)
+            return await self._native.aget_state(config, subgraphs=subgraphs)
         if role == PLANNING_CHECKPOINT_ROLE:
-            return await self._planning_factory().aget_state(config)
+            return await self._planning_factory().aget_state(
+                config,
+                subgraphs=subgraphs,
+            )
         raise PlanStateConflictError("checkpoint lineage has an unknown graph role")
 
     def astream(
@@ -479,6 +522,13 @@ class PlanCapableGraphRuntime:
         config = _config(bound)
         configurable = config.get("configurable", {})
         lineage_required = RUN_ID_METADATA_KEY in configurable
+        runtime_profile = configurable.get(RUNTIME_PROFILE_METADATA_KEY)
+        if lineage_required and (
+            not isinstance(runtime_profile, str) or not runtime_profile
+        ):
+            raise PlanStateConflictError(
+                "lineage routing requires a canonical Runtime Profile"
+            )
         if (
             not self._prefer_plan
             and not _is_resume_command(graph_input)
@@ -507,6 +557,7 @@ class PlanCapableGraphRuntime:
                 head = await resolve_agui_thread_head(
                     self.checkpointer,
                     thread_id=thread_id,
+                    runtime_profile=cast(str, runtime_profile),
                 )
                 if head is None:
                     raise PlanStateConflictError(
@@ -790,6 +841,7 @@ class PlanCapableGraphRuntime:
                 self.checkpointer,
                 thread_id=thread_id,
                 run_id=semantic_run_id,
+                runtime_profile=cast(str, runtime_profile),
             )
             native_snapshot = await self._native.aget_state(native_head.config)
         else:

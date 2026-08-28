@@ -1,4 +1,4 @@
-"""Identity-driven Redis coordination composed from the reusable lease lock."""
+"""RunIdentity-driven Redis coordination composed from the reusable lease lock."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from typing import Self
 
 from redis.asyncio import Redis
 
-from tinkerfin_agui_adapter import Identity
+from tinkerfin_contracts import RunIdentity
 
 from ..errors import (
     RedisLeaseError,
@@ -31,6 +31,13 @@ def _coordination_error(
     operation: str,
     error: Exception,
 ) -> RunCoordinationError:
+    """Translate lease failures into the stable coordinator error taxonomy.
+
+    Ownership loss, deadline exhaustion, and backend unavailability remain distinct for
+    host recovery policy. The original lease error and Redis operation stay in trusted
+    diagnostic context rather than client-safe messages.
+    """
+
     diagnostic_context = {"implementation": "redis", "operation": operation}
     if isinstance(error, RunCoordinationError):
         return error
@@ -60,7 +67,7 @@ def _coordination_error(
 
 
 class RedisRunCoordinator:
-    """Serialize Graph runs whose Identity resolves to the same Redis lease key.
+    """Serialize Graph runs whose RunIdentity resolves to the same Redis lease key.
 
     The coordinator deliberately keeps the small `RunCoordinator` extension shape.
     `RedisLeaseLock` owns acquisition, fencing, renewal, cancellation, release, and
@@ -71,8 +78,10 @@ class RedisRunCoordinator:
         self,
         *,
         lease_lock: RedisLeaseLock,
-        key_resolver: Callable[[Identity], str],
+        key_resolver: Callable[[RunIdentity], str],
     ) -> None:
+        """Bind a borrowed lease manager and canonical Run-to-resource resolver."""
+
         if not isinstance(lease_lock, RedisLeaseLock):
             raise TypeError("lease_lock must be a RedisLeaseLock")
         if not callable(key_resolver):
@@ -85,7 +94,7 @@ class RedisRunCoordinator:
         cls,
         client: Redis,
         *,
-        key_resolver: Callable[[Identity], str],
+        key_resolver: Callable[[RunIdentity], str],
         key_prefix: str = _DEFAULT_KEY_PREFIX,
         lease_ttl_seconds: float = _DEFAULT_LEASE_TTL_SECONDS,
         renew_interval_seconds: float | None = None,
@@ -111,7 +120,7 @@ class RedisRunCoordinator:
         cls,
         url: str,
         *,
-        key_resolver: Callable[[Identity], str],
+        key_resolver: Callable[[RunIdentity], str],
         key_prefix: str = _DEFAULT_KEY_PREFIX,
         lease_ttl_seconds: float = _DEFAULT_LEASE_TTL_SECONDS,
         renew_interval_seconds: float | None = None,
@@ -160,15 +169,15 @@ class RedisRunCoordinator:
 
     def __call__(
         self,
-        identity: Identity,
+        identity: RunIdentity,
         /,
     ) -> AbstractAsyncContextManager[None]:
         return self._coordinate(identity)
 
     @asynccontextmanager  # pyright: ignore[reportDeprecated]
-    async def _coordinate(self, identity: Identity) -> AsyncIterator[None]:
-        if not isinstance(identity, Identity):
-            raise TypeError("identity must be an Identity")
+    async def _coordinate(self, identity: RunIdentity) -> AsyncIterator[None]:
+        if not isinstance(identity, RunIdentity):
+            raise TypeError("identity must be a RunIdentity")
         resolved_key = self._key_resolver(identity)
         if not isinstance(resolved_key, str):
             raise TypeError("key_resolver must return a string")

@@ -1,844 +1,280 @@
-import base64
-import json
-from datetime import datetime
+from __future__ import annotations
+
+import asyncio
+from datetime import UTC, datetime
 
 import pytest
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from tinkerfin import Identity
-from tinkerfin_agui_adapter import ScopedIdCodec
-from tinkerfin_studio.api.errors import (
-    BusinessException,
-    ConversationErrorCode,
-    SystemException,
+from tinkerfin_contracts import (
+    NativeMessageObservation,
+    NativeMessageRecord,
+    RunClosedObservation,
+    RunIdentity,
+    RunInputObservation,
+    RunObservationSession,
+    RunSourceContext,
+    RunStartedObservation,
+    RunTerminalObservation,
 )
-from tinkerfin_studio.conversation.coordinator import (
-    ConversationProjectionCoordinator,
-)
+from tinkerfin_studio.api.errors import BusinessException, ConversationErrorCode
 from tinkerfin_studio.conversation.history import ConversationHistoryService
-from tinkerfin_studio.conversation.models import ConversationInterrupt
 from tinkerfin_studio.conversation.repository import ConversationRepository
-from tinkerfin_studio.conversation.snapshot import empty_snapshot
-from tinkerfin_studio.infrastructure.database import Database
+from tinkerfin_tracing import Tracer
 
 
-@pytest.mark.parametrize(
-    "payload",
-    [
-        {"pinned": "false", "updatedAt": "2026-08-18T10:00:00", "id": 1},
-        {"pinned": False, "updatedAt": "2026-08-18T10:00:00+08:00", "id": 1},
-        {"pinned": False, "updatedAt": "2026-08-18T10:00:00", "id": "1"},
-        {"pinned": False, "updatedAt": "2026-08-18T10:00:00", "id": 1, "extra": True},
-    ],
-)
-def test_history_cursor_rejects_noncanonical_payloads(
-    payload: dict[str, object],
-) -> None:
-    """游标字段不得通过宽松类型转换或额外字段进入查询"""
-
-    cursor = base64.urlsafe_b64encode(
-        json.dumps(payload, separators=(",", ":")).encode()
-    ).decode()
-
-    with pytest.raises(BusinessException):
-        ConversationHistoryService._decode_cursor(cursor)
-
-
-def test_history_cursor_rejects_a_different_search_query() -> None:
-    """搜索游标不得被其他查询词复用"""
-
-    cursor = base64.urlsafe_b64encode(
-        json.dumps(
-            {
-                "pinned": False,
-                "updatedAt": "2026-08-18T10:00:00",
-                "id": 1,
-                "query": "目标",
-            },
-            separators=(",", ":"),
-        ).encode()
-    ).decode()
-
-    with pytest.raises(BusinessException):
-        ConversationHistoryService._decode_cursor(cursor, query="其他")
-
-
-def test_history_group_config_exposes_server_day_ranges() -> None:
-    """前端时间分组只消费服务端公开的有序范围"""
-
-    assert ConversationHistoryService.group_config().day_ranges == [7, 30]
-
-
-@pytest.mark.parametrize(
-    ("reasons", "expected_kind"),
-    (
-        ((), None),
-        (("tool_call",), "tool_approval"),
-        (("tool_call", "tool_call"), "tool_approval"),
-        (("tinkerfin:plan_clarification",), "plan_clarification"),
-        (("tinkerfin:plan_review",), "plan_review"),
-    ),
-)
-async def test_history_list_exposes_pending_interaction_kind(
-    session: AsyncSession,
-    reasons: tuple[str, ...],
-    expected_kind: str | None,
-) -> None:
-    """列表摘要必须携带无需详情水化即可展示的待处理交互类型"""
-
-    repository = ConversationRepository(session)
-    thread = await repository.create_thread(
-        user_id=7,
-        thread_id=f"thread-pending-kind-{expected_kind or 'none'}-{len(reasons)}",
-        title="待处理类型摘要",
-        model_id="main",
-    )
-    if reasons:
-        snapshot = empty_snapshot()
-        snapshot["snapshotSeq"] = 1
-        snapshot["runStatus"] = "waiting_approval"
-        snapshot["interrupts"] = [
-            {"id": f"interrupt-{index}", "reason": reason}
-            for index, reason in enumerate(reasons)
-        ]
-        thread.status = "waiting_approval"
-        thread.last_seq = 1
-        thread.snapshot_seq = 1
-        thread.has_pending_interrupt = True
-        thread.snapshot_json = snapshot
-    await repository.commit()
-
-    service = ConversationHistoryService(
-        repository,
-        user_id=7,
-        projector=ConversationProjectionCoordinator.__new__(
-            ConversationProjectionCoordinator
-        ),
-    )
-
-    response = await service.list_history(page_size=10, cursor=None)
-
-    assert len(response.items) == 1
-    assert response.items[0].pending_interaction_kind == expected_kind
-    assert response.items[0].model_dump(by_alias=True)["pendingInteractionKind"] == (
-        expected_kind
+def _context(thread_id: str, run_id: str) -> RunSourceContext:
+    return RunSourceContext(
+        identity=RunIdentity(threadId=thread_id, runId=run_id),
+        runtime_profile="deepagents-v2",
+        input_kind="ordinary",
+        input={
+            "messages": [
+                {
+                    "id": f"user-{run_id}",
+                    "role": "user",
+                    "content": f"request {run_id}",
+                }
+            ]
+        },
+        config={},
     )
 
 
-@pytest.mark.parametrize(
-    "reasons",
-    (
-        ("unknown",),
-        ("tool_call", "tinkerfin:plan_clarification"),
-        ("tinkerfin:plan_clarification", "tinkerfin:plan_review"),
-        ("tinkerfin:plan_review", "tinkerfin:plan_review"),
-    ),
-)
-async def test_history_list_rejects_ambiguous_pending_interaction_kind(
-    session: AsyncSession,
-    reasons: tuple[str, ...],
-) -> None:
-    """损坏或混合的 pending 组不得被列表摘要猜测成任一交互"""
-
-    repository = ConversationRepository(session)
-    thread = await repository.create_thread(
-        user_id=7,
-        thread_id=f"thread-invalid-pending-kind-{len(reasons)}-{'-'.join(reasons)}",
-        title="无效待处理类型",
-        model_id="main",
-    )
-    snapshot = empty_snapshot()
-    snapshot["snapshotSeq"] = 1
-    snapshot["runStatus"] = "waiting_approval"
-    snapshot["interrupts"] = [
-        {"id": f"interrupt-{index}", "reason": reason}
-        for index, reason in enumerate(reasons)
-    ]
-    thread.status = "waiting_approval"
-    thread.last_seq = 1
-    thread.snapshot_seq = 1
-    thread.has_pending_interrupt = True
-    thread.snapshot_json = snapshot
-    await repository.commit()
-
-    service = ConversationHistoryService(
-        repository,
-        user_id=7,
-        projector=ConversationProjectionCoordinator.__new__(
-            ConversationProjectionCoordinator
-        ),
-    )
-
-    with pytest.raises(SystemException) as captured:
-        await service.list_history(page_size=10, cursor=None)
-
-    assert captured.value.error_code is ConversationErrorCode.HISTORY_SCHEMA_MISMATCH
-
-
-async def test_list_threads_pages_across_pinned_and_recent_groups(
-    session: AsyncSession,
-) -> None:
-    """布尔置顶排序的游标必须稳定跨越置顶与普通会话"""
-
-    repository = ConversationRepository(session)
-    values = (
-        ("thread-pinned-new", True, datetime(2026, 8, 18, 12, 0)),
-        ("thread-pinned-old", True, datetime(2026, 8, 18, 11, 0)),
-        ("thread-recent-new", False, datetime(2026, 8, 18, 13, 0)),
-        ("thread-recent-old", False, datetime(2026, 8, 18, 10, 0)),
-    )
-    for thread_id, pinned, updated_at in values:
-        thread = await repository.create_thread(
-            user_id=7,
-            thread_id=thread_id,
-            title=thread_id,
-            model_id="main",
+async def _open_trace(
+    tracer: Tracer,
+    *,
+    thread_id: str,
+    run_id: str,
+) -> tuple[RunSourceContext, RunObservationSession]:
+    context = _context(thread_id, run_id)
+    session = await tracer.open_run(context)
+    now = datetime.now(UTC)
+    await session.observe(
+        RunStartedObservation(
+            identity=context.identity,
+            observed_at=now,
+            monotonic_ns=1,
         )
-        thread.pinned = pinned
-        thread.updated_at = updated_at
-    await repository.commit()
-
-    first_page_with_lookahead = await repository.list_threads(
-        user_id=7,
-        page_size=2,
-        cursor=None,
     )
-    first_page = first_page_with_lookahead[:2]
-    assert [thread.thread_id for thread in first_page] == [
-        "thread-pinned-new",
-        "thread-pinned-old",
-    ]
-
-    page_tail = first_page[-1]
-    second_page = await repository.list_threads(
-        user_id=7,
-        page_size=2,
-        cursor=(page_tail.pinned, page_tail.updated_at, page_tail.id),
+    await session.observe(
+        RunInputObservation(
+            identity=context.identity,
+            source=context,
+            observed_at=now,
+            monotonic_ns=2,
+        )
     )
-
-    assert [thread.thread_id for thread in second_page] == [
-        "thread-recent-new",
-        "thread-recent-old",
-    ]
+    return context, session
 
 
-async def test_list_threads_searches_a_literal_title_substring_for_current_user(
-    session: AsyncSession,
+async def _finish_trace(
+    context: RunSourceContext,
+    session: RunObservationSession,
 ) -> None:
-    """标题模糊查询必须限制用户并把 SQL 通配符作为普通字符"""
-
-    repository = ConversationRepository(session)
-    values = (
-        (7, "thread-percent", "进度 100% 完成"),
-        (7, "thread-target", "服务端目标会话"),
-        (7, "thread-other", "其他会话"),
-        (8, "thread-other-user", "服务端目标会话"),
+    now = datetime.now(UTC)
+    await session.observe(
+        RunTerminalObservation(
+            identity=context.identity,
+            outcome="succeeded",
+            observed_at=now,
+            monotonic_ns=90,
+        )
     )
-    for user_id, thread_id, title in values:
-        await repository.create_thread(
+    await session.observe(
+        RunClosedObservation(
+            identity=context.identity,
+            outcome="succeeded",
+            observed_at=now,
+            monotonic_ns=91,
+        )
+    )
+    await session.aclose()
+
+
+async def _register(
+    repository: ConversationRepository,
+    *,
+    user_id: int,
+    thread_id: str,
+    run_id: str,
+):
+    thread = await repository.get_thread(user_id=user_id, thread_id=thread_id)
+    if thread is None:
+        thread = await repository.create_thread(
             user_id=user_id,
             thread_id=thread_id,
-            title=title,
-            model_id="main",
+            title="Trace 会话",
+            model_id="model-main",
         )
+    await repository.create_run_registration(
+        thread_id=thread.id,
+        run_id=run_id,
+        parent_run_id=thread.last_run_id,
+        model_id="model-main",
+        runtime_profile="deepagents-v2",
+        input_json={"runId": run_id},
+        config_json={"runtimeProfile": "deepagents-v2"},
+    )
+    thread.last_run_id = run_id
+    thread.last_model = "model-main"
     await repository.commit()
-
-    literal_percent = await repository.list_threads(
-        user_id=7,
-        page_size=10,
-        cursor=None,
-        query="%",
-    )
-    target = await repository.list_threads(
-        user_id=7,
-        page_size=10,
-        cursor=None,
-        query="目标",
-    )
-
-    assert [thread.thread_id for thread in literal_percent] == ["thread-percent"]
-    assert [thread.thread_id for thread in target] == ["thread-target"]
+    return thread
 
 
-async def test_get_detail_releases_read_transaction_before_projection(
-    session: AsyncSession,
+async def test_history_reads_fixed_trace_view_without_agui_event_tail(
+    session,
 ) -> None:
-    """历史追赶属于外部 I/O，不得继承归属查询的隐式事务"""
-
+    tracer = Tracer()
     repository = ConversationRepository(session)
-    thread = await repository.create_thread(
-        user_id=7,
-        thread_id="thread-history-transaction",
-        title="事务边界",
-        model_id="main",
+    thread = await _register(
+        repository,
+        user_id=1,
+        thread_id="thread-history",
+        run_id="run-history",
     )
-    await repository.commit()
-    transaction_states: list[bool] = []
-
-    class TransactionCheckingProjector(ConversationProjectionCoordinator):
-        def __init__(self) -> None:
-            pass
-
-        async def reconcile(self, *, thread_pk: int, identity: Identity) -> int:
-            assert thread_pk == thread.id
-            del identity
-            transaction_states.append(session.in_transaction())
-            return 0
+    context, trace_session = await _open_trace(
+        tracer,
+        thread_id=thread.thread_id,
+        run_id="run-history",
+    )
+    await trace_session.observe(
+        NativeMessageObservation(
+            identity=context.identity,
+            namespace=(),
+            message=NativeMessageRecord(
+                message_type="assistant",
+                id="assistant-history",
+                content="answer",
+            ),
+            observed_at=datetime.now(UTC),
+            monotonic_ns=3,
+        )
+    )
+    await _finish_trace(context, trace_session)
 
     detail = await ConversationHistoryService(
         repository,
-        user_id=7,
-        projector=TransactionCheckingProjector(),
+        user_id=1,
+        tracer=tracer,
     ).get_detail(thread.thread_id)
+    payload = detail.model_dump(mode="json", by_alias=True)
 
-    assert detail.thread_id == thread.thread_id
-    assert transaction_states == [False]
-
-
-@pytest.mark.parametrize(
-    ("before_status", "after_status", "after_run_status", "has_pending"),
-    (
-        ("idle", "running", "streaming", False),
-        ("running", "waiting_approval", "waiting_approval", True),
-        ("waiting_approval", "idle", "idle", False),
-    ),
-)
-async def test_get_detail_reloads_thread_after_independent_projection(
-    database: Database,
-    before_status: str,
-    after_status: str,
-    after_run_status: str,
-    has_pending: bool,
-) -> None:
-    """独立投影提交后详情必须返回同一份最新 thread 与 snapshot 事实"""
-
-    old_interrupt_id = "interrupt-before"
-    async with database.session() as session:
-        repository = ConversationRepository(session)
-        thread = await repository.create_thread(
-            user_id=7,
-            thread_id=f"thread-reload-{before_status}-{after_status}",
-            title="投影后重载",
-            model_id="main",
-        )
-        before_snapshot = empty_snapshot()
-        before_snapshot["snapshotSeq"] = 7
-        before_snapshot["runStatus"] = (
-            "streaming" if before_status == "running" else before_status
-        )
-        before_snapshot["activeRunId"] = (
-            "run-before" if before_status == "running" else None
-        )
-        if before_status == "waiting_approval":
-            before_interrupt = {
-                "id": old_interrupt_id,
-                "reason": "tinkerfin:plan_review",
-                "message": "确认旧 Plan",
-            }
-            before_snapshot["interrupts"] = [before_interrupt]
-            created_at = datetime(2026, 8, 22, 1, 0)
-            session.add(
-                ConversationInterrupt(
-                    conversation_thread_id=thread.id,
-                    run_id="run-before",
-                    resolved_run_id=None,
-                    interrupt_id=old_interrupt_id,
-                    status="pending",
-                    reason="tinkerfin:plan_review",
-                    message="确认旧 Plan",
-                    request_json=before_interrupt,
-                    resume_json=None,
-                    created_at=created_at,
-                    resolved_at=None,
-                    updated_at=created_at,
-                )
-            )
-        thread.status = before_status
-        thread.last_run_id = "run-before"
-        thread.last_seq = 7
-        thread.snapshot_seq = 7
-        thread.has_pending_interrupt = before_status == "waiting_approval"
-        thread.snapshot_json = before_snapshot
-        await repository.commit()
-        thread_pk = thread.id
-
-        class IndependentProjector(ConversationProjectionCoordinator):
-            def __init__(self) -> None:
-                pass
-
-            async def reconcile(
-                self,
-                *,
-                thread_pk: int,
-                identity: Identity,
-            ) -> int:
-                del identity
-                async with database.session() as projected_session:
-                    projected_repository = ConversationRepository(projected_session)
-                    projected = await projected_repository.get_thread_by_pk(thread_pk)
-                    assert projected is not None
-                    existing = await projected_session.scalar(
-                        select(ConversationInterrupt).where(
-                            ConversationInterrupt.conversation_thread_id == thread_pk,
-                            ConversationInterrupt.interrupt_id == old_interrupt_id,
-                        )
-                    )
-                    if existing is not None:
-                        existing.status = "resolved"
-                        existing.resolved_at = datetime(2026, 8, 22, 1, 1)
-                        existing.updated_at = datetime(2026, 8, 22, 1, 1)
-
-                    after_snapshot = empty_snapshot()
-                    after_snapshot["snapshotSeq"] = 8
-                    after_snapshot["runStatus"] = after_run_status
-                    after_snapshot["activeRunId"] = (
-                        "run-after" if after_status == "running" else None
-                    )
-                    if has_pending:
-                        pending_interrupt = {
-                            "id": "interrupt-after",
-                            "reason": "tinkerfin:plan_review",
-                            "message": "确认新 Plan",
-                        }
-                        after_snapshot["interrupts"] = [pending_interrupt]
-                        created_at = datetime(2026, 8, 22, 1, 1)
-                        projected_session.add(
-                            ConversationInterrupt(
-                                conversation_thread_id=thread_pk,
-                                run_id="run-after",
-                                resolved_run_id=None,
-                                interrupt_id="interrupt-after",
-                                status="pending",
-                                reason="tinkerfin:plan_review",
-                                message="确认新 Plan",
-                                request_json=pending_interrupt,
-                                resume_json=None,
-                                created_at=created_at,
-                                resolved_at=None,
-                                updated_at=created_at,
-                            )
-                        )
-                    projected.status = after_status
-                    projected.last_run_id = "run-after"
-                    projected.last_seq = 8
-                    projected.snapshot_seq = 8
-                    projected.has_pending_interrupt = has_pending
-                    projected.snapshot_json = after_snapshot
-                    await projected_session.commit()
-                return 8
-
-        detail = await ConversationHistoryService(
-            repository,
-            user_id=7,
-            projector=IndependentProjector(),
-        ).get_detail(thread.thread_id)
-
-        assert detail.last_seq == 8
-        assert detail.snapshot_seq == 8
-        assert detail.snapshot is not None
-        assert detail.snapshot["snapshotSeq"] == 8
-        assert detail.status == after_status
-        assert detail.has_pending_interrupt is has_pending
-        assert detail.pending_interaction_kind == (
-            "plan_review" if has_pending else None
-        )
-        assert detail.last_run_id == "run-after"
-
-        async with database.session() as verification_session:
-            stored = await ConversationRepository(
-                verification_session
-            ).get_thread_by_pk(thread_pk)
-            assert stored is not None
-            assert stored.last_seq == 8
-            assert stored.snapshot_seq == 8
-            assert stored.snapshot_json == detail.snapshot
-            assert stored.snapshot_json is not None
-            assert stored.snapshot_json["snapshotSeq"] == stored.snapshot_seq
+    assert detail.head_run_id == "run-history"
+    assert detail.status.execution == "succeeded"
+    assert [(item.role, item.content) for item in detail.messages] == [
+        ("user", "request run-history"),
+        ("assistant", "answer"),
+    ]
+    assert detail.message_count == 2
+    assert "snapshot" not in payload
+    assert "events" not in payload
 
 
-async def test_stale_history_reader_cannot_overwrite_new_projection(
-    database: Database,
-) -> None:
-    """旧 Session 的历史修复不得覆盖并发 projector 已提交的新快照"""
-
-    async with database.session() as stale_session:
-        stale_repository = ConversationRepository(stale_session)
-        thread = await stale_repository.create_thread(
-            user_id=7,
-            thread_id="thread-history-repair-race",
-            title="历史修复竞态",
-            model_id="main",
-        )
-        old_snapshot = empty_snapshot()
-        old_snapshot.update(
-            {
-                "snapshotSeq": 7,
-                "messages": [{"id": "message-old", "role": "assistant"}],
-                "todos": [{"id": "todo-old", "status": "pending"}],
-                "approval": {"items": [{"id": "interrupt-old"}]},
-                "interrupts": [{"id": "interrupt-old"}],
-                "activeRunId": "run-old",
-                "runStatus": "waiting_approval",
-            }
-        )
-        thread.last_seq = 7
-        thread.snapshot_seq = 7
-        thread.snapshot_json = old_snapshot
-        thread.status = "waiting_approval"
-        thread.has_pending_interrupt = True
-        await stale_repository.commit()
-
-        stale_thread = await stale_repository.get_thread_by_pk(thread.id)
-        assert stale_thread is not None
-        expected_snapshot = empty_snapshot()
-        expected_snapshot.update(
-            {
-                "snapshotSeq": 8,
-                "messages": [{"id": "message-new", "role": "assistant"}],
-                "todos": [{"id": "todo-new", "status": "running"}],
-                "approval": None,
-                "interrupts": [],
-                "activeRunId": "run-new",
-                "runStatus": "streaming",
-            }
-        )
-
-        async with database.session() as projected_session:
-            projected_repository = ConversationRepository(projected_session)
-            projected = await projected_repository.get_thread_by_pk(thread.id)
-            assert projected is not None
-            projected.last_seq = 8
-            projected.snapshot_seq = 8
-            projected.snapshot_json = expected_snapshot
-            projected.status = "running"
-            projected.has_pending_interrupt = False
-            await projected_repository.commit()
-
-        class NoopProjector(ConversationProjectionCoordinator):
-            def __init__(self) -> None:
-                pass
-
-            async def reconcile(self, *, thread_pk: int, identity: Identity) -> int:
-                del identity
-                assert thread_pk == stale_thread.id
-                return 8
-
-        detail = await ConversationHistoryService(
-            stale_repository,
-            user_id=7,
-            projector=NoopProjector(),
-        ).get_detail(stale_thread.thread_id)
-        assert detail.snapshot == expected_snapshot
-
-    async with database.session() as verification_session:
-        stored = await ConversationRepository(verification_session).get_thread_by_pk(
-            thread.id
-        )
-        assert stored is not None
-        assert stored.snapshot_seq == 8
-        assert stored.snapshot_json is not None
-        assert stored.snapshot_json["snapshotSeq"] == stored.snapshot_seq
-        assert stored.snapshot_json == expected_snapshot
-        assert stored.status == "running"
-        assert stored.has_pending_interrupt is False
-
-
-@pytest.mark.parametrize(
-    ("snapshot_seq", "snapshot_json"),
-    (
-        (1, None),
-        (1, {"snapshotVersion": 3, "snapshotSeq": 1}),
-        (1, {"snapshotSeq": 0}),
-    ),
-)
-async def test_get_detail_rejects_noncurrent_or_inconsistent_snapshot(
-    database: Database,
-    snapshot_seq: int,
-    snapshot_json: dict[str, object] | None,
-) -> None:
-    """历史详情不得把旧字段或序号矛盾的快照降级为事件回放"""
-
-    async with database.session() as session:
-        repository = ConversationRepository(session)
-        thread = await repository.create_thread(
-            user_id=7,
-            thread_id=f"thread-invalid-snapshot-{snapshot_json}",
-            title="无效快照",
-            model_id="main",
-        )
-        thread.last_seq = snapshot_seq
-        thread.snapshot_seq = snapshot_seq
-        thread.snapshot_json = snapshot_json
-        await repository.commit()
-        thread_pk = thread.id
-
-        class NoopProjector(ConversationProjectionCoordinator):
-            def __init__(self) -> None:
-                pass
-
-            async def reconcile(self, *, thread_pk: int, identity: Identity) -> int:
-                del identity
-                assert thread_pk == thread.id
-                return snapshot_seq
-
-        with pytest.raises(SystemException) as captured:
-            await ConversationHistoryService(
-                repository,
-                user_id=7,
-                projector=NoopProjector(),
-            ).get_detail(thread.thread_id)
-
-        assert (
-            captured.value.error_code is ConversationErrorCode.HISTORY_SCHEMA_MISMATCH
-        )
-
-    async with database.session() as verification_session:
-        stored = await ConversationRepository(verification_session).get_thread_by_pk(
-            thread_pk
-        )
-        assert stored is not None
-        assert stored.snapshot_seq == snapshot_seq
-        assert stored.snapshot_json == snapshot_json
-
-
-async def test_get_detail_does_not_reinterpret_persisted_tool_approval(
-    session: AsyncSession,
-) -> None:
-    """历史查询只返回当前快照契约，不从 interrupt 表重建旧数据"""
-
+async def test_history_cursor_keeps_original_as_of_after_new_turn(session) -> None:
+    tracer = Tracer()
     repository = ConversationRepository(session)
-    thread = await repository.create_thread(
-        user_id=7,
-        thread_id="thread-history-repair",
-        title="历史审批修复",
-        model_id="main",
+    thread = await _register(
+        repository,
+        user_id=1,
+        thread_id="thread-cursor",
+        run_id="run-first",
     )
-    original_args = {
-        "file_path": "/history-result.txt",
-        "content": "HISTORY_APPROVAL_OK",
-    }
-    request_json = {
-        "id": "history-interrupt#0",
-        "reason": "tool_call",
-        "message": "确认历史写入",
-        "toolCallId": ScopedIdCodec().encode("tool", (), "history-tool-call"),
-        "metadata": {
-            "langgraphValue": {
-                "action_requests": [{"name": "write_file", "args": original_args}],
-                "review_configs": [
-                    {
-                        "action_name": "write_file",
-                        "allowed_decisions": ["approve", "edit", "reject"],
-                    }
-                ],
-            },
-            "deepagents": {
-                "schema": "tinkerfin.deepagents.tool-review",
-                "nativeInterruptId": "history-interrupt#0",
-                "actionIndex": 0,
-                "toolName": "write_file",
-                "originalArgs": original_args,
-                "allowedDecisions": ["approve", "edit", "reject"],
-            },
-        },
-    }
-    thread.status = "waiting_approval"
-    thread.last_seq = 7
-    thread.snapshot_seq = 7
-    thread.has_pending_interrupt = True
-    persisted_snapshot: dict[str, object] = {
-        "snapshotSeq": 7,
-        "messages": [],
-        "todos": [],
-        "mode": "default",
-        "approval": {
-            "items": [
-                {
-                    "id": "history-interrupt#0",
-                    "interruptId": "history-interrupt#0",
-                    "toolCallId": ScopedIdCodec().encode(
-                        "tool", (), "history-tool-call"
-                    ),
-                    "toolName": "tool",
-                    "params": "{}",
-                    "input": "{}",
-                    "description": "确认历史写入",
-                    "originalArgs": {},
-                    "allowedDecisions": [],
-                }
-            ],
-            "activeIndex": 0,
-            "submitted": False,
-        },
-        "runStatus": "waiting_approval",
-        "activeRunId": None,
-        "serverState": {},
-        "runs": {},
-        "interrupts": [request_json],
-    }
-    thread.snapshot_json = persisted_snapshot
-    created_at = datetime(2026, 8, 18, 1, 0)
-    session.add(
-        ConversationInterrupt(
-            conversation_thread_id=thread.id,
-            run_id="run-interrupted",
-            resolved_run_id=None,
-            interrupt_id="history-interrupt#0",
-            status="pending",
-            reason="tool_call",
-            message="确认历史写入",
-            request_json=request_json,
-            resume_json=None,
-            created_at=created_at,
-            resolved_at=None,
-            updated_at=created_at,
+    first_context, first_session = await _open_trace(
+        tracer,
+        thread_id=thread.thread_id,
+        run_id="run-first",
+    )
+    await _finish_trace(first_context, first_session)
+    service = ConversationHistoryService(repository, user_id=1, tracer=tracer)
+    first = await service.get_detail(thread.thread_id, limit=1)
+    assert first.history_cursor is None
+
+    await _register(
+        repository,
+        user_id=1,
+        thread_id=thread.thread_id,
+        run_id="run-second",
+    )
+    second_context, second_session = await _open_trace(
+        tracer,
+        thread_id=thread.thread_id,
+        run_id="run-second",
+    )
+    await _finish_trace(second_context, second_session)
+    latest = await service.get_detail(thread.thread_id, limit=1)
+
+    assert latest.history_cursor is not None
+    fixed = await service.get_detail(
+        thread.thread_id,
+        history_cursor=latest.history_cursor,
+        limit=1,
+    )
+    assert fixed.as_of_seq == latest.as_of_seq
+    assert fixed.head_run_id == "run-second"
+    assert len(fixed.messages) > len(latest.messages)
+
+
+async def test_history_rejects_another_users_thread_before_trace_lookup(
+    session,
+) -> None:
+    repository = ConversationRepository(session)
+    await _register(
+        repository,
+        user_id=2,
+        thread_id="thread-private",
+        run_id="run-private",
+    )
+    service = ConversationHistoryService(repository, user_id=1, tracer=Tracer())
+
+    with pytest.raises(BusinessException) as captured:
+        await service.get_detail("thread-private")
+
+    assert captured.value.error_code is ConversationErrorCode.NOT_FOUND
+
+
+async def test_trace_follow_sends_snapshot_then_semantic_update_and_closes(
+    session,
+) -> None:
+    tracer = Tracer()
+    repository = ConversationRepository(session)
+    thread = await _register(
+        repository,
+        user_id=1,
+        thread_id="thread-follow",
+        run_id="run-follow",
+    )
+    context, trace_session = await _open_trace(
+        tracer,
+        thread_id=thread.thread_id,
+        run_id="run-follow",
+    )
+    events = await ConversationHistoryService(
+        repository,
+        user_id=1,
+        tracer=tracer,
+    ).follow_trace(thread.thread_id)
+    assert session.in_transaction() is False
+
+    snapshot = await anext(events)
+    assert snapshot.type == "snapshot"
+    assert snapshot.snapshot.status.execution == "running"
+    pending = asyncio.create_task(anext(events))
+    await trace_session.observe(
+        NativeMessageObservation(
+            identity=context.identity,
+            namespace=(),
+            message=NativeMessageRecord(
+                message_type="assistant",
+                id="assistant-follow",
+                content="delta",
+            ),
+            observed_at=datetime.now(UTC),
+            monotonic_ns=3,
         )
     )
-    await repository.commit()
 
-    class NoopProjector(ConversationProjectionCoordinator):
-        def __init__(self) -> None:
-            pass
-
-        async def reconcile(self, *, thread_pk: int, identity: Identity) -> int:
-            assert thread_pk == thread.id
-            del identity
-            return 0
-
-    detail = await ConversationHistoryService(
-        repository,
-        user_id=7,
-        projector=NoopProjector(),
-    ).get_detail(thread.thread_id)
-
-    assert detail.status == "waiting_approval"
-    assert detail.has_pending_interrupt is True
-    assert detail.pending_interaction_kind == "tool_approval"
-    assert detail.snapshot == persisted_snapshot
-    await session.refresh(thread)
-    assert thread.snapshot_json == persisted_snapshot
-
-
-async def test_get_detail_does_not_repair_stale_interrupt_snapshot(
-    session: AsyncSession,
-) -> None:
-    """旧快照不会触发查询时兼容写入"""
-
-    repository = ConversationRepository(session)
-    thread = await repository.create_thread(
-        user_id=7,
-        thread_id="thread-history-clear",
-        title="清理旧审批",
-        model_id="main",
-    )
-    thread.status = "idle"
-    thread.last_seq = 3
-    thread.snapshot_seq = 3
-    thread.has_pending_interrupt = True
-    persisted_snapshot: dict[str, object] = {
-        "snapshotSeq": 3,
-        "messages": [],
-        "todos": [],
-        "mode": "plan",
-        "approval": None,
-        "runStatus": "waiting_approval",
-        "activeRunId": None,
-        "serverState": {},
-        "runs": {},
-        "interrupts": [
-            {
-                "id": "resolved-plan",
-                "reason": "tinkerfin:plan_review",
-                "message": "确认 Plan",
-            }
-        ],
-    }
-    thread.snapshot_json = persisted_snapshot
-    await repository.commit()
-
-    class NoopProjector(ConversationProjectionCoordinator):
-        def __init__(self) -> None:
-            pass
-
-        async def reconcile(self, *, thread_pk: int, identity: Identity) -> int:
-            assert thread_pk == thread.id
-            del identity
-            return 0
-
-    detail = await ConversationHistoryService(
-        repository,
-        user_id=7,
-        projector=NoopProjector(),
-    ).get_detail(thread.thread_id)
-
-    assert detail.status == "idle"
-    assert detail.has_pending_interrupt is True
-    assert detail.snapshot == persisted_snapshot
-    await session.refresh(thread)
-    assert thread.has_pending_interrupt is True
-    assert thread.snapshot_json == persisted_snapshot
-
-
-async def test_get_detail_preserves_running_snapshot_without_pending_interrupts(
-    session: AsyncSession,
-) -> None:
-    """无待审批的活动会话刷新时必须保留续流 run 身份"""
-
-    repository = ConversationRepository(session)
-    thread = await repository.create_thread(
-        user_id=7,
-        thread_id="thread-history-running",
-        title="活动流刷新",
-        model_id="main",
-    )
-    thread.status = "running"
-    thread.last_run_id = "run-history-running"
-    thread.last_seq = 1
-    thread.snapshot_seq = 1
-    thread.has_pending_interrupt = False
-    running_snapshot: dict[str, object] = {
-        "snapshotSeq": 1,
-        "messages": [],
-        "todos": [],
-        "mode": "default",
-        "approval": None,
-        "runStatus": "streaming",
-        "activeRunId": "run-history-running",
-        "serverState": {},
-        "runs": {
-            "run-history-running": {
-                "runId": "run-history-running",
-                "status": "running",
-                "agentType": "main",
-            }
-        },
-        "interrupts": [],
-    }
-    thread.snapshot_json = running_snapshot
-    expected_snapshot = dict(running_snapshot)
-    await repository.commit()
-
-    class NoopProjector(ConversationProjectionCoordinator):
-        def __init__(self) -> None:
-            pass
-
-        async def reconcile(self, *, thread_pk: int, identity: Identity) -> int:
-            assert thread_pk == thread.id
-            del identity
-            return 1
-
-    detail = await ConversationHistoryService(
-        repository,
-        user_id=7,
-        projector=NoopProjector(),
-    ).get_detail(thread.thread_id)
-
-    assert detail.status == "running"
-    assert detail.has_pending_interrupt is False
-    assert detail.snapshot == expected_snapshot
-    assert detail.snapshot is not None
-    assert detail.snapshot["runStatus"] == "streaming"
-    assert detail.snapshot["activeRunId"] == "run-history-running"
-    await session.refresh(thread)
-    assert thread.snapshot_json == expected_snapshot
+    update = await asyncio.wait_for(pending, timeout=2)
+    assert update.type == "update"
+    assert update.update.messages.upserts[0].content == "delta"
+    await events.aclose()
+    await _finish_trace(context, trace_session)

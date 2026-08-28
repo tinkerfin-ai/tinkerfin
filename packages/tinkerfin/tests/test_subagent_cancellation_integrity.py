@@ -25,7 +25,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.errors import NodeCancelledError
 from langgraph.graph import END, START, MessagesState, StateGraph
 
-from tinkerfin import AgUiEventStream, Identity, TinkerFin
+from tinkerfin import AgUiEventStream, RunIdentity, TinkerFin
 
 
 class _ToolBindingFakeModel(FakeMessagesListChatModel):
@@ -117,7 +117,7 @@ async def _run_default_agui(
             checkpointer=InMemorySaver(),
         )
     )
-    identity = Identity(threadId=thread_id, runId=f"run-{thread_id}")
+    identity = RunIdentity(threadId=thread_id, runId=f"run-{thread_id}")
     runtime = definition.new_agui(
         identity=identity,
         mode="default",
@@ -339,7 +339,7 @@ async def test_external_abort_stays_cancelled_and_cleans_the_subagent() -> None:
             checkpointer=InMemorySaver(),
         )
     )
-    identity = Identity(threadId="external-abort", runId="run-external-abort")
+    identity = RunIdentity(threadId="external-abort", runId="run-external-abort")
     runtime = definition.new_agui(
         identity=identity,
         mode="default",

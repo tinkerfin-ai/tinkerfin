@@ -65,7 +65,13 @@ describe('ApprovalCard', () => {
 
     render(<Harness />)
 
-    expect(screen.getByRole('region', { name: '等待审批' })).toHaveTextContent('/first.txt')
+    const card = screen.getByRole('region', { name: '等待审批' })
+    expect(card).toHaveTextContent('/first.txt')
+    expect(card.querySelector('.approval-composer-head')).toHaveTextContent('写入 /first.txt')
+    expect(card.querySelector('.interaction-card-color-bridge.is-warning')).toBeInTheDocument()
+    for (const action of ['允许', '拒绝']) {
+      expect(screen.getByRole('button', { name: action })).toHaveClass('ui-button--capsule')
+    }
     expect(screen.queryByText('1 / 2')).not.toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: '允许' }))
 
@@ -74,6 +80,9 @@ describe('ApprovalCard', () => {
     expect(onSubmit).not.toHaveBeenCalled()
 
     await user.click(screen.getByRole('button', { name: '拒绝' }))
+    for (const action of ['取消', '确认拒绝']) {
+      expect(screen.getByRole('button', { name: action })).toHaveClass('ui-button--capsule')
+    }
     await user.type(screen.getByLabelText('拒绝原因（可选）'), '文件位置不正确')
     await user.click(screen.getByRole('button', { name: '确认拒绝' }))
 
@@ -240,32 +249,25 @@ describe('ApprovalCard', () => {
     expect(screen.queryByRole('button', { name: '编辑' })).not.toBeInTheDocument()
   })
 
-  it('remembers collapse per conversation and restores the current approval card', async () => {
-    const user = userEvent.setup()
+  it('always stays expanded and ignores the removed per-conversation collapse preference', () => {
     const approval: ApprovalState = {
       activeIndex: 0,
       submitted: false,
       items: [approvalItem('collapse', '/collapse.txt')],
     }
     const conversation = conversationWithApproval(approval)
+    window.sessionStorage.setItem('tinkerfin:approval-collapse:thread-approval', 'collapsed')
     const view = render(<ApprovalCard conversation={conversation} onChange={vi.fn()} onSubmit={vi.fn()} />)
 
     expect(screen.getAllByText('写入 /collapse.txt')).toHaveLength(1)
-    expect(screen.getByRole('separator', { name: '调整交互卡片高度' })).toBeInTheDocument()
-
-    for (const toggle of screen.getAllByRole('button', { name: '收起审批卡片' })) {
-      expect(toggle).toHaveAttribute('aria-expanded', 'true')
-    }
-
-    await user.click(screen.getAllByRole('button', { name: '收起审批卡片' }).at(-1)!)
     expect(screen.queryByRole('separator', { name: '调整交互卡片高度' })).not.toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: '允许' })).not.toBeInTheDocument()
-    expect(screen.getByRole('region', { name: '等待审批' })).not.toHaveTextContent('1 / 1')
-    expect(window.sessionStorage.getItem('tinkerfin:approval-collapse:thread-approval'))
-      .toBe('collapsed')
-    for (const toggle of screen.getAllByRole('button', { name: '展开审批卡片' })) {
-      expect(toggle).toHaveAttribute('aria-expanded', 'false')
-    }
+    expect(screen.getByRole('button', { name: '允许' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /展开审批卡片|收起审批卡片/ })).not.toBeInTheDocument()
+    const card = screen.getByRole('region', { name: '等待审批' })
+    expect(card).not.toHaveClass('is-minimized')
+    expect(card.querySelector('.approval-composer-head')).not.toHaveTextContent('等待审批')
+    expect(card.querySelector('.approval-toggle-surface')).not.toBeInTheDocument()
+    expect(card.querySelector('.interaction-card-color-bridge')).toBeInTheDocument()
 
     view.rerender(
       <ApprovalCard
@@ -274,14 +276,8 @@ describe('ApprovalCard', () => {
         onSubmit={vi.fn()}
       />,
     )
-    await waitFor(() => expect(screen.getByRole('button', { name: '允许' })).toBeInTheDocument())
-
-    view.rerender(<ApprovalCard conversation={conversation} onChange={vi.fn()} onSubmit={vi.fn()} />)
-    await waitFor(() => expect(screen.queryByRole('button', { name: '允许' })).not.toBeInTheDocument())
-
-    await user.click(screen.getAllByRole('button', { name: '展开审批卡片' }).at(-1)!)
     expect(screen.getByRole('button', { name: '允许' })).toBeInTheDocument()
-    expect(screen.getByRole('separator', { name: '调整交互卡片高度' })).toBeInTheDocument()
+    expect(screen.queryByRole('separator', { name: '调整交互卡片高度' })).not.toBeInTheDocument()
   })
 
   it('announces an error and exposes an explicit retry for a completed group', () => {

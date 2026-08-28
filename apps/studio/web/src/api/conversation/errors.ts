@@ -6,7 +6,7 @@ const conversationErrorMessageKeys = {
   stream_event_invalid: '实时输出事件格式不正确，请重试',
   stream_body_missing: '实时输出连接没有返回数据，请重试',
   stream_disconnected: '实时输出连接意外中断，请重试',
-  stream_recovery_failed: '实时事件恢复失败，请重试',
+  stream_recovery_failed: '会话 Trace 恢复失败，请重试',
   stream_sequence_invalid: '实时事件顺序异常，请重试',
   state_patch_invalid: '会话状态更新失败，请重试',
   run_request_failed: '对话请求失败，请重试',

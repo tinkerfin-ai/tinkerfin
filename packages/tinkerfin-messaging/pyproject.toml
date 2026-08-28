@@ -16,16 +16,18 @@ classifiers = [
 ]
 
 dependencies = [
-    "ag-ui-protocol==0.1.19",
     "pydantic>=2,<3",
-    "tinkerfin>=0.1.0,<0.9.0",
+    "tinkerfin-contracts>=0.1.0,<0.9.0",
 ]
 
 [project.optional-dependencies]
 redis = ["redis>=6,<9"]
+agui = ["ag-ui-protocol==0.1.19"]
+native = ["tinkerfin-native-stream>=0.1.0,<0.9.0"]
 
 [tool.uv.sources]
-tinkerfin = { workspace = true }
+tinkerfin-contracts = { workspace = true }
+tinkerfin-native-stream = { workspace = true }
 
 [project.urls]
 Homepage = "https://github.com/tinkerfin-ai/tinkerfin"

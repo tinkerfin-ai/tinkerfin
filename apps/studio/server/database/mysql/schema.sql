@@ -21,6 +21,7 @@ CREATE TABLE agent_models (
   base_url VARCHAR(1024) NOT NULL COMMENT '模型服务 API 基础地址',
   api_key TEXT NOT NULL COMMENT '模型服务明文 API 密钥，禁止通过接口或日志暴露',
   reasoning_enabled BOOL NOT NULL COMMENT '是否启用已验证的 provider reasoning 参数',
+  runtime_profile VARCHAR(128) NOT NULL COMMENT 'Worker 创建与恢复 Run 使用的 Runtime Profile',
   enabled BOOL NOT NULL COMMENT '是否允许创建新 run',
   is_default BOOL NOT NULL COMMENT '是否为前端默认模型，由应用事务保证唯一',
   sort_order INTEGER NOT NULL COMMENT '模型目录升序排序值',
@@ -35,94 +36,165 @@ CREATE TABLE agent_models (
 CREATE TABLE conversation_threads (
   id BIGINT NOT NULL AUTO_INCREMENT COMMENT '会话主键',
   user_id BIGINT NOT NULL COMMENT '所属用户 ID，由应用层保证存在',
-  thread_id VARCHAR(128) NOT NULL COMMENT '外部 AG-UI threadId',
+  thread_id VARCHAR(128) NOT NULL COMMENT '公开 AG-UI 与 Trace 共用的 threadId',
   title VARCHAR(255) NOT NULL COMMENT '会话标题',
-  status VARCHAR(32) NOT NULL COMMENT '会话状态：idle/running/waiting_approval/error/deleting',
-  last_run_id VARCHAR(128) COMMENT '最近主 run ID',
-  last_model VARCHAR(64) COMMENT '最近主 run 使用的稳定模型 ID',
-  last_seq BIGINT NOT NULL COMMENT 'Messaging 会话流最新已投影序号',
-  snapshot_seq BIGINT NOT NULL COMMENT '当前快照覆盖到的序号',
-  message_count INTEGER NOT NULL COMMENT 'user 与 assistant 消息数量',
-  tool_call_count INTEGER NOT NULL COMMENT 'Tool 调用开始事件累计数',
-  has_pending_interrupt BOOL NOT NULL COMMENT '是否存在待处理审批',
+  status VARCHAR(32) NOT NULL COMMENT '列表状态：idle/running/waiting_approval/error/deleting',
+  last_run_id VARCHAR(128) COMMENT '最近主 Run ID',
+  last_model VARCHAR(64) COMMENT '最近主 Run 使用的稳定模型 ID',
+  message_count INTEGER NOT NULL COMMENT 'Trace 中 user 与 assistant 消息数',
+  tool_call_count INTEGER NOT NULL COMMENT 'Trace 中 Tool proposal 数',
+  has_pending_interrupt BOOL NOT NULL COMMENT 'Trace 是否存在待处理交互',
+  pending_interaction_kind VARCHAR(64) COMMENT 'Trace 待处理交互的产品类型',
   pinned BOOL NOT NULL COMMENT '是否置顶',
-  snapshot_json JSON COMMENT '按 snapshot_seq 生成的完整前端恢复快照',
   created_at DATETIME NOT NULL COMMENT '创建时间',
-  updated_at DATETIME NOT NULL COMMENT '更新时间',
+  updated_at DATETIME NOT NULL COMMENT '最近 Trace 或用户会话活动时间',
   deleted_at DATETIME COMMENT '软删除时间',
   CONSTRAINT pk_conversation_threads PRIMARY KEY (id),
   CONSTRAINT uq_conversation_threads_thread UNIQUE (thread_id),
   KEY ix_conversation_threads_user_pinned_updated (user_id, deleted_at, pinned, updated_at, id),
   KEY ix_conversation_threads_user_status_updated (user_id, status, updated_at, id),
   KEY ix_conversation_threads_user_updated (user_id, deleted_at, updated_at, id)
-) COMMENT='用户会话元信息与最新可信前端快照';
+) COMMENT='用户会话归属、产品控制与 Trace 列表摘要';
 
-CREATE TABLE conversation_runs (
-  id BIGINT NOT NULL AUTO_INCREMENT COMMENT 'run 投影主键',
+CREATE TABLE conversation_run_registrations (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT 'Run 注册主键',
   conversation_thread_id BIGINT NOT NULL COMMENT '所属会话主键，由应用层保证存在',
-  run_id VARCHAR(128) NOT NULL COMMENT '主请求 runId 或 subagentInvocationId',
-  parent_run_id VARCHAR(128) COMMENT '标准 AG-UI parentRunId',
-  origin_main_run_id VARCHAR(128) COMMENT '首次发现子执行的主请求 run ID',
-  last_main_run_id VARCHAR(128) COMMENT '最近承载子执行事件的主请求 run ID',
-  agent_type VARCHAR(32) NOT NULL COMMENT '运行主体：main 或 subagent',
-  agent_name VARCHAR(128) COMMENT '运行主体名称',
-  graph_task_id VARCHAR(128) COMMENT '子图 runtime task ID',
-  model_id VARCHAR(64) COMMENT '主 run 使用的稳定模型 ID',
-  status VARCHAR(32) NOT NULL COMMENT 'run 状态：preparing/running/success/interrupt/error/cancelled',
-  input_json JSON COMMENT '主 run 的完整请求输入',
-  config_json JSON COMMENT 'checkpoint、模型与 resume 配置投影',
-  outcome_json JSON COMMENT '最终 AG-UI outcome 或 error',
-  started_at DATETIME NOT NULL COMMENT '开始时间',
-  finished_at DATETIME COMMENT '结束时间',
+  run_id VARCHAR(128) NOT NULL COMMENT '公开且幂等的主 Run ID',
+  parent_run_id VARCHAR(128) COMMENT 'branch 或 resume 来源 Run ID',
+  model_id VARCHAR(64) NOT NULL COMMENT '主 Run 使用的稳定模型 ID',
+  runtime_profile VARCHAR(128) NOT NULL COMMENT '主 Run 固定使用的 Runtime Profile',
+  status VARCHAR(32) NOT NULL COMMENT 'preparing/starting/running/waiting/succeeded/failed/cancelled/abandoned',
+  input_json JSON NOT NULL COMMENT '用于同 runId 幂等核验的标准请求',
+  config_json JSON NOT NULL COMMENT '模型与 Runtime Profile 的业务配置快照',
+  terminal_outcome VARCHAR(32) COMMENT 'Trace 终态结果',
+  error_code VARCHAR(128) COMMENT '客户端安全的终态错误码',
+  started_at DATETIME NOT NULL COMMENT '请求注册时间',
+  finished_at DATETIME COMMENT 'Trace 终态时间',
   created_at DATETIME NOT NULL COMMENT '创建时间',
-  updated_at DATETIME NOT NULL COMMENT '更新时间',
-  CONSTRAINT pk_conversation_runs PRIMARY KEY (id),
-  CONSTRAINT uq_conversation_runs_thread_run UNIQUE (conversation_thread_id, run_id),
-  KEY ix_conversation_runs_thread_last_main_status (conversation_thread_id, last_main_run_id, status),
-  KEY ix_conversation_runs_thread_started (conversation_thread_id, started_at, id),
-  KEY ix_conversation_runs_thread_status (conversation_thread_id, status, updated_at)
-) COMMENT='主 Agent 与子 Agent 运行投影';
+  updated_at DATETIME NOT NULL COMMENT '最近业务状态更新时间',
+  CONSTRAINT pk_conversation_run_registrations PRIMARY KEY (id),
+  CONSTRAINT uq_conversation_run_registrations_thread_run UNIQUE (conversation_thread_id, run_id),
+  KEY ix_conversation_run_registrations_thread_started (conversation_thread_id, started_at, id),
+  KEY ix_conversation_run_registrations_thread_status (conversation_thread_id, status, updated_at)
+) COMMENT='主 Run 请求幂等、Runtime Profile 与业务状态注册';
 
-CREATE TABLE conversation_events (
-  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '事件主键',
+CREATE TABLE conversation_interrupt_claims (
+  id BIGINT NOT NULL AUTO_INCREMENT COMMENT '认领主键',
   conversation_thread_id BIGINT NOT NULL COMMENT '所属会话主键，由应用层保证存在',
-  run_id VARCHAR(128) NOT NULL COMMENT 'Messaging producer run ID',
-  seq BIGINT NOT NULL COMMENT '与 SSE id 一致的严格递增序号',
-  event_id VARCHAR(255) NOT NULL COMMENT 'Messaging 幂等 message ID',
-  event_type VARCHAR(64) NOT NULL COMMENT 'AG-UI 事件类型',
-  protocol_version VARCHAR(32) NOT NULL COMMENT 'AG-UI 协议版本',
-  event_json JSON NOT NULL COMMENT 'AG-UI 事件 JSON',
-  event_text LONGTEXT NOT NULL COMMENT '与 SSE data 完全一致的 UTF-8 JSON',
-  created_at DATETIME NOT NULL COMMENT 'Redis 首次提交时间',
-  CONSTRAINT pk_conversation_events PRIMARY KEY (id),
-  CONSTRAINT uq_conversation_events_thread_seq UNIQUE (conversation_thread_id, seq),
-  CONSTRAINT uq_conversation_events_thread_event UNIQUE (conversation_thread_id, event_id),
-  KEY ix_conversation_events_thread_run_seq (conversation_thread_id, run_id, seq)
-) COMMENT='Redis Messaging 已提交 AG-UI 事件的 MySQL 事实副本';
+  interrupt_id VARCHAR(255) NOT NULL COMMENT '框架从 Checkpointer 解析的公开 interrupt ID',
+  source_run_id VARCHAR(128) NOT NULL COMMENT '产生 interrupt 的来源 Run ID',
+  claimed_run_id VARCHAR(128) NOT NULL COMMENT '原子认领该 interrupt 的 resume Run ID',
+  status VARCHAR(32) NOT NULL COMMENT 'claimed/resolved/cancelled',
+  resolution_id VARCHAR(128) COMMENT 'checkpoint marker 或 Trace abandonment 证据',
+  created_at DATETIME NOT NULL COMMENT '认领创建时间',
+  resolved_at DATETIME COMMENT '框架确认恢复 checkpoint 的时间',
+  updated_at DATETIME NOT NULL COMMENT '最近状态更新时间',
+  CONSTRAINT pk_conversation_interrupt_claims PRIMARY KEY (id),
+  CONSTRAINT uq_conversation_interrupt_claims_thread_interrupt UNIQUE (conversation_thread_id, interrupt_id),
+  KEY ix_conversation_interrupt_claims_run_status (conversation_thread_id, claimed_run_id, status)
+) COMMENT='由框架恢复事实驱动的 interrupt 原子认领与结算';
 
-CREATE TABLE conversation_interrupts (
-  id BIGINT NOT NULL AUTO_INCREMENT COMMENT 'interrupt 投影主键',
-  conversation_thread_id BIGINT NOT NULL COMMENT '所属会话主键，由应用层保证存在',
-  run_id VARCHAR(128) NOT NULL COMMENT '产生 interrupt 的主 run ID',
-  resolved_run_id VARCHAR(128) COMMENT '认领或处理该 interrupt 的 resume run ID',
-  interrupt_id VARCHAR(255) NOT NULL COMMENT 'AG-UI 公共 interrupt ID',
-  status VARCHAR(32) NOT NULL COMMENT 'pending/resolved/cancelled',
-  reason VARCHAR(64) NOT NULL COMMENT 'AG-UI interrupt reason',
-  message TEXT COMMENT '前端审批提示',
-  request_json JSON NOT NULL COMMENT '完整公开 interrupt 请求',
-  resume_json JSON COMMENT '对应 resume 条目',
-  created_at DATETIME NOT NULL COMMENT '创建时间',
-  resolved_at DATETIME COMMENT '解决时间',
-  updated_at DATETIME NOT NULL COMMENT '更新时间',
-  CONSTRAINT pk_conversation_interrupts PRIMARY KEY (id),
-  CONSTRAINT uq_conversation_interrupts_thread_interrupt UNIQUE (conversation_thread_id, interrupt_id),
-  KEY ix_conversation_interrupts_thread_status (conversation_thread_id, status, updated_at)
-) COMMENT='前端可恢复的 HITL interrupt 投影';
+CREATE TABLE tinkerfin_trace_events (
+  namespace_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 namespace key',
+  thread_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 thread key',
+  generation VARCHAR(64) NOT NULL COMMENT 'Exact Trace generation ID',
+  trace_seq BIGINT NOT NULL COMMENT 'One-based global sequence in the generation',
+  event_id VARCHAR(64) NOT NULL COMMENT 'Idempotent Store event identity',
+  run_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 Run key',
+  run_id TEXT NOT NULL COMMENT 'Semantic Run owning this fact',
+  fact_kind VARCHAR(64) NOT NULL COMMENT 'Queryable current semantic fact discriminator',
+  occurred_at DATETIME(6) NOT NULL COMMENT 'Source UTC fact timestamp',
+  payload LONGBLOB NOT NULL COMMENT 'Opaque canonical fact payload bytes',
+  payload_digest VARCHAR(64) NOT NULL COMMENT 'SHA-256 of canonical pre-storage payload',
+  persisted_bytes BIGINT NOT NULL COMMENT 'Measured current TraceEvent encoded bytes',
+  created_at DATETIME(6) NOT NULL COMMENT 'Database UTC commit time',
+  CONSTRAINT pk_tinkerfin_trace_events PRIMARY KEY (namespace_hash, thread_hash, generation, trace_seq),
+  UNIQUE KEY uq_tinkerfin_trace_events_id (namespace_hash, event_id),
+  KEY ix_tinkerfin_trace_events_run (namespace_hash, thread_hash, generation, run_hash, trace_seq)
+) COMMENT='Authoritative semantic Trace Ledger events';
 
-CREATE TABLE store_migrations (
-  v INTEGER NOT NULL COMMENT 'Store migration 版本',
-  CONSTRAINT pk_store_migrations PRIMARY KEY (v)
-) COMMENT='LangGraph MySQL Store 已应用迁移版本';
+CREATE TABLE tinkerfin_trace_namespaces (
+  namespace_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 key for the logical namespace',
+  namespace TEXT NOT NULL COMMENT 'Logical Trace Store namespace',
+  created_at DATETIME(6) NOT NULL COMMENT 'Database UTC creation time',
+  CONSTRAINT pk_tinkerfin_trace_namespaces PRIMARY KEY (namespace_hash)
+) COMMENT='Trace namespace ownership';
+
+CREATE TABLE tinkerfin_trace_projection_checkpoints (
+  namespace_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 namespace key',
+  thread_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 thread key',
+  generation VARCHAR(64) NOT NULL COMMENT 'Exact Trace generation ID',
+  projection_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 Projection key',
+  run_scope_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 Run scope key',
+  projection_name TEXT NOT NULL COMMENT 'Canonical Projection identity',
+  run_scope TEXT NOT NULL COMMENT 'Run ID or empty thread-wide scope',
+  as_of_seq BIGINT NOT NULL COMMENT 'Fixed Ledger prefix represented by state',
+  state_payload LONGBLOB NOT NULL COMMENT 'Opaque canonical Projection state bytes',
+  state_digest VARCHAR(64) NOT NULL COMMENT 'SHA-256 of canonical pre-storage state',
+  created_at DATETIME(6) NOT NULL COMMENT 'Database UTC checkpoint commit time',
+  CONSTRAINT pk_tinkerfin_trace_projection_checkpoints PRIMARY KEY (
+    namespace_hash,
+    thread_hash,
+    generation,
+    projection_hash,
+    run_scope_hash,
+    as_of_seq
+  ),
+  KEY ix_tinkerfin_trace_checkpoints_lookup (
+    namespace_hash,
+    thread_hash,
+    generation,
+    projection_hash,
+    run_scope_hash,
+    as_of_seq
+  )
+) COMMENT='Disposable Projection checkpoint history';
+
+CREATE TABLE tinkerfin_trace_threads (
+  namespace_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 namespace key',
+  thread_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 thread key',
+  namespace TEXT NOT NULL COMMENT 'Logical Trace namespace',
+  thread_id TEXT NOT NULL COMMENT 'Canonical semantic thread ID',
+  generation VARCHAR(64) NOT NULL COMMENT 'Non-reusable current generation ID',
+  next_seq BIGINT NOT NULL COMMENT 'Next one-based global Trace sequence',
+  persisted_bytes BIGINT NOT NULL COMMENT 'Canonical encoded event bytes in this generation',
+  created_at DATETIME(6) NOT NULL COMMENT 'Database UTC generation creation time',
+  updated_at DATETIME(6) NOT NULL COMMENT 'Database UTC last mutation time',
+  CONSTRAINT pk_tinkerfin_trace_threads PRIMARY KEY (namespace_hash, thread_hash),
+  UNIQUE KEY ix_tinkerfin_trace_threads_generation (namespace_hash, generation)
+) COMMENT='Current Trace generation and sequence allocator';
+
+CREATE TABLE tinkerfin_trace_writers (
+  namespace_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 namespace key',
+  thread_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 thread key',
+  generation VARCHAR(64) NOT NULL COMMENT 'Exact Trace generation ID',
+  run_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 Run key',
+  run_id TEXT NOT NULL COMMENT 'Canonical semantic Run ID',
+  owner_token VARCHAR(64) NOT NULL COMMENT 'Opaque current writer ownership token',
+  fence BIGINT NOT NULL COMMENT 'Monotonic writer fencing token',
+  lease_expires_at DATETIME(6) NOT NULL COMMENT 'Database-clock writer lease deadline',
+  active BOOL NOT NULL COMMENT 'Whether the writer may still append',
+  terminal_committed BOOL NOT NULL COMMENT 'Whether the exactly-once Run terminal fact is committed',
+  closed_committed BOOL NOT NULL COMMENT 'Whether the Runtime cleanup completion fact is committed',
+  committed_events BIGINT NOT NULL COMMENT 'Events committed by this Run writer',
+  remaining_event_reserve BIGINT NOT NULL COMMENT 'Reserved terminal event capacity',
+  remaining_byte_reserve BIGINT NOT NULL COMMENT 'Reserved terminal canonical bytes',
+  created_at DATETIME(6) NOT NULL COMMENT 'Database UTC first writer creation time',
+  updated_at DATETIME(6) NOT NULL COMMENT 'Database UTC last ownership mutation time',
+  CONSTRAINT pk_tinkerfin_trace_writers PRIMARY KEY (
+    namespace_hash,
+    thread_hash,
+    generation,
+    run_hash
+  ),
+  KEY ix_tinkerfin_trace_writers_active_lease (
+    namespace_hash,
+    thread_hash,
+    generation,
+    active,
+    lease_expires_at
+  )
+) COMMENT='Exclusive Run writer ownership, lease, fence, and terminal reserve';
 
 CREATE TABLE store (
   prefix VARCHAR(500) NOT NULL COMMENT 'Store 文档命名空间',
@@ -133,8 +205,6 @@ CREATE TABLE store (
   CONSTRAINT pk_store PRIMARY KEY (prefix, `key`),
   KEY store_prefix_idx (prefix)
 ) COMMENT='Deep Agents 长期 memory Store';
-
-INSERT INTO store_migrations (v) VALUES (0), (1);
 
 CREATE TABLE tinkerfin_opensandbox_owners (
   namespace VARCHAR(64) NOT NULL COMMENT 'OpenSandbox State 逻辑部署命名空间',

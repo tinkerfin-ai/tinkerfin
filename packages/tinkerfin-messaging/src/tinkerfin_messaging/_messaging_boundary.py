@@ -18,7 +18,7 @@ import inspect
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable
 from typing import TYPE_CHECKING, TypeAlias, TypeVar, cast
 
-from tinkerfin_agui_adapter import Identity
+from tinkerfin_contracts import RunIdentity
 
 from .errors import (
     MessagingBackendError,
@@ -104,7 +104,7 @@ async def _iterate_backend(
         raise translated from error
 
 
-def _derived_message_id(identity: Identity, ordinal: int) -> str:
+def _derived_message_id(identity: RunIdentity, ordinal: int) -> str:
     """Keep ordinary message IDs bounded without changing the common readable form."""
 
     candidate = f"{identity.run_id}:{ordinal}"
@@ -170,7 +170,7 @@ def _normalize_cancel_callback(
         signature.bind(
             CancelContext(
                 channel="callback",
-                identity=Identity(threadId="callback", runId="callback"),
+                identity=RunIdentity(threadId="callback", runId="callback"),
             )
         )
     except TypeError as error:

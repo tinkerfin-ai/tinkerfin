@@ -3,15 +3,25 @@
 [Documentation](../README.md) · [中文](../../zh/agui/index.md)
 
 AG-UI represents agent text, tool calls, state, approvals, and outcomes as
-frontend-friendly events. TinkerFin uses one canonical `Identity` for public lifecycle
+frontend-friendly events. TinkerFin uses one canonical `RunIdentity` for public lifecycle
 events, Graph execution, checkpoints, coordination, and durable delivery.
+
+## Installation
+
+```bash
+pip install "tinkerfin[agui]"
+pip install langchain-openai
+```
+
+The second command installs the provider adapter used by the example; replace it when
+using another model vendor.
 
 ## Your first AG-UI Runtime
 
 ```python
 import asyncio
 
-from tinkerfin import Identity, TinkerFin
+from tinkerfin import RunIdentity, TinkerFin
 
 
 agent = TinkerFin().create_deep_agent(
@@ -22,7 +32,7 @@ agent = TinkerFin().create_deep_agent(
 
 async def main() -> None:
     runtime = agent.new_agui(
-        identity=Identity(threadId="conversation-1", runId="run-1"),
+        identity=RunIdentity(threadId="conversation-1", runId="run-1"),
     )
     events = runtime.astream(
         {"messages": [{"role": "user", "content": "Hello"}]},
@@ -34,8 +44,8 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-- `Identity.threadId` is the canonical thread used by every runtime and durable boundary.
-- `Identity.runId` identifies one semantic run and is reused only for an idempotent retry.
+- `RunIdentity.threadId` is the canonical thread used by every runtime and durable boundary.
+- `RunIdentity.runId` identifies one semantic run and is reused only for an idempotent retry.
 - The first `runtime.astream(...)` argument is the explicit Graph input.
 - `RUN_STARTED.input` is omitted; the Runtime does not fabricate or duplicate Graph input.
 
@@ -46,13 +56,13 @@ then map only the application-approved facts:
 
 | `RunAgentInput` field | Application responsibility | Framework call |
 | --- | --- | --- |
-| `threadId` / `runId` | Authenticate, authorize, and select one canonical identity | `Identity(...)` |
+| `threadId` / `runId` | Authenticate, authorize, and select one canonical identity | `RunIdentity(...)` |
 | `parentRunId` | Authorize a branch or resume source in the same thread | `parent_run_id=...` |
 | `state` / `messages` | Validate and map to the concrete Graph state schema | `astream(graph_input)` |
 | `tools` | Treat as client descriptions, not server execution permission | Not automatic |
 | `context` | Translate only when the host explicitly supports it | Graph `context=...` |
 | `forwardedProps` | Apply product policy such as model or mode selection | Host-owned |
-| `resume` | Pair with trusted server-persisted interrupts | `AgUiResumeBinding.from_agui(...)` |
+| `resume` | Carry client decisions only | `AgUiResumeRequest(entries=...)` |
 
 Do not inject a complete frontend history into a Graph that already has checkpoint state;
 the same message could execute twice.
@@ -60,31 +70,39 @@ the same message could execute twice.
 ## Resume
 
 ```python
-from tinkerfin import AgUiResumeBinding, Identity
+from tinkerfin import AgUiResumeRequest, RunIdentity
 
 
-binding = AgUiResumeBinding.from_agui(
-    entries=resume_entries,
-    interrupts=trusted_persisted_interrupts,
+resume_identity = RunIdentity(threadId="conversation-1", runId="run-resume")
+binding = await agent.prepare_agui_resume(
+    identity=resume_identity,
+    parent_run_id=parent_run_id,
+    request=AgUiResumeRequest(entries=tuple(resume_entries)),
 )
 runtime = agent.new_agui(
-    identity=Identity(threadId="conversation-1", runId="run-resume"),
+    identity=resume_identity,
     parent_run_id=parent_run_id,
     resume=binding,
     on_resume_checkpointed=record_checkpoint_idempotently,
+    on_resume_initialization_failed=release_unprepared_claim_idempotently,
 )
 events = runtime.astream(config=config)
 ```
 
-The binding validates complete coverage, native grouping, decision order, JSON Schema,
-Tool correlation, cancellation, and subagent provenance. It has a stable JSON round trip
-but owns no identity, parent, Graph, or I/O resource. Native `Command` construction stays
-inside the Runtime. Entirely cancelled batches emit a finite cancelled lifecycle without
-invoking a Graph.
+The Definition reads the canonical checkpoint and validates complete coverage, native
+grouping, decision order, JSON Schema, Tool correlation, cancellation, Runtime Profile,
+and subagent provenance before returning the private binding. The client request contains
+no server interrupt payload or native `Command`. Entirely cancelled batches emit a finite
+cancelled lifecycle without invoking a Graph.
 
-`on_resume_checkpointed` runs after the private marker is readable and before resumed
-native output. A retry can deliver the same `AgUiResumeCheckpoint` again, so the callback
-must be idempotent. It does not mean a Tool or run has completed.
+The selected Profile first writes private lineage and marker values without changing the
+interrupted Graph's pending work. `on_resume_checkpointed` runs after those values are
+readable and before resumed native output. A prepared retry can deliver the same
+`AgUiResumeCheckpoint` again, so the callback must be idempotent. It does not mean a Tool
+or run has completed.
+If the Runtime fails, is cancelled, or closes before that marker becomes readable,
+`on_resume_initialization_failed` runs from protected settlement so the host can release
+its claim. It never runs after prepared or accepted marker evidence exists.
 
 ## `new_agui()` parameters
 
@@ -93,22 +111,25 @@ must be idempotent. It does not mean a Tool or run has completed.
 | `identity` | required | Canonical thread and run identity |
 | `parent_run_id` | `None` | Optional checkpoint branch or resume source |
 | `mode` | Definition default | `default` or `plan` for this Runtime only |
-| `on_part` | `None` | Observe each validated LangGraph v2 part |
+| `on_part` | `None` | Observe each validated upstream Native object |
 | `timeout` | `None` | Total native-stream deadline |
 | `settlement_timeout` | `None` | Caller wait limit for protected stream cleanup |
 | `expose_reasoning_events` | `False` | Emit supported public reasoning events |
 | `expose_subagent_events` | `True` | Emit validated subagent events |
 | `resume` | `None` | Validated `AgUiResumeBinding` |
-| `on_resume_checkpointed` | `None` | Idempotent callback after durable resume acceptance |
+| `on_resume_checkpointed` | `None` | Idempotent callback after the exact resume-intent marker is readable |
+| `on_resume_initialization_failed` | `None` | Idempotent host settlement only before marker durability |
 | `on_event` | `None` | Async observer before each AG-UI event is delivered |
 
 The reasoning switch never exposes private provider metadata.
 
-## Fixed stream settings
+## Profile-owned stream settings
 
-AG-UI conversion requires `messages/tasks/values`, `version="v2"`, and
-`subgraphs=True`. Usually omit them. You may add `updates`, `checkpoints`, `debug`, or
-`custom`. Missing required modes, v1, or `subgraphs=False` fails before Graph iteration.
+The selected Runtime Profile owns required semantic modes, the upstream version,
+subgraph behavior, and complete state output. Usually omit those options. The built-in
+Profile allows supported diagnostic modes to be added; removing required semantics or
+supplying a conflicting upstream option fails before Graph iteration. AG-UI conversion
+consumes the same canonical frame already produced for Runtime Observation.
 
 `parent_run_id` is not subagent provenance. It selects the unique valid checkpoint leaf
 for that run in the same canonical thread. Missing, cross-thread, active, failed,

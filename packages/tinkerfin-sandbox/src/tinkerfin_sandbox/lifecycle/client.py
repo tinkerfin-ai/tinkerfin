@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from uuid import uuid4
 
@@ -29,8 +28,6 @@ from ..errors import (
 )
 from ..models import OpenSandboxConfig, OpenSandboxRuntimeInfo
 from ._protocols import _SandboxClient
-
-logger = logging.getLogger(__name__)
 
 _CREATE_TOKEN_METADATA_KEY = "tinkerfin.ai/create-token"
 
@@ -197,35 +194,20 @@ class OpenSandboxClient(_SandboxClient):
     @staticmethod
     async def _close_quietly(
         backend: OpenSandboxBackend,
-        *,
-        operation: str,
     ) -> None:
         try:
             await backend.aclose()
-        except Exception:
-            logger.warning(
-                "Failed to close local resources for sandbox %s after %s",
-                backend.id,
-                operation,
-                exc_info=True,
-            )
+        except Exception:  # noqa: BLE001 - local close is best effort
+            pass
 
     @staticmethod
     async def _close_sdk_quietly(
         sandbox: Sandbox,
-        *,
-        sandbox_id: str,
-        operation: str,
     ) -> None:
         try:
             await sandbox.close()
-        except Exception:
-            logger.warning(
-                "Failed to close local SDK resources for sandbox %s after %s",
-                sandbox_id,
-                operation,
-                exc_info=True,
-            )
+        except Exception:  # noqa: BLE001 - temporary SDK close is best effort
+            pass
 
     async def _create(
         self,
@@ -267,13 +249,9 @@ class OpenSandboxClient(_SandboxClient):
         except Exception as error:
             try:
                 await backend.akill()
-            except Exception:
-                logger.warning(
-                    "Failed to reclaim newly created sandbox %s after initialization",
-                    backend.id,
-                    exc_info=True,
-                )
-            await self._close_quietly(backend, operation="initialization failure")
+            except Exception:  # noqa: BLE001 - preserve initialization failure
+                pass
+            await self._close_quietly(backend)
             translated = _backend_error("workspace initialization", error)
             raise translated from error
         try:
@@ -281,13 +259,9 @@ class OpenSandboxClient(_SandboxClient):
         except BaseException:
             try:
                 await backend.akill()
-            except Exception:
-                logger.warning(
-                    "Failed to reclaim newly created sandbox %s after initialization",
-                    backend.id,
-                    exc_info=True,
-                )
-            await self._close_quietly(backend, operation="initializer failure")
+            except Exception:  # noqa: BLE001 - preserve initializer failure
+                pass
+            await self._close_quietly(backend)
             raise
         return backend
 
@@ -330,37 +304,21 @@ class OpenSandboxClient(_SandboxClient):
                         connection_config=self.connection_config,
                         connect_timeout=self.config.connect_timeout,
                     )
-                except Exception:
-                    logger.warning(
-                        "Failed to reconnect to sandbox %s with unknown creation result",
-                        candidate.id,
-                        exc_info=True,
-                    )
+                except Exception:  # noqa: BLE001 - unknown create result is reclaimed
                     await self._kill_discovered_candidates(manager, candidates)
                     return None
             if len(candidates) > 1:
-                logger.error(
-                    "Creation token %s matched multiple OpenSandbox instances",
-                    token,
-                )
                 await self._kill_discovered_candidates(manager, candidates)
             return None
-        except Exception:
-            logger.warning(
-                "Failed to query OpenSandbox after an unknown creation result",
-                exc_info=True,
-            )
+        except Exception:  # noqa: BLE001 - recovery failure preserves create outcome
             return None
         finally:
             if manager is not None:
                 try:
                     await manager.close()
                 # Cleanup of a temporary query must not mask the creation outcome.
-                except Exception:
-                    logger.warning(
-                        "Failed to close the creation-token query client",
-                        exc_info=True,
-                    )
+                except Exception:  # noqa: BLE001 - temporary client close is best effort
+                    pass
 
     @staticmethod
     async def _kill_discovered_candidates(
@@ -371,25 +329,17 @@ class OpenSandboxClient(_SandboxClient):
         for candidate in candidates:
             try:
                 await manager.kill_sandbox(candidate.id)
-            except Exception:
-                logger.warning(
-                    "Failed to remove creation-token candidate sandbox %s",
-                    candidate.id,
-                    exc_info=True,
-                )
+            except Exception:  # noqa: BLE001 - candidate cleanup is best effort
+                pass
 
     async def _reclaim_backend(self, backend: OpenSandboxBackend) -> None:
         """Reclaim a remote instance whose creation completed after cancellation."""
         try:
             await backend.akill()
-        except Exception:
-            logger.warning(
-                "Failed to reclaim sandbox %s after creation was cancelled",
-                backend.id,
-                exc_info=True,
-            )
+        except Exception:  # noqa: BLE001 - cancelled creation cleanup is best effort
+            pass
         finally:
-            await self._close_quietly(backend, operation="cancelled creation")
+            await self._close_quietly(backend)
 
     async def _reclaim_cancelled_create(
         self,
@@ -417,7 +367,7 @@ class OpenSandboxClient(_SandboxClient):
         except Exception:  # noqa: BLE001
             # Failed SDK and initializer paths already close their own connection.
             return
-        await self._close_quietly(backend, operation="cancelled reconnect")
+        await self._close_quietly(backend)
 
     def _track_cleanup_task(self, task: asyncio.Task[None]) -> None:
         """Retain a background cleanup task until completion."""
@@ -473,19 +423,13 @@ class OpenSandboxClient(_SandboxClient):
         try:
             await self._initialize_workspace(sandbox)
         except Exception as error:
-            await self._close_quietly(
-                backend,
-                operation="reconnect initialization failure",
-            )
+            await self._close_quietly(backend)
             translated = _backend_error("workspace initialization", error)
             raise translated from error
         try:
             await self._initialize(backend)
         except BaseException:
-            await self._close_quietly(
-                backend,
-                operation="reconnect initializer failure",
-            )
+            await self._close_quietly(backend)
             raise
         return backend
 
@@ -518,21 +462,14 @@ class OpenSandboxClient(_SandboxClient):
             )
             backend = self._wrap(sandbox)
             return await backend.aget_runtime_info()
-        except Exception as exc:
-            logger.info(
-                "Read-only inspection failed for sandbox %s", sandbox_id, exc_info=True
-            )
+        except Exception as exc:  # noqa: BLE001 - inspection returns unavailable details
             return OpenSandboxRuntimeInfo.unavailable(
                 sandbox_id,
                 unavailable_reason(exc),
             )
         finally:
             if sandbox is not None:
-                await self._close_sdk_quietly(
-                    sandbox,
-                    sandbox_id=sandbox_id,
-                    operation="read-only inspection",
-                )
+                await self._close_sdk_quietly(sandbox)
 
     async def _destroy_once(self, sandbox_id: str) -> None:
         """Connect, kill, and close one Sandbox while preserving the kill outcome."""
@@ -555,13 +492,7 @@ class OpenSandboxClient(_SandboxClient):
         except Exception as error:  # noqa: BLE001 - preserve SDK kill failure through close
             kill_error = error
         finally:
-            await self._close_sdk_quietly(
-                sandbox,
-                sandbox_id=sandbox_id,
-                operation=(
-                    "failed destruction" if kill_error is not None else "destruction"
-                ),
-            )
+            await self._close_sdk_quietly(sandbox)
         if kill_error is not None:
             error = kill_error
             translated = _backend_error("destroy", error)
@@ -573,6 +504,13 @@ class OpenSandboxClient(_SandboxClient):
         Caller cancellation stops no remote work. The method waits for the shared kill
         and local close settlement, then preserves the caller's cancellation signal.
         Concurrent calls for the same ID join one task.
+
+        Args:
+            sandbox_id: Canonical remote Sandbox identifier to destroy idempotently.
+
+        Raises:
+            asyncio.CancelledError: The caller cancels after retained destruction settles.
+            OpenSandboxBackendError: Lookup, kill, or SDK resource settlement fails.
         """
 
         task = self._destroy_tasks.get(sandbox_id)

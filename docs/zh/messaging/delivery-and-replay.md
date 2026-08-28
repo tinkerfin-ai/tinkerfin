@@ -19,7 +19,7 @@ subscription = await channel.wrap(
 - 同一 thread 有另一个活跃 run：抛出 `RunAlreadyActive`；
 - codec 与 channel 已绑定格式不同：抛出 `CodecMismatch`。
 
-`runId` 是幂等 key。Messaging 不读取或保存业务请求摘要；同一个 `Identity` 的正文是否一致由应用校验。
+`runId` 是幂等 key。Messaging 不读取或保存业务请求摘要；同一个 `RunIdentity` 的正文是否一致由应用校验。
 
 ## 直接获得 SSE
 
@@ -59,7 +59,7 @@ status = await channel.get_run_status(identity=identity)
 | `follow()` | 指定 run | 先回放，再等待该 run 的权威终止 |
 | `get_run_status()` | 指定 run | 不取得 owner 的当前 durable 状态 |
 
-虽然 thread 级 API 只使用 `identity.threadId` 定位日志，接口仍统一接收完整 `Identity`，避免 thread/run 在不同层重复平铺。
+虽然 thread 级 API 只使用 `identity.threadId` 定位日志，接口仍统一接收完整 `RunIdentity`，避免 thread/run 在不同层重复平铺。
 
 `get_run_status()` 可原子把过期 producer lease 归档为 `owner_lost`。没有 durable
 run 时抛出 `RunNotFound`，且不会创建或恢复 producer。

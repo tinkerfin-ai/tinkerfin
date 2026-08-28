@@ -189,6 +189,14 @@ def match_hitl_action_groups(
     When `selected_slots` is provided, unselected actions still constrain matching,
     but uniqueness is evaluated after projecting each solution to selected slots.
 
+    Args:
+        action_groups: Native interrupt action groups in checkpoint order.
+        candidate_messages: Candidate Tool calls grouped by their parent AI message.
+        selected_slots: Optional per-action mask retained in the public result.
+
+    Returns:
+        One ordered tuple of scoped Tool-call IDs per native action group.
+
     Raises:
         HitlCorrelationError: No complete assignment exists or multiple assignments
             are possible.
@@ -331,6 +339,13 @@ def relevant_malformed_hitl_candidate(
     grouping, position, namespace-scoped ID uniqueness, and action order remain hard
     constraints. This detects whether ignoring invalid JSON could change correlation;
     it does not choose a Tool call for execution.
+
+    Args:
+        action_groups: Native interrupt actions whose complete assignment is required.
+        candidate_messages: Valid and malformed Tool candidates grouped by message.
+
+    Returns:
+        First malformed candidate relevant to a valid assignment, or ``None``.
 
     Raises:
         HitlCorrelationError: The relevance search exceeds its bounded state budget.
@@ -480,6 +495,13 @@ def match_hitl_tool_call_ids(
     Matching considers every checkpoint AI message and requires one unique
     `name + args` ordered subsequence. It does not perform checkpoint I/O, use
     stream arrival order, or mutate Tool arguments.
+
+    Args:
+        actions: One native HITL action group in checkpoint order.
+        messages: Trusted checkpoint messages containing candidate Tool calls.
+
+    Returns:
+        Unique scoped Tool-call IDs in native action order.
 
     Raises:
         HitlCorrelationError: The checkpoint lacks stable Tool calls or more than

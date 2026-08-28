@@ -9,7 +9,7 @@ from typing import ClassVar, cast
 
 import pytest
 
-from tinkerfin import Identity
+from tinkerfin import RunIdentity
 from tinkerfin_messaging import (
     InvalidCursor,
     MessageSubscription,
@@ -24,8 +24,8 @@ def _identity(
     *,
     thread_id: str = "conversation-1",
     run_id: str = "run-1",
-) -> Identity:
-    return Identity(threadId=thread_id, runId=run_id)
+) -> RunIdentity:
+    return RunIdentity(threadId=thread_id, runId=run_id)
 
 
 class _TextCodec:
@@ -166,22 +166,13 @@ async def test_validate_cursor_checks_tail_without_claiming_a_run(
     assert source.close_calls == 1
 
 
-async def test_overlong_identity_closes_the_unclaimed_source(
-    messaging_backend: MessagingBackend,
-) -> None:
+def test_overlong_identity_is_rejected_before_source_ownership() -> None:
     source = _ControlledSource("never-consumed")
 
-    async with Messaging(backend=messaging_backend) as messaging:
-        channel = messaging.channel(name="events", codec=_TextCodec())
+    with pytest.raises(ValueError, match="at most 1024"):
+        _identity(thread_id="x" * 1025)
 
-        with pytest.raises(ValueError, match="at most 1024"):
-            await channel.wrap(
-                source,
-                identity=_identity(thread_id="x" * 1025),
-                after=0,
-            )
-
-    assert source.close_calls == 1
+    assert source.close_calls == 0
     assert not source.started.is_set()
 
 

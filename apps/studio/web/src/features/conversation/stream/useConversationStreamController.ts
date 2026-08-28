@@ -18,18 +18,20 @@ import {
   hasConversationErrorCode,
 } from '../../../api/conversation/errors'
 import {
-  fetchConversationEvents,
-  type ConversationEventEnvelope,
+  fetchConversationHistoryDetail,
+  followConversationTrace,
 } from '../../../api/conversation/history'
 import type { ChatRequestPayload } from '../../../api/conversation/types'
 import { translateCurrent } from '../../../i18n'
 import type { Conversation, WorkspaceState } from '../../../types'
 import {
   applyConversationEvent,
-  applyHistoryEventEnvelope,
-  applyLiveEventEnvelope,
   markConversationDetached,
 } from '../agui'
+import {
+  applyConversationTraceUpdate,
+  restoreConversationFromTrace,
+} from '../trace/runtime'
 import { InvalidStateDeltaError } from '../agui/jsonPatch'
 import { updateConversation, upsertConversation } from '../../../lib/workspace'
 import {
@@ -38,10 +40,10 @@ import {
   type ActiveRunSession,
 } from './activeRunSession'
 
-const HISTORY_CATCH_UP_PAGE_SIZE = 1000
 const RECONNECT_MAX_DELAY_MS = 5000
 const ACTIVE_RUN_PERSIST_INTERVAL_MS = 250
 const TEXT_RENDER_INTERVAL_MS = 50
+const DETACHED_TRACE_RECONNECT_LIMIT = 3
 
 const waitForReconnect = (delay: number, signal: AbortSignal): Promise<void> => (
   new Promise((resolve) => {
@@ -80,7 +82,7 @@ export interface ConversationStreamController {
     mode: 'start' | 'resume',
     options?: StreamRunOptions,
   ) => Promise<void>
-  catchUpDetachedConversation: (threadId: string) => Promise<void>
+  followDetachedConversation: (threadId: string) => Promise<void>
   detachThreadStream: (threadId: string, reason: string) => void
   cancelActiveRun: () => Promise<boolean>
   cancelPendingRunId: string | null
@@ -121,9 +123,8 @@ export function useConversationStreamController({
     value: Conversation | null
   } | undefined>(undefined)
   const latestWorkspace = useRef(workspace)
-  const catchUpRequests = useRef(new Set<string>())
-  const catchUpControllers = useRef(new Map<string, AbortController>())
-  const delayedCatchUpTimers = useRef(new Set<number>())
+  const traceFollowControllers = useRef(new Map<string, AbortController>())
+  const delayedTraceFollowTimers = useRef(new Set<number>())
   const activeRunPersistence = useRef<{
     runId: string
     session: ActiveRunSession
@@ -294,55 +295,71 @@ export function useConversationStreamController({
     })
   }, [clearCancelPending, flushActiveRunPersistence, setDraftConversation, setWorkspace])
 
-  const catchUpDetachedConversation = useCallback(async (threadId: string) => {
+  const followDetachedConversation = useCallback(async (threadId: string) => {
     if (!isMounted.current) return
     const target = latestWorkspace.current.conversations.find(
       (item) => item.threadId === threadId,
     )
-    if (!target || target.lastSeq == null) return
-    if (target.runStatus !== 'detached' && target.runStatus !== 'idle') return
-    if (catchUpRequests.current.has(threadId)) return
+    if (!target || target.runStatus !== 'detached' || !target.isHydrated) return
+    if (traceFollowControllers.current.has(threadId)) return
     const controller = new AbortController()
-    catchUpRequests.current.add(threadId)
-    catchUpControllers.current.set(threadId, controller)
+    traceFollowControllers.current.set(threadId, controller)
     try {
-      let afterSeq = target.lastSeq
-      while (true) {
-        if (
-          controller.signal.aborted
-          || !isMounted.current
-          || (activeAbortController.current && activeThreadId.current === threadId)
-        ) return
-        const envelopes = await fetchConversationEvents(threadId, {
-          afterSeq,
-          limit: HISTORY_CATCH_UP_PAGE_SIZE,
-          signal: controller.signal,
-          suppressGlobalError: true,
-        })
-        if (
-          controller.signal.aborted
-          || !isMounted.current
-          || (activeAbortController.current && activeThreadId.current === threadId)
-        ) return
-        if (!envelopes.length) return
-        const nextAfterSeq = envelopes.at(-1)?.seq ?? afterSeq
-        if (nextAfterSeq <= afterSeq) return
-        setWorkspace((state) => {
+      let reconnectAttempts = 0
+      while (!controller.signal.aborted) {
+        for await (const event of followConversationTrace(threadId, controller.signal)) {
           if (
             controller.signal.aborted
             || !isMounted.current
             || (activeAbortController.current && activeThreadId.current === threadId)
-          ) {
-            return state
+          ) return
+          if (event.type === 'error') throw new ConversationError('stream_recovery_failed')
+          setWorkspace((state) => updateConversation(state, threadId, (item) => {
+            if (event.type === 'snapshot') {
+              return restoreConversationFromTrace(event.snapshot, { model: item.model })
+            }
+            return applyConversationTraceUpdate(item, event.update)
+          }))
+          const execution = event.type === 'snapshot'
+            ? event.snapshot.status.execution
+            : event.update.status.execution
+          if (execution !== 'running') {
+            const detail = await fetchConversationHistoryDetail(threadId, {
+              signal: controller.signal,
+              suppressGlobalError: true,
+            })
+            if (!controller.signal.aborted) {
+              setWorkspace((state) => updateConversation(
+                state,
+                threadId,
+                (item) => restoreConversationFromTrace(detail, { model: item.model }),
+              ))
+            }
+            return
           }
-          return updateConversation(
-            state,
-            threadId,
-            (item) => envelopes.reduce(applyHistoryEventEnvelope, item),
-          )
+        }
+        if (
+          controller.signal.aborted
+          || !isMounted.current
+          || (activeAbortController.current && activeThreadId.current === threadId)
+        ) return
+
+        // 网络 EOF 不是终态；重连前先刷新权威快照，避免漏掉断连期间提交的终态
+        const detail = await fetchConversationHistoryDetail(threadId, {
+          signal: controller.signal,
+          suppressGlobalError: true,
         })
-        afterSeq = nextAfterSeq
-        if (envelopes.length < HISTORY_CATCH_UP_PAGE_SIZE) return
+        if (controller.signal.aborted || !isMounted.current) return
+        setWorkspace((state) => updateConversation(
+          state,
+          threadId,
+          (item) => restoreConversationFromTrace(detail, { model: item.model }),
+        ))
+        if (detail.status.execution !== 'running') return
+        reconnectAttempts += 1
+        if (reconnectAttempts > DETACHED_TRACE_RECONNECT_LIMIT) {
+          throw new ConversationError('stream_recovery_failed')
+        }
       }
     } catch (error) {
       if (
@@ -350,26 +367,14 @@ export function useConversationStreamController({
         || !isMounted.current
         || (activeAbortController.current && activeThreadId.current === threadId)
       ) return
-      // 补拉失败保留原进度，界面只展示稳定恢复提示，内部响应不得成为用户文案
       const message = conversationErrorMessage(error, 'stream_recovery_failed')
-      setWorkspace((state) => {
-        if (
-          controller.signal.aborted
-          || !isMounted.current
-          || (activeAbortController.current && activeThreadId.current === threadId)
-        ) return state
-        return updateConversation(state, threadId, (item) => ({
-          ...item,
-          notice: {
-            kind: 'error',
-            content: message,
-          },
-        }))
-      })
+      setWorkspace((state) => updateConversation(state, threadId, (item) => ({
+        ...item,
+        notice: { kind: 'error', content: message },
+      })))
     } finally {
-      if (catchUpControllers.current.get(threadId) === controller) {
-        catchUpControllers.current.delete(threadId)
-        catchUpRequests.current.delete(threadId)
+      if (traceFollowControllers.current.get(threadId) === controller) {
+        traceFollowControllers.current.delete(threadId)
       }
     }
   }, [setWorkspace])
@@ -381,12 +386,11 @@ export function useConversationStreamController({
     options: StreamRunOptions = { target: 'workspace' },
   ) => {
     activeAbortController.current?.abort()
-    const staleCatchUpController = catchUpControllers.current.get(threadIdToStream)
-    if (staleCatchUpController) {
-      staleCatchUpController.abort()
-      if (catchUpControllers.current.get(threadIdToStream) === staleCatchUpController) {
-        catchUpControllers.current.delete(threadIdToStream)
-        catchUpRequests.current.delete(threadIdToStream)
+    const staleTraceController = traceFollowControllers.current.get(threadIdToStream)
+    if (staleTraceController) {
+      staleTraceController.abort()
+      if (traceFollowControllers.current.get(threadIdToStream) === staleTraceController) {
+        traceFollowControllers.current.delete(threadIdToStream)
       }
     }
     const streamEpoch = activeStreamEpoch.current + 1
@@ -407,6 +411,7 @@ export function useConversationStreamController({
       : draftTarget
     let receivedEvent = false
     let mainTerminalReceived = false
+    let traceAuthorityLoaded = false
     let requestPayload: ChatRequestPayload = { ...payload }
     let reconnectAttempt = 0
     let lastAppliedSeq = (
@@ -425,49 +430,6 @@ export function useConversationStreamController({
     }, immediate)
     // 首次写入建立刷新恢复所有权，不能等待第一个节流周期
     persistActiveRun(true)
-
-    const fetchMissingEvents = async (
-      threadId: string,
-      currentSeq: number,
-    ): Promise<ConversationEventEnvelope[]> => {
-      const missing: ConversationEventEnvelope[] = []
-      let cursor = lastAppliedSeq
-      while (cursor + 1 < currentSeq) {
-        const envelopes = await fetchConversationEvents(threadId, {
-          afterSeq: cursor,
-          limit: Math.min(HISTORY_CATCH_UP_PAGE_SIZE, currentSeq - cursor),
-          signal: controller.signal,
-          suppressGlobalError: true,
-        })
-        if (!envelopes.length) {
-          throw new ConversationError(
-            'stream_sequence_invalid',
-            `expected=${cursor + 1}, actual=${currentSeq}`,
-          )
-        }
-        let progressed = false
-        for (const envelope of envelopes) {
-          if (envelope.seq <= cursor) continue
-          if (envelope.seq !== cursor + 1) {
-            throw new ConversationError(
-              'stream_sequence_invalid',
-              `expected=${cursor + 1}, actual=${envelope.seq}`,
-            )
-          }
-          if (envelope.seq >= currentSeq) break
-          missing.push(envelope)
-          cursor = envelope.seq
-          progressed = true
-        }
-        if (!progressed && cursor + 1 < currentSeq) {
-          throw new ConversationError(
-            'stream_sequence_invalid',
-            `expected=${cursor + 1}, actual=${currentSeq}`,
-          )
-        }
-      }
-      return missing
-    }
 
     try {
       while (!mainTerminalReceived) {
@@ -490,12 +452,6 @@ export function useConversationStreamController({
         }
 
         if (seq != null && seq <= lastAppliedSeq) continue
-        const missingEnvelopes = seq != null && seq > lastAppliedSeq + 1
-          ? await fetchMissingEvents(reportedThreadId, seq)
-          : []
-        if (missingEnvelopes.length > 0) {
-          lastAppliedSeq = missingEnvelopes.at(-1)?.seq ?? lastAppliedSeq
-        }
         if (seq != null && seq !== lastAppliedSeq + 1) {
           throw new ConversationError(
             'stream_sequence_invalid',
@@ -505,11 +461,7 @@ export function useConversationStreamController({
 
         if (target === 'draft' && draftTarget) {
           const deferTextRender = event.type === 'TEXT_MESSAGE_CONTENT'
-          const caughtUpDraft = missingEnvelopes.reduce(
-            applyLiveEventEnvelope,
-            draftTarget,
-          )
-          const withEvent = applyConversationEvent(caughtUpDraft, event)
+          const withEvent = applyConversationEvent(draftTarget, event)
           const nextDraft = seq == null
             ? withEvent
             : { ...withEvent, lastSeq: seq, isHydrated: true }
@@ -549,11 +501,7 @@ export function useConversationStreamController({
         if (!validationTarget) {
           throw new ConversationError('stream_event_invalid', '缺少事件验证目标会话')
         }
-        const caughtUpValidation = missingEnvelopes.reduce(
-          applyLiveEventEnvelope,
-          validationTarget,
-        )
-        const validated = applyConversationEvent(caughtUpValidation, event)
+        const validated = applyConversationEvent(validationTarget, event)
         validationTarget = seq == null
           ? { ...validated, isHydrated: true }
           : { ...validated, lastSeq: seq, isHydrated: true }
@@ -565,8 +513,7 @@ export function useConversationStreamController({
             ? targetThreadId
             : state.currentThreadId
           const nextState = updateConversation(state, targetConversationId, (item) => {
-            const caughtUp = missingEnvelopes.reduce(applyLiveEventEnvelope, item)
-            const withEvent = applyConversationEvent(caughtUp, event)
+            const withEvent = applyConversationEvent(item, event)
             return seq == null
               ? { ...withEvent, isHydrated: true }
               : { ...withEvent, lastSeq: seq, isHydrated: true }
@@ -599,6 +546,7 @@ export function useConversationStreamController({
           const canRetry = (
             error instanceof TypeError
             || hasConversationErrorCode(error, 'stream_disconnected')
+            || hasConversationErrorCode(error, 'stream_sequence_invalid')
           )
             && (receivedEvent || options.initialAfterSeq != null)
           if (!canRetry) throw error
@@ -609,6 +557,25 @@ export function useConversationStreamController({
           )
           if (controller.signal.aborted) return
         }
+      }
+      if (mainTerminalReceived && target === 'workspace') {
+        const detail = await fetchConversationHistoryDetail(targetThreadId, {
+          signal: controller.signal,
+          suppressGlobalError: true,
+        })
+        const authoritative = restoreConversationFromTrace(detail, {
+          model: validationTarget?.model ?? payload.forwardedProps.model,
+        })
+        validationTarget = authoritative
+        traceAuthorityLoaded = true
+        enqueueWorkspaceUpdate(
+          streamEpoch,
+          (state) => updateConversation(
+            state,
+            targetThreadId,
+            () => authoritative,
+          ),
+        )
       }
     } catch (error) {
       if (controller.signal.aborted) return
@@ -636,10 +603,12 @@ export function useConversationStreamController({
         enqueueWorkspaceUpdate(streamEpoch, (state) => updateConversation(
           state,
           currentTargetThreadId,
-          (item) => markConversationDetached(
-            item,
-            message,
-          ),
+          (item) => ({
+            ...markConversationDetached(item, message),
+            runStatus: 'detached',
+            activeRunId: item.activeRunId ?? payload.runId,
+            notice: { kind: 'error', content: message },
+          }),
         ))
       } else {
         if (!receivedEvent) clearActiveRunPersistence(payload.runId)
@@ -685,18 +654,18 @@ export function useConversationStreamController({
             ),
           )
         }
-        if (!mainTerminalReceived && target === 'workspace') {
+        if ((!mainTerminalReceived || !traceAuthorityLoaded) && target === 'workspace') {
           const timer = window.setTimeout(() => {
-            delayedCatchUpTimers.current.delete(timer)
+            delayedTraceFollowTimers.current.delete(timer)
             if (!isMounted.current || activeStreamEpoch.current !== streamEpoch) return
-            void catchUpDetachedConversation(currentTargetThreadId)
+            void followDetachedConversation(currentTargetThreadId)
           }, 100)
-          delayedCatchUpTimers.current.add(timer)
+          delayedTraceFollowTimers.current.add(timer)
         }
       }
     }
   }, [
-    catchUpDetachedConversation,
+    followDetachedConversation,
     clearActiveRunPersistence,
     clearCancelPending,
     enqueueDraftUpdate,
@@ -750,9 +719,8 @@ export function useConversationStreamController({
   }, [flushActiveRunPersistence])
 
   useEffect(() => {
-    const controllers = catchUpControllers.current
-    const requests = catchUpRequests.current
-    const timers = delayedCatchUpTimers.current
+    const controllers = traceFollowControllers.current
+    const timers = delayedTraceFollowTimers.current
     isMounted.current = true
     return () => {
       isMounted.current = false
@@ -769,7 +737,6 @@ export function useConversationStreamController({
       cancelPendingRunIdRef.current = null
       for (const controller of controllers.values()) controller.abort()
       controllers.clear()
-      requests.clear()
       for (const timer of timers) window.clearTimeout(timer)
       timers.clear()
       if (workspaceUpdateTimer.current != null) window.clearTimeout(workspaceUpdateTimer.current)
@@ -783,7 +750,7 @@ export function useConversationStreamController({
 
   return {
     streamRun,
-    catchUpDetachedConversation,
+    followDetachedConversation,
     detachThreadStream,
     cancelActiveRun,
     cancelPendingRunId,

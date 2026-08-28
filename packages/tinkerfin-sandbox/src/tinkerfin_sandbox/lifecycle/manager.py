@@ -8,7 +8,6 @@ shared warm slots, and cleanup work remain available to another worker.
 from __future__ import annotations
 
 import asyncio
-import logging
 import math
 from collections.abc import AsyncGenerator, Callable, Sequence
 from contextlib import asynccontextmanager
@@ -46,9 +45,6 @@ from .state import (
     OpenSandboxWarmClaim,
     _OpenSandboxStateBoundary,
 )
-
-logger = logging.getLogger(__name__)
-
 
 KeyT = TypeVar("KeyT")
 
@@ -361,7 +357,6 @@ class OpenSandboxManager(Generic[KeyT]):
         """Best-effort local closure that does not mask the primary result."""
 
         return await _manager_resources._close_backend(
-            self,
             backend,
         )
 
@@ -369,7 +364,6 @@ class OpenSandboxManager(Generic[KeyT]):
         """Retire a handle and close its local backend through the manager."""
 
         return await _manager_resources._close_handle(
-            self,
             handle,
         )
 

@@ -1,7 +1,7 @@
 [project]
 name = "tinkerfin"
 version = "0.1.0"
-description = "Request-scoped native, AG-UI, and SSE streaming for Deep Agents."
+description = "Request-scoped Native, Plan, Observation, and optional AG-UI streaming."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
@@ -16,17 +16,23 @@ classifiers = [
 ]
 
 dependencies = [
-    "ag-ui-protocol==0.1.19",
     "deepagents==0.7.5",
     "langchain==1.3.14",
-    "langchain-core>=1.5.3,<1.6.0",
-    "langgraph>=1.2.10,<1.3.0",
+    "langchain-core==1.5.3",
+    "langgraph==1.2.10",
+    "jsonschema>=4.25,<5",
     "pydantic>=2,<3",
-    "tinkerfin-agui-adapter>=0.1.0,<0.9.0",
+    "tinkerfin-contracts>=0.1.0,<0.9.0",
+    "tinkerfin-native-stream>=0.1.0,<0.9.0",
+    "typing-extensions>=4.12.2,<5",
     "wcmatch>=11,<12",
 ]
 
 [project.optional-dependencies]
+agui = [
+    "ag-ui-protocol==0.1.19",
+    "tinkerfin-agui-adapter>=0.1.0,<0.9.0",
+]
 redis = ["redis>=6,<9"]
 
 [project.urls]
@@ -46,3 +52,5 @@ tinkerfin = ["*.pyi", "py.typed"]
 
 [tool.uv.sources]
 tinkerfin-agui-adapter = { workspace = true }
+tinkerfin-contracts = { workspace = true }
+tinkerfin-native-stream = { workspace = true }

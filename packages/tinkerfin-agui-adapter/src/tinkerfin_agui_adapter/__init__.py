@@ -5,8 +5,21 @@ from ._json_schema import (
     validate_json_schema_instance as validate_json_schema_instance,
 )
 from .adapter import DeepAgentAgUiAdapter as DeepAgentAgUiAdapter
+from .adapter import (
+    ValidatedDeepAgentStreamPart as ValidatedDeepAgentStreamPart,
+)
+from .adapter import ValidatedExtraStreamPart as ValidatedExtraStreamPart
+from .adapter import ValidatedMessageStreamPart as ValidatedMessageStreamPart
+from .adapter import ValidatedTaskResultPayload as ValidatedTaskResultPayload
+from .adapter import ValidatedTasksStreamPart as ValidatedTasksStreamPart
+from .adapter import ValidatedTaskStartPayload as ValidatedTaskStartPayload
+from .adapter import ValidatedUpdatesStreamPart as ValidatedUpdatesStreamPart
+from .adapter import ValidatedValuesStreamPart as ValidatedValuesStreamPart
+from .adapter import (
+    validate_deep_agent_stream_part as validate_deep_agent_stream_part,
+)
 from .contracts import AgentRunOutcome as AgentRunOutcome
-from .contracts import Identity as Identity
+from .contracts import RunIdentity as RunIdentity
 from .errors import AgUiAdapterError as AgUiAdapterError
 from .errors import AgUiAdapterErrorCode as AgUiAdapterErrorCode
 from .errors import AgUiConversionError as AgUiConversionError
@@ -57,10 +70,10 @@ __all__ = [
     "HitlNoMatchError",
     "HitlRequest",
     "HitlReviewConfig",
-    "Identity",
     "ResumeMapper",
     "ResumeMappingError",
     "ResumeTranslation",
+    "RunIdentity",
     "RuntimeInterruptEnvelope",
     "ScopedIdCodec",
     "SseEventId",
@@ -68,6 +81,14 @@ __all__ = [
     "ToolReviewContractError",
     "ToolReviewDecision",
     "ToolReviewInterruptMetadata",
+    "ValidatedDeepAgentStreamPart",
+    "ValidatedExtraStreamPart",
+    "ValidatedMessageStreamPart",
+    "ValidatedTaskResultPayload",
+    "ValidatedTaskStartPayload",
+    "ValidatedTasksStreamPart",
+    "ValidatedUpdatesStreamPart",
+    "ValidatedValuesStreamPart",
     "astream_events",
     "create_subagent_provenance",
     "encode_sse",
@@ -75,5 +96,6 @@ __all__ = [
     "parse_tool_review_interrupt",
     "require_valid_schema",
     "subagent_invocation_id",
+    "validate_deep_agent_stream_part",
     "validate_json_schema_instance",
 ]

@@ -19,7 +19,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
-from tinkerfin_agui_adapter import Identity
+from tinkerfin_contracts import RunIdentity
 
 from ._identity import required_identifier, required_identity
 from ._redis_control import (
@@ -41,6 +41,7 @@ from .errors import (
     RunNotFound,
     RunProducerFailed,
     StreamDeleted,
+    StreamExpired,
 )
 from .models import MessageEnvelope, RecoveryCheckpoint
 
@@ -52,12 +53,35 @@ async def prepare(
     self: RedisBackend,
     *,
     channel: str,
-    identity: Identity,
+    identity: RunIdentity,
     codec: str,
     after: int | None,
     cancellable: bool,
     recoverable: bool,
 ) -> PreparedRun:
+    """Atomically start, recover, or attach within one thread generation.
+
+    The Lua contract validates codec, limits, cursor, active-run exclusion, recovery
+    capability, and lease acquisition together. A delete/recreate race restarts the
+    lookup instead of binding the caller to a stale generation.
+
+    Args:
+        self: Redis Backend owning the current channel namespace and worker lease.
+        channel: Canonical logical channel name.
+        identity: Exact thread and semantic Run identity.
+        codec: Persisted codec identity required by every generation.
+        after: Optional exclusive replay cursor.
+        cancellable: Whether the new owner exposes remote cancellation.
+        recoverable: Whether the source can restart from a committed checkpoint.
+
+    Returns:
+        Owner or attachment preparation bound to one current generation.
+
+    Raises:
+        MessagingError: Redis state rejects or cannot prove the requested preparation.
+        TypeError: ``after`` has the wrong type.
+    """
+
     required_identifier("channel", channel)
     required_identity(identity)
     required_identifier("codec", codec)
@@ -75,7 +99,13 @@ async def prepare(
                 identity=identity,
                 generation=control.generation,
             )
-        elif control.state == "deleted":
+        elif control.state in {"deleted", "expired"}:
+            if control.state == "expired" and after not in {None, 0}:
+                raise StreamExpired(
+                    channel=channel,
+                    identity=identity,
+                    generation=control.generation,
+                )
             generation = control.generation + 1
         else:
             generation = control.generation
@@ -106,10 +136,14 @@ async def prepare(
                 str(self._limits.max_checkpoint_bytes),
                 str(self._limits.max_thread_messages),
                 str(self._limits.max_thread_payload_bytes),
+                str(self._retention_ms),
             ],
         )
         code = self._text(response[0])
         if code == "GENERATION_CHANGED":
+            continue
+        if code == "STREAM_EXPIRING":
+            await self._read_control(scope)
             continue
         if code == "STREAM_DELETED":
             raise StreamDeleted(
@@ -125,6 +159,10 @@ async def prepare(
             raise _redis_protocol_error(
                 "Redis channel was opened with different MessagingLimits"
             )
+        if code == "RETENTION_MISMATCH":
+            raise _redis_protocol_error(
+                "Redis channel was opened with a different retention policy"
+            )
         break
     if code == "INVALID_CURSOR":
         raise InvalidCursor(
@@ -138,7 +176,7 @@ async def prepare(
         )
     if code == "RUN_ACTIVE":
         raise RunAlreadyActive(
-            active_identity=Identity(
+            active_identity=RunIdentity(
                 threadId=identity.thread_id,
                 runId=self._text(response[1]),
             ),
@@ -191,6 +229,27 @@ async def append(
     payload: bytes,
     checkpoint: RecoveryCheckpoint | None = None,
 ) -> MessageEnvelope:
+    """Append one fenced, quota-checked, idempotent message and checkpoint.
+
+    Message-ID deduplication compares a digest of identity, codec, payload, and optional
+    checkpoint before allocating sequence or quota. The current generation, owner token,
+    and fence must still match in the same Lua transaction.
+
+    Args:
+        self: Redis Backend owning the producer fence.
+        handle: Exact owned generation, token, and fence.
+        message_id: Stable idempotency key within the stream.
+        codec: Codec identity already bound during preparation.
+        payload: Finite encoded message bytes.
+        checkpoint: Optional source position committed atomically with the message.
+
+    Returns:
+        The committed immutable envelope, including its allocated sequence.
+
+    Raises:
+        MessagingError: Ownership, idempotency, codec, quota, or Redis evidence fails.
+    """
+
     _validate_append_input(
         handle,
         message_id=message_id,
@@ -287,13 +346,23 @@ async def append(
     )
 
 
-async def latest_seq(self: RedisBackend, *, channel: str, identity: Identity) -> int:
+async def latest_seq(self: RedisBackend, *, channel: str, identity: RunIdentity) -> int:
+    """Return the current generation tail, retrying a concurrent generation change."""
+
     required_identifier("channel", channel)
     required_identity(identity)
     scope = self._scope(channel, identity)
     while True:
         control = await self._read_control(scope)
-        if control is None or control.state != "active":
+        if control is None:
+            return 0
+        if control.state == "expired":
+            raise StreamExpired(
+                channel=channel,
+                identity=identity,
+                generation=control.generation,
+            )
+        if control.state != "active":
             return 0
         keys = self._keys(
             channel,
@@ -312,10 +381,32 @@ async def read(
     self: RedisBackend,
     *,
     channel: str,
-    identity: Identity,
+    identity: RunIdentity,
     after: int = 0,
     limit: int = 100,
 ) -> tuple[MessageEnvelope, ...]:
+    """Read one finite page from a generation proven current after the Redis query.
+
+    The control row is checked again after reading metadata and stream entries. This
+    prevents a delete/recreate race from combining a cursor or payloads from different
+    generations.
+
+    Args:
+        self: Redis Backend owning the channel namespace.
+        channel: Canonical logical channel name.
+        identity: Exact thread and semantic Run identity.
+        after: Exclusive committed sequence cursor.
+        limit: Maximum envelopes returned in this page.
+
+    Returns:
+        Ascending immutable envelopes from one proven current generation.
+
+    Raises:
+        MessagingError: The stream, cursor, payload, or Redis evidence is invalid.
+        TypeError: Cursor or limit has the wrong type.
+        ValueError: Cursor or limit is outside the supported range.
+    """
+
     if isinstance(after, bool) or not isinstance(after, int):
         raise TypeError("after must be an integer")
     if after < 0:
@@ -329,6 +420,12 @@ async def read(
     scope = self._scope(channel, identity)
     while True:
         control = await self._read_control(scope)
+        if control is not None and control.state == "expired":
+            raise StreamExpired(
+                channel=channel,
+                identity=identity,
+                generation=control.generation,
+            )
         if control is None or control.state != "active":
             if after > 0:
                 raise InvalidCursor(after=after, latest=0)
@@ -370,7 +467,7 @@ async def bind_follow(
     self: RedisBackend,
     *,
     channel: str,
-    identity: Identity,
+    identity: RunIdentity,
     after: int,
 ) -> BackendRunHandle:
     """Resolve one follower and validate its cursor against one generation."""
@@ -384,6 +481,12 @@ async def bind_follow(
     scope = self._scope(channel, identity)
     while True:
         control = await self._read_control(scope)
+        if control is not None and control.state == "expired":
+            raise StreamExpired(
+                channel=channel,
+                identity=identity,
+                generation=control.generation,
+            )
         if control is None or control.state != "active":
             raise RunNotFound(identity=identity)
         unresolved = BackendRunHandle(
@@ -422,6 +525,24 @@ def follow(
     *,
     after: int,
 ) -> AsyncGenerator[MessageEnvelope, None]:
+    """Follow one previously bound generation until its authoritative terminal state.
+
+    Snapshot pages and signals share the bound handle. Producer failure or owner loss
+    terminates with ``RunProducerFailed`` after all committed messages are yielded;
+    successful and cancelled runs end normally.
+
+    Args:
+        self: Redis Backend owning snapshot and signal reads.
+        handle: Previously bound immutable generation handle.
+        after: Exclusive sequence already delivered to the follower.
+
+    Returns:
+        Cancellation-responsive iterator over ascending committed envelopes.
+
+    Raises:
+        MessagingError: Generation, producer, cursor, payload, or Redis evidence fails.
+    """
+
     async def iterate() -> AsyncGenerator[MessageEnvelope, None]:
         keys = await self._keys_for_handle(handle)
         cursor = after
@@ -455,7 +576,7 @@ def _snapshot_messages(
     value: _RedisScriptValue,
     *,
     channel: str,
-    identity: Identity,
+    identity: RunIdentity,
     after: int | None,
     end_seq: int,
 ) -> tuple[MessageEnvelope, ...]:
@@ -540,7 +661,7 @@ def _snapshot_messages(
 def _decode_entry(
     self: RedisBackend,
     channel: str,
-    identity: Identity,
+    identity: RunIdentity,
     entry: tuple[bytes, Mapping[bytes, bytes]],
 ) -> MessageEnvelope:
     identifier, raw_fields = entry
@@ -548,7 +669,7 @@ def _decode_entry(
     seq = int(self._text(identifier).split("-", maxsplit=1)[0])
     return MessageEnvelope(
         channel=channel,
-        identity=Identity(
+        identity=RunIdentity(
             threadId=identity.thread_id,
             runId=self._text(fields["run"]),
         ),
@@ -566,13 +687,13 @@ def _decode_entry(
 
 def _message_signature(
     *,
-    identity: Identity,
+    identity: RunIdentity,
     codec: str,
     payload: bytes,
     checkpoint: RecoveryCheckpoint | None,
 ) -> str:
     digest = hashlib.sha256()
-    digest.update(b"tinkerfin-messaging:redis-message:v1\0")
+    digest.update(b"tinkerfin-messaging:redis-message\0")
     values = [identity.run_id.encode(), codec.encode(), payload]
     if checkpoint is not None:
         values.extend(

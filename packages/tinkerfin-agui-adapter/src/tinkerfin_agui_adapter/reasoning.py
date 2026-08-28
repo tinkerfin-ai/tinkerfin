@@ -18,6 +18,15 @@ def normalize_operational_data(value: object) -> JsonValue:
     Tool arguments and results must remain semantically identical to the proposal
     that is approved or executed. Unsupported opaque objects fail before event
     construction instead of being stringified implicitly.
+
+    Args:
+        value: Operational value from a typed or untyped upstream boundary.
+
+    Returns:
+        Finite JSON data preserving every non-private operational field.
+
+    Raises:
+        ValueError: The value is opaque, non-finite, or not JSON representable.
     """
 
     normalized = _JSON_VALUE_ADAPTER.validate_python(to_jsonable_python(value))

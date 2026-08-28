@@ -269,7 +269,7 @@ columns fail startup and must be rebuilt before a DML-only runtime account is st
 
 Persistent state coordinates allocation, binding, warm slots, owner fencing, and
 cleanup. It does not serialize complete graph runs; use an application run coordinator
-when graph execution also requires per-Identity exclusion.
+when graph execution also requires per-RunIdentity exclusion.
 
 Consuming a ready warm slot atomically commits that Sandbox as the owner binding; the
 manager does not bind it a second time. An on-demand bind whose response fails or is

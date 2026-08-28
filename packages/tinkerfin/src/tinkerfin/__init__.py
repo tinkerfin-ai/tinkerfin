@@ -1,23 +1,19 @@
 """Request-scoped Deep Agents runtime with native, AG-UI, and SSE streams."""
 
-from tinkerfin_agui_adapter import Identity as Identity
+from typing import TYPE_CHECKING
+
+from tinkerfin_contracts import RunIdentity as RunIdentity
+from tinkerfin_native_stream import NativeStreamFrame as NativeStreamFrame
 
 from ._hitl import TINKERFIN_HITL_CONTRACT as TINKERFIN_HITL_CONTRACT
+from ._optional_dependencies import require_agui
 from ._tasks import join_task as join_task
-from .agui_resume import AgUiResumeBinding as AgUiResumeBinding
-from .agui_resume import AgUiResumeCheckpoint as AgUiResumeCheckpoint
-from .agui_resume import (
-    AgUiResumeCheckpointObserver as AgUiResumeCheckpointObserver,
-)
 from .coordination import InMemoryRunCoordinator as InMemoryRunCoordinator
 from .coordination import RunCoordinator as RunCoordinator
 from .deep_agent import DeepAgentAgUiResumeRuntime as DeepAgentAgUiResumeRuntime
 from .deep_agent import DeepAgentAgUiRuntime as DeepAgentAgUiRuntime
 from .deep_agent import DeepAgentDefinition as DeepAgentDefinition
 from .deep_agent import DeepAgentRuntime as DeepAgentRuntime
-from .errors import (
-    AgUiNativeStreamConfigurationError as AgUiNativeStreamConfigurationError,
-)
 from .errors import AgUiResumeBindingError as AgUiResumeBindingError
 from .errors import RedisLeaseError as RedisLeaseError
 from .errors import RedisLeaseLifecycleError as RedisLeaseLifecycleError
@@ -32,10 +28,15 @@ from .errors import RunCoordinationTimeoutError as RunCoordinationTimeoutError
 from .errors import (
     RunCoordinationUnavailableError as RunCoordinationUnavailableError,
 )
+from .errors import RunObservationError as RunObservationError
 from .errors import TinkerFinError as TinkerFinError
 from .errors import TinkerFinErrorCode as TinkerFinErrorCode
 from .errors import TinkerFinLifecycleError as TinkerFinLifecycleError
 from .errors import TinkerFinStreamProtocolError as TinkerFinStreamProtocolError
+from .native_driver import DeepAgentsV2StreamDriver as DeepAgentsV2StreamDriver
+from .native_driver import DeepSeekReasoningExtractor as DeepSeekReasoningExtractor
+from .native_driver import NativeStreamDriver as NativeStreamDriver
+from .native_driver import ReasoningExtractor as ReasoningExtractor
 from .plan import AgentMode as AgentMode
 from .runtime import AgUiEventStream as AgUiEventStream
 from .runtime import AgUiSettlementTimeoutError as AgUiSettlementTimeoutError
@@ -49,27 +50,75 @@ from .runtime import SseMapper as SseMapper
 from .runtime import SsePayload as SsePayload
 from .runtime import SsePreflight as SsePreflight
 from .runtime import TinkerFin as TinkerFin
+from .runtime_profile import (
+    DeepAgentsFactoryPreparation as DeepAgentsFactoryPreparation,
+)
+from .runtime_profile import DeepAgentsRuntimeProfile as DeepAgentsRuntimeProfile
+from .runtime_profile import DeepAgentsV2RuntimeProfile as DeepAgentsV2RuntimeProfile
+
+if TYPE_CHECKING:
+    from .agui_resume import AgUiResumeBinding as AgUiResumeBinding
+    from .agui_resume import AgUiResumeCheckpoint as AgUiResumeCheckpoint
+    from .agui_resume import (
+        AgUiResumeCheckpointObserver as AgUiResumeCheckpointObserver,
+    )
+    from .agui_resume import (
+        AgUiResumeInitializationFailureObserver as AgUiResumeInitializationFailureObserver,
+    )
+    from .agui_resume import AgUiResumeRequest as AgUiResumeRequest
+
+_AGUI_RESUME_EXPORTS = frozenset(
+    {
+        "AgUiResumeBinding",
+        "AgUiResumeCheckpoint",
+        "AgUiResumeCheckpointObserver",
+        "AgUiResumeInitializationFailureObserver",
+        "AgUiResumeRequest",
+    }
+)
+
+
+def __getattr__(name: str) -> object:
+    """Load AG-UI resume contracts only when their optional extra is present."""
+
+    if name not in _AGUI_RESUME_EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    require_agui()
+    from . import agui_resume
+
+    value = getattr(agui_resume, name)
+    globals()[name] = value
+    return value
+
 
 __all__ = [
     "TINKERFIN_HITL_CONTRACT",
     "AgUiEventStream",
-    "AgUiNativeStreamConfigurationError",
     "AgUiResumeBinding",
     "AgUiResumeBindingError",
     "AgUiResumeCheckpoint",
     "AgUiResumeCheckpointObserver",
+    "AgUiResumeInitializationFailureObserver",
+    "AgUiResumeRequest",
     "AgUiSettlementTimeoutError",
     "AgentMode",
     "DeepAgentAgUiResumeRuntime",
     "DeepAgentAgUiRuntime",
     "DeepAgentDefinition",
     "DeepAgentRuntime",
+    "DeepAgentsFactoryPreparation",
+    "DeepAgentsRuntimeProfile",
+    "DeepAgentsV2RuntimeProfile",
+    "DeepAgentsV2StreamDriver",
+    "DeepSeekReasoningExtractor",
     "EventObserver",
-    "Identity",
     "InMemoryRunCoordinator",
     "NativeGraphRunStream",
+    "NativeStreamDriver",
+    "NativeStreamFrame",
     "NativeStreamPart",
     "PartObserver",
+    "ReasoningExtractor",
     "RedisLeaseError",
     "RedisLeaseLifecycleError",
     "RedisLeaseProtocolError",
@@ -80,6 +129,8 @@ __all__ = [
     "RunCoordinationTimeoutError",
     "RunCoordinationUnavailableError",
     "RunCoordinator",
+    "RunIdentity",
+    "RunObservationError",
     "SseBody",
     "SseEventIdResolver",
     "SseMapper",

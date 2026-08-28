@@ -16,6 +16,8 @@ from pydantic import (
     model_validator,
 )
 
+from tinkerfin_studio.agent.runtime_profiles import RuntimeProfileId
+
 ModelId = Annotated[
     str,
     StringConstraints(
@@ -47,6 +49,9 @@ class AgentModelWrite(BaseModel):
     reasoning_enabled: bool = Field(
         default=False, description="是否启用 provider reasoning 参数"
     )
+    runtime_profile: RuntimeProfileId = Field(
+        description="创建与恢复 Run 使用的已安装 Runtime Profile",
+    )
     enabled: bool = Field(default=True, description="是否允许创建新 run")
     is_default: bool = Field(default=False, description="是否设为唯一默认模型")
     sort_order: int = Field(default=0, description="模型目录升序排序值")
@@ -75,6 +80,9 @@ class AgentModelCatalogItem(BaseModel):
     reasoning_enabled: bool = Field(
         alias="reasoningEnabled", description="是否启用 reasoning"
     )
+    runtime_profile: RuntimeProfileId = Field(
+        alias="runtimeProfile", description="模型绑定的 Runtime Profile"
+    )
     is_default: bool = Field(alias="isDefault", description="是否为默认模型")
 
 
@@ -101,4 +109,5 @@ class AgentModelConfig(BaseModel):
     base_url: str
     api_key: SecretStr
     reasoning_enabled: bool
+    runtime_profile: RuntimeProfileId
     updated_at: str

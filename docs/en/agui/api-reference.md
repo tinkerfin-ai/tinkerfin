@@ -7,10 +7,12 @@
 | API | Use |
 | --- | --- |
 | `DeepAgentDefinition.new_agui(...)` | Creates one AG-UI Runtime |
+| `DeepAgentDefinition.prepare_agui_resume(...)` | Resolves client decisions from the canonical Graph checkpoint |
 | `DeepAgentAgUiRuntime.astream(graph_input, ...)` | Runs an ordinary Graph request |
 | `DeepAgentAgUiResumeRuntime.astream(...)` | Runs a bound resume without caller input |
 | `AgUiEventStream` | Iterates, aborts, closes, or renders AG-UI events |
-| `AgUiResumeBinding.from_agui(...)` | Validates persisted interrupts, decisions, cancellation, Tool IDs, and sources |
+| `AgUiResumeRequest` | Carries only untrusted client decisions into checkpoint resolution |
+| `AgUiResumeBinding` | Private framework-resolved resume facts accepted by `new_agui(...)` |
 | `AgUiResumeCheckpoint` | Stable evidence that a native resume marker is durable |
 | `TINKERFIN_HITL_CONTRACT` | Contract declaration for external mixed-cancellation subagents |
 
@@ -31,7 +33,7 @@ See [AG-UI basics](index.md) for Runtime parameters and [Interrupts and resume](
 | --- | --- |
 | `process(part)` | Validate and convert one complete native part |
 | `finish()` | Close remaining text, reasoning, and tool lifecycles normally |
-| `abort(code=...)` | Close open child lifecycles after failure or cancellation |
+| `abort()` | Close open child lifecycles; the orchestrator still owns the one main terminal |
 | `main_outcome()` | Return success or interrupt outcome |
 
 ## `AgUiLifecycleEventFactory`
@@ -51,7 +53,9 @@ See [AG-UI basics](index.md) for Runtime parameters and [Interrupts and resume](
 
 | API | Use |
 | --- | --- |
-| `AgUiResumeBinding.from_agui(...)` | Build the high-level binding from trusted persisted AG-UI interrupts |
+| `DeepAgentDefinition.prepare_agui_resume(...)` | Restore pending facts from the canonical checkpoint and build the high-level binding |
+| `AgUiResumeRequest` | Immutable, non-empty, duplicate-free client resume entries |
+| `AgUiResumeBinding.from_agui(...)` | Advanced path for an integration that owns a complete trusted AG-UI terminal log |
 | `AgUiResumeBinding.model_validate(...)` | Restore the complete stable binding JSON model |
 | `AgUiResumeBindingError` | High-level binding cannot preserve the supplied resume semantics |
 | `ResumeMapper.map(...)` | Map from native interrupts and checkpoint messages |
@@ -59,9 +63,12 @@ See [AG-UI basics](index.md) for Runtime parameters and [Interrupts and resume](
 | `ResumeTranslation` | Holds kind, mode, resume data, cancellations, Tool IDs, sources, and native decisions |
 | `ResumeMappingError` | Low-level Adapter data cannot be mapped without losing semantics |
 
-`ResumeTranslation` is the lower-level Adapter result. High-level Runtime callers use
-`AgUiResumeBinding.from_agui(...)`; the binding internally represents fully resolved,
-mixed Tool cancellation, or all-cancelled abandonment without exposing a native command.
+`ResumeTranslation` is the lower-level Adapter result. High-level Runtime callers pass
+an `AgUiResumeRequest` to `prepare_agui_resume(...)`; the Definition restores native
+interrupts and complete messages from the checkpointer. The returned binding represents
+fully resolved, mixed Tool cancellation, or all-cancelled abandonment without exposing
+a native command. `from_agui(...)` is only for a trusted event-log integration and must
+not consume client-resubmitted interrupt details.
 
 ## Interrupt data
 

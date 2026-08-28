@@ -1,4 +1,4 @@
-"""Optional Redis leases and Identity-driven run coordination."""
+"""Optional Redis leases and RunIdentity-driven run coordination."""
 
 from __future__ import annotations
 

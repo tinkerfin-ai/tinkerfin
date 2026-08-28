@@ -8,11 +8,10 @@ from typing import NoReturn, Self
 
 from langgraph.checkpoint.redis.aio import AsyncRedisSaver
 from langgraph.store.base import BaseStore
-from langgraph.store.mysql.asyncmy import AsyncMyStore
 from redis.asyncio import Redis
-from sqlalchemy.engine import make_url
 
-from tinkerfin_studio.config.settings import DatabaseSettings, RedisSettings
+from tinkerfin_langgraph_mysql import AsyncMyStore
+from tinkerfin_studio.config.settings import DatabaseSettings, RedisRuntimeSettings
 from tinkerfin_studio.infrastructure.redis_client import create_redis_client
 
 
@@ -124,7 +123,7 @@ class AgentPersistence:
     def __init__(
         self,
         database: DatabaseSettings,
-        redis: RedisSettings,
+        redis: RedisRuntimeSettings,
     ) -> None:
         self._database_settings = database
         self._redis_settings = redis
@@ -149,17 +148,14 @@ class AgentPersistence:
         return self._checkpointer
 
     async def __aenter__(self) -> Self:
-        """初始化 Store connection、Redis client 和 checkpoint 索引"""
+        """初始化单条 Store connection、Runtime Redis client 和 checkpoint 索引"""
 
         if self._resources is not None:
             raise RuntimeError("Agent persistence 已经启动")
-        database_url = make_url(self._database_settings.url)
-        store_url = database_url.set(drivername="mysql").render_as_string(
-            hide_password=False
-        )
         resources = _PersistenceResources()
         try:
-            store_resource = AsyncMyStore.from_conn_string(store_url)
+            # Store 集成负责 URL、当前 DDL 与连接清理，Studio 只提供宿主配置
+            store_resource = AsyncMyStore.from_conn_string(self._database_settings.url)
             store = await resources.enter_store(store_resource)
             checkpoint_redis = create_redis_client(
                 self._redis_settings,
@@ -172,7 +168,6 @@ class AgentPersistence:
                 checkpoint_prefix=self._redis_settings.checkpoint_prefix,
                 checkpoint_write_prefix=self._redis_settings.checkpoint_write_prefix,
             )
-            await store.setup()
             await checkpointer.asetup()
         except BaseException as error:
             failures = await resources.settle(

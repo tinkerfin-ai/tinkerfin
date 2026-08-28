@@ -19,14 +19,15 @@ from pydantic_core import PydanticSerializationError
 from tinkerfin_agui_adapter import (
     AgUiStreamContractError,
     DeepAgentAgUiAdapter,
-    Identity,
+    RunIdentity,
     astream_events,
 )
 from tinkerfin_agui_adapter.microbatch import ContentBatcher, micro_batch
+from tinkerfin_native_stream import NativeStreamContractError
 
 
-def _identity() -> Identity:
-    return Identity(threadId="thread-1", runId="run-1")
+def _identity() -> RunIdentity:
+    return RunIdentity(threadId="thread-1", runId="run-1")
 
 
 def _message_part(message: AIMessageChunk) -> dict[str, object]:
@@ -234,7 +235,8 @@ def test_malformed_v2_container_shapes_are_rejected_without_state_mutation(
 
     with pytest.raises(AgUiStreamContractError) as raised:
         adapter.process(malformed_part)
-    assert isinstance(raised.value.cause, ValidationError)
+    assert isinstance(raised.value.cause, NativeStreamContractError)
+    assert isinstance(raised.value.cause.cause, ValidationError)
 
     assert [event.type.value for event in adapter.finish()] == ["TEXT_MESSAGE_END"]
 
@@ -290,7 +292,8 @@ def test_native_v2_objects_and_tuple_fields_reject_coerced_shapes_before_mutatio
 
     with pytest.raises(AgUiStreamContractError) as raised:
         adapter.process(malformed_part)
-    assert isinstance(raised.value.cause, ValidationError)
+    assert isinstance(raised.value.cause, NativeStreamContractError)
+    assert isinstance(raised.value.cause.cause, ValidationError)
 
     assert [event.type.value for event in adapter.finish()] == ["TEXT_MESSAGE_END"]
 

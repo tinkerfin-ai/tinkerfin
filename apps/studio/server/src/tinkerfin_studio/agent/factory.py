@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable, Mapping
 from functools import partial
 from pathlib import Path
 from typing import cast
@@ -22,11 +23,12 @@ from langchain_core.tools import BaseTool
 from pydantic import BaseModel, ConfigDict, Field, RootModel
 
 from tinkerfin import (
-    AgUiEventStream,
-    AgUiResumeBinding,
     AgUiResumeCheckpointObserver,
+    AgUiResumeInitializationFailureObserver,
+    AgUiResumeRequest,
     DeepAgentDefinition,
     TinkerFin,
+    join_task,
 )
 from tinkerfin.plan import PlanReviewAction
 from tinkerfin_messaging import (
@@ -129,12 +131,12 @@ class ConversationAgentFactory:
         *,
         persistence: AgentPersistence,
         sandbox_manager: OpenSandboxManager[str],
-        tinkerfin: TinkerFin,
+        tinkerfin_profiles: Mapping[str, TinkerFin],
         tavily_api_key: str | None,
     ) -> None:
         self._persistence = persistence
         self._sandbox_manager = sandbox_manager
-        self._tinkerfin = tinkerfin
+        self._tinkerfin_profiles = dict(tinkerfin_profiles)
         self._tavily_api_key = tavily_api_key
 
     def create_agui_events(
@@ -144,13 +146,79 @@ class ConversationAgentFactory:
         model_config: AgentModelConfig,
         graph_input: InputAgentState | None,
         prepared: PreparedRunRequest,
-        resume: AgUiResumeBinding | None,
+        resume: AgUiResumeRequest | None,
         title: str,
+        on_producer_opened: Callable[[], Awaitable[None]],
         on_resume_checkpointed: AgUiResumeCheckpointObserver | None = None,
+        on_resume_initialization_failed: (
+            AgUiResumeInitializationFailureObserver | None
+        ) = None,
     ) -> ProfiledDeferredMessageSource[BaseEvent, BaseEvent]:
-        """返回仅由 Messaging producer owner 打开的 AG-UI 事件源"""
+        """返回仅由 Messaging producer owner 打开的 AG-UI 事件源
+
+        恢复请求已经在短事务中认领公开 ID，但 checkpointer 解析仍由延迟 owner 执行
+        初始化失败或取消时必须先可靠释放未 checkpoint 的认领，避免无效客户端输入
+        永久占用后续恢复机会
+
+        Args:
+            user_id: 已通过认证与会话归属校验的用户 ID
+            model_config: 已解密且绑定当前 Runtime Profile 的模型配置
+            graph_input: 普通运行的业务 Graph 输入；恢复运行为空
+            prepared: 已固定身份、谱系、mode 与 Graph 配置的请求
+            resume: 只含客户端决定的恢复请求；普通运行为空
+            title: 注入 Agent 的当前会话标题
+            on_producer_opened: Messaging owner 建立后、业务源打开前的激活回调
+            on_resume_checkpointed: marker 可读后结算业务认领的幂等回调
+            on_resume_initialization_failed: marker 前失败时释放业务认领的幂等回调
+
+        Returns:
+            只会被真正 Messaging producer owner 打开一次的延迟事件源
+
+        Raises:
+            RuntimeError: 模型绑定的 Runtime Profile 不在当前 Worker 目录
+        """
+
+        tinkerfin = self._tinkerfin_profiles.get(model_config.runtime_profile)
+        if tinkerfin is None:
+            raise RuntimeError("模型绑定的 Runtime Profile 在当前 Worker 不可用")
 
         async def open_events() -> MessageSourceBinding[BaseEvent]:
+            resolved_resume = None
+
+            async def release_resume_claims() -> None:
+                callback = on_resume_initialization_failed
+                if resume is None or callback is None:
+                    return
+
+                async def release() -> None:
+                    await callback()
+
+                cleanup = asyncio.create_task(
+                    release(),
+                    name=f"studio-resume-claim-release:{prepared.identity.run_id}",
+                )
+                await join_task(cleanup)
+
+            async def release_preserving(primary: BaseException) -> None:
+                """释放 marker 前认领，同时保持主失败或取消语义"""
+
+                try:
+                    await release_resume_claims()
+                except BaseException as cleanup_error:  # 保留初始化与清理的主次顺序
+                    if not isinstance(primary, Exception):
+                        primary.add_note(
+                            f"恢复认领释放同时失败：{type(cleanup_error).__name__}"
+                        )
+                        return
+                    if not isinstance(cleanup_error, Exception):
+                        cleanup_error.add_note(
+                            f"Agent Runtime 初始化同时失败：{type(primary).__name__}"
+                        )
+                        raise
+                    primary.add_note(
+                        f"恢复认领释放同时失败：{type(cleanup_error).__name__}"
+                    )
+
             try:
                 definition = await self._create_definition(
                     user_id=user_id,
@@ -174,27 +242,43 @@ class ConversationAgentFactory:
                         config=prepared.graph_config,
                     )
                 else:
+                    resolved_resume = await definition.prepare_agui_resume(
+                        identity=prepared.identity,
+                        parent_run_id=prepared.parent_run_id,
+                        mode=prepared.mode,
+                        request=resume,
+                    )
                     resume_runtime = await to_thread.run_sync(
                         partial(
                             definition.new_agui,
                             identity=prepared.identity,
                             parent_run_id=prepared.parent_run_id,
                             mode=prepared.mode,
-                            resume=resume,
+                            resume=resolved_resume,
                             on_resume_checkpointed=on_resume_checkpointed,
+                            on_resume_initialization_failed=(
+                                on_resume_initialization_failed
+                            ),
                             expose_reasoning_events=False,
                             expose_subagent_events=True,
                         )
                     )
                     agent_events = resume_runtime.astream(config=prepared.graph_config)
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as cancellation:
+                await release_preserving(cancellation)
                 raise
             except Exception as error:
+                await release_preserving(error)
                 logger.exception("创建会话 Agent Runtime 失败")
-                agent_events = AgUiEventStream.from_initialization_error(
+                agent_events = tinkerfin.failed_agui_run(
                     error,
                     identity=prepared.identity,
                     parent_run_id=prepared.parent_run_id,
+                    mode=prepared.mode,
+                    input=graph_input,
+                    config=prepared.graph_config,
+                    resume=resolved_resume,
+                    resume_request=(resume if resolved_resume is None else None),
                 )
 
             def attach_run_metadata(event: BaseEvent) -> BaseEvent:
@@ -214,6 +298,7 @@ class ConversationAgentFactory:
             replay_type=BaseEvent,
             cancellable=True,
             cancel_after_first_item=True,
+            on_owner_preflight=on_producer_opened,
         )
 
     async def _create_definition(
@@ -224,6 +309,9 @@ class ConversationAgentFactory:
     ) -> DeepAgentDefinition[None]:
         """准备一次请求借用的模型、Sandbox 与 Deep Agent 建图参数"""
 
+        tinkerfin = self._tinkerfin_profiles.get(model_config.runtime_profile)
+        if tinkerfin is None:
+            raise RuntimeError("模型绑定的 Runtime Profile 在当前 Worker 不可用")
         sandbox = await self._sandbox_manager.get(f"users/{user_id}")
         backend = CompositeBackend(
             default=sandbox,
@@ -281,7 +369,7 @@ class ConversationAgentFactory:
             ),
         )
         # Studio 计划草稿只允许批准、反馈和拒绝，避免客户端与恢复 Schema 漂移
-        return self._tinkerfin.plan(
+        return tinkerfin.plan(
             enabled=True,
             planner_model=plan_model,
             clarification_schema=StudioPlanClarificationForm,

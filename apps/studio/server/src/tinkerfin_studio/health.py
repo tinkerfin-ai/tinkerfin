@@ -23,13 +23,15 @@ class ReadinessService:
         self,
         *,
         database: Database,
-        redis: Redis,
+        redis_control: Redis,
+        redis_runtime: Redis,
         sandbox: SandboxSettings,
         http_client: httpx.AsyncClient,
         timeout_seconds: float = 3,
     ) -> None:
         self._database = database
-        self._redis = redis
+        self._redis_control = redis_control
+        self._redis_runtime = redis_runtime
         self._sandbox = sandbox
         self._http_client = http_client
         self._timeout_seconds = timeout_seconds
@@ -38,9 +40,13 @@ class ReadinessService:
         async with self._database.engine.connect() as connection:
             await connection.execute(text("SELECT 1"))
 
-    async def _check_redis(self) -> None:
-        if not await cast(Awaitable[bool], self._redis.ping()):
-            raise RuntimeError("Redis PING 未返回成功")
+    async def _check_redis_control(self) -> None:
+        if not await cast(Awaitable[bool], self._redis_control.ping()):
+            raise RuntimeError("Redis Control PING 未返回成功")
+
+    async def _check_redis_runtime(self) -> None:
+        if not await cast(Awaitable[bool], self._redis_runtime.ping()):
+            raise RuntimeError("Redis Runtime PING 未返回成功")
 
     async def _check_opensandbox(self) -> None:
         headers = {}
@@ -69,13 +75,15 @@ class ReadinessService:
     async def check(self) -> dict[str, bool]:
         """返回不含异常和凭据的稳定组件状态"""
 
-        mysql, redis, opensandbox = await asyncio.gather(
+        mysql, redis_control, redis_runtime, opensandbox = await asyncio.gather(
             self._safe(self._check_mysql),
-            self._safe(self._check_redis),
+            self._safe(self._check_redis_control),
+            self._safe(self._check_redis_runtime),
             self._safe(self._check_opensandbox),
         )
         return {
             "mysql": mysql,
-            "redis": redis,
+            "redis_control": redis_control,
+            "redis_runtime": redis_runtime,
             "opensandbox": opensandbox,
         }

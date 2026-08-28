@@ -1,13 +1,11 @@
 export {
   applyConversationEvent,
-  applyHistoryEventEnvelope,
-  applyLiveEventEnvelope,
   buildInitialPayload,
   buildPlanAbandonPayload,
   buildPlanResumePayload,
   buildResumePayload,
   createRunId,
   markConversationDetached,
+  planInteractionFromTracePayload,
   prepareResumeSubmission,
-  restoreConversationFromHistory,
 } from "./runtime"

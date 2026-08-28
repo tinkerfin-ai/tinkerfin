@@ -73,12 +73,15 @@ source = DeferredMessageSource(
 | `opener` | 异步创建真正 source，并返回 `MessageSourceBinding` |
 | `cancellable` | 声明打开后的 source 是否支持取消 |
 | `cancel_after_first_item` | 是否等第一条协议事件产生后才允许取消超过它 |
+| `on_owner_preflight` | owner 专用的可选异步激活函数，在 producer 与 opener 执行前完成 |
 
 附着或纯回放请求不会调用 opener。`cancel_after_first_item=True` 适合必须先出现 `RUN_STARTED` 的协议。
 
+Messaging 在 durable owner 选定后等待 `on_owner_preflight`。回调失败时会释放本次 owner 并关闭 deferred wrapper，opener 不会运行。宿主可在这里执行必须阻止过期回收的 CAS 或 lease 激活。
+
 `MessageSourceBinding` 包含 `source` 和可选 `cancel`。如果 source 自己声明取消函数，可以省略 binding 的 `cancel`。
 
-如果 opener 打开的是已知 AG-UI 或 Native 流，并且 name-only channel 必须在打开前识别 codec 与 Identity，使用 `ProfiledDeferredMessageSource`：
+如果 opener 打开的是已知 AG-UI 或 Native 流，并且 name-only channel 必须在打开前识别 codec 与 RunIdentity，使用 `ProfiledDeferredMessageSource`：
 
 ```python
 from ag_ui.core import BaseEvent
@@ -104,6 +107,7 @@ source = ProfiledDeferredMessageSource(
 | `replay_type` | 必填 | codec 解码后的数据类型 |
 | `cancellable` | 必填 | source 是否支持远程取消 |
 | `cancel_after_first_item` | `False` | 是否防止取消越过第一条协议事件 |
+| `on_owner_preflight` | `None` | producer 执行前的 owner 专用异步激活函数 |
 
 ## 固定事件与转换事件
 
@@ -143,7 +147,7 @@ subscription = await channel.wrap_recoverable(
 | 参数 | 默认值 | 作用 |
 | --- | --- | --- |
 | `source` | 必填 | 实现 `open(checkpoint)` 的可恢复 source |
-| `identity` | profile source 可省略 | 自定义 source 的运行身份，或对 profile Identity 的一致性检查 |
+| `identity` | profile source 可省略 | 自定义 source 的运行身份，或对 profile RunIdentity 的一致性检查 |
 | `after` | `None` | 独占回放游标；`None` 从 prepare 时的当前末尾开始 |
 | `cancel` | `None` | 接受远程取消后停止 source，并可返回带稳定 ID 的有限尾部 |
 | `on_committed` | `None` | owner 每次成功提交后的异步观察函数 |

@@ -7,8 +7,8 @@ from datetime import UTC, datetime
 import pytest
 from pydantic import ValidationError
 
-from tinkerfin import Identity
-from tinkerfin_agui_adapter import Identity as AdapterIdentity
+from tinkerfin_agui_adapter import RunIdentity as AdapterIdentity
+from tinkerfin_contracts import RunIdentity
 from tinkerfin_messaging import (
     MessageEnvelope,
     RecoverableMessage,
@@ -19,7 +19,7 @@ from tinkerfin_messaging import (
 def _envelope(**changes: object) -> MessageEnvelope:
     values: dict[str, object] = {
         "channel": "events",
-        "identity": Identity(threadId="conversation-1", runId="run-1"),
+        "identity": RunIdentity(threadId="conversation-1", runId="run-1"),
         "seq": 1,
         "message_id": "run-1:1",
         "codec": "test.bytes.v1",
@@ -49,8 +49,8 @@ def test_current_envelopes_reject_removed_version_fields() -> None:
 
 
 def test_messaging_uses_the_same_identity_type_as_the_framework() -> None:
-    assert Identity is AdapterIdentity
-    assert MessageEnvelope.model_fields["identity"].annotation is Identity
+    assert RunIdentity is AdapterIdentity
+    assert MessageEnvelope.model_fields["identity"].annotation is RunIdentity
 
 
 def test_envelope_rejects_zero_sequence() -> None:
@@ -123,7 +123,7 @@ def test_envelope_rejects_identifiers_over_1024_characters(field: str) -> None:
 
 def test_envelope_rejects_unbounded_or_extra_identity_fields() -> None:
     with pytest.raises(ValidationError, match="at most 1024"):
-        _envelope(identity=Identity(threadId="x" * 1025, runId="run-1"))
+        _envelope(identity=RunIdentity(threadId="x" * 1025, runId="run-1"))
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         _envelope(
             identity={

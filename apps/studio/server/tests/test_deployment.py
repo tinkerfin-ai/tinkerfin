@@ -1,8 +1,10 @@
-"""Studio 后端部署入口测试。"""
+"""Studio 后端部署入口测试"""
 
 from __future__ import annotations
 
 import os
+import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -12,10 +14,37 @@ APP_ROOT = Path(__file__).resolve().parents[1]
 DEPLOY_DIR = APP_ROOT / "deploy"
 
 
+def _release_project_paths() -> tuple[str, ...]:
+    script = (DEPLOY_DIR / "deploy.sh").read_text(encoding="utf-8")
+    match = re.search(
+        r"readonly -a PROJECT_PATHS=\(\n(?P<body>.*?)\n\)",
+        script,
+        flags=re.DOTALL,
+    )
+    assert match is not None
+    return tuple(shlex.split(match.group("body")))
+
+
+def test_deploy_builds_the_complete_workspace_release_set() -> None:
+    """生产镜像必须包含 Studio 导入链需要的全部本地发行包"""
+
+    assert _release_project_paths() == (
+        "packages/tinkerfin-contracts",
+        "packages/tinkerfin-native-stream",
+        "packages/tinkerfin-agui-adapter",
+        "packages/tinkerfin",
+        "packages/tinkerfin-messaging",
+        "packages/tinkerfin-tracing",
+        "packages/tinkerfin-sandbox",
+        "packages/tinkerfin-langgraph-mysql",
+        "apps/studio/server",
+    )
+
+
 def test_setup_generates_private_file_secrets_without_printing_values(
     tmp_path: Path,
 ) -> None:
-    """初始化脚本必须生成私有文件且不把密钥写到输出。"""
+    """初始化脚本必须生成私有文件且不把密钥写到输出"""
 
     target = tmp_path / "deploy"
     target.mkdir()
@@ -33,7 +62,8 @@ def test_setup_generates_private_file_secrets_without_printing_values(
     secret_files = {
         "mysql_root_password",
         "mysql_password",
-        "redis_password",
+        "redis_control_password",
+        "redis_runtime_password",
         "opensandbox_api_key",
         "database_url",
     }
@@ -46,14 +76,15 @@ def test_setup_generates_private_file_secrets_without_printing_values(
 
 
 def test_compose_supports_bundled_and_external_service_sets(tmp_path: Path) -> None:
-    """同一 Compose 必须支持完整后端栈和仅 Studio 两种模式。"""
+    """同一 Compose 必须支持完整后端栈和仅 Studio 两种模式"""
 
     secrets = tmp_path / "secrets"
     secrets.mkdir()
     for name in (
         "mysql_root_password",
         "mysql_password",
-        "redis_password",
+        "redis_control_password",
+        "redis_runtime_password",
         "opensandbox_api_key",
         "database_url",
     ):
@@ -87,7 +118,8 @@ def test_compose_supports_bundled_and_external_service_sets(tmp_path: Path) -> N
 
     assert set(bundled) == {
         "mysql",
-        "redis",
+        "redis-control",
+        "redis-runtime",
         "opensandbox",
         "database-init",
         "studio",

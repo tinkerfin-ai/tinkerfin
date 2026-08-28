@@ -1,0 +1,393 @@
+import type {
+  ConversationHistoryDetail,
+  ConversationTraceUpdate,
+  TraceInteraction,
+  TraceNode,
+} from '../../../api/conversation/history'
+import { ConversationError } from '../../../api/conversation/errors'
+import { translateCurrent } from '../../../i18n'
+import type {
+  ApprovalAllowedDecision,
+  ApprovalItem,
+  ApprovalState,
+  Conversation,
+  JsonObject,
+  JsonValue,
+  Message,
+  PendingInteractionKind,
+  TodoItem,
+} from '../../../types'
+import { planInteractionFromTracePayload } from '../agui'
+
+const isObject = (value: unknown): value is JsonObject => (
+  value != null && typeof value === 'object' && !Array.isArray(value)
+)
+
+const text = (value: JsonValue | null | undefined): string => {
+  if (typeof value === 'string') return value
+  if (value == null) return ''
+  return JSON.stringify(value, null, 2)
+}
+
+const elapsedMs = (startedAt: string, completedAt?: string | null) => {
+  if (!completedAt) return undefined
+  const duration = Date.parse(completedAt) - Date.parse(startedAt)
+  return Number.isFinite(duration) && duration >= 0 ? duration : undefined
+}
+
+const nodeMessageStatus = (
+  status: TraceNode['status'],
+): NonNullable<Message['meta']>['status'] => {
+  switch (status) {
+    case 'running': return 'running'
+    case 'waiting': return 'paused'
+    case 'succeeded': return 'completed'
+    case 'cancelled':
+    case 'abandoned': return 'cancelled'
+    default: return 'failed'
+  }
+}
+
+const todosFromState = (root: JsonObject): TodoItem[] => {
+  if (!Array.isArray(root.todos)) return []
+  return root.todos.flatMap((value, index) => {
+    if (!isObject(value) || typeof value.content !== 'string') return []
+    const rawStatus = value.status
+    const status: TodoItem['status'] = rawStatus === 'completed'
+      ? 'completed'
+      : rawStatus === 'in_progress'
+        ? 'running'
+        : rawStatus === 'failed'
+          ? 'failed'
+          : rawStatus === 'cancelled'
+            ? 'cancelled'
+            : 'pending'
+    return [{
+      id: typeof value.id === 'string' ? value.id : 'trace-todo-' + index,
+      content: value.content,
+      status,
+    }]
+  })
+}
+
+const modeFromState = (root: JsonObject): Conversation['mode'] => {
+  const plan = root.tinkerfin_plan
+  return isObject(plan) && plan.effectiveMode === 'plan' ? 'plan' : 'default'
+}
+
+const applyEntityDelta = <T extends { id: string }>(
+  current: T[],
+  upserts: T[],
+  removes: string[],
+): T[] => {
+  const values = new Map(current.map((item) => [item.id, item]))
+  for (const id of removes) values.delete(id)
+  for (const item of upserts) values.set(item.id, structuredClone(item))
+  return [...values.values()]
+}
+
+const decodePointerToken = (value: string) => value.replaceAll('~1', '/').replaceAll('~0', '~')
+
+const capturedArguments = (value: JsonValue | undefined): JsonObject => {
+  if (!isObject(value) || value.disposition !== 'inline' || !isObject(value.value)) return {}
+  const result: JsonObject = {}
+  for (const [pointer, item] of Object.entries(value.value)) {
+    if (!pointer.startsWith('/') || pointer.slice(1).includes('/')) continue
+    result[decodePointerToken(pointer.slice(1))] = structuredClone(item)
+  }
+  return result
+}
+
+const allowedDecisions = (value: JsonValue | undefined): ApprovalAllowedDecision[] => {
+  if (!Array.isArray(value)) return []
+  return value.filter((item): item is ApprovalAllowedDecision => (
+    item === 'approve' || item === 'edit' || item === 'reject' || item === 'respond'
+  ))
+}
+
+const scopedSourceKey = (namespace: string[], sourceId: string): string => (
+  JSON.stringify([namespace, sourceId])
+)
+
+const approvalFromInteraction = (
+  interaction: TraceInteraction,
+  nodes: TraceNode[],
+): ApprovalState | undefined => {
+  if (interaction.kind !== 'tool_approval' || !isObject(interaction.payload)) return undefined
+  const actions = interaction.payload.action_requests
+  const reviews = interaction.payload.review_configs
+  if (!Array.isArray(actions) || !Array.isArray(reviews) || actions.length !== reviews.length) {
+    return undefined
+  }
+  if (interaction.toolCallIds.length !== actions.length) return undefined
+  const items = actions.flatMap<ApprovalItem>((rawAction, index) => {
+    const rawReview = reviews[index]
+    if (!isObject(rawAction) || !isObject(rawReview) || typeof rawAction.name !== 'string') return []
+    const decisions = allowedDecisions(rawReview.allowed_decisions)
+    if (decisions.length === 0) return []
+    const publicId = actions.length === 1
+      ? interaction.sourceId
+      : interaction.sourceId + '#' + index
+    const originalArgs = capturedArguments(rawAction.arguments)
+    const toolCallId = interaction.toolCallIds[index]
+    const toolNode = nodes.find((node) => (
+      node.kind === 'tool'
+      && node.status === 'waiting'
+      && node.sourceId === toolCallId
+      && node.label === rawAction.name
+      && node.namespace.length === interaction.namespace.length
+      && node.namespace.every(
+        (value, position) => value === interaction.namespace[position],
+      )
+    ))
+    if (!toolNode || !toolCallId) return []
+    return [{
+      id: publicId,
+      interruptId: publicId,
+      toolCallId,
+      toolName: rawAction.name,
+      params: JSON.stringify(originalArgs, null, 2),
+      input: typeof originalArgs.file_path === 'string' ? originalArgs.file_path : '',
+      description: rawAction.name,
+      originalArgs,
+      allowedDecisions: decisions,
+    }]
+  })
+  if (items.length !== actions.length || items.length === 0) return undefined
+  return { items, activeIndex: 0, submitted: false, mode: 'options' }
+}
+
+const interactionState = (
+  interactions: TraceInteraction[],
+  nodes: TraceNode[],
+): {
+  approval?: ApprovalState
+  planInteraction?: Conversation['planInteraction']
+  pendingInteractionKind?: PendingInteractionKind
+} => {
+  const pending = interactions
+    .filter((interaction) => interaction.status === 'pending')
+    .sort((left, right) => left.traceSeq - right.traceSeq || left.id.localeCompare(right.id))
+  if (pending.length === 0) return {}
+  if (pending.length === 1) {
+    const interaction = pending[0]
+    if (interaction) {
+      const plan = planInteractionFromTracePayload(interaction.sourceId, interaction.payload)
+      if (plan) {
+        return {
+          planInteraction: plan,
+          pendingInteractionKind: plan.kind === 'questions'
+            ? 'plan_clarification'
+            : 'plan_review',
+        }
+      }
+    }
+  }
+  if (pending.every((interaction) => interaction.kind === 'tool_approval')) {
+    const groups = pending.map((interaction) => approvalFromInteraction(interaction, nodes))
+    if (groups.some((group) => !group)) throw new ConversationError('stream_event_invalid')
+    const items = groups.flatMap((group) => group?.items ?? [])
+    const interruptIds = new Set(items.map((item) => item.interruptId))
+    if (items.length === 0 || interruptIds.size !== items.length) {
+      throw new ConversationError('stream_event_invalid')
+    }
+    return {
+      approval: { items, activeIndex: 0, submitted: false, mode: 'options' },
+      pendingInteractionKind: 'tool_approval',
+    }
+  }
+  if (pending.length > 1) throw new ConversationError('stream_event_invalid')
+  return { pendingInteractionKind: 'input_required' }
+}
+
+const traceMessages = (trace: ConversationHistoryDetail): Message[] => {
+  const reasoning = new Map(
+    trace.reasoning
+      .filter((item) => !item.contentOmitted && item.content != null)
+      .map((item) => [item.messageId, text(item.content)]),
+  )
+  const toolResults = new Map(
+    trace.messages
+      .filter((item) => item.role === 'tool' && item.toolCallId)
+      .map((item) => [
+        scopedSourceKey(item.namespace, item.toolCallId as string),
+        item,
+      ]),
+  )
+  const nodesById = new Map(trace.nodes.map((node) => [node.id, node]))
+  const owningSubagent = (node: TraceNode): TraceNode | undefined => {
+    let parentId = node.parentId
+    const visited = new Set<string>()
+    while (parentId && !visited.has(parentId)) {
+      visited.add(parentId)
+      const parent = nodesById.get(parentId)
+      if (!parent) return undefined
+      if (parent.kind === 'subagent') return parent
+      parentId = parent.parentId
+    }
+    return undefined
+  }
+  const ordered: Array<{ value: Message; sequence: number }> = trace.messages.flatMap((item) => {
+    if (item.role !== 'user' && item.role !== 'assistant') return []
+    return [{
+      sequence: item.traceSeq,
+      value: {
+        id: item.id,
+        role: item.role,
+        content: text(item.content),
+        createdAt: item.createdAt,
+        meta: item.role === 'assistant'
+          ? {
+              status: item.status === 'completed' ? 'completed' : 'running',
+              runId: item.runId,
+              reasoning: reasoning.get(item.id),
+              completedAt: item.completedAt ?? undefined,
+              durationMs: elapsedMs(item.createdAt, item.completedAt),
+            }
+          : undefined,
+      },
+    }]
+  })
+  trace.nodes.forEach((node) => {
+    const failedRun = node.kind === 'run' && node.status === 'failed'
+    if (
+      node.kind !== 'tool'
+      && node.kind !== 'subagent'
+      && node.kind !== 'plan'
+      && !failedRun
+    ) return
+    const result = node.sourceId
+      ? toolResults.get(scopedSourceKey(node.namespace, node.sourceId))
+      : undefined
+    const subagent = node.kind === 'tool' ? owningSubagent(node) : undefined
+    const role: Message['role'] = node.kind === 'tool'
+      ? 'tool'
+      : node.kind === 'subagent'
+        ? 'subagent'
+        : failedRun
+          ? 'error'
+          : 'process'
+    ordered.push({
+      sequence: node.traceSeq,
+      value: {
+        id: node.id,
+        role,
+        content: failedRun ? translateCurrent('对话运行失败') : node.label,
+        createdAt: node.startedAt,
+        meta: {
+          title: node.label,
+          toolName: node.kind === 'tool' ? node.label : undefined,
+          agentName: node.kind === 'subagent' ? node.label : undefined,
+          sourceAgentName: subagent?.label,
+          result: text(result?.content),
+          status: nodeMessageStatus(node.status),
+          toolCallId: node.kind === 'tool' ? node.sourceId ?? undefined : undefined,
+          batchId: node.kind === 'tool' && !subagent
+            ? node.parentId ?? undefined
+            : undefined,
+          subRunId: node.kind === 'subagent' ? node.id : undefined,
+          runId: subagent?.id ?? node.runId,
+          completedAt: node.completedAt ?? undefined,
+          durationMs: elapsedMs(node.startedAt, node.completedAt),
+        },
+      },
+    })
+  })
+  return ordered.sort((left, right) => (
+    left.sequence - right.sequence
+  )).map((item) => item.value)
+}
+
+const runStatus = (trace: ConversationHistoryDetail): Conversation['runStatus'] => {
+  switch (trace.status.execution) {
+    case 'running': return 'detached'
+    case 'waiting': return 'waiting_approval'
+    case 'failed':
+    case 'unknown': return 'error'
+    default: return 'idle'
+  }
+}
+
+const assertTraceDetail = (trace: ConversationHistoryDetail) => {
+  if (
+    !trace.threadId
+    || !trace.headRunId
+    || !Number.isSafeInteger(trace.asOfSeq)
+    || trace.asOfSeq < 1
+    || !Array.isArray(trace.messages)
+    || !Array.isArray(trace.nodes)
+    || !Array.isArray(trace.interactions)
+    || !isObject(trace.state?.root)
+  ) throw new ConversationError('stream_event_invalid')
+}
+
+export const restoreConversationFromTrace = (
+  detail: ConversationHistoryDetail,
+  options: { model: string },
+): Conversation => {
+  assertTraceDetail(detail)
+  const trace = structuredClone(detail)
+  const interaction = interactionState(trace.interactions, trace.nodes)
+  const status = runStatus(trace)
+  const messages = traceMessages(trace)
+  if (
+    (trace.status.execution === 'failed' || trace.status.execution === 'unknown')
+    && !messages.some((message) => message.role === 'error')
+  ) {
+    messages.push({
+      id: 'trace-error:' + trace.headRunId,
+      role: 'error',
+      content: translateCurrent('对话运行失败'),
+      createdAt: trace.updatedAt,
+      meta: { runId: trace.headRunId, status: 'failed' },
+    })
+  }
+  return {
+    threadId: trace.threadId,
+    title: trace.title,
+    pinned: trace.pinned,
+    updatedAt: trace.updatedAt,
+    model: trace.lastModel ?? options.model,
+    mode: modeFromState(trace.state.root),
+    messages,
+    todos: todosFromState(trace.state.root),
+    approval: interaction.approval,
+    planInteraction: interaction.planInteraction,
+    pendingInteractionKind: interaction.pendingInteractionKind,
+    runStatus: status,
+    activeRunId: status === 'detached' ? trace.headRunId : undefined,
+    serverState: structuredClone(trace.state.root),
+    lastSeq: undefined,
+    trace,
+    isHydrated: true,
+  }
+}
+
+export const applyConversationTraceUpdate = (
+  conversation: Conversation,
+  update: ConversationTraceUpdate,
+): Conversation => {
+  const previous = conversation.trace
+  if (!previous) throw new ConversationError('stream_event_invalid')
+  if (update.asOfSeq <= previous.asOfSeq) return conversation
+  const next: ConversationHistoryDetail = {
+    ...structuredClone(previous),
+    asOfSeq: update.asOfSeq,
+    headRunId: update.status.headRunId,
+    messages: applyEntityDelta(previous.messages, update.messages.upserts, update.messages.removes),
+    reasoning: applyEntityDelta(previous.reasoning, update.reasoning.upserts, update.reasoning.removes),
+    nodes: applyEntityDelta(previous.nodes, update.nodes.upserts, update.nodes.removes),
+    interactions: applyEntityDelta(
+      previous.interactions,
+      update.interactions.upserts,
+      update.interactions.removes,
+    ),
+    state: structuredClone(update.state),
+    status: structuredClone(update.status),
+    completeness: structuredClone(update.completeness),
+    messageCount: update.messageCount,
+    toolCallCount: update.toolCallCount,
+    historyCursor: null,
+  }
+  return restoreConversationFromTrace(next, { model: conversation.model })
+}

@@ -8,7 +8,7 @@ from uuid import NAMESPACE_URL, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .contracts import Identity
+from .contracts import RunIdentity
 from .ids import ScopedIdCodec
 
 SUBAGENT_PROVENANCE_SCHEMA = "tinkerfin.subagent-provenance"
@@ -119,7 +119,7 @@ class SubagentProvenance(BaseModel):
 
 def subagent_invocation_id(
     *,
-    identity: Identity,
+    identity: RunIdentity,
     parent_tool_call_id: str,
 ) -> str:
     """Return the canonical logical invocation ID.
@@ -136,8 +136,8 @@ def subagent_invocation_id(
         ValueError: The parent ID is not a complete scoped Tool ID.
     """
 
-    if not isinstance(identity, Identity):
-        raise TypeError("identity must be an Identity")
+    if not isinstance(identity, RunIdentity):
+        raise TypeError("identity must be a RunIdentity")
     try:
         kind, _namespace, _raw_id = ScopedIdCodec().decode(parent_tool_call_id)
     except (TypeError, ValueError) as error:
@@ -156,7 +156,7 @@ def subagent_invocation_id(
 
 def create_subagent_provenance(
     *,
-    identity: Identity,
+    identity: RunIdentity,
     namespace: tuple[str, ...],
     parent_namespace: tuple[str, ...],
     graph_task_id: str,

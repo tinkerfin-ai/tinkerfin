@@ -8,7 +8,7 @@
 
 ```python
 from langgraph.checkpoint.memory import MemorySaver
-from tinkerfin import Identity, TinkerFin
+from tinkerfin import RunIdentity, TinkerFin
 
 
 tinkerfin = TinkerFin()
@@ -90,7 +90,7 @@ Plan 审阅默认允许 `PlanReviewAction.APPROVE`、`RESPOND` 和 `REJECT`。�
 选择 Plan 时必须提供明确 Planner 模型和具体 `BaseCheckpointSaver`。TinkerFin 不会自动创建
 进程内 saver，也不会静默降低 durability；生产环境必须提供生产级 saver。Planning 与原生
 Deep Agent 借用同一个 saver、Store、cache、backend 和 runtime context。恢复时必须保持同一个
-`Identity.threadId`。Plan 状态位于根状态的 `tinkerfin_plan` 字段，`PlanContentModel`、
+`RunIdentity.threadId`。Plan 状态位于根状态的 `tinkerfin_plan` 字段，`PlanContentModel`、
 内置结构化与 Markdown 内容类型、`PlanDraft`、`ConfirmedPlan`、`PlanHandoff`、`PlanState`
 等模型从 `tinkerfin.plan` 导入。
 
@@ -135,10 +135,11 @@ Choice 题在 Python 使用 `allow_free_text`，JSON 使用 `allowFreeText`。�
 Planning 在 Graph resume 前校验 pending 的精确响应 Schema，从可信 Form 派生 Option label、规范化
 答案顺序，并把明确跳过保留为 Planner 上下文。
 
-完全自定义语义题型通过 `clarification_type(...)` 注册。一个冻结描述符同时提供带版本的 namespaced
+完全自定义语义题型通过 `clarification_type(...)` 注册。一个冻结描述符同时提供无版本 namespaced
 ID、模型选择说明、Question/Response Model、可选的逐题 Schema 与校验器，以及 canonical JSON
 normalizer。所有 callback 必须同步、确定性且不执行外部 I/O；宿主客户端必须为 Form 中的每个自定义
-题型提供 renderer。逐题 Schema、校验或规范化语义发生变化时，必须升级 type ID 的版本。
+题型提供 renderer。Definition fingerprint 固定唯一当前 Schema 与 callback；合同变化时重建不兼容
+存量数据，不得引入另一个 type ID 版本。
 
 配置 `PlanReviewAction.EDIT` 后，完整编辑的草稿是用户权威约束。Planner 只能继续澄清或接受
 该草稿，不得静默替换。澄清期间 revision 不变；只有形成完整可审阅草稿时才递增一次。
@@ -150,11 +151,11 @@ Plan Mode 固定使用 `sync` checkpoint durability。通常省略 `durability` 
 
 ```python
 plan_runtime = agent.new(
-    identity=Identity(threadId="project-7", runId="run-1"),
+    identity=RunIdentity(threadId="project-7", runId="run-1"),
     mode="plan",
 )
 default_runtime = agent.new_agui(
-    identity=Identity(threadId="project-7", runId="run-2"),
+    identity=RunIdentity(threadId="project-7", runId="run-2"),
     mode="default",
 )
 ```
@@ -167,7 +168,7 @@ default_runtime = agent.new_agui(
 
 ```python
 runtime = agent.new(
-    identity=Identity(threadId="project-7", runId="run-1"),
+    identity=RunIdentity(threadId="project-7", runId="run-1"),
     mode="default",
     on_part=None,
 )
@@ -195,17 +196,17 @@ stream = runtime.astream(
 | `config` | `None` | thread、tags、metadata、递归限制等运行配置 |
 | `context` | `None` | 与 `context_schema` 对应的运行上下文 |
 
-一般不用在 `config` 中重复填写 `configurable.thread_id`。如果显式填写，相同值可以使用；与 `Identity.threadId` 不同会在 Graph 迭代、观察器和 coordinator 启动前报错。
+一般不用在 `config` 中重复填写 `configurable.thread_id`。如果显式填写，相同值可以使用；与 `RunIdentity.threadId` 不同会在 Graph 迭代、观察器和 coordinator 启动前报错。
 
 ### 输出控制
 
 | 参数 | 默认值 | 作用 |
 | --- | --- | --- |
-| `stream_mode` | `None` | 选择 `values`、`updates`、`messages`、`tasks` 等输出 |
+| `stream_mode` | 由 Profile 固定 | 必需语义 mode 始终存在，可以增加受支持的额外 mode |
 | `print_mode` | `()` | 额外打印指定模式，不改变返回内容 |
-| `output_keys` | `None` | 只返回指定状态字段 |
-| `subgraphs` | `False` | 是否包含子图输出 |
-| `version` | 自动为 `"v2"` | 原生 Runtime 固定使用 v2；显式传 `"v1"` 会在运行前报错 |
+| `output_keys` | 由 Profile 固定 | 必须保持 Profile 所需的完整 state 合同 |
+| `subgraphs` | 由 Profile 固定 | 保持 Profile 所需的完整 Graph scope |
+| `version` | 由 Profile 固定 | 冲突的上游 version 会在 Graph 迭代前报错 |
 | `debug` | `None` | 覆盖本次运行的调试设置 |
 
 ### 中断和持久化控制
@@ -218,7 +219,8 @@ stream = runtime.astream(
 | `control` | `None` | 传入 LangGraph 运行控制信息 |
 | 其他关键字参数 | 无 | 沿用当前 LangGraph 支持的附加运行参数 |
 
-如果只想读取最终状态，可以使用 `stream_mode="values"`。如果要自己观察完整的 v2 运行数据，通常组合 `messages`、`tasks`、`values`，并启用 `subgraphs=True`。
+必需 profile 用于提供完整 Runtime 与 Trace 语义。只有消费方还需要其他数据时，才增加
+`updates`、`checkpoints`、`debug` 或 `custom`。
 
 ## 观察每一条数据
 
@@ -242,7 +244,7 @@ Runtime 是一次性的。重新调用 `agent.new()`。
 
 ### 会话没有延续
 
-确认 Agent 配置了 checkpointer，并且后续运行使用相同的 `Identity.threadId`。
+确认 Agent 配置了 checkpointer，并且后续运行使用相同的 `RunIdentity.threadId`。
 
 ### 异步服务启动时卡顿
 

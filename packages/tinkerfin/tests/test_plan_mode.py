@@ -54,8 +54,11 @@ from redis.exceptions import ResponseError
 
 import tinkerfin.plan as plan_api
 import tinkerfin.plan._runtime as plan_runtime_module
-from tinkerfin import AgUiResumeBinding, AgUiResumeCheckpoint, Identity, TinkerFin
-from tinkerfin._agui_lineage import RUN_ID_METADATA_KEY
+from tinkerfin import AgUiResumeBinding, AgUiResumeCheckpoint, RunIdentity, TinkerFin
+from tinkerfin._agui_lineage import (
+    RUN_ID_METADATA_KEY,
+    RUNTIME_PROFILE_METADATA_KEY,
+)
 from tinkerfin.plan import (
     ClarificationForm,
     ClarificationFormBase,
@@ -249,8 +252,8 @@ class _MarkdownImpostor(PlanContentModel):
     markdown: str
 
 
-def _identity(run_id: str, *, thread_id: str = "plan-thread") -> Identity:
-    return Identity(threadId=thread_id, runId=run_id)
+def _identity(run_id: str, *, thread_id: str = "plan-thread") -> RunIdentity:
+    return RunIdentity(threadId=thread_id, runId=run_id)
 
 
 def _structured_plan_state(value: object) -> PlanState[StructuredPlanContent]:
@@ -1098,10 +1101,10 @@ async def test_plan_run_requires_the_definition_checkpointer_only_when_selected(
 
 @pytest.mark.asyncio
 async def test_default_preserves_coordinator_and_composed_state() -> None:
-    coordinated: list[Identity] = []
+    coordinated: list[RunIdentity] = []
 
     @asynccontextmanager
-    async def coordinate(identity: Identity) -> AsyncIterator[None]:
+    async def coordinate(identity: RunIdentity) -> AsyncIterator[None]:
         coordinated.append(identity)
         yield
 
@@ -2165,6 +2168,7 @@ async def test_completed_resume_uses_the_exact_planning_snapshot(
                 "configurable": {
                     "thread_id": "plan-thread",
                     RUN_ID_METADATA_KEY: "agui-reject-3",
+                    RUNTIME_PROFILE_METADATA_KEY: "deepagents-v2",
                 }
             },
             stream_mode=["messages", "tasks", "values"],

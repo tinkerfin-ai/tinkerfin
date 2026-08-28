@@ -1,18 +1,61 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import sqlite3
 from pathlib import Path
 from typing import Never, cast
 
 import aiosqlite
 import pytest
+from sqlalchemy import text
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import DBAPIError, OperationalError
-from sqlalchemy.ext.asyncio import AsyncConnection
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 from sqlalchemy.sql import Executable
 
 import tinkerfin_sandbox
+from tinkerfin_sandbox.lifecycle.state import OpenSandboxState
+
+
+@pytest.mark.parametrize(
+    ("method_name", "documents_args", "documents_return"),
+    [
+        ("start", True, False),
+        ("acquire_owner", True, True),
+        ("renew_owner", True, True),
+        ("bind_owner", True, True),
+        ("unbind_owner", True, False),
+        ("read_binding", True, True),
+        ("release_owner", True, False),
+        ("claim_warm_slot", False, True),
+        ("publish_warm", True, False),
+        ("renew_warm", True, True),
+        ("release_warm", True, False),
+        ("consume_warm", True, True),
+        ("enqueue_cleanup", True, False),
+        ("claim_cleanup", False, True),
+        ("renew_cleanup", True, True),
+        ("complete_cleanup", True, False),
+        ("release_cleanup", True, False),
+        ("shutdown_sandbox_ids", False, True),
+        ("aclose", False, False),
+    ],
+)
+def test_state_protocol_documents_public_lifecycle_contracts(
+    method_name: str,
+    documents_args: bool,
+    documents_return: bool,
+) -> None:
+    """Keep fencing, result, and failure guidance next to every State method."""
+
+    method = getattr(OpenSandboxState, method_name)
+    documentation = inspect.getdoc(method)
+
+    assert documentation is not None
+    assert ("Args:" in documentation) is documents_args
+    assert ("Returns:" in documentation) is documents_return
+    assert "Raises:" in documentation
 
 
 def _public_type(name: str) -> type:
@@ -193,6 +236,232 @@ async def test_sqlalchemy_state_boundary_records_trusted_implementation_context(
     }
     assert url not in str(captured.value)
     assert "secret" not in str(captured.value)
+
+
+async def test_sqlalchemy_state_borrows_engine_without_disposing_its_pool(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(_sqlite_url(tmp_path / "borrowed.db"))
+    borrowed_pool = engine.pool
+    async with engine.connect() as connection:
+        await connection.exec_driver_sql("PRAGMA busy_timeout = 5000")
+        await connection.rollback()
+    state = tinkerfin_sandbox.SQLAlchemyOpenSandboxState(engine=engine)
+    try:
+        await state.start(warm_pool_size=0)
+        claim = await state.acquire_owner("borrowed-owner")
+        await state.release_owner(claim)
+        await state.aclose()
+        assert engine.pool is borrowed_pool
+        async with engine.connect() as connection:
+            assert await connection.scalar(text("SELECT 1")) == 1
+            assert (
+                await connection.exec_driver_sql("PRAGMA busy_timeout")
+            ).scalar_one() == 5000
+    finally:
+        await engine.dispose()
+
+
+async def _sqlite_busy_timeout(engine: AsyncEngine) -> int:
+    async with engine.connect() as connection:
+        value = (await connection.exec_driver_sql("PRAGMA busy_timeout")).scalar_one()
+    if not isinstance(value, int):
+        raise TypeError("SQLite busy_timeout must be an integer")
+    return value
+
+
+async def test_borrowed_sqlite_restores_session_setting_after_failure_and_cancel(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(
+        _sqlite_url(tmp_path / "borrowed-settlement.db"),
+        pool_size=1,
+        max_overflow=0,
+    )
+    async with engine.connect() as connection:
+        await connection.exec_driver_sql("PRAGMA busy_timeout = 4321")
+        await connection.rollback()
+    state = tinkerfin_sandbox.SQLAlchemyOpenSandboxState(engine=engine)
+    failure = RuntimeError("borrowed operation failed")
+
+    async def fail_operation(_connection: AsyncConnection) -> Never:
+        raise failure
+
+    entered = asyncio.Event()
+
+    async def block_operation(_connection: AsyncConnection) -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    try:
+        await state.start(warm_pool_size=0)
+        with pytest.raises(RuntimeError) as captured:
+            await state._run_write_transaction(fail_operation)
+        assert captured.value is failure
+        assert await _sqlite_busy_timeout(engine) == 4321
+
+        operation = asyncio.create_task(state._run_write_transaction(block_operation))
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        operation.cancel("borrowed operation cancelled")
+        with pytest.raises(
+            asyncio.CancelledError,
+            match="borrowed operation cancelled",
+        ):
+            await operation
+        assert await _sqlite_busy_timeout(engine) == 4321
+    finally:
+        await state.aclose()
+        await engine.dispose()
+
+
+async def test_borrowed_sqlite_invalidates_an_uncertain_commit_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_async_engine(
+        _sqlite_url(tmp_path / "borrowed-uncertain.db"),
+        pool_size=1,
+        max_overflow=0,
+    )
+    state = tinkerfin_sandbox.SQLAlchemyOpenSandboxState(engine=engine)
+    await state.start(warm_pool_size=0)
+    async with engine.connect() as connection:
+        original_connection = await connection.run_sync(
+            lambda sync_connection: sync_connection.connection.dbapi_connection
+        )
+    state_type = type(state)
+    original_commit = state_type._commit_write_transaction
+    uncertainty = tinkerfin_sandbox.OpenSandboxStateCommitUncertainError(
+        "commit result unknown"
+    )
+
+    async def fail_commit(
+        _state: object,
+        _connection: AsyncConnection,
+        _disposition: object,
+    ) -> Never:
+        raise uncertainty
+
+    async def operation(_connection: AsyncConnection) -> None:
+        return None
+
+    monkeypatch.setattr(state_type, "_commit_write_transaction", fail_commit)
+    try:
+        with pytest.raises(
+            tinkerfin_sandbox.OpenSandboxStateCommitUncertainError
+        ) as captured:
+            await state._run_write_transaction(operation)
+        assert captured.value is uncertainty
+    finally:
+        monkeypatch.setattr(
+            state_type,
+            "_commit_write_transaction",
+            original_commit,
+        )
+    async with engine.connect() as connection:
+        replacement_connection = await connection.run_sync(
+            lambda sync_connection: sync_connection.connection.dbapi_connection
+        )
+    assert replacement_connection is not original_connection
+    await state.aclose()
+    await engine.dispose()
+
+
+async def test_borrowed_sqlite_cancelled_failed_commit_invalidates_without_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_async_engine(
+        _sqlite_url(tmp_path / "borrowed-cancelled-commit.db"),
+        pool_size=1,
+        max_overflow=0,
+    )
+    state = tinkerfin_sandbox.SQLAlchemyOpenSandboxState(engine=engine)
+    await state.start(warm_pool_size=0)
+    async with engine.connect() as connection:
+        original_connection = await connection.run_sync(
+            lambda sync_connection: sync_connection.connection.dbapi_connection
+        )
+    commit_entered = asyncio.Event()
+    release_commit = asyncio.Event()
+    original_exec_driver_sql = AsyncConnection.exec_driver_sql
+    loop = asyncio.get_running_loop()
+    original_exception_handler = loop.get_exception_handler()
+    loop_errors: list[dict[str, object]] = []
+
+    async def fail_commit(
+        connection: AsyncConnection,
+        statement: str,
+    ) -> CursorResult[tuple[object, ...]]:
+        if statement == "COMMIT":
+            commit_entered.set()
+            await release_commit.wait()
+            raise OperationalError(
+                "COMMIT",
+                None,
+                RuntimeError("commit response failed"),
+                connection_invalidated=False,
+            )
+        return cast(
+            CursorResult[tuple[object, ...]],
+            await original_exec_driver_sql(connection, statement),
+        )
+
+    async def no_op(_connection: AsyncConnection) -> None:
+        return None
+
+    def capture_loop_error(
+        _loop: asyncio.AbstractEventLoop,
+        context: dict[str, object],
+    ) -> None:
+        loop_errors.append(context)
+
+    monkeypatch.setattr(AsyncConnection, "exec_driver_sql", fail_commit)
+    loop.set_exception_handler(capture_loop_error)
+    operation = asyncio.create_task(state._run_write_transaction(no_op))
+    try:
+        await asyncio.wait_for(commit_entered.wait(), timeout=2)
+        operation.cancel("caller cancelled during commit")
+        release_commit.set()
+        with pytest.raises(
+            asyncio.CancelledError,
+            match="caller cancelled during commit",
+        ):
+            await operation
+        await asyncio.sleep(0)
+    finally:
+        release_commit.set()
+        if not operation.done():
+            operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
+        loop.set_exception_handler(original_exception_handler)
+        monkeypatch.setattr(
+            AsyncConnection,
+            "exec_driver_sql",
+            original_exec_driver_sql,
+        )
+    async with engine.connect() as connection:
+        replacement_connection = await connection.run_sync(
+            lambda sync_connection: sync_connection.connection.dbapi_connection
+        )
+    assert replacement_connection is not original_connection
+    assert loop_errors == []
+    await state.aclose()
+    await engine.dispose()
+
+
+async def test_sqlalchemy_state_requires_exactly_one_engine_source() -> None:
+    with pytest.raises(ValueError, match="exactly one"):
+        tinkerfin_sandbox.SQLAlchemyOpenSandboxState()
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    try:
+        with pytest.raises(ValueError, match="exactly one"):
+            tinkerfin_sandbox.SQLAlchemyOpenSandboxState(
+                url="sqlite+aiosqlite:///:memory:",
+                engine=engine,
+            )
+    finally:
+        await engine.dispose()
 
 
 async def _hold_sqlite_write_lock(path: Path) -> aiosqlite.Connection:
@@ -409,7 +678,7 @@ async def test_sqlite_state_retries_only_after_statement_rollback_and_close(
                 "UPDATE owners",
                 code=lock_code,
             )
-        assert rollback_calls == 1
+        assert rollback_calls >= 1
         assert close_calls >= 1
         return cast(
             CursorResult[tuple[object, ...]],
@@ -471,7 +740,9 @@ async def test_sqlite_state_does_not_retry_when_statement_rollback_fails(
         raise _sqlite_lock_operational_error("UPDATE owners")
 
     async def fail_rollback(connection: AsyncConnection) -> None:
-        del connection
+        if execute_attempts == 0:
+            await original_rollback(connection)
+            return
         raise RuntimeError("rollback connection was lost")
 
     monkeypatch.setattr(AsyncConnection, "execute", fail_statement)

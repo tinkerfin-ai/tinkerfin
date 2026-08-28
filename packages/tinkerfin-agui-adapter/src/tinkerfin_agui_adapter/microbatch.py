@@ -113,6 +113,17 @@ async def micro_batch(
     event type, or at end of stream. Event order is preserved, Tool/reasoning/
     state/lifecycle events are never batched, and the caller-provided iterator is
     closed on completion, cancellation, or consumer abandonment.
+
+    Args:
+        events: Single-use AG-UI event iterator transferred to this generator.
+        batcher: Optional request-scoped batch policy and pending text owner.
+
+    Yields:
+        Original non-text events and bounded merged text-content events in order.
+
+    Raises:
+        asyncio.CancelledError: The consumer cancels while pulling or settling input.
+        BaseException: The input iterator, batching operation, or owned close fails.
     """
 
     batcher = batcher or ContentBatcher()
@@ -121,10 +132,17 @@ async def micro_batch(
     primary_error: BaseException | None = None
     try:
         while True:
+            timeout = batcher.seconds_until_flush()
+            if pending_event is None and timeout is None:
+                try:
+                    event = await anext(iterator)
+                except StopAsyncIteration:
+                    break
+                for emitted in batcher.add(event):
+                    yield emitted
+                continue
             if pending_event is None:
                 pending_event = asyncio.ensure_future(anext(iterator))
-
-            timeout = batcher.seconds_until_flush()
             done, _pending = await asyncio.wait(
                 {pending_event},
                 timeout=timeout,

@@ -21,12 +21,14 @@ cp "${SCRIPT_DIR}/.env.example" "${ENV_FILE}"
 
 mysql_root_password=$(openssl rand -hex 24)
 mysql_password=$(openssl rand -hex 24)
-redis_password=$(openssl rand -hex 24)
+redis_control_password=$(openssl rand -hex 24)
+redis_runtime_password=$(openssl rand -hex 24)
 opensandbox_api_key=$(openssl rand -hex 32)
 
 printf '%s\n' "${mysql_root_password}" > "${SECRETS_DIR}/mysql_root_password"
 printf '%s\n' "${mysql_password}" > "${SECRETS_DIR}/mysql_password"
-printf '%s\n' "${redis_password}" > "${SECRETS_DIR}/redis_password"
+printf '%s\n' "${redis_control_password}" > "${SECRETS_DIR}/redis_control_password"
+printf '%s\n' "${redis_runtime_password}" > "${SECRETS_DIR}/redis_runtime_password"
 printf '%s\n' "${opensandbox_api_key}" > "${SECRETS_DIR}/opensandbox_api_key"
 printf 'mysql+asyncmy://studio:%s@mysql:3306/tinkerfin?charset=utf8mb4\n' \
     "${mysql_password}" > "${SECRETS_DIR}/database_url"

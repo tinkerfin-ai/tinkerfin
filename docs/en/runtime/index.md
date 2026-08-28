@@ -19,14 +19,18 @@ Start with `agent.new()` if you are new to TinkerFin.
 pip install tinkerfin
 ```
 
-Install and configure your model provider separately, including its credentials.
+This base installation includes Native Runtime, Plan Mode, Observation, and native SSE.
+Install `pip install "tinkerfin[agui]"` before using `new_agui()`.
+
+Install and configure your model provider separately, including its credentials. The
+OpenAI model string below requires `pip install langchain-openai`.
 
 ## Your first Runtime
 
 ```python
 import asyncio
 
-from tinkerfin import Identity, TinkerFin
+from tinkerfin import RunIdentity, TinkerFin
 
 
 tinkerfin = TinkerFin()
@@ -37,7 +41,7 @@ agent = tinkerfin.create_deep_agent(
 
 
 async def main() -> None:
-    identity = Identity(threadId="conversation-1", runId="run-1")
+    identity = RunIdentity(threadId="conversation-1", runId="run-1")
     runtime = agent.new(identity=identity)
     stream = runtime.astream(
         {"messages": [{"role": "user", "content": "Describe Beijing in one sentence"}]},
@@ -57,12 +61,12 @@ The example has four steps:
 3. `agent.new(identity=...)` creates a fresh Graph and binds one run identity.
 4. `runtime.astream(...)` starts the run and yields results as they arrive.
 
-## What `Identity` does
+## What `RunIdentity` does
 
-`Identity` contains only `threadId` and `runId`. Runtime injects `threadId` into the Graph config automatically.
+`RunIdentity` contains only `threadId` and `runId`. Runtime injects `threadId` into the Graph config automatically.
 
 ```python
-identity = Identity(threadId="user-42-support", runId="run-20260820-1")
+identity = RunIdentity(threadId="user-42-support", runId="run-20260820-1")
 ```
 
 | Field | Requirement | Purpose |
@@ -70,9 +74,10 @@ identity = Identity(threadId="user-42-support", runId="run-20260820-1")
 | `threadId` | Required, non-empty, no surrounding whitespace | Continuing conversation and Graph checkpoint thread |
 | `runId` | Required, non-empty, no surrounding whitespace | Idempotent ID for one semantic run in the thread |
 
-An `Identity` is immutable and rejects extra fields. It does not contain parent lineage,
+A `RunIdentity` is immutable, limits each identifier to 1,024 characters, and rejects
+extra fields. It does not contain parent lineage,
 user authentication data, or request content. `new_agui(parent_run_id=...)` accepts
-lineage only when needed. The same canonical Identity is used by public events, the
+lineage only when needed. The same canonical RunIdentity is used by public events, the
 Graph, checkpoints, coordination, and durable delivery.
 
 Reuse `threadId` for one continuing conversation. Use a new `runId` for new semantic input, and reuse it only for retries or attachment.
@@ -82,15 +87,29 @@ Reuse `threadId` for one continuing conversation. Use a new `runId` for new sema
 Call `astream()` only once on each Runtime. Create another Runtime for another run:
 
 ```python
-first = agent.new(identity=Identity(threadId="thread-1", runId="run-1"))
-second = agent.new(identity=Identity(threadId="thread-1", runId="run-2"))
+first = agent.new(identity=RunIdentity(threadId="thread-1", runId="run-1"))
+second = agent.new(identity=RunIdentity(threadId="thread-1", runId="run-2"))
 ```
 
 The agent definition is reusable; a Runtime represents one execution.
+
+## Current capability boundary
+
+The distribution provides the explicit `deepagents-v2` Runtime Profile. It does not
+provide a Deep Agents v3 Profile or TodoGroups projection/UI. A separately implemented
+Profile must own its concrete upstream build and stream contract while emitting the same
+canonical Native observations; downstream Runtime, Trace, AG-UI, and Messaging code does
+not branch on upstream versions.
+
+Archive/S3/Blob storage, payload encryption/KMS, and OpenTelemetry exporters are not
+provided. Concrete integrations compose the already active `TraceStore`, canonical
+payload codec, `RuntimeObserver`, or Store/Messaging Backend decorator boundaries. There
+are no placeholder interfaces for unavailable capabilities.
 
 ## Next steps
 
 - [Create and run a Deep Agent](deep-agents.md)
 - [Streams and SSE](streams-and-sse.md)
 - [Run coordination and Redis leases](extensions.md)
+- [Record semantic execution history](../tracing/index.md)
 - [Runtime usage reference](api-reference.md)

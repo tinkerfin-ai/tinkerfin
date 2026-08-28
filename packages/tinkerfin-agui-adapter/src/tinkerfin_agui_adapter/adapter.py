@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import Literal, cast
+from typing import Literal, TypeAlias, cast
 
-from ag_ui.core import BaseEvent, RawEvent
+from ag_ui.core import BaseEvent
 from ag_ui.core import Interrupt as AgUiInterrupt
 from ag_ui.core.types import Message
 from langchain_core.messages import (
@@ -16,30 +16,36 @@ from langchain_core.messages import (
 )
 from pydantic import JsonValue, ValidationError
 
+from tinkerfin_native_stream import (
+    NativeExtraStreamPart,
+    NativeMessageStreamPart,
+    NativeStreamContractError,
+    NativeStreamFrame,
+    NativeTaskResultPayload,
+    NativeTasksStreamPart,
+    NativeTaskStartPayload,
+    NativeUpdatesStreamPart,
+    NativeValidatedStreamPart,
+    NativeValuesStreamPart,
+    validate_native_stream_part,
+)
+
 from . import _adapter_contracts, _adapter_messages, _adapter_tasks
 from ._adapter_contracts import (
     ActiveReasoning,
     ActiveToolCall,
     AgentSource,
     BufferedChildInterrupt,
-    DeepAgentStreamPartEnvelope,
-    ExtraStreamPart,
     GraphScope,
-    MessageStreamPart,
     NativeToolCall,
     StreamMode,
     SubagentInvocation,
     TaskResultFingerprint,
-    TaskResultPayload,
-    TasksStreamPart,
     TaskStartFingerprint,
-    TaskStartPayload,
     ToolResultFingerprint,
-    UpdatesStreamPart,
-    ValuesStreamPart,
 )
 from ._adapter_messages import _complete_ai_message_to_chunk
-from .contracts import AgentRunOutcome, Identity
+from .contracts import AgentRunOutcome, RunIdentity
 from .errors import (
     AgUiAdapterError,
     AgUiStreamContractError,
@@ -49,11 +55,91 @@ from .hitl import HitlActionRequest
 from .ids import ScopedIdCodec
 from .models import AgentRuntimeInterrupt
 
+ValidatedDeepAgentStreamPart: TypeAlias = NativeValidatedStreamPart
+ValidatedExtraStreamPart: TypeAlias = NativeExtraStreamPart
+ValidatedMessageStreamPart: TypeAlias = NativeMessageStreamPart
+ValidatedTaskResultPayload: TypeAlias = NativeTaskResultPayload
+ValidatedTaskStartPayload: TypeAlias = NativeTaskStartPayload
+ValidatedTasksStreamPart: TypeAlias = NativeTasksStreamPart
+ValidatedUpdatesStreamPart: TypeAlias = NativeUpdatesStreamPart
+ValidatedValuesStreamPart: TypeAlias = NativeValuesStreamPart
+
+ExtraStreamPart: TypeAlias = NativeExtraStreamPart
+MessageStreamPart: TypeAlias = NativeMessageStreamPart
+TaskResultPayload: TypeAlias = NativeTaskResultPayload
+TasksStreamPart: TypeAlias = NativeTasksStreamPart
+TaskStartPayload: TypeAlias = NativeTaskStartPayload
+UpdatesStreamPart: TypeAlias = NativeUpdatesStreamPart
+ValuesStreamPart: TypeAlias = NativeValuesStreamPart
+
+
+def _stream_contract_error(part: object, error: Exception) -> AgUiStreamContractError:
+    """Translate one structural or correlation failure without exposing payloads."""
+
+    context: dict[str, str] = {}
+    mode: object | None = None
+    if isinstance(part, Mapping):
+        mode = cast(Mapping[object, object], part).get("type")
+    else:
+        mode = getattr(part, "type", None)
+    if isinstance(mode, str):
+        context["mode"] = mode
+    if isinstance(error, ValidationError):
+        details = error.errors(include_input=False)
+        message = (
+            str(details[0]["msg"])
+            if details
+            else "Deep Agents StreamPart validation failed"
+        )
+    else:
+        message = str(error)
+    return AgUiStreamContractError(
+        message,
+        context=context,
+        cause=error,
+    )
+
+
+def validate_deep_agent_stream_part(part: object) -> ValidatedDeepAgentStreamPart:
+    """Validate one live v2 StreamPart before any consumer mutates state.
+
+    This standalone boundary uses the authoritative
+    ``tinkerfin_native_stream.validate_native_stream_part`` symbol also consumed by
+    ``DeepAgentsV2StreamDriver``. TinkerFin Runtime integrations instead call
+    :meth:`DeepAgentAgUiAdapter.process_frame` so the Adapter never validates a second
+    time. The distinction keeps direct v2 conversion useful without making the generic
+    frame path depend on v2.
+
+    Args:
+        part: Live LangGraph v2 envelope.
+
+    Returns:
+        The immutable mode-specific validated envelope.
+
+    Raises:
+        AgUiStreamContractError: The envelope or mode payload is malformed.
+    """
+
+    try:
+        return validate_native_stream_part(part)
+    except AgUiAdapterError:
+        raise
+    except NativeStreamContractError as error:
+        translated = AgUiStreamContractError(
+            error.message,
+            context=error.context,
+            cause=error,
+        )
+        raise translated from error
+    except (TypeError, ValueError, ValidationError) as error:
+        translated = _stream_contract_error(part, error)
+        raise translated from error
+
 
 class DeepAgentAgUiAdapter:
     """Convert individual Deep Agents v2 stream parts into AG-UI events.
 
-    Each instance retains one caller-declared immutable `Identity` and preserves
+    Each instance retains one caller-declared immutable `RunIdentity` and preserves
     event order and full namespace-scoped identifiers across `messages`, `tasks`,
     and `values` parts. It reads the run ID only when constructing protocol output.
     It supports ordinary compiled subgraphs as native graph scopes and enriches
@@ -75,7 +161,7 @@ class DeepAgentAgUiAdapter:
     def __init__(
         self,
         *,
-        identity: Identity,
+        identity: RunIdentity,
         prior_tool_call_ids: frozenset[str] = frozenset(),
         expose_reasoning_events: bool = False,
         expose_subagent_events: bool = True,
@@ -95,8 +181,8 @@ class DeepAgentAgUiAdapter:
             ValueError: A private key or prior Tool ID is not canonical.
         """
 
-        if not isinstance(identity, Identity):
-            raise TypeError("identity must be an Identity")
+        if not isinstance(identity, RunIdentity):
+            raise TypeError("identity must be a RunIdentity")
         if not isinstance(expose_reasoning_events, bool):
             raise TypeError("expose_reasoning_events must be a bool")
         if not isinstance(expose_subagent_events, bool):
@@ -172,14 +258,65 @@ class DeepAgentAgUiAdapter:
         self._interrupts_by_id: dict[str, AgUiInterrupt] = {}
 
     def process(self, part: object) -> list[BaseEvent]:
-        """Validate and convert one part without owning or advancing its source.
+        """Validate and convert one standalone Deep Agents v2 part.
 
         Returns events in protocol order. Validation and correlation errors are
-        raised before this part changes lifecycle state.
+        raised before this part changes lifecycle state. Runtime integrations that
+        already own a Profile must use :meth:`process_frame` instead.
+
+        Args:
+            part: One complete live v2 StreamPart object from the standalone source.
+
+        Returns:
+            Visible AG-UI events in lifecycle order.
+
+        Raises:
+            AgUiStreamContractError: The v2 envelope is structurally invalid.
+            AgUiAdapterError: Conversion or full-ID correlation fails.
+        """
+
+        return self.process_validated(validate_deep_agent_stream_part(part))
+
+    def process_frame(self, frame: NativeStreamFrame) -> list[BaseEvent]:
+        """Convert one Driver-owned canonical frame without parsing its source again.
+
+        Args:
+            frame: Exact normalization result produced for the upstream part.
+
+        Returns:
+            AG-UI events emitted in protocol order.
+
+        Raises:
+            TypeError: ``frame`` is not a canonical ``NativeStreamFrame``.
+            AgUiAdapterError: Canonical correlation or conversion fails.
+        """
+
+        if not isinstance(frame, NativeStreamFrame):
+            raise TypeError("frame must be a NativeStreamFrame")
+        return self.process_validated(frame.canonical)
+
+    def process_validated(
+        self,
+        part: ValidatedDeepAgentStreamPart,
+    ) -> list[BaseEvent]:
+        """Convert one structurally validated part without repeating validation.
+
+        Correlation checks still run before this part mutates adapter state. Callers
+        must obtain ``part`` from :func:`validate_deep_agent_stream_part`.
+
+        Args:
+            part: Structurally validated live Native part.
+
+        Returns:
+            Visible AG-UI events in lifecycle order.
+
+        Raises:
+            AgUiAdapterError: Conversion, privacy normalization, or correlation fails.
+            TypeError: The validated model contains an unsupported live-object shape.
         """
 
         try:
-            validated = DeepAgentStreamPartEnvelope.model_validate(part).root
+            validated = part
             if isinstance(validated, MessageStreamPart):
                 self._validate_message_part(validated)
                 events = self._process_message_part(validated)
@@ -193,25 +330,7 @@ class DeepAgentAgUiAdapter:
         except AgUiAdapterError:
             raise
         except (TypeError, ValueError, ValidationError) as error:
-            context: dict[str, str] = {}
-            if isinstance(part, Mapping):
-                mode = cast(Mapping[object, object], part).get("type")
-                if isinstance(mode, str):
-                    context["mode"] = mode
-            if isinstance(error, ValidationError):
-                details = error.errors(include_input=False)
-                message = (
-                    str(details[0]["msg"])
-                    if details
-                    else "Deep Agents StreamPart validation failed"
-                )
-            else:
-                message = str(error)
-            translated = AgUiStreamContractError(
-                message,
-                context=context,
-                cause=error,
-            )
+            translated = _stream_contract_error(part, error)
             raise translated from error
 
     def _visible_events(self, events: list[BaseEvent]) -> list[BaseEvent]:
@@ -314,7 +433,7 @@ class DeepAgentAgUiAdapter:
         events.extend(self._close_all_tools())
         return self._visible_events(events)
 
-    def abort(self, *, code: str) -> list[BaseEvent]:
+    def abort(self) -> list[BaseEvent]:
         """Close open child lifecycles after failure, without a main terminal."""
 
         return self._visible_events(
@@ -369,26 +488,6 @@ class DeepAgentAgUiAdapter:
             self,
             namespace,
             payload,
-        )
-
-    def _task_raw_event(
-        self,
-        *,
-        namespace: tuple[str, ...],
-        source: AgentSource,
-        phase: Literal["start", "result"],
-        data: Mapping[str, object],
-        subagents: Sequence[dict[str, JsonValue]] = (),
-    ) -> RawEvent:
-        """Build a task RAW event after JSON and provider-privacy filtering."""
-
-        return _adapter_tasks._task_raw_event(
-            self,
-            namespace=namespace,
-            source=source,
-            phase=phase,
-            data=data,
-            subagents=subagents,
         )
 
     def _process_values_part(self, part: ValuesStreamPart) -> list[BaseEvent]:
@@ -640,14 +739,6 @@ class DeepAgentAgUiAdapter:
             namespace,
         )
 
-    def _run_id_for(self, source: AgentSource) -> str:
-        """Return the caller-declared main AG-UI run ID for every graph source."""
-
-        return _adapter_messages._run_id_for(
-            self,
-            source,
-        )
-
     def _event_context(
         self,
         stream_mode: StreamMode,
@@ -721,14 +812,12 @@ class DeepAgentAgUiAdapter:
 
     def _record_interrupts(
         self,
-        namespace: tuple[str, ...],
         interrupts: Sequence[AgUiInterrupt],
     ) -> None:
         """Record terminal interrupts in first-seen order and ignore replayed frames."""
 
         return _adapter_contracts._record_interrupts(
             self,
-            namespace,
             interrupts,
         )
 

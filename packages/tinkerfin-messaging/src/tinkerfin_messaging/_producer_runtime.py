@@ -54,7 +54,7 @@ _LeaseRenewalOutcome: TypeAlias = Literal[
     "ownership_rejected",
 ]
 
-logger = logging.getLogger("tinkerfin_messaging.messaging")
+logger = logging.getLogger("tinkerfin.messaging.producer")
 
 
 @dataclass(slots=True)
@@ -80,6 +80,13 @@ class _PendingCommit(Generic[ProducedT]):
 
 
 def _lease_schedule(self: Messaging) -> tuple[float | None, float | None]:
+    """Read one internally consistent renewal interval and failure budget.
+
+    Backends may disable leases entirely. A timeout without renewal or a timeout no
+    greater than the interval cannot prove ownership and is rejected before a producer
+    task starts.
+    """
+
     interval_value = _read_backend(
         "lease_renew_interval",
         lambda: self.backend.lease_renew_interval,
@@ -137,7 +144,6 @@ async def _renew_lease_forever(
         except BaseException as error:
             finished = loop.time()
             _log_lease_failure(
-                prepared=prepared,
                 phase=phase,
                 outcome="backend_exception",
                 attempt=attempt,
@@ -154,7 +160,6 @@ async def _renew_lease_forever(
                 f"Producer for run {prepared.handle.identity.run_id!r} lost its lease"
             )
             _log_lease_failure(
-                prepared=prepared,
                 phase=phase,
                 outcome="ownership_rejected",
                 attempt=attempt,
@@ -171,7 +176,6 @@ async def _renew_lease_forever(
 
 def _log_lease_failure(
     *,
-    prepared: PreparedRun,
     phase: _LeaseRenewalPhase,
     outcome: _LeaseRenewalOutcome,
     attempt: int,
@@ -181,24 +185,27 @@ def _log_lease_failure(
     timeout: float | None,
     error: BaseException,
 ) -> None:
+    """Record trusted scheduling evidence without serializing message payloads.
+
+    Scheduler delay, command duration, and time since the last success distinguish an
+    overloaded event loop from a backend rejection. The log is operational telemetry
+    and never enters durable envelopes or the user Trace Ledger.
+    """
+
     deadline_elapsed = timeout is not None and since_last_success >= timeout
     logger.error(
         "Messaging producer lease renewal failed",
         extra={
-            "channel": prepared.handle.channel,
-            "thread_id": prepared.handle.identity.thread_id,
-            "run_id": prepared.handle.identity.run_id,
-            "renewal_phase": phase,
-            "renewal_outcome": outcome,
-            "attempt": attempt,
-            "scheduler_delay_seconds": scheduler_delay,
-            "command_duration_seconds": command_duration,
-            "seconds_since_last_success": since_last_success,
-            "lease_timeout_seconds": timeout,
-            "deadline_elapsed": deadline_elapsed,
-            "error_type": f"{type(error).__module__}.{type(error).__qualname__}",
+            "tinkerfin_renewal_phase": phase,
+            "tinkerfin_renewal_outcome": outcome,
+            "tinkerfin_attempt": attempt,
+            "tinkerfin_scheduler_delay_seconds": scheduler_delay,
+            "tinkerfin_command_duration_seconds": command_duration,
+            "tinkerfin_seconds_since_last_success": since_last_success,
+            "tinkerfin_lease_timeout_seconds": timeout,
+            "tinkerfin_deadline_elapsed": deadline_elapsed,
+            "tinkerfin_error_type": type(error).__name__,
         },
-        exc_info=(type(error), error, error.__traceback__),
     )
 
 
@@ -206,14 +213,23 @@ def _start_producer(
     self: Messaging,
     *,
     prepared: PreparedRun,
-    source: MessageSource[SourceT],
+    source: MessageSource[ProducedT],
     codec: MessageCodec[SourceT, ReplayT],
-    cancel: _ContextCancelCallback[SourceT] | None,
+    codec_input: Callable[[ProducedT], SourceT] | None,
+    cancel: _ContextCancelCallback[ProducedT] | None,
     on_committed: CommittedCallback | None,
 ) -> asyncio.Event:
-    def prepare_item(item: SourceT, ordinal: int) -> _ProducedMessage[SourceT]:
+    """Start a direct producer with one optional source-owned normalization hook.
+
+    ``codec_input`` runs in the bounded commit path and settles before another source
+    pull. This ordering lets a Runtime transfer a single-use canonical frame without
+    copying or reparsing its live provider object in Messaging.
+    """
+
+    def prepare_item(item: ProducedT, ordinal: int) -> _ProducedMessage[SourceT]:
+        data = cast(SourceT, item) if codec_input is None else codec_input(item)
         return _ProducedMessage(
-            data=item,
+            data=data,
             message_id=_derived_message_id(prepared.handle.identity, ordinal),
             checkpoint=None,
         )
@@ -298,6 +314,13 @@ def _start_recoverable_producer(
     cancel: _ContextCancelCallback[RecoverableMessage[SourceT]] | None,
     on_committed: CommittedCallback | None,
 ) -> asyncio.Event:
+    """Start a producer whose caller supplies stable IDs and atomic checkpoints.
+
+    Recovery ignores local ordinals: each ``RecoverableMessage`` must bind its own ID
+    to the checkpoint written in the same backend append, making retry idempotency and
+    source resume position one transaction.
+    """
+
     def prepare_item(
         item: RecoverableMessage[SourceT],
         ordinal: int,
@@ -333,6 +356,16 @@ def _start_producer_task(
     on_committed: CommittedCallback | None,
     prepare_item: Callable[[ProducedT, int], _ProducedMessage[SourceT]],
 ) -> asyncio.Event:
+    """Own source pull, bounded commit, lease, cancellation, and final settlement.
+
+    At most one item occupies the commit path, and the source is not pulled again until
+    that append acknowledges, preserving backpressure and any single-use codec sidecar.
+    Backend settlement arbitrates natural completion versus remote cancellation; only
+    the winner may append a cancellation tail. Lease loss fences further commits, while
+    every task and source is joined or closed before the producer records its terminal
+    status.
+    """
+
     from .messaging import CancelContext
 
     state = _ProducerState()
@@ -384,21 +417,14 @@ def _start_producer_task(
             logger.error(
                 "Messaging producer retained a secondary failure",
                 extra={
-                    "channel": prepared.handle.channel,
-                    "thread_id": prepared.handle.identity.thread_id,
-                    "run_id": prepared.handle.identity.run_id,
-                    "primary_stage": primary_stage,
-                    "secondary_stage": stage,
-                    "ownership_lost": isinstance(
+                    "tinkerfin_primary_stage": primary_stage,
+                    "tinkerfin_secondary_stage": stage,
+                    "tinkerfin_ownership_lost": isinstance(
                         secondary,
                         BackendOwnershipLost,
                     ),
+                    "tinkerfin_error_type": type(secondary).__name__,
                 },
-                exc_info=(
-                    type(secondary),
-                    secondary,
-                    secondary.__traceback__,
-                ),
             )
 
         def record_failure(
@@ -457,14 +483,12 @@ def _start_producer_task(
                             await on_committed(envelope)
                         except Exception as observer_error:  # noqa: BLE001 - observer isolation
                             logger.error(
-                                "Committed message hook failed: "
-                                "channel=%s thread_id=%s run_id=%s seq=%s "
-                                "error_type=%s",
-                                envelope.channel,
-                                envelope.identity.thread_id,
-                                envelope.identity.run_id,
-                                envelope.seq,
-                                type(observer_error).__name__,
+                                "Messaging committed hook failed",
+                                extra={
+                                    "tinkerfin_error_type": type(
+                                        observer_error
+                                    ).__name__,
+                                },
                             )
                 except asyncio.CancelledError as append_cancellation:
                     pending.error = append_cancellation

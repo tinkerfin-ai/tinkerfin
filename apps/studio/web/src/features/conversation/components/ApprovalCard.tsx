@@ -1,7 +1,6 @@
-import { ChevronDown, ChevronUp } from 'lucide-react'
-import { useEffect, useId, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
-import { Button, IconButton, OverlayScrollbar } from '../../../components/ui'
+import { Button, OverlayScrollbar } from '../../../components/ui'
 import type {
   ApprovalDecision,
   ApprovalState,
@@ -9,14 +8,10 @@ import type {
   Message,
 } from '../../../types'
 import { useI18n } from '../../../i18n'
-import {
-  readApprovalCollapsed,
-  writeApprovalCollapsed,
-} from '../planQuestionCollapse'
 import { MarkdownContent } from './MarkdownContent'
 import { ToolCallCard } from './MessageBlock'
 import { ActivityDots } from './ActivityDots'
-import { InteractionCardResizeHandle } from './InteractionCardResizeHandle'
+import { InteractionCardColorBridge } from './InteractionCardColorBridge'
 
 export interface ApprovalSubmissionDecision {
   interruptId: string
@@ -91,20 +86,13 @@ export function ApprovalCard({
 }) {
   const { t } = useI18n()
   const approval = conversation.approval
-  const cardId = useId()
-  const cardRef = useRef<HTMLElement>(null)
   const bodyRef = useRef<HTMLDivElement>(null)
   const rejectionTextareaRef = useRef<HTMLTextAreaElement>(null)
   const rejectButtonRef = useRef<HTMLButtonElement>(null)
   const approveButtonRef = useRef<HTMLButtonElement>(null)
   const retryButtonRef = useRef<HTMLButtonElement>(null)
   const restoreRejectFocusRef = useRef(false)
-  const [minimized, setMinimized] = useState(() => readApprovalCollapsed(conversation.threadId))
   const [rejectionDrafts, setRejectionDrafts] = useState<Record<string, string>>({})
-
-  useEffect(() => {
-    setMinimized(readApprovalCollapsed(conversation.threadId))
-  }, [conversation.threadId])
 
   const activeIndex = Math.max(0, Math.min(
     approval?.activeIndex ?? 0,
@@ -117,25 +105,25 @@ export function ApprovalCard({
   useEffect(() => {
     const previous = previousActiveInterruptIdRef.current
     previousActiveInterruptIdRef.current = activeInterruptId
-    if (!activeInterruptId || !previous || previous === activeInterruptId || minimized) return
+    if (!activeInterruptId || !previous || previous === activeInterruptId) return
     const frame = window.requestAnimationFrame(() => (
       rejectButtonRef.current ?? approveButtonRef.current ?? retryButtonRef.current
     )?.focus())
     return () => window.cancelAnimationFrame(frame)
-  }, [activeInterruptId, minimized])
+  }, [activeInterruptId])
 
   useEffect(() => {
-    if (!activeInterruptId || approval?.mode !== 'reject' || minimized) return
+    if (!activeInterruptId || approval?.mode !== 'reject') return
     const frame = window.requestAnimationFrame(() => rejectionTextareaRef.current?.focus())
     return () => window.cancelAnimationFrame(frame)
-  }, [activeInterruptId, approval?.mode, minimized])
+  }, [activeInterruptId, approval?.mode])
 
   useEffect(() => {
-    if (!restoreRejectFocusRef.current || approval?.mode === 'reject' || minimized) return
+    if (!restoreRejectFocusRef.current || approval?.mode === 'reject') return
     restoreRejectFocusRef.current = false
     const frame = window.requestAnimationFrame(() => rejectButtonRef.current?.focus())
     return () => window.cancelAnimationFrame(frame)
-  }, [activeInterruptId, approval?.mode, minimized])
+  }, [activeInterruptId, approval?.mode])
 
   if (!approval || approval.items.length === 0) return null
   if (!active) return null
@@ -198,20 +186,9 @@ export function ApprovalCard({
     setMode('options')
   }
 
-  const toggleMinimized = () => {
-    // 收起只保存当前会话的展示偏好，不改变审批状态或触发恢复
-    setMinimized((current) => {
-      const next = !current
-      writeApprovalCollapsed(conversation.threadId, next)
-      return next
-    })
-  }
-
   return (
     <section
-      ref={cardRef}
-      id={cardId}
-      className={`approval-composer${minimized ? ' is-minimized' : ''}`}
+      className="approval-composer"
       aria-label={t('等待审批')}
       onWheel={(event) => {
         const body = bodyRef.current
@@ -227,125 +204,105 @@ export function ApprovalCard({
         }
       }}
     >
-      {!minimized && <InteractionCardResizeHandle cardRef={cardRef} controls={cardId} />}
       <header className="approval-composer-head">
-        <button
-          type="button"
-          className="approval-toggle-surface"
-          aria-label={minimized ? t('展开审批卡片') : t('收起审批卡片')}
-          aria-expanded={!minimized}
-          onClick={toggleMinimized}
-        />
         <div className="approval-composer-heading">
           <h2>
             <span className="approval-status-dot" aria-hidden="true" />
-            <span>{t('等待审批')}</span>
+            <span>{description.title}</span>
           </h2>
-          <p>{description.title}</p>
-        </div>
-        <div className="approval-composer-head-actions">
-          <IconButton
-            size="sm"
-            className="approval-composer-head-button"
-            label={minimized ? t('展开审批卡片') : t('收起审批卡片')}
-            tooltip={minimized ? t('展开审批卡片') : t('收起审批卡片')}
-            icon={minimized ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
-            aria-expanded={!minimized}
-            onClick={toggleMinimized}
-          />
         </div>
       </header>
+      <InteractionCardColorBridge tone="warning" />
 
-      {!minimized && (
-        <>
-          <div ref={bodyRef} className="approval-composer-body ui-scrollbar">
-            {description.detail && (
-              <div className="approval-composer-detail">
-                <MarkdownContent content={description.detail} variant="compact" />
-              </div>
-            )}
-            <ToolCallCard message={toolMessage} className="approval-tool-card" />
-            {approval.mode === 'reject' && (
-              <form
-                id={rejectionFormId}
-                key={active.interruptId}
-                className="approval-rejection-form"
-                onSubmit={confirmRejection}
-              >
-                <label htmlFor={`approval-reason-${active.id}`}>
-                  {t('拒绝原因（可选）')}
-                </label>
-                <textarea
-                  ref={rejectionTextareaRef}
-                  id={`approval-reason-${active.id}`}
-                  name="reason"
-                  value={rejectionReason}
-                  rows={3}
-                  placeholder={t('说明拒绝此操作的原因…')}
-                  onChange={(event) => {
-                    const value = event.currentTarget.value
-                    setRejectionDrafts((current) => ({
-                      ...current,
-                      [active.interruptId]: value,
-                    }))
-                  }}
-                />
-              </form>
-            )}
+      <div ref={bodyRef} className="approval-composer-body ui-scrollbar">
+        {description.detail && (
+          <div className="approval-composer-detail">
+            <MarkdownContent content={description.detail} variant="compact" />
           </div>
-          <OverlayScrollbar viewportRef={bodyRef} />
-          <footer className="approval-composer-footer">
-            <p className="approval-composer-feedback" role="alert">
-              {approval.error ?? ''}
-            </p>
-            <div className="approval-composer-actions">
-              {approval.mode === 'reject' ? (
-                <>
-                  <Button size="sm" onClick={cancelRejection}>{t('取消')}</Button>
-                  <Button size="sm" type="submit" form={rejectionFormId} variant="danger">
-                    {t('确认拒绝')}
-                  </Button>
-                </>
-              ) : allDecided ? (
+        )}
+        <ToolCallCard message={toolMessage} className="approval-tool-card" />
+        {approval.mode === 'reject' && (
+          <form
+            id={rejectionFormId}
+            key={active.interruptId}
+            className="approval-rejection-form"
+            onSubmit={confirmRejection}
+          >
+            <label htmlFor={`approval-reason-${active.id}`}>
+              {t('拒绝原因（可选）')}
+            </label>
+            <textarea
+              ref={rejectionTextareaRef}
+              id={`approval-reason-${active.id}`}
+              name="reason"
+              value={rejectionReason}
+              rows={3}
+              placeholder={t('说明拒绝此操作的原因…')}
+              onChange={(event) => {
+                const value = event.currentTarget.value
+                setRejectionDrafts((current) => ({
+                  ...current,
+                  [active.interruptId]: value,
+                }))
+              }}
+            />
+          </form>
+        )}
+      </div>
+      <OverlayScrollbar viewportRef={bodyRef} />
+      <footer className="approval-composer-footer">
+        <p className="approval-composer-feedback" role="alert">
+          {approval.error ?? ''}
+        </p>
+        <div className="approval-composer-actions">
+          {approval.mode === 'reject' ? (
+            <>
+              <Button size="sm" shape="capsule" onClick={cancelRejection}>{t('取消')}</Button>
+              <Button size="sm" shape="capsule" type="submit" form={rejectionFormId} variant="danger">
+                {t('确认拒绝')}
+              </Button>
+            </>
+          ) : allDecided ? (
+            <Button
+              ref={retryButtonRef}
+              size="sm"
+              shape="capsule"
+              className="approval-allow-button"
+              onClick={() => onSubmit(interruptIds)}
+            >
+              {t('重新提交')}
+            </Button>
+          ) : (
+            <>
+              {canReject && (
                 <Button
-                  ref={retryButtonRef}
+                  ref={rejectButtonRef}
                   size="sm"
-                  className="approval-allow-button"
-                  onClick={() => onSubmit(interruptIds)}
+                  shape="capsule"
+                  className="approval-reject-button"
+                  onClick={() => setMode('reject')}
                 >
-                  {t('重新提交')}
+                  {t('拒绝')}
                 </Button>
-              ) : (
-                <>
-                  {canReject && (
-                    <Button
-                      ref={rejectButtonRef}
-                      size="sm"
-                      className="approval-reject-button"
-                      onClick={() => setMode('reject')}
-                    >
-                      {t('拒绝')}
-                    </Button>
-                  )}
-                  {canApprove && (
-                    <Button
-                      ref={approveButtonRef}
-                      size="sm"
-                      className="approval-allow-button"
-                      onClick={() => recordDecision({
-                        interruptId: active.interruptId,
-                        decision: 'approved',
-                      })}
-                    >
-                      {t('允许')}
-                    </Button>
-                  )}
-                </>
               )}
-            </div>
-          </footer>
-        </>
-      )}
+              {canApprove && (
+                <Button
+                  ref={approveButtonRef}
+                  size="sm"
+                  shape="capsule"
+                  className="approval-allow-button"
+                  onClick={() => recordDecision({
+                    interruptId: active.interruptId,
+                    decision: 'approved',
+                  })}
+                >
+                  {t('允许')}
+                </Button>
+              )}
+            </>
+          )}
+        </div>
+      </footer>
     </section>
   )
 }

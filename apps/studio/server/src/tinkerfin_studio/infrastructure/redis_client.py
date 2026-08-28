@@ -2,11 +2,11 @@
 
 from redis.asyncio import Redis
 
-from tinkerfin_studio.config.settings import RedisSettings
+from tinkerfin_studio.config.settings import RedisConnectionSettings
 
 
 def create_redis_client(
-    settings: RedisSettings, *, database: int | None = None
+    settings: RedisConnectionSettings, *, database: int | None = None
 ) -> Redis:
     """创建由应用生命周期拥有的二进制 Redis client"""
 

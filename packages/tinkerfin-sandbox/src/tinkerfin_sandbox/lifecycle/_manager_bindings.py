@@ -15,7 +15,6 @@ __all__ = [
 ]
 
 import asyncio
-import logging
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias, TypeVar, cast
 
@@ -45,7 +44,6 @@ _BindingResolution: TypeAlias = Literal[
     "not_authoritative",
     "unknown",
 ]
-logger = logging.getLogger("tinkerfin_sandbox.lifecycle.manager")
 
 
 async def _reconcile_candidate_binding(
@@ -340,12 +338,8 @@ async def _get_locked(
     if stored_id is not None:
         try:
             backend = await self._client.connect(stored_id)
-        except Exception:
-            logger.info(
-                "Failed to reconnect Sandbox %s; creating a replacement",
-                stored_id,
-                exc_info=True,
-            )
+        except Exception:  # noqa: BLE001 - reconnect failure triggers replacement
+            pass
         else:
             if await self._check_owned_backend(
                 backend,
@@ -469,12 +463,8 @@ async def reset(self: OpenSandboxManager[KeyT], key: KeyT) -> None:
                         break
                 try:
                     reset_task.result()
-                except Exception:
-                    logger.info(
-                        "Workspace reset for %r failed after caller cancellation",
-                        owner_key,
-                        exc_info=True,
-                    )
+                except Exception:  # noqa: BLE001 - cancellation remains primary
+                    pass
                 raise cancellation
             except Exception as exc:
                 raise OpenSandboxResetError(
@@ -619,11 +609,6 @@ async def delete(self: OpenSandboxManager[KeyT], key: KeyT) -> None:
                         break
                 try:
                     delete_task.result()
-                except Exception:
-                    logger.info(
-                        "Sandbox deletion for %r failed after caller cancellation; "
-                        "targets retained",
-                        owner_key,
-                        exc_info=True,
-                    )
+                except Exception:  # noqa: BLE001 - cancellation remains primary
+                    pass
                 raise cancellation

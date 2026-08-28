@@ -25,7 +25,7 @@ def test_server_arguments_allow_container_runtime_values() -> None:
 
 
 def test_main_initializes_logging_before_starting_server(tmp_path, monkeypatch) -> None:
-    """服务入口必须在启动 Uvicorn 前写出进程加载日志。"""
+    """服务入口必须在启动 Uvicorn 前写出进程加载日志"""
 
     root_logger = logging.getLogger()
     previous_handlers = list(root_logger.handlers)
@@ -35,7 +35,11 @@ def test_main_initializes_logging_before_starting_server(tmp_path, monkeypatch) 
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("LOG_FILE_ENABLED", "true")
-    monkeypatch.setattr(server_entrypoint.uvicorn, "run", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        server_entrypoint.uvicorn,
+        "run",
+        lambda *_args, **_kwargs: None,
+    )
 
     try:
         server_entrypoint.main(["--no-reload"])

@@ -5,12 +5,13 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import ClassVar, Protocol, TypeVar, runtime_checkable
 
-from tinkerfin_agui_adapter import Identity
+from tinkerfin_contracts import RunIdentity
 
 from .models import RecoverableMessage, RecoveryCheckpoint
 
 SourceT_co = TypeVar("SourceT_co", covariant=True)
 SourceT_contra = TypeVar("SourceT_contra", contravariant=True)
+CodecInputT_co = TypeVar("CodecInputT_co", covariant=True)
 ReplayT_co = TypeVar("ReplayT_co", covariant=True)
 ReplayT_contra = TypeVar("ReplayT_contra", contravariant=True)
 RecoverableSourceT = TypeVar("RecoverableSourceT")
@@ -49,7 +50,7 @@ class ProfiledMessageSource(
         ...
 
     @property
-    def messaging_identity(self) -> Identity:
+    def messaging_identity(self) -> RunIdentity:
         """Return the immutable durable thread and run identity."""
 
         ...
@@ -63,6 +64,30 @@ class ProfiledMessageSource(
     @property
     def messaging_replay_type(self) -> type[ReplayT_co]:
         """Return the decoded item type yielded during replay."""
+
+        ...
+
+
+@runtime_checkable
+class MessageCodecInputSource(
+    Protocol[SourceT_contra, CodecInputT_co],
+):
+    """Transform a live item into the finite value accepted by its profile codec.
+
+    This optional structural capability lets an upstream Runtime retain ownership of
+    provider-specific normalization while Messaging remains protocol-neutral. The
+    producer invokes the hook exactly once for an accepted item and settles its commit
+    before pulling the next item, so a source may transfer a single-use sidecar safely.
+    """
+
+    @property
+    def messaging_codec_input_type(self) -> type[CodecInputT_co]:
+        """Return the exact finite type accepted by the inferred profile codec."""
+
+        ...
+
+    def messaging_codec_input(self, item: SourceT_contra) -> CodecInputT_co:
+        """Return the already normalized codec input paired with ``item``."""
 
         ...
 

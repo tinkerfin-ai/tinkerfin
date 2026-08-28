@@ -8,7 +8,6 @@ protocol methods retain the Deep Agents shape but reject remote I/O explicitly.
 from __future__ import annotations
 
 import asyncio
-import logging
 import posixpath
 import secrets
 import shlex
@@ -53,8 +52,6 @@ from ._rooted_protocol import (
     _RootedTransferCommand,
     _RootedTransferHandshake,
 )
-
-logger = logging.getLogger(__name__)
 
 _TransferT = TypeVar("_TransferT")
 
@@ -715,8 +712,7 @@ class OpenSandboxBackend(BaseSandbox):
                 continue
             try:
                 content = await self._sandbox.files.read_bytes(path)
-            except Exception as exc:
-                logger.debug("Failed to download Sandbox file: %s", path, exc_info=True)
+            except Exception as exc:  # noqa: BLE001 - per-file SDK isolation
                 responses.append(
                     FileDownloadResponse(
                         path=path,
@@ -757,8 +753,7 @@ class OpenSandboxBackend(BaseSandbox):
                         [WriteEntry(path=parent, mode=755)]
                     )
                 await self._sandbox.files.write_file(path, content, mode=644)
-            except Exception as exc:
-                logger.debug("Failed to upload Sandbox file: %s", path, exc_info=True)
+            except Exception as exc:  # noqa: BLE001 - per-file SDK isolation
                 responses.append(
                     FileUploadResponse(
                         path=path,
@@ -816,8 +811,7 @@ class OpenSandboxBackend(BaseSandbox):
         """Asynchronously read lifecycle details and probe data-plane health."""
         try:
             info = await self._sandbox.get_info()
-        except Exception as exc:
-            logger.info("Failed to read Sandbox %s details", self.id, exc_info=True)
+        except Exception as exc:  # noqa: BLE001 - runtime info has a stable unavailable form
             return OpenSandboxRuntimeInfo.unavailable(
                 self.id,
                 unavailable_reason(exc),
@@ -825,7 +819,6 @@ class OpenSandboxBackend(BaseSandbox):
 
         try:
             healthy = (await self.aexecute(self._health_command)).exit_code == 0
-        except Exception:
-            logger.info("Sandbox %s health check failed", self.id, exc_info=True)
+        except Exception:  # noqa: BLE001 - health failures map to an unhealthy result
             healthy = False
         return OpenSandboxRuntimeInfo.from_sdk(info, healthy=healthy)

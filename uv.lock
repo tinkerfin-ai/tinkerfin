@@ -12,9 +12,13 @@ resolution-markers = [
 members = [
     "tinkerfin",
     "tinkerfin-agui-adapter",
+    "tinkerfin-contracts",
+    "tinkerfin-langgraph-mysql",
     "tinkerfin-messaging",
+    "tinkerfin-native-stream",
     "tinkerfin-sandbox",
     "tinkerfin-studio",
+    "tinkerfin-tracing",
     "tinkerfin-workspace",
 ]
 
@@ -28,18 +32,6 @@ dependencies = [
 sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/a7/10/4ad299267a7d04b89935aa99eef62979758fcf95aee9f8bb5d70c35b1be1/ag_ui_protocol-0.1.19.tar.gz", hash = "sha256:43c27f60d41712dcad0e9e0a203cbdf1c8e248b22417374c5c68321c448af4ea", size = 10720, upload-time = "2026-06-02T17:26:15.627Z" }
 wheels = [
     { url = "https://pypi.tuna.tsinghua.edu.cn/packages/4c/0a/bcad8116eb058e4b4a305e3fc37ebd7efc879deeb86b854f1c5b8b6e97dd/ag_ui_protocol-0.1.19-py3-none-any.whl", hash = "sha256:898843b1410d378824da0c6a776486288b9c5828689d0bf563118868e37f390f", size = 13490, upload-time = "2026-06-02T17:26:16.313Z" },
-]
-
-[[package]]
-name = "aiomysql"
-version = "0.3.2"
-source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
-dependencies = [
-    { name = "pymysql" },
-]
-sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/29/e0/302aeffe8d90853556f47f3106b89c16cc2ec2a4d269bdfd82e3f4ae12cc/aiomysql-0.3.2.tar.gz", hash = "sha256:72d15ef5cfc34c03468eb41e1b90adb9fd9347b0b589114bd23ead569a02ac1a", size = 108311, upload-time = "2025-10-22T00:15:21.278Z" }
-wheels = [
-    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/4c/af/aae0153c3e28712adaf462328f6c7a3c196a1c1c27b491de4377dd3e6b52/aiomysql-0.3.2-py3-none-any.whl", hash = "sha256:c82c5ba04137d7afd5c693a258bea8ead2aad77101668044143a991e04632eb2", size = 71834, upload-time = "2025-10-22T00:15:15.905Z" },
 ]
 
 [[package]]
@@ -1126,31 +1118,6 @@ wheels = [
 ]
 
 [[package]]
-name = "langgraph-checkpoint-mysql"
-version = "3.0.0"
-source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
-dependencies = [
-    { name = "langgraph-checkpoint" },
-    { name = "orjson" },
-    { name = "typing-extensions" },
-]
-sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/e0/4e/0a6c78e5d3f2ca1525903c2363e721873594b6b77dd83537a6369193c474/langgraph_checkpoint_mysql-3.0.0.tar.gz", hash = "sha256:006aaa089f4c2fbd7b2c113b800ccd3dbb95f92203e656451677256b4b4f880f", size = 213142, upload-time = "2026-01-23T11:11:15.74Z" }
-wheels = [
-    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/08/68/343103a7fae05523f9cecabbec2babdb737e66b4bf6ea48ae00c685ed11c/langgraph_checkpoint_mysql-3.0.0-py3-none-any.whl", hash = "sha256:7560ccd16e7596a047e15a307cec12dbd88fdcaab45a75759e5c6adef22a27d1", size = 38009, upload-time = "2026-01-23T11:11:14.697Z" },
-]
-
-[package.optional-dependencies]
-aiomysql = [
-    { name = "aiomysql" },
-]
-asyncmy = [
-    { name = "asyncmy" },
-]
-pymysql = [
-    { name = "pymysql" },
-]
-
-[[package]]
 name = "langgraph-checkpoint-redis"
 version = "0.5.1"
 source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
@@ -1771,15 +1738,6 @@ source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
 sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/c3/b2/bc9c9196916376152d655522fdcebac55e66de6603a76a02bca1b6414f6c/pygments-2.20.0.tar.gz", hash = "sha256:6757cd03768053ff99f3039c1a36d6c0aa0b263438fcab17520b30a303a82b5f", size = 4955991, upload-time = "2026-03-29T13:29:33.898Z" }
 wheels = [
     { url = "https://pypi.tuna.tsinghua.edu.cn/packages/f4/7e/a72dd26f3b0f4f2bf1dd8923c85f7ceb43172af56d63c7383eb62b332364/pygments-2.20.0-py3-none-any.whl", hash = "sha256:81a9e26dd42fd28a23a2d169d86d7ac03b46e2f8b59ed4698fb4785f946d0176", size = 1231151, upload-time = "2026-03-29T13:29:30.038Z" },
-]
-
-[[package]]
-name = "pymysql"
-version = "1.2.0"
-source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
-sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/c9/bc/1c6a92f385940f727daeecf3bacaf186e03875dff57197801046c583bcf0/pymysql-1.2.0.tar.gz", hash = "sha256:6c7b17ca686988104d7426c27895b455cdeea3e9d3ceb1270f0c3704fead8c33", size = 49021, upload-time = "2026-05-19T08:26:22.302Z" }
-wheels = [
-    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/c4/bd/2534e130295c8cfd4f0a2e31623baab7502278f1e97bcfe61db75656a77f/pymysql-1.2.0-py3-none-any.whl", hash = "sha256:62169ce6d5510f08e140c5e7990ee884a9764024e4a9a27b2cc11f1099322ae0", size = 45716, upload-time = "2026-05-19T08:26:20.974Z" },
 ]
 
 [[package]]
@@ -2446,34 +2404,44 @@ name = "tinkerfin"
 version = "0.1.0"
 source = { editable = "packages/tinkerfin" }
 dependencies = [
-    { name = "ag-ui-protocol" },
     { name = "deepagents" },
+    { name = "jsonschema" },
     { name = "langchain" },
     { name = "langchain-core" },
     { name = "langgraph" },
     { name = "pydantic" },
-    { name = "tinkerfin-agui-adapter" },
+    { name = "tinkerfin-contracts" },
+    { name = "tinkerfin-native-stream" },
+    { name = "typing-extensions" },
     { name = "wcmatch" },
 ]
 
 [package.optional-dependencies]
+agui = [
+    { name = "ag-ui-protocol" },
+    { name = "tinkerfin-agui-adapter" },
+]
 redis = [
     { name = "redis" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "ag-ui-protocol", specifier = "==0.1.19" },
+    { name = "ag-ui-protocol", marker = "extra == 'agui'", specifier = "==0.1.19" },
     { name = "deepagents", specifier = "==0.7.5" },
+    { name = "jsonschema", specifier = ">=4.25,<5" },
     { name = "langchain", specifier = "==1.3.14" },
-    { name = "langchain-core", specifier = ">=1.5.3,<1.6.0" },
-    { name = "langgraph", specifier = ">=1.2.10,<1.3.0" },
+    { name = "langchain-core", specifier = "==1.5.3" },
+    { name = "langgraph", specifier = "==1.2.10" },
     { name = "pydantic", specifier = ">=2,<3" },
     { name = "redis", marker = "extra == 'redis'", specifier = ">=6,<9" },
-    { name = "tinkerfin-agui-adapter", editable = "packages/tinkerfin-agui-adapter" },
+    { name = "tinkerfin-agui-adapter", marker = "extra == 'agui'", editable = "packages/tinkerfin-agui-adapter" },
+    { name = "tinkerfin-contracts", editable = "packages/tinkerfin-contracts" },
+    { name = "tinkerfin-native-stream", editable = "packages/tinkerfin-native-stream" },
+    { name = "typing-extensions", specifier = ">=4.12.2,<5" },
     { name = "wcmatch", specifier = ">=11,<12" },
 ]
-provides-extras = ["redis"]
+provides-extras = ["agui", "redis"]
 
 [[package]]
 name = "tinkerfin-agui-adapter"
@@ -2485,15 +2453,49 @@ dependencies = [
     { name = "langchain-core" },
     { name = "pydantic" },
     { name = "pydantic-core" },
+    { name = "tinkerfin-contracts" },
+    { name = "tinkerfin-native-stream" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "ag-ui-protocol", specifier = "==0.1.19" },
     { name = "jsonschema", specifier = ">=4.25,<5" },
-    { name = "langchain-core", specifier = ">=1.5.3,<2" },
+    { name = "langchain-core", specifier = "==1.5.3" },
     { name = "pydantic", specifier = ">=2,<3" },
     { name = "pydantic-core", specifier = ">=2,<3" },
+    { name = "tinkerfin-contracts", editable = "packages/tinkerfin-contracts" },
+    { name = "tinkerfin-native-stream", editable = "packages/tinkerfin-native-stream" },
+]
+
+[[package]]
+name = "tinkerfin-contracts"
+version = "0.1.0"
+source = { editable = "packages/tinkerfin-contracts" }
+dependencies = [
+    { name = "pydantic" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "pydantic", specifier = ">=2,<3" }]
+
+[[package]]
+name = "tinkerfin-langgraph-mysql"
+version = "0.1.0"
+source = { editable = "packages/tinkerfin-langgraph-mysql" }
+dependencies = [
+    { name = "asyncmy" },
+    { name = "langgraph-checkpoint" },
+    { name = "orjson" },
+    { name = "typing-extensions" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "asyncmy", specifier = "==0.2.14" },
+    { name = "langgraph-checkpoint", specifier = "==4.2.0" },
+    { name = "orjson", specifier = "==3.11.9" },
+    { name = "typing-extensions", specifier = ">=4.12.2,<5" },
 ]
 
 [[package]]
@@ -2501,24 +2503,51 @@ name = "tinkerfin-messaging"
 version = "0.1.0"
 source = { editable = "packages/tinkerfin-messaging" }
 dependencies = [
-    { name = "ag-ui-protocol" },
     { name = "pydantic" },
-    { name = "tinkerfin" },
+    { name = "tinkerfin-contracts" },
 ]
 
 [package.optional-dependencies]
+agui = [
+    { name = "ag-ui-protocol" },
+]
+native = [
+    { name = "tinkerfin-native-stream" },
+]
 redis = [
     { name = "redis" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "ag-ui-protocol", specifier = "==0.1.19" },
+    { name = "ag-ui-protocol", marker = "extra == 'agui'", specifier = "==0.1.19" },
     { name = "pydantic", specifier = ">=2,<3" },
     { name = "redis", marker = "extra == 'redis'", specifier = ">=6,<9" },
-    { name = "tinkerfin", editable = "packages/tinkerfin" },
+    { name = "tinkerfin-contracts", editable = "packages/tinkerfin-contracts" },
+    { name = "tinkerfin-native-stream", marker = "extra == 'native'", editable = "packages/tinkerfin-native-stream" },
 ]
-provides-extras = ["redis"]
+provides-extras = ["redis", "agui", "native"]
+
+[[package]]
+name = "tinkerfin-native-stream"
+version = "0.1.0"
+source = { editable = "packages/tinkerfin-native-stream" }
+dependencies = [
+    { name = "langchain-core" },
+    { name = "langgraph" },
+    { name = "pydantic" },
+    { name = "pydantic-core" },
+    { name = "tinkerfin-contracts" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "langchain-core", specifier = "==1.5.3" },
+    { name = "langgraph", specifier = "==1.2.10" },
+    { name = "pydantic", specifier = ">=2,<3" },
+    { name = "pydantic-core", specifier = ">=2,<3" },
+    { name = "tinkerfin-contracts", editable = "packages/tinkerfin-contracts" },
+]
 
 [[package]]
 name = "tinkerfin-sandbox"
@@ -2530,6 +2559,7 @@ dependencies = [
     { name = "langchain-core" },
     { name = "opensandbox" },
     { name = "pydantic" },
+    { name = "typing-extensions" },
 ]
 
 [package.optional-dependencies]
@@ -2544,15 +2574,16 @@ sqlite = [
 
 [package.metadata]
 requires-dist = [
-    { name = "aiosqlite", marker = "extra == 'sqlite'", specifier = ">=0.22,<1" },
-    { name = "asyncmy", marker = "extra == 'mysql'", specifier = ">=0.2.11,<1" },
-    { name = "deepagents", specifier = ">=0.7.1,<0.8.0" },
-    { name = "langchain", specifier = ">=1.3.14,<2" },
-    { name = "langchain-core", specifier = ">=1.5.3,<2" },
+    { name = "aiosqlite", marker = "extra == 'sqlite'", specifier = ">=0.22,<0.23" },
+    { name = "asyncmy", marker = "extra == 'mysql'", specifier = "==0.2.14" },
+    { name = "deepagents", specifier = "==0.7.5" },
+    { name = "langchain", specifier = "==1.3.14" },
+    { name = "langchain-core", specifier = "==1.5.3" },
     { name = "opensandbox", specifier = "==0.1.14" },
     { name = "pydantic", specifier = ">=2,<3" },
-    { name = "sqlalchemy", extras = ["asyncio"], marker = "extra == 'mysql'", specifier = ">=2.0.48,<3" },
-    { name = "sqlalchemy", extras = ["asyncio"], marker = "extra == 'sqlite'", specifier = ">=2.0.48,<3" },
+    { name = "sqlalchemy", extras = ["asyncio"], marker = "extra == 'mysql'", specifier = "==2.0.52" },
+    { name = "sqlalchemy", extras = ["asyncio"], marker = "extra == 'sqlite'", specifier = "==2.0.52" },
+    { name = "typing-extensions", specifier = ">=4.12.2,<5" },
 ]
 provides-extras = ["sqlite", "mysql"]
 
@@ -2566,24 +2597,27 @@ dependencies = [
     { name = "deepagents" },
     { name = "fastapi" },
     { name = "httpx" },
-    { name = "jsonpatch" },
     { name = "langchain" },
     { name = "langchain-core" },
     { name = "langchain-deepseek" },
     { name = "langchain-openai" },
     { name = "langgraph" },
-    { name = "langgraph-checkpoint-mysql", extra = ["aiomysql", "asyncmy", "pymysql"] },
     { name = "langgraph-checkpoint-redis" },
     { name = "langsmith" },
+    { name = "opensandbox" },
+    { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
     { name = "redis" },
     { name = "sqlalchemy", extra = ["asyncio"] },
+    { name = "starlette" },
     { name = "tavily-python" },
-    { name = "tinkerfin", extra = ["redis"] },
-    { name = "tinkerfin-messaging", extra = ["redis"] },
+    { name = "tinkerfin", extra = ["agui", "redis"] },
+    { name = "tinkerfin-langgraph-mysql" },
+    { name = "tinkerfin-messaging", extra = ["agui", "redis"] },
     { name = "tinkerfin-sandbox", extra = ["mysql"] },
+    { name = "tinkerfin-tracing", extra = ["mysql"] },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -2591,30 +2625,63 @@ dependencies = [
 requires-dist = [
     { name = "ag-ui-protocol", specifier = "==0.1.19" },
     { name = "anyio", specifier = ">=4,<5" },
-    { name = "asyncmy", specifier = ">=0.2.11,<1" },
+    { name = "asyncmy", specifier = "==0.2.14" },
     { name = "deepagents", specifier = "==0.7.5" },
     { name = "fastapi", specifier = ">=0.141,<1" },
     { name = "httpx", specifier = ">=0.28,<1" },
-    { name = "jsonpatch", specifier = ">=1.33,<2" },
     { name = "langchain", specifier = "==1.3.14" },
     { name = "langchain-core", specifier = "==1.5.3" },
     { name = "langchain-deepseek", specifier = "==1.1.0" },
     { name = "langchain-openai", specifier = "==1.4.3" },
     { name = "langgraph", specifier = "==1.2.10" },
-    { name = "langgraph-checkpoint-mysql", extras = ["aiomysql", "asyncmy", "pymysql"], specifier = "==3.0.0" },
     { name = "langgraph-checkpoint-redis", specifier = "==0.5.1" },
     { name = "langsmith", specifier = ">=0.10.9,<1" },
+    { name = "opensandbox", specifier = "==0.1.14" },
+    { name = "pydantic", specifier = ">=2,<3" },
     { name = "pydantic-settings", specifier = ">=2.12,<3" },
     { name = "python-dotenv", specifier = ">=1.2,<2" },
     { name = "pyyaml", specifier = ">=6.0.3,<7" },
     { name = "redis", specifier = ">=6,<9" },
-    { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.48,<3" },
+    { name = "sqlalchemy", extras = ["asyncio"], specifier = "==2.0.52" },
+    { name = "starlette", specifier = ">=0.46,<1" },
     { name = "tavily-python", specifier = ">=0.7,<1" },
-    { name = "tinkerfin", extras = ["redis"], editable = "packages/tinkerfin" },
-    { name = "tinkerfin-messaging", extras = ["redis"], editable = "packages/tinkerfin-messaging" },
+    { name = "tinkerfin", extras = ["agui", "redis"], editable = "packages/tinkerfin" },
+    { name = "tinkerfin-langgraph-mysql", editable = "packages/tinkerfin-langgraph-mysql" },
+    { name = "tinkerfin-messaging", extras = ["agui", "redis"], editable = "packages/tinkerfin-messaging" },
     { name = "tinkerfin-sandbox", extras = ["mysql"], editable = "packages/tinkerfin-sandbox" },
+    { name = "tinkerfin-tracing", extras = ["mysql"], editable = "packages/tinkerfin-tracing" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.52,<1" },
 ]
+
+[[package]]
+name = "tinkerfin-tracing"
+version = "0.1.0"
+source = { editable = "packages/tinkerfin-tracing" }
+dependencies = [
+    { name = "pydantic" },
+    { name = "tinkerfin-contracts" },
+]
+
+[package.optional-dependencies]
+mysql = [
+    { name = "asyncmy" },
+    { name = "sqlalchemy", extra = ["asyncio"] },
+]
+sqlite = [
+    { name = "aiosqlite" },
+    { name = "sqlalchemy", extra = ["asyncio"] },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "aiosqlite", marker = "extra == 'sqlite'", specifier = ">=0.22,<0.23" },
+    { name = "asyncmy", marker = "extra == 'mysql'", specifier = "==0.2.14" },
+    { name = "pydantic", specifier = ">=2,<3" },
+    { name = "sqlalchemy", extras = ["asyncio"], marker = "extra == 'mysql'", specifier = "==2.0.52" },
+    { name = "sqlalchemy", extras = ["asyncio"], marker = "extra == 'sqlite'", specifier = "==2.0.52" },
+    { name = "tinkerfin-contracts", editable = "packages/tinkerfin-contracts" },
+]
+provides-extras = ["sqlite", "mysql"]
 
 [[package]]
 name = "tinkerfin-workspace"

@@ -70,22 +70,30 @@ class PlanClarificationMetadata(_ContractModel):
 
 
 class ApprovePlan(_ContractModel):
+    """Approve the current Plan revision without edits."""
+
     type: Literal["approve"]
     base_revision: int = Field(ge=1, strict=True)
 
 
 class EditPlanBase(_ContractModel):
+    """Identify an edit decision for one current Plan revision."""
+
     type: Literal["edit"]
     base_revision: int = Field(ge=1, strict=True)
 
 
 class RespondToPlan(_ContractModel):
+    """Return user feedback for one current Plan revision."""
+
     type: Literal["respond"]
     base_revision: int = Field(ge=1, strict=True)
     message: NonBlankText
 
 
 class RejectPlan(_ContractModel):
+    """Reject one current Plan revision with optional feedback."""
+
     type: Literal["reject"]
     base_revision: int = Field(ge=1, strict=True)
     message: NonBlankText | None = None

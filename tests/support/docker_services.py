@@ -11,9 +11,19 @@ from __future__ import annotations
 import re
 import secrets
 import sys
+import time
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, cast
+from urllib.error import HTTPError, URLError
+from urllib.request import (
+    BaseHandler,
+    HTTPSHandler,
+    ProxyHandler,
+    Request,
+    build_opener,
+)
 from uuid import uuid4
 
 import docker
@@ -27,6 +37,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from testcontainers.core.config import get_docker_socket, testcontainers_config
 from testcontainers.core.container import DockerContainer
 from testcontainers.core.wait_strategies import ExecWaitStrategy, HttpWaitStrategy
+from testcontainers.core.waiting_utils import WaitStrategyTarget
 
 _MYSQL_IMAGE = (
     "mysql:8.4@sha256:b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb"
@@ -53,6 +64,97 @@ _DOCKER_FIXTURE_NAMES = frozenset(
         "redis_url",
     }
 )
+
+
+class _MappedPortHttpWaitStrategy(HttpWaitStrategy):
+    """Retry Docker's mapped-port publication before starting HTTP readiness.
+
+    Docker Desktop can report a container as running a few milliseconds before its
+    random host-port mapping becomes visible. Testcontainers 4.15 builds the HTTP URL
+    once, so that narrow daemon race otherwise aborts a healthy container immediately.
+    The probe re-resolves that mapping, bypasses host proxy settings for loopback, and
+    keeps the inherited status-code and response checks within one startup timeout.
+    """
+
+    def __init__(
+        self,
+        port: int,
+        path: str,
+        *,
+        mapping_timeout_seconds: float = 10.0,
+    ) -> None:
+        super().__init__(port, path)
+        self._mapping_timeout_seconds = mapping_timeout_seconds
+
+    def _build_url(self, container: WaitStrategyTarget) -> str:
+        deadline = time.monotonic() + self._mapping_timeout_seconds
+        while True:
+            try:
+                url = super()._build_url(container)
+                if sys.platform == "darwin":
+                    return url.replace("://localhost:", "://127.0.0.1:", 1)
+                return url
+            except ConnectionError as error:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "Docker did not publish the OpenSandbox host-port mapping "
+                        f"within {self._mapping_timeout_seconds:g} seconds"
+                    ) from error
+                time.sleep(self._poll_interval)
+
+    def wait_until_ready(self, container: WaitStrategyTarget) -> None:
+        """Re-resolve a random host port on every bounded HTTP attempt."""
+
+        started_at = time.monotonic()
+        headers = self._setup_headers()
+        ssl_context = self._setup_ssl_context()
+        last_url = f"http://unresolved:{self._port}{self._path}"
+        while True:
+            if time.monotonic() - started_at > self._startup_timeout:
+                self._raise_timeout_error(last_url)
+            last_url = self._build_url(container)
+            if self._try_http_request(last_url, headers, ssl_context):
+                return
+            time.sleep(self._poll_interval)
+
+    def _try_http_request(
+        self,
+        url: str,
+        headers: dict[str, str],
+        ssl_context: Any,
+    ) -> bool:
+        """Probe loopback directly without macOS or host proxy configuration."""
+
+        handlers: list[BaseHandler] = [ProxyHandler({})]
+        if ssl_context is not None:
+            handlers.append(HTTPSHandler(context=ssl_context))
+        opener = build_opener(*handlers)
+        request = Request(
+            url,
+            headers=headers,
+            method=self._method,
+            data=self._body.encode() if self._body else None,
+        )
+        try:
+            with opener.open(request, timeout=1) as response:
+                return self._check_response(response, url)
+        except (URLError, HTTPError) as error:
+            return self._handle_http_error(error)
+        except (ConnectionResetError, ConnectionRefusedError, BrokenPipeError, OSError):
+            return False
+
+
+def _with_opensandbox_port(container: DockerContainer) -> DockerContainer:
+    """Expose OpenSandbox through a random host port safe for the current daemon."""
+
+    container.with_exposed_ports(8090)
+    if sys.platform == "darwin":
+        # Docker Desktop can create a non-forwarding 0.0.0.0 random binding for this
+        # Docker-socket-owning image. docker-py's explicit loopback + port 0 keeps the
+        # port random while using the forwarding path verified by the host process.
+        ports = cast(dict[str, object], container.ports)
+        ports["8090"] = ("127.0.0.1", 0)
+    return container
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -329,14 +431,13 @@ def opensandbox_test_service(
     config_path: Path = tmp_path_factory.mktemp("opensandbox") / "config.toml"
     config_path.write_text(_opensandbox_config(), encoding="utf-8")
     wait = (
-        HttpWaitStrategy(8090, "/health")
+        _MappedPortHttpWaitStrategy(8090, "/health")
         .with_poll_interval(0.5)
         .with_startup_timeout(180)
     )
     container = (
-        DockerContainer(_OPENSANDBOX_SERVER_IMAGE)
+        _with_opensandbox_port(DockerContainer(_OPENSANDBOX_SERVER_IMAGE))
         .with_env("OPENSANDBOX_SERVER_API_KEY", api_key)
-        .with_exposed_ports(8090)
         .with_volume_mapping(
             _opensandbox_docker_socket(),
             "/var/run/docker.sock",

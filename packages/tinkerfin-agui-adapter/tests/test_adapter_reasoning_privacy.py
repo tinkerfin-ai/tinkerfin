@@ -13,11 +13,11 @@ from ag_ui.core import (
 )
 from langchain_core.messages import AIMessage, AIMessageChunk
 
-from tinkerfin_agui_adapter import Identity, astream_events
+from tinkerfin_agui_adapter import RunIdentity, astream_events
 
 
-def _identity() -> Identity:
-    return Identity(threadId="thread-1", runId="run-1")
+def _identity() -> RunIdentity:
+    return RunIdentity(threadId="thread-1", runId="run-1")
 
 
 @pytest.mark.parametrize("expose_reasoning_events", [False, True])

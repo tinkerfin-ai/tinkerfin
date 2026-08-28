@@ -8,12 +8,6 @@ import type {
   PlanClarificationAnswer,
   RawEventContext,
 } from "../../../api/conversation/types"
-import { parseConversationAgUiEvent } from "../../../api/conversation/eventParser"
-import type {
-  ConversationEventEnvelope,
-  ConversationHistoryDetail,
-  ConversationSnapshotJson,
-} from "../../../api/conversation/history"
 import {
   ConversationError,
   conversationErrorMessage,
@@ -216,11 +210,6 @@ const hasOnlyKeys = (value: JsonObject, keys: readonly string[]) => {
   const expected = [...keys].sort()
   return actual.length === expected.length
     && actual.every((key, index) => key === expected[index])
-}
-
-const hasNoUnknownKeys = (value: object, keys: readonly string[]) => {
-  const allowed = new Set(keys)
-  return Object.keys(value).every((key) => allowed.has(key))
 }
 
 const CLARIFICATION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
@@ -432,6 +421,36 @@ const planInteractionFromInterrupts = (
   }
 
   return undefined
+}
+
+export const planInteractionFromTracePayload = (
+  interruptId: string,
+  payload: JsonValue | null | undefined,
+): Conversation['planInteraction'] => {
+  if (!isJsonObject(payload)) return undefined
+  const kind = payload.kind
+  const responseSchema = payload.responseSchema
+  if (
+    (kind !== 'tinkerfin:plan_clarification' && kind !== 'tinkerfin:plan_review')
+    || !isJsonObject(responseSchema)
+    || payload.schema !== 'tinkerfin.runtime-interrupt'
+  ) return undefined
+  const message = typeof payload.message === 'string' ? payload.message : undefined
+  return planInteractionFromInterrupts([
+    {
+      id: interruptId,
+      reason: kind,
+      message,
+      responseSchema,
+      metadata: {
+        runtimeInterrupt: {
+          schema: 'tinkerfin.runtime-interrupt',
+          nativeInterruptId: interruptId,
+          envelope: structuredClone(payload),
+        },
+      },
+    },
+  ])
 }
 
 const attachApproval = (conversation: Conversation, interrupts: InterruptEvent[]) => ({
@@ -1475,193 +1494,5 @@ export const applyConversationEvent = (
 
     default:
       return conversation
-  }
-}
-
-// ---------------------------------------------------------------------------
-// 历史恢复：当前快照与严格有序的尾部事件
-// ---------------------------------------------------------------------------
-
-const currentSnapshot = (
-  detail: ConversationHistoryDetail,
-): ConversationSnapshotJson | null => {
-  if (!hasNoUnknownKeys(detail, [
-    'createdAt',
-    'events',
-    'hasPendingInterrupt',
-    'id',
-    'lastModel',
-    'lastRunId',
-    'lastSeq',
-    'messageCount',
-    'pendingInteractionKind',
-    'pinned',
-    'snapshot',
-    'snapshotSeq',
-    'status',
-    'threadId',
-    'title',
-    'toolCallCount',
-    'updatedAt',
-  ])) throw new Error("会话历史详情字段不符合当前契约")
-  if (detail.lastSeq < detail.snapshotSeq) {
-    throw new Error("会话历史 lastSeq 不能小于 snapshotSeq")
-  }
-  const snapshot = detail.snapshot ?? null
-  if (snapshot == null) {
-    if (detail.snapshotSeq !== 0 || detail.lastSeq !== 0) {
-      throw new Error("只有无事件的新会话可以缺少快照")
-    }
-    return null
-  }
-  if (!hasOnlyKeys(snapshot as unknown as JsonObject, [
-    'activeRunId',
-    'approval',
-    'interrupts',
-    'messages',
-    'mode',
-    'runStatus',
-    'runs',
-    'serverState',
-    'snapshotSeq',
-    'todos',
-  ])) throw new Error("会话历史快照字段不符合当前契约")
-  if (snapshot.snapshotSeq !== detail.snapshotSeq) {
-    throw new Error("会话历史快照序号与详情不一致")
-  }
-  return snapshot
-}
-
-const messagesFromSnapshot = (snapshot: ConversationSnapshotJson | null | undefined): Message[] => {
-  if (!snapshot) return []
-  return snapshot.messages.map((message) => ({
-    ...message,
-    meta: message.meta ? { ...message.meta } : undefined,
-  }))
-}
-
-/**
- * 按当前历史契约恢复持久化会话
- *
- * 当前快照包含完整 UI 投影，只回放 `snapshotSeq` 之后的事件；新会话允许
- * `snapshot=null` 与 `snapshotSeq=0`，字段或序号矛盾直接拒绝
- */
-export const restoreConversationFromHistory = (
-  detail: ConversationHistoryDetail,
-  options: { model: string },
-): Conversation => {
-  const snapshot = currentSnapshot(detail)
-  const hasSnapshot = snapshot != null
-  const snapshotPlanInteraction = hasSnapshot
-    ? planInteractionFromInterrupts(snapshot.interrupts)
-    : undefined
-  const baseline: Conversation = {
-    threadId: detail.threadId,
-    title: detail.title,
-    pinned: detail.pinned,
-    updatedAt: detail.updatedAt,
-    model: options.model,
-    mode: hasSnapshot && snapshot.mode === "plan" ? "plan" : "default",
-    messages: hasSnapshot ? messagesFromSnapshot(snapshot) : [],
-    todos: hasSnapshot ? snapshot.todos.map((todo) => ({ ...todo })) : [],
-    approval: hasSnapshot && !snapshotPlanInteraction && snapshot.approval
-      ? snapshot.approval
-      : undefined,
-    planInteraction: snapshotPlanInteraction,
-    runStatus: ((): Conversation["runStatus"] => {
-      switch (detail.status) {
-        // 历史水化不拥有原始 SSE 连接；服务端仍在运行时，本地应标记为断连并通过
-        // 持久化事件追赶，不能展示无效的停止按钮
-        case "running": return "detached"
-        case "waiting_approval": return "waiting_approval"
-        case "error": return "error"
-        default: return "idle"
-      }
-    })(),
-    activeRunId: hasSnapshot
-      ? snapshot.activeRunId ?? undefined
-      : undefined,
-    serverState: hasSnapshot ? snapshot.serverState : {},
-    lastSeq: hasSnapshot ? detail.snapshotSeq : 0,
-  }
-
-  const restored = detail.events.reduce<Conversation>(
-    (conversation, envelope) => applyHistoryEventEnvelope(conversation, envelope),
-    baseline,
-  )
-
-  // 事件回放只重建 UI 投影，不会创建浏览器持有的 SSE 连接；RUN_STARTED 不能让
-  // 已水化历史停在 `streaming` 并暴露无效停止按钮，详情状态才是权威服务端状态
-  const hasAuthoritativeApproval = detail.status === "waiting_approval"
-    && detail.hasPendingInterrupt
-  const authoritative: Conversation = {
-    ...restored,
-    approval: hasAuthoritativeApproval ? restored.approval : undefined,
-    planInteraction: hasAuthoritativeApproval ? restored.planInteraction : undefined,
-    runStatus: detail.status === "running"
-      ? "detached"
-      : hasAuthoritativeApproval
-        ? "waiting_approval"
-        : detail.status === "error"
-          ? "error"
-          : "idle",
-  }
-  return hasAuthoritativeApproval
-    ? restorePendingInteraction(authoritative)
-    : authoritative
-}
-
-export const applyHistoryEventEnvelope = (
-  conversation: Conversation,
-  envelope: ConversationEventEnvelope,
-): Conversation => applyPersistedEventEnvelope(conversation, envelope, false)
-
-export const applyLiveEventEnvelope = (
-  conversation: Conversation,
-  envelope: ConversationEventEnvelope,
-): Conversation => applyPersistedEventEnvelope(conversation, envelope, true)
-
-const applyPersistedEventEnvelope = (
-  conversation: Conversation,
-  envelope: ConversationEventEnvelope,
-  ownsLiveStream: boolean,
-): Conversation => {
-  const lastSeq = conversation.lastSeq ?? 0
-  if (envelope.seq <= lastSeq) return conversation
-  if (envelope.seq !== lastSeq + 1) {
-    throw new Error(
-      `会话事件序号不连续: expected=${lastSeq + 1}, actual=${envelope.seq}`,
-    )
-  }
-  const event = parseConversationAgUiEvent(envelope.event)
-  const next = applyConversationEvent(conversation, event)
-  const previousById = new Map(conversation.messages.map((message) => [message.id, message]))
-  const timestampedMessages = next.messages.map((message) => {
-    const previous = previousById.get(message.id)
-    const createdAt = previous?.createdAt ?? envelope.createdAt
-    const completionChanged = message.meta?.completedAt != null
-      && message.meta.completedAt !== previous?.meta?.completedAt
-    if (!completionChanged && previous) return message
-    return {
-      ...message,
-      createdAt,
-      meta: completionChanged
-        ? {
-            ...message.meta,
-            completedAt: envelope.createdAt,
-            durationMs: elapsedMs(createdAt, envelope.createdAt),
-          }
-        : message.meta,
-    }
-  })
-  return {
-    ...next,
-    // 持久化追赶属于回放，不是页面持有的实时连接；回放的 RUN_STARTED 可以标识
-    // 服务端活跃运行，但不能暴露停止等仅适用于实时连接的控件
-    runStatus: !ownsLiveStream && next.runStatus === "streaming"
-      ? "detached"
-      : next.runStatus,
-    messages: timestampedMessages,
-    lastSeq: envelope.seq,
   }
 }

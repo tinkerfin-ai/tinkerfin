@@ -254,17 +254,17 @@ def test_clarification_metadata_requires_finite_json(value: float) -> None:
 
 
 class _RatingQuestion(ClarificationQuestionBase):
-    answer_type: Literal["acme:rating.v1"] = "acme:rating.v1"
+    answer_type: Literal["acme:rating"] = "acme:rating"
     maximum: int = Field(ge=1)
 
 
 class _RatingResponse(ClarificationResponseBase):
-    answer_type: Literal["acme:rating.v1"] = "acme:rating.v1"
+    answer_type: Literal["acme:rating"] = "acme:rating"
     rating: int
 
 
 class _DetailedRatingResponse(ClarificationResponseBase):
-    answer_type: Literal["acme:rating.v1"] = "acme:rating.v1"
+    answer_type: Literal["acme:rating"] = "acme:rating"
     rating: int
     reason: str | None = None
 
@@ -280,7 +280,7 @@ def _rating_schema(question: _RatingQuestion) -> dict[str, JsonValue]:
         "required": ["status", "answerType", "rating"],
         "properties": {
             "status": {"const": "answered"},
-            "answerType": {"const": "acme:rating.v1"},
+            "answerType": {"const": "acme:rating"},
             "rating": {"type": "integer", "minimum": 1, "maximum": question.maximum},
         },
     }
@@ -300,7 +300,7 @@ def _referenced_rating_schema(question: _RatingQuestion) -> dict[str, JsonValue]
         "required": ["status", "answerType", "rating"],
         "properties": {
             "status": {"const": "answered"},
-            "answerType": {"const": "acme:rating.v1"},
+            "answerType": {"const": "acme:rating"},
             "rating": {"$ref": "#/$defs/Bound"},
         },
     }
@@ -308,7 +308,7 @@ def _referenced_rating_schema(question: _RatingQuestion) -> dict[str, JsonValue]
 
 def test_custom_type_is_one_registration_unit_and_extends_the_default_form() -> None:
     rating = clarification_type(
-        type_id="acme:rating.v1",
+        type_id="acme:rating",
         description="Use for one bounded integer rating.",
         question_model=_RatingQuestion,
         response_model=_RatingResponse,
@@ -323,7 +323,7 @@ def test_custom_type_is_one_registration_unit_and_extends_the_default_form() -> 
             "questions": [
                 {
                     "id": "risk",
-                    "answerType": "acme:rating.v1",
+                    "answerType": "acme:rating",
                     "prompt": "Risk?",
                     "required": True,
                     "maximum": 5,
@@ -342,7 +342,7 @@ def test_custom_type_is_one_registration_unit_and_extends_the_default_form() -> 
             "answers": {
                 "risk": {
                     "status": "answered",
-                    "answerType": "acme:rating.v1",
+                    "answerType": "acme:rating",
                     "rating": 4,
                 }
             },
@@ -355,10 +355,23 @@ def test_custom_type_is_one_registration_unit_and_extends_the_default_form() -> 
     )
 
 
-def test_custom_type_requires_versioned_namespaced_matching_discriminators() -> None:
-    with pytest.raises(PlanModeConfigurationError, match="versioned namespaced"):
+@pytest.mark.parametrize(
+    "type_id",
+    [
+        "rating",
+        "acme:rating.v0",
+        "acme:rating.v00",
+        "acme:rating.v01",
+        "acme:rating.v1",
+        "acme:rating.v10",
+    ],
+)
+def test_custom_type_requires_unversioned_namespaced_discriminators(
+    type_id: str,
+) -> None:
+    with pytest.raises(PlanModeConfigurationError, match="unversioned namespaced"):
         clarification_type(
-            type_id="rating",
+            type_id=type_id,
             description="Rating",
             question_model=_RatingQuestion,
             response_model=_RatingResponse,
@@ -369,7 +382,7 @@ def test_custom_type_requires_versioned_namespaced_matching_discriminators() -> 
 def test_public_descriptor_constructor_enforces_the_factory_contract() -> None:
     with pytest.raises(PlanModeConfigurationError, match="does not match"):
         ClarificationType(
-            type_id="acme:different.v1",
+            type_id="acme:different",
             description="Use for one bounded integer rating.",
             question_model=_RatingQuestion,
             response_model=_RatingResponse,
@@ -379,7 +392,7 @@ def test_public_descriptor_constructor_enforces_the_factory_contract() -> None:
         )
     with pytest.raises(PlanModeConfigurationError, match="must not be blank"):
         ClarificationType(
-            type_id="acme:rating.v1",
+            type_id="acme:rating",
             description="   ",
             question_model=_RatingQuestion,
             response_model=_RatingResponse,
@@ -394,13 +407,13 @@ def test_custom_response_must_inherit_answer_status_unchanged() -> None:
         "WrongStatusResponse",
         __base__=ClarificationResponseBase,
         status=(Literal["wrong"], "wrong"),
-        answer_type=(Literal["acme:broken.v1"], "acme:broken.v1"),
+        answer_type=(Literal["acme:broken"], "acme:broken"),
         rating=(int, ...),
     )
 
     with pytest.raises(PlanModeConfigurationError, match="status"):
         clarification_type(
-            type_id="acme:broken.v1",
+            type_id="acme:broken",
             description="Use for a broken response.",
             question_model=create_model(
                 "BrokenQuestion",
@@ -415,7 +428,7 @@ def test_custom_response_must_inherit_answer_status_unchanged() -> None:
 
 def test_custom_only_form_uses_its_registered_semantic_type() -> None:
     rating = clarification_type(
-        type_id="acme:rating.v1",
+        type_id="acme:rating",
         description="Use for one bounded integer rating.",
         question_model=_RatingQuestion,
         response_model=_RatingResponse,
@@ -427,12 +440,12 @@ def test_custom_only_form_uses_its_registered_semantic_type() -> None:
         custom_types=(rating,),
     )
 
-    assert set(binding.types) == {"acme:rating.v1"}
+    assert set(binding.types) == {"acme:rating"}
 
 
 def test_custom_response_definitions_are_scoped_per_question() -> None:
     rating = clarification_type(
-        type_id="acme:rating.v1",
+        type_id="acme:rating",
         description="Use for one bounded integer rating.",
         question_model=_RatingQuestion,
         response_model=_RatingResponse,
@@ -448,14 +461,14 @@ def test_custom_response_definitions_are_scoped_per_question() -> None:
             "questions": [
                 {
                     "id": "strict",
-                    "answerType": "acme:rating.v1",
+                    "answerType": "acme:rating",
                     "prompt": "Strict rating?",
                     "required": True,
                     "maximum": 5,
                 },
                 {
                     "id": "wide",
-                    "answerType": "acme:rating.v1",
+                    "answerType": "acme:rating",
                     "prompt": "Wide rating?",
                     "required": True,
                     "maximum": 10,
@@ -476,12 +489,12 @@ def test_custom_response_definitions_are_scoped_per_question() -> None:
                 "answers": {
                     "strict": {
                         "status": "answered",
-                        "answerType": "acme:rating.v1",
+                        "answerType": "acme:rating",
                         "rating": 7,
                     },
                     "wide": {
                         "status": "answered",
-                        "answerType": "acme:rating.v1",
+                        "answerType": "acme:rating",
                         "rating": 7,
                     },
                 },
@@ -491,7 +504,7 @@ def test_custom_response_definitions_are_scoped_per_question() -> None:
 
 def test_custom_schema_and_normalized_values_require_finite_json() -> None:
     invalid_schema = clarification_type(
-        type_id="acme:rating.v1",
+        type_id="acme:rating",
         description="Use for one bounded integer rating.",
         question_model=_RatingQuestion,
         response_model=_RatingResponse,
@@ -510,7 +523,7 @@ def test_custom_schema_and_normalized_values_require_finite_json() -> None:
             "questions": [
                 {
                     "id": "risk",
-                    "answerType": "acme:rating.v1",
+                    "answerType": "acme:rating",
                     "prompt": "Risk?",
                     "required": True,
                     "maximum": 5,
@@ -522,7 +535,7 @@ def test_custom_schema_and_normalized_values_require_finite_json() -> None:
         build_response_schema(binding, form)
 
     invalid_normalizer = clarification_type(
-        type_id="acme:rating.v1",
+        type_id="acme:rating",
         description="Use for one bounded integer rating.",
         question_model=_RatingQuestion,
         response_model=_RatingResponse,
@@ -544,7 +557,7 @@ def test_custom_schema_and_normalized_values_require_finite_json() -> None:
                 "answers": {
                     "risk": {
                         "status": "answered",
-                        "answerType": "acme:rating.v1",
+                        "answerType": "acme:rating",
                         "rating": 4,
                     }
                 },
@@ -554,14 +567,14 @@ def test_custom_schema_and_normalized_values_require_finite_json() -> None:
 
 def test_binding_fingerprint_covers_the_custom_response_contract() -> None:
     basic = clarification_type(
-        type_id="acme:rating.v1",
+        type_id="acme:rating",
         description="Use for one bounded integer rating.",
         question_model=_RatingQuestion,
         response_model=_RatingResponse,
         normalize=lambda _question, response: {"rating": response.rating},
     )
     detailed = clarification_type(
-        type_id="acme:rating.v1",
+        type_id="acme:rating",
         description="Use for one bounded integer rating.",
         question_model=_RatingQuestion,
         response_model=_DetailedRatingResponse,

@@ -1,39 +1,30 @@
 from __future__ import annotations
 
-import asyncio
 import re
 import secrets
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
 import pytest
-from ag_ui.core import BaseEvent, Event
-from langgraph.store.mysql.asyncmy import AsyncMyStore
-from pydantic import TypeAdapter
-from sqlalchemy import inspect, text
+from sqlalchemy import inspect
 from sqlalchemy.engine import URL, Connection, make_url
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
-    async_sessionmaker,
     create_async_engine,
 )
 
-from tinkerfin import Identity
-from tinkerfin_messaging.models import MessageEnvelope
+from langgraph.store.mysql.asyncmy import AsyncMyStore
 from tinkerfin_sandbox import get_sqlalchemy_opensandbox_state_schema
 from tinkerfin_studio.auth.models import User
 from tinkerfin_studio.conversation.models import (
-    ConversationEvent,
-    ConversationInterrupt,
-    ConversationRun,
+    ConversationInterruptClaim,
+    ConversationRunRegistration,
     ConversationThread,
 )
-from tinkerfin_studio.conversation.projection import ConversationProjector
-from tinkerfin_studio.conversation.repository import ConversationRepository
 from tinkerfin_studio.infrastructure.database import Base
 from tinkerfin_studio.models.entity import AgentModel
+from tinkerfin_tracing import SqlAlchemyTraceStore
 
 _SCHEMA_PATH = Path(__file__).parents[1] / "database" / "mysql" / "schema.sql"
 _DATABASE_NAME_PATTERN = re.compile(r"\Atinkerfin_schema_[a-f0-9]{16}_(sql|runtime)\Z")
@@ -42,48 +33,27 @@ _EXPECTED_TABLES = frozenset(
         "users",
         "agent_models",
         "conversation_threads",
-        "conversation_runs",
-        "conversation_events",
-        "conversation_interrupts",
-        "store_migrations",
+        "conversation_run_registrations",
+        "conversation_interrupt_claims",
         "store",
         "tinkerfin_opensandbox_owners",
         "tinkerfin_opensandbox_workers",
         "tinkerfin_opensandbox_warm_slots",
         "tinkerfin_opensandbox_cleanup",
+        "tinkerfin_trace_events",
+        "tinkerfin_trace_namespaces",
+        "tinkerfin_trace_projection_checkpoints",
+        "tinkerfin_trace_threads",
+        "tinkerfin_trace_writers",
     }
 )
 _BUSINESS_MODELS = (
     User,
     AgentModel,
     ConversationThread,
-    ConversationRun,
-    ConversationEvent,
-    ConversationInterrupt,
+    ConversationRunRegistration,
+    ConversationInterruptClaim,
 )
-_EVENT_ADAPTER = TypeAdapter(Event)
-
-
-def _projection_event(
-    seq: int,
-    value: dict[str, object],
-) -> tuple[MessageEnvelope, BaseEvent]:
-    event = cast(BaseEvent, _EVENT_ADAPTER.validate_python(value))
-    return (
-        MessageEnvelope(
-            channel="studio-conversation-agui",
-            identity=Identity(
-                threadId="users/1/threads/thread-projection-lock",
-                runId="run-projection-lock",
-            ),
-            seq=seq,
-            message_id=f"run-projection-lock:{seq}",
-            codec="agui.event",
-            payload=event.model_dump_json(by_alias=True, exclude_none=True).encode(),
-            created_at=datetime(2026, 8, 22, 2, seq, tzinfo=UTC),
-        ),
-        event,
-    )
 
 
 class _ReflectedColumn(TypedDict):
@@ -251,6 +221,7 @@ async def _create_runtime_schema(engine: AsyncEngine, database_url: URL) -> None
         await store.setup()
     sandbox_schema = get_sqlalchemy_opensandbox_state_schema(dialect="mysql")
     await _execute_ddl(engine, sandbox_schema.ddl)
+    await SqlAlchemyTraceStore(engine, namespace="tinkerfin-studio").setup()
 
 
 async def _create_database(admin_engine: AsyncEngine, database_name: str) -> None:
@@ -273,7 +244,7 @@ async def _drop_database(admin_engine: AsyncEngine, database_name: str) -> None:
 async def test_full_schema_sql_matches_runtime_generated_mysql_schema(
     mysql_admin_url: str,
 ) -> None:
-    """全量脚本必须与三个运行时 schema 来源逐项一致"""
+    """全量脚本必须与四个当前 Schema 所有者逐项一致"""
 
     admin_url = make_url(mysql_admin_url)
     token = secrets.token_hex(8)
@@ -296,24 +267,16 @@ async def test_full_schema_sql_matches_runtime_generated_mysql_schema(
 
         async with sql_engine.connect() as connection:
             sql_schema = await connection.run_sync(_reflect_schema)
-            sql_store_versions = tuple(
-                await connection.scalars(
-                    text("SELECT v FROM store_migrations ORDER BY v")
-                )
-            )
         async with runtime_engine.connect() as connection:
             runtime_schema = await connection.run_sync(_reflect_schema)
-            runtime_store_versions = tuple(
-                await connection.scalars(
-                    text("SELECT v FROM store_migrations ORDER BY v")
-                )
-            )
 
         assert set(sql_schema.tables) == _EXPECTED_TABLES
         assert set(runtime_schema.tables) == _EXPECTED_TABLES
         assert sql_schema.tables == runtime_schema.tables
         assert sql_schema.tables["conversation_threads"].check_constraints == {}
-        assert sql_schema.tables["conversation_events"].check_constraints == {}
+        assert (
+            sql_schema.tables["conversation_run_registrations"].check_constraints == {}
+        )
         business_table_names = {model.__tablename__ for model in _BUSINESS_MODELS}
         assert {
             table_name: sql_schema.table_comments[table_name]
@@ -329,6 +292,14 @@ async def test_full_schema_sql_matches_runtime_generated_mysql_schema(
             table_name: runtime_schema.column_comments[table_name]
             for table_name in business_table_names
         }
+        assert (
+            sql_schema.table_comments["store"]
+            == (runtime_schema.table_comments["store"])
+        )
+        assert (
+            sql_schema.column_comments["store"]
+            == (runtime_schema.column_comments["store"])
+        )
         assert all(not table.foreign_keys for table in sql_schema.tables.values())
         assert all(not table.foreign_keys for table in runtime_schema.tables.values())
         assert all(sql_schema.table_comments.values())
@@ -339,209 +310,11 @@ async def test_full_schema_sql_matches_runtime_generated_mysql_schema(
             if not comment
         )
         assert missing_column_comments == []
-        assert sql_store_versions == (0, 1)
-        assert runtime_store_versions == (0, 1)
     finally:
         if sql_engine is not None:
             await sql_engine.dispose()
         if runtime_engine is not None:
             await runtime_engine.dispose()
         for database_name in reversed(created_databases):
-            await _drop_database(admin_engine, database_name)
-        await admin_engine.dispose()
-
-
-@pytest.mark.studio_mysql_integration
-async def test_concurrent_same_run_resume_claim_uses_current_mysql_row(
-    mysql_admin_url: str,
-) -> None:
-    """同 runId 并发认领必须在 MySQL 默认隔离级别下保持幂等"""
-
-    admin_url = make_url(mysql_admin_url)
-    database_name = f"tinkerfin_schema_{secrets.token_hex(8)}_runtime"
-    database_url = _database_url(admin_url, database_name)
-    admin_engine = create_async_engine(admin_url)
-    engine: AsyncEngine | None = None
-    created = False
-    try:
-        await _create_database(admin_engine, database_name)
-        created = True
-        engine = create_async_engine(database_url)
-        async with engine.begin() as connection:
-            await connection.run_sync(Base.metadata.create_all)
-        sessions = async_sessionmaker(
-            engine,
-            expire_on_commit=False,
-            autoflush=False,
-        )
-        async with sessions() as setup_session:
-            repository = ConversationRepository(setup_session)
-            thread = await repository.create_thread(
-                user_id=1,
-                thread_id="thread-same-run-claim",
-                title="并发认领",
-                model_id=None,
-            )
-            now = datetime.now(UTC).replace(tzinfo=None)
-            setup_session.add(
-                ConversationInterrupt(
-                    conversation_thread_id=thread.id,
-                    run_id="run-interrupted",
-                    resolved_run_id=None,
-                    interrupt_id="interrupt-same-run",
-                    status="pending",
-                    reason="tool_call",
-                    message="确认操作",
-                    request_json={"id": "interrupt-same-run"},
-                    resume_json=None,
-                    created_at=now,
-                    resolved_at=None,
-                    updated_at=now,
-                )
-            )
-            await repository.commit()
-            thread_pk = thread.id
-
-        ready_count = 0
-        ready_lock = asyncio.Lock()
-        release = asyncio.Event()
-
-        async def claim() -> str | None:
-            nonlocal ready_count
-            async with sessions() as session:
-                repository = ConversationRepository(session)
-                await repository.get_thread(
-                    user_id=1,
-                    thread_id="thread-same-run-claim",
-                )
-                async with ready_lock:
-                    ready_count += 1
-                    if ready_count == 2:
-                        release.set()
-                await release.wait()
-                rows = await repository.claim_pending_interrupts(
-                    thread_pk=thread_pk,
-                    run_id="run-same",
-                    interrupt_ids=frozenset({"interrupt-same-run"}),
-                )
-                owner = rows[0].resolved_run_id
-                await repository.commit()
-                return owner
-
-        owners = await asyncio.gather(claim(), claim())
-
-        assert owners == ["run-same", "run-same"]
-    finally:
-        if engine is not None:
-            await engine.dispose()
-        if created:
-            await _drop_database(admin_engine, database_name)
-        await admin_engine.dispose()
-
-
-@pytest.mark.studio_mysql_integration
-async def test_concurrent_projectors_serialize_on_the_mysql_thread_row(
-    mysql_admin_url: str,
-) -> None:
-    """MySQL 行锁必须让相邻事件按提交后的最新 snapshot 序号串行投影"""
-
-    admin_url = make_url(mysql_admin_url)
-    database_name = f"tinkerfin_schema_{secrets.token_hex(8)}_runtime"
-    database_url = _database_url(admin_url, database_name)
-    admin_engine = create_async_engine(admin_url)
-    engine: AsyncEngine | None = None
-    second_task: asyncio.Task[None] | None = None
-    created = False
-    try:
-        await _create_database(admin_engine, database_name)
-        created = True
-        engine = create_async_engine(database_url)
-        async with engine.begin() as connection:
-            await connection.run_sync(Base.metadata.create_all)
-        sessions = async_sessionmaker(
-            engine,
-            expire_on_commit=False,
-            autoflush=False,
-        )
-        async with sessions() as setup_session:
-            repository = ConversationRepository(setup_session)
-            thread = await repository.create_thread(
-                user_id=1,
-                thread_id="thread-projection-lock",
-                title="投影行锁",
-                model_id="main",
-            )
-            await repository.create_main_run(
-                thread_id=thread.id,
-                run_id="run-projection-lock",
-                model_id="main",
-                input_json={"messages": []},
-                config_json={},
-            )
-            await repository.commit()
-            thread_pk = thread.id
-
-        first_envelope, first_event = _projection_event(
-            1,
-            {
-                "type": "RUN_STARTED",
-                "threadId": "thread-projection-lock",
-                "runId": "run-projection-lock",
-            },
-        )
-        second_envelope, second_event = _projection_event(
-            2,
-            {
-                "type": "RUN_FINISHED",
-                "threadId": "thread-projection-lock",
-                "runId": "run-projection-lock",
-                "outcome": {"type": "success"},
-            },
-        )
-        second_attempted = asyncio.Event()
-
-        async def project_second() -> None:
-            async with sessions() as second_session:
-                second_attempted.set()
-                await ConversationProjector(second_session).project(
-                    thread_pk=thread_pk,
-                    envelope=second_envelope,
-                    event=second_event,
-                )
-                await second_session.commit()
-
-        async with sessions() as first_session:
-            await ConversationProjector(first_session).project(
-                thread_pk=thread_pk,
-                envelope=first_envelope,
-                event=first_event,
-            )
-            second_task = asyncio.create_task(
-                project_second(),
-                name="test-concurrent-mysql-projector",
-            )
-            await second_attempted.wait()
-            with pytest.raises(TimeoutError):
-                await asyncio.wait_for(asyncio.shield(second_task), timeout=0.2)
-            await first_session.commit()
-        await asyncio.wait_for(second_task, timeout=5)
-
-        async with sessions() as verification_session:
-            repository = ConversationRepository(verification_session)
-            stored = await repository.get_thread_by_pk(thread_pk)
-            assert stored is not None
-            assert stored.last_seq == 2
-            assert stored.snapshot_seq == 2
-            assert stored.snapshot_json is not None
-            assert stored.snapshot_json["snapshotSeq"] == stored.snapshot_seq
-            assert stored.status == "idle"
-            assert await repository.count_events(thread_pk) == 2
-    finally:
-        if second_task is not None and not second_task.done():
-            second_task.cancel()
-            await asyncio.gather(second_task, return_exceptions=True)
-        if engine is not None:
-            await engine.dispose()
-        if created:
             await _drop_database(admin_engine, database_name)
         await admin_engine.dispose()

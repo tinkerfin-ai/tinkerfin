@@ -33,7 +33,9 @@ BindResponseSchema = Callable[[QuestionT], dict[str, JsonValue]]
 ValidateResponse = Callable[[QuestionT, ResponseT], None]
 NormalizeResponse = Callable[[QuestionT, ResponseT], Mapping[str, JsonValue]]
 
-_CUSTOM_TYPE_PATTERN = re.compile(r"^[a-z][a-z0-9.-]*:[a-z][a-z0-9._-]*\.v[1-9][0-9]*$")
+_CUSTOM_TYPE_PATTERN = re.compile(
+    r"^(?!.*\.v[0-9]+$)[a-z][a-z0-9.-]*:[a-z][a-z0-9._-]*$"
+)
 _BUILTIN_TYPE_IDS = frozenset({"single_choice", "multiple_choice", "text", "date"})
 _JSON_OBJECT = TypeAdapter(
     dict[str, JsonValue],
@@ -50,8 +52,7 @@ class ClarificationType(Generic[QuestionT, ResponseT]):
     them more than once for the same response.
 
     Attributes:
-        type_id: Versioned namespaced discriminator shared by both boundary models;
-            its version must change whenever callback semantics change.
+        type_id: Unversioned namespaced discriminator shared by both boundary models.
         description: Model-facing guidance for choosing this semantic answer type.
         question_model: Structured question model emitted by the Planner.
         response_model: Answered payload model accepted from a client.
@@ -134,11 +135,11 @@ def _validate_descriptor(
         type_id not in _BUILTIN_TYPE_IDS and not _CUSTOM_TYPE_PATTERN.fullmatch(type_id)
     ):
         raise PlanModeConfigurationError(
-            "custom clarification type_id must be a versioned namespaced ID"
+            "custom clarification type_id must be an unversioned namespaced ID"
         )
     if not allow_builtin and type_id in _BUILTIN_TYPE_IDS:
         raise PlanModeConfigurationError(
-            "custom clarification type_id must be a versioned namespaced ID"
+            "custom clarification type_id must be an unversioned namespaced ID"
         )
     description = descriptor.description
     if not isinstance(description, str) or not description.strip():
@@ -205,9 +206,7 @@ def clarification_type(
     """Create one validated custom clarification type descriptor.
 
     Args:
-        type_id: Versioned namespaced discriminator such as ``acme:rating.v1``;
-            increment its version whenever Schema, validation, or normalization
-            semantics change.
+        type_id: Unversioned namespaced discriminator such as ``acme:rating``.
         description: Guidance telling the Planner when to choose the type.
         question_model: Concrete model for Planner-generated questions.
         response_model: Concrete model for answered client payloads.

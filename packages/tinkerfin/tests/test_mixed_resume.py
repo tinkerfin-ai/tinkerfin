@@ -25,7 +25,7 @@ from langgraph.graph import END, START, MessagesState, StateGraph
 
 from tinkerfin import (
     AgUiResumeBinding,
-    Identity,
+    RunIdentity,
     TinkerFin,
     TinkerFinLifecycleError,
 )
@@ -113,7 +113,7 @@ async def test_mixed_resume_executes_resolved_tool_and_settles_cancelled_tool_on
         interrupt_on={"approved_tool": True, "cancelled_tool": True},
         checkpointer=saver,
     )
-    first_identity = Identity(threadId="thread-mixed", runId="run-review")
+    first_identity = RunIdentity(threadId="thread-mixed", runId="run-review")
     first_runtime = definition.new_agui(
         identity=first_identity,
     )
@@ -148,7 +148,7 @@ async def test_mixed_resume_executes_resolved_tool_and_settles_cancelled_tool_on
     assert translation.mode == "custom"
     assert translation.kind == "tool"
 
-    resume_identity = Identity(threadId="thread-mixed", runId="run-resume")
+    resume_identity = RunIdentity(threadId="thread-mixed", runId="run-resume")
     binding = AgUiResumeBinding.from_agui(
         entries=entries,
         interrupts=interrupts,
@@ -277,7 +277,7 @@ async def test_mixed_resume_is_injected_into_supported_subagents(
         interrupt_on={"child_approved": True, "child_cancelled": True},
         checkpointer=InMemorySaver(),
     )
-    review_identity = Identity(
+    review_identity = RunIdentity(
         threadId=f"thread-{subagent_type}",
         runId="run-review",
     )
@@ -308,7 +308,7 @@ async def test_mixed_resume_is_injected_into_supported_subagents(
             {"interruptId": interrupts[1].id, "status": "cancelled"}
         ),
     )
-    resume_identity = Identity(
+    resume_identity = RunIdentity(
         threadId=f"thread-{subagent_type}",
         runId="run-resume",
     )
@@ -377,7 +377,7 @@ async def test_permission_interrupt_uses_the_same_mixed_cancellation_contract() 
         interrupt_on={"permission_peer": True},
         checkpointer=InMemorySaver(),
     )
-    review_identity = Identity(threadId="thread-permission", runId="run-review")
+    review_identity = RunIdentity(threadId="thread-permission", runId="run-review")
     review_runtime = definition.new_agui(
         identity=review_identity,
     )
@@ -412,7 +412,7 @@ async def test_permission_interrupt_uses_the_same_mixed_cancellation_contract() 
             }
         ),
     )
-    resume_identity = Identity(threadId="thread-permission", runId="run-resume")
+    resume_identity = RunIdentity(threadId="thread-permission", runId="run-resume")
     binding = AgUiResumeBinding.from_agui(
         entries=entries,
         interrupts=interrupts,
@@ -464,7 +464,7 @@ def _external_subagent(*, declared: bool) -> dict[str, object]:
 def _external_mixed_binding(
     *,
     unidentified: bool = False,
-) -> tuple[Identity, AgUiResumeBinding]:
+) -> tuple[RunIdentity, AgUiResumeBinding]:
     translation = ResumeTranslation(
         mode="custom",
         kind="tool",
@@ -476,7 +476,7 @@ def _external_mixed_binding(
             "native-external": ({"type": "approve"}, None),
         },
     )
-    identity = Identity(threadId="thread-mixed", runId="run-external-resume")
+    identity = RunIdentity(threadId="thread-mixed", runId="run-external-resume")
     binding = AgUiResumeBinding._from_translation(translation)
     return identity, binding
 

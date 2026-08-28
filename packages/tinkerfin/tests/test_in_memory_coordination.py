@@ -5,12 +5,12 @@ from types import TracebackType
 
 import pytest
 
-from tinkerfin import Identity
+from tinkerfin import RunIdentity
 from tinkerfin.coordination import InMemoryRunCoordinator
 
 
-def _identity(thread_id: str, *, run_id: str = "run-1") -> Identity:
-    return Identity(threadId=thread_id, runId=run_id)
+def _identity(thread_id: str, *, run_id: str = "run-1") -> RunIdentity:
+    return RunIdentity(threadId=thread_id, runId=run_id)
 
 
 class _ControllableLock:
@@ -79,7 +79,7 @@ async def test_different_resolved_keys_enter_without_waiting_for_each_other() ->
     attempting = (asyncio.Event(), asyncio.Event())
     entered = (asyncio.Event(), asyncio.Event())
 
-    async def coordinate(index: int, identity: Identity) -> None:
+    async def coordinate(index: int, identity: RunIdentity) -> None:
         attempting[index].set()
         async with coordinator(identity):
             entered[index].set()

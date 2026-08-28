@@ -15,7 +15,7 @@ from typing import assert_type, cast
 import pytest
 
 import tinkerfin_messaging.sources as source_adapters
-from tinkerfin import Identity
+from tinkerfin import RunIdentity
 from tinkerfin_messaging import (
     CancelCallback,
     CancelContext,
@@ -25,8 +25,8 @@ from tinkerfin_messaging.protocols import MessageSource
 from tinkerfin_messaging.sources import FiniteMessageSource, map_source
 
 
-def _identity() -> Identity:
-    return Identity(threadId="thread-1", runId="run-1")
+def _identity() -> RunIdentity:
+    return RunIdentity(threadId="thread-1", runId="run-1")
 
 
 class _TrackedSource:

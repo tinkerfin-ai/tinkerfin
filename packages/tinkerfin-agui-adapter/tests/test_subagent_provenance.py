@@ -13,7 +13,7 @@ from pydantic import ValidationError
 from tinkerfin_agui_adapter import (
     SUBAGENT_PROVENANCE_SCHEMA,
     DeepAgentAgUiAdapter,
-    Identity,
+    RunIdentity,
     ScopedIdCodec,
     SubagentProvenance,
     create_subagent_provenance,
@@ -29,7 +29,7 @@ def _parent_tool_id(namespace: tuple[str, ...] = ("tools:parent",)) -> str:
 
 
 def test_subagent_invocation_id_has_a_frozen_known_vector() -> None:
-    identity = Identity(threadId="thread-known", runId="run-known")
+    identity = RunIdentity(threadId="thread-known", runId="run-known")
     parent_tool_call_id = _parent_tool_id()
 
     assert parent_tool_call_id == ("tf:tool:W1sidG9vbHM6cGFyZW50Il0sImNhbGwtdGFzayJd")
@@ -41,7 +41,7 @@ def test_subagent_invocation_id_has_a_frozen_known_vector() -> None:
         == "subagent-2594398b-b209-5a61-a9f0-8a4d6100bbcd"
     )
     resumed = create_subagent_provenance(
-        identity=Identity(threadId="thread-known", runId="run-resumed"),
+        identity=RunIdentity(threadId="thread-known", runId="run-resumed"),
         namespace=("tools:parent", "tools:graph-task"),
         parent_namespace=("tools:parent",),
         graph_task_id="graph-task",
@@ -55,7 +55,7 @@ def test_subagent_invocation_id_has_a_frozen_known_vector() -> None:
     assert resumed.request_run_id == "run-resumed"
     assert (
         subagent_invocation_id(
-            identity=Identity(threadId="other-thread", runId="run-known"),
+            identity=RunIdentity(threadId="other-thread", runId="run-known"),
             parent_tool_call_id=parent_tool_call_id,
         )
         != resumed.subagent_invocation_id
@@ -67,7 +67,9 @@ def _converted_invocation(
     run_id: str,
     extra_task_args: dict[str, object] | None = None,
 ) -> tuple[DeepAgentAgUiAdapter, RawEvent, SubagentProvenance]:
-    adapter = DeepAgentAgUiAdapter(identity=Identity(threadId="thread-1", runId=run_id))
+    adapter = DeepAgentAgUiAdapter(
+        identity=RunIdentity(threadId="thread-1", runId=run_id)
+    )
     task_args = {
         "description": "Research",
         "subagent_type": "researcher",
@@ -210,7 +212,7 @@ def test_adapter_publishes_stable_identity_without_rewriting_main_run() -> None:
 
 def test_subagent_provenance_is_frozen_and_strict() -> None:
     value = create_subagent_provenance(
-        identity=Identity(threadId="thread-1", runId="run-1"),
+        identity=RunIdentity(threadId="thread-1", runId="run-1"),
         namespace=("tools:parent", "tools:graph-task"),
         parent_namespace=("tools:parent",),
         graph_task_id="graph-task",
@@ -229,7 +231,7 @@ def test_subagent_provenance_is_frozen_and_strict() -> None:
         )
     with pytest.raises(ValueError, match="scoped Tool"):
         subagent_invocation_id(
-            identity=Identity(threadId="thread-1", runId="run-1"),
+            identity=RunIdentity(threadId="thread-1", runId="run-1"),
             parent_tool_call_id="not-scoped",
         )
 

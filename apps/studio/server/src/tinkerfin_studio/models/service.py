@@ -1,8 +1,12 @@
 """Agent 模型目录业务服务"""
 
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 
-from tinkerfin_studio.api.errors import BusinessException, ModelErrorCode
+from tinkerfin_studio.api.errors import (
+    BusinessException,
+    ModelErrorCode,
+    SystemException,
+)
 from tinkerfin_studio.models.repository import AgentModelRepository
 from tinkerfin_studio.models.schemas import (
     AgentModelCatalog,
@@ -34,15 +38,21 @@ class AgentModelService:
         """返回不含连接信息和密钥的启用模型目录"""
 
         models = await self._repository.list_enabled()
-        items = [
-            AgentModelCatalogItem(
-                modelId=model.model_id,
-                displayName=model.display_name,
-                reasoningEnabled=model.reasoning_enabled,
-                isDefault=model.is_default,
-            )
-            for model in models
-        ]
+        try:
+            items = [
+                AgentModelCatalogItem.model_validate(
+                    {
+                        "modelId": model.model_id,
+                        "displayName": model.display_name,
+                        "reasoningEnabled": model.reasoning_enabled,
+                        "runtimeProfile": model.runtime_profile,
+                        "isDefault": model.is_default,
+                    }
+                )
+                for model in models
+            ]
+        except ValidationError as error:
+            raise SystemException(ModelErrorCode.CATALOG_UNAVAILABLE) from error
         default = next((item.model_id for item in items if item.is_default), None)
         return AgentModelCatalog(items=items, defaultModelId=default)
 
@@ -54,15 +64,19 @@ class AgentModelService:
             raise BusinessException(ModelErrorCode.NOT_FOUND)
         if not model.enabled:
             raise BusinessException(ModelErrorCode.DISABLED)
-        return AgentModelConfig.model_validate(
-            {
-                "model_id": model.model_id,
-                "display_name": model.display_name,
-                "provider": model.provider,
-                "model_name": model.model_name,
-                "base_url": model.base_url,
-                "api_key": SecretStr(model.api_key),
-                "reasoning_enabled": model.reasoning_enabled,
-                "updated_at": model.updated_at.isoformat(),
-            }
-        )
+        try:
+            return AgentModelConfig.model_validate(
+                {
+                    "model_id": model.model_id,
+                    "display_name": model.display_name,
+                    "provider": model.provider,
+                    "model_name": model.model_name,
+                    "base_url": model.base_url,
+                    "api_key": SecretStr(model.api_key),
+                    "reasoning_enabled": model.reasoning_enabled,
+                    "runtime_profile": model.runtime_profile,
+                    "updated_at": model.updated_at.isoformat(),
+                }
+            )
+        except ValidationError as error:
+            raise SystemException(ModelErrorCode.CATALOG_UNAVAILABLE) from error

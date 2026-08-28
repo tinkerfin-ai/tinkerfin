@@ -1003,6 +1003,11 @@
     background: var(--color-layer-1);
   }
 
+  .approval-composer {
+    height: auto;
+    min-height: var(--layout-composer-surface-height);
+  }
+
   .plan-question-composer { background: var(--color-layer-1); }
 
   .interaction-card-resize-handle {
@@ -1045,9 +1050,7 @@
   }
 
   /* 收起态复用标准输入表面的基准高度，内容或触控热区需要时允许自然撑开 */
-  .approval-composer.is-minimized,
-  .plan-question-composer.is-minimized,
-  .plan-review-composer.is-minimized {
+  .plan-question-composer.is-minimized {
     height: auto;
     min-height: var(--layout-composer-surface-height);
     max-height: none;
@@ -1058,24 +1061,39 @@
   .plan-review-composer-head {
     position: relative;
     display: flex;
-    align-items: flex-start;
+    align-items: center;
     justify-content: space-between;
     gap: var(--space-4);
     flex: 0 0 auto;
-    /* 标题和说明的半行距计入可见留白，6px 底部间距让两段节奏一致 */
-    padding: 18px 14px var(--space-1-5) 22px;
+    padding: var(--space-1-5) var(--space-4);
   }
 
   .approval-composer-head,
   .plan-review-composer-head { background: var(--color-warning-panel-background); }
   .plan-question-composer-head { background: var(--color-plan-panel-background); }
+  .approval-composer-head,
+  .plan-review-composer-head { padding-block: 10px; }
 
-  .approval-composer.is-minimized .approval-composer-head,
-  .plan-review-composer.is-minimized .plan-review-composer-head {
-    min-height: var(--layout-composer-surface-height);
-    align-items: center;
-    padding-top: var(--space-3);
-    padding-bottom: var(--space-3);
+  .interaction-card-color-bridge {
+    height: var(--space-3);
+    flex: 0 0 var(--space-3);
+    pointer-events: none;
+  }
+
+  .interaction-card-color-bridge.is-warning {
+    background: linear-gradient(
+      to bottom,
+      var(--color-warning-panel-background),
+      var(--color-layer-1)
+    );
+  }
+
+  .interaction-card-color-bridge.is-plan {
+    background: linear-gradient(
+      to bottom,
+      var(--color-plan-panel-background),
+      var(--color-layer-1)
+    );
   }
 
   .plan-question-composer.is-minimized .plan-question-composer-head {
@@ -1086,7 +1104,6 @@
     padding-bottom: 0;
   }
 
-  .approval-toggle-surface,
   .plan-interaction-toggle-surface {
     position: absolute;
     z-index: var(--layer-local);
@@ -1098,7 +1115,6 @@
     cursor: pointer;
   }
 
-  .approval-toggle-surface:focus-visible,
   .plan-interaction-toggle-surface:focus-visible { outline: 2px solid var(--color-border-strong); outline-offset: -2px; }
 
   .approval-composer-heading,
@@ -1106,31 +1122,24 @@
   .plan-review-composer-heading { position: relative; z-index: calc(var(--layer-local) + 1); min-width: 0; flex: 1 1 auto; pointer-events: none; }
   .approval-composer-heading h2,
   .plan-question-composer-heading h2,
-  .plan-review-composer-heading h2 { display: flex; min-width: 0; align-items: center; gap: var(--space-2); margin: 0; font-size: var(--type-title-size); font-weight: var(--weight-semibold); line-height: var(--type-title-line); }
-  .plan-question-composer-heading h2 > svg { flex: 0 0 auto; color: var(--color-text-secondary); }
+  .plan-review-composer-heading h2 { display: flex; min-width: 0; align-items: center; gap: var(--space-2); margin: 0; font-size: var(--type-ui-size); font-weight: var(--weight-regular); line-height: var(--type-title-line); }
+  .plan-question-composer-heading h2 > svg { flex: 0 0 auto; color: var(--color-plan-panel-accent); }
   .plan-review-composer-heading h2 > svg { flex: 0 0 auto; color: var(--color-warning-panel-accent); }
+  .approval-composer-heading h2 > span:not(.approval-status-dot),
+  .plan-review-composer-heading h2 > span { color: var(--color-warning-panel-accent); }
+  .plan-review-composer-heading h2 > span { flex: 1 1 auto; }
+  .plan-question-composer-heading h2 > span { color: var(--color-plan-panel-accent); }
   .approval-composer-heading h2 > span:not(.approval-status-dot),
   .plan-question-composer-heading h2 > span,
   .plan-review-composer-heading h2 > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .approval-composer-heading h2 > small,
-  .plan-question-composer-heading h2 > small,
-  .plan-review-composer-heading h2 > small { flex: 0 0 auto; color: var(--color-text-secondary); font-size: var(--type-ui-size); font-weight: var(--weight-medium); line-height: var(--type-ui-line); white-space: nowrap; }
-  .approval-composer-heading p,
-  .plan-question-composer-heading p,
-  .plan-review-composer-heading p { margin: var(--space-0-5) 0 0; overflow: hidden; color: var(--color-text-secondary); font-size: var(--type-ui-size); line-height: var(--type-ui-line); text-overflow: ellipsis; white-space: nowrap; }
+  .plan-question-composer-heading h2 > small { flex: 0 0 auto; color: var(--color-text-secondary); font-size: var(--type-meta-size); font-weight: var(--weight-regular); line-height: var(--type-ui-line); white-space: nowrap; }
+  .plan-question-composer-heading p { margin: var(--space-0-5) 0 0; overflow: hidden; color: var(--color-text-secondary); font-size: var(--type-meta-size); line-height: var(--type-ui-line); text-overflow: ellipsis; white-space: nowrap; }
 
-  .approval-composer-head-actions,
-  .plan-question-composer-head-actions,
-  .plan-review-composer-head-actions { position: relative; z-index: calc(var(--layer-local) + 1); display: flex; align-items: center; gap: var(--space-1); flex: 0 0 auto; }
-  .approval-composer-head-button,
-  .plan-question-composer-head-button,
-  .plan-review-composer-head-button { width: var(--control-plan-chip); min-width: var(--control-plan-chip); height: var(--control-plan-chip); min-height: var(--control-plan-chip); border: 0; background: transparent; color: var(--color-text-tertiary); box-shadow: none; }
-  .approval-composer-head-button:hover:not(:disabled),
-  .approval-composer-head-button:active:not(:disabled),
+  .plan-question-composer-head-actions { position: relative; z-index: calc(var(--layer-local) + 1); display: flex; align-items: center; gap: var(--space-1); flex: 0 0 auto; }
+  .plan-question-composer-head-button { width: var(--control-plan-chip); min-width: var(--control-plan-chip); height: var(--control-plan-chip); min-height: var(--control-plan-chip); border: 0; background: transparent; color: var(--color-text-tertiary); box-shadow: none; }
   .plan-question-composer-head-button:hover:not(:disabled),
-  .plan-question-composer-head-button:active:not(:disabled),
-  .plan-review-composer-head-button:hover:not(:disabled),
-  .plan-review-composer-head-button:active:not(:disabled) { border: 0; background: var(--color-hover); color: var(--color-text-primary); box-shadow: none; }
+  .plan-question-composer-head-button:active:not(:disabled) { border: 0; background: var(--color-hover); color: var(--color-text-primary); box-shadow: none; }
 
   :is(.approval-composer, .plan-question-composer, .plan-review-composer)
   .ui-button:not(.ui-icon-button):focus-visible {
@@ -1219,8 +1228,8 @@
     align-items: center;
     gap: var(--space-3);
     flex: 0 0 auto;
-    min-height: var(--control-xl);
-    padding: var(--space-2) 12px var(--space-2) 18px;
+    min-height: var(--space-16);
+    padding: var(--space-3) var(--space-4);
   }
 
   .approval-composer-feedback {
@@ -1232,9 +1241,12 @@
     text-align: right;
   }
 
+  .approval-composer-feedback:empty { display: none; }
+
   .approval-composer-actions {
     display: flex;
     align-items: center;
+    grid-column: 2;
     gap: var(--space-2);
   }
 
@@ -1694,13 +1706,14 @@
     .plan-question-composer,
     .plan-review-composer { border-radius: var(--radius-3xl); }
     .approval-composer-head,
-    .plan-question-composer-head,
-    .plan-review-composer-head { padding: var(--space-3) var(--space-2) var(--space-1-5) var(--space-4); }
+    .plan-review-composer-head { padding: 10px var(--space-4); }
+    .plan-question-composer-head { padding: var(--space-1-5) var(--space-4); }
     .approval-composer-body,
     .plan-question-composer-body { padding-right: var(--space-2); padding-left: var(--space-2); }
     .approval-composer-footer,
     .plan-question-composer-footer,
     .plan-review-composer-footer { grid-template-columns: minmax(0, 1fr) auto; padding-left: var(--space-3); }
+    .approval-composer-footer { padding-right: var(--space-4); padding-left: var(--space-4); }
     .approval-composer-feedback,
     .plan-question-composer-feedback,
     .plan-review-composer-feedback { grid-row: 2; grid-column: 1 / -1; text-align: left; }
@@ -1753,9 +1766,7 @@
     .plan-question-date { height: var(--control-lg); }
     .plan-question-composer.is-minimized .plan-question-progress,
     .plan-question-composer.is-minimized .plan-question-progress-step { height: var(--control-lg); }
-    .approval-composer-head-button,
-    .plan-question-composer-head-button,
-    .plan-review-composer-head-button { width: var(--control-lg); min-width: var(--control-lg); height: var(--control-lg); min-height: var(--control-lg); }
+    .plan-question-composer-head-button { width: var(--control-lg); min-width: var(--control-lg); height: var(--control-lg); min-height: var(--control-lg); }
     .plan-question-pager-button { width: var(--control-lg); min-width: var(--control-lg); height: var(--control-lg); min-height: var(--control-lg); }
   }
 
@@ -1765,18 +1776,14 @@
     .plan-question-option,
     .plan-question-custom,
     .plan-question-date,
-    .approval-toggle-surface,
-    .approval-composer-head-button .ui-icon-button__icon,
     .plan-interaction-toggle-surface,
     .plan-question-composer-head-button .ui-icon-button__icon,
-    .plan-review-composer-head-button .ui-icon-button__icon,
     .plan-question-pager-button .ui-icon-button__icon { transition: none; }
   }
 
   @media (forced-colors: active) {
     .subagent-card-head:focus-visible,
     .tool-row > summary:focus-visible,
-    .approval-toggle-surface:focus-visible,
     .plan-interaction-toggle-surface:focus-visible,
     .plan-question-progress-step:focus-visible,
     :is(.approval-composer, .plan-question-composer, .plan-review-composer)
@@ -1809,6 +1816,10 @@
     .approval-composer-head,
     .plan-question-composer-head,
     .plan-review-composer-head { background: Canvas; }
+    .interaction-card-color-bridge { background: Canvas; }
+    .approval-composer-heading h2 > span:not(.approval-status-dot),
+    .plan-question-composer-heading h2 > :is(svg, span),
+    .plan-review-composer-heading h2 > :is(svg, span) { color: CanvasText; }
     :is(.approval-composer, .plan-question-composer, .plan-review-composer) {
       outline: 1px solid ButtonText;
       outline-offset: -1px;

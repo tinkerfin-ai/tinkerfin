@@ -11,10 +11,11 @@ from ag_ui.core import BaseEvent
 import tinkerfin_agui_adapter
 from tinkerfin_agui_adapter import (
     DeepAgentAgUiAdapter,
-    Identity,
     ResumeMapper,
     ResumeMappingError,
+    RunIdentity,
     astream_events,
+    validate_deep_agent_stream_part,
 )
 
 _PUBLIC_EXPORTS = {
@@ -33,7 +34,7 @@ _PUBLIC_EXPORTS = {
     "HitlNoMatchError",
     "HitlRequest",
     "HitlReviewConfig",
-    "Identity",
+    "RunIdentity",
     "ResumeMapper",
     "ResumeMappingError",
     "ResumeTranslation",
@@ -46,6 +47,14 @@ _PUBLIC_EXPORTS = {
     "ToolReviewContractError",
     "ToolReviewDecision",
     "ToolReviewInterruptMetadata",
+    "ValidatedDeepAgentStreamPart",
+    "ValidatedExtraStreamPart",
+    "ValidatedMessageStreamPart",
+    "ValidatedTaskResultPayload",
+    "ValidatedTaskStartPayload",
+    "ValidatedTasksStreamPart",
+    "ValidatedUpdatesStreamPart",
+    "ValidatedValuesStreamPart",
     "astream_events",
     "create_subagent_provenance",
     "encode_sse",
@@ -54,6 +63,7 @@ _PUBLIC_EXPORTS = {
     "require_valid_schema",
     "subagent_invocation_id",
     "validate_json_schema_instance",
+    "validate_deep_agent_stream_part",
 }
 
 
@@ -76,7 +86,7 @@ def test_high_level_stream_has_the_locked_public_contract() -> None:
         if name != "parts"
     )
     assert hints["parts"] == AsyncIterable[object]
-    assert hints["identity"] is Identity
+    assert hints["identity"] is RunIdentity
     assert hints["expose_reasoning_events"] is bool
     assert signature.parameters["expose_reasoning_events"].default is False
     assert hints["expose_subagent_events"] is bool
@@ -90,6 +100,10 @@ def test_high_level_stream_has_the_locked_public_contract() -> None:
     process_hints = get_type_hints(DeepAgentAgUiAdapter.process)
     assert process_hints["part"] is object
     assert process_hints["return"] == list[BaseEvent]
+    validated_hints = get_type_hints(DeepAgentAgUiAdapter.process_validated)
+    validator_hints = get_type_hints(validate_deep_agent_stream_part)
+    assert validated_hints["part"] == validator_hints["return"]
+    assert validated_hints["return"] == list[BaseEvent]
 
     adapter_signature = inspect.signature(DeepAgentAgUiAdapter)
     adapter_hints = get_type_hints(DeepAgentAgUiAdapter.__init__)
@@ -104,10 +118,39 @@ def test_high_level_stream_has_the_locked_public_contract() -> None:
         parameter.kind is inspect.Parameter.KEYWORD_ONLY
         for parameter in adapter_signature.parameters.values()
     )
-    assert adapter_hints["identity"] is Identity
+    assert adapter_hints["identity"] is RunIdentity
     assert adapter_hints["private_state_keys"] == frozenset[str]
     assert adapter_signature.parameters["private_state_keys"].default == frozenset()
     assert adapter_signature.parameters["identity"].default is inspect.Parameter.empty
+
+
+def test_public_validator_can_be_reused_without_revalidating_the_envelope() -> None:
+    part = {
+        "type": "values",
+        "ns": (),
+        "data": {"messages": []},
+        "interrupts": (),
+    }
+    validated = validate_deep_agent_stream_part(part)
+    validated_adapter = DeepAgentAgUiAdapter(
+        identity=RunIdentity(threadId="thread-1", runId="run-1")
+    )
+    ordinary_adapter = DeepAgentAgUiAdapter(
+        identity=RunIdentity(threadId="thread-1", runId="run-1")
+    )
+
+    assert validated.type == "values"
+    assert validated_adapter.process_validated(validated) == ordinary_adapter.process(
+        part
+    )
+
+
+def test_standalone_process_documents_its_translated_public_error() -> None:
+    documentation = inspect.getdoc(DeepAgentAgUiAdapter.process)
+
+    assert documentation is not None
+    assert "AgUiStreamContractError" in documentation
+    assert "NativeStreamContractError:" not in documentation
 
 
 def test_adapter_exports_exactly_the_documented_public_surface() -> None:
@@ -120,13 +163,13 @@ def test_private_state_policy_requires_an_immutable_canonical_key_set() -> None:
     constructor: Callable[..., DeepAgentAgUiAdapter] = DeepAgentAgUiAdapter
     with pytest.raises(TypeError, match="frozenset"):
         constructor(
-            identity=Identity(threadId="thread-1", runId="run-1"),
+            identity=RunIdentity(threadId="thread-1", runId="run-1"),
             private_state_keys={"private"},  # pyright: ignore[reportArgumentType]
         )
     for value in ("", " private"):
         with pytest.raises(ValueError, match="canonical"):
             DeepAgentAgUiAdapter(
-                identity=Identity(threadId="thread-1", runId="run-1"),
+                identity=RunIdentity(threadId="thread-1", runId="run-1"),
                 private_state_keys=frozenset({value}),
             )
 
@@ -137,7 +180,7 @@ def test_public_adapter_schema_and_resume_errors_are_english() -> None:
             name: getattr(tinkerfin_agui_adapter, name).model_json_schema()
             for name in (
                 "AgentRunOutcome",
-                "Identity",
+                "RunIdentity",
                 "AgentRuntimeInterrupt",
                 "RuntimeInterruptEnvelope",
                 "SubagentProvenance",

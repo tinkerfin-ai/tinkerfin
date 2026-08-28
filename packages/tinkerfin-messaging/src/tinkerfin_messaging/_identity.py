@@ -1,8 +1,8 @@
-"""Messaging-specific validation for the shared framework run Identity."""
+"""Messaging-specific validation for the shared framework run identity."""
 
 from __future__ import annotations
 
-from tinkerfin_agui_adapter import Identity
+from tinkerfin_contracts import RunIdentity
 
 
 def required_canonical_text(name: str, value: str) -> str:
@@ -24,11 +24,11 @@ def required_identifier(name: str, value: str) -> str:
     return value
 
 
-def required_identity(identity: Identity) -> Identity:
-    """Validate the shared Identity and Messaging's bounded key constraints."""
+def required_identity(identity: RunIdentity) -> RunIdentity:
+    """Validate the shared RunIdentity and Messaging's bounded key constraints."""
 
-    if not isinstance(identity, Identity):
-        raise TypeError("identity must be an Identity")
+    if not isinstance(identity, RunIdentity):
+        raise TypeError("identity must be a RunIdentity")
     required_identifier("identity.thread_id", identity.thread_id)
     required_identifier("identity.run_id", identity.run_id)
     return identity

@@ -12,7 +12,7 @@ from tests.support.docker_services import RedisTestService
 
 from tinkerfin_studio.agent import persistence as persistence_module
 from tinkerfin_studio.agent.persistence import AgentPersistence
-from tinkerfin_studio.config.settings import DatabaseSettings, RedisSettings
+from tinkerfin_studio.config.settings import DatabaseSettings, RedisRuntimeSettings
 
 
 @dataclass(slots=True)
@@ -43,6 +43,11 @@ class _FakeStoreResource:
 
     async def __aenter__(self) -> _FakeStore:
         self._trace.events.append("store.enter")
+        try:
+            await self.store.setup()
+        except BaseException:
+            self._trace.events.append("store.close")
+            raise
         return self.store
 
     async def __aexit__(
@@ -78,7 +83,11 @@ class _FakeSaver:
 
 
 def _database_settings() -> DatabaseSettings:
-    return DatabaseSettings(url="mysql+asyncmy://root:secret@127.0.0.1:3306/test")
+    return DatabaseSettings(
+        url="mysql+asyncmy://root:secret@127.0.0.1:3306/test",
+        connection_budget=21,
+        management_connection_reserve=10,
+    )
 
 
 def _redis_settings(
@@ -86,15 +95,13 @@ def _redis_settings(
     host: str = "127.0.0.1",
     port: int = 6379,
     prefix: str = "test",
-) -> RedisSettings:
-    return RedisSettings(
+) -> RedisRuntimeSettings:
+    return RedisRuntimeSettings(
         host=host,
         port=port,
         database=15,
         checkpoint_database=0,
         messaging_key_prefix=f"{prefix}:messaging",
-        run_key_prefix=f"{prefix}:run",
-        auth_key_prefix=f"{prefix}:auth",
         checkpoint_prefix=f"{prefix}:checkpoint",
         checkpoint_write_prefix=f"{prefix}:checkpoint-write",
     )
@@ -110,7 +117,8 @@ def _install_fakes(
 
     class StoreFactory:
         @classmethod
-        def from_conn_string(cls, _url: str) -> _FakeStoreResource:
+        def from_conn_string(cls, url: str) -> _FakeStoreResource:
+            assert url == _database_settings().url
             return resource
 
     def create_redis(*_args: object, **_kwargs: object) -> _FakeRedis:
@@ -148,9 +156,9 @@ async def test_successful_lifecycle_publishes_then_closes_owned_resources(
         assert persistence.checkpointer is saver
         assert trace.events == [
             "store.enter",
+            "store.setup",
             "redis.create",
             "saver.create",
-            "store.setup",
             "saver.setup",
         ]
 
@@ -159,6 +167,21 @@ async def test_successful_lifecycle_publishes_then_closes_owned_resources(
         _ = persistence.store
     with pytest.raises(RuntimeError, match="尚未启动"):
         _ = persistence.checkpointer
+
+
+@pytest.mark.asyncio
+async def test_store_setup_failure_closes_before_other_resources_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_error = RuntimeError("store setup failed")
+    trace = _LifecycleTrace(store_setup_error=setup_error)
+    _install_fakes(monkeypatch, trace)
+
+    with pytest.raises(RuntimeError, match="store setup failed") as raised:
+        await _persistence().__aenter__()
+
+    assert raised.value is setup_error
+    assert trace.events == ["store.enter", "store.setup", "store.close"]
 
 
 @pytest.mark.asyncio
@@ -306,7 +329,11 @@ async def test_real_store_and_checkpointer_complete_one_owned_lifecycle(
 ) -> None:
     token = f"agent-persistence:{uuid4().hex}"
     persistence = AgentPersistence(
-        DatabaseSettings(url=mysql_sandbox_url),
+        DatabaseSettings(
+            url=mysql_sandbox_url,
+            connection_budget=21,
+            management_connection_reserve=10,
+        ),
         _redis_settings(
             host=redis_test_service.host,
             port=redis_test_service.port,

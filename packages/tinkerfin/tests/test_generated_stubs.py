@@ -112,6 +112,41 @@ def test_generated_stubs_exist_and_the_generator_reports_no_drift() -> None:
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+def test_generated_stubs_preserve_public_source_explanations() -> None:
+    for path in (_DEEP_AGENT_STUB, _INIT_STUB):
+        module = ast.parse(path.read_text(encoding="utf-8"))
+        assert ast.get_docstring(module)
+
+    deep_agent = ast.parse(_DEEP_AGENT_STUB.read_text(encoding="utf-8"))
+    for class_name, method_names in {
+        "DeepAgentRuntime": ("astream",),
+        "DeepAgentAgUiRuntime": ("astream",),
+        "DeepAgentAgUiResumeRuntime": ("astream",),
+        "DeepAgentDefinition": ("new", "prepare_agui_resume", "new_agui"),
+    }.items():
+        class_node = next(
+            node
+            for node in deep_agent.body
+            if isinstance(node, ast.ClassDef) and node.name == class_name
+        )
+        assert ast.get_docstring(class_node)
+        for method_name in method_names:
+            methods = [
+                node
+                for node in class_node.body
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == method_name
+            ]
+            assert methods
+            assert all(ast.get_docstring(method) for method in methods)
+
+    generated_text = _DEEP_AGENT_STUB.read_text(encoding="utf-8")
+    assert "Args:" in generated_text
+    assert "Returns:" in generated_text
+    assert "Raises:" in generated_text
+    assert "version-added" not in generated_text
+
+
 def test_generated_stubs_preserve_upstream_options_with_explicit_agui_inputs() -> None:
     create_arguments = copy.deepcopy(
         _stub_method(_INIT_STUB, "TinkerFin", "create_deep_agent").args
@@ -126,6 +161,16 @@ def test_generated_stubs_preserve_upstream_options_with_explicit_agui_inputs() -
         _upstream_function(CompiledStateGraph.astream).args
     )
     _RenameAstreamTypes().visit(expected_astream)
+    for index, argument in enumerate(expected_astream.kwonlyargs):
+        if argument.arg == "output_keys":
+            argument.annotation = ast.parse("None", mode="eval").body
+            expected_astream.kw_defaults[index] = ast.Constant(value=None)
+        elif argument.arg == "subgraphs":
+            argument.annotation = ast.parse("Literal[True]", mode="eval").body
+            expected_astream.kw_defaults[index] = ast.Constant(value=True)
+        elif argument.arg == "version":
+            argument.annotation = ast.parse('Literal["v2"]', mode="eval").body
+            expected_astream.kw_defaults[index] = ast.Constant(value="v2")
     native = _stub_method(_DEEP_AGENT_STUB, "DeepAgentRuntime", "astream")
     assert ast.dump(native.args, include_attributes=False) == ast.dump(
         expected_astream,
@@ -166,6 +211,7 @@ def test_generated_stubs_preserve_upstream_options_with_explicit_agui_inputs() -
 
 
 def test_generated_stub_declares_precise_facade_return_types() -> None:
+    observe = _stub_method(_INIT_STUB, "TinkerFin", "observe")
     plan = _stub_method(_INIT_STUB, "TinkerFin", "plan")
     create = _stub_method(_INIT_STUB, "TinkerFin", "create_deep_agent")
     native_new = _stub_method(_DEEP_AGENT_STUB, "DeepAgentDefinition", "new")
@@ -190,6 +236,7 @@ def test_generated_stub_declares_precise_facade_return_types() -> None:
         "astream",
     )
 
+    assert _return_type(observe) == "TinkerFin"
     assert _return_type(plan) == "TinkerFin"
     assert _return_type(create) == "DeepAgentDefinition[ContextT]"
     assert _return_type(native_new) == "DeepAgentRuntime[ContextT]"
@@ -280,10 +327,13 @@ def test_root_stub_keeps_plan_annotation_dependencies_private() -> None:
 
 def test_built_wheel_contains_the_generated_stubs(tmp_path: Path) -> None:
     output = tmp_path / "dist"
+    # Wheel contents are the contract under test. Offline resolution keeps this check
+    # from becoming an unrelated package-index availability probe.
     subprocess.run(
         [
             "uv",
             "build",
+            "--offline",
             "--quiet",
             "--wheel",
             "--out-dir",
@@ -305,6 +355,8 @@ def test_built_wheel_contains_the_generated_stubs(tmp_path: Path) -> None:
     assert "tinkerfin/plan/clarification.py" in names
     assert "tinkerfin/__init__.pyi" in names
     assert "tinkerfin/deep_agent.pyi" in names
+    assert "tinkerfin/agui_native.py" not in names
+    assert not any("-v1" in name for name in names)
 
 
 def test_definition_stub_methods_follow_the_runtime_implementation() -> None:
@@ -330,3 +382,20 @@ def test_definition_stub_methods_follow_the_runtime_implementation() -> None:
     assert "run_input" not in runtime_names
     assert "parent_run_id" in runtime_names
     assert "on_resume_checkpointed" in runtime_names
+
+
+def test_resume_preparation_remains_async_in_generated_stub() -> None:
+    module = ast.parse(_DEEP_AGENT_STUB.read_text(encoding="utf-8"))
+    definition = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.ClassDef) and node.name == "DeepAgentDefinition"
+    )
+    resume = next(
+        node
+        for node in definition.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "prepare_agui_resume"
+    )
+
+    assert isinstance(resume, ast.AsyncFunctionDef)

@@ -26,6 +26,6 @@ describe('conversation error boundary', () => {
     expect(conversationErrorMessage(
       new Error('底层连接信息'),
       'stream_recovery_failed',
-    )).toBe('实时事件恢复失败，请重试')
+    )).toBe('会话 Trace 恢复失败，请重试')
   })
 })

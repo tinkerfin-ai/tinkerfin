@@ -1,7 +1,7 @@
 # TinkerFin Studio Web 客户端
 
-该目录包含 React 19 与 TypeScript 客户端，提供登录、会话列表、AG-UI SSE 对话、
-历史恢复、任务与 Tool 状态、子 Agent 展示和 HITL 中断恢复。
+该目录包含 React 19 与 TypeScript 客户端，提供登录、会话列表、owned Run 的 AG-UI SSE、
+Trace 历史与跟随、任务与 Tool 状态、子 Agent 展示和 HITL 中断恢复。
 
 ## 本地运行
 
@@ -24,9 +24,10 @@ pnpm dev
 VITE_API_BASE_URL=https://api.example.com pnpm dev
 ```
 
-客户端会调用 `apps/studio/server` 提供的认证、数据库模型目录、会话、
-历史记录、取消和 AG-UI 对话流接口。SSE 网络中断后，客户端使用服务端回填的
-canonical threadId、原 runId 和最后一条持久化序号自动重连。
+客户端会调用 `apps/studio/server` 提供的认证、数据库模型目录、会话、Trace、取消和
+AG-UI 对话流接口。owned Run 网络中断后，客户端使用 canonical threadId、原 runId 和最后一条
+Messaging 序号自动重连；历史或 detached 会话只消费 Trace snapshot/follow，不重放 AG-UI 正文。
+owned Run 进入终态后，客户端重新读取 Trace，并用权威视图替换临时 AG-UI 状态。
 
 登录会话使用后端返回的 UTC `expires_at` 作为固定到期时间，不因页面操作或请求续期。
 客户端会在定时到期、页面恢复和认证请求前检查该时间；到期或收到后端 401 时静默返回
@@ -48,13 +49,14 @@ canonical threadId、原 runId 和最后一条持久化序号自动重连。
 
 新会话在侧栏以“新会话”显示，首个 chat 请求发送空 `threadId`。客户端生成本次请求的
 `runId`，并给 user 消息填写 `request-${runId}`，以满足标准 AG-UI 消息校验。后端不把
-这个客户端消息 ID 作为业务身份；服务端在 `RUN_STARTED` 中返回已入库的 canonical
-`threadId`、标题和带权威消息 ID 的完整 input，客户端据此替换草稿状态。
+这个客户端消息 ID 作为业务身份；`RUN_STARTED` 只返回 canonical `threadId`、`runId` 与标题，
+客户端保留当前临时消息。主终态后重新读取 Trace，并用其中的权威消息 ID 与正文替换临时状态。
 
 ## 输入与命令
 
 消息输入卡片的底部工具行提供本地附件、Plan 状态、模型选择和发送或停止操作。模型选择
-只展示后端目录中的可用模型，并随每次请求发送稳定模型 ID。
+只展示后端目录中的可用模型，并随每次请求发送稳定模型 ID。目录同时返回必填
+`runtimeProfile`，用于证明该模型可由当前 Worker 执行；客户端不参与恢复 Profile 选择。
 
 输入 `/plan` 会在本地开启 Plan，不产生消息请求；输入 `/plan <消息>` 会开启 Plan，并只把
 去掉命令前缀后的正文发送给后端。Plan 开启后，工具行显示黄色 `Plan` 状态按钮；该按钮是
@@ -68,9 +70,10 @@ canonical threadId、原 runId 和最后一条持久化序号自动重连。
 对应内部 `plan` 模式，`off` 对应内部 `default` 模式。HTTP 请求的模式字段只有
 `forwardedProps.command.plan`。
 
-会话消息保留浏览器原生滚动语义，并使用全局统一的视觉滑块。历史较长时初始显示最新
-100 个条目，“加载更早消息”每次向前增加 100 个，并保持当前阅读位置。实时新增内容会
-追加到已展开窗口，不会重新裁掉已加载内容。
+会话消息保留浏览器原生滚动语义，并使用全局统一的视觉滑块。Trace 初始读取最新 100 个
+Turn；存在 `historyCursor` 时，“加载更早消息”从同一固定 `asOfSeq` 再扩展 100 个 Turn。
+已读取内容仍按 100 个可见条目分批展开并保持当前阅读位置。Trace follow 的实时增量不会进入
+AG-UI 历史 reducer。
 
 默认代理目标是 `http://127.0.0.1:8090`。需要临时连接其他本地端口时设置：
 
@@ -99,9 +102,9 @@ Widely Available 默认目标；真实发布仍应按目标用户浏览器矩阵
 
 ## 第三方许可证
 
-工程核验记录见 [`THIRD_PARTY_LICENSES.md`](./THIRD_PARTY_LICENSES.md)。`pnpm build` 会在
-`dist/third-party-licenses.md` 生成实际进入浏览器制品的依赖许可证清单。GSAP 当前仅用于
-Studio 界面状态动效，适用边界以官方 Standard License 原文为准。
+仓库默认许可见[根 LICENSE](../../../LICENSE)。`pnpm build` 会在
+`dist/third-party-licenses.md` 生成实际进入浏览器制品的依赖许可证清单。GSAP 当前仅用于 Studio
+界面状态动效，适用边界以官方 Standard License 原文为准。
 
 ## 安全限制
 

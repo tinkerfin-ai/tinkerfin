@@ -16,11 +16,12 @@ from langgraph.config import get_stream_writer
 
 from tinkerfin import (
     DeepAgentDefinition,
-    Identity,
     NativeGraphRunStream,
+    RunIdentity,
     TinkerFin,
 )
 from tinkerfin_messaging import (
+    MessageCodecInputSource,
     MessageSubscription,
     Messaging,
     NativeStreamPart,
@@ -31,8 +32,8 @@ def _identity(
     *,
     thread_id: str = "thread-1",
     run_id: str = "run-1",
-) -> Identity:
-    return Identity(threadId=thread_id, runId=run_id)
+) -> RunIdentity:
+    return RunIdentity(threadId=thread_id, runId=run_id)
 
 
 class _ToolBindingFakeModel(FakeMessagesListChatModel):
@@ -114,9 +115,11 @@ async def test_native_and_agui_streams_wrap_without_runtime_parameters() -> None
             subgraphs=True,
         )
         assert isinstance(native_source, NativeGraphRunStream)
+        assert isinstance(native_source, MessageCodecInputSource)
         assert native_source.messaging_identity is native_identity
-        assert native_source.messaging_codec_profile == "langgraph.stream-part.v2"
+        assert native_source.messaging_codec_profile == "tinkerfin.native-stream"
         assert native_source.messaging_source_type is Mapping
+        assert native_source.messaging_codec_input_type is NativeStreamPart
         assert native_source.messaging_replay_type is NativeStreamPart
         native = await native_channel.wrap(
             native_source,

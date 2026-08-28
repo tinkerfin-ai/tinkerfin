@@ -12,11 +12,7 @@ from typing import Annotated, Any, cast, get_args, get_origin
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, create_model
 
-from tinkerfin_agui_adapter import (
-    require_valid_schema,
-    validate_json_schema_instance,
-)
-
+from ._json_schema import require_valid_schema, validate_json_schema_instance
 from .clarification import (
     ClarificationFormBase,
     ClarificationModel,
@@ -167,6 +163,13 @@ def _field_model_types(
     optional: bool = False,
     variadic_tuple: bool = False,
 ) -> tuple[type[BaseModel], ...]:
+    """Extract concrete model leaves from one framework-owned field contract.
+
+    The helper rejects ``Any`` and abstract placeholders so persisted forms cannot
+    depend on a runtime subtype the Definition did not freeze. Variadic tuple checks
+    also preserve repeated question and option Schema semantics.
+    """
+
     field = model.model_fields.get(field_name)
     if field is None:
         if optional:
@@ -281,6 +284,8 @@ def _validate_question_model(
     *,
     source: str,
 ) -> str:
+    """Validate inherited core fields and return one stable answer-type identity."""
+
     _require_inherited_core_fields(
         question_type,
         base=ClarificationQuestionBase,
@@ -315,6 +320,12 @@ def _validate_form_schema(
     ClarificationQuestionCount,
     dict[str, type[ClarificationQuestionBase]],
 ]:
+    """Freeze one concrete form and its unique question-type dispatch table.
+
+    Model annotations and generated JSON Schema are checked together; accepting only
+    one of them would let runtime parsing and published response constraints diverge.
+    """
+
     if not isinstance(value, type) or not issubclass(value, ClarificationFormBase):
         raise PlanModeConfigurationError(
             "clarification_schema must be a ClarificationFormBase subclass"
@@ -508,6 +519,13 @@ def _string_schema() -> dict[str, JsonValue]:
 
 
 def _answered_schema(question: ClarificationQuestionBase) -> dict[str, JsonValue]:
+    """Build the exact answered branch for one built-in checkpoint question.
+
+    Choice IDs come from the trusted frozen form. ``oneOf`` expresses the exclusive
+    custom-answer path, and multiple-choice bounds count a custom answer as one
+    selection so UI order cannot alter validation.
+    """
+
     type_id = _question_answer_type(question)
     base: dict[str, JsonValue] = {
         "type": "object",
@@ -739,6 +757,13 @@ def _validate_builtin_response(
     question: ClarificationQuestionBase,
     response: BaseModel,
 ) -> None:
+    """Recheck a parsed built-in response against its exact checkpoint question.
+
+    JSON Schema rejects malformed transport input; this second boundary enforces the
+    trusted domain relation to the specific options and selection limits stored in the
+    checkpoint before normalized answers enter Plan context.
+    """
+
     if isinstance(question, SingleChoiceQuestion):
         single = cast(
             SingleChoiceQuestion[ClarificationModel, ClarificationOptionBase],

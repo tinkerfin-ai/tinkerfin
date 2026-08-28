@@ -476,7 +476,7 @@ async def test_from_url_owns_its_client(
     monkeypatch.setattr(
         Redis,
         "from_url",
-        staticmethod(lambda _url, *, decode_responses: cast(Redis, client)),
+        staticmethod(lambda _url, **_options: cast(Redis, client)),
     )
     async with RedisLeaseLock.from_url("redis://lease.example/0") as lock:
         async with lock.hold("resource"):

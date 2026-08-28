@@ -10,9 +10,9 @@ from redis.asyncio.cluster import RedisCluster
 from redis.exceptions import ConnectionError as RedisConnectionError
 
 from tinkerfin import (
-    Identity,
     RunCoordinationError,
     RunCoordinationUnavailableError,
+    RunIdentity,
 )
 from tinkerfin.errors import (
     RedisLeaseError,
@@ -22,8 +22,8 @@ from tinkerfin.errors import (
 from tinkerfin.redis import RedisRunCoordinator
 
 
-def _identity(*, thread_id: str = "user-1", run_id: str = "run-1") -> Identity:
-    return Identity(threadId=thread_id, runId=run_id)
+def _identity(*, thread_id: str = "user-1", run_id: str = "run-1") -> RunIdentity:
+    return RunIdentity(threadId=thread_id, runId=run_id)
 
 
 def test_from_client_rejects_redis_cluster_outside_the_client_boundary() -> None:
@@ -175,7 +175,7 @@ async def test_identity_key_is_resolved_once_per_coordinated_run() -> None:
     client = _ScriptedRedis([1, 1])
     resolver_calls = 0
 
-    def resolve(identity: Identity) -> str:
+    def resolve(identity: RunIdentity) -> str:
         nonlocal resolver_calls
         resolver_calls += 1
         return identity.thread_id
@@ -356,7 +356,7 @@ async def test_from_url_closes_owned_client_after_non_redis_health_failure(
     monkeypatch.setattr(
         Redis,
         "from_url",
-        staticmethod(lambda _url, *, decode_responses: cast(Redis, client)),
+        staticmethod(lambda _url, **_options: cast(Redis, client)),
     )
     coordinator = RedisRunCoordinator.from_url(
         "redis://coordination.example/0",
@@ -380,7 +380,7 @@ async def test_from_url_cancellation_closes_owned_client_before_propagating(
     monkeypatch.setattr(
         Redis,
         "from_url",
-        staticmethod(lambda _url, *, decode_responses: cast(Redis, client)),
+        staticmethod(lambda _url, **_options: cast(Redis, client)),
     )
     coordinator = RedisRunCoordinator.from_url(
         "redis://coordination.example/0",

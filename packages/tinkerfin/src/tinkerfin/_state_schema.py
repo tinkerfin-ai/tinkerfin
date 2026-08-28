@@ -10,8 +10,7 @@ from deepagents.graph import DeepAgentState
 from pydantic import JsonValue
 from typing_extensions import TypedDict, is_typeddict
 
-from ._agui_lineage_state import LINEAGE_STATE_KEY
-from .agui_resume import RESUME_MARKER_STATE_KEY
+from ._agui_lineage_state import LINEAGE_STATE_KEY, RESUME_MARKER_STATE_KEY
 
 
 class TinkerFinRuntimeState(DeepAgentState, total=False):
@@ -35,6 +34,13 @@ class StateSchemaCompositionError(ValueError):
 
 
 def _schema_hints(schema: type, *, source: str) -> dict[str, Any]:
+    """Resolve one TypedDict while preserving explicit field requiredness.
+
+    ``get_type_hints`` can erase the distinction between totality inherited from a
+    base and per-field ``Required``/``NotRequired`` wrappers. Reapplying the runtime
+    key sets keeps composition from silently weakening checkpoint state contracts.
+    """
+
     if not is_typeddict(schema):
         raise StateSchemaCompositionError(f"{source} must be a TypedDict state schema")
     try:

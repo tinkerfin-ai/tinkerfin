@@ -18,10 +18,10 @@ from langgraph.types import Command, Interrupt
 
 from tinkerfin_agui_adapter import (
     DeepAgentAgUiAdapter,
-    Identity,
     ResumeMapper,
     SubagentProvenance,
 )
+from tinkerfin_contracts import RunIdentity
 
 
 class _ToolBindingFakeModel(FakeMessagesListChatModel):
@@ -227,7 +227,7 @@ async def test_real_subagent_tool_resume_preserves_native_identity() -> None:
     assert parent_results[0]["interrupts"] == []
 
     before_adapter = DeepAgentAgUiAdapter(
-        identity=Identity(threadId="real-subagent-resume", runId="request-before")
+        identity=RunIdentity(threadId="real-subagent-resume", runId="request-before")
     )
     before_events = [event for part in before for event in before_adapter.process(part)]
     before_events.extend(before_adapter.finish())
@@ -264,7 +264,7 @@ async def test_real_subagent_tool_resume_preserves_native_identity() -> None:
     )
 
     after_adapter = DeepAgentAgUiAdapter(
-        identity=Identity(threadId="real-subagent-resume", runId="request-after"),
+        identity=RunIdentity(threadId="real-subagent-resume", runId="request-after"),
         prior_tool_call_ids=frozenset(translation.prior_tool_call_ids),
     )
     after_events = [event for part in after for event in after_adapter.process(part)]

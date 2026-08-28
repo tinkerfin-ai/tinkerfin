@@ -15,7 +15,7 @@ The converter does not create a Graph, invoke a model, read checkpoints, or prov
 ## The simplest conversion path
 
 ```python
-from tinkerfin_agui_adapter import Identity, astream_events
+from tinkerfin_agui_adapter import RunIdentity, astream_events
 
 
 parts = graph.astream(
@@ -28,7 +28,7 @@ parts = graph.astream(
 
 events = astream_events(
     parts,
-    identity=Identity(threadId="thread-1", runId="run-1"),
+    identity=RunIdentity(threadId="thread-1", runId="run-1"),
 )
 
 async for event in events:
@@ -77,7 +77,7 @@ from tinkerfin_agui_adapter import (
 
 
 lifecycle = AgUiLifecycleEventFactory()
-identity = Identity(threadId="thread-1", runId="run-1")
+identity = RunIdentity(threadId="thread-1", runId="run-1")
 adapter = DeepAgentAgUiAdapter(identity=identity)
 
 await send_event(lifecycle.started(identity=identity))
@@ -94,7 +94,7 @@ try:
         )
     )
 except Exception:
-    for event in adapter.abort(code="runtime_error"):
+    for event in adapter.abort():
         await send_event(event)
     await send_event(
         lifecycle.failed(
@@ -104,6 +104,9 @@ except Exception:
         )
     )
 ```
+
+`abort()` closes only child text, reasoning, and Tool lifecycles. The custom
+orchestrator emits the one main `RUN_ERROR`, as shown above.
 
 Your orchestrator owns one start and one terminal. Prefer `astream_events()` unless you truly need that ownership.
 

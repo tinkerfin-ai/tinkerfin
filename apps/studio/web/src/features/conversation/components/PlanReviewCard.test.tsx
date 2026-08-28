@@ -4,7 +4,6 @@ import { useState } from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { PlanReviewState } from '../../../types'
-import { planReviewCollapseKey } from '../planQuestionCollapse'
 import { PlanReviewCard, PlanReviewStatusRow } from './PlanReviewCard'
 import conversationStyles from '../conversation.css?raw'
 
@@ -39,7 +38,6 @@ describe('PlanReviewCard', () => {
     }
     const view = render(
       <PlanReviewCard
-        threadId="thread-a"
         interaction={current}
         onChange={change}
         onSubmit={submit}
@@ -47,12 +45,17 @@ describe('PlanReviewCard', () => {
     )
 
     expect(screen.getByRole('heading', { level: 1, name: '实现模式切换' })).toBeInTheDocument()
-    expect(screen.getByRole('heading', { level: 2 })).toHaveTextContent(/^Plan/)
-    expect(screen.getByText('切换实现模式并保持父图稳定')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { level: 2 }))
+      .toHaveTextContent('切换实现模式并保持父图稳定')
+    const card = screen.getByRole('region', { name: 'Plan 审阅' })
+    expect(card.querySelector('.plan-review-composer-heading p')).not.toBeInTheDocument()
+    expect(card.querySelector('.plan-review-composer-heading small')).not.toBeInTheDocument()
+    expect(card).not.toHaveTextContent('Plan')
+    expect(screen.getByRole('region', { name: '计划草稿内容' }))
+      .not.toHaveTextContent('切换实现模式并保持父图稳定')
+    expect(card.querySelector('.interaction-card-color-bridge.is-warning')).toBeInTheDocument()
     expect(screen.getByText('保持父图稳定')).toBeInTheDocument()
-    expect(screen.getByText((content, element) => (
-      element?.tagName === 'SMALL' && content.includes('第 3 版')
-    ))).toBeInTheDocument()
+    expect(card).not.toHaveTextContent('第 3 版')
     expect(screen.queryByRole('button', { name: '编辑' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /关闭|放弃/ })).not.toBeInTheDocument()
     expect(screen.getAllByRole('button').filter((button) => (
@@ -63,7 +66,6 @@ describe('PlanReviewCard', () => {
     expect(current.action).toBe('approve')
     view.rerender(
       <PlanReviewCard
-        threadId="thread-a"
         interaction={current}
         onChange={change}
         onSubmit={submit}
@@ -80,7 +82,6 @@ describe('PlanReviewCard', () => {
     }
     const view = render(
       <PlanReviewCard
-        threadId="thread-a"
         interaction={current}
         onChange={change}
         onSubmit={vi.fn()}
@@ -89,7 +90,7 @@ describe('PlanReviewCard', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '反馈' }))
     view.rerender(
-      <PlanReviewCard threadId="thread-a" interaction={current} onChange={change} onSubmit={vi.fn()} />,
+      <PlanReviewCard interaction={current} onChange={change} onSubmit={vi.fn()} />,
     )
     const feedback = screen.getByRole('textbox', { name: '需要调整的内容' })
     fireEvent.change(feedback, { target: { value: '补充移动端验证' } })
@@ -97,7 +98,7 @@ describe('PlanReviewCard', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '拒绝' }))
     view.rerender(
-      <PlanReviewCard threadId="thread-a" interaction={current} onChange={change} onSubmit={vi.fn()} />,
+      <PlanReviewCard interaction={current} onChange={change} onSubmit={vi.fn()} />,
     )
     const rejectionReason = screen.getByRole('textbox', { name: '拒绝原因（可选）' })
     expect(rejectionReason).toHaveValue('补充移动端验证')
@@ -112,7 +113,6 @@ describe('PlanReviewCard', () => {
       const [current, setCurrent] = useState(interaction())
       return (
         <PlanReviewCard
-          threadId="thread-a"
           interaction={current}
           onChange={setCurrent}
           onSubmit={submit}
@@ -137,12 +137,12 @@ describe('PlanReviewCard', () => {
     expect(submit).toHaveBeenCalledOnce()
   })
 
-  it('persists collapse per thread without submitting or changing the review', async () => {
+  it('always stays expanded and ignores the removed per-thread collapse preference', () => {
     const change = vi.fn()
     const submit = vi.fn()
-    const view = render(
+    window.sessionStorage.setItem('tinkerfin:plan-review-collapse:thread-a', 'collapsed')
+    render(
       <PlanReviewCard
-        threadId="thread-a"
         interaction={interaction()}
         onChange={change}
         onSubmit={submit}
@@ -150,35 +150,15 @@ describe('PlanReviewCard', () => {
     )
 
     expect(screen.getByRole('separator', { name: '调整交互卡片高度' })).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: '收起计划草稿' }))
-    expect(screen.queryByRole('separator', { name: '调整交互卡片高度' })).not.toBeInTheDocument()
-    expect(screen.queryByRole('region', { name: '计划草稿内容' })).not.toBeInTheDocument()
-    expect(screen.getByText('切换实现模式并保持父图稳定')).toBeInTheDocument()
-    expect(screen.queryByText('等待审阅')).not.toBeInTheDocument()
-    expect(window.sessionStorage.getItem(planReviewCollapseKey('thread-a'))).toBe('collapsed')
-    expect(screen.getByRole('button', { name: '点击标题区域展开计划草稿' }))
-      .toHaveAttribute('aria-expanded', 'false')
+    expect(screen.getByRole('region', { name: '计划草稿内容' })).toBeInTheDocument()
+    const card = screen.getByRole('region', { name: 'Plan 审阅' })
+    expect(card).not.toHaveClass('is-minimized')
+    expect(card.querySelector('.plan-review-toggle-surface')).not.toBeInTheDocument()
+    expect(card.querySelector('.plan-review-composer-head-button')).not.toBeInTheDocument()
+    expect(card.querySelector('.interaction-card-color-bridge')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /展开计划草稿|收起计划草稿/ })).not.toBeInTheDocument()
     expect(change).not.toHaveBeenCalled()
     expect(submit).not.toHaveBeenCalled()
-
-    view.rerender(
-      <PlanReviewCard
-        threadId="thread-b"
-        interaction={interaction()}
-        onChange={change}
-        onSubmit={submit}
-      />,
-    )
-    await waitFor(() => expect(screen.getByRole('region', { name: '计划草稿内容' })).toBeVisible())
-    view.rerender(
-      <PlanReviewCard
-        threadId="thread-a"
-        interaction={interaction()}
-        onChange={change}
-        onSubmit={submit}
-      />,
-    )
-    await waitFor(() => expect(screen.queryByRole('region', { name: '计划草稿内容' })).not.toBeInTheDocument())
   })
 
   it('shows waiting and submitted conversation statuses', () => {
@@ -195,7 +175,6 @@ describe('PlanReviewCard', () => {
   it('announces a dynamic submission error', () => {
     render(
       <PlanReviewCard
-        threadId="thread-a"
         interaction={{ ...interaction(), error: '计划版本已经更新' }}
         onChange={vi.fn()}
         onSubmit={vi.fn()}
@@ -209,8 +188,13 @@ describe('PlanReviewCard', () => {
     expect(conversationStyles).toMatch(/\.approval-composer,\s*\.plan-question-composer,\s*\.plan-review-composer\s*\{[^}]*border:\s*0;/s)
     expect(conversationStyles).toMatch(/\.approval-composer,\s*\.plan-review-composer\s*\{[^}]*background:\s*var\(--color-layer-1\);/s)
     expect(conversationStyles).toMatch(/\.approval-composer-head,\s*\.plan-review-composer-head\s*\{[^}]*background:\s*var\(--color-warning-panel-background\);/s)
+    expect(conversationStyles).toMatch(/\.approval-composer-head,\s*\.plan-review-composer-head\s*\{[^}]*padding-block:\s*10px;/s)
     expect(conversationStyles).toMatch(/\.plan-review-composer-heading h2 > svg\s*\{[^}]*color:\s*var\(--color-warning-panel-accent\);/s)
-    expect(conversationStyles).toMatch(/\.plan-review-composer\.is-minimized \.plan-review-composer-head\s*\{[^}]*min-height:\s*var\(--layout-composer-surface-height\);[^}]*align-items:\s*center;[^}]*padding-top:\s*var\(--space-3\);[^}]*padding-bottom:\s*var\(--space-3\);/s)
+    expect(conversationStyles).toMatch(/\.approval-composer-heading h2 > span:not\(\.approval-status-dot\),\s*\.plan-review-composer-heading h2 > span\s*\{[^}]*color:\s*var\(--color-warning-panel-accent\);/s)
+    expect(conversationStyles).toMatch(/\.plan-review-composer-heading h2 > span\s*\{[^}]*flex:\s*1 1 auto;/s)
+    expect(conversationStyles).toMatch(/\.approval-composer-footer\s*\{[^}]*min-height:\s*var\(--space-16\);[^}]*padding:\s*var\(--space-3\) var\(--space-4\);/s)
+    expect(conversationStyles).not.toContain('.plan-review-composer.is-minimized')
+    expect(conversationStyles).not.toContain('.plan-review-composer-head-button')
     expect(conversationStyles).toMatch(/\.plan-review-composer-body\s*\{[^}]*flex:\s*1 1 auto;[^}]*overflow-y:\s*auto;/s)
     expect(conversationStyles).toMatch(/\.plan-review-composer-footer\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) auto;[^}]*min-height:\s*var\(--control-xl\);/s)
     expect(conversationStyles).toMatch(/@media \(max-width:\s*440px\)[\s\S]*\.plan-review-actions\s*\{[^}]*grid-template-columns:\s*repeat\(3, minmax\(0, 1fr\)\);/s)

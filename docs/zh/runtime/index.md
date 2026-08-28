@@ -19,14 +19,18 @@ Runtime 负责启动一次 Agent 运行，并把运行过程作为异步数据�
 pip install tinkerfin
 ```
 
-模型供应商的依赖和密钥需要按模型自己的要求安装、配置。
+基础安装包含原生 Runtime、Plan Mode、Observation 与原生 SSE。使用 `new_agui()` 前需安装
+`pip install "tinkerfin[agui]"`。
+
+模型供应商的依赖和密钥需要按模型自己的要求安装、配置。下方 OpenAI 模型字符串需要
+`pip install langchain-openai`。
 
 ## 第一个 Runtime
 
 ```python
 import asyncio
 
-from tinkerfin import Identity, TinkerFin
+from tinkerfin import RunIdentity, TinkerFin
 
 
 tinkerfin = TinkerFin()
@@ -37,7 +41,7 @@ agent = tinkerfin.create_deep_agent(
 
 
 async def main() -> None:
-    identity = Identity(threadId="conversation-1", runId="run-1")
+    identity = RunIdentity(threadId="conversation-1", runId="run-1")
     runtime = agent.new(identity=identity)
     stream = runtime.astream(
         {"messages": [{"role": "user", "content": "用一句话介绍北京"}]},
@@ -57,12 +61,12 @@ asyncio.run(main())
 3. `agent.new(identity=...)` 创建新的 Graph，并绑定本次运行身份。
 4. `runtime.astream(...)` 启动运行，并逐条返回结果。
 
-## `Identity` 有什么用
+## `RunIdentity` 有什么用
 
-`Identity` 只包含 `threadId` 和 `runId`。Runtime 会把 `threadId` 自动写入 Graph 配置，因此调用时不用再重复填写。
+`RunIdentity` 只包含 `threadId` 和 `runId`。Runtime 会把 `threadId` 自动写入 Graph 配置，因此调用时不用再重复填写。
 
 ```python
-identity = Identity(threadId="user-42-support", runId="run-20260820-1")
+identity = RunIdentity(threadId="user-42-support", runId="run-20260820-1")
 ```
 
 | 字段 | 要求 | 作用 |
@@ -70,9 +74,10 @@ identity = Identity(threadId="user-42-support", runId="run-20260820-1")
 | `threadId` | 必填、非空、不能有首尾空白 | 一段可继续的会话，也是 Graph checkpoint thread |
 | `runId` | 必填、非空、不能有首尾空白 | thread 中一次语义运行的幂等 ID |
 
-`Identity` 创建后不可修改，也不接受额外字段。parent 谱系、用户身份和请求正文都不属于它。
+`RunIdentity` 创建后不可修改，每个 ID 最多 1024 个字符，也不接受额外字段。parent 谱系、
+用户身份和请求正文都不属于它。
 只有需要谱系时才向 `new_agui(parent_run_id=...)` 传入。公开事件、Graph、checkpoint、协调和
-持久投递共同使用这一个 canonical Identity。
+持久投递共同使用这一个 canonical RunIdentity。
 
 同一段连续会话复用 `threadId`，每次新的语义运行使用新的 `runId`。网络重试或重新附着同一次运行时复用原来的 `runId`。
 
@@ -81,15 +86,26 @@ identity = Identity(threadId="user-42-support", runId="run-20260820-1")
 每个 Runtime 只能调用一次 `astream()`。需要再次运行时，重新调用 `agent.new()`：
 
 ```python
-first = agent.new(identity=Identity(threadId="thread-1", runId="run-1"))
-second = agent.new(identity=Identity(threadId="thread-1", runId="run-2"))
+first = agent.new(identity=RunIdentity(threadId="thread-1", runId="run-1"))
+second = agent.new(identity=RunIdentity(threadId="thread-1", runId="run-2"))
 ```
 
 Definition 可以重复使用；Runtime 只代表一次运行。
+
+## 当前能力边界
+
+当前发行只提供显式选择的 `deepagents-v2` Runtime Profile，不提供 Deep Agents v3 Profile 或
+TodoGroups Projection/UI。其他真实 Profile 必须拥有对应上游建图与流合同，同时输出同一 canonical
+Native Observation；下游 Runtime、Trace、AG-UI 与 Messaging 不按上游版本分支。
+
+当前不提供 Archive/S3/Blob 存储、payload Encryption/KMS 或 OpenTelemetry exporter。具体集成只能
+组合已经实际使用的 `TraceStore`、canonical payload codec、`RuntimeObserver` 或 Store/Messaging
+Backend decorator 边界；项目没有为不可用能力保留空接口。
 
 ## 下一步
 
 - [创建和运行 Deep Agent](deep-agents.md)
 - [事件流与 SSE](streams-and-sse.md)
 - [运行协调与 Redis 租约](extensions.md)
+- [记录语义执行历史](../tracing/index.md)
 - [Runtime 使用参考](api-reference.md)

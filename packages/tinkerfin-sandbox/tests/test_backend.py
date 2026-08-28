@@ -1266,7 +1266,6 @@ class OpenSandboxClientTests(unittest.IsolatedAsyncioTestCase):
                 "tinkerfin_sandbox.lifecycle.client.Sandbox.create",
                 return_value=sandbox,
             ),
-            self.assertLogs("tinkerfin_sandbox.lifecycle.client", level="WARNING"),
             self.assertRaisesRegex(RuntimeError, "seed failed"),
         ):
             await client.create()
@@ -1380,12 +1379,9 @@ class OpenSandboxClientTests(unittest.IsolatedAsyncioTestCase):
             config=self.config,
         )
 
-        with (
-            patch(
-                "tinkerfin_sandbox.lifecycle.client.Sandbox.connect",
-                return_value=sandbox,
-            ),
-            self.assertLogs("tinkerfin_sandbox.lifecycle.client", level="WARNING"),
+        with patch(
+            "tinkerfin_sandbox.lifecycle.client.Sandbox.connect",
+            return_value=sandbox,
         ):
             details = await client.inspect("existing")
 
@@ -1460,12 +1456,9 @@ class OpenSandboxClientTests(unittest.IsolatedAsyncioTestCase):
             config=self.config,
         )
 
-        with (
-            patch(
-                "tinkerfin_sandbox.lifecycle.client.Sandbox.connect",
-                return_value=sandbox,
-            ),
-            self.assertLogs("tinkerfin_sandbox.lifecycle.client", level="WARNING"),
+        with patch(
+            "tinkerfin_sandbox.lifecycle.client.Sandbox.connect",
+            return_value=sandbox,
         ):
             with self.assertRaises(UnexpectedOpenSandboxBackendError) as captured:
                 await client.destroy("existing")
@@ -1511,7 +1504,9 @@ class OpenSandboxClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(sandbox.killed)
         self.assertTrue(sandbox.closed)
 
-    async def test_destroy_logs_local_close_failure_after_confirmed_kill(self) -> None:
+    async def test_destroy_ignores_local_close_failure_after_confirmed_kill(
+        self,
+    ) -> None:
         sandbox = _FakeSandbox("existing")
         sandbox.close_error = RuntimeError("close failed")
         client = OpenSandboxClient(
@@ -1519,12 +1514,9 @@ class OpenSandboxClientTests(unittest.IsolatedAsyncioTestCase):
             config=self.config,
         )
 
-        with (
-            patch(
-                "tinkerfin_sandbox.lifecycle.client.Sandbox.connect",
-                return_value=sandbox,
-            ),
-            self.assertLogs("tinkerfin_sandbox.lifecycle.client", level="WARNING"),
+        with patch(
+            "tinkerfin_sandbox.lifecycle.client.Sandbox.connect",
+            return_value=sandbox,
         ):
             await client.destroy("existing")
 

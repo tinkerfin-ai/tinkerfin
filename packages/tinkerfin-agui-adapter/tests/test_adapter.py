@@ -40,18 +40,19 @@ from tinkerfin_agui_adapter import (
     AgUiAdapterErrorCode,
     AgUiStreamContractError,
     HitlCorrelationError,
-    Identity,
+    RunIdentity,
     create_subagent_provenance,
     parse_tool_review_interrupt,
 )
 from tinkerfin_agui_adapter.adapter import DeepAgentAgUiAdapter
 from tinkerfin_agui_adapter.ids import ScopedIdCodec
+from tinkerfin_native_stream import NativeStreamContractError
 
 _IDS = ScopedIdCodec()
 
 
-def _identity(*, run_id: str = "run-main") -> Identity:
-    return Identity(threadId="thread-1", runId=run_id)
+def _identity(*, run_id: str = "run-main") -> RunIdentity:
+    return RunIdentity(threadId="thread-1", runId=run_id)
 
 
 def _message_id(namespace: tuple[str, ...], raw_id: str) -> str:
@@ -858,7 +859,7 @@ def test_abort_does_not_synthesize_subagent_run_terminals() -> None:
         )
     )
 
-    events = adapter.abort(code="runtime_error")
+    events = adapter.abort()
     assert events == []
 
 
@@ -2607,7 +2608,8 @@ def test_malformed_tasks_payload_is_rejected_at_parser_boundary() -> None:
         )
 
     assert raised.value.code is AgUiAdapterErrorCode.STREAM_CONTRACT_INVALID
-    assert isinstance(raised.value.cause, ValidationError)
+    assert isinstance(raised.value.cause, NativeStreamContractError)
+    assert isinstance(raised.value.cause.cause, ValidationError)
 
 
 def test_ai_message_without_stable_id_is_rejected_before_stream_state_changes() -> None:

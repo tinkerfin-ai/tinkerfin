@@ -1,4 +1,4 @@
-"""Studio 版本来源测试。"""
+"""Studio 版本来源测试"""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ APP_ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_built_wheel_reads_version_module(tmp_path: Path) -> None:
-    """wheel 元数据必须读取版本模块，避免 pyproject 重复维护版本号。"""
+    """wheel 元数据必须读取版本模块，避免 pyproject 重复维护版本号"""
 
     project_dir = tmp_path / "project"
     output_dir = tmp_path / "dist"
@@ -51,7 +51,7 @@ def test_built_wheel_reads_version_module(tmp_path: Path) -> None:
 
 
 def test_application_uses_the_package_version() -> None:
-    """OpenAPI 版本必须与 Studio 包版本保持一致。"""
+    """OpenAPI 版本必须与 Studio 包版本保持一致"""
 
     application = create_application(lifespan=None)
 

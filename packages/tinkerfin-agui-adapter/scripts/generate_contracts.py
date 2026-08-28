@@ -9,7 +9,7 @@ from pathlib import Path
 from tinkerfin_agui_adapter import (
     SUBAGENT_PROVENANCE_SCHEMA,
     TOOL_REVIEW_SCHEMA,
-    Identity,
+    RunIdentity,
     ScopedIdCodec,
     SubagentProvenance,
     ToolReviewInterruptMetadata,
@@ -70,7 +70,7 @@ def _artifacts() -> dict[Path, str]:
     parent_namespace = ("tools:parent",)
     parent_tool_call_id = ScopedIdCodec().encode("tool", parent_namespace, "call-task")
     subagent_fixture = create_subagent_provenance(
-        identity=Identity(threadId="thread-known", runId="run-known"),
+        identity=RunIdentity(threadId="thread-known", runId="run-known"),
         namespace=(*parent_namespace, "tools:graph-task"),
         parent_namespace=parent_namespace,
         graph_task_id="graph-task",

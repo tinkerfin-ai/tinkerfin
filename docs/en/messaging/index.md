@@ -6,24 +6,28 @@ Messaging turns a single-use object stream into a durable producer that supports
 
 ## Installation
 
+Core messaging is protocol-neutral:
+
 ```bash
 pip install tinkerfin-messaging
 ```
 
-Native and AG-UI codecs are included. Install Redis only when needed:
+Install the codecs and backend used by the host. The example below needs AG-UI:
 
 ```bash
-pip install "tinkerfin-messaging[redis]"
+pip install tinkerfin "tinkerfin-messaging[agui]"
+pip install "tinkerfin-messaging[native]"
+pip install "tinkerfin-messaging[agui,redis]"
 ```
 
 ## Turn a TinkerFin stream into resumable SSE
 
 ```python
-from tinkerfin import Identity
+from tinkerfin import RunIdentity
 from tinkerfin_messaging import Messaging
 
 
-identity = Identity(threadId="thread-42", runId="run-7")
+identity = RunIdentity(threadId="thread-42", runId="run-7")
 events = agent.new_agui(identity=identity).astream(graph_input)
 
 async with Messaging() as messaging:
@@ -34,7 +38,11 @@ async with Messaging() as messaging:
         await send_to_client(chunk)
 ```
 
-`AgUiEventStream` and `NativeGraphRunStream` carry immutable codec and Identity profiles. A name-only channel therefore needs no duplicate codec, thread, or run parameters, including for an empty source.
+`AgUiEventStream` and `NativeGraphRunStream` carry immutable codec and RunIdentity profiles. A name-only channel therefore needs no duplicate codec, thread, or run parameters, including for an empty source.
+
+`AgUiCodec` requires `[agui]`; `NativeStreamPartCodec` requires `[native]`; and
+`RedisBackend` requires `[redis]`. Missing extras fail at the relevant lazy import with
+the exact installation command instead of loading the Agent Runtime into Messaging Core.
 
 The returned body already contains SSE bytes. Do not call Runtime `to_sse()` first or pass a pre-encoded `SseBody` into Messaging.
 
@@ -47,18 +55,18 @@ channel = messaging.channel(name="custom", codec=codec)
 subscription = await channel.wrap(source, identity=identity, after=0)
 ```
 
-If a source has an Identity profile and an explicit different Identity is supplied, preflight fails before backend preparation or source opening.
+If a source has a RunIdentity profile and an explicit different RunIdentity is supplied, preflight fails before backend preparation or source opening.
 
 ## Core concepts
 
 | Name | Purpose |
 | --- | --- |
 | channel name | Stable payload format, such as AG-UI |
-| `Identity.threadId` | Ordered log, generation, and replay cursor scope |
-| `Identity.runId` | Semantic producer and caller idempotency key |
+| `RunIdentity.threadId` | Ordered log, generation, and replay cursor scope |
+| `RunIdentity.runId` | Semantic producer and caller idempotency key |
 | `seq` | One-based committed position in the thread log |
 
-The same Identity always means the same semantic run. Reuse it for retries and attachment; use a new runId for new input. Messaging does not compare request bodies—authorization and business idempotency belong to the caller.
+The same RunIdentity always means the same semantic run. Reuse it for retries and attachment; use a new runId for new input. Messaging does not compare request bodies—authorization and business idempotency belong to the caller.
 
 ## `after`
 

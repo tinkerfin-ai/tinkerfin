@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Never
 
 import pytest
 from sqlalchemy import event, inspect
 from sqlalchemy.engine import Connection
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
+import tinkerfin_sandbox
 from tinkerfin_sandbox import (
     SQLAlchemyOpenSandboxState,
     get_sqlalchemy_opensandbox_state_schema,
 )
+from tinkerfin_sandbox.lifecycle._sql_transactions import _SQLDialectCapabilities
 
 
 def _ddl_statements(ddl: str) -> tuple[str, ...]:
@@ -68,6 +72,251 @@ async def _reset_and_apply_exported_schema(mysql_url: str) -> None:
                 await connection.exec_driver_sql(statement)
     finally:
         await engine.dispose()
+
+
+@pytest.mark.docker_integration
+@pytest.mark.mysql_integration
+async def test_mysql57_fallback_restores_borrowed_session_lock_wait(
+    mysql_sandbox_url: str,
+) -> None:
+    engine = create_async_engine(
+        mysql_sandbox_url,
+        pool_size=2,
+        max_overflow=0,
+    )
+    state = SQLAlchemyOpenSandboxState(
+        engine=engine,
+        namespace="integration-mysql57-session-restore",
+        poll_interval=0.01,
+    )
+    try:
+        await state.start(warm_pool_size=0)
+        async with (
+            engine.connect() as first_connection,
+            engine.connect() as second_connection,
+        ):
+            await first_connection.exec_driver_sql(
+                "SET SESSION innodb_lock_wait_timeout = 37"
+            )
+            await second_connection.exec_driver_sql(
+                "SET SESSION innodb_lock_wait_timeout = 37"
+            )
+            await first_connection.rollback()
+            await second_connection.rollback()
+        state._capabilities = _SQLDialectCapabilities(
+            name="mysql",
+            server_version=(5, 7, 44),
+            supports_skip_locked=False,
+        )
+        claim = await state.acquire_owner("mysql57-owner")
+        await state.release_owner(claim)
+        await state.aclose()
+        async with (
+            engine.connect() as first_connection,
+            engine.connect() as second_connection,
+        ):
+            values = {
+                (
+                    await connection.exec_driver_sql(
+                        "SELECT @@SESSION.innodb_lock_wait_timeout"
+                    )
+                ).scalar_one()
+                for connection in (first_connection, second_connection)
+            }
+            assert values == {37}
+    finally:
+        await state.aclose()
+        await engine.dispose()
+
+
+async def _mysql_pool_connection_ids(engine: AsyncEngine) -> set[int]:
+    async with (
+        engine.connect() as first_connection,
+        engine.connect() as second_connection,
+    ):
+        return {
+            await connection.run_sync(
+                lambda sync_connection: id(sync_connection.connection.dbapi_connection)
+            )
+            for connection in (first_connection, second_connection)
+        }
+
+
+async def _mysql_pool_lock_wait_values(engine: AsyncEngine) -> set[int]:
+    async with (
+        engine.connect() as first_connection,
+        engine.connect() as second_connection,
+    ):
+        return {
+            int(
+                (
+                    await connection.exec_driver_sql(
+                        "SELECT @@SESSION.innodb_lock_wait_timeout"
+                    )
+                ).scalar_one()
+            )
+            for connection in (first_connection, second_connection)
+        }
+
+
+@pytest.mark.docker_integration
+@pytest.mark.mysql_integration
+async def test_mysql57_borrowed_settlement_restores_or_invalidates_session(
+    mysql_sandbox_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_async_engine(mysql_sandbox_url, pool_size=2, max_overflow=0)
+    state = SQLAlchemyOpenSandboxState(
+        engine=engine,
+        namespace="integration-mysql57-settlement",
+        poll_interval=0.01,
+    )
+    await state.start(warm_pool_size=0)
+    async with (
+        engine.connect() as first_connection,
+        engine.connect() as second_connection,
+    ):
+        for connection in (first_connection, second_connection):
+            await connection.exec_driver_sql(
+                "SET SESSION innodb_lock_wait_timeout = 37"
+            )
+            await connection.rollback()
+    state._capabilities = _SQLDialectCapabilities(
+        name="mysql",
+        server_version=(5, 7, 44),
+        supports_skip_locked=False,
+    )
+    failure = RuntimeError("borrowed MySQL operation failed")
+
+    async def fail_operation(_connection: AsyncConnection) -> Never:
+        raise failure
+
+    entered = asyncio.Event()
+
+    async def block_operation(_connection: AsyncConnection) -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    with pytest.raises(RuntimeError) as captured:
+        await state._run_write_transaction(fail_operation)
+    assert captured.value is failure
+    assert await _mysql_pool_lock_wait_values(engine) == {37}
+
+    operation = asyncio.create_task(state._run_write_transaction(block_operation))
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    operation.cancel("borrowed MySQL operation cancelled")
+    with pytest.raises(
+        asyncio.CancelledError,
+        match="borrowed MySQL operation cancelled",
+    ):
+        await operation
+    assert await _mysql_pool_lock_wait_values(engine) == {37}
+
+    original_ids = await _mysql_pool_connection_ids(engine)
+    state_type = type(state)
+    original_commit = state_type._commit_write_transaction
+    uncertainty = tinkerfin_sandbox.OpenSandboxStateCommitUncertainError(
+        "MySQL commit result unknown"
+    )
+
+    async def fail_commit(
+        _state: object,
+        _connection: AsyncConnection,
+        _disposition: object,
+    ) -> Never:
+        raise uncertainty
+
+    async def no_op(_connection: AsyncConnection) -> None:
+        return None
+
+    monkeypatch.setattr(state_type, "_commit_write_transaction", fail_commit)
+    try:
+        with pytest.raises(
+            tinkerfin_sandbox.OpenSandboxStateCommitUncertainError
+        ) as captured_uncertainty:
+            await state._run_write_transaction(no_op)
+        assert captured_uncertainty.value is uncertainty
+    finally:
+        monkeypatch.setattr(
+            state_type,
+            "_commit_write_transaction",
+            original_commit,
+        )
+    assert await _mysql_pool_connection_ids(engine) != original_ids
+
+    await state.aclose()
+    await engine.dispose()
+
+
+@pytest.mark.docker_integration
+@pytest.mark.mysql_integration
+async def test_mysql57_cancelled_failed_commit_invalidates_without_warning(
+    mysql_sandbox_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_async_engine(mysql_sandbox_url, pool_size=2, max_overflow=0)
+    state = SQLAlchemyOpenSandboxState(
+        engine=engine,
+        namespace="integration-mysql57-cancelled-commit",
+        poll_interval=0.01,
+    )
+    await state.start(warm_pool_size=0)
+    state._capabilities = _SQLDialectCapabilities(
+        name="mysql",
+        server_version=(5, 7, 44),
+        supports_skip_locked=False,
+    )
+    original_ids = await _mysql_pool_connection_ids(engine)
+    commit_entered = asyncio.Event()
+    release_commit = asyncio.Event()
+    original_commit = AsyncConnection.commit
+    loop = asyncio.get_running_loop()
+    original_exception_handler = loop.get_exception_handler()
+    loop_errors: list[dict[str, object]] = []
+
+    async def fail_commit(_connection: AsyncConnection) -> Never:
+        commit_entered.set()
+        await release_commit.wait()
+        raise OperationalError(
+            "COMMIT",
+            None,
+            RuntimeError("commit response failed"),
+            connection_invalidated=False,
+        )
+
+    async def no_op(_connection: AsyncConnection) -> None:
+        return None
+
+    def capture_loop_error(
+        _loop: asyncio.AbstractEventLoop,
+        context: dict[str, object],
+    ) -> None:
+        loop_errors.append(context)
+
+    monkeypatch.setattr(AsyncConnection, "commit", fail_commit)
+    loop.set_exception_handler(capture_loop_error)
+    operation = asyncio.create_task(state._run_write_transaction(no_op))
+    try:
+        await asyncio.wait_for(commit_entered.wait(), timeout=2)
+        operation.cancel("caller cancelled during MySQL commit")
+        release_commit.set()
+        with pytest.raises(
+            asyncio.CancelledError,
+            match="caller cancelled during MySQL commit",
+        ):
+            await operation
+        await asyncio.sleep(0)
+    finally:
+        release_commit.set()
+        if not operation.done():
+            operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
+        loop.set_exception_handler(original_exception_handler)
+        monkeypatch.setattr(AsyncConnection, "commit", original_commit)
+    assert await _mysql_pool_connection_ids(engine) != original_ids
+    assert loop_errors == []
+    await state.aclose()
+    await engine.dispose()
 
 
 @pytest.mark.mysql_integration

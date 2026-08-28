@@ -41,6 +41,13 @@ class _AgUiStreamDeadlineExceeded(TimeoutError):
 
 
 async def __anext__(self: AgUiEventStream) -> BaseEvent:
+    """Deliver one event under the stream's single-active-operation invariant.
+
+    Conversion, callback, and cleanup errors remain observable on ``stream.error``.
+    Caller cancellation stays cancellation and is annotated with any conversion or
+    retained cleanup evidence rather than being converted to a normal error event.
+    """
+
     if self._closed:
         raise StopAsyncIteration
     current = cast(asyncio.Task[object] | None, asyncio.current_task())
@@ -116,7 +123,7 @@ async def abort(self: AgUiEventStream) -> list[BaseEvent]:
     )
     await self._close(None, active=active_to_cancel)
 
-    tail = self._adapter.abort(code="cancelled")
+    tail = self._adapter.abort()
     if self._main_started:
         tail.append(
             self._decorate_initialization_event(
@@ -198,6 +205,13 @@ async def _close(
     *,
     active: asyncio.Task[object] | None = None,
 ) -> None:
+    """Join one retained cleanup task under the caller's settlement budget.
+
+    The timeout limits only this caller's wait and never cancels the owned cleanup.
+    A processing failure remains primary; cleanup failures become notes unless caller
+    cancellation outranks both outcomes.
+    """
+
     task = self._close_task
     if task is None:
         self._closed = True
@@ -290,6 +304,14 @@ async def _observe(self: AgUiEventStream, event: BaseEvent) -> None:
 
 
 async def _close_upstream(self: AgUiEventStream, primary: BaseException | None) -> None:
+    """Close Native parts once while preserving cancellation and secondary evidence.
+
+    A source may itself raise ``CancelledError`` during cleanup, so cancellation-count
+    deltas distinguish a fresh caller cancellation from a source-owned cleanup failure.
+    The method also imports a settled upstream Runtime error into the AG-UI failure
+    chain instead of letting transport cleanup hide it.
+    """
+
     if self._upstream_closed:
         return
     close = getattr(self._upstream, "aclose", None)
@@ -338,6 +360,18 @@ async def _close_upstream(self: AgUiEventStream, primary: BaseException | None) 
         raise
     else:
         self._upstream_closed = True
+        upstream_error = getattr(self._upstream, "error", None)
+        if isinstance(primary, asyncio.CancelledError) and isinstance(
+            upstream_error, Exception
+        ):
+            self.error = upstream_error
+            primary.add_note(
+                "AG-UI processing also failed: "
+                f"{type(upstream_error).__name__}: {upstream_error}"
+            )
+            for note in getattr(upstream_error, "__notes__", ()):
+                primary.add_note(note)
+                self._record_secondary_error_note(note)
 
 
 def _record_secondary_error_note(self: AgUiEventStream, note: str) -> None:

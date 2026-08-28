@@ -442,7 +442,7 @@ def test_conversation_routes_are_registered_with_the_locked_paths() -> None:
     assert "/api/conversation/history" in paths
     assert "/api/conversation/config" in paths
     assert "/api/conversation/{thread_id}/history" in paths
-    assert "/api/conversation/{thread_id}/events" in paths
+    assert "/api/conversation/{thread_id}/trace" in paths
     assert "/api/conversation/{thread_id}/runs/{run_id}/cancel" in paths
     history_parameters = paths["/api/conversation/history"]["get"]["parameters"]
     assert {
@@ -454,3 +454,11 @@ def test_conversation_routes_are_registered_with_the_locked_paths() -> None:
         "cursor",
         "query",
     }
+    detail_parameters = paths["/api/conversation/{thread_id}/history"]["get"][
+        "parameters"
+    ]
+    assert {
+        parameter["name"]
+        for parameter in detail_parameters
+        if parameter["in"] == "query"
+    } == {"historyCursor", "limit"}

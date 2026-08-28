@@ -9,11 +9,11 @@ from ag_ui.core import BaseEvent
 from langchain.agents.middleware.types import InputAgentState
 from langgraph.graph.state import CompiledStateGraph
 
-from tinkerfin import DeepAgentDefinition, Identity
+from tinkerfin import DeepAgentDefinition, RunIdentity
 
 
-def _identity() -> Identity:
-    return Identity(threadId="thread-1", runId="run-1")
+def _identity() -> RunIdentity:
+    return RunIdentity(threadId="thread-1", runId="run-1")
 
 
 def _graph_input() -> InputAgentState:

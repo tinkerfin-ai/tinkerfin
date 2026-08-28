@@ -1,60 +1,52 @@
-"""会话历史分页、详情和事实事件查询"""
+"""用户归属校验后的 Trace 历史分页与实时跟随"""
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
+import logging
+from collections.abc import AsyncGenerator
 from datetime import datetime
-from typing import NoReturn, cast
 
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
-    JsonValue,
+    TypeAdapter,
     ValidationError,
     field_validator,
 )
 
-from tinkerfin_messaging.errors import MessagingError, RunNotFound
 from tinkerfin_studio.api.errors import (
     BusinessException,
     ConversationErrorCode,
     SystemException,
 )
-from tinkerfin_studio.conversation.coordinator import (
-    ConversationProjectionCoordinator,
-)
-from tinkerfin_studio.conversation.models import ConversationEvent, ConversationThread
+from tinkerfin_studio.conversation.models import ConversationThread
 from tinkerfin_studio.conversation.repository import ConversationRepository
-from tinkerfin_studio.conversation.run_preparation import conversation_identity
 from tinkerfin_studio.conversation.schemas import (
-    ConversationEventEnvelope,
     ConversationHistoryDetail,
     ConversationHistoryGroupConfig,
     ConversationHistoryListItem,
     ConversationHistoryListResponse,
+    ConversationTraceErrorEvent,
+    ConversationTraceSnapshotEvent,
+    ConversationTraceUpdateEvent,
     PendingInteractionKind,
+)
+from tinkerfin_tracing import (
+    InvalidTraceCursor,
+    Tracer,
+    TraceThread,
+    TraceThreadNotFound,
+    TracingError,
 )
 
 _HISTORY_PAGE_SIZE_MAX = 100
 _HISTORY_DAY_RANGES = (7, 30)
-_EVENT_LIMIT_MAX = 1000
-_PROTOCOL_VERSION = "ag-ui-protocol@0.1.19"
-_SNAPSHOT_FIELDS = frozenset(
-    {
-        "snapshotSeq",
-        "messages",
-        "todos",
-        "mode",
-        "approval",
-        "runStatus",
-        "activeRunId",
-        "serverState",
-        "runs",
-        "interrupts",
-    }
-)
+logger = logging.getLogger(__name__)
+_PENDING_KIND = TypeAdapter(PendingInteractionKind | None)
 
 
 class _HistoryCursorPayload(BaseModel):
@@ -64,7 +56,7 @@ class _HistoryCursorPayload(BaseModel):
 
     pinned: bool = Field(description="游标行是否置顶")
     updated_at: datetime = Field(
-        alias="updatedAt", description="游标行的无时区最近会话活动时间"
+        alias="updatedAt", description="游标行的无时区最近 Trace 活动时间"
     )
     row_id: int = Field(alias="id", gt=0, description="游标行数据库主键")
     query: str | None = Field(
@@ -91,98 +83,31 @@ def _history_item(thread: ConversationThread) -> ConversationHistoryListItem:
         status=thread.status,
         lastRunId=thread.last_run_id,
         lastModel=thread.last_model,
-        lastSeq=thread.last_seq,
         messageCount=thread.message_count,
         toolCallCount=thread.tool_call_count,
         hasPendingInterrupt=thread.has_pending_interrupt,
-        pendingInteractionKind=_pending_interaction_kind(thread),
+        pendingInteractionKind=_PENDING_KIND.validate_python(
+            thread.pending_interaction_kind
+        ),
         pinned=thread.pinned,
         createdAt=thread.created_at,
         updatedAt=thread.updated_at,
     )
 
 
-def _history_schema_mismatch(reason: str) -> NoReturn:
-    raise SystemException(
-        ConversationErrorCode.HISTORY_SCHEMA_MISMATCH
-    ) from ValueError(reason)
-
-
-def _validated_snapshot(thread: ConversationThread) -> dict[str, JsonValue] | None:
-    snapshot = thread.snapshot_json
-    if snapshot is None:
-        if thread.snapshot_seq != 0:
-            _history_schema_mismatch(
-                f"empty snapshot with snapshot_seq={thread.snapshot_seq}"
-            )
-        return None
-    if set(snapshot) != _SNAPSHOT_FIELDS:
-        _history_schema_mismatch("snapshot fields do not match the current contract")
-    if snapshot.get("snapshotSeq") != thread.snapshot_seq:
-        _history_schema_mismatch("snapshot JSON sequence does not match snapshot_seq")
-    return cast(dict[str, JsonValue], snapshot)
-
-
-def _pending_interaction_kind(
-    thread: ConversationThread,
-) -> PendingInteractionKind | None:
-    """从当前可信快照生成历史列表使用的待处理交互类型"""
-
-    if not thread.has_pending_interrupt:
-        return None
-    snapshot = _validated_snapshot(thread)
-    if snapshot is None:
-        _history_schema_mismatch("pending interrupt requires a current snapshot")
-    raw_interrupts = snapshot.get("interrupts")
-    if not isinstance(raw_interrupts, list) or not raw_interrupts:
-        _history_schema_mismatch("pending interrupt summary requires interrupts")
-    reasons: list[str] = []
-    for raw_interrupt in raw_interrupts:
-        if not isinstance(raw_interrupt, dict):
-            _history_schema_mismatch("snapshot interrupt must be an object")
-        reason = raw_interrupt.get("reason")
-        if not isinstance(reason, str):
-            _history_schema_mismatch("snapshot interrupt reason must be a string")
-        reasons.append(reason)
-    unique_reasons = set(reasons)
-    if unique_reasons == {"tool_call"}:
-        return "tool_approval"
-    if len(reasons) == 1 and reasons[0] == "tinkerfin:plan_clarification":
-        return "plan_clarification"
-    if len(reasons) == 1 and reasons[0] == "tinkerfin:plan_review":
-        return "plan_review"
-    _history_schema_mismatch("pending interrupt reasons do not form one interaction")
-
-
-def _event_envelope(event: ConversationEvent) -> ConversationEventEnvelope:
-    if event.protocol_version != _PROTOCOL_VERSION:
-        _history_schema_mismatch(
-            f"event protocol_version={event.protocol_version!r}, "
-            f"expected={_PROTOCOL_VERSION!r}"
-        )
-    return ConversationEventEnvelope(
-        seq=event.seq,
-        eventId=event.event_id,
-        eventType=event.event_type,
-        runId=event.run_id,
-        event=cast(JsonValue, event.event_json),
-        createdAt=event.created_at,
-    )
-
-
 class ConversationHistoryService:
-    """查询前先追赶 Redis 事实日志的会话历史服务"""
+    """从 Studio 读取归属与摘要，从 Trace 读取唯一会话正文"""
 
     def __init__(
         self,
         repository: ConversationRepository,
         *,
         user_id: int,
-        projector: ConversationProjectionCoordinator,
+        tracer: Tracer,
     ) -> None:
         self._repository = repository
         self._user_id = user_id
-        self._projector = projector
+        self._tracer = tracer
 
     async def list_history(
         self,
@@ -191,7 +116,7 @@ class ConversationHistoryService:
         cursor: str | None,
         query: str | None = None,
     ) -> ConversationHistoryListResponse:
-        """按标题查询、置顶和最近会话活动时间稳定分页"""
+        """按标题查询、置顶和最近 Trace 活动时间稳定分页"""
 
         resolved_query = (query.strip() or None) if query is not None else None
         resolved = self._decode_cursor(cursor, query=resolved_query)
@@ -220,87 +145,138 @@ class ConversationHistoryService:
 
         return ConversationHistoryGroupConfig(dayRanges=list(_HISTORY_DAY_RANGES))
 
-    async def get_detail(self, thread_id: str) -> ConversationHistoryDetail:
-        """追赶事件后返回可信快照和尾部"""
-
-        thread = await self._require_thread(thread_id)
-        await self._reconcile(thread)
-        refreshed = await self._require_thread(thread_id, reload=True)
-        snapshot = _validated_snapshot(refreshed)
-        events = await self._repository.list_events(
-            thread_pk=refreshed.id,
-            after_seq=refreshed.snapshot_seq,
-            limit=_EVENT_LIMIT_MAX,
-        )
-        return ConversationHistoryDetail(
-            id=refreshed.id,
-            threadId=refreshed.thread_id,
-            title=refreshed.title,
-            status=refreshed.status,
-            lastRunId=refreshed.last_run_id,
-            lastModel=refreshed.last_model,
-            lastSeq=refreshed.last_seq,
-            snapshotSeq=refreshed.snapshot_seq,
-            messageCount=refreshed.message_count,
-            toolCallCount=refreshed.tool_call_count,
-            hasPendingInterrupt=refreshed.has_pending_interrupt,
-            pendingInteractionKind=_pending_interaction_kind(refreshed),
-            pinned=refreshed.pinned,
-            snapshot=snapshot,
-            events=[_event_envelope(event) for event in events],
-            createdAt=refreshed.created_at,
-            updatedAt=refreshed.updated_at,
-        )
-
-    async def list_events(
+    async def get_detail(
         self,
-        *,
         thread_id: str,
-        after_seq: int | None,
+        *,
+        history_cursor: str | None = None,
+        limit: int = 100,
+    ) -> ConversationHistoryDetail:
+        """返回一个固定 as-of、可继续向前扩展的 Trace 视图"""
+
+        thread, trace = await self._load_trace(
+            thread_id,
+            history_cursor=history_cursor,
+            limit=limit,
+        )
+        detail = await self._detail(thread=thread, trace=trace)
+        await self._repository.commit()
+        return detail
+
+    async def follow_trace(
+        self,
+        thread_id: str,
+    ) -> AsyncGenerator[
+        ConversationTraceSnapshotEvent
+        | ConversationTraceUpdateEvent
+        | ConversationTraceErrorEvent,
+        None,
+    ]:
+        """先返回权威快照，再按框架顺序跟随同一 generation 的语义增量"""
+
+        thread, trace = await self._load_trace(
+            thread_id,
+            history_cursor=None,
+            limit=100,
+        )
+        detail = await self._detail(thread=thread, trace=trace)
+        # 归属和 Run 配置已固定到 snapshot；长流开始前归还业务连接
+        await self._repository.commit()
+
+        async def events() -> AsyncGenerator[
+            ConversationTraceSnapshotEvent
+            | ConversationTraceUpdateEvent
+            | ConversationTraceErrorEvent,
+            None,
+        ]:
+            yield ConversationTraceSnapshotEvent(snapshot=detail)
+            updates = trace.follow()
+            try:
+                async for update in updates:
+                    yield ConversationTraceUpdateEvent(update=update)
+            except asyncio.CancelledError:
+                raise
+            except TracingError as error:
+                logger.error(
+                    "Trace follow 异常结束: thread_id=%s",
+                    thread.thread_id,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+                yield ConversationTraceErrorEvent()
+            finally:
+                await updates.aclose()
+
+        return events()
+
+    async def _load_trace(
+        self,
+        thread_id: str,
+        *,
+        history_cursor: str | None,
         limit: int,
-    ) -> list[ConversationEventEnvelope]:
-        """追赶后返回指定序号之后的连续事件"""
+    ) -> tuple[ConversationThread, TraceThread]:
+        """释放业务事务后读取借用 Engine 上的框架 Trace Store"""
 
         thread = await self._require_thread(thread_id)
-        await self._reconcile(thread)
-        events = await self._repository.list_events(
-            thread_pk=thread.id,
-            after_seq=after_seq or 0,
-            limit=min(max(limit, 1), _EVENT_LIMIT_MAX),
-        )
-        return [_event_envelope(event) for event in events]
-
-    async def _reconcile(self, thread: ConversationThread) -> None:
-        thread_pk = thread.id
-        identity = conversation_identity(
-            thread.thread_id,
-            thread.last_run_id or "projection-read",
-        )
-        # 归属查询完成后释放隐式只读事务，再读取 Messaging 事实日志
+        head_run_id = thread.last_run_id
+        if head_run_id is None:
+            raise SystemException(ConversationErrorCode.TRACE_UNAVAILABLE)
+        # Trace Store 使用独立事务；先结束归属查询，避免一个请求同时占用两条共享池连接
         await self._repository.commit()
         try:
-            await self._projector.reconcile(
-                thread_pk=thread_pk,
-                identity=identity,
+            trace = await self._tracer.get(
+                thread.thread_id,
+                head_run_id=None if history_cursor is not None else head_run_id,
+                history_cursor=history_cursor,
+                limit=min(max(limit, 1), _HISTORY_PAGE_SIZE_MAX),
             )
-        except RunNotFound:
-            return
-        except MessagingError as error:
-            raise SystemException(
-                ConversationErrorCode.EVENT_PROJECTION_UNAVAILABLE
-            ) from error
+        except InvalidTraceCursor as error:
+            raise BusinessException(ConversationErrorCode.INVALID_CURSOR) from error
+        except (TraceThreadNotFound, TracingError) as error:
+            raise SystemException(ConversationErrorCode.TRACE_UNAVAILABLE) from error
+        return thread, trace
 
-    async def _require_thread(
+    async def _detail(
         self,
-        thread_id: str,
         *,
-        reload: bool = False,
-    ) -> ConversationThread:
-        if reload:
-            query = self._repository.reload_thread
-        else:
-            query = self._repository.get_thread
-        thread = await query(user_id=self._user_id, thread_id=thread_id)
+        thread: ConversationThread,
+        trace: TraceThread,
+    ) -> ConversationHistoryDetail:
+        registration = await self._repository.get_run(
+            thread_pk=thread.id,
+            run_id=trace.head_run_id,
+        )
+        if registration is None:
+            raise SystemException(ConversationErrorCode.TRACE_UNAVAILABLE)
+        return ConversationHistoryDetail(
+            id=thread.id,
+            threadId=thread.thread_id,
+            title=thread.title,
+            lastModel=registration.model_id,
+            runtimeProfile=registration.runtime_profile,
+            pinned=thread.pinned,
+            asOfSeq=trace.as_of_seq,
+            headRunId=trace.head_run_id,
+            availableHeads=trace.available_heads,
+            historyCursor=trace.history_cursor,
+            messageCount=trace.message_count,
+            toolCallCount=trace.tool_call_count,
+            messages=trace.messages,
+            reasoning=trace.reasoning,
+            nodes=trace.tree.nodes,
+            state=trace.state,
+            interactions=trace.interactions,
+            status=trace.status,
+            completeness=trace.completeness,
+            createdAt=thread.created_at,
+            updatedAt=thread.updated_at,
+        )
+
+    async def _require_thread(self, thread_id: str) -> ConversationThread:
+        thread = await self._repository.get_thread(
+            user_id=self._user_id,
+            thread_id=thread_id,
+        )
         if thread is None:
             raise BusinessException(ConversationErrorCode.NOT_FOUND)
         return thread

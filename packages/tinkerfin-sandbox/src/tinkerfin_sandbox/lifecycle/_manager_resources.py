@@ -52,7 +52,7 @@ if TYPE_CHECKING:
     from .manager import OpenSandboxManager
 
 KeyT = TypeVar("KeyT")
-logger = logging.getLogger("tinkerfin_sandbox.lifecycle.manager")
+logger = logging.getLogger("tinkerfin.sandbox.lifecycle")
 
 
 _ManagedBackend = OpenSandboxHandle | RootedOpenSandboxBackend
@@ -198,8 +198,7 @@ async def _is_backend_healthy(
             self._client.config.health_command,
         )
         return response.exit_code == 0
-    except Exception:
-        logger.info("Sandbox %s health check failed", backend.id, exc_info=True)
+    except Exception:  # noqa: BLE001 - health failures mean unhealthy
         return False
 
 
@@ -209,32 +208,28 @@ async def _renew_backend(
     """Best-effort renewal without invalidating an otherwise healthy handle."""
     try:
         await backend.arenew(self._client.config.ttl)
-    except Exception:
-        logger.warning("Failed to renew Sandbox %s", backend.id, exc_info=True)
+    except Exception:  # noqa: BLE001 - lease renewal is best effort
+        pass
 
 
 async def _close_backend(
-    self: OpenSandboxManager[KeyT], backend: OpenSandboxBackend
+    backend: OpenSandboxBackend,
 ) -> None:
     """Best-effort local closure that does not mask the primary result."""
     try:
         await backend.aclose()
-    except Exception:
-        logger.warning(
-            "Failed to close local resources for Sandbox %s",
-            backend.id,
-            exc_info=True,
-        )
+    except Exception:  # noqa: BLE001 - local close is best effort
+        pass
 
 
 async def _close_handle(
-    self: OpenSandboxManager[KeyT], handle: OpenSandboxHandle
+    handle: OpenSandboxHandle,
 ) -> None:
     """Retire a handle and close its local backend through the manager."""
     try:
         await handle._aclose_from_manager()
-    except Exception:
-        logger.warning("Failed to close Sandbox handle %s", handle.id, exc_info=True)
+    except Exception:  # noqa: BLE001 - handle close is best effort
+        pass
 
 
 def _track_cleanup_task(
@@ -348,15 +343,10 @@ async def _destroy_remote(
             ) from exc
         try:
             await self._state.enqueue_cleanup(sandbox_id)
-        except Exception:
-            logger.error(
-                "Failed to persist cleanup work for Sandbox %s",
-                sandbox_id,
-                exc_info=True,
-            )
+        except Exception:  # noqa: BLE001 - cleanup persistence is best effort
+            pass
         else:
             self._cleanup_wakeup.set()
-        logger.warning("Failed to destroy remote Sandbox %s", sandbox_id, exc_info=True)
 
 
 async def _drain_cleanup_queue(self: OpenSandboxManager[KeyT]) -> bool:
@@ -373,13 +363,13 @@ async def _drain_cleanup_queue(self: OpenSandboxManager[KeyT]) -> bool:
             except asyncio.CancelledError:
                 pass
             raise cancellation
-        except Exception:
-            logger.warning(
-                "Failed to clean up orphan Sandbox %s",
-                claim.sandbox_id,
-                exc_info=True,
-            )
+        except Exception as error:  # noqa: BLE001 - cleanup claim owner classifies failure
+            error_type = type(error).__name__
             await self._release_cleanup_claim(claim)
+            logger.warning(
+                "Sandbox orphan cleanup failed",
+                extra={"tinkerfin_error_type": error_type},
+            )
             return True
         await self._state.complete_cleanup(claim)
 
@@ -483,9 +473,10 @@ async def _cleanup_queue_loop(
             retry_pending = await self._drain_cleanup_queue()
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as error:  # noqa: BLE001 - cleanup supervisor owns retry
             logger.error(
-                "Failed to consume the OpenSandbox cleanup queue", exc_info=True
+                "Sandbox cleanup queue failed",
+                extra={"tinkerfin_error_type": type(error).__name__},
             )
             retry_pending = True
         if retry_pending:
@@ -514,6 +505,7 @@ async def _fill_warm_pool(
     self: OpenSandboxManager[KeyT], *, fail_on_error: bool = False
 ) -> None:
     """Claim and fill global warm slots through State."""
+    failure_type: str | None = None
     async with self._warm_fill_lock:
         while True:
             if self._closed:
@@ -531,13 +523,13 @@ async def _fill_warm_pool(
                 if backend is not None:
                     await self._cleanup_owned_backend(backend, destroy=True)
                 raise
-            except Exception:
-                logger.warning("Failed to create a warm Sandbox", exc_info=True)
+            except Exception as error:
                 if backend is not None:
                     await self._cleanup_owned_backend(backend, destroy=True)
                 if fail_on_error:
                     raise
-                return
+                failure_type = type(error).__name__
+                break
             finally:
                 if not published:
                     release_task = asyncio.create_task(
@@ -548,6 +540,12 @@ async def _fill_warm_pool(
 
             async with self._warm_lock:
                 self._warm_backends.append(backend)
+    # Host logging handlers can block. Never invoke them while the ownership lock is held.
+    if failure_type is not None:
+        logger.warning(
+            "Sandbox warm-pool creation failed",
+            extra={"tinkerfin_error_type": failure_type},
+        )
 
 
 def _schedule_replenish(self: OpenSandboxManager[KeyT]) -> None:
@@ -626,12 +624,7 @@ async def _acquire_backend(
             except asyncio.CancelledError:
                 self._schedule_replenish()
                 raise
-            except Exception:
-                logger.info(
-                    "Failed to reconnect warm Sandbox %s; creating on demand",
-                    binding.sandbox_id,
-                    exc_info=True,
-                )
+            except Exception:  # noqa: BLE001 - failed reconnect consumes the warm slot
                 continue
         try:
             healthy = await self._check_owned_backend(
@@ -648,7 +641,6 @@ async def _acquire_backend(
                 consumed_warm_slot=True,
                 retire_after_commit_ids=tuple(retire_after_commit_ids),
             )
-        logger.info("Replacing unhealthy warm Sandbox %s", backend.id)
         try:
             await self._cleanup_owned_backend(backend, destroy=False)
         except asyncio.CancelledError:
@@ -668,13 +660,11 @@ async def _close_resources(self: OpenSandboxManager[KeyT]) -> None:
         try:
             await start_task
         except asyncio.CancelledError:
-            logger.info(
-                "Sandbox manager startup was cancelled; closing owned resources"
-            )
-        except Exception:
-            logger.warning(
-                "Failed while awaiting Sandbox manager startup", exc_info=True
-            )
+            pass
+        except Exception:  # noqa: BLE001 - caller-visible startup already owns failure
+            # Strict startup already reports this failure to its caller. Closing must not
+            # create a second package-owned record for the same outcome.
+            pass
 
     await self._operations_done.wait()
 
@@ -691,9 +681,10 @@ async def _close_resources(self: OpenSandboxManager[KeyT]) -> None:
     if replenish_task is not None:
         try:
             await replenish_task
-        except Exception:
+        except Exception as error:  # noqa: BLE001 - replenish task is supervisor-owned
             logger.warning(
-                "Failed while awaiting warm-pool replenishment", exc_info=True
+                "Sandbox warm-pool replenishment failed",
+                extra={"tinkerfin_error_type": type(error).__name__},
             )
     self._replenish_task = None
 
@@ -717,11 +708,10 @@ async def _close_resources(self: OpenSandboxManager[KeyT]) -> None:
             continue
         try:
             backend = await handle._aretire()
-        except Exception:
+        except Exception as error:  # noqa: BLE001 - close supervisor owns retirement
             logger.warning(
-                "Failed to retire process-local Sandbox handle %s",
-                handle.id,
-                exc_info=True,
+                "Sandbox process-local handle retirement failed",
+                extra={"tinkerfin_error_type": type(error).__name__},
             )
             continue
         await self._dispose_backend(backend)
@@ -731,8 +721,11 @@ async def _close_resources(self: OpenSandboxManager[KeyT]) -> None:
     if self._started:
         try:
             shutdown_ids.update(await self._state.shutdown_sandbox_ids())
-        except Exception:
-            logger.warning("Failed to read State shutdown resources", exc_info=True)
+        except Exception as error:  # noqa: BLE001 - close supervisor owns State lookup
+            logger.warning(
+                "Sandbox State shutdown lookup failed",
+                extra={"tinkerfin_error_type": type(error).__name__},
+            )
     for pending in self._pending_destroy_ids.values():
         shutdown_ids.update(pending)
     for sandbox_id in shutdown_ids - destroyed_ids:
@@ -741,9 +734,15 @@ async def _close_resources(self: OpenSandboxManager[KeyT]) -> None:
 
     try:
         await self._state.aclose()
-    except Exception:
-        logger.warning("Failed to close OpenSandbox State", exc_info=True)
+    except Exception as error:  # noqa: BLE001 - close supervisor owns State closure
+        logger.warning(
+            "Sandbox State close failed",
+            extra={"tinkerfin_error_type": type(error).__name__},
+        )
     try:
         await self._client.aclose()
-    except Exception:
-        logger.warning("Failed to close OpenSandbox client", exc_info=True)
+    except Exception as error:  # noqa: BLE001 - close supervisor owns client closure
+        logger.warning(
+            "Sandbox client close failed",
+            extra={"tinkerfin_error_type": type(error).__name__},
+        )

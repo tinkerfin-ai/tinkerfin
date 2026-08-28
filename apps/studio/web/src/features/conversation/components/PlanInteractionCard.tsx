@@ -3,6 +3,7 @@ import { useId, useRef, type ReactNode, type RefObject } from 'react'
 
 import { IconButton } from '../../../components/ui'
 import { ActivityDots } from './ActivityDots'
+import { InteractionCardColorBridge } from './InteractionCardColorBridge'
 import { InteractionCardResizeHandle } from './InteractionCardResizeHandle'
 
 type PlanInteractionKind = 'question' | 'review'
@@ -51,6 +52,7 @@ export function PlanInteractionCard({
   kind,
   ariaLabel,
   minimized,
+  collapsible = true,
   icon,
   title,
   titleMeta,
@@ -66,13 +68,14 @@ export function PlanInteractionCard({
   kind: PlanInteractionKind
   ariaLabel: string
   minimized: boolean
+  collapsible?: boolean
   icon: ReactNode
   title: ReactNode
   titleMeta?: ReactNode
-  description: ReactNode
-  toggleSurfaceLabel: string
-  toggleLabel: string
-  onToggle: () => void
+  description?: ReactNode
+  toggleSurfaceLabel?: string
+  toggleLabel?: string
+  onToggle?: () => void
   bodyRef: RefObject<HTMLDivElement | null>
   headerAction?: ReactNode
   minimizedContent?: ReactNode
@@ -81,9 +84,7 @@ export function PlanInteractionCard({
   const namespace = namespaceFor(kind)
   const cardId = useId()
   const cardRef = useRef<HTMLElement>(null)
-  const toggleSurfaceClass = kind === 'question'
-    ? 'plan-question-toggle-surface'
-    : 'plan-review-toggle-surface'
+  const toggleSurfaceClass = 'plan-question-toggle-surface'
   return (
     <section
       ref={cardRef}
@@ -107,34 +108,43 @@ export function PlanInteractionCard({
     >
       {!minimized && <InteractionCardResizeHandle cardRef={cardRef} controls={cardId} />}
       <header className={`plan-interaction-card-head ${namespace}-head`}>
-        <button
-          type="button"
-          className={`plan-interaction-toggle-surface ${toggleSurfaceClass}`}
-          aria-label={toggleSurfaceLabel}
-          aria-expanded={!minimized}
-          onClick={onToggle}
-        />
+        {collapsible && toggleSurfaceLabel && onToggle && (
+          <button
+            type="button"
+            className={`plan-interaction-toggle-surface ${toggleSurfaceClass}`}
+            aria-label={toggleSurfaceLabel}
+            aria-expanded={!minimized}
+            onClick={onToggle}
+          />
+        )}
         <div className={`plan-interaction-card-heading ${namespace}-heading`}>
           <h2>
             {icon}
             <span>{title}</span>
             {titleMeta && <small>{titleMeta}</small>}
           </h2>
-          <p>{description}</p>
+          {description && <p>{description}</p>}
         </div>
-        <div className={`plan-interaction-card-head-actions ${namespace}-head-actions`}>
-          <IconButton
-            size="sm"
-            className={`plan-interaction-card-head-button ${namespace}-head-button`}
-            label={toggleLabel}
-            tooltip={toggleLabel}
-            icon={minimized ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
-            aria-expanded={!minimized}
-            onClick={onToggle}
-          />
-          {headerAction}
-        </div>
+        {(collapsible || headerAction) && (
+          <div className={`plan-interaction-card-head-actions ${namespace}-head-actions`}>
+            {collapsible && toggleLabel && onToggle && (
+              <IconButton
+                size="sm"
+                className={`plan-interaction-card-head-button ${namespace}-head-button`}
+                label={toggleLabel}
+                tooltip={toggleLabel}
+                icon={minimized ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                aria-expanded={!minimized}
+                onClick={onToggle}
+              />
+            )}
+            {headerAction}
+          </div>
+        )}
       </header>
+      {!minimized && (
+        <InteractionCardColorBridge tone={kind === 'question' ? 'plan' : 'warning'} />
+      )}
       {minimized ? minimizedContent : children}
     </section>
   )

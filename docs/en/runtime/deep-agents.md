@@ -8,7 +8,7 @@ This guide starts with the settings most applications need, then covers the opti
 
 ```python
 from langgraph.checkpoint.memory import MemorySaver
-from tinkerfin import Identity, TinkerFin
+from tinkerfin import RunIdentity, TinkerFin
 
 
 tinkerfin = TinkerFin()
@@ -95,7 +95,7 @@ Selecting Plan requires a concrete `BaseCheckpointSaver` and an explicit Planner
 TinkerFin never creates an in-process saver or silently weakens durability. Production
 applications must provide a production-grade saver. Planning and the native Deep Agent
 borrow the same saver, Store, cache, backend, and runtime context. Keep the same
-`Identity.threadId` when resuming. Plan state appears at the root `tinkerfin_plan` key;
+`RunIdentity.threadId` when resuming. Plan state appears at the root `tinkerfin_plan` key;
 `PlanContentModel`, the built-in structured and Markdown content types, `PlanDraft`,
 `ConfirmedPlan`, `PlanHandoff`, and `PlanState` are exported from `tinkerfin.plan`.
 
@@ -149,12 +149,12 @@ derives trusted option labels, canonicalizes answer order, and retains explicit 
 Planner context.
 
 Use `clarification_type(...)` to register a host-defined semantic answer type. One frozen
-descriptor supplies its versioned namespaced ID, model-facing description, Question and
+descriptor supplies its unversioned namespaced ID, model-facing description, Question and
 Response models, optional per-question Schema and validator, and a canonical JSON
 normalizer. All callbacks are synchronous, deterministic, and free of external I/O. A
-host client must provide a renderer for every custom type included in its Form. Any
-change to per-question Schema, validation, or normalization semantics requires a new
-type ID version.
+host client must provide a renderer for every custom type included in its Form. The
+Definition fingerprint fixes the exact current Schema and callbacks; incompatible stored
+data is rebuilt instead of introducing another type-ID version.
 
 When `PlanReviewAction.EDIT` is configured, a complete user edit is authoritative. The
 Planner either asks for missing information or accepts that exact edit; it cannot
@@ -168,11 +168,11 @@ Choose the current request on Runtime creation:
 
 ```python
 plan_runtime = agent.new(
-    identity=Identity(threadId="project-7", runId="run-1"),
+    identity=RunIdentity(threadId="project-7", runId="run-1"),
     mode="plan",
 )
 default_runtime = agent.new_agui(
-    identity=Identity(threadId="project-7", runId="run-2"),
+    identity=RunIdentity(threadId="project-7", runId="run-2"),
     mode="default",
 )
 ```
@@ -186,7 +186,7 @@ routed to Planning, while Tool and subagent resumes go directly to the native Gr
 
 ```python
 runtime = agent.new(
-    identity=Identity(threadId="project-7", runId="run-1"),
+    identity=RunIdentity(threadId="project-7", runId="run-1"),
     mode="default",
     on_part=None,
 )
@@ -214,17 +214,17 @@ stream = runtime.astream(
 | `config` | `None` | Thread, tags, metadata, recursion limits, and other run configuration |
 | `context` | `None` | Runtime context matching `context_schema` |
 
-You normally omit `configurable.thread_id`. An explicitly equal value is accepted; a value different from `Identity.threadId` fails before Graph iteration, observers, or coordination begin.
+You normally omit `configurable.thread_id`. An explicitly equal value is accepted; a value different from `RunIdentity.threadId` fails before Graph iteration, observers, or coordination begin.
 
 ### Output controls
 
 | Parameter | Default | Purpose |
 | --- | --- | --- |
-| `stream_mode` | `None` | Selects `values`, `updates`, `messages`, `tasks`, or another supported mode |
+| `stream_mode` | Profile-owned | Required semantic modes are always present; supported extra modes may be added |
 | `print_mode` | `()` | Prints extra modes without changing yielded data |
-| `output_keys` | `None` | Limits state output to selected keys |
-| `subgraphs` | `False` | Includes subgraph output when true |
-| `version` | forced to `"v2"` | Explicit v1 is rejected before Graph iteration |
+| `output_keys` | Profile-owned | Must preserve the Profile's complete state contract |
+| `subgraphs` | Profile-owned | Preserves the Profile's complete graph scope |
+| `version` | Profile-owned | A conflicting upstream version is rejected before Graph iteration |
 | `debug` | `None` | Overrides debugging for this run |
 
 ### Interrupt and durability controls
@@ -237,7 +237,8 @@ You normally omit `configurable.thread_id`. An explicitly equal value is accepte
 | `control` | `None` | Supplies LangGraph run control data |
 | Extra keyword arguments | none | Current additional LangGraph run options |
 
-Use `stream_mode="values"` when you mainly need state snapshots. To inspect the complete native v2 run, combine `messages`, `tasks`, and `values` with `subgraphs=True`.
+The required profile supplies complete Runtime and Trace semantics. Add `updates`,
+`checkpoints`, `debug`, or `custom` only when the consumer also needs those modes.
 
 ## Observe every part
 
@@ -261,7 +262,7 @@ The Runtime is single-use. Call `agent.new()` again.
 
 ### The conversation does not continue
 
-Make sure the agent has a checkpointer and later runs use the same `Identity.threadId`.
+Make sure the agent has a checkpointer and later runs use the same `RunIdentity.threadId`.
 
 ### An asynchronous server pauses while creating the Runtime
 

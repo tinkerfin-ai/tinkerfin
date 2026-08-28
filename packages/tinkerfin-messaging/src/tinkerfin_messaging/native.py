@@ -2,39 +2,70 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from typing import ClassVar
 
-from tinkerfin import NativeStreamPart as NativeStreamPart
-from tinkerfin.native import normalize_native_stream_part
+from tinkerfin_native_stream import NativeStreamPart as NativeStreamPart
 
 from .protocols import MessageCodec, SseRenderer
 
 
 class NativeStreamPartCodec(
-    MessageCodec[Mapping[str, object], NativeStreamPart],
+    MessageCodec[NativeStreamPart, NativeStreamPart],
     SseRenderer[NativeStreamPart],
 ):
-    """Persist verified LangGraph v2 envelopes using TinkerFin's native schema."""
+    """Persist a Driver-owned canonical TinkerFin Native replay envelope.
 
-    codec_id: ClassVar[str] = "langgraph.stream-part.v2"
-    messaging_source_type: ClassVar[type[Mapping[str, object]]] = Mapping
+    The codec intentionally accepts only ``NativeStreamPart``. Live Deep Agents or
+    LangGraph mappings must first pass through the selected Runtime Profile; parsing
+    them here would bind Messaging to one upstream stream version.
+    """
+
+    codec_id: ClassVar[str] = "tinkerfin.native-stream"
+    messaging_source_type: ClassVar[type[NativeStreamPart]] = NativeStreamPart
     messaging_replay_type: ClassVar[type[NativeStreamPart]] = NativeStreamPart
 
-    def encode(self, item: Mapping[str, object]) -> bytes:
-        """Validate a live envelope and encode its canonical finite form."""
+    def encode(self, item: NativeStreamPart) -> bytes:
+        """Encode one immutable finite frame without reparsing an upstream object.
 
-        return (
-            normalize_native_stream_part(item).model_dump_json(by_alias=True).encode()
-        )
+        Args:
+            item: Canonical replay model produced by a Runtime Profile.
+
+        Returns:
+            UTF-8 JSON bytes in the current Native replay shape.
+
+        Raises:
+            TypeError: ``item`` is not a ``NativeStreamPart``.
+        """
+
+        if not isinstance(item, NativeStreamPart):
+            raise TypeError("Native codec input must be a NativeStreamPart")
+        return item.model_dump_json(by_alias=True).encode()
 
     def decode(self, payload: bytes) -> NativeStreamPart:
-        """Validate one persisted native stream representation."""
+        """Validate one persisted native stream representation.
+
+        Args:
+            payload: UTF-8 JSON bytes previously committed under this codec ID.
+
+        Returns:
+            A new immutable canonical replay model.
+
+        Raises:
+            ValidationError: JSON or the current Native replay contract is invalid.
+        """
 
         return NativeStreamPart.model_validate_json(payload)
 
     def render(self, *, seq: int, payload: NativeStreamPart) -> bytes:
-        """Render one replay part as a typed SSE event."""
+        """Render one replay part as a typed SSE event.
+
+        Args:
+            seq: Positive durable Messaging sequence used as the SSE ID.
+            payload: Validated canonical Native replay model.
+
+        Returns:
+            One complete UTF-8 SSE frame with ``event: stream-part``.
+        """
 
         encoded = payload.model_dump_json(by_alias=True).encode()
         return (

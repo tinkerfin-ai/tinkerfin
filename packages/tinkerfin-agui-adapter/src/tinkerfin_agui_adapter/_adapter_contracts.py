@@ -15,12 +15,12 @@ __all__ = [
 ]
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Annotated, Literal, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 from ag_ui.core import Interrupt as AgUiInterrupt
-from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -28,10 +28,10 @@ from pydantic import (
     JsonValue,
     RootModel,
     ValidationError,
-    field_validator,
 )
 from pydantic.alias_generators import to_camel
-from pydantic_core import PydanticCustomError
+
+from tinkerfin_native_stream import NativeValuesStreamPart
 
 from .errors import HitlCorrelationError, HitlNoMatchError
 from .hitl import (
@@ -87,175 +87,6 @@ def _to_json_value(value: object) -> JsonValue:
     return to_json_value(value)
 
 
-class StreamMetadata(_ProtocolModel):
-    """Metadata fields used to classify a Deep Agents message part."""
-
-    model_config = ConfigDict(extra="allow")
-
-    lc_agent_name: str | None = Field(
-        default=None, description="Agent name recorded by LangChain"
-    )
-    langgraph_node: str | None = Field(
-        default=None, description="LangGraph node that emitted the current event"
-    )
-
-
-class MessageStreamData(_ProtocolModel):
-    """Validated payload of a v2 `messages` stream part."""
-
-    message: BaseMessage = Field(description="Message object from the stream output")
-    metadata: StreamMetadata = Field(
-        description="LangGraph metadata associated with the message"
-    )
-
-    @field_validator("message", mode="before")
-    @classmethod
-    def validate_native_message(cls, value: object) -> object:
-        """Require a supported live LangChain message rather than serialized data."""
-
-        if not isinstance(value, (AIMessage, ToolMessage)):
-            raise PydanticCustomError(
-                "messages_native_object",
-                "messages stream data must contain a live AIMessage or ToolMessage",
-            )
-        return value
-
-
-class MessageStreamPart(_ProtocolModel):
-    """Validated v2 `messages` envelope consumed by the adapter."""
-
-    type: Literal["messages"] = Field(description="Stream-part type, fixed to messages")
-    ns: tuple[str, ...] = Field(
-        strict=True,
-        description="Subgraph namespace that owns this stream part",
-    )
-    data: MessageStreamData = Field(description="Message stream-part payload")
-
-    @field_validator("data", mode="before")
-    @classmethod
-    def validate_message_data(cls, value: object) -> object:
-        """Name and validate the native message-and-metadata pair."""
-
-        if not isinstance(value, tuple):
-            raise PydanticCustomError(
-                "messages_data_tuple",
-                "messages stream data must be a two-item tuple",
-            )
-        pair = cast(tuple[object, ...], value)
-        if len(pair) != 2:
-            raise ValueError("messages stream data must contain message and metadata")
-        return {"message": pair[0], "metadata": pair[1]}
-
-
-class ValuesStreamPart(_ProtocolModel):
-    """Validated v2 `values` envelope consumed by the adapter."""
-
-    type: Literal["values"] = Field(description="Stream-part type, fixed to values")
-    ns: tuple[str, ...] = Field(
-        strict=True,
-        description="Subgraph namespace that owns this stream part",
-    )
-    data: dict[str, object] = Field(description="Native state object in this part")
-    interrupts: tuple[AgentRuntimeInterrupt, ...] = Field(
-        strict=True, description="Interrupts attached to this stream part"
-    )
-
-    @field_validator("data", mode="before")
-    @classmethod
-    def validate_state(cls, value: object) -> object:
-        """Preserve message objects while requiring a mapping state boundary."""
-
-        if not isinstance(value, Mapping):
-            raise TypeError("values stream data must be a JSON object")
-        return dict(cast(Mapping[object, object], value))
-
-
-class TaskStartPayload(_ProtocolModel):
-    """Validated start payload from the v2 `tasks` stream."""
-
-    id: str = Field(min_length=1, description="Stable LangGraph task ID")
-    name: str = Field(min_length=1, description="Graph node about to execute")
-    input: object = Field(description="Native input passed to the graph node")
-    triggers: tuple[str, ...] = Field(
-        strict=True,
-        description="Channels that triggered this task",
-    )
-    metadata: StreamMetadata | None = Field(
-        default=None,
-        description="User-level task metadata parsed by LangGraph",
-    )
-
-
-class TaskResultPayload(_ProtocolModel):
-    """Validated result payload from the v2 `tasks` stream."""
-
-    id: str = Field(
-        min_length=1,
-        description="LangGraph task ID matching the corresponding start",
-    )
-    name: str = Field(min_length=1, description="Graph node that completed")
-    error: object | None = Field(
-        default=None, description="Native exception or error text from task failure"
-    )
-    interrupts: list[object] = Field(
-        strict=True,
-        description="Native task interrupts; values remains authoritative for state",
-    )
-    result: dict[str, object] = Field(
-        description="Channels written by the task; values remains authoritative for state"
-    )
-
-
-TaskStreamPayload = TaskStartPayload | TaskResultPayload
-
-
-class TasksStreamPart(_ProtocolModel):
-    """Validated v2 `tasks` envelope consumed by the adapter."""
-
-    type: Literal["tasks"] = Field(description="Stream-part type, fixed to tasks")
-    ns: tuple[str, ...] = Field(
-        strict=True,
-        description="Parent graph namespace that owns this task",
-    )
-    data: TaskStreamPayload = Field(description="Task start or task result payload")
-
-
-class ExtraStreamPart(_ProtocolModel):
-    """Validated v2 envelope for modes projected as safe AG-UI RAW events."""
-
-    type: Literal["checkpoints", "debug", "custom"] = Field(
-        description="Native stream mode projected as a RAW event"
-    )
-    ns: tuple[str, ...] = Field(
-        strict=True,
-        description="Full graph namespace for the native stream part",
-    )
-    data: object = Field(description="Native payload validated before publication")
-
-
-class UpdatesStreamPart(_ProtocolModel):
-    """Validated node-to-state-update mapping from LangGraph updates mode."""
-
-    type: Literal["updates"] = Field(description="Stream-part type, fixed to updates")
-    ns: tuple[str, ...] = Field(
-        strict=True,
-        description="Full graph namespace for the native stream part",
-    )
-    data: dict[str, object] = Field(description="Node names mapped to state updates")
-
-    @field_validator("data", mode="before")
-    @classmethod
-    def validate_updates(cls, value: object) -> object:
-        """Require the documented node-name mapping without coercing update values."""
-
-        if not isinstance(value, Mapping):
-            raise TypeError("updates stream data must be a node mapping")
-        mapping = cast(Mapping[object, object], value)
-        if any(not isinstance(key, str) or not key for key in mapping):
-            raise TypeError("updates stream node names must be non-empty strings")
-        return dict(mapping)
-
-
 class NativeToolCall(_ProtocolModel):
     """Native Tool call projected from `tasks.data.input`."""
 
@@ -269,20 +100,6 @@ class NativeToolCall(_ProtocolModel):
 
 class NativeToolCallList(RootModel[list[NativeToolCall]]):
     """Tool calls carried by one ToolNode task-start payload."""
-
-
-DeepAgentStreamPart = Annotated[
-    MessageStreamPart
-    | TasksStreamPart
-    | ValuesStreamPart
-    | UpdatesStreamPart
-    | ExtraStreamPart,
-    Field(discriminator="type"),
-]
-
-
-class DeepAgentStreamPartEnvelope(RootModel[DeepAgentStreamPart]):
-    """Discriminated validation boundary for an untrusted v2 stream part."""
 
 
 class AgentSource(_ProtocolModel):
@@ -494,7 +311,7 @@ def _group_prepared_interrupts(
 
 def _buffer_child_interrupts(
     self: DeepAgentAgUiAdapter,
-    part: ValuesStreamPart,
+    part: NativeValuesStreamPart,
     source: AgentSource,
     raw_messages: object,
 ) -> None:
@@ -657,7 +474,6 @@ def _prepare_root_interrupts(
 
 def _record_interrupts(
     self: DeepAgentAgUiAdapter,
-    namespace: tuple[str, ...],
     interrupts: Sequence[AgUiInterrupt],
 ) -> None:
     """Record terminal interrupts in first-seen order and ignore replayed frames."""

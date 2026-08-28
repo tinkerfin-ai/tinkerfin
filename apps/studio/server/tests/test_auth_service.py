@@ -63,6 +63,7 @@ async def test_login_resolve_and_logout_use_one_token_record(
     issued_after = datetime.now(UTC)
     login = await service.login("alice", "secret-pass")
     resolved = await service.resolve_token(login.access_token)
+    assert session.in_transaction() is False
     await service.logout(login.access_token)
     revoked = await service.resolve_token(login.access_token)
 
@@ -74,6 +75,49 @@ async def test_login_resolve_and_logout_use_one_token_record(
     assert revoked.is_authenticated is False
     assert revoked.failure_reason == "revoked_token"
     assert tokens.records[login.access_token].expires_at == login.expires_at
+
+
+async def test_login_releases_the_user_transaction_before_password_and_redis(
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PBKDF2 与 Redis token 写入不得占用业务数据库连接"""
+
+    user = User(
+        username="transaction-user",
+        display_name="Transaction User",
+        password_hash="stored-hash",
+        roles=[],
+        disabled=False,
+    )
+    session.add(user)
+    await session.commit()
+
+    async def verify_without_transaction(password: str, password_hash: str) -> bool:
+        assert (password, password_hash) == ("secret-pass", "stored-hash")
+        assert session.in_transaction() is False
+        return True
+
+    class TransactionCheckingTokens(TokenMemoryStore):
+        async def save(self, record: TokenRecord) -> None:
+            assert session.in_transaction() is False
+            await super().save(record)
+
+    monkeypatch.setattr(
+        "tinkerfin_studio.auth.service.verify_password",
+        verify_without_transaction,
+    )
+    tokens = TransactionCheckingTokens()
+    service = AuthService(
+        UserRepository(session),
+        tokens,
+        token_expire_seconds=1800,
+    )
+
+    login = await service.login("transaction-user", "secret-pass")
+
+    assert login.user.username == "transaction-user"
+    assert session.in_transaction() is False
 
 
 async def test_expired_token_is_rejected_without_changing_its_deadline(

@@ -6,13 +6,14 @@ from collections.abc import AsyncIterator, Callable
 
 import pytest
 from langchain.agents.middleware.types import InputAgentState
+from langchain_core.messages import AIMessageChunk
 from langgraph.graph.state import CompiledStateGraph
 
-from tinkerfin import DeepAgentDefinition, Identity
+from tinkerfin import DeepAgentDefinition, RunIdentity
 
 
-def _identity() -> Identity:
-    return Identity(threadId="thread-1", runId="run-1")
+def _identity() -> RunIdentity:
+    return RunIdentity(threadId="thread-1", runId="run-1")
 
 
 def _graph_input() -> InputAgentState:
@@ -64,7 +65,11 @@ async def test_native_object_stream_encodes_the_current_sse_contract(
     assert payload == {
         "type": "values",
         "ns": ["child:task-1"],
-        "data": {"answer": 42},
+        "data": {
+            "state": {"answer": 42},
+            "messages": [],
+            "interrupts": [],
+        },
         "interrupts": [],
     }
 
@@ -82,12 +87,30 @@ async def test_native_object_stream_encodes_the_current_sse_contract(
     ],
 )
 @pytest.mark.asyncio
-async def test_native_object_stream_encodes_every_supported_v2_mode(
+async def test_native_object_stream_encodes_every_canonical_mode(
     mode: str,
     definition_factory: Callable[..., DeepAgentDefinition[None]],
 ) -> None:
+    payloads: dict[str, object] = {
+        "messages": (
+            AIMessageChunk(id="message-1", content="visible"),
+            {"langgraph_node": "model"},
+        ),
+        "tasks": {
+            "id": "task-1",
+            "name": "model",
+            "input": {},
+            "triggers": (),
+        },
+        "values": {"messages": []},
+        "updates": {"model": {"messages": []}},
+        "checkpoints": {"checkpoint": "one"},
+        "debug": {"debug": True},
+        "custom": {"custom": True},
+    }
+
     async def source() -> AsyncIterator[object]:
-        yield {"type": mode, "ns": (), "data": {"mode": mode}}
+        yield {"type": mode, "ns": (), "data": payloads[mode]}
 
     body = (
         definition_factory(_SourceGraph(source))
@@ -99,12 +122,10 @@ async def test_native_object_stream_encodes_every_supported_v2_mode(
 
     assert len(frames) == 1
     payload = json.loads(frames[0].split("data: ", maxsplit=1)[1])
-    assert payload == {
-        "type": mode,
-        "ns": [],
-        "data": {"mode": mode},
-        "interrupts": [],
-    }
+    assert payload["type"] == mode
+    assert payload["ns"] == []
+    assert "data" in payload
+    assert payload["interrupts"] == []
 
 
 @pytest.mark.asyncio

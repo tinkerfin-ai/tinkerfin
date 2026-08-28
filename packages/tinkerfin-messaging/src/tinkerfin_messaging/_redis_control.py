@@ -33,16 +33,18 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import RedisError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
-from tinkerfin_agui_adapter import Identity
+from tinkerfin_contracts import RunIdentity
 
 from ._identity import required_identifier, required_identity
 from ._redis_scripts import (
     _BEGIN_DELETE_SCRIPT,
+    _BEGIN_EXPIRATION_SCRIPT,
     _BEGIN_SETTLEMENT_SCRIPT,
     _CANCEL_SCRIPT,
     _DELETE_BATCH_SCRIPT,
     _FINALIZE_DELETE_SCRIPT,
     _FINISH_SCRIPT,
+    _READ_CONTROL_SCRIPT,
     _RENEW_SCRIPT,
     _RUN_SNAPSHOT_SCRIPT,
 )
@@ -56,6 +58,7 @@ from .errors import (
     RunNotFound,
     StreamDeleteConflict,
     StreamDeleted,
+    StreamExpired,
     UnexpectedMessagingBackendError,
 )
 from .models import MessageEnvelope
@@ -78,6 +81,12 @@ async def _redis_call(
     operation: str,
     awaitable: Awaitable[_RedisResultT],
 ) -> _RedisResultT:
+    """Translate Redis transport failures without intercepting cancellation.
+
+    Client-safe errors expose only the logical operation. The concrete Redis failure is
+    retained as trusted causal evidence and never serialized into a durable message.
+    """
+
     try:
         return await awaitable
     except RedisTimeoutError as error:
@@ -164,6 +173,8 @@ class _AsyncRedisClient(Protocol):
 
     async def hget(self, name: str, key: str) -> bytes | None: ...
 
+    async def get(self, name: str) -> bytes | None: ...
+
     async def hgetall(self, name: str) -> dict[bytes, bytes]: ...
 
     async def exists(self, *names: str) -> int: ...
@@ -190,7 +201,13 @@ class _AsyncRedisClient(Protocol):
     ) -> _RedisStreamRead: ...
 
 
-_ControlState = Literal["active", "deleting", "deleted"]
+_ControlState = Literal[
+    "active",
+    "deleting",
+    "deleted",
+    "expiring",
+    "expired",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,7 +227,7 @@ class _RedisKeys:
     """Name the shared and generation-private keys for one run lookup."""
 
     channel: str
-    identity: Identity
+    identity: RunIdentity
     channel_meta: str
     control: str
     delete_lease: str
@@ -220,10 +237,41 @@ class _RedisKeys:
     lease_key: str
     messages: str
     index: str
+    tombstone: str
     base: str
     stream_base: str
     generation_base: str
     generation: int
+
+
+@dataclass(frozen=True, slots=True)
+class _RedisGenerationKeys:
+    """Name only the keys required for resumable generation cleanup."""
+
+    control: str
+    delete_lease: str
+    index: str
+    tombstone: str
+    generation: int
+
+
+class _GenerationCleanupKeys(Protocol):
+    """Structural key subset shared by explicit deletion and expiry."""
+
+    @property
+    def control(self) -> str: ...
+
+    @property
+    def delete_lease(self) -> str: ...
+
+    @property
+    def index(self) -> str: ...
+
+    @property
+    def tombstone(self) -> str: ...
+
+    @property
+    def generation(self) -> int: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -296,6 +344,23 @@ async def finish(
     status: FinalRunStatus,
     error: BaseException | None = None,
 ) -> None:
+    """Commit one terminal status only for the current generation and fence owner.
+
+    The Lua boundary verifies generation, owner token, and monotonic fence together, so
+    a stale producer cannot overwrite a replacement owner's result. Failure class and
+    message are operational diagnostics, not user Trace facts.
+
+    Args:
+        self: Redis Backend owning the current producer lease.
+        handle: Exact generation, owner token, and monotonic fence.
+        status: Authoritative terminal producer outcome.
+        error: Optional trusted producer failure retained as bounded diagnostics.
+
+    Raises:
+        BackendOwnershipLost: The producer no longer owns the exact generation.
+        MessagingError: Redis cannot commit or prove the terminal transition.
+    """
+
     generation = handle.generation
     if handle.owner_token is None or handle.fence is None or generation is None:
         raise BackendOwnershipLost(
@@ -325,6 +390,7 @@ async def finish(
             status,
             error_class,
             error_message,
+            str(self._retention_ms),
         ],
     )
     code = self._text(response[0])
@@ -337,6 +403,8 @@ async def finish(
 
 
 async def request_cancel(self: RedisBackend, handle: BackendRunHandle) -> bool:
+    """Record one idempotent cancellation request for a cancellable active run."""
+
     keys = await self._keys_for_handle(handle)
     await self._settled_run_snapshot(keys, handle.identity)
     response = await self._eval(
@@ -359,6 +427,8 @@ async def request_cancel(self: RedisBackend, handle: BackendRunHandle) -> bool:
 
 
 async def wait_for_cancel(self: RedisBackend, handle: BackendRunHandle) -> bool:
+    """Wait for cancellation or terminal settlement without polling past deletion."""
+
     keys = await self._keys_for_handle(handle)
     while True:
         snapshot = await self._settled_run_snapshot(keys, handle.identity)
@@ -370,6 +440,8 @@ async def wait_for_cancel(self: RedisBackend, handle: BackendRunHandle) -> bool:
 
 
 async def wait_finished(self: RedisBackend, handle: BackendRunHandle) -> RunStatus:
+    """Wait until the bound generation reaches one authoritative terminal status."""
+
     keys = await self._keys_for_handle(handle)
     while True:
         snapshot = await self._settled_run_snapshot(keys, handle.identity)
@@ -382,7 +454,7 @@ async def get_run_status(
     self: RedisBackend,
     *,
     channel: str,
-    identity: Identity,
+    identity: RunIdentity,
 ) -> RunStatus:
     """Return current status while atomically archiving an expired owner lease."""
 
@@ -391,6 +463,12 @@ async def get_run_status(
     scope = self._scope(channel, identity)
     while True:
         control = await self._read_control(scope)
+        if control is not None and control.state == "expired":
+            raise StreamExpired(
+                channel=channel,
+                identity=identity,
+                generation=control.generation,
+            )
         if control is None or control.state != "active":
             raise RunNotFound(identity=identity)
         keys = self._keys(
@@ -401,13 +479,15 @@ async def get_run_status(
         try:
             snapshot = await self._settled_run_snapshot(keys, identity)
         except StreamDeleted:
-            # Identity-only lookups follow the current generation. A stale bound
+            # RunIdentity-only lookups follow the current generation. A stale bound
             # handle still receives StreamDeleted through _keys_for_handle().
             continue
         return snapshot.status
 
 
 async def failure(self: RedisBackend, handle: BackendRunHandle) -> BaseException | None:
+    """Reconstruct bounded remote failure evidence for a settled producer."""
+
     keys = await self._keys_for_handle(handle)
     snapshot = await self._settled_run_snapshot(keys, handle.identity)
     if not snapshot.error_class and not snapshot.error_message:
@@ -458,7 +538,7 @@ async def renew(self: RedisBackend, handle: BackendRunHandle) -> bool:
 
 
 async def delete_stream(
-    self: RedisBackend, *, channel: str, identity: Identity
+    self: RedisBackend, *, channel: str, identity: RunIdentity
 ) -> None:
     """Delete one stream through a leased, generation-fenced cleanup."""
 
@@ -507,7 +587,7 @@ async def delete_stream(
             raise StreamDeleteConflict(
                 channel=channel,
                 identity=identity,
-                active_identity=Identity(
+                active_identity=RunIdentity(
                     threadId=identity.thread_id,
                     runId=self._text(response[1]),
                 ),
@@ -533,8 +613,10 @@ async def delete_stream(
 async def _delete_owned_generation(
     self: RedisBackend,
     *,
-    keys: _RedisKeys,
+    keys: _GenerationCleanupKeys,
     delete_owner: str,
+    working_state: Literal["deleting", "expiring"] = "deleting",
+    final_state: Literal["deleted", "expired"] = "deleted",
 ) -> bool:
     """Clear one fenced generation while periodically renewing ownership."""
 
@@ -555,6 +637,7 @@ async def _delete_owned_generation(
                     str(keys.generation),
                     delete_owner,
                     str(self._lease_ms),
+                    working_state,
                 ],
             )
             code = self._text(response[0])
@@ -568,8 +651,13 @@ async def _delete_owned_generation(
 
         response = await self._eval(
             _FINALIZE_DELETE_SCRIPT,
-            [keys.control, keys.delete_lease, keys.index],
-            [str(keys.generation), delete_owner],
+            [keys.control, keys.delete_lease, keys.index, keys.tombstone],
+            [
+                str(keys.generation),
+                delete_owner,
+                working_state,
+                final_state,
+            ],
         )
         code = self._text(response[0])
         if code == "DONE":
@@ -583,7 +671,53 @@ async def _delete_owned_generation(
         )
 
 
-def _scope(self: RedisBackend, channel: str, identity: Identity) -> _RedisStreamScope:
+async def _expire_generation(
+    self: RedisBackend,
+    scope: _RedisStreamScope,
+    *,
+    generation: int,
+) -> None:
+    """Resume lazy physical cleanup after the Redis deadline becomes authoritative."""
+
+    generation_base = f"{scope.stream_base}:generation:{generation}"
+    keys = _RedisGenerationKeys(
+        control=scope.control,
+        delete_lease=scope.delete_lease,
+        index=f"{generation_base}:index",
+        tombstone=f"{generation_base}:tombstone",
+        generation=generation,
+    )
+    delete_owner = f"{self._worker_id}:expire:{uuid4().hex}"
+    while True:
+        response = await self._eval(
+            _BEGIN_EXPIRATION_SCRIPT,
+            [keys.control, keys.delete_lease],
+            [str(generation), delete_owner, str(self._lease_ms)],
+        )
+        code = self._text(response[0])
+        if code == "DONE":
+            return
+        if code == "WAIT":
+            await asyncio.sleep(self._poll_interval)
+            continue
+        if code == "RETRY":
+            return
+        if code != "OWNED":
+            raise _redis_protocol_error(f"unexpected Redis expiration response: {code}")
+        completed = await _delete_owned_generation(
+            self,
+            keys=keys,
+            delete_owner=delete_owner,
+            working_state="expiring",
+            final_state="expired",
+        )
+        if completed:
+            return
+
+
+def _scope(
+    self: RedisBackend, channel: str, identity: RunIdentity
+) -> _RedisStreamScope:
     channel_scope = self._digest(channel)
     base = f"{self._prefix}:{{{channel_scope}}}"
     stream_digest = self._digest(identity.thread_id)
@@ -601,10 +735,17 @@ def _scope(self: RedisBackend, channel: str, identity: Identity) -> _RedisStream
 def _keys(
     self: RedisBackend,
     channel: str,
-    identity: Identity,
+    identity: RunIdentity,
     *,
     generation: int,
 ) -> _RedisKeys:
+    """Derive generation-scoped keys under one Redis Cluster hash slot.
+
+    Channel and thread digests select the shared hash tag; generation and run digests
+    then isolate replacement histories and producer ownership without exposing caller
+    identifiers in raw Redis keys.
+    """
+
     scope = self._scope(channel, identity)
     generation_base = f"{scope.stream_base}:generation:{generation}"
     run_digest = self._digest(identity.run_id)
@@ -620,6 +761,7 @@ def _keys(
         lease_key=f"{generation_base}:lease:{run_digest}",
         messages=f"{generation_base}:messages",
         index=f"{generation_base}:index",
+        tombstone=f"{generation_base}:tombstone",
         base=scope.base,
         stream_base=scope.stream_base,
         generation_base=generation_base,
@@ -631,34 +773,52 @@ async def _read_control(
     self: RedisBackend,
     scope: _RedisStreamScope,
 ) -> _StreamControl | None:
-    values = await _redis_call(
-        "stream control read",
-        self._client.hgetall(scope.control),
-    )
-    if not values:
-        return None
-    decoded = {
-        self._text(key): self._text(value)
-        for key, value in cast(Mapping[bytes, bytes], values).items()
-    }
-    state = decoded.get("state")
-    if state not in {"active", "deleting", "deleted"}:
-        raise _redis_protocol_error(
-            f"Redis stream control has invalid state: {state!r}"
+    """Read control, atomically recognize deadlines, and resume expired cleanup."""
+
+    while True:
+        raw_response = await _redis_call(
+            "stream control read",
+            self._client.eval(
+                _READ_CONTROL_SCRIPT,
+                1,
+                scope.control,
+            ),
         )
-    try:
-        generation = int(decoded["generation"])
-    except (KeyError, ValueError) as error:
-        raise _redis_protocol_error(
-            "Redis stream control has invalid generation",
-            cause=error,
-        ) from error
-    if generation < 1:
-        raise _redis_protocol_error("Redis stream control has invalid generation")
-    return _StreamControl(
-        generation=generation,
-        state=cast(_ControlState, state),
-    )
+        if not isinstance(raw_response, list):
+            raise _redis_protocol_error(
+                "Redis stream control returned a non-list response"
+            )
+        response = cast(list[_RedisScriptValue], raw_response)
+        if not response:
+            raise _redis_protocol_error("Redis stream control returned no fields")
+        code = self._snapshot_text(response[0], field="control response code")
+        if code == "NONE":
+            return None
+        if code != "OK" or len(response) != 3:
+            raise _redis_protocol_error(f"unexpected Redis control response: {code}")
+        try:
+            generation = int(
+                self._snapshot_text(response[1], field="control generation")
+            )
+        except ValueError as error:
+            raise _redis_protocol_error(
+                "Redis stream control has invalid generation",
+                cause=error,
+            ) from error
+        if generation < 1:
+            raise _redis_protocol_error("Redis stream control has invalid generation")
+        state = self._snapshot_text(response[2], field="control state")
+        if state not in {"active", "deleting", "deleted", "expiring", "expired"}:
+            raise _redis_protocol_error(
+                f"Redis stream control has invalid state: {state!r}"
+            )
+        if state == "expiring":
+            await _expire_generation(self, scope, generation=generation)
+            continue
+        return _StreamControl(
+            generation=generation,
+            state=cast(_ControlState, state),
+        )
 
 
 async def _keys_for_handle(self: RedisBackend, handle: BackendRunHandle) -> _RedisKeys:
@@ -669,16 +829,57 @@ async def _keys_for_handle(self: RedisBackend, handle: BackendRunHandle) -> _Red
         if control is None:
             raise RunNotFound(identity=handle.identity)
         if control.state != "active":
-            self._raise_stream_deleted(
+            await _raise_generation_unavailable(
+                self,
                 handle,
                 generation=control.generation,
             )
         generation = control.generation
-    return self._keys(
+    keys = self._keys(
         handle.channel,
         handle.identity,
         generation=generation,
     )
+    if handle.generation is not None:
+        reason = await _redis_call(
+            "generation tombstone lookup",
+            self._client.get(keys.tombstone),
+        )
+        if reason is not None:
+            if self._text(reason) == "expired":
+                raise StreamExpired(
+                    channel=handle.channel,
+                    identity=handle.identity,
+                    generation=generation,
+                )
+            self._raise_stream_deleted(handle, generation=generation)
+    return keys
+
+
+async def _raise_generation_unavailable(
+    self: RedisBackend,
+    handle: BackendRunHandle,
+    *,
+    generation: int,
+) -> Never:
+    """Distinguish retention expiry from explicit deletion for a stale handle."""
+
+    keys = self._keys(
+        handle.channel,
+        handle.identity,
+        generation=generation,
+    )
+    reason = await _redis_call(
+        "generation tombstone lookup",
+        self._client.get(keys.tombstone),
+    )
+    if reason is not None and self._text(reason) == "expired":
+        raise StreamExpired(
+            channel=handle.channel,
+            identity=handle.identity,
+            generation=generation,
+        )
+    self._raise_stream_deleted(handle, generation=generation)
 
 
 async def _is_current_generation(self: RedisBackend, keys: _RedisKeys) -> bool:
@@ -702,7 +903,7 @@ async def _is_current_generation(self: RedisBackend, keys: _RedisKeys) -> bool:
 async def _run_snapshot(
     self: RedisBackend,
     keys: _RedisKeys,
-    identity: Identity,
+    identity: RunIdentity,
     *,
     after: int | None = None,
 ) -> _RunSnapshot:
@@ -721,6 +922,7 @@ async def _run_snapshot(
             keys.signals,
             str(keys.generation),
             "__none__" if after is None else str(after),
+            str(self._retention_ms),
         ),
     )
     if not isinstance(raw_response, list):
@@ -821,7 +1023,7 @@ async def _run_snapshot(
 async def _settled_run_snapshot(
     self: RedisBackend,
     keys: _RedisKeys,
-    identity: Identity,
+    identity: RunIdentity,
     *,
     after: int | None = None,
 ) -> _RunSnapshot:

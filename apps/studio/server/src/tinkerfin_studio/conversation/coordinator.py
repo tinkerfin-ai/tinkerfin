@@ -1,103 +1,83 @@
-"""Redis Messaging 到 MySQL 的后台投影协调"""
+"""Trace 权威列表摘要、Run 状态与恢复认领协调"""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import UTC, datetime, timedelta
+from collections.abc import Iterable
+from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from ag_ui.core import BaseEvent
 from ag_ui.core.types import ResumeEntry
 
-from tinkerfin import AgUiResumeCheckpoint, Identity
-from tinkerfin_messaging import (
-    DecodedMessage,
-    MessageChannel,
-    RunNotFound,
-    RunProducerFailed,
-    RunStatus,
-    StreamDeleted,
-)
-from tinkerfin_studio.conversation.projection import ConversationProjector
-from tinkerfin_studio.conversation.repository import ConversationRepository
+from tinkerfin import AgUiResumeCheckpoint, RunIdentity
+from tinkerfin_messaging import RunNotFound
+from tinkerfin_messaging.messaging import MessageChannel
 from tinkerfin_studio.infrastructure.database import Database
+from tinkerfin_tracing import Tracer, TraceThread, TraceThreadNotFound, TraceUpdate
 
+from .repository import ConversationRepository
+
+_STALE_PREPARING_SECONDS = 30
+_FOLLOW_RETRY_INITIAL_SECONDS = 0.05
+_FOLLOW_RETRY_MAX_SECONDS = 2.0
 logger = logging.getLogger(__name__)
-_PREPARING_RECOVERY_GRACE = timedelta(seconds=30)
-_FINAL_RUN_STATUSES = frozenset({"completed", "cancelled", "failed", "owner_lost"})
 
 
-class ConversationProjectionCoordinator:
-    """拥有当前 Worker 的会话投影任务并支持请求前同步追赶"""
+@dataclass(frozen=True, slots=True)
+class _StalePreparingRun:
+    """跨外部存活检查携带的无连接 Run 身份"""
+
+    thread_pk: int
+    run_pk: int
+    identity: RunIdentity
+    expected_updated_at: datetime
+
+
+class ConversationTraceCoordinator:
+    """把 Trace 当前事实收敛为 Studio 列表摘要，不保存会话正文"""
 
     def __init__(
         self,
         *,
         database: Database,
-        channel: MessageChannel[BaseEvent, BaseEvent],
+        tracer: Tracer,
+        conversation_channel: MessageChannel[BaseEvent, BaseEvent],
     ) -> None:
         self._database = database
-        self._channel = channel
-        self._tasks: dict[Identity, asyncio.Task[None]] = {}
+        self._tracer = tracer
+        self._conversation_channel = conversation_channel
+        self._tasks: dict[tuple[int, str], asyncio.Task[None]] = {}
         self._closed = False
 
-    def ensure(
-        self,
-        *,
-        thread_pk: int,
-        identity: Identity,
-    ) -> None:
-        """保证当前 Worker 至多有一个该 run 的跟随任务"""
+    def ensure(self, *, thread_pk: int, identity: RunIdentity) -> None:
+        """为一个已注册 Run 保留唯一 Trace follow 所有者"""
 
         if self._closed:
-            raise RuntimeError("会话投影协调器已经关闭")
-        existing = self._tasks.get(identity)
-        if existing is not None and not existing.done():
+            raise RuntimeError("Trace 摘要协调器已经关闭")
+        key = (thread_pk, identity.run_id)
+        current = self._tasks.get(key)
+        if current is not None and not current.done():
             return
         task = asyncio.create_task(
             self._follow(thread_pk=thread_pk, identity=identity),
-            name=f"studio-conversation-projector:{identity.run_id}",
+            name=f"studio-trace-summary:{identity.run_id}",
         )
-        self._tasks[identity] = task
-        task.add_done_callback(lambda completed: self._finished(identity, completed))
+        task.add_done_callback(
+            lambda completed, task_key=key: self._finished(task_key, completed)
+        )
+        self._tasks[key] = task
 
-    async def reconcile(self, *, thread_pk: int, identity: Identity) -> int:
-        """把 Redis 当前已提交尾部完整投影到 MySQL"""
+    async def reconcile(self, *, thread_pk: int, identity: RunIdentity) -> int:
+        """读取固定 Trace 前缀并同步列表摘要"""
 
-        while True:
-            after = await self._last_seq(thread_pk)
-            latest = await self._channel.latest_seq(identity=identity)
-            if after >= latest:
-                return after
-            messages = await self._channel.read(
-                identity=identity,
-                after=after,
-                limit=min(1000, latest - after),
-            )
-            if not messages:
-                raise RuntimeError(
-                    f"Redis 事件尾部无法补齐: after={after}, latest={latest}"
-                )
-            for message in messages:
-                await self._project(thread_pk, message)
-
-    async def reconcile_and_settle(
-        self,
-        *,
-        thread_pk: int,
-        identity: Identity,
-    ) -> RunStatus:
-        """追赶已提交事件，并收敛 Messaging 已确认但没有协议事件的终态"""
-
-        await self.reconcile(thread_pk=thread_pk, identity=identity)
-        status = await self._channel.get_run_status(identity=identity)
-        if status in _FINAL_RUN_STATUSES:
-            await self._settle_messaging_terminal(
-                thread_pk=thread_pk,
-                identity=identity,
-                status=status,
-            )
-        return status
+        trace = await self._tracer.get(
+            identity.thread_id,
+            head_run_id=identity.run_id,
+        )
+        await self._persist_thread(thread_pk=thread_pk, trace=trace)
+        return trace.as_of_seq
 
     async def settle_resume(
         self,
@@ -106,73 +86,97 @@ class ConversationProjectionCoordinator:
         entries: tuple[ResumeEntry, ...],
         checkpoint: AgUiResumeCheckpoint,
     ) -> None:
-        """根据框架 checkpoint 证据幂等完成业务审批结算"""
+        """用框架 checkpoint marker 幂等结算不含 payload 的业务认领"""
 
-        if not entries:
-            raise ValueError("checkpoint 回调缺少公开 resume 条目")
         async with self._database.session() as session:
-            try:
-                repository = ConversationRepository(session)
-                thread = await repository.get_thread_by_pk(thread_pk)
-                if thread is None:
-                    raise LookupError(f"恢复会话不存在: {thread_pk}")
-                if thread.thread_id != checkpoint.identity.thread_id:
-                    raise ValueError("checkpoint 与会话 threadId 不一致")
-                await repository.settle_claimed_interrupts(
-                    thread_pk=thread_pk,
-                    run_id=checkpoint.identity.run_id,
-                    entries=entries,
-                    resolution_id=checkpoint.marker_id,
-                )
-                await session.commit()
-            except BaseException:
-                await session.rollback()
-                raise
+            repository = ConversationRepository(session)
+            await repository.settle_claims(
+                thread_pk=thread_pk,
+                run_id=checkpoint.identity.run_id,
+                entries=entries,
+                resolution_id=checkpoint.marker_id,
+            )
+            await repository.commit()
+        await self.reconcile(thread_pk=thread_pk, identity=checkpoint.identity)
 
     async def recover_preparing(
-        self, *, thread_pk: int | None = None
+        self,
+        *,
+        thread_pk: int | None = None,
     ) -> frozenset[int]:
-        """清理超过宽限且 Messaging 中不存在的未启动 run"""
+        """清理没有 Trace 的过期 preparing 注册并恢复已有 Trace 摘要"""
 
-        cutoff = datetime.now(UTC).replace(tzinfo=None) - _PREPARING_RECOVERY_GRACE
+        candidates: list[_StalePreparingRun] = []
         async with self._database.session() as session:
-            runs = await ConversationRepository(session).list_stale_preparing_runs(
-                older_than=cutoff,
+            repository = ConversationRepository(session)
+            registrations = await repository.list_stale_unstarted_runs(
+                older_than_seconds=_STALE_PREPARING_SECONDS,
                 thread_pk=thread_pk,
             )
-            candidates = tuple(
-                (run.id, run.conversation_thread_id, run.run_id) for run in runs
-            )
-            await session.commit()
-        deleted_threads: set[int] = set()
-        for run_pk, candidate_thread_pk, run_id in candidates:
-            identity = await self._run_identity(candidate_thread_pk, run_id)
-            if identity is None:
-                continue
+            recovered_threads: set[int] = set()
+            for registration in registrations:
+                thread = await repository.get_thread_by_pk(
+                    registration.conversation_thread_id
+                )
+                if thread is None:
+                    continue
+                candidates.append(
+                    _StalePreparingRun(
+                        thread_pk=thread.id,
+                        run_pk=registration.id,
+                        identity=RunIdentity(
+                            threadId=thread.thread_id,
+                            runId=registration.run_id,
+                        ),
+                        expected_updated_at=registration.updated_at,
+                    )
+                )
+            # Trace 与 Redis 检查不占用 Studio 的业务连接或事务
+            await repository.commit()
+
+        recovered_threads: set[int] = set()
+        deletions: list[_StalePreparingRun] = []
+        for candidate in candidates:
             try:
-                await self._channel.get_run_status(identity=identity)
-            except (RunNotFound, StreamDeleted):
-                # 只有没有任何 durable 执行事实的空注册才可删除，有 owner 的慢启动必须保留
-                async with self._database.session() as session:
-                    try:
-                        result = await ConversationRepository(
-                            session
-                        ).delete_unstarted_run(
-                            thread_pk=candidate_thread_pk,
-                            run_pk=run_pk,
-                            run_id=run_id,
-                            delete_empty_thread=True,
-                        )
-                        await session.commit()
-                    except BaseException:
-                        await session.rollback()
-                        raise
-                if result.thread_deleted:
-                    deleted_threads.add(candidate_thread_pk)
-        return frozenset(deleted_threads)
+                await self._tracer.get(
+                    candidate.identity.thread_id,
+                    head_run_id=candidate.identity.run_id,
+                )
+            except TraceThreadNotFound:
+                try:
+                    producer_status = await self._conversation_channel.get_run_status(
+                        identity=candidate.identity
+                    )
+                except RunNotFound:
+                    producer_status = None
+                # Messaging 只证明当前 owner 是否存活，终态不能替代 Trace 的 Agent 结果
+                if producer_status in {"running", "cancel_requested"}:
+                    continue
+                deletions.append(candidate)
+            else:
+                recovered_threads.add(candidate.thread_pk)
+                self.ensure(
+                    thread_pk=candidate.thread_pk,
+                    identity=candidate.identity,
+                )
+
+        if deletions:
+            async with self._database.session() as session:
+                repository = ConversationRepository(session)
+                for candidate in deletions:
+                    await repository.delete_unstarted_run(
+                        thread_pk=candidate.thread_pk,
+                        run_pk=candidate.run_pk,
+                        run_id=candidate.identity.run_id,
+                        delete_empty_thread=True,
+                        expected_updated_at=candidate.expected_updated_at,
+                        allow_starting=True,
+                    )
+                await repository.commit()
+        return frozenset(recovered_threads)
 
     async def aclose(self) -> None:
-        """取消阻塞 follow，并等待所有本地投影任务退出"""
+        """取消并结算全部协调器自有 follow task"""
 
         if self._closed:
             return
@@ -182,103 +186,216 @@ class ConversationProjectionCoordinator:
         for task in tasks:
             if not task.done():
                 task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _follow(self, *, thread_pk: int, identity: Identity) -> None:
-        after = await self._last_seq(thread_pk)
-        subscription = await self._channel.follow(
-            identity=identity,
-            after=after,
-        )
-        try:
+    async def _follow(self, *, thread_pk: int, identity: RunIdentity) -> None:
+        """从最新 Trace snapshot 恢复摘要并持续跟随到确定终态"""
+
+        delay = _FOLLOW_RETRY_INITIAL_SECONDS
+        while True:
             try:
-                async for message in subscription:
-                    await self._project(thread_pk, message)
-            except RunProducerFailed:
-                status = await self._channel.get_run_status(identity=identity)
-                await self._settle_messaging_terminal(
+                terminal = await self._follow_once(
                     thread_pk=thread_pk,
                     identity=identity,
-                    status=status,
                 )
-            else:
-                status = await self._channel.get_run_status(identity=identity)
-                if status in _FINAL_RUN_STATUSES:
-                    await self._settle_messaging_terminal(
-                        thread_pk=thread_pk,
-                        identity=identity,
-                        status=status,
-                    )
-        finally:
-            await subscription.aclose()
-
-    async def _last_seq(self, thread_pk: int) -> int:
-        async with self._database.session() as session:
-            thread = await ConversationRepository(session).get_thread_by_pk(thread_pk)
-            if thread is None:
-                raise LookupError(f"会话不存在: {thread_pk}")
-            return thread.last_seq
-
-    async def _run_identity(self, thread_pk: int, run_id: str) -> Identity | None:
-        async with self._database.session() as session:
-            thread = await ConversationRepository(session).get_thread_by_pk(thread_pk)
-            if thread is None:
-                return None
-            return Identity(threadId=thread.thread_id, runId=run_id)
-
-    async def _project(
-        self,
-        thread_pk: int,
-        message: DecodedMessage[BaseEvent],
-    ) -> None:
-        async with self._database.session() as session:
-            try:
-                await ConversationProjector(session).project(
-                    thread_pk=thread_pk,
-                    envelope=message.envelope,
-                    event=message.data,
+            except Exception as error:  # noqa: BLE001 - owner retries ordinary failures
+                # Trace 是唯一权威；摘要失败只能退避重建，不能永久放弃当前 Run
+                logger.warning(
+                    "Trace 摘要 follow 将重试: thread_pk=%s run_id=%s error_type=%s",
+                    thread_pk,
+                    identity.run_id,
+                    type(error).__name__,
                 )
-                await session.commit()
-            except BaseException:
-                await session.rollback()
-                raise
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, _FOLLOW_RETRY_MAX_SECONDS)
+                continue
+            if terminal:
+                return
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, _FOLLOW_RETRY_MAX_SECONDS)
 
-    async def _settle_messaging_terminal(
+    async def _follow_once(
         self,
         *,
         thread_pk: int,
-        identity: Identity,
-        status: RunStatus,
-    ) -> None:
-        if status not in _FINAL_RUN_STATUSES:
-            return
-        async with self._database.session() as session:
-            try:
-                await ConversationProjector(session).settle_messaging_terminal(
+        identity: RunIdentity,
+    ) -> bool:
+        """从一个最新固定前缀恢复，并报告是否已经到达终态"""
+
+        trace = await self._tracer.get(
+            identity.thread_id,
+            head_run_id=identity.run_id,
+        )
+        await self._persist_thread(thread_pk=thread_pk, trace=trace)
+        if trace.status.execution not in {"running"}:
+            return True
+        pending = {
+            item.id: item.kind
+            for item in trace.interactions
+            if item.status == "pending"
+        }
+        updates = trace.follow()
+        try:
+            async for update in updates:
+                for interaction_id in update.interactions.removes:
+                    pending.pop(interaction_id, None)
+                for interaction in update.interactions.upserts:
+                    if interaction.status == "pending":
+                        pending[interaction.id] = interaction.kind
+                    else:
+                        pending.pop(interaction.id, None)
+                await self._persist_update(
                     thread_pk=thread_pk,
-                    identity_run_id=identity.run_id,
-                    durable_status=status,
+                    update=update,
+                    pending=pending,
+                    generation=trace.key.generation,
                 )
-                await session.commit()
-            except BaseException:
-                await session.rollback()
-                raise
+                if update.status.execution != "running":
+                    return True
+        finally:
+            await updates.aclose()
+        return False
+
+    async def _persist_thread(self, *, thread_pk: int, trace: TraceThread) -> None:
+        pending = {
+            item.id: item.kind
+            for item in trace.interactions
+            if item.status == "pending"
+        }
+        await self._write_summary(
+            thread_pk=thread_pk,
+            run_id=trace.head_run_id,
+            execution=trace.status.execution,
+            message_count=trace.message_count,
+            tool_call_count=trace.tool_call_count,
+            has_pending_interrupt=bool(pending),
+            pending_interaction_kind=_pending_kind(pending.values()),
+            updated_at=_trace_activity_at(trace),
+            settlement_id=f"trace:{trace.key.generation}:{trace.as_of_seq}",
+        )
+
+    async def _persist_update(
+        self,
+        *,
+        thread_pk: int,
+        update: TraceUpdate,
+        pending: dict[str, str],
+        generation: str,
+    ) -> None:
+        await self._write_summary(
+            thread_pk=thread_pk,
+            run_id=update.status.head_run_id,
+            execution=update.status.execution,
+            message_count=update.message_count,
+            tool_call_count=update.tool_call_count,
+            has_pending_interrupt=bool(pending),
+            pending_interaction_kind=_pending_kind(pending.values()),
+            updated_at=_update_activity_at(update),
+            settlement_id=f"trace:{generation}:{update.as_of_seq}",
+        )
+
+    async def _write_summary(
+        self,
+        *,
+        thread_pk: int,
+        run_id: str,
+        execution: str,
+        message_count: int,
+        tool_call_count: int,
+        has_pending_interrupt: bool,
+        pending_interaction_kind: str | None,
+        updated_at: datetime,
+        settlement_id: str,
+    ) -> None:
+        status, outcome = _summary_status(execution, has_pending_interrupt)
+        async with self._database.session() as session:
+            repository = ConversationRepository(session)
+            await repository.update_trace_summary(
+                thread_pk=thread_pk,
+                run_id=run_id,
+                status=status,
+                message_count=message_count,
+                tool_call_count=tool_call_count,
+                has_pending_interrupt=has_pending_interrupt,
+                pending_interaction_kind=pending_interaction_kind,
+                terminal_outcome=outcome,
+                updated_at=updated_at,
+            )
+            if outcome == "abandoned":
+                await repository.cancel_claims(
+                    thread_pk=thread_pk,
+                    run_id=run_id,
+                    resolution_id=settlement_id,
+                )
+            await repository.commit()
 
     def _finished(
         self,
-        identity: Identity,
+        key: tuple[int, str],
         task: asyncio.Task[None],
     ) -> None:
-        if self._tasks.get(identity) is task:
-            self._tasks.pop(identity, None)
+        if self._tasks.get(key) is task:
+            self._tasks.pop(key, None)
         if task.cancelled():
             return
-        error = task.exception()
-        if error is not None:
-            logger.error(
-                "会话后台投影失败: thread_id=%s run_id=%s",
-                identity.thread_id,
-                identity.run_id,
-                exc_info=error,
-            )
+        task.exception()
+
+
+def _summary_status(execution: str, pending: bool) -> tuple[str, str | None]:
+    if execution == "running":
+        return "running", None
+    if execution == "waiting" or pending:
+        return "waiting_approval", "interrupted"
+    if execution == "succeeded":
+        return "idle", "succeeded"
+    if execution in {"cancelled", "abandoned"}:
+        return "idle", execution
+    return "error", "failed"
+
+
+def _pending_kind(values: Iterable[str]) -> str | None:
+    kinds = set(values)
+    if not kinds:
+        return None
+    mapped = {
+        "tinkerfin:plan_clarification": "plan_clarification",
+        "tinkerfin:plan_review": "plan_review",
+        "tool_approval": "tool_approval",
+    }
+    resolved = {mapped.get(kind, "input_required") for kind in kinds}
+    return next(iter(resolved)) if len(resolved) == 1 else "input_required"
+
+
+def _trace_activity_at(trace: TraceThread) -> datetime:
+    values = [
+        value
+        for message in trace.messages
+        for value in (message.created_at, message.completed_at)
+        if value is not None
+    ]
+    values.extend(
+        value
+        for node in trace.tree.nodes
+        for value in (node.started_at, node.completed_at)
+        if value is not None
+    )
+    values.extend(
+        value
+        for interaction in trace.interactions
+        for value in (interaction.opened_at, interaction.resolved_at)
+        if value is not None
+    )
+    return _database_time(max(values, default=datetime.now(UTC)))
+
+
+def _update_activity_at(update: TraceUpdate) -> datetime:
+    return _database_time(max(fact.occurred_at for fact in update.facts))
+
+
+def _database_time(value: datetime) -> datetime:
+    if value.utcoffset() is None:
+        return value
+    return value.astimezone(UTC).replace(tzinfo=None)
+
+
+__all__ = ["ConversationTraceCoordinator"]

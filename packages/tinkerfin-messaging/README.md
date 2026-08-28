@@ -2,7 +2,8 @@
 
 ## What it is
 
-`tinkerfin-messaging` persists and replays asynchronous object streams. It supports TinkerFin Native and AG-UI streams out of the box while keeping custom source, codec, renderer, and backend extension points.
+`tinkerfin-messaging` persists and replays asynchronous object streams. Its Core is
+protocol-neutral; optional integrations add Redis, AG-UI, and TinkerFin Native codecs.
 
 ## Installation
 
@@ -10,20 +11,29 @@
 pip install tinkerfin-messaging
 ```
 
-Native and AG-UI codecs are included. Redis remains optional:
+Install only the integrations used by the host:
 
 ```bash
+pip install "tinkerfin-messaging[agui]"
+pip install "tinkerfin-messaging[native]"
 pip install "tinkerfin-messaging[redis]"
+pip install "tinkerfin-messaging[agui,redis]"
+```
+
+The TinkerFin AG-UI quick start below also requires the Runtime package:
+
+```bash
+pip install "tinkerfin[agui]" "tinkerfin-messaging[agui]"
 ```
 
 ## Quick Start
 
 ```python
-from tinkerfin import Identity
+from tinkerfin_contracts import RunIdentity
 from tinkerfin_messaging import Messaging
 
 
-identity = Identity(threadId="thread-1", runId="run-1")
+identity = RunIdentity(threadId="thread-1", runId="run-1")
 events = agent.new_agui(identity=identity).astream(graph_input)
 
 async with Messaging() as messaging:
@@ -34,7 +44,9 @@ async with Messaging() as messaging:
         await send(frame)
 ```
 
-TinkerFin streams carry their codec and Identity profiles. Do not repeat thread or run parameters, and do not pre-encode the stream with Runtime `to_sse()`.
+This example requires the `agui` extra. TinkerFin streams carry their codec and
+RunIdentity profiles. Do not repeat thread or run parameters, and do not pre-encode the
+stream with Runtime `to_sse()`.
 
 ## Custom sources
 
@@ -51,7 +63,7 @@ subscription = await channel.wrap(
 )
 ```
 
-A custom source must receive one explicit Identity. A profiled source may omit it; an explicitly conflicting Identity fails before backend preparation or source opening.
+A custom source must receive one explicit RunIdentity. A profiled source may omit it; an explicitly conflicting RunIdentity fails before backend preparation or source opening.
 
 ## Channel operations
 
@@ -68,7 +80,7 @@ A custom source must receive one explicit Identity. A profiled source may omit i
 | `cancel(identity=...)` | Request cancellation and wait for settlement |
 | `delete_stream(identity=...)` | Delete an inactive thread generation |
 
-`Identity.runId` is the caller's idempotency key. Messaging does not store or compare business request bodies. Reuse an Identity only for retry, replay, or attachment to the same semantic run.
+`RunIdentity.runId` is the caller's idempotency key. Messaging does not store or compare business request bodies. Reuse a RunIdentity only for retry, replay, or attachment to the same semantic run.
 
 `get_run_status()` returns `running`, `cancel_requested`, `completed`, `cancelled`,
 `failed`, or `owner_lost`. A leased backend can atomically classify an expired owner as
@@ -76,14 +88,16 @@ A custom source must receive one explicit Identity. A profiled source may omit i
 
 ## Durable values
 
-`MessageEnvelope` contains channel, nested Identity, sequence, message ID, codec,
+`MessageEnvelope` contains channel, nested RunIdentity, sequence, message ID, codec,
 payload bytes, and UTC creation time.
 
 `RecoveryCheckpoint` contains an opaque source position plus the last stable message ID.
 
 ## Deferred and recoverable sources
 
-Use `DeferredMessageSource` when only the durable owner should build an expensive Graph or Sandbox. Use `ProfiledDeferredMessageSource` when the codec and Identity must be visible before opening.
+Use `DeferredMessageSource` when only the durable owner should build an expensive Graph or Sandbox. Use `ProfiledDeferredMessageSource` when the codec and RunIdentity must be visible before opening.
+
+Set `on_owner_preflight` when a host must atomically activate business state after durable owner selection but before the producer task or opener starts. Attachments never invoke it; failure releases the prepared owner and leaves the source unopened.
 
 Use `RecoverableSource` and `RecoverableMessage` when a producer can rebuild from the last atomically committed checkpoint. Stable message IDs make commits idempotent; external side effects still require application-level idempotency.
 
@@ -93,16 +107,36 @@ Use `RecoverableSource` and `RecoverableMessage` when a producer can rebuild fro
 
 ```python
 from redis.asyncio import Redis
-from tinkerfin_messaging import Messaging, RedisBackend
+from tinkerfin_messaging import (
+    Messaging,
+    MessagingRetentionPolicy,
+    RedisBackend,
+)
 
 
 redis = Redis.from_url("redis://localhost:6379/0", decode_responses=False)
-backend = RedisBackend(redis, key_prefix="my-app:messaging")
+backend = RedisBackend(
+    redis,
+    key_prefix="my-app:messaging",
+    retention_policy=MessagingRetentionPolicy.expire_after(86_400),
+)
 messaging = Messaging(backend=backend)
 ```
 
 Redis keeps trusted per-owner lease renewal counts and timestamps for postmortem
 diagnostics; these fields never enter envelopes or client output.
+
+Retention is disabled by default. `MessagingRetentionPolicy.expire_after(seconds)`
+starts a thread-generation deadline after terminal settlement. Active producers never
+expire, and a new Run admitted before the deadline clears the timer. After expiry,
+replay/status/cursor operations raise `StreamExpired`; an explicit `after=0` start opens
+the next empty generation. Old bound handles retain an `expired` tombstone even after a
+replacement generation starts. Memory uses a monotonic clock. Redis uses its server
+clock and performs generation-fenced, resumable physical cleanup when the deadline is
+first observed by a backend operation.
+
+Explicit `delete_stream()` is separate: it rejects an active producer and records a
+`deleted` generation tombstone. Old handles raise `StreamDeleted`, not `StreamExpired`.
 
 ## Capacity limits
 
@@ -117,14 +151,22 @@ and channel must use the same limits. A mismatch fails without changing existing
 an idempotent retry of an already committed message succeeds even when the thread is now
 at its quota.
 
+Redis also stores the retention fingerprint. Workers sharing a key prefix and channel
+must use the same retention policy; a mismatch fails before mutation.
+
 ## Built-in codecs
 
 | API | Live input | Replay output |
 | --- | --- | --- |
 | `AgUiCodec` | `BaseEvent` | `BaseEvent` |
-| `NativeStreamPartCodec` | LangGraph v2 mapping | `NativeStreamPart` |
+| `NativeStreamPartCodec` | `NativeStreamPart` | `NativeStreamPart` |
 
-Both codecs also render durable SSE with the committed sequence as the event ID.
+`AgUiCodec` requires the `agui` extra. `NativeStreamPartCodec` requires the `native`
+extra. A profiled Runtime source may implement `MessageCodecInputSource` to transfer an
+already normalized finite value to its codec. TinkerFin Native streams use that hook to
+hand off the selected Runtime Profile's canonical frame; Messaging never parses the live
+Deep Agents or LangGraph mapping. Both codecs render durable SSE with the committed
+sequence as the event ID.
 
 ## Cancellation and cleanup
 

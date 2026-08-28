@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from redis.asyncio import Redis
 
-from tinkerfin_agui_adapter import Identity
+from tinkerfin_contracts import RunIdentity
 
 from . import _redis_control, _redis_journal
 from ._identity import required_identifier
@@ -30,6 +30,7 @@ from .backend import (
 )
 from .limits import DEFAULT_MESSAGING_LIMITS, MessagingLimits
 from .models import MessageEnvelope, RecoveryCheckpoint
+from .retention import MessagingRetentionPolicy
 
 
 class RedisBackend(MessagingBackend):
@@ -47,6 +48,7 @@ class RedisBackend(MessagingBackend):
         lease_ttl: float = 15.0,
         poll_interval: float = 0.1,
         limits: MessagingLimits = DEFAULT_MESSAGING_LIMITS,
+        retention_policy: MessagingRetentionPolicy = MessagingRetentionPolicy(),
     ) -> None:
         """Initialize a backend that borrows one binary Redis client.
 
@@ -56,6 +58,7 @@ class RedisBackend(MessagingBackend):
             lease_ttl: Producer ownership expiry in seconds.
             poll_interval: Maximum fallback polling interval in seconds.
             limits: Immutable payload and per-thread capacity contract.
+            retention_policy: Terminal replay deadline policy; disabled by default.
 
         Raises:
             TypeError: A timing or limits value has the wrong type.
@@ -77,6 +80,8 @@ class RedisBackend(MessagingBackend):
             raise ValueError("poll_interval must be a finite positive number")
         if not isinstance(limits, MessagingLimits):
             raise TypeError("limits must be a MessagingLimits")
+        if not isinstance(retention_policy, MessagingRetentionPolicy):
+            raise TypeError("retention_policy must be a MessagingRetentionPolicy")
         connection_options = cast(
             Mapping[str, object],
             client.get_connection_kwargs(),
@@ -93,6 +98,11 @@ class RedisBackend(MessagingBackend):
         )
         self._worker_id = uuid4().hex
         self._limits = limits
+        self._retention_policy = retention_policy
+        terminal_ttl = retention_policy.terminal_ttl_seconds
+        self._retention_ms = (
+            0 if terminal_ttl is None else max(1, math.ceil(terminal_ttl * 1000))
+        )
 
     @property
     def limits(self) -> MessagingLimits:
@@ -100,11 +110,17 @@ class RedisBackend(MessagingBackend):
 
         return self._limits
 
+    @property
+    def retention_policy(self) -> MessagingRetentionPolicy:
+        """Return the terminal replay policy enforced with the Redis clock."""
+
+        return self._retention_policy
+
     async def prepare(
         self,
         *,
         channel: str,
-        identity: Identity,
+        identity: RunIdentity,
         codec: str,
         after: int | None,
         cancellable: bool,
@@ -166,7 +182,7 @@ class RedisBackend(MessagingBackend):
             error=error,
         )
 
-    async def latest_seq(self, *, channel: str, identity: Identity) -> int:
+    async def latest_seq(self, *, channel: str, identity: RunIdentity) -> int:
         """Return the active generation's latest committed sequence."""
 
         return await _redis_journal.latest_seq(
@@ -179,7 +195,7 @@ class RedisBackend(MessagingBackend):
         self,
         *,
         channel: str,
-        identity: Identity,
+        identity: RunIdentity,
     ) -> RunStatus:
         """Return one run status after atomically settling an expired lease."""
 
@@ -193,7 +209,7 @@ class RedisBackend(MessagingBackend):
         self,
         *,
         channel: str,
-        identity: Identity,
+        identity: RunIdentity,
         after: int = 0,
         limit: int = 100,
     ) -> tuple[MessageEnvelope, ...]:
@@ -211,7 +227,7 @@ class RedisBackend(MessagingBackend):
         self,
         *,
         channel: str,
-        identity: Identity,
+        identity: RunIdentity,
         after: int,
     ) -> BackendRunHandle:
         """Resolve one follower and validate its cursor against the bound generation."""
@@ -289,7 +305,7 @@ class RedisBackend(MessagingBackend):
 
         return self._lease_ttl
 
-    async def delete_stream(self, *, channel: str, identity: Identity) -> None:
+    async def delete_stream(self, *, channel: str, identity: RunIdentity) -> None:
         """Delete one stream through a leased, generation-fenced cleanup."""
 
         return await _redis_control.delete_stream(
@@ -312,7 +328,7 @@ class RedisBackend(MessagingBackend):
             delete_owner=delete_owner,
         )
 
-    def _scope(self, channel: str, identity: Identity) -> _RedisStreamScope:
+    def _scope(self, channel: str, identity: RunIdentity) -> _RedisStreamScope:
         return _redis_control._scope(
             self,
             channel,
@@ -322,7 +338,7 @@ class RedisBackend(MessagingBackend):
     def _keys(
         self,
         channel: str,
-        identity: Identity,
+        identity: RunIdentity,
         *,
         generation: int,
     ) -> _RedisKeys:
@@ -357,7 +373,7 @@ class RedisBackend(MessagingBackend):
     async def _run_snapshot(
         self,
         keys: _RedisKeys,
-        identity: Identity,
+        identity: RunIdentity,
         *,
         after: int | None = None,
     ) -> _RunSnapshot:
@@ -373,7 +389,7 @@ class RedisBackend(MessagingBackend):
     async def _settled_run_snapshot(
         self,
         keys: _RedisKeys,
-        identity: Identity,
+        identity: RunIdentity,
         *,
         after: int | None = None,
     ) -> _RunSnapshot:
@@ -455,7 +471,7 @@ class RedisBackend(MessagingBackend):
         value: _RedisScriptValue,
         *,
         channel: str,
-        identity: Identity,
+        identity: RunIdentity,
         after: int | None,
         end_seq: int,
     ) -> tuple[MessageEnvelope, ...]:
@@ -484,7 +500,7 @@ class RedisBackend(MessagingBackend):
     def _decode_entry(
         self,
         channel: str,
-        identity: Identity,
+        identity: RunIdentity,
         entry: tuple[bytes, Mapping[bytes, bytes]],
     ) -> MessageEnvelope:
         return _redis_journal._decode_entry(
@@ -510,7 +526,7 @@ class RedisBackend(MessagingBackend):
     @staticmethod
     def _message_signature(
         *,
-        identity: Identity,
+        identity: RunIdentity,
         codec: str,
         payload: bytes,
         checkpoint: RecoveryCheckpoint | None,

@@ -20,16 +20,31 @@ services:
       start_period: 30s
     restart: unless-stopped
 
-  redis:
+  redis-control:
     profiles: [bundled]
     image: redis/redis-stack-server:7.4.0-v8@sha256:798ab84d9f266936b034ab11c4d04a2b8e4b441884c5aa7d17ac951eefdf742a
     entrypoint: [/bin/sh, -ec]
-    command: ['export REDIS_ARGS="--appendonly yes --requirepass $$(cat /run/secrets/redis_password)"; exec /entrypoint.sh']
-    secrets: [redis_password]
+    command: ['export REDIS_ARGS="--appendonly yes --requirepass $$(cat /run/secrets/redis_control_password)"; exec /entrypoint.sh']
+    secrets: [redis_control_password]
     volumes:
-      - redis-data:/data
+      - redis-control-data:/data
     healthcheck:
-      test: [CMD-SHELL, "redis-cli -a $$(cat /run/secrets/redis_password) ping | grep -q PONG"]
+      test: [CMD-SHELL, "redis-cli -a $$(cat /run/secrets/redis_control_password) ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  redis-runtime:
+    profiles: [bundled]
+    image: redis/redis-stack-server:7.4.0-v8@sha256:798ab84d9f266936b034ab11c4d04a2b8e4b441884c5aa7d17ac951eefdf742a
+    entrypoint: [/bin/sh, -ec]
+    command: ['export REDIS_ARGS="--appendonly yes --requirepass $$(cat /run/secrets/redis_runtime_password)"; exec /entrypoint.sh']
+    secrets: [redis_runtime_password]
+    volumes:
+      - redis-runtime-data:/data
+    healthcheck:
+      test: [CMD-SHELL, "redis-cli -a $$(cat /run/secrets/redis_runtime_password) ping | grep -q PONG"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -81,11 +96,12 @@ services:
     env_file: ${STUDIO_ENV_FILE:-.env}
     environment:
       DATABASE_URL_FILE: /run/secrets/database_url
-      REDIS_PASSWORD_FILE: /run/secrets/redis_password
+      REDIS_CONTROL_PASSWORD_FILE: /run/secrets/redis_control_password
+      REDIS_RUNTIME_PASSWORD_FILE: /run/secrets/redis_runtime_password
       OPEN_SANDBOX_API_KEY_FILE: /run/secrets/opensandbox_api_key
     extra_hosts:
       - host.docker.internal:host-gateway
-    secrets: [database_url, redis_password, opensandbox_api_key]
+    secrets: [database_url, redis_control_password, redis_runtime_password, opensandbox_api_key]
     ports:
       - "${STUDIO_BIND_ADDRESS:-127.0.0.1}:${STUDIO_PORT:-8090}:8090"
     volumes:
@@ -102,7 +118,10 @@ services:
       mysql:
         condition: service_healthy
         required: false
-      redis:
+      redis-control:
+        condition: service_healthy
+        required: false
+      redis-runtime:
         condition: service_healthy
         required: false
       opensandbox:
@@ -123,8 +142,10 @@ secrets:
     file: ${SECRETS_DIR:-./secrets}/mysql_root_password
   mysql_password:
     file: ${SECRETS_DIR:-./secrets}/mysql_password
-  redis_password:
-    file: ${SECRETS_DIR:-./secrets}/redis_password
+  redis_control_password:
+    file: ${SECRETS_DIR:-./secrets}/redis_control_password
+  redis_runtime_password:
+    file: ${SECRETS_DIR:-./secrets}/redis_runtime_password
   opensandbox_api_key:
     file: ${SECRETS_DIR:-./secrets}/opensandbox_api_key
   database_url:
@@ -132,6 +153,7 @@ secrets:
 
 volumes:
   mysql-data:
-  redis-data:
+  redis-control-data:
+  redis-runtime-data:
   opensandbox-data:
   studio-logs:

@@ -86,11 +86,13 @@ def build_web_search_tool(api_key: str | None) -> BaseTool:
             topic=topic,
         )
         try:
-            raw = await AsyncTavilyClient(api_key=api_key).search(
-                query=search_input.query,
-                max_results=search_input.max_results,
-                topic=search_input.topic,
-            )
+            # 每次 Tool 调用独占一个短生命周期连接池，取消和异常也由上下文完成关闭
+            async with AsyncTavilyClient(api_key=api_key) as client:
+                raw = await client.search(
+                    query=search_input.query,
+                    max_results=search_input.max_results,
+                    topic=search_input.topic,
+                )
             payload = WebSearchPayload.model_validate(raw)
         except ToolException:
             raise

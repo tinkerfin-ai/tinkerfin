@@ -20,7 +20,7 @@ from langgraph.graph.message import add_messages
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import interrupt
 
-from tinkerfin_agui_adapter import DeepAgentAgUiAdapter, Identity
+from tinkerfin_agui_adapter import DeepAgentAgUiAdapter, RunIdentity
 from tinkerfin_agui_adapter.ids import ScopedIdCodec
 
 
@@ -32,8 +32,8 @@ class _InterruptChildState(_State, total=False):
     messages: Annotated[list[AnyMessage], add_messages]
 
 
-def _identity(*, run_id: str = "run-1") -> Identity:
-    return Identity(threadId="thread-1", runId=run_id)
+def _identity(*, run_id: str = "run-1") -> RunIdentity:
+    return RunIdentity(threadId="thread-1", runId=run_id)
 
 
 def _increment(state: _State) -> dict[str, int]:

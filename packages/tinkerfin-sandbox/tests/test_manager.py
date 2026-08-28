@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 import unittest
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -1901,7 +1902,9 @@ async def test_reset_requires_a_managed_key() -> None:
 
 
 @pytest.mark.asyncio
-async def test_strict_startup_warmup_propagates_creation_failure() -> None:
+async def test_strict_startup_warmup_propagates_without_package_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Require strict warmup failure to prevent the manager becoming available."""
 
     manager = _new_manager(
@@ -1910,11 +1913,54 @@ async def test_strict_startup_warmup_propagates_creation_failure() -> None:
         fail_on_startup_warmup_error=True,
     )
 
-    with pytest.raises(UnexpectedOpenSandboxBackendError) as captured:
-        await manager.start()
+    with caplog.at_level(logging.DEBUG, logger="tinkerfin.sandbox"):
+        with pytest.raises(UnexpectedOpenSandboxBackendError) as captured:
+            await manager.start()
+        await manager.aclose()
     assert isinstance(captured.value.cause, RuntimeError)
     assert str(captured.value.cause) == "warmup failed"
-    await manager.aclose()
+    assert caplog.records == []
+
+
+@pytest.mark.asyncio
+async def test_best_effort_warmup_logs_once_after_releasing_the_owner_lock() -> None:
+    manager = _new_manager(
+        client=_FailingCreateClient(),
+        warm_pool_size=1,
+        fail_on_startup_warmup_error=False,
+    )
+    records: list[logging.LogRecord] = []
+
+    class _LockCheckingHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            assert not manager._warm_fill_lock.locked()
+            records.append(record)
+
+    logger = logging.getLogger("tinkerfin.sandbox.lifecycle")
+    handler = _LockCheckingHandler()
+    previous_level = logger.level
+    previous_propagate = logger.propagate
+    logger.addHandler(handler)
+    logger.setLevel(logging.WARNING)
+    logger.propagate = False
+    try:
+        await manager.start()
+        await manager.aclose()
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
+        logger.propagate = previous_propagate
+
+    failures = [
+        record
+        for record in records
+        if record.getMessage() == "Sandbox warm-pool creation failed"
+    ]
+    assert len(failures) == 1
+    assert failures[0].__dict__["tinkerfin_error_type"] == (
+        "UnexpectedOpenSandboxBackendError"
+    )
+    assert failures[0].exc_info is None
 
 
 @pytest.mark.asyncio
@@ -2307,15 +2353,20 @@ async def test_repeated_cancellation_cannot_interrupt_warm_claim_release() -> No
 
 
 @pytest.mark.asyncio
-async def test_close_after_cancelled_startup_still_closes_state_and_client() -> None:
+async def test_close_after_cancelled_startup_is_silent_and_closes_resources(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     client = _CancelledWarmupClient()
     state = _CloseObservedState()
     manager = _new_manager(client=client, state=state, warm_pool_size=1)
 
-    with pytest.raises(asyncio.CancelledError):
-        await manager.start()
+    with caplog.at_level(logging.DEBUG, logger="tinkerfin.sandbox"):
+        with pytest.raises(asyncio.CancelledError):
+            await manager.start()
 
-    close_result = (await asyncio.gather(manager.aclose(), return_exceptions=True))[0]
+        close_result = (await asyncio.gather(manager.aclose(), return_exceptions=True))[
+            0
+        ]
     state_close_calls = state.close_calls
     client_close_calls = client.close_calls
     if isinstance(close_result, BaseException):
@@ -2325,6 +2376,7 @@ async def test_close_after_cancelled_startup_still_closes_state_and_client() -> 
     assert close_result is None
     assert state_close_calls == 1
     assert client_close_calls == 1
+    assert caplog.records == []
 
 
 @pytest.mark.asyncio

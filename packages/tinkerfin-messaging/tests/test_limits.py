@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from tinkerfin import Identity
+from tinkerfin import RunIdentity
 from tinkerfin_messaging import (
     MemoryBackend,
     MessagingLimits,
@@ -13,8 +13,8 @@ from tinkerfin_messaging import (
 )
 
 
-def _identity() -> Identity:
-    return Identity(threadId="quota-thread", runId="quota-run")
+def _identity() -> RunIdentity:
+    return RunIdentity(threadId="quota-thread", runId="quota-run")
 
 
 def test_messaging_limits_reject_invalid_capacity_shapes() -> None:

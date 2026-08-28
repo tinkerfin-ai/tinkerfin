@@ -10,7 +10,7 @@ coordinator 会作用于这个 factory 创建的每个 Runtime。
 如果同一用户、项目或会话不能同时运行两个任务，可以配置 coordinator。
 
 ```python
-from tinkerfin import Identity, InMemoryRunCoordinator, TinkerFin
+from tinkerfin import RunIdentity, InMemoryRunCoordinator, TinkerFin
 
 
 coordinator = InMemoryRunCoordinator(
@@ -18,13 +18,13 @@ coordinator = InMemoryRunCoordinator(
 )
 tinkerfin = TinkerFin(run_coordinator=coordinator)
 
-identity = Identity(threadId="tenant-7/user-42", runId="run-1")
+identity = RunIdentity(threadId="tenant-7/user-42", runId="run-1")
 agent = tinkerfin.create_deep_agent(model=model, tools=tools)
 runtime = agent.new(identity=identity)
 stream = runtime.astream(graph_input)
 ```
 
-每个 Runtime 都有 `Identity`。coordinator 接收同一个完整值，并在 Native 或 AG-UI
+每个 Runtime 都有 `RunIdentity`。coordinator 接收同一个完整值，并在 Native 或 AG-UI
 事件流的整个生命周期内持有协调作用域。
 
 内存 coordinator 只协调当前进程。如果应用有多个进程，可以实现 `RunCoordinator`，把锁放到共享系统中：
@@ -35,7 +35,7 @@ from contextlib import asynccontextmanager
 
 class CustomRunCoordinator:
     @asynccontextmanager
-    async def __call__(self, identity: Identity):
+    async def __call__(self, identity: RunIdentity):
         lock = await acquire_lock(identity.thread_id)
         try:
             yield
@@ -98,7 +98,12 @@ lock = RedisLeaseLock.from_url(
 
 活跃租约、等待者和释放操作会通过同一个 Redis 连接池发送短命令，但不会在两次轮询或续期之间独占连接。连接池应覆盖峰值并发获取、续期、释放以及应用自己的 Redis 请求。Redis Cluster 不受支持。
 
-## 观察器适合做什么
+## 选择合适的观察边界
+
+需要覆盖 input、resume checkpoint、interrupt、terminal、close 和已校验 Native part 的
+框架级 run/native 语义时，使用 `TinkerFin.observe(runtime_observer)`。Observer 为每个请求
+打开一个 session，参与强制持久边界；无法保存契约时让 Run fail-closed。配套实现是
+`tinkerfin-tracing.Tracer`。
 
 `on_part` 和 AG-UI 的 `on_event` 适合：
 
@@ -107,6 +112,7 @@ lock = RedisLeaseLock.from_url(
 - 更新运行进度；
 - 在事件交付前执行轻量校验。
 
-观察器会影响主事件流。不要在其中做同步网络请求或无法取消的长任务。
+三种观察路径都在主事件流生命周期内等待。不要执行同步网络请求或无法取消的长任务。
+传输投递诊断应进入日志、Metrics 或 OTel，不要把 AG-UI 或 Messaging 状态写入用户语义 Trace。
 
 下一篇：[Runtime 使用参考](api-reference.md)。

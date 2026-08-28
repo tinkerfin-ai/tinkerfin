@@ -17,16 +17,22 @@ from langchain_core.messages import AIMessageChunk
 from langgraph.graph.state import CompiledStateGraph
 from pydantic import ValidationError
 
-from tinkerfin import AgUiEventStream, DeepAgentDefinition, Identity
-from tinkerfin_agui_adapter import AgUiStreamContractError
+from tinkerfin import (
+    AgUiEventStream,
+    DeepAgentDefinition,
+    RunIdentity,
+    TinkerFin,
+    TinkerFinStreamProtocolError,
+)
+from tinkerfin_native_stream import NativeStreamContractError
 
 
 def _identity(
     *,
     thread_id: str = "thread-1",
     run_id: str = "run-1",
-) -> Identity:
-    return Identity(threadId=thread_id, runId=run_id)
+) -> RunIdentity:
+    return RunIdentity(threadId=thread_id, runId=run_id)
 
 
 class _SourceGraph:
@@ -66,7 +72,7 @@ def _bind_definition_factory(
 def _agui_stream(
     source_factory: Callable[[], AsyncIterator[object]],
     *,
-    identity: Identity | None = None,
+    identity: RunIdentity | None = None,
     timeout: float | None = None,
     settlement_timeout: float | None = None,
     expose_reasoning_events: bool = False,
@@ -142,7 +148,7 @@ async def test_agui_stream_keeps_its_immutable_identity() -> None:
 async def test_initialization_failure_uses_the_standard_complete_lifecycle() -> None:
     identity = _identity()
 
-    stream = AgUiEventStream.from_initialization_error(
+    stream = TinkerFin().failed_agui_run(
         RuntimeError("cannot initialize runtime"),
         identity=identity,
     )
@@ -167,7 +173,7 @@ async def test_initialization_failure_marker_uses_canonical_identity_and_parent(
     None
 ):
     identity = _identity(thread_id="thread-1")
-    stream = AgUiEventStream.from_initialization_error(
+    stream = TinkerFin().failed_agui_run(
         RuntimeError("cannot initialize runtime"),
         identity=identity,
         parent_run_id="run-parent",
@@ -186,7 +192,7 @@ async def test_initialization_failure_marker_uses_canonical_identity_and_parent(
 
 @pytest.mark.asyncio
 async def test_initialization_failure_cancel_tail_keeps_release_marker() -> None:
-    stream = AgUiEventStream.from_initialization_error(
+    stream = TinkerFin().failed_agui_run(
         RuntimeError("cannot initialize runtime"),
         identity=_identity(),
     )
@@ -386,30 +392,28 @@ async def test_agui_abort_from_terminal_observer_is_an_idempotent_noop() -> None
 
 
 @pytest.mark.asyncio
-async def test_agui_records_conversion_error_and_emits_one_error_terminal(
+async def test_agui_conversion_error_emits_one_terminal_without_package_logging(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     async def parts() -> AsyncIterator[object]:
-        yield {"type": "not-a-stream-mode", "ns": (), "data": {}}
+        yield {
+            "type": "not-a-stream-mode",
+            "ns": (),
+            "data": {"api_token": "SECRET-RUNTIME"},
+        }
 
     stream = _agui_stream(parts)
-    with caplog.at_level(logging.ERROR, logger="tinkerfin.runtime"):
+    with caplog.at_level(logging.DEBUG, logger="tinkerfin"):
         events = [event async for event in stream]
 
     terminals = [event for event in events if isinstance(event, RunErrorEvent)]
     assert len(terminals) == 1
     assert terminals[0].message == "Agent run failed"
-    assert isinstance(stream.error, AgUiStreamContractError)
-    assert isinstance(stream.error.cause, ValidationError)
-    record = next(
-        item
-        for item in caplog.records
-        if item.getMessage() == "AG-UI runtime conversion failed"
-    )
-    assert record.__dict__["thread_id"] == "thread-1"
-    assert record.__dict__["run_id"] == "run-1"
-    assert record.__dict__["error_code"] == "runtime_error"
-    assert record.__dict__["error_type"] == "AgUiStreamContractError"
+    assert isinstance(stream.error, TinkerFinStreamProtocolError)
+    assert isinstance(stream.error.cause, NativeStreamContractError)
+    assert isinstance(stream.error.cause.cause, ValidationError)
+    assert caplog.records == []
+    assert "SECRET-RUNTIME" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -629,8 +633,9 @@ async def test_agui_conversion_error_survives_two_upstream_close_failures() -> N
     events = await _collect_events(stream)
 
     assert [event.type.value for event in events] == ["RUN_STARTED", "RUN_ERROR"]
-    assert isinstance(stream.error, AgUiStreamContractError)
-    assert isinstance(stream.error.cause, ValidationError)
+    assert isinstance(stream.error, TinkerFinStreamProtocolError)
+    assert isinstance(stream.error.cause, NativeStreamContractError)
+    assert isinstance(stream.error.cause.cause, ValidationError)
     assert any(
         "CancelledError: close awaitable cancelled itself" in note
         for note in stream.error.__notes__
@@ -655,10 +660,11 @@ async def test_agui_caller_cancellation_keeps_conversion_and_cleanup_evidence() 
         with pytest.raises(asyncio.CancelledError, match="caller stopped") as raised:
             await consumer
         notes = raised.value.__notes__
-        assert any("AgUiStreamContractError" in note for note in notes)
+        assert any("TinkerFinStreamProtocolError" in note for note in notes)
         assert any("RuntimeError: native close failed" in note for note in notes)
-        assert isinstance(stream.error, AgUiStreamContractError)
-        assert isinstance(stream.error.cause, ValidationError)
+        assert isinstance(stream.error, TinkerFinStreamProtocolError)
+        assert isinstance(stream.error.cause, NativeStreamContractError)
+        assert isinstance(stream.error.cause.cause, ValidationError)
     finally:
         parts.release_close.set()
         await asyncio.gather(consumer, return_exceptions=True)

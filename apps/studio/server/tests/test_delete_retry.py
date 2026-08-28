@@ -1,21 +1,70 @@
-"""跨存储会话删除失败后的幂等重试契约"""
+"""Trace 权威跨存储删除失败后的幂等重试契约"""
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import cast
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from tinkerfin import Identity
+from tinkerfin import RunIdentity
+from tinkerfin_contracts import (
+    RunClosedObservation,
+    RunInputObservation,
+    RunSourceContext,
+    RunStartedObservation,
+    RunTerminalObservation,
+)
+from tinkerfin_studio.api.errors import BusinessException, ConversationErrorCode
 from tinkerfin_studio.conversation.command import ConversationCommandService
 from tinkerfin_studio.conversation.repository import ConversationRepository
 from tinkerfin_studio.resources import ApplicationResources
+from tinkerfin_tracing import Tracer, TraceThreadNotFound
 
 
-@pytest.mark.parametrize("failure_stage", ["messaging", "checkpoint", "database"])
-async def test_delete_retries_each_cross_store_failure_safely(
+async def _completed_trace(tracer: Tracer, identity: RunIdentity) -> None:
+    context = RunSourceContext(
+        identity=identity,
+        runtime_profile="deepagents-v2",
+        input_kind="ordinary",
+        input={"messages": [{"id": "user-1", "role": "user", "content": "删除"}]},
+        config={},
+    )
+    trace_session = await tracer.open_run(context)
+    now = datetime.now(UTC)
+    for observation in (
+        RunStartedObservation(
+            identity=identity,
+            observed_at=now,
+            monotonic_ns=1,
+        ),
+        RunInputObservation(
+            identity=identity,
+            source=context,
+            observed_at=now,
+            monotonic_ns=2,
+        ),
+        RunTerminalObservation(
+            identity=identity,
+            outcome="succeeded",
+            observed_at=now,
+            monotonic_ns=3,
+        ),
+        RunClosedObservation(
+            identity=identity,
+            outcome="succeeded",
+            observed_at=now,
+            monotonic_ns=4,
+        ),
+    ):
+        await trace_session.observe(observation)
+    await trace_session.aclose()
+
+
+@pytest.mark.parametrize("failure_stage", ["checkpoint", "messaging", "database"])
+async def test_delete_retries_each_destructive_stage_without_restoring_old_authority(
     session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
     failure_stage: str,
@@ -27,21 +76,34 @@ async def test_delete_retries_each_cross_store_failure_safely(
         title="删除重试",
         model_id="main",
     )
+    registration = await repository.create_run_registration(
+        thread_id=thread.id,
+        run_id="run-delete",
+        parent_run_id=None,
+        model_id="main",
+        runtime_profile="deepagents-v2",
+        input_json={"runId": "run-delete"},
+        config_json={"runtimeProfile": "deepagents-v2"},
+    )
+    registration.status = "succeeded"
+    registration.terminal_outcome = "succeeded"
+    thread.last_run_id = registration.run_id
+    thread.status = "idle"
     await repository.commit()
     thread_pk = thread.id
     thread_id = thread.thread_id
+    identity = RunIdentity(threadId=thread_id, runId=registration.run_id)
+    tracer = Tracer()
+    await _completed_trace(tracer, identity)
     calls = {"messaging": 0, "checkpoint": 0, "database": 0}
 
-    class Projector:
-        async def reconcile(self, *, thread_pk: int, identity: Identity) -> int:
-            del thread_pk, identity
-            assert not session.in_transaction()
-            return 0
-
     class Channel:
-        async def delete_stream(self, *, identity: Identity) -> None:
+        async def get_run_status(self, *, identity: RunIdentity):
             del identity
-            assert not session.in_transaction()
+            return "completed"
+
+        async def delete_stream(self, *, identity: RunIdentity) -> None:
+            del identity
             calls["messaging"] += 1
             if failure_stage == "messaging" and calls["messaging"] == 1:
                 raise RuntimeError("messaging delete failed")
@@ -49,7 +111,6 @@ async def test_delete_retries_each_cross_store_failure_safely(
     class Checkpointer:
         async def adelete_thread(self, thread_id: str) -> None:
             del thread_id
-            assert not session.in_transaction()
             calls["checkpoint"] += 1
             if failure_stage == "checkpoint" and calls["checkpoint"] == 1:
                 raise RuntimeError("checkpoint delete failed")
@@ -66,16 +127,12 @@ async def test_delete_retries_each_cross_store_failure_safely(
     resources = cast(
         ApplicationResources,
         SimpleNamespace(
-            conversation_projector=Projector(),
+            tracer=tracer,
             conversation_channel=Channel(),
             agent_persistence=SimpleNamespace(checkpointer=Checkpointer()),
         ),
     )
-    service = ConversationCommandService(
-        repository,
-        user_id=7,
-        resources=resources,
-    )
+    service = ConversationCommandService(repository, user_id=7, resources=resources)
 
     with pytest.raises(RuntimeError, match="delete failed"):
         await service.delete(thread_id=thread_id)
@@ -83,6 +140,8 @@ async def test_delete_retries_each_cross_store_failure_safely(
     retained = await repository.get_thread_by_pk(thread_pk)
     assert retained is not None
     assert retained.status == "deleting"
+    with pytest.raises(TraceThreadNotFound):
+        await tracer.get(thread_id)
 
     await service.delete(thread_id=thread_id)
 
@@ -90,3 +149,74 @@ async def test_delete_retries_each_cross_store_failure_safely(
     assert calls["messaging"] >= 1
     assert calls["checkpoint"] >= 1
     assert calls["database"] >= 1
+
+
+async def test_delete_refuses_an_active_trace_and_restores_summary_status(
+    session: AsyncSession,
+) -> None:
+    repository = ConversationRepository(session)
+    thread = await repository.create_thread(
+        user_id=7,
+        thread_id="thread-delete-active",
+        title="运行中",
+        model_id="main",
+    )
+    registration = await repository.create_run_registration(
+        thread_id=thread.id,
+        run_id="run-active",
+        parent_run_id=None,
+        model_id="main",
+        runtime_profile="deepagents-v2",
+        input_json={"runId": "run-active"},
+        config_json={"runtimeProfile": "deepagents-v2"},
+    )
+    registration.status = "waiting"
+    thread.last_run_id = registration.run_id
+    thread.status = "waiting_approval"
+    await repository.commit()
+    tracer = Tracer()
+    identity = RunIdentity(threadId=thread.thread_id, runId=registration.run_id)
+    context = RunSourceContext(
+        identity=identity,
+        runtime_profile="deepagents-v2",
+        input_kind="ordinary",
+        input={"messages": []},
+        config={},
+    )
+    active_session = await tracer.open_run(context)
+    now = datetime.now(UTC)
+    await active_session.observe(
+        RunStartedObservation(
+            identity=identity,
+            observed_at=now,
+            monotonic_ns=1,
+        )
+    )
+    await active_session.observe(
+        RunInputObservation(
+            identity=identity,
+            source=context,
+            observed_at=now,
+            monotonic_ns=2,
+        )
+    )
+
+    class Channel:
+        async def get_run_status(self, *, identity: RunIdentity):
+            del identity
+            return "completed"
+
+    resources = cast(
+        ApplicationResources,
+        SimpleNamespace(tracer=tracer, conversation_channel=Channel()),
+    )
+    service = ConversationCommandService(repository, user_id=7, resources=resources)
+
+    with pytest.raises(BusinessException) as captured:
+        await service.delete(thread_id=thread.thread_id)
+
+    assert captured.value.error_code is ConversationErrorCode.DELETE_CONFLICT
+    stored = await repository.get_thread_by_pk(thread.id)
+    assert stored is not None
+    assert stored.status == "waiting_approval"
+    await active_session.aclose()

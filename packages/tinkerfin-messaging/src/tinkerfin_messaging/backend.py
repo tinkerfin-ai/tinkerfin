@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from abc import abstractmethod
 from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import dataclass
@@ -10,7 +11,7 @@ from datetime import UTC, datetime
 from typing import Literal, Protocol, runtime_checkable
 from uuid import uuid4
 
-from tinkerfin_agui_adapter import Identity
+from tinkerfin_contracts import RunIdentity
 
 from ._identity import required_identifier, required_identity
 from .errors import (
@@ -25,9 +26,11 @@ from .errors import (
     RunProducerFailed,
     StreamDeleteConflict,
     StreamDeleted,
+    StreamExpired,
 )
 from .limits import DEFAULT_MESSAGING_LIMITS, MessagingLimits
 from .models import MessageEnvelope, RecoveryCheckpoint
+from .retention import MessagingRetentionPolicy
 
 RunStatus = Literal[
     "running",
@@ -51,7 +54,7 @@ class BackendRunHandle:
     """
 
     channel: str
-    identity: Identity
+    identity: RunIdentity
     owner_token: str | None
     fence: int | None
     generation: int | None = None
@@ -116,17 +119,47 @@ class MessagingBackend(Protocol):
 
         ...
 
+    @property
+    def retention_policy(self) -> MessagingRetentionPolicy:
+        """Return the immutable terminal replay retention policy."""
+
+        ...
+
     async def prepare(
         self,
         *,
         channel: str,
-        identity: Identity,
+        identity: RunIdentity,
         codec: str,
         after: int | None,
         cancellable: bool,
         recoverable: bool,
     ) -> PreparedRun:
-        """Atomically start, recover, or attach to one durable semantic run."""
+        """Atomically start, recover, or attach to one durable semantic run.
+
+        Args:
+            channel: Canonical logical channel containing the stream.
+            identity: Exact thread and semantic Run identity.
+            codec: Stable codec identity required for every generation attachment.
+            after: Exclusive replay cursor, or ``None`` to attach at the current tail.
+            cancellable: Whether the new producer accepts remote cancellation.
+            recoverable: Whether a lost producer may resume from a durable checkpoint.
+
+        Returns:
+            Exact generation handle, validated cursor, ownership decision, and optional
+            recovery checkpoint.
+
+        Raises:
+            RunAlreadyActive: Another producer already owns the semantic Run.
+            RunNotFound: A requested attachment or recovery target does not exist.
+            CodecMismatch: Existing durable data uses another codec identity.
+            InvalidCursor: ``after`` is outside the current committed range.
+            StreamDeleted: The selected stream generation was deleted.
+            StreamExpired: Terminal replay retention has elapsed.
+            MessagingError: Durable state cannot be classified or mutated safely.
+            TypeError: A public input has the wrong type.
+            ValueError: An identifier or option is not canonical.
+        """
 
         ...
 
@@ -139,7 +172,27 @@ class MessagingBackend(Protocol):
         payload: bytes,
         checkpoint: RecoveryCheckpoint | None = None,
     ) -> MessageEnvelope:
-        """Idempotently commit one encoded message under the producer fence."""
+        """Idempotently commit one encoded message under the producer fence.
+
+        Args:
+            handle: Owned exact-generation handle returned by ``prepare()``.
+            message_id: Stable semantic message identity used for idempotency.
+            codec: Codec identity that must match the prepared generation.
+            payload: Already encoded bounded message bytes.
+            checkpoint: Optional recovery position committed with this message.
+
+        Returns:
+            The existing or newly committed immutable envelope and sequence.
+
+        Raises:
+            BackendOwnershipLost: The producer token or fence is no longer current.
+            MessageIdConflict: The same message ID already names different evidence.
+            CodecMismatch: The supplied codec differs from the durable generation.
+            MessagingQuotaExceeded: Payload or checkpoint limits are exceeded.
+            MessagingError: Durable append evidence is unavailable or inconsistent.
+            TypeError: A public input has the wrong type.
+            ValueError: Payload metadata is internally inconsistent.
+        """
 
         ...
 
@@ -170,12 +223,35 @@ class MessagingBackend(Protocol):
         status: FinalRunStatus,
         error: BaseException | None = None,
     ) -> None:
-        """Commit one terminal run status and release producer ownership."""
+        """Commit one terminal run status and release producer ownership.
+
+        Args:
+            handle: Current producer handle after settlement has begun.
+            status: Exactly one durable terminal classification.
+            error: Optional trusted failure retained for in-process followers.
+
+        Raises:
+            BackendOwnershipLost: The producer handle no longer owns settlement.
+            MessagingError: The terminal transition cannot be committed safely.
+        """
 
         ...
 
-    async def latest_seq(self, *, channel: str, identity: Identity) -> int:
-        """Return the current generation's last committed sequence."""
+    async def latest_seq(self, *, channel: str, identity: RunIdentity) -> int:
+        """Return the current generation's last committed sequence.
+
+        Args:
+            channel: Canonical logical channel containing the stream.
+            identity: Exact thread and semantic Run identity.
+
+        Returns:
+            Greatest committed sequence, or zero for an empty generation.
+
+        Raises:
+            StreamExpired: Its terminal replay retention has elapsed.
+            MessagingError: Durable sequence evidence cannot be read safely.
+            ValueError: The channel or identity is not canonical.
+        """
 
         ...
 
@@ -184,12 +260,24 @@ class MessagingBackend(Protocol):
         self,
         *,
         channel: str,
-        identity: Identity,
+        identity: RunIdentity,
     ) -> RunStatus:
         """Return one durable run's current authoritative status.
 
         A backend may atomically settle an expired producer lease as
         ``owner_lost`` while obtaining this status.
+
+        Args:
+            channel: Canonical logical channel containing the durable run.
+            identity: Exact thread and semantic Run identity to inspect.
+
+        Returns:
+            Current running, cancellation, completion, failure, or ownership-loss state.
+
+        Raises:
+            RunNotFound: No durable record exists for the exact channel and identity.
+            MessagingBackendError: Durable state cannot be read or classified safely.
+            ValueError: The channel or identity is not canonical.
         """
 
         ...
@@ -198,11 +286,29 @@ class MessagingBackend(Protocol):
         self,
         *,
         channel: str,
-        identity: Identity,
+        identity: RunIdentity,
         after: int = 0,
         limit: int = 100,
     ) -> tuple[MessageEnvelope, ...]:
-        """Read a bounded page strictly after a validated thread cursor."""
+        """Read a bounded page strictly after a validated thread cursor.
+
+        Args:
+            channel: Canonical logical channel containing the stream.
+            identity: Exact thread and semantic Run identity.
+            after: Exclusive non-negative committed sequence.
+            limit: Positive maximum number of envelopes returned.
+
+        Returns:
+            Immutable ascending committed envelopes from one generation.
+
+        Raises:
+            RunNotFound: No current generation exists for the identity.
+            InvalidCursor: ``after`` is beyond the committed tail.
+            StreamDeleted: The selected generation was explicitly deleted.
+            StreamExpired: Its terminal replay retention has elapsed.
+            MessagingError: Durable payload evidence cannot be read safely.
+            ValueError: A cursor, limit, channel, or identity is invalid.
+        """
 
         ...
 
@@ -210,10 +316,27 @@ class MessagingBackend(Protocol):
         self,
         *,
         channel: str,
-        identity: Identity,
+        identity: RunIdentity,
         after: int,
     ) -> BackendRunHandle:
-        """Atomically bind a follower and validate its thread cursor."""
+        """Atomically bind a follower and validate its thread cursor.
+
+        Args:
+            channel: Canonical logical channel containing the stream.
+            identity: Exact thread and semantic Run identity.
+            after: Exclusive sequence already delivered to the follower.
+
+        Returns:
+            Observer-only handle pinned to the validated current generation.
+
+        Raises:
+            RunNotFound: No current generation exists for the identity.
+            InvalidCursor: ``after`` is beyond the committed tail.
+            StreamDeleted: The selected generation was explicitly deleted.
+            StreamExpired: Its terminal replay retention has elapsed.
+            MessagingError: A generation cannot be bound atomically.
+            ValueError: The cursor, channel, or identity is invalid.
+        """
 
         ...
 
@@ -223,27 +346,93 @@ class MessagingBackend(Protocol):
         *,
         after: int,
     ) -> AsyncIterator[MessageEnvelope]:
-        """Return an ordered follower bound to the handle's exact generation."""
+        """Return an ordered follower bound to the handle's exact generation.
+
+        Args:
+            handle: Observer-only exact-generation handle from ``bind_follow()``.
+            after: Exclusive sequence already delivered to the caller.
+
+        Returns:
+            Cancellation-responsive iterator of ascending committed envelopes.
+
+        Raises:
+            InvalidCursor: ``after`` is beyond the bound generation tail.
+            RunProducerFailed: The producer terminates as failed or owner-lost.
+            StreamDeleted: The bound generation is deleted during iteration.
+            StreamExpired: Its terminal replay retention elapses.
+            MessagingError: Durable follow evidence becomes unavailable or corrupt.
+            ValueError: The handle or cursor is invalid.
+        """
 
         ...
 
     async def request_cancel(self, handle: BackendRunHandle) -> bool:
-        """Durably request producer cancellation if the run still accepts it."""
+        """Durably request producer cancellation if the run still accepts it.
+
+        Args:
+            handle: Observer or producer handle selecting one exact generation.
+
+        Returns:
+            Whether a new cancellation request was durably recorded.
+
+        Raises:
+            CancellationUnsupported: The active producer is not cancellable.
+            RunNotFound: The selected run or generation does not exist.
+            StreamDeleted: The selected generation was explicitly deleted.
+            MessagingError: Cancellation state cannot be changed safely.
+        """
 
         ...
 
     async def wait_for_cancel(self, handle: BackendRunHandle) -> bool:
-        """Wait until cancellation is requested or the run becomes terminal."""
+        """Wait until cancellation is requested or the run becomes terminal.
+
+        Args:
+            handle: Owned producer handle whose cancellation state is observed.
+
+        Returns:
+            ``True`` for a durable cancellation request, otherwise ``False`` after
+            terminal settlement.
+
+        Raises:
+            BackendOwnershipLost: The handle no longer owns the producer fence.
+            StreamDeleted: The selected generation was explicitly deleted.
+            MessagingError: Cancellation evidence cannot be observed safely.
+        """
 
         ...
 
     async def wait_finished(self, handle: BackendRunHandle) -> RunStatus:
-        """Wait for and return the durable terminal run status."""
+        """Wait for and return the durable terminal run status.
+
+        Args:
+            handle: Exact-generation handle selecting the run to observe.
+
+        Returns:
+            Completed, cancelled, failed, or owner-lost terminal status.
+
+        Raises:
+            RunNotFound: The selected run or generation does not exist.
+            StreamDeleted: The selected generation was explicitly deleted.
+            MessagingError: Terminal evidence cannot be observed safely.
+        """
 
         ...
 
     async def failure(self, handle: BackendRunHandle) -> BaseException | None:
-        """Return the trusted producer failure associated with a terminal run."""
+        """Return the trusted producer failure associated with a terminal run.
+
+        Args:
+            handle: Exact-generation handle selecting a settled run.
+
+        Returns:
+            In-process producer failure, bounded remote evidence, or ``None``.
+
+        Raises:
+            RunNotFound: The selected run or generation does not exist.
+            StreamDeleted: The selected generation was explicitly deleted.
+            MessagingError: Failure evidence cannot be reconstructed safely.
+        """
 
         ...
 
@@ -260,11 +449,22 @@ class MessagingBackend(Protocol):
         ...
 
     async def renew(self, handle: BackendRunHandle) -> bool:
-        """Renew producer ownership and report whether its fence remains current."""
+        """Renew producer ownership and report whether its fence remains current.
+
+        Args:
+            handle: Owned producer handle with token, fence, and generation.
+
+        Returns:
+            ``True`` only while the same producer fence remains authoritative.
+
+        Raises:
+            MessagingError: Lease state cannot be read or renewed safely.
+            TypeError: ``handle`` is not a backend run handle.
+        """
 
         ...
 
-    async def delete_stream(self, *, channel: str, identity: Identity) -> None:
+    async def delete_stream(self, *, channel: str, identity: RunIdentity) -> None:
         """Delete one inactive stream and all of its durable run data.
 
         Missing and previously deleted streams are successful no-ops. An active
@@ -276,6 +476,8 @@ class MessagingBackend(Protocol):
 
         Raises:
             StreamDeleteConflict: The stream still has an active producer.
+            MessagingError: Durable stream data cannot be deleted safely.
+            ValueError: The channel or identity is not canonical.
         """
 
         ...
@@ -285,7 +487,7 @@ class _RunRecord:
     def __init__(
         self,
         *,
-        identity: Identity,
+        identity: RunIdentity,
         start_seq: int,
         owner_token: str,
         cancellable: bool,
@@ -305,6 +507,8 @@ class _RunRecord:
 
 
 class _StreamState:
+    """Own one in-memory generation, its active Run, and terminal deadline."""
+
     def __init__(self, *, generation: int) -> None:
         self.generation = generation
         self.deleted = False
@@ -315,34 +519,60 @@ class _StreamState:
             str, tuple[str, str, bytes, RecoveryCheckpoint | None]
         ] = {}
         self.runs: dict[str, _RunRecord] = {}
-        self.active_identity: Identity | None = None
+        self.active_identity: RunIdentity | None = None
         self.payload_bytes = 0
+        self.expires_at_monotonic: float | None = None
 
 
 class _ChannelState:
+    """Coordinate thread generations and retain stale-handle dispositions."""
+
     def __init__(self) -> None:
         self.lock = asyncio.Lock()
         self.codec: str | None = None
         self.streams: dict[str, _StreamState] = {}
         self.next_generations: dict[str, int] = {}
+        self.tombstones: dict[str, dict[int, Literal["deleted", "expired"]]] = {}
 
 
 class MemoryBackend(MessagingBackend):
     """Keep ordered logs and run coordination in one event loop process."""
 
-    def __init__(self, *, limits: MessagingLimits = DEFAULT_MESSAGING_LIMITS) -> None:
-        """Initialize process-local streams with immutable capacity limits."""
+    def __init__(
+        self,
+        *,
+        limits: MessagingLimits = DEFAULT_MESSAGING_LIMITS,
+        retention_policy: MessagingRetentionPolicy = MessagingRetentionPolicy(),
+    ) -> None:
+        """Initialize process-local streams with capacity and retention limits.
+
+        Args:
+            limits: Immutable payload and per-thread capacity contract.
+            retention_policy: Terminal replay deadline policy; disabled by default.
+
+        Raises:
+            TypeError: Either policy has the wrong public type.
+        """
 
         if not isinstance(limits, MessagingLimits):
             raise TypeError("limits must be a MessagingLimits")
+        if not isinstance(retention_policy, MessagingRetentionPolicy):
+            raise TypeError("retention_policy must be a MessagingRetentionPolicy")
         self._channels: dict[str, _ChannelState] = {}
         self._limits = limits
+        self._retention_policy = retention_policy
 
     @property
     def limits(self) -> MessagingLimits:
         """Return the immutable limits applied to every in-memory generation."""
 
         return self._limits
+
+    @property
+    def retention_policy(self) -> MessagingRetentionPolicy:
+        """Return the terminal replay policy applied to every stream."""
+
+        return self._retention_policy
 
     @property
     def lease_renew_interval(self) -> float | None:
@@ -364,7 +594,7 @@ class MemoryBackend(MessagingBackend):
             self._owned_record(state, handle)
             return True
 
-    async def delete_stream(self, *, channel: str, identity: Identity) -> None:
+    async def delete_stream(self, *, channel: str, identity: RunIdentity) -> None:
         """Atomically delete one inactive in-memory stream."""
 
         required_identifier("channel", channel)
@@ -373,7 +603,7 @@ class MemoryBackend(MessagingBackend):
         if channel_state is None:
             return
         async with channel_state.lock:
-            state = channel_state.streams.get(identity.thread_id)
+            state = self._expire_if_due(channel_state, identity.thread_id)
             if state is None:
                 return
             async with state.condition:
@@ -389,16 +619,125 @@ class MemoryBackend(MessagingBackend):
                 channel_state.next_generations[identity.thread_id] = (
                     state.generation + 1
                 )
+                self._record_tombstone(
+                    channel_state,
+                    identity.thread_id,
+                    generation=state.generation,
+                    reason="deleted",
+                )
                 state.condition.notify_all()
+
+    @staticmethod
+    def _record_tombstone(
+        channel_state: _ChannelState,
+        thread_id: str,
+        *,
+        generation: int,
+        reason: Literal["deleted", "expired"],
+    ) -> None:
+        """Retain why an old generation can no longer satisfy a bound cursor."""
+
+        channel_state.tombstones.setdefault(thread_id, {})[generation] = reason
+
+    def _expire_if_due(
+        self,
+        channel_state: _ChannelState,
+        thread_id: str,
+    ) -> _StreamState | None:
+        """Lazily retire one terminal generation using a monotonic deadline."""
+
+        state = channel_state.streams.get(thread_id)
+        if state is None:
+            return None
+        deadline = state.expires_at_monotonic
+        if deadline is None or time.monotonic() < deadline:
+            return state
+        state.deleted = True
+        del channel_state.streams[thread_id]
+        channel_state.next_generations[thread_id] = state.generation + 1
+        self._record_tombstone(
+            channel_state,
+            thread_id,
+            generation=state.generation,
+            reason="expired",
+        )
+        return None
+
+    @staticmethod
+    def _tombstone_reason(
+        channel_state: _ChannelState,
+        thread_id: str,
+        generation: int | None,
+    ) -> tuple[int, Literal["deleted", "expired"]] | None:
+        """Resolve an exact or latest unavailable generation disposition."""
+
+        tombstones = channel_state.tombstones.get(thread_id, {})
+        if generation is not None:
+            reason = tombstones.get(generation)
+            return None if reason is None else (generation, reason)
+        if not tombstones:
+            return None
+        latest = max(tombstones)
+        return latest, tombstones[latest]
+
+    @staticmethod
+    def _raise_tombstone(
+        *,
+        channel: str,
+        identity: RunIdentity,
+        generation: int,
+        reason: Literal["deleted", "expired"],
+    ) -> None:
+        """Raise the stable error associated with one generation tombstone."""
+
+        if reason == "expired":
+            raise StreamExpired(
+                channel=channel,
+                identity=identity,
+                generation=generation,
+            )
+        raise StreamDeleted(
+            channel=channel,
+            identity=identity,
+            generation=generation,
+        )
 
     def _state_for_handle(self, handle: BackendRunHandle) -> _StreamState:
         channel_state = self._channels.get(handle.channel)
-        state = (
-            None
-            if channel_state is None
-            else channel_state.streams.get(handle.identity.thread_id)
-        )
+        state = None
+        if channel_state is not None:
+            state = self._expire_if_due(channel_state, handle.identity.thread_id)
+            if state is not None and (
+                handle.generation is not None and handle.generation != state.generation
+            ):
+                tombstone = self._tombstone_reason(
+                    channel_state,
+                    handle.identity.thread_id,
+                    handle.generation,
+                )
+                if tombstone is not None:
+                    generation, reason = tombstone
+                    self._raise_tombstone(
+                        channel=handle.channel,
+                        identity=handle.identity,
+                        generation=generation,
+                        reason=reason,
+                    )
         if state is None:
+            if channel_state is not None:
+                tombstone = self._tombstone_reason(
+                    channel_state,
+                    handle.identity.thread_id,
+                    handle.generation,
+                )
+                if tombstone is not None:
+                    generation, reason = tombstone
+                    self._raise_tombstone(
+                        channel=handle.channel,
+                        identity=handle.identity,
+                        generation=generation,
+                        reason=reason,
+                    )
             if handle.generation is not None:
                 raise StreamDeleted(
                     channel=handle.channel,
@@ -420,7 +759,7 @@ class MemoryBackend(MessagingBackend):
         self,
         *,
         channel: str,
-        identity: Identity,
+        identity: RunIdentity,
         codec: str,
         after: int | None,
         cancellable: bool,
@@ -433,8 +772,27 @@ class MemoryBackend(MessagingBackend):
         required_identifier("codec", codec)
         channel_state = self._channel(channel)
         async with channel_state.lock:
-            state = channel_state.streams.get(identity.thread_id)
+            state = self._expire_if_due(channel_state, identity.thread_id)
             if state is None:
+                expired = self._tombstone_reason(
+                    channel_state,
+                    identity.thread_id,
+                    None,
+                )
+                if (
+                    expired is not None
+                    and expired[1] == "expired"
+                    and after
+                    not in {
+                        None,
+                        0,
+                    }
+                ):
+                    raise StreamExpired(
+                        channel=channel,
+                        identity=identity,
+                        generation=expired[0],
+                    )
                 generation = channel_state.next_generations.get(identity.thread_id, 1)
                 state = _StreamState(generation=generation)
                 channel_state.streams[identity.thread_id] = state
@@ -483,6 +841,9 @@ class MemoryBackend(MessagingBackend):
                     channel_state.codec = codec
                 state.runs[identity.run_id] = record
                 state.active_identity = identity
+                # Only a genuinely new Run clears terminal retention. Attaching to an
+                # existing terminal Run leaves its original deadline unchanged.
+                state.expires_at_monotonic = None
                 return PreparedRun(
                     handle=BackendRunHandle(
                         channel=channel,
@@ -607,9 +968,13 @@ class MemoryBackend(MessagingBackend):
             record.end_seq = len(state.messages)
             if state.active_identity == handle.identity:
                 state.active_identity = None
+            terminal_ttl = self._retention_policy.terminal_ttl_seconds
+            state.expires_at_monotonic = (
+                None if terminal_ttl is None else time.monotonic() + terminal_ttl
+            )
             state.condition.notify_all()
 
-    async def latest_seq(self, *, channel: str, identity: Identity) -> int:
+    async def latest_seq(self, *, channel: str, identity: RunIdentity) -> int:
         """Return the latest committed sequence or zero for an empty stream."""
 
         required_identifier("channel", channel)
@@ -618,8 +983,19 @@ class MemoryBackend(MessagingBackend):
         if channel_state is None:
             return 0
         async with channel_state.lock:
-            state = channel_state.streams.get(identity.thread_id)
+            state = self._expire_if_due(channel_state, identity.thread_id)
             if state is None:
+                tombstone = self._tombstone_reason(
+                    channel_state,
+                    identity.thread_id,
+                    None,
+                )
+                if tombstone is not None and tombstone[1] == "expired":
+                    raise StreamExpired(
+                        channel=channel,
+                        identity=identity,
+                        generation=tombstone[0],
+                    )
                 return 0
             async with state.condition:
                 return len(state.messages)
@@ -628,7 +1004,7 @@ class MemoryBackend(MessagingBackend):
         self,
         *,
         channel: str,
-        identity: Identity,
+        identity: RunIdentity,
     ) -> RunStatus:
         """Return the current in-memory status for one exact semantic run."""
 
@@ -638,8 +1014,19 @@ class MemoryBackend(MessagingBackend):
         if channel_state is None:
             raise RunNotFound(identity=identity)
         async with channel_state.lock:
-            state = channel_state.streams.get(identity.thread_id)
+            state = self._expire_if_due(channel_state, identity.thread_id)
             if state is None:
+                tombstone = self._tombstone_reason(
+                    channel_state,
+                    identity.thread_id,
+                    None,
+                )
+                if tombstone is not None and tombstone[1] == "expired":
+                    raise StreamExpired(
+                        channel=channel,
+                        identity=identity,
+                        generation=tombstone[0],
+                    )
                 raise RunNotFound(identity=identity)
             async with state.condition:
                 record = state.runs.get(identity.run_id)
@@ -651,7 +1038,7 @@ class MemoryBackend(MessagingBackend):
         self,
         *,
         channel: str,
-        identity: Identity,
+        identity: RunIdentity,
         after: int = 0,
         limit: int = 100,
     ) -> tuple[MessageEnvelope, ...]:
@@ -673,8 +1060,19 @@ class MemoryBackend(MessagingBackend):
                 raise InvalidCursor(after=after, latest=0)
             return ()
         async with channel_state.lock:
-            state = channel_state.streams.get(identity.thread_id)
+            state = self._expire_if_due(channel_state, identity.thread_id)
             if state is None:
+                tombstone = self._tombstone_reason(
+                    channel_state,
+                    identity.thread_id,
+                    None,
+                )
+                if tombstone is not None and tombstone[1] == "expired":
+                    raise StreamExpired(
+                        channel=channel,
+                        identity=identity,
+                        generation=tombstone[0],
+                    )
                 if after > 0:
                     raise InvalidCursor(after=after, latest=0)
                 return ()
@@ -691,7 +1089,7 @@ class MemoryBackend(MessagingBackend):
         self,
         *,
         channel: str,
-        identity: Identity,
+        identity: RunIdentity,
         after: int,
     ) -> BackendRunHandle:
         """Bind one follower after validating its cursor under the stream lock."""
@@ -706,8 +1104,19 @@ class MemoryBackend(MessagingBackend):
         if channel_state is None:
             raise RunNotFound(identity=identity)
         async with channel_state.lock:
-            state = channel_state.streams.get(identity.thread_id)
+            state = self._expire_if_due(channel_state, identity.thread_id)
             if state is None:
+                tombstone = self._tombstone_reason(
+                    channel_state,
+                    identity.thread_id,
+                    None,
+                )
+                if tombstone is not None and tombstone[1] == "expired":
+                    raise StreamExpired(
+                        channel=channel,
+                        identity=identity,
+                        generation=tombstone[0],
+                    )
                 raise RunNotFound(identity=identity)
             async with state.condition:
                 if state.deleted:

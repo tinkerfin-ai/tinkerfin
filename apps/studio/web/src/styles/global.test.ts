@@ -207,7 +207,8 @@ describe('前端视觉契约', () => {
     const uiStyles = cssFiles['../components/ui/ui.css']
     expect(conversationStyles).toMatch(/\.subagent-card-head:focus-visible\s*\{[^}]*outline:\s*2px solid var\(--color-border-strong\);/s)
     expect(conversationStyles).toMatch(/\.tool-row > summary:focus-visible\s*\{[^}]*outline:\s*2px solid var\(--color-border-strong\);/s)
-    expect(conversationStyles).toMatch(/\.approval-toggle-surface:focus-visible,[\s\S]*\.plan-interaction-toggle-surface:focus-visible\s*\{[^}]*outline:\s*2px solid var\(--color-border-strong\);/s)
+    expect(conversationStyles).toMatch(/\.plan-interaction-toggle-surface:focus-visible\s*\{[^}]*outline:\s*2px solid var\(--color-border-strong\);/s)
+    expect(conversationStyles).not.toContain('.approval-toggle-surface')
     expect(conversationStyles).toMatch(/\.plan-question-progress-step:focus-visible\s*\{[^}]*outline:\s*2px solid var\(--color-border-strong\);/s)
     expect(uiStyles).toMatch(/\.ui-text-field__control:focus-within,\s*\.ui-date-picker__trigger:focus-visible\s*\{[^}]*border-color:\s*var\(--color-border-strong\);[^}]*outline:\s*0;/s)
     expect(conversationStyles).toMatch(/:is\(\.approval-composer, \.plan-question-composer, \.plan-review-composer\)[\s\S]*\.ui-button:not\(\.ui-icon-button\):focus-visible\s*\{[^}]*outline:\s*2px solid var\(--color-border-strong\);/s)
@@ -240,11 +241,13 @@ describe('前端视觉契约', () => {
     expect(conversationStyles).toMatch(/\.approval-composer,[\s\S]*\.plan-review-composer\s*\{[^}]*height:\s*var\(--interaction-card-height, var\(--layout-interaction-card-min-height\)\);[^}]*min-height:\s*var\(--layout-interaction-card-min-height\);[^}]*max-height:\s*var\(--layout-interaction-card-max-height\);/s)
     expect(conversationStyles).toMatch(/\.composer-dock\.is-taken-over\s*\{[^}]*grid-row:\s*3;[^}]*padding-top:\s*var\(--layout-interaction-card-gap\);/s)
     expect(conversationStyles).toMatch(/\.composer-dock\.is-taken-over::before\s*\{[^}]*display:\s*none;/s)
-    expect(conversationStyles).toMatch(/\.approval-composer\.is-minimized,[\s\S]*\.plan-review-composer\.is-minimized\s*\{[^}]*height:\s*auto;[^}]*min-height:\s*var\(--layout-composer-surface-height\);[^}]*max-height:\s*none;/s)
+    expect(conversationStyles).toMatch(/\.plan-question-composer\.is-minimized\s*\{[^}]*height:\s*auto;[^}]*min-height:\s*var\(--layout-composer-surface-height\);[^}]*max-height:\s*none;/s)
     const minimizedSurfaceRule = conversationStyles.match(
-      /\.approval-composer\.is-minimized,[\s\S]*?\.plan-review-composer\.is-minimized\s*\{[^}]*\}/s,
+      /\.plan-question-composer\.is-minimized\s*\{[^}]*\}/s,
     )?.[0] ?? ''
     expect(minimizedSurfaceRule).toMatch(/(?:^|\n)\s*height:\s*auto;/)
+    expect(conversationStyles).not.toContain('.approval-composer.is-minimized')
+    expect(conversationStyles).not.toContain('.plan-review-composer.is-minimized')
   })
 
   it('交互卡片无外边框且上边框悬浮只改变拖拽光标', () => {

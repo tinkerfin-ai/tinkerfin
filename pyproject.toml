@@ -27,6 +27,9 @@ package = false
 
 [tool.uv.sources]
 tinkerfin = { workspace = true }
+tinkerfin-contracts = { workspace = true }
+tinkerfin-tracing = { workspace = true }
+tinkerfin-langgraph-mysql = { workspace = true }
 tinkerfin-sandbox = { workspace = true }
 tinkerfin-agui-adapter = { workspace = true }
 tinkerfin-messaging = { workspace = true }
@@ -74,6 +77,14 @@ include = [
     "tests",
     "packages/tinkerfin/src",
     "packages/tinkerfin/tests",
+    "packages/tinkerfin-contracts/src",
+    "packages/tinkerfin-contracts/tests",
+    "packages/tinkerfin-native-stream/src",
+    "packages/tinkerfin-native-stream/tests",
+    "packages/tinkerfin-tracing/src",
+    "packages/tinkerfin-tracing/tests",
+    "packages/tinkerfin-langgraph-mysql/src",
+    "packages/tinkerfin-langgraph-mysql/tests",
     "packages/tinkerfin-agui-adapter/src",
     "packages/tinkerfin-agui-adapter/tests",
     "packages/tinkerfin-messaging/src",
@@ -113,13 +124,18 @@ addopts = [
     "--strict-config",
     "--strict-markers",
     "-m",
-    "not docker_integration",
+    "not docker_integration and not packaging_e2e",
 ]
 
 [tool.coverage.run]
 branch = true
 source = [
     "tinkerfin",
+    "tinkerfin_contracts",
+    "tinkerfin_native_stream",
+    "tinkerfin_tracing",
+    "tinkerfin_langgraph_mysql",
+    "langgraph.store.mysql",
     "tinkerfin_agui_adapter",
     "tinkerfin_messaging",
     "tinkerfin_sandbox",

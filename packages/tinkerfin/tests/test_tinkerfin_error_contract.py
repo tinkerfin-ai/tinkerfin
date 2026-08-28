@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from tinkerfin import (
-    AgUiNativeStreamConfigurationError,
     AgUiResumeBindingError,
     AgUiSettlementTimeoutError,
     RedisLeaseError,
@@ -51,10 +50,6 @@ def test_error_contexts_are_separated_read_only_and_copied() -> None:
 
 
 def test_semantic_errors_keep_python_catch_contracts() -> None:
-    assert isinstance(
-        AgUiNativeStreamConfigurationError("invalid stream"),
-        ValueError,
-    )
     assert isinstance(AgUiResumeBindingError("invalid resume"), ValueError)
     assert isinstance(AgUiSettlementTimeoutError(timeout=1), TimeoutError)
     assert isinstance(TinkerFinLifecycleError("closed"), RuntimeError)

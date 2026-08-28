@@ -8,17 +8,22 @@ import math
 from collections.abc import AsyncGenerator, AsyncIterator
 from typing import TYPE_CHECKING, TypeVar, cast
 
+from tinkerfin_contracts import RunTerminalOutcome
+from tinkerfin_native_stream import NativeStreamContractError
+
 from ._tasks import join_task
 from .errors import (
     RunCoordinationError,
     RunCoordinationOwnershipLostError,
     RunCoordinationTimeoutError,
     RunCoordinationUnavailableError,
+    RunObservationError,
     TinkerFinError,
     TinkerFinErrorCode,
     TinkerFinLifecycleError,
+    TinkerFinStreamProtocolError,
 )
-from .native import NativeStreamPart, normalize_native_stream_part
+from .native import NativeStreamPart
 from .sse import (
     SseBody,
     SseEventIdResolver,
@@ -33,6 +38,19 @@ if TYPE_CHECKING:
 PartT = TypeVar("PartT")
 
 __all__ = ["_finish", "_finish_once", "_observe", "_start"]
+
+
+def _native_contract_error(
+    error: NativeStreamContractError,
+) -> TinkerFinStreamProtocolError:
+    """Translate the shared Native contract failure at the Runtime boundary."""
+
+    return TinkerFinStreamProtocolError(
+        "Native stream part violates the current contract",
+        context=error.context,
+        diagnostic_context={"native_code": error.code.value},
+        cause=error,
+    )
 
 
 def _coordination_error(operation: str, error: Exception) -> RunCoordinationError:
@@ -121,6 +139,13 @@ async def _resolve_sse_event_id(
 
 
 async def __anext__(self: _GraphRunStream[PartT]) -> PartT:
+    """Own one pull, publish its canonical frame, and preserve terminal ordering.
+
+    Lazy startup and Observer failure racing happen inside the same active-operation
+    slot. Natural exhaustion alone selects success or interrupt; every exception and
+    cancellation settles the shared Runtime lifecycle before it propagates.
+    """
+
     if self._closed:
         raise StopAsyncIteration
     current = cast(asyncio.Task[object] | None, asyncio.current_task())
@@ -136,17 +161,28 @@ async def __anext__(self: _GraphRunStream[PartT]) -> PartT:
         source = self._source
         assert source is not None
         try:
-            part = await anext(source)
+            part = await _next_or_observer_failure(self, source)
         except StopAsyncIteration:
-            await self._finish(None)
+            outcome: RunTerminalOutcome
+            if self._observation.context.input_kind == "abandon":
+                outcome = "abandoned"
+            elif self._last_root_interrupt_ids:
+                outcome = "interrupted"
+            else:
+                outcome = "succeeded"
+            await self._finish(None, outcome=outcome)
             raise
         except BaseException as error:
-            await self._finish(error)
+            if isinstance(error, Exception):
+                self.error = error
+            await self._finish(error, outcome=_error_outcome(error))
             raise
         try:
             await self._observe(part)
         except BaseException as error:
-            await self._finish(error)
+            if isinstance(error, Exception):
+                self.error = error
+            await self._finish(error, outcome=_error_outcome(error))
             raise
         return part
     finally:
@@ -174,7 +210,58 @@ async def aclose(self: _GraphRunStream[PartT]) -> None:
     ):
         active.cancel()
         await asyncio.gather(active, return_exceptions=True)
-    await self._finish(None)
+    await self._finish(
+        None,
+        outcome="cancelled" if self._started else None,
+    )
+
+
+async def _next_or_observer_failure(
+    self: _GraphRunStream[PartT],
+    source: AsyncIterator[PartT],
+) -> PartT:
+    """Race one upstream pull with the managed Observer failure signal."""
+
+    if not self._observation.enabled:
+        return await anext(source)
+
+    async def pull_next() -> PartT:
+        return await anext(source)
+
+    pull = asyncio.create_task(pull_next(), name="tinkerfin-graph-run-pull")
+    failure = asyncio.create_task(
+        self._observation.wait_failure(),
+        name="tinkerfin-observer-failure-wait",
+    )
+    try:
+        done, _pending = await asyncio.wait(
+            (pull, failure),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if failure in done:
+            if not pull.done():
+                pull.cancel()
+            await asyncio.gather(pull, return_exceptions=True)
+            await failure
+            raise AssertionError("Observer failure waiter returned without failing")
+        return await pull
+    except BaseException:
+        if not pull.done():
+            pull.cancel()
+        raise
+    finally:
+        if not failure.done():
+            failure.cancel()
+        await asyncio.gather(failure, return_exceptions=True)
+        if not pull.done():
+            pull.cancel()
+        await asyncio.gather(pull, return_exceptions=True)
+
+
+def _error_outcome(error: BaseException) -> RunTerminalOutcome:
+    if isinstance(error, (asyncio.CancelledError, GeneratorExit)):
+        return "cancelled"
+    return "failed"
 
 
 def to_sse(
@@ -201,7 +288,7 @@ def to_sse(
                 try:
                     if deadline is None:
                         raw_part = await anext(self)
-                        part = normalize_native_stream_part(raw_part)
+                        part = self._take_frame(raw_part).replay
                         payload = await _map_sse_item(
                             part,
                             mapper=mapper,
@@ -220,7 +307,7 @@ def to_sse(
                     else:
                         async with asyncio.timeout_at(deadline):
                             raw_part = await anext(self)
-                            part = normalize_native_stream_part(raw_part)
+                            part = self._take_frame(raw_part).replay
                             payload = await _map_sse_item(
                                 part,
                                 mapper=mapper,
@@ -251,6 +338,28 @@ def to_sse(
 
 
 async def _observe(self: _GraphRunStream[PartT], part: PartT) -> None:
+    """Normalize once, retain the frame sidecar, then notify public consumers.
+
+    The order is Driver validation, Runtime Observation, and finally ``on_part``.
+    Keeping the sidecar before callbacks makes the exact same canonical frame available
+    to one downstream Adapter, SSE, or Messaging consumer without parsing the raw part.
+    """
+
+    try:
+        frame = self._stream_driver.normalize(
+            part,
+            context=self._observation.context,
+        )
+    except NativeStreamContractError as error:
+        translated = _native_contract_error(error)
+        raise translated from error
+    # The sidecar is the only downstream normalization authority for this raw part.
+    # AG-UI, native SSE, and Messaging must consume it rather than parse v2 again.
+    self._native_frame = (part, frame)
+    self._last_root_interrupt_ids = frame.root_interrupt_ids
+    if self._observation.enabled:
+        for observation in frame.observations:
+            await self._observation.observe(observation)
     observer = self._on_part
     if observer is None:
         return
@@ -276,23 +385,31 @@ async def _start(self: _GraphRunStream[PartT]) -> None:
             translated = _coordination_error("enter", error)
             raise translated from error
         self._coordination = coordination
+    self._started = True
     try:
+        await self._observation.start()
         source = self._source_factory()
         if not isinstance(source, AsyncIterator):
             raise TypeError("source_factory must return an async iterator")
         self._source = source
     except BaseException as error:
-        await self._finish(error)
+        if isinstance(error, Exception):
+            self.error = error
+        await self._finish(error, outcome=_error_outcome(error))
         raise
-    self._started = True
 
 
-async def _finish(self: _GraphRunStream[PartT], error: BaseException | None) -> None:
+async def _finish(
+    self: _GraphRunStream[PartT],
+    error: BaseException | None,
+    *,
+    outcome: RunTerminalOutcome | None = None,
+) -> None:
     task = self._finish_task
     if task is None:
         self._closed = True
         task = asyncio.create_task(
-            self._finish_once(error),
+            self._finish_once(error, outcome),
             name="tinkerfin-graph-run-stream-close",
         )
         self._finish_task = task
@@ -300,8 +417,18 @@ async def _finish(self: _GraphRunStream[PartT], error: BaseException | None) -> 
 
 
 async def _finish_once(
-    self: _GraphRunStream[PartT], error: BaseException | None
+    self: _GraphRunStream[PartT],
+    error: BaseException | None,
+    outcome: RunTerminalOutcome | None,
 ) -> None:
+    """Settle upstream ownership and publish one final Observation lifecycle.
+
+    Upstream and coordinator resources close before terminal Observation. Cleanup can
+    downgrade an otherwise successful outcome to failure, while an already selected
+    execution error remains primary and receives every cleanup failure as a note.
+    Observer terminal/close failures are retained without abandoning other sessions.
+    """
+
     source = self._source
     self._source = None
     coordination = self._coordination
@@ -327,14 +454,71 @@ async def _finish_once(
             else:
                 cleanup_errors.append(cleanup_error)
 
+    # A request-specific settlement hook participates in the same retained close task.
+    # It runs after upstream ownership is released and at most once, including when a
+    # stream is closed before its first pull.
+    on_settle = self._on_settle
+    self._on_settle = None
+    if on_settle is not None:
+        try:
+            await on_settle()
+        except BaseException as cleanup_error:  # noqa: BLE001 - cleanup outcome
+            cleanup_errors.append(cleanup_error)
+
+    effective_outcome = outcome
+    if self._started and effective_outcome is None:
+        effective_outcome = "failed" if error is not None else "cancelled"
+    if (
+        cleanup_errors
+        and effective_outcome in {"succeeded", "interrupted"}
+        and error is None
+    ):
+        effective_outcome = "failed"
+
+    observation_errors: list[BaseException] = []
+    if self._started and effective_outcome is not None:
+        terminal_error = error or (cleanup_errors[0] if cleanup_errors else None)
+        code = _terminal_code(effective_outcome, terminal_error)
+        try:
+            await self._observation.terminal(
+                effective_outcome,
+                code=code,
+                error=terminal_error,
+                interrupt_ids=self._last_root_interrupt_ids,
+            )
+        except BaseException as observation_error:  # noqa: BLE001 - cleanup continues
+            observation_errors.append(observation_error)
+        try:
+            await self._observation.close()
+        except BaseException as observation_error:  # noqa: BLE001 - report below
+            observation_errors.append(observation_error)
+
+    all_secondary = [*cleanup_errors, *observation_errors]
     if error is not None:
-        for cleanup_error in cleanup_errors:
+        for secondary in all_secondary:
             error.add_note(
-                "Graph run cleanup also failed: "
-                f"{type(cleanup_error).__name__}: {cleanup_error}"
+                "Graph run settlement also failed: "
+                f"{type(secondary).__name__}: {secondary}"
             )
         return
-    if len(cleanup_errors) == 1:
-        raise cleanup_errors[0]
-    if cleanup_errors:
-        raise BaseExceptionGroup("Graph run cleanup failed", cleanup_errors)
+    if len(all_secondary) == 1:
+        raise all_secondary[0]
+    if all_secondary:
+        raise BaseExceptionGroup("Graph run settlement failed", all_secondary)
+
+
+def _terminal_code(
+    outcome: RunTerminalOutcome,
+    error: BaseException | None,
+) -> str | None:
+    if outcome == "failed":
+        return (
+            "observer_failed"
+            if isinstance(error, RunObservationError)
+            else "runtime_error"
+        )
+    if outcome == "cancelled":
+        return "cancelled"
+    if outcome == "abandoned":
+        return "abandoned"
+    return None

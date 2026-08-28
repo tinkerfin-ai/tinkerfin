@@ -1,0 +1,703 @@
+"""Runtime observation normalization, fan-out, and session ownership."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import cast
+
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    BaseMessage,
+    ChatMessage,
+    HumanMessage,
+    RemoveMessage,
+    SystemMessage,
+    ToolMessage,
+)
+from pydantic import JsonValue
+
+from tinkerfin_contracts import (
+    NativeExtraObservation,
+    NativeInterruptRecord,
+    NativeMessageObservation,
+    NativeMessageRecord,
+    NativeMessageType,
+    NativeObservation,
+    NativeStateObservation,
+    NativeTaskObservation,
+    NativeToolCall,
+    NativeToolCallChunk,
+    ObservationBoundary,
+    RunClosedObservation,
+    RunInputKind,
+    RunInputObservation,
+    RunMode,
+    RunObservationSession,
+    RunObserverFailedObservation,
+    RunResumeCheckpointedObservation,
+    RunResumeSummary,
+    RunSourceContext,
+    RunStartedObservation,
+    RunTerminalObservation,
+    RunTerminalOutcome,
+    RuntimeObservation,
+    RuntimeObserver,
+)
+from tinkerfin_native_stream import (
+    NativeExtraStreamPart,
+    NativeMessageStreamPart,
+    NativeRuntimeInterrupt,
+    NativeTaskResultPayload,
+    NativeTasksStreamPart,
+    NativeTaskStartPayload,
+    NativeUpdatesStreamPart,
+    NativeValidatedStreamPart,
+    NativeValuesStreamPart,
+    to_json_value,
+)
+
+from .errors import RunObservationError
+
+
+def _stamp() -> tuple[datetime, int]:
+    return datetime.now(UTC), time.monotonic_ns()
+
+
+def _json_value(value: object) -> JsonValue:
+    return to_json_value(value)
+
+
+def _source_value(value: object) -> JsonValue:
+    """Snapshot supported source values and omit opaque host resources safely."""
+
+    try:
+        return _json_value(value)
+    except (TypeError, ValueError):
+        return {
+            "$type": "omitted",
+            "class": _qualified_name(value),
+        }
+
+
+def _json_object(value: object) -> dict[str, JsonValue]:
+    normalized = _json_value(value)
+    if not isinstance(normalized, dict):
+        raise TypeError("normalized observation value must be an object")
+    return normalized
+
+
+def _qualified_name(value: object) -> str:
+    value_type = type(value)
+    return f"{value_type.__module__}.{value_type.__qualname__}"
+
+
+def _message_type(message: BaseMessage) -> NativeMessageType:
+    if isinstance(message, AIMessageChunk):
+        return "assistant_chunk"
+    if isinstance(message, AIMessage):
+        return "assistant"
+    if isinstance(message, HumanMessage):
+        return "human"
+    if isinstance(message, ToolMessage):
+        return "tool"
+    if isinstance(message, SystemMessage):
+        return "system"
+    if isinstance(message, ChatMessage):
+        return "chat"
+    if isinstance(message, RemoveMessage):
+        return "remove"
+    return "other"
+
+
+def _message_record(message: BaseMessage) -> NativeMessageRecord:
+    """Detach one LangChain message into the stable protocol-neutral record.
+
+    Full IDs and every Tool fragment are preserved for correlation. Provider-specific
+    ``additional_kwargs`` are intentionally absent; verified reasoning uses a separate
+    extractor and Observation so private metadata cannot leak through this core record.
+    """
+
+    tool_calls: tuple[NativeToolCall, ...] = ()
+    tool_chunks: tuple[NativeToolCallChunk, ...] = ()
+    # AIMessageChunk subclasses AIMessage in LangChain Core 1.5.3. Its derived
+    # ``tool_calls`` view can contain an intentionally ID-less entry while a later
+    # provider fragment contributes arguments to an existing index. Only complete
+    # AIMessage snapshots may populate the complete-call contract; the locked stream
+    # evidence and test_v2_driver_keeps_idless_followup_tool_data_as_a_chunk protect
+    # this distinction.
+    if isinstance(message, AIMessageChunk):
+        tool_chunks = tuple(
+            NativeToolCallChunk(
+                index=cast(int, chunk["index"]),
+                id=chunk.get("id"),
+                name=chunk.get("name"),
+                arguments=chunk.get("args") or "",
+            )
+            for chunk in message.tool_call_chunks
+        )
+    elif isinstance(message, AIMessage):
+        normalized_calls: list[NativeToolCall] = []
+        for call in message.tool_calls:
+            tool_call_id = call.get("id")
+            if not isinstance(tool_call_id, str) or not tool_call_id:
+                raise ValueError("complete Tool calls require a stable ID")
+            normalized_calls.append(
+                NativeToolCall(
+                    id=tool_call_id,
+                    name=call["name"],
+                    arguments=_json_object(call.get("args", {})),
+                )
+            )
+        tool_calls = tuple(normalized_calls)
+    response_metadata = _json_object(message.response_metadata)
+    raw_usage = getattr(message, "usage_metadata", None)
+    usage_metadata = None if raw_usage is None else _json_object(raw_usage)
+    tool_call_id = message.tool_call_id if isinstance(message, ToolMessage) else None
+    raw_tool_status = message.status if isinstance(message, ToolMessage) else None
+    tool_status = raw_tool_status if raw_tool_status in {"success", "error"} else None
+    return NativeMessageRecord(
+        message_type=_message_type(message),
+        id=message.id,
+        name=message.name,
+        content=_json_value(message.content),
+        tool_calls=tool_calls,
+        tool_call_chunks=tool_chunks,
+        tool_call_id=tool_call_id,
+        tool_status=tool_status,
+        response_metadata=response_metadata,
+        usage_metadata=usage_metadata,
+    )
+
+
+def _interrupt_record(value: object) -> NativeInterruptRecord:
+    """Normalize one validated task interrupt into the shared Native contract."""
+
+    interrupt = NativeRuntimeInterrupt.model_validate(value)
+    return NativeInterruptRecord(
+        id=interrupt.id,
+        value=interrupt.value,
+    )
+
+
+def native_observation(
+    part: NativeValidatedStreamPart,
+    *,
+    context: RunSourceContext,
+) -> NativeObservation:
+    """Project one validated live part into a protocol-neutral observation."""
+
+    observed_at, monotonic_ns = _stamp()
+    if isinstance(part, NativeMessageStreamPart):
+        return NativeMessageObservation(
+            identity=context.identity,
+            namespace=part.ns,
+            observed_at=observed_at,
+            monotonic_ns=monotonic_ns,
+            message=_message_record(part.data.message),
+            metadata=_json_object(part.data.metadata.model_dump(mode="python")),
+        )
+    if isinstance(part, NativeTasksStreamPart):
+        payload = part.data
+        if isinstance(payload, NativeTaskStartPayload):
+            metadata = payload.metadata
+            return NativeTaskObservation(
+                identity=context.identity,
+                namespace=part.ns,
+                observed_at=observed_at,
+                monotonic_ns=monotonic_ns,
+                phase="start",
+                task_id=payload.id,
+                name=payload.name,
+                triggers=payload.triggers,
+                input=_source_value(payload.input),
+                metadata=(
+                    {}
+                    if metadata is None
+                    else _json_object(metadata.model_dump(mode="python"))
+                ),
+            )
+        if not isinstance(payload, NativeTaskResultPayload):
+            raise TypeError("validated task payload has an unsupported phase")
+        error = payload.error
+        return NativeTaskObservation(
+            identity=context.identity,
+            namespace=part.ns,
+            observed_at=observed_at,
+            monotonic_ns=monotonic_ns,
+            phase="result",
+            task_id=payload.id,
+            name=payload.name,
+            result=_source_value(payload.result),
+            error_type=None if error is None else _qualified_name(error),
+            interrupts=tuple(_interrupt_record(value) for value in payload.interrupts),
+        )
+    if isinstance(part, NativeValuesStreamPart):
+        raw_messages = part.data.get("messages", ())
+        if not isinstance(raw_messages, Sequence) or isinstance(
+            raw_messages, (str, bytes, bytearray)
+        ):
+            raise TypeError("values messages must be a sequence")
+        messages: list[NativeMessageRecord] = []
+        for raw_message in cast(Sequence[object], raw_messages):
+            if not isinstance(raw_message, BaseMessage):
+                raise TypeError("values messages must contain LangChain messages")
+            messages.append(_message_record(raw_message))
+        private_keys = frozenset(context.private_state_keys)
+        state = {
+            key: _source_value(value)
+            for key, value in part.data.items()
+            if key != "messages" and key not in private_keys
+        }
+        return NativeStateObservation(
+            identity=context.identity,
+            namespace=part.ns,
+            observed_at=observed_at,
+            monotonic_ns=monotonic_ns,
+            state=state,
+            messages=tuple(messages),
+            interrupts=tuple(
+                NativeInterruptRecord(id=value.id, value=_json_value(value.value))
+                for value in part.interrupts
+            ),
+        )
+    if not isinstance(part, NativeExtraStreamPart | NativeUpdatesStreamPart):
+        raise TypeError("validated Native part has an unsupported mode")
+    data = _json_value(part.data)
+    encoded = json.dumps(
+        data,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    return NativeExtraObservation(
+        identity=context.identity,
+        namespace=part.ns,
+        observed_at=observed_at,
+        monotonic_ns=monotonic_ns,
+        mode=part.type,
+        data_type=_qualified_name(part.data),
+        safe_size_bytes=len(encoded),
+        top_level_keys=tuple(sorted(data)) if isinstance(data, dict) else (),
+    )
+
+
+def source_context(
+    *,
+    identity: object,
+    runtime_profile: str,
+    input_kind: RunInputKind,
+    parent_run_id: str | None,
+    mode: RunMode,
+    graph_input: object,
+    config: object,
+    private_state_keys: frozenset[str],
+    resume: tuple[RunResumeSummary, ...] = (),
+) -> RunSourceContext:
+    """Build one finite source snapshot before opening Observer resources."""
+
+    from tinkerfin_contracts import RunIdentity
+
+    if not isinstance(identity, RunIdentity):
+        raise TypeError("identity must be a RunIdentity")
+    return RunSourceContext(
+        identity=identity,
+        runtime_profile=runtime_profile,
+        input_kind=input_kind,
+        parent_run_id=parent_run_id,
+        mode=mode,
+        input=_source_value(graph_input),
+        config=_source_value(config),
+        resume=resume,
+        private_state_keys=tuple(sorted(private_state_keys)),
+    )
+
+
+@dataclass(slots=True)
+class _SessionSlot:
+    index: int
+    name: str
+    session: RunObservationSession
+    waiter: asyncio.Task[None] | None = None
+    healthy: bool = True
+
+
+class RuntimeObservationHub:
+    """Own ordered Observer sessions and one active failure signal for a Run."""
+
+    def __init__(
+        self,
+        *,
+        context: RunSourceContext,
+        observers: tuple[RuntimeObserver, ...],
+    ) -> None:
+        """Bind immutable Run context to ordered borrowed Observer registrations."""
+
+        self.context = context
+        self._observers = observers
+        self._slots: list[_SessionSlot] = []
+        self._failure: asyncio.Future[tuple[_SessionSlot, BaseException]] | None = None
+        self._started = False
+        self._terminal: RunTerminalOutcome | None = None
+        self._closed = False
+
+    @property
+    def enabled(self) -> bool:
+        """Return whether the Run has any Observer sessions to manage."""
+
+        return bool(self._observers)
+
+    @property
+    def terminal_outcome(self) -> RunTerminalOutcome | None:
+        """Return the first selected terminal outcome, if terminal was published."""
+
+        return self._terminal
+
+    async def start(self) -> None:
+        """Open every Observer, then publish ordered Run start and input facts.
+
+        Cancellation is never converted. Ordinary opening failures are aggregated,
+        reported to every healthy session, and fail the Runtime before any Native pull.
+        """
+
+        if self._started:
+            return
+        loop = asyncio.get_running_loop()
+        self._failure = loop.create_future()
+        opening_failures: list[tuple[str, BaseException]] = []
+        for index, observer in enumerate(self._observers):
+            name = f"{type(observer).__module__}.{type(observer).__qualname__}"
+            try:
+                session = await observer.open_run(self.context.model_copy(deep=True))
+                if not isinstance(session, RunObservationSession):
+                    raise TypeError(
+                        "RuntimeObserver.open_run must return RunObservationSession"
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # noqa: BLE001 - Observer extension boundary
+                opening_failures.append((name, error))
+                continue
+            slot = _SessionSlot(index=index, name=name, session=session)
+            slot.waiter = asyncio.create_task(
+                self._watch(slot),
+                name=f"tinkerfin-observer-failure:{index}",
+            )
+            self._slots.append(slot)
+        self._started = True
+        if opening_failures:
+            error = self._observation_error(opening_failures)
+            await self._notify_failures(opening_failures)
+            raise error
+        observed_at, monotonic_ns = _stamp()
+        await self.observe(
+            RunStartedObservation(
+                identity=self.context.identity,
+                observed_at=observed_at,
+                monotonic_ns=monotonic_ns,
+            )
+        )
+        observed_at, monotonic_ns = _stamp()
+        await self.observe(
+            RunInputObservation(
+                identity=self.context.identity,
+                source=self.context,
+                observed_at=observed_at,
+                monotonic_ns=monotonic_ns,
+            )
+        )
+
+    async def _watch(self, slot: _SessionSlot) -> None:
+        try:
+            error = await slot.session.failure_waiter()
+            if not isinstance(error, BaseException):
+                error = TypeError(
+                    "RunObservationSession.failure_waiter must resolve to an exception"
+                )
+        except asyncio.CancelledError:
+            return
+        except BaseException as caught:  # noqa: BLE001 - relay process control
+            error = caught
+        failure = self._failure
+        if failure is not None and not failure.done():
+            failure.set_result((slot, error))
+
+    async def wait_failure(self) -> None:
+        """Wait for the first active session failure and propagate it fail-closed."""
+
+        failure = self._failure
+        if failure is None:
+            failure = asyncio.get_running_loop().create_future()
+            self._failure = failure
+        slot, error = await asyncio.shield(failure)
+        # The waiter transports a session-returned process-control exception through
+        # the managed race; it must never enter the ordinary Observer error family.
+        if not isinstance(error, Exception):
+            raise error
+        if not slot.healthy:
+            raise self._observation_error(((slot.name, error),))
+        slot.healthy = False
+        failures = ((slot.name, error),)
+        await self._notify_failures(failures)
+        raise self._observation_error(failures)
+
+    async def observe(self, observation: RuntimeObservation) -> None:
+        """Broadcast a defensive copy in registration order to healthy sessions.
+
+        One Observer cannot mutate the value seen by another. All failures from this
+        broadcast are collected before healthy sessions receive failure notifications.
+
+        Args:
+            observation: Immutable Runtime fact copied once per healthy session.
+
+        Raises:
+            asyncio.CancelledError: The caller or Observer cancels delivery.
+            RunObservationError: One or more ordinary Observer deliveries fail.
+        """
+
+        failures: list[tuple[str, BaseException]] = []
+        for slot in self._slots:
+            if not slot.healthy:
+                continue
+            try:
+                await slot.session.observe(observation.model_copy(deep=True))
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # noqa: BLE001 - Observer extension boundary
+                slot.healthy = False
+                failures.append((slot.name, error))
+        if failures:
+            await self._notify_failures(failures)
+            raise self._observation_error(failures)
+
+    async def _notify_failures(
+        self,
+        failures: Sequence[tuple[str, BaseException]],
+    ) -> None:
+        secondary: list[tuple[str, BaseException]] = []
+        for failed_name, failure in failures:
+            observed_at, monotonic_ns = _stamp()
+            notification = RunObserverFailedObservation(
+                identity=self.context.identity,
+                observer_name=failed_name,
+                error_type=_qualified_name(failure),
+                observed_at=observed_at,
+                monotonic_ns=monotonic_ns,
+            )
+            for slot in self._slots:
+                if not slot.healthy:
+                    continue
+                try:
+                    await slot.session.observe(notification.model_copy(deep=True))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:  # noqa: BLE001 - Observer extension boundary
+                    slot.healthy = False
+                    secondary.append((slot.name, error))
+        if secondary:
+            for slot in self._slots:
+                if slot.name in {name for name, _error in secondary}:
+                    slot.healthy = False
+
+    async def resume_checkpointed(
+        self,
+        *,
+        marker_id: str,
+        native_interrupt_ids: frozenset[str],
+    ) -> None:
+        """Publish durable resume intent and force it before continuation output."""
+
+        observed_at, monotonic_ns = _stamp()
+        await self.observe(
+            RunResumeCheckpointedObservation(
+                identity=self.context.identity,
+                marker_id=marker_id,
+                native_interrupt_ids=tuple(sorted(native_interrupt_ids)),
+                observed_at=observed_at,
+                monotonic_ns=monotonic_ns,
+            )
+        )
+        await self.force(ObservationBoundary.RESUME_CHECKPOINTED)
+
+    async def terminal(
+        self,
+        outcome: RunTerminalOutcome,
+        *,
+        code: str | None = None,
+        error: BaseException | None = None,
+        interrupt_ids: tuple[str, ...] = (),
+    ) -> None:
+        """Select and force one terminal outcome without rewriting it on retry.
+
+        Terminal broadcast failures make the caller fail closed, but the actual Agent
+        outcome remains the one selected before Observation delivery.
+
+        Args:
+            outcome: First authoritative Runtime terminal classification.
+            code: Optional stable client-safe terminal code.
+            error: Optional trusted failure used only for its qualified type.
+            interrupt_ids: Stable root interrupt IDs for an interrupted outcome.
+
+        Raises:
+            asyncio.CancelledError: The caller or Observer cancels terminal delivery.
+            RunObservationError: Terminal delivery or force fails for an Observer.
+        """
+
+        if self._terminal is not None:
+            return
+        self._terminal = outcome
+        observed_at, monotonic_ns = _stamp()
+        await self.observe(
+            RunTerminalObservation(
+                identity=self.context.identity,
+                outcome=outcome,
+                code=code,
+                error_type=None if error is None else _qualified_name(error),
+                interrupt_ids=interrupt_ids,
+                observed_at=observed_at,
+                monotonic_ns=monotonic_ns,
+            )
+        )
+        await self.force(
+            ObservationBoundary.INTERRUPT
+            if outcome == "interrupted"
+            else ObservationBoundary.TERMINAL
+        )
+
+    async def force(self, boundary: ObservationBoundary) -> None:
+        """Force every healthy session at a hard replay or terminal boundary."""
+
+        failures: list[tuple[str, BaseException]] = []
+        for slot in self._slots:
+            if not slot.healthy:
+                continue
+            try:
+                await slot.session.force(boundary)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # noqa: BLE001 - Observer extension boundary
+                slot.healthy = False
+                failures.append((slot.name, error))
+        if failures:
+            await self._notify_failures(failures)
+            raise self._observation_error(failures)
+
+    async def close(self) -> None:
+        """Settle every Observer session while preserving caller cancellation."""
+
+        if self._closed:
+            return
+        await self._close_once()
+
+    async def _close_once(self) -> None:
+        """Own the cancellation-safe cleanup body shared by close callers."""
+
+        self._closed = True
+        failures: list[tuple[str, BaseException]] = []
+        process_control: BaseException | None = None
+
+        def retain_process_control(error: BaseException, *, source: str) -> None:
+            nonlocal process_control
+            if process_control is None:
+                process_control = error
+                return
+            process_control.add_note(
+                "another Runtime Observer process-control outcome occurred in "
+                f"{source}: {type(error).__name__}: {error}"
+            )
+
+        if self._started and self._terminal is not None:
+            observed_at, monotonic_ns = _stamp()
+            try:
+                await self.observe(
+                    RunClosedObservation(
+                        identity=self.context.identity,
+                        outcome=self._terminal,
+                        observed_at=observed_at,
+                        monotonic_ns=monotonic_ns,
+                    )
+                )
+                await self.force(ObservationBoundary.CLOSE)
+            except asyncio.CancelledError as error:
+                retain_process_control(error, source="runtime.close_observation")
+            except Exception as error:  # noqa: BLE001 - Observer extension boundary
+                failures.append(("runtime.close_observation", error))
+            except BaseException as error:  # noqa: BLE001 - preserve process control
+                retain_process_control(error, source="runtime.close_observation")
+        for slot in reversed(self._slots):
+            waiter = slot.waiter
+            if waiter is not None and not waiter.done():
+                waiter.cancel()
+            try:
+                await slot.session.aclose()
+            except asyncio.CancelledError as error:
+                retain_process_control(error, source=slot.name)
+            except Exception as error:  # noqa: BLE001 - Observer extension boundary
+                failures.append((slot.name, error))
+            except BaseException as error:  # noqa: BLE001 - preserve process control
+                retain_process_control(error, source=slot.name)
+        if self._slots:
+            try:
+                await asyncio.gather(
+                    *(slot.waiter for slot in self._slots if slot.waiter is not None),
+                    return_exceptions=True,
+                )
+            except asyncio.CancelledError as error:
+                retain_process_control(error, source="failure_waiter settlement")
+        failure = self._failure
+        if failure is not None and not failure.done():
+            failure.cancel()
+        if process_control is not None:
+            for name, error in failures:
+                process_control.add_note(
+                    f"Runtime Observer cleanup also failed in {name}: "
+                    f"{type(error).__name__}: {error}"
+                )
+            raise process_control
+        if failures:
+            raise self._observation_error(failures)
+
+    @staticmethod
+    def _observation_error(
+        failures: Sequence[tuple[str, BaseException]],
+    ) -> RunObservationError:
+        causes = [error for _name, error in failures]
+        cause: BaseException = (
+            causes[0]
+            if len(causes) == 1
+            else BaseExceptionGroup("Runtime observers failed", causes)
+        )
+        return RunObservationError(
+            observer_names=tuple(name for name, _error in failures),
+            cause=cause,
+        )
+
+
+def observer_tuple(observers: Sequence[RuntimeObserver]) -> tuple[RuntimeObserver, ...]:
+    """Validate and freeze ordered Observer registration without aliases."""
+
+    frozen = tuple(observers)
+    seen: set[int] = set()
+    for observer in frozen:
+        if not isinstance(observer, RuntimeObserver):
+            raise TypeError("observer must implement RuntimeObserver")
+        identity = id(observer)
+        if identity in seen:
+            raise ValueError(
+                "the same RuntimeObserver instance cannot be registered twice"
+            )
+        seen.add(identity)
+    return frozen
+
+
+__all__ = [
+    "RuntimeObservationHub",
+    "native_observation",
+    "observer_tuple",
+    "source_context",
+]

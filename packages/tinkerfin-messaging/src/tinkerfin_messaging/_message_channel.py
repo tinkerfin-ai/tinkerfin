@@ -13,10 +13,10 @@ __all__ = [
     "get_run_status",
 ]
 
-from collections.abc import AsyncIterator, Callable
-from typing import TYPE_CHECKING, TypeVar, cast
+from collections.abc import AsyncIterator, Awaitable, Callable
+from typing import TYPE_CHECKING, TypeAlias, TypeVar, cast
 
-from tinkerfin_agui_adapter import Identity
+from tinkerfin_contracts import RunIdentity
 
 from ._identity import required_identifier, required_identity
 from ._messaging_boundary import (
@@ -58,9 +58,10 @@ ProfileReplayT = TypeVar("ProfileReplayT")
 _RUN_STATUSES = frozenset(
     {"running", "cancel_requested", "completed", "cancelled", "failed", "owner_lost"}
 )
+_CodecInputTransform: TypeAlias = Callable[[object], object]
 
 
-def _resolve_identity(source: object, identity: Identity | None) -> Identity:
+def _resolve_identity(source: object, identity: RunIdentity | None) -> RunIdentity:
     """Resolve one explicit or immutable source identity before side effects."""
 
     explicit = None if identity is None else required_identity(identity)
@@ -85,6 +86,7 @@ def _resolve_binding(
     MessageCodec[SourceT, ReplayT],
     SseRenderer[ReplayT] | None,
     str | None,
+    _CodecInputTransform | None,
 ]:
     """Resolve an explicit codec or one supported structural source profile."""
 
@@ -93,7 +95,7 @@ def _resolve_binding(
     codec = self._codec
     inferred_profile = self._inferred_profile
     if codec is not None and inferred_profile is None:
-        return codec, self._renderer, None
+        return codec, self._renderer, None, None
     profile = getattr(source, "messaging_codec_profile", None)
     if profile is None:
         if inferred_profile is not None:
@@ -109,19 +111,27 @@ def _resolve_binding(
         if profile != inferred_profile:
             raise CodecMismatch(expected=inferred_profile, actual=profile)
         assert codec is not None
-        self._validate_profile_types(source=source, profile=profile, codec=codec)
-        return codec, self._renderer, profile
+        codec_input = self._validate_profile_types(
+            source=source,
+            profile=profile,
+            codec=codec,
+        )
+        return codec, self._renderer, profile, codec_input
     if profile == "agui.event":
         from .agui import AgUiCodec
 
         built_in = AgUiCodec()
-    elif profile == "langgraph.stream-part.v2":
+    elif profile == "tinkerfin.native-stream":
         from .native import NativeStreamPartCodec
 
         built_in = NativeStreamPartCodec()
     else:
         raise TypeError(f"unsupported built-in codec profile: {profile!r}")
-    self._validate_profile_types(source=source, profile=profile, codec=built_in)
+    codec_input = self._validate_profile_types(
+        source=source,
+        profile=profile,
+        codec=built_in,
+    )
     current = self._inferred_profile
     if current is not None and current != profile:
         raise CodecMismatch(expected=current, actual=profile)
@@ -129,6 +139,7 @@ def _resolve_binding(
         cast(MessageCodec[SourceT, ReplayT], built_in),
         cast(SseRenderer[ReplayT], built_in),
         profile,
+        codec_input,
     )
 
 
@@ -137,32 +148,92 @@ def _validate_profile_types(
     source: object,
     profile: str,
     codec: object,
-) -> None:
-    """Prove declared live and replay types before durable preparation."""
+) -> _CodecInputTransform | None:
+    """Prove live, optional codec-input, and replay types before preparation."""
 
-    for attribute, label in (
-        ("messaging_source_type", "live source type"),
-        ("messaging_replay_type", "replay type"),
-    ):
-        missing = object()
-        declared = getattr(source, attribute, missing)
-        if declared is missing:
+    missing = object()
+    declared_source = getattr(source, "messaging_source_type", missing)
+    if declared_source is missing:
+        raise SourceProfileMismatch(
+            profile=profile,
+            reason="missing live source type metadata",
+        )
+    if not isinstance(declared_source, type):
+        raise SourceProfileMismatch(
+            profile=profile,
+            reason="live source type metadata must be a type",
+        )
+    expected_source = getattr(codec, "messaging_source_type", missing)
+    if expected_source is missing:
+        raise SourceProfileMismatch(
+            profile=profile,
+            reason="built-in codec is missing codec input type metadata",
+        )
+
+    raw_transform = getattr(source, "messaging_codec_input", missing)
+    if raw_transform is missing:
+        if declared_source is not expected_source:
+            expected_name = getattr(
+                expected_source,
+                "__qualname__",
+                type(expected_source).__name__,
+            )
             raise SourceProfileMismatch(
                 profile=profile,
-                reason=f"missing {label} metadata",
+                reason=f"live source type metadata must be {expected_name}",
             )
-        expected = getattr(codec, attribute, missing)
-        if expected is missing:
+        codec_input: _CodecInputTransform | None = None
+    else:
+        if not callable(raw_transform):
             raise SourceProfileMismatch(
                 profile=profile,
-                reason=f"built-in codec is missing {label} metadata",
+                reason="codec input transform must be callable",
             )
-        if declared is not expected:
-            expected_name = getattr(expected, "__qualname__", type(expected).__name__)
+        declared_codec_input = getattr(
+            source,
+            "messaging_codec_input_type",
+            missing,
+        )
+        if declared_codec_input is missing:
             raise SourceProfileMismatch(
                 profile=profile,
-                reason=f"{label} metadata must be {expected_name}",
+                reason="missing codec input type metadata",
             )
+        if declared_codec_input is not expected_source:
+            expected_name = getattr(
+                expected_source,
+                "__qualname__",
+                type(expected_source).__name__,
+            )
+            raise SourceProfileMismatch(
+                profile=profile,
+                reason=f"codec input type metadata must be {expected_name}",
+            )
+        codec_input = cast(_CodecInputTransform, raw_transform)
+
+    declared_replay = getattr(source, "messaging_replay_type", missing)
+    if declared_replay is missing:
+        raise SourceProfileMismatch(
+            profile=profile,
+            reason="missing replay type metadata",
+        )
+    expected_replay = getattr(codec, "messaging_replay_type", missing)
+    if expected_replay is missing:
+        raise SourceProfileMismatch(
+            profile=profile,
+            reason="built-in codec is missing replay type metadata",
+        )
+    if declared_replay is not expected_replay:
+        expected_name = getattr(
+            expected_replay,
+            "__qualname__",
+            type(expected_replay).__name__,
+        )
+        raise SourceProfileMismatch(
+            profile=profile,
+            reason=f"replay type metadata must be {expected_name}",
+        )
+    return codec_input
 
 
 def _commit_inferred_binding(
@@ -209,7 +280,7 @@ def _validate_page(*, after: int, limit: int | None = None) -> None:
 
 
 async def latest_seq(
-    self: MessageChannel[SourceT, ReplayT], *, identity: Identity
+    self: MessageChannel[SourceT, ReplayT], *, identity: RunIdentity
 ) -> int:
     """Return the greatest committed sequence, or zero for an empty stream."""
 
@@ -233,7 +304,7 @@ async def latest_seq(
 async def get_run_status(
     self: MessageChannel[SourceT, ReplayT],
     *,
-    identity: Identity,
+    identity: RunIdentity,
 ) -> RunStatus:
     """Return one durable run's current authoritative status."""
 
@@ -265,7 +336,7 @@ async def get_run_status(
 async def read(
     self: MessageChannel[SourceT, ReplayT],
     *,
-    identity: Identity,
+    identity: RunIdentity,
     after: int = 0,
     limit: int = 100,
 ) -> tuple[DecodedMessage[ReplayT], ...]:
@@ -309,7 +380,7 @@ async def read(
 async def follow(
     self: MessageChannel[SourceT, ReplayT],
     *,
-    identity: Identity,
+    identity: RunIdentity,
     after: int = 0,
 ) -> MessageSubscription[ReplayT]:
     """Follow one run's committed events through its authoritative terminal."""
@@ -344,7 +415,7 @@ async def follow(
 async def validate_cursor(
     self: MessageChannel[SourceT, ReplayT],
     *,
-    identity: Identity,
+    identity: RunIdentity,
     after: int | None,
 ) -> None:
     """Validate one replay cursor without creating or attaching a run.
@@ -391,11 +462,13 @@ async def wrap(
         MessageSource[SourceT] | ProfiledMessageSource[ProfileSourceT, ProfileReplayT]
     ),
     *,
-    identity: Identity | None = None,
+    identity: RunIdentity | None = None,
     after: int | None = None,
     cancel: (CancelCallback[SourceT] | CancelCallback[ProfileSourceT] | None) = None,
     on_committed: CommittedCallback | None = None,
 ) -> MessageSubscription[ReplayT] | MessageSubscription[ProfileReplayT]:
+    """Open a replayable subscription while preserving the source profile type."""
+
     return cast(
         "MessageSubscription[ReplayT] | MessageSubscription[ProfileReplayT]",
         await self._wrap(
@@ -412,7 +485,7 @@ async def _wrap(
     self: MessageChannel[SourceT, ReplayT],
     source: MessageSource[object],
     *,
-    identity: Identity | None = None,
+    identity: RunIdentity | None = None,
     after: int | None = None,
     cancel: CancelCallback[object] | None = None,
     on_committed: CommittedCallback | None = None,
@@ -455,7 +528,7 @@ async def _wrap(
     source_released = False
     try:
         _validate_optional_cursor(after)
-        codec, renderer, profile = self._resolve_binding(source)
+        codec, renderer, profile, codec_input = self._resolve_binding(source)
         producer_codec = cast(MessageCodec[object, object], codec)
         replay_renderer = cast(SseRenderer[object] | None, renderer)
         codec_id = required_identifier("codec_id", codec.codec_id)
@@ -490,6 +563,14 @@ async def _wrap(
             ),
         )
         self._messaging._require_open()
+        if prepared.is_owner:
+            owner_preflight = getattr(source, "messaging_owner_preflight", None)
+            if owner_preflight is not None:
+                if not callable(owner_preflight):
+                    raise TypeError("messaging_owner_preflight must be async callable")
+                callback = cast(Callable[[], Awaitable[None]], owner_preflight)
+                await callback()
+                self._messaging._require_open()
         self._commit_inferred_binding(
             codec=codec,
             renderer=renderer,
@@ -500,6 +581,7 @@ async def _wrap(
                 prepared=prepared,
                 source=source,
                 codec=producer_codec,
+                codec_input=codec_input,
                 cancel=normalized_cancel,
                 on_committed=on_committed,
             )
@@ -543,7 +625,7 @@ async def sse(
     self: MessageChannel[SourceT, ReplayT],
     source: MessageSource[object],
     *,
-    identity: Identity | None = None,
+    identity: RunIdentity | None = None,
     after: int | Callable[[], int | None] | None = None,
     cancel: CancelCallback[object] | None = None,
     on_committed: CommittedCallback | None = None,
@@ -594,7 +676,7 @@ async def wrap_recoverable(
     self: MessageChannel[SourceT, ReplayT],
     source: RecoverableSource[SourceT],
     *,
-    identity: Identity | None = None,
+    identity: RunIdentity | None = None,
     after: int | None = None,
     cancel: CancelCallback[RecoverableMessage[SourceT]] | None = None,
     on_committed: CommittedCallback | None = None,
@@ -633,7 +715,12 @@ async def wrap_recoverable(
     producer_started = False
     try:
         _validate_optional_cursor(after)
-        codec, renderer, profile = self._resolve_binding(source)
+        codec, renderer, profile, codec_input = self._resolve_binding(source)
+        if codec_input is not None:
+            raise SourceProfileMismatch(
+                profile=profile or codec.codec_id,
+                reason="recoverable source profiles must yield codec input directly",
+            )
         codec_id = required_identifier("codec_id", codec.codec_id)
         resolved_identity = self._resolve_identity(source, identity)
         if cancel is not None:
@@ -700,7 +787,9 @@ async def wrap_recoverable(
     )
 
 
-async def cancel(self: MessageChannel[SourceT, ReplayT], *, identity: Identity) -> bool:
+async def cancel(
+    self: MessageChannel[SourceT, ReplayT], *, identity: RunIdentity
+) -> bool:
     """Request cancellation and wait until the durable run status is final.
 
     Args:
@@ -750,7 +839,7 @@ async def cancel(self: MessageChannel[SourceT, ReplayT], *, identity: Identity) 
 
 
 async def delete_stream(
-    self: MessageChannel[SourceT, ReplayT], *, identity: Identity
+    self: MessageChannel[SourceT, ReplayT], *, identity: RunIdentity
 ) -> None:
     """Delete one inactive durable stream without changing the channel codec.
 
@@ -758,7 +847,7 @@ async def delete_stream(
     requests producer cancellation; callers must settle an active run first.
 
     Args:
-        identity: Identity whose thread-level durable stream is deleted.
+        identity: RunIdentity whose thread-level durable stream is deleted.
 
     Raises:
         MessagingError: Messaging closes or the backend rejects deletion.

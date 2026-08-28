@@ -2,18 +2,36 @@
 
 [Runtime basics](index.md) · [中文](../../zh/runtime/api-reference.md)
 
+AG-UI Runtime entrypoints require `pip install "tinkerfin[agui]"`. Native Runtime,
+Plan Mode, Observation, and native SSE are part of the base installation.
+
 This page groups the public Runtime capabilities by how you use them. Most applications only need the first two sections.
 
 ## Entry points
 
 | API | When to use it | Main input or result |
 | --- | --- | --- |
-| `TinkerFin(run_coordinator=None, state_schema=None)` | Create the main entry point | Optional shared coordinator and Definition-wide state |
+| `TinkerFin(run_coordinator=None, state_schema=None, runtime_profile=None)` | Create the main entry point | Optional shared coordinator, Definition-wide state, and complete Deep Agents integration Profile |
+| `TinkerFin.observe(observer)` | Add one managed Runtime observer immutably | A `tinkerfin-contracts` `RuntimeObserver` |
 | `TinkerFin.plan(...)` | Create an immutable Plan-capable factory | Capability and mode defaults, optional Planner model, clarification form, Plan content schema, and review actions |
 | `TinkerFin.create_deep_agent(...)` | Create a reusable agent definition | See [Create and run a Deep Agent](deep-agents.md) |
-| `Identity(threadId=..., runId=...)` | Identify one framework run | Thread and run only |
+| `DeepAgentsRuntimeProfile` | Implement a complete upstream integration | Canonical Profile ID, graph factory, Native Stream Driver, and resume checkpoint semantics |
+| `DeepAgentsFactoryPreparation` | Return Profile-owned factory overrides | Read-only override mapping and external-subagent cancellation boundary |
+| `DeepAgentsV2RuntimeProfile(...)` | Use the current built-in integration | Locked graph construction, invocation, validation, observations, reasoning extractors, and replay |
+| `RunIdentity(threadId=..., runId=...)` | Identify one framework run | Thread and run only |
 | `DeepAgentDefinition.new(...)` | Create a native Runtime | Required `identity`, optional request `mode` and `on_part` |
 | `DeepAgentDefinition.new_agui(...)` | Create an AG-UI Runtime | Required canonical `identity`; optional parent, mode, resume, checkpoint callback, and observers |
+| `TinkerFin.failed_agui_run(...)` | Represent a setup failure after a Run was accepted | Error, identity, and the real available input/config/resume |
+
+`DeepAgentsV2RuntimeProfile` is the default current Profile. TinkerFin selects one
+Profile before Definition creation, persists its `profile_id` with checkpoint lineage,
+and rejects branch or resume through another Profile before Graph continuation. It never
+detects or negotiates a Profile from stream data. A verified provider reasoning path is
+enabled only by passing a `ReasoningExtractor`, such as `DeepSeekReasoningExtractor`, to
+the Profile; this does not authorize Trace persistence by itself. A custom Profile also
+implements its concrete `stage_resume_intent()`, `pending_resume_values()`, and
+`native_resume_submitted()` checkpointer semantics; TinkerFin does not fall back to v2
+checkpoint behavior for it.
 
 Reuse `DeepAgentDefinition`. Treat `DeepAgentRuntime`, `DeepAgentAgUiRuntime`, and
 `DeepAgentAgUiResumeRuntime` as single-use values returned by the entry points rather
@@ -64,7 +82,9 @@ explicitly only when the host provides a trusted draft editor.
 omitting it uses all four built-in answer types. Shared typed metadata uses
 `BuiltInClarificationForm[QuestionAttributes, OptionModel]`. A host-defined semantic type
 is registered once through `.plan(clarification_types=(clarification_type(...),))`.
-Changing its Schema, validator, or normalizer semantics requires a new type ID version.
+Its namespaced type ID is unversioned. The Definition fingerprint fixes the exact current
+Schema and callbacks; incompatible stored data must be rebuilt instead of assigning a
+second type-ID version.
 
 Clarification responses use an `answers` object keyed by checkpoint question ID. An
 answered value contains `status: answered`, its `answerType`, and type-specific fields;
@@ -84,7 +104,7 @@ non-checkpointed context contract.
 
 | API | Use |
 | --- | --- |
-| `NativeGraphRunStream` | Iterates normalized LangGraph v2 parts and can go directly to Messaging |
+| `NativeGraphRunStream` | Iterates original upstream objects while transferring the same Driver-owned canonical frame to Messaging or Native SSE |
 | `AgUiEventStream` | Iterates AG-UI events; supports `abort()`, `aclose()`, and `to_sse()` |
 | `SseBody` | Iterates SSE strings; call `prepare()` first and `aclose()` when done |
 
@@ -92,13 +112,17 @@ non-checkpointed context contract.
 
 Requests cancellation and returns the remaining events needed to close open lifecycles correctly. Repeated calls do not create duplicate terminal tails.
 
-### `AgUiEventStream.from_initialization_error(...)`
+### `TinkerFin.failed_agui_run(...)`
 
-Creates a valid failed AG-UI stream when initialization failed before Graph iteration. Normal `new_agui()` callers do not need it.
+Creates an observed failed AG-UI stream when model, Sandbox, Definition, or Graph setup
+fails after the host accepted the semantic Run. It records real Run input, one failed
+terminal, and close through the same Runtime lifecycle. Normal `new_agui()` callers do
+not need it.
 
 ## Native stream data
 
-`NativeStreamPart` is the durable native v2 representation.
+`NativeStreamPart` is the current finite canonical replay representation. It is produced
+by the selected Profile and contains no upstream version selector.
 
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
@@ -109,13 +133,17 @@ Creates a valid failed AG-UI stream when initialization failed before Graph iter
 
 The Runtime normally creates these objects for you.
 
-## AG-UI stream preflight
+## Native stream preflight
 
-`new_agui()` fixes the native profile to `messages`, `tasks`, and `values` with
-`version="v2"` and `subgraphs=True`. Callers may add `updates`, `checkpoints`, `debug`,
-or `custom` through the Runtime `astream(stream_mode=...)` argument. Missing required
-modes, duplicates, unsupported modes, a conflicting version, or disabled subgraphs
-raise `AgUiNativeStreamConfigurationError` before Graph or coordinator side effects.
+The selected Runtime Profile owns its complete upstream invocation and checkpoint contract,
+including required modes, upstream version, subgraph behavior, complete state output, and
+stable build/bound stream signatures plus durable resume-intent writes that preserve
+interrupted control state. The bound signature permits lazy resume Graph construction
+inside retained async settlement. The built-in Profile
+lets callers add supported diagnostic modes through
+`astream(stream_mode=...)`; removing a required mode or supplying a conflicting upstream
+option fails before Graph or coordinator side effects. Native and AG-UI paths use the
+same Profile boundary and expose the same parameter-validation errors.
 
 ## SSE types
 
@@ -132,6 +160,8 @@ raise `AgUiNativeStreamConfigurationError` before Graph or coordinator side effe
 | --- | --- |
 | `PartObserver` | Asynchronously observes native parts |
 | `EventObserver` | Asynchronously observes AG-UI events |
+| `RuntimeObserver` | Opens one managed run/native observation session per admitted Runtime request |
+| `RunObservationSession` | Receives ordered observations, hard-boundary force calls, failure notification, and close |
 | `join_task(task, cancel=False, suppress_task_cancellation=False)` | Settle a host-owned task before propagating caller cancellation |
 | `RunCoordinator` | Extension boundary for run exclusion |
 | `InMemoryRunCoordinator(key_resolver=...)` | Serializes business keys within one process |
@@ -140,22 +170,33 @@ After installing `tinkerfin[redis]`:
 
 | API | Use |
 | --- | --- |
-| `RedisRunCoordinator` | Serialize matching `Identity` values across processes |
+| `RedisRunCoordinator` | Serialize matching `RunIdentity` values across processes |
 | `RedisLeaseLock` | Manage renewable Redis resource leases |
 | `RedisLease` | Immutable resource key and fencing token yielded by `hold()` |
 | `RedisLeaseLost` | Report uncertain, expired, or lost ownership |
 
 See [Run coordination and Redis leases](extensions.md#use-a-renewable-redis-lease-when-needed) for constructor defaults and connection-pool guidance.
 
+`TinkerFin.observe(...)` returns a separate factory and preserves Observer registration
+through `.plan(...)`. Runtime validates each Native part once, then publishes Trace-safe
+observations before `on_part` and AG-UI conversion. An Observer failure terminates the
+Run fail-closed; Runtime still closes all opened sessions. `tinkerfin-tracing.Tracer` is
+the provided semantic implementation. AG-UI events, Messaging commits, SSE frames, and
+Redis ownership are not Runtime observations.
+
+An Agent terminal is selected before Observer broadcast. A terminal-broadcast Observer
+failure fails the caller and is reported to healthy Observers without rewriting that
+already selected execution outcome.
+
 ## Resume and errors
 
 | API | When it appears |
 | --- | --- |
-| `AgUiResumeBinding` | Resuming an interrupted AG-UI run |
+| `AgUiResumeRequest` | Untrusted client decisions for an interrupted AG-UI run |
+| `AgUiResumeBinding` | Private checkpoint-resolved facts accepted by `new_agui()` |
 | `AgUiResumeCheckpoint` | Stable callback value after the resume marker is durable |
 | `tinkerfin.plan.PlanModeConfigurationError` | A Plan definition lacks a concrete saver or explicit model, has an incompatible state schema, or requests non-sync durability |
 | `AgUiSettlementTimeoutError` | Caller wait ended before protected Runtime cleanup settled |
-| `AgUiNativeStreamConfigurationError` | Native options do not satisfy the AG-UI profile |
 
 `DeepAgentDefinition.new_agui(...)` creates one request Runtime with these options:
 
@@ -170,15 +211,16 @@ See [Run coordination and Redis leases](extensions.md#use-a-renewable-redis-leas
 | `expose_subagent_events` | `True` | Deliver subagent events |
 | `resume` | `None` | Complete trusted `AgUiResumeBinding` for a resumed request |
 | `on_resume_checkpointed` | `None` | Idempotent callback after the exact resume marker is readable |
+| `on_resume_initialization_failed` | `None` | Idempotent settlement if failure, cancellation, or close occurs before marker durability |
 | `on_event` | `None` | Observer called before AG-UI event delivery |
 
 The returned Runtime preserves the installed Graph `astream(...)` parameter shape. It
-injects the same `Identity` into Graph configuration and does not accept another Runtime
+injects the same `RunIdentity` into Graph configuration and does not accept another Runtime
 identity at `astream()`.
 
-`AgUiResumeBinding.from_agui(...)` validates complete trusted AG-UI interrupts and
-entries, including native groups, cancellation mode, Tool IDs, and source agents. The
-binding stores no identity or parent and exposes no native command. It can be persisted
-and restored as one complete Pydantic model.
+`DeepAgentDefinition.prepare_agui_resume(...)` accepts an `AgUiResumeRequest`, reads the
+canonical checkpoint through the selected Profile, validates native groups, cancellation,
+Tool IDs, source agents, and Profile lineage, and returns the private binding. The client
+request contains no server interrupt payload or native command.
 
 See [Interrupts and resume](../agui/interrupts-and-resume.md) for the complete resume flow.

@@ -85,17 +85,46 @@ class OpenSandboxState(Protocol):
         ...
 
     async def start(self, *, warm_pool_size: int) -> None:
-        """Open State with one immutable warm-pool capacity."""
+        """Open State with one immutable warm-pool capacity.
+
+        Args:
+            warm_pool_size: Non-negative global slot count fixed for this lifecycle.
+
+        Raises:
+            OpenSandboxStateConfigurationError: A repeated start changes capacity.
+            OpenSandboxStateError: Durable setup or worker registration fails.
+            ValueError: ``warm_pool_size`` is negative.
+        """
 
         ...
 
     async def acquire_owner(self, owner_key: str) -> OpenSandboxOwnerClaim:
-        """Acquire the exclusive fencing claim for one owner key."""
+        """Acquire the exclusive fencing claim for one owner key.
+
+        Args:
+            owner_key: Host identity used only to derive the State-owned digest.
+
+        Returns:
+            Current exclusive claim and any previously committed binding.
+
+        Raises:
+            OpenSandboxStateError: State is closed or ownership cannot be acquired.
+        """
 
         ...
 
     async def renew_owner(self, claim: OpenSandboxOwnerClaim) -> bool:
-        """Renew an owner claim and return whether it still owns the fence."""
+        """Renew an owner claim and return whether it still owns the fence.
+
+        Args:
+            claim: Exact owner token and generation returned by ``acquire_owner()``.
+
+        Returns:
+            Whether the same claim remains authoritative after renewal.
+
+        Raises:
+            OpenSandboxStateError: Durable renewal evidence is unavailable.
+        """
 
         ...
 
@@ -104,27 +133,71 @@ class OpenSandboxState(Protocol):
         claim: OpenSandboxOwnerClaim,
         sandbox_id: str,
     ) -> OpenSandboxBinding:
-        """Commit a remote Sandbox as the claimed owner's authoritative binding."""
+        """Commit a remote Sandbox as the claimed owner's authoritative binding.
+
+        Args:
+            claim: Current exclusive owner claim.
+            sandbox_id: Canonical remote Sandbox identifier to publish.
+
+        Returns:
+            Newly authoritative binding and owner generation.
+
+        Raises:
+            OpenSandboxStateOwnershipError: The claim is stale or no longer current.
+            OpenSandboxStateError: The binding cannot be committed durably.
+        """
 
         ...
 
     async def unbind_owner(self, claim: OpenSandboxOwnerClaim) -> None:
-        """Remove the binding protected by an active owner claim."""
+        """Remove the binding protected by an active owner claim.
+
+        Args:
+            claim: Current exclusive owner claim protecting the binding.
+
+        Raises:
+            OpenSandboxStateOwnershipError: The claim is stale or no longer current.
+            OpenSandboxStateError: Durable binding removal fails.
+        """
 
         ...
 
     async def read_binding(self, owner_key: str) -> OpenSandboxBinding | None:
-        """Read the current authoritative binding without acquiring ownership."""
+        """Read the current authoritative binding without acquiring ownership.
+
+        Args:
+            owner_key: Host owner identity whose digest selects the binding.
+
+        Returns:
+            Detached authoritative binding, or ``None`` when no binding exists.
+
+        Raises:
+            OpenSandboxStateError: State is closed or durable lookup fails.
+        """
 
         ...
 
     async def release_owner(self, claim: OpenSandboxOwnerClaim) -> None:
-        """Release an owner claim without changing its committed binding."""
+        """Release an owner claim without changing its committed binding.
+
+        Args:
+            claim: Owner token and generation to release idempotently.
+
+        Raises:
+            OpenSandboxStateError: Durable release fails.
+        """
 
         ...
 
     async def claim_warm_slot(self) -> OpenSandboxWarmClaim | None:
-        """Claim one empty warm slot, or return ``None`` when none is available."""
+        """Claim one empty warm slot without waiting for another worker.
+
+        Returns:
+            Exclusive slot claim, or ``None`` when no empty slot is available.
+
+        Raises:
+            OpenSandboxStateError: State is closed or slot evidence cannot be read.
+        """
 
         ...
 
@@ -133,17 +206,43 @@ class OpenSandboxState(Protocol):
         claim: OpenSandboxWarmClaim,
         sandbox_id: str,
     ) -> None:
-        """Publish a created Sandbox into the claimed warm slot."""
+        """Publish a created Sandbox into the claimed warm slot.
+
+        Args:
+            claim: Current warm-slot fencing claim.
+            sandbox_id: Canonical remote Sandbox identifier to publish.
+
+        Raises:
+            OpenSandboxStateOwnershipError: The slot claim is stale or superseded.
+            OpenSandboxStateError: Durable publication fails.
+        """
 
         ...
 
     async def renew_warm(self, claim: OpenSandboxWarmClaim) -> bool:
-        """Renew a warm-slot claim and report whether its fence remains current."""
+        """Renew a warm-slot claim and report whether its fence remains current.
+
+        Args:
+            claim: Exact warm-slot token and generation to renew.
+
+        Returns:
+            Whether the same slot claim remains authoritative.
+
+        Raises:
+            OpenSandboxStateError: Durable renewal evidence is unavailable.
+        """
 
         ...
 
     async def release_warm(self, claim: OpenSandboxWarmClaim) -> None:
-        """Release a warm-slot claim without consuming its published Sandbox."""
+        """Release a warm-slot claim without consuming its published Sandbox.
+
+        Args:
+            claim: Warm-slot token and generation to release idempotently.
+
+        Raises:
+            OpenSandboxStateError: Durable release fails.
+        """
 
         ...
 
@@ -155,51 +254,113 @@ class OpenSandboxState(Protocol):
 
         A non-``None`` result is already authoritative. Callers must publish that
         exact binding without invoking ``bind_owner()`` again.
+
+        Args:
+            claim: Current owner claim receiving an available warm Sandbox.
+
+        Returns:
+            Authoritative owner binding, or ``None`` when no ready slot is available.
+
+        Raises:
+            OpenSandboxStateError: Claim ownership or durable State access fails.
         """
 
         ...
 
     async def enqueue_cleanup(self, sandbox_id: str) -> None:
-        """Idempotently enqueue an orphaned remote Sandbox for destruction."""
+        """Idempotently enqueue an orphaned remote Sandbox for destruction.
+
+        Args:
+            sandbox_id: Canonical remote Sandbox identifier requiring cleanup.
+
+        Raises:
+            OpenSandboxStateError: The cleanup target cannot be persisted.
+        """
 
         ...
 
     async def claim_cleanup(self) -> OpenSandboxCleanupClaim | None:
-        """Claim one pending cleanup item, or return ``None`` when empty."""
+        """Claim one pending cleanup item without waiting when the queue is empty.
+
+        Returns:
+            Exclusive cleanup claim, or ``None`` when no item is available.
+
+        Raises:
+            OpenSandboxStateError: State is closed or cleanup evidence cannot be read.
+        """
 
         ...
 
     async def renew_cleanup(self, claim: OpenSandboxCleanupClaim) -> bool:
-        """Renew a cleanup claim and report whether its fence remains current."""
+        """Renew a cleanup claim and report whether its fence remains current.
+
+        Args:
+            claim: Exact cleanup token and generation to renew.
+
+        Returns:
+            Whether the same cleanup claim remains authoritative.
+
+        Raises:
+            OpenSandboxStateError: Durable renewal evidence is unavailable.
+        """
 
         ...
 
     async def complete_cleanup(self, claim: OpenSandboxCleanupClaim) -> None:
-        """Remove a cleanup item after confirmed remote destruction."""
+        """Remove a cleanup item after confirmed remote destruction.
+
+        Args:
+            claim: Current cleanup claim whose remote Sandbox was destroyed.
+
+        Raises:
+            OpenSandboxStateOwnershipError: The cleanup claim is stale or superseded.
+            OpenSandboxStateError: Durable completion fails.
+        """
 
         ...
 
     async def release_cleanup(self, claim: OpenSandboxCleanupClaim) -> None:
-        """Release a cleanup claim so another worker can retry it."""
+        """Release a cleanup claim so another worker can retry it.
+
+        Args:
+            claim: Cleanup token and generation to release idempotently.
+
+        Raises:
+            OpenSandboxStateError: Durable release fails.
+        """
 
         ...
 
     async def shutdown_sandbox_ids(self) -> tuple[str, ...]:
-        """Return process-local Sandbox IDs that this State must destroy on close."""
+        """Return process-local Sandbox IDs that this State must destroy on close.
+
+        Returns:
+            Stable unique IDs owned by this process and not durably handed off.
+
+        Raises:
+            OpenSandboxStateError: Shutdown ownership evidence cannot be read safely.
+        """
 
         ...
 
     async def aclose(self) -> None:
-        """Close State resources after active manager operations have settled."""
+        """Close State resources after active manager operations have settled.
+
+        Raises:
+            OpenSandboxStateError: Worker release, task settlement, or an owned Engine
+                close fails. Borrowed Engines are never disposed.
+        """
 
         ...
 
 
 async def _call_state(
-    state: OpenSandboxState,
+    _state: OpenSandboxState,
     operation: str,
     awaitable: object,
 ) -> object:
+    """Translate State failures while retaining it until the awaitable settles."""
+
     try:
         return await cast(Awaitable[object], awaitable)
     except OpenSandboxStateError:

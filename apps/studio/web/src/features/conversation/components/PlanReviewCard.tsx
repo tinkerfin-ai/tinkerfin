@@ -1,13 +1,9 @@
 import { Check, MessageSquareText, Route, X } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef } from 'react'
 
 import { Button, OverlayScrollbar } from '../../../components/ui'
 import type { PlanReviewState } from '../../../types'
 import { useI18n } from '../../../i18n'
-import {
-  readPlanReviewCollapsed,
-  writePlanReviewCollapsed,
-} from '../planQuestionCollapse'
 import { MarkdownContent } from './MarkdownContent'
 import { PlanInteractionCard, PlanInteractionStatusRow } from './PlanInteractionCard'
 
@@ -26,12 +22,10 @@ export function PlanReviewStatusRow({ interaction }: { interaction: PlanReviewSt
 }
 
 export function PlanReviewCard({
-  threadId,
   interaction,
   onChange,
   onSubmit,
 }: {
-  threadId: string
   interaction: PlanReviewState
   onChange: (updater: (current: PlanReviewState) => PlanReviewState) => void
   onSubmit: () => void
@@ -39,20 +33,11 @@ export function PlanReviewCard({
   const { t } = useI18n()
   const bodyRef = useRef<HTMLDivElement | null>(null)
   const messageRef = useRef<HTMLTextAreaElement | null>(null)
-  const [minimized, setMinimized] = useState(() => readPlanReviewCollapsed(threadId))
-
   useEffect(() => {
-    setMinimized(readPlanReviewCollapsed(threadId))
-  }, [threadId])
-
-  useEffect(() => {
-    if (
-      minimized
-      || (interaction.action !== 'respond' && interaction.action !== 'reject')
-    ) return
+    if (interaction.action !== 'respond' && interaction.action !== 'reject') return
     const frame = window.requestAnimationFrame(() => messageRef.current?.focus())
     return () => window.cancelAnimationFrame(frame)
-  }, [interaction.action, interaction.interruptId, minimized])
+  }, [interaction.action, interaction.interruptId])
 
   const update = (patch: Partial<PlanReviewState>) => onChange((current) => ({
     ...current,
@@ -60,14 +45,6 @@ export function PlanReviewCard({
     error: undefined,
   }))
 
-  const toggleMinimized = () => {
-    // 收起只保存当前会话的展示偏好，不改变待审阅状态或触发恢复
-    setMinimized((current) => {
-      const next = !current
-      writePlanReviewCollapsed(threadId, next)
-      return next
-    })
-  }
   const canSubmit = Boolean(interaction.action)
     && !interaction.submitted
     && (interaction.action !== 'respond' || Boolean(interaction.message?.trim()))
@@ -76,16 +53,10 @@ export function PlanReviewCard({
     <PlanInteractionCard
       kind="review"
       ariaLabel={t('Plan 审阅')}
-      minimized={minimized}
+      minimized={false}
+      collapsible={false}
       icon={<Route size={16} aria-hidden="true" />}
-      title="Plan"
-      titleMeta={<>· {t('第 {revision} 版', { revision: interaction.revision })}</>}
-      description={interaction.draft.content.description}
-      toggleSurfaceLabel={minimized
-        ? t('点击标题区域展开计划草稿')
-        : t('点击标题区域收起计划草稿')}
-      toggleLabel={minimized ? t('展开计划草稿') : t('收起计划草稿')}
-      onToggle={toggleMinimized}
+      title={interaction.draft.content.description}
       bodyRef={bodyRef}
     >
       <>

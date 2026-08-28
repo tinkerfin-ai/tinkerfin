@@ -38,6 +38,7 @@ from ._sql_schema import _workers
 from ._sql_transactions import (
     _MYSQL_STARTUP_LOCK_TIMEOUT_SECONDS,
     _SQLDialectCapabilities,
+    _WriteConnectionDisposition,
 )
 from ._sql_transactions import _apply_claim_lock as _apply_claim_lock
 from ._sql_transactions import (
@@ -160,12 +161,13 @@ def get_sqlalchemy_opensandbox_state_schema(
 class SQLAlchemyOpenSandboxState(OpenSandboxState):
     """Persist OpenSandbox allocation state through SQLAlchemy Core.
 
-    The State creates and owns its asynchronous engine. Callers provide only an
-    async SQLAlchemy URL and must close the State, normally by transferring its
-    lifecycle to ``OpenSandboxManager``.
+    The State accepts either an owned URL or a borrowed ``AsyncEngine``. Borrowed mode
+    never creates, reconfigures, or disposes the host Engine; both modes still own
+    worker registration and background renewal tasks.
 
     Args:
-        url: SQLite ``sqlite+aiosqlite`` or MySQL ``mysql+asyncmy`` URL.
+        url: Owned SQLite ``sqlite+aiosqlite`` or MySQL ``mysql+asyncmy`` URL.
+        engine: Borrowed asynchronous SQLite or MySQL Engine.
         namespace: Logical deployment namespace stored with every state row.
         lease_ttl: Seconds before an abandoned State claim or Worker can be fenced out.
         poll_interval: Seconds between attempts while another worker owns a claim.
@@ -173,23 +175,42 @@ class SQLAlchemyOpenSandboxState(OpenSandboxState):
             lock conflicts. The first attempt is always made.
 
     Raises:
-        ValueError: A namespace or timing option is invalid.
+        TypeError: Engine or timing values have the wrong public type.
+        ValueError: Engine ownership selection, namespace, timing, or dialect is invalid.
     """
 
     def __init__(
         self,
         *,
-        url: str,
+        url: str | None = None,
+        engine: AsyncEngine | None = None,
         namespace: str = "",
         lease_ttl: float = 15.0,
         poll_interval: float = 0.05,
         sqlite_retry_timeout: float = 5.0,
     ) -> None:
-        """Initialize owned SQLAlchemy persistence without opening the engine.
+        """Initialize owned or borrowed SQLAlchemy persistence without database I/O.
 
-        The State owns the asynchronous engine created from ``url``. Timing values
+        Exactly one of ``url`` and ``engine`` is required. Timing and ownership values
         are validated before any connection, task, or schema mutation occurs.
+
+        Args:
+            url: URL used to create an Engine owned by this State.
+            engine: Existing asynchronous Engine borrowed from the host.
+            namespace: Logical deployment namespace stored with State records.
+            lease_ttl: Claim and Worker lease duration in seconds.
+            poll_interval: Delay between contested claim attempts in seconds.
+            sqlite_retry_timeout: Bounded SQLite lock retry duration in seconds.
+
+        Raises:
+            TypeError: Engine or timing values have the wrong public type.
+            ValueError: Ownership selection, namespace, timing, or dialect is invalid.
         """
+
+        if (url is None) == (engine is None):
+            raise ValueError("exactly one of url or engine must be provided")
+        if engine is not None and not isinstance(engine, AsyncEngine):
+            raise TypeError("engine must be an AsyncEngine or None")
 
         if len(namespace) > 64:
             raise ValueError("namespace must contain at most 64 characters")
@@ -223,7 +244,10 @@ class SQLAlchemyOpenSandboxState(OpenSandboxState):
         self._worker_lease_ttl = resolved_lease_ttl
         self._worker_renew_task: asyncio.Task[None] | None = None
         self._worker_failure: Exception | None = None
-        self._engine: AsyncEngine = create_async_engine(url)
+        self._owns_engine = url is not None
+        self._engine = (
+            create_async_engine(url) if url is not None else cast(AsyncEngine, engine)
+        )
         self._dialect = self._engine.url.get_backend_name()
         if self._dialect not in {"sqlite", "mysql"}:
             raise ValueError(
@@ -294,12 +318,17 @@ class SQLAlchemyOpenSandboxState(OpenSandboxState):
             connection,
         )
 
-    async def _commit_write_transaction(self, connection: AsyncConnection) -> None:
+    async def _commit_write_transaction(
+        self,
+        connection: AsyncConnection,
+        disposition: _WriteConnectionDisposition,
+    ) -> None:
         """Settle COMMIT and retry only SQLite's known uncommitted BUSY result."""
 
         return await _sql_transactions._commit_write_transaction(
             self,
             connection,
+            disposition,
         )
 
     async def _write_transaction_once(
@@ -603,11 +632,12 @@ class SQLAlchemyOpenSandboxState(OpenSandboxState):
 
     @_state_operation("close")
     async def aclose(self) -> None:
-        """Settle startup and close owned database resources idempotently.
+        """Settle startup and release State-owned resources idempotently.
 
         All callers await one shielded close task. Closing waits any owned startup
         attempt, unregisters the worker when its transaction may have committed, and
-        then disposes the asynchronous engine.
+        then disposes only an Engine created from ``url``. A borrowed Engine remains
+        pooled and usable by its host after State closure.
         """
         async with self._start_lock:
             close_task = self._close_task
@@ -621,7 +651,7 @@ class SQLAlchemyOpenSandboxState(OpenSandboxState):
         await asyncio.shield(close_task)
 
     async def _aclose_once(self) -> None:
-        """Settle startup, unregister the worker, and dispose the engine."""
+        """Settle startup, unregister the worker, and dispose only an owned engine."""
         start_task = self._start_task
         if start_task is not None:
             await asyncio.gather(start_task, return_exceptions=True)
@@ -645,4 +675,5 @@ class SQLAlchemyOpenSandboxState(OpenSandboxState):
             except Exception:  # noqa: BLE001
                 # Lease expiry removes a crashed or unreachable worker registration
                 pass
-        await self._engine.dispose()
+        if self._owns_engine:
+            await self._engine.dispose()

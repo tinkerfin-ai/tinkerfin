@@ -1,4 +1,4 @@
-"""Studio 全局日志初始化测试。"""
+"""Studio 全局日志初始化测试"""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from pathlib import Path
 def test_setup_logging_defaults_to_stdout_without_creating_files(
     tmp_path: Path,
 ) -> None:
-    """容器缺省日志必须只写标准输出。"""
+    """容器缺省日志必须只写标准输出"""
 
     result = subprocess.run(
         [
@@ -38,7 +38,7 @@ def test_setup_logging_defaults_to_stdout_without_creating_files(
 
 
 def test_setup_logging_writes_rotating_file_when_enabled(tmp_path: Path) -> None:
-    """显式开启文件日志时必须同时保留标准输出。"""
+    """显式开启文件日志时必须同时保留标准输出"""
 
     result = subprocess.run(
         [

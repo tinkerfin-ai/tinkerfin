@@ -11,7 +11,7 @@ from typing import ClassVar, Literal, cast
 import pytest
 
 import tinkerfin_messaging
-from tinkerfin import Identity
+from tinkerfin import RunIdentity
 from tinkerfin_messaging import (
     BackendOwnershipLost,
     BackendRunHandle,
@@ -29,8 +29,8 @@ from tinkerfin_messaging import (
 )
 
 
-def _identity(*, run_id: str = "run-1") -> Identity:
-    return Identity(threadId="conversation-1", runId=run_id)
+def _identity(*, run_id: str = "run-1") -> RunIdentity:
+    return RunIdentity(threadId="conversation-1", runId=run_id)
 
 
 class _TextCodec:
@@ -188,7 +188,7 @@ class _DiagnosticLeaseBackend(MemoryBackend):
         self,
         *,
         channel: str,
-        identity: Identity,
+        identity: RunIdentity,
         codec: str,
         after: int | None,
         cancellable: bool,
@@ -244,7 +244,7 @@ class _BlockingPrepareBackend(MemoryBackend):
         self,
         *,
         channel: str,
-        identity: Identity,
+        identity: RunIdentity,
         codec: str,
         after: int | None,
         cancellable: bool,
@@ -579,7 +579,7 @@ async def test_cooperative_source_silence_keeps_renewing_without_failure_log(
     release = asyncio.Event()
     source = _Source(release=release)
 
-    with caplog.at_level(logging.ERROR, logger="tinkerfin_messaging.messaging"):
+    with caplog.at_level(logging.ERROR, logger="tinkerfin.messaging"):
         async with Messaging(backend=backend) as messaging:
             subscription = await messaging.channel(
                 name="events",
@@ -612,12 +612,12 @@ async def test_cooperative_source_silence_keeps_renewing_without_failure_log(
         (
             "exception",
             "backend_exception",
-            "tinkerfin_messaging.errors.UnexpectedMessagingBackendError",
+            "UnexpectedMessagingBackendError",
         ),
         (
             "reject",
             "ownership_rejected",
-            "tinkerfin_messaging.errors.BackendOwnershipLost",
+            "BackendOwnershipLost",
         ),
     ],
 )
@@ -630,7 +630,7 @@ async def test_lease_failure_log_classifies_backend_outcomes(
     backend = _DiagnosticLeaseBackend(behavior=behavior)
     source = _Source(release=asyncio.Event())
 
-    with caplog.at_level(logging.ERROR, logger="tinkerfin_messaging.messaging"):
+    with caplog.at_level(logging.ERROR, logger="tinkerfin.messaging"):
         async with Messaging(backend=backend) as messaging:
             subscription = await messaging.channel(
                 name="events",
@@ -649,19 +649,27 @@ async def test_lease_failure_log_classifies_backend_outcomes(
         if record.getMessage() == "Messaging producer lease renewal failed"
     ]
     assert len(records) == 1
-    fields = vars(records[0])
-    assert fields["channel"] == "events"
-    assert fields["thread_id"] == "conversation-1"
-    assert fields["run_id"] == "run-1"
-    assert fields["renewal_phase"] == "producer"
-    assert fields["renewal_outcome"] == outcome
-    assert fields["attempt"] == 1
-    assert fields["deadline_elapsed"] is False
-    assert fields["error_type"] == error_type
-    assert fields["scheduler_delay_seconds"] >= 0
-    assert fields["command_duration_seconds"] >= 0
-    assert fields["seconds_since_last_success"] >= 0
-    assert fields["lease_timeout_seconds"] == backend.timeout
+    record = records[0]
+    fields = vars(record)
+    assert fields["tinkerfin_renewal_phase"] == "producer"
+    assert fields["tinkerfin_renewal_outcome"] == outcome
+    assert fields["tinkerfin_attempt"] == 1
+    assert fields["tinkerfin_deadline_elapsed"] is False
+    assert fields["tinkerfin_error_type"] == error_type
+    assert fields["tinkerfin_scheduler_delay_seconds"] >= 0
+    assert fields["tinkerfin_command_duration_seconds"] >= 0
+    assert fields["tinkerfin_seconds_since_last_success"] >= 0
+    assert fields["tinkerfin_lease_timeout_seconds"] == backend.timeout
+    assert record.exc_info is None
+    assert "events" not in caplog.text
+    assert "conversation-1" not in caplog.text
+    assert "run-1" not in caplog.text
+    assert all(
+        key.startswith("tinkerfin_") for key in fields if key.startswith("tinkerfin")
+    )
+    assert "channel" not in fields
+    assert "thread_id" not in fields
+    assert "run_id" not in fields
     assert "owner_token" not in fields
     assert "fence" not in fields
     assert "payload" not in fields
@@ -679,7 +687,7 @@ async def test_event_loop_block_is_distinguished_from_on_time_renewal_rejection(
     backend = _DiagnosticLeaseBackend(behavior="success")
     source = _BlockingEventLoopSource(block_seconds=0.08)
 
-    with caplog.at_level(logging.ERROR, logger="tinkerfin_messaging.messaging"):
+    with caplog.at_level(logging.ERROR, logger="tinkerfin.messaging"):
         async with Messaging(backend=backend) as messaging:
             subscription = await messaging.channel(
                 name="events",
@@ -698,10 +706,10 @@ async def test_event_loop_block_is_distinguished_from_on_time_renewal_rejection(
         if record.getMessage() == "Messaging producer lease renewal failed"
     )
     fields = vars(record)
-    assert fields["renewal_outcome"] == "ownership_rejected"
-    assert fields["deadline_elapsed"] is True
-    assert fields["scheduler_delay_seconds"] >= backend.timeout
-    assert fields["seconds_since_last_success"] >= backend.timeout
+    assert fields["tinkerfin_renewal_outcome"] == "ownership_rejected"
+    assert fields["tinkerfin_deadline_elapsed"] is True
+    assert fields["tinkerfin_scheduler_delay_seconds"] >= backend.timeout
+    assert fields["tinkerfin_seconds_since_last_success"] >= backend.timeout
     assert source.closed.is_set()
 
 

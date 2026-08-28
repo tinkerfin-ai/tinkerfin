@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 import pytest
 
 import tinkerfin_messaging as messaging_api
-from tinkerfin import Identity
+from tinkerfin import RunIdentity
 from tinkerfin_messaging import (
     BackendOwnershipLost,
     CodecMismatch,
@@ -28,14 +28,14 @@ def _identity(
     *,
     thread_id: str = "conversation-1",
     run_id: str = "run-1",
-) -> Identity:
-    return Identity(threadId=thread_id, runId=run_id)
+) -> RunIdentity:
+    return RunIdentity(threadId=thread_id, runId=run_id)
 
 
 async def _prepare_memory(
     backend: MemoryBackend,
     *,
-    identity: Identity,
+    identity: RunIdentity,
     codec: str = "test.bytes.v1",
 ) -> PreparedRun:
     return await backend.prepare(
@@ -51,7 +51,7 @@ async def _prepare_memory(
 async def _prepare_backend(
     backend: MessagingBackend,
     *,
-    identity: Identity | None = None,
+    identity: RunIdentity | None = None,
     codec: str = "test.bytes.v1",
     cancellable: bool = False,
 ) -> PreparedRun:
@@ -102,7 +102,7 @@ async def test_message_channel_validates_deletion_and_obeys_its_lifecycle() -> N
 
     with pytest.raises(ValueError):
         await channel.delete_stream(
-            identity=Identity.model_construct(
+            identity=RunIdentity.model_construct(
                 thread_id=" not-canonical ",
                 run_id="run-1",
             )

@@ -13,7 +13,7 @@ from ag_ui.core import (
     RunStartedEvent,
 )
 
-from .contracts import AgentRunOutcome, Identity
+from .contracts import AgentRunOutcome, RunIdentity
 
 
 class AgUiLifecycleEventFactory:
@@ -28,7 +28,7 @@ class AgUiLifecycleEventFactory:
     def started(
         self,
         *,
-        identity: Identity,
+        identity: RunIdentity,
         parent_run_id: str | None = None,
     ) -> BaseEvent:
         """Build the main start event without fabricating protocol input.
@@ -55,17 +55,17 @@ class AgUiLifecycleEventFactory:
         )
 
     @staticmethod
-    def validate_identity(identity: Identity) -> None:
-        """Reject values outside the shared Identity contract."""
+    def validate_identity(identity: RunIdentity) -> None:
+        """Reject values outside the shared RunIdentity contract."""
 
-        if not isinstance(identity, Identity):
-            raise TypeError("identity must be an Identity")
+        if not isinstance(identity, RunIdentity):
+            raise TypeError("identity must be a RunIdentity")
 
     @staticmethod
     def validate_parent_run_id(
         parent_run_id: str | None,
         *,
-        identity: Identity,
+        identity: RunIdentity,
     ) -> None:
         """Require an optional canonical parent distinct from the current run."""
 
@@ -81,7 +81,7 @@ class AgUiLifecycleEventFactory:
     def finished(
         self,
         *,
-        identity: Identity,
+        identity: RunIdentity,
         outcome: AgentRunOutcome,
     ) -> BaseEvent:
         """Build a success or interrupt terminal from an adapter outcome."""
@@ -102,7 +102,7 @@ class AgUiLifecycleEventFactory:
     def failed(
         self,
         *,
-        identity: Identity,
+        identity: RunIdentity,
         message: str,
         code: str,
         parent_run_id: str | None = None,
@@ -123,7 +123,7 @@ class AgUiLifecycleEventFactory:
             raw_event=raw_event,
         )
 
-    def is_main_lifecycle(self, event: BaseEvent, *, identity: Identity) -> bool:
+    def is_main_lifecycle(self, event: BaseEvent, *, identity: RunIdentity) -> bool:
         """Return whether an event competes for the identified main lifecycle."""
 
         self.validate_identity(identity)

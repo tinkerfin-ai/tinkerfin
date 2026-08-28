@@ -12,12 +12,12 @@ from ag_ui.core import (
 )
 from langchain_core.messages import AIMessageChunk, ToolMessage
 
-from tinkerfin_agui_adapter import DeepAgentAgUiAdapter, Identity, astream_events
+from tinkerfin_agui_adapter import DeepAgentAgUiAdapter, RunIdentity, astream_events
 from tinkerfin_agui_adapter.ids import ScopedIdCodec
 
 
-def _identity() -> Identity:
-    return Identity(threadId="thread-1", runId="run-1")
+def _identity() -> RunIdentity:
+    return RunIdentity(threadId="thread-1", runId="run-1")
 
 
 def _root_tool_id(raw_id: str) -> str:

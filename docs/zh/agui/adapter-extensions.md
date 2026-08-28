@@ -15,7 +15,7 @@ pip install tinkerfin-agui-adapter
 ## 最简单的转换方式
 
 ```python
-from tinkerfin_agui_adapter import Identity, astream_events
+from tinkerfin_agui_adapter import RunIdentity, astream_events
 
 
 parts = graph.astream(
@@ -28,7 +28,7 @@ parts = graph.astream(
 
 events = astream_events(
     parts,
-    identity=Identity(threadId="thread-1", runId="run-1"),
+    identity=RunIdentity(threadId="thread-1", runId="run-1"),
 )
 
 async for event in events:
@@ -76,7 +76,7 @@ from tinkerfin_agui_adapter import (
 
 
 lifecycle = AgUiLifecycleEventFactory()
-identity = Identity(threadId="thread-1", runId="run-1")
+identity = RunIdentity(threadId="thread-1", runId="run-1")
 adapter = DeepAgentAgUiAdapter(identity=identity)
 
 await send_event(lifecycle.started(identity=identity))
@@ -93,7 +93,7 @@ try:
         )
     )
 except Exception:
-    for event in adapter.abort(code="runtime_error"):
+    for event in adapter.abort():
         await send_event(event)
     await send_event(
         lifecycle.failed(
@@ -103,6 +103,8 @@ except Exception:
         )
     )
 ```
+
+`abort()` 只关闭文字、推理和 Tool 子生命周期；自定义编排器仍按上例唯一发送主 `RUN_ERROR`。
 
 这里由你的代码负责“一个开始、一个终止”。一般应用优先使用 `astream_events()`，因为它已经处理了关闭、取消和失败顺序。
 

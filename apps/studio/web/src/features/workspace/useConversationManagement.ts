@@ -7,7 +7,7 @@ import {
 } from '../../api/conversation/history'
 import type { ToastKind } from '../../components/ui/ToastViewport'
 import type { Conversation, WorkspaceState } from '../../types'
-import { clearInteractionCardCollapsed } from '../conversation/planQuestionCollapse'
+import { clearPlanQuestionCollapsed } from '../conversation/planQuestionCollapse'
 import {
   createNewConversation,
   removeConversation,
@@ -23,7 +23,7 @@ export function useConversationManagement({
   setDraft,
   setDraftConversation,
   setDraftModel,
-  catchUpDetachedConversation,
+  followDetachedConversation,
   abandonPlanInteraction,
   cancelActiveRun,
   detachThreadStream,
@@ -39,7 +39,7 @@ export function useConversationManagement({
   setDraft: Dispatch<SetStateAction<string>>
   setDraftConversation: Dispatch<SetStateAction<Conversation | null>>
   setDraftModel: Dispatch<SetStateAction<string>>
-  catchUpDetachedConversation: (threadId: string) => Promise<void>
+  followDetachedConversation: (threadId: string) => Promise<void>
   abandonPlanInteraction: (threadId: string) => void
   cancelActiveRun: () => Promise<boolean>
   detachThreadStream: (threadId: string, reason: string) => void
@@ -74,7 +74,7 @@ export function useConversationManagement({
     setDraft('')
     setDraftConversation(null)
     setWorkspace((state) => ({ ...state, currentThreadId: threadId }))
-    if (findConversation(threadId)?.isHydrated) void catchUpDetachedConversation(threadId)
+    if (findConversation(threadId)?.isHydrated) void followDetachedConversation(threadId)
   }
 
   const performNewConversation = () => {
@@ -199,7 +199,7 @@ export function useConversationManagement({
       } else if (dialog.kind === 'delete') {
         if (dialog.isRunning) await cancelActiveRun()
         await deleteConversationApi(dialog.threadId)
-        clearInteractionCardCollapsed(dialog.threadId)
+        clearPlanQuestionCollapsed(dialog.threadId)
         if (dialog.threadId === latest.current.workspace.currentThreadId) {
           onConversationBoundary()
         }

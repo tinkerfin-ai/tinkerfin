@@ -6,11 +6,11 @@ import pytest
 from ag_ui.core import RunFinishedEvent, RunStartedEvent
 from langchain_core.messages import AIMessageChunk
 
-from tinkerfin_agui_adapter import Identity, astream_events
+from tinkerfin_agui_adapter import RunIdentity, astream_events
 
 
-def _identity() -> Identity:
-    return Identity(threadId="thread-1", runId="run-1")
+def _identity() -> RunIdentity:
+    return RunIdentity(threadId="thread-1", runId="run-1")
 
 
 @pytest.mark.asyncio

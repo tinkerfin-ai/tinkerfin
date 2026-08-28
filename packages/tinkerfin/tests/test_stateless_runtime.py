@@ -10,11 +10,11 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.runtime import RunControl
 from langgraph.types import StreamMode
 
-from tinkerfin import DeepAgentDefinition, Identity, NativeGraphRunStream, TinkerFin
+from tinkerfin import DeepAgentDefinition, NativeGraphRunStream, RunIdentity, TinkerFin
 
 
-def _identity() -> Identity:
-    return Identity(threadId="thread-1", runId="run-1")
+def _identity() -> RunIdentity:
+    return RunIdentity(threadId="thread-1", runId="run-1")
 
 
 def _graph_input() -> InputAgentState:
@@ -107,7 +107,7 @@ async def test_run_stream_forwards_native_arguments_and_observes_before_delivery
         config,
         stream_mode=("messages", "tasks", "values"),
         print_mode="debug",
-        output_keys=("messages",),
+        output_keys=None,
         interrupt_before=("agent",),
         interrupt_after=("tools",),
         durability="sync",
@@ -126,11 +126,16 @@ async def test_run_stream_forwards_native_arguments_and_observes_before_delivery
     assert graph.calls == [
         {
             "input": {"messages": []},
-            "config": config,
+            "config": {
+                "configurable": {
+                    "thread_id": "thread-1",
+                    "_tinkerfin_runtime_profile": "deepagents-v2",
+                }
+            },
             "context": None,
             "stream_mode": ("messages", "tasks", "values"),
             "print_mode": "debug",
-            "output_keys": ("messages",),
+            "output_keys": None,
             "interrupt_before": ("agent",),
             "interrupt_after": ("tools",),
             "durability": "sync",
@@ -141,6 +146,7 @@ async def test_run_stream_forwards_native_arguments_and_observes_before_delivery
             "kwargs": {},
         }
     ]
+    assert config == {"configurable": {"thread_id": "thread-1"}}
     assert graph.closed.is_set()
 
 
@@ -204,7 +210,7 @@ async def test_coordinator_is_lazy_and_released_when_stream_closes(
     released = asyncio.Event()
 
     @asynccontextmanager
-    async def coordinate(identity: Identity) -> AsyncIterator[None]:
+    async def coordinate(identity: RunIdentity) -> AsyncIterator[None]:
         assert identity == _identity()
         entered.set()
         try:
@@ -241,7 +247,7 @@ async def test_closing_stream_cancels_an_active_graph_pull_before_releasing(
     released = asyncio.Event()
 
     @asynccontextmanager
-    async def coordinate(identity: Identity) -> AsyncIterator[None]:
+    async def coordinate(identity: RunIdentity) -> AsyncIterator[None]:
         del identity
         try:
             yield

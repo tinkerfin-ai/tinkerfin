@@ -79,6 +79,21 @@ class _SQLDialectCapabilities:
     supports_skip_locked: bool
 
 
+@dataclass(frozen=True, slots=True)
+class _WriteConnectionSetting:
+    """Remember one connection-local lock wait value changed by a write attempt."""
+
+    name: Literal["mysql_lock_wait_timeout", "sqlite_busy_timeout"]
+    value: int
+
+
+@dataclass(slots=True)
+class _WriteConnectionDisposition:
+    """Carry connection reuse safety independently from the primary exception."""
+
+    discard_connection: bool = False
+
+
 _SelectRowT = TypeVar("_SelectRowT", bound=tuple[object, ...])
 
 
@@ -207,8 +222,57 @@ async def _begin_write_transaction(
         )
 
 
+async def _capture_write_connection_setting(
+    self: SQLAlchemyOpenSandboxState,
+    connection: AsyncConnection,
+) -> _WriteConnectionSetting | None:
+    """Read the host connection setting that this write attempt must restore."""
+
+    capabilities = self._require_capabilities()
+    if capabilities.name == "sqlite":
+        value = (await connection.exec_driver_sql("PRAGMA busy_timeout")).scalar_one()
+        if not isinstance(value, int):
+            raise OpenSandboxStateError("SQLite returned an invalid busy_timeout")
+        # Reading a PRAGMA activates SQLAlchemy's autobegin wrapper even though SQLite
+        # has not opened the write transaction yet.
+        await connection.rollback()
+        return _WriteConnectionSetting(name="sqlite_busy_timeout", value=value)
+    if capabilities.supports_skip_locked:
+        return None
+    value = (
+        await connection.exec_driver_sql("SELECT @@SESSION.innodb_lock_wait_timeout")
+    ).scalar_one()
+    if not isinstance(value, int):
+        raise OpenSandboxStateError(
+            "MySQL returned an invalid innodb_lock_wait_timeout"
+        )
+    await connection.rollback()
+    return _WriteConnectionSetting(name="mysql_lock_wait_timeout", value=value)
+
+
+async def _restore_write_connection_setting(
+    connection: AsyncConnection,
+    setting: _WriteConnectionSetting | None,
+) -> None:
+    """Restore one borrowed pool connection before it becomes reusable."""
+
+    if setting is None:
+        return
+    if setting.name == "sqlite_busy_timeout":
+        await connection.exec_driver_sql(f"PRAGMA busy_timeout = {setting.value}")
+    else:
+        await connection.exec_driver_sql(
+            f"SET SESSION innodb_lock_wait_timeout = {setting.value}"
+        )
+    # SET SESSION and PRAGMA activate SQLAlchemy's local transaction marker. Rolling
+    # it back does not undo the connection-level value; it only returns a clean wrapper.
+    await connection.rollback()
+
+
 async def _commit_write_transaction(
-    self: SQLAlchemyOpenSandboxState, connection: AsyncConnection
+    self: SQLAlchemyOpenSandboxState,
+    connection: AsyncConnection,
+    disposition: _WriteConnectionDisposition,
 ) -> None:
     """Settle COMMIT and retry only SQLite's known uncommitted BUSY result."""
 
@@ -233,7 +297,7 @@ async def _commit_write_transaction(
         cancellation: asyncio.CancelledError | None = None
         while not commit_task.done():
             try:
-                await asyncio.shield(commit_task)
+                await asyncio.wait((commit_task,))
             except asyncio.CancelledError as error:
                 current = asyncio.current_task()
                 if current is None or current.cancelling() == 0:
@@ -241,8 +305,6 @@ async def _commit_write_transaction(
                 if cancellation is None:
                     cancellation = error
                 continue
-            except Exception:  # noqa: BLE001 - inspect settled task below
-                break
 
         commit_error: BaseException | None = None
         if commit_task.cancelled():
@@ -268,11 +330,21 @@ async def _commit_write_transaction(
                 if isinstance(commit_error, DBAPIError) and (
                     self._is_retryable_sqlite_lock(commit_error)
                 ):
-                    await connection.rollback()
+                    try:
+                        await connection.rollback()
+                    except BaseException as rollback_error:  # noqa: BLE001
+                        disposition.discard_connection = True
+                        cancellation.add_note(
+                            "OpenSandbox cancelled COMMIT rollback also failed: "
+                            f"{type(rollback_error).__name__}: {rollback_error}"
+                        )
+                else:
+                    disposition.discard_connection = True
             raise cancellation
         if commit_error is None:
             return
         if isinstance(commit_error, asyncio.CancelledError):
+            disposition.discard_connection = True
             raise commit_error
         if isinstance(commit_error, DBAPIError) and (
             self._is_retryable_sqlite_lock(commit_error)
@@ -298,6 +370,7 @@ async def _commit_write_transaction(
                 ) from commit_error
             delay = min(delay * 2, _SQLITE_RETRY_MAX_DELAY_SECONDS)
             continue
+        disposition.discard_connection = True
         raise OpenSandboxStateCommitUncertainError(
             "OpenSandbox write COMMIT outcome is uncertain; "
             "the transaction was not retried"
@@ -312,7 +385,11 @@ async def _write_transaction_once(
 
     connection = await self._engine.connect()
     retryable_error: DBAPIError | None = None
+    connection_setting: _WriteConnectionSetting | None = None
+    connection_disposition = _WriteConnectionDisposition()
+    primary_error: BaseException | None = None
     try:
+        connection_setting = await _capture_write_connection_setting(self, connection)
         try:
             await self._begin_write_transaction(connection)
         except DBAPIError as error:
@@ -348,10 +425,61 @@ async def _write_transaction_once(
                 else:
                     raise
             else:
-                await self._commit_write_transaction(connection)
+                await self._commit_write_transaction(
+                    connection,
+                    connection_disposition,
+                )
                 return result
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
-        await connection.close()
+        cleanup_error: BaseException | None = None
+        discard_connection = (
+            connection_disposition.discard_connection
+            or isinstance(
+                primary_error,
+                OpenSandboxStateCommitUncertainError,
+            )
+            or (
+                isinstance(primary_error, DBAPIError)
+                and primary_error.connection_invalidated
+            )
+        )
+        if discard_connection:
+            try:
+                await connection.invalidate()
+            except BaseException as error:  # noqa: BLE001 - preserve primary outcome
+                cleanup_error = error
+        else:
+            try:
+                await _restore_write_connection_setting(connection, connection_setting)
+            except BaseException as error:  # noqa: BLE001 - invalidate before reuse
+                cleanup_error = error
+                try:
+                    await connection.invalidate()
+                except BaseException as invalidate_error:  # noqa: BLE001
+                    error.add_note(
+                        "OpenSandbox connection invalidation also failed: "
+                        f"{type(invalidate_error).__name__}: {invalidate_error}"
+                    )
+        try:
+            await connection.close()
+        except BaseException as error:  # noqa: BLE001 - preserve the primary failure
+            if cleanup_error is None:
+                cleanup_error = error
+            else:
+                cleanup_error.add_note(
+                    "OpenSandbox connection close also failed: "
+                    f"{type(error).__name__}: {error}"
+                )
+        if cleanup_error is not None:
+            if primary_error is None:
+                raise cleanup_error
+            primary_error.add_note(
+                "OpenSandbox connection setting cleanup also failed: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
 
     assert retryable_error is not None
     raise _RetryableSQLiteWriteError(retryable_error)

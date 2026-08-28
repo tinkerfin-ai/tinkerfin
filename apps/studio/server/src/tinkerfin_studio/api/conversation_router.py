@@ -1,11 +1,12 @@
-"""会话流、历史和线程命令 HTTP 入口"""
+"""AG-UI 实时流、Trace 历史和会话命令 HTTP 入口"""
 
+from collections.abc import AsyncGenerator
 from typing import Annotated, TypeAlias
 
 from ag_ui.core import RunAgentInput
 from fastapi import APIRouter, Header, Path, Query, Request
 from fastapi.exceptions import RequestValidationError
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from starlette.responses import StreamingResponse
 
 from tinkerfin_studio.api.dependencies import (
@@ -18,7 +19,6 @@ from tinkerfin_studio.api.responses import ApiResponse
 from tinkerfin_studio.conversation.request import THREAD_ID_PATTERN, ChatRequest
 from tinkerfin_studio.conversation.schemas import (
     CancelRunResponse,
-    ConversationEventEnvelope,
     ConversationHistoryDetail,
     ConversationHistoryGroupConfig,
     ConversationHistoryListItem,
@@ -70,29 +70,35 @@ async def get_conversation_config(
 async def get_history(
     thread_id: ThreadIdPath,
     service: ConversationHistoryDep,
+    history_cursor: Annotated[
+        str | None,
+        Query(alias="historyCursor", min_length=1),
+    ] = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 100,
 ) -> ApiResponse[ConversationHistoryDetail]:
-    """返回一个会话的可信快照和尾部事件"""
-
-    return ApiResponse.success(await service.get_detail(thread_id))
-
-
-@router.get(
-    "/{thread_id}/events", response_model=ApiResponse[list[ConversationEventEnvelope]]
-)
-async def list_events(
-    thread_id: ThreadIdPath,
-    service: ConversationHistoryDep,
-    after_seq: Annotated[int | None, Query(alias="afterSeq", ge=0)] = None,
-    limit: Annotated[int, Query(ge=1, le=1000)] = 100,
-) -> ApiResponse[list[ConversationEventEnvelope]]:
-    """返回 afterSeq 之后的连续已提交事件"""
+    """返回一个会话的固定前缀 Trace 视图"""
 
     return ApiResponse.success(
-        await service.list_events(
-            thread_id=thread_id,
-            after_seq=after_seq,
+        await service.get_detail(
+            thread_id,
+            history_cursor=history_cursor,
             limit=limit,
         )
+    )
+
+
+@router.get("/{thread_id}/trace", response_class=StreamingResponse)
+async def follow_trace(
+    thread_id: ThreadIdPath,
+    service: ConversationHistoryDep,
+) -> StreamingResponse:
+    """鉴权后先发送 Trace snapshot，再持续发送语义增量"""
+
+    events = await service.follow_trace(thread_id)
+    return StreamingResponse(
+        _trace_sse(events),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
@@ -168,3 +174,16 @@ async def cancel_run(
         resources=get_resources(request.app),
     )
     return ApiResponse.success(await service.cancel(thread_id=thread_id, run_id=run_id))
+
+
+async def _trace_sse(
+    events: AsyncGenerator[BaseModel, None],
+) -> AsyncGenerator[bytes, None]:
+    """逐条编码 Trace 事件，并在断连时关闭框架 follow iterator"""
+
+    try:
+        async for event in events:
+            payload = event.model_dump_json(by_alias=True, exclude_none=False)
+            yield f"event: trace\ndata: {payload}\n\n".encode()
+    finally:
+        await events.aclose()

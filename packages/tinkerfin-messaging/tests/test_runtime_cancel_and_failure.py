@@ -10,7 +10,7 @@ from typing import ClassVar, cast
 import pytest
 
 import tinkerfin_messaging.sources as source_adapters
-from tinkerfin import Identity
+from tinkerfin import RunIdentity
 from tinkerfin_messaging import (
     BackendOwnershipLost,
     BackendRunHandle,
@@ -29,8 +29,8 @@ from tinkerfin_messaging import (
 )
 
 
-def _identity() -> Identity:
-    return Identity(threadId="conversation-1", runId="run-1")
+def _identity() -> RunIdentity:
+    return RunIdentity(threadId="conversation-1", runId="run-1")
 
 
 class _TextCodec:
@@ -927,7 +927,7 @@ async def test_commit_failure_remains_primary_when_finish_loses_ownership(
         await asyncio.wait_for(backend.append_started.wait(), timeout=1)
         producer = _active_producer("run-1")
 
-        with caplog.at_level(logging.ERROR, logger="tinkerfin_messaging.messaging"):
+        with caplog.at_level(logging.ERROR, logger="tinkerfin.messaging"):
             backend.release_append.set()
             await asyncio.wait_for(backend.finish_started.wait(), timeout=1)
             backend.release_finish.set()
@@ -938,18 +938,18 @@ async def test_commit_failure_remains_primary_when_finish_loses_ownership(
         records = [
             record
             for record in caplog.records
-            if getattr(record, "secondary_stage", None) == "finish"
+            if getattr(record, "tinkerfin_secondary_stage", None) == "finish"
         ]
         assert captured.value.cause is append_error
         assert "BackendOwnershipLost" in notes
         assert "finish" in notes
         assert len(records) == 1
         record_fields = vars(records[0])
-        assert record_fields["channel"] == "events"
-        assert record_fields["thread_id"] == "conversation-1"
-        assert record_fields["run_id"] == "run-1"
-        assert record_fields["primary_stage"] == "commit"
-        assert record_fields["ownership_lost"] is True
+        assert record_fields["tinkerfin_primary_stage"] == "commit"
+        assert record_fields["tinkerfin_ownership_lost"] is True
+        assert "channel" not in record_fields
+        assert "thread_id" not in record_fields
+        assert "run_id" not in record_fields
     finally:
         backend.release_append.set()
         backend.release_finish.set()
@@ -1019,7 +1019,7 @@ async def test_callback_failure_retains_later_source_close_failure(
         source.abort()
         raise callback_error
 
-    with caplog.at_level(logging.ERROR, logger="tinkerfin_messaging.messaging"):
+    with caplog.at_level(logging.ERROR, logger="tinkerfin.messaging"):
         async with Messaging() as messaging:
             channel = messaging.channel(name="events", codec=_TextCodec())
             subscription = await channel.wrap(
@@ -1039,11 +1039,11 @@ async def test_callback_failure_retains_later_source_close_failure(
     records = [
         vars(record)
         for record in caplog.records
-        if getattr(record, "secondary_stage", None) == "source_close"
+        if getattr(record, "tinkerfin_secondary_stage", None) == "source_close"
     ]
     assert "source_close" in notes
     assert "RuntimeError: source close failed" in notes
     assert len(records) == 1
-    assert records[0]["primary_stage"] == "callback"
-    assert records[0]["ownership_lost"] is False
+    assert records[0]["tinkerfin_primary_stage"] == "callback"
+    assert records[0]["tinkerfin_ownership_lost"] is False
     assert source.close_calls == 1

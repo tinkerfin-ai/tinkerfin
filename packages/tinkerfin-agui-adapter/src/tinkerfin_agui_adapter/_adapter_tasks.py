@@ -27,21 +27,34 @@ from ag_ui.core import (
 from ag_ui.core.types import Message
 from pydantic import JsonValue
 
+from tinkerfin_native_stream import (
+    NativeExtraStreamPart as ExtraStreamPart,
+)
+from tinkerfin_native_stream import (
+    NativeTaskResultPayload as TaskResultPayload,
+)
+from tinkerfin_native_stream import (
+    NativeTasksStreamPart as TasksStreamPart,
+)
+from tinkerfin_native_stream import (
+    NativeTaskStartPayload as TaskStartPayload,
+)
+from tinkerfin_native_stream import (
+    NativeUpdatesStreamPart as UpdatesStreamPart,
+)
+from tinkerfin_native_stream import (
+    NativeValuesStreamPart as ValuesStreamPart,
+)
+
 from ._adapter_contracts import (
     _MESSAGE_STATE_KEY,
     AgentSource,
-    ExtraStreamPart,
     GraphScope,
     NativeToolCall,
     NativeToolCallList,
     SubagentInvocation,
     TaskResultFingerprint,
-    TaskResultPayload,
-    TasksStreamPart,
     TaskStartFingerprint,
-    TaskStartPayload,
-    UpdatesStreamPart,
-    ValuesStreamPart,
     _to_json_value,
 )
 from ._adapter_messages import _json_patch
@@ -216,6 +229,14 @@ def _process_task_start(
     parent_namespace: tuple[str, ...],
     payload: TaskStartPayload,
 ) -> list[BaseEvent]:
+    """Stage one task start and commit all correlation state atomically.
+
+    Runtime task IDs establish graph scopes; only validated ``tools`` inputs containing
+    Deep Agents ``task`` calls establish subagent identity. Every duplicate and
+    cross-map conflict is checked against staged copies before the Adapter mutates live
+    state, so a rejected part can be retried without partial provenance.
+    """
+
     parent_source = self._source(parent_namespace)
     self._require_started_source(parent_source)
     tool_calls = (
@@ -377,7 +398,7 @@ def _process_task_start(
                     by_alias=True,
                 )
             )
-    event = self._task_raw_event(
+    event = _task_raw_event(
         namespace=parent_namespace,
         source=parent_source,
         phase="start",
@@ -431,6 +452,13 @@ def _process_task_result(
     namespace: tuple[str, ...],
     payload: TaskResultPayload,
 ) -> list[BaseEvent]:
+    """Complete a previously started runtime task with exact replay semantics.
+
+    Results correlate by full namespace and task ID, never completion order. An exact
+    replay is ignored, while any change to name, error, interrupts, or result fails
+    before the stored fingerprint is updated.
+    """
+
     source = self._source(namespace)
     self._require_started_source(source)
     key = (namespace, payload.id)
@@ -475,7 +503,7 @@ def _process_task_result(
             "conflicting task result for "
             f"namespace={namespace!r} graph_task_id={payload.id!r}"
         )
-    event = self._task_raw_event(
+    event = _task_raw_event(
         namespace=namespace,
         source=source,
         phase="result",
@@ -495,7 +523,6 @@ def _process_task_result(
 
 
 def _task_raw_event(
-    self: DeepAgentAgUiAdapter,
     *,
     namespace: tuple[str, ...],
     source: AgentSource,
@@ -581,6 +608,14 @@ def _process_extra_part(
 def _emit_values_part(
     self: DeepAgentAgUiAdapter, part: ValuesStreamPart
 ) -> list[BaseEvent]:
+    """Synchronize root state or retain a non-root snapshot as provenance.
+
+    Subgraph values never overwrite root application state. Root interrupts first close
+    every open child lifecycle, then emit final state and message snapshots before the
+    interrupt terminal can be created. Ordinary root updates use RFC 6902 operations
+    against only a baseline the client actually received.
+    """
+
     source = self._source(part.ns)
     raw_event = self._event_context("values", source)
     raw_messages = part.data.get(_MESSAGE_STATE_KEY, [])
@@ -641,7 +676,7 @@ def _emit_values_part(
             )
         )
         self._previous_root_state = current
-        self._record_interrupts(part.ns, prepared_interrupts)
+        self._record_interrupts(prepared_interrupts)
         self._resolved_child_interrupt_ids.update(propagated_child_ids)
         return events
 

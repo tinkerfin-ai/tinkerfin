@@ -2,18 +2,34 @@
 
 [Runtime 入门](index.md) · [English](../../en/runtime/api-reference.md)
 
+AG-UI Runtime 入口需要安装 `pip install "tinkerfin[agui]"`。原生 Runtime、Plan Mode、
+Observation 与原生 SSE 属于基础安装。
+
 这一页按实际使用顺序汇总 Runtime 的公开能力。常见项目通常只会用到前两组。
 
 ## 创建入口
 
 | API | 什么时候用 | 主要参数或结果 |
 | --- | --- | --- |
-| `TinkerFin(run_coordinator=None, state_schema=None)` | 创建统一入口 | 可选共享 coordinator 和 Definition 级 state |
+| `TinkerFin(run_coordinator=None, state_schema=None, runtime_profile=None)` | 创建统一入口 | 可选共享 coordinator、Definition 级 state 与完整 Deep Agents 集成 Profile |
+| `TinkerFin.observe(observer)` | 不可变地增加一个 Runtime observer | `tinkerfin-contracts` 的 `RuntimeObserver` |
 | `TinkerFin.plan(...)` | 创建不可变的 Plan-capable factory | 能力和 mode 默认值、可选 Planner 模型、澄清表单、计划内容 Schema 与审阅动作 |
 | `TinkerFin.create_deep_agent(...)` | 创建可重复生成 Runtime 的 Agent 定义 | 参数见[创建和运行 Deep Agent](deep-agents.md) |
-| `Identity(threadId=..., runId=...)` | 表示一次框架运行 | 只包含 thread 和 run |
+| `DeepAgentsRuntimeProfile` | 实现完整上游集成 | canonical Profile ID、Graph factory、Native Stream Driver 与 resume checkpoint 语义 |
+| `DeepAgentsFactoryPreparation` | 返回 Profile 管理的 factory overrides | 只读 override mapping 与外部 subagent 取消边界 |
+| `DeepAgentsV2RuntimeProfile(...)` | 使用当前内置集成 | 锁定的建图、调用、校验、Observation、reasoning extractor 与 replay |
+| `RunIdentity(threadId=..., runId=...)` | 表示一次框架运行 | 只包含 thread 和 run |
 | `DeepAgentDefinition.new(...)` | 创建原生 Runtime | 必填 `identity`，可选本次请求 `mode` 和 `on_part` |
 | `DeepAgentDefinition.new_agui(...)` | 创建 AG-UI Runtime | 必填 canonical `identity`；可选 parent、mode、resume、checkpoint callback 与 observer |
+| `TinkerFin.failed_agui_run(...)` | 表达 Run 接受后的初始化失败 | 错误、identity，以及真实可用的 input/config/resume |
+
+默认当前 Profile 是 `DeepAgentsV2RuntimeProfile`。TinkerFin 在创建 Definition 前选定一个
+Profile，把其 `profile_id` 写入 checkpoint 谱系，并在 Graph continuation 前拒绝由另一个
+Profile 执行 branch 或 resume；Runtime 不从流数据探测或协商 Profile。只有向 Profile 显式
+传入已验证的 `ReasoningExtractor`（例如 `DeepSeekReasoningExtractor`）才会启用对应 provider
+reasoning 路径；这本身不会授权 Trace 持久化。自定义 Profile 还必须实现自身明确的
+`stage_resume_intent()`、`pending_resume_values()` 与 `native_resume_submitted()` checkpointer
+语义；TinkerFin 不会为它回退到 v2 checkpoint 行为。
 
 `DeepAgentDefinition` 可以重复使用。`DeepAgentRuntime`、`DeepAgentAgUiRuntime` 和
 `DeepAgentAgUiResumeRuntime` 都是一次性运行对象，不要自行构造。
@@ -56,7 +72,8 @@ Planning 状态以 camel case JSON 保存在 `tinkerfin_plan`；批准 handoff �
 answer type。共享强类型 metadata 使用
 `BuiltInClarificationForm[QuestionAttributes, OptionModel]`。完全自定义语义题型通过
 `.plan(clarification_types=(clarification_type(...),))` 一次注册。逐题 Schema、校验或规范化
-语义变化时必须升级 type ID 版本。
+使用无版本 namespaced type ID。Definition fingerprint 固定唯一当前 Schema 与 callback；合同变化
+时必须重建不兼容存量数据，不得新增 type ID 版本。
 
 澄清响应的 `answers` 是以 checkpoint question ID 为 key 的 object。已回答 value 包含
 `status: answered`、对应 `answerType` 和题型字段；可选题跳过只包含 `status: skipped`。
@@ -72,7 +89,7 @@ reducer、`Required` / `NotRequired` 和 schema metadata 会保留；同名字�
 
 | API | 用法 |
 | --- | --- |
-| `NativeGraphRunStream` | 异步迭代规范化的 LangGraph v2 数据，可直接交给 Messaging |
+| `NativeGraphRunStream` | 异步迭代原始上游对象，同时向 Messaging 或 Native SSE 转交同一个 Driver-owned canonical frame |
 | `AgUiEventStream` | 异步迭代 AG-UI 事件；支持 `abort()`、`aclose()` 和 `to_sse()` |
 | `SseBody` | 异步迭代 SSE 字符串；先 `prepare()`，结束时 `aclose()` |
 
@@ -80,13 +97,16 @@ reducer、`Required` / `NotRequired` 和 schema metadata 会保留；同名字�
 
 请求停止当前 AG-UI 运行，并返回为正确结束开放事件所需的剩余事件。多次调用不会重复产生终止尾部。
 
-### `AgUiEventStream.from_initialization_error(...)`
+### `TinkerFin.failed_agui_run(...)`
 
-如果 Graph 尚未开始就初始化失败，可以用它生成一条合法的 AG-UI 失败流。常规 `new_agui()` 调用不需要直接使用。
+宿主接受语义 Run 后，如果模型、Sandbox、Definition 或 Graph 初始化失败，用它生成受观察的
+AG-UI 失败流。该入口通过同一 Runtime 生命周期记录真实输入、唯一失败终态和关闭。常规
+`new_agui()` 调用不需要直接使用。
 
 ## 原生数据模型
 
-`NativeStreamPart` 是可持久化的原生 v2 数据。
+`NativeStreamPart` 是当前有限、可持久化的 canonical replay 表示，由所选 Profile 产生，
+不包含上游版本选择字段。
 
 | 字段 | 类型 | 默认值 | 含义 |
 | --- | --- | --- | --- |
@@ -97,13 +117,14 @@ reducer、`Required` / `NotRequired` 和 schema metadata 会保留；同名字�
 
 通常由 Runtime 自动创建，不需要手工拼装。
 
-## AG-UI 流预检
+## Native 流预检
 
-`new_agui()` 固定使用 `messages`、`tasks`、`values`、`version="v2"` 和
-`subgraphs=True`。调用方可以通过 Runtime 的 `astream(stream_mode=...)` 增加
-`updates`、`checkpoints`、`debug` 或 `custom`。缺少必需 mode、重复或不支持的 mode、
-冲突的 version、关闭 subgraphs 都会在 Graph 或 coordinator 产生副作用前抛出
-`AgUiNativeStreamConfigurationError`。
+所选 Runtime Profile 完整拥有上游调用与 checkpoint 合同，包括必需 mode、上游 version、
+subgraph 行为、完整 state 输出、稳定建图/绑定流签名，以及不破坏 interrupted control state 的
+durable resume-intent 写入。绑定流签名让 resume Graph 在受保护异步结算内延迟构造。当前内置
+Profile 允许调用方通过 `astream(stream_mode=...)` 增加受支持的
+诊断 mode；移除必需 mode 或传入冲突的上游参数，会在 Graph 或 coordinator 产生副作用前
+失败。Native 与 AG-UI 路径共用同一个 Profile 边界，并暴露一致的参数校验错误。
 
 ## SSE 类型
 
@@ -120,6 +141,8 @@ reducer、`Required` / `NotRequired` 和 schema metadata 会保留；同名字�
 | --- | --- |
 | `PartObserver` | 观察原生数据的异步函数 |
 | `EventObserver` | 观察 AG-UI 事件的异步函数 |
+| `RuntimeObserver` | 为每个已接纳 Runtime 请求打开一个受管理的 run/native 观察 session |
+| `RunObservationSession` | 接收有序 Observation、强制边界、异步失败通知与关闭 |
 | `join_task(task, cancel=False, suppress_task_cancellation=False)` | owned task 完整结算后再传播调用方取消 |
 | `RunCoordinator` | 自定义运行互斥边界 |
 | `InMemoryRunCoordinator(key_resolver=...)` | 当前进程内按业务 key 串行运行 |
@@ -128,22 +151,31 @@ reducer、`Required` / `NotRequired` 和 schema metadata 会保留；同名字�
 
 | API | 作用 |
 | --- | --- |
-| `RedisRunCoordinator` | 多进程按 `Identity` 串行运行 |
+| `RedisRunCoordinator` | 多进程按 `RunIdentity` 串行运行 |
 | `RedisLeaseLock` | 自动续期的通用 Redis 租约锁 |
 | `RedisLease` | `hold()` 返回的不可变资源 key 与 fencing token |
 | `RedisLeaseLost` | 续期不确定、租约过期或所有权丢失 |
 
 构造参数、默认值和连接池要求见[运行协调与 Redis 租约](extensions.md#如果需要通用-redis-租约锁)。
 
+`TinkerFin.observe(...)` 返回独立 factory，并在 `.plan(...)` 后保留 Observer。Runtime 对每个
+Native part 只做一次强校验，然后在 `on_part` 和 AG-UI 转换前发布安全 Observation。Observer
+失败会让 Run fail-closed，Runtime 仍会关闭全部已打开 session。配套语义实现是
+`tinkerfin-tracing.Tracer`。AG-UI event、Messaging commit、SSE frame 和 Redis ownership
+不属于 Runtime Observation。
+
+Agent 终态在 Observer 广播前已经选定。某个 Observer 在终态广播时失败会让调用方失败，并通知
+其他健康 Observer，但不会事后改写已经结束的 Agent 执行结果。
+
 ## 恢复和错误
 
 | API | 什么时候遇到 |
 | --- | --- |
-| `AgUiResumeBinding` | 恢复被 interrupt 暂停的 AG-UI 运行 |
+| `AgUiResumeRequest` | 恢复请求中不可信的客户端决定 |
+| `AgUiResumeBinding` | `new_agui()` 接受的私有 checkpoint 解析事实 |
 | `AgUiResumeCheckpoint` | resume marker 持久化后的稳定回调值 |
 | `tinkerfin.plan.PlanModeConfigurationError` | Plan Definition 缺少具体 saver 或明确模型、state schema 不兼容，或使用了非 sync durability |
 | `AgUiSettlementTimeoutError` | 调用方停止等待，但 Runtime 的清理仍未在限定时间内完成 |
-| `AgUiNativeStreamConfigurationError` | 原生流配置不符合 AG-UI 转换要求 |
 
 `DeepAgentDefinition.new_agui(...)` 使用以下请求级参数：
 
@@ -158,13 +190,14 @@ reducer、`Required` / `NotRequired` 和 schema metadata 会保留；同名字�
 | `expose_subagent_events` | `True` | 是否交付子 Agent 事件 |
 | `resume` | `None` | 恢复请求使用的完整可信 `AgUiResumeBinding` |
 | `on_resume_checkpointed` | `None` | 确切 resume marker 可读取后的幂等 callback |
+| `on_resume_initialization_failed` | `None` | marker 持久前失败、取消或关闭时执行的幂等结算 |
 | `on_event` | `None` | AG-UI 事件交付前的观察函数 |
 
-返回的 Runtime 保留已安装 Graph 的 `astream(...)` 参数形状。框架会把同一个 `Identity`
+返回的 Runtime 保留已安装 Graph 的 `astream(...)` 参数形状。框架会把同一个 `RunIdentity`
 写入 Graph 配置，`astream()` 不再接收第二套 Runtime 身份。
 
-`AgUiResumeBinding.from_agui(...)` 校验完整可信 AG-UI interrupt 与 entries，包括原生分组、
-取消模式、Tool ID 与来源 Agent。Binding 不保存 identity 或 parent，也不公开原生 command；宿主可把
-它作为一个完整 Pydantic 模型持久化和恢复。
+`DeepAgentDefinition.prepare_agui_resume(...)` 接收 `AgUiResumeRequest`，由所选 Profile 从权威
+checkpoint 读取原生分组、取消、Tool ID、来源 Agent 和 Profile 谱系并完成校验，再返回
+私有 binding。客户端请求不包含服务端 interrupt payload 或原生 command。
 
 恢复流程见 [interrupt 与恢复](../agui/interrupts-and-resume.md)。

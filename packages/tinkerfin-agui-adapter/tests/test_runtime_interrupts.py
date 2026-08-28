@@ -10,13 +10,16 @@ from pydantic import ValidationError
 
 from tinkerfin_agui_adapter import (
     DeepAgentAgUiAdapter,
-    Identity,
     ResumeMapper,
     ResumeMappingError,
+    RunIdentity,
     RuntimeInterruptEnvelope,
 )
 from tinkerfin_agui_adapter.models import AgentRuntimeInterrupt
 from tinkerfin_agui_adapter.runtime_interrupts import prepare_runtime_ag_ui_interrupt
+from tinkerfin_native_stream import (
+    RuntimeInterruptEnvelope as NativeRuntimeInterruptEnvelope,
+)
 
 
 def _entry(
@@ -43,13 +46,22 @@ def _envelope() -> RuntimeInterruptEnvelope:
     )
 
 
+def test_agui_envelope_extends_the_shared_native_contract() -> None:
+    assert issubclass(RuntimeInterruptEnvelope, NativeRuntimeInterruptEnvelope)
+    assert _envelope().model_dump(mode="json", by_alias=True) == (
+        NativeRuntimeInterruptEnvelope.model_validate(
+            _envelope().model_dump(mode="json", by_alias=True)
+        ).model_dump(mode="json", by_alias=True)
+    )
+
+
 def _native(interrupt_id: str, value: object) -> AgentRuntimeInterrupt:
     return AgentRuntimeInterrupt.model_validate({"id": interrupt_id, "value": value})
 
 
 def test_runtime_interrupt_maps_to_ag_ui_and_resumes_without_tool_ids() -> None:
     adapter = DeepAgentAgUiAdapter(
-        identity=Identity(threadId="thread-1", runId="run-1")
+        identity=RunIdentity(threadId="thread-1", runId="run-1")
     )
     events = adapter.process(
         {
@@ -191,7 +203,7 @@ def test_unknown_runtime_interrupt_contract_fails_closed() -> None:
 
 def test_persisted_runtime_response_schema_cannot_change_before_resume() -> None:
     adapter = DeepAgentAgUiAdapter(
-        identity=Identity(threadId="thread-1", runId="run-1")
+        identity=RunIdentity(threadId="thread-1", runId="run-1")
     )
     adapter.process(
         {

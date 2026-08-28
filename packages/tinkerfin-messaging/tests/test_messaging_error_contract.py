@@ -9,7 +9,7 @@ from redis.asyncio import Redis
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
-from tinkerfin import Identity
+from tinkerfin import RunIdentity
 from tinkerfin_messaging import (
     InvalidCursor,
     MemoryBackend,
@@ -25,7 +25,7 @@ from tinkerfin_messaging import (
 
 
 class _FailingBackend(MemoryBackend):
-    async def latest_seq(self, *, channel: str, identity: Identity) -> int:
+    async def latest_seq(self, *, channel: str, identity: RunIdentity) -> int:
         del channel, identity
         raise ConnectionError("implementation detail")
 
@@ -41,6 +41,10 @@ class _FailingRedis:
         del name
         raise self.error
 
+    async def eval(self, script: str, numkeys: int, *keys: str) -> object:
+        del script, numkeys, keys
+        raise self.error
+
 
 class _ProtocolRedis:
     def get_connection_kwargs(self) -> dict[str, object]:
@@ -49,6 +53,10 @@ class _ProtocolRedis:
     async def hgetall(self, name: str) -> dict[bytes, bytes]:
         del name
         return {b"state": b"corrupt", b"generation": b"1"}
+
+    async def eval(self, script: str, numkeys: int, *keys: str) -> object:
+        del script, numkeys, keys
+        return [b"OK", b"1", b"corrupt"]
 
 
 def test_error_codes_are_unique_and_namespaced() -> None:
@@ -89,7 +97,7 @@ def test_error_separates_and_copies_safe_and_diagnostic_context() -> None:
 
 
 async def test_facade_wraps_an_undeclared_custom_backend_failure() -> None:
-    identity = Identity(threadId="thread-1", runId="run-1")
+    identity = RunIdentity(threadId="thread-1", runId="run-1")
     async with Messaging(backend=_FailingBackend()) as messaging:
         channel = messaging.channel(name="events")
         with pytest.raises(UnexpectedMessagingBackendError) as raised:
@@ -122,7 +130,7 @@ async def test_redis_backend_translates_driver_failures(
 ) -> None:
     client = cast(Redis, _FailingRedis(driver_error))
     backend = RedisBackend(client)
-    identity = Identity(threadId="thread-1", runId="run-1")
+    identity = RunIdentity(threadId="thread-1", runId="run-1")
 
     with pytest.raises(expected_type) as raised:
         await backend.latest_seq(channel="events", identity=identity)
@@ -140,7 +148,7 @@ async def test_redis_backend_translates_driver_failures(
 async def test_redis_protocol_details_are_trusted_diagnostics_only() -> None:
     client = cast(Redis, _ProtocolRedis())
     backend = RedisBackend(client)
-    identity = Identity(threadId="thread-1", runId="run-1")
+    identity = RunIdentity(threadId="thread-1", runId="run-1")
 
     with pytest.raises(MessagingBackendProtocolError) as raised:
         await backend.latest_seq(channel="events", identity=identity)

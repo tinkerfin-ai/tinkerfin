@@ -22,13 +22,13 @@ class TinkerFinErrorCode(StrEnum):
     )
     PLAN_STATE_CONFLICT = "tinkerfin.plan_state_conflict"
     PLAN_STRUCTURED_OUTPUT = "tinkerfin.plan_structured_output"
-    AGUI_NATIVE_STREAM_CONFIGURATION = "tinkerfin.agui_native_stream_configuration"
     AGUI_RESUME_BINDING_INVALID = "tinkerfin.agui_resume_binding_invalid"
     AGUI_SETTLEMENT_TIMEOUT = "tinkerfin.agui_settlement_timeout"
     RUN_COORDINATION_FAILED = "tinkerfin.run_coordination_failed"
     RUN_COORDINATION_UNAVAILABLE = "tinkerfin.run_coordination_unavailable"
     RUN_COORDINATION_TIMEOUT = "tinkerfin.run_coordination_timeout"
     RUN_COORDINATION_OWNERSHIP_LOST = "tinkerfin.run_coordination_ownership_lost"
+    RUN_OBSERVATION_FAILED = "tinkerfin.run_observation_failed"
     REDIS_LEASE_FAILED = "tinkerfin.redis_lease_failed"
     REDIS_LEASE_UNAVAILABLE = "tinkerfin.redis_lease_unavailable"
     REDIS_LEASE_TIMEOUT = "tinkerfin.redis_lease_timeout"
@@ -88,12 +88,6 @@ class TinkerFinStreamProtocolError(TinkerFinError, ValueError):
     code = TinkerFinErrorCode.STREAM_PROTOCOL_ERROR
 
 
-class AgUiNativeStreamConfigurationError(TinkerFinError, ValueError):
-    """A native LangGraph stream cannot satisfy AG-UI conversion requirements."""
-
-    code = TinkerFinErrorCode.AGUI_NATIVE_STREAM_CONFIGURATION
-
-
 class AgUiResumeBindingError(TinkerFinError, ValueError):
     """Trusted AG-UI resume facts cannot form a lossless Runtime binding."""
 
@@ -139,6 +133,30 @@ class RunCoordinationOwnershipLostError(RunCoordinationError):
     code = TinkerFinErrorCode.RUN_COORDINATION_OWNERSHIP_LOST
 
 
+class RunObservationError(TinkerFinError, RuntimeError):
+    """One or more configured Runtime observers failed or became unavailable."""
+
+    code = TinkerFinErrorCode.RUN_OBSERVATION_FAILED
+
+    def __init__(
+        self,
+        *,
+        observer_names: tuple[str, ...],
+        cause: BaseException,
+    ) -> None:
+        """Retain trusted Observer identities without exposing error payloads."""
+
+        self.observer_names = observer_names
+        super().__init__(
+            "Runtime observation failed",
+            context={"observer_count": len(observer_names)},
+            diagnostic_context={
+                "observer_names": ",".join(observer_names),
+            },
+            cause=cause,
+        )
+
+
 class RedisLeaseError(TinkerFinError, RuntimeError):
     """Base failure for the optional Redis lease implementation."""
 
@@ -170,7 +188,6 @@ class RedisLeaseLifecycleError(RedisLeaseError):
 
 
 __all__ = [
-    "AgUiNativeStreamConfigurationError",
     "AgUiResumeBindingError",
     "AgUiSettlementTimeoutError",
     "RedisLeaseError",
@@ -182,6 +199,7 @@ __all__ = [
     "RunCoordinationOwnershipLostError",
     "RunCoordinationTimeoutError",
     "RunCoordinationUnavailableError",
+    "RunObservationError",
     "TinkerFinError",
     "TinkerFinErrorCode",
     "TinkerFinLifecycleError",

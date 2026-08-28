@@ -1,0 +1,619 @@
+from __future__ import annotations
+
+import asyncio
+from collections.abc import AsyncGenerator, AsyncIterator
+from datetime import UTC, datetime, timedelta
+from typing import cast
+
+from ag_ui.core import BaseEvent, RunStartedEvent
+
+from tinkerfin_contracts import (
+    NativeInterruptRecord,
+    NativeMessageObservation,
+    NativeMessageRecord,
+    NativeStateObservation,
+    NativeToolCall,
+    RunClosedObservation,
+    RunIdentity,
+    RunInputObservation,
+    RunResumeSummary,
+    RunSourceContext,
+    RunStartedObservation,
+    RunTerminalObservation,
+)
+from tinkerfin_messaging import MessageChannel, Messaging, RunNotFound
+from tinkerfin_messaging.agui import AgUiCodec
+from tinkerfin_studio.conversation.coordinator import ConversationTraceCoordinator
+from tinkerfin_studio.conversation.models import ConversationRunRegistration
+from tinkerfin_studio.conversation.repository import ConversationRepository
+from tinkerfin_tracing import Tracer, TraceThread, TraceUpdate
+
+
+async def _messaging_channel() -> tuple[
+    Messaging,
+    MessageChannel[BaseEvent, BaseEvent],
+]:
+    messaging = Messaging()
+    await messaging.__aenter__()
+    channel = messaging.channel(
+        name="studio-conversation-agui",
+        codec=AgUiCodec(),
+    )
+    return messaging, channel
+
+
+class _SlowEventSource:
+    """在首条事件前保持 producer owner 的真实异步测试源"""
+
+    def __init__(self, *, identity: RunIdentity) -> None:
+        self.identity = identity
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self._iterator: AsyncGenerator[BaseEvent, None] | None = None
+
+    def __aiter__(self) -> AsyncIterator[BaseEvent]:
+        iterator = self._iterate()
+        self._iterator = iterator
+        return iterator
+
+    async def _iterate(self) -> AsyncGenerator[BaseEvent, None]:
+        self.entered.set()
+        await self.release.wait()
+        yield RunStartedEvent(
+            thread_id=self.identity.thread_id,
+            run_id=self.identity.run_id,
+        )
+
+    async def aclose(self) -> None:
+        self.release.set()
+        iterator = self._iterator
+        self._iterator = None
+        if iterator is not None:
+            await iterator.aclose()
+
+
+class _MissingRunBarrierChannel:
+    """在 missing 观测后暂停，让 owner preflight 与回收删除精确交错"""
+
+    def __init__(self) -> None:
+        self.checked = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def get_run_status(self, *, identity: RunIdentity) -> str:
+        self.checked.set()
+        await self.release.wait()
+        raise RunNotFound(identity=identity)
+
+
+async def _setup_run(database, *, thread_id: str, run_id: str):
+    tracer = Tracer()
+    async with database.session() as session:
+        repository = ConversationRepository(session)
+        thread = await repository.create_thread(
+            user_id=1,
+            thread_id=thread_id,
+            title="协调器测试",
+            model_id="model-main",
+        )
+        await repository.create_run_registration(
+            thread_id=thread.id,
+            run_id=run_id,
+            parent_run_id=None,
+            model_id="model-main",
+            runtime_profile="deepagents-v2",
+            input_json={"runId": run_id},
+            config_json={"runtimeProfile": "deepagents-v2"},
+        )
+        thread.last_run_id = run_id
+        thread.status = "running"
+        await repository.commit()
+        thread_pk = thread.id
+    context = RunSourceContext(
+        identity=RunIdentity(threadId=thread_id, runId=run_id),
+        runtime_profile="deepagents-v2",
+        input_kind="ordinary",
+        input={"messages": [{"id": "user-1", "role": "user", "content": "执行任务"}]},
+        config={},
+    )
+    trace_session = await tracer.open_run(context)
+    now = datetime.now(UTC)
+    await trace_session.observe(
+        RunStartedObservation(
+            identity=context.identity,
+            observed_at=now,
+            monotonic_ns=1,
+        )
+    )
+    await trace_session.observe(
+        RunInputObservation(
+            identity=context.identity,
+            source=context,
+            observed_at=now,
+            monotonic_ns=2,
+        )
+    )
+    return tracer, context, trace_session, thread_pk
+
+
+async def _thread(database, thread_pk: int):
+    async with database.session() as session:
+        return await ConversationRepository(session).get_thread_by_pk(thread_pk)
+
+
+async def _wait_for(database, thread_pk: int, predicate) -> None:
+    async with asyncio.timeout(2):
+        while True:
+            value = await _thread(database, thread_pk)
+            if value is not None and predicate(value):
+                return
+            await asyncio.sleep(0.01)
+
+
+async def _finish(context, trace_session) -> None:
+    now = datetime.now(UTC)
+    await trace_session.observe(
+        RunTerminalObservation(
+            identity=context.identity,
+            outcome="succeeded",
+            observed_at=now,
+            monotonic_ns=90,
+        )
+    )
+    await trace_session.observe(
+        RunClosedObservation(
+            identity=context.identity,
+            outcome="succeeded",
+            observed_at=now,
+            monotonic_ns=91,
+        )
+    )
+    await trace_session.aclose()
+
+
+async def test_trace_coordinator_keeps_pending_state_across_unrelated_delta(
+    database,
+) -> None:
+    tracer, context, trace_session, thread_pk = await _setup_run(
+        database,
+        thread_id="thread-pending",
+        run_id="run-pending",
+    )
+    messaging, channel = await _messaging_channel()
+    coordinator = ConversationTraceCoordinator(
+        database=database,
+        tracer=tracer,
+        conversation_channel=channel,
+    )
+    coordinator.ensure(thread_pk=thread_pk, identity=context.identity)
+    interrupt = NativeInterruptRecord(
+        id="interrupt-1",
+        value={
+            "action_requests": [
+                {"name": "write_file", "args": {"path": "/result.txt"}}
+            ],
+            "review_configs": [
+                {"action_name": "write_file", "allowed_decisions": ["approve"]}
+            ],
+        },
+    )
+    await trace_session.observe(
+        NativeStateObservation(
+            identity=context.identity,
+            namespace=(),
+            state={},
+            messages=(
+                NativeMessageRecord(
+                    message_type="assistant",
+                    id="assistant-pending",
+                    content="",
+                    tool_calls=(
+                        NativeToolCall(
+                            id="call-write-result",
+                            name="write_file",
+                            arguments={"path": "/result.txt"},
+                        ),
+                    ),
+                ),
+            ),
+            interrupts=(interrupt,),
+            observed_at=datetime.now(UTC),
+            monotonic_ns=3,
+        )
+    )
+    await _wait_for(
+        database,
+        thread_pk,
+        lambda item: (
+            item.has_pending_interrupt
+            and item.pending_interaction_kind == "tool_approval"
+        ),
+    )
+    await trace_session.observe(
+        NativeMessageObservation(
+            identity=context.identity,
+            namespace=(),
+            message=NativeMessageRecord(
+                message_type="assistant",
+                id="assistant-pending",
+                content="仍在等待",
+            ),
+            observed_at=datetime.now(UTC),
+            monotonic_ns=4,
+        )
+    )
+    await _wait_for(database, thread_pk, lambda item: item.message_count == 2)
+    stored = await _thread(database, thread_pk)
+    assert stored is not None
+    assert stored.has_pending_interrupt is True
+    assert stored.pending_interaction_kind == "tool_approval"
+
+    await trace_session.observe(
+        NativeStateObservation(
+            identity=context.identity,
+            namespace=(),
+            state={},
+            interrupts=(),
+            observed_at=datetime.now(UTC),
+            monotonic_ns=5,
+        )
+    )
+    await _wait_for(database, thread_pk, lambda item: not item.has_pending_interrupt)
+    await _finish(context, trace_session)
+    await coordinator.aclose()
+    await messaging.aclose()
+
+
+async def test_trace_coordinator_recovers_after_one_summary_write_failure(
+    database,
+    monkeypatch,
+) -> None:
+    """瞬时摘要失败后必须从最新 Trace 前缀恢复并继续跟随到终态"""
+
+    tracer, context, trace_session, thread_pk = await _setup_run(
+        database,
+        thread_id="thread-retry",
+        run_id="run-retry",
+    )
+    messaging, channel = await _messaging_channel()
+    coordinator = ConversationTraceCoordinator(
+        database=database,
+        tracer=tracer,
+        conversation_channel=channel,
+    )
+    original_thread = coordinator._persist_thread
+    original_update = coordinator._persist_update
+    snapshots = 0
+    first_snapshot = asyncio.Event()
+    retry_snapshot = asyncio.Event()
+    failed_update = asyncio.Event()
+    update_attempts = 0
+
+    async def record_snapshot(*, thread_pk: int, trace: TraceThread) -> None:
+        nonlocal snapshots
+        await original_thread(thread_pk=thread_pk, trace=trace)
+        snapshots += 1
+        first_snapshot.set()
+        if snapshots >= 2:
+            retry_snapshot.set()
+
+    async def fail_first_update(
+        *,
+        thread_pk: int,
+        update: TraceUpdate,
+        pending: dict[str, str],
+        generation: str,
+    ) -> None:
+        nonlocal update_attempts
+        update_attempts += 1
+        if update_attempts == 1:
+            failed_update.set()
+            raise RuntimeError("transient summary failure")
+        await original_update(
+            thread_pk=thread_pk,
+            update=update,
+            pending=pending,
+            generation=generation,
+        )
+
+    monkeypatch.setattr(coordinator, "_persist_thread", record_snapshot)
+    monkeypatch.setattr(coordinator, "_persist_update", fail_first_update)
+    coordinator.ensure(thread_pk=thread_pk, identity=context.identity)
+    await asyncio.wait_for(first_snapshot.wait(), timeout=2)
+
+    await trace_session.observe(
+        NativeMessageObservation(
+            identity=context.identity,
+            namespace=(),
+            message=NativeMessageRecord(
+                message_type="assistant",
+                id="assistant-retry-1",
+                content="第一次更新",
+            ),
+            observed_at=datetime.now(UTC),
+            monotonic_ns=3,
+        )
+    )
+    await asyncio.wait_for(failed_update.wait(), timeout=2)
+    await asyncio.wait_for(retry_snapshot.wait(), timeout=2)
+
+    await trace_session.observe(
+        NativeMessageObservation(
+            identity=context.identity,
+            namespace=(),
+            message=NativeMessageRecord(
+                message_type="assistant",
+                id="assistant-retry-2",
+                content="第二次更新",
+            ),
+            observed_at=datetime.now(UTC),
+            monotonic_ns=4,
+        )
+    )
+    await _wait_for(database, thread_pk, lambda item: item.message_count == 3)
+
+    await _finish(context, trace_session)
+    await _wait_for(database, thread_pk, lambda item: item.status == "idle")
+    assert update_attempts >= 2
+
+    await coordinator.aclose()
+    await messaging.aclose()
+
+
+async def test_recover_preparing_deletes_empty_thread_without_trace(database) -> None:
+    tracer = Tracer()
+    async with database.session() as session:
+        repository = ConversationRepository(session)
+        thread = await repository.create_thread(
+            user_id=1,
+            thread_id="thread-stale",
+            title="过期会话",
+            model_id="model-main",
+        )
+        registration = await repository.create_run_registration(
+            thread_id=thread.id,
+            run_id="run-stale",
+            parent_run_id=None,
+            model_id="model-main",
+            runtime_profile="deepagents-v2",
+            input_json={"runId": "run-stale"},
+            config_json={"runtimeProfile": "deepagents-v2"},
+        )
+        registration.created_at = datetime.now(UTC).replace(tzinfo=None) - timedelta(
+            minutes=1
+        )
+        thread.last_run_id = registration.run_id
+        await repository.commit()
+        thread_pk = thread.id
+    messaging, channel = await _messaging_channel()
+    coordinator = ConversationTraceCoordinator(
+        database=database,
+        tracer=tracer,
+        conversation_channel=channel,
+    )
+
+    await coordinator.recover_preparing(thread_pk=thread_pk)
+
+    assert await _thread(database, thread_pk) is None
+    await coordinator.aclose()
+    await messaging.aclose()
+
+
+async def test_recover_preparing_preserves_a_live_messaging_owner(database) -> None:
+    """慢初始化 producer 活跃时不得按 Trace 暂缺删除 Run"""
+
+    tracer = Tracer()
+    identity = RunIdentity(threadId="thread-slow", runId="run-slow")
+    async with database.session() as session:
+        repository = ConversationRepository(session)
+        thread = await repository.create_thread(
+            user_id=1,
+            thread_id=identity.thread_id,
+            title="慢初始化会话",
+            model_id="model-main",
+        )
+        registration = await repository.create_run_registration(
+            thread_id=thread.id,
+            run_id=identity.run_id,
+            parent_run_id=None,
+            model_id="model-main",
+            runtime_profile="deepagents-v2",
+            input_json={"runId": identity.run_id},
+            config_json={"runtimeProfile": "deepagents-v2"},
+        )
+        registration.created_at = datetime.now(UTC).replace(tzinfo=None) - timedelta(
+            minutes=1
+        )
+        thread.last_run_id = identity.run_id
+        await repository.commit()
+        thread_pk = thread.id
+
+    messaging, channel = await _messaging_channel()
+    coordinator = ConversationTraceCoordinator(
+        database=database,
+        tracer=tracer,
+        conversation_channel=channel,
+    )
+    source = _SlowEventSource(identity=identity)
+    subscription = await channel.wrap(source, identity=identity)
+    await asyncio.wait_for(source.entered.wait(), timeout=2)
+
+    await coordinator.recover_preparing(thread_pk=thread_pk)
+
+    assert await _thread(database, thread_pk) is not None
+
+    source.release.set()
+    async with asyncio.timeout(2):
+        while await channel.get_run_status(identity=identity) == "running":
+            await asyncio.sleep(0.01)
+    await subscription.aclose()
+
+    await coordinator.recover_preparing(thread_pk=thread_pk)
+
+    assert await _thread(database, thread_pk) is None
+    await coordinator.aclose()
+    await messaging.aclose()
+
+
+async def test_owner_preflight_cas_fences_a_stale_recovery_delete(database) -> None:
+    """missing 检查后的 owner 激活必须让延迟删除 CAS 失效"""
+
+    identity = RunIdentity(threadId="thread-preflight-race", runId="run-preflight-race")
+    async with database.session() as session:
+        repository = ConversationRepository(session)
+        thread = await repository.create_thread(
+            user_id=1,
+            thread_id=identity.thread_id,
+            title="激活竞态",
+            model_id="model-main",
+        )
+        registration = await repository.create_run_registration(
+            thread_id=thread.id,
+            run_id=identity.run_id,
+            parent_run_id=None,
+            model_id="model-main",
+            runtime_profile="deepagents-v2",
+            input_json={"runId": identity.run_id},
+            config_json={"runtimeProfile": "deepagents-v2"},
+        )
+        registration.created_at = datetime.now(UTC).replace(tzinfo=None) - timedelta(
+            minutes=1
+        )
+        thread.last_run_id = identity.run_id
+        await repository.commit()
+        thread_pk = thread.id
+        run_pk = registration.id
+
+    barrier = _MissingRunBarrierChannel()
+    coordinator = ConversationTraceCoordinator(
+        database=database,
+        tracer=Tracer(),
+        conversation_channel=cast(
+            MessageChannel[BaseEvent, BaseEvent],
+            barrier,
+        ),
+    )
+    recovery = asyncio.create_task(coordinator.recover_preparing(thread_pk=thread_pk))
+    await asyncio.wait_for(barrier.checked.wait(), timeout=2)
+    async with database.session() as session:
+        repository = ConversationRepository(session)
+        assert await repository.activate_run_registration(
+            thread_pk=thread_pk,
+            run_pk=run_pk,
+            run_id=identity.run_id,
+        )
+        await repository.commit()
+    barrier.release.set()
+    await asyncio.wait_for(recovery, timeout=2)
+
+    async with database.session() as session:
+        repository = ConversationRepository(session)
+        run = await repository.get_run(thread_pk=thread_pk, run_id=identity.run_id)
+        assert run is not None
+        assert run.status == "starting"
+
+    await coordinator.aclose()
+
+
+async def test_abandoned_trace_settles_the_complete_claim_batch_as_cancelled(
+    database,
+) -> None:
+    tracer = Tracer()
+    identity = RunIdentity(threadId="thread-abandon", runId="run-abandon")
+    async with database.session() as session:
+        repository = ConversationRepository(session)
+        thread = await repository.create_thread(
+            user_id=1,
+            thread_id=identity.thread_id,
+            title="放弃恢复",
+            model_id="model-main",
+        )
+        registration = await repository.create_run_registration(
+            thread_id=thread.id,
+            run_id=identity.run_id,
+            parent_run_id="run-interrupted",
+            model_id="model-main",
+            runtime_profile="deepagents-v2",
+            input_json={"runId": identity.run_id},
+            config_json={"runtimeProfile": "deepagents-v2"},
+        )
+        await repository.create_interrupt_claims(
+            thread_pk=thread.id,
+            source_run_id="run-interrupted",
+            claimed_run_id=identity.run_id,
+            interrupt_ids=("interrupt-1", "interrupt-2"),
+        )
+        thread.last_run_id = identity.run_id
+        await repository.commit()
+        thread_pk = thread.id
+        registration_pk = registration.id
+    context = RunSourceContext(
+        identity=identity,
+        runtime_profile="deepagents-v2",
+        input_kind="abandon",
+        parent_run_id="run-interrupted",
+        input={},
+        config={},
+        resume=(
+            RunResumeSummary(interrupt_id="interrupt-1", status="cancelled"),
+            RunResumeSummary(interrupt_id="interrupt-2", status="cancelled"),
+        ),
+    )
+    trace_session = await tracer.open_run(context)
+    now = datetime.now(UTC)
+    await trace_session.observe(
+        RunStartedObservation(
+            identity=identity,
+            observed_at=now,
+            monotonic_ns=1,
+        )
+    )
+    await trace_session.observe(
+        RunInputObservation(
+            identity=identity,
+            source=context,
+            observed_at=now,
+            monotonic_ns=2,
+        )
+    )
+    await trace_session.observe(
+        RunTerminalObservation(
+            identity=identity,
+            outcome="abandoned",
+            observed_at=now,
+            monotonic_ns=3,
+        )
+    )
+    await trace_session.observe(
+        RunClosedObservation(
+            identity=identity,
+            outcome="abandoned",
+            observed_at=now,
+            monotonic_ns=4,
+        )
+    )
+    await trace_session.aclose()
+    messaging, channel = await _messaging_channel()
+    coordinator = ConversationTraceCoordinator(
+        database=database,
+        tracer=tracer,
+        conversation_channel=channel,
+    )
+
+    await coordinator.reconcile(thread_pk=thread_pk, identity=identity)
+
+    async with database.session() as session:
+        repository = ConversationRepository(session)
+        claims = await repository.list_claims_for_update(
+            thread_pk=thread_pk,
+            interrupt_ids=frozenset({"interrupt-1", "interrupt-2"}),
+        )
+        stored_registration = await session.get(
+            ConversationRunRegistration,
+            registration_pk,
+        )
+    assert {claim.status for claim in claims} == {"cancelled"}
+    assert all(claim.resolution_id is not None for claim in claims)
+    assert stored_registration is not None
+    assert stored_registration.status == "abandoned"
+    await coordinator.aclose()
+    await messaging.aclose()

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import re
 from collections.abc import Awaitable, Callable, Generator
 from contextlib import contextmanager
@@ -38,8 +37,6 @@ from ._rooted_protocol import (
 from ._rooted_transfer import _AsyncStartState
 from .handle import OpenSandboxHandle
 from .sdk import OpenSandboxBackend
-
-logger = logging.getLogger(__name__)
 
 _ResultT = TypeVar("_ResultT")
 
@@ -856,12 +853,6 @@ class RootedOpenSandboxBackend(BaseSandbox):
         except TimeoutError:
             if not state.has_started:
                 task.cancel()
-            logger.warning(
-                "OpenSandbox rooted grep timed out after %s seconds: path=%r glob=%r",
-                ASYNC_GREP_TIMEOUT,
-                path,
-                glob,
-            )
             return GrepResult(
                 error=(
                     f"Error: grep timed out after {ASYNC_GREP_TIMEOUT}s. "

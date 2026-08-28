@@ -8,7 +8,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, 
 from dataclasses import dataclass
 from typing import Generic, Protocol, TypeVar, cast, overload
 
-from tinkerfin_agui_adapter import Identity
+from tinkerfin_contracts import RunIdentity
 
 from ._identity import required_identifier, required_identity
 from ._messaging_boundary import _join_owned_task
@@ -68,6 +68,8 @@ class DeferredMessageSource(Generic[SourceT]):
         cancel_after_first_item: Delay the callback until the first pull has produced
             an item or terminal outcome. Use this when the first item establishes a
             protocol lifecycle that cancellation must not overtake.
+        on_owner_preflight: Optional callback settled after durable owner acquisition
+            but before a producer task or source opener can start.
 
     Raises:
         TypeError: The opener or cancellable declaration has an invalid shape.
@@ -79,6 +81,7 @@ class DeferredMessageSource(Generic[SourceT]):
         *,
         cancellable: bool,
         cancel_after_first_item: bool = False,
+        on_owner_preflight: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         """Initialize deferred ownership without invoking the opener."""
 
@@ -90,6 +93,8 @@ class DeferredMessageSource(Generic[SourceT]):
             raise TypeError("cancel_after_first_item must be a boolean")
         if cancel_after_first_item and not cancellable:
             raise ValueError("cancel_after_first_item requires a cancellable source")
+        if on_owner_preflight is not None and not callable(on_owner_preflight):
+            raise TypeError("on_owner_preflight must be an async callable or None")
         self._opener = opener
         self._cancellable = cancellable
         self._cancel_after_first_item = cancel_after_first_item
@@ -102,6 +107,8 @@ class DeferredMessageSource(Generic[SourceT]):
         self._binding: _OpenedMessageSource[SourceT] | None = None
         self._active_task: asyncio.Task[object] | None = None
         self._close_task: asyncio.Task[None] | None = None
+        self._owner_preflight = on_owner_preflight
+        self._owner_preflight_task: asyncio.Task[None] | None = None
 
     @property
     def messaging_cancel_callback(self) -> CancelCallback[SourceT] | None:
@@ -115,6 +122,25 @@ class DeferredMessageSource(Generic[SourceT]):
         """Return whether a supplied callback names this source's same owner."""
 
         return callback == self.cancel
+
+    async def messaging_owner_preflight(self) -> None:
+        """Settle the one owner-only hook before producer execution can begin."""
+
+        callback = self._owner_preflight
+        if callback is None:
+            return
+        task = self._owner_preflight_task
+        if task is None:
+
+            async def invoke() -> None:
+                await callback()
+
+            task = asyncio.create_task(
+                invoke(),
+                name="tinkerfin-messaging-owner-preflight",
+            )
+            self._owner_preflight_task = task
+        await _join_owned_task(task)
 
     def __aiter__(self) -> DeferredMessageSource[SourceT]:
         """Claim and return this source's single-use asynchronous iterator."""
@@ -296,19 +322,38 @@ class ProfiledDeferredMessageSource(
         self,
         opener: Callable[[], Awaitable[MessageSourceBinding[SourceT]]],
         *,
-        identity: Identity,
+        identity: RunIdentity,
         codec_profile: str,
         source_type: type[SourceT],
         replay_type: type[ReplayT],
         cancellable: bool,
         cancel_after_first_item: bool = False,
+        on_owner_preflight: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
-        """Initialize deferred ownership and an immutable built-in codec profile."""
+        """Initialize deferred ownership and an immutable built-in codec profile.
+
+        Args:
+            opener: Async factory invoked only after owner preflight succeeds.
+            identity: Immutable durable run identity available before source opening.
+            codec_profile: Registered built-in codec profile name.
+            source_type: Exact live item type consumed by the profile codec.
+            replay_type: Exact decoded replay item type.
+            cancellable: Whether the future opened binding must expose cancellation.
+            cancel_after_first_item: Whether remote cancellation waits for the first
+                owner pull to settle.
+            on_owner_preflight: Optional owner-only callback completed after durable
+                preparation and before producer or opener execution.
+
+        Raises:
+            TypeError: A profile type or inherited deferred-source option is invalid.
+            ValueError: An identifier or cancellation option is invalid.
+        """
 
         super().__init__(
             opener,
             cancellable=cancellable,
             cancel_after_first_item=cancel_after_first_item,
+            on_owner_preflight=on_owner_preflight,
         )
         self._messaging_identity = required_identity(identity)
         self._messaging_codec_profile = required_identifier(
@@ -323,7 +368,7 @@ class ProfiledDeferredMessageSource(
         self._messaging_replay_type = replay_type
 
     @property
-    def messaging_identity(self) -> Identity:
+    def messaging_identity(self) -> RunIdentity:
         """Return the durable run identity without opening the source."""
 
         return self._messaging_identity

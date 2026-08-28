@@ -24,15 +24,17 @@ from langgraph.types import StateSnapshot, interrupt
 from langgraph.typing import ContextT
 from pydantic import ConfigDict, JsonValue, TypeAdapter
 
-from tinkerfin_agui_adapter import Identity, RuntimeInterruptEnvelope
+from tinkerfin_contracts import RunIdentity
+from tinkerfin_native_stream import RuntimeInterruptEnvelope
 
-from .._agui_lineage import (
+from .._agui_lineage_state import (
     CHECKPOINT_ROLE_METADATA_KEY,
     PARENT_RUN_ID_METADATA_KEY,
     PLANNING_CHECKPOINT_ROLE,
     RUN_ID_METADATA_KEY,
+    RUNTIME_PROFILE_METADATA_KEY,
+    lineage_state_update,
 )
-from .._agui_lineage_state import lineage_state_update
 from ._clarification import (
     build_response_schema,
     pending_contract_digest,
@@ -50,6 +52,7 @@ from ._contracts import (
     RejectPlan,
     RespondToPlan,
 )
+from ._json_schema import require_valid_schema
 from ._planner import create_planner_agent, invoke_planner
 from ._state import (
     PLAN_CHECKPOINT_RUN_ID,
@@ -240,6 +243,7 @@ def _json_schema(adapter: TypeAdapter[_SchemaT]) -> dict[str, JsonValue]:
 def _runtime_interrupt_value(
     envelope: RuntimeInterruptEnvelope,
 ) -> dict[str, JsonValue]:
+    require_valid_schema(envelope.response_schema)
     return _JSON_OBJECT.validate_python(
         envelope.model_dump(
             mode="json",
@@ -266,6 +270,13 @@ def _optional_cache(value: object) -> BaseCache[object] | None:
 
 
 def _planning_config(value: object) -> RunnableConfig:
+    """Derive a Planning config without overwriting semantic Run lineage.
+
+    LangGraph's ``run_id`` index is reserved for the stable Planning checkpoint owner;
+    the caller's semantic Run ID remains under TinkerFin private metadata. The copy
+    prevents Profile and role injection from mutating host-owned config mappings.
+    """
+
     if value is None:
         config = RunnableConfig()
     elif isinstance(value, Mapping):
@@ -298,12 +309,19 @@ def _planning_config(value: object) -> RunnableConfig:
 
 
 def _planning_lineage_update(config: RunnableConfig) -> dict[str, object]:
+    """Build the planning-role marker from fully validated Runtime metadata.
+
+    Runtime Profile identity is mandatory so Plan checkpoints cannot later be resumed
+    or handed off through a different upstream integration.
+    """
+
     configurable = config.get("configurable", {})
     run_id = configurable.get(RUN_ID_METADATA_KEY)
     if run_id is None:
         return {}
     thread_id = configurable.get("thread_id")
     parent_run_id = configurable.get(PARENT_RUN_ID_METADATA_KEY)
+    runtime_profile = configurable.get(RUNTIME_PROFILE_METADATA_KEY)
     if not isinstance(thread_id, str) or not isinstance(run_id, str):
         raise PlanModeConfigurationError(
             "Plan Mode requires canonical AG-UI lineage identifiers"
@@ -312,11 +330,16 @@ def _planning_lineage_update(config: RunnableConfig) -> dict[str, object]:
         raise PlanModeConfigurationError(
             "Plan Mode requires a canonical AG-UI parent run ID"
         )
+    if not isinstance(runtime_profile, str) or not runtime_profile:
+        raise PlanModeConfigurationError(
+            "Plan Mode requires a canonical Runtime Profile"
+        )
     return cast(
         dict[str, object],
         lineage_state_update(
-            identity=Identity(threadId=thread_id, runId=run_id),
+            identity=RunIdentity(threadId=thread_id, runId=run_id),
             parent_run_id=parent_run_id,
+            runtime_profile=runtime_profile,
             role="planning",
         ),
     )
@@ -352,6 +375,8 @@ class PlanningWorkflowGraph(Generic[ContextT]):
     __slots__ = ("_graph", "_signature")
 
     def __init__(self, graph: _CompiledPlanningRuntime) -> None:
+        """Wrap one compiled graph without taking ownership of its durable resources."""
+
         self._graph = graph
         self._signature = inspect.signature(graph.astream)
 
@@ -380,10 +405,18 @@ class PlanningWorkflowGraph(Generic[ContextT]):
         bound.arguments["config"] = _planning_config(bound.arguments.get("config"))
         return self._graph.astream(*bound.args, **bound.kwargs)
 
-    async def aget_state(self, config: RunnableConfig) -> StateSnapshot:
+    async def aget_state(
+        self,
+        config: RunnableConfig,
+        *,
+        subgraphs: bool = False,
+    ) -> StateSnapshot:
         """Read the current Planning checkpoint without changing ownership."""
 
-        return await self._graph.aget_state(_planning_config(config))
+        return await self._graph.aget_state(
+            _planning_config(config),
+            subgraphs=subgraphs,
+        )
 
     async def mark_handoff_phase(
         self,
@@ -394,7 +427,27 @@ class PlanningWorkflowGraph(Generic[ContextT]):
         native_checkpoint_id: str,
         completed_checkpoint_id: str | None = None,
     ) -> PlanState[PlanContentModel]:
-        """Synchronously commit verified native checkpoint progress."""
+        """Synchronously commit verified native progress on the Planning head.
+
+        LangGraph 1.2.10 does not mutate the caller's resume config to its latest
+        checkpoint. Handoff transitions therefore remove the consumed checkpoint ID and
+        let the borrowed saver select the canonical Planning head; updating the original
+        interrupt checkpoint would fork away durable resume evidence.
+
+        Args:
+            config: Current request configuration used to locate the Planning thread.
+            plan: Approved Plan with the current durable handoff state.
+            phase: Next legal native handoff phase.
+            native_checkpoint_id: Native Graph checkpoint proving accepted work.
+            completed_checkpoint_id: Optional checkpoint proving native completion.
+
+        Returns:
+            Updated immutable Plan state committed on the canonical Planning head.
+
+        Raises:
+            RuntimeError: The Plan or requested handoff transition is invalid.
+            TinkerFinLifecycleError: Planning checkpoint ownership cannot be proven.
+        """
 
         handoff = plan.handoff
         if plan.status is not PlanStatus.APPROVED or handoff is None:
@@ -420,8 +473,12 @@ class PlanningWorkflowGraph(Generic[ContextT]):
                 )
             }
         )
+        head_config = _planning_config(config)
+        configurable = dict(head_config.get("configurable", {}))
+        configurable.pop("checkpoint_id", None)
+        head_config["configurable"] = configurable
         await self._graph.aupdate_state(
-            _planning_config(config),
+            head_config,
             {
                 **plan_state_update(updated),
                 **_planning_lineage_update(config),

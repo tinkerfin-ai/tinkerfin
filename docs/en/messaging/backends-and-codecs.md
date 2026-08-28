@@ -12,7 +12,12 @@ pip install "tinkerfin-messaging[redis]"
 
 ```python
 from redis.asyncio import Redis
-from tinkerfin_messaging import Messaging, MessagingLimits, RedisBackend
+from tinkerfin_messaging import (
+    Messaging,
+    MessagingLimits,
+    MessagingRetentionPolicy,
+    RedisBackend,
+)
 
 
 redis = Redis.from_url(
@@ -25,6 +30,7 @@ backend = RedisBackend(
     lease_ttl=15.0,
     poll_interval=0.1,
     limits=MessagingLimits(),
+    retention_policy=MessagingRetentionPolicy.expire_after(86_400),
 )
 messaging = Messaging(backend=backend)
 ```
@@ -36,12 +42,25 @@ messaging = Messaging(backend=backend)
 | `lease_ttl` | `15.0` | Producer ownership lease in seconds |
 | `poll_interval` | `0.1` | Delete-lease contention interval |
 | `limits` | `MessagingLimits()` | Encoded payload, checkpoint, message-count, and thread-byte limits |
+| `retention_policy` | disabled | Terminal thread-generation replay window |
 
 The caller owns the Redis client and closes it during application shutdown. Size the connection pool for blocked followers, cancellation waiters, and ordinary commands.
 
-Messaging does not impose retention or compaction. Apply your own policy through `delete_stream()`.
+An enabled retention policy starts at terminal settlement. Active producers do not
+expire, and a new Run before the deadline clears the timer. An expired generation raises
+`StreamExpired`; an explicit `after=0` start creates the next empty generation. Redis
+uses its server clock and performs resumable physical cleanup when a backend operation
+first observes the deadline. `delete_stream()` remains an explicit, distinct
+`StreamDeleted` lifecycle.
 
 ## Select a built-in codec explicitly
+
+Install the matching codec extra:
+
+```bash
+pip install "tinkerfin-messaging[agui]"
+# or: pip install "tinkerfin-messaging[native]"
+```
 
 ```python
 from tinkerfin_messaging import AgUiCodec
@@ -57,16 +76,19 @@ channel = messaging.channel(
 
 | Installation | API | Use |
 | --- | --- | --- |
-| base | `AgUiCodec` | AG-UI encoding, decoding, and SSE |
-| base | `NativeStreamPartCodec` | Native v2 encoding, decoding, and SSE |
+| `[agui]` | `AgUiCodec` | AG-UI encoding, decoding, and SSE |
+| `[native]` | `NativeStreamPartCodec` | Canonical Native replay encoding, decoding, and SSE |
 | `[redis]` | `RedisBackend` | Multi-process durable backend |
 
-Canonical TinkerFin streams include immutable codec and Identity profiles, so a name-only channel infers both. Custom sources need an explicit codec and Identity.
+Canonical TinkerFin streams include immutable codec and RunIdentity profiles, so a
+name-only channel infers both. Native Runtime sources additionally transfer the
+Driver-owned `NativeStreamPart` through `MessageCodecInputSource`; the codec never
+reparses a live upstream mapping. Custom sources need an explicit codec and RunIdentity.
 
 RedisBackend stores the complete limits fingerprint, per-generation `payload_bytes`,
 and the current and immediately previous owner's successful lease-renewal counts and UTC
 timestamps for trusted postmortem diagnostics. Workers sharing a channel must use
-identical limits.
+identical limits and retention policies.
 Quota checks and counters are atomic with append after message-ID idempotency. These
 fields never enter `MessageEnvelope`.
 

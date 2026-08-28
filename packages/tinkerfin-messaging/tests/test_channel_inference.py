@@ -11,14 +11,15 @@ from pydantic import BaseModel
 
 import tinkerfin_messaging
 from tinkerfin import (
-    AgUiEventStream,
-    Identity,
     NativeStreamPart,
+    RunIdentity,
+    TinkerFin,
 )
 from tinkerfin_messaging import (
     BackendRunHandle,
     CodecMismatch,
     MemoryBackend,
+    MessageCodecInputSource,
     MessageEnvelope,
     MessageSource,
     MessageSubscription,
@@ -37,8 +38,8 @@ def _identity(
     *,
     thread_id: str = "thread-1",
     run_id: str = "run-1",
-) -> Identity:
-    return Identity(threadId=thread_id, runId=run_id)
+) -> RunIdentity:
+    return RunIdentity(threadId=thread_id, runId=run_id)
 
 
 class _TextCodec:
@@ -95,7 +96,7 @@ class _CountingBackend(MemoryBackend):
         self,
         *,
         channel: str,
-        identity: Identity,
+        identity: RunIdentity,
         codec: str,
         after: int | None,
         cancellable: bool,
@@ -132,6 +133,7 @@ class _CountingBackend(MemoryBackend):
 
 class _DeclaredProfileSource:
     messaging_source_type: type[object]
+    messaging_codec_input_type: type[object]
     messaging_replay_type: type[object]
 
     def __init__(
@@ -139,18 +141,22 @@ class _DeclaredProfileSource:
         *,
         profile: str,
         source_type: type[object] | None = None,
+        codec_input_type: type[object] | None = None,
         replay_type: type[object] | None = None,
-        identity: Identity | None = None,
+        identity: RunIdentity | None = None,
     ) -> None:
         self.messaging_codec_profile = profile
         self.messaging_identity = identity or _identity()
         if source_type is not None:
             self.messaging_source_type = source_type
+        if codec_input_type is not None:
+            self.messaging_codec_input_type = codec_input_type
         if replay_type is not None:
             self.messaging_replay_type = replay_type
         self.iterator_calls = 0
         self.pull_calls = 0
         self.close_calls = 0
+        self.transform_calls = 0
 
     def __aiter__(self) -> _DeclaredProfileSource:
         self.iterator_calls += 1
@@ -159,6 +165,13 @@ class _DeclaredProfileSource:
     async def __anext__(self) -> Mapping[str, object]:
         self.pull_calls += 1
         raise StopAsyncIteration
+
+    def messaging_codec_input(
+        self,
+        item: Mapping[str, object],
+    ) -> NativeStreamPart:
+        self.transform_calls += 1
+        return NativeStreamPart.model_validate(item)
 
     async def aclose(self) -> None:
         self.close_calls += 1
@@ -217,7 +230,7 @@ class _NativeProfileSource:
         self,
         value: int | None,
         *,
-        identity: Identity,
+        identity: RunIdentity,
     ) -> None:
         self.messaging_identity = identity
         self._value = value
@@ -225,15 +238,25 @@ class _NativeProfileSource:
 
     @property
     def messaging_codec_profile(self) -> str:
-        return "langgraph.stream-part.v2"
+        return "tinkerfin.native-stream"
 
     @property
     def messaging_source_type(self) -> type[Mapping[str, object]]:
         return Mapping
 
     @property
+    def messaging_codec_input_type(self) -> type[NativeStreamPart]:
+        return NativeStreamPart
+
+    @property
     def messaging_replay_type(self) -> type[NativeStreamPart]:
         return NativeStreamPart
+
+    def messaging_codec_input(
+        self,
+        item: Mapping[str, object],
+    ) -> NativeStreamPart:
+        return NativeStreamPart.model_validate(item)
 
     def __aiter__(self) -> _NativeProfileSource:
         return self
@@ -256,12 +279,12 @@ class _NativeProfileSource:
 def _native_source(
     value: int = 1,
     *,
-    identity: Identity | None = None,
+    identity: RunIdentity | None = None,
 ) -> _NativeProfileSource:
     return _NativeProfileSource(value, identity=identity or _identity())
 
 
-def _empty_native_source(*, identity: Identity) -> _NativeProfileSource:
+def _empty_native_source(*, identity: RunIdentity) -> _NativeProfileSource:
     return _NativeProfileSource(None, identity=identity)
 
 
@@ -310,8 +333,10 @@ async def test_native_profile_infers_live_and_replay_types() -> None:
     source = _native_source()
 
     assert isinstance(source, ProfiledMessageSource)
-    assert source.messaging_codec_profile == "langgraph.stream-part.v2"
+    assert isinstance(source, MessageCodecInputSource)
+    assert source.messaging_codec_profile == "tinkerfin.native-stream"
     assert source.messaging_source_type is Mapping
+    assert source.messaging_codec_input_type is NativeStreamPart
     assert source.messaging_replay_type is NativeStreamPart
 
     async with Messaging() as messaging:
@@ -398,22 +423,25 @@ async def test_explicit_identity_must_match_profiled_source_before_prepare() -> 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("source_type", "replay_type", "reason"),
+    ("source_type", "codec_input_type", "replay_type", "reason"),
     [
-        (None, None, "missing"),
-        (str, NativeStreamPart, "live source type"),
-        (Mapping, str, "replay type"),
+        (None, NativeStreamPart, NativeStreamPart, "missing live source type"),
+        (Mapping, None, NativeStreamPart, "missing codec input type"),
+        (Mapping, str, NativeStreamPart, "codec input type"),
+        (Mapping, NativeStreamPart, str, "replay type"),
     ],
 )
 async def test_incomplete_native_profile_fails_before_prepare(
     source_type: type[object] | None,
+    codec_input_type: type[object] | None,
     replay_type: type[object] | None,
     reason: str,
 ) -> None:
     backend = _CountingBackend()
     source = _DeclaredProfileSource(
-        profile="langgraph.stream-part.v2",
+        profile="tinkerfin.native-stream",
         source_type=source_type,
+        codec_input_type=codec_input_type,
         replay_type=replay_type,
     )
     mismatch_type = getattr(
@@ -442,6 +470,7 @@ async def test_unknown_profile_fails_without_opening_the_source_or_backend() -> 
     source = _DeclaredProfileSource(
         profile="vendor.unknown.v1",
         source_type=Mapping,
+        codec_input_type=NativeStreamPart,
         replay_type=NativeStreamPart,
     )
 
@@ -472,13 +501,14 @@ async def test_reused_inferred_channel_revalidates_profile_before_prepare() -> N
         baseline_append = backend.append_calls
 
         malformed = _DeclaredProfileSource(
-            profile="langgraph.stream-part.v2",
-            source_type=str,
+            profile="tinkerfin.native-stream",
+            source_type=Mapping,
+            codec_input_type=str,
             replay_type=NativeStreamPart,
         )
         with pytest.raises(
             tinkerfin_messaging.SourceProfileMismatch,
-            match="live source type",
+            match="codec input type",
         ):
             await channel.wrap(
                 malformed,
@@ -505,7 +535,7 @@ async def test_name_only_channel_infers_native_and_agui_profiles() -> None:
 
         agui_channel = messaging.channel(name="agui-events")
         agui_identity = _identity()
-        events = AgUiEventStream.from_initialization_error(
+        events = TinkerFin().failed_agui_run(
             RuntimeError("test initialization failure"),
             identity=agui_identity,
         )
@@ -578,7 +608,7 @@ async def test_name_only_channel_rejects_custom_and_incompatible_sources() -> No
         )
         await _collect(native)
 
-        incompatible = AgUiEventStream.from_initialization_error(
+        incompatible = TinkerFin().failed_agui_run(
             RuntimeError("test initialization failure"),
             identity=_identity(thread_id="agui", run_id="agui-run"),
         )
@@ -593,10 +623,14 @@ async def test_name_only_channel_rejects_custom_and_incompatible_sources() -> No
 
 @pytest.mark.asyncio
 async def test_preencoded_runtime_sse_is_rejected_before_source_open() -> None:
-    encoded = AgUiEventStream.from_initialization_error(
-        RuntimeError("test initialization failure"),
-        identity=_identity(thread_id="stream-1"),
-    ).to_sse()
+    encoded = (
+        TinkerFin()
+        .failed_agui_run(
+            RuntimeError("test initialization failure"),
+            identity=_identity(thread_id="stream-1"),
+        )
+        .to_sse()
+    )
     async with Messaging() as messaging:
         channel = messaging.channel(name="native-parts")
         with pytest.raises(TypeError, match="object events, not pre-encoded SSE"):

@@ -10,20 +10,18 @@ from ag_ui.core import BaseEvent
 from langchain.agents.middleware.types import InputAgentState
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from tinkerfin import AgUiResumeCheckpoint, join_task
+from tinkerfin import AgUiResumeCheckpoint, RunIdentity, join_task
 from tinkerfin_messaging.errors import (
     MessagingError,
     MessagingErrorCode,
-    RunNotFound,
     RunProducerFailed,
-    StreamDeleted,
 )
-from tinkerfin_messaging.models import MessageEnvelope
 from tinkerfin_messaging.protocols import ProfiledMessageSource
 from tinkerfin_studio.agent.factory import ConversationAgentFactory
 from tinkerfin_studio.api.errors import (
     BusinessException,
     ConversationErrorCode,
+    ModelErrorCode,
     SystemException,
 )
 from tinkerfin_studio.auth.types import UserContext
@@ -49,6 +47,7 @@ from tinkerfin_studio.models.repository import AgentModelRepository
 from tinkerfin_studio.models.schemas import AgentModelConfig
 from tinkerfin_studio.models.service import AgentModelService
 from tinkerfin_studio.resources import ApplicationResources
+from tinkerfin_tracing import TraceThreadNotFound, TracingError
 
 _MESSAGING_ERRORS: dict[
     MessagingErrorCode,
@@ -111,6 +110,10 @@ _MESSAGING_ERRORS: dict[
     MessagingErrorCode.BACKEND_OWNERSHIP_LOST: (
         ConversationErrorCode.MESSAGING_FAILURE,
         False,
+    ),
+    MessagingErrorCode.STREAM_EXPIRED: (
+        ConversationErrorCode.MESSAGING_STREAM_EXPIRED,
+        True,
     ),
     MessagingErrorCode.STREAM_DELETED: (
         ConversationErrorCode.RUN_NOT_FOUND,
@@ -188,6 +191,8 @@ class ConversationChatService:
         model = await AgentModelService(AgentModelRepository(self._session)).resolve(
             request.forwarded_props.model
         )
+        if model.runtime_profile not in self._resources.tinkerfin_profiles:
+            raise SystemException(ModelErrorCode.CATALOG_UNAVAILABLE)
         run_preparer, prepared, execution = await self._prepare_execution(
             request,
             intent=intent,
@@ -199,6 +204,7 @@ class ConversationChatService:
                 execution=execution,
                 prepared=prepared,
                 model=model,
+                run_preparer=run_preparer,
             )
         except BaseException:
             await self._cleanup_execution(
@@ -228,7 +234,6 @@ class ConversationChatService:
         run_preparer = ConversationRunPreparer(
             self._session,
             user_id=self._user.user_id,
-            projector=self._resources.conversation_projector,
         )
         resolved_thread = await run_preparer.resolve_thread(
             request,
@@ -237,12 +242,14 @@ class ConversationChatService:
         thread = resolved_thread.thread
         # 释放 thread 查询产生的只读事务，恢复检查不得占用请求连接或数据库锁
         await self._repository.commit()
-        deleted_threads = (
-            await self._resources.conversation_projector.recover_preparing(
-                thread_pk=thread.id,
-            )
+        await self._resources.conversation_trace.recover_preparing(
+            thread_pk=thread.id,
         )
-        if thread.id in deleted_threads:
+        refreshed = await self._repository.reload_thread(
+            user_id=self._user.user_id,
+            thread_id=thread.thread_id,
+        )
+        if refreshed is None:
             if request.thread_id:
                 raise BusinessException(ConversationErrorCode.NOT_FOUND)
             resolved_thread = await run_preparer.resolve_thread(
@@ -250,22 +257,32 @@ class ConversationChatService:
                 intent=intent,
             )
             thread = resolved_thread.thread
+        else:
+            thread = refreshed
         if thread.last_run_id and thread.last_run_id != request.run_id:
-            # 用户发送下一条消息前先追上上一 run 的最终审批，避免投影延迟绕过卡片
+            # 新请求登记前先刷新上一 head，不能用 Messaging 传输状态推断 Agent 结果
+            # Trace reconcile 会借用同一共享 Engine；先结束 reload 产生的只读事务
+            await self._repository.commit()
             previous_identity = conversation_identity(
                 thread.thread_id,
                 thread.last_run_id,
             )
             try:
-                previous_status = (
-                    await self._resources.conversation_projector.reconcile_and_settle(
-                        thread_pk=thread.id,
-                        identity=previous_identity,
-                    )
+                await self._resources.conversation_trace.reconcile(
+                    thread_pk=thread.id,
+                    identity=previous_identity,
                 )
-            except (RunNotFound, StreamDeleted):
-                previous_status = None
-            if previous_status in {"running", "cancel_requested"}:
+            except TraceThreadNotFound as error:
+                raise SystemException(
+                    ConversationErrorCode.TRACE_UNAVAILABLE
+                ) from error
+            thread = await self._repository.reload_thread(
+                user_id=self._user.user_id,
+                thread_id=thread.thread_id,
+            )
+            if thread is None:
+                raise BusinessException(ConversationErrorCode.NOT_FOUND)
+            if thread.status == "running":
                 raise BusinessException(ConversationErrorCode.RUN_CONFLICT)
         prepared = prepare_run_request(
             request,
@@ -274,7 +291,6 @@ class ConversationChatService:
         )
         try:
             execution = await run_preparer.register(
-                request,
                 intent=intent,
                 prepared=prepared,
                 model=model,
@@ -312,22 +328,23 @@ class ConversationChatService:
         execution: PreparedExecution,
         prepared: PreparedRunRequest,
         model: AgentModelConfig,
+        run_preparer: ConversationRunPreparer,
     ) -> ProfiledMessageSource[BaseEvent, BaseEvent]:
         """创建普通、恢复或审批放弃使用的统一 profile source"""
 
         graph_input: InputAgentState | None
-        resume_binding = None
+        resume_request = None
         if isinstance(intent, StartChatIntent):
             graph_input = bind_start_graph_input(intent, prepared)
         else:
             if execution.resume is None:
-                raise RuntimeError("恢复请求缺少 AgUiResumeBinding")
+                raise RuntimeError("恢复请求缺少 AgUiResumeRequest")
             graph_input = None
-            resume_binding = execution.resume
+            resume_request = execution.resume
         factory = ConversationAgentFactory(
             persistence=self._resources.agent_persistence,
             sandbox_manager=self._resources.sandbox_manager,
-            tinkerfin=self._resources.tinkerfin,
+            tinkerfin_profiles=self._resources.tinkerfin_profiles,
             tavily_api_key=(
                 None
                 if self._resources.settings.tavily_api_key is None
@@ -338,10 +355,28 @@ class ConversationChatService:
         async def record_resume_checkpoint(checkpoint: AgUiResumeCheckpoint) -> None:
             if not isinstance(intent, ResumeChatIntent):
                 raise TypeError("普通运行不应收到 resume checkpoint")
-            await self._resources.conversation_projector.settle_resume(
+            await self._resources.conversation_trace.settle_resume(
                 thread_pk=execution.thread.id,
                 entries=intent.entries,
                 checkpoint=checkpoint,
+            )
+
+        async def release_resume_claims() -> None:
+            async with self._resources.database.session() as session:
+                repository = ConversationRepository(session)
+                await repository.release_claims(
+                    thread_pk=execution.thread.id,
+                    run_id=prepared.identity.run_id,
+                )
+                await repository.commit()
+
+        async def activate_producer() -> None:
+            """在 durable owner 建立后、Graph 初始化前激活业务 Run"""
+
+            await run_preparer.activate_started(
+                thread_pk=execution.thread.id,
+                identity_run_id=prepared.identity.run_id,
+                registered=execution.registered,
             )
 
         return factory.create_agui_events(
@@ -349,9 +384,13 @@ class ConversationChatService:
             model_config=model,
             graph_input=graph_input,
             prepared=prepared,
-            resume=resume_binding,
+            resume=resume_request,
+            on_producer_opened=activate_producer,
             on_resume_checkpointed=(
-                record_resume_checkpoint if resume_binding is not None else None
+                record_resume_checkpoint if resume_request is not None else None
+            ),
+            on_resume_initialization_failed=(
+                release_resume_claims if resume_request is not None else None
             ),
             title=execution.thread.title,
         )
@@ -366,12 +405,6 @@ class ConversationChatService:
         run_preparer: ConversationRunPreparer,
     ) -> AsyncIterator[bytes]:
         """执行无数据库锁的 Messaging 预握手，并保护失败清理"""
-
-        async def wake_projection(envelope: MessageEnvelope) -> None:
-            self._resources.conversation_projector.ensure(
-                thread_pk=execution.thread.id,
-                identity=envelope.identity,
-            )
 
         cleanup_task: asyncio.Task[None] | None = None
 
@@ -416,7 +449,6 @@ class ConversationChatService:
             self._resources.conversation_channel.sse(
                 events,
                 after=after,
-                on_committed=wake_projection,
             ),
             name=f"studio-conversation-preflight:{prepared.identity.run_id}",
         )
@@ -460,6 +492,10 @@ class ConversationChatService:
             if isinstance(error, MessagingError):
                 raise self._messaging_error(error) from error
             raise
+        self._resources.conversation_trace.ensure(
+            thread_pk=execution.thread.id,
+            identity=prepared.identity,
+        )
         return body
 
     async def cancel(self, *, thread_id: str, run_id: str) -> CancelRunResponse:
@@ -483,18 +519,28 @@ class ConversationChatService:
             )
         except RunProducerFailed:
             # run 已经失败时“停止”是幂等确认，用户应回到可重试状态而不是看到 500
-            await self._resources.conversation_projector.reconcile_and_settle(
-                thread_pk=thread_pk,
-                identity=identity,
-            )
+            await self._reconcile_trace(thread_pk=thread_pk, identity=identity)
             return CancelRunResponse(cancelled=False)
         except MessagingError as error:
             raise self._messaging_error(error, operation="cancel") from error
-        await self._resources.conversation_projector.reconcile_and_settle(
-            thread_pk=thread_pk,
-            identity=identity,
-        )
+        await self._reconcile_trace(thread_pk=thread_pk, identity=identity)
         return CancelRunResponse(cancelled=cancelled)
+
+    async def _reconcile_trace(
+        self,
+        *,
+        thread_pk: int,
+        identity: RunIdentity,
+    ) -> None:
+        """把取消后的 Runtime 终态同步为列表摘要"""
+
+        try:
+            await self._resources.conversation_trace.reconcile(
+                thread_pk=thread_pk,
+                identity=identity,
+            )
+        except TracingError as error:
+            raise SystemException(ConversationErrorCode.TRACE_UNAVAILABLE) from error
 
     @staticmethod
     def _messaging_error(

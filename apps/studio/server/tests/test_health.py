@@ -1,4 +1,4 @@
-"""外部依赖 readiness 检查测试。"""
+"""外部依赖 readiness 检查测试"""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ from collections.abc import Awaitable
 from typing import cast
 
 import httpx
+import pytest
 from redis.asyncio import Redis
 
 from tinkerfin_studio.config.settings import SandboxSettings
@@ -39,7 +40,7 @@ class _Redis:
 
 
 async def test_readiness_checks_all_dependencies_concurrently() -> None:
-    """三个依赖全部可用时 readiness 必须逐项返回成功。"""
+    """四项外部依赖全部可用时 readiness 必须逐项返回成功"""
 
     async def sandbox(request: httpx.Request) -> httpx.Response:
         assert request.url == "http://opensandbox:8090/health"
@@ -48,7 +49,8 @@ async def test_readiness_checks_all_dependencies_concurrently() -> None:
     async with httpx.AsyncClient(transport=httpx.MockTransport(sandbox)) as http_client:
         service = ReadinessService(
             database=cast(Database, _Database()),
-            redis=cast(Redis, _Redis()),
+            redis_control=cast(Redis, _Redis()),
+            redis_runtime=cast(Redis, _Redis()),
             sandbox=SandboxSettings(
                 domain="opensandbox:8090",
                 protocol="http",
@@ -63,13 +65,17 @@ async def test_readiness_checks_all_dependencies_concurrently() -> None:
 
         assert await service.check() == {
             "mysql": True,
-            "redis": True,
+            "redis_control": True,
+            "redis_runtime": True,
             "opensandbox": True,
         }
 
 
-async def test_readiness_converts_dependency_errors_to_false() -> None:
-    """依赖异常不得逃逸或暴露到健康响应。"""
+@pytest.mark.parametrize("broken_domain", ["control", "runtime"])
+async def test_readiness_isolates_each_redis_failure_domain(
+    broken_domain: str,
+) -> None:
+    """任一 Redis 故障不得污染另一故障域或泄漏异常"""
 
     class BrokenRedis:
         def ping(self) -> Awaitable[bool]:
@@ -82,7 +88,14 @@ async def test_readiness_converts_dependency_errors_to_false() -> None:
     async with httpx.AsyncClient(transport=httpx.MockTransport(sandbox)) as http_client:
         service = ReadinessService(
             database=cast(Database, _Database()),
-            redis=cast(Redis, BrokenRedis()),
+            redis_control=cast(
+                Redis,
+                BrokenRedis() if broken_domain == "control" else _Redis(),
+            ),
+            redis_runtime=cast(
+                Redis,
+                BrokenRedis() if broken_domain == "runtime" else _Redis(),
+            ),
             sandbox=SandboxSettings(
                 domain="opensandbox:8090",
                 protocol="http",
@@ -97,4 +110,7 @@ async def test_readiness_converts_dependency_errors_to_false() -> None:
 
         result = await service.check()
 
-    assert result == {"mysql": True, "redis": False, "opensandbox": False}
+    assert result["mysql"] is True
+    assert result["redis_control"] is (broken_domain != "control")
+    assert result["redis_runtime"] is (broken_domain != "runtime")
+    assert result["opensandbox"] is False

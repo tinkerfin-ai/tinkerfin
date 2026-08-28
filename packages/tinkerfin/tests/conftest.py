@@ -6,7 +6,6 @@ from collections.abc import Callable
 
 import pytest
 
-import tinkerfin.deep_agent as deep_agent_module
 from tinkerfin import DeepAgentDefinition, TinkerFin
 
 
@@ -25,10 +24,8 @@ def definition_factory(
             return graph
 
         monkeypatch.setattr(
-            deep_agent_module,
-            "_native_create_deep_agent",
+            "tinkerfin.runtime_profile._deepagents_graph.create_deep_agent",
             build,
-            raising=False,
         )
         return (tinkerfin or TinkerFin()).create_deep_agent(
             model="provider:model",

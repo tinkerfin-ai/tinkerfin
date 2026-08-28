@@ -4,13 +4,17 @@
 
 ## What it is
 
-TinkerFin adds native, AG-UI, SSE, and durable Messaging delivery to Deep Agents.
+TinkerFin adds native, AG-UI, SSE, semantic Trace, and durable Messaging delivery to Deep Agents.
 Models, tools, backends, checkpoints, stores, and Sandbox resources remain host-owned.
 
 ```text
 packages/
-├── tinkerfin/                 Deep Agents runtime, AG-UI, SSE, coordination
+├── tinkerfin-contracts/       protocol-neutral run and observation contracts
+├── tinkerfin-native-stream/   current Deep Agents/LangGraph stream contract
+├── tinkerfin/                 Deep Agents runtime, optional AG-UI, SSE, coordination
 ├── tinkerfin-agui-adapter/    LangGraph v2 StreamPart to AG-UI conversion
+├── tinkerfin-tracing/         semantic Ledger, queries, and projections
+├── tinkerfin-langgraph-mysql/ asyncmy-only LangGraph MySQL Store
 ├── tinkerfin-messaging/       durable delivery, replay, cancellation, Redis
 └── tinkerfin-sandbox/         OpenSandbox backend and lifecycle management
 apps/studio/
@@ -27,11 +31,21 @@ Python 3.11 or newer is required.
 pip install tinkerfin
 ```
 
+The Quick Start uses LangChain's OpenAI model adapter:
+
+```bash
+pip install langchain-openai
+```
+
 Optional integrations:
 
 ```bash
+pip install "tinkerfin[agui]"
 pip install "tinkerfin[redis]"
-pip install "tinkerfin-messaging[redis]"
+pip install tinkerfin-tracing
+pip install "tinkerfin-tracing[mysql]"
+pip install tinkerfin-langgraph-mysql
+pip install "tinkerfin-messaging[agui,redis]"
 pip install "tinkerfin-sandbox[sqlite]"
 ```
 
@@ -40,7 +54,7 @@ pip install "tinkerfin-sandbox[sqlite]"
 ```python
 import asyncio
 
-from tinkerfin import Identity, TinkerFin
+from tinkerfin import RunIdentity, TinkerFin
 
 tinkerfin = TinkerFin()
 agent = tinkerfin.create_deep_agent(
@@ -50,41 +64,54 @@ agent = tinkerfin.create_deep_agent(
 
 
 async def main() -> None:
-    identity = Identity(threadId="thread-1", runId="run-1")
-    runtime = agent.new_agui(identity=identity)
-    events = runtime.astream(
+    identity = RunIdentity(threadId="thread-1", runId="run-1")
+    runtime = agent.new(identity=identity)
+    parts = runtime.astream(
         {"messages": [{"role": "user", "content": "Hello"}]},
     )
-    async for event in events:
-        print(event)
+    async for part in parts:
+        print(part)
 
 
 asyncio.run(main())
 ```
 
 Use `agent.new()` for native LangGraph objects. Both Runtime types expose the installed
-`CompiledStateGraph.astream(...)` parameter shape.
+`CompiledStateGraph.astream(...)` parameter shape with a canonical complete Native
+profile.
 
 ## Core concepts
 
 - `create_deep_agent(...)` records the installed Deep Agents build call;
   `new()` / `new_agui()` creates a fresh Graph and a single-use Runtime.
+- Native Runtime, Plan Mode, Observation, and SSE are included by default;
+  `new_agui()` requires `tinkerfin[agui]`.
 - `TinkerFin(state_schema=...)` contributes application state to every Deep Agent
   Definition created by that factory; Definition state and middleware state are merged
   without weakening reducers or requiredness.
 - `.plan(enabled=True)` adds one stable parent workflow without changing the installed
   `create_deep_agent(...)` signature. Choose `mode="default"` or `mode="plan"` on each
   `new()` / `new_agui()` request; selecting Plan requires a concrete checkpointer.
-- AG-UI uses v2 `messages`, `tasks`, and `values` with `subgraphs=True`; invalid stream
-  options fail before iteration or lifecycle events.
+- One explicit Runtime Profile owns graph construction, required stream options,
+  Native validation, observations, and canonical replay; conflicting or partial
+  upstream options fail before iteration or lifecycle events.
 - Runtime and Adapter enforce event ordering, subagent provenance, interrupt/resume,
   reasoning privacy, cancellation, backpressure, and cleanup.
 - Object streams provide direct SSE and can be passed unencoded to Messaging for
   persistence, replay, attachment, and remote cancellation.
-- AG-UI Runtime uses one `Identity` for public events, Graph execution, checkpoints, and
+- AG-UI Runtime uses one `RunIdentity` for public events, Graph execution, checkpoints, and
   durable delivery; optional `parent_run_id` creates a real checkpoint branch.
-- Resume uses `AgUiResumeBinding.from_agui(...)`; the Runtime owns native commands, Tool
-  correlation, cancellation, and durable checkpoint evidence.
+- Resume accepts an `AgUiResumeRequest`; `DeepAgentDefinition.prepare_agui_resume()`
+  reads the canonical checkpoint and produces the private binding. Runtime owns native
+  commands, Tool correlation, cancellation, and durable checkpoint evidence.
+- `.observe(Tracer())` records fail-closed Runtime lifecycle and validated Native semantic
+  facts without recording AG-UI, Messaging, SSE, or Redis delivery state.
+- The distribution provides the explicit `deepagents-v2` Runtime Profile. It does not
+  provide a Deep Agents v3 Profile or TodoGroups projection/UI; another real Profile
+  must emit the same canonical contract without adding downstream version branches.
+- Archive/S3/Blob, payload encryption/KMS, and OpenTelemetry exporters are not provided.
+  Storage integrations compose `TraceStore`, canonical codec, `RuntimeObserver`, or
+  Store/Messaging Backend decorators rather than introducing placeholder APIs.
 
 ## Documentation
 
@@ -92,13 +119,20 @@ Use `agent.new()` for native LangGraph objects. Both Runtime types expose the in
 - [Runtime](docs/en/runtime/index.md)
 - [AG-UI](docs/en/agui/index.md)
 - [Messaging](docs/en/messaging/index.md)
+- [Tracing](docs/en/tracing/index.md)
 - [Sandbox](docs/en/sandbox/index.md)
 - [Repository testing](docs/en/development/testing.md)
 - [Core package](packages/tinkerfin/README.md)
+- [Shared contracts](packages/tinkerfin-contracts/README.md)
 - [AG-UI adapter](packages/tinkerfin-agui-adapter/README.md)
+- [Tracing package](packages/tinkerfin-tracing/README.md)
+- [LangGraph MySQL Store](packages/tinkerfin-langgraph-mysql/README.md)
 - [Studio server](apps/studio/server/README.md)
 - [Studio web client](apps/studio/web/README.md)
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE).
+Apache License 2.0 is the repository default; see [LICENSE](LICENSE).
+`tinkerfin-langgraph-mysql`, derived from the upstream LangGraph MySQL Store, is
+distributed under its packaged [MIT LICENSE](packages/tinkerfin-langgraph-mysql/LICENSE)
+and [NOTICE](packages/tinkerfin-langgraph-mysql/NOTICE).

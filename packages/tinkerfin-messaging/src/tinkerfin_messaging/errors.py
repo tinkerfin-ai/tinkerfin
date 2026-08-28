@@ -7,7 +7,7 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import TypeAlias
 
-from tinkerfin_agui_adapter import Identity
+from tinkerfin_contracts import RunIdentity
 
 _ContextValue: TypeAlias = str | int | float | bool | None
 
@@ -31,6 +31,7 @@ class MessagingErrorCode(StrEnum):
     RECOVERY_UNSUPPORTED = "messaging.recovery_unsupported"
     SSE_RENDERING_UNSUPPORTED = "messaging.sse_rendering_unsupported"
     BACKEND_OWNERSHIP_LOST = "messaging.backend_ownership_lost"
+    STREAM_EXPIRED = "messaging.stream_expired"
     STREAM_DELETED = "messaging.stream_deleted"
     STREAM_DELETE_CONFLICT = "messaging.stream_delete_conflict"
     BACKEND_UNAVAILABLE = "messaging.backend_unavailable"
@@ -39,7 +40,7 @@ class MessagingErrorCode(StrEnum):
     UNEXPECTED_BACKEND_FAILURE = "messaging.unexpected_backend_failure"
 
 
-def _identity_context(identity: Identity) -> dict[str, _ContextValue]:
+def _identity_context(identity: RunIdentity) -> dict[str, _ContextValue]:
     return {
         "thread_id": identity.thread_id,
         "run_id": identity.run_id,
@@ -173,7 +174,7 @@ class MessageIdConflict(MessagingError):
 
     code = MessagingErrorCode.MESSAGE_ID_CONFLICT
 
-    def __init__(self, *, identity: Identity, message_id: str) -> None:
+    def __init__(self, *, identity: RunIdentity, message_id: str) -> None:
         """Initialize a conflicting idempotency-key failure."""
 
         self.identity = identity
@@ -209,8 +210,8 @@ class RunAlreadyActive(MessagingError):
     def __init__(
         self,
         *,
-        active_identity: Identity,
-        requested_identity: Identity,
+        active_identity: RunIdentity,
+        requested_identity: RunIdentity,
     ) -> None:
         """Initialize an ownership conflict with active and requested runs."""
 
@@ -232,7 +233,7 @@ class RunNotFound(MessagingError):
 
     code = MessagingErrorCode.RUN_NOT_FOUND
 
-    def __init__(self, *, identity: Identity) -> None:
+    def __init__(self, *, identity: RunIdentity) -> None:
         """Initialize a missing-run failure for one durable identity."""
 
         self.identity = identity
@@ -247,7 +248,7 @@ class RunProducerFailed(MessagingError):
 
     code = MessagingErrorCode.RUN_PRODUCER_FAILED
 
-    def __init__(self, *, identity: Identity, cause: BaseException) -> None:
+    def __init__(self, *, identity: RunIdentity, cause: BaseException) -> None:
         """Initialize a producer failure while preserving its original cause."""
 
         self.identity = identity
@@ -263,7 +264,7 @@ class CancellationUnsupported(MessagingError):
 
     code = MessagingErrorCode.CANCELLATION_UNSUPPORTED
 
-    def __init__(self, *, identity: Identity) -> None:
+    def __init__(self, *, identity: RunIdentity) -> None:
         """Initialize an unsupported cancellation failure for one run."""
 
         self.identity = identity
@@ -300,7 +301,7 @@ class StreamDeleted(MessagingError):
         self,
         *,
         channel: str,
-        identity: Identity,
+        identity: RunIdentity,
         generation: int | None,
     ) -> None:
         """Initialize a stale-generation failure for one deleted stream."""
@@ -324,6 +325,40 @@ class StreamDeleted(MessagingError):
         )
 
 
+class StreamExpired(MessagingError):
+    """A terminal transport generation is outside its replay window."""
+
+    code = MessagingErrorCode.STREAM_EXPIRED
+
+    def __init__(
+        self,
+        *,
+        channel: str,
+        identity: RunIdentity,
+        generation: int,
+    ) -> None:
+        """Initialize an expired-generation failure for Trace rehydration.
+
+        Args:
+            channel: Durable codec channel that owned the transport log.
+            identity: Requested semantic Run identity.
+            generation: Expired thread-stream generation.
+        """
+
+        self.channel = channel
+        self.identity = identity
+        self.generation = generation
+        super().__init__(
+            f"Thread {identity.thread_id!r} in channel {channel!r} generation "
+            f"{generation} is outside the replay retention window",
+            context={
+                **_identity_context(identity),
+                "channel": channel,
+                "generation": generation,
+            },
+        )
+
+
 class StreamDeleteConflict(MessagingError):
     """A stream cannot be deleted while one producer lease is active."""
 
@@ -333,8 +368,8 @@ class StreamDeleteConflict(MessagingError):
         self,
         *,
         channel: str,
-        identity: Identity,
-        active_identity: Identity,
+        identity: RunIdentity,
+        active_identity: RunIdentity,
     ) -> None:
         """Initialize a deletion conflict with the active producer identity."""
 
@@ -406,5 +441,6 @@ __all__ = [
     "SseRenderingUnsupported",
     "StreamDeleteConflict",
     "StreamDeleted",
+    "StreamExpired",
     "UnexpectedMessagingBackendError",
 ]

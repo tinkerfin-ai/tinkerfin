@@ -9,7 +9,7 @@ from typing import ClassVar
 
 import pytest
 
-from tinkerfin import Identity
+from tinkerfin import RunIdentity
 from tinkerfin_messaging import (
     BackendOwnershipLost,
     BackendRunHandle,
@@ -24,8 +24,8 @@ from tinkerfin_messaging import (
 )
 
 
-def _identity() -> Identity:
-    return Identity(threadId="conversation-1", runId="run-1")
+def _identity() -> RunIdentity:
+    return RunIdentity(threadId="conversation-1", runId="run-1")
 
 
 class _TextCodec:
@@ -192,7 +192,7 @@ async def test_ownership_loss_dominates_a_simultaneous_source_open_failure(
     barrier = asyncio.Barrier(2)
     backend = _ConcurrentRenewalFailureBackend(barrier)
 
-    with caplog.at_level(logging.ERROR, logger="tinkerfin_messaging.messaging"):
+    with caplog.at_level(logging.ERROR, logger="tinkerfin.messaging"):
         async with Messaging(backend=backend) as messaging:
             channel = messaging.channel(name="events", codec=_TextCodec())
 
@@ -214,9 +214,9 @@ async def test_ownership_loss_dominates_a_simultaneous_source_open_failure(
         if record.getMessage() == "Messaging producer lease renewal failed"
     )
     fields = vars(record)
-    assert fields["renewal_phase"] == "source_open"
-    assert fields["renewal_outcome"] == "backend_exception"
-    assert fields["error_type"] == ("tinkerfin_messaging.errors.BackendOwnershipLost")
+    assert fields["tinkerfin_renewal_phase"] == "source_open"
+    assert fields["tinkerfin_renewal_outcome"] == "backend_exception"
+    assert fields["tinkerfin_error_type"] == "BackendOwnershipLost"
 
 
 def test_recoverable_checkpoint_must_match_the_stable_message_id() -> None:

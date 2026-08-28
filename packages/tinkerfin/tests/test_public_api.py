@@ -7,14 +7,22 @@ import inspect
 import tinkerfin
 from tinkerfin import (
     AgUiEventStream,
-    AgUiNativeStreamConfigurationError,
     AgUiResumeBindingError,
     AgUiSettlementTimeoutError,
-    Identity,
+    DeepAgentsFactoryPreparation,
+    DeepAgentsRuntimeProfile,
+    DeepAgentsV2RuntimeProfile,
+    DeepAgentsV2StreamDriver,
+    DeepSeekReasoningExtractor,
     InMemoryRunCoordinator,
     NativeGraphRunStream,
+    NativeStreamDriver,
+    NativeStreamFrame,
     NativeStreamPart,
+    ReasoningExtractor,
     RunCoordinator,
+    RunIdentity,
+    RunObservationError,
     SseBody,
     SsePayload,
     TinkerFin,
@@ -25,23 +33,33 @@ from tinkerfin import (
 def test_top_level_exposes_the_stateless_runtime_contract() -> None:
     expected = {
         "AgUiSettlementTimeoutError",
-        "AgUiNativeStreamConfigurationError",
         "AgUiEventStream",
         "AgUiResumeBinding",
         "AgUiResumeBindingError",
         "AgUiResumeCheckpoint",
         "AgUiResumeCheckpointObserver",
+        "AgUiResumeInitializationFailureObserver",
+        "AgUiResumeRequest",
         "AgentMode",
         "DeepAgentAgUiRuntime",
         "DeepAgentAgUiResumeRuntime",
         "DeepAgentDefinition",
         "DeepAgentRuntime",
+        "DeepAgentsFactoryPreparation",
+        "DeepAgentsRuntimeProfile",
+        "DeepAgentsV2RuntimeProfile",
+        "DeepAgentsV2StreamDriver",
+        "DeepSeekReasoningExtractor",
         "EventObserver",
-        "Identity",
+        "RunIdentity",
+        "RunObservationError",
         "InMemoryRunCoordinator",
         "NativeGraphRunStream",
+        "NativeStreamDriver",
+        "NativeStreamFrame",
         "NativeStreamPart",
         "PartObserver",
+        "ReasoningExtractor",
         "RedisLeaseError",
         "RedisLeaseLifecycleError",
         "RedisLeaseProtocolError",
@@ -71,14 +89,22 @@ def test_top_level_exposes_the_stateless_runtime_contract() -> None:
     assert all(
         value is not None
         for value in (
-            AgUiNativeStreamConfigurationError,
             AgUiResumeBindingError,
             AgUiSettlementTimeoutError,
             AgUiEventStream,
-            Identity,
+            DeepAgentsFactoryPreparation,
+            DeepAgentsRuntimeProfile,
+            DeepAgentsV2RuntimeProfile,
+            DeepAgentsV2StreamDriver,
+            DeepSeekReasoningExtractor,
+            RunIdentity,
+            RunObservationError,
             InMemoryRunCoordinator,
             NativeGraphRunStream,
+            NativeStreamDriver,
+            NativeStreamFrame,
             NativeStreamPart,
+            ReasoningExtractor,
             RunCoordinator,
             SseBody,
             SsePayload,
@@ -92,7 +118,11 @@ def test_top_level_exposes_the_stateless_runtime_contract() -> None:
 def test_factory_has_no_application_resource_lifecycle() -> None:
     constructor = inspect.signature(TinkerFin).parameters
 
-    assert tuple(constructor) == ("run_coordinator", "state_schema")
+    assert tuple(constructor) == (
+        "run_coordinator",
+        "state_schema",
+        "runtime_profile",
+    )
     assert not hasattr(TinkerFin, "__aenter__")
     assert not hasattr(TinkerFin, "__aexit__")
 

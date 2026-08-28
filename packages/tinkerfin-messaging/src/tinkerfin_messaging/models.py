@@ -8,7 +8,7 @@ from typing import Generic, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from tinkerfin_agui_adapter import Identity
+from tinkerfin_contracts import RunIdentity
 
 from ._identity import required_identifier, required_identity
 
@@ -25,7 +25,7 @@ class MessageEnvelope(BaseModel):
         max_length=1024,
         description="Logical channel whose codec interprets the payload.",
     )
-    identity: Identity = Field(
+    identity: RunIdentity = Field(
         description="Shared thread and semantic run identity for this payload."
     )
     seq: int = Field(
@@ -56,7 +56,7 @@ class MessageEnvelope(BaseModel):
 
     @field_validator("identity")
     @classmethod
-    def _identity_is_bounded(cls, value: Identity) -> Identity:
+    def _identity_is_bounded(cls, value: RunIdentity) -> RunIdentity:
         return required_identity(value)
 
     @field_validator("created_at")

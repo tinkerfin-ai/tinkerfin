@@ -124,10 +124,10 @@ class ConversationErrorCode(ErrorCode):
         409,
         "当前运行不支持取消",
     )
-    EVENT_PROJECTION_UNAVAILABLE = _ErrorCodeValue(
+    TRACE_UNAVAILABLE = _ErrorCodeValue(
         1_001_004_023,
         503,
-        "会话事件投影暂不可用",
+        "会话 Trace 暂不可用",
     )
     RUN_CANCEL_FAILED = _ErrorCodeValue(1_001_004_025, 500, "取消会话运行失败")
     RESUME_ALREADY_CLAIMED = _ErrorCodeValue(
@@ -136,11 +136,6 @@ class ConversationErrorCode(ErrorCode):
         "该审批已被另一次恢复运行认领",
     )
     MESSAGING_FAILURE = _ErrorCodeValue(1_001_004_027, 500, "会话消息处理失败")
-    HISTORY_SCHEMA_MISMATCH = _ErrorCodeValue(
-        1_001_004_028,
-        500,
-        "会话历史数据不符合当前结构",
-    )
     MESSAGING_QUOTA_EXCEEDED = _ErrorCodeValue(
         1_001_004_029,
         413,
@@ -151,6 +146,11 @@ class ConversationErrorCode(ErrorCode):
         1_001_004_031,
         413,
         "用户消息超过当前容量限制",
+    )
+    MESSAGING_STREAM_EXPIRED = _ErrorCodeValue(
+        1_001_004_032,
+        410,
+        "实时重播窗口已过期，请重新加载会话",
     )
 
 
@@ -200,7 +200,7 @@ async def application_exception_handler(
 
 async def request_validation_handler(
     request: Request,
-    error: RequestValidationError,
+    _error: RequestValidationError,
 ) -> JSONResponse:
     """把请求校验失败投影为统一错误"""
 

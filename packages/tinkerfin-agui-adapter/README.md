@@ -28,7 +28,7 @@ import asyncio
 
 from langchain_core.messages import AIMessageChunk
 
-from tinkerfin_agui_adapter import Identity, astream_events, encode_sse
+from tinkerfin_agui_adapter import RunIdentity, astream_events, encode_sse
 
 
 async def parts():
@@ -44,7 +44,7 @@ async def parts():
 
 
 async def main():
-    identity = Identity(threadId="thread-1", runId="run-1")
+    identity = RunIdentity(threadId="thread-1", runId="run-1")
     async for event in astream_events(
         parts(),
         identity=identity,

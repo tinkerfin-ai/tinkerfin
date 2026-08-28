@@ -37,8 +37,8 @@ async def get_auth_service(request: Request, session: SessionDep) -> AuthService
     return AuthService(
         UserRepository(session),
         RedisTokenRepository(
-            resources.redis,
-            key_prefix=resources.settings.redis.auth_key_prefix,
+            resources.redis_control,
+            key_prefix=resources.settings.redis_control.auth_key_prefix,
         ),
         token_expire_seconds=resources.settings.auth_token_expire_seconds,
     )
@@ -117,7 +117,7 @@ async def get_conversation_history_service(
     return ConversationHistoryService(
         ConversationRepository(session),
         user_id=user.user_id,
-        projector=get_resources(request.app).conversation_projector,
+        tracer=get_resources(request.app).tracer,
     )
 
 

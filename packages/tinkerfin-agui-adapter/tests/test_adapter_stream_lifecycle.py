@@ -10,9 +10,8 @@ from langchain_core.messages import AIMessageChunk, ChatMessage, ToolMessage
 from pydantic import ValidationError
 
 from tinkerfin_agui_adapter import (
-    AgUiStreamContractError,
     DeepAgentAgUiAdapter,
-    Identity,
+    RunIdentity,
     astream_events,
 )
 from tinkerfin_agui_adapter.ids import ScopedIdCodec
@@ -22,8 +21,8 @@ def _identity(
     *,
     thread_id: str = "thread-1",
     run_id: str = "run-1",
-) -> Identity:
-    return Identity(threadId=thread_id, runId=run_id)
+) -> RunIdentity:
+    return RunIdentity(threadId=thread_id, runId=run_id)
 
 
 class _GateParts:
@@ -215,7 +214,7 @@ async def test_non_identity_fails_before_pulling_parts() -> None:
         yield _text_part()
 
     invalid_identity: Any = object()
-    with pytest.raises(TypeError, match="identity must be an Identity"):
+    with pytest.raises(TypeError, match="identity must be a RunIdentity"):
         astream_events(
             parts(),
             identity=invalid_identity,
@@ -225,18 +224,18 @@ async def test_non_identity_fails_before_pulling_parts() -> None:
 
 
 def test_identity_is_strict_frozen_and_serializes_protocol_aliases() -> None:
-    identity = Identity(threadId="thread-1", runId="run-1")
+    identity = RunIdentity(threadId="thread-1", runId="run-1")
 
     assert identity.model_dump(by_alias=True) == {
         "threadId": "thread-1",
         "runId": "run-1",
     }
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
-        Identity.model_validate(
+        RunIdentity.model_validate(
             {"threadId": "thread-1", "runId": "run-1", "parentRunId": "parent"}
         )
     with pytest.raises(ValidationError, match="surrounding whitespace"):
-        Identity(threadId=" thread-1", runId="run-1")
+        RunIdentity(threadId=" thread-1", runId="run-1")
     with pytest.raises(ValidationError, match="frozen"):
         setattr(identity, "thread_id", "thread-2")
 
@@ -679,12 +678,12 @@ async def test_upstream_close_failure_becomes_error_before_any_success_terminal(
 
 
 @pytest.mark.asyncio
-async def test_conversion_and_secondary_close_failures_are_logged(
+async def test_conversion_and_secondary_close_failures_emit_no_package_log(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     parts = _FailingPartAndClose()
 
-    with caplog.at_level("ERROR", logger="tinkerfin_agui_adapter.stream"):
+    with caplog.at_level("DEBUG", logger="tinkerfin.agui"):
         events = [
             event
             async for event in astream_events(
@@ -694,23 +693,7 @@ async def test_conversion_and_secondary_close_failures_are_logged(
         ]
 
     assert [event.type.value for event in events] == ["RUN_STARTED", "RUN_ERROR"]
-    assert len(caplog.records) == 2
-    records = {record.getMessage(): record for record in caplog.records}
-    assert set(records) == {
-        "Deep Agents to AG-UI stream conversion failed",
-        "Closing the upstream after AG-UI conversion failure also failed",
-    }
-    conversion_record = records["Deep Agents to AG-UI stream conversion failed"]
-    close_record = records[
-        "Closing the upstream after AG-UI conversion failure also failed"
-    ]
-    assert conversion_record.exc_info is not None
-    assert conversion_record.exc_info[0] is AgUiStreamContractError
-    conversion_error = conversion_record.exc_info[1]
-    assert isinstance(conversion_error, AgUiStreamContractError)
-    assert isinstance(conversion_error.cause, ValidationError)
-    assert close_record.exc_info is not None
-    assert close_record.exc_info[0] is RuntimeError
+    assert caplog.records == []
 
 
 @pytest.mark.asyncio

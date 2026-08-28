@@ -14,7 +14,7 @@ from ag_ui.core import (
 )
 from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 
-from tinkerfin_agui_adapter import AgUiStreamContractError, Identity
+from tinkerfin_agui_adapter import AgUiStreamContractError, RunIdentity
 from tinkerfin_agui_adapter.adapter import DeepAgentAgUiAdapter
 from tinkerfin_agui_adapter.reasoning import normalize_operational_data
 from tinkerfin_agui_adapter.sse import encode_sse
@@ -25,7 +25,7 @@ def _adapter(
     private_state_keys: frozenset[str] = frozenset(),
 ) -> DeepAgentAgUiAdapter:
     return DeepAgentAgUiAdapter(
-        identity=Identity(threadId="thread-json", runId="run-json"),
+        identity=RunIdentity(threadId="thread-json", runId="run-json"),
         private_state_keys=private_state_keys,
     )
 

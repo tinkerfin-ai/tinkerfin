@@ -44,7 +44,7 @@ status = await channel.get_run_status(identity=identity)
 | `follow()` | selected run | Replay, then wait for its terminal state |
 | `get_run_status()` | selected run | Current durable run status without ownership |
 
-Thread-level methods use `identity.threadId`, but still accept the complete Identity so extensions never flatten thread and run into separate parameters.
+Thread-level methods use `identity.threadId`, but still accept the complete RunIdentity so extensions never flatten thread and run into separate parameters.
 
 `get_run_status()` can atomically archive an expired producer lease as `owner_lost`.
 It raises `RunNotFound` when no durable record exists and never creates or recovers a

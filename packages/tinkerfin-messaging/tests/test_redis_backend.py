@@ -16,7 +16,7 @@ from redis.asyncio import Redis
 from redis.exceptions import RedisError
 from redis.typing import KeyT, StreamIdT
 
-from tinkerfin import Identity
+from tinkerfin import RunIdentity
 from tinkerfin_messaging import (
     BackendOwnershipLost,
     BackendRunHandle,
@@ -26,6 +26,7 @@ from tinkerfin_messaging import (
     MessagingBackendProtocolError,
     MessagingLimits,
     MessagingQuotaExceeded,
+    MessagingRetentionPolicy,
     PreparedRun,
     RecoverableMessage,
     RecoveryCheckpoint,
@@ -33,6 +34,8 @@ from tinkerfin_messaging import (
     RunAlreadyActive,
     RunProducerFailed,
     StreamDeleted,
+    StreamExpired,
+    _redis_journal,
     _redis_scripts,
 )
 
@@ -42,15 +45,17 @@ _RedisT = TypeVar("_RedisT", bound=Redis)
 
 _REDIS_SCRIPT_DIGESTS = {
     "_APPEND_SCRIPT": "34b6443e16fd55fe6cb0cfcc11ab893f4ac18c8cccf34be80e26651602b60525",
-    "_BEGIN_DELETE_SCRIPT": "3a22ee94dd7437c196a2bbd5d7ab30f597144d0dd39075a25fdc86470fc9e6e5",
+    "_BEGIN_DELETE_SCRIPT": "6b52a1e68a9183d72ca6902d042ab80164b1f148a8aa628e8b447dca5364cf32",
+    "_BEGIN_EXPIRATION_SCRIPT": "bd522a5be66f40c1e2a049019071a322a817a5890d6253360659d99dd1735a11",
     "_BEGIN_SETTLEMENT_SCRIPT": "554621573ed7a50c3b5ea0be5bb7166f051d2fdba213db0493423a84f5423414",
     "_CANCEL_SCRIPT": "c4d82de1405dffc62a13ec7efbc11790e5bcab99c746b02fb8cb397ad59fce09",
-    "_DELETE_BATCH_SCRIPT": "e0a233eb4d17f70abb3ef4f2afda18007e267c065d7b62dc413ea0c80f37cc82",
-    "_FINALIZE_DELETE_SCRIPT": "60dba88f869c6584a5c9d9eb036c3aa9336010238a892da2e2fca6ff8008782c",
-    "_FINISH_SCRIPT": "7e020d232d28d30e75551c5661e30ad3b5abc04c6e169a7028abd5f3484b687e",
-    "_PREPARE_SCRIPT": "7d0feb23b17a864afc5828dc95be5314193fb001425af188286a265d63f5d69e",
+    "_DELETE_BATCH_SCRIPT": "c018e231de54762346bc095581f23d9bca9107667273102dae4b7d51e20bbf10",
+    "_FINALIZE_DELETE_SCRIPT": "c6623e079d25a0d250977b2fc44fbd423f80a7eee440f3ab88f4723df2e207cf",
+    "_FINISH_SCRIPT": "1c61107eaa22defa2480c0966975a15f4e6a89dbca3b7f714ae596e2d6e0fece",
+    "_PREPARE_SCRIPT": "737da97459a473c59e887419e746c31d3e9180f5764c049e9cf512e99bccd62a",
+    "_READ_CONTROL_SCRIPT": "0cda87dabd7a112208ade6abe7f2ed806f9ac216b6ed0913c5fc194223a0703c",
     "_RENEW_SCRIPT": "90a2c24ed5f4e9c64f84a41fa6b4bc69e03206c5df48c5f75ec4b66be6c62113",
-    "_RUN_SNAPSHOT_SCRIPT": "974988f01916e9e05931ae3b5b180e4cd8988b2d72d34d2517ecc96a25f64a20",
+    "_RUN_SNAPSHOT_SCRIPT": "2f1bafc8936ea8c23feca11b2a8f7d9d970b8854342e84f379388d1cc4935054",
 }
 
 
@@ -61,12 +66,38 @@ def test_redis_lua_scripts_remain_byte_stable() -> None:
         assert hashlib.sha256(script.encode()).hexdigest() == expected
 
 
+def test_redis_message_signature_uses_the_current_unversioned_domain() -> None:
+    identity = RunIdentity(threadId="conversation-1", runId="run-1")
+
+    assert (
+        _redis_journal._message_signature(
+            identity=identity,
+            codec="text",
+            payload=b"payload",
+            checkpoint=None,
+        )
+        == "c42f38656e51cdde504a1f0bf4b07b7ce060380dfcffe3a9e20b1131fb9e0866"
+    )
+    assert (
+        _redis_journal._message_signature(
+            identity=identity,
+            codec="text",
+            payload=b"payload",
+            checkpoint=RecoveryCheckpoint(
+                position=b"42",
+                last_message_id="message-1",
+            ),
+        )
+        == "9a6fa1ec2cfccb0bdeaa1a14bed2e49746169b7391148dd042368835b4f58b34"
+    )
+
+
 def _identity(
     *,
     thread_id: str = "conversation-1",
     run_id: str = "run-1",
-) -> Identity:
-    return Identity(threadId=thread_id, runId=run_id)
+) -> RunIdentity:
+    return RunIdentity(threadId=thread_id, runId=run_id)
 
 
 def _redis_client(
@@ -689,6 +720,218 @@ async def test_real_redis_replays_commits_across_backend_instances(
     assert replay[0].seq == 1
 
 
+async def test_real_redis_retention_expires_data_and_preserves_generation_tombstone(
+    redis_url: str,
+) -> None:
+    first_client = _redis_client(Redis, redis_url)
+    second_client = _redis_client(Redis, redis_url)
+    prefix = f"tfmsg:retention:{uuid4().hex}"
+    policy = MessagingRetentionPolicy.expire_after(0.12)
+    first_backend = RedisBackend(
+        first_client,
+        key_prefix=prefix,
+        lease_ttl=1,
+        poll_interval=0.01,
+        retention_policy=policy,
+    )
+    second_backend = RedisBackend(
+        second_client,
+        key_prefix=prefix,
+        lease_ttl=1,
+        poll_interval=0.01,
+        retention_policy=policy,
+    )
+    try:
+        first = await first_backend.prepare(
+            channel="events",
+            identity=_identity(run_id="retained-run"),
+            codec="test.bytes.v1",
+            after=0,
+            cancellable=False,
+            recoverable=False,
+        )
+        await first_backend.append(
+            first.handle,
+            message_id="retained-message",
+            codec="test.bytes.v1",
+            payload=b"retained",
+        )
+        await first_backend.finish(first.handle, status="completed")
+        await asyncio.sleep(0.2)
+
+        with pytest.raises(StreamExpired) as expired:
+            await second_backend.read(
+                channel="events",
+                identity=_identity(run_id="retained-run"),
+            )
+        assert expired.value.generation == 1
+
+        channel_scope = hashlib.sha256(b"events").hexdigest()
+        stream_scope = hashlib.sha256(b"conversation-1").hexdigest()
+        generation_base = (
+            f"{prefix}:{{{channel_scope}}}:stream:{stream_scope}:generation:1"
+        )
+        remaining = await second_client.keys(f"{generation_base}:*")
+        assert remaining == [f"{generation_base}:tombstone".encode()]
+        assert await second_client.get(f"{generation_base}:tombstone") == b"expired"
+
+        with pytest.raises(StreamExpired):
+            await second_backend.prepare(
+                channel="events",
+                identity=_identity(run_id="replacement"),
+                codec="test.bytes.v1",
+                after=1,
+                cancellable=False,
+                recoverable=False,
+            )
+        replacement = await second_backend.prepare(
+            channel="events",
+            identity=_identity(run_id="replacement"),
+            codec="test.bytes.v1",
+            after=0,
+            cancellable=False,
+            recoverable=False,
+        )
+        assert replacement.handle.generation == 2
+        with pytest.raises(StreamExpired):
+            await anext(first_backend.follow(first.handle, after=0))
+        await second_backend.finish(replacement.handle, status="completed")
+    finally:
+        await _delete_prefix(second_client, prefix)
+        await asyncio.gather(first_client.aclose(), second_client.aclose())
+
+
+async def test_real_redis_new_run_clears_prior_terminal_deadline(
+    redis_url: str,
+) -> None:
+    client = _redis_client(Redis, redis_url)
+    prefix = f"tfmsg:retention-clear:{uuid4().hex}"
+    backend = RedisBackend(
+        client,
+        key_prefix=prefix,
+        retention_policy=MessagingRetentionPolicy.expire_after(0.3),
+    )
+    try:
+        first = await backend.prepare(
+            channel="events",
+            identity=_identity(run_id="first"),
+            codec="test.bytes.v1",
+            after=0,
+            cancellable=False,
+            recoverable=False,
+        )
+        await backend.finish(first.handle, status="completed")
+        await asyncio.sleep(0.1)
+        second = await backend.prepare(
+            channel="events",
+            identity=_identity(run_id="second"),
+            codec="test.bytes.v1",
+            after=None,
+            cancellable=False,
+            recoverable=False,
+        )
+        await asyncio.sleep(0.25)
+
+        assert (
+            await backend.get_run_status(
+                channel="events",
+                identity=_identity(run_id="second"),
+            )
+            == "running"
+        )
+        await backend.finish(second.handle, status="completed")
+    finally:
+        await _delete_prefix(client, prefix)
+        await client.aclose()
+
+
+async def test_real_redis_owner_loss_starts_terminal_retention(redis_url: str) -> None:
+    client = _redis_client(Redis, redis_url)
+    prefix = f"tfmsg:retention-owner-lost:{uuid4().hex}"
+    policy = MessagingRetentionPolicy.expire_after(0.1)
+    owner = RedisBackend(
+        client,
+        key_prefix=prefix,
+        lease_ttl=0.08,
+        poll_interval=0.01,
+        retention_policy=policy,
+    )
+    observer = RedisBackend(
+        client,
+        key_prefix=prefix,
+        lease_ttl=0.08,
+        poll_interval=0.01,
+        retention_policy=policy,
+    )
+    try:
+        await owner.prepare(
+            channel="events",
+            identity=_identity(run_id="owner-lost"),
+            codec="test.bytes.v1",
+            after=0,
+            cancellable=False,
+            recoverable=False,
+        )
+        await asyncio.sleep(0.12)
+        assert (
+            await observer.get_run_status(
+                channel="events",
+                identity=_identity(run_id="owner-lost"),
+            )
+            == "owner_lost"
+        )
+        await asyncio.sleep(0.15)
+
+        with pytest.raises(StreamExpired):
+            await observer.read(
+                channel="events",
+                identity=_identity(run_id="owner-lost"),
+            )
+    finally:
+        await _delete_prefix(client, prefix)
+        await client.aclose()
+
+
+async def test_real_redis_rejects_cross_worker_retention_mismatch(
+    redis_url: str,
+) -> None:
+    client = _redis_client(Redis, redis_url)
+    prefix = f"tfmsg:retention-mismatch:{uuid4().hex}"
+    enabled = RedisBackend(
+        client,
+        key_prefix=prefix,
+        retention_policy=MessagingRetentionPolicy.expire_after(30),
+    )
+    disabled = RedisBackend(
+        client,
+        key_prefix=prefix,
+        retention_policy=MessagingRetentionPolicy.disabled(),
+    )
+    try:
+        prepared = await enabled.prepare(
+            channel="events",
+            identity=_identity(run_id="enabled"),
+            codec="test.bytes.v1",
+            after=0,
+            cancellable=False,
+            recoverable=False,
+        )
+        await enabled.finish(prepared.handle, status="completed")
+
+        with pytest.raises(MessagingBackendProtocolError, match="invalid protocol"):
+            await disabled.prepare(
+                channel="events",
+                identity=_identity(run_id="disabled"),
+                codec="test.bytes.v1",
+                after=0,
+                cancellable=False,
+                recoverable=False,
+            )
+    finally:
+        await _delete_prefix(client, prefix)
+        await client.aclose()
+
+
 @pytest.mark.parametrize(
     ("message_id", "checkpoint"),
     [
@@ -1261,7 +1504,7 @@ async def test_real_redis_workers_bind_channel_codec_atomically(
     async def prepare(
         backend: RedisBackend,
         *,
-        identity: Identity,
+        identity: RunIdentity,
         codec: str,
     ):
         return await backend.prepare(
@@ -1351,6 +1594,7 @@ async def test_real_redis_persists_channel_and_stream_metadata_separately(
         b"codec": b"test.bytes.v1",
         b"max_checkpoint_bytes": b"1048576",
         b"max_message_payload_bytes": b"16777216",
+        b"retention_ms": b"0",
         b"max_thread_messages": b"100000",
         b"max_thread_payload_bytes": b"1073741824",
     }
@@ -1750,12 +1994,16 @@ async def test_real_redis_delete_unlinks_only_the_target_generation(
     )
     assert deleted_control[b"generation"] == b"1"
     assert deleted_control[b"state"] == b"deleted"
-    assert [
+    deleted_generation_keys = [
         key
         async for key in client.scan_iter(
             match=f"{deleted_base}:generation:*",
         )
-    ] == []
+    ]
+    assert deleted_generation_keys == [
+        f"{deleted_base}:generation:1:tombstone".encode()
+    ]
+    assert await client.get(deleted_generation_keys[0]) == b"deleted"
     assert await client.exists(f"{deleted_base}:delete-lease") == 0
     assert [
         key
@@ -1784,7 +2032,7 @@ async def test_real_redis_delete_unlinks_only_the_target_generation(
         async for key in client.scan_iter(
             match=f"{deleted_base}:generation:1:*",
         )
-    ] == []
+    ] == [f"{deleted_base}:generation:1:tombstone".encode()]
     assert [
         key
         async for key in client.scan_iter(
@@ -1826,10 +2074,11 @@ async def test_real_redis_delete_fences_an_expired_producer(
         with pytest.raises(StreamDeleted):
             await stale.renew(prepared.handle)
         remaining = [key async for key in client.scan_iter(match=f"{prefix}:*")]
-        assert len(remaining) == 3
+        assert len(remaining) == 4
         assert any(key.endswith(b":channel") for key in remaining)
         assert any(key.endswith(b":control") for key in remaining)
         assert any(key.endswith(b":signals") for key in remaining)
+        assert any(key.endswith(b":tombstone") for key in remaining)
     finally:
         await _delete_prefix(client, prefix)
 
@@ -1908,9 +2157,11 @@ async def test_real_redis_concurrent_deletes_converge_after_multiple_batches(
         == b"deleted"
     )
     generation_base = _redis_text(controls[0]).removesuffix(":control")
-    assert [
+    generation_keys = [
         key async for key in client.scan_iter(match=f"{generation_base}:generation:*")
-    ] == []
+    ]
+    assert generation_keys == [f"{generation_base}:generation:1:tombstone".encode()]
+    assert await client.get(generation_keys[0]) == b"deleted"
 
 
 async def test_real_redis_cancelled_delete_is_taken_over_after_lease_expiry(
@@ -2009,12 +2260,14 @@ async def test_real_redis_cancelled_delete_is_taken_over_after_lease_expiry(
             == b"deleted"
         )
         generation_base = _redis_text(controls[0]).removesuffix(":control")
-        assert [
+        generation_keys = [
             key
             async for key in takeover_client.scan_iter(
                 match=f"{generation_base}:generation:*",
             )
-        ] == []
+        ]
+        assert generation_keys == [f"{generation_base}:generation:1:tombstone".encode()]
+        assert await takeover_client.get(generation_keys[0]) == b"deleted"
     finally:
         await _delete_prefix(takeover_client, prefix)
         await asyncio.gather(gated_client.aclose(), takeover_client.aclose())
@@ -2075,12 +2328,14 @@ async def test_real_redis_delete_is_taken_over_after_worker_process_is_killed(
             == b"deleted"
         )
         generation_base = _redis_text(controls[0]).removesuffix(":control")
-        assert [
+        generation_keys = [
             key
             async for key in client.scan_iter(
                 match=f"{generation_base}:generation:*",
             )
-        ] == []
+        ]
+        assert generation_keys == [f"{generation_base}:generation:1:tombstone".encode()]
+        assert await client.get(generation_keys[0]) == b"deleted"
     finally:
         if process.is_alive():
             process.kill()

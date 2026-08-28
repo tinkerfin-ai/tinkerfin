@@ -1,0 +1,180 @@
+"""Public-safe capture and omission contracts."""
+
+from __future__ import annotations
+
+import pytest
+
+from tinkerfin_tracing import TraceCaptureRejected
+from tinkerfin_tracing.capture import CapturedValue, CapturePolicy, ToolCaptureRule
+
+
+def test_public_safe_capture_removes_only_reserved_reasoning_and_credentials() -> None:
+    captured = CapturePolicy.public_safe().capture(
+        {
+            "content": "visible",
+            "reasoning_content": "business value",
+            "additional_kwargs": {
+                "reasoning_content": "private provider trace",
+                "ordinary": "kept",
+            },
+            "nested": {"api_key": "secret", "value": "kept"},
+        },
+        max_bytes=4096,
+    )
+
+    assert captured.disposition == "inline"
+    assert captured.value == {
+        "content": "visible",
+        "reasoning_content": "business value",
+        "additional_kwargs": {"ordinary": "kept"},
+        "nested": {"api_key": {"$type": "redacted"}, "value": "kept"},
+    }
+
+
+def test_tool_content_is_metadata_only_without_an_allowlist() -> None:
+    captured = CapturePolicy.public_safe().capture_tool(
+        tool_name="search",
+        value={"query": "private", "limit": 5},
+        target="arguments",
+        max_bytes=4096,
+    )
+
+    assert captured.disposition == "omitted"
+    assert captured.value is None
+    assert captured.reason == "tool_content_not_allowlisted"
+    assert captured.safe_size_bytes > 0
+
+
+def test_tool_allowlist_preserves_only_selected_json_pointer_paths() -> None:
+    policy = CapturePolicy.public_safe(
+        tool_rules=(
+            ToolCaptureRule(
+                tool_name="search",
+                argument_paths=("/query", "/filters/0/name"),
+            ),
+        )
+    )
+
+    captured = policy.capture_tool(
+        tool_name="search",
+        value={
+            "query": "public",
+            "filters": [{"name": "docs", "token": "private"}],
+            "unselected": "private",
+        },
+        target="arguments",
+        max_bytes=4096,
+    )
+
+    assert captured.value == {
+        "/query": "public",
+        "/filters/0/name": "docs",
+    }
+
+
+def test_oversized_safe_value_is_explicitly_omitted() -> None:
+    captured = CapturePolicy.public_safe().capture("x" * 100, max_bytes=16)
+
+    assert captured.disposition == "omitted"
+    assert captured.reason == "payload_too_large"
+    assert captured.safe_size_bytes > 16
+
+
+def test_json_null_is_a_valid_inline_capture() -> None:
+    captured = CapturePolicy.public_safe().capture(None, max_bytes=4096)
+
+    assert captured.disposition == "inline"
+    assert captured.value is None
+    assert captured.reason is None
+
+    with pytest.raises(ValueError, match="canonical JSON bytes"):
+        CapturedValue(disposition="inline", safe_size_bytes=3, value=None)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_capture_rejects_non_finite_numbers_before_serialization(value: float) -> None:
+    with pytest.raises(TraceCaptureRejected, match="finite JSON"):
+        CapturePolicy.public_safe().capture(value, max_bytes=4096)
+
+
+def test_credential_redaction_covers_common_authorization_spellings() -> None:
+    captured = CapturePolicy.public_safe().capture(
+        {
+            "client-secret": "private",
+            "private_key": "private",
+            "proxyAuthorization": "private",
+            "session_token": "private",
+            "ordinary": "public",
+        },
+        max_bytes=4096,
+    )
+
+    assert captured.value == {
+        "client-secret": {"$type": "redacted"},
+        "private_key": {"$type": "redacted"},
+        "proxyAuthorization": {"$type": "redacted"},
+        "session_token": {"$type": "redacted"},
+        "ordinary": "public",
+    }
+
+
+def test_credential_redaction_covers_vendor_and_token_key_spellings() -> None:
+    captured = CapturePolicy.public_safe().capture(
+        {
+            "OPENAI_API_KEY": "sk-live-secret",
+            "auth_token": "bearer-secret",
+            "id_token": "jwt-secret",
+            "secret_key": "signing-secret",
+            "GITHUB_TOKEN": "github-secret",
+            "token": "generic-secret",
+            "ordinary_key": "public",
+        },
+        max_bytes=4096,
+    )
+
+    assert captured.value == {
+        "OPENAI_API_KEY": {"$type": "redacted"},
+        "auth_token": {"$type": "redacted"},
+        "id_token": {"$type": "redacted"},
+        "secret_key": {"$type": "redacted"},
+        "GITHUB_TOKEN": {"$type": "redacted"},
+        "token": {"$type": "redacted"},
+        "ordinary_key": "public",
+    }
+
+
+def test_tool_capture_rejects_noncanonical_json_pointer_escape() -> None:
+    with pytest.raises(ValueError, match="canonical JSON Pointers"):
+        ToolCaptureRule(tool_name="search", argument_paths=("/filters/~2name",))
+
+
+def test_tool_capture_does_not_treat_leading_zero_token_as_array_index() -> None:
+    policy = CapturePolicy.public_safe(
+        tool_rules=(ToolCaptureRule(tool_name="search", result_paths=("/items/01",)),)
+    )
+
+    captured = policy.capture_tool(
+        tool_name="search",
+        value={"items": ["zero", "one"]},
+        target="result",
+        max_bytes=4096,
+    )
+
+    assert captured.value == {}
+
+
+def test_structural_capture_retains_shape_without_source_values() -> None:
+    captured = CapturePolicy.public_safe().capture_structure(
+        {"messages": ["private content"], "password": "credential"},
+        max_bytes=4096,
+    )
+
+    assert captured.disposition == "inline"
+    assert captured.value == {
+        "$type": "structural_metadata",
+        "dataType": "object",
+        "sourceSafeSizeBytes": 64,
+        "topLevelKeys": ["messages", "password"],
+    }
+    assert "private content" not in captured.model_dump_json(by_alias=True)
+    assert "credential" not in captured.model_dump_json(by_alias=True)

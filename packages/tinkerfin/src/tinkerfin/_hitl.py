@@ -412,6 +412,16 @@ def prepare_hitl_factory_overrides(
     The permission predicates mirror the locked Deep Agents 0.7.5
     ``_build_interrupt_on_from_permissions`` contract. Contract tests compare exact,
     bulk, glob-pattern, precedence, and pathless behavior before dependency upgrades.
+
+    Args:
+        arguments: Build arguments already bound to the Profile factory signature.
+
+    Returns:
+        Immutable effective HITL inputs and unsupported external subagent names.
+
+    Raises:
+        TypeError: A permission, middleware, or subagent value has the wrong shape.
+        ValueError: Permission and interrupt policies conflict or are incomplete.
     """
 
     permissions = _as_permissions(arguments.get("permissions"))

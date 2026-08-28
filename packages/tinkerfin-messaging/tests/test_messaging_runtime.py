@@ -8,7 +8,7 @@ from typing import ClassVar
 
 import pytest
 
-from tinkerfin import Identity
+from tinkerfin import RunIdentity
 from tinkerfin_messaging import (
     DecodedMessage,
     DeferredMessageSource,
@@ -24,8 +24,8 @@ def _identity(
     *,
     thread_id: str = "conversation-1",
     run_id: str = "run-1",
-) -> Identity:
-    return Identity(threadId=thread_id, runId=run_id)
+) -> RunIdentity:
+    return RunIdentity(threadId=thread_id, runId=run_id)
 
 
 class _TextCodec:
@@ -130,6 +130,11 @@ async def test_completed_run_attachment_never_opens_deferred_source(
     """A completed-run replay must not build the unused replacement producer."""
 
     open_calls = 0
+    preflight_calls = 0
+
+    async def owner_preflight() -> None:
+        nonlocal preflight_calls
+        preflight_calls += 1
 
     async def open_source() -> MessageSourceBinding[str]:
         nonlocal open_calls
@@ -146,11 +151,69 @@ async def test_completed_run_attachment_never_opens_deferred_source(
         assert await _data(first) == ["persisted"]
 
         replay = await channel.wrap(
-            DeferredMessageSource(open_source, cancellable=False),
+            DeferredMessageSource(
+                open_source,
+                cancellable=False,
+                on_owner_preflight=owner_preflight,
+            ),
             identity=_identity(),
             after=0,
         )
         assert await _data(replay) == ["persisted"]
+
+    assert open_calls == 0
+    assert preflight_calls == 0
+
+
+async def test_deferred_owner_preflight_settles_before_source_open(
+    messaging_backend: MessagingBackend,
+) -> None:
+    order: list[str] = []
+
+    async def owner_preflight() -> None:
+        order.append("preflight")
+
+    async def open_source() -> MessageSourceBinding[str]:
+        order.append("open")
+        return MessageSourceBinding(source=_Source(("ready",)))
+
+    source = DeferredMessageSource(
+        open_source,
+        cancellable=False,
+        on_owner_preflight=owner_preflight,
+    )
+    async with Messaging(backend=messaging_backend) as messaging:
+        subscription = await messaging.channel(
+            name="events",
+            codec=_TextCodec(),
+        ).wrap(source, identity=_identity(), after=0)
+        assert await _data(subscription) == ["ready"]
+
+    assert order == ["preflight", "open"]
+
+
+async def test_deferred_owner_preflight_failure_prevents_source_open(
+    messaging_backend: MessagingBackend,
+) -> None:
+    open_calls = 0
+
+    async def owner_preflight() -> None:
+        raise RuntimeError("business activation lost")
+
+    async def open_source() -> MessageSourceBinding[str]:
+        nonlocal open_calls
+        open_calls += 1
+        return MessageSourceBinding(source=_Source(("must-not-run",)))
+
+    source = DeferredMessageSource(
+        open_source,
+        cancellable=False,
+        on_owner_preflight=owner_preflight,
+    )
+    async with Messaging(backend=messaging_backend) as messaging:
+        channel = messaging.channel(name="events", codec=_TextCodec())
+        with pytest.raises(RuntimeError, match="business activation lost"):
+            await channel.wrap(source, identity=_identity(), after=0)
 
     assert open_calls == 0
 

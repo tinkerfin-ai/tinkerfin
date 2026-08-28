@@ -160,7 +160,7 @@ export function WorkspaceScreen({
   const {
     cancelActiveRun,
     cancelPendingRunId,
-    catchUpDetachedConversation,
+    followDetachedConversation,
     detachThreadStream,
     getActiveThreadId,
     hasActiveStream,
@@ -188,12 +188,13 @@ export function WorkspaceScreen({
     retryHistoryLoad,
     retryHistoryBootstrap,
     hydrateConversation,
+    loadOlderTrace,
   } = useWorkspaceHistory({
     workspace,
     setWorkspace,
     defaultModelId,
     modelCatalogStatus,
-    catchUpDetachedConversation,
+    followDetachedConversation,
     onToast: pushToast,
   })
 
@@ -448,10 +449,9 @@ export function WorkspaceScreen({
     if (anchor.trigger.isConnected) anchor.trigger.focus({ preventScroll: true })
     else pane?.focus({ preventScroll: true })
     earlierMessageAnchor.current = null
-  }, [conversation.threadId, conversationPane, messageWindowStart])
+  }, [conversation.threadId, conversationPane, displayMessages.length, messageWindowStart])
 
   const loadEarlierMessages = useCallback((trigger: HTMLButtonElement) => {
-    if (messageWindowStart <= 0) return
     const pane = conversationPane.current
     if (pane) {
       earlierMessageAnchor.current = {
@@ -461,11 +461,19 @@ export function WorkspaceScreen({
         trigger,
       }
     }
-    setMessageWindow({
-      threadId: conversation.threadId,
-      start: Math.max(0, messageWindowStart - MESSAGE_RENDER_BATCH_SIZE),
+    if (messageWindowStart > 0) {
+      setMessageWindow({
+        threadId: conversation.threadId,
+        start: Math.max(0, messageWindowStart - MESSAGE_RENDER_BATCH_SIZE),
+      })
+      return
+    }
+    void loadOlderTrace(conversation.threadId).then((loaded) => {
+      if (loaded || earlierMessageAnchor.current?.trigger !== trigger) return
+      earlierMessageAnchor.current = null
+      if (trigger.isConnected) trigger.focus({ preventScroll: true })
     })
-  }, [conversation.threadId, conversationPane, messageWindowStart])
+  }, [conversation.threadId, conversationPane, loadOlderTrace, messageWindowStart])
 
   const beginSend = useCallback((content: string, modeOverride?: AgentMode) => {
     const trimmed = content.trim()
@@ -782,7 +790,7 @@ export function WorkspaceScreen({
     setDraft,
     setDraftConversation,
     setDraftModel,
-    catchUpDetachedConversation,
+    followDetachedConversation,
     abandonPlanInteraction,
     cancelActiveRun,
     detachThreadStream,
@@ -923,7 +931,9 @@ export function WorkspaceScreen({
         <ConversationViewport
           conversation={conversation}
           entries={visibleDisplayMessages}
-          hasEarlierMessages={messageWindowStart > 0}
+          hasEarlierMessages={
+            messageWindowStart > 0 || conversation.trace?.historyCursor != null
+          }
           childToolsByRunId={childToolsByRunId}
           paneRef={conversationPane}
           messageEndRef={messageEnd}
@@ -983,7 +993,6 @@ export function WorkspaceScreen({
                 ? (
                 <PlanReviewCard
                   key={`${conversation.threadId}:${conversation.planInteraction.interruptId}`}
-                  threadId={conversation.threadId}
                   interaction={conversation.planInteraction}
                   onChange={(updater) => changePlanInteraction(
                     conversation.threadId,

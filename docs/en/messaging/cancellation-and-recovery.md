@@ -74,12 +74,15 @@ source = DeferredMessageSource(
 | `opener` | Asynchronously creates the source and returns `MessageSourceBinding` |
 | `cancellable` | Declares whether the opened source supports cancellation |
 | `cancel_after_first_item` | Prevents cancellation from overtaking the first protocol event |
+| `on_owner_preflight` | Optional async owner-only activation before producer and opener execution |
 
 Attachments and replay-only requests close the deferred wrapper without opening the real source. `cancel_after_first_item=True` is useful for protocols that must emit `RUN_STARTED` first.
 
+Messaging settles `on_owner_preflight` after durable owner selection. A failure releases that prepared owner and closes the deferred wrapper before its opener runs. Use this hook for a host-side CAS or lease activation that must fence stale recovery.
+
 `MessageSourceBinding` holds the source and an optional cancel callback. Leave the callback empty when the source already declares its own.
 
-Use `ProfiledDeferredMessageSource` when the opener returns a known AG-UI or Native source and a name-only channel must know the codec and Identity before opening it:
+Use `ProfiledDeferredMessageSource` when the opener returns a known AG-UI or Native source and a name-only channel must know the codec and RunIdentity before opening it:
 
 ```python
 from ag_ui.core import BaseEvent
@@ -105,6 +108,7 @@ source = ProfiledDeferredMessageSource(
 | `replay_type` | required | Value type decoded by the codec |
 | `cancellable` | required | Whether the source supports remote cancellation |
 | `cancel_after_first_item` | `False` | Prevent cancellation from overtaking the first protocol event |
+| `on_owner_preflight` | `None` | Owner-only async activation before producer execution |
 
 ## Fixed and transformed sources
 
@@ -145,7 +149,7 @@ subscription = await channel.wrap_recoverable(
 | Parameter | Default | Purpose |
 | --- | --- | --- |
 | `source` | required | Recoverable source implementing `open(checkpoint)` |
-| `identity` | optional for a profiled source | Custom-source identity or equality check for the advertised Identity |
+| `identity` | optional for a profiled source | Custom-source identity or equality check for the advertised RunIdentity |
 | `after` | `None` | Exclusive replay cursor; `None` starts at the tail captured during prepare |
 | `cancel` | `None` | Stops the source after accepted remote cancellation and may return a finite stable-ID tail |
 | `on_committed` | `None` | Async observer after each successful owner commit |

@@ -9,11 +9,12 @@ from typing import cast
 
 import pytest
 from ag_ui.core import BaseEvent, RunAgentInput, RunErrorEvent, RunStartedEvent
+from ag_ui.core.types import ResumeEntry
 from langchain.agents.middleware.types import InputAgentState
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from pydantic import SecretStr, ValidationError
 
-from tinkerfin import AgUiEventStream, TinkerFin
+from tinkerfin import AgUiEventStream, AgUiResumeRequest, TinkerFin
 from tinkerfin.plan import PlanReviewAction
 from tinkerfin_agui_adapter import AgUiLifecycleEventFactory
 from tinkerfin_messaging import FiniteMessageSource, MemoryBackend, Messaging
@@ -50,6 +51,7 @@ def _model_config() -> AgentModelConfig:
         base_url="https://models.example.test/v1",
         api_key=SecretStr("secret"),
         reasoning_enabled=False,
+        runtime_profile="deepagents-v2",
         updated_at="2026-08-19T00:00:00",
     )
 
@@ -79,6 +81,10 @@ def _prepared(*, mode: str = "default"):
         user_id=7,
         thread_id="thread-1",
     )
+
+
+async def _owner_preflight() -> None:
+    return None
 
 
 def test_prepare_run_request_preserves_the_selected_agent_mode() -> None:
@@ -196,7 +202,7 @@ async def test_create_definition_configures_plan_models_and_product_hitl_decisio
             SimpleNamespace(checkpointer=object(), store=object()),
         ),
         sandbox_manager=cast(OpenSandboxManager[str], SandboxManager()),
-        tinkerfin=cast(TinkerFin, tinkerfin),
+        tinkerfin_profiles={"deepagents-v2": cast(TinkerFin, tinkerfin)},
         tavily_api_key=None,
     )
     config = _model_config().model_copy(
@@ -273,7 +279,7 @@ async def test_create_agui_events_defers_definition_and_preserves_framework_star
     factory = ConversationAgentFactory(
         persistence=cast(AgentPersistence, SimpleNamespace()),
         sandbox_manager=cast(OpenSandboxManager[str], SimpleNamespace()),
-        tinkerfin=TinkerFin(),
+        tinkerfin_profiles={"deepagents-v2": TinkerFin()},
         tavily_api_key=None,
     )
     model = _model_config()
@@ -285,6 +291,7 @@ async def test_create_agui_events_defers_definition_and_preserves_framework_star
         prepared=prepared,
         resume=None,
         title="会话标题",
+        on_producer_opened=_owner_preflight,
     )
 
     assert definition_calls == 0
@@ -326,7 +333,7 @@ async def test_create_agui_events_converts_owner_initialization_failure(
     factory = ConversationAgentFactory(
         persistence=cast(AgentPersistence, SimpleNamespace()),
         sandbox_manager=cast(OpenSandboxManager[str], SimpleNamespace()),
-        tinkerfin=TinkerFin(),
+        tinkerfin_profiles={"deepagents-v2": TinkerFin()},
         tavily_api_key=None,
     )
     prepared = _prepared()
@@ -337,6 +344,7 @@ async def test_create_agui_events_converts_owner_initialization_failure(
         prepared=prepared,
         resume=None,
         title="会话标题",
+        on_producer_opened=_owner_preflight,
     )
 
     emitted = [event async for event in events]
@@ -353,6 +361,166 @@ async def test_create_agui_events_converts_owner_initialization_failure(
     }
     assert failed.code == "runtime_initialization_error"
     assert failed.message == "Agent run failed"
+
+
+async def test_resume_initialization_failure_releases_uncheckpointed_claims(
+    monkeypatch,
+) -> None:
+    """Checkpointer 校验失败不得永久占用 Studio 的 interrupt ID"""
+
+    async def fail_definition(_factory, *, user_id, model_config):
+        del user_id, model_config
+        raise RuntimeError("cannot resolve resume")
+
+    monkeypatch.setattr(
+        ConversationAgentFactory,
+        "_create_definition",
+        fail_definition,
+    )
+    released = 0
+
+    async def release() -> None:
+        nonlocal released
+        released += 1
+
+    factory = ConversationAgentFactory(
+        persistence=cast(AgentPersistence, SimpleNamespace()),
+        sandbox_manager=cast(OpenSandboxManager[str], SimpleNamespace()),
+        tinkerfin_profiles={"deepagents-v2": TinkerFin()},
+        tavily_api_key=None,
+    )
+    events = factory.create_agui_events(
+        user_id=7,
+        model_config=_model_config(),
+        graph_input=None,
+        prepared=_prepared(),
+        resume=AgUiResumeRequest(
+            entries=(
+                ResumeEntry(
+                    interrupt_id="interrupt-1#0",
+                    status="resolved",
+                    payload={"type": "approve"},
+                ),
+            )
+        ),
+        title="会话标题",
+        on_producer_opened=_owner_preflight,
+        on_resume_initialization_failed=release,
+    )
+
+    emitted = [event async for event in events]
+
+    assert released == 1
+    assert isinstance(emitted[-1], RunErrorEvent)
+
+
+async def test_resume_initialization_cancel_preserves_cancellation_when_release_fails(
+    monkeypatch,
+) -> None:
+    """marker 前取消不得被业务认领释放失败替换"""
+
+    entered = asyncio.Event()
+    release_attempts = 0
+
+    async def block_definition(_factory, *, user_id, model_config):
+        del user_id, model_config
+        entered.set()
+        await asyncio.Event().wait()
+
+    async def fail_release() -> None:
+        nonlocal release_attempts
+        release_attempts += 1
+        raise RuntimeError("claim release failed")
+
+    monkeypatch.setattr(
+        ConversationAgentFactory,
+        "_create_definition",
+        block_definition,
+    )
+    factory = ConversationAgentFactory(
+        persistence=cast(AgentPersistence, SimpleNamespace()),
+        sandbox_manager=cast(OpenSandboxManager[str], SimpleNamespace()),
+        tinkerfin_profiles={"deepagents-v2": TinkerFin()},
+        tavily_api_key=None,
+    )
+    events = factory.create_agui_events(
+        user_id=7,
+        model_config=_model_config(),
+        graph_input=None,
+        prepared=_prepared(),
+        resume=AgUiResumeRequest(
+            entries=(
+                ResumeEntry(
+                    interrupt_id="interrupt-1#0",
+                    status="resolved",
+                    payload={"type": "approve"},
+                ),
+            )
+        ),
+        title="会话标题",
+        on_producer_opened=_owner_preflight,
+        on_resume_initialization_failed=fail_release,
+    )
+
+    async def consume() -> list[BaseEvent]:
+        return [event async for event in events]
+
+    consuming = asyncio.create_task(consume())
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    consuming.cancel()
+    result = (await asyncio.gather(consuming, return_exceptions=True))[0]
+    await events.aclose()
+
+    assert isinstance(result, asyncio.CancelledError)
+    assert release_attempts == 1
+
+
+async def test_resume_setup_failure_remains_primary_when_release_fails(
+    monkeypatch,
+) -> None:
+    """marker 前业务清理失败不得替换 Agent 初始化错误终态"""
+
+    async def fail_definition(_factory, *, user_id, model_config):
+        del user_id, model_config
+        raise RuntimeError("cannot resolve resume")
+
+    async def fail_release() -> None:
+        raise ValueError("claim release failed")
+
+    monkeypatch.setattr(
+        ConversationAgentFactory,
+        "_create_definition",
+        fail_definition,
+    )
+    factory = ConversationAgentFactory(
+        persistence=cast(AgentPersistence, SimpleNamespace()),
+        sandbox_manager=cast(OpenSandboxManager[str], SimpleNamespace()),
+        tinkerfin_profiles={"deepagents-v2": TinkerFin()},
+        tavily_api_key=None,
+    )
+    events = factory.create_agui_events(
+        user_id=7,
+        model_config=_model_config(),
+        graph_input=None,
+        prepared=_prepared(),
+        resume=AgUiResumeRequest(
+            entries=(
+                ResumeEntry(
+                    interrupt_id="interrupt-1#0",
+                    status="resolved",
+                    payload={"type": "approve"},
+                ),
+            )
+        ),
+        title="会话标题",
+        on_producer_opened=_owner_preflight,
+        on_resume_initialization_failed=fail_release,
+    )
+
+    emitted = [event async for event in events]
+
+    assert isinstance(emitted[-1], RunErrorEvent)
+    assert emitted[-1].code == "runtime_initialization_error"
 
 
 async def test_remote_cancel_waits_for_deferred_agent_open_and_keeps_one_terminal(
@@ -405,7 +573,7 @@ async def test_remote_cancel_waits_for_deferred_agent_open_and_keeps_one_termina
     factory = ConversationAgentFactory(
         persistence=cast(AgentPersistence, SimpleNamespace()),
         sandbox_manager=cast(OpenSandboxManager[str], SimpleNamespace()),
-        tinkerfin=TinkerFin(),
+        tinkerfin_profiles={"deepagents-v2": TinkerFin()},
         tavily_api_key=None,
     )
     prepared = _prepared()
@@ -416,6 +584,7 @@ async def test_remote_cancel_waits_for_deferred_agent_open_and_keeps_one_termina
         prepared=prepared,
         resume=None,
         title="会话标题",
+        on_producer_opened=_owner_preflight,
     )
 
     async with Messaging(backend=MemoryBackend()) as messaging:

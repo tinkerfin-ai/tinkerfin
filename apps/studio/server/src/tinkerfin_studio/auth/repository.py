@@ -37,7 +37,7 @@ class UserRepository:
         self._session.add(user)
 
     async def commit(self) -> None:
-        """提交当前用户资料事务"""
+        """提交用户写入或结束已物化用户事实的只读事务"""
 
         await self._session.commit()
 

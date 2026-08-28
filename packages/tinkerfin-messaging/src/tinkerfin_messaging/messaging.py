@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from types import TracebackType
 from typing import Generic, Never, Self, TypeAlias, TypeVar, cast, overload
 
-from tinkerfin_agui_adapter import Identity
+from tinkerfin_contracts import RunIdentity
 
 from . import _message_channel, _messaging_boundary, _producer_runtime
 from ._identity import required_identifier, required_identity
@@ -64,7 +64,7 @@ class CancelContext:
     """Identify the run whose accepted cancellation invokes a callback."""
 
     channel: str
-    identity: Identity
+    identity: RunIdentity
 
     def __post_init__(self) -> None:
         """Validate the durable channel and run identity before callback use."""
@@ -198,7 +198,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         self._inferred_profile: str | None = None
 
     @staticmethod
-    def _resolve_identity(source: object, identity: Identity | None) -> Identity:
+    def _resolve_identity(source: object, identity: RunIdentity | None) -> RunIdentity:
         """Resolve one explicit or immutable source identity before side effects."""
 
         return _message_channel._resolve_identity(
@@ -213,6 +213,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         MessageCodec[SourceT, ReplayT],
         SseRenderer[ReplayT] | None,
         str | None,
+        Callable[[object], object] | None,
     ]:
         """Resolve an explicit codec or one supported structural source profile."""
 
@@ -227,8 +228,8 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         source: object,
         profile: str,
         codec: object,
-    ) -> None:
-        """Prove declared live and replay types before durable preparation."""
+    ) -> Callable[[object], object] | None:
+        """Prove declared live, codec-input, and replay types before preparation."""
 
         return _message_channel._validate_profile_types(
             source=source,
@@ -262,7 +263,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
             limit=limit,
         )
 
-    async def latest_seq(self, *, identity: Identity) -> int:
+    async def latest_seq(self, *, identity: RunIdentity) -> int:
         """Return the greatest committed sequence, or zero for an empty stream."""
 
         return await _message_channel.latest_seq(
@@ -270,7 +271,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
             identity=identity,
         )
 
-    async def get_run_status(self, *, identity: Identity) -> RunStatus:
+    async def get_run_status(self, *, identity: RunIdentity) -> RunStatus:
         """Return one durable run's current authoritative status.
 
         The lookup has no producer ownership. A leased backend may atomically
@@ -296,7 +297,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
     async def read(
         self,
         *,
-        identity: Identity,
+        identity: RunIdentity,
         after: int = 0,
         limit: int = 100,
     ) -> tuple[DecodedMessage[ReplayT], ...]:
@@ -312,7 +313,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
     async def follow(
         self,
         *,
-        identity: Identity,
+        identity: RunIdentity,
         after: int = 0,
     ) -> MessageSubscription[ReplayT]:
         """Follow one run's committed events through its authoritative terminal."""
@@ -326,7 +327,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
     async def validate_cursor(
         self,
         *,
-        identity: Identity,
+        identity: RunIdentity,
         after: int | None,
     ) -> None:
         """Validate one replay cursor without creating or attaching a run.
@@ -357,7 +358,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         self,
         source: MessageSource[SourceT],
         *,
-        identity: Identity,
+        identity: RunIdentity,
         after: int | None = None,
         cancel: CancelCallback[SourceT] | None = None,
         on_committed: CommittedCallback | None = None,
@@ -368,7 +369,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         self,
         source: ProfiledMessageSource[ProfileSourceT, ProfileReplayT],
         *,
-        identity: Identity | None = None,
+        identity: RunIdentity | None = None,
         after: int | None = None,
         cancel: CancelCallback[ProfileSourceT] | None = None,
         on_committed: CommittedCallback | None = None,
@@ -381,14 +382,39 @@ class MessageChannel(Generic[SourceT, ReplayT]):
             | ProfiledMessageSource[ProfileSourceT, ProfileReplayT]
         ),
         *,
-        identity: Identity | None = None,
+        identity: RunIdentity | None = None,
         after: int | None = None,
         cancel: (
             CancelCallback[SourceT] | CancelCallback[ProfileSourceT] | None
         ) = None,
         on_committed: CommittedCallback | None = None,
     ) -> MessageSubscription[ReplayT] | MessageSubscription[ProfileReplayT]:
-        """Start or attach one source and return its run-bounded subscription."""
+        """Start or attach one source and return its run-bounded subscription.
+
+        The producing request transfers its single-use source to Messaging, which
+        closes it after terminal settlement. An attachment never opens or closes the
+        supplied source. Replay remains bounded by committed backend sequence and
+        preserves downstream backpressure.
+
+        Args:
+            source: Custom source with explicit identity, or profiled TinkerFin source.
+            identity: Required custom-source identity or optional equality check for a
+                profiled source.
+            after: Exclusive replay cursor, or current committed tail when omitted.
+            cancel: Optional at-most-once cancellation owner; omit when the source
+                already declares its own matching callback.
+            on_committed: Owner-only async observer invoked after each durable append;
+                attachment never invokes it and observer failure does not change the
+                producer outcome.
+
+        Returns:
+            Detachable subscription over committed, decoded messages.
+
+        Raises:
+            MessagingError: Backend preflight, ownership, cursor, or startup fails.
+            TypeError: Source, codec profile, or cancellation signature is invalid.
+            ValueError: Explicit and source identities conflict.
+        """
 
         return await _message_channel.wrap(
             self,
@@ -403,7 +429,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         self,
         source: MessageSource[object],
         *,
-        identity: Identity | None = None,
+        identity: RunIdentity | None = None,
         after: int | None = None,
         cancel: CancelCallback[object] | None = None,
         on_committed: CommittedCallback | None = None,
@@ -451,7 +477,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         self,
         source: MessageSource[SourceT],
         *,
-        identity: Identity,
+        identity: RunIdentity,
         after: int | Callable[[], int | None] | None = None,
         cancel: CancelCallback[SourceT] | None = None,
         on_committed: CommittedCallback | None = None,
@@ -462,7 +488,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         self,
         source: ProfiledMessageSource[ProfileSourceT, ProfileReplayT],
         *,
-        identity: Identity | None = None,
+        identity: RunIdentity | None = None,
         after: int | Callable[[], int | None] | None = None,
         cancel: CancelCallback[ProfileSourceT] | None = None,
         on_committed: CommittedCallback | None = None,
@@ -472,7 +498,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         self,
         source: MessageSource[object],
         *,
-        identity: Identity | None = None,
+        identity: RunIdentity | None = None,
         after: int | Callable[[], int | None] | None = None,
         cancel: CancelCallback[object] | None = None,
         on_committed: CommittedCallback | None = None,
@@ -512,7 +538,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         self,
         source: RecoverableSource[SourceT],
         *,
-        identity: Identity | None = None,
+        identity: RunIdentity | None = None,
         after: int | None = None,
         cancel: CancelCallback[RecoverableMessage[SourceT]] | None = None,
         on_committed: CommittedCallback | None = None,
@@ -551,7 +577,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
             on_committed=on_committed,
         )
 
-    async def cancel(self, *, identity: Identity) -> bool:
+    async def cancel(self, *, identity: RunIdentity) -> bool:
         """Request cancellation and wait until the durable run status is final.
 
         Args:
@@ -573,14 +599,14 @@ class MessageChannel(Generic[SourceT, ReplayT]):
             identity=identity,
         )
 
-    async def delete_stream(self, *, identity: Identity) -> None:
+    async def delete_stream(self, *, identity: RunIdentity) -> None:
         """Delete one inactive durable stream without changing the channel codec.
 
         Missing and previously deleted streams are successful no-ops. Deletion never
         requests producer cancellation; callers must settle an active run first.
 
         Args:
-            identity: Identity whose thread-level durable stream is deleted.
+            identity: RunIdentity whose thread-level durable stream is deleted.
 
         Raises:
             MessagingError: Messaging closes or the backend rejects deletion.
@@ -813,7 +839,22 @@ class Messaging:
         codec: MessageCodec[SourceT, ReplayT] | None = None,
         renderer: SseRenderer[ReplayT] | None = None,
     ) -> MessageChannel[SourceT, ReplayT]:
-        """Create a typed codec view over the shared backend."""
+        """Create a typed channel view that borrows this Messaging lifecycle.
+
+        Args:
+            name: Canonical logical channel name used in backend keys.
+            codec: Optional explicit source/replay codec. A profiled source can infer it
+                when the channel leaves this value unset.
+            renderer: Optional replay-to-SSE renderer. A codec implementing the same
+                Protocol is reused automatically.
+
+        Returns:
+            Reusable typed channel view sharing the parent backend and producer owner.
+
+        Raises:
+            MessagingClosed: The parent lifecycle is not open.
+            ValueError: ``name`` is not canonical.
+        """
 
         self._require_open()
         if renderer is None and isinstance(codec, SseRenderer):
@@ -829,9 +870,10 @@ class Messaging:
         self,
         *,
         prepared: PreparedRun,
-        source: MessageSource[SourceT],
+        source: MessageSource[ProducedT],
         codec: MessageCodec[SourceT, ReplayT],
-        cancel: _ContextCancelCallback[SourceT] | None,
+        codec_input: Callable[[ProducedT], SourceT] | None,
+        cancel: _ContextCancelCallback[ProducedT] | None,
         on_committed: CommittedCallback | None,
     ) -> asyncio.Event:
         return _producer_runtime._start_producer(
@@ -839,6 +881,7 @@ class Messaging:
             prepared=prepared,
             source=source,
             codec=codec,
+            codec_input=codec_input,
             cancel=cancel,
             on_committed=on_committed,
         )

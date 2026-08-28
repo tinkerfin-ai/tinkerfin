@@ -9,6 +9,7 @@ from typing import Any, TypedDict, cast
 
 import pytest
 from ag_ui.core import BaseEvent, RunErrorEvent, RunStartedEvent
+from deepagents.graph import create_deep_agent as upstream_create_deep_agent
 from langchain.agents.middleware.types import InputAgentState
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
@@ -19,24 +20,22 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
 
-import tinkerfin.deep_agent as deep_agent_module
 from tinkerfin import (
     AgUiEventStream,
-    AgUiNativeStreamConfigurationError,
     AgUiResumeBinding,
     DeepAgentAgUiResumeRuntime,
     DeepAgentAgUiRuntime,
     DeepAgentDefinition,
     DeepAgentRuntime,
-    Identity,
     NativeGraphRunStream,
+    RunIdentity,
     TinkerFin,
     TinkerFinLifecycleError,
 )
 
 
 @asynccontextmanager
-async def _coordinate(_identity: Identity) -> AsyncIterator[None]:
+async def _coordinate(_identity: RunIdentity) -> AsyncIterator[None]:
     yield
 
 
@@ -117,10 +116,8 @@ def _install_builder(
         return graph
 
     monkeypatch.setattr(
-        deep_agent_module,
-        "_native_create_deep_agent",
+        "tinkerfin.runtime_profile._deepagents_graph.create_deep_agent",
         build,
-        raising=False,
     )
     return calls, graphs
 
@@ -155,11 +152,11 @@ def _identity(
     *,
     thread_id: str = "thread-1",
     run_id: str = "run-1",
-) -> Identity:
-    return Identity(threadId=thread_id, runId=run_id)
+) -> RunIdentity:
+    return RunIdentity(threadId=thread_id, runId=run_id)
 
 
-def _resume_identity(*, run_id: str = "run-resume") -> Identity:
+def _resume_identity(*, run_id: str = "run-resume") -> RunIdentity:
     return _identity(run_id=run_id)
 
 
@@ -194,13 +191,17 @@ async def test_native_facade_streams_a_real_deep_agent_graph() -> None:
         cast(Mapping[str, object], part)
         async for part in runtime.astream(
             InputAgentState(messages=[HumanMessage(content="hello")]),
-            stream_mode="values",
         )
     ]
-    state = cast(Mapping[str, object], parts[-1]["data"])
+    state_part = next(
+        part
+        for part in reversed(parts)
+        if part["type"] == "values" and part["ns"] == ()
+    )
+    state = cast(Mapping[str, object], state_part["data"])
     messages = cast(Sequence[BaseMessage], state["messages"])
 
-    assert parts[-1]["type"] == "values"
+    assert {part["type"] for part in parts} == {"messages", "tasks", "values"}
     assert isinstance(messages[-1], AIMessage)
     assert messages[-1].content == "ok"
 
@@ -278,7 +279,7 @@ async def test_resume_runtime_rejects_graph_input_without_consuming_runtime(
             Command(resume={"decisions": [{"type": "reject"}]}),
         )
 
-    assert graphs[0].calls == []
+    assert graphs == []
     assert observed == []
 
     stream = runtime.astream()
@@ -312,8 +313,9 @@ async def test_all_cancelled_resume_uses_a_finite_runtime_without_building_graph
 
     assert isinstance(runtime, DeepAgentAgUiResumeRuntime)
     assert calls == []
-    with pytest.raises(AgUiNativeStreamConfigurationError, match="version"):
-        runtime.astream(version="v1")
+    invalid_astream = cast(Callable[..., object], runtime.astream)
+    with pytest.raises(ValueError, match="version"):
+        invalid_astream(version="v1")
     events = [event async for event in runtime.astream(config=_graph_config())]
 
     assert [event.type.value for event in events] == ["RUN_STARTED", "RUN_ERROR"]
@@ -408,7 +410,7 @@ def test_new_requires_identity_before_building_graph(
 async def test_native_runtime_forwards_the_bound_call_lazily_and_is_single_use(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    native_part = object()
+    native_part = {"type": "custom", "ns": (), "data": {"value": "native"}}
     _, graphs = _install_builder(monkeypatch, parts=(native_part,))
     observed: list[object] = []
 
@@ -423,14 +425,14 @@ async def test_native_runtime_forwards_the_bound_call_lazily_and_is_single_use(
         graph_input,
         config,
         context={"tenant": "tenant-1"},
-        stream_mode="custom",
+        stream_mode=("custom", "values", "messages", "tasks"),
         print_mode="debug",
-        output_keys="messages",
+        output_keys=None,
         interrupt_before=("model",),
         interrupt_after=("tools",),
         durability="sync",
         control=None,
-        subgraphs=False,
+        subgraphs=True,
         debug=True,
     )
 
@@ -445,18 +447,23 @@ async def test_native_runtime_forwards_the_bound_call_lazily_and_is_single_use(
         (
             (
                 graph_input,
-                {"configurable": {"thread_id": "thread-1"}},
+                {
+                    "configurable": {
+                        "thread_id": "thread-1",
+                        "_tinkerfin_runtime_profile": "deepagents-v2",
+                    }
+                },
             ),
             {
                 "context": {"tenant": "tenant-1"},
-                "stream_mode": "custom",
+                "stream_mode": ("messages", "tasks", "values", "custom"),
                 "print_mode": "debug",
-                "output_keys": "messages",
+                "output_keys": None,
                 "interrupt_before": ("model",),
                 "interrupt_after": ("tools",),
                 "durability": "sync",
                 "control": None,
-                "subgraphs": False,
+                "subgraphs": True,
                 "debug": True,
                 "version": "v2",
             },
@@ -472,7 +479,7 @@ async def test_native_runtime_forwards_the_bound_call_lazily_and_is_single_use(
 async def test_native_invalid_binding_does_not_claim_the_runtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    part = object()
+    part = {"type": "custom", "ns": (), "data": {"value": "native"}}
     _, graphs = _install_builder(monkeypatch, parts=(part,))
     runtime = _definition(TinkerFin()).new(identity=_identity())
     invalid_astream = cast(Callable[..., object], runtime.astream)
@@ -484,8 +491,19 @@ async def test_native_invalid_binding_does_not_claim_the_runtime(
     assert await anext(stream) is part
     await stream.aclose()
     assert len(graphs[0].calls) == 1
-    assert graphs[0].calls[0][0][1] == {"configurable": {"thread_id": "thread-1"}}
+    assert graphs[0].calls[0][0][1] == {
+        "configurable": {
+            "thread_id": "thread-1",
+            "_tinkerfin_runtime_profile": "deepagents-v2",
+        }
+    }
     assert graphs[0].calls[0][1]["version"] == "v2"
+    assert graphs[0].calls[0][1]["stream_mode"] == (
+        "messages",
+        "tasks",
+        "values",
+    )
+    assert graphs[0].calls[0][1]["subgraphs"] is True
 
 
 @pytest.mark.asyncio
@@ -495,11 +513,20 @@ async def test_native_v1_and_conflicting_thread_fail_before_side_effects(
     part = _state_part()
     _, graphs = _install_builder(monkeypatch, parts=(part,))
     runtime = _definition(TinkerFin()).new(identity=_identity())
+    invalid_astream = cast(Callable[..., object], runtime.astream)
 
     with pytest.raises(ValueError, match="requires version='v2'"):
-        runtime.astream(_graph_input(), version="v1")
+        invalid_astream(_graph_input(), version="v1")
+    with pytest.raises(ValueError, match="stream_mode"):
+        invalid_astream(_graph_input(), stream_mode="messages")
+    with pytest.raises(ValueError, match="stream_mode"):
+        invalid_astream(_graph_input(), stream_mode=())
+    with pytest.raises(ValueError, match="subgraphs"):
+        invalid_astream(_graph_input(), subgraphs=False)
+    with pytest.raises(ValueError, match="output_keys"):
+        invalid_astream(_graph_input(), output_keys="messages")
     with pytest.raises(ValueError, match="must equal identity.thread_id"):
-        runtime.astream(
+        invalid_astream(
             _graph_input(),
             {"configurable": {"thread_id": "thread-other"}},
         )
@@ -582,6 +609,7 @@ async def test_agui_runtime_normalizes_explicit_modes_and_forwards_other_options
         ),
         ({"version": "v1"}, "version"),
         ({"subgraphs": False}, "subgraphs"),
+        ({"output_keys": "messages"}, "output_keys"),
     ],
 )
 def test_invalid_agui_reserved_options_fail_before_every_stream_side_effect(
@@ -589,11 +617,11 @@ def test_invalid_agui_reserved_options_fail_before_every_stream_side_effect(
     options: dict[str, object],
     expected: str,
 ) -> None:
-    coordination: list[Identity] = []
+    coordination: list[RunIdentity] = []
     observed: list[object] = []
 
     @asynccontextmanager
-    async def coordinate(identity: Identity) -> AsyncIterator[None]:
+    async def coordinate(identity: RunIdentity) -> AsyncIterator[None]:
         coordination.append(identity)
         yield
 
@@ -608,7 +636,7 @@ def test_invalid_agui_reserved_options_fail_before_every_stream_side_effect(
     )
     invalid_astream = cast(Callable[..., object], runtime.astream)
 
-    with pytest.raises(AgUiNativeStreamConfigurationError, match=expected):
+    with pytest.raises((TypeError, ValueError), match=expected):
         invalid_astream(_graph_input(), **options)
 
     assert graphs[0].calls == []
@@ -674,9 +702,8 @@ def test_runtime_wrappers_preserve_upstream_parameter_information(
     builder.add_edge("identity", END)
     graph = builder.compile()
     monkeypatch.setattr(
-        deep_agent_module,
-        "_native_create_deep_agent",
-        lambda *args, **kwargs: graph,
+        "tinkerfin.runtime_profile._deepagents_graph.create_deep_agent",
+        lambda *_args, **_kwargs: graph,
     )
     tinkerfin = TinkerFin()
     definition = _definition(tinkerfin)
@@ -690,10 +717,8 @@ def test_runtime_wrappers_preserve_upstream_parameter_information(
         parameters=tuple(upstream.parameters.values())[1:]
     )
 
-    from deepagents.graph import create_deep_agent
-
     assert inspect.signature(tinkerfin.create_deep_agent) == inspect.signature(
-        create_deep_agent
+        upstream_create_deep_agent
     )
     assert inspect.signature(native.astream) == bound_upstream
     assert inspect.signature(agui.astream) == bound_upstream

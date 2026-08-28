@@ -55,27 +55,35 @@ class AuthService:
         """校验用户名密码并签发访问令牌"""
 
         user = await self._users.get_by_username(username)
+        user_context = None if user is None else self._context(user)
+        password_hash = _DUMMY_PASSWORD_HASH if user is None else user.password_hash
+        # 密码计算与 Redis 不占用只读用户查询的数据库事务
+        await self._users.commit()
         password_is_valid = await verify_password(
             password,
-            _DUMMY_PASSWORD_HASH if user is None else user.password_hash,
+            password_hash,
         )
-        if user is None or not password_is_valid:
+        if user_context is None or not password_is_valid:
             raise BusinessException(AuthErrorCode.BAD_CREDENTIALS)
-        if user.disabled:
+        if user_context.disabled:
             raise BusinessException(AuthErrorCode.USER_DISABLED)
 
         token = secrets.token_urlsafe(32)
         expires_at = datetime.now(UTC) + timedelta(seconds=self._token_expire_seconds)
         try:
             await self._tokens.save(
-                TokenRecord(token=token, user_id=user.id, expires_at=expires_at)
+                TokenRecord(
+                    token=token,
+                    user_id=user_context.user_id,
+                    expires_at=expires_at,
+                )
             )
         except RedisError as error:
             raise SystemException(AuthErrorCode.SERVICE_UNAVAILABLE) from error
         return LoginResult(
             access_token=token,
             expires_at=expires_at,
-            user=self._context(user),
+            user=user_context,
         )
 
     async def resolve_token(self, token: str | None) -> RequestAuthState:
@@ -95,13 +103,16 @@ class AuthService:
             return RequestAuthState(token=token, failure_reason="expired_token")
         user = await self._users.get_by_id(record.user_id)
         if user is None:
+            await self._users.commit()
             return RequestAuthState(token=token, failure_reason="user_not_found")
-        if user.disabled:
+        user_context = self._context(user)
+        await self._users.commit()
+        if user_context.disabled:
             return RequestAuthState(token=token, failure_reason="disabled_user")
         return RequestAuthState(
             token=token,
             is_authenticated=True,
-            user=self._context(user),
+            user=user_context,
             expires_at=record.expires_at,
         )
 
@@ -117,7 +128,9 @@ class AuthService:
         """按用户 ID 返回安全上下文"""
 
         user = await self._users.get_by_id(user_id)
-        return None if user is None else self._context(user)
+        user_context = None if user is None else self._context(user)
+        await self._users.commit()
+        return user_context
 
     async def update_user(
         self,

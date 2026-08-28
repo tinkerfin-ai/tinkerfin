@@ -12,7 +12,12 @@ pip install "tinkerfin-messaging[redis]"
 
 ```python
 from redis.asyncio import Redis
-from tinkerfin_messaging import Messaging, MessagingLimits, RedisBackend
+from tinkerfin_messaging import (
+    Messaging,
+    MessagingLimits,
+    MessagingRetentionPolicy,
+    RedisBackend,
+)
 
 
 redis = Redis.from_url(
@@ -25,6 +30,7 @@ backend = RedisBackend(
     lease_ttl=15.0,
     poll_interval=0.1,
     limits=MessagingLimits(),
+    retention_policy=MessagingRetentionPolicy.expire_after(86_400),
 )
 messaging = Messaging(backend=backend)
 ```
@@ -36,12 +42,23 @@ messaging = Messaging(backend=backend)
 | `lease_ttl` | `15.0` | 生产者所有权租约秒数 |
 | `poll_interval` | `0.1` | 删除时等待活跃租约的轮询间隔 |
 | `limits` | `MessagingLimits()` | 编码 Payload、checkpoint、消息数和 thread 字节上限 |
+| `retention_policy` | 关闭 | thread generation 终态后的重播窗口 |
 
 Redis client 是调用方提供的资源，应用关闭时自行关闭。连接池容量要覆盖同时等待消息、等待取消和普通命令的连接数。
 
-Messaging 不自动压缩或过期历史消息。应用需要根据自己的保留策略调用 `delete_stream()`。
+启用 retention 后，从终态结算时开始计时。active producer 不会过期，截止前的新 Run 会清除
+计时。过期 generation 抛出 `StreamExpired`，显式 `after=0` 启动会创建下一个空 generation。
+Redis 使用服务器时钟，在 Backend 操作第一次观察到截止点时执行可恢复的物理清理。
+`delete_stream()` 仍是独立的显式 `StreamDeleted` 生命周期。
 
 ## 显式使用内置 codec
+
+先安装对应 codec extra：
+
+```bash
+pip install "tinkerfin-messaging[agui]"
+# 或：pip install "tinkerfin-messaging[native]"
+```
 
 ```python
 from tinkerfin_messaging import AgUiCodec
@@ -57,15 +74,18 @@ channel = messaging.channel(
 
 | 安装范围 | API | 用途 |
 | --- | --- | --- |
-| 基础安装 | `AgUiCodec` | AG-UI 事件编码、解码和 SSE |
-| 基础安装 | `NativeStreamPartCodec` | LangGraph v2 数据编码、解码和 SSE |
+| `[agui]` | `AgUiCodec` | AG-UI 事件编码、解码和 SSE |
+| `[native]` | `NativeStreamPartCodec` | canonical Native replay 编码、解码和 SSE |
 | `[redis]` | `RedisBackend` | 多进程持久 backend |
 
-TinkerFin 的规范事件流带有 codec 与 Identity，因此 name-only channel 可以自动选择 codec 和 durable scope。自定义 source 必须显式配置 codec，并在调用时提供 Identity。
+TinkerFin 的规范事件流带有 codec 与 RunIdentity，因此 name-only channel 可以自动选择 codec 和
+durable scope。Native Runtime source 还会通过 `MessageCodecInputSource` 转交 Driver-owned
+`NativeStreamPart`，codec 不会再次解析 live 上游 Mapping。自定义 source 必须显式配置 codec，
+并在调用时提供 RunIdentity。
 
 RedisBackend 保存完整 limits fingerprint、每个 generation 的 `payload_bytes`，以及当前 owner 和
 上一个 owner 的成功续租次数与 UTC 时间，仅用于可信故障取证。共享同一 channel 的 worker 必须
-使用完全相同的 limits。配额检查与计数会在 message ID 幂等检查后，与 append 原子完成；
+使用完全相同的 limits 与 retention policy。配额检查与计数会在 message ID 幂等检查后，与 append 原子完成；
 这些字段不会进入 `MessageEnvelope`。
 
 默认上限为：单条编码消息 16 MiB、checkpoint 1 MiB、每个 thread generation 100,000 条消息，

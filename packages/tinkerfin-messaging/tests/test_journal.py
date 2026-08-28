@@ -12,7 +12,7 @@ import pytest
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
-from tinkerfin import Identity
+from tinkerfin import RunIdentity
 from tinkerfin_messaging import (
     BackendRunHandle,
     CodecMismatch,
@@ -31,8 +31,8 @@ def _identity(
     *,
     thread_id: str = "stream-1",
     run_id: str = "run-1",
-) -> Identity:
-    return Identity(threadId=thread_id, runId=run_id)
+) -> RunIdentity:
+    return RunIdentity(threadId=thread_id, runId=run_id)
 
 
 async def _delete_prefix(client: Redis, prefix: str) -> None:
@@ -92,7 +92,7 @@ async def backend(
 async def _prepare(
     backend: MessagingBackend,
     *,
-    identity: Identity | None = None,
+    identity: RunIdentity | None = None,
     codec: str = "test.bytes.v1",
 ) -> PreparedRun:
     resolved_identity = identity or _identity()
@@ -193,12 +193,12 @@ async def test_append_rejects_invalid_envelope_identifiers_before_commit(
     elif field == "thread_id":
         handle = replace(
             handle,
-            identity=Identity.model_construct(thread_id=value, run_id="run-1"),
+            identity=RunIdentity.model_construct(thread_id=value, run_id="run-1"),
         )
     elif field == "run_id":
         handle = replace(
             handle,
-            identity=Identity.model_construct(thread_id="stream-1", run_id=value),
+            identity=RunIdentity.model_construct(thread_id="stream-1", run_id=value),
         )
     elif field == "message_id":
         message_id = value

@@ -12,8 +12,7 @@ from langgraph.types import interrupt
 from redis.asyncio import Redis
 from redis.exceptions import ResponseError
 
-import tinkerfin.deep_agent as deep_agent_module
-from tinkerfin import AgUiResumeBinding, AgUiResumeCheckpoint, Identity, TinkerFin
+from tinkerfin import AgUiResumeBinding, AgUiResumeCheckpoint, RunIdentity, TinkerFin
 from tinkerfin._agui_lineage_state import (
     LINEAGE_STATE_KEY,
     parse_lineage_marker,
@@ -65,12 +64,15 @@ async def test_real_redis_saver_indexes_run_id_and_resumes_once(
         graphs.append(graph)
         return graph
 
-    monkeypatch.setattr(deep_agent_module, "_native_create_deep_agent", build)
+    monkeypatch.setattr(
+        "tinkerfin.runtime_profile._deepagents_graph.create_deep_agent",
+        build,
+    )
     try:
         await saver.asetup()
         definition = TinkerFin().create_deep_agent(model="provider:model", tools=[])
         parent = cast(Any, definition).new_agui(
-            identity=Identity(threadId=thread_id, runId="run-parent"),
+            identity=RunIdentity(threadId=thread_id, runId="run-parent"),
         )
         parent_events = [event async for event in parent.astream({})]
         assert parent_events[-1].type.value == "RUN_FINISHED"
@@ -86,11 +88,28 @@ async def test_real_redis_saver_indexes_run_id_and_resumes_once(
         )
         checkpoints: list[AgUiResumeCheckpoint] = []
 
+        async def fail_after_staging(value: AgUiResumeCheckpoint) -> None:
+            checkpoints.append(value)
+            raise RuntimeError("host settlement unavailable")
+
+        failed = cast(Any, definition).new_agui(
+            identity=RunIdentity(threadId=thread_id, runId="run-resume"),
+            resume=binding,
+            on_resume_checkpointed=fail_after_staging,
+        )
+        failed_stream = failed.astream()
+        failed_events = [event async for event in failed_stream]
+
+        assert failed_events[-1].type.value == "RUN_ERROR"
+        assert isinstance(failed_stream.error, RuntimeError)
+        assert executions == []
+        assert len(checkpoints) == 1
+
         async def checkpointed(value: AgUiResumeCheckpoint) -> None:
             checkpoints.append(value)
 
         resumed = cast(Any, definition).new_agui(
-            identity=Identity(threadId=thread_id, runId="run-resume"),
+            identity=RunIdentity(threadId=thread_id, runId="run-resume"),
             resume=binding,
             on_resume_checkpointed=checkpointed,
         )
@@ -100,7 +119,8 @@ async def test_real_redis_saver_indexes_run_id_and_resumes_once(
         assert resumed_events[-1].type.value == "RUN_FINISHED"
         assert resumed_stream.error is None
         assert executions == [{"answer": "continue"}]
-        assert len(checkpoints) == 1
+        assert len(checkpoints) == 2
+        assert checkpoints[0] == checkpoints[1]
         indexed = [
             checkpoint
             async for checkpoint in saver.alist(

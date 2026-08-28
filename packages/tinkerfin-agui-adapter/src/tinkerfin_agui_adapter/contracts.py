@@ -6,40 +6,11 @@ from typing import Literal
 
 from ag_ui.core import BaseEvent
 from ag_ui.core import Interrupt as AgUiInterrupt
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import Field, model_validator
+
+from tinkerfin_contracts import RunIdentity as RunIdentity
 
 from .models import RuntimeModel
-
-
-class Identity(BaseModel):
-    """Canonical thread and run identity shared by TinkerFin integrations."""
-
-    model_config = ConfigDict(
-        extra="forbid",
-        frozen=True,
-        populate_by_name=True,
-        strict=True,
-    )
-
-    thread_id: str = Field(
-        alias="threadId",
-        min_length=1,
-        description="Stable thread identity used by runtime and durable delivery",
-    )
-    run_id: str = Field(
-        alias="runId",
-        min_length=1,
-        description="Idempotent identity for one semantic run within the thread",
-    )
-
-    @field_validator("thread_id", "run_id")
-    @classmethod
-    def identifiers_are_canonical(cls, value: str) -> str:
-        """Reject surrounding whitespace before the identity causes side effects."""
-
-        if value != value.strip():
-            raise ValueError("identity values must not contain surrounding whitespace")
-        return value
 
 
 class AgentRunOutcome(RuntimeModel):

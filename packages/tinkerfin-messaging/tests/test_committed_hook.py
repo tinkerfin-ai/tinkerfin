@@ -7,12 +7,12 @@ import logging
 from collections.abc import AsyncGenerator, AsyncIterator
 from typing import ClassVar
 
-from tinkerfin import Identity
+from tinkerfin import RunIdentity
 from tinkerfin_messaging import MemoryBackend, MessageEnvelope, Messaging
 
 
-def _identity() -> Identity:
-    return Identity(threadId="stream-1", runId="run-1")
+def _identity() -> RunIdentity:
+    return RunIdentity(threadId="stream-1", runId="run-1")
 
 
 class _TextCodec:
@@ -145,7 +145,7 @@ async def test_on_committed_failure_is_logged_without_failing_the_run(
     async def fail(envelope: MessageEnvelope) -> None:
         raise RuntimeError(f"projection unavailable: {envelope.payload.decode()}")
 
-    caplog.set_level(logging.ERROR, logger="tinkerfin_messaging.messaging")
+    caplog.set_level(logging.ERROR, logger="tinkerfin.messaging")
     async with Messaging(backend=MemoryBackend()) as messaging:
         channel = messaging.channel(name="events", codec=_TextCodec())
         body = await channel.sse(
@@ -163,8 +163,18 @@ async def test_on_committed_failure_is_logged_without_failing_the_run(
         )
         assert await _collect(replay) == [b"id: 1\ndata: secret-payload\n\n"]
 
-    assert "error_type=RuntimeError" in caplog.text
-    assert "channel=events thread_id=stream-1 run_id=run-1 seq=1" in caplog.text
+    records = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "Messaging committed hook failed"
+    ]
+    assert len(records) == 1
+    record = records[0]
+    assert record.__dict__["tinkerfin_error_type"] == "RuntimeError"
+    assert record.exc_info is None
+    assert "events" not in caplog.text
+    assert "stream-1" not in caplog.text
+    assert "run-1" not in caplog.text
     assert "projection unavailable" not in caplog.text
     assert "secret-payload" not in caplog.text
 

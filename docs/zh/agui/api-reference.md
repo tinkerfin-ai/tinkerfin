@@ -7,10 +7,12 @@
 | API | 用途 |
 | --- | --- |
 | `DeepAgentDefinition.new_agui(...)` | 创建一次 AG-UI Runtime |
+| `DeepAgentDefinition.prepare_agui_resume(...)` | 从权威 Graph checkpoint 解析客户端决定 |
 | `DeepAgentAgUiRuntime.astream(graph_input, ...)` | 执行普通 Graph 请求 |
 | `DeepAgentAgUiResumeRuntime.astream(...)` | 执行已绑定恢复，不接收调用方 input |
 | `AgUiEventStream` | 迭代、取消、关闭或转成 SSE |
-| `AgUiResumeBinding.from_agui(...)` | 校验已保存 interrupt、决定、取消、Tool ID 与来源 |
+| `AgUiResumeRequest` | 只把不可信客户端决定带入 checkpoint 解析 |
+| `AgUiResumeBinding` | 由框架解析并交给 `new_agui(...)` 的私有恢复事实 |
 | `AgUiResumeCheckpoint` | 原生 resume marker 已持久化的稳定证据 |
 | `TINKERFIN_HITL_CONTRACT` | 外部 mixed-cancellation 子 Agent 的契约声明 |
 
@@ -31,7 +33,7 @@
 | --- | --- |
 | `process(part)` | 校验并转换一条完整原生数据 |
 | `finish()` | 正常结束仍开放的文字、推理和 Tool 生命周期 |
-| `abort(code=...)` | 失败或取消时关闭开放生命周期 |
+| `abort()` | 关闭开放的子生命周期；主终态仍由编排器唯一负责 |
 | `main_outcome()` | 返回 success 或 interrupt 终止结果 |
 
 ## 生命周期工厂
@@ -53,7 +55,9 @@
 
 | API | 用途 |
 | --- | --- |
-| `AgUiResumeBinding.from_agui(...)` | 从可信已保存 AG-UI interrupt 构造高层 Binding |
+| `DeepAgentDefinition.prepare_agui_resume(...)` | 从权威 checkpoint 恢复 pending 事实并构造高层 Binding |
+| `AgUiResumeRequest` | 不可变、非空且拒绝重复 ID 的客户端恢复项 |
+| `AgUiResumeBinding.from_agui(...)` | 自行拥有完整可信 AG-UI 终止日志时使用的高级入口 |
 | `AgUiResumeBinding.model_validate(...)` | 恢复完整稳定 Binding JSON 模型 |
 | `AgUiResumeBindingError` | 高层 Binding 无法无损保留恢复语义 |
 | `ResumeMapper.map(...)` | 从原生 interrupt 和 checkpoint 消息转换恢复请求 |
@@ -61,9 +65,10 @@
 | `ResumeTranslation` | 保存 kind、mode、恢复数据、取消项、Tool ID、来源与原生决定 |
 | `ResumeMappingError` | Adapter 低层数据无法无损映射 |
 
-`ResumeTranslation` 是 Adapter 的低层结果。高层 Runtime 使用
-`AgUiResumeBinding.from_agui(...)`；Binding 内部表示全部 resolved、Tool mixed cancellation
-或全部 cancelled abandonment，不公开原生 command。
+`ResumeTranslation` 是 Adapter 的低层结果。高层 Runtime 把 `AgUiResumeRequest` 交给
+`prepare_agui_resume(...)`，Definition 从 checkpointer 恢复原生 interrupt 与完整消息。返回的
+Binding 表示全部 resolved、Tool mixed cancellation 或全部 cancelled abandonment，不公开原生
+Command。`from_agui(...)` 只适用于可信事件日志集成，不能接收客户端重新提交的 interrupt 详情。
 
 ## interrupt 数据模型
 

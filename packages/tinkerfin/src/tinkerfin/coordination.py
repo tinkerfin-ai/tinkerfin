@@ -7,18 +7,18 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Protocol, runtime_checkable
 
-from tinkerfin_agui_adapter import Identity
+from tinkerfin_contracts import RunIdentity
 
 from ._tasks import join_task
 
 
 @runtime_checkable
 class RunCoordinator(Protocol):
-    """Provide one asynchronous exclusive scope for a run Identity."""
+    """Provide one asynchronous exclusive scope for a run identity."""
 
     def __call__(
         self,
-        identity: Identity,
+        identity: RunIdentity,
         /,
     ) -> AbstractAsyncContextManager[None]:
         """Return an exclusive asynchronous scope for ``identity``."""
@@ -43,10 +43,10 @@ class InMemoryRunCoordinator:
     Redis implementation when workers or processes must share the same run boundary.
 
     Args:
-        key_resolver: Convert a run Identity into a stable, non-blank key.
+        key_resolver: Convert a run identity into a stable, non-blank key.
     """
 
-    def __init__(self, *, key_resolver: Callable[[Identity], str]) -> None:
+    def __init__(self, *, key_resolver: Callable[[RunIdentity], str]) -> None:
         """Initialize process-local coordination for one event loop."""
 
         if not callable(key_resolver):
@@ -58,7 +58,7 @@ class InMemoryRunCoordinator:
 
     def __call__(
         self,
-        identity: Identity,
+        identity: RunIdentity,
         /,
     ) -> AbstractAsyncContextManager[None]:
         """Return the lazy exclusive scope for one validated run identity."""
@@ -66,9 +66,9 @@ class InMemoryRunCoordinator:
         return self._coordinate(identity)
 
     @asynccontextmanager  # pyright: ignore[reportDeprecated]
-    async def _coordinate(self, identity: Identity) -> AsyncIterator[None]:
-        if not isinstance(identity, Identity):
-            raise TypeError("identity must be an Identity")
+    async def _coordinate(self, identity: RunIdentity) -> AsyncIterator[None]:
+        if not isinstance(identity, RunIdentity):
+            raise TypeError("identity must be a RunIdentity")
         key = self._key_resolver(identity)
         if not isinstance(key, str):
             raise TypeError("key_resolver must return a string")

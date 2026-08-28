@@ -8,7 +8,7 @@ from typing import ClassVar, cast
 
 import pytest
 
-from tinkerfin import Identity
+from tinkerfin import RunIdentity
 from tinkerfin_messaging import (
     CodecMismatch,
     FiniteMessageSource,
@@ -31,8 +31,8 @@ def _identity(
     *,
     thread_id: str = "thread-1",
     run_id: str = "run-1",
-) -> Identity:
-    return Identity(threadId=thread_id, runId=run_id)
+) -> RunIdentity:
+    return RunIdentity(threadId=thread_id, runId=run_id)
 
 
 class _TextCodec:
@@ -71,7 +71,7 @@ class _MissingRunStatusBackend(MessagingBackend):
 
 
 class _InvalidRunStatusBackend(MemoryBackend):
-    async def get_run_status(self, *, channel: str, identity: Identity) -> RunStatus:
+    async def get_run_status(self, *, channel: str, identity: RunIdentity) -> RunStatus:
         del channel, identity
         return cast(RunStatus, "corrupted")
 

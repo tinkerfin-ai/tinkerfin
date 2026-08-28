@@ -2,13 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   deleteConversation,
-  fetchConversationEvents,
   fetchConversationHistoryDetail,
   fetchConversationHistoryGroupConfig,
   fetchConversationHistoryList,
+  followConversationTrace,
   patchConversation,
+  type ConversationHistoryDetail,
 } from './history'
-import { subscribeApiErrors } from '../shared/http'
 import { clearAuthSession, saveAuthSession } from '../../auth/session'
 
 function envelope(data: unknown, code = 0, message = 'success', status = 200) {
@@ -18,13 +18,58 @@ function envelope(data: unknown, code = 0, message = 'success', status = 200) {
   })
 }
 
-describe('conversation history client', () => {
+const detail = (): ConversationHistoryDetail => ({
+  id: 1,
+  threadId: 'thread-trace',
+  title: 'Trace 会话',
+  lastModel: 'main',
+  runtimeProfile: 'deepagents-v2',
+  pinned: false,
+  asOfSeq: 4,
+  headRunId: 'run-1',
+  availableHeads: ['run-1'],
+  historyCursor: null,
+  messageCount: 1,
+  toolCallCount: 0,
+  messages: [],
+  reasoning: [],
+  nodes: [],
+  state: { root: {}, subgraphs: {} },
+  interactions: [],
+  status: { execution: 'succeeded', headRunId: 'run-1' },
+  completeness: { missingPrefix: false, missingTail: false, payloadOmitted: false },
+  createdAt: '2026-08-28T00:00:00',
+  updatedAt: '2026-08-28T00:01:00',
+})
+
+const streamResponse = (...values: unknown[]) => {
+  const encoder = new TextEncoder()
+  return new Response(new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const value of values) {
+        controller.enqueue(encoder.encode(
+          'event: trace\ndata: ' + JSON.stringify(value) + '\n\n',
+        ))
+      }
+      controller.close()
+    },
+  }), { headers: { 'Content-Type': 'text/event-stream' } })
+}
+
+describe('conversation Trace client', () => {
   beforeEach(() => {
     saveAuthSession({
       token: 'history-token',
       tokenType: 'Bearer',
       expiresAt: '2099-01-01T00:00:00.000Z',
-      user: { user_id: 7, username: 'yunsan', display_name: '云杉', avatar_url: null, roles: [], disabled: false },
+      user: {
+        user_id: 7,
+        username: 'yunsan',
+        display_name: '云杉',
+        avatar_url: null,
+        roles: [],
+        disabled: false,
+      },
     })
   })
 
@@ -36,7 +81,7 @@ describe('conversation history client', () => {
   it.each([
     ['list', () => fetchConversationHistoryList()],
     ['config', () => fetchConversationHistoryGroupConfig()],
-    ['events', () => fetchConversationEvents('thread-auth')],
+    ['detail', () => fetchConversationHistoryDetail('thread-auth')],
     ['patch', () => patchConversation('thread-auth', { title: '新标题' })],
     ['delete', () => deleteConversation('thread-auth')],
   ])('sends the session bearer token for %s requests', async (_name, request) => {
@@ -44,12 +89,7 @@ describe('conversation history client', () => {
       const sentRequest = input instanceof Request ? input : new Request(input)
       expect(sentRequest.headers.get('Authorization')).toBe('Bearer history-token')
       if (sentRequest.method === 'DELETE') return new Response(null, { status: 204 })
-      return envelope({
-        items: [],
-        nextCursor: null,
-        threadId: 'thread-auth',
-        title: '新标题',
-      })
+      return envelope({ items: [], nextCursor: null, dayRanges: [7, 30], ...detail() })
     })
     vi.stubGlobal('fetch', fetchMock)
 
@@ -58,43 +98,17 @@ describe('conversation history client', () => {
     expect(fetchMock).toHaveBeenCalledOnce()
   })
 
-  it('rejects a business conflict returned with HTTP 409', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => envelope(
-      null,
-      1_001_004_003,
-      '会话仍在运行，请先停止并等待运行结束',
-      409,
-    )))
-
-    await expect(deleteConversation('thread-running')).rejects.toThrow(
-      '会话仍在运行，请先停止并等待运行结束',
-    )
-  })
-
-  it('accepts the empty 204 response after both stores are deleted', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 204 })))
-
-    await expect(deleteConversation('thread-idle')).resolves.toBeUndefined()
-  })
-
-  it('unwraps list responses through the shared client', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => envelope({
-      items: [],
-      nextCursor: null,
-    })))
-
-    await expect(fetchConversationHistoryList()).resolves.toEqual({
-      items: [],
-      nextCursor: null,
-    })
-  })
-
-  it('encodes the fuzzy query and opaque cursor in list requests', async () => {
+  it('encodes list and fixed Trace history cursors independently', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
-      const sentRequest = input instanceof Request ? input : new Request(input)
-      const url = new URL(sentRequest.url)
+      const request = input instanceof Request ? input : new Request(input)
+      const url = new URL(request.url)
+      if (url.pathname.endsWith('/history') && url.pathname.includes('thread-trace')) {
+        expect(url.searchParams.get('historyCursor')).toBe('opaque-trace-cursor')
+        expect(url.searchParams.get('limit')).toBe('40')
+        return envelope(detail())
+      }
       expect(url.searchParams.get('pageSize')).toBe('5')
-      expect(url.searchParams.get('cursor')).toBe('opaque-cursor')
+      expect(url.searchParams.get('cursor')).toBe('opaque-list-cursor')
       expect(url.searchParams.get('query')).toBe('目标会话')
       return envelope({ items: [], nextCursor: null })
     })
@@ -102,79 +116,71 @@ describe('conversation history client', () => {
 
     await fetchConversationHistoryList({
       pageSize: 5,
-      cursor: 'opaque-cursor',
+      cursor: 'opaque-list-cursor',
       query: '目标会话',
     })
-
-    expect(fetchMock).toHaveBeenCalledOnce()
-  })
-
-  it('unwraps history group configuration through the shared client', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => envelope({ dayRanges: [7, 30] })))
-
-    await expect(fetchConversationHistoryGroupConfig()).resolves.toEqual({
-      dayRanges: [7, 30],
+    await fetchConversationHistoryDetail('thread-trace', {
+      historyCursor: 'opaque-trace-cursor',
+      limit: 40,
     })
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
   })
 
-  it('unwraps update responses through the shared client', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => envelope({
-      id: 1,
-      threadId: 'thread-rename',
-      title: '新标题',
-    })))
+  it('parses the mandatory snapshot before semantic Trace updates', async () => {
+    const snapshot = { type: 'snapshot' as const, snapshot: detail() }
+    const update = {
+      type: 'update' as const,
+      update: {
+        asOfSeq: 5,
+        events: [],
+        facts: [],
+        messages: { upserts: [], removes: [] },
+        reasoning: { upserts: [], removes: [] },
+        nodes: { upserts: [], removes: [] },
+        interactions: { upserts: [], removes: [] },
+        state: { root: {}, subgraphs: {} },
+        status: { execution: 'succeeded', headRunId: 'run-1' },
+        completeness: { missingPrefix: false, missingTail: false, payloadOmitted: false },
+        messageCount: 1,
+        toolCallCount: 0,
+        projections: {},
+      },
+    }
+    vi.stubGlobal('fetch', vi.fn(async () => streamResponse(snapshot, update)))
 
-    await expect(patchConversation('thread-rename', { title: '新标题' })).resolves.toMatchObject({
-      threadId: 'thread-rename',
-      title: '新标题',
-    })
+    const received = []
+    for await (const event of followConversationTrace('thread-trace')) received.push(event)
+
+    expect(received).toEqual([snapshot, update])
   })
 
-  it('suppresses the global channel when event recovery has local error UI', async () => {
-    const listener = vi.fn()
-    const unsubscribe = subscribeApiErrors(listener)
-    vi.stubGlobal('fetch', vi.fn(async () => envelope(
-      null,
-      1_001_004_000,
-      '会话不存在',
-      404,
-    )))
+  it('rejects a non-Trace SSE event instead of coercing it', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => streamResponse({ type: 'RUN_STARTED' })))
 
-    await expect(fetchConversationEvents('thread-missing', {
-      suppressGlobalError: true,
-    })).rejects.toThrow('会话不存在')
-    expect(listener).not.toHaveBeenCalled()
+    const consume = async () => {
+      for await (const event of followConversationTrace('thread-trace')) {
+        // 消费完整流以触发边界校验
+        void event
+      }
+    }
 
-    unsubscribe()
+    await expect(consume()).rejects.toThrow()
   })
 
-  it.each([
-    ['detail', (signal: AbortSignal) => fetchConversationHistoryDetail('thread-cancel', { signal })],
-    ['events', (signal: AbortSignal) => fetchConversationEvents('thread-cancel', { signal })],
-  ])('propagates AbortSignal through %s requests', async (_name, request) => {
-    let requestSignal: AbortSignal | undefined
-    let notifyStarted: (() => void) | undefined
-    const started = new Promise<void>((resolve) => {
-      notifyStarted = resolve
-    })
-    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
-      const sentRequest = input instanceof Request ? input : new Request(input)
-      requestSignal = sentRequest.signal
-      notifyStarted?.()
-      return await new Promise<Response>((_resolve, reject) => {
-        sentRequest.signal.addEventListener('abort', () => {
-          reject(new DOMException('请求已取消', 'AbortError'))
-        }, { once: true })
-      })
-    }))
-    const controller = new AbortController()
-    const pending = request(controller.signal)
-    const rejection = expect(pending).rejects.toBeDefined()
+  it('keeps delete conflict and empty 204 behavior', async () => {
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce(envelope(
+        null,
+        1_001_004_003,
+        '会话仍在运行，请先停止并等待运行结束',
+        409,
+      ))
+      .mockResolvedValueOnce(new Response(null, { status: 204 })))
 
-    await started
-    controller.abort()
-
-    await rejection
-    expect(requestSignal?.aborted).toBe(true)
+    await expect(deleteConversation('thread-running')).rejects.toThrow(
+      '会话仍在运行，请先停止并等待运行结束',
+    )
+    await expect(deleteConversation('thread-idle')).resolves.toBeUndefined()
   })
 })

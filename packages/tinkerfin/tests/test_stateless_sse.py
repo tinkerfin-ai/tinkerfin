@@ -14,16 +14,16 @@ from pydantic import ValidationError
 
 from tinkerfin import (
     DeepAgentDefinition,
-    Identity,
     NativeStreamPart,
+    RunIdentity,
     SseBody,
     SseMapper,
     SsePayload,
 )
 
 
-def _identity() -> Identity:
-    return Identity(threadId="thread-1", runId="run-1")
+def _identity() -> RunIdentity:
+    return RunIdentity(threadId="thread-1", runId="run-1")
 
 
 def _graph_input() -> InputAgentState:
@@ -179,12 +179,20 @@ async def test_native_custom_mapper_filters_and_controls_payload_fields(
         yield {"type": "values", "ns": (), "data": {"value": 2}, "interrupts": ()}
 
     async def mapper(part: NativeStreamPart) -> SsePayload | None:
-        if part.data == {"value": 1}:
+        if part.data == {
+            "state": {"value": 1},
+            "messages": [],
+            "interrupts": [],
+        }:
             return None
         return SsePayload(data="line-1\nline-2", event="custom", retry=1500)
 
     async def event_id_resolver(part: NativeStreamPart) -> int:
-        assert part.data == {"value": 2}
+        assert part.data == {
+            "state": {"value": 2},
+            "messages": [],
+            "interrupts": [],
+        }
         return 7
 
     body = (

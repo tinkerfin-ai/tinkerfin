@@ -8,12 +8,12 @@ from pydantic_core import PydanticSerializationError
 from tinkerfin_agui_adapter import (
     AgUiStreamContractError,
     DeepAgentAgUiAdapter,
-    Identity,
+    RunIdentity,
 )
 
 
-def _identity() -> Identity:
-    return Identity(threadId="thread-1", runId="run-1")
+def _identity() -> RunIdentity:
+    return RunIdentity(threadId="thread-1", runId="run-1")
 
 
 def _task_start(*, namespace: tuple[str, ...] = ()) -> dict[str, object]:

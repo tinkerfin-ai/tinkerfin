@@ -1,0 +1,547 @@
+"""Deep Agents v2 invocation Driver and verified reasoning extractors."""
+
+from __future__ import annotations
+
+import inspect
+from collections.abc import Mapping, Sequence
+from datetime import datetime
+from typing import Protocol, cast, runtime_checkable
+
+from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
+from langgraph.types import StreamMode
+from pydantic import JsonValue
+
+from tinkerfin_contracts import (
+    NativeObservation,
+    NativeReasoningObservation,
+    NativeStateObservation,
+    NativeTaskObservation,
+    RunIdentity,
+    RunSourceContext,
+)
+from tinkerfin_native_stream import (
+    NativeExtraStreamPart,
+    NativeMessageStreamPart,
+    NativeStreamFrame,
+    NativeStreamPart,
+    NativeUpdatesStreamPart,
+    NativeValidatedStreamPart,
+    NativeValuesStreamPart,
+    to_json_value,
+    validate_native_stream_part,
+)
+
+from ._agui_lineage_state import RUNTIME_PROFILE_METADATA_KEY
+from ._observation import native_observation
+from .errors import TinkerFinStreamProtocolError
+
+_REQUIRED_MODES: tuple[StreamMode, ...] = ("messages", "tasks", "values")
+_SUPPORTED_EXTRA_MODES: frozenset[StreamMode] = frozenset(
+    {"updates", "checkpoints", "debug", "custom"}
+)
+
+
+def _bind_v2_invocation(
+    signature: inspect.Signature,
+    args: tuple[object, ...],
+    options: Mapping[str, object],
+    *,
+    identity: RunIdentity,
+    runtime_profile: str,
+) -> inspect.BoundArguments:
+    """Apply the complete locked v2 invocation contract before source creation."""
+
+    if not isinstance(identity, RunIdentity):
+        raise TypeError("identity must be a RunIdentity")
+    bound = signature.bind(*args, **dict(options))
+    parameters = signature.parameters
+    variable_keyword = next(
+        (
+            name
+            for name, parameter in parameters.items()
+            if parameter.kind is inspect.Parameter.VAR_KEYWORD
+        ),
+        None,
+    )
+
+    def read(name: str) -> object | None:
+        parameter = parameters.get(name)
+        if (
+            parameter is not None
+            and parameter.kind is not inspect.Parameter.VAR_KEYWORD
+        ):
+            return bound.arguments.get(name)
+        if variable_keyword is None:
+            return None
+        raw_values = bound.arguments.get(variable_keyword)
+        if not isinstance(raw_values, Mapping):
+            return None
+        return cast(Mapping[object, object], raw_values).get(name)
+
+    def supplied(name: str) -> bool:
+        parameter = parameters.get(name)
+        if (
+            parameter is not None
+            and parameter.kind is not inspect.Parameter.VAR_KEYWORD
+        ):
+            return name in bound.arguments
+        raw_values = (
+            None if variable_keyword is None else bound.arguments.get(variable_keyword)
+        )
+        return isinstance(raw_values, Mapping) and name in raw_values
+
+    def write(name: str, value: object) -> None:
+        parameter = parameters.get(name)
+        if (
+            parameter is not None
+            and parameter.kind is not inspect.Parameter.VAR_KEYWORD
+        ):
+            bound.arguments[name] = value
+            return
+        if variable_keyword is None:
+            raise TypeError(f"Graph astream must accept the {name!r} option")
+        raw_values = bound.arguments.get(variable_keyword)
+        values: dict[object, object] = (
+            dict(cast(Mapping[object, object], raw_values))
+            if isinstance(raw_values, Mapping)
+            else {}
+        )
+        values[name] = value
+        bound.arguments[variable_keyword] = values
+
+    raw_config = read("config")
+    if raw_config is None:
+        config: dict[str, object] = {}
+    elif isinstance(raw_config, Mapping):
+        config = dict(cast(Mapping[str, object], raw_config))
+    else:
+        raise TypeError("config must be a mapping or None")
+    raw_configurable = config.get("configurable")
+    if raw_configurable is None:
+        configurable: dict[str, object] = {}
+    elif isinstance(raw_configurable, Mapping):
+        configurable = dict(cast(Mapping[str, object], raw_configurable))
+    else:
+        raise TypeError("config.configurable must be a mapping")
+    configured_thread = configurable.get("thread_id")
+    if configured_thread is not None and configured_thread != identity.thread_id:
+        raise ValueError("config thread_id must equal identity.thread_id")
+    configurable["thread_id"] = identity.thread_id
+    configured_profile = configurable.get(RUNTIME_PROFILE_METADATA_KEY)
+    if configured_profile is not None and configured_profile != runtime_profile:
+        raise ValueError(
+            "config Runtime Profile must equal the selected TinkerFin Profile"
+        )
+    configurable[RUNTIME_PROFILE_METADATA_KEY] = runtime_profile
+    config["configurable"] = configurable
+    write("config", config)
+
+    if read("output_keys") is not None:
+        raise ValueError(
+            "Deep Agents v2 output_keys must be None so values remains a complete "
+            "state snapshot"
+        )
+
+    raw_modes = read("stream_mode")
+    if supplied("stream_mode") and raw_modes is None:
+        raise ValueError(
+            "Deep Agents v2 stream_mode must include messages, tasks, and values"
+        )
+    if raw_modes is None:
+        modes: tuple[object, ...] = ()
+    elif isinstance(raw_modes, str):
+        modes = (raw_modes,)
+    elif isinstance(raw_modes, Sequence):
+        modes = tuple(cast(Sequence[object], raw_modes))
+    else:
+        raise TypeError(
+            "Deep Agents v2 stream_mode must be a supported mode or sequence"
+        )
+    duplicate = tuple(mode for index, mode in enumerate(modes) if mode in modes[:index])
+    if duplicate:
+        raise ValueError(
+            f"Deep Agents v2 stream_mode contains duplicate modes: {duplicate!r}"
+        )
+    supported = frozenset((*_REQUIRED_MODES, *_SUPPORTED_EXTRA_MODES))
+    unsupported = tuple(
+        mode for mode in modes if not isinstance(mode, str) or mode not in supported
+    )
+    if unsupported:
+        raise ValueError(
+            f"Deep Agents v2 stream_mode contains unsupported modes: {unsupported!r}"
+        )
+    if supplied("stream_mode"):
+        missing = tuple(mode for mode in _REQUIRED_MODES if mode not in modes)
+        if missing:
+            raise ValueError(
+                f"Deep Agents v2 stream_mode is missing required modes: {missing!r}"
+            )
+    extra_modes = tuple(mode for mode in modes if mode not in _REQUIRED_MODES)
+    write("stream_mode", (*_REQUIRED_MODES, *extra_modes))
+
+    version = read("version")
+    if version is not None and version != "v2":
+        raise ValueError("Deep Agents v2 Driver requires version='v2'")
+    write("version", "v2")
+    subgraphs = read("subgraphs")
+    if subgraphs is not None and subgraphs is not True:
+        raise ValueError("Deep Agents v2 Driver requires subgraphs=True")
+    write("subgraphs", True)
+    return bound
+
+
+def _canonical_replay(
+    part: NativeValidatedStreamPart,
+    observation: NativeObservation,
+) -> NativeStreamPart:
+    """Build finite replay from the already normalized public observation graph.
+
+    Replay deliberately excludes Runtime identity and timestamps because the stream
+    source owns those separately. Building from the observation avoids serializing
+    opaque upstream task/state objects a second time. The Plan non-JSON regression and
+    Native codec contract tests protect this ordering.
+    """
+
+    # Extra modes deliberately remain metadata-only in the user Trace Ledger, but
+    # Native replay is a transport contract and must retain their finite payload.
+    # Normalizing here keeps that provider-shaped value inside the Driver boundary;
+    # downstream SSE and Messaging consumers receive only the detached result.
+    payload = (
+        to_json_value(part.data)
+        if isinstance(part, NativeExtraStreamPart | NativeUpdatesStreamPart)
+        else cast(
+            JsonValue,
+            observation.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude={
+                    "identity",
+                    "kind",
+                    "monotonic_ns",
+                    "namespace",
+                    "observed_at",
+                },
+            ),
+        )
+    )
+    interrupt_records = (
+        observation.interrupts
+        if isinstance(observation, NativeTaskObservation | NativeStateObservation)
+        else ()
+    )
+    interrupts = tuple(
+        cast(JsonValue, item.model_dump(mode="json", by_alias=True))
+        for item in interrupt_records
+    )
+    return NativeStreamPart(
+        type=part.type,
+        ns=part.ns,
+        data=payload,
+        interrupts=interrupts,
+    )
+
+
+@runtime_checkable
+class ReasoningExtractor(Protocol):
+    """Extract one verified provider reasoning value from a native message."""
+
+    @property
+    def name(self) -> str:
+        """Return the stable extractor identity used in observations."""
+
+        ...
+
+    def extract(self, message: BaseMessage) -> JsonValue | None:
+        """Return reasoning content or ``None`` when this extractor does not match."""
+
+        ...
+
+
+class DeepSeekReasoningExtractor:
+    """Extract the verified DeepSeek reasoning metadata path.
+
+    The supported source is
+    ``AIMessage.additional_kwargs.reasoning_content`` and the equivalent
+    ``AIMessageChunk`` field observed in the locked Deep Agents corpus. The
+    extractor never scans arbitrary same-named business fields.
+    """
+
+    @property
+    def name(self) -> str:
+        """Return the stable provider-path identity."""
+
+        return "deepseek.additional_kwargs.reasoning_content"
+
+    def extract(self, message: BaseMessage) -> JsonValue | None:
+        """Return a non-empty verified reasoning string when present.
+
+        Args:
+            message: Live LangChain message from a validated Native frame.
+
+        Returns:
+            The reasoning string, or ``None`` when the verified path is absent.
+
+        Raises:
+            TinkerFinStreamProtocolError: The provider path contains a non-string
+                value that does not match the locked provider contract.
+        """
+
+        if not isinstance(message, AIMessage | AIMessageChunk):
+            return None
+        value = message.additional_kwargs.get("reasoning_content")
+        if value is None or value == "":
+            return None
+        if not isinstance(value, str):
+            raise TinkerFinStreamProtocolError(
+                "DeepSeek reasoning_content must be a string"
+            )
+        return value
+
+
+@runtime_checkable
+class NativeStreamDriver(Protocol):
+    """Bind and normalize one concrete third-party Native stream profile.
+
+    The Driver owns upstream invocation requirements as well as per-part conversion.
+    TinkerFin never probes an event to guess a Driver and never changes Drivers during
+    one Run. Every implementation must map its source into the same canonical frame.
+    """
+
+    def bind_invocation(
+        self,
+        signature: inspect.Signature,
+        args: tuple[object, ...],
+        options: Mapping[str, object],
+        *,
+        identity: RunIdentity,
+        runtime_profile: str,
+    ) -> inspect.BoundArguments:
+        """Bind one upstream call and apply this Driver's complete stream profile.
+
+        Args:
+            signature: Concrete upstream ``astream`` signature.
+            args: Positional arguments supplied by the Runtime caller.
+            options: Keyword arguments supplied by the Runtime caller.
+            identity: Canonical Run identity that must own the upstream thread.
+            runtime_profile: Canonical Profile identity persisted with checkpoints.
+
+        Returns:
+            Bound arguments ready for lineage preparation and invocation.
+
+        Raises:
+            TypeError: The upstream signature or an option has an invalid shape.
+            ValueError: Caller options conflict with the Driver profile.
+        """
+
+        ...
+
+    def validate(self, part: object) -> NativeValidatedStreamPart:
+        """Return the immutable validated representation of one upstream part."""
+
+        ...
+
+    def normalize(
+        self,
+        part: object,
+        *,
+        context: RunSourceContext,
+    ) -> NativeStreamFrame:
+        """Return validated data and ordered protocol-neutral observations."""
+
+        ...
+
+
+class DeepAgentsV2StreamDriver:
+    """Own the locked Deep Agents 0.7.5 and LangGraph v2 stream profile.
+
+    The Driver fixes ``messages/tasks/values``, third-party ``version="v2"``, complete
+    state snapshots, and subgraph streaming. The version identifier remains confined
+    to this integration boundary and never becomes a TinkerFin protocol field.
+    ``test_v2_profile_owns_factory_identity_and_complete_invocation_binding`` and the
+    locked Deep Agents 0.7.5 corpus protect these upstream assumptions; downstream
+    consumers are instead tested against ``NativeStreamFrame``.
+
+    Args:
+        reasoning_extractors: Explicit provider extractors. Omitting the tuple means
+            no provider reasoning observation can be emitted.
+
+    Raises:
+        TypeError: An extractor does not implement ``ReasoningExtractor``.
+        ValueError: Extractor names are non-canonical or duplicated.
+    """
+
+    def __init__(
+        self,
+        *,
+        reasoning_extractors: tuple[ReasoningExtractor, ...] = (),
+    ) -> None:
+        """Freeze and validate the ordered provider reasoning extractor registry."""
+
+        names: list[str] = []
+        for extractor in reasoning_extractors:
+            if not isinstance(extractor, ReasoningExtractor):
+                raise TypeError("reasoning extractor must implement ReasoningExtractor")
+            name = extractor.name
+            if not isinstance(name, str) or not name or name != name.strip():
+                raise ValueError("reasoning extractor name must be canonical text")
+            names.append(name)
+        if len(set(names)) != len(names):
+            raise ValueError("reasoning extractor names must be unique")
+        self._reasoning_extractors = reasoning_extractors
+
+    @property
+    def reasoning_extractors(self) -> tuple[ReasoningExtractor, ...]:
+        """Return the immutable ordered extractor registration."""
+
+        return self._reasoning_extractors
+
+    def bind_invocation(
+        self,
+        signature: inspect.Signature,
+        args: tuple[object, ...],
+        options: Mapping[str, object],
+        *,
+        identity: RunIdentity,
+        runtime_profile: str,
+    ) -> inspect.BoundArguments:
+        """Bind one call to the complete locked LangGraph v2 profile.
+
+        Args:
+            signature: Concrete upstream ``astream`` signature.
+            args: Positional invocation values.
+            options: Keyword invocation values, including supported extra modes.
+            identity: Canonical identity whose thread ID is injected into config.
+            runtime_profile: Selected Profile identity injected into private config.
+
+        Returns:
+            Bound arguments containing the required modes, v2, and subgraphs.
+
+        Raises:
+            TypeError: Config or stream options have invalid container types.
+            ValueError: Identity, modes, output keys, version, or subgraphs conflict
+                with the current Driver contract.
+        """
+
+        return _bind_v2_invocation(
+            signature,
+            args,
+            options,
+            identity=identity,
+            runtime_profile=runtime_profile,
+        )
+
+    def validate(self, part: object) -> NativeValidatedStreamPart:
+        """Validate one live part against the current Deep Agents v2 contract."""
+
+        return validate_native_stream_part(part)
+
+    def normalize(
+        self,
+        part: object,
+        *,
+        context: RunSourceContext,
+    ) -> NativeStreamFrame:
+        """Validate one part and produce ordered Runtime observations.
+
+        Args:
+            part: Live upstream StreamPart object.
+            context: Immutable Run identity, lineage, and privacy context.
+
+        Returns:
+            One frame containing the validated part, its core observation, optional
+            explicitly enabled reasoning observations, and root interrupt IDs.
+
+        Raises:
+            TinkerFinStreamProtocolError: Multiple extractors claim one message or a
+                reasoning message lacks a stable ID.
+            NativeStreamContractError: The current upstream part is malformed.
+        """
+
+        canonical = self.validate(part)
+        primary = native_observation(canonical, context=context)
+        reasoning = self._reasoning_observations(
+            canonical,
+            context=context,
+            observed_at=primary.observed_at,
+            monotonic_ns=primary.monotonic_ns,
+        )
+        root_interrupt_ids = (
+            tuple(value.id for value in canonical.interrupts)
+            if isinstance(canonical, NativeValuesStreamPart) and not canonical.ns
+            else ()
+        )
+        return NativeStreamFrame(
+            canonical=canonical,
+            observations=(primary, *reasoning),
+            replay=_canonical_replay(canonical, primary),
+            root_interrupt_ids=root_interrupt_ids,
+        )
+
+    def _reasoning_observations(
+        self,
+        part: NativeValidatedStreamPart,
+        *,
+        context: RunSourceContext,
+        observed_at: datetime,
+        monotonic_ns: int,
+    ) -> tuple[NativeObservation, ...]:
+        if not self._reasoning_extractors:
+            return ()
+        messages: tuple[BaseMessage, ...]
+        if isinstance(part, NativeMessageStreamPart):
+            messages = (part.data.message,)
+        elif isinstance(part, NativeValuesStreamPart):
+            raw_messages = part.data.get("messages", ())
+            if not isinstance(raw_messages, Sequence) or isinstance(
+                raw_messages,
+                (str, bytes, bytearray),
+            ):
+                raise TypeError("values messages must be a sequence")
+            values = cast(Sequence[object], raw_messages)
+            if any(not isinstance(value, BaseMessage) for value in values):
+                raise TypeError("values messages must contain LangChain messages")
+            messages = tuple(cast(Sequence[BaseMessage], values))
+        else:
+            return ()
+
+        observations: list[NativeObservation] = []
+        for message in messages:
+            matches = [
+                (extractor.name, value)
+                for extractor in self._reasoning_extractors
+                if (value := extractor.extract(message)) is not None
+            ]
+            if len(matches) > 1:
+                raise TinkerFinStreamProtocolError(
+                    "multiple reasoning extractors matched one message"
+                )
+            if not matches:
+                continue
+            message_id = message.id
+            if not isinstance(message_id, str) or not message_id:
+                raise TinkerFinStreamProtocolError(
+                    "reasoning observations require a stable message ID"
+                )
+            extractor_name, content = matches[0]
+            observations.append(
+                NativeReasoningObservation(
+                    identity=context.identity,
+                    namespace=part.ns,
+                    message_id=message_id,
+                    extractor=extractor_name,
+                    content=content,
+                    snapshot=not isinstance(message, AIMessageChunk),
+                    observed_at=observed_at,
+                    monotonic_ns=monotonic_ns,
+                )
+            )
+        return tuple(observations)
+
+
+__all__ = [
+    "DeepAgentsV2StreamDriver",
+    "DeepSeekReasoningExtractor",
+    "NativeStreamDriver",
+    "NativeStreamFrame",
+    "ReasoningExtractor",
+]

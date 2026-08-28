@@ -8,21 +8,30 @@ from typing import Annotated, Any, TypedDict, cast
 
 import pytest
 from ag_ui.core import BaseEvent, RunErrorEvent, RunStartedEvent
+from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.base import CheckpointTuple
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import interrupt
 
-import tinkerfin.deep_agent as deep_agent_module
-from tinkerfin import AgUiResumeBinding, Identity, TinkerFin
+from tinkerfin import (
+    AgUiResumeBinding,
+    DeepAgentsV2RuntimeProfile,
+    RunIdentity,
+    TinkerFin,
+)
 from tinkerfin._agui_lineage import (
     CHECKPOINT_ROLE_METADATA_KEY,
     NATIVE_CHECKPOINT_ROLE,
     PARENT_RUN_ID_METADATA_KEY,
     RUN_ID_METADATA_KEY,
+    RUNTIME_PROFILE_METADATA_KEY,
+    _resume_stage_and_source,
 )
 from tinkerfin._agui_lineage_state import (
     PLANNING_CHECKPOINT_RUN_ID,
+    RESUME_MARKER_STATE_KEY,
     lineage_state_update,
 )
 from tinkerfin.errors import TinkerFinLifecycleError
@@ -30,13 +39,20 @@ from tinkerfin.errors import TinkerFinLifecycleError
 
 def test_lineage_marker_uses_the_current_unversioned_contract() -> None:
     payload = lineage_state_update(
-        identity=Identity(threadId="thread-1", runId="run-1"),
+        identity=RunIdentity(threadId="thread-1", runId="run-1"),
         parent_run_id=None,
+        runtime_profile="deepagents-v2",
         role="native",
     )["_tinkerfin_lineage"]
 
     assert PLANNING_CHECKPOINT_RUN_ID == "tinkerfin-plan"
-    assert set(payload) == {"threadId", "runId", "parentRunId", "role"}
+    assert set(payload) == {
+        "threadId",
+        "runId",
+        "parentRunId",
+        "runtimeProfile",
+        "role",
+    }
 
 
 class _BranchState(TypedDict, total=False):
@@ -47,6 +63,8 @@ class _BranchState(TypedDict, total=False):
 
 def _install_branch_graph(
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    executions: list[str] | None = None,
 ) -> tuple[MemorySaver, list[CompiledStateGraph[Any, Any, Any, Any]]]:
     saver = MemorySaver()
     graphs: list[CompiledStateGraph[Any, Any, Any, Any]] = []
@@ -54,6 +72,8 @@ def _install_branch_graph(
     def build(*_args: object, **_kwargs: object):
         async def record(state: _BranchState) -> dict[str, object]:
             latest = state.get("history", [""])[-1]
+            if executions is not None:
+                executions.append(latest)
             if latest == "fail":
                 raise RuntimeError("branch fixture failure")
             if latest == "pause":
@@ -68,8 +88,133 @@ def _install_branch_graph(
         graphs.append(graph)
         return graph
 
-    monkeypatch.setattr(deep_agent_module, "_native_create_deep_agent", build)
+    monkeypatch.setattr(
+        "tinkerfin.runtime_profile._deepagents_graph.create_deep_agent",
+        build,
+    )
     return saver, graphs
+
+
+class _DifferentFixtureProfile(DeepAgentsV2RuntimeProfile):
+    """Give the v2 fixture a distinct integration identity for lineage tests."""
+
+    @property
+    def profile_id(self) -> str:
+        """Return a non-production identity without pretending to implement v3."""
+
+        return "fixture-different-profile"
+
+
+class _MappedCheckpointSaver(MemorySaver):
+    """Return exact synthetic parent rows for corrupt-ancestry contract tests."""
+
+    def __init__(self, checkpoints: dict[str, CheckpointTuple]) -> None:
+        super().__init__()
+        self._checkpoints = checkpoints
+
+    async def aget_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
+        checkpoint_id = config.get("configurable", {}).get("checkpoint_id")
+        return (
+            self._checkpoints.get(checkpoint_id)
+            if isinstance(checkpoint_id, str)
+            else None
+        )
+
+
+def _checkpoint_config(checkpoint_id: str) -> RunnableConfig:
+    return {
+        "configurable": {
+            "thread_id": "thread-cycle",
+            "checkpoint_ns": "",
+            "checkpoint_id": checkpoint_id,
+        }
+    }
+
+
+def _committed_resume_checkpoint(
+    checkpoint_id: str,
+    *,
+    parent_id: str | None,
+    marker: object,
+) -> CheckpointTuple:
+    return CheckpointTuple(
+        config=_checkpoint_config(checkpoint_id),
+        checkpoint=cast(
+            Any,
+            {"channel_values": {RESUME_MARKER_STATE_KEY: marker}},
+        ),
+        metadata=cast(Any, {}),
+        parent_config=(None if parent_id is None else _checkpoint_config(parent_id)),
+        pending_writes=[],
+    )
+
+
+def _resume_marker_fixture() -> tuple[RunIdentity, object]:
+    identity = RunIdentity(threadId="thread-cycle", runId="run-resume")
+    binding = AgUiResumeBinding(
+        mode="resume",
+        resume_data={"answer": "continue"},
+        native_interrupt_ids=("interrupt-1",),
+    )
+    marker = binding._marker(identity=identity, parent_run_id="run-parent")
+    return identity, marker
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("parents", "head_id"),
+    [
+        ({"a": "a"}, "a"),
+        ({"a": "b", "b": "a"}, "a"),
+    ],
+)
+async def test_resume_ancestry_rejects_checkpoint_cycles(
+    parents: dict[str, str],
+    head_id: str,
+) -> None:
+    identity, marker = _resume_marker_fixture()
+    rows = {
+        checkpoint_id: _committed_resume_checkpoint(
+            checkpoint_id,
+            parent_id=parent_id,
+            marker=cast(Any, marker).model_dump(mode="json", by_alias=True),
+        )
+        for checkpoint_id, parent_id in parents.items()
+    }
+    saver = _MappedCheckpointSaver(rows)
+
+    with pytest.raises(TinkerFinLifecycleError, match="checkpoint cycle"):
+        await _resume_stage_and_source(
+            saver,
+            head=rows[head_id],
+            identity=identity,
+            marker=cast(Any, marker),
+            runtime_profile=DeepAgentsV2RuntimeProfile(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_resume_ancestry_rejects_an_unbounded_checkpoint_chain() -> None:
+    identity, marker = _resume_marker_fixture()
+    serialized = cast(Any, marker).model_dump(mode="json", by_alias=True)
+    rows = {
+        f"checkpoint-{index}": _committed_resume_checkpoint(
+            f"checkpoint-{index}",
+            parent_id=(None if index == 4096 else f"checkpoint-{index + 1}"),
+            marker=serialized,
+        )
+        for index in range(4097)
+    }
+    saver = _MappedCheckpointSaver(rows)
+
+    with pytest.raises(TinkerFinLifecycleError, match="safe checkpoint depth"):
+        await _resume_stage_and_source(
+            saver,
+            head=rows["checkpoint-0"],
+            identity=identity,
+            marker=cast(Any, marker),
+            runtime_profile=DeepAgentsV2RuntimeProfile(),
+        )
 
 
 async def _run(
@@ -80,7 +225,7 @@ async def _run(
     parent_run_id: str | None = None,
     resume: AgUiResumeBinding | None = None,
 ) -> tuple[list[BaseEvent], object]:
-    identity = Identity(threadId="thread-1", runId=run_id)
+    identity = RunIdentity(threadId="thread-1", runId=run_id)
     runtime = cast(Any, definition).new_agui(
         identity=identity,
         parent_run_id=parent_run_id,
@@ -334,6 +479,92 @@ async def test_interrupted_parent_requires_the_exact_resume_binding(
 
 
 @pytest.mark.asyncio
+async def test_branch_rejects_a_checkpoint_from_another_runtime_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executions: list[str] = []
+    saver, _graphs = _install_branch_graph(monkeypatch, executions=executions)
+    source = TinkerFin().create_deep_agent(model="provider:model", tools=[])
+    await _run(source, run_id="run-profile-source", value="source")
+
+    mismatched = TinkerFin(
+        runtime_profile=_DifferentFixtureProfile(),
+    ).create_deep_agent(model="provider:model", tools=[])
+    events, stream = await _run(
+        mismatched,
+        run_id="run-profile-child",
+        value="must-not-run",
+        parent_run_id="run-profile-source",
+    )
+
+    assert [event.type.value for event in events] == ["RUN_STARTED", "RUN_ERROR"]
+    assert isinstance(cast(Any, stream).error, TinkerFinLifecycleError)
+    assert "another Runtime Profile" in str(cast(Any, stream).error)
+    assert executions == ["source"]
+    child_rows = [
+        row
+        async for row in saver.alist(
+            {"configurable": {"thread_id": "thread-1"}},
+            filter={RUN_ID_METADATA_KEY: "run-profile-child"},
+        )
+    ]
+    assert child_rows == []
+
+
+@pytest.mark.asyncio
+async def test_resume_rejects_a_checkpoint_from_another_runtime_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executions: list[str] = []
+    saver, _graphs = _install_branch_graph(monkeypatch, executions=executions)
+    source = TinkerFin().create_deep_agent(model="provider:model", tools=[])
+    interrupted_events, _source_stream = await _run(
+        source,
+        run_id="run-profile-paused",
+        value="pause",
+    )
+    assert interrupted_events[-1].type.value == "RUN_FINISHED"
+    paused_head = await _run_head(saver, run_id="run-profile-paused")
+    native_ids = tuple(
+        item.id
+        for _task_id, _channel, value in paused_head.pending_writes or ()
+        if isinstance(value, list)
+        for item in value
+        if hasattr(item, "id")
+    )
+    assert native_ids
+
+    mismatched = TinkerFin(
+        runtime_profile=_DifferentFixtureProfile(),
+    ).create_deep_agent(model="provider:model", tools=[])
+    binding = AgUiResumeBinding(
+        mode="resume",
+        resume_data={"answer": "continue"},
+        native_interrupt_ids=native_ids,
+    )
+    events, stream = await _run(
+        mismatched,
+        run_id="run-profile-resume",
+        value=None,
+        parent_run_id="run-profile-paused",
+        resume=binding,
+    )
+
+    assert [event.type.value for event in events] == ["RUN_STARTED", "RUN_ERROR"]
+    assert isinstance(cast(Any, stream).error, TinkerFinLifecycleError)
+    assert "another Runtime Profile" in str(cast(Any, stream).error)
+    assert executions == ["pause"]
+    resumed_rows = [
+        row
+        async for row in saver.alist(
+            {"configurable": {"thread_id": "thread-1"}},
+            filter={RUN_ID_METADATA_KEY: "run-profile-resume"},
+        )
+    ]
+    assert resumed_rows == []
+
+
+@pytest.mark.asyncio
 async def test_active_parent_is_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -341,13 +572,14 @@ async def test_active_parent_is_rejected(
     definition = TinkerFin().create_deep_agent(model="provider:model", tools=[])
     cast(Any, definition)._build_astream("default")
     active_graph = graphs[-1]
-    active_identity = Identity(threadId="thread-1", runId="run-active")
+    active_identity = RunIdentity(threadId="thread-1", runId="run-active")
     active_stream = active_graph.astream(
         {
             "history": ["active"],
             **lineage_state_update(
                 identity=active_identity,
                 parent_run_id=None,
+                runtime_profile="deepagents-v2",
                 role="native",
             ),
         },
@@ -355,6 +587,7 @@ async def test_active_parent_is_rejected(
             "configurable": {
                 "thread_id": "thread-1",
                 RUN_ID_METADATA_KEY: "run-active",
+                RUNTIME_PROFILE_METADATA_KEY: "deepagents-v2",
                 CHECKPOINT_ROLE_METADATA_KEY: NATIVE_CHECKPOINT_ROLE,
             }
         },

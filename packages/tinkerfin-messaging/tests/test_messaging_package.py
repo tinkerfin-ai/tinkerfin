@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import subprocess
 import sys
@@ -13,7 +14,42 @@ from pathlib import Path
 import pytest
 
 import tinkerfin_messaging
-from tinkerfin import Identity
+from tinkerfin_contracts import RunIdentity
+
+
+@pytest.mark.parametrize(
+    ("method_name", "documents_return"),
+    [
+        ("prepare", True),
+        ("append", True),
+        ("begin_settlement", True),
+        ("finish", False),
+        ("latest_seq", True),
+        ("get_run_status", True),
+        ("read", True),
+        ("bind_follow", True),
+        ("follow", True),
+        ("request_cancel", True),
+        ("wait_for_cancel", True),
+        ("wait_finished", True),
+        ("failure", True),
+        ("renew", True),
+        ("delete_stream", False),
+    ],
+)
+def test_backend_protocol_documents_public_lifecycle_contracts(
+    method_name: str,
+    documents_return: bool,
+) -> None:
+    """Keep ownership, result, and failure guidance next to each Backend method."""
+
+    method = getattr(tinkerfin_messaging.MessagingBackend, method_name)
+    documentation = inspect.getdoc(method)
+
+    assert documentation is not None
+    assert "Args:" in documentation
+    assert "Raises:" in documentation
+    assert ("Returns:" in documentation) is documents_return
 
 
 def test_public_namespace_exposes_the_default_tinkerfin_facade() -> None:
@@ -26,6 +62,7 @@ def test_public_namespace_exposes_the_default_tinkerfin_facade() -> None:
         "MemoryBackend",
         "MessageChannel",
         "MessageCodec",
+        "MessageCodecInputSource",
         "MessageEnvelope",
         "MessageSource",
         "MessageSourceBinding",
@@ -49,21 +86,21 @@ def test_public_namespace_exposes_the_default_tinkerfin_facade() -> None:
 def test_cancel_context_is_an_immutable_public_value() -> None:
     context = tinkerfin_messaging.CancelContext(
         channel="events",
-        identity=Identity(threadId="conversation-1", runId="run-1"),
+        identity=RunIdentity(threadId="conversation-1", runId="run-1"),
     )
 
     assert (context.channel, context.identity) == (
         "events",
-        Identity(threadId="conversation-1", runId="run-1"),
+        RunIdentity(threadId="conversation-1", runId="run-1"),
     )
     with pytest.raises(FrozenInstanceError):
         context.__setattr__(
             "identity",
-            Identity(threadId="conversation-1", runId="replacement"),
+            RunIdentity(threadId="conversation-1", runId="replacement"),
         )
 
 
-def test_base_import_does_not_load_core_runtime_or_redis_integration() -> None:
+def test_base_import_does_not_load_optional_integrations() -> None:
     repository_root = Path(__file__).resolve().parents[3]
     result = subprocess.run(
         [
@@ -72,8 +109,9 @@ def test_base_import_does_not_load_core_runtime_or_redis_integration() -> None:
             (
                 "import json, sys, tinkerfin_messaging; "
                 "print(json.dumps(sorted(name for name in sys.modules "
-                "if name == 'tinkerfin' or name.startswith('tinkerfin.') "
-                "or name == 'redis' or name.startswith('redis.'))))"
+                "if any(name == prefix or name.startswith(prefix + '.') "
+                "for prefix in ('ag_ui', 'deepagents', 'langchain', 'langgraph', "
+                "'redis', 'tinkerfin', 'tinkerfin_native_stream')))))"
             ),
         ],
         cwd=repository_root,
@@ -85,7 +123,7 @@ def test_base_import_does_not_load_core_runtime_or_redis_integration() -> None:
     assert json.loads(result.stdout) == []
 
 
-def test_distribution_declares_default_tinkerfin_dependencies() -> None:
+def test_distribution_declares_only_protocol_neutral_core_dependencies() -> None:
     try:
         metadata = distribution("tinkerfin-messaging")
     except PackageNotFoundError:
@@ -93,22 +131,36 @@ def test_distribution_declares_default_tinkerfin_dependencies() -> None:
 
     requirements = set(metadata.requires or ())
     assert "pydantic<3,>=2" in requirements
-    assert "ag-ui-protocol==0.1.19" in requirements
-    assert "tinkerfin<0.9.0,>=0.1.0" in requirements
+    assert "tinkerfin-contracts<0.9.0,>=0.1.0" in requirements
+    assert not any(
+        "extra ==" not in value and "ag-ui-protocol" in value for value in requirements
+    )
+    assert not any(
+        "extra ==" not in value and value.startswith("tinkerfin<")
+        for value in requirements
+    )
     assert files("tinkerfin_messaging").joinpath("py.typed").is_file()
 
 
-def test_distribution_only_keeps_the_redis_extra() -> None:
+def test_distribution_declares_redis_agui_and_native_extras() -> None:
     requirements = set(distribution("tinkerfin-messaging").requires or ())
 
     assert 'redis<9,>=6; extra == "redis"' in requirements
-    assert not any('extra == "agui"' in value for value in requirements)
-    assert not any('extra == "native"' in value for value in requirements)
+    assert 'ag-ui-protocol==0.1.19; extra == "agui"' in requirements
+    assert 'tinkerfin-native-stream<0.9.0,>=0.1.0; extra == "native"' in requirements
+    assert not any(
+        'extra == "native"' in value and value.startswith("tinkerfin<")
+        for value in requirements
+    )
 
 
 @pytest.mark.parametrize(
     ("symbol", "blocked_packages", "extra"),
-    (("RedisBackend", ("redis",), "redis"),),
+    (
+        ("AgUiCodec", ("ag_ui",), "agui"),
+        ("NativeStreamPartCodec", ("tinkerfin_native_stream",), "native"),
+        ("RedisBackend", ("redis",), "redis"),
+    ),
 )
 def test_missing_optional_dependency_reports_the_install_command(
     symbol: str,

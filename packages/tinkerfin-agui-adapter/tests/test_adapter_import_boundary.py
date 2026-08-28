@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 
@@ -16,7 +17,7 @@ import asyncio
 import builtins
 import sys
 
-blocked = {"deepagents", "langgraph", "tinkerfin"}
+blocked = {"deepagents", "tinkerfin", "tinkerfin_messaging", "tinkerfin_tracing"}
 original_import = builtins.__import__
 
 def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
@@ -35,15 +36,19 @@ expected_exports = {
     "AgUiLifecycleError", "AgUiSerializationError", "AgUiStreamContractError",
     "AgUiLifecycleEventFactory", "AgentRunOutcome", "AgentRuntimeInterrupt",
     "DeepAgentAgUiAdapter", "HitlActionRequest", "HitlCorrelationError",
-    "HitlNoMatchError", "HitlRequest", "HitlReviewConfig", "Identity",
+    "HitlNoMatchError", "HitlRequest", "HitlReviewConfig", "RunIdentity",
     "ResumeMapper", "ResumeMappingError",
     "ResumeTranslation", "RuntimeInterruptEnvelope", "ScopedIdCodec", "SseEventId",
     "SUBAGENT_PROVENANCE_SCHEMA", "SubagentProvenance",
     "TOOL_REVIEW_SCHEMA", "ToolReviewContractError",
     "ToolReviewDecision", "ToolReviewInterruptMetadata", "astream_events",
+    "ValidatedDeepAgentStreamPart", "ValidatedExtraStreamPart",
+    "ValidatedMessageStreamPart", "ValidatedTaskResultPayload",
+    "ValidatedTaskStartPayload", "ValidatedTasksStreamPart",
+    "ValidatedUpdatesStreamPart", "ValidatedValuesStreamPart",
     "create_subagent_provenance", "encode_sse", "micro_batch",
     "parse_tool_review_interrupt", "require_valid_schema", "subagent_invocation_id",
-    "validate_json_schema_instance",
+    "validate_deep_agent_stream_part", "validate_json_schema_instance",
 }
 assert set(tinkerfin_agui_adapter.__all__) == expected_exports
 for export in expected_exports:
@@ -53,7 +58,7 @@ DeepAgentAgUiAdapter = tinkerfin_agui_adapter.DeepAgentAgUiAdapter
 ResumeMapper = tinkerfin_agui_adapter.ResumeMapper
 astream_events = tinkerfin_agui_adapter.astream_events
 encode_sse = tinkerfin_agui_adapter.encode_sse
-Identity = tinkerfin_agui_adapter.Identity
+RunIdentity = tinkerfin_agui_adapter.RunIdentity
 
 async def parts():
     yield {
@@ -67,7 +72,7 @@ async def parts():
     yield {"type": "values", "ns": (), "data": {}, "interrupts": ()}
 
 async def main():
-    identity = Identity(threadId="thread-1", runId="run-1")
+    identity = RunIdentity(threadId="thread-1", runId="run-1")
     events = [
         event
         async for event in astream_events(
@@ -97,3 +102,41 @@ assert not (blocked & set(sys.modules))
     )
 
     assert completed.returncode == 0, completed.stderr
+
+
+def test_built_wheel_contains_only_current_contract_artifacts(tmp_path: Path) -> None:
+    """A local incremental build must not publish deleted contract generations."""
+
+    package_root = Path(__file__).parents[1]
+    repository_root = package_root.parents[1]
+    output = tmp_path / "dist"
+    subprocess.run(
+        [
+            "uv",
+            "build",
+            "--offline",
+            "--quiet",
+            "--wheel",
+            "--out-dir",
+            str(output),
+            "--no-create-gitignore",
+            str(package_root),
+        ],
+        cwd=repository_root,
+        check=True,
+    )
+    wheel = next(output.glob("tinkerfin_agui_adapter-*.whl"))
+
+    with zipfile.ZipFile(wheel) as archive:
+        names = set(archive.namelist())
+
+    contract_names = {
+        name for name in names if name.startswith("tinkerfin_agui_adapter/contracts/")
+    }
+    assert contract_names == {
+        "tinkerfin_agui_adapter/contracts/subagent-provenance.fixture.json",
+        "tinkerfin_agui_adapter/contracts/subagent-provenance.schema.json",
+        "tinkerfin_agui_adapter/contracts/tool-review.fixture.json",
+        "tinkerfin_agui_adapter/contracts/tool-review.schema.json",
+    }
+    assert not any("-v1" in name for name in names)
