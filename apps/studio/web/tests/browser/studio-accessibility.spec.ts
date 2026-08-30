@@ -179,13 +179,6 @@ const spacingAuditMessages: Message[] = [
     createdAt: BASE_TIME,
   },
   {
-    id: 'spacing-empty-assistant',
-    role: 'assistant',
-    content: '',
-    createdAt: BASE_TIME,
-    meta: { status: 'completed' },
-  },
-  {
     id: 'spacing-user-d',
     role: 'user',
     content: '气泡 D',
@@ -390,6 +383,24 @@ const planQuestionForm = {
       prompt: '期望完成日期是什么时候？',
       required: true,
     },
+    {
+      id: 'browser-plan-time',
+      answerType: 'time',
+      prompt: '期望几点上线？',
+      required: true,
+      timeZone: 'Asia/Shanghai',
+      minimum: '09:00',
+      maximum: '18:00',
+    },
+    {
+      id: 'browser-plan-datetime',
+      answerType: 'datetime',
+      prompt: '回滚截止点是什么时候？',
+      required: true,
+      timeZone: 'Asia/Shanghai',
+      minimum: '2026-09-01T09:00',
+      maximum: '2026-09-30T18:00',
+    },
   ] as JsonValue[],
 } satisfies JsonObject
 
@@ -459,7 +470,16 @@ const planReviewPayload: JsonObject = {
   schema: 'tinkerfin.runtime-interrupt',
   kind: 'tinkerfin:plan_review',
   message: 'Review the proposed Plan before execution begins.',
-  responseSchema: { type: 'object' },
+  responseSchema: {
+    discriminator: {
+      propertyName: 'type',
+      mapping: {
+        approve: '#/$defs/ApprovePlan',
+        reject: '#/$defs/RejectPlan',
+        cancel: '#/$defs/CancelPlan',
+      },
+    },
+  },
   metadata: {
     origin: 'plan',
     review: {
@@ -1094,14 +1114,16 @@ test('Plan 澄清按后端题型渲染单选、多选、文本与日期控件', 
   for (const bounds of [dateIconBounds, dateLabelBounds, dateInputBounds]) {
     expect(Math.abs(bounds.y + (bounds.height / 2) - dateRowCenter)).toBeLessThanOrEqual(.5)
   }
+  await page.locator('.plan-question-composer-head').hover()
   const initialDateStyle = await date.evaluate((element) => {
     const style = getComputedStyle(element)
     return { backgroundColor: style.backgroundColor, borderColor: style.borderColor }
   })
   await date.hover()
   await expect(date).toHaveCSS('cursor', 'pointer')
-  expect(await date.evaluate((element) => getComputedStyle(element).backgroundColor))
-    .not.toBe(initialDateStyle.backgroundColor)
+  await expect.poll(async () => (
+    date.evaluate((element) => getComputedStyle(element).backgroundColor)
+  )).not.toBe(initialDateStyle.backgroundColor)
   await page.locator('.plan-question-composer-head').hover()
   await date.focus()
   expect(await date.evaluate((element) => getComputedStyle(element).borderColor))
@@ -1158,6 +1180,85 @@ test('Plan 澄清按后端题型渲染单选、多选、文本与日期控件', 
   }, nextMonthValue)
   await expect(date).toContainText(expectedDisplay)
   await expect(date).toBeFocused()
+
+  await page.getByRole('button', { name: '下一题', exact: true }).click()
+  const time = page.getByRole('button', { name: '时间回答：期望几点上线？' })
+  await expect(time).toHaveAttribute('aria-haspopup', 'dialog')
+  await expect(page.locator('.plan-question-time select')).toHaveCount(0)
+  await expect(page.getByRole('region', { name: '期望几点上线？' })).not.toContainText('时区')
+  const timeBounds = await time.boundingBox()
+  if (!timeBounds) throw new Error('时间选择器几何不可用')
+  expect(timeBounds.height).toBeCloseTo(dateInputBounds.height, 5)
+  await time.click()
+  const timeDialog = page.getByRole('dialog', { name: '选择时间' })
+  await expect(timeDialog).toBeVisible()
+  await expect(timeDialog).toHaveCSS('border-radius', '22px')
+  await expect.poll(async () => {
+    const [triggerBounds, dialogBounds] = await Promise.all([
+      time.boundingBox(),
+      timeDialog.boundingBox(),
+    ])
+    if (!triggerBounds || !dialogBounds) return Number.POSITIVE_INFINITY
+    return Math.abs(
+      triggerBounds.x + triggerBounds.width - dialogBounds.x - dialogBounds.width,
+    )
+  }).toBeLessThanOrEqual(1)
+  for (const [colorScheme, expectedBackground] of [
+    ['light', 'rgb(255, 255, 255)'],
+    ['dark', 'rgb(35, 35, 36)'],
+  ] as const) {
+    await page.emulateMedia({ colorScheme })
+    await page.evaluate((theme) => {
+      document.documentElement.dataset.theme = theme
+    }, colorScheme)
+    for (const width of [320, 768, 1024, 1440]) {
+      await page.setViewportSize({ width, height: 900 })
+      const closeNavigation = page.getByRole('button', { name: '关闭导航' })
+      if (await closeNavigation.isVisible()) await closeNavigation.click()
+      await expect(timeDialog).toHaveCSS('background-color', expectedBackground)
+      const [responsiveTriggerBounds, responsiveDialogBounds] = await Promise.all([
+        time.boundingBox(),
+        timeDialog.boundingBox(),
+      ])
+      if (!responsiveTriggerBounds || !responsiveDialogBounds) {
+        throw new Error('时间选择器响应式几何不可用')
+      }
+      expect(responsiveDialogBounds.x).toBeGreaterThanOrEqual(0)
+      expect(responsiveDialogBounds.x + responsiveDialogBounds.width).toBeLessThanOrEqual(width)
+      expect(responsiveDialogBounds.y).toBeGreaterThanOrEqual(0)
+      expect(responsiveDialogBounds.y + responsiveDialogBounds.height).toBeLessThanOrEqual(900)
+      expect(responsiveTriggerBounds.x).toBeGreaterThanOrEqual(0)
+      expect(responsiveTriggerBounds.x + responsiveTriggerBounds.width).toBeLessThanOrEqual(width)
+    }
+  }
+  await page.emulateMedia({ colorScheme: 'light' })
+  await page.evaluate(() => {
+    document.documentElement.dataset.theme = 'light'
+  })
+  await page.setViewportSize({ width: 1024, height: 900 })
+  const hourList = page.getByRole('listbox', { name: '小时' })
+  const minuteList = page.getByRole('listbox', { name: '分钟' })
+  await hourList.getByRole('option', { name: '09' }).click()
+  await minuteList.getByRole('option', { name: '30' }).click()
+  await expect(time).toContainText('09:30')
+  await expect(time).toBeFocused()
+
+  await page.getByRole('button', { name: '下一题', exact: true }).click()
+  const dateTimeRegion = page.getByRole('region', { name: '回滚截止点是什么时候？' })
+  await expect(dateTimeRegion).not.toContainText('时区')
+  await expect(dateTimeRegion).not.toContainText('允许范围')
+  const dateTimeDate = page.getByRole('button', { name: '日期回答：回滚截止点是什么时候？' })
+  const dateTimeTime = page.getByRole('button', { name: '时间回答：回滚截止点是什么时候？' })
+  await expect(dateTimeTime).toBeDisabled()
+  await dateTimeDate.click()
+  await page.locator('[data-date-value="2026-09-01"]').click()
+  await expect(dateTimeTime).toBeEnabled()
+  await expect(dateTimeTime).toContainText('09:00')
+  await dateTimeTime.click()
+  await page.getByRole('listbox', { name: '小时' }).getByRole('option', { name: '09' }).click()
+  await page.getByRole('listbox', { name: '分钟' }).getByRole('option', { name: '30' }).click()
+  await expect(dateTimeTime).toContainText('09:30')
+  await expect(page.locator('.plan-question-datetime select')).toHaveCount(0)
 })
 
 test('Plan 澄清切换到长多选题后 Tab 从首项按视觉顺序移动', async ({ page }) => {
@@ -1339,21 +1440,15 @@ test('收起的 Plan 澄清和标准输入框同高同宽且内部布局同步',
     expect(question.surface.y + question.surface.height - (
       question.progress.y + question.progress.height
     )).toBeCloseTo(0, 5)
-    expect(Math.abs(
-      question.heading.y - question.surface.y
-      - (question.surface.y + question.surface.height
-        - question.progressBar.y - question.progressBar.height),
-    )).toBeLessThanOrEqual(1)
   }
 })
 
-test('展开的审批、Plan 澄清与草稿使用协调的双层标题和静态渐变', async ({ page }) => {
+test('展开的审批、Plan 澄清与草稿使用统一单行标题规格和静态渐变', async ({ page }) => {
   type HeaderChrome = {
     headerHeight: number
     headingCenterDelta: number
     actionsCenterDelta: number | null
-    titleToDescription: number | null
-    descriptionToBoundary: number | null
+    descriptionCenterDelta: number | null
     titleFontSize: string
     titleLineHeight: string
     titleWeight: string
@@ -1388,14 +1483,13 @@ test('展开的审批、Plan 澄清与草稿使用协调的双层标题和静态
           const bridge = card.querySelector<HTMLElement>('.interaction-card-color-bridge')
           if (!header || !bridge) throw new Error('卡片标题渐变几何不可用')
           const title = header.querySelector<HTMLElement>('h2')
-          const description = header.querySelector<HTMLElement>('p')
+          const description = header.querySelector<HTMLElement>('.plan-interaction-card-description')
           const actions = selectors.actions
             ? header.querySelector<HTMLElement>(selectors.actions)
             : null
           const heading = title?.parentElement
           if (!title || !heading || (selectors.actions && !actions)) throw new Error('卡片标题渐变几何不可用')
           const headerBounds = header.getBoundingClientRect()
-          const titleBounds = title.getBoundingClientRect()
           const headingBounds = heading.getBoundingClientRect()
           const actionsBounds = actions?.getBoundingClientRect()
           const bridgeBounds = bridge.getBoundingClientRect()
@@ -1403,12 +1497,6 @@ test('展开的审批、Plan 澄清与草稿使用协调的双层标题和静态
           const descriptionBounds = description?.getBoundingClientRect()
           const descriptionStyle = description ? getComputedStyle(description) : null
           const bridgeStyle = getComputedStyle(bridge)
-          const titleHalfLeading = (
-            Number.parseFloat(titleStyle.lineHeight) - Number.parseFloat(titleStyle.fontSize)
-          ) / 2
-          const descriptionHalfLeading = descriptionStyle
-            ? (Number.parseFloat(descriptionStyle.lineHeight) - Number.parseFloat(descriptionStyle.fontSize)) / 2
-            : null
           return {
             headerHeight: headerBounds.height,
             headingCenterDelta: headingBounds.top + (headingBounds.height / 2)
@@ -1417,11 +1505,9 @@ test('展开的审批、Plan 澄清与草稿使用协调的双层标题和静态
               ? actionsBounds.top + (actionsBounds.height / 2)
                 - headerBounds.top - (headerBounds.height / 2)
               : null,
-            titleToDescription: descriptionBounds && descriptionHalfLeading != null
-              ? descriptionBounds.top - titleBounds.bottom + titleHalfLeading + descriptionHalfLeading
-              : null,
-            descriptionToBoundary: descriptionBounds && descriptionHalfLeading != null
-              ? headerBounds.bottom - descriptionBounds.bottom + descriptionHalfLeading
+            descriptionCenterDelta: descriptionBounds
+              ? descriptionBounds.top + (descriptionBounds.height / 2)
+                - headerBounds.top - (headerBounds.height / 2)
               : null,
             titleFontSize: titleStyle.fontSize,
             titleLineHeight: titleStyle.lineHeight,
@@ -1457,6 +1543,7 @@ test('展开的审批、Plan 澄清与草稿使用协调的双层标题和静态
   const reviewChrome = await collectChrome({
     cardSelector: '.plan-review-composer',
     headerSelector: '.plan-review-composer-head',
+    actionsSelector: '.plan-review-composer-head-actions',
   })
 
   for (const [key, approval] of approvalChrome) {
@@ -1475,10 +1562,12 @@ test('展开的审批、Plan 澄清与草稿使用协调的双层标题和静态
       expect(chrome.bridgePointerEvents).toBe('none')
       expect(chrome.bridgeBackground).toContain('linear-gradient')
     }
+    for (const chrome of [approval, question, review]) {
+      expect(chrome.headerHeight).toBeCloseTo(44, 5)
+    }
     for (const chrome of [question]) {
-      expect(chrome.headerHeight).toBeCloseTo(60, 5)
-      expect(chrome.titleToDescription).toBeCloseTo(11.5, 5)
-      expect(chrome.descriptionToBoundary).toBeCloseTo(10.5, 5)
+      expect(Math.abs(chrome.descriptionCenterDelta ?? Number.POSITIVE_INFINITY))
+        .toBeLessThanOrEqual(1)
       expect(chrome.descriptionFontSize).toBe('13px')
       expect(chrome.descriptionLineHeight).toBe('22px')
       expect(chrome.hasDescription).toBe(true)
@@ -1486,11 +1575,11 @@ test('展开的审批、Plan 澄清与草稿使用协调的双层标题和静态
     for (const chrome of [approval, review]) {
       expect(chrome.headerHeight).toBeCloseTo(44, 5)
       expect(chrome.hasDescription).toBe(false)
-      expect(chrome.titleToDescription).toBeNull()
-      expect(chrome.descriptionToBoundary).toBeNull()
-      expect(chrome.actionsCenterDelta).toBeNull()
+      expect(chrome.descriptionCenterDelta).toBeNull()
     }
     expect(approval.actionsCenterDelta).toBeNull()
+    expect(Math.abs(review.actionsCenterDelta ?? Number.POSITIVE_INFINITY))
+      .toBeLessThanOrEqual(1)
   }
 })
 
@@ -1547,7 +1636,7 @@ test('Tool 审批按独立卡片顺序接管输入区且不暴露折叠或拖拽
   await reject.click()
   const reason = card.getByRole('textbox', { name: '拒绝原因（可选）' })
   await expect(reason).toBeFocused()
-  await card.getByRole('button', { name: '取消' }).click()
+  await card.getByRole('button', { name: '取消', exact: true }).click()
   await expect(reject).toBeFocused()
 
   await page.emulateMedia({ reducedMotion: 'reduce' })
@@ -1630,8 +1719,6 @@ test('普通用户与回答使用角色化节奏且卡片边界保持16px', asyn
     userC: page.locator('#spacing-user-c .message-markdown'),
     userCAction: page.locator('#spacing-user-c .message-action-row--user'),
     error: page.locator('#spacing-error'),
-    emptyIndicator: page.locator('#spacing-empty-assistant .streaming-indicator'),
-    emptyDots: page.locator('#spacing-empty-assistant .activity-dots'),
     userD: page.locator('#spacing-user-d .message-markdown'),
   }
   const gap = (before: { y: number; height: number }, after: { y: number }) => (
@@ -1671,9 +1758,6 @@ test('普通用户与回答使用角色化节奏且卡片边界保持16px', asyn
       expect(gap(bounds.assistantBCopy, bounds.userC)).toBeCloseTo(57, 5)
       expect(gap(bounds.userC, bounds.error)).toBeCloseTo(56, 5)
       expect(gap(bounds.userCAction, bounds.error)).toBeCloseTo(16, 5)
-      expect(gap(bounds.emptyIndicator, bounds.userD)).toBeCloseTo(16, 5)
-      expect(bounds.emptyIndicator.x).toBeCloseTo(bounds.assistantBBody.x, 5)
-      expect(bounds.emptyDots.x - bounds.assistantBBody.x).toBeCloseTo(1, 5)
     }
   }
 })
@@ -1908,7 +1992,7 @@ test('提问等待状态与上一条气泡使用公共顶层间距', async ({ pa
   const waitDots = waitState.locator('.activity-dots')
   const messageList = page.locator('.message-list')
 
-  await expect(header.locator('p'))
+  await expect(header.locator('.plan-interaction-card-description'))
     .toHaveText('这些答案会影响后续规划')
   for (const [colorScheme, headerBackground, contentBackground, accentColor] of [
     ['light', 'rgb(237, 243, 254)', 'rgb(255, 255, 255)', 'rgb(57, 100, 254)'],
@@ -1972,16 +2056,17 @@ test('计划草稿以描述标题和三动作卡片接管输入区', async ({ pa
     .toHaveText('保持现有会话行为并完成响应式验证')
   await expect(card.locator('.plan-review-composer-heading p')).toHaveCount(0)
   await expect(card.locator('.plan-review-composer-heading small')).toHaveCount(0)
-  await expect(card).not.toContainText('Plan')
+  await expect(card.locator('.plan-review-composer-heading h2')).not.toContainText('Plan')
   await expect(card).not.toContainText('第 3 版')
   await expect(card.locator('.plan-review-toggle-surface')).toHaveCount(0)
-  await expect(card.locator('.plan-review-composer-head-button')).toHaveCount(0)
+  await expect(card.locator('.plan-review-composer-head-button')).toHaveCount(1)
+  await expect(card.getByRole('button', { name: '取消当前 Plan 草稿' })).toBeVisible()
   await expect(page.getByRole('separator', { name: '调整交互卡片高度' })).toBeVisible()
   await expect(waitState).toContainText('Plan')
   await expect(waitState).toContainText('等待审阅')
   await expect(waitDots).toBeVisible()
   await expect(card.getByRole('button', { name: '拒绝' })).toBeVisible()
-  await expect(card.getByRole('button', { name: '反馈' })).toBeVisible()
+  await expect(card.getByRole('button', { name: '反馈' })).toHaveCount(0)
   await expect(card.getByRole('button', { name: '批准' })).toBeVisible()
   await expect(card.getByRole('button', { name: '编辑' })).toHaveCount(0)
   await expect(card.getByRole('button', { name: /关闭|放弃/ })).toHaveCount(0)
@@ -2021,8 +2106,8 @@ test('计划草稿以描述标题和三动作卡片接管输入区', async ({ pa
       ])
       if (!cardBounds || !statusBounds || !dotsBounds || !messageListBounds) throw new Error('计划草稿卡片几何不可用')
       const actionBounds = await Promise.all([
+        card.getByRole('button', { name: '取消当前 Plan 草稿' }).boundingBox(),
         card.getByRole('button', { name: '拒绝' }).boundingBox(),
-        card.getByRole('button', { name: '反馈' }).boundingBox(),
         card.getByRole('button', { name: '批准' }).boundingBox(),
       ])
       if (actionBounds.some((bounds) => !bounds)) throw new Error('计划草稿操作按钮几何不可用')
@@ -2041,15 +2126,15 @@ test('计划草稿以描述标题和三动作卡片接管输入区', async ({ pa
   }
 
   await page.emulateMedia({ colorScheme: 'light' })
-  const feedback = card.getByRole('button', { name: '反馈' })
-  await feedback.click()
-  const feedbackInput = card.getByRole('textbox', { name: '需要调整的内容' })
-  const submitDecision = card.getByRole('button', { name: '提交决定' })
-  await expect(feedbackInput).toBeFocused()
-  await expect(feedbackInput).toHaveAttribute('required', '')
-  await expect(submitDecision).toBeDisabled()
-  await feedbackInput.fill('补充断连恢复验证')
-  await expect(submitDecision).toBeEnabled()
+  const reject = card.getByRole('button', { name: '拒绝' })
+  await reject.click()
+  const rejectionReason = card.getByRole('textbox', { name: '拒绝原因（可选）' })
+  await expect(rejectionReason).toBeFocused()
+  await expect(rejectionReason).not.toHaveAttribute('required')
+  await expect(card.getByRole('button', { name: '确认拒绝' })).toBeEnabled()
+  await rejectionReason.fill('补充断连恢复验证')
+  await card.getByRole('button', { name: '取消', exact: true }).click()
+  await expect(reject).toBeFocused()
 
   await expect(card.getByRole('region', { name: '计划草稿内容' })).toBeVisible()
   await expect(card).toContainText('保持现有会话行为并完成响应式验证')

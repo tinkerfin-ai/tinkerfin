@@ -208,7 +208,7 @@ export function ApprovalCard({
         <div className="approval-composer-heading">
           <h2>
             <span className="approval-status-dot" aria-hidden="true" />
-            <span>{description.title}</span>
+            <span className="plan-interaction-card-title">{description.title}</span>
           </h2>
         </div>
       </header>

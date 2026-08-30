@@ -50,6 +50,8 @@ describe('PlanReviewCard', () => {
       .toHaveTextContent('切换实现模式并保持父图稳定')
     const card = screen.getByRole('region', { name: 'Plan 审阅' })
     expect(card.querySelector('.plan-review-composer-heading p')).not.toBeInTheDocument()
+    expect(card.querySelector('.plan-interaction-card-title'))
+      .toHaveTextContent('切换实现模式并保持父图稳定')
     expect(card.querySelector('.interaction-card-color-bridge.is-warning')).toBeInTheDocument()
     expect(screen.getByText('保持父图稳定')).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: '编辑' })).not.toBeInTheDocument()
@@ -168,5 +170,14 @@ describe('PlanReviewCard', () => {
     expect(conversationStyles).toMatch(/\.plan-review-composer-footer\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) auto;[^}]*min-height:\s*var\(--space-16\);[^}]*padding:\s*var\(--space-3\) var\(--space-4\);/s)
     expect(conversationStyles).not.toContain('.plan-review-input.is-editor')
     expect(conversationStyles).not.toContain('.plan-review-actions')
+  })
+
+  it('与 HITL 和澄清卡共用标题尺寸、间距和动作规格', () => {
+    expect(conversationStyles).toMatch(/\.approval-composer-head,\s*\.plan-question-composer-head,\s*\.plan-review-composer-head\s*\{[^}]*align-items:\s*center;[^}]*gap:\s*var\(--space-4\);[^}]*padding:\s*10px var\(--space-4\);/s)
+    expect(conversationStyles).toMatch(/\.approval-composer-heading h2,\s*\.plan-question-composer-heading h2,\s*\.plan-review-composer-heading h2\s*\{[^}]*gap:\s*var\(--space-2\);[^}]*font-size:\s*var\(--type-ui-size\);[^}]*line-height:\s*var\(--type-title-line\);/s)
+    expect(conversationStyles).toMatch(/\.plan-interaction-card-head-button\s*\{[^}]*width:\s*var\(--control-plan-chip\);[^}]*height:\s*var\(--control-plan-chip\);/s)
+    expect(conversationStyles).toMatch(/\.approval-status-dot\s*\{[^}]*width:\s*var\(--icon-sm\);[^}]*height:\s*var\(--icon-sm\);/s)
+    expect(conversationStyles).toMatch(/\.approval-composer-head,\s*\.plan-review-composer-head\s*\{[^}]*var\(--color-warning-panel-background\);/s)
+    expect(conversationStyles).toMatch(/\.plan-question-composer-head\s*\{[^}]*var\(--color-plan-panel-background\);/s)
   })
 })

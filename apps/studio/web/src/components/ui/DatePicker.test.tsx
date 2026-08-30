@@ -65,10 +65,10 @@ describe('DatePicker', () => {
   })
 
   it('遵循全局控件、触控、高对比和 reduced-motion 契约', () => {
-    expect(uiStyles).toMatch(/\.ui-date-picker__trigger--xs\s*\{[^}]*height:\s*var\(--control-xs\);[^}]*min-height:\s*var\(--control-xs\);/s)
-    expect(uiStyles).toMatch(/\.ui-date-picker__trigger:hover:not\(:disabled\)\s*\{[^}]*cursor:\s*pointer;/s)
-    expect(uiStyles).toMatch(/@media \(any-hover: none\), \(any-pointer: coarse\)[\s\S]*\.ui-date-picker__trigger,\s*\.ui-date-picker__nav,\s*\.ui-date-picker__day,\s*\.ui-date-picker__period\s*\{[^}]*min-height:\s*var\(--control-lg\);/s)
-    expect(uiStyles).toMatch(/@media \(forced-colors: active\)[\s\S]*\.ui-date-picker__trigger:focus-visible,[\s\S]*outline:\s*2px solid Highlight;/s)
-    expect(uiStyles).toMatch(/@media \(prefers-reduced-motion: reduce\)[\s\S]*\.ui-date-picker__popover,[\s\S]*transition:\s*none;/s)
+    expect(uiStyles).toMatch(/\.ui-temporal-picker__trigger--xs\s*\{[^}]*height:\s*var\(--control-xs\);[^}]*min-height:\s*var\(--control-xs\);/s)
+    expect(uiStyles).toMatch(/\.ui-temporal-picker__trigger:hover:not\(:disabled\)\s*\{[^}]*cursor:\s*pointer;/s)
+    expect(uiStyles).toMatch(/@media \(any-hover: none\), \(any-pointer: coarse\)[\s\S]*\.ui-temporal-picker__trigger,\s*\.ui-date-picker__nav,\s*\.ui-date-picker__day,\s*\.ui-date-picker__period,[\s\S]*min-height:\s*var\(--control-lg\);/s)
+    expect(uiStyles).toMatch(/@media \(forced-colors: active\)[\s\S]*\.ui-temporal-picker__trigger:focus-visible,[\s\S]*outline:\s*2px solid Highlight;/s)
+    expect(uiStyles).toMatch(/@media \(prefers-reduced-motion: reduce\)[\s\S]*\.ui-temporal-picker__popover,[\s\S]*transition:\s*none;/s)
   })
 })

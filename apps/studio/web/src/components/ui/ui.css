@@ -221,7 +221,7 @@
   }
 
   .ui-text-field__control,
-  .ui-date-picker__trigger {
+  .ui-temporal-picker__trigger {
     border: 1px solid var(--color-border);
     outline: 0;
     background: var(--color-layer-1);
@@ -233,10 +233,10 @@
 
   .ui-text-field__control { border-radius: var(--radius-3xl); }
 
-  .ui-date-picker,
-  .ui-date-picker__control { display: inline-flex; min-width: 0; }
+  .ui-temporal-picker,
+  .ui-temporal-picker__control { display: inline-flex; min-width: 0; }
 
-  .ui-date-picker__trigger {
+  .ui-temporal-picker__trigger {
     box-sizing: border-box;
     display: inline-flex;
     align-items: center;
@@ -253,24 +253,25 @@
     cursor: pointer;
   }
 
-  .ui-date-picker__trigger > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .ui-date-picker__trigger > svg { flex: 0 0 auto; }
-  .ui-date-picker__trigger.is-placeholder { color: var(--color-placeholder); }
-  .ui-date-picker__trigger--xs { height: var(--control-xs); min-height: var(--control-xs); }
-  .ui-date-picker__trigger--md { height: var(--control-md); min-height: var(--control-md); }
-  .ui-date-picker__trigger--lg { height: var(--control-lg); min-height: var(--control-lg); }
+  .ui-temporal-picker__trigger > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ui-temporal-picker__trigger > svg { flex: 0 0 auto; }
+  .ui-temporal-picker__trigger.is-placeholder { color: var(--color-placeholder); }
+  .ui-temporal-picker__trigger--xs { height: var(--control-xs); min-height: var(--control-xs); }
+  .ui-temporal-picker__trigger--md { height: var(--control-md); min-height: var(--control-md); }
+  .ui-temporal-picker__trigger--lg { height: var(--control-lg); min-height: var(--control-lg); }
 
-  .ui-date-picker__trigger:hover:not(:disabled) {
+  .ui-temporal-picker__trigger:hover:not(:disabled) {
     border-color: var(--color-border-strong);
     background: var(--color-hover);
     color: var(--color-text-primary);
     cursor: pointer;
   }
 
-  .ui-date-picker__trigger:disabled { cursor: not-allowed; opacity: .48; }
-  .ui-date-picker__trigger[aria-invalid='true'] { border-color: var(--color-danger); }
+  .ui-temporal-picker__trigger:disabled { cursor: not-allowed; opacity: .48; }
+  .ui-temporal-picker__trigger[aria-invalid='true'] { border-color: var(--color-danger); }
 
-  .ui-date-picker__popover {
+  .ui-temporal-picker__popover {
+    box-sizing: border-box;
     position: relative;
     z-index: var(--layer-dropdown);
     width: min(300px, calc(100vw - var(--space-6)));
@@ -281,7 +282,53 @@
     box-shadow: var(--shadow-3);
     color: var(--color-text-primary);
     font-family: var(--font-ui);
-    animation: ui-date-picker-in var(--motion-fast) var(--ease-out) both;
+    animation: ui-temporal-picker-in var(--motion-fast) var(--ease-out) both;
+  }
+
+  .ui-time-picker__positioner { position: fixed; z-index: var(--layer-dropdown); }
+  .ui-time-picker__columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-3); }
+  .ui-time-picker__column { min-width: 0; }
+  .ui-time-picker__column h3 {
+    margin: 0 0 var(--space-2);
+    color: var(--color-text-secondary);
+    font-size: var(--type-ui-size);
+    font-weight: var(--weight-semibold);
+    line-height: var(--type-title-line);
+    text-align: center;
+  }
+  .ui-time-picker__list {
+    display: grid;
+    max-height: min(216px, calc(100vh - 120px));
+    gap: var(--space-0-5);
+    padding-right: var(--space-0-5);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+  .ui-time-picker__option {
+    display: grid;
+    width: 100%;
+    height: var(--control-sm);
+    padding: 0;
+    place-items: center;
+    border: 0;
+    border-radius: var(--radius-lg);
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    font-family: var(--font-ui);
+    font-size: var(--type-ui-size);
+    font-weight: var(--weight-regular);
+    line-height: var(--type-ui-line);
+  }
+  .ui-time-picker__option:hover:not(:disabled) { background: var(--color-hover); color: var(--color-text-primary); }
+  .ui-time-picker__option:active:not(:disabled) { background: var(--color-active); }
+  .ui-time-picker__option:focus-visible { outline: 2px solid var(--color-border-strong); outline-offset: -2px; }
+  .ui-time-picker__option:disabled { cursor: not-allowed; opacity: .36; }
+  .ui-time-picker__option.is-selected,
+  .ui-time-picker__option.is-selected:hover {
+    background: var(--color-brand);
+    color: var(--color-on-brand);
+    font-weight: var(--weight-semibold);
   }
 
   .ui-date-picker__head {
@@ -407,7 +454,7 @@
   .ui-text-field--capsule .ui-text-field__control { border-radius: var(--radius-3xl); }
 
   .ui-text-field__control:focus-within,
-  .ui-date-picker__trigger:focus-visible {
+  .ui-temporal-picker__trigger:focus-visible {
     border-color: var(--color-border-strong);
     outline: 0;
     box-shadow: none;
@@ -634,7 +681,7 @@
     to { transform: rotate(360deg); }
   }
 
-  @keyframes ui-date-picker-in {
+  @keyframes ui-temporal-picker-in {
     from { transform: translateY(var(--space-1)); opacity: 0; }
     to { transform: translateY(0); opacity: 1; }
   }
@@ -642,7 +689,7 @@
   @keyframes ui-modal-in { from { transform: translateY(var(--space-2)) scale(.985); opacity: 0; } to { transform: translateY(0) scale(1); opacity: 1; } }
 
   @media (max-width: 440px) {
-    .ui-date-picker__popover { width: 100vw; padding: var(--space-1-5); }
+    .ui-temporal-picker__popover { width: calc(100vw - (2 * var(--space-3))); padding: var(--space-1-5); }
     .ui-date-picker__weekdays,
     .ui-date-picker__grid { gap: 0; }
     .modal-backdrop { padding: var(--space-3); }
@@ -652,17 +699,18 @@
   }
 
   @media (any-hover: none), (any-pointer: coarse) {
-    .ui-date-picker__popover { width: min(344px, 100vw); }
+    .ui-temporal-picker__popover { width: min(344px, calc(100vw - (2 * var(--space-3)))); }
     .ui-button {
       min-width: var(--control-lg);
       min-height: var(--control-lg);
     }
 
-    .ui-date-picker__trigger,
+    .ui-temporal-picker__trigger,
     .ui-date-picker__nav,
     .ui-date-picker__day,
-    .ui-date-picker__period { min-height: var(--control-lg); }
-    .ui-date-picker__trigger,
+    .ui-date-picker__period,
+    .ui-time-picker__option { min-height: var(--control-lg); }
+    .ui-temporal-picker__trigger,
     .ui-date-picker__nav { height: var(--control-lg); }
     .ui-date-picker__nav { width: var(--control-lg); min-width: var(--control-lg); }
     .ui-date-picker__head {
@@ -676,8 +724,8 @@
 
   @media (forced-colors: active) {
     .ui-button,
-    .ui-date-picker__popover,
-    .ui-date-picker__trigger,
+    .ui-temporal-picker__popover,
+    .ui-temporal-picker__trigger,
     .ui-text-field__control,
     .ui-surface {
       border: 1px solid ButtonText;
@@ -686,11 +734,12 @@
     }
 
     .ui-button:focus-visible,
-    .ui-date-picker__trigger:focus-visible,
+    .ui-temporal-picker__trigger:focus-visible,
     .ui-date-picker__nav:focus-visible,
     .ui-date-picker__caption:focus-visible,
     .ui-date-picker__day:focus-visible,
     .ui-date-picker__period:focus-visible,
+    .ui-time-picker__option:focus-visible,
     .ui-icon-button:focus-visible,
     .ui-text-field__control:focus-within {
       outline: 2px solid Highlight;
@@ -704,8 +753,9 @@
 
   @media (prefers-reduced-motion: reduce) {
     .ui-button,
-    .ui-date-picker__popover,
-    .ui-date-picker__trigger,
+    .ui-temporal-picker__popover,
+    .ui-temporal-picker__trigger,
+    .ui-time-picker__option,
     .ui-tooltip,
     .ui-text-field__control,
     .modal-dialog {

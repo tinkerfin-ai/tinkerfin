@@ -68,6 +68,7 @@ describe('ApprovalCard', () => {
     const card = screen.getByRole('region', { name: '等待审批' })
     expect(card).toHaveTextContent('/first.txt')
     expect(card.querySelector('.approval-composer-head')).toHaveTextContent('写入 /first.txt')
+    expect(card.querySelector('.plan-interaction-card-title')).toHaveTextContent('写入 /first.txt')
     expect(card.querySelector('.interaction-card-color-bridge.is-warning')).toBeInTheDocument()
     for (const action of ['允许', '拒绝']) {
       expect(screen.getByRole('button', { name: action })).toHaveClass('ui-button--capsule')

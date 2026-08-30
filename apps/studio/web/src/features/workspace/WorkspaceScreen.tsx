@@ -1009,7 +1009,6 @@ export function WorkspaceScreen({
                     : current,
                 )}
                 onSubmit={submitPlanInteraction}
-                onAbandon={exitPlanMode}
               />
               )
               : conversation.planInteraction?.kind === 'review'

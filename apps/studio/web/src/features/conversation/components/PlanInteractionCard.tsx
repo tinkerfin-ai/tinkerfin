@@ -120,10 +120,12 @@ export function PlanInteractionCard({
         <div className={`plan-interaction-card-heading ${namespace}-heading`}>
           <h2>
             {icon}
-            <span>{title}</span>
-            {titleMeta && <small>{titleMeta}</small>}
+            <span className="plan-interaction-card-title">{title}</span>
+            {titleMeta && <small className="plan-interaction-card-title-meta">{titleMeta}</small>}
+            {description && (
+              <small className="plan-interaction-card-description">{description}</small>
+            )}
           </h2>
-          {description && <p>{description}</p>}
         </div>
         {(collapsible || headerAction) && (
           <div className={`plan-interaction-card-head-actions ${namespace}-head-actions`}>

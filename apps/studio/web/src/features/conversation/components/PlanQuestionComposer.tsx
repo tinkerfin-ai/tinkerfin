@@ -5,11 +5,11 @@ import {
   ChevronLeft,
   ChevronRight,
   CircleHelp,
-  MessageSquareText,
   Clock3,
-  X,
+  MessageSquareText,
 } from 'lucide-react'
 import {
+  forwardRef,
   useEffect,
   useMemo,
   useRef,
@@ -17,7 +17,7 @@ import {
   type KeyboardEvent,
 } from 'react'
 
-import { Button, DatePicker, IconButton, OverlayScrollbar } from '../../../components/ui'
+import { Button, DatePicker, IconButton, OverlayScrollbar, TimePicker } from '../../../components/ui'
 import { useI18n } from '../../../i18n'
 import type { PlanQuestionItem, PlanQuestionState } from '../../../types'
 import {
@@ -34,6 +34,91 @@ const multipleSelectionMaximum = (
 const multipleSelectionCount = (
   question: Extract<PlanQuestionItem, { answerType: 'multiple_choice' }>,
 ) => question.selectedOptionIds.length + Number(Boolean(question.customAnswer?.trim()))
+
+const splitLocalDateTime = (value: string | undefined) => {
+  const match = /^(\d{4}-\d{2}-\d{2})T([01]\d|2[0-3]):([0-5]\d)$/.exec(value ?? '')
+  return match
+    ? { date: match[1]!, time: `${match[2]}:${match[3]}` }
+    : undefined
+}
+
+const timeBoundsForDate = (
+  date: string,
+  minimum: string | undefined,
+  maximum: string | undefined,
+) => {
+  const minimumParts = splitLocalDateTime(minimum)
+  const maximumParts = splitLocalDateTime(maximum)
+  return {
+    minimum: minimumParts?.date === date ? minimumParts.time : undefined,
+    maximum: maximumParts?.date === date ? maximumParts.time : undefined,
+  }
+}
+
+const clampTime = (
+  value: string,
+  minimum: string | undefined,
+  maximum: string | undefined,
+) => {
+  if (minimum && value < minimum) return minimum
+  if (maximum && value > maximum) return maximum
+  return value
+}
+
+const PlanDateTimeControl = forwardRef<HTMLButtonElement, {
+  value: string | undefined
+  prompt: string
+  minimum?: string
+  maximum?: string
+  onChange: (value: string) => void
+}>(function PlanDateTimeControl({
+  value,
+  prompt,
+  minimum,
+  maximum,
+  onChange,
+}, forwardedRef) {
+  const { t } = useI18n()
+  const parts = splitLocalDateTime(value)
+  const minimumParts = splitLocalDateTime(minimum)
+  const maximumParts = splitLocalDateTime(maximum)
+  const bounds = parts
+    ? timeBoundsForDate(parts.date, minimum, maximum)
+    : { minimum: undefined, maximum: undefined }
+
+  return (
+    <span className="plan-question-datetime-controls">
+      <DatePicker
+        ref={forwardedRef}
+        controlSize="xs"
+        value={parts?.date ?? ''}
+        min={minimumParts?.date}
+        max={maximumParts?.date}
+        label={t('日期回答：{question}', { question: prompt })}
+        onChange={(date) => {
+          const nextBounds = timeBoundsForDate(date, minimum, maximum)
+          const nextTime = clampTime(
+            parts?.time ?? nextBounds.minimum ?? '00:00',
+            nextBounds.minimum,
+            nextBounds.maximum,
+          )
+          onChange(`${date}T${nextTime}`)
+        }}
+      />
+      <TimePicker
+        controlSize="xs"
+        value={parts?.time ?? ''}
+        label={t('时间回答：{question}', { question: prompt })}
+        min={bounds.minimum}
+        max={bounds.maximum}
+        disabled={!parts}
+        onChange={(time) => {
+          if (parts) onChange(`${parts.date}T${time}`)
+        }}
+      />
+    </span>
+  )
+})
 
 const minuteTimeIsValid = (
   question: Extract<PlanQuestionItem, { answerType: 'time' }>,
@@ -161,13 +246,11 @@ export function PlanQuestionComposer({
   interaction,
   onChange,
   onSubmit,
-  onAbandon,
 }: {
   threadId: string
   interaction: PlanQuestionState
   onChange: (updater: (current: PlanQuestionState) => PlanQuestionState) => void
   onSubmit: () => void
-  onAbandon: () => void
 }) {
   const { t } = useI18n()
   const [minimized, setMinimized] = useState(() => readPlanQuestionCollapsed(threadId))
@@ -175,8 +258,8 @@ export function PlanQuestionComposer({
   const optionRefs = useRef<Array<HTMLElement | null>>([])
   const textAnswerRef = useRef<HTMLTextAreaElement | null>(null)
   const dateAnswerRef = useRef<HTMLButtonElement | null>(null)
-  const timeAnswerRef = useRef<HTMLInputElement | null>(null)
-  const dateTimeAnswerRef = useRef<HTMLInputElement | null>(null)
+  const timeAnswerRef = useRef<HTMLButtonElement | null>(null)
+  const dateTimeAnswerRef = useRef<HTMLButtonElement | null>(null)
   const bodyRef = useRef<HTMLDivElement | null>(null)
   const activeIndex = Math.min(
     interaction.activeQuestionIndex,
@@ -475,16 +558,6 @@ export function PlanQuestionComposer({
       toggleLabel={minimized ? t('展开问题卡片') : t('收起问题卡片')}
       onToggle={toggleMinimized}
       bodyRef={bodyRef}
-      headerAction={(
-        <IconButton
-          size="sm"
-          className="plan-interaction-card-head-button plan-question-composer-head-button"
-          label={t('放弃本次 Plan 澄清')}
-          tooltip={t('放弃本次 Plan 澄清')}
-          icon={<X size={15} />}
-          onClick={onAbandon}
-        />
-      )}
       minimizedContent={(
         <nav className="plan-question-progress" aria-label={t('问题进度')}>
           {progress.map((item) => (
@@ -645,7 +718,6 @@ export function PlanQuestionComposer({
                 <span className="plan-question-date-copy">
                   <span className="plan-question-time-copy">
                     <span className="plan-question-date-label">{t('选择时间')}</span>
-                    <small>{t('时区：{timeZone}', { timeZone: question.timeZone })}</small>
                     {(question.minimum || question.maximum) && (
                       <small>{t('允许范围：{minimum}–{maximum}', {
                         minimum: question.minimum ?? '00:00',
@@ -653,17 +725,14 @@ export function PlanQuestionComposer({
                       })}</small>
                     )}
                   </span>
-                  <input
+                  <TimePicker
                     ref={timeAnswerRef}
-                    className="plan-question-time-input"
-                    type="time"
-                    step={60}
+                    controlSize="xs"
+                    value={question.time ?? ''}
+                    label={t('时间回答：{question}', { question: question.prompt })}
                     min={question.minimum ?? undefined}
                     max={question.maximum ?? undefined}
-                    value={question.time ?? ''}
-                    aria-label={t('时间回答：{question}', { question: question.prompt })}
-                    onChange={(event) => {
-                      const value = event.currentTarget.value
+                    onChange={(value) => {
                       updateQuestion((current) => current.answerType === 'time'
                         ? { ...current, time: value, skipped: false }
                         : current)
@@ -673,32 +742,21 @@ export function PlanQuestionComposer({
               </div>
             )}
             {question.answerType === 'datetime' && (
-              <div className={`plan-question-date plan-question-time${question.dateTime ? ' is-active' : ''}`}>
+              <div className={`plan-question-date plan-question-time plan-question-datetime${question.dateTime ? ' is-active' : ''}`}>
                 <span className="plan-question-option-index" aria-hidden="true">
                   <CalendarClock size={13} />
                 </span>
                 <span className="plan-question-date-copy">
                   <span className="plan-question-time-copy">
                     <span className="plan-question-date-label">{t('选择日期和时间')}</span>
-                    <small>{t('时区：{timeZone}', { timeZone: question.timeZone })}</small>
-                    {(question.minimum || question.maximum) && (
-                      <small>{t('允许范围：{minimum}–{maximum}', {
-                        minimum: question.minimum ?? t('不限'),
-                        maximum: question.maximum ?? t('不限'),
-                      })}</small>
-                    )}
                   </span>
-                  <input
+                  <PlanDateTimeControl
                     ref={dateTimeAnswerRef}
-                    className="plan-question-time-input"
-                    type="datetime-local"
-                    step={60}
-                    min={question.minimum ?? undefined}
-                    max={question.maximum ?? undefined}
-                    value={question.dateTime ?? ''}
-                    aria-label={t('日期时间回答：{question}', { question: question.prompt })}
-                    onChange={(event) => {
-                      const value = event.currentTarget.value
+                    value={question.dateTime}
+                    prompt={question.prompt}
+                    minimum={question.minimum ?? undefined}
+                    maximum={question.maximum ?? undefined}
+                    onChange={(value) => {
                       updateQuestion((current) => current.answerType === 'datetime'
                         ? { ...current, dateTime: value, skipped: false }
                         : current)

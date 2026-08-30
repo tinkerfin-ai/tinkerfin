@@ -1114,14 +1114,12 @@
     justify-content: space-between;
     gap: var(--space-4);
     flex: 0 0 auto;
-    padding: var(--space-1-5) var(--space-4);
+    padding: 10px var(--space-4);
   }
 
   .approval-composer-head,
   .plan-review-composer-head { background: var(--color-warning-panel-background); }
   .plan-question-composer-head { background: var(--color-plan-panel-background); }
-  .approval-composer-head,
-  .plan-review-composer-head { padding-block: 10px; }
 
   .interaction-card-color-bridge {
     height: var(--space-3);
@@ -1181,14 +1179,27 @@
   .approval-composer-heading h2 > span:not(.approval-status-dot),
   .plan-question-composer-heading h2 > span,
   .plan-review-composer-heading h2 > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .approval-composer-heading h2 > small,
-  .plan-question-composer-heading h2 > small { flex: 0 0 auto; color: var(--color-text-secondary); font-size: var(--type-meta-size); font-weight: var(--weight-regular); line-height: var(--type-ui-line); white-space: nowrap; }
-  .plan-question-composer-heading p { margin: var(--space-0-5) 0 0; overflow: hidden; color: var(--color-text-secondary); font-size: var(--type-meta-size); line-height: var(--type-ui-line); text-overflow: ellipsis; white-space: nowrap; }
+  .approval-composer-heading .plan-interaction-card-title,
+  .plan-review-composer-heading .plan-interaction-card-title { flex: 1 1 auto; }
+  .plan-question-composer-heading .plan-interaction-card-title { flex: 0 1 auto; }
+  .plan-interaction-card-title-meta { flex: 0 0 auto; }
+  .plan-interaction-card-description {
+    min-width: 0;
+    flex: 1 1 auto;
+    overflow: hidden;
+    color: var(--color-text-secondary);
+    font-size: var(--type-meta-size);
+    font-weight: var(--weight-regular);
+    line-height: var(--type-ui-line);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .plan-interaction-card-title-meta { color: var(--color-text-secondary); font-size: var(--type-meta-size); font-weight: var(--weight-regular); line-height: var(--type-ui-line); white-space: nowrap; }
 
-  .plan-question-composer-head-actions { position: relative; z-index: calc(var(--layer-local) + 1); display: flex; align-items: center; gap: var(--space-1); flex: 0 0 auto; }
-  .plan-question-composer-head-button { width: var(--control-plan-chip); min-width: var(--control-plan-chip); height: var(--control-plan-chip); min-height: var(--control-plan-chip); border: 0; background: transparent; color: var(--color-text-tertiary); box-shadow: none; }
-  .plan-question-composer-head-button:hover:not(:disabled),
-  .plan-question-composer-head-button:active:not(:disabled) { border: 0; background: var(--color-hover); color: var(--color-text-primary); box-shadow: none; }
+  .plan-interaction-card-head-actions { position: relative; z-index: calc(var(--layer-local) + 1); display: flex; align-items: center; gap: var(--space-1); flex: 0 0 auto; }
+  .plan-interaction-card-head-button { width: var(--control-plan-chip); min-width: var(--control-plan-chip); height: var(--control-plan-chip); min-height: var(--control-plan-chip); border: 0; background: transparent; color: var(--color-text-tertiary); box-shadow: none; }
+  .plan-interaction-card-head-button:hover:not(:disabled),
+  .plan-interaction-card-head-button:active:not(:disabled) { border: 0; background: var(--color-hover); color: var(--color-text-primary); box-shadow: none; }
 
   :is(.approval-composer, .plan-question-composer, .plan-review-composer)
   .ui-button:not(.ui-icon-button):focus-visible {
@@ -1487,23 +1498,12 @@
   .plan-question-date > .plan-question-option-index { margin-top: 0; }
   .plan-question-date-copy { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: var(--space-3); font-size: var(--type-ui-size); line-height: var(--type-title-line); }
   .plan-question-date-label { color: var(--color-text-secondary); }
-  .plan-question-date .ui-date-picker__trigger { min-width: 150px; }
+  .plan-question-date .ui-temporal-picker__trigger { min-width: 150px; }
   .plan-question-time-copy { display: grid; min-width: 0; gap: 1px; }
   .plan-question-time-copy small { color: var(--color-text-tertiary); font-size: var(--type-micro-size); line-height: var(--type-caption-line); }
-  .plan-question-time-input {
-    min-width: 150px;
-    min-height: var(--control-sm);
-    padding: 0 var(--space-2);
-    border: 1px solid var(--color-border);
-    border-radius: var(--radius-md);
-    background: var(--color-layer-1);
-    color: var(--color-text-primary);
-    font: inherit;
-    color-scheme: light dark;
-  }
-  .plan-question-time-input:hover { border-color: var(--color-border-strong); }
-  .plan-question-time-input:active { background: var(--color-active); }
-  .plan-question-time-input:focus-visible { border-color: var(--color-border-strong); outline: 2px solid var(--color-border-strong); outline-offset: 1px; }
+  .plan-question-datetime { height: auto; min-height: var(--control-md); }
+  .plan-question-datetime-controls { display: flex; min-width: 0; align-items: center; justify-content: flex-end; gap: var(--space-2); }
+  .plan-question-datetime-controls > .ui-temporal-picker { flex: 1 1 150px; }
 
   .plan-question-composer-footer {
     display: grid;
@@ -1733,8 +1733,8 @@
     .plan-question-composer,
     .plan-review-composer { border-radius: var(--radius-3xl); }
     .approval-composer-head,
+    .plan-question-composer-head,
     .plan-review-composer-head { padding: 10px var(--space-4); }
-    .plan-question-composer-head { padding: var(--space-1-5) var(--space-4); }
     .approval-composer-body,
     .plan-question-composer-body { padding-right: var(--space-2); padding-left: var(--space-2); }
     .approval-composer-footer,
@@ -1748,6 +1748,12 @@
     .plan-review-rejection-form { margin-right: var(--space-4); margin-left: var(--space-4); }
     .plan-question-progress { margin-right: var(--space-3); margin-left: var(--space-3); }
     .approval-composer-actions { grid-column: 2; }
+    .plan-question-datetime { padding-top: var(--space-2); padding-bottom: var(--space-2); }
+    .plan-question-datetime .plan-question-date-copy { display: grid; width: 100%; align-items: stretch; }
+    .plan-question-datetime-controls { display: grid; width: 100%; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+    .plan-question-datetime-controls .ui-temporal-picker,
+    .plan-question-datetime-controls .ui-temporal-picker__control,
+    .plan-question-datetime-controls .ui-temporal-picker__trigger { width: 100%; min-width: 0; }
   }
 
   @media (max-width: 440px) {
@@ -1782,10 +1788,10 @@
     .composer-model-options [role='option'],
     .composer-suggestion-item { min-height: var(--control-lg); }
     .plan-question-date { height: var(--control-lg); }
-    .plan-question-time-input { min-height: var(--control-lg); }
+    .plan-question-datetime { height: auto; }
     .plan-question-composer.is-minimized .plan-question-progress,
     .plan-question-composer.is-minimized .plan-question-progress-step { height: var(--control-lg); }
-    .plan-question-composer-head-button { width: var(--control-lg); min-width: var(--control-lg); height: var(--control-lg); min-height: var(--control-lg); }
+    .plan-interaction-card-head-button { width: var(--control-lg); min-width: var(--control-lg); height: var(--control-lg); min-height: var(--control-lg); }
     .plan-question-pager-button { width: var(--control-lg); min-width: var(--control-lg); height: var(--control-lg); min-height: var(--control-lg); }
   }
 
@@ -1796,7 +1802,7 @@
     .plan-question-custom,
     .plan-question-date,
     .plan-interaction-toggle-surface,
-    .plan-question-composer-head-button .ui-icon-button__icon,
+    .plan-interaction-card-head-button .ui-icon-button__icon,
     .plan-question-pager-button .ui-icon-button__icon { transition: none; }
   }
 

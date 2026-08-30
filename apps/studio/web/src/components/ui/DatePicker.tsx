@@ -101,8 +101,9 @@ export const DatePicker = forwardRef<HTMLButtonElement, DatePickerProps>(functio
     ? api.format(api.value[0], { year: 'numeric', month: '2-digit', day: '2-digit' })
     : placeholder ?? t('年 / 月 / 日')
   const triggerClasses = [
+    'ui-temporal-picker__trigger',
+    `ui-temporal-picker__trigger--${controlSize}`,
     'ui-date-picker__trigger',
-    `ui-date-picker__trigger--${controlSize}`,
     api.value.length === 0 ? 'is-placeholder' : '',
     className,
   ].filter(Boolean).join(' ')
@@ -116,8 +117,8 @@ export const DatePicker = forwardRef<HTMLButtonElement, DatePickerProps>(functio
         })()
 
   return (
-    <span {...api.getRootProps()} className="ui-date-picker">
-      <span {...api.getControlProps()} className="ui-date-picker__control">
+    <span {...api.getRootProps()} className="ui-temporal-picker ui-date-picker">
+      <span {...api.getControlProps()} className="ui-temporal-picker__control ui-date-picker__control">
         {name && <input type="hidden" name={name} value={value} />}
         <button
           type="button"
@@ -134,7 +135,7 @@ export const DatePicker = forwardRef<HTMLButtonElement, DatePickerProps>(functio
       </span>
       <Portal>
         <div {...api.getPositionerProps()}>
-          <div {...api.getContentProps()} className="ui-date-picker__popover">
+          <div {...api.getContentProps()} className="ui-temporal-picker__popover ui-date-picker__popover">
               <header {...api.getViewControlProps({ view: api.view })} className="ui-date-picker__head">
                 <button type="button" {...api.getPrevTriggerProps({ view: api.view })} className="ui-date-picker__nav">
                   <ChevronLeft size={17} aria-hidden="true" />
