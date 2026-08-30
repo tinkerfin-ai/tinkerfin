@@ -39,6 +39,10 @@ Public methods are `create(metadata=None)`, `connect(sandbox_id)`, `inspect(sand
 
 See [Sandbox lifecycle](lifecycle.md) for constructor parameters and operations. `build_agent_middleware(backend, permissions=None)` returns middleware ready for Deep Agents.
 
+`await manager.check_ready()` returns `None` only when configured warm capacity is
+verified. It raises `OpenSandboxWarmPoolUnavailableError` for startup or background
+capacity failure and `OpenSandboxManagerClosedError` after shutdown.
+
 ## Backends and handles
 
 | API | Use |
@@ -83,6 +87,7 @@ Synchronous remote methods fail explicitly; use the asynchronous forms.
 | `OpenSandboxBinding` | `sandbox_id`, `generation` |
 | `OpenSandboxOwnerClaim` | owner key, digest, token, generation, optional binding |
 | `OpenSandboxWarmClaim` | slot, token, generation |
+| `OpenSandboxReadyWarmClaim` | warm claim fields plus the published Sandbox ID |
 | `OpenSandboxCleanupClaim` | sandbox ID, token, generation |
 
 These types mainly support custom `OpenSandboxState` implementations.

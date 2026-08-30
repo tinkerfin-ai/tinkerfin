@@ -46,13 +46,16 @@ def _bind_v2_invocation(
     args: tuple[object, ...],
     options: Mapping[str, object],
     *,
-    identity: RunIdentity,
-    runtime_profile: str,
+    identity: RunIdentity | None,
+    runtime_profile: str | None,
+    require_semantic_modes: bool,
 ) -> inspect.BoundArguments:
     """Apply the complete locked v2 invocation contract before source creation."""
 
-    if not isinstance(identity, RunIdentity):
-        raise TypeError("identity must be a RunIdentity")
+    if identity is not None and not isinstance(identity, RunIdentity):
+        raise TypeError("identity must be a RunIdentity or None")
+    if (identity is None) != (runtime_profile is None):
+        raise TypeError("identity and runtime_profile must be supplied together")
     bound = signature.bind(*args, **dict(options))
     parameters = signature.parameters
     variable_keyword = next(
@@ -123,16 +126,17 @@ def _bind_v2_invocation(
         configurable = dict(cast(Mapping[str, object], raw_configurable))
     else:
         raise TypeError("config.configurable must be a mapping")
-    configured_thread = configurable.get("thread_id")
-    if configured_thread is not None and configured_thread != identity.thread_id:
-        raise ValueError("config thread_id must equal identity.thread_id")
-    configurable["thread_id"] = identity.thread_id
-    configured_profile = configurable.get(RUNTIME_PROFILE_METADATA_KEY)
-    if configured_profile is not None and configured_profile != runtime_profile:
-        raise ValueError(
-            "config Runtime Profile must equal the selected TinkerFin Profile"
-        )
-    configurable[RUNTIME_PROFILE_METADATA_KEY] = runtime_profile
+    if identity is not None:
+        configured_thread = configurable.get("thread_id")
+        if configured_thread is not None and configured_thread != identity.thread_id:
+            raise ValueError("config thread_id must equal identity.thread_id")
+        configurable["thread_id"] = identity.thread_id
+        configured_profile = configurable.get(RUNTIME_PROFILE_METADATA_KEY)
+        if configured_profile is not None and configured_profile != runtime_profile:
+            raise ValueError(
+                "config Runtime Profile must equal the selected TinkerFin Profile"
+            )
+        configurable[RUNTIME_PROFILE_METADATA_KEY] = runtime_profile
     config["configurable"] = configurable
     write("config", config)
 
@@ -170,7 +174,7 @@ def _bind_v2_invocation(
         raise ValueError(
             f"Deep Agents v2 stream_mode contains unsupported modes: {unsupported!r}"
         )
-    if supplied("stream_mode"):
+    if supplied("stream_mode") and require_semantic_modes:
         missing = tuple(mode for mode in _REQUIRED_MODES if mode not in modes)
         if missing:
             raise ValueError(
@@ -428,6 +432,37 @@ class DeepAgentsV2StreamDriver:
             options,
             identity=identity,
             runtime_profile=runtime_profile,
+            require_semantic_modes=True,
+        )
+
+    def bind_graph_invocation(
+        self,
+        signature: inspect.Signature,
+        args: tuple[object, ...],
+        options: Mapping[str, object],
+    ) -> inspect.BoundArguments:
+        """Bind direct Graph streaming to the locked v2 envelope contract.
+
+        Unlike a managed Runtime call, this boundary does not inject TinkerFin identity
+        or Profile checkpoint metadata. Required semantic modes remain internal routing
+        inputs and are filtered by ``DeepAgentGraph`` when the caller requested a subset.
+
+        Args:
+            signature: Concrete upstream ``astream`` signature.
+            args: Positional direct Graph values.
+            options: Keyword direct Graph options.
+
+        Returns:
+            Bound v2 Graph arguments without managed Runtime identity state.
+        """
+
+        return _bind_v2_invocation(
+            signature,
+            args,
+            options,
+            identity=None,
+            runtime_profile=None,
+            require_semantic_modes=False,
         )
 
     def validate(self, part: object) -> NativeValidatedStreamPart:

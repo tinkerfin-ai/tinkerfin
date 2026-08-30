@@ -248,6 +248,10 @@ class ConversationHistoryService:
         )
         if registration is None:
             raise SystemException(ConversationErrorCode.TRACE_UNAVAILABLE)
+        summary = trace.summary
+        interactions = {item.id: item for item in trace.interactions}
+        # Pending 项必须跨越可见 Turn 窗口保留，避免历史分页隐藏仍需用户处理的交互
+        interactions.update({item.id: item for item in summary.pending_interactions})
         return ConversationHistoryDetail(
             id=thread.id,
             threadId=thread.thread_id,
@@ -259,15 +263,20 @@ class ConversationHistoryService:
             headRunId=trace.head_run_id,
             availableHeads=trace.available_heads,
             historyCursor=trace.history_cursor,
-            messageCount=trace.message_count,
-            toolCallCount=trace.tool_call_count,
+            messageCount=summary.message_count,
+            toolCallCount=summary.tool_call_count,
             messages=trace.messages,
             reasoning=trace.reasoning,
             nodes=trace.tree.nodes,
             state=trace.state,
-            interactions=trace.interactions,
-            status=trace.status,
-            completeness=trace.completeness,
+            interactions=tuple(
+                sorted(
+                    interactions.values(),
+                    key=lambda item: (item.trace_seq, item.id),
+                )
+            ),
+            status=summary.status,
+            completeness=summary.completeness,
             createdAt=thread.created_at,
             updatedAt=thread.updated_at,
         )

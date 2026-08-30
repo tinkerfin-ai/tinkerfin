@@ -59,9 +59,11 @@ identity nor invalidate a task that Deep Agents accepts.
 ## Reasoning events
 
 ```python
-runtime = agent.new_agui(
-    identity=identity,
-    expose_reasoning_events=True,
+events = await tinkerfin.open_agui_run(
+    identity,
+    agent=agent,
+    input=graph_input,
+    include_reasoning_events=True,
 )
 ```
 
@@ -96,12 +98,15 @@ async def audit_event(event) -> None:
     await audit_log.write(event.model_dump(mode="json", by_alias=True))
 
 
-runtime = agent.new_agui(
-    identity=identity,
-    on_event=audit_event,
+events = await tinkerfin.open_agui_run(
+    identity,
+    agent=agent,
+    input=graph_input,
+    on_agui_event=audit_event,
 )
 ```
 
-`on_event` is useful for audits and metrics. Keep it asynchronous and lightweight because it is part of the delivery path.
+`on_agui_event` is useful for audits and metrics. Keep it asynchronous and lightweight
+because it is part of the delivery path.
 
 Next: [Interrupts and resume](interrupts-and-resume.md).

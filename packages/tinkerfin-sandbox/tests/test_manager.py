@@ -28,6 +28,8 @@ import tinkerfin_sandbox
 from tinkerfin_sandbox import (
     InMemoryOpenSandboxState,
     OpenSandboxBackend,
+    OpenSandboxBackendTimeoutError,
+    OpenSandboxBackendUnavailableError,
     OpenSandboxBinding,
     OpenSandboxCleanupClaim,
     OpenSandboxClient,
@@ -40,6 +42,7 @@ from tinkerfin_sandbox import (
     OpenSandboxManagerClosedError,
     OpenSandboxOwnerClaim,
     OpenSandboxPlatformInfo,
+    OpenSandboxReadyWarmClaim,
     OpenSandboxResetError,
     OpenSandboxRuntimeInfo,
     OpenSandboxState,
@@ -154,6 +157,27 @@ class _FakeBackend:
         return self.runtime_info
 
 
+class _RenewFailingBackend(_FakeBackend):
+    """Keep data-plane health while making remote expiry renewal unavailable."""
+
+    async def arenew(self, timeout: timedelta) -> None:
+        del timeout
+        raise RuntimeError("renew unavailable")
+
+
+class _RecoverableRenewBackend(_FakeBackend):
+    """Expose a temporary renewal outage on an otherwise reusable remote."""
+
+    def __init__(self, sandbox_id: str) -> None:
+        super().__init__(sandbox_id)
+        self.fail_renew = True
+
+    async def arenew(self, timeout: timedelta) -> None:
+        if self.fail_renew:
+            raise RuntimeError("renew unavailable")
+        await super().arenew(timeout)
+
+
 class _FakeClient:
     def __init__(
         self,
@@ -206,7 +230,15 @@ class _FakeClient:
 
     async def connect(self, sandbox_id: str) -> OpenSandboxBackend:
         self.connect_calls.append(sandbox_id)
-        return cast(OpenSandboxBackend, self.connected[sandbox_id])
+        try:
+            backend = self.connected[sandbox_id]
+        except KeyError as error:
+            raise OpenSandboxBackendUnavailableError(
+                "Sandbox not found",
+                context={"reason": "not_found"},
+                cause=error,
+            ) from error
+        return cast(OpenSandboxBackend, backend)
 
     async def inspect(self, sandbox_id: str) -> OpenSandboxRuntimeInfo:
         self.inspect_calls.append(sandbox_id)
@@ -321,6 +353,19 @@ class _FakeState(InMemoryOpenSandboxState):
 
     async def shutdown_sandbox_ids(self) -> tuple[str, ...]:
         return ()
+
+
+class _WarmStateWithoutReconciliation(InMemoryOpenSandboxState):
+    """Represent a custom State that has not implemented ready-slot fencing."""
+
+    def __getattribute__(self, name: str) -> object:
+        if name in {
+            "claim_ready_warm_slot",
+            "discard_ready_warm_slot",
+            "warm_pool_ready",
+        }:
+            raise AttributeError(name)
+        return super().__getattribute__(name)
 
 
 class _LeakingState(_FakeState):
@@ -443,6 +488,22 @@ class _WarmLeaseState(OpenSandboxState):
 
     async def claim_warm_slot(self) -> OpenSandboxWarmClaim | None:
         return await self._inner.claim_warm_slot()
+
+    async def claim_ready_warm_slot(
+        self,
+        *,
+        exclude_slots: Sequence[int],
+    ) -> OpenSandboxReadyWarmClaim | None:
+        return await self._inner.claim_ready_warm_slot(exclude_slots=exclude_slots)
+
+    async def discard_ready_warm_slot(
+        self,
+        claim: OpenSandboxReadyWarmClaim,
+    ) -> None:
+        await self._inner.discard_ready_warm_slot(claim)
+
+    async def warm_pool_ready(self) -> bool:
+        return await self._inner.warm_pool_ready()
 
     async def publish_warm(
         self,
@@ -601,13 +662,14 @@ def _runtime_info(
     *,
     available: bool = True,
     healthy: bool = True,
+    state: str = "RUNNING",
     unavailable_reason: OpenSandboxUnavailableReason | None = None,
 ) -> OpenSandboxRuntimeInfo:
     return OpenSandboxRuntimeInfo(
         sandbox_id=sandbox_id,
         available=available,
         healthy=healthy,
-        status=(OpenSandboxStatusInfo(state="RUNNING") if available else None),
+        status=(OpenSandboxStatusInfo(state=state) if available else None),
         created_at=datetime(2026, 8, 8, 1, 2, tzinfo=UTC),
         expires_at=datetime(2026, 8, 8, 3, 2, tzinfo=UTC),
         image="registry.example/sandbox:1",
@@ -1451,6 +1513,42 @@ class _FailingCreateClient(_FakeClient):
         raise RuntimeError("warmup failed")
 
 
+class _AuthenticationFailingClient(_FailingCreateClient):
+    """Reject every remote operation without claiming that a valid ID is missing."""
+
+    async def connect(self, sandbox_id: str) -> OpenSandboxBackend:
+        self.connect_calls.append(sandbox_id)
+        raise UnexpectedOpenSandboxBackendError("authentication rejected")
+
+
+class _TimeoutThenInspectClient(_FakeClient):
+    """Expose a reconnect timeout followed by one authoritative query result."""
+
+    async def connect(self, sandbox_id: str) -> OpenSandboxBackend:
+        self.connect_calls.append(sandbox_id)
+        raise OpenSandboxBackendTimeoutError("reconnect timed out")
+
+
+class _FailAfterFirstCreateClient(_FakeClient):
+    """Create startup capacity, then expose a recoverable refill outage."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_refill = True
+        self.config = self.config.model_copy(update={"ttl": timedelta(seconds=0.15)})
+
+    async def create(
+        self,
+        *,
+        metadata: Mapping[str, str] | None = None,
+    ) -> OpenSandboxBackend:
+        if self.create_calls >= 1 and self.fail_refill:
+            self.create_calls += 1
+            self.create_metadata.append(dict(metadata or {}))
+            raise RuntimeError("refill unavailable")
+        return await super().create(metadata=metadata)
+
+
 class _BlockingCloseFailingCreateClient(_FailingCreateClient):
     def __init__(self) -> None:
         super().__init__()
@@ -1920,6 +2018,349 @@ async def test_strict_startup_warmup_propagates_without_package_log(
     assert isinstance(captured.value.cause, RuntimeError)
     assert str(captured.value.cause) == "warmup failed"
     assert caplog.records == []
+
+
+@pytest.mark.asyncio
+async def test_strict_startup_replaces_a_published_but_missing_warm_sandbox() -> None:
+    """A non-empty durable slot must not bypass remote startup verification."""
+
+    state = _FakeState()
+    await state.start(warm_pool_size=1)
+    claim = await state.claim_warm_slot()
+    assert claim is not None
+    await state.publish_warm(claim, "missing-warm")
+    client = _FakeClient()
+    manager = _new_manager(
+        client=client,
+        state=state,
+        warm_pool_size=1,
+        fail_on_startup_warmup_error=True,
+    )
+    try:
+        await manager.start()
+        await manager.check_ready()
+        assert client.connect_calls == ["missing-warm"]
+        assert client.create_calls == 1
+        await _eventually(lambda: client.destroy_calls == ["missing-warm"])
+        assert client.destroy_calls == ["missing-warm"]
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_strict_startup_reuses_a_healthy_published_warm_sandbox() -> None:
+    """Restart recovery must renew the existing ID without duplicate creation."""
+
+    state = _FakeState()
+    await state.start(warm_pool_size=1)
+    claim = await state.claim_warm_slot()
+    assert claim is not None
+    await state.publish_warm(claim, "warm-existing")
+    client = _FakeClient()
+    existing = _FakeBackend("warm-existing")
+    client.connected[existing.id] = existing
+    manager = _new_manager(
+        client=client,
+        state=state,
+        warm_pool_size=1,
+        fail_on_startup_warmup_error=True,
+    )
+    try:
+        await manager.start()
+        await manager.check_ready()
+        assert client.connect_calls == ["warm-existing"]
+        assert client.create_calls == 0
+        assert existing.renew_calls == [client.config.ttl]
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_sql_state_restart_reuses_verified_warm_capacity(tmp_path: Path) -> None:
+    """A later manager must reconnect the same healthy durable warm Sandbox."""
+
+    url = f"sqlite+aiosqlite:///{tmp_path / 'warm-restart.db'}"
+    first_client = _FakeClient()
+    first = _new_manager(
+        client=first_client,
+        state=SQLAlchemyOpenSandboxState(url=url, namespace="warm-restart"),
+        warm_pool_size=1,
+        fail_on_startup_warmup_error=True,
+    )
+    await first.start()
+    warm_id = first_client.backends[0].id
+    await first.aclose()
+    assert first_client.destroy_calls == []
+
+    second_client = _FakeClient()
+    second_backend = _FakeBackend(warm_id)
+    second_client.connected[warm_id] = second_backend
+    second = _new_manager(
+        client=second_client,
+        state=SQLAlchemyOpenSandboxState(url=url, namespace="warm-restart"),
+        warm_pool_size=1,
+        fail_on_startup_warmup_error=True,
+    )
+    try:
+        await second.start()
+        await second.check_ready()
+        assert second_client.connect_calls == [warm_id]
+        assert second_client.create_calls == 0
+        assert second_backend.renew_calls == [second_client.config.ttl]
+    finally:
+        await second.aclose()
+
+
+@pytest.mark.asyncio
+async def test_strict_startup_rejects_stale_capacity_when_replacement_fails() -> None:
+    """A stale published ID and failed create must prevent manager startup."""
+
+    state = _FakeState()
+    await state.start(warm_pool_size=1)
+    claim = await state.claim_warm_slot()
+    assert claim is not None
+    await state.publish_warm(claim, "missing-warm")
+    manager = _new_manager(
+        client=_FailingCreateClient(),
+        state=state,
+        warm_pool_size=1,
+        fail_on_startup_warmup_error=True,
+    )
+
+    with pytest.raises(UnexpectedOpenSandboxBackendError):
+        await manager.start()
+    await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_authentication_failure_preserves_a_published_warm_binding() -> None:
+    """An unverifiable reconnect must fail startup without discarding valid State."""
+
+    state = _FakeState()
+    await state.start(warm_pool_size=1)
+    claim = await state.claim_warm_slot()
+    assert claim is not None
+    await state.publish_warm(claim, "warm-existing")
+    client = _AuthenticationFailingClient()
+    manager = _new_manager(
+        client=client,
+        state=state,
+        warm_pool_size=1,
+        fail_on_startup_warmup_error=True,
+    )
+
+    with pytest.raises(UnexpectedOpenSandboxBackendError):
+        await manager.start()
+    assert await state.warm_pool_ready()
+    assert client.create_calls == 0
+    assert client.destroy_calls == []
+    await manager.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_state", ["Failed", "Stopping", "Terminated"])
+async def test_terminal_status_after_timeout_replaces_published_warm(
+    terminal_state: str,
+) -> None:
+    """A control-plane terminal state confirms that timed-out data is unusable."""
+
+    state = _FakeState()
+    await state.start(warm_pool_size=1)
+    claim = await state.claim_warm_slot()
+    assert claim is not None
+    await state.publish_warm(claim, "failed-warm")
+    client = _TimeoutThenInspectClient()
+    client.inspection_results["failed-warm"] = _runtime_info(
+        "failed-warm",
+        healthy=False,
+        state=terminal_state,
+    )
+    manager = _new_manager(
+        client=client,
+        state=state,
+        warm_pool_size=1,
+        fail_on_startup_warmup_error=True,
+    )
+    try:
+        await manager.start()
+        await manager.check_ready()
+        assert client.connect_calls == ["failed-warm"]
+        assert client.inspect_calls == ["failed-warm"]
+        assert client.create_calls == 1
+        await _eventually(lambda: client.destroy_calls == ["failed-warm"])
+        assert client.destroy_calls == ["failed-warm"]
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_unreachable_inspection_after_timeout_preserves_published_warm() -> None:
+    """A secondary query outage must not turn a timeout into destructive certainty."""
+
+    state = _FakeState()
+    await state.start(warm_pool_size=1)
+    claim = await state.claim_warm_slot()
+    assert claim is not None
+    await state.publish_warm(claim, "unverified-warm")
+    client = _TimeoutThenInspectClient()
+    client.inspection_results["unverified-warm"] = _runtime_info(
+        "unverified-warm",
+        available=False,
+        healthy=False,
+        unavailable_reason="unreachable",
+    )
+    manager = _new_manager(
+        client=client,
+        state=state,
+        warm_pool_size=1,
+        fail_on_startup_warmup_error=True,
+    )
+
+    with pytest.raises(OpenSandboxBackendTimeoutError):
+        await manager.start()
+    assert await state.warm_pool_ready()
+    assert client.inspect_calls == ["unverified-warm"]
+    assert client.create_calls == 0
+    assert client.destroy_calls == []
+    await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_failed_stale_replacement_cannot_be_consumed_as_ready_capacity() -> None:
+    """Invalidated warm IDs must not move into an owner binding during an outage."""
+
+    state = _FakeState()
+    await state.start(warm_pool_size=1)
+    warm_claim = await state.claim_warm_slot()
+    assert warm_claim is not None
+    await state.publish_warm(warm_claim, "missing-warm")
+    manager = _new_manager(
+        client=_FailingCreateClient(),
+        state=state,
+        warm_pool_size=1,
+        fail_on_startup_warmup_error=False,
+    )
+    await manager.start()
+    try:
+        with pytest.raises(tinkerfin_sandbox.OpenSandboxWarmPoolUnavailableError):
+            await manager.check_ready()
+        owner_claim = await state.acquire_owner("probe-owner")
+        try:
+            assert await state.consume_warm(owner_claim) is None
+        finally:
+            await state.release_owner(owner_claim)
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_strict_warm_pool_requires_ready_slot_reconciliation_state() -> None:
+    """A custom State cannot claim truthful readiness without the current fence API."""
+
+    manager = _new_manager(
+        client=_FakeClient(),
+        state=_WarmStateWithoutReconciliation(),
+        warm_pool_size=1,
+        fail_on_startup_warmup_error=True,
+    )
+
+    with pytest.raises(tinkerfin_sandbox.OpenSandboxWarmPoolUnavailableError):
+        await manager.start()
+    await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_open_manager_renews_idle_warm_capacity_before_remote_ttl() -> None:
+    """An unconsumed warm Sandbox must remain ready across its configured TTL."""
+
+    client = _FakeClient()
+    client.config = client.config.model_copy(update={"ttl": timedelta(seconds=0.15)})
+    manager = _new_manager(
+        client=client,
+        warm_pool_size=1,
+        fail_on_startup_warmup_error=True,
+    )
+    await manager.start()
+    try:
+        backend = cast(_FakeBackend, client.backends[0])
+        await _eventually(lambda: len(backend.renew_calls) >= 2)
+        assert client.create_calls == 1
+        await manager.check_ready()
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_failed_warm_renewal_degrades_without_discarding_the_remote() -> None:
+    """An uncertain renewal failure must preserve ID ownership until recovery."""
+
+    client = _ReconnectableFakeClient(backend_factory=_RecoverableRenewBackend)
+    client.config = client.config.model_copy(update={"ttl": timedelta(seconds=0.15)})
+    manager = _new_manager(
+        client=client,
+        warm_pool_size=1,
+        fail_on_startup_warmup_error=True,
+    )
+    await manager.start()
+    try:
+        backend = cast(_RecoverableRenewBackend, client.backends[0])
+        await _eventually(lambda: manager._warm_failure is not None)
+        with pytest.raises(tinkerfin_sandbox.OpenSandboxWarmPoolUnavailableError):
+            await manager.check_ready()
+        assert client.create_calls == 1
+        assert client.destroy_calls == []
+
+        backend.fail_renew = False
+        await _eventually(lambda: manager._warm_ready.is_set())
+        await manager.check_ready()
+        assert client.create_calls == 1
+        assert backend.renew_calls
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_owner_reuse_remains_available_when_best_effort_renewal_fails() -> None:
+    """Warm readiness changes must not weaken the established owner reuse path."""
+
+    client = _FakeClient(backend_factory=_RenewFailingBackend)
+    manager = _new_manager(client=client, warm_pool_size=0)
+    await manager.start()
+    try:
+        first = await manager.get(_key("user-1"))
+        second = await manager.get(_key("user-1"))
+        assert second is first
+        assert client.create_calls == 1
+    finally:
+        await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_refill_failure_degrades_readiness_until_capacity_recovers() -> None:
+    """Background refill failures must be visible without failing the active owner."""
+
+    client = _FailAfterFirstCreateClient()
+    manager = _new_manager(
+        client=client,
+        warm_pool_size=1,
+        fail_on_startup_warmup_error=True,
+    )
+    await manager.start()
+    try:
+        handle = await manager.get(_key("user-1"))
+        assert handle.id == "sandbox-1"
+        await _eventually(
+            lambda: manager._warm_failure is not None,
+        )
+        with pytest.raises(tinkerfin_sandbox.OpenSandboxWarmPoolUnavailableError):
+            await manager.check_ready()
+
+        client.fail_refill = False
+        await _eventually(lambda: client.create_calls >= 3)
+        await _eventually(lambda: manager._warm_ready.is_set())
+        await manager.check_ready()
+    finally:
+        await manager.aclose()
 
 
 @pytest.mark.asyncio

@@ -8,6 +8,7 @@ from tinkerfin_sandbox import (
     OpenSandboxErrorCode,
     OpenSandboxSettlementTimeoutError,
     OpenSandboxStateUnavailableError,
+    OpenSandboxWarmPoolUnavailableError,
 )
 
 
@@ -57,3 +58,14 @@ def test_timeout_errors_remain_machine_classifiable() -> None:
     assert state_timeout.code is OpenSandboxErrorCode.BACKEND_TIMEOUT
     assert isinstance(settlement_timeout, TimeoutError)
     assert settlement_timeout.code is OpenSandboxErrorCode.SETTLEMENT_TIMEOUT
+
+
+def test_warm_pool_failure_is_public_and_machine_classifiable() -> None:
+    error = OpenSandboxWarmPoolUnavailableError(
+        "Warm capacity is unavailable",
+        context={"target_capacity": 1},
+    )
+
+    assert isinstance(error, RuntimeError)
+    assert error.code is OpenSandboxErrorCode.WARM_POOL_UNAVAILABLE
+    assert dict(error.context) == {"target_capacity": 1}

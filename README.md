@@ -20,7 +20,6 @@ packages/
 apps/studio/
 ├── server/                    Studio server application
 └── web/                       Studio web application
-docs/                          Chinese and English usage documentation
 ```
 
 ## Installation
@@ -65,9 +64,10 @@ agent = tinkerfin.create_deep_agent(
 
 async def main() -> None:
     identity = RunIdentity(threadId="thread-1", runId="run-1")
-    runtime = agent.new(identity=identity)
-    parts = runtime.astream(
-        {"messages": [{"role": "user", "content": "Hello"}]},
+    parts = await tinkerfin.open_run(
+        identity,
+        agent=agent,
+        input={"messages": [{"role": "user", "content": "Hello"}]},
     )
     async for part in parts:
         print(part)
@@ -76,22 +76,23 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-Use `agent.new()` for native LangGraph objects. Both Runtime types expose the installed
-`CompiledStateGraph.astream(...)` parameter shape with a canonical complete Native
-profile.
+`open_run()` owns definition resolution, asynchronous Graph construction, observation,
+coordination, cancellation, and cleanup. Use `await agent.create_graph()` only when an
+advanced integration needs a reusable direct LangGraph-style `Runnable` without managed
+run identity, Trace, AG-UI, or Messaging lifecycle.
 
 ## Core concepts
 
 - `create_deep_agent(...)` records the installed Deep Agents build call;
-  `new()` / `new_agui()` creates a fresh Graph and a single-use Runtime.
+  `open_run()` and `open_agui_run()` are the ordinary managed execution paths.
 - Native Runtime, Plan Mode, Observation, and SSE are included by default;
-  `new_agui()` requires `tinkerfin[agui]`.
+  `open_agui_run()` requires `tinkerfin[agui]`.
 - `TinkerFin(state_schema=...)` contributes application state to every Deep Agent
   Definition created by that factory; Definition state and middleware state are merged
   without weakening reducers or requiredness.
 - `.plan(enabled=True)` adds one stable parent workflow without changing the installed
   `create_deep_agent(...)` signature. Choose `mode="default"` or `mode="plan"` on each
-  `new()` / `new_agui()` request; selecting Plan requires a concrete checkpointer.
+  managed run or direct Graph; selecting Plan requires a concrete checkpointer.
 - One explicit Runtime Profile owns graph construction, required stream options,
   Native validation, observations, and canonical replay; conflicting or partial
   upstream options fail before iteration or lifecycle events.
@@ -101,9 +102,10 @@ profile.
   persistence, replay, attachment, and remote cancellation.
 - AG-UI Runtime uses one `RunIdentity` for public events, Graph execution, checkpoints, and
   durable delivery; optional `parent_run_id` creates a real checkpoint branch.
-- Resume accepts an `AgUiResumeRequest`; `DeepAgentDefinition.prepare_agui_resume()`
-  reads the canonical checkpoint and produces the private binding. Runtime owns native
-  commands, Tool correlation, cancellation, and durable checkpoint evidence.
+- `open_agui_run(resume=...)` accepts an `AgUiResumeRequest`, reads the canonical
+  checkpoint, and owns native commands, Tool correlation, cancellation, and durable
+  checkpoint evidence. Binding APIs remain available only for advanced event-log
+  integrations.
 - `.observe(Tracer())` records fail-closed Runtime lifecycle and validated Native semantic
   facts without recording AG-UI, Messaging, SSE, or Redis delivery state.
 - The distribution provides the explicit `deepagents-v2` Runtime Profile. It does not
@@ -121,7 +123,6 @@ profile.
 - [Messaging](docs/en/messaging/index.md)
 - [Tracing](docs/en/tracing/index.md)
 - [Sandbox](docs/en/sandbox/index.md)
-- [Repository testing](docs/en/development/testing.md)
 - [Core package](packages/tinkerfin/README.md)
 - [Shared contracts](packages/tinkerfin-contracts/README.md)
 - [AG-UI adapter](packages/tinkerfin-agui-adapter/README.md)

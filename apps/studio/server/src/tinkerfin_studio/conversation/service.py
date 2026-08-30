@@ -2,21 +2,24 @@
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 
 from ag_ui.core import BaseEvent
 from langchain.agents.middleware.types import InputAgentState
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from tinkerfin import AgUiResumeCheckpoint, RunIdentity, join_task
+from tinkerfin import AgUiResumeCheckpoint, RunIdentity
+from tinkerfin_messaging import (
+    ProfiledMessageSource,
+    create_agui_run_source,
+    parse_sse_event_id,
+)
 from tinkerfin_messaging.errors import (
     MessagingError,
     MessagingErrorCode,
     RunProducerFailed,
 )
-from tinkerfin_messaging.protocols import ProfiledMessageSource
 from tinkerfin_studio.agent.factory import ConversationAgentFactory
 from tinkerfin_studio.api.errors import (
     BusinessException,
@@ -34,6 +37,7 @@ from tinkerfin_studio.conversation.run_preparation import (
     bind_start_graph_input,
     classify_intent,
     conversation_identity,
+    decorate_main_event,
     prepare_run_request,
 )
 from tinkerfin_studio.conversation.run_registration import (
@@ -145,21 +149,17 @@ _MESSAGING_ERRORS: dict[
 def parse_last_event_id(value: str | None) -> int | None:
     """解析规范十进制 SSE 重连游标"""
 
-    if value is None:
-        return None
-    if not value.isascii() or not value.isdecimal():
-        raise BusinessException(ConversationErrorCode.INVALID_LAST_EVENT_ID)
-    parsed = int(value)
-    if str(parsed) != value:
-        raise BusinessException(ConversationErrorCode.INVALID_LAST_EVENT_ID)
-    return parsed
+    try:
+        return parse_sse_event_id(value)
+    except (TypeError, ValueError) as error:
+        raise BusinessException(ConversationErrorCode.INVALID_LAST_EVENT_ID) from error
 
 
 @dataclass(frozen=True, slots=True)
 class PreparedChat:
     """完成 Messaging 预握手后的 HTTP SSE 内容"""
 
-    body: AsyncIterator[bytes]
+    body: AsyncGenerator[bytes, None]
     thread_id: str
 
 
@@ -184,7 +184,7 @@ class ConversationChatService:
         *,
         last_event_id: str | None,
     ) -> PreparedChat:
-        """完成业务校验、Graph 创建和 Messaging 预握手"""
+        """完成业务校验、Agent 事件源准备和 Messaging 预握手"""
 
         after = parse_last_event_id(last_event_id)
         intent = classify_intent(request)
@@ -198,21 +198,12 @@ class ConversationChatService:
             intent=intent,
             model=model,
         )
-        try:
-            events = self._create_events(
-                intent=intent,
-                execution=execution,
-                prepared=prepared,
-                model=model,
-                run_preparer=run_preparer,
-            )
-        except BaseException:
-            await self._cleanup_execution(
-                run_preparer,
-                prepared=prepared,
-                execution=execution,
-            )
-            raise
+        events = self._create_events(
+            intent=intent,
+            execution=execution,
+            prepared=prepared,
+            model=model,
+        )
         body = await self._start_delivery(
             events,
             after=after,
@@ -301,26 +292,6 @@ class ConversationChatService:
             raise self._messaging_error(error) from error
         return run_preparer, prepared, execution
 
-    @staticmethod
-    async def _cleanup_execution(
-        run_preparer: ConversationRunPreparer,
-        *,
-        prepared: PreparedRunRequest,
-        execution: PreparedExecution,
-    ) -> None:
-        """以受保护任务清理尚未启动的 run 与 interrupt claim"""
-
-        task = asyncio.create_task(
-            run_preparer.cleanup_unstarted(
-                thread_pk=execution.thread.id,
-                identity_run_id=prepared.identity.run_id,
-                registered=execution.registered,
-                thread_created=execution.thread_created,
-            ),
-            name=f"studio-conversation-cleanup:{prepared.identity.run_id}",
-        )
-        await join_task(task)
-
     def _create_events(
         self,
         *,
@@ -328,9 +299,8 @@ class ConversationChatService:
         execution: PreparedExecution,
         prepared: PreparedRunRequest,
         model: AgentModelConfig,
-        run_preparer: ConversationRunPreparer,
     ) -> ProfiledMessageSource[BaseEvent, BaseEvent]:
-        """创建普通、恢复或审批放弃使用的统一 profile source"""
+        """创建仅由 Messaging owner 打开的统一 AG-UI 事件源"""
 
         graph_input: InputAgentState | None
         resume_request = None
@@ -341,10 +311,10 @@ class ConversationChatService:
                 raise RuntimeError("恢复请求缺少 AgUiResumeRequest")
             graph_input = None
             resume_request = execution.resume
+        tinkerfin = self._resources.tinkerfin_profiles[model.runtime_profile]
         factory = ConversationAgentFactory(
             persistence=self._resources.agent_persistence,
             sandbox_manager=self._resources.sandbox_manager,
-            tinkerfin_profiles=self._resources.tinkerfin_profiles,
             tavily_api_key=(
                 None
                 if self._resources.settings.tavily_api_key is None
@@ -370,29 +340,43 @@ class ConversationChatService:
                 )
                 await repository.commit()
 
-        async def activate_producer() -> None:
-            """在 durable owner 建立后、Graph 初始化前激活业务 Run"""
-
-            await run_preparer.activate_started(
-                thread_pk=execution.thread.id,
-                identity_run_id=prepared.identity.run_id,
-                registered=execution.registered,
+        async def create_agent():
+            return await factory.create_agent(
+                tinkerfin=tinkerfin,
+                user_id=self._user.user_id,
+                model_config=model,
             )
 
-        return factory.create_agui_events(
-            user_id=self._user.user_id,
-            model_config=model,
-            graph_input=graph_input,
-            prepared=prepared,
-            resume=resume_request,
-            on_producer_opened=activate_producer,
-            on_resume_checkpointed=(
-                record_resume_checkpoint if resume_request is not None else None
-            ),
-            on_resume_initialization_failed=(
-                release_resume_claims if resume_request is not None else None
-            ),
-            title=execution.thread.title,
+        async def open_events(identity: RunIdentity):
+            return await tinkerfin.open_agui_run(
+                identity,
+                agent=create_agent,
+                input=graph_input,
+                resume=resume_request,
+                parent_run_id=prepared.parent_run_id,
+                mode=prepared.mode,
+                config=prepared.graph_config,
+                on_resume_saved=(
+                    record_resume_checkpoint if resume_request is not None else None
+                ),
+                on_resume_not_saved=(
+                    release_resume_claims if resume_request is not None else None
+                ),
+            )
+
+        def attach_run_metadata(event: BaseEvent) -> BaseEvent:
+            """补充 Studio 标题与取消文案"""
+
+            return decorate_main_event(
+                event,
+                prepared=prepared,
+                title=execution.thread.title,
+            )
+
+        return create_agui_run_source(
+            prepared.identity,
+            open_events=open_events,
+            transform_event=attach_run_metadata,
         )
 
     async def _start_delivery(
@@ -403,99 +387,52 @@ class ConversationChatService:
         prepared: PreparedRunRequest,
         execution: PreparedExecution,
         run_preparer: ConversationRunPreparer,
-    ) -> AsyncIterator[bytes]:
-        """执行无数据库锁的 Messaging 预握手，并保护失败清理"""
+    ) -> AsyncGenerator[bytes, None]:
+        """让 Messaging 完成 owner/attachment 选择并返回 SSE 内容"""
 
-        cleanup_task: asyncio.Task[None] | None = None
+        async def activate_source() -> None:
+            """在 producer 创建前激活已选中的业务 Run"""
 
-        async def cleanup() -> None:
-            nonlocal cleanup_task
-            if cleanup_task is None:
-                cleanup_task = asyncio.create_task(
-                    run_preparer.cleanup_unstarted(
-                        thread_pk=execution.thread.id,
-                        identity_run_id=prepared.identity.run_id,
-                        registered=execution.registered,
-                        thread_created=execution.thread_created,
-                    ),
-                    name=f"studio-conversation-cleanup:{prepared.identity.run_id}",
-                )
-            await join_task(cleanup_task)
+            await run_preparer.activate_started(
+                thread_pk=execution.thread.id,
+                identity_run_id=prepared.identity.run_id,
+                registered=execution.registered,
+            )
 
-        async def settle_interrupted_preflight() -> BaseException | None:
-            """完成预握手的业务清理或关闭，并返回次要失败"""
+        async def cleanup_not_started() -> None:
+            """清理没有 producer 且没有 attachment 的业务注册"""
 
-            try:
-                interrupted_body = await preflight
-            except BaseException as preflight_error:  # noqa: BLE001 - owned task 终态
-                try:
-                    await cleanup()
-                except BaseException as cleanup_error:  # noqa: BLE001 - 保留两项失败
-                    preflight_error.add_note(
-                        "会话预握手清理同时失败: "
-                        f"{type(cleanup_error).__name__}: {cleanup_error}"
-                    )
-                return preflight_error
-            close = getattr(interrupted_body, "aclose", None)
-            if close is None:
-                return None
-            try:
-                await close()
-            except BaseException as close_error:  # noqa: BLE001 - 返回给原取消附注
-                return close_error
-            return None
+            await run_preparer.cleanup_unstarted(
+                thread_pk=execution.thread.id,
+                identity_run_id=prepared.identity.run_id,
+                registered=execution.registered,
+                thread_created=execution.thread_created,
+            )
 
-        preflight = asyncio.create_task(
-            self._resources.conversation_channel.sse(
+        try:
+            body = await self._resources.conversation_channel.sse(
                 events,
                 after=after,
-            ),
-            name=f"studio-conversation-preflight:{prepared.identity.run_id}",
-        )
-        current = asyncio.current_task()
-        try:
-            body = await asyncio.shield(preflight)
-        except asyncio.CancelledError as cancellation:
-            caller_cancelled = current is not None and current.cancelling() > 0
-            settlement = asyncio.create_task(
-                settle_interrupted_preflight(),
-                name=f"studio-conversation-preflight-settlement:{prepared.identity.run_id}",
+                on_source_starting=activate_source,
+                on_delivery_not_started=cleanup_not_started,
             )
-            try:
-                settlement_error = await join_task(settlement)
-            except asyncio.CancelledError as repeated_cancellation:
-                # join_task 已保证 settlement 完成；这里保留首次取消作为请求主因
-                settlement_error = settlement.result()
-                cancellation.add_note(
-                    f"等待会话预握手结算期间再次收到调用方取消: {repeated_cancellation}"
-                )
-            if settlement_error is not None:
-                stage = "HTTP 取消后" if caller_cancelled else "owned task 取消后"
-                cancellation.add_note(
-                    f"Messaging 预握手在{stage}结算失败: "
-                    f"{type(settlement_error).__name__}: {settlement_error}"
-                )
-            raise cancellation
+        except MessagingError as error:
+            raise self._messaging_error(error) from error
+        try:
+            self._resources.conversation_trace.ensure(
+                thread_pk=execution.thread.id,
+                identity=prepared.identity,
+            )
         except BaseException as error:
             try:
-                await cleanup()
-            except asyncio.CancelledError as cleanup_cancellation:
-                cleanup_cancellation.add_note(
-                    f"会话预握手同时失败: {type(error).__name__}: {error}"
+                await body.aclose()
+            except BaseException as close_error:
+                close_error.add_note(
+                    "SSE 内容关闭前的 Trace follow 注册也失败: "
+                    f"{type(error).__name__}: {error}"
                 )
                 raise
-            except BaseException as cleanup_error:  # noqa: BLE001 - 主失败必须保留
-                error.add_note(
-                    "会话预握手清理同时失败: "
-                    f"{type(cleanup_error).__name__}: {cleanup_error}"
-                )
-            if isinstance(error, MessagingError):
-                raise self._messaging_error(error) from error
             raise
-        self._resources.conversation_trace.ensure(
-            thread_pk=execution.thread.id,
-            identity=prepared.identity,
-        )
         return body
 
     async def cancel(self, *, thread_id: str, run_id: str) -> CancelRunResponse:

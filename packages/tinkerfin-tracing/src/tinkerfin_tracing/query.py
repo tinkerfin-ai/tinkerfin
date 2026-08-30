@@ -45,12 +45,13 @@ from .views import (
     TraceReasoning,
     TraceState,
     TraceStatus,
+    TraceSummary,
     TraceTree,
     TraceUpdate,
 )
 
 EntityT = TypeVar("EntityT", bound=BaseModel)
-_CORE_PROJECTION_NAME = "tinkerfin.core"
+_CORE_PROJECTION_NAME = "tinkerfin.core.summary"
 
 
 class _CursorPayload(TraceModel):
@@ -192,14 +193,21 @@ class TraceThread:
         """Return the selected head's current execution status."""
 
         self._ensure_live()
-        return self._core.status.model_copy(deep=True)
+        return self._core.summary.status.model_copy(deep=True)
 
     @property
     def completeness(self) -> TraceCompleteness:
         """Return structural and retained-payload completeness signals."""
 
         self._ensure_live()
-        return self._core.completeness.model_copy(deep=True)
+        return self._core.summary.completeness.model_copy(deep=True)
+
+    @property
+    def summary(self) -> TraceSummary:
+        """Return complete cumulative status for this selected fixed-as-of lineage."""
+
+        self._ensure_live()
+        return self._core.summary.model_copy(deep=True)
 
     @property
     def has_older(self) -> bool:
@@ -213,14 +221,14 @@ class TraceThread:
         """Return full selected-lineage user and assistant message count."""
 
         self._ensure_live()
-        return self._core.message_count
+        return self._core.summary.message_count
 
     @property
     def tool_call_count(self) -> int:
         """Return full selected-lineage Tool proposal count."""
 
         self._ensure_live()
-        return self._core.tool_call_count
+        return self._core.summary.tool_call_count
 
     @property
     def history_cursor(self) -> str | None:
@@ -425,10 +433,7 @@ class TraceThread:
                         current.interactions,
                     ),
                     state=current.state,
-                    status=current.status,
-                    completeness=current.completeness,
-                    message_count=current.message_count,
-                    tool_call_count=current.tool_call_count,
+                    summary=current.summary,
                     projections={
                         name: result.model_dump(mode="json", by_alias=True)
                         for name, result in projection_results.items()

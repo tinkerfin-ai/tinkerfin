@@ -33,7 +33,7 @@ from tinkerfin_contracts import (
 )
 
 from .capture import CapturedValue, CapturePolicy, ReasoningCapturePolicy
-from .errors import TraceCorruption, TraceStoreProtocolError
+from .errors import TraceCaptureRejected, TraceCorruption, TraceStoreProtocolError
 from .facts import (
     InteractionFact,
     MessageFact,
@@ -123,6 +123,16 @@ class _PendingInteraction:
     tool_call_ids: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _SubagentDescriptor:
+    """Retain one proven Deep Agents task Tool to child-namespace relationship."""
+
+    parent_tool_call_id: str
+    parent_task_id: str
+    agent_name: str
+    description: str
+
+
 class _TracingSession:
     """Own one Run writer and its ordered, bounded semantic mapping lifecycle.
 
@@ -195,6 +205,7 @@ class _TracingSession:
         self._pending_interactions: dict[
             tuple[tuple[str, ...], str], _PendingInteraction
         ] = {}
+        self._subagent_descriptors: dict[tuple[str, ...], _SubagentDescriptor] = {}
         self._active_subagents: dict[tuple[str, ...], tuple[str, str | None]] = {}
         self._batch_writer = TraceBatchWriter(
             writer,
@@ -597,6 +608,8 @@ class _TracingSession:
                     outcome=observation.outcome,
                 ),
             ]
+        if isinstance(observation, NativeTaskObservation):
+            self._remember_subagent_descriptors(observation)
         namespace = observation.namespace
         facts = self._subagent_start(observation, source_id=source_id)
         if isinstance(observation, NativeMessageObservation):
@@ -811,6 +824,22 @@ class _TracingSession:
         source_id: str,
     ) -> list[TraceSemanticFact]:
         message = observation.message
+        if message.message_type == "tool" and message.tool_call_id is not None:
+            tool_key = (observation.namespace, message.tool_call_id)
+            tool_name = self._tool_names.get(tool_key) or message.name or "unknown"
+            if not self._policy.traces_tool(tool_name):
+                self._tool_result(
+                    message,
+                    namespace=observation.namespace,
+                    common={
+                        "source_observation_id": source_id,
+                        "identity": observation.identity,
+                        "namespace": observation.namespace,
+                        "occurred_at": observation.observed_at,
+                        "monotonic_ns": observation.monotonic_ns,
+                    },
+                )
+                return []
         message_source_id = message.id or (
             f"anonymous-{self._message_fingerprint(message, observation.namespace)}"
         )
@@ -929,16 +958,17 @@ class _TracingSession:
                 self._tool_names[key] = chunk.name
                 if key not in self._tool_started:
                     self._tool_started.add(key)
-                    facts.append(
-                        _make_fact(
-                            ToolFact,
-                            common,
-                            phase="started",
-                            tool_call_id=_scope_id("tool", namespace, chunk.id),
-                            source_tool_call_id=chunk.id,
-                            tool_name=chunk.name,
+                    if self._policy.traces_tool(chunk.name):
+                        facts.append(
+                            _make_fact(
+                                ToolFact,
+                                common,
+                                phase="started",
+                                tool_call_id=_scope_id("tool", namespace, chunk.id),
+                                source_tool_call_id=chunk.id,
+                                tool_name=chunk.name,
+                            )
                         )
-                    )
             binding = self._tool_slots.get(slot)
             if binding is not None and chunk.arguments:
                 tool_id, tool_name = binding
@@ -960,33 +990,35 @@ class _TracingSession:
                 )
                 if content is not None:
                     self._tool_argument_snapshots.add(tool_key)
-                facts.append(
-                    _make_fact(
-                        ToolFact,
-                        common,
-                        phase="arguments",
-                        tool_call_id=_scope_id("tool", namespace, tool_id),
-                        source_tool_call_id=tool_id,
-                        tool_name=tool_name,
-                        content=content,
+                if self._policy.traces_tool(tool_name):
+                    facts.append(
+                        _make_fact(
+                            ToolFact,
+                            common,
+                            phase="arguments",
+                            tool_call_id=_scope_id("tool", namespace, tool_id),
+                            source_tool_call_id=tool_id,
+                            tool_name=tool_name,
+                            content=content,
+                        )
                     )
-                )
         for call in message.tool_calls:
             key = (namespace, call.id)
             self._tool_names[key] = call.name
             if key not in self._tool_completed:
                 if key not in self._tool_started:
                     self._tool_started.add(key)
-                    facts.append(
-                        _make_fact(
-                            ToolFact,
-                            common,
-                            phase="started",
-                            tool_call_id=_scope_id("tool", namespace, call.id),
-                            source_tool_call_id=call.id,
-                            tool_name=call.name,
-                        ),
-                    )
+                    if self._policy.traces_tool(call.name):
+                        facts.append(
+                            _make_fact(
+                                ToolFact,
+                                common,
+                                phase="started",
+                                tool_call_id=_scope_id("tool", namespace, call.id),
+                                source_tool_call_id=call.id,
+                                tool_name=call.name,
+                            ),
+                        )
                 streamed_arguments = self._tool_argument_fragments.get(key)
                 arguments_match = False
                 if streamed_arguments is not None:
@@ -996,7 +1028,9 @@ class _TracingSession:
                         )
                     except (TypeError, ValueError, json.JSONDecodeError):
                         arguments_match = False
-                if not arguments_match or key not in self._tool_argument_snapshots:
+                if self._policy.traces_tool(call.name) and (
+                    not arguments_match or key not in self._tool_argument_snapshots
+                ):
                     facts.append(
                         _make_fact(
                             ToolFact,
@@ -1013,16 +1047,17 @@ class _TracingSession:
                             ),
                         )
                     )
-                facts.append(
-                    _make_fact(
-                        ToolFact,
-                        common,
-                        phase="completed",
-                        tool_call_id=_scope_id("tool", namespace, call.id),
-                        source_tool_call_id=call.id,
-                        tool_name=call.name,
+                if self._policy.traces_tool(call.name):
+                    facts.append(
+                        _make_fact(
+                            ToolFact,
+                            common,
+                            phase="completed",
+                            tool_call_id=_scope_id("tool", namespace, call.id),
+                            source_tool_call_id=call.id,
+                            tool_name=call.name,
+                        )
                     )
-                )
                 self._tool_completed.add(key)
                 self._tool_argument_fragments.pop(key, None)
         return facts
@@ -1041,6 +1076,9 @@ class _TracingSession:
         self._tool_results.add(key)
         self._tool_argument_fragments.pop(key, None)
         tool_name = self._tool_names.get(key) or message.name or "unknown"
+        if not self._policy.traces_tool(tool_name):
+            self._tool_completed.add(key)
+            return []
         facts: list[TraceSemanticFact] = []
         if key not in self._tool_completed:
             facts.append(
@@ -1228,6 +1266,17 @@ class _TracingSession:
             key = (namespace, interrupt.id)
             if key in self._pending_interactions:
                 continue
+            # LangGraph v2 propagates a dynamic child's interrupt through every
+            # ancestor values snapshot. The deepest observed scope owns correlation;
+            # treating the later root copy as another review would compare child
+            # actions with the parent's unrelated Tool calls and fail the whole Run.
+            if any(
+                pending_id == interrupt.id
+                and len(pending_namespace) > len(namespace)
+                and pending_namespace[: len(namespace)] == namespace
+                for pending_namespace, pending_id in self._pending_interactions
+            ):
+                continue
             interaction_kind = _interaction_kind(interrupt.value)
             tool_call_ids = _interaction_tool_call_ids(
                 interrupt.value,
@@ -1290,10 +1339,15 @@ class _TracingSession:
             return []
         if namespace in self._active_subagents:
             return []
-        agent_name: str | None = None
+        descriptor = self._subagent_descriptors.get(namespace)
+        agent_name: str | None = None if descriptor is None else descriptor.agent_name
         if isinstance(observation, NativeMessageObservation):
             raw_name = observation.metadata.get("lc_agent_name")
             if isinstance(raw_name, str) and raw_name:
+                if agent_name is not None and raw_name != agent_name:
+                    raise TraceCorruption(
+                        "Subagent name conflicts with its parent task Tool"
+                    )
                 agent_name = raw_name
         subagent_id = _scope_id("subagent", namespace, namespace[-1])
         self._active_subagents[namespace] = (subagent_id, agent_name)
@@ -1307,9 +1361,84 @@ class _TracingSession:
                 phase="started",
                 subagent_id=subagent_id,
                 agent_name=agent_name,
+                parent_tool_call_id=(
+                    None if descriptor is None else descriptor.parent_tool_call_id
+                ),
+                input=(
+                    None
+                    if descriptor is None
+                    else self._policy.capture_tool(
+                        tool_name="task",
+                        value={
+                            "description": descriptor.description,
+                            "subagent_type": descriptor.agent_name,
+                        },
+                        target="arguments",
+                        max_bytes=self._payload_budget,
+                    )
+                ),
                 status="running",
             )
         ]
+
+    def _remember_subagent_descriptors(
+        self,
+        observation: NativeTaskObservation,
+    ) -> None:
+        """Index verified Deep Agents task Tool inputs before child parts arrive.
+
+        Deep Agents 0.7.5 emits the parent ``tools`` task start before each child
+        namespace. The task input carries model Tool calls; only exact ``task`` calls
+        with the locked ``description`` and ``subagent_type`` fields establish public
+        subagent identity. Contract coverage mirrors the adapter provenance tests.
+        """
+
+        if (
+            observation.phase != "start"
+            or observation.name != "tools"
+            or not isinstance(observation.input, list)
+        ):
+            return
+        descriptors: list[tuple[str, str, str]] = []
+        for raw_call in observation.input:
+            if not isinstance(raw_call, dict) or raw_call.get("name") != "task":
+                continue
+            raw_id = raw_call.get("id")
+            raw_args = raw_call.get("args")
+            if (
+                not isinstance(raw_id, str)
+                or not raw_id
+                or not isinstance(raw_args, dict)
+            ):
+                continue
+            description = raw_args.get("description")
+            agent_name = raw_args.get("subagent_type")
+            if (
+                not isinstance(description, str)
+                or not description
+                or not isinstance(agent_name, str)
+                or not agent_name
+            ):
+                continue
+            descriptors.append((raw_id, agent_name, description))
+        multiple = len(descriptors) > 1
+        for index, (tool_call_id, agent_name, description) in enumerate(descriptors):
+            suffix = (
+                f"{observation.task_id}:{index}" if multiple else observation.task_id
+            )
+            namespace = (*observation.namespace, f"tools:{suffix}")
+            descriptor = _SubagentDescriptor(
+                parent_tool_call_id=tool_call_id,
+                parent_task_id=observation.task_id,
+                agent_name=agent_name,
+                description=description,
+            )
+            existing = self._subagent_descriptors.get(namespace)
+            if existing is not None and existing != descriptor:
+                raise TraceCorruption(
+                    "Subagent parent task Tool changed before child execution"
+                )
+            self._subagent_descriptors[namespace] = descriptor
 
     def _subagent_completions(
         self,
@@ -1329,11 +1458,19 @@ class _TracingSession:
             for namespace in self._active_subagents
             if len(namespace) == len(parent) + 1
             and namespace[: len(parent)] == parent
-            and namespace[-1].partition(":")[2] == observation.task_id
+            and (
+                (
+                    self._subagent_descriptors[namespace].parent_task_id
+                    if namespace in self._subagent_descriptors
+                    else namespace[-1].partition(":")[2]
+                )
+                == observation.task_id
+            )
         ]
         facts: list[TraceSemanticFact] = []
         for namespace in sorted(matches):
             subagent_id, agent_name = self._active_subagents.pop(namespace)
+            self._subagent_descriptors.pop(namespace, None)
             facts.append(
                 SubagentFact(
                     source_observation_id=source_id,
@@ -1431,10 +1568,10 @@ class _TracingSession:
 
     def _capture_interaction(self, value: JsonValue) -> CapturedValue:
         if not isinstance(value, dict):
-            return self._capture(value)
+            return self._capture_required_interaction(value)
         raw_actions = value.get("action_requests")
         if not isinstance(raw_actions, list):
-            return self._capture(value)
+            return self._capture_required_interaction(value)
         actions: list[JsonValue] = []
         for raw_action in raw_actions:
             if not isinstance(raw_action, dict):
@@ -1452,18 +1589,40 @@ class _TracingSession:
             raw_arguments = raw_action.get("args")
             arguments: JsonValue = raw_arguments if raw_arguments is not None else {}
             action: dict[str, JsonValue] = {"name": tool_name}
-            action["arguments"] = self._policy.capture_tool(
+            captured_arguments = self._policy.capture_tool(
                 tool_name=tool_name,
                 value=arguments,
                 target="arguments",
                 max_bytes=self._payload_budget,
-            ).model_dump(mode="json", by_alias=True)
+            )
+            action["arguments"] = captured_arguments.model_dump(
+                mode="json",
+                by_alias=True,
+            )
+            description = raw_action.get("description")
+            if (
+                isinstance(description, str)
+                and description
+                and captured_arguments.disposition == "inline"
+                and self._policy.captures_review_description(tool_name)
+            ):
+                action["description"] = description
             actions.append(action)
         safe_value = {
             key: item for key, item in value.items() if key != "action_requests"
         }
         safe_value["action_requests"] = actions
-        return self._capture(safe_value)
+        return self._capture_required_interaction(safe_value)
+
+    def _capture_required_interaction(self, value: JsonValue) -> CapturedValue:
+        """Reject a pause that cannot be reconstructed from its durable Trace."""
+
+        captured = self._capture(value)
+        if captured.disposition == "omitted":
+            raise TraceCaptureRejected(
+                "Pending interaction payload exceeds the safe Trace boundary"
+            )
+        return captured
 
     def _message_fingerprint(
         self,
@@ -1546,7 +1705,8 @@ class Tracer:
         Args:
             store: Borrowed Store. Omitting it creates a bounded in-process Store owned
                 only by this Tracer value.
-            capture_policy: Public semantic capture and redaction policy.
+            capture_policy: Public semantic capture and redaction policy. Omitting it
+                retains complete sanitized Tool content through ``public_history``.
             reasoning_capture_policy: Independent authorization for extracted provider
                 reasoning content.
             limits: Capacity contract; when supplied it must equal ``store.limits``.
@@ -1588,7 +1748,7 @@ class Tracer:
             raise ValueError("Tracer limits must match Store limits")
         self._store = resolved_store
         self._capture_policy = (
-            CapturePolicy.public_safe() if capture_policy is None else capture_policy
+            CapturePolicy.public_history() if capture_policy is None else capture_policy
         )
         self._reasoning_capture_policy = (
             ReasoningCapturePolicy.omitted()
@@ -1703,6 +1863,7 @@ class Tracer:
         Raises:
             ValueError: Identity, limit, cursor, or Projection names are invalid.
             TraceThreadNotFound: The thread or cursor generation is unavailable.
+            TraceRunNotFound: The explicitly selected Run has not entered the generation.
             AmbiguousTraceHead: Multiple heads exist without an explicit selection.
             TraceStoreError: Snapshot, event, or Projection checkpoint access fails.
             TraceProjectionFailed: A requested business Projection cannot be evaluated.
@@ -1927,10 +2088,20 @@ def _interaction_tool_call_ids(
             raise TraceCorruption("Tool review actions require a name and object args")
         actions.append((name, arguments))
 
+    completed_call_ids = {
+        message.tool_call_id
+        for message in messages
+        if message.message_type == "tool" and message.tool_call_id is not None
+    }
     unique: tuple[str, ...] | None = None
     work = 0
     for message in messages:
-        calls = message.tool_calls
+        # A completed historical call cannot be the proposal that produced the
+        # currently pending interrupt. Keep unresolved messages available so
+        # parallel review groups and subgraph scopes retain their exact IDs.
+        calls = tuple(
+            call for call in message.tool_calls if call.id not in completed_call_ids
+        )
         if not calls:
             continue
         work += len(actions) * len(calls)

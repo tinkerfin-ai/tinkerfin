@@ -25,6 +25,7 @@ from ..errors import (
     OpenSandboxSettlementTimeoutError,
     OpenSandboxStateError,
     OpenSandboxStateOwnershipError,
+    OpenSandboxWarmPoolUnavailableError,
 )
 from ..models import OpenSandboxDetails
 from . import _manager_bindings, _manager_resources
@@ -41,6 +42,7 @@ from .state import (
     OpenSandboxBinding,
     OpenSandboxCleanupClaim,
     OpenSandboxOwnerClaim,
+    OpenSandboxReadyWarmClaim,
     OpenSandboxState,
     OpenSandboxWarmClaim,
     _OpenSandboxStateBoundary,
@@ -127,7 +129,10 @@ class OpenSandboxManager(Generic[KeyT]):
         self._warm_backends: list[OpenSandboxBackend] = []
         self._warm_lock = asyncio.Lock()
         self._warm_fill_lock = asyncio.Lock()
-        self._replenish_task: asyncio.Task[None] | None = None
+        self._warm_maintenance_task: asyncio.Task[None] | None = None
+        self._warm_maintenance_wakeup = asyncio.Event()
+        self._warm_ready = asyncio.Event()
+        self._warm_failure: BaseException | None = None
         self._cleanup_tasks: set[asyncio.Task[None]] = set()
         self._cleanup_wakeup = asyncio.Event()
         self._cleanup_queue_task: asyncio.Task[None] | None = None
@@ -224,11 +229,50 @@ class OpenSandboxManager(Generic[KeyT]):
             self._cleanup_queue_loop(retry_pending=retry_cleanup),
             name="tinkerfin-opensandbox-cleanup",
         )
-        await self._fill_warm_pool(fail_on_error=self._fail_on_startup_warmup_error)
+        await self._maintain_warm_pool(fail_on_error=self._fail_on_startup_warmup_error)
+        self._warm_maintenance_task = asyncio.create_task(
+            self._warm_maintenance_loop(),
+            name="tinkerfin-opensandbox-warm-maintenance",
+        )
 
     def _ensure_open(self) -> None:
         if self._closed:
             raise OpenSandboxManagerClosedError("OpenSandbox manager is closed")
+
+    async def check_ready(self) -> None:
+        """Raise when the configured ready Sandbox capacity is unavailable.
+
+        Hosts can use this side-effect-free check in their readiness endpoint. It
+        reports startup or background warm-pool failures without exposing provider
+        responses, credentials, or remote identifiers.
+
+        Raises:
+            OpenSandboxManagerClosedError: The manager is not available for work.
+            OpenSandboxWarmPoolUnavailableError: The target warm capacity is not
+                currently backed by verified remote Sandboxes.
+        """
+
+        self._ensure_open()
+        if not self._started:
+            raise OpenSandboxWarmPoolUnavailableError(
+                "OpenSandbox warm capacity has not started",
+                context={"target_capacity": self._warm_pool_size},
+            )
+        if self._warm_pool_size == 0:
+            return
+        if self._warm_ready.is_set() and self._warm_failure is None:
+            return
+        failure = self._warm_failure
+        raise OpenSandboxWarmPoolUnavailableError(
+            "OpenSandbox warm capacity is unavailable",
+            context={"target_capacity": self._warm_pool_size},
+            diagnostic_context={
+                "error_type": (
+                    type(failure).__name__ if failure is not None else "not_ready"
+                )
+            },
+            cause=failure,
+        ) from failure
 
     @asynccontextmanager
     async def _operation(self) -> AsyncGenerator[None]:
@@ -349,6 +393,14 @@ class OpenSandboxManager(Generic[KeyT]):
         """Best-effort renewal without invalidating an otherwise healthy handle."""
 
         return await _manager_resources._renew_backend(
+            self,
+            backend,
+        )
+
+    async def _renew_ready_backend(self, backend: _HealthBackend) -> None:
+        """Renew warm capacity strictly so readiness never hides expiry failure."""
+
+        return await _manager_resources._renew_ready_backend(
             self,
             backend,
         )
@@ -527,13 +579,33 @@ class OpenSandboxManager(Generic[KeyT]):
             strict=strict,
         )
 
-    async def _fill_warm_pool(self, *, fail_on_error: bool = False) -> None:
-        """Claim and fill global warm slots through State."""
+    async def _fill_warm_pool(self) -> tuple[str, ...]:
+        """Claim and fill every currently empty global warm slot."""
 
         return await _manager_resources._fill_warm_pool(
             self,
+        )
+
+    async def _reconcile_ready_warm_slot(
+        self,
+        claim: OpenSandboxReadyWarmClaim,
+    ) -> str | None:
+        """Verify one published remote Sandbox or invalidate its fenced slot."""
+
+        return await _manager_resources._reconcile_ready_warm_slot(self, claim)
+
+    async def _maintain_warm_pool(self, *, fail_on_error: bool) -> None:
+        """Reconcile published slots, fill capacity, and update host readiness."""
+
+        return await _manager_resources._maintain_warm_pool(
+            self,
             fail_on_error=fail_on_error,
         )
+
+    async def _warm_maintenance_loop(self) -> None:
+        """Renew or replace ready capacity until manager shutdown."""
+
+        return await _manager_resources._warm_maintenance_loop(self)
 
     def _schedule_replenish(self) -> None:
         """Schedule at most one replenishment task for an open undersized pool."""

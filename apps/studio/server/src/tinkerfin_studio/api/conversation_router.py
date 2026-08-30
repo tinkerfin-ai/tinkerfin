@@ -16,7 +16,7 @@ from tinkerfin_studio.api.dependencies import (
     UserContextDep,
 )
 from tinkerfin_studio.api.responses import ApiResponse
-from tinkerfin_studio.conversation.request import THREAD_ID_PATTERN, ChatRequest
+from tinkerfin_studio.conversation.request import ChatRequest
 from tinkerfin_studio.conversation.schemas import (
     CancelRunResponse,
     ConversationHistoryDetail,
@@ -35,7 +35,6 @@ ThreadIdPath: TypeAlias = Annotated[
     Path(
         min_length=1,
         max_length=128,
-        pattern=THREAD_ID_PATTERN,
         description="会话 threadId",
     ),
 ]
@@ -137,7 +136,7 @@ async def chat(
     user: UserContextDep,
     last_event_id: Annotated[str | None, Header(alias="Last-Event-ID")] = None,
 ) -> StreamingResponse:
-    """创建请求级 Deep Agent graph 并返回 durable AG-UI SSE"""
+    """启动或附着 durable Agent run 并返回 AG-UI SSE"""
 
     try:
         chat_request = ChatRequest.from_agui(input_data)
@@ -149,7 +148,7 @@ async def chat(
         resources=get_resources(request.app),
     ).start(chat_request, last_event_id=last_event_id)
     return StreamingResponse(
-        prepared.body,
+        _chat_sse(prepared.body),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -187,3 +186,15 @@ async def _trace_sse(
             yield f"event: trace\ndata: {payload}\n\n".encode()
     finally:
         await events.aclose()
+
+
+async def _chat_sse(
+    body: AsyncGenerator[bytes, None],
+) -> AsyncGenerator[bytes, None]:
+    """转发框架 SSE，并在 HTTP 断连或响应终止时释放订阅"""
+
+    try:
+        async for frame in body:
+            yield frame
+    finally:
+        await body.aclose()

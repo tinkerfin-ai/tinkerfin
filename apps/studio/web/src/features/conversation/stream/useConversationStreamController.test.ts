@@ -182,12 +182,43 @@ describe('useConversationStreamController', () => {
       const current = result.current.workspace.conversations[0]
       expect(current?.messages.map((message) => message.content)).toEqual(['Trace 最终内容'])
       expect(current?.runStatus).toBe('idle')
+      expect(current?.lastSeq).toBe(4)
       expect(current?.trace?.asOfSeq).toBe(5)
     })
     expect(traceMocks.detail).toHaveBeenCalledWith(THREAD_ID, {
       signal: expect.any(AbortSignal),
       suppressGlobalError: true,
     })
+  })
+
+  it('accepts the first thread-wide sequence as the baseline when history has no cursor', async () => {
+    clientMocks.resume.mockImplementation(() => streamItems([
+      { seq: 185, event: { type: 'RUN_STARTED', threadId: THREAD_ID, runId: RUN_ID } },
+      {
+        seq: 186,
+        event: {
+          type: 'RUN_FINISHED',
+          threadId: THREAD_ID,
+          runId: RUN_ID,
+          outcome: { type: 'success' },
+        },
+      },
+    ]))
+    const { result } = renderHook(() => useControllerHarness(
+      conversation({ lastSeq: undefined }),
+    ))
+
+    await act(async () => {
+      await result.current.controller.streamRun(THREAD_ID, payload, 'resume')
+    })
+
+    expect(clientMocks.resume).toHaveBeenCalledOnce()
+    expect(clientMocks.resume).toHaveBeenCalledWith(
+      payload,
+      expect.any(AbortSignal),
+      undefined,
+    )
+    expect(result.current.workspace.conversations[0]?.lastSeq).toBe(186)
   })
 
   it('repairs a sequence gap by reconnecting Messaging from the last applied seq', async () => {

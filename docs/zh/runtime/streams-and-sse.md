@@ -7,8 +7,12 @@
 ## 直接消费对象流
 
 ```python
-runtime = agent.new(identity=identity)
-stream = runtime.astream(graph_input, config)
+stream = await tinkerfin.open_run(
+    identity,
+    agent=agent,
+    input=graph_input,
+    config=config,
+)
 
 try:
     async for part in stream:
@@ -44,7 +48,8 @@ finally:
 | `mapper` | `None` | 把对象转换为 `SsePayload` 的函数 |
 | `event_id_resolver` | `None` | 为每条事件生成 SSE `id` 的函数 |
 
-`AgUiEventStream.to_sse()` 不接收 `timeout`，因为 AG-UI 的运行超时在创建 Runtime 时配置。
+`AgUiEventStream.to_sse()` 不接收 `timeout`；AG-UI 运行超时通过
+`open_agui_run(stream_timeout=...)` 配置。
 
 ## 自定义事件名称和数据
 

@@ -13,6 +13,8 @@ from pydantic import Field, JsonValue, field_validator, model_validator
 from tinkerfin_contracts import RunIdentity
 
 from ._models import TraceModel
+from ._prepared import PreparedTraceFact, prepare_trace_facts
+from .codec import CanonicalTracePayloadCodec
 from .errors import (
     TraceProjectionCheckpointConflict,
     TraceQuotaExceeded,
@@ -448,10 +450,23 @@ class _MemoryWriter:
 
         if self._closed:
             raise TraceStoreProtocolError("Trace writer is closed")
-        return await self._store._append(
+        prepared = prepare_trace_facts(facts, codec=self._store._codec)
+        return await self._append_prepared(prepared, mandatory=mandatory)
+
+    async def _append_prepared(
+        self,
+        prepared: tuple[PreparedTraceFact, ...],
+        *,
+        mandatory: bool,
+    ) -> tuple[TraceEvent, ...]:
+        """Append facts using canonical evidence already computed by batching."""
+
+        if self._closed:
+            raise TraceStoreProtocolError("Trace writer is closed")
+        return await self._store._append_prepared(
             self._key,
             run_id=self._run_id,
-            facts=facts,
+            prepared_facts=prepared,
             mandatory=mandatory,
         )
 
@@ -485,6 +500,7 @@ class InMemoryTraceStore:
             raise ValueError("namespace must be canonical text of at most 2048 chars")
         self._namespace = namespace
         self._limits = limits or TraceLimits()
+        self._codec = CanonicalTracePayloadCodec()
         self._threads: dict[str, _ThreadState] = {}
         self._total_bytes = 0
         self._condition = asyncio.Condition()
@@ -577,16 +593,17 @@ class InMemoryTraceStore:
                 context={"resource": "tracer_bytes"},
             )
 
-    async def _append(
+    async def _append_prepared(
         self,
         key: TraceThreadKey,
         *,
         run_id: str,
-        facts: tuple[TraceSemanticFact, ...],
+        prepared_facts: tuple[PreparedTraceFact, ...],
         mandatory: bool,
     ) -> tuple[TraceEvent, ...]:
         """Apply the shared ordered terminal and capacity contract under one lock."""
 
+        facts = tuple(item.fact for item in prepared_facts)
         if not facts:
             return ()
         terminal_batch = all(

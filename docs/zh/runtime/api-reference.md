@@ -7,18 +7,30 @@ Observation 与原生 SSE 属于基础安装。
 
 这一页按实际使用顺序汇总 Runtime 的公开能力。常见项目通常只会用到前两组。
 
-## 创建入口
+## 常用入口
 
 | API | 什么时候用 | 主要参数或结果 |
 | --- | --- | --- |
-| `TinkerFin(run_coordinator=None, state_schema=None, runtime_profile=None)` | 创建统一入口 | 可选共享 coordinator、Definition 级 state 与完整 Deep Agents 集成 Profile |
+| `TinkerFin(checkpointer=None, run_coordinator=None, state_schema=None, runtime_profile=None)` | 创建统一入口 | 可选 borrowed 默认 saver、共享 coordinator、Definition 级 state 与集成 Profile |
 | `TinkerFin.observe(observer)` | 不可变地增加一个 Runtime observer | `tinkerfin-contracts` 的 `RuntimeObserver` |
 | `TinkerFin.plan(...)` | 创建不可变的 Plan-capable factory | 能力和 mode 默认值、可选 Planner 模型、澄清表单、计划内容 Schema 与审阅动作 |
 | `TinkerFin.create_deep_agent(...)` | 创建可重复生成 Runtime 的 Agent 定义 | 参数见[创建和运行 Deep Agent](deep-agents.md) |
+| `TinkerFin.open_run(identity, *, agent, input, ...)` | 打开一次 managed 原生运行 | 单次使用的 `NativeGraphRunStream` |
+| `TinkerFin.open_agui_run(identity, *, agent, input=... or resume=..., ...)` | 打开一次 managed AG-UI 运行 | 单次使用的 `AgUiEventStream` |
+| `DeepAgentDefinition.create_graph(mode=...)` | 在 managed 生命周期外复用异步 Runnable | 完整 native 或 Plan-capable `DeepAgentGraph` |
+| `RunIdentity(threadId=..., runId=...)` | 表示一次框架运行 | 只包含 thread 和 run |
+
+`agent` 可以是已有 Definition，也可以是返回 Definition 的同步或异步 callable。Managed 门面
+负责 Definition 解析、异步 Graph 构造、身份绑定、Observation、协调、setup 失败转换、取消与
+清理。`open_agui_run()` 要求 `input` 与 `resume` 严格二选一。
+
+## 高级集成入口
+
+| API | 什么时候用 | 主要参数或结果 |
+| --- | --- | --- |
 | `DeepAgentsRuntimeProfile` | 实现完整上游集成 | canonical Profile ID、Graph factory、Native Stream Driver 与 resume checkpoint 语义 |
 | `DeepAgentsFactoryPreparation` | 返回 Profile 管理的 factory overrides | 只读 override mapping 与外部 subagent 取消边界 |
 | `DeepAgentsV2RuntimeProfile(...)` | 使用当前内置集成 | 锁定的建图、调用、校验、Observation、reasoning extractor 与 replay |
-| `RunIdentity(threadId=..., runId=...)` | 表示一次框架运行 | 只包含 thread 和 run |
 | `DeepAgentDefinition.new(...)` | 创建原生 Runtime | 必填 `identity`，可选本次请求 `mode` 和 `on_part` |
 | `DeepAgentDefinition.new_agui(...)` | 创建 AG-UI Runtime | 必填 canonical `identity`；可选 parent、mode、resume、checkpoint callback 与 observer |
 | `TinkerFin.failed_agui_run(...)` | 表达 Run 接受后的初始化失败 | 错误、identity，以及真实可用的 input/config/resume |
@@ -36,10 +48,11 @@ reasoning 路径；这本身不会授权 Trace 持久化。自定义 Profile 还
 
 `.plan(enabled=True)` 只影响从返回 factory 创建的 Definition，不会给
 `create_deep_agent(...)` 增加参数。返回 factory 保留 coordinator 和全局 state schema。
-真正选择 Plan 时必须提供明确 Planner 模型和具体生产级 checkpointer；default 保持上游要求。
+真正选择 Plan 时必须提供 Planner model 或 Agent model 之一，以及具体生产级 checkpointer；
+省略 `planner_model` 时使用 Agent model，default 保持上游要求。
 Plan 配置不合法时抛出 `tinkerfin.plan.PlanModeConfigurationError`。
 
-每次 `new()` 或 `new_agui()` 通过 `mode="default"` 或 `mode="plan"` 选择当前路径；省略时
+每次 managed run 或 direct Graph 通过 `mode="default"` 或 `mode="plan"` 选择当前路径；省略时
 使用 `.plan(default_mode=...)`。default 直接运行原生 Deep Agent；plan 运行独立 Planning
 Graph，并在批准后自动交给原生执行。同一 checkpoint thread 后续可以再次选择 Plan。普通
 Definition 只接受 `default`。
@@ -47,7 +60,7 @@ Definition 只接受 `default`。
 ## Plan Mode 数据
 
 顶层包导出 `AgentMode`。`tinkerfin.plan` 导出 `ClarificationModel`、
-`ClarificationOption`、`ClarificationForm`、`BuiltInClarificationForm`、四类内置 Question、
+`ClarificationOption`、`ClarificationForm`、`BuiltInClarificationForm`、六类内置 Question、
 `ClarificationType`、`clarification_type`、`DefaultClarificationForm`、`PlanContentModel`、`StructuredPlanStep`、
 `StructuredPlanContent`、`MarkdownPlanContent`、`PlanSchemaReference`、`PlanDraft`、
 `ConfirmedPlan`、`RequirementAnswer`、`PendingClarification`、`ClarificationExchange`、
@@ -68,7 +81,12 @@ Planning 状态以 camel case JSON 保存在 `tinkerfin_plan`；批准 handoff �
 `APPROVE`、`RESPOND` 和 `REJECT`，interrupt 的响应 Schema 只包含实际配置的动作。只有宿主
 提供可信计划编辑器时才应显式加入 `EDIT`。
 
-`.plan(clarification_schema=...)` 接受一个具体 `ClarificationFormBase` 子类；省略时启用四类内置
+只有 `APPROVE` 会退出 Planning 并把确认后的草稿交给原生执行。`REJECT` 使当前草稿失效，接受可选
+原因，产生一次用户可见的 Planner 回复，并以 `awaiting_input`、effective mode `plan` 等待下一条规划
+输入。显式配置的 `CANCEL` 采用相同续接但不携带原因。AG-UI `status="cancelled"` 仍表示真正放弃，
+不会转换为 Plan 决定。
+
+`.plan(clarification_schema=...)` 接受一个具体 `ClarificationFormBase` 子类；省略时启用六类内置
 answer type。共享强类型 metadata 使用
 `BuiltInClarificationForm[QuestionAttributes, OptionModel]`。完全自定义语义题型通过
 `.plan(clarification_types=(clarification_type(...),))` 一次注册。逐题 Schema、校验或规范化
@@ -78,7 +96,11 @@ answer type。共享强类型 metadata 使用
 澄清响应的 `answers` 是以 checkpoint question ID 为 key 的 object。已回答 value 包含
 `status: answered`、对应 `answerType` 和题型字段；可选题跳过只包含 `status: skipped`。
 pending 的精确 JSON Schema 会在 Graph resume 前验证完整覆盖、Option ID、多选数量、非空文本和
-真实日历日期。宿主模型不能重新定义框架拥有的 ID、required/skip 语义或 checkpoint 所有权。
+真实日历日期。时间回答还会验证本地分钟精度、题目声明的 IANA 时区和不跨越午夜的包含边界范围。
+宿主模型不能重新定义框架拥有的 ID、required/skip 语义或 checkpoint 所有权。
+日期时间回答表示必填 IANA 时区中的一个本地日期和分钟，范围可以跨日期；规范化结果包含
+`localDateTime`、`timeZone` 和唯一 UTC `instant`。DST 不存在时间与重复的本地分钟都会被拒绝。
+
 
 `TinkerFin(state_schema=...)` 为该 factory 创建的每个原生 Deep Agent Definition 提供应用级
 state。独立 Planning Graph 组合自己的所需视图，不改变原生 default topology 或 middleware。
@@ -99,9 +121,8 @@ reducer、`Required` / `NotRequired` 和 schema metadata 会保留；同名字�
 
 ### `TinkerFin.failed_agui_run(...)`
 
-宿主接受语义 Run 后，如果模型、Sandbox、Definition 或 Graph 初始化失败，用它生成受观察的
-AG-UI 失败流。该入口通过同一 Runtime 生命周期记录真实输入、唯一失败终态和关闭。常规
-`new_agui()` 调用不需要直接使用。
+高级宿主在进入 managed 门面前已经接受语义 Run 时，可以用它生成受观察的 AG-UI 失败流。
+普通模型、Sandbox、Definition 或 Graph setup 失败已经由 `open_agui_run()` 自动转换。
 
 ## 原生数据模型
 
@@ -121,7 +142,9 @@ AG-UI 失败流。该入口通过同一 Runtime 生命周期记录真实输入�
 
 所选 Runtime Profile 完整拥有上游调用与 checkpoint 合同，包括必需 mode、上游 version、
 subgraph 行为、完整 state 输出、稳定建图/绑定流签名，以及不破坏 interrupted control state 的
-durable resume-intent 写入。绑定流签名让 resume Graph 在受保护异步结算内延迟构造。当前内置
+durable resume-intent 写入。绑定流签名让 resume Graph 在受保护异步结算内延迟构造。自定义 Profile
+需要原生异步建图时可以实现 `create_agent_graph(factory, args, kwargs)`；未实现时，Core 会在 AnyIO
+有容量限制的 worker 中调用该 Profile 自己选定的同步 factory，不会替换为内置 v2 factory。当前内置
 Profile 允许调用方通过 `astream(stream_mode=...)` 增加受支持的
 诊断 mode；移除必需 mode 或传入冲突的上游参数，会在 Graph 或 coordinator 产生副作用前
 失败。Native 与 AG-UI 路径共用同一个 Profile 边界，并暴露一致的参数校验错误。
@@ -172,12 +195,29 @@ Agent 终态在 Observer 广播前已经选定。某个 Observer 在终态广播
 | API | 什么时候遇到 |
 | --- | --- |
 | `AgUiResumeRequest` | 恢复请求中不可信的客户端决定 |
-| `AgUiResumeBinding` | `new_agui()` 接受的私有 checkpoint 解析事实 |
+| `AgUiResumeBinding` | `new_agui()` 接受的高级 checkpoint 解析事实 |
 | `AgUiResumeCheckpoint` | resume marker 持久化后的稳定回调值 |
 | `tinkerfin.plan.PlanModeConfigurationError` | Plan Definition 缺少具体 saver 或明确模型、state schema 不兼容，或使用了非 sync durability |
 | `AgUiSettlementTimeoutError` | 调用方停止等待，但 Runtime 的清理仍未在限定时间内完成 |
 
-`DeepAgentDefinition.new_agui(...)` 使用以下请求级参数：
+`TinkerFin.open_agui_run(...)` 是普通入口：
+
+| 参数 | 默认值 | 作用 |
+| --- | --- | --- |
+| `identity` | 必填 | canonical thread 与 run 身份 |
+| `agent` | 必填 | Definition，或返回 Definition 的同步/异步 callable |
+| `input` / `resume` | 严格二选一 | 普通 Graph 输入或只含客户端决定的 `AgUiResumeRequest` |
+| `parent_run_id` | `None` | `RUN_STARTED` 暴露的可选 checkpoint 谱系 |
+| `mode` | Definition 默认值 | 原生 default 或 Plan 路径 |
+| `config` / `context` | `None` | Graph 配置与声明的 Runtime context |
+| `stream_timeout` / `cleanup_timeout` | `None` | 原生 pull 时限与受保护清理等待时限 |
+| `include_reasoning_events` | `False` | 是否交付已验证的公开推理事件 |
+| `include_subagent_events` | `True` | 是否交付已验证子 Agent 事件 |
+| `on_native_part` / `on_agui_event` | `None` | 交付前的异步观察函数 |
+| `on_resume_saved` / `on_resume_not_saved` | `None` | durable marker 证据前后的宿主幂等结算 |
+| `resume_checkpointer` | TinkerFin 默认值 | lazy resume Definition 显式覆盖 factory 默认 saver 时声明的高级持久化权威；必须传入同一对象 |
+
+高级编排仍可直接使用 `DeepAgentDefinition.new_agui(...)`：
 
 | 参数 | 默认值 | 作用 |
 | --- | --- | --- |

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Sequence
 from dataclasses import dataclass
 from typing import Protocol, cast, runtime_checkable
 from uuid import uuid4
@@ -52,6 +52,13 @@ class OpenSandboxWarmClaim:
     slot: int
     token: str
     generation: int
+
+
+@dataclass(frozen=True, slots=True)
+class OpenSandboxReadyWarmClaim(OpenSandboxWarmClaim):
+    """Fencing identity for verifying one published warm Sandbox."""
+
+    sandbox_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,6 +204,55 @@ class OpenSandboxState(Protocol):
 
         Raises:
             OpenSandboxStateError: State is closed or slot evidence cannot be read.
+        """
+
+        ...
+
+    async def claim_ready_warm_slot(
+        self,
+        *,
+        exclude_slots: Sequence[int],
+    ) -> OpenSandboxReadyWarmClaim | None:
+        """Claim one published slot without discarding its remote identifier.
+
+        Args:
+            exclude_slots: Slot indexes already checked by the current maintenance
+                pass.
+
+        Returns:
+            Exclusive published-slot claim, or ``None`` when no eligible slot is
+            available.
+
+        Raises:
+            OpenSandboxStateError: State is closed or slot evidence cannot be read.
+        """
+
+        ...
+
+    async def discard_ready_warm_slot(
+        self,
+        claim: OpenSandboxReadyWarmClaim,
+    ) -> None:
+        """Remove one verified-unusable warm ID and enqueue durable cleanup.
+
+        Args:
+            claim: Current published-slot fencing claim.
+
+        Raises:
+            OpenSandboxStateOwnershipError: The claim is stale or superseded.
+            OpenSandboxStateError: Durable invalidation or cleanup enqueue fails.
+        """
+
+        ...
+
+    async def warm_pool_ready(self) -> bool:
+        """Return whether every configured slot is published and unclaimed.
+
+        Returns:
+            Whether the configured warm capacity is currently consumable.
+
+        Raises:
+            OpenSandboxStateError: State is closed or capacity evidence is unavailable.
         """
 
         ...
@@ -354,6 +410,23 @@ class OpenSandboxState(Protocol):
         ...
 
 
+class _WarmPoolReconciliationState(Protocol):
+    """Runtime view of the current ready-slot reconciliation contract."""
+
+    async def claim_ready_warm_slot(
+        self,
+        *,
+        exclude_slots: Sequence[int],
+    ) -> OpenSandboxReadyWarmClaim | None: ...
+
+    async def discard_ready_warm_slot(
+        self,
+        claim: OpenSandboxReadyWarmClaim,
+    ) -> None: ...
+
+    async def warm_pool_ready(self) -> bool: ...
+
+
 async def _call_state(
     _state: OpenSandboxState,
     operation: str,
@@ -484,6 +557,59 @@ class _OpenSandboxStateBoundary(  # pyright: ignore[reportUnusedClass]
                 self._state,
                 "claim_warm_slot",
                 self._state.claim_warm_slot(),
+            ),
+        )
+
+    @property
+    def supports_warm_pool_reconciliation(self) -> bool:
+        """Return whether this State can fence and verify published warm slots."""
+
+        return (
+            callable(getattr(self._state, "claim_ready_warm_slot", None))
+            and callable(getattr(self._state, "discard_ready_warm_slot", None))
+            and callable(getattr(self._state, "warm_pool_ready", None))
+        )
+
+    async def claim_ready_warm_slot(
+        self,
+        *,
+        exclude_slots: Sequence[int],
+    ) -> OpenSandboxReadyWarmClaim | None:
+        """Claim one published slot through the current reconciliation contract."""
+
+        state = cast(_WarmPoolReconciliationState, self._state)
+        return cast(
+            OpenSandboxReadyWarmClaim | None,
+            await _call_state(
+                self._state,
+                "claim_ready_warm_slot",
+                state.claim_ready_warm_slot(exclude_slots=exclude_slots),
+            ),
+        )
+
+    async def discard_ready_warm_slot(
+        self,
+        claim: OpenSandboxReadyWarmClaim,
+    ) -> None:
+        """Invalidate one unusable published slot through its exact fence."""
+
+        state = cast(_WarmPoolReconciliationState, self._state)
+        await _call_state(
+            self._state,
+            "discard_ready_warm_slot",
+            state.discard_ready_warm_slot(claim),
+        )
+
+    async def warm_pool_ready(self) -> bool:
+        """Return whether every configured warm slot contains a published Sandbox."""
+
+        state = cast(_WarmPoolReconciliationState, self._state)
+        return cast(
+            bool,
+            await _call_state(
+                self._state,
+                "warm_pool_ready",
+                state.warm_pool_ready(),
             ),
         )
 
@@ -758,6 +884,57 @@ class InMemoryOpenSandboxState(OpenSandboxState):
                     generation=slot.generation,
                 )
         return None
+
+    async def claim_ready_warm_slot(
+        self,
+        *,
+        exclude_slots: Sequence[int],
+    ) -> OpenSandboxReadyWarmClaim | None:
+        """Claim one published slot so its remote resource can be renewed or replaced."""
+
+        self._ensure_open()
+        excluded = set(exclude_slots)
+        for slot in self._warm_slots:
+            if (
+                slot.slot in excluded
+                or slot.sandbox_id is None
+                or slot.active_token is not None
+            ):
+                continue
+            slot.generation += 1
+            token = uuid4().hex
+            slot.active_token = token
+            return OpenSandboxReadyWarmClaim(
+                slot=slot.slot,
+                token=token,
+                generation=slot.generation,
+                sandbox_id=slot.sandbox_id,
+            )
+        return None
+
+    async def discard_ready_warm_slot(
+        self,
+        claim: OpenSandboxReadyWarmClaim,
+    ) -> None:
+        """Clear one unusable published slot and retain its cleanup obligation."""
+
+        slot = self._claimed_warm_slot(claim)
+        if slot.sandbox_id != claim.sandbox_id:
+            raise OpenSandboxStateOwnershipError(
+                f"Warm slot {claim.slot} no longer contains the claimed Sandbox"
+            )
+        slot.sandbox_id = None
+        slot.active_token = None
+        self._cleanup.setdefault(claim.sandbox_id, _MemoryCleanupRecord())
+
+    async def warm_pool_ready(self) -> bool:
+        """Return whether every process-local warm slot is published and unclaimed."""
+
+        self._ensure_open()
+        return all(
+            slot.sandbox_id is not None and slot.active_token is None
+            for slot in self._warm_slots
+        )
 
     def _claimed_warm_slot(
         self,

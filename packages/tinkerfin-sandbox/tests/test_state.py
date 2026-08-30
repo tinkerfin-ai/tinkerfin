@@ -915,6 +915,84 @@ async def test_sqlite_state_auto_initializes_and_recovers_binding(
     await restarted.aclose()
 
 
+async def test_sqlite_state_fences_ready_warm_reconciliation(tmp_path: Path) -> None:
+    """Ready-slot maintenance must preserve the ID until a fenced publish."""
+
+    state_type = _public_type("SQLAlchemyOpenSandboxState")
+    state = state_type(url=_sqlite_url(tmp_path / "ready-warm.db"), namespace="test")
+    await state.start(warm_pool_size=1)
+    try:
+        initial = await state.claim_warm_slot()
+        assert initial is not None
+        await state.publish_warm(initial, "warm-1")
+        assert await state.warm_pool_ready()
+
+        ready = await state.claim_ready_warm_slot(exclude_slots=())
+        assert ready is not None
+        assert ready.sandbox_id == "warm-1"
+        assert not await state.warm_pool_ready()
+        assert await state.claim_ready_warm_slot(exclude_slots=(ready.slot,)) is None
+
+        await state.publish_warm(ready, "warm-1")
+        assert await state.warm_pool_ready()
+    finally:
+        await state.aclose()
+
+
+async def test_sqlite_state_discards_unusable_warm_id_with_durable_cleanup(
+    tmp_path: Path,
+) -> None:
+    """Invalidating a ready slot must atomically retain its remote cleanup duty."""
+
+    state_type = _public_type("SQLAlchemyOpenSandboxState")
+    state = state_type(url=_sqlite_url(tmp_path / "discard-warm.db"), namespace="test")
+    await state.start(warm_pool_size=1)
+    try:
+        initial = await state.claim_warm_slot()
+        assert initial is not None
+        await state.publish_warm(initial, "warm-stale")
+        ready = await state.claim_ready_warm_slot(exclude_slots=())
+        assert ready is not None
+
+        await state.discard_ready_warm_slot(ready)
+
+        assert not await state.warm_pool_ready()
+        replacement = await state.claim_warm_slot()
+        assert replacement is not None
+        await state.release_warm(replacement)
+        cleanup = await state.claim_cleanup()
+        assert cleanup is not None
+        assert cleanup.sandbox_id == "warm-stale"
+        await state.complete_cleanup(cleanup)
+    finally:
+        await state.aclose()
+
+
+async def test_sqlite_restart_releases_a_dead_worker_warm_claim(
+    tmp_path: Path,
+) -> None:
+    """A dead worker claim must not leave startup capacity permanently empty."""
+
+    state_type = _public_type("SQLAlchemyOpenSandboxState")
+    url = _sqlite_url(tmp_path / "dead-warm-claim.db")
+    first = state_type(url=url, namespace="test")
+    await first.start(warm_pool_size=1)
+    abandoned = await first.claim_warm_slot()
+    assert abandoned is not None
+    await first.aclose()
+
+    restarted = state_type(url=url, namespace="test")
+    await restarted.start(warm_pool_size=1)
+    try:
+        replacement = await restarted.claim_warm_slot()
+        assert replacement is not None
+        assert replacement.slot == abandoned.slot
+        assert replacement.generation > abandoned.generation
+        await restarted.release_warm(replacement)
+    finally:
+        await restarted.aclose()
+
+
 async def test_sqlite_state_repeated_start_requires_the_same_capacity(
     tmp_path: Path,
 ) -> None:
@@ -1382,7 +1460,7 @@ async def test_sqlite_state_fences_an_expired_owner_claim(tmp_path: Path) -> Non
     second = state_type(
         url=url,
         namespace="test",
-        lease_ttl=0.1,
+        lease_ttl=1.0,
         poll_interval=0.01,
     )
     await asyncio.gather(

@@ -5,9 +5,11 @@ from __future__ import annotations
 import inspect
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from functools import partial
 from types import MappingProxyType
 from typing import Protocol, TypeAlias, cast, runtime_checkable
 
+from anyio import to_thread
 from deepagents import graph as _deepagents_graph
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver, CheckpointTuple
@@ -88,6 +90,12 @@ class DeepAgentsRuntimeProfile(Protocol):
     saver semantics used to stage a resume without discarding pending root or subgraph
     work. ``profile_id`` identifies a third-party integration implementation, not a
     TinkerFin protocol version.
+
+    A Profile whose graph factory is asynchronous may additionally implement
+    ``create_agent_graph(factory, args, kwargs)``. Profiles that expose only this base
+    contract keep their selected synchronous factory; Core invokes it in AnyIO's
+    capacity-limited worker boundary. Both paths preserve the Profile's own factory and
+    never fall back to another integration.
     """
 
     @property
@@ -276,6 +284,31 @@ class DeepAgentsV2RuntimeProfile:
             uncontracted_external_subagents=(hitl.uncontracted_external_subagents),
         )
 
+    async def create_agent_graph(
+        self,
+        factory: Callable[..., object],
+        args: tuple[object, ...],
+        kwargs: Mapping[str, object],
+    ) -> object:
+        """Build the locked synchronous Deep Agents graph in a bounded worker.
+
+        AnyIO's process-wide worker limiter supplies the required capacity bound. The
+        default non-abandoning cancellation behavior keeps the synchronous build owned
+        until it settles, so cancellation cannot leave an unobserved graph construction
+        running after this method returns.
+
+        Args:
+            factory: Exact factory captured by the Definition.
+            args: Frozen positional arguments for that factory.
+            kwargs: Frozen keyword arguments for that factory.
+
+        Returns:
+            The freshly constructed locked Deep Agents graph.
+        """
+
+        build = partial(factory, *args, **dict(kwargs))
+        return await to_thread.run_sync(build)
+
     @property
     def stream_driver(self) -> NativeStreamDriver:
         """Return the request-independent v2 stream Driver."""
@@ -372,6 +405,30 @@ class DeepAgentsV2RuntimeProfile:
             channel == _V2_RESUME_CHANNEL
             for _task_id, channel, _value in checkpoint.pending_writes or ()
         )
+
+    def _matches_resume_subgraph_namespace(
+        self,
+        namespace: tuple[str, ...],
+        pending_task_ids: frozenset[str],
+    ) -> bool:
+        """Identify dynamic v2 subgraphs owned by currently interrupted root tasks.
+
+        Deep Agents 0.7.5 names an ordinary dynamic child ``tools:<task-id>`` and
+        appends a decimal slot for parallel children. Nested children retain that first
+        component. This private Profile hook keeps the upstream convention out of Core
+        and does not add a required method to existing custom Runtime Profiles.
+        """
+
+        if not namespace or not pending_task_ids:
+            return False
+        first = namespace[0]
+        for task_id in pending_task_ids:
+            prefix = f"tools:{task_id}"
+            if first == prefix:
+                return True
+            if first.startswith(f"{prefix}:") and first[len(prefix) + 1 :].isdecimal():
+                return True
+        return False
 
 
 __all__ = [

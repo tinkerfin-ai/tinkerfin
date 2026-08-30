@@ -228,6 +228,40 @@ async def test_sqlite_export_initializes_a_runtime_compatible_empty_database(
 
 
 @pytest.mark.parametrize(
+    "mutation",
+    (
+        "CREATE UNIQUE INDEX unexpected_owner_namespace "
+        "ON tinkerfin_opensandbox_owners(namespace);",
+        "DROP INDEX ix_tinkerfin_opensandbox_owners_lease; "
+        "CREATE UNIQUE INDEX ix_tinkerfin_opensandbox_owners_lease "
+        "ON tinkerfin_opensandbox_owners(namespace, lease_expires_at);",
+    ),
+)
+async def test_sqlite_start_rejects_indexes_outside_the_current_schema(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    database_path = tmp_path / "incompatible-index.db"
+    state_type = tinkerfin_sandbox.SQLAlchemyOpenSandboxState
+    initial = state_type(url=_sqlite_url(database_path), namespace="test")
+    await initial.start(warm_pool_size=0)
+    await initial.aclose()
+    async with aiosqlite.connect(database_path) as connection:
+        await connection.executescript(mutation)
+        await connection.commit()
+
+    candidate = state_type(url=_sqlite_url(database_path), namespace="test")
+    try:
+        with pytest.raises(
+            tinkerfin_sandbox.OpenSandboxStateError,
+            match="schema is incompatible",
+        ):
+            await candidate.start(warm_pool_size=0)
+    finally:
+        await candidate.aclose()
+
+
+@pytest.mark.parametrize(
     ("dialect_name", "server_version", "supports_skip_locked"),
     [
         ("sqlite", (3, 49, 1), False),

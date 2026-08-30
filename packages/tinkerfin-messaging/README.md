@@ -29,24 +29,39 @@ pip install "tinkerfin[agui]" "tinkerfin-messaging[agui]"
 ## Quick Start
 
 ```python
-from tinkerfin_contracts import RunIdentity
-from tinkerfin_messaging import Messaging
+from tinkerfin import RunIdentity, TinkerFin
+from tinkerfin_messaging import Messaging, create_agui_run_source
 
 
+tinkerfin = TinkerFin()
+agent = tinkerfin.create_deep_agent(model=model, tools=tools)
 identity = RunIdentity(threadId="thread-1", runId="run-1")
-events = agent.new_agui(identity=identity).astream(graph_input)
+source = create_agui_run_source(
+    identity,
+    open_events=lambda run_identity: tinkerfin.open_agui_run(
+        run_identity,
+        agent=agent,
+        input=graph_input,
+    ),
+)
 
 async with Messaging() as messaging:
     channel = messaging.channel(name="agent-events")
-    body = await channel.sse(events, after=0)
+    body = await channel.sse(
+        source,
+        after=0,
+        on_source_starting=activate_business_run,
+        on_delivery_not_started=cleanup_business_run,
+    )
 
     async for frame in body:
         await send(frame)
 ```
 
-This example requires the `agui` extra. TinkerFin streams carry their codec and
-RunIdentity profiles. Do not repeat thread or run parameters, and do not pre-encode the
-stream with Runtime `to_sse()`.
+This example requires the `agui` extra. Messaging selects owner or attachment before
+opening the model, Sandbox, or Graph. The helper supplies the exact same `RunIdentity`
+object to `open_events` and verifies the opened stream. Do not repeat thread or run
+parameters, and do not pre-encode the stream with Runtime `to_sse()`.
 
 ## Custom sources
 
@@ -93,11 +108,33 @@ payload bytes, and UTC creation time.
 
 `RecoveryCheckpoint` contains an opaque source position plus the last stable message ID.
 
-## Deferred and recoverable sources
+## Managed AG-UI and advanced sources
+
+Use `create_agui_run_source()` for the common TinkerFin AG-UI path. It hides Binding,
+codec profile, source types, transforms, and the cancellation fence while retaining lazy
+owner-only Agent creation. Its optional transform may add product metadata or change
+content, but must preserve the concrete event type and all Run, message, Tool, activity,
+reasoning, snapshot, and interrupt correlation identities. A `RUN_STARTED` event's
+optional `RunAgentInput` is the caller's complete authoritative input and cannot be
+changed. Use the advanced unprofiled `map_source()` boundary when the output protocol
+itself must change.
+
+`on_source_starting` belongs to the channel and activates host delivery only for a new
+owner. `on_delivery_not_started` cleans up when neither a producer nor an attachment was
+established. Attachments invoke neither callback. Source-owned `on_owner_preflight`
+remains a separate advanced hook for preparing the source itself.
+
+An attachment does not open the unused candidate source, but Messaging does close that
+single-use candidate before returning the attached subscription. Callers must not reuse
+it after `wrap()` or `sse()` returns.
+
+The lower-level source classes remain available to custom protocol authors.
 
 Use `DeferredMessageSource` when only the durable owner should build an expensive Graph or Sandbox. Use `ProfiledDeferredMessageSource` when the codec and RunIdentity must be visible before opening.
 
-Set `on_owner_preflight` when a host must atomically activate business state after durable owner selection but before the producer task or opener starts. Attachments never invoke it; failure releases the prepared owner and leaves the source unopened.
+Set `on_owner_preflight` only when a custom source must prepare its own state after
+durable owner selection but before the producer task or opener starts. Host delivery
+activation belongs in the channel's `on_source_starting` callback.
 
 Use `RecoverableSource` and `RecoverableMessage` when a producer can rebuild from the last atomically committed checkpoint. Stable message IDs make commits idempotent; external side effects still require application-level idempotency.
 
@@ -182,6 +219,10 @@ cancellation.
 
 `read()` and `follow()` reject a cursor greater than the current generation tail with
 `InvalidCursor`; they never reinterpret it as an empty page or a future wait.
+
+Use `parse_sse_event_id()` for canonical non-negative decimal `Last-Event-ID` values.
+Use `is_active_run_status()`, `is_final_run_status()`, and `is_failed_run_status()` when
+branching on the durable status returned by Messaging; these pure TypeGuards do no I/O.
 
 ## Documentation
 

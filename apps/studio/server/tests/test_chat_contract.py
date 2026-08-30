@@ -1,3 +1,5 @@
+import asyncio
+from collections.abc import AsyncGenerator
 from typing import cast
 
 import pytest
@@ -7,7 +9,7 @@ from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from tinkerfin_studio.api.conversation_router import chat
+from tinkerfin_studio.api.conversation_router import _chat_sse, chat
 from tinkerfin_studio.api.errors import BusinessException, ConversationErrorCode
 from tinkerfin_studio.application import create_application
 from tinkerfin_studio.auth.types import UserContext
@@ -64,6 +66,54 @@ def test_chat_request_preserves_command_extensions_and_derives_plan_mode() -> No
     }
     prepared = prepare_run_request(request, user_id=7, thread_id="thread-1")
     assert prepared.mode == "plan"
+
+
+async def test_chat_sse_closes_the_framework_body_when_delivery_is_cancelled() -> None:
+    """HTTP 断连必须显式释放框架订阅"""
+
+    delivered = asyncio.Event()
+    closed = asyncio.Event()
+
+    async def framework_body() -> AsyncGenerator[bytes, None]:
+        try:
+            yield b"id: 1\ndata: {}\n\n"
+            await asyncio.Event().wait()
+        finally:
+            closed.set()
+
+    async def consume() -> None:
+        async for _frame in _chat_sse(framework_body()):
+            delivered.set()
+
+    consumer = asyncio.create_task(consume())
+    await asyncio.wait_for(delivered.wait(), timeout=1)
+    consumer.cancel()
+    await asyncio.gather(consumer, return_exceptions=True)
+
+    assert closed.is_set()
+
+
+def test_chat_request_accepts_a_multi_segment_colon_thread_id() -> None:
+    request = ChatRequest.from_agui(
+        RunAgentInput.model_validate(
+            {
+                "threadId": "tenant:workspace:conversation:thread-1",
+                "runId": "run-colon-thread",
+                "state": {},
+                "messages": [
+                    {"id": "client-colon", "role": "user", "content": "继续任务"}
+                ],
+                "tools": [],
+                "context": [],
+                "forwardedProps": {
+                    "model": "main",
+                    "command": {"plan": "off"},
+                },
+            }
+        )
+    )
+
+    assert request.thread_id == "tenant:workspace:conversation:thread-1"
 
 
 @pytest.mark.parametrize(

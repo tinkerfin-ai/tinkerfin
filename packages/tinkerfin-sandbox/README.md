@@ -100,6 +100,7 @@ in remote OpenSandbox owner labels; those labels use stable digests.
 - `reset(key)` clears the configured `workspace_root` without changing the binding;
 - `destroy(key)` destroys known remote instances and removes the binding;
 - `get_details(key)` returns a stable owner-aware runtime snapshot;
+- `check_ready()` raises when configured warm capacity is degraded;
 - `aclose()` waits for active operations and closes owned local resources.
 
 `settlement_timeout=None` keeps the default complete wait. A finite constructor value
@@ -117,16 +118,29 @@ calling task is cancelled.
 join the same kill and local-close lifecycle. Caller cancellation waits for that owned
 settlement and then propagates; a confirmed remote kill is not reported as failed only
 because the SDK close step also fails. `aclose()` waits for every active destroy task
-before closing the owned transport.
+before closing the transport that the client created when `ConnectionConfig` omitted
+one. Concurrent close callers join one retained settlement; cancelling a waiter does
+not cancel transport closure, and a failed close remains retryable. A transport supplied
+by the caller remains borrowed and is never closed by the client.
 
 Warm-pool capacities are strict integers, and command timeouts are strict finite numeric
 values; booleans are rejected before State startup or task creation. State and
 SQLAlchemy constructors apply the same boundary so invalid capacity cannot fail later
 inside warmup.
 
+Published warm slots are fenced, reconnected, health-checked, and renewed before they
+count as ready. Missing or expired instances are replaced atomically. The manager keeps
+ready instances renewed while it is open and retries failed background replenishment;
+`check_ready()` exposes degraded capacity to a host without leaking provider details.
+With `fail_on_startup_warmup_error=True`, authentication, reconnect, health, renewal,
+creation, or publication failure prevents startup.
+
 With `InMemoryOpenSandboxState`, shutdown destroys remote Sandboxes owned only by that
 process because no later worker can recover them. Persistent state keeps committed
 bindings, warm slots, and durable cleanup work available to other workers.
+It stores lifecycle identity rather than container contents. An expired owner binding
+is replaced on the next `get()`; durable workspace contents require an OpenSandbox
+volume or snapshot policy selected by the host.
 
 ## Rooted backend
 
@@ -265,7 +279,8 @@ Use `dialect="sqlite"` for SQLite. One MySQL script targets both MySQL 5.7 and 8
 contains every current table, explicit index, and comment. After that script is applied,
 `start()` validates the deployed structure before it registers a worker. The descriptor
 is immutable and exposes `dialect`, `table_names`, and `ddl`. Non-current owned tables or
-columns fail startup and must be rebuilt before a DML-only runtime account is started.
+columns, missing or extra indexes, and changed index uniqueness fail startup and must be
+rebuilt before a DML-only runtime account is started.
 
 Persistent state coordinates allocation, binding, warm slots, owner fencing, and
 cleanup. It does not serialize complete graph runs; use an application run coordinator

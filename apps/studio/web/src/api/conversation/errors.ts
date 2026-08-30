@@ -20,7 +20,6 @@ const conversationErrorMessageKeys = {
   plan_option_required: '该问题必须选择一个选项',
   plan_answer_invalid: 'Plan 澄清答案无效，请检查后重试',
   plan_action_required: '请选择 Plan 处理方式',
-  plan_feedback_required: '请填写 Plan 修改意见',
   plan_submit_failed: 'Plan 请求无法提交',
 } as const satisfies Record<string, TranslationKey>
 

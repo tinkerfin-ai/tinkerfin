@@ -22,8 +22,6 @@ from pydantic import (
 
 from tinkerfin_studio.api.errors import BusinessException, ConversationErrorCode
 
-THREAD_ID_PATTERN = r"^[^:]+\z"
-OPTIONAL_THREAD_ID_PATTERN = r"^[^:]*\z"
 MAX_USER_MESSAGE_BYTES = 256 * 1024
 
 
@@ -77,8 +75,7 @@ class ChatRequest(BaseModel):
         alias="threadId",
         default="",
         max_length=128,
-        pattern=OPTIONAL_THREAD_ID_PATTERN,
-        description="新会话可为空；冒号会破坏 checkpoint key，禁止使用",
+        description="现有会话的稳定 thread ID；新会话可为空",
     )
     run_id: str = Field(
         alias="runId", min_length=1, max_length=128, description="当前主 run ID"

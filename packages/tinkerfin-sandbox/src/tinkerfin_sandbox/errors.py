@@ -32,6 +32,7 @@ class OpenSandboxErrorCode(StrEnum):
     HANDLE_OWNERSHIP = "sandbox.handle_ownership"
     HANDLE_CLOSED = "sandbox.handle_closed"
     MANAGER_CLOSED = "sandbox.manager_closed"
+    WARM_POOL_UNAVAILABLE = "sandbox.warm_pool_unavailable"
     SETTLEMENT_TIMEOUT = "sandbox.settlement_timeout"
 
 
@@ -190,6 +191,12 @@ class OpenSandboxManagerClosedError(OpenSandboxError, RuntimeError):
     code = OpenSandboxErrorCode.MANAGER_CLOSED
 
 
+class OpenSandboxWarmPoolUnavailableError(OpenSandboxError, RuntimeError):
+    """The configured ready Sandbox capacity cannot currently be guaranteed."""
+
+    code = OpenSandboxErrorCode.WARM_POOL_UNAVAILABLE
+
+
 class OpenSandboxSettlementTimeoutError(OpenSandboxError, TimeoutError):
     """A caller stopped waiting before manager settlement completed."""
 
@@ -225,6 +232,7 @@ __all__ = [
     "OpenSandboxStateProtocolError",
     "OpenSandboxStateTimeoutError",
     "OpenSandboxStateUnavailableError",
+    "OpenSandboxWarmPoolUnavailableError",
     "UnexpectedOpenSandboxBackendError",
     "UnexpectedOpenSandboxStateError",
 ]

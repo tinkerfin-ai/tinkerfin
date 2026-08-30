@@ -41,6 +41,7 @@ values; booleans are rejected before State startup or task creation.
 | `delete(key)` | Alias for `destroy()` | Binding is removed |
 | `is_healthy(key)` | Probe the current instance | No |
 | `get_details(key)` | Return runtime and owner information | No |
+| `check_ready()` | Raise unless configured warm capacity is verified | No |
 
 ```python
 backend = await manager.get(project_key)
@@ -67,11 +68,27 @@ finally:
 
 `start()` is idempotent. A closed manager cannot be restarted.
 
+Startup fences every published warm slot, reconnects it, runs the data-plane health
+command, and renews its remote expiry. Missing instances are replaced before startup
+returns. With `fail_on_startup_warmup_error=True`, any authentication, reconnect,
+health, renewal, creation, or State publication failure propagates and the host must
+not report ready.
+
+While open, the manager periodically renews or replaces warm instances. A failed
+background refill does not invalidate an owner backend already handed to a request,
+but `check_ready()` raises `OpenSandboxWarmPoolUnavailableError` until capacity is
+restored. Hosts should include that method in their readiness check.
+
 Close waits for active creation, replacement, reset, and cleanup to settle safely. A finite `settlement_timeout` only limits this caller's wait. It raises `OpenSandboxSettlementTimeoutError` without cancelling owned cleanup; call `aclose()` later to continue waiting.
 
 ## Health checks and replacement
 
 `OpenSandboxConfig.health_command` probes the data plane and defaults to `printf ok`. When `get()` finds an unhealthy binding, it creates a replacement and updates the stable handle.
+
+Persistent State stores binding and fencing identity, not container files. When an
+owner Sandbox expires, the next `get()` creates a replacement. Persisting workspace
+contents across remote expiry requires a volume or snapshot policy configured by the
+host.
 
 In-flight operations finish against the backend they acquired. The old instance is not closed underneath them, and replacement waits for safe retirement before returning.
 
@@ -83,7 +100,11 @@ After creation, health checking, replacement, reset, destroy, or close begins, t
 that same remote kill and local close. Caller cancellation waits for settlement and then
 propagates. Once kill succeeds, an SDK close failure is logged as cleanup evidence rather
 than reported as a remote destruction failure. Client close waits for all active destroy
-tasks before closing its owned transport.
+tasks before closing the shared transport it created when `ConnectionConfig` omitted
+one. Concurrent client-close callers join one retained settlement. Cancelling a waiter
+does not cancel transport closure, and a close task that fails can be retried without
+losing ownership. A caller-supplied transport remains borrowed and is never closed by
+the client.
 
 ## Inspect details
 

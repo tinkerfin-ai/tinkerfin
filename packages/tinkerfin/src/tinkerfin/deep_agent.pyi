@@ -1,13 +1,11 @@
 """Typed public Runtime and Definition contracts generated from locked source."""
 
-# ruff: noqa: F403, F405
 # Generated from locked dependencies by scripts/generate_stubs.py; do not edit signatures manually.
-from collections.abc import Mapping, Sequence
-from typing import Generic, Literal, overload
+from collections.abc import AsyncIterator, Mapping, Sequence
+from typing import Any, Generic, Literal, overload
 
-from deepagents.graph import *
 from langchain.agents.middleware.types import InputAgentState
-from langchain_core.runnables import RunnableConfig
+from langchain_core.runnables import Runnable, RunnableConfig
 from langgraph.pregel.main import (
     All,
     DeprecatedKwargs,
@@ -16,6 +14,7 @@ from langgraph.pregel.main import (
     StreamMode,
 )
 from langgraph.types import Command
+from langgraph.typing import ContextT
 from typing_extensions import Unpack
 
 from tinkerfin_contracts import RunIdentity as RunIdentity
@@ -28,6 +27,30 @@ from .agui_resume import (
 )
 from .plan import AgentMode
 from .runtime import AgUiEventStream, EventObserver, NativeGraphRunStream, PartObserver
+
+class DeepAgentGraph(
+    Runnable[InputAgentState | Command[object] | None, Mapping[str, object]]
+):
+    """Complete reusable async native or Plan-capable Graph."""
+
+    def invoke(
+        self,
+        input: InputAgentState | Command[object] | None,
+        config: RunnableConfig | None = None,
+        **kwargs: Any,
+    ) -> Mapping[str, object]: ...
+    async def ainvoke(
+        self,
+        input: InputAgentState | Command[object] | None,
+        config: RunnableConfig | None = None,
+        **kwargs: Any,
+    ) -> Mapping[str, object]: ...
+    def astream(
+        self,
+        input: InputAgentState | Command[object] | None,
+        config: RunnableConfig | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[Mapping[str, object]]: ...
 
 class DeepAgentRuntime(Generic[ContextT]):
     """Single-request Runtime preserving the native LangGraph object stream."""
@@ -178,8 +201,70 @@ class DeepAgentAgUiResumeRuntime(Generic[ContextT]):
         ...
 
 class DeepAgentDefinition(Generic[ContextT]):
-    """Store one Graph build call and create a fresh Graph for every Runtime."""
+    """Store one Graph build call and create a fresh Graph for every execution."""
 
+    async def create_graph(self, *, mode: AgentMode | None = None) -> DeepAgentGraph:
+        """Create one complete reusable async native or Plan-capable Graph.
+
+        The selected Runtime Profile owns asynchronous construction of the native Graph.
+        Plan capability adds one lazily built Planning Graph to the same reusable router;
+        it never creates a second native Graph. The returned Runnable owns no borrowed
+        model, checkpointer, Store, backend, or cache resource and never closes them.
+
+        Args:
+            mode: Default route for new input. Resume always follows durable checkpoint
+                role evidence rather than this preference.
+
+        Returns:
+            A reusable async Graph containing the Definition's complete native and
+            optional Plan behavior.
+
+        Raises:
+            TypeError: The Profile factory does not produce the declared Graph boundary.
+            ValueError: The requested mode is unavailable on this Definition.
+            BaseException: Profile or Planning Graph construction fails."""
+        ...
+    def _belongs_to(self, family: object) -> bool:
+        """Return whether this Definition came from one configured factory family."""
+        ...
+    def _resume_checkpointer(self) -> object | None:
+        """Return the effective borrowed saver without transferring ownership."""
+        ...
+    async def _open_native_run(
+        self,
+        *,
+        identity: RunIdentity,
+        input: InputAgentState | Command[object] | None,
+        mode: AgentMode | None,
+        config: RunnableConfig | None,
+        context: object | None,
+        on_part: PartObserver[Mapping[str, object]] | None,
+        stream_options: Mapping[str, object],
+    ) -> NativeGraphRunStream:
+        """Build once and return one managed native stream for the common facade."""
+        ...
+    async def _open_agui_run(
+        self,
+        *,
+        identity: RunIdentity,
+        input: InputAgentState | None,
+        resume_request: AgUiResumeRequest | None,
+        parent_run_id: str | None,
+        mode: AgentMode | None,
+        config: RunnableConfig | None,
+        context: object | None,
+        on_resume_checkpointed: AgUiResumeCheckpointObserver | None,
+        on_resume_initialization_failed: AgUiResumeInitializationFailureObserver | None,
+        timeout: float | None,
+        settlement_timeout: float | None,
+        expose_reasoning_events: bool,
+        expose_subagent_events: bool,
+        on_part: PartObserver[Mapping[str, object]] | None,
+        on_event: EventObserver | None,
+        stream_options: Mapping[str, object],
+    ) -> AgUiEventStream:
+        """Build once and return one managed AG-UI stream for the common facade."""
+        ...
     def new(
         self,
         *,

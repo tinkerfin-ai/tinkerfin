@@ -262,6 +262,39 @@ class _BlockingPrepareBackend(MemoryBackend):
         )
 
 
+class _CancellationResistantPrepareBackend(_BlockingPrepareBackend):
+    async def prepare(
+        self,
+        *,
+        channel: str,
+        identity: RunIdentity,
+        codec: str,
+        after: int | None,
+        cancellable: bool,
+        recoverable: bool,
+    ) -> PreparedRun:
+        try:
+            return await super().prepare(
+                channel=channel,
+                identity=identity,
+                codec=codec,
+                after=after,
+                cancellable=cancellable,
+                recoverable=recoverable,
+            )
+        except asyncio.CancelledError:
+            await self.release.wait()
+            return await MemoryBackend.prepare(
+                self,
+                channel=channel,
+                identity=identity,
+                codec=codec,
+                after=after,
+                cancellable=cancellable,
+                recoverable=recoverable,
+            )
+
+
 class _BlockingAppendBackend(MemoryBackend):
     def __init__(self, *, blocked_payload: bytes = b"one") -> None:
         super().__init__()
@@ -713,9 +746,15 @@ async def test_event_loop_block_is_distinguished_from_on_time_renewal_rejection(
     assert source.closed.is_set()
 
 
-async def test_wrap_cancellation_closes_an_unclaimed_source() -> None:
-    backend = _BlockingPrepareBackend()
+async def test_wrap_repeated_cancellation_settles_before_producer_start() -> None:
+    backend = _CancellationResistantPrepareBackend()
     source = _Source("unused")
+    not_started = 0
+
+    async def delivery_not_started() -> None:
+        nonlocal not_started
+        assert source.close_calls == 1
+        not_started += 1
 
     async with Messaging(backend=backend) as messaging:
         channel = messaging.channel(name="events", codec=_TextCodec())
@@ -724,15 +763,22 @@ async def test_wrap_cancellation_closes_an_unclaimed_source() -> None:
                 source,
                 identity=_identity(),
                 after=0,
+                on_delivery_not_started=delivery_not_started,
             )
         )
         await asyncio.wait_for(backend.entered.wait(), timeout=1)
         wrapping.cancel()
+        await asyncio.sleep(0)
+        wrapping.cancel()
+        await asyncio.sleep(0)
+        assert not wrapping.done()
+        backend.release.set()
         with pytest.raises(asyncio.CancelledError):
             await wrapping
 
     assert source.close_calls == 1
     assert not source.started.is_set()
+    assert not_started == 1
 
 
 async def test_shutdown_waits_for_inflight_prepare_and_rejects_late_producer() -> None:
@@ -837,7 +883,11 @@ async def test_recoverable_preflight_settles_owner_when_source_close_fails() -> 
         )
         assert await _data(resumed) == ["next-run"]
 
-    assert wrap_result is close_error
+    assert isinstance(wrap_result, MessagingClosed)
+    assert any(
+        "cannot close rebuilt source" in note
+        for note in getattr(wrap_result, "__notes__", ())
+    )
     assert source.close_calls == 1
 
 

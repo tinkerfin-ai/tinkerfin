@@ -41,6 +41,7 @@ warm-pool 数量必须是严格整数。命令与生命周期 timeout 必须是�
 | `delete(key)` | `destroy()` 的同义入口 | 被删除 |
 | `is_healthy(key)` | 检查当前实例是否健康 | 不变化 |
 | `get_details(key)` | 返回运行状态和 owner 信息 | 不变化 |
+| `check_ready()` | 预热容量未通过真实验证时抛出异常 | 不变化 |
 
 ```python
 backend = await manager.get(project_key)
@@ -67,11 +68,23 @@ finally:
 
 `start()` 可以重复调用；manager 关闭后不能重新启动。
 
+启动会为每个已发布 warm slot 取得 fencing claim，重新连接远端实例，执行数据面健康检查并续期。
+缺失实例会在启动返回前被原子替换。启用 `fail_on_startup_warmup_error=True` 后，认证、重连、健康
+检查、续期、创建或 State 发布任一步失败都会向外传播，宿主不得报告 ready。
+
+Manager 运行期间会周期续期或替换 warm 实例。后台补充失败不会推翻已经交给当前请求的 owner
+backend，但 `check_ready()` 会持续抛出 `OpenSandboxWarmPoolUnavailableError`，直到容量恢复。宿主应把
+该方法纳入 readiness 检查。
+
 关闭会等待正在进行的创建、替换、重置和清理安全落定。有限的 `settlement_timeout` 只限制当前调用方等待，不会取消 manager 已经接管的清理任务。超时会抛出 `OpenSandboxSettlementTimeoutError`，稍后可以再次调用 `aclose()` 继续等待。
 
 ## 健康检查与替换
 
 `OpenSandboxConfig.health_command` 用于检查数据面是否可用，默认是 `printf ok`。`get()` 发现已有绑定不健康时，会创建替代实例并更新 handle。
+
+持久 State 保存绑定和 fencing 身份，不保存容器文件。Owner Sandbox 过期后，下一次 `get()` 会创建
+替代实例；若业务要求远端过期后仍保留 workspace 内容，宿主必须配置 OpenSandbox volume 或 snapshot
+策略。
 
 正在执行的操作会继续使用它开始时取得的 backend。替换完成前，旧 backend 不会被提前关闭；替换调用会等旧实例安全退役后才返回。
 
@@ -82,7 +95,9 @@ finally:
 `OpenSandboxClient.destroy()` 会为每个 Sandbox ID 保留一个 task。并发调用方共同等待同一次远端
 kill 和本地 close。调用方取消会先等待 settlement，再继续传播取消。kill 已成功时，SDK close
 失败只作为清理证据记录，不会误报成远端销毁失败。Client 关闭前会等待所有活跃 destroy task，
-再关闭自己拥有的 transport。
+再关闭 `ConnectionConfig` 未提供 transport 时由 Client 创建的共享 transport。并发关闭调用会共同
+等待同一个受 Client 持有的结算任务；取消等待者不会取消 transport 关闭，关闭任务失败后仍可重试且
+不会丢失所有权。调用方显式传入的 transport 始终按借用资源处理，Client 不会关闭它。
 
 如果业务要在取消后立刻给用户响应，可以让清理继续由 manager 持有，并通过监控或状态接口观察最终结果。
 

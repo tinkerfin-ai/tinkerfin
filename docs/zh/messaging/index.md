@@ -23,29 +23,53 @@ pip install "tinkerfin-messaging[agui,redis]"
 ## 把 TinkerFin 流变成可续传 SSE
 
 ```python
-from tinkerfin import RunIdentity
-from tinkerfin_messaging import Messaging
+from tinkerfin import RunIdentity, TinkerFin
+from tinkerfin_messaging import Messaging, create_agui_run_source
 
 
+tinkerfin = TinkerFin()
+agent = tinkerfin.create_deep_agent(model=model, tools=tools)
 identity = RunIdentity(threadId="thread-42", runId="run-7")
-runtime = agent.new_agui(identity=identity)
-events = runtime.astream(graph_input)
+source = create_agui_run_source(
+    identity,
+    open_events=lambda run_identity: tinkerfin.open_agui_run(
+        run_identity,
+        agent=agent,
+        input=graph_input,
+    ),
+)
 
 async with Messaging() as messaging:
     channel = messaging.channel(name="agent-events")
-    body = await channel.sse(events, after=0)
+    body = await channel.sse(
+        source,
+        after=0,
+        on_source_starting=activate_business_run,
+        on_delivery_not_started=cleanup_business_run,
+    )
 
     async for chunk in body:
         await send_to_client(chunk)
 ```
 
-`AgUiEventStream` 和 `NativeGraphRunStream` 会携带不可变 codec profile 与 `RunIdentity`，所以 name-only channel 不需要重复传 codec、thread 或 run。空流也能在拉取第一条数据前完成识别。
+`create_agui_run_source()` 会把模型、Sandbox 与 Graph setup 留到 owner 确定后；attachment 不会
+打开 Agent。Name-only channel 不需要重复传 codec、thread 或 run，空流也能在第一条数据前识别。
+可选 transform 可以补充产品 metadata 或调整内容，但不得改变事件类型以及 Run、消息、Tool、快照或
+interrupt 的关联身份，也不得改变可选 `RUN_STARTED.input` 的任何字段。需要改变输出协议时，应使用
+高级、无 profile 的 `map_source()` 边界。
+
+`on_source_starting` 只为新 owner 激活宿主投递。既没有 producer、也没有 attachment 时，
+`on_delivery_not_started` 负责宿主清理；attachment 不调用这两个 callback。
+
+Attachment 不会打开未使用的候选 source，但 Messaging 会在返回前关闭这个 single-use
+candidate。`wrap()` 或 `sse()` 返回后不得复用它。
 
 `AgUiCodec` 需要 `[agui]`，`NativeStreamPartCodec` 需要 `[native]`，`RedisBackend`
 需要 `[redis]`。缺少 extra 时，相应懒加载入口会给出准确安装命令；Messaging Core 不会因此
 加载完整 Agent Runtime。
 
-`body` 已经是 `bytes` 形式的 SSE，不要再调用 Runtime 的 `to_sse()`，也不要把已经编码过的 `SseBody` 交给 Messaging。
+`body` 已经是调用方拥有的 SSE bytes 流；HTTP setup 在消费前失败时应关闭它。不要再调用
+Runtime 的 `to_sse()`，也不要把已经编码过的 `SseBody` 交给 Messaging。
 
 ## 自定义 source
 

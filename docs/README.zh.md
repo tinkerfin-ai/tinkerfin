@@ -9,7 +9,7 @@ TinkerFin 为 Deep Agents 提供原生流、AG-UI、SSE、语义 Trace 和可持
 
 ```text
 packages/
-├── tinkerfin-contracts/       与协议无关的运行身份和观察契约
+├── tinkerfin-contracts/       运行身份和观察契约
 ├── tinkerfin-native-stream/   当前 Deep Agents/LangGraph 原生流契约
 ├── tinkerfin/                 Deep Agents Runtime、可选 AG-UI、SSE 与运行协调
 ├── tinkerfin-agui-adapter/    LangGraph v2 StreamPart 到 AG-UI 的转换
@@ -20,7 +20,6 @@ packages/
 apps/studio/
 ├── server/                    Studio 服务端
 └── web/                       Studio Web 应用
-docs/                          中文与英文使用文档
 ```
 
 ## 安装
@@ -65,9 +64,10 @@ agent = tinkerfin.create_deep_agent(
 
 async def main() -> None:
     identity = RunIdentity(threadId="thread-1", runId="run-1")
-    runtime = agent.new(identity=identity)
-    parts = runtime.astream(
-        {"messages": [{"role": "user", "content": "Hello"}]},
+    parts = await tinkerfin.open_run(
+        identity,
+        agent=agent,
+        input={"messages": [{"role": "user", "content": "你好"}]},
     )
     async for part in parts:
         print(part)
@@ -76,20 +76,21 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-需要 LangGraph 原生对象时使用 `agent.new()`。两种 Runtime 的 `astream(...)` 都保留
-当前 `CompiledStateGraph.astream(...)` 的参数形状，并固定为完整 Native profile。
+`open_run()` 统一负责 Definition 解析、异步 Graph 构造、Observation、协调、取消和清理。
+只有高级集成需要一个不带 managed identity、Trace、AG-UI 或 Messaging 生命周期的可复用
+LangGraph 风格 `Runnable` 时，才直接调用 `await agent.create_graph()`。
 
 ## 核心概念
 
-- `create_deep_agent(...)` 记录 Deep Agents 建图参数，`new()` / `new_agui()` 创建新
-  Graph 和单次使用的 Runtime
-- 原生 Runtime、Plan Mode、Observation 与 SSE 默认可用；`new_agui()` 需要安装
+- `create_deep_agent(...)` 记录 Deep Agents 建图参数，普通运行使用 `open_run()` 或
+  `open_agui_run()`
+- 原生 Runtime、Plan Mode、Observation 与 SSE 默认可用；`open_agui_run()` 需要安装
   `tinkerfin[agui]`
 - `TinkerFin(state_schema=...)` 为该 factory 创建的所有 Deep Agent Definition 提供
   应用级 state；Definition state 与 middleware state 会在不破坏 reducer 和必填语义的
   前提下自动组合
 - `.plan(enabled=True)` 在不改变 Deep Agents `create_deep_agent(...)` 参数的前提下
-  创建稳定父工作流；每次 `new()` / `new_agui()` 通过 `mode="default"` 或
+  创建稳定父工作流；每次 managed run 或 direct Graph 通过 `mode="default"` 或
   `mode="plan"` 选择本轮路径；选择 Plan 时必须提供具体 checkpointer
 - 一个显式 Runtime Profile 完整负责建图、必需流参数、Native 校验、Observation 与 canonical
   replay；冲突或局部上游参数会在迭代及生命周期事件开始前失败
@@ -98,8 +99,8 @@ asyncio.run(main())
 - 对象流可以直接输出 SSE，也可以交给 Messaging 持久化、回放、附着和远程取消
 - AG-UI Runtime 使用一个 `RunIdentity` 统一公开事件、Graph、checkpoint 与持久投递；可选
   `parent_run_id` 会创建真实 checkpoint 分支
-- 恢复请求使用 `AgUiResumeRequest`；`DeepAgentDefinition.prepare_agui_resume()` 从权威
-  checkpoint 生成私有 binding，Runtime 自己管理原生 Command、Tool 关联、取消与持久证据
+- `open_agui_run(resume=...)` 接收 `AgUiResumeRequest`，从权威 checkpoint 解析事实，并管理
+  原生 Command、Tool 关联、取消与持久证据；Binding 只保留给高级事件日志集成
 - `.observe(Tracer())` 以 fail-closed 方式记录 Runtime 生命周期与校验后的 Native 语义，
   不记录 AG-UI、Messaging、SSE 或 Redis 投递状态
 - 当前发行只提供显式的 `deepagents-v2` Runtime Profile，不提供 Deep Agents v3 Profile 或
@@ -116,7 +117,6 @@ asyncio.run(main())
 - [Messaging](zh/messaging/index.md)
 - [Tracing](zh/tracing/index.md)
 - [Sandbox](zh/sandbox/index.md)
-- [仓库测试](zh/development/testing.md)
 - [核心包](../packages/tinkerfin/README.md)
 - [共享 contracts](../packages/tinkerfin-contracts/README.md)
 - [AG-UI adapter](../packages/tinkerfin-agui-adapter/README.md)

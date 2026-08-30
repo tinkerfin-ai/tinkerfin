@@ -30,7 +30,12 @@ from ._redis_control import (
     _RunSnapshot,
 )
 from ._redis_scripts import _APPEND_SCRIPT, _PREPARE_SCRIPT
-from .backend import BackendRunHandle, PreparedRun, _validate_append_input
+from .backend import (
+    BackendRunHandle,
+    PreparedRun,
+    _validate_append_input,
+    is_failed_run_status,
+)
 from .errors import (
     BackendOwnershipLost,
     CodecMismatch,
@@ -559,7 +564,7 @@ def follow(
                 if cursor < snapshot.end_seq:
                     continue
             if snapshot.terminal:
-                if snapshot.status in {"failed", "owner_lost"}:
+                if is_failed_run_status(snapshot.status):
                     cause = self._remote_error(snapshot)
                     raise RunProducerFailed(
                         identity=handle.identity,

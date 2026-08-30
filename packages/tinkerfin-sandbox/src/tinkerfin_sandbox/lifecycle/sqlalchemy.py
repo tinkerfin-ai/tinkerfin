@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import math
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -48,6 +48,7 @@ from .state import (
     OpenSandboxBinding,
     OpenSandboxCleanupClaim,
     OpenSandboxOwnerClaim,
+    OpenSandboxReadyWarmClaim,
     OpenSandboxState,
     OpenSandboxWarmClaim,
 )
@@ -519,6 +520,34 @@ class SQLAlchemyOpenSandboxState(OpenSandboxState):
         return await _sql_state_ops.claim_warm_slot(
             self,
         )
+
+    @_state_operation("claim_ready_warm_slot")
+    async def claim_ready_warm_slot(
+        self,
+        *,
+        exclude_slots: Sequence[int],
+    ) -> OpenSandboxReadyWarmClaim | None:
+        """Fence one published slot for remote health and expiry reconciliation."""
+
+        return await _sql_state_ops.claim_ready_warm_slot(
+            self,
+            exclude_slots=exclude_slots,
+        )
+
+    @_state_operation("discard_ready_warm_slot")
+    async def discard_ready_warm_slot(
+        self,
+        claim: OpenSandboxReadyWarmClaim,
+    ) -> None:
+        """Clear one unusable published slot and retain durable cleanup."""
+
+        await _sql_state_ops.discard_ready_warm_slot(self, claim)
+
+    @_state_operation("warm_pool_ready")
+    async def warm_pool_ready(self) -> bool:
+        """Return whether every configured slot is published and unclaimed."""
+
+        return await _sql_state_ops.warm_pool_ready(self)
 
     @_state_operation("publish_warm")
     async def publish_warm(

@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from tinkerfin_contracts import RunIdentity
 
+from ._prepared import PreparedTraceFact, prepare_trace_facts
 from .codec import CanonicalTracePayloadCodec
 from .errors import (
     TraceProjectionCheckpointConflict,
@@ -143,6 +144,17 @@ class _SqlTraceWriter:
     ) -> tuple[TraceEvent, ...]:
         """Append under the current token/fence after checking heartbeat health."""
 
+        prepared = prepare_trace_facts(facts, codec=self._store._codec)
+        return await self._append_prepared(prepared, mandatory=mandatory)
+
+    async def _append_prepared(
+        self,
+        prepared: tuple[PreparedTraceFact, ...],
+        *,
+        mandatory: bool,
+    ) -> tuple[TraceEvent, ...]:
+        """Append using canonical bytes already computed before queue admission."""
+
         if self._closed:
             raise TraceStoreProtocolError("Trace writer is closed")
         if self._failure is not None:
@@ -155,7 +167,7 @@ class _SqlTraceWriter:
             run_id=self._run_id,
             owner_token=self._owner_token,
             fence=self._fence,
-            facts=facts,
+            prepared_facts=prepared,
             mandatory=mandatory,
         )
 
@@ -832,7 +844,7 @@ class SqlAlchemyTraceStore:
         run_id: str,
         owner_token: str,
         fence: int,
-        facts: tuple[TraceSemanticFact, ...],
+        prepared_facts: tuple[PreparedTraceFact, ...],
         mandatory: bool,
     ) -> tuple[TraceEvent, ...]:
         """Commit canonical facts under namespace, thread, and writer fencing.
@@ -849,7 +861,8 @@ class SqlAlchemyTraceStore:
             run_id: Run whose writer row must remain active and fenced.
             owner_token: Private lease token returned when the writer opened.
             fence: Monotonic ownership generation paired with the token.
-            facts: Ordered semantic facts accepted as one atomic transaction.
+            prepared_facts: Ordered facts and canonical payload evidence accepted as
+                one atomic transaction.
             mandatory: Whether terminal reserve, rather than ordinary capacity, applies.
 
         Returns:
@@ -862,11 +875,9 @@ class SqlAlchemyTraceStore:
                 proven committed.
         """
 
-        if not facts:
+        if not prepared_facts:
             return ()
-        source_payloads = tuple(
-            (uuid4().hex, fact, self._codec.encode_fact(fact)) for fact in facts
-        )
+        source_payloads = tuple((uuid4().hex, item) for item in prepared_facts)
 
         async def operation(connection: AsyncConnection) -> tuple[TraceEvent, ...]:
             now = await _database_now(connection)
@@ -891,20 +902,21 @@ class SqlAlchemyTraceStore:
                 by_id = {cast(str, row["event_id"]): row for row in existing_rows}
                 if len(by_id) != len(source_payloads) or any(
                     event_id not in by_id
-                    or by_id[event_id]["payload_digest"] != encoded.digest
-                    for event_id, _fact_value, encoded in source_payloads
+                    or by_id[event_id]["payload_digest"] != item.payload_digest
+                    for event_id, item in source_payloads
                 ):
                     raise TraceStoreProtocolError(
                         "Trace event idempotency evidence conflicts"
                     )
                 return tuple(
                     self._decode_event(key, by_id[event_id])
-                    for event_id, _fact_value, _encoded in source_payloads
+                    for event_id, _item in source_payloads
                 )
             _require_writer_owner(writer, owner_token=owner_token, fence=fence, now=now)
             next_seq = cast(int, thread["next_seq"])
             prepared: list[tuple[TraceEvent, bytes, str]] = []
-            for event_id, fact, encoded in source_payloads:
+            for event_id, item in source_payloads:
+                fact = item.fact
                 if (
                     fact.identity.thread_id != key.thread_id
                     or fact.identity.run_id != run_id
@@ -920,7 +932,7 @@ class SqlAlchemyTraceStore:
                 )
                 if event.persisted_bytes > self._limits.max_event_bytes:
                     raise TraceQuotaExceeded("Trace event exceeds max_event_bytes")
-                prepared.append((event, encoded.data, encoded.digest))
+                prepared.append((event, item.canonical_payload, item.payload_digest))
                 next_seq += 1
             added_bytes = sum(item[0].persisted_bytes for item in prepared)
             terminal_batch = all(

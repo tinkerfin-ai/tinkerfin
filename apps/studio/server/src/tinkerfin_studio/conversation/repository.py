@@ -276,7 +276,7 @@ class ConversationRepository:
         run_id: str,
         resolution_id: str,
     ) -> None:
-        """以 Trace abandonment 证据结算未进入 Graph 的整批取消"""
+        """以 Trace abandonment 证据结算未继续执行的整批取消"""
 
         rows = await self._session.scalars(
             select(ConversationInterruptClaim)

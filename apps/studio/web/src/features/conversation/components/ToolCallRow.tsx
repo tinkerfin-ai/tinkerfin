@@ -84,7 +84,7 @@ const toolSummary = (
     summary = firstStringValue(parsed, presentation?.summaryKeys ?? [])
   }
   if (!summary && params) summary = firstLine(params)
-  if (!summary) summary = message.meta?.toolCallId ?? message.id
+  if (!summary) return presentation ? '' : toolName
 
   return presentation ? summary : `${toolName} · ${summary}`
 }
@@ -141,8 +141,12 @@ export function ToolCallRow({
           <ChevronDown className="tool-row-chevron" size={14} strokeWidth={2} />
         </span>
         <span className="tool-row-title">{presentation?.title ?? 'Tool call'}</span>
-        <span className="tool-row-separator" aria-hidden="true" />
-        <span className={`tool-row-summary${failure ? ' is-error' : ''}`}>{summary}</span>
+        {summary
+          ? <>
+              <span className="tool-row-separator" aria-hidden="true" />
+              <span className={`tool-row-summary${failure ? ' is-error' : ''}`}>{summary}</span>
+            </>
+          : null}
       </summary>
       {children}
     </details>

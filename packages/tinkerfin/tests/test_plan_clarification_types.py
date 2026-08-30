@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Literal, cast
+from datetime import datetime
+from typing import ClassVar, Literal, cast
 
 import pytest
 from jsonschema.exceptions import SchemaError
@@ -17,9 +18,11 @@ from tinkerfin.plan import (
     ClarificationQuestionBase,
     ClarificationResponseBase,
     ClarificationType,
+    DateTimeQuestion,
     DefaultClarificationForm,
     PlanClarificationResponseError,
     PlanModeConfigurationError,
+    TimeQuestion,
     clarification_type,
 )
 from tinkerfin.plan._clarification import (
@@ -40,7 +43,186 @@ def test_default_form_exposes_all_builtin_discriminated_question_types() -> None
         "multiple_choice",
         "text",
         "date",
+        "time",
+        "datetime",
     }
+
+
+class _ConfigurableTimeZoneForm(DefaultClarificationForm):
+    default_time_zone: ClassVar[str] = "UTC"
+
+
+def _question_schema(
+    schema: dict[str, object],
+    *,
+    answer_type: str,
+) -> dict[str, object]:
+    questions = cast(dict[str, object], schema["properties"])["questions"]
+    items = cast(dict[str, object], cast(dict[str, object], questions)["items"])
+    discriminator = cast(dict[str, object], items["discriminator"])
+    mapping = cast(dict[str, str], discriminator["mapping"])
+    reference = mapping[answer_type]
+    definition = reference.removeprefix("#/$defs/")
+    return cast(dict[str, object], cast(dict[str, object], schema["$defs"])[definition])
+
+
+def test_form_default_time_zone_is_in_schema_and_fingerprint() -> None:
+    utc_binding = create_clarification_binding(_ConfigurableTimeZoneForm)
+    _ConfigurableTimeZoneForm.default_time_zone = "Asia/Shanghai"
+    try:
+        shanghai_binding = create_clarification_binding(_ConfigurableTimeZoneForm)
+    finally:
+        _ConfigurableTimeZoneForm.default_time_zone = "UTC"
+
+    assert utc_binding.fingerprint != shanghai_binding.fingerprint
+    schema = cast(
+        dict[str, object],
+        shanghai_binding.form_schema.model_json_schema(by_alias=True),
+    )
+    for answer_type in ("time", "datetime"):
+        question_schema = _question_schema(schema, answer_type=answer_type)
+        properties = cast(dict[str, object], question_schema["properties"])
+        assert cast(dict[str, object], properties["timeZone"])["default"] == (
+            "Asia/Shanghai"
+        )
+        assert "timeZone" not in cast(list[str], question_schema["required"])
+
+    form = cast(
+        _ConfigurableTimeZoneForm,
+        shanghai_binding.form_schema.model_validate(
+            {
+                "questions": [
+                    {
+                        "id": "local-time",
+                        "answerType": "time",
+                        "prompt": "Local time?",
+                        "required": True,
+                    },
+                    {
+                        "id": "explicit-zone",
+                        "answerType": "datetime",
+                        "prompt": "UTC instant?",
+                        "required": True,
+                        "timeZone": "UTC",
+                    },
+                ]
+            }
+        ),
+    )
+
+    local_time, explicit_zone = form.questions
+    assert isinstance(local_time, TimeQuestion)
+    assert isinstance(explicit_zone, DateTimeQuestion)
+    assert local_time.time_zone == "Asia/Shanghai"
+    assert explicit_zone.time_zone == "UTC"
+
+
+def test_invalid_form_default_time_zone_fails_at_definition_creation() -> None:
+    class InvalidTimeZoneForm(DefaultClarificationForm):
+        default_time_zone: ClassVar[str] = "Mars/Olympus_Mons"
+
+    with pytest.raises(PlanModeConfigurationError, match="default_time_zone"):
+        TinkerFin().plan(clarification_schema=InvalidTimeZoneForm)
+
+
+def test_datetime_question_normalizes_one_unique_zoned_instant() -> None:
+    binding = create_clarification_binding(DefaultClarificationForm)
+    form = binding.form_schema.model_validate(
+        {
+            "questions": [
+                {
+                    "id": "deployment-at",
+                    "answerType": "datetime",
+                    "prompt": "When should deployment begin?",
+                    "required": True,
+                    "timeZone": "Asia/Shanghai",
+                    "minimum": "2026-08-30T09:00:00",
+                    "maximum": "2026-09-30T18:00:00",
+                }
+            ]
+        }
+    )
+    schema = build_response_schema(binding, form)
+
+    answers = validate_and_normalize_response(
+        binding,
+        form,
+        schema,
+        {
+            "type": "respond",
+            "answers": {
+                "deployment-at": {
+                    "status": "answered",
+                    "answerType": "datetime",
+                    "dateTime": "2026-08-30T09:30:00",
+                }
+            },
+        },
+    )
+
+    assert answers[0].answer_type == "datetime"
+    assert answers[0].value == {
+        "localDateTime": "2026-08-30T09:30",
+        "timeZone": "Asia/Shanghai",
+        "instant": "2026-08-30T01:30:00Z",
+    }
+    properties = cast(dict[str, JsonValue], schema["properties"])
+    answers_schema = cast(dict[str, JsonValue], properties["answers"])
+    answer_properties = cast(dict[str, JsonValue], answers_schema["properties"])
+    response_schema = cast(dict[str, JsonValue], answer_properties["deployment-at"])
+    response_properties = cast(dict[str, JsonValue], response_schema["properties"])
+    date_time_schema = cast(dict[str, JsonValue], response_properties["dateTime"])
+    assert cast(str, date_time_schema["pattern"]).endswith(r"(?::00)?$")
+
+
+def test_datetime_question_rejects_dst_gaps_folds_offsets_and_hidden_seconds() -> None:
+    binding = create_clarification_binding(DefaultClarificationForm)
+    form = binding.form_schema.model_validate(
+        {
+            "questions": [
+                {
+                    "id": "deployment-at",
+                    "answerType": "datetime",
+                    "prompt": "When should deployment begin?",
+                    "required": True,
+                    "timeZone": "America/New_York",
+                }
+            ]
+        }
+    )
+    schema = build_response_schema(binding, form)
+
+    for local_datetime in (
+        "2026-03-08T02:30:00",
+        "2026-11-01T01:30:00",
+        "2026-08-30T09:30:01",
+        "2026-08-30T09:30:00-04:00",
+    ):
+        with pytest.raises(PlanClarificationResponseError):
+            validate_and_normalize_response(
+                binding,
+                form,
+                schema,
+                {
+                    "type": "respond",
+                    "answers": {
+                        "deployment-at": {
+                            "status": "answered",
+                            "answerType": "datetime",
+                            "dateTime": local_datetime,
+                        }
+                    },
+                },
+            )
+
+    with pytest.raises(ValidationError, match="minute precision"):
+        DateTimeQuestion(
+            id="bounded",
+            prompt="Choose",
+            required=True,
+            time_zone="UTC",
+            minimum=datetime(2026, 8, 30, 9, 0, 1),
+        )
 
 
 def test_mixed_form_builds_an_exact_response_schema_and_trusted_values() -> None:
@@ -243,6 +425,8 @@ def test_shared_metadata_form_requires_no_per_question_subclasses() -> None:
         "multiple_choice",
         "text",
         "date",
+        "time",
+        "datetime",
     }
     TinkerFin().plan(clarification_schema=_BrandedForm)
 

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from tinkerfin_tracing import TraceCaptureRejected
-from tinkerfin_tracing.capture import CapturedValue, CapturePolicy, ToolCaptureRule
+from tinkerfin_tracing import CapturePolicy, ToolTraceCapture, TraceCaptureRejected
+from tinkerfin_tracing.capture import CapturedValue, ToolCaptureRule
 
 
 def test_public_safe_capture_removes_only_reserved_reasoning_and_credentials() -> None:
@@ -31,7 +31,7 @@ def test_public_safe_capture_removes_only_reserved_reasoning_and_credentials() -
     }
 
 
-def test_tool_content_is_metadata_only_without_an_allowlist() -> None:
+def test_public_safe_tool_content_is_metadata_only_without_an_allowlist() -> None:
     captured = CapturePolicy.public_safe().capture_tool(
         tool_name="search",
         value={"query": "private", "limit": 5},
@@ -41,8 +41,83 @@ def test_tool_content_is_metadata_only_without_an_allowlist() -> None:
 
     assert captured.disposition == "omitted"
     assert captured.value is None
-    assert captured.reason == "tool_content_not_allowlisted"
+    assert captured.reason == "tool_content_metadata_only"
     assert captured.safe_size_bytes > 0
+
+
+def test_public_history_captures_every_tool_without_a_second_registry() -> None:
+    policy = CapturePolicy.public_history()
+
+    captured = policy.capture_tool(
+        tool_name="new_business_tool",
+        value={"query": "public", "api_key": "private"},
+        target="arguments",
+        max_bytes=4096,
+    )
+
+    assert captured.value == {
+        "query": "public",
+        "api_key": {"$type": "redacted"},
+    }
+    assert policy.traces_tool("new_business_tool") is True
+    assert policy.captures_review_description("new_business_tool") is True
+
+
+def test_public_history_applies_exact_per_tool_capture_overrides() -> None:
+    policy = CapturePolicy.public_history(
+        tool_overrides={
+            "metadata": ToolTraceCapture.metadata_only(),
+            "selected": ToolTraceCapture.selected_content(
+                argument_paths=("/query",),
+                result_paths=("/answer",),
+            ),
+            "disabled": ToolTraceCapture.disabled(),
+        }
+    )
+
+    metadata = policy.capture_tool(
+        tool_name="metadata",
+        value={"query": "private"},
+        target="arguments",
+        max_bytes=4096,
+    )
+    selected = policy.capture_tool(
+        tool_name="selected",
+        value={"query": "public", "other": "private"},
+        target="arguments",
+        max_bytes=4096,
+    )
+    disabled = policy.capture_tool(
+        tool_name="disabled",
+        value={"query": "private"},
+        target="arguments",
+        max_bytes=4096,
+    )
+
+    assert metadata.reason == "tool_content_metadata_only"
+    assert selected.value == {"/query": "public"}
+    assert disabled.reason == "tool_tracing_disabled"
+    assert policy.traces_tool("disabled") is False
+    assert policy.traces_tool("unconfigured") is True
+
+
+def test_public_history_requires_typed_override_names_and_values() -> None:
+    with pytest.raises(TypeError, match="mapping"):
+        CapturePolicy.public_history(
+            tool_overrides=()  # pyright: ignore[reportArgumentType]
+        )
+    with pytest.raises(TypeError, match="name strings"):
+        CapturePolicy.public_history(
+            tool_overrides={  # pyright: ignore[reportArgumentType]
+                1: ToolTraceCapture.metadata_only()
+            }
+        )
+    with pytest.raises(TypeError, match="ToolTraceCapture"):
+        CapturePolicy.public_history(
+            tool_overrides={  # pyright: ignore[reportArgumentType]
+                "search": object()
+            }
+        )
 
 
 def test_tool_allowlist_preserves_only_selected_json_pointer_paths() -> None:
@@ -70,6 +145,34 @@ def test_tool_allowlist_preserves_only_selected_json_pointer_paths() -> None:
         "/query": "public",
         "/filters/0/name": "docs",
     }
+
+
+def test_tool_allowlist_can_explicitly_select_the_sanitized_root_value() -> None:
+    policy = CapturePolicy.public_safe(
+        tool_rules=(ToolCaptureRule(tool_name="read_file", result_paths=("",)),)
+    )
+
+    captured = policy.capture_tool(
+        tool_name="read_file",
+        value={"content": "public", "api_key": "private"},
+        target="result",
+        max_bytes=4096,
+    )
+
+    assert captured.value == {
+        "": {
+            "content": "public",
+            "api_key": {"$type": "redacted"},
+        }
+    }
+
+
+def test_root_tool_capture_path_cannot_be_combined_with_nested_paths() -> None:
+    with pytest.raises(ValueError, match="root Tool capture path"):
+        ToolCaptureRule(
+            tool_name="read_file",
+            result_paths=("", "/content"),
+        )
 
 
 def test_oversized_safe_value_is_explicitly_omitted() -> None:

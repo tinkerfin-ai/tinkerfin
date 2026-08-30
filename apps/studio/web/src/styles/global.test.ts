@@ -185,10 +185,9 @@ describe('前端视觉契约', () => {
     expect(uiStyles).toMatch(/\.ui-text-field--lg \.ui-text-field__control\s*\{[^}]*min-height:\s*var\(--control-lg\);/s)
     expect(uiStyles).toMatch(/\.ui-text-field__control:focus-within,\s*\.ui-date-picker__trigger:focus-visible\s*\{[^}]*border-color:\s*var\(--color-border-strong\);[^}]*box-shadow:\s*none;/s)
     expect(tokensStyles).not.toContain('--shadow-focus')
-    expect(conversationStyles).toMatch(/\.approval-rejection-form textarea:focus\s*\{[^}]*border-color:\s*var\(--color-border-strong\);[^}]*outline:\s*0;[^}]*box-shadow:\s*none;/s)
-    expect(conversationStyles).toMatch(/\.plan-review-input textarea:focus\s*\{[^}]*border-color:\s*var\(--color-border-strong\);[^}]*outline:\s*0;[^}]*box-shadow:\s*none;/s)
+    expect(conversationStyles).toMatch(/\.approval-rejection-form textarea:focus,\s*\.plan-review-rejection-form textarea:focus\s*\{[^}]*border-color:\s*var\(--color-border-strong\);[^}]*outline:\s*0;[^}]*box-shadow:\s*none;/s)
     expect(conversationStyles).not.toMatch(/\.approval-rejection-form textarea:focus-visible[^{]*\{[^}]*var\(--color-focus\)/s)
-    expect(conversationStyles).toMatch(/@media \(forced-colors:\s*active\)[\s\S]*\.approval-rejection-form textarea:focus-visible,[\s\S]*\.plan-review-input textarea:focus-visible,[\s\S]*\.composer-attachment-remove:focus-visible\s*\{[^}]*outline:\s*2px solid Highlight;/s)
+    expect(conversationStyles).toMatch(/@media \(forced-colors:\s*active\)[\s\S]*\.approval-rejection-form textarea:focus-visible,[\s\S]*\.plan-review-rejection-form textarea:focus-visible,[\s\S]*\.composer-attachment-remove:focus-visible\s*\{[^}]*outline:\s*2px solid Highlight;/s)
   })
 
   it('带边框控件使用单一焦点边且鼠标焦点不触发主题选项轮廓', () => {
@@ -268,7 +267,7 @@ describe('前端视觉契约', () => {
       '.approval-composer-body',
       '.approval-composer-footer',
       '.plan-review-composer-body',
-      '.plan-review-actions',
+      '.plan-review-rejection-form',
       '.plan-review-composer-footer',
       '.plan-question-composer-body',
       '.plan-question-composer-footer',
@@ -509,7 +508,8 @@ describe('前端视觉契约', () => {
     expect(workspaceStyles).toMatch(/\.message-list > :is\([\s\S]*?\.message-history-loader,[\s\S]*?\.message-stream-tail[\s\S]*?\) \+ :is\([\s\S]*?\.message-history-loader,[\s\S]*?\.message-stream-tail/s)
     expect(workspaceStyles).toMatch(/\.message-history-loader\s*\{[^}]*display:\s*grid;[^}]*place-items:\s*center;[^}]*\}/s)
     expect(workspaceStyles).not.toMatch(/\.message-history-loader\s*\{[^}]*padding-bottom:/s)
-    expect(conversationStyles).toMatch(/\.streaming-indicator,\s*\.message-stream-tail\s*\{[^}]*margin:\s*0;/s)
+    expect(conversationStyles).toMatch(/\.message-stream-tail\s*\{[^}]*margin:\s*0;/s)
+    expect(conversationStyles).not.toContain('.streaming-indicator')
     expect(conversationStyles).not.toContain(':has(+ .approval-wait-state)')
     expect(tokensStyles).toContain('--optical-activity-dots-inset: 1px;')
     expect(conversationStyles).toMatch(/\.activity-dots\s*\{[^}]*margin-inline-start:\s*var\(--optical-activity-dots-inset\);/s)
@@ -631,8 +631,7 @@ describe('前端视觉契约', () => {
     expect(uiStyles).toMatch(/\.ui-text-field__control\s*\{[^}]*border-radius:\s*var\(--radius-3xl\);/s)
     expect(uiStyles).toMatch(/\.ui-text-field--capsule \.ui-text-field__control\s*\{[^}]*border-radius:\s*var\(--radius-3xl\);/s)
     expect(uiStyles).toMatch(/\.modal-dialog\s*\{[^}]*border-radius:\s*var\(--radius-3xl\);/s)
-    expect(conversationStyles).toMatch(/\.approval-rejection-form textarea\s*\{[^}]*border-radius:\s*var\(--radius-3xl\);/s)
-    expect(conversationStyles).toMatch(/\.plan-review-input textarea\s*\{[^}]*border-radius:\s*var\(--radius-3xl\);/s)
+    expect(conversationStyles).toMatch(/\.approval-rejection-form textarea,\s*\.plan-review-rejection-form textarea\s*\{[^}]*border-radius:\s*var\(--radius-3xl\);/s)
     expect(settingsStyles).toMatch(/@media \(max-width:\s*440px\)[\s\S]*\.settings-dialog\s*\{[^}]*border-radius:\s*var\(--radius-3xl\);/s)
     expect(conversationStyles).not.toMatch(/\.markdown-content--article \.markdown-code-block\s*\{[^}]*border-radius:/s)
     expect(uiStyles).toMatch(/\.ui-button\.is-selected\s*\{[^}]*background:\s*var\(--color-brand-soft\);/s)

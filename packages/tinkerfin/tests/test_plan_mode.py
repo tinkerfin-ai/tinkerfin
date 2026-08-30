@@ -7,18 +7,21 @@ import inspect
 import logging
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
+from datetime import time
 from typing import Any, TypedDict, cast
 from uuid import uuid4
 
 import pytest
 from ag_ui.core import (
     BaseEvent,
+    MessagesSnapshotEvent,
     RunErrorEvent,
     RunFinishedEvent,
     RunFinishedInterruptOutcome,
     RunFinishedSuccessOutcome,
     StateDeltaEvent,
     StateSnapshotEvent,
+    TextMessageContentEvent,
 )
 from ag_ui.core.types import ResumeEntry
 from deepagents import create_deep_agent
@@ -27,7 +30,11 @@ from deepagents.backends.utils import create_file_data
 from deepagents.graph import DeepAgentState
 from langchain.agents.middleware import TodoListMiddleware
 from langchain.agents.middleware.model_call_limit import ModelCallLimitExceededError
-from langchain.agents.middleware.types import AgentMiddleware, AgentState
+from langchain.agents.middleware.types import (
+    AgentMiddleware,
+    AgentState,
+    InputAgentState,
+)
 from langchain.tools import tool
 from langchain_core.callbacks.manager import CallbackManagerForLLMRun
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
@@ -54,7 +61,13 @@ from redis.exceptions import ResponseError
 
 import tinkerfin.plan as plan_api
 import tinkerfin.plan._runtime as plan_runtime_module
-from tinkerfin import AgUiResumeBinding, AgUiResumeCheckpoint, RunIdentity, TinkerFin
+from tinkerfin import (
+    AgUiResumeBinding,
+    AgUiResumeCheckpoint,
+    AgUiResumeRequest,
+    RunIdentity,
+    TinkerFin,
+)
 from tinkerfin._agui_lineage import (
     RUN_ID_METADATA_KEY,
     RUNTIME_PROFILE_METADATA_KEY,
@@ -80,6 +93,12 @@ from tinkerfin.plan import (
     StructuredPlanContent,
     StructuredPlanStep,
     TextQuestion,
+    TimeQuestion,
+)
+from tinkerfin.plan._clarification import (
+    build_response_schema,
+    create_clarification_binding,
+    validate_and_normalize_response,
 )
 from tinkerfin.plan._state import plan_state_update
 from tinkerfin.plan._workflow import PlanningWorkflowGraph
@@ -277,7 +296,6 @@ def _planner(
                 "name": "PlannerOutcome",
                 "args": {
                     "type": "draft",
-                    "clarification": None,
                     "draft": {
                         "goal": resolved_goal,
                         "assumptions": [],
@@ -308,7 +326,6 @@ def _markdown_planner(markdown: str) -> AIMessage:
                 "name": "PlannerOutcome",
                 "args": {
                     "type": "draft",
-                    "clarification": None,
                     "draft": {"markdown": markdown},
                 },
                 "id": "markdown-planner",
@@ -327,7 +344,6 @@ def _custom_plan_planner() -> AIMessage:
                 "name": "PlannerOutcome",
                 "args": {
                     "type": "draft",
-                    "clarification": None,
                     "draft": {
                         "summary": "Release safely",
                         "checks": ["Targeted tests pass"],
@@ -363,7 +379,6 @@ def _planner_clarification(
                 "name": "PlannerOutcome",
                 "args": {
                     "type": "clarify",
-                    "draft": None,
                     "clarification": {"questions": [question]},
                 },
                 "id": f"clarify-{question_id}",
@@ -403,7 +418,6 @@ def _planner_clarification_batch(
                 "name": "PlannerOutcome",
                 "args": {
                     "type": "clarify",
-                    "draft": None,
                     "clarification": {"questions": questions},
                 },
                 "id": "clarify-batch",
@@ -422,7 +436,6 @@ def _custom_planner_clarification() -> AIMessage:
                 "name": "PlannerOutcome",
                 "args": {
                     "type": "clarify",
-                    "draft": None,
                     "clarification": {
                         "questions": [
                             {
@@ -460,7 +473,6 @@ def _opaque_planner_clarification() -> AIMessage:
                 "name": "PlannerOutcome",
                 "args": {
                     "type": "clarify",
-                    "draft": None,
                     "clarification": {
                         "questions": [
                             {
@@ -488,8 +500,6 @@ def _accept_edit() -> AIMessage:
                 "name": "PlannerOutcome",
                 "args": {
                     "type": "accept_edit",
-                    "clarification": None,
-                    "draft": None,
                 },
                 "id": "accept-edit",
                 "type": "tool_call",
@@ -667,6 +677,7 @@ def test_plan_package_exports_only_the_current_contract() -> None:
         "ClarificationType",
         "ConfirmedPlan",
         "DateQuestion",
+        "DateTimeQuestion",
         "DefaultClarificationForm",
         "MarkdownPlanContent",
         "MultipleChoiceQuestion",
@@ -688,8 +699,102 @@ def test_plan_package_exports_only_the_current_contract() -> None:
         "StructuredPlanContent",
         "StructuredPlanStep",
         "TextQuestion",
+        "TimeQuestion",
         "clarification_type",
     }
+
+
+def test_time_clarification_validates_zone_precision_range_and_response() -> None:
+    binding = create_clarification_binding(DefaultClarificationForm)
+    form = cast(
+        DefaultClarificationForm,
+        binding.form_schema.model_validate(
+            {
+                "questions": [
+                    {
+                        "id": "deployment-time",
+                        "answerType": "time",
+                        "prompt": "Choose a deployment time",
+                        "required": True,
+                        "timeZone": "Asia/Shanghai",
+                        "minimum": "09:00",
+                        "maximum": "18:00",
+                    }
+                ]
+            }
+        ),
+    )
+    question = form.questions[0]
+    assert isinstance(question, TimeQuestion)
+    assert question.minimum == time(9, 0)
+    assert question.maximum == time(18, 0)
+    response_schema = build_response_schema(binding, form)
+
+    answers = validate_and_normalize_response(
+        binding,
+        form,
+        response_schema,
+        {
+            "type": "respond",
+            "answers": {
+                "deployment-time": {
+                    "status": "answered",
+                    "answerType": "time",
+                    "time": "09:30:00",
+                }
+            },
+        },
+    )
+
+    assert answers[0].value == {
+        "time": "09:30",
+        "timeZone": "Asia/Shanghai",
+    }
+    with pytest.raises(PlanClarificationResponseError):
+        validate_and_normalize_response(
+            binding,
+            form,
+            response_schema,
+            {
+                "type": "respond",
+                "answers": {
+                    "deployment-time": {
+                        "status": "answered",
+                        "answerType": "time",
+                        "time": "08:59:00",
+                    }
+                },
+            },
+        )
+    with pytest.raises(ValidationError, match="minute precision"):
+        binding.form_schema.model_validate(
+            {
+                "questions": [
+                    {
+                        "id": "seconds",
+                        "answerType": "time",
+                        "prompt": "Choose",
+                        "required": True,
+                        "timeZone": "UTC",
+                        "minimum": "09:00:01",
+                    }
+                ]
+            }
+        )
+    with pytest.raises(ValidationError, match="IANA time zone"):
+        binding.form_schema.model_validate(
+            {
+                "questions": [
+                    {
+                        "id": "zone",
+                        "answerType": "time",
+                        "prompt": "Choose",
+                        "required": True,
+                        "timeZone": "Not/A_Zone",
+                    }
+                ]
+            }
+        )
 
 
 @pytest.mark.parametrize("value", [1, "true", None, object()])
@@ -725,6 +830,7 @@ def test_plan_configuration_defaults_to_structured_and_freezes_custom_content() 
             content_schema=_CustomPlanContent,
             allowed_review_actions=(
                 PlanReviewAction.APPROVE,
+                PlanReviewAction.CANCEL,
                 PlanReviewAction.EDIT,
                 PlanReviewAction.RESPOND,
                 PlanReviewAction.REJECT,
@@ -747,7 +853,63 @@ def test_plan_configuration_defaults_to_structured_and_freezes_custom_content() 
     planner_schema = custom_options.contracts.planner_response_type.model_json_schema(
         by_alias=True
     )
+    assert planner_schema["type"] == "object"
     assert "_CustomPlanContent" in planner_schema["$defs"]
+    assert set(planner_schema["discriminator"]["mapping"]) == {
+        "clarify",
+        "draft",
+    }
+    clarify_schema = planner_schema["$defs"]["PlannerClarifyOutcome"]
+    draft_schema = planner_schema["$defs"]["PlannerDraftOutcome"]
+    assert set(clarify_schema["properties"]) == {"type", "clarification"}
+    assert set(draft_schema["properties"]) == {"type", "draft"}
+    assert set(clarify_schema["required"]) == {"type", "clarification"}
+    assert set(draft_schema["required"]) == {"type", "draft"}
+    assert all(
+        schema["additionalProperties"] is False
+        for schema in (clarify_schema, draft_schema)
+    )
+    edit_planner_schema = (
+        custom_options.contracts.planner_edit_response_type.model_json_schema(
+            by_alias=True
+        )
+    )
+    assert set(edit_planner_schema["discriminator"]["mapping"]) == {
+        "clarify",
+        "accept_edit",
+    }
+    accept_schema = edit_planner_schema["$defs"]["PlannerAcceptEditOutcome"]
+    assert set(accept_schema["properties"]) == {"type"}
+    assert accept_schema["required"] == ["type"]
+    assert accept_schema["additionalProperties"] is False
+    parsed_draft = custom_options.contracts.planner_response_type.model_validate(
+        {
+            "type": "draft",
+            "draft": {"summary": "Release", "checks": ["Tests pass"]},
+        }
+    )
+    assert parsed_draft.type == "draft"
+    assert parsed_draft.draft is not None
+    assert parsed_draft.clarification is None
+    with pytest.raises(ValidationError, match="union_tag_invalid"):
+        custom_options.contracts.planner_response_type.model_validate(
+            {"type": "accept_edit"}
+        )
+    with pytest.raises(ValidationError, match="union_tag_invalid"):
+        custom_options.contracts.planner_edit_response_type.model_validate(
+            {
+                "type": "draft",
+                "draft": {"summary": "Release", "checks": ["Tests pass"]},
+            }
+        )
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        custom_options.contracts.planner_response_type.model_validate(
+            {
+                "type": "draft",
+                "draft": {"summary": "Release", "checks": ["Tests pass"]},
+                "clarification": None,
+            }
+        )
     default_review_schema = custom_options.contracts.review_response.json_schema(
         by_alias=True
     )
@@ -769,6 +931,7 @@ def test_plan_configuration_defaults_to_structured_and_freezes_custom_content() 
         by_alias=True
     )
     assert review_schema["discriminator"]["mapping"]["edit"].endswith("/EditPlan")
+    assert review_schema["discriminator"]["mapping"]["cancel"].endswith("/CancelPlan")
     assert review_schema["$defs"]["EditPlan"]["properties"]["content"] == {
         "$ref": "#/$defs/_CustomPlanContent"
     }
@@ -1078,6 +1241,39 @@ async def test_plan_capable_default_is_native_and_needs_no_checkpointer() -> Non
 
 
 @pytest.mark.asyncio
+async def test_new_default_run_with_a_saver_does_not_build_the_planning_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def reject_planning_build(_runtime: object) -> PlanningWorkflowGraph[Any]:
+        raise AssertionError("a new default Run must not build the Planning graph")
+
+    monkeypatch.setattr(
+        plan_runtime_module.PlanCapableGraphRuntime,
+        "_planning_graph",
+        reject_planning_build,
+    )
+    definition = (
+        TinkerFin()
+        .plan(enabled=True)
+        .create_deep_agent(
+            model=_FakeModel(responses=[AIMessage(content="done")]),
+            tools=[],
+            checkpointer=InMemorySaver(),
+        )
+    )
+
+    parts = await _parts(
+        definition,
+        {"messages": [HumanMessage(content="Run", id="default-with-saver")]},
+        run_id="default-with-saver",
+        config={"configurable": {"thread_id": "plan-thread"}},
+        mode="default",
+    )
+
+    assert all("tinkerfin_plan" not in state for state in _root_values(parts))
+
+
+@pytest.mark.asyncio
 async def test_plan_run_requires_the_definition_checkpointer_only_when_selected() -> (
     None
 ):
@@ -1094,6 +1290,28 @@ async def test_plan_run_requires_the_definition_checkpointer_only_when_selected(
             definition,
             {"messages": [HumanMessage(content="Plan", id="plan-message")]},
             run_id="plan-no-saver",
+            config={"configurable": {"thread_id": "plan-thread"}},
+            mode="plan",
+        )
+
+
+@pytest.mark.asyncio
+async def test_plan_run_requires_a_planner_or_agent_model() -> None:
+    definition = (
+        TinkerFin()
+        .plan(enabled=True)
+        .create_deep_agent(
+            model=None,
+            tools=[],
+            checkpointer=InMemorySaver(),
+        )
+    )
+
+    with pytest.raises(PlanModeConfigurationError, match="model"):
+        await _parts(
+            definition,
+            {"messages": [HumanMessage(content="Plan", id="plan-message")]},
+            run_id="plan-no-model",
             config={"configurable": {"thread_id": "plan-thread"}},
             mode="plan",
         )
@@ -1295,12 +1513,19 @@ async def test_markdown_plan_review_edit_and_handoff_preserve_exact_text() -> No
     assert plan.confirmed_plan is not None
     assert plan.confirmed_plan.content.markdown == edited
     execution_input = model.model_inputs[-1]
-    handoff = next(
+    original_user = next(
         message
         for message in execution_input
         if isinstance(message, HumanMessage) and message.id == "markdown-request"
     )
-    handoff_text = str(handoff.content)
+    assert original_user.content == "Plan release"
+    handoff = next(
+        message
+        for message in execution_input
+        if isinstance(message, SystemMessage)
+        and "<tinkerfin-approved-plan" in str(message.content)
+    )
+    handoff_text = handoff.text
     assert 'content-type="text/markdown"' in handoff_text
     assert "schema=" not in handoff_text
     assert edited in handoff_text
@@ -1402,24 +1627,85 @@ async def test_plan_approval_hands_off_to_native_with_the_same_message_id() -> N
     assert plan.handoff is not None
     final_messages = cast(Sequence[BaseMessage], final["messages"])
     assert final_messages[-1].content == "native done"
+    original_user = next(
+        message
+        for message in final_messages
+        if isinstance(message, HumanMessage) and message.id == "request-1"
+    )
+    assert original_user.content == "Implement"
+    assert not any(
+        "<tinkerfin-approved-plan" in str(message.content) for message in final_messages
+    )
     execution_input = model.model_inputs[-1]
-    handoff_message = next(
+    handoff_user = next(
         message
         for message in execution_input
         if isinstance(message, HumanMessage) and message.id == "request-1"
     )
-    assert "<tinkerfin-approved-plan" in str(handoff_message.content)
-    assert plan.handoff.digest in str(handoff_message.content)
-    assert not any(
-        isinstance(message, SystemMessage)
-        and "<tinkerfin-approved-plan" in str(message.content)
+    assert handoff_user.content == "Implement"
+    handoff_system = next(
+        message
         for message in execution_input
+        if isinstance(message, SystemMessage)
+        and "<tinkerfin-approved-plan" in str(message.content)
     )
+    assert plan.handoff.digest in str(handoff_system.content)
+    assert "<tinkerfin-approved-plan" not in repr(completed)
     assert all(
         "execute_deep_agent:" not in "|".join(cast(tuple[str, ...], part["ns"]))
         for part in completed
     )
     assert _root_interrupts(first)[0].value["kind"] == "tinkerfin:plan_review"
+
+
+@pytest.mark.asyncio
+async def test_plan_handoff_preserves_user_content_blocks_exactly() -> None:
+    model = _FakeModel(responses=[_planner(), AIMessage(content="native done")])
+    definition = (
+        TinkerFin()
+        .plan(enabled=True)
+        .create_deep_agent(
+            model=model,
+            tools=[],
+            checkpointer=InMemorySaver(),
+        )
+    )
+    content: list[str | dict[Any, Any]] = [
+        {"type": "text", "text": "Implement from blocks"},
+        {"type": "text", "text": "Keep this shape"},
+    ]
+    request = HumanMessage(content=content, id="block-user")
+    config = {"configurable": {"thread_id": "plan-thread"}}
+    await _parts(
+        definition,
+        {"messages": [request]},
+        run_id="block-review",
+        config=config,
+        mode="plan",
+    )
+    completed = await _parts(
+        definition,
+        Command(resume={"type": "approve", "baseRevision": 1}),
+        run_id="block-execution",
+        config=config,
+        mode="default",
+    )
+
+    execution_user = next(
+        message
+        for message in model.model_inputs[-1]
+        if isinstance(message, HumanMessage) and message.id == "block-user"
+    )
+    assert execution_user.content == content
+    final_user = next(
+        message
+        for message in cast(
+            Sequence[BaseMessage], _root_values(completed)[-1]["messages"]
+        )
+        if isinstance(message, HumanMessage) and message.id == "block-user"
+    )
+    assert final_user.content == content
+    assert request.content == content
 
 
 @pytest.mark.asyncio
@@ -1482,9 +1768,18 @@ async def test_real_redis_plan_approval_executes_native_handoff(
         assert any(
             isinstance(message, HumanMessage)
             and message.id == "request-redis"
+            and message.content == "Implement"
+            for message in execution_input
+        )
+        assert any(
+            isinstance(message, SystemMessage)
             and "<tinkerfin-approved-plan" in str(message.content)
             for message in execution_input
         )
+        serialized_events = "\n".join(
+            event.model_dump_json(by_alias=True) for event in completed
+        )
+        assert "<tinkerfin-approved-plan" not in serialized_events
     finally:
         try:
             await saver.adelete_thread(thread_id)
@@ -1683,6 +1978,19 @@ async def test_agui_plan_resume_checkpoints_durably_and_retries_without_reexecut
 
     _assert_success(events)
     assert len(checkpoints) == 1
+    serialized_events = "\n".join(
+        event.model_dump_json(by_alias=True) for event in events
+    )
+    assert "<tinkerfin-approved-plan" not in serialized_events
+    assert "_tinkerfin_plan_handoff_digest" not in serialized_events
+    snapshots = [event for event in review if isinstance(event, MessagesSnapshotEvent)]
+    assert snapshots
+    assert [
+        message.content
+        for snapshot in snapshots
+        for message in snapshot.messages
+        if message.role == "user"
+    ] == ["Implement"]
     assert all(
         "_tinkerfin_resume" not in event.snapshot
         and "_tinkerfin_lineage" not in event.snapshot
@@ -1914,6 +2222,92 @@ async def test_native_conversation_continues_after_plan_handoff() -> None:
 
 
 @pytest.mark.asyncio
+async def test_concurrent_plan_handoffs_isolate_transient_system_context() -> None:
+    model = _FakeModel(
+        responses=[
+            _planner(goal="Execute alpha"),
+            _planner(goal="Execute beta"),
+            AIMessage(content="alpha done"),
+            AIMessage(content="beta done"),
+        ]
+    )
+    definition = (
+        TinkerFin()
+        .plan(enabled=True)
+        .create_deep_agent(
+            model=model,
+            tools=[],
+            checkpointer=InMemorySaver(),
+        )
+    )
+    graph = await definition.create_graph(mode="plan")
+
+    async def collect(
+        graph_input: InputAgentState | Command[object] | None,
+        *,
+        thread_id: str,
+    ) -> list[Mapping[str, object]]:
+        return [
+            part
+            async for part in graph.astream(
+                graph_input,
+                config={"configurable": {"thread_id": thread_id}},
+                stream_mode=["messages", "tasks", "values"],
+                version="v2",
+                subgraphs=True,
+            )
+        ]
+
+    await collect(
+        {"messages": [HumanMessage(content="Alpha request", id="alpha-user")]},
+        thread_id="alpha-thread",
+    )
+    await collect(
+        {"messages": [HumanMessage(content="Beta request", id="beta-user")]},
+        thread_id="beta-thread",
+    )
+    executions = await asyncio.gather(
+        collect(
+            Command(resume={"type": "approve", "baseRevision": 1}),
+            thread_id="alpha-thread",
+        ),
+        collect(
+            Command(resume={"type": "approve", "baseRevision": 1}),
+            thread_id="beta-thread",
+        ),
+    )
+
+    model_inputs = [
+        messages
+        for messages in model.model_inputs
+        if any(
+            isinstance(message, SystemMessage)
+            and "<tinkerfin-approved-plan" in message.text
+            for message in messages
+        )
+    ]
+    assert len(model_inputs) == 2
+    by_user_id = {
+        cast(str, user.id): (user, system)
+        for messages in model_inputs
+        for user in messages
+        if isinstance(user, HumanMessage) and user.id in {"alpha-user", "beta-user"}
+        for system in messages
+        if isinstance(system, SystemMessage)
+        and "<tinkerfin-approved-plan" in system.text
+    }
+    alpha_user, alpha_system = by_user_id["alpha-user"]
+    beta_user, beta_system = by_user_id["beta-user"]
+    assert alpha_user.content == "Alpha request"
+    assert beta_user.content == "Beta request"
+    assert "Execute alpha" in alpha_system.text
+    assert "Execute beta" not in alpha_system.text
+    assert "Execute beta" in beta_system.text
+    assert "Execute alpha" not in beta_system.text
+    assert "<tinkerfin-approved-plan" not in repr(executions)
+
+
+@pytest.mark.asyncio
 async def test_plan_default_plan_with_todos_regresses_historical_correlation_failure() -> (
     None
 ):
@@ -2120,7 +2514,12 @@ async def test_completed_resume_uses_the_exact_planning_snapshot(
         TinkerFin()
         .plan(enabled=True)
         .create_deep_agent(
-            model=_FakeModel(responses=[_planner()]),
+            model=_FakeModel(
+                responses=[
+                    _planner(),
+                    AIMessage(content="The rejected draft will not be executed."),
+                ]
+            ),
             tools=[],
             checkpointer=InMemorySaver(),
         )
@@ -2148,21 +2547,21 @@ async def test_completed_resume_uses_the_exact_planning_snapshot(
     _assert_success(resolved)
 
     async def stale_checkpoint_state(
-        _planning: object,
+        _checkpointer: object,
         _config: RunnableConfig,
     ) -> dict[str, object]:
         return plan_state_update(PlanState[StructuredPlanContent]())
 
     monkeypatch.setattr(
         plan_runtime_module,
-        "_checkpoint_state",
+        "_plan_checkpoint_channels",
         stale_checkpoint_state,
     )
 
-    native_astream = cast(Any, definition)._build_astream("plan")
+    graph = await definition.create_graph(mode="plan")
     replayed = [
         part
-        async for part in native_astream(
+        async for part in graph.astream(
             Command(resume={"type": "reject", "baseRevision": 1}),
             config={
                 "configurable": {
@@ -2179,7 +2578,7 @@ async def test_completed_resume_uses_the_exact_planning_snapshot(
 
     assert (
         _structured_plan_state(_root_values(replayed)[-1]["tinkerfin_plan"]).status
-        is PlanStatus.CANCELLED
+        is PlanStatus.AWAITING_INPUT
     )
 
 
@@ -2793,7 +3192,7 @@ async def test_natural_language_feedback_creates_one_revised_draft() -> None:
 
 
 @pytest.mark.asyncio
-async def test_review_rejects_stale_revision_and_reject_ends_planning() -> None:
+async def test_review_rejects_stale_revision_and_reject_waits_for_plan_input() -> None:
     config = {"configurable": {"thread_id": "plan-thread"}}
     definition = (
         TinkerFin()
@@ -2824,7 +3223,13 @@ async def test_review_rejects_stale_revision_and_reject_ends_planning() -> None:
         TinkerFin()
         .plan(enabled=True)
         .create_deep_agent(
-            model=_FakeModel(responses=[_planner()]),
+            model=_FakeModel(
+                responses=[
+                    _planner(),
+                    AIMessage(content="I will keep planning without that draft."),
+                    _planner(suffix=" revised"),
+                ]
+            ),
             tools=[],
             checkpointer=InMemorySaver(),
         )
@@ -2841,11 +3246,178 @@ async def test_review_rejects_stale_revision_and_reject_ends_planning() -> None:
         Command(resume={"type": "reject", "baseRevision": 1}),
         run_id="reject-2",
         config=config,
-        mode="default",
+        mode="plan",
     )
     plan = _structured_plan_state(_root_values(rejected)[-1]["tinkerfin_plan"])
-    assert plan.status is PlanStatus.CANCELLED
-    assert plan.effective_mode == "default"
+    assert plan.status is PlanStatus.AWAITING_INPUT
+    assert plan.effective_mode == "plan"
+    assert plan.review_action is PlanReviewAction.REJECT
+    assert plan.review_reason is None
+    root_messages = [
+        cast(tuple[BaseMessage, object], part["data"])[0]
+        for part in rejected
+        if part["type"] == "messages" and part["ns"] == ()
+    ]
+    assert (
+        sum(
+            isinstance(message, AIMessage)
+            and message.content == "I will keep planning without that draft."
+            for message in root_messages
+        )
+        == 1
+    )
+
+    continued = await _parts(
+        definition,
+        {"messages": [HumanMessage(content="Use a smaller scope", id="message-3")]},
+        run_id="reject-3",
+        config=config,
+        mode="plan",
+    )
+    continued_plan = _structured_plan_state(
+        _root_values(continued)[-1]["tinkerfin_plan"]
+    )
+    assert continued_plan.status is PlanStatus.AWAITING_REVIEW
+    assert continued_plan.effective_mode == "plan"
+    assert continued_plan.revision == 2
+    assert continued_plan.request_message_id == "message-3"
+
+
+@pytest.mark.asyncio
+async def test_review_cancel_keeps_plan_mode_and_replies_once() -> None:
+    model = _FakeModel(
+        responses=[
+            _planner(),
+            AIMessage(content="The current draft is cancelled; we can keep planning."),
+        ]
+    )
+    definition = (
+        TinkerFin()
+        .plan(
+            enabled=True,
+            allowed_review_actions=(
+                PlanReviewAction.APPROVE,
+                PlanReviewAction.REJECT,
+                PlanReviewAction.CANCEL,
+            ),
+        )
+        .create_deep_agent(
+            model=model,
+            tools=[],
+            checkpointer=InMemorySaver(),
+        )
+    )
+    config = {"configurable": {"thread_id": "plan-thread"}}
+    review = await _parts(
+        definition,
+        {"messages": [HumanMessage(content="Implement", id="cancel-message")]},
+        run_id="cancel-1",
+        config=config,
+        mode="plan",
+    )
+    schema = _root_interrupts(review)[0].value["responseSchema"]
+    assert set(schema["discriminator"]["mapping"]) == {
+        "approve",
+        "reject",
+        "cancel",
+    }
+
+    cancelled = await _parts(
+        definition,
+        Command(resume={"type": "cancel", "baseRevision": 1}),
+        run_id="cancel-2",
+        config=config,
+        mode="plan",
+    )
+    plan = _structured_plan_state(_root_values(cancelled)[-1]["tinkerfin_plan"])
+    assert plan.status is PlanStatus.AWAITING_INPUT
+    assert plan.effective_mode == "plan"
+    assert plan.review_action is PlanReviewAction.CANCEL
+    assert plan.review_reason is None
+    root_messages = [
+        cast(tuple[BaseMessage, object], part["data"])[0]
+        for part in cancelled
+        if part["type"] == "messages" and part["ns"] == ()
+    ]
+    assert (
+        sum(
+            isinstance(message, AIMessage)
+            and message.content
+            == "The current draft is cancelled; we can keep planning."
+            for message in root_messages
+        )
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_agui_plan_cancel_resolves_the_card_and_streams_one_reply() -> None:
+    reply = "The draft is cancelled, and Planning remains active."
+    definition = (
+        TinkerFin()
+        .plan(
+            enabled=True,
+            allowed_review_actions=(
+                PlanReviewAction.APPROVE,
+                PlanReviewAction.REJECT,
+                PlanReviewAction.CANCEL,
+            ),
+        )
+        .create_deep_agent(
+            model=_FakeModel(responses=[_planner(), AIMessage(content=reply)]),
+            tools=[],
+            checkpointer=InMemorySaver(),
+        )
+    )
+    config = {"configurable": {"thread_id": "plan-thread"}}
+    review = await _agui_events(
+        definition,
+        {"messages": [HumanMessage(content="Implement", id="agui-cancel-message")]},
+        run_id="agui-cancel-1",
+        config=config,
+        mode="plan",
+    )
+    binding = _plan_binding(
+        _terminal(review),
+        payload={"type": "cancel", "baseRevision": 1},
+    )
+
+    cancelled = await _agui_events(
+        definition,
+        None,
+        run_id="agui-cancel-2",
+        config=config,
+        mode="plan",
+        resume=binding,
+    )
+
+    _assert_success(cancelled)
+    assert (
+        "".join(
+            event.delta
+            for event in cancelled
+            if isinstance(event, TextMessageContentEvent)
+        )
+        == reply
+    )
+    snapshots = [event for event in cancelled if isinstance(event, StateSnapshotEvent)]
+    assert snapshots
+    initial_plan = _structured_plan_state(snapshots[-1].snapshot["tinkerfin_plan"])
+    assert initial_plan.status is PlanStatus.AWAITING_REVIEW
+    operations = [
+        operation
+        for event in cancelled
+        if isinstance(event, StateDeltaEvent)
+        for operation in event.delta
+    ]
+    assert {
+        (operation.get("path"), operation.get("value")) for operation in operations
+    }.issuperset(
+        {
+            ("/tinkerfin_plan/status", PlanStatus.AWAITING_INPUT.value),
+            ("/tinkerfin_plan/reviewAction", PlanReviewAction.CANCEL.value),
+        }
+    )
 
 
 @pytest.mark.asyncio
@@ -3028,10 +3600,15 @@ async def test_plan_enabled_default_subagent_resume_uses_only_the_native_head(
     interrupt = outcome.interrupts[0]
     assert interrupt.tool_call_id is not None
     assert ScopedIdCodec().decode(interrupt.tool_call_id)[1]
-    binding = AgUiResumeBinding.from_agui(
+    request = AgUiResumeRequest(
         entries=(_resume_entry(interrupt.id, {"type": "approve"}),),
-        interrupts=outcome.interrupts,
     )
+    binding = await definition.prepare_agui_resume(
+        identity=RunIdentity(threadId=thread_id, runId="subagent-resume"),
+        request=request,
+        mode="default",
+    )
+    assert binding.prior_tool_call_ids == (interrupt.tool_call_id,)
 
     caplog.clear()
     caplog.set_level(logging.WARNING, logger="langgraph")
@@ -3049,6 +3626,125 @@ async def test_plan_enabled_default_subagent_resume_uses_only_the_native_head(
     assert not any(
         "Ignoring unknown node name" in record.getMessage() for record in caplog.records
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.redis_e2e
+async def test_real_redis_public_subagent_resume_recovers_dynamic_messages(
+    redis_checkpoint_url: str,
+) -> None:
+    token = uuid4().hex
+    thread_id = f"tinkerfin-subagent-resume-{token}"
+    checkpoint_prefix = f"tinkerfin:test:subagent:{token}:checkpoint"
+    write_prefix = f"tinkerfin:test:subagent:{token}:write"
+    client = Redis.from_url(
+        redis_checkpoint_url,
+        decode_responses=False,
+        socket_connect_timeout=5,
+        socket_timeout=5,
+    )
+    saver = AsyncRedisSaver(
+        redis_client=client,
+        checkpoint_prefix=checkpoint_prefix,
+        checkpoint_write_prefix=write_prefix,
+    )
+    try:
+        await saver.asetup()
+        model = _FakeModel(
+            responses=[
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "task",
+                            "args": {
+                                "description": "Run the reviewed child tool",
+                                "subagent_type": "general-purpose",
+                            },
+                            "id": "redis-parent-task-call",
+                            "type": "tool_call",
+                        }
+                    ],
+                ),
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "approved_tool",
+                            "args": {"value": "redis-child"},
+                            "id": "redis-child-approved-call",
+                            "type": "tool_call",
+                        }
+                    ],
+                ),
+                AIMessage(content="child done"),
+                AIMessage(content="root done"),
+            ]
+        )
+        definition = TinkerFin().create_deep_agent(
+            model=model,
+            tools=[approved_tool],
+            interrupt_on={"approved_tool": {"allowed_decisions": ["approve"]}},
+            checkpointer=saver,
+        )
+        config = {"configurable": {"thread_id": thread_id}}
+        review = await _agui_events(
+            definition,
+            {"messages": [HumanMessage(content="Delegate", id="redis-message")]},
+            run_id="redis-subagent-review",
+            config=config,
+            thread_id=thread_id,
+        )
+        outcome = _terminal(review).outcome
+        assert outcome is not None and outcome.type == "interrupt"
+        interrupt = outcome.interrupts[0]
+        request = AgUiResumeRequest(
+            entries=(_resume_entry(interrupt.id, {"type": "approve"}),),
+        )
+        binding = await definition.prepare_agui_resume(
+            identity=RunIdentity(
+                threadId=thread_id,
+                runId="redis-subagent-resume",
+            ),
+            request=request,
+        )
+
+        assert binding.prior_tool_call_ids == (interrupt.tool_call_id,)
+        completed = await _agui_events(
+            definition,
+            None,
+            run_id="redis-subagent-resume",
+            config=config,
+            thread_id=thread_id,
+            resume=binding,
+        )
+        _assert_success(completed)
+    finally:
+        try:
+            await saver.adelete_thread(thread_id)
+        finally:
+            registry_keys = [
+                key
+                async for key in client.scan_iter(
+                    match=f"write_keys_zset:{thread_id}:*",
+                    count=100,
+                )
+            ]
+            latest_keys = [
+                key
+                async for key in client.scan_iter(
+                    match=f"{checkpoint_prefix}_latest:{thread_id}:*",
+                    count=100,
+                )
+            ]
+            if registry_keys or latest_keys:
+                await client.unlink(*registry_keys, *latest_keys)
+            for index_name in (checkpoint_prefix, write_prefix):
+                try:
+                    await client.execute_command("FT.DROPINDEX", index_name, "DD")
+                except ResponseError:
+                    pass
+            await client.aclose()
 
 
 @pytest.mark.asyncio

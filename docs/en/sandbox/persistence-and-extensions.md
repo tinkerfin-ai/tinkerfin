@@ -70,7 +70,8 @@ Path("opensandbox-schema.sql").write_text(schema.ddl, encoding="utf-8")
 ```
 
 `dialect` is `mysql` or `sqlite`. The returned value also provides `table_names`.
-Runtime startup still validates the deployed structure.
+Runtime startup still validates the complete deployed table, column, primary-key, and
+index structure, including the exact index set and uniqueness flags.
 
 ## Warm capacity
 
@@ -112,11 +113,15 @@ Implement `OpenSandboxState` to store bindings and leases in an existing databas
 | --- | --- |
 | Lifetime | `start()`, `aclose()` |
 | Owner | `acquire_owner()`, `renew_owner()`, `bind_owner()`, `unbind_owner()`, `release_owner()`, `read_binding()` |
-| Warm pool | `claim_warm_slot()`, `renew_warm()`, `publish_warm()`, `release_warm()`, `consume_warm()` |
+| Warm pool | `claim_warm_slot()`, `claim_ready_warm_slot()`, `renew_warm()`, `publish_warm()`, `discard_ready_warm_slot()`, `release_warm()`, `warm_pool_ready()`, `consume_warm()` |
 | Cleanup | `enqueue_cleanup()`, `claim_cleanup()`, `renew_cleanup()`, `complete_cleanup()`, `release_cleanup()` |
 | Shutdown recovery | `shutdown_sandbox_ids()` |
 
-A custom implementation needs atomic claims, generation fencing, lease renewal, and idempotent release. After an uncertain network result, never destroy a Sandbox that may already be the authoritative binding.
+A custom implementation needs atomic claims, generation fencing, lease renewal, and
+idempotent release. Ready-slot claims must preserve the published ID while it is probed;
+discarding a proven unusable ID must clear the slot and enqueue cleanup in one atomic
+transition. After an uncertain network result, never destroy a Sandbox that may already
+be the authoritative binding.
 
 `InMemoryOpenSandboxState(namespace=...)` demonstrates the behavior but does not share state across processes.
 

@@ -56,6 +56,9 @@ export function ConversationItem({
 }) {
   const { t } = useI18n()
   const requiresAttention = conversation.runStatus === 'waiting_approval'
+    || conversation.pendingInteractionKind != null
+    || Boolean(conversation.approval && !conversation.approval.submitted)
+    || Boolean(conversation.planInteraction && !conversation.planInteraction.submitted)
   // 已水化交互优先，历史摘要保证首次渲染使用同一业务类型
   const attentionTone = conversation.planInteraction && !conversation.planInteraction.submitted
     ? conversation.planInteraction.kind === 'review' ? 'approval' : 'plan'

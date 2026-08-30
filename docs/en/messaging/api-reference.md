@@ -9,6 +9,7 @@
 | `Messaging(...)` | `backend=None`, `settlement_timeout=None` | Create one application lifecycle |
 | `Messaging.channel(...)` | name, optional codec and renderer | Create a reusable channel |
 | `Messaging.aclose()` | none | Settle preflight, producers, and cleanup |
+| `create_agui_run_source(...)` | identity, `open_events`, optional transform | Create the ordinary lazy TinkerFin AG-UI source |
 
 The default backend is `MemoryBackend`.
 
@@ -16,9 +17,9 @@ The default backend is `MemoryBackend`.
 
 | Method | Main parameters | Result |
 | --- | --- | --- |
-| `sse(...)` | source, optional RunIdentity, after, cancel, on_committed | SSE byte iterator |
-| `wrap(...)` | source, optional RunIdentity, after, cancel, on_committed | `MessageSubscription` |
-| `wrap_recoverable(...)` | recoverable source, optional RunIdentity, after, cancel, on_committed | Recoverable subscription |
+| `sse(...)` | source, optional identity, after, callbacks | Caller-owned closeable SSE byte iterator |
+| `wrap(...)` | source, optional identity, after, callbacks | `MessageSubscription` |
+| `wrap_recoverable(...)` | recoverable source, optional identity, after, callbacks | Recoverable subscription |
 | `read(...)` | RunIdentity, `after=0`, `limit=100` | Ascending finite page |
 | `follow(...)` | RunIdentity, `after=0` | Follow a run to its terminal state |
 | `get_run_status(...)` | RunIdentity | Current authoritative run status |
@@ -49,7 +50,24 @@ RunIdentity is optional only when the source advertises an immutable profile.
 | `payload` | Encoded bytes |
 | `created_at` | Aware UTC timestamp |
 
-## Source helpers
+## Common helpers
+
+| API | Purpose |
+| --- | --- |
+| `create_agui_run_source(...)` | Hide Binding, codec/type profile, transform, and first-event cancellation while opening one managed AG-UI run only for the owner |
+| `parse_sse_event_id(value)` | Parse `None` or canonical non-negative ASCII decimal SSE IDs |
+| `is_active_run_status(status)` | TypeGuard for `running` and `cancel_requested` |
+| `is_final_run_status(status)` | TypeGuard for all terminal durable statuses |
+| `is_failed_run_status(status)` | TypeGuard for `failed` and `owner_lost` |
+
+The status helpers are pure and perform no backend I/O.
+The common AG-UI source transform can enrich product metadata or content only. It rejects
+event-type substitutions and changes to Run, message, Tool, snapshot, or interrupt IDs.
+It also preserves every field of an optional `RUN_STARTED.input`, including messages,
+tools, context, forwarded props, and resume entries. Use advanced `map_source()` when
+changing the output protocol is intentional.
+
+## Advanced source helpers
 
 | API | Purpose |
 | --- | --- |
@@ -104,6 +122,11 @@ RunIdentity is optional only when the source advertises an immutable profile.
 | `CancelCallback` | Zero arguments or one `CancelContext`; may return a finite tail |
 | `CancelContext` | Immutable channel and RunIdentity |
 | `CommittedCallback` | Receives owner commits after append |
+| `on_source_starting` | Owner-only async callback after source preflight and before producer creation |
+| `on_delivery_not_started` | Async cleanup when neither producer nor attachment was established |
+
+Attachments invoke neither delivery callback. `on_owner_preflight` belongs to the source
+and runs before `on_source_starting`; the two callbacks are not interchangeable.
 
 ## Common errors
 

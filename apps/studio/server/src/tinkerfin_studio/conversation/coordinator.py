@@ -12,10 +12,16 @@ from ag_ui.core import BaseEvent
 from ag_ui.core.types import ResumeEntry
 
 from tinkerfin import AgUiResumeCheckpoint, RunIdentity
-from tinkerfin_messaging import RunNotFound
+from tinkerfin_messaging import RunNotFound, is_active_run_status
 from tinkerfin_messaging.messaging import MessageChannel
 from tinkerfin_studio.infrastructure.database import Database
-from tinkerfin_tracing import Tracer, TraceThread, TraceThreadNotFound, TraceUpdate
+from tinkerfin_tracing import (
+    Tracer,
+    TraceRunNotFound,
+    TraceThread,
+    TraceThreadNotFound,
+    TraceUpdate,
+)
 
 from .repository import ConversationRepository
 
@@ -142,7 +148,7 @@ class ConversationTraceCoordinator:
                     candidate.identity.thread_id,
                     head_run_id=candidate.identity.run_id,
                 )
-            except TraceThreadNotFound:
+            except (TraceRunNotFound, TraceThreadNotFound):
                 try:
                     producer_status = await self._conversation_channel.get_run_status(
                         identity=candidate.identity
@@ -150,7 +156,7 @@ class ConversationTraceCoordinator:
                 except RunNotFound:
                     producer_status = None
                 # Messaging 只证明当前 owner 是否存活，终态不能替代 Trace 的 Agent 结果
-                if producer_status in {"running", "cancel_requested"}:
+                if is_active_run_status(producer_status):
                     continue
                 deletions.append(candidate)
             else:
@@ -198,6 +204,9 @@ class ConversationTraceCoordinator:
                     thread_pk=thread_pk,
                     identity=identity,
                 )
+            except (TraceRunNotFound, TraceThreadNotFound):
+                # Deferred Agent 初始化期间 Run 尚未写入 Ledger 是预期等待，不属于 Trace 损坏
+                terminal = False
             except Exception as error:  # noqa: BLE001 - owner retries ordinary failures
                 # Trace 是唯一权威；摘要失败只能退避重建，不能永久放弃当前 Run
                 logger.warning(
@@ -227,50 +236,34 @@ class ConversationTraceCoordinator:
             head_run_id=identity.run_id,
         )
         await self._persist_thread(thread_pk=thread_pk, trace=trace)
-        if trace.status.execution not in {"running"}:
+        if trace.summary.status.execution != "running":
             return True
-        pending = {
-            item.id: item.kind
-            for item in trace.interactions
-            if item.status == "pending"
-        }
         updates = trace.follow()
         try:
             async for update in updates:
-                for interaction_id in update.interactions.removes:
-                    pending.pop(interaction_id, None)
-                for interaction in update.interactions.upserts:
-                    if interaction.status == "pending":
-                        pending[interaction.id] = interaction.kind
-                    else:
-                        pending.pop(interaction.id, None)
                 await self._persist_update(
                     thread_pk=thread_pk,
                     update=update,
-                    pending=pending,
                     generation=trace.key.generation,
                 )
-                if update.status.execution != "running":
+                if update.summary.status.execution != "running":
                     return True
         finally:
             await updates.aclose()
         return False
 
     async def _persist_thread(self, *, thread_pk: int, trace: TraceThread) -> None:
-        pending = {
-            item.id: item.kind
-            for item in trace.interactions
-            if item.status == "pending"
-        }
+        summary = trace.summary
+        pending = summary.pending_interactions
         await self._write_summary(
             thread_pk=thread_pk,
             run_id=trace.head_run_id,
-            execution=trace.status.execution,
-            message_count=trace.message_count,
-            tool_call_count=trace.tool_call_count,
+            execution=summary.status.execution,
+            message_count=summary.message_count,
+            tool_call_count=summary.tool_call_count,
             has_pending_interrupt=bool(pending),
-            pending_interaction_kind=_pending_kind(pending.values()),
-            updated_at=_trace_activity_at(trace),
+            pending_interaction_kind=_pending_kind(item.kind for item in pending),
+            updated_at=_database_time(summary.last_occurred_at),
             settlement_id=f"trace:{trace.key.generation}:{trace.as_of_seq}",
         )
 
@@ -279,18 +272,19 @@ class ConversationTraceCoordinator:
         *,
         thread_pk: int,
         update: TraceUpdate,
-        pending: dict[str, str],
         generation: str,
     ) -> None:
+        summary = update.summary
+        pending = summary.pending_interactions
         await self._write_summary(
             thread_pk=thread_pk,
-            run_id=update.status.head_run_id,
-            execution=update.status.execution,
-            message_count=update.message_count,
-            tool_call_count=update.tool_call_count,
+            run_id=summary.status.head_run_id,
+            execution=summary.status.execution,
+            message_count=summary.message_count,
+            tool_call_count=summary.tool_call_count,
             has_pending_interrupt=bool(pending),
-            pending_interaction_kind=_pending_kind(pending.values()),
-            updated_at=_update_activity_at(update),
+            pending_interaction_kind=_pending_kind(item.kind for item in pending),
+            updated_at=_database_time(summary.last_occurred_at),
             settlement_id=f"trace:{generation}:{update.as_of_seq}",
         )
 
@@ -364,32 +358,6 @@ def _pending_kind(values: Iterable[str]) -> str | None:
     }
     resolved = {mapped.get(kind, "input_required") for kind in kinds}
     return next(iter(resolved)) if len(resolved) == 1 else "input_required"
-
-
-def _trace_activity_at(trace: TraceThread) -> datetime:
-    values = [
-        value
-        for message in trace.messages
-        for value in (message.created_at, message.completed_at)
-        if value is not None
-    ]
-    values.extend(
-        value
-        for node in trace.tree.nodes
-        for value in (node.started_at, node.completed_at)
-        if value is not None
-    )
-    values.extend(
-        value
-        for interaction in trace.interactions
-        for value in (interaction.opened_at, interaction.resolved_at)
-        if value is not None
-    )
-    return _database_time(max(values, default=datetime.now(UTC)))
-
-
-def _update_activity_at(update: TraceUpdate) -> datetime:
-    return _database_time(max(fact.occurred_at for fact in update.facts))
 
 
 def _database_time(value: datetime) -> datetime:

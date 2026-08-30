@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import json
 import subprocess
 import sys
 import textwrap
@@ -265,6 +266,54 @@ def test_root_stub_does_not_export_low_level_source_contracts() -> None:
         "NativeTinkerFinRun",
         "TinkerFinRun",
     }.isdisjoint(imported)
+
+
+def test_generated_stubs_reject_third_party_ghost_exports(tmp_path: Path) -> None:
+    import tinkerfin
+    import tinkerfin.deep_agent as deep_agent_module
+
+    assert not hasattr(tinkerfin, "DeepAgentState")
+    assert not hasattr(tinkerfin, "create_deep_agent")
+    assert not hasattr(deep_agent_module, "create_deep_agent")
+    for stub in (_INIT_STUB, _DEEP_AGENT_STUB):
+        module = ast.parse(stub.read_text(encoding="utf-8"))
+        assert all(
+            alias.name != "*"
+            for node in module.body
+            if isinstance(node, ast.ImportFrom)
+            for alias in node.names
+        )
+
+    fixture = tmp_path / "ghost_exports.py"
+    fixture.write_text(
+        "from tinkerfin import DeepAgentState, create_deep_agent\n"
+        "from tinkerfin.deep_agent import create_deep_agent as module_factory\n",
+        encoding="utf-8",
+    )
+    pyright = Path(sys.executable).with_name("pyright")
+    completed = subprocess.run(
+        [
+            str(pyright),
+            "--pythonpath",
+            sys.executable,
+            "--outputjson",
+            str(fixture),
+        ],
+        cwd=_REPOSITORY_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    report = json.loads(completed.stdout)
+    diagnostics = report["generalDiagnostics"]
+
+    assert completed.returncode == 1
+    assert report["summary"]["errorCount"] == 3
+    assert all(
+        diagnostic["rule"] == "reportAttributeAccessIssue"
+        and "unknown import symbol" in diagnostic["message"]
+        for diagnostic in diagnostics
+    )
 
 
 def test_root_stub_keeps_plan_annotation_dependencies_private() -> None:

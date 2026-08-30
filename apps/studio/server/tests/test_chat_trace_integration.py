@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
 from types import SimpleNamespace
 from typing import cast
 
@@ -281,15 +280,37 @@ async def test_same_run_rejects_a_changed_registered_runtime_profile(session) ->
 class _Channel:
     def __init__(self) -> None:
         self.after: int | None = None
+        self.body: _Body | None = None
 
-    async def sse(self, _source, *, after: int | None = None):
+    async def sse(
+        self,
+        _source,
+        *,
+        after: int | None = None,
+        on_source_starting=None,
+        on_delivery_not_started=None,
+    ):
+        del on_delivery_not_started
         self.after = after
+        if on_source_starting is not None:
+            await on_source_starting()
 
-        async def body() -> AsyncGenerator[bytes, None]:
-            if False:
-                yield b""
+        self.body = _Body()
+        return self.body
 
-        return body()
+
+class _Body:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def __aiter__(self) -> _Body:
+        return self
+
+    async def __anext__(self) -> bytes:
+        raise StopAsyncIteration
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 class _TraceCoordinator:
@@ -311,6 +332,12 @@ class _TraceCoordinator:
     def ensure(self, *, thread_pk: int, identity: RunIdentity) -> None:
         del thread_pk
         self.ensured.append(identity)
+
+
+class _FailingTraceCoordinator(_TraceCoordinator):
+    def ensure(self, *, thread_pk: int, identity: RunIdentity) -> None:
+        super().ensure(thread_pk=thread_pk, identity=identity)
+        raise RuntimeError("trace follow unavailable")
 
 
 async def test_chat_service_uses_messaging_only_for_delivery(
@@ -362,6 +389,58 @@ async def test_chat_service_uses_messaging_only_for_delivery(
     assert len(trace.ensured) == 1
     assert trace.ensured[0].run_id == "run-1"
     assert [chunk async for chunk in prepared.body] == []
+
+
+async def test_chat_service_closes_sse_body_when_trace_follow_cannot_start(
+    database,
+    session,
+) -> None:
+    """Trace follow 注册失败时立即释放尚未交给 HTTP 的 SSE 内容"""
+
+    await AgentModelService(AgentModelRepository(session)).upsert(
+        AgentModelWrite(
+            model_id="model-main",
+            display_name="主模型",
+            provider="deepseek",
+            model_name="deepseek-chat",
+            base_url="https://example.invalid/v1",
+            api_key=SecretStr("secret"),
+            runtime_profile="deepagents-v2",
+            enabled=True,
+            is_default=True,
+        )
+    )
+    channel = _Channel()
+    trace = _FailingTraceCoordinator()
+    resources = cast(
+        ApplicationResources,
+        SimpleNamespace(
+            database=database,
+            agent_persistence=object(),
+            sandbox_manager=object(),
+            tinkerfin_profiles={"deepagents-v2": TinkerFin()},
+            settings=SimpleNamespace(tavily_api_key=None),
+            conversation_channel=channel,
+            conversation_trace=trace,
+        ),
+    )
+    service = ConversationChatService(
+        session,
+        user=UserContext(
+            user_id=1,
+            username="user",
+            display_name="用户",
+            roles=(),
+            disabled=False,
+        ),
+        resources=resources,
+    )
+
+    with pytest.raises(RuntimeError, match="trace follow unavailable"):
+        await service.start(_ordinary_request(), last_event_id=None)
+
+    assert channel.body is not None
+    assert channel.body.closed
 
 
 async def test_previous_head_reconcile_releases_the_request_transaction(

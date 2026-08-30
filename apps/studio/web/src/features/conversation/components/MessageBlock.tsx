@@ -8,11 +8,10 @@ import {
   TriangleAlert,
   X,
 } from 'lucide-react'
-import { memo, useEffect, useRef, useState } from 'react'
+import { memo, useEffect, useId, useRef, useState } from 'react'
 
 import { IconButton } from '../../../components/ui'
 import type { ConversationNotice as ConversationNoticeType, Message } from '../../../types'
-import { ActivityDots } from './ActivityDots'
 import { MarkdownContent } from './MarkdownContent'
 import { ToolCallRow } from './ToolCallRow'
 import { COPY_FEEDBACK_DURATION_MS } from './copyFeedback'
@@ -188,8 +187,12 @@ function SubagentOutputNode({ message }: { message: Message }) {
 function SubagentCard({ message, childTools }: { message: Message; childTools: Message[] }) {
   const { t } = useI18n()
   const [openToolIds, setOpenToolIds] = useState<Set<string>>(() => new Set())
+  const [inputHovered, setInputHovered] = useState(false)
+  const [inputFocused, setInputFocused] = useState(false)
+  const inputTooltipId = useId()
   const status = message.meta?.status ?? 'completed'
   const input = message.meta?.input
+  const inputDetailOpen = inputHovered || inputFocused
   const agentName = message.meta?.agentName ?? 'subagent'
   const statusLabel = status === 'running'
     ? t('正在运行')
@@ -234,7 +237,30 @@ function SubagentCard({ message, childTools }: { message: Message; childTools: M
         {input && (
           <div className="subagent-task-line">
             <span>{agentName}</span>
-            <p>{input}</p>
+            <div
+              className={`subagent-task-detail${inputDetailOpen ? ' is-open' : ''}`}
+              onMouseEnter={() => setInputHovered(true)}
+              onMouseLeave={() => setInputHovered(false)}
+            >
+              <button
+                type="button"
+                className="subagent-task-summary"
+                aria-describedby={inputDetailOpen ? inputTooltipId : undefined}
+                onFocus={() => setInputFocused(true)}
+                onBlur={() => setInputFocused(false)}
+              >
+                {input}
+              </button>
+              {inputDetailOpen && (
+                <span
+                  id={inputTooltipId}
+                  className="ui-tooltip subagent-task-tooltip"
+                  role="tooltip"
+                >
+                  {input}
+                </span>
+              )}
+            </div>
           </div>
         )}
         <ol
@@ -288,16 +314,11 @@ function MessageBlockView({
   if (message.role === 'error') {
     return <article id={message.id} className="error-message"><CircleAlert size={17} /><div><strong>{t('任务遇到问题')}</strong><MarkdownContent content={message.content} className="error-markdown" variant="compact" /></div></article>
   }
+  if (!message.content) return null
   return (
     <article id={message.id} className="message assistant-message">
-      {message.content
-        ? <>
-            <MarkdownContent content={message.content} className="message-markdown" />
-            {showActions && message.meta?.status !== 'running' && <MessageActionRow content={message.content} kind="assistant" />}
-          </>
-        : message.meta?.status === 'running'
-          ? null
-          : <p className="streaming-indicator"><ActivityDots label={t('正在回复')} /></p>}
+      <MarkdownContent content={message.content} className="message-markdown" />
+      {showActions && message.meta?.status !== 'running' && <MessageActionRow content={message.content} kind="assistant" />}
     </article>
   )
 }

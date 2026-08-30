@@ -57,55 +57,26 @@ agent = tinkerfin.create_deep_agent(
 
 
 async def main() -> None:
-    runtime = agent.new(identity=RunIdentity(threadId="thread-1", runId="run-1"))
-    async for part in runtime.astream(
-        {"messages": [{"role": "user", "content": "Hello"}]},
-    ):
+    stream = await tinkerfin.open_run(
+        RunIdentity(threadId="thread-1", runId="run-1"),
+        agent=agent,
+        input={"messages": [{"role": "user", "content": "Hello"}]},
+    )
+    async for part in stream:
         print(part)
 
 
 asyncio.run(main())
 ```
 
-`create_deep_agent(...)` records the build call. `new()` creates a fresh Graph and a
-single-use Runtime; the Graph iterator starts on first pull.
+`create_deep_agent(...)` records the build call. `open_run()` resolves the Definition,
+constructs the Graph asynchronously, binds identity and observations, and returns one
+single-use managed stream.
 
-### Runtime Profile
+Advanced integrations that need a reusable direct Runnable can continue with
+[Direct Graph](#direct-graph).
 
-`TinkerFin()` uses `DeepAgentsV2RuntimeProfile` by default. A Profile owns the complete
-third-party integration: graph construction, invocation options, live-object validation,
-canonical observations, finite replay, and the checkpointer writes that stage a resume
-without changing interrupted Graph control. TinkerFin selects it before Definition creation
-and records its `profile_id` with durable lineage; branch and resume reject a checkpoint
-created by another Profile before Graph continuation.
-
-Hosts with another real integration can implement `DeepAgentsRuntimeProfile` and inject
-it explicitly:
-
-```python
-from tinkerfin import DeepAgentsV2RuntimeProfile, TinkerFin
-
-
-profile = DeepAgentsV2RuntimeProfile()
-tinkerfin = TinkerFin(runtime_profile=profile)
-```
-
-The Runtime does not infer a Profile from stream data, negotiate one during a Run, or
-change Profiles across resume. Every Profile must produce the same current
-`NativeStreamFrame` contract, so observers, AG-UI, Native SSE, and Messaging remain
-independent of its upstream envelope. A custom Profile also declares the stable build
-signature and bound `astream_signature` implemented by its graph, then returns
-`DeepAgentsFactoryPreparation` for factory-specific HITL and permission overrides. The
-stream signature lets resume construct the Graph lazily inside retained async ownership,
-so factory failures and process control settle pre-marker host claims without exposing
-build order. A Profile must also stage and recognize resume intent according to its
-concrete checkpointer semantics. The built-in factory and v2 checkpoint behavior are
-never used as runtime fallbacks for another Profile.
-
-This distribution provides `DeepAgentsV2RuntimeProfile`; it does not provide a Deep
-Agents v3 Profile or TodoGroups projection/UI. A new Profile is a concrete integration
-that must emit the same canonical contract, not a downstream version branch or an empty
-capability placeholder.
+## Core concepts
 
 ### Plan Mode
 
@@ -117,23 +88,27 @@ TinkerFin factory; the installed Deep Agents factory signature does not change.
 from tinkerfin import TinkerFin
 
 
-tinkerfin = TinkerFin()
-agent = tinkerfin.plan(
+planned = TinkerFin().plan(
     enabled=True,
     default_mode="default",
     planner_model="openai:gpt-5.4",
-).create_deep_agent(
+)
+agent = planned.create_deep_agent(
     model="openai:gpt-5.4",
     tools=[],
     checkpointer=production_checkpointer,
 )
 
-plan_runtime = agent.new(
-    identity=RunIdentity(threadId="thread-1", runId="run-1"),
+plan_stream = await planned.open_run(
+    RunIdentity(threadId="thread-1", runId="run-1"),
+    agent=agent,
+    input=graph_input,
     mode="plan",
 )
-default_runtime = agent.new(
-    identity=RunIdentity(threadId="thread-1", runId="run-2"),
+default_stream = await planned.open_run(
+    RunIdentity(threadId="thread-1", runId="run-2"),
+    agent=agent,
+    input=graph_input,
     mode="default",
 )
 ```
@@ -144,23 +119,29 @@ Plan review defaults to `PlanReviewAction.APPROVE`, `RESPOND`, and `REJECT`.
 response Schema. A host with a trusted draft editor can explicitly include
 `PlanReviewAction.EDIT`; editing is not enabled by default.
 
-Selecting `mode="plan"` requires an explicit Planner model and a concrete
-`BaseCheckpointSaver`. TinkerFin never creates an in-process saver or silently weakens
+Approval is the only review decision that exits Planning and starts native execution.
+`REJECT` invalidates the current draft, accepts an optional reason, emits one visible
+Planner reply, and waits for another Plan input. An explicitly configured `CANCEL`
+performs the same Plan-mode continuation without a reason. These domain decisions are
+resolved resume payloads; AG-UI `status="cancelled"` remains true abandonment and does
+not invoke the model.
+
+Selecting `mode="plan"` requires a concrete `BaseCheckpointSaver` and one explicit
+model. `planner_model` is optional when the Agent definition supplies `model`; omitting
+both is rejected. TinkerFin never creates an in-process saver or silently weakens
 durability. Production hosts must supply a production-grade saver; the same saver,
 Store, cache, backend, and runtime context are borrowed by Planning and native
 execution. Planning and handoff boundaries use synchronous checkpoint durability, and
 an explicit non-`sync` value is rejected.
 
 `mode="default"` calls the native Deep Agent Graph directly without running Planning or
-creating a parent Graph. Every Definition includes a private resume marker channel.
-Definitions with Tool review also replace the existing Deep Agents patch middleware slot
-with a locked-dependency adapter that preserves patch behavior and delegates
-approve/edit/reject/respond to LangChain unchanged. Its only extension is an internal
-cancel decision used for mixed AG-UI resume batches.
+creating a parent Graph. Native Todo, Tool review, subagent, cancellation, and error
+behavior remains available. AG-UI review batches may contain both resolved and abandoned
+actions without requiring the host to modify Deep Agents state or middleware.
 
 Only `ls`, `read_file`, `glob`, and `grep` are available to the Planner. Every
 clarification question explicitly declares whether it is required and selects one semantic
-answer type: `single_choice`, `multiple_choice`, `text`, or `date`. Choice questions can
+answer type: `single_choice`, `multiple_choice`, `text`, `date`, `time`, or `datetime`. Choice questions can
 accept one custom alternative, and optional questions can be explicitly skipped. Clients
 submit stable option IDs or typed values under the checkpoint question ID; Planning derives
 trusted option labels and canonical values from the checkpointed form. A skipped answer
@@ -169,6 +150,14 @@ and commits a deterministic handoff bound to the original user message ID. The r
 then starts the native Deep Agent in the same request; the effective mode becomes
 `default` before execution. The public Plan state and value models are available from
 `tinkerfin.plan` and are emitted under the root state key `tinkerfin_plan`.
+
+Date answers use `YYYY-MM-DD` without a time zone. Time answers use one local wall-clock
+minute in the question's IANA time zone; a question may declare inclusive `minimum` and
+`maximum` bounds, and ranges cannot wrap across midnight.
+Datetime answers combine one calendar date and local minute in the question's required
+IANA zone. Their optional local `minimum` and `maximum` can span dates. Normalization
+retains `localDateTime` and `timeZone` and adds the unique UTC `instant`; DST gaps and
+repeated local minutes are rejected instead of silently selecting an offset.
 
 Plan content is independently configurable. Omitting `content_schema` uses
 `StructuredPlanContent`; pass `MarkdownPlanContent` for one exact Markdown document, or
@@ -291,52 +280,66 @@ agent = tinkerfin.plan().create_deep_agent(
 )
 ```
 
-The native Graph combines the private resume marker, application, Definition, and
-upstream middleware state contracts. The standalone Planning Graph composes the fields
-it needs without changing native default topology. A conflicting field fails before a
-Plan run.
+The native Graph composes application, Definition, and upstream state contracts. The
+standalone Planning Graph composes the fields it needs without changing native default
+topology. A conflicting field fails before a Plan run.
 Runtime context continues to use Deep Agents `context_schema`; it is not merged into
 state or stored in the checkpoint.
 
-## Core concepts
-
-### Native Runtime
+### Direct Graph
 
 ```python
-runtime = agent.new(identity=identity, mode="plan", on_part=on_part)
+graph = await agent.create_graph(mode="default")
+result = await graph.ainvoke(graph_input, config=config)
+```
 
-parts = runtime.astream(
-    graph_input,
-    config,
+The direct Graph supports `ainvoke()`, `astream()`, `abatch()`, and standard Runnable
+composition without managed identity, Observation, Trace, AG-UI, Messaging, or business
+lifecycle. Direct resume uses LangGraph `Command(resume=...)`; synchronous execution is
+intentionally rejected for async checkpointers, Stores, tools, and cancellation.
+
+### Managed native runs
+
+```python
+parts = await tinkerfin.open_run(
+    identity,
+    agent=agent,
+    input=graph_input,
+    mode="plan",
+    config=config,
     context=context,
+    on_native_part=on_native_part,
 )
 ```
 
-The selected Runtime Profile injects RunIdentity and its complete upstream invocation
-contract into Graph config. Supported extra modes may be added, but required semantic
-modes cannot be removed and state output must remain complete. `NativeGraphRunStream`
-returns the original upstream objects while transferring each Driver-owned canonical
-frame exactly once to Observation, Native SSE, or Messaging. It preserves ordering,
-backpressure, errors, cancellation, coordination, observer ordering, and cleanup.
+The selected Runtime Profile constructs the Graph asynchronously and injects
+`RunIdentity` plus its complete upstream invocation contract. Supported extra modes may
+be added, but required semantic modes cannot be removed and state output must remain
+complete. `NativeGraphRunStream` returns original upstream objects while transferring
+each Driver-owned canonical frame exactly once to Observation, Native SSE, or Messaging.
+It preserves ordering, backpressure, errors, cancellation, coordination, observer
+ordering, and cleanup.
 
-### AG-UI Runtime
+### Managed AG-UI runs
 
 ```python
 from tinkerfin import AgUiResumeRequest, RunIdentity
 
 
-runtime = agent.new_agui(
-    identity=RunIdentity(threadId="thread-1", runId="run-1"),
+events = await tinkerfin.open_agui_run(
+    RunIdentity(threadId="thread-1", runId="run-1"),
+    agent=agent,
+    input=graph_input,
     parent_run_id=parent_run_id,
     mode="default",
-    on_part=on_part,
-    on_event=on_event,
+    config=config,
+    context=context,
+    on_native_part=on_native_part,
+    on_agui_event=on_agui_event,
 )
-
-events = runtime.astream(graph_input, config, context=context)
 ```
 
-The AG-UI Runtime uses the same selected Profile and canonical frame as Native Runtime.
+The AG-UI path uses the same selected Profile and canonical frame as the native path.
 Explicit upstream options must match that Profile; supported diagnostic modes may be
 added, while incomplete state output is rejected. Invalid options fail before stream
 side effects.
@@ -350,39 +353,35 @@ parents fail before Graph execution.
 
 The returned `AgUiEventStream` preserves event, interrupt/resume, subagent, reasoning
 privacy, cancellation, and cleanup semantics and can be passed directly to SSE or
-Messaging. Give the Definition only the next request's client decisions; it resolves
-trusted interrupts and Tool correlation from its concrete checkpointer:
+Messaging. Give `open_agui_run()` only the next request's client decisions; it resolves
+trusted interrupts and Tool correlation from the Definition checkpointer:
 
 ```python
 resume_identity = RunIdentity(threadId="thread-1", runId="run-resume")
-binding = await agent.prepare_agui_resume(
-    identity=resume_identity,
+events = await tinkerfin.open_agui_run(
+    resume_identity,
+    agent=agent,
+    resume=AgUiResumeRequest(entries=tuple(resume_entries)),
     parent_run_id=parent_run_id,
-    request=AgUiResumeRequest(entries=tuple(resume_entries)),
+    config=config,
+    context=context,
+    on_resume_saved=record_checkpoint_idempotently,
+    on_resume_not_saved=release_unprepared_claim_idempotently,
 )
-runtime = agent.new_agui(
-    identity=resume_identity,
-    parent_run_id=parent_run_id,
-    resume=binding,
-    on_resume_checkpointed=record_checkpoint_idempotently,
-    on_resume_initialization_failed=release_unprepared_claim_idempotently,
-)
-events = runtime.astream(config=config, context=context)
 ```
 
-The binding owns validated native resume, Tool correlation, cancellation, and provenance
-facts and has a stable JSON round trip. It owns no identity or parent and exposes no
-native `Command`. Before submitting the decision, the selected Profile durably writes the
-private lineage and marker on the exact interrupted checkpoint without running a node or
-discarding root, Planning, or subgraph pending work. `on_resume_checkpointed` runs only
-after those writes are readable and may receive the same `AgUiResumeCheckpoint` again on
-retry, so hosts must consume it idempotently. The decision-only continuation and accepted
-retry remain internal; an accepted decision is not resubmitted. An entirely cancelled
-binding emits a finite cancelled lifecycle without creating or invoking a Graph.
-If failure, cancellation, or close occurs before the marker is readable,
-`on_resume_initialization_failed` runs from the Runtime's retained settlement task so the
-host can release its pre-checkpoint claim. It is never called after prepared or accepted
-marker evidence exists, and the host callback must be idempotent.
+Before continuing, the selected Profile durably accepts the exact interrupted checkpoint
+without running a node or discarding root, Planning, or subgraph pending work.
+`on_resume_saved` runs only after that acceptance is readable and may receive the same
+`AgUiResumeCheckpoint` on retry, so it must be idempotent. If setup fails before durable
+acceptance, `on_resume_not_saved` settles the host claim through protected cleanup. An
+entirely cancelled request emits a finite cancelled lifecycle without invoking a Graph.
+
+Advanced integrations that own a trusted event log or need custom request orchestration
+can still use `new()`, `new_agui()`, `prepare_agui_resume()`, `AgUiResumeBinding`, and
+`failed_agui_run()`. These low-level boundaries preserve the same capabilities but make
+the caller responsible for their ordering and settlement; they are not required by the
+ordinary managed path.
 
 AG-UI batches may mix resolved and cancelled Tool reviews. Resolved Tools retain native
 behavior; cancelled Tools are removed from execution and receive a deterministic error
@@ -419,9 +418,9 @@ The Runtime selects the Agent outcome before terminal broadcast. If an Observer 
 that already selected terminal, callers still fail closed and healthy Observers receive
 the failure notice, but the actual Agent outcome is not rewritten after execution ended.
 
-When host setup fails after accepting a Run, use
-`tinkerfin.failed_agui_run(error, identity=..., input=..., config=..., resume=...)` to
-produce the same observed failed lifecycle without invoking a Graph.
+`open_agui_run()` converts ordinary model, Sandbox, Definition, and Graph setup failures
+into the same observed failed lifecycle. Advanced orchestrators that accept a Run before
+calling the managed facade can use `failed_agui_run(...)` directly.
 
 The Observation contracts live in `tinkerfin-contracts`. The provided semantic Ledger
 implementation is `tinkerfin-tracing`; it records Runtime and Native facts, not AG-UI,
@@ -453,9 +452,16 @@ ordinary business data.
 
 ### Ownership
 
-A Definition may create multiple Runtimes; each one owns a separate Graph invocation
-and one object stream. Graph construction is synchronous, so async servers should use
-their controlled thread boundary around `new()` or `new_agui()` when needed.
+A Definition can create reusable direct Graphs and multiple managed streams. The selected
+Runtime Profile always owns the exact factory. A Profile may expose native asynchronous
+construction; otherwise Core invokes that Profile's synchronous factory in AnyIO's
+capacity-limited worker boundary. Callers do not create their own Graph-construction
+thread.
+
+TinkerFin and every Definition borrow caller-provided models, checkpointers, Stores,
+backends, caches, and Sandbox resources. They do not set up or close those resources.
+Managed streams own only request-scoped execution, observations, coordination, and
+cleanup.
 
 A configured coordinator receives the same complete RunIdentity. Coordination does not
 replace a LangGraph checkpointer.
@@ -464,6 +470,55 @@ Hosts that own an asynchronous cleanup or preflight task can use `join_task(task
 wait for its definitive result without letting repeated caller cancellation interrupt
 settlement. Caller cancellation is re-raised after the owned task finishes; an owned
 task failure remains observable when no caller cancellation outranks it.
+
+## Advanced Runtime Profile integration
+
+`TinkerFin()` uses `DeepAgentsV2RuntimeProfile` by default. A Profile owns the complete
+third-party integration: Graph construction, invocation options, live-object validation,
+canonical observations, finite replay, and resume marker writes that preserve interrupted
+Graph control. TinkerFin selects it before Definition creation and records its
+`profile_id` with durable lineage; branch and resume reject a checkpoint created by
+another Profile before Graph continuation.
+
+Hosts with another real integration can implement `DeepAgentsRuntimeProfile` and inject
+it explicitly:
+
+```python
+from tinkerfin import DeepAgentsV2RuntimeProfile, TinkerFin
+
+
+profile = DeepAgentsV2RuntimeProfile()
+tinkerfin = TinkerFin(runtime_profile=profile)
+```
+
+The Runtime does not infer or negotiate a Profile from stream data. Every Profile must
+produce the same current `NativeStreamFrame` contract so observers, AG-UI, Native SSE,
+and Messaging remain independent of its upstream envelope. A custom Profile declares
+its stable build and stream signatures, returns `DeepAgentsFactoryPreparation` for
+factory-specific overrides, and owns its concrete resume staging and marker recognition.
+It may additionally implement `create_agent_graph(factory, args, kwargs)` when graph
+construction is natively asynchronous. Without that method, Core awaits the Profile's
+selected synchronous factory through the bounded worker boundary; it never substitutes
+the built-in v2 factory.
+Factory failures become a managed lifecycle; cancellation and process control settle
+marker-aware host claims before propagating. Built-in v2 behavior is never a fallback
+for another Profile.
+
+The built-in v2 Profile stores lineage and resume acceptance in private checkpoint
+channels. Its Tool-review integration occupies the locked Deep Agents patch-middleware
+slot, delegates approve/edit/reject/respond unchanged, and adds only the private
+cancellation decision required to preserve mixed AG-UI batches. These details are
+Profile implementation contracts and are not part of the ordinary managed API.
+
+A lazy resumed Agent normally inherits the `TinkerFin(checkpointer=...)` saver. If its
+Definition intentionally overrides that saver, pass the same object as
+`resume_checkpointer` to `open_agui_run()`. This declares the durable marker authority
+before host setup begins; a returned Definition using another object fails closed and
+does not release the host claim.
+
+This distribution provides `DeepAgentsV2RuntimeProfile`; it does not provide a Deep
+Agents v3 Profile or TodoGroups projection/UI. A new Profile is a concrete integration
+that emits the same canonical contract, not a downstream version branch or placeholder.
 
 ## Documentation
 

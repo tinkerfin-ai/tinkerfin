@@ -39,6 +39,10 @@ class _Redis:
         return True
 
 
+async def _sandbox_ready() -> None:
+    """模拟框架已验证真实预热容量"""
+
+
 async def test_readiness_checks_all_dependencies_concurrently() -> None:
     """四项外部依赖全部可用时 readiness 必须逐项返回成功"""
 
@@ -59,6 +63,7 @@ async def test_readiness_checks_all_dependencies_concurrently() -> None:
                 workspace_root="/workspace",
                 state_namespace="studio",
             ),
+            sandbox_ready=_sandbox_ready,
             http_client=http_client,
             timeout_seconds=1,
         )
@@ -104,6 +109,7 @@ async def test_readiness_isolates_each_redis_failure_domain(
                 workspace_root="/workspace",
                 state_namespace="studio",
             ),
+            sandbox_ready=_sandbox_ready,
             http_client=http_client,
             timeout_seconds=1,
         )
@@ -113,4 +119,37 @@ async def test_readiness_isolates_each_redis_failure_domain(
     assert result["mysql"] is True
     assert result["redis_control"] is (broken_domain != "control")
     assert result["redis_runtime"] is (broken_domain != "runtime")
+    assert result["opensandbox"] is False
+
+
+async def test_readiness_rejects_control_plane_health_without_warm_capacity() -> None:
+    """控制面存活但框架预热失败时应用不得报告 ready"""
+
+    async def sandbox(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(200, json={"status": "healthy"})
+
+    async def unavailable() -> None:
+        raise RuntimeError("warm capacity unavailable")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(sandbox)) as http_client:
+        service = ReadinessService(
+            database=cast(Database, _Database()),
+            redis_control=cast(Redis, _Redis()),
+            redis_runtime=cast(Redis, _Redis()),
+            sandbox=SandboxSettings(
+                domain="opensandbox:8090",
+                protocol="http",
+                api_key=None,
+                warm_pool_size=1,
+                workspace_root="/workspace",
+                state_namespace="studio",
+            ),
+            sandbox_ready=unavailable,
+            http_client=http_client,
+            timeout_seconds=1,
+        )
+
+        result = await service.check()
+
     assert result["opensandbox"] is False

@@ -13,8 +13,11 @@ __all__ = [
     "get_run_status",
 ]
 
-from collections.abc import AsyncIterator, Awaitable, Callable
-from typing import TYPE_CHECKING, TypeAlias, TypeVar, cast
+import asyncio
+import inspect
+from collections.abc import AsyncGenerator, Awaitable, Callable
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Generic, NoReturn, TypeAlias, TypeVar, cast
 
 from tinkerfin_contracts import RunIdentity
 
@@ -25,7 +28,14 @@ from ._messaging_boundary import (
     _normalize_cancel_callback,
     _validate_optional_cursor,
 )
-from .backend import BackendRunHandle, PreparedRun, RunStatus
+from .backend import (
+    BackendRunHandle,
+    PreparedRun,
+    RunStatus,
+    is_active_run_status,
+    is_failed_run_status,
+    is_final_run_status,
+)
 from .errors import (
     BackendOwnershipLost,
     CodecMismatch,
@@ -55,10 +65,222 @@ SourceT = TypeVar("SourceT")
 ReplayT = TypeVar("ReplayT")
 ProfileSourceT = TypeVar("ProfileSourceT")
 ProfileReplayT = TypeVar("ProfileReplayT")
-_RUN_STATUSES = frozenset(
-    {"running", "cancel_requested", "completed", "cancelled", "failed", "owner_lost"}
-)
+PreflightT = TypeVar("PreflightT")
 _CodecInputTransform: TypeAlias = Callable[[object], object]
+_DeliveryCallback: TypeAlias = Callable[[], Awaitable[None]]
+
+
+@dataclass(frozen=True, slots=True)
+class _RetainedPreflightOutcome(Generic[PreflightT]):
+    """Carry a preflight result or BaseException without leaking a child-task error."""
+
+    result: PreflightT | None = None
+    error: BaseException | None = None
+
+
+async def _retained_preflight(
+    operation: Callable[[], Awaitable[PreflightT]],
+    *,
+    started: asyncio.Event | None = None,
+) -> _RetainedPreflightOutcome[PreflightT]:
+    """Run one preflight to settlement and return its complete outcome as data."""
+
+    if started is not None:
+        started.set()
+    try:
+        return _RetainedPreflightOutcome(result=await operation())
+    except BaseException as error:  # noqa: BLE001 - the caller re-raises this outcome
+        return _RetainedPreflightOutcome(error=error)
+
+
+async def _await_retained_preflight(
+    task: asyncio.Task[_RetainedPreflightOutcome[PreflightT]],
+    *,
+    cancel_requested: asyncio.Event,
+    task_started: asyncio.Event,
+    close_late_result: Callable[[PreflightT], Awaitable[None]],
+) -> PreflightT:
+    """Keep preflight owned across repeated cancellation and close late success."""
+
+    current = asyncio.current_task()
+    cancel_count = current.cancelling() if current is not None else 0
+    caller_cancellation: asyncio.CancelledError | None = None
+    started_waiter = asyncio.create_task(
+        task_started.wait(),
+        name="tinkerfin-messaging-preflight-started",
+    )
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as cancellation:
+            next_count = current.cancelling() if current is not None else 0
+            if next_count > cancel_count:
+                first_cancellation = caller_cancellation is None
+                if first_cancellation:
+                    caller_cancellation = cancellation
+                cancel_requested.set()
+                cancel_count = next_count
+                if first_cancellation:
+                    while not started_waiter.done() and not task.done():
+                        try:
+                            await asyncio.shield(started_waiter)
+                        except asyncio.CancelledError as repeated:
+                            repeated_count = (
+                                current.cancelling() if current is not None else 0
+                            )
+                            if repeated_count > cancel_count:
+                                cancel_count = repeated_count
+                                continue
+                            if started_waiter.done() or task.done():
+                                break
+                            raise repeated
+                    if not task.done():
+                        task.cancel()
+                continue
+            if task.done():
+                break
+            raise
+
+    if not started_waiter.done():  # pragma: no cover - task start always sets the event
+        started_waiter.cancel()
+    await asyncio.gather(started_waiter, return_exceptions=True)
+    outcome = task.result()
+    if caller_cancellation is not None:
+        if outcome.result is not None:
+
+            async def close_late() -> _RetainedPreflightOutcome[None]:
+                return await _retained_preflight(
+                    lambda: close_late_result(cast(PreflightT, outcome.result))
+                )
+
+            close_task = asyncio.create_task(
+                close_late(),
+                name="tinkerfin-messaging-late-delivery-close",
+            )
+            while not close_task.done():
+                try:
+                    await asyncio.shield(close_task)
+                except asyncio.CancelledError as repeated:
+                    next_count = current.cancelling() if current is not None else 0
+                    if next_count > cancel_count:
+                        cancel_requested.set()
+                        cancel_count = next_count
+                        continue
+                    if close_task.done():
+                        break
+                    raise repeated
+            close_outcome = close_task.result()
+            close_error = close_outcome.error
+            if close_error is not None:
+                caller_cancellation.add_note(
+                    "Late Messaging delivery cleanup also failed: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+        if outcome.error is not None:
+            caller_cancellation.add_note(
+                "Messaging preflight also failed: "
+                f"{type(outcome.error).__name__}: {outcome.error}"
+            )
+        raise caller_cancellation.with_traceback(caller_cancellation.__traceback__)
+    if outcome.error is not None:
+        raise outcome.error.with_traceback(outcome.error.__traceback__)
+    if outcome.result is None:  # pragma: no cover - every operation returns delivery
+        raise RuntimeError("Messaging preflight produced no delivery")
+    return outcome.result
+
+
+def _validate_delivery_callback(
+    name: str,
+    callback: _DeliveryCallback | None,
+) -> None:
+    if callback is not None and not callable(callback):
+        raise TypeError(f"{name} must be an async callable or None")
+
+
+async def _invoke_delivery_callback(
+    name: str,
+    callback: _DeliveryCallback | None,
+) -> None:
+    if callback is None:
+        return
+    result = callback()
+    if not inspect.isawaitable(result):
+        raise TypeError(f"{name} must return an awaitable")
+    await result
+
+
+def _add_secondary_failure(primary: BaseException, secondary: BaseException) -> None:
+    primary.add_note(
+        "Messaging preflight settlement also failed: "
+        f"{type(secondary).__name__}: {secondary}"
+    )
+
+
+def _retain_settlement_failure(
+    primary: BaseException,
+    secondary: BaseException,
+) -> BaseException:
+    """Retain failure order without suppressing later process control.
+
+    Cleanup continues after this function returns. Cancellation, keyboard interrupt,
+    and system exit outrank only an ordinary primary. Once process control is primary,
+    all later failures remain secondary evidence.
+    """
+
+    if isinstance(primary, Exception) and not isinstance(secondary, Exception):
+        secondary.add_note(
+            f"Messaging preflight also failed: {type(primary).__name__}: {primary}"
+        )
+        return secondary
+    _add_secondary_failure(primary, secondary)
+    return primary
+
+
+async def _settle_unregistered_delivery(
+    primary: BaseException,
+    *,
+    source: MessageSource[object] | None,
+    on_delivery_not_started: _DeliveryCallback | None,
+) -> NoReturn:
+    """Release delivery inputs when shutdown rejects preflight registration.
+
+    A closed Messaging facade cannot retain a preflight task, but it still owns the
+    unused ordinary source and the host's not-started outcome. Recoverable factories are
+    never opened at this boundary, so only their host callback requires settlement.
+    """
+
+    outcome = primary
+
+    def retain(error: BaseException) -> None:
+        nonlocal outcome
+        outcome = _retain_settlement_failure(outcome, error)
+
+    if source is not None:
+        try:
+            await source.aclose()
+        except BaseException as close_error:  # noqa: BLE001 - settle remaining callback
+            retain(close_error)
+    try:
+        _validate_delivery_callback(
+            "on_delivery_not_started",
+            on_delivery_not_started,
+        )
+        await _invoke_delivery_callback(
+            "on_delivery_not_started",
+            on_delivery_not_started,
+        )
+    except BaseException as callback_error:  # noqa: BLE001 - preserve failure priority
+        retain(callback_error)
+    if outcome is not primary:
+        raise outcome.with_traceback(outcome.__traceback__) from primary
+    raise primary.with_traceback(primary.__traceback__)
+
+
+def _raise_if_start_cancelled(cancel_requested: asyncio.Event) -> None:
+    """Stop a retained preflight before it transfers ownership to a producer."""
+
+    if cancel_requested.is_set():
+        raise asyncio.CancelledError("Messaging delivery was cancelled before startup")
 
 
 def _resolve_identity(source: object, identity: RunIdentity | None) -> RunIdentity:
@@ -320,7 +542,7 @@ async def get_run_status(
             ),
         )
         self._messaging._require_open()
-        if not isinstance(status, str) or status not in _RUN_STATUSES:
+        if not (is_active_run_status(status) or is_final_run_status(status)):
             raise MessagingBackendProtocolError(
                 "Messaging backend returned an invalid run status",
                 diagnostic_context={
@@ -466,6 +688,8 @@ async def wrap(
     after: int | None = None,
     cancel: (CancelCallback[SourceT] | CancelCallback[ProfileSourceT] | None) = None,
     on_committed: CommittedCallback | None = None,
+    on_source_starting: _DeliveryCallback | None = None,
+    on_delivery_not_started: _DeliveryCallback | None = None,
 ) -> MessageSubscription[ReplayT] | MessageSubscription[ProfileReplayT]:
     """Open a replayable subscription while preserving the source profile type."""
 
@@ -477,6 +701,8 @@ async def wrap(
             after=after,
             cancel=cast("CancelCallback[object] | None", cancel),
             on_committed=on_committed,
+            on_source_starting=on_source_starting,
+            on_delivery_not_started=on_delivery_not_started,
         ),
     )
 
@@ -489,6 +715,8 @@ async def _wrap(
     after: int | None = None,
     cancel: CancelCallback[object] | None = None,
     on_committed: CommittedCallback | None = None,
+    on_source_starting: _DeliveryCallback | None = None,
+    on_delivery_not_started: _DeliveryCallback | None = None,
 ) -> MessageSubscription[object]:
     """Validate and start-or-attach before an HTTP response is constructed.
 
@@ -519,14 +747,82 @@ async def _wrap(
         ValueError: The explicit and source identities conflict.
     """
 
+    try:
+        preflight = self._messaging._begin_preflight()
+    except BaseException as error:  # noqa: BLE001 - settle unclaimed delivery inputs
+        await _settle_unregistered_delivery(
+            error,
+            source=source,
+            on_delivery_not_started=on_delivery_not_started,
+        )
+    try:
+        cancel_requested = asyncio.Event()
+        task_started = asyncio.Event()
+
+        async def operation() -> MessageSubscription[object]:
+            return await _wrap_once(
+                self,
+                source,
+                identity=identity,
+                after=after,
+                cancel=cancel,
+                on_committed=on_committed,
+                on_source_starting=on_source_starting,
+                on_delivery_not_started=on_delivery_not_started,
+                cancel_requested=cancel_requested,
+            )
+
+        task = asyncio.create_task(
+            _retained_preflight(operation, started=task_started),
+            name="tinkerfin-messaging-start-or-attach",
+        )
+        self._messaging._bind_preflight_owner(
+            preflight,
+            cast(asyncio.Task[object], task),
+        )
+
+        async def close_late(subscription: MessageSubscription[object]) -> None:
+            await subscription.aclose()
+
+        return await _await_retained_preflight(
+            task,
+            cancel_requested=cancel_requested,
+            task_started=task_started,
+            close_late_result=close_late,
+        )
+    finally:
+        self._messaging._finish_preflight(preflight)
+
+
+async def _wrap_once(
+    self: MessageChannel[SourceT, ReplayT],
+    source: MessageSource[object],
+    *,
+    identity: RunIdentity | None,
+    after: int | None,
+    cancel: CancelCallback[object] | None,
+    on_committed: CommittedCallback | None,
+    on_source_starting: _DeliveryCallback | None,
+    on_delivery_not_started: _DeliveryCallback | None,
+    cancel_requested: asyncio.Event,
+) -> MessageSubscription[object]:
+    """Settle one complete ordinary start-or-attach decision."""
+
     from .messaging import MessageSubscription
 
-    preflight = self._messaging._begin_preflight()
     prepared: PreparedRun | None = None
     normalized_cancel: _ContextCancelCallback[object] | None = None
     producer_started = False
+    delivery_started = False
     source_released = False
+    producer_codec: MessageCodec[object, object] | None = None
+    replay_renderer: SseRenderer[object] | None = None
     try:
+        _validate_delivery_callback("on_source_starting", on_source_starting)
+        _validate_delivery_callback(
+            "on_delivery_not_started",
+            on_delivery_not_started,
+        )
         _validate_optional_cursor(after)
         codec, renderer, profile, codec_input = self._resolve_binding(source)
         producer_codec = cast(MessageCodec[object, object], codec)
@@ -562,15 +858,32 @@ async def _wrap(
                 recoverable=False,
             ),
         )
+        if not prepared.is_owner:
+            # A validated attachment is already a real delivery. Candidate-source or
+            # response construction failures must never roll back host business state.
+            delivery_started = True
         self._messaging._require_open()
+        _raise_if_start_cancelled(cancel_requested)
         if prepared.is_owner:
             owner_preflight = getattr(source, "messaging_owner_preflight", None)
             if owner_preflight is not None:
                 if not callable(owner_preflight):
                     raise TypeError("messaging_owner_preflight must be async callable")
                 callback = cast(Callable[[], Awaitable[None]], owner_preflight)
-                await callback()
+                result = callback()
+                if not inspect.isawaitable(result):
+                    raise TypeError(
+                        "messaging_owner_preflight must return an awaitable"
+                    )
+                await result
                 self._messaging._require_open()
+                _raise_if_start_cancelled(cancel_requested)
+            await _invoke_delivery_callback(
+                "on_source_starting",
+                on_source_starting,
+            )
+            self._messaging._require_open()
+            _raise_if_start_cancelled(cancel_requested)
         self._commit_inferred_binding(
             codec=codec,
             renderer=renderer,
@@ -586,39 +899,53 @@ async def _wrap(
                 on_committed=on_committed,
             )
             producer_started = True
+            delivery_started = True
             await started.wait()
             self._messaging._require_open()
         else:
             await source.aclose()
             source_released = True
             self._messaging._require_open()
+        return MessageSubscription(
+            backend=self._messaging.backend,
+            prepared=prepared,
+            codec=producer_codec,
+            renderer=replay_renderer,
+        )
+    # Preflight settlement must cover cancellation and process-control outcomes while
+    # preserving the initiating failure after owned cleanup.
     except BaseException as error:
+        primary = error
         if not producer_started and not source_released:
             try:
                 await source.aclose()
-            finally:
-                if prepared is not None and prepared.is_owner:
-                    try:
-                        await _await_backend(
-                            "finish",
-                            self._messaging.backend.finish(
-                                prepared.handle,
-                                status="failed",
-                                error=error,
-                            ),
-                        )
-                    except BackendOwnershipLost:
-                        pass
-        raise
-    finally:
-        self._messaging._finish_preflight(preflight)
-
-    return MessageSubscription(
-        backend=self._messaging.backend,
-        prepared=prepared,
-        codec=producer_codec,
-        renderer=replay_renderer,
-    )
+            except BaseException as close_error:  # noqa: BLE001 - cleanup continues
+                primary = _retain_settlement_failure(primary, close_error)
+            if prepared is not None and prepared.is_owner:
+                try:
+                    await _await_backend(
+                        "finish",
+                        self._messaging.backend.finish(
+                            prepared.handle,
+                            status="failed",
+                            error=primary,
+                        ),
+                    )
+                except BackendOwnershipLost:
+                    pass
+                except BaseException as finish_error:  # noqa: BLE001 - cleanup continues
+                    primary = _retain_settlement_failure(primary, finish_error)
+        if not delivery_started:
+            try:
+                await _invoke_delivery_callback(
+                    "on_delivery_not_started",
+                    on_delivery_not_started,
+                )
+            except BaseException as callback_error:  # noqa: BLE001 - cleanup continues
+                primary = _retain_settlement_failure(primary, callback_error)
+        if primary is not error:
+            raise primary.with_traceback(primary.__traceback__) from error
+        raise error.with_traceback(error.__traceback__)
 
 
 async def sse(
@@ -629,7 +956,9 @@ async def sse(
     after: int | Callable[[], int | None] | None = None,
     cancel: CancelCallback[object] | None = None,
     on_committed: CommittedCallback | None = None,
-) -> AsyncIterator[bytes]:
+    on_source_starting: _DeliveryCallback | None = None,
+    on_delivery_not_started: _DeliveryCallback | None = None,
+) -> AsyncGenerator[bytes, None]:
     """Prepare durable publication and return its SSE response body.
 
     Args:
@@ -645,6 +974,7 @@ async def sse(
 
     Returns:
         A durable SSE body whose IDs are committed channel sequence numbers.
+        The caller owns the body and must close it when it will not be consumed.
 
     Raises:
         MessagingError: Durable preparation or producer startup is rejected.
@@ -654,9 +984,28 @@ async def sse(
 
     try:
         resolved_after = after() if callable(after) else after
-    except BaseException:
-        await source.aclose()
-        raise
+    # Cursor resolution happens before delivery; every failure category still owns the
+    # unused candidate source and host not-started settlement.
+    except BaseException as error:
+        primary = error
+        try:
+            await source.aclose()
+        except BaseException as close_error:  # noqa: BLE001 - cleanup continues
+            primary = _retain_settlement_failure(primary, close_error)
+        try:
+            _validate_delivery_callback(
+                "on_delivery_not_started",
+                on_delivery_not_started,
+            )
+            await _invoke_delivery_callback(
+                "on_delivery_not_started",
+                on_delivery_not_started,
+            )
+        except BaseException as callback_error:  # noqa: BLE001 - cleanup continues
+            primary = _retain_settlement_failure(primary, callback_error)
+        if primary is not error:
+            raise primary.with_traceback(primary.__traceback__) from error
+        raise error.with_traceback(error.__traceback__)
 
     subscription = await self._wrap(
         source,
@@ -664,6 +1013,8 @@ async def sse(
         after=resolved_after,
         cancel=cancel,
         on_committed=on_committed,
+        on_source_starting=on_source_starting,
+        on_delivery_not_started=on_delivery_not_started,
     )
     try:
         return subscription.sse()
@@ -680,6 +1031,8 @@ async def wrap_recoverable(
     after: int | None = None,
     cancel: CancelCallback[RecoverableMessage[SourceT]] | None = None,
     on_committed: CommittedCallback | None = None,
+    on_source_starting: _DeliveryCallback | None = None,
+    on_delivery_not_started: _DeliveryCallback | None = None,
 ) -> MessageSubscription[ReplayT]:
     """Start or rebuild an owner from its last committed checkpoint.
 
@@ -706,14 +1059,82 @@ async def wrap_recoverable(
         ValueError: The explicit and source identities conflict.
     """
 
+    try:
+        preflight = self._messaging._begin_preflight()
+    except BaseException as error:  # noqa: BLE001 - recoverable source was not opened
+        await _settle_unregistered_delivery(
+            error,
+            source=None,
+            on_delivery_not_started=on_delivery_not_started,
+        )
+    try:
+        cancel_requested = asyncio.Event()
+        task_started = asyncio.Event()
+
+        async def operation() -> MessageSubscription[ReplayT]:
+            return await _wrap_recoverable_once(
+                self,
+                source,
+                identity=identity,
+                after=after,
+                cancel=cancel,
+                on_committed=on_committed,
+                on_source_starting=on_source_starting,
+                on_delivery_not_started=on_delivery_not_started,
+                cancel_requested=cancel_requested,
+            )
+
+        task = asyncio.create_task(
+            _retained_preflight(operation, started=task_started),
+            name="tinkerfin-messaging-recoverable-start-or-attach",
+        )
+        self._messaging._bind_preflight_owner(
+            preflight,
+            cast(asyncio.Task[object], task),
+        )
+
+        async def close_late(subscription: MessageSubscription[ReplayT]) -> None:
+            await subscription.aclose()
+
+        return await _await_retained_preflight(
+            task,
+            cancel_requested=cancel_requested,
+            task_started=task_started,
+            close_late_result=close_late,
+        )
+    finally:
+        self._messaging._finish_preflight(preflight)
+
+
+async def _wrap_recoverable_once(
+    self: MessageChannel[SourceT, ReplayT],
+    source: RecoverableSource[SourceT],
+    *,
+    identity: RunIdentity | None,
+    after: int | None,
+    cancel: CancelCallback[RecoverableMessage[SourceT]] | None,
+    on_committed: CommittedCallback | None,
+    on_source_starting: _DeliveryCallback | None,
+    on_delivery_not_started: _DeliveryCallback | None,
+    cancel_requested: asyncio.Event,
+) -> MessageSubscription[ReplayT]:
+    """Settle one complete recoverable start-or-attach decision."""
+
     from .messaging import MessageSubscription
 
-    preflight = self._messaging._begin_preflight()
     prepared: PreparedRun | None = None
     opened: MessageSource[RecoverableMessage[SourceT]] | None = None
     normalized_cancel: _ContextCancelCallback[RecoverableMessage[SourceT]] | None = None
     producer_started = False
+    delivery_started = False
+    codec: MessageCodec[SourceT, ReplayT] | None = None
+    renderer: SseRenderer[ReplayT] | None = None
     try:
+        _validate_delivery_callback("on_source_starting", on_source_starting)
+        _validate_delivery_callback(
+            "on_delivery_not_started",
+            on_delivery_not_started,
+        )
         _validate_optional_cursor(after)
         codec, renderer, profile, codec_input = self._resolve_binding(source)
         if codec_input is not None:
@@ -736,7 +1157,29 @@ async def wrap_recoverable(
                 recoverable=True,
             ),
         )
+        if not prepared.is_owner:
+            delivery_started = True
         self._messaging._require_open()
+        _raise_if_start_cancelled(cancel_requested)
+        if prepared.is_owner:
+            owner_preflight = getattr(source, "messaging_owner_preflight", None)
+            if owner_preflight is not None:
+                if not callable(owner_preflight):
+                    raise TypeError("messaging_owner_preflight must be async callable")
+                result = owner_preflight()
+                if not inspect.isawaitable(result):
+                    raise TypeError(
+                        "messaging_owner_preflight must return an awaitable"
+                    )
+                await result
+                self._messaging._require_open()
+                _raise_if_start_cancelled(cancel_requested)
+            await _invoke_delivery_callback(
+                "on_source_starting",
+                on_source_starting,
+            )
+            self._messaging._require_open()
+            _raise_if_start_cancelled(cancel_requested)
         self._commit_inferred_binding(
             codec=codec,
             renderer=renderer,
@@ -748,6 +1191,7 @@ async def wrap_recoverable(
                 source=source,
             )
             self._messaging._require_open()
+            _raise_if_start_cancelled(cancel_requested)
             started = self._messaging._start_recoverable_producer(
                 prepared=prepared,
                 source=opened,
@@ -756,35 +1200,49 @@ async def wrap_recoverable(
                 on_committed=on_committed,
             )
             producer_started = True
+            delivery_started = True
             await started.wait()
             self._messaging._require_open()
+        return MessageSubscription(
+            backend=self._messaging.backend,
+            prepared=prepared,
+            codec=cast(MessageCodec[object, ReplayT], codec),
+            renderer=renderer,
+        )
+    # Recoverable preparation owns opened sources and backend settlement for every
+    # failure category, including cancellation and process control.
     except BaseException as error:
+        primary = error
         if prepared is not None and prepared.is_owner and not producer_started:
-            try:
-                if opened is not None:
-                    await opened.aclose()
-            finally:
+            if opened is not None:
                 try:
-                    await _await_backend(
-                        "finish",
-                        self._messaging.backend.finish(
-                            prepared.handle,
-                            status="failed",
-                            error=error,
-                        ),
-                    )
-                except BackendOwnershipLost:
-                    pass
-        raise
-    finally:
-        self._messaging._finish_preflight(preflight)
-
-    return MessageSubscription(
-        backend=self._messaging.backend,
-        prepared=prepared,
-        codec=cast(MessageCodec[object, ReplayT], codec),
-        renderer=renderer,
-    )
+                    await opened.aclose()
+                except BaseException as close_error:  # noqa: BLE001 - cleanup continues
+                    primary = _retain_settlement_failure(primary, close_error)
+            try:
+                await _await_backend(
+                    "finish",
+                    self._messaging.backend.finish(
+                        prepared.handle,
+                        status="failed",
+                        error=primary,
+                    ),
+                )
+            except BackendOwnershipLost:
+                pass
+            except BaseException as finish_error:  # noqa: BLE001 - cleanup continues
+                primary = _retain_settlement_failure(primary, finish_error)
+        if not delivery_started:
+            try:
+                await _invoke_delivery_callback(
+                    "on_delivery_not_started",
+                    on_delivery_not_started,
+                )
+            except BaseException as callback_error:  # noqa: BLE001 - cleanup continues
+                primary = _retain_settlement_failure(primary, callback_error)
+        if primary is not error:
+            raise primary.with_traceback(primary.__traceback__) from error
+        raise error.with_traceback(error.__traceback__)
 
 
 async def cancel(
@@ -823,7 +1281,7 @@ async def cancel(
             "wait_finished",
             self._messaging.backend.wait_finished(handle),
         )
-        if status in {"failed", "owner_lost"}:
+        if is_failed_run_status(status):
             cause = await _await_backend(
                 "failure",
                 self._messaging.backend.failure(handle),

@@ -8,8 +8,10 @@ from datetime import UTC, datetime
 import pytest
 
 from tinkerfin_contracts import (
+    NativeInterruptRecord,
     NativeMessageObservation,
     NativeMessageRecord,
+    NativeReasoningObservation,
     NativeStateObservation,
     NativeToolCall,
     RunClosedObservation,
@@ -17,6 +19,7 @@ from tinkerfin_contracts import (
     RunInputKind,
     RunInputObservation,
     RunObservationSession,
+    RunResumeSummary,
     RunSourceContext,
     RunStartedObservation,
     RunTerminalObservation,
@@ -24,10 +27,14 @@ from tinkerfin_contracts import (
 )
 from tinkerfin_tracing import (
     AmbiguousTraceHead,
+    InMemoryTraceStore,
     InvalidTraceCursor,
     StateRevisionFact,
+    TraceProjectionCheckpoint,
     Tracer,
+    TraceRunNotFound,
     TraceThreadNotFound,
+    TracingErrorCode,
 )
 
 
@@ -36,6 +43,7 @@ def _context(
     *,
     input_kind: RunInputKind = "ordinary",
     parent_run_id: str | None = None,
+    resume: tuple[RunResumeSummary, ...] = (),
 ) -> RunSourceContext:
     return RunSourceContext(
         identity=RunIdentity(threadId="thread-query", runId=run_id),
@@ -52,6 +60,7 @@ def _context(
             ]
         },
         config={},
+        resume=resume,
     )
 
 
@@ -260,6 +269,12 @@ async def test_explicit_branch_follow_advances_to_its_only_descendant_head() -> 
 
     update = await asyncio.wait_for(first_update, timeout=2)
     assert update.status.head_run_id == "resume-a"
+    assert update.summary.status == update.status
+    assert update.summary.message_count == update.message_count
+    serialized = update.model_dump(mode="json", by_alias=True)
+    assert serialized["summary"]["status"] == serialized["status"]
+    assert serialized["summary"]["messageCount"] == serialized["messageCount"]
+    assert "status" not in type(update).model_fields
     await _finish(session, resumed)
     await follower.aclose()
     await asyncio.sleep(0)
@@ -470,6 +485,72 @@ async def test_all_runtime_terminals_have_distinct_execution_status(
     assert thread.status.execution == expected
 
 
+async def test_pending_interaction_keeps_active_and_success_terminal_waiting() -> None:
+    tracer = Tracer()
+    context = _context("pending-success")
+    session = await _start(tracer, context)
+    await session.observe(
+        NativeStateObservation(
+            identity=context.identity,
+            namespace=(),
+            state={},
+            interrupts=(
+                NativeInterruptRecord(
+                    id="pending-success-interrupt",
+                    value={"kind": "input_required", "message": "Wait"},
+                ),
+            ),
+            observed_at=datetime.now(UTC),
+            monotonic_ns=3,
+        )
+    )
+
+    active = await tracer.get("thread-query", head_run_id=context.identity.run_id)
+    assert active.status.execution == "running"
+    assert [item.source_id for item in active.summary.pending_interactions] == [
+        "pending-success-interrupt"
+    ]
+
+    await _finish(session, context, outcome="succeeded")
+    completed = await tracer.get(
+        "thread-query",
+        head_run_id=context.identity.run_id,
+    )
+    assert completed.status.execution == "waiting"
+    assert [item.source_id for item in completed.summary.pending_interactions] == [
+        "pending-success-interrupt"
+    ]
+
+
+async def test_failed_terminal_remains_failed_with_a_pending_interaction() -> None:
+    tracer = Tracer()
+    context = _context("pending-failure")
+    session = await _start(tracer, context)
+    await session.observe(
+        NativeStateObservation(
+            identity=context.identity,
+            namespace=(),
+            state={},
+            interrupts=(
+                NativeInterruptRecord(
+                    id="pending-failure-interrupt",
+                    value={"kind": "input_required", "message": "Wait"},
+                ),
+            ),
+            observed_at=datetime.now(UTC),
+            monotonic_ns=3,
+        )
+    )
+
+    await _finish(session, context, outcome="failed")
+    thread = await tracer.get("thread-query", head_run_id=context.identity.run_id)
+
+    assert thread.status.execution == "failed"
+    assert [item.source_id for item in thread.summary.pending_interactions] == [
+        "pending-failure-interrupt"
+    ]
+
+
 async def test_resume_with_a_missing_parent_builds_an_explicit_partial_turn() -> None:
     tracer = Tracer()
     context = _context(
@@ -501,11 +582,433 @@ async def test_default_window_contains_exactly_the_latest_one_hundred_turns() ->
     assert thread.has_older is True
     assert thread.message_count == 105
     assert thread.tool_call_count == 0
+    summary_before = thread.summary
     await thread.load_older(limit=5)
     assert len(thread.messages) == 105
     assert len(thread.tree.roots) == 105
     assert thread.has_older is False
     assert thread.message_count == 105
+    assert thread.summary == summary_before
+
+
+async def test_summary_keeps_pending_interactions_outside_the_visible_window() -> None:
+    tracer = Tracer()
+    context = _context("pending-first")
+    session = await _start(tracer, context)
+    await session.observe(
+        NativeStateObservation(
+            identity=context.identity,
+            namespace=(),
+            state={"waiting": True},
+            interrupts=(
+                NativeInterruptRecord(
+                    id="pending-old",
+                    value={"kind": "input_required", "message": "Wait"},
+                ),
+            ),
+            observed_at=datetime.now(UTC),
+            monotonic_ns=3,
+        )
+    )
+    await _finish(session, context, outcome="interrupted")
+    for index in range(104):
+        await _record(tracer, f"later-{index:03d}")
+
+    thread = await tracer.get("thread-query")
+
+    assert thread.has_older is True
+    assert all(item.source_id != "pending-old" for item in thread.interactions)
+    assert [item.source_id for item in thread.summary.pending_interactions] == [
+        "pending-old"
+    ]
+
+
+async def test_summary_uses_the_selected_lineage_maximum_source_time() -> None:
+    tracer = Tracer()
+    context = _context("summary-time")
+    session = await _start(tracer, context)
+    future_time = datetime(2035, 1, 2, 3, 4, tzinfo=UTC)
+    await session.observe(
+        NativeStateObservation(
+            identity=context.identity,
+            namespace=(),
+            state={"tinkerfin_plan": {"status": "draft"}},
+            observed_at=future_time,
+            monotonic_ns=3,
+        )
+    )
+    await _finish(session, context)
+
+    thread = await tracer.get("thread-query")
+    events = (await thread.events(limit=100)).items
+
+    assert thread.summary.last_occurred_at == future_time
+    assert thread.summary.last_occurred_at == max(
+        event.fact.occurred_at for event in events
+    )
+
+
+async def test_summary_pending_interactions_exclude_sibling_branches() -> None:
+    tracer = Tracer()
+    await _record(tracer, "summary-root")
+    for run_id, interrupt_id in (
+        ("summary-branch-a", "interrupt-a"),
+        ("summary-branch-b", "interrupt-b"),
+    ):
+        context = _context(
+            run_id,
+            input_kind="branch",
+            parent_run_id="summary-root",
+        )
+        session = await _start(tracer, context)
+        await session.observe(
+            NativeStateObservation(
+                identity=context.identity,
+                namespace=(),
+                state={"branch": run_id},
+                interrupts=(
+                    NativeInterruptRecord(
+                        id=interrupt_id,
+                        value={"kind": "input_required", "message": run_id},
+                    ),
+                ),
+                observed_at=datetime.now(UTC),
+                monotonic_ns=3,
+            )
+        )
+        await _finish(session, context, outcome="interrupted")
+
+    branch_a = await tracer.get("thread-query", head_run_id="summary-branch-a")
+    branch_b = await tracer.get("thread-query", head_run_id="summary-branch-b")
+
+    assert [item.source_id for item in branch_a.summary.pending_interactions] == [
+        "interrupt-a"
+    ]
+    assert [item.source_id for item in branch_b.summary.pending_interactions] == [
+        "interrupt-b"
+    ]
+
+
+async def test_same_turn_sibling_resumes_isolate_selected_lineage_views() -> None:
+    tracer = Tracer()
+    await _record(tracer, "summary-root")
+    for run_id, interrupt_id in (
+        ("summary-resume-a", "interrupt-a"),
+        ("summary-resume-b", "interrupt-b"),
+    ):
+        context = _context(
+            run_id,
+            input_kind="resume",
+            parent_run_id="summary-root",
+        )
+        session = await _start(tracer, context)
+        now = datetime.now(UTC)
+        message_id = f"assistant-{run_id}"
+        await session.observe(
+            NativeMessageObservation(
+                identity=context.identity,
+                namespace=(),
+                message=NativeMessageRecord(
+                    message_type="assistant",
+                    id=message_id,
+                    content=run_id,
+                    tool_calls=(
+                        NativeToolCall(
+                            id=f"tool-{run_id}",
+                            name="search",
+                            arguments={},
+                        ),
+                    ),
+                ),
+                observed_at=now,
+                monotonic_ns=3,
+            )
+        )
+        await session.observe(
+            NativeReasoningObservation(
+                identity=context.identity,
+                namespace=(),
+                message_id=message_id,
+                extractor="fixture.reasoning",
+                content=f"reasoning-{run_id}",
+                snapshot=True,
+                observed_at=now,
+                monotonic_ns=4,
+            )
+        )
+        await session.observe(
+            NativeStateObservation(
+                identity=context.identity,
+                namespace=(),
+                state={"resume": run_id},
+                interrupts=(
+                    NativeInterruptRecord(
+                        id=interrupt_id,
+                        value={"kind": "input_required", "message": run_id},
+                    ),
+                ),
+                observed_at=now,
+                monotonic_ns=5,
+            )
+        )
+        await _finish(session, context, outcome="interrupted")
+
+    for head, expected_interrupt in (
+        ("summary-resume-a", "interrupt-a"),
+        ("summary-resume-b", "interrupt-b"),
+    ):
+        trace = await tracer.get("thread-query", head_run_id=head)
+        selected_runs = {"summary-root", head}
+
+        assert trace.summary.message_count == 2
+        assert trace.summary.tool_call_count == 1
+        assert {message.run_id for message in trace.messages} == selected_runs
+        assert {item.run_id for item in trace.reasoning} == {head}
+        assert {item.run_id for item in trace.interactions} == {head}
+        assert [item.source_id for item in trace.summary.pending_interactions] == [
+            expected_interrupt
+        ]
+        assert all(node.run_id in selected_runs for node in trace.tree.nodes)
+
+
+async def test_sibling_message_removal_does_not_mutate_another_head() -> None:
+    tracer = Tracer()
+    root = _context("remove-root")
+    root_session = await _start(tracer, root)
+    await root_session.observe(
+        NativeMessageObservation(
+            identity=root.identity,
+            namespace=(),
+            message=NativeMessageRecord(
+                message_type="assistant",
+                id="shared-assistant",
+                content="root answer",
+            ),
+            observed_at=datetime.now(UTC),
+            monotonic_ns=3,
+        )
+    )
+    await _finish(root_session, root)
+
+    branch_a = _context(
+        "remove-a",
+        input_kind="resume",
+        parent_run_id="remove-root",
+    )
+    branch_a_session = await _start(tracer, branch_a)
+    await _finish(branch_a_session, branch_a)
+
+    branch_b = _context(
+        "remove-b",
+        input_kind="resume",
+        parent_run_id="remove-root",
+    )
+    branch_b_session = await _start(tracer, branch_b)
+    await branch_b_session.observe(
+        NativeMessageObservation(
+            identity=branch_b.identity,
+            namespace=(),
+            message=NativeMessageRecord(
+                message_type="remove",
+                id="shared-assistant",
+                content="",
+            ),
+            observed_at=datetime.now(UTC),
+            monotonic_ns=3,
+        )
+    )
+    await _finish(branch_b_session, branch_b)
+
+    selected_a = await tracer.get("thread-query", head_run_id="remove-a")
+    selected_b = await tracer.get("thread-query", head_run_id="remove-b")
+
+    assert [message.source_id for message in selected_a.messages] == [
+        "user-remove-root",
+        "shared-assistant",
+    ]
+    assert selected_a.summary.message_count == 2
+    assert [message.source_id for message in selected_b.messages] == [
+        "user-remove-root"
+    ]
+    assert selected_b.summary.message_count == 1
+
+
+async def test_sibling_reconciliation_result_and_resolution_are_isolated() -> None:
+    tracer = Tracer()
+    root = _context("transition-root")
+    root_session = await _start(tracer, root)
+    await root_session.observe(
+        NativeMessageObservation(
+            identity=root.identity,
+            namespace=(),
+            message=NativeMessageRecord(
+                message_type="assistant",
+                id="transition-assistant",
+                content="root answer",
+                tool_calls=(
+                    NativeToolCall(
+                        id="transition-tool",
+                        name="search",
+                        arguments={},
+                    ),
+                ),
+            ),
+            observed_at=datetime.now(UTC),
+            monotonic_ns=3,
+        )
+    )
+    await root_session.observe(
+        NativeStateObservation(
+            identity=root.identity,
+            namespace=(),
+            state={},
+            interrupts=(
+                NativeInterruptRecord(
+                    id="transition-interrupt",
+                    value={"kind": "input_required", "message": "Continue?"},
+                ),
+                NativeInterruptRecord(
+                    id="transition-other",
+                    value={"kind": "input_required", "message": "Keep waiting?"},
+                ),
+            ),
+            observed_at=datetime.now(UTC),
+            monotonic_ns=4,
+        )
+    )
+    await _finish(root_session, root, outcome="interrupted")
+
+    branch_a = _context(
+        "transition-a",
+        input_kind="resume",
+        parent_run_id="transition-root",
+    )
+    branch_a_session = await _start(tracer, branch_a)
+    await _finish(branch_a_session, branch_a)
+
+    branch_b = _context(
+        "transition-b",
+        input_kind="resume",
+        parent_run_id="transition-root",
+        resume=(
+            RunResumeSummary(
+                interrupt_id="transition-interrupt",
+                status="resolved",
+                decision="approve",
+            ),
+        ),
+    )
+    branch_b_session = await _start(tracer, branch_b)
+    await branch_b_session.observe(
+        NativeStateObservation(
+            identity=branch_b.identity,
+            namespace=(),
+            state={},
+            messages=(
+                NativeMessageRecord(
+                    message_type="human",
+                    id="user-transition-root",
+                    content="request transition-root",
+                ),
+                NativeMessageRecord(
+                    message_type="assistant",
+                    id="transition-assistant",
+                    content="branch-b answer",
+                    tool_calls=(
+                        NativeToolCall(
+                            id="transition-tool",
+                            name="search",
+                            arguments={},
+                        ),
+                    ),
+                ),
+            ),
+            interrupts=(
+                NativeInterruptRecord(
+                    id="transition-other",
+                    value={"kind": "input_required", "message": "Keep waiting?"},
+                ),
+            ),
+            observed_at=datetime.now(UTC),
+            monotonic_ns=3,
+        )
+    )
+    await branch_b_session.observe(
+        NativeMessageObservation(
+            identity=branch_b.identity,
+            namespace=(),
+            message=NativeMessageRecord(
+                message_type="tool",
+                id="transition-result",
+                name="search",
+                content="branch-b result",
+                tool_call_id="transition-tool",
+                tool_status="success",
+            ),
+            observed_at=datetime.now(UTC),
+            monotonic_ns=4,
+        )
+    )
+    await _finish(branch_b_session, branch_b)
+
+    selected_a = await tracer.get("thread-query", head_run_id="transition-a")
+    selected_b = await tracer.get("thread-query", head_run_id="transition-b")
+    assistant_a = next(
+        message
+        for message in selected_a.messages
+        if message.source_id == "transition-assistant"
+    )
+    assistant_b = next(
+        message
+        for message in selected_b.messages
+        if message.source_id == "transition-assistant"
+    )
+
+    assert assistant_a.content == "root answer"
+    assert assistant_b.content == "branch-b answer"
+    assert all(message.role != "tool" for message in selected_a.messages)
+    assert any(
+        message.role == "tool" and message.source_id == "transition-result"
+        for message in selected_b.messages
+    )
+    assert [item.source_id for item in selected_a.summary.pending_interactions] == [
+        "transition-interrupt",
+        "transition-other",
+    ]
+    assert [item.source_id for item in selected_b.summary.pending_interactions] == [
+        "transition-other"
+    ]
+
+
+async def test_core_summary_rebuild_uses_only_its_current_cache_scope() -> None:
+    store = InMemoryTraceStore()
+    tracer = Tracer(store=store)
+    await _record(tracer, "summary-cache")
+    snapshot = await store.snapshot("thread-query")
+    await store.save_projection_checkpoint(
+        TraceProjectionCheckpoint(
+            key=snapshot.key,
+            projection_name="tinkerfin.core",
+            run_id=None,
+            as_of_seq=snapshot.as_of_seq,
+            state={"unrelated": True},
+        ),
+        expected_as_of_seq=None,
+    )
+
+    thread = await tracer.get("thread-query")
+    current = await store.load_projection_checkpoint(
+        snapshot.key,
+        projection_name="tinkerfin.core.summary",
+        run_id=None,
+        as_of_seq=snapshot.as_of_seq,
+    )
+
+    assert thread.summary.status.execution == "succeeded"
+    assert current is not None
+    assert current.as_of_seq == snapshot.as_of_seq
+    assert isinstance(current.state, dict)
+    assert "runs" in current.state
 
 
 async def test_ambiguous_head_error_exposes_every_selectable_head() -> None:
@@ -518,6 +1021,17 @@ async def test_ambiguous_head_error_exposes_every_selectable_head() -> None:
         await tracer.get("thread-query")
 
     assert captured.value.context["head_run_ids"] == "branch-a,branch-b"
+
+
+async def test_missing_explicit_run_uses_precise_not_found_error() -> None:
+    tracer = Tracer()
+    await _record(tracer, "existing-run")
+
+    with pytest.raises(TraceRunNotFound) as captured:
+        await tracer.get("thread-query", head_run_id="not-started-run")
+
+    assert captured.value.code is TracingErrorCode.RUN_NOT_FOUND
+    assert captured.value.context == {"head_run_id": "not-started-run"}
 
 
 async def test_concurrent_ordinary_runs_remain_independent_heads() -> None:

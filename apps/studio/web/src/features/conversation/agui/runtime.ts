@@ -23,6 +23,7 @@ import type {
   MarkdownPlanDraft,
   Message,
   PlanQuestionItem,
+  PlanReviewState,
   TodoItem,
   TodoStatus,
 } from "../../../types"
@@ -246,6 +247,20 @@ const parsePlanQuestionOptions = (value: unknown) => {
     : null
 }
 
+const normalizeMinuteTime = (value: unknown): string | null => {
+  if (typeof value !== 'string') return null
+  const match = /^([01]\d|2[0-3]):([0-5]\d)(?::00)?$/.exec(value)
+  return match ? `${match[1]}:${match[2]}` : null
+}
+
+const normalizeMinuteDateTime = (value: unknown): string | null => {
+  if (typeof value !== 'string') return null
+  const match = /^(\d{4}-\d{2}-\d{2})T([01]\d|2[0-3]):([0-5]\d)(?::00)?$/.exec(value)
+  return match && isIsoCalendarDate(match[1])
+    ? `${match[1]}T${match[2]}:${match[3]}`
+    : null
+}
+
 const parsePlanQuestions = (value: unknown): PlanQuestionItem[] | null => {
   if (!Array.isArray(value)) return null
   const questions = value.flatMap<PlanQuestionItem>((rawQuestion) => {
@@ -315,6 +330,48 @@ const parsePlanQuestions = (value: unknown): PlanQuestionItem[] | null => {
     if (rawQuestion.answerType === 'date') {
       return [{ ...common, answerType: 'date' }]
     }
+    if (rawQuestion.answerType === 'time') {
+      if (!isNonBlankString(rawQuestion.timeZone)) return []
+      const minimum = rawQuestion.minimum == null
+        ? null
+        : normalizeMinuteTime(rawQuestion.minimum)
+      const maximum = rawQuestion.maximum == null
+        ? null
+        : normalizeMinuteTime(rawQuestion.maximum)
+      if (
+        (rawQuestion.minimum != null && minimum == null)
+        || (rawQuestion.maximum != null && maximum == null)
+        || (minimum != null && maximum != null && minimum > maximum)
+      ) return []
+      return [{
+        ...common,
+        answerType: 'time',
+        timeZone: rawQuestion.timeZone,
+        minimum,
+        maximum,
+      }]
+    }
+    if (rawQuestion.answerType === 'datetime') {
+      if (!isNonBlankString(rawQuestion.timeZone)) return []
+      const minimum = rawQuestion.minimum == null
+        ? null
+        : normalizeMinuteDateTime(rawQuestion.minimum)
+      const maximum = rawQuestion.maximum == null
+        ? null
+        : normalizeMinuteDateTime(rawQuestion.maximum)
+      if (
+        (rawQuestion.minimum != null && minimum == null)
+        || (rawQuestion.maximum != null && maximum == null)
+        || (minimum != null && maximum != null && minimum > maximum)
+      ) return []
+      return [{
+        ...common,
+        answerType: 'datetime',
+        timeZone: rawQuestion.timeZone,
+        minimum,
+        maximum,
+      }]
+    }
     return []
   })
   return questions.length === value.length
@@ -334,6 +391,31 @@ const isIsoCalendarDate = (value: string) => {
   const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0)
   const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
   return day >= 1 && day <= (daysInMonth[month - 1] ?? 0)
+}
+
+const PLAN_REVIEW_ACTIONS = ['approve', 'reject', 'cancel'] as const
+
+const parsePlanReviewActions = (
+  responseSchema: JsonValue | undefined,
+): PlanReviewState['allowedActions'] | null => {
+  if (!isJsonObject(responseSchema)) return null
+  const discriminator = responseSchema.discriminator
+  if (
+    !isJsonObject(discriminator)
+    || !hasOnlyKeys(discriminator, ['mapping', 'propertyName'])
+    || discriminator.propertyName !== 'type'
+    || !isJsonObject(discriminator.mapping)
+  ) return null
+  const mapping = discriminator.mapping
+  const actions = Object.keys(mapping)
+  if (
+    actions.length === 0
+    || actions.some((action) => (
+      !PLAN_REVIEW_ACTIONS.includes(action as typeof PLAN_REVIEW_ACTIONS[number])
+      || typeof mapping[action] !== 'string'
+    ))
+  ) return null
+  return actions as PlanReviewState['allowedActions']
 }
 
 const planInteractionFromInterrupts = (
@@ -376,6 +458,8 @@ const planInteractionFromInterrupts = (
   }
 
   if (interrupt.reason === 'tinkerfin:plan_review') {
+    const allowedActions = parsePlanReviewActions(interrupt.responseSchema)
+    if (!allowedActions) return invalidPlanInteraction()
     const review = metadata.review
     if (
       !review
@@ -416,6 +500,7 @@ const planInteractionFromInterrupts = (
       interruptId: interrupt.id,
       revision: draft.revision,
       draft: structuredClone(draft) as unknown as MarkdownPlanDraft,
+      allowedActions,
       submitted: false,
     }
   }
@@ -873,35 +958,68 @@ export const buildPlanResumePayload = (
         answers[question.id] = { status: 'answered', answerType: 'text', answer }
         return
       }
-      const date = question.date?.trim() ?? ''
-      if (!date) {
+      if (question.answerType === 'date') {
+        const date = question.date?.trim() ?? ''
+        if (!date) {
+          if (question.required) throw new ConversationError("plan_required_answers_missing")
+          answers[question.id] = { status: 'skipped' }
+          return
+        }
+        if (!isIsoCalendarDate(date)) throw new ConversationError("plan_answer_invalid")
+        answers[question.id] = { status: 'answered', answerType: 'date', date }
+        return
+      }
+      if (question.answerType === 'datetime') {
+        const dateTime = normalizeMinuteDateTime(question.dateTime?.trim() ?? '')
+        if (!dateTime) {
+          if (question.required) throw new ConversationError("plan_required_answers_missing")
+          answers[question.id] = { status: 'skipped' }
+          return
+        }
+        if (
+          (question.minimum != null && dateTime < question.minimum)
+          || (question.maximum != null && dateTime > question.maximum)
+        ) throw new ConversationError("plan_answer_invalid")
+        answers[question.id] = {
+          status: 'answered',
+          answerType: 'datetime',
+          dateTime: `${dateTime}:00`,
+        }
+        return
+      }
+      const time = normalizeMinuteTime(question.time?.trim() ?? '')
+      if (!time) {
         if (question.required) throw new ConversationError("plan_required_answers_missing")
         answers[question.id] = { status: 'skipped' }
         return
       }
-      if (!isIsoCalendarDate(date)) throw new ConversationError("plan_answer_invalid")
-      answers[question.id] = { status: 'answered', answerType: 'date', date }
+      if (
+        (question.minimum != null && time < question.minimum)
+        || (question.maximum != null && time > question.maximum)
+      ) throw new ConversationError("plan_answer_invalid")
+      answers[question.id] = {
+        status: 'answered',
+        answerType: 'time',
+        time: `${time}:00`,
+      }
     })
     payload = { type: 'respond', answers }
   } else {
     if (!interaction.action) throw new ConversationError("plan_action_required")
+    if (!interaction.allowedActions?.includes(interaction.action)) {
+      throw new ConversationError("plan_action_required")
+    }
     if (interaction.action === 'approve') {
       payload = { type: 'approve', baseRevision: interaction.revision }
-    } else if (interaction.action === 'respond') {
-      const message = interaction.message?.trim()
-      if (!message) throw new ConversationError("plan_feedback_required")
-      payload = {
-        type: 'respond',
-        baseRevision: interaction.revision,
-        message,
-      }
-    } else {
+    } else if (interaction.action === 'reject') {
       const message = interaction.message?.trim()
       payload = {
         type: 'reject',
         baseRevision: interaction.revision,
         ...(message ? { message } : {}),
       }
+    } else {
+      payload = { type: 'cancel', baseRevision: interaction.revision }
     }
   }
 
@@ -914,9 +1032,9 @@ export const buildPlanResumePayload = (
     context: [],
     forwardedProps: forwardedPropsFor(
       conversation.model,
-      interaction.kind === 'review' && (
-        interaction.action === 'approve' || interaction.action === 'reject'
-      ) ? 'default' : 'plan',
+      interaction.kind === 'review' && interaction.action === 'approve'
+        ? 'default'
+        : 'plan',
     ),
     resume: [{
       interruptId: interaction.interruptId,

@@ -39,6 +39,10 @@
 
 `OpenSandboxManager` 的构造参数和操作见 [Sandbox 生命周期](lifecycle.md)。`build_agent_middleware(backend, permissions=None)` 返回可直接传给 Deep Agents 的 middleware 元组。
 
+只有配置的预热容量已经通过真实验证时，`await manager.check_ready()` 才会正常返回。启动或后台容量
+失败会抛出 `OpenSandboxWarmPoolUnavailableError`，Manager 关闭后会抛出
+`OpenSandboxManagerClosedError`。
+
 ## Backend 和 handle
 
 | API | 用途 |
@@ -83,6 +87,7 @@
 | `OpenSandboxBinding` | `sandbox_id`、`generation` |
 | `OpenSandboxOwnerClaim` | owner key、摘要、token、generation、可选 binding |
 | `OpenSandboxWarmClaim` | slot、token、generation |
+| `OpenSandboxReadyWarmClaim` | warm claim 字段和已发布 Sandbox ID |
 | `OpenSandboxCleanupClaim` | sandbox ID、token、generation |
 
 这些类型主要用于自定义 `OpenSandboxState`，普通 manager 使用者不需要手工创建。

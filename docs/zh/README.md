@@ -13,7 +13,6 @@ TinkerFin 用来运行 Deep Agents、记录语义执行轨迹、把实时过程�
 | 3 | [Tracing](tracing/index.md) | 查询语义消息、执行树、状态和交互 |
 | 4 | [Messaging](messaging/index.md) | 保存、回放、续传和取消事件流 |
 | 5 | [Sandbox](sandbox/index.md) | 让 Agent 在隔离环境中读写文件和执行命令 |
-| 6 | [仓库测试](development/testing.md) | 运行普通测试和临时 Docker 集成测试 |
 
 ## 先认识几个词
 

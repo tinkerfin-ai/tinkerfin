@@ -36,6 +36,7 @@ class ContentBatcher:
         self._now = now
         self._message_id: str | None = None
         self._buffer: list[str] = []
+        self._buffer_chars = 0
         self._raw_event: object | None = None
         self._buffer_started_at: float | None = None
 
@@ -77,8 +78,10 @@ class ContentBatcher:
             self._message_id = message_id
             self._raw_event = event.raw_event
             self._buffer_started_at = now
-        self._buffer.append(event.delta or "")
-        if sum(len(chunk) for chunk in self._buffer) >= self._char_threshold:
+        delta = event.delta or ""
+        self._buffer.append(delta)
+        self._buffer_chars += len(delta)
+        if self._buffer_chars >= self._char_threshold:
             emitted.extend(self._flush())
         return emitted
 
@@ -87,6 +90,7 @@ class ContentBatcher:
             return []
         if self._message_id is None:
             self._buffer = []
+            self._buffer_chars = 0
             self._raw_event = None
             self._buffer_started_at = None
             return []
@@ -96,6 +100,7 @@ class ContentBatcher:
             raw_event=self._raw_event,
         )
         self._buffer = []
+        self._buffer_chars = 0
         self._message_id = None
         self._raw_event = None
         self._buffer_started_at = None

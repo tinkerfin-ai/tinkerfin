@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import date
-from typing import Annotated, Generic, Literal, TypeAlias, TypeVar, cast
+from datetime import UTC, date, datetime, time
+from typing import Annotated, ClassVar, Generic, Literal, TypeAlias, TypeVar, cast
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 from pydantic.alias_generators import to_camel
@@ -180,8 +181,154 @@ class DateQuestion(ClarificationQuestionBase, Generic[QuestionAttributesT]):
     )
 
 
+def _require_minute_precision(value: time, *, field: str) -> None:
+    if value.tzinfo is not None:
+        raise ValueError(f"{field} must not contain a UTC offset")
+    if value.second != 0 or value.microsecond != 0:
+        raise ValueError(f"{field} must use minute precision")
+
+
+def _require_local_datetime_minute(value: datetime, *, field: str) -> None:
+    if value.tzinfo is not None:
+        raise ValueError(f"{field} must not contain a UTC offset")
+    if value.second != 0 or value.microsecond != 0:
+        raise ValueError(f"{field} must use minute precision")
+
+
+def _resolve_local_datetime(
+    value: datetime,
+    zone: ZoneInfo,
+    *,
+    field: str,
+) -> datetime:
+    """Return one unique zoned instant or reject a DST gap or fold."""
+
+    _require_local_datetime_minute(value, field=field)
+    candidates: dict[datetime, datetime] = {}
+    for fold in (0, 1):
+        aware = value.replace(tzinfo=zone, fold=fold)
+        instant = aware.astimezone(UTC)
+        if instant.astimezone(zone).replace(tzinfo=None) == value:
+            candidates.setdefault(instant, aware)
+    if not candidates:
+        raise ValueError(f"{field} identifies a nonexistent local minute")
+    if len(candidates) != 1:
+        raise ValueError(f"{field} identifies an ambiguous local minute")
+    return next(iter(candidates.values()))
+
+
+class _TimeZoneQuestionBase(
+    ClarificationQuestionBase,
+    Generic[QuestionAttributesT],
+):
+    """Shared IANA time-zone contract for local temporal questions."""
+
+    time_zone: ClarificationText = Field(
+        description="IANA time zone used to interpret and display the local answer",
+    )
+    attributes: QuestionAttributesT | None = Field(
+        default=None,
+        description="Optional non-authoritative host metadata exposed to users",
+    )
+
+    @model_validator(mode="after")
+    def time_zone_is_valid(
+        self,
+    ) -> _TimeZoneQuestionBase[QuestionAttributesT]:
+        """Reject a zone that cannot resolve local answers to civil time."""
+
+        try:
+            ZoneInfo(self.time_zone)
+        except (ZoneInfoNotFoundError, ValueError) as error:
+            raise ValueError("time_zone must be a valid IANA time zone") from error
+        return self
+
+    def _time_zone_info(self) -> ZoneInfo:
+        """Return the zone already validated by the inherited model contract."""
+
+        return ZoneInfo(self.time_zone)
+
+
+class TimeQuestion(
+    _TimeZoneQuestionBase[QuestionAttributesT],
+    Generic[QuestionAttributesT],
+):
+    """Question answered by one local wall-clock minute in an IANA time zone."""
+
+    answer_type: Literal["time"] = "time"
+    minimum: time | None = Field(
+        default=None,
+        description="Optional inclusive local lower bound at minute precision",
+    )
+    maximum: time | None = Field(
+        default=None,
+        description="Optional inclusive local upper bound at minute precision",
+    )
+
+    @model_validator(mode="after")
+    def time_contract_is_satisfiable(self) -> TimeQuestion[QuestionAttributesT]:
+        """Require one non-wrapping minute range."""
+
+        if self.minimum is not None:
+            _require_minute_precision(self.minimum, field="minimum")
+        if self.maximum is not None:
+            _require_minute_precision(self.maximum, field="maximum")
+        if (
+            self.minimum is not None
+            and self.maximum is not None
+            and self.minimum > self.maximum
+        ):
+            raise ValueError("minimum must be earlier than or equal to maximum")
+        return self
+
+
+class DateTimeQuestion(
+    _TimeZoneQuestionBase[QuestionAttributesT],
+    Generic[QuestionAttributesT],
+):
+    """Question answered by one unique local datetime in an IANA time zone."""
+
+    answer_type: Literal["datetime"] = "datetime"
+    minimum: datetime | None = Field(
+        default=None,
+        description="Optional inclusive local lower bound at minute precision",
+    )
+    maximum: datetime | None = Field(
+        default=None,
+        description="Optional inclusive local upper bound at minute precision",
+    )
+
+    @model_validator(mode="after")
+    def datetime_contract_is_satisfiable(
+        self,
+    ) -> DateTimeQuestion[QuestionAttributesT]:
+        """Require a real zone, unique local bounds, and an ordered instant range."""
+
+        zone = self._time_zone_info()
+        minimum = (
+            None
+            if self.minimum is None
+            else _resolve_local_datetime(self.minimum, zone, field="minimum")
+        )
+        maximum = (
+            None
+            if self.maximum is None
+            else _resolve_local_datetime(self.maximum, zone, field="maximum")
+        )
+        if minimum is not None and maximum is not None and minimum > maximum:
+            raise ValueError("minimum must be earlier than or equal to maximum")
+        return self
+
+
 class ClarificationFormBase(ClarificationModel):
-    """Core fields and invariants for a Plan clarification form."""
+    """Core fields and invariants for a Plan clarification form.
+
+    ``default_time_zone`` supplies the IANA zone copied into omitted ``timeZone``
+    fields when a Definition binds ``TimeQuestion`` and ``DateTimeQuestion`` models.
+    Individual questions can always declare a different zone explicitly.
+    """
+
+    default_time_zone: ClassVar[str] = "UTC"
 
     @model_validator(mode="after")
     def question_ids_are_unique(self) -> ClarificationFormBase:
@@ -224,7 +371,9 @@ class BuiltInClarificationForm(
             SingleChoiceQuestion[QuestionAttributesT, OptionT]
             | MultipleChoiceQuestion[QuestionAttributesT, OptionT]
             | TextQuestion[QuestionAttributesT]
-            | DateQuestion[QuestionAttributesT],
+            | DateQuestion[QuestionAttributesT]
+            | TimeQuestion[QuestionAttributesT]
+            | DateTimeQuestion[QuestionAttributesT],
             Field(discriminator="answer_type"),
         ],
         ...,
@@ -246,7 +395,9 @@ BuiltInQuestion: TypeAlias = Annotated[
         ClarificationModel, ClarificationOption[ClarificationModel]
     ]
     | TextQuestion[ClarificationModel]
-    | DateQuestion[ClarificationModel],
+    | DateQuestion[ClarificationModel]
+    | TimeQuestion[ClarificationModel]
+    | DateTimeQuestion[ClarificationModel],
     Field(discriminator="answer_type"),
 ]
 
@@ -307,6 +458,34 @@ class DateResponse(ClarificationResponseBase):
     date: date
 
 
+class TimeResponse(ClarificationResponseBase):
+    """Untrusted local time response serialized at minute precision."""
+
+    answer_type: Literal["time"] = "time"
+    time: time
+
+    @model_validator(mode="after")
+    def answer_uses_local_minute_precision(self) -> TimeResponse:
+        """Reject offsets and hidden seconds before checkpoint normalization."""
+
+        _require_minute_precision(self.time, field="time")
+        return self
+
+
+class DateTimeResponse(ClarificationResponseBase):
+    """Untrusted local datetime response serialized at minute precision."""
+
+    answer_type: Literal["datetime"] = "datetime"
+    date_time: datetime
+
+    @model_validator(mode="after")
+    def answer_uses_local_minute_precision(self) -> DateTimeResponse:
+        """Reject offsets and hidden seconds before time-zone resolution."""
+
+        _require_local_datetime_minute(self.date_time, field="date_time")
+        return self
+
+
 class SkippedResponse(ClarificationModel):
     """Explicit skip for one optional clarification question."""
 
@@ -314,7 +493,12 @@ class SkippedResponse(ClarificationModel):
 
 
 BuiltInResponse: TypeAlias = Annotated[
-    SingleChoiceResponse | MultipleChoiceResponse | TextResponse | DateResponse,
+    SingleChoiceResponse
+    | MultipleChoiceResponse
+    | TextResponse
+    | DateResponse
+    | TimeResponse
+    | DateTimeResponse,
     Field(discriminator="answer_type"),
 ]
 
@@ -335,6 +519,8 @@ __all__ = [
     "ClarificationTypeId",
     "DateQuestion",
     "DateResponse",
+    "DateTimeQuestion",
+    "DateTimeResponse",
     "DefaultClarificationForm",
     "MultipleChoiceQuestion",
     "MultipleChoiceResponse",
@@ -343,4 +529,6 @@ __all__ = [
     "SkippedResponse",
     "TextQuestion",
     "TextResponse",
+    "TimeQuestion",
+    "TimeResponse",
 ]

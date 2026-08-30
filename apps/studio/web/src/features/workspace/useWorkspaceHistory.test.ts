@@ -235,6 +235,34 @@ describe('useWorkspaceHistory Trace pagination authority', () => {
     expect(merged?.trace?.asOfSeq).toBe(6)
   })
 
+  it('accepts a newer waiting summary and requires fresh Trace hydration', () => {
+    const terminal = detail({
+      asOfSeq: 6,
+      status: { execution: 'succeeded', headRunId: RUN_ID },
+      updatedAt: '2026-08-28T00:00:10.000Z',
+    })
+    const current = {
+      ...restoreConversationFromTrace(terminal, { model: 'fallback' }),
+      isHydrated: true,
+    }
+    const waiting = {
+      ...historyItemFromDetail(terminal),
+      status: 'waiting_approval',
+      pendingInteractionKind: 'plan_review' as const,
+      hasPendingInterrupt: true,
+      updatedAt: '2026-08-28T00:00:11.000Z',
+    }
+
+    const merged = mergeHistoryConversations([current], [waiting], 'fallback')[0]
+
+    expect(merged).toMatchObject({
+      runStatus: 'waiting_approval',
+      pendingInteractionKind: 'plan_review',
+      updatedAt: waiting.updatedAt,
+      isHydrated: false,
+    })
+  })
+
   it('keeps multiple same-kind Tool groups visible in a synthesized summary', () => {
     const source = detail({
       interactions: [

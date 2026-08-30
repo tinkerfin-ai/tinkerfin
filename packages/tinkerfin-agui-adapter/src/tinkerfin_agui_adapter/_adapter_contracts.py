@@ -712,6 +712,7 @@ def _tool_call_id_groups_for_actions(
                 call.namespace != namespace
                 or call.tool_call_id in seen_tool_ids
                 or call.parent_message_id is None
+                or call.tool_call_id in self._result_fingerprints
             ):
                 continue
             seen_tool_ids.add(call.tool_call_id)

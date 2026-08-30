@@ -7,8 +7,12 @@
 ## Consume the object stream
 
 ```python
-runtime = agent.new(identity=identity)
-stream = runtime.astream(graph_input, config)
+stream = await tinkerfin.open_run(
+    identity,
+    agent=agent,
+    input=graph_input,
+    config=config,
+)
 
 try:
     async for part in stream:
@@ -44,7 +48,8 @@ Each `chunk` is an encoded SSE string. The default mapper supports TinkerFin's n
 | `mapper` | `None` | Converts a stream object into `SsePayload` |
 | `event_id_resolver` | `None` | Produces the SSE `id` for each event |
 
-`AgUiEventStream.to_sse()` does not accept `timeout`; configure its run timeout when creating the AG-UI Runtime.
+`AgUiEventStream.to_sse()` does not accept `timeout`; configure `stream_timeout` on
+`open_agui_run()`.
 
 ## Customize event names and data
 

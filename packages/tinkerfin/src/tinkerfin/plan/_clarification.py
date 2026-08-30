@@ -5,9 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass
 from types import MappingProxyType, NoneType
 from typing import Annotated, Any, cast, get_args, get_origin
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, create_model
@@ -19,12 +21,14 @@ from .clarification import (
     ClarificationOptionBase,
     ClarificationQuestionBase,
     DateQuestion,
+    DateTimeQuestion,
     MultipleChoiceQuestion,
     MultipleChoiceResponse,
     SingleChoiceQuestion,
     SingleChoiceResponse,
     SkippedResponse,
     TextQuestion,
+    TimeQuestion,
 )
 from .clarification_types import (
     BUILTIN_CLARIFICATION_TYPES,
@@ -50,6 +54,8 @@ _BUILTIN_QUESTION_BASES: dict[str, type[ClarificationQuestionBase]] = {
     "multiple_choice": MultipleChoiceQuestion,
     "text": TextQuestion,
     "date": DateQuestion,
+    "time": TimeQuestion,
+    "datetime": DateTimeQuestion,
 }
 
 
@@ -383,6 +389,60 @@ def _compose_form_schema(
     return bound
 
 
+def _validated_default_time_zone(
+    form_schema: type[ClarificationFormBase],
+) -> str:
+    """Freeze one valid IANA default before publishing a Definition contract."""
+
+    value = form_schema.default_time_zone
+    if not isinstance(value, str):
+        raise PlanModeConfigurationError(
+            "clarification_schema.default_time_zone must be a valid IANA time zone"
+        )
+    try:
+        ZoneInfo(value)
+    except (ZoneInfoNotFoundError, ValueError) as error:
+        raise PlanModeConfigurationError(
+            "clarification_schema.default_time_zone must be a valid IANA time zone",
+            cause=error,
+        ) from error
+    return value
+
+
+def _bind_question_default_time_zone(
+    question_model: type[ClarificationQuestionBase],
+    *,
+    default_time_zone: str,
+) -> type[ClarificationQuestionBase]:
+    """Publish a form-owned zone as the actual question field default.
+
+    A concrete derived model is necessary because Pydantic otherwise keeps the
+    generic question's required field in the Planner JSON Schema. Copying the complete
+    ``FieldInfo`` preserves host constraints, aliases, and descriptions while making
+    the effective default visible to structured-output providers and fingerprints.
+    """
+
+    field = question_model.model_fields.get("time_zone")
+    if field is None:
+        raise PlanModeConfigurationError(
+            "built-in time questions must define the framework time_zone field"
+        )
+    if field.default == default_time_zone:
+        return question_model
+    bound_field = deepcopy(field)
+    bound_field.default = default_time_zone
+    bound_field.default_factory = None
+    bound_field.validate_default = True
+    bound = create_model(
+        f"{question_model.__name__}WithFormDefault",
+        __base__=question_model,
+        __module__=question_model.__module__,
+        __doc__=question_model.__doc__,
+        time_zone=(field.annotation, bound_field),
+    )
+    return bound
+
+
 def _schema_fingerprint(value: object) -> str:
     payload: object = value
     if isinstance(value, type) and issubclass(value, BaseModel):
@@ -411,6 +471,7 @@ def create_clarification_binding(
     """Create one immutable complete clarification contract for a Definition."""
 
     form_schema, question_count, question_models = _validate_form_schema(schema)
+    default_time_zone = _validated_default_time_zone(form_schema)
     descriptors: dict[str, ClarificationType[Any, Any]] = {
         item.type_id: item for item in BUILTIN_CLARIFICATION_TYPES
     }
@@ -441,7 +502,16 @@ def create_clarification_binding(
                 f"question model does not match clarification type: {type_id}"
             )
 
-    if custom_types:
+    original_question_models = dict(question_models)
+    for type_id in ("time", "datetime"):
+        question_model = question_models.get(type_id)
+        if question_model is not None:
+            question_models[type_id] = _bind_question_default_time_zone(
+                question_model,
+                default_time_zone=default_time_zone,
+            )
+
+    if custom_types or question_models != original_question_models:
         form_schema = _compose_form_schema(
             form_schema,
             question_count,
@@ -612,6 +682,22 @@ def _answered_schema(question: ClarificationQuestionBase) -> dict[str, JsonValue
     elif isinstance(question, DateQuestion):
         properties["date"] = {"type": "string", "format": "date"}
         required.append("date")
+    elif isinstance(question, TimeQuestion):
+        properties["time"] = {
+            "type": "string",
+            "format": "time",
+            "pattern": r"^(?:[01][0-9]|2[0-3]):[0-5][0-9](?::00)?$",
+        }
+        required.append("time")
+    elif isinstance(question, DateTimeQuestion):
+        properties["dateTime"] = {
+            "type": "string",
+            "pattern": (
+                r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T"
+                r"(?:[01][0-9]|2[0-3]):[0-5][0-9](?::00)?$"
+            ),
+        }
+        required.append("dateTime")
     else:
         raise TypeError(
             "custom clarification questions require their registered Schema"

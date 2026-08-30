@@ -13,7 +13,6 @@ If this is your first time using TinkerFin, read these sections in order.
 | 3 | [Tracing](tracing/index.md) | Query semantic messages, execution trees, state, and interactions |
 | 4 | [Messaging](messaging/index.md) | Persist, replay, resume, and cancel streams |
 | 5 | [Sandbox](sandbox/index.md) | Let an agent work with files and commands in isolation |
-| 6 | [Repository testing](development/testing.md) | Run ordinary and disposable Docker integration tests |
 
 ## A few terms first
 

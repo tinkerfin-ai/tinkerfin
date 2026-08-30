@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Self
+from typing import ClassVar, Self
 
 from pydantic import Field, model_validator
 
@@ -31,7 +31,9 @@ class StudioPlanClarificationOption(ClarificationOptionBase):
 class StudioPlanClarificationForm(
     BuiltInClarificationForm[ClarificationModel, StudioPlanClarificationOption]
 ):
-    """由 Planner 生成并供 Studio 用户回答的澄清表单"""
+    """按上海时区展示时间的澄清表单"""
+
+    default_time_zone: ClassVar[str] = "Asia/Shanghai"
 
     title: str = Field(
         description="根据本次澄清问题生成简洁、用户可见的表单标题",

@@ -646,6 +646,21 @@ async def _start_once(self: SQLAlchemyOpenSandboxState, *, warm_pool_size: int) 
             )
         }
         if not active_capacities:
+            # No live worker can still own a warm transition. Releasing every stale
+            # claim lets the next manager validate published IDs or refill empty slots
+            # before it reports readiness.
+            await connection.execute(
+                update(_warm_slots)
+                .where(
+                    _warm_slots.c.namespace == self._namespace,
+                    _warm_slots.c.slot < warm_pool_size,
+                )
+                .values(
+                    claim_token=None,
+                    lease_expires_at=None,
+                    updated_at=now,
+                )
+            )
             for slot, sandbox_id in existing_slots.items():
                 if slot < warm_pool_size:
                     continue

@@ -2404,6 +2404,7 @@ name = "tinkerfin"
 version = "0.1.0"
 source = { editable = "packages/tinkerfin" }
 dependencies = [
+    { name = "anyio" },
     { name = "deepagents" },
     { name = "jsonschema" },
     { name = "langchain" },
@@ -2413,6 +2414,7 @@ dependencies = [
     { name = "tinkerfin-contracts" },
     { name = "tinkerfin-native-stream" },
     { name = "typing-extensions" },
+    { name = "tzdata" },
     { name = "wcmatch" },
 ]
 
@@ -2428,6 +2430,7 @@ redis = [
 [package.metadata]
 requires-dist = [
     { name = "ag-ui-protocol", marker = "extra == 'agui'", specifier = "==0.1.19" },
+    { name = "anyio", specifier = ">=4,<5" },
     { name = "deepagents", specifier = "==0.7.5" },
     { name = "jsonschema", specifier = ">=4.25,<5" },
     { name = "langchain", specifier = "==1.3.14" },
@@ -2439,6 +2442,7 @@ requires-dist = [
     { name = "tinkerfin-contracts", editable = "packages/tinkerfin-contracts" },
     { name = "tinkerfin-native-stream", editable = "packages/tinkerfin-native-stream" },
     { name = "typing-extensions", specifier = ">=4.12.2,<5" },
+    { name = "tzdata", specifier = ">=2025.2" },
     { name = "wcmatch", specifier = ">=11,<12" },
 ]
 provides-extras = ["agui", "redis"]
@@ -2811,6 +2815,15 @@ dependencies = [
 sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/6d/bc/4eae18cd40c65798a16267572ba346c11f599d44b01603dbd843342042bc/typing_inspection-0.4.3.tar.gz", hash = "sha256:c5f9ec1530b5c1e2c9bc34a84d9a3466ed1b2f3f2fa9f901368d9c5596210e4d", size = 76711, upload-time = "2026-08-10T09:39:18.063Z" }
 wheels = [
     { url = "https://pypi.tuna.tsinghua.edu.cn/packages/42/f7/7a3935abdebd5cf18705a5f0335dd6a3a18bef3baa7cb9edc3b6b9922cc8/typing_inspection-0.4.3-py3-none-any.whl", hash = "sha256:5f42b23858a91e0b4ef521f5418f03a0da3c9216fd2995ef5e73463100e676cd", size = 14693, upload-time = "2026-08-10T09:39:16.693Z" },
+]
+
+[[package]]
+name = "tzdata"
+version = "2026.3"
+source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
+sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/92/ff/5a28bdfd8c3ebec42564ac7d0e54ca3db65044a9314a97f9564fa7a1e926/tzdata-2026.3.tar.gz", hash = "sha256:4a1518b8993086a7982523e071643f3c0e5f213e75b21318e78bcabfff9d1415", size = 198674, upload-time = "2026-07-10T08:50:37.887Z" }
+wheels = [
+    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/e5/6d/b53b99a9f2766d095985947a5782f1702cabb129a34f7a802d7197af832f/tzdata-2026.3-py2.py3-none-any.whl", hash = "sha256:dc096730c87af6cab1b171c9d532be840741ff5d459015e7f6947bd7d7e54931", size = 348168, upload-time = "2026-07-10T08:50:36.46Z" },
 ]
 
 [[package]]

@@ -28,10 +28,15 @@ agent = TinkerFin().create_deep_agent(
 ## Plan 需求澄清和审批
 
 通过 `TinkerFin().plan(enabled=True)` 创建的 Agent 还会因为两类 Runtime 原因暂停。本次
-请求需要在创建 Runtime 时选择 `mode="plan"`：
+请求使用 `mode="plan"`：
 
 ```python
-runtime = agent.new_agui(identity=identity, mode="plan")
+events = await tinkerfin.open_agui_run(
+    identity,
+    agent=agent,
+    input=graph_input,
+    mode="plan",
+)
 ```
 
 | `reason` | `resolved` 时的 payload |
@@ -54,9 +59,9 @@ Form 并派生所选 Option label。`answers` object 必须完整覆盖每个 ch
 包含未知 key。提交其他 `answerType` 的字段、违反多选数量、无效日期、跳过必填题或使用未知 Option
 ID 都会在 Graph 消费 resume 前失败。
 
-Plan interrupt 使用同一套 `DeepAgentDefinition.prepare_agui_resume(...)`，不需要另一套恢复
-API。Definition 从权威 checkpoint 恢复可信 envelope 和完整待处理集合，Planning Graph 校验
-响应契约，并拒绝过期的 `baseRevision`。每次恢复使用新的 `runId`，同时保持原 `threadId`。
+Plan 与 Tool interrupt 使用同一套 `open_agui_run(resume=...)`。框架从权威 checkpoint 恢复可信
+envelope 和完整待处理集合，Planning Graph 校验响应契约，并拒绝过期的 `baseRevision`。每次
+恢复使用新的 `runId`，同时保持原 `threadId`。
 
 同一待处理批次不能混合 Plan interrupt 与 Tool interrupt。Plan 批准后仍可能在执行阶段
 产生 Tool 审批；后续恢复会继续使用原来的 scoped Tool ID。
@@ -92,48 +97,35 @@ mode 不会批准、拒绝或取消待处理的 Tool/Filesystem 审批。
 
 服务端应读取当前完整的待处理集合，并要求恢复请求一次覆盖全部待处理项。不要只凭前端传来的 interrupt 内容恢复。
 
-## 从权威 checkpoint 准备恢复
+## 从权威 checkpoint 恢复
 
-普通宿主只把客户端决定交给框架。Definition 会从同一 checkpoint thread 读取当前 pending
+普通宿主只把客户端决定交给框架。Managed 门面会从同一 checkpoint thread 读取当前 pending
 interrupt、完整消息、lineage 和 Runtime Profile：
 
 ```python
 from tinkerfin import AgUiResumeRequest
 
 
-request = AgUiResumeRequest(entries=tuple(resume_entries))
-binding = await agent.prepare_agui_resume(
-    identity=resume_identity,
+events = await tinkerfin.open_agui_run(
+    resume_identity,
+    agent=agent,
+    resume=AgUiResumeRequest(entries=tuple(resume_entries)),
     parent_run_id=parent_run_id,
-    request=request,
+    config=config,
+    on_resume_saved=record_checkpoint_idempotently,
+    on_resume_not_saved=release_unprepared_claim_idempotently,
 )
 ```
 
 `AgUiResumeRequest` 会拒绝重复 ID，且不包含服务端 interrupt payload、原生 Command、checkpoint
-身份或 Runtime Profile 选择。准备阶段要求完整覆盖 pending 集合，并使用 checkpoint 中的完整
-消息证明 Tool 关联。未知、过期、缺失或不允许的决定都会在 Graph 继续前失败。
-
-Binding 只传一次，原生 Command 由 Runtime 管理：
-
-```python
-runtime = agent.new_agui(
-    identity=identity,
-    parent_run_id=parent_run_id,
-    resume=binding,
-    on_resume_checkpointed=record_checkpoint_idempotently,
-    on_resume_initialization_failed=release_unprepared_claim_idempotently,
-)
-events = runtime.astream(config=config)
-```
-
-`AgUiResumeBinding` 保存框架解析后的原生 interrupt group、scoped Tool ID、取消和已验证的子
-Agent 来源。它具有稳定 JSON 往返，但不保存 identity 或 parent，也不暴露 `Command`。应用仍需
-校验完整 HTTP 请求与权限，并原子认领公开 pending 集合。
+身份或 Runtime Profile 选择。解析阶段要求完整覆盖 pending 集合，并使用 checkpoint 中的完整
+消息证明 Tool 关联。未知、过期、缺失或不允许的决定都会在 Graph 继续前失败。应用仍需校验
+完整 HTTP 请求与权限，并原子认领公开 pending 集合。
 
 ## Adapter 高级恢复入口
 
-`prepare_agui_resume()` 是高层 checkpoint 路径。自行拥有完整原生 checkpoint 对象的 Adapter
-集成可以使用低层 mapper：
+`prepare_agui_resume()` 与 `AgUiResumeBinding` 继续作为自定义编排使用的高级 Definition 边界。
+自行拥有完整原生 checkpoint 对象的 Adapter 集成可以使用低层 mapper：
 
 ```python
 translation = ResumeMapper().map(
@@ -166,12 +158,12 @@ cancelled Tool 生成确定性的未执行 error `ToolMessage`。main、general-
 提交原生 decision 前，所选 Runtime Profile 会先在精确的 interrupted checkpoint 上持久写入
 私有 lineage 与 marker；这个阶段不执行 Graph node，也不替换 root、Planning 或子图的 pending
 work。只有这些写入可读后，框架才会在首条恢复后原生事件公开前调用
-`on_resume_checkpointed`。prepared 重试会再次交付同一个 `AgUiResumeCheckpoint`，因此回调必须
+`on_resume_saved`。prepared 重试会再次交付同一个 `AgUiResumeCheckpoint`，因此回调必须
 幂等；Graph 已接受的 decision 不会重复提交。decision-only 与 `None` continuation 都留在框架内部。
 
-如果 binding、staging 或流启动在 marker 可读前失败或取消，Runtime 会在受保护 close task 中调用
-`on_resume_initialization_failed`。宿主用这个幂等回调释放已认领的公开 interrupt 集合；prepared 或
-accepted 证据存在后不会调用，重试继续通过 `on_resume_checkpointed` 结算。
+如果请求解析、staging 或流启动在 marker 可读前失败或取消，Runtime 会通过受保护结算调用
+`on_resume_not_saved`。宿主用这个幂等回调释放已认领的公开 interrupt 集合；prepared 或
+accepted 证据存在后不会调用，重试继续通过 `on_resume_saved` 结算。
 
 ## 重试和并发
 
@@ -179,7 +171,7 @@ accepted 证据存在后不会调用，重试继续通过 `on_resume_checkpointe
 - 在业务存储中原子地认领待处理 interrupt，避免两个请求同时恢复；
 - 在 checkpoint 结算前保持客户端决定请求不变，重试时不得重新构造或接受客户端提供的
   interrupt metadata；
-- 只根据 `on_resume_checkpointed` 解决业务审批，不能根据 `RUN_STARTED`；
+- 只根据 `on_resume_saved` 解决业务审批，不能根据 `RUN_STARTED`；
 - 恢复后的 Tool 结果沿用原 Tool ID，不重复发送 Tool start、args 和 end。
 
 ## 常见错误
@@ -187,7 +179,7 @@ accepted 证据存在后不会调用，重试继续通过 `on_resume_checkpointe
 | 错误 | 常见原因 |
 | --- | --- |
 | `AgUiResumeBindingError` | ID 不存在、覆盖不完整、决定不允许、Schema payload 非法或缺少 Tool 关联数据 |
-| `ValueError` | binding 模式非法、通用 Runtime mixed cancellation 不支持或 Tool ID 不完整 |
+| `ValueError` | input/resume 选择非法、通用 Runtime mixed cancellation 不支持或 Tool ID 不完整 |
 | 恢复后找不到状态 | `RunIdentity.threadId` 改变，或没有配置 checkpointer |
 | 同一个操作执行两次 | 应用没有原子认领 interrupt，或重试没有复用已保存的恢复数据 |
 

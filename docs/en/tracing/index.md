@@ -37,19 +37,18 @@ from tinkerfin_tracing import Tracer
 
 
 tracer = Tracer()
-agent = (
-    TinkerFin()
-    .observe(tracer)
-    .create_deep_agent(
-        model="openai:gpt-5.4",
-        tools=[],
-    )
+tinkerfin = TinkerFin().observe(tracer)
+agent = tinkerfin.create_deep_agent(
+    model="openai:gpt-5.4",
+    tools=[],
 )
 
-runtime = agent.new(
-    identity=RunIdentity(threadId="thread-1", runId="run-1"),
+stream = await tinkerfin.open_run(
+    RunIdentity(threadId="thread-1", runId="run-1"),
+    agent=agent,
+    input=graph_input,
 )
-async for part in runtime.astream(graph_input):
+async for part in stream:
     consume(part)
 
 thread = await tracer.get("thread-1")
@@ -58,6 +57,7 @@ print(thread.tree.roots)
 print(thread.state.root)
 print(thread.interactions)
 print(thread.status.execution)
+print(thread.summary.pending_interactions)
 ```
 
 `.observe(...)` returns a separate configured `TinkerFin` factory. Each request opens a
@@ -72,7 +72,7 @@ Run fail-closed.
 window contains the latest 100 complete Turns:
 
 - `messages`, `tree`, and `interactions` use the Turn window;
-- `state`, `status`, and `completeness` cover the complete selected lineage at the fixed
+- `state` and `summary` cover the complete selected lineage at the fixed
   as-of sequence;
 - `await thread.load_older(limit=100)` expands only the historical window;
 - messages remain chronological while top-level Turn nodes are latest-first.
@@ -80,6 +80,11 @@ window contains the latest 100 complete Turns:
 A Turn starts with an ordinary or branch user input. Resume, approval, clarification,
 and Plan review create another Run segment in the same Turn. A new branch with new user
 input creates a new Turn.
+
+`thread.summary` contains cumulative status, completeness, message and Tool counts,
+pending interactions, and the maximum source `last_occurred_at`. These values do not
+depend on the visible Turn window. Every live `update.summary` is the complete cumulative
+value after that update, not a delta.
 
 If a thread has multiple branch heads, `get()` raises `AmbiguousTraceHead` and exposes
 the selectable Run IDs. Select one explicitly:
@@ -109,9 +114,10 @@ upserts/removals. Cancelling or closing the iterator releases its wait.
 writers prevent deletion; a cursor or handle from a deleted generation cannot address a
 recreated thread with the same ID.
 
-## Public-safe capture
+## Public history and safety
 
-`CapturePolicy.public_safe()` keeps public user and assistant content while enforcing
+`Tracer()` uses `CapturePolicy.public_history()`. It keeps public user, assistant, and
+complete Tool content without requiring a second Tool-name registry, while enforcing
 independent safety rules:
 
 - provider-private `additional_kwargs.reasoning_content` is removed without deleting a
@@ -121,11 +127,19 @@ independent safety rules:
   extra-mode structural facts before tracing;
 - Run and Runtime task payloads retain bounded structural metadata rather than repeated
   state or message bodies;
-- Tool arguments, results, and approval arguments are metadata-only unless a Tool name
-  and JSON Pointer path are explicitly allowlisted;
+- each newly observed Tool retains complete sanitized arguments, results, and public
+  review descriptions by default;
+- `ToolTraceCapture.metadata_only()` retains lifecycle without content,
+  `selected_content()` retains explicit RFC 6901 paths, and `disabled()` suppresses the
+  Tool facts;
 - oversized safe payloads carry an explicit omitted disposition instead of partial or
   silently truncated content.
 - non-finite numbers are rejected before JSON serialization.
+
+Hosts that require metadata-only Tool retention can select
+`CapturePolicy.public_safe(tool_rules=...)`. Its low-level `ToolCaptureRule` preserves
+the existing exact-name and JSON Pointer boundary without becoming a second Agent Tool
+registry on the ordinary path.
 
 Provider reasoning requires two independent opt-ins. Configure a verified extractor on
 `DeepAgentsV2RuntimeProfile`, then pass `ReasoningCapturePolicy.content()` to `Tracer`

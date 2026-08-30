@@ -60,6 +60,9 @@ from .errors import (
     OpenSandboxStateUnavailableError as OpenSandboxStateUnavailableError,
 )
 from .errors import (
+    OpenSandboxWarmPoolUnavailableError as OpenSandboxWarmPoolUnavailableError,
+)
+from .errors import (
     UnexpectedOpenSandboxBackendError as UnexpectedOpenSandboxBackendError,
 )
 from .errors import UnexpectedOpenSandboxStateError as UnexpectedOpenSandboxStateError
@@ -70,6 +73,7 @@ from .lifecycle import OpenSandboxClient as OpenSandboxClient
 from .lifecycle import OpenSandboxInitializer as OpenSandboxInitializer
 from .lifecycle import OpenSandboxManager as OpenSandboxManager
 from .lifecycle import OpenSandboxOwnerClaim as OpenSandboxOwnerClaim
+from .lifecycle import OpenSandboxReadyWarmClaim as OpenSandboxReadyWarmClaim
 from .lifecycle import OpenSandboxState as OpenSandboxState
 from .lifecycle import OpenSandboxWarmClaim as OpenSandboxWarmClaim
 from .middleware import (

@@ -17,15 +17,17 @@ from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 
 from tinkerfin_contracts import RunIdentity
 from tinkerfin_tracing.capture import CapturedValue
+from tinkerfin_tracing.codec import CanonicalTracePayloadCodec, EncodedTracePayload
 from tinkerfin_tracing.errors import (
     TraceStoreError,
     TraceStoreProtocolError,
     TraceStoreTimeout,
 )
-from tinkerfin_tracing.facts import RunFact
+from tinkerfin_tracing.facts import RunFact, TraceEvent, TraceSemanticFact
 from tinkerfin_tracing.sql_schema import TRACE_TABLE_NAMES
 from tinkerfin_tracing.sql_store import SqlAlchemyTraceStore, SqlTraceStoreOptions
 from tinkerfin_tracing.store import TraceProjectionCheckpoint
+from tinkerfin_tracing.writing import TraceBatchWriter, TraceWritePolicy
 
 
 def _identity(run_id: str = "run-sql") -> RunIdentity:
@@ -53,6 +55,45 @@ def _fact(
         config=captured,
         outcome="succeeded" if phase in {"terminal", "closed"} else None,
     )
+
+
+async def _ignore_committed(_events: tuple[TraceEvent, ...]) -> None:
+    return None
+
+
+async def test_sql_batch_admission_reuses_one_canonical_encoding_per_fact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = CanonicalTracePayloadCodec.encode_fact
+    encoded_observations: list[str] = []
+
+    def count_encoding(
+        codec: CanonicalTracePayloadCodec,
+        fact: TraceSemanticFact,
+    ) -> EncodedTracePayload:
+        encoded_observations.append(fact.source_observation_id)
+        return original(codec, fact)
+
+    monkeypatch.setattr(CanonicalTracePayloadCodec, "encode_fact", count_encoding)
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'encoding.db'}")
+    store = SqlAlchemyTraceStore(engine, namespace="encoding-test")
+    try:
+        writer = TraceBatchWriter(
+            await store.open_writer(_identity()),
+            policy=TraceWritePolicy(max_batch_delay_seconds=0),
+            on_committed=_ignore_committed,
+        )
+        await writer.submit((_fact("started"), _fact("input")), mandatory=False)
+        await writer.force()
+        await writer.aclose()
+    finally:
+        await engine.dispose()
+
+    assert encoded_observations == [
+        "observation-run-sql-started",
+        "observation-run-sql-input",
+    ]
 
 
 async def test_sqlite_store_auto_setup_round_trip_and_generation_delete(

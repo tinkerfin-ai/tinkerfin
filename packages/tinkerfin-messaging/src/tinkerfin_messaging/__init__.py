@@ -4,11 +4,17 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Never
 
+from .backend import ActiveRunStatus as ActiveRunStatus
 from .backend import BackendRunHandle as BackendRunHandle
+from .backend import FailedRunStatus as FailedRunStatus
+from .backend import FinalRunStatus as FinalRunStatus
 from .backend import MemoryBackend as MemoryBackend
 from .backend import MessagingBackend as MessagingBackend
 from .backend import PreparedRun as PreparedRun
 from .backend import RunStatus as RunStatus
+from .backend import is_active_run_status as is_active_run_status
+from .backend import is_failed_run_status as is_failed_run_status
+from .backend import is_final_run_status as is_final_run_status
 from .errors import BackendOwnershipLost as BackendOwnershipLost
 from .errors import CancellationUnsupported as CancellationUnsupported
 from .errors import CodecMismatch as CodecMismatch
@@ -58,14 +64,17 @@ from .sources import FiniteMessageSource as FiniteMessageSource
 from .sources import MessageSourceBinding as MessageSourceBinding
 from .sources import ProfiledDeferredMessageSource as ProfiledDeferredMessageSource
 from .sources import map_source as map_source
+from .sse import parse_sse_event_id as parse_sse_event_id
 
 if TYPE_CHECKING:
     from .agui import AgUiCodec as AgUiCodec
+    from .agui import create_agui_run_source as create_agui_run_source
     from .native import NativeStreamPart as NativeStreamPart
     from .native import NativeStreamPartCodec as NativeStreamPartCodec
     from .redis import RedisBackend as RedisBackend
 
 __all__ = [
+    "ActiveRunStatus",
     "AgUiCodec",
     "BackendOwnershipLost",
     "BackendRunHandle",
@@ -77,6 +86,8 @@ __all__ = [
     "CommittedCallback",
     "DecodedMessage",
     "DeferredMessageSource",
+    "FailedRunStatus",
+    "FinalRunStatus",
     "FiniteMessageSource",
     "InvalidCursor",
     "MemoryBackend",
@@ -123,7 +134,12 @@ __all__ = [
     "StreamDeleted",
     "StreamExpired",
     "UnexpectedMessagingBackendError",
+    "create_agui_run_source",
+    "is_active_run_status",
+    "is_failed_run_status",
+    "is_final_run_status",
     "map_source",
+    "parse_sse_event_id",
 ]
 
 
@@ -148,9 +164,9 @@ def _raise_missing_extra(
 def __getattr__(name: str) -> object:
     """Load optional integrations only when their public symbol is requested."""
 
-    if name == "AgUiCodec":
+    if name in {"AgUiCodec", "create_agui_run_source"}:
         try:
-            from .agui import AgUiCodec
+            from .agui import AgUiCodec, create_agui_run_source
         except ModuleNotFoundError as error:
             _raise_missing_extra(
                 error,
@@ -159,8 +175,9 @@ def __getattr__(name: str) -> object:
                 packages=("ag_ui",),
             )
 
-        globals()[name] = AgUiCodec
-        return AgUiCodec
+        globals()["AgUiCodec"] = AgUiCodec
+        globals()["create_agui_run_source"] = create_agui_run_source
+        return globals()[name]
     if name in {"NativeStreamPart", "NativeStreamPartCodec"}:
         try:
             from .native import NativeStreamPart, NativeStreamPartCodec

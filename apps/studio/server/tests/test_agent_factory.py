@@ -1,24 +1,18 @@
-"""请求级 Agent 事件源的延迟创建与公开行为"""
+"""Studio Agent 定义的模型、Plan、Tool 与资源装配合同"""
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from types import SimpleNamespace
 from typing import cast
 
 import pytest
-from ag_ui.core import BaseEvent, RunAgentInput, RunErrorEvent, RunStartedEvent
-from ag_ui.core.types import ResumeEntry
-from langchain.agents.middleware.types import InputAgentState
+from ag_ui.core import RunAgentInput
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from pydantic import SecretStr, ValidationError
 
-from tinkerfin import AgUiEventStream, AgUiResumeRequest, TinkerFin
+from tinkerfin import TinkerFin
 from tinkerfin.plan import PlanReviewAction
-from tinkerfin_agui_adapter import AgUiLifecycleEventFactory
-from tinkerfin_messaging import FiniteMessageSource, MemoryBackend, Messaging
-from tinkerfin_messaging.agui import AgUiCodec
+from tinkerfin_sandbox import OpenSandboxBackendUnavailableError
 from tinkerfin_sandbox.lifecycle.manager import OpenSandboxManager
 from tinkerfin_studio.agent import factory as factory_module
 from tinkerfin_studio.agent.factory import ConversationAgentFactory, _create_model
@@ -28,18 +22,6 @@ from tinkerfin_studio.agent.plan_content import StudioMarkdownPlanContent
 from tinkerfin_studio.conversation.request import ChatRequest
 from tinkerfin_studio.conversation.run_preparation import prepare_run_request
 from tinkerfin_studio.models.schemas import AgentModelConfig
-
-
-class _AgentEvents(FiniteMessageSource[BaseEvent]):
-    @property
-    def messaging_cancel_callback(
-        self,
-    ) -> Callable[[], Awaitable[list[BaseEvent]]]:
-        return self.abort
-
-    async def abort(self) -> list[BaseEvent]:
-        await self.aclose()
-        return []
 
 
 def _model_config() -> AgentModelConfig:
@@ -83,12 +65,11 @@ def _prepared(*, mode: str = "default"):
     )
 
 
-async def _owner_preflight() -> None:
-    return None
-
-
 def test_prepare_run_request_preserves_the_selected_agent_mode() -> None:
-    assert _prepared(mode="plan").mode == "plan"
+    prepared = _prepared(mode="plan")
+
+    assert prepared.mode == "plan"
+    assert "thread_id" not in prepared.graph_config.get("configurable", {})
 
 
 def test_studio_plan_content_requires_dynamic_description_and_markdown() -> None:
@@ -110,12 +91,12 @@ def test_studio_plan_content_requires_dynamic_description_and_markdown() -> None
     ((True, "enabled", True), (False, "disabled", False)),
 )
 def test_create_deepseek_model_explicitly_controls_thinking(
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
     reasoning_enabled: bool,
     thinking_type: str,
     has_reasoning_effort: bool,
 ) -> None:
-    """DeepSeek 的 reasoning 开关必须转换为显式 provider 参数"""
+    """把 Studio reasoning 开关转换为明确的模型参数"""
 
     captured: dict[str, object] = {}
     model = FakeListChatModel(responses=["unused"])
@@ -139,14 +120,17 @@ def test_create_deepseek_model_explicitly_controls_thinking(
     assert ("reasoning_effort" in captured) is has_reasoning_effort
 
 
-async def test_create_definition_configures_plan_models_and_product_hitl_decisions(
-    monkeypatch,
+async def test_create_agent_configures_plan_tools_and_borrowed_resources(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """主 Agent 保留 reasoning，并为 Plan 与 Tool 审批装配产品配置"""
+    """创建 Agent 时保留产品 Plan、审批和应用资源配置"""
 
     root_model = FakeListChatModel(responses=["root"])
     plan_model = FakeListChatModel(responses=["plan"])
     reasoning_overrides: list[bool | None] = []
+    sandbox = object()
+    composite_backend = object()
+    composite_options: dict[str, object] = {}
 
     def create_model(
         config: AgentModelConfig,
@@ -160,7 +144,7 @@ async def test_create_definition_configures_plan_models_and_product_hitl_decisio
     class SandboxManager:
         async def get(self, key: str) -> object:
             assert key == "users/7"
-            return object()
+            return sandbox
 
         def build_agent_middleware(self, backend: object) -> tuple[()]:
             del backend
@@ -180,11 +164,12 @@ async def test_create_definition_configures_plan_models_and_product_hitl_decisio
             return SimpleNamespace()
 
     monkeypatch.setattr(factory_module, "_create_model", create_model)
-    monkeypatch.setattr(
-        factory_module,
-        "CompositeBackend",
-        lambda **_kwargs: SimpleNamespace(),
-    )
+
+    def create_composite_backend(**options: object) -> object:
+        composite_options.update(options)
+        return composite_backend
+
+    monkeypatch.setattr(factory_module, "CompositeBackend", create_composite_backend)
     monkeypatch.setattr(
         factory_module,
         "StoreBackend",
@@ -195,14 +180,15 @@ async def test_create_definition_configures_plan_models_and_product_hitl_decisio
         "_read_subagents",
         lambda: factory_module._SubagentFile.model_validate({}),
     )
+    checkpointer = object()
+    store = object()
     tinkerfin = RecordingTinkerFin()
     factory = ConversationAgentFactory(
         persistence=cast(
             AgentPersistence,
-            SimpleNamespace(checkpointer=object(), store=object()),
+            SimpleNamespace(checkpointer=checkpointer, store=store),
         ),
         sandbox_manager=cast(OpenSandboxManager[str], SandboxManager()),
-        tinkerfin_profiles={"deepagents-v2": cast(TinkerFin, tinkerfin)},
         tavily_api_key=None,
     )
     config = _model_config().model_copy(
@@ -213,7 +199,11 @@ async def test_create_definition_configures_plan_models_and_product_hitl_decisio
         }
     )
 
-    await factory._create_definition(user_id=7, model_config=config)
+    await factory.create_agent(
+        tinkerfin=cast(TinkerFin, tinkerfin),
+        user_id=7,
+        model_config=config,
+    )
 
     assert reasoning_overrides == [None, False]
     assert tinkerfin.plan_options == {
@@ -223,11 +213,15 @@ async def test_create_definition_configures_plan_models_and_product_hitl_decisio
         "content_schema": StudioMarkdownPlanContent,
         "allowed_review_actions": (
             PlanReviewAction.APPROVE,
-            PlanReviewAction.RESPOND,
             PlanReviewAction.REJECT,
+            PlanReviewAction.CANCEL,
         ),
     }
     assert tinkerfin.definition_options["model"] is root_model
+    assert composite_options["default"] is sandbox
+    assert tinkerfin.definition_options["backend"] is composite_backend
+    assert tinkerfin.definition_options["checkpointer"] is checkpointer
+    assert tinkerfin.definition_options["store"] is store
     assert tinkerfin.definition_options["interrupt_on"] == {
         "write_file": {
             "allowed_decisions": ["approve", "reject"],
@@ -236,376 +230,30 @@ async def test_create_definition_configures_plan_models_and_product_hitl_decisio
     }
 
 
-async def test_create_agui_events_defers_definition_and_preserves_framework_start(
-    monkeypatch,
-) -> None:
-    """未拉取时不得建图，owner 拉取后应交付完整主运行元数据"""
+async def test_create_agent_propagates_sandbox_creation_failure() -> None:
+    """Sandbox 恢复或创建失败必须让当前 Agent Run 明确失败"""
 
-    definition_calls = 0
-    runtime_calls = 0
-    runtime_options: dict[str, object] = {}
+    expected = OpenSandboxBackendUnavailableError("Sandbox control plane unavailable")
 
-    class Runtime:
-        def astream(self, graph_input, config=None):
-            nonlocal runtime_calls
-            del graph_input, config
-            runtime_calls += 1
-            return _AgentEvents.from_events(
-                (
-                    AgUiLifecycleEventFactory().started(
-                        identity=_prepared().identity,
-                        parent_run_id=_prepared().parent_run_id,
-                    ),
-                )
-            )
-
-    class Definition:
-        def new_agui(self, **kwargs):
-            runtime_options.update(kwargs)
-            return Runtime()
-
-    async def create_definition(_factory, *, user_id, model_config):
-        nonlocal definition_calls
-        del user_id, model_config
-        definition_calls += 1
-        return Definition()
-
-    monkeypatch.setattr(
-        ConversationAgentFactory,
-        "_create_definition",
-        create_definition,
-        raising=False,
-    )
-    factory = ConversationAgentFactory(
-        persistence=cast(AgentPersistence, SimpleNamespace()),
-        sandbox_manager=cast(OpenSandboxManager[str], SimpleNamespace()),
-        tinkerfin_profiles={"deepagents-v2": TinkerFin()},
-        tavily_api_key=None,
-    )
-    model = _model_config()
-    prepared = _prepared()
-    events = factory.create_agui_events(
-        user_id=7,
-        model_config=model,
-        graph_input=cast(InputAgentState, {"messages": []}),
-        prepared=prepared,
-        resume=None,
-        title="会话标题",
-        on_producer_opened=_owner_preflight,
-    )
-
-    assert definition_calls == 0
-    assert runtime_calls == 0
-
-    emitted = [event async for event in events]
-
-    assert definition_calls == 1
-    assert runtime_calls == 1
-    assert runtime_options["mode"] == "default"
-    assert runtime_options["identity"] == prepared.identity
-    assert runtime_options["parent_run_id"] is None
-    assert "on_resume_checkpointed" not in runtime_options
-    assert "run_input" not in runtime_options
-    assert len(emitted) == 1
-    started = emitted[0]
-    assert isinstance(started, RunStartedEvent)
-    started_payload = started.model_dump(mode="python", by_alias=False)
-    assert started_payload["input"] is None
-    assert started_payload["title"] == "会话标题"
-
-
-async def test_create_agui_events_converts_owner_initialization_failure(
-    monkeypatch,
-) -> None:
-    """owner 初始化失败也必须产生完整且唯一的 AG-UI 错误生命周期"""
-
-    expected = RuntimeError("cannot initialize agent")
-
-    async def fail_definition(_factory, *, user_id, model_config):
-        del user_id, model_config
-        raise expected
-
-    monkeypatch.setattr(
-        ConversationAgentFactory,
-        "_create_definition",
-        fail_definition,
-    )
-    factory = ConversationAgentFactory(
-        persistence=cast(AgentPersistence, SimpleNamespace()),
-        sandbox_manager=cast(OpenSandboxManager[str], SimpleNamespace()),
-        tinkerfin_profiles={"deepagents-v2": TinkerFin()},
-        tavily_api_key=None,
-    )
-    prepared = _prepared()
-    events = factory.create_agui_events(
-        user_id=7,
-        model_config=_model_config(),
-        graph_input=cast(InputAgentState, {"messages": []}),
-        prepared=prepared,
-        resume=None,
-        title="会话标题",
-        on_producer_opened=_owner_preflight,
-    )
-
-    emitted = [event async for event in events]
-
-    assert [type(event) for event in emitted] == [RunStartedEvent, RunErrorEvent]
-    started = emitted[0]
-    failed = emitted[1]
-    assert isinstance(started, RunStartedEvent)
-    assert isinstance(failed, RunErrorEvent)
-    assert started.raw_event == {
-        "threadId": "thread-1",
-        "runId": "run-1",
-        "initializationFailed": True,
-    }
-    assert failed.code == "runtime_initialization_error"
-    assert failed.message == "Agent run failed"
-
-
-async def test_resume_initialization_failure_releases_uncheckpointed_claims(
-    monkeypatch,
-) -> None:
-    """Checkpointer 校验失败不得永久占用 Studio 的 interrupt ID"""
-
-    async def fail_definition(_factory, *, user_id, model_config):
-        del user_id, model_config
-        raise RuntimeError("cannot resolve resume")
-
-    monkeypatch.setattr(
-        ConversationAgentFactory,
-        "_create_definition",
-        fail_definition,
-    )
-    released = 0
-
-    async def release() -> None:
-        nonlocal released
-        released += 1
+    class FailingSandboxManager:
+        async def get(self, key: str) -> object:
+            assert key == "users/7"
+            raise expected
 
     factory = ConversationAgentFactory(
-        persistence=cast(AgentPersistence, SimpleNamespace()),
-        sandbox_manager=cast(OpenSandboxManager[str], SimpleNamespace()),
-        tinkerfin_profiles={"deepagents-v2": TinkerFin()},
-        tavily_api_key=None,
-    )
-    events = factory.create_agui_events(
-        user_id=7,
-        model_config=_model_config(),
-        graph_input=None,
-        prepared=_prepared(),
-        resume=AgUiResumeRequest(
-            entries=(
-                ResumeEntry(
-                    interrupt_id="interrupt-1#0",
-                    status="resolved",
-                    payload={"type": "approve"},
-                ),
-            )
+        persistence=cast(
+            AgentPersistence,
+            SimpleNamespace(checkpointer=object(), store=object()),
         ),
-        title="会话标题",
-        on_producer_opened=_owner_preflight,
-        on_resume_initialization_failed=release,
-    )
-
-    emitted = [event async for event in events]
-
-    assert released == 1
-    assert isinstance(emitted[-1], RunErrorEvent)
-
-
-async def test_resume_initialization_cancel_preserves_cancellation_when_release_fails(
-    monkeypatch,
-) -> None:
-    """marker 前取消不得被业务认领释放失败替换"""
-
-    entered = asyncio.Event()
-    release_attempts = 0
-
-    async def block_definition(_factory, *, user_id, model_config):
-        del user_id, model_config
-        entered.set()
-        await asyncio.Event().wait()
-
-    async def fail_release() -> None:
-        nonlocal release_attempts
-        release_attempts += 1
-        raise RuntimeError("claim release failed")
-
-    monkeypatch.setattr(
-        ConversationAgentFactory,
-        "_create_definition",
-        block_definition,
-    )
-    factory = ConversationAgentFactory(
-        persistence=cast(AgentPersistence, SimpleNamespace()),
-        sandbox_manager=cast(OpenSandboxManager[str], SimpleNamespace()),
-        tinkerfin_profiles={"deepagents-v2": TinkerFin()},
+        sandbox_manager=cast(OpenSandboxManager[str], FailingSandboxManager()),
         tavily_api_key=None,
     )
-    events = factory.create_agui_events(
-        user_id=7,
-        model_config=_model_config(),
-        graph_input=None,
-        prepared=_prepared(),
-        resume=AgUiResumeRequest(
-            entries=(
-                ResumeEntry(
-                    interrupt_id="interrupt-1#0",
-                    status="resolved",
-                    payload={"type": "approve"},
-                ),
-            )
-        ),
-        title="会话标题",
-        on_producer_opened=_owner_preflight,
-        on_resume_initialization_failed=fail_release,
-    )
 
-    async def consume() -> list[BaseEvent]:
-        return [event async for event in events]
-
-    consuming = asyncio.create_task(consume())
-    await asyncio.wait_for(entered.wait(), timeout=2)
-    consuming.cancel()
-    result = (await asyncio.gather(consuming, return_exceptions=True))[0]
-    await events.aclose()
-
-    assert isinstance(result, asyncio.CancelledError)
-    assert release_attempts == 1
-
-
-async def test_resume_setup_failure_remains_primary_when_release_fails(
-    monkeypatch,
-) -> None:
-    """marker 前业务清理失败不得替换 Agent 初始化错误终态"""
-
-    async def fail_definition(_factory, *, user_id, model_config):
-        del user_id, model_config
-        raise RuntimeError("cannot resolve resume")
-
-    async def fail_release() -> None:
-        raise ValueError("claim release failed")
-
-    monkeypatch.setattr(
-        ConversationAgentFactory,
-        "_create_definition",
-        fail_definition,
-    )
-    factory = ConversationAgentFactory(
-        persistence=cast(AgentPersistence, SimpleNamespace()),
-        sandbox_manager=cast(OpenSandboxManager[str], SimpleNamespace()),
-        tinkerfin_profiles={"deepagents-v2": TinkerFin()},
-        tavily_api_key=None,
-    )
-    events = factory.create_agui_events(
-        user_id=7,
-        model_config=_model_config(),
-        graph_input=None,
-        prepared=_prepared(),
-        resume=AgUiResumeRequest(
-            entries=(
-                ResumeEntry(
-                    interrupt_id="interrupt-1#0",
-                    status="resolved",
-                    payload={"type": "approve"},
-                ),
-            )
-        ),
-        title="会话标题",
-        on_producer_opened=_owner_preflight,
-        on_resume_initialization_failed=fail_release,
-    )
-
-    emitted = [event async for event in events]
-
-    assert isinstance(emitted[-1], RunErrorEvent)
-    assert emitted[-1].code == "runtime_initialization_error"
-
-
-async def test_remote_cancel_waits_for_deferred_agent_open_and_keeps_one_terminal(
-    monkeypatch,
-) -> None:
-    """打开期间的远程取消必须等待同一 Runtime 并提交唯一取消终止"""
-
-    opening = asyncio.Event()
-    release_open = asyncio.Event()
-    open_calls = 0
-
-    class Runtime:
-        def astream(self, graph_input, config=None) -> AgUiEventStream:
-            del graph_input, config
-
-            async def parts() -> AsyncIterator[Mapping[str, object]]:
-                await asyncio.Event().wait()
-                if False:  # pragma: no cover - 保持异步迭代器形状
-                    yield {}
-
-            return AgUiEventStream(
-                parts=parts(),
-                identity=_prepared().identity,
-                expose_reasoning_events=False,
-                expose_subagent_events=True,
-                prior_tool_call_ids=frozenset(),
-                timeout=None,
-                settlement_timeout=None,
-                on_event=None,
-            )
-
-    class Definition:
-        def new_agui(self, **kwargs):
-            del kwargs
-            return Runtime()
-
-    async def create_definition(_factory, *, user_id, model_config):
-        nonlocal open_calls
-        del user_id, model_config
-        open_calls += 1
-        opening.set()
-        await release_open.wait()
-        return Definition()
-
-    monkeypatch.setattr(
-        ConversationAgentFactory,
-        "_create_definition",
-        create_definition,
-    )
-    factory = ConversationAgentFactory(
-        persistence=cast(AgentPersistence, SimpleNamespace()),
-        sandbox_manager=cast(OpenSandboxManager[str], SimpleNamespace()),
-        tinkerfin_profiles={"deepagents-v2": TinkerFin()},
-        tavily_api_key=None,
-    )
-    prepared = _prepared()
-    events = factory.create_agui_events(
-        user_id=7,
-        model_config=_model_config(),
-        graph_input=cast(InputAgentState, {"messages": []}),
-        prepared=prepared,
-        resume=None,
-        title="会话标题",
-        on_producer_opened=_owner_preflight,
-    )
-
-    async with Messaging(backend=MemoryBackend()) as messaging:
-        channel = messaging.channel(name="events", codec=AgUiCodec())
-        subscription = await channel.wrap(
-            events,
-            after=0,
+    with pytest.raises(OpenSandboxBackendUnavailableError) as captured:
+        await factory.create_agent(
+            tinkerfin=TinkerFin(),
+            user_id=7,
+            model_config=_model_config(),
         )
-        await asyncio.wait_for(opening.wait(), timeout=1)
-        cancelling = asyncio.create_task(channel.cancel(identity=prepared.identity))
-        await asyncio.sleep(0)
-        assert not cancelling.done()
 
-        release_open.set()
-
-        assert await asyncio.wait_for(cancelling, timeout=1) is True
-        emitted = [message.data async for message in subscription]
-
-    assert open_calls == 1
-    assert [type(event) for event in emitted] == [RunStartedEvent, RunErrorEvent]
-    failed = emitted[-1]
-    assert isinstance(failed, RunErrorEvent)
-    assert failed.code == "cancelled"
-    assert failed.message == "聊天生成已取消"
+    assert captured.value is expected

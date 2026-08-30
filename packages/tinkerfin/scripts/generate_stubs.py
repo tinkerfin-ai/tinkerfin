@@ -232,16 +232,15 @@ def _render_deep_agent_stub() -> str:
     )
     content = f'''"""Typed public Runtime and Definition contracts generated from locked source."""
 
-# ruff: noqa: F403, F405
 # Generated from locked dependencies by scripts/generate_stubs.py; do not edit signatures manually.
-from collections.abc import Mapping, Sequence
-from typing import Generic, Literal, overload
+from collections.abc import AsyncIterator, Mapping, Sequence
+from typing import Any, Generic, Literal, overload
 
-from deepagents.graph import *
 from langchain.agents.middleware.types import InputAgentState
-from langchain_core.runnables import RunnableConfig
+from langchain_core.runnables import Runnable, RunnableConfig
 from langgraph.pregel.main import All, DeprecatedKwargs, Durability, RunControl, StreamMode
 from langgraph.types import Command
+from langgraph.typing import ContextT
 from typing_extensions import Unpack
 
 from tinkerfin_contracts import RunIdentity as RunIdentity
@@ -250,10 +249,42 @@ from .agui_resume import AgUiResumeBinding, AgUiResumeCheckpointObserver, AgUiRe
 from .plan import AgentMode
 from .runtime import AgUiEventStream, EventObserver, NativeGraphRunStream, PartObserver
 
+class DeepAgentGraph(
+    Runnable[InputAgentState | Command[object] | None, Mapping[str, object]]
+):
+    """Complete reusable async native or Plan-capable Graph."""
+
+    def invoke(
+        self,
+        input: InputAgentState | Command[object] | None,
+        config: RunnableConfig | None = None,
+        **kwargs: Any,
+    ) -> Mapping[str, object]: ...
+    async def ainvoke(
+        self,
+        input: InputAgentState | Command[object] | None,
+        config: RunnableConfig | None = None,
+        **kwargs: Any,
+    ) -> Mapping[str, object]: ...
+    def astream(
+        self,
+        input: InputAgentState | Command[object] | None,
+        config: RunnableConfig | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[Mapping[str, object]]: ...
+
 class DeepAgentRuntime(Generic[ContextT]):
     """Single-request Runtime preserving the native LangGraph object stream."""
 
-{_method(CompiledStateGraph.astream, canonical_stream_profile=True, docstring=_NATIVE_ASTREAM_DOC, replacements=astream_arguments, return_type="NativeGraphRunStream")}
+{
+        _method(
+            CompiledStateGraph.astream,
+            canonical_stream_profile=True,
+            docstring=_NATIVE_ASTREAM_DOC,
+            replacements=astream_arguments,
+            return_type="NativeGraphRunStream",
+        )
+    }
 
 class DeepAgentAgUiRuntime(Generic[ContextT]):
     """Single-request AG-UI Runtime requiring one explicit Graph input."""
@@ -284,10 +315,34 @@ class DeepAgentAgUiResumeRuntime(Generic[ContextT]):
         ...
 
 class DeepAgentDefinition(Generic[ContextT]):
-    """Store one Graph build call and create a fresh Graph for every Runtime."""
+    """Store one Graph build call and create a fresh Graph for every execution."""
 
+{_method(DeepAgentDefinition.create_graph, is_async=True, return_type="DeepAgentGraph")}
+{_method(DeepAgentDefinition._belongs_to, return_type="bool")}
+{_method(DeepAgentDefinition._resume_checkpointer, return_type="object | None")}
+{
+        _method(
+            DeepAgentDefinition._open_native_run,
+            is_async=True,
+            replacements={"_GraphInput": "InputAgentState | Command[object] | None"},
+            return_type="NativeGraphRunStream",
+        )
+    }
+{
+        _method(
+            DeepAgentDefinition._open_agui_run,
+            is_async=True,
+            return_type="AgUiEventStream",
+        )
+    }
 {_method(DeepAgentDefinition.new, return_type="DeepAgentRuntime[ContextT]")}
-{_method(DeepAgentDefinition.prepare_agui_resume, is_async=True, return_type="AgUiResumeBinding")}
+{
+        _method(
+            DeepAgentDefinition.prepare_agui_resume,
+            is_async=True,
+            return_type="AgUiResumeBinding",
+        )
+    }
     @overload
     def new_agui(
         self,
@@ -344,12 +399,28 @@ CREATE_DEEP_AGENT: object
 def _render_init_stub() -> str:
     content = f'''"""Typed root facade generated from the current Runtime implementation."""
 
-# ruff: noqa: F403, F405
 # Generated from locked dependencies by scripts/generate_stubs.py; do not edit signatures manually.
 from collections.abc import Callable, Sequence
 from typing import Any
 
-from deepagents.graph import *
+from deepagents import (
+    AsyncSubAgent,
+    CompiledSubAgent,
+    DeepAgentState,
+    FilesystemPermission,
+    SubAgent,
+)
+from deepagents.backends import BackendProtocol
+from langchain.agents.middleware import AgentMiddleware, InterruptOnConfig
+from langchain.agents.middleware.types import ResponseT, StateT_co
+from langchain.agents.structured_output import ResponseFormat
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import SystemMessage
+from langchain_core.tools import BaseTool
+from langgraph.cache.base import BaseCache
+from langgraph.store.base import BaseStore
+from langgraph.types import Checkpointer
+from langgraph.typing import ContextT
 
 from tinkerfin_contracts import RunIdentity as RunIdentity
 from tinkerfin_contracts import RuntimeObserver as _RuntimeObserver
@@ -436,7 +507,13 @@ class TinkerFin(_RuntimeTinkerFin):
             return_type="TinkerFin",
         )
     }
-{_method(create_deep_agent, add_self=True, return_type="DeepAgentDefinition[ContextT]")}
+{
+        _method(
+            create_deep_agent,
+            add_self=True,
+            return_type="DeepAgentDefinition[ContextT]",
+        )
+    }
 
 __all__: list[str]
 '''

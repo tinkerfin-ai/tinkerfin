@@ -6,9 +6,10 @@
 parts into validated AG-UI 0.1.19 events. It does not create a graph, invoke a model,
 query checkpoints, authenticate requests, or provide an HTTP server.
 
-Use it when an application already owns graph execution and needs only the conversion
-boundary. Applications that also need Graph binding, observed streams, and direct SSE
-can use [`tinkerfin`](https://pypi.org/project/tinkerfin/).
+Use it when an application already owns Graph execution and needs only the conversion
+boundary. Applications that need managed Graph construction, checkpoint resume,
+Observation, and stream cleanup can use
+[`TinkerFin.open_agui_run()`](https://github.com/tinkerfin-ai/tinkerfin/blob/main/docs/en/agui/index.md).
 
 ## Installation
 

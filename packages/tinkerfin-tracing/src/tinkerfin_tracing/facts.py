@@ -223,6 +223,13 @@ class SubagentFact(TraceFactBase):
     phase: Literal["started", "completed"]
     subagent_id: str = Field(min_length=1, max_length=2048)
     agent_name: str | None = Field(default=None, min_length=1, max_length=1024)
+    parent_tool_call_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=1024,
+        description="Raw parent task Tool call ID when Deep Agents provenance is proven",
+    )
+    input: CapturedValue | None = None
     status: Literal["running", "succeeded", "failed", "cancelled"]
 
 

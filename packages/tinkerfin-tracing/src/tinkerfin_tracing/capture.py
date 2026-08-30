@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Literal
+from collections.abc import Mapping
+from typing import Literal, Self
 
 from pydantic import Field, JsonValue, field_validator, model_validator
 
@@ -67,6 +68,7 @@ class ToolCaptureRule(TraceModel):
     tool_name: str = Field(min_length=1, max_length=1024)
     argument_paths: tuple[str, ...] = ()
     result_paths: tuple[str, ...] = ()
+    include_review_description: bool = False
 
     @field_validator("argument_paths", "result_paths")
     @classmethod
@@ -79,7 +81,98 @@ class ToolCaptureRule(TraceModel):
             raise ValueError("Tool capture paths must be canonical JSON Pointers")
         if len(set(paths)) != len(paths):
             raise ValueError("Tool capture paths must be unique")
+        if "" in paths and len(paths) != 1:
+            raise ValueError("The root Tool capture path must be used alone")
         return paths
+
+
+class ToolTraceCapture(TraceModel):
+    """Define how one Tool contributes content and lifecycle facts to Trace."""
+
+    mode: Literal[
+        "full_content",
+        "metadata_only",
+        "selected_content",
+        "disabled",
+    ]
+    argument_paths: tuple[str, ...] = ()
+    result_paths: tuple[str, ...] = ()
+    include_review_description: bool = False
+
+    @classmethod
+    def full_content(cls) -> Self:
+        """Trace lifecycle plus complete sanitized arguments, results, and review text."""
+
+        return cls(mode="full_content", include_review_description=True)
+
+    @classmethod
+    def metadata_only(cls) -> Self:
+        """Trace Tool lifecycle while retaining no argument or result content."""
+
+        return cls(mode="metadata_only")
+
+    @classmethod
+    def selected_content(
+        cls,
+        *,
+        argument_paths: tuple[str, ...] = (),
+        result_paths: tuple[str, ...] = (),
+        include_review_description: bool = False,
+    ) -> Self:
+        """Trace lifecycle plus explicitly selected RFC 6901 content paths.
+
+        Args:
+            argument_paths: Canonical JSON Pointers selected from Tool arguments.
+            result_paths: Canonical JSON Pointers selected from Tool results.
+            include_review_description: Whether a public review description may be
+                retained when selected arguments are available.
+
+        Returns:
+            An immutable selected-content setting for one Tool.
+        """
+
+        return cls(
+            mode="selected_content",
+            argument_paths=argument_paths,
+            result_paths=result_paths,
+            include_review_description=include_review_description,
+        )
+
+    @classmethod
+    def disabled(cls) -> Self:
+        """Suppress Tool lifecycle and content facts from Trace."""
+
+        return cls(mode="disabled")
+
+    @field_validator("argument_paths", "result_paths")
+    @classmethod
+    def paths_are_canonical_json_pointers(
+        cls, paths: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        """Require unique canonical pointers and one unambiguous root selection."""
+
+        if any(not _is_canonical_pointer(path) for path in paths):
+            raise ValueError("Tool capture paths must be canonical JSON Pointers")
+        if len(set(paths)) != len(paths):
+            raise ValueError("Tool capture paths must be unique")
+        if "" in paths and len(paths) != 1:
+            raise ValueError("The root Tool capture path must be used alone")
+        return paths
+
+    @model_validator(mode="after")
+    def paths_match_mode(self) -> ToolTraceCapture:
+        """Keep path and review settings exclusive to content-bearing modes."""
+
+        has_paths = bool(self.argument_paths or self.result_paths)
+        if self.mode != "selected_content" and has_paths:
+            raise ValueError("only selected_content accepts Tool capture paths")
+        if self.mode in {"metadata_only", "disabled"} and (
+            self.include_review_description
+        ):
+            raise ValueError(
+                "metadata-only or disabled Tool capture cannot retain review text"
+            )
+        return self
 
 
 class ReasoningCapturePolicy(TraceModel):
@@ -125,8 +218,12 @@ class ReasoningCapturePolicy(TraceModel):
 
 
 class CapturePolicy(TraceModel):
-    """Define the only public-safe retention behavior used by the Tracer."""
+    """Define public-safe content retention for messages, state, and Tools."""
 
+    default_tool_capture: ToolTraceCapture = Field(
+        default_factory=ToolTraceCapture.metadata_only
+    )
+    tool_overrides: tuple[tuple[str, ToolTraceCapture], ...] = ()
     tool_rules: tuple[ToolCaptureRule, ...] = ()
 
     @classmethod
@@ -135,9 +232,51 @@ class CapturePolicy(TraceModel):
         *,
         tool_rules: tuple[ToolCaptureRule, ...] = (),
     ) -> CapturePolicy:
-        """Return the default user-visible capture policy."""
+        """Return a metadata-only Tool policy with optional selected paths."""
 
-        return cls(tool_rules=tool_rules)
+        return cls(
+            default_tool_capture=ToolTraceCapture.metadata_only(),
+            tool_rules=tool_rules,
+        )
+
+    @classmethod
+    def public_history(
+        cls,
+        *,
+        tool_overrides: Mapping[str, ToolTraceCapture] | None = None,
+    ) -> CapturePolicy:
+        """Capture every Tool's sanitized public content with exact-name overrides.
+
+        Args:
+            tool_overrides: Optional settings for Tools whose content or lifecycle
+                retention differs from the full-content default.
+
+        Returns:
+            A policy that automatically covers newly observed Tools.
+
+        Raises:
+            TypeError: An override key or value has the wrong type.
+        """
+
+        if tool_overrides is None:
+            overrides: tuple[tuple[str, ToolTraceCapture], ...] = ()
+        else:
+            if not isinstance(tool_overrides, Mapping):
+                raise TypeError("tool_overrides must be a mapping or None")
+            normalized: list[tuple[str, ToolTraceCapture]] = []
+            for tool_name, capture in tool_overrides.items():
+                if not isinstance(tool_name, str):
+                    raise TypeError("tool_overrides keys must be Tool name strings")
+                if not isinstance(capture, ToolTraceCapture):
+                    raise TypeError(
+                        "tool_overrides values must be ToolTraceCapture values"
+                    )
+                normalized.append((tool_name, capture))
+            overrides = tuple(normalized)
+        return cls(
+            default_tool_capture=ToolTraceCapture.full_content(),
+            tool_overrides=overrides,
+        )
 
     @field_validator("tool_rules")
     @classmethod
@@ -150,6 +289,71 @@ class CapturePolicy(TraceModel):
         if len(set(names)) != len(names):
             raise ValueError("Tool capture rules must use unique Tool names")
         return rules
+
+    @field_validator("tool_overrides")
+    @classmethod
+    def override_names_are_unique(
+        cls, overrides: tuple[tuple[str, ToolTraceCapture], ...]
+    ) -> tuple[tuple[str, ToolTraceCapture], ...]:
+        """Reject ambiguous duplicate per-Tool settings."""
+
+        names = [tool_name for tool_name, _capture in overrides]
+        if any(not tool_name or len(tool_name) > 1024 for tool_name in names):
+            raise ValueError("Tool trace override names must be non-empty and bounded")
+        if len(set(names)) != len(names):
+            raise ValueError("Tool trace overrides must use unique Tool names")
+        return overrides
+
+    @model_validator(mode="after")
+    def legacy_rules_do_not_conflict_with_overrides(self) -> CapturePolicy:
+        """Keep low-level selected paths and high-level overrides unambiguous."""
+
+        rule_names = {rule.tool_name for rule in self.tool_rules}
+        override_names = {tool_name for tool_name, _capture in self.tool_overrides}
+        if rule_names.intersection(override_names):
+            raise ValueError(
+                "a Tool cannot use both a capture rule and a trace override"
+            )
+        return self
+
+    def tool_capture(self, tool_name: str) -> ToolTraceCapture:
+        """Resolve one Tool's effective capture setting by exact stable name."""
+
+        override = next(
+            (
+                candidate
+                for candidate_name, candidate in self.tool_overrides
+                if candidate_name == tool_name
+            ),
+            None,
+        )
+        if override is not None:
+            return override
+        rule = next(
+            (
+                candidate
+                for candidate in self.tool_rules
+                if candidate.tool_name == tool_name
+            ),
+            None,
+        )
+        if rule is not None:
+            return ToolTraceCapture.selected_content(
+                argument_paths=rule.argument_paths,
+                result_paths=rule.result_paths,
+                include_review_description=rule.include_review_description,
+            )
+        return self.default_tool_capture
+
+    def traces_tool(self, tool_name: str) -> bool:
+        """Return whether one Tool contributes lifecycle facts to Trace."""
+
+        return self.tool_capture(tool_name).mode != "disabled"
+
+    def captures_review_description(self, tool_name: str) -> bool:
+        """Return whether one Tool may retain its public review description."""
+
+        return self.tool_capture(tool_name).include_review_description
 
     def capture(self, value: JsonValue, *, max_bytes: int) -> CapturedValue:
         """Sanitize one JSON graph and omit it when the encoded value is too large."""
@@ -182,26 +386,29 @@ class CapturePolicy(TraceModel):
         target: Literal["arguments", "result"],
         max_bytes: int,
     ) -> CapturedValue:
-        """Capture only explicitly allowed Tool paths, otherwise retain metadata."""
+        """Capture Tool content according to its resolved high- or low-level setting."""
 
         _validate_max_bytes(max_bytes)
         safe = _sanitize(value)
         encoded_size = len(_encode(safe))
-        rule = next(
-            (
-                candidate
-                for candidate in self.tool_rules
-                if candidate.tool_name == tool_name
-            ),
-            None,
-        )
-        if rule is None:
+        capture = self.tool_capture(tool_name)
+        if capture.mode == "full_content":
+            return self.capture(safe, max_bytes=max_bytes)
+        if capture.mode == "metadata_only":
             return CapturedValue(
                 disposition="omitted",
                 safe_size_bytes=encoded_size,
-                reason="tool_content_not_allowlisted",
+                reason="tool_content_metadata_only",
             )
-        paths = rule.argument_paths if target == "arguments" else rule.result_paths
+        if capture.mode == "disabled":
+            return CapturedValue(
+                disposition="omitted",
+                safe_size_bytes=encoded_size,
+                reason="tool_tracing_disabled",
+            )
+        paths = (
+            capture.argument_paths if target == "arguments" else capture.result_paths
+        )
         selected: dict[str, JsonValue] = {}
         for path in paths:
             found, selected_value = _resolve_pointer(safe, path)
@@ -273,6 +480,8 @@ def _validate_max_bytes(value: int) -> None:
 
 
 def _is_canonical_pointer(path: str) -> bool:
+    if path == "":
+        return True
     if not path.startswith("/"):
         return False
     index = 0
@@ -364,4 +573,5 @@ __all__ = [
     "CapturedValue",
     "ReasoningCapturePolicy",
     "ToolCaptureRule",
+    "ToolTraceCapture",
 ]

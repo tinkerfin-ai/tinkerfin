@@ -184,20 +184,37 @@ def _validate_schema(sync_connection: Connection) -> None:
             issues.append(f"{table.name}: incompatible primary key")
 
         reflected_indexes = {
-            str(index["name"]): tuple(index.get("column_names") or ())
+            str(index["name"]): (
+                tuple(index.get("column_names") or ()),
+                bool(index.get("unique", False)),
+            )
             for index in inspector.get_indexes(table.name)
             if index.get("name") is not None
         }
+        expected_indexes: dict[str, tuple[tuple[str, ...], bool]] = {}
         for expected_index in table.indexes:
             expected_name = expected_index.name
             if expected_name is None:
                 issues.append(f"{table.name}: expected index has no name")
                 continue
             expected_columns = tuple(column.name for column in expected_index.columns)
-            if reflected_indexes.get(expected_name) != expected_columns:
-                issues.append(
-                    f"{table.name}: missing or incompatible index {expected_name}"
-                )
+            expected_indexes[expected_name] = (
+                expected_columns,
+                bool(expected_index.unique),
+            )
+        missing_indexes = sorted(expected_indexes.keys() - reflected_indexes.keys())
+        unexpected_indexes = sorted(reflected_indexes.keys() - expected_indexes.keys())
+        incompatible_indexes = sorted(
+            name
+            for name in expected_indexes.keys() & reflected_indexes.keys()
+            if reflected_indexes[name] != expected_indexes[name]
+        )
+        if missing_indexes or unexpected_indexes or incompatible_indexes:
+            issues.append(
+                f"{table.name}: indexes differ; missing={missing_indexes}, "
+                f"unexpected={unexpected_indexes}, "
+                f"incompatible={incompatible_indexes}"
+            )
 
     if issues:
         raise OpenSandboxStateError(

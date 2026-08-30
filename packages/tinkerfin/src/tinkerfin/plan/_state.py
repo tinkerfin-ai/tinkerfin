@@ -20,6 +20,7 @@ from .._state_schema import (
     state_schema_field_names,
 )
 from ._content import PlanContentBinding
+from ._handoff import PLAN_HANDOFF_STATE_KEY
 from .errors import PlanModeConfigurationError
 from .models import PlanContentModel, PlanContentT, PlanState
 
@@ -28,7 +29,11 @@ PLAN_SCHEMA_FINGERPRINT_KEY = "_tinkerfin_plan_clarification_schema"
 PLAN_CONTENT_SCHEMA_FINGERPRINT_KEY = "_tinkerfin_plan_content_schema"
 PLAN_CHECKPOINT_RUN_ID = PLANNING_CHECKPOINT_RUN_ID
 PLAN_PRIVATE_STATE_KEYS = frozenset(
-    {PLAN_SCHEMA_FINGERPRINT_KEY, PLAN_CONTENT_SCHEMA_FINGERPRINT_KEY}
+    {
+        PLAN_SCHEMA_FINGERPRINT_KEY,
+        PLAN_CONTENT_SCHEMA_FINGERPRINT_KEY,
+        PLAN_HANDOFF_STATE_KEY,
+    }
 )
 
 

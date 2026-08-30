@@ -128,6 +128,11 @@ class _TextCodec:
         return payload.decode()
 
 
+class _TextSseCodec(_TextCodec):
+    def render(self, *, seq: int, payload: str) -> bytes:
+        return f"id: {seq}\ndata: {payload}\n\n".encode()
+
+
 class _Source:
     def __init__(
         self,
@@ -358,6 +363,19 @@ class _CommandCountingRedis(Redis):
             self.command_counts[command_name.lower()] += 1
         response = super().execute_command(*args, **options)
         return await cast(Awaitable[object], response)
+
+
+class _ConnectionTrackingRedis(Redis):
+    """Retain real single-connection children for lifecycle assertions."""
+
+    blocking_children: list[_ConnectionTrackingRedis]
+
+    def client(self) -> _ConnectionTrackingRedis:
+        client = super().client()
+        assert isinstance(client, _ConnectionTrackingRedis)
+        client.blocking_children = self.blocking_children
+        self.blocking_children.append(client)
+        return client
 
 
 class _GatedXreadRedis(Redis):
@@ -1084,6 +1102,77 @@ async def test_real_redis_twenty_idle_followers_use_one_block_each(
     assert counts["xrange"] == 0
     assert counts["xread"] <= 20
     await backend.finish(prepared.handle, status="completed")
+
+
+async def test_real_redis_cancelled_consumer_closes_its_pinned_follow_client(
+    redis_url: str,
+) -> None:
+    """A response-task cancellation must close the XREAD client without a retry."""
+
+    client = _redis_client(_ConnectionTrackingRedis, redis_url)
+    client.blocking_children = []
+    prefix = f"tfmsg:cancelled-consumer:{uuid4().hex}"
+    backend = RedisBackend(
+        client,
+        key_prefix=prefix,
+        lease_ttl=30,
+        poll_interval=1,
+    )
+    prepared: PreparedRun | None = None
+    subscription: MessageSubscription[str] | None = None
+    consumer: asyncio.Task[None] | None = None
+    try:
+        async with Messaging(backend=backend) as messaging:
+            channel = messaging.channel(name="events", codec=_TextSseCodec())
+            prepared = await backend.prepare(
+                channel="events",
+                identity=_identity(),
+                codec=_TextSseCodec.codec_id,
+                after=0,
+                cancellable=False,
+                recoverable=False,
+            )
+            await backend.append(
+                prepared.handle,
+                message_id="first",
+                codec=_TextSseCodec.codec_id,
+                payload=b"first",
+            )
+            subscription = await channel.follow(identity=_identity(), after=0)
+            body = subscription.sse()
+            delivered = asyncio.Event()
+
+            async def consume() -> None:
+                async for _frame in body:
+                    delivered.set()
+
+            consumer = asyncio.create_task(
+                consume(),
+                name="test-messaging-cancelled-sse-consumer",
+            )
+            await asyncio.wait_for(delivered.wait(), timeout=1)
+            async with asyncio.timeout(1):
+                while not (
+                    client.blocking_children
+                    and client.blocking_children[-1].connection is not None
+                ):
+                    await asyncio.sleep(0)
+
+            consumer.cancel()
+            await asyncio.gather(consumer, return_exceptions=True)
+
+            assert client.blocking_children
+            assert all(child.connection is None for child in client.blocking_children)
+            await subscription.aclose()
+            await backend.finish(prepared.handle, status="completed")
+    finally:
+        if consumer is not None and not consumer.done():
+            consumer.cancel()
+            await asyncio.gather(consumer, return_exceptions=True)
+        if subscription is not None:
+            await subscription.aclose()
+        await _delete_prefix(client, prefix)
+        await client.aclose()
 
 
 async def test_real_redis_cancel_and_finish_wake_without_poll_interval_delay(

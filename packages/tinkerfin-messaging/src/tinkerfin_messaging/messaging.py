@@ -59,6 +59,14 @@ ProfileReplayT = TypeVar("ProfileReplayT")
 BackendResultT = TypeVar("BackendResultT")
 
 
+@dataclass(eq=False, slots=True)
+class _PreflightRegistration:
+    """Track only one preflight lifecycle, never its caller's later work."""
+
+    owner: asyncio.Task[object]
+    settled: asyncio.Future[None]
+
+
 @dataclass(frozen=True, slots=True)
 class CancelContext:
     """Identify the run whose accepted cancellation invokes a callback."""
@@ -152,8 +160,8 @@ class MessageSubscription(Generic[ReplayT]):
                     raise
                 primary.add_note(f"Messaging follow cleanup also failed: {close_error}")
 
-    def sse(self) -> AsyncIterator[bytes]:
-        """Render committed messages while preserving their durable sequences."""
+    def sse(self) -> AsyncGenerator[bytes, None]:
+        """Render committed messages in a caller-owned, closeable SSE body."""
 
         return _messaging_boundary.sse(
             self,
@@ -362,6 +370,8 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         after: int | None = None,
         cancel: CancelCallback[SourceT] | None = None,
         on_committed: CommittedCallback | None = None,
+        on_source_starting: Callable[[], Awaitable[None]] | None = None,
+        on_delivery_not_started: Callable[[], Awaitable[None]] | None = None,
     ) -> MessageSubscription[ReplayT]: ...
 
     @overload
@@ -373,6 +383,8 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         after: int | None = None,
         cancel: CancelCallback[ProfileSourceT] | None = None,
         on_committed: CommittedCallback | None = None,
+        on_source_starting: Callable[[], Awaitable[None]] | None = None,
+        on_delivery_not_started: Callable[[], Awaitable[None]] | None = None,
     ) -> MessageSubscription[ProfileReplayT]: ...
 
     async def wrap(
@@ -388,13 +400,16 @@ class MessageChannel(Generic[SourceT, ReplayT]):
             CancelCallback[SourceT] | CancelCallback[ProfileSourceT] | None
         ) = None,
         on_committed: CommittedCallback | None = None,
+        on_source_starting: Callable[[], Awaitable[None]] | None = None,
+        on_delivery_not_started: Callable[[], Awaitable[None]] | None = None,
     ) -> MessageSubscription[ReplayT] | MessageSubscription[ProfileReplayT]:
         """Start or attach one source and return its run-bounded subscription.
 
         The producing request transfers its single-use source to Messaging, which
-        closes it after terminal settlement. An attachment never opens or closes the
-        supplied source. Replay remains bounded by committed backend sequence and
-        preserves downstream backpressure.
+        closes it after terminal settlement. An attachment never opens its unused
+        candidate source; Messaging closes that candidate once before returning the
+        attached subscription. Replay remains bounded by committed backend sequence
+        and preserves downstream backpressure.
 
         Args:
             source: Custom source with explicit identity, or profiled TinkerFin source.
@@ -406,6 +421,10 @@ class MessageChannel(Generic[SourceT, ReplayT]):
             on_committed: Owner-only async observer invoked after each durable append;
                 attachment never invokes it and observer failure does not change the
                 producer outcome.
+            on_source_starting: Owner-only async callback after durable preparation and
+                source preflight, before the producer task is created.
+            on_delivery_not_started: Async cleanup callback used only when neither a
+                producer nor a valid attachment was established.
 
         Returns:
             Detachable subscription over committed, decoded messages.
@@ -423,6 +442,8 @@ class MessageChannel(Generic[SourceT, ReplayT]):
             after=after,
             cancel=cancel,
             on_committed=on_committed,
+            on_source_starting=on_source_starting,
+            on_delivery_not_started=on_delivery_not_started,
         )
 
     async def _wrap(
@@ -433,6 +454,8 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         after: int | None = None,
         cancel: CancelCallback[object] | None = None,
         on_committed: CommittedCallback | None = None,
+        on_source_starting: Callable[[], Awaitable[None]] | None = None,
+        on_delivery_not_started: Callable[[], Awaitable[None]] | None = None,
     ) -> MessageSubscription[object]:
         """Validate and start-or-attach before an HTTP response is constructed.
 
@@ -470,6 +493,8 @@ class MessageChannel(Generic[SourceT, ReplayT]):
             after=after,
             cancel=cancel,
             on_committed=on_committed,
+            on_source_starting=on_source_starting,
+            on_delivery_not_started=on_delivery_not_started,
         )
 
     @overload
@@ -481,7 +506,9 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         after: int | Callable[[], int | None] | None = None,
         cancel: CancelCallback[SourceT] | None = None,
         on_committed: CommittedCallback | None = None,
-    ) -> AsyncIterator[bytes]: ...
+        on_source_starting: Callable[[], Awaitable[None]] | None = None,
+        on_delivery_not_started: Callable[[], Awaitable[None]] | None = None,
+    ) -> AsyncGenerator[bytes, None]: ...
 
     @overload
     async def sse(
@@ -492,7 +519,9 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         after: int | Callable[[], int | None] | None = None,
         cancel: CancelCallback[ProfileSourceT] | None = None,
         on_committed: CommittedCallback | None = None,
-    ) -> AsyncIterator[bytes]: ...
+        on_source_starting: Callable[[], Awaitable[None]] | None = None,
+        on_delivery_not_started: Callable[[], Awaitable[None]] | None = None,
+    ) -> AsyncGenerator[bytes, None]: ...
 
     async def sse(
         self,
@@ -502,7 +531,9 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         after: int | Callable[[], int | None] | None = None,
         cancel: CancelCallback[object] | None = None,
         on_committed: CommittedCallback | None = None,
-    ) -> AsyncIterator[bytes]:
+        on_source_starting: Callable[[], Awaitable[None]] | None = None,
+        on_delivery_not_started: Callable[[], Awaitable[None]] | None = None,
+    ) -> AsyncGenerator[bytes, None]:
         """Prepare durable publication and return its SSE response body.
 
         Args:
@@ -515,9 +546,12 @@ class MessageChannel(Generic[SourceT, ReplayT]):
             cancel: Optional callback used for accepted remote cancellation. Omit it
                 when the source declares its own callback.
             on_committed: Optional owner-only observer for newly committed envelopes.
+            on_source_starting: Owner-only async callback before producer creation.
+            on_delivery_not_started: Async cleanup callback when no delivery starts.
 
         Returns:
             A durable SSE body whose IDs are committed channel sequence numbers.
+            The caller owns the body and must close it when it will not be consumed.
 
         Raises:
             MessagingError: Durable preparation or producer startup is rejected.
@@ -532,6 +566,8 @@ class MessageChannel(Generic[SourceT, ReplayT]):
             after=after,
             cancel=cancel,
             on_committed=on_committed,
+            on_source_starting=on_source_starting,
+            on_delivery_not_started=on_delivery_not_started,
         )
 
     async def wrap_recoverable(
@@ -542,6 +578,8 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         after: int | None = None,
         cancel: CancelCallback[RecoverableMessage[SourceT]] | None = None,
         on_committed: CommittedCallback | None = None,
+        on_source_starting: Callable[[], Awaitable[None]] | None = None,
+        on_delivery_not_started: Callable[[], Awaitable[None]] | None = None,
     ) -> MessageSubscription[ReplayT]:
         """Start or rebuild an owner from its last committed checkpoint.
 
@@ -558,6 +596,10 @@ class MessageChannel(Generic[SourceT, ReplayT]):
                 arguments is invoked without the context.
             on_committed: Asynchronous owner-only observer invoked after every
                 successful append, including idempotent recovery commits.
+            on_source_starting: Owner-only async callback before source recovery and
+                producer creation.
+            on_delivery_not_started: Async cleanup callback when no producer or valid
+                attachment was established.
 
         Returns:
             A detachable subscription over committed decoded messages.
@@ -575,6 +617,8 @@ class MessageChannel(Generic[SourceT, ReplayT]):
             after=after,
             cancel=cancel,
             on_committed=on_committed,
+            on_source_starting=on_source_starting,
+            on_delivery_not_started=on_delivery_not_started,
         )
 
     async def cancel(self, *, identity: RunIdentity) -> bool:
@@ -660,7 +704,7 @@ class Messaging:
         )
         self._settlement_timeout = resolved_timeout
         self._state = "new"
-        self._preflight_tasks: set[asyncio.Task[object]] = set()
+        self._preflight_tasks: set[_PreflightRegistration] = set()
         self._producer_tasks: set[asyncio.Task[None]] = set()
         self._settling_producers: set[asyncio.Task[None]] = set()
         self._close_task: asyncio.Task[None] | None = None
@@ -762,7 +806,9 @@ class Messaging:
                 if not producer.done() and producer not in self._settling_producers:
                     producer.cancel()
             preflights = tuple(
-                task for task in self._preflight_tasks if task is not initiating_caller
+                registration.settled
+                for registration in self._preflight_tasks
+                if registration.owner is not initiating_caller
             )
             if preflights:
                 await asyncio.gather(*preflights, return_exceptions=True)
@@ -800,19 +846,34 @@ class Messaging:
         if not task.cancelled():
             task.exception()
 
-    def _begin_preflight(self) -> asyncio.Task[object]:
-        """Register caller-owned startup work before shutdown can take its snapshot."""
+    def _begin_preflight(self) -> _PreflightRegistration:
+        """Register one explicit lifecycle before shutdown can take its snapshot."""
 
         self._require_open()
         current = asyncio.current_task()
         if current is None:
             raise RuntimeError("Messaging preflight requires an asyncio task")
-        task = cast(asyncio.Task[object], current)
-        self._preflight_tasks.add(task)
-        return task
+        registration = _PreflightRegistration(
+            owner=cast(asyncio.Task[object], current),
+            settled=asyncio.get_running_loop().create_future(),
+        )
+        self._preflight_tasks.add(registration)
+        return registration
 
-    def _finish_preflight(self, task: asyncio.Task[object]) -> None:
-        self._preflight_tasks.discard(task)
+    def _bind_preflight_owner(
+        self,
+        registration: _PreflightRegistration,
+        owner: asyncio.Task[object],
+    ) -> None:
+        """Bind retained startup to the child that owns its actual settlement."""
+
+        if registration in self._preflight_tasks:
+            registration.owner = owner
+
+    def _finish_preflight(self, registration: _PreflightRegistration) -> None:
+        if not registration.settled.done():
+            registration.settled.set_result(None)
+        self._preflight_tasks.discard(registration)
 
     @overload
     def channel(

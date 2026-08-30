@@ -1,4 +1,4 @@
-import { render, screen, within } from '@testing-library/react'
+import { fireEvent, render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 
@@ -171,6 +171,38 @@ describe('MessageBlock subagent card', () => {
     expect(toolDetails?.open).toBe(false)
   })
 
+  it('shows the complete SubAgent input only while its summary is hovered or focused', async () => {
+    const user = userEvent.setup()
+    const fullInput = '先读取完整需求并逐项核对，再调用 write_file 写入结果；不要省略任何已确认约束'
+    const { container } = render(
+      <MessageBlock
+        message={{
+          ...subagentMessage,
+          meta: { ...subagentMessage.meta, input: fullInput },
+        }}
+        childTools={[childTool]}
+      />,
+    )
+    await user.click(container.querySelector('.subagent-card-head')!)
+    const summary = container.querySelector<HTMLElement>('.subagent-task-summary')
+    expect(summary).not.toBeNull()
+    expect(screen.queryByRole('tooltip')).not.toBeInTheDocument()
+
+    await user.hover(summary!)
+    const hovered = screen.getByRole('tooltip')
+    expect(hovered).toHaveTextContent(fullInput)
+    expect(summary).toHaveAttribute('aria-describedby', hovered.id)
+
+    await user.unhover(summary!)
+    expect(screen.queryByRole('tooltip')).not.toBeInTheDocument()
+
+    fireEvent.focus(summary!)
+    const focused = screen.getByRole('tooltip')
+    expect(focused).toHaveTextContent(fullInput)
+    fireEvent.blur(summary!)
+    expect(screen.queryByRole('tooltip')).not.toBeInTheDocument()
+  })
+
   it('never renders legacy process or assistant reasoning content', () => {
     const processMessage: Message = {
       id: 'legacy-process',
@@ -236,6 +268,41 @@ describe('MessageBlock subagent card', () => {
       expect(row).not.toBeNull()
       expect(row?.querySelector(`.lucide-${icon}`)).not.toBeNull()
     }
+  })
+
+  it('never exposes internal Tool call IDs when captured details are unavailable', () => {
+    const { container } = render(<>
+      <MessageBlock message={{
+        id: 'tool:internal-known-id',
+        role: 'tool',
+        content: '',
+        createdAt: '2026-08-24T00:00:00.000Z',
+        meta: {
+          toolName: 'ls',
+          toolCallId: 'call_internal_known',
+          status: 'completed',
+        },
+      }} />
+      <MessageBlock message={{
+        id: 'tool:internal-unknown-id',
+        role: 'tool',
+        content: '',
+        createdAt: '2026-08-24T00:00:00.000Z',
+        meta: {
+          toolName: 'custom_tool',
+          toolCallId: 'call_internal_unknown',
+          status: 'completed',
+        },
+      }} />
+    </>)
+
+    const summaries = Array.from(container.querySelectorAll('.tool-card > summary'))
+    expect(summaries[0]).toHaveTextContent('List')
+    expect(summaries[0]).not.toHaveTextContent('call_internal_known')
+    expect(summaries[0]).not.toHaveTextContent('tool:internal-known-id')
+    expect(summaries[1]).toHaveTextContent('Tool callcustom_tool')
+    expect(summaries[1]).not.toHaveTextContent('call_internal_unknown')
+    expect(summaries[1]).not.toHaveTextContent('tool:internal-unknown-id')
   })
 
   it('keeps an expanded row open while streamed arguments and the final result update', async () => {
@@ -525,6 +592,22 @@ describe('MessageBlock user composition', () => {
 })
 
 describe('MessageBlock assistant composition', () => {
+  it.each(['running', 'completed'] as const)(
+    'does not present an empty %s Tool-only assistant message as a pending reply',
+    (status) => {
+      const { container } = render(<MessageBlock message={{
+        id: `assistant-tool-only-${status}`,
+        role: 'assistant',
+        content: '',
+        createdAt: '2026-08-29T00:00:00Z',
+        meta: { status },
+      }} />)
+
+      expect(container).toBeEmptyDOMElement()
+      expect(screen.queryByRole('status', { name: '正在回复' })).not.toBeInTheDocument()
+    },
+  )
+
   it('renders answer actions only when the message list marks the assistant as final', () => {
     const message: Message = {
       id: 'assistant-stage',

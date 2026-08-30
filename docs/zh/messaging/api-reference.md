@@ -9,6 +9,7 @@
 | `Messaging(...)` | `backend=None`、`settlement_timeout=None` | 创建单次应用生命周期 |
 | `Messaging.channel(...)` | `name`、可选 `codec`、可选 `renderer` | 创建可并发复用的 channel |
 | `Messaging.aclose()` | 无 | 等待 preflight、producer 和清理任务完成 |
+| `create_agui_run_source(...)` | identity、`open_events`、可选 transform | 创建普通惰性 TinkerFin AG-UI source |
 
 默认 backend 是 `MemoryBackend`。
 
@@ -16,9 +17,9 @@
 
 | 方法 | 关键参数 | 结果 |
 | --- | --- | --- |
-| `sse(...)` | source、可选 `identity`、after、cancel、on_committed | SSE bytes 迭代器 |
-| `wrap(...)` | source、可选 `identity`、after、cancel、on_committed | `MessageSubscription` |
-| `wrap_recoverable(...)` | recoverable source、可选 `identity`、after、cancel、on_committed | 可恢复 subscription |
+| `sse(...)` | source、可选 identity、after、callback | 调用方拥有且可关闭的 SSE bytes 迭代器 |
+| `wrap(...)` | source、可选 identity、after、callback | `MessageSubscription` |
+| `wrap_recoverable(...)` | recoverable source、可选 identity、after、callback | 可恢复 subscription |
 | `read(...)` | `identity`、`after=0`、`limit=100` | 升序历史元组 |
 | `follow(...)` | `identity`、`after=0` | 跟随该 run 到终止 |
 | `get_run_status(...)` | `identity` | 当前权威 run 状态 |
@@ -49,7 +50,22 @@ TinkerFin profile source 的 `identity` 可省略；普通自定义 source 必�
 | `payload` | 编码后的 bytes |
 | `created_at` | aware UTC 时间 |
 
-## Source 工具
+## 常用 helper
+
+| API | 用途 |
+| --- | --- |
+| `create_agui_run_source(...)` | 隐藏 Binding、codec/type profile、转换与首事件取消，只为 owner 打开 managed AG-UI run |
+| `parse_sse_event_id(value)` | 解析 `None` 或 canonical 非负 ASCII 十进制 SSE ID |
+| `is_active_run_status(status)` | 收窄 `running` 与 `cancel_requested` 的 TypeGuard |
+| `is_final_run_status(status)` | 收窄全部 durable 终态的 TypeGuard |
+| `is_failed_run_status(status)` | 收窄 `failed` 与 `owner_lost` 的 TypeGuard |
+
+状态 helper 是纯函数，不访问 backend。
+普通 AG-UI source 的 transform 只用于补充产品 metadata 或内容；事件类型以及 Run、消息、Tool、快照或
+interrupt ID 发生变化时会被拒绝。可选 `RUN_STARTED.input` 中的消息、工具、上下文、forwarded props
+与 resume 等全部字段也保持调用方原始输入。需要主动改变输出协议时，应使用高级 `map_source()`。
+
+## 高级 source 工具
 
 | API | 用途 |
 | --- | --- |
@@ -106,6 +122,11 @@ TinkerFin profile source 的 `identity` 可省略；普通自定义 source 必�
 | `CancelCallback` | 无参数或接收 `CancelContext`，可返回有限取消尾部 |
 | `CancelContext` | 不可变的 channel 与 RunIdentity |
 | `CommittedCallback` | owner 提交后接收完整 Envelope |
+| `on_source_starting` | source preflight 后、producer 创建前的 owner 专用异步 callback |
+| `on_delivery_not_started` | producer 与 attachment 都未成立时执行的异步清理 |
+
+Attachment 不调用两个 delivery callback。`on_owner_preflight` 属于 source，并且先于
+`on_source_starting`；两者不能互换。
 
 ## 常见错误
 

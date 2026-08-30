@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Generic, Literal, TypeVar
 
-from pydantic import BaseModel, Field, JsonValue
+from pydantic import BaseModel, Field, JsonValue, computed_field, field_validator
 
 from ._models import TraceModel
 from .facts import TraceEvent, TraceSemanticFact
@@ -46,7 +46,12 @@ class TraceReasoning(TraceModel):
 
 
 class TraceNode(TraceModel):
-    """One stable flat execution-tree node."""
+    """One stable flat execution-tree node with policy-controlled details.
+
+    ``input`` and ``result`` are present only when the Tracer capture policy explicitly
+    retained those values. The omission flags distinguish unavailable content from a
+    valid JSON null without exposing the omitted bytes.
+    """
 
     id: str
     trace_seq: int = Field(ge=1)
@@ -56,6 +61,10 @@ class TraceNode(TraceModel):
     run_id: str
     namespace: tuple[str, ...] = ()
     source_id: str | None = None
+    input: JsonValue | None = None
+    input_omitted: bool = False
+    result: JsonValue | None = None
+    result_omitted: bool = False
     status: Literal[
         "running",
         "waiting",
@@ -138,6 +147,30 @@ class TraceCompleteness(TraceModel):
     payload_omitted: bool = False
 
 
+class TraceSummary(TraceModel):
+    """Return complete cumulative status for one selected fixed-as-of lineage.
+
+    Counts, pending interactions, and the latest source time are independent of the
+    visible history window. Sibling branches never contribute to this value.
+    """
+
+    status: TraceStatus
+    completeness: TraceCompleteness
+    message_count: int = Field(ge=0)
+    tool_call_count: int = Field(ge=0)
+    pending_interactions: tuple[TraceInteraction, ...] = ()
+    last_occurred_at: datetime
+
+    @field_validator("last_occurred_at")
+    @classmethod
+    def last_occurred_at_is_utc(cls, value: datetime) -> datetime:
+        """Require one comparable source timestamp without rewriting evidence."""
+
+        if value.tzinfo is None or value.utcoffset() != UTC.utcoffset(value):
+            raise ValueError("last_occurred_at must be an aware UTC timestamp")
+        return value
+
+
 class TraceEventPage(TraceModel):
     """One fixed-as-of ascending page of safe Ledger events."""
 
@@ -167,11 +200,36 @@ class TraceUpdate(TraceModel):
     nodes: TraceEntityDelta[TraceNode]
     interactions: TraceEntityDelta[TraceInteraction]
     state: TraceState
-    status: TraceStatus
-    completeness: TraceCompleteness
-    message_count: int = Field(ge=0)
-    tool_call_count: int = Field(ge=0)
+    summary: TraceSummary
     projections: dict[str, JsonValue] = Field(default_factory=dict)
+
+    @computed_field
+    @property
+    def status(self) -> TraceStatus:
+        """Return the cumulative status retained in :attr:`summary`."""
+
+        return self.summary.status
+
+    @computed_field
+    @property
+    def completeness(self) -> TraceCompleteness:
+        """Return cumulative completeness retained in :attr:`summary`."""
+
+        return self.summary.completeness
+
+    @computed_field
+    @property
+    def message_count(self) -> int:
+        """Return the cumulative selected-lineage message count."""
+
+        return self.summary.message_count
+
+    @computed_field
+    @property
+    def tool_call_count(self) -> int:
+        """Return the cumulative selected-lineage Tool call count."""
+
+        return self.summary.tool_call_count
 
 
 __all__ = [
@@ -184,6 +242,7 @@ __all__ = [
     "TraceReasoning",
     "TraceState",
     "TraceStatus",
+    "TraceSummary",
     "TraceTree",
     "TraceUpdate",
 ]

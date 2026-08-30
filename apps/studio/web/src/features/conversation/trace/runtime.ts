@@ -90,8 +90,16 @@ const decodePointerToken = (value: string) => value.replaceAll('~1', '/').replac
 
 const capturedArguments = (value: JsonValue | undefined): JsonObject => {
   if (!isObject(value) || value.disposition !== 'inline' || !isObject(value.value)) return {}
+  const root = value.value['']
+  if (Object.keys(value.value).length === 1 && isObject(root)) {
+    return structuredClone(root)
+  }
+  const entries = Object.entries(value.value)
+  if (!entries.every(([pointer]) => pointer.startsWith('/'))) {
+    return structuredClone(value.value)
+  }
   const result: JsonObject = {}
-  for (const [pointer, item] of Object.entries(value.value)) {
+  for (const [pointer, item] of entries) {
     if (!pointer.startsWith('/') || pointer.slice(1).includes('/')) continue
     result[decodePointerToken(pointer.slice(1))] = structuredClone(item)
   }
@@ -132,7 +140,7 @@ const approvalFromInteraction = (
     const toolCallId = interaction.toolCallIds[index]
     const toolNode = nodes.find((node) => (
       node.kind === 'tool'
-      && node.status === 'waiting'
+      && (node.status === 'running' || node.status === 'waiting')
       && node.sourceId === toolCallId
       && node.label === rawAction.name
       && node.namespace.length === interaction.namespace.length
@@ -148,7 +156,9 @@ const approvalFromInteraction = (
       toolName: rawAction.name,
       params: JSON.stringify(originalArgs, null, 2),
       input: typeof originalArgs.file_path === 'string' ? originalArgs.file_path : '',
-      description: rawAction.name,
+      description: typeof rawAction.description === 'string'
+        ? rawAction.description
+        : rawAction.name,
       originalArgs,
       allowedDecisions: decisions,
     }]
@@ -215,6 +225,29 @@ const traceMessages = (trace: ConversationHistoryDetail): Message[] => {
       ]),
   )
   const nodesById = new Map(trace.nodes.map((node) => [node.id, node]))
+  const verifiedSubagents = trace.nodes.filter((node) => (
+    node.kind === 'subagent' && node.sourceId
+  ))
+  const subagentPartialOutput = new Map<string, Array<{ sequence: number; content: string }>>()
+  trace.messages.forEach((message) => {
+    if (message.role !== 'assistant' || message.namespace.length === 0) return
+    const owner = verifiedSubagents
+      .filter((node) => (
+        node.namespace.length <= message.namespace.length
+        && node.namespace.every((value, position) => value === message.namespace[position])
+      ))
+      .sort((left, right) => right.namespace.length - left.namespace.length)[0]
+    if (!owner) return
+    const content = text(message.content)
+    if (!content) return
+    const existing = subagentPartialOutput.get(owner.id) ?? []
+    existing.push({ sequence: message.traceSeq, content })
+    subagentPartialOutput.set(owner.id, existing)
+  })
+  const subagentByParentTool = new Map(verifiedSubagents.map((node) => [
+    scopedSourceKey(node.namespace.slice(0, -1), node.sourceId as string),
+    node,
+  ]))
   const owningSubagent = (node: TraceNode): TraceNode | undefined => {
     let parentId = node.parentId
     const visited = new Set<string>()
@@ -222,12 +255,13 @@ const traceMessages = (trace: ConversationHistoryDetail): Message[] => {
       visited.add(parentId)
       const parent = nodesById.get(parentId)
       if (!parent) return undefined
-      if (parent.kind === 'subagent') return parent
+      if (parent.kind === 'subagent' && parent.sourceId) return parent
       parentId = parent.parentId
     }
     return undefined
   }
   const ordered: Array<{ value: Message; sequence: number }> = trace.messages.flatMap((item) => {
+    if (item.namespace.length > 0) return []
     if (item.role !== 'user' && item.role !== 'assistant') return []
     return [{
       sequence: item.traceSeq,
@@ -256,10 +290,32 @@ const traceMessages = (trace: ConversationHistoryDetail): Message[] => {
       && node.kind !== 'plan'
       && !failedRun
     ) return
+    if (node.kind === 'subagent' && !node.sourceId) return
+    const delegatedSubagent = node.kind === 'tool' && node.sourceId
+      ? subagentByParentTool.get(scopedSourceKey(node.namespace, node.sourceId))
+      : undefined
+    if (delegatedSubagent) return
     const result = node.sourceId
       ? toolResults.get(scopedSourceKey(node.namespace, node.sourceId))
       : undefined
+    const retainedInput = node.inputOmitted ? undefined : node.input
+    const retainedResult = node.resultOmitted ? undefined : node.result
     const subagent = node.kind === 'tool' ? owningSubagent(node) : undefined
+    if (node.kind === 'tool' && node.namespace.length > 0 && !subagent) return
+    const parentTool = node.kind === 'subagent' && node.sourceId
+      ? trace.nodes.find((candidate) => (
+          candidate.kind === 'tool'
+          && candidate.sourceId === node.sourceId
+          && candidate.namespace.length === node.namespace.length - 1
+          && candidate.namespace.every(
+            (value, position) => value === node.namespace[position],
+          )
+        ))
+      : undefined
+    const subagentInput = isObject(retainedInput)
+      && typeof retainedInput.description === 'string'
+      ? retainedInput.description
+      : text(retainedInput)
     const role: Message['role'] = node.kind === 'tool'
       ? 'tool'
       : node.kind === 'subagent'
@@ -279,7 +335,18 @@ const traceMessages = (trace: ConversationHistoryDetail): Message[] => {
           toolName: node.kind === 'tool' ? node.label : undefined,
           agentName: node.kind === 'subagent' ? node.label : undefined,
           sourceAgentName: subagent?.label,
-          result: text(result?.content),
+          params: node.kind === 'tool' ? text(retainedInput) : undefined,
+          input: node.kind === 'subagent' ? subagentInput : undefined,
+          result: text(
+            node.kind === 'subagent'
+              ? parentTool?.result
+                ?? retainedResult
+                ?? subagentPartialOutput.get(node.id)
+                  ?.sort((left, right) => left.sequence - right.sequence)
+                  .map((item) => item.content)
+                  .join('\n\n')
+              : result?.content ?? retainedResult,
+          ),
           status: nodeMessageStatus(node.status),
           toolCallId: node.kind === 'tool' ? node.sourceId ?? undefined : undefined,
           batchId: node.kind === 'tool' && !subagent
@@ -323,12 +390,15 @@ const assertTraceDetail = (trace: ConversationHistoryDetail) => {
 
 export const restoreConversationFromTrace = (
   detail: ConversationHistoryDetail,
-  options: { model: string },
+  options: { model: string; lastDeliveredSeq?: number },
 ): Conversation => {
   assertTraceDetail(detail)
   const trace = structuredClone(detail)
   const interaction = interactionState(trace.interactions, trace.nodes)
-  const status = runStatus(trace)
+  const projectedStatus = runStatus(trace)
+  const status = interaction.pendingInteractionKind && projectedStatus !== 'error'
+    ? 'waiting_approval'
+    : projectedStatus
   const messages = traceMessages(trace)
   if (
     (trace.status.execution === 'failed' || trace.status.execution === 'unknown')
@@ -357,7 +427,8 @@ export const restoreConversationFromTrace = (
     runStatus: status,
     activeRunId: status === 'detached' ? trace.headRunId : undefined,
     serverState: structuredClone(trace.state.root),
-    lastSeq: undefined,
+    // Trace 序号与 Messaging 投递序号相互独立；实时调用方保留已知游标，纯历史水化保持未知
+    lastSeq: options.lastDeliveredSeq,
     trace,
     isHydrated: true,
   }
@@ -389,5 +460,8 @@ export const applyConversationTraceUpdate = (
     toolCallCount: update.toolCallCount,
     historyCursor: null,
   }
-  return restoreConversationFromTrace(next, { model: conversation.model })
+  return restoreConversationFromTrace(next, {
+    model: conversation.model,
+    lastDeliveredSeq: conversation.lastSeq,
+  })
 }

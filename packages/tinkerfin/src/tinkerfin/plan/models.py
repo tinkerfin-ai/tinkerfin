@@ -34,6 +34,7 @@ class PlanStatus(StrEnum):
     PLANNING = "planning"
     AWAITING_CLARIFICATION = "awaiting_clarification"
     AWAITING_REVIEW = "awaiting_review"
+    AWAITING_INPUT = "awaiting_input"
     APPROVED = "approved"
     CANCELLED = "cancelled"
 
@@ -42,6 +43,7 @@ class PlanReviewAction(StrEnum):
     """Resolved user action for the current Plan draft."""
 
     APPROVE = "approve"
+    CANCEL = "cancel"
     EDIT = "edit"
     RESPOND = "respond"
     REJECT = "reject"
@@ -283,6 +285,7 @@ class PlanState(_PlanModel, Generic[PlanContentT]):
     feedback: tuple[NonBlankText, ...] = ()
     revision: int = Field(default=0, ge=0, strict=True)
     review_action: PlanReviewAction | None = None
+    review_reason: NonBlankText | None = None
 
 
 __all__ = [

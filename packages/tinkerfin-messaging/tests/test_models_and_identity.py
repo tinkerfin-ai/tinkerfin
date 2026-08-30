@@ -13,6 +13,10 @@ from tinkerfin_messaging import (
     MessageEnvelope,
     RecoverableMessage,
     RecoveryCheckpoint,
+    is_active_run_status,
+    is_failed_run_status,
+    is_final_run_status,
+    parse_sse_event_id,
 )
 
 
@@ -132,3 +136,52 @@ def test_envelope_rejects_unbounded_or_extra_identity_fields() -> None:
                 "parentRunId": "parent-1",
             }
         )
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, None), ("0", 0), ("1", 1), ("1048576", 1048576)],
+)
+def test_sse_event_id_parser_accepts_only_canonical_sequences(
+    value: str | None,
+    expected: int | None,
+) -> None:
+    assert parse_sse_event_id(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["", "00", "01", "+1", "-1", " 1", "1 ", "1.0", "١", "１"],
+)
+def test_sse_event_id_parser_rejects_noncanonical_text(value: str) -> None:
+    with pytest.raises(ValueError, match="canonical ASCII decimal"):
+        parse_sse_event_id(value)
+
+
+def test_sse_event_id_parser_rejects_non_text_values() -> None:
+    with pytest.raises(TypeError, match="string or None"):
+        parse_sse_event_id(1)  # pyright: ignore[reportArgumentType]
+
+
+@pytest.mark.parametrize(
+    ("status", "active", "final", "failed"),
+    [
+        ("running", True, False, False),
+        ("cancel_requested", True, False, False),
+        ("completed", False, True, False),
+        ("cancelled", False, True, False),
+        ("failed", False, True, True),
+        ("owner_lost", False, True, True),
+        ("unknown", False, False, False),
+        ([], False, False, False),
+    ],
+)
+def test_run_status_predicates_share_one_persisted_classification(
+    status: object,
+    active: bool,
+    final: bool,
+    failed: bool,
+) -> None:
+    assert is_active_run_status(status) is active
+    assert is_final_run_status(status) is final
+    assert is_failed_run_status(status) is failed

@@ -18,12 +18,15 @@ tinkerfin = TinkerFin(run_coordinator=coordinator)
 
 identity = RunIdentity(threadId="tenant-7/user-42", runId="run-1")
 agent = tinkerfin.create_deep_agent(model=model, tools=tools)
-runtime = agent.new(identity=identity)
-stream = runtime.astream(graph_input)
+stream = await tinkerfin.open_run(
+    identity,
+    agent=agent,
+    input=graph_input,
+)
 ```
 
-Every Runtime has a `RunIdentity`. The coordinator receives that same complete value and
-holds its scope for the lifetime of the native or AG-UI stream.
+Every managed run has a `RunIdentity`. The coordinator receives that same complete value
+and holds its scope for the lifetime of the native or AG-UI stream.
 
 The built-in coordinator only covers the current process. If several processes must share locks, implement `RunCoordinator` with a shared lock service:
 

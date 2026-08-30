@@ -344,6 +344,21 @@ describe('Sidebar', () => {
         .querySelector('.conversation-attention-dot')).toHaveClass('is-approval')
     }
 
+    const pendingDespiteIdleStatus = workspace.conversations.map((item): Conversation => (
+      item.threadId === 'recent'
+        ? { ...item, runStatus: 'idle', pendingInteractionKind: 'plan_review' }
+        : item
+    ))
+    rerender(
+      <Sidebar
+        {...baseProps}
+        workspace={{ ...workspace, conversations: pendingDespiteIdleStatus }}
+        historyConversations={pendingDespiteIdleStatus}
+      />,
+    )
+    expect(screen.getByRole('button', { name: '打开会话：最近会话，等待处理' })
+      .querySelector('.conversation-attention-dot')).toHaveClass('is-approval')
+
     const planWaiting = waiting.map((item): Conversation => item.threadId === 'recent'
       ? {
           ...item,
@@ -379,6 +394,7 @@ describe('Sidebar', () => {
           ...item,
           planInteraction: {
             kind: 'review',
+            allowedActions: ['approve', 'reject', 'cancel'],
             interruptId: 'plan-review',
             revision: 1,
             submitted: false,

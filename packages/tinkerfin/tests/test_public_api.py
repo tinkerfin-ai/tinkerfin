@@ -119,6 +119,7 @@ def test_factory_has_no_application_resource_lifecycle() -> None:
     constructor = inspect.signature(TinkerFin).parameters
 
     assert tuple(constructor) == (
+        "checkpointer",
         "run_coordinator",
         "state_schema",
         "runtime_profile",

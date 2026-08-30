@@ -316,7 +316,10 @@ export function useConversationStreamController({
           if (event.type === 'error') throw new ConversationError('stream_recovery_failed')
           setWorkspace((state) => updateConversation(state, threadId, (item) => {
             if (event.type === 'snapshot') {
-              return restoreConversationFromTrace(event.snapshot, { model: item.model })
+              return restoreConversationFromTrace(event.snapshot, {
+                model: item.model,
+                lastDeliveredSeq: item.lastSeq,
+              })
             }
             return applyConversationTraceUpdate(item, event.update)
           }))
@@ -332,7 +335,10 @@ export function useConversationStreamController({
               setWorkspace((state) => updateConversation(
                 state,
                 threadId,
-                (item) => restoreConversationFromTrace(detail, { model: item.model }),
+                (item) => restoreConversationFromTrace(detail, {
+                  model: item.model,
+                  lastDeliveredSeq: item.lastSeq,
+                }),
               ))
             }
             return
@@ -353,7 +359,10 @@ export function useConversationStreamController({
         setWorkspace((state) => updateConversation(
           state,
           threadId,
-          (item) => restoreConversationFromTrace(detail, { model: item.model }),
+          (item) => restoreConversationFromTrace(detail, {
+            model: item.model,
+            lastDeliveredSeq: item.lastSeq,
+          }),
         ))
         if (detail.status.execution !== 'running') return
         reconnectAttempts += 1
@@ -414,19 +423,20 @@ export function useConversationStreamController({
     let traceAuthorityLoaded = false
     let requestPayload: ChatRequestPayload = { ...payload }
     let reconnectAttempt = 0
-    let lastAppliedSeq = (
+    let lastAppliedSeq: number | null = (
       options.initialAfterSeq
       ?? (target === 'draft'
         ? draftTarget?.lastSeq
         : latestWorkspace.current.conversations.find(
             (item) => item.threadId === targetThreadId,
           )?.lastSeq)
-    ) ?? 0
+    ) ?? null
     const persistActiveRun = (immediate = false) => scheduleActiveRunPersistence({
       threadId: targetThreadId,
       payload: requestPayload,
       mode,
-      lastSeq: lastAppliedSeq,
+      // 尚未收到首帧时使用 0 作为刷新恢复记录中的未知游标哨兵
+      lastSeq: lastAppliedSeq ?? 0,
     }, immediate)
     // 首次写入建立刷新恢复所有权，不能等待第一个节流周期
     persistActiveRun(true)
@@ -437,7 +447,9 @@ export function useConversationStreamController({
           for await (const { event, seq } of stream(
             requestPayload,
             controller.signal,
-            reconnectAttempt === 0 ? options.initialAfterSeq : lastAppliedSeq,
+            reconnectAttempt === 0
+              ? options.initialAfterSeq
+              : lastAppliedSeq ?? undefined,
           )) {
         receivedEvent = true
         const reportedThreadId: string = 'threadId' in event && typeof event.threadId === 'string'
@@ -451,8 +463,8 @@ export function useConversationStreamController({
           requestPayload = { ...requestPayload, threadId: reportedThreadId }
         }
 
-        if (seq != null && seq <= lastAppliedSeq) continue
-        if (seq != null && seq !== lastAppliedSeq + 1) {
+        if (seq != null && lastAppliedSeq != null && seq <= lastAppliedSeq) continue
+        if (seq != null && lastAppliedSeq != null && seq !== lastAppliedSeq + 1) {
           throw new ConversationError(
             'stream_sequence_invalid',
             `expected=${lastAppliedSeq + 1}, actual=${seq}`,
@@ -565,6 +577,7 @@ export function useConversationStreamController({
         })
         const authoritative = restoreConversationFromTrace(detail, {
           model: validationTarget?.model ?? payload.forwardedProps.model,
+          lastDeliveredSeq: lastAppliedSeq ?? undefined,
         })
         validationTarget = authoritative
         traceAuthorityLoaded = true

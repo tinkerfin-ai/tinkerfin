@@ -46,6 +46,7 @@ from ._config import PlanOptions
 from ._content import serialize_plan_content
 from ._contracts import (
     ApprovePlan,
+    CancelPlan,
     EditPlanBase,
     PlanClarificationMetadata,
     PlanClarificationPayload,
@@ -53,11 +54,17 @@ from ._contracts import (
     RespondToPlan,
 )
 from ._json_schema import require_valid_schema
-from ._planner import create_planner_agent, invoke_planner
+from ._planner import (
+    create_planner_agent,
+    invoke_plan_review_reply,
+    invoke_planner,
+    resolve_planner_model,
+)
 from ._state import (
     PLAN_CHECKPOINT_RUN_ID,
     PLAN_CONTENT_SCHEMA_FINGERPRINT_KEY,
     PLAN_SCHEMA_FINGERPRINT_KEY,
+    PLAN_STATE_KEY,
     PlanningWorkflowNodeState,
     create_plan_state_schema,
     plan_state_update,
@@ -551,17 +558,45 @@ class _PlanningGraphFactory(Generic[ContextT]):
             base_state_schema,
             middleware=caller_middleware,
         )
+        resolved_model = resolve_planner_model(self._options.planner_model or model)
         planner = create_planner_agent(
-            self._options.planner_model or model,
+            resolved_model,
             backend=backend,
             clarification=self._options.clarification,
             content=self._options.content,
-            contracts=self._options.contracts,
+            response_type=self._options.contracts.planner_response_type,
+            context_schema=context_schema,
+        )
+        edit_planner = create_planner_agent(
+            resolved_model,
+            backend=backend,
+            clarification=self._options.clarification,
+            content=self._options.content,
+            response_type=self._options.contracts.planner_edit_response_type,
             context_schema=context_schema,
         )
 
         def initialize_node(state: PlanningWorkflowNodeState) -> dict[str, object]:
-            messages = _messages(cast(Mapping[str, object], state))
+            mapped = cast(Mapping[str, object], state)
+            messages = _messages(mapped)
+            if PLAN_STATE_KEY in mapped:
+                current = read_plan_state(mapped, self._options.content)
+                if current.status is PlanStatus.AWAITING_INPUT:
+                    _require_schema_fingerprints(mapped, self._options)
+                    continued = current.model_copy(
+                        update={
+                            "status": PlanStatus.PLANNING,
+                            "effective_mode": "plan",
+                            "request_message_id": _request_message_id(messages),
+                            "pending_clarification": None,
+                            "pending_edit": None,
+                            "confirmed_plan": None,
+                            "handoff": None,
+                            "review_action": None,
+                            "review_reason": None,
+                        }
+                    )
+                    return plan_state_update(continued)
             plan = self._options.content.state_type(
                 request_message_id=_request_message_id(messages)
             )
@@ -580,11 +615,17 @@ class _PlanningGraphFactory(Generic[ContextT]):
             mapped = cast(Mapping[str, object], state)
             _require_schema_fingerprints(mapped, self._options)
             current = read_plan_state(mapped, self._options.content)
+            has_authoritative_edit = current.pending_edit is not None
+            response_type = (
+                self._options.contracts.planner_edit_response_type
+                if has_authoritative_edit
+                else self._options.contracts.planner_response_type
+            )
             outcome = await invoke_planner(
-                planner,
+                edit_planner if has_authoritative_edit else planner,
                 _messages(mapped),
                 current,
-                contracts=self._options.contracts,
+                response_type=response_type,
                 clarification_history=_clarification_context(
                     current,
                     self._options,
@@ -614,6 +655,7 @@ class _PlanningGraphFactory(Generic[ContextT]):
                             ),
                         ),
                         "review_action": None,
+                        "review_reason": None,
                     }
                 )
                 return plan_state_update(updated)
@@ -653,6 +695,7 @@ class _PlanningGraphFactory(Generic[ContextT]):
                     "handoff": None,
                     "revision": revision,
                     "review_action": None,
+                    "review_reason": None,
                 }
             )
             return plan_state_update(updated)
@@ -708,6 +751,7 @@ class _PlanningGraphFactory(Generic[ContextT]):
                         *current.clarification_history,
                         exchange,
                     ),
+                    "review_reason": None,
                 }
             )
             return plan_state_update(updated)
@@ -740,7 +784,7 @@ class _PlanningGraphFactory(Generic[ContextT]):
                 ),
             )
             response = cast(
-                ApprovePlan | EditPlanBase | RespondToPlan | RejectPlan,
+                ApprovePlan | CancelPlan | EditPlanBase | RespondToPlan | RejectPlan,
                 self._options.contracts.review_response.validate_python(
                     interrupt(_runtime_interrupt_value(envelope))
                 ),
@@ -760,6 +804,20 @@ class _PlanningGraphFactory(Generic[ContextT]):
                         "confirmed_plan": confirmed,
                         "handoff": _create_handoff(confirmed, message_id),
                         "review_action": PlanReviewAction.APPROVE,
+                        "review_reason": None,
+                    }
+                )
+            elif isinstance(response, CancelPlan):
+                updated = current.model_copy(
+                    update={
+                        "status": PlanStatus.AWAITING_INPUT,
+                        "effective_mode": "plan",
+                        "pending_clarification": None,
+                        "pending_edit": None,
+                        "confirmed_plan": None,
+                        "handoff": None,
+                        "review_action": PlanReviewAction.CANCEL,
+                        "review_reason": None,
                     }
                 )
             elif isinstance(response, EditPlanBase):
@@ -774,6 +832,7 @@ class _PlanningGraphFactory(Generic[ContextT]):
                         "effective_mode": "plan",
                         "pending_edit": edited,
                         "review_action": PlanReviewAction.EDIT,
+                        "review_reason": None,
                     }
                 )
             elif isinstance(response, RespondToPlan):
@@ -784,6 +843,7 @@ class _PlanningGraphFactory(Generic[ContextT]):
                         "pending_edit": None,
                         "feedback": (*current.feedback, response.message),
                         "review_action": PlanReviewAction.RESPOND,
+                        "review_reason": None,
                     }
                 )
             elif isinstance(response, RejectPlan):
@@ -794,15 +854,37 @@ class _PlanningGraphFactory(Generic[ContextT]):
                 )
                 updated = current.model_copy(
                     update={
-                        "status": PlanStatus.CANCELLED,
-                        "effective_mode": "default",
+                        "status": PlanStatus.AWAITING_INPUT,
+                        "effective_mode": "plan",
+                        "pending_clarification": None,
+                        "pending_edit": None,
+                        "confirmed_plan": None,
+                        "handoff": None,
                         "feedback": feedback,
                         "review_action": PlanReviewAction.REJECT,
+                        "review_reason": response.message,
                     }
                 )
             else:  # pragma: no cover - discriminated adapter is exhaustive
                 raise TypeError("unsupported Plan review response")
             return plan_state_update(updated)
+
+        async def respond_to_review(
+            state: PlanningWorkflowNodeState,
+            config: RunnableConfig,
+        ) -> dict[str, object]:
+            mapped = cast(Mapping[str, object], state)
+            _require_schema_fingerprints(mapped, self._options)
+            current = read_plan_state(mapped, self._options.content)
+            if current.status is not PlanStatus.AWAITING_INPUT:
+                raise RuntimeError("Plan review reply requires awaiting input state")
+            reply = await invoke_plan_review_reply(
+                resolved_model,
+                _messages(mapped),
+                current,
+                config=config,
+            )
+            return {"messages": [reply]}
 
         def planner_path(state: PlanningWorkflowNodeState) -> str:
             current = read_plan_state(
@@ -828,6 +910,7 @@ class _PlanningGraphFactory(Generic[ContextT]):
         builder.add_node("create_plan", planner_node)
         builder.add_node("clarify_plan", answer_clarification)
         builder.add_node("review_plan", review_node)
+        builder.add_node("respond_to_review", respond_to_review)
         builder.add_edge(START, "initialize_plan")
         builder.add_edge("initialize_plan", "create_plan")
         builder.add_conditional_edges(
@@ -841,11 +924,13 @@ class _PlanningGraphFactory(Generic[ContextT]):
             review_path,
             {
                 "approve": END,
+                "cancel": "respond_to_review",
                 "edit": "create_plan",
                 "respond": "create_plan",
-                "reject": END,
+                "reject": "respond_to_review",
             },
         )
+        builder.add_edge("respond_to_review", END)
 
         parent = builder.compile(
             checkpointer=_checkpoint_saver(arguments["checkpointer"]),

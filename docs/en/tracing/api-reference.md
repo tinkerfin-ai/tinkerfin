@@ -28,10 +28,15 @@ names are canonical, unique, and registered immutably at construction.
 
 | API | Purpose |
 | --- | --- |
-| `CapturePolicy.public_safe(tool_rules=())` | Default public retention policy |
+| `CapturePolicy.public_history(tool_overrides=None)` | Default policy; retain complete sanitized content for every Tool with optional exact-name overrides |
+| `CapturePolicy.public_safe(tool_rules=())` | Metadata-only Tool policy with optional low-level RFC 6901 selections |
+| `ToolTraceCapture.full_content()` | Retain Tool lifecycle, complete sanitized content, and public review text |
+| `ToolTraceCapture.metadata_only()` | Retain Tool lifecycle without arguments, results, or review text |
+| `ToolTraceCapture.selected_content(...)` | Retain Tool lifecycle and selected argument/result paths |
+| `ToolTraceCapture.disabled()` | Suppress Tool lifecycle and result-message facts |
 | `ReasoningCapturePolicy.omitted()` | Default reasoning policy; retain no content or digest |
 | `ReasoningCapturePolicy.content()` | Explicitly retain bounded content received from a configured Runtime extractor |
-| `ToolCaptureRule(toolName=..., argumentPaths=..., resultPaths=...)` | Allow selected RFC 6901 JSON Pointer values for one Tool |
+| `ToolCaptureRule(toolName=..., argumentPaths=..., resultPaths=..., includeReviewDescription=False)` | Allow selected RFC 6901 values and an optional review description for one Tool |
 | `CapturedValue` | Explicit `inline` or `omitted` capture envelope |
 | `TraceLimits` | Immutable event, thread, Tracer, reserve, and follow limits |
 | `TraceWritePolicy` | Immutable batch, 64 MiB pending, backpressure, and delay policy |
@@ -54,6 +59,8 @@ accept only `run.terminal` and `run.closed` facts. The byte reserve must cover
 `terminalReserveEventsPerRun * maxEventBytes`, so every reserved event can reach its
 declared maximum. A session that already failed remains an incomplete Trace; reserve
 capacity does not synthesize facts after Observer ownership is lost.
+An interaction payload that cannot fit its reconstruction boundary fails observation
+before a durable pause is published; it is never silently reduced to a blind approval.
 
 ## `TraceThread`
 
@@ -68,8 +75,10 @@ capacity does not synthesize facts after Observer ownership is lost.
 | `tree` | Flat authoritative `TraceTree`; `roots` and `children(id)` are convenience views |
 | `state` | Complete root and collision-safe subgraph states for the selected lineage |
 | `interactions` | Approval, clarification, review, and input interactions in the window |
+| `summary` | Complete cumulative status, completeness, counts, pending interactions, and maximum source time for the selected lineage |
 | `status` | `running`, `waiting`, `succeeded`, `failed`, `cancelled`, `abandoned`, or `unknown` |
 | `completeness` | Independent missing-prefix, missing-tail, and payload-omitted signals |
+| `message_count` / `tool_call_count` | Compatibility views computed from `summary` |
 | `projections` | Defensive copies of explicitly requested business results |
 | `has_older` | Whether earlier complete Turns can be loaded |
 | `history_cursor` | Opaque generation/head/as-of cursor for another `Tracer.get(...)` history request |
@@ -79,8 +88,13 @@ capacity does not synthesize facts after Observer ownership is lost.
 | `delete()` | Delete this exact inactive Store generation |
 
 `TraceUpdate` contains committed selected-lineage events and facts, entity
-upserts/removals for messages, reasoning, nodes, and interactions, plus the current complete state,
-status, completeness, and requested Projection results.
+upserts/removals for messages, reasoning, nodes, and interactions, the current complete
+state, and `summary`. `update.summary` is the cumulative value after the update, not a
+delta. Flat status, completeness, and count fields are computed from that same value.
+
+`TraceSummary.pending_interactions` and `last_occurred_at` cover the complete selected
+lineage at the fixed as-of boundary, independent of the loaded Turn window. Pending
+items are ordered by their first `trace_seq`; resolved or cancelled items are removed.
 
 Every `TraceMessage`, `TraceReasoning`, `TraceNode`, and `TraceInteraction` exposes
 `trace_seq`, the first authoritative Ledger sequence that created that entity. Consumers
@@ -89,6 +103,14 @@ substitutes. `TraceInteraction.source_id` preserves the canonical Native interru
 protocol clients can derive their documented per-action public IDs without an AG-UI copy.
 For Tool review, `tool_call_ids` preserves the exact checkpoint correlation in action
 position order. Consumers must not rebuild that relation from Tool names or node order.
+
+`TraceNode.input` and `result` contain only policy-retained values. `inputOmitted` and
+`resultOmitted` distinguish omission from JSON null. `Tracer()` uses
+`CapturePolicy.public_history()`, so newly observed Tools automatically retain complete
+sanitized content and public review descriptions. Exact-name `toolOverrides` can select
+`fullContent`, `metadataOnly`, `selectedContent`, or `disabled`. The low-level
+`ToolCaptureRule` and empty RFC 6901 root path remain available through
+`CapturePolicy.public_safe()` for explicit selected-path retention.
 
 ## Semantic facts
 
@@ -211,6 +233,6 @@ foreign keys or project-owned Schema-version fields.
 
 All tracing-owned failures inherit `TracingError` and expose a stable `tracing.*` code.
 The public family includes invalid cursor, thread not found, ambiguous head, Run
-conflict, corruption, Store unavailable/timeout/protocol error, Projection checkpoint
+not found, Run conflict, corruption, Store unavailable/timeout/protocol error, Projection checkpoint
 conflict, quota exceeded, capture rejected, Observer failed, and Projection failed. Public `context` is client-safe;
 trusted diagnostics and causes are separate.

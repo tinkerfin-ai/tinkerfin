@@ -1897,6 +1897,140 @@ def test_ambiguous_hitl_tool_correlation_is_rejected() -> None:
         )
 
 
+def test_hitl_checkpoint_ignores_a_completed_historical_duplicate() -> None:
+    adapter = _adapter()
+    arguments = {"file_path": "/same.txt"}
+    historical = AIMessage(
+        id="message-completed-history",
+        content="",
+        tool_calls=[
+            {
+                "name": "write_file",
+                "args": arguments,
+                "id": "call-completed-history",
+                "type": "tool_call",
+            }
+        ],
+    )
+    result = ToolMessage(
+        id="result-completed-history",
+        content="done",
+        name="write_file",
+        tool_call_id="call-completed-history",
+    )
+    current = AIMessage(
+        id="message-current-review",
+        content="",
+        tool_calls=[
+            {
+                "name": "write_file",
+                "args": arguments,
+                "id": "call-current-review",
+                "type": "tool_call",
+            }
+        ],
+    )
+
+    adapter.process(
+        {
+            "type": "values",
+            "ns": (),
+            "data": {"messages": [historical, result, current]},
+            "interrupts": (
+                {
+                    "id": "interrupt-current-review",
+                    "value": {
+                        "action_requests": [{"name": "write_file", "args": arguments}],
+                        "review_configs": [
+                            {
+                                "action_name": "write_file",
+                                "allowed_decisions": ["approve"],
+                            }
+                        ],
+                    },
+                },
+            ),
+        }
+    )
+
+    assert adapter.main_outcome().interrupts[0].tool_call_id == _tool_id(
+        (),
+        "call-current-review",
+    )
+
+
+def test_hitl_stream_history_ignores_a_completed_historical_duplicate() -> None:
+    adapter = _adapter()
+    arguments = {"file_path": "/same.txt"}
+    metadata = {"lc_agent_name": None, "langgraph_node": "model"}
+    for message in (
+        AIMessage(
+            id="message-completed-stream-history",
+            content="",
+            tool_calls=[
+                {
+                    "name": "write_file",
+                    "args": arguments,
+                    "id": "call-completed-stream-history",
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        ToolMessage(
+            id="result-completed-stream-history",
+            content="done",
+            name="write_file",
+            tool_call_id="call-completed-stream-history",
+        ),
+        AIMessage(
+            id="message-current-stream-review",
+            content="",
+            tool_calls=[
+                {
+                    "name": "write_file",
+                    "args": arguments,
+                    "id": "call-current-stream-review",
+                    "type": "tool_call",
+                }
+            ],
+        ),
+    ):
+        adapter.process(
+            {
+                "type": "messages",
+                "ns": (),
+                "data": (message, metadata),
+            }
+        )
+
+    adapter.process(
+        {
+            "type": "values",
+            "ns": (),
+            "data": {},
+            "interrupts": (
+                {
+                    "id": "interrupt-current-stream-review",
+                    "value": {
+                        "action_requests": [{"name": "write_file", "args": arguments}],
+                        "review_configs": [
+                            {
+                                "action_name": "write_file",
+                                "allowed_decisions": ["approve"],
+                            }
+                        ],
+                    },
+                },
+            ),
+        }
+    )
+
+    assert adapter.main_outcome().interrupts[0].tool_call_id == _tool_id(
+        (),
+        "call-current-stream-review",
+    )
+
+
 def test_hitl_history_fallback_rejects_cross_message_ambiguity() -> None:
     adapter = _adapter()
     metadata = {"lc_agent_name": None, "langgraph_node": "model"}

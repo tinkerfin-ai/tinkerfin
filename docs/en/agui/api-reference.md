@@ -2,7 +2,21 @@
 
 [AG-UI basics](index.md) · [中文](../../zh/agui/api-reference.md)
 
-## High-level Runtime APIs
+## Common managed APIs
+
+| API | Use |
+| --- | --- |
+| `TinkerFin.open_agui_run(identity, *, agent, input=... or resume=..., ...)` | Opens one ordinary or resumed AG-UI run |
+| `AgUiEventStream` | Iterates, aborts, closes, or renders AG-UI events |
+| `AgUiResumeRequest` | Carries only untrusted client decisions into checkpoint resolution |
+| `AgUiResumeCheckpoint` | Stable evidence passed to `on_resume_saved` after marker durability |
+| `TINKERFIN_HITL_CONTRACT` | Contract declaration for external mixed-cancellation subagents |
+
+`open_agui_run()` owns Agent resolution, asynchronous Graph construction, checkpoint
+resolution, failed lifecycle conversion, resume settlement, and stream creation. See
+[AG-UI basics](index.md) for its parameters.
+
+## Advanced Runtime APIs
 
 | API | Use |
 | --- | --- |
@@ -10,13 +24,10 @@
 | `DeepAgentDefinition.prepare_agui_resume(...)` | Resolves client decisions from the canonical Graph checkpoint |
 | `DeepAgentAgUiRuntime.astream(graph_input, ...)` | Runs an ordinary Graph request |
 | `DeepAgentAgUiResumeRuntime.astream(...)` | Runs a bound resume without caller input |
-| `AgUiEventStream` | Iterates, aborts, closes, or renders AG-UI events |
-| `AgUiResumeRequest` | Carries only untrusted client decisions into checkpoint resolution |
 | `AgUiResumeBinding` | Private framework-resolved resume facts accepted by `new_agui(...)` |
-| `AgUiResumeCheckpoint` | Stable evidence that a native resume marker is durable |
-| `TINKERFIN_HITL_CONTRACT` | Contract declaration for external mixed-cancellation subagents |
 
-See [AG-UI basics](index.md) for Runtime parameters and [Interrupts and resume](interrupts-and-resume.md) for binding use.
+See [Interrupts and resume](interrupts-and-resume.md) for ordinary and advanced resume
+boundaries.
 
 ## Conversion entry points
 
@@ -53,8 +64,9 @@ See [AG-UI basics](index.md) for Runtime parameters and [Interrupts and resume](
 
 | API | Use |
 | --- | --- |
-| `DeepAgentDefinition.prepare_agui_resume(...)` | Restore pending facts from the canonical checkpoint and build the high-level binding |
+| `TinkerFin.open_agui_run(resume=...)` | Restore pending facts and run a managed resume without exposing a binding |
 | `AgUiResumeRequest` | Immutable, non-empty, duplicate-free client resume entries |
+| `DeepAgentDefinition.prepare_agui_resume(...)` | Advanced path that restores pending facts and returns a binding |
 | `AgUiResumeBinding.from_agui(...)` | Advanced path for an integration that owns a complete trusted AG-UI terminal log |
 | `AgUiResumeBinding.model_validate(...)` | Restore the complete stable binding JSON model |
 | `AgUiResumeBindingError` | High-level binding cannot preserve the supplied resume semantics |
@@ -63,12 +75,11 @@ See [AG-UI basics](index.md) for Runtime parameters and [Interrupts and resume](
 | `ResumeTranslation` | Holds kind, mode, resume data, cancellations, Tool IDs, sources, and native decisions |
 | `ResumeMappingError` | Low-level Adapter data cannot be mapped without losing semantics |
 
-`ResumeTranslation` is the lower-level Adapter result. High-level Runtime callers pass
-an `AgUiResumeRequest` to `prepare_agui_resume(...)`; the Definition restores native
-interrupts and complete messages from the checkpointer. The returned binding represents
-fully resolved, mixed Tool cancellation, or all-cancelled abandonment without exposing
-a native command. `from_agui(...)` is only for a trusted event-log integration and must
-not consume client-resubmitted interrupt details.
+`ResumeTranslation` is the lower-level Adapter result. Ordinary callers pass an
+`AgUiResumeRequest` directly to `open_agui_run(resume=...)`; the facade restores native
+interrupts and complete messages from the checkpointer. Definition-level binding methods
+remain for trusted event-log or custom orchestration and must not consume
+client-resubmitted interrupt details.
 
 ## Interrupt data
 

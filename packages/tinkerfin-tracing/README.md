@@ -29,20 +29,23 @@ Tracing itself remains provider-neutral and does not depend on either package.
 ## Quick Start
 
 ```python
-from tinkerfin import TinkerFin
+from tinkerfin import RunIdentity, TinkerFin
 from tinkerfin_tracing import Tracer
 
 tracer = Tracer()
-definition = (
-    TinkerFin()
-    .observe(tracer)
-    .create_deep_agent(
-        model="openai:gpt-5.4",
-        tools=[],
-    )
+tinkerfin = TinkerFin().observe(tracer)
+definition = tinkerfin.create_deep_agent(
+    model="openai:gpt-5.4",
+    tools=[],
 )
 
-# Run the Definition through its ordinary native or AG-UI Runtime.
+stream = await tinkerfin.open_run(
+    RunIdentity(threadId="thread-1", runId="run-1"),
+    agent=definition,
+    input=graph_input,
+)
+async for _part in stream:
+    pass
 
 thread = await tracer.get("thread-1")
 print(thread.messages)
@@ -50,6 +53,7 @@ print(thread.reasoning)
 print(thread.tree.roots)
 print(thread.state.root)
 print(thread.status.execution)
+print(thread.summary.pending_interactions)
 ```
 
 Messages, reasoning, nodes, and interactions carry the first authoritative `trace_seq`
@@ -73,7 +77,7 @@ store = SqlAlchemyTraceStore(engine, namespace="my-application")
 await store.setup()
 tracer = Tracer(store=store)
 
-# Configure TinkerFin with `.observe(tracer)`, then close every Runtime request.
+# Configure TinkerFin with `.observe(tracer)`, then consume or close every managed stream.
 
 await engine.dispose()  # The host, not the Store, owns this operation.
 ```
@@ -88,8 +92,42 @@ Schema-version fields and can share a database with host-owned tables.
 
 `Tracer.get()` fixes one global `as_of_seq`. The default window contains the latest 100
 complete Turns. Messages remain chronological; top-level Turn nodes are latest-first;
-state, status, and completeness cover the full selected lineage. Multiple branch heads
+state and summary cover the full selected lineage. Multiple branch heads
 require an explicit `head_run_id`.
+Requesting a Run that has not entered the current generation raises
+`TraceRunNotFound`; it is not reported as stored-fact corruption.
+
+`TraceThread.summary` is the complete cumulative value for the selected lineage at the
+fixed as-of boundary. Its status, completeness, message and Tool counts, pending
+interactions, and maximum source `last_occurred_at` do not shrink with the visible Turn
+window. Every `TraceUpdate.summary` is the complete value after that update. Existing
+flat status and count accessors are computed from this one summary.
+
+`Tracer()` captures every observed Tool's complete sanitized arguments, results, and
+public review description. `TraceNode.input` and `TraceNode.result` expose those retained
+values, while their omission flags distinguish policy or size omission from JSON null.
+Per-Tool overrides describe whether the Tool remains fully visible, metadata-only,
+selected-content, or absent from Trace:
+
+```python
+from tinkerfin_tracing import CapturePolicy, ToolTraceCapture
+
+CapturePolicy.public_history(
+    tool_overrides={
+        "execute": ToolTraceCapture.metadata_only(),
+        "private_audit": ToolTraceCapture.disabled(),
+        "web_search": ToolTraceCapture.selected_content(
+            argument_paths=("/query",),
+            result_paths=("/answer", "/sources"),
+        ),
+    }
+)
+```
+
+New Tools require no second Trace registry. `CapturePolicy.public_safe(tool_rules=...)`
+remains the explicit metadata-only and RFC 6901 selection boundary for hosts that do not
+want the public-history default. Every mode still applies credential and provider
+reasoning sanitization, event-size limits, and explicit omission semantics.
 
 `TraceThread.history_cursor` expands the same fixed prefix through
 `Tracer.get(history_cursor=...)`, even when newer events have committed.
@@ -125,13 +163,17 @@ capability.
 
 ## Safety
 
-`CapturePolicy.public_safe()` preserves public user and assistant content while removing
-exact or vendor-prefixed credential fields, Runtime private state, and the verified
-provider-private reasoning path. A same-named business field elsewhere remains intact.
-Run and Runtime task payloads retain public structural metadata. Tool arguments, results,
-and approval arguments are metadata-only unless an explicit Tool-name JSON Pointer rule
-permits selected values. Oversized safe values use an explicit omitted disposition;
+The default `CapturePolicy.public_history()` preserves public user, assistant, and Tool
+content while removing exact or vendor-prefixed credential fields, Runtime private
+state, and the verified provider-private reasoning path. A same-named business field
+elsewhere remains intact. Run and Runtime task payloads retain public structural
+metadata. `ToolTraceCapture.metadata_only()` preserves Tool lifecycle without content;
+`disabled()` suppresses Tool and result-message facts; `selected_content()` retains only
+the named RFC 6901 paths. Oversized safe values use an explicit omitted disposition, and
 non-finite numbers are rejected before serialization.
+An interaction that cannot fit its required reconstruction payload fails observation
+before the Runtime publishes an unrecoverable pause; ordinary optional payloads retain
+their explicit omission signal.
 
 Provider reasoning has an independent retention gate. Runtime must first receive a
 verified `ReasoningExtractor`; Tracing then defaults to

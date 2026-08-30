@@ -12,9 +12,13 @@ import pytest
 from tinkerfin import RunIdentity
 from tinkerfin_messaging import (
     InvalidCursor,
+    MessageSource,
     MessageSubscription,
     Messaging,
     MessagingBackend,
+    MessagingClosed,
+    RecoverableMessage,
+    RecoveryCheckpoint,
     RunAlreadyActive,
     SseRenderingUnsupported,
 )
@@ -81,14 +85,309 @@ class _ControlledSource:
         self.closed.set()
 
 
+class _NeverOpenedRecoverable:
+    def __init__(self) -> None:
+        self.open_calls = 0
+
+    async def open(
+        self,
+        checkpoint: RecoveryCheckpoint | None,
+    ) -> MessageSource[RecoverableMessage[str]]:
+        del checkpoint
+        self.open_calls += 1
+        raise AssertionError("closed Messaging opened a recoverable source")
+
+
+class _FailingCloseSource(_ControlledSource):
+    def __init__(self, error: BaseException) -> None:
+        super().__init__("never-consumed")
+        self._error = error
+
+    async def aclose(self) -> None:
+        await super().aclose()
+        raise self._error
+
+
+class _ClosingRecoverable:
+    def __init__(self, messaging: Messaging, close_error: BaseException) -> None:
+        self._messaging = messaging
+        self.opened = _FailingCloseSource(close_error)
+        self.open_calls = 0
+
+    async def open(
+        self,
+        checkpoint: RecoveryCheckpoint | None,
+    ) -> MessageSource[RecoverableMessage[str]]:
+        del checkpoint
+        self.open_calls += 1
+        await self._messaging.aclose()
+        return cast(MessageSource[RecoverableMessage[str]], self.opened)
+
+
 async def _collect_data(subscription: MessageSubscription[str]) -> list[str]:
     return [message.data async for message in subscription]
+
+
+@pytest.mark.parametrize("render_sse", [False, True])
+async def test_closed_messaging_settles_an_unregistered_ordinary_delivery(
+    render_sse: bool,
+) -> None:
+    messaging = Messaging()
+    await messaging.__aenter__()
+    channel = messaging.channel(
+        name="events",
+        codec=_TextCodec(),
+        renderer=_TextSseRenderer(),
+    )
+    await messaging.aclose()
+    source = _ControlledSource("never-consumed")
+    not_started = 0
+
+    async def delivery_not_started() -> None:
+        nonlocal not_started
+        assert source.closed.is_set()
+        not_started += 1
+
+    with pytest.raises(MessagingClosed):
+        if render_sse:
+            await channel.sse(
+                source,
+                identity=_identity(),
+                on_delivery_not_started=delivery_not_started,
+            )
+        else:
+            await channel.wrap(
+                source,
+                identity=_identity(),
+                on_delivery_not_started=delivery_not_started,
+            )
+
+    assert source.close_calls == 1
+    assert not source.started.is_set()
+    assert not_started == 1
+
+
+async def test_closed_messaging_does_not_open_a_recoverable_delivery() -> None:
+    messaging = Messaging()
+    await messaging.__aenter__()
+    channel = messaging.channel(name="events", codec=_TextCodec())
+    await messaging.aclose()
+    source = _NeverOpenedRecoverable()
+    not_started = 0
+
+    async def delivery_not_started() -> None:
+        nonlocal not_started
+        not_started += 1
+
+    with pytest.raises(MessagingClosed):
+        await channel.wrap_recoverable(
+            source,
+            identity=_identity(),
+            on_delivery_not_started=delivery_not_started,
+        )
+
+    assert source.open_calls == 0
+    assert not_started == 1
+
+
+async def test_closed_messaging_propagates_source_cleanup_cancellation() -> None:
+    messaging = Messaging()
+    await messaging.__aenter__()
+    channel = messaging.channel(name="events", codec=_TextCodec())
+    await messaging.aclose()
+    source = _FailingCloseSource(asyncio.CancelledError("cleanup cancelled"))
+    not_started = 0
+
+    async def delivery_not_started() -> None:
+        nonlocal not_started
+        not_started += 1
+
+    with pytest.raises(asyncio.CancelledError) as captured:
+        await channel.wrap(
+            source,
+            identity=_identity(),
+            on_delivery_not_started=delivery_not_started,
+        )
+
+    assert source.close_calls == 1
+    assert not_started == 1
+    assert any(
+        "MessagingClosed" in note for note in getattr(captured.value, "__notes__", ())
+    )
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [asyncio.CancelledError, KeyboardInterrupt, SystemExit],
+)
+async def test_registered_wrap_propagates_cleanup_process_control(
+    error_type: type[BaseException],
+) -> None:
+    source = _FailingCloseSource(error_type("cleanup stopped"))
+    not_started = 0
+
+    async def delivery_not_started() -> None:
+        nonlocal not_started
+        not_started += 1
+
+    async with Messaging() as messaging:
+        channel = messaging.channel(name="events", codec=_TextCodec())
+        with pytest.raises(error_type) as captured:
+            await channel.wrap(
+                source,
+                identity=_identity(),
+                after=True,
+                on_delivery_not_started=delivery_not_started,
+            )
+
+    assert source.close_calls == 1
+    assert not_started == 1
+    assert any("TypeError" in note for note in getattr(captured.value, "__notes__", ()))
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [asyncio.CancelledError, KeyboardInterrupt, SystemExit],
+)
+async def test_sse_cursor_failure_propagates_cleanup_process_control(
+    error_type: type[BaseException],
+) -> None:
+    source = _FailingCloseSource(error_type("cleanup stopped"))
+    not_started = 0
+
+    def resolve_after() -> int:
+        raise RuntimeError("cursor lookup failed")
+
+    async def delivery_not_started() -> None:
+        nonlocal not_started
+        not_started += 1
+
+    async with Messaging() as messaging:
+        channel = messaging.channel(
+            name="events",
+            codec=_TextCodec(),
+            renderer=_TextSseRenderer(),
+        )
+        with pytest.raises(error_type) as captured:
+            await channel.sse(
+                source,
+                identity=_identity(),
+                after=resolve_after,
+                on_delivery_not_started=delivery_not_started,
+            )
+
+    assert source.close_calls == 1
+    assert not_started == 1
+    assert any(
+        "RuntimeError" in note for note in getattr(captured.value, "__notes__", ())
+    )
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [asyncio.CancelledError, KeyboardInterrupt, SystemExit],
+)
+async def test_recoverable_preflight_propagates_opened_cleanup_process_control(
+    error_type: type[BaseException],
+) -> None:
+    messaging = Messaging()
+    await messaging.__aenter__()
+    source = _ClosingRecoverable(messaging, error_type("cleanup stopped"))
+    not_started = 0
+
+    async def delivery_not_started() -> None:
+        nonlocal not_started
+        not_started += 1
+
+    try:
+        channel = messaging.channel(name="events", codec=_TextCodec())
+        with pytest.raises(error_type) as captured:
+            await channel.wrap_recoverable(
+                source,
+                identity=_identity(),
+                on_delivery_not_started=delivery_not_started,
+            )
+    finally:
+        await messaging.aclose()
+
+    assert source.open_calls == 1
+    assert source.opened.close_calls == 1
+    assert not_started == 1
+    assert any(
+        "MessagingClosed" in note for note in getattr(captured.value, "__notes__", ())
+    )
+
+
+async def test_close_waits_for_preflight_not_the_callers_later_work() -> None:
+    messaging = Messaging()
+    await messaging.__aenter__()
+    channel = messaging.channel(name="events", codec=_TextCodec())
+    source = _ControlledSource("unused")
+    callback_started = asyncio.Event()
+    release_callback = asyncio.Event()
+    request_continued = asyncio.Event()
+    release_request = asyncio.Event()
+
+    async def source_starting() -> None:
+        callback_started.set()
+        await release_callback.wait()
+
+    async def request() -> None:
+        with pytest.raises(MessagingClosed):
+            await channel.wrap(
+                source,
+                identity=_identity(),
+                on_source_starting=source_starting,
+            )
+        request_continued.set()
+        await release_request.wait()
+
+    request_task = asyncio.create_task(request())
+    await callback_started.wait()
+    close_task = asyncio.create_task(messaging.aclose())
+    await asyncio.sleep(0)
+    release_callback.set()
+    await request_continued.wait()
+
+    await asyncio.wait_for(asyncio.shield(close_task), timeout=1)
+    assert not request_task.done()
+
+    release_request.set()
+    await request_task
+
+
+async def test_source_starting_can_close_messaging_without_preflight_deadlock() -> None:
+    messaging = Messaging()
+    await messaging.__aenter__()
+    channel = messaging.channel(name="events", codec=_TextCodec())
+    source = _ControlledSource("unused")
+
+    async def source_starting() -> None:
+        await messaging.aclose()
+
+    with pytest.raises(MessagingClosed):
+        await asyncio.wait_for(
+            channel.wrap(
+                source,
+                identity=_identity(),
+                on_source_starting=source_starting,
+            ),
+            timeout=1,
+        )
+
+    assert source.close_calls == 1
 
 
 async def test_invalid_cursor_is_rejected_during_wrap_and_closes_source(
     messaging_backend: MessagingBackend,
 ) -> None:
     source = _ControlledSource("never-consumed")
+    not_started = 0
+
+    async def delivery_not_started() -> None:
+        nonlocal not_started
+        assert source.closed.is_set()
+        not_started += 1
 
     async with Messaging(backend=messaging_backend) as messaging:
         channel = messaging.channel(name="events", codec=_TextCodec())
@@ -98,12 +397,14 @@ async def test_invalid_cursor_is_rejected_during_wrap_and_closes_source(
                 source,
                 identity=_identity(),
                 after=1,
+                on_delivery_not_started=delivery_not_started,
             )
 
     assert captured.value.after == 1
     assert captured.value.latest == 0
     assert source.close_calls == 1
     assert not source.started.is_set()
+    assert not_started == 1
 
 
 async def test_boolean_cursor_is_rejected_during_wrap_and_closes_source(
@@ -182,6 +483,16 @@ async def test_same_run_attaches_and_closes_the_unused_candidate_source(
     release = asyncio.Event()
     owner = _ControlledSource("first", release=release)
     candidate = _ControlledSource("must-not-run")
+    candidate_starting = 0
+    candidate_not_started = 0
+
+    async def candidate_source_starting() -> None:
+        nonlocal candidate_starting
+        candidate_starting += 1
+
+    async def candidate_delivery_not_started() -> None:
+        nonlocal candidate_not_started
+        candidate_not_started += 1
 
     async with Messaging(backend=messaging_backend) as messaging:
         channel = messaging.channel(name="events", codec=_TextCodec())
@@ -196,6 +507,8 @@ async def test_same_run_attaches_and_closes_the_unused_candidate_source(
             candidate,
             identity=_identity(),
             after=0,
+            on_source_starting=candidate_source_starting,
+            on_delivery_not_started=candidate_delivery_not_started,
         )
 
         release.set()
@@ -209,6 +522,76 @@ async def test_same_run_attaches_and_closes_the_unused_candidate_source(
     assert candidate.close_calls == 1
     assert not candidate.started.is_set()
     assert owner.close_calls == 1
+    assert candidate_starting == 0
+    assert candidate_not_started == 0
+
+
+async def test_owner_callbacks_run_after_source_preflight_and_before_production(
+    messaging_backend: MessagingBackend,
+) -> None:
+    order: list[str] = []
+
+    class _SourceWithPreflight(_ControlledSource):
+        async def messaging_owner_preflight(self) -> None:
+            order.append("source_preflight")
+
+        def __aiter__(self) -> AsyncIterator[str]:
+            order.append("source_pull")
+            return super().__aiter__()
+
+    source = _SourceWithPreflight("message")
+
+    async def source_starting() -> None:
+        order.append("host_starting")
+
+    async def delivery_not_started() -> None:
+        order.append("not_started")
+
+    async with Messaging(backend=messaging_backend) as messaging:
+        subscription = await messaging.channel(
+            name="events",
+            codec=_TextCodec(),
+        ).wrap(
+            source,
+            identity=_identity(),
+            after=0,
+            on_source_starting=source_starting,
+            on_delivery_not_started=delivery_not_started,
+        )
+        assert await _collect_data(subscription) == ["message"]
+
+    assert order[:2] == ["source_preflight", "host_starting"]
+    assert order.count("source_pull") == 1
+    assert "not_started" not in order
+
+
+async def test_source_starting_failure_settles_before_not_started_callback(
+    messaging_backend: MessagingBackend,
+) -> None:
+    source = _ControlledSource("must-not-run")
+    order: list[str] = []
+
+    async def source_starting() -> None:
+        order.append("source_starting")
+        raise RuntimeError("business activation failed")
+
+    async def delivery_not_started() -> None:
+        assert source.closed.is_set()
+        order.append("not_started")
+
+    async with Messaging(backend=messaging_backend) as messaging:
+        with pytest.raises(RuntimeError, match="business activation failed"):
+            await messaging.channel(name="events", codec=_TextCodec()).wrap(
+                source,
+                identity=_identity(),
+                after=0,
+                on_source_starting=source_starting,
+                on_delivery_not_started=delivery_not_started,
+            )
+
+    assert order == ["source_starting", "not_started"]
+    assert source.close_calls == 1
+    assert not source.started.is_set()
 
 
 async def test_wrap_rejects_an_active_run_conflict_before_returning(
@@ -354,11 +737,17 @@ async def test_channel_sse_closes_source_when_cursor_callback_fails(
 ) -> None:
     source = _ControlledSource("never-consumed")
     resolver_calls = 0
+    not_started = 0
 
     def resolve_after() -> int:
         nonlocal resolver_calls
         resolver_calls += 1
         raise RuntimeError("cursor lookup failed")
+
+    async def delivery_not_started() -> None:
+        nonlocal not_started
+        assert source.closed.is_set()
+        not_started += 1
 
     async with Messaging(backend=messaging_backend) as messaging:
         channel = messaging.channel(
@@ -371,8 +760,10 @@ async def test_channel_sse_closes_source_when_cursor_callback_fails(
                 source,
                 identity=_identity(),
                 after=resolve_after,
+                on_delivery_not_started=delivery_not_started,
             )
 
     assert resolver_calls == 1
     assert source.close_calls == 1
     assert not source.started.is_set()
+    assert not_started == 1

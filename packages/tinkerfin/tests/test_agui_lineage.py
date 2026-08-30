@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator
 from operator import add
-from typing import Annotated, Any, TypedDict, cast
+from typing import Annotated, Any, cast
 
 import pytest
 from ag_ui.core import BaseEvent, RunErrorEvent, RunStartedEvent
+from langchain.agents.middleware.types import InputAgentState
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import CheckpointTuple
 from langgraph.checkpoint.memory import MemorySaver
@@ -55,7 +56,7 @@ def test_lineage_marker_uses_the_current_unversioned_contract() -> None:
     }
 
 
-class _BranchState(TypedDict, total=False):
+class _BranchState(InputAgentState, total=False):
     history: Annotated[list[str], add]
     _tinkerfin_lineage: dict[str, object]
     _tinkerfin_resume: dict[str, object]
@@ -93,6 +94,10 @@ def _install_branch_graph(
         build,
     )
     return saver, graphs
+
+
+def _branch_input(value: str) -> _BranchState:
+    return {"messages": [], "history": [value]}
 
 
 class _DifferentFixtureProfile(DeepAgentsV2RuntimeProfile):
@@ -234,7 +239,7 @@ async def _run(
     stream = (
         runtime.astream()
         if resume is not None
-        else runtime.astream({"history": [cast(str, value)]})
+        else runtime.astream(_branch_input(cast(str, value)))
     )
     return [event async for event in stream], stream
 
@@ -345,9 +350,9 @@ async def test_missing_or_cross_execution_parent_fails_before_graph_invocation(
     saver, _graphs = _install_branch_graph(monkeypatch)
     definition = TinkerFin().create_deep_agent(model="provider:model", tools=[])
     if parent_run_id == "run-other-thread":
-        graph = cast(Any, definition)._build_astream("default").__self__
+        graph = await definition.create_graph()
         async for _part in graph.astream(
-            {"history": ["other"]},
+            _branch_input("other"),
             config={
                 "configurable": {
                     "thread_id": "other-thread",
@@ -570,7 +575,7 @@ async def test_active_parent_is_rejected(
 ) -> None:
     _saver, graphs = _install_branch_graph(monkeypatch)
     definition = TinkerFin().create_deep_agent(model="provider:model", tools=[])
-    cast(Any, definition)._build_astream("default")
+    await definition.create_graph()
     active_graph = graphs[-1]
     active_identity = RunIdentity(threadId="thread-1", runId="run-active")
     active_stream = active_graph.astream(

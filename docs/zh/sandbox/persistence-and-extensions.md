@@ -69,7 +69,8 @@ schema = get_sqlalchemy_opensandbox_state_schema(dialect="mysql")
 Path("opensandbox-schema.sql").write_text(schema.ddl, encoding="utf-8")
 ```
 
-`dialect` 可以是 `mysql` 或 `sqlite`。返回值还包含 `table_names`，应用启动时仍会检查数据库结构是否匹配。
+`dialect` 可以是 `mysql` 或 `sqlite`。返回值还包含 `table_names`。应用启动时仍会检查完整的表、字段、
+主键与索引结构，包括精确的索引集合和 unique 标志。
 
 ## 预热 Sandbox
 
@@ -113,11 +114,13 @@ initializer 在新 Sandbox 可用后执行。它应当可取消、可观察，�
 | --- | --- |
 | 生命周期 | `start()`、`aclose()` |
 | owner | `acquire_owner()`、`renew_owner()`、`bind_owner()`、`unbind_owner()`、`release_owner()`、`read_binding()` |
-| warm pool | `claim_warm_slot()`、`renew_warm()`、`publish_warm()`、`release_warm()`、`consume_warm()` |
+| warm pool | `claim_warm_slot()`、`claim_ready_warm_slot()`、`renew_warm()`、`publish_warm()`、`discard_ready_warm_slot()`、`release_warm()`、`warm_pool_ready()`、`consume_warm()` |
 | cleanup | `enqueue_cleanup()`、`claim_cleanup()`、`renew_cleanup()`、`complete_cleanup()`、`release_cleanup()` |
 | 关闭恢复 | `shutdown_sandbox_ids()` |
 
-自定义状态必须有原子 claim、代际 fencing、租约续期和幂等释放。网络超时后结果不确定时，不得擅自销毁可能已经成为权威绑定的 Sandbox。
+自定义状态必须有原子 claim、代际 fencing、租约续期和幂等释放。ready slot 在远端检查期间必须保留
+已发布 ID；确认 ID 不可用后，清空 slot 与加入 cleanup 队列必须是一次原子转换。网络超时后结果不确定
+时，不得擅自销毁可能已经成为权威绑定的 Sandbox。
 
 `InMemoryOpenSandboxState(namespace=...)` 可以作为行为参考，但它不适合跨进程共享。
 

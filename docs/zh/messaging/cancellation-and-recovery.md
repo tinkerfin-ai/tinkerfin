@@ -45,7 +45,44 @@ TinkerFin 的 AG-UI 流已经提供取消能力，直接把该流交给 Messagin
 
 ## 只有 owner 才创建 Agent
 
-如果创建 Graph、模型连接或 Sandbox 很昂贵，可以延迟到 Messaging 确认当前请求是生产者 owner 之后再创建。
+Managed TinkerFin AG-UI 运行使用面向任务的 helper：
+
+```python
+from tinkerfin_messaging import create_agui_run_source
+
+
+source = create_agui_run_source(
+    identity,
+    open_events=lambda run_identity: tinkerfin.open_agui_run(
+        run_identity,
+        agent=create_agent,
+        input=graph_input,
+        config=graph_config,
+    ),
+    transform_event=add_product_metadata,
+)
+```
+
+Messaging 选定当前调用为 owner 后才会打开 Agent。该 helper 隐藏 Binding、profile 常量、source
+类型、映射和首事件取消 fence，并把调用方只传一次的同一个 `RunIdentity` 对象交给
+`open_events`。`transform_event` 可以补充产品 metadata 或内容，但必须保留具体事件类型和全部协议
+关联身份，并完整保留调用方提供的可选 `RUN_STARTED.input`。
+
+宿主投递状态使用 channel callback：
+
+```python
+body = await channel.sse(
+    source,
+    on_source_starting=activate_business_run,
+    on_delivery_not_started=cleanup_business_run,
+)
+```
+
+Source 自有 `on_owner_preflight` 是准备 source 本身的高级 hook，不是宿主激活的另一个名称。
+
+## 高级 deferred source
+
+自定义协议 source 创建成本较高时，可以使用 `DeferredMessageSource`：
 
 ```python
 from tinkerfin_messaging import (
@@ -77,11 +114,14 @@ source = DeferredMessageSource(
 
 附着或纯回放请求不会调用 opener。`cancel_after_first_item=True` 适合必须先出现 `RUN_STARTED` 的协议。
 
-Messaging 在 durable owner 选定后等待 `on_owner_preflight`。回调失败时会释放本次 owner 并关闭 deferred wrapper，opener 不会运行。宿主可在这里执行必须阻止过期回收的 CAS 或 lease 激活。
+Messaging 在 durable owner 选定后等待 `on_owner_preflight`。回调失败时会释放本次 owner 并关闭
+deferred wrapper，opener 不会运行。该 hook 只用于 source 自有准备；宿主激活应放在
+`on_source_starting`。
 
 `MessageSourceBinding` 包含 `source` 和可选 `cancel`。如果 source 自己声明取消函数，可以省略 binding 的 `cancel`。
 
-如果 opener 打开的是已知 AG-UI 或 Native 流，并且 name-only channel 必须在打开前识别 codec 与 RunIdentity，使用 `ProfiledDeferredMessageSource`：
+自定义 opener 打开已知 AG-UI 或 Native 流，并且 name-only channel 必须在打开前识别 codec
+与 RunIdentity 时，使用 `ProfiledDeferredMessageSource`：
 
 ```python
 from ag_ui.core import BaseEvent

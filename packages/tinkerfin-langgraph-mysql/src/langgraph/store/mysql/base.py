@@ -26,25 +26,25 @@ from langgraph.store.base import (
 )
 from typing_extensions import TypedDict
 
-_STORE_TABLE_COMMENT = "Deep Agents 长期 memory Store"
+_STORE_TABLE_COMMENT = "Deep Agents long-term memory Store"
 _STORE_SCHEMA_STATEMENT = """
 CREATE TABLE IF NOT EXISTS store (
-    prefix VARCHAR(500) NOT NULL COMMENT 'Store 文档命名空间',
-    `key` VARCHAR(150) NOT NULL COMMENT '命名空间内文档键',
-    value JSON NOT NULL COMMENT '文档 JSON 内容',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '更新时间',
+    prefix VARCHAR(500) NOT NULL COMMENT 'Store document namespace',
+    `key` VARCHAR(150) NOT NULL COMMENT 'Document key within the namespace',
+    value JSON NOT NULL COMMENT 'Document JSON value',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT 'Document creation time',
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT 'Document update time',
     CONSTRAINT pk_store PRIMARY KEY (prefix, `key`),
     KEY store_prefix_idx (prefix)
-) COMMENT='Deep Agents 长期 memory Store'
+) COMMENT='Deep Agents long-term memory Store'
 """
 
 _STORE_COLUMN_CONTRACTS: tuple[tuple[str, str, str, str | None, str], ...] = (
-    ("prefix", "varchar(500)", "NO", None, "Store 文档命名空间"),
-    ("key", "varchar(150)", "NO", None, "命名空间内文档键"),
-    ("value", "json", "NO", None, "文档 JSON 内容"),
-    ("created_at", "timestamp", "YES", "current_timestamp", "创建时间"),
-    ("updated_at", "timestamp", "YES", "current_timestamp", "更新时间"),
+    ("prefix", "varchar(500)", "NO", None, "Store document namespace"),
+    ("key", "varchar(150)", "NO", None, "Document key within the namespace"),
+    ("value", "json", "NO", None, "Document JSON value"),
+    ("created_at", "timestamp", "YES", "current_timestamp", "Document creation time"),
+    ("updated_at", "timestamp", "YES", "current_timestamp", "Document update time"),
 )
 _STORE_INDEX_CONTRACTS: tuple[tuple[str, int, int, str, str], ...] = (
     ("PRIMARY", 0, 1, "prefix", "BTREE"),

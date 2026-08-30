@@ -11,9 +11,9 @@ from pydantic import (
     ConfigDict,
     Field,
     JsonValue,
+    RootModel,
     TypeAdapter,
     create_model,
-    model_validator,
 )
 from pydantic.alias_generators import to_camel
 
@@ -32,28 +32,42 @@ class _ContractModel(BaseModel):
     )
 
 
-class PlannerOutcomeBase(_ContractModel):
-    """Structured result from the single read-only Planner agent."""
+class _PlannerOutcomeMember(_ContractModel):
+    """Provide the discriminator shared by the three Planner results."""
 
     type: Literal["clarify", "draft", "accept_edit"]
-    clarification: ClarificationFormBase | None = None
-    draft: PlanContentModel | None = None
 
-    @model_validator(mode="after")
-    def payload_matches_type(self) -> PlannerOutcomeBase:
-        """Require exactly the payload owned by the selected Planner outcome."""
 
-        if self.type == "clarify":
-            if self.clarification is None or self.draft is not None:
-                raise ValueError("clarify outcome requires a form and no draft")
-        elif self.type == "draft":
-            if self.clarification is not None or self.draft is None:
-                raise ValueError(
-                    "draft outcome requires a draft and no clarification form"
-                )
-        elif self.clarification is not None or self.draft is not None:
-            raise ValueError("accept_edit outcome cannot contain a form or draft")
-        return self
+class PlannerOutcomeBase(RootModel[_PlannerOutcomeMember]):
+    """Expose one discriminated result from the single read-only Planner call."""
+
+    # Tool providers require function parameters to declare an object at the root.
+    # Pydantic's discriminated RootModel otherwise emits only oneOf/discriminator even
+    # though every member is an extra-forbid object with the same discriminator.
+    model_config = ConfigDict(
+        frozen=True,
+        json_schema_extra={"type": "object"},
+    )
+
+    @property
+    def type(self) -> Literal["clarify", "draft", "accept_edit"]:
+        """Return the selected Planner result kind."""
+
+        return self.root.type
+
+    @property
+    def clarification(self) -> ClarificationFormBase | None:
+        """Return the clarification form only for a clarify result."""
+
+        value = getattr(self.root, "clarification", None)
+        return value if isinstance(value, ClarificationFormBase) else None
+
+    @property
+    def draft(self) -> PlanContentModel | None:
+        """Return the proposed content only for a draft result."""
+
+        value = getattr(self.root, "draft", None)
+        return value if isinstance(value, PlanContentModel) else None
 
 
 class PlanClarificationPayload(_ContractModel):
@@ -73,6 +87,13 @@ class ApprovePlan(_ContractModel):
     """Approve the current Plan revision without edits."""
 
     type: Literal["approve"]
+    base_revision: int = Field(ge=1, strict=True)
+
+
+class CancelPlan(_ContractModel):
+    """Discard the current draft while keeping the Planning conversation active."""
+
+    type: Literal["cancel"]
     base_revision: int = Field(ge=1, strict=True)
 
 
@@ -114,6 +135,7 @@ class PlanContractBinding:
     """Dynamic Planner and review contracts frozen for one Definition."""
 
     planner_response_type: type[PlannerOutcomeBase]
+    planner_edit_response_type: type[PlannerOutcomeBase]
     review_response: TypeAdapter[object]
     review_payload_type: type[_ContractModel]
     review_metadata_type: type[_ContractModel]
@@ -132,6 +154,23 @@ def _review_model_union(
     return review_union
 
 
+def _planner_response_type(
+    first: type[BaseModel],
+    second: type[BaseModel],
+) -> type[PlannerOutcomeBase]:
+    """Build one state-specific two-outcome Planner Tool contract."""
+
+    planner_annotation = Annotated[
+        first | second,
+        Field(discriminator="type"),
+    ]  # pyright: ignore[reportInvalidTypeForm]
+    return create_model(
+        "PlannerOutcome",
+        __base__=PlannerOutcomeBase,
+        root=(planner_annotation, ...),
+    )
+
+
 def create_plan_contract_binding(
     clarification: ClarificationSchemaBinding,
     content: PlanContentBinding,
@@ -140,11 +179,30 @@ def create_plan_contract_binding(
 ) -> PlanContractBinding:
     """Bind one clarification form and one Plan content schema atomically."""
 
-    planner_type = create_model(
-        "PlannerOutcome",
-        __base__=PlannerOutcomeBase,
-        clarification=(clarification.form_schema | None, None),
-        draft=(content.schema | None, None),
+    clarify_type = create_model(
+        "PlannerClarifyOutcome",
+        __base__=_PlannerOutcomeMember,
+        type=(Literal["clarify"], ...),
+        clarification=(clarification.form_schema, ...),
+    )
+    draft_type = create_model(
+        "PlannerDraftOutcome",
+        __base__=_PlannerOutcomeMember,
+        type=(Literal["draft"], ...),
+        draft=(content.schema, ...),
+    )
+    accept_edit_type = create_model(
+        "PlannerAcceptEditOutcome",
+        __base__=_PlannerOutcomeMember,
+        type=(Literal["accept_edit"], ...),
+    )
+    planner_type = _planner_response_type(
+        clarify_type,
+        draft_type,
+    )
+    planner_edit_type = _planner_response_type(
+        clarify_type,
+        accept_edit_type,
     )
     edit_type = create_model(
         "EditPlan",
@@ -154,6 +212,7 @@ def create_plan_contract_binding(
     review_types = tuple(
         {
             PlanReviewAction.APPROVE: ApprovePlan,
+            PlanReviewAction.CANCEL: CancelPlan,
             PlanReviewAction.EDIT: edit_type,
             PlanReviewAction.RESPOND: RespondToPlan,
             PlanReviewAction.REJECT: RejectPlan,
@@ -185,6 +244,7 @@ def create_plan_contract_binding(
     )
     return PlanContractBinding(
         planner_response_type=planner_type,
+        planner_edit_response_type=planner_edit_type,
         review_response=review_response,
         review_payload_type=review_payload_type,
         review_metadata_type=review_metadata_type,
@@ -193,6 +253,7 @@ def create_plan_contract_binding(
 
 __all__ = [
     "ApprovePlan",
+    "CancelPlan",
     "EditPlanBase",
     "PlanClarificationMetadata",
     "PlanClarificationPayload",

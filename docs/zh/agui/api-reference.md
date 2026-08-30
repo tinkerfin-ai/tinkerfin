@@ -2,7 +2,20 @@
 
 [AG-UI 入门](index.md) · [English](../../en/agui/api-reference.md)
 
-## 高层 Runtime 能力
+## 常用 managed 能力
+
+| API | 用途 |
+| --- | --- |
+| `TinkerFin.open_agui_run(identity, *, agent, input=... or resume=..., ...)` | 打开一次普通或恢复 AG-UI 运行 |
+| `AgUiEventStream` | 迭代、取消、关闭或转成 SSE |
+| `AgUiResumeRequest` | 只把不可信客户端决定带入 checkpoint 解析 |
+| `AgUiResumeCheckpoint` | marker 持久后传给 `on_resume_saved` 的稳定证据 |
+| `TINKERFIN_HITL_CONTRACT` | 外部 mixed-cancellation 子 Agent 的契约声明 |
+
+`open_agui_run()` 统一负责 Agent 解析、异步 Graph 构造、checkpoint 解析、失败生命周期转换、
+resume 结算与流创建。参数见 [AG-UI 入门](index.md)。
+
+## 高级 Runtime 能力
 
 | API | 用途 |
 | --- | --- |
@@ -10,13 +23,9 @@
 | `DeepAgentDefinition.prepare_agui_resume(...)` | 从权威 Graph checkpoint 解析客户端决定 |
 | `DeepAgentAgUiRuntime.astream(graph_input, ...)` | 执行普通 Graph 请求 |
 | `DeepAgentAgUiResumeRuntime.astream(...)` | 执行已绑定恢复，不接收调用方 input |
-| `AgUiEventStream` | 迭代、取消、关闭或转成 SSE |
-| `AgUiResumeRequest` | 只把不可信客户端决定带入 checkpoint 解析 |
 | `AgUiResumeBinding` | 由框架解析并交给 `new_agui(...)` 的私有恢复事实 |
-| `AgUiResumeCheckpoint` | 原生 resume marker 已持久化的稳定证据 |
-| `TINKERFIN_HITL_CONTRACT` | 外部 mixed-cancellation 子 Agent 的契约声明 |
 
-完整 Runtime 参数见 [AG-UI 入门](index.md)，恢复参数见 [interrupt 与恢复](interrupts-and-resume.md)。
+普通和高级恢复边界见 [interrupt 与恢复](interrupts-and-resume.md)。
 
 ## 转换入口
 
@@ -55,8 +64,9 @@
 
 | API | 用途 |
 | --- | --- |
-| `DeepAgentDefinition.prepare_agui_resume(...)` | 从权威 checkpoint 恢复 pending 事实并构造高层 Binding |
+| `TinkerFin.open_agui_run(resume=...)` | 恢复 pending 事实并执行 managed resume，不暴露 Binding |
 | `AgUiResumeRequest` | 不可变、非空且拒绝重复 ID 的客户端恢复项 |
+| `DeepAgentDefinition.prepare_agui_resume(...)` | 恢复 pending 事实并返回 Binding 的高级入口 |
 | `AgUiResumeBinding.from_agui(...)` | 自行拥有完整可信 AG-UI 终止日志时使用的高级入口 |
 | `AgUiResumeBinding.model_validate(...)` | 恢复完整稳定 Binding JSON 模型 |
 | `AgUiResumeBindingError` | 高层 Binding 无法无损保留恢复语义 |
@@ -65,10 +75,9 @@
 | `ResumeTranslation` | 保存 kind、mode、恢复数据、取消项、Tool ID、来源与原生决定 |
 | `ResumeMappingError` | Adapter 低层数据无法无损映射 |
 
-`ResumeTranslation` 是 Adapter 的低层结果。高层 Runtime 把 `AgUiResumeRequest` 交给
-`prepare_agui_resume(...)`，Definition 从 checkpointer 恢复原生 interrupt 与完整消息。返回的
-Binding 表示全部 resolved、Tool mixed cancellation 或全部 cancelled abandonment，不公开原生
-Command。`from_agui(...)` 只适用于可信事件日志集成，不能接收客户端重新提交的 interrupt 详情。
+`ResumeTranslation` 是 Adapter 的低层结果。普通调用方把 `AgUiResumeRequest` 直接交给
+`open_agui_run(resume=...)`，门面从 checkpointer 恢复原生 interrupt 与完整消息。Definition 级
+Binding 方法继续服务可信事件日志或自定义编排，不能接收客户端重新提交的 interrupt 详情。
 
 ## interrupt 数据模型
 

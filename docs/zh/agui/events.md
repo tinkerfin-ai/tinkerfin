@@ -59,9 +59,11 @@ Agents 原本可执行的 task 在转换阶段失败。
 如果界面需要显示支持的推理过程：
 
 ```python
-runtime = agent.new_agui(
-    identity=identity,
-    expose_reasoning_events=True,
+events = await tinkerfin.open_agui_run(
+    identity,
+    agent=agent,
+    input=graph_input,
+    include_reasoning_events=True,
 )
 ```
 
@@ -98,12 +100,14 @@ async def audit_event(event) -> None:
     await audit_log.write(event.model_dump(mode="json", by_alias=True))
 
 
-runtime = agent.new_agui(
-    identity=identity,
-    on_event=audit_event,
+events = await tinkerfin.open_agui_run(
+    identity,
+    agent=agent,
+    input=graph_input,
+    on_agui_event=audit_event,
 )
 ```
 
-`on_event` 在事件交给消费者前执行。它适合审计和指标，不适合阻塞 I/O。
+`on_agui_event` 在事件交给消费者前执行。它适合审计和指标，不适合阻塞 I/O。
 
 下一篇：[interrupt 与恢复](interrupts-and-resume.md)。

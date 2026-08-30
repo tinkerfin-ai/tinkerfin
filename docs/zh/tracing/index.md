@@ -34,19 +34,18 @@ from tinkerfin_tracing import Tracer
 
 
 tracer = Tracer()
-agent = (
-    TinkerFin()
-    .observe(tracer)
-    .create_deep_agent(
-        model="openai:gpt-5.4",
-        tools=[],
-    )
+tinkerfin = TinkerFin().observe(tracer)
+agent = tinkerfin.create_deep_agent(
+    model="openai:gpt-5.4",
+    tools=[],
 )
 
-runtime = agent.new(
-    identity=RunIdentity(threadId="thread-1", runId="run-1"),
+stream = await tinkerfin.open_run(
+    RunIdentity(threadId="thread-1", runId="run-1"),
+    agent=agent,
+    input=graph_input,
 )
-async for part in runtime.astream(graph_input):
+async for part in stream:
     consume(part)
 
 thread = await tracer.get("thread-1")
@@ -55,6 +54,7 @@ print(thread.tree.roots)
 print(thread.state.root)
 print(thread.interactions)
 print(thread.status.execution)
+print(thread.summary.pending_interactions)
 ```
 
 `.observe(...)` 返回单独配置的 `TinkerFin` factory。每个请求打开一个 request-scoped Trace
@@ -68,12 +68,16 @@ Agent Run fail-closed。
 个完整 Turn：
 
 - `messages`、`tree`、`interactions` 使用 Turn 窗口；
-- `state`、`status`、`completeness` 覆盖所选谱系在固定 as-of 的完整事实；
+- `state` 与 `summary` 覆盖所选谱系在固定 as-of 的完整事实；
 - `await thread.load_older(limit=100)` 只扩展历史窗口；
 - 消息保持正序，顶层 Turn 节点按最新优先。
 
 普通输入或带新用户输入的 branch 会创建 Turn。resume、审批、澄清和 Plan review 只在同一
 Turn 中增加 Run segment。
+
+`thread.summary` 包含累计 status、completeness、message/Tool 数量、pending interaction 与来源
+时间最大值 `last_occurred_at`，不受可见 Turn 窗口影响。实时 `update.summary` 是应用该 update
+之后的完整累计值，不是 delta。
 
 同一 thread 有多个 branch head 时，`get()` 抛出 `AmbiguousTraceHead` 并给出所有可选 Run
 ID。需要显式选择：
@@ -101,9 +105,10 @@ async for update in thread.follow():
 `thread.delete()` 只删除该 handle 指向的不活跃 generation。存在 active writer 时拒绝删除；
 旧 generation 的 cursor 或 handle 不能访问同 ID 重建后的 thread。
 
-## 公开安全捕获
+## 公开历史与安全捕获
 
-`CapturePolicy.public_safe()` 保留公开用户与助手正文，同时独立执行以下安全规则：
+`Tracer()` 默认使用 `CapturePolicy.public_history()`，无需维护第二份 Tool 名单即可保存公开用户、
+助手及完整 Tool 内容，同时独立执行以下安全规则：
 
 - 删除 provider-private `additional_kwargs.reasoning_content`，但不全局删除其他位置的同名
   业务字段；
@@ -111,10 +116,15 @@ async for update in thread.follow():
 - Runtime 声明的顶层 private state channel 在 state、task 与额外 mode 结构 fact 进入 Trace
   前删除；
 - Run 与 Runtime task payload 只保留有界结构元数据，不复制 state 或 message 正文；
-- Tool 参数、结果和审批参数默认 metadata-only，只有按 Tool 名和 JSON Pointer 显式
-  allowlist 的值可以保存；
+- 新出现的 Tool 默认保存经清理的完整参数、结果和公开审批说明；
+- `ToolTraceCapture.metadata_only()` 只保存生命周期，`selected_content()` 只保存明确的 RFC 6901
+  路径，`disabled()` 不写入该 Tool 的 facts；
 - 安全化后仍超限的 payload 使用明确 omitted disposition，不做局部或静默截断。
 - non-finite 数字在 JSON 序列化前直接拒绝。
+
+需要 Tool 默认 metadata-only 的宿主可显式选择 `CapturePolicy.public_safe(tool_rules=...)`。低层
+`ToolCaptureRule` 继续提供准确 Tool 名与 JSON Pointer 选择能力，但普通 Agent 路径无需据此维护第二份
+Tool Registry。
 
 Provider reasoning 需要两道彼此独立的显式授权：先在 `DeepAgentsV2RuntimeProfile` 配置已验证的
 extractor，再仅在允许持久化时向 `Tracer` 传入 `ReasoningCapturePolicy.content()`。默认

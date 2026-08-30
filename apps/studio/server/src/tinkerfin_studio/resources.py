@@ -39,7 +39,10 @@ from tinkerfin_studio.conversation.coordinator import (
 from tinkerfin_studio.health import ReadinessService
 from tinkerfin_studio.infrastructure.database import Database
 from tinkerfin_studio.infrastructure.redis_client import create_redis_client
-from tinkerfin_tracing import SqlAlchemyTraceStore, Tracer
+from tinkerfin_tracing import (
+    SqlAlchemyTraceStore,
+    Tracer,
+)
 
 logger = logging.getLogger(__name__)
 _STUDIO_MESSAGING_LIMITS = MessagingLimits(
@@ -223,6 +226,7 @@ def build_lifespan():
             tinkerfin_profiles = MappingProxyType(
                 {
                     profile_id: TinkerFin(
+                        checkpointer=persistence.checkpointer,
                         run_coordinator=run_coordinator,
                         runtime_profile=profile,
                     ).observe(tracer)
@@ -303,6 +307,7 @@ def build_lifespan():
                     redis_control=redis_control,
                     redis_runtime=redis_runtime,
                     sandbox=settings.sandbox,
+                    sandbox_ready=sandbox_manager.check_ready,
                     http_client=http_client,
                 ),
             )

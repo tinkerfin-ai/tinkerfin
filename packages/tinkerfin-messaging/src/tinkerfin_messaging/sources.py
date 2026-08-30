@@ -54,6 +54,14 @@ class _OpenedMessageSource(Generic[SourceT]):
     cancel: _ContextCancelCallback[SourceT] | None
 
 
+@dataclass(frozen=True, slots=True)
+class _DeferredOpenOutcome(Generic[SourceT]):
+    """Carry an opened binding or process-control failure back to its owner task."""
+
+    binding: _OpenedMessageSource[SourceT] | None = None
+    error: BaseException | None = None
+
+
 class DeferredMessageSource(Generic[SourceT]):
     """Open one source on its first owner pull and never for an unused attachment.
 
@@ -103,7 +111,7 @@ class DeferredMessageSource(Generic[SourceT]):
         self._exhausted = False
         self._first_pull_settled = asyncio.Event()
         self._iterator: AsyncIterator[SourceT] | None = None
-        self._open_task: asyncio.Task[_OpenedMessageSource[SourceT]] | None = None
+        self._open_task: asyncio.Task[_DeferredOpenOutcome[SourceT]] | None = None
         self._binding: _OpenedMessageSource[SourceT] | None = None
         self._active_task: asyncio.Task[object] | None = None
         self._close_task: asyncio.Task[None] | None = None
@@ -232,9 +240,24 @@ class DeferredMessageSource(Generic[SourceT]):
                 name="tinkerfin-messaging-deferred-source-open",
             )
             self._open_task = task
-        return await asyncio.shield(task)
+        outcome = await asyncio.shield(task)
+        if outcome.error is not None:
+            raise outcome.error.with_traceback(outcome.error.__traceback__)
+        if outcome.binding is None:  # pragma: no cover - every opener has one outcome
+            raise RuntimeError("deferred source opening produced no binding")
+        return outcome.binding
 
-    async def _open_once(self) -> _OpenedMessageSource[SourceT]:
+    async def _open_once(self) -> _DeferredOpenOutcome[SourceT]:
+        """Run opener failures as data so process control reaches the awaiting owner."""
+
+        try:
+            return _DeferredOpenOutcome(binding=await self._open_binding())
+        except BaseException as error:  # noqa: BLE001 - re-raised by the owner task
+            return _DeferredOpenOutcome(error=error)
+
+    async def _open_binding(self) -> _OpenedMessageSource[SourceT]:
+        """Validate and retain the single source binding produced by the opener."""
+
         opened = self._opener()
         if not inspect.isawaitable(opened):
             raise TypeError("opener must return an awaitable")
@@ -271,16 +294,17 @@ class DeferredMessageSource(Generic[SourceT]):
     ) -> None:
         try:
             await source.aclose()
-        except asyncio.CancelledError as cancellation:
-            cancellation.add_note(
+        except BaseException as close_error:
+            if isinstance(close_error, Exception):
+                error.add_note(
+                    "opened source cleanup also failed: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+                return
+            close_error.add_note(
                 f"deferred source opening also failed: {type(error).__name__}: {error}"
             )
             raise
-        except Exception as close_error:  # noqa: BLE001 - host source cleanup
-            error.add_note(
-                "opened source cleanup also failed: "
-                f"{type(close_error).__name__}: {close_error}"
-            )
 
     async def _finish(self) -> None:
         task = self._close_task

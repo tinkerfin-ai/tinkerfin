@@ -491,6 +491,104 @@ describe('PlanQuestionComposer', () => {
     })
   })
 
+  it('uses a bounded local time control with an explicit time zone', () => {
+    let current: PlanQuestionState = {
+      ...interaction(),
+      activeQuestionIndex: 0,
+      questions: [{
+        id: 'deployment-time',
+        answerType: 'time',
+        prompt: '何时执行？',
+        required: true,
+        timeZone: 'Asia/Shanghai',
+        minimum: '09:00',
+        maximum: '18:00',
+      }],
+    }
+    const submit = vi.fn()
+    const change = (updater: (value: PlanQuestionState) => PlanQuestionState) => {
+      current = updater(current)
+    }
+    const view = render(
+      <PlanQuestionComposer threadId="thread-a" interaction={current} onChange={change} onSubmit={submit} onAbandon={vi.fn()} />,
+    )
+
+    expect(screen.getByText('时区：Asia/Shanghai')).toBeInTheDocument()
+    expect(screen.getByText('允许范围：09:00–18:00')).toBeInTheDocument()
+    const input = screen.getByLabelText('时间回答：何时执行？')
+    expect(input).toHaveAttribute('type', 'time')
+    expect(input).toHaveAttribute('min', '09:00')
+    expect(input).toHaveAttribute('max', '18:00')
+    fireEvent.change(input, { target: { value: '09:30' } })
+    expect(current.questions[0]).toMatchObject({
+      answerType: 'time',
+      time: '09:30',
+      skipped: false,
+    })
+
+    current = {
+      ...current,
+      questions: current.questions.map((question) => question.answerType === 'time'
+        ? { ...question, time: '08:59' }
+        : question),
+    }
+    view.rerender(
+      <PlanQuestionComposer threadId="thread-a" interaction={current} onChange={change} onSubmit={submit} onAbandon={vi.fn()} />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: '提交' }))
+    expect(submit).not.toHaveBeenCalled()
+    expect(current.error).toBe('Plan 时间答案超出允许范围')
+  })
+
+  it('uses a bounded datetime-local control with an explicit time zone', () => {
+    let current: PlanQuestionState = {
+      ...interaction(),
+      activeQuestionIndex: 0,
+      questions: [{
+        id: 'deployment-at',
+        answerType: 'datetime',
+        prompt: '何时执行？',
+        required: true,
+        timeZone: 'Asia/Shanghai',
+        minimum: '2026-08-30T09:00',
+        maximum: '2026-09-30T18:00',
+      }],
+    }
+    const submit = vi.fn()
+    const change = (updater: (value: PlanQuestionState) => PlanQuestionState) => {
+      current = updater(current)
+    }
+    const view = render(
+      <PlanQuestionComposer threadId="thread-a" interaction={current} onChange={change} onSubmit={submit} onAbandon={vi.fn()} />,
+    )
+
+    expect(screen.getByText('时区：Asia/Shanghai')).toBeInTheDocument()
+    expect(screen.getByText('允许范围：2026-08-30T09:00–2026-09-30T18:00')).toBeInTheDocument()
+    const input = screen.getByLabelText('日期时间回答：何时执行？')
+    expect(input).toHaveAttribute('type', 'datetime-local')
+    expect(input).toHaveAttribute('min', '2026-08-30T09:00')
+    expect(input).toHaveAttribute('max', '2026-09-30T18:00')
+    fireEvent.change(input, { target: { value: '2026-08-30T09:30' } })
+    expect(current.questions[0]).toMatchObject({
+      answerType: 'datetime',
+      dateTime: '2026-08-30T09:30',
+      skipped: false,
+    })
+
+    current = {
+      ...current,
+      questions: current.questions.map((question) => question.answerType === 'datetime'
+        ? { ...question, dateTime: '2026-08-30T08:59' }
+        : question),
+    }
+    view.rerender(
+      <PlanQuestionComposer threadId="thread-a" interaction={current} onChange={change} onSubmit={submit} onAbandon={vi.fn()} />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: '提交' }))
+    expect(submit).not.toHaveBeenCalled()
+    expect(current.error).toBe('Plan 日期时间答案超出允许范围')
+  })
+
   it('keeps every option row borderless and on one shared grid', () => {
     expect(conversationStyles).toMatch(/\.plan-question-option,\s*\.plan-question-custom,\s*\.plan-question-date\s*{[^}]*grid-template-columns:\s*20px minmax\(0, 1fr\);[^}]*width:\s*100%;[^}]*min-height:\s*var\(--control-md\);[^}]*border:\s*0;/s)
     expect(conversationStyles).not.toMatch(/\.plan-question-option\s*{[^}]*border:\s*1px/s)
@@ -519,7 +617,10 @@ describe('PlanQuestionComposer', () => {
     expect(conversationStyles).toMatch(/\.plan-question-date\s*\{[^}]*align-items:\s*center;[^}]*height:\s*var\(--control-md\);[^}]*padding-top:\s*0;[^}]*padding-bottom:\s*0;/s)
     expect(conversationStyles).toMatch(/\.plan-question-date > \.plan-question-option-index\s*\{[^}]*margin-top:\s*0;/s)
     expect(conversationStyles).toMatch(/\.plan-question-date \.ui-date-picker__trigger\s*\{[^}]*min-width:\s*150px;/s)
+    expect(conversationStyles).toMatch(/\.plan-question-time-input\s*\{[^}]*min-width:\s*150px;[^}]*border:\s*1px solid var\(--color-border\);[^}]*background:\s*var\(--color-layer-1\);/s)
+    expect(conversationStyles).toMatch(/\.plan-question-time-input:focus-visible\s*\{[^}]*outline:\s*2px solid var\(--color-border-strong\);/s)
     expect(conversationStyles).toMatch(/@media \(any-hover: none\), \(any-pointer: coarse\)[\s\S]*\.plan-question-date\s*\{[^}]*height:\s*var\(--control-lg\);/s)
+    expect(conversationStyles).toMatch(/@media \(any-hover: none\), \(any-pointer: coarse\)[\s\S]*\.plan-question-time-input\s*\{[^}]*min-height:\s*var\(--control-lg\);/s)
     expect(conversationStyles).not.toMatch(/\.plan-question-(?:option-recommended|composer-body > h3 small)[^{]*{[^}]*translateY/s)
     expect(conversationStyles).toMatch(/\.plan-question-custom textarea\s*{[^}]*height:\s*var\(--type-title-line\);[^}]*max-height:\s*calc\(var\(--type-title-line\) \* 3\);[^}]*overflow-y:\s*hidden;[^}]*font-size:\s*var\(--type-ui-size\);/s)
     expect(conversationStyles).not.toMatch(/\.plan-question-(?:option:focus-visible|custom:focus-within) \.plan-question-option-index/)

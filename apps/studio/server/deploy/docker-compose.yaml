@@ -62,6 +62,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - opensandbox-data:/data
+      - opensandbox-metadata:/root/.opensandbox/metadata
       - ./opensandbox/config.toml:/etc/opensandbox/config.toml:ro
     healthcheck:
       test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=3)"]
@@ -156,4 +157,5 @@ volumes:
   redis-control-data:
   redis-runtime-data:
   opensandbox-data:
+  opensandbox-metadata:
   studio-logs:

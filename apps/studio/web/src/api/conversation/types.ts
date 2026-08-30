@@ -35,6 +35,8 @@ export type PlanClarificationAnswer =
   }
   | { status: "answered"; answerType: "text"; answer: string }
   | { status: "answered"; answerType: "date"; date: string }
+  | { status: "answered"; answerType: "time"; time: string }
+  | { status: "answered"; answerType: "datetime"; dateTime: string }
 
 export type ChatResumePayload =
   | { type: "approve" }
@@ -48,7 +50,7 @@ export type ChatResumePayload =
     answers: Record<string, PlanClarificationAnswer>
   }
   | { type: "approve"; baseRevision: number }
-  | { type: "respond"; baseRevision: number; message: string }
+  | { type: "cancel"; baseRevision: number }
   | { type: "reject"; baseRevision: number; message?: string }
 
 export interface ChatResumeEntry {

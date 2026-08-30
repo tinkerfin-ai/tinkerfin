@@ -5,11 +5,12 @@ from __future__ import annotations
 __all__ = ["_enqueue_cleanup_in_transaction"]
 
 import asyncio
+from collections.abc import Sequence
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
-from sqlalchemy import delete, insert, select, update
+from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
@@ -20,6 +21,7 @@ from .state import (
     OpenSandboxBinding,
     OpenSandboxCleanupClaim,
     OpenSandboxOwnerClaim,
+    OpenSandboxReadyWarmClaim,
     OpenSandboxWarmClaim,
     _owner_digest,
 )
@@ -317,6 +319,119 @@ async def claim_warm_slot(
         )
 
     return await self._run_claim_transaction(claim)
+
+
+async def claim_ready_warm_slot(
+    self: SQLAlchemyOpenSandboxState,
+    *,
+    exclude_slots: Sequence[int],
+) -> OpenSandboxReadyWarmClaim | None:
+    """Fence one published warm slot without discarding its current remote ID."""
+
+    self._ensure_open()
+
+    async def claim(connection: AsyncConnection) -> OpenSandboxReadyWarmClaim | None:
+        now = self._now()
+        statement = select(_warm_slots).where(
+            _warm_slots.c.namespace == self._namespace,
+            _warm_slots.c.sandbox_id.is_not(None),
+            (_warm_slots.c.claim_token.is_(None))
+            | (_warm_slots.c.lease_expires_at <= now),
+        )
+        if exclude_slots:
+            statement = statement.where(_warm_slots.c.slot.not_in(tuple(exclude_slots)))
+        statement = statement.order_by(_warm_slots.c.slot).limit(1)
+        statement = _apply_claim_lock(
+            statement,
+            capabilities=self._require_capabilities(),
+        )
+        row = (await connection.execute(statement)).mappings().one_or_none()
+        if row is None:
+            return None
+        token = uuid4().hex
+        generation = int(row["generation"]) + 1
+        result = await connection.execute(
+            update(_warm_slots)
+            .where(
+                _warm_slots.c.namespace == self._namespace,
+                _warm_slots.c.slot == row["slot"],
+                _warm_slots.c.generation == row["generation"],
+                _warm_slots.c.sandbox_id == row["sandbox_id"],
+            )
+            .values(
+                generation=generation,
+                claim_token=token,
+                lease_expires_at=now + timedelta(seconds=self._lease_ttl),
+                updated_at=now,
+            )
+        )
+        if result.rowcount != 1:
+            return None
+        return OpenSandboxReadyWarmClaim(
+            slot=int(row["slot"]),
+            token=token,
+            generation=generation,
+            sandbox_id=str(row["sandbox_id"]),
+        )
+
+    return await self._run_claim_transaction(claim)
+
+
+async def discard_ready_warm_slot(
+    self: SQLAlchemyOpenSandboxState,
+    claim: OpenSandboxReadyWarmClaim,
+) -> None:
+    """Clear one unusable published ID and enqueue its cleanup atomically."""
+
+    self._ensure_open()
+
+    async def discard(connection: AsyncConnection) -> None:
+        now = self._now()
+        result = await connection.execute(
+            update(_warm_slots)
+            .where(
+                _warm_slots.c.namespace == self._namespace,
+                _warm_slots.c.slot == claim.slot,
+                _warm_slots.c.sandbox_id == claim.sandbox_id,
+                _warm_slots.c.claim_token == claim.token,
+                _warm_slots.c.generation == claim.generation,
+                _warm_slots.c.lease_expires_at > now,
+            )
+            .values(
+                sandbox_id=None,
+                claim_token=None,
+                lease_expires_at=None,
+                updated_at=now,
+            )
+        )
+        if result.rowcount != 1:
+            raise OpenSandboxStateOwnershipError(
+                f"Warm slot {claim.slot} is no longer current"
+            )
+        await self._enqueue_cleanup_in_transaction(
+            connection,
+            claim.sandbox_id,
+            now=now,
+        )
+
+    await self._run_write_transaction(discard)
+
+
+async def warm_pool_ready(self: SQLAlchemyOpenSandboxState) -> bool:
+    """Return whether every configured slot has an unclaimed published Sandbox."""
+
+    self._ensure_open()
+    async with self._engine.connect() as connection:
+        ready = await connection.scalar(
+            select(func.count())
+            .select_from(_warm_slots)
+            .where(
+                _warm_slots.c.namespace == self._namespace,
+                _warm_slots.c.sandbox_id.is_not(None),
+                _warm_slots.c.claim_token.is_(None),
+            )
+        )
+    return int(ready or 0) == self._warm_pool_size
 
 
 async def publish_warm(

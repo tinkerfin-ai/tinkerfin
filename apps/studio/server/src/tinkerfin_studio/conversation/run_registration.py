@@ -44,7 +44,7 @@ class PreparedExecution:
 
 
 class ConversationRunPreparer:
-    """拥有 chat 启动前短事务，不读取 Graph 或第三方 interrupt payload"""
+    """拥有 chat 启动前短事务，不读取 Agent 内部状态或审批 payload"""
 
     def __init__(self, session: AsyncSession, *, user_id: int) -> None:
         self._session = session

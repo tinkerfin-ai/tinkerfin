@@ -10,10 +10,12 @@ from .clarification import ClarificationOptionBase as ClarificationOptionBase
 from .clarification import ClarificationQuestionBase as ClarificationQuestionBase
 from .clarification import ClarificationResponseBase as ClarificationResponseBase
 from .clarification import DateQuestion as DateQuestion
+from .clarification import DateTimeQuestion as DateTimeQuestion
 from .clarification import DefaultClarificationForm as DefaultClarificationForm
 from .clarification import MultipleChoiceQuestion as MultipleChoiceQuestion
 from .clarification import SingleChoiceQuestion as SingleChoiceQuestion
 from .clarification import TextQuestion as TextQuestion
+from .clarification import TimeQuestion as TimeQuestion
 from .clarification_types import ClarificationType as ClarificationType
 from .clarification_types import clarification_type as clarification_type
 from .errors import (
@@ -52,6 +54,7 @@ __all__ = [
     "ClarificationType",
     "ConfirmedPlan",
     "DateQuestion",
+    "DateTimeQuestion",
     "DefaultClarificationForm",
     "MarkdownPlanContent",
     "MultipleChoiceQuestion",
@@ -73,5 +76,6 @@ __all__ = [
     "StructuredPlanContent",
     "StructuredPlanStep",
     "TextQuestion",
+    "TimeQuestion",
     "clarification_type",
 ]

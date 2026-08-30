@@ -84,6 +84,10 @@ const detail = (): ConversationHistoryDetail => ({
       runId: 'run-1',
       namespace: [],
       sourceId: 'call-write',
+      input: { file_path: '/result.txt' },
+      inputOmitted: false,
+      result: 'written',
+      resultOmitted: false,
       status: 'succeeded',
       startedAt: '2026-08-28T00:00:02Z',
       completedAt: '2026-08-28T00:00:03Z',
@@ -120,11 +124,105 @@ describe('Trace conversation projection', () => {
     expect(restored.messages[1]?.meta?.reasoning).toBe('已授权推理')
     expect(restored.messages[2]?.meta).toMatchObject({
       toolName: 'write_file',
+      params: '{\n  "file_path": "/result.txt"\n}',
       result: 'written',
       status: 'completed',
     })
     expect(restored.lastSeq).toBeUndefined()
     expect(restored.trace?.asOfSeq).toBe(8)
+  })
+
+  it('preserves a caller-owned Messaging cursor across Trace projection', () => {
+    const restored = restoreConversationFromTrace(detail(), {
+      model: 'fallback',
+      lastDeliveredSeq: 73,
+    })
+
+    expect(restored.lastSeq).toBe(73)
+  })
+
+  it('keeps subgraph messages out of the main conversation timeline', () => {
+    const source = detail()
+    source.messages = [
+      ...source.messages,
+      {
+        ...source.messages[0]!,
+        id: 'message:subgraph-user',
+        sourceId: 'subgraph-user',
+        namespace: ['tools:planner'],
+        traceSeq: 5,
+        content: '内部输入',
+      },
+      {
+        ...source.messages[1]!,
+        id: 'message:subgraph-assistant',
+        sourceId: 'subgraph-assistant',
+        namespace: ['tools:planner'],
+        traceSeq: 6,
+        content: '内部输出',
+      },
+    ]
+
+    const restored = restoreConversationFromTrace(source, { model: 'fallback' })
+
+    expect(restored.messages.filter((message) => (
+      message.role === 'user' || message.role === 'assistant'
+    )).map((message) => message.id)).toEqual([
+      'message:user-1',
+      'message:assistant-1',
+    ])
+  })
+
+  it('restores active SubAgent partial output without leaking it into main messages', () => {
+    const source = detail()
+    source.status = { execution: 'running', headRunId: 'run-1' }
+    source.messages = [
+      ...source.messages,
+      {
+        ...source.messages[1]!,
+        id: 'message:subagent-partial-a',
+        sourceId: 'subagent-partial-a',
+        namespace: ['tools:parent-task'],
+        traceSeq: 6,
+        content: '第一段子任务输出',
+        status: 'streaming',
+        completedAt: null,
+      },
+      {
+        ...source.messages[1]!,
+        id: 'message:subagent-partial-b',
+        sourceId: 'subagent-partial-b',
+        namespace: ['tools:parent-task'],
+        traceSeq: 7,
+        content: '第二段子任务输出',
+        status: 'streaming',
+        completedAt: null,
+      },
+    ]
+    source.nodes = [{
+      ...source.nodes[0]!,
+      id: 'subagent-running',
+      kind: 'subagent',
+      label: 'researcher',
+      namespace: ['tools:parent-task'],
+      sourceId: 'call-task',
+      status: 'running',
+      input: { description: '检查当前行为', subagent_type: 'researcher' },
+      result: undefined,
+      resultOmitted: false,
+      completedAt: null,
+    }]
+
+    const restored = restoreConversationFromTrace(source, { model: 'fallback' })
+    const subagent = restored.messages.find((message) => message.role === 'subagent')
+
+    expect(subagent?.meta?.result).toBe('第一段子任务输出\n\n第二段子任务输出')
+    expect(restored.messages.filter((message) => (
+      message.role === 'user' || message.role === 'assistant'
+    )).map((message) => message.id)).toEqual([
+      'message:user-1',
+      'message:assistant-1',
+    ])
   })
 
   it('correlates Tool results by full namespace and source ID', () => {
@@ -155,8 +253,33 @@ describe('Trace conversation projection', () => {
       },
       {
         ...source.nodes[0]!,
+        id: 'tool-task-parent',
+        label: 'task',
+        namespace: [],
+        sourceId: 'call-task',
+        input: {
+          description: '研究当前契约',
+          subagent_type: 'researcher',
+        },
+        result: 'subagent-result',
+      },
+      {
+        ...source.nodes[0]!,
+        id: 'subagent-child',
+        kind: 'subagent',
+        label: 'researcher',
+        namespace: ['tools:child'],
+        sourceId: 'call-task',
+        input: {
+          description: '研究当前契约',
+          subagent_type: 'researcher',
+        },
+      },
+      {
+        ...source.nodes[0]!,
         id: 'tool-subgraph',
         traceSeq: 5,
+        parentId: 'subagent-child',
         namespace: ['tools:child'],
         sourceId: 'call-shared',
       },
@@ -173,6 +296,12 @@ describe('Trace conversation projection', () => {
       'tool-root': 'root-result',
       'tool-subgraph': 'subgraph-result',
     })
+    expect(restored.messages.find((message) => message.role === 'subagent')?.meta)
+      .toMatchObject({
+        agentName: 'researcher',
+        input: '研究当前契约',
+        result: 'subagent-result',
+      })
   })
 
   it('applies id-based semantic deltas and replaces state atomically', () => {
@@ -225,10 +354,11 @@ describe('Trace conversation projection', () => {
         action_requests: [
           {
             name: 'write_file',
+            description: '写入 A 文件',
             arguments: {
               disposition: 'inline',
               safeSizeBytes: 20,
-              value: { '/file_path': '/a.txt' },
+              value: { '': { file_path: '/a.txt' } },
             },
           },
           {
@@ -267,10 +397,91 @@ describe('Trace conversation projection', () => {
       'call-a',
       'call-b',
     ])
+    expect(restored.approval?.items.map((item) => item.description)).toEqual([
+      '写入 A 文件',
+      'write_file',
+    ])
     expect(restored.pendingInteractionKind).toBe('tool_approval')
   })
 
-  it('merges every pending Tool approval group in Trace order', () => {
+  it('preserves full captured arguments for each same-name HITL action', () => {
+    const source = detail()
+    source.status = { execution: 'waiting', headRunId: 'run-1' }
+    source.interactions = [{
+      id: 'interaction-full-content',
+      traceSeq: 5,
+      sourceId: 'native-interrupt',
+      namespace: [],
+      runId: 'run-1',
+      kind: 'tool_approval',
+      toolCallIds: ['call-a', 'call-b'],
+      status: 'pending',
+      payloadOmitted: false,
+      payload: {
+        action_requests: [
+          {
+            name: 'write_file',
+            arguments: {
+              disposition: 'inline',
+              safeSizeBytes: 47,
+              value: { content: 'A', file_path: '/multi-hitl-a.txt' },
+            },
+          },
+          {
+            name: 'write_file',
+            arguments: {
+              disposition: 'inline',
+              safeSizeBytes: 47,
+              value: { content: 'B', file_path: '/multi-hitl-b.txt' },
+            },
+          },
+        ],
+        review_configs: [
+          { action_name: 'write_file', allowed_decisions: ['approve', 'reject'] },
+          { action_name: 'write_file', allowed_decisions: ['approve', 'reject'] },
+        ],
+      },
+      openedAt: '2026-08-28T00:00:04Z',
+      resolvedAt: null,
+    }]
+    source.nodes = [
+      {
+        ...source.nodes[0]!,
+        id: 'tool-b',
+        status: 'waiting',
+        sourceId: 'call-b',
+        input: { content: 'B', file_path: '/multi-hitl-b.txt' },
+      },
+      {
+        ...source.nodes[0]!,
+        id: 'tool-a',
+        status: 'waiting',
+        sourceId: 'call-a',
+        input: { content: 'A', file_path: '/multi-hitl-a.txt' },
+      },
+    ]
+
+    const restored = restoreConversationFromTrace(source, { model: 'fallback' })
+
+    expect(restored.approval?.items.map((item) => ({
+      toolCallId: item.toolCallId,
+      originalArgs: item.originalArgs,
+      params: item.params,
+    }))).toEqual([
+      {
+        toolCallId: 'call-a',
+        originalArgs: { content: 'A', file_path: '/multi-hitl-a.txt' },
+        params: '{\n  "content": "A",\n  "file_path": "/multi-hitl-a.txt"\n}',
+      },
+      {
+        toolCallId: 'call-b',
+        originalArgs: { content: 'B', file_path: '/multi-hitl-b.txt' },
+        params: '{\n  "content": "B",\n  "file_path": "/multi-hitl-b.txt"\n}',
+      },
+    ])
+  })
+
+  it('merges pending Tool approvals while a SubAgent Tool is still running', () => {
     const source = detail()
     source.status = { execution: 'waiting', headRunId: 'run-1' }
     const interaction = (
@@ -324,7 +535,7 @@ describe('Trace conversation projection', () => {
         id: 'tool-b',
         traceSeq: 6,
         namespace: ['tools:child'],
-        status: 'waiting',
+        status: 'running',
         sourceId: 'call-b',
       },
       {
@@ -394,7 +605,7 @@ describe('Trace conversation projection', () => {
 
   it('hydrates Plan clarification directly from the native Runtime envelope', () => {
     const source = detail()
-    source.status = { execution: 'waiting', headRunId: 'run-1' }
+    source.status = { execution: 'succeeded', headRunId: 'run-1' }
     source.interactions = [{
       id: 'interaction-plan',
       traceSeq: 5,
@@ -438,5 +649,6 @@ describe('Trace conversation projection', () => {
       title: '确认范围',
     })
     expect(restored.pendingInteractionKind).toBe('plan_clarification')
+    expect(restored.runStatus).toBe('waiting_approval')
   })
 })

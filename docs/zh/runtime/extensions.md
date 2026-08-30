@@ -20,11 +20,14 @@ tinkerfin = TinkerFin(run_coordinator=coordinator)
 
 identity = RunIdentity(threadId="tenant-7/user-42", runId="run-1")
 agent = tinkerfin.create_deep_agent(model=model, tools=tools)
-runtime = agent.new(identity=identity)
-stream = runtime.astream(graph_input)
+stream = await tinkerfin.open_run(
+    identity,
+    agent=agent,
+    input=graph_input,
+)
 ```
 
-每个 Runtime 都有 `RunIdentity`。coordinator 接收同一个完整值，并在 Native 或 AG-UI
+每个 managed run 都有 `RunIdentity`。coordinator 接收同一个完整值，并在 Native 或 AG-UI
 事件流的整个生命周期内持有协调作用域。
 
 内存 coordinator 只协调当前进程。如果应用有多个进程，可以实现 `RunCoordinator`，把锁放到共享系统中：

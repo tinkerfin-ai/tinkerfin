@@ -7,18 +7,31 @@ Plan Mode, Observation, and native SSE are part of the base installation.
 
 This page groups the public Runtime capabilities by how you use them. Most applications only need the first two sections.
 
-## Entry points
+## Common entry points
 
 | API | When to use it | Main input or result |
 | --- | --- | --- |
-| `TinkerFin(run_coordinator=None, state_schema=None, runtime_profile=None)` | Create the main entry point | Optional shared coordinator, Definition-wide state, and complete Deep Agents integration Profile |
+| `TinkerFin(checkpointer=None, run_coordinator=None, state_schema=None, runtime_profile=None)` | Create the main entry point | Optional borrowed default saver, shared coordinator, Definition-wide state, and integration Profile |
 | `TinkerFin.observe(observer)` | Add one managed Runtime observer immutably | A `tinkerfin-contracts` `RuntimeObserver` |
 | `TinkerFin.plan(...)` | Create an immutable Plan-capable factory | Capability and mode defaults, optional Planner model, clarification form, Plan content schema, and review actions |
 | `TinkerFin.create_deep_agent(...)` | Create a reusable agent definition | See [Create and run a Deep Agent](deep-agents.md) |
+| `TinkerFin.open_run(identity, *, agent, input, ...)` | Open one managed native run | A single-use `NativeGraphRunStream` |
+| `TinkerFin.open_agui_run(identity, *, agent, input=... or resume=..., ...)` | Open one managed AG-UI run | A single-use `AgUiEventStream` |
+| `DeepAgentDefinition.create_graph(mode=...)` | Reuse a direct async Runnable without managed lifecycle | Complete native or Plan-capable `DeepAgentGraph` |
+| `RunIdentity(threadId=..., runId=...)` | Identify one framework run | Thread and run only |
+
+`agent` may be an existing Definition or a synchronous/asynchronous callable returning
+one. The managed facade owns Definition resolution, asynchronous Graph construction,
+identity binding, Observation, coordination, setup-failure conversion, cancellation,
+and cleanup. `open_agui_run()` requires exactly one of `input` and `resume`.
+
+## Advanced integration APIs
+
+| API | When to use it | Main input or result |
+| --- | --- | --- |
 | `DeepAgentsRuntimeProfile` | Implement a complete upstream integration | Canonical Profile ID, graph factory, Native Stream Driver, and resume checkpoint semantics |
 | `DeepAgentsFactoryPreparation` | Return Profile-owned factory overrides | Read-only override mapping and external-subagent cancellation boundary |
 | `DeepAgentsV2RuntimeProfile(...)` | Use the current built-in integration | Locked graph construction, invocation, validation, observations, reasoning extractors, and replay |
-| `RunIdentity(threadId=..., runId=...)` | Identify one framework run | Thread and run only |
 | `DeepAgentDefinition.new(...)` | Create a native Runtime | Required `identity`, optional request `mode` and `on_part` |
 | `DeepAgentDefinition.new_agui(...)` | Create an AG-UI Runtime | Required canonical `identity`; optional parent, mode, resume, checkpoint callback, and observers |
 | `TinkerFin.failed_agui_run(...)` | Represent a setup failure after a Run was accepted | Error, identity, and the real available input/config/resume |
@@ -40,11 +53,12 @@ than constructing them directly.
 `.plan(enabled=True)` affects only definitions created from the returned factory. It
 does not add a parameter to `create_deep_agent(...)`. The returned factory retains its
 coordinator and global state schema. Selecting Plan requires an explicit Planner model
-and a concrete production checkpointer; default runs retain upstream requirements.
+or an explicit Agent model, plus a concrete production checkpointer; default runs retain
+upstream requirements. Omitting `planner_model` uses the Agent model.
 Invalid Plan configuration raises `tinkerfin.plan.PlanModeConfigurationError`.
 
-Choose the current request path with `mode="default"` or `mode="plan"` on `new()` or
-`new_agui()`. Omitting it uses `.plan(default_mode=...)`. Default directly runs the
+Choose the current request path with `mode="default"` or `mode="plan"` on a managed run
+or direct Graph. Omitting it uses `.plan(default_mode=...)`. Default directly runs the
 native Deep Agent; Plan runs the standalone Planning Graph and automatically hands an
 approved draft to native execution. The same checkpoint thread can select Plan on a
 later request. An ordinary Definition accepts only `default`.
@@ -53,7 +67,7 @@ later request. An ordinary Definition accepts only `default`.
 
 The top-level package exports `AgentMode`. The `tinkerfin.plan` package exports
 `ClarificationModel`, `ClarificationOption`, `ClarificationForm`,
-`BuiltInClarificationForm`, the four built-in Question types,
+`BuiltInClarificationForm`, the six built-in Question types,
 `ClarificationType`, `clarification_type`, `DefaultClarificationForm`,
 `PlanContentModel`, `StructuredPlanStep`, `StructuredPlanContent`,
 `MarkdownPlanContent`, `PlanSchemaReference`, `PlanDraft`, `ConfirmedPlan`,
@@ -78,8 +92,14 @@ The reviewed draft and `ConfirmedPlan` always use the same frozen content schema
 interrupt response Schema contains exactly the configured decisions. Include `EDIT`
 explicitly only when the host provides a trusted draft editor.
 
+Only `APPROVE` exits Planning and hands the confirmed draft to native execution.
+`REJECT` invalidates the reviewed draft, accepts an optional reason, returns one visible
+Planner reply, and enters `awaiting_input` while keeping effective mode `plan`. An
+explicitly configured `CANCEL` follows the same continuation without a reason. AG-UI
+`status="cancelled"` remains abandonment and does not become a Plan decision.
+
 `.plan(clarification_schema=...)` accepts one concrete `ClarificationFormBase` subclass;
-omitting it uses all four built-in answer types. Shared typed metadata uses
+omitting it uses all six built-in answer types. Shared typed metadata uses
 `BuiltInClarificationForm[QuestionAttributes, OptionModel]`. A host-defined semantic type
 is registered once through `.plan(clarification_types=(clarification_type(...),))`.
 Its namespaced type ID is unversioned. The Definition fingerprint fixes the exact current
@@ -90,8 +110,13 @@ Clarification responses use an `answers` object keyed by checkpoint question ID.
 answered value contains `status: answered`, its `answerType`, and type-specific fields;
 an optional skip contains only `status: skipped`. The exact pending JSON Schema validates
 complete coverage, choice IDs, selection bounds, non-blank text, and calendar dates before
-Graph resume. Host models cannot redefine framework-owned IDs, required/skip semantics,
-or checkpoint ownership.
+Graph resume. Time responses additionally validate local minute precision, the question's
+IANA time zone, and any inclusive non-wrapping range. Host models cannot redefine
+framework-owned IDs, required/skip semantics, or checkpoint ownership.
+Datetime responses contain one local calendar date and minute in a required IANA zone.
+Their bounds may span dates; normalization emits `localDateTime`, `timeZone`, and a
+unique UTC `instant`. DST gaps and repeated local minutes are rejected.
+
 
 `TinkerFin(state_schema=...)` contributes application state to every native Deep Agent
 Definition created by that factory. The standalone Planning Graph composes its own
@@ -114,10 +139,9 @@ Requests cancellation and returns the remaining events needed to close open life
 
 ### `TinkerFin.failed_agui_run(...)`
 
-Creates an observed failed AG-UI stream when model, Sandbox, Definition, or Graph setup
-fails after the host accepted the semantic Run. It records real Run input, one failed
-terminal, and close through the same Runtime lifecycle. Normal `new_agui()` callers do
-not need it.
+Creates an observed failed AG-UI stream when an advanced host accepted a semantic Run
+before entering the managed facade. `open_agui_run()` already uses this behavior for
+ordinary model, Sandbox, Definition, or Graph setup failures.
 
 ## Native stream data
 
@@ -139,7 +163,10 @@ The selected Runtime Profile owns its complete upstream invocation and checkpoin
 including required modes, upstream version, subgraph behavior, complete state output, and
 stable build/bound stream signatures plus durable resume-intent writes that preserve
 interrupted control state. The bound signature permits lazy resume Graph construction
-inside retained async settlement. The built-in Profile
+inside retained async settlement. A custom Profile may expose
+`create_agent_graph(factory, args, kwargs)` for native asynchronous construction;
+otherwise Core invokes that Profile's selected synchronous factory in AnyIO's bounded
+worker pool. The built-in Profile
 lets callers add supported diagnostic modes through
 `astream(stream_mode=...)`; removing a required mode or supplying a conflicting upstream
 option fails before Graph or coordinator side effects. Native and AG-UI paths use the
@@ -193,12 +220,29 @@ already selected execution outcome.
 | API | When it appears |
 | --- | --- |
 | `AgUiResumeRequest` | Untrusted client decisions for an interrupted AG-UI run |
-| `AgUiResumeBinding` | Private checkpoint-resolved facts accepted by `new_agui()` |
+| `AgUiResumeBinding` | Advanced checkpoint-resolved facts accepted by `new_agui()` |
 | `AgUiResumeCheckpoint` | Stable callback value after the resume marker is durable |
 | `tinkerfin.plan.PlanModeConfigurationError` | A Plan definition lacks a concrete saver or explicit model, has an incompatible state schema, or requests non-sync durability |
 | `AgUiSettlementTimeoutError` | Caller wait ended before protected Runtime cleanup settled |
 
-`DeepAgentDefinition.new_agui(...)` creates one request Runtime with these options:
+`TinkerFin.open_agui_run(...)` is the ordinary entry point:
+
+| Parameter | Default | Purpose |
+| --- | --- | --- |
+| `identity` | required | Canonical thread and run identity |
+| `agent` | required | Definition or sync/async callable returning one |
+| `input` / `resume` | exactly one | Ordinary Graph input or client-only `AgUiResumeRequest` |
+| `parent_run_id` | `None` | Optional checkpoint lineage exposed on `RUN_STARTED` |
+| `mode` | Definition default | Native default or Plan route |
+| `config` / `context` | `None` | Graph configuration and declared Runtime context |
+| `stream_timeout` / `cleanup_timeout` | `None` | Native pull deadline and protected cleanup wait |
+| `include_reasoning_events` | `False` | Deliver verified public reasoning events |
+| `include_subagent_events` | `True` | Deliver validated subagent events |
+| `on_native_part` / `on_agui_event` | `None` | Async observers before delivery |
+| `on_resume_saved` / `on_resume_not_saved` | `None` | Idempotent host settlement around durable marker evidence |
+| `resume_checkpointer` | TinkerFin default | Advanced saver authority when a lazy resumed Definition intentionally overrides the factory default; it must be the exact same object |
+
+Advanced orchestration may use `DeepAgentDefinition.new_agui(...)` directly:
 
 | Parameter | Default | Purpose |
 | --- | --- | --- |

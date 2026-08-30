@@ -125,3 +125,12 @@ def test_compose_supports_bundled_and_external_service_sets(tmp_path: Path) -> N
         "studio",
     }
     assert external == ["studio"]
+
+
+def test_bundled_opensandbox_persists_runtime_expiration_metadata() -> None:
+    """Server 重建后必须保留 Docker runtime 已续期的过期时间"""
+
+    compose = (DEPLOY_DIR / "docker-compose.yaml").read_text(encoding="utf-8")
+
+    assert "opensandbox-metadata:/root/.opensandbox/metadata" in compose
+    assert re.search(r"(?m)^  opensandbox-metadata:\s*$", compose)

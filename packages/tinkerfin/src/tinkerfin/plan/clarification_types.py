@@ -5,7 +5,9 @@ from __future__ import annotations
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Generic, TypeVar, cast
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter
 
@@ -17,12 +19,17 @@ from .clarification import (
     ClarificationResponseBase,
     DateQuestion,
     DateResponse,
+    DateTimeQuestion,
+    DateTimeResponse,
     MultipleChoiceQuestion,
     MultipleChoiceResponse,
     SingleChoiceQuestion,
     SingleChoiceResponse,
     TextQuestion,
     TextResponse,
+    TimeQuestion,
+    TimeResponse,
+    _resolve_local_datetime,
 )
 from .errors import PlanModeConfigurationError
 
@@ -36,7 +43,9 @@ NormalizeResponse = Callable[[QuestionT, ResponseT], Mapping[str, JsonValue]]
 _CUSTOM_TYPE_PATTERN = re.compile(
     r"^(?!.*\.v[0-9]+$)[a-z][a-z0-9.-]*:[a-z][a-z0-9._-]*$"
 )
-_BUILTIN_TYPE_IDS = frozenset({"single_choice", "multiple_choice", "text", "date"})
+_BUILTIN_TYPE_IDS = frozenset(
+    {"single_choice", "multiple_choice", "text", "date", "time", "datetime"}
+)
 _JSON_OBJECT = TypeAdapter(
     dict[str, JsonValue],
     config=ConfigDict(allow_inf_nan=False),
@@ -284,6 +293,70 @@ def _date_value(
     return {"date": response.date.isoformat()}
 
 
+def _time_value(
+    question: TimeQuestion[ClarificationModel],
+    response: TimeResponse,
+) -> Mapping[str, JsonValue]:
+    return {
+        "time": response.time.isoformat(timespec="minutes"),
+        "timeZone": question.time_zone,
+    }
+
+
+def _validate_time(
+    question: TimeQuestion[ClarificationModel],
+    response: TimeResponse,
+) -> None:
+    if question.minimum is not None and response.time < question.minimum:
+        raise ValueError("time response is earlier than the inclusive minimum")
+    if question.maximum is not None and response.time > question.maximum:
+        raise ValueError("time response is later than the inclusive maximum")
+
+
+def _resolved_datetime(
+    question: DateTimeQuestion[ClarificationModel],
+    response: DateTimeResponse,
+) -> datetime:
+    return _resolve_local_datetime(
+        response.date_time,
+        ZoneInfo(question.time_zone),
+        field="date_time",
+    )
+
+
+def _validate_datetime(
+    question: DateTimeQuestion[ClarificationModel],
+    response: DateTimeResponse,
+) -> None:
+    zone = ZoneInfo(question.time_zone)
+    resolved = _resolve_local_datetime(response.date_time, zone, field="date_time")
+    if question.minimum is not None and resolved < _resolve_local_datetime(
+        question.minimum,
+        zone,
+        field="minimum",
+    ):
+        raise ValueError("datetime response is earlier than the inclusive minimum")
+    if question.maximum is not None and resolved > _resolve_local_datetime(
+        question.maximum,
+        zone,
+        field="maximum",
+    ):
+        raise ValueError("datetime response is later than the inclusive maximum")
+
+
+def _datetime_value(
+    question: DateTimeQuestion[ClarificationModel],
+    response: DateTimeResponse,
+) -> Mapping[str, JsonValue]:
+    resolved = _resolved_datetime(question, response)
+    instant = resolved.astimezone(UTC).isoformat(timespec="seconds")
+    return {
+        "localDateTime": response.date_time.isoformat(timespec="minutes"),
+        "timeZone": question.time_zone,
+        "instant": instant.replace("+00:00", "Z"),
+    }
+
+
 def _builtin_type(
     *,
     type_id: str,
@@ -348,6 +421,42 @@ BUILTIN_CLARIFICATION_TYPES = (
         normalize=cast(
             NormalizeResponse[ClarificationQuestionBase, ClarificationResponseBase],
             _date_value,
+        ),
+    ),
+    ClarificationType(
+        type_id="time",
+        description=(
+            "Use for one local wall-clock minute in a declared IANA time zone, "
+            "optionally within an inclusive range."
+        ),
+        question_model=TimeQuestion[ClarificationModel],
+        response_model=TimeResponse,
+        bind_response_schema=None,
+        validate=cast(
+            ValidateResponse[ClarificationQuestionBase, ClarificationResponseBase],
+            _validate_time,
+        ),
+        normalize=cast(
+            NormalizeResponse[ClarificationQuestionBase, ClarificationResponseBase],
+            _time_value,
+        ),
+    ),
+    ClarificationType(
+        type_id="datetime",
+        description=(
+            "Use for one date and local wall-clock minute that must resolve to a "
+            "unique instant in a declared IANA time zone."
+        ),
+        question_model=DateTimeQuestion[ClarificationModel],
+        response_model=DateTimeResponse,
+        bind_response_schema=None,
+        validate=cast(
+            ValidateResponse[ClarificationQuestionBase, ClarificationResponseBase],
+            _validate_datetime,
+        ),
+        normalize=cast(
+            NormalizeResponse[ClarificationQuestionBase, ClarificationResponseBase],
+            _datetime_value,
         ),
     ),
 )

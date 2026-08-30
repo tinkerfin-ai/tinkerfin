@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncGenerator, AsyncIterator
 from datetime import UTC, datetime, timedelta
 from typing import cast
@@ -26,7 +27,7 @@ from tinkerfin_messaging.agui import AgUiCodec
 from tinkerfin_studio.conversation.coordinator import ConversationTraceCoordinator
 from tinkerfin_studio.conversation.models import ConversationRunRegistration
 from tinkerfin_studio.conversation.repository import ConversationRepository
-from tinkerfin_tracing import Tracer, TraceThread, TraceUpdate
+from tinkerfin_tracing import Tracer, TraceRunNotFound, TraceThread, TraceUpdate
 
 
 async def _messaging_channel() -> tuple[
@@ -83,6 +84,30 @@ class _MissingRunBarrierChannel:
         self.checked.set()
         await self.release.wait()
         raise RunNotFound(identity=identity)
+
+
+class _DelayedTraceLookup:
+    """先报告目标 Run 尚未写入，再返回同一权威 Trace"""
+
+    def __init__(self, trace: TraceThread) -> None:
+        self._trace = trace
+        self.attempts = 0
+
+    async def get(
+        self,
+        thread_id: str,
+        *,
+        head_run_id: str | None = None,
+    ) -> TraceThread:
+        self.attempts += 1
+        if self.attempts <= 2:
+            raise TraceRunNotFound(
+                "Selected Run does not exist in this Trace generation",
+                context={"head_run_id": head_run_id},
+            )
+        assert thread_id == self._trace.key.thread_id
+        assert head_run_id == self._trace.head_run_id
+        return self._trace
 
 
 async def _setup_run(database, *, thread_id: str, run_id: str):
@@ -300,7 +325,6 @@ async def test_trace_coordinator_recovers_after_one_summary_write_failure(
         *,
         thread_pk: int,
         update: TraceUpdate,
-        pending: dict[str, str],
         generation: str,
     ) -> None:
         nonlocal update_attempts
@@ -311,7 +335,6 @@ async def test_trace_coordinator_recovers_after_one_summary_write_failure(
         await original_update(
             thread_pk=thread_pk,
             update=update,
-            pending=pending,
             generation=generation,
         )
 
@@ -359,6 +382,45 @@ async def test_trace_coordinator_recovers_after_one_summary_write_failure(
     await messaging.aclose()
 
 
+async def test_trace_coordinator_waits_for_not_started_run_without_corruption_warning(
+    database,
+    caplog,
+) -> None:
+    """Deferred Agent 尚未提交首个 fact 时只等待，不误报 Trace 损坏"""
+
+    tracer, context, trace_session, thread_pk = await _setup_run(
+        database,
+        thread_id="thread-delayed-trace",
+        run_id="run-delayed-trace",
+    )
+    await _finish(context, trace_session)
+    trace = await tracer.get(
+        context.identity.thread_id,
+        head_run_id=context.identity.run_id,
+    )
+    delayed = _DelayedTraceLookup(trace)
+    messaging, channel = await _messaging_channel()
+    coordinator = ConversationTraceCoordinator(
+        database=database,
+        tracer=cast(Tracer, delayed),
+        conversation_channel=channel,
+    )
+    caplog.set_level(
+        logging.WARNING,
+        logger="tinkerfin_studio.conversation.coordinator",
+    )
+
+    coordinator.ensure(thread_pk=thread_pk, identity=context.identity)
+    await _wait_for(database, thread_pk, lambda item: item.status == "idle")
+
+    assert delayed.attempts >= 3
+    assert not any(
+        "Trace 摘要 follow 将重试" in record.getMessage() for record in caplog.records
+    )
+    await coordinator.aclose()
+    await messaging.aclose()
+
+
 async def test_recover_preparing_deletes_empty_thread_without_trace(database) -> None:
     tracer = Tracer()
     async with database.session() as session:
@@ -394,6 +456,61 @@ async def test_recover_preparing_deletes_empty_thread_without_trace(database) ->
     await coordinator.recover_preparing(thread_pk=thread_pk)
 
     assert await _thread(database, thread_pk) is None
+    await coordinator.aclose()
+    await messaging.aclose()
+
+
+async def test_recover_preparing_removes_only_a_missing_new_run_from_existing_trace(
+    database,
+) -> None:
+    tracer, old_context, old_session, thread_pk = await _setup_run(
+        database,
+        thread_id="thread-existing-trace",
+        run_id="run-existing-trace",
+    )
+    await _finish(old_context, old_session)
+    async with database.session() as session:
+        repository = ConversationRepository(session)
+        thread = await repository.get_thread_by_pk(thread_pk)
+        assert thread is not None
+        registration = await repository.create_run_registration(
+            thread_id=thread.id,
+            run_id="run-missing-trace",
+            parent_run_id="run-existing-trace",
+            model_id="model-main",
+            runtime_profile="deepagents-v2",
+            input_json={"runId": "run-missing-trace"},
+            config_json={"runtimeProfile": "deepagents-v2"},
+        )
+        registration.created_at = datetime.now(UTC).replace(tzinfo=None) - timedelta(
+            minutes=1
+        )
+        thread.last_run_id = registration.run_id
+        await repository.commit()
+
+    messaging, channel = await _messaging_channel()
+    coordinator = ConversationTraceCoordinator(
+        database=database,
+        tracer=tracer,
+        conversation_channel=channel,
+    )
+
+    await coordinator.recover_preparing(thread_pk=thread_pk)
+
+    async with database.session() as session:
+        repository = ConversationRepository(session)
+        thread = await repository.get_thread_by_pk(thread_pk)
+        missing = await repository.get_run(
+            thread_pk=thread_pk,
+            run_id="run-missing-trace",
+        )
+        existing = await repository.get_run(
+            thread_pk=thread_pk,
+            run_id="run-existing-trace",
+        )
+    assert thread is not None
+    assert missing is None
+    assert existing is not None
     await coordinator.aclose()
     await messaging.aclose()
 

@@ -67,6 +67,7 @@ _ROOTED_TRANSFER_POLL_SECONDS = 0.01
 _ROOTED_TRANSFER_TERMINAL_LOG_SECONDS = 0.5
 _ROOTED_TRANSFER_MAX_LOG_BYTES = 64 * 1024
 _ROOTED_OFFLOAD_MAX_CAPTURE_BYTES = 10 * 1024 * 1024
+_TERMINAL_SANDBOX_STATES = frozenset({"failed", "stopping", "terminated"})
 _ASYNC_ONLY_MESSAGE = (
     "OpenSandboxBackend supports asynchronous remote I/O only; "
     "use the corresponding async method"
@@ -816,6 +817,12 @@ class OpenSandboxBackend(BaseSandbox):
                 self.id,
                 unavailable_reason(exc),
             )
+
+        # OpenSandbox 0.1.14 defines these states as irreversible transitions away
+        # from usable capacity. Avoid a data-plane command that cannot succeed and can
+        # otherwise consume the full endpoint timeout after Docker has already exited.
+        if info.status.state.casefold() in _TERMINAL_SANDBOX_STATES:
+            return OpenSandboxRuntimeInfo.from_sdk(info, healthy=False)
 
         try:
             healthy = (await self.aexecute(self._health_command)).exit_code == 0

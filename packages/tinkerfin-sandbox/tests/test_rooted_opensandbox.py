@@ -3,18 +3,33 @@
 from __future__ import annotations
 
 import asyncio
+import secrets
 import shlex
+import shutil
 from dataclasses import dataclass
 from datetime import timedelta
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
 from deepagents.backends.protocol import INVALID_PATH
 from docker import DockerClient
 from opensandbox.config import ConnectionConfig
-from tests.support.docker_services import OpenSandboxTestService
+from testcontainers.core.container import DockerContainer
+from tests.support.docker_services import (
+    OpenSandboxTestService,
+    _MappedPortHttpWaitStrategy,
+    _opensandbox_config,
+    _opensandbox_docker_socket,
+    _with_opensandbox_port,
+)
 
-from tinkerfin_sandbox import OpenSandboxClient, OpenSandboxConfig
+from tinkerfin_sandbox import (
+    OpenSandboxClient,
+    OpenSandboxConfig,
+    OpenSandboxManager,
+    SQLAlchemyOpenSandboxState,
+)
 from tinkerfin_sandbox.backends import _rooted_protocol
 from tinkerfin_sandbox.backends.sdk import OpenSandboxBackend
 
@@ -190,6 +205,86 @@ async def _wait_for_child_cleanup(
     raise AssertionError("OpenSandbox child container was not removed")
 
 
+async def _owned_sandbox_ids(
+    docker_client: DockerClient,
+    *,
+    label: str,
+    value: str,
+) -> tuple[str, ...]:
+    """Return current remote IDs without blocking the async test loop."""
+
+    containers = await asyncio.to_thread(
+        docker_client.containers.list,
+        all=True,
+        filters={"label": f"{label}={value}"},
+    )
+    return tuple(str(container.labels["opensandbox.io/id"]) for container in containers)
+
+
+async def _wait_for_owned_sandbox_count(
+    docker_client: DockerClient,
+    *,
+    label: str,
+    value: str,
+    count: int,
+    timeout: float = 15.0,
+) -> tuple[str, ...]:
+    """Wait for one exact number of test-owned remote Sandboxes."""
+
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        sandbox_ids = await _owned_sandbox_ids(
+            docker_client,
+            label=label,
+            value=value,
+        )
+        if len(sandbox_ids) == count:
+            return sandbox_ids
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"expected {count} owned Sandboxes")
+
+
+def _recreated_opensandbox_server(
+    *,
+    api_key: str,
+    config_path: Path,
+    metadata_dir: Path,
+    run_id: str,
+) -> DockerContainer:
+    """Build one disposable Server sharing only Docker and runtime metadata."""
+
+    wait = (
+        _MappedPortHttpWaitStrategy(8090, "/health")
+        .with_poll_interval(0.5)
+        .with_startup_timeout(180)
+    )
+    return (
+        _with_opensandbox_port(
+            DockerContainer(
+                "opensandbox/server:v0.2.2@sha256:"
+                "8f8762af7565ed9c6f9dbcf009dd56727aa1fef8ce58a17f2b007b88cfe542bb"
+            )
+        )
+        .with_env("OPENSANDBOX_SERVER_API_KEY", api_key)
+        .with_volume_mapping(
+            _opensandbox_docker_socket(),
+            "/var/run/docker.sock",
+            "rw",
+        )
+        .with_volume_mapping(
+            str(metadata_dir),
+            "/root/.opensandbox/metadata",
+            "rw",
+        )
+        .with_copy_into_container(config_path, "/etc/opensandbox/config.toml")
+        .with_kwargs(
+            extra_hosts={"host.docker.internal": "host-gateway"},
+            labels={"tinkerfin.test/run": run_id},
+        )
+        .waiting_for(wait)
+    )
+
+
 @pytest.mark.opensandbox_e2e
 async def test_real_rooted_descriptor_transfers_reject_symlink_races(
     opensandbox_test_service: OpenSandboxTestService,
@@ -258,3 +353,227 @@ async def test_real_rooted_descriptor_transfers_reject_symlink_races(
         docker_test_client,
         opensandbox_test_service.sandbox_metadata,
     )
+
+
+@pytest.mark.opensandbox_e2e
+async def test_real_manager_renews_warm_ttl_and_replaces_it_after_restart(
+    opensandbox_test_service: OpenSandboxTestService,
+    docker_test_client: DockerClient,
+    tmp_path: Path,
+) -> None:
+    """Prove running renewal and durable stale-slot recovery against Docker."""
+
+    purpose = f"warm-lifecycle-{uuid4().hex}"
+    purpose_label = "purpose"
+    config = OpenSandboxConfig(
+        workspace_root="/workspace",
+        warm_pool_size=1,
+        ttl=timedelta(seconds=60),
+        metadata={
+            purpose_label: purpose,
+            **opensandbox_test_service.sandbox_metadata,
+        },
+    )
+    connection = ConnectionConfig(
+        domain=opensandbox_test_service.domain,
+        api_key=opensandbox_test_service.api_key,
+        request_timeout=timedelta(minutes=2),
+        use_server_proxy=True,
+    )
+    state_url = f"sqlite+aiosqlite:///{tmp_path / 'warm-lifecycle.db'}"
+    first_client = OpenSandboxClient(connection_config=connection, config=config)
+    first = OpenSandboxManager[str](
+        client=first_client,
+        key_resolver=lambda value: value,
+        state=SQLAlchemyOpenSandboxState(
+            url=state_url,
+            namespace=purpose,
+            lease_ttl=1.0,
+            poll_interval=0.02,
+        ),
+        warm_pool_size=1,
+        fail_on_startup_warmup_error=True,
+    )
+    second: OpenSandboxManager[str] | None = None
+    cleanup_client: OpenSandboxClient | None = None
+    try:
+        await first.start()
+        (original_id,) = await _wait_for_owned_sandbox_count(
+            docker_test_client,
+            label=purpose_label,
+            value=purpose,
+            count=1,
+        )
+        initial_info = await first_client.inspect(original_id)
+        assert initial_info.expires_at is not None
+        await asyncio.sleep(22)
+        await first.check_ready()
+        renewed_info = await first_client.inspect(original_id)
+        assert renewed_info.expires_at is not None
+        assert renewed_info.expires_at > initial_info.expires_at
+        assert await _owned_sandbox_ids(
+            docker_test_client,
+            label=purpose_label,
+            value=purpose,
+        ) == (original_id,)
+
+        await first.aclose()
+        expiry_client = OpenSandboxClient(connection_config=connection, config=config)
+        expiring_backend = await expiry_client.connect(original_id)
+        try:
+            await expiring_backend.arenew(timedelta(seconds=3))
+        finally:
+            await expiring_backend.aclose()
+            await expiry_client.aclose()
+        await _wait_for_owned_sandbox_count(
+            docker_test_client,
+            label=purpose_label,
+            value=purpose,
+            count=0,
+            timeout=10.0,
+        )
+
+        second_client = OpenSandboxClient(connection_config=connection, config=config)
+        second = OpenSandboxManager[str](
+            client=second_client,
+            key_resolver=lambda value: value,
+            state=SQLAlchemyOpenSandboxState(
+                url=state_url,
+                namespace=purpose,
+                lease_ttl=1.0,
+                poll_interval=0.02,
+            ),
+            warm_pool_size=1,
+            fail_on_startup_warmup_error=True,
+        )
+        await second.start()
+        await second.check_ready()
+        (replacement_id,) = await _wait_for_owned_sandbox_count(
+            docker_test_client,
+            label=purpose_label,
+            value=purpose,
+            count=1,
+        )
+        assert replacement_id != original_id
+        owner = await second.get("owner")
+        assert owner.id == replacement_id
+        assert (await owner.aexecute("printf ready")).exit_code == 0
+    finally:
+        if second is not None:
+            await second.aclose()
+        await first.aclose()
+        cleanup_client = OpenSandboxClient(connection_config=connection, config=config)
+        for sandbox_id in await _owned_sandbox_ids(
+            docker_test_client,
+            label=purpose_label,
+            value=purpose,
+        ):
+            await cleanup_client.destroy(sandbox_id)
+        await cleanup_client.aclose()
+        await _wait_for_owned_sandbox_count(
+            docker_test_client,
+            label=purpose_label,
+            value=purpose,
+            count=0,
+        )
+
+
+@pytest.mark.docker_integration
+@pytest.mark.opensandbox_e2e
+async def test_recreated_server_restores_persisted_expiration_override(
+    docker_test_client: DockerClient,
+    docker_test_run_id: str,
+    tmp_path: Path,
+) -> None:
+    """A Server replacement must honor the latest Docker expiration metadata."""
+
+    api_key = secrets.token_urlsafe(32)
+    config_path = tmp_path / "config.toml"
+    await asyncio.to_thread(
+        config_path.write_text,
+        _opensandbox_config(),
+        encoding="utf-8",
+    )
+    metadata_dir = tmp_path / "metadata"
+    await asyncio.to_thread(metadata_dir.mkdir)
+    host_metadata_dir = Path.home() / ".opensandbox" / "metadata"
+    if await asyncio.to_thread(host_metadata_dir.is_dir):
+        await asyncio.to_thread(
+            shutil.copytree,
+            host_metadata_dir,
+            metadata_dir,
+            dirs_exist_ok=True,
+        )
+    purpose = f"server-restart-{uuid4().hex}"
+    purpose_label = "purpose"
+    sandbox_id: str | None = None
+    try:
+        first_server = _recreated_opensandbox_server(
+            api_key=api_key,
+            config_path=config_path,
+            metadata_dir=metadata_dir,
+            run_id=docker_test_run_id,
+        )
+        await asyncio.to_thread(first_server.start)
+        try:
+            first_domain = await asyncio.to_thread(
+                lambda: (
+                    f"{first_server.get_container_host_ip()}:"
+                    f"{first_server.get_exposed_port(8090)}"
+                )
+            )
+            connection = ConnectionConfig(
+                domain=first_domain,
+                api_key=api_key,
+                request_timeout=timedelta(minutes=2),
+                use_server_proxy=True,
+            )
+            client = OpenSandboxClient(
+                connection_config=connection,
+                config=OpenSandboxConfig(
+                    workspace_root="/workspace",
+                    warm_pool_size=0,
+                    ttl=timedelta(seconds=60),
+                    metadata={
+                        purpose_label: purpose,
+                        "tinkerfin.test/sandbox-run": docker_test_run_id,
+                    },
+                ),
+            )
+            backend = await client.create()
+            sandbox_id = backend.id
+            try:
+                await backend.arenew(timedelta(seconds=12))
+            finally:
+                await backend.aclose()
+                await client.aclose()
+            expiration_file = metadata_dir / "_expiration" / f"{sandbox_id}.json"
+            assert await asyncio.to_thread(expiration_file.is_file)
+        finally:
+            await asyncio.to_thread(first_server.stop)
+
+        second_server = _recreated_opensandbox_server(
+            api_key=api_key,
+            config_path=config_path,
+            metadata_dir=metadata_dir,
+            run_id=docker_test_run_id,
+        )
+        await asyncio.to_thread(second_server.start)
+        try:
+            await _wait_for_owned_sandbox_count(
+                docker_test_client,
+                label=purpose_label,
+                value=purpose,
+                count=0,
+                timeout=20.0,
+            )
+        finally:
+            await asyncio.to_thread(second_server.stop)
+    finally:
+        remaining = await asyncio.to_thread(
+            docker_test_client.containers.list,
+            all=True,
+            filters={"label": f"{purpose_label}={purpose}"},
+        )
+        for container in remaining:
+            await asyncio.to_thread(container.remove, force=True)

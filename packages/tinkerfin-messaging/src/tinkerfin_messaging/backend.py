@@ -8,7 +8,7 @@ from abc import abstractmethod
 from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Literal, Protocol, runtime_checkable
+from typing import Literal, Protocol, TypeGuard, runtime_checkable
 from uuid import uuid4
 
 from tinkerfin_contracts import RunIdentity
@@ -40,7 +40,30 @@ RunStatus = Literal[
     "failed",
     "owner_lost",
 ]
+ActiveRunStatus = Literal["running", "cancel_requested"]
 FinalRunStatus = Literal["completed", "cancelled", "failed", "owner_lost"]
+FailedRunStatus = Literal["failed", "owner_lost"]
+_ACTIVE_RUN_STATUSES = frozenset({"running", "cancel_requested"})
+_FINAL_RUN_STATUSES = frozenset({"completed", "cancelled", "failed", "owner_lost"})
+_FAILED_RUN_STATUSES = frozenset({"failed", "owner_lost"})
+
+
+def is_active_run_status(status: object) -> TypeGuard[ActiveRunStatus]:
+    """Return whether a value names a non-terminal durable run state."""
+
+    return isinstance(status, str) and status in _ACTIVE_RUN_STATUSES
+
+
+def is_final_run_status(status: object) -> TypeGuard[FinalRunStatus]:
+    """Return whether a value names an authoritative terminal run state."""
+
+    return isinstance(status, str) and status in _FINAL_RUN_STATUSES
+
+
+def is_failed_run_status(status: object) -> TypeGuard[FailedRunStatus]:
+    """Return whether a terminal state represents failed producer delivery."""
+
+    return isinstance(status, str) and status in _FAILED_RUN_STATUSES
 
 
 @dataclass(frozen=True, slots=True)
@@ -1158,12 +1181,7 @@ class MemoryBackend(MessagingBackend):
                     record = state.runs.get(handle.identity.run_id)
                     if record is None:
                         raise RunNotFound(identity=handle.identity)
-                    is_terminal = record.status in {
-                        "completed",
-                        "cancelled",
-                        "failed",
-                        "owner_lost",
-                    }
+                    is_terminal = is_final_run_status(record.status)
                     available_end = (
                         record.end_seq if is_terminal else len(state.messages)
                     )
@@ -1183,7 +1201,7 @@ class MemoryBackend(MessagingBackend):
                     for message in page:
                         cursor = message.seq
                         yield message
-                if terminal_status in {"failed", "owner_lost"}:
+                if is_failed_run_status(terminal_status):
                     cause = terminal_error or RuntimeError(
                         f"Producer for run {handle.identity.run_id!r} stopped"
                     )
@@ -1202,7 +1220,7 @@ class MemoryBackend(MessagingBackend):
             record = state.runs.get(handle.identity.run_id)
             if record is None:
                 raise RunNotFound(identity=handle.identity)
-            if record.status in {"completed", "cancelled", "failed", "owner_lost"}:
+            if is_final_run_status(record.status):
                 return False
             if record.settling:
                 return False
@@ -1226,12 +1244,7 @@ class MemoryBackend(MessagingBackend):
                     raise RunNotFound(identity=handle.identity)
                 if record.status == "cancel_requested":
                     return True
-                if record.status in {
-                    "completed",
-                    "cancelled",
-                    "failed",
-                    "owner_lost",
-                }:
+                if is_final_run_status(record.status):
                     return False
                 await state.condition.wait()
 
@@ -1245,12 +1258,7 @@ class MemoryBackend(MessagingBackend):
                 record = state.runs.get(handle.identity.run_id)
                 if record is None:
                     raise RunNotFound(identity=handle.identity)
-                if record.status in {
-                    "completed",
-                    "cancelled",
-                    "failed",
-                    "owner_lost",
-                }:
+                if is_final_run_status(record.status):
                     return record.status
                 await state.condition.wait()
 

@@ -21,6 +21,7 @@ from tinkerfin import (
     AgUiResumeBinding,
     AgUiResumeCheckpoint,
     AgUiResumeRequest,
+    DeepAgentDefinition,
     DeepAgentsV2RuntimeProfile,
     RunIdentity,
     TinkerFin,
@@ -144,6 +145,361 @@ def _assert_private_marker_absent(events: list[BaseEvent]) -> None:
     )
     assert RESUME_MARKER_STATE_KEY not in serialized
     assert LINEAGE_STATE_KEY not in serialized
+
+
+@pytest.mark.asyncio
+async def test_open_agui_run_reuses_one_graph_for_resume_resolution_and_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    default_saver = MemorySaver()
+    saver = MemorySaver()
+    graphs: list[CompiledStateGraph[Any, Any, Any, Any]] = []
+    resumed: list[object] = []
+
+    def build(*_args: object, **_kwargs: object):
+        async def reviewed(state: _ToolReviewState) -> dict[str, object]:
+            del state
+            decision = interrupt(
+                {
+                    "action_requests": [{"name": "write_file", "args": {"path": "a"}}],
+                    "review_configs": [
+                        {
+                            "action_name": "write_file",
+                            "allowed_decisions": ["approve"],
+                        }
+                    ],
+                }
+            )
+            resumed.append(decision)
+            return {}
+
+        builder = StateGraph(_ToolReviewState)
+        builder.add_node("reviewed", reviewed)
+        builder.add_edge(START, "reviewed")
+        builder.add_edge("reviewed", END)
+        graph = builder.compile(checkpointer=saver)
+        graphs.append(graph)
+        return graph
+
+    monkeypatch.setattr(
+        "tinkerfin.runtime_profile._deepagents_graph.create_deep_agent",
+        build,
+    )
+    tinkerfin = TinkerFin(checkpointer=default_saver)
+    definition = tinkerfin.create_deep_agent(
+        model="provider:model",
+        tools=[],
+        checkpointer=saver,
+    )
+    parent_identity = RunIdentity(threadId="thread-managed", runId="run-parent")
+    review_message = AIMessage(
+        id="review-message",
+        content="",
+        tool_calls=[
+            {
+                "name": "write_file",
+                "args": {"path": "a"},
+                "id": "call-a",
+                "type": "tool_call",
+            }
+        ],
+    )
+    parent = await tinkerfin.open_agui_run(
+        parent_identity,
+        agent=definition,
+        input={"messages": [review_message]},
+    )
+    parent_events = [event async for event in parent]
+    terminal = parent_events[-1]
+    assert isinstance(terminal, RunFinishedEvent)
+    assert terminal.outcome is not None and terminal.outcome.type == "interrupt"
+    public_interrupt_id = terminal.outcome.interrupts[0].id
+
+    request = AgUiResumeRequest(
+        entries=(
+            ResumeEntry.model_validate(
+                {
+                    "interruptId": public_interrupt_id,
+                    "status": "resolved",
+                    "payload": {"type": "approve"},
+                }
+            ),
+        )
+    )
+    resume_identity = RunIdentity(
+        threadId=parent_identity.thread_id,
+        runId="run-resume",
+    )
+    checkpoints: list[AgUiResumeCheckpoint] = []
+
+    async def checkpointed(checkpoint: AgUiResumeCheckpoint) -> None:
+        checkpoints.append(checkpoint)
+
+    resumed_stream = await tinkerfin.open_agui_run(
+        resume_identity,
+        agent=definition,
+        resume=request,
+        parent_run_id=parent_identity.run_id,
+        on_resume_saved=checkpointed,
+    )
+    resumed_events = [event async for event in resumed_stream]
+
+    assert resumed_events[-1].type.value == "RUN_FINISHED"
+    assert len(graphs) == 2
+    assert len(checkpoints) == 1
+    assert resumed == [{"decisions": [{"type": "approve"}]}]
+
+    releases = 0
+
+    async def fail_agent_setup() -> DeepAgentDefinition[None]:
+        raise RuntimeError("retry factory failed")
+
+    async def release_unprepared() -> None:
+        nonlocal releases
+        releases += 1
+
+    retry = await tinkerfin.open_agui_run(
+        resume_identity,
+        agent=fail_agent_setup,
+        resume=request,
+        parent_run_id=parent_identity.run_id,
+        on_resume_not_saved=release_unprepared,
+        resume_checkpointer=saver,
+    )
+    retry_events = [event async for event in retry]
+
+    assert retry_events[-1].type.value == "RUN_ERROR"
+    assert releases == 0
+
+
+@pytest.mark.asyncio
+async def test_open_agui_run_releases_a_pre_definition_resume_failure_once() -> None:
+    saver = MemorySaver()
+    tinkerfin = TinkerFin(checkpointer=saver)
+    identity = RunIdentity(threadId="thread-unprepared", runId="run-resume")
+    request = AgUiResumeRequest(
+        entries=(
+            ResumeEntry.model_validate(
+                {
+                    "interruptId": "interrupt-1#0",
+                    "status": "cancelled",
+                }
+            ),
+        )
+    )
+    releases = 0
+
+    async def fail_agent_setup() -> DeepAgentDefinition[None]:
+        raise RuntimeError("model setup failed")
+
+    async def release_unprepared() -> None:
+        nonlocal releases
+        releases += 1
+
+    stream = await tinkerfin.open_agui_run(
+        identity,
+        agent=fail_agent_setup,
+        resume=request,
+        on_resume_not_saved=release_unprepared,
+    )
+    events = [event async for event in stream]
+
+    assert [event.type.value for event in events] == ["RUN_STARTED", "RUN_ERROR"]
+    assert releases == 1
+
+
+async def test_lazy_resume_uses_its_declared_override_before_definition_exists() -> (
+    None
+):
+    default_saver = MemorySaver()
+    override_saver = MemorySaver()
+    tinkerfin = TinkerFin(checkpointer=default_saver)
+    identity = RunIdentity(threadId="thread-declared-saver", runId="run-resume")
+    request = AgUiResumeRequest(
+        entries=(
+            ResumeEntry.model_validate(
+                {
+                    "interruptId": "interrupt-1#0",
+                    "status": "cancelled",
+                }
+            ),
+        )
+    )
+    releases = 0
+
+    async def fail_agent_setup() -> DeepAgentDefinition[None]:
+        raise RuntimeError("model setup failed")
+
+    async def release_unprepared() -> None:
+        nonlocal releases
+        releases += 1
+
+    stream = await tinkerfin.open_agui_run(
+        identity,
+        agent=fail_agent_setup,
+        resume=request,
+        on_resume_not_saved=release_unprepared,
+        resume_checkpointer=override_saver,
+    )
+    events = [event async for event in stream]
+
+    assert [event.type.value for event in events] == ["RUN_STARTED", "RUN_ERROR"]
+    assert releases == 1
+
+
+async def test_lazy_resume_fails_closed_when_definition_changes_saver() -> None:
+    default_saver = MemorySaver()
+    override_saver = MemorySaver()
+    tinkerfin = TinkerFin(checkpointer=default_saver)
+    definition = tinkerfin.create_deep_agent(
+        model="provider:model",
+        tools=[],
+        checkpointer=override_saver,
+    )
+    identity = RunIdentity(threadId="thread-saver-mismatch", runId="run-resume")
+    request = AgUiResumeRequest(
+        entries=(
+            ResumeEntry.model_validate(
+                {
+                    "interruptId": "interrupt-1#0",
+                    "status": "cancelled",
+                }
+            ),
+        )
+    )
+    releases = 0
+
+    async def create_agent() -> DeepAgentDefinition[Any]:
+        return definition
+
+    async def release_unprepared() -> None:
+        nonlocal releases
+        releases += 1
+
+    stream = await tinkerfin.open_agui_run(
+        identity,
+        agent=create_agent,
+        resume=request,
+        on_resume_not_saved=release_unprepared,
+    )
+    events = [event async for event in stream]
+
+    assert [event.type.value for event in events] == ["RUN_STARTED", "RUN_ERROR"]
+    assert releases == 0
+    assert stream.error is not None
+    assert "declared resume_checkpointer" in str(stream.error)
+
+
+@pytest.mark.parametrize("release_fails", [False, True])
+async def test_open_agui_run_settles_pre_definition_resume_cancellation_once(
+    release_fails: bool,
+) -> None:
+    saver = MemorySaver()
+    tinkerfin = TinkerFin(checkpointer=saver)
+    identity = RunIdentity(threadId="thread-cancel-setup", runId="run-resume")
+    request = AgUiResumeRequest(
+        entries=(
+            ResumeEntry.model_validate(
+                {
+                    "interruptId": "interrupt-1#0",
+                    "status": "cancelled",
+                }
+            ),
+        )
+    )
+    entered = asyncio.Event()
+    blocked = asyncio.Event()
+    releases = 0
+
+    async def create_agent() -> DeepAgentDefinition[None]:
+        entered.set()
+        await blocked.wait()
+        raise AssertionError("cancelled Agent setup resumed unexpectedly")
+
+    async def release_unprepared() -> None:
+        nonlocal releases
+        releases += 1
+        if release_fails:
+            raise RuntimeError("host release failed")
+
+    task = asyncio.create_task(
+        tinkerfin.open_agui_run(
+            identity,
+            agent=create_agent,
+            resume=request,
+            on_resume_not_saved=release_unprepared,
+        )
+    )
+    await entered.wait()
+    task.cancel()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError) as captured:
+        await task
+
+    assert releases == 1
+    if release_fails:
+        assert any("host release failed" in note for note in captured.value.__notes__)
+
+
+async def test_open_agui_run_retains_marker_probe_across_repeated_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    saver = MemorySaver()
+    tinkerfin = TinkerFin(checkpointer=saver)
+    identity = RunIdentity(threadId="thread-cancel-probe", runId="run-resume")
+    request = AgUiResumeRequest(
+        entries=(
+            ResumeEntry.model_validate(
+                {
+                    "interruptId": "interrupt-1#0",
+                    "status": "cancelled",
+                }
+            ),
+        )
+    )
+    factory_started = asyncio.Event()
+    factory_blocked = asyncio.Event()
+    probe_started = asyncio.Event()
+    release_probe = asyncio.Event()
+    releases = 0
+
+    async def create_agent() -> DeepAgentDefinition[None]:
+        factory_started.set()
+        await factory_blocked.wait()
+        raise AssertionError("cancelled Agent setup resumed unexpectedly")
+
+    async def marker_is_durable(*_args: object, **_kwargs: object) -> bool:
+        probe_started.set()
+        await release_probe.wait()
+        return False
+
+    async def release_unprepared() -> None:
+        nonlocal releases
+        releases += 1
+
+    monkeypatch.setattr(
+        "tinkerfin._agui_lineage.agui_resume_marker_is_durable",
+        marker_is_durable,
+    )
+    task = asyncio.create_task(
+        tinkerfin.open_agui_run(
+            identity,
+            agent=create_agent,
+            resume=request,
+            on_resume_not_saved=release_unprepared,
+        )
+    )
+    await factory_started.wait()
+    task.cancel("first")
+    await probe_started.wait()
+    task.cancel("second")
+    release_probe.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert releases == 1
 
 
 @pytest.mark.asyncio
@@ -523,7 +879,7 @@ async def test_resume_graph_factory_failure_uses_pre_marker_settlement(
     monkeypatch: pytest.MonkeyPatch,
     error: BaseException,
 ) -> None:
-    _saver, graphs, _executions = _install_resume_graph(monkeypatch)
+    saver, graphs, _executions = _install_resume_graph(monkeypatch)
     definition = TinkerFin().create_deep_agent(model="provider:model", tools=[])
     interrupt_id = await _create_interrupted_parent(definition, graphs)
     identity, binding = _resume_binding(interrupt_id)
@@ -540,7 +896,7 @@ async def test_resume_graph_factory_failure_uses_pre_marker_settlement(
         "tinkerfin.runtime_profile._deepagents_graph.create_deep_agent",
         fail_factory,
     )
-    failing_definition = TinkerFin().create_deep_agent(
+    failing_definition = TinkerFin(checkpointer=saver).create_deep_agent(
         model="provider:model",
         tools=[],
     )
@@ -562,6 +918,59 @@ async def test_resume_graph_factory_failure_uses_pre_marker_settlement(
         assert captured.value is error
     await stream.aclose()
     assert releases == 1
+
+
+@pytest.mark.asyncio
+async def test_resume_graph_factory_failure_preserves_a_durable_retry_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    saver, graphs, _executions = _install_resume_graph(monkeypatch)
+    definition = TinkerFin(checkpointer=saver).create_deep_agent(
+        model="provider:model",
+        tools=[],
+    )
+    interrupt_id = await _create_interrupted_parent(definition, graphs)
+    identity, binding = _resume_binding(interrupt_id)
+
+    async def fail_after_marker(_checkpoint: AgUiResumeCheckpoint) -> None:
+        raise RuntimeError("host settlement unavailable")
+
+    first = cast(Any, definition).new_agui(
+        identity=identity,
+        parent_run_id="run-parent",
+        resume=binding,
+        on_resume_checkpointed=fail_after_marker,
+    )
+    first_events = [event async for event in first.astream()]
+    assert first_events[-1].type.value == "RUN_ERROR"
+
+    def fail_factory(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("retry factory failed")
+
+    monkeypatch.setattr(
+        "tinkerfin.runtime_profile._deepagents_graph.create_deep_agent",
+        fail_factory,
+    )
+    releases = 0
+
+    async def release_unprepared() -> None:
+        nonlocal releases
+        releases += 1
+
+    retry_definition = TinkerFin(checkpointer=saver).create_deep_agent(
+        model="provider:model",
+        tools=[],
+    )
+    retry = cast(Any, retry_definition).new_agui(
+        identity=identity,
+        parent_run_id="run-parent",
+        resume=binding,
+        on_resume_initialization_failed=release_unprepared,
+    )
+    retry_events = [event async for event in retry.astream()]
+
+    assert retry_events[-1].type.value == "RUN_ERROR"
+    assert releases == 0
 
 
 @pytest.mark.asyncio

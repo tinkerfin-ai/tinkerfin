@@ -13,6 +13,7 @@ from typing import (
     reveal_type,
 )
 
+from deepagents import CompiledSubAgent
 from langchain.agents.middleware.types import InputAgentState
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage
@@ -31,6 +32,7 @@ from tinkerfin import (
     RunIdentity,
     TinkerFin,
 )
+from tinkerfin.deep_agent import DeepAgentGraph
 from tinkerfin.plan import (
     ClarificationForm,
     ClarificationModel,
@@ -175,6 +177,35 @@ if TYPE_CHECKING:
         resumed_agui.astream(context={"tenant": "tenant-1"}),
         AgUiEventStream,
     )
+
+    async def check_managed_and_direct_graphs() -> None:
+        graph = await definition.create_graph()
+        assert_type(graph, DeepAgentGraph)
+        subagent: CompiledSubAgent = {
+            "name": "typed-subagent",
+            "description": "Exercises the public async Runnable contract.",
+            "runnable": graph,
+        }
+        assert_type(subagent["runnable"], Runnable)
+        assert_type(
+            await tinkerfin.open_run(
+                identity,
+                agent=definition,
+                input=graph_input,
+                context={"tenant": "tenant-1"},
+            ),
+            NativeGraphRunStream,
+        )
+        assert_type(
+            await tinkerfin.open_agui_run(
+                identity,
+                agent=definition,
+                input=graph_input,
+                context={"tenant": "tenant-1"},
+            ),
+            AgUiEventStream,
+        )
+
     reveal_type(tinkerfin.create_deep_agent)
     reveal_type(native.astream)
     reveal_type(agui.astream)

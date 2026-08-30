@@ -28,10 +28,15 @@ Tracer(
 
 | API | 用途 |
 | --- | --- |
-| `CapturePolicy.public_safe(tool_rules=())` | 默认公开数据保留策略 |
+| `CapturePolicy.public_history(tool_overrides=None)` | 默认策略；保存全部 Tool 经清理的完整内容，并支持按准确名称覆盖 |
+| `CapturePolicy.public_safe(tool_rules=())` | Tool 默认仅保留元数据，可通过低层 RFC 6901 规则选择内容 |
+| `ToolTraceCapture.full_content()` | 保存 Tool 生命周期、完整安全内容与公开审批说明 |
+| `ToolTraceCapture.metadata_only()` | 保存 Tool 生命周期，不保存参数、结果或审批说明 |
+| `ToolTraceCapture.selected_content(...)` | 保存 Tool 生命周期与选定的参数/结果路径 |
+| `ToolTraceCapture.disabled()` | 不保存 Tool 生命周期及其结果消息 fact |
 | `ReasoningCapturePolicy.omitted()` | 默认推理策略，不保存正文或 digest |
 | `ReasoningCapturePolicy.content()` | 显式保存 Runtime 已配置 extractor 提供的有界正文 |
-| `ToolCaptureRule(toolName=..., argumentPaths=..., resultPaths=...)` | 为一个 Tool 放行指定 RFC 6901 JSON Pointer 值 |
+| `ToolCaptureRule(toolName=..., argumentPaths=..., resultPaths=..., includeReviewDescription=False)` | 为一个 Tool 放行指定 RFC 6901 值与可选审批说明 |
 | `CapturedValue` | 明确的 `inline` 或 `omitted` 捕获 envelope |
 | `TraceLimits` | 不可变的 event、thread、Tracer、reserve 与 follow 上限 |
 | `TraceWritePolicy` | 不可变的 batch、64 MiB pending、背压与等待策略 |
@@ -53,6 +58,8 @@ Tracer(
 `run.terminal` 和 `run.closed` facts。字节 reserve 必须覆盖
 `terminalReserveEventsPerRun * maxEventBytes`，保证每个预留 event 都能达到声明的最大值。
 已经失败的 session 仍属于不完整 Trace；reserve 不会在 Observer 失去所有权后伪造 fact。
+无法容纳完整恢复信息的 interaction payload 会在 durable pause 发布前使 Observation 失败，不能静默
+退化为缺少详情的盲审批。
 
 ## `TraceThread`
 
@@ -67,8 +74,10 @@ Tracer(
 | `tree` | 扁平权威 `TraceTree`；`roots` 与 `children(id)` 是便利视图 |
 | `state` | 所选谱系的完整 root 与无碰撞 subgraph state |
 | `interactions` | 窗口内审批、澄清、review 与输入交互 |
+| `summary` | 所选谱系的完整累计 status、completeness、计数、pending interaction 与来源最大时间 |
 | `status` | `running`、`waiting`、`succeeded`、`failed`、`cancelled`、`abandoned` 或 `unknown` |
 | `completeness` | 独立的 missing-prefix、missing-tail、payload-omitted 信号 |
+| `message_count` / `tool_call_count` | 从 `summary` 计算的兼容读取视图 |
 | `projections` | 显式请求业务 Projection 的防御性结果副本 |
 | `has_older` | 是否还有更早完整 Turn |
 | `history_cursor` | 供下一次 `Tracer.get(...)` 使用的 generation/head/as-of opaque cursor |
@@ -78,13 +87,24 @@ Tracer(
 | `delete()` | 删除当前 handle 的确切不活跃 generation |
 
 `TraceUpdate` 包含已提交的所选谱系 event/fact，message、reasoning、node、interaction 的
-upsert/remove，以及当前完整 state、status、completeness 和请求的 Projection 结果。
+upsert/remove、当前完整 state 与 `summary`。`update.summary` 是应用该 update 后的累计完整值，
+不是 delta；平铺 status、completeness 与计数字段都从同一个值计算。
+
+`TraceSummary.pending_interactions` 与 `last_occurred_at` 覆盖 fixed-as-of 的完整所选谱系，不受
+已加载 Turn 窗口影响。Pending 按首次出现的 `trace_seq` 排序，resolved 或 cancelled 后移除。
 
 每个 `TraceMessage`、`TraceReasoning`、`TraceNode` 与 `TraceInteraction` 都公开首次创建该
 实体的权威 Ledger `trace_seq`。跨实体类型合并时必须使用该序号，时间戳与 ID 不能替代顺序。
 `TraceInteraction.source_id` 保留规范 Native interrupt ID，使协议客户端无需保存 AG-UI 副本
 即可按已声明规则生成每个 action 的公开 ID。Tool 审批还通过 `tool_call_ids`
 按 action 位置保留 checkpoint 已证明的精确关联；消费方不得按 Tool 名或 node 顺序重建。
+
+`TraceNode.input` 与 `result` 只包含 capture policy 明确保留的值；`inputOmitted` 与
+`resultOmitted` 用于区分省略和 JSON null。`Tracer()` 默认使用
+`CapturePolicy.public_history()`，新出现的 Tool 会自动保存经清理的完整内容与公开审批说明。
+`toolOverrides` 可按准确名称选择 `fullContent`、`metadataOnly`、`selectedContent` 或 `disabled`。
+需要显式选择路径时，仍可通过 `CapturePolicy.public_safe()` 使用低层 `ToolCaptureRule` 与空 RFC 6901
+根路径。
 
 ## 语义 Facts
 
@@ -200,6 +220,6 @@ payload 是 opaque bytes；可查询的 Run、fact kind、timestamp、sequence �
 ## 错误
 
 Tracing 自有失败都继承 `TracingError`，并使用稳定 `tracing.*` code。公开错误族包含 invalid
-cursor、thread not found、ambiguous head、Run conflict、corruption、Store
+cursor、thread not found、ambiguous head、Run not found、Run conflict、corruption、Store
 unavailable/timeout/protocol error、Projection checkpoint conflict、quota exceeded、capture rejected、Observer failed 与
 Projection failed。公开 `context` 只含客户端安全信息；可信诊断与 cause 独立保存。

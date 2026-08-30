@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 import secrets
+import shutil
 import sys
 import time
 from collections.abc import AsyncIterator, Iterator
@@ -418,7 +419,7 @@ def _opensandbox_docker_socket() -> str:
     return get_docker_socket()
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 def opensandbox_test_service(
     docker_test_client: DockerClient,
     docker_test_run_id: str,
@@ -430,6 +431,14 @@ def opensandbox_test_service(
     api_key = secrets.token_urlsafe(32)
     config_path: Path = tmp_path_factory.mktemp("opensandbox") / "config.toml"
     config_path.write_text(_opensandbox_config(), encoding="utf-8")
+    metadata_dir = tmp_path_factory.mktemp("opensandbox-metadata")
+    host_metadata_dir = Path.home() / ".opensandbox" / "metadata"
+    if host_metadata_dir.is_dir():
+        # OpenSandbox scans every managed child on the shared Docker daemon. A
+        # point-in-time copy prevents the test Server from restoring unrelated
+        # Sandboxes with stale immutable creation labels, while test writes remain
+        # isolated from the host Server's metadata directory.
+        shutil.copytree(host_metadata_dir, metadata_dir, dirs_exist_ok=True)
     wait = (
         _MappedPortHttpWaitStrategy(8090, "/health")
         .with_poll_interval(0.5)
@@ -441,6 +450,11 @@ def opensandbox_test_service(
         .with_volume_mapping(
             _opensandbox_docker_socket(),
             "/var/run/docker.sock",
+            "rw",
+        )
+        .with_volume_mapping(
+            str(metadata_dir),
+            "/root/.opensandbox/metadata",
             "rw",
         )
         .with_copy_into_container(config_path, "/etc/opensandbox/config.toml")

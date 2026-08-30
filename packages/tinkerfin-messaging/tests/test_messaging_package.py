@@ -6,12 +6,15 @@ import inspect
 import json
 import subprocess
 import sys
+from collections.abc import Awaitable
 from dataclasses import FrozenInstanceError
 from importlib.metadata import PackageNotFoundError, distribution
 from importlib.resources import files
 from pathlib import Path
+from typing import get_args, get_origin, get_type_hints
 
 import pytest
+from ag_ui.core import BaseEvent
 
 import tinkerfin_messaging
 from tinkerfin_contracts import RunIdentity
@@ -56,9 +59,12 @@ def test_public_namespace_exposes_the_default_tinkerfin_facade() -> None:
     required = {
         "CancelCallback",
         "AgUiCodec",
+        "ActiveRunStatus",
         "CancelContext",
         "CancellableMessageSource",
         "DeferredMessageSource",
+        "FailedRunStatus",
+        "FinalRunStatus",
         "MemoryBackend",
         "MessageChannel",
         "MessageCodec",
@@ -77,10 +83,36 @@ def test_public_namespace_exposes_the_default_tinkerfin_facade() -> None:
         "RedisBackend",
         "SourceProfileMismatch",
         "SseRenderer",
+        "create_agui_run_source",
+        "is_active_run_status",
+        "is_failed_run_status",
+        "is_final_run_status",
+        "parse_sse_event_id",
     }
 
     assert required <= set(tinkerfin_messaging.__all__)
     assert all(hasattr(tinkerfin_messaging, name) for name in required)
+
+
+def test_agui_run_source_hides_its_deferred_implementation_type() -> None:
+    from tinkerfin_messaging.agui import create_agui_run_source
+
+    return_type = get_type_hints(create_agui_run_source)["return"]
+
+    assert get_origin(return_type) is tinkerfin_messaging.ProfiledMessageSource
+
+
+def test_agui_run_source_requires_an_event_message_source_opener() -> None:
+    from tinkerfin_messaging.agui import create_agui_run_source
+
+    open_events_type = get_type_hints(create_agui_run_source)["open_events"]
+    parameters, result = get_args(open_events_type)
+    source_type = get_args(result)[0]
+
+    assert parameters == [RunIdentity]
+    assert get_origin(result) is Awaitable
+    assert get_origin(source_type) is tinkerfin_messaging.MessageSource
+    assert get_args(source_type) == (BaseEvent,)
 
 
 def test_cancel_context_is_an_immutable_public_value() -> None:
@@ -158,6 +190,7 @@ def test_distribution_declares_redis_agui_and_native_extras() -> None:
     ("symbol", "blocked_packages", "extra"),
     (
         ("AgUiCodec", ("ag_ui",), "agui"),
+        ("create_agui_run_source", ("ag_ui",), "agui"),
         ("NativeStreamPartCodec", ("tinkerfin_native_stream",), "native"),
         ("RedisBackend", ("redis",), "redis"),
     ),

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from functools import cache
 from typing import Literal
 
-from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 from pydantic import Field, JsonValue, ValidationError, model_validator
 
 from ._json_schema import SchemaError, require_valid_schema
@@ -431,6 +431,11 @@ def relevant_malformed_hitl_candidate(
 def _checkpoint_tool_call_candidates(
     messages: Sequence[BaseMessage],
 ) -> tuple[tuple[HitlToolCallCandidate, ...], ...]:
+    completed_call_ids = {
+        str(message.tool_call_id)
+        for message in messages
+        if isinstance(message, ToolMessage) and message.tool_call_id
+    }
     candidate_messages: list[tuple[HitlToolCallCandidate, ...]] = []
     seen_call_ids: set[str] = set()
     for message_index, message in enumerate(messages):
@@ -451,6 +456,11 @@ def _checkpoint_tool_call_candidates(
                     "checkpoint tool-call IDs must be unique within a graph scope"
                 )
             seen_call_ids.add(normalized_call_id)
+            # HITL proposals have no ToolMessage yet. Excluding completed historical
+            # calls preserves parallel pending messages without letting an earlier
+            # identical Turn make the current review appear ambiguous.
+            if normalized_call_id in completed_call_ids:
+                continue
             try:
                 args = JsonObject.model_validate(call.get("args"))
             except ValidationError as error:
@@ -467,7 +477,8 @@ def _checkpoint_tool_call_candidates(
                     arguments=args.root,
                 )
             )
-        candidate_messages.append(tuple(candidates))
+        if candidates:
+            candidate_messages.append(tuple(candidates))
     return tuple(candidate_messages)
 
 

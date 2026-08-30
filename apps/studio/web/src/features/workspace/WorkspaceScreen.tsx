@@ -71,6 +71,7 @@ interface PendingResume {
 }
 
 const MESSAGE_RENDER_BATCH_SIZE = 100
+const RESUME_RUN_DEDUPE_LIMIT = 256
 
 const matchesApprovalGroup = (
   approval: ApprovalState | undefined,
@@ -381,6 +382,7 @@ export function WorkspaceScreen({
 
     return conversation.messages.filter((message) => {
       if (message.role !== 'tool') return true
+      if (message.meta?.sourceAgentName) return false
       if (
         activeApprovalToolCallId
         && message.meta?.toolCallId === activeApprovalToolCallId
@@ -391,7 +393,6 @@ export function WorkspaceScreen({
       ) return false
       if (message.meta?.toolName === 'write_todos') return false
       if (message.meta?.toolName === 'PlannerOutcome') return false
-      if (message.meta?.sourceAgentName) return false
       if (message.meta?.toolName === 'task') {
         return message.meta.status !== 'running' && !message.meta.subRunId
       }
@@ -586,13 +587,18 @@ export function WorkspaceScreen({
     if (!isClaimed || startedResumeRunIds.current.has(pendingResume.payload.runId)) return
 
     startedResumeRunIds.current.add(pendingResume.payload.runId)
+    while (startedResumeRunIds.current.size > RESUME_RUN_DEDUPE_LIMIT) {
+      const oldest = startedResumeRunIds.current.values().next().value
+      if (typeof oldest !== 'string') break
+      startedResumeRunIds.current.delete(oldest)
+    }
+    // 同一个 resume runId 在当前页面生命周期内只能启动一次；流结束时不能删除，
+    // 否则仍携带旧 pendingResume 的并发渲染会再次提交已结算审批
     void streamRun(
       pendingResume.threadId,
       pendingResume.payload,
       'resume',
-    ).finally(() => {
-      startedResumeRunIds.current.delete(pendingResume.payload.runId)
-    })
+    )
   }, [pendingResume, streamRun, workspace.conversations])
 
   const submitApproval = useCallback((
@@ -675,14 +681,25 @@ export function WorkspaceScreen({
     })
   }, [conversation.threadId, t, updateCurrent, workspace.currentThreadId])
 
-  const submitPlanInteraction = useCallback(() => {
+  const submitPlanInteraction = useCallback((
+    reviewAction?: 'approve' | 'reject' | 'cancel',
+  ) => {
     const authoritative = latestWorkspace.current.conversations.find(
       (item) => item.threadId === conversation.threadId,
     )
     if (!authoritative?.planInteraction || authoritative.runStatus === 'streaming') return
+    const requested = reviewAction && authoritative.planInteraction.kind === 'review'
+      ? {
+          ...authoritative,
+          planInteraction: {
+            ...authoritative.planInteraction,
+            action: reviewAction,
+          },
+        }
+      : authoritative
     let payload: ChatRequestPayload
     try {
-      payload = buildPlanResumePayload(authoritative)
+      payload = buildPlanResumePayload(requested)
     } catch (error) {
       const message = conversationErrorMessage(error, 'plan_submit_failed')
       updateCurrent((item) => ({
@@ -699,7 +716,14 @@ export function WorkspaceScreen({
       runStatus: 'streaming',
       activeRunId: payload.runId,
       planInteraction: item.planInteraction
-        ? { ...item.planInteraction, submitted: true, error: undefined }
+        ? {
+            ...item.planInteraction,
+            ...(reviewAction && item.planInteraction.kind === 'review'
+              ? { action: reviewAction }
+              : {}),
+            submitted: true,
+            error: undefined,
+          }
         : item.planInteraction,
     })))
     setPendingResume({
@@ -1000,7 +1024,8 @@ export function WorkspaceScreen({
                       ? updater(current as PlanReviewState)
                       : current,
                   )}
-                  onSubmit={submitPlanInteraction}
+                  onSubmit={(action) => submitPlanInteraction(action)}
+                  onCancel={() => submitPlanInteraction('cancel')}
                 />
                 )
                 : undefined}

@@ -197,14 +197,14 @@ CREATE TABLE tinkerfin_trace_writers (
 ) COMMENT='Exclusive Run writer ownership, lease, fence, and terminal reserve';
 
 CREATE TABLE store (
-  prefix VARCHAR(500) NOT NULL COMMENT 'Store 文档命名空间',
-  `key` VARCHAR(150) NOT NULL COMMENT '命名空间内文档键',
-  value JSON NOT NULL COMMENT '文档 JSON 内容',
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '更新时间',
+  prefix VARCHAR(500) NOT NULL COMMENT 'Store document namespace',
+  `key` VARCHAR(150) NOT NULL COMMENT 'Document key within the namespace',
+  value JSON NOT NULL COMMENT 'Document JSON value',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT 'Document creation time',
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT 'Document update time',
   CONSTRAINT pk_store PRIMARY KEY (prefix, `key`),
   KEY store_prefix_idx (prefix)
-) COMMENT='Deep Agents 长期 memory Store';
+) COMMENT='Deep Agents long-term memory Store';
 
 CREATE TABLE tinkerfin_opensandbox_owners (
   namespace VARCHAR(64) NOT NULL COMMENT 'OpenSandbox State 逻辑部署命名空间',

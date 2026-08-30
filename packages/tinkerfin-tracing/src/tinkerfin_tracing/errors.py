@@ -16,6 +16,7 @@ class TracingErrorCode(StrEnum):
     ERROR = "tracing.error"
     INVALID_CURSOR = "tracing.invalid_cursor"
     THREAD_NOT_FOUND = "tracing.thread_not_found"
+    RUN_NOT_FOUND = "tracing.run_not_found"
     AMBIGUOUS_HEAD = "tracing.ambiguous_head"
     RUN_CONFLICT = "tracing.run_conflict"
     CORRUPTION = "tracing.corruption"
@@ -67,6 +68,12 @@ class TraceThreadNotFound(TracingError, LookupError):
     """The selected Trace thread or generation does not exist."""
 
     code = TracingErrorCode.THREAD_NOT_FOUND
+
+
+class TraceRunNotFound(TracingError, LookupError):
+    """The requested Run has not entered the selected Trace generation."""
+
+    code = TracingErrorCode.RUN_NOT_FOUND
 
 
 class AmbiguousTraceHead(TracingError, LookupError):
@@ -145,6 +152,7 @@ __all__ = [
     "TraceProjectionFailed",
     "TraceQuotaExceeded",
     "TraceRunConflict",
+    "TraceRunNotFound",
     "TraceStoreError",
     "TraceStoreProtocolError",
     "TraceStoreTimeout",

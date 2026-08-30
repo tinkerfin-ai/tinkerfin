@@ -231,7 +231,7 @@ def __aiter__(
     return delivery
 
 
-def sse(self: MessageSubscription[ReplayT]) -> AsyncIterator[bytes]:
+def sse(self: MessageSubscription[ReplayT]) -> AsyncGenerator[bytes, None]:
     """Render committed messages while preserving their durable sequences."""
 
     renderer = self._renderer

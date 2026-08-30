@@ -48,7 +48,12 @@ from ._redis_scripts import (
     _RENEW_SCRIPT,
     _RUN_SNAPSHOT_SCRIPT,
 )
-from .backend import BackendRunHandle, FinalRunStatus, RunStatus
+from .backend import (
+    BackendRunHandle,
+    FinalRunStatus,
+    RunStatus,
+    is_final_run_status,
+)
 from .errors import (
     BackendOwnershipLost,
     CancellationUnsupported,
@@ -301,7 +306,7 @@ class _RunSnapshot:
     def terminal(self) -> bool:
         """Return whether the snapshot fixes the run's final message boundary."""
 
-        return self.status in {"completed", "cancelled", "failed", "owner_lost"}
+        return is_final_run_status(self.status)
 
 
 async def begin_settlement(self: RedisBackend, handle: BackendRunHandle) -> bool:
@@ -1081,14 +1086,17 @@ async def _wait_for_snapshot_change(
     """Block on durable data or lifecycle signals, then require a new snapshot."""
 
     blocking_client = self._client.client()
-    read_task: asyncio.Task[None] | None = None
-    try:
-        await _redis_call(
-            "blocking client initialization",
-            blocking_client.initialize(),
-        )
 
-        async def read() -> None:
+    # The task owns the pinned client from initialization through close. HTTP response
+    # cancellation can abandon a nested async-generator await before its outer finally
+    # resumes; keeping cleanup inside the loop-owned task prevents that transport race
+    # from leaking the connection. The caller still cancels and joins the task normally.
+    async def read() -> None:
+        try:
+            await _redis_call(
+                "blocking client initialization",
+                blocking_client.initialize(),
+            )
             await _redis_call(
                 "stream wait",
                 blocking_client.xread(
@@ -1100,32 +1108,39 @@ async def _wait_for_snapshot_change(
                     block=self._wait_block_ms(snapshot.lease_ttl_ms),
                 ),
             )
+        finally:
+            await _redis_call("blocking client close", blocking_client.aclose())
 
-        read_task = asyncio.create_task(
-            read(),
-            name="tinkerfin-messaging-redis-xread",
-        )
-        try:
-            await asyncio.shield(read_task)
-        except asyncio.CancelledError as cancellation:
-            connection = blocking_client.connection
-            if connection is not None:
-                await asyncio.shield(
-                    _redis_call(
-                        "blocking read cancellation",
-                        connection.disconnect(nowait=True),
-                    )
-                )
+    read_task = asyncio.create_task(
+        read(),
+        name="tinkerfin-messaging-redis-xread",
+    )
+    owner_task = asyncio.current_task()
+
+    def cancel_when_owner_finishes(_task: asyncio.Task[object]) -> None:
+        if not read_task.done() and read_task.cancelling() == 0:
             read_task.cancel()
-            await asyncio.gather(read_task, return_exceptions=True)
-            raise cancellation.with_traceback(cancellation.__traceback__)
+
+    def read_finished(task: asyncio.Task[None]) -> None:
+        if owner_task is not None:
+            owner_task.remove_done_callback(cancel_when_owner_finishes)
+        if not task.cancelled():
+            task.exception()
+
+    if owner_task is not None:
+        owner_task.add_done_callback(cancel_when_owner_finishes)
+    read_task.add_done_callback(read_finished)
+    try:
+        await asyncio.shield(read_task)
+    except asyncio.CancelledError as cancellation:
+        if not read_task.done() and read_task.cancelling() == 0:
+            read_task.cancel()
+        await asyncio.gather(read_task, return_exceptions=True)
+        raise cancellation.with_traceback(cancellation.__traceback__)
     finally:
-        if read_task is not None and not read_task.done():
+        if not read_task.done() and read_task.cancelling() == 0:
             read_task.cancel()
-            await asyncio.gather(read_task, return_exceptions=True)
-        await asyncio.shield(
-            _redis_call("blocking client close", blocking_client.aclose())
-        )
+        await asyncio.gather(read_task, return_exceptions=True)
 
 
 def _wait_block_ms(self: RedisBackend, lease_ttl_ms: int) -> int:

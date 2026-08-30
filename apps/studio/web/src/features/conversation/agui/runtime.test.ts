@@ -3,7 +3,14 @@ import { describe, expect, it } from 'vitest'
 import type { ConversationAgUiEvent, InterruptEvent } from '../../../api/conversation/types'
 import { buildEmptyConversation } from '../../../lib/workspace'
 import type { ApprovalAllowedDecision, ApprovalItem, Conversation } from '../../../types'
-import { applyConversationEvent, buildResumePayload, markConversationDetached, prepareResumeSubmission } from './runtime'
+import {
+  applyConversationEvent,
+  buildPlanResumePayload,
+  buildResumePayload,
+  markConversationDetached,
+  planInteractionFromTracePayload,
+  prepareResumeSubmission,
+} from './runtime'
 
 const THREAD_ID = 'thread-order-check'
 const RUN_ID = 'run-order-check'
@@ -124,6 +131,231 @@ function nativeContractEvents(): ConversationAgUiEvent[] {
     { type: 'RUN_FINISHED', threadId: THREAD_ID, runId: RUN_ID, outcome: { type: 'success' } },
   ]
 }
+
+it('parses bounded time clarification and submits an RFC time answer', () => {
+  const interaction = planInteractionFromTracePayload('plan-time', {
+    schema: 'tinkerfin.runtime-interrupt',
+    kind: 'tinkerfin:plan_clarification',
+    message: 'Choose a time',
+    responseSchema: {},
+    metadata: {
+      origin: 'plan',
+      clarification: {
+        form: {
+          title: '确认时间',
+          description: '用于安排执行窗口',
+          questions: [{
+            id: 'deployment-time',
+            answerType: 'time',
+            prompt: '何时执行？',
+            required: true,
+            timeZone: 'Asia/Shanghai',
+            minimum: '09:00:00',
+            maximum: '18:00:00',
+          }],
+        },
+      },
+    },
+  })
+  if (!interaction || interaction.kind !== 'questions') {
+    throw new Error('测试夹具必须产生 Plan 时间澄清')
+  }
+  expect(interaction.questions[0]).toMatchObject({
+    answerType: 'time',
+    timeZone: 'Asia/Shanghai',
+    minimum: '09:00',
+    maximum: '18:00',
+  })
+  const answered = {
+    ...interaction,
+    questions: interaction.questions.map((question) => question.answerType === 'time'
+      ? { ...question, time: '09:30' }
+      : question),
+  }
+  const payload = buildPlanResumePayload({
+    ...buildEmptyConversation({
+      threadId: THREAD_ID,
+      now: '2026-08-30T00:00:00.000Z',
+      model: 'main',
+    }),
+    planInteraction: answered,
+  })
+
+  expect(payload.resume?.[0]?.payload).toEqual({
+    type: 'respond',
+    answers: {
+      'deployment-time': {
+        status: 'answered',
+        answerType: 'time',
+        time: '09:30:00',
+      },
+    },
+  })
+})
+
+it('parses a zoned datetime clarification and submits one local minute', () => {
+  const interaction = planInteractionFromTracePayload('plan-datetime', {
+    schema: 'tinkerfin.runtime-interrupt',
+    kind: 'tinkerfin:plan_clarification',
+    responseSchema: {},
+    metadata: {
+      origin: 'plan',
+      clarification: {
+        form: {
+          title: '确认执行时间',
+          description: '用于安排唯一执行时间点',
+          questions: [{
+            id: 'deployment-at',
+            answerType: 'datetime',
+            prompt: '何时执行？',
+            required: true,
+            timeZone: 'Asia/Shanghai',
+            minimum: '2026-08-30T09:00:00',
+            maximum: '2026-09-30T18:00:00',
+          }],
+        },
+      },
+    },
+  })
+  if (!interaction || interaction.kind !== 'questions') {
+    throw new Error('测试夹具必须产生 Plan 日期时间澄清')
+  }
+  expect(interaction.questions[0]).toMatchObject({
+    answerType: 'datetime',
+    timeZone: 'Asia/Shanghai',
+    minimum: '2026-08-30T09:00',
+    maximum: '2026-09-30T18:00',
+  })
+  const answered = {
+    ...interaction,
+    questions: interaction.questions.map((question) => question.answerType === 'datetime'
+      ? { ...question, dateTime: '2026-08-30T09:30' }
+      : question),
+  }
+
+  const payload = buildPlanResumePayload({
+    ...buildEmptyConversation({
+      threadId: THREAD_ID,
+      now: '2026-08-30T00:00:00.000Z',
+      model: 'main',
+    }),
+    planInteraction: answered,
+  })
+
+  expect(payload.resume?.[0]?.payload).toEqual({
+    type: 'respond',
+    answers: {
+      'deployment-at': {
+        status: 'answered',
+        answerType: 'datetime',
+        dateTime: '2026-08-30T09:30:00',
+      },
+    },
+  })
+})
+
+it('uses each Plan review interrupt response Schema as its action authority', () => {
+  const interaction = planInteractionFromTracePayload('plan-review-actions', {
+    schema: 'tinkerfin.runtime-interrupt',
+    kind: 'tinkerfin:plan_review',
+    responseSchema: {
+      discriminator: {
+        propertyName: 'type',
+        mapping: {
+          approve: '#/$defs/ApprovePlan',
+          reject: '#/$defs/RejectPlan',
+          cancel: '#/$defs/CancelPlan',
+        },
+      },
+    },
+    metadata: {
+      origin: 'plan',
+      review: {
+        draft: {
+          revision: 1,
+          contentSchema: {
+            fingerprint: '0'.repeat(64),
+            mediaType: 'text/markdown',
+          },
+          content: {
+            description: 'Review one Plan',
+            markdown: '# Plan',
+          },
+        },
+      },
+    },
+  })
+
+  expect(interaction).toMatchObject({
+    kind: 'review',
+    allowedActions: ['approve', 'reject', 'cancel'],
+  })
+})
+
+it('keeps reject and cancel in Plan mode while only approval exits', () => {
+  const conversation = buildEmptyConversation({
+    threadId: THREAD_ID,
+    now: '2026-08-30T00:00:00.000Z',
+    model: 'main',
+  })
+  conversation.planInteraction = {
+    kind: 'review',
+    interruptId: 'plan-review-decision',
+    revision: 2,
+    allowedActions: ['approve', 'reject', 'cancel'],
+    submitted: false,
+    action: 'reject',
+    message: 'Use a smaller scope',
+    draft: {
+      revision: 2,
+      contentSchema: {
+        fingerprint: '0'.repeat(64),
+        mediaType: 'text/markdown',
+      },
+      content: {
+        description: 'Review the current execution Plan',
+        markdown: '# Original Plan',
+      },
+    },
+  }
+
+  const rejected = buildPlanResumePayload(conversation)
+
+  expect(rejected.forwardedProps).toEqual({ model: 'main', command: { plan: 'on' } })
+  expect(rejected.resume?.[0]).toEqual({
+    interruptId: 'plan-review-decision',
+    status: 'resolved',
+    payload: {
+      type: 'reject',
+      baseRevision: 2,
+      message: 'Use a smaller scope',
+    },
+  })
+  if (!conversation.planInteraction || conversation.planInteraction.kind !== 'review') {
+    throw new Error('测试夹具必须保留 Plan 审阅')
+  }
+  const review = conversation.planInteraction
+  const cancelled = buildPlanResumePayload({
+    ...conversation,
+    planInteraction: {
+      ...review,
+      action: 'cancel',
+      message: undefined,
+    },
+  })
+  expect(cancelled.forwardedProps).toEqual({ model: 'main', command: { plan: 'on' } })
+  expect(cancelled.resume?.[0]).toEqual({
+    interruptId: 'plan-review-decision',
+    status: 'resolved',
+    payload: { type: 'cancel', baseRevision: 2 },
+  })
+  const approved = buildPlanResumePayload({
+    ...conversation,
+    planInteraction: { ...review, action: 'approve', message: undefined },
+  })
+  expect(approved.forwardedProps).toEqual({ model: 'main', command: { plan: 'off' } })
+  expect(approved.resume?.[0]?.payload).toEqual({ type: 'approve', baseRevision: 2 })
+})
 
 function interrupt(
   overrides: Partial<InterruptEvent> & Pick<InterruptEvent, 'id'>,

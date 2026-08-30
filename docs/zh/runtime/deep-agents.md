@@ -80,15 +80,20 @@ Plan Mode 按下面的边界处理请求：
 
 1. 一个只读 Planner 判断意图和约束是否充分
 2. Planner 只能使用 `ls`、`read_file`、`glob` 和 `grep`
-3. 每道澄清问题由 Planner 选择 `single_choice`、`multiple_choice`、`text` 或 `date`，需求澄清和计划审批通过 LangGraph interrupt 暂停
+3. 每道澄清问题由 Planner 选择 `single_choice`、`multiple_choice`、`text`、`date`、`time` 或 `datetime`，需求澄清和计划审批通过 LangGraph interrupt 暂停
 4. 用户批准后冻结 `ConfirmedPlan`，以原用户消息 ID 提交确定性 handoff，并立即启动原生 Deep Agent
 
 Plan 审阅默认允许 `PlanReviewAction.APPROVE`、`RESPOND` 和 `REJECT`。如需改变允许动作，
 通过 `allowed_review_actions` 传入非空且不重复的有序集合；响应 Schema 只包含实际配置的动作。只有宿主
 提供可信计划编辑器时才应显式启用 `EDIT`。
 
-选择 Plan 时必须提供明确 Planner 模型和具体 `BaseCheckpointSaver`。TinkerFin 不会自动创建
-进程内 saver，也不会静默降低 durability；生产环境必须提供生产级 saver。Planning 与原生
+只有批准会退出 Plan 模式并开始原生执行。拒绝会使当前草稿失效，接受可选原因，生成一次用户可见的
+Planner 回复，然后等待下一条 Plan 输入。显式配置的 `CANCEL` 采用相同续接但不携带原因。AG-UI
+传输层取消仍表示放弃，不会调用 Planner。
+
+选择 Plan 时必须提供具体 `BaseCheckpointSaver` 和一个显式模型。Agent Definition 已提供
+`model` 时可以省略 `planner_model`；两者都省略会被拒绝。TinkerFin 不会自动创建进程内 saver，
+也不会静默降低 durability；生产环境必须提供生产级 saver。Planning 与原生
 Deep Agent 借用同一个 saver、Store、cache、backend 和 runtime context。恢复时必须保持同一个
 `RunIdentity.threadId`。Plan 状态位于根状态的 `tinkerfin_plan` 字段，`PlanContentModel`、
 内置结构化与 Markdown 内容类型、`PlanDraft`、`ConfirmedPlan`、`PlanHandoff`、`PlanState`
@@ -123,17 +128,21 @@ Planner 只拥有用于按需检查 workspace 的只读文件工具；这份受�
 开始执行，不会再次索要通用 Plan 审批；执行过程中仍保留 `write_file` 等 Tool 自身配置的人工审批。
 
 `.plan(...)` 省略 `clarification_schema` 时使用内置 `DefaultClarificationForm`。
-`BuiltInClarificationForm[QuestionAttributes, OptionModel]` 可以一次为四类内置题型增加共享强类型
+`BuiltInClarificationForm[QuestionAttributes, OptionModel]` 可以一次为六类内置题型增加共享强类型
 metadata，不需要分别创建题型子类。宿主也可以提供只包含客户端已支持题型的具体
 `ClarificationForm` 联合。attributes 会公开给用户，属于模型生成的规划参考，不能直接作为权限、
 计费或合规依据。
 
 Choice 题在 Python 使用 `allow_free_text`，JSON 使用 `allowFreeText`。多选题还声明
 `min_selections` 和可选 `max_selections`，已选 Option ID 可以和一个自定义答案共存。文本答案必须
-非空；日期固定使用不含时间和时区的 `YYYY-MM-DD`。完整回答以 checkpoint question ID 为 key，
+非空；日期固定使用不含时间和时区的 `YYYY-MM-DD`。时间答案表示题目所声明 IANA 时区中的本地分钟，
+可选的 `minimum` 和 `maximum` 是包含边界且不得跨越午夜。完整回答以 checkpoint question ID 为 key，
 每个 value 使用 `status: answered` 和对应 `answerType`，可选题跳过时使用 `status: skipped`。
 Planning 在 Graph resume 前校验 pending 的精确响应 Schema，从可信 Form 派生 Option label、规范化
 答案顺序，并把明确跳过保留为 Planner 上下文。
+日期时间题要求 IANA 时区并接收一个本地日期与分钟，范围可以跨日期；规范化会增加唯一 UTC
+`instant`，DST 不存在时间或重复的本地分钟会被拒绝。
+
 
 完全自定义语义题型通过 `clarification_type(...)` 注册。一个冻结描述符同时提供无版本 namespaced
 ID、模型选择说明、Question/Response Model、可选的逐题 Schema 与校验器，以及 canonical JSON
@@ -147,107 +156,90 @@ normalizer。所有 callback 必须同步、确定性且不执行外部 I/O；�
 Plan Mode 固定使用 `sync` checkpoint durability。通常省略 `durability` 即可；显式传入
 `sync` 也可以，`async` 和 `exit` 会在事件流开始前报错。
 
-在创建 Runtime 时选择本次请求的 mode：
+每次 managed run 都可以选择 mode：
 
 ```python
-plan_runtime = agent.new(
-    identity=RunIdentity(threadId="project-7", runId="run-1"),
+plan_stream = await tinkerfin.open_run(
+    RunIdentity(threadId="project-7", runId="run-1"),
+    agent=agent,
+    input=graph_input,
     mode="plan",
 )
-default_runtime = agent.new_agui(
-    identity=RunIdentity(threadId="project-7", runId="run-2"),
+default_events = await tinkerfin.open_agui_run(
+    RunIdentity(threadId="project-7", runId="run-2"),
+    agent=agent,
+    input=graph_input,
     mode="default",
 )
 ```
 
-`default` 使用原生 topology，并包含 TinkerFin 私有 resume marker；`plan` 使用独立 Planning Graph。批准后在原生执行前
-把有效 mode 切为 `default`。同一 checkpoint thread 的后续请求可以再次选择 Plan；Plan resume
-回到 Planning，Tool 与子 Agent resume 直接回到原生 Graph。
+`default` 使用原生 topology；`plan` 使用独立 Planning Graph。批准后在原生执行前把有效 mode
+切为 `default`。同一 checkpoint thread 后续可以再次选择 Plan；Plan resume 回到 Planning，
+Tool 与子 Agent resume 回到原生 Graph。
 
-## 创建一次原生 Runtime
+## 打开一次 managed 原生运行
 
 ```python
-runtime = agent.new(
-    identity=RunIdentity(threadId="project-7", runId="run-1"),
+stream = await tinkerfin.open_run(
+    RunIdentity(threadId="project-7", runId="run-1"),
+    agent=agent,
+    input={"messages": [{"role": "user", "content": "检查这个项目"}]},
     mode="default",
-    on_part=None,
+    config=config,
+    context=context,
+    on_native_part=record_part,
 )
 ```
 
 | 参数 | 默认值 | 作用 |
 | --- | --- | --- |
-| `identity` | 必填 | 本次运行的 `threadId` 与 `runId`，也用于 checkpoint 和并发协调 |
+| `identity` | 必填 | checkpoint 与协调共用的 thread 和 run 身份 |
+| `agent` | 必填 | Definition，或返回 Definition 的同步/异步 callable |
+| `input` | 必填 | 新 state、原生 `Command` 或 `None` |
 | `mode` | Definition 默认值 | `default` 或 `plan`；普通 Definition 只接受 `default` |
-| `on_part` | `None` | 每条原生数据返回给调用方之前执行的观察函数 |
+| `config` | `None` | tags、metadata、递归限制等 Graph 配置 |
+| `context` | `None` | 与 `context_schema` 对应的 Runtime context |
+| `on_native_part` | `None` | 每条原生数据交给消费方前执行的异步观察函数 |
+| 其他关键字参数 | 无 | 当前 Profile 支持的 Graph stream 参数 |
 
-## 启动运行
+一般不在 `config` 中重复填写 `configurable.thread_id`。显式相同值可以使用，不同值会在 Graph
+迭代、Observation 与协调启动前报错。所选 Profile 负责必需 stream mode、version、subgraph
+范围与完整 state 输出。
 
-```python
-stream = runtime.astream(
-    {"messages": [{"role": "user", "content": "检查这个项目"}]},
-)
-```
+`on_native_part` 会在交付路径中等待。不要在其中执行阻塞网络或数据库访问，应使用异步客户端。
 
-### 输入和配置
+## 复用 Direct Graph
 
-| 参数 | 默认值 | 作用 |
-| --- | --- | --- |
-| `input` | 必填 | 新消息、状态输入、`Command` 或 `None` |
-| `config` | `None` | thread、tags、metadata、递归限制等运行配置 |
-| `context` | `None` | 与 `context_schema` 对应的运行上下文 |
-
-一般不用在 `config` 中重复填写 `configurable.thread_id`。如果显式填写，相同值可以使用；与 `RunIdentity.threadId` 不同会在 Graph 迭代、观察器和 coordinator 启动前报错。
-
-### 输出控制
-
-| 参数 | 默认值 | 作用 |
-| --- | --- | --- |
-| `stream_mode` | 由 Profile 固定 | 必需语义 mode 始终存在，可以增加受支持的额外 mode |
-| `print_mode` | `()` | 额外打印指定模式，不改变返回内容 |
-| `output_keys` | 由 Profile 固定 | 必须保持 Profile 所需的完整 state 合同 |
-| `subgraphs` | 由 Profile 固定 | 保持 Profile 所需的完整 Graph scope |
-| `version` | 由 Profile 固定 | 冲突的上游 version 会在 Graph 迭代前报错 |
-| `debug` | `None` | 覆盖本次运行的调试设置 |
-
-### 中断和持久化控制
-
-| 参数 | 默认值 | 作用 |
-| --- | --- | --- |
-| `interrupt_before` | `None` | 在指定节点执行前暂停 |
-| `interrupt_after` | `None` | 在指定节点执行后暂停 |
-| `durability` | `None` | 控制 checkpoint 持久化时机；Planning 与 handoff 必须使用 `sync` |
-| `control` | `None` | 传入 LangGraph 运行控制信息 |
-| 其他关键字参数 | 无 | 沿用当前 LangGraph 支持的附加运行参数 |
-
-必需 profile 用于提供完整 Runtime 与 Trace 语义。只有消费方还需要其他数据时，才增加
-`updates`、`checkpoints`、`debug` 或 `custom`。
-
-## 观察每一条数据
-
-`on_part` 必须是异步函数。它在数据交给你的 `async for` 之前执行。
+不需要 managed run 生命周期的高级集成可以创建一个异步 Runnable，并跨 thread ID 复用：
 
 ```python
-async def record_part(part: object) -> None:
-    print("received", part)
-
-
-runtime = agent.new(identity=identity, on_part=record_part)
+graph = await agent.create_graph(mode="plan")
+state = await graph.ainvoke(graph_input, config=config)
+async for part in graph.astream(graph_input, config=config):
+    consume(part)
 ```
 
-观察函数抛出的异常会终止运行。不要在其中执行阻塞网络请求；需要写数据库或调用服务时使用异步客户端。
+Direct Graph 负责 Plan/native 路由和基于 checkpoint 的 resume 选择，但不会创建 `RunIdentity`、
+Runtime Observation、Trace、AG-UI、Messaging 或宿主业务状态。Direct resume 使用 LangGraph
+`Command(resume=...)`。
 
 ## 常见问题
 
-### 第二次调用 `astream()` 报错
+### 同一个 managed stream 第二次迭代报错
 
-Runtime 是一次性的。重新调用 `agent.new()`。
+Managed stream 只能使用一次。下一个运行使用新的 run identity 再调用 `open_run()`。
 
 ### 会话没有延续
 
-确认 Agent 配置了 checkpointer，并且后续运行使用相同的 `RunIdentity.threadId`。
+确认 Agent 配置了 checkpointer，并且后续运行复用同一个 `RunIdentity.threadId`。
 
-### 异步服务启动时卡顿
+### Graph 构造阻塞事件循环
 
-`agent.new()` 会同步创建 Graph。如果建图较重，在异步服务器中通过受控线程边界调用它。
+内置 Profile 会通过 AnyIO 有容量限制的 worker 边界调用锁定的同步 Deep Agents factory。
+不要在应用层为 `open_run()`、`open_agui_run()` 或 `create_graph()` 再套一层构造线程。
+
+自定义 Profile 的 factory 原生异步时，可以实现 `create_agent_graph(factory, args, kwargs)`。
+未实现这个可选方法的 Profile 继续拥有自己的同步 factory，由 Core 通过同一个有容量限制的 worker
+边界调用。
 
 下一篇：[事件流与 SSE](streams-and-sse.md)。

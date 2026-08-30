@@ -60,7 +60,7 @@ Graph 关联或持久化身份；Service 会为 Graph 输入与 Trace 快照分�
 
 请求边界不接受 `forwardedProps.mode`。`command.plan=on` 在 run 准备阶段转换为内部
 `AgentMode.plan`，`command.plan=off` 转换为 `AgentMode.default`；Trace state 和框架
-`new_agui(mode=...)` 使用内部模式，不把该字段重新暴露到 HTTP 契约。command 对象允许
+`open_agui_run(mode=...)` 使用内部模式，不把该字段重新暴露到 HTTP 契约。command 对象允许
 保留未来命令字段，但当前服务端只解释 `plan`。
 
 模型目录中的 `runtime_profile` 为必填值。当前 Worker 只注册 `deepagents-v2`；Run 注册会固定
@@ -93,6 +93,8 @@ LangGraph Store 由 `tinkerfin-langgraph-mysql` 通过 asyncmy 管理一条独�
 `setup.sh` 创建部署专用 `.env` 和权限为 `0600` 的文件型 Secrets。默认部署启动
 Studio、MySQL、Redis Control、Redis Runtime、OpenSandbox 和一次性数据库初始化服务，只向
 宿主机回环地址发布 Studio 端口。两个 Redis 使用独立 Secret、AOF 卷与健康检查。
+OpenSandbox 的 SQLite Store 与 Docker runtime metadata 分别使用持久卷；后者保留运行中 Sandbox
+续期后的过期时间，使 OpenSandbox Server 容器重建后不会退回创建时的旧时间。
 
 ## 外部依赖模式
 
@@ -108,7 +110,8 @@ Studio、MySQL、Redis Control、Redis Runtime、OpenSandbox 和一次性数据�
 ## 运行约束
 
 - `/health/live` 只表示进程存活
-- `/health/ready` 独立检查 MySQL、Redis Control、Redis Runtime 与 OpenSandbox，就绪失败返回 503
+- `/health/ready` 独立检查 MySQL、Redis Control、Redis Runtime、OpenSandbox 控制面与真实预热容量，
+  就绪失败返回 503
 - `DATABASE_CONNECTION_BUDGET` 必须覆盖共享 SQLAlchemy 池和一条 Agent Store connection；
   启动时还会用 `@@max_connections` 校验 `DATABASE_MANAGEMENT_CONNECTION_RESERVE`
 - `MESSAGING_RETENTION_SECONDS` 默认 `86400`，只定义终态后的网络重播窗口；`0` 关闭自动过期

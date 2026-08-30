@@ -11,6 +11,7 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, call, patch
 from uuid import UUID
 
+import httpx
 import pytest
 from deepagents.backends.protocol import INVALID_PATH, ExecuteResponse
 from opensandbox import Sandbox
@@ -30,12 +31,89 @@ from pydantic import ValidationError
 
 from tinkerfin_sandbox import (
     OpenSandboxBackend,
+    OpenSandboxBackendTimeoutError,
     OpenSandboxBackendUnavailableError,
     OpenSandboxClient,
     OpenSandboxConfig,
     OpenSandboxRuntimeInfo,
     UnexpectedOpenSandboxBackendError,
 )
+
+
+class _ObservedTransport(httpx.AsyncBaseTransport):
+    """Expose whether the client-owned SDK transport reached final closure."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        del request
+        raise AssertionError("observed transport must not perform network I/O")
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _BlockingObservedTransport(_ObservedTransport):
+    """Hold transport closure so cancellation ownership can be observed."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.close_calls = 0
+        self.close_entered = asyncio.Event()
+        self.close_gate = asyncio.Event()
+        self.close_cancelled = False
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+        self.close_entered.set()
+        try:
+            await self.close_gate.wait()
+        except asyncio.CancelledError:
+            self.close_cancelled = True
+            raise
+        self.closed = True
+
+
+class _FirstCloseCancelsTransport(_ObservedTransport):
+    """Cancel one close attempt so the client's retry ownership is observable."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.close_calls = 0
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+        if self.close_calls == 1:
+            raise asyncio.CancelledError
+        self.closed = True
+
+
+class _FirstCloseFailsTransport(_ObservedTransport):
+    """Fail one close attempt so ordinary retry ownership can be observed."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.close_calls = 0
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+        if self.close_calls == 1:
+            raise RuntimeError("transport close failed")
+        self.closed = True
+
+
+def _assert_scoped_sdk_connection(
+    actual: ConnectionConfig,
+    public: ConnectionConfig,
+) -> None:
+    """Require an equivalent SDK config with one client-scoped transport."""
+
+    assert actual is not public
+    assert actual.transport is not None
+    assert actual.model_dump(exclude={"transport"}) == public.model_dump(
+        exclude={"transport"}
+    )
 
 
 class _FakeCommands:
@@ -400,6 +478,20 @@ class OpenSandboxBackendTests(unittest.IsolatedAsyncioTestCase):
                 ),
             ):
                 operation()
+
+    async def test_runtime_info_skips_data_plane_for_terminal_status(self) -> None:
+        sandbox = _FakeSandbox()
+        sandbox.info.status.state = "Failed"
+        sandbox.info.status.reason = "CONTAINER_EXITED_ERROR"
+        backend = OpenSandboxBackend(sandbox=cast(Sandbox, sandbox))
+
+        details = await backend.aget_runtime_info()
+
+        self.assertTrue(details.available)
+        self.assertFalse(details.healthy)
+        assert details.status is not None
+        self.assertEqual(details.status.state, "Failed")
+        self.assertEqual(sandbox.commands.calls, [])
 
     async def test_download_files_preserves_binary_data_and_partial_success(
         self,
@@ -1165,7 +1257,10 @@ class OpenSandboxClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["resource"], self.config.resource)
         self.assertEqual(kwargs["timeout"], self.config.ttl)
         self.assertEqual(kwargs["ready_timeout"], self.config.ready_timeout)
-        self.assertIs(kwargs["connection_config"], self.connection_config)
+        _assert_scoped_sdk_connection(
+            kwargs["connection_config"],
+            self.connection_config,
+        )
 
     async def test_create_uses_native_async_sdk_and_passes_volumes(self) -> None:
         volume = Volume(
@@ -1291,10 +1386,15 @@ class OpenSandboxClientTests(unittest.IsolatedAsyncioTestCase):
         ):
             await client.connect("existing")
 
-        connect.assert_called_once_with(
-            "existing",
-            connection_config=self.connection_config,
-            connect_timeout=self.config.connect_timeout,
+        connect.assert_called_once()
+        self.assertEqual(connect.call_args.args, ("existing",))
+        self.assertEqual(
+            connect.call_args.kwargs["connect_timeout"],
+            self.config.connect_timeout,
+        )
+        _assert_scoped_sdk_connection(
+            connect.call_args.kwargs["connection_config"],
+            self.connection_config,
         )
         self.assertTrue(sandbox.closed)
         self.assertFalse(sandbox.killed)
@@ -1331,6 +1431,66 @@ class OpenSandboxClientTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(connect_finished.wait(), timeout=1)
             with self.assertRaises(asyncio.CancelledError):
                 await connect_task
+
+        self.assertTrue(sandbox.closed)
+        self.assertFalse(sandbox.killed)
+
+    async def test_connect_timeout_bounds_the_complete_sdk_reconnect(self) -> None:
+        entered = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def blocked_connect(
+            *_args: object,
+            **_kwargs: object,
+        ) -> _FakeSandbox:
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+            raise AssertionError("blocked connect unexpectedly resumed")
+
+        client = OpenSandboxClient(
+            connection_config=self.connection_config,
+            config=self.config.model_copy(
+                update={"connect_timeout": timedelta(milliseconds=25)}
+            ),
+        )
+        with (
+            patch(
+                "tinkerfin_sandbox.lifecycle.client.Sandbox.connect",
+                side_effect=blocked_connect,
+            ),
+            self.assertRaises(OpenSandboxBackendTimeoutError),
+        ):
+            await asyncio.wait_for(client.connect("existing"), timeout=0.5)
+
+        self.assertTrue(entered.is_set())
+        self.assertTrue(cancelled.is_set())
+
+    async def test_connect_timeout_closes_a_backend_blocked_in_initializer(
+        self,
+    ) -> None:
+        sandbox = _FakeSandbox("existing")
+
+        async def blocked_initializer(_backend: OpenSandboxBackend) -> None:
+            await asyncio.Event().wait()
+
+        client = OpenSandboxClient(
+            connection_config=self.connection_config,
+            config=self.config.model_copy(
+                update={"connect_timeout": timedelta(milliseconds=25)}
+            ),
+            initializers=(blocked_initializer,),
+        )
+        with (
+            patch(
+                "tinkerfin_sandbox.lifecycle.client.Sandbox.connect",
+                return_value=sandbox,
+            ),
+            self.assertRaises(OpenSandboxBackendTimeoutError),
+        ):
+            await asyncio.wait_for(client.connect("existing"), timeout=0.5)
 
         self.assertTrue(sandbox.closed)
         self.assertFalse(sandbox.killed)
@@ -1418,11 +1578,16 @@ class OpenSandboxClientTests(unittest.IsolatedAsyncioTestCase):
         ) as connect:
             await client.destroy("existing")
 
-        connect.assert_called_once_with(
-            "existing",
-            connection_config=self.connection_config,
-            connect_timeout=self.config.connect_timeout,
-            skip_health_check=True,
+        connect.assert_called_once()
+        self.assertEqual(connect.call_args.args, ("existing",))
+        self.assertEqual(
+            connect.call_args.kwargs["connect_timeout"],
+            self.config.connect_timeout,
+        )
+        self.assertTrue(connect.call_args.kwargs["skip_health_check"])
+        _assert_scoped_sdk_connection(
+            connect.call_args.kwargs["connection_config"],
+            self.connection_config,
         )
         self.assertTrue(sandbox.killed)
         self.assertTrue(sandbox.closed)
@@ -1579,6 +1744,189 @@ async def test_rooted_file_operation_uses_isolated_internal_command_context() ->
         "PROJECT_ENV": "enabled",
         "PYTHONPATH": "/workspace",
     }
+
+
+@pytest.mark.asyncio
+async def test_connect_timeout_retains_owned_transport_until_client_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = _ObservedTransport()
+    observed_configs: list[ConnectionConfig] = []
+    entered = asyncio.Event()
+
+    async def blocked_connect(
+        _sandbox_id: str,
+        *,
+        connection_config: ConnectionConfig,
+        **_options: object,
+    ) -> Sandbox:
+        observed_configs.append(connection_config)
+        entered.set()
+        await asyncio.Event().wait()
+        raise AssertionError("cancelled SDK connect unexpectedly resumed")
+
+    monkeypatch.setattr(
+        "opensandbox.config.connection.httpx.AsyncHTTPTransport",
+        lambda **_options: transport,
+    )
+    monkeypatch.setattr(
+        "tinkerfin_sandbox.lifecycle.client.Sandbox.connect",
+        blocked_connect,
+    )
+    client = OpenSandboxClient(
+        connection_config=ConnectionConfig(),
+        config=OpenSandboxConfig(
+            warm_pool_size=0,
+            connect_timeout=timedelta(milliseconds=25),
+        ),
+    )
+
+    with pytest.raises(OpenSandboxBackendTimeoutError):
+        await asyncio.wait_for(client.connect("existing"), timeout=0.5)
+
+    assert entered.is_set()
+    assert observed_configs[0].transport is transport
+    assert transport.closed is False
+    await client.aclose()
+    assert transport.closed is True
+
+
+@pytest.mark.asyncio
+async def test_inspect_cancellation_retains_owned_transport_until_client_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = _ObservedTransport()
+    observed_configs: list[ConnectionConfig] = []
+    entered = asyncio.Event()
+
+    async def blocked_connect(
+        _sandbox_id: str,
+        *,
+        connection_config: ConnectionConfig,
+        **_options: object,
+    ) -> Sandbox:
+        observed_configs.append(connection_config)
+        entered.set()
+        await asyncio.Event().wait()
+        raise AssertionError("cancelled SDK inspection unexpectedly resumed")
+
+    monkeypatch.setattr(
+        "opensandbox.config.connection.httpx.AsyncHTTPTransport",
+        lambda **_options: transport,
+    )
+    monkeypatch.setattr(
+        "tinkerfin_sandbox.lifecycle.client.Sandbox.connect",
+        blocked_connect,
+    )
+    client = OpenSandboxClient(
+        connection_config=ConnectionConfig(),
+        config=OpenSandboxConfig(warm_pool_size=0),
+    )
+    inspection = asyncio.create_task(client.inspect("existing"))
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    inspection.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await inspection
+
+    assert observed_configs[0].transport is transport
+    assert transport.closed is False
+    await client.aclose()
+    assert transport.closed is True
+
+
+@pytest.mark.asyncio
+async def test_client_never_closes_a_caller_owned_transport() -> None:
+    transport = _ObservedTransport()
+    client = OpenSandboxClient(
+        connection_config=ConnectionConfig(transport=transport),
+        config=OpenSandboxConfig(warm_pool_size=0),
+    )
+
+    await client.aclose()
+
+    assert transport.closed is False
+
+
+@pytest.mark.asyncio
+async def test_client_close_retains_owned_transport_across_waiter_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = _BlockingObservedTransport()
+    monkeypatch.setattr(
+        "opensandbox.config.connection.httpx.AsyncHTTPTransport",
+        lambda **_options: transport,
+    )
+    client = OpenSandboxClient(
+        connection_config=ConnectionConfig(),
+        config=OpenSandboxConfig(warm_pool_size=0),
+    )
+    first = asyncio.create_task(client.aclose())
+    await asyncio.wait_for(transport.close_entered.wait(), timeout=1)
+    first.cancel()
+    second = asyncio.create_task(client.aclose())
+    await asyncio.sleep(0)
+
+    assert transport.close_cancelled is False
+    assert second.done() is False
+    transport.close_gate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    await second
+    await client.aclose()
+
+    assert transport.closed is True
+    assert transport.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_client_close_retries_when_the_owned_close_task_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = _FirstCloseCancelsTransport()
+    monkeypatch.setattr(
+        "opensandbox.config.connection.httpx.AsyncHTTPTransport",
+        lambda **_options: transport,
+    )
+    client = OpenSandboxClient(
+        connection_config=ConnectionConfig(),
+        config=OpenSandboxConfig(warm_pool_size=0),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await client.aclose()
+    assert transport.closed is False
+
+    await client.aclose()
+
+    assert transport.closed is True
+    assert transport.close_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_client_close_reports_an_owned_transport_failure_and_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = _FirstCloseFailsTransport()
+    monkeypatch.setattr(
+        "opensandbox.config.connection.httpx.AsyncHTTPTransport",
+        lambda **_options: transport,
+    )
+    client = OpenSandboxClient(
+        connection_config=ConnectionConfig(),
+        config=OpenSandboxConfig(warm_pool_size=0),
+    )
+
+    with pytest.raises(UnexpectedOpenSandboxBackendError) as captured:
+        await client.aclose()
+
+    assert isinstance(captured.value.__cause__, RuntimeError)
+    assert transport.closed is False
+
+    await client.aclose()
+
+    assert transport.closed is True
+    assert transport.close_calls == 2
 
 
 @pytest.mark.asyncio
@@ -1803,10 +2151,14 @@ async def test_create_recovers_one_candidate_after_unknown_result(
     ]
     assert sdk_manager.killed_ids == []
     assert sdk_manager.closed
-    connect.assert_awaited_once_with(
-        "recovered-sandbox",
-        connection_config=client.connection_config,
-        connect_timeout=client.config.connect_timeout,
+    connect.assert_awaited_once()
+    awaited = connect.await_args
+    assert awaited is not None
+    assert awaited.args == ("recovered-sandbox",)
+    assert awaited.kwargs["connect_timeout"] == client.config.connect_timeout
+    _assert_scoped_sdk_connection(
+        awaited.kwargs["connection_config"],
+        client.connection_config,
     )
 
 

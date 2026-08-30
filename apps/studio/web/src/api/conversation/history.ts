@@ -67,6 +67,10 @@ export interface TraceNode {
   runId: string
   namespace: string[]
   sourceId?: string | null
+  input?: JsonValue | null
+  inputOmitted: boolean
+  result?: JsonValue | null
+  resultOmitted: boolean
   status: 'running' | 'waiting' | 'succeeded' | 'failed' | 'cancelled' | 'abandoned' | 'unknown'
   startedAt: string
   completedAt?: string | null

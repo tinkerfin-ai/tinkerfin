@@ -1,10 +1,12 @@
 import {
+  CalendarClock,
   CalendarDays,
   Check,
   ChevronLeft,
   ChevronRight,
   CircleHelp,
   MessageSquareText,
+  Clock3,
   X,
 } from 'lucide-react'
 import {
@@ -33,6 +35,24 @@ const multipleSelectionCount = (
   question: Extract<PlanQuestionItem, { answerType: 'multiple_choice' }>,
 ) => question.selectedOptionIds.length + Number(Boolean(question.customAnswer?.trim()))
 
+const minuteTimeIsValid = (
+  question: Extract<PlanQuestionItem, { answerType: 'time' }>,
+) => Boolean(
+  question.time
+  && /^([01]\d|2[0-3]):[0-5]\d$/.test(question.time)
+  && (question.minimum == null || question.time >= question.minimum)
+  && (question.maximum == null || question.time <= question.maximum),
+)
+
+const minuteDateTimeIsValid = (
+  question: Extract<PlanQuestionItem, { answerType: 'datetime' }>,
+) => Boolean(
+  question.dateTime
+  && /^\d{4}-\d{2}-\d{2}T([01]\d|2[0-3]):[0-5]\d$/.test(question.dateTime)
+  && (question.minimum == null || question.dateTime >= question.minimum)
+  && (question.maximum == null || question.dateTime <= question.maximum),
+)
+
 const questionAnswerState = (question: PlanQuestionItem): 'answered' | 'missing' | 'invalid' => {
   if (question.skipped) return question.required ? 'invalid' : 'answered'
   if (question.answerType === 'single_choice') {
@@ -46,7 +66,13 @@ const questionAnswerState = (question: PlanQuestionItem): 'answered' | 'missing'
       : 'invalid'
   }
   if (question.answerType === 'text') return question.answer?.trim() ? 'answered' : 'missing'
-  return question.date ? 'answered' : 'missing'
+  if (question.answerType === 'date') return question.date ? 'answered' : 'missing'
+  if (question.answerType === 'datetime') {
+    if (!question.dateTime) return 'missing'
+    return minuteDateTimeIsValid(question) ? 'answered' : 'invalid'
+  }
+  if (!question.time) return 'missing'
+  return minuteTimeIsValid(question) ? 'answered' : 'invalid'
 }
 
 const questionAnswered = (question: PlanQuestionItem) => {
@@ -61,7 +87,9 @@ const questionHasDraftAnswer = (question: PlanQuestionItem) => {
     return question.selectedOptionIds.length > 0 || Boolean(question.customAnswer?.trim())
   }
   if (question.answerType === 'text') return Boolean(question.answer?.trim())
-  return Boolean(question.date)
+  if (question.answerType === 'date') return Boolean(question.date)
+  if (question.answerType === 'datetime') return Boolean(question.dateTime)
+  return Boolean(question.time)
 }
 
 const preferredOptionIndex = (question: PlanQuestionItem | undefined) => {
@@ -94,7 +122,11 @@ const clearQuestionAnswer = (question: PlanQuestionItem): PlanQuestionItem => {
   if (question.answerType === 'text') {
     return { ...question, answer: '', skipped: true }
   }
-  return { ...question, date: '', skipped: true }
+  if (question.answerType === 'date') return { ...question, date: '', skipped: true }
+  if (question.answerType === 'datetime') {
+    return { ...question, dateTime: '', skipped: true }
+  }
+  return { ...question, time: '', skipped: true }
 }
 
 const resizeTextAnswer = (textarea: HTMLTextAreaElement | null) => {
@@ -143,6 +175,8 @@ export function PlanQuestionComposer({
   const optionRefs = useRef<Array<HTMLElement | null>>([])
   const textAnswerRef = useRef<HTMLTextAreaElement | null>(null)
   const dateAnswerRef = useRef<HTMLButtonElement | null>(null)
+  const timeAnswerRef = useRef<HTMLInputElement | null>(null)
+  const dateTimeAnswerRef = useRef<HTMLInputElement | null>(null)
   const bodyRef = useRef<HTMLDivElement | null>(null)
   const activeIndex = Math.min(
     interaction.activeQuestionIndex,
@@ -176,7 +210,11 @@ export function PlanQuestionComposer({
           ? optionRefs.current[0]
           : enteredQuestion.answerType === 'text'
             ? textAnswerRef.current
-            : dateAnswerRef.current
+            : enteredQuestion.answerType === 'date'
+              ? dateAnswerRef.current
+              : enteredQuestion.answerType === 'datetime'
+                ? dateTimeAnswerRef.current
+              : timeAnswerRef.current
       target?.focus()
     })
     return () => window.cancelAnimationFrame(frame)
@@ -360,17 +398,26 @@ export function PlanQuestionComposer({
       const optionIndex = preferredOptionIndex(question)
       if (question.answerType === 'single_choice') setFocusedAnswerIndex(optionIndex)
       window.requestAnimationFrame(() => (
-        optionRefs.current[optionIndex] ?? textAnswerRef.current ?? dateAnswerRef.current
+        optionRefs.current[optionIndex]
+        ?? textAnswerRef.current
+        ?? dateAnswerRef.current
+        ?? dateTimeAnswerRef.current
+        ?? timeAnswerRef.current
       )?.focus())
     }
     const firstInvalid = interaction.questions.findIndex((item) => (
       questionAnswerState(item) === 'invalid'
     ))
     if (firstInvalid >= 0) {
+      const invalidQuestion = interaction.questions[firstInvalid]
       onChange((current) => ({
         ...current,
         activeQuestionIndex: firstInvalid,
-        error: t('Plan 澄清答案超出允许的选择数量'),
+        error: invalidQuestion?.answerType === 'time'
+          ? t('Plan 时间答案超出允许范围')
+          : invalidQuestion?.answerType === 'datetime'
+            ? t('Plan 日期时间答案超出允许范围')
+          : t('Plan 澄清答案超出允许的选择数量'),
       }))
       if (firstInvalid === activeIndex) focusCurrentAnswer()
       return
@@ -584,6 +631,76 @@ export function PlanQuestionComposer({
                     onChange={(value) => {
                       updateQuestion((current) => current.answerType === 'date'
                         ? { ...current, date: value, skipped: false }
+                        : current)
+                    }}
+                  />
+                </span>
+              </div>
+            )}
+            {question.answerType === 'time' && (
+              <div className={`plan-question-date plan-question-time${question.time ? ' is-active' : ''}`}>
+                <span className="plan-question-option-index" aria-hidden="true">
+                  <Clock3 size={13} />
+                </span>
+                <span className="plan-question-date-copy">
+                  <span className="plan-question-time-copy">
+                    <span className="plan-question-date-label">{t('选择时间')}</span>
+                    <small>{t('时区：{timeZone}', { timeZone: question.timeZone })}</small>
+                    {(question.minimum || question.maximum) && (
+                      <small>{t('允许范围：{minimum}–{maximum}', {
+                        minimum: question.minimum ?? '00:00',
+                        maximum: question.maximum ?? '23:59',
+                      })}</small>
+                    )}
+                  </span>
+                  <input
+                    ref={timeAnswerRef}
+                    className="plan-question-time-input"
+                    type="time"
+                    step={60}
+                    min={question.minimum ?? undefined}
+                    max={question.maximum ?? undefined}
+                    value={question.time ?? ''}
+                    aria-label={t('时间回答：{question}', { question: question.prompt })}
+                    onChange={(event) => {
+                      const value = event.currentTarget.value
+                      updateQuestion((current) => current.answerType === 'time'
+                        ? { ...current, time: value, skipped: false }
+                        : current)
+                    }}
+                  />
+                </span>
+              </div>
+            )}
+            {question.answerType === 'datetime' && (
+              <div className={`plan-question-date plan-question-time${question.dateTime ? ' is-active' : ''}`}>
+                <span className="plan-question-option-index" aria-hidden="true">
+                  <CalendarClock size={13} />
+                </span>
+                <span className="plan-question-date-copy">
+                  <span className="plan-question-time-copy">
+                    <span className="plan-question-date-label">{t('选择日期和时间')}</span>
+                    <small>{t('时区：{timeZone}', { timeZone: question.timeZone })}</small>
+                    {(question.minimum || question.maximum) && (
+                      <small>{t('允许范围：{minimum}–{maximum}', {
+                        minimum: question.minimum ?? t('不限'),
+                        maximum: question.maximum ?? t('不限'),
+                      })}</small>
+                    )}
+                  </span>
+                  <input
+                    ref={dateTimeAnswerRef}
+                    className="plan-question-time-input"
+                    type="datetime-local"
+                    step={60}
+                    min={question.minimum ?? undefined}
+                    max={question.maximum ?? undefined}
+                    value={question.dateTime ?? ''}
+                    aria-label={t('日期时间回答：{question}', { question: question.prompt })}
+                    onChange={(event) => {
+                      const value = event.currentTarget.value
+                      updateQuestion((current) => current.answerType === 'datetime'
+                        ? { ...current, dateTime: value, skipped: false }
                         : current)
                     }}
                   />

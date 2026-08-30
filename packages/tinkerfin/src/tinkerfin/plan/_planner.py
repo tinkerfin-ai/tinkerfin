@@ -11,16 +11,17 @@ from deepagents.middleware.filesystem import FilesystemMiddleware, FsToolName
 from langchain.agents import create_agent  # pyright: ignore[reportUnknownVariableType]
 from langchain.agents.middleware import AgentMiddleware, ModelCallLimitMiddleware
 from langchain.agents.structured_output import ToolStrategy
+from langchain.chat_models import init_chat_model
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.typing import ContextT
 
 from ._clarification import ClarificationSchemaBinding, stateless_child_config
 from ._content import PlanContentBinding
-from ._contracts import PlanContractBinding, PlannerOutcomeBase
+from ._contracts import PlannerOutcomeBase
 from .errors import PlanStructuredOutputError
-from .models import PlanContentModel, PlanState
+from .models import PlanContentModel, PlanReviewAction, PlanState
 
 _READ_ONLY_TOOLS: list[FsToolName] = [
     "ls",
@@ -29,6 +30,13 @@ _READ_ONLY_TOOLS: list[FsToolName] = [
     "grep",
 ]
 _PLANNER_MODEL_CALL_LIMIT = 6
+_PLAN_REVIEW_REPLY_PROMPT = """You respond after the user has rejected or cancelled one
+Plan draft. The rejected draft is permanently non-executable, but the conversation
+remains in Planning mode. Write exactly one concise, user-visible paragraph in the
+user's language. Acknowledge the decision and invite the user to continue refining the
+Plan. Reflect an optional rejection reason without inventing one. Do not produce a new
+draft, ask a structured clarification, call a tool, execute work, claim that Planning
+mode ended, or expose private chain-of-thought."""
 _PLANNER_PROMPT = """You are the single read-only Planner for a user-reviewed workflow.
 
 You create a Plan for a separate execution Deep Agent. Your deliberately restricted
@@ -78,6 +86,17 @@ class _StructuredAgent(Protocol):
         input: Mapping[str, object],
         config: RunnableConfig | None = None,
     ) -> Mapping[str, object]: ...
+
+
+def resolve_planner_model(model: str | BaseChatModel) -> BaseChatModel:
+    """Resolve one configured Planner model for structured and visible responses."""
+
+    if isinstance(model, BaseChatModel):
+        return model
+    resolved = init_chat_model(model)
+    if not isinstance(resolved, BaseChatModel):
+        raise TypeError("an explicit Planner model must resolve to BaseChatModel")
+    return resolved
 
 
 def _planner_system_prompt(
@@ -160,7 +179,7 @@ def create_planner_agent(
     backend: BackendProtocol,
     clarification: ClarificationSchemaBinding,
     content: PlanContentBinding,
-    contracts: PlanContractBinding,
+    response_type: type[PlannerOutcomeBase],
     context_schema: type[ContextT] | None,
 ) -> _StructuredAgent:
     """Build a Planner with an explicit read-only filesystem action space."""
@@ -189,7 +208,7 @@ def create_planner_agent(
             system_prompt=_planner_system_prompt(clarification, content),
             middleware=middleware,
             response_format=ToolStrategy(
-                contracts.planner_response_type,
+                response_type,
                 handle_errors=True,
             ),
             context_schema=context_schema,
@@ -206,7 +225,7 @@ async def invoke_planner(
     messages: Sequence[BaseMessage],
     plan: PlanState[PlanContentModel],
     *,
-    contracts: PlanContractBinding,
+    response_type: type[PlannerOutcomeBase],
     clarification_history: Sequence[Mapping[str, object]],
     config: RunnableConfig,
     files: object | None,
@@ -244,7 +263,7 @@ async def invoke_planner(
         config=stateless_child_config(config),
     )
     response = result.get("structured_response")
-    if isinstance(response, contracts.planner_response_type):
+    if isinstance(response, response_type):
         return response
 
     invalid_messages = _invalid_structured_call_messages(result)
@@ -270,7 +289,7 @@ async def invoke_planner(
             config=stateless_child_config(config),
         )
         response = result.get("structured_response")
-        if isinstance(response, contracts.planner_response_type):
+        if isinstance(response, response_type):
             return response
 
     raise PlanStructuredOutputError(
@@ -278,4 +297,76 @@ async def invoke_planner(
     )
 
 
-__all__ = ["create_planner_agent", "invoke_planner"]
+async def invoke_plan_review_reply(
+    model: BaseChatModel,
+    messages: Sequence[BaseMessage],
+    plan: PlanState[PlanContentModel],
+    *,
+    config: RunnableConfig,
+) -> AIMessage:
+    """Generate the sole visible reply after a rejected or cancelled draft.
+
+    The direct model call deliberately binds no Tool and runs in the parent Planning
+    node, so its message is visible in the current stream without entering the native
+    execution Graph. The durable Plan state remains the authority for subsequent input.
+
+    Args:
+        model: Resolved Planner chat model shared by the Planning definition.
+        messages: Current user-visible Planning conversation.
+        plan: Durable state containing the resolved review decision.
+        config: Current parent Runnable configuration.
+
+    Returns:
+        One non-empty assistant message to append to Planning state.
+
+    Raises:
+        PlanStructuredOutputError: The model returns no visible text or attempts a Tool
+            call despite the reply-only contract.
+    """
+
+    decision = plan.review_action
+    if decision not in {PlanReviewAction.REJECT, PlanReviewAction.CANCEL}:
+        raise PlanStructuredOutputError(
+            "Plan review reply requires a reject or cancel decision"
+        )
+    assert decision is not None
+    draft = plan.draft
+    context = {
+        "decision": decision.value,
+        "reason": plan.review_reason,
+        "rejectedDraft": (
+            None
+            if draft is None
+            else draft.content.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude_none=False,
+            )
+        ),
+    }
+    response = await model.ainvoke(
+        [
+            SystemMessage(content=_PLAN_REVIEW_REPLY_PROMPT),
+            *messages,
+            HumanMessage(
+                content=(
+                    "Trusted Plan review decision:\n"
+                    + json.dumps(context, ensure_ascii=False, indent=2)
+                )
+            ),
+        ],
+        config=stateless_child_config(config),
+    )
+    if response.tool_calls or response.invalid_tool_calls or not response.text.strip():
+        raise PlanStructuredOutputError(
+            "Plan review reply must contain visible text without Tool calls"
+        )
+    return response
+
+
+__all__ = [
+    "create_planner_agent",
+    "invoke_plan_review_reply",
+    "invoke_planner",
+    "resolve_planner_model",
+]

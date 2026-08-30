@@ -81,7 +81,7 @@ Plan Mode routes a request through these boundaries:
 1. One read-only Planner judges whether intent and constraints are sufficient.
 2. The Planner can use only `ls`, `read_file`, `glob`, and `grep`.
 3. Each clarification question uses a Planner-selected `single_choice`,
-   `multiple_choice`, `text`, or `date` answer type; clarification and plan review pause
+   `multiple_choice`, `text`, `date`, `time`, or `datetime` answer type; clarification and plan review pause
    through LangGraph interrupts.
 4. Approval freezes a `ConfirmedPlan`, commits a deterministic handoff using the
    original user message ID, and immediately starts the native Deep Agent.
@@ -91,9 +91,15 @@ Pass a non-empty, duplicate-free `allowed_review_actions` sequence to change the
 decisions. The response Schema contains exactly that sequence; `EDIT` is available only
 when the host explicitly enables it and provides a trusted draft editor.
 
-Selecting Plan requires a concrete `BaseCheckpointSaver` and an explicit Planner model.
-TinkerFin never creates an in-process saver or silently weakens durability. Production
-applications must provide a production-grade saver. Planning and the native Deep Agent
+Approval alone exits Plan mode and starts native execution. Rejection invalidates the
+draft, accepts an optional reason, produces one visible Planner reply, and waits for the
+next Plan input. A configured `CANCEL` does the same without a reason. Transport-level
+AG-UI cancellation remains abandonment and does not invoke the Planner.
+
+Selecting Plan requires a concrete `BaseCheckpointSaver` and one explicit model.
+`planner_model` is optional when the Agent definition supplies `model`; omitting both is
+rejected. TinkerFin never creates an in-process saver or silently weakens durability.
+Production applications must provide a production-grade saver. Planning and the native Deep Agent
 borrow the same saver, Store, cache, backend, and runtime context. Keep the same
 `RunIdentity.threadId` when resuming. Plan state appears at the root `tinkerfin_plan` key;
 `PlanContentModel`, the built-in structured and Markdown content types, `PlanDraft`,
@@ -134,7 +140,7 @@ interrupt, still applies during execution.
 
 The built-in `DefaultClarificationForm` is used when `.plan(...)` omits
 `clarification_schema`. `BuiltInClarificationForm[QuestionAttributes, OptionModel]`
-applies shared strongly typed metadata to all four built-in types without per-type
+applies shared strongly typed metadata to all six built-in types without per-type
 subclasses. A host can also provide a concrete `ClarificationForm` union containing only
 the answer types its client supports. Attributes are public, model-generated planning
 context rather than authoritative permission, billing, or compliance data.
@@ -142,11 +148,17 @@ context rather than authoritative permission, billing, or compliance data.
 Choice questions use `allow_free_text` (`allowFreeText` on JSON). Multiple choice also
 declares `min_selections` and an optional `max_selections`; selected option IDs and one
 custom answer may coexist. Text answers are non-blank, and dates use `YYYY-MM-DD` without
-a time or time zone. A complete response is keyed by checkpoint question ID. Each value
+a time or time zone. Time answers contain one local wall-clock minute and the question
+declares the IANA time zone used to interpret it; optional inclusive bounds must form a
+non-wrapping range. A complete response is keyed by checkpoint question ID. Each value
 has `status: answered` plus its `answerType`, or `status: skipped` for an optional
 question. Planning validates the exact pending response Schema before Graph resume,
 derives trusted option labels, canonicalizes answer order, and retains explicit skips as
 Planner context.
+Datetime questions require an IANA zone and accept one local calendar date plus minute;
+their bounds may span dates. Normalization adds the unique UTC `instant`, and rejects
+DST gaps or repeated local minutes.
+
 
 Use `clarification_type(...)` to register a host-defined semantic answer type. One frozen
 descriptor supplies its unversioned namespaced ID, model-facing description, Question and
@@ -164,108 +176,95 @@ only when a complete draft becomes reviewable.
 Plan Mode fixes checkpoint durability to `sync`. Omitting `durability` is recommended;
 passing `sync` is also accepted, while `async` and `exit` fail before streaming.
 
-Choose the current request on Runtime creation:
+Choose the route on each managed run:
 
 ```python
-plan_runtime = agent.new(
-    identity=RunIdentity(threadId="project-7", runId="run-1"),
+plan_stream = await tinkerfin.open_run(
+    RunIdentity(threadId="project-7", runId="run-1"),
+    agent=agent,
+    input=graph_input,
     mode="plan",
 )
-default_runtime = agent.new_agui(
-    identity=RunIdentity(threadId="project-7", runId="run-2"),
+default_events = await tinkerfin.open_agui_run(
+    RunIdentity(threadId="project-7", runId="run-2"),
+    agent=agent,
+    input=graph_input,
     mode="default",
 )
 ```
 
-`default` uses the native topology with TinkerFin's private resume marker; `plan` uses
-the standalone Planning Graph. Approval changes the effective mode to `default` before native execution.
-A later request on the same checkpoint thread can select Plan again. Plan resumes are
-routed to Planning, while Tool and subagent resumes go directly to the native Graph.
+`default` uses the native topology; `plan` uses the standalone Planning Graph. Approval
+changes the effective mode to `default` before native execution. A later request on the
+same checkpoint thread can select Plan again. Plan resumes route to Planning, while Tool
+and subagent resumes route to the native Graph.
 
-## Create one native Runtime
+## Open one managed native run
 
 ```python
-runtime = agent.new(
-    identity=RunIdentity(threadId="project-7", runId="run-1"),
+stream = await tinkerfin.open_run(
+    RunIdentity(threadId="project-7", runId="run-1"),
+    agent=agent,
+    input={"messages": [{"role": "user", "content": "Review this project"}]},
     mode="default",
-    on_part=None,
+    config=config,
+    context=context,
+    on_native_part=record_part,
 )
 ```
 
 | Parameter | Default | Purpose |
 | --- | --- | --- |
 | `identity` | required | Thread and run identity used by checkpointing and coordination |
+| `agent` | required | A Definition or sync/async callable returning one |
+| `input` | required | New state, native `Command`, or `None` |
 | `mode` | Definition default | `default` or `plan`; ordinary Definitions accept only `default` |
-| `on_part` | `None` | Observer called before each native part reaches the consumer |
-
-## Start the run
-
-```python
-stream = runtime.astream(
-    {"messages": [{"role": "user", "content": "Review this project"}]},
-)
-```
-
-### Input and configuration
-
-| Parameter | Default | Purpose |
-| --- | --- | --- |
-| `input` | required | New state input, a `Command`, or `None` |
-| `config` | `None` | Thread, tags, metadata, recursion limits, and other run configuration |
+| `config` | `None` | Tags, metadata, recursion limits, and other Graph configuration |
 | `context` | `None` | Runtime context matching `context_schema` |
+| `on_native_part` | `None` | Async observer before each native part reaches the consumer |
+| Extra keywords | none | Current Profile-supported Graph stream options |
 
-You normally omit `configurable.thread_id`. An explicitly equal value is accepted; a value different from `RunIdentity.threadId` fails before Graph iteration, observers, or coordination begin.
+You normally omit `configurable.thread_id`. An explicitly equal value is accepted; a
+different value fails before Graph iteration, observations, or coordination. The selected
+Profile owns required stream modes, version, subgraph scope, and complete state output.
 
-### Output controls
+`on_native_part` is awaited in the delivery path. Use asynchronous clients inside it and
+avoid blocking network or database calls.
 
-| Parameter | Default | Purpose |
-| --- | --- | --- |
-| `stream_mode` | Profile-owned | Required semantic modes are always present; supported extra modes may be added |
-| `print_mode` | `()` | Prints extra modes without changing yielded data |
-| `output_keys` | Profile-owned | Must preserve the Profile's complete state contract |
-| `subgraphs` | Profile-owned | Preserves the Profile's complete graph scope |
-| `version` | Profile-owned | A conflicting upstream version is rejected before Graph iteration |
-| `debug` | `None` | Overrides debugging for this run |
+## Reuse a direct Graph
 
-### Interrupt and durability controls
-
-| Parameter | Default | Purpose |
-| --- | --- | --- |
-| `interrupt_before` | `None` | Pauses before selected nodes |
-| `interrupt_after` | `None` | Pauses after selected nodes |
-| `durability` | `None` | Controls checkpoint timing; Planning and handoff require `sync` |
-| `control` | `None` | Supplies LangGraph run control data |
-| Extra keyword arguments | none | Current additional LangGraph run options |
-
-The required profile supplies complete Runtime and Trace semantics. Add `updates`,
-`checkpoints`, `debug`, or `custom` only when the consumer also needs those modes.
-
-## Observe every part
-
-`on_part` must be asynchronous. It runs before the item reaches your `async for` loop.
+Advanced integrations that do not need managed run lifecycle can create one async
+Runnable and reuse it across thread IDs:
 
 ```python
-async def record_part(part: object) -> None:
-    print("received", part)
-
-
-runtime = agent.new(identity=identity, on_part=record_part)
+graph = await agent.create_graph(mode="plan")
+state = await graph.ainvoke(graph_input, config=config)
+async for part in graph.astream(graph_input, config=config):
+    consume(part)
 ```
 
-An observer failure ends the run. Use asynchronous clients inside it instead of blocking network or database calls.
+The direct Graph owns Plan/native routing and checkpoint-based resume selection. It does
+not create `RunIdentity`, Runtime Observation, Trace, AG-UI, Messaging, or host business
+state. Direct resume uses LangGraph `Command(resume=...)`.
 
 ## Common problems
 
-### A second `astream()` call fails
+### A second iteration of one managed stream fails
 
-The Runtime is single-use. Call `agent.new()` again.
+Managed streams are single-use. Call `open_run()` again with the next run identity.
 
 ### The conversation does not continue
 
-Make sure the agent has a checkpointer and later runs use the same `RunIdentity.threadId`.
+Make sure the Agent has a checkpointer and later runs reuse the same
+`RunIdentity.threadId`.
 
-### An asynchronous server pauses while creating the Runtime
+### Graph construction blocks the event loop
 
-`agent.new()` constructs the Graph synchronously. If construction is expensive, call it through a controlled thread boundary.
+The built-in Profile runs its locked synchronous Deep Agents factory through AnyIO's
+capacity-limited worker boundary. Do not add another application thread around
+`open_run()`, `open_agui_run()`, or `create_graph()`.
+
+A custom Profile can implement `create_agent_graph(factory, args, kwargs)` when its
+factory is natively asynchronous. A Profile without that optional method retains its own
+synchronous factory, which Core invokes through the same bounded worker boundary.
 
 Next: [Streams and SSE](streams-and-sse.md).

@@ -23,28 +23,57 @@ pip install "tinkerfin-messaging[agui,redis]"
 ## Turn a TinkerFin stream into resumable SSE
 
 ```python
-from tinkerfin import RunIdentity
-from tinkerfin_messaging import Messaging
+from tinkerfin import RunIdentity, TinkerFin
+from tinkerfin_messaging import Messaging, create_agui_run_source
 
 
+tinkerfin = TinkerFin()
+agent = tinkerfin.create_deep_agent(model=model, tools=tools)
 identity = RunIdentity(threadId="thread-42", runId="run-7")
-events = agent.new_agui(identity=identity).astream(graph_input)
+source = create_agui_run_source(
+    identity,
+    open_events=lambda run_identity: tinkerfin.open_agui_run(
+        run_identity,
+        agent=agent,
+        input=graph_input,
+    ),
+)
 
 async with Messaging() as messaging:
     channel = messaging.channel(name="agent-events")
-    body = await channel.sse(events, after=0)
+    body = await channel.sse(
+        source,
+        after=0,
+        on_source_starting=activate_business_run,
+        on_delivery_not_started=cleanup_business_run,
+    )
 
     async for chunk in body:
         await send_to_client(chunk)
 ```
 
-`AgUiEventStream` and `NativeGraphRunStream` carry immutable codec and RunIdentity profiles. A name-only channel therefore needs no duplicate codec, thread, or run parameters, including for an empty source.
+`create_agui_run_source()` keeps model, Sandbox, and Graph setup behind the owner
+decision. Attachments never open the Agent. A name-only channel needs no duplicate codec,
+thread, or run parameters, including for an empty source. Its optional transform may add
+product metadata or change content, but cannot change an event type or any Run, message,
+Tool, snapshot, or interrupt correlation identity. It cannot change any field of an
+optional `RUN_STARTED.input`. Protocol-changing transformations belong to the advanced
+unprofiled `map_source()` boundary.
+
+`on_source_starting` activates host delivery for a new owner. If neither a producer nor
+an attachment is established, `on_delivery_not_started` performs host cleanup. An
+attachment invokes neither callback.
+
+An attachment never opens its unused candidate source, but Messaging closes that
+single-use candidate before returning. Do not reuse it after `wrap()` or `sse()`.
 
 `AgUiCodec` requires `[agui]`; `NativeStreamPartCodec` requires `[native]`; and
 `RedisBackend` requires `[redis]`. Missing extras fail at the relevant lazy import with
 the exact installation command instead of loading the Agent Runtime into Messaging Core.
 
-The returned body already contains SSE bytes. Do not call Runtime `to_sse()` first or pass a pre-encoded `SseBody` into Messaging.
+The returned body already contains SSE bytes and is caller-owned; close it if HTTP setup
+fails before consumption. Do not call Runtime `to_sse()` first or pass a pre-encoded
+`SseBody` into Messaging.
 
 ## Custom sources
 

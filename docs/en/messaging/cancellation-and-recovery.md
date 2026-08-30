@@ -46,7 +46,47 @@ form a wait cycle.
 
 ## Create the agent only for the owner
 
-Use `DeferredMessageSource` when Graph, model, or Sandbox setup is expensive:
+For managed TinkerFin AG-UI runs, use the task-oriented helper:
+
+```python
+from tinkerfin_messaging import create_agui_run_source
+
+
+source = create_agui_run_source(
+    identity,
+    open_events=lambda run_identity: tinkerfin.open_agui_run(
+        run_identity,
+        agent=create_agent,
+        input=graph_input,
+        config=graph_config,
+    ),
+    transform_event=add_product_metadata,
+)
+```
+
+The helper opens the Agent only after Messaging selects this caller as owner. It hides
+Binding, profile constants, source types, mapping, and the first-event cancellation
+fence. The exact `RunIdentity` supplied once to the helper is passed to `open_events`.
+`transform_event` may enrich product metadata or content, but it must preserve the
+concrete event type, every protocol correlation identity, and the complete optional
+`RUN_STARTED.input` supplied by the caller.
+
+Use channel callbacks for host delivery state:
+
+```python
+body = await channel.sse(
+    source,
+    on_source_starting=activate_business_run,
+    on_delivery_not_started=cleanup_business_run,
+)
+```
+
+Source-owned `on_owner_preflight` is a separate advanced hook for preparing the source
+itself. It is not a second name for host activation.
+
+## Advanced deferred sources
+
+Use `DeferredMessageSource` when a custom protocol source is expensive:
 
 ```python
 from tinkerfin_messaging import (
@@ -78,11 +118,14 @@ source = DeferredMessageSource(
 
 Attachments and replay-only requests close the deferred wrapper without opening the real source. `cancel_after_first_item=True` is useful for protocols that must emit `RUN_STARTED` first.
 
-Messaging settles `on_owner_preflight` after durable owner selection. A failure releases that prepared owner and closes the deferred wrapper before its opener runs. Use this hook for a host-side CAS or lease activation that must fence stale recovery.
+Messaging settles `on_owner_preflight` after durable owner selection. A failure releases
+that prepared owner and closes the deferred wrapper before its opener runs. Use it only
+for source-owned preparation; host activation belongs in `on_source_starting`.
 
 `MessageSourceBinding` holds the source and an optional cancel callback. Leave the callback empty when the source already declares its own.
 
-Use `ProfiledDeferredMessageSource` when the opener returns a known AG-UI or Native source and a name-only channel must know the codec and RunIdentity before opening it:
+Use `ProfiledDeferredMessageSource` when a custom opener returns a known AG-UI or Native
+source and a name-only channel must know the codec and RunIdentity before opening it:
 
 ```python
 from ag_ui.core import BaseEvent

@@ -26,6 +26,7 @@ class ReadinessService:
         redis_control: Redis,
         redis_runtime: Redis,
         sandbox: SandboxSettings,
+        sandbox_ready: Callable[[], Awaitable[None]],
         http_client: httpx.AsyncClient,
         timeout_seconds: float = 3,
     ) -> None:
@@ -33,6 +34,7 @@ class ReadinessService:
         self._redis_control = redis_control
         self._redis_runtime = redis_runtime
         self._sandbox = sandbox
+        self._sandbox_ready = sandbox_ready
         self._http_client = http_client
         self._timeout_seconds = timeout_seconds
 
@@ -49,6 +51,8 @@ class ReadinessService:
             raise RuntimeError("Redis Runtime PING 未返回成功")
 
     async def _check_opensandbox(self) -> None:
+        # 控制面健康不代表预热容量真实可用；框架生命周期检查必须先通过
+        await self._sandbox_ready()
         headers = {}
         if self._sandbox.api_key is not None:
             headers["OPEN-SANDBOX-API-KEY"] = self._sandbox.api_key.get_secret_value()

@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Literal, TypeAlias, cast
 from langchain_core.messages import BaseMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver, CheckpointTuple
+from langgraph.graph.message import Messages, add_messages
 from langgraph.types import StateSnapshot
 from pydantic import ValidationError
 
@@ -41,6 +42,7 @@ if TYPE_CHECKING:
 
 _CHECKPOINTER_RUN_ID_KEY = "run_id"
 _MAX_RESUME_ANCESTRY_DEPTH = 4096
+_MAX_RESUME_CHECKPOINT_SCAN = 4096
 
 _CheckpointSaver: TypeAlias = (
     BaseCheckpointSaver[int] | BaseCheckpointSaver[float] | BaseCheckpointSaver[str]
@@ -420,8 +422,180 @@ def _snapshot_namespace(snapshot: StateSnapshot) -> tuple[str, ...]:
     return components
 
 
-def _resume_context(snapshot: StateSnapshot) -> AgUiResumeContext:
-    """Collect root/subgraph messages and pending interrupts from one state tree."""
+def _checkpoint_message_sequence(value: object) -> tuple[BaseMessage, ...]:
+    """Validate one committed or pending LangGraph messages-channel value."""
+
+    if isinstance(value, BaseMessage):
+        return (value,)
+    if not isinstance(value, list | tuple):
+        raise TinkerFinLifecycleError(
+            "checkpoint messages channel is not a message sequence"
+        )
+    raw_messages = cast(list[object] | tuple[object, ...], value)
+    messages = tuple(raw_messages)
+    if any(not isinstance(message, BaseMessage) for message in messages):
+        raise TinkerFinLifecycleError(
+            "checkpoint messages channel contains a non-LangChain value"
+        )
+    return tuple(cast(BaseMessage, message) for message in messages)
+
+
+async def _dynamic_resume_messages(
+    checkpointer: _CheckpointSaver,
+    *,
+    source: CheckpointTuple,
+    snapshot: StateSnapshot,
+    runtime_profile: DeepAgentsRuntimeProfile,
+) -> Mapping[tuple[str, ...], tuple[BaseMessage, ...]]:
+    """Recover messages from Profile-owned dynamic subgraph checkpoint ancestry."""
+
+    matcher_value = getattr(
+        runtime_profile,
+        "_matches_resume_subgraph_namespace",
+        None,
+    )
+    if not callable(matcher_value):
+        return MappingProxyType({})
+    matcher = cast(
+        Callable[[tuple[str, ...], frozenset[str]], bool],
+        matcher_value,
+    )
+    pending_task_ids = frozenset(task.id for task in snapshot.tasks if task.interrupts)
+    if not pending_task_ids:
+        return MappingProxyType({})
+
+    source_marker = _checkpoint_lineage(source)
+    if source_marker is None:
+        raise TinkerFinLifecycleError("resume source has no private lineage marker")
+    thread_id = source_marker.thread_id
+    namespaces: set[str] = set()
+    listed = 0
+    listing_config: RunnableConfig = {
+        "configurable": {
+            "thread_id": thread_id,
+        }
+    }
+    async for checkpoint in checkpointer.alist(
+        listing_config,
+        limit=_MAX_RESUME_CHECKPOINT_SCAN + 1,
+    ):
+        listed += 1
+        if listed > _MAX_RESUME_CHECKPOINT_SCAN:
+            raise TinkerFinLifecycleError(
+                "resume checkpoint scan exceeded its safe bound",
+                diagnostic_context={"maximum_checkpoints": _MAX_RESUME_CHECKPOINT_SCAN},
+            )
+        raw_namespace = checkpoint.config.get("configurable", {}).get(
+            "checkpoint_ns",
+            "",
+        )
+        if not isinstance(raw_namespace, str):
+            raise TinkerFinLifecycleError("resume checkpoint namespace is not text")
+        if not raw_namespace:
+            continue
+        namespace = tuple(raw_namespace.split("|"))
+        if any(not component for component in namespace):
+            raise TinkerFinLifecycleError(
+                "resume checkpoint namespace has an empty component"
+            )
+        try:
+            selected = matcher(namespace, pending_task_ids)
+        except Exception as error:
+            raise TinkerFinLifecycleError(
+                "Runtime Profile rejected dynamic resume namespace inspection",
+                cause=error,
+            ) from error
+        if not isinstance(selected, bool):
+            raise TinkerFinLifecycleError(
+                "Runtime Profile namespace matcher did not return bool"
+            )
+        if selected:
+            namespaces.add(raw_namespace)
+
+    messages_by_namespace: dict[tuple[str, ...], tuple[BaseMessage, ...]] = {}
+    for raw_namespace in sorted(namespaces):
+        config: RunnableConfig = {
+            "configurable": {
+                "thread_id": thread_id,
+                "checkpoint_ns": raw_namespace,
+            }
+        }
+        current = await checkpointer.aget_tuple(config)
+        if current is None:
+            raise TinkerFinLifecycleError(
+                "dynamic resume checkpoint namespace has no head"
+            )
+        ancestry: list[CheckpointTuple] = []
+        visited: set[tuple[str, str, str]] = set()
+        for _depth in range(_MAX_RESUME_ANCESTRY_DEPTH):
+            key = _checkpoint_ancestry_key(current)
+            if key in visited:
+                raise TinkerFinLifecycleError(
+                    "dynamic resume checkpoint ancestry contains a cycle"
+                )
+            visited.add(key)
+            if key[0] != thread_id or key[1] != raw_namespace:
+                raise TinkerFinLifecycleError(
+                    "dynamic resume checkpoint ancestry changed scope"
+                )
+            _require_runtime_profile(
+                current,
+                expected=runtime_profile.profile_id,
+            )
+            marker = _checkpoint_lineage(current)
+            if marker is None or marker.run_id != source_marker.run_id:
+                raise TinkerFinLifecycleError(
+                    "dynamic resume checkpoint belongs to another Run"
+                )
+            ancestry.append(current)
+            if current.parent_config is None:
+                break
+            parent = await checkpointer.aget_tuple(current.parent_config)
+            if parent is None:
+                raise TinkerFinLifecycleError(
+                    "dynamic resume checkpoint ancestry is incomplete"
+                )
+            current = parent
+        else:
+            raise TinkerFinLifecycleError(
+                "dynamic resume checkpoint ancestry exceeds the safe depth",
+                diagnostic_context={
+                    "maximum_depth": _MAX_RESUME_ANCESTRY_DEPTH,
+                },
+            )
+
+        folded: list[BaseMessage] = []
+        for checkpoint in reversed(ancestry):
+            channel_values = checkpoint.checkpoint.get("channel_values")
+            if isinstance(channel_values, Mapping) and "messages" in channel_values:
+                folded = list(
+                    _checkpoint_message_sequence(
+                        cast(Mapping[object, object], channel_values)["messages"]
+                    )
+                )
+            for _task_id, channel, value in checkpoint.pending_writes or ():
+                if channel != "messages":
+                    continue
+                # LangGraph's public alias is invariant even though validated
+                # BaseMessage lists are its canonical runtime input and output shape.
+                merged: object = add_messages(
+                    cast(Messages, list(folded)),
+                    cast(Messages, list(_checkpoint_message_sequence(value))),
+                )
+                folded = list(_checkpoint_message_sequence(merged))
+        if folded:
+            messages_by_namespace[tuple(raw_namespace.split("|"))] = tuple(folded)
+    return MappingProxyType(messages_by_namespace)
+
+
+async def _resume_context(
+    snapshot: StateSnapshot,
+    *,
+    checkpointer: _CheckpointSaver,
+    source: CheckpointTuple,
+    runtime_profile: DeepAgentsRuntimeProfile,
+) -> AgUiResumeContext:
+    """Collect root, materialized, and dynamic subgraph resume correlation."""
 
     messages_by_namespace: dict[tuple[str, ...], tuple[BaseMessage, ...]] = {}
     interrupts_by_id: dict[str, NativeRuntimeInterrupt] = {}
@@ -461,6 +635,19 @@ def _resume_context(snapshot: StateSnapshot) -> AgUiResumeContext:
                 visit(task.state)
 
     visit(snapshot)
+    dynamic_messages = await _dynamic_resume_messages(
+        checkpointer,
+        source=source,
+        snapshot=snapshot,
+        runtime_profile=runtime_profile,
+    )
+    for namespace, messages in dynamic_messages.items():
+        previous_messages = messages_by_namespace.get(namespace)
+        if previous_messages is not None and previous_messages != messages:
+            raise TinkerFinLifecycleError(
+                "checkpoint repeats one namespace with conflicting dynamic messages"
+            )
+        messages_by_namespace[namespace] = messages
     if not interrupts_by_id:
         raise TinkerFinLifecycleError("checkpoint has no pending interrupt to resume")
     return AgUiResumeContext(
@@ -526,7 +713,12 @@ async def resolve_agui_resume_context(
             "resume checkpoint contains failed task evidence",
             diagnostic_context={"failed_task_count": len(failures)},
         )
-    return _resume_context(snapshot)
+    return await _resume_context(
+        snapshot,
+        checkpointer=checkpointer,
+        source=checkpoint,
+        runtime_profile=runtime_profile,
+    )
 
 
 async def _thread_head(
@@ -848,6 +1040,63 @@ async def _durable_resume_progress(
         marker=marker,
         phase=phase,
     )
+
+
+async def agui_resume_marker_is_durable(
+    checkpointer: object,
+    *,
+    identity: RunIdentity,
+    runtime_profile: DeepAgentsRuntimeProfile,
+) -> bool:
+    """Prove whether one Run already owns a prepared or accepted resume marker.
+
+    This probe intentionally reads the borrowed saver without constructing a Graph. It
+    protects host claims when an async model, Sandbox, Definition, or Graph factory fails
+    during retry. A partial marker without its matching pending lineage is corrupt or
+    unknowable and fails closed instead of being interpreted as no durable intent.
+
+    Args:
+        checkpointer: Borrowed saver selected before Definition construction.
+        identity: Exact semantic resume Run identity to inspect.
+        runtime_profile: Profile that owns pending-write and accepted-decision semantics.
+
+    Returns:
+        ``True`` for a prepared or accepted marker and ``False`` when no marker exists.
+
+    Raises:
+        TinkerFinLifecycleError: The saver, marker, Profile, or pending lineage cannot be
+            validated safely.
+    """
+
+    if not isinstance(checkpointer, BaseCheckpointSaver):
+        raise TinkerFinLifecycleError(
+            "AG-UI resume marker probing requires a concrete BaseCheckpointSaver"
+        )
+    saver = cast(_CheckpointSaver, checkpointer)
+    head = await _thread_head(saver, thread_id=identity.thread_id)
+    if head is None:
+        return False
+    marker = _resume_marker_for_identity(
+        head,
+        identity=identity,
+        runtime_profile=runtime_profile,
+    )
+    if marker is None:
+        return False
+    _require_runtime_profile(head, expected=runtime_profile.profile_id)
+    if _committed_resume_marker_for_identity(head, identity=identity) is not None:
+        return True
+    if not _pending_resume_lineage_ready(
+        head,
+        identity=identity,
+        parent_run_id=marker.parent_run_id,
+        runtime_profile=runtime_profile,
+    ):
+        raise TinkerFinLifecycleError(
+            "checkpoint contains a resume marker without durable lineage",
+            context={"run_id": identity.run_id},
+        )
+    return True
 
 
 async def _resume_source_from_head(
@@ -1208,6 +1457,7 @@ __all__ = [
     "AgUiLineageResolution",
     "AgUiResumeContext",
     "AgUiThreadHead",
+    "agui_resume_marker_is_durable",
     "bind_agui_lineage",
     "resolve_agui_native_run_head",
     "resolve_agui_resume_context",

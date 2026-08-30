@@ -32,7 +32,11 @@ from ._protocols import _SandboxClient
 _CREATE_TOKEN_METADATA_KEY = "tinkerfin.ai/create-token"
 
 
-async def _join_owned_task(task: asyncio.Task[None]) -> None:
+async def _join_owned_task(
+    task: asyncio.Task[None],
+    *,
+    failure_label: str,
+) -> None:
     """Settle one owned task before propagating cancellation of its waiter."""
 
     current = asyncio.current_task()
@@ -60,7 +64,7 @@ async def _join_owned_task(task: asyncio.Task[None]) -> None:
     if cancellation is not None:
         if task_error is not None:
             cancellation.add_note(
-                "OpenSandbox destruction also failed: "
+                f"{failure_label} also failed: "
                 f"{type(task_error).__name__}: {task_error}"
             )
         raise cancellation.with_traceback(cancellation.__traceback__)
@@ -97,6 +101,7 @@ def _backend_error(
     ):
         return OpenSandboxBackendUnavailableError(
             f"OpenSandbox is unavailable for {operation}",
+            context={"reason": reason},
             diagnostic_context=diagnostic_context,
             cause=error,
         )
@@ -142,9 +147,14 @@ class OpenSandboxClient(_SandboxClient):
         """
         self.config = config or OpenSandboxConfig()
         self.connection_config = self._resolve_connection_config(connection_config)
+        (
+            self._owned_connection_config,
+            self._sdk_connection_config,
+        ) = self._scope_sdk_transport(self.connection_config)
         self._initializers = tuple(initializers)
         self._cleanup_tasks: set[asyncio.Task[None]] = set()
         self._destroy_tasks: dict[str, asyncio.Task[None]] = {}
+        self._close_task: asyncio.Task[None] | None = None
 
     def _resolve_connection_config(
         self,
@@ -162,6 +172,32 @@ class OpenSandboxClient(_SandboxClient):
                 "request_timeout": self.config.lifecycle_request_timeout,
             }
         )
+
+    @staticmethod
+    def _scope_sdk_transport(
+        connection_config: ConnectionConfig,
+    ) -> tuple[ConnectionConfig | None, ConnectionConfig]:
+        """Give every SDK call one client-scoped borrowed transport.
+
+        ``opensandbox==0.1.14`` creates a transport inside ``Sandbox.connect`` when
+        the supplied config has none, but its exception cleanup does not catch task
+        cancellation. The client therefore creates that transport before any SDK
+        coroutine starts and retains the only owning config until :meth:`aclose`.
+        SDK resources receive a validated borrowed copy so closing a temporary
+        Sandbox cannot close the shared client transport. A caller-supplied transport
+        remains borrowed and is never closed here.
+        """
+
+        owner = (
+            connection_config.with_transport_if_missing()
+            if connection_config.transport is None
+            else None
+        )
+        source = connection_config if owner is None else owner
+        sdk_config = ConnectionConfig.model_validate(source.model_dump(mode="python"))
+        if sdk_config.transport is None:
+            raise RuntimeError("OpenSandbox SDK transport initialization failed")
+        return owner, sdk_config
 
     def _wrap(self, sandbox: Sandbox) -> OpenSandboxBackend:
         """Wrap an SDK sandbox as an asynchronous Deep Agents backend."""
@@ -228,7 +264,7 @@ class OpenSandboxClient(_SandboxClient):
                 volumes=volumes or None,
                 timeout=self.config.ttl,
                 ready_timeout=self.config.ready_timeout,
-                connection_config=self.connection_config,
+                connection_config=self._sdk_connection_config,
             )
         except Exception as error:
             try:
@@ -274,7 +310,7 @@ class OpenSandboxClient(_SandboxClient):
         manager: OpenSandboxSDKManager | None = None
         try:
             manager = await OpenSandboxSDKManager.create(
-                connection_config=self.connection_config
+                connection_config=self._sdk_connection_config
             )
             candidates_by_id: dict[str, SandboxInfo] = {}
             page_number = 1
@@ -301,7 +337,7 @@ class OpenSandboxClient(_SandboxClient):
                 try:
                     return await Sandbox.connect(
                         candidate.id,
-                        connection_config=self.connection_config,
+                        connection_config=self._sdk_connection_config,
                         connect_timeout=self.config.connect_timeout,
                     )
                 except Exception:  # noqa: BLE001 - unknown create result is reclaimed
@@ -408,12 +444,15 @@ class OpenSandboxClient(_SandboxClient):
                 pass
             raise cancellation
 
-    async def _connect(self, sandbox_id: str) -> OpenSandboxBackend:
-        """Strictly reconnect to and initialize an existing remote sandbox."""
+    async def _connect_without_deadline(
+        self,
+        sandbox_id: str,
+    ) -> OpenSandboxBackend:
+        """Reconnect and initialize while the caller owns the outer deadline."""
         try:
             sandbox = await Sandbox.connect(
                 sandbox_id,
-                connection_config=self.connection_config,
+                connection_config=self._sdk_connection_config,
                 connect_timeout=self.config.connect_timeout,
             )
         except Exception as error:
@@ -432,6 +471,25 @@ class OpenSandboxClient(_SandboxClient):
             await self._close_quietly(backend)
             raise
         return backend
+
+    async def _connect(self, sandbox_id: str) -> OpenSandboxBackend:
+        """Strictly reconnect within the complete configured connection deadline.
+
+        The SDK's ``connect_timeout`` does not bound every endpoint request made while
+        resolving an existing Sandbox. The outer timeout therefore covers endpoint
+        lookup, workspace health, and host initializers as one observable reconnect.
+        Unlike create, reconnect allocates no new remote resource; every partially
+        opened local backend is closed by the inner operation before timeout escapes.
+        """
+
+        try:
+            async with asyncio.timeout(self.config.connect_timeout.total_seconds()):
+                return await self._connect_without_deadline(sandbox_id)
+        except OpenSandboxBackendError:
+            raise
+        except TimeoutError as error:
+            translated = _backend_error("connect", error)
+            raise translated from error
 
     async def connect(self, sandbox_id: str) -> OpenSandboxBackend:
         """Connect to an existing Sandbox without creating a replacement."""
@@ -456,7 +514,7 @@ class OpenSandboxClient(_SandboxClient):
         try:
             sandbox = await Sandbox.connect(
                 sandbox_id,
-                connection_config=self.connection_config,
+                connection_config=self._sdk_connection_config,
                 connect_timeout=self.config.connect_timeout,
                 skip_health_check=True,
             )
@@ -477,7 +535,7 @@ class OpenSandboxClient(_SandboxClient):
         try:
             sandbox = await Sandbox.connect(
                 sandbox_id,
-                connection_config=self.connection_config,
+                connection_config=self._sdk_connection_config,
                 connect_timeout=self.config.connect_timeout,
                 skip_health_check=True,
             )
@@ -526,18 +584,68 @@ class OpenSandboxClient(_SandboxClient):
                     self._destroy_tasks.pop(sandbox_id, None)
 
             task.add_done_callback(discard)
-        await _join_owned_task(task)
+        await _join_owned_task(task, failure_label="OpenSandbox destruction")
 
-    async def aclose(self) -> None:
-        """Finish cancellation cleanup and close the owned asynchronous transport."""
+    async def _close_resources(self) -> None:
+        """Settle client work before releasing its only owned transport.
+
+        The owning config remains reachable until transport closure succeeds. This
+        lets a later close retry if the retained task itself is cancelled, while
+        SDK calls continue to borrow only ``_sdk_connection_config``.
+        """
+
         while self._destroy_tasks:
             tasks = tuple(self._destroy_tasks.values())
             await asyncio.gather(*tasks, return_exceptions=True)
         while self._cleanup_tasks:
             tasks = tuple(self._cleanup_tasks)
             await asyncio.gather(*tasks, return_exceptions=True)
+        owned_connection_config = self._owned_connection_config
+        if owned_connection_config is None:
+            return
         try:
-            await self.connection_config.close_transport_if_owned()
+            transport = owned_connection_config.transport
+            if transport is None:
+                raise RuntimeError("OpenSandbox owned transport is missing")
+            # OpenSandbox 0.1.14's ownership helper suppresses ordinary close
+            # failures. This client has already proven ownership in
+            # ``_scope_sdk_transport``, so it closes the transport directly and keeps
+            # the owner reachable until a successful result. The retry contract is
+            # guarded by ``test_client_close_reports_an_owned_transport_failure_and_retries``.
+            await transport.aclose()
         except Exception as error:
             translated = _backend_error("client close", error)
             raise translated from error
+        self._owned_connection_config = None
+
+    async def aclose(self) -> None:
+        """Finish client work and close only the asynchronous transport it owns.
+
+        Concurrent callers join one retained close task. Cancelling a caller does
+        not cancel resource settlement; cancellation propagates after that shared
+        task completes. If the close task itself fails or is cancelled, the owned
+        transport remains available for a later retry.
+
+        Raises:
+            asyncio.CancelledError: The caller is cancelled after settlement, or the
+                retained close task is cancelled independently.
+            OpenSandboxBackendError: Owned transport closure fails.
+        """
+
+        close_task = self._close_task
+        if close_task is None:
+            close_task = asyncio.create_task(
+                self._close_resources(),
+                name="tinkerfin-opensandbox-client-close",
+            )
+            self._close_task = close_task
+        try:
+            await _join_owned_task(
+                close_task,
+                failure_label="OpenSandbox client close",
+            )
+        finally:
+            # A finished task no longer owns work. The transport owner itself is
+            # cleared only by a successful settlement, so failed closure can retry.
+            if close_task.done() and self._close_task is close_task:
+                self._close_task = None

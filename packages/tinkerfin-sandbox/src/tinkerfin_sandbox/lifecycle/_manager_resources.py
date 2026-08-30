@@ -19,14 +19,18 @@ __all__ = [
     "_drain_cleanup_queue",
     "_fill_warm_pool",
     "_is_backend_healthy",
+    "_maintain_warm_pool",
     "_owner_key",
+    "_reconcile_ready_warm_slot",
     "_release_cleanup_claim",
     "_renew_backend",
+    "_renew_ready_backend",
     "_schedule_replenish",
     "_start_backend_cleanup",
     "_take_local_warm_backend",
     "_track_cleanup_task",
     "_wait_for_cleanup_tasks",
+    "_warm_maintenance_loop",
 ]
 
 import asyncio
@@ -36,15 +40,21 @@ from typing import TYPE_CHECKING, TypeVar
 
 from ..backends.handle import OpenSandboxHandle
 from ..backends.rooted import RootedOpenSandboxBackend
-from ..backends.sdk import OpenSandboxBackend
+from ..backends.sdk import OpenSandboxBackend, unavailable_reason
 from ..errors import (
+    OpenSandboxBackendError,
+    OpenSandboxBackendTimeoutError,
+    OpenSandboxBackendUnavailableError,
     OpenSandboxDestroyError,
     OpenSandboxStateOwnershipError,
+    OpenSandboxWarmPoolUnavailableError,
 )
+from ..models import OpenSandboxRuntimeInfo
 from .state import (
     OpenSandboxBinding,
     OpenSandboxCleanupClaim,
     OpenSandboxOwnerClaim,
+    OpenSandboxReadyWarmClaim,
     OpenSandboxWarmClaim,
 )
 
@@ -68,6 +78,15 @@ _CLEANUP_RETRY_MAX_SECONDS = 5.0
 
 
 _CLEANUP_IDLE_POLL_SECONDS = 5.0
+
+
+_TERMINAL_WARM_STATES = frozenset({"failed", "stopping", "terminated"})
+
+
+_WARM_MAINTENANCE_MAX_SECONDS = 60.0
+
+
+_WARM_MAINTENANCE_MIN_SECONDS = 0.05
 
 
 _OWNER_METADATA_KEY = "tinkerfin.ai/owner"
@@ -205,11 +224,20 @@ async def _is_backend_healthy(
 async def _renew_backend(
     self: OpenSandboxManager[KeyT], backend: _HealthBackend
 ) -> None:
-    """Best-effort renewal without invalidating an otherwise healthy handle."""
+    """Best-effort renewal without invalidating an otherwise healthy owner handle."""
+
     try:
         await backend.arenew(self._client.config.ttl)
-    except Exception:  # noqa: BLE001 - lease renewal is best effort
+    except Exception:  # noqa: BLE001 - preserve the established owner reuse contract
         pass
+
+
+async def _renew_ready_backend(
+    self: OpenSandboxManager[KeyT], backend: _HealthBackend
+) -> None:
+    """Renew warm capacity strictly because readiness depends on its expiry."""
+
+    await backend.arenew(self._client.config.ttl)
 
 
 async def _close_backend(
@@ -501,18 +529,17 @@ async def _dispose_backend(
         await self._close_backend(backend)
 
 
-async def _fill_warm_pool(
-    self: OpenSandboxManager[KeyT], *, fail_on_error: bool = False
-) -> None:
-    """Claim and fill global warm slots through State."""
-    failure_type: str | None = None
+async def _fill_warm_pool(self: OpenSandboxManager[KeyT]) -> tuple[str, ...]:
+    """Claim and fill global warm slots, preserving the first creation failure."""
+
+    published_ids: list[str] = []
     async with self._warm_fill_lock:
         while True:
             if self._closed:
-                return
+                return tuple(published_ids)
             claim = await self._state.claim_warm_slot()
             if claim is None:
-                return
+                return tuple(published_ids)
             backend = None
             published = False
             try:
@@ -523,13 +550,10 @@ async def _fill_warm_pool(
                 if backend is not None:
                     await self._cleanup_owned_backend(backend, destroy=True)
                 raise
-            except Exception as error:
+            except Exception as error:  # noqa: BLE001 - public boundaries translated it
                 if backend is not None:
                     await self._cleanup_owned_backend(backend, destroy=True)
-                if fail_on_error:
-                    raise
-                failure_type = type(error).__name__
-                break
+                raise error.with_traceback(error.__traceback__)
             finally:
                 if not published:
                     release_task = asyncio.create_task(
@@ -540,23 +564,275 @@ async def _fill_warm_pool(
 
             async with self._warm_lock:
                 self._warm_backends.append(backend)
-    # Host logging handlers can block. Never invoke them while the ownership lock is held.
-    if failure_type is not None:
-        logger.warning(
-            "Sandbox warm-pool creation failed",
-            extra={"tinkerfin_error_type": failure_type},
+            published_ids.append(backend.id)
+
+
+async def _probe_ready_warm_backend(
+    self: OpenSandboxManager[KeyT],
+    claim: OpenSandboxReadyWarmClaim,
+) -> OpenSandboxBackend | None:
+    """Reconnect, health-check, and renew one fenced published warm Sandbox."""
+
+    backend = await self._take_local_warm_backend(claim.sandbox_id)
+    if backend is None:
+        try:
+            backend = await self._client.connect(claim.sandbox_id)
+        except Exception as error:
+            if _is_confirmed_missing_backend(error):
+                return None
+            if isinstance(error, OpenSandboxBackendTimeoutError):
+                try:
+                    runtime = await self._client.inspect(claim.sandbox_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as inspection_error:
+                    error.add_note(
+                        "OpenSandbox terminal-state inspection also failed: "
+                        f"{type(inspection_error).__name__}"
+                    )
+                    raise error.with_traceback(
+                        error.__traceback__
+                    ) from inspection_error
+                if _runtime_confirms_unusable_warm(runtime):
+                    return None
+            raise
+
+    async def check_health() -> bool:
+        response = await backend.aexecute(self._client.config.health_command)
+        return response.exit_code == 0
+
+    health_task = asyncio.create_task(
+        check_health(),
+        name=f"tinkerfin-opensandbox-warm-health:{claim.slot}",
+    )
+    try:
+        healthy = await asyncio.shield(health_task)
+    except asyncio.CancelledError:
+        cleanup_task = asyncio.create_task(
+            self._cleanup_after_health_check(
+                backend,
+                health_task,
+                destroy=False,
+            ),
+            name=f"tinkerfin-opensandbox-warm-health-cleanup:{claim.slot}",
         )
+        self._track_cleanup_task(cleanup_task)
+        raise
+    except Exception:
+        await self._cleanup_owned_backend(backend, destroy=False)
+        raise
+    if not healthy:
+        await self._cleanup_owned_backend(backend, destroy=False)
+        return None
+    try:
+        await self._renew_ready_backend(backend)
+    except Exception:
+        await self._cleanup_owned_backend(backend, destroy=False)
+        raise
+    return backend
+
+
+def _is_confirmed_missing_backend(error: Exception) -> bool:
+    """Return whether a reconnect failure proves the remote ID no longer exists."""
+
+    if not isinstance(error, OpenSandboxBackendUnavailableError):
+        return False
+    if error.context.get("reason") == "not_found":
+        return True
+    source = error.cause if isinstance(error, OpenSandboxBackendError) else None
+    candidate = source if isinstance(source, Exception) else error
+    return unavailable_reason(candidate) == "not_found"
+
+
+def _runtime_confirms_unusable_warm(runtime: OpenSandboxRuntimeInfo) -> bool:
+    """Accept only authoritative absence or terminal lifecycle as replacement proof."""
+
+    if not runtime.available:
+        return runtime.unavailable_reason == "not_found"
+    status = runtime.status
+    return status is not None and status.state.casefold() in _TERMINAL_WARM_STATES
+
+
+async def _probe_ready_warm_with_renewal(
+    self: OpenSandboxManager[KeyT],
+    claim: OpenSandboxReadyWarmClaim,
+) -> OpenSandboxBackend | None:
+    """Keep the State fence current while the remote readiness probe is in flight."""
+
+    interval = self._state.lease_renew_interval
+    if interval is None:
+        return await _probe_ready_warm_backend(self, claim)
+
+    probing = asyncio.create_task(
+        _probe_ready_warm_backend(self, claim),
+        name=f"tinkerfin-opensandbox-warm-probe:{claim.slot}",
+    )
+
+    async def renew() -> None:
+        while True:
+            await asyncio.sleep(interval)
+            if not await self._state.renew_warm(claim):
+                raise OpenSandboxStateOwnershipError(
+                    f"Warm slot {claim.slot} was lost during remote readiness check"
+                )
+
+    renewing = asyncio.create_task(
+        renew(),
+        name=f"tinkerfin-opensandbox-warm-probe-lease:{claim.slot}",
+    )
+    try:
+        done, _ = await asyncio.wait(
+            {probing, renewing},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if renewing in done:
+            renewal_error = renewing.exception()
+            if renewal_error is not None:
+                if not probing.done():
+                    probing.cancel()
+                await asyncio.gather(probing, return_exceptions=True)
+                raise renewal_error
+        return probing.result()
+    except asyncio.CancelledError:
+        if not probing.done():
+            probing.cancel()
+        await asyncio.gather(probing, return_exceptions=True)
+        raise
+    finally:
+        if not renewing.done():
+            renewing.cancel()
+        await asyncio.gather(renewing, return_exceptions=True)
+
+
+async def _reconcile_ready_warm_slot(
+    self: OpenSandboxManager[KeyT],
+    claim: OpenSandboxReadyWarmClaim,
+) -> str | None:
+    """Republish one healthy ID or atomically invalidate one unusable slot."""
+
+    backend = await _probe_ready_warm_with_renewal(self, claim)
+    if backend is None:
+        await self._state.discard_ready_warm_slot(claim)
+        self._cleanup_wakeup.set()
+        return None
+    try:
+        await self._state.publish_warm(claim, backend.id)
+    except BaseException:
+        await self._cleanup_owned_backend(backend, destroy=False)
+        raise
+    async with self._warm_lock:
+        self._warm_backends.append(backend)
+    return backend.id
+
+
+async def _prune_unpublished_local_warm_backends(
+    self: OpenSandboxManager[KeyT],
+    verified_ids: set[str],
+) -> None:
+    """Close local connections that no longer represent verified warm capacity."""
+
+    async with self._warm_lock:
+        retained: list[OpenSandboxBackend] = []
+        stale: list[OpenSandboxBackend] = []
+        for backend in self._warm_backends:
+            target = retained if backend.id in verified_ids else stale
+            target.append(backend)
+        self._warm_backends = retained
+    for backend in stale:
+        await self._cleanup_owned_backend(backend, destroy=False)
+
+
+async def _maintain_warm_pool(
+    self: OpenSandboxManager[KeyT],
+    *,
+    fail_on_error: bool,
+) -> None:
+    """Reconcile real capacity and expose its current readiness to the host."""
+
+    if self._warm_pool_size == 0:
+        self._warm_failure = None
+        self._warm_ready.set()
+        return
+    self._warm_ready.clear()
+    try:
+        if not self._state.supports_warm_pool_reconciliation:
+            raise OpenSandboxWarmPoolUnavailableError(
+                "OpenSandbox State cannot verify published warm capacity",
+                context={"target_capacity": self._warm_pool_size},
+            )
+        checked_slots: list[int] = []
+        verified_ids: set[str] = set()
+        while len(checked_slots) < self._warm_pool_size:
+            claim = await self._state.claim_ready_warm_slot(
+                exclude_slots=checked_slots,
+            )
+            if claim is None:
+                break
+            checked_slots.append(claim.slot)
+            settled = False
+            try:
+                sandbox_id = await self._reconcile_ready_warm_slot(claim)
+                settled = True
+                if sandbox_id is not None:
+                    verified_ids.add(sandbox_id)
+            finally:
+                if not settled:
+                    release_task = asyncio.create_task(
+                        self._state.release_warm(claim),
+                        name=(
+                            f"tinkerfin-opensandbox-warm-reconcile-release:{claim.slot}"
+                        ),
+                    )
+                    await self._await_claim_release(release_task)
+        verified_ids.update(await self._fill_warm_pool())
+        if not await self._state.warm_pool_ready():
+            raise OpenSandboxStateOwnershipError(
+                "OpenSandbox warm capacity is still being filled by another worker"
+            )
+        await _prune_unpublished_local_warm_backends(self, verified_ids)
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        previous_failure = self._warm_failure
+        self._warm_failure = error
+        if fail_on_error:
+            raise
+        if previous_failure is None or type(previous_failure) is not type(error):
+            logger.warning(
+                "Sandbox warm-pool creation failed",
+                extra={"tinkerfin_error_type": type(error).__name__},
+            )
+        return
+    self._warm_failure = None
+    self._warm_ready.set()
+
+
+async def _warm_maintenance_loop(self: OpenSandboxManager[KeyT]) -> None:
+    """Periodically renew ready instances and retry degraded capacity."""
+
+    ttl_seconds = self._client.config.ttl.total_seconds()
+    interval = max(
+        _WARM_MAINTENANCE_MIN_SECONDS,
+        min(ttl_seconds / 3, _WARM_MAINTENANCE_MAX_SECONDS),
+    )
+    while True:
+        try:
+            await asyncio.wait_for(
+                self._warm_maintenance_wakeup.wait(),
+                timeout=interval,
+            )
+        except TimeoutError:
+            pass
+        self._warm_maintenance_wakeup.clear()
+        await self._maintain_warm_pool(fail_on_error=False)
 
 
 def _schedule_replenish(self: OpenSandboxManager[KeyT]) -> None:
     """Schedule at most one replenishment task for an open undersized pool."""
     if self._closed or not self._started or self._warm_pool_size == 0:
         return
-    if self._replenish_task is not None and not self._replenish_task.done():
-        return
-    self._replenish_task = asyncio.create_task(
-        self._fill_warm_pool(fail_on_error=False)
-    )
+    self._warm_ready.clear()
+    self._warm_maintenance_wakeup.set()
 
 
 async def _take_local_warm_backend(
@@ -666,6 +942,14 @@ async def _close_resources(self: OpenSandboxManager[KeyT]) -> None:
             # create a second package-owned record for the same outcome.
             pass
 
+    maintenance_task = self._warm_maintenance_task
+    if maintenance_task is not None:
+        if not maintenance_task.done():
+            maintenance_task.cancel()
+        await asyncio.gather(maintenance_task, return_exceptions=True)
+    self._warm_maintenance_task = None
+    self._warm_ready.clear()
+
     await self._operations_done.wait()
 
     cleanup_queue_task = self._cleanup_queue_task
@@ -676,17 +960,6 @@ async def _close_resources(self: OpenSandboxManager[KeyT]) -> None:
     self._cleanup_queue_task = None
 
     await self._wait_for_cleanup_tasks()
-
-    replenish_task = self._replenish_task
-    if replenish_task is not None:
-        try:
-            await replenish_task
-        except Exception as error:  # noqa: BLE001 - replenish task is supervisor-owned
-            logger.warning(
-                "Sandbox warm-pool replenishment failed",
-                extra={"tinkerfin_error_type": type(error).__name__},
-            )
-    self._replenish_task = None
 
     async with self._warm_lock:
         warm_backends = self._warm_backends

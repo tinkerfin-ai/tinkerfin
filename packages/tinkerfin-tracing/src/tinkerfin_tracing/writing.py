@@ -6,7 +6,10 @@ import asyncio
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import Protocol, runtime_checkable
 
+from ._prepared import PreparedTraceFact, prepare_trace_facts
+from .codec import CanonicalTracePayloadCodec
 from .errors import TraceQuotaExceeded, TraceStoreProtocolError
 from .facts import TraceEvent, TraceSemanticFact
 from .store import TraceWriter
@@ -65,9 +68,24 @@ class TraceWritePolicy:
 
 @dataclass(slots=True)
 class _PendingFacts:
-    facts: tuple[TraceSemanticFact, ...]
+    prepared: tuple[PreparedTraceFact, ...]
     encoded_bytes: int
     committed: asyncio.Future[None]
+
+
+@runtime_checkable
+class _PreparedTraceWriter(Protocol):
+    """Accept canonical fact evidence without changing the public writer contract."""
+
+    async def _append_prepared(
+        self,
+        prepared: tuple[PreparedTraceFact, ...],
+        *,
+        mandatory: bool,
+    ) -> tuple[TraceEvent, ...]:
+        """Append facts using the canonical bytes already computed for admission."""
+
+        ...
 
 
 class TraceBatchWriter:
@@ -95,12 +113,15 @@ class TraceBatchWriter:
         if not callable(on_committed):
             raise TypeError("on_committed must be callable")
         self._writer = writer
+        self._codec = CanonicalTracePayloadCodec()
         self._policy = policy
         self._on_committed = on_committed
         self._condition = asyncio.Condition()
         self._queue: deque[_PendingFacts] = deque()
         self._pending_events = 0
         self._pending_bytes = 0
+        self._queued_events = 0
+        self._queued_bytes = 0
         self._force_requested = False
         self._closing = False
         self._closed = False
@@ -132,15 +153,15 @@ class TraceBatchWriter:
                 await self.force()
                 self._raise_if_failed()
                 try:
-                    events = await self._writer.append(facts, mandatory=True)
+                    prepared = prepare_trace_facts(facts, codec=self._codec)
+                    events = await self._append(prepared, mandatory=True)
                     await self._notify_committed(events)
                 except BaseException as error:
                     self._record_failure(error)
                     raise
             return
-        encoded_bytes = sum(
-            len(fact.model_dump_json(by_alias=True).encode()) for fact in facts
-        )
+        prepared_facts = prepare_trace_facts(facts, codec=self._codec)
+        encoded_bytes = sum(item.exact_byte_count for item in prepared_facts)
         if (
             len(facts) > self._policy.max_pending_events
             or encoded_bytes > self._policy.max_pending_bytes
@@ -160,13 +181,15 @@ class TraceBatchWriter:
                 await self._condition.wait()
                 self._require_open()
             pending = _PendingFacts(
-                facts=facts,
+                prepared=prepared_facts,
                 encoded_bytes=encoded_bytes,
                 committed=committed,
             )
             self._queue.append(pending)
             self._pending_events += len(facts)
             self._pending_bytes += encoded_bytes
+            self._queued_events += len(facts)
+            self._queued_bytes += encoded_bytes
             self._last_commit = committed
             self._ensure_worker()
             self._condition.notify_all()
@@ -248,21 +271,21 @@ class TraceBatchWriter:
                 batch = await self._next_batch()
                 if batch is None:
                     return
-                facts = tuple(fact for item in batch for fact in item.facts)
+                prepared = tuple(fact for item in batch for fact in item.prepared)
                 try:
-                    events = await self._writer.append(facts, mandatory=False)
+                    events = await self._append(prepared, mandatory=False)
                     await self._notify_committed(events)
                 except BaseException as error:  # noqa: BLE001 - producer outcome
                     async with self._condition:
                         self._record_failure(error)
                         self._settle_failed(batch, error)
                         while self._queue:
-                            self._settle_failed((self._queue.popleft(),), error)
+                            self._settle_failed((self._pop_queued(),), error)
                         self._condition.notify_all()
                     return
                 async with self._condition:
                     for item in batch:
-                        self._pending_events -= len(item.facts)
+                        self._pending_events -= len(item.prepared)
                         self._pending_bytes -= item.encoded_bytes
                         if not item.committed.done():
                             item.committed.set_result(None)
@@ -273,7 +296,7 @@ class TraceBatchWriter:
             async with self._condition:
                 self._record_failure(error)
                 while self._queue:
-                    self._settle_failed((self._queue.popleft(),), error)
+                    self._settle_failed((self._pop_queued(),), error)
                 self._condition.notify_all()
             raise
 
@@ -287,11 +310,9 @@ class TraceBatchWriter:
                 asyncio.get_running_loop().time() + self._policy.max_batch_delay_seconds
             )
             while not self._force_requested and not self._closing:
-                queued_events = sum(len(item.facts) for item in self._queue)
-                queued_bytes = sum(item.encoded_bytes for item in self._queue)
                 if (
-                    queued_events >= self._policy.max_batch_events
-                    or queued_bytes >= self._policy.max_batch_bytes
+                    self._queued_events >= self._policy.max_batch_events
+                    or self._queued_bytes >= self._policy.max_batch_bytes
                 ):
                     break
                 remaining = deadline - asyncio.get_running_loop().time()
@@ -308,19 +329,44 @@ class TraceBatchWriter:
             while self._queue:
                 candidate = self._queue[0]
                 would_exceed = selected and (
-                    selected_events + len(candidate.facts)
+                    selected_events + len(candidate.prepared)
                     > self._policy.max_batch_events
                     or selected_bytes + candidate.encoded_bytes
                     > self._policy.max_batch_bytes
                 )
                 if would_exceed:
                     break
-                selected.append(self._queue.popleft())
-                selected_events += len(candidate.facts)
+                selected.append(self._pop_queued())
+                selected_events += len(candidate.prepared)
                 selected_bytes += candidate.encoded_bytes
             if not self._queue:
                 self._force_requested = False
             return tuple(selected)
+
+    async def _append(
+        self,
+        prepared: tuple[PreparedTraceFact, ...],
+        *,
+        mandatory: bool,
+    ) -> tuple[TraceEvent, ...]:
+        writer = self._writer
+        if isinstance(writer, _PreparedTraceWriter):
+            return await writer._append_prepared(
+                prepared,
+                mandatory=mandatory,
+            )
+        return await writer.append(
+            tuple(item.fact for item in prepared),
+            mandatory=mandatory,
+        )
+
+    def _pop_queued(self) -> _PendingFacts:
+        """Remove one queued submission and update only queue-local counters."""
+
+        item = self._queue.popleft()
+        self._queued_events -= len(item.prepared)
+        self._queued_bytes -= item.encoded_bytes
+        return item
 
     async def _notify_committed(self, events: tuple[TraceEvent, ...]) -> None:
         if not events:
@@ -335,7 +381,7 @@ class TraceBatchWriter:
         error: BaseException,
     ) -> None:
         for item in batch:
-            self._pending_events -= len(item.facts)
+            self._pending_events -= len(item.prepared)
             self._pending_bytes -= item.encoded_bytes
             if not item.committed.done():
                 item.committed.set_exception(error)

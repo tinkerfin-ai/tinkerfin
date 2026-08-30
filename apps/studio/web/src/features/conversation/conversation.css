@@ -416,7 +416,6 @@
     }
   }
 
-  .streaming-indicator,
   .message-stream-tail {
     margin: 0;
     color: var(--color-text-tertiary);
@@ -815,12 +814,62 @@
     font-weight: var(--weight-medium);
   }
 
-  .subagent-task-line p {
+  .subagent-task-detail {
+    position: relative;
+    min-width: 0;
+  }
+
+  .subagent-task-summary {
+    display: block;
+    width: 100%;
     min-width: 0;
     margin: 0;
+    padding: 0;
     overflow: hidden;
+    border: 0;
+    border-radius: var(--radius-xs);
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    outline: 0;
+    cursor: help;
+    text-align: left;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .subagent-task-summary:hover,
+  .subagent-task-summary:active { color: var(--color-text-primary); }
+
+  .subagent-task-summary:focus-visible {
+    outline: 2px solid var(--color-focus);
+    outline-offset: 2px;
+  }
+
+  .subagent-task-tooltip {
+    top: calc(100% + var(--space-1));
+    right: 0;
+    left: auto;
+    width: max-content;
+    max-width: min(560px, calc(100vw - var(--space-8)));
+    max-height: min(240px, 40vh);
+    padding: var(--space-3) var(--space-4);
+    overflow: auto;
+    transform: translateY(-2px);
+    color: var(--color-text-primary);
+    font-size: var(--type-ui-size);
+    line-height: var(--type-title-line);
+    overflow-wrap: anywhere;
+    pointer-events: auto;
+    text-align: left;
+    white-space: pre-wrap;
+  }
+
+  .subagent-task-detail.is-open .subagent-task-tooltip {
+    transform: translateY(0);
+    opacity: 1;
+    visibility: visible;
+    transition-delay: var(--motion-instant);
   }
 
   .subagent-trace-list {
@@ -1190,19 +1239,27 @@
 
   .approval-tool-card .tool-detail-card { background: var(--color-layer-2); }
 
-  .approval-rejection-form {
+  .approval-rejection-form,
+  .plan-review-rejection-form {
     display: grid;
     gap: var(--space-1-5);
+  }
+
+  .approval-rejection-form {
     margin: 0 10px;
   }
 
-  .approval-rejection-form label {
+  .plan-review-rejection-form { margin: 0 22px var(--space-4); }
+
+  .approval-rejection-form label,
+  .plan-review-rejection-form label {
     font-size: var(--type-meta-size);
     font-weight: var(--weight-semibold);
     line-height: var(--type-meta-line);
   }
 
-  .approval-rejection-form textarea {
+  .approval-rejection-form textarea,
+  .plan-review-rejection-form textarea {
     width: 100%;
     max-height: calc(var(--type-meta-line) * 6);
     padding: var(--space-3);
@@ -1216,7 +1273,8 @@
     line-height: var(--type-meta-line);
   }
 
-  .approval-rejection-form textarea:focus {
+  .approval-rejection-form textarea:focus,
+  .plan-review-rejection-form textarea:focus {
     border-color: var(--color-border-strong);
     outline: 0;
     box-shadow: none;
@@ -1282,63 +1340,14 @@
     padding: var(--space-4) 22px;
   }
 
-  .plan-review-actions {
-    display: flex;
-    min-width: 0;
-    flex-wrap: wrap;
-    justify-content: flex-end;
-    gap: var(--space-2);
-    margin: 0 22px;
-    padding: var(--space-3) 0;
-  }
-
-  .plan-review-reject-button { color: var(--color-danger-text); }
-
-  .plan-review-reject-button:hover:not(:disabled) {
-    border-color: transparent;
-    background: var(--color-danger-soft);
-  }
-
-  .plan-review-input {
-    display: grid;
-    gap: var(--space-1-5);
-    margin: 0 22px var(--space-4);
-  }
-
-  .plan-review-input > span {
-    font-size: var(--type-meta-size);
-    font-weight: var(--weight-semibold);
-    line-height: var(--type-meta-line);
-  }
-
-  .plan-review-input textarea {
-    width: 100%;
-    max-height: calc(var(--type-meta-line) * 6);
-    padding: var(--space-3);
-    resize: vertical;
-    border: 1px solid var(--color-border);
-    border-radius: var(--radius-3xl);
-    outline: 0;
-    background: var(--color-layer-1);
-    color: var(--color-text-primary);
-    font-size: var(--type-meta-size);
-    line-height: var(--type-meta-line);
-  }
-
-  .plan-review-input textarea:focus {
-    border-color: var(--color-border-strong);
-    outline: 0;
-    box-shadow: none;
-  }
-
   .plan-review-composer-footer {
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;
     align-items: center;
     gap: var(--space-3);
     flex: 0 0 auto;
-    min-height: var(--control-xl);
-    padding: var(--space-2) 12px var(--space-2) 18px;
+    min-height: var(--space-16);
+    padding: var(--space-3) var(--space-4);
   }
 
   .plan-review-composer-feedback {
@@ -1349,6 +1358,8 @@
     line-height: var(--type-caption-line);
     text-align: right;
   }
+
+  .plan-review-composer-feedback:empty { display: none; }
 
   .plan-question-progress {
     display: flex;
@@ -1477,6 +1488,22 @@
   .plan-question-date-copy { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: var(--space-3); font-size: var(--type-ui-size); line-height: var(--type-title-line); }
   .plan-question-date-label { color: var(--color-text-secondary); }
   .plan-question-date .ui-date-picker__trigger { min-width: 150px; }
+  .plan-question-time-copy { display: grid; min-width: 0; gap: 1px; }
+  .plan-question-time-copy small { color: var(--color-text-tertiary); font-size: var(--type-micro-size); line-height: var(--type-caption-line); }
+  .plan-question-time-input {
+    min-width: 150px;
+    min-height: var(--control-sm);
+    padding: 0 var(--space-2);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    background: var(--color-layer-1);
+    color: var(--color-text-primary);
+    font: inherit;
+    color-scheme: light dark;
+  }
+  .plan-question-time-input:hover { border-color: var(--color-border-strong); }
+  .plan-question-time-input:active { background: var(--color-active); }
+  .plan-question-time-input:focus-visible { border-color: var(--color-border-strong); outline: 2px solid var(--color-border-strong); outline-offset: 1px; }
 
   .plan-question-composer-footer {
     display: grid;
@@ -1718,8 +1745,7 @@
     .plan-question-composer-feedback,
     .plan-review-composer-feedback { grid-row: 2; grid-column: 1 / -1; text-align: left; }
     .plan-review-content { padding-right: var(--space-4); padding-left: var(--space-4); }
-    .plan-review-actions,
-    .plan-review-input { margin-right: var(--space-4); margin-left: var(--space-4); }
+    .plan-review-rejection-form { margin-right: var(--space-4); margin-left: var(--space-4); }
     .plan-question-progress { margin-right: var(--space-3); margin-left: var(--space-3); }
     .approval-composer-actions { grid-column: 2; }
   }
@@ -1730,15 +1756,6 @@
     .tool-detail-section { grid-template-columns: minmax(0, 1fr); row-gap: var(--space-1-5); padding: var(--space-3); }
     .tool-field-label { position: static; }
     .plan-review-composer-head { gap: var(--space-2); }
-    .plan-review-actions {
-      display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-    }
-    .plan-review-actions .ui-button {
-      width: 100%;
-      gap: var(--space-1);
-      padding-inline: var(--space-1-5);
-    }
   }
 
   @media (any-hover: none), (any-pointer: coarse) {
@@ -1757,6 +1774,7 @@
       transition: none;
     }
     .subagent-card-head { height: var(--control-lg); }
+    .subagent-task-summary { min-height: var(--control-lg); }
     .tool-row > summary { height: var(--control-lg); }
     .plan-question-option,
     .plan-question-custom,
@@ -1764,6 +1782,7 @@
     .composer-model-options [role='option'],
     .composer-suggestion-item { min-height: var(--control-lg); }
     .plan-question-date { height: var(--control-lg); }
+    .plan-question-time-input { min-height: var(--control-lg); }
     .plan-question-composer.is-minimized .plan-question-progress,
     .plan-question-composer.is-minimized .plan-question-progress-step { height: var(--control-lg); }
     .plan-question-composer-head-button { width: var(--control-lg); min-width: var(--control-lg); height: var(--control-lg); min-height: var(--control-lg); }
@@ -1790,7 +1809,7 @@
     .ui-button:not(.ui-icon-button):focus-visible { outline: 2px solid Highlight; }
 
     .approval-rejection-form textarea:focus-visible,
-    .plan-review-input textarea:focus-visible,
+    .plan-review-rejection-form textarea:focus-visible,
     .composer-attachment-remove:focus-visible { outline: 2px solid Highlight; outline-offset: 2px; }
 
     .plan-question-option:focus-visible,

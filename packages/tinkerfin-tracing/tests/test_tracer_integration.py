@@ -6,10 +6,14 @@ import asyncio
 import inspect
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from datetime import UTC, datetime
+from importlib.metadata import version
 from typing import Any, cast
 
 import pytest
+from ag_ui.core import RunFinishedEvent
 from langchain.agents.middleware.types import InputAgentState
+from langchain.tools import tool
+from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import (
     AIMessage,
     AIMessageChunk,
@@ -17,7 +21,10 @@ from langchain_core.messages import (
     ToolMessage,
 )
 from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import BaseTool
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import Interrupt
 from pydantic import BaseModel
 
 from tinkerfin import (
@@ -70,6 +77,23 @@ class _Graph:
     ) -> AsyncIterator[Mapping[str, object]]:
         for part in self.parts:
             yield part
+
+
+class _SubagentToolBindingModel(FakeMessagesListChatModel):
+    def bind_tools(
+        self,
+        tools: Sequence[dict[str, Any] | type | Callable[..., Any] | BaseTool],
+        **kwargs: Any,
+    ) -> _SubagentToolBindingModel:
+        del tools, kwargs
+        return self
+
+
+@tool
+def reviewed_child_tool(value: str) -> str:
+    """Return a value after the child Tool review."""
+
+    return value
 
 
 class _ReadCountingStore(InMemoryTraceStore):
@@ -253,9 +277,9 @@ async def test_runtime_trace_projects_messages_tree_state_todos_and_safe_events(
     assert [(message.role, message.content) for message in thread.messages] == [
         ("user", "do work"),
         ("assistant", "hello world"),
-        ("tool", None),
+        ("tool", "Updated todo list"),
     ]
-    assert thread.messages[2].content_omitted is True
+    assert thread.messages[2].content_omitted is False
     assert [message.trace_seq for message in thread.messages] == sorted(
         message.trace_seq for message in thread.messages
     )
@@ -273,7 +297,7 @@ async def test_runtime_trace_projects_messages_tree_state_todos_and_safe_events(
     tool = next(node for node in thread.tree.nodes if node.kind == "tool")
     assert assistant.trace_seq < tool.trace_seq
     assert thread.status.execution == "succeeded"
-    assert thread.completeness.payload_omitted is True
+    assert thread.completeness.payload_omitted is False
     result = thread.projections["fact_counts"]
     assert isinstance(result, FactCountResult)
     assert result.counts["tool"] == 4
@@ -321,6 +345,165 @@ async def test_runtime_trace_projects_messages_tree_state_todos_and_safe_events(
         "closed",
     ]
     assert all(event.fact.kind not in {"agui", "messaging"} for event in page.items)
+
+
+async def test_propagated_subagent_interrupt_uses_the_deepest_trace_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = ("tools:subagent-task",)
+    interrupt = Interrupt(
+        id="child-review",
+        value={
+            "action_requests": [
+                {
+                    "name": "write_file",
+                    "args": {"file_path": "/result.txt", "content": "result"},
+                }
+            ],
+            "review_configs": [
+                {
+                    "action_name": "write_file",
+                    "allowed_decisions": ["approve", "reject"],
+                }
+            ],
+        },
+    )
+    child_message = AIMessage(
+        id="child-assistant",
+        content="",
+        tool_calls=[
+            {
+                "name": "write_file",
+                "args": {"file_path": "/result.txt", "content": "result"},
+                "id": "child-write",
+                "type": "tool_call",
+            }
+        ],
+    )
+    root_message = AIMessage(
+        id="root-assistant",
+        content="",
+        tool_calls=[
+            {
+                "name": "task",
+                "args": {
+                    "description": "Write the reviewed result",
+                    "subagent_type": "general-purpose",
+                },
+                "id": "parent-task",
+                "type": "tool_call",
+            }
+        ],
+    )
+    parts: tuple[Mapping[str, object], ...] = (
+        {
+            "type": "values",
+            "ns": namespace,
+            "data": {
+                "messages": [child_message],
+            },
+            "interrupts": (interrupt,),
+        },
+        {
+            "type": "values",
+            "ns": (),
+            "data": {
+                "messages": [
+                    HumanMessage(id="user", content="Delegate"),
+                    root_message,
+                ],
+            },
+            "interrupts": (interrupt,),
+        },
+    )
+    tracer = Tracer()
+    definition = _definition(monkeypatch, _Graph(parts), tracer=tracer)
+    runtime = definition.new(
+        identity=RunIdentity(threadId="thread-child-review", runId="run-review")
+    )
+
+    delivered = [
+        part
+        async for part in runtime.astream(
+            InputAgentState(messages=[HumanMessage(id="user", content="Delegate")]),
+            config=cast(
+                RunnableConfig,
+                {"configurable": {"thread_id": "thread-child-review"}},
+            ),
+        )
+    ]
+    thread = await tracer.get("thread-child-review")
+
+    assert delivered == list(parts)
+    assert [
+        (interaction.namespace, interaction.source_id, interaction.status)
+        for interaction in thread.interactions
+    ] == [(namespace, "child-review", "pending")]
+    assert thread.status.execution == "waiting"
+
+
+async def test_locked_subagent_hitl_remains_an_interrupt_with_tracing() -> None:
+    assert version("deepagents") == "0.7.5"
+    assert version("langgraph") == "1.2.10"
+    model = _SubagentToolBindingModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "task",
+                        "args": {
+                            "description": "Run the reviewed child Tool",
+                            "subagent_type": "general-purpose",
+                        },
+                        "id": "parent-task-call",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "reviewed_child_tool",
+                        "args": {"value": "child"},
+                        "id": "child-reviewed-call",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="child done"),
+            AIMessage(content="root done"),
+        ]
+    )
+    tracer = Tracer(store=InMemoryTraceStore())
+    definition = (
+        TinkerFin()
+        .observe(tracer)
+        .create_deep_agent(
+            model=model,
+            tools=[reviewed_child_tool],
+            interrupt_on={"reviewed_child_tool": {"allowed_decisions": ["approve"]}},
+            checkpointer=InMemorySaver(),
+        )
+    )
+    identity = RunIdentity(threadId="thread-real-child-review", runId="run-review")
+    stream = definition.new_agui(identity=identity).astream(
+        {"messages": [HumanMessage(content="Delegate", id="user")]}
+    )
+    events = [event async for event in stream]
+    terminal = events[-1]
+    thread = await tracer.get(identity.thread_id)
+
+    assert isinstance(terminal, RunFinishedEvent)
+    assert terminal.outcome is not None
+    assert terminal.outcome.type == "interrupt"
+    assert len(terminal.outcome.interrupts) == 1
+    assert stream.error is None
+    assert len(thread.interactions) == 1
+    assert thread.interactions[0].namespace
+    assert thread.interactions[0].status == "pending"
+    assert thread.status.execution == "waiting"
 
 
 async def _record_run(

@@ -29,7 +29,7 @@ def conversation_identity(thread_id: str, run_id: str) -> RunIdentity:
 
 @dataclass(frozen=True, slots=True)
 class StartChatIntent:
-    """一次普通用户输入及其 Graph 映射"""
+    """一次普通用户输入及其 Agent 消息"""
 
     graph_message: HumanMessage
     title: str
@@ -47,7 +47,7 @@ ChatIntent = StartChatIntent | ResumeChatIntent
 
 @dataclass(frozen=True, slots=True)
 class PreparedRunRequest:
-    """数据库、Messaging、Graph 与主开始事件共用的权威请求事实"""
+    """数据库、Messaging、Agent 与主开始事件共用的权威请求事实"""
 
     input_json: dict[str, JsonValue]
     identity: RunIdentity
@@ -110,7 +110,6 @@ def prepare_run_request(
     identity = conversation_identity(thread_id, request.run_id)
     graph_config: RunnableConfig = {
         "configurable": {
-            "thread_id": identity.thread_id,
             "forwarded_props": request.forwarded_props.model_dump(
                 mode="json",
                 by_alias=True,
@@ -143,7 +142,7 @@ def decorate_main_event(
     prepared: PreparedRunRequest,
     title: str,
 ) -> BaseEvent:
-    """只补充 Studio 产品标题和取消文案，不重写框架协议字段"""
+    """只补充 Studio 产品标题和取消文案"""
 
     run_id = prepared.identity.run_id
     if isinstance(event, RunStartedEvent) and event.run_id == run_id:

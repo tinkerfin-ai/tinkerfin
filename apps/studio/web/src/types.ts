@@ -98,7 +98,7 @@ export interface PlanQuestionOption {
 
 interface PlanQuestionBase {
   id: string
-  answerType: 'single_choice' | 'multiple_choice' | 'text' | 'date'
+  answerType: 'single_choice' | 'multiple_choice' | 'text' | 'date' | 'time' | 'datetime'
   prompt: string
   required: boolean
   attributes?: JsonObject | null
@@ -133,11 +133,29 @@ export interface PlanDateQuestion extends PlanQuestionBase {
   date?: string
 }
 
+export interface PlanTimeQuestion extends PlanQuestionBase {
+  answerType: 'time'
+  timeZone: string
+  minimum?: string | null
+  maximum?: string | null
+  time?: string
+}
+
+export interface PlanDateTimeQuestion extends PlanQuestionBase {
+  answerType: 'datetime'
+  timeZone: string
+  minimum?: string | null
+  maximum?: string | null
+  dateTime?: string
+}
+
 export type PlanQuestionItem =
   | PlanSingleChoiceQuestion
   | PlanMultipleChoiceQuestion
   | PlanTextQuestion
   | PlanDateQuestion
+  | PlanTimeQuestion
+  | PlanDateTimeQuestion
 
 export interface PlanQuestionState {
   kind: 'questions'
@@ -172,7 +190,8 @@ export interface PlanReviewState {
   interruptId: string
   revision: number
   draft: MarkdownPlanDraft
-  action?: 'approve' | 'respond' | 'reject'
+  allowedActions: Array<'approve' | 'reject' | 'cancel'>
+  action?: 'approve' | 'reject' | 'cancel'
   message?: string
   submitted: boolean
   error?: string

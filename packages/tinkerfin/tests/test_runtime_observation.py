@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import threading
 from collections.abc import AsyncIterator, Callable, Mapping
 from datetime import UTC, datetime
 from typing import cast
@@ -12,12 +13,15 @@ import pytest
 from ag_ui.core import RunErrorEvent
 from langchain.agents.middleware.types import InputAgentState
 from langchain_core.messages import AIMessageChunk
+from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.base import BaseCheckpointSaver, CheckpointTuple
 from langgraph.types import Interrupt, StreamMode
 
 from tinkerfin import (
     AgUiResumeBinding,
     DeepAgentDefinition,
     DeepAgentsFactoryPreparation,
+    DeepAgentsRuntimeProfile,
     DeepAgentsV2RuntimeProfile,
     DeepAgentsV2StreamDriver,
     NativeStreamFrame,
@@ -35,6 +39,10 @@ from tinkerfin_contracts import (
     RuntimeObservation,
 )
 from tinkerfin_native_stream import NativeStreamPart, NativeValuesStreamPart
+
+_ProfileCheckpointSaver = (
+    BaseCheckpointSaver[int] | BaseCheckpointSaver[float] | BaseCheckpointSaver[str]
+)
 
 
 class _Session:
@@ -344,6 +352,68 @@ async def test_root_interrupt_selects_interrupted_terminal(
         ObservationBoundary.INTERRUPT,
         ObservationBoundary.CLOSE,
     ]
+
+
+async def test_root_interrupt_survives_trailing_message_part(
+    definition_factory: Callable[..., DeepAgentDefinition[None]],
+) -> None:
+    session = _Session()
+    observer = _Observer(session)
+    interrupted = {
+        "type": "values",
+        "ns": (),
+        "data": {"messages": []},
+        "interrupts": (Interrupt(value={"request": "approval"}, id="interrupt-1"),),
+    }
+    trailing = {
+        "type": "messages",
+        "ns": (),
+        "data": (
+            AIMessageChunk(id="message-after-interrupt", content=""),
+            {"langgraph_node": "model"},
+        ),
+    }
+    stream = (
+        _definition(definition_factory, _Graph([interrupted, trailing]), observer)
+        .new(identity=_identity())
+        .astream(_input())
+    )
+
+    assert [value async for value in stream] == [interrupted, trailing]
+    terminal = session.observations[-2]
+    assert terminal.kind == "run.terminal"
+    assert terminal.outcome == "interrupted"
+    assert terminal.interrupt_ids == ("interrupt-1",)
+
+
+async def test_later_root_values_can_clear_an_observed_interrupt(
+    definition_factory: Callable[..., DeepAgentDefinition[None]],
+) -> None:
+    session = _Session()
+    observer = _Observer(session)
+    interrupted = {
+        "type": "values",
+        "ns": (),
+        "data": {"messages": []},
+        "interrupts": (Interrupt(value={"request": "approval"}, id="interrupt-1"),),
+    }
+    continued = {
+        "type": "values",
+        "ns": (),
+        "data": {"messages": []},
+        "interrupts": (),
+    }
+    stream = (
+        _definition(definition_factory, _Graph([interrupted, continued]), observer)
+        .new(identity=_identity())
+        .astream(_input())
+    )
+
+    assert [value async for value in stream] == [interrupted, continued]
+    terminal = session.observations[-2]
+    assert terminal.kind == "run.terminal"
+    assert terminal.outcome == "succeeded"
+    assert terminal.interrupt_ids == ()
 
 
 async def test_explicit_close_selects_cancelled_terminal(
@@ -706,6 +776,7 @@ class _FixtureGraph:
 
 class _FixtureStreamDriver:
     def __init__(self) -> None:
+        self.validate_calls = 0
         self.normalize_calls = 0
 
     def bind_invocation(
@@ -728,6 +799,7 @@ class _FixtureStreamDriver:
         return bound
 
     def validate(self, part: object) -> NativeValuesStreamPart:
+        self.validate_calls += 1
         if part != {"fixture_payload": "value"}:
             raise ValueError("fixture source emitted an unexpected object")
         return NativeValuesStreamPart(
@@ -765,10 +837,11 @@ class _FixtureStreamDriver:
         )
 
 
-class _FixtureRuntimeProfile(DeepAgentsV2RuntimeProfile):
+class _FixtureRuntimeProfile:
     def __init__(self, graph: _FixtureGraph) -> None:
         self._graph = graph
         self._driver = _FixtureStreamDriver()
+        self.build_thread_ids: list[int] = []
 
     @property
     def profile_id(self) -> str:
@@ -797,13 +870,54 @@ class _FixtureRuntimeProfile(DeepAgentsV2RuntimeProfile):
     def stream_driver(self) -> _FixtureStreamDriver:
         return self._driver
 
+    async def stage_resume_intent(
+        self,
+        checkpointer: _ProfileCheckpointSaver,
+        config: RunnableConfig,
+        writes: tuple[tuple[str, object], ...],
+    ) -> None:
+        del checkpointer, config, writes
+        raise AssertionError("fixture profile does not stage resume state")
+
+    def pending_resume_values(
+        self,
+        checkpoint: CheckpointTuple,
+        *,
+        channel_name: str,
+    ) -> tuple[object, ...]:
+        del checkpoint, channel_name
+        return ()
+
+    def native_resume_submitted(self, checkpoint: CheckpointTuple) -> bool:
+        del checkpoint
+        return False
+
     def _build(self, *_args: object, **_kwargs: object) -> _FixtureGraph:
+        self.build_thread_ids.append(threading.get_ident())
         return self._graph
+
+
+class _AsyncFixtureRuntimeProfile(_FixtureRuntimeProfile):
+    def __init__(self, graph: _FixtureGraph) -> None:
+        super().__init__(graph)
+        self.async_build_calls = 0
+
+    async def create_agent_graph(
+        self,
+        factory: Callable[..., object],
+        args: tuple[object, ...],
+        kwargs: Mapping[str, object],
+    ) -> object:
+        self.async_build_calls += 1
+        await asyncio.sleep(0)
+        return factory(*args, **dict(kwargs))
 
 
 async def test_profile_maps_a_non_v2_source_once_for_observer_and_agui() -> None:
     graph = _FixtureGraph()
     profile = _FixtureRuntimeProfile(graph)
+    assert isinstance(profile, DeepAgentsRuntimeProfile)
+    event_loop_thread = threading.get_ident()
     session = _Session()
     definition = (
         TinkerFin(runtime_profile=profile)
@@ -824,7 +938,10 @@ async def test_profile_maps_a_non_v2_source_once_for_observer_and_agui() -> None
     assert configurable["run_id"] == "run-observed"
     assert configurable["_tinkerfin_runtime_profile"] == "fixture-profile"
     assert not ({"version", "stream_mode", "subgraphs"} & set(graph.options))
+    assert profile.stream_driver.validate_calls == 1
     assert profile.stream_driver.normalize_calls == 1
+    assert profile.build_thread_ids
+    assert all(thread_id != event_loop_thread for thread_id in profile.build_thread_ids)
     assert any(event.type.value == "STATE_SNAPSHOT" for event in events)
     assert [item.kind for item in session.observations] == [
         "run.started",
@@ -833,3 +950,56 @@ async def test_profile_maps_a_non_v2_source_once_for_observer_and_agui() -> None
         "run.terminal",
         "run.closed",
     ]
+
+
+async def test_existing_profile_uses_its_own_signature_for_direct_graph() -> None:
+    graph = _FixtureGraph()
+    profile = _FixtureRuntimeProfile(graph)
+    definition = TinkerFin(runtime_profile=profile).create_deep_agent(
+        model="provider:model",
+        tools=[],
+    )
+
+    direct = await definition.create_graph()
+    state = await direct.ainvoke(_input())
+
+    assert state == {"messages": [], "fixture": "value"}
+    assert graph.options == {"config": None, "fixture_mode": None}
+    assert profile.stream_driver.validate_calls == 1
+    assert profile.stream_driver.normalize_calls == 0
+
+
+async def test_custom_profile_can_own_asynchronous_graph_creation() -> None:
+    graph = _FixtureGraph()
+    profile = _AsyncFixtureRuntimeProfile(graph)
+    definition = TinkerFin(runtime_profile=profile).create_deep_agent(
+        model="provider:model",
+        tools=[],
+    )
+
+    direct = await definition.create_graph()
+    state = await direct.ainvoke(_input())
+
+    assert state == {"messages": [], "fixture": "value"}
+    assert profile.async_build_calls == 1
+
+
+async def test_custom_async_graph_capability_must_return_an_awaitable() -> None:
+    class InvalidAsyncProfile(_FixtureRuntimeProfile):
+        def create_agent_graph(
+            self,
+            factory: Callable[..., object],
+            args: tuple[object, ...],
+            kwargs: Mapping[str, object],
+        ) -> object:
+            del factory, args, kwargs
+            return object()
+
+    profile = InvalidAsyncProfile(_FixtureGraph())
+    definition = TinkerFin(runtime_profile=profile).create_deep_agent(
+        model="provider:model",
+        tools=[],
+    )
+
+    with pytest.raises(TypeError, match="must return an awaitable"):
+        await definition.create_graph()

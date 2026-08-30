@@ -8,6 +8,7 @@ from .capture import CapturedValue as CapturedValue
 from .capture import CapturePolicy as CapturePolicy
 from .capture import ReasoningCapturePolicy as ReasoningCapturePolicy
 from .capture import ToolCaptureRule as ToolCaptureRule
+from .capture import ToolTraceCapture as ToolTraceCapture
 from .codec import CanonicalTracePayloadCodec as CanonicalTracePayloadCodec
 from .codec import EncodedTracePayload as EncodedTracePayload
 from .errors import AmbiguousTraceHead as AmbiguousTraceHead
@@ -21,6 +22,7 @@ from .errors import (
 from .errors import TraceProjectionFailed as TraceProjectionFailed
 from .errors import TraceQuotaExceeded as TraceQuotaExceeded
 from .errors import TraceRunConflict as TraceRunConflict
+from .errors import TraceRunNotFound as TraceRunNotFound
 from .errors import TraceStoreError as TraceStoreError
 from .errors import TraceStoreProtocolError as TraceStoreProtocolError
 from .errors import TraceStoreTimeout as TraceStoreTimeout
@@ -63,6 +65,7 @@ from .views import TraceNode as TraceNode
 from .views import TraceReasoning as TraceReasoning
 from .views import TraceState as TraceState
 from .views import TraceStatus as TraceStatus
+from .views import TraceSummary as TraceSummary
 from .views import TraceTree as TraceTree
 from .views import TraceUpdate as TraceUpdate
 from .writing import TraceWritePolicy as TraceWritePolicy
@@ -100,6 +103,7 @@ __all__ = [
     "SubagentFact",
     "ToolCaptureRule",
     "ToolFact",
+    "ToolTraceCapture",
     "TraceCaptureRejected",
     "TraceCompleteness",
     "TraceCorruption",
@@ -118,6 +122,7 @@ __all__ = [
     "TraceQuotaExceeded",
     "TraceReasoning",
     "TraceRunConflict",
+    "TraceRunNotFound",
     "TraceSemanticFact",
     "TraceState",
     "TraceStatus",
@@ -126,6 +131,7 @@ __all__ = [
     "TraceStoreProtocolError",
     "TraceStoreSchema",
     "TraceStoreTimeout",
+    "TraceSummary",
     "TraceThread",
     "TraceThreadKey",
     "TraceThreadNotFound",

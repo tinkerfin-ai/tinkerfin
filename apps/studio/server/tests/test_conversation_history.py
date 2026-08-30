@@ -6,8 +6,10 @@ from datetime import UTC, datetime
 import pytest
 
 from tinkerfin_contracts import (
+    NativeInterruptRecord,
     NativeMessageObservation,
     NativeMessageRecord,
+    NativeStateObservation,
     RunClosedObservation,
     RunIdentity,
     RunInputObservation,
@@ -15,6 +17,7 @@ from tinkerfin_contracts import (
     RunSourceContext,
     RunStartedObservation,
     RunTerminalObservation,
+    RunTerminalOutcome,
 )
 from tinkerfin_studio.api.errors import BusinessException, ConversationErrorCode
 from tinkerfin_studio.conversation.history import ConversationHistoryService
@@ -70,12 +73,14 @@ async def _open_trace(
 async def _finish_trace(
     context: RunSourceContext,
     session: RunObservationSession,
+    *,
+    outcome: RunTerminalOutcome = "succeeded",
 ) -> None:
     now = datetime.now(UTC)
     await session.observe(
         RunTerminalObservation(
             identity=context.identity,
-            outcome="succeeded",
+            outcome=outcome,
             observed_at=now,
             monotonic_ns=90,
         )
@@ -83,7 +88,7 @@ async def _finish_trace(
     await session.observe(
         RunClosedObservation(
             identity=context.identity,
-            outcome="succeeded",
+            outcome=outcome,
             observed_at=now,
             monotonic_ns=91,
         )
@@ -212,6 +217,63 @@ async def test_history_cursor_keeps_original_as_of_after_new_turn(session) -> No
     assert fixed.as_of_seq == latest.as_of_seq
     assert fixed.head_run_id == "run-second"
     assert len(fixed.messages) > len(latest.messages)
+
+
+async def test_history_keeps_pending_interactions_outside_the_visible_turn(
+    session,
+) -> None:
+    tracer = Tracer()
+    repository = ConversationRepository(session)
+    thread = await _register(
+        repository,
+        user_id=1,
+        thread_id="thread-pending-history",
+        run_id="run-pending-first",
+    )
+    first_context, first_session = await _open_trace(
+        tracer,
+        thread_id=thread.thread_id,
+        run_id="run-pending-first",
+    )
+    await first_session.observe(
+        NativeStateObservation(
+            identity=first_context.identity,
+            namespace=(),
+            state={},
+            interrupts=(
+                NativeInterruptRecord(
+                    id="pending-outside-window",
+                    value={"kind": "input_required", "message": "Wait"},
+                ),
+            ),
+            observed_at=datetime.now(UTC),
+            monotonic_ns=3,
+        )
+    )
+    await _finish_trace(first_context, first_session, outcome="interrupted")
+    await _register(
+        repository,
+        user_id=1,
+        thread_id=thread.thread_id,
+        run_id="run-latest-turn",
+    )
+    latest_context, latest_session = await _open_trace(
+        tracer,
+        thread_id=thread.thread_id,
+        run_id="run-latest-turn",
+    )
+    await _finish_trace(latest_context, latest_session)
+
+    detail = await ConversationHistoryService(
+        repository,
+        user_id=1,
+        tracer=tracer,
+    ).get_detail(thread.thread_id, limit=1)
+
+    assert detail.status.execution == "waiting"
+    assert [
+        item.source_id for item in detail.interactions if item.status == "pending"
+    ] == ["pending-outside-window"]
 
 
 async def test_history_rejects_another_users_thread_before_trace_lookup(

@@ -164,8 +164,24 @@ export const mergeHistoryConversations = (
       byId.set(item.threadId, summary)
       continue
     }
-    // Trace 水化与 follow 拥有运行状态；列表和搜索只能更新产品元数据，不能回退语义视图
-    const preserveRuntime = existing.isHydrated || existing.runStatus === 'streaming'
+    const summaryTime = Date.parse(item.updatedAt)
+    const existingTime = Date.parse(existing.updatedAt)
+    const summaryIsNotOlder = Number.isFinite(summaryTime)
+      && Number.isFinite(existingTime)
+      && summaryTime >= existingTime
+    const headChanged = item.lastRunId != null
+      && item.lastRunId !== existing.trace?.headRunId
+    const pendingChanged = summary.pendingInteractionKind !== existing.pendingInteractionKind
+    const statusChanged = summary.runStatus !== existing.runStatus
+    // 浏览器自有 live stream 优先；已水化快照只拒绝较旧摘要，不能屏蔽更新的权威状态
+    const advanceHydratedRuntime = Boolean(
+      existing.isHydrated
+      && existing.runStatus !== 'streaming'
+      && summaryIsNotOlder
+      && (headChanged || pendingChanged || statusChanged || summaryTime > existingTime),
+    )
+    const preserveRuntime = existing.runStatus === 'streaming'
+      || Boolean(existing.isHydrated && !advanceHydratedRuntime)
     byId.set(item.threadId, {
       ...existing,
       title: item.title,
@@ -174,9 +190,11 @@ export const mergeHistoryConversations = (
       model: preserveRuntime ? existing.model : summary.model,
       activeRunId: preserveRuntime ? existing.activeRunId : summary.activeRunId,
       pendingInteractionKind: existing.isHydrated
+        && !advanceHydratedRuntime
         ? existing.pendingInteractionKind
         : summary.pendingInteractionKind,
       runStatus: preserveRuntime ? existing.runStatus : summary.runStatus,
+      isHydrated: existing.isHydrated && !advanceHydratedRuntime,
     })
   }
   return sortConversations([...byId.values()])
@@ -629,6 +647,7 @@ export function useWorkspaceHistory({
       prefetchedHistoryDetails.current.delete(threadId)
       const restored = restoreConversationFromTrace(detail, {
         model: detail.lastModel ?? target.model,
+        lastDeliveredSeq: target.lastSeq,
       })
       setHydrationState((current) => current?.threadId === threadId ? null : current)
       setWorkspace((state) => upsertConversation(state, { ...restored, isHydrated: true }))
@@ -687,6 +706,7 @@ export function useWorkspaceHistory({
         if (!ownsTracePageRequest(current, requestIdentity)) return state
         const restored = restoreConversationFromTrace(detail, {
           model: current?.model ?? target.model,
+          lastDeliveredSeq: current?.lastSeq,
         })
         return upsertConversation(state, restored)
       })

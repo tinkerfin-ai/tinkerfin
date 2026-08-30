@@ -129,6 +129,27 @@ async def test_recoverable_owner_uses_stable_id_and_attach_does_not_open_factory
     )
     owner_factory = _Factory(source)
     unused_factory = _Factory(error=AssertionError("attach must not rebuild source"))
+    owner_starting = 0
+    owner_not_started = 0
+    attachment_starting = 0
+    attachment_not_started = 0
+
+    async def source_starting() -> None:
+        nonlocal owner_starting
+        assert owner_factory.checkpoints == []
+        owner_starting += 1
+
+    async def delivery_not_started() -> None:
+        nonlocal owner_not_started
+        owner_not_started += 1
+
+    async def attached_source_starting() -> None:
+        nonlocal attachment_starting
+        attachment_starting += 1
+
+    async def attached_delivery_not_started() -> None:
+        nonlocal attachment_not_started
+        attachment_not_started += 1
 
     async with Messaging(backend=messaging_backend) as messaging:
         channel = messaging.channel(name="events", codec=_TextCodec())
@@ -136,6 +157,8 @@ async def test_recoverable_owner_uses_stable_id_and_attach_does_not_open_factory
             owner_factory,
             identity=_identity(),
             after=0,
+            on_source_starting=source_starting,
+            on_delivery_not_started=delivery_not_started,
         )
         owner_delivery = aiter(owner)
         first = await anext(owner_delivery)
@@ -143,6 +166,8 @@ async def test_recoverable_owner_uses_stable_id_and_attach_does_not_open_factory
             unused_factory,
             identity=_identity(),
             after=0,
+            on_source_starting=attached_source_starting,
+            on_delivery_not_started=attached_delivery_not_started,
         )
         release.set()
 
@@ -154,6 +179,10 @@ async def test_recoverable_owner_uses_stable_id_and_attach_does_not_open_factory
     assert owner_factory.checkpoints == [None]
     assert unused_factory.checkpoints == []
     assert source.close_calls == 1
+    assert owner_starting == 1
+    assert owner_not_started == 0
+    assert attachment_starting == 0
+    assert attachment_not_started == 0
 
 
 async def test_recoverable_factory_failure_settles_run_before_returning(
@@ -162,6 +191,14 @@ async def test_recoverable_factory_failure_settles_run_before_returning(
     cause = RuntimeError("cannot reopen source")
     failed_factory = _Factory(error=cause)
     unused_factory = _Factory(error=AssertionError("failed run must be replay-only"))
+    not_started_statuses: list[str] = []
+
+    async def delivery_not_started() -> None:
+        status = await messaging_backend.get_run_status(
+            channel="events",
+            identity=_identity(),
+        )
+        not_started_statuses.append(status)
 
     async with Messaging(backend=messaging_backend) as messaging:
         channel = messaging.channel(name="events", codec=_TextCodec())
@@ -170,6 +207,7 @@ async def test_recoverable_factory_failure_settles_run_before_returning(
                 failed_factory,
                 identity=_identity(),
                 after=0,
+                on_delivery_not_started=delivery_not_started,
             )
 
         replay = await channel.wrap_recoverable(
@@ -184,6 +222,7 @@ async def test_recoverable_factory_failure_settles_run_before_returning(
     assert "cannot reopen source" in str(captured.value.cause)
     assert failed_factory.checkpoints == [None]
     assert unused_factory.checkpoints == []
+    assert not_started_statuses == ["failed"]
 
 
 async def test_ownership_loss_dominates_a_simultaneous_source_open_failure(

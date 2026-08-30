@@ -42,7 +42,7 @@ def test_studio_plan_form_exposes_all_builtin_question_types() -> None:
     assert "schemaVersion" not in schema["properties"]
     assert set(
         schema["properties"]["questions"]["items"]["discriminator"]["mapping"]
-    ) == {"single_choice", "multiple_choice", "text", "date"}
+    ) == {"single_choice", "multiple_choice", "text", "date", "time", "datetime"}
     assert schema["properties"]["title"] == {
         "description": "根据本次澄清问题生成简洁、用户可见的表单标题",
         "maxLength": 20,
@@ -50,6 +50,7 @@ def test_studio_plan_form_exposes_all_builtin_question_types() -> None:
         "title": "Title",
         "type": "string",
     }
+    assert StudioPlanClarificationForm.default_time_zone == "Asia/Shanghai"
     assert schema["properties"]["description"] == {
         "description": "说明回答这些问题将如何影响本次计划",
         "maxLength": 60,

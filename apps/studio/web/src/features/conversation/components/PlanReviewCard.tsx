@@ -1,7 +1,7 @@
-import { Check, MessageSquareText, Route, X } from 'lucide-react'
+import { Route, X } from 'lucide-react'
 import { useEffect, useRef } from 'react'
 
-import { Button, OverlayScrollbar } from '../../../components/ui'
+import { Button, IconButton, OverlayScrollbar } from '../../../components/ui'
 import type { PlanReviewState } from '../../../types'
 import { useI18n } from '../../../i18n'
 import { MarkdownContent } from './MarkdownContent'
@@ -25,17 +25,28 @@ export function PlanReviewCard({
   interaction,
   onChange,
   onSubmit,
+  onCancel,
 }: {
   interaction: PlanReviewState
   onChange: (updater: (current: PlanReviewState) => PlanReviewState) => void
-  onSubmit: () => void
+  onSubmit: (action: 'approve' | 'reject') => void
+  onCancel: () => void
 }) {
   const { t } = useI18n()
   const bodyRef = useRef<HTMLDivElement | null>(null)
   const messageRef = useRef<HTMLTextAreaElement | null>(null)
+  const rejectButtonRef = useRef<HTMLButtonElement | null>(null)
+  const restoreRejectFocusRef = useRef(false)
   useEffect(() => {
-    if (interaction.action !== 'respond' && interaction.action !== 'reject') return
+    if (interaction.action !== 'reject') return
     const frame = window.requestAnimationFrame(() => messageRef.current?.focus())
+    return () => window.cancelAnimationFrame(frame)
+  }, [interaction.action, interaction.interruptId])
+
+  useEffect(() => {
+    if (!restoreRejectFocusRef.current || interaction.action === 'reject') return
+    restoreRejectFocusRef.current = false
+    const frame = window.requestAnimationFrame(() => rejectButtonRef.current?.focus())
     return () => window.cancelAnimationFrame(frame)
   }, [interaction.action, interaction.interruptId])
 
@@ -45,9 +56,15 @@ export function PlanReviewCard({
     error: undefined,
   }))
 
-  const canSubmit = Boolean(interaction.action)
-    && !interaction.submitted
-    && (interaction.action !== 'respond' || Boolean(interaction.message?.trim()))
+  const actionAllowed = (action: PlanReviewState['allowedActions'][number]) => (
+    interaction.allowedActions?.includes(action) ?? false
+  )
+  const rejectionFormId = `plan-review-rejection-${interaction.interruptId}`
+
+  const cancelRejection = () => {
+    restoreRejectFocusRef.current = true
+    update({ action: undefined })
+  }
 
   return (
     <PlanInteractionCard
@@ -58,6 +75,16 @@ export function PlanReviewCard({
       icon={<Route size={16} aria-hidden="true" />}
       title={interaction.draft.content.description}
       bodyRef={bodyRef}
+      headerAction={actionAllowed('cancel') ? (
+        <IconButton
+          size="sm"
+          className="plan-interaction-card-head-button plan-review-composer-head-button"
+          label={t('取消当前 Plan 草稿')}
+          tooltip={t('取消当前 Plan 草稿')}
+          icon={<X size={15} />}
+          onClick={onCancel}
+        />
+      ) : undefined}
     >
       <>
         <div
@@ -72,52 +99,28 @@ export function PlanReviewCard({
           >
             <MarkdownContent content={interaction.draft.content.markdown} />
           </div>
-          <div className="plan-review-actions" role="group" aria-label={t('Plan 处理方式')}>
-            <Button
-              size="sm"
-              className="plan-review-reject-button"
-              selected={interaction.action === 'reject'}
-              leadingIcon={<X size={14} />}
-              onClick={() => update({ action: 'reject' })}
+          {interaction.action === 'reject' && (
+            <form
+              id={rejectionFormId}
+              className="plan-review-rejection-form"
+              onSubmit={(event) => {
+                event.preventDefault()
+                onSubmit('reject')
+              }}
             >
-              {t('拒绝')}
-            </Button>
-            <Button
-              size="sm"
-              selected={interaction.action === 'respond'}
-              leadingIcon={<MessageSquareText size={14} />}
-              onClick={() => update({ action: 'respond' })}
-            >
-              {t('反馈')}
-            </Button>
-            <Button
-              size="sm"
-              variant="primary"
-              selected={interaction.action === 'approve'}
-              leadingIcon={<Check size={14} />}
-              onClick={() => update({ action: 'approve' })}
-            >
-              {t('批准')}
-            </Button>
-          </div>
-          {(interaction.action === 'respond' || interaction.action === 'reject') && (
-            <label className="plan-review-input">
-              <span>
-                {interaction.action === 'respond'
-                  ? t('需要调整的内容')
-                  : t('拒绝原因（可选）')}
-              </span>
+              <label htmlFor={`plan-review-reason-${interaction.interruptId}`}>
+                {t('拒绝原因（可选）')}
+              </label>
               <textarea
                 ref={messageRef}
+                id={`plan-review-reason-${interaction.interruptId}`}
+                name="reason"
                 rows={3}
                 value={interaction.message ?? ''}
-                required={interaction.action === 'respond'}
-                placeholder={interaction.action === 'respond'
-                  ? t('说明需要修改的范围和原因…')
-                  : t('说明为什么不执行这份计划…')}
+                placeholder={t('说明为什么不执行这份计划…')}
                 onChange={(event) => update({ message: event.currentTarget.value })}
               />
-            </label>
+            </form>
           )}
         </div>
         <OverlayScrollbar viewportRef={bodyRef} />
@@ -125,14 +128,48 @@ export function PlanReviewCard({
           <p className="plan-review-composer-feedback" role="alert">
             {interaction.error ?? ''}
           </p>
-          <Button
-            size="sm"
-            variant="primary"
-            disabled={!canSubmit}
-            onClick={onSubmit}
-          >
-            {t('提交决定')}
-          </Button>
+          <div className="approval-composer-actions">
+            {interaction.action === 'reject' ? (
+              <>
+                <Button size="sm" shape="capsule" onClick={cancelRejection}>
+                  {t('取消')}
+                </Button>
+                <Button
+                  size="sm"
+                  shape="capsule"
+                  type="submit"
+                  form={rejectionFormId}
+                  variant="danger"
+                >
+                  {t('确认拒绝')}
+                </Button>
+              </>
+            ) : (
+              <>
+                {actionAllowed('reject') && (
+                  <Button
+                    ref={rejectButtonRef}
+                    size="sm"
+                    shape="capsule"
+                    className="approval-reject-button"
+                    onClick={() => update({ action: 'reject' })}
+                  >
+                    {t('拒绝')}
+                  </Button>
+                )}
+                {actionAllowed('approve') && (
+                  <Button
+                    size="sm"
+                    shape="capsule"
+                    className="approval-allow-button"
+                    onClick={() => onSubmit('approve')}
+                  >
+                    {t('批准')}
+                  </Button>
+                )}
+              </>
+            )}
+          </div>
         </footer>
       </>
     </PlanInteractionCard>

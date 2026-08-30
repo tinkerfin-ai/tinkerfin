@@ -9,7 +9,7 @@ from collections.abc import AsyncGenerator, AsyncIterator
 from typing import TYPE_CHECKING, TypeVar, cast
 
 from tinkerfin_contracts import RunTerminalOutcome
-from tinkerfin_native_stream import NativeStreamContractError
+from tinkerfin_native_stream import NativeStreamContractError, NativeValuesStreamPart
 
 from ._tasks import join_task
 from .errors import (
@@ -356,7 +356,12 @@ async def _observe(self: _GraphRunStream[PartT], part: PartT) -> None:
     # The sidecar is the only downstream normalization authority for this raw part.
     # AG-UI, native SSE, and Messaging must consume it rather than parse v2 again.
     self._native_frame = (part, frame)
-    self._last_root_interrupt_ids = frame.root_interrupt_ids
+    # Only a newer root state snapshot can replace the current interrupt set. LangGraph
+    # may emit task or message records after the interrupting values frame; their empty
+    # per-part metadata must not turn a paused Run into success. A later root values
+    # frame with no interrupts still clears the set for a continued invocation.
+    if isinstance(frame.canonical, NativeValuesStreamPart) and not frame.canonical.ns:
+        self._last_root_interrupt_ids = frame.root_interrupt_ids
     if self._observation.enabled:
         for observation in frame.observations:
             await self._observation.observe(observation)
@@ -388,6 +393,12 @@ async def _start(self: _GraphRunStream[PartT]) -> None:
     self._started = True
     try:
         await self._observation.start()
+        preflight = self._source_preflight
+        if preflight is not None:
+            result = preflight()
+            if not inspect.isawaitable(result):
+                raise TypeError("source_preflight must return an awaitable")
+            await result
         source = self._source_factory()
         if not isinstance(source, AsyncIterator):
             raise TypeError("source_factory must return an async iterator")
