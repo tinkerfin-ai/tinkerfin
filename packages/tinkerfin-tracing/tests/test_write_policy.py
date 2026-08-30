@@ -9,6 +9,7 @@ from typing import Literal
 import pytest
 
 from tinkerfin_contracts import RunIdentity
+from tinkerfin_tracing.codec import CanonicalTracePayloadCodec, EncodedTracePayload
 from tinkerfin_tracing.facts import RunFact, TraceEvent, TraceSemanticFact
 from tinkerfin_tracing.store import InMemoryTraceStore, TraceThreadKey, TraceWriter
 from tinkerfin_tracing.writing import TraceBatchWriter, TraceWritePolicy
@@ -171,3 +172,31 @@ async def test_cancelled_force_does_not_cancel_owned_commit_or_leave_tasks() -> 
     assert not {
         name for name in live_names if name.startswith("tinkerfin-trace-writer")
     }
+
+
+async def test_memory_batch_admission_reuses_one_canonical_encoding_per_fact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = CanonicalTracePayloadCodec.encode_fact
+    encoded_observations: list[str] = []
+
+    def count_encoding(
+        codec: CanonicalTracePayloadCodec,
+        fact: TraceSemanticFact,
+    ) -> EncodedTracePayload:
+        encoded_observations.append(fact.source_observation_id)
+        return original(codec, fact)
+
+    monkeypatch.setattr(CanonicalTracePayloadCodec, "encode_fact", count_encoding)
+    store = InMemoryTraceStore()
+    writer = TraceBatchWriter(
+        await store.open_writer(_identity()),
+        policy=TraceWritePolicy(max_batch_delay_seconds=0),
+        on_committed=_ignore_committed,
+    )
+
+    await writer.submit((_fact(1), _fact(2)), mandatory=False)
+    await writer.force()
+    await writer.aclose()
+
+    assert encoded_observations == ["observation-1", "observation-2"]
