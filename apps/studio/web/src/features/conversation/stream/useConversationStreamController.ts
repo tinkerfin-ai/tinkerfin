@@ -22,8 +22,13 @@ import {
   followConversationTrace,
 } from '../../../api/conversation/history'
 import type { ChatRequestPayload } from '../../../api/conversation/types'
+import type { TaskTraceSnapshot } from '../../../api/conversation/taskTrace'
 import { translateCurrent } from '../../../i18n'
-import type { Conversation, WorkspaceState } from '../../../types'
+import type {
+  Conversation,
+  WebTaskTraceViewState,
+  WorkspaceState,
+} from '../../../types'
 import {
   applyConversationEvent,
   markConversationDetached,
@@ -32,8 +37,14 @@ import {
   applyConversationTraceUpdate,
   restoreConversationFromTrace,
 } from '../trace/runtime'
+import { LiveTodoTraceProjector } from '../todoTrace/liveProjection'
+import { TaskTraceFollowOwnership } from '../todoTrace/followOwnership'
 import { InvalidStateDeltaError } from '../agui/jsonPatch'
-import { updateConversation, upsertConversation } from '../../../lib/workspace'
+import {
+  selectCurrentConversation,
+  updateConversation,
+  upsertConversation,
+} from '../../../lib/workspace'
 import {
   clearActiveRunSession,
   writeActiveRunSession,
@@ -44,6 +55,30 @@ const RECONNECT_MAX_DELAY_MS = 5000
 const ACTIVE_RUN_PERSIST_INTERVAL_MS = 250
 const TEXT_RENDER_INTERVAL_MS = 50
 const DETACHED_TRACE_RECONNECT_LIMIT = 3
+
+const taskTraceView = (snapshot: TaskTraceSnapshot): WebTaskTraceViewState => (
+  snapshot.status === 'ready'
+    ? { phase: 'ready', snapshot }
+    : { phase: 'unavailable', snapshot }
+)
+
+const latestUserTurn = (conversation: Conversation | undefined) => {
+  let message: Conversation['messages'][number] | undefined
+  for (let index = (conversation?.messages.length ?? 0) - 1; index >= 0; index -= 1) {
+    const candidate = conversation?.messages[index]
+    if (candidate?.role !== 'user') continue
+    message = candidate
+    break
+  }
+  const runId = message?.meta?.runId
+  return message && runId
+    ? {
+        runId,
+        userMessageId: message.id,
+        userMessagePreview: message.content,
+      }
+    : undefined
+}
 
 const waitForReconnect = (delay: number, signal: AbortSignal): Promise<void> => (
   new Promise((resolve) => {
@@ -83,6 +118,7 @@ export interface ConversationStreamController {
     options?: StreamRunOptions,
   ) => Promise<void>
   followDetachedConversation: (threadId: string) => Promise<void>
+  handoffTaskTraceFollow: (threadId: string) => Promise<void>
   detachThreadStream: (threadId: string, reason: string) => void
   cancelActiveRun: () => Promise<boolean>
   cancelPendingRunId: string | null
@@ -123,7 +159,8 @@ export function useConversationStreamController({
     value: Conversation | null
   } | undefined>(undefined)
   const latestWorkspace = useRef(workspace)
-  const traceFollowControllers = useRef(new Map<string, AbortController>())
+  const taskTraceFollowOwnership = useRef(new TaskTraceFollowOwnership())
+  const activeTodoProjector = useRef<LiveTodoTraceProjector | null>(null)
   const delayedTraceFollowTimers = useRef(new Set<number>())
   const activeRunPersistence = useRef<{
     runId: string
@@ -301,15 +338,19 @@ export function useConversationStreamController({
       (item) => item.threadId === threadId,
     )
     if (!target || target.runStatus !== 'detached' || !target.isHydrated) return
-    if (traceFollowControllers.current.has(threadId)) return
-    const controller = new AbortController()
-    traceFollowControllers.current.set(threadId, controller)
-    try {
+    await taskTraceFollowOwnership.current.follow(threadId, async ({
+      includeTaskTrace,
+      signal,
+    }) => {
+      try {
       let reconnectAttempts = 0
-      while (!controller.signal.aborted) {
-        for await (const event of followConversationTrace(threadId, controller.signal)) {
+      while (!signal.aborted) {
+        for await (const event of followConversationTrace(threadId, {
+          includeTaskTrace,
+          signal,
+        })) {
           if (
-            controller.signal.aborted
+            signal.aborted
             || !isMounted.current
             || (activeAbortController.current && activeThreadId.current === threadId)
           ) return
@@ -319,25 +360,35 @@ export function useConversationStreamController({
               return restoreConversationFromTrace(event.snapshot, {
                 model: item.model,
                 lastDeliveredSeq: item.lastSeq,
+                includeTaskTrace,
+                taskTrace: item.taskTrace,
               })
             }
-            return applyConversationTraceUpdate(item, event.update)
+            return applyConversationTraceUpdate(
+              item,
+              event.update,
+              event.taskTrace,
+              includeTaskTrace,
+            )
           }))
           const execution = event.type === 'snapshot'
             ? event.snapshot.status.execution
             : event.update.status.execution
           if (execution !== 'running') {
             const detail = await fetchConversationHistoryDetail(threadId, {
-              signal: controller.signal,
+              includeTaskTrace,
+              signal,
               suppressGlobalError: true,
             })
-            if (!controller.signal.aborted) {
+            if (!signal.aborted) {
               setWorkspace((state) => updateConversation(
                 state,
                 threadId,
                 (item) => restoreConversationFromTrace(detail, {
                   model: item.model,
                   lastDeliveredSeq: item.lastSeq,
+                  includeTaskTrace,
+                  taskTrace: item.taskTrace,
                 }),
               ))
             }
@@ -345,23 +396,26 @@ export function useConversationStreamController({
           }
         }
         if (
-          controller.signal.aborted
+          signal.aborted
           || !isMounted.current
           || (activeAbortController.current && activeThreadId.current === threadId)
         ) return
 
         // 网络 EOF 不是终态；重连前先刷新权威快照，避免漏掉断连期间提交的终态
         const detail = await fetchConversationHistoryDetail(threadId, {
-          signal: controller.signal,
+          includeTaskTrace,
+          signal,
           suppressGlobalError: true,
         })
-        if (controller.signal.aborted || !isMounted.current) return
+        if (signal.aborted || !isMounted.current) return
         setWorkspace((state) => updateConversation(
           state,
           threadId,
           (item) => restoreConversationFromTrace(detail, {
             model: item.model,
             lastDeliveredSeq: item.lastSeq,
+            includeTaskTrace,
+            taskTrace: item.taskTrace,
           }),
         ))
         if (detail.status.execution !== 'running') return
@@ -372,7 +426,7 @@ export function useConversationStreamController({
       }
     } catch (error) {
       if (
-        controller.signal.aborted
+        signal.aborted
         || !isMounted.current
         || (activeAbortController.current && activeThreadId.current === threadId)
       ) return
@@ -381,12 +435,16 @@ export function useConversationStreamController({
         ...item,
         notice: { kind: 'error', content: message },
       })))
-    } finally {
-      if (traceFollowControllers.current.get(threadId) === controller) {
-        traceFollowControllers.current.delete(threadId)
       }
-    }
+    })
   }, [setWorkspace])
+
+  const handoffTaskTraceFollow = useCallback(async (threadId: string) => {
+    const handoff = await taskTraceFollowOwnership.current.handoff(threadId)
+    for (const demotedThreadId of handoff.demotedThreadIds) {
+      void followDetachedConversation(demotedThreadId)
+    }
+  }, [followDetachedConversation])
 
   const streamRun = useCallback(async (
     threadIdToStream: string,
@@ -395,13 +453,7 @@ export function useConversationStreamController({
     options: StreamRunOptions = { target: 'workspace' },
   ) => {
     activeAbortController.current?.abort()
-    const staleTraceController = traceFollowControllers.current.get(threadIdToStream)
-    if (staleTraceController) {
-      staleTraceController.abort()
-      if (traceFollowControllers.current.get(threadIdToStream) === staleTraceController) {
-        traceFollowControllers.current.delete(threadIdToStream)
-      }
-    }
+    await taskTraceFollowOwnership.current.stop(threadIdToStream)
     const streamEpoch = activeStreamEpoch.current + 1
     activeStreamEpoch.current = streamEpoch
     const controller = new AbortController()
@@ -418,6 +470,54 @@ export function useConversationStreamController({
           (item) => item.threadId === targetThreadId,
         )
       : draftTarget
+    let todoProjector: LiveTodoTraceProjector | null = null
+    let projectedTaskTrace = validationTarget?.taskTrace ?? { phase: 'unloaded' as const }
+    let projectedSnapshot: TaskTraceSnapshot | null = null
+    if (validationTarget?.taskTrace.phase !== 'unavailable') {
+      todoProjector = new LiveTodoTraceProjector()
+      const priorHead = validationTarget?.trace?.headRunId
+        ?? latestUserTurn(validationTarget)?.runId
+      if (
+        validationTarget?.taskTrace.phase === 'ready'
+        && priorHead
+      ) {
+        todoProjector.hydrate(validationTarget.taskTrace.snapshot, {
+          headRunId: priorHead,
+          latestTurn: latestUserTurn(validationTarget),
+        })
+      }
+      const turn = mode === 'start'
+        ? latestUserTurn(validationTarget)
+        : undefined
+      todoProjector.startRun({
+        runId: payload.runId,
+        inputKind: mode === 'start' ? 'ordinary' : 'resume',
+        parentRunId: payload.parentRunId,
+        turn,
+      })
+      projectedSnapshot = todoProjector.snapshot
+      projectedTaskTrace = taskTraceView(projectedSnapshot)
+      activeTodoProjector.current?.close()
+      activeTodoProjector.current = todoProjector
+    }
+    const applyTaskTrace = (
+      current: Conversation,
+      event: Parameters<typeof applyConversationEvent>[1],
+      receivedAt: string,
+    ): Conversation => {
+      if (!todoProjector) return current
+      const snapshot = todoProjector.consume(event, {
+        receivedAt,
+        rootState: current.serverState,
+      })
+      if (snapshot !== projectedSnapshot) {
+        projectedSnapshot = snapshot
+        projectedTaskTrace = taskTraceView(snapshot)
+      }
+      return current.taskTrace === projectedTaskTrace
+        ? current
+        : { ...current, taskTrace: projectedTaskTrace }
+    }
     let receivedEvent = false
     let mainTerminalReceived = false
     let traceAuthorityLoaded = false
@@ -452,6 +552,7 @@ export function useConversationStreamController({
               : lastAppliedSeq ?? undefined,
           )) {
         receivedEvent = true
+        const eventReceivedAt = new Date().toISOString()
         const reportedThreadId: string = 'threadId' in event && typeof event.threadId === 'string'
           ? event.threadId
           : (activeThreadId.current ?? targetThreadId)
@@ -473,7 +574,11 @@ export function useConversationStreamController({
 
         if (target === 'draft' && draftTarget) {
           const deferTextRender = event.type === 'TEXT_MESSAGE_CONTENT'
-          const withEvent = applyConversationEvent(draftTarget, event)
+          const withEvent = applyTaskTrace(
+            applyConversationEvent(draftTarget, event),
+            event,
+            eventReceivedAt,
+          )
           const nextDraft = seq == null
             ? withEvent
             : { ...withEvent, lastSeq: seq, isHydrated: true }
@@ -486,10 +591,10 @@ export function useConversationStreamController({
               threadId: reportedThreadId,
               isHydrated: true,
             }
-            enqueueWorkspaceUpdate(streamEpoch, (state) => ({
-              ...upsertConversation(state, candidateConversation),
-              currentThreadId: reportedThreadId,
-            }))
+            enqueueWorkspaceUpdate(streamEpoch, (state) => upsertConversation(
+              selectCurrentConversation(state, reportedThreadId),
+              candidateConversation,
+            ))
             enqueueDraftUpdate(streamEpoch, null)
             draftTarget = undefined
             validationTarget = candidateConversation
@@ -513,7 +618,11 @@ export function useConversationStreamController({
         if (!validationTarget) {
           throw new ConversationError('stream_event_invalid', '缺少事件验证目标会话')
         }
-        const validated = applyConversationEvent(validationTarget, event)
+        const validated = applyTaskTrace(
+          applyConversationEvent(validationTarget, event),
+          event,
+          eventReceivedAt,
+        )
         validationTarget = seq == null
           ? { ...validated, isHydrated: true }
           : { ...validated, lastSeq: seq, isHydrated: true }
@@ -526,13 +635,16 @@ export function useConversationStreamController({
             : state.currentThreadId
           const nextState = updateConversation(state, targetConversationId, (item) => {
             const withEvent = applyConversationEvent(item, event)
+            const withTaskTrace = state.currentThreadId === targetConversationId
+              ? { ...withEvent, taskTrace: projectedTaskTrace }
+              : withEvent
             return seq == null
-              ? { ...withEvent, isHydrated: true }
-              : { ...withEvent, lastSeq: seq, isHydrated: true }
+              ? { ...withTaskTrace, isHydrated: true }
+              : { ...withTaskTrace, lastSeq: seq, isHydrated: true }
           })
           return state.currentThreadId === targetConversationId
             && reportedThreadId !== targetConversationId
-            ? { ...nextState, currentThreadId: reportedThreadId }
+            ? selectCurrentConversation(nextState, reportedThreadId)
             : nextState
         }, event.type === 'TEXT_MESSAGE_CONTENT')
         if (seq != null) lastAppliedSeq = seq
@@ -571,13 +683,16 @@ export function useConversationStreamController({
         }
       }
       if (mainTerminalReceived && target === 'workspace') {
+        await handoffTaskTraceFollow(targetThreadId)
         const detail = await fetchConversationHistoryDetail(targetThreadId, {
+          includeTaskTrace: true,
           signal: controller.signal,
           suppressGlobalError: true,
         })
         const authoritative = restoreConversationFromTrace(detail, {
           model: validationTarget?.model ?? payload.forwardedProps.model,
           lastDeliveredSeq: lastAppliedSeq ?? undefined,
+          includeTaskTrace: true,
         })
         validationTarget = authoritative
         traceAuthorityLoaded = true
@@ -637,6 +752,10 @@ export function useConversationStreamController({
         )
       }
     } finally {
+      if (activeTodoProjector.current === todoProjector) {
+        activeTodoProjector.current = null
+      }
+      todoProjector?.close()
       clearCancelPending(payload.runId)
       if (mainTerminalReceived) clearActiveRunPersistence(payload.runId)
       if (activeAbortController.current === controller) {
@@ -679,6 +798,7 @@ export function useConversationStreamController({
     }
   }, [
     followDetachedConversation,
+    handoffTaskTraceFollow,
     clearActiveRunPersistence,
     clearCancelPending,
     enqueueDraftUpdate,
@@ -732,14 +852,16 @@ export function useConversationStreamController({
   }, [flushActiveRunPersistence])
 
   useEffect(() => {
-    const controllers = traceFollowControllers.current
     const timers = delayedTraceFollowTimers.current
+    const followOwnership = taskTraceFollowOwnership.current
     isMounted.current = true
     return () => {
       isMounted.current = false
       activeStreamEpoch.current += 1
       flushActiveRunPersistence(activeRunId.current ?? undefined)
       activeAbortController.current?.abort()
+      activeTodoProjector.current?.close()
+      activeTodoProjector.current = null
       activeAbortController.current = null
       activeThreadId.current = null
       activeRunId.current = null
@@ -748,8 +870,7 @@ export function useConversationStreamController({
       activeRunPersistence.current = null
       cancelRequest.current = null
       cancelPendingRunIdRef.current = null
-      for (const controller of controllers.values()) controller.abort()
-      controllers.clear()
+      followOwnership.abortAll()
       for (const timer of timers) window.clearTimeout(timer)
       timers.clear()
       if (workspaceUpdateTimer.current != null) window.clearTimeout(workspaceUpdateTimer.current)
@@ -764,6 +885,7 @@ export function useConversationStreamController({
   return {
     streamRun,
     followDetachedConversation,
+    handoffTaskTraceFollow,
     detachThreadStream,
     cancelActiveRun,
     cancelPendingRunId,

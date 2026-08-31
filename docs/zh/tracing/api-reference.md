@@ -175,6 +175,31 @@ generation 中的一个 Run，支持原子有序 fact batch 与幂等关闭。`S
 为每个 active writer 预留终态容量，禁止 active delete，删除时唤醒 follower，并始终返回防御性
 副本。
 
+### `TraceLedgerBackend` 与 `DurableTraceStore`
+
+`DurableTraceStore(backend, namespace="default", limits=None, options=None, codec=None)`
+在借用的 Backend 上提供完整 Store 与 writer 生命周期。Backend 精确实现以下存储操作：
+
+| 操作 | 必需结果 |
+| --- | --- |
+| `prepare_storage()` | 幂等准备并校验自有存储结构 |
+| `commit_ledger_change(change)` | 原子解析并应用一次框架拥有的 Ledger 变更 |
+| `load_ledger_state(request)` | 返回一致的 namespace、thread、writer 与存储时钟状态 |
+| `read_event_page(request)` | 返回一个有界 exact-generation 原始 event page |
+| `load_projection_checkpoint(request)` | 返回指定 prefix 以内最新的原始 checkpoint |
+
+`commit_ledger_change()` 在事务或条件写循环内取得当前状态，调用
+`resolve_ledger_change()`，再把返回的存储 effect 作为一个单元提交。发生乐观冲突后可重新调用
+resolver；resolver 不执行 I/O。Backend 必须使用存储端时间检查 lease，并在返回或抛出 Store 错误前
+查明未知提交结果。`DurableTraceStore` 借用 Backend 客户端且从不关闭它。
+
+`TraceStoreOptions` 配置 `writer_lease_seconds`、
+`writer_heartbeat_interval_seconds`、`follow_poll_seconds`、
+`commit_retry_attempts` 与 `commit_retry_delay_seconds`。
+
+`verify_trace_ledger_backend(primary_backend, peer_backend)` 使用两个独立客户端验证共享序号、回放、
+checkpoint、follow 与删除契约。供应商特有的事务中断和存储时钟故障仍需 Backend 自己执行故障注入。
+
 ### `SqlAlchemyTraceStore`
 
 ```python
@@ -188,8 +213,7 @@ SqlAlchemyTraceStore(
 ```
 
 Store 借用 SQLite 或 MySQL 异步 Engine。`setup()` 创建并反射校验唯一当前 Trace Schema，且
-从不销毁 Engine。`SqlTraceStoreOptions` 配置数据库时钟 writer lease、heartbeat interval、
-follow polling、retry 次数与 retry delay。
+从不销毁 Engine。它使用与 `DurableTraceStore` 相同的 `TraceStoreOptions`。
 
 | Extra | Engine URL |
 | --- | --- |

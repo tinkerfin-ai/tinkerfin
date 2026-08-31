@@ -1,9 +1,11 @@
 import type {
+  ConversationHistoryCoreDetail,
   ConversationHistoryDetail,
   ConversationTraceUpdate,
   TraceInteraction,
   TraceNode,
 } from '../../../api/conversation/history'
+import type { TaskTraceSnapshot } from '../../../api/conversation/taskTrace'
 import { ConversationError } from '../../../api/conversation/errors'
 import { translateCurrent } from '../../../i18n'
 import type {
@@ -16,6 +18,7 @@ import type {
   Message,
   PendingInteractionKind,
   TodoItem,
+  WebTaskTraceViewState,
 } from '../../../types'
 import { planInteractionFromTracePayload } from '../agui'
 
@@ -210,7 +213,7 @@ const interactionState = (
   return { pendingInteractionKind: 'input_required' }
 }
 
-const traceMessages = (trace: ConversationHistoryDetail): Message[] => {
+const traceMessages = (trace: ConversationHistoryCoreDetail): Message[] => {
   const reasoning = new Map(
     trace.reasoning
       .filter((item) => !item.contentOmitted && item.content != null)
@@ -278,7 +281,7 @@ const traceMessages = (trace: ConversationHistoryDetail): Message[] => {
               completedAt: item.completedAt ?? undefined,
               durationMs: elapsedMs(item.createdAt, item.completedAt),
             }
-          : undefined,
+          : { runId: item.runId },
       },
     }]
   })
@@ -365,7 +368,7 @@ const traceMessages = (trace: ConversationHistoryDetail): Message[] => {
   )).map((item) => item.value)
 }
 
-const runStatus = (trace: ConversationHistoryDetail): Conversation['runStatus'] => {
+const runStatus = (trace: ConversationHistoryCoreDetail): Conversation['runStatus'] => {
   switch (trace.status.execution) {
     case 'running': return 'detached'
     case 'waiting': return 'waiting_approval'
@@ -375,7 +378,7 @@ const runStatus = (trace: ConversationHistoryDetail): Conversation['runStatus'] 
   }
 }
 
-const assertTraceDetail = (trace: ConversationHistoryDetail) => {
+const assertTraceDetail = (trace: ConversationHistoryCoreDetail) => {
   if (
     !trace.threadId
     || !trace.headRunId
@@ -388,12 +391,30 @@ const assertTraceDetail = (trace: ConversationHistoryDetail) => {
   ) throw new ConversationError('stream_event_invalid')
 }
 
+const taskTraceView = (snapshot: TaskTraceSnapshot): WebTaskTraceViewState => (
+  snapshot.status === 'ready'
+    ? { phase: 'ready', snapshot }
+    : { phase: 'unavailable', snapshot }
+)
+
 export const restoreConversationFromTrace = (
   detail: ConversationHistoryDetail,
-  options: { model: string; lastDeliveredSeq?: number },
+  options: {
+    model: string
+    lastDeliveredSeq?: number
+    includeTaskTrace: boolean
+    taskTrace?: WebTaskTraceViewState
+  },
 ): Conversation => {
-  assertTraceDetail(detail)
-  const trace = structuredClone(detail)
+  const { taskTrace: wireTaskTrace, ...wireCore } = detail
+  const trace = structuredClone(wireCore)
+  assertTraceDetail(trace)
+  if (options.includeTaskTrace && wireTaskTrace == null) {
+    throw new ConversationError('stream_event_invalid')
+  }
+  const taskTrace = options.includeTaskTrace && wireTaskTrace != null
+    ? taskTraceView(wireTaskTrace)
+    : options.taskTrace ?? { phase: 'unloaded' as const }
   const interaction = interactionState(trace.interactions, trace.nodes)
   const projectedStatus = runStatus(trace)
   const status = interaction.pendingInteractionKind && projectedStatus !== 'error'
@@ -421,6 +442,7 @@ export const restoreConversationFromTrace = (
     mode: modeFromState(trace.state.root),
     messages,
     todos: todosFromState(trace.state.root),
+    taskTrace,
     approval: interaction.approval,
     planInteraction: interaction.planInteraction,
     pendingInteractionKind: interaction.pendingInteractionKind,
@@ -437,11 +459,13 @@ export const restoreConversationFromTrace = (
 export const applyConversationTraceUpdate = (
   conversation: Conversation,
   update: ConversationTraceUpdate,
+  taskTraceReplacement: TaskTraceSnapshot | null,
+  includeTaskTrace: boolean,
 ): Conversation => {
   const previous = conversation.trace
   if (!previous) throw new ConversationError('stream_event_invalid')
   if (update.asOfSeq <= previous.asOfSeq) return conversation
-  const next: ConversationHistoryDetail = {
+  const next: ConversationHistoryCoreDetail = {
     ...structuredClone(previous),
     asOfSeq: update.asOfSeq,
     headRunId: update.status.headRunId,
@@ -460,8 +484,15 @@ export const applyConversationTraceUpdate = (
     toolCallCount: update.toolCallCount,
     historyCursor: null,
   }
-  return restoreConversationFromTrace(next, {
+  const taskTrace = includeTaskTrace && taskTraceReplacement != null
+    ? taskTraceView(taskTraceReplacement)
+    : includeTaskTrace
+      ? conversation.taskTrace
+      : { phase: 'unloaded' as const }
+  return restoreConversationFromTrace({ ...next, taskTrace: null }, {
     model: conversation.model,
     lastDeliveredSeq: conversation.lastSeq,
+    includeTaskTrace: false,
+    taskTrace,
   })
 }

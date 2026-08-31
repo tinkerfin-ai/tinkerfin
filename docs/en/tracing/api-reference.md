@@ -184,6 +184,36 @@ atomic ordered fact batches plus idempotent close. `StoreThreadSnapshot` contain
 rejects duplicate or active Run IDs, reserves terminal capacity per active writer,
 prevents active deletion, wakes followers on deletion, and returns defensive copies.
 
+### `TraceLedgerBackend` and `DurableTraceStore`
+
+`DurableTraceStore(backend, namespace="default", limits=None, options=None, codec=None)`
+provides the complete Store and writer lifecycle over a borrowed Backend. A Backend
+implements exactly these storage operations:
+
+| Operation | Required result |
+| --- | --- |
+| `prepare_storage()` | Idempotently prepare and validate owned storage structures |
+| `commit_ledger_change(change)` | Atomically resolve and apply one framework-owned Ledger change |
+| `load_ledger_state(request)` | Return consistent namespace, thread, writer, and storage-clock state |
+| `read_event_page(request)` | Return one bounded exact-generation raw event page |
+| `load_projection_checkpoint(request)` | Return the newest raw checkpoint at or below one prefix |
+
+`commit_ledger_change()` obtains current state inside its transaction or conditional
+write loop, calls `resolve_ledger_change()`, and applies the returned storage effect as
+one unit. The resolver may be called again after an optimistic conflict and performs no
+I/O. A Backend must use storage time for lease guards and must prove an uncertain commit
+before returning or raising a Store error. Backend clients are borrowed and are never
+closed by `DurableTraceStore`.
+
+`TraceStoreOptions` configures `writer_lease_seconds`,
+`writer_heartbeat_interval_seconds`, `follow_poll_seconds`,
+`commit_retry_attempts`, and `commit_retry_delay_seconds`.
+
+`verify_trace_ledger_backend(primary_backend, peer_backend)` runs the shared ordering,
+replay, checkpoint, follow, and deletion contract against two independent clients.
+Provider-specific transaction interruption and storage-clock failures still require
+Backend fault-injection tests.
+
 ### `SqlAlchemyTraceStore`
 
 ```python
@@ -197,9 +227,8 @@ SqlAlchemyTraceStore(
 ```
 
 The Store borrows a SQLite or MySQL asynchronous Engine. `setup()` creates and reflects
-the exact current Trace Schema and never disposes the Engine. `SqlTraceStoreOptions`
-configures database-clock writer lease duration, heartbeat interval, follow polling,
-retry attempts, and retry delay.
+the exact current Trace Schema and never disposes the Engine. It accepts the same
+`TraceStoreOptions` used by `DurableTraceStore`.
 
 | Extra | Engine URL |
 | --- | --- |

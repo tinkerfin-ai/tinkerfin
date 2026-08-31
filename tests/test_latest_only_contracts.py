@@ -114,10 +114,12 @@ def test_public_docs_state_unavailable_capabilities_and_real_extension_boundarie
     for content in (root_en, root_zh, runtime_en, runtime_zh):
         assert "Deep Agents v3" in content
         assert "TodoGroups" in content
+        assert "TraceLedgerBackend" in content
         assert "TraceStore" in content
         assert "RuntimeObserver" in content
     for content in (root_en, root_zh, tracing_en, tracing_zh):
         assert "S3/Blob" in content
+        assert "TraceLedgerBackend" in content
         assert "TraceStore" in content
         assert "canonical" in content
         assert "RuntimeObserver" in content

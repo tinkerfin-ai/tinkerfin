@@ -27,8 +27,8 @@ redis = Redis.from_url(
 backend = RedisBackend(
     redis,
     key_prefix="my-app:tinkerfin",
-    lease_ttl=15.0,
-    poll_interval=0.1,
+    producer_lease_seconds=15.0,
+    generation_cleanup_retry_seconds=0.1,
     limits=MessagingLimits(),
     retention_policy=MessagingRetentionPolicy.expire_after(86_400),
 )
@@ -39,8 +39,8 @@ messaging = Messaging(backend=backend)
 | --- | --- | --- |
 | `client` | required | Async Redis client returning bytes |
 | `key_prefix` | `tinkerfin-messaging` | Prefix reserved for this application |
-| `lease_ttl` | `15.0` | Producer ownership lease in seconds |
-| `poll_interval` | `0.1` | Delete-lease contention interval |
+| `producer_lease_seconds` | `15.0` | Producer ownership duration on the Redis clock |
+| `generation_cleanup_retry_seconds` | `0.1` | Delay before retrying cleanup ownership |
 | `limits` | `MessagingLimits()` | Encoded payload, checkpoint, message-count, and thread-byte limits |
 | `retention_policy` | disabled | Terminal thread-generation replay window |
 
@@ -94,8 +94,8 @@ fields never enter `MessageEnvelope`.
 
 Default limits are 16 MiB per encoded message, 1 MiB per checkpoint, 100,000 messages
 per thread generation, and 1 GiB of encoded payload per thread generation. Custom
-backends expose the same immutable `limits` property and must reject quota overflow
-before mutation.
+backends expose the same immutable limits through `messaging_settings` and must reject
+quota overflow before mutation.
 
 ## Define a custom message format
 
@@ -158,15 +158,62 @@ Implement `ProfiledMessageSource` only when the source can declare a complete im
 
 ## Define a custom backend
 
-Implement `MessagingBackend` only when another shared store is required. A complete implementation must provide:
+Implement `MessagingBackend` only when another durable store is required. Messaging owns
+producer tasks, cancellation, follow loops, settlement, retention decisions, and error
+conversion. A Backend author implements one immutable settings property and six storage
+operations:
 
-- atomic preparation, owner/attachment selection, and codec validation;
-- ordered appends, stable sequence numbers, and message ID deduplication;
-- history reads and continuing follow;
-- run completion, failure, and cancellation signals;
-- producer lease renewal interval, expiry budget, fencing, and ownership-loss detection;
-- stream generation isolation and deletion.
+| Extension member | Backend responsibility |
+| --- | --- |
+| `messaging_settings` | Return immutable limits, retention, producer lease, renewal, and wait settings shared by cooperating workers |
+| `prepare_messaging_storage()` | Idempotently create or validate the one current storage shape without taking ownership of the injected client |
+| `commit_messaging_transition(transition)` | Atomically commit one framework-defined transition and return its exact durable result |
+| `load_messaging_state(query)` | Return a storage-clock-consistent bounded snapshot for the requested channel, generation, run, and message evidence |
+| `read_committed_messages(query)` | Return an ascending exact-generation page and change cursor; `run_state` is required in the same atomic view when `stop_at_run_terminal=True` |
+| `wait_for_messaging_change(wait)` | Wait for a possible message or control change; spurious timeout returns are allowed and cancellation must release subscriptions or pinned connections |
+| `purge_stream_generation(purge)` | Idempotently remove one bounded batch from a generation already sealed for cleanup, without removing shared control or its tombstone |
 
-All backend operations are asynchronous. Do not block the event loop with synchronous database or network clients. Match the public behavior of `MemoryBackend` when implementing another backend.
+`MessagingTransition`, `MessagingStateSnapshot`, and `MessagingStorageEffect` are frozen
+storage-neutral values. A transactional Backend loads the requested state while holding
+its transaction, calls `resolve_messaging_transition()`, and atomically applies the
+returned effect. It must retry only proven optimistic conflicts; cancellation and an
+uncertain external commit cannot be converted into an unverified success.
+
+`begin_generation_cleanup` may return an opaque, bounded-lifetime `cleanup_token`.
+Messaging does not inspect or persist the token. It passes the value unchanged and
+serially to `purge_stream_generation()` and `finish_generation_cleanup` for the exact
+generation and authoritative cleanup reason returned by begin. A Backend that returns a
+token must bound its external lease, tolerate an idempotent retry, and allow a different
+cleanup attempt to take over after cancellation or process loss.
+
+All database and network calls must be natively asynchronous. The host owns injected
+clients, connection pools, and shutdown. `wait_for_messaging_change()` must propagate
+`CancelledError` after releasing its own wait resource. `purge_stream_generation()` must
+remain bounded. Different cleanup attempts may overlap, but their generation and token
+fences must prevent either attempt from deleting another generation.
+
+Run the public contract verifier against an empty isolated namespace:
+
+```python
+from contextlib import asynccontextmanager
+
+from tinkerfin_messaging.testing import verify_messaging_backend
+
+
+@asynccontextmanager
+async def open_backend():
+    backend = MyBackend(client, namespace="contract-test")
+    try:
+        yield backend
+    finally:
+        await delete_contract_test_namespace()
+
+
+await verify_messaging_backend(open_backend)
+```
+
+The verifier covers supported Messaging behavior. A distributed implementation must
+also test real contention, lease expiry, process loss, uncertain transport outcomes,
+and database-specific cleanup recovery.
 
 Next: [Messaging usage reference](api-reference.md).

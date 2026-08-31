@@ -110,16 +110,18 @@ checkpointers, Stores, tools, and cancellation remain native.
 
 ## Current capability boundary
 
-The distribution provides the explicit `deepagents-v2` Runtime Profile. It does not
-provide a Deep Agents v3 Profile or TodoGroups projection/UI. Another concrete Profile
-must own its upstream construction and stream contract while emitting the same canonical
-Native observations; downstream Runtime, Trace, AG-UI, and Messaging code does not
-branch on upstream versions.
+The framework distribution provides the explicit `deepagents-v2` Runtime Profile. It
+does not provide a Deep Agents v3 Profile or a generic TodoGroups projection/UI. Studio
+derives its product-specific task trace from canonical Trace facts at query time. Another
+concrete Profile must own its upstream construction and stream contract while emitting
+the same canonical Native observations; downstream Runtime, Trace, AG-UI, and Messaging
+code does not branch on upstream versions.
 
 Archive/S3/Blob storage, payload encryption/KMS, and OpenTelemetry exporters are not
-provided. Concrete integrations compose the active `TraceStore`, canonical payload
-codec, `RuntimeObserver`, or Store/Messaging Backend boundaries. No placeholder API
-represents an unavailable capability.
+provided. Active Trace storage implements `TraceLedgerBackend`; advanced integrations
+may replace `TraceStore`, wrap the canonical payload codec, observe `RuntimeObserver`,
+or decorate Store/Messaging Backend boundaries. No placeholder API represents an
+unavailable capability.
 
 ## Next steps
 

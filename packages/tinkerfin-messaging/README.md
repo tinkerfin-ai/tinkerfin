@@ -160,6 +160,31 @@ backend = RedisBackend(
 messaging = Messaging(backend=backend)
 ```
 
+Custom storage implements `MessagingBackend`. Messaging owns the producer, follow,
+cancellation, settlement, retention, and cleanup lifecycle; a Backend supplies immutable
+`messaging_settings` plus six asynchronous storage operations:
+
+| Operation | Storage responsibility |
+| --- | --- |
+| `prepare_messaging_storage()` | Idempotently create or validate the current storage shape |
+| `commit_messaging_transition()` | Atomically commit one framework-defined transition |
+| `load_messaging_state()` | Load one bounded storage-clock-consistent state snapshot |
+| `read_committed_messages()` | Read an ascending exact-generation page |
+| `wait_for_messaging_change()` | Wait cancellation-responsively for a possible message or control change |
+| `purge_stream_generation()` | Remove one bounded batch from an already sealed generation |
+
+Transactional implementations call `resolve_messaging_transition()` inside their atomic
+boundary and apply the returned `MessagingStorageEffect`. Use
+`tinkerfin_messaging.testing.verify_messaging_backend()` against an empty isolated
+namespace before shipping an implementation. The complete atomicity, cancellation,
+resource ownership, and cleanup requirements are documented in
+[Backends and codecs](https://github.com/tinkerfin-ai/tinkerfin/blob/main/docs/en/messaging/backends-and-codecs.md).
+
+A cleanup begin result may include an opaque, bounded-lifetime `cleanup_token`.
+Messaging never inspects or persists it and passes it unchanged, serially, to purge and
+finish for the same generation. Backends that return a token must let its external lease
+expire so another cleanup attempt can resume after cancellation or process loss.
+
 Redis keeps trusted per-owner lease renewal counts and timestamps for postmortem
 diagnostics; these fields never enter envelopes or client output.
 

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from .backend import TraceLedgerBackend as TraceLedgerBackend
+from .backend import TraceStoreOptions as TraceStoreOptions
 from .capture import CapturedValue as CapturedValue
 from .capture import CapturePolicy as CapturePolicy
 from .capture import ReasoningCapturePolicy as ReasoningCapturePolicy
@@ -11,6 +13,8 @@ from .capture import ToolCaptureRule as ToolCaptureRule
 from .capture import ToolTraceCapture as ToolTraceCapture
 from .codec import CanonicalTracePayloadCodec as CanonicalTracePayloadCodec
 from .codec import EncodedTracePayload as EncodedTracePayload
+from .durable_store import DurableTraceStore as DurableTraceStore
+from .durable_store import InMemoryTraceStore as InMemoryTraceStore
 from .errors import AmbiguousTraceHead as AmbiguousTraceHead
 from .errors import InvalidTraceCursor as InvalidTraceCursor
 from .errors import TraceCaptureRejected as TraceCaptureRejected
@@ -48,13 +52,13 @@ from .facts import TurnFact as TurnFact
 from .limits import TraceLimits as TraceLimits
 from .projection import TraceProjection as TraceProjection
 from .query import TraceThread as TraceThread
-from .store import InMemoryTraceStore as InMemoryTraceStore
 from .store import StoreThreadSnapshot as StoreThreadSnapshot
 from .store import StoreWriterSnapshot as StoreWriterSnapshot
 from .store import TraceProjectionCheckpoint as TraceProjectionCheckpoint
 from .store import TraceStore as TraceStore
 from .store import TraceThreadKey as TraceThreadKey
 from .store import TraceWriter as TraceWriter
+from .testing import verify_trace_ledger_backend as verify_trace_ledger_backend
 from .tracer import Tracer as Tracer
 from .views import TraceCompleteness as TraceCompleteness
 from .views import TraceEntityDelta as TraceEntityDelta
@@ -74,13 +78,13 @@ if TYPE_CHECKING:
     from .sql_schema import TraceStoreSchema as TraceStoreSchema
     from .sql_schema import get_trace_store_schema as get_trace_store_schema
     from .sql_store import SqlAlchemyTraceStore as SqlAlchemyTraceStore
-    from .sql_store import SqlTraceStoreOptions as SqlTraceStoreOptions
 
 __all__ = [
     "AmbiguousTraceHead",
     "CanonicalTracePayloadCodec",
     "CapturePolicy",
     "CapturedValue",
+    "DurableTraceStore",
     "EncodedTracePayload",
     "FactCountProjection",
     "FactCountResult",
@@ -96,7 +100,6 @@ __all__ = [
     "RunFact",
     "RuntimeTaskFact",
     "SqlAlchemyTraceStore",
-    "SqlTraceStoreOptions",
     "StateRevisionFact",
     "StoreThreadSnapshot",
     "StoreWriterSnapshot",
@@ -111,6 +114,7 @@ __all__ = [
     "TraceEvent",
     "TraceEventPage",
     "TraceInteraction",
+    "TraceLedgerBackend",
     "TraceLimits",
     "TraceMessage",
     "TraceNode",
@@ -128,6 +132,7 @@ __all__ = [
     "TraceStatus",
     "TraceStore",
     "TraceStoreError",
+    "TraceStoreOptions",
     "TraceStoreProtocolError",
     "TraceStoreSchema",
     "TraceStoreTimeout",
@@ -144,15 +149,16 @@ __all__ = [
     "TracingErrorCode",
     "TurnFact",
     "get_trace_store_schema",
+    "verify_trace_ledger_backend",
 ]
 
 
 def __getattr__(name: str) -> object:
     """Load SQLAlchemy integrations only when their public symbol is requested."""
 
-    if name in {"SqlAlchemyTraceStore", "SqlTraceStoreOptions"}:
+    if name == "SqlAlchemyTraceStore":
         try:
-            from .sql_store import SqlAlchemyTraceStore, SqlTraceStoreOptions
+            from .sql_store import SqlAlchemyTraceStore
         except ModuleNotFoundError as error:
             if error.name != "sqlalchemy" and not str(error.name).startswith(
                 "sqlalchemy."
@@ -163,8 +169,7 @@ def __getattr__(name: str) -> object:
                 '"tinkerfin-tracing[sqlite]" or "tinkerfin-tracing[mysql]"'
             ) from error
         globals()["SqlAlchemyTraceStore"] = SqlAlchemyTraceStore
-        globals()["SqlTraceStoreOptions"] = SqlTraceStoreOptions
-        return globals()[name]
+        return SqlAlchemyTraceStore
     if name in {"TraceStoreSchema", "get_trace_store_schema"}:
         try:
             from .sql_schema import TraceStoreSchema, get_trace_store_schema

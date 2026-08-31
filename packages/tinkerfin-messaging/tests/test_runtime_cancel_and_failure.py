@@ -8,21 +8,20 @@ from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from typing import ClassVar, cast
 
 import pytest
+from backend_harness import MessagingBackendHarness
 
 import tinkerfin_messaging.sources as source_adapters
 from tinkerfin import RunIdentity
 from tinkerfin_messaging import (
     BackendOwnershipLost,
-    BackendRunHandle,
     CancelCallback,
     CancelContext,
     CancellationUnsupported,
     MemoryBackend,
-    MessageEnvelope,
     MessageSubscription,
     Messaging,
-    MessagingBackend,
-    RecoveryCheckpoint,
+    MessagingTransition,
+    MessagingTransitionResult,
     RunNotFound,
     RunProducerFailed,
     UnexpectedMessagingBackendError,
@@ -219,27 +218,22 @@ class _ControlledAppendBackend(MemoryBackend):
         self.append_started = asyncio.Event()
         self.release_append = asyncio.Event()
 
-    async def append(
+    async def commit_messaging_transition(
         self,
-        handle: BackendRunHandle,
-        *,
-        message_id: str,
-        codec: str,
-        payload: bytes,
-        checkpoint: RecoveryCheckpoint | None = None,
-    ) -> MessageEnvelope:
-        if payload == self.blocked_payload:
+        transition: MessagingTransition,
+    ) -> MessagingTransitionResult:
+        if (
+            transition.kind == "append_message"
+            and transition.payload == self.blocked_payload
+        ):
             self.append_started.set()
             await self.release_append.wait()
-        if payload == self.failed_payload:
+        if (
+            transition.kind == "append_message"
+            and transition.payload == self.failed_payload
+        ):
             raise RuntimeError("cannot append payload")
-        return await super().append(
-            handle,
-            message_id=message_id,
-            codec=codec,
-            payload=payload,
-            checkpoint=checkpoint,
-        )
+        return await super().commit_messaging_transition(transition)
 
 
 async def test_channel_uses_deferred_source_owned_cancel_callback() -> None:
@@ -372,40 +366,19 @@ class _FinishOwnershipLostBackend(MemoryBackend):
         self.finish_started = asyncio.Event()
         self.release_finish = asyncio.Event()
 
-    async def append(
+    async def commit_messaging_transition(
         self,
-        handle: BackendRunHandle,
-        *,
-        message_id: str,
-        codec: str,
-        payload: bytes,
-        checkpoint: RecoveryCheckpoint | None = None,
-    ) -> MessageEnvelope:
-        if self.append_error is not None:
+        transition: MessagingTransition,
+    ) -> MessagingTransitionResult:
+        if transition.kind == "append_message" and self.append_error is not None:
             self.append_started.set()
             await self.release_append.wait()
             raise self.append_error
-        return await super().append(
-            handle,
-            message_id=message_id,
-            codec=codec,
-            payload=payload,
-            checkpoint=checkpoint,
-        )
-
-    async def finish(
-        self,
-        handle: BackendRunHandle,
-        *,
-        status: str,
-        error: BaseException | None = None,
-    ) -> None:
-        del status, error
-        self.finish_started.set()
-        await self.release_finish.wait()
-        raise BackendOwnershipLost(
-            f"Producer for run {handle.identity.run_id!r} lost ownership during finish"
-        )
+        if transition.kind == "finish_run":
+            self.finish_started.set()
+            await self.release_finish.wait()
+            raise BackendOwnershipLost("Producer lost ownership during finish")
+        return await super().commit_messaging_transition(transition)
 
 
 def _active_producer(run: str) -> asyncio.Task[None]:
@@ -421,7 +394,7 @@ async def _data(subscription: MessageSubscription[str]) -> list[str]:
 
 
 async def test_cancel_invokes_callback_once_and_commits_callback_output(
-    messaging_backend: MessagingBackend,
+    messaging_backend: MessagingBackendHarness,
 ) -> None:
     release = asyncio.Event()
     source = _CancellableSource(
@@ -458,7 +431,7 @@ async def test_cancel_invokes_callback_once_and_commits_callback_output(
 
 
 async def test_cancel_callback_receives_the_owned_run_context(
-    messaging_backend: MessagingBackend,
+    messaging_backend: MessagingBackendHarness,
 ) -> None:
     release = asyncio.Event()
     source = _CancellableSource(release=release)
@@ -486,7 +459,7 @@ async def test_cancel_callback_receives_the_owned_run_context(
 
 
 async def test_cancel_callback_prefers_the_compatible_zero_argument_shape(
-    messaging_backend: MessagingBackend,
+    messaging_backend: MessagingBackendHarness,
 ) -> None:
     release = asyncio.Event()
     source = _CancellableSource(release=release)
@@ -571,7 +544,7 @@ async def test_uninspectable_cancel_callback_is_rejected_before_claiming_the_run
 
 
 async def test_cancel_callback_type_error_is_not_retried_without_context(
-    messaging_backend: MessagingBackend,
+    messaging_backend: MessagingBackendHarness,
 ) -> None:
     source = _AbortableSource()
     calls = 0
@@ -603,7 +576,7 @@ async def test_cancel_callback_type_error_is_not_retried_without_context(
 
 
 async def test_sync_cancel_callback_can_return_tail_messages(
-    messaging_backend: MessagingBackend,
+    messaging_backend: MessagingBackendHarness,
 ) -> None:
     release = asyncio.Event()
     source = _CancellableSource(release=release)
@@ -627,7 +600,7 @@ async def test_sync_cancel_callback_can_return_tail_messages(
 
 
 async def test_concurrent_cancel_callers_share_one_callback_and_settlement(
-    messaging_backend: MessagingBackend,
+    messaging_backend: MessagingBackendHarness,
 ) -> None:
     release = asyncio.Event()
     source = _CancellableSource(release=release)
@@ -695,7 +668,7 @@ async def test_cancel_commits_an_in_flight_message_before_callback_tail() -> Non
 
 
 async def test_cancel_without_callback_is_rejected_without_stopping_source(
-    messaging_backend: MessagingBackend,
+    messaging_backend: MessagingBackendHarness,
 ) -> None:
     release = asyncio.Event()
     source = _CancellableSource(release=release)
@@ -718,7 +691,7 @@ async def test_cancel_without_callback_is_rejected_without_stopping_source(
 
 
 async def test_cancel_after_natural_completion_returns_false(
-    messaging_backend: MessagingBackend,
+    messaging_backend: MessagingBackendHarness,
 ) -> None:
     release = asyncio.Event()
     release.set()
@@ -741,7 +714,7 @@ async def test_cancel_after_natural_completion_returns_false(
 
 
 async def test_backend_rejects_a_second_cancel_settlement_claim(
-    messaging_backend: MessagingBackend,
+    messaging_backend: MessagingBackendHarness,
 ) -> None:
     prepared = await messaging_backend.prepare(
         channel="events",
@@ -765,7 +738,7 @@ async def test_backend_rejects_a_second_cancel_settlement_claim(
 
 
 async def test_cancel_callback_failure_becomes_the_run_failure(
-    messaging_backend: MessagingBackend,
+    messaging_backend: MessagingBackendHarness,
 ) -> None:
     release = asyncio.Event()
     source = _CancellableSource(release=release)
@@ -797,7 +770,7 @@ async def test_cancel_callback_failure_becomes_the_run_failure(
 
 
 async def test_cancel_tail_codec_failure_preserves_the_committed_prefix(
-    messaging_backend: MessagingBackend,
+    messaging_backend: MessagingBackendHarness,
 ) -> None:
     source = _AbortableSource(
         before=("committed",),
@@ -852,7 +825,7 @@ async def test_cancel_tail_append_failure_preserves_the_committed_prefix() -> No
 
 
 async def test_cancel_callback_can_join_the_source_consumer_without_deadlock(
-    messaging_backend: MessagingBackend,
+    messaging_backend: MessagingBackendHarness,
 ) -> None:
     source = _JoinOnCloseSource()
 
@@ -880,7 +853,7 @@ async def test_cancel_callback_can_join_the_source_consumer_without_deadlock(
 
 
 async def test_codec_failure_preserves_the_committed_prefix(
-    messaging_backend: MessagingBackend,
+    messaging_backend: MessagingBackendHarness,
 ) -> None:
     release = asyncio.Event()
     release.set()

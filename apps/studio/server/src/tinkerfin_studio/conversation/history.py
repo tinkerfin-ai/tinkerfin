@@ -35,6 +35,12 @@ from tinkerfin_studio.conversation.schemas import (
     ConversationTraceUpdateEvent,
     PendingInteractionKind,
 )
+from tinkerfin_studio.conversation.todo_groups import (
+    TaskTraceQueryTimeout,
+    TaskTraceSnapshot,
+    TodoGroupProjector,
+    TodoGroupQueryExecutor,
+)
 from tinkerfin_tracing import (
     InvalidTraceCursor,
     Tracer,
@@ -104,10 +110,12 @@ class ConversationHistoryService:
         *,
         user_id: int,
         tracer: Tracer,
+        todo_group_query: TodoGroupQueryExecutor,
     ) -> None:
         self._repository = repository
         self._user_id = user_id
         self._tracer = tracer
+        self._todo_group_query = todo_group_query
 
     async def list_history(
         self,
@@ -151,6 +159,7 @@ class ConversationHistoryService:
         *,
         history_cursor: str | None = None,
         limit: int = 100,
+        include_task_trace: bool = True,
     ) -> ConversationHistoryDetail:
         """返回一个固定 as-of、可继续向前扩展的 Trace 视图"""
 
@@ -159,13 +168,31 @@ class ConversationHistoryService:
             history_cursor=history_cursor,
             limit=limit,
         )
-        detail = await self._detail(thread=thread, trace=trace)
-        await self._repository.commit()
-        return detail
+        projector: TodoGroupProjector | None = None
+        try:
+            task_trace = None
+            if include_task_trace:
+                projector = await self._project_task_trace(trace)
+                task_trace = projector.snapshot(
+                    status=trace.status,
+                    completeness=trace.completeness,
+                )
+            detail = await self._detail(
+                thread=thread,
+                trace=trace,
+                task_trace=task_trace,
+            )
+            await self._repository.commit()
+            return detail
+        finally:
+            if projector is not None:
+                projector.close()
 
     async def follow_trace(
         self,
         thread_id: str,
+        *,
+        include_task_trace: bool = True,
     ) -> AsyncGenerator[
         ConversationTraceSnapshotEvent
         | ConversationTraceUpdateEvent
@@ -179,9 +206,26 @@ class ConversationHistoryService:
             history_cursor=None,
             limit=100,
         )
-        detail = await self._detail(thread=thread, trace=trace)
-        # 归属和 Run 配置已固定到 snapshot；长流开始前归还业务连接
-        await self._repository.commit()
+        projector: TodoGroupProjector | None = None
+        try:
+            task_trace = None
+            if include_task_trace:
+                projector = await self._project_task_trace(trace)
+                task_trace = projector.snapshot(
+                    status=trace.status,
+                    completeness=trace.completeness,
+                )
+            detail = await self._detail(
+                thread=thread,
+                trace=trace,
+                task_trace=task_trace,
+            )
+            # 归属和 Run 配置已固定到 snapshot；长流开始前归还业务连接
+            await self._repository.commit()
+        except BaseException:
+            if projector is not None:
+                projector.close()
+            raise
 
         async def events() -> AsyncGenerator[
             ConversationTraceSnapshotEvent
@@ -189,11 +233,29 @@ class ConversationHistoryService:
             | ConversationTraceErrorEvent,
             None,
         ]:
-            yield ConversationTraceSnapshotEvent(snapshot=detail)
             updates = trace.follow()
+            last_revision = projector.revision if projector is not None else 0
+            last_task_trace = task_trace
             try:
+                yield ConversationTraceSnapshotEvent(snapshot=detail)
                 async for update in updates:
-                    yield ConversationTraceUpdateEvent(update=update)
+                    task_trace_update = None
+                    if projector is not None:
+                        for event in update.events:
+                            projector.consume(event)
+                        if projector.revision != last_revision:
+                            candidate = projector.snapshot(
+                                status=update.status,
+                                completeness=update.completeness,
+                            )
+                            last_revision = projector.revision
+                            if candidate != last_task_trace:
+                                task_trace_update = candidate
+                                last_task_trace = candidate
+                    yield ConversationTraceUpdateEvent(
+                        update=update,
+                        taskTrace=task_trace_update,
+                    )
             except asyncio.CancelledError:
                 raise
             except TracingError as error:
@@ -205,6 +267,8 @@ class ConversationHistoryService:
                 yield ConversationTraceErrorEvent()
             finally:
                 await updates.aclose()
+                if projector is not None:
+                    projector.close()
 
         return events()
 
@@ -236,11 +300,23 @@ class ConversationHistoryService:
             raise SystemException(ConversationErrorCode.TRACE_UNAVAILABLE) from error
         return thread, trace
 
+    async def _project_task_trace(
+        self,
+        trace: TraceThread,
+    ) -> TodoGroupProjector:
+        """把任务轨迹读取失败映射为现有 Trace 不可用错误"""
+
+        try:
+            return await self._todo_group_query.project(trace)
+        except (TaskTraceQueryTimeout, TracingError) as error:
+            raise SystemException(ConversationErrorCode.TRACE_UNAVAILABLE) from error
+
     async def _detail(
         self,
         *,
         thread: ConversationThread,
         trace: TraceThread,
+        task_trace: TaskTraceSnapshot | None,
     ) -> ConversationHistoryDetail:
         registration = await self._repository.get_run(
             thread_pk=thread.id,
@@ -277,6 +353,7 @@ class ConversationHistoryService:
             ),
             status=summary.status,
             completeness=summary.completeness,
+            taskTrace=task_trace,
             createdAt=thread.created_at,
             updatedAt=thread.updated_at,
         )

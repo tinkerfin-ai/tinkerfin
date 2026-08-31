@@ -1,12 +1,10 @@
-import { BrandMark } from '../../../components/ui/BrandMark'
+import { BrandLogo } from '../../../components/ui'
 import { useI18n } from '../../../i18n'
 
 export function EmptyConversationBrand() {
   return (
     <div className="empty-brand-lockup" aria-hidden="true">
-      <BrandMark size={34} />
-      <span className="empty-brand-name">TinkerFin</span>
-      <span className="brand-plus">Plus</span>
+      <BrandLogo size="lg" />
     </div>
   )
 }

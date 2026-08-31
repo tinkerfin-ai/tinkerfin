@@ -126,6 +126,7 @@
     --layout-interaction-card-gap: var(--space-6);
     --layout-content-medium: 712px;
     --layout-task-drawer: 348px;
+    --layout-todo-trace-drawer: 400px;
     --layout-header-height: 60px;
     --layout-settings-dialog: 760px;
     --layout-settings-nav: 180px;

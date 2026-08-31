@@ -42,6 +42,9 @@ export function Composer({
   disabledReason,
   hero,
   takeover,
+  scrollToBottomControl,
+  taskTraceControl,
+  backgroundInert = false,
   modelControl,
   planActive,
   planLocked = false,
@@ -63,6 +66,9 @@ export function Composer({
   disabledReason?: string
   hero?: ReactNode
   takeover?: ReactNode
+  scrollToBottomControl?: ReactNode
+  taskTraceControl?: ReactNode
+  backgroundInert?: boolean
   modelControl: ReactNode
   planActive: boolean
   planLocked?: boolean
@@ -207,10 +213,20 @@ export function Composer({
 
   return (
     <footer className={`composer-dock${hero ? ' is-hero' : ''}${takeover ? ' is-taken-over' : ''}`}>
+      {(scrollToBottomControl || taskTraceControl) && (
+        <div className="composer-auxiliary-controls">
+          {scrollToBottomControl && (
+            <div className="composer-scroll-to-bottom-control">{scrollToBottomControl}</div>
+          )}
+          {taskTraceControl && (
+            <div className="composer-task-trace-control">{taskTraceControl}</div>
+          )}
+        </div>
+      )}
       <div
         className={`composer-default${takeover ? ' is-taken-over' : ''}`}
-        aria-hidden={Boolean(takeover) || undefined}
-        inert={Boolean(takeover) || undefined}
+        aria-hidden={Boolean(takeover) || backgroundInert || undefined}
+        inert={Boolean(takeover) || backgroundInert || undefined}
       >
         {hero && <div className="composer-hero">{hero}</div>}
         <div className="composer" onPointerDown={(event) => {
@@ -357,7 +373,15 @@ export function Composer({
         </div>
         </div>
       </div>
-      {takeover && <div className="composer-takeover">{takeover}</div>}
+      {takeover && (
+        <div
+          className="composer-takeover"
+          aria-hidden={backgroundInert || undefined}
+          inert={backgroundInert || undefined}
+        >
+          {takeover}
+        </div>
+      )}
       <p className="composer-note">{t('TinkerFin 可能会犯错，请核对重要信息')}</p>
     </footer>
   )

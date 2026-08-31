@@ -63,7 +63,12 @@ from tinkerfin_tracing import (
     TraceThreadKey,
     TurnFact,
 )
-from tinkerfin_tracing.projection import project_core
+from tinkerfin_tracing.projection import (
+    advance_core_projection_state,
+    empty_core_projection_state,
+    project_core,
+    project_core_checkpoint,
+)
 
 
 class _Graph:
@@ -596,6 +601,73 @@ async def test_incremental_core_checkpoint_reads_only_the_visible_turn_window() 
     assert thread.state == baseline.state
     assert thread.status == baseline.status
     assert thread.completeness == baseline.completeness
+
+
+async def test_implicit_resume_matches_full_fold_for_every_incremental_batch() -> None:
+    store = _ReadCountingStore()
+    tracer = Tracer(store=store)
+    await _record_run(tracer, run_id="implicit-resume-parent")
+    await _record_run(
+        tracer,
+        run_id="implicit-resume-child",
+        input_kind="resume",
+    )
+    snapshot = await store.snapshot("thread-lineage")
+    events = await store.read_events(
+        snapshot.key,
+        after_seq=0,
+        as_of_seq=snapshot.as_of_seq,
+        limit=1000,
+    )
+    baseline = project_core(
+        events,
+        head_run_id=None,
+        turn_limit=100,
+        active_run_ids=snapshot.active_run_ids,
+    )
+
+    states = []
+    for chunk_size in range(1, len(events) + 1):
+        state = empty_core_projection_state()
+        for offset in range(0, len(events), chunk_size):
+            state = advance_core_projection_state(
+                state,
+                events[offset : offset + chunk_size],
+            )
+        states.append(state)
+    for split in range(1, len(events)):
+        state = advance_core_projection_state(
+            empty_core_projection_state(),
+            events[:split],
+        )
+        states.append(advance_core_projection_state(state, events[split:]))
+
+    expected_state = states[0].model_dump(mode="json", by_alias=True)
+    for state in states:
+        assert state.model_dump(mode="json", by_alias=True) == expected_state
+        projected = project_core_checkpoint(
+            state,
+            head_run_id=None,
+            turn_limit=100,
+            active_run_ids=snapshot.active_run_ids,
+        )
+        assert projected.selected_run_ids == baseline.selected_run_ids
+        assert projected.selected_head == baseline.selected_head
+        assert projected.available_heads == baseline.available_heads
+        assert projected.messages == baseline.messages
+        assert projected.reasoning == baseline.reasoning
+        assert projected.tree == baseline.tree
+        assert projected.state == baseline.state
+        assert projected.interactions == baseline.interactions
+        assert projected.summary == baseline.summary
+        assert projected.has_older == baseline.has_older
+
+    store.read_calls.clear()
+    cached = await tracer.get("thread-lineage")
+
+    assert store.read_calls == []
+    assert cached.completeness == baseline.completeness
+    assert cached.completeness.missing_prefix is False
 
 
 async def test_history_cursor_expands_one_fixed_prefix_after_new_commits() -> None:

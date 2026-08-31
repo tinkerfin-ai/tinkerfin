@@ -541,6 +541,7 @@ local run_key = KEYS[3]
 local lease_key = KEYS[4]
 local messages = KEYS[5]
 local signals = KEYS[6]
+local channel_meta = KEYS[7]
 local generation = ARGV[1]
 local requested_after = ARGV[2]
 local retention_ms = tonumber(ARGV[3])
@@ -611,6 +612,7 @@ if status ~= 'completed' and status ~= 'cancelled' and status ~= 'failed' and st
 end
 
 local end_seq = redis.call('HGET', run_key, 'end_seq') or ''
+local observed_at = redis.call('TIME')
 local page = {}
 if requested_after ~= '__none__' then
     local cursor = tonumber(requested_after)
@@ -635,7 +637,137 @@ return {
     redis.call('HGET', run_key, 'lease_renew_count') or '',
     redis.call('HGET', run_key, 'lease_last_success_seconds') or '',
     redis.call('HGET', run_key, 'lease_last_success_microseconds') or '',
-    page
+    page,
+    observed_at[1],
+    observed_at[2],
+    redis.call('HGET', run_key, 'start_seq') or '',
+    redis.call('HGET', run_key, 'settling') or '0',
+    redis.call('HGET', run_key, 'cancellable') or '0',
+    redis.call('HGET', run_key, 'recoverable') or '0',
+    redis.call('HGET', run_key, 'owner_token') or '',
+    redis.call('HGET', run_key, 'fence') or '',
+    redis.call('HGET', run_key, 'checkpoint_present') or '0',
+    redis.call('HGET', run_key, 'checkpoint_position') or '',
+    redis.call('HGET', run_key, 'checkpoint_message_id') or '',
+    redis.call('HGET', meta, 'active_run') or '',
+    redis.call('HGET', meta, 'seq') or '0',
+    redis.call('HGET', meta, 'payload_bytes') or '0',
+    redis.call('HGET', meta, 'fence_counter') or '0',
+    redis.call('HGET', channel_meta, 'codec') or '',
+    redis.call('HGET', channel_meta, 'max_message_payload_bytes') or '',
+    redis.call('HGET', channel_meta, 'max_checkpoint_bytes') or '',
+    redis.call('HGET', channel_meta, 'max_thread_messages') or '',
+    redis.call('HGET', channel_meta, 'max_thread_payload_bytes') or '',
+    redis.call('HGET', channel_meta, 'retention_ms') or ''
+}
+"""
+
+
+# State loading reads every requested value and the Redis clock in one script. A
+# preceding control lookup only selects same-slot keys; the script rejects that lookup
+# if the current generation or active-run key changed before this atomic read.
+_MESSAGING_STATE_SNAPSHOT_SCRIPT = r"""
+local control = KEYS[1]
+local channel_meta = KEYS[2]
+local meta = KEYS[3]
+local target_run = KEYS[4]
+local target_lease = KEYS[5]
+local messages = KEYS[6]
+local dedupe = KEYS[7]
+local selected_tombstone = KEYS[8]
+local active_run = KEYS[9]
+local active_lease = KEYS[10]
+
+local expected_generation = tonumber(ARGV[1])
+local selected_generation = tonumber(ARGV[2])
+local include_active_run = ARGV[3] == '1'
+local expected_active_run_key = ARGV[4]
+local expected_active_lease_key = ARGV[5]
+local requested_message_id = ARGV[6]
+
+local current_generation = tonumber(redis.call('HGET', control, 'generation') or '0')
+if current_generation ~= expected_generation then
+    return {'GENERATION_CHANGED'}
+end
+
+local observed_at = redis.call('TIME')
+local state = redis.call('HGET', control, 'state') or 'none'
+local control_values = redis.call('HGETALL', control)
+local channel_values = redis.call('HGETALL', channel_meta)
+if current_generation == 0 then
+    return {
+        'OK', 'missing', '0', state, observed_at[1], observed_at[2], '0',
+        control_values, channel_values, {}, {}, '-2', {}, '-2', {}, {}, ''
+    }
+end
+if state ~= 'active' and state ~= 'deleting' and state ~= 'deleted'
+    and state ~= 'expiring' and state ~= 'expired' then
+    return {'INVALID_CONTROL_STATE', state}
+end
+if selected_generation ~= current_generation then
+    return {
+        'OK', 'unavailable', tostring(current_generation), state,
+        observed_at[1], observed_at[2], '0', control_values, channel_values,
+        {}, {}, '-2', {}, '-2', {}, {}, redis.call('GET', selected_tombstone) or ''
+    }
+end
+if state == 'deleted' or state == 'expired' then
+    return {
+        'OK', 'unavailable', tostring(current_generation), state,
+        observed_at[1], observed_at[2], '0', control_values, channel_values,
+        {}, {}, '-2', {}, '-2', {}, {}, state
+    }
+end
+if state == 'deleting' or state == 'expiring' then
+    return {
+        'OK', 'sealed', tostring(current_generation), state,
+        observed_at[1], observed_at[2], state == 'expiring' and '1' or '0',
+        control_values, channel_values, {}, {}, '-2', {}, '-2', {}, {}, ''
+    }
+end
+
+if include_active_run then
+    local stored_active_run_key = redis.call('HGET', meta, 'active_key') or ''
+    local stored_active_lease_key = redis.call('HGET', meta, 'active_lease') or ''
+    if stored_active_run_key ~= expected_active_run_key
+        or stored_active_lease_key ~= expected_active_lease_key then
+        return {'ACTIVE_RUN_CHANGED'}
+    end
+end
+
+local now_ms = tonumber(observed_at[1]) * 1000
+    + math.floor(tonumber(observed_at[2]) / 1000)
+local retention_deadline_ms = tonumber(
+    redis.call('HGET', control, 'retention_deadline_ms') or '0')
+local retention_expired = '0'
+if retention_deadline_ms > 0 and now_ms >= retention_deadline_ms then
+    retention_expired = '1'
+end
+
+local dedupe_values = {}
+local matching_message = {}
+if requested_message_id ~= '' then
+    dedupe_values = redis.call('HGETALL', dedupe)
+    local sequence = redis.call('HGET', dedupe, 'seq')
+    if sequence then
+        matching_message = redis.call(
+            'XRANGE', messages, sequence .. '-0', sequence .. '-0', 'COUNT', '1')
+    end
+end
+
+return {
+    'OK', 'active', tostring(current_generation), state,
+    observed_at[1], observed_at[2], retention_expired,
+    control_values,
+    channel_values,
+    redis.call('HGETALL', meta),
+    redis.call('HGETALL', target_run),
+    tostring(redis.call('PTTL', target_lease)),
+    include_active_run and redis.call('HGETALL', active_run) or {},
+    include_active_run and tostring(redis.call('PTTL', active_lease)) or '-2',
+    dedupe_values,
+    matching_message,
+    ''
 }
 """
 

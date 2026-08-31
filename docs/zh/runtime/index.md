@@ -101,13 +101,14 @@ result = await graph.ainvoke(graph_input, config=config)
 
 ## 当前能力边界
 
-当前发行提供显式 `deepagents-v2` Runtime Profile，不提供 Deep Agents v3 Profile 或 TodoGroups
-Projection/UI。其他具体 Profile 必须拥有对应上游构造与流合同，同时输出同一 canonical Native
-Observation；下游 Runtime、Trace、AG-UI 与 Messaging 不按上游版本分支。
+框架发行提供显式 `deepagents-v2` Runtime Profile，不提供 Deep Agents v3 Profile 或通用
+TodoGroups Projection/UI。Studio 在查询时从 canonical Trace 事实派生产品任务轨迹。其他具体
+Profile 必须拥有对应上游构造与流合同，同时输出同一 canonical Native Observation；下游
+Runtime、Trace、AG-UI 与 Messaging 不按上游版本分支。
 
 当前不提供 Archive/S3/Blob、payload Encryption/KMS 或 OpenTelemetry exporter。具体集成只能
-组合已使用的 `TraceStore`、canonical payload codec、`RuntimeObserver` 或 Store/Messaging
-Backend 边界；项目不提供空占位接口。
+通过 `TraceLedgerBackend` 接入活动 Trace 存储；高级集成可完整替换 `TraceStore`、包装 canonical
+payload codec、观察 `RuntimeObserver` 或装饰 Store/Messaging Backend 边界。项目不提供空占位接口。
 
 ## 下一步
 

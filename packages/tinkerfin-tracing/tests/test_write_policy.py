@@ -7,11 +7,15 @@ from datetime import UTC, datetime
 from typing import Literal
 
 import pytest
+from pydantic import JsonValue
 
 from tinkerfin_contracts import RunIdentity
+from tinkerfin_tracing._prepared import prepare_trace_facts
+from tinkerfin_tracing.capture import CapturedValue
 from tinkerfin_tracing.codec import CanonicalTracePayloadCodec, EncodedTracePayload
+from tinkerfin_tracing.durable_store import InMemoryTraceStore
 from tinkerfin_tracing.facts import RunFact, TraceEvent, TraceSemanticFact
-from tinkerfin_tracing.store import InMemoryTraceStore, TraceThreadKey, TraceWriter
+from tinkerfin_tracing.store import TraceThreadKey, TraceWriter
 from tinkerfin_tracing.writing import TraceBatchWriter, TraceWritePolicy
 
 
@@ -86,6 +90,39 @@ class _GateWriter(_RecordingWriter):
 
 async def _ignore_committed(_events: tuple[TraceEvent, ...]) -> None:
     return None
+
+
+def test_prepared_fact_and_canonical_payload_share_one_deep_snapshot() -> None:
+    value: dict[str, JsonValue] = {"x": 1}
+    captured = CapturedValue(
+        disposition="inline",
+        safe_size_bytes=7,
+        value=value,
+    )
+    fact = RunFact(
+        source_observation_id="snapshot-input",
+        identity=_identity(),
+        occurred_at=datetime.now(UTC),
+        monotonic_ns=1,
+        phase="input",
+        input_kind="ordinary",
+        input=captured,
+        config=captured,
+    )
+    codec = CanonicalTracePayloadCodec()
+    prepared = prepare_trace_facts((fact,), codec=codec)[0]
+
+    assert fact.input is not None
+    assert isinstance(fact.input.value, dict)
+    fact.input.value["x"] = 2
+    decoded = codec.decode_fact(prepared.canonical_payload)
+
+    assert isinstance(prepared.fact, RunFact)
+    assert prepared.fact.input is not None
+    assert prepared.fact.input.value == {"x": 1}
+    assert isinstance(decoded, RunFact)
+    assert decoded.input is not None
+    assert decoded.input.value == {"x": 1}
 
 
 async def test_policy_batches_ordinary_facts_and_isolates_mandatory_terminal() -> None:

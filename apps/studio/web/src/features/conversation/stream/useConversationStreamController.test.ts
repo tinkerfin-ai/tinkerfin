@@ -83,6 +83,7 @@ const traceDetail = (
   createdAt: BASE_TIME,
   updatedAt: BASE_TIME,
   ...overrides,
+  taskTrace: overrides.taskTrace ?? { status: 'ready', todoGroups: [] },
 })
 
 const conversation = (overrides: Partial<Conversation> = {}): Conversation => ({
@@ -100,6 +101,10 @@ const conversation = (overrides: Partial<Conversation> = {}): Conversation => ({
   lastSeq: 0,
   isHydrated: true,
   ...overrides,
+  taskTrace: overrides.taskTrace ?? {
+    phase: 'ready',
+    snapshot: { status: 'ready', todoGroups: [] },
+  },
 })
 
 async function* streamItems(
@@ -186,6 +191,7 @@ describe('useConversationStreamController', () => {
       expect(current?.trace?.asOfSeq).toBe(5)
     })
     expect(traceMocks.detail).toHaveBeenCalledWith(THREAD_ID, {
+      includeTaskTrace: true,
       signal: expect.any(AbortSignal),
       suppressGlobalError: true,
     })
@@ -274,6 +280,7 @@ describe('useConversationStreamController', () => {
       { type: 'snapshot', snapshot },
       {
         type: 'update',
+        taskTrace: null,
         update: {
           asOfSeq: 3,
           events: [],
@@ -336,6 +343,7 @@ describe('useConversationStreamController', () => {
         ? traceItems([{ type: 'snapshot', snapshot: initial }])
         : traceItems([{
             type: 'update',
+            taskTrace: null,
             update: {
               asOfSeq: 4,
               events: [],
@@ -375,15 +383,15 @@ describe('useConversationStreamController', () => {
     let traceAborted = false
     traceMocks.follow.mockImplementation(async function* (
       _threadId: string,
-      signal: AbortSignal,
+      options: { signal: AbortSignal },
     ) {
       await new Promise<void>((resolve) => {
-        signal.addEventListener('abort', () => {
+        options.signal.addEventListener('abort', () => {
           traceAborted = true
           resolve()
         }, { once: true })
       })
-      if (signal.aborted) yield { type: 'error', code: 'trace_unavailable' }
+      if (options.signal.aborted) yield { type: 'error', code: 'trace_unavailable' }
     })
     clientMocks.start.mockImplementation(() => streamItems([
       { seq: 1, event: { type: 'RUN_STARTED', threadId: THREAD_ID, runId: RUN_ID } },

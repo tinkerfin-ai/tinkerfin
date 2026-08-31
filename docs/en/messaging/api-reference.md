@@ -34,7 +34,7 @@ RunIdentity is optional only when the source advertises an immutable profile.
 
 | API | Purpose |
 | --- | --- |
-| `MessageSubscription` | Asynchronously iterate `DecodedMessage`; supports `sse()` and `aclose()` |
+| `MessageSubscription` | Returned by channel `wrap()`/`follow()`; asynchronously iterates `DecodedMessage` and supports `sse()`/`aclose()`; do not construct directly |
 | `DecodedMessage` | Committed `envelope` plus codec-decoded `data` |
 | `MessageEnvelope` | Immutable committed durable message |
 
@@ -95,25 +95,32 @@ changing the output protocol is intentional.
 | `NativeStreamPart` | `[native]` finite canonical Native replay value |
 | `MemoryBackend` | In-process implementation |
 | `RedisBackend` | `[redis]` multi-process implementation |
-| `MessagingBackend` | Custom backend protocol |
+| `MessagingBackend` | Six-operation custom storage protocol |
+| `MessagingBackendSettings` | Immutable limits, retention, lease, renewal, and wait settings |
+| `MessagingTransition` | Framework-defined atomic lifecycle intent |
+| `MessagingStateSnapshot` | Bounded storage-clock-consistent transition evidence |
+| `MessagingStorageEffect` | Complete replacements produced by `resolve_messaging_transition()` |
 | `MessagingRetentionPolicy` | Disabled or positive terminal replay deadline |
 
 ### Backend operations
 
 | Operation | Contract |
 | --- | --- |
-| `prepare(...)` | Channel, RunIdentity, codec, cursor, cancellation/recovery flags; returns `PreparedRun` |
-| `append(...)` | Handle, message ID, codec, bytes, optional checkpoint; returns Envelope |
-| `begin_settlement()` / `finish()` | Atomically claim and record finalization |
-| `get_run_status()` | Channel and RunIdentity; may atomically classify an expired lease as `owner_lost` |
-| `latest_seq()` / `read()` | Channel, RunIdentity, and pagination |
-| `bind_follow()` / `follow()` | Bind an authoritative generation and read it |
-| cancellation methods | Request, wait, and retrieve failure |
-| `lease_renew_interval` / `lease_timeout` / `renew(handle)` | Describe and renew producer lease ownership |
-| `retention_policy` | Immutable terminal replay policy shared by backend workers |
-| `delete_stream(...)` | Delete an inactive thread generation |
+| `messaging_settings` | Return immutable settings shared by cooperating Backend instances |
+| `prepare_messaging_storage()` | Idempotently create or validate the current storage shape |
+| `commit_messaging_transition(...)` | Atomically commit a framework transition |
+| `load_messaging_state(...)` | Load one bounded consistent state snapshot |
+| `read_committed_messages(...)` | Read one ascending exact-generation message page |
+| `wait_for_messaging_change(...)` | Wait cancellation-responsively for a possible message or control change |
+| `purge_stream_generation(...)` | Idempotently remove one bounded batch from a sealed generation |
 
-`BackendRunHandle` contains channel, RunIdentity, owner token, fence, and generation. `PreparedRun` adds the cursor, owner decision, checkpoint, and recovery flag.
+`resolve_messaging_transition()` contains the reusable storage-neutral state machine.
+`tinkerfin_messaging.testing.verify_messaging_backend()` verifies supported behavior
+against an isolated Backend factory.
+
+Cleanup begin can return an opaque, expiring `cleanup_token`. Messaging passes it
+unchanged and serially to bounded purge and finish calls for the returned generation;
+it never interprets or persists the token.
 
 ## Callbacks
 

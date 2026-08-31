@@ -346,6 +346,111 @@ async def test_missing_prefix_is_scoped_to_the_selected_head_lineage() -> None:
     assert orphan.completeness.missing_prefix is True
 
 
+@pytest.mark.parametrize("input_kind", ["resume", "abandon"])
+async def test_implicit_continuation_keeps_the_sole_completed_parent_lineage(
+    input_kind: RunInputKind,
+) -> None:
+    tracer = Tracer()
+    parent = _context("implicit-parent")
+    parent_session = await _start(tracer, parent)
+    await _finish(parent_session, parent, outcome="interrupted")
+    continuation = _context("implicit-continuation", input_kind=input_kind)
+    continuation_session = await _start(tracer, continuation)
+    await _finish(
+        continuation_session,
+        continuation,
+        outcome="abandoned" if input_kind == "abandon" else "succeeded",
+    )
+
+    thread = await tracer.get("thread-query")
+    run_nodes = tuple(node for node in thread.tree.nodes if node.kind == "run")
+
+    assert thread.head_run_id == "implicit-continuation"
+    assert thread.completeness.missing_prefix is False
+    assert len(thread.tree.roots) == 1
+    assert {node.run_id for node in run_nodes} == {
+        "implicit-parent",
+        "implicit-continuation",
+    }
+
+
+@pytest.mark.parametrize("input_kind", ["resume", "abandon"])
+async def test_continuation_without_any_parent_evidence_remains_partial(
+    input_kind: RunInputKind,
+) -> None:
+    tracer = Tracer()
+    context = _context("missing-predecessor", input_kind=input_kind)
+    session = await _start(tracer, context)
+    await _finish(
+        session,
+        context,
+        outcome="abandoned" if input_kind == "abandon" else "succeeded",
+    )
+
+    thread = await tracer.get("thread-query")
+
+    assert thread.completeness.missing_prefix is True
+    assert thread.tree.roots[0].id.startswith("turn-partial:")
+
+
+async def test_implicit_resume_with_multiple_completed_heads_remains_partial() -> None:
+    tracer = Tracer()
+    await _record(tracer, "ambiguous-root")
+    await _record(
+        tracer,
+        "ambiguous-a",
+        input_kind="branch",
+        parent_run_id="ambiguous-root",
+    )
+    await _record(
+        tracer,
+        "ambiguous-b",
+        input_kind="branch",
+        parent_run_id="ambiguous-root",
+    )
+    await _record(tracer, "ambiguous-resume", input_kind="resume")
+
+    thread = await tracer.get("thread-query", head_run_id="ambiguous-resume")
+
+    assert thread.completeness.missing_prefix is True
+    assert thread.tree.roots[0].id.startswith("turn-partial:")
+
+
+async def test_implicit_resume_does_not_inherit_one_unterminated_head() -> None:
+    tracer = Tracer()
+    active = _context("active-parent")
+    active_session = await _start(tracer, active)
+    continuation = _context("active-resume", input_kind="resume")
+    continuation_session = await _start(tracer, continuation)
+    try:
+        await _finish(continuation_session, continuation)
+        thread = await tracer.get("thread-query", head_run_id="active-resume")
+
+        assert thread.completeness.missing_prefix is True
+        assert thread.tree.roots[0].id.startswith("turn-partial:")
+    finally:
+        await _finish(active_session, active)
+
+
+@pytest.mark.parametrize("input_kind", ["resume", "abandon"])
+async def test_explicit_continuation_parent_stays_complete(
+    input_kind: RunInputKind,
+) -> None:
+    tracer = Tracer()
+    await _record(tracer, "explicit-parent")
+    await _record(
+        tracer,
+        "explicit-continuation",
+        input_kind=input_kind,
+        parent_run_id="explicit-parent",
+    )
+
+    thread = await tracer.get("thread-query")
+
+    assert thread.completeness.missing_prefix is False
+    assert len(thread.tree.roots) == 1
+
+
 async def test_follow_skips_commits_from_an_unselected_sibling_branch() -> None:
     tracer = Tracer()
     await _record(tracer, "root")

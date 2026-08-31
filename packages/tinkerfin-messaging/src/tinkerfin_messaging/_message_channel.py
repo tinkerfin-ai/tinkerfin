@@ -29,9 +29,9 @@ from ._messaging_boundary import (
     _validate_optional_cursor,
 )
 from .backend import (
-    BackendRunHandle,
-    PreparedRun,
     RunStatus,
+    _BackendRunHandle,
+    _PreparedRun,
     is_active_run_status,
     is_failed_run_status,
     is_final_run_status,
@@ -512,7 +512,7 @@ async def latest_seq(
         self._messaging._require_open()
         latest = await _await_backend(
             "latest_seq",
-            self._messaging.backend.latest_seq(
+            self._messaging._runtime_backend.latest_seq(
                 channel=self.name,
                 identity=identity,
             ),
@@ -536,7 +536,7 @@ async def get_run_status(
         self._messaging._require_open()
         status: object = await _await_backend(
             "get_run_status",
-            self._messaging.backend.get_run_status(
+            self._messaging._runtime_backend.get_run_status(
                 channel=self.name,
                 identity=identity,
             ),
@@ -573,7 +573,7 @@ async def read(
         self._messaging._require_open()
         envelopes = await _await_backend(
             "read",
-            self._messaging.backend.read(
+            self._messaging._runtime_backend.read(
                 channel=self.name,
                 identity=identity,
                 after=after,
@@ -617,16 +617,16 @@ async def follow(
         self._messaging._require_open()
         handle = await _await_backend(
             "bind_follow",
-            self._messaging.backend.bind_follow(
+            self._messaging._runtime_backend.bind_follow(
                 channel=self.name,
                 identity=identity,
                 after=after,
             ),
         )
         self._messaging._require_open()
-        return MessageSubscription(
-            backend=self._messaging.backend,
-            prepared=PreparedRun(handle=handle, after=after, is_owner=False),
+        return MessageSubscription._create(
+            ledger=self._messaging._runtime_backend,
+            prepared=_PreparedRun(handle=handle, after=after, is_owner=False),
             codec=cast(MessageCodec[object, ReplayT], codec),
             renderer=self._renderer,
         )
@@ -666,7 +666,7 @@ async def validate_cursor(
             raise TypeError("after must be an integer or None")
         latest = await _await_backend(
             "latest_seq",
-            self._messaging.backend.latest_seq(
+            self._messaging._runtime_backend.latest_seq(
                 channel=self.name,
                 identity=identity,
             ),
@@ -810,7 +810,7 @@ async def _wrap_once(
 
     from .messaging import MessageSubscription
 
-    prepared: PreparedRun | None = None
+    prepared: _PreparedRun | None = None
     normalized_cancel: _ContextCancelCallback[object] | None = None
     producer_started = False
     delivery_started = False
@@ -849,7 +849,7 @@ async def _wrap_once(
             normalized_cancel = _normalize_cancel_callback(cancel)
         prepared = await _await_backend(
             "prepare",
-            self._messaging.backend.prepare(
+            self._messaging._runtime_backend.prepare(
                 channel=self.name,
                 identity=resolved_identity,
                 codec=codec_id,
@@ -906,8 +906,8 @@ async def _wrap_once(
             await source.aclose()
             source_released = True
             self._messaging._require_open()
-        return MessageSubscription(
-            backend=self._messaging.backend,
+        return MessageSubscription._create(
+            ledger=self._messaging._runtime_backend,
             prepared=prepared,
             codec=producer_codec,
             renderer=replay_renderer,
@@ -925,7 +925,7 @@ async def _wrap_once(
                 try:
                     await _await_backend(
                         "finish",
-                        self._messaging.backend.finish(
+                        self._messaging._runtime_backend.finish(
                             prepared.handle,
                             status="failed",
                             error=primary,
@@ -1122,7 +1122,7 @@ async def _wrap_recoverable_once(
 
     from .messaging import MessageSubscription
 
-    prepared: PreparedRun | None = None
+    prepared: _PreparedRun | None = None
     opened: MessageSource[RecoverableMessage[SourceT]] | None = None
     normalized_cancel: _ContextCancelCallback[RecoverableMessage[SourceT]] | None = None
     producer_started = False
@@ -1148,7 +1148,7 @@ async def _wrap_recoverable_once(
             normalized_cancel = _normalize_cancel_callback(cancel)
         prepared = await _await_backend(
             "prepare",
-            self._messaging.backend.prepare(
+            self._messaging._runtime_backend.prepare(
                 channel=self.name,
                 identity=resolved_identity,
                 codec=codec_id,
@@ -1203,8 +1203,8 @@ async def _wrap_recoverable_once(
             delivery_started = True
             await started.wait()
             self._messaging._require_open()
-        return MessageSubscription(
-            backend=self._messaging.backend,
+        return MessageSubscription._create(
+            ledger=self._messaging._runtime_backend,
             prepared=prepared,
             codec=cast(MessageCodec[object, ReplayT], codec),
             renderer=renderer,
@@ -1222,7 +1222,7 @@ async def _wrap_recoverable_once(
             try:
                 await _await_backend(
                     "finish",
-                    self._messaging.backend.finish(
+                    self._messaging._runtime_backend.finish(
                         prepared.handle,
                         status="failed",
                         error=primary,
@@ -1267,7 +1267,7 @@ async def cancel(
     preflight = self._messaging._begin_preflight()
     try:
         required_identity(identity)
-        handle = BackendRunHandle(
+        handle = _BackendRunHandle(
             channel=self.name,
             identity=identity,
             owner_token=None,
@@ -1275,16 +1275,16 @@ async def cancel(
         )
         initiated = await _await_backend(
             "request_cancel",
-            self._messaging.backend.request_cancel(handle),
+            self._messaging._runtime_backend.request_cancel(handle),
         )
         status = await _await_backend(
             "wait_finished",
-            self._messaging.backend.wait_finished(handle),
+            self._messaging._runtime_backend.wait_finished(handle),
         )
         if is_failed_run_status(status):
             cause = await _await_backend(
                 "failure",
-                self._messaging.backend.failure(handle),
+                self._messaging._runtime_backend.failure(handle),
             )
             raise RunProducerFailed(
                 identity=identity,
@@ -1318,7 +1318,7 @@ async def delete_stream(
         required_identity(identity)
         await _await_backend(
             "delete_stream",
-            self._messaging.backend.delete_stream(
+            self._messaging._runtime_backend.delete_stream(
                 channel=self.name,
                 identity=identity,
             ),

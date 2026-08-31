@@ -11,6 +11,7 @@ from tinkerfin_messaging import (
     MessagingQuotaExceeded,
     RecoveryCheckpoint,
 )
+from tinkerfin_messaging._messaging_ledger import _MessagingLedger
 
 
 def _identity() -> RunIdentity:
@@ -38,7 +39,7 @@ async def test_memory_backend_enforces_quota_before_mutation_and_keeps_retry_ide
         max_thread_messages=2,
         max_thread_payload_bytes=6,
     )
-    backend = MemoryBackend(limits=limits)
+    backend = _MessagingLedger(MemoryBackend(limits=limits))
     prepared = await backend.prepare(
         channel="events",
         identity=_identity(),

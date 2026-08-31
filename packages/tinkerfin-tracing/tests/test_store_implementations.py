@@ -17,7 +17,9 @@ from tinkerfin_tracing import (
     SqlAlchemyTraceStore,
     TraceProjectionCheckpoint,
     TraceStore,
+    TraceStoreOptions,
     TraceThreadKey,
+    verify_trace_ledger_backend,
 )
 from tinkerfin_tracing.errors import (
     TraceProjectionCheckpointConflict,
@@ -25,6 +27,7 @@ from tinkerfin_tracing.errors import (
     TraceStoreProtocolError,
     TraceThreadNotFound,
 )
+from tinkerfin_tracing.sql_store import _SqlAlchemyTraceLedgerBackend
 
 
 def _identity(run_id: str = "run-contract") -> RunIdentity:
@@ -173,6 +176,39 @@ async def test_sqlite_store_satisfies_shared_contract(tmp_path: Path) -> None:
         )
     finally:
         await engine.dispose()
+
+
+async def test_sqlite_backend_satisfies_public_cross_instance_verifier(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "backend-contract.db"
+    first_engine = create_async_engine(f"sqlite+aiosqlite:///{database}")
+    second_engine = create_async_engine(f"sqlite+aiosqlite:///{database}")
+    options = TraceStoreOptions(
+        writer_lease_seconds=2,
+        writer_heartbeat_interval_seconds=0.5,
+        follow_poll_seconds=0.01,
+        commit_retry_attempts=10,
+        commit_retry_delay_seconds=0.001,
+    )
+    try:
+        await verify_trace_ledger_backend(
+            _SqlAlchemyTraceLedgerBackend(
+                first_engine,
+                namespace="sqlite-backend-contract",
+                options=options,
+            ),
+            _SqlAlchemyTraceLedgerBackend(
+                second_engine,
+                namespace="sqlite-backend-contract",
+                options=options,
+            ),
+            namespace="sqlite-backend-contract",
+            options=options,
+        )
+    finally:
+        await first_engine.dispose()
+        await second_engine.dispose()
 
 
 async def test_sqlite_concurrent_schema_first_start_uses_one_current_shape(

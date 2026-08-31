@@ -103,11 +103,12 @@ LangGraph 风格 `Runnable` 时，才直接调用 `await agent.create_graph()`�
   原生 Command、Tool 关联、取消与持久证据；Binding 只保留给高级事件日志集成
 - `.observe(Tracer())` 以 fail-closed 方式记录 Runtime 生命周期与校验后的 Native 语义，
   不记录 AG-UI、Messaging、SSE 或 Redis 投递状态
-- 当前发行只提供显式的 `deepagents-v2` Runtime Profile，不提供 Deep Agents v3 Profile 或
-  TodoGroups 投影与界面；新的真实 Profile 必须输出同一 canonical 合同，不能在下游增加版本分支
-- 当前不提供 Archive/S3/Blob、payload Encryption/KMS 或 OpenTelemetry exporter；未来存储与
-  可观测集成只能组合已真实使用的 `TraceStore`、canonical codec、`RuntimeObserver` 或
-  Store/Messaging Backend decorator，不能增加占位 API
+- 框架发行只提供显式的 `deepagents-v2` Runtime Profile，不提供 Deep Agents v3 Profile 或通用
+  TodoGroups 投影与界面；Studio 在查询时从 canonical Trace 事实派生产品任务轨迹，新的真实
+  Profile 必须输出同一合同，不能在下游增加版本分支
+- 当前不提供 Archive/S3/Blob、payload Encryption/KMS 或 OpenTelemetry exporter；活动 Trace
+  存储实现 `TraceLedgerBackend`，高级集成可替换 `TraceStore`、包装 canonical codec、观察
+  `RuntimeObserver` 或装饰 Store/Messaging Backend，不能增加占位 API
 
 ## 文档
 

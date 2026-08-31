@@ -5,6 +5,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from tinkerfin_studio.conversation.todo_groups import TaskTraceSnapshot
 from tinkerfin_tracing import (
     TraceCompleteness,
     TraceInteraction,
@@ -95,6 +96,7 @@ class ConversationHistoryDetail(BaseModel):
     interactions: tuple[TraceInteraction, ...]
     status: TraceStatus
     completeness: TraceCompleteness
+    task_trace: TaskTraceSnapshot | None = Field(alias="taskTrace")
     created_at: datetime = Field(alias="createdAt")
     updated_at: datetime = Field(
         alias="updatedAt",
@@ -114,6 +116,7 @@ class ConversationTraceUpdateEvent(BaseModel):
 
     type: Literal["update"] = "update"
     update: TraceUpdate
+    task_trace: TaskTraceSnapshot | None = Field(alias="taskTrace")
 
 
 class ConversationTraceErrorEvent(BaseModel):

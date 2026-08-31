@@ -61,7 +61,6 @@ export function useConversationScroll({
   const scrollButtonHovered = useRef(false)
   const scrollButtonFocused = useRef(false)
   const scrollButtonPhase = useRef<ScrollButtonPhase>('hidden')
-  const previousScrollTop = useRef<number | null>(null)
   const pendingUserScrollIntent = useRef(false)
   const userHasScrolled = useRef(false)
   const pendingConversationScroll = useRef<{ threadId: string; scrollTop: number | null } | null>(null)
@@ -135,9 +134,6 @@ export function useConversationScroll({
         pendingUserScrollIntent.current = false
         userHasScrolled.current = true
       }
-      const lastScrollTop = previousScrollTop.current
-      const isScrollingTowardBottom = lastScrollTop != null && pane.scrollTop > lastScrollTop
-      previousScrollTop.current = pane.scrollTop
       const isNearBottom = pane.scrollHeight - pane.scrollTop - pane.clientHeight <= 96
       if (isNearBottom) {
         followLatest.current = true
@@ -150,7 +146,7 @@ export function useConversationScroll({
         followLatest.current = false
         if (scrollingToBottom.current) {
           setScrollButtonPhase('hidden')
-        } else if (!isScrollingTowardBottom || scrollButtonPhase.current === 'visible') {
+        } else {
           setScrollButtonPhase('visible')
           if (!scrollButtonHovered.current && !scrollButtonFocused.current) armScrollButtonFade()
         }
@@ -266,7 +262,6 @@ export function useConversationScroll({
       window.cancelAnimationFrame(scrollMeasureFrame.current)
       scrollMeasureFrame.current = null
     }
-    previousScrollTop.current = null
     pendingUserScrollIntent.current = false
     userHasScrolled.current = false
     clearScrollButtonTimers()

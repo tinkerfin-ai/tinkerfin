@@ -38,6 +38,7 @@ const detail = (): ConversationHistoryDetail => ({
   interactions: [],
   status: { execution: 'succeeded', headRunId: 'run-1' },
   completeness: { missingPrefix: false, missingTail: false, payloadOmitted: false },
+  taskTrace: { status: 'ready', todoGroups: [] },
   createdAt: '2026-08-28T00:00:00',
   updatedAt: '2026-08-28T00:01:00',
 })
@@ -81,7 +82,9 @@ describe('conversation Trace client', () => {
   it.each([
     ['list', () => fetchConversationHistoryList()],
     ['config', () => fetchConversationHistoryGroupConfig()],
-    ['detail', () => fetchConversationHistoryDetail('thread-auth')],
+    ['detail', () => fetchConversationHistoryDetail('thread-auth', {
+      includeTaskTrace: true,
+    })],
     ['patch', () => patchConversation('thread-auth', { title: '新标题' })],
     ['delete', () => deleteConversation('thread-auth')],
   ])('sends the session bearer token for %s requests', async (_name, request) => {
@@ -105,7 +108,8 @@ describe('conversation Trace client', () => {
       if (url.pathname.endsWith('/history') && url.pathname.includes('thread-trace')) {
         expect(url.searchParams.get('historyCursor')).toBe('opaque-trace-cursor')
         expect(url.searchParams.get('limit')).toBe('40')
-        return envelope(detail())
+        expect(url.searchParams.get('includeTaskTrace')).toBe('false')
+        return envelope({ ...detail(), taskTrace: null })
       }
       expect(url.searchParams.get('pageSize')).toBe('5')
       expect(url.searchParams.get('cursor')).toBe('opaque-list-cursor')
@@ -120,6 +124,7 @@ describe('conversation Trace client', () => {
       query: '目标会话',
     })
     await fetchConversationHistoryDetail('thread-trace', {
+      includeTaskTrace: false,
       historyCursor: 'opaque-trace-cursor',
       limit: 40,
     })
@@ -131,6 +136,7 @@ describe('conversation Trace client', () => {
     const snapshot = { type: 'snapshot' as const, snapshot: detail() }
     const update = {
       type: 'update' as const,
+      taskTrace: null,
       update: {
         asOfSeq: 5,
         events: [],
@@ -150,7 +156,9 @@ describe('conversation Trace client', () => {
     vi.stubGlobal('fetch', vi.fn(async () => streamResponse(snapshot, update)))
 
     const received = []
-    for await (const event of followConversationTrace('thread-trace')) received.push(event)
+    for await (const event of followConversationTrace('thread-trace', {
+      includeTaskTrace: true,
+    })) received.push(event)
 
     expect(received).toEqual([snapshot, update])
   })
@@ -159,13 +167,28 @@ describe('conversation Trace client', () => {
     vi.stubGlobal('fetch', vi.fn(async () => streamResponse({ type: 'RUN_STARTED' })))
 
     const consume = async () => {
-      for await (const event of followConversationTrace('thread-trace')) {
+      for await (const event of followConversationTrace('thread-trace', {
+        includeTaskTrace: true,
+      })) {
         // 消费完整流以触发边界校验
         void event
       }
     }
 
     await expect(consume()).rejects.toThrow()
+  })
+
+  it('rejects mismatched true and false task trace expectations', async () => {
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce(envelope({ ...detail(), taskTrace: null }))
+      .mockResolvedValueOnce(envelope(detail())))
+
+    await expect(fetchConversationHistoryDetail('thread-trace', {
+      includeTaskTrace: true,
+    })).rejects.toThrow()
+    await expect(fetchConversationHistoryDetail('thread-trace', {
+      includeTaskTrace: false,
+    })).rejects.toThrow()
   })
 
   it('keeps delete conflict and empty 204 behavior', async () => {

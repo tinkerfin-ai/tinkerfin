@@ -33,6 +33,7 @@ from tinkerfin_contracts import (
 )
 
 from .capture import CapturedValue, CapturePolicy, ReasoningCapturePolicy
+from .durable_store import InMemoryTraceStore
 from .errors import TraceCaptureRejected, TraceCorruption, TraceStoreProtocolError
 from .facts import (
     InteractionFact,
@@ -64,7 +65,6 @@ from .query import (
     resolve_history_request,
 )
 from .store import (
-    InMemoryTraceStore,
     StoreThreadSnapshot,
     TraceStore,
     TraceWriter,

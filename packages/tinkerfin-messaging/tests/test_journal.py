@@ -14,17 +14,16 @@ from redis.exceptions import RedisError
 
 from tinkerfin import RunIdentity
 from tinkerfin_messaging import (
-    BackendRunHandle,
     CodecMismatch,
     MemoryBackend,
     MessageEnvelope,
     MessageIdConflict,
-    MessagingBackend,
-    PreparedRun,
     RecoveryCheckpoint,
     RedisBackend,
     RunProducerFailed,
 )
+from tinkerfin_messaging._messaging_ledger import _MessagingLedger
+from tinkerfin_messaging.backend import _BackendRunHandle, _PreparedRun
 
 
 def _identity(
@@ -61,9 +60,9 @@ async def _delete_prefix(client: Redis, prefix: str) -> None:
 )
 async def backend(
     request: pytest.FixtureRequest,
-) -> AsyncGenerator[MessagingBackend, None]:
+) -> AsyncGenerator[_MessagingLedger, None]:
     if request.param == "memory":
-        yield MemoryBackend()
+        yield _MessagingLedger(MemoryBackend())
         return
 
     redis_url = request.getfixturevalue("redis_url")
@@ -83,18 +82,24 @@ async def backend(
                 "real Redis PING failed without exposing credentials: "
                 f"{type(error).__name__}"
             )
-        yield RedisBackend(client, key_prefix=prefix, poll_interval=0.02)
+        yield _MessagingLedger(
+            RedisBackend(
+                client,
+                key_prefix=prefix,
+                generation_cleanup_retry_seconds=0.02,
+            )
+        )
     finally:
         await _delete_prefix(client, prefix)
         await client.aclose()
 
 
 async def _prepare(
-    backend: MessagingBackend,
+    backend: _MessagingLedger,
     *,
     identity: RunIdentity | None = None,
     codec: str = "test.bytes.v1",
-) -> PreparedRun:
+) -> _PreparedRun:
     resolved_identity = identity or _identity()
     return await backend.prepare(
         channel="events",
@@ -111,7 +116,7 @@ async def _collect(iterator: AsyncIterator[MessageEnvelope]) -> list[MessageEnve
 
 
 async def test_concurrent_appends_allocate_one_contiguous_sequence(
-    backend: MessagingBackend,
+    backend: _MessagingLedger,
 ) -> None:
     prepared = await _prepare(backend)
 
@@ -134,7 +139,7 @@ async def test_concurrent_appends_allocate_one_contiguous_sequence(
 
 
 async def test_message_id_retry_is_idempotent_and_content_sensitive(
-    backend: MessagingBackend,
+    backend: _MessagingLedger,
 ) -> None:
     prepared = await _prepare(backend)
 
@@ -178,14 +183,14 @@ async def test_message_id_retry_is_idempotent_and_content_sensitive(
     ],
 )
 async def test_append_rejects_invalid_envelope_identifiers_before_commit(
-    backend: MessagingBackend,
+    backend: _MessagingLedger,
     field: str,
     value: str,
 ) -> None:
     """A missing identifier check must not reach either backend commit path."""
 
     prepared = await _prepare(backend)
-    handle: BackendRunHandle = prepared.handle
+    handle: _BackendRunHandle = prepared.handle
     message_id = "message-1"
     codec = "test.bytes.v1"
     if field == "channel":
@@ -249,7 +254,7 @@ async def test_append_rejects_invalid_envelope_identifiers_before_commit(
     ],
 )
 async def test_append_rejects_invalid_payload_and_checkpoint_before_commit(
-    backend: MessagingBackend,
+    backend: _MessagingLedger,
     payload: object,
     checkpoint: object,
     error_type: type[Exception],
@@ -272,7 +277,7 @@ async def test_append_rejects_invalid_payload_and_checkpoint_before_commit(
 
 
 async def test_append_accepts_complete_identifier_and_checkpoint_boundaries(
-    backend: MessagingBackend,
+    backend: _MessagingLedger,
 ) -> None:
     identifier = "x" * 1024
     prepared = await backend.prepare(
@@ -303,7 +308,7 @@ async def test_append_accepts_complete_identifier_and_checkpoint_boundaries(
 
 
 async def test_checkpoint_participates_in_message_id_idempotency(
-    backend: MessagingBackend,
+    backend: _MessagingLedger,
 ) -> None:
     prepared = await _prepare(backend)
     first_checkpoint = RecoveryCheckpoint(
@@ -344,7 +349,7 @@ async def test_checkpoint_participates_in_message_id_idempotency(
 
 
 async def test_concurrent_message_id_retries_commit_once(
-    backend: MessagingBackend,
+    backend: _MessagingLedger,
 ) -> None:
     prepared = await _prepare(backend)
 
@@ -368,7 +373,7 @@ async def test_concurrent_message_id_retries_commit_once(
 
 
 async def test_stream_sequences_are_independent(
-    backend: MessagingBackend,
+    backend: _MessagingLedger,
 ) -> None:
     first = await _prepare(backend, identity=_identity())
     second = await _prepare(
@@ -396,7 +401,7 @@ async def test_stream_sequences_are_independent(
 
 
 async def test_history_to_live_transition_has_no_gap_or_duplicate(
-    backend: MessagingBackend,
+    backend: _MessagingLedger,
 ) -> None:
     prepared = await _prepare(backend)
     await backend.append(
@@ -421,7 +426,7 @@ async def test_history_to_live_transition_has_no_gap_or_duplicate(
 
 
 async def test_completed_old_run_stops_before_a_later_run(
-    backend: MessagingBackend,
+    backend: _MessagingLedger,
 ) -> None:
     old = await _prepare(backend, identity=_identity())
     await backend.append(
@@ -448,7 +453,7 @@ async def test_completed_old_run_stops_before_a_later_run(
 
 
 async def test_failed_run_drains_committed_prefix_before_raising(
-    backend: MessagingBackend,
+    backend: _MessagingLedger,
 ) -> None:
     prepared = await _prepare(backend)
     await backend.append(
@@ -470,7 +475,7 @@ async def test_failed_run_drains_committed_prefix_before_raising(
 
 
 async def test_codec_is_bound_to_the_channel_across_streams(
-    backend: MessagingBackend,
+    backend: _MessagingLedger,
 ) -> None:
     prepared = await _prepare(backend)
     await backend.finish(prepared.handle, status="completed")
@@ -494,7 +499,7 @@ async def test_codec_is_bound_to_the_channel_across_streams(
 
 
 async def test_append_rejects_a_codec_different_from_the_channel_binding(
-    backend: MessagingBackend,
+    backend: _MessagingLedger,
 ) -> None:
     prepared = await _prepare(backend, codec="test.codec-a.v1")
 
@@ -528,7 +533,7 @@ async def test_append_rejects_a_codec_different_from_the_channel_binding(
 
 
 async def test_concurrent_first_use_binds_one_channel_codec_atomically(
-    backend: MessagingBackend,
+    backend: _MessagingLedger,
 ) -> None:
     outcomes = await asyncio.gather(
         _prepare(
@@ -544,7 +549,7 @@ async def test_concurrent_first_use_binds_one_channel_codec_atomically(
         return_exceptions=True,
     )
 
-    owners = [outcome for outcome in outcomes if isinstance(outcome, PreparedRun)]
+    owners = [outcome for outcome in outcomes if isinstance(outcome, _PreparedRun)]
     mismatches = [outcome for outcome in outcomes if isinstance(outcome, CodecMismatch)]
     assert len(owners) == 1
     assert len(mismatches) == 1
@@ -552,7 +557,7 @@ async def test_concurrent_first_use_binds_one_channel_codec_atomically(
 
 
 async def test_backend_exposes_defensive_cursor_reads(
-    backend: MessagingBackend,
+    backend: _MessagingLedger,
 ) -> None:
     prepared = await _prepare(backend)
     for index in range(3):
@@ -578,7 +583,7 @@ async def test_backend_exposes_defensive_cursor_reads(
     [(True, TypeError), (0, ValueError), (1001, ValueError)],
 )
 async def test_backend_read_rejects_invalid_limit_boundaries_consistently(
-    backend: MessagingBackend,
+    backend: _MessagingLedger,
     limit: int,
     error_type: type[Exception],
 ) -> None:
@@ -595,7 +600,7 @@ async def test_backend_read_rejects_invalid_limit_boundaries_consistently(
     [(True, TypeError), (-1, ValueError)],
 )
 async def test_backend_read_rejects_invalid_cursor_boundaries_consistently(
-    backend: MessagingBackend,
+    backend: _MessagingLedger,
     after: int,
     error_type: type[Exception],
 ) -> None:

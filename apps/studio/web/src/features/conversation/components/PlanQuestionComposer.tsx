@@ -794,13 +794,14 @@ export function PlanQuestionComposer({
           </p>
           <div className="plan-question-composer-actions">
             {!question.required && (
-              <Button size="sm" variant="secondary" onClick={skipQuestion}>
+              <Button size="sm" shape="capsule" variant="secondary" onClick={skipQuestion}>
                 {t('跳过本题')}
               </Button>
             )}
             {hasNextQuestion ? (
               <Button
                 size="sm"
+                shape="capsule"
                 variant="primary"
                 disabled={!canAdvance}
                 onClick={advanceQuestion}
@@ -808,7 +809,7 @@ export function PlanQuestionComposer({
                 {t('下一题')}
               </Button>
             ) : (
-              <Button size="sm" variant="primary" onClick={submit}>
+              <Button size="sm" shape="capsule" variant="primary" onClick={submit}>
                 {t('提交')}
               </Button>
             )}

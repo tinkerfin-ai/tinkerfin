@@ -108,12 +108,15 @@ run identity, Trace, AG-UI, or Messaging lifecycle.
   integrations.
 - `.observe(Tracer())` records fail-closed Runtime lifecycle and validated Native semantic
   facts without recording AG-UI, Messaging, SSE, or Redis delivery state.
-- The distribution provides the explicit `deepagents-v2` Runtime Profile. It does not
-  provide a Deep Agents v3 Profile or TodoGroups projection/UI; another real Profile
-  must emit the same canonical contract without adding downstream version branches.
+- The framework distribution provides the explicit `deepagents-v2` Runtime Profile. It
+  does not provide a Deep Agents v3 Profile or a generic TodoGroups projection/UI.
+  Studio derives its product-specific task trace from canonical Trace facts at query
+  time; another real Profile must emit the same contract without downstream version
+  branches.
 - Archive/S3/Blob, payload encryption/KMS, and OpenTelemetry exporters are not provided.
-  Storage integrations compose `TraceStore`, canonical codec, `RuntimeObserver`, or
-  Store/Messaging Backend decorators rather than introducing placeholder APIs.
+  Active Trace storage implements `TraceLedgerBackend`; advanced integrations may
+  replace `TraceStore`, wrap the canonical codec, observe `RuntimeObserver`, or decorate
+  Store/Messaging Backend operations.
 
 ## Documentation
 

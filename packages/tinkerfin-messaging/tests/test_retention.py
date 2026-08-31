@@ -13,6 +13,7 @@ from tinkerfin_messaging import (
     StreamDeleted,
     StreamExpired,
 )
+from tinkerfin_messaging._messaging_ledger import _MessagingLedger
 
 
 def _identity(run_id: str = "run-retention") -> RunIdentity:
@@ -20,7 +21,7 @@ def _identity(run_id: str = "run-retention") -> RunIdentity:
 
 
 async def _start(
-    backend: MemoryBackend,
+    backend: _MessagingLedger,
     run_id: str,
     *,
     after: int | None = None,
@@ -35,7 +36,7 @@ async def _start(
     )
 
 
-async def _finish(backend: MemoryBackend, prepared) -> None:
+async def _finish(backend: _MessagingLedger, prepared) -> None:
     await backend.begin_settlement(prepared.handle)
     await backend.finish(prepared.handle, status="completed")
 
@@ -55,8 +56,8 @@ def test_retention_policy_is_explicit_and_immutable() -> None:
 
 
 async def test_memory_active_run_never_expires() -> None:
-    backend = MemoryBackend(
-        retention_policy=MessagingRetentionPolicy.expire_after(0.02)
+    backend = _MessagingLedger(
+        MemoryBackend(retention_policy=MessagingRetentionPolicy.expire_after(0.02))
     )
     prepared = await _start(backend, "active", after=0)
 
@@ -80,8 +81,8 @@ async def test_memory_active_run_never_expires() -> None:
 
 
 async def test_memory_new_run_before_deadline_clears_terminal_timer() -> None:
-    backend = MemoryBackend(
-        retention_policy=MessagingRetentionPolicy.expire_after(0.08)
+    backend = _MessagingLedger(
+        MemoryBackend(retention_policy=MessagingRetentionPolicy.expire_after(0.08))
     )
     first = await _start(backend, "first", after=0)
     await backend.append(
@@ -106,8 +107,8 @@ async def test_memory_new_run_before_deadline_clears_terminal_timer() -> None:
 
 
 async def test_memory_expiry_uses_new_generation_and_preserves_tombstone() -> None:
-    backend = MemoryBackend(
-        retention_policy=MessagingRetentionPolicy.expire_after(0.02)
+    backend = _MessagingLedger(
+        MemoryBackend(retention_policy=MessagingRetentionPolicy.expire_after(0.02))
     )
     first = await _start(backend, "first", after=0)
     await backend.append(
@@ -150,7 +151,9 @@ async def test_memory_expiry_uses_new_generation_and_preserves_tombstone() -> No
 
 
 async def test_memory_disabled_retention_requires_explicit_delete() -> None:
-    backend = MemoryBackend(retention_policy=MessagingRetentionPolicy.disabled())
+    backend = _MessagingLedger(
+        MemoryBackend(retention_policy=MessagingRetentionPolicy.disabled())
+    )
     prepared = await _start(backend, "kept", after=0)
     await backend.append(
         prepared.handle,

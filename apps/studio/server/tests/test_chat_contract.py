@@ -511,4 +511,10 @@ def test_conversation_routes_are_registered_with_the_locked_paths() -> None:
         parameter["name"]
         for parameter in detail_parameters
         if parameter["in"] == "query"
-    } == {"historyCursor", "limit"}
+    } == {"historyCursor", "includeTaskTrace", "limit"}
+    trace_parameters = paths["/api/conversation/{thread_id}/trace"]["get"]["parameters"]
+    assert {
+        parameter["name"]
+        for parameter in trace_parameters
+        if parameter["in"] == "query"
+    } == {"includeTaskTrace"}

@@ -7,7 +7,7 @@ from ag_ui.core import RunAgentInput
 from fastapi import APIRouter, Header, Path, Query, Request
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ValidationError
-from starlette.responses import StreamingResponse
+from starlette.responses import Response, StreamingResponse
 
 from tinkerfin_studio.api.dependencies import (
     ConversationCommandDep,
@@ -74,26 +74,33 @@ async def get_history(
         Query(alias="historyCursor", min_length=1),
     ] = None,
     limit: Annotated[int, Query(ge=1, le=100)] = 100,
-) -> ApiResponse[ConversationHistoryDetail]:
+    include_task_trace: Annotated[bool, Query(alias="includeTaskTrace")] = True,
+) -> Response:
     """返回一个会话的固定前缀 Trace 视图"""
 
-    return ApiResponse.success(
-        await service.get_detail(
-            thread_id,
-            history_cursor=history_cursor,
-            limit=limit,
-        )
+    detail = await service.get_detail(
+        thread_id,
+        history_cursor=history_cursor,
+        limit=limit,
+        include_task_trace=include_task_trace,
     )
+    envelope = ApiResponse[ConversationHistoryDetail].success(detail)
+    content = envelope.model_dump_json(by_alias=True, exclude_none=False).encode()
+    return Response(content=content, media_type="application/json")
 
 
 @router.get("/{thread_id}/trace", response_class=StreamingResponse)
 async def follow_trace(
     thread_id: ThreadIdPath,
     service: ConversationHistoryDep,
+    include_task_trace: Annotated[bool, Query(alias="includeTaskTrace")] = True,
 ) -> StreamingResponse:
     """鉴权后先发送 Trace snapshot，再持续发送语义增量"""
 
-    events = await service.follow_trace(thread_id)
+    events = await service.follow_trace(
+        thread_id,
+        include_task_trace=include_task_trace,
+    )
     return StreamingResponse(
         _trace_sse(events),
         media_type="text/event-stream",
@@ -182,8 +189,11 @@ async def _trace_sse(
 
     try:
         async for event in events:
-            payload = event.model_dump_json(by_alias=True, exclude_none=False)
-            yield f"event: trace\ndata: {payload}\n\n".encode()
+            payload = event.model_dump_json(
+                by_alias=True,
+                exclude_none=False,
+            ).encode()
+            yield b"event: trace\ndata: " + payload + b"\n\n"
     finally:
         await events.aclose()
 

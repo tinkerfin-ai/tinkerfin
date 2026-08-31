@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest'
 
-import faviconSvg from '../../public/tinkerfin-favicon.svg?raw'
 import indexHtml from '../../index.html?raw'
+import brandLogoSource from '../components/ui/BrandLogo.tsx?raw'
+import brandMarkSource from '../components/ui/BrandMark.tsx?raw'
 import mainEntry from '../main.tsx?raw'
 import workspaceLayoutAnimation from '../features/workspace/useWorkspaceLayoutAnimation.ts?raw'
 import tokensStyles from './tokens.css?raw'
@@ -80,11 +81,13 @@ describe('前端视觉契约', () => {
     }
   })
 
-  it('网站标题与菜单品牌使用同一 Blocks 几何', () => {
-    expect(indexHtml).toContain('href="/tinkerfin-favicon.svg?v=10"')
-    expect(faviconSvg).toContain('<rect width="7" height="7" x="14" y="3" rx="1" />')
-    expect(faviconSvg).toContain('M10 21V8a1 1 0 0 0-1-1H4')
-    expect(faviconSvg).not.toContain('<image')
+  it('网站标题、菜单和过渡状态使用同一套品牌资产', () => {
+    expect(indexHtml).toContain('type="image/png" href="/brand/tinkerfin-favicon.png?v=1"')
+    expect(indexHtml).not.toContain('tinkerfin-favicon.svg')
+    expect(brandLogoSource).toContain('/brand/tinkerfin-mark.png?v=1')
+    expect(brandLogoSource).toContain('/brand/tinkerfin-wordmark.png?v=1')
+    expect(brandMarkSource).toContain('/brand/tinkerfin-mark.png?v=1')
+    expect(brandMarkSource).not.toContain('lucide-react')
   })
 
   it('按既定顺序加载自托管字体、令牌、排版和基础样式', () => {
@@ -133,6 +136,7 @@ describe('前端视觉契约', () => {
       '--layout-sidebar-rail: 56px;',
       '--layout-content-wide: 840px;',
       '--layout-task-drawer: 348px;',
+      '--layout-todo-trace-drawer: 400px;',
       '--layout-settings-dialog: 760px;',
       '--layout-settings-nav: 180px;',
       '--layout-settings-height: 540px;',
@@ -231,7 +235,6 @@ describe('前端视觉契约', () => {
     expect(workspaceStyles).toMatch(/\.message-list\s*\{[^}]*padding:\s*var\(--space-8\) 0 var\(--composer-height\);/s)
     expect(workspaceStyles).toMatch(/\.workspace-main:has\(\.composer-dock\.is-taken-over\)\s*\{[^}]*grid-template-rows:\s*var\(--layout-header-height\) minmax\(0, 1fr\) auto;/s)
     expect(workspaceStyles).toMatch(/\.workspace-main:has\(\.composer-dock\.is-taken-over\) \.message-list\s*\{[^}]*padding-bottom:\s*var\(--space-4\);/s)
-    expect(workspaceStyles).toMatch(/\.workspace-main:has\(\.composer-dock\.is-taken-over\) \.conversation-scroll-action\s*\{[^}]*bottom:\s*var\(--space-3\);/s)
     expect(workspaceStyles).not.toMatch(/\.message-list\s*\{[^}]*padding-(?:right|left):/s)
     expect(workspaceStyles).toMatch(/@media \(max-width:\s*767px\)[\s\S]*\.conversation-pane\s*\{[^}]*padding-inline:\s*var\(--space-4\);[^}]*\}[\s\S]*\.message-list\s*\{[^}]*padding-top:\s*var\(--space-6\);/s)
     expect(workspaceStyles).toMatch(/@media \(max-width:\s*440px\)[\s\S]*\.conversation-pane\s*\{[^}]*padding-inline:\s*var\(--space-3\);/s)
@@ -281,13 +284,17 @@ describe('前端视觉契约', () => {
     }
   })
 
-  it('空会话使用横向品牌组合，并在窄屏收紧字号与间距', () => {
+  it('品牌组合保持既定高度、比例和深色主题字标', () => {
+    const uiStyles = cssFiles['../components/ui/ui.css']
     const workspaceStyles = cssFiles['../features/workspace/workspace.css']
 
-    expect(workspaceStyles).toMatch(/\.empty-brand-lockup\s*\{[^}]*grid-template-columns:\s*auto auto auto;[^}]*align-items:\s*center;[^}]*justify-content:\s*center;[^}]*column-gap:\s*var\(--space-2\);/s)
-    expect(workspaceStyles).toMatch(/\.empty-brand-name\s*\{[^}]*font-size:\s*var\(--type-brand-size\);[^}]*line-height:\s*var\(--type-brand-line\);/s)
-    expect(workspaceStyles).toMatch(/\.brand-plus\s*\{[^}]*padding:\s*1px var\(--space-2\) 0;[^}]*border-radius:\s*var\(--radius-pill\);[^}]*background:\s*var\(--color-brand-soft\);[^}]*color:\s*var\(--color-brand-text\);/s)
-    expect(workspaceStyles).toMatch(/@media \(max-width:\s*440px\)[\s\S]*\.empty-brand-name\s*\{[^}]*font-size:\s*var\(--type-h1-size\);/s)
+    expect(workspaceStyles).toMatch(/\.empty-brand-lockup\s*\{[^}]*display:\s*grid;[^}]*place-items:\s*center;/s)
+    expect(workspaceStyles).not.toMatch(/\.brand-(?:name|plus)|\.empty-brand-name/)
+    expect(uiStyles).toMatch(/\.brand-logo\s*\{[^}]*--brand-logo-height:\s*22px;[^}]*height:\s*var\(--brand-logo-height\);[^}]*aspect-ratio:\s*2010 \/ 458;/s)
+    expect(uiStyles).toContain('.brand-logo--md { --brand-logo-height: 30px; }')
+    expect(uiStyles).toContain('.brand-logo--lg { --brand-logo-height: 34px; }')
+    expect(uiStyles).toMatch(/:root\[data-theme='dark'\] \.brand-logo__wordmark\s*\{[^}]*filter:\s*brightness\(0\) invert\(1\);/s)
+    expect(uiStyles).toMatch(/@media \(max-width:\s*440px\)[\s\S]*\.brand-logo--lg\s*\{[^}]*--brand-logo-height:\s*32px;/s)
   })
 
   it('浅色和深色普通文本、辅助文本及状态文本均达到 4.5:1', () => {
@@ -368,6 +375,22 @@ describe('前端视觉契约', () => {
     expect(ownerLocalMotionValues).toEqual([])
   })
 
+  it('任务轨迹抽屉复用语义令牌并覆盖响应式与辅助模式', () => {
+    const conversationStyles = cssFiles['../features/conversation/conversation.css']
+    const todoTraceStyles = cssFiles['../features/conversation/todoTrace/todoTrace.css']
+    const drawerRegion = todoTraceStyles.match(/\.todo-trace-drawer-region\s*\{([^}]*)\}/s)?.[1] ?? ''
+
+    expect(tokensStyles).toContain('--layout-todo-trace-drawer: 400px;')
+    expect(todoTraceStyles).toMatch(/\.todo-trace-drawer\s*\{[^}]*width:\s*min\(var\(--layout-todo-trace-drawer\), 100vw\);/s)
+    expect(todoTraceStyles).toMatch(/@media \(min-width: 1281px\)[\s\S]*\.app-shell\.has-todo-trace \.workspace-main\s*\{[^}]*margin-right:\s*var\(--layout-todo-trace-drawer\);/s)
+    expect(todoTraceStyles).toMatch(/@media \(max-width: 440px\)[\s\S]*\.todo-trace-drawer\s*\{[^}]*width:\s*100vw;/s)
+    expect(conversationStyles).toMatch(/@media \(any-hover: none\), \(any-pointer: coarse\)[\s\S]*\.composer-auxiliary-control\s*\{[^}]*min-height:\s*var\(--control-lg\);/s)
+    expect(todoTraceStyles).toMatch(/@media \(forced-colors: active\)[\s\S]*\.todo-trace-todo::before\s*\{[^}]*background:\s*ButtonText;/s)
+    expect(todoTraceStyles).toMatch(/@media \(prefers-reduced-motion: reduce\)[\s\S]*\.todo-trace-spin\s*\{[^}]*animation:\s*none;/s)
+    expect(drawerRegion).not.toMatch(/\bborder(?:-radius)?\s*:/)
+    expect(drawerRegion).not.toMatch(/\bbackground\s*:/)
+  })
+
   it('字号和字重通过排版角色消费，不在功能样式中形成第二套尺度', () => {
     const explicitFontSizes = [...componentStyles.matchAll(/font-size:\s*([^;]+);/g)]
       .map((match) => match[1].trim())
@@ -393,7 +416,7 @@ describe('前端视觉契约', () => {
       [cssFiles['../features/workspace/workspace.css'], '.conversation-main'],
       [cssFiles['../features/workspace/workspace.css'], '.user-card'],
       [cssFiles['../features/conversation/conversation.css'], '.composer-model-select'],
-      [cssFiles['../features/workspace/workspace.css'], '.scroll-to-bottom'],
+      [cssFiles['../features/conversation/conversation.css'], '.composer-auxiliary-control'],
     ] as const
 
     for (const [source, selector] of contracts) {
@@ -434,17 +457,13 @@ describe('前端视觉契约', () => {
     expect(workspaceStyles).toMatch(/\.sidebar-head\s*\{[^}]*align-items:\s*center;[^}]*gap:\s*var\(--space-2\);[^}]*min-height:\s*calc\(var\(--control-xl\) \+ var\(--space-4\)\);[^}]*margin-bottom:\s*var\(--space-1\);/s)
     expect(workspaceStyles).toMatch(/\.sidebar-head-actions\s*\{[^}]*margin-left:\s*auto;[^}]*flex:\s*0 0 auto;[^}]*align-items:\s*center;[^}]*gap:\s*var\(--space-1\);/s)
     expect(workspaceStyles).toMatch(/\.brand\s*\{[^}]*overflow:\s*hidden;[^}]*flex:\s*1 1 auto;[^}]*padding:\s*0;/s)
-    expect(workspaceStyles).toMatch(/\.brand\s*\{[^}]*font-size:\s*var\(--type-h3-size\);[^}]*line-height:\s*var\(--type-h3-line\);/s)
-    expect(workspaceStyles).toMatch(/\.brand-name\s*\{[^}]*flex:\s*0 0 auto;[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap;/s)
     expect(workspaceStyles).not.toContain('.brand > span')
-    expect(workspaceStyles).toMatch(/\.sidebar-head \.brand-plus\s*\{[^}]*padding-inline:\s*var\(--space-1\);[^}]*font-size:\s*var\(--type-micro-size\);[^}]*line-height:\s*var\(--type-micro-line\);/s)
+    expect(workspaceStyles).not.toMatch(/\.brand-(?:name|plus)|\.empty-brand-name/)
     expect(workspaceStyles).toMatch(/\.sidebar-head-actions \.ui-icon-button\s*\{[^}]*width:\s*var\(--control-xs\);[^}]*min-height:\s*var\(--control-xs\);[^}]*height:\s*var\(--control-xs\);/s)
     expect(workspaceStyles).toMatch(/@media \(any-hover:\s*none\), \(any-pointer:\s*coarse\)[\s\S]*\.sidebar-head-actions \.ui-icon-button\s*\{[^}]*width:\s*var\(--control-lg\);[^}]*min-width:\s*var\(--control-lg\);[^}]*height:\s*var\(--control-lg\);/s)
     expect(workspaceStyles).toMatch(/@media \(any-hover:\s*none\), \(any-pointer:\s*coarse\)[\s\S]*\.sidebar-rail\s*\{[^}]*gap:\s*var\(--space-2\);[^}]*padding-top:\s*var\(--space-4\);/s)
     expect(workspaceStyles).toMatch(/@media \(any-hover:\s*none\), \(any-pointer:\s*coarse\)[\s\S]*\.sidebar-rail \.ui-icon-button\s*\{[^}]*width:\s*var\(--control-lg\);[^}]*min-width:\s*var\(--control-lg\);[^}]*min-height:\s*var\(--control-lg\);[^}]*height:\s*var\(--control-lg\);/s)
-    expect(workspaceStyles).toMatch(/@media \(any-hover:\s*none\), \(any-pointer:\s*coarse\)[\s\S]*\.sidebar-head\s*\{[^}]*gap:\s*var\(--space-1\);[^}]*\}[\s\S]*\.sidebar-head-actions\s*\{[^}]*gap:\s*var\(--space-0\);[^}]*\}[\s\S]*\.brand\s*\{[^}]*gap:\s*var\(--space-0-5\);/s)
-    expect(workspaceStyles).toMatch(/@media \(any-hover:\s*none\), \(any-pointer:\s*coarse\)[\s\S]*\.brand \.brand-mark svg\s*\{[^}]*width:\s*28px;[^}]*height:\s*28px;/s)
-    expect(workspaceStyles).toMatch(/@media \(any-hover:\s*none\), \(any-pointer:\s*coarse\)[\s\S]*\.sidebar-head \.brand-plus\s*\{[^}]*padding-inline:\s*var\(--space-0\);[^}]*font-size:\s*var\(--type-micro-size\);/s)
+    expect(workspaceStyles).toMatch(/@media \(any-hover:\s*none\), \(any-pointer:\s*coarse\)[\s\S]*\.sidebar-head\s*\{[^}]*gap:\s*var\(--space-1\);[^}]*\}[\s\S]*\.sidebar-head-actions\s*\{[^}]*gap:\s*var\(--space-0\);/s)
     expect(workspaceStyles).toMatch(/\.brand:hover,[\s\S]*\.brand:active\s*{[^}]*background:\s*transparent;[^}]*box-shadow:\s*none;[^}]*color:\s*var\(--color-text-primary\);/s)
     expect(workspaceStyles).toMatch(/\.sidebar-head-actions \.ui-tooltip\s*\{[^}]*right:\s*0;[^}]*left:\s*auto;/s)
     expect(workspaceStyles).toMatch(/\.sidebar-head-actions \.sidebar-mode-toggle \+ \.ui-tooltip\s*\{[^}]*top:\s*50%;[^}]*right:\s*auto;[^}]*left:\s*calc\(100% \+ var\(--space-3\)\);[^}]*transform:\s*translate\(var\(--space-0-5\), -50%\);/s)
@@ -468,20 +487,28 @@ describe('前端视觉契约', () => {
     expect(cssFiles['../components/ui/ui.css']).toContain('.ui-overlay-scrollbar')
   })
 
-  it('回到底部使用文字胶囊、历史间距和滚动内容安全内边距', () => {
+  it('回到底部与任务轨迹共享输入框上方的布局和按钮视觉契约', () => {
+    const conversationStyles = cssFiles['../features/conversation/conversation.css']
     const workspaceStyles = cssFiles['../features/workspace/workspace.css']
-    expect(workspaceStyles).toMatch(
-      /\.conversation-region\s*\{[^}]*grid-row:\s*2;[^}]*grid-column:\s*1;[^}]*position:\s*relative;/s,
-    )
-    expect(workspaceStyles).toMatch(
-      /\.conversation-scroll-action\s*\{[^}]*position:\s*absolute;[^}]*bottom:\s*calc\(var\(--composer-height\) \+ var\(--space-3\)\);[^}]*left:\s*50%;[^}]*transform:\s*translateX\(-50%\);/s,
-    )
+    const auxiliaryControl = conversationStyles.match(/\.composer-auxiliary-control\s*\{([^}]*)\}/s)?.[1] ?? ''
+    expect(workspaceStyles).not.toContain('.conversation-scroll-action')
     expect(workspaceStyles).toMatch(
       /\.message-list\s*\{[^}]*padding:[^;}]*var\(--composer-height\);/s,
     )
-    expect(workspaceStyles).toMatch(
-      /\.scroll-to-bottom\s*\{[^}]*gap:\s*var\(--space-2\);[^}]*min-width:\s*var\(--control-lg\);[^}]*height:\s*var\(--control-lg\);[^}]*padding:\s*0 var\(--space-4\);[^}]*border-radius:\s*var\(--radius-pill\);[^}]*background:\s*var\(--color-layer-1\);/s,
+    expect(conversationStyles).toMatch(
+      /\.composer-auxiliary-controls\s*\{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*minmax\(0, 1fr\) auto minmax\(0, 1fr\);[^}]*width:\s*min\(100%, var\(--layout-composer-width\)\);[^}]*align-items:\s*center;/s,
     )
+    expect(conversationStyles).toMatch(/\.composer-scroll-to-bottom-control\s*\{[^}]*grid-column:\s*2;[^}]*justify-self:\s*center;/s)
+    expect(conversationStyles).toMatch(/\.composer-task-trace-control\s*\{[^}]*grid-column:\s*3;[^}]*justify-self:\s*end;/s)
+    expect(conversationStyles).toMatch(/@media \(max-width: 440px\)[\s\S]*\.composer-auxiliary-controls\s*\{[^}]*gap:\s*var\(--space-4\);[^}]*\}[\s\S]*\.composer-auxiliary-control\s*\{[^}]*padding-inline:\s*var\(--space-1-5\);/s)
+    expect(conversationStyles).toMatch(/@media \(max-width: 1023px\)[\s\S]*\.composer-auxiliary-controls,\s*\.composer,\s*\.composer-note\s*\{[^}]*max-width:\s*var\(--layout-content-medium\);/s)
+    expect(auxiliaryControl).toContain('gap: var(--space-1-5);')
+    expect(auxiliaryControl).toContain('min-height: var(--control-sm);')
+    expect(auxiliaryControl).toContain('padding: 0 var(--space-3);')
+    expect(auxiliaryControl).toContain('border-radius: var(--radius-pill);')
+    expect(auxiliaryControl).toContain('font-size: var(--type-caption-size);')
+    expect(auxiliaryControl).toContain('font-weight: var(--weight-medium);')
+    expect(auxiliaryControl).toContain('line-height: var(--type-caption-line);')
     expect(workspaceStyles).toMatch(/\.scroll-to-bottom\s*\{[^}]*opacity:\s*0;[^}]*transition:[^}]*opacity var\(--motion-slow\)/s)
     expect(workspaceStyles).toMatch(/\.scroll-to-bottom\.is-fading\s*\{[^}]*transform:\s*translateY\(var\(--space-2\)\);[^}]*opacity:\s*0;[^}]*pointer-events:\s*none;/s)
     expect(workspaceStyles).not.toContain('.scroll-to-bottom::before')

@@ -10,8 +10,7 @@ import {
 import { useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 
-import { Button, IconButton, MOTION_DURATION_SECONDS, TextField } from '../../components/ui'
-import { BrandMark } from '../../components/ui/BrandMark'
+import { BrandLogo, Button, IconButton, MOTION_DURATION_SECONDS, TextField } from '../../components/ui'
 import { ThemePicker } from '../../components/ui/ThemePicker'
 import { useI18n } from '../../i18n'
 import { ValidatedForm } from './components/ValidatedForm'
@@ -19,6 +18,13 @@ import { ProviderBrandLogo } from './ProviderBrandLogo'
 import './auth.css'
 
 gsap.registerPlugin(useGSAP)
+
+// 环境光带使用长周期漂移，避免与表单交互动效形成节奏竞争
+const AMBIENT_DRIFT_SECONDS = {
+  blue: 7,
+  violet: 9,
+  mist: 8,
+} as const
 
 interface Credentials {
   username: string
@@ -77,7 +83,7 @@ export function AuthScreen({ onLogin, pending = false, error }: AuthScreenProps)
     const motion = gsap.matchMedia()
     motion.add('(prefers-reduced-motion: no-preference)', () => {
       const targets = root.querySelectorAll<HTMLElement>(
-        '.auth-header, .auth-intro, .auth-signal-field, .auth-panel',
+        '.auth-header, .auth-intro, .auth-ambient, .auth-panel',
       )
       const entrance = gsap.fromTo(targets, {
         autoAlpha: 0,
@@ -90,7 +96,55 @@ export function AuthScreen({ onLogin, pending = false, error }: AuthScreenProps)
         stagger: MOTION_DURATION_SECONDS.fast / 3,
         clearProps: 'opacity,visibility,transform',
       })
-      return () => entrance.kill()
+
+      const ambientTweens: gsap.core.Tween[] = []
+      const blueRibbon = root.querySelector<SVGGElement>('.auth-ribbon--blue')
+      const violetRibbon = root.querySelector<SVGGElement>('.auth-ribbon--violet')
+      const ambientMist = root.querySelector<HTMLElement>('.auth-ambient-mist')
+
+      if (blueRibbon) {
+        ambientTweens.push(gsap.to(blueRibbon, {
+          xPercent: 5,
+          yPercent: 7,
+          rotation: 2,
+          scale: 1.035,
+          duration: AMBIENT_DRIFT_SECONDS.blue,
+          ease: 'sine.inOut',
+          repeat: -1,
+          yoyo: true,
+          force3D: true,
+        }))
+      }
+      if (violetRibbon) {
+        ambientTweens.push(gsap.to(violetRibbon, {
+          xPercent: -5,
+          yPercent: -6,
+          rotation: -2,
+          scale: 1.04,
+          duration: AMBIENT_DRIFT_SECONDS.violet,
+          ease: 'sine.inOut',
+          repeat: -1,
+          yoyo: true,
+          force3D: true,
+        }))
+      }
+      if (ambientMist) {
+        ambientTweens.push(gsap.to(ambientMist, {
+          xPercent: 7,
+          yPercent: -7,
+          scale: 1.12,
+          duration: AMBIENT_DRIFT_SECONDS.mist,
+          ease: 'sine.inOut',
+          repeat: -1,
+          yoyo: true,
+          force3D: true,
+        }))
+      }
+
+      return () => {
+        entrance.kill()
+        ambientTweens.forEach((tween) => tween.kill())
+      }
     })
 
     return () => motion.revert()
@@ -100,18 +154,52 @@ export function AuthScreen({ onLogin, pending = false, error }: AuthScreenProps)
     <main id="main-content" ref={rootRef} className="auth-page" aria-label={t('TinkerFin 账户登录')}>
       <h1 className="visually-hidden">{t('TinkerFin Studio 账户')}</h1>
       <div className="auth-ambient" aria-hidden="true">
-        <span className="auth-signal-field">
-          <span className="auth-signal-orbit auth-signal-orbit--outer"><i /></span>
-          <span className="auth-signal-orbit auth-signal-orbit--middle"><i /></span>
-          <span className="auth-signal-orbit auth-signal-orbit--inner"><i /></span>
-          <span className="auth-signal-core"><i /><i /><i /><i /></span>
-        </span>
+        <svg
+          className="auth-ambient-art"
+          viewBox="0 0 1000 1000"
+          preserveAspectRatio="xMidYMid slice"
+          focusable="false"
+          aria-hidden="true"
+        >
+          <defs>
+            <linearGradient id="auth-ribbon-blue-gradient" x1="0%" y1="0%" x2="100%" y2="0%">
+              <stop offset="0%" stopColor="rgb(108 190 255)" stopOpacity="0" />
+              <stop offset="20%" stopColor="rgb(108 190 255)" stopOpacity=".18" />
+              <stop offset="48%" stopColor="rgb(72 158 255)" stopOpacity=".42" />
+              <stop offset="76%" stopColor="rgb(126 205 255)" stopOpacity=".2" />
+              <stop offset="100%" stopColor="rgb(126 205 255)" stopOpacity="0" />
+            </linearGradient>
+            <linearGradient id="auth-ribbon-violet-gradient" x1="0%" y1="0%" x2="100%" y2="0%">
+              <stop offset="0%" stopColor="rgb(190 163 255)" stopOpacity="0" />
+              <stop offset="18%" stopColor="rgb(190 163 255)" stopOpacity=".16" />
+              <stop offset="50%" stopColor="rgb(143 104 255)" stopOpacity=".36" />
+              <stop offset="76%" stopColor="rgb(194 169 255)" stopOpacity=".18" />
+              <stop offset="100%" stopColor="rgb(194 169 255)" stopOpacity="0" />
+            </linearGradient>
+            <filter id="auth-ribbon-soft-filter" x="-30%" y="-30%" width="160%" height="160%" colorInterpolationFilters="sRGB">
+              <feGaussianBlur stdDeviation="32" />
+            </filter>
+            <filter id="auth-ribbon-body-filter" x="-30%" y="-30%" width="160%" height="160%" colorInterpolationFilters="sRGB">
+              <feGaussianBlur stdDeviation="8" />
+            </filter>
+          </defs>
+
+          <g className="auth-ribbon auth-ribbon--blue">
+            <path className="auth-ribbon__soft" d="M -160 260 C 70 46 280 232 544 82 C 706 -10 862 -54 1110 -164" stroke="url(#auth-ribbon-blue-gradient)" strokeWidth="190" filter="url(#auth-ribbon-soft-filter)" />
+            <path className="auth-ribbon__body" d="M -160 260 C 70 46 280 232 544 82 C 706 -10 862 -54 1110 -164" stroke="url(#auth-ribbon-blue-gradient)" strokeWidth="120" filter="url(#auth-ribbon-body-filter)" />
+          </g>
+
+          <g className="auth-ribbon auth-ribbon--violet">
+            <path className="auth-ribbon__soft" d="M 120 1160 C 330 820 490 1030 700 780 C 824 632 964 626 1160 510" stroke="url(#auth-ribbon-violet-gradient)" strokeWidth="200" filter="url(#auth-ribbon-soft-filter)" />
+            <path className="auth-ribbon__body" d="M 120 1160 C 330 820 490 1030 700 780 C 824 632 964 626 1160 510" stroke="url(#auth-ribbon-violet-gradient)" strokeWidth="128" filter="url(#auth-ribbon-body-filter)" />
+          </g>
+        </svg>
+        <span className="auth-ambient-mist" />
       </div>
 
       <header className="auth-header">
         <div className="auth-brand">
-          <BrandMark />
-          <span>TinkerFin</span>
+          <BrandLogo size="md" />
         </div>
         <ThemePicker />
       </header>

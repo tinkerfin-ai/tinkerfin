@@ -16,6 +16,7 @@ const conversation = (
   mode: 'default',
   messages: [],
   todos,
+  taskTrace: { phase: 'unloaded' },
   runStatus,
 })
 

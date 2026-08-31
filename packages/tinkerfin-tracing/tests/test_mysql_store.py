@@ -27,6 +27,8 @@ from tinkerfin_tracing import (
     TraceLimits,
     TraceProjectionCheckpoint,
     Tracer,
+    TraceStoreOptions,
+    verify_trace_ledger_backend,
 )
 from tinkerfin_tracing.errors import (
     TraceQuotaExceeded,
@@ -34,9 +36,18 @@ from tinkerfin_tracing.errors import (
     TraceStoreProtocolError,
 )
 from tinkerfin_tracing.sql_schema import TRACE_TABLE_NAMES
-from tinkerfin_tracing.sql_store import SqlAlchemyTraceStore, SqlTraceStoreOptions
+from tinkerfin_tracing.sql_store import (
+    SqlAlchemyTraceStore,
+    _SqlAlchemyTraceLedgerBackend,
+)
 
 pytestmark = pytest.mark.docker_integration
+
+
+def _backend(store: SqlAlchemyTraceStore) -> _SqlAlchemyTraceLedgerBackend:
+    backend = store.backend
+    assert isinstance(backend, _SqlAlchemyTraceLedgerBackend)
+    return backend
 
 
 @pytest.fixture(autouse=True)
@@ -78,9 +89,9 @@ async def test_mysql_cross_instance_sequence_follow_and_expired_writer_fencing()
     first_engine = create_async_engine(_url())
     second_engine = create_async_engine(_url())
     namespace = f"mysql-e2e-{uuid4().hex}"
-    options = SqlTraceStoreOptions(
+    options = TraceStoreOptions(
         writer_lease_seconds=2,
-        heartbeat_interval_seconds=0.5,
+        writer_heartbeat_interval_seconds=0.5,
         follow_poll_seconds=0.01,
     )
     first_store = SqlAlchemyTraceStore(
@@ -234,9 +245,9 @@ async def test_mysql_concurrent_first_setup_reflects_the_only_current_schema() -
 
 async def test_mysql_process_crash_exposes_missing_tail_then_allows_takeover() -> None:
     namespace = f"mysql-crash-{uuid4().hex}"
-    options = SqlTraceStoreOptions(
+    options = TraceStoreOptions(
         writer_lease_seconds=0.6,
-        heartbeat_interval_seconds=0.2,
+        writer_heartbeat_interval_seconds=0.2,
         follow_poll_seconds=0.01,
     )
     engine = create_async_engine(_url())
@@ -249,8 +260,8 @@ import sys
 from datetime import UTC, datetime
 from sqlalchemy.ext.asyncio import create_async_engine
 from tinkerfin_contracts import RunIdentity
-from tinkerfin_tracing import RunFact
-from tinkerfin_tracing.sql_store import SqlAlchemyTraceStore, SqlTraceStoreOptions
+from tinkerfin_tracing import RunFact, TraceStoreOptions
+from tinkerfin_tracing.sql_store import SqlAlchemyTraceStore
 
 async def main():
     url, namespace = sys.argv[1:]
@@ -258,9 +269,9 @@ async def main():
     store = SqlAlchemyTraceStore(
         engine,
         namespace=namespace,
-        options=SqlTraceStoreOptions(
+        options=TraceStoreOptions(
             writer_lease_seconds=0.6,
-            heartbeat_interval_seconds=0.2,
+            writer_heartbeat_interval_seconds=0.2,
             follow_poll_seconds=0.01,
         ),
     )
@@ -340,11 +351,14 @@ async def test_mysql_retryable_or_unknown_commit_reuses_event_ids(
     store = SqlAlchemyTraceStore(
         engine,
         namespace=f"mysql-retry-{error_code}-{uuid4().hex}",
-        options=SqlTraceStoreOptions(retry_attempts=2, retry_delay_seconds=0.001),
+        options=TraceStoreOptions(
+            commit_retry_attempts=2,
+            commit_retry_delay_seconds=0.001,
+        ),
     )
     identity = _identity(f"retry-{error_code}")
     writer = await store.open_writer(identity)
-    original = store._raw_write_connection
+    original = _backend(store)._raw_write_connection
     remaining = 1
 
     @asynccontextmanager
@@ -362,7 +376,7 @@ async def test_mysql_retryable_or_unknown_commit_reuses_event_ids(
             )
 
     try:
-        monkeypatch.setattr(store, "_raw_write_connection", fail_after_commit)
+        monkeypatch.setattr(_backend(store), "_raw_write_connection", fail_after_commit)
         committed = await writer.append((_fact(f"retry-{error_code}", "started"),))
         snapshot = await store.snapshot(identity.thread_id)
         stored = await store.read_events(
@@ -374,7 +388,7 @@ async def test_mysql_retryable_or_unknown_commit_reuses_event_ids(
         assert snapshot.as_of_seq == 1
         assert tuple(event.event_id for event in stored) == (committed[0].event_id,)
     finally:
-        monkeypatch.setattr(store, "_raw_write_connection", original)
+        monkeypatch.setattr(_backend(store), "_raw_write_connection", original)
         await writer.aclose()
         snapshot = await store.snapshot(identity.thread_id)
         await store.delete(snapshot.key)
@@ -448,9 +462,9 @@ async def test_mysql_expired_incomplete_writer_keeps_terminal_reserve() -> None:
             terminal_reserve_events_per_run=2,
             terminal_reserve_bytes_per_run=2048,
         ),
-        options=SqlTraceStoreOptions(
+        options=TraceStoreOptions(
             writer_lease_seconds=10,
-            heartbeat_interval_seconds=5,
+            writer_heartbeat_interval_seconds=5,
         ),
     )
     first = await store.open_writer(_identity("reserve-a"))
@@ -490,4 +504,86 @@ async def test_mysql_expired_incomplete_writer_keeps_terminal_reserve() -> None:
     finally:
         await first.aclose()
         await second.aclose()
+        await engine.dispose()
+
+
+async def test_mysql_backend_satisfies_public_cross_instance_verifier() -> None:
+    first_engine = create_async_engine(_url(), pool_pre_ping=True)
+    second_engine = create_async_engine(_url(), pool_pre_ping=True)
+    namespace = f"mysql-backend-contract-{uuid4().hex}"
+    options = TraceStoreOptions(
+        writer_lease_seconds=3,
+        writer_heartbeat_interval_seconds=0.5,
+        follow_poll_seconds=0.01,
+        commit_retry_attempts=10,
+        commit_retry_delay_seconds=0.001,
+    )
+    try:
+        await verify_trace_ledger_backend(
+            _SqlAlchemyTraceLedgerBackend(
+                first_engine,
+                namespace=namespace,
+                options=options,
+            ),
+            _SqlAlchemyTraceLedgerBackend(
+                second_engine,
+                namespace=namespace,
+                options=options,
+            ),
+            namespace=namespace,
+            options=options,
+        )
+    finally:
+        await first_engine.dispose()
+        await second_engine.dispose()
+
+
+async def test_mysql_writer_lease_starts_after_namespace_lock_wait() -> None:
+    engine = create_async_engine(_url(), pool_pre_ping=True)
+    namespace = f"mysql-lease-clock-{uuid4().hex}"
+    identity = _identity("lease-clock")
+    store = SqlAlchemyTraceStore(
+        engine,
+        namespace=namespace,
+        options=TraceStoreOptions(
+            writer_lease_seconds=1,
+            writer_heartbeat_interval_seconds=0.9,
+            commit_retry_attempts=5,
+            commit_retry_delay_seconds=0.001,
+        ),
+    )
+    await store.setup()
+    writer = None
+    open_writer = None
+    try:
+        async with engine.connect() as blocker:
+            async with blocker.begin():
+                await blocker.execute(
+                    text(
+                        "SELECT namespace_hash FROM tinkerfin_trace_namespaces "
+                        "WHERE namespace = :namespace FOR UPDATE"
+                    ),
+                    {"namespace": namespace},
+                )
+                open_writer = asyncio.create_task(store.open_writer(identity))
+                await asyncio.sleep(1.2)
+                assert not open_writer.done()
+        writer = await asyncio.wait_for(open_writer, timeout=5)
+        async with engine.connect() as connection:
+            remaining_microseconds = await connection.scalar(
+                text(
+                    "SELECT TIMESTAMPDIFF(MICROSECOND, UTC_TIMESTAMP(6), "
+                    "lease_expires_at) FROM tinkerfin_trace_writers "
+                    "WHERE namespace_hash = SHA2(:namespace, 256) AND run_id = :run_id"
+                ),
+                {"namespace": namespace, "run_id": identity.run_id},
+            )
+        assert isinstance(remaining_microseconds, int)
+        assert remaining_microseconds > 500_000
+    finally:
+        if open_writer is not None and not open_writer.done():
+            open_writer.cancel()
+            await asyncio.gather(open_writer, return_exceptions=True)
+        if writer is not None:
+            await writer.aclose()
         await engine.dispose()

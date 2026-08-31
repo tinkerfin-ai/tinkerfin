@@ -11,6 +11,7 @@ import { clearPlanQuestionCollapsed } from '../conversation/planQuestionCollapse
 import {
   createNewConversation,
   removeConversation,
+  selectCurrentConversation,
   updateConversation,
 } from '../../lib/workspace'
 import type { WorkspaceDialog } from './components/WorkspaceDialogs'
@@ -73,7 +74,7 @@ export function useConversationManagement({
     if (threadId !== latest.current.workspace.currentThreadId) onConversationBoundary()
     setDraft('')
     setDraftConversation(null)
-    setWorkspace((state) => ({ ...state, currentThreadId: threadId }))
+    setWorkspace((state) => selectCurrentConversation(state, threadId))
     if (findConversation(threadId)?.isHydrated) void followDetachedConversation(threadId)
   }
 

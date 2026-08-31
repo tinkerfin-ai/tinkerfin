@@ -36,6 +36,7 @@ from tinkerfin_studio.config.settings import Settings, get_settings
 from tinkerfin_studio.conversation.coordinator import (
     ConversationTraceCoordinator,
 )
+from tinkerfin_studio.conversation.todo_groups import TodoGroupQueryExecutor
 from tinkerfin_studio.health import ReadinessService
 from tinkerfin_studio.infrastructure.database import Database
 from tinkerfin_studio.infrastructure.redis_client import create_redis_client
@@ -141,6 +142,7 @@ class ApplicationResources:
     agent_persistence: AgentPersistence
     tinkerfin_profiles: Mapping[str, TinkerFin]
     tracer: Tracer
+    todo_group_query: TodoGroupQueryExecutor
     messaging: Messaging
     conversation_channel: MessageChannel[BaseEvent, BaseEvent]
     sandbox_manager: OpenSandboxManager[str]
@@ -221,6 +223,7 @@ def build_lifespan():
             # Trace Store 借用业务 Engine 并在接收请求前校验唯一当前 Schema
             await trace_store.setup()
             tracer = Tracer(store=trace_store)
+            todo_group_query = TodoGroupQueryExecutor()
             # 每个 Run 由框架打开独立 Trace session，写入失败会让 Agent fail-closed
             # Tracer 只借用进程级 Store，不接管共享 Engine 或改变 reasoning 默认省略策略
             tinkerfin_profiles = MappingProxyType(
@@ -298,6 +301,7 @@ def build_lifespan():
                 agent_persistence=persistence,
                 tinkerfin_profiles=tinkerfin_profiles,
                 tracer=tracer,
+                todo_group_query=todo_group_query,
                 messaging=messaging,
                 conversation_channel=channel,
                 sandbox_manager=sandbox_manager,

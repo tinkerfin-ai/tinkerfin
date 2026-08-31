@@ -16,17 +16,15 @@ from tinkerfin import (
     TinkerFin,
 )
 from tinkerfin_messaging import (
-    BackendRunHandle,
     CodecMismatch,
     MemoryBackend,
     MessageCodecInputSource,
-    MessageEnvelope,
     MessageSource,
     MessageSubscription,
     Messaging,
     MessagingError,
-    PreparedRun,
-    RecoveryCheckpoint,
+    MessagingTransition,
+    MessagingTransitionResult,
 )
 from tinkerfin_messaging.protocols import ProfiledMessageSource
 
@@ -92,43 +90,15 @@ class _CountingBackend(MemoryBackend):
         self.prepare_calls = 0
         self.append_calls = 0
 
-    async def prepare(
+    async def commit_messaging_transition(
         self,
-        *,
-        channel: str,
-        identity: RunIdentity,
-        codec: str,
-        after: int | None,
-        cancellable: bool,
-        recoverable: bool,
-    ) -> PreparedRun:
-        self.prepare_calls += 1
-        return await super().prepare(
-            channel=channel,
-            identity=identity,
-            codec=codec,
-            after=after,
-            cancellable=cancellable,
-            recoverable=recoverable,
-        )
-
-    async def append(
-        self,
-        handle: BackendRunHandle,
-        *,
-        message_id: str,
-        codec: str,
-        payload: bytes,
-        checkpoint: RecoveryCheckpoint | None = None,
-    ) -> MessageEnvelope:
-        self.append_calls += 1
-        return await super().append(
-            handle,
-            message_id=message_id,
-            codec=codec,
-            payload=payload,
-            checkpoint=checkpoint,
-        )
+        transition: MessagingTransition,
+    ) -> MessagingTransitionResult:
+        if transition.kind == "prepare_run":
+            self.prepare_calls += 1
+        elif transition.kind == "append_message":
+            self.append_calls += 1
+        return await super().commit_messaging_transition(transition)
 
 
 class _DeclaredProfileSource:

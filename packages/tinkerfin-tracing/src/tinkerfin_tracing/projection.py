@@ -530,11 +530,17 @@ def advance_core_projection_state(
                 candidate = next(iter(candidates))
                 if runs[candidate].terminal is not None:
                     parent_run_id = candidate
-            if (
-                parent_run_id is None
-                and fact.input_kind in {"resume", "abandon"}
-                and not candidates
-            ):
+            known_parent_run_id = (
+                parent_run_id
+                if parent_run_id is not None
+                else None
+                if info is None
+                else info.parent_run_id
+            )
+            # Runtime lifecycle phases may omit the parent already bound by ``started``.
+            # Repeated input evidence must not degrade that lineage, while a continuation
+            # with no explicit, inferred, or previously bound parent remains incomplete.
+            if known_parent_run_id is None and fact.input_kind in {"resume", "abandon"}:
                 info = info or inherited_run(
                     run_id,
                     occurred_at=fact.occurred_at,

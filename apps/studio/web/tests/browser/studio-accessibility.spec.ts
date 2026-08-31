@@ -1,9 +1,15 @@
 import { expect, test, type Locator, type Page, type Route } from '@playwright/test'
+import { resolve } from 'node:path'
 import type { ConversationHistoryDetail } from '../../src/api/conversation/history'
+import type { TaskTraceSnapshot } from '../../src/api/conversation/taskTrace'
 import type { JsonObject, JsonValue, Message } from '../../src/types'
 
 const THREAD_ID = 'browser-thread'
 const BASE_TIME = '2026-08-25T00:00:00.000Z'
+const UI_EVIDENCE_DIR = resolve(
+  process.cwd(),
+  '../../../.agents/evidence/20260828014138-trace-persistence-studio-authority/implementation/browser/ui-refinement-20260831',
+)
 const user = {
   user_id: 7,
   username: 'browser-user',
@@ -491,7 +497,18 @@ const planReviewPayload: JsonObject = {
         },
         content: {
           description: '保持现有会话行为并完成响应式验证',
-          markdown: '# 浏览器计划草稿\n\n- 保持现有会话行为\n- 完成响应式验证',
+          markdown: [
+            '# 浏览器计划草稿',
+            '',
+            '- 保持现有会话行为',
+            '- 完成响应式验证',
+            '- 验证正常结束与异常恢复',
+            '- 验证断连后的状态保持',
+            '- 验证浅色与深色主题',
+            '- 验证窄屏与桌面布局',
+            '- 验证键盘和触控操作',
+            '- 验证 Footer 不遮挡最终验收项',
+          ].join('\n'),
         },
       },
     },
@@ -520,6 +537,7 @@ interface MockStudioOptions {
   planReview?: boolean
   runError?: boolean
   runningActivity?: boolean
+  taskTrace?: TaskTraceSnapshot
 }
 
 async function mockStudio(page: Page, {
@@ -536,12 +554,13 @@ async function mockStudio(page: Page, {
   planReview = false,
   runError = false,
   runningActivity = false,
+  taskTrace = { status: 'ready', todoGroups: [] },
 }: MockStudioOptions = {}) {
   let historyRequestCount = 0
   const isWaitingForInput = approval || planQuestion || planReview
   const historyMessages = conversationMessages
     ?? (approval ? approvalMessages : runningActivity ? runningActivityMessages : messages)
-  const buildTraceDetail = (): ConversationHistoryDetail => {
+  const buildTraceDetail = (includeTaskTrace = true): ConversationHistoryDetail => {
     const traceMessages = historyMessages.flatMap((message, index) => {
       if (message.role === 'user' || message.role === 'assistant') {
         return [{
@@ -720,6 +739,7 @@ async function mockStudio(page: Page, {
         missingTail: false,
         payloadOmitted: false,
       },
+      taskTrace: includeTaskTrace ? taskTrace : null,
       createdAt: BASE_TIME,
       updatedAt: BASE_TIME,
     }
@@ -823,7 +843,10 @@ async function mockStudio(page: Page, {
       return
     }
     if (url.pathname === `/api/conversation/${THREAD_ID}/history`) {
-      await fulfillJson(route, buildTraceDetail())
+      await fulfillJson(
+        route,
+        buildTraceDetail(url.searchParams.get('includeTaskTrace') !== 'false'),
+      )
       return
     }
     if (url.pathname === `/api/conversation/${THREAD_ID}/trace`) {
@@ -832,7 +855,7 @@ async function mockStudio(page: Page, {
         contentType: 'text/event-stream',
         body: `event: trace\ndata: ${JSON.stringify({
           type: 'snapshot',
-          snapshot: buildTraceDetail(),
+          snapshot: buildTraceDetail(url.searchParams.get('includeTaskTrace') !== 'false'),
         })}\n\n`,
       })
       return
@@ -897,6 +920,41 @@ test('四个目标视口保持正确导航形态且没有页面级横向溢出',
       document.body.scrollWidth - document.body.clientWidth,
     ))
     expect(overflow).toBeLessThanOrEqual(0)
+  }
+})
+
+test('新会话点击后在浅深主题和四个视口都不显示品牌蓝选中态', async ({ page }) => {
+  await mockStudio(page)
+  for (const colorScheme of ['light', 'dark'] as const) {
+    await page.emulateMedia({ colorScheme })
+    for (const width of [320, 768, 1024, 1440]) {
+      await page.setViewportSize({ width, height: 900 })
+      if (width === 320) {
+        await page.getByRole('button', { name: '打开导航' }).click()
+      }
+      const newChat = width === 768
+        ? page.locator('.sidebar-rail').getByRole('button', { name: '新会话' })
+        : page.locator('.sidebar-wide').getByRole('button', { name: '新会话' })
+      await expect(newChat).toBeVisible()
+      await expect(newChat).not.toHaveAttribute('title')
+      await newChat.hover()
+      await expect(page.getByRole('tooltip', { name: '新会话' })).toHaveCount(0)
+      await newChat.click()
+      await expect(newChat).not.toHaveClass(/is-selected/)
+      await expect(newChat).not.toHaveAttribute('aria-pressed')
+      const colors = await newChat.evaluate((element) => {
+        const probe = document.createElement('span')
+        probe.style.color = 'var(--color-brand-text)'
+        document.body.append(probe)
+        const brandText = getComputedStyle(probe).color
+        probe.remove()
+        return {
+          color: getComputedStyle(element).color,
+          brandText,
+        }
+      })
+      expect(colors.color).not.toBe(colors.brandText)
+    }
   }
 })
 
@@ -1086,8 +1144,32 @@ test('Plan 澄清按后端题型渲染单选、多选、文本与日期控件', 
   await page.getByRole('textbox', { name: '自定义回答：需要覆盖哪些平台？' }).fill('桌面端')
   await expect(page.getByRole('checkbox', { name: '移动端' })).toBeDisabled()
   await expect(page.getByRole('button', { name: '浏览下一题' })).toBeEnabled()
-  await expect(page.getByRole('button', { name: '下一题', exact: true })).toBeEnabled()
-  await page.getByRole('button', { name: '下一题', exact: true }).click()
+  const nextQuestion = page.getByRole('button', { name: '下一题', exact: true })
+  await expect(nextQuestion).toBeEnabled()
+  await expect(nextQuestion).toHaveClass(/ui-button--capsule/)
+  await expect(nextQuestion).toHaveClass(/ui-button--primary/)
+  await expect(nextQuestion).toHaveCSS('background-color', 'rgb(57, 100, 254)')
+  const clarificationFooter = page.locator('.plan-question-composer-footer')
+  const clarificationBody = page.locator('.plan-question-composer-body')
+  const [footerVisual, clarificationBodyBounds, clarificationFooterBounds] = await Promise.all([
+    clarificationFooter.evaluate((element) => ({
+      background: getComputedStyle(element).backgroundColor,
+      content: getComputedStyle(element, '::before').content,
+      gradient: getComputedStyle(element, '::before').backgroundImage,
+    })),
+    clarificationBody.boundingBox(),
+    clarificationFooter.boundingBox(),
+  ])
+  expect(footerVisual.background).toBe('rgba(0, 0, 0, 0)')
+  expect(footerVisual.content).not.toBe('none')
+  expect(footerVisual.gradient).toContain('linear-gradient')
+  if (!clarificationBodyBounds || !clarificationFooterBounds) {
+    throw new Error('Plan 澄清正文与 Footer 几何不可用')
+  }
+  expect(clarificationBodyBounds.y + clarificationBodyBounds.height)
+    .toBeLessThanOrEqual(clarificationFooterBounds.y + .5)
+  await page.screenshot({ path: resolve(UI_EVIDENCE_DIR, 'plan-question-footer-light.png') })
+  await nextQuestion.click()
 
   const text = page.getByRole('textbox', { name: '自定义回答：还有哪些限制？' })
   await expect(text).toBeVisible()
@@ -1211,6 +1293,10 @@ test('Plan 澄清按后端题型渲染单选、多选、文本与日期控件', 
     await page.evaluate((theme) => {
       document.documentElement.dataset.theme = theme
     }, colorScheme)
+    const footerOverlay = await page.locator('.plan-question-composer-footer').evaluate(
+      (element) => getComputedStyle(element, '::before').backgroundImage,
+    )
+    expect(footerOverlay).toContain('linear-gradient')
     for (const width of [320, 768, 1024, 1440]) {
       await page.setViewportSize({ width, height: 900 })
       const closeNavigation = page.getByRole('button', { name: '关闭导航' })
@@ -1308,6 +1394,13 @@ test('Plan 澄清返回已作答单选题时保持选中项焦点且移出悬浮
     await page.evaluate((theme) => {
       document.documentElement.dataset.theme = theme
     }, colorScheme)
+    const stableFooterOverlay = await page.locator('.plan-question-composer-footer').evaluate(
+      (element) => getComputedStyle(element, '::before').backgroundImage,
+    )
+    expect(stableFooterOverlay).toContain('linear-gradient')
+    if (colorScheme === 'dark') {
+      await page.screenshot({ path: resolve(UI_EVIDENCE_DIR, 'plan-question-footer-dark.png') })
+    }
     for (const width of [320, 768, 1024, 1440]) {
       await page.setViewportSize({ width, height: 900 })
       await mobile.focus()
@@ -1458,6 +1551,9 @@ test('展开的审批、Plan 澄清与草稿使用统一单行标题规格和静
     bridgeHeight: number
     bridgePointerEvents: string
     bridgeBackground: string
+    footerOverlayContent: string
+    footerOverlayBackground: string
+    bodyFooterOverlap: number
   }
   const collectChrome = async ({
     cardSelector,
@@ -1481,7 +1577,15 @@ test('展开的审批、Plan 澄清与草稿使用统一单行标题规格和静
         const chrome = await page.locator(cardSelector).evaluate((card, selectors) => {
           const header = card.querySelector<HTMLElement>(selectors.header)
           const bridge = card.querySelector<HTMLElement>('.interaction-card-color-bridge')
-          if (!header || !bridge) throw new Error('卡片标题渐变几何不可用')
+          const body = card.querySelector<HTMLElement>(
+            ':scope > :is(.approval-composer-body, .plan-question-composer-body, .plan-review-composer-body)',
+          )
+          const footer = card.querySelector<HTMLElement>(
+            ':scope > :is(.approval-composer-footer, .plan-question-composer-footer, .plan-review-composer-footer)',
+          )
+          if (!header || !bridge || !body || !footer) {
+            throw new Error('卡片标题与 Footer 渐变几何不可用')
+          }
           const title = header.querySelector<HTMLElement>('h2')
           const description = header.querySelector<HTMLElement>('.plan-interaction-card-description')
           const actions = selectors.actions
@@ -1497,6 +1601,9 @@ test('展开的审批、Plan 澄清与草稿使用统一单行标题规格和静
           const descriptionBounds = description?.getBoundingClientRect()
           const descriptionStyle = description ? getComputedStyle(description) : null
           const bridgeStyle = getComputedStyle(bridge)
+          const bodyBounds = body.getBoundingClientRect()
+          const footerBounds = footer.getBoundingClientRect()
+          const footerOverlayStyle = getComputedStyle(footer, '::before')
           return {
             headerHeight: headerBounds.height,
             headingCenterDelta: headingBounds.top + (headingBounds.height / 2)
@@ -1518,6 +1625,9 @@ test('展开的审批、Plan 澄清与草稿使用统一单行标题规格和静
             bridgeHeight: bridgeBounds.height,
             bridgePointerEvents: bridgeStyle.pointerEvents,
             bridgeBackground: bridgeStyle.backgroundImage,
+            footerOverlayContent: footerOverlayStyle.content,
+            footerOverlayBackground: footerOverlayStyle.backgroundImage,
+            bodyFooterOverlap: bodyBounds.bottom - footerBounds.top,
           }
         }, { header: headerSelector, actions: actionsSelector })
         result.set(`${colorScheme}-${width}`, chrome)
@@ -1561,6 +1671,9 @@ test('展开的审批、Plan 澄清与草稿使用统一单行标题规格和静
       expect(chrome.bridgeHeight).toBeCloseTo(12, 5)
       expect(chrome.bridgePointerEvents).toBe('none')
       expect(chrome.bridgeBackground).toContain('linear-gradient')
+      expect(chrome.footerOverlayContent).not.toBe('none')
+      expect(chrome.footerOverlayBackground).toContain('linear-gradient')
+      expect(chrome.bodyFooterOverlap).toBeLessThanOrEqual(.5)
     }
     for (const chrome of [approval, question, review]) {
       expect(chrome.headerHeight).toBeCloseTo(44, 5)
@@ -1923,6 +2036,67 @@ test('文章型 Markdown 使用参考排版且表格保持可滚动', async ({ p
   }
 })
 
+test('同批 Todos 与单个普通 Tool 保持公共中间间距', async ({ page }) => {
+  const selectedTodo: Message = {
+    id: 'single-batch-todos',
+    role: 'tool',
+    content: 'write_todos',
+    createdAt: BASE_TIME,
+    meta: {
+      toolName: 'write_todos',
+      toolCallId: 'single-batch-todos',
+      runId: 'single-batch-run',
+      batchId: 'single-batch',
+      status: 'completed',
+    },
+  }
+  const singleTool: Message = {
+    id: 'single-batch-list',
+    role: 'tool',
+    content: 'ls',
+    createdAt: BASE_TIME,
+    meta: {
+      toolName: 'ls',
+      toolCallId: 'single-batch-list',
+      runId: 'single-batch-run',
+      batchId: 'single-batch',
+      params: '{"path":"/memories"}',
+      result: '读取完成',
+      status: 'completed',
+    },
+  }
+  await mockStudio(page, {
+    conversationMessages: [selectedTodo, singleTool],
+    taskTrace: {
+      status: 'ready',
+      todoGroups: [{
+        id: 'todo-group:single-batch-run',
+        userMessageId: 'single-batch-user',
+        userMessagePreview: '整理记忆文件',
+        groupToolCallId: selectedTodo.id,
+        createdAt: BASE_TIME,
+        status: 'completed',
+        todos: [{ id: 'single-batch-todo-1', content: '整理记忆文件', status: 'completed' }],
+      }],
+    },
+  })
+  const todoSummary = page.locator('#single-batch-todos > summary')
+  const toolSummary = page.locator('#single-batch-list > summary')
+
+  for (const colorScheme of ['light', 'dark'] as const) {
+    await page.emulateMedia({ colorScheme })
+    for (const width of [320, 768, 1024, 1440]) {
+      await page.setViewportSize({ width, height: 900 })
+      const [todoBounds, toolBounds] = await Promise.all([
+        todoSummary.boundingBox(),
+        toolSummary.boundingBox(),
+      ])
+      if (!todoBounds || !toolBounds) throw new Error('Todos 或单个 Tool 几何不可用')
+      expect(toolBounds.y - (todoBounds.y + todoBounds.height)).toBeCloseTo(16, 5)
+    }
+  }
+})
+
 test('展开 Tool 批次在卡片边框之间保持公共间距', async ({ page }) => {
   await mockStudio(page, {
     conversationMessages: spacingBatchMessages,
@@ -1945,6 +2119,89 @@ test('展开 Tool 批次在卡片边框之间保持公共间距', async ({ page 
       if (!firstDetail || !secondHeader || !secondDetail || !answer) throw new Error('Tool 批次几何不可用')
       expect(secondHeader.y - (firstDetail.y + firstDetail.height)).toBeCloseTo(16, 5)
       expect(answer.y - (secondDetail.y + secondDetail.height)).toBeCloseTo(16, 5)
+    }
+  }
+})
+
+test('对话底部 Tool 在浅深主题与四个视口展开后避开 Composer', async ({ page }) => {
+  const disclosureMessages: Message[] = [
+    {
+      id: 'tool-disclosure-user',
+      role: 'user',
+      content: '检查多个文件并汇总',
+      createdAt: BASE_TIME,
+    },
+    ...Array.from({ length: 30 }, (_, index): Message => ({
+      id: `tool-disclosure-context-${index + 1}`,
+      role: 'assistant',
+      content: `已有对话上下文 ${index + 1}`,
+      createdAt: BASE_TIME,
+      meta: { status: 'completed' },
+    })),
+    ...Array.from({ length: 6 }, (_, index): Message => ({
+      id: `tool-disclosure-${index + 1}`,
+      role: 'tool',
+      content: 'glob',
+      createdAt: BASE_TIME,
+      meta: {
+        toolName: 'glob',
+        toolCallId: `tool-disclosure-call-${index + 1}`,
+        params: JSON.stringify({ pattern: index === 5 ? '**/*' : `**/*.${index}` }),
+        result: Array.from({ length: 12 }, (__, item) => `/workspace/result-${index}-${item}.md`).join('\n'),
+        status: 'completed',
+      },
+    })),
+  ]
+  await mockStudio(page, { conversationMessages: disclosureMessages })
+  for (const colorScheme of ['light', 'dark'] as const) {
+    await page.emulateMedia({
+      colorScheme,
+      reducedMotion: colorScheme === 'dark' ? 'reduce' : 'no-preference',
+    })
+    for (const width of [320, 768, 1024, 1440]) {
+      await page.setViewportSize({ width, height: 900 })
+      await page.reload()
+      await expect(page.getByRole('textbox', { name: '消息输入' })).toBeVisible()
+      const pane = page.getByRole('region', { name: '对话内容' })
+      await pane.evaluate((element) => { element.scrollTop = element.scrollHeight })
+      const row = page.locator('#tool-disclosure-6')
+      const summary = row.locator(':scope > summary')
+      const beforeOpen = await pane.evaluate((element) => element.scrollTop)
+
+      await summary.click()
+      await expect(row).toHaveAttribute('open', '')
+      await expect.poll(async () => {
+        const [detail, composer] = await Promise.all([
+          row.locator('.tool-detail-card').boundingBox(),
+          page.locator('.composer').boundingBox(),
+        ])
+        if (!detail || !composer) return Number.POSITIVE_INFINITY
+        return (detail.y + detail.height) - composer.y
+      }).toBeLessThanOrEqual(-8)
+      const [detailBounds, composerBounds] = await Promise.all([
+        row.locator('.tool-detail-card').boundingBox(),
+        page.locator('.composer').boundingBox(),
+      ])
+      if (!detailBounds || !composerBounds) throw new Error('Tool 详情或 Composer 几何不可用')
+      expect(detailBounds.y + detailBounds.height).toBeLessThanOrEqual(composerBounds.y - 8)
+      await expect.poll(async () => pane.evaluate((element) => element.scrollTop)).toBeGreaterThan(beforeOpen)
+      if (colorScheme === 'light' && width === 1440) {
+        await page.screenshot({
+          path: resolve(UI_EVIDENCE_DIR, 'tool-detail-above-composer-light.png'),
+        })
+      }
+
+      const beforeClose = await pane.evaluate((element) => element.scrollTop)
+      await summary.click()
+      await expect(row).not.toHaveAttribute('open', '')
+      expect(await pane.evaluate((element) => element.scrollTop)).toBeLessThanOrEqual(beforeClose)
+      const [summaryBounds, paneBounds] = await Promise.all([
+        summary.boundingBox(),
+        pane.boundingBox(),
+      ])
+      if (!summaryBounds || !paneBounds) throw new Error('Tool 摘要或对话滚动区几何不可用')
+      expect(summaryBounds.y).toBeGreaterThanOrEqual(paneBounds.y)
+      expect(summaryBounds.y + summaryBounds.height).toBeLessThanOrEqual(composerBounds.y - 8)
     }
   }
 })
@@ -2045,6 +2302,8 @@ test('计划草稿以描述标题和三动作卡片接管输入区', async ({ pa
   })
   const card = page.getByRole('region', { name: 'Plan 审阅' })
   const header = card.locator('.plan-review-composer-head')
+  const body = card.locator('.plan-review-composer-body')
+  const footer = card.locator('.plan-review-composer-footer')
   const waitState = page.locator('.plan-review-wait-state')
   const statusRow = waitState.locator('.plan-review-status-row')
   const waitDots = waitState.locator('.activity-dots')
@@ -2074,6 +2333,7 @@ test('计划草稿以描述标题和三动作卡片接管输入区', async ({ pa
   const title = card.locator('.plan-review-composer-heading h2 > span')
   const icon = card.locator('.plan-review-composer-heading h2 > svg')
   const bridge = card.locator('.interaction-card-color-bridge.is-warning')
+  const finalItem = card.getByText('验证 Footer 不遮挡最终验收项')
   for (const [colorScheme, headerBackground, contentBackground] of [
     ['light', 'rgb(254, 245, 231)', 'rgb(255, 255, 255)'],
     ['dark', 'rgb(39, 36, 31)', 'rgb(35, 35, 36)'],
@@ -2092,19 +2352,35 @@ test('计划草稿以描述标题和三动作卡片接管输入区', async ({ pa
       await expect(header).toHaveCSS('background-color', headerBackground)
       await expect(header).toHaveCSS('padding-top', '10px')
       await expect(header).toHaveCSS('padding-bottom', '10px')
+      await expect(footer).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)')
+      const reviewFooterOverlay = await footer.evaluate(
+        (element) => {
+          const style = getComputedStyle(element, '::before')
+          return { content: style.content, backgroundImage: style.backgroundImage }
+        },
+      )
+      expect(reviewFooterOverlay.content).not.toBe('none')
+      expect(reviewFooterOverlay.backgroundImage).toContain('linear-gradient')
+      await body.evaluate((element) => { element.scrollTop = element.scrollHeight })
+      await expect(finalItem).toBeVisible()
       await expect(title).toHaveCSS('color', 'rgb(245, 158, 11)')
       await expect(icon).toHaveCSS('color', 'rgb(245, 158, 11)')
       const bridgeBackground = await bridge.evaluate((element) => getComputedStyle(element).backgroundImage)
       expect(bridgeBackground).toContain(headerBackground)
       expect(bridgeBackground).toContain(contentBackground)
       await expect(statusRow.locator('.plan-interaction-status-label')).toHaveCSS('font-weight', '400')
-      const [cardBounds, statusBounds, dotsBounds, messageListBounds] = await Promise.all([
+      const [cardBounds, bodyBounds, footerBounds, finalItemBounds, statusBounds, dotsBounds, messageListBounds] = await Promise.all([
         card.boundingBox(),
+        body.boundingBox(),
+        footer.boundingBox(),
+        finalItem.boundingBox(),
         statusRow.boundingBox(),
         waitDots.boundingBox(),
         messageList.boundingBox(),
       ])
-      if (!cardBounds || !statusBounds || !dotsBounds || !messageListBounds) throw new Error('计划草稿卡片几何不可用')
+      if (!cardBounds || !bodyBounds || !footerBounds || !finalItemBounds || !statusBounds || !dotsBounds || !messageListBounds) throw new Error('计划草稿卡片几何不可用')
+      expect(bodyBounds.y + bodyBounds.height).toBeLessThanOrEqual(footerBounds.y + .5)
+      expect(finalItemBounds.y + finalItemBounds.height).toBeLessThanOrEqual(footerBounds.y + .5)
       const actionBounds = await Promise.all([
         card.getByRole('button', { name: '取消当前 Plan 草稿' }).boundingBox(),
         card.getByRole('button', { name: '拒绝' }).boundingBox(),
@@ -2121,6 +2397,11 @@ test('计划草稿以描述标题和三动作卡片接管输入区', async ({ pa
         expect(bounds.x).toBeGreaterThanOrEqual(cardBounds.x)
         expect(bounds.x + bounds.width).toBeLessThanOrEqual(cardBounds.x + cardBounds.width)
         expect(bounds.height).toBeLessThanOrEqual(44)
+      }
+      if (width === 1024) {
+        await page.screenshot({
+          path: resolve(UI_EVIDENCE_DIR, `plan-review-footer-${colorScheme}.png`),
+        })
       }
     }
   }
@@ -2536,7 +2817,24 @@ test('全局滚动条保持统一参数、分层显隐和直接拖拽映射', as
 })
 
 test('账户菜单、modal 隔离和定时滚动控件保持完整键盘路径', async ({ page }) => {
-  await mockStudio(page)
+  await mockStudio(page, {
+    taskTrace: {
+      status: 'ready',
+      todoGroups: [{
+        id: 'todo-group:browser-run',
+        userMessageId: 'browser-message-1',
+        userMessagePreview: '浏览器历史消息 1',
+        groupToolCallId: 'browser-task-trace-tool',
+        createdAt: BASE_TIME,
+        status: 'completed',
+        todos: [{
+          id: 'todo-group:browser-run:todo:1',
+          content: '验证输入区辅助操作',
+          status: 'completed',
+        }],
+      }],
+    },
+  })
   const account = page.getByRole('button', { name: '打开用户菜单' })
   await account.click()
   await expect(page.getByRole('menuitem', { name: '设置' })).toBeFocused()
@@ -2565,8 +2863,110 @@ test('账户菜单、modal 隔离和定时滚动控件保持完整键盘路径',
   })
   const scrollButton = page.getByRole('button', { name: '回到底部' })
   await expect(scrollButton).toBeVisible()
+  const taskTraceButton = page.getByRole('button', { name: '任务轨迹 1' })
+  await expect(taskTraceButton).toBeVisible()
   await scrollButton.focus()
+  const auxiliaryAlignment = await page.evaluate(() => {
+    const scroll = document.querySelector<HTMLElement>('.scroll-to-bottom')
+    const taskTrace = document.querySelector<HTMLElement>('.todo-trace-launcher')
+    const composer = document.querySelector<HTMLElement>('.composer')
+    if (!scroll || !taskTrace || !composer) return null
+    const scrollRect = scroll.getBoundingClientRect()
+    const taskTraceRect = taskTrace.getBoundingClientRect()
+    const composerRect = composer.getBoundingClientRect()
+    const visual = (element: HTMLElement) => {
+      const style = getComputedStyle(element)
+      return {
+        minHeight: style.minHeight,
+        borderRadius: style.borderRadius,
+        paddingLeft: style.paddingLeft,
+        paddingRight: style.paddingRight,
+        fontSize: style.fontSize,
+        fontWeight: style.fontWeight,
+        lineHeight: style.lineHeight,
+      }
+    }
+    return {
+      scroll: {
+        top: scrollRect.top,
+        height: scrollRect.height,
+        centerY: scrollRect.top + (scrollRect.height / 2),
+        centerX: scrollRect.left + (scrollRect.width / 2),
+        right: scrollRect.right,
+      },
+      taskTrace: {
+        top: taskTraceRect.top,
+        height: taskTraceRect.height,
+        centerY: taskTraceRect.top + (taskTraceRect.height / 2),
+        left: taskTraceRect.left,
+        right: taskTraceRect.right,
+      },
+      composerTop: composerRect.top,
+      composerCenterX: composerRect.left + (composerRect.width / 2),
+      composerRight: composerRect.right,
+      scrollVisual: visual(scroll),
+      taskTraceVisual: visual(taskTrace),
+    }
+  })
+  expect(auxiliaryAlignment).not.toBeNull()
+  expect(Math.abs((auxiliaryAlignment?.scroll.top ?? 0) - (auxiliaryAlignment?.taskTrace.top ?? 0)))
+    .toBeLessThanOrEqual(0.5)
+  expect(Math.abs((auxiliaryAlignment?.scroll.height ?? 0) - (auxiliaryAlignment?.taskTrace.height ?? 0)))
+    .toBeLessThanOrEqual(0.5)
+  expect(Math.abs((auxiliaryAlignment?.scroll.centerY ?? 0) - (auxiliaryAlignment?.taskTrace.centerY ?? 0)))
+    .toBeLessThanOrEqual(0.5)
+  expect(Math.abs((auxiliaryAlignment?.scroll.centerX ?? 0) - (auxiliaryAlignment?.composerCenterX ?? 0)))
+    .toBeLessThanOrEqual(0.5)
+  expect(Math.abs((auxiliaryAlignment?.taskTrace.right ?? 0) - (auxiliaryAlignment?.composerRight ?? 0)))
+    .toBeLessThanOrEqual(0.5)
+  expect(auxiliaryAlignment?.scroll.right).toBeLessThan(auxiliaryAlignment?.taskTrace.left ?? 0)
+  expect((auxiliaryAlignment?.scroll.top ?? 0) + (auxiliaryAlignment?.scroll.height ?? 0))
+    .toBeLessThanOrEqual(auxiliaryAlignment?.composerTop ?? 0)
+  expect(auxiliaryAlignment?.scrollVisual).toEqual(auxiliaryAlignment?.taskTraceVisual)
+  for (const width of [768, 1023, 1024, 1440]) {
+    await page.setViewportSize({ width, height: 900 })
+    const responsiveAlignment = await page.evaluate(() => {
+      const scroll = document.querySelector<HTMLElement>('.scroll-to-bottom')
+      const taskTrace = document.querySelector<HTMLElement>('.todo-trace-launcher')
+      const composer = document.querySelector<HTMLElement>('.composer')
+      if (!scroll || !taskTrace || !composer) return null
+      const scrollRect = scroll.getBoundingClientRect()
+      const taskTraceRect = taskTrace.getBoundingClientRect()
+      const composerRect = composer.getBoundingClientRect()
+      return {
+        centerDelta: Math.abs(
+          (scrollRect.left + (scrollRect.width / 2))
+          - (composerRect.left + (composerRect.width / 2)),
+        ),
+        rightDelta: Math.abs(taskTraceRect.right - composerRect.right),
+        verticalDelta: Math.abs(
+          (scrollRect.top + (scrollRect.height / 2))
+          - (taskTraceRect.top + (taskTraceRect.height / 2)),
+        ),
+        overlap: Math.max(0, scrollRect.right - taskTraceRect.left),
+        overflow: Math.max(
+          document.documentElement.scrollWidth - document.documentElement.clientWidth,
+          document.body.scrollWidth - document.body.clientWidth,
+        ),
+      }
+    })
+    expect(responsiveAlignment).not.toBeNull()
+    expect(responsiveAlignment?.centerDelta).toBeLessThanOrEqual(0.5)
+    expect(responsiveAlignment?.rightDelta).toBeLessThanOrEqual(0.5)
+    expect(responsiveAlignment?.verticalDelta).toBeLessThanOrEqual(0.5)
+    expect(responsiveAlignment?.overlap).toBe(0)
+    expect(responsiveAlignment?.overflow).toBeLessThanOrEqual(0)
+  }
   await page.waitForTimeout(2_000)
+  await expect(scrollButton).toBeVisible()
+  await pane.focus()
+  await page.waitForTimeout(1_800)
+  await expect(scrollButton).toHaveCount(0)
+  await pane.evaluate((element) => {
+    element.dispatchEvent(new WheelEvent('wheel', { deltaY: 120, bubbles: true }))
+    element.scrollTop += 120
+    element.dispatchEvent(new Event('scroll', { bubbles: true }))
+  })
   await expect(scrollButton).toBeVisible()
 })
 
@@ -2616,7 +3016,20 @@ test('布局动效不逐帧触发布局且冷缓存只请求允许的西文字�
       fontResponses.set(response.url(), response.body())
     }
   })
-  await mockStudio(page)
+  await mockStudio(page, {
+    taskTrace: {
+      status: 'ready',
+      todoGroups: [{
+        id: 'todo-group:browser-run',
+        userMessageId: 'browser-message-1',
+        userMessagePreview: '浏览器历史消息 1',
+        groupToolCallId: 'browser-task-trace-tool',
+        createdAt: BASE_TIME,
+        status: 'completed',
+        todos: [{ id: 'browser-todo', content: '验证布局性能', status: 'completed' }],
+      }],
+    },
+  })
   await page.evaluate(() => document.fonts.ready)
 
   const westernFonts = [...fontResponses.entries()].filter(([url]) => (
@@ -2648,7 +3061,7 @@ test('布局动效不逐帧触发布局且冷缓存只请求允许的西文字�
   const before = await layoutCount()
   await page.getByRole('button', { name: '收起侧边栏' }).click()
   await page.waitForTimeout(400)
-  await page.getByRole('button', { name: '打开任务抽屉' }).click()
+  await page.getByRole('button', { name: '任务轨迹 1' }).click()
   await page.waitForTimeout(400)
   const layoutDelta = (await layoutCount()) - before
   await session.send('Tracing.end')

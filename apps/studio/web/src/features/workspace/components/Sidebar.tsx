@@ -27,9 +27,7 @@ import {
 import type { KeyboardEvent as ReactKeyboardEvent, MouseEvent } from 'react'
 
 import type { AuthUser } from '../../../api/auth/types'
-import { BrandMark } from '../../../components/ui/BrandMark'
-import { Button, IconButton, OverlayScrollbar, UserAvatar } from '../../../components/ui'
-import { TRANSIENT_THREAD_ID } from '../../../lib/workspace'
+import { BrandLogo, Button, IconButton, OverlayScrollbar, UserAvatar } from '../../../components/ui'
 import { useI18n } from '../../../i18n'
 import type { Conversation, WorkspaceState } from '../../../types'
 import { groupConversationHistory } from '../historyGroups'
@@ -216,8 +214,6 @@ export function Sidebar({
     ? workspace.conversations.find((item) => item.threadId === openMenu.threadId)
     : undefined
   const isOverlayHidden = mode === 'overlay' && !overlayOpen
-  const isNewConversation = workspace.currentThreadId === TRANSIENT_THREAD_ID
-
   const capturePaginationAnchor = useCallback(() => {
     const root = historyScrollRef.current
     if (!root) return
@@ -578,9 +574,7 @@ export function Sidebar({
         >
           <div className={`sidebar-head${isSearchOpen ? ' is-search-open' : ''}`}>
             <a className="brand" href="#top" aria-label={t('TinkerFin 首页')}>
-              <BrandMark size={30} />
-              <span className="brand-name">TinkerFin</span>
-              <small className="brand-plus">Plus</small>
+              <BrandLogo size="md" />
             </a>
             <div className="sidebar-head-actions">
               <IconButton
@@ -632,11 +626,9 @@ export function Sidebar({
               className="new-chat"
               size="lg"
               variant="ghost"
-              selected={isNewConversation}
               leadingIcon={<SquarePen size={18} />}
               trailingIcon={<kbd className="new-chat-shortcut">⌘ K</kbd>}
               aria-keyshortcuts="Meta+K"
-              title={t('Command + K 开启新会话')}
               onClick={onNew}
             >
               {t('新会话')}
@@ -795,7 +787,7 @@ export function Sidebar({
             aria-expanded="false"
             onClick={onToggleMode}
           />
-          <IconButton label={t('新会话')} tooltip={t('新会话')} icon={<SquarePen size={18} />} selected={isNewConversation} tabIndex={railInteractive ? 0 : -1} onClick={onNew} />
+          <IconButton label={t('新会话')} icon={<SquarePen size={18} />} tabIndex={railInteractive ? 0 : -1} onClick={onNew} />
           <IconButton
             label={historyQuery ? t('搜索会话，当前查询：{query}', { query: historyQuery }) : t('搜索会话')}
             tooltip={t('搜索会话')}

@@ -103,13 +103,14 @@ const detail = (): ConversationHistoryDetail => ({
   interactions: [],
   status: { execution: 'succeeded', headRunId: 'run-1' },
   completeness: { missingPrefix: false, missingTail: false, payloadOmitted: false },
+  taskTrace: { status: 'ready', todoGroups: [] },
   createdAt: '2026-08-28T00:00:00',
   updatedAt: '2026-08-28T00:00:03',
 })
 
 describe('Trace conversation projection', () => {
   it('hydrates messages, tools, reasoning, todos and status without AG-UI replay', () => {
-    const restored = restoreConversationFromTrace(detail(), { model: 'fallback' })
+    const restored = restoreConversationFromTrace(detail(), { model: 'fallback', includeTaskTrace: true })
 
     expect(restored.runStatus).toBe('idle')
     expect(restored.mode).toBe('plan')
@@ -130,11 +131,17 @@ describe('Trace conversation projection', () => {
     })
     expect(restored.lastSeq).toBeUndefined()
     expect(restored.trace?.asOfSeq).toBe(8)
+    expect(restored.trace).not.toHaveProperty('taskTrace')
+    expect(restored.taskTrace).toEqual({
+      phase: 'ready',
+      snapshot: { status: 'ready', todoGroups: [] },
+    })
   })
 
   it('preserves a caller-owned Messaging cursor across Trace projection', () => {
     const restored = restoreConversationFromTrace(detail(), {
       model: 'fallback',
+      includeTaskTrace: true,
       lastDeliveredSeq: 73,
     })
 
@@ -163,7 +170,7 @@ describe('Trace conversation projection', () => {
       },
     ]
 
-    const restored = restoreConversationFromTrace(source, { model: 'fallback' })
+    const restored = restoreConversationFromTrace(source, { model: 'fallback', includeTaskTrace: true })
 
     expect(restored.messages.filter((message) => (
       message.role === 'user' || message.role === 'assistant'
@@ -213,7 +220,7 @@ describe('Trace conversation projection', () => {
       completedAt: null,
     }]
 
-    const restored = restoreConversationFromTrace(source, { model: 'fallback' })
+    const restored = restoreConversationFromTrace(source, { model: 'fallback', includeTaskTrace: true })
     const subagent = restored.messages.find((message) => message.role === 'subagent')
 
     expect(subagent?.meta?.result).toBe('第一段子任务输出\n\n第二段子任务输出')
@@ -285,7 +292,7 @@ describe('Trace conversation projection', () => {
       },
     ]
 
-    const restored = restoreConversationFromTrace(source, { model: 'fallback' })
+    const restored = restoreConversationFromTrace(source, { model: 'fallback', includeTaskTrace: true })
     const results = Object.fromEntries(
       restored.messages
         .filter((message) => message.role === 'tool')
@@ -305,7 +312,7 @@ describe('Trace conversation projection', () => {
   })
 
   it('applies id-based semantic deltas and replaces state atomically', () => {
-    const initial = restoreConversationFromTrace(detail(), { model: 'fallback' })
+    const initial = restoreConversationFromTrace(detail(), { model: 'fallback', includeTaskTrace: true })
 
     const updated = applyConversationTraceUpdate(initial, {
       asOfSeq: 10,
@@ -327,7 +334,7 @@ describe('Trace conversation projection', () => {
       messageCount: 2,
       toolCallCount: 1,
       projections: {},
-    })
+    }, null, true)
 
     expect(updated.trace?.asOfSeq).toBe(10)
     expect(updated.messages.find((message) => message.role === 'assistant')?.content)
@@ -335,6 +342,7 @@ describe('Trace conversation projection', () => {
     expect(updated.messages.some((message) => message.role === 'tool')).toBe(false)
     expect(updated.todos).toEqual([])
     expect(updated.runStatus).toBe('error')
+    expect(updated.taskTrace).toBe(initial.taskTrace)
   })
 
   it('reconstructs stable multi-action approval IDs from native Trace facts', () => {
@@ -383,7 +391,7 @@ describe('Trace conversation projection', () => {
       { ...source.nodes[0]!, id: 'tool-a', status: 'waiting', sourceId: 'call-a' },
     ]
 
-    const restored = restoreConversationFromTrace(source, { model: 'fallback' })
+    const restored = restoreConversationFromTrace(source, { model: 'fallback', includeTaskTrace: true })
 
     expect(restored.approval?.items.map((item) => item.interruptId)).toEqual([
       'native-interrupt#0',
@@ -461,7 +469,7 @@ describe('Trace conversation projection', () => {
       },
     ]
 
-    const restored = restoreConversationFromTrace(source, { model: 'fallback' })
+    const restored = restoreConversationFromTrace(source, { model: 'fallback', includeTaskTrace: true })
 
     expect(restored.approval?.items.map((item) => ({
       toolCallId: item.toolCallId,
@@ -548,7 +556,7 @@ describe('Trace conversation projection', () => {
       },
     ]
 
-    const restored = restoreConversationFromTrace(source, { model: 'fallback' })
+    const restored = restoreConversationFromTrace(source, { model: 'fallback', includeTaskTrace: true })
 
     expect(restored.approval?.items.map((item) => ({
       interruptId: item.interruptId,
@@ -599,7 +607,7 @@ describe('Trace conversation projection', () => {
       },
     ]
 
-    expect(() => restoreConversationFromTrace(source, { model: 'fallback' }))
+    expect(() => restoreConversationFromTrace(source, { model: 'fallback', includeTaskTrace: true }))
       .toThrowError('stream_event_invalid')
   })
 
@@ -641,7 +649,7 @@ describe('Trace conversation projection', () => {
       resolvedAt: null,
     }]
 
-    const restored = restoreConversationFromTrace(source, { model: 'fallback' })
+    const restored = restoreConversationFromTrace(source, { model: 'fallback', includeTaskTrace: true })
 
     expect(restored.planInteraction).toMatchObject({
       kind: 'questions',

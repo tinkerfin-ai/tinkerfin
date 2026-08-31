@@ -1,4 +1,3 @@
-import { ArrowDown } from 'lucide-react'
 import { useMemo, type RefObject } from 'react'
 
 import { Button, ErrorBoundary, OverlayScrollbar } from '../../../components/ui'
@@ -11,13 +10,11 @@ import { ApprovalStatusRow } from '../../conversation/components/ApprovalCard'
 import { ConversationNotice, MessageBlock, ToolCallBatch } from '../../conversation/components/MessageBlock'
 import { PlanQuestionStatusRow } from '../../conversation/components/PlanQuestionComposer'
 import { PlanReviewStatusRow } from '../../conversation/components/PlanReviewCard'
+import { UpdateTasksRow } from '../../conversation/todoTrace/components/UpdateTasksRow'
+import type { ConversationDisplayEntry } from '../../conversation/todoTrace/displayEntries'
 import { EmptyConversation } from './EmptyConversation'
 import { WorkspaceStatus } from './WorkspaceStatus'
 import { useI18n } from '../../../i18n'
-
-export type ConversationDisplayEntry =
-  | { type: 'message'; message: Message }
-  | { type: 'tools'; messages: Message[] }
 
 function collectCopyableAssistantIds(entries: ConversationDisplayEntry[], currentTurnRunning: boolean) {
   const copyableIds = new Set<string>()
@@ -28,6 +25,10 @@ function collectCopyableAssistantIds(entries: ConversationDisplayEntry[], curren
 
   for (const entry of entries) {
     if (entry.type === 'tools') {
+      candidate = null
+      continue
+    }
+    if (entry.type === 'todo-group') {
       candidate = null
       continue
     }
@@ -64,18 +65,12 @@ export function ConversationViewport({
   isHydrating,
   isHydrationFailed,
   isRunning,
-  showScrollToBottom,
-  fadeScrollToBottom,
+  backgroundInert = false,
   onScroll,
   onUserScrollIntent,
   onRetryHistory,
   onRetryHydration,
   onLoadEarlierMessages,
-  onScrollToBottom,
-  onScrollToBottomPointerEnter,
-  onScrollToBottomPointerLeave,
-  onScrollToBottomFocus,
-  onScrollToBottomBlur,
 }: {
   conversation: Conversation
   entries: ConversationDisplayEntry[]
@@ -89,18 +84,12 @@ export function ConversationViewport({
   isHydrating: boolean
   isHydrationFailed: boolean
   isRunning: boolean
-  showScrollToBottom: boolean
-  fadeScrollToBottom: boolean
+  backgroundInert?: boolean
   onScroll: (pane: HTMLElement) => void
   onUserScrollIntent: () => void
   onRetryHistory: () => void
   onRetryHydration: () => void
   onLoadEarlierMessages: (trigger: HTMLButtonElement) => void
-  onScrollToBottom: () => void
-  onScrollToBottomPointerEnter: () => void
-  onScrollToBottomPointerLeave: () => void
-  onScrollToBottomFocus: () => void
-  onScrollToBottomBlur: () => void
 }) {
   const { t } = useI18n()
   const isEmpty = conversation.messages.length === 0 && !conversation.notice
@@ -116,7 +105,11 @@ export function ConversationViewport({
         <WorkspaceStatus kind="error" title={t('对话区域无法显示')} description={t('消息渲染遇到问题，其他工作区功能仍可继续使用')} onRetry={reset} />
       )}
     >
-      <div className="conversation-region">
+      <div
+        className="conversation-region"
+        aria-hidden={backgroundInert || undefined}
+        inert={backgroundInert || undefined}
+      >
         {/* 命名 section 是主对话滚动区，必须可由键盘直接进入 */}
         {/* eslint-disable jsx-a11y/no-noninteractive-tabindex */}
         <section
@@ -152,7 +145,9 @@ export function ConversationViewport({
             )}
             {entries.map((entry) => entry.type === 'tools'
               ? <ToolCallBatch key={`batch-${entry.messages[0].id}`} messages={entry.messages} />
-              : <MessageBlock
+              : entry.type === 'todo-group'
+                ? <UpdateTasksRow key={entry.group.id} group={entry.group} message={entry.message} />
+                : <MessageBlock
                   key={entry.message.id}
                   message={entry.message}
                   showActions={copyableAssistantIds.has(entry.message.id)}
@@ -175,24 +170,6 @@ export function ConversationViewport({
         </section>
         {/* eslint-enable jsx-a11y/no-noninteractive-tabindex */}
         <OverlayScrollbar viewportRef={paneRef} visibility="persistent" />
-        <div className="conversation-scroll-action" aria-hidden={!showScrollToBottom || undefined}>
-          <button
-            type="button"
-            className={`scroll-to-bottom${showScrollToBottom ? ' is-visible' : ''}${fadeScrollToBottom ? ' is-fading' : ''}`}
-            aria-label={t('回到底部')}
-            aria-hidden={!showScrollToBottom || undefined}
-            tabIndex={showScrollToBottom ? 0 : -1}
-            title={t('回到底部')}
-            onPointerEnter={onScrollToBottomPointerEnter}
-            onPointerLeave={onScrollToBottomPointerLeave}
-            onFocus={onScrollToBottomFocus}
-            onBlur={onScrollToBottomBlur}
-            onClick={onScrollToBottom}
-          >
-            <ArrowDown size={16} aria-hidden="true" />
-            <span>{t('回到底部')}</span>
-          </button>
-        </div>
       </div>
     </ErrorBoundary>
   )

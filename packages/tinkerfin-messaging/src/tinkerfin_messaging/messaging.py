@@ -30,8 +30,10 @@ from ._messaging_boundary import (
 from ._messaging_boundary import (
     _normalize_cancel_callback as _normalize_cancel_callback,
 )
+from ._messaging_ledger import _MessagingLedger
 from ._producer_runtime import _ProducedMessage
-from .backend import MemoryBackend, MessagingBackend, PreparedRun, RunStatus
+from .backend import MemoryBackend, RunStatus, _PreparedRun
+from .backend_contract import MessagingBackend
 from .errors import (
     CodecMismatch,
     MessagingClosed,
@@ -95,27 +97,58 @@ CommittedCallback: TypeAlias = Callable[[MessageEnvelope], Awaitable[None]]
 
 
 class MessageSubscription(Generic[ReplayT]):
-    """Decode one run-bounded replay and close its backend iterator exactly once."""
+    """Decode one channel-created run replay and close it exactly once.
 
-    def __init__(
-        self,
+    Instances are returned by ``MessageChannel.wrap()`` and
+    ``MessageChannel.follow()``. Direct construction is unsupported because the channel
+    must first bind the codec, exact generation, cursor, and parent Messaging lifecycle.
+    A subscription is single-use; its consumer owns iteration and may call ``aclose()``
+    to detach without cancelling the producer.
+    """
+
+    _ledger: _MessagingLedger
+    _prepared: _PreparedRun
+    _codec: MessageCodec[object, ReplayT]
+    _renderer: SseRenderer[ReplayT] | None
+    _claimed: bool
+    _delivery: AsyncIterator[DecodedMessage[ReplayT]] | None
+    _backend_iterator: AsyncIterator[object] | None
+    _backend_close_task: asyncio.Task[None] | None
+    _close_task: asyncio.Task[None] | None
+
+    def __init__(self) -> None:
+        """Reject construction that bypasses MessageChannel binding.
+
+        Raises:
+            TypeError: Always; obtain a subscription from ``wrap()`` or ``follow()``.
+        """
+
+        raise TypeError(
+            "MessageSubscription is created by MessageChannel.wrap() or follow()"
+        )
+
+    @classmethod
+    def _create(
+        cls,
         *,
-        backend: MessagingBackend,
-        prepared: PreparedRun,
+        ledger: _MessagingLedger,
+        prepared: _PreparedRun,
         codec: MessageCodec[object, ReplayT],
         renderer: SseRenderer[ReplayT] | None,
-    ) -> None:
-        """Initialize a lazy single-use decoder over one prepared run."""
+    ) -> Self:
+        """Create a lazy decoder after the channel has completed durable binding."""
 
-        self._backend = backend
-        self._prepared = prepared
-        self._codec = codec
-        self._renderer = renderer
-        self._claimed = False
-        self._delivery: AsyncIterator[DecodedMessage[ReplayT]] | None = None
-        self._backend_iterator: AsyncIterator[object] | None = None
-        self._backend_close_task: asyncio.Task[None] | None = None
-        self._close_task: asyncio.Task[None] | None = None
+        subscription = cls.__new__(cls)
+        subscription._ledger = ledger
+        subscription._prepared = prepared
+        subscription._codec = codec
+        subscription._renderer = renderer
+        subscription._claimed = False
+        subscription._delivery = None
+        subscription._backend_iterator = None
+        subscription._backend_close_task = None
+        subscription._close_task = None
+        return subscription
 
     def __aiter__(self) -> AsyncIterator[DecodedMessage[ReplayT]]:
         """Claim and return the subscription's one decoded iterator."""
@@ -127,7 +160,7 @@ class MessageSubscription(Generic[ReplayT]):
     async def _iterate(self) -> AsyncGenerator[DecodedMessage[ReplayT], None]:
         backend_iterator = _read_backend(
             "follow",
-            lambda: self._backend.follow(
+            lambda: self._ledger.follow(
                 self._prepared.handle,
                 after=self._prepared.after,
             ),
@@ -702,8 +735,10 @@ class Messaging:
         self._backend: MessagingBackend = (
             MemoryBackend() if backend is None else backend
         )
+        self._ledger = _MessagingLedger(self._backend)
         self._settlement_timeout = resolved_timeout
         self._state = "new"
+        self._storage_setup_task: asyncio.Task[None] | None = None
         self._preflight_tasks: set[_PreflightRegistration] = set()
         self._producer_tasks: set[asyncio.Task[None]] = set()
         self._settling_producers: set[asyncio.Task[None]] = set()
@@ -711,19 +746,72 @@ class Messaging:
 
     @property
     def backend(self) -> MessagingBackend:
-        """Return the fixed backend that owns this facade's complete lifecycle."""
+        """Return the borrowed storage backend fixed at construction time."""
 
         return self._backend
 
+    @property
+    def _runtime_backend(self) -> _MessagingLedger:
+        """Return the private framework lifecycle coordinator."""
+
+        return self._ledger
+
     async def __aenter__(self) -> Self:
-        """Open this single-use Messaging lifecycle."""
+        """Prepare storage and open this single-use Messaging lifecycle.
+
+        Storage preparation is retained by the facade when this caller is cancelled.
+        Another enter cannot overlap that preparation, and closing waits for the owned
+        preparation task before the facade becomes permanently closed.
+
+        Returns:
+            This open Messaging facade after storage preparation succeeds.
+
+        Raises:
+            MessagingClosed: The facade is opening, open, closing, or already closed.
+            BaseException: Storage preparation fails or this caller is cancelled.
+        """
 
         if self._state == "closed":
             raise MessagingClosed("Messaging is closed")
         if self._state != "new":
             raise MessagingClosed("Messaging is already open")
+        # Publishing ``opening`` before the first await makes the single-use check
+        # authoritative for concurrent enter and close callers.
+        self._state = "opening"
+        setup_task = self._storage_setup_task
+        if (
+            setup_task is not None
+            and setup_task.done()
+            and (setup_task.cancelled() or setup_task.exception() is not None)
+        ):
+            self._storage_setup_task = None
+            setup_task = None
+        if setup_task is None:
+            setup_task = asyncio.create_task(
+                self._ledger.prepare_storage(),
+                name="tinkerfin-messaging-prepare-storage",
+            )
+            setup_task.add_done_callback(self._storage_setup_finished)
+            self._storage_setup_task = setup_task
+        try:
+            await asyncio.shield(setup_task)
+        except BaseException:
+            # Caller cancellation does not cancel the retained setup task. A later
+            # enter may join it, unless close has already claimed the lifecycle.
+            if self._state == "opening":
+                self._state = "new"
+            raise
+        if self._state != "opening":
+            raise MessagingClosed("Messaging closed during storage preparation")
         self._state = "open"
         return self
+
+    @staticmethod
+    def _storage_setup_finished(task: asyncio.Task[None]) -> None:
+        """Consume a retained storage preparation failure between callers."""
+
+        if not task.cancelled():
+            task.exception()
 
     async def __aexit__(
         self,
@@ -799,6 +887,13 @@ class Messaging:
 
         primary: BaseException | None = None
         try:
+            setup_task = self._storage_setup_task
+            if setup_task is not None:
+                try:
+                    await _join_owned_task(setup_task)
+                except BaseException as setup_error:  # noqa: BLE001 - preserve outcome
+                    primary = setup_error
+
             # A cancellation preflight can be waiting for the producer's durable
             # terminal. Signal existing producers before joining preflights so close,
             # cancel, and settlement cannot form a wait cycle.
@@ -930,7 +1025,7 @@ class Messaging:
     def _start_producer(
         self,
         *,
-        prepared: PreparedRun,
+        prepared: _PreparedRun,
         source: MessageSource[ProducedT],
         codec: MessageCodec[SourceT, ReplayT],
         codec_input: Callable[[ProducedT], SourceT] | None,
@@ -950,7 +1045,7 @@ class Messaging:
     async def _open_recoverable_source(
         self,
         *,
-        prepared: PreparedRun,
+        prepared: _PreparedRun,
         source: RecoverableSource[SourceT],
     ) -> MessageSource[RecoverableMessage[SourceT]]:
         """Keep distributed ownership alive while a source rebuilds its state."""
@@ -964,7 +1059,7 @@ class Messaging:
     def _start_recoverable_producer(
         self,
         *,
-        prepared: PreparedRun,
+        prepared: _PreparedRun,
         source: MessageSource[RecoverableMessage[SourceT]],
         codec: MessageCodec[SourceT, ReplayT],
         cancel: _ContextCancelCallback[RecoverableMessage[SourceT]] | None,
@@ -982,7 +1077,7 @@ class Messaging:
     def _start_producer_task(
         self,
         *,
-        prepared: PreparedRun,
+        prepared: _PreparedRun,
         source: MessageSource[ProducedT],
         codec: MessageCodec[SourceT, ReplayT],
         cancel: _ContextCancelCallback[ProducedT] | None,

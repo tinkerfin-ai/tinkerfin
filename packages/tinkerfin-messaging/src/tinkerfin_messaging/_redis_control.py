@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 __all__ = [
-    "_delete_owned_generation",
     "_eval",
     "_is_current_generation",
     "_keys",
     "_keys_for_handle",
     "_raise_stream_deleted",
     "_read_control",
+    "_reconcile_current_run_status",
     "_run_snapshot",
     "_scope",
     "_settled_run_snapshot",
@@ -19,7 +19,6 @@ __all__ = [
     "_socket_timeout_budget",
     "_wait_block_ms",
     "_wait_for_snapshot_change",
-    "get_run_status",
 ]
 
 import asyncio
@@ -49,10 +48,15 @@ from ._redis_scripts import (
     _RUN_SNAPSHOT_SCRIPT,
 )
 from .backend import (
-    BackendRunHandle,
     FinalRunStatus,
     RunStatus,
+    _BackendRunHandle,
     is_final_run_status,
+)
+from .backend_contract import (
+    MessagingCleanupReason,
+    StreamGenerationPurge,
+    StreamGenerationPurgeResult,
 )
 from .errors import (
     BackendOwnershipLost,
@@ -66,7 +70,7 @@ from .errors import (
     StreamExpired,
     UnexpectedMessagingBackendError,
 )
-from .models import MessageEnvelope
+from .models import MessageEnvelope, RecoveryCheckpoint
 
 if TYPE_CHECKING:
     from .redis import RedisBackend
@@ -182,6 +186,8 @@ class _AsyncRedisClient(Protocol):
 
     async def hgetall(self, name: str) -> dict[bytes, bytes]: ...
 
+    async def time(self) -> tuple[int, int]: ...
+
     async def exists(self, *names: str) -> int: ...
 
     async def srandmember(
@@ -250,36 +256,6 @@ class _RedisKeys:
 
 
 @dataclass(frozen=True, slots=True)
-class _RedisGenerationKeys:
-    """Name only the keys required for resumable generation cleanup."""
-
-    control: str
-    delete_lease: str
-    index: str
-    tombstone: str
-    generation: int
-
-
-class _GenerationCleanupKeys(Protocol):
-    """Structural key subset shared by explicit deletion and expiry."""
-
-    @property
-    def control(self) -> str: ...
-
-    @property
-    def delete_lease(self) -> str: ...
-
-    @property
-    def index(self) -> str: ...
-
-    @property
-    def tombstone(self) -> str: ...
-
-    @property
-    def generation(self) -> int: ...
-
-
-@dataclass(frozen=True, slots=True)
 class _StreamControl:
     """Describe the authoritative generation and deletion state."""
 
@@ -301,6 +277,25 @@ class _RunSnapshot:
     lease_last_success_seconds: int
     lease_last_success_microseconds: int
     messages: tuple[MessageEnvelope, ...]
+    observed_seconds: int
+    observed_microseconds: int
+    start_seq: int
+    settling: bool
+    cancellable: bool
+    recoverable: bool
+    owner_token: str
+    fence: int
+    checkpoint: RecoveryCheckpoint | None
+    active_run_id: str
+    latest_seq: int
+    payload_bytes: int
+    fence_counter: int
+    codec_id: str
+    max_message_payload_bytes: int
+    max_checkpoint_bytes: int
+    max_thread_messages: int
+    max_thread_payload_bytes: int
+    retention_ms: int
 
     @property
     def terminal(self) -> bool:
@@ -309,7 +304,7 @@ class _RunSnapshot:
         return is_final_run_status(self.status)
 
 
-async def begin_settlement(self: RedisBackend, handle: BackendRunHandle) -> bool:
+async def begin_settlement(self: RedisBackend, handle: _BackendRunHandle) -> bool:
     """Atomically choose an accepted cancellation or ordinary settlement."""
 
     generation = handle.generation
@@ -344,7 +339,7 @@ async def begin_settlement(self: RedisBackend, handle: BackendRunHandle) -> bool
 
 async def finish(
     self: RedisBackend,
-    handle: BackendRunHandle,
+    handle: _BackendRunHandle,
     *,
     status: FinalRunStatus,
     error: BaseException | None = None,
@@ -407,7 +402,7 @@ async def finish(
         )
 
 
-async def request_cancel(self: RedisBackend, handle: BackendRunHandle) -> bool:
+async def request_cancel(self: RedisBackend, handle: _BackendRunHandle) -> bool:
     """Record one idempotent cancellation request for a cancellable active run."""
 
     keys = await self._keys_for_handle(handle)
@@ -431,37 +426,13 @@ async def request_cancel(self: RedisBackend, handle: BackendRunHandle) -> bool:
     return True
 
 
-async def wait_for_cancel(self: RedisBackend, handle: BackendRunHandle) -> bool:
-    """Wait for cancellation or terminal settlement without polling past deletion."""
-
-    keys = await self._keys_for_handle(handle)
-    while True:
-        snapshot = await self._settled_run_snapshot(keys, handle.identity)
-        if snapshot.status == "cancel_requested":
-            return True
-        if snapshot.terminal:
-            return False
-        await self._wait_for_snapshot_change(keys, snapshot)
-
-
-async def wait_finished(self: RedisBackend, handle: BackendRunHandle) -> RunStatus:
-    """Wait until the bound generation reaches one authoritative terminal status."""
-
-    keys = await self._keys_for_handle(handle)
-    while True:
-        snapshot = await self._settled_run_snapshot(keys, handle.identity)
-        if snapshot.terminal:
-            return snapshot.status
-        await self._wait_for_snapshot_change(keys, snapshot)
-
-
-async def get_run_status(
+async def _reconcile_current_run_status(
     self: RedisBackend,
     *,
     channel: str,
     identity: RunIdentity,
 ) -> RunStatus:
-    """Return current status while atomically archiving an expired owner lease."""
+    """Reconcile and return current status through the atomic Redis snapshot."""
 
     required_identifier("channel", channel)
     required_identity(identity)
@@ -490,17 +461,7 @@ async def get_run_status(
         return snapshot.status
 
 
-async def failure(self: RedisBackend, handle: BackendRunHandle) -> BaseException | None:
-    """Reconstruct bounded remote failure evidence for a settled producer."""
-
-    keys = await self._keys_for_handle(handle)
-    snapshot = await self._settled_run_snapshot(keys, handle.identity)
-    if not snapshot.error_class and not snapshot.error_message:
-        return None
-    return self._remote_error(snapshot)
-
-
-async def renew(self: RedisBackend, handle: BackendRunHandle) -> bool:
+async def renew(self: RedisBackend, handle: _BackendRunHandle) -> bool:
     """Renew a lease only while its complete fencing identity still matches."""
 
     generation = handle.generation
@@ -542,52 +503,78 @@ async def renew(self: RedisBackend, handle: BackendRunHandle) -> bool:
     return True
 
 
-async def delete_stream(
-    self: RedisBackend, *, channel: str, identity: RunIdentity
-) -> None:
-    """Delete one stream through a leased, generation-fenced cleanup."""
+async def _generation_tombstone_reason(
+    self: RedisBackend,
+    keys: _RedisKeys,
+) -> MessagingCleanupReason | None:
+    value = await _redis_call(
+        "generation cleanup tombstone lookup",
+        self._client.get(keys.tombstone),
+    )
+    if value is None:
+        return None
+    reason = self._text(value)
+    if reason not in {"deleted", "expired"}:
+        raise _redis_protocol_error("Redis generation cleanup tombstone is invalid")
+    return cast(MessagingCleanupReason, reason)
 
-    required_identifier("channel", channel)
-    required_identity(identity)
-    scope = self._scope(channel, identity)
-    delete_owner = f"{self._worker_id}:delete:{uuid4().hex}"
+
+async def _claim_generation_cleanup(
+    self: RedisBackend,
+    *,
+    channel: str,
+    identity: RunIdentity,
+    generation: int,
+    reason: MessagingCleanupReason,
+    owner_token: str | None = None,
+) -> str | None:
+    """Acquire or join one exact Redis cleanup lease without deleting records."""
+
+    keys = self._keys(channel, identity, generation=generation)
+    resolved_owner_token = (
+        f"{self._worker_id}:cleanup:{uuid4().hex}"
+        if owner_token is None
+        else owner_token
+    )
     while True:
-        control = await self._read_control(scope)
-        generation = 1 if control is None else control.generation
-        keys = self._keys(
-            channel,
-            identity,
-            generation=generation,
-        )
-        expected_active_lease = ""
-        active_lease_key = f"{keys.generation_base}:no-active-lease"
-        if control is not None and control.state == "active":
+        if reason == "deleted":
             active_lease = await _redis_call(
                 "active lease lookup",
                 self._client.hget(keys.meta, "active_lease"),
             )
-            if active_lease is not None:
-                expected_active_lease = self._text(active_lease)
-                active_lease_key = expected_active_lease
-        response = await self._eval(
-            _BEGIN_DELETE_SCRIPT,
-            [
-                keys.control,
-                keys.meta,
-                keys.delete_lease,
-                active_lease_key,
-                keys.signals,
-            ],
-            [
-                str(generation),
-                delete_owner,
-                str(self._lease_ms),
-                expected_active_lease,
-            ],
-        )
+            expected_active_lease = (
+                "" if active_lease is None else self._text(active_lease)
+            )
+            active_lease_key = (
+                f"{keys.generation_base}:no-active-lease"
+                if not expected_active_lease
+                else expected_active_lease
+            )
+            response = await self._eval(
+                _BEGIN_DELETE_SCRIPT,
+                [
+                    keys.control,
+                    keys.meta,
+                    keys.delete_lease,
+                    active_lease_key,
+                    keys.signals,
+                ],
+                [
+                    str(generation),
+                    resolved_owner_token,
+                    str(self._lease_ms),
+                    expected_active_lease,
+                ],
+            )
+        else:
+            response = await self._eval(
+                _BEGIN_EXPIRATION_SCRIPT,
+                [keys.control, keys.delete_lease],
+                [str(generation), resolved_owner_token, str(self._lease_ms)],
+            )
         code = self._text(response[0])
-        if code == "DONE":
-            return
+        if code == "OWNED":
+            return resolved_owner_token
         if code == "ACTIVE":
             raise StreamDeleteConflict(
                 channel=channel,
@@ -597,127 +584,304 @@ async def delete_stream(
                     runId=self._text(response[1]),
                 ),
             )
-        if code in {"RETRY", "LEASE_LOST"}:
-            continue
         if code == "WAIT":
             await asyncio.sleep(self._poll_interval)
             continue
+        if code in {"DONE", "RETRY"}:
+            return None
         if code == "INVALID_CONTROL_STATE":
             raise _redis_protocol_error(
                 f"Redis stream control has invalid state: {self._text(response[1])!r}"
             )
-        if code != "OWNED":
-            raise _redis_protocol_error(f"unexpected Redis delete response: {code}")
-        if await self._delete_owned_generation(
-            keys=keys,
-            delete_owner=delete_owner,
-        ):
-            return
+        raise _redis_protocol_error(f"unexpected Redis cleanup claim response: {code}")
 
 
-async def _delete_owned_generation(
+async def _begin_generation_cleanup(
     self: RedisBackend,
     *,
-    keys: _GenerationCleanupKeys,
-    delete_owner: str,
-    working_state: Literal["deleting", "expiring"] = "deleting",
-    final_state: Literal["deleted", "expired"] = "deleted",
-) -> bool:
-    """Clear one fenced generation while periodically renewing ownership."""
+    channel: str,
+    identity: RunIdentity,
+    requested_reason: MessagingCleanupReason,
+) -> tuple[
+    int | None,
+    MessagingCleanupReason | None,
+    str | None,
+    bool,
+]:
+    """Seal one current generation and return its exact physical cleanup work."""
 
+    required_identifier("channel", channel)
+    required_identity(identity)
+    if requested_reason not in {"deleted", "expired"}:
+        raise TypeError("requested_reason must be deleted or expired")
+    scope = self._scope(channel, identity)
     while True:
+        control = await self._read_control(scope)
+        if control is None:
+            return None, None, None, False
+        if control.state in {"deleted", "expired"}:
+            return (
+                control.generation,
+                cast(MessagingCleanupReason, control.state),
+                None,
+                False,
+            )
+        if control.state == "active" and requested_reason == "expired":
+            return None, None, None, False
+        actual_reason: MessagingCleanupReason = (
+            "expired" if control.state == "expiring" else "deleted"
+        )
+        cleanup_token = await _claim_generation_cleanup(
+            self,
+            channel=channel,
+            identity=identity,
+            generation=control.generation,
+            reason=actual_reason,
+        )
+        if cleanup_token is not None:
+            return control.generation, actual_reason, cleanup_token, True
+
+
+async def _purge_stream_generation(
+    self: RedisBackend,
+    purge: StreamGenerationPurge,
+) -> StreamGenerationPurgeResult:
+    """Remove at most one requested Redis cleanup batch under an exact lease."""
+
+    required_identifier("channel", purge.channel)
+    required_identity(purge.identity)
+    if isinstance(purge.generation, bool) or not isinstance(purge.generation, int):
+        raise TypeError("generation must be an integer")
+    if purge.generation < 1:
+        raise ValueError("generation must be positive")
+    if isinstance(purge.maximum_records, bool) or not isinstance(
+        purge.maximum_records,
+        int,
+    ):
+        raise TypeError("maximum_records must be an integer")
+    if purge.maximum_records < 1:
+        raise ValueError("maximum_records must be positive")
+    cleanup_token = purge.cleanup_token
+    if not isinstance(cleanup_token, str) or not cleanup_token:
+        raise TypeError("cleanup_token must be a non-empty string")
+    scope = self._scope(purge.channel, purge.identity)
+    keys = self._keys(
+        purge.channel,
+        purge.identity,
+        generation=purge.generation,
+    )
+    while True:
+        control = await self._read_control(scope)
+        if control is None or control.generation != purge.generation:
+            tombstone = await _generation_tombstone_reason(self, keys)
+            if tombstone is not None:
+                return StreamGenerationPurgeResult(
+                    removed_records=0,
+                    complete=True,
+                )
+            raise _redis_protocol_error(
+                "Redis cleanup generation is neither current nor tombstoned"
+            )
+        if control.state in {"deleted", "expired"}:
+            return StreamGenerationPurgeResult(
+                removed_records=0,
+                complete=True,
+            )
+        if control.state == "active":
+            active_run = await _redis_call(
+                "active cleanup conflict lookup",
+                self._client.hget(keys.meta, "active_run"),
+            )
+            raise StreamDeleteConflict(
+                channel=purge.channel,
+                identity=purge.identity,
+                active_identity=RunIdentity(
+                    threadId=purge.identity.thread_id,
+                    runId=(
+                        purge.identity.run_id
+                        if active_run is None
+                        else self._text(active_run)
+                    ),
+                ),
+            )
+        reason: MessagingCleanupReason = (
+            "expired" if control.state == "expiring" else "deleted"
+        )
+        claimed_token = await _claim_generation_cleanup(
+            self,
+            channel=purge.channel,
+            identity=purge.identity,
+            generation=purge.generation,
+            reason=reason,
+            owner_token=cleanup_token,
+        )
+        if claimed_token is None:
+            continue
         raw_members = await _redis_call(
             "stream index read",
-            self._client.srandmember(keys.index, number=64),
+            self._client.srandmember(
+                keys.index,
+                number=purge.maximum_records,
+            ),
         )
         members = tuple(
             self._text(member)
             for member in cast(Sequence[bytes | str], raw_members or ())
         )
-        if members:
-            response = await self._eval(
-                _DELETE_BATCH_SCRIPT,
-                [keys.control, keys.delete_lease, keys.index, *members],
-                [
-                    str(keys.generation),
-                    delete_owner,
-                    str(self._lease_ms),
-                    working_state,
-                ],
+        if not members:
+            return StreamGenerationPurgeResult(
+                removed_records=0,
+                complete=True,
             )
-            code = self._text(response[0])
-            if code in {"RETRY", "LEASE_LOST"}:
-                return False
-            if code != "OK":
-                raise _redis_protocol_error(
-                    f"unexpected Redis delete batch response: {code}"
-                )
-            continue
-
         response = await self._eval(
-            _FINALIZE_DELETE_SCRIPT,
-            [keys.control, keys.delete_lease, keys.index, keys.tombstone],
+            _DELETE_BATCH_SCRIPT,
+            [keys.control, keys.delete_lease, keys.index, *members],
             [
                 str(keys.generation),
-                delete_owner,
-                working_state,
-                final_state,
+                claimed_token,
+                str(self._lease_ms),
+                "expiring" if reason == "expired" else "deleting",
             ],
         )
         code = self._text(response[0])
-        if code == "DONE":
-            return True
-        if code == "MORE":
-            continue
+        if code == "OK" and len(response) == 2:
+            remaining = self._snapshot_integer(
+                response[1],
+                field="cleanup records remaining",
+                minimum=0,
+            )
+            return StreamGenerationPurgeResult(
+                removed_records=len(members),
+                complete=remaining == 0,
+            )
         if code in {"RETRY", "LEASE_LOST"}:
-            return False
+            continue
+        raise _redis_protocol_error(f"unexpected Redis delete batch response: {code}")
+
+
+async def _finish_generation_cleanup(
+    self: RedisBackend,
+    *,
+    channel: str,
+    identity: RunIdentity,
+    generation: int,
+    reason: MessagingCleanupReason,
+    cleanup_token: str | None,
+) -> None:
+    """Finalize one empty Redis generation and retain its exact tombstone."""
+
+    required_identifier("channel", channel)
+    required_identity(identity)
+    if isinstance(generation, bool) or not isinstance(generation, int):
+        raise TypeError("generation must be an integer")
+    if generation < 1:
+        raise ValueError("generation must be positive")
+    if reason not in {"deleted", "expired"}:
+        raise TypeError("reason must be deleted or expired")
+    if not isinstance(cleanup_token, str) or not cleanup_token:
+        raise TypeError("cleanup_token must be a non-empty string")
+    scope = self._scope(channel, identity)
+    keys = self._keys(channel, identity, generation=generation)
+    while True:
+        control = await self._read_control(scope)
+        if control is None or control.generation != generation:
+            tombstone = await _generation_tombstone_reason(self, keys)
+            if tombstone == reason:
+                return
+            if tombstone is not None:
+                raise _redis_protocol_error(
+                    "Redis generation was finalized for a different cleanup reason"
+                )
+            raise _redis_protocol_error(
+                "Redis cleanup generation is neither current nor tombstoned"
+            )
+        if control.state in {"deleted", "expired"}:
+            if control.state != reason:
+                raise _redis_protocol_error(
+                    "Redis generation was finalized for a different cleanup reason"
+                )
+            return
+        expected_state = "expiring" if reason == "expired" else "deleting"
+        if control.state != expected_state:
+            raise _redis_protocol_error(
+                "Redis generation is not sealed for the requested cleanup"
+            )
+        claimed_token = await _claim_generation_cleanup(
+            self,
+            channel=channel,
+            identity=identity,
+            generation=generation,
+            reason=reason,
+            owner_token=cleanup_token,
+        )
+        if claimed_token is None:
+            continue
+        response = await self._eval(
+            _FINALIZE_DELETE_SCRIPT,
+            [keys.control, keys.delete_lease, keys.index, keys.tombstone],
+            [str(generation), claimed_token, expected_state, reason],
+        )
+        code = self._text(response[0])
+        if code == "DONE":
+            return
+        if code == "MORE":
+            raise _redis_protocol_error(
+                "Redis generation cleanup was finalized before purge completed"
+            )
+        if code in {"RETRY", "LEASE_LOST"}:
+            continue
         raise _redis_protocol_error(
             f"unexpected Redis delete finalization response: {code}"
         )
 
 
-async def _expire_generation(
+async def _complete_generation_cleanup(
     self: RedisBackend,
-    scope: _RedisStreamScope,
     *,
-    generation: int,
+    channel: str,
+    identity: RunIdentity,
+    requested_reason: MessagingCleanupReason,
 ) -> None:
-    """Resume lazy physical cleanup after the Redis deadline becomes authoritative."""
+    """Resume a raced cleanup through the same split Backend operations."""
 
-    generation_base = f"{scope.stream_base}:generation:{generation}"
-    keys = _RedisGenerationKeys(
-        control=scope.control,
-        delete_lease=scope.delete_lease,
-        index=f"{generation_base}:index",
-        tombstone=f"{generation_base}:tombstone",
-        generation=generation,
+    (
+        generation,
+        reason,
+        cleanup_token,
+        cleanup_required,
+    ) = await _begin_generation_cleanup(
+        self,
+        channel=channel,
+        identity=identity,
+        requested_reason=requested_reason,
     )
-    delete_owner = f"{self._worker_id}:expire:{uuid4().hex}"
+    if not cleanup_required:
+        return
+    if generation is None or reason is None or cleanup_token is None:
+        raise _redis_protocol_error(
+            "Redis cleanup begin returned incomplete ownership evidence"
+        )
     while True:
-        response = await self._eval(
-            _BEGIN_EXPIRATION_SCRIPT,
-            [keys.control, keys.delete_lease],
-            [str(generation), delete_owner, str(self._lease_ms)],
-        )
-        code = self._text(response[0])
-        if code == "DONE":
-            return
-        if code == "WAIT":
-            await asyncio.sleep(self._poll_interval)
-            continue
-        if code == "RETRY":
-            return
-        if code != "OWNED":
-            raise _redis_protocol_error(f"unexpected Redis expiration response: {code}")
-        completed = await _delete_owned_generation(
+        progress = await _purge_stream_generation(
             self,
-            keys=keys,
-            delete_owner=delete_owner,
-            working_state="expiring",
-            final_state="expired",
+            StreamGenerationPurge(
+                channel=channel,
+                identity=identity,
+                generation=generation,
+                maximum_records=64,
+                cleanup_token=cleanup_token,
+            ),
         )
-        if completed:
-            return
+        if progress.complete:
+            break
+    await _finish_generation_cleanup(
+        self,
+        channel=channel,
+        identity=identity,
+        generation=generation,
+        reason=reason,
+        cleanup_token=cleanup_token,
+    )
 
 
 def _scope(
@@ -778,7 +942,7 @@ async def _read_control(
     self: RedisBackend,
     scope: _RedisStreamScope,
 ) -> _StreamControl | None:
-    """Read control, atomically recognize deadlines, and resume expired cleanup."""
+    """Read and classify the current generation without physical cleanup."""
 
     while True:
         raw_response = await _redis_call(
@@ -817,16 +981,13 @@ async def _read_control(
             raise _redis_protocol_error(
                 f"Redis stream control has invalid state: {state!r}"
             )
-        if state == "expiring":
-            await _expire_generation(self, scope, generation=generation)
-            continue
         return _StreamControl(
             generation=generation,
             state=cast(_ControlState, state),
         )
 
 
-async def _keys_for_handle(self: RedisBackend, handle: BackendRunHandle) -> _RedisKeys:
+async def _keys_for_handle(self: RedisBackend, handle: _BackendRunHandle) -> _RedisKeys:
     generation = handle.generation
     if generation is None:
         scope = self._scope(handle.channel, handle.identity)
@@ -863,7 +1024,7 @@ async def _keys_for_handle(self: RedisBackend, handle: BackendRunHandle) -> _Red
 
 async def _raise_generation_unavailable(
     self: RedisBackend,
-    handle: BackendRunHandle,
+    handle: _BackendRunHandle,
     *,
     generation: int,
 ) -> Never:
@@ -918,13 +1079,14 @@ async def _run_snapshot(
         "run snapshot",
         self._client.eval(
             _RUN_SNAPSHOT_SCRIPT,
-            6,
+            7,
             keys.control,
             keys.meta,
             keys.run_key,
             keys.lease_key,
             keys.messages,
             keys.signals,
+            keys.channel_meta,
             str(keys.generation),
             "__none__" if after is None else str(after),
             str(self._retention_ms),
@@ -957,7 +1119,7 @@ async def _run_snapshot(
         raise _redis_protocol_error(
             "Redis run snapshot has an invalid message boundary"
         )
-    if code != "OK" or len(response) != 11:
+    if code != "OK" or len(response) != 32:
         raise _redis_protocol_error(f"unexpected Redis run snapshot response: {code}")
 
     status_text = self._snapshot_text(response[1], field="status")
@@ -1011,6 +1173,87 @@ async def _run_snapshot(
         after=after,
         end_seq=end_seq,
     )
+    observed_seconds = self._snapshot_integer(
+        response[11],
+        field="observed seconds",
+        minimum=0,
+    )
+    observed_microseconds = self._snapshot_integer(
+        response[12],
+        field="observed microseconds",
+        minimum=0,
+    )
+    start_seq = self._snapshot_integer(
+        response[13],
+        field="start_seq",
+        minimum=0,
+    )
+    settling = _snapshot_boolean(self, response[14], field="settling")
+    cancellable = _snapshot_boolean(self, response[15], field="cancellable")
+    recoverable = _snapshot_boolean(self, response[16], field="recoverable")
+    owner_token = self._snapshot_text(response[17], field="owner token")
+    fence = self._snapshot_integer(response[18], field="fence", minimum=0)
+    checkpoint_present = _snapshot_boolean(
+        self,
+        response[19],
+        field="checkpoint presence",
+    )
+    checkpoint = None
+    checkpoint_position = self._snapshot_bytes(
+        response[20],
+        field="checkpoint position",
+    )
+    checkpoint_message_id = self._snapshot_text(
+        response[21],
+        field="checkpoint message ID",
+    )
+    if checkpoint_present:
+        checkpoint = RecoveryCheckpoint(
+            position=checkpoint_position,
+            last_message_id=checkpoint_message_id or None,
+        )
+    active_run_id = self._snapshot_text(response[22], field="active run ID")
+    latest_seq = self._snapshot_integer(
+        response[23],
+        field="latest sequence",
+        minimum=0,
+    )
+    payload_bytes = self._snapshot_integer(
+        response[24],
+        field="payload bytes",
+        minimum=0,
+    )
+    fence_counter = self._snapshot_integer(
+        response[25],
+        field="fence counter",
+        minimum=0,
+    )
+    codec_id = self._snapshot_text(response[26], field="codec ID")
+    max_message_payload_bytes = self._snapshot_integer(
+        response[27],
+        field="maximum message payload bytes",
+        minimum=1,
+    )
+    max_checkpoint_bytes = self._snapshot_integer(
+        response[28],
+        field="maximum checkpoint bytes",
+        minimum=1,
+    )
+    max_thread_messages = self._snapshot_integer(
+        response[29],
+        field="maximum thread messages",
+        minimum=1,
+    )
+    max_thread_payload_bytes = self._snapshot_integer(
+        response[30],
+        field="maximum thread payload bytes",
+        minimum=1,
+    )
+    retention_ms = self._snapshot_integer(
+        response[31],
+        field="retention milliseconds",
+        minimum=0,
+    )
     return _RunSnapshot(
         status=cast(RunStatus, status_text),
         end_seq=end_seq,
@@ -1022,6 +1265,25 @@ async def _run_snapshot(
         lease_last_success_seconds=lease_last_success_seconds,
         lease_last_success_microseconds=lease_last_success_microseconds,
         messages=messages,
+        observed_seconds=observed_seconds,
+        observed_microseconds=observed_microseconds,
+        start_seq=start_seq,
+        settling=settling,
+        cancellable=cancellable,
+        recoverable=recoverable,
+        owner_token=owner_token,
+        fence=fence,
+        checkpoint=checkpoint,
+        active_run_id=active_run_id,
+        latest_seq=latest_seq,
+        payload_bytes=payload_bytes,
+        fence_counter=fence_counter,
+        codec_id=codec_id,
+        max_message_payload_bytes=max_message_payload_bytes,
+        max_checkpoint_bytes=max_checkpoint_bytes,
+        max_thread_messages=max_thread_messages,
+        max_thread_payload_bytes=max_thread_payload_bytes,
+        retention_ms=retention_ms,
     )
 
 
@@ -1190,6 +1452,20 @@ def _snapshot_integer(
     return parsed
 
 
+def _snapshot_boolean(
+    self: RedisBackend,
+    value: _RedisScriptValue,
+    *,
+    field: str,
+) -> bool:
+    """Decode one canonical Redis boolean from a snapshot scalar."""
+
+    text = self._snapshot_text(value, field=field)
+    if text not in {"0", "1"}:
+        raise _redis_protocol_error(f"Redis run snapshot has invalid {field}")
+    return text == "1"
+
+
 def _snapshot_text(value: _RedisScriptValue, *, field: str) -> str:
     """Decode one UTF-8 scalar and reject nested or malformed responses."""
 
@@ -1213,7 +1489,7 @@ def _snapshot_bytes(value: _RedisScriptValue, *, field: str) -> bytes:
 
 
 def _raise_stream_deleted(
-    handle: BackendRunHandle,
+    handle: _BackendRunHandle,
     *,
     generation: int | None = None,
 ) -> Never:

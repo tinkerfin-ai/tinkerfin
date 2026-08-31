@@ -11,6 +11,8 @@ from pydantic import JsonValue, ValidationError
 
 from tinkerfin_contracts import RunIdentity, RunSourceContext
 from tinkerfin_tracing.capture import CapturedValue, CapturePolicy
+from tinkerfin_tracing.codec import CanonicalTracePayloadCodec
+from tinkerfin_tracing.durable_store import InMemoryTraceStore
 from tinkerfin_tracing.errors import (
     TraceProjectionCheckpointConflict,
     TraceQuotaExceeded,
@@ -18,11 +20,10 @@ from tinkerfin_tracing.errors import (
     TraceStoreProtocolError,
     TraceThreadNotFound,
 )
-from tinkerfin_tracing.facts import MessageFact, RunFact
+from tinkerfin_tracing.facts import MessageFact, RunFact, TraceSemanticFact
 from tinkerfin_tracing.limits import TraceLimits
 from tinkerfin_tracing.query import TraceThread
 from tinkerfin_tracing.store import (
-    InMemoryTraceStore,
     StoreThreadSnapshot,
     TraceProjectionCheckpoint,
     TraceStore,
@@ -84,6 +85,43 @@ async def test_store_assigns_one_contiguous_sequence_across_concurrent_runs() ->
     assert snapshot.persisted_bytes == sum(event.persisted_bytes for event in stored)
     await first.aclose()
     await second.aclose()
+
+
+async def test_in_memory_reads_reuse_framework_validated_event_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = InMemoryTraceStore()
+    writer = await store.open_writer(_identity())
+    await writer.append((_fact("run-1"),))
+    snapshot = await store.snapshot("thread-1")
+    decode_calls = 0
+    original = CanonicalTracePayloadCodec.decode_fact
+
+    def count_decode(
+        codec: CanonicalTracePayloadCodec,
+        payload: bytes,
+    ) -> TraceSemanticFact:
+        nonlocal decode_calls
+        decode_calls += 1
+        return original(codec, payload)
+
+    monkeypatch.setattr(CanonicalTracePayloadCodec, "decode_fact", count_decode)
+
+    forward = await store.read_events(
+        snapshot.key,
+        after_seq=0,
+        as_of_seq=1,
+        limit=1,
+    )
+    reverse = await store.read_events_reverse(
+        snapshot.key,
+        before_seq=2,
+        limit=1,
+    )
+
+    assert forward == reverse
+    assert decode_calls == 0
+    await writer.aclose()
 
 
 async def test_store_rejects_duplicate_run_and_active_generation_delete() -> None:
@@ -220,6 +258,17 @@ async def test_regular_append_preserves_mandatory_terminal_reserve() -> None:
 
     assert [event.trace_seq for event in terminal] == [15, 16]
     await writer.aclose()
+
+
+async def test_ordinary_batch_rejects_mixed_terminal_fact() -> None:
+    store = InMemoryTraceStore()
+    writer = await store.open_writer(_identity())
+    try:
+        with pytest.raises(TraceStoreProtocolError, match="mandatory append"):
+            await writer.append((_fact("run-1"), _fact("run-1", "terminal")))
+        assert (await store.snapshot("thread-1")).as_of_seq == 0
+    finally:
+        await writer.aclose()
 
 
 async def test_closing_a_zero_fact_writer_allows_the_same_run_to_retry() -> None:

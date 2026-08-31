@@ -2,20 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from uuid import uuid4
 
+from .backend import TraceStoredFact
 from .codec import CanonicalTracePayloadCodec
 from .facts import TraceSemanticFact
 
-
-@dataclass(frozen=True, slots=True)
-class PreparedTraceFact:
-    """Keep one validated fact with the exact canonical bytes used for admission."""
-
-    fact: TraceSemanticFact
-    canonical_payload: bytes
-    exact_byte_count: int
-    payload_digest: str
+PreparedTraceFact = TraceStoredFact
 
 
 def prepare_trace_facts(
@@ -27,10 +20,12 @@ def prepare_trace_facts(
 
     prepared: list[PreparedTraceFact] = []
     for fact in facts:
-        encoded = codec.encode_fact(fact)
+        stored_fact = fact.model_copy(deep=True)
+        encoded = codec.encode_fact(stored_fact)
         prepared.append(
-            PreparedTraceFact(
-                fact=fact,
+            TraceStoredFact(
+                event_id=uuid4().hex,
+                fact=stored_fact,
                 canonical_payload=encoded.data,
                 exact_byte_count=len(encoded.data),
                 payload_digest=encoded.digest,

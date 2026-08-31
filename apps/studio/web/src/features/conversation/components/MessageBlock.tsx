@@ -347,9 +347,20 @@ export function ConversationNotice({ notice }: { notice: ConversationNoticeType 
 }
 
 export function ToolCallCard({ message, className }: { message: Message; className?: string }) {
+  const { t } = useI18n()
+  const isTodoUpdate = message.meta?.toolName === 'write_todos'
+  const todoStatus = message.meta?.status === 'failed'
+    ? t('任务清单更新失败')
+    : message.meta?.status === 'cancelled'
+      ? t('任务清单更新已取消')
+      : message.meta?.status === 'running' || message.meta?.status === 'paused'
+        ? t('正在更新任务清单')
+        : t('未生成任务清单')
   return (
     <ToolCallRow message={message} className={`tool-card${className ? ` ${className}` : ''}`}>
-      <ToolDetails message={message} />
+      {isTodoUpdate
+        ? <div className="todo-trace-tool-status">{todoStatus}</div>
+        : <ToolDetails message={message} />}
     </ToolCallRow>
   )
 }

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 
 import type { AgentMode, ChatRequestPayload } from '../../api/conversation/types'
+import type { TodoGroup } from '../../api/conversation/taskTrace'
 import { conversationErrorMessage } from '../../api/conversation/errors'
 import type { AuthUser } from '../../api/auth/types'
 import { Button, ErrorBoundary, useThemePreference } from '../../components/ui'
@@ -17,24 +18,28 @@ import { parseComposerSubmission } from '../conversation/composerCommand'
 import { useLocalAttachments } from '../conversation/useLocalAttachments'
 import { ComposerModelPicker } from './components/ComposerModelPicker'
 import { Sidebar } from './components/Sidebar'
-import { TaskDrawer } from './components/TaskDrawer'
 import {
   ConversationViewport,
-  type ConversationDisplayEntry,
 } from './components/ConversationViewport'
 import { EmptyConversationBrand } from './components/EmptyConversation'
 import { WorkspaceDialogs } from './components/WorkspaceDialogs'
 import { WorkspaceHeader } from './components/WorkspaceHeader'
 import { WorkspaceStatus } from './components/WorkspaceStatus'
+import { ScrollToBottomButton } from './components/ScrollToBottomButton'
 import { SettingsDialog } from '../settings/SettingsDialog'
 import { useWorkspaceNavigation } from './useWorkspaceNavigation'
 import { useModelCatalog } from './useModelCatalog'
 import { useWorkspaceHistory } from './useWorkspaceHistory'
 import { useConversationScroll } from './useConversationScroll'
 import { useConversationManagement } from './useConversationManagement'
-import { useTaskDrawerState } from './useTaskDrawerState'
+import { useConversationMessageWindow } from './useConversationMessageWindow'
 import { useWorkspaceLayoutAnimation } from './useWorkspaceLayoutAnimation'
+import { buildConversationDisplayEntries } from '../conversation/todoTrace/displayEntries'
+import { TodoTraceLauncher } from '../conversation/todoTrace/components/TodoTraceLauncher'
+import { TodoTraceDrawer } from '../conversation/todoTrace/components/TodoTraceDrawer'
+import { useTodoTraceDrawer } from '../conversation/todoTrace/useTodoTraceDrawer'
 import '../conversation/conversation.css'
+import '../conversation/todoTrace/todoTrace.css'
 import './workspace.css'
 import {
   buildInitialPayload,
@@ -51,6 +56,7 @@ import {
 import {
   buildEmptyConversation,
   createEmptyWorkspace,
+  selectCurrentConversation,
   updateConversation,
 } from '../../lib/workspace'
 import { readThreadFromLocation, writeThreadToLocation } from '../../lib/threadRoute'
@@ -70,7 +76,6 @@ interface PendingResume {
   expectedInterruptIds: readonly string[]
 }
 
-const MESSAGE_RENDER_BATCH_SIZE = 100
 const RESUME_RUN_DEDUPE_LIMIT = 256
 
 const matchesApprovalGroup = (
@@ -126,10 +131,6 @@ export function WorkspaceScreen({
   const [draft, setDraft] = useState('')
   const [isModelPickerOpen, setModelPickerOpen] = useState(false)
   const [pendingResume, setPendingResume] = useState<PendingResume | null>(null)
-  const [messageWindow, setMessageWindow] = useState<{
-    threadId: string
-    start: number | null
-  }>({ threadId: '', start: null })
   const [settingsOpen, setSettingsOpen] = useState(false)
   const settingsRestoreFocus = useRef<HTMLElement | null>(null)
   const theme = useThemePreference()
@@ -145,12 +146,6 @@ export function WorkspaceScreen({
   const appShell = useRef<HTMLDivElement>(null)
   const latestWorkspace = useRef(workspace)
   const startedResumeRunIds = useRef(new Set<string>())
-  const earlierMessageAnchor = useRef<{
-    threadId: string
-    scrollHeight: number
-    scrollTop: number
-    trigger: HTMLButtonElement
-  } | null>(null)
   latestWorkspace.current = workspace
   const pushToast = onToast
 
@@ -164,6 +159,7 @@ export function WorkspaceScreen({
     followDetachedConversation,
     detachThreadStream,
     getActiveThreadId,
+    handoffTaskTraceFollow,
     hasActiveStream,
     isActiveThread,
     streamRun,
@@ -185,10 +181,12 @@ export function WorkspaceScreen({
     isHistoryBootstrapped,
     historyBootstrapStatus,
     hydrationState,
+    taskTraceLoadFailed,
     loadMoreHistory,
     retryHistoryLoad,
     retryHistoryBootstrap,
     hydrateConversation,
+    retryTaskTrace,
     loadOlderTrace,
   } = useWorkspaceHistory({
     workspace,
@@ -196,6 +194,7 @@ export function WorkspaceScreen({
     defaultModelId,
     modelCatalogStatus,
     followDetachedConversation,
+    prepareTaskTraceOwner: handoffTaskTraceFollow,
     onToast: pushToast,
   })
 
@@ -225,9 +224,15 @@ export function WorkspaceScreen({
     document.title = 'TinkerFin'
   }, [])
 
-  const taskDrawer = useTaskDrawerState({
+  const taskTraceBlocked = Boolean(
+    (conversation.approval && !conversation.approval.submitted)
+    || (conversation.planInteraction && !conversation.planInteraction.submitted)
+    || conversation.pendingInteractionKind,
+  )
+  const taskDrawer = useTodoTraceDrawer({
     threadId: conversation.threadId,
-    todoCount: conversation.todos.length,
+    taskTrace: conversation.taskTrace,
+    blocked: taskTraceBlocked,
   })
   useWorkspaceLayoutAnimation({
     shellRef: appShell,
@@ -313,7 +318,7 @@ export function WorkspaceScreen({
         state.currentThreadId === threadId
           ? state
           : threadId && state.conversations.some((item) => item.threadId === threadId)
-            ? { ...state, currentThreadId: threadId }
+            ? selectCurrentConversation(state, threadId)
             : state,
       )
     }
@@ -368,117 +373,29 @@ export function WorkspaceScreen({
     return grouped
   }, [conversation.messages])
 
-  const displayMessages = useMemo(() => {
-    const pendingApproval = conversation.approval?.submitted === false
-      ? conversation.approval
-      : undefined
-    const activeApprovalIndex = pendingApproval
-      ? Math.max(0, Math.min(pendingApproval.activeIndex, pendingApproval.items.length - 1))
-      : -1
-    const activeApprovalToolCallId = pendingApproval?.items[activeApprovalIndex]?.toolCallId
-    const approvalToolCallIds = new Set(
-      pendingApproval?.items.flatMap((item) => item.toolCallId ? [item.toolCallId] : []) ?? [],
-    )
-
-    return conversation.messages.filter((message) => {
-      if (message.role !== 'tool') return true
-      if (message.meta?.sourceAgentName) return false
-      if (
-        activeApprovalToolCallId
-        && message.meta?.toolCallId === activeApprovalToolCallId
-      ) return true
-      if (
-        message.meta?.toolCallId
-        && approvalToolCallIds.has(message.meta.toolCallId)
-      ) return false
-      if (message.meta?.toolName === 'write_todos') return false
-      if (message.meta?.toolName === 'PlannerOutcome') return false
-      if (message.meta?.toolName === 'task') {
-        return message.meta.status !== 'running' && !message.meta.subRunId
-      }
-      return true
-    })
-    .reduce<ConversationDisplayEntry[]>((groups, message) => {
-      const previous = groups.at(-1)
-      if (message.role === 'tool' && message.meta?.batchId && previous?.type === 'tools' && previous.messages[0]?.meta?.batchId === message.meta.batchId) {
-        previous.messages.push(message)
-      } else if (message.role === 'tool' && message.meta?.batchId) groups.push({ type: 'tools', messages: [message] })
-      else groups.push({ type: 'message', message })
-      return groups
-    }, [])
-  }, [conversation.approval, conversation.messages])
-
-  const defaultMessageWindowStart = Math.max(
-    0,
-    displayMessages.length - MESSAGE_RENDER_BATCH_SIZE,
-  )
-  const messageWindowStart = messageWindow.threadId === conversation.threadId
-    && messageWindow.start != null
-    ? Math.min(messageWindow.start, displayMessages.length)
-    : defaultMessageWindowStart
-  const visibleDisplayMessages = useMemo(
-    () => displayMessages.slice(messageWindowStart),
-    [displayMessages, messageWindowStart],
+  const displayMessages = useMemo(
+    () => buildConversationDisplayEntries(conversation),
+    [conversation],
   )
 
-  useLayoutEffect(() => {
-    setMessageWindow((current) => {
-      if (current.threadId !== conversation.threadId) {
-        earlierMessageAnchor.current = null
-        return {
-          threadId: conversation.threadId,
-          start: displayMessages.length > 0 ? defaultMessageWindowStart : null,
-        }
-      }
-      if (current.start == null && displayMessages.length > 0) {
-        return { ...current, start: defaultMessageWindowStart }
-      }
-      if (current.start != null && current.start > displayMessages.length) {
-        return { ...current, start: defaultMessageWindowStart }
-      }
-      return current
+  const messageWindow = useConversationMessageWindow({
+    threadId: conversation.threadId,
+    entries: displayMessages,
+    historyCursor: conversation.trace?.historyCursor,
+    paneRef: conversationPane,
+    loadOlderTrace,
+  })
+  const returnToLatestMessages = useCallback(() => {
+    messageWindow.restoreTail()
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(scrollConversationToBottom)
     })
-  }, [conversation.threadId, defaultMessageWindowStart, displayMessages.length])
-
-  useLayoutEffect(() => {
-    const anchor = earlierMessageAnchor.current
-    if (!anchor || anchor.threadId !== conversation.threadId) return
-    const pane = conversationPane.current
-    if (pane) {
-      pane.scrollTop = anchor.scrollTop + (pane.scrollHeight - anchor.scrollHeight)
-    }
-    if (anchor.trigger.isConnected) anchor.trigger.focus({ preventScroll: true })
-    else pane?.focus({ preventScroll: true })
-    earlierMessageAnchor.current = null
-  }, [conversation.threadId, conversationPane, displayMessages.length, messageWindowStart])
-
-  const loadEarlierMessages = useCallback((trigger: HTMLButtonElement) => {
-    const pane = conversationPane.current
-    if (pane) {
-      earlierMessageAnchor.current = {
-        threadId: conversation.threadId,
-        scrollHeight: pane.scrollHeight,
-        scrollTop: pane.scrollTop,
-        trigger,
-      }
-    }
-    if (messageWindowStart > 0) {
-      setMessageWindow({
-        threadId: conversation.threadId,
-        start: Math.max(0, messageWindowStart - MESSAGE_RENDER_BATCH_SIZE),
-      })
-      return
-    }
-    void loadOlderTrace(conversation.threadId).then((loaded) => {
-      if (loaded || earlierMessageAnchor.current?.trigger !== trigger) return
-      earlierMessageAnchor.current = null
-      if (trigger.isConnected) trigger.focus({ preventScroll: true })
-    })
-  }, [conversation.threadId, conversationPane, loadOlderTrace, messageWindowStart])
+  }, [messageWindow, scrollConversationToBottom])
 
   const beginSend = useCallback((content: string, modeOverride?: AgentMode) => {
     const trimmed = content.trim()
     if (!trimmed || isRunning || !conversation.model) return
+    messageWindow.restoreTail()
     const effectiveMode = modeOverride ?? conversation.mode
 
     const now = new Date().toISOString()
@@ -505,6 +422,7 @@ export function WorkspaceScreen({
         notice: undefined,
         approval: undefined,
         todos: [],
+        taskTrace: { phase: 'ready', snapshot: { status: 'ready', todoGroups: [] } },
         serverState: {},
       }
 
@@ -564,7 +482,7 @@ export function WorkspaceScreen({
     })
     void streamRun(currentConversation.threadId, payload, 'start')
     setDraft('')
-  }, [conversation.mode, conversation.model, draftConversation?.model, draftModel, hydrateConversation, isRunning, scrollConversationToBottomImmediately, streamRun, t, workspace.conversations, workspace.currentThreadId])
+  }, [conversation.mode, conversation.model, draftConversation?.model, draftModel, hydrateConversation, isRunning, messageWindow, scrollConversationToBottomImmediately, streamRun, t, workspace.conversations, workspace.currentThreadId])
 
   useEffect(() => {
     if (!pendingResume) return
@@ -888,13 +806,37 @@ export function WorkspaceScreen({
     beginSend(submission.content)
   }
 
+  const locateTodoGroup = useCallback((group: TodoGroup) => {
+    const locate = async () => {
+      const result = await messageWindow.revealMessage(group.userMessageId)
+      if (result === 'not-found') pushToast('error', t('未找到任务对应的用户消息'))
+      else if (result === 'failed') pushToast('error', t('定位消息失败，请重试'))
+    }
+    if (taskDrawer.modalActive) {
+      taskDrawer.close(false)
+      window.requestAnimationFrame(() => {
+        window.requestAnimationFrame(() => void locate())
+      })
+    } else void locate()
+  }, [messageWindow, pushToast, t, taskDrawer])
+
   // Portal 对话框打开时整块工作区退出辅助技术与键盘路径，只保留最上层操作
   const portalModalActive = settingsOpen || dialog != null
+  const taskTraceLauncher = taskTraceBlocked ? undefined : (
+    <TodoTraceLauncher
+      ref={taskDrawer.launcherRef}
+      taskTrace={conversation.taskTrace}
+      open={taskDrawer.open}
+      loadFailed={taskTraceLoadFailed}
+      onToggle={taskDrawer.toggle}
+      onRetry={() => retryTaskTrace(conversation.threadId)}
+    />
+  )
 
   return (
     <div
       ref={appShell}
-      className={`app-shell ${taskDrawer.open ? 'has-drawer' : ''}`}
+      className={`app-shell ${taskDrawer.open ? 'has-todo-trace' : ''}`}
       id="top"
       data-sidebar-mode={navigation.mode}
       aria-hidden={portalModalActive || undefined}
@@ -929,7 +871,7 @@ export function WorkspaceScreen({
         onRetryLoadMore={retryHistoryLoad}
         user={user}
         onOpenSettings={(restoreFocusTo) => {
-          taskDrawer.close()
+          taskDrawer.close(false)
           settingsRestoreFocus.current = restoreFocusTo ?? null
           setSettingsOpen(true)
         }}
@@ -940,24 +882,19 @@ export function WorkspaceScreen({
         data-workspace-layout-target="main"
         id="main-content"
         className="workspace-main"
-        aria-hidden={(navigation.mode === 'overlay' && navigation.overlayOpen) || taskDrawer.modalActive || undefined}
-        inert={(navigation.mode === 'overlay' && navigation.overlayOpen) || taskDrawer.modalActive || undefined}
+        aria-hidden={(navigation.mode === 'overlay' && navigation.overlayOpen) || undefined}
+        inert={(navigation.mode === 'overlay' && navigation.overlayOpen) || undefined}
       >
         <WorkspaceHeader
           conversationTitle={conversation.title}
-          drawerOpen={taskDrawer.open}
-          todoCount={conversation.todos.length}
-          drawerToggleRef={taskDrawer.toggleRef}
           overlayTriggerRef={navigation.overlayTriggerRef}
           onOpenOverlay={navigation.openOverlay}
-          onToggleDrawer={taskDrawer.toggle}
+          backgroundInert={taskDrawer.modalActive}
         />
         <ConversationViewport
           conversation={conversation}
-          entries={visibleDisplayMessages}
-          hasEarlierMessages={
-            messageWindowStart > 0 || conversation.trace?.historyCursor != null
-          }
+          entries={messageWindow.visibleEntries}
+          hasEarlierMessages={messageWindow.hasEarlierMessages}
           childToolsByRunId={childToolsByRunId}
           paneRef={conversationPane}
           messageEndRef={messageEnd}
@@ -967,18 +904,12 @@ export function WorkspaceScreen({
           isHydrating={isConversationHydrating}
           isHydrationFailed={isConversationHydrationFailed}
           isRunning={isRunning}
-          showScrollToBottom={showScrollToBottom}
-          fadeScrollToBottom={fadeScrollToBottom}
+          backgroundInert={taskDrawer.modalActive}
           onScroll={handleConversationScroll}
           onUserScrollIntent={markUserScrollIntent}
           onRetryHistory={retryHistoryBootstrap}
           onRetryHydration={() => void hydrateConversation(conversation.threadId)}
-          onLoadEarlierMessages={loadEarlierMessages}
-          onScrollToBottom={scrollConversationToBottom}
-          onScrollToBottomPointerEnter={pauseScrollToBottomFade}
-          onScrollToBottomPointerLeave={resumeScrollToBottomFade}
-          onScrollToBottomFocus={focusScrollToBottom}
-          onScrollToBottomBlur={blurScrollToBottom}
+          onLoadEarlierMessages={(trigger) => void messageWindow.loadEarlierMessages(trigger)}
         />
         <Composer
           value={draft}
@@ -1028,6 +959,21 @@ export function WorkspaceScreen({
                 />
                 )
                 : undefined}
+          scrollToBottomControl={!taskDrawer.modalActive
+            && (showScrollToBottom || !messageWindow.followsTail)
+            ? (
+              <ScrollToBottomButton
+                fading={fadeScrollToBottom}
+                onPointerEnter={pauseScrollToBottomFade}
+                onPointerLeave={resumeScrollToBottomFade}
+                onFocus={focusScrollToBottom}
+                onBlur={blurScrollToBottom}
+                onClick={returnToLatestMessages}
+              />
+            )
+            : undefined}
+          taskTraceControl={taskDrawer.modalActive ? undefined : taskTraceLauncher}
+          backgroundInert={taskDrawer.modalActive}
           modelControl={(
             <ComposerModelPicker
               model={conversation.model}
@@ -1067,21 +1013,34 @@ export function WorkspaceScreen({
           onScrollConversation={scrollConversationBy}
         />
       </main>
-      {taskDrawer.modalActive && <button type="button" className="task-drawer-scrim" aria-label={t('关闭任务抽屉遮罩')} onClick={taskDrawer.close} />}
+      {taskDrawer.modalActive && (
+        <button
+          type="button"
+          className="todo-trace-scrim"
+          aria-hidden="true"
+          tabIndex={-1}
+          onClick={() => taskDrawer.close(true)}
+        />
+      )}
       <ErrorBoundary
         resetKey={`${conversation.threadId || 'draft'}:${taskDrawer.open ? 'open' : 'closed'}`}
         fallback={({ reset }) => taskDrawer.open ? (
-          <aside id="task-drawer" className="task-drawer is-open task-drawer-error" aria-label={t('任务抽屉渲染错误')}>
-            <WorkspaceStatus kind="error" title={t('任务抽屉无法显示')} description={t('对话内容未受影响，可以重试或关闭抽屉')} onRetry={reset} compact />
-            <Button onClick={taskDrawer.close}>{t('关闭抽屉')}</Button>
+          <aside ref={taskDrawer.drawerRef} id="todo-trace-drawer" className="todo-trace-drawer is-open todo-trace-error" aria-label={t('任务轨迹无法显示')}>
+            <WorkspaceStatus kind="error" title={t('任务轨迹无法显示')} description={t('对话内容未受影响，可以重试或关闭任务轨迹')} onRetry={reset} compact />
+            <Button onClick={() => taskDrawer.close(true)}>{t('关闭任务轨迹')}</Button>
           </aside>
         ) : null}
       >
-        <TaskDrawer
-          conversation={conversation}
+        <TodoTraceDrawer
+          groups={conversation.taskTrace.phase === 'ready'
+            ? conversation.taskTrace.snapshot.todoGroups
+            : []}
           open={taskDrawer.open}
-          onClose={taskDrawer.close}
-          focusOnOpen={taskDrawer.modalActive}
+          usesOverlay={taskDrawer.usesOverlay}
+          openEpoch={taskDrawer.openEpoch}
+          drawerRef={taskDrawer.drawerRef}
+          onClose={() => taskDrawer.close(true)}
+          onLocate={locateTodoGroup}
         />
       </ErrorBoundary>
       <WorkspaceDialogs

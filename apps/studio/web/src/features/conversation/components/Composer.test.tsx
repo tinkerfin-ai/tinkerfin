@@ -14,6 +14,72 @@ const composerChromeProps = () => ({
 })
 
 describe('Composer', () => {
+  it('places scroll and task-trace controls in one auxiliary row without an empty fallback', () => {
+    const { container, rerender } = render(
+      <Composer
+        {...composerChromeProps()}
+        scrollToBottomControl={<button type="button">回到底部</button>}
+        taskTraceControl={<button type="button">任务轨迹 2</button>}
+        value=""
+        isRunning={false}
+        onChange={vi.fn()}
+        onSend={vi.fn()}
+        onStop={vi.fn()}
+      />,
+    )
+
+    const controls = container.querySelector('.composer-auxiliary-controls')
+    expect(controls).not.toBeNull()
+    expect(within(controls as HTMLElement).getAllByRole('button').map((button) => button.textContent))
+      .toEqual(['回到底部', '任务轨迹 2'])
+    expect(screen.getByRole('button', { name: '回到底部' }).parentElement)
+      .toHaveClass('composer-scroll-to-bottom-control')
+    expect(screen.getByRole('button', { name: '任务轨迹 2' }).parentElement)
+      .toHaveClass('composer-task-trace-control')
+
+    rerender(
+      <Composer
+        {...composerChromeProps()}
+        taskTraceControl={<button type="button">任务轨迹 2</button>}
+        value=""
+        isRunning={false}
+        onChange={vi.fn()}
+        onSend={vi.fn()}
+        onStop={vi.fn()}
+      />,
+    )
+    expect(screen.queryByRole('button', { name: '回到底部' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '任务轨迹 2' }).parentElement)
+      .toHaveClass('composer-task-trace-control')
+
+    rerender(
+      <Composer
+        {...composerChromeProps()}
+        scrollToBottomControl={<button type="button">回到底部</button>}
+        value=""
+        isRunning={false}
+        onChange={vi.fn()}
+        onSend={vi.fn()}
+        onStop={vi.fn()}
+      />,
+    )
+    expect(screen.getByRole('button', { name: '回到底部' }).parentElement)
+      .toHaveClass('composer-scroll-to-bottom-control')
+    expect(screen.queryByRole('button', { name: '任务轨迹 2' })).not.toBeInTheDocument()
+
+    rerender(
+      <Composer
+        {...composerChromeProps()}
+        value=""
+        isRunning={false}
+        onChange={vi.fn()}
+        onSend={vi.fn()}
+        onStop={vi.fn()}
+      />,
+    )
+    expect(container.querySelector('.composer-auxiliary-controls')).not.toBeInTheDocument()
+  })
+
   it('keeps the default composer mounted and inert during a takeover, then restores focus', () => {
     const animation = vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => {
       callback(0)

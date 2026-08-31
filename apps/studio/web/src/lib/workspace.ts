@@ -2,6 +2,14 @@ import type { Conversation, WorkspaceState } from '../types'
 
 export const TRANSIENT_THREAD_ID = ''
 
+const unloadedTaskTrace = (): Conversation['taskTrace'] => ({ phase: 'unloaded' })
+
+const withoutTaskTrace = (conversation: Conversation): Conversation => (
+  conversation.taskTrace.phase === 'unloaded'
+    ? conversation
+    : { ...conversation, taskTrace: unloadedTaskTrace() }
+)
+
 const sortConversations = (conversations: Conversation[]) =>
   [...conversations].sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))
 
@@ -16,6 +24,7 @@ export const buildEmptyConversation = (
   mode: options.mode ?? 'default',
   messages: [],
   todos: [],
+  taskTrace: unloadedTaskTrace(),
   runStatus: 'idle',
   isHydrated: true,
 })
@@ -28,9 +37,26 @@ export const createEmptyWorkspace = (): WorkspaceState => ({
 export function createNewConversation(
   state: WorkspaceState,
 ): WorkspaceState {
+  return selectCurrentConversation(state, TRANSIENT_THREAD_ID)
+}
+
+/** 原子切换当前会话，并保证只有目标会话能重新取得 taskTrace */
+export function selectCurrentConversation(
+  state: WorkspaceState,
+  threadId: string,
+): WorkspaceState {
+  if (state.currentThreadId === threadId) return state
   return {
-    ...state,
-    currentThreadId: TRANSIENT_THREAD_ID,
+    currentThreadId: threadId,
+    conversations: state.conversations.map((conversation) => {
+      if (conversation.threadId !== threadId) return withoutTaskTrace(conversation)
+      return {
+        ...conversation,
+        taskTrace: conversation.isHydrated
+          ? { phase: 'loading' }
+          : unloadedTaskTrace(),
+      }
+    }),
   }
 }
 
@@ -41,9 +67,11 @@ export function updateConversation(
 ): WorkspaceState {
   return {
     ...state,
-    conversations: state.conversations.map((conversation) =>
-      conversation.threadId === threadId ? updater(conversation) : conversation,
-    ),
+    conversations: state.conversations.map((conversation) => {
+      if (conversation.threadId !== threadId) return conversation
+      const updated = updater(conversation)
+      return threadId === state.currentThreadId ? updated : withoutTaskTrace(updated)
+    }),
   }
 }
 
@@ -54,12 +82,15 @@ export function upsertConversation(
   const hasConversation = state.conversations.some(
     (conversation) => conversation.threadId === nextConversation.threadId,
   )
+  const ownedNext = nextConversation.threadId === state.currentThreadId
+    ? nextConversation
+    : withoutTaskTrace(nextConversation)
   const conversations = hasConversation
     ? state.conversations.map((conversation) =>
         conversation.threadId === nextConversation.threadId
-          ? nextConversation
+          ? ownedNext
           : conversation)
-    : [nextConversation, ...state.conversations]
+    : [ownedNext, ...state.conversations]
   return {
     ...state,
     conversations: sortConversations(conversations),
@@ -73,11 +104,11 @@ export function removeConversation(
   const conversations = state.conversations.filter(
     (conversation) => conversation.threadId !== threadId,
   )
-  return {
+  const currentThreadId = state.currentThreadId === threadId
+    ? (conversations[0]?.threadId ?? TRANSIENT_THREAD_ID)
+    : state.currentThreadId
+  return selectCurrentConversation({
     conversations,
-    currentThreadId:
-      state.currentThreadId === threadId
-        ? (conversations[0]?.threadId ?? TRANSIENT_THREAD_ID)
-        : state.currentThreadId,
-  }
+    currentThreadId: state.currentThreadId,
+  }, currentThreadId)
 }

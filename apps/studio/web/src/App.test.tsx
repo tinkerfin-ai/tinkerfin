@@ -116,6 +116,7 @@ const traceDetail = (
   createdAt: BASE_TIME,
   updatedAt: BASE_TIME,
   ...overrides,
+  taskTrace: overrides.taskTrace ?? { status: 'ready', todoGroups: [] },
 })
 
 const jsonResponse = (data: unknown) => new Response(

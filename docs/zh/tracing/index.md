@@ -155,6 +155,24 @@ await store.setup()
 tracer = Tracer(store=store)
 ```
 
+框架尚未内置的共享数据库通过 `TraceLedgerBackend` 接入，使用者不需要重新实现完整
+`TraceStore` 和 `TraceWriter`：
+
+```python
+from my_trace_storage import MyTraceLedgerBackend
+from tinkerfin_tracing import DurableTraceStore, Tracer
+
+backend = MyTraceLedgerBackend(database_client)
+store = DurableTraceStore(backend, namespace="my-application")
+await store.setup()
+tracer = Tracer(store=store)
+```
+
+Backend 精确实现五个存储操作：准备存储、原子提交一次 Ledger 变更、加载 Ledger 状态、读取一个
+event page、加载一个 Projection checkpoint。writer 生命周期、终态 reserve、序号分配、checkpoint
+决策、canonical 校验、follow 轮询、背压和取消由框架负责。Backend 作者可使用两个独立客户端运行
+`verify_trace_ledger_backend()`，验证共享可观察契约。
+
 SQL writer 使用数据库时钟 lease 与单调递增 fence。过期且未完成的 writer 会表现为
 `missing_tail`，继续保留终态容量并允许 takeover；已完成 Run 不允许 takeover。SQLite 锁等待
 进入有界且可取消的 Store retry；MySQL 对锁超时、死锁和未知提交结果重试，并用保留的 event ID
@@ -162,8 +180,9 @@ SQL writer 使用数据库时钟 lease 与单调递增 fence。过期且未完�
 
 Fact 与 Projection state 使用 canonical finite UTF-8 JSON，SHA-256 digest 覆盖存储转换前的
 canonical bytes，并在读取时校验。Trace 持久化不包含 S3/Blob 归档、加密/KMS 或
-OpenTelemetry exporter。具体 Archive/Blob 集成必须实现或装饰 `TraceStore`；加密包装 canonical
-payload codec 且不改变转换前 digest；telemetry 通过 `RuntimeObserver` 或 Store/Messaging Backend
-decorator 观察。只有这些已经实际使用的边界属于扩展合同，Tracing 不提供空能力接口。
+OpenTelemetry exporter。活动共享存储实现 `TraceLedgerBackend`，完整替换 `TraceStore` 属于高级
+扩展边界；加密包装 canonical payload codec 且不改变转换前 digest，telemetry 通过
+`RuntimeObserver` 或 Store/Messaging Backend decorator 观察。不支持原子条件变更的 Blob 存储只能
+作为归档目标，不能作为活动 Ledger。
 
 下一篇：[Tracing API 参考](api-reference.md)。

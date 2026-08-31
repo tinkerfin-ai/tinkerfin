@@ -1,4 +1,8 @@
-import type { ConversationHistoryDetail } from './api/conversation/history'
+import type { ConversationHistoryCoreDetail } from './api/conversation/history'
+import type {
+  ReadyTaskTraceSnapshot,
+  UnavailableTaskTraceSnapshot,
+} from './api/conversation/taskTrace'
 
 export type MessageRole = 'user' | 'assistant' | 'process' | 'tool' | 'subagent' | 'approval' | 'error'
 export type TodoStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled'
@@ -12,6 +16,12 @@ export type PendingInteractionKind =
 export type ApprovalMode = 'options' | 'reject'
 export type ApprovalAllowedDecision = 'approve' | 'edit' | 'reject' | 'respond'
 export type AgentMode = 'default' | 'plan'
+
+export type WebTaskTraceViewState =
+  | { phase: 'unloaded' }
+  | { phase: 'loading' }
+  | { phase: 'ready'; snapshot: ReadyTaskTraceSnapshot }
+  | { phase: 'unavailable'; snapshot: UnavailableTaskTraceSnapshot }
 
 export interface JsonObject {
   [key: string]: JsonValue
@@ -209,6 +219,7 @@ export interface Conversation {
   messages: Message[]
   notice?: ConversationNotice
   todos: TodoItem[]
+  taskTrace: WebTaskTraceViewState
   approval?: ApprovalState
   planInteraction?: PlanInteraction
   pendingInteractionKind?: PendingInteractionKind
@@ -218,7 +229,7 @@ export interface Conversation {
   /** 最后一条已持久化 AG-UI 事件序号，用于 afterSeq 续传 */
   lastSeq?: number
   /** Trace 历史或 detached follow 使用的唯一权威语义视图 */
-  trace?: ConversationHistoryDetail
+  trace?: ConversationHistoryCoreDetail
   /** 完整会话详情是否已从后端历史恢复 */
   isHydrated?: boolean
 }

@@ -19,14 +19,19 @@ from tinkerfin_messaging import (
     MessagingBackendUnavailable,
     MessagingError,
     MessagingErrorCode,
+    MessagingStateQuery,
+    MessagingStateSnapshot,
     RedisBackend,
     UnexpectedMessagingBackendError,
 )
 
 
 class _FailingBackend(MemoryBackend):
-    async def latest_seq(self, *, channel: str, identity: RunIdentity) -> int:
-        del channel, identity
+    async def load_messaging_state(
+        self,
+        query: MessagingStateQuery,
+    ) -> MessagingStateSnapshot:
+        del query
         raise ConnectionError("implementation detail")
 
 
@@ -133,7 +138,9 @@ async def test_redis_backend_translates_driver_failures(
     identity = RunIdentity(threadId="thread-1", runId="run-1")
 
     with pytest.raises(expected_type) as raised:
-        await backend.latest_seq(channel="events", identity=identity)
+        await backend.load_messaging_state(
+            MessagingStateQuery(channel="events", identity=identity)
+        )
 
     assert raised.value.code is expected_code
     assert raised.value.cause is driver_error
@@ -151,7 +158,9 @@ async def test_redis_protocol_details_are_trusted_diagnostics_only() -> None:
     identity = RunIdentity(threadId="thread-1", runId="run-1")
 
     with pytest.raises(MessagingBackendProtocolError) as raised:
-        await backend.latest_seq(channel="events", identity=identity)
+        await backend.load_messaging_state(
+            MessagingStateQuery(channel="events", identity=identity)
+        )
 
     assert dict(raised.value.context) == {}
     assert dict(raised.value.diagnostic_context) == {

@@ -17,6 +17,7 @@ const workspace: WorkspaceState = {
       mode: 'default',
       messages: [],
       todos: [],
+      taskTrace: { phase: 'unloaded' },
       runStatus: 'idle',
     },
     {
@@ -28,6 +29,7 @@ const workspace: WorkspaceState = {
       mode: 'default',
       messages: [],
       todos: [],
+      taskTrace: { phase: 'unloaded' },
       runStatus: 'idle',
     },
   ],
@@ -201,14 +203,10 @@ describe('Sidebar', () => {
     const brand = screen.getByRole('link', { name: 'TinkerFin 首页' })
     const collapse = screen.getByRole('button', { name: '收起侧边栏' })
     const actions = collapse.closest('.sidebar-head-actions')
-    expect(brand.querySelector('.brand-mark svg')).toHaveAttribute('width', '30')
-    expect(brand.querySelector('.brand-mark svg')).toHaveAttribute('height', '30')
-    const brandName = within(brand).getByText('TinkerFin')
-    const brandPlus = within(brand).getByText('Plus')
-    expect(brandName).toHaveClass('brand-name')
-    expect(brandName.parentElement).toBe(brand)
-    expect(brandPlus).toHaveClass('brand-plus')
-    expect(brandPlus.parentElement).toBe(brand)
+    expect(brand.querySelector('.brand-logo')).toHaveClass('brand-logo--md')
+    expect(brand.querySelector('.brand-logo__mark')).toHaveAttribute('alt', '')
+    expect(brand.querySelector('.brand-logo__wordmark')).toHaveAttribute('alt', '')
+    expect(brand).not.toHaveTextContent('Plus')
     expect(collapse.querySelector('.lucide-panel-right')).toBeInTheDocument()
     expect(within(actions as HTMLElement).getAllByRole('button').map((button) => button.getAttribute('aria-label')))
       .toEqual(['搜索会话', '收起侧边栏'])
@@ -223,7 +221,7 @@ describe('Sidebar', () => {
     expect(newChat.parentElement).toHaveClass('new-chat-wrap')
     expect(historyScroll).not.toContainElement(newChat)
     expect(newChat).toHaveAttribute('aria-keyshortcuts', 'Meta+K')
-    expect(newChat).toHaveAttribute('title', 'Command + K 开启新会话')
+    expect(newChat).not.toHaveAttribute('title')
     expect(newChat.querySelector('.new-chat-shortcut')).toHaveTextContent('⌘ K')
 
     fireEvent.keyDown(document, { key: 'k', metaKey: true })
@@ -240,16 +238,17 @@ describe('Sidebar', () => {
     expect(onNew).not.toHaveBeenCalled()
   })
 
-  it('仅在当前草稿是新会话时选中新会话入口', () => {
+  it('新会话入口始终保持动作按钮语义，不显示选中态', () => {
     const { rerender } = render(<Sidebar {...baseProps} />)
 
     expect(screen.getByRole('button', { name: '新会话' })).not.toHaveClass('is-selected')
-    expect(screen.getByRole('button', { name: '新会话' })).toHaveAttribute('aria-pressed', 'false')
+    expect(screen.getByRole('button', { name: '新会话' })).not.toHaveAttribute('aria-pressed')
 
     rerender(<Sidebar {...baseProps} workspace={{ ...workspace, currentThreadId: '' }} />)
 
-    expect(screen.getByRole('button', { name: '新会话' })).toHaveClass('is-selected')
-    expect(screen.getByRole('button', { name: '新会话' })).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByRole('button', { name: '新会话' })).not.toHaveClass('is-selected')
+    expect(screen.getByRole('button', { name: '新会话' })).not.toHaveAttribute('aria-pressed')
+    expect(screen.queryByRole('tooltip', { name: '新会话' })).not.toBeInTheDocument()
   })
 
   it('按置顶和本地自然日渲染历史分组，不保留固定标题或行内置顶图标', () => {
@@ -803,7 +802,7 @@ describe('Sidebar rail and inline search', () => {
     expect(screen.queryByRole('menuitem', { name: '退出登录' })).not.toBeInTheDocument()
   })
 
-  it('在 Rail 导航中同步新会话的选中状态', () => {
+  it('Rail 新会话入口也保持无选中态', () => {
     render(
       <Sidebar
         {...baseProps}
@@ -815,7 +814,8 @@ describe('Sidebar rail and inline search', () => {
       />,
     )
 
-    expect(screen.getByRole('button', { name: '新会话' })).toHaveClass('is-selected')
+    expect(screen.getByRole('button', { name: '新会话' })).not.toHaveClass('is-selected')
+    expect(screen.getByRole('button', { name: '新会话' })).not.toHaveAttribute('aria-pressed')
   })
 
   it('focuses the input only after a rail expansion settles', async () => {

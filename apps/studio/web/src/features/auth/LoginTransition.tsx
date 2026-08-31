@@ -2,8 +2,7 @@ import { useGSAP } from '@gsap/react'
 import gsap from 'gsap'
 import { useRef } from 'react'
 
-import { BrandMark } from '../../components/ui/BrandMark'
-import { MOTION_DURATION_SECONDS } from '../../components/ui/motion'
+import { BrandMark, MOTION_DURATION_SECONDS } from '../../components/ui'
 import { useI18n } from '../../i18n'
 
 gsap.registerPlugin(useGSAP)

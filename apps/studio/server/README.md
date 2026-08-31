@@ -70,13 +70,16 @@ Graph 关联或持久化身份；Service 会为 Graph 输入与 Trace 快照分�
 
 - `GET /api/conversation/history` 只读取 Studio 列表摘要
 - `GET /api/conversation/{threadId}/history` 在校验用户归属后返回固定 `asOfSeq` 的 Trace 视图；
-  `historyCursor` 只扩展同一固定前缀的 Turn 窗口
+  `historyCursor` 只扩展同一固定前缀的 Turn 窗口；`includeTaskTrace=true` 会从同一 Trace 前缀
+  查询重建根 Agent 任务轨迹，`false` 跳过该投影
 - `GET /api/conversation/{threadId}/trace` 先发送完整 Trace snapshot，再按提交顺序发送语义增量；
-  断连或取消会关闭底层 follow iterator
+  `includeTaskTrace=true` 时只在任务轨迹实际变化后发送完整 replacement；断连或取消会关闭
+  底层 follow iterator 与请求内 projector
 - `POST /api/conversation/chat` 的当前 owned Run 使用 AG-UI + Messaging；终态会话正文仍以 Trace 为准
 
 Studio MySQL 只保存会话归属、Run 注册、interrupt claim 和列表摘要。Trace 的五张表由
 `SqlAlchemyTraceStore.setup()` 自动创建并校验，`database/mysql/schema.sql` 同时提供完整空库 DDL。
+任务轨迹不写第二份副本、不注册 Projection checkpoint，只读取公共 `TraceThread.events()`。
 LangGraph Store 由 `tinkerfin-langgraph-mysql` 通过 asyncmy 管理一条独立连接，进入资源上下文时
 自动执行当前 Store DDL，退出、异常或取消时自动关闭。
 

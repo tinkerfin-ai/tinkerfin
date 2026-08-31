@@ -2,6 +2,10 @@ import type { PendingInteractionKind, JsonObject, JsonValue } from '../../types'
 import { requestEventStream, requestJson } from '../shared/http'
 import { ConversationError } from './errors'
 import { parseJsonSseStream } from './sse'
+import {
+  parseTaskTraceSnapshot,
+  type TaskTraceSnapshot,
+} from './taskTrace'
 
 export interface ConversationHistoryListItem {
   id: number
@@ -127,9 +131,12 @@ export interface ConversationHistoryDetail {
   interactions: TraceInteraction[]
   status: TraceStatus
   completeness: TraceCompleteness
+  taskTrace: TaskTraceSnapshot | null
   createdAt: string
   updatedAt: string
 }
+
+export type ConversationHistoryCoreDetail = Omit<ConversationHistoryDetail, 'taskTrace'>
 
 export interface TraceEntityDelta<T> {
   upserts: T[]
@@ -154,7 +161,11 @@ export interface ConversationTraceUpdate {
 
 export type ConversationTraceEvent =
   | { type: 'snapshot'; snapshot: ConversationHistoryDetail }
-  | { type: 'update'; update: ConversationTraceUpdate }
+  | {
+      type: 'update'
+      update: ConversationTraceUpdate
+      taskTrace: TaskTraceSnapshot | null
+    }
   | { type: 'error'; code: 'trace_unavailable' }
 
 const CONVERSATION_API_PATH = '/api/conversation'
@@ -192,47 +203,90 @@ export const fetchConversationHistoryGroupConfig = (
 export const fetchConversationHistoryDetail = (
   threadId: string,
   options: {
+    includeTaskTrace: boolean
     historyCursor?: string | null
     limit?: number
     signal?: AbortSignal
     suppressGlobalError?: boolean
-  } = {},
+  },
 ): Promise<ConversationHistoryDetail> => {
   const search = new URLSearchParams()
+  search.set('includeTaskTrace', String(options.includeTaskTrace))
   if (options.historyCursor) search.set('historyCursor', options.historyCursor)
   if (options.limit) search.set('limit', String(options.limit))
   const query = search.toString() ? '?' + search.toString() : ''
-  return requestJson<ConversationHistoryDetail>(
+  return requestJson<unknown>(
     CONVERSATION_API_PATH + '/' + encodeURIComponent(threadId) + '/history' + query,
     {
       signal: options.signal,
       suppressGlobalError: options.suppressGlobalError,
     },
-  )
+  ).then((value) => parseHistoryDetail(value, options.includeTaskTrace))
 }
 
-const isTraceEvent = (value: unknown): value is ConversationTraceEvent => {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+const isRecord = (value: unknown): value is Record<string, unknown> => (
+  value !== null && typeof value === 'object' && !Array.isArray(value)
+)
+
+const parseHistoryDetail = (
+  value: unknown,
+  includeTaskTrace: boolean,
+): ConversationHistoryDetail => {
+  if (!isRecord(value) || !Object.hasOwn(value, 'taskTrace')) {
+    throw new ConversationError('stream_event_invalid')
+  }
+  if (includeTaskTrace) {
+    if (value.taskTrace === null) throw new ConversationError('stream_event_invalid')
+    parseTaskTraceSnapshot(value.taskTrace)
+  } else if (value.taskTrace !== null) {
+    throw new ConversationError('stream_event_invalid')
+  }
+  return value as unknown as ConversationHistoryDetail
+}
+
+const parseTraceEvent = (
+  value: unknown,
+  includeTaskTrace: boolean,
+): ConversationTraceEvent => {
+  if (!isRecord(value)) throw new ConversationError('stream_event_invalid')
   const record = value as Record<string, unknown>
-  if (record.type === 'snapshot') return Boolean(record.snapshot && typeof record.snapshot === 'object')
-  if (record.type === 'update') return Boolean(record.update && typeof record.update === 'object')
-  return record.type === 'error' && record.code === 'trace_unavailable'
+  if (record.type === 'snapshot') {
+    return {
+      type: 'snapshot',
+      snapshot: parseHistoryDetail(record.snapshot, includeTaskTrace),
+    }
+  }
+  if (record.type === 'update') {
+    if (!isRecord(record.update) || !Object.hasOwn(record, 'taskTrace')) {
+      throw new ConversationError('stream_event_invalid')
+    }
+    if (record.taskTrace !== null) {
+      if (!includeTaskTrace) throw new ConversationError('stream_event_invalid')
+      parseTaskTraceSnapshot(record.taskTrace)
+    }
+    return record as unknown as ConversationTraceEvent
+  }
+  if (record.type === 'error' && record.code === 'trace_unavailable') {
+    return { type: 'error', code: 'trace_unavailable' }
+  }
+  throw new ConversationError('stream_event_invalid')
 }
 
 export async function* followConversationTrace(
   threadId: string,
-  signal?: AbortSignal,
+  options: { includeTaskTrace: boolean; signal?: AbortSignal },
 ): AsyncGenerator<ConversationTraceEvent> {
+  const search = new URLSearchParams({
+    includeTaskTrace: String(options.includeTaskTrace),
+  })
   const response = await requestEventStream(
-    CONVERSATION_API_PATH + '/' + encodeURIComponent(threadId) + '/trace',
-    { signal, suppressGlobalError: true },
+    CONVERSATION_API_PATH + '/' + encodeURIComponent(threadId) + '/trace?' + search,
+    { signal: options.signal, suppressGlobalError: true },
   )
   if (!response.body) throw new ConversationError('stream_body_missing')
-  for await (const frame of parseJsonSseStream(response.body, signal)) {
-    if (frame.event !== 'trace' || !isTraceEvent(frame.data)) {
-      throw new ConversationError('stream_event_invalid')
-    }
-    yield frame.data
+  for await (const frame of parseJsonSseStream(response.body, options.signal)) {
+    if (frame.event !== 'trace') throw new ConversationError('stream_event_invalid')
+    yield parseTraceEvent(frame.data, options.includeTaskTrace)
   }
 }
 

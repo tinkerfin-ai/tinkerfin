@@ -86,6 +86,23 @@ describe('AuthScreen', () => {
     expect(authStyles).toMatch(/\.auth-form-stage\s*{[^}]*calc\(100vw - var\(--space-8\)\)/s)
   })
 
+  it('keeps the animated blue-violet ambient inside the desktop introduction pane', () => {
+    render(<AuthScreen onLogin={vi.fn()} />)
+
+    const ambient = document.querySelector('.auth-ambient')
+    expect(ambient).toHaveAttribute('aria-hidden', 'true')
+    expect(ambient?.querySelector('.auth-ambient-art')).not.toBeNull()
+    expect(ambient?.querySelectorAll('.auth-ribbon')).toHaveLength(2)
+    expect(ambient?.querySelector('.auth-ribbon__flow')).not.toBeInTheDocument()
+    expect(ambient?.querySelector('.auth-ambient-mist')).not.toBeNull()
+    expect(document.querySelector('.auth-signal-field')).not.toBeInTheDocument()
+    expect(authStyles).toMatch(/\.auth-ambient\s*{[^}]*inset:\s*0 46% 0 0;[^}]*overflow:\s*hidden;[^}]*isolation:\s*isolate;/s)
+    expect(authStyles).toMatch(/\.auth-ribbon\s*{[^}]*transform-box:\s*fill-box;[^}]*will-change:\s*transform;/s)
+    expect(authStyles).not.toContain('.auth-ribbon__flow')
+    expect(authStyles).toMatch(/@media \(max-width:\s*1023px\)[\s\S]*\.auth-ambient,[\s\S]*\.auth-intro\s*{[^}]*display:\s*none;/s)
+    expect(authStyles).toMatch(/@media \(prefers-reduced-motion:\s*reduce\)[\s\S]*\.auth-ribbon,[\s\S]*\.auth-ambient-mist\s*{[^}]*will-change:\s*auto;/s)
+  })
+
   it('uses the shared outlined field and lets the auth form own only its transparent surface', () => {
     render(<AuthScreen onLogin={vi.fn()} />)
 
@@ -107,13 +124,15 @@ describe('AuthScreen', () => {
     expect(authStyles).toMatch(/\.auth-page \.ui-button--text:hover:not\(:disabled\),[\s\S]*\.auth-page \.ui-button--text:active:not\(:disabled\)\s*{[^}]*background:\s*transparent;[^}]*box-shadow:\s*none;/s)
   })
 
-  it('renders the static brand without interactive hover states', () => {
+  it('renders the static brand asset without interactive hover states', () => {
     render(<AuthScreen onLogin={vi.fn()} />)
 
     expect(screen.queryByRole('button', { name: 'TinkerFin' })).not.toBeInTheDocument()
-    expect(document.querySelector('.auth-brand')).toHaveTextContent('TinkerFin')
-    expect(document.querySelector('.auth-brand .brand-mark svg')).toHaveAttribute('width', '22')
-    expect(document.querySelector('.auth-brand .brand-mark svg')).toHaveAttribute('height', '22')
+    const brand = document.querySelector('.auth-brand')
+    expect(brand?.querySelector('.brand-logo')).toHaveClass('brand-logo--md')
+    expect(brand?.querySelector('.brand-logo__mark')).toHaveAttribute('alt', '')
+    expect(brand?.querySelector('.brand-logo__wordmark')).toHaveAttribute('alt', '')
+    expect(brand).toHaveTextContent('')
     expect(authStyles).not.toMatch(/\.auth-brand:(hover|active|focus-visible|disabled)/)
   })
 

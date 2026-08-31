@@ -118,6 +118,7 @@ async def get_conversation_history_service(
         ConversationRepository(session),
         user_id=user.user_id,
         tracer=get_resources(request.app).tracer,
+        todo_group_query=get_resources(request.app).todo_group_query,
     )
 
 

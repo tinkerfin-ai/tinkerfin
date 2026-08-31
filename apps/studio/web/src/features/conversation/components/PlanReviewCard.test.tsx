@@ -168,6 +168,7 @@ describe('PlanReviewCard', () => {
     expect(conversationStyles).toMatch(/\.approval-allow-button\s*\{[^}]*background:\s*var\(--color-text-primary\);/s)
     expect(conversationStyles).toMatch(/\.approval-rejection-form,\s*\.plan-review-rejection-form\s*\{[^}]*display:\s*grid;/s)
     expect(conversationStyles).toMatch(/\.plan-review-composer-footer\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) auto;[^}]*min-height:\s*var\(--space-16\);[^}]*padding:\s*var\(--space-3\) var\(--space-4\);/s)
+    expect(conversationStyles).toMatch(/\.plan-question-composer-footer::before,\s*\.plan-review-composer-footer::before\s*\{[^}]*linear-gradient\([\s\S]*color-mix\(in srgb, var\(--color-layer-1\) 72%, transparent\)/s)
     expect(conversationStyles).not.toContain('.plan-review-input.is-editor')
     expect(conversationStyles).not.toContain('.plan-review-actions')
   })

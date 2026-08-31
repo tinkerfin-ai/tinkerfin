@@ -6,6 +6,7 @@ import asyncio
 import logging
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
+from dataclasses import replace
 from typing import ClassVar, Literal, cast
 
 import pytest
@@ -14,19 +15,21 @@ import tinkerfin_messaging
 from tinkerfin import RunIdentity
 from tinkerfin_messaging import (
     BackendOwnershipLost,
-    BackendRunHandle,
     MemoryBackend,
     MessageEnvelope,
     MessageSubscription,
     Messaging,
     MessagingBackend,
+    MessagingBackendSettings,
     MessagingClosed,
     MessagingNotStarted,
-    PreparedRun,
+    MessagingTransition,
+    MessagingTransitionResult,
     RecoverableMessage,
     RecoveryCheckpoint,
     RunProducerFailed,
 )
+from tinkerfin_messaging.backend import _BackendRunHandle
 
 
 def _identity(*, run_id: str = "run-1") -> RunIdentity:
@@ -110,17 +113,6 @@ class _TrackingBackend(MemoryBackend):
         super().__init__()
         self.follow_close_calls = 0
 
-    def follow(
-        self,
-        handle: BackendRunHandle,
-        *,
-        after: int,
-    ) -> AsyncIterator[MessageEnvelope]:
-        return _TrackingIterator(
-            super().follow(handle, after=after),
-            self,
-        )
-
 
 class _BlockingCloseIterator(_TrackingIterator):
     def __init__(
@@ -145,22 +137,37 @@ class _BlockingFollowerBackend(_TrackingBackend):
         self.close_release = asyncio.Event()
         self.close_finished = asyncio.Event()
 
-    def follow(
-        self,
-        handle: BackendRunHandle,
+
+def _install_tracking_follow(
+    messaging: Messaging,
+    backend: _TrackingBackend,
+    *,
+    block_close: bool = False,
+) -> None:
+    original_follow = messaging._runtime_backend.follow
+
+    def tracked_follow(
+        handle: _BackendRunHandle,
         *,
         after: int,
     ) -> AsyncIterator[MessageEnvelope]:
-        return _BlockingCloseIterator(
-            MemoryBackend.follow(self, handle, after=after),
-            self,
-        )
+        iterator = original_follow(handle, after=after)
+        if block_close:
+            assert isinstance(backend, _BlockingFollowerBackend)
+            return _BlockingCloseIterator(iterator, backend)
+        return _TrackingIterator(iterator, backend)
+
+    setattr(messaging._runtime_backend, "follow", tracked_follow)
 
 
 class _LeasedMemoryBackend(MemoryBackend):
     @property
-    def lease_renew_interval(self) -> float:
-        return 0.01
+    def messaging_settings(self) -> MessagingBackendSettings:
+        return replace(
+            super().messaging_settings,
+            producer_renew_interval_seconds=0.01,
+            producer_lease_seconds=0.03,
+        )
 
 
 class _DiagnosticLeaseBackend(MemoryBackend):
@@ -177,43 +184,31 @@ class _DiagnosticLeaseBackend(MemoryBackend):
         self.renew_calls = 0
 
     @property
-    def lease_renew_interval(self) -> float:
-        return self.timeout / 3
-
-    @property
-    def lease_timeout(self) -> float:
-        return self.timeout
-
-    async def prepare(
-        self,
-        *,
-        channel: str,
-        identity: RunIdentity,
-        codec: str,
-        after: int | None,
-        cancellable: bool,
-        recoverable: bool,
-    ) -> PreparedRun:
-        prepared = await super().prepare(
-            channel=channel,
-            identity=identity,
-            codec=codec,
-            after=after,
-            cancellable=cancellable,
-            recoverable=recoverable,
+    def messaging_settings(self) -> MessagingBackendSettings:
+        return replace(
+            super().messaging_settings,
+            producer_renew_interval_seconds=self.timeout / 3,
+            producer_lease_seconds=self.timeout,
         )
-        if prepared.is_owner:
-            self.expires_at = time.monotonic() + self.timeout
-        return prepared
 
-    async def renew(self, handle: BackendRunHandle) -> bool:
-        self.renew_calls += 1
-        if self.behavior == "exception":
-            raise RuntimeError("diagnostic backend renew failed")
-        if self.behavior == "reject" or time.monotonic() >= self.expires_at:
-            return False
-        self.expires_at = time.monotonic() + self.timeout
-        return await super().renew(handle)
+    async def commit_messaging_transition(
+        self,
+        transition: MessagingTransition,
+    ) -> MessagingTransitionResult:
+        if transition.kind == "renew_producer_ownership":
+            self.renew_calls += 1
+            if self.behavior == "exception":
+                raise RuntimeError("diagnostic backend renew failed")
+            if self.behavior == "reject" or time.monotonic() >= self.expires_at:
+                return MessagingTransitionResult(
+                    kind=transition.kind,
+                    producer_ownership_confirmed=False,
+                )
+            self.expires_at = time.monotonic() + self.timeout
+        result = await super().commit_messaging_transition(transition)
+        if transition.kind == "prepare_run" and result.is_producer_owner:
+            self.expires_at = time.monotonic() + self.timeout
+        return result
 
 
 class _BlockingEventLoopSource(_Source):
@@ -240,59 +235,49 @@ class _BlockingPrepareBackend(MemoryBackend):
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
 
-    async def prepare(
+    async def commit_messaging_transition(
         self,
-        *,
-        channel: str,
-        identity: RunIdentity,
-        codec: str,
-        after: int | None,
-        cancellable: bool,
-        recoverable: bool,
-    ) -> PreparedRun:
-        self.entered.set()
-        await self.release.wait()
-        return await super().prepare(
-            channel=channel,
-            identity=identity,
-            codec=codec,
-            after=after,
-            cancellable=cancellable,
-            recoverable=recoverable,
-        )
+        transition: MessagingTransition,
+    ) -> MessagingTransitionResult:
+        if transition.kind == "prepare_run":
+            self.entered.set()
+            await self.release.wait()
+        return await super().commit_messaging_transition(transition)
+
+
+class _StorageSetupBackend(MemoryBackend):
+    def __init__(self, *, fail_first: bool = False) -> None:
+        super().__init__()
+        self.fail_first = fail_first
+        self.calls = 0
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.finished = asyncio.Event()
+        self.cancelled = False
+
+    async def prepare_messaging_storage(self) -> None:
+        self.calls += 1
+        self.started.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        if self.fail_first and self.calls == 1:
+            raise RuntimeError("storage setup failed")
+        self.finished.set()
 
 
 class _CancellationResistantPrepareBackend(_BlockingPrepareBackend):
-    async def prepare(
+    async def commit_messaging_transition(
         self,
-        *,
-        channel: str,
-        identity: RunIdentity,
-        codec: str,
-        after: int | None,
-        cancellable: bool,
-        recoverable: bool,
-    ) -> PreparedRun:
+        transition: MessagingTransition,
+    ) -> MessagingTransitionResult:
         try:
-            return await super().prepare(
-                channel=channel,
-                identity=identity,
-                codec=codec,
-                after=after,
-                cancellable=cancellable,
-                recoverable=recoverable,
-            )
+            return await super().commit_messaging_transition(transition)
         except asyncio.CancelledError:
             await self.release.wait()
-            return await MemoryBackend.prepare(
-                self,
-                channel=channel,
-                identity=identity,
-                codec=codec,
-                after=after,
-                cancellable=cancellable,
-                recoverable=recoverable,
-            )
+            return await MemoryBackend.commit_messaging_transition(self, transition)
 
 
 class _BlockingAppendBackend(MemoryBackend):
@@ -303,29 +288,21 @@ class _BlockingAppendBackend(MemoryBackend):
         self.release_append = asyncio.Event()
         self.append_cancelled = asyncio.Event()
 
-    async def append(
+    async def commit_messaging_transition(
         self,
-        handle: BackendRunHandle,
-        *,
-        message_id: str,
-        codec: str,
-        payload: bytes,
-        checkpoint: RecoveryCheckpoint | None = None,
-    ) -> MessageEnvelope:
-        if payload == self.blocked_payload:
+        transition: MessagingTransition,
+    ) -> MessagingTransitionResult:
+        if (
+            transition.kind == "append_message"
+            and transition.payload == self.blocked_payload
+        ):
             self.append_started.set()
             try:
                 await self.release_append.wait()
             except asyncio.CancelledError:
                 self.append_cancelled.set()
                 raise
-        return await super().append(
-            handle,
-            message_id=message_id,
-            codec=codec,
-            payload=payload,
-            checkpoint=checkpoint,
-        )
+        return await super().commit_messaging_transition(transition)
 
 
 class _CountingBlockingAppendBackend(_BlockingAppendBackend):
@@ -333,15 +310,13 @@ class _CountingBlockingAppendBackend(_BlockingAppendBackend):
         super().__init__(blocked_payload=blocked_payload)
         self.finish_calls = 0
 
-    async def finish(
+    async def commit_messaging_transition(
         self,
-        handle: BackendRunHandle,
-        *,
-        status: Literal["completed", "cancelled", "failed", "owner_lost"],
-        error: BaseException | None = None,
-    ) -> None:
-        self.finish_calls += 1
-        await super().finish(handle, status=status, error=error)
+        transition: MessagingTransition,
+    ) -> MessagingTransitionResult:
+        if transition.kind == "finish_run":
+            self.finish_calls += 1
+        return await super().commit_messaging_transition(transition)
 
 
 class _FinishFailureBackend(MemoryBackend):
@@ -351,20 +326,16 @@ class _FinishFailureBackend(MemoryBackend):
         self.release_finish = asyncio.Event()
         self.finish_calls = 0
 
-    async def finish(
+    async def commit_messaging_transition(
         self,
-        handle: BackendRunHandle,
-        *,
-        status: Literal["completed", "cancelled", "failed", "owner_lost"],
-        error: BaseException | None = None,
-    ) -> None:
-        del status, error
-        self.finish_calls += 1
-        self.finish_started.set()
-        await self.release_finish.wait()
-        raise BackendOwnershipLost(
-            f"Producer for run {handle.identity.run_id!r} lost ownership during finish"
-        )
+        transition: MessagingTransition,
+    ) -> MessagingTransitionResult:
+        if transition.kind == "finish_run":
+            self.finish_calls += 1
+            self.finish_started.set()
+            await self.release_finish.wait()
+            raise BackendOwnershipLost("Producer lost ownership during finish")
+        return await super().commit_messaging_transition(transition)
 
 
 class _DelayedCancelObservationBackend(MemoryBackend):
@@ -373,13 +344,6 @@ class _DelayedCancelObservationBackend(MemoryBackend):
         self.cancel_is_durable = asyncio.Event()
         self.release_observer = asyncio.Event()
 
-    async def wait_for_cancel(self, handle: BackendRunHandle) -> bool:
-        requested = await super().wait_for_cancel(handle)
-        if requested:
-            self.cancel_is_durable.set()
-            await self.release_observer.wait()
-        return requested
-
 
 class _BlockingSettlementBackend(MemoryBackend):
     def __init__(self) -> None:
@@ -387,10 +351,14 @@ class _BlockingSettlementBackend(MemoryBackend):
         self.settlement_entered = asyncio.Event()
         self.release_settlement = asyncio.Event()
 
-    async def begin_settlement(self, handle: BackendRunHandle) -> bool:
-        self.settlement_entered.set()
-        await self.release_settlement.wait()
-        return await super().begin_settlement(handle)
+    async def commit_messaging_transition(
+        self,
+        transition: MessagingTransition,
+    ) -> MessagingTransitionResult:
+        if transition.kind == "begin_settlement":
+            self.settlement_entered.set()
+            await self.release_settlement.wait()
+        return await super().commit_messaging_transition(transition)
 
 
 class _ClaimThenBlockSettlementBackend(MemoryBackend):
@@ -401,18 +369,31 @@ class _ClaimThenBlockSettlementBackend(MemoryBackend):
         self.settlement_claimed = asyncio.Event()
         self.release_response = asyncio.Event()
 
-    async def wait_for_cancel(self, handle: BackendRunHandle) -> bool:
-        requested = await super().wait_for_cancel(handle)
+    async def commit_messaging_transition(
+        self,
+        transition: MessagingTransition,
+    ) -> MessagingTransitionResult:
+        result = await super().commit_messaging_transition(transition)
+        if transition.kind == "begin_settlement":
+            self.settlement_claimed.set()
+            await self.release_response.wait()
+        return result
+
+
+def _install_delayed_cancel_observer(
+    messaging: Messaging,
+    backend: _DelayedCancelObservationBackend | _ClaimThenBlockSettlementBackend,
+) -> None:
+    original_wait = messaging._runtime_backend.wait_for_cancel
+
+    async def delayed_wait(handle: _BackendRunHandle) -> bool:
+        requested = await original_wait(handle)
         if requested:
-            self.cancel_is_durable.set()
-            await self.release_observer.wait()
+            backend.cancel_is_durable.set()
+            await backend.release_observer.wait()
         return requested
 
-    async def begin_settlement(self, handle: BackendRunHandle) -> bool:
-        result = await super().begin_settlement(handle)
-        self.settlement_claimed.set()
-        await self.release_response.wait()
-        return result
+    setattr(messaging._runtime_backend, "wait_for_cancel", delayed_wait)
 
 
 class _RecoverableSource:
@@ -501,11 +482,82 @@ async def test_messaging_is_single_use_and_requires_an_open_lifecycle() -> None:
         await messaging.__aenter__()
 
 
+async def test_storage_setup_survives_enter_caller_cancellation() -> None:
+    backend = _StorageSetupBackend()
+    messaging = Messaging(backend=backend)
+    entering = asyncio.create_task(messaging.__aenter__())
+    await asyncio.wait_for(backend.started.wait(), timeout=1)
+
+    entering.cancel("caller stopped waiting for setup")
+    with pytest.raises(
+        asyncio.CancelledError, match="caller stopped waiting for setup"
+    ):
+        await entering
+    assert backend.cancelled is False
+    backend.release.set()
+    await asyncio.wait_for(backend.finished.wait(), timeout=1)
+
+    await messaging.__aenter__()
+    assert backend.calls == 1
+    await messaging.aclose()
+
+
+async def test_concurrent_storage_setup_enter_is_rejected() -> None:
+    backend = _StorageSetupBackend()
+    messaging = Messaging(backend=backend)
+    first_enter = asyncio.create_task(messaging.__aenter__())
+    await asyncio.wait_for(backend.started.wait(), timeout=1)
+
+    with pytest.raises(MessagingClosed, match="already open"):
+        await messaging.__aenter__()
+
+    backend.release.set()
+    assert await asyncio.wait_for(first_enter, timeout=1) is messaging
+    assert backend.calls == 1
+    await messaging.aclose()
+
+
+async def test_close_during_storage_setup_prevents_reopening() -> None:
+    backend = _StorageSetupBackend()
+    messaging = Messaging(backend=backend)
+    entering = asyncio.create_task(messaging.__aenter__())
+    await asyncio.wait_for(backend.started.wait(), timeout=1)
+
+    closing = asyncio.create_task(messaging.aclose())
+    await asyncio.sleep(0)
+    assert not closing.done()
+    assert not entering.done()
+
+    backend.release.set()
+    with pytest.raises(MessagingClosed, match="closed during storage preparation"):
+        await asyncio.wait_for(entering, timeout=1)
+    await asyncio.wait_for(closing, timeout=1)
+
+    assert backend.cancelled is False
+    assert backend.finished.is_set()
+    with pytest.raises(MessagingClosed):
+        await messaging.__aenter__()
+
+
+async def test_storage_setup_failure_can_retry_on_the_next_enter() -> None:
+    backend = _StorageSetupBackend(fail_first=True)
+    backend.release.set()
+    messaging = Messaging(backend=backend)
+
+    with pytest.raises(RuntimeError, match="storage setup failed"):
+        await messaging.__aenter__()
+    await messaging.__aenter__()
+
+    assert backend.calls == 2
+    await messaging.aclose()
+
+
 async def test_backend_subscription_closes_after_normal_completion() -> None:
     backend = _TrackingBackend()
     source = _Source("one", "two")
 
     async with Messaging(backend=backend) as messaging:
+        _install_tracking_follow(messaging, backend)
         channel = messaging.channel(name="events", codec=_TextCodec())
         subscription = await channel.wrap(
             source,
@@ -523,6 +575,7 @@ async def test_backend_subscription_closes_on_early_detach() -> None:
     source = _Source("one", release=release)
 
     async with Messaging(backend=backend) as messaging:
+        _install_tracking_follow(messaging, backend)
         channel = messaging.channel(name="events", codec=_TextCodec())
         subscription = await channel.wrap(
             source,
@@ -547,6 +600,7 @@ async def test_subscription_close_survives_caller_cancellation() -> None:
     source = _Source("one", release=release)
 
     async with Messaging(backend=backend) as messaging:
+        _install_tracking_follow(messaging, backend, block_close=True)
         channel = messaging.channel(name="events", codec=_TextCodec())
         subscription = await channel.wrap(source, identity=_identity(), after=0)
         assert (await anext(aiter(subscription))).data == "one"
@@ -572,6 +626,7 @@ async def test_never_iterated_subscription_closes_without_claiming_delivery() ->
     source = _Source("one")
 
     async with Messaging(backend=backend) as messaging:
+        _install_tracking_follow(messaging, backend)
         channel = messaging.channel(name="events", codec=_TextCodec())
         subscription = await channel.wrap(
             source,
@@ -591,6 +646,7 @@ async def test_backend_subscription_closes_on_producer_failure() -> None:
     source = _Source("one", error=cause)
 
     async with Messaging(backend=backend) as messaging:
+        _install_tracking_follow(messaging, backend)
         channel = messaging.channel(name="events", codec=_TextCodec())
         subscription = await channel.wrap(
             source,
@@ -959,8 +1015,8 @@ async def test_immediate_shutdown_after_wrap_closes_source_and_settles_run() -> 
 
     assert source.close_calls == 1
     status = await asyncio.wait_for(
-        backend.wait_finished(
-            BackendRunHandle(
+        messaging._runtime_backend.wait_finished(
+            _BackendRunHandle(
                 channel="events",
                 identity=_identity(),
                 owner_token=None,
@@ -1028,6 +1084,7 @@ async def test_shutdown_honors_durable_cancel_before_watcher_returns() -> None:
         return ("cancelled-tail",)
 
     await messaging.__aenter__()
+    _install_delayed_cancel_observer(messaging, backend)
     channel = messaging.channel(name="events", codec=_TextCodec())
     subscription = await channel.wrap(
         source,
@@ -1042,8 +1099,8 @@ async def test_shutdown_honors_durable_cancel_before_watcher_returns() -> None:
 
     closing = asyncio.create_task(messaging.__aexit__(None, None, None))
     status = await asyncio.wait_for(
-        backend.wait_finished(
-            BackendRunHandle(
+        messaging._runtime_backend.wait_finished(
+            _BackendRunHandle(
                 channel="events",
                 identity=_identity(),
                 owner_token=None,
@@ -1113,6 +1170,7 @@ async def test_cancelled_shutdown_finishes_a_claimed_settlement() -> None:
         return ("cancelled-tail",)
 
     await messaging.__aenter__()
+    _install_delayed_cancel_observer(messaging, backend)
     channel = messaging.channel(name="events", codec=_TextCodec())
     subscription = await channel.wrap(
         source,

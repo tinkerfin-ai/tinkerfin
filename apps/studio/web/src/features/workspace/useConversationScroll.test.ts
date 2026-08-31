@@ -13,6 +13,7 @@ const conversation: Conversation = {
   mode: 'default',
   messages: [],
   todos: [],
+  taskTrace: { phase: 'unloaded' },
   runStatus: 'idle',
   isHydrated: true,
 }
@@ -94,7 +95,7 @@ describe('useConversationScroll', () => {
     expect(result.current.fadeScrollToBottom).toBe(true)
   })
 
-  it('does not flash again while rapidly scrolling toward the bottom after the idle hide', () => {
+  it('shows again for either scroll direction after idle hide until reaching the bottom', () => {
     const { result } = renderHook(() => useConversationScroll({ conversation, isRunning: false }))
     const pane = document.createElement('section')
     Object.defineProperties(pane, {
@@ -119,8 +120,10 @@ describe('useConversationScroll', () => {
       result.current.handleScroll(pane)
     })
     act(() => vi.advanceTimersByTime(0))
-    expect(result.current.showScrollToBottom).toBe(false)
+    expect(result.current.showScrollToBottom).toBe(true)
 
+    act(() => vi.advanceTimersByTime(1800))
+    expect(result.current.showScrollToBottom).toBe(false)
     pane.scrollTop = 800
     act(() => {
       result.current.markUserScrollIntent()

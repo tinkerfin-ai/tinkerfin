@@ -71,6 +71,7 @@ const toolSummary = (
   presentation: ToolPresentation | undefined,
 ) => {
   const params = message.meta?.params ?? ''
+  if (toolName === 'write_todos') return ''
   const parsed = params ? parseParams(params) : null
   let summary = ''
 
@@ -102,12 +103,18 @@ export function ToolCallRow({
   className,
   open,
   onOpenChange,
+  presentationOverride,
   children,
 }: {
   message: Message
   className?: string
   open?: boolean
   onOpenChange?: (open: boolean) => void
+  presentationOverride?: {
+    title: string
+    summary?: string
+    icon?: ReactNode
+  }
   children: ReactNode
 }) {
   const { t } = useI18n()
@@ -118,7 +125,9 @@ export function ToolCallRow({
   const failure = status === 'failed' && Boolean(message.meta?.result)
     ? firstLine(message.meta?.result ?? '')
     : ''
-  const summary = failure || toolSummary(message, toolName, presentation)
+  const summary = presentationOverride?.summary !== undefined
+    ? presentationOverride.summary
+    : failure || toolSummary(message, toolName, presentation)
 
   return (
     <details
@@ -126,9 +135,16 @@ export function ToolCallRow({
       className={`tool-row ${status}${className ? ` ${className}` : ''}`}
       open={open}
       data-tool-name={toolName}
-      onToggle={onOpenChange
-        ? (event) => onOpenChange(event.currentTarget.open)
-        : undefined}
+      onToggle={(event) => {
+        const row = event.currentTarget
+        onOpenChange?.(row.open)
+        if (!row.open) return
+        // 展开后的真实高度下一帧才稳定，只滚动到刚好避开输入区的位置
+        window.requestAnimationFrame(() => {
+          if (!row.open || !row.isConnected) return
+          row.scrollIntoView?.({ behavior: 'auto', block: 'nearest' })
+        })
+      }}
     >
       <summary>
         <span className="tool-row-visually-hidden">{statusText(status, t)}</span>
@@ -136,11 +152,13 @@ export function ToolCallRow({
           <span className="tool-row-icon">
             {status === 'failed' || status === 'cancelled'
               ? <span className={`tool-row-state-dot is-${status}`} />
-              : <ToolIcon size={14} strokeWidth={2} />}
+              : presentationOverride?.icon ?? <ToolIcon size={14} strokeWidth={2} />}
           </span>
           <ChevronDown className="tool-row-chevron" size={14} strokeWidth={2} />
         </span>
-        <span className="tool-row-title">{presentation?.title ?? 'Tool call'}</span>
+        <span className="tool-row-title">
+          {presentationOverride?.title ?? presentation?.title ?? 'Tool call'}
+        </span>
         {summary
           ? <>
               <span className="tool-row-separator" aria-hidden="true" />

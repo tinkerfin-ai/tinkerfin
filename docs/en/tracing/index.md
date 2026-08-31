@@ -174,6 +174,26 @@ await store.setup()
 tracer = Tracer(store=store)
 ```
 
+An unsupported shared database integrates through `TraceLedgerBackend`, not by
+reimplementing `TraceStore` and `TraceWriter`:
+
+```python
+from my_trace_storage import MyTraceLedgerBackend
+from tinkerfin_tracing import DurableTraceStore, Tracer
+
+backend = MyTraceLedgerBackend(database_client)
+store = DurableTraceStore(backend, namespace="my-application")
+await store.setup()
+tracer = Tracer(store=store)
+```
+
+The Backend implements exactly five storage operations: prepare storage, commit one
+atomic Ledger change, load Ledger state, read one event page, and load one Projection
+checkpoint. The framework owns writer lifecycle, terminal reserve, sequence allocation,
+checkpoint decisions, canonical validation, follow polling, backpressure, and
+cancellation. `verify_trace_ledger_backend()` checks the shared observable contract
+using two independent Backend clients.
+
 SQL writers use database-clock leases and monotonically increasing fences. An expired
 incomplete writer becomes `missing_tail`, keeps reserved terminal capacity, and can be
 taken over; a completed Run cannot be taken over. SQLite lock waits enter a bounded,
@@ -183,10 +203,11 @@ one repeatable database snapshot.
 
 Facts and Projection state use canonical finite UTF-8 JSON. Their SHA-256 digest covers
 the canonical bytes before storage and is verified on read. Trace persistence
-does not include S3/Blob archiving, encryption/KMS, or OpenTelemetry exporters. A
-concrete archive or Blob integration implements or decorates `TraceStore`; encryption
-wraps the canonical payload codec without changing its pre-transform digest; telemetry
-observes `RuntimeObserver` or decorates Store/Messaging Backend operations. These active
-boundaries are the extension contract, so tracing exposes no empty capability interface.
+does not include S3/Blob archiving, encryption/KMS, or OpenTelemetry exporters. Active
+shared storage implements `TraceLedgerBackend`; a complete `TraceStore` replacement is
+the advanced extension boundary. Encryption wraps the canonical payload codec without
+changing its pre-transform digest; telemetry observes `RuntimeObserver` or decorates
+Store/Messaging Backend operations. Blob storage without atomic conditional changes is
+an archive target, not an active Ledger.
 
 Next: [Tracing API reference](api-reference.md).

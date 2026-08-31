@@ -7,10 +7,11 @@ from typing import cast
 from uuid import uuid4
 
 import pytest
+from backend_harness import MessagingBackendHarness
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
-from tinkerfin_messaging import MemoryBackend, MessagingBackend, RedisBackend
+from tinkerfin_messaging import MemoryBackend, RedisBackend
 
 
 async def _delete_prefix(client: Redis, prefix: str) -> None:
@@ -39,11 +40,11 @@ async def _delete_prefix(client: Redis, prefix: str) -> None:
 )
 async def messaging_backend(
     request: pytest.FixtureRequest,
-) -> AsyncGenerator[MessagingBackend, None]:
+) -> AsyncGenerator[MessagingBackendHarness, None]:
     """Yield an isolated backend implementation for the shared runtime contract."""
 
     if request.param == "memory":
-        yield MemoryBackend()
+        yield MessagingBackendHarness(MemoryBackend())
         return
 
     redis_url = request.getfixturevalue("redis_url")
@@ -63,11 +64,13 @@ async def messaging_backend(
                 "real Redis PING failed without exposing credentials: "
                 f"{type(error).__name__}"
             )
-        yield RedisBackend(
-            client,
-            key_prefix=prefix,
-            lease_ttl=3,
-            poll_interval=0.02,
+        yield MessagingBackendHarness(
+            RedisBackend(
+                client,
+                key_prefix=prefix,
+                producer_lease_seconds=3,
+                generation_cleanup_retry_seconds=0.02,
+            )
         )
     finally:
         await _delete_prefix(client, prefix)

@@ -1,7 +1,7 @@
 # TinkerFin Studio Web 客户端
 
 该目录包含 React 19 与 TypeScript 客户端，提供登录、会话列表、owned Run 的 AG-UI SSE、
-Trace 历史与跟随、任务与 Tool 状态、子 Agent 展示和 HITL 中断恢复。
+Trace 历史与跟随、会话任务轨迹、Tool 状态、子 Agent 展示和 HITL 中断恢复。
 
 ## 本地运行
 
@@ -74,6 +74,13 @@ owned Run 进入终态后，客户端重新读取 Trace，并用权威视图替�
 Turn；存在 `historyCursor` 时，“加载更早消息”从同一固定 `asOfSeq` 再扩展 100 个 Turn。
 已读取内容仍按 100 个可见条目分批展开并保持当前阅读位置。Trace follow 的实时增量不会进入
 AG-UI 历史 reducer。
+
+根 Agent 成功确认的 `write_todos` 在所属用户轮次显示为 `Todos`，Todo 内容只取根状态。
+Composer 输入框上方的辅助操作行在需要时居中显示「回到底部」、右侧显示「任务轨迹 N」；任务
+轨迹打开统一倒序树，同一时间只展开一个 Group，可从 Group 定位到对应用户消息。只有当前会话
+请求任务轨迹，非当前 detached follow 显式跳过；切换会话时释放旧
+Group/Todo 对象图。客户端不把任务轨迹数据写入 localStorage、sessionStorage 或服务端副本，
+sessionStorage 只保存每个会话的抽屉开关偏好。
 
 默认代理目标是 `http://127.0.0.1:8090`。需要临时连接其他本地端口时设置：
 

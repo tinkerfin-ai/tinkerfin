@@ -5,19 +5,22 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncGenerator, AsyncIterator
+from dataclasses import replace
 from typing import ClassVar
 
 import pytest
+from backend_harness import MessagingBackendHarness
 
 from tinkerfin import RunIdentity
 from tinkerfin_messaging import (
     BackendOwnershipLost,
-    BackendRunHandle,
     CancelContext,
     MemoryBackend,
     MessageSubscription,
     Messaging,
-    MessagingBackend,
+    MessagingBackendSettings,
+    MessagingTransition,
+    MessagingTransitionResult,
     RecoverableMessage,
     RecoveryCheckpoint,
     RunProducerFailed,
@@ -99,13 +102,21 @@ class _ConcurrentRenewalFailureBackend(MemoryBackend):
         self._barrier = barrier
 
     @property
-    def lease_renew_interval(self) -> float:
-        return 0.001
+    def messaging_settings(self) -> MessagingBackendSettings:
+        return replace(
+            super().messaging_settings,
+            producer_renew_interval_seconds=0.001,
+            producer_lease_seconds=0.003,
+        )
 
-    async def renew(self, handle: BackendRunHandle) -> bool:
-        del handle
-        await self._barrier.wait()
-        raise BackendOwnershipLost("recoverable source owner lease was lost")
+    async def commit_messaging_transition(
+        self,
+        transition: MessagingTransition,
+    ) -> MessagingTransitionResult:
+        if transition.kind == "renew_producer_ownership":
+            await self._barrier.wait()
+            raise BackendOwnershipLost("recoverable source owner lease was lost")
+        return await super().commit_messaging_transition(transition)
 
 
 async def _data(subscription: MessageSubscription[str]) -> list[str]:
@@ -113,7 +124,7 @@ async def _data(subscription: MessageSubscription[str]) -> list[str]:
 
 
 async def test_recoverable_owner_uses_stable_id_and_attach_does_not_open_factory(
-    messaging_backend: MessagingBackend,
+    messaging_backend: MessagingBackendHarness,
 ) -> None:
     release = asyncio.Event()
     source = _Source(
@@ -186,7 +197,7 @@ async def test_recoverable_owner_uses_stable_id_and_attach_does_not_open_factory
 
 
 async def test_recoverable_factory_failure_settles_run_before_returning(
-    messaging_backend: MessagingBackend,
+    messaging_backend: MessagingBackendHarness,
 ) -> None:
     cause = RuntimeError("cannot reopen source")
     failed_factory = _Factory(error=cause)
@@ -274,7 +285,7 @@ def test_recoverable_checkpoint_must_match_the_stable_message_id() -> None:
 
 
 async def test_recoverable_cancel_callback_returns_checkpointed_tail(
-    messaging_backend: MessagingBackend,
+    messaging_backend: MessagingBackendHarness,
 ) -> None:
     release = asyncio.Event()
     first = RecoverableMessage(

@@ -14,9 +14,9 @@ __all__ = [
 ]
 
 import hashlib
-from collections.abc import AsyncGenerator, Mapping, Sequence
+from collections.abc import Mapping
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from tinkerfin_contracts import RunIdentity
@@ -24,17 +24,16 @@ from tinkerfin_contracts import RunIdentity
 from ._identity import required_identifier, required_identity
 from ._redis_control import (
     _SNAPSHOT_PAGE_SIZE,
-    _redis_call,
+    _complete_generation_cleanup,
     _redis_protocol_error,
     _RedisScriptValue,
     _RunSnapshot,
 )
 from ._redis_scripts import _APPEND_SCRIPT, _PREPARE_SCRIPT
 from .backend import (
-    BackendRunHandle,
-    PreparedRun,
+    _BackendRunHandle,
+    _PreparedRun,
     _validate_append_input,
-    is_failed_run_status,
 )
 from .errors import (
     BackendOwnershipLost,
@@ -43,8 +42,6 @@ from .errors import (
     MessageIdConflict,
     MessagingQuotaExceeded,
     RunAlreadyActive,
-    RunNotFound,
-    RunProducerFailed,
     StreamDeleted,
     StreamExpired,
 )
@@ -63,7 +60,7 @@ async def prepare(
     after: int | None,
     cancellable: bool,
     recoverable: bool,
-) -> PreparedRun:
+) -> _PreparedRun:
     """Atomically start, recover, or attach within one thread generation.
 
     The Lua contract validates codec, limits, cursor, active-run exclusion, recovery
@@ -104,6 +101,14 @@ async def prepare(
                 identity=identity,
                 generation=control.generation,
             )
+        elif control.state == "expiring":
+            await _complete_generation_cleanup(
+                self,
+                channel=channel,
+                identity=identity,
+                requested_reason="expired",
+            )
+            continue
         elif control.state in {"deleted", "expired"}:
             if control.state == "expired" and after not in {None, 0}:
                 raise StreamExpired(
@@ -148,7 +153,12 @@ async def prepare(
         if code == "GENERATION_CHANGED":
             continue
         if code == "STREAM_EXPIRING":
-            await self._read_control(scope)
+            await _complete_generation_cleanup(
+                self,
+                channel=channel,
+                identity=identity,
+                requested_reason="expired",
+            )
             continue
         if code == "STREAM_DELETED":
             raise StreamDeleted(
@@ -197,8 +207,8 @@ async def prepare(
                 position=self._bytes(response[4]),
                 last_message_id=last_id,
             )
-        return PreparedRun(
-            handle=BackendRunHandle(
+        return _PreparedRun(
+            handle=_BackendRunHandle(
                 channel=channel,
                 identity=identity,
                 owner_token=owner_token,
@@ -212,8 +222,8 @@ async def prepare(
         )
     if code != "ATTACH":
         raise _redis_protocol_error(f"unexpected Redis prepare response: {code}")
-    return PreparedRun(
-        handle=BackendRunHandle(
+    return _PreparedRun(
+        handle=_BackendRunHandle(
             channel=channel,
             identity=identity,
             owner_token=None,
@@ -227,7 +237,7 @@ async def prepare(
 
 async def append(
     self: RedisBackend,
-    handle: BackendRunHandle,
+    handle: _BackendRunHandle,
     *,
     message_id: str,
     codec: str,
@@ -349,231 +359,6 @@ async def append(
         payload=bytes(payload),
         created_at=created_at,
     )
-
-
-async def latest_seq(self: RedisBackend, *, channel: str, identity: RunIdentity) -> int:
-    """Return the current generation tail, retrying a concurrent generation change."""
-
-    required_identifier("channel", channel)
-    required_identity(identity)
-    scope = self._scope(channel, identity)
-    while True:
-        control = await self._read_control(scope)
-        if control is None:
-            return 0
-        if control.state == "expired":
-            raise StreamExpired(
-                channel=channel,
-                identity=identity,
-                generation=control.generation,
-            )
-        if control.state != "active":
-            return 0
-        keys = self._keys(
-            channel,
-            identity,
-            generation=control.generation,
-        )
-        value = await _redis_call(
-            "latest sequence lookup",
-            self._client.hget(keys.meta, "seq"),
-        )
-        if await self._is_current_generation(keys):
-            return 0 if value is None else int(self._text(value))
-
-
-async def read(
-    self: RedisBackend,
-    *,
-    channel: str,
-    identity: RunIdentity,
-    after: int = 0,
-    limit: int = 100,
-) -> tuple[MessageEnvelope, ...]:
-    """Read one finite page from a generation proven current after the Redis query.
-
-    The control row is checked again after reading metadata and stream entries. This
-    prevents a delete/recreate race from combining a cursor or payloads from different
-    generations.
-
-    Args:
-        self: Redis Backend owning the channel namespace.
-        channel: Canonical logical channel name.
-        identity: Exact thread and semantic Run identity.
-        after: Exclusive committed sequence cursor.
-        limit: Maximum envelopes returned in this page.
-
-    Returns:
-        Ascending immutable envelopes from one proven current generation.
-
-    Raises:
-        MessagingError: The stream, cursor, payload, or Redis evidence is invalid.
-        TypeError: Cursor or limit has the wrong type.
-        ValueError: Cursor or limit is outside the supported range.
-    """
-
-    if isinstance(after, bool) or not isinstance(after, int):
-        raise TypeError("after must be an integer")
-    if after < 0:
-        raise ValueError("after must be greater than or equal to zero")
-    if isinstance(limit, bool) or not isinstance(limit, int):
-        raise TypeError("limit must be an integer")
-    if not 1 <= limit <= 1000:
-        raise ValueError("limit must be between 1 and 1000")
-    required_identifier("channel", channel)
-    required_identity(identity)
-    scope = self._scope(channel, identity)
-    while True:
-        control = await self._read_control(scope)
-        if control is not None and control.state == "expired":
-            raise StreamExpired(
-                channel=channel,
-                identity=identity,
-                generation=control.generation,
-            )
-        if control is None or control.state != "active":
-            if after > 0:
-                raise InvalidCursor(after=after, latest=0)
-            return ()
-        keys = self._keys(
-            channel,
-            identity,
-            generation=control.generation,
-        )
-        latest_value = await _redis_call(
-            "message tail lookup",
-            self._client.hget(keys.meta, "seq"),
-        )
-        latest = 0 if latest_value is None else int(self._text(latest_value))
-        entries = ()
-        if after <= latest:
-            entries = await _redis_call(
-                "message read",
-                self._client.xrange(
-                    keys.messages,
-                    min=f"({after}-0",
-                    max="+",
-                    count=limit,
-                ),
-            )
-        if await self._is_current_generation(keys):
-            if after > latest:
-                raise InvalidCursor(after=after, latest=latest)
-            return tuple(
-                self._decode_entry(channel, identity, entry)
-                for entry in cast(
-                    Sequence[tuple[bytes, Mapping[bytes, bytes]]],
-                    entries,
-                )
-            )
-
-
-async def bind_follow(
-    self: RedisBackend,
-    *,
-    channel: str,
-    identity: RunIdentity,
-    after: int,
-) -> BackendRunHandle:
-    """Resolve one follower and validate its cursor against one generation."""
-
-    required_identifier("channel", channel)
-    required_identity(identity)
-    if isinstance(after, bool) or not isinstance(after, int):
-        raise TypeError("after must be an integer")
-    if after < 0:
-        raise ValueError("after must be greater than or equal to zero")
-    scope = self._scope(channel, identity)
-    while True:
-        control = await self._read_control(scope)
-        if control is not None and control.state == "expired":
-            raise StreamExpired(
-                channel=channel,
-                identity=identity,
-                generation=control.generation,
-            )
-        if control is None or control.state != "active":
-            raise RunNotFound(identity=identity)
-        unresolved = BackendRunHandle(
-            channel=channel,
-            identity=identity,
-            owner_token=None,
-            fence=None,
-            generation=control.generation,
-        )
-        keys = self._keys(
-            channel,
-            identity,
-            generation=control.generation,
-        )
-        exists = await _redis_call(
-            "run existence lookup",
-            self._client.exists(keys.run_key),
-        )
-        latest_value = await _redis_call(
-            "message tail lookup",
-            self._client.hget(keys.meta, "seq"),
-        )
-        if not await self._is_current_generation(keys):
-            continue
-        if not exists:
-            raise RunNotFound(identity=identity)
-        latest = 0 if latest_value is None else int(self._text(latest_value))
-        if after > latest:
-            raise InvalidCursor(after=after, latest=latest)
-        return unresolved
-
-
-def follow(
-    self: RedisBackend,
-    handle: BackendRunHandle,
-    *,
-    after: int,
-) -> AsyncGenerator[MessageEnvelope, None]:
-    """Follow one previously bound generation until its authoritative terminal state.
-
-    Snapshot pages and signals share the bound handle. Producer failure or owner loss
-    terminates with ``RunProducerFailed`` after all committed messages are yielded;
-    successful and cancelled runs end normally.
-
-    Args:
-        self: Redis Backend owning snapshot and signal reads.
-        handle: Previously bound immutable generation handle.
-        after: Exclusive sequence already delivered to the follower.
-
-    Returns:
-        Cancellation-responsive iterator over ascending committed envelopes.
-
-    Raises:
-        MessagingError: Generation, producer, cursor, payload, or Redis evidence fails.
-    """
-
-    async def iterate() -> AsyncGenerator[MessageEnvelope, None]:
-        keys = await self._keys_for_handle(handle)
-        cursor = after
-        while True:
-            snapshot = await self._settled_run_snapshot(
-                keys,
-                handle.identity,
-                after=cursor,
-            )
-            if snapshot.messages:
-                for message in snapshot.messages:
-                    cursor = message.seq
-                    yield message
-                if cursor < snapshot.end_seq:
-                    continue
-            if snapshot.terminal:
-                if is_failed_run_status(snapshot.status):
-                    cause = self._remote_error(snapshot)
-                    raise RunProducerFailed(
-                        identity=handle.identity,
-                        cause=cause,
-                    )
-                return
-            await self._wait_for_snapshot_change(keys, snapshot)
-
-    return iterate()
 
 
 def _snapshot_messages(

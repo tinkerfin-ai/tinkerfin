@@ -5,76 +5,61 @@
     grid-template-columns: minmax(0, 1.08fr) minmax(420px, .92fr);
     min-height: 100dvh;
     overflow: hidden;
-    background:
-      radial-gradient(circle at 16% 16%, color-mix(in srgb, var(--color-brand-soft) 78%, transparent), transparent 34%),
-      linear-gradient(135deg, var(--color-sidebar), var(--color-canvas) 52%);
+    background: var(--color-canvas);
     color: var(--color-text-primary);
   }
 
   .auth-ambient {
     position: absolute;
-    inset: 0 42% 0 0;
+    inset: 0 46% 0 0;
     overflow: hidden;
+    isolation: isolate;
+    background:
+      radial-gradient(ellipse at 48% 46%, color-mix(in srgb, var(--color-canvas) 96%, transparent) 0 24%, transparent 68%),
+      linear-gradient(155deg, color-mix(in srgb, rgb(234 244 255) 74%, var(--color-canvas)) 0%, var(--color-canvas) 48%, color-mix(in srgb, rgb(243 237 255) 68%, var(--color-canvas)) 100%);
     pointer-events: none;
   }
 
-  .auth-signal-field {
+  .auth-ambient::after {
     position: absolute;
-    top: 51%;
-    left: 61%;
-    width: 360px;
-    height: 360px;
-    transform: translate(-50%, -50%);
-    opacity: .68;
+    z-index: var(--layer-base);
+    inset: 0;
+    background: radial-gradient(ellipse at 45% 48%, color-mix(in srgb, var(--color-canvas) 68%, transparent) 0 22%, transparent 66%);
+    content: '';
   }
 
-  .auth-signal-orbit {
+  .auth-ambient-art {
     position: absolute;
-    top: 50%;
-    left: 50%;
-    border: 1px solid color-mix(in srgb, var(--color-brand) 22%, transparent);
+    z-index: var(--layer-local);
+    inset: -6% -9%;
+    width: 118%;
+    height: 112%;
+    overflow: visible;
+  }
+
+  .auth-ribbon {
+    transform-box: fill-box;
+    transform-origin: center;
+    will-change: transform;
+  }
+
+  .auth-ribbon path {
+    fill: none;
+    stroke-linecap: round;
+  }
+
+  .auth-ribbon__soft { opacity: .55; }
+  .auth-ribbon__body { opacity: .48; }
+
+  .auth-ambient-mist {
+    position: absolute;
+    z-index: var(--layer-local);
+    inset: 8% 4% 6% 6%;
     border-radius: var(--radius-pill);
-    transform: translate(-50%, -50%);
-  }
-
-  .auth-signal-orbit i {
-    position: absolute;
-    top: 50%;
-    right: -3px;
-    width: var(--space-1-5);
-    height: var(--space-1-5);
-    transform: translateY(-50%);
-    border: 2px solid var(--color-sidebar);
-    border-radius: var(--radius-pill);
-    background: var(--color-brand);
-  }
-
-  .auth-signal-orbit--outer { width: 320px; height: 320px; }
-  .auth-signal-orbit--middle { width: 224px; height: 224px; }
-  .auth-signal-orbit--inner { width: 128px; height: 128px; }
-
-  .auth-signal-core {
-    position: absolute;
-    top: 50%;
-    left: 50%;
-    display: grid;
-    grid-template-columns: repeat(2, var(--space-2));
-    gap: var(--space-2);
-    width: 64px;
-    height: 64px;
-    transform: translate(-50%, -50%);
-    place-content: center;
-    border: 1px solid var(--color-border);
-    border-radius: var(--radius-pill);
-    background: color-mix(in srgb, var(--color-layer-1) 86%, transparent);
-    box-shadow: var(--shadow-2);
-  }
-
-  .auth-signal-core i {
-    width: var(--space-2);
-    height: var(--space-2);
-    border: 1px solid var(--color-brand);
-    border-radius: var(--radius-xs);
+    background:
+      radial-gradient(ellipse at 8% 12%, rgb(105 177 255 / 15%), transparent 42%),
+      radial-gradient(ellipse at 92% 90%, rgb(155 119 255 / 16%), transparent 44%);
+    filter: blur(56px);
   }
 
   .auth-header {
@@ -91,15 +76,11 @@
   .auth-brand {
     display: inline-flex;
     align-items: center;
-    gap: var(--space-2);
     min-height: var(--control-lg);
     padding: 0 var(--space-2);
     border: 0;
     border-radius: var(--radius-md);
     background: transparent;
-    color: var(--color-text-primary);
-    font-size: var(--type-title-size);
-    font-weight: var(--weight-bold);
   }
 
   .auth-intro {
@@ -395,25 +376,42 @@
       background: var(--color-canvas);
       backdrop-filter: none;
     }
+
+    .auth-ribbon__soft {
+      display: none;
+    }
+
+    .auth-ribbon__body,
+    .auth-ambient-mist {
+      opacity: .18;
+    }
   }
 
   @media (forced-colors: active) {
     .auth-page,
+    .auth-ambient,
     .auth-panel,
-    .auth-signal-core,
     .auth-form-error {
       background: Canvas;
       color: CanvasText;
     }
 
-    .auth-signal-orbit,
-    .auth-signal-core,
     .auth-field .ui-text-field__control {
       border-color: ButtonText;
+    }
+
+    .auth-ambient-art,
+    .auth-ambient-mist {
+      display: none;
     }
   }
 
   @media (prefers-reduced-motion: reduce) {
+    .auth-ribbon,
+    .auth-ambient-mist {
+      will-change: auto;
+    }
+
     .auth-view {
       animation: none;
     }

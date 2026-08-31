@@ -9,29 +9,23 @@ describe('WorkspaceHeader', () => {
     render(
       <WorkspaceHeader
         conversationTitle="研究下一季度产品路线"
-        drawerOpen={false}
-        todoCount={3}
-        drawerToggleRef={createRef<HTMLButtonElement>()}
         overlayTriggerRef={createRef<HTMLButtonElement>()}
         onOpenOverlay={vi.fn()}
-        onToggleDrawer={vi.fn()}
+        actions={<button type="button">额外操作</button>}
       />,
     )
 
     expect(screen.getByRole('heading', { level: 1, name: '研究下一季度产品路线' }))
       .toHaveClass('workspace-title')
+    expect(screen.getByRole('button', { name: '额外操作' })).toBeInTheDocument()
   })
 
   it('uses the product term for an untitled draft', () => {
     render(
       <WorkspaceHeader
         conversationTitle=""
-        drawerOpen
-        todoCount={0}
-        drawerToggleRef={createRef<HTMLButtonElement>()}
         overlayTriggerRef={createRef<HTMLButtonElement>()}
         onOpenOverlay={vi.fn()}
-        onToggleDrawer={vi.fn()}
       />,
     )
 

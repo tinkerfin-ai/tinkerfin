@@ -4,26 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import time
-from abc import abstractmethod
-from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Literal, Protocol, TypeGuard, runtime_checkable
-from uuid import uuid4
+from typing import TYPE_CHECKING, Literal, Never, TypeGuard
 
 from tinkerfin_contracts import RunIdentity
 
 from ._identity import required_identifier, required_identity
 from .errors import (
-    BackendOwnershipLost,
-    CancellationUnsupported,
     CodecMismatch,
     InvalidCursor,
-    MessageIdConflict,
     MessagingQuotaExceeded,
-    RunAlreadyActive,
-    RunNotFound,
-    RunProducerFailed,
     StreamDeleteConflict,
     StreamDeleted,
     StreamExpired,
@@ -31,6 +22,22 @@ from .errors import (
 from .limits import DEFAULT_MESSAGING_LIMITS, MessagingLimits
 from .models import MessageEnvelope, RecoveryCheckpoint
 from .retention import MessagingRetentionPolicy
+
+if TYPE_CHECKING:
+    from .backend_contract import (
+        CommittedMessagePage,
+        CommittedMessageQuery,
+        MessagingBackendSettings,
+        MessagingChangeWait,
+        MessagingStateQuery,
+        MessagingStateSnapshot,
+        MessagingStorageEffect,
+        MessagingTransition,
+        MessagingTransitionResult,
+        StoredMessagingRun,
+        StreamGenerationPurge,
+        StreamGenerationPurgeResult,
+    )
 
 RunStatus = Literal[
     "running",
@@ -67,13 +74,12 @@ def is_failed_run_status(status: object) -> TypeGuard[FailedRunStatus]:
 
 
 @dataclass(frozen=True, slots=True)
-class BackendRunHandle:
-    """Identify one run, stream generation, and optional producer fence.
+class _BackendRunHandle:
+    """Carry one framework-internal run, generation, and optional producer fence.
 
-    Backends return an explicit positive `generation` from `prepare()`. A `None`
-    generation is reserved for a newly constructed observer handle that resolves the
-    current generation, such as `MessageChannel.cancel()`; it never grants producer
-    ownership.
+    The ledger converts public ``MessagingRunReference`` values into exact positive
+    generations. A ``None`` generation exists only before an observer resolves the
+    current generation and never grants producer ownership.
     """
 
     channel: str
@@ -84,7 +90,7 @@ class BackendRunHandle:
 
 
 def _validate_append_input(
-    handle: BackendRunHandle,
+    handle: _BackendRunHandle,
     *,
     message_id: str,
     codec: str,
@@ -94,8 +100,8 @@ def _validate_append_input(
 ) -> None:
     """Reject caller-controlled values before a backend can mutate state."""
 
-    if not isinstance(handle, BackendRunHandle):
-        raise TypeError("handle must be a BackendRunHandle")
+    if not isinstance(handle, _BackendRunHandle):
+        raise TypeError("handle must be an internal Messaging run handle")
     required_identifier("channel", handle.channel)
     required_identity(handle.identity)
     required_identifier("message_id", message_id)
@@ -122,388 +128,14 @@ def _validate_append_input(
 
 
 @dataclass(frozen=True, slots=True)
-class PreparedRun:
-    """Return the atomically validated cursor and start-or-attach decision."""
+class _PreparedRun:
+    """Carry the ledger's internal validated cursor and ownership decision."""
 
-    handle: BackendRunHandle
+    handle: _BackendRunHandle
     after: int
     is_owner: bool
     checkpoint: RecoveryCheckpoint | None = None
     recovered: bool = False
-
-
-@runtime_checkable
-class MessagingBackend(Protocol):
-    """Replaceable persistence, replay, and distributed run boundary."""
-
-    @property
-    def limits(self) -> MessagingLimits:
-        """Return immutable capacity limits enforced before durable mutation."""
-
-        ...
-
-    @property
-    def retention_policy(self) -> MessagingRetentionPolicy:
-        """Return the immutable terminal replay retention policy."""
-
-        ...
-
-    async def prepare(
-        self,
-        *,
-        channel: str,
-        identity: RunIdentity,
-        codec: str,
-        after: int | None,
-        cancellable: bool,
-        recoverable: bool,
-    ) -> PreparedRun:
-        """Atomically start, recover, or attach to one durable semantic run.
-
-        Args:
-            channel: Canonical logical channel containing the stream.
-            identity: Exact thread and semantic Run identity.
-            codec: Stable codec identity required for every generation attachment.
-            after: Exclusive replay cursor, or ``None`` to attach at the current tail.
-            cancellable: Whether the new producer accepts remote cancellation.
-            recoverable: Whether a lost producer may resume from a durable checkpoint.
-
-        Returns:
-            Exact generation handle, validated cursor, ownership decision, and optional
-            recovery checkpoint.
-
-        Raises:
-            RunAlreadyActive: Another producer already owns the semantic Run.
-            RunNotFound: A requested attachment or recovery target does not exist.
-            CodecMismatch: Existing durable data uses another codec identity.
-            InvalidCursor: ``after`` is outside the current committed range.
-            StreamDeleted: The selected stream generation was deleted.
-            StreamExpired: Terminal replay retention has elapsed.
-            MessagingError: Durable state cannot be classified or mutated safely.
-            TypeError: A public input has the wrong type.
-            ValueError: An identifier or option is not canonical.
-        """
-
-        ...
-
-    async def append(
-        self,
-        handle: BackendRunHandle,
-        *,
-        message_id: str,
-        codec: str,
-        payload: bytes,
-        checkpoint: RecoveryCheckpoint | None = None,
-    ) -> MessageEnvelope:
-        """Idempotently commit one encoded message under the producer fence.
-
-        Args:
-            handle: Owned exact-generation handle returned by ``prepare()``.
-            message_id: Stable semantic message identity used for idempotency.
-            codec: Codec identity that must match the prepared generation.
-            payload: Already encoded bounded message bytes.
-            checkpoint: Optional recovery position committed with this message.
-
-        Returns:
-            The existing or newly committed immutable envelope and sequence.
-
-        Raises:
-            BackendOwnershipLost: The producer token or fence is no longer current.
-            MessageIdConflict: The same message ID already names different evidence.
-            CodecMismatch: The supplied codec differs from the durable generation.
-            MessagingQuotaExceeded: Payload or checkpoint limits are exceeded.
-            MessagingError: Durable append evidence is unavailable or inconsistent.
-            TypeError: A public input has the wrong type.
-            ValueError: Payload metadata is internally inconsistent.
-        """
-
-        ...
-
-    async def begin_settlement(self, handle: BackendRunHandle) -> bool:
-        """Atomically claim finalization and report an accepted cancellation.
-
-        `True` transfers an existing durable cancellation request to the producer,
-        which must invoke its callback before finishing. `False` closes the run to
-        later cancellation so ordinary producer settlement can proceed.
-
-        Args:
-            handle: Owned run and its current fencing identity.
-
-        Returns:
-            Whether cancellation was durably accepted before settlement began.
-
-        Raises:
-            BackendOwnershipLost: The handle no longer owns the run or has already
-                begun settlement.
-        """
-
-        ...
-
-    async def finish(
-        self,
-        handle: BackendRunHandle,
-        *,
-        status: FinalRunStatus,
-        error: BaseException | None = None,
-    ) -> None:
-        """Commit one terminal run status and release producer ownership.
-
-        Args:
-            handle: Current producer handle after settlement has begun.
-            status: Exactly one durable terminal classification.
-            error: Optional trusted failure retained for in-process followers.
-
-        Raises:
-            BackendOwnershipLost: The producer handle no longer owns settlement.
-            MessagingError: The terminal transition cannot be committed safely.
-        """
-
-        ...
-
-    async def latest_seq(self, *, channel: str, identity: RunIdentity) -> int:
-        """Return the current generation's last committed sequence.
-
-        Args:
-            channel: Canonical logical channel containing the stream.
-            identity: Exact thread and semantic Run identity.
-
-        Returns:
-            Greatest committed sequence, or zero for an empty generation.
-
-        Raises:
-            StreamExpired: Its terminal replay retention has elapsed.
-            MessagingError: Durable sequence evidence cannot be read safely.
-            ValueError: The channel or identity is not canonical.
-        """
-
-        ...
-
-    @abstractmethod
-    async def get_run_status(
-        self,
-        *,
-        channel: str,
-        identity: RunIdentity,
-    ) -> RunStatus:
-        """Return one durable run's current authoritative status.
-
-        A backend may atomically settle an expired producer lease as
-        ``owner_lost`` while obtaining this status.
-
-        Args:
-            channel: Canonical logical channel containing the durable run.
-            identity: Exact thread and semantic Run identity to inspect.
-
-        Returns:
-            Current running, cancellation, completion, failure, or ownership-loss state.
-
-        Raises:
-            RunNotFound: No durable record exists for the exact channel and identity.
-            MessagingBackendError: Durable state cannot be read or classified safely.
-            ValueError: The channel or identity is not canonical.
-        """
-
-        ...
-
-    async def read(
-        self,
-        *,
-        channel: str,
-        identity: RunIdentity,
-        after: int = 0,
-        limit: int = 100,
-    ) -> tuple[MessageEnvelope, ...]:
-        """Read a bounded page strictly after a validated thread cursor.
-
-        Args:
-            channel: Canonical logical channel containing the stream.
-            identity: Exact thread and semantic Run identity.
-            after: Exclusive non-negative committed sequence.
-            limit: Positive maximum number of envelopes returned.
-
-        Returns:
-            Immutable ascending committed envelopes from one generation.
-
-        Raises:
-            RunNotFound: No current generation exists for the identity.
-            InvalidCursor: ``after`` is beyond the committed tail.
-            StreamDeleted: The selected generation was explicitly deleted.
-            StreamExpired: Its terminal replay retention has elapsed.
-            MessagingError: Durable payload evidence cannot be read safely.
-            ValueError: A cursor, limit, channel, or identity is invalid.
-        """
-
-        ...
-
-    async def bind_follow(
-        self,
-        *,
-        channel: str,
-        identity: RunIdentity,
-        after: int,
-    ) -> BackendRunHandle:
-        """Atomically bind a follower and validate its thread cursor.
-
-        Args:
-            channel: Canonical logical channel containing the stream.
-            identity: Exact thread and semantic Run identity.
-            after: Exclusive sequence already delivered to the follower.
-
-        Returns:
-            Observer-only handle pinned to the validated current generation.
-
-        Raises:
-            RunNotFound: No current generation exists for the identity.
-            InvalidCursor: ``after`` is beyond the committed tail.
-            StreamDeleted: The selected generation was explicitly deleted.
-            StreamExpired: Its terminal replay retention has elapsed.
-            MessagingError: A generation cannot be bound atomically.
-            ValueError: The cursor, channel, or identity is invalid.
-        """
-
-        ...
-
-    def follow(
-        self,
-        handle: BackendRunHandle,
-        *,
-        after: int,
-    ) -> AsyncIterator[MessageEnvelope]:
-        """Return an ordered follower bound to the handle's exact generation.
-
-        Args:
-            handle: Observer-only exact-generation handle from ``bind_follow()``.
-            after: Exclusive sequence already delivered to the caller.
-
-        Returns:
-            Cancellation-responsive iterator of ascending committed envelopes.
-
-        Raises:
-            InvalidCursor: ``after`` is beyond the bound generation tail.
-            RunProducerFailed: The producer terminates as failed or owner-lost.
-            StreamDeleted: The bound generation is deleted during iteration.
-            StreamExpired: Its terminal replay retention elapses.
-            MessagingError: Durable follow evidence becomes unavailable or corrupt.
-            ValueError: The handle or cursor is invalid.
-        """
-
-        ...
-
-    async def request_cancel(self, handle: BackendRunHandle) -> bool:
-        """Durably request producer cancellation if the run still accepts it.
-
-        Args:
-            handle: Observer or producer handle selecting one exact generation.
-
-        Returns:
-            Whether a new cancellation request was durably recorded.
-
-        Raises:
-            CancellationUnsupported: The active producer is not cancellable.
-            RunNotFound: The selected run or generation does not exist.
-            StreamDeleted: The selected generation was explicitly deleted.
-            MessagingError: Cancellation state cannot be changed safely.
-        """
-
-        ...
-
-    async def wait_for_cancel(self, handle: BackendRunHandle) -> bool:
-        """Wait until cancellation is requested or the run becomes terminal.
-
-        Args:
-            handle: Owned producer handle whose cancellation state is observed.
-
-        Returns:
-            ``True`` for a durable cancellation request, otherwise ``False`` after
-            terminal settlement.
-
-        Raises:
-            BackendOwnershipLost: The handle no longer owns the producer fence.
-            StreamDeleted: The selected generation was explicitly deleted.
-            MessagingError: Cancellation evidence cannot be observed safely.
-        """
-
-        ...
-
-    async def wait_finished(self, handle: BackendRunHandle) -> RunStatus:
-        """Wait for and return the durable terminal run status.
-
-        Args:
-            handle: Exact-generation handle selecting the run to observe.
-
-        Returns:
-            Completed, cancelled, failed, or owner-lost terminal status.
-
-        Raises:
-            RunNotFound: The selected run or generation does not exist.
-            StreamDeleted: The selected generation was explicitly deleted.
-            MessagingError: Terminal evidence cannot be observed safely.
-        """
-
-        ...
-
-    async def failure(self, handle: BackendRunHandle) -> BaseException | None:
-        """Return the trusted producer failure associated with a terminal run.
-
-        Args:
-            handle: Exact-generation handle selecting a settled run.
-
-        Returns:
-            In-process producer failure, bounded remote evidence, or ``None``.
-
-        Raises:
-            RunNotFound: The selected run or generation does not exist.
-            StreamDeleted: The selected generation was explicitly deleted.
-            MessagingError: Failure evidence cannot be reconstructed safely.
-        """
-
-        ...
-
-    @property
-    def lease_renew_interval(self) -> float | None:
-        """Return the producer lease renewal interval, or ``None`` if unneeded."""
-
-        ...
-
-    @property
-    def lease_timeout(self) -> float | None:
-        """Return the ownership expiry budget used only for trusted diagnostics."""
-
-        ...
-
-    async def renew(self, handle: BackendRunHandle) -> bool:
-        """Renew producer ownership and report whether its fence remains current.
-
-        Args:
-            handle: Owned producer handle with token, fence, and generation.
-
-        Returns:
-            ``True`` only while the same producer fence remains authoritative.
-
-        Raises:
-            MessagingError: Lease state cannot be read or renewed safely.
-            TypeError: ``handle`` is not a backend run handle.
-        """
-
-        ...
-
-    async def delete_stream(self, *, channel: str, identity: RunIdentity) -> None:
-        """Delete one inactive stream and all of its durable run data.
-
-        Missing and previously deleted streams are successful no-ops. An active
-        producer is rejected without requesting cancellation.
-
-        Args:
-            channel: Durable codec namespace containing the stream.
-            identity: Thread and run identity whose thread stream is deleted.
-
-        Raises:
-            StreamDeleteConflict: The stream still has an active producer.
-            MessagingError: Durable stream data cannot be deleted safely.
-            ValueError: The channel or identity is not canonical.
-        """
-
-        ...
 
 
 class _RunRecord:
@@ -519,7 +151,7 @@ class _RunRecord:
         self.identity = identity
         self.start_seq = start_seq
         self.end_seq = start_seq
-        self.owner_token = owner_token
+        self.owner_token: str | None = owner_token
         self.fence = 1
         self.cancellable = cancellable
         self.recoverable = recoverable
@@ -534,6 +166,13 @@ class _StreamState:
 
     def __init__(self, *, generation: int) -> None:
         self.generation = generation
+        self.disposition: Literal[
+            "active",
+            "deleting",
+            "deleted",
+            "expiring",
+            "expired",
+        ] = "active"
         self.deleted = False
         self.condition = asyncio.Condition()
         self.messages: list[MessageEnvelope] = []
@@ -545,6 +184,7 @@ class _StreamState:
         self.active_identity: RunIdentity | None = None
         self.payload_bytes = 0
         self.expires_at_monotonic: float | None = None
+        self.control_sequence = 0
 
 
 class _ChannelState:
@@ -558,7 +198,7 @@ class _ChannelState:
         self.tombstones: dict[str, dict[int, Literal["deleted", "expired"]]] = {}
 
 
-class MemoryBackend(MessagingBackend):
+class MemoryBackend:
     """Keep ordered logs and run coordination in one event loop process."""
 
     def __init__(
@@ -586,69 +226,666 @@ class MemoryBackend(MessagingBackend):
         self._retention_policy = retention_policy
 
     @property
-    def limits(self) -> MessagingLimits:
-        """Return the immutable limits applied to every in-memory generation."""
+    def messaging_settings(self) -> MessagingBackendSettings:
+        """Return immutable settings for the process-local Messaging store.
 
-        return self._limits
+        Returns:
+            Capacity and retention settings with external producer leases disabled.
+        """
 
-    @property
-    def retention_policy(self) -> MessagingRetentionPolicy:
-        """Return the terminal replay policy applied to every stream."""
+        from .backend_contract import MessagingBackendSettings
 
-        return self._retention_policy
+        return MessagingBackendSettings(
+            limits=self._limits,
+            retention_policy=self._retention_policy,
+            producer_renew_interval_seconds=None,
+            producer_lease_seconds=None,
+            change_wait_timeout_seconds=None,
+        )
 
-    @property
-    def lease_renew_interval(self) -> float | None:
-        """In-process ownership has no expiring external lease."""
+    async def prepare_messaging_storage(self) -> None:
+        """Confirm that process-local storage requires no external preparation.
 
-        return None
+        Returns:
+            ``None`` because in-memory structures are created lazily.
+        """
 
-    @property
-    def lease_timeout(self) -> float | None:
-        """In-process ownership has no expiry budget."""
+    async def commit_messaging_transition(
+        self,
+        transition: MessagingTransition,
+    ) -> MessagingTransitionResult:
+        """Resolve and atomically apply one in-memory Messaging transition.
 
-        return None
+        Args:
+            transition: Complete framework-created lifecycle transition.
 
-    async def renew(self, handle: BackendRunHandle) -> bool:
-        """Confirm the in-memory producer still owns its run record."""
+        Returns:
+            Result committed with the transition's storage effect.
 
-        state = self._state_for_handle(handle)
-        async with state.condition:
-            self._owned_record(state, handle)
-            return True
+        Raises:
+            MessagingError: Current state rejects the transition.
+            TypeError: The transition has the wrong public type.
+            ValueError: Transition identifiers or options are invalid.
+        """
 
-    async def delete_stream(self, *, channel: str, identity: RunIdentity) -> None:
-        """Atomically delete one inactive in-memory stream."""
+        from ._messaging_transition import resolve_messaging_transition
+        from .backend_contract import MessagingTransition
 
-        required_identifier("channel", channel)
-        required_identity(identity)
-        channel_state = self._channels.get(channel)
-        if channel_state is None:
-            return
+        if not isinstance(transition, MessagingTransition):
+            raise TypeError("transition must be a MessagingTransition")
+        selected_generation = (
+            transition.cleanup_generation
+            if transition.kind == "finish_generation_cleanup"
+            else (
+                None
+                if transition.run_reference is None
+                else transition.run_reference.generation
+            )
+        )
+        channel_state = self._channel(transition.channel)
         async with channel_state.lock:
-            state = self._expire_if_due(channel_state, identity.thread_id)
-            if state is None:
-                return
-            async with state.condition:
-                active_identity = state.active_identity
-                if active_identity is not None:
-                    raise StreamDeleteConflict(
-                        channel=channel,
-                        identity=identity,
-                        active_identity=active_identity,
-                    )
-                state.deleted = True
-                del channel_state.streams[identity.thread_id]
-                channel_state.next_generations[identity.thread_id] = (
-                    state.generation + 1
-                )
-                self._record_tombstone(
+            stream_state = self._expire_if_due(
+                channel_state,
+                transition.identity.thread_id,
+            )
+            if stream_state is None:
+                snapshot = self._memory_state_snapshot(
                     channel_state,
-                    identity.thread_id,
-                    generation=state.generation,
-                    reason="deleted",
+                    transition.channel,
+                    transition.identity,
+                    generation=selected_generation,
+                    message_id=transition.message_id,
+                    include_active_run=True,
                 )
-                state.condition.notify_all()
+                effect = resolve_messaging_transition(transition, snapshot)
+                self._apply_memory_effect(
+                    channel_state,
+                    transition.identity,
+                    effect,
+                )
+                return effect.result
+            async with stream_state.condition:
+                snapshot = self._memory_state_snapshot(
+                    channel_state,
+                    transition.channel,
+                    transition.identity,
+                    generation=selected_generation,
+                    message_id=transition.message_id,
+                    include_active_run=True,
+                )
+                effect = resolve_messaging_transition(transition, snapshot)
+                self._apply_memory_effect(
+                    channel_state,
+                    transition.identity,
+                    effect,
+                )
+                stream_state.condition.notify_all()
+                return effect.result
+
+    async def load_messaging_state(
+        self,
+        query: MessagingStateQuery,
+    ) -> MessagingStateSnapshot:
+        """Load one consistent bounded process-local Messaging snapshot.
+
+        Args:
+            query: Channel, generation, run, and optional message evidence to load.
+
+        Returns:
+            Defensive state snapshot observed under the channel and stream locks.
+
+        Raises:
+            TypeError: The query has the wrong public type.
+            ValueError: Query identifiers are invalid.
+        """
+
+        from .backend_contract import MessagingStateQuery
+
+        if not isinstance(query, MessagingStateQuery):
+            raise TypeError("query must be a MessagingStateQuery")
+        required_identifier("channel", query.channel)
+        required_identity(query.identity)
+        channel_state = self._channels.get(query.channel)
+        if channel_state is None:
+            return self._empty_memory_snapshot()
+        async with channel_state.lock:
+            stream_state = self._expire_if_due(
+                channel_state,
+                query.identity.thread_id,
+            )
+            if stream_state is None:
+                return self._memory_state_snapshot(
+                    channel_state,
+                    query.channel,
+                    query.identity,
+                    generation=query.generation,
+                    message_id=query.message_id,
+                    include_active_run=query.include_active_run,
+                )
+            async with stream_state.condition:
+                return self._memory_state_snapshot(
+                    channel_state,
+                    query.channel,
+                    query.identity,
+                    generation=query.generation,
+                    message_id=query.message_id,
+                    include_active_run=query.include_active_run,
+                )
+
+    async def read_committed_messages(
+        self,
+        query: CommittedMessageQuery,
+    ) -> CommittedMessagePage:
+        """Read one bounded ascending page from an exact in-memory generation.
+
+        Args:
+            query: Exact generation, exclusive cursor, upper bound, and page limit.
+
+        Returns:
+            Defensive committed messages and their observed change cursor.
+
+        Raises:
+            InvalidCursor: The exclusive cursor exceeds the generation tail.
+            StreamDeleted: The exact generation was deleted.
+            StreamExpired: The exact generation exceeded retention.
+            TypeError: A cursor, limit, or query has the wrong type.
+            ValueError: A cursor or limit is outside its supported range.
+        """
+
+        from .backend_contract import (
+            CommittedMessagePage,
+            CommittedMessageQuery,
+            MessagingChangeCursor,
+        )
+
+        if not isinstance(query, CommittedMessageQuery):
+            raise TypeError("query must be a CommittedMessageQuery")
+        if isinstance(query.after_sequence, bool) or not isinstance(
+            query.after_sequence, int
+        ):
+            raise TypeError("after_sequence must be an integer")
+        if query.after_sequence < 0:
+            raise ValueError("after_sequence must be non-negative")
+        if isinstance(query.limit, bool) or not isinstance(query.limit, int):
+            raise TypeError("limit must be an integer")
+        if not 1 <= query.limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        channel_state = self._channels.get(query.channel)
+        if channel_state is None:
+            self._raise_memory_generation_unavailable(query)
+        assert channel_state is not None
+        async with channel_state.lock:
+            stream_state = self._expire_if_due(
+                channel_state,
+                query.identity.thread_id,
+            )
+            if stream_state is None or stream_state.generation != query.generation:
+                self._raise_memory_generation_unavailable(query)
+            assert stream_state is not None
+            async with stream_state.condition:
+                if stream_state.disposition != "active":
+                    self._raise_memory_stream_disposition(
+                        channel=query.channel,
+                        identity=query.identity,
+                        generation=stream_state.generation,
+                        disposition=stream_state.disposition,
+                    )
+                latest = len(stream_state.messages)
+                if query.after_sequence > latest:
+                    raise InvalidCursor(after=query.after_sequence, latest=latest)
+                through = (
+                    latest
+                    if query.through_sequence is None
+                    else min(query.through_sequence, latest)
+                )
+                run_record = stream_state.runs.get(query.identity.run_id)
+                if (
+                    query.stop_at_run_terminal
+                    and run_record is not None
+                    and is_final_run_status(run_record.status)
+                ):
+                    through = min(through, run_record.end_seq)
+                end = min(through, query.after_sequence + query.limit)
+                messages = tuple(
+                    message.model_copy(deep=True)
+                    for message in stream_state.messages[query.after_sequence : end]
+                )
+                return CommittedMessagePage(
+                    generation=stream_state.generation,
+                    latest_sequence=latest,
+                    messages=messages,
+                    change_cursor=MessagingChangeCursor(
+                        message_sequence=latest,
+                        control_sequence=stream_state.control_sequence,
+                    ),
+                    run_state=(
+                        None
+                        if run_record is None
+                        else self._stored_memory_run(
+                            run_record,
+                            stream_state.generation,
+                        )
+                    ),
+                )
+
+    async def wait_for_messaging_change(self, wait: MessagingChangeWait) -> None:
+        """Wait for an in-memory message or control change with a bounded timeout.
+
+        Args:
+            wait: Exact generation, observed cursor, and finite wait duration.
+
+        Returns:
+            ``None`` after a change, spurious wakeup, or timeout.
+
+        Raises:
+            StreamDeleted: The exact generation was deleted while waiting.
+            StreamExpired: The exact generation exceeded retention while waiting.
+            TypeError: The wait value has the wrong public type.
+        """
+
+        from .backend_contract import MessagingChangeWait
+
+        if not isinstance(wait, MessagingChangeWait):
+            raise TypeError("wait must be a MessagingChangeWait")
+        channel_state = self._channels.get(wait.channel)
+        if channel_state is None:
+            self._raise_memory_generation_unavailable(wait)
+        assert channel_state is not None
+        stream_state = self._expire_if_due(
+            channel_state,
+            wait.identity.thread_id,
+        )
+        if stream_state is None or stream_state.generation != wait.generation:
+            self._raise_memory_generation_unavailable(wait)
+        assert stream_state is not None
+        async with stream_state.condition:
+            if stream_state.disposition != "active":
+                self._raise_memory_stream_disposition(
+                    channel=wait.channel,
+                    identity=wait.identity,
+                    generation=wait.generation,
+                    disposition=stream_state.disposition,
+                )
+            if (
+                len(stream_state.messages) != wait.after.message_sequence
+                or stream_state.control_sequence != wait.after.control_sequence
+            ):
+                return
+            if wait.timeout_seconds is None:
+                await stream_state.condition.wait()
+                return
+            try:
+                await asyncio.wait_for(
+                    stream_state.condition.wait(),
+                    timeout=wait.timeout_seconds,
+                )
+            except TimeoutError:
+                return
+
+    async def purge_stream_generation(
+        self,
+        purge: StreamGenerationPurge,
+    ) -> StreamGenerationPurgeResult:
+        """Remove one bounded batch from a sealed in-memory generation.
+
+        Args:
+            purge: Exact sealed generation and maximum records to remove.
+
+        Returns:
+            Removed record count and whether generation-private records are exhausted.
+
+        Raises:
+            StreamDeleteConflict: The generation remains active.
+            TypeError: The purge value or bound has the wrong type.
+            ValueError: The deletion bound is not positive.
+        """
+
+        from .backend_contract import (
+            StreamGenerationPurge,
+            StreamGenerationPurgeResult,
+        )
+
+        if not isinstance(purge, StreamGenerationPurge):
+            raise TypeError("purge must be a StreamGenerationPurge")
+        if isinstance(purge.maximum_records, bool) or not isinstance(
+            purge.maximum_records, int
+        ):
+            raise TypeError("maximum_records must be an integer")
+        if purge.maximum_records < 1:
+            raise ValueError("maximum_records must be positive")
+        channel_state = self._channels.get(purge.channel)
+        if channel_state is None:
+            return StreamGenerationPurgeResult(removed_records=0, complete=True)
+        async with channel_state.lock:
+            stream_state = channel_state.streams.get(purge.identity.thread_id)
+            if stream_state is None or stream_state.generation != purge.generation:
+                return StreamGenerationPurgeResult(removed_records=0, complete=True)
+            async with stream_state.condition:
+                if stream_state.disposition not in {"deleting", "expiring"}:
+                    raise StreamDeleteConflict(
+                        channel=purge.channel,
+                        identity=purge.identity,
+                        active_identity=(
+                            stream_state.active_identity or purge.identity
+                        ),
+                    )
+                removed = 0
+                while stream_state.messages and removed < purge.maximum_records:
+                    message = stream_state.messages.pop()
+                    stream_state.by_message_id.pop(message.message_id, None)
+                    stream_state.signatures.pop(message.message_id, None)
+                    removed += 1
+                while stream_state.runs and removed < purge.maximum_records:
+                    stream_state.runs.pop(next(iter(stream_state.runs)))
+                    removed += 1
+                complete = not stream_state.messages and not stream_state.runs
+                return StreamGenerationPurgeResult(
+                    removed_records=removed,
+                    complete=complete,
+                )
+
+    @staticmethod
+    def _empty_memory_snapshot() -> MessagingStateSnapshot:
+        from .backend_contract import MessagingStateSnapshot
+
+        return MessagingStateSnapshot(
+            observed_at=datetime.now(UTC),
+            channel=None,
+            stream=None,
+            target_run=None,
+            active_run=None,
+            matching_message=None,
+        )
+
+    def _memory_state_snapshot(
+        self,
+        channel_state: _ChannelState,
+        channel: str,
+        identity: RunIdentity,
+        *,
+        generation: int | None,
+        message_id: str | None,
+        include_active_run: bool,
+    ) -> MessagingStateSnapshot:
+        from ._messaging_transition import messaging_message_signature
+        from .backend_contract import (
+            MessagingStateSnapshot,
+            StoredMessageEvidence,
+            StoredMessagingChannel,
+            StoredMessagingStream,
+        )
+
+        stream_state = channel_state.streams.get(identity.thread_id)
+        selected_state = stream_state
+        if selected_state is not None and (
+            generation is not None and selected_state.generation != generation
+        ):
+            selected_state = None
+        tombstone = self._tombstone_reason(
+            channel_state,
+            identity.thread_id,
+            generation,
+        )
+        stored_channel = (
+            None
+            if channel_state.codec is None
+            else StoredMessagingChannel(
+                channel=channel,
+                codec_id=channel_state.codec,
+                limits=self._limits,
+                retention_policy=self._retention_policy,
+            )
+        )
+        if selected_state is None:
+            return MessagingStateSnapshot(
+                observed_at=datetime.now(UTC),
+                channel=stored_channel,
+                stream=None,
+                target_run=None,
+                active_run=None,
+                matching_message=None,
+                tombstone_generation=None if tombstone is None else tombstone[0],
+                tombstone_reason=None if tombstone is None else tombstone[1],
+            )
+
+        target_record = selected_state.runs.get(identity.run_id)
+        active_record = None
+        if include_active_run and selected_state.active_identity is not None:
+            active_record = selected_state.runs.get(
+                selected_state.active_identity.run_id
+            )
+            if active_record is target_record:
+                active_record = None
+        matching_message = None
+        if message_id is not None:
+            envelope = selected_state.by_message_id.get(message_id)
+            signature_values = selected_state.signatures.get(message_id)
+            if envelope is not None and signature_values is not None:
+                run_id, codec_id, payload, checkpoint = signature_values
+                matching_message = StoredMessageEvidence(
+                    envelope=envelope.model_copy(deep=True),
+                    signature=messaging_message_signature(
+                        identity=RunIdentity(
+                            threadId=identity.thread_id,
+                            runId=run_id,
+                        ),
+                        codec_id=codec_id,
+                        payload=payload,
+                        checkpoint=checkpoint,
+                    ),
+                    checkpoint=checkpoint,
+                )
+        next_fence = 1 + max(
+            (record.fence for record in selected_state.runs.values()),
+            default=0,
+        )
+        return MessagingStateSnapshot(
+            observed_at=datetime.now(UTC),
+            channel=stored_channel,
+            stream=StoredMessagingStream(
+                channel=channel,
+                thread_id=identity.thread_id,
+                generation=selected_state.generation,
+                disposition=selected_state.disposition,
+                latest_sequence=len(selected_state.messages),
+                payload_bytes=selected_state.payload_bytes,
+                next_producer_fence=next_fence,
+                active_run_id=(
+                    None
+                    if selected_state.active_identity is None
+                    else selected_state.active_identity.run_id
+                ),
+                retention_expired=False,
+                message_sequence=len(selected_state.messages),
+                control_sequence=selected_state.control_sequence,
+            ),
+            target_run=(
+                None
+                if target_record is None
+                else self._stored_memory_run(target_record, selected_state.generation)
+            ),
+            active_run=(
+                None
+                if active_record is None
+                else self._stored_memory_run(active_record, selected_state.generation)
+            ),
+            matching_message=matching_message,
+            tombstone_generation=None if tombstone is None else tombstone[0],
+            tombstone_reason=None if tombstone is None else tombstone[1],
+        )
+
+    @staticmethod
+    def _stored_memory_run(
+        record: _RunRecord,
+        generation: int,
+    ) -> StoredMessagingRun:
+        from .backend_contract import StoredMessagingRun
+
+        return StoredMessagingRun(
+            identity=record.identity,
+            generation=generation,
+            start_sequence=record.start_seq,
+            end_sequence=record.end_seq,
+            status=record.status,
+            settlement_started=record.settling,
+            cancellable=record.cancellable,
+            recoverable=record.recoverable,
+            producer_token=record.owner_token,
+            producer_fence=record.fence,
+            producer_lease_active=(
+                not is_final_run_status(record.status)
+                and record.owner_token is not None
+            ),
+            checkpoint=record.checkpoint,
+            failure_class=(
+                ""
+                if record.error is None
+                else f"{type(record.error).__module__}.{type(record.error).__qualname__}"
+            ),
+            failure_message="" if record.error is None else str(record.error),
+            local_failure=record.error,
+        )
+
+    def _apply_memory_effect(
+        self,
+        channel_state: _ChannelState,
+        identity: RunIdentity,
+        effect: MessagingStorageEffect,
+    ) -> None:
+        if effect.channel is not None:
+            if channel_state.codec is None:
+                channel_state.codec = effect.channel.codec_id
+            elif channel_state.codec != effect.channel.codec_id:
+                raise CodecMismatch(
+                    expected=channel_state.codec,
+                    actual=effect.channel.codec_id,
+                )
+        stream_effect = effect.stream
+        stream_state = channel_state.streams.get(identity.thread_id)
+        if stream_effect is not None and (
+            stream_state is None or stream_state.generation != stream_effect.generation
+        ):
+            stream_state = _StreamState(generation=stream_effect.generation)
+            channel_state.streams[identity.thread_id] = stream_state
+        if stream_effect is not None:
+            assert stream_state is not None
+            stream_state.disposition = stream_effect.disposition
+            stream_state.deleted = stream_effect.disposition != "active"
+            stream_state.payload_bytes = stream_effect.payload_bytes
+            stream_state.control_sequence = stream_effect.control_sequence
+            stream_state.active_identity = (
+                None
+                if stream_effect.active_run_id is None
+                else RunIdentity(
+                    threadId=identity.thread_id,
+                    runId=stream_effect.active_run_id,
+                )
+            )
+        if effect.runs:
+            if stream_state is None:
+                raise RuntimeError("Messaging run effect requires a stream")
+            for stored_run in effect.runs:
+                record = stream_state.runs.get(stored_run.identity.run_id)
+                if record is None:
+                    record = _RunRecord(
+                        identity=stored_run.identity,
+                        start_seq=stored_run.start_sequence,
+                        owner_token=stored_run.producer_token or "",
+                        cancellable=stored_run.cancellable,
+                        recoverable=stored_run.recoverable,
+                    )
+                    stream_state.runs[stored_run.identity.run_id] = record
+                record.start_seq = stored_run.start_sequence
+                record.end_seq = stored_run.end_sequence
+                record.owner_token = stored_run.producer_token
+                record.fence = stored_run.producer_fence
+                record.cancellable = stored_run.cancellable
+                record.recoverable = stored_run.recoverable
+                record.status = stored_run.status
+                record.settling = stored_run.settlement_started
+                record.error = stored_run.local_failure
+                record.checkpoint = stored_run.checkpoint
+        if effect.message is not None:
+            if stream_state is None:
+                raise RuntimeError("Messaging message effect requires a stream")
+            envelope = effect.message.envelope.model_copy(deep=True)
+            if envelope.message_id not in stream_state.by_message_id:
+                stream_state.messages.append(envelope)
+                stream_state.by_message_id[envelope.message_id] = envelope
+                stream_state.signatures[envelope.message_id] = (
+                    envelope.identity.run_id,
+                    envelope.codec,
+                    bytes(envelope.payload),
+                    effect.message.checkpoint,
+                )
+        if stream_state is not None:
+            if effect.retention_action == "clear":
+                stream_state.expires_at_monotonic = None
+            elif effect.retention_action == "start":
+                terminal_ttl = self._retention_policy.terminal_ttl_seconds
+                stream_state.expires_at_monotonic = (
+                    None if terminal_ttl is None else time.monotonic() + terminal_ttl
+                )
+        if effect.tombstone_reason is not None:
+            if stream_state is None:
+                raise RuntimeError("Messaging tombstone effect requires a stream")
+            stream_state.deleted = True
+            stream_state.disposition = effect.tombstone_reason
+            channel_state.streams.pop(identity.thread_id, None)
+            channel_state.next_generations[identity.thread_id] = (
+                stream_state.generation + 1
+            )
+            self._record_tombstone(
+                channel_state,
+                identity.thread_id,
+                generation=stream_state.generation,
+                reason=effect.tombstone_reason,
+            )
+
+    def _raise_memory_generation_unavailable(
+        self,
+        query: CommittedMessageQuery | MessagingChangeWait,
+    ) -> Never:
+        channel_state = self._channels.get(query.channel)
+        if channel_state is not None:
+            tombstone = self._tombstone_reason(
+                channel_state,
+                query.identity.thread_id,
+                query.generation,
+            )
+            if tombstone is not None:
+                generation, reason = tombstone
+                self._raise_tombstone(
+                    channel=query.channel,
+                    identity=query.identity,
+                    generation=generation,
+                    reason=reason,
+                )
+        raise StreamDeleted(
+            channel=query.channel,
+            identity=query.identity,
+            generation=query.generation,
+        )
+
+    @staticmethod
+    def _raise_memory_stream_disposition(
+        *,
+        channel: str,
+        identity: RunIdentity,
+        generation: int,
+        disposition: str,
+    ) -> Never:
+        if disposition in {"expiring", "expired"}:
+            raise StreamExpired(
+                channel=channel,
+                identity=identity,
+                generation=generation,
+            )
+        raise StreamDeleted(
+            channel=channel,
+            identity=identity,
+            generation=generation,
+        )
 
     @staticmethod
     def _record_tombstone(
@@ -725,583 +962,9 @@ class MemoryBackend(MessagingBackend):
             generation=generation,
         )
 
-    def _state_for_handle(self, handle: BackendRunHandle) -> _StreamState:
-        channel_state = self._channels.get(handle.channel)
-        state = None
-        if channel_state is not None:
-            state = self._expire_if_due(channel_state, handle.identity.thread_id)
-            if state is not None and (
-                handle.generation is not None and handle.generation != state.generation
-            ):
-                tombstone = self._tombstone_reason(
-                    channel_state,
-                    handle.identity.thread_id,
-                    handle.generation,
-                )
-                if tombstone is not None:
-                    generation, reason = tombstone
-                    self._raise_tombstone(
-                        channel=handle.channel,
-                        identity=handle.identity,
-                        generation=generation,
-                        reason=reason,
-                    )
-        if state is None:
-            if channel_state is not None:
-                tombstone = self._tombstone_reason(
-                    channel_state,
-                    handle.identity.thread_id,
-                    handle.generation,
-                )
-                if tombstone is not None:
-                    generation, reason = tombstone
-                    self._raise_tombstone(
-                        channel=handle.channel,
-                        identity=handle.identity,
-                        generation=generation,
-                        reason=reason,
-                    )
-            if handle.generation is not None:
-                raise StreamDeleted(
-                    channel=handle.channel,
-                    identity=handle.identity,
-                    generation=handle.generation,
-                )
-            raise RunNotFound(identity=handle.identity)
-        self._require_generation(state, handle)
-        return state
-
     def _channel(self, channel: str) -> _ChannelState:
         state = self._channels.get(channel)
         if state is None:
             state = _ChannelState()
             self._channels[channel] = state
         return state
-
-    async def prepare(
-        self,
-        *,
-        channel: str,
-        identity: RunIdentity,
-        codec: str,
-        after: int | None,
-        cancellable: bool,
-        recoverable: bool,
-    ) -> PreparedRun:
-        """Start, recover, or attach to one in-memory semantic run atomically."""
-
-        required_identifier("channel", channel)
-        required_identity(identity)
-        required_identifier("codec", codec)
-        channel_state = self._channel(channel)
-        async with channel_state.lock:
-            state = self._expire_if_due(channel_state, identity.thread_id)
-            if state is None:
-                expired = self._tombstone_reason(
-                    channel_state,
-                    identity.thread_id,
-                    None,
-                )
-                if (
-                    expired is not None
-                    and expired[1] == "expired"
-                    and after
-                    not in {
-                        None,
-                        0,
-                    }
-                ):
-                    raise StreamExpired(
-                        channel=channel,
-                        identity=identity,
-                        generation=expired[0],
-                    )
-                generation = channel_state.next_generations.get(identity.thread_id, 1)
-                state = _StreamState(generation=generation)
-                channel_state.streams[identity.thread_id] = state
-            async with state.condition:
-                latest = len(state.messages)
-                cursor = latest if after is None else after
-                if isinstance(cursor, bool) or not isinstance(cursor, int):
-                    raise TypeError("after must be an integer or None")
-                if cursor < 0 or cursor > latest:
-                    raise InvalidCursor(after=cursor, latest=latest)
-                if channel_state.codec is not None and channel_state.codec != codec:
-                    raise CodecMismatch(expected=channel_state.codec, actual=codec)
-
-                existing = state.runs.get(identity.run_id)
-                if existing is not None:
-                    if channel_state.codec is None:
-                        channel_state.codec = codec
-                    return PreparedRun(
-                        handle=BackendRunHandle(
-                            channel=channel,
-                            identity=identity,
-                            owner_token=None,
-                            fence=None,
-                            generation=state.generation,
-                        ),
-                        after=cursor,
-                        is_owner=False,
-                    )
-
-                active_identity = state.active_identity
-                if active_identity is not None:
-                    raise RunAlreadyActive(
-                        active_identity=active_identity,
-                        requested_identity=identity,
-                    )
-
-                owner_token = uuid4().hex
-                record = _RunRecord(
-                    identity=identity,
-                    start_seq=latest,
-                    owner_token=owner_token,
-                    cancellable=cancellable,
-                    recoverable=recoverable,
-                )
-                if channel_state.codec is None:
-                    channel_state.codec = codec
-                state.runs[identity.run_id] = record
-                state.active_identity = identity
-                # Only a genuinely new Run clears terminal retention. Attaching to an
-                # existing terminal Run leaves its original deadline unchanged.
-                state.expires_at_monotonic = None
-                return PreparedRun(
-                    handle=BackendRunHandle(
-                        channel=channel,
-                        identity=identity,
-                        owner_token=owner_token,
-                        fence=record.fence,
-                        generation=state.generation,
-                    ),
-                    after=cursor,
-                    is_owner=True,
-                )
-
-    async def append(
-        self,
-        handle: BackendRunHandle,
-        *,
-        message_id: str,
-        codec: str,
-        payload: bytes,
-        checkpoint: RecoveryCheckpoint | None = None,
-    ) -> MessageEnvelope:
-        """Idempotently append one message after ownership and quota checks."""
-
-        _validate_append_input(
-            handle,
-            message_id=message_id,
-            codec=codec,
-            payload=payload,
-            checkpoint=checkpoint,
-            limits=self._limits,
-        )
-        state = self._state_for_handle(handle)
-        channel_state = self._channel(handle.channel)
-        signature = (handle.identity.run_id, codec, payload, checkpoint)
-        async with state.condition:
-            record = self._owned_record(state, handle)
-            if channel_state.codec != codec:
-                raise CodecMismatch(expected=channel_state.codec or "", actual=codec)
-            existing = state.by_message_id.get(message_id)
-            if existing is not None:
-                if state.signatures[message_id] != signature:
-                    raise MessageIdConflict(
-                        identity=handle.identity,
-                        message_id=message_id,
-                    )
-                return existing.model_copy(deep=True)
-
-            if len(state.messages) >= self._limits.max_thread_messages:
-                raise MessagingQuotaExceeded(
-                    resource="thread_messages",
-                    limit=self._limits.max_thread_messages,
-                )
-            if (
-                state.payload_bytes + len(payload)
-                > self._limits.max_thread_payload_bytes
-            ):
-                raise MessagingQuotaExceeded(
-                    resource="thread_payload_bytes",
-                    limit=self._limits.max_thread_payload_bytes,
-                )
-
-            envelope = MessageEnvelope(
-                channel=handle.channel,
-                identity=handle.identity,
-                seq=len(state.messages) + 1,
-                message_id=message_id,
-                codec=codec,
-                payload=bytes(payload),
-                created_at=datetime.now(UTC),
-            )
-            state.messages.append(envelope)
-            state.by_message_id[message_id] = envelope
-            state.signatures[message_id] = signature
-            state.payload_bytes += len(payload)
-            record.end_seq = envelope.seq
-            record.checkpoint = checkpoint
-            state.condition.notify_all()
-            return envelope.model_copy(deep=True)
-
-    async def begin_settlement(self, handle: BackendRunHandle) -> bool:
-        """Atomically choose an accepted cancellation or ordinary settlement."""
-
-        state = self._state_for_handle(handle)
-        async with state.condition:
-            record = self._owned_record(state, handle)
-            if record.settling:
-                raise BackendOwnershipLost(
-                    f"Producer for run {handle.identity.run_id!r} cannot begin "
-                    "settlement"
-                )
-            if record.status == "cancel_requested":
-                record.settling = True
-                return True
-            if record.status != "running":
-                raise BackendOwnershipLost(
-                    f"Producer for run {handle.identity.run_id!r} cannot begin "
-                    "settlement"
-                )
-            record.settling = True
-            return False
-
-    async def finish(
-        self,
-        handle: BackendRunHandle,
-        *,
-        status: FinalRunStatus,
-        error: BaseException | None = None,
-    ) -> None:
-        """Commit the producer terminal state and release its active identity."""
-
-        state = self._state_for_handle(handle)
-        async with state.condition:
-            record = self._owned_record(state, handle)
-            if record.status == "cancel_requested" and status == "completed":
-                status = "failed"
-                error = RuntimeError(
-                    "producer completed without settling accepted cancellation"
-                )
-            record.status = status
-            record.settling = True
-            record.error = error
-            record.end_seq = len(state.messages)
-            if state.active_identity == handle.identity:
-                state.active_identity = None
-            terminal_ttl = self._retention_policy.terminal_ttl_seconds
-            state.expires_at_monotonic = (
-                None if terminal_ttl is None else time.monotonic() + terminal_ttl
-            )
-            state.condition.notify_all()
-
-    async def latest_seq(self, *, channel: str, identity: RunIdentity) -> int:
-        """Return the latest committed sequence or zero for an empty stream."""
-
-        required_identifier("channel", channel)
-        required_identity(identity)
-        channel_state = self._channels.get(channel)
-        if channel_state is None:
-            return 0
-        async with channel_state.lock:
-            state = self._expire_if_due(channel_state, identity.thread_id)
-            if state is None:
-                tombstone = self._tombstone_reason(
-                    channel_state,
-                    identity.thread_id,
-                    None,
-                )
-                if tombstone is not None and tombstone[1] == "expired":
-                    raise StreamExpired(
-                        channel=channel,
-                        identity=identity,
-                        generation=tombstone[0],
-                    )
-                return 0
-            async with state.condition:
-                return len(state.messages)
-
-    async def get_run_status(
-        self,
-        *,
-        channel: str,
-        identity: RunIdentity,
-    ) -> RunStatus:
-        """Return the current in-memory status for one exact semantic run."""
-
-        required_identifier("channel", channel)
-        required_identity(identity)
-        channel_state = self._channels.get(channel)
-        if channel_state is None:
-            raise RunNotFound(identity=identity)
-        async with channel_state.lock:
-            state = self._expire_if_due(channel_state, identity.thread_id)
-            if state is None:
-                tombstone = self._tombstone_reason(
-                    channel_state,
-                    identity.thread_id,
-                    None,
-                )
-                if tombstone is not None and tombstone[1] == "expired":
-                    raise StreamExpired(
-                        channel=channel,
-                        identity=identity,
-                        generation=tombstone[0],
-                    )
-                raise RunNotFound(identity=identity)
-            async with state.condition:
-                record = state.runs.get(identity.run_id)
-                if record is None:
-                    raise RunNotFound(identity=identity)
-                return record.status
-
-    async def read(
-        self,
-        *,
-        channel: str,
-        identity: RunIdentity,
-        after: int = 0,
-        limit: int = 100,
-    ) -> tuple[MessageEnvelope, ...]:
-        """Read one ascending defensive page after an exclusive cursor."""
-
-        required_identifier("channel", channel)
-        required_identity(identity)
-        if isinstance(after, bool) or not isinstance(after, int):
-            raise TypeError("after must be an integer")
-        if after < 0:
-            raise ValueError("after must be greater than or equal to zero")
-        if isinstance(limit, bool) or not isinstance(limit, int):
-            raise TypeError("limit must be an integer")
-        if not 1 <= limit <= 1000:
-            raise ValueError("limit must be between 1 and 1000")
-        channel_state = self._channels.get(channel)
-        if channel_state is None:
-            if after > 0:
-                raise InvalidCursor(after=after, latest=0)
-            return ()
-        async with channel_state.lock:
-            state = self._expire_if_due(channel_state, identity.thread_id)
-            if state is None:
-                tombstone = self._tombstone_reason(
-                    channel_state,
-                    identity.thread_id,
-                    None,
-                )
-                if tombstone is not None and tombstone[1] == "expired":
-                    raise StreamExpired(
-                        channel=channel,
-                        identity=identity,
-                        generation=tombstone[0],
-                    )
-                if after > 0:
-                    raise InvalidCursor(after=after, latest=0)
-                return ()
-            async with state.condition:
-                latest = len(state.messages)
-                if after > latest:
-                    raise InvalidCursor(after=after, latest=latest)
-                return tuple(
-                    message.model_copy(deep=True)
-                    for message in state.messages[after : after + limit]
-                )
-
-    async def bind_follow(
-        self,
-        *,
-        channel: str,
-        identity: RunIdentity,
-        after: int,
-    ) -> BackendRunHandle:
-        """Bind one follower after validating its cursor under the stream lock."""
-
-        required_identifier("channel", channel)
-        required_identity(identity)
-        if isinstance(after, bool) or not isinstance(after, int):
-            raise TypeError("after must be an integer")
-        if after < 0:
-            raise ValueError("after must be greater than or equal to zero")
-        channel_state = self._channels.get(channel)
-        if channel_state is None:
-            raise RunNotFound(identity=identity)
-        async with channel_state.lock:
-            state = self._expire_if_due(channel_state, identity.thread_id)
-            if state is None:
-                tombstone = self._tombstone_reason(
-                    channel_state,
-                    identity.thread_id,
-                    None,
-                )
-                if tombstone is not None and tombstone[1] == "expired":
-                    raise StreamExpired(
-                        channel=channel,
-                        identity=identity,
-                        generation=tombstone[0],
-                    )
-                raise RunNotFound(identity=identity)
-            async with state.condition:
-                if state.deleted:
-                    raise StreamDeleted(
-                        channel=channel,
-                        identity=identity,
-                        generation=state.generation,
-                    )
-                if identity.run_id not in state.runs:
-                    raise RunNotFound(identity=identity)
-                latest = len(state.messages)
-                if after > latest:
-                    raise InvalidCursor(after=after, latest=latest)
-                return BackendRunHandle(
-                    channel=channel,
-                    identity=identity,
-                    owner_token=None,
-                    fence=None,
-                    generation=state.generation,
-                )
-
-    def follow(
-        self,
-        handle: BackendRunHandle,
-        *,
-        after: int,
-    ) -> AsyncIterator[MessageEnvelope]:
-        """Follow committed messages until this exact run reaches a terminal state."""
-
-        async def iterate() -> AsyncGenerator[MessageEnvelope, None]:
-            state = self._state_for_handle(handle)
-            cursor = after
-            while True:
-                page: tuple[MessageEnvelope, ...] = ()
-                terminal_status: RunStatus | None = None
-                terminal_error: BaseException | None = None
-                async with state.condition:
-                    self._require_generation(state, handle)
-                    record = state.runs.get(handle.identity.run_id)
-                    if record is None:
-                        raise RunNotFound(identity=handle.identity)
-                    is_terminal = is_final_run_status(record.status)
-                    available_end = (
-                        record.end_seq if is_terminal else len(state.messages)
-                    )
-                    if is_terminal:
-                        terminal_status = record.status
-                        terminal_error = record.error
-                    if cursor < available_end:
-                        page = tuple(
-                            message.model_copy(deep=True)
-                            for message in state.messages[cursor:available_end]
-                        )
-                    elif not is_terminal:
-                        await state.condition.wait()
-                        continue
-
-                if page:
-                    for message in page:
-                        cursor = message.seq
-                        yield message
-                if is_failed_run_status(terminal_status):
-                    cause = terminal_error or RuntimeError(
-                        f"Producer for run {handle.identity.run_id!r} stopped"
-                    )
-                    raise RunProducerFailed(identity=handle.identity, cause=cause)
-                if terminal_status is not None:
-                    return
-
-        return iterate()
-
-    async def request_cancel(self, handle: BackendRunHandle) -> bool:
-        """Request cancellation unless settlement or termination already won."""
-
-        state = self._state_for_handle(handle)
-        async with state.condition:
-            self._require_generation(state, handle)
-            record = state.runs.get(handle.identity.run_id)
-            if record is None:
-                raise RunNotFound(identity=handle.identity)
-            if is_final_run_status(record.status):
-                return False
-            if record.settling:
-                return False
-            if not record.cancellable:
-                raise CancellationUnsupported(identity=handle.identity)
-            if record.status == "cancel_requested":
-                return False
-            record.status = "cancel_requested"
-            state.condition.notify_all()
-            return True
-
-    async def wait_for_cancel(self, handle: BackendRunHandle) -> bool:
-        """Wait for cancellation or return ``False`` after terminal settlement."""
-
-        state = self._state_for_handle(handle)
-        async with state.condition:
-            while True:
-                self._require_generation(state, handle)
-                record = state.runs.get(handle.identity.run_id)
-                if record is None:
-                    raise RunNotFound(identity=handle.identity)
-                if record.status == "cancel_requested":
-                    return True
-                if is_final_run_status(record.status):
-                    return False
-                await state.condition.wait()
-
-    async def wait_finished(self, handle: BackendRunHandle) -> RunStatus:
-        """Wait for and return this run's terminal in-memory status."""
-
-        state = self._state_for_handle(handle)
-        async with state.condition:
-            while True:
-                self._require_generation(state, handle)
-                record = state.runs.get(handle.identity.run_id)
-                if record is None:
-                    raise RunNotFound(identity=handle.identity)
-                if is_final_run_status(record.status):
-                    return record.status
-                await state.condition.wait()
-
-    async def failure(self, handle: BackendRunHandle) -> BaseException | None:
-        """Return the recorded producer failure after a run has settled."""
-
-        state = self._state_for_handle(handle)
-        async with state.condition:
-            self._require_generation(state, handle)
-            record = state.runs.get(handle.identity.run_id)
-            if record is None:
-                raise RunNotFound(identity=handle.identity)
-            return record.error
-
-    @staticmethod
-    def _owned_record(
-        state: _StreamState,
-        handle: BackendRunHandle,
-    ) -> _RunRecord:
-        MemoryBackend._require_generation(state, handle)
-        record = state.runs.get(handle.identity.run_id)
-        if record is None:
-            raise RunNotFound(identity=handle.identity)
-        if (
-            handle.owner_token is None
-            or handle.fence is None
-            or record.owner_token != handle.owner_token
-            or record.fence != handle.fence
-        ):
-            raise BackendOwnershipLost(
-                f"Producer for run {handle.identity.run_id!r} no longer owns its fence"
-            )
-        return record
-
-    @staticmethod
-    def _require_generation(
-        state: _StreamState,
-        handle: BackendRunHandle,
-    ) -> None:
-        generation = handle.generation
-        if state.deleted or (generation is not None and generation != state.generation):
-            raise StreamDeleted(
-                channel=handle.channel,
-                identity=handle.identity,
-                generation=generation,
-            )

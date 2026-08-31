@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import inspect
 from collections.abc import AsyncGenerator, AsyncIterator
 from typing import ClassVar, cast
 
 import pytest
+from backend_harness import MessagingBackendHarness
 
 from tinkerfin import RunIdentity
 from tinkerfin_messaging import (
@@ -20,6 +20,8 @@ from tinkerfin_messaging import (
     MessagingBackendProtocolError,
     MessagingClosed,
     MessagingErrorCode,
+    MessagingTransition,
+    MessagingTransitionResult,
     RunNotFound,
     RunProducerFailed,
     RunStatus,
@@ -66,14 +68,21 @@ class _FailingSource:
             await self._iterator.aclose()
 
 
-class _MissingRunStatusBackend(MessagingBackend):
-    """Model an explicit backend subclass that omitted the new operation."""
+class _IncompleteMessagingBackend:
+    """Model a backend object that omits required storage operations."""
 
 
 class _InvalidRunStatusBackend(MemoryBackend):
-    async def get_run_status(self, *, channel: str, identity: RunIdentity) -> RunStatus:
-        del channel, identity
-        return cast(RunStatus, "corrupted")
+    async def commit_messaging_transition(
+        self,
+        transition: MessagingTransition,
+    ) -> MessagingTransitionResult:
+        if transition.kind == "reconcile_producer_ownership":
+            return MessagingTransitionResult(
+                kind=transition.kind,
+                run_status=cast(RunStatus, "corrupted"),
+            )
+        return await super().commit_messaging_transition(transition)
 
 
 class _FalseyBackend(MemoryBackend):
@@ -93,7 +102,7 @@ async def _commit(messaging: Messaging, *items: str) -> MessageChannel[str, str]
 
 
 async def test_channel_reads_typed_committed_pages_and_follows_one_run(
-    messaging_backend: MessagingBackend,
+    messaging_backend: MessagingBackendHarness,
 ) -> None:
     async with Messaging(backend=messaging_backend) as messaging:
         channel = await _commit(messaging, "first", "second")
@@ -113,7 +122,7 @@ async def test_channel_reads_typed_committed_pages_and_follows_one_run(
 
 
 async def test_channel_empty_committed_stream_returns_zero_and_empty_page(
-    messaging_backend: MessagingBackend,
+    messaging_backend: MessagingBackendHarness,
 ) -> None:
     async with Messaging(backend=messaging_backend) as messaging:
         channel = messaging.channel(name="events", codec=_TextCodec())
@@ -124,7 +133,7 @@ async def test_channel_empty_committed_stream_returns_zero_and_empty_page(
 
 
 async def test_channel_run_status_exposes_every_durable_state(
-    messaging_backend: MessagingBackend,
+    messaging_backend: MessagingBackendHarness,
 ) -> None:
     """Hosts can reconcile durable state without probing a blocking follower."""
 
@@ -199,9 +208,10 @@ async def test_channel_run_status_rejects_calls_after_messaging_closes() -> None
 def test_messaging_rejects_a_backend_missing_the_status_contract() -> None:
     """Explicit and structural backends must implement the complete contract."""
 
-    assert inspect.isabstract(_MissingRunStatusBackend)
+    incomplete = _IncompleteMessagingBackend()
+    assert not isinstance(incomplete, MessagingBackend)
     with pytest.raises(TypeError, match="backend must implement MessagingBackend"):
-        Messaging(backend=cast(MessagingBackend, object()))
+        Messaging(backend=cast(MessagingBackend, incomplete))
 
 
 def test_messaging_keeps_a_valid_falsey_backend() -> None:
@@ -233,7 +243,7 @@ async def test_channel_run_status_rejects_invalid_backend_results(
 
 
 async def test_channel_read_and_follow_reject_cursors_beyond_thread_tail(
-    messaging_backend: MessagingBackend,
+    messaging_backend: MessagingBackendHarness,
 ) -> None:
     """Direct read and follow must enforce the same strict cursor contract."""
 
@@ -321,7 +331,7 @@ async def test_channel_follow_preserves_producer_failure_after_committed_events(
 
 
 async def test_channel_follow_keeps_its_committed_terminal_snapshot_during_deletion(
-    messaging_backend: MessagingBackend,
+    messaging_backend: MessagingBackendHarness,
 ) -> None:
     async with Messaging(backend=messaging_backend) as messaging:
         channel = await _commit(messaging, "first", "second")
@@ -337,7 +347,7 @@ async def test_channel_follow_keeps_its_committed_terminal_snapshot_during_delet
 
 
 async def test_channel_follow_binds_generation_before_first_pull(
-    messaging_backend: MessagingBackend,
+    messaging_backend: MessagingBackendHarness,
 ) -> None:
     async with Messaging(backend=messaging_backend) as messaging:
         channel = await _commit(messaging, "old")

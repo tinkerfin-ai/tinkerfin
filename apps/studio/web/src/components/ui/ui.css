@@ -771,11 +771,65 @@
 }
 
 @layer ui {
+  .brand-logo {
+    --brand-logo-height: 22px;
+    position: relative;
+    display: inline-block;
+    width: auto;
+    height: var(--brand-logo-height);
+    flex: 0 0 auto;
+    aspect-ratio: 2010 / 458;
+  }
+
+  .brand-logo--md { --brand-logo-height: 30px; }
+  .brand-logo--lg { --brand-logo-height: 34px; }
+
+  .brand-logo__mark,
+  .brand-logo__wordmark {
+    position: absolute;
+    display: block;
+  }
+
+  .brand-logo__mark {
+    top: 0;
+    left: 0;
+    width: 32.189%;
+    height: 100%;
+  }
+
+  .brand-logo__wordmark {
+    top: 18.996%;
+    right: 0;
+    width: 64.428%;
+    height: 52.838%;
+  }
+
+  :root[data-theme='dark'] .brand-logo__wordmark {
+    filter: brightness(0) invert(1);
+  }
+
   .brand-mark {
     display: inline-grid;
     flex: 0 0 auto;
     place-items: center;
-    color: currentColor;
+  }
+
+  .brand-mark img {
+    display: block;
+    width: auto;
+    height: var(--brand-mark-height);
+  }
+
+  @media (max-width: 440px) {
+    .brand-logo--lg { --brand-logo-height: 32px; }
+  }
+
+  @media (forced-colors: active) {
+    .brand-logo__mark,
+    .brand-logo__wordmark,
+    .brand-mark img {
+      forced-color-adjust: none;
+    }
   }
 
   .theme-switcher {

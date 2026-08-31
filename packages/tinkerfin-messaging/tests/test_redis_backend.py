@@ -7,11 +7,13 @@ import hashlib
 import multiprocessing
 from collections import Counter
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Mapping, Sequence
+from contextlib import asynccontextmanager
 from multiprocessing.synchronize import Event as ProcessEvent
 from typing import ClassVar, TypeVar, cast
 from uuid import uuid4
 
 import pytest
+from backend_harness import RedisBackendHarness
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 from redis.typing import KeyT, StreamIdT
@@ -19,7 +21,6 @@ from redis.typing import KeyT, StreamIdT
 from tinkerfin import RunIdentity
 from tinkerfin_messaging import (
     BackendOwnershipLost,
-    BackendRunHandle,
     CodecMismatch,
     MessageSubscription,
     Messaging,
@@ -27,21 +28,54 @@ from tinkerfin_messaging import (
     MessagingLimits,
     MessagingQuotaExceeded,
     MessagingRetentionPolicy,
-    PreparedRun,
+    MessagingStateQuery,
+    MessagingTransition,
     RecoverableMessage,
     RecoveryCheckpoint,
-    RedisBackend,
     RunAlreadyActive,
     RunProducerFailed,
+    StreamDeleteConflict,
     StreamDeleted,
     StreamExpired,
+    StreamGenerationPurge,
     _redis_journal,
     _redis_scripts,
 )
+from tinkerfin_messaging import (
+    RedisBackend as RedisStorageBackend,
+)
+from tinkerfin_messaging.backend import _BackendRunHandle, _PreparedRun
+from tinkerfin_messaging.testing import verify_messaging_backend
 
 _RedisStreamEntry = tuple[bytes, dict[bytes, bytes]]
 _XReadResponse = list[tuple[bytes, list[_RedisStreamEntry]]]
 _RedisT = TypeVar("_RedisT", bound=Redis)
+
+
+class RedisBackend(RedisBackendHarness):
+    """Construct the public Redis storage backend behind the test lifecycle harness."""
+
+    def __init__(
+        self,
+        client: Redis,
+        *,
+        key_prefix: str = "tinkerfin-messaging",
+        lease_ttl: float = 15.0,
+        poll_interval: float = 0.1,
+        limits: MessagingLimits = MessagingLimits(),
+        retention_policy: MessagingRetentionPolicy = MessagingRetentionPolicy(),
+    ) -> None:
+        super().__init__(
+            RedisStorageBackend(
+                client,
+                key_prefix=key_prefix,
+                producer_lease_seconds=lease_ttl,
+                generation_cleanup_retry_seconds=poll_interval,
+                limits=limits,
+                retention_policy=retention_policy,
+            )
+        )
+
 
 _REDIS_SCRIPT_DIGESTS = {
     "_APPEND_SCRIPT": "34b6443e16fd55fe6cb0cfcc11ab893f4ac18c8cccf34be80e26651602b60525",
@@ -52,10 +86,11 @@ _REDIS_SCRIPT_DIGESTS = {
     "_DELETE_BATCH_SCRIPT": "c018e231de54762346bc095581f23d9bca9107667273102dae4b7d51e20bbf10",
     "_FINALIZE_DELETE_SCRIPT": "c6623e079d25a0d250977b2fc44fbd423f80a7eee440f3ab88f4723df2e207cf",
     "_FINISH_SCRIPT": "1c61107eaa22defa2480c0966975a15f4e6a89dbca3b7f714ae596e2d6e0fece",
+    "_MESSAGING_STATE_SNAPSHOT_SCRIPT": "40d5362e08cf6dfbad004a3fb1b7d9b3293b1e600012bc23ca624d3fc2f2c429",
     "_PREPARE_SCRIPT": "737da97459a473c59e887419e746c31d3e9180f5764c049e9cf512e99bccd62a",
     "_READ_CONTROL_SCRIPT": "0cda87dabd7a112208ade6abe7f2ed806f9ac216b6ed0913c5fc194223a0703c",
     "_RENEW_SCRIPT": "90a2c24ed5f4e9c64f84a41fa6b4bc69e03206c5df48c5f75ec4b66be6c62113",
-    "_RUN_SNAPSHOT_SCRIPT": "2f1bafc8936ea8c23feca11b2a8f7d9d970b8854342e84f379388d1cc4935054",
+    "_RUN_SNAPSHOT_SCRIPT": "3986e780233a7f925ae605bfeab9afb88b50bfb77b9ea45ec20c063509f7aefd",
 }
 
 
@@ -292,26 +327,37 @@ class _GatedEvalRedis(Redis):
     append_release: asyncio.Event
     gate_next_eval_before = False
     gate_next_eval_after = False
+    gate_next_state_snapshot_before = False
+    gate_next_state_snapshot_after = False
     gate_append_response = False
 
     async def execute_command(self, *args: object, **options: object) -> object:
         command = args[0] if args else ""
         command_name = command.decode() if isinstance(command, bytes) else str(command)
         is_eval = command_name.casefold() == "eval"
-        if is_eval and self.gate_next_eval_before:
+        script = args[1] if len(args) > 1 else ""
+        script_text = script.decode() if isinstance(script, bytes) else str(script)
+        is_state_snapshot = is_eval and "ACTIVE_RUN_CHANGED" in script_text
+        if is_eval and (
+            self.gate_next_eval_before
+            or (is_state_snapshot and self.gate_next_state_snapshot_before)
+        ):
             self.gate_next_eval_before = False
+            self.gate_next_state_snapshot_before = False
             self.eval_entered.set()
             await self.eval_release.wait()
         response = super().execute_command(*args, **options)
         result = await cast(Awaitable[object], response)
-        script = args[1] if len(args) > 1 else ""
-        script_text = script.decode() if isinstance(script, bytes) else str(script)
         if is_eval and self.gate_append_response and "'APPENDED'" in script_text:
             self.gate_append_response = False
             self.append_committed.set()
             await self.append_release.wait()
-        if is_eval and self.gate_next_eval_after:
+        if is_eval and (
+            self.gate_next_eval_after
+            or (is_state_snapshot and self.gate_next_state_snapshot_after)
+        ):
             self.gate_next_eval_after = False
+            self.gate_next_state_snapshot_after = False
             self.eval_returned.set()
             await self.return_release.wait()
         return result
@@ -521,7 +567,7 @@ def test_redis_backend_uses_the_public_client_configuration_boundary() -> None:
 async def redis_backends(
     redis_url: str,
 ) -> AsyncGenerator[
-    tuple[RedisBackend, RedisBackend, Redis],
+    tuple[RedisBackendHarness, RedisBackendHarness, Redis],
     None,
 ]:
     first_client = _redis_client(Redis, redis_url)
@@ -564,7 +610,7 @@ async def redis_backends(
 async def counting_redis_backend(
     redis_url: str,
 ) -> AsyncGenerator[
-    tuple[RedisBackend, _CommandCountingRedis, str],
+    tuple[RedisBackendHarness, _CommandCountingRedis, str],
     None,
 ]:
     """Provide one real backend whose command boundary remains observable."""
@@ -596,7 +642,7 @@ async def counting_redis_backend(
 
 
 async def test_channel_follow_binds_generation_across_redis_backend_instances(
-    redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+    redis_backends: tuple[RedisBackendHarness, RedisBackendHarness, Redis],
 ) -> None:
     owner_backend, observer_backend, _ = redis_backends
     async with (
@@ -628,11 +674,23 @@ async def test_channel_follow_binds_generation_across_redis_backend_instances(
             await anext(aiter(stale))
 
 
+async def test_public_backend_verifier_accepts_real_redis(
+    redis_backends: tuple[RedisBackendHarness, RedisBackendHarness, Redis],
+) -> None:
+    backend, _, _ = redis_backends
+
+    @asynccontextmanager
+    async def open_backend() -> AsyncIterator[RedisStorageBackend]:
+        yield backend.storage_backend
+
+    await verify_messaging_backend(open_backend)
+
+
 @pytest.fixture
 async def gated_xread_backends(
     redis_url: str,
 ) -> AsyncGenerator[
-    tuple[RedisBackend, RedisBackend, _GatedXreadRedis],
+    tuple[RedisBackendHarness, RedisBackendHarness, _GatedXreadRedis],
     None,
 ]:
     """Provide separate waiting and state-changing clients for one XREAD race."""
@@ -676,7 +734,7 @@ async def gated_xread_backends(
 async def gated_redis_backend(
     redis_url: str,
 ) -> AsyncGenerator[
-    tuple[RedisBackend, _GatedEvalRedis],
+    tuple[RedisBackendHarness, _GatedEvalRedis],
     None,
 ]:
     client = _redis_client(_GatedEvalRedis, redis_url)
@@ -694,7 +752,10 @@ async def gated_redis_backend(
             pytest.fail(
                 f"real Redis PING failed without exposing credentials: {type(error).__name__}"
             )
-        yield RedisBackend(client, key_prefix=prefix, poll_interval=0.05), client
+        yield (
+            RedisBackend(client, key_prefix=prefix, poll_interval=0.05),
+            client,
+        )
     finally:
         client.eval_release.set()
         client.return_release.set()
@@ -704,7 +765,7 @@ async def gated_redis_backend(
 
 
 async def test_real_redis_replays_commits_across_backend_instances(
-    redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+    redis_backends: tuple[RedisBackendHarness, RedisBackendHarness, Redis],
 ) -> None:
     owner, follower, _ = redis_backends
     prepared = await owner.prepare(
@@ -965,7 +1026,7 @@ async def test_real_redis_rejects_cross_worker_retention_mismatch(
     ],
 )
 async def test_real_redis_rejects_invalid_append_before_lua_or_state_change(
-    counting_redis_backend: tuple[RedisBackend, _CommandCountingRedis, str],
+    counting_redis_backend: tuple[RedisBackendHarness, _CommandCountingRedis, str],
     message_id: str,
     checkpoint: RecoveryCheckpoint | None,
 ) -> None:
@@ -1031,7 +1092,7 @@ async def test_real_redis_rejects_invalid_append_before_lua_or_state_change(
 
 
 async def test_real_redis_idle_waits_do_not_run_a_fixed_polling_loop(
-    counting_redis_backend: tuple[RedisBackend, _CommandCountingRedis, str],
+    counting_redis_backend: tuple[RedisBackendHarness, _CommandCountingRedis, str],
 ) -> None:
     """Restoring the 100ms loop must exceed these idle command bounds."""
 
@@ -1063,16 +1124,20 @@ async def test_real_redis_idle_waits_do_not_run_a_fixed_polling_loop(
     cancel_counts = await observe(backend.wait_for_cancel(prepared.handle))
     finish_counts = await observe(backend.wait_finished(prepared.handle))
 
-    for counts in (follow_counts, cancel_counts, finish_counts):
-        assert counts["eval"] <= 1
-        assert counts["hgetall"] == 0
-        assert counts["xrange"] == 0
-        assert counts["xread"] <= 1
+    for operation, counts in (
+        ("follow", follow_counts),
+        ("cancel", cancel_counts),
+        ("finish", finish_counts),
+    ):
+        assert counts["eval"] <= 1, (operation, counts)
+        assert counts["hgetall"] == 0, (operation, counts)
+        assert counts["xrange"] == 0, (operation, counts)
+        assert counts["xread"] <= 1, (operation, counts)
     await backend.finish(prepared.handle, status="completed")
 
 
 async def test_real_redis_twenty_idle_followers_use_one_block_each(
-    counting_redis_backend: tuple[RedisBackend, _CommandCountingRedis, str],
+    counting_redis_backend: tuple[RedisBackendHarness, _CommandCountingRedis, str],
 ) -> None:
     """Follower count may scale blocked connections, not 100ms command churn."""
 
@@ -1087,7 +1152,7 @@ async def test_real_redis_twenty_idle_followers_use_one_block_each(
     )
     followers = [backend.follow(prepared.handle, after=0) for _ in range(20)]
     client.command_counts.clear()
-    tasks = [asyncio.create_task(anext(follower)) for follower in followers]
+    tasks = [asyncio.ensure_future(anext(follower)) for follower in followers]
     try:
         await asyncio.sleep(0.35)
         counts = client.command_counts.copy()
@@ -1118,7 +1183,7 @@ async def test_real_redis_cancelled_consumer_closes_its_pinned_follow_client(
         lease_ttl=30,
         poll_interval=1,
     )
-    prepared: PreparedRun | None = None
+    prepared: _PreparedRun | None = None
     subscription: MessageSubscription[str] | None = None
     consumer: asyncio.Task[None] | None = None
     try:
@@ -1176,7 +1241,7 @@ async def test_real_redis_cancelled_consumer_closes_its_pinned_follow_client(
 
 
 async def test_real_redis_cancel_and_finish_wake_without_poll_interval_delay(
-    counting_redis_backend: tuple[RedisBackend, _CommandCountingRedis, str],
+    counting_redis_backend: tuple[RedisBackendHarness, _CommandCountingRedis, str],
 ) -> None:
     """State signals, rather than a one-second poll, must control wake latency."""
 
@@ -1238,7 +1303,11 @@ async def test_real_redis_cancel_and_finish_wake_without_poll_interval_delay(
 
 @pytest.mark.parametrize("transition", ["cancel", "finish"])
 async def test_real_redis_signal_closes_the_snapshot_to_xread_gap(
-    gated_xread_backends: tuple[RedisBackend, RedisBackend, _GatedXreadRedis],
+    gated_xread_backends: tuple[
+        RedisBackendHarness,
+        RedisBackendHarness,
+        _GatedXreadRedis,
+    ],
     transition: str,
 ) -> None:
     """A state change before XREAD is sent must remain durably observable."""
@@ -1277,7 +1346,7 @@ async def test_real_redis_signal_closes_the_snapshot_to_xread_gap(
 
 
 async def test_real_redis_state_change_before_snapshot_is_immediately_visible(
-    redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+    redis_backends: tuple[RedisBackendHarness, RedisBackendHarness, Redis],
 ) -> None:
     owner, observer, _ = redis_backends
     prepared = await owner.prepare(
@@ -1306,7 +1375,7 @@ async def test_real_redis_state_change_before_snapshot_is_immediately_visible(
 
 
 async def test_real_redis_nonrecoverable_lease_expiry_uses_its_pttl(
-    redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+    redis_backends: tuple[RedisBackendHarness, RedisBackendHarness, Redis],
 ) -> None:
     _, _, client = redis_backends
     prefix = f"tfmsg:lease-aware:{uuid4().hex}"
@@ -1349,7 +1418,7 @@ async def test_real_redis_nonrecoverable_lease_expiry_uses_its_pttl(
 
 
 async def test_real_redis_run_status_atomically_archives_an_expired_owner(
-    redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+    redis_backends: tuple[RedisBackendHarness, RedisBackendHarness, Redis],
 ) -> None:
     _, _, client = redis_backends
     prefix = f"tfmsg:status-expiry:{uuid4().hex}"
@@ -1398,7 +1467,7 @@ async def test_real_redis_run_status_atomically_archives_an_expired_owner(
 
 
 async def test_real_redis_recoverable_lease_expiry_waits_for_takeover_signal(
-    redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+    redis_backends: tuple[RedisBackendHarness, RedisBackendHarness, Redis],
 ) -> None:
     _, _, client = redis_backends
     prefix = f"tfmsg:recover-signal:{uuid4().hex}"
@@ -1510,7 +1579,7 @@ async def test_real_redis_cancelled_block_releases_the_only_connection(
 
 
 async def test_real_redis_cancellation_settles_an_inflight_snapshot(
-    gated_redis_backend: tuple[RedisBackend, _GatedEvalRedis],
+    gated_redis_backend: tuple[RedisBackendHarness, _GatedEvalRedis],
 ) -> None:
     backend, client = gated_redis_backend
     prepared = await backend.prepare(
@@ -1541,11 +1610,125 @@ async def test_real_redis_cancellation_settles_an_inflight_snapshot(
         client.eval_release.set()
         if not waiting.done():
             waiting.cancel()
-            await asyncio.gather(waiting, return_exceptions=True)
+        await asyncio.gather(waiting, return_exceptions=True)
+
+
+async def test_real_redis_state_snapshot_remains_coherent_before_a_later_append(
+    gated_redis_backend: tuple[RedisBackendHarness, _GatedEvalRedis],
+) -> None:
+    backend, client = gated_redis_backend
+    identity = _identity()
+    prepared = await backend.prepare(
+        channel="events",
+        identity=identity,
+        codec="test.bytes.v1",
+        after=0,
+        cancellable=False,
+        recoverable=False,
+    )
+    client.gate_next_state_snapshot_after = True
+    loading = asyncio.create_task(
+        backend.load_messaging_state(
+            MessagingStateQuery(channel="events", identity=identity)
+        )
+    )
+    try:
+        await asyncio.wait_for(client.eval_returned.wait(), timeout=0.5)
+        envelope = await backend.append(
+            prepared.handle,
+            message_id="message-1",
+            codec="test.bytes.v1",
+            payload=b"value",
+        )
+        client.return_release.set()
+        snapshot = await asyncio.wait_for(loading, timeout=0.5)
+
+        assert envelope.seq == 1
+        assert snapshot.stream is not None
+        assert snapshot.target_run is not None
+        assert snapshot.stream.latest_sequence == snapshot.target_run.end_sequence == 0
+    finally:
+        client.return_release.set()
+        if not loading.done():
+            loading.cancel()
+            await asyncio.gather(loading, return_exceptions=True)
+        await backend.finish(prepared.handle, status="completed")
+
+
+async def test_real_redis_state_snapshot_observes_an_append_that_precedes_it(
+    gated_redis_backend: tuple[RedisBackendHarness, _GatedEvalRedis],
+) -> None:
+    backend, client = gated_redis_backend
+    identity = _identity()
+    prepared = await backend.prepare(
+        channel="events",
+        identity=identity,
+        codec="test.bytes.v1",
+        after=0,
+        cancellable=False,
+        recoverable=False,
+    )
+    client.gate_next_state_snapshot_before = True
+    loading = asyncio.create_task(
+        backend.load_messaging_state(
+            MessagingStateQuery(channel="events", identity=identity)
+        )
+    )
+    try:
+        await asyncio.wait_for(client.eval_entered.wait(), timeout=0.5)
+        envelope = await backend.append(
+            prepared.handle,
+            message_id="message-1",
+            codec="test.bytes.v1",
+            payload=b"value",
+        )
+        client.eval_release.set()
+        snapshot = await asyncio.wait_for(loading, timeout=0.5)
+
+        assert snapshot.stream is not None
+        assert snapshot.target_run is not None
+        assert (
+            snapshot.stream.latest_sequence
+            == snapshot.target_run.end_sequence
+            == envelope.seq
+        )
+        assert snapshot.observed_at >= envelope.created_at
+    finally:
+        client.eval_release.set()
+        if not loading.done():
+            loading.cancel()
+            await asyncio.gather(loading, return_exceptions=True)
+        await backend.finish(prepared.handle, status="completed")
+
+
+async def test_real_redis_state_load_uses_one_atomic_evidence_command(
+    counting_redis_backend: tuple[RedisBackendHarness, _CommandCountingRedis, str],
+) -> None:
+    backend, client, _ = counting_redis_backend
+    identity = _identity()
+    prepared = await backend.prepare(
+        channel="events",
+        identity=identity,
+        codec="test.bytes.v1",
+        after=0,
+        cancellable=False,
+        recoverable=False,
+    )
+    client.command_counts.clear()
+
+    snapshot = await backend.load_messaging_state(
+        MessagingStateQuery(channel="events", identity=identity)
+    )
+
+    assert snapshot.target_run is not None
+    assert client.command_counts["eval"] == 2
+    for command in ("time", "hgetall", "exists", "xrange"):
+        assert client.command_counts[command] == 0
+    await backend.finish(prepared.handle, status="completed")
 
 
 async def test_real_redis_burst_replay_keeps_a_bounded_pull_page(
-    counting_redis_backend: tuple[RedisBackend, _CommandCountingRedis, str],
+    counting_redis_backend: tuple[RedisBackendHarness, _CommandCountingRedis, str],
 ) -> None:
     """Snapshot optimization must not prefetch beyond the existing 100-item page."""
 
@@ -1586,12 +1769,12 @@ async def test_real_redis_burst_replay_keeps_a_bounded_pull_page(
 
 
 async def test_real_redis_workers_bind_channel_codec_atomically(
-    redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+    redis_backends: tuple[RedisBackendHarness, RedisBackendHarness, Redis],
 ) -> None:
     first, second, _ = redis_backends
 
     async def prepare(
-        backend: RedisBackend,
+        backend: RedisBackendHarness,
         *,
         identity: RunIdentity,
         codec: str,
@@ -1619,7 +1802,7 @@ async def test_real_redis_workers_bind_channel_codec_atomically(
         return_exceptions=True,
     )
 
-    owners = [outcome for outcome in outcomes if isinstance(outcome, PreparedRun)]
+    owners = [outcome for outcome in outcomes if isinstance(outcome, _PreparedRun)]
     mismatches = [outcome for outcome in outcomes if isinstance(outcome, CodecMismatch)]
     assert len(owners) == 1
     assert len(mismatches) == 1
@@ -1628,10 +1811,10 @@ async def test_real_redis_workers_bind_channel_codec_atomically(
 
 
 async def test_real_redis_persists_channel_and_stream_metadata_separately(
-    redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+    redis_backends: tuple[RedisBackendHarness, RedisBackendHarness, Redis],
 ) -> None:
     backend, _, client = redis_backends
-    prepared_runs: list[PreparedRun] = []
+    prepared_runs: list[_PreparedRun] = []
     for index in (1, 2):
         prepared = await backend.prepare(
             channel="events",
@@ -1754,7 +1937,7 @@ async def test_real_redis_persists_channel_and_stream_metadata_separately(
 
 
 async def test_real_redis_enforces_thread_quotas_after_idempotency(
-    redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+    redis_backends: tuple[RedisBackendHarness, RedisBackendHarness, Redis],
 ) -> None:
     _, _, client = redis_backends
     message_prefix = f"tfmsg:quota-messages:{uuid4().hex}"
@@ -1860,7 +2043,7 @@ async def test_real_redis_enforces_thread_quotas_after_idempotency(
 
 
 async def test_real_redis_rejects_limits_mismatch_without_mutation(
-    redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+    redis_backends: tuple[RedisBackendHarness, RedisBackendHarness, Redis],
 ) -> None:
     _, _, client = redis_backends
     prefix = f"tfmsg:limits-mismatch:{uuid4().hex}"
@@ -1927,7 +2110,7 @@ async def test_real_redis_rejects_limits_mismatch_without_mutation(
     ],
 )
 async def test_real_redis_rejects_malformed_run_snapshot_scalars(
-    redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+    redis_backends: tuple[RedisBackendHarness, RedisBackendHarness, Redis],
     field: str,
     value: str,
     message: str,
@@ -1959,8 +2142,38 @@ async def test_real_redis_rejects_malformed_run_snapshot_scalars(
     await backend.finish(prepared.handle, status="completed")
 
 
+async def test_public_channel_keeps_redis_protocol_details_out_of_its_message(
+    redis_backends: tuple[RedisBackendHarness, RedisBackendHarness, Redis],
+) -> None:
+    backend, _, client = redis_backends
+    storage = cast(RedisStorageBackend, backend.storage_backend)
+    identity = _identity()
+    async with Messaging(backend=storage) as messaging:
+        channel = messaging.channel(name="events", codec=_TextCodec())
+        subscription = await channel.wrap(_Source("value"), identity=identity, after=0)
+        assert [message.data async for message in subscription] == ["value"]
+
+        run_keys = [
+            key
+            async for key in client.scan_iter(match="tfmsg:test:*:generation:1:run:*")
+        ]
+        assert len(run_keys) == 1
+        await cast(Awaitable[int], client.hset(run_keys[0], "status", "corrupt"))
+
+        with pytest.raises(MessagingBackendProtocolError) as captured:
+            await channel.get_run_status(identity=identity)
+
+    assert (
+        str(captured.value) == "Messaging backend returned an invalid protocol response"
+    )
+    assert "Redis Messaging run has an invalid status" == str(
+        captured.value.diagnostic_context["detail"]
+    )
+    assert captured.value.diagnostic_context["implementation"] == "redis"
+
+
 async def test_real_redis_rejects_a_malformed_snapshot_message_entry(
-    redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+    redis_backends: tuple[RedisBackendHarness, RedisBackendHarness, Redis],
 ) -> None:
     backend, _, client = redis_backends
     prepared = await backend.prepare(
@@ -2002,7 +2215,7 @@ async def test_real_redis_rejects_a_malformed_snapshot_message_entry(
 
 
 async def test_real_redis_rejected_prepare_does_not_index_phantom_run_keys(
-    redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+    redis_backends: tuple[RedisBackendHarness, RedisBackendHarness, Redis],
 ) -> None:
     first, second, client = redis_backends
     prepared = await first.prepare(
@@ -2037,8 +2250,104 @@ async def test_real_redis_rejected_prepare_does_not_index_phantom_run_keys(
     await first.finish(prepared.handle, status="completed")
 
 
+async def test_real_redis_cleanup_uses_seal_bounded_purge_and_finish(
+    redis_backends: tuple[RedisBackendHarness, RedisBackendHarness, Redis],
+) -> None:
+    backend, _, _ = redis_backends
+    storage = cast(RedisStorageBackend, backend.storage_backend)
+    identity = _identity()
+    prepared = await backend.prepare(
+        channel="events",
+        identity=identity,
+        codec="test.bytes.v1",
+        after=0,
+        cancellable=False,
+        recoverable=False,
+    )
+    assert prepared.handle.generation is not None
+    with pytest.raises(StreamDeleteConflict):
+        await storage.purge_stream_generation(
+            StreamGenerationPurge(
+                channel="events",
+                identity=identity,
+                generation=prepared.handle.generation,
+                maximum_records=1,
+                cleanup_token="unowned-cleanup",
+            )
+        )
+    await backend.finish(prepared.handle, status="completed")
+
+    begin = await storage.commit_messaging_transition(
+        MessagingTransition(
+            kind="begin_generation_cleanup",
+            transition_id=uuid4().hex,
+            channel="events",
+            identity=identity,
+            settings=storage.messaging_settings,
+            cleanup_reason="deleted",
+        )
+    )
+    assert begin.cleanup_required is True
+    assert begin.cleanup_generation == prepared.handle.generation
+    assert begin.cleanup_reason == "deleted"
+    assert isinstance(begin.cleanup_token, str)
+
+    with pytest.raises(MessagingBackendProtocolError, match="invalid protocol"):
+        await storage.commit_messaging_transition(
+            MessagingTransition(
+                kind="finish_generation_cleanup",
+                transition_id=uuid4().hex,
+                channel="events",
+                identity=identity,
+                settings=storage.messaging_settings,
+                cleanup_generation=begin.cleanup_generation,
+                cleanup_reason=begin.cleanup_reason,
+                cleanup_token=begin.cleanup_token,
+            )
+        )
+
+    removed_records = 0
+    while True:
+        progress = await storage.purge_stream_generation(
+            StreamGenerationPurge(
+                channel="events",
+                identity=identity,
+                generation=prepared.handle.generation,
+                maximum_records=1,
+                cleanup_token=begin.cleanup_token,
+            )
+        )
+        removed_records += progress.removed_records
+        if progress.complete:
+            break
+    assert removed_records > 1
+
+    await storage.commit_messaging_transition(
+        MessagingTransition(
+            kind="finish_generation_cleanup",
+            transition_id=uuid4().hex,
+            channel="events",
+            identity=identity,
+            settings=storage.messaging_settings,
+            cleanup_generation=begin.cleanup_generation,
+            cleanup_reason=begin.cleanup_reason,
+            cleanup_token=begin.cleanup_token,
+        )
+    )
+    snapshot = await storage.load_messaging_state(
+        MessagingStateQuery(
+            channel="events",
+            identity=identity,
+            generation=prepared.handle.generation,
+        )
+    )
+    assert snapshot.stream is None
+    assert snapshot.tombstone_generation == prepared.handle.generation
+    assert snapshot.tombstone_reason == "deleted"
+
+
 async def test_real_redis_delete_unlinks_only_the_target_generation(
-    redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+    redis_backends: tuple[RedisBackendHarness, RedisBackendHarness, Redis],
 ) -> None:
     backend, _, client = redis_backends
     for stream in ("stream-deleted", "stream-retained"):
@@ -2132,7 +2441,7 @@ async def test_real_redis_delete_unlinks_only_the_target_generation(
 
 
 async def test_real_redis_delete_fences_an_expired_producer(
-    redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+    redis_backends: tuple[RedisBackendHarness, RedisBackendHarness, Redis],
 ) -> None:
     _, _, client = redis_backends
     prefix = f"tfmsg:delete-expired:{uuid4().hex}"
@@ -2173,7 +2482,7 @@ async def test_real_redis_delete_fences_an_expired_producer(
 
 
 async def test_real_redis_delete_wakes_a_follower_of_an_expired_producer(
-    redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+    redis_backends: tuple[RedisBackendHarness, RedisBackendHarness, Redis],
 ) -> None:
     _, _, client = redis_backends
     prefix = f"tfmsg:delete-follower:{uuid4().hex}"
@@ -2199,7 +2508,7 @@ async def test_real_redis_delete_wakes_a_follower_of_an_expired_producer(
             recoverable=True,
         )
         follower = stale.follow(prepared.handle, after=0)
-        waiting = asyncio.create_task(anext(follower))
+        waiting = asyncio.ensure_future(anext(follower))
         await asyncio.sleep(0.2)
 
         await deleter.delete_stream(channel="events", identity=_identity())
@@ -2214,7 +2523,7 @@ async def test_real_redis_delete_wakes_a_follower_of_an_expired_producer(
 
 
 async def test_real_redis_concurrent_deletes_converge_after_multiple_batches(
-    redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+    redis_backends: tuple[RedisBackendHarness, RedisBackendHarness, Redis],
 ) -> None:
     first, second, client = redis_backends
     prepared = await first.prepare(
@@ -2363,7 +2672,7 @@ async def test_real_redis_cancelled_delete_is_taken_over_after_lease_expiry(
 
 
 async def test_real_redis_delete_is_taken_over_after_worker_process_is_killed(
-    redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+    redis_backends: tuple[RedisBackendHarness, RedisBackendHarness, Redis],
     redis_url: str,
 ) -> None:
     _, _, client = redis_backends
@@ -2433,7 +2742,7 @@ async def test_real_redis_delete_is_taken_over_after_worker_process_is_killed(
 
 
 async def test_real_redis_lifecycle_signal_is_bounded_and_cross_generation(
-    redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+    redis_backends: tuple[RedisBackendHarness, RedisBackendHarness, Redis],
 ) -> None:
     _, _, client = redis_backends
     prefix = f"tfmsg:cancel-state:{uuid4().hex}"
@@ -2524,7 +2833,7 @@ async def test_real_redis_lifecycle_signal_is_bounded_and_cross_generation(
 
 
 async def test_real_redis_shutdown_settles_during_the_first_commit(
-    gated_redis_backend: tuple[RedisBackend, _GatedEvalRedis],
+    gated_redis_backend: tuple[RedisBackendHarness, _GatedEvalRedis],
 ) -> None:
     backend, client = gated_redis_backend
     release = asyncio.Event()
@@ -2559,7 +2868,7 @@ async def test_real_redis_shutdown_settles_during_the_first_commit(
 
 
 async def test_real_redis_running_follower_never_crosses_into_a_later_run(
-    gated_redis_backend: tuple[RedisBackend, _GatedEvalRedis],
+    gated_redis_backend: tuple[RedisBackendHarness, _GatedEvalRedis],
 ) -> None:
     backend, client = gated_redis_backend
     first = await backend.prepare(
@@ -2578,7 +2887,7 @@ async def test_real_redis_running_follower_never_crosses_into_a_later_run(
     )
     follower = backend.follow(first.handle, after=1)
     client.gate_next_eval_after = True
-    next_message = asyncio.create_task(anext(follower))
+    next_message = asyncio.ensure_future(anext(follower))
     await asyncio.wait_for(client.eval_returned.wait(), timeout=1)
 
     await backend.finish(first.handle, status="completed")
@@ -2607,7 +2916,7 @@ async def test_real_redis_running_follower_never_crosses_into_a_later_run(
 
 
 async def test_real_redis_terminal_snapshot_precedes_later_deletion(
-    gated_redis_backend: tuple[RedisBackend, _GatedEvalRedis],
+    gated_redis_backend: tuple[RedisBackendHarness, _GatedEvalRedis],
 ) -> None:
     backend, client = gated_redis_backend
     prepared = await backend.prepare(
@@ -2627,7 +2936,7 @@ async def test_real_redis_terminal_snapshot_precedes_later_deletion(
     await backend.finish(prepared.handle, status="completed")
     follower = backend.follow(prepared.handle, after=1)
     client.gate_next_eval_after = True
-    next_message = asyncio.create_task(anext(follower))
+    next_message = asyncio.ensure_future(anext(follower))
     await asyncio.wait_for(client.eval_returned.wait(), timeout=1)
 
     await backend.delete_stream(channel="events", identity=_identity())
@@ -2641,7 +2950,7 @@ async def test_real_redis_terminal_snapshot_precedes_later_deletion(
 
 
 async def test_real_redis_deletion_precedes_the_atomic_run_snapshot(
-    gated_redis_backend: tuple[RedisBackend, _GatedEvalRedis],
+    gated_redis_backend: tuple[RedisBackendHarness, _GatedEvalRedis],
 ) -> None:
     backend, client = gated_redis_backend
     prepared = await backend.prepare(
@@ -2655,7 +2964,7 @@ async def test_real_redis_deletion_precedes_the_atomic_run_snapshot(
     await backend.finish(prepared.handle, status="completed")
     follower = backend.follow(prepared.handle, after=0)
     client.gate_next_eval_before = True
-    next_message = asyncio.create_task(anext(follower))
+    next_message = asyncio.ensure_future(anext(follower))
     await asyncio.wait_for(client.eval_entered.wait(), timeout=1)
 
     await backend.delete_stream(channel="events", identity=_identity())
@@ -2669,7 +2978,7 @@ async def test_real_redis_deletion_precedes_the_atomic_run_snapshot(
 
 
 async def test_real_redis_cross_worker_attach_uses_one_producer(
-    redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+    redis_backends: tuple[RedisBackendHarness, RedisBackendHarness, Redis],
 ) -> None:
     owner_backend, follower_backend, _ = redis_backends
     release = asyncio.Event()
@@ -2707,7 +3016,7 @@ async def test_real_redis_cross_worker_attach_uses_one_producer(
 
 
 async def test_real_redis_remote_cancel_reaches_the_owner_callback(
-    redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+    redis_backends: tuple[RedisBackendHarness, RedisBackendHarness, Redis],
 ) -> None:
     owner_backend, remote_backend, _ = redis_backends
     release = asyncio.Event()
@@ -2743,7 +3052,7 @@ async def test_real_redis_remote_cancel_reaches_the_owner_callback(
 
 
 async def test_real_redis_expired_owner_is_fenced_and_prefix_remains_replayable(
-    redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+    redis_backends: tuple[RedisBackendHarness, RedisBackendHarness, Redis],
 ) -> None:
     stale, observer, _ = redis_backends
     prepared = await stale.prepare(
@@ -2785,7 +3094,7 @@ async def test_real_redis_expired_owner_is_fenced_and_prefix_remains_replayable(
 
 
 async def test_real_redis_follower_observes_nonrecoverable_lease_expiry(
-    redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+    redis_backends: tuple[RedisBackendHarness, RedisBackendHarness, Redis],
 ) -> None:
     owner, follower, _ = redis_backends
     prepared = await owner.prepare(
@@ -2815,7 +3124,7 @@ async def test_real_redis_follower_observes_nonrecoverable_lease_expiry(
 
 
 async def test_real_redis_messaging_renews_the_owner_lease(
-    redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+    redis_backends: tuple[RedisBackendHarness, RedisBackendHarness, Redis],
 ) -> None:
     owner_backend, follower_backend, client = redis_backends
     release = asyncio.Event()
@@ -2883,7 +3192,7 @@ async def test_real_redis_messaging_renews_the_owner_lease(
 
 
 async def test_real_redis_recoverable_takeover_uses_checkpoint_and_higher_fence(
-    redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+    redis_backends: tuple[RedisBackendHarness, RedisBackendHarness, Redis],
 ) -> None:
     stale, recovering, client = redis_backends
     original = await stale.prepare(
@@ -2945,7 +3254,7 @@ async def test_real_redis_recoverable_takeover_uses_checkpoint_and_higher_fence(
 
 
 async def test_real_redis_recovery_preserves_an_existing_cancel_request(
-    redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+    redis_backends: tuple[RedisBackendHarness, RedisBackendHarness, Redis],
 ) -> None:
     stale, recovering, _ = redis_backends
     await stale.prepare(
@@ -2957,7 +3266,7 @@ async def test_real_redis_recovery_preserves_an_existing_cancel_request(
         recoverable=True,
     )
     requested = await recovering.request_cancel(
-        BackendRunHandle(
+        _BackendRunHandle(
             channel="events",
             identity=_identity(),
             owner_token=None,
@@ -2983,7 +3292,7 @@ async def test_real_redis_recovery_preserves_an_existing_cancel_request(
 
 
 async def test_real_redis_does_not_recover_a_claimed_cancel_settlement(
-    redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+    redis_backends: tuple[RedisBackendHarness, RedisBackendHarness, Redis],
 ) -> None:
     stale, recovering, _ = redis_backends
     original = await stale.prepare(
@@ -3017,7 +3326,7 @@ async def test_real_redis_does_not_recover_a_claimed_cancel_settlement(
 
 async def test_recovered_pending_cancel_survives_source_completion(
     monkeypatch: pytest.MonkeyPatch,
-    redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+    redis_backends: tuple[RedisBackendHarness, RedisBackendHarness, Redis],
 ) -> None:
     stale, recovering, _ = redis_backends
     original = await stale.prepare(
@@ -3033,16 +3342,6 @@ async def test_recovered_pending_cancel_survives_source_completion(
 
     cancel_observed = asyncio.Event()
     release_observer = asyncio.Event()
-    original_wait_for_cancel = recovering.wait_for_cancel
-
-    async def delayed_wait_for_cancel(handle: BackendRunHandle) -> bool:
-        requested = await original_wait_for_cancel(handle)
-        if requested:
-            cancel_observed.set()
-            await release_observer.wait()
-        return requested
-
-    monkeypatch.setattr(recovering, "wait_for_cancel", delayed_wait_for_cancel)
     source_release = asyncio.Event()
     source = _RecoverableSource(release=source_release)
     factory = _FixedRecoveryFactory(source)
@@ -3062,6 +3361,20 @@ async def test_recovered_pending_cancel_survives_source_completion(
         return (tail,)
 
     async with Messaging(backend=recovering) as messaging:
+        original_wait_for_cancel = messaging._runtime_backend.wait_for_cancel
+
+        async def delayed_wait_for_cancel(handle: _BackendRunHandle) -> bool:
+            requested = await original_wait_for_cancel(handle)
+            if requested:
+                cancel_observed.set()
+                await release_observer.wait()
+            return requested
+
+        monkeypatch.setattr(
+            messaging._runtime_backend,
+            "wait_for_cancel",
+            delayed_wait_for_cancel,
+        )
         channel = messaging.channel(name="events", codec=_TextCodec())
         subscription = await channel.wrap_recoverable(
             factory,
@@ -3087,7 +3400,7 @@ async def test_recovered_pending_cancel_survives_source_completion(
 
 
 async def test_public_cancel_settles_an_ownerless_recoverable_run(
-    redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+    redis_backends: tuple[RedisBackendHarness, RedisBackendHarness, Redis],
 ) -> None:
     stale, recovering, _ = redis_backends
     await stale.prepare(
@@ -3109,7 +3422,7 @@ async def test_public_cancel_settles_an_ownerless_recoverable_run(
             )
 
     replay = recovering.follow(
-        BackendRunHandle(
+        _BackendRunHandle(
             channel="events",
             identity=_identity(),
             owner_token=None,
@@ -3125,7 +3438,7 @@ async def test_public_cancel_settles_an_ownerless_recoverable_run(
 
 
 async def test_wrap_recoverable_reopens_from_the_last_real_redis_checkpoint(
-    redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+    redis_backends: tuple[RedisBackendHarness, RedisBackendHarness, Redis],
 ) -> None:
     stale, recovering, _ = redis_backends
     original = await stale.prepare(
@@ -3165,7 +3478,7 @@ async def test_wrap_recoverable_reopens_from_the_last_real_redis_checkpoint(
 
 
 async def test_recoverable_source_resumes_after_owner_process_is_killed(
-    redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+    redis_backends: tuple[RedisBackendHarness, RedisBackendHarness, Redis],
     redis_url: str,
 ) -> None:
     _, _, client = redis_backends
@@ -3253,7 +3566,7 @@ async def test_recoverable_source_resumes_after_owner_process_is_killed(
 
 
 async def test_ordinary_source_is_not_restarted_after_owner_process_is_killed(
-    redis_backends: tuple[RedisBackend, RedisBackend, Redis],
+    redis_backends: tuple[RedisBackendHarness, RedisBackendHarness, Redis],
     redis_url: str,
 ) -> None:
     _, _, client = redis_backends

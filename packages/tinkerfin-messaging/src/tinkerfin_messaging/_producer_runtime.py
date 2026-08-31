@@ -25,7 +25,7 @@ from ._messaging_boundary import (
     _invoke_cancel,
     _read_backend,
 )
-from .backend import PreparedRun
+from .backend import _PreparedRun
 from .errors import BackendOwnershipLost
 from .models import RecoverableMessage, RecoveryCheckpoint
 from .protocols import MessageCodec, MessageSource, RecoverableSource
@@ -89,11 +89,11 @@ def _lease_schedule(self: Messaging) -> tuple[float | None, float | None]:
 
     interval_value = _read_backend(
         "lease_renew_interval",
-        lambda: self.backend.lease_renew_interval,
+        lambda: self._runtime_backend.lease_renew_interval,
     )
     timeout_value = _read_backend(
         "lease_timeout",
-        lambda: self.backend.lease_timeout,
+        lambda: self._runtime_backend.lease_timeout,
     )
     if interval_value is None:
         if timeout_value is not None:
@@ -117,7 +117,7 @@ def _lease_schedule(self: Messaging) -> tuple[float | None, float | None]:
 async def _renew_lease_forever(
     self: Messaging,
     *,
-    prepared: PreparedRun,
+    prepared: _PreparedRun,
     phase: _LeaseRenewalPhase,
     interval: float,
     timeout: float | None,
@@ -137,7 +137,7 @@ async def _renew_lease_forever(
         try:
             renewed = await _await_backend(
                 "renew",
-                self.backend.renew(prepared.handle),
+                self._runtime_backend.renew(prepared.handle),
             )
         except asyncio.CancelledError:
             raise
@@ -212,7 +212,7 @@ def _log_lease_failure(
 def _start_producer(
     self: Messaging,
     *,
-    prepared: PreparedRun,
+    prepared: _PreparedRun,
     source: MessageSource[ProducedT],
     codec: MessageCodec[SourceT, ReplayT],
     codec_input: Callable[[ProducedT], SourceT] | None,
@@ -247,7 +247,7 @@ def _start_producer(
 async def _open_recoverable_source(
     self: Messaging,
     *,
-    prepared: PreparedRun,
+    prepared: _PreparedRun,
     source: RecoverableSource[SourceT],
 ) -> MessageSource[RecoverableMessage[SourceT]]:
     """Keep distributed ownership alive while a source rebuilds its state."""
@@ -308,7 +308,7 @@ async def _open_recoverable_source(
 def _start_recoverable_producer(
     self: Messaging,
     *,
-    prepared: PreparedRun,
+    prepared: _PreparedRun,
     source: MessageSource[RecoverableMessage[SourceT]],
     codec: MessageCodec[SourceT, ReplayT],
     cancel: _ContextCancelCallback[RecoverableMessage[SourceT]] | None,
@@ -349,7 +349,7 @@ def _start_recoverable_producer(
 def _start_producer_task(
     self: Messaging,
     *,
-    prepared: PreparedRun,
+    prepared: _PreparedRun,
     source: MessageSource[ProducedT],
     codec: MessageCodec[SourceT, ReplayT],
     cancel: _ContextCancelCallback[ProducedT] | None,
@@ -469,7 +469,7 @@ def _start_producer_task(
                         raise TypeError("MessageCodec.encode() must return bytes")
                     envelope = await _await_backend(
                         "append",
-                        self.backend.append(
+                        self._runtime_backend.append(
                             prepared.handle,
                             message_id=produced.message_id,
                             codec=self._codec_id(codec),
@@ -559,7 +559,7 @@ def _start_producer_task(
             settlement_task = asyncio.create_task(
                 _await_backend(
                     "begin_settlement",
-                    self.backend.begin_settlement(prepared.handle),
+                    self._runtime_backend.begin_settlement(prepared.handle),
                 ),
                 name=(
                     f"tinkerfin-messaging-settlement:{prepared.handle.identity.run_id}"
@@ -603,7 +603,7 @@ def _start_producer_task(
         async def watch_cancel() -> Iterable[ProducedT] | None:
             requested = await _await_backend(
                 "wait_for_cancel",
-                self.backend.wait_for_cancel(prepared.handle),
+                self._runtime_backend.wait_for_cancel(prepared.handle),
             )
             if not requested:
                 return None
@@ -793,7 +793,7 @@ def _start_producer_task(
             try:
                 await _await_backend(
                     "finish",
-                    self.backend.finish(
+                    self._runtime_backend.finish(
                         prepared.handle,
                         status=status,
                         error=error,

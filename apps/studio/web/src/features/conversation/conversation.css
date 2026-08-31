@@ -527,6 +527,12 @@
     width: 100%;
     min-width: 0;
     flex-direction: column;
+    scroll-margin-block-start: var(--space-4);
+    scroll-margin-block-end: calc(var(--composer-height) + var(--space-4));
+  }
+
+  .workspace-main:has(.composer-dock.is-taken-over) .tool-row {
+    scroll-margin-block-end: var(--space-4);
   }
 
   .tool-row > summary {
@@ -1351,6 +1357,35 @@
     padding: var(--space-4) 22px;
   }
 
+  .plan-question-composer-footer,
+  .plan-review-composer-footer {
+    position: relative;
+    z-index: var(--layer-local);
+    isolation: isolate;
+    background: transparent;
+  }
+
+  .plan-question-composer-footer::before,
+  .plan-review-composer-footer::before {
+    position: absolute;
+    z-index: var(--layer-base);
+    top: calc(var(--space-10) * -1);
+    right: 0;
+    bottom: 0;
+    left: 0;
+    background: linear-gradient(
+      to bottom,
+      transparent,
+      color-mix(in srgb, var(--color-layer-1) 44%, transparent) var(--space-10),
+      color-mix(in srgb, var(--color-layer-1) 72%, transparent)
+    );
+    content: '';
+    pointer-events: none;
+  }
+
+  .plan-question-composer-footer > *,
+  .plan-review-composer-footer > * { position: relative; z-index: var(--layer-local); }
+
   .plan-review-composer-footer {
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;
@@ -1552,6 +1587,82 @@
     background: transparent;
   }
 
+  .composer-auxiliary-controls {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+    width: min(100%, var(--layout-composer-width));
+    min-height: var(--control-sm);
+    margin: 0 auto var(--space-1-5);
+    align-items: center;
+    gap: var(--space-3);
+    pointer-events: none;
+  }
+
+  .composer-scroll-to-bottom-control {
+    grid-column: 2;
+    justify-self: center;
+  }
+
+  .composer-task-trace-control {
+    grid-column: 3;
+    justify-self: end;
+  }
+
+  .composer-scroll-to-bottom-control,
+  .composer-task-trace-control { display: flex; min-width: 0; pointer-events: auto; }
+
+  .composer-auxiliary-control {
+    display: inline-flex;
+    width: max-content;
+    min-width: 0;
+    min-height: var(--control-sm);
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-1-5);
+    padding: 0 var(--space-3);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-pill);
+    background: color-mix(in srgb, var(--color-layer-1) 92%, transparent);
+    box-shadow: var(--shadow-1);
+    color: var(--color-text-secondary);
+    font: inherit;
+    font-size: var(--type-caption-size);
+    font-weight: var(--weight-medium);
+    line-height: var(--type-caption-line);
+    cursor: pointer;
+    transition:
+      border-color var(--motion-fast) var(--ease-out),
+      background var(--motion-fast) var(--ease-out),
+      color var(--motion-fast) var(--ease-out),
+      box-shadow var(--motion-fast) var(--ease-out),
+      transform var(--motion-fast) var(--ease-out);
+  }
+
+  .composer-auxiliary-control:hover:not(:disabled) {
+    border-color: var(--color-border-strong);
+    background: var(--color-hover);
+    color: var(--color-text-primary);
+  }
+
+  .composer-auxiliary-control:active:not(:disabled) {
+    transform: scale(.98);
+    background: var(--color-active);
+  }
+
+  .composer-auxiliary-control.is-selected {
+    border-color: color-mix(in srgb, var(--color-brand) 48%, var(--color-border));
+    background: var(--color-brand-soft);
+    box-shadow: none;
+    color: var(--color-brand-text);
+  }
+
+  .composer-auxiliary-control:focus-visible {
+    outline: 2px solid var(--color-focus);
+    outline-offset: 2px;
+  }
+
+  .composer-auxiliary-control:disabled { cursor: not-allowed; opacity: .48; }
+
   .composer-dock.is-taken-over {
     grid-row: 3;
     padding-top: var(--layout-interaction-card-gap);
@@ -1721,6 +1832,7 @@
   }
 
   @media (max-width: 1023px) {
+    .composer-auxiliary-controls,
     .composer,
     .composer-note { max-width: var(--layout-content-medium); }
   }
@@ -1758,6 +1870,8 @@
 
   @media (max-width: 440px) {
     .composer-dock { padding-right: var(--space-3); padding-left: var(--space-3); }
+    .composer-auxiliary-controls { gap: var(--space-4); }
+    .composer-auxiliary-control { padding-inline: var(--space-1-5); }
     .tool-detail-card { margin-left: 0; }
     .tool-detail-section { grid-template-columns: minmax(0, 1fr); row-gap: var(--space-1-5); padding: var(--space-3); }
     .tool-field-label { position: static; }
@@ -1765,6 +1879,7 @@
   }
 
   @media (any-hover: none), (any-pointer: coarse) {
+    .composer-auxiliary-control { min-height: var(--control-lg); }
     .composer-add-button,
     .composer-plan-chip,
     .composer-model-select,
@@ -1796,6 +1911,7 @@
   }
 
   @media (prefers-reduced-motion: reduce) {
+    .composer-auxiliary-control,
     .message-action-row--user,
     .plan-question-progress-step > span,
     .plan-question-option,
@@ -1807,6 +1923,15 @@
   }
 
   @media (forced-colors: active) {
+    .composer-auxiliary-control {
+      border-color: ButtonText;
+      background: Canvas;
+      color: CanvasText;
+    }
+
+    .composer-auxiliary-control:focus-visible { outline-color: Highlight; }
+    .plan-question-composer-footer::before,
+    .plan-review-composer-footer::before { background: Canvas; }
     .subagent-card-head:focus-visible,
     .tool-row > summary:focus-visible,
     .plan-interaction-toggle-surface:focus-visible,

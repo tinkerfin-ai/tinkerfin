@@ -1,8 +1,12 @@
 import { describe, expect, it } from 'vitest'
 
+import type { Conversation, WorkspaceState } from '../types'
+
 import {
   buildEmptyConversation,
   createNewConversation,
+  selectCurrentConversation,
+  updateConversation,
   upsertConversation,
 } from './workspace'
 
@@ -43,6 +47,7 @@ function conversation(
         ]
       : [],
     todos: [],
+    taskTrace: { phase: 'unloaded' as const },
     runStatus: 'idle' as const,
     isHydrated: true,
   }
@@ -83,5 +88,81 @@ describe('workspace conversation behavior', () => {
 
     expect(next.conversations.map((item) => item.threadId)).toEqual(['thread-2', 'thread-1'])
     expect(next.currentThreadId).toBe('thread-1')
+  })
+
+  it('atomically clears every non-current task trace during selection', () => {
+    const initial = {
+      conversations: [
+        {
+          ...conversation({ threadId: 'thread-1' }),
+          taskTrace: { phase: 'ready' as const, snapshot: { status: 'ready' as const, todoGroups: [] } },
+        },
+        conversation({ threadId: 'thread-2' }),
+      ],
+      currentThreadId: 'thread-1',
+    }
+
+    const next = selectCurrentConversation(initial, 'thread-2')
+
+    expect(next.conversations.find((item) => item.threadId === 'thread-1')?.taskTrace)
+      .toEqual({ phase: 'unloaded' })
+    expect(next.conversations.find((item) => item.threadId === 'thread-2')?.taskTrace)
+      .toEqual({ phase: 'loading' })
+  })
+
+  it('prevents background updates from repopulating task trace', () => {
+    const initial = {
+      conversations: [
+        conversation({ threadId: 'thread-1' }),
+        conversation({ threadId: 'thread-2' }),
+      ],
+      currentThreadId: 'thread-1',
+    }
+
+    const next = updateConversation(initial, 'thread-2', (item) => ({
+      ...item,
+      taskTrace: { phase: 'ready', snapshot: { status: 'ready', todoGroups: [] } },
+    }))
+
+    expect(next.conversations.find((item) => item.threadId === 'thread-2')?.taskTrace)
+      .toEqual({ phase: 'unloaded' })
+  })
+
+  it('keeps only the selected graph while five large conversations are visited', () => {
+    const largeTaskTrace = (threadId: string): Conversation['taskTrace'] => ({
+      phase: 'ready' as const,
+      snapshot: {
+        status: 'ready' as const,
+        todoGroups: Array.from({ length: 5_000 }, (_, index) => ({
+          id: `todo-group:${threadId}:${index}`,
+          userMessageId: `${threadId}:message:${index}`,
+          userMessagePreview: `任务 ${index}`,
+          groupToolCallId: `${threadId}:tool:${index}`,
+          createdAt: BASE_TIME,
+          status: 'completed' as const,
+          todos: [],
+        })),
+      },
+    })
+    let state: WorkspaceState = {
+      conversations: Array.from({ length: 5 }, (_, index) => ({
+        ...conversation({ threadId: `thread-${index}` }),
+        taskTrace: largeTaskTrace(`thread-${index}`),
+      })),
+      currentThreadId: 'thread-0',
+    }
+
+    for (let index = 1; index < 5; index += 1) {
+      const threadId = `thread-${index}`
+      state = selectCurrentConversation(state, threadId)
+      state = updateConversation(state, threadId, (item) => ({
+        ...item,
+        taskTrace: largeTaskTrace(threadId),
+      }))
+      expect(state.conversations.filter((item) => item.taskTrace.phase === 'ready'))
+        .toHaveLength(1)
+      expect(state.conversations.find((item) => item.taskTrace.phase === 'ready')?.threadId)
+        .toBe(threadId)
+    }
   })
 })

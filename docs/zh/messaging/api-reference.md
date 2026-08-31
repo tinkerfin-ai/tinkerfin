@@ -34,7 +34,7 @@ TinkerFin profile source 的 `identity` 可省略；普通自定义 source 必�
 
 | API | 用途 |
 | --- | --- |
-| `MessageSubscription` | 异步迭代 `DecodedMessage`；支持 `sse()` 和 `aclose()` |
+| `MessageSubscription` | 仅由 channel `wrap()`/`follow()` 返回，不直接构造；异步迭代 `DecodedMessage`，并支持 `sse()`/`aclose()` |
 | `DecodedMessage` | `envelope` 与 codec 解码后的 `data` |
 | `MessageEnvelope` | 已提交的不可变持久消息 |
 
@@ -93,27 +93,30 @@ interrupt ID 发生变化时会被拒绝。可选 `RUN_STARTED.input` 中的消�
 | `NativeStreamPart` | 安装 `[native]` 后可用的有限 canonical Native replay 值 |
 | `MemoryBackend` | 单进程实现 |
 | `RedisBackend` | 安装 `[redis]` 后可用的多进程实现 |
-| `MessagingBackend` | 自定义 backend 协议 |
+| `MessagingBackend` | 六操作自定义存储协议 |
+| `MessagingBackendSettings` | 不可变 limits、retention、lease、续租与等待设置 |
+| `MessagingTransition` | 框架定义的原子生命周期意图 |
+| `MessagingStateSnapshot` | 有界且与存储时钟一致的 transition 证据 |
+| `MessagingStorageEffect` | `resolve_messaging_transition()` 产生的完整替换效果 |
 | `MessagingRetentionPolicy` | 关闭或配置正数秒的终态重播窗口 |
 
 ### `MessagingBackend` 操作
 
 | 操作 | 参数与结果 |
 | --- | --- |
-| `prepare(...)` | channel、RunIdentity、codec、after、是否可取消/恢复；返回 `PreparedRun` |
-| `append(...)` | handle、message ID、codec、bytes、可选 checkpoint；返回 Envelope |
-| `begin_settlement(handle)` | 原子进入收尾，返回是否已有取消请求 |
-| `finish(...)` | handle、最终状态、可选 error |
-| `get_run_status(...)` | channel 与 RunIdentity；可原子把过期 lease 判定为 `owner_lost` |
-| `latest_seq(...)` / `read(...)` | channel、RunIdentity 与分页参数 |
-| `bind_follow(...)` / `follow(...)` | 绑定权威 generation 并持续读取 |
-| `request_cancel()` / `wait_for_cancel()` | 记录或等待取消 |
-| `wait_finished()` / `failure()` | 等待最终状态或读取失败 |
-| `lease_renew_interval` / `lease_timeout` / `renew(handle)` | 描述续租周期、过期预算并确认所有权 |
-| `retention_policy` | 所有 backend worker 必须一致的不可变终态重播策略 |
-| `delete_stream(...)` | 删除不活跃 thread generation |
+| `messaging_settings` | 返回所有协作 Backend 实例共享的不可变设置 |
+| `prepare_messaging_storage()` | 幂等创建或校验当前存储形态 |
+| `commit_messaging_transition(...)` | 原子提交一个框架 transition |
+| `load_messaging_state(...)` | 加载一个有界一致状态快照 |
+| `read_committed_messages(...)` | 读取精确 generation 的升序消息页 |
+| `wait_for_messaging_change(...)` | 可响应取消地等待消息或控制状态可能变化 |
+| `purge_stream_generation(...)` | 对已封闭 generation 幂等删除一个有界批次 |
 
-`BackendRunHandle` 包含 channel、RunIdentity、owner token、fence 和 generation。`PreparedRun` 还包含游标、`is_owner`、可选 checkpoint 与 `recovered`。
+`resolve_messaging_transition()` 提供可复用的存储中立状态机。
+`tinkerfin_messaging.testing.verify_messaging_backend()` 使用隔离 Backend factory 验证受支持行为。
+
+清理 begin 可以返回一个不透明且会过期的 `cleanup_token`。Messaging 不解析、不持久化该 token，
+只会将其原样、串行传给返回 generation 的有界 purge 与 finish 调用。
 
 ## Callback
 

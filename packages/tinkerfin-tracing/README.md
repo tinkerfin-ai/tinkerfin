@@ -88,6 +88,29 @@ operation, but an application should call it during startup so an invalid or sta
 Schema fails before accepting Agent traffic. Trace tables have no foreign keys or
 Schema-version fields and can share a database with host-owned tables.
 
+For another shared storage system, implement the five-operation
+`TraceLedgerBackend` and lend it to `DurableTraceStore`:
+
+```python
+from my_trace_storage import MyTraceLedgerBackend
+from tinkerfin_tracing import DurableTraceStore, Tracer
+
+backend = MyTraceLedgerBackend(database_client)
+store = DurableTraceStore(backend, namespace="my-application")
+await store.setup()
+tracer = Tracer(store=store)
+
+# The host remains responsible for closing database_client.
+```
+
+The required operations are `prepare_storage()`, `commit_ledger_change()`,
+`load_ledger_state()`, `read_event_page()`, and
+`load_projection_checkpoint()`. The framework owns `TraceWriter`, semantic state
+transitions, canonical validation, heartbeats, and following. A shared Backend must
+provide atomic conditional changes and storage-clock lease checks; ordinary CRUD or
+Blob storage cannot provide this contract. Backend authors can run
+`verify_trace_ledger_backend(primary, peer)` against two independent clients.
+
 ## Query semantics
 
 `Tracer.get()` fixes one global `as_of_seq`. The default window contains the latest 100
@@ -155,11 +178,11 @@ keeps its terminal reserve until takeover, close, or explicit generation deletio
 Event facts and Projection state are stored as opaque canonical UTF-8 JSON bytes. Their
 SHA-256 digest is calculated before any storage transformation and checked on reads and
 unknown-commit retries. The package does not provide S3/Blob archiving, payload
-encryption or KMS integration, or OpenTelemetry exporters. Concrete storage additions
-implement or decorate `TraceStore`; encryption wraps the canonical payload codec without
-changing its pre-transform digest; telemetry consumes `RuntimeObserver` or decorates
-Store/Messaging Backend operations. No placeholder interface represents an unavailable
-capability.
+encryption or KMS integration, or OpenTelemetry exporters. Active shared storage
+implements `TraceLedgerBackend`; complete `TraceStore` replacement remains an advanced
+extension. Encryption wraps the canonical payload codec without changing its
+pre-transform digest; telemetry consumes `RuntimeObserver` or decorates Store/Messaging
+Backend operations. No placeholder interface represents an unavailable capability.
 
 ## Safety
 

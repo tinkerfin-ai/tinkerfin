@@ -27,8 +27,8 @@ redis = Redis.from_url(
 backend = RedisBackend(
     redis,
     key_prefix="my-app:tinkerfin",
-    lease_ttl=15.0,
-    poll_interval=0.1,
+    producer_lease_seconds=15.0,
+    generation_cleanup_retry_seconds=0.1,
     limits=MessagingLimits(),
     retention_policy=MessagingRetentionPolicy.expire_after(86_400),
 )
@@ -39,8 +39,8 @@ messaging = Messaging(backend=backend)
 | --- | --- | --- |
 | `client` | 必填 | 异步 Redis client，必须返回 bytes |
 | `key_prefix` | `tinkerfin-messaging` | 当前应用独占的 Redis key 前缀 |
-| `lease_ttl` | `15.0` | 生产者所有权租约秒数 |
-| `poll_interval` | `0.1` | 删除时等待活跃租约的轮询间隔 |
+| `producer_lease_seconds` | `15.0` | Redis 时钟上的生产者所有权持续秒数 |
+| `generation_cleanup_retry_seconds` | `0.1` | generation 清理所有权的重试间隔秒数 |
 | `limits` | `MessagingLimits()` | 编码 Payload、checkpoint、消息数和 thread 字节上限 |
 | `retention_policy` | 关闭 | thread generation 终态后的重播窗口 |
 
@@ -89,8 +89,8 @@ RedisBackend 保存完整 limits fingerprint、每个 generation 的 `payload_by
 这些字段不会进入 `MessageEnvelope`。
 
 默认上限为：单条编码消息 16 MiB、checkpoint 1 MiB、每个 thread generation 100,000 条消息，
-以及每个 thread generation 1 GiB 编码 Payload。自定义 backend 也必须提供同一不可变 `limits`
-属性，并在修改数据前拒绝超额写入。
+以及每个 thread generation 1 GiB 编码 Payload。自定义 backend 通过
+`messaging_settings` 提供同一不可变 limits，并在修改数据前拒绝超额写入。
 
 ## 自定义消息格式
 
@@ -155,15 +155,56 @@ class QueueSource:
 
 ## 自定义 backend
 
-只有需要接入其他共享存储时才实现 `MessagingBackend`。它需要完整支持：
+只有需要接入其他持久化存储时才实现 `MessagingBackend`。Messaging 负责 producer
+任务、取消、follow 循环、收尾、retention 判定和错误转换；Backend 作者只实现一个不可变设置
+属性和六个存储操作：
 
-- 原子准备、owner/attachment 判定和 codec 校验；
-- 有序追加、稳定序号和 message ID 去重；
-- 历史读取和持续 follow；
-- run 完成、失败和取消信号；
-- producer 续租周期、过期预算、fencing 和所有权丢失；
-- stream 代际隔离与删除。
+| 扩展成员 | Backend 职责 |
+| --- | --- |
+| `messaging_settings` | 返回所有协作 worker 共享的 limits、retention、producer lease、续租和等待设置 |
+| `prepare_messaging_storage()` | 幂等创建或校验唯一当前存储形态，不接管调用方注入的 client |
+| `commit_messaging_transition(transition)` | 原子提交框架定义的一个 transition，并返回该提交的准确持久化结果 |
+| `load_messaging_state(query)` | 返回指定 channel、generation、run 和消息证据的存储时钟一致有界快照 |
+| `read_committed_messages(query)` | 返回精确 generation 的升序有界页和变化游标；`stop_at_run_terminal=True` 时，必须在同一原子视图中返回 `run_state` |
+| `wait_for_messaging_change(wait)` | 等待消息或控制状态可能变化；允许超时空唤醒，取消时必须释放订阅或独占连接 |
+| `purge_stream_generation(purge)` | 对已经封闭清理的 generation 幂等删除一个有界批次，不得删除共享 control 或 tombstone |
 
-backend 的方法都是异步协议。不要用同步数据库或同步网络客户端阻塞事件循环。自定义实现应与 `MemoryBackend` 的公开行为保持一致。
+`MessagingTransition`、`MessagingStateSnapshot` 和 `MessagingStorageEffect` 是不可变的
+存储中立值。事务型 Backend 在事务内加载所需状态，调用
+`resolve_messaging_transition()`，再原子应用返回的 effect。只有已经证明的乐观并发冲突可以
+安全重试；取消或结果不确定的外部提交不得被静默当作成功。
+
+`begin_generation_cleanup` 可以返回一个不透明、生命周期有界的 `cleanup_token`。
+Messaging 不解析也不持久化该 token，只会把它原样、串行传给同一精确 generation 和实际清理原因的
+`purge_stream_generation()` 与 `finish_generation_cleanup`。Backend 返回 token 时，必须保证其外部
+lease 有界、允许幂等重试，并在调用取消或进程退出后允许新的清理尝试接管。
+
+数据库和网络调用必须使用原生异步接口。注入的 client、连接池和关闭过程由宿主拥有。
+`wait_for_messaging_change()` 必须先释放自身等待资源，再继续传播 `CancelledError`。
+`purge_stream_generation()` 必须有界。不同清理尝试可以并发，但 generation 与 token fence 必须保证
+任何一方都不会删除其他 generation。
+
+使用空的隔离 namespace 运行公共契约验证：
+
+```python
+from contextlib import asynccontextmanager
+
+from tinkerfin_messaging.testing import verify_messaging_backend
+
+
+@asynccontextmanager
+async def open_backend():
+    backend = MyBackend(client, namespace="contract-test")
+    try:
+        yield backend
+    finally:
+        await delete_contract_test_namespace()
+
+
+await verify_messaging_backend(open_backend)
+```
+
+验证器覆盖受支持的 Messaging 行为。分布式实现还必须使用真实存储验证并发竞争、lease 过期、
+进程丢失、不确定传输结果和存储专用的清理恢复。
 
 下一篇：[Messaging 使用参考](api-reference.md)。
