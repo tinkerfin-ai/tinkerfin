@@ -1554,6 +1554,7 @@ test('展开的审批、Plan 澄清与草稿使用统一单行标题规格和静
     footerOverlayContent: string
     footerOverlayBackground: string
     bodyFooterOverlap: number
+    footerInsideBody: boolean
   }
   const collectChrome = async ({
     cardSelector,
@@ -1581,7 +1582,7 @@ test('展开的审批、Plan 澄清与草稿使用统一单行标题规格和静
             ':scope > :is(.approval-composer-body, .plan-question-composer-body, .plan-review-composer-body)',
           )
           const footer = card.querySelector<HTMLElement>(
-            ':scope > :is(.approval-composer-footer, .plan-question-composer-footer, .plan-review-composer-footer)',
+            ':is(.approval-composer-footer, .plan-question-composer-footer, .plan-review-composer-footer)',
           )
           if (!header || !bridge || !body || !footer) {
             throw new Error('卡片标题与 Footer 渐变几何不可用')
@@ -1628,6 +1629,7 @@ test('展开的审批、Plan 澄清与草稿使用统一单行标题规格和静
             footerOverlayContent: footerOverlayStyle.content,
             footerOverlayBackground: footerOverlayStyle.backgroundImage,
             bodyFooterOverlap: bodyBounds.bottom - footerBounds.top,
+            footerInsideBody: body.contains(footer),
           }
         }, { header: headerSelector, actions: actionsSelector })
         result.set(`${colorScheme}-${width}`, chrome)
@@ -1673,7 +1675,6 @@ test('展开的审批、Plan 澄清与草稿使用统一单行标题规格和静
       expect(chrome.bridgeBackground).toContain('linear-gradient')
       expect(chrome.footerOverlayContent).not.toBe('none')
       expect(chrome.footerOverlayBackground).toContain('linear-gradient')
-      expect(chrome.bodyFooterOverlap).toBeLessThanOrEqual(.5)
     }
     for (const chrome of [approval, question, review]) {
       expect(chrome.headerHeight).toBeCloseTo(44, 5)
@@ -1691,6 +1692,12 @@ test('展开的审批、Plan 澄清与草稿使用统一单行标题规格和静
       expect(chrome.descriptionCenterDelta).toBeNull()
     }
     expect(approval.actionsCenterDelta).toBeNull()
+    expect(approval.footerInsideBody).toBe(false)
+    expect(question.footerInsideBody).toBe(false)
+    expect(review.footerInsideBody).toBe(true)
+    expect(approval.bodyFooterOverlap).toBeLessThanOrEqual(.5)
+    expect(question.bodyFooterOverlap).toBeLessThanOrEqual(.5)
+    expect(review.bodyFooterOverlap).toBeGreaterThan(0)
     expect(Math.abs(review.actionsCenterDelta ?? Number.POSITIVE_INFINITY))
       .toBeLessThanOrEqual(1)
   }
@@ -2379,7 +2386,9 @@ test('计划草稿以描述标题和三动作卡片接管输入区', async ({ pa
         messageList.boundingBox(),
       ])
       if (!cardBounds || !bodyBounds || !footerBounds || !finalItemBounds || !statusBounds || !dotsBounds || !messageListBounds) throw new Error('计划草稿卡片几何不可用')
-      expect(bodyBounds.y + bodyBounds.height).toBeLessThanOrEqual(footerBounds.y + .5)
+      expect(footerBounds.y).toBeLessThan(bodyBounds.y + bodyBounds.height)
+      expect(footerBounds.y + footerBounds.height)
+        .toBeLessThanOrEqual(bodyBounds.y + bodyBounds.height + .5)
       expect(finalItemBounds.y + finalItemBounds.height).toBeLessThanOrEqual(footerBounds.y + .5)
       const actionBounds = await Promise.all([
         card.getByRole('button', { name: '取消当前 Plan 草稿' }).boundingBox(),

@@ -1344,10 +1344,10 @@
   }
 
   .plan-review-composer-body {
-    display: grid;
-    align-content: start;
+    display: flex;
     min-height: 0;
     flex: 1 1 auto;
+    flex-direction: column;
     overflow-y: auto;
     overscroll-behavior: contain;
   }
@@ -1373,26 +1373,36 @@
     right: 0;
     bottom: 0;
     left: 0;
+    content: '';
+    pointer-events: none;
+  }
+
+  .plan-question-composer-footer::before {
     background: linear-gradient(
       to bottom,
       transparent,
-      color-mix(in srgb, var(--color-layer-1) 44%, transparent) var(--space-10),
-      color-mix(in srgb, var(--color-layer-1) 72%, transparent)
+      color-mix(in srgb, var(--color-layer-1) 82%, transparent) var(--space-10),
+      color-mix(in srgb, var(--color-layer-1) 94%, transparent)
     );
-    content: '';
-    pointer-events: none;
+  }
+
+  .plan-review-composer-footer::before {
+    background: linear-gradient(to bottom, transparent, var(--color-layer-1));
   }
 
   .plan-question-composer-footer > *,
   .plan-review-composer-footer > * { position: relative; z-index: var(--layer-local); }
 
   .plan-review-composer-footer {
+    position: sticky;
+    bottom: 0;
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;
     align-items: center;
     gap: var(--space-3);
     flex: 0 0 auto;
     min-height: var(--space-16);
+    margin-top: auto;
     padding: var(--space-3) var(--space-4);
   }
 

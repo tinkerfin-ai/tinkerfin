@@ -122,55 +122,55 @@ export function PlanReviewCard({
               />
             </form>
           )}
+          <footer className="plan-review-composer-footer">
+            <p className="plan-review-composer-feedback" role="alert">
+              {interaction.error ?? ''}
+            </p>
+            <div className="approval-composer-actions">
+              {interaction.action === 'reject' ? (
+                <>
+                  <Button size="sm" shape="capsule" onClick={cancelRejection}>
+                    {t('取消')}
+                  </Button>
+                  <Button
+                    size="sm"
+                    shape="capsule"
+                    type="submit"
+                    form={rejectionFormId}
+                    variant="danger"
+                  >
+                    {t('确认拒绝')}
+                  </Button>
+                </>
+              ) : (
+                <>
+                  {actionAllowed('reject') && (
+                    <Button
+                      ref={rejectButtonRef}
+                      size="sm"
+                      shape="capsule"
+                      className="approval-reject-button"
+                      onClick={() => update({ action: 'reject' })}
+                    >
+                      {t('拒绝')}
+                    </Button>
+                  )}
+                  {actionAllowed('approve') && (
+                    <Button
+                      size="sm"
+                      shape="capsule"
+                      className="approval-allow-button"
+                      onClick={() => onSubmit('approve')}
+                    >
+                      {t('批准')}
+                    </Button>
+                  )}
+                </>
+              )}
+            </div>
+          </footer>
         </div>
         <OverlayScrollbar viewportRef={bodyRef} />
-        <footer className="plan-review-composer-footer">
-          <p className="plan-review-composer-feedback" role="alert">
-            {interaction.error ?? ''}
-          </p>
-          <div className="approval-composer-actions">
-            {interaction.action === 'reject' ? (
-              <>
-                <Button size="sm" shape="capsule" onClick={cancelRejection}>
-                  {t('取消')}
-                </Button>
-                <Button
-                  size="sm"
-                  shape="capsule"
-                  type="submit"
-                  form={rejectionFormId}
-                  variant="danger"
-                >
-                  {t('确认拒绝')}
-                </Button>
-              </>
-            ) : (
-              <>
-                {actionAllowed('reject') && (
-                  <Button
-                    ref={rejectButtonRef}
-                    size="sm"
-                    shape="capsule"
-                    className="approval-reject-button"
-                    onClick={() => update({ action: 'reject' })}
-                  >
-                    {t('拒绝')}
-                  </Button>
-                )}
-                {actionAllowed('approve') && (
-                  <Button
-                    size="sm"
-                    shape="capsule"
-                    className="approval-allow-button"
-                    onClick={() => onSubmit('approve')}
-                  >
-                    {t('批准')}
-                  </Button>
-                )}
-              </>
-            )}
-          </div>
-        </footer>
       </>
     </PlanInteractionCard>
   )
