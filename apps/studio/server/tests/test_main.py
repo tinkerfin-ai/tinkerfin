@@ -12,16 +12,28 @@ def test_server_arguments_keep_local_safe_defaults() -> None:
     assert options.host == "127.0.0.1"
     assert options.port == 8090
     assert options.reload is True
+    assert options.graceful_shutdown_timeout_seconds == 10
 
 
 def test_server_arguments_allow_container_runtime_values() -> None:
     """部署入口应支持显式监听地址、端口和关闭热重载"""
 
-    options = parse_args(["--host", "0.0.0.0", "--port", "9000", "--no-reload"])
+    options = parse_args(
+        [
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "9000",
+            "--no-reload",
+            "--graceful-shutdown-timeout-seconds",
+            "30",
+        ]
+    )
 
     assert options.host == "0.0.0.0"
     assert options.port == 9000
     assert options.reload is False
+    assert options.graceful_shutdown_timeout_seconds == 30
 
 
 def test_main_initializes_logging_before_starting_server(tmp_path, monkeypatch) -> None:
@@ -55,3 +67,23 @@ def test_main_initializes_logging_before_starting_server(tmp_path, monkeypatch) 
 
     log_file = tmp_path / "logs/tinkerfin-studio.log"
     assert "服务器已加载" in log_file.read_text(encoding="utf-8")
+
+
+def test_main_applies_bounded_graceful_shutdown(monkeypatch) -> None:
+    """服务入口必须让长驻 SSE 在单次关闭信号后进入有界取消"""
+
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        server_entrypoint,
+        "setup_logging",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        server_entrypoint.uvicorn,
+        "run",
+        lambda *_args, **kwargs: captured.update(kwargs),
+    )
+
+    server_entrypoint.main(["--no-reload", "--graceful-shutdown-timeout-seconds", "7"])
+
+    assert captured["timeout_graceful_shutdown"] == 7

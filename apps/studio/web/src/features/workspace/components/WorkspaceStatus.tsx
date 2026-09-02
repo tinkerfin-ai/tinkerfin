@@ -12,7 +12,7 @@ export function WorkspaceStatus({
 }: {
   kind: 'loading' | 'error'
   title: string
-  description: string
+  description?: string
   onRetry?: () => void
   compact?: boolean
 }) {
@@ -21,7 +21,7 @@ export function WorkspaceStatus({
     <Surface
       tone={kind === 'error' ? 'danger' : 'neutral'}
       elevation={compact ? 0 : 1}
-      className={`workspace-status is-${kind}${compact ? ' is-compact' : ''}`}
+      className={`workspace-status is-${kind}${description ? '' : ' is-title-only'}${compact ? ' is-compact' : ''}`}
       role={kind === 'error' ? 'alert' : 'status'}
       aria-busy={kind === 'loading' || undefined}
     >
@@ -32,7 +32,7 @@ export function WorkspaceStatus({
       </span>
       <div>
         <strong>{title}</strong>
-        <p>{description}</p>
+        {description && <p>{description}</p>}
       </div>
       {kind === 'error' && onRetry && (
         <Button size="sm" leadingIcon={<RotateCcw size={14} />} onClick={onRetry}>{t('重试')}</Button>

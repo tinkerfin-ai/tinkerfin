@@ -117,7 +117,10 @@ async def test_default_policy_omits_reasoning_without_a_digest() -> None:
         _reasoning(context, "private delta", snapshot=False, monotonic_ns=3)
     )
     await session.observe(
-        _reasoning(context, "private complete", snapshot=True, monotonic_ns=4)
+        _reasoning(context, "private delta 2", snapshot=False, monotonic_ns=4)
+    )
+    await session.observe(
+        _reasoning(context, "private complete", snapshot=True, monotonic_ns=5)
     )
     await session.observe(
         NativeStateObservation(
@@ -125,7 +128,7 @@ async def test_default_policy_omits_reasoning_without_a_digest() -> None:
             namespace=(),
             state={"reasoning_content": "business value"},
             observed_at=datetime.now(UTC),
-            monotonic_ns=5,
+            monotonic_ns=6,
         )
     )
     await _finish(session, context)
@@ -137,13 +140,13 @@ async def test_default_policy_omits_reasoning_without_a_digest() -> None:
 
     assert [fact.phase for fact in facts] == [
         "content",
-        "reconciled",
         "completed",
     ]
     assert all(
         fact.content is None or fact.content.disposition == "omitted" for fact in facts
     )
     assert "private delta" not in encoded
+    assert "private delta 2" not in encoded
     assert "private complete" not in encoded
     assert "digest" not in encoded
     assert thread.state.root["reasoning_content"] == "business value"

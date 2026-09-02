@@ -20,16 +20,51 @@ Tracer(
 | `store` | 借用的 `TraceStore`；默认新建 `InMemoryTraceStore` |
 | `open_run(context)` | TinkerFin Runtime 使用的 `RuntimeObserver` 入口 |
 | `get(thread_id, head_run_id=None, limit=100, history_cursor=None, projections=())` | 最新或 cursor 固定 as-of 的 `TraceThread` |
+| `query(thread_id, where=None, head_run_id=None, cursor=None, limit=100)` | Store 直接筛选的 `TraceQuery` 页与实时跟随器 |
+| `rebuild_entries(thread_id)` | 重建当前派生查询节点，不改写 Ledger event |
 
 同时传入 `store` 与 `limits` 时，两者必须完全相等。Projection 名必须规范、唯一，并在构造时
 一次性注册。
+
+## `TraceFilter`、`TraceQuery` 与节点
+
+`TraceFilter` 支持 `kinds`、`statuses`、`parent_id`、`agent_names`、
+`middleware_names`、`skill_names`、`providers`、`models`、`namespaces`、`search`、
+`started_after`、`started_before` 和 `include_ancestors`。集合在边界冻结；每个可重复文本条件最多
+接受 64 个值，名称和图命名空间片段必须是最长 1,024 字符的规范文本；时间边界必须是带时区的
+UTC 值。
+
+`TraceQuery` 提供 `turns`、`items`、`next_cursor`、`as_of_seq`、`facets`、
+`completeness` 与 `follow()`。`TraceTurn` 解析所选谱系中的轮次和已有用户
+`TraceMessage`，不会再保存一份消息正文。每个 `TraceEntry` 包含 `turn_id`、由 callback 证明的
+结构 `parent_id`；实际 Tool 执行另用 `proposal_id` 关联提议。request/result 与直接
+`TraceFailure` 从引用的 Ledger fact 解码；`request_omitted` 与 `result_omitted` 区分策略或容量
+省略和 JSON null。
+每个 Facet 计数应用除自身维度外的全部当前条件，因此可直接切换类型或状态。直接失败归属写入
+Ledger，不随筛选条件或分页变化。
+
+`TraceEntryKind` 覆盖 Agent、技术 Run、graph model/tools step、provider 请求、Tool 提议、实际
+Tool 执行、子 Agent、Skill、middleware、Memory、Guardrail、retrieval、自定义 context 与
+Runtime task。成功节点没有成功徽章契约；只有具备直接失败依据的节点拥有 `failure`。
+`TraceEntryCompleteness.call_tracking_missing` 表示缺少 provider/Tool callback，
+`execution_tree_missing` 表示所选 Run 没有观察到 Agent 执行根。
+
+`TraceQuery.follow()` 跟随当前筛选页及其游标并返回 `TraceFollow`，同时发送 `turn_upserts`/`turn_removes` 与节点变化。
+它拥有每次 Store 读取，并在单次或重复取消继续传播前等待上游关闭。消费方必须用
+`turn_id` 和 `parent_id` 构树，不能按名称、时间、到达顺序或 `proposal_id` 重建父级。
+循环可能提前 `break` 时应使用 `TraceFollow` 的 `async with`，否则必须显式调用 `aclose()`。
+进入已关闭的 handle 或并发发起第二次读取时，会抛出 code 为 `tracing.follow_lifecycle` 的
+`TraceFollowLifecycleError`。
 
 ## Capture 与容量
 
 | API | 用途 |
 | --- | --- |
-| `CapturePolicy.public_history(tool_overrides=None)` | 默认策略；保存全部 Tool 经清理的完整内容，并支持按准确名称覆盖 |
-| `CapturePolicy.public_safe(tool_rules=())` | Tool 默认仅保留元数据，可通过低层 RFC 6901 规则选择内容 |
+| `CapturePolicy.public_history(tool_overrides=None, middleware_overrides=None, include_error_messages=False)` | 默认策略；保存经清理的 Tool 历史和可见 middleware 配置，并支持逐项覆盖 |
+| `CapturePolicy.public_safe(tool_rules=(), middleware_overrides=None, include_error_messages=False)` | Tool 默认仅保留元数据，并支持低层 RFC 6901 选择和 middleware 覆盖 |
+| `MiddlewareTraceCapture.visible()` | 保存配置及标准 callback 能证明的执行事实 |
+| `MiddlewareTraceCapture.configuration_only()` | 只保存配置，不记录执行状态和耗时 |
+| `MiddlewareTraceCapture.disabled()` | 不保存 middleware 专属事实且不改变其执行 |
 | `ToolTraceCapture.full_content()` | 保存 Tool 生命周期、完整安全内容与公开审批说明 |
 | `ToolTraceCapture.metadata_only()` | 保存 Tool 生命周期，不保存参数、结果或审批说明 |
 | `ToolTraceCapture.selected_content(...)` | 保存 Tool 生命周期与选定的参数/结果路径 |
@@ -77,7 +112,7 @@ Tracer(
 | `summary` | 所选谱系的完整累计 status、completeness、计数、pending interaction 与来源最大时间 |
 | `status` | `running`、`waiting`、`succeeded`、`failed`、`cancelled`、`abandoned` 或 `unknown` |
 | `completeness` | 独立的 missing-prefix、missing-tail、payload-omitted 信号 |
-| `message_count` / `tool_call_count` | 从 `summary` 计算的兼容读取视图 |
+| `message_count` / `tool_call_count` | 从 `summary` 计算的便利读取视图 |
 | `projections` | 显式请求业务 Projection 的防御性结果副本 |
 | `has_older` | 是否还有更早完整 Turn |
 | `history_cursor` | 供下一次 `Tracer.get(...)` 使用的 generation/head/as-of opaque cursor |
@@ -116,16 +151,25 @@ upsert/remove、当前完整 state 与 `summary`。`update.summary` 是应用该
 | `RunFact` | start、input/resume、resume checkpoint、Observer failure、terminal 或 close |
 | `MessageFact` | message start/content/completion/reconciliation/removal |
 | `ReasoningFact` | 独立 capture policy 下的显式 extractor 正文、reconciliation 与 completion |
-| `ToolFact` | Tool start、参数快照、proposal end 或 result |
-| `RuntimeTaskFact` | 带 interrupt ID 与结构 payload metadata 的 LangGraph task start/result |
+| `ToolFact` | Tool start、参数快照、proposal end、result、取消或放弃 |
+| `RuntimeTaskFact` | LangGraph task start、完成、失败、interrupt、取消、放弃与结构 payload metadata |
 | `StateRevisionFact` | 一个精确 namespace 中变化的非 message state key |
 | `InteractionFact` | pending 到 resolved/cancelled 的人工交互 |
-| `SubagentFact` | 已校验的非根 Graph scope start 与父 task completion |
+| `SubagentFact` | 已校验的非根 Graph scope start、waiting 更新与终态结算 |
 | `PlanRevisionFact` | 公开 `tinkerfin_plan` revision 与 status |
 | `NativeExtraFact` | 允许的额外 Native mode 结构 metadata |
+| `CallTrackingFact` | 标记已启用调用观察能力的 Run |
+| `ModelCallFact` | 最终 provider 请求、首个输出、完成、用量、直接失败或控制流终态 |
+| `ToolExecutionFact` | 审批后实际 Tool 输入及直接失败或控制流终态，与提议分离 |
+| `ContextContributionFact` | 显式 Memory、Guardrail、retrieval 或自定义贡献生命周期 |
+| `MiddlewareFact` | 可见的 middleware 配置元数据，不宣称 hook 已执行 |
+| `SkillFact` | 成功准确读取已配置 Skill 指令文件 |
 
 `TraceEvent` 增加 Store event ID、全局 `traceSeq`、generation 与实际持久字节数。项目协议不包含
 schema 或 protocol version 字段。
+
+`failure` 只由直接 failed 依据投影。cancelled、interrupted 与 abandoned fact 只表达状态，不生成
+错误徽章。
 
 ## 业务 Projection
 
@@ -174,6 +218,10 @@ generation 中的一个 Run，支持原子有序 fact batch 与幂等关闭。`S
 `InMemoryTraceStore` 为同一 thread 的并发 Run 分配连续全局序号，拒绝重复或 active Run ID，
 为每个 active writer 预留终态容量，禁止 active delete，删除时唤醒 follower，并始终返回防御性
 副本。
+
+`TraceEntryStore` 是可选的直接查询 Store 能力；`TraceEntryRebuildStore` 从一个精确 Ledger
+generation 重建其派生节点。Backend 分别通过 `TraceQueryBackend` 与
+`TraceEntryRebuildBackend` 提供对应能力；只承担 Ledger 或归档的集成无需实现两者。
 
 ### `TraceLedgerBackend` 与 `DurableTraceStore`
 
@@ -236,14 +284,16 @@ Projection checkpoint CAS 只允许向前推进；唯一例外是以相同 prefi
 `EncodedTracePayload.digest` 是存储转换前 canonical bytes 的 SHA-256。SQL event 与 Projection
 payload 是 opaque bytes；可查询的 Run、fact kind、timestamp、sequence 与 digest metadata 会和
 解码内容交叉校验。
+可逆 Codec 可以保护实际存储的 `data`，但必须保留 canonical digest，在解码时还原数据，并在
+`digest()` 中对还原后的 canonical bytes 计算摘要。
 
 `get_trace_store_schema(dialect="sqlite" | "mysql")` 使用与 `setup()` 相同的 metadata，返回
-确定性空库 DDL。Trace 精确拥有 namespace、thread、writer、event 与 Projection checkpoint
-五张表；表内没有外键或项目自有 Schema-version 字段。
+确定性空库 DDL。Trace 精确拥有 namespace、thread、writer、event、无 payload 的查询 entry 与
+Projection checkpoint 六张表；表内没有外键或项目自有 Schema-version 字段。
 
 ## 错误
 
 Tracing 自有失败都继承 `TracingError`，并使用稳定 `tracing.*` code。公开错误族包含 invalid
-cursor、thread not found、ambiguous head、Run not found、Run conflict、corruption、Store
+cursor、thread not found、ambiguous head、Run not found、Run conflict、Follow lifecycle misuse、corruption、Store
 unavailable/timeout/protocol error、Projection checkpoint conflict、quota exceeded、capture rejected、Observer failed 与
 Projection failed。公开 `context` 只含客户端安全信息；可信诊断与 cause 独立保存。

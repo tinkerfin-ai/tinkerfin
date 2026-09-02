@@ -30,11 +30,13 @@ NativeMessageType: TypeAlias = Literal[
     "remove",
     "other",
 ]
+ContextKind: TypeAlias = Literal["memory", "guardrail", "retrieval", "custom"]
 
 
 class ObservationBoundary(StrEnum):
     """Durability boundaries that a managed observation session must settle."""
 
+    CALL_STARTED = "call_started"
     RESUME_CHECKPOINTED = "resume_checkpointed"
     INTERRUPT = "interrupt"
     TERMINAL = "terminal"
@@ -57,6 +59,54 @@ class RunResumeSummary(ContractModel):
         return self
 
 
+class MiddlewareDescriptor(ContractModel):
+    """Describe one visible middleware contribution without carrying its instance."""
+
+    name: str = Field(min_length=1, max_length=1024)
+    class_name: str = Field(
+        min_length=1,
+        max_length=1024,
+        description="Fully qualified implementation class for diagnostic display",
+    )
+    hooks: tuple[str, ...] = Field(
+        default=(),
+        description="Implemented LangChain hook names when full visibility is enabled",
+    )
+
+    @model_validator(mode="after")
+    def values_are_canonical(self) -> MiddlewareDescriptor:
+        """Reject ambiguous names and duplicate hook labels."""
+
+        if self.name != self.name.strip() or self.class_name != self.class_name.strip():
+            raise ValueError("middleware names must be canonical text")
+        if any(not hook or hook != hook.strip() for hook in self.hooks):
+            raise ValueError("middleware hooks must be canonical text")
+        if len(set(self.hooks)) != len(self.hooks):
+            raise ValueError("middleware hooks must be unique")
+        return self
+
+
+class SkillSourceDescriptor(ContractModel):
+    """Bind one configured Skill source to its root or named subagent catalog."""
+
+    path: str = Field(
+        min_length=1,
+        max_length=4096,
+        description="Configured Skill catalog root, not evidence of a Skill invocation",
+    )
+    agent_name: str | None = Field(default=None, min_length=1, max_length=1024)
+
+    @model_validator(mode="after")
+    def values_are_canonical(self) -> SkillSourceDescriptor:
+        """Reject whitespace aliases before matching a successful Skill read."""
+
+        if self.path != self.path.strip():
+            raise ValueError("Skill source path must be canonical text")
+        if self.agent_name is not None and self.agent_name != self.agent_name.strip():
+            raise ValueError("Skill source agent name must be canonical text")
+        return self
+
+
 class RunSourceContext(ContractModel):
     """Describe the real input and lineage used to open one Runtime request.
 
@@ -74,6 +124,12 @@ class RunSourceContext(ContractModel):
     config: JsonValue
     resume: tuple[RunResumeSummary, ...] = ()
     private_state_keys: tuple[str, ...] = ()
+    call_tracking_enabled: bool = Field(
+        default=False,
+        description="Whether the managed request installed provider and Tool callbacks",
+    )
+    middleware: tuple[MiddlewareDescriptor, ...] = ()
+    skill_sources: tuple[SkillSourceDescriptor, ...] = ()
 
     @model_validator(mode="after")
     def identifiers_and_collections_are_canonical(self) -> RunSourceContext:
@@ -86,6 +142,12 @@ class RunSourceContext(ContractModel):
             raise ValueError("resume interrupt IDs must be unique")
         if len(set(self.private_state_keys)) != len(self.private_state_keys):
             raise ValueError("private state keys must be unique")
+        middleware_names = tuple(item.name for item in self.middleware)
+        if len(set(middleware_names)) != len(middleware_names):
+            raise ValueError("middleware names must be unique")
+        skill_keys = tuple((item.agent_name, item.path) for item in self.skill_sources)
+        if len(set(skill_keys)) != len(skill_keys):
+            raise ValueError("Skill sources must be unique per Agent")
         return self
 
 
@@ -188,6 +250,228 @@ class RunClosedObservation(ObservationModel):
     outcome: RunTerminalOutcome
 
 
+class AgentStepObservation(ObservationModel):
+    """Record one actual Agent graph step independently of Native stream delivery."""
+
+    kind: Literal["call.agent_step"] = "call.agent_step"
+    identity: RunIdentity
+    phase: Literal[
+        "started",
+        "completed",
+        "failed",
+        "cancelled",
+        "interrupted",
+        "abandoned",
+    ]
+    call_id: str = Field(min_length=1, max_length=1024)
+    parent_call_id: str | None = Field(default=None, min_length=1, max_length=1024)
+    namespace: tuple[str, ...] = ()
+    agent_name: str | None = Field(default=None, min_length=1, max_length=1024)
+    step_kind: Literal["agent", "middleware", "model", "tools", "subagent", "task"]
+    name: str = Field(min_length=1, max_length=1024)
+    task_id: str | None = Field(default=None, min_length=1, max_length=1024)
+    middleware_name: str | None = Field(default=None, min_length=1, max_length=1024)
+    hook: str | None = Field(default=None, min_length=1, max_length=1024)
+    error_type: str | None = Field(default=None, min_length=1, max_length=1024)
+    error_message: str | None = Field(default=None, min_length=1, max_length=4096)
+    failure_origin: bool = False
+
+    @model_validator(mode="after")
+    def phase_and_step_fields_are_consistent(self) -> AgentStepObservation:
+        """Keep middleware identity and terminal failures attached to real phases."""
+
+        is_middleware = self.step_kind == "middleware"
+        if is_middleware != (
+            self.middleware_name is not None and self.hook is not None
+        ):
+            raise ValueError(
+                "middleware steps require a middleware name and hook exclusively"
+            )
+        if self.phase == "failed" and self.error_type is None:
+            raise ValueError("failed Agent steps require an error type")
+        if self.phase != "failed" and (
+            self.error_type is not None or self.error_message is not None
+        ):
+            raise ValueError("non-failure Agent step phases cannot carry an error")
+        if self.failure_origin and self.phase != "failed":
+            raise ValueError("only failed Agent steps can own a failure")
+        return self
+
+
+class ModelCallObservation(ObservationModel):
+    """Record one provider call independently of Native stream delivery."""
+
+    kind: Literal["call.model"] = "call.model"
+    identity: RunIdentity
+    phase: Literal[
+        "started",
+        "first_output",
+        "completed",
+        "failed",
+        "cancelled",
+        "interrupted",
+        "abandoned",
+    ]
+    call_id: str = Field(min_length=1, max_length=1024)
+    parent_call_id: str | None = Field(default=None, min_length=1, max_length=1024)
+    namespace: tuple[str, ...] = ()
+    agent_name: str | None = Field(default=None, min_length=1, max_length=1024)
+    provider: str | None = Field(default=None, min_length=1, max_length=1024)
+    model: str | None = Field(default=None, min_length=1, max_length=1024)
+    messages: tuple[NativeMessageRecord, ...] = Field(
+        default=(),
+        description="Final middleware-processed messages sent to the provider",
+    )
+    invocation: JsonValue | None = Field(
+        default=None,
+        description="Provider invocation parameters exposed by the locked callback",
+    )
+    options: JsonValue | None = Field(
+        default=None,
+        description="Bound model options exposed by the locked callback",
+    )
+    usage: dict[str, JsonValue] | None = None
+    response_metadata: dict[str, JsonValue] | None = None
+    tool_call_ids: tuple[str, ...] = ()
+    error_type: str | None = Field(default=None, min_length=1, max_length=1024)
+    error_message: str | None = Field(default=None, min_length=1, max_length=4096)
+    failure_origin: bool = False
+
+    @model_validator(mode="after")
+    def phase_fields_are_consistent(self) -> ModelCallObservation:
+        """Require final request evidence only on start and errors only on failures."""
+
+        has_request = (
+            bool(self.messages)
+            or self.invocation is not None
+            or self.options is not None
+        )
+        if self.phase == "started" and not self.messages:
+            raise ValueError("started model calls require final messages")
+        if self.phase != "started" and has_request:
+            raise ValueError("only started model calls may carry final request values")
+        if self.phase == "failed" and self.error_type is None:
+            raise ValueError("failed model calls require an error type")
+        if self.phase != "failed" and (
+            self.error_type is not None or self.error_message is not None
+        ):
+            raise ValueError("non-failure model call phases cannot carry an error")
+        if self.failure_origin and self.phase != "failed":
+            raise ValueError("only failed model calls can own a failure")
+        if self.phase != "completed" and self.tool_call_ids:
+            raise ValueError("only completed model calls may carry Tool call IDs")
+        if any(
+            not tool_call_id or tool_call_id != tool_call_id.strip()
+            for tool_call_id in self.tool_call_ids
+        ):
+            raise ValueError("model Tool call IDs must be canonical text")
+        if len(set(self.tool_call_ids)) != len(self.tool_call_ids):
+            raise ValueError("model Tool call IDs must be unique")
+        return self
+
+
+class ToolExecutionObservation(ObservationModel):
+    """Record actual Tool execution separately from a model's Tool proposal."""
+
+    kind: Literal["call.tool"] = "call.tool"
+    identity: RunIdentity
+    phase: Literal[
+        "started",
+        "completed",
+        "failed",
+        "cancelled",
+        "interrupted",
+        "abandoned",
+    ]
+    execution_id: str = Field(min_length=1, max_length=1024)
+    parent_call_id: str | None = Field(default=None, min_length=1, max_length=1024)
+    namespace: tuple[str, ...] = ()
+    agent_name: str | None = Field(default=None, min_length=1, max_length=1024)
+    tool_call_id: str | None = Field(default=None, min_length=1, max_length=1024)
+    tool_name: str = Field(min_length=1, max_length=1024)
+    input: JsonValue | None = Field(
+        default=None,
+        description="Actual post-review Tool input carried only by the start phase",
+    )
+    output: JsonValue | None = Field(
+        default=None,
+        description="Actual Tool result carried only by a terminal phase",
+    )
+    error_type: str | None = Field(default=None, min_length=1, max_length=1024)
+    error_message: str | None = Field(default=None, min_length=1, max_length=4096)
+    failure_origin: bool = False
+
+    @model_validator(mode="after")
+    def phase_fields_are_consistent(self) -> ToolExecutionObservation:
+        """Keep attempted input, successful output, and failures unambiguous."""
+
+        if self.phase == "started" and self.input is None:
+            raise ValueError("started Tool executions require actual input")
+        if self.phase != "started" and self.input is not None:
+            raise ValueError("only started Tool executions may carry input")
+        if self.phase == "completed" and self.output is None:
+            raise ValueError("completed Tool executions require output")
+        if self.phase not in {"completed", "failed"} and self.output is not None:
+            raise ValueError("only completed or handled-failure Tools may carry output")
+        if self.phase == "failed" and self.error_type is None and self.output is None:
+            raise ValueError("failed Tool executions require error or output evidence")
+        if self.phase != "failed" and (
+            self.error_type is not None or self.error_message is not None
+        ):
+            raise ValueError("non-failure Tool execution phases cannot carry an error")
+        if self.failure_origin and self.phase != "failed":
+            raise ValueError("only failed Tool executions can own a failure")
+        return self
+
+
+class ContextContributionObservation(ObservationModel):
+    """Record one explicitly named Memory, Guardrail, retrieval, or custom action."""
+
+    kind: Literal["call.context"] = "call.context"
+    identity: RunIdentity
+    phase: Literal[
+        "started",
+        "completed",
+        "failed",
+        "cancelled",
+        "interrupted",
+        "abandoned",
+    ]
+    contribution_id: str = Field(min_length=1, max_length=1024)
+    parent_call_id: str | None = Field(default=None, min_length=1, max_length=1024)
+    namespace: tuple[str, ...] = ()
+    context_kind: ContextKind
+    name: str = Field(min_length=1, max_length=1024)
+    input: JsonValue | None = Field(
+        default=None,
+        description="Public contribution input carried only by the start phase",
+    )
+    output: JsonValue | None = Field(
+        default=None,
+        description="Public contribution result carried only by successful completion",
+    )
+    error_type: str | None = Field(default=None, min_length=1, max_length=1024)
+    failure_origin: bool = False
+
+    @model_validator(mode="after")
+    def phase_fields_are_consistent(self) -> ContextContributionObservation:
+        """Keep contribution input, output, and terminal errors phase-owned."""
+
+        if self.phase != "started" and self.input is not None:
+            raise ValueError("only started context contributions may carry input")
+        if self.phase != "completed" and self.output is not None:
+            raise ValueError("only completed context contributions may carry output")
+        if self.phase == "failed" and self.error_type is None:
+            raise ValueError("failed contributions require an error type")
+        if self.phase != "failed" and self.error_type is not None:
+            raise ValueError(
+                "non-failure contribution phases cannot carry an error type"
+            )
+        if self.failure_origin and self.phase != "failed":
+            raise ValueError("only failed contributions can own a failure")
+        return self
+
+
 class NativeMessageObservation(ObservationModel):
     """Record one validated Native message part with complete graph scope."""
 
@@ -273,6 +557,10 @@ RuntimeObservation: TypeAlias = Annotated[
     | RunObserverFailedObservation
     | RunTerminalObservation
     | RunClosedObservation
+    | AgentStepObservation
+    | ModelCallObservation
+    | ToolExecutionObservation
+    | ContextContributionObservation
     | NativeMessageObservation
     | NativeReasoningObservation
     | NativeTaskObservation
@@ -288,6 +576,11 @@ RUNTIME_OBSERVATION_ADAPTER: TypeAdapter[RuntimeObservation] = TypeAdapter(
 
 __all__ = [
     "RUNTIME_OBSERVATION_ADAPTER",
+    "AgentStepObservation",
+    "ContextContributionObservation",
+    "ContextKind",
+    "MiddlewareDescriptor",
+    "ModelCallObservation",
     "NativeExtraMode",
     "NativeExtraObservation",
     "NativeInterruptRecord",
@@ -313,4 +606,6 @@ __all__ = [
     "RunTerminalObservation",
     "RunTerminalOutcome",
     "RuntimeObservation",
+    "SkillSourceDescriptor",
+    "ToolExecutionObservation",
 ]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import cast
 
@@ -278,9 +279,10 @@ async def test_same_run_rejects_a_changed_registered_runtime_profile(session) ->
 
 
 class _Channel:
-    def __init__(self) -> None:
+    def __init__(self, *, close_error: BaseException | None = None) -> None:
         self.after: int | None = None
         self.body: _Body | None = None
+        self._close_error = close_error
 
     async def sse(
         self,
@@ -295,13 +297,14 @@ class _Channel:
         if on_source_starting is not None:
             await on_source_starting()
 
-        self.body = _Body()
+        self.body = _Body(close_error=self._close_error)
         return self.body
 
 
 class _Body:
-    def __init__(self) -> None:
+    def __init__(self, *, close_error: BaseException | None = None) -> None:
         self.closed = False
+        self._close_error = close_error
 
     def __aiter__(self) -> _Body:
         return self
@@ -311,6 +314,8 @@ class _Body:
 
     async def aclose(self) -> None:
         self.closed = True
+        if self._close_error is not None:
+            raise self._close_error
 
 
 class _TraceCoordinator:
@@ -391,9 +396,23 @@ async def test_chat_service_uses_messaging_only_for_delivery(
     assert [chunk async for chunk in prepared.body] == []
 
 
+@pytest.mark.parametrize(
+    ("close_error", "expected_error"),
+    (
+        pytest.param(None, RuntimeError, id="close-succeeds"),
+        pytest.param(ValueError("body close failed"), RuntimeError, id="close-fails"),
+        pytest.param(
+            asyncio.CancelledError("body close cancelled"),
+            asyncio.CancelledError,
+            id="close-cancelled",
+        ),
+    ),
+)
 async def test_chat_service_closes_sse_body_when_trace_follow_cannot_start(
     database,
     session,
+    close_error: BaseException | None,
+    expected_error: type[BaseException],
 ) -> None:
     """Trace follow 注册失败时立即释放尚未交给 HTTP 的 SSE 内容"""
 
@@ -410,7 +429,7 @@ async def test_chat_service_closes_sse_body_when_trace_follow_cannot_start(
             is_default=True,
         )
     )
-    channel = _Channel()
+    channel = _Channel(close_error=close_error)
     trace = _FailingTraceCoordinator()
     resources = cast(
         ApplicationResources,
@@ -436,11 +455,18 @@ async def test_chat_service_closes_sse_body_when_trace_follow_cannot_start(
         resources=resources,
     )
 
-    with pytest.raises(RuntimeError, match="trace follow unavailable"):
+    with pytest.raises(expected_error) as caught:
         await service.start(_ordinary_request(), last_event_id=None)
 
     assert channel.body is not None
     assert channel.body.closed
+    if isinstance(close_error, Exception):
+        assert isinstance(caught.value, RuntimeError)
+        assert "body close failed" in " ".join(getattr(caught.value, "__notes__", ()))
+        assert caught.value.__cause__ is close_error
+    elif isinstance(close_error, asyncio.CancelledError):
+        assert isinstance(caught.value.__cause__, RuntimeError)
+        assert "trace follow unavailable" in str(caught.value.__cause__)
 
 
 async def test_previous_head_reconcile_releases_the_request_transaction(

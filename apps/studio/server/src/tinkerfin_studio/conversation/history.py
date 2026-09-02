@@ -30,6 +30,10 @@ from tinkerfin_studio.conversation.schemas import (
     ConversationHistoryGroupConfig,
     ConversationHistoryListItem,
     ConversationHistoryListResponse,
+    ConversationTraceEntryErrorEvent,
+    ConversationTraceEntryPage,
+    ConversationTraceEntrySnapshotEvent,
+    ConversationTraceEntryUpdateEvent,
     ConversationTraceErrorEvent,
     ConversationTraceSnapshotEvent,
     ConversationTraceUpdateEvent,
@@ -43,6 +47,8 @@ from tinkerfin_studio.conversation.todo_groups import (
 )
 from tinkerfin_tracing import (
     InvalidTraceCursor,
+    TraceFilter,
+    TraceQuery,
     Tracer,
     TraceThread,
     TraceThreadNotFound,
@@ -271,6 +277,111 @@ class ConversationHistoryService:
                     projector.close()
 
         return events()
+
+    async def query_trace_entries(
+        self,
+        thread_id: str,
+        *,
+        where: TraceFilter,
+        cursor: str | None,
+        limit: int,
+    ) -> ConversationTraceEntryPage:
+        """在框架 Store 内筛选当前会话链路节点"""
+
+        query = await self._load_entry_query(
+            thread_id,
+            where=where,
+            cursor=cursor,
+            limit=limit,
+        )
+        return self._entry_page(query)
+
+    async def follow_trace_entries(
+        self,
+        thread_id: str,
+        *,
+        where: TraceFilter,
+        limit: int,
+    ) -> AsyncGenerator[
+        ConversationTraceEntrySnapshotEvent
+        | ConversationTraceEntryUpdateEvent
+        | ConversationTraceEntryErrorEvent,
+        None,
+    ]:
+        """先发送当前筛选页，再跟随同一 generation 的链路变化"""
+
+        query = await self._load_entry_query(
+            thread_id,
+            where=where,
+            cursor=None,
+            limit=limit,
+        )
+
+        async def events() -> AsyncGenerator[
+            ConversationTraceEntrySnapshotEvent
+            | ConversationTraceEntryUpdateEvent
+            | ConversationTraceEntryErrorEvent,
+            None,
+        ]:
+            updates = query.follow()
+            try:
+                yield ConversationTraceEntrySnapshotEvent(
+                    snapshot=self._entry_page(query)
+                )
+                async for update in updates:
+                    yield ConversationTraceEntryUpdateEvent(update=update)
+            except asyncio.CancelledError:
+                raise
+            except TracingError as error:
+                logger.error(
+                    "链路跟随异常结束: thread_id=%s",
+                    thread_id,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+                yield ConversationTraceEntryErrorEvent()
+            finally:
+                await updates.aclose()
+
+        return events()
+
+    async def _load_entry_query(
+        self,
+        thread_id: str,
+        *,
+        where: TraceFilter,
+        cursor: str | None,
+        limit: int,
+    ) -> TraceQuery:
+        """校验会话归属并在释放业务连接后查询框架索引"""
+
+        thread = await self._require_thread(thread_id)
+        head_run_id = thread.last_run_id
+        if head_run_id is None:
+            raise SystemException(ConversationErrorCode.TRACE_UNAVAILABLE)
+        await self._repository.commit()
+        try:
+            return await self._tracer.query(
+                thread.thread_id,
+                where=where,
+                head_run_id=head_run_id,
+                cursor=cursor,
+                limit=limit,
+            )
+        except InvalidTraceCursor as error:
+            raise BusinessException(ConversationErrorCode.INVALID_CURSOR) from error
+        except (TraceThreadNotFound, TracingError) as error:
+            raise SystemException(ConversationErrorCode.TRACE_UNAVAILABLE) from error
+
+    @staticmethod
+    def _entry_page(query: TraceQuery) -> ConversationTraceEntryPage:
+        return ConversationTraceEntryPage(
+            turns=query.turns,
+            items=query.items,
+            nextCursor=query.next_cursor,
+            asOfSeq=query.as_of_seq,
+            facets=query.facets,
+            completeness=query.completeness,
+        )
 
     async def _load_trace(
         self,

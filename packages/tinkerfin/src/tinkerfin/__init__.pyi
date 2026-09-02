@@ -23,10 +23,13 @@ from langgraph.store.base import BaseStore
 from langgraph.types import Checkpointer
 from langgraph.typing import ContextT
 
+from tinkerfin_contracts import ContextKind as ContextKind
 from tinkerfin_contracts import RunIdentity as RunIdentity
 from tinkerfin_contracts import RuntimeObserver as _RuntimeObserver
 from tinkerfin_native_stream import NativeStreamFrame as NativeStreamFrame
 
+from ._call_observation import TraceContribution as TraceContribution
+from ._call_observation import trace_contribution as trace_contribution
 from ._hitl import TINKERFIN_HITL_CONTRACT as TINKERFIN_HITL_CONTRACT
 from ._tasks import join_task as join_task
 from .agui_resume import AgUiResumeBinding as AgUiResumeBinding

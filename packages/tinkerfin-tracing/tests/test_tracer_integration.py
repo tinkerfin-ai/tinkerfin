@@ -11,6 +11,7 @@ from typing import Any, cast
 
 import pytest
 from ag_ui.core import RunFinishedEvent
+from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
 from langchain.agents.middleware.types import InputAgentState
 from langchain.tools import tool
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
@@ -35,6 +36,8 @@ from tinkerfin import (
     TinkerFin,
 )
 from tinkerfin_contracts import (
+    AgentStepObservation,
+    MiddlewareDescriptor,
     RunClosedObservation,
     RunIdentity,
     RunInputKind,
@@ -45,16 +48,22 @@ from tinkerfin_contracts import (
     RuntimeObservation,
 )
 from tinkerfin_tracing import (
+    AgentStepFact,
     AmbiguousTraceHead,
+    CapturePolicy,
     FactCountProjection,
     FactCountResult,
     InMemoryTraceStore,
     MessageFact,
+    MiddlewareFact,
+    MiddlewareTraceCapture,
     ReasoningCapturePolicy,
     ReasoningFact,
     RunFact,
     StateRevisionFact,
     ToolFact,
+    TraceEntryKind,
+    TraceEntryStatus,
     TraceEvent,
     TraceLimits,
     TraceProjectionFailed,
@@ -482,15 +491,12 @@ async def test_locked_subagent_hitl_remains_an_interrupt_with_tracing() -> None:
         ]
     )
     tracer = Tracer(store=InMemoryTraceStore())
-    definition = (
-        TinkerFin()
-        .observe(tracer)
-        .create_deep_agent(
-            model=model,
-            tools=[reviewed_child_tool],
-            interrupt_on={"reviewed_child_tool": {"allowed_decisions": ["approve"]}},
-            checkpointer=InMemorySaver(),
-        )
+    tinkerfin = TinkerFin().observe(tracer)
+    definition = tinkerfin.create_deep_agent(
+        model=model,
+        tools=[reviewed_child_tool],
+        interrupt_on={"reviewed_child_tool": {"allowed_decisions": ["approve"]}},
+        checkpointer=InMemorySaver(),
     )
     identity = RunIdentity(threadId="thread-real-child-review", runId="run-review")
     stream = definition.new_agui(identity=identity).astream(
@@ -509,6 +515,274 @@ async def test_locked_subagent_hitl_remains_an_interrupt_with_tracing() -> None:
     assert thread.interactions[0].namespace
     assert thread.interactions[0].status == "pending"
     assert thread.status.execution == "waiting"
+    entries = await tracer.query(identity.thread_id, limit=200)
+    assert entries.items
+    assert all(item.failure is None for item in entries.items)
+    assert not any(
+        item.status in {TraceEntryStatus.RUNNING, TraceEntryStatus.FAILED}
+        for item in entries.items
+    )
+
+
+async def test_real_subagent_cancellation_settles_every_child_entry() -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    @tool
+    async def wait_for_child_cancellation() -> str:
+        """Wait until the owning Runtime cancels the child Tool.
+
+        Returns:
+            An unreachable value.
+        """
+
+        entered.set()
+        await release.wait()
+        return "unreachable"
+
+    model = _SubagentToolBindingModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "task",
+                        "args": {
+                            "description": "Wait inside the child Agent",
+                            "subagent_type": "general-purpose",
+                        },
+                        "id": "cancel-parent-task",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "wait_for_child_cancellation",
+                        "args": {},
+                        "id": "cancel-child-tool",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+        ]
+    )
+    tracer = Tracer(store=InMemoryTraceStore())
+    tinkerfin = TinkerFin().observe(tracer)
+    definition = tinkerfin.create_deep_agent(
+        model=model,
+        tools=[wait_for_child_cancellation],
+    )
+    identity = RunIdentity(threadId="thread-child-cancel", runId="run-cancel")
+    stream = await tinkerfin.open_run(
+        identity,
+        agent=definition,
+        input={"messages": [HumanMessage(content="Delegate", id="user")]},
+    )
+
+    async def consume() -> None:
+        async for _part in stream:
+            pass
+
+    consumer = asyncio.create_task(consume())
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    consumer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await consumer
+
+    entries = await tracer.query(identity.thread_id, limit=200)
+    child_entries = tuple(
+        item
+        for item in entries.items
+        if item.kind
+        in {
+            TraceEntryKind.SUBAGENT,
+            TraceEntryKind.TASK,
+            TraceEntryKind.TOOL,
+            TraceEntryKind.TOOL_PROPOSAL,
+        }
+    )
+    assert child_entries
+    failures = tuple(item for item in entries.items if item.failure is not None)
+    assert not failures, [
+        (item.kind, item.name, item.status, item.failure) for item in failures
+    ]
+    assert not any(
+        item.status in {TraceEntryStatus.RUNNING, TraceEntryStatus.WAITING}
+        for item in child_entries
+    )
+    assert any(
+        item.kind is TraceEntryKind.SUBAGENT
+        and item.status is TraceEntryStatus.CANCELLED
+        for item in child_entries
+    )
+
+
+async def test_capture_policy_filters_middleware_configuration_facts() -> None:
+    store = InMemoryTraceStore()
+    tracer = Tracer(
+        store=store,
+        capture_policy=CapturePolicy.public_history(
+            middleware_overrides={
+                "internal-metrics": MiddlewareTraceCapture.disabled(),
+                "prompt-cache": MiddlewareTraceCapture.configuration_only(),
+            }
+        ),
+    )
+    identity = RunIdentity(threadId="thread-middleware-policy", runId="run-policy")
+    context = RunSourceContext(
+        identity=identity,
+        runtime_profile="deepagents-v2",
+        input_kind="ordinary",
+        input={"messages": [{"role": "user", "content": "hello"}]},
+        config={},
+        middleware=(
+            MiddlewareDescriptor(
+                name="internal-metrics",
+                class_name="acme.InternalMetricsMiddleware",
+                hooks=("awrap_model_call",),
+            ),
+            MiddlewareDescriptor(
+                name="prompt-cache",
+                class_name="acme.PromptCacheMiddleware",
+                hooks=("awrap_model_call",),
+            ),
+            MiddlewareDescriptor(
+                name="guardrail",
+                class_name="acme.GuardrailMiddleware",
+                hooks=("abefore_model",),
+            ),
+        ),
+    )
+
+    session = await tracer.open_run(context)
+    now = datetime.now(UTC)
+    for observation in (
+        RunStartedObservation(identity=identity, observed_at=now, monotonic_ns=1),
+        RunInputObservation(
+            identity=identity,
+            source=context,
+            observed_at=now,
+            monotonic_ns=2,
+        ),
+        RunTerminalObservation(
+            identity=identity,
+            outcome="succeeded",
+            observed_at=now,
+            monotonic_ns=3,
+        ),
+        RunClosedObservation(
+            identity=identity,
+            outcome="succeeded",
+            observed_at=now,
+            monotonic_ns=4,
+        ),
+    ):
+        await session.observe(observation)
+    await session.aclose()
+
+    snapshot = await store.snapshot(identity.thread_id)
+    events = await store.read_events(
+        snapshot.key,
+        after_seq=0,
+        as_of_seq=snapshot.as_of_seq,
+        limit=100,
+    )
+    middleware = tuple(
+        event.fact for event in events if isinstance(event.fact, MiddlewareFact)
+    )
+    assert [(fact.name, fact.hooks) for fact in middleware] == [
+        ("prompt-cache", ("awrap_model_call",)),
+        ("guardrail", ("abefore_model",)),
+    ]
+
+
+async def test_type_policy_covers_callback_only_internal_middleware() -> None:
+    store = InMemoryTraceStore()
+    tracer = Tracer(
+        store=store,
+        capture_policy=CapturePolicy.public_history(
+            middleware_overrides={
+                PatchToolCallsMiddleware: MiddlewareTraceCapture.configuration_only(),
+            }
+        ),
+    )
+    identity = RunIdentity(threadId="thread-internal-middleware", runId="run-policy")
+    context = RunSourceContext(
+        identity=identity,
+        runtime_profile="deepagents-v2",
+        input_kind="ordinary",
+        input={"messages": [{"role": "user", "content": "hello"}]},
+        config={},
+    )
+    session = await tracer.open_run(context)
+    now = datetime.now(UTC)
+    observations: tuple[RuntimeObservation, ...] = (
+        RunStartedObservation(identity=identity, observed_at=now, monotonic_ns=1),
+        RunInputObservation(
+            identity=identity,
+            source=context,
+            observed_at=now,
+            monotonic_ns=2,
+        ),
+        AgentStepObservation(
+            identity=identity,
+            phase="started",
+            call_id="internal-before-agent",
+            step_kind="middleware",
+            name="PatchToolCallsMiddleware.before_agent",
+            middleware_name="PatchToolCallsMiddleware",
+            hook="before_agent",
+            observed_at=now,
+            monotonic_ns=3,
+        ),
+        AgentStepObservation(
+            identity=identity,
+            phase="completed",
+            call_id="internal-before-agent",
+            step_kind="middleware",
+            name="PatchToolCallsMiddleware.before_agent",
+            middleware_name="PatchToolCallsMiddleware",
+            hook="before_agent",
+            observed_at=now,
+            monotonic_ns=4,
+        ),
+        RunTerminalObservation(
+            identity=identity,
+            outcome="succeeded",
+            observed_at=now,
+            monotonic_ns=5,
+        ),
+        RunClosedObservation(
+            identity=identity,
+            outcome="succeeded",
+            observed_at=now,
+            monotonic_ns=6,
+        ),
+    )
+    for observation in observations:
+        await session.observe(observation)
+    await session.aclose()
+
+    snapshot = await store.snapshot(identity.thread_id)
+    events = await store.read_events(
+        snapshot.key,
+        after_seq=0,
+        as_of_seq=snapshot.as_of_seq,
+        limit=100,
+    )
+    middleware = tuple(
+        event.fact for event in events if isinstance(event.fact, MiddlewareFact)
+    )
+    assert len(middleware) == 1
+    assert middleware[0].name == "PatchToolCallsMiddleware"
+    assert middleware[0].class_name == (
+        f"{PatchToolCallsMiddleware.__module__}.{PatchToolCallsMiddleware.__qualname__}"
+    )
+    assert middleware[0].hooks == ("before_agent",)
+    assert not any(isinstance(event.fact, AgentStepFact) for event in events)
 
 
 async def _record_run(

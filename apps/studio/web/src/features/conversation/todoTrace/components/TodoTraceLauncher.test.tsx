@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import type { WebTaskTraceViewState } from '../../../../types'
 import { TodoTraceLauncher } from './TodoTraceLauncher'
+import conversationStyles from '../../conversation.css?raw'
 import todoTraceStyles from '../todoTrace.css?raw'
 
 const ready = (count: number): WebTaskTraceViewState => ({
@@ -23,10 +24,11 @@ const ready = (count: number): WebTaskTraceViewState => ({
 })
 
 describe('TodoTraceLauncher', () => {
-  it('keeps the launcher borderless in every visual state', () => {
-    expect(todoTraceStyles).toMatch(
-      /\.composer-auxiliary-control\.todo-trace-launcher\s*{[^}]*border:\s*0;/s,
+  it('uses the shared borderless trace-launcher variant in every visual state', () => {
+    expect(conversationStyles).toMatch(
+      /\.composer-auxiliary-control\.composer-trace-launcher\s*{[^}]*border:\s*0;/s,
     )
+    expect(todoTraceStyles).not.toMatch(/todo-trace-launcher\s*{[^}]*border:/s)
     expect(todoTraceStyles).toMatch(
       /\.composer-auxiliary-control\.todo-trace-launcher\.is-selected\s*{[^}]*box-shadow:\s*var\(--shadow-1\);/s,
     )
@@ -99,6 +101,7 @@ describe('TodoTraceLauncher', () => {
       />,
     )
     const launcher = screen.getByRole('button', { name: '任务轨迹 2' })
+    expect(launcher).toHaveClass('composer-trace-launcher')
     expect(launcher).toHaveAttribute('aria-expanded', 'true')
     expect(launcher).toHaveClass('is-selected')
     fireEvent.click(launcher)

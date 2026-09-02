@@ -35,6 +35,18 @@ const pendingApproval: ApprovalState = {
   }],
 }
 
+const storedScroll = (threadId: string) => JSON.parse(
+  window.sessionStorage.getItem(`tinkerfin:conversation-scroll:${threadId}`) ?? 'null',
+) as { scrollTop: number; followLatest: boolean } | null
+
+const setStoredScroll = (
+  threadId: string,
+  value: { scrollTop: number; followLatest: boolean },
+) => window.sessionStorage.setItem(
+  `tinkerfin:conversation-scroll:${threadId}`,
+  JSON.stringify(value),
+)
+
 describe('useConversationScroll', () => {
   beforeEach(() => {
     window.sessionStorage.clear()
@@ -209,12 +221,15 @@ describe('useConversationScroll', () => {
     expect(window.sessionStorage.getItem('tinkerfin:conversation-scroll:thread-scroll')).toBeNull()
 
     rerender({ currentConversation: secondConversation })
-    expect(window.sessionStorage.getItem('tinkerfin:conversation-scroll:thread-scroll')).toBe('180')
+    expect(storedScroll('thread-scroll')).toEqual({ scrollTop: 180, followLatest: true })
 
     pane.scrollTop = 260
     act(() => result.current.handleScroll(pane))
     unmount()
-    expect(window.sessionStorage.getItem('tinkerfin:conversation-scroll:thread-scroll-second')).toBe('260')
+    expect(storedScroll('thread-scroll-second')).toEqual({
+      scrollTop: 260,
+      followLatest: true,
+    })
   })
 
   it('页面进入后台前提交尚未执行的滚动写入', () => {
@@ -229,14 +244,14 @@ describe('useConversationScroll', () => {
     act(() => result.current.handleScroll(pane))
     act(() => window.dispatchEvent(new Event('pagehide')))
 
-    expect(window.sessionStorage.getItem('tinkerfin:conversation-scroll:thread-scroll')).toBe('320')
+    expect(storedScroll('thread-scroll')).toEqual({ scrollTop: 320, followLatest: true })
     act(() => vi.runOnlyPendingTimers())
   })
 
   it('restores an off-bottom conversation position without treating it as user scrolling', () => {
     const firstConversation = { ...conversation, threadId: 'thread-first' }
     const secondConversation = { ...conversation, threadId: 'thread-second' }
-    window.sessionStorage.setItem('tinkerfin:conversation-scroll:thread-second', '240')
+    setStoredScroll('thread-second', { scrollTop: 240, followLatest: false })
     const { result, rerender } = renderHook(
       ({ currentConversation }) => useConversationScroll({
         conversation: currentConversation,
@@ -267,6 +282,159 @@ describe('useConversationScroll', () => {
     expect(result.current.showScrollToBottom).toBe(true)
   })
 
+  it('restores the exact reading position after the conversation viewport remounts', () => {
+    const { result, rerender, unmount } = renderHook(
+      ({ active }) => useConversationScroll({ conversation, isRunning: false, active }),
+      { initialProps: { active: true } },
+    )
+    const firstPane = document.createElement('section')
+    Object.defineProperties(firstPane, {
+      clientHeight: { configurable: true, value: 400 },
+      scrollHeight: { configurable: true, value: 1200 },
+      scrollTop: { configurable: true, writable: true, value: 260 },
+    })
+    result.current.paneRef.current = firstPane
+
+    act(() => {
+      result.current.markUserScrollIntent()
+      result.current.handleScroll(firstPane)
+    })
+    rerender({ active: false })
+    expect(storedScroll('thread-scroll')).toEqual({ scrollTop: 260, followLatest: false })
+
+    result.current.paneRef.current = null
+    const remountedPane = document.createElement('section')
+    Object.defineProperties(remountedPane, {
+      clientHeight: { configurable: true, value: 400 },
+      scrollHeight: { configurable: true, value: 1200 },
+      scrollTop: { configurable: true, writable: true, value: 0 },
+    })
+    result.current.paneRef.current = remountedPane
+    rerender({ active: true })
+
+    expect(remountedPane.scrollTop).toBe(260)
+    act(() => vi.runOnlyPendingTimers())
+    unmount()
+  })
+
+  it('跨会话返回时让原本位于底部的会话继续跟随新增内容', () => {
+    const secondConversation = { ...conversation, threadId: 'thread-scroll-second' }
+    const { result, rerender } = renderHook(
+      ({ currentConversation }) => useConversationScroll({
+        conversation: currentConversation,
+        isRunning: false,
+      }),
+      { initialProps: { currentConversation: conversation } },
+    )
+    const pane = document.createElement('section')
+    Object.defineProperties(pane, {
+      clientHeight: { configurable: true, value: 400 },
+      scrollHeight: { configurable: true, value: 1200 },
+      scrollTop: { configurable: true, writable: true, value: 800 },
+    })
+    result.current.paneRef.current = pane
+    act(() => result.current.handleScroll(pane))
+    act(() => vi.advanceTimersByTime(0))
+
+    rerender({ currentConversation: secondConversation })
+    expect(storedScroll('thread-scroll')).toEqual({ scrollTop: 800, followLatest: true })
+
+    Object.defineProperties(pane, {
+      scrollHeight: { configurable: true, value: 1500 },
+      scrollTop: { configurable: true, writable: true, value: 0 },
+    })
+    rerender({ currentConversation: conversation })
+    act(() => vi.advanceTimersByTime(0))
+
+    expect(pane.scrollTop).toBe(1500)
+    expect(result.current.showScrollToBottom).toBe(false)
+  })
+
+  it('程序性滚动进入底部阈值后跨会话继续跟随新增内容', () => {
+    const otherConversation = { ...conversation, threadId: 'thread-scroll-other' }
+    setStoredScroll('thread-scroll', { scrollTop: 240, followLatest: false })
+    const { result, rerender } = renderHook(
+      ({ currentConversation }) => useConversationScroll({
+        conversation: currentConversation,
+        isRunning: false,
+      }),
+      { initialProps: { currentConversation: otherConversation } },
+    )
+    const pane = document.createElement('section')
+    Object.defineProperties(pane, {
+      clientHeight: { configurable: true, value: 400 },
+      scrollHeight: { configurable: true, value: 1200 },
+      scrollTop: { configurable: true, writable: true, value: 0 },
+    })
+    result.current.paneRef.current = pane
+
+    rerender({ currentConversation: conversation })
+    act(() => vi.advanceTimersByTime(0))
+    expect(pane.scrollTop).toBe(240)
+
+    pane.scrollTop = 800
+    act(() => result.current.handleScroll(pane))
+    act(() => vi.advanceTimersByTime(0))
+    rerender({ currentConversation: otherConversation })
+    expect(storedScroll('thread-scroll')).toEqual({ scrollTop: 800, followLatest: true })
+
+    Object.defineProperties(pane, {
+      scrollHeight: { configurable: true, value: 1600 },
+      scrollTop: { configurable: true, writable: true, value: 0 },
+    })
+    rerender({ currentConversation: conversation })
+    act(() => vi.advanceTimersByTime(0))
+
+    expect(pane.scrollTop).toBe(1600)
+    expect(result.current.showScrollToBottom).toBe(false)
+  })
+
+  it('continues following the latest message after an inactive viewport remount', () => {
+    const { result, rerender, unmount } = renderHook(
+      ({ active, currentConversation }) => useConversationScroll({
+        conversation: currentConversation,
+        isRunning: false,
+        active,
+      }),
+      { initialProps: { active: true, currentConversation: conversation } },
+    )
+    const firstPane = document.createElement('section')
+    Object.defineProperties(firstPane, {
+      clientHeight: { configurable: true, value: 400 },
+      scrollHeight: { configurable: true, value: 1200 },
+      scrollTop: { configurable: true, writable: true, value: 800 },
+    })
+    result.current.paneRef.current = firstPane
+    act(() => result.current.handleScroll(firstPane))
+    act(() => vi.advanceTimersByTime(0))
+
+    rerender({ active: false, currentConversation: conversation })
+    result.current.paneRef.current = null
+    const remountedPane = document.createElement('section')
+    Object.defineProperties(remountedPane, {
+      clientHeight: { configurable: true, value: 400 },
+      scrollHeight: { configurable: true, value: 1400 },
+      scrollTop: { configurable: true, writable: true, value: 0 },
+    })
+    result.current.paneRef.current = remountedPane
+    rerender({
+      active: true,
+      currentConversation: {
+        ...conversation,
+        messages: [{
+          id: 'message-while-trace-open',
+          role: 'assistant',
+          content: '新增消息',
+          createdAt: '2026-08-24T00:00:01Z',
+        }],
+      },
+    })
+
+    expect(remountedPane.scrollTop).toBe(1000)
+    act(() => vi.runOnlyPendingTimers())
+    unmount()
+  })
+
   it('treats wheel input forwarded from the composer as user scrolling', () => {
     const { result } = renderHook(() => useConversationScroll({ conversation, isRunning: false }))
     const pane = document.createElement('section')
@@ -282,6 +450,25 @@ describe('useConversationScroll', () => {
 
     expect(pane.scrollTop).toBe(180)
     expect(result.current.showScrollToBottom).toBe(true)
+  })
+
+  it('does not stop following when wheel or touch intent cannot move past the bottom', () => {
+    const { result } = renderHook(() => useConversationScroll({ conversation, isRunning: false }))
+    const pane = document.createElement('section')
+    Object.defineProperties(pane, {
+      clientHeight: { configurable: true, value: 400 },
+      scrollHeight: { configurable: true, value: 1200 },
+      scrollTop: { configurable: true, writable: true, value: 800 },
+    })
+    result.current.paneRef.current = pane
+    act(() => result.current.handleScroll(pane))
+    act(() => vi.advanceTimersByTime(0))
+
+    act(() => result.current.markUserScrollIntent())
+    Object.defineProperty(pane, 'scrollHeight', { configurable: true, value: 1400 })
+    act(() => result.current.syncToBottomIfFollowing())
+
+    expect(pane.scrollTop).toBe(1400)
   })
 
   it('布局缩小会话视口时保持底部跟随，只有用户滚动才能退出', () => {
@@ -327,7 +514,7 @@ describe('useConversationScroll', () => {
       scrollTop: { configurable: true, writable: true, value: 180 },
     })
     result.current.paneRef.current = pane
-    window.sessionStorage.setItem('tinkerfin:conversation-scroll:thread-scroll', '180')
+    setStoredScroll('thread-scroll', { scrollTop: 180, followLatest: false })
 
     const approvalConversation: Conversation = {
       ...conversation,

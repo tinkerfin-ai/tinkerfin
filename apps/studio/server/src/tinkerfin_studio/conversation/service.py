@@ -427,11 +427,21 @@ class ConversationChatService:
             try:
                 await body.aclose()
             except BaseException as close_error:
-                close_error.add_note(
-                    "SSE 内容关闭前的 Trace follow 注册也失败: "
-                    f"{type(error).__name__}: {error}"
+                if isinstance(error, Exception) and not isinstance(
+                    close_error, Exception
+                ):
+                    close_error.add_note(
+                        "SSE 内容关闭前的 Trace follow 注册也失败: "
+                        f"{type(error).__name__}: {error}"
+                    )
+                    raise close_error.with_traceback(
+                        close_error.__traceback__
+                    ) from error
+                error.add_note(
+                    "Trace follow 注册失败后的 SSE 内容关闭也失败: "
+                    f"{type(close_error).__name__}: {close_error}"
                 )
-                raise
+                raise error.with_traceback(error.__traceback__) from close_error
             raise
         return body
 

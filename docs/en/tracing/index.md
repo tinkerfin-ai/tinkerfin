@@ -2,11 +2,12 @@
 
 [Documentation](../README.md) · [中文](../../zh/tracing/index.md)
 
-`tinkerfin-tracing` records user-facing execution history from two authoritative
-sources:
+`tinkerfin-tracing` records user-facing execution history from complementary
+authoritative sources:
 
 ```text
 TinkerFin Runtime lifecycle
++ LangChain provider and Tool callbacks
 + validated LangGraph Native messages/tasks/values
 ```
 
@@ -61,10 +62,47 @@ print(thread.summary.pending_interactions)
 ```
 
 `.observe(...)` returns a separate configured `TinkerFin` factory. Each request opens a
-request-scoped Trace session. Runtime validates every Native part before Trace, invokes
-Trace before `on_part` and AG-UI conversion, and forces accepted observations at resume,
+request-scoped Trace session. The callback plane records the final middleware-processed
+model request before provider execution, first output, usage, failures, cancellation,
+and actual post-approval Tool execution. Runtime validates every Native part before
+Trace; that Native plane remains authoritative for messages, Todo, Plan, HITL, state,
+checkpoints, and subagents. Accepted observations are forced at call start, resume,
 interrupt, terminal, and close boundaries. A Trace write failure terminates the Agent
 Run fail-closed.
+
+## Filter call entries in the Store
+
+```python
+from tinkerfin_tracing import TraceEntryKind, TraceFilter
+
+query = await tracer.query(
+    "thread-1",
+    where=TraceFilter(
+        kinds={
+            TraceEntryKind.MODEL,
+            TraceEntryKind.PROVIDER,
+            TraceEntryKind.TOOL,
+            TraceEntryKind.SKILL,
+        },
+        include_ancestors=True,
+    ),
+    limit=100,
+)
+print(query.turns, query.items, query.facets, query.next_cursor)
+```
+
+The Store applies kind, status, parent, Agent, middleware, Skill, provider, model,
+namespace, time, and text filters before returning rows. `TraceQuery.follow()` tracks
+the same filtered page, including its cursor. The derived SQL entry table contains no request, result,
+message, or state payload; selected details are loaded by Ledger sequence and decoded
+through the configured codec. `await tracer.rebuild_entries(thread_id)` reconstructs
+those disposable entries without rewriting Ledger events.
+
+Each returned entry has one Turn owner. `parent_id` describes only the verified call
+tree; actual Tool executions use a separate `proposal_id` to refer to their model Tool
+proposal. User messages are resolved from existing message facts into `query.turns`.
+Live followers publish Turn and entry changes together, including before a provider
+produces output.
 
 ## Read one fixed execution slice
 
@@ -100,15 +138,18 @@ page = await thread.events(limit=100)
 while page.next_cursor is not None:
     page = await thread.events(cursor=page.next_cursor, limit=100)
 
-async for update in thread.follow():
-    apply_message_delta(update.messages)
-    apply_node_delta(update.nodes)
+updates = thread.follow()
+async with updates:
+    async for update in updates:
+        apply_message_delta(update.messages)
+        apply_node_delta(update.nodes)
 ```
 
 Event cursors are opaque and bind namespace, thread, generation, selected head, fixed
 page as-of, and last global sequence. Concurrent appends do not enter an existing page
 session. `follow()` starts after the handle's original as-of and yields semantic entity
-upserts/removals. Cancelling or closing the iterator releases its wait.
+upserts/removals. Cancellation, exhaustion, or the context manager closes its wait;
+consumers that do not use `async with` must call `aclose()` after an early break.
 
 `thread.delete()` deletes only the inactive generation named by that handle. Active
 writers prevent deletion; a cursor or handle from a deleted generation cannot address a
@@ -129,6 +170,9 @@ independent safety rules:
   state or message bodies;
 - each newly observed Tool retains complete sanitized arguments, results, and public
   review descriptions by default;
+- middleware configuration and standard-callback lifecycles are visible by default;
+  `configuration_only()` and `disabled()` can narrow individual implementations without
+  changing middleware execution;
 - `ToolTraceCapture.metadata_only()` retains lifecycle without content,
   `selected_content()` retains explicit RFC 6901 paths, and `disabled()` suppresses the
   Tool facts;
@@ -140,6 +184,17 @@ Hosts that require metadata-only Tool retention can select
 `CapturePolicy.public_safe(tool_rules=...)`. Its low-level `ToolCaptureRule` preserves
 the existing exact-name and JSON Pointer boundary without becoming a second Agent Tool
 registry on the ordinary path.
+
+`middleware_overrides` accepts an implementation type for every instance or an exact
+public name for one named instance. Exact names take precedence. Wrap-only middleware is
+configuration evidence because LangChain does not publish those hooks through standard
+callbacks; Trace never fabricates execution or timing. Type selectors also apply when
+framework-injected middleware first appears through its standard callback class name.
+
+Only directly failed work owns `failure`. Interrupts remain waiting, cancellations remain
+cancelled, and unmatched work at a terminal boundary becomes abandoned. Runtime terminal
+settlement updates Native tasks, Tool proposals, Tool executions, subagents, and callback
+steps so a completed Run cannot leave query entries running.
 
 Provider reasoning requires two independent opt-ins. Configure a verified extractor on
 `DeepAgentsV2RuntimeProfile`, then pass `ReasoningCapturePolicy.content()` to `Tracer`
@@ -193,6 +248,11 @@ checkpoint. The framework owns writer lifecycle, terminal reserve, sequence allo
 checkpoint decisions, canonical validation, follow polling, backpressure, and
 cancellation. `verify_trace_ledger_backend()` checks the shared observable contract
 using two independent Backend clients.
+
+Direct entry filtering is an optional `TraceQueryBackend` capability. Atomic
+reconstruction is a separate `TraceEntryRebuildBackend` capability, so archival or
+telemetry integrations do not need to implement query storage. The ordinary
+`TraceLedgerBackend` contract and custom payload codec remain unchanged.
 
 SQL writers use database-clock leases and monotonically increasing fences. An expired
 incomplete writer becomes `missing_tail`, keeps reserved terminal capacity, and can be

@@ -226,7 +226,13 @@ async def _next_or_observer_failure(
         return await anext(source)
 
     async def pull_next() -> PartT:
-        return await anext(source)
+        from ._call_observation import bind_observation_hub, reset_observation_hub
+
+        token = bind_observation_hub(self._observation)
+        try:
+            return await anext(source)
+        finally:
+            reset_observation_hub(token)
 
     pull = asyncio.create_task(pull_next(), name="tinkerfin-graph-run-pull")
     failure = asyncio.create_task(

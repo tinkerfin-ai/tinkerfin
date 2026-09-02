@@ -21,6 +21,9 @@ cp apps/studio/server/.env.example \
 uv run python -m tinkerfin_studio --host 127.0.0.1 --port 8090 --reload
 ```
 
+进程收到关闭信号后默认等待现有连接 10 秒，再取消仍在运行的 SSE 请求并完成资源清理。
+可通过 `--graceful-shutdown-timeout-seconds` 调整等待时间。
+
 本地进程使用应用目录的 `.env`，其中 MySQL、Redis Control、Redis Runtime 和 OpenSandbox
 地址必须能从宿主机访问，数据库应先由部署流程自动准备。Control 只承载认证与 Run 协调，
 Runtime 只承载 Checkpointer 与 Messaging；两者必须配置为不同物理服务地址。
@@ -75,11 +78,18 @@ Graph 关联或持久化身份；Service 会为 Graph 输入与 Trace 快照分�
 - `GET /api/conversation/{threadId}/trace` 先发送完整 Trace snapshot，再按提交顺序发送语义增量；
   `includeTaskTrace=true` 时只在任务轨迹实际变化后发送完整 replacement；断连或取消会关闭
   底层 follow iterator 与请求内 projector
+- `GET /api/conversation/{threadId}/trace/entries` 在校验用户归属后由 Trace Store 直接筛选链路
+  节点，支持 kind、status、parent、Agent、middleware、Skill、provider、model、namespace、时间、
+  文本、opaque cursor 与祖先补齐；响应中的 Turn 直接引用 Trace 已有 HumanMessage
+- `GET /api/conversation/{threadId}/trace/entries/follow` 先发送同一筛选首页，再持续发送节点
+  和 Turn 的 upsert/remove、Facet 与完整性变化；断连或取消会关闭底层过滤跟随器
 - `POST /api/conversation/chat` 的当前 owned Run 使用 AG-UI + Messaging；终态会话正文仍以 Trace 为准
 
-Studio MySQL 只保存会话归属、Run 注册、interrupt claim 和列表摘要。Trace 的五张表由
+Studio 业务表只保存会话归属、Run 注册、interrupt claim 和列表摘要。Trace 的六张表由
 `SqlAlchemyTraceStore.setup()` 自动创建并校验，`database/mysql/schema.sql` 同时提供完整空库 DDL。
-任务轨迹不写第二份副本、不注册 Projection checkpoint，只读取公共 `TraceThread.events()`。
+链路查询 entry 表只保存筛选、关系、状态、时间与 Ledger 序号，不保存 request、result、message
+或 state payload；详情仍经 Trace codec 读取 Ledger。任务轨迹不写第二份副本、不注册 Projection
+checkpoint，只读取公共 `TraceThread.events()`。
 LangGraph Store 由 `tinkerfin-langgraph-mysql` 通过 asyncmy 管理一条独立连接，进入资源上下文时
 自动执行当前 Store DDL，退出、异常或取消时自动关闭。
 

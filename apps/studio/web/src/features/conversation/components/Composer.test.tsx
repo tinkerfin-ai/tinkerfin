@@ -14,12 +14,17 @@ const composerChromeProps = () => ({
 })
 
 describe('Composer', () => {
-  it('places scroll and task-trace controls in one auxiliary row without an empty fallback', () => {
+  it('places centered scroll and ordered trace actions in one auxiliary row without an empty fallback', () => {
     const { container, rerender } = render(
       <Composer
         {...composerChromeProps()}
         scrollToBottomControl={<button type="button">回到底部</button>}
-        taskTraceControl={<button type="button">任务轨迹 2</button>}
+        taskTraceControl={(
+          <>
+            <button type="button">链路分析</button>
+            <button type="button">任务轨迹 2</button>
+          </>
+        )}
         value=""
         isRunning={false}
         onChange={vi.fn()}
@@ -31,11 +36,13 @@ describe('Composer', () => {
     const controls = container.querySelector('.composer-auxiliary-controls')
     expect(controls).not.toBeNull()
     expect(within(controls as HTMLElement).getAllByRole('button').map((button) => button.textContent))
-      .toEqual(['回到底部', '任务轨迹 2'])
+      .toEqual(['回到底部', '链路分析', '任务轨迹 2'])
     expect(screen.getByRole('button', { name: '回到底部' }).parentElement)
       .toHaveClass('composer-scroll-to-bottom-control')
     expect(screen.getByRole('button', { name: '任务轨迹 2' }).parentElement)
       .toHaveClass('composer-task-trace-control')
+    expect(screen.getByRole('button', { name: '链路分析' }).parentElement)
+      .toBe(screen.getByRole('button', { name: '任务轨迹 2' }).parentElement)
 
     rerender(
       <Composer

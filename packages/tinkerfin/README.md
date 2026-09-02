@@ -409,10 +409,47 @@ agent = tinkerfin.create_deep_agent(model=model, tools=tools)
 ```
 
 Each admitted request opens one managed `RunObservationSession`. Runtime publishes real
-input, resume checkpoint, terminal, close, and validated Native `messages/tasks/values`
-facts before `on_part` and AG-UI conversion. Observer failure terminates the Run
-fail-closed, while Runtime still settles and closes every opened session. Registration
-is preserved by `.plan(...)`; registering the same Observer object twice is rejected.
+input, final model requests, provider and Tool call lifecycles, resume checkpoint,
+terminal, close, and validated Native `messages/tasks/values` facts before `on_part` and
+AG-UI conversion. Model and Tool callbacks do not wait for Native response delivery;
+Native facts remain authoritative for messages, Todo, Plan, HITL, state, checkpoints,
+and subagents. Observer failure terminates the Run fail-closed, while Runtime still
+settles and closes every opened session. Registration is preserved by `.plan(...)`;
+registering the same Observer object twice is rejected.
+
+Middleware retention belongs to each Tracer, while TinkerFin always passes the original
+instances to Deep Agents in their declared order:
+
+```python
+from tinkerfin import TinkerFin
+from tinkerfin_tracing import CapturePolicy, MiddlewareTraceCapture, Tracer
+
+tracer = Tracer(
+    capture_policy=CapturePolicy.public_history(
+        middleware_overrides={
+            InternalMetricsMiddleware: MiddlewareTraceCapture.disabled(),
+        }
+    )
+)
+tinkerfin = TinkerFin().observe(tracer)
+agent = tinkerfin.create_deep_agent(
+    model=model,
+    tools=tools,
+    middleware=[customer_memory, internal_metrics],
+)
+```
+
+`visible()` retains configuration and standard callback lifecycles,
+`configuration_only()` retains configuration without claiming execution, and
+`disabled()` suppresses middleware-specific facts. Every setting retains final model
+requests and actual Tool executions. Type settings also apply to framework-injected
+middleware first observed through its standard callback class name; exact public names
+still take precedence. Interrupt, cancellation, abandonment, and generator closure are
+control flow rather than failures, and Runtime settlement closes unmatched callback work
+without assigning the Run error to every ancestor. Reusable middleware and Tools can expose an explicit
+Memory, Guardrail, retrieval, or custom action with
+`async with trace_contribution(kind="memory", name="Customer memory")` without
+depending on a Tracer implementation.
 
 The Runtime selects the Agent outcome before terminal broadcast. If an Observer rejects
 that already selected terminal, callers still fail closed and healthy Observers receive

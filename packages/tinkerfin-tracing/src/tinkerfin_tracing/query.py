@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncIterator, Mapping
 from types import MappingProxyType
 from typing import TypeVar, cast
 
@@ -19,6 +19,7 @@ from .errors import (
     TraceThreadNotFound,
 )
 from .facts import TraceEvent, TraceSemanticFact
+from .follow import TraceFollow, _close_trace_source, _trace_follow
 from .projection import (
     CoreProjection,
     CoreProjectionState,
@@ -359,90 +360,104 @@ class TraceThread:
             page_as_of_seq=page_as_of_seq,
         )
 
-    async def follow(self) -> AsyncGenerator[TraceUpdate, None]:
-        """Yield semantic deltas for commits after this handle's original as-of.
+    def follow(self) -> TraceFollow[TraceUpdate]:
+        """Return a closeable follower for commits after this handle's original as-of.
 
         The iterator follows the exact generation and selected head. Sibling-branch
-        batches advance internal projection state but are not emitted. Cancellation,
-        consumer break, and exceptions always close the borrowed Store follower in the
-        ``finally`` path.
+        batches advance internal projection state but are not emitted. Normal
+        exhaustion, cancellation, and explicit close settle the borrowed Store
+        follower. Use ``async with`` when the consumer may break early.
 
-        Yields:
-            Defensive Trace updates in committed global sequence order.
+        Returns:
+            A single-use follower of defensive updates in committed global sequence
+            order. Use it as an asynchronous context manager when iteration may stop
+            early, or call ``aclose()`` explicitly.
 
         Raises:
+            TraceFollowLifecycleError: The returned follower is reused concurrently or
+                entered after closing.
             TraceThreadNotFound: The generation is deleted or replaced.
             TraceStoreProtocolError: A batch is discontinuous or malformed.
             TraceProjectionFailed: A requested business Projection fails.
             TraceStoreError: Snapshot, follow, or checkpoint access fails.
         """
 
-        self._ensure_live()
-        core_state = self._core_state
-        previous = self._core
-        batches = self._store.follow(self.key, after_seq=self.as_of_seq)
-        try:
-            async for batch in batches:
-                _validate_event_batch(
-                    batch,
-                    key=self.key,
-                    expected_after=core_state.as_of_seq,
-                )
-                core_state = advance_core_projection_state(core_state, batch)
-                current_snapshot = await self._store.snapshot_key(self.key)
-                if not isinstance(current_snapshot, StoreThreadSnapshot):
-                    raise TraceStoreProtocolError(
-                        "Trace Store returned an invalid thread snapshot"
+        async def updates() -> AsyncIterator[TraceUpdate]:
+            self._ensure_live()
+            core_state = self._core_state
+            previous = self._core
+            batches = self._store.follow(self.key, after_seq=self.as_of_seq)
+            primary_error: BaseException | None = None
+            try:
+                async for batch in batches:
+                    _validate_event_batch(
+                        batch,
+                        key=self.key,
+                        expected_after=core_state.as_of_seq,
                     )
-                current = project_core_checkpoint(
-                    core_state,
-                    head_run_id=self._head_requested,
-                    turn_limit=self._turn_limit,
-                    active_run_ids=current_snapshot.active_run_ids,
-                )
-                selected_batch = tuple(
-                    event
-                    for event in batch
-                    if event.fact.identity.run_id in current.selected_run_ids
-                )
-                if not selected_batch:
+                    core_state = advance_core_projection_state(core_state, batch)
+                    current_snapshot = await self._store.snapshot_key(self.key)
+                    if not isinstance(current_snapshot, StoreThreadSnapshot):
+                        raise TraceStoreProtocolError(
+                            "Trace Store returned an invalid thread snapshot"
+                        )
+                    current = project_core_checkpoint(
+                        core_state,
+                        head_run_id=self._head_requested,
+                        turn_limit=self._turn_limit,
+                        active_run_ids=current_snapshot.active_run_ids,
+                    )
+                    selected_batch = tuple(
+                        event
+                        for event in batch
+                        if event.fact.identity.run_id in current.selected_run_ids
+                    )
+                    if not selected_batch:
+                        previous = current
+                        continue
+                    projection_results = await _projection_results(
+                        self._projection_registry,
+                        self._projection_names,
+                        store=self._store,
+                        key=self.key,
+                        core_state=core_state,
+                        head_run_id=current.selected_head,
+                        run_ids=current.selected_run_ids,
+                        as_of_seq=core_state.as_of_seq,
+                    )
+                    update = TraceUpdate(
+                        as_of_seq=batch[-1].trace_seq,
+                        events=selected_batch,
+                        facts=tuple(event.fact for event in selected_batch),
+                        messages=_entity_delta(previous.messages, current.messages),
+                        reasoning=_entity_delta(
+                            previous.reasoning,
+                            current.reasoning,
+                        ),
+                        nodes=_entity_delta(previous.tree.nodes, current.tree.nodes),
+                        interactions=_entity_delta(
+                            previous.interactions,
+                            current.interactions,
+                        ),
+                        state=current.state,
+                        summary=current.summary,
+                        projections={
+                            name: result.model_dump(mode="json", by_alias=True)
+                            for name, result in projection_results.items()
+                        },
+                    )
                     previous = current
-                    continue
-                projection_results = await _projection_results(
-                    self._projection_registry,
-                    self._projection_names,
-                    store=self._store,
-                    key=self.key,
-                    core_state=core_state,
-                    head_run_id=current.selected_head,
-                    run_ids=current.selected_run_ids,
-                    as_of_seq=core_state.as_of_seq,
+                    yield update.model_copy(deep=True)
+            except BaseException as error:
+                primary_error = error
+                raise
+            finally:
+                await _close_trace_source(
+                    batches,
+                    primary_error=primary_error,
                 )
-                update = TraceUpdate(
-                    as_of_seq=batch[-1].trace_seq,
-                    events=selected_batch,
-                    facts=tuple(event.fact for event in selected_batch),
-                    messages=_entity_delta(previous.messages, current.messages),
-                    reasoning=_entity_delta(
-                        previous.reasoning,
-                        current.reasoning,
-                    ),
-                    nodes=_entity_delta(previous.tree.nodes, current.tree.nodes),
-                    interactions=_entity_delta(
-                        previous.interactions,
-                        current.interactions,
-                    ),
-                    state=current.state,
-                    summary=current.summary,
-                    projections={
-                        name: result.model_dump(mode="json", by_alias=True)
-                        for name, result in projection_results.items()
-                    },
-                )
-                previous = current
-                yield update.model_copy(deep=True)
-        finally:
-            await batches.aclose()
+
+        return _trace_follow(updates)
 
     async def delete(self) -> None:
         """Delete this exact inactive generation and invalidate the handle.

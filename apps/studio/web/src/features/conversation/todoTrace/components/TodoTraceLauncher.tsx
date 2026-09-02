@@ -24,7 +24,7 @@ export const TodoTraceLauncher = forwardRef<HTMLButtonElement, {
       <button
         ref={ref}
         type="button"
-        className="composer-auxiliary-control todo-trace-launcher is-loading"
+        className="composer-auxiliary-control composer-trace-launcher todo-trace-launcher is-loading"
         aria-label={t('正在加载任务轨迹')}
         disabled
       >
@@ -38,7 +38,7 @@ export const TodoTraceLauncher = forwardRef<HTMLButtonElement, {
       <button
         ref={ref}
         type="button"
-        className="composer-auxiliary-control todo-trace-launcher is-error"
+        className="composer-auxiliary-control composer-trace-launcher todo-trace-launcher is-error"
         aria-label={t('重试任务轨迹')}
         onClick={onRetry}
       >
@@ -55,7 +55,7 @@ export const TodoTraceLauncher = forwardRef<HTMLButtonElement, {
     <button
       ref={ref}
       type="button"
-      className={`composer-auxiliary-control todo-trace-launcher${open ? ' is-selected' : ''}`}
+      className={`composer-auxiliary-control composer-trace-launcher todo-trace-launcher${open ? ' is-selected' : ''}`}
       aria-expanded={open}
       aria-controls="todo-trace-drawer"
       aria-label={t('任务轨迹 {count}', { count })}

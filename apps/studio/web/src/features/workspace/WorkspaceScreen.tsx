@@ -1,3 +1,4 @@
+import { Route } from 'lucide-react'
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 
 import type { AgentMode, ChatRequestPayload } from '../../api/conversation/types'
@@ -25,6 +26,7 @@ import { EmptyConversationBrand } from './components/EmptyConversation'
 import { WorkspaceDialogs } from './components/WorkspaceDialogs'
 import { WorkspaceHeader } from './components/WorkspaceHeader'
 import { WorkspaceStatus } from './components/WorkspaceStatus'
+import { ChainTraceErrorFallback } from './components/ChainTraceErrorFallback'
 import { ScrollToBottomButton } from './components/ScrollToBottomButton'
 import { SettingsDialog } from '../settings/SettingsDialog'
 import { useWorkspaceNavigation } from './useWorkspaceNavigation'
@@ -38,7 +40,9 @@ import { buildConversationDisplayEntries } from '../conversation/todoTrace/displ
 import { TodoTraceLauncher } from '../conversation/todoTrace/components/TodoTraceLauncher'
 import { TodoTraceDrawer } from '../conversation/todoTrace/components/TodoTraceDrawer'
 import { useTodoTraceDrawer } from '../conversation/todoTrace/useTodoTraceDrawer'
+import { ChainTraceView } from '../conversation/chainTrace/ChainTraceView'
 import '../conversation/conversation.css'
+import '../conversation/chainTrace/chainTrace.css'
 import '../conversation/todoTrace/todoTrace.css'
 import './workspace.css'
 import {
@@ -132,6 +136,9 @@ export function WorkspaceScreen({
   const [isModelPickerOpen, setModelPickerOpen] = useState(false)
   const [pendingResume, setPendingResume] = useState<PendingResume | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [workspaceView, setWorkspaceView] = useState<'conversation' | 'trace'>('conversation')
+  const [chainTraceHeaderTarget, setChainTraceHeaderTarget] = useState<HTMLDivElement | null>(null)
+  const chainTraceLauncherRef = useRef<HTMLButtonElement>(null)
   const settingsRestoreFocus = useRef<HTMLElement | null>(null)
   const theme = useThemePreference()
   const navigation = useWorkspaceNavigation()
@@ -254,7 +261,11 @@ export function WorkspaceScreen({
     resumeScrollToBottomFade,
     focusScrollToBottom,
     blurScrollToBottom,
-  } = useConversationScroll({ conversation, isRunning })
+  } = useConversationScroll({
+    conversation,
+    isRunning,
+    active: workspaceView === 'conversation',
+  })
   const isConversationHydrating = Boolean(
     workspace.currentThreadId
     && selectedConversation
@@ -300,7 +311,7 @@ export function WorkspaceScreen({
     const observer = new ResizeObserver(measure)
     observer.observe(composer)
     return () => observer.disconnect()
-  }, [syncConversationToBottomIfFollowing])
+  }, [syncConversationToBottomIfFollowing, workspaceView])
 
   // 当前会话变化时同步进 URL（草稿 currentThreadId==='' → 删除参数），覆盖点击选择、
   // 新建草稿、首条消息后后端回报 reportedThreadId、删除会话等全部来源
@@ -832,6 +843,31 @@ export function WorkspaceScreen({
       onRetry={() => retryTaskTrace(conversation.threadId)}
     />
   )
+  const returnToConversation = () => {
+    setWorkspaceView('conversation')
+    window.requestAnimationFrame(() => chainTraceLauncherRef.current?.focus())
+  }
+  const chainTraceLauncher = conversation.threadId ? (
+    <button
+      ref={chainTraceLauncherRef}
+      type="button"
+      className="composer-auxiliary-control composer-trace-launcher chain-trace-launcher"
+      aria-label={t('链路分析')}
+      onClick={() => {
+        taskDrawer.close(false)
+        setWorkspaceView('trace')
+      }}
+    >
+      <Route size={16} aria-hidden="true" />
+      <span>{t('链路分析')}</span>
+    </button>
+  ) : undefined
+  const conversationAuxiliaryActions = chainTraceLauncher || taskTraceLauncher ? (
+    <>
+      {chainTraceLauncher}
+      {taskTraceLauncher}
+    </>
+  ) : undefined
 
   return (
     <div
@@ -858,7 +894,10 @@ export function WorkspaceScreen({
         onToggleMode={navigation.toggleDesktopMode}
         onRequestExpanded={navigation.requestExpanded}
         onCloseOverlay={navigation.closeOverlay}
-        onNew={newConversation}
+        onNew={() => {
+          setWorkspaceView('conversation')
+          newConversation()
+        }}
         onSelect={selectConversation}
         onPin={pinConversation}
         pinPendingThreadIds={pinPendingThreadIds}
@@ -889,129 +928,158 @@ export function WorkspaceScreen({
           conversationTitle={conversation.title}
           overlayTriggerRef={navigation.overlayTriggerRef}
           onOpenOverlay={navigation.openOverlay}
+          actions={workspaceView === 'trace' ? (
+            <div
+              ref={setChainTraceHeaderTarget}
+              className="chain-trace-header-controls"
+              role="group"
+              aria-label={t('链路筛选')}
+            />
+          ) : undefined}
           backgroundInert={taskDrawer.modalActive}
         />
-        <ConversationViewport
-          conversation={conversation}
-          entries={messageWindow.visibleEntries}
-          hasEarlierMessages={messageWindow.hasEarlierMessages}
-          childToolsByRunId={childToolsByRunId}
-          paneRef={conversationPane}
-          messageEndRef={messageEnd}
-          historyStatus={historyBootstrapStatus}
-          isHistoryBootstrapped={isHistoryBootstrapped}
-          isInitialHistoryUnavailable={isInitialHistoryUnavailable}
-          isHydrating={isConversationHydrating}
-          isHydrationFailed={isConversationHydrationFailed}
-          isRunning={isRunning}
-          backgroundInert={taskDrawer.modalActive}
-          onScroll={handleConversationScroll}
-          onUserScrollIntent={markUserScrollIntent}
-          onRetryHistory={retryHistoryBootstrap}
-          onRetryHydration={() => void hydrateConversation(conversation.threadId)}
-          onLoadEarlierMessages={(trigger) => void messageWindow.loadEarlierMessages(trigger)}
-        />
-        <Composer
-          value={draft}
-          isRunning={isRunning}
-          canStop={Boolean(conversation.threadId)}
-          stopPending={cancelPendingRunId === conversation.activeRunId}
-          isHydrating={isConversationHydrating}
-          hero={showConversationHero ? <EmptyConversationBrand /> : undefined}
-          takeover={conversation.approval && !conversation.approval.submitted
-            ? (
-              <ApprovalCard
-                key={`${conversation.threadId}:${conversation.approval.items[0]?.interruptId ?? ''}`}
-                conversation={conversation}
-                onChange={(updater) => changeApproval(conversation.threadId, updater)}
-                onSubmit={submitApproval}
-              />
-            )
-            : conversation.planInteraction?.kind === 'questions'
-              && !conversation.planInteraction.submitted
-              ? (
-              <PlanQuestionComposer
-                threadId={conversation.threadId}
-                interaction={conversation.planInteraction}
-                onChange={(updater) => changePlanInteraction(
-                  conversation.threadId,
-                  (current) => current.kind === 'questions'
-                    ? updater(current as PlanQuestionState)
-                    : current,
-                )}
-                onSubmit={submitPlanInteraction}
-              />
-              )
-              : conversation.planInteraction?.kind === 'review'
-                && !conversation.planInteraction.submitted
+        {workspaceView === 'conversation' ? (
+          <>
+            <ConversationViewport
+              conversation={conversation}
+              entries={messageWindow.visibleEntries}
+              hasEarlierMessages={messageWindow.hasEarlierMessages}
+              childToolsByRunId={childToolsByRunId}
+              paneRef={conversationPane}
+              messageEndRef={messageEnd}
+              historyStatus={historyBootstrapStatus}
+              isHistoryBootstrapped={isHistoryBootstrapped}
+              isInitialHistoryUnavailable={isInitialHistoryUnavailable}
+              isHydrating={isConversationHydrating}
+              isHydrationFailed={isConversationHydrationFailed}
+              isRunning={isRunning}
+              backgroundInert={taskDrawer.modalActive}
+              onScroll={handleConversationScroll}
+              onUserScrollIntent={markUserScrollIntent}
+              onRetryHistory={retryHistoryBootstrap}
+              onRetryHydration={() => void hydrateConversation(conversation.threadId)}
+              onLoadEarlierMessages={(trigger) => void messageWindow.loadEarlierMessages(trigger)}
+            />
+            <Composer
+              value={draft}
+              isRunning={isRunning}
+              canStop={Boolean(conversation.threadId)}
+              stopPending={cancelPendingRunId === conversation.activeRunId}
+              isHydrating={isConversationHydrating}
+              hero={showConversationHero ? <EmptyConversationBrand /> : undefined}
+              takeover={conversation.approval && !conversation.approval.submitted
                 ? (
-                <PlanReviewCard
-                  key={`${conversation.threadId}:${conversation.planInteraction.interruptId}`}
-                  interaction={conversation.planInteraction}
-                  onChange={(updater) => changePlanInteraction(
-                    conversation.threadId,
-                    (current) => current.kind === 'review'
-                      ? updater(current as PlanReviewState)
-                      : current,
-                  )}
-                  onSubmit={(action) => submitPlanInteraction(action)}
-                  onCancel={() => submitPlanInteraction('cancel')}
-                />
+                  <ApprovalCard
+                    key={`${conversation.threadId}:${conversation.approval.items[0]?.interruptId ?? ''}`}
+                    conversation={conversation}
+                    onChange={(updater) => changeApproval(conversation.threadId, updater)}
+                    onSubmit={submitApproval}
+                  />
+                )
+                : conversation.planInteraction?.kind === 'questions'
+                  && !conversation.planInteraction.submitted
+                  ? (
+                    <PlanQuestionComposer
+                      threadId={conversation.threadId}
+                      interaction={conversation.planInteraction}
+                      onChange={(updater) => changePlanInteraction(
+                        conversation.threadId,
+                        (current) => current.kind === 'questions'
+                          ? updater(current as PlanQuestionState)
+                          : current,
+                      )}
+                      onSubmit={submitPlanInteraction}
+                    />
+                  )
+                  : conversation.planInteraction?.kind === 'review'
+                    && !conversation.planInteraction.submitted
+                    ? (
+                      <PlanReviewCard
+                        key={`${conversation.threadId}:${conversation.planInteraction.interruptId}`}
+                        interaction={conversation.planInteraction}
+                        onChange={(updater) => changePlanInteraction(
+                          conversation.threadId,
+                          (current) => current.kind === 'review'
+                            ? updater(current as PlanReviewState)
+                            : current,
+                        )}
+                        onSubmit={(action) => submitPlanInteraction(action)}
+                        onCancel={() => submitPlanInteraction('cancel')}
+                      />
+                    )
+                    : undefined}
+              scrollToBottomControl={!taskDrawer.modalActive
+                && (showScrollToBottom || !messageWindow.followsTail)
+                ? (
+                  <ScrollToBottomButton
+                    fading={fadeScrollToBottom}
+                    onPointerEnter={pauseScrollToBottomFade}
+                    onPointerLeave={resumeScrollToBottomFade}
+                    onFocus={focusScrollToBottom}
+                    onBlur={blurScrollToBottom}
+                    onClick={returnToLatestMessages}
+                  />
                 )
                 : undefined}
-          scrollToBottomControl={!taskDrawer.modalActive
-            && (showScrollToBottom || !messageWindow.followsTail)
-            ? (
-              <ScrollToBottomButton
-                fading={fadeScrollToBottom}
-                onPointerEnter={pauseScrollToBottomFade}
-                onPointerLeave={resumeScrollToBottomFade}
-                onFocus={focusScrollToBottom}
-                onBlur={blurScrollToBottom}
-                onClick={returnToLatestMessages}
-              />
-            )
-            : undefined}
-          taskTraceControl={taskDrawer.modalActive ? undefined : taskTraceLauncher}
-          backgroundInert={taskDrawer.modalActive}
-          modelControl={(
-            <ComposerModelPicker
-              model={conversation.model}
-              modelIds={modelIds}
-              defaultModelId={defaultModelId}
-              modelDisplayName={modelDisplayName}
-              status={modelCatalogStatus}
-              open={isModelPickerOpen}
-              onOpenChange={setModelPickerOpen}
-              onSelectModel={selectModel}
-              onRetry={retryModelCatalog}
+              taskTraceControl={taskDrawer.modalActive ? undefined : conversationAuxiliaryActions}
+              backgroundInert={taskDrawer.modalActive}
+              modelControl={(
+                <ComposerModelPicker
+                  model={conversation.model}
+                  modelIds={modelIds}
+                  defaultModelId={defaultModelId}
+                  modelDisplayName={modelDisplayName}
+                  status={modelCatalogStatus}
+                  open={isModelPickerOpen}
+                  onOpenChange={setModelPickerOpen}
+                  onSelectModel={selectModel}
+                  onRetry={retryModelCatalog}
+                />
+              )}
+              planActive={conversation.mode === 'plan'}
+              planLocked={isRunning}
+              attachments={localAttachments.attachments}
+              attachmentError={localAttachments.error}
+              disabledReason={isConversationHydrationFailed
+                ? t('会话加载失败，请先重试')
+                : modelCatalogStatus === 'loading'
+                  ? t('正在加载模型…')
+                  : modelCatalogStatus === 'error'
+                    ? t('模型加载失败，请先重试')
+                    : modelCatalogStatus === 'empty'
+                      ? t('未配置可用模型，请联系管理员或重试')
+                      : !isHistoryBootstrapped || historyBootstrapStatus === 'loading'
+                        ? t('正在加载历史会话…')
+                        : isInitialHistoryUnavailable
+                          ? t('历史会话加载失败，请先重试')
+                          : undefined}
+              onChange={setDraft}
+              onSend={send}
+              onStop={() => void stop()}
+              onExitPlan={exitPlanMode}
+              onAddAttachments={localAttachments.addFiles}
+              onRemoveAttachment={localAttachments.removeAttachment}
+              onScrollConversation={scrollConversationBy}
             />
-          )}
-          planActive={conversation.mode === 'plan'}
-          planLocked={isRunning}
-          attachments={localAttachments.attachments}
-          attachmentError={localAttachments.error}
-          disabledReason={isConversationHydrationFailed
-            ? t('会话加载失败，请先重试')
-            : modelCatalogStatus === 'loading'
-              ? t('正在加载模型…')
-              : modelCatalogStatus === 'error'
-                ? t('模型加载失败，请先重试')
-                : modelCatalogStatus === 'empty'
-                  ? t('未配置可用模型，请联系管理员或重试')
-                : !isHistoryBootstrapped || historyBootstrapStatus === 'loading'
-                  ? t('正在加载历史会话…')
-                  : isInitialHistoryUnavailable
-                    ? t('历史会话加载失败，请先重试')
-                    : undefined}
-          onChange={setDraft}
-          onSend={send}
-          onStop={() => void stop()}
-          onExitPlan={exitPlanMode}
-          onAddAttachments={localAttachments.addFiles}
-          onRemoveAttachment={localAttachments.removeAttachment}
-          onScrollConversation={scrollConversationBy}
-        />
+          </>
+        ) : (
+          <ErrorBoundary
+            resetKey={`${conversation.threadId || 'draft'}:chain-trace`}
+            fallback={({ reset }) => (
+              <ChainTraceErrorFallback
+                onReturn={returnToConversation}
+                onRetry={reset}
+              />
+            )}
+          >
+            <ChainTraceView
+              threadId={conversation.threadId}
+              active={workspaceView === 'trace'}
+              headerTarget={chainTraceHeaderTarget}
+              onReturnToConversation={returnToConversation}
+            />
+          </ErrorBoundary>
+        )}
       </main>
       {taskDrawer.modalActive && (
         <button

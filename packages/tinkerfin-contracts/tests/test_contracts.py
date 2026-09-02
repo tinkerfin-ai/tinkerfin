@@ -10,6 +10,9 @@ from pydantic import ValidationError
 
 from tinkerfin_contracts import (
     RUNTIME_OBSERVATION_ADAPTER,
+    AgentStepObservation,
+    ContextContributionObservation,
+    ModelCallObservation,
     NativeMessageObservation,
     NativeMessageRecord,
     NativeReasoningObservation,
@@ -21,6 +24,7 @@ from tinkerfin_contracts import (
     RunSourceContext,
     RuntimeObservation,
     RuntimeObserver,
+    ToolExecutionObservation,
 )
 
 
@@ -127,6 +131,119 @@ def test_reasoning_observation_is_explicit_and_strict() -> None:
                 "schema_version": 1,
             }
         )
+
+
+def test_agent_step_requires_real_middleware_and_failure_evidence() -> None:
+    now = datetime.now(UTC)
+    step = AgentStepObservation(
+        identity=_context().identity,
+        phase="started",
+        call_id="step-1",
+        parent_call_id="agent-1",
+        step_kind="middleware",
+        name="guardrail.before_model",
+        middleware_name="guardrail",
+        hook="before_model",
+        observed_at=now,
+        monotonic_ns=4,
+    )
+
+    restored = RUNTIME_OBSERVATION_ADAPTER.validate_python(
+        step.model_dump(mode="python", by_alias=True)
+    )
+    assert isinstance(restored, AgentStepObservation)
+    missing_hook = step.model_dump(mode="python")
+    missing_hook["hook"] = None
+    with pytest.raises(ValidationError, match="middleware name and hook"):
+        AgentStepObservation.model_validate(missing_hook)
+    with pytest.raises(ValidationError, match="require an error type"):
+        AgentStepObservation(
+            identity=_context().identity,
+            phase="failed",
+            call_id="step-1",
+            step_kind="model",
+            name="model",
+            observed_at=now,
+            monotonic_ns=5,
+        )
+    interrupted = AgentStepObservation(
+        identity=_context().identity,
+        phase="interrupted",
+        call_id="step-interrupted",
+        step_kind="model",
+        name="model",
+        observed_at=now,
+        monotonic_ns=6,
+    )
+    assert interrupted.error_type is None
+    with pytest.raises(ValidationError, match="non-failure"):
+        AgentStepObservation(
+            identity=_context().identity,
+            phase="cancelled",
+            call_id="step-cancelled",
+            step_kind="model",
+            name="model",
+            error_type="asyncio.exceptions.CancelledError",
+            observed_at=now,
+            monotonic_ns=7,
+        )
+
+
+def test_call_failure_origin_is_exclusive_to_failed_phases() -> None:
+    now = datetime.now(UTC)
+    failures = (
+        ModelCallObservation(
+            identity=_context().identity,
+            phase="failed",
+            call_id="model-call",
+            error_type="builtins.RuntimeError",
+            failure_origin=True,
+            observed_at=now,
+            monotonic_ns=8,
+        ),
+        ToolExecutionObservation(
+            identity=_context().identity,
+            phase="failed",
+            execution_id="tool-call",
+            tool_name="lookup",
+            error_type="builtins.RuntimeError",
+            failure_origin=True,
+            observed_at=now,
+            monotonic_ns=9,
+        ),
+        ContextContributionObservation(
+            identity=_context().identity,
+            phase="failed",
+            contribution_id="retrieval-call",
+            context_kind="retrieval",
+            name="lookup",
+            error_type="builtins.RuntimeError",
+            failure_origin=True,
+            observed_at=now,
+            monotonic_ns=10,
+        ),
+    )
+
+    for failure in failures:
+        restored = RUNTIME_OBSERVATION_ADAPTER.validate_python(
+            failure.model_dump(mode="python", by_alias=True)
+        )
+        assert isinstance(
+            restored,
+            (
+                ModelCallObservation,
+                ToolExecutionObservation,
+                ContextContributionObservation,
+            ),
+        )
+        assert restored.failure_origin is True
+        invalid = failure.model_dump(mode="python")
+        invalid["phase"] = "cancelled"
+        invalid["error_type"] = None
+        if "error_message" in invalid:
+            invalid["error_message"] = None
+        with pytest.raises(ValidationError, match="own a failure"):
+            type(failure).model_validate(invalid)
 
 
 def test_resume_and_run_input_contracts_reject_ambiguous_identity() -> None:

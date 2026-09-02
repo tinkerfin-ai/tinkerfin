@@ -118,6 +118,7 @@
     --layout-content-wide: 840px;
     --layout-conversation-width: 748px;
     --layout-composer-width: 780px;
+    --layout-feedback-card: 360px;
     --layout-composer-surface-height: 94px;
     --layout-interaction-card-min-height: clamp(260px, 32dvh, 320px);
     --layout-interaction-card-context-reserve: 120px;
@@ -128,6 +129,7 @@
     --layout-task-drawer: 348px;
     --layout-todo-trace-drawer: 400px;
     --layout-header-height: 60px;
+    --layout-drawer-header-height: calc(var(--layout-header-height) + var(--space-4));
     --layout-settings-dialog: 760px;
     --layout-settings-nav: 180px;
     --layout-settings-height: 540px;

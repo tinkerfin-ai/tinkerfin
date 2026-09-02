@@ -3,19 +3,28 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from collections.abc import AsyncGenerator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from typing import Literal
 from uuid import uuid4
 
 from tinkerfin_contracts import RunIdentity
 
+from ._entry_index import entry_mutations
 from ._prepared import PreparedTraceFact, prepare_trace_facts
 from .backend import (
     StoredTraceCheckpoint,
+    StoredTraceEntry,
+    StoredTraceEntryPage,
     StoredTraceEvent,
     StoredTraceEventPage,
     TraceCheckpointRequest,
+    TraceEntryMutation,
+    TraceEntryQueryRequest,
+    TraceEntryRebuildBackend,
+    TraceEntryRebuildRequest,
     TraceEventPageRequest,
     TraceLedgerBackend,
     TraceLedgerChange,
@@ -25,10 +34,12 @@ from .backend import (
     TraceLedgerStorageEffect,
     TraceLedgerThreadState,
     TraceLedgerWriterState,
+    TraceQueryBackend,
     TraceStoreOptions,
     resolve_ledger_change,
 )
 from .codec import CanonicalTracePayloadCodec
+from .entries import TraceEntryKind, TraceEntryStatus, TraceFacets, TraceFilter
 from .errors import (
     TraceStoreProtocolError,
     TraceThreadNotFound,
@@ -38,12 +49,51 @@ from .limits import TraceLimits
 from .store import (
     StoreThreadSnapshot,
     StoreWriterSnapshot,
+    TraceEntryRecord,
+    TraceEntryRecordPage,
     TraceProjectionCheckpoint,
     TraceThreadKey,
     TraceWriter,
     _checkpoint_lookup,
     _event,
 )
+
+
+async def _join_retained_task(task: asyncio.Task[None]) -> None:
+    """Wait for one retained lifecycle task across repeated caller cancellation."""
+
+    current = asyncio.current_task()
+    cancel_count = current.cancelling() if current is not None else 0
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as error:
+            next_count = current.cancelling() if current is not None else 0
+            if next_count > cancel_count or (cancellation is None and next_count > 0):
+                cancellation = cancellation or error
+                cancel_count = next_count
+                continue
+            if task.done():
+                break
+            raise
+        except BaseException:  # noqa: BLE001 - inspect the retained result below
+            break
+
+    task_error: BaseException | None = None
+    try:
+        task.result()
+    except BaseException as error:  # noqa: BLE001 - preserve exact task result
+        task_error = error
+    if cancellation is not None:
+        if task_error is not None:
+            cancellation.add_note(
+                "retained Trace lifecycle task also failed: "
+                f"{type(task_error).__module__}.{type(task_error).__qualname__}"
+            )
+        raise cancellation.with_traceback(cancellation.__traceback__)
+    if task_error is not None:
+        raise task_error.with_traceback(task_error.__traceback__)
 
 
 class _DurableTraceWriter:
@@ -154,7 +204,7 @@ class _DurableTraceWriter:
             )
             task.add_done_callback(_consume_task_exception)
             self._close_task = task
-        await asyncio.shield(task)
+        await _join_retained_task(task)
 
     async def _heartbeat_forever(self) -> None:
         try:
@@ -231,6 +281,16 @@ class DurableTraceStore:
         options: TraceStoreOptions | None = None,
         codec: CanonicalTracePayloadCodec | None = None,
     ) -> None:
+        """Initialize a Store over a borrowed durable Backend.
+
+        Args:
+            backend: Borrowed shared Ledger Backend.
+            namespace: Stable logical isolation key.
+            limits: Optional capacity limits.
+            options: Optional writer and retry settings.
+            codec: Optional canonical payload codec.
+        """
+
         if not isinstance(backend, TraceLedgerBackend):
             raise TypeError("backend must implement TraceLedgerBackend")
         if (
@@ -281,7 +341,7 @@ class DurableTraceStore:
         return self._backend
 
     async def setup(self) -> None:
-        """Prepare backend storage once while allowing retry after a failed attempt."""
+        """Prepare storage once and settle retained I/O before cancellation returns."""
 
         async with self._setup_lock:
             task = self._setup_task
@@ -299,7 +359,7 @@ class DurableTraceStore:
                 )
                 task.add_done_callback(_consume_task_exception)
                 self._setup_task = task
-        await asyncio.shield(task)
+        await _join_retained_task(task)
 
     async def open_writer(self, identity: RunIdentity) -> TraceWriter:
         """Open one exclusive backend-fenced writer for a semantic Run."""
@@ -417,6 +477,153 @@ class DurableTraceStore:
         if before_seq > page.tail_seq + 1:
             raise ValueError("before_seq exceeds the current Trace tail")
         return events
+
+    async def query_trace_entries(
+        self,
+        key: TraceThreadKey,
+        *,
+        run_ids: tuple[str, ...],
+        where: TraceFilter,
+        limit: int,
+        before_started_at: datetime | None = None,
+        before_entry_id: str | None = None,
+    ) -> TraceEntryRecordPage:
+        """Run one direct backend query and decode only referenced Ledger events."""
+
+        self._validate_key(key)
+        if not isinstance(where, TraceFilter):
+            raise TypeError("where must be a TraceFilter")
+        if limit < 1:
+            raise ValueError("entry page limit must be positive")
+        if (before_started_at is None) != (before_entry_id is None):
+            raise ValueError("entry cursor time and ID must be supplied together")
+        if before_started_at is not None and (
+            before_started_at.tzinfo is None
+            or before_started_at.utcoffset() != UTC.utcoffset(before_started_at)
+        ):
+            raise ValueError("entry cursor time must be aware UTC")
+        backend = self._backend
+        if not isinstance(backend, TraceQueryBackend):
+            raise TraceStoreProtocolError(
+                "Trace Store backend does not provide indexed entry queries"
+            )
+        await self.setup()
+        stored = await backend.query_trace_entries(
+            TraceEntryQueryRequest(
+                key=key,
+                run_ids=run_ids,
+                where=where,
+                limit=limit,
+                before_started_at=before_started_at,
+                before_entry_id=before_entry_id,
+            )
+        )
+        if stored.key != key:
+            raise TraceStoreProtocolError(
+                "Trace entry page belongs to another generation"
+            )
+        return TraceEntryRecordPage(
+            key=stored.key,
+            as_of_seq=stored.as_of_seq,
+            entries=tuple(
+                TraceEntryRecord(
+                    entry_id=item.entry_id,
+                    parent_id=item.parent_id,
+                    kind=item.kind,
+                    status=item.status,
+                    name=item.name,
+                    run_id=item.run_id,
+                    namespace=item.namespace,
+                    agent_name=item.agent_name,
+                    provider=item.provider,
+                    model=item.model,
+                    started_at=item.started_at,
+                    first_output_at=item.first_output_at,
+                    completed_at=item.completed_at,
+                    started_seq=item.started_seq,
+                    updated_seq=item.updated_seq,
+                    started_event=self._decode_entry_event(
+                        item.started_event,
+                        key=key,
+                        expected_seq=item.started_seq,
+                    ),
+                    updated_event=self._decode_entry_event(
+                        item.updated_event,
+                        key=key,
+                        expected_seq=item.updated_seq,
+                    ),
+                )
+                for item in stored.entries
+            ),
+            facets=stored.facets.model_copy(deep=True),
+            has_more=stored.has_more,
+            next_started_at=stored.next_started_at,
+            next_entry_id=stored.next_entry_id,
+            call_tracking_present=stored.call_tracking_present,
+        )
+
+    async def rebuild_trace_entries(self, key: TraceThreadKey) -> int:
+        """Reconstruct one disposable entry index from its authoritative Ledger.
+
+        Args:
+            key: Exact generation to read and rebuild.
+
+        Returns:
+            Number of reconstructed entry rows.
+
+        Raises:
+            TraceThreadNotFound: The exact generation is unavailable.
+            TraceStoreProtocolError: The Backend lacks reconstruction support, the
+                Ledger has a gap, or its tail changes during replacement.
+            TraceStoreError: A bounded Ledger read or atomic replacement fails.
+        """
+
+        self._validate_key(key)
+        backend = self._backend
+        if not isinstance(backend, TraceEntryRebuildBackend):
+            raise TraceStoreProtocolError(
+                "Trace Store backend does not rebuild indexed entries"
+            )
+        snapshot = await self.snapshot_key(key)
+        mutations: list[TraceEntryMutation] = []
+        after_seq = 0
+        while after_seq < snapshot.as_of_seq:
+            page = await self.read_events(
+                key,
+                after_seq=after_seq,
+                as_of_seq=snapshot.as_of_seq,
+                limit=self._limits.follow_batch_size,
+            )
+            if not page:
+                raise TraceStoreProtocolError(
+                    "Trace Ledger ended before the rebuild prefix"
+                )
+            mutations.extend(entry_mutations(page))
+            after_seq = page[-1].trace_seq
+        # Historical Ledgers can predate a semantic parent fact. Because this operation
+        # replaces the whole derived index, only parents rebuilt from the same fixed
+        # prefix can remain; unknown ancestry stays at the root instead of becoming an
+        # orphaned relationship.
+        rebuilt_entry_ids = {
+            mutation.entry_id
+            for mutation in mutations
+            if mutation.started_seq is not None
+        }
+        mutations = [
+            replace(mutation, parent_id=None)
+            if mutation.started_seq is not None
+            and mutation.parent_id is not None
+            and mutation.parent_id not in rebuilt_entry_ids
+            else mutation
+            for mutation in mutations
+        ]
+        return await backend.rebuild_trace_entries(
+            TraceEntryRebuildRequest(
+                key=key,
+                as_of_seq=snapshot.as_of_seq,
+                mutations=tuple(mutations),
+            )
+        )
 
     async def load_projection_checkpoint(
         self,
@@ -644,6 +851,19 @@ class DurableTraceStore:
             raise TraceStoreProtocolError("Trace event size metadata conflicts")
         return event
 
+    def _decode_entry_event(
+        self,
+        record: StoredTraceEvent,
+        *,
+        key: TraceThreadKey,
+        expected_seq: int,
+    ) -> TraceEvent:
+        if record.trace_seq != expected_seq:
+            raise TraceStoreProtocolError(
+                "Trace entry references a different Ledger sequence"
+            )
+        return self._decode_event(key, record)
+
     def _decode_checkpoint(
         self,
         stored: StoredTraceCheckpoint,
@@ -677,6 +897,25 @@ class DurableTraceStore:
 
 
 @dataclass(slots=True)
+class _MemoryTraceEntry:
+    entry_id: str
+    parent_id: str | None
+    kind: TraceEntryKind
+    status: TraceEntryStatus
+    name: str
+    run_id: str
+    namespace: tuple[str, ...]
+    agent_name: str | None
+    provider: str | None
+    model: str | None
+    started_at: datetime
+    first_output_at: datetime | None
+    completed_at: datetime | None
+    started_seq: int
+    updated_seq: int
+
+
+@dataclass(slots=True)
 class _MemoryThread:
     state: TraceLedgerThreadState
     writers: dict[str, TraceLedgerWriterState] = field(
@@ -684,6 +923,9 @@ class _MemoryThread:
     )
     events: list[_MemoryStoredTraceEvent] = field(
         default_factory=lambda: list[_MemoryStoredTraceEvent]()
+    )
+    entries: dict[str, _MemoryTraceEntry] = field(
+        default_factory=lambda: dict[str, _MemoryTraceEntry]()
     )
     checkpoints: dict[
         tuple[str, str | None],
@@ -779,6 +1021,111 @@ class _InMemoryTraceLedgerBackend:
                 tail_seq=tail,
                 events=records,
             )
+
+    async def query_trace_entries(
+        self,
+        request: TraceEntryQueryRequest,
+    ) -> StoredTraceEntryPage:
+        """Filter the process-local index without decoding Ledger payloads."""
+
+        async with self._condition:
+            thread = self._threads.get((request.key.namespace, request.key.thread_id))
+            if thread is None or thread.state.key != request.key:
+                raise TraceThreadNotFound("Trace generation does not exist")
+            tail = thread.state.next_seq - 1
+            run_ids = frozenset(request.run_ids)
+            candidates = [
+                row for row in thread.entries.values() if row.run_id in run_ids
+            ]
+            matching = [row for row in candidates if _entry_matches(row, request.where)]
+            matching.sort(
+                key=lambda row: (row.started_at, _entry_order_key(row.entry_id)),
+                reverse=True,
+            )
+            facets = _entry_facets(candidates, request.where)
+            if request.before_started_at is not None:
+                if request.before_entry_id is None:
+                    raise ValueError("entry cursor requires an entry ID")
+                cursor = (
+                    request.before_started_at,
+                    _entry_order_key(request.before_entry_id),
+                )
+                matching = [
+                    row
+                    for row in matching
+                    if (row.started_at, _entry_order_key(row.entry_id)) < cursor
+                ]
+            has_more = len(matching) > request.limit
+            selected = matching[: request.limit]
+            cursor_row = selected[-1] if has_more and selected else None
+            result_rows: dict[str, _MemoryTraceEntry] = {
+                row.entry_id: row for row in selected
+            }
+            if request.where.include_ancestors:
+                pending = [
+                    row.parent_id for row in selected if row.parent_id is not None
+                ]
+                while pending:
+                    entry_id = pending.pop()
+                    if entry_id in result_rows:
+                        continue
+                    parent = thread.entries.get(entry_id)
+                    if parent is None or parent.run_id not in run_ids:
+                        continue
+                    result_rows[entry_id] = parent
+                    if parent.parent_id is not None:
+                        pending.append(parent.parent_id)
+            tracked_runs = {
+                event.run_id
+                for event in thread.events
+                if event.fact_kind == "call.tracking"
+            }
+            return StoredTraceEntryPage(
+                key=request.key,
+                as_of_seq=tail,
+                entries=tuple(
+                    _stored_memory_entry(thread, row)
+                    for row in sorted(
+                        result_rows.values(),
+                        key=lambda item: (
+                            item.started_at,
+                            _entry_order_key(item.entry_id),
+                        ),
+                        reverse=True,
+                    )
+                ),
+                facets=facets,
+                has_more=has_more,
+                next_started_at=(None if cursor_row is None else cursor_row.started_at),
+                next_entry_id=None if cursor_row is None else cursor_row.entry_id,
+                call_tracking_present=bool(run_ids) and run_ids <= tracked_runs,
+            )
+
+    async def rebuild_trace_entries(
+        self,
+        request: TraceEntryRebuildRequest,
+    ) -> int:
+        """Atomically replace process-local derived entries at one exact tail."""
+
+        async with self._condition:
+            thread = self._threads.get((request.key.namespace, request.key.thread_id))
+            if thread is None or thread.state.key != request.key:
+                raise TraceThreadNotFound("Trace generation does not exist")
+            if thread.state.next_seq - 1 != request.as_of_seq:
+                raise TraceStoreProtocolError(
+                    "Trace Ledger changed while rebuilding entries"
+                )
+            rebuilt: dict[str, _MemoryTraceEntry] = {}
+            current = thread.entries
+            thread.entries = rebuilt
+            try:
+                for mutation in request.mutations:
+                    _apply_memory_entry(thread, mutation)
+            except BaseException:
+                thread.entries = current
+                raise
+            self._condition.notify_all()
+            return len(rebuilt)
 
     async def load_projection_checkpoint(
         self,
@@ -949,6 +1296,8 @@ class _InMemoryTraceLedgerBackend:
                     strict=True,
                 )
             )
+        for mutation in effect.entry_mutations:
+            _apply_memory_entry(thread, mutation)
         if effect.checkpoint is not None:
             thread.checkpoints.setdefault(
                 (effect.checkpoint.projection_name, effect.checkpoint.run_id),
@@ -965,6 +1314,13 @@ class InMemoryTraceStore(DurableTraceStore):
         namespace: str = "default",
         limits: TraceLimits | None = None,
     ) -> None:
+        """Initialize a bounded process-local Store.
+
+        Args:
+            namespace: Stable logical isolation key.
+            limits: Optional capacity limits.
+        """
+
         super().__init__(
             _InMemoryTraceLedgerBackend(),
             namespace=namespace,
@@ -988,6 +1344,245 @@ def _memory_stored_event(
         payload_digest=payload_digest,
         persisted_bytes=event.persisted_bytes,
         validated_event=event,
+    )
+
+
+def _apply_memory_entry(
+    thread: _MemoryThread,
+    mutation: TraceEntryMutation,
+) -> None:
+    row = thread.entries.get(mutation.entry_id)
+    if row is None:
+        kind = mutation.kind
+        status = mutation.status
+        name = mutation.name
+        run_id = mutation.run_id
+        namespace = mutation.namespace
+        started_at = mutation.started_at
+        started_seq = mutation.started_seq
+        if (
+            kind is None
+            or status is None
+            or name is None
+            or run_id is None
+            or namespace is None
+            or started_at is None
+            or started_seq is None
+        ):
+            return
+        row = _MemoryTraceEntry(
+            entry_id=mutation.entry_id,
+            parent_id=mutation.parent_id,
+            kind=kind,
+            status=status,
+            name=name,
+            run_id=run_id,
+            namespace=namespace,
+            agent_name=mutation.agent_name,
+            provider=mutation.provider,
+            model=mutation.model,
+            started_at=started_at,
+            first_output_at=mutation.first_output_at,
+            completed_at=mutation.completed_at,
+            started_seq=started_seq,
+            updated_seq=mutation.updated_seq,
+        )
+        thread.entries[mutation.entry_id] = row
+        return
+    if mutation.updated_seq < row.updated_seq:
+        raise TraceStoreProtocolError("Trace entry sequence moved backwards")
+    if mutation.kind is not None and mutation.kind != row.kind:
+        raise TraceStoreProtocolError("Trace entry kind changed")
+    if mutation.name is not None and mutation.name != row.name:
+        raise TraceStoreProtocolError("Trace entry name changed")
+    if mutation.run_id is not None and mutation.run_id != row.run_id:
+        raise TraceStoreProtocolError("Trace entry Run changed")
+    if mutation.namespace is not None and mutation.namespace != row.namespace:
+        raise TraceStoreProtocolError("Trace entry namespace changed")
+    if mutation.started_seq is not None:
+        if mutation.started_at is None:
+            row.started_seq = mutation.started_seq
+            row.updated_seq = mutation.updated_seq
+        return
+    if mutation.parent_id is not None:
+        if row.parent_id is not None and mutation.parent_id != row.parent_id:
+            raise TraceStoreProtocolError("Trace entry parent changed")
+        row.parent_id = mutation.parent_id
+    if mutation.status is not None:
+        row.status = mutation.status
+    if mutation.agent_name is not None:
+        row.agent_name = mutation.agent_name
+    if mutation.provider is not None:
+        row.provider = mutation.provider
+    if mutation.model is not None:
+        row.model = mutation.model
+    if mutation.first_output_at is not None:
+        row.first_output_at = mutation.first_output_at
+    if mutation.completed_at is not None:
+        row.completed_at = mutation.completed_at
+    row.updated_seq = mutation.updated_seq
+
+
+def _entry_matches(
+    row: _MemoryTraceEntry,
+    where: TraceFilter,
+    *,
+    exclude: Literal[
+        "kinds",
+        "statuses",
+        "agent_names",
+        "middleware_names",
+        "skill_names",
+        "providers",
+        "models",
+    ]
+    | None = None,
+) -> bool:
+    return not (
+        (where.kinds and exclude != "kinds" and row.kind not in where.kinds)
+        or (
+            where.statuses
+            and exclude != "statuses"
+            and row.status not in where.statuses
+        )
+        or (where.parent_id is not None and row.parent_id != where.parent_id)
+        or (
+            where.agent_names
+            and exclude != "agent_names"
+            and row.agent_name not in where.agent_names
+        )
+        or (
+            where.middleware_names
+            and exclude != "middleware_names"
+            and (
+                row.kind is not TraceEntryKind.MIDDLEWARE
+                or row.name not in where.middleware_names
+            )
+        )
+        or (
+            where.skill_names
+            and exclude != "skill_names"
+            and (
+                row.kind is not TraceEntryKind.SKILL
+                or row.name not in where.skill_names
+            )
+        )
+        or (
+            where.providers
+            and exclude != "providers"
+            and row.provider not in where.providers
+        )
+        or (where.models and exclude != "models" and row.model not in where.models)
+        or (where.namespaces and row.namespace not in where.namespaces)
+        or (
+            where.search is not None
+            and not any(
+                where.search.lower() in value.lower()
+                for value in (
+                    row.name,
+                    row.agent_name,
+                    row.provider,
+                    row.model,
+                )
+                if value is not None
+            )
+        )
+        or (where.started_after is not None and row.started_at <= where.started_after)
+        or (where.started_before is not None and row.started_at >= where.started_before)
+    )
+
+
+def _entry_facets(
+    rows: list[_MemoryTraceEntry],
+    where: TraceFilter,
+) -> TraceFacets:
+    kinds: dict[TraceEntryKind, int] = {}
+    statuses: dict[TraceEntryStatus, int] = {}
+    agents: dict[str, int] = {}
+    middleware: dict[str, int] = {}
+    skills: dict[str, int] = {}
+    providers: dict[str, int] = {}
+    models: dict[str, int] = {}
+    for row in rows:
+        if _entry_matches(row, where, exclude="kinds"):
+            kinds[row.kind] = kinds.get(row.kind, 0) + 1
+        if _entry_matches(row, where, exclude="statuses"):
+            statuses[row.status] = statuses.get(row.status, 0) + 1
+        if row.agent_name is not None and _entry_matches(
+            row, where, exclude="agent_names"
+        ):
+            agents[row.agent_name] = agents.get(row.agent_name, 0) + 1
+        if row.kind is TraceEntryKind.MIDDLEWARE and _entry_matches(
+            row,
+            where,
+            exclude="middleware_names",
+        ):
+            middleware[row.name] = middleware.get(row.name, 0) + 1
+        if row.kind is TraceEntryKind.SKILL and _entry_matches(
+            row,
+            where,
+            exclude="skill_names",
+        ):
+            skills[row.name] = skills.get(row.name, 0) + 1
+        if row.provider is not None and _entry_matches(
+            row,
+            where,
+            exclude="providers",
+        ):
+            providers[row.provider] = providers.get(row.provider, 0) + 1
+        if row.model is not None and _entry_matches(
+            row,
+            where,
+            exclude="models",
+        ):
+            models[row.model] = models.get(row.model, 0) + 1
+    return TraceFacets(
+        kinds=kinds,
+        statuses=statuses,
+        agents=agents,
+        middleware=middleware,
+        skills=skills,
+        providers=providers,
+        models=models,
+    )
+
+
+def _entry_order_key(entry_id: str) -> str:
+    """Match the collision-checked SQL ordering for equal entry timestamps."""
+
+    return hashlib.sha256(entry_id.encode("utf-8")).hexdigest()
+
+
+def _stored_memory_entry(
+    thread: _MemoryThread,
+    row: _MemoryTraceEntry,
+) -> StoredTraceEntry:
+    try:
+        started_event = thread.events[row.started_seq - 1]
+        updated_event = thread.events[row.updated_seq - 1]
+    except IndexError as error:
+        raise TraceStoreProtocolError(
+            "Trace entry references an unavailable Ledger event",
+            cause=error,
+        ) from error
+    return StoredTraceEntry(
+        entry_id=row.entry_id,
+        parent_id=row.parent_id,
+        kind=row.kind,
+        status=row.status,
+        name=row.name,
+        run_id=row.run_id,
+        namespace=row.namespace,
+        agent_name=row.agent_name,
+        provider=row.provider,
+        model=row.model,
+        started_at=row.started_at,
+        first_output_at=row.first_output_at,
+        completed_at=row.completed_at,
+        started_seq=row.started_seq,
+        updated_seq=row.updated_seq,
+        started_event=started_event,
+        updated_event=updated_event,
     )
 
 

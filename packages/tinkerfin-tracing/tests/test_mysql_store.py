@@ -3,27 +3,35 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
+import logging
 import os
 import sys
+import warnings
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Literal, cast
 from uuid import uuid4
 
 import pytest
 from asyncmy.errors import OperationalError
 from sqlalchemy import inspect, text
 from sqlalchemy.engine import make_url
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import DBAPIError, SAWarning
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
+from sqlalchemy.pool import AsyncAdaptedQueuePool
 
 from tinkerfin_contracts import RunIdentity
 from tinkerfin_tracing import (
     CapturedValue,
+    CapturePolicy,
     MessageFact,
+    ModelCallFact,
     RunFact,
+    TraceEntryKind,
+    TraceFilter,
     TraceLimits,
     TraceProjectionCheckpoint,
     Tracer,
@@ -42,6 +50,221 @@ from tinkerfin_tracing.sql_store import (
 )
 
 pytestmark = pytest.mark.docker_integration
+
+
+async def test_mysql_cancelled_reads_return_pool_capacity(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    engine = create_async_engine(_url(), pool_size=1, max_overflow=0)
+    blocker_engine = create_async_engine(_url(), pool_size=1, max_overflow=0)
+    store = SqlAlchemyTraceStore(
+        engine,
+        namespace=f"mysql-cancelled-read-{uuid4().hex}",
+    )
+    writer = await store.open_writer(_identity("cancelled-read"))
+    try:
+        await writer.append((_fact("cancelled-read", "started"),))
+        snapshot = await store.snapshot(_identity("cancelled-read").thread_id)
+        blocker = await blocker_engine.connect()
+        try:
+            await blocker.exec_driver_sql("LOCK TABLES tinkerfin_trace_entries WRITE")
+            caplog.clear()
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                query = asyncio.create_task(
+                    store.query_trace_entries(
+                        snapshot.key,
+                        run_ids=("cancelled-read",),
+                        where=TraceFilter(),
+                        limit=10,
+                    )
+                )
+                await asyncio.sleep(0.05)
+                assert not query.done()
+                for attempt in range(8):
+                    if query.done():
+                        break
+                    query.cancel(f"cancelled read {attempt + 1}")
+                    await asyncio.sleep(0)
+                with pytest.raises(asyncio.CancelledError) as captured:
+                    await query
+                assert captured.value.args == ("cancelled read 1",)
+
+                pool = cast(AsyncAdaptedQueuePool, engine.sync_engine.pool)
+                assert pool.checkedout() == 0
+                gc.collect()
+                await asyncio.sleep(0)
+            assert not [item for item in caught if issubclass(item.category, SAWarning)]
+            assert not [
+                record
+                for record in caplog.records
+                if record.name.startswith("sqlalchemy.pool")
+                and record.levelno >= logging.ERROR
+            ]
+        finally:
+            await blocker.exec_driver_sql("UNLOCK TABLES")
+            await blocker.close()
+
+        assert (await store.snapshot(snapshot.key.thread_id)).key == snapshot.key
+    finally:
+        await writer.aclose()
+        await blocker_engine.dispose()
+        await engine.dispose()
+
+
+async def test_mysql_cancelled_writes_preserve_data_and_return_pool_capacity(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    engine = create_async_engine(_url(), pool_size=1, max_overflow=0)
+    blocker_engine = create_async_engine(_url(), pool_size=1, max_overflow=0)
+    store = SqlAlchemyTraceStore(
+        engine,
+        namespace=f"mysql-cancelled-write-{uuid4().hex}",
+    )
+    writer = await store.open_writer(_identity("cancelled-write"))
+    try:
+        await writer.append((_fact("cancelled-write", "started"),))
+        await writer.append(
+            (
+                _fact("cancelled-write", "terminal"),
+                _fact("cancelled-write", "closed"),
+            ),
+            mandatory=True,
+        )
+        await writer.aclose()
+        snapshot = await store.snapshot(_identity("cancelled-write").thread_id)
+        blocker = await blocker_engine.connect()
+        try:
+            await blocker.exec_driver_sql("LOCK TABLES tinkerfin_trace_threads WRITE")
+            caplog.clear()
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                deletion = asyncio.create_task(store.delete(snapshot.key))
+                await asyncio.sleep(0.05)
+                assert not deletion.done()
+                for attempt in range(8):
+                    if deletion.done():
+                        break
+                    deletion.cancel(f"cancelled write {attempt + 1}")
+                    await asyncio.sleep(0)
+                with pytest.raises(asyncio.CancelledError) as captured:
+                    await deletion
+                assert captured.value.args == ("cancelled write 1",)
+
+                pool = cast(AsyncAdaptedQueuePool, engine.sync_engine.pool)
+                assert pool.checkedout() == 0
+                gc.collect()
+                await asyncio.sleep(0)
+            assert not [item for item in caught if issubclass(item.category, SAWarning)]
+            assert not [
+                record
+                for record in caplog.records
+                if record.name.startswith("sqlalchemy.pool")
+                and record.levelno >= logging.ERROR
+            ]
+        finally:
+            await blocker.exec_driver_sql("UNLOCK TABLES")
+            await blocker.close()
+
+        assert (await store.snapshot(snapshot.key.thread_id)).key == snapshot.key
+    finally:
+        await writer.aclose()
+        await blocker_engine.dispose()
+        await engine.dispose()
+
+
+async def test_mysql_entry_query_filters_and_joins_ledger_details() -> None:
+    engine = create_async_engine(_url(), pool_pre_ping=True)
+    namespace = f"mysql-entry-query-{uuid4().hex}"
+    store = SqlAlchemyTraceStore(engine, namespace=namespace)
+    writer = await store.open_writer(_identity("entry-query"))
+    marker = "mysql-final-request"
+    now = datetime.now(UTC)
+    try:
+        await writer.append(
+            (
+                _fact("entry-query", "started"),
+                ModelCallFact(
+                    source_observation_id="mysql-model-start",
+                    identity=_identity("entry-query"),
+                    occurred_at=now,
+                    monotonic_ns=2,
+                    phase="started",
+                    call_id="mysql-model-call",
+                    provider="deepseek",
+                    model="deepseek-chat",
+                    request=CapturePolicy.public_history().capture(
+                        {"messages": [{"content": marker}]},
+                        max_bytes=4096,
+                    ),
+                ),
+                ModelCallFact(
+                    source_observation_id="mysql-model-completed",
+                    identity=_identity("entry-query"),
+                    occurred_at=now,
+                    monotonic_ns=3,
+                    phase="completed",
+                    call_id="mysql-model-call",
+                ),
+            )
+        )
+        snapshot = await store.snapshot(_identity("entry-query").thread_id)
+        page = await store.query_trace_entries(
+            snapshot.key,
+            run_ids=("entry-query",),
+            where=TraceFilter(
+                kinds={TraceEntryKind.PROVIDER},
+                providers={"deepseek"},
+                search="deepseek-chat",
+            ),
+            limit=10,
+        )
+
+        assert len(page.entries) == 1
+        start_fact = page.entries[0].started_event.fact
+        assert isinstance(start_fact, ModelCallFact)
+        assert start_fact.request is not None
+        assert start_fact.request.value == {"messages": [{"content": marker}]}
+        literal_wildcard = await store.query_trace_entries(
+            snapshot.key,
+            run_ids=("entry-query",),
+            where=TraceFilter(
+                kinds={TraceEntryKind.PROVIDER},
+                search="%",
+            ),
+            limit=10,
+        )
+        assert literal_wildcard.entries == ()
+        async with engine.connect() as connection:
+            plan = (
+                (
+                    await connection.execute(
+                        text(
+                            "EXPLAIN SELECT entry_id FROM tinkerfin_trace_entries "
+                            "WHERE namespace_hash = SHA2(:namespace, 256) "
+                            "AND thread_hash = SHA2(:thread_id, 256) "
+                            "AND generation = :generation "
+                            "AND run_hash = SHA2(:run_id, 256) "
+                            "AND kind = 'model'"
+                        ),
+                        {
+                            "namespace": namespace,
+                            "thread_id": snapshot.key.thread_id,
+                            "generation": snapshot.key.generation,
+                            "run_id": "entry-query",
+                        },
+                    )
+                )
+                .mappings()
+                .one()
+            )
+        assert plan["key"] in {
+            "ix_tinkerfin_trace_entries_run",
+            "ix_tinkerfin_trace_entries_kind_status",
+        }
+    finally:
+        await writer.aclose()
+        await engine.dispose()
 
 
 def _backend(store: SqlAlchemyTraceStore) -> _SqlAlchemyTraceLedgerBackend:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from typing import cast
 
 import pytest
@@ -335,23 +335,27 @@ async def test_native_sse_timeout_covers_mapper_and_closes_upstream(
     definition_factory: Callable[..., DeepAgentDefinition[None]],
 ) -> None:
     parts = _CountingParts()
+    mapper_started = asyncio.Event()
 
     async def mapper(_part: NativeStreamPart) -> SsePayload:
-        await asyncio.sleep(0.05)
-        return SsePayload(data="too late")
+        mapper_started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
 
     body = (
         definition_factory(_SourceGraph(lambda: parts))
         .new(identity=_identity())
         .astream(_graph_input())
         .to_sse(
-            timeout=0.001,
+            timeout=1.0,
             mapper=mapper,
         )
     )
 
+    pull = asyncio.create_task(anext(body))
+    await asyncio.wait_for(mapper_started.wait(), timeout=2.0)
     with pytest.raises(TimeoutError, match="native SSE stream timed out"):
-        await anext(body)
+        await pull
 
     assert parts.closed.is_set()
 
@@ -378,6 +382,114 @@ async def test_external_sse_close_cancels_an_active_pull_and_is_idempotent(
     ].__class__ is asyncio.CancelledError
     assert parts.closed.is_set()
     assert parts.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_sse_body_repeated_cancellation_waits_for_source_cleanup() -> None:
+    started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    closed = asyncio.Event()
+
+    async def source() -> AsyncGenerator[str, None]:
+        try:
+            started.set()
+            await asyncio.Future()
+            yield "unreachable"
+        finally:
+            cleanup_started.set()
+            await release_cleanup.wait()
+            closed.set()
+
+    iterator = source()
+    body = SseBody(source_factory=lambda: iterator, close=iterator.aclose)
+    pull = asyncio.create_task(anext(body))
+    await started.wait()
+
+    pull.cancel("first cancellation")
+    await cleanup_started.wait()
+    pull.cancel("repeated cancellation")
+    await asyncio.sleep(0)
+    try:
+        assert not pull.done()
+    finally:
+        release_cleanup.set()
+
+    with pytest.raises(asyncio.CancelledError) as captured:
+        await pull
+    assert captured.value.args == ("first cancellation",)
+    assert closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_sse_body_factory_failure_closes_and_terminates_the_body() -> None:
+    close_calls = 0
+
+    def source_factory() -> AsyncIterator[str]:
+        raise LookupError("factory failed")
+
+    async def close() -> None:
+        nonlocal close_calls
+        close_calls += 1
+
+    body = SseBody(source_factory=source_factory, close=close)
+
+    with pytest.raises(LookupError, match="factory failed"):
+        await anext(body)
+
+    assert close_calls == 1
+    with pytest.raises(StopAsyncIteration):
+        await anext(body)
+    assert close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_sse_body_factory_failure_keeps_an_ordinary_close_failure_secondary() -> (
+    None
+):
+    def source_factory() -> AsyncIterator[str]:
+        raise LookupError("factory failed")
+
+    async def close() -> None:
+        raise ValueError("close failed")
+
+    body = SseBody(source_factory=source_factory, close=close)
+
+    with pytest.raises(LookupError, match="factory failed") as captured:
+        await anext(body)
+
+    assert any("ValueError: close failed" in note for note in captured.value.__notes__)
+
+
+@pytest.mark.asyncio
+async def test_sse_body_does_not_hide_cancellation_during_failure_cleanup() -> None:
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+
+    def source_factory() -> AsyncIterator[str]:
+        raise LookupError("factory failed")
+
+    async def close() -> None:
+        close_started.set()
+        await release_close.wait()
+
+    body = SseBody(source_factory=source_factory, close=close)
+    owner = asyncio.create_task(anext(body))
+    await close_started.wait()
+
+    owner.cancel("caller cancelled")
+    await asyncio.sleep(0)
+    try:
+        assert not owner.done()
+    finally:
+        release_close.set()
+
+    with pytest.raises(asyncio.CancelledError) as captured:
+        await owner
+    assert captured.value.args == ("caller cancelled",)
+    assert isinstance(captured.value.__cause__, LookupError)
+    with pytest.raises(StopAsyncIteration):
+        await anext(body)
 
 
 @pytest.mark.asyncio

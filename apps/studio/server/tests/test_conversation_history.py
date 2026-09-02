@@ -10,6 +10,7 @@ from starlette.types import Message as AsgiMessage
 from starlette.types import Scope
 
 from tinkerfin_contracts import (
+    ModelCallObservation,
     NativeInterruptRecord,
     NativeMessageObservation,
     NativeMessageRecord,
@@ -37,7 +38,14 @@ from tinkerfin_studio.conversation.todo_groups import (
     TodoGroupProjector,
     TodoGroupQueryExecutor,
 )
-from tinkerfin_tracing import TraceCompleteness, Tracer, TraceStatus, TraceThread
+from tinkerfin_tracing import (
+    TraceCompleteness,
+    TraceEntryKind,
+    TraceFilter,
+    Tracer,
+    TraceStatus,
+    TraceThread,
+)
 
 
 def _service(
@@ -224,6 +232,159 @@ async def test_history_reads_fixed_trace_view_without_agui_event_tail(
     assert "events" not in payload
 
 
+async def test_trace_entry_query_returns_the_final_model_request(session) -> None:
+    tracer = Tracer()
+    repository = ConversationRepository(session)
+    thread = await _register(
+        repository,
+        user_id=1,
+        thread_id="thread-entry-history",
+        run_id="run-entry-history",
+    )
+    context, trace_session = await _open_trace(
+        tracer,
+        thread_id=thread.thread_id,
+        run_id="run-entry-history",
+    )
+    now = datetime.now(UTC)
+    await trace_session.observe(
+        ModelCallObservation(
+            identity=context.identity,
+            phase="started",
+            call_id="model-entry",
+            provider="openai",
+            model="gpt-test",
+            messages=(
+                NativeMessageRecord(message_type="system", content="final-system"),
+                NativeMessageRecord(message_type="human", content="final-user"),
+            ),
+            invocation={"model": "gpt-test"},
+            options={"temperature": 0.2},
+            observed_at=now,
+            monotonic_ns=3,
+        )
+    )
+    await trace_session.observe(
+        ModelCallObservation(
+            identity=context.identity,
+            phase="completed",
+            call_id="model-entry",
+            usage={"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+            observed_at=now,
+            monotonic_ns=4,
+        )
+    )
+    await _finish_trace(context, trace_session)
+
+    page = await _service(repository, tracer=tracer).query_trace_entries(
+        thread.thread_id,
+        where=TraceFilter(kinds={TraceEntryKind.PROVIDER}),
+        cursor=None,
+        limit=100,
+    )
+
+    assert len(page.items) == 1
+    assert len(page.turns) == 1
+    assert page.turns[0].ordinal == 1
+    assert page.turns[0].user_message is not None
+    assert page.turns[0].user_message.content == "request run-entry-history"
+    assert page.items[0].turn_id == page.turns[0].id
+    assert page.items[0].request == {
+        "messages": [
+            {
+                "messageType": "system",
+                "id": None,
+                "name": None,
+                "content": "final-system",
+                "toolCalls": [],
+                "toolCallChunks": [],
+                "toolCallId": None,
+                "toolStatus": None,
+                "responseMetadata": {},
+                "usageMetadata": None,
+            },
+            {
+                "messageType": "human",
+                "id": None,
+                "name": None,
+                "content": "final-user",
+                "toolCalls": [],
+                "toolCallChunks": [],
+                "toolCallId": None,
+                "toolStatus": None,
+                "responseMetadata": {},
+                "usageMetadata": None,
+            },
+        ],
+        "invocation": {"model": "gpt-test"},
+        "options": {"temperature": 0.2},
+    }
+    assert page.items[0].usage == {
+        "input_tokens": 2,
+        "output_tokens": 1,
+        "total_tokens": 3,
+    }
+    with pytest.raises(BusinessException) as invalid_cursor:
+        await _service(repository, tracer=tracer).query_trace_entries(
+            thread.thread_id,
+            where=TraceFilter(),
+            cursor="not-a-trace-entry-cursor",
+            limit=100,
+        )
+    assert invalid_cursor.value.error_code is ConversationErrorCode.INVALID_CURSOR
+
+
+async def test_trace_entry_follow_sends_snapshot_update_and_closes(session) -> None:
+    tracer = Tracer()
+    repository = ConversationRepository(session)
+    thread = await _register(
+        repository,
+        user_id=1,
+        thread_id="thread-entry-follow",
+        run_id="run-entry-follow",
+    )
+    context, trace_session = await _open_trace(
+        tracer,
+        thread_id=thread.thread_id,
+        run_id="run-entry-follow",
+    )
+    events = await _service(repository, tracer=tracer).follow_trace_entries(
+        thread.thread_id,
+        where=TraceFilter(kinds={TraceEntryKind.PROVIDER}),
+        limit=100,
+    )
+
+    snapshot = await anext(events)
+    assert snapshot.type == "snapshot"
+    assert snapshot.snapshot.items == ()
+    assert snapshot.snapshot.turns == ()
+    assert session.in_transaction() is False
+    pending = asyncio.create_task(anext(events))
+    await trace_session.observe(
+        ModelCallObservation(
+            identity=context.identity,
+            phase="started",
+            call_id="model-entry-follow",
+            messages=(NativeMessageRecord(message_type="human", content="follow"),),
+            observed_at=datetime.now(UTC),
+            monotonic_ns=3,
+        )
+    )
+
+    update = await asyncio.wait_for(pending, timeout=2)
+    assert update.type == "update"
+    assert [(item.kind, item.status) for item in update.update.upserts] == [
+        (TraceEntryKind.PROVIDER, "running")
+    ]
+    assert len(update.update.turn_upserts) == 1
+    assert update.update.turn_upserts[0].user_message is not None
+    assert (
+        update.update.turn_upserts[0].user_message.content == "request run-entry-follow"
+    )
+    await events.aclose()
+    await _finish_trace(context, trace_session)
+
+
 async def test_history_cursor_keeps_original_as_of_after_new_turn(session) -> None:
     tracer = Tracer()
     repository = ConversationRepository(session)
@@ -345,6 +506,14 @@ async def test_history_rejects_another_users_thread_before_trace_lookup(
         await service.get_detail("thread-private")
 
     assert captured.value.error_code is ConversationErrorCode.NOT_FOUND
+    with pytest.raises(BusinessException) as entry_error:
+        await service.query_trace_entries(
+            "thread-private",
+            where=TraceFilter(),
+            cursor=None,
+            limit=100,
+        )
+    assert entry_error.value.error_code is ConversationErrorCode.NOT_FOUND
 
 
 async def test_trace_follow_sends_snapshot_then_semantic_update_and_closes(

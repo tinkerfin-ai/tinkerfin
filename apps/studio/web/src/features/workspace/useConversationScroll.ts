@@ -16,20 +16,38 @@ const conversationScrollKey = (threadId: string) => `${CONVERSATION_SCROLL_KEY_P
 
 type ScrollButtonPhase = 'hidden' | 'visible' | 'fading'
 
-const readConversationScrollTop = (threadId: string): number | null => {
+type ConversationScrollState = {
+  scrollTop: number
+  followLatest: boolean
+}
+
+const readConversationScroll = (threadId: string): ConversationScrollState | null => {
   try {
     const storedValue = window.sessionStorage.getItem(conversationScrollKey(threadId))
     if (storedValue == null) return null
-    const value = Number(storedValue)
-    return Number.isFinite(value) && value >= 0 ? value : null
+    const value: unknown = JSON.parse(storedValue)
+    if (value == null || typeof value !== 'object' || Array.isArray(value)) return null
+    const state = value as Record<string, unknown>
+    return Number.isFinite(state.scrollTop)
+      && typeof state.scrollTop === 'number'
+      && state.scrollTop >= 0
+      && typeof state.followLatest === 'boolean'
+      ? { scrollTop: state.scrollTop, followLatest: state.followLatest }
+      : null
   } catch {
     return null
   }
 }
 
-const writeConversationScrollTop = (threadId: string, scrollTop: number): void => {
+const writeConversationScroll = (
+  threadId: string,
+  state: ConversationScrollState,
+): void => {
   try {
-    window.sessionStorage.setItem(conversationScrollKey(threadId), String(Math.max(0, scrollTop)))
+    window.sessionStorage.setItem(conversationScrollKey(threadId), JSON.stringify({
+      scrollTop: Math.max(0, state.scrollTop),
+      followLatest: state.followLatest,
+    }))
   } catch {
     // 浏览器禁用会话存储时保留原有滚动行为
   }
@@ -38,9 +56,11 @@ const writeConversationScrollTop = (threadId: string, scrollTop: number): void =
 export function useConversationScroll({
   conversation,
   isRunning,
+  active = true,
 }: {
   conversation: Conversation
   isRunning: boolean
+  active?: boolean
 }) {
   const [showScrollToBottom, setShowScrollToBottom] = useState(false)
   const [fadeScrollToBottom, setFadeScrollToBottom] = useState(false)
@@ -54,7 +74,7 @@ export function useConversationScroll({
   const scrollPersistenceFrame = useRef<number | null>(null)
   const pendingScrollPersistence = useRef<{
     threadId: string
-    scrollTop: number
+    state: ConversationScrollState
   } | null>(null)
   const scrollButtonFadeTimeout = useRef<number | null>(null)
   const scrollButtonHideTimeout = useRef<number | null>(null)
@@ -63,8 +83,12 @@ export function useConversationScroll({
   const scrollButtonPhase = useRef<ScrollButtonPhase>('hidden')
   const pendingUserScrollIntent = useRef(false)
   const userHasScrolled = useRef(false)
-  const pendingConversationScroll = useRef<{ threadId: string; scrollTop: number | null } | null>(null)
+  const pendingConversationScroll = useRef<{
+    threadId: string
+    state: ConversationScrollState | null
+  } | null>(null)
   const lastForcedApprovalIdentity = useRef<string | null>(null)
+  const previousActive = useRef(active)
   const pendingApprovalKey = conversation.approval && !conversation.approval.submitted
     ? conversation.approval.items.map((item) => item.interruptId).join('\u0000')
     : null
@@ -89,7 +113,7 @@ export function useConversationScroll({
   const commitPendingScrollPersistence = useCallback(() => {
     const pending = pendingScrollPersistence.current
     pendingScrollPersistence.current = null
-    if (pending) writeConversationScrollTop(pending.threadId, pending.scrollTop)
+    if (pending) writeConversationScroll(pending.threadId, pending.state)
   }, [])
 
   const flushScrollPersistence = useCallback(() => {
@@ -100,8 +124,11 @@ export function useConversationScroll({
     commitPendingScrollPersistence()
   }, [commitPendingScrollPersistence])
 
-  const scheduleScrollPersistence = useCallback((threadId: string, scrollTop: number) => {
-    pendingScrollPersistence.current = { threadId, scrollTop }
+  const scheduleScrollPersistence = useCallback((
+    threadId: string,
+    state: ConversationScrollState,
+  ) => {
+    pendingScrollPersistence.current = { threadId, state }
     if (scrollPersistenceFrame.current != null) return
     scrollPersistenceFrame.current = window.requestAnimationFrame(() => {
       scrollPersistenceFrame.current = null
@@ -120,20 +147,30 @@ export function useConversationScroll({
   }, [clearScrollButtonTimers, setScrollButtonPhase])
 
   const handleScroll = useCallback((pane: HTMLElement) => {
-    if (conversation.threadId) {
-      scheduleScrollPersistence(conversation.threadId, pane.scrollTop)
-    }
     if (followScrollFrame.current != null) {
       window.cancelAnimationFrame(followScrollFrame.current)
       followScrollFrame.current = null
     }
+    const isNearBottom = pane.scrollHeight - pane.scrollTop - pane.clientHeight <= 96
+    if (pendingUserScrollIntent.current) {
+      pendingUserScrollIntent.current = false
+      userHasScrolled.current = !isNearBottom
+      followLatest.current = isNearBottom
+    }
+    if (isNearBottom) {
+      followLatest.current = true
+      scrollingToBottom.current = false
+      userHasScrolled.current = false
+    }
+    if (conversation.threadId) {
+      scheduleScrollPersistence(conversation.threadId, {
+        scrollTop: pane.scrollTop,
+        followLatest: followLatest.current,
+      })
+    }
     if (scrollMeasureFrame.current != null) return
     scrollMeasureFrame.current = window.requestAnimationFrame(() => {
       scrollMeasureFrame.current = null
-      if (pendingUserScrollIntent.current) {
-        pendingUserScrollIntent.current = false
-        userHasScrolled.current = true
-      }
       const isNearBottom = pane.scrollHeight - pane.scrollTop - pane.clientHeight <= 96
       if (isNearBottom) {
         followLatest.current = true
@@ -176,7 +213,10 @@ export function useConversationScroll({
     if (pane) {
       pane.scrollTop = pane.scrollHeight
       if (conversation.threadId) {
-        scheduleScrollPersistence(conversation.threadId, pane.scrollTop)
+        scheduleScrollPersistence(conversation.threadId, {
+          scrollTop: pane.scrollTop,
+          followLatest: true,
+        })
       }
     } else {
       messageEndRef.current?.scrollIntoView?.({ behavior: 'auto', block: 'end' })
@@ -245,14 +285,14 @@ export function useConversationScroll({
   useLayoutEffect(() => {
     // 会话切换前先提交旧会话最后一次滚动位置，避免新线程覆盖待写状态
     flushScrollPersistence()
-    const savedScrollTop = conversation.threadId
-      ? readConversationScrollTop(conversation.threadId)
+    const savedScroll = conversation.threadId
+      ? readConversationScroll(conversation.threadId)
       : null
     pendingConversationScroll.current = conversation.threadId
-      ? { threadId: conversation.threadId, scrollTop: savedScrollTop }
+      ? { threadId: conversation.threadId, state: savedScroll }
       : null
     lastForcedApprovalIdentity.current = null
-    followLatest.current = savedScrollTop == null
+    followLatest.current = savedScroll?.followLatest ?? true
     scrollingToBottom.current = false
     if (followScrollFrame.current != null) {
       window.cancelAnimationFrame(followScrollFrame.current)
@@ -269,6 +309,27 @@ export function useConversationScroll({
     scrollButtonHovered.current = false
     scrollButtonFocused.current = false
   }, [clearScrollButtonTimers, conversation.threadId, flushScrollPersistence, setScrollButtonPhase])
+
+  useLayoutEffect(() => {
+    const wasActive = previousActive.current
+    previousActive.current = active
+    if (wasActive && !active) {
+      flushScrollPersistence()
+      return
+    }
+    if (wasActive || !active) return
+
+    const pane = paneRef.current
+    if (!pane) return
+    const maxScroll = Math.max(0, pane.scrollHeight - pane.clientHeight)
+    if (followLatest.current) {
+      pane.scrollTop = maxScroll
+    } else if (conversation.threadId) {
+      const savedScroll = readConversationScroll(conversation.threadId)
+      if (savedScroll != null) pane.scrollTop = Math.min(savedScroll.scrollTop, maxScroll)
+    }
+    handleScroll(pane)
+  }, [active, conversation.threadId, flushScrollPersistence, handleScroll])
 
   useLayoutEffect(() => {
     if (!conversation.threadId || !conversation.isHydrated || !pendingApprovalKey) return
@@ -293,7 +354,10 @@ export function useConversationScroll({
       if (pane) {
         pane.scrollTop = pane.scrollHeight
         if (conversation.threadId) {
-          scheduleScrollPersistence(conversation.threadId, pane.scrollTop)
+          scheduleScrollPersistence(conversation.threadId, {
+            scrollTop: pane.scrollTop,
+            followLatest: true,
+          })
         }
       } else {
         messageEndRef.current?.scrollIntoView?.({ behavior: 'auto', block: 'end' })
@@ -309,8 +373,10 @@ export function useConversationScroll({
     )
     if (shouldRestoreConversationScroll && pane && pendingScroll) {
       pendingConversationScroll.current = null
-      if (pendingScroll.scrollTop != null) {
-        pane.scrollTop = pendingScroll.scrollTop
+      if (pendingScroll.state != null) {
+        pane.scrollTop = pendingScroll.state.followLatest
+          ? pane.scrollHeight
+          : pendingScroll.state.scrollTop
         handleScroll(pane)
         return
       }

@@ -28,17 +28,19 @@ The consumer pulls one item at a time. A slow consumer naturally slows the produ
 ## Convert the stream to SSE
 
 ```python
+from starlette.responses import StreamingResponse
+
+
 sse = stream.to_sse()
 await sse.prepare()
-
-try:
-    async for chunk in sse:
-        await send_to_client(chunk)
-finally:
-    await sse.aclose()
+return StreamingResponse(sse, media_type="text/event-stream")
 ```
 
-Each `chunk` is an encoded SSE string. The default mapper supports TinkerFin's native stream format.
+Each `chunk` is an encoded SSE string. The default mapper supports TinkerFin's native
+stream format. `SseBody` owns each upstream pull and its close task, so a host response
+can cancel it directly without recreating TinkerFin's cleanup sequence. A caller that
+iterates the body without an owning response must still call `aclose()` when it stops
+before normal exhaustion.
 
 ### `to_sse()` parameters
 
@@ -105,7 +107,7 @@ If preflight fails, the HTTP layer can still return a normal error response beca
 | --- | --- |
 | Normal exhaustion | Closes upstream and propagates errors |
 | Consumer stops early | Call `aclose()` to release resources |
-| Current task is cancelled | Cancellation propagates while required cleanup settles |
+| Current task is cancelled once or repeatedly | Cancellation propagates after the owned pull and required cleanup settle |
 | Native stream exceeds its total timeout | Fails the run and closes upstream |
 | `prepare()` fails | Does not start the response |
 

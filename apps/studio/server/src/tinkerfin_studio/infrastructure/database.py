@@ -31,6 +31,12 @@ class MySQLConnectionBudget:
     server_max_connections: int
 
 
+@dataclass(frozen=True, slots=True)
+class _DatabaseResources:
+    engine: AsyncEngine
+    session_factory: async_sessionmaker[AsyncSession]
+
+
 class Database:
     """拥有异步 Engine 与 Session 工厂的应用生命周期资源"""
 
@@ -48,21 +54,21 @@ class Database:
         self._pool_size = pool_size
         self._max_overflow = max_overflow
         self._pool_recycle = pool_recycle
-        self._engine: AsyncEngine | None = None
-        self._session_factory: async_sessionmaker[AsyncSession] | None = None
+        self._resources: _DatabaseResources | None = None
 
     @property
     def engine(self) -> AsyncEngine:
         """返回生命周期内可用的异步 Engine"""
 
-        if self._engine is None:
+        resources = self._resources
+        if resources is None:
             raise RuntimeError("数据库尚未启动")
-        return self._engine
+        return resources.engine
 
     async def __aenter__(self) -> Self:
         """创建 Engine 和 Session 工厂"""
 
-        if self._engine is not None:
+        if self._resources is not None:
             raise RuntimeError("数据库已经启动")
         options: dict[str, object] = {
             "echo": self._echo,
@@ -75,11 +81,13 @@ class Database:
             if self._max_overflow is not None:
                 options["max_overflow"] = self._max_overflow
         engine = create_async_engine(self._url, **options)
-        self._engine = engine
-        self._session_factory = async_sessionmaker(
-            engine,
-            expire_on_commit=False,
-            autoflush=False,
+        self._resources = _DatabaseResources(
+            engine=engine,
+            session_factory=async_sessionmaker(
+                engine,
+                expire_on_commit=False,
+                autoflush=False,
+            ),
         )
         return self
 
@@ -92,19 +100,18 @@ class Database:
         """关闭 Engine 且不吞掉调用域异常"""
 
         del exc_type, exc_value, traceback
-        engine = self._engine
-        self._session_factory = None
-        self._engine = None
-        if engine is not None:
-            await engine.dispose()
+        resources = self._resources
+        self._resources = None
+        if resources is not None:
+            await resources.engine.dispose()
 
     def session(self) -> AsyncSession:
         """创建一个由调用方关闭的异步会话"""
 
-        factory = self._session_factory
-        if factory is None:
+        resources = self._resources
+        if resources is None:
             raise RuntimeError("数据库尚未启动")
-        return factory()
+        return resources.session_factory()
 
     async def verify_connection_budget(
         self,

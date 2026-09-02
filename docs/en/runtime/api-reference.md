@@ -35,6 +35,7 @@ and cleanup. `open_agui_run()` requires exactly one of `input` and `resume`.
 | `DeepAgentDefinition.new(...)` | Create a native Runtime | Required `identity`, optional request `mode` and `on_part` |
 | `DeepAgentDefinition.new_agui(...)` | Create an AG-UI Runtime | Required canonical `identity`; optional parent, mode, resume, checkpoint callback, and observers |
 | `TinkerFin.failed_agui_run(...)` | Represent a setup failure after a Run was accepted | Error, identity, and the real available input/config/resume |
+| `trace_contribution(kind=..., name=..., input=None)` | Publish explicit Memory, Guardrail, retrieval, or custom semantics | Async context manager with optional `set_result(...)` |
 
 `DeepAgentsV2RuntimeProfile` is the default current Profile. TinkerFin selects one
 Profile before Definition creation, persists its `profile_id` with checkpoint lineage,
@@ -131,7 +132,7 @@ non-checkpointed context contract.
 | --- | --- |
 | `NativeGraphRunStream` | Iterates original upstream objects while transferring the same Driver-owned canonical frame to Messaging or Native SSE |
 | `AgUiEventStream` | Iterates AG-UI events; supports `abort()`, `aclose()`, and `to_sse()` |
-| `SseBody` | Iterates SSE strings; call `prepare()` first and `aclose()` when done |
+| `SseBody` | Single-use SSE body that owns each upstream pull and close task; call `prepare()` before handing it to a host response |
 
 ### `AgUiEventStream.abort()`
 
@@ -205,10 +206,13 @@ After installing `tinkerfin[redis]`:
 See [Run coordination and Redis leases](extensions.md#use-a-renewable-redis-lease-when-needed) for constructor defaults and connection-pool guidance.
 
 `TinkerFin.observe(...)` returns a separate factory and preserves Observer registration
-through `.plan(...)`. Runtime validates each Native part once, then publishes Trace-safe
-observations before `on_part` and AG-UI conversion. An Observer failure terminates the
-Run fail-closed; Runtime still closes all opened sessions. `tinkerfin-tracing.Tracer` is
-the provided semantic implementation. AG-UI events, Messaging commits, SSE frames, and
+through `.plan(...)`. Managed Deep Agent requests install one request-scoped LangChain
+callback that records the final middleware-processed model request before provider
+execution and records actual Tool execution after review or argument editing. Runtime
+also validates each Native part once, then publishes Trace-safe Native observations
+before `on_part` and AG-UI conversion. An Observer failure terminates the Run
+fail-closed; Runtime still closes all opened sessions. `tinkerfin-tracing.Tracer` is the
+provided semantic implementation. AG-UI events, Messaging commits, SSE frames, and
 Redis ownership are not Runtime observations.
 
 An Agent terminal is selected before Observer broadcast. A terminal-broadcast Observer

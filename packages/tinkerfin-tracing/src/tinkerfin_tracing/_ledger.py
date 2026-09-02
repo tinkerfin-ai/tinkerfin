@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from uuid import uuid4
 
+from ._entry_index import entry_mutations
 from .backend import (
     StoredTraceCheckpoint,
     StoredTraceEvent,
@@ -420,6 +421,7 @@ def _resolve_append_events(
         writer=updated_writer,
         events=tuple(stored_events),
         validated_events=tuple(public_events),
+        entry_mutations=entry_mutations(tuple(public_events)),
         namespace_persisted_bytes_delta=added_bytes,
         namespace_reserved_bytes_delta=reserve_delta,
     )

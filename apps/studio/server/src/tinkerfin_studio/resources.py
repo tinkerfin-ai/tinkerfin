@@ -41,6 +41,7 @@ from tinkerfin_studio.health import ReadinessService
 from tinkerfin_studio.infrastructure.database import Database
 from tinkerfin_studio.infrastructure.redis_client import create_redis_client
 from tinkerfin_tracing import (
+    CapturePolicy,
     SqlAlchemyTraceStore,
     Tracer,
 )
@@ -222,10 +223,15 @@ def build_lifespan():
             )
             # Trace Store 借用业务 Engine 并在接收请求前校验唯一当前 Schema
             await trace_store.setup()
-            tracer = Tracer(store=trace_store)
+            tracer = Tracer(
+                store=trace_store,
+                capture_policy=CapturePolicy.public_history(
+                    include_error_messages=True
+                ),
+            )
             todo_group_query = TodoGroupQueryExecutor()
             # 每个 Run 由框架打开独立 Trace session，写入失败会让 Agent fail-closed
-            # Tracer 只借用进程级 Store，不接管共享 Engine 或改变 reasoning 默认省略策略
+            # Studio 授权保留有界错误摘要；Tracer 仍不接管共享 Engine，reasoning 默认省略
             tinkerfin_profiles = MappingProxyType(
                 {
                     profile_id: TinkerFin(

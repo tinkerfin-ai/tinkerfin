@@ -20,16 +20,57 @@ Tracer(
 | `store` | Borrowed `TraceStore`; defaults to a new `InMemoryTraceStore` |
 | `open_run(context)` | `RuntimeObserver` entry used by TinkerFin Runtime |
 | `get(thread_id, head_run_id=None, limit=100, history_cursor=None, projections=())` | Latest or cursor-bound fixed-as-of `TraceThread` |
+| `query(thread_id, where=None, head_run_id=None, cursor=None, limit=100)` | Store-filtered `TraceQuery` page and live follower |
+| `rebuild_entries(thread_id)` | Reconstruct current derived query entries without changing Ledger events |
 
 Passing both `store` and `limits` requires exact equality with `store.limits`. Projection
 names are canonical, unique, and registered immutably at construction.
+
+## `TraceFilter`, `TraceQuery`, and entries
+
+`TraceFilter` supports `kinds`, `statuses`, `parent_id`, `agent_names`,
+`middleware_names`, `skill_names`, `providers`, `models`, `namespaces`, `search`,
+`started_after`, `started_before`, and `include_ancestors`. Collection values are frozen
+at validation. Each repeatable text filter accepts at most 64 values; names and graph
+namespace segments are canonical text of at most 1,024 characters. Time boundaries are
+aware UTC values.
+
+`TraceQuery` exposes `turns`, `items`, `next_cursor`, `as_of_seq`, `facets`,
+`completeness`, and `follow()`. `TraceTurn` resolves the selected lineage's ordinal and
+existing user `TraceMessage`; it does not create another message payload. Every
+`TraceEntry` carries its `turn_id`, callback-proven structural `parent_id`, and an
+independent `proposal_id` for actual Tool executions. Request/result details and direct
+`TraceFailure` values are decoded from referenced Ledger facts. `request_omitted` and
+`result_omitted` distinguish policy or size omission from JSON null.
+Each Facet count applies every active filter except its own dimension. Direct failure
+ownership is stored in the Ledger and does not change with filters or pagination.
+
+`TraceEntryKind` includes Agent, technical Run, graph model and tools steps, provider
+request, Tool proposal, actual Tool execution, subagent, Skill, middleware, Memory,
+Guardrail, retrieval, custom context, and Runtime task. A successful entry has no
+success badge contract; `failure` belongs only to the entry with direct failure
+evidence. `TraceEntryCompleteness.call_tracking_missing` reports missing provider/Tool
+callbacks, while `execution_tree_missing` reports selected Runs without an observed
+Agent execution root.
+
+`TraceQuery.follow()` follows the current filtered page, including its cursor, and returns a `TraceFollow` handle that emits
+`turn_upserts`/`turn_removes` together with entry changes. It owns each Store pull and
+waits for upstream close before cancellation propagates, including repeated caller
+cancellation. Consumers must build the tree from `turn_id` and `parent_id`; they must
+not reconstruct parents from names, timestamps, arrival order, or `proposal_id`.
+`TraceFollow` is an asynchronous context manager; use it when the loop may break early,
+or call `aclose()` explicitly. Entering a closed handle or starting another pull raises
+`TraceFollowLifecycleError` with code `tracing.follow_lifecycle`.
 
 ## Capture and limits
 
 | API | Purpose |
 | --- | --- |
-| `CapturePolicy.public_history(tool_overrides=None)` | Default policy; retain complete sanitized content for every Tool with optional exact-name overrides |
-| `CapturePolicy.public_safe(tool_rules=())` | Metadata-only Tool policy with optional low-level RFC 6901 selections |
+| `CapturePolicy.public_history(tool_overrides=None, middleware_overrides=None, include_error_messages=False)` | Default policy; retain sanitized Tool history and visible middleware configuration with per-item overrides |
+| `CapturePolicy.public_safe(tool_rules=(), middleware_overrides=None, include_error_messages=False)` | Metadata-only Tool policy with optional low-level RFC 6901 selections and middleware overrides |
+| `MiddlewareTraceCapture.visible()` | Retain configuration and standard-callback execution evidence |
+| `MiddlewareTraceCapture.configuration_only()` | Retain configuration without execution status or timing |
+| `MiddlewareTraceCapture.disabled()` | Suppress middleware-specific facts without changing execution |
 | `ToolTraceCapture.full_content()` | Retain Tool lifecycle, complete sanitized content, and public review text |
 | `ToolTraceCapture.metadata_only()` | Retain Tool lifecycle without arguments, results, or review text |
 | `ToolTraceCapture.selected_content(...)` | Retain Tool lifecycle and selected argument/result paths |
@@ -78,7 +119,7 @@ before a durable pause is published; it is never silently reduced to a blind app
 | `summary` | Complete cumulative status, completeness, counts, pending interactions, and maximum source time for the selected lineage |
 | `status` | `running`, `waiting`, `succeeded`, `failed`, `cancelled`, `abandoned`, or `unknown` |
 | `completeness` | Independent missing-prefix, missing-tail, and payload-omitted signals |
-| `message_count` / `tool_call_count` | Compatibility views computed from `summary` |
+| `message_count` / `tool_call_count` | Convenience views computed from `summary` |
 | `projections` | Defensive copies of explicitly requested business results |
 | `has_older` | Whether earlier complete Turns can be loaded |
 | `history_cursor` | Opaque generation/head/as-of cursor for another `Tracer.get(...)` history request |
@@ -122,16 +163,25 @@ sanitized content and public review descriptions. Exact-name `toolOverrides` can
 | `RunFact` | Start, input/resume, resume checkpoint, Observer failure, terminal, or close |
 | `MessageFact` | Message start/content/completion/reconciliation/removal |
 | `ReasoningFact` | Explicit extractor content/reconciliation/completion under an independent capture policy |
-| `ToolFact` | Tool start, argument snapshot, proposal end, or result |
-| `RuntimeTaskFact` | LangGraph task start/result, interrupt IDs, and structural payload metadata |
+| `ToolFact` | Tool start, argument snapshot, proposal end, result, cancellation, or abandonment |
+| `RuntimeTaskFact` | LangGraph task start, completion, failure, interrupt, cancellation, abandonment, and structural payload metadata |
 | `StateRevisionFact` | Changed non-message state keys in one exact namespace |
 | `InteractionFact` | Pending to resolved/cancelled human interaction |
-| `SubagentFact` | Validated non-root graph scope start and parent-task completion |
+| `SubagentFact` | Validated non-root graph scope start, waiting update, and terminal settlement |
 | `PlanRevisionFact` | Public `tinkerfin_plan` revision and status |
 | `NativeExtraFact` | Structural metadata for an allowed extra Native mode |
+| `CallTrackingFact` | Marks a Run whose call-observation capability was active |
+| `ModelCallFact` | Final provider request, first output, completion, usage, direct failure, or control-flow terminal |
+| `ToolExecutionFact` | Actual post-review Tool input and proven failure or control-flow terminal, separate from proposal |
+| `ContextContributionFact` | Explicit Memory, Guardrail, retrieval, or custom contribution lifecycle |
+| `MiddlewareFact` | Visible configured middleware metadata without claiming hook execution |
+| `SkillFact` | Successful exact read of a configured Skill instruction file |
 
 `TraceEvent` adds a Store event ID, global `traceSeq`, generation, and measured persisted
 bytes. There are no project-owned schema or protocol version fields.
+
+`failure` is projected only from direct failed evidence. Cancelled, interrupted, and
+abandoned facts carry status without an error badge.
 
 ## Business Projections
 
@@ -183,6 +233,12 @@ atomic ordered fact batches plus idempotent close. `StoreThreadSnapshot` contain
 `InMemoryTraceStore` assigns one contiguous per-thread sequence across concurrent Runs,
 rejects duplicate or active Run IDs, reserves terminal capacity per active writer,
 prevents active deletion, wakes followers on deletion, and returns defensive copies.
+
+`TraceEntryStore` is the optional direct-query Store capability.
+`TraceEntryRebuildStore` reconstructs its disposable entries from one exact Ledger
+generation. Backend implementations expose the corresponding independent
+`TraceQueryBackend` and `TraceEntryRebuildBackend` capabilities; a Ledger-only or archive
+integration need not implement either.
 
 ### `TraceLedgerBackend` and `DurableTraceStore`
 
@@ -252,16 +308,18 @@ same identity and prefix raises `TraceStoreProtocolError`.
 `EncodedTracePayload.digest` is SHA-256 of those bytes before storage. SQL event and
 Projection payloads are opaque bytes; searchable Run, fact kind, timestamp, sequence,
 and digest metadata is checked against decoded content.
+A reversible codec may protect the stored `data`, but must retain the canonical digest,
+reverse the transform while decoding, and hash recovered canonical bytes in `digest()`.
 
 `get_trace_store_schema(dialect="sqlite" | "mysql")` returns deterministic empty-
 database DDL compiled from the same metadata used by `setup()`. Trace owns exactly the
-namespace, thread, writer, event, and Projection-checkpoint tables. They contain no
-foreign keys or project-owned Schema-version fields.
+namespace, thread, writer, event, payload-free query-entry, and Projection-checkpoint
+tables. They contain no foreign keys or project-owned Schema-version fields.
 
 ## Errors
 
 All tracing-owned failures inherit `TracingError` and expose a stable `tracing.*` code.
 The public family includes invalid cursor, thread not found, ambiguous head, Run
-not found, Run conflict, corruption, Store unavailable/timeout/protocol error, Projection checkpoint
+not found, Run conflict, Follow lifecycle misuse, corruption, Store unavailable/timeout/protocol error, Projection checkpoint
 conflict, quota exceeded, capture rejected, Observer failed, and Projection failed. Public `context` is client-safe;
 trusted diagnostics and causes are separate.

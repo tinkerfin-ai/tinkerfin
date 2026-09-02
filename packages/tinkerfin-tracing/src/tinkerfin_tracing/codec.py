@@ -16,12 +16,13 @@ _JSON_VALUE_ADAPTER: TypeAdapter[JsonValue] = TypeAdapter(JsonValue)
 
 @dataclass(frozen=True, slots=True)
 class EncodedTracePayload:
-    """Pair canonical bytes with their pre-storage SHA-256 digest.
+    """Pair opaque Store bytes with their canonical pre-transform digest.
 
     Attributes:
-        data: Finite, sorted-key, whitespace-free UTF-8 JSON bytes.
-        digest: Lowercase SHA-256 hex digest of the exact canonical ``data`` persisted
-            by the current Store implementations.
+        data: Bytes persisted by the Store. The base codec emits finite canonical JSON;
+            a reversible storage-transform codec may emit protected bytes instead.
+        digest: Lowercase SHA-256 hex digest of the finite canonical JSON before an
+            optional reversible storage transform.
     """
 
     data: bytes
@@ -31,9 +32,13 @@ class EncodedTracePayload:
 class CanonicalTracePayloadCodec:
     """Encode current Trace facts and cache state as canonical finite JSON.
 
-    The digest covers the same opaque bytes written by the SQL Store and remains
-    independent of searchable event metadata. Reads re-encode decoded data and compare
-    both canonical bytes and digest before returning a fact.
+    The digest covers canonical pre-transform bytes and remains independent of
+    searchable event metadata. Reads re-encode decoded data and compare both canonical
+    bytes and digest before returning a fact.
+
+    A reversible storage-transform subclass must preserve the digest returned by the
+    base encoder, reverse its transform in both decode methods, and override
+    :meth:`digest` to hash the recovered canonical bytes.
     """
 
     def encode_fact(self, fact: TraceSemanticFact) -> EncodedTracePayload:
@@ -145,7 +150,10 @@ class CanonicalTracePayloadCodec:
 
     @staticmethod
     def digest(payload: bytes) -> str:
-        """Return SHA-256 for already canonical pre-storage bytes.
+        """Return SHA-256 for canonical bytes emitted by the base codec.
+
+        Reversible storage-transform subclasses must override this method and hash the
+        recovered canonical bytes so the digest remains independent of stored form.
 
         Args:
             payload: Non-empty bytes from this codec boundary.

@@ -1,10 +1,11 @@
 """AG-UI 实时流、Trace 历史和会话命令 HTTP 入口"""
 
 from collections.abc import AsyncGenerator
+from datetime import datetime
 from typing import Annotated, TypeAlias
 
 from ag_ui.core import RunAgentInput
-from fastapi import APIRouter, Header, Path, Query, Request
+from fastapi import APIRouter, Depends, Header, Path, Query, Request
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ValidationError
 from starlette.responses import Response, StreamingResponse
@@ -24,9 +25,11 @@ from tinkerfin_studio.conversation.schemas import (
     ConversationHistoryListItem,
     ConversationHistoryListResponse,
     ConversationThreadUpdate,
+    ConversationTraceEntryPage,
 )
 from tinkerfin_studio.conversation.service import ConversationChatService
 from tinkerfin_studio.resources import get_resources
+from tinkerfin_tracing import TraceEntryKind, TraceEntryStatus, TraceFilter
 
 router = APIRouter(prefix="/conversation", tags=["会话"])
 
@@ -38,6 +41,71 @@ ThreadIdPath: TypeAlias = Annotated[
         description="会话 threadId",
     ),
 ]
+
+
+def _entry_namespace(value: str) -> tuple[str, ...]:
+    if value == "root":
+        return ()
+    segments = tuple(value.split("|"))
+    if any(not segment or segment != segment.strip() for segment in segments):
+        raise ValueError("namespace 必须是 root 或以 | 分隔的规范路径")
+    return segments
+
+
+async def _trace_entry_filter(
+    kinds: Annotated[list[TraceEntryKind] | None, Query(alias="kind")] = None,
+    statuses: Annotated[list[TraceEntryStatus] | None, Query(alias="status")] = None,
+    parent_id: Annotated[str | None, Query(alias="parentId", min_length=1)] = None,
+    agents: Annotated[list[str] | None, Query(alias="agent")] = None,
+    middleware: Annotated[list[str] | None, Query()] = None,
+    skills: Annotated[list[str] | None, Query(alias="skill")] = None,
+    providers: Annotated[list[str] | None, Query(alias="provider")] = None,
+    models: Annotated[list[str] | None, Query(alias="model")] = None,
+    namespaces: Annotated[list[str] | None, Query(alias="namespace")] = None,
+    search: Annotated[
+        str | None, Query(alias="query", min_length=1, max_length=255)
+    ] = None,
+    started_after: Annotated[datetime | None, Query(alias="startedAfter")] = None,
+    started_before: Annotated[datetime | None, Query(alias="startedBefore")] = None,
+    include_ancestors: Annotated[
+        bool,
+        Query(alias="includeAncestors"),
+    ] = True,
+) -> TraceFilter:
+    """把可读查询参数转换为框架直接过滤条件"""
+
+    try:
+        return TraceFilter(
+            kinds=set(kinds or ()),
+            statuses=set(statuses or ()),
+            parent_id=parent_id,
+            agent_names=set(agents or ()),
+            middleware_names=set(middleware or ()),
+            skill_names=set(skills or ()),
+            providers=set(providers or ()),
+            models=set(models or ()),
+            namespaces={_entry_namespace(value) for value in namespaces or ()},
+            search=search,
+            started_after=started_after,
+            started_before=started_before,
+            include_ancestors=include_ancestors,
+        )
+    except ValidationError as error:
+        raise RequestValidationError(error.errors(include_input=False)) from error
+    except ValueError as error:
+        raise RequestValidationError(
+            [
+                {
+                    "type": "value_error",
+                    "loc": ("query", "namespace"),
+                    "msg": str(error),
+                    "input": None,
+                }
+            ]
+        ) from error
+
+
+TraceEntryFilterDep: TypeAlias = Annotated[TraceFilter, Depends(_trace_entry_filter)]
 
 
 @router.get("/history", response_model=ApiResponse[ConversationHistoryListResponse])
@@ -108,6 +176,50 @@ async def follow_trace(
     )
 
 
+@router.get(
+    "/{thread_id}/trace/entries",
+    response_model=ApiResponse[ConversationTraceEntryPage],
+)
+async def query_trace_entries(
+    thread_id: ThreadIdPath,
+    service: ConversationHistoryDep,
+    where: TraceEntryFilterDep,
+    cursor: Annotated[str | None, Query(min_length=1, max_length=16_384)] = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 100,
+) -> ApiResponse[ConversationTraceEntryPage]:
+    """按当前会话归属直接筛选链路节点"""
+
+    return ApiResponse.success(
+        await service.query_trace_entries(
+            thread_id,
+            where=where,
+            cursor=cursor,
+            limit=limit,
+        )
+    )
+
+
+@router.get("/{thread_id}/trace/entries/follow", response_class=StreamingResponse)
+async def follow_trace_entries(
+    thread_id: ThreadIdPath,
+    service: ConversationHistoryDep,
+    where: TraceEntryFilterDep,
+    limit: Annotated[int, Query(ge=1, le=200)] = 100,
+) -> StreamingResponse:
+    """发送链路筛选快照并持续跟随匹配变化"""
+
+    events = await service.follow_trace_entries(
+        thread_id,
+        where=where,
+        limit=limit,
+    )
+    return StreamingResponse(
+        _trace_sse(events),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @router.patch("/{thread_id}", response_model=ApiResponse[ConversationHistoryListItem])
 async def update_thread(
     thread_id: ThreadIdPath,
@@ -155,7 +267,7 @@ async def chat(
         resources=get_resources(request.app),
     ).start(chat_request, last_event_id=last_event_id)
     return StreamingResponse(
-        _chat_sse(prepared.body),
+        prepared.body,
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -196,15 +308,3 @@ async def _trace_sse(
             yield b"event: trace\ndata: " + payload + b"\n\n"
     finally:
         await events.aclose()
-
-
-async def _chat_sse(
-    body: AsyncGenerator[bytes, None],
-) -> AsyncGenerator[bytes, None]:
-    """转发框架 SSE，并在 HTTP 断连或响应终止时释放订阅"""
-
-    try:
-        async for frame in body:
-            yield frame
-    finally:
-        await body.aclose()

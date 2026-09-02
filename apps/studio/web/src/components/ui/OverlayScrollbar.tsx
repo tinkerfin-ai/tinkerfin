@@ -13,6 +13,7 @@ export interface OverlayScrollbarProps {
   axis?: OverlayScrollbarAxis
   size?: OverlayScrollbarSize
   visibility?: OverlayScrollbarVisibility
+  onUserScrollIntent?: () => void
 }
 
 interface ScrollbarGeometry {
@@ -32,6 +33,7 @@ export function OverlayScrollbar({
   axis = 'vertical',
   size = 'regular',
   visibility = 'transient',
+  onUserScrollIntent,
 }: OverlayScrollbarProps) {
   const overlayRef = useRef<HTMLDivElement>(null)
   const thumbRef = useRef<HTMLSpanElement>(null)
@@ -148,6 +150,7 @@ export function OverlayScrollbar({
     const geometry = geometryRef.current
     if (!viewport || geometry.maxScroll <= 0 || geometry.travel <= 0) return
 
+    onUserScrollIntent?.()
     event.preventDefault()
     event.currentTarget.setPointerCapture?.(event.pointerId)
     clearHideTimer()

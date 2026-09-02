@@ -48,7 +48,7 @@ def test_distribution_declares_only_contracts_and_pydantic() -> None:
 
     requirements = set(metadata.requires or ())
     assert {item for item in requirements if "extra ==" not in item} == {
-        "pydantic<3,>=2",
+        "pydantic<3,>=2.12",
         "tinkerfin-contracts<0.9.0,>=0.1.0",
     }
     assert 'aiosqlite<0.23,>=0.22; extra == "sqlite"' in requirements

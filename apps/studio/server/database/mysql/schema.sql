@@ -113,6 +113,45 @@ CREATE TABLE tinkerfin_trace_events (
   KEY ix_tinkerfin_trace_events_run (namespace_hash, thread_hash, generation, run_hash, trace_seq)
 ) COMMENT='Authoritative semantic Trace Ledger events';
 
+CREATE TABLE tinkerfin_trace_entries (
+  namespace_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 namespace key',
+  thread_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 thread key',
+  generation VARCHAR(64) NOT NULL COMMENT 'Exact Trace generation ID',
+  entry_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 entry identity key',
+  entry_id TEXT NOT NULL COMMENT 'Canonical Trace entry identity',
+  parent_hash VARCHAR(64) COMMENT 'SHA-256 parent identity key when present',
+  parent_id TEXT COMMENT 'Canonical parent entry identity',
+  kind VARCHAR(32) NOT NULL COMMENT 'Functional entry kind',
+  status VARCHAR(32) NOT NULL COMMENT 'Current entry status',
+  name_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 display-name key',
+  name TEXT NOT NULL COMMENT 'Functional entry display name',
+  run_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 Run key',
+  run_id TEXT NOT NULL COMMENT 'Semantic Run owning the entry',
+  graph_namespace_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 canonical graph namespace key',
+  graph_namespace TEXT NOT NULL COMMENT 'Canonical JSON graph namespace',
+  agent_hash VARCHAR(64) COMMENT 'SHA-256 Agent name key when present',
+  agent_name TEXT COMMENT 'Named subagent when present',
+  provider_hash VARCHAR(64) COMMENT 'SHA-256 model provider key when present',
+  provider TEXT COMMENT 'Model provider when present',
+  model_hash VARCHAR(64) COMMENT 'SHA-256 model name key when present',
+  model TEXT COMMENT 'Model name when present',
+  started_at DATETIME(6) NOT NULL COMMENT 'Source UTC entry start time',
+  first_output_at DATETIME(6) COMMENT 'Source UTC first model output time',
+  completed_at DATETIME(6) COMMENT 'Source UTC entry completion time',
+  started_seq BIGINT NOT NULL COMMENT 'Ledger event containing authoritative start details',
+  updated_seq BIGINT NOT NULL COMMENT 'Ledger event containing the current entry update',
+  CONSTRAINT pk_tinkerfin_trace_entries PRIMARY KEY (namespace_hash, thread_hash, generation, entry_hash),
+  KEY ix_tinkerfin_trace_entries_agent (namespace_hash, thread_hash, generation, agent_hash, started_at),
+  KEY ix_tinkerfin_trace_entries_kind_status (namespace_hash, thread_hash, generation, kind, status, started_at),
+  KEY ix_tinkerfin_trace_entries_model (namespace_hash, thread_hash, generation, model_hash, started_at),
+  KEY ix_tinkerfin_trace_entries_name (namespace_hash, thread_hash, generation, name_hash, started_at),
+  KEY ix_tinkerfin_trace_entries_namespace (namespace_hash, thread_hash, generation, graph_namespace_hash, started_at),
+  KEY ix_tinkerfin_trace_entries_page (namespace_hash, thread_hash, generation, started_at, entry_hash),
+  KEY ix_tinkerfin_trace_entries_parent (namespace_hash, thread_hash, generation, parent_hash, started_at),
+  KEY ix_tinkerfin_trace_entries_provider_model (namespace_hash, thread_hash, generation, provider_hash, model_hash, started_at),
+  KEY ix_tinkerfin_trace_entries_run (namespace_hash, thread_hash, generation, run_hash, started_at)
+) COMMENT='Disposable directly filterable Trace entry index without fact payloads';
+
 CREATE TABLE tinkerfin_trace_namespaces (
   namespace_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 key for the logical namespace',
   namespace TEXT NOT NULL COMMENT 'Logical Trace Store namespace',

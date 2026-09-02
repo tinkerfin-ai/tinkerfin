@@ -28,6 +28,7 @@ class TracingErrorCode(StrEnum):
     OBSERVER_FAILED = "tracing.observer_failed"
     PROJECTION_FAILED = "tracing.projection_failed"
     PROJECTION_CHECKPOINT_CONFLICT = "tracing.projection_checkpoint_conflict"
+    FOLLOW_LIFECYCLE = "tracing.follow_lifecycle"
 
 
 class TracingError(Exception):
@@ -142,11 +143,18 @@ class TraceProjectionCheckpointConflict(TraceStoreError):
     code = TracingErrorCode.PROJECTION_CHECKPOINT_CONFLICT
 
 
+class TraceFollowLifecycleError(TracingError, RuntimeError):
+    """A live Trace follower is closed or already serving another operation."""
+
+    code = TracingErrorCode.FOLLOW_LIFECYCLE
+
+
 __all__ = [
     "AmbiguousTraceHead",
     "InvalidTraceCursor",
     "TraceCaptureRejected",
     "TraceCorruption",
+    "TraceFollowLifecycleError",
     "TraceObserverFailed",
     "TraceProjectionCheckpointConflict",
     "TraceProjectionFailed",

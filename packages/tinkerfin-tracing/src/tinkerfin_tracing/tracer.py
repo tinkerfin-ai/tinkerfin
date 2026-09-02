@@ -7,12 +7,17 @@ import hashlib
 import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import PurePosixPath
 from types import MappingProxyType
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel, JsonValue
 
 from tinkerfin_contracts import (
+    AgentStepObservation,
+    ContextContributionObservation,
+    ModelCallObservation,
     NativeExtraObservation,
     NativeMessageObservation,
     NativeMessageRecord,
@@ -30,21 +35,39 @@ from tinkerfin_contracts import (
     RunStartedObservation,
     RunTerminalObservation,
     RuntimeObservation,
+    ToolExecutionObservation,
 )
 
+from ._entry_projection import project_trace_entry
+from ._ids import scope_id as _scope_id
 from .capture import CapturedValue, CapturePolicy, ReasoningCapturePolicy
 from .durable_store import InMemoryTraceStore
+from .entries import (
+    TraceEntry,
+    TraceEntryCompleteness,
+    TraceEntryPage,
+    TraceFilter,
+    TraceTurn,
+)
+from .entry_query import TraceQuery, decode_entry_cursor, encode_entry_cursor
 from .errors import TraceCaptureRejected, TraceCorruption, TraceStoreProtocolError
 from .facts import (
+    AgentStepFact,
+    CallTrackingFact,
+    ContextContributionFact,
     InteractionFact,
     MessageFact,
+    MiddlewareFact,
+    ModelCallFact,
     NativeExtraFact,
     PlanRevisionFact,
     ReasoningFact,
     RunFact,
     RuntimeTaskFact,
+    SkillFact,
     StateRevisionFact,
     SubagentFact,
+    ToolExecutionFact,
     ToolFact,
     TraceEvent,
     TraceFactBase,
@@ -53,8 +76,12 @@ from .facts import (
 )
 from .limits import TraceLimits
 from .projection import (
+    CoreProjectionState,
+    CoreProjectionWindow,
     RegisteredTraceProjection,
     TraceProjection,
+    project_core_checkpoint,
+    select_core_projection_window,
     select_prior_run_ids,
 )
 from .query import (
@@ -66,20 +93,13 @@ from .query import (
 )
 from .store import (
     StoreThreadSnapshot,
+    TraceEntryRebuildStore,
+    TraceEntryStore,
     TraceStore,
+    TraceThreadKey,
     TraceWriter,
 )
 from .writing import TraceBatchWriter, TraceWritePolicy
-
-
-def _scope_id(kind: str, namespace: tuple[str, ...], source_id: str) -> str:
-    encoded = json.dumps(
-        list(namespace),
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode()
-    scope = hashlib.sha256(encoded).hexdigest()[:24]
-    return f"{kind}:{scope}:{source_id}"
 
 
 def _fingerprint(value: JsonValue) -> str:
@@ -103,7 +123,7 @@ def _message_role(message: NativeMessageRecord) -> str:
 
 
 def _make_fact(
-    model: type[TraceFactBase],
+    fact_type: type[TraceFactBase],
     common: Mapping[str, object],
     **values: object,
 ) -> TraceSemanticFact:
@@ -111,7 +131,7 @@ def _make_fact(
 
     return cast(
         TraceSemanticFact,
-        model.model_validate({**common, **values}),
+        fact_type.model_validate({**common, **values}),
     )
 
 
@@ -131,6 +151,28 @@ class _SubagentDescriptor:
     parent_task_id: str
     agent_name: str
     description: str
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingToolExecution:
+    """Retain actual Tool input until its execution callback reaches a terminal."""
+
+    input: JsonValue | None
+    parent_call_id: str | None
+    namespace: tuple[str, ...]
+    agent_name: str | None
+    tool_name: str
+    traced: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingRuntimeTask:
+    """Retain one Native task identity until its result or Run terminal."""
+
+    namespace: tuple[str, ...]
+    run_id: str
+    source_task_id: str
+    task_name: str
 
 
 class _TracingSession:
@@ -179,6 +221,10 @@ class _TracingSession:
         self._context = context
         self._policy = capture_policy
         self._reasoning_policy = reasoning_capture_policy
+        self._middleware_descriptors = {
+            descriptor.name: descriptor for descriptor in context.middleware
+        }
+        self._configured_middleware: set[str] = set()
         self._limits = limits
         self._on_closed = on_closed
         self._closed = False
@@ -201,12 +247,21 @@ class _TracingSession:
         self._tool_argument_snapshots: set[tuple[tuple[str, ...], str]] = set()
         self._tool_completed: set[tuple[tuple[str, ...], str]] = set()
         self._tool_results: set[tuple[tuple[str, ...], str]] = set()
+        self._tool_call_models: dict[tuple[tuple[str, ...], str], str] = {}
+        self._tool_executions: dict[str, _PendingToolExecution] = {}
+        self._tool_execution_by_call: dict[tuple[tuple[str, ...], str], str] = {}
+        self._visible_tool_execution_calls: set[tuple[tuple[str, ...], str]] = set()
+        self._active_runtime_tasks: dict[
+            tuple[tuple[str, ...], str], _PendingRuntimeTask
+        ] = {}
+        self._callback_entries: dict[str, str] = {}
         self._states: dict[tuple[str, ...], dict[str, JsonValue]] = {}
         self._pending_interactions: dict[
             tuple[tuple[str, ...], str], _PendingInteraction
         ] = {}
         self._subagent_descriptors: dict[tuple[str, ...], _SubagentDescriptor] = {}
         self._active_subagents: dict[tuple[str, ...], tuple[str, str | None]] = {}
+        self._failure_origin_seen = False
         self._batch_writer = TraceBatchWriter(
             writer,
             policy=write_policy,
@@ -264,10 +319,34 @@ class _TracingSession:
                     self._tool_started.add(key)
                 if fact.phase == "arguments" and fact.content is not None:
                     self._tool_argument_snapshots.add(key)
-                if fact.phase in {"completed", "result"}:
+                if fact.phase in {"completed", "result", "cancelled", "abandoned"}:
                     self._tool_completed.add(key)
-                if fact.phase == "result":
+                if fact.phase in {"result", "cancelled", "abandoned"}:
                     self._tool_results.add(key)
+            elif isinstance(fact, ModelCallFact) and fact.phase == "completed":
+                for tool_call_id in fact.tool_call_ids:
+                    self._tool_call_models[(fact.namespace, tool_call_id)] = (
+                        fact.call_id
+                    )
+            elif (
+                isinstance(fact, ToolExecutionFact)
+                and fact.phase == "started"
+                and fact.source_tool_call_id is not None
+            ):
+                self._tool_execution_by_call[
+                    (fact.namespace, fact.source_tool_call_id)
+                ] = fact.execution_id
+            elif isinstance(fact, RuntimeTaskFact):
+                key = (fact.namespace, fact.source_task_id)
+                if fact.phase in {"started", "interrupted"}:
+                    self._active_runtime_tasks[key] = _PendingRuntimeTask(
+                        namespace=fact.namespace,
+                        run_id=fact.identity.run_id,
+                        source_task_id=fact.source_task_id,
+                        task_name=fact.task_name,
+                    )
+                else:
+                    self._active_runtime_tasks.pop(key, None)
             elif isinstance(fact, StateRevisionFact):
                 state = self._states.setdefault(fact.namespace, {})
                 for key in fact.removed_keys:
@@ -290,13 +369,18 @@ class _TracingSession:
                 else:
                     self._pending_interactions.pop(key, None)
             elif isinstance(fact, SubagentFact):
-                if fact.phase == "started":
+                if fact.phase in {"started", "updated"} and fact.status in {
+                    "running",
+                    "waiting",
+                }:
                     self._active_subagents[fact.namespace] = (
                         fact.subagent_id,
                         fact.agent_name,
                     )
                 else:
                     self._active_subagents.pop(fact.namespace, None)
+            elif isinstance(fact, MiddlewareFact):
+                self._configured_middleware.add(fact.name)
 
     async def observe(self, observation: RuntimeObservation) -> None:
         """Map and enqueue one already ordered Runtime observation.
@@ -329,6 +413,12 @@ class _TracingSession:
                 await self._append(tuple(completions), mandatory=False)
         facts = self._facts(observation, source_id=source_id)
         if not facts:
+            return
+        if isinstance(observation, RunTerminalObservation):
+            settlement = tuple(facts[:-1])
+            if settlement:
+                await self._append(settlement, mandatory=False)
+            await self._append((facts[-1],), mandatory=True)
             return
         mandatory = isinstance(
             observation, (RunTerminalObservation, RunClosedObservation)
@@ -491,6 +581,8 @@ class _TracingSession:
                     interrupt_ids=resume_ids,
                 )
             )
+            if source.call_tracking_enabled:
+                facts.append(_make_fact(CallTrackingFact, common))
             if user_message is not None and source.input_kind in {"ordinary", "branch"}:
                 user_message_id, user_content = user_message
                 scoped_message_id = _scope_id("message", (), user_message_id)
@@ -567,7 +659,368 @@ class _TracingSession:
                         status="resolved",
                     )
                 )
+            for descriptor in source.middleware:
+                middleware_capture = self._policy.middleware_capture(
+                    name=descriptor.name,
+                    class_name=descriptor.class_name,
+                )
+                if middleware_capture.mode == "disabled":
+                    continue
+                self._configured_middleware.add(descriptor.name)
+                facts.append(
+                    _make_fact(
+                        MiddlewareFact,
+                        common,
+                        middleware_id=_scope_id(
+                            "middleware",
+                            (),
+                            f"{observation.identity.run_id}:{descriptor.name}",
+                        ),
+                        name=descriptor.name,
+                        class_name=descriptor.class_name,
+                        hooks=descriptor.hooks,
+                    )
+                )
             return facts
+        if isinstance(observation, AgentStepObservation):
+            middleware_configuration: TraceSemanticFact | None = None
+            if observation.step_kind == "middleware":
+                middleware_name = observation.middleware_name
+                if middleware_name is None:  # pragma: no cover - contract validation
+                    raise TraceCorruption("middleware Agent step has no name")
+                descriptor = self._middleware_descriptors.get(middleware_name)
+                class_name = (
+                    descriptor.class_name
+                    if descriptor is not None
+                    else self._policy._middleware_class_name(middleware_name)
+                )
+                middleware_capture = self._policy.middleware_capture(
+                    name=middleware_name,
+                    class_name=class_name,
+                )
+                if (
+                    middleware_capture.mode != "disabled"
+                    and middleware_name not in self._configured_middleware
+                ):
+                    self._configured_middleware.add(middleware_name)
+                    middleware_configuration = _make_fact(
+                        MiddlewareFact,
+                        common,
+                        middleware_id=_scope_id(
+                            "middleware",
+                            (),
+                            f"{observation.identity.run_id}:{middleware_name}",
+                        ),
+                        name=middleware_name,
+                        class_name=class_name,
+                        hooks=(
+                            descriptor.hooks
+                            if descriptor is not None
+                            else (
+                                () if observation.hook is None else (observation.hook,)
+                            )
+                        ),
+                    )
+                if middleware_capture.mode != "visible":
+                    return (
+                        []
+                        if middleware_configuration is None
+                        else [middleware_configuration]
+                    )
+            if observation.step_kind == "agent":
+                call_id = _scope_id(
+                    "agent",
+                    observation.namespace,
+                    observation.identity.run_id,
+                )
+            elif observation.step_kind == "subagent" and observation.namespace:
+                call_id = _scope_id(
+                    "subagent",
+                    observation.namespace,
+                    observation.namespace[-1],
+                )
+            else:
+                call_id = _scope_id(
+                    "agent-step",
+                    observation.namespace,
+                    observation.call_id,
+                )
+            parent_call_id = (
+                None
+                if observation.parent_call_id is None
+                else self._callback_entries.get(observation.parent_call_id)
+            )
+            if observation.phase == "started":
+                self._callback_entries[observation.call_id] = call_id
+            elif observation.phase in {
+                "completed",
+                "failed",
+                "cancelled",
+                "interrupted",
+                "abandoned",
+            }:
+                self._callback_entries.pop(observation.call_id, None)
+            facts = (
+                [] if middleware_configuration is None else [middleware_configuration]
+            )
+            if observation.failure_origin:
+                self._failure_origin_seen = True
+            facts.append(
+                _make_fact(
+                    AgentStepFact,
+                    common,
+                    namespace=observation.namespace,
+                    phase=observation.phase,
+                    call_id=call_id,
+                    parent_call_id=parent_call_id,
+                    step_kind=observation.step_kind,
+                    name=observation.name,
+                    source_task_id=observation.task_id,
+                    agent_name=observation.agent_name,
+                    middleware_name=observation.middleware_name,
+                    hook=observation.hook,
+                    error_type=observation.error_type,
+                    error_message=(
+                        self._capture(observation.error_message)
+                        if self._policy.include_error_messages
+                        and observation.error_message is not None
+                        else None
+                    ),
+                    failure_origin=observation.failure_origin,
+                )
+            )
+            return facts
+        if isinstance(observation, ModelCallObservation):
+            if observation.failure_origin:
+                self._failure_origin_seen = True
+            call_id = _scope_id(
+                "model-call",
+                observation.namespace,
+                observation.call_id,
+            )
+            if observation.phase == "started":
+                self._callback_entries[observation.call_id] = call_id
+            elif observation.phase in {
+                "completed",
+                "failed",
+                "cancelled",
+                "interrupted",
+                "abandoned",
+            }:
+                self._callback_entries.pop(observation.call_id, None)
+            if observation.phase == "completed":
+                for tool_call_id in observation.tool_call_ids:
+                    self._tool_call_models[(observation.namespace, tool_call_id)] = (
+                        call_id
+                    )
+            request = (
+                None
+                if observation.phase != "started"
+                else self._capture(
+                    {
+                        "messages": [
+                            message.model_dump(mode="json", by_alias=True)
+                            for message in observation.messages
+                        ],
+                        "invocation": observation.invocation,
+                        "options": observation.options,
+                    }
+                )
+            )
+            return [
+                _make_fact(
+                    ModelCallFact,
+                    common,
+                    namespace=observation.namespace,
+                    phase=observation.phase,
+                    call_id=call_id,
+                    parent_call_id=(
+                        None
+                        if observation.parent_call_id is None
+                        else self._callback_entries.get(observation.parent_call_id)
+                    ),
+                    agent_name=observation.agent_name,
+                    provider=observation.provider,
+                    model=observation.model,
+                    request=request,
+                    usage=(
+                        None
+                        if observation.usage is None
+                        else self._capture(observation.usage)
+                    ),
+                    response_metadata=(
+                        None
+                        if observation.response_metadata is None
+                        else self._capture(observation.response_metadata)
+                    ),
+                    tool_call_ids=observation.tool_call_ids,
+                    error_type=observation.error_type,
+                    error_message=(
+                        self._capture(observation.error_message)
+                        if self._policy.include_error_messages
+                        and observation.error_message is not None
+                        else None
+                    ),
+                    failure_origin=observation.failure_origin,
+                )
+            ]
+        if isinstance(observation, ToolExecutionObservation):
+            execution_id = _scope_id(
+                "tool-execution",
+                observation.namespace,
+                observation.execution_id,
+            )
+            if observation.phase == "started":
+                if observation.execution_id in self._tool_executions:
+                    raise TraceCorruption("Tool execution started more than once")
+                if observation.input is None:  # pragma: no cover - contract validation
+                    raise TraceCorruption("Tool execution start has no input")
+                if observation.tool_call_id is not None:
+                    self._tool_execution_by_call[
+                        (observation.namespace, observation.tool_call_id)
+                    ] = execution_id
+                traced = self._policy.traces_tool(observation.tool_name)
+                if traced and observation.tool_call_id is not None:
+                    self._visible_tool_execution_calls.add(
+                        (observation.namespace, observation.tool_call_id)
+                    )
+                parent_call_id = (
+                    None
+                    if observation.parent_call_id is None
+                    else self._callback_entries.get(observation.parent_call_id)
+                )
+                self._tool_executions[observation.execution_id] = _PendingToolExecution(
+                    input=observation.input if traced else None,
+                    parent_call_id=parent_call_id,
+                    namespace=observation.namespace,
+                    agent_name=observation.agent_name,
+                    tool_name=observation.tool_name,
+                    traced=traced,
+                )
+                if not traced:
+                    return []
+                self._callback_entries[observation.execution_id] = execution_id
+                return [
+                    _make_fact(
+                        ToolExecutionFact,
+                        common,
+                        namespace=observation.namespace,
+                        phase="started",
+                        execution_id=execution_id,
+                        parent_call_id=parent_call_id,
+                        agent_name=observation.agent_name,
+                        source_tool_call_id=observation.tool_call_id,
+                        tool_name=observation.tool_name,
+                        input=self._policy.capture_tool(
+                            tool_name=observation.tool_name,
+                            value=observation.input,
+                            target="arguments",
+                            max_bytes=self._payload_budget,
+                        ),
+                    )
+                ]
+            pending = self._tool_executions.pop(observation.execution_id, None)
+            self._callback_entries.pop(observation.execution_id, None)
+            if pending is None:
+                raise TraceCorruption("Tool execution terminal has no matching start")
+            if (
+                pending.namespace != observation.namespace
+                or pending.agent_name != observation.agent_name
+                or pending.tool_name != observation.tool_name
+            ):
+                raise TraceCorruption("Tool execution identity changed before terminal")
+            if not pending.traced:
+                return []
+            if observation.failure_origin:
+                self._failure_origin_seen = True
+            output = (
+                None
+                if observation.output is None
+                else self._policy.capture_tool(
+                    tool_name=observation.tool_name,
+                    value=observation.output,
+                    target="result",
+                    max_bytes=self._payload_budget,
+                )
+            )
+            facts = [
+                _make_fact(
+                    ToolExecutionFact,
+                    common,
+                    namespace=observation.namespace,
+                    phase=observation.phase,
+                    execution_id=execution_id,
+                    parent_call_id=pending.parent_call_id,
+                    agent_name=observation.agent_name,
+                    source_tool_call_id=observation.tool_call_id,
+                    tool_name=observation.tool_name,
+                    output=output,
+                    error_type=observation.error_type,
+                    error_message=(
+                        self._capture(observation.error_message)
+                        if self._policy.include_error_messages
+                        and observation.error_message is not None
+                        else None
+                    ),
+                    failure_origin=observation.failure_origin,
+                )
+            ]
+            skill = self._successful_skill(pending, observation)
+            if skill is not None:
+                skill_name, source_path = skill
+                facts.append(
+                    _make_fact(
+                        SkillFact,
+                        common,
+                        namespace=observation.namespace,
+                        skill_id=_scope_id(
+                            "skill",
+                            observation.namespace,
+                            observation.execution_id,
+                        ),
+                        execution_id=execution_id,
+                        name=skill_name,
+                        source_path=source_path,
+                        agent_name=observation.agent_name,
+                    )
+                )
+            return facts
+        if isinstance(observation, ContextContributionObservation):
+            if observation.failure_origin:
+                self._failure_origin_seen = True
+            parent_call_id = (
+                None
+                if observation.parent_call_id is None
+                else self._callback_entries.get(observation.parent_call_id)
+            )
+            return [
+                _make_fact(
+                    ContextContributionFact,
+                    common,
+                    namespace=observation.namespace,
+                    phase=observation.phase,
+                    contribution_id=_scope_id(
+                        "context",
+                        observation.namespace,
+                        observation.contribution_id,
+                    ),
+                    parent_call_id=parent_call_id,
+                    context_kind=observation.context_kind,
+                    name=observation.name,
+                    input=(
+                        None
+                        if observation.input is None
+                        else self._capture(observation.input)
+                    ),
+                    output=(
+                        None
+                        if observation.output is None
+                        else self._capture(observation.output)
+                    ),
+                    error_type=observation.error_type,
+                    failure_origin=observation.failure_origin,
+                )
+            ]
         if isinstance(observation, RunResumeCheckpointedObservation):
             return [
                 _make_fact(
@@ -588,8 +1041,16 @@ class _TracingSession:
                 )
             ]
         if isinstance(observation, RunTerminalObservation):
+            facts = self._terminal_settlement_facts(
+                observation,
+                common=common,
+                source_id=source_id,
+            )
             self._active_subagents.clear()
-            return [
+            self._active_runtime_tasks.clear()
+            self._callback_entries.clear()
+            self._tool_executions.clear()
+            facts.append(
                 _make_fact(
                     RunFact,
                     common,
@@ -597,8 +1058,14 @@ class _TracingSession:
                     outcome=observation.outcome,
                     code=observation.code,
                     error_type=observation.error_type,
-                ),
-            ]
+                    failure_origin=(
+                        observation.outcome == "failed"
+                        and observation.error_type is not None
+                        and not self._failure_origin_seen
+                    ),
+                )
+            )
+            return facts
         if isinstance(observation, RunClosedObservation):
             return [
                 _make_fact(
@@ -617,12 +1084,43 @@ class _TracingSession:
         elif isinstance(observation, NativeReasoningObservation):
             facts.extend(self._reasoning_facts(observation, source_id=source_id))
         elif isinstance(observation, NativeTaskObservation):
+            task_key = (observation.namespace, observation.task_id)
+            if observation.phase == "start":
+                previous_task = self._active_runtime_tasks.get(task_key)
+                if (
+                    previous_task is not None
+                    and previous_task.run_id == observation.identity.run_id
+                ):
+                    raise TraceCorruption("Native Runtime task started more than once")
+                self._active_runtime_tasks[task_key] = _PendingRuntimeTask(
+                    namespace=observation.namespace,
+                    run_id=observation.identity.run_id,
+                    source_task_id=observation.task_id,
+                    task_name=observation.name,
+                )
+                task_phase = "started"
+            else:
+                pending_task = self._active_runtime_tasks.pop(task_key, None)
+                if (
+                    pending_task is not None
+                    and pending_task.task_name != observation.name
+                ):
+                    raise TraceCorruption(
+                        "Native Runtime task name changed before result"
+                    )
+                task_phase = (
+                    "interrupted"
+                    if observation.interrupts
+                    else (
+                        "failed" if observation.error_type is not None else "completed"
+                    )
+                )
             facts.append(
                 _make_fact(
                     RuntimeTaskFact,
                     common,
                     namespace=namespace,
-                    phase="started" if observation.phase == "start" else "completed",
+                    phase=task_phase,
                     task_id=_scope_id("task", namespace, observation.task_id),
                     source_task_id=observation.task_id,
                     task_name=observation.name,
@@ -653,8 +1151,14 @@ class _TracingSession:
                     interrupt_ids=tuple(
                         interrupt.id for interrupt in observation.interrupts
                     ),
+                    failure_origin=(
+                        task_phase == "failed"
+                        and not self._context.call_tracking_enabled
+                    ),
                 )
             )
+            if task_phase == "failed" and not self._context.call_tracking_enabled:
+                self._failure_origin_seen = True
             facts.extend(self._subagent_completions(observation, source_id=source_id))
         elif isinstance(observation, NativeStateObservation):
             facts.extend(self._state_facts(observation, source_id=source_id))
@@ -673,6 +1177,105 @@ class _TracingSession:
                     ),
                 )
             )
+        return facts
+
+    def _terminal_settlement_facts(
+        self,
+        observation: RunTerminalObservation,
+        *,
+        common: Mapping[str, object],
+        source_id: str,
+    ) -> list[TraceSemanticFact]:
+        """Settle Native work that emitted no result before the Run terminal.
+
+        Native task results remain authoritative when present. Missing results cannot
+        inherit a Run failure as their own error: interrupted work waits, explicit Run
+        cancellation cancels it, and every other unmatched node is abandoned. Tool
+        proposals remain waiting across an interrupt so a resumed checkpoint can still
+        resolve the same proposal.
+        """
+
+        terminal_phase: Literal["interrupted", "cancelled", "abandoned"]
+        if observation.outcome == "interrupted":
+            terminal_phase = "interrupted"
+        elif observation.outcome == "cancelled":
+            terminal_phase = "cancelled"
+        else:
+            terminal_phase = "abandoned"
+        facts: list[TraceSemanticFact] = []
+        for key, task in sorted(self._active_runtime_tasks.items()):
+            facts.append(
+                _make_fact(
+                    RuntimeTaskFact,
+                    common,
+                    namespace=task.namespace,
+                    phase=terminal_phase,
+                    task_id=_scope_id(
+                        "task",
+                        task.namespace,
+                        task.source_task_id,
+                    ),
+                    source_task_id=task.source_task_id,
+                    task_name=task.task_name,
+                    interrupt_ids=(
+                        observation.interrupt_ids
+                        if terminal_phase == "interrupted"
+                        else ()
+                    ),
+                )
+            )
+            self._active_runtime_tasks.pop(key, None)
+        for namespace, (subagent_id, agent_name) in sorted(
+            self._active_subagents.items()
+        ):
+            waiting = terminal_phase == "interrupted"
+            subagent_status: Literal["waiting", "cancelled", "abandoned"]
+            if waiting:
+                subagent_status = "waiting"
+            elif terminal_phase == "cancelled":
+                subagent_status = "cancelled"
+            else:
+                subagent_status = "abandoned"
+            facts.append(
+                SubagentFact(
+                    source_observation_id=source_id,
+                    identity=observation.identity,
+                    namespace=namespace,
+                    occurred_at=observation.observed_at,
+                    monotonic_ns=observation.monotonic_ns,
+                    phase="updated" if waiting else "completed",
+                    subagent_id=subagent_id,
+                    agent_name=agent_name,
+                    status=subagent_status,
+                )
+            )
+            self._subagent_descriptors.pop(namespace, None)
+        if terminal_phase != "interrupted":
+            unresolved_tools = sorted(self._tool_started - self._tool_results)
+            for namespace, tool_call_id in unresolved_tools:
+                tool_name = self._tool_names.get((namespace, tool_call_id))
+                if tool_name is None or not self._policy.traces_tool(tool_name):
+                    continue
+                facts.append(
+                    _make_fact(
+                        ToolFact,
+                        common,
+                        namespace=namespace,
+                        phase=(
+                            "cancelled"
+                            if terminal_phase == "cancelled"
+                            else "abandoned"
+                        ),
+                        tool_call_id=_scope_id("tool", namespace, tool_call_id),
+                        source_tool_call_id=tool_call_id,
+                        parent_call_id=self._tool_call_models.get(
+                            (namespace, tool_call_id)
+                        ),
+                        tool_name=tool_name,
+                    )
+                )
+                self._tool_results.add((namespace, tool_call_id))
+                self._tool_completed.add((namespace, tool_call_id))
         return facts
 
     def _reasoning_facts(
@@ -715,6 +1318,8 @@ class _TracingSession:
                 observation.content,
                 max_bytes=self._payload_budget,
             )
+            if captured.disposition == "omitted" and key in self._active_reasoning:
+                return facts
             if key in self._reasoning_completed and captured.disposition == "omitted":
                 return facts
             self._reasoning_completed.discard(key)
@@ -743,7 +1348,10 @@ class _TracingSession:
         if already_completed and (content_matches or captured.disposition == "omitted"):
             self._active_reasoning.pop(key, None)
             return facts
-        if not content_matches:
+        omission_already_recorded = (
+            captured.disposition == "omitted" and key in self._active_reasoning
+        )
+        if not content_matches and not omission_already_recorded:
             self._track_reasoning_content(key, captured, append=False)
             facts.append(
                 self._reasoning_content_fact(
@@ -966,6 +1574,7 @@ class _TracingSession:
                                 phase="started",
                                 tool_call_id=_scope_id("tool", namespace, chunk.id),
                                 source_tool_call_id=chunk.id,
+                                parent_call_id=self._tool_call_models.get(key),
                                 tool_name=chunk.name,
                             )
                         )
@@ -990,7 +1599,7 @@ class _TracingSession:
                 )
                 if content is not None:
                     self._tool_argument_snapshots.add(tool_key)
-                if self._policy.traces_tool(tool_name):
+                if self._policy.traces_tool(tool_name) and content is not None:
                     facts.append(
                         _make_fact(
                             ToolFact,
@@ -998,6 +1607,7 @@ class _TracingSession:
                             phase="arguments",
                             tool_call_id=_scope_id("tool", namespace, tool_id),
                             source_tool_call_id=tool_id,
+                            parent_call_id=self._tool_call_models.get(tool_key),
                             tool_name=tool_name,
                             content=content,
                         )
@@ -1016,6 +1626,7 @@ class _TracingSession:
                                 phase="started",
                                 tool_call_id=_scope_id("tool", namespace, call.id),
                                 source_tool_call_id=call.id,
+                                parent_call_id=self._tool_call_models.get(key),
                                 tool_name=call.name,
                             ),
                         )
@@ -1038,6 +1649,7 @@ class _TracingSession:
                             phase="arguments",
                             tool_call_id=_scope_id("tool", namespace, call.id),
                             source_tool_call_id=call.id,
+                            parent_call_id=self._tool_call_models.get(key),
                             tool_name=call.name,
                             content=self._policy.capture_tool(
                                 tool_name=call.name,
@@ -1055,6 +1667,7 @@ class _TracingSession:
                             phase="completed",
                             tool_call_id=_scope_id("tool", namespace, call.id),
                             source_tool_call_id=call.id,
+                            parent_call_id=self._tool_call_models.get(key),
                             tool_name=call.name,
                         )
                     )
@@ -1088,10 +1701,17 @@ class _TracingSession:
                     phase="completed",
                     tool_call_id=_scope_id("tool", namespace, message.tool_call_id),
                     source_tool_call_id=message.tool_call_id,
+                    parent_call_id=self._tool_call_models.get(key),
                     tool_name=tool_name,
                 )
             )
             self._tool_completed.add(key)
+        result_status = message.tool_status or "success"
+        failure_origin = (
+            result_status == "error" and key not in self._visible_tool_execution_calls
+        )
+        if failure_origin:
+            self._failure_origin_seen = True
         facts.append(
             _make_fact(
                 ToolFact,
@@ -1099,6 +1719,7 @@ class _TracingSession:
                 phase="result",
                 tool_call_id=_scope_id("tool", namespace, message.tool_call_id),
                 source_tool_call_id=message.tool_call_id,
+                parent_call_id=self._tool_call_models.get(key),
                 tool_name=tool_name,
                 content=self._policy.capture_tool(
                     tool_name=tool_name,
@@ -1106,7 +1727,8 @@ class _TracingSession:
                     target="result",
                     max_bytes=self._payload_budget,
                 ),
-                result_status=message.tool_status or "success",
+                result_status=result_status,
+                failure_origin=failure_origin,
             )
         )
         return facts
@@ -1364,6 +1986,13 @@ class _TracingSession:
                 parent_tool_call_id=(
                     None if descriptor is None else descriptor.parent_tool_call_id
                 ),
+                parent_execution_id=(
+                    None
+                    if descriptor is None
+                    else self._tool_execution_by_call.get(
+                        (namespace[:-1], descriptor.parent_tool_call_id)
+                    )
+                ),
                 input=(
                     None
                     if descriptor is None
@@ -1501,6 +2130,30 @@ class _TracingSession:
         key = matches[0]
         pending = self._pending_interactions.pop(key)
         return key[0], pending
+
+    def _successful_skill(
+        self,
+        pending: _PendingToolExecution,
+        observation: ToolExecutionObservation,
+    ) -> tuple[str, str] | None:
+        """Recognize only a successful exact configured ``SKILL.md`` read."""
+
+        if observation.phase != "completed" or pending.tool_name != "read_file":
+            return None
+        if not isinstance(pending.input, dict):
+            return None
+        raw_path = pending.input.get("file_path")
+        if not isinstance(raw_path, str) or not raw_path:
+            return None
+        candidate = PurePosixPath(raw_path)
+        if candidate.name != "SKILL.md" or not candidate.parent.name:
+            return None
+        for source in self._context.skill_sources:
+            if source.agent_name != pending.agent_name:
+                continue
+            if candidate.parent.parent == PurePosixPath(source.path):
+                return candidate.parent.name, str(candidate)
+        return None
 
     @property
     def _payload_budget(self) -> int:
@@ -1915,6 +2568,219 @@ class Tracer:
             projection_names=projections,
         )
 
+    async def query(
+        self,
+        thread_id: str,
+        *,
+        where: TraceFilter | None = None,
+        head_run_id: str | None = None,
+        cursor: str | None = None,
+        limit: int = 100,
+    ) -> TraceQuery:
+        """Return one directly filtered current entry page with live following.
+
+        Args:
+            thread_id: Canonical Trace thread identity.
+            where: Functional indexed filters. Omitting it selects every entry kind.
+            head_run_id: Optional explicit branch head.
+            cursor: Optional opaque cursor from the same generation and filter.
+            limit: Positive maximum matching entries before requested ancestors.
+
+        Returns:
+            Current page values and a closeable filtered follow iterator.
+
+        Raises:
+            ValueError: An identity, filter, or limit is invalid.
+            InvalidTraceCursor: The cursor belongs to another query.
+            TraceThreadNotFound: The current generation is unavailable.
+            TraceStoreProtocolError: The Store does not support direct entry queries.
+        """
+
+        if (
+            not isinstance(thread_id, str)
+            or not thread_id
+            or thread_id != thread_id.strip()
+        ):
+            raise ValueError("thread_id must be canonical non-empty text")
+        if head_run_id is not None and (
+            not isinstance(head_run_id, str)
+            or not head_run_id
+            or head_run_id != head_run_id.strip()
+        ):
+            raise ValueError("head_run_id must be canonical non-empty text or None")
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 1000
+        ):
+            raise ValueError("limit must be an integer between 1 and 1000")
+        if where is not None and not isinstance(where, TraceFilter):
+            raise TypeError("where must be a TraceFilter or None")
+        resolved_filter = where or TraceFilter()
+        page, key = await self._query_entry_page(
+            thread_id,
+            where=resolved_filter,
+            head_run_id=head_run_id,
+            cursor=cursor,
+            limit=limit,
+            expected_key=None,
+        )
+
+        async def refresh() -> TraceEntryPage:
+            refreshed, _key = await self._query_entry_page(
+                thread_id,
+                where=resolved_filter,
+                head_run_id=head_run_id,
+                cursor=cursor,
+                limit=limit,
+                expected_key=key,
+            )
+            return refreshed
+
+        return TraceQuery(page, store=self._store, key=key, refresh=refresh)
+
+    async def rebuild_entries(self, thread_id: str) -> int:
+        """Reconstruct current query entries without changing authoritative facts.
+
+        Active sessions owned by this Tracer are flushed first. A concurrent commit by
+        another process makes the rebuild fail instead of publishing a partial index.
+
+        Args:
+            thread_id: Canonical Trace thread identity.
+
+        Returns:
+            Number of rebuilt query entries in the current generation.
+
+        Raises:
+            ValueError: ``thread_id`` is not canonical non-empty text.
+            TraceThreadNotFound: The current generation is unavailable.
+            TraceStoreProtocolError: The Store cannot rebuild entries or the Ledger
+                changes during reconstruction.
+        """
+
+        if (
+            not isinstance(thread_id, str)
+            or not thread_id
+            or thread_id != thread_id.strip()
+        ):
+            raise ValueError("thread_id must be canonical non-empty text")
+        sessions = tuple(self._sessions.get(thread_id, ()))
+        if sessions:
+            await asyncio.gather(*(session.flush() for session in sessions))
+        store = self._store
+        if not isinstance(store, TraceEntryRebuildStore):
+            raise TraceStoreProtocolError(
+                "Trace Store does not rebuild indexed entries"
+            )
+        snapshot = await store.snapshot(thread_id)
+        return await store.rebuild_trace_entries(snapshot.key)
+
+    async def _query_entry_page(
+        self,
+        thread_id: str,
+        *,
+        where: TraceFilter,
+        head_run_id: str | None,
+        cursor: str | None,
+        limit: int,
+        expected_key: TraceThreadKey | None,
+    ) -> tuple[TraceEntryPage, TraceThreadKey]:
+        sessions = tuple(self._sessions.get(thread_id, ()))
+        if sessions:
+            await asyncio.gather(*(session.flush() for session in sessions))
+        snapshot = await self._store.snapshot(thread_id)
+        if expected_key is not None and snapshot.key != expected_key:
+            raise TraceStoreProtocolError(
+                "Trace entry follow generation changed during the query"
+            )
+        core_state = await load_core_projection_state(
+            self._store,
+            snapshot.key,
+            as_of_seq=snapshot.as_of_seq,
+        )
+        window = select_core_projection_window(
+            core_state,
+            head_run_id=head_run_id,
+            turn_limit=max(1, len(core_state.turn_order)),
+        )
+        core = project_core_checkpoint(
+            core_state,
+            head_run_id=head_run_id,
+            turn_limit=1,
+            active_run_ids=snapshot.active_run_ids,
+        )
+        before_started_at: datetime | None = None
+        before_entry_id: str | None = None
+        if cursor is not None:
+            before_started_at, before_entry_id = decode_entry_cursor(
+                cursor,
+                key=snapshot.key,
+                head_run_id=head_run_id,
+                where=where,
+            )
+        store = self._store
+        if not isinstance(store, TraceEntryStore):
+            raise TraceStoreProtocolError(
+                "Trace Store does not provide indexed entry queries"
+            )
+        records = await store.query_trace_entries(
+            snapshot.key,
+            run_ids=tuple(sorted(core.selected_run_ids)),
+            where=where,
+            limit=limit,
+            before_started_at=before_started_at,
+            before_entry_id=before_entry_id,
+        )
+        projected_items: list[TraceEntry] = []
+        selected_turn_ids: set[str] = set()
+        for record in records.entries:
+            turn_id = window.run_turns.get(record.run_id)
+            if turn_id is None:
+                raise TraceStoreProtocolError(
+                    "Trace entry Run has no selected Turn ownership"
+                )
+            selected_turn_ids.add(turn_id)
+            projected_items.append(project_trace_entry(record, turn_id=turn_id))
+        tracked_run_ids = {
+            fact.identity.run_id
+            for fact in core_state.runs[window.selected_head].tree_facts
+            if isinstance(fact, AgentStepFact)
+            and fact.phase == "started"
+            and fact.step_kind == "agent"
+        }
+        next_cursor = (
+            encode_entry_cursor(
+                key=snapshot.key,
+                head_run_id=head_run_id,
+                where=where,
+                before_started_at=records.next_started_at,
+                before_entry_id=records.next_entry_id,
+            )
+            if records.has_more
+            and records.next_started_at is not None
+            and records.next_entry_id is not None
+            else None
+        )
+        return (
+            TraceEntryPage(
+                turns=_entry_turns(
+                    core_state,
+                    window,
+                    selected_turn_ids=selected_turn_ids,
+                ),
+                items=tuple(projected_items),
+                next_cursor=next_cursor,
+                as_of_seq=records.as_of_seq,
+                facets=records.facets,
+                completeness=TraceEntryCompleteness(
+                    call_tracking_missing=not records.call_tracking_present,
+                    execution_tree_missing=not window.selected_run_ids
+                    <= tracked_run_ids,
+                ),
+            ),
+            snapshot.key,
+        )
+
     def _session_closed(self, session: _TracingSession) -> None:
         """Remove one settled session from same-Tracer read-your-writes flushing."""
 
@@ -1925,6 +2791,62 @@ class Tracer:
         sessions.discard(session)
         if not sessions:
             self._sessions.pop(thread_id, None)
+
+
+def _entry_turns(
+    state: CoreProjectionState,
+    window: CoreProjectionWindow,
+    *,
+    selected_turn_ids: set[str],
+) -> tuple[TraceTurn, ...]:
+    """Resolve only the selected entry page's Turns from the core checkpoint."""
+
+    lineage_turn_ids = {
+        window.run_turns[run_id]
+        for run_id in window.selected_run_ids
+        if run_id in window.run_turns
+    }
+    ordered_turn_ids = [
+        turn_id for turn_id in state.turn_order if turn_id in lineage_turn_ids
+    ]
+    ordinals = {
+        turn_id: ordinal for ordinal, turn_id in enumerate(ordered_turn_ids, start=1)
+    }
+    turns: list[TraceTurn] = []
+    for turn_id in ordered_turn_ids:
+        if turn_id not in selected_turn_ids:
+            continue
+        checkpoint = state.turns.get(turn_id)
+        if checkpoint is None or not checkpoint.run_ids:
+            raise TraceStoreProtocolError("Trace entry Turn checkpoint is unavailable")
+        run_checkpoints = tuple(
+            state.runs[run_id] for run_id in checkpoint.run_ids if run_id in state.runs
+        )
+        if not run_checkpoints:
+            raise TraceStoreProtocolError("Trace entry Turn has no available Run")
+        user_message = None
+        if checkpoint.user_message_id is not None:
+            candidates = (
+                message
+                for run in run_checkpoints
+                for message in run.messages
+                if message.role == "user"
+                and message.source_id == checkpoint.user_message_id
+            )
+            user_message = min(
+                candidates, key=lambda item: item.trace_seq, default=None
+            )
+        turns.append(
+            TraceTurn(
+                id=turn_id,
+                ordinal=ordinals[turn_id],
+                started_at=min(run.started_at for run in run_checkpoints),
+                user_message=(
+                    None if user_message is None else user_message.model_copy(deep=True)
+                ),
+            )
+        )
+    return tuple(turns)
 
 
 def _projection_registry(

@@ -1787,7 +1787,10 @@ test('HITL 始终展开并忽略旧的会话级收起缓存', async ({ page }) =
 
 test('待审批会话忽略缓存位置一次到底且不锁住后续滚动', async ({ page }) => {
   await page.addInitScript((key) => {
-    window.sessionStorage.setItem(key, '120')
+    window.sessionStorage.setItem(key, JSON.stringify({
+      scrollTop: 120,
+      followLatest: false,
+    }))
   }, `tinkerfin:conversation-scroll:${THREAD_ID}`)
   await mockStudio(page, {
     approval: true,

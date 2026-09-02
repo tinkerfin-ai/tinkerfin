@@ -21,13 +21,13 @@ from tinkerfin_studio.resources import get_resources
 
 
 async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
-    """为一个 HTTP 请求借用独立异步数据库会话"""
+    """为一个 HTTP 入口借用会话，并在响应内容发送前归还连接"""
 
     async with get_resources(request.app).database.session() as session:
         yield session
 
 
-SessionDep = Annotated[AsyncSession, Depends(get_session)]
+SessionDep = Annotated[AsyncSession, Depends(get_session, scope="function")]
 
 
 async def get_auth_service(request: Request, session: SessionDep) -> AuthService:

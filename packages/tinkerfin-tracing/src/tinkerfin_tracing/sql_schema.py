@@ -25,6 +25,7 @@ TRACE_TABLE_NAMES = (
     "tinkerfin_trace_threads",
     "tinkerfin_trace_writers",
     "tinkerfin_trace_events",
+    "tinkerfin_trace_entries",
     "tinkerfin_trace_projection_checkpoints",
 )
 
@@ -266,8 +267,175 @@ Index(
     events.c.trace_seq,
 )
 
-projection_checkpoints = Table(
+entries = Table(
     TRACE_TABLE_NAMES[4],
+    metadata,
+    Column(
+        "namespace_hash", String(64), primary_key=True, comment="SHA-256 namespace key"
+    ),
+    Column("thread_hash", String(64), primary_key=True, comment="SHA-256 thread key"),
+    Column(
+        "generation", String(64), primary_key=True, comment="Exact Trace generation ID"
+    ),
+    Column(
+        "entry_hash", String(64), primary_key=True, comment="SHA-256 entry identity key"
+    ),
+    Column("entry_id", Text, nullable=False, comment="Canonical Trace entry identity"),
+    Column(
+        "parent_hash",
+        String(64),
+        nullable=True,
+        comment="SHA-256 parent identity key when present",
+    ),
+    Column("parent_id", Text, nullable=True, comment="Canonical parent entry identity"),
+    Column("kind", String(32), nullable=False, comment="Functional entry kind"),
+    Column("status", String(32), nullable=False, comment="Current entry status"),
+    Column("name_hash", String(64), nullable=False, comment="SHA-256 display-name key"),
+    Column("name", Text, nullable=False, comment="Functional entry display name"),
+    Column("run_hash", String(64), nullable=False, comment="SHA-256 Run key"),
+    Column("run_id", Text, nullable=False, comment="Semantic Run owning the entry"),
+    Column(
+        "graph_namespace_hash",
+        String(64),
+        nullable=False,
+        comment="SHA-256 canonical graph namespace key",
+    ),
+    Column(
+        "graph_namespace",
+        Text,
+        nullable=False,
+        comment="Canonical JSON graph namespace",
+    ),
+    Column(
+        "agent_hash",
+        String(64),
+        nullable=True,
+        comment="SHA-256 Agent name key when present",
+    ),
+    Column("agent_name", Text, nullable=True, comment="Named subagent when present"),
+    Column(
+        "provider_hash",
+        String(64),
+        nullable=True,
+        comment="SHA-256 model provider key when present",
+    ),
+    Column("provider", Text, nullable=True, comment="Model provider when present"),
+    Column(
+        "model_hash",
+        String(64),
+        nullable=True,
+        comment="SHA-256 model name key when present",
+    ),
+    Column("model", Text, nullable=True, comment="Model name when present"),
+    Column(
+        "started_at",
+        _DATABASE_TIMESTAMP,
+        nullable=False,
+        comment="Source UTC entry start time",
+    ),
+    Column(
+        "first_output_at",
+        _DATABASE_TIMESTAMP,
+        nullable=True,
+        comment="Source UTC first model output time",
+    ),
+    Column(
+        "completed_at",
+        _DATABASE_TIMESTAMP,
+        nullable=True,
+        comment="Source UTC entry completion time",
+    ),
+    Column(
+        "started_seq",
+        BigInteger,
+        nullable=False,
+        comment="Ledger event containing authoritative start details",
+    ),
+    Column(
+        "updated_seq",
+        BigInteger,
+        nullable=False,
+        comment="Ledger event containing the current entry update",
+    ),
+    comment="Disposable directly filterable Trace entry index without fact payloads",
+)
+Index(
+    "ix_tinkerfin_trace_entries_page",
+    entries.c.namespace_hash,
+    entries.c.thread_hash,
+    entries.c.generation,
+    entries.c.started_at,
+    entries.c.entry_hash,
+)
+Index(
+    "ix_tinkerfin_trace_entries_run",
+    entries.c.namespace_hash,
+    entries.c.thread_hash,
+    entries.c.generation,
+    entries.c.run_hash,
+    entries.c.started_at,
+)
+Index(
+    "ix_tinkerfin_trace_entries_kind_status",
+    entries.c.namespace_hash,
+    entries.c.thread_hash,
+    entries.c.generation,
+    entries.c.kind,
+    entries.c.status,
+    entries.c.started_at,
+)
+Index(
+    "ix_tinkerfin_trace_entries_parent",
+    entries.c.namespace_hash,
+    entries.c.thread_hash,
+    entries.c.generation,
+    entries.c.parent_hash,
+    entries.c.started_at,
+)
+Index(
+    "ix_tinkerfin_trace_entries_name",
+    entries.c.namespace_hash,
+    entries.c.thread_hash,
+    entries.c.generation,
+    entries.c.name_hash,
+    entries.c.started_at,
+)
+Index(
+    "ix_tinkerfin_trace_entries_agent",
+    entries.c.namespace_hash,
+    entries.c.thread_hash,
+    entries.c.generation,
+    entries.c.agent_hash,
+    entries.c.started_at,
+)
+Index(
+    "ix_tinkerfin_trace_entries_provider_model",
+    entries.c.namespace_hash,
+    entries.c.thread_hash,
+    entries.c.generation,
+    entries.c.provider_hash,
+    entries.c.model_hash,
+    entries.c.started_at,
+)
+Index(
+    "ix_tinkerfin_trace_entries_model",
+    entries.c.namespace_hash,
+    entries.c.thread_hash,
+    entries.c.generation,
+    entries.c.model_hash,
+    entries.c.started_at,
+)
+Index(
+    "ix_tinkerfin_trace_entries_namespace",
+    entries.c.namespace_hash,
+    entries.c.thread_hash,
+    entries.c.generation,
+    entries.c.graph_namespace_hash,
+    entries.c.started_at,
+)
+
+projection_checkpoints = Table(
+    TRACE_TABLE_NAMES[5],
     metadata,
     Column(
         "namespace_hash", String(64), primary_key=True, comment="SHA-256 namespace key"

@@ -28,6 +28,7 @@ from tinkerfin_contracts import (
     RunStartedObservation,
     RunTerminalObservation,
     RunTerminalOutcome,
+    ToolExecutionObservation,
 )
 from tinkerfin_tracing import (
     CapturePolicy,
@@ -40,6 +41,7 @@ from tinkerfin_tracing import (
     StateRevisionFact,
     SubagentFact,
     ToolCaptureRule,
+    ToolExecutionFact,
     ToolFact,
     ToolTraceCapture,
     TraceCaptureRejected,
@@ -194,6 +196,8 @@ async def test_tool_allowlist_is_applied_to_the_complete_arguments_snapshot() ->
     arguments: dict[str, JsonValue] = {
         "todos": [{"content": "Inspect", "status": "pending"}]
     }
+    encoded_arguments = json.dumps(arguments, separators=(",", ":"))
+    split = len(encoded_arguments) // 2
     await session.observe(
         NativeMessageObservation(
             identity=context.identity,
@@ -207,7 +211,26 @@ async def test_tool_allowlist_is_applied_to_the_complete_arguments_snapshot() ->
                         index=0,
                         id="call-todos",
                         name="write_todos",
-                        arguments=json.dumps(arguments, separators=(",", ":")),
+                        arguments=encoded_arguments[:split],
+                    ),
+                ),
+            ),
+            observed_at=datetime.now(UTC),
+            monotonic_ns=3,
+        )
+    )
+    await session.observe(
+        NativeMessageObservation(
+            identity=context.identity,
+            namespace=(),
+            message=NativeMessageRecord(
+                message_type="assistant_chunk",
+                id="assistant-tool",
+                content="",
+                tool_call_chunks=(
+                    NativeToolCallChunk(
+                        index=0,
+                        arguments=encoded_arguments[split:],
                     ),
                 ),
                 tool_calls=(
@@ -219,7 +242,7 @@ async def test_tool_allowlist_is_applied_to_the_complete_arguments_snapshot() ->
                 ),
             ),
             observed_at=datetime.now(UTC),
-            monotonic_ns=3,
+            monotonic_ns=4,
         )
     )
     await _finish(session, context)
@@ -230,8 +253,9 @@ async def test_tool_allowlist_is_applied_to_the_complete_arguments_snapshot() ->
         if isinstance(event.fact, ToolFact) and event.fact.phase == "arguments"
     ]
 
-    assert argument_facts[-1].content is not None
-    assert argument_facts[-1].content.value == {"/todos/0/content": "Inspect"}
+    assert len(argument_facts) == 1
+    assert argument_facts[0].content is not None
+    assert argument_facts[0].content.value == {"/todos/0/content": "Inspect"}
 
 
 async def test_root_tool_capture_populates_bounded_node_input_and_result() -> None:
@@ -322,6 +346,30 @@ async def test_disabled_tool_emits_no_tool_or_result_message_facts() -> None:
         )
     )
     await session.observe(
+        ToolExecutionObservation(
+            identity=context.identity,
+            phase="started",
+            execution_id="execution-disabled-tool",
+            tool_call_id="call-disabled-tool",
+            tool_name="private_tool",
+            input={"secret": "private"},
+            observed_at=datetime.now(UTC),
+            monotonic_ns=4,
+        )
+    )
+    await session.observe(
+        ToolExecutionObservation(
+            identity=context.identity,
+            phase="completed",
+            execution_id="execution-disabled-tool",
+            tool_call_id="call-disabled-tool",
+            tool_name="private_tool",
+            output={"secret": "private"},
+            observed_at=datetime.now(UTC),
+            monotonic_ns=5,
+        )
+    )
+    await session.observe(
         NativeMessageObservation(
             identity=context.identity,
             namespace=(),
@@ -333,7 +381,7 @@ async def test_disabled_tool_emits_no_tool_or_result_message_facts() -> None:
                 tool_call_id="call-disabled-tool",
             ),
             observed_at=datetime.now(UTC),
-            monotonic_ns=4,
+            monotonic_ns=6,
         )
     )
     await _finish(session, context)
@@ -342,6 +390,7 @@ async def test_disabled_tool_emits_no_tool_or_result_message_facts() -> None:
     events = (await thread.events(limit=100)).items
 
     assert not any(isinstance(event.fact, ToolFact) for event in events)
+    assert not any(isinstance(event.fact, ToolExecutionFact) for event in events)
     assert not any(
         isinstance(event.fact, MessageFact) and event.fact.role == "tool"
         for event in events

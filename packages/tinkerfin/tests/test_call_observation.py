@@ -1,0 +1,730 @@
+"""Provider and Tool call observation through the managed Runtime facade."""
+
+from __future__ import annotations
+
+import asyncio
+import gc
+import weakref
+from collections.abc import Awaitable, Callable, Sequence
+from typing import Any
+from uuid import uuid4
+
+import pytest
+from langchain.agents.middleware.types import (
+    AgentMiddleware,
+    ModelRequest,
+    ModelResponse,
+)
+from langchain.tools import tool
+from langchain_core.language_models.fake_chat_models import (
+    FakeListChatModel,
+    FakeMessagesListChatModel,
+)
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.outputs import LLMResult
+from langchain_core.runnables import Runnable
+from langchain_core.tools import BaseTool
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import Command
+
+from tinkerfin import (
+    RunIdentity,
+    TinkerFin,
+    trace_contribution,
+)
+from tinkerfin._observation import RuntimeObservationHub
+from tinkerfin_contracts import (
+    AgentStepObservation,
+    ContextContributionObservation,
+    ModelCallObservation,
+    ObservationBoundary,
+    RunObservationSession,
+    RunSourceContext,
+    RuntimeObservation,
+    ToolExecutionObservation,
+)
+
+
+class _Session:
+    def __init__(self) -> None:
+        self.observations: list[RuntimeObservation] = []
+        self.boundaries: list[ObservationBoundary] = []
+        self.failure: asyncio.Future[BaseException] | None = None
+
+    async def observe(self, observation: RuntimeObservation) -> None:
+        self.observations.append(observation)
+
+    async def force(self, boundary: ObservationBoundary) -> None:
+        self.boundaries.append(boundary)
+
+    def failure_waiter(self) -> Awaitable[BaseException]:
+        if self.failure is None:
+            self.failure = asyncio.get_running_loop().create_future()
+        return self.failure
+
+    async def aclose(self) -> None:
+        return None
+
+
+class _Observer:
+    def __init__(self, session: _Session) -> None:
+        self.session = session
+        self.contexts: list[RunSourceContext] = []
+
+    async def open_run(self, context: RunSourceContext) -> RunObservationSession:
+        self.contexts.append(context)
+        return self.session
+
+
+class _StreamingModel(FakeListChatModel):
+    def bind_tools(
+        self,
+        tools: Sequence[dict[str, Any] | type | Callable[..., Any] | BaseTool],
+        **kwargs: Any,
+    ) -> Runnable:
+        del tools, kwargs
+        return self
+
+
+class _MessageModel(FakeMessagesListChatModel):
+    def bind_tools(
+        self,
+        tools: Sequence[dict[str, Any] | type | Callable[..., Any] | BaseTool],
+        **kwargs: Any,
+    ) -> Runnable:
+        del tools, kwargs
+        return self
+
+
+class _RewriteRequest(AgentMiddleware[Any, Any, Any]):
+    @property
+    def name(self) -> str:
+        return "rewrite-request"
+
+    async def awrap_model_call(
+        self,
+        request: ModelRequest[Any],
+        handler: Callable[[ModelRequest[Any]], Awaitable[ModelResponse[Any]]],
+    ) -> ModelResponse[Any]:
+        return await handler(
+            request.override(
+                messages=[HumanMessage(content="final-user", id="final-user-id")],
+                system_message=SystemMessage(content="final-system"),
+                model_settings={"temperature": 0.2},
+            )
+        )
+
+
+class _ContributingMiddleware(AgentMiddleware[Any, Any, Any]):
+    def __init__(self, name: str, calls: list[str]) -> None:
+        self._name = name
+        self.calls = calls
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    async def awrap_model_call(
+        self,
+        request: ModelRequest[Any],
+        handler: Callable[[ModelRequest[Any]], Awaitable[ModelResponse[Any]]],
+    ) -> ModelResponse[Any]:
+        self.calls.append(self.name)
+        async with trace_contribution(
+            kind="memory",
+            name=f"{self.name} memory",
+            input={"query": "safe"},
+        ) as contribution:
+            response = await handler(request)
+            contribution.set_result({"matches": 1})
+            return response
+
+
+class _FailBeforeModel(AgentMiddleware[Any, Any, Any]):
+    @property
+    def name(self) -> str:
+        return "guardrail"
+
+    async def abefore_model(self, state: Any, runtime: Any) -> None:
+        del state, runtime
+        raise RuntimeError("blocked before model")
+
+
+def _identity(run_id: str) -> RunIdentity:
+    return RunIdentity(threadId="thread-call-observation", runId=run_id)
+
+
+def test_error_claim_retains_identity_for_the_run_lifetime() -> None:
+    class ClaimedError(RuntimeError):
+        pass
+
+    context = RunSourceContext(
+        identity=_identity("run-error-identity"),
+        runtime_profile="deepagents-v2",
+        input_kind="ordinary",
+        input={"messages": []},
+        config={},
+    )
+    hub = RuntimeObservationHub(context=context, observers=())
+    error = ClaimedError("first failure")
+    reference = weakref.ref(error)
+
+    assert hub.claim_error(error) is True
+    assert hub.claim_error(error) is False
+    del error
+    gc.collect()
+
+    assert reference() is not None
+    assert hub.claim_error(ClaimedError("distinct failure")) is True
+
+
+@pytest.mark.asyncio
+async def test_model_call_records_final_request_and_first_output_before_native() -> (
+    None
+):
+    """The provider lifecycle does not wait for the Native message projection."""
+
+    session = _Session()
+    tinkerfin = TinkerFin().observe(_Observer(session))
+    definition = tinkerfin.create_deep_agent(
+        model=_StreamingModel(responses=["done"]),
+        tools=[],
+        middleware=[_RewriteRequest()],
+    )
+    stream = await tinkerfin.open_run(
+        _identity("run-model"),
+        agent=definition,
+        input={"messages": [HumanMessage(content="original-user")]},
+    )
+
+    async for _part in stream:
+        pass
+
+    model_calls = [
+        observation
+        for observation in session.observations
+        if isinstance(observation, ModelCallObservation)
+    ]
+    assert [observation.phase for observation in model_calls] == [
+        "started",
+        "first_output",
+        "completed",
+    ]
+    assert tuple(
+        (message.message_type, message.content, message.id)
+        for message in model_calls[0].messages
+    ) == (
+        ("system", "final-system", None),
+        ("human", "final-user", "final-user-id"),
+    )
+    first_model_index = session.observations.index(model_calls[0])
+    first_native_index = next(
+        index
+        for index, observation in enumerate(session.observations)
+        if observation.kind == "native.message"
+    )
+    assert first_model_index < first_native_index
+    steps = [
+        observation
+        for observation in session.observations
+        if isinstance(observation, AgentStepObservation)
+    ]
+    assert [(step.step_kind, step.name, step.phase) for step in steps] == [
+        ("agent", "LangGraph", "started"),
+        ("middleware", "PatchToolCallsMiddleware.before_agent", "started"),
+        ("middleware", "PatchToolCallsMiddleware.before_agent", "completed"),
+        ("model", "model", "started"),
+        ("model", "model", "completed"),
+        ("agent", "LangGraph", "completed"),
+    ]
+    model_step = next(step for step in steps if step.step_kind == "model")
+    assert model_calls[0].parent_call_id == model_step.call_id
+    started_calls = sum(step.phase == "started" for step in steps) + 1
+    assert session.boundaries.count(ObservationBoundary.CALL_STARTED) == started_calls
+    assert ObservationBoundary.TERMINAL in session.boundaries
+
+
+@pytest.mark.asyncio
+async def test_provider_parent_uses_the_matching_graph_task_when_raw_parent_is_unknown() -> (
+    None
+):
+    session = _Session()
+    context = RunSourceContext(
+        identity=_identity("run-normalized-parent"),
+        runtime_profile="deepagents-v2",
+        input_kind="ordinary",
+        input={"messages": [{"role": "user", "content": "hello"}]},
+        config={},
+    )
+    hub = RuntimeObservationHub(context=context, observers=(_Observer(session),))
+    await hub.start()
+    handler = hub.call_handler
+    root_run_id = uuid4()
+    model_run_id = uuid4()
+    provider_run_id = uuid4()
+    unknown_parent_id = uuid4()
+    metadata = {
+        "langgraph_checkpoint_ns": "model:native-task-1",
+        "langgraph_node": "model",
+    }
+    await handler.on_chain_start(
+        {},
+        {},
+        run_id=root_run_id,
+        name="LangGraph",
+    )
+    await handler.on_chain_start(
+        {},
+        {},
+        run_id=model_run_id,
+        parent_run_id=root_run_id,
+        name="model",
+        metadata=metadata,
+    )
+    await handler.on_chat_model_start(
+        {},
+        [[HumanMessage(content="hello")]],
+        run_id=provider_run_id,
+        parent_run_id=unknown_parent_id,
+        metadata=metadata,
+    )
+    await handler.on_llm_end(
+        LLMResult(generations=[[]]),
+        run_id=provider_run_id,
+    )
+    await handler.on_chain_end({}, run_id=model_run_id)
+    await handler.on_chain_end({}, run_id=root_run_id)
+    await hub.terminal("succeeded")
+    await hub.close()
+
+    model_start = next(
+        observation
+        for observation in session.observations
+        if isinstance(observation, AgentStepObservation)
+        and observation.step_kind == "model"
+        and observation.phase == "started"
+    )
+    provider_start = next(
+        observation
+        for observation in session.observations
+        if isinstance(observation, ModelCallObservation)
+        and observation.phase == "started"
+    )
+    assert provider_start.parent_call_id == model_start.call_id
+
+
+@pytest.mark.asyncio
+async def test_before_model_failure_is_owned_by_the_middleware_step() -> None:
+    session = _Session()
+    tinkerfin = TinkerFin().observe(_Observer(session))
+    definition = tinkerfin.create_deep_agent(
+        model=_StreamingModel(responses=["unused"]),
+        tools=[],
+        middleware=[_FailBeforeModel()],
+    )
+    stream = await tinkerfin.open_run(
+        _identity("run-middleware-error"),
+        agent=definition,
+        input={"messages": [HumanMessage(content="check guardrail")]},
+    )
+
+    with pytest.raises(RuntimeError, match="blocked before model"):
+        async for _part in stream:
+            pass
+
+    failed = [
+        observation
+        for observation in session.observations
+        if isinstance(observation, AgentStepObservation)
+        and observation.phase == "failed"
+        and observation.failure_origin
+    ]
+    assert [(item.middleware_name, item.hook) for item in failed] == [
+        ("guardrail", "before_model")
+    ]
+    assert not any(
+        isinstance(observation, ModelCallObservation)
+        for observation in session.observations
+    )
+    assert any(
+        isinstance(observation, AgentStepObservation)
+        and observation.step_kind == "agent"
+        and observation.phase == "failed"
+        and not observation.failure_origin
+        for observation in session.observations
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_execution_records_the_actual_input_and_result() -> None:
+    """Tool execution remains distinct from the preceding model proposal."""
+
+    @tool
+    async def add_values(a: int, b: int) -> str:
+        """Add two values.
+
+        Args:
+            a: First value.
+            b: Second value.
+
+        Returns:
+            Decimal sum.
+        """
+
+        return str(a + b)
+
+    model = _MessageModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "add_values",
+                        "args": {"a": 2, "b": 3},
+                        "id": "call-add",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="done"),
+        ]
+    )
+    session = _Session()
+    tinkerfin = TinkerFin().observe(_Observer(session))
+    definition = tinkerfin.create_deep_agent(model=model, tools=[add_values])
+    stream = await tinkerfin.open_run(
+        _identity("run-tool"),
+        agent=definition,
+        input={"messages": [HumanMessage(content="add")]},
+    )
+
+    async for _part in stream:
+        pass
+
+    executions = [
+        observation
+        for observation in session.observations
+        if isinstance(observation, ToolExecutionObservation)
+    ]
+    assert [observation.phase for observation in executions] == [
+        "started",
+        "completed",
+    ]
+    assert executions[0].tool_call_id == "call-add"
+    assert executions[0].input == {"a": 2, "b": 3}
+    assert isinstance(executions[1].output, dict)
+    assert executions[1].output["$type"] == "langchain.message"
+    output_value = executions[1].output["value"]
+    assert isinstance(output_value, dict)
+    output_data = output_value["data"]
+    assert isinstance(output_data, dict)
+    assert output_data["content"] == "5"
+
+
+@pytest.mark.asyncio
+async def test_runtime_cancellation_closes_an_unmatched_tool_execution() -> None:
+    """Run settlement supplies the terminal callback that BaseTool omits."""
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    @tool
+    async def wait_until_cancelled() -> str:
+        """Wait for cancellation.
+
+        Returns:
+            An unreachable value.
+        """
+
+        entered.set()
+        await release.wait()
+        return "unreachable"
+
+    model = _MessageModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "wait_until_cancelled",
+                        "args": {},
+                        "id": "call-cancel",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        ]
+    )
+    session = _Session()
+    tinkerfin = TinkerFin().observe(_Observer(session))
+    definition = tinkerfin.create_deep_agent(model=model, tools=[wait_until_cancelled])
+    stream = await tinkerfin.open_run(
+        _identity("run-cancel"),
+        agent=definition,
+        input={"messages": [HumanMessage(content="wait")]},
+    )
+
+    async def consume() -> None:
+        async for _part in stream:
+            pass
+
+    task = asyncio.create_task(consume())
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    executions = [
+        observation
+        for observation in session.observations
+        if isinstance(observation, ToolExecutionObservation)
+    ]
+    assert [observation.phase for observation in executions] == [
+        "started",
+        "cancelled",
+    ]
+    assert executions[-1].error_type is None
+    assert executions[-1].error_message is None
+    terminal_index = next(
+        index
+        for index, observation in enumerate(session.observations)
+        if observation.kind == "run.terminal"
+    )
+    assert session.observations.index(executions[-1]) < terminal_index
+    steps = [
+        observation
+        for observation in session.observations
+        if isinstance(observation, AgentStepObservation)
+    ]
+    phases_by_call: dict[str, set[str]] = {}
+    for step in steps:
+        phases_by_call.setdefault(step.call_id, set()).add(step.phase)
+    assert all(
+        "started" in phases
+        and bool(
+            phases.intersection(
+                {"completed", "failed", "cancelled", "interrupted", "abandoned"}
+            )
+        )
+        for phases in phases_by_call.values()
+    )
+    assert all(
+        step.error_type is None and not step.failure_origin
+        for step in steps
+        if step.phase == "cancelled"
+    )
+
+
+@pytest.mark.asyncio
+async def test_middleware_description_never_changes_original_execution() -> None:
+    """Definition metadata preserves every original middleware instance and order."""
+
+    calls: list[str] = []
+    metrics = _ContributingMiddleware("internal-metrics", calls)
+    visible = _ContributingMiddleware("customer-memory", calls)
+    session = _Session()
+    observer = _Observer(session)
+    tinkerfin = TinkerFin().observe(observer)
+    definition = tinkerfin.create_deep_agent(
+        model=_StreamingModel(responses=["done"]),
+        tools=[],
+        middleware=[metrics, visible],
+    )
+    stream = await tinkerfin.open_run(
+        _identity("run-middleware"),
+        agent=definition,
+        input={"messages": [HumanMessage(content="remember")]},
+    )
+
+    async for _part in stream:
+        pass
+
+    assert calls == ["internal-metrics", "customer-memory"]
+    assert len(observer.contexts) == 1
+    assert [item.name for item in observer.contexts[0].middleware] == [
+        "internal-metrics",
+        "customer-memory",
+    ]
+    assert all(
+        item.hooks == ("awrap_model_call",) for item in observer.contexts[0].middleware
+    )
+    contributions = [
+        observation
+        for observation in session.observations
+        if isinstance(observation, ContextContributionObservation)
+    ]
+    assert [item.phase for item in contributions] == [
+        "started",
+        "started",
+        "completed",
+        "completed",
+    ]
+    assert {item.name for item in contributions} == {
+        "internal-metrics memory",
+        "customer-memory memory",
+    }
+    assert contributions[-1].output == {"matches": 1}
+
+
+@pytest.mark.asyncio
+async def test_rejected_tool_review_never_records_an_execution() -> None:
+    @tool
+    async def protected_action(value: str) -> str:
+        """Return one reviewed value.
+
+        Args:
+            value: Reviewed input.
+
+        Returns:
+            The accepted value.
+        """
+
+        return value
+
+    model = _MessageModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "protected_action",
+                        "args": {"value": "original"},
+                        "id": "call-reviewed-reject",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="done"),
+        ]
+    )
+    session = _Session()
+    tinkerfin = TinkerFin(checkpointer=MemorySaver()).observe(_Observer(session))
+    definition = tinkerfin.create_deep_agent(
+        model=model,
+        tools=[protected_action],
+        interrupt_on={
+            "protected_action": {
+                "allowed_decisions": ["approve", "edit", "reject"],
+            }
+        },
+    )
+    first = await tinkerfin.open_run(
+        _identity("run-review-reject-start"),
+        agent=definition,
+        input={"messages": [HumanMessage(content="review")]},
+    )
+    async for _part in first:
+        pass
+    interrupted_observations = tuple(session.observations)
+    interrupted_steps = tuple(
+        observation
+        for observation in interrupted_observations
+        if isinstance(observation, AgentStepObservation)
+    )
+    assert any(step.phase == "interrupted" for step in interrupted_steps)
+    assert not any(step.phase == "failed" for step in interrupted_steps)
+    assert all(
+        step.error_type is None and not step.failure_origin
+        for step in interrupted_steps
+        if step.phase == "interrupted"
+    )
+    assert any(
+        observation.kind == "run.terminal" and observation.outcome == "interrupted"
+        for observation in interrupted_observations
+    )
+    resumed = await tinkerfin.open_run(
+        _identity("run-review-reject-resume"),
+        agent=definition,
+        input=Command(
+            resume={"decisions": [{"type": "reject", "message": "not allowed"}]}
+        ),
+    )
+    async for _part in resumed:
+        pass
+
+    assert not any(
+        isinstance(observation, ToolExecutionObservation)
+        for observation in session.observations
+    )
+
+
+@pytest.mark.asyncio
+async def test_edited_tool_review_records_only_the_actual_input() -> None:
+    @tool
+    async def add_reviewed(a: int, b: int) -> str:
+        """Add reviewed values.
+
+        Args:
+            a: First reviewed value.
+            b: Second reviewed value.
+
+        Returns:
+            Decimal sum.
+        """
+
+        return str(a + b)
+
+    model = _MessageModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "add_reviewed",
+                        "args": {"a": 1, "b": 2},
+                        "id": "call-reviewed-edit",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="done"),
+        ]
+    )
+    session = _Session()
+    tinkerfin = TinkerFin(checkpointer=MemorySaver()).observe(_Observer(session))
+    definition = tinkerfin.create_deep_agent(
+        model=model,
+        tools=[add_reviewed],
+        interrupt_on={
+            "add_reviewed": {
+                "allowed_decisions": ["approve", "edit", "reject"],
+            }
+        },
+    )
+    first = await tinkerfin.open_run(
+        _identity("run-review-edit-start"),
+        agent=definition,
+        input={"messages": [HumanMessage(content="review")]},
+    )
+    async for _part in first:
+        pass
+    resumed = await tinkerfin.open_run(
+        _identity("run-review-edit-resume"),
+        agent=definition,
+        input=Command(
+            resume={
+                "decisions": [
+                    {
+                        "type": "edit",
+                        "edited_action": {
+                            "name": "add_reviewed",
+                            "args": {"a": 7, "b": 8},
+                        },
+                    }
+                ]
+            }
+        ),
+    )
+    async for _part in resumed:
+        pass
+
+    executions = [
+        observation
+        for observation in session.observations
+        if isinstance(observation, ToolExecutionObservation)
+    ]
+    assert [observation.phase for observation in executions] == [
+        "started",
+        "completed",
+    ]
+    assert executions[0].input == {"a": 7, "b": 8}

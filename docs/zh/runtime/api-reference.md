@@ -34,6 +34,7 @@ Observation 与原生 SSE 属于基础安装。
 | `DeepAgentDefinition.new(...)` | 创建原生 Runtime | 必填 `identity`，可选本次请求 `mode` 和 `on_part` |
 | `DeepAgentDefinition.new_agui(...)` | 创建 AG-UI Runtime | 必填 canonical `identity`；可选 parent、mode、resume、checkpoint callback 与 observer |
 | `TinkerFin.failed_agui_run(...)` | 表达 Run 接受后的初始化失败 | 错误、identity，以及真实可用的 input/config/resume |
+| `trace_contribution(kind=..., name=..., input=None)` | 发布显式 Memory、Guardrail、retrieval 或自定义语义 | 可用 `set_result(...)` 补充结果的异步上下文管理器 |
 
 默认当前 Profile 是 `DeepAgentsV2RuntimeProfile`。TinkerFin 在创建 Definition 前选定一个
 Profile，把其 `profile_id` 写入 checkpoint 谱系，并在 Graph continuation 前拒绝由另一个
@@ -113,7 +114,7 @@ reducer、`Required` / `NotRequired` 和 schema metadata 会保留；同名字�
 | --- | --- |
 | `NativeGraphRunStream` | 异步迭代原始上游对象，同时向 Messaging 或 Native SSE 转交同一个 Driver-owned canonical frame |
 | `AgUiEventStream` | 异步迭代 AG-UI 事件；支持 `abort()`、`aclose()` 和 `to_sse()` |
-| `SseBody` | 异步迭代 SSE 字符串；先 `prepare()`，结束时 `aclose()` |
+| `SseBody` | 单次消费的 SSE body，拥有每次上游读取与关闭任务；交给宿主 Response 前可先调用 `prepare()` |
 
 ### `AgUiEventStream.abort()`
 
@@ -181,11 +182,12 @@ Profile 允许调用方通过 `astream(stream_mode=...)` 增加受支持的
 
 构造参数、默认值和连接池要求见[运行协调与 Redis 租约](extensions.md#如果需要通用-redis-租约锁)。
 
-`TinkerFin.observe(...)` 返回独立 factory，并在 `.plan(...)` 后保留 Observer。Runtime 对每个
-Native part 只做一次强校验，然后在 `on_part` 和 AG-UI 转换前发布安全 Observation。Observer
-失败会让 Run fail-closed，Runtime 仍会关闭全部已打开 session。配套语义实现是
-`tinkerfin-tracing.Tracer`。AG-UI event、Messaging commit、SSE frame 和 Redis ownership
-不属于 Runtime Observation。
+`TinkerFin.observe(...)` 返回独立 factory，并在 `.plan(...)` 后保留 Observer。受管 Deep Agent
+请求会安装一个 request-scoped LangChain callback，在 provider 执行前记录 middleware 处理后的
+最终模型请求，并在审批或参数编辑后记录实际 Tool 执行。Runtime 同时对每个 Native part 只做一次
+强校验，然后在 `on_part` 和 AG-UI 转换前发布安全 Native Observation。Observer 失败会让 Run
+fail-closed，Runtime 仍会关闭全部已打开 session。配套语义实现是 `tinkerfin-tracing.Tracer`。
+AG-UI event、Messaging commit、SSE frame 和 Redis ownership 不属于 Runtime Observation。
 
 Agent 终态在 Observer 广播前已经选定。某个 Observer 在终态广播时失败会让调用方失败，并通知
 其他健康 Observer，但不会事后改写已经结束的 Agent 执行结果。

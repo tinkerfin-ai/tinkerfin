@@ -1357,6 +1357,7 @@
     padding: var(--space-4) 22px;
   }
 
+  .approval-composer-footer,
   .plan-question-composer-footer,
   .plan-review-composer-footer {
     position: relative;
@@ -1365,6 +1366,7 @@
     background: transparent;
   }
 
+  .approval-composer-footer::before,
   .plan-question-composer-footer::before,
   .plan-review-composer-footer::before {
     position: absolute;
@@ -1377,6 +1379,7 @@
     pointer-events: none;
   }
 
+  .approval-composer-footer::before,
   .plan-question-composer-footer::before {
     background: linear-gradient(
       to bottom,
@@ -1390,6 +1393,7 @@
     background: linear-gradient(to bottom, transparent, var(--color-layer-1));
   }
 
+  .approval-composer-footer > *,
   .plan-question-composer-footer > *,
   .plan-review-composer-footer > * { position: relative; z-index: var(--layer-local); }
 
@@ -1616,6 +1620,8 @@
   .composer-task-trace-control {
     grid-column: 3;
     justify-self: end;
+    align-items: center;
+    gap: var(--space-2);
   }
 
   .composer-scroll-to-bottom-control,
@@ -1672,6 +1678,8 @@
   }
 
   .composer-auxiliary-control:disabled { cursor: not-allowed; opacity: .48; }
+
+  .composer-auxiliary-control.composer-trace-launcher { border: 0; }
 
   .composer-dock.is-taken-over {
     grid-row: 3;
@@ -1882,6 +1890,12 @@
     .composer-dock { padding-right: var(--space-3); padding-left: var(--space-3); }
     .composer-auxiliary-controls { gap: var(--space-4); }
     .composer-auxiliary-control { padding-inline: var(--space-1-5); }
+    .composer-task-trace-control { gap: var(--space-1); }
+    .composer-task-trace-control .composer-auxiliary-control {
+      width: var(--control-sm);
+      padding-inline: 0;
+    }
+    .composer-task-trace-control .composer-auxiliary-control > span { display: none; }
     .tool-detail-card { margin-left: 0; }
     .tool-detail-section { grid-template-columns: minmax(0, 1fr); row-gap: var(--space-1-5); padding: var(--space-3); }
     .tool-field-label { position: static; }
@@ -1890,6 +1904,10 @@
 
   @media (any-hover: none), (any-pointer: coarse) {
     .composer-auxiliary-control { min-height: var(--control-lg); }
+    .composer-task-trace-control .composer-auxiliary-control {
+      width: var(--control-lg);
+      min-width: var(--control-lg);
+    }
     .composer-add-button,
     .composer-plan-chip,
     .composer-model-select,
@@ -1940,6 +1958,7 @@
     }
 
     .composer-auxiliary-control:focus-visible { outline-color: Highlight; }
+    .approval-composer-footer::before,
     .plan-question-composer-footer::before,
     .plan-review-composer-footer::before { background: Canvas; }
     .subagent-card-head:focus-visible,

@@ -10,7 +10,7 @@ import {
 } from 'lucide-react'
 import { useEffect, useRef } from 'react'
 
-import { IconButton, OverlayScrollbar } from '../../../components/ui'
+import { DrawerHeader, OverlayScrollbar } from '../../../components/ui'
 import type {
   Conversation,
   ConversationRunStatus,
@@ -111,10 +111,12 @@ export function TaskDrawer({
       aria-hidden={!open || undefined}
       inert={!open || undefined}
     >
-      <header className="task-drawer-head">
-        <h2>{t('任务详情')}</h2>
-        {onClose && <IconButton ref={closeButtonRef} label={t('关闭任务详情')} icon={<X size={18} />} onClick={onClose} />}
-      </header>
+      <DrawerHeader
+        ref={closeButtonRef}
+        title={t('任务详情')}
+        closeLabel={onClose ? t('关闭任务详情') : undefined}
+        onClose={onClose}
+      />
       <section className="drawer-panel todo-panel">
         <header className="panel-head">
           <div className="panel-title"><ClipboardList size={20} /><h3>{t('待办清单')}</h3></div>

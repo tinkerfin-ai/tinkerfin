@@ -2,9 +2,12 @@
 
 from typing import TYPE_CHECKING
 
+from tinkerfin_contracts import ContextKind as ContextKind
 from tinkerfin_contracts import RunIdentity as RunIdentity
 from tinkerfin_native_stream import NativeStreamFrame as NativeStreamFrame
 
+from ._call_observation import TraceContribution as TraceContribution
+from ._call_observation import trace_contribution as trace_contribution
 from ._hitl import TINKERFIN_HITL_CONTRACT as TINKERFIN_HITL_CONTRACT
 from ._optional_dependencies import require_agui
 from ._tasks import join_task as join_task
@@ -102,6 +105,7 @@ __all__ = [
     "AgUiResumeRequest",
     "AgUiSettlementTimeoutError",
     "AgentMode",
+    "ContextKind",
     "DeepAgentAgUiResumeRuntime",
     "DeepAgentAgUiRuntime",
     "DeepAgentDefinition",
@@ -141,5 +145,7 @@ __all__ = [
     "TinkerFinErrorCode",
     "TinkerFinLifecycleError",
     "TinkerFinStreamProtocolError",
+    "TraceContribution",
     "join_task",
+    "trace_contribution",
 ]

@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import cast
 
+from langchain_core.callbacks import AsyncCallbackHandler
 from langchain_core.messages import (
     AIMessage,
     AIMessageChunk,
@@ -23,6 +24,7 @@ from langchain_core.messages import (
 from pydantic import JsonValue
 
 from tinkerfin_contracts import (
+    MiddlewareDescriptor,
     NativeExtraObservation,
     NativeInterruptRecord,
     NativeMessageObservation,
@@ -48,6 +50,7 @@ from tinkerfin_contracts import (
     RunTerminalOutcome,
     RuntimeObservation,
     RuntimeObserver,
+    SkillSourceDescriptor,
 )
 from tinkerfin_native_stream import (
     NativeExtraStreamPart,
@@ -298,6 +301,9 @@ def source_context(
     config: object,
     private_state_keys: frozenset[str],
     resume: tuple[RunResumeSummary, ...] = (),
+    call_tracking_enabled: bool = False,
+    middleware: tuple[MiddlewareDescriptor, ...] = (),
+    skill_sources: tuple[SkillSourceDescriptor, ...] = (),
 ) -> RunSourceContext:
     """Build one finite source snapshot before opening Observer resources."""
 
@@ -315,6 +321,9 @@ def source_context(
         config=_source_value(config),
         resume=resume,
         private_state_keys=tuple(sorted(private_state_keys)),
+        call_tracking_enabled=call_tracking_enabled,
+        middleware=middleware,
+        skill_sources=skill_sources,
     )
 
 
@@ -325,6 +334,16 @@ class _SessionSlot:
     session: RunObservationSession
     waiter: asyncio.Task[None] | None = None
     healthy: bool = True
+
+
+@dataclass(slots=True)
+class _ObserverDelivery:
+    """Carry one accepted serial Observer operation to the Hub-owned worker."""
+
+    operation: Callable[[], Awaitable[None]]
+    settled: asyncio.Future[None]
+    active: bool = False
+    cancel_requested: bool = False
 
 
 class RuntimeObservationHub:
@@ -338,6 +357,8 @@ class RuntimeObservationHub:
     ) -> None:
         """Bind immutable Run context to ordered borrowed Observer registrations."""
 
+        from ._call_observation import RuntimeCallHandler
+
         self.context = context
         self._observers = observers
         self._slots: list[_SessionSlot] = []
@@ -345,6 +366,11 @@ class RuntimeObservationHub:
         self._started = False
         self._terminal: RunTerminalOutcome | None = None
         self._closed = False
+        self._claimed_errors: list[BaseException] = []
+        self._delivery_queue: asyncio.Queue[_ObserverDelivery | None] | None = None
+        self._delivery_worker: asyncio.Task[None] | None = None
+        self._delivery_stop: asyncio.Task[None] | None = None
+        self._call_handler = RuntimeCallHandler(self)
 
     @property
     def enabled(self) -> bool:
@@ -357,6 +383,23 @@ class RuntimeObservationHub:
         """Return the first selected terminal outcome, if terminal was published."""
 
         return self._terminal
+
+    @property
+    def call_handler(self) -> AsyncCallbackHandler:
+        """Return the request-owned LangChain callback for invocation configuration."""
+
+        return self._call_handler
+
+    def claim_error(self, error: BaseException) -> bool:
+        """Return whether one propagated failure has no more specific recorded owner."""
+
+        if any(claimed is error for claimed in self._claimed_errors):
+            return False
+        # Retaining the object prevents CPython from reusing its address for a distinct
+        # later failure during the same Run. Trace limits bound accepted observations,
+        # and the whole request-scoped Hub is released after close.
+        self._claimed_errors.append(error)
+        return True
 
     async def start(self) -> None:
         """Open every Observer, then publish ordered Run start and input facts.
@@ -390,9 +433,10 @@ class RuntimeObservationHub:
             )
             self._slots.append(slot)
         self._started = True
+        self._start_delivery_worker()
         if opening_failures:
             error = self._observation_error(opening_failures)
-            await self._notify_failures(opening_failures)
+            await self._deliver_failure_notifications(opening_failures)
             raise error
         observed_at, monotonic_ns = _stamp()
         await self.observe(
@@ -443,7 +487,7 @@ class RuntimeObservationHub:
             raise self._observation_error(((slot.name, error),))
         slot.healthy = False
         failures = ((slot.name, error),)
-        await self._notify_failures(failures)
+        await self._deliver_failure_notifications(failures)
         raise self._observation_error(failures)
 
     async def observe(self, observation: RuntimeObservation) -> None:
@@ -460,22 +504,106 @@ class RuntimeObservationHub:
             RunObservationError: One or more ordinary Observer deliveries fail.
         """
 
-        failures: list[tuple[str, BaseException]] = []
-        for slot in self._slots:
-            if not slot.healthy:
-                continue
-            try:
-                await slot.session.observe(observation.model_copy(deep=True))
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:  # noqa: BLE001 - Observer extension boundary
-                slot.healthy = False
-                failures.append((slot.name, error))
-        if failures:
-            await self._notify_failures(failures)
-            raise self._observation_error(failures)
+        if self._closed:
+            raise RuntimeError("Runtime Observation Hub is closed")
+        await self._deliver_observation(observation)
 
-    async def _notify_failures(
+    def _start_delivery_worker(self) -> None:
+        """Start one bounded worker only when at least one Observer was opened."""
+
+        if not self._slots or self._delivery_worker is not None:
+            return
+        self._delivery_queue = asyncio.Queue(maxsize=1)
+        self._delivery_worker = asyncio.create_task(
+            self._deliver_observer_operations(),
+            name="tinkerfin-observer-delivery",
+        )
+
+    async def _deliver_observer_operations(self) -> None:
+        """Execute accepted Observer I/O in order without a coordination lock."""
+
+        queue = self._delivery_queue
+        if queue is None:  # pragma: no cover - worker construction invariant
+            raise RuntimeError("Observer delivery queue is unavailable")
+        while True:
+            delivery = await queue.get()
+            if delivery is None:
+                return
+            if delivery.cancel_requested:
+                if not delivery.settled.done():
+                    delivery.settled.set_exception(asyncio.CancelledError())
+                continue
+            delivery.active = True
+            try:
+                await delivery.operation()
+            except BaseException as error:  # noqa: BLE001 - relay process control
+                if (
+                    isinstance(error, asyncio.CancelledError)
+                    and delivery.cancel_requested
+                ):
+                    current = asyncio.current_task()
+                    if current is not None:
+                        current.uncancel()
+                if not delivery.settled.done():
+                    delivery.settled.set_exception(error)
+            else:
+                if not delivery.settled.done():
+                    delivery.settled.set_result(None)
+            finally:
+                delivery.active = False
+
+    async def _enqueue_delivery(
+        self,
+        operation: Callable[[], Awaitable[None]],
+    ) -> None:
+        """Apply bounded backpressure and await one accepted serial operation."""
+
+        queue = self._delivery_queue
+        if queue is None:
+            await operation()
+            return
+        settled = asyncio.get_running_loop().create_future()
+        delivery = _ObserverDelivery(operation=operation, settled=settled)
+        await queue.put(delivery)
+        try:
+            await asyncio.shield(settled)
+        except asyncio.CancelledError:
+            delivery.cancel_requested = True
+            worker = self._delivery_worker
+            if delivery.active and worker is not None:
+                worker.cancel()
+            settled.add_done_callback(_consume_delivery_exception)
+            raise
+
+    async def _deliver_observation(self, observation: RuntimeObservation) -> None:
+        async def broadcast() -> None:
+            failures: list[tuple[str, BaseException]] = []
+            for slot in self._slots:
+                if not slot.healthy:
+                    continue
+                try:
+                    await slot.session.observe(observation.model_copy(deep=True))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:  # noqa: BLE001 - Observer extension boundary
+                    slot.healthy = False
+                    failures.append((slot.name, error))
+            if failures:
+                await self._notify_failures_now(failures)
+                raise self._observation_error(failures)
+
+        await self._enqueue_delivery(broadcast)
+
+    async def _deliver_failure_notifications(
+        self,
+        failures: Sequence[tuple[str, BaseException]],
+    ) -> None:
+        async def notify() -> None:
+            await self._notify_failures_now(failures)
+
+        await self._enqueue_delivery(notify)
+
+    async def _notify_failures_now(
         self,
         failures: Sequence[tuple[str, BaseException]],
     ) -> None:
@@ -551,6 +679,7 @@ class RuntimeObservationHub:
         if self._terminal is not None:
             return
         self._terminal = outcome
+        await self._call_handler.settle(outcome, error=error)
         observed_at, monotonic_ns = _stamp()
         await self.observe(
             RunTerminalObservation(
@@ -572,20 +701,28 @@ class RuntimeObservationHub:
     async def force(self, boundary: ObservationBoundary) -> None:
         """Force every healthy session at a hard replay or terminal boundary."""
 
-        failures: list[tuple[str, BaseException]] = []
-        for slot in self._slots:
-            if not slot.healthy:
-                continue
-            try:
-                await slot.session.force(boundary)
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:  # noqa: BLE001 - Observer extension boundary
-                slot.healthy = False
-                failures.append((slot.name, error))
-        if failures:
-            await self._notify_failures(failures)
-            raise self._observation_error(failures)
+        if self._closed:
+            raise RuntimeError("Runtime Observation Hub is closed")
+        await self._deliver_force(boundary)
+
+    async def _deliver_force(self, boundary: ObservationBoundary) -> None:
+        async def force_sessions() -> None:
+            failures: list[tuple[str, BaseException]] = []
+            for slot in self._slots:
+                if not slot.healthy:
+                    continue
+                try:
+                    await slot.session.force(boundary)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:  # noqa: BLE001 - Observer extension boundary
+                    slot.healthy = False
+                    failures.append((slot.name, error))
+            if failures:
+                await self._notify_failures_now(failures)
+                raise self._observation_error(failures)
+
+        await self._enqueue_delivery(force_sessions)
 
     async def close(self) -> None:
         """Settle every Observer session while preserving caller cancellation."""
@@ -614,7 +751,7 @@ class RuntimeObservationHub:
         if self._started and self._terminal is not None:
             observed_at, monotonic_ns = _stamp()
             try:
-                await self.observe(
+                await self._deliver_observation(
                     RunClosedObservation(
                         identity=self.context.identity,
                         outcome=self._terminal,
@@ -622,13 +759,21 @@ class RuntimeObservationHub:
                         monotonic_ns=monotonic_ns,
                     )
                 )
-                await self.force(ObservationBoundary.CLOSE)
+                await self._deliver_force(ObservationBoundary.CLOSE)
             except asyncio.CancelledError as error:
                 retain_process_control(error, source="runtime.close_observation")
             except Exception as error:  # noqa: BLE001 - Observer extension boundary
                 failures.append(("runtime.close_observation", error))
             except BaseException as error:  # noqa: BLE001 - preserve process control
                 retain_process_control(error, source="runtime.close_observation")
+        try:
+            await self._stop_delivery_worker()
+        except asyncio.CancelledError as error:
+            retain_process_control(error, source="observer delivery settlement")
+        except Exception as error:  # noqa: BLE001 - Observer extension boundary
+            failures.append(("observer delivery settlement", error))
+        except BaseException as error:  # noqa: BLE001 - preserve process control
+            retain_process_control(error, source="observer delivery settlement")
         for slot in reversed(self._slots):
             waiter = slot.waiter
             if waiter is not None and not waiter.done():
@@ -662,6 +807,35 @@ class RuntimeObservationHub:
         if failures:
             raise self._observation_error(failures)
 
+    async def _stop_delivery_worker(self) -> None:
+        """Drain and join the owned delivery worker exactly once."""
+
+        worker = self._delivery_worker
+        queue = self._delivery_queue
+        if worker is None or queue is None:
+            return
+        stop = self._delivery_stop
+        if stop is None:
+
+            async def stop_worker() -> None:
+                await queue.put(None)
+                await worker
+
+            stop = asyncio.create_task(
+                stop_worker(),
+                name="tinkerfin-observer-delivery-close",
+            )
+            self._delivery_stop = stop
+        try:
+            await asyncio.shield(stop)
+        except asyncio.CancelledError:
+            await asyncio.shield(stop)
+            raise
+        finally:
+            if stop.done() and not stop.cancelled() and stop.exception() is None:
+                self._delivery_worker = None
+                self._delivery_queue = None
+
     @staticmethod
     def _observation_error(
         failures: Sequence[tuple[str, BaseException]],
@@ -693,6 +867,13 @@ def observer_tuple(observers: Sequence[RuntimeObserver]) -> tuple[RuntimeObserve
             )
         seen.add(identity)
     return frozen
+
+
+def _consume_delivery_exception(future: asyncio.Future[None]) -> None:
+    """Retrieve a delivery failure after its original caller was cancelled."""
+
+    if not future.cancelled():
+        future.exception()
 
 
 __all__ = [

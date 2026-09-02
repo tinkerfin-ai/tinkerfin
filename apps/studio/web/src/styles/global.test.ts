@@ -137,6 +137,7 @@ describe('前端视觉契约', () => {
       '--layout-content-wide: 840px;',
       '--layout-task-drawer: 348px;',
       '--layout-todo-trace-drawer: 400px;',
+      '--layout-drawer-header-height: calc(var(--layout-header-height) + var(--space-4));',
       '--layout-settings-dialog: 760px;',
       '--layout-settings-nav: 180px;',
       '--layout-settings-height: 540px;',
@@ -170,6 +171,30 @@ describe('前端视觉契约', () => {
     expect(uiStyles).toMatch(/\.modal-dialog--action\.has-input \.modal-dialog-actions\s*\{[^}]*margin-top:\s*var\(--space-6\);/s)
     expect(uiStyles).not.toMatch(/\.modal-dialog--action \.modal-dialog-actions \.ui-button\s*\{/s)
     expect(uiStyles).toMatch(/@media \(any-hover: none\), \(any-pointer: coarse\)[\s\S]*\.ui-button\s*\{[^}]*min-width:\s*var\(--control-lg\);[^}]*min-height:\s*var\(--control-lg\);/s)
+  })
+
+  it('工作区状态和全局提示使用统一反馈卡片宽度', () => {
+    const uiStyles = cssFiles['../components/ui/ui.css']
+    const workspaceStyles = cssFiles['../features/workspace/workspace.css']
+
+    expect(tokensStyles).toContain('--layout-feedback-card: 360px;')
+    expect(uiStyles).toMatch(/\.toast-viewport\s*\{[^}]*width:\s*min\(calc\(100vw - var\(--space-6\)\), var\(--layout-feedback-card\)\);/s)
+    expect(uiStyles).toMatch(/\.toast-card\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*100%;/s)
+    expect(workspaceStyles).toMatch(/\.workspace-status\s*\{[^}]*width:\s*min\(calc\(100% - var\(--space-8\)\), var\(--layout-feedback-card\)\);/s)
+  })
+
+  it('所有抽屉使用同一头部高度、标题层级和关闭按钮布局', () => {
+    const uiStyles = cssFiles['../components/ui/ui.css']
+    const workspaceStyles = cssFiles['../features/workspace/workspace.css']
+    const todoTraceStyles = cssFiles['../features/conversation/todoTrace/todoTrace.css']
+    const chainTraceStyles = cssFiles['../features/conversation/chainTrace/chainTrace.css']
+
+    expect(uiStyles).toMatch(/\.ui-drawer-header\s*\{[^}]*height:\s*var\(--layout-drawer-header-height\);[^}]*padding:\s*calc\(var\(--space-2\) \+ var\(--space-4\)\) 0 var\(--space-2\);/s)
+    expect(uiStyles).toMatch(/\.ui-drawer-header > \.ui-icon-button-wrap\s*\{[^}]*grid-row:\s*1;/s)
+    expect(workspaceStyles).toMatch(/\.task-drawer\s*\{[^}]*grid-template-rows:\s*var\(--layout-drawer-header-height\) minmax\(0, 1fr\);/s)
+    expect(todoTraceStyles).toMatch(/\.todo-trace-drawer\s*\{[^}]*grid-template-rows:\s*var\(--layout-drawer-header-height\) minmax\(0, 1fr\);/s)
+    expect(chainTraceStyles).toMatch(/\.chain-trace-details\s*\{[^}]*position:\s*fixed;[^}]*z-index:\s*var\(--layer-drawer\);[^}]*top:\s*0;[^}]*right:\s*0;[^}]*grid-template-rows:\s*var\(--layout-drawer-header-height\) auto minmax\(0, 1fr\);[^}]*height:\s*100dvh;/s)
+    expect(chainTraceStyles).not.toMatch(/\.chain-trace-split\.uses-overlay \.chain-trace-details\s*\{[^}]*position:\s*absolute;/s)
   })
 
   it('ThemePicker 以固定完整宽度和 scaleX 展开表面', () => {

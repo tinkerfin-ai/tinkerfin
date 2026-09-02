@@ -132,6 +132,28 @@ class _BlockingClosedSession(_Session):
             await self._never.wait()
 
 
+class _ConcurrentAccessSession(_Session):
+    def __init__(self) -> None:
+        super().__init__()
+        self.active_calls = 0
+        self.max_active_calls = 0
+
+    async def _enter(self, operation: Callable[[], None]) -> None:
+        self.active_calls += 1
+        self.max_active_calls = max(self.max_active_calls, self.active_calls)
+        try:
+            await asyncio.sleep(0)
+            operation()
+        finally:
+            self.active_calls -= 1
+
+    async def observe(self, observation: RuntimeObservation) -> None:
+        await self._enter(lambda: self.observations.append(observation))
+
+    async def force(self, boundary: ObservationBoundary) -> None:
+        await self._enter(lambda: self.boundaries.append(boundary))
+
+
 class _Graph:
     def __init__(
         self,
@@ -600,6 +622,39 @@ async def test_observation_close_preserves_caller_cancellation_and_settles_sessi
         await closing
     assert closing.cancelled() is True
     assert session.closed == 1
+
+
+async def test_observer_delivery_serializes_observations_and_forces() -> None:
+    session = _ConcurrentAccessSession()
+    hub = TinkerFin().observe(_Observer(session))._observation_hub(_source_context())
+    await hub.start()
+    observed_at = datetime.now(UTC)
+
+    await asyncio.gather(
+        hub.observe(
+            NativeStateObservation(
+                identity=_identity(),
+                namespace=(),
+                state={"step": 1},
+                observed_at=observed_at,
+                monotonic_ns=1,
+            )
+        ),
+        hub.force(ObservationBoundary.CALL_STARTED),
+        hub.observe(
+            NativeStateObservation(
+                identity=_identity(),
+                namespace=(),
+                state={"step": 2},
+                observed_at=observed_at,
+                monotonic_ns=2,
+            )
+        ),
+    )
+    await hub.terminal("succeeded")
+    await hub.close()
+
+    assert session.max_active_calls == 1
 
 
 @pytest.mark.parametrize("error_type", [SystemExit, KeyboardInterrupt])

@@ -8,12 +8,17 @@ from pydantic import BaseModel, ConfigDict, Field
 from tinkerfin_studio.conversation.todo_groups import TaskTraceSnapshot
 from tinkerfin_tracing import (
     TraceCompleteness,
+    TraceEntry,
+    TraceEntryCompleteness,
+    TraceEntryDelta,
+    TraceFacets,
     TraceInteraction,
     TraceMessage,
     TraceNode,
     TraceReasoning,
     TraceState,
     TraceStatus,
+    TraceTurn,
     TraceUpdate,
 )
 
@@ -126,6 +131,48 @@ class ConversationTraceErrorEvent(BaseModel):
     code: Literal["trace_unavailable"] = "trace_unavailable"
 
 
+class ConversationTraceEntryPage(BaseModel):
+    """服务端直接筛选后的当前链路节点页"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    turns: tuple[TraceTurn, ...]
+    items: tuple[TraceEntry, ...]
+    next_cursor: str | None = Field(
+        default=None,
+        alias="nextCursor",
+        description="同一筛选条件下的下一页不透明游标",
+    )
+    as_of_seq: int = Field(
+        alias="asOfSeq",
+        ge=1,
+        description="本页读取时对应的 Trace Ledger 尾序号",
+    )
+    facets: TraceFacets
+    completeness: TraceEntryCompleteness
+
+
+class ConversationTraceEntrySnapshotEvent(BaseModel):
+    """链路跟随连接建立后的完整筛选页"""
+
+    type: Literal["snapshot"] = "snapshot"
+    snapshot: ConversationTraceEntryPage
+
+
+class ConversationTraceEntryUpdateEvent(BaseModel):
+    """同一筛选条件下的链路节点增删与 Facet 更新"""
+
+    type: Literal["update"] = "update"
+    update: TraceEntryDelta
+
+
+class ConversationTraceEntryErrorEvent(BaseModel):
+    """链路跟随开始后可安全重试的终止信号"""
+
+    type: Literal["error"] = "error"
+    code: Literal["trace_unavailable"] = "trace_unavailable"
+
+
 class ConversationThreadUpdate(BaseModel):
     """重命名或置顶请求"""
 
@@ -146,6 +193,10 @@ __all__ = [
     "ConversationHistoryListItem",
     "ConversationHistoryListResponse",
     "ConversationThreadUpdate",
+    "ConversationTraceEntryErrorEvent",
+    "ConversationTraceEntryPage",
+    "ConversationTraceEntrySnapshotEvent",
+    "ConversationTraceEntryUpdateEvent",
     "ConversationTraceErrorEvent",
     "ConversationTraceSnapshotEvent",
     "ConversationTraceUpdateEvent",

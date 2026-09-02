@@ -40,6 +40,7 @@ _EXPECTED_TABLES = frozenset(
         "tinkerfin_opensandbox_workers",
         "tinkerfin_opensandbox_warm_slots",
         "tinkerfin_opensandbox_cleanup",
+        "tinkerfin_trace_entries",
         "tinkerfin_trace_events",
         "tinkerfin_trace_namespaces",
         "tinkerfin_trace_projection_checkpoints",

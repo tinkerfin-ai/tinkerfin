@@ -8,7 +8,6 @@
   .todo-trace-launcher.is-loading:disabled { cursor: wait; opacity: .68; }
   .todo-trace-launcher.is-error { color: var(--color-danger-text); }
 
-  .composer-auxiliary-control.todo-trace-launcher { border: 0; }
   .composer-auxiliary-control.todo-trace-launcher.is-selected { box-shadow: var(--shadow-1); }
 
   .todo-trace-scrim {
@@ -27,7 +26,7 @@
     top: 0;
     right: 0;
     display: grid;
-    grid-template-rows: var(--layout-header-height) minmax(0, 1fr);
+    grid-template-rows: var(--layout-drawer-header-height) minmax(0, 1fr);
     width: min(var(--layout-todo-trace-drawer), 100vw);
     height: 100dvh;
     padding: 0 var(--space-4) max(var(--space-4), env(safe-area-inset-bottom));
@@ -50,51 +49,6 @@
     visibility: visible;
     pointer-events: auto;
     transition-delay: var(--motion-instant);
-  }
-
-  .todo-trace-drawer-head {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
-    grid-template-rows: var(--type-title-line) var(--type-micro-line);
-    min-width: 0;
-    height: var(--layout-header-height);
-    align-content: center;
-    align-items: center;
-    column-gap: var(--space-3);
-    padding-block: var(--space-2);
-    row-gap: var(--space-0-5);
-  }
-
-  .todo-trace-drawer-heading {
-    display: grid;
-    grid-row: 1 / 3;
-    min-width: 0;
-    gap: var(--space-0-5);
-  }
-
-  .todo-trace-drawer-head > .ui-icon-button-wrap {
-    grid-column: 2;
-    grid-row: 1;
-  }
-
-  .todo-trace-drawer-head h2 {
-    min-width: 0;
-    margin: 0;
-    overflow: hidden;
-    color: var(--color-text-primary);
-    font-size: var(--type-title-size);
-    line-height: var(--type-title-line);
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .todo-trace-drawer-heading > span {
-    overflow: hidden;
-    color: var(--color-text-tertiary);
-    font-size: var(--type-micro-size);
-    line-height: var(--type-micro-line);
-    text-overflow: ellipsis;
-    white-space: nowrap;
   }
 
   .todo-trace-drawer-region {

@@ -41,6 +41,7 @@ def test_top_level_exposes_the_stateless_runtime_contract() -> None:
         "AgUiResumeInitializationFailureObserver",
         "AgUiResumeRequest",
         "AgentMode",
+        "ContextKind",
         "DeepAgentAgUiRuntime",
         "DeepAgentAgUiResumeRuntime",
         "DeepAgentDefinition",
@@ -81,7 +82,9 @@ def test_top_level_exposes_the_stateless_runtime_contract() -> None:
         "TinkerFinErrorCode",
         "TinkerFinLifecycleError",
         "TinkerFinStreamProtocolError",
+        "TraceContribution",
         "join_task",
+        "trace_contribution",
     }
 
     assert set(tinkerfin.__all__) == expected

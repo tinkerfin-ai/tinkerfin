@@ -1,13 +1,12 @@
 import {
   ArrowUpRight,
   ChevronDown,
-  X,
 } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import type { RefObject } from 'react'
 
 import type { TodoGroup } from '../../../../api/conversation/taskTrace'
-import { IconButton, OverlayScrollbar } from '../../../../components/ui'
+import { DrawerHeader, OverlayScrollbar } from '../../../../components/ui'
 import { useI18n } from '../../../../i18n'
 import { todoProgress } from '../domain'
 import { useTodoGroupWindow } from '../useTodoGroupWindow'
@@ -139,18 +138,13 @@ export function TodoTraceDrawer({
             })
           : t('没有已确认的任务轨迹')}
       </p>
-      <header className="todo-trace-drawer-head">
-        <span className="todo-trace-drawer-heading">
-          <h2>{t('任务轨迹')}</h2>
-          <span>{t('当前会话 · {count} 组', { count: groups.length })}</span>
-        </span>
-        <IconButton
-          ref={closeRef}
-          label={t('关闭任务轨迹')}
-          icon={<X size={18} />}
-          onClick={onClose}
-        />
-      </header>
+      <DrawerHeader
+        ref={closeRef}
+        title={t('任务轨迹')}
+        description={t('当前会话 · {count} 组', { count: groups.length })}
+        closeLabel={t('关闭任务轨迹')}
+        onClose={onClose}
+      />
       <div className="todo-trace-drawer-region">
         <div
           ref={viewportRef}

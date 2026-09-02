@@ -4,9 +4,11 @@ import {
   useLayoutEffect,
   useRef,
   useState,
+  type CSSProperties,
   type KeyboardEvent,
   type ReactNode,
 } from 'react'
+import { createPortal } from 'react-dom'
 
 export interface ListboxPickerProps<T extends string> {
   value: T
@@ -20,6 +22,8 @@ export interface ListboxPickerProps<T extends string> {
   triggerClassName: string
   listboxClassName: string
   optionClassName?: string
+  listboxPortalTarget?: Element | null
+  listboxStyle?: CSSProperties
   disabled?: boolean
   renderTrigger: (value: T) => ReactNode
   renderOption: (option: T, selected: boolean) => ReactNode
@@ -38,6 +42,8 @@ export function ListboxPicker<T extends string>({
   triggerClassName,
   listboxClassName,
   optionClassName,
+  listboxPortalTarget,
+  listboxStyle,
   disabled = false,
   renderTrigger,
   renderOption,
@@ -63,12 +69,24 @@ export function ListboxPicker<T extends string>({
     if (!open) return
     setActiveIndex(selectedIndex)
     listboxRef.current?.focus()
-  }, [open, selectedIndex])
+  }, [open, options.length, selectedIndex])
+
+  useLayoutEffect(() => {
+    if (!open) return
+    const activeOption = document.getElementById(`${listboxId}-option-${activeIndex}`)
+    if (activeOption && listboxRef.current?.contains(activeOption)) {
+      activeOption.scrollIntoView?.({ block: 'nearest' })
+    }
+  }, [activeIndex, listboxId, open])
 
   useEffect(() => {
     if (!open) return
     const handleOutsidePointer = (event: PointerEvent) => {
-      if (event.target instanceof Node && !rootRef.current?.contains(event.target)) {
+      if (
+        event.target instanceof Node
+        && !rootRef.current?.contains(event.target)
+        && !listboxRef.current?.contains(event.target)
+      ) {
         onOpenChange(false)
       }
     }
@@ -114,6 +132,38 @@ export function ListboxPicker<T extends string>({
     }
   }
 
+  const listbox = open ? (
+    <div
+      ref={listboxRef}
+      id={listboxId}
+      className={listboxClassName}
+      style={listboxStyle}
+      role="listbox"
+      aria-label={listboxLabel}
+      aria-activedescendant={`${listboxId}-option-${activeIndex}`}
+      tabIndex={-1}
+      onKeyDown={handleListboxKeyDown}
+    >
+      {options.map((option, index) => (
+        <div
+          key={option}
+          id={`${listboxId}-option-${index}`}
+          className={optionClassName}
+          role="option"
+          tabIndex={-1}
+          aria-selected={value === option}
+          data-active={activeIndex === index}
+          onClick={() => choose(index)}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter' || event.key === ' ') choose(index)
+          }}
+        >
+          {renderOption(option, value === option)}
+        </div>
+      ))}
+    </div>
+  ) : null
+
   return (
     <div ref={rootRef} className={rootClassName}>
       <button
@@ -129,36 +179,9 @@ export function ListboxPicker<T extends string>({
       >
         {renderTrigger(value)}
       </button>
-      {open && (
-        <div
-          ref={listboxRef}
-          id={listboxId}
-          className={listboxClassName}
-          role="listbox"
-          aria-label={listboxLabel}
-          aria-activedescendant={`${listboxId}-option-${activeIndex}`}
-          tabIndex={-1}
-          onKeyDown={handleListboxKeyDown}
-        >
-          {options.map((option, index) => (
-            <div
-              key={option}
-              id={`${listboxId}-option-${index}`}
-              className={optionClassName}
-              role="option"
-              tabIndex={-1}
-              aria-selected={value === option}
-              data-active={activeIndex === index}
-              onClick={() => choose(index)}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter' || event.key === ' ') choose(index)
-              }}
-            >
-              {renderOption(option, value === option)}
-            </div>
-          ))}
-        </div>
-      )}
+      {listboxPortalTarget && listbox
+        ? createPortal(listbox, listboxPortalTarget)
+        : listbox}
     </div>
   )
 }

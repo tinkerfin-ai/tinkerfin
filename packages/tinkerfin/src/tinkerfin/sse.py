@@ -73,7 +73,7 @@ def encode_sse_payload(
 
 
 class SseBody(Generic[ChunkT_co]):
-    """Own one lazy single-use response iterator and its upstream cleanup."""
+    """Own one lazy single-use response iterator, each pull, and upstream cleanup."""
 
     is_tinkerfin_sse_body = True
 
@@ -127,7 +127,7 @@ class SseBody(Generic[ChunkT_co]):
         return self
 
     async def __anext__(self) -> ChunkT_co:
-        """Return the next body chunk while enforcing one active operation."""
+        """Return one chunk without exposing the upstream pull to caller cancellation."""
 
         if self._closed:
             raise StopAsyncIteration
@@ -140,14 +140,45 @@ class SseBody(Generic[ChunkT_co]):
         self._active_task = current
         self._started = True
         try:
-            source = self._source
-            if source is None:
-                source = self._source_factory()
-                self._source = source
             try:
+                source = self._source
+                if source is None:
+                    source = self._source_factory()
+                    self._source = source
+            except BaseException as error:
+                await self._finish(error)
+                raise
+
+            async def pull_next() -> ChunkT_co:
                 return await anext(source)
+
+            pull = asyncio.create_task(
+                pull_next(),
+                name="tinkerfin-sse-body-pull",
+            )
+            try:
+                return await asyncio.shield(pull)
             except StopAsyncIteration:
                 await self._finish(None)
+                raise
+            except asyncio.CancelledError as error:
+                if not pull.done():
+                    pull.cancel()
+                    try:
+                        await join_task(
+                            pull,
+                            suppress_task_cancellation=True,
+                        )
+                    except asyncio.CancelledError:
+                        # Repeated caller cancellation is restored by the original
+                        # cancellation after the owned pull finishes cleanup.
+                        pass
+                    except BaseException as cleanup_error:  # noqa: BLE001
+                        error.add_note(
+                            "SSE pull cleanup also failed: "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}"
+                        )
+                await self._finish(error)
                 raise
             except BaseException as error:
                 await self._finish(error)
@@ -183,6 +214,16 @@ class SseBody(Generic[ChunkT_co]):
             await join_task(task)
         except BaseException as cleanup_error:
             if primary is not None and not isinstance(primary, GeneratorExit):
+                if isinstance(primary, Exception) and not isinstance(
+                    cleanup_error, Exception
+                ):
+                    cleanup_error.add_note(
+                        "SSE processing also failed: "
+                        f"{type(primary).__name__}: {primary}"
+                    )
+                    raise cleanup_error.with_traceback(
+                        cleanup_error.__traceback__
+                    ) from primary
                 primary.add_note(
                     "SSE cleanup also failed: "
                     f"{type(cleanup_error).__name__}: {cleanup_error}"

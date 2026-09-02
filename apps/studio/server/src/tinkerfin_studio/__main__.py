@@ -27,6 +27,12 @@ def parse_args(args: Sequence[str] | None = None) -> Namespace:
         default=True,
         help="是否开启开发热重载",
     )
+    parser.add_argument(
+        "--graceful-shutdown-timeout-seconds",
+        type=int,
+        default=10,
+        help="停止接收请求后等待现有连接结束的秒数",
+    )
     return parser.parse_args(args)
 
 
@@ -41,6 +47,7 @@ def main(args: Sequence[str] | None = None) -> None:
         host=options.host,
         port=options.port,
         reload=options.reload,
+        timeout_graceful_shutdown=options.graceful_shutdown_timeout_seconds,
         log_config=None,
     )
 

@@ -153,8 +153,9 @@ def test_generated_stubs_preserve_upstream_options_with_explicit_agui_inputs() -
         _stub_method(_INIT_STUB, "TinkerFin", "create_deep_agent").args
     )
     create_arguments.args = create_arguments.args[1:]
+    expected_create = copy.deepcopy(_upstream_function(create_deep_agent).args)
     assert ast.dump(create_arguments, include_attributes=False) == ast.dump(
-        _upstream_function(create_deep_agent).args,
+        expected_create,
         include_attributes=False,
     )
 

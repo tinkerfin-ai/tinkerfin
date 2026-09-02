@@ -2,10 +2,11 @@
 
 [文档首页](../README.md) · [English](../../en/tracing/index.md)
 
-`tinkerfin-tracing` 只从两个权威来源记录用户可读执行历史：
+`tinkerfin-tracing` 从彼此互补的权威来源记录用户可读执行历史：
 
 ```text
 TinkerFin Runtime 生命周期
++ LangChain provider 与 Tool callback
 + 校验后的 LangGraph Native messages/tasks/values
 ```
 
@@ -58,9 +59,41 @@ print(thread.summary.pending_interactions)
 ```
 
 `.observe(...)` 返回单独配置的 `TinkerFin` factory。每个请求打开一个 request-scoped Trace
-session。Runtime 会先校验每个 Native part，再写 Trace，之后才调用 `on_part` 和 AG-UI 转换；
-在 resume、interrupt、terminal 和 close 边界强制结算已接收 Observation。Trace 写入失败会让
-Agent Run fail-closed。
+session。Callback 平面会在 provider 执行前记录 middleware 处理后的最终模型请求，并记录首个
+输出、用量、失败、取消和审批后实际执行的 Tool；Native 平面仍是消息、Todo、Plan、HITL、state、
+checkpoint 与子 Agent 的权威来源。Runtime 会先校验每个 Native part，再写 Trace，之后才调用
+`on_part` 和 AG-UI 转换，并在调用开始、resume、interrupt、terminal 和 close 边界强制结算已接收
+Observation。Trace 写入失败会让 Agent Run fail-closed。
+
+## 在 Store 中直接筛选调用节点
+
+```python
+from tinkerfin_tracing import TraceEntryKind, TraceFilter
+
+query = await tracer.query(
+    "thread-1",
+    where=TraceFilter(
+        kinds={
+            TraceEntryKind.MODEL,
+            TraceEntryKind.PROVIDER,
+            TraceEntryKind.TOOL,
+            TraceEntryKind.SKILL,
+        },
+        include_ancestors=True,
+    ),
+    limit=100,
+)
+print(query.turns, query.items, query.facets, query.next_cursor)
+```
+
+Store 会先应用 kind、status、parent、Agent、middleware、Skill、provider、model、namespace、时间与
+文本条件，再返回结果。`TraceQuery.follow()` 跟随同一筛选页及其游标。派生 SQL entry 表不保存 request、
+result、message 或 state payload；详情只按 Ledger 序号读取，并经当前 codec 解码。
+`await tracer.rebuild_entries(thread_id)` 可从 Ledger 重建这些派生节点，不改写权威 event。
+
+每个查询节点只属于一个 Turn。`parent_id` 只表达有依据的调用树；实际 Tool 执行通过独立
+`proposal_id` 关联模型 Tool 提议。`query.turns` 从已有 message fact 解析用户消息，不保存第二份
+正文。实时跟随会一起发送 Turn 与节点变化，并能在 provider 尚未输出时发布新 Turn。
 
 ## 读取固定执行切面
 
@@ -93,17 +126,20 @@ page = await thread.events(limit=100)
 while page.next_cursor is not None:
     page = await thread.events(cursor=page.next_cursor, limit=100)
 
-async for update in thread.follow():
-    apply_message_delta(update.messages)
-    apply_node_delta(update.nodes)
+updates = thread.follow()
+async with updates:
+    async for update in updates:
+        apply_message_delta(update.messages)
+        apply_node_delta(update.nodes)
 ```
 
 事件 cursor 是不透明值，绑定 namespace、thread、generation、selected head、固定分页 as-of
 与最后全局序号。并发 append 不会进入已经开始的分页。`follow()` 从 handle 原始 as-of 之后
-开始，返回语义实体的 upsert/remove；取消或关闭迭代器会释放等待资源。
+开始，返回语义实体的 upsert/remove。取消、正常耗尽或退出 `async with` 会释放等待资源；
+不使用上下文管理器的消费方提前 `break` 后必须调用 `aclose()`。
 
 `thread.delete()` 只删除该 handle 指向的不活跃 generation。存在 active writer 时拒绝删除；
-旧 generation 的 cursor 或 handle 不能访问同 ID 重建后的 thread。
+其他 generation 的 cursor 或 handle 不能访问同 ID 的当前 thread。
 
 ## 公开历史与安全捕获
 
@@ -117,6 +153,8 @@ async for update in thread.follow():
   前删除；
 - Run 与 Runtime task payload 只保留有界结构元数据，不复制 state 或 message 正文；
 - 新出现的 Tool 默认保存经清理的完整参数、结果和公开审批说明；
+- middleware 配置及标准 callback 能证明的生命周期默认可见；可用
+  `configuration_only()` 或 `disabled()` 逐项收窄，且不改变 middleware 执行；
 - `ToolTraceCapture.metadata_only()` 只保存生命周期，`selected_content()` 只保存明确的 RFC 6901
   路径，`disabled()` 不写入该 Tool 的 facts；
 - 安全化后仍超限的 payload 使用明确 omitted disposition，不做局部或静默截断。
@@ -125,6 +163,15 @@ async for update in thread.follow():
 需要 Tool 默认 metadata-only 的宿主可显式选择 `CapturePolicy.public_safe(tool_rules=...)`。低层
 `ToolCaptureRule` 继续提供准确 Tool 名与 JSON Pointer 选择能力，但普通 Agent 路径无需据此维护第二份
 Tool Registry。
+
+`middleware_overrides` 可用实现类型覆盖该类型全部实例，也可用公开名称精确覆盖一个命名实例，
+公开名称优先。只有 wrap hook 的 middleware 仅作为配置证据，因为 LangChain 不通过标准 callback
+发布这些 hook；Trace 不会伪造执行状态或耗时。框架注入的 middleware 首次通过标准 callback
+类名出现时，实现类型覆盖同样生效。
+
+只有具备直接失败依据的节点拥有 `failure`。interrupt 保持 waiting，取消保持 cancelled，终态时仍
+缺少结果的工作标记为 abandoned。Runtime 终态会结算 Native task、Tool 提议、Tool 执行、
+subagent 与 callback step，已终止 Run 不会留下 running 查询节点。
 
 Provider reasoning 需要两道彼此独立的显式授权：先在 `DeepAgentsV2RuntimeProfile` 配置已验证的
 extractor，再仅在允许持久化时向 `Tracer` 传入 `ReasoningCapturePolicy.content()`。默认
@@ -172,6 +219,10 @@ Backend 精确实现五个存储操作：准备存储、原子提交一次 Ledge
 event page、加载一个 Projection checkpoint。writer 生命周期、终态 reserve、序号分配、checkpoint
 决策、canonical 校验、follow 轮询、背压和取消由框架负责。Backend 作者可使用两个独立客户端运行
 `verify_trace_ledger_backend()`，验证共享可观察契约。
+
+直接筛选属于可选 `TraceQueryBackend` 能力，原子重建属于独立的
+`TraceEntryRebuildBackend` 能力；归档或 telemetry 集成无需实现查询存储。普通
+`TraceLedgerBackend` 契约与自定义 payload codec 保持不变。
 
 SQL writer 使用数据库时钟 lease 与单调递增 fence。过期且未完成的 writer 会表现为
 `missing_tail`，继续保留终态容量并允许 takeover；已完成 Run 不允许 takeover。SQLite 锁等待

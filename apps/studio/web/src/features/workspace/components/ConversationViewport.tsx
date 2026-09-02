@@ -126,7 +126,7 @@ export function ConversationViewport({
         ) : isInitialHistoryUnavailable ? (
           <WorkspaceStatus kind="error" title={t('历史会话加载失败')} description={t('无法读取历史记录，请重试；现有数据不会被修改')} onRetry={onRetryHistory} />
         ) : isHydrating ? (
-          <WorkspaceStatus kind="loading" title={t('正在加载会话')} description={t('正在恢复消息、任务和运行状态')} />
+          <WorkspaceStatus kind="loading" title={t('正在加载会话')} />
         ) : isHydrationFailed ? (
           <WorkspaceStatus kind="error" title={t('会话加载失败')} description={t('该会话尚未完整恢复，重试前不会发送新消息')} onRetry={onRetryHydration} />
         ) : isEmpty ? (
@@ -169,7 +169,11 @@ export function ConversationViewport({
         )}
         </section>
         {/* eslint-enable jsx-a11y/no-noninteractive-tabindex */}
-        <OverlayScrollbar viewportRef={paneRef} visibility="persistent" />
+        <OverlayScrollbar
+          viewportRef={paneRef}
+          visibility="persistent"
+          onUserScrollIntent={onUserScrollIntent}
+        />
       </div>
     </ErrorBoundary>
   )

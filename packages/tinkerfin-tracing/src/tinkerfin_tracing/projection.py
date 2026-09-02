@@ -22,6 +22,7 @@ from .errors import (
     TraceRunNotFound,
 )
 from .facts import (
+    AgentStepFact,
     InteractionFact,
     MessageFact,
     PlanRevisionFact,
@@ -210,6 +211,7 @@ class CoreTurnCheckpoint(TraceModel):
     first_seq: int
     last_seq: int
     run_ids: tuple[str, ...]
+    user_message_id: str | None = None
 
 
 class CoreProjectionState(TraceModel):
@@ -481,6 +483,8 @@ def advance_core_projection_state(
         info: CoreRunCheckpoint,
         turn_id: str,
         trace_seq: int,
+        *,
+        user_message_id: str | None = None,
     ) -> CoreRunCheckpoint:
         previous = turns.get(turn_id)
         run_ids = (
@@ -499,6 +503,11 @@ def advance_core_projection_state(
                 trace_seq if previous is None else max(previous.last_seq, trace_seq)
             ),
             run_ids=run_ids,
+            user_message_id=(
+                user_message_id
+                if user_message_id is not None
+                else (None if previous is None else previous.user_message_id)
+            ),
         )
         if turn_id not in turn_order:
             turn_order.append(turn_id)
@@ -597,7 +606,12 @@ def advance_core_projection_state(
             info = info.model_copy(update={"last_seq": event.trace_seq})
 
         if isinstance(fact, TurnFact):
-            info = assign_turn(info, fact.turn_id, event.trace_seq)
+            info = assign_turn(
+                info,
+                fact.turn_id,
+                event.trace_seq,
+                user_message_id=fact.user_message_id,
+            )
         elif isinstance(fact, StateRevisionFact | PlanRevisionFact):
             info = info.model_copy(
                 update={
@@ -626,7 +640,12 @@ def advance_core_projection_state(
         tree_facts = info.tree_facts
         tree_sequences = info.tree_sequences
         if isinstance(
-            fact, RuntimeTaskFact | ToolFact | SubagentFact | PlanRevisionFact
+            fact,
+            AgentStepFact
+            | RuntimeTaskFact
+            | ToolFact
+            | SubagentFact
+            | PlanRevisionFact,
         ):
             tree_facts = (*tree_facts, fact)
             tree_sequences = (*tree_sequences, event.trace_seq)
@@ -1794,19 +1813,21 @@ def _tree(
                 input_omitted=input_omitted,
                 result=result_value,
                 result_omitted=result_omitted,
-                status=(
-                    "running"
-                    if fact.phase == "started"
-                    else (
-                        "failed"
-                        if fact.error_type
-                        else ("waiting" if fact.interrupt_ids else "succeeded")
-                    )
+                status=cast(
+                    NodeStatus,
+                    {
+                        "started": "running",
+                        "completed": "succeeded",
+                        "failed": "failed",
+                        "cancelled": "cancelled",
+                        "interrupted": "waiting",
+                        "abandoned": "abandoned",
+                    }[fact.phase],
                 ),
                 started_at=(previous.started_at if previous else fact.occurred_at),
                 completed_at=(
                     fact.occurred_at
-                    if fact.phase == "completed" and not fact.interrupt_ids
+                    if fact.phase in {"completed", "failed", "cancelled", "abandoned"}
                     else None
                 ),
             )
@@ -1839,12 +1860,28 @@ def _tree(
                 result=result_value,
                 result_omitted=result_omitted,
                 status=(
-                    "running"
-                    if fact.phase in {"started", "arguments", "completed"}
-                    else ("failed" if fact.result_status == "error" else "succeeded")
+                    "cancelled"
+                    if fact.phase == "cancelled"
+                    else (
+                        "abandoned"
+                        if fact.phase == "abandoned"
+                        else (
+                            "running"
+                            if fact.phase in {"started", "arguments", "completed"}
+                            else (
+                                "failed"
+                                if fact.result_status == "error"
+                                else "succeeded"
+                            )
+                        )
+                    )
                 ),
                 started_at=previous.started_at if previous else fact.occurred_at,
-                completed_at=(fact.occurred_at if fact.phase == "result" else None),
+                completed_at=(
+                    fact.occurred_at
+                    if fact.phase in {"result", "cancelled", "abandoned"}
+                    else None
+                ),
             )
         elif isinstance(fact, SubagentFact):
             previous = nodes.get(fact.subagent_id)

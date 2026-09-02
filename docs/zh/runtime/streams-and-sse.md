@@ -28,17 +28,17 @@ finally:
 ## 转成 SSE
 
 ```python
+from starlette.responses import StreamingResponse
+
+
 sse = stream.to_sse()
 await sse.prepare()
-
-try:
-    async for chunk in sse:
-        await send_to_client(chunk)
-finally:
-    await sse.aclose()
+return StreamingResponse(sse, media_type="text/event-stream")
 ```
 
 默认编码适合 TinkerFin 的原生流。每个 `chunk` 都是一个已经编码的 SSE 字符串。
+`SseBody` 拥有每次上游读取及其关闭任务，因此宿主 Response 可以直接取消它，不需要重新实现
+TinkerFin 的清理顺序。没有交给 Response、而是自行提前停止迭代的调用方仍需调用 `aclose()`。
 
 ### `to_sse()` 参数
 
@@ -105,7 +105,7 @@ await sse.prepare(preflight=authorize)
 | --- | --- |
 | 正常迭代完成 | 上游关闭，错误正常传播 |
 | 消费者提前退出 | 调用 `aclose()` 释放资源 |
-| 当前任务被取消 | 取消继续向上传播，并等待必要清理 |
+| 当前任务被单次或重复取消 | 所有已拥有的读取与必要清理结算后继续传播取消 |
 | 原生流超过总时限 | 运行失败并关闭上游 |
 | `prepare()` 失败 | 不开始发送响应 |
 

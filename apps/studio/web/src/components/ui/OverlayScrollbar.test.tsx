@@ -13,10 +13,12 @@ function ScrollbarHarness({
   axis = 'vertical',
   size = 'regular',
   visibility = 'transient',
+  onUserScrollIntent,
 }: {
   axis?: OverlayScrollbarAxis
   size?: OverlayScrollbarSize
   visibility?: OverlayScrollbarVisibility
+  onUserScrollIntent?: () => void
 }) {
   const viewportRef = useRef<HTMLDivElement>(null)
   return (
@@ -27,6 +29,7 @@ function ScrollbarHarness({
         axis={axis}
         size={size}
         visibility={visibility}
+        onUserScrollIntent={onUserScrollIntent}
       />
     </div>
   )
@@ -121,7 +124,13 @@ describe('OverlayScrollbar', () => {
 
   it('maps thumb dragging directly to the viewport scroll position', () => {
     const flushFrames = installFrames()
-    const { container } = render(<ScrollbarHarness visibility="persistent" />)
+    const onUserScrollIntent = vi.fn()
+    const { container } = render(
+      <ScrollbarHarness
+        visibility="persistent"
+        onUserScrollIntent={onUserScrollIntent}
+      />,
+    )
     const host = container.querySelector<HTMLElement>('.scrollbar-host')!
     const viewport = container.querySelector<HTMLElement>('.ui-scrollbar')!
     const thumb = container.querySelector<HTMLElement>('.ui-overlay-scrollbar__thumb')!
@@ -142,6 +151,7 @@ describe('OverlayScrollbar', () => {
       fireEvent(thumb, event)
     }
     dispatchPointer('pointerdown', 100)
+    expect(onUserScrollIntent).toHaveBeenCalledOnce()
     dispatchPointer('pointermove', 150)
     expect(viewport.scrollTop).toBeCloseTo(506.19, 1)
     dispatchPointer('pointerup', 150)
