@@ -24,7 +24,6 @@ from tinkerfin_studio.agent.factory import ConversationAgentFactory
 from tinkerfin_studio.api.errors import (
     BusinessException,
     ConversationErrorCode,
-    ModelErrorCode,
     SystemException,
 )
 from tinkerfin_studio.auth.types import UserContext
@@ -191,8 +190,6 @@ class ConversationChatService:
         model = await AgentModelService(AgentModelRepository(self._session)).resolve(
             request.forwarded_props.model
         )
-        if model.runtime_profile not in self._resources.tinkerfin_profiles:
-            raise SystemException(ModelErrorCode.CATALOG_UNAVAILABLE)
         run_preparer, prepared, execution = await self._prepare_execution(
             request,
             intent=intent,
@@ -311,7 +308,7 @@ class ConversationChatService:
                 raise RuntimeError("恢复请求缺少 AgUiResumeRequest")
             graph_input = None
             resume_request = execution.resume
-        tinkerfin = self._resources.tinkerfin_profiles[model.runtime_profile]
+        tinkerfin = self._resources.tinkerfin
         factory = ConversationAgentFactory(
             persistence=self._resources.agent_persistence,
             sandbox_manager=self._resources.sandbox_manager,
@@ -390,8 +387,8 @@ class ConversationChatService:
     ) -> AsyncGenerator[bytes, None]:
         """让 Messaging 完成 owner/attachment 选择并返回 SSE 内容"""
 
-        async def activate_source() -> None:
-            """在 producer 创建前激活已选中的业务 Run"""
+        async def activate_ready_source() -> None:
+            """在框架 Run 可查询后发布业务 head"""
 
             await run_preparer.activate_started(
                 thread_pk=execution.thread.id,
@@ -413,7 +410,7 @@ class ConversationChatService:
             body = await self._resources.conversation_channel.sse(
                 events,
                 after=after,
-                on_source_starting=activate_source,
+                on_source_ready=activate_ready_source,
                 on_delivery_not_started=cleanup_not_started,
             )
         except MessagingError as error:

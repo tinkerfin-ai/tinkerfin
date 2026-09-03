@@ -1,92 +1,170 @@
 # TinkerFin Tracing
 
-`tinkerfin-tracing` records TinkerFin Runtime lifecycle, provider and Tool call
-boundaries, and validated Native semantic facts in one replayable Ledger. It provides a
-bounded in-memory Store, directly filtered call entries, fixed-as-of
-messages/reasoning/tree/state/interaction views, live semantic deltas, incremental core
-checkpoints, deterministic business Projection extensions, and borrowed-Engine SQLite
-and MySQL persistence.
+TinkerFin Tracing records normalized Runtime observations in one replayable semantic
+Ledger. It provides canonical execution graphs, fixed-prefix conversation history,
+live updates, bounded in-memory storage, and durable SQLite or MySQL storage.
 
-It does not record AG-UI events, Messaging settlement, SSE frames, or Redis ownership.
+Tracing does not persist AG-UI frames, HTTP state, or Messaging delivery state.
 
 ## Installation
 
 ```bash
 pip install tinkerfin-tracing
 
-# Durable SQLite or MySQL persistence
+# Durable storage
 pip install "tinkerfin-tracing[sqlite]"
 pip install "tinkerfin-tracing[mysql]"
 ```
-
-The Runtime example below also uses the core Runtime and LangChain's OpenAI adapter:
-
-```bash
-pip install tinkerfin langchain-openai
-```
-
-Tracing itself remains provider-neutral and does not depend on either package.
 
 ## Quick Start
 
 ```python
 from tinkerfin import RunIdentity, TinkerFin
-from tinkerfin_tracing import TraceEntryKind, TraceFilter, Tracer
+from tinkerfin_tracing import TraceGraphFilter, TraceGraphNodeKind, Tracer
 
 tracer = Tracer()
 tinkerfin = TinkerFin().observe(tracer)
-definition = tinkerfin.create_deep_agent(
+agent = tinkerfin.create_deep_agent(
     model="openai:gpt-5.4",
     tools=[],
 )
 
 stream = await tinkerfin.open_run(
     RunIdentity(threadId="thread-1", runId="run-1"),
-    agent=definition,
+    agent=agent,
     input=graph_input,
 )
 async for _part in stream:
     pass
 
-thread = await tracer.get("thread-1")
-print(thread.messages)
-print(thread.reasoning)
-print(thread.tree.roots)
-print(thread.state.root)
-print(thread.status.execution)
-print(thread.summary.pending_interactions)
+history = await tracer.get("thread-1")
+print(history.messages)
+print(history.state.root)
+print(history.summary.status.execution)
+print(history.graph.turns, history.graph.nodes)
 
-calls = await tracer.query(
+graph = await tracer.query(
     "thread-1",
-    where=TraceFilter(
-        kinds={
-            TraceEntryKind.MODEL,
-            TraceEntryKind.PROVIDER,
-            TraceEntryKind.TOOL,
-        }
+    where=TraceGraphFilter(
+        kinds={TraceGraphNodeKind.MODEL, TraceGraphNodeKind.TOOL},
     ),
 )
-print(calls.turns, calls.items)
+print(graph.turns, graph.nodes, graph.ordered_node_ids)
 ```
 
-Graph model entries describe the actual Agent step. Provider entries retain the final
-middleware-processed System and user messages, provider settings, usage, response
-metadata, and time to first output. Tool proposals remain distinct from actual
-post-approval Tool executions: `parent_id` retains the execution tree and `proposal_id`
-retains their semantic association. `TraceTurn` resolves its HumanMessage from the
-existing message fact rather than storing another payload. Native streams remain the
-authority for messages, Todo, Plan, HITL, state, checkpoints, and subagents.
+`TinkerFin.ainvoke()` and managed stream entry points open the same observation
+lifecycle. Calling a compiled graph directly remains an unmanaged advanced path and
+does not automatically create a complete Trace.
 
-Messages, reasoning, nodes, and interactions carry the first authoritative `trace_seq`
-that created each entity. Use that sequence—not timestamps or IDs—when merging different
-view kinds. Interactions retain the canonical Native `source_id` for public resume ID
-derivation and position-aligned `tool_call_ids` proven from the checkpoint message.
-Consumers must not re-correlate same-name or parallel review actions by list order.
+## Canonical Graph
 
-The default `InMemoryTraceStore` is process-local and is lost when the process exits.
+Each user Turn is rooted at its existing HumanMessage. Model calls link to
+AssistantMessage nodes by stable provider output message IDs. SystemMessage and
+ToolMessage nodes remain available as technical evidence. One logical Tool node combines
+its proposal, actual post-review execution, and result without duplicating payloads.
 
-For durable persistence, construct one host-owned asynchronous Engine and lend it to the
-Store:
+`TraceGraphFilter` supports kind, status, parent, Agent, middleware, Skill, provider,
+model, graph namespace, time, and literal text predicates. Technical nodes are hidden by
+default. `include_technical_nodes=True` includes them, while
+`include_ancestor_nodes=True` asks the framework to return and reconnect visible
+ancestors.
+
+`TraceGraphQuery.snapshot` returns the complete current page. `follow()` is available
+only on the current first page and publishes `TraceGraphDelta` values with complete
+authoritative node order, roots, and the current older-page cursor. A pagination cursor
+is bound to its namespace, thread, generation, selected head, filter, and Ledger tail;
+a newer commit replaces the live cursor and invalidates any previously issued cursor
+instead of silently changing its page.
+
+`TraceGraphQueryLimits` independently bounds direct matches, expanded nodes, and
+serialized page/update bytes. When only details exceed the byte budget, the framework
+keeps the graph structure and marks content, request, or result values as omitted. A
+structure-only page that still exceeds the budget fails with `TraceQuotaExceeded`.
+
+`Tracer.get()` exposes the same canonical nodes through `TraceThread.graph` at the
+history handle's exact fixed prefix. `TraceThread.follow()` carries a
+`TraceUpdate.graph` delta with the same ordering and root contract. Current-tail history
+uses the disposable index; an older fixed prefix replays the same Graph reducer from the
+Ledger instead of storing another execution tree or payload copy.
+
+The SQL Graph index stores only identity, relationship, filter, lifecycle, and Ledger
+sequence locators. Fact payloads remain solely in the Ledger and are decoded only for
+selected rows. The index is disposable and can be rebuilt with
+`await tracer.rebuild_graph(thread_id)`.
+
+## Capture and business redaction
+
+`CapturePolicy` decides whether content is retained, which Tool paths are selected, and
+the applicable byte budget. It does not perform redaction. `ReasoningCapturePolicy`
+independently authorizes or rejects persistence of explicitly extracted reasoning.
+
+Framework credential redaction and verified provider-private reasoning removal are
+mandatory. Applications may add business rules through `Tracer(redactor=...)`:
+
+```python
+from pydantic import JsonValue
+
+from tinkerfin_tracing import (
+    CompositeRedactor,
+    RedactionContext,
+    Tracer,
+    redact_json_paths,
+)
+
+
+class CustomerRedactor:
+    def redact(
+        self,
+        value: JsonValue,
+        *,
+        context: RedactionContext,
+    ) -> JsonValue:
+        if (
+            context.content_kind == "tool_arguments"
+            and context.component_name == "create_customer"
+        ):
+            return redact_json_paths(
+                value,
+                paths=("/id_card_number", "/mobile", "/bank_account"),
+            )
+        return value
+
+
+tracer = Tracer(
+    redactor=CompositeRedactor(
+        CustomerRedactor(),
+    )
+)
+```
+
+Each Redactor receives detached finite JSON after mandatory credential and private
+reasoning cleanup. It never receives LangChain messages, provider objects, thread IDs,
+Run IDs, or user identities. `RedactionContext.content_kind` identifies message, model
+request/response, Tool arguments/result, state, middleware configuration, interaction,
+plan, or custom content; `component_name` contains only the public component name when
+one exists.
+
+Redactors are synchronous, deterministic, reentrant, free of I/O, and must not mutate
+their input. Every result is validated before the next Redactor runs. The framework
+performs credential and private-reasoning cleanup again after the business chain, so an
+extension cannot reintroduce those fields. Invalid JSON, an awaitable, input mutation,
+an exception, or damage to required state, model-message, or HITL structure rejects the
+capture. Raw content is never used as a fallback.
+
+The default `CapturePolicy.public_history()` retains complete sanitized Tool content.
+Use per-Tool `ToolTraceCapture.metadata_only()`, `selected_content()`, or `disabled()`
+when a Tool needs a narrower policy. `CapturePolicy.public_safe()` makes metadata-only
+Tool capture the default and supports explicit RFC 6901 selections.
+
+Provider reasoning still requires two independent opt-ins: a verified Runtime extractor
+and `ReasoningCapturePolicy.content()` on the Tracer. The default stores no reasoning
+content or digest. A business field named `reasoning_content` outside the reserved
+`additional_kwargs` provider path is ordinary data and is not removed automatically.
+
+## Storage and extension boundaries
+
+`InMemoryTraceStore` is bounded and process-local. `SqlAlchemyTraceStore` borrows an
+application-owned asynchronous Engine and supports SQLite and MySQL:
 
 ```python
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -98,178 +176,30 @@ store = SqlAlchemyTraceStore(engine, namespace="my-application")
 await store.setup()
 tracer = Tracer(store=store)
 
-# Configure TinkerFin with `.observe(tracer)`, then consume or close every managed stream.
-
-await engine.dispose()  # The host, not the Store, owns this operation.
+# The application remains responsible for closing the borrowed Engine.
+await engine.dispose()
 ```
 
-`setup()` creates and reflects exactly six framework-owned tables. It is idempotent and
-safe for concurrent first starts. The same setup runs lazily before the first Store
-operation, but an application should call it during startup so an invalid or stale
-Schema fails before accepting Agent traffic. Trace tables have no foreign keys or
-Schema-version fields and can share a database with host-owned tables.
+The Store owns exactly six current tables. Hash search keys use 32-byte SHA-256 binary
+values. The Graph table has one lineage index in addition to its primary key, so a new
+node revision updates two B-Trees rather than maintaining one index per filter field.
+Filtering and Facets run after selected-lineage revisions are merged.
+Literal metadata search folds only ASCII `A-Z` for ASCII-only queries and is
+case-sensitive when the query contains non-ASCII characters. Unicode characters are
+never mapped to ASCII lookalikes, keeping the built-in Stores equivalent without a
+duplicate search payload.
 
-For another shared storage system, implement the five-operation
-`TraceLedgerBackend` and lend it to `DurableTraceStore`:
+Custom shared storage implements the five-operation `TraceLedgerBackend`; optional
+indexed Graph queries use `TraceGraphQueryBackend` and rebuilds use
+`TraceGraphRebuildBackend`. A codec may encrypt canonical fact and checkpoint bytes
+without changing their pre-transform digest. Runtime observers and Backend decorators
+remain the integration points for telemetry or archival. The package does not provide
+an S3, KMS, or OpenTelemetry implementation.
 
-```python
-from my_trace_storage import MyTraceLedgerBackend
-from tinkerfin_tracing import DurableTraceStore, Tracer
-
-backend = MyTraceLedgerBackend(database_client)
-store = DurableTraceStore(backend, namespace="my-application")
-await store.setup()
-tracer = Tracer(store=store)
-
-# The host remains responsible for closing database_client.
-```
-
-The required operations are `prepare_storage()`, `commit_ledger_change()`,
-`load_ledger_state()`, `read_event_page()`, and
-`load_projection_checkpoint()`. The framework owns `TraceWriter`, semantic state
-transitions, canonical validation, heartbeats, and following. A shared Backend must
-provide atomic conditional changes and storage-clock lease checks; ordinary CRUD or
-Blob storage cannot provide this contract. Backend authors can run
-`verify_trace_ledger_backend(primary, peer)` against two independent clients.
-Backends that support directly filtered entries additionally implement
-`TraceQueryBackend`; backends that can atomically reconstruct those derived entries
-implement `TraceEntryRebuildBackend`. These optional capabilities do not change the
-five-operation Ledger contract.
-
-## Query semantics
-
-`Tracer.query()` resolves the selected Run lineage, applies kind, status, parent,
-Agent, middleware, Skill, provider, model, namespace, time, and text filters in the
-Store, and returns a stable cursor, server-computed Facets, and optional ancestors.
-Each Facet applies every active filter except its own dimension, so a caller can switch
-kind or status directly without clearing that filter first. Failure ownership comes
-from the Ledger fact and therefore remains stable across filters and pagination.
-`TraceQuery.follow()` refreshes that same filtered page after indexed commits and
-emits Turn and entry upserts/removals through a `TraceFollow` handle. The handle owns
-each Store pull and waits for its upstream follower to close before cancellation escapes,
-including repeated caller cancellation. `TraceFollow` is an asynchronous context
-manager; use that scope when iteration may stop early, or call `aclose()` explicitly.
-Entering a closed handle or starting another pull raises `TraceFollowLifecycleError`
-with code `tracing.follow_lifecycle`.
-It never loads the complete Ledger into the caller or browser to perform filtering.
-
-The SQL entry table contains only searchable identity, relationship, status, time, and
-Ledger-sequence columns. Request, result, message, and state payloads remain solely in
-the Ledger and are decoded through the configured `CanonicalTracePayloadCodec` only for
-selected rows. `await tracer.rebuild_entries(thread_id)` atomically reconstructs the
-disposable entries from the current Ledger generation without rewriting authoritative
-events.
-
-`Tracer.get()` fixes one global `as_of_seq`. The default window contains the latest 100
-complete Turns. Messages remain chronological; top-level Turn nodes are latest-first;
-state and summary cover the full selected lineage. Multiple branch heads
-require an explicit `head_run_id`.
-Requesting a Run that has not entered the current generation raises
-`TraceRunNotFound`; it is not reported as stored-fact corruption.
-
-`TraceThread.summary` is the complete cumulative value for the selected lineage at the
-fixed as-of boundary. Its status, completeness, message and Tool counts, pending
-interactions, and maximum source `last_occurred_at` do not shrink with the visible Turn
-window. Every `TraceUpdate.summary` is the complete value after that update. Existing
-flat status and count accessors are computed from this one summary.
-
-`Tracer()` captures every observed Tool's complete sanitized arguments, results, and
-public review description. `TraceNode.input` and `TraceNode.result` expose those retained
-values, while their omission flags distinguish policy or size omission from JSON null.
-Per-Tool overrides describe whether the Tool remains fully visible, metadata-only,
-selected-content, or absent from Trace:
-
-```python
-from tinkerfin_tracing import (
-    CapturePolicy,
-    MiddlewareTraceCapture,
-    ToolTraceCapture,
-)
-
-CapturePolicy.public_history(
-    tool_overrides={
-        "execute": ToolTraceCapture.metadata_only(),
-        "private_audit": ToolTraceCapture.disabled(),
-        "web_search": ToolTraceCapture.selected_content(
-            argument_paths=("/query",),
-            result_paths=("/answer", "/sources"),
-        ),
-    },
-    middleware_overrides={
-        InternalMetricsMiddleware: MiddlewareTraceCapture.disabled(),
-        PromptCacheMiddleware: MiddlewareTraceCapture.configuration_only(),
-    },
-)
-```
-
-Middleware types select every instance of that implementation; an exact public name can
-override one named instance. `visible()` is the default and retains only lifecycles that
-standard callbacks can prove. Configuration-only wrap hooks never receive fabricated
-timing. A type selector also covers framework-injected middleware whose first evidence is
-a standard callback class name. Exact failures alone carry `failure`; interrupted work
-waits, cancelled work is cancelled, and unmatched terminal work is abandoned instead of
-remaining `running` or inheriting a Run-level error. New Tools require no second Trace registry. `CapturePolicy.public_safe(tool_rules=...)`
-remains the explicit metadata-only and RFC 6901 selection boundary for hosts that do not
-want the public-history default. Every mode still applies credential and provider
-reasoning sanitization, event-size limits, and explicit omission semantics.
-
-`TraceThread.history_cursor` expands the same fixed prefix through
-`Tracer.get(history_cursor=...)`, even when newer events have committed.
-`TraceThread.events()` uses a separate opaque generation-aware event cursor. `follow()`
-starts after the handle's original as-of and emits selected-lineage entity
-upserts/removals. `delete()` accepts only the exact inactive generation held by that
-handle.
-
-Store snapshots contain generation, as-of, byte, and active-writer metadata rather than
-the Ledger prefix. Events are available only through bounded forward or reverse reads.
-The framework-owned core Projection advances with committed batches; custom Projections
-cache validated Run-scoped state on query, so a business Projection failure never
-terminates the Agent writer.
-
-`TraceWritePolicy` controls asynchronous batch size, delay, and backpressure. Its default
-pending budget is 64 MiB. Runtime force, terminal, and close boundaries wait for every
-accepted transaction and checkpoint; caller cancellation never cancels the owned commit.
-
-`SqlAlchemyTraceStore` uses a database-clock lease and monotonic fence for each Run
-writer. MySQL transactions use `READ COMMITTED` row locks; SQLite writes use
-`BEGIN IMMEDIATE` and a bounded, cancellation-responsive busy retry. Fixed reads use one
-repeatable snapshot. An expired incomplete writer remains visible as a missing tail and
-keeps its terminal reserve until takeover, close, or explicit generation deletion.
-
-By default, event facts and Projection state are stored as opaque canonical UTF-8 JSON
-bytes. A codec may apply a reversible storage transform to those bytes. Their SHA-256
-digest is calculated from canonical JSON before that transform and checked on reads and
-unknown-commit retries. The package does not provide S3/Blob archiving, payload
-encryption or KMS integration, or OpenTelemetry exporters. Active shared storage
-implements `TraceLedgerBackend`; complete `TraceStore` replacement remains an advanced
-extension. Encryption wraps the canonical payload codec without changing its
-pre-transform digest; telemetry consumes `RuntimeObserver` or decorates Store/Messaging
-Backend operations. No placeholder interface represents an unavailable capability.
-
-## Safety
-
-The default `CapturePolicy.public_history()` preserves public user, assistant, and Tool
-content while removing exact or vendor-prefixed credential fields, Runtime private
-state, and the verified provider-private reasoning path. A same-named business field
-elsewhere remains intact. Run and Runtime task payloads retain public structural
-metadata. `ToolTraceCapture.metadata_only()` preserves Tool lifecycle without content;
-`disabled()` suppresses Tool and result-message facts; `selected_content()` retains only
-the named RFC 6901 paths. Oversized safe values use an explicit omitted disposition, and
-non-finite numbers are rejected before serialization.
-An interaction that cannot fit its required reconstruction payload fails observation
-before the Runtime publishes an unrecoverable pause; ordinary optional payloads retain
-their explicit omission signal.
-
-Provider reasoning has an independent retention gate. Runtime must first receive a
-verified `ReasoningExtractor`; Tracing then defaults to
-`ReasoningCapturePolicy.omitted()`. Use
-`Tracer(reasoning_capture_policy=ReasoningCapturePolicy.content())` only when the host
-explicitly authorizes bounded reasoning retention. Omitted reasoning stores no content
-or digest. A business field named `reasoning_content` outside reserved provider metadata
-is unaffected.
-
-Observer and Store failures terminate the Agent Run fail-closed. Requested business
-Projection failures leave the Ledger unchanged and do not terminate the Agent Run.
+The low-level `TraceWriter` accepts already captured semantic facts and is a trusted
+storage boundary. Applications that need mandatory framework and business redaction use
+`Tracer`; direct Fact construction does not provide enough source context for the Store
+to infer business rules safely.
 
 ## Documentation
 

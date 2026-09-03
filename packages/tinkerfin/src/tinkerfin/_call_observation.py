@@ -33,6 +33,7 @@ from ._observation import (
     _source_value,
     _stamp,
 )
+from .errors import TinkerFinStreamProtocolError
 
 if TYPE_CHECKING:
     from ._observation import RuntimeObservationHub
@@ -228,6 +229,31 @@ def _response_tool_call_ids(response: LLMResult) -> tuple[str, ...]:
     return tuple(values)
 
 
+def _response_message_ids(response: LLMResult) -> tuple[str, ...]:
+    """Return stable message identities from one completed chat-model response."""
+
+    values: list[str] = []
+    for generations in response.generations:
+        for generation in generations:
+            message = getattr(generation, "message", None)
+            if not isinstance(message, BaseMessage):
+                continue
+            message_id = _optional_text(message.id)
+            if message_id is not None and message_id not in values:
+                values.append(message_id)
+    return tuple(values)
+
+
+def _chunk_message_ids(value: object) -> tuple[str, ...]:
+    """Return the message identity carried by a locked callback chunk, if present."""
+
+    message = getattr(value, "message", None)
+    if not isinstance(message, BaseMessage):
+        return ()
+    message_id = _optional_text(message.id)
+    return () if message_id is None else (message_id,)
+
+
 @dataclass(frozen=True, slots=True)
 class _ModelCallState:
     parent_call_id: str | None
@@ -365,6 +391,11 @@ class RuntimeCallHandler(AsyncCallbackHandler):
         segments = _checkpoint_segments(metadata)
         namespace = segments[:-1]
         task_id = _callback_task_id(metadata)
+        # LangGraph repeats the current task ID on nested chain callbacks. Only the
+        # first chain in that task represents the Native task itself; retaining the ID
+        # on descendants would collapse distinct callback nodes into one Graph node.
+        if task_id is not None and (namespace, task_id) in self._graph_tasks:
+            task_id = None
         raw_parent = _parent_id(parent_run_id)
         middleware_name, separator, hook = name.rpartition(".")
         is_middleware = separator and hook in _MIDDLEWARE_NODE_HOOKS
@@ -376,7 +407,7 @@ class RuntimeCallHandler(AsyncCallbackHandler):
             and parent_tool is not None
             and parent_tool.tool_name == "task"
         )
-        if not segments and name == "LangGraph":
+        if not segments and raw_parent is None:
             step_kind: Literal[
                 "agent", "middleware", "model", "tools", "subagent", "task"
             ] = "agent"
@@ -546,6 +577,7 @@ class RuntimeCallHandler(AsyncCallbackHandler):
             messages=tuple(_message_record(message) for message in messages[0]),
             invocation=_source_value(cast(object, raw_invocation)),
             options=_source_value(raw_options),
+            output_message_ids=(),
         )
         if call_id in self._models:
             raise ValueError("model callback run ID started more than once")
@@ -565,8 +597,43 @@ class RuntimeCallHandler(AsyncCallbackHandler):
     ) -> None:
         """Record only the first provider output timestamp, never token content."""
 
-        del token, parent_run_id, kwargs
-        call_id = str(run_id)
+        del token, parent_run_id
+        await self._observe_first_model_output(
+            str(run_id),
+            output_message_ids=_chunk_message_ids(kwargs.get("chunk")),
+        )
+
+    async def on_stream_event(
+        self,
+        event: Mapping[str, object],
+        *,
+        run_id: UUID,
+        parent_run_id: UUID | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Record the first v3 message boundary without retaining event content."""
+
+        del parent_run_id, kwargs
+        if event.get("event") != "message-start":
+            return
+        message_id = _optional_text(event.get("id"))
+        if message_id is None:
+            raise TinkerFinStreamProtocolError(
+                "v3 message start requires a stable message ID"
+            )
+        await self._observe_first_model_output(
+            str(run_id),
+            output_message_ids=(message_id,),
+        )
+
+    async def _observe_first_model_output(
+        self,
+        call_id: str,
+        *,
+        output_message_ids: tuple[str, ...],
+    ) -> None:
+        """Emit one provider first-output fact across supported callback surfaces."""
+
         state = self._models.get(call_id)
         if state is None or call_id in self._first_outputs:
             return
@@ -582,6 +649,7 @@ class RuntimeCallHandler(AsyncCallbackHandler):
                 parent_call_id=state.parent_call_id,
                 namespace=state.namespace,
                 agent_name=state.agent_name,
+                output_message_ids=output_message_ids,
             )
         )
 
@@ -602,6 +670,7 @@ class RuntimeCallHandler(AsyncCallbackHandler):
             phase="completed",
             usage=usage,
             response_metadata=response_metadata,
+            output_message_ids=_response_message_ids(response),
             tool_call_ids=_response_tool_call_ids(response),
         )
 
@@ -638,6 +707,7 @@ class RuntimeCallHandler(AsyncCallbackHandler):
         phase: _ModelTerminalPhase,
         usage: dict[str, JsonValue] | None = None,
         response_metadata: dict[str, JsonValue] | None = None,
+        output_message_ids: tuple[str, ...] = (),
         tool_call_ids: tuple[str, ...] = (),
         error_type: str | None = None,
         error_message: str | None = None,
@@ -659,6 +729,7 @@ class RuntimeCallHandler(AsyncCallbackHandler):
                 agent_name=state.agent_name,
                 usage=usage,
                 response_metadata=response_metadata,
+                output_message_ids=output_message_ids,
                 tool_call_ids=tool_call_ids,
                 error_type=error_type,
                 error_message=error_message,
@@ -836,6 +907,7 @@ class RuntimeCallHandler(AsyncCallbackHandler):
                     parent_call_id=state.parent_call_id,
                     namespace=state.namespace,
                     agent_name=state.agent_name,
+                    output_message_ids=(),
                 )
             )
         for execution_id, state in tools:

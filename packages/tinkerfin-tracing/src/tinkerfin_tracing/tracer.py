@@ -38,18 +38,15 @@ from tinkerfin_contracts import (
     ToolExecutionObservation,
 )
 
-from ._entry_projection import project_trace_entry
+from ._graph_projection import project_trace_graph_records
 from ._ids import scope_id as _scope_id
-from .capture import CapturedValue, CapturePolicy, ReasoningCapturePolicy
-from .durable_store import InMemoryTraceStore
-from .entries import (
-    TraceEntry,
-    TraceEntryCompleteness,
-    TraceEntryPage,
-    TraceFilter,
-    TraceTurn,
+from .capture import (
+    CapturedValue,
+    CapturePolicy,
+    ReasoningCapturePolicy,
+    TraceCapturePipeline,
 )
-from .entry_query import TraceQuery, decode_entry_cursor, encode_entry_cursor
+from .durable_store import InMemoryTraceStore
 from .errors import TraceCaptureRejected, TraceCorruption, TraceStoreProtocolError
 from .facts import (
     AgentStepFact,
@@ -57,7 +54,6 @@ from .facts import (
     ContextContributionFact,
     InteractionFact,
     MessageFact,
-    MiddlewareFact,
     ModelCallFact,
     NativeExtraFact,
     PlanRevisionFact,
@@ -74,15 +70,21 @@ from .facts import (
     TraceSemanticFact,
     TurnFact,
 )
+from .graph import (
+    TraceGraphCompleteness,
+    TraceGraphFilter,
+    TraceGraphPage,
+    TraceGraphQueryLimits,
+    bound_graph_page,
+)
+from .graph_query import TraceGraphQuery, decode_graph_cursor, encode_graph_cursor
 from .limits import TraceLimits
 from .projection import (
-    CoreProjectionState,
-    CoreProjectionWindow,
     RegisteredTraceProjection,
     TraceProjection,
-    project_core_checkpoint,
     select_core_projection_window,
     select_prior_run_ids,
+    trace_graph_turns,
 )
 from .query import (
     TraceThread,
@@ -91,15 +93,23 @@ from .query import (
     read_lineage_events,
     resolve_history_request,
 )
+from .redaction import (
+    RedactionContentKind,
+    RedactionContext,
+    TraceRedactor,
+    _validate_redactor,
+)
 from .store import (
     StoreThreadSnapshot,
-    TraceEntryRebuildStore,
-    TraceEntryStore,
+    TraceGraphRebuildStore,
+    TraceGraphStore,
     TraceStore,
     TraceThreadKey,
     TraceWriter,
 )
 from .writing import TraceBatchWriter, TraceWritePolicy
+
+_GRAPH_QUERY_STABILITY_ATTEMPTS = 4
 
 
 def _fingerprint(value: JsonValue) -> str:
@@ -194,6 +204,7 @@ class _TracingSession:
         context: RunSourceContext,
         capture_policy: CapturePolicy,
         reasoning_capture_policy: ReasoningCapturePolicy,
+        redactor: TraceRedactor | None,
         limits: TraceLimits,
         write_policy: TraceWritePolicy,
         on_closed: Callable[[_TracingSession], None],
@@ -207,6 +218,7 @@ class _TracingSession:
             context: Immutable Runtime input and privacy facts for this Run.
             capture_policy: Public semantic payload capture policy.
             reasoning_capture_policy: Independent provider reasoning retention policy.
+            redactor: Optional business value Redactor applied after framework safety.
             limits: Store-aligned event and payload capacity limits.
             write_policy: Batching, pending-byte, backpressure, and delay policy.
             on_closed: Callback that removes this session from its Tracer owner.
@@ -220,11 +232,14 @@ class _TracingSession:
         self._store = store
         self._context = context
         self._policy = capture_policy
-        self._reasoning_policy = reasoning_capture_policy
+        self._capture_pipeline = TraceCapturePipeline(
+            policy=capture_policy,
+            reasoning_policy=reasoning_capture_policy,
+            redactor=redactor,
+        )
         self._middleware_descriptors = {
             descriptor.name: descriptor for descriptor in context.middleware
         }
-        self._configured_middleware: set[str] = set()
         self._limits = limits
         self._on_closed = on_closed
         self._closed = False
@@ -233,11 +248,15 @@ class _TracingSession:
         self._run_scope = hashlib.sha256(writer.run_id.encode("utf-8")).hexdigest()
         self._private_state_keys = frozenset(context.private_state_keys)
         self._message_fingerprints: dict[tuple[tuple[str, ...], str], str] = {}
+        self._delivered_message_fingerprints: dict[
+            tuple[tuple[str, ...], str], str
+        ] = {}
         self._message_seen: set[tuple[tuple[str, ...], str]] = set()
         self._message_contents: dict[tuple[tuple[str, ...], str], JsonValue] = {}
         self._message_completed: set[tuple[tuple[str, ...], str]] = set()
         self._reasoning_contents: dict[tuple[tuple[str, ...], str], JsonValue] = {}
         self._reasoning_extractors: dict[tuple[tuple[str, ...], str], str] = {}
+        self._message_model_names: dict[tuple[tuple[str, ...], str], str] = {}
         self._reasoning_completed: set[tuple[tuple[str, ...], str]] = set()
         self._active_reasoning: dict[tuple[tuple[str, ...], str], None] = {}
         self._tool_slots: dict[tuple[tuple[str, ...], str, int], tuple[str, str]] = {}
@@ -255,6 +274,7 @@ class _TracingSession:
             tuple[tuple[str, ...], str], _PendingRuntimeTask
         ] = {}
         self._callback_entries: dict[str, str] = {}
+        self._model_component_names: dict[str, str] = {}
         self._states: dict[tuple[str, ...], dict[str, JsonValue]] = {}
         self._pending_interactions: dict[
             tuple[tuple[str, ...], str], _PendingInteraction
@@ -280,6 +300,7 @@ class _TracingSession:
                 if fact.phase == "removed":
                     self._message_seen.discard(key)
                     self._message_fingerprints.pop(key, None)
+                    self._delivered_message_fingerprints.pop(key, None)
                     self._message_contents.pop(key, None)
                     self._message_completed.discard(key)
                     continue
@@ -292,7 +313,12 @@ class _TracingSession:
                 if fact.phase in {"completed", "reconciled"}:
                     self._message_completed.add(key)
                 if fact.fingerprint is not None:
-                    self._message_fingerprints[key] = fact.fingerprint
+                    target = (
+                        self._message_fingerprints
+                        if fact.from_state_snapshot
+                        else self._delivered_message_fingerprints
+                    )
+                    target[key] = fact.fingerprint
             elif isinstance(fact, ReasoningFact):
                 key = (fact.namespace, fact.source_message_id)
                 previous_extractor = self._reasoning_extractors.get(key)
@@ -323,11 +349,17 @@ class _TracingSession:
                     self._tool_completed.add(key)
                 if fact.phase in {"result", "cancelled", "abandoned"}:
                     self._tool_results.add(key)
-            elif isinstance(fact, ModelCallFact) and fact.phase == "completed":
-                for tool_call_id in fact.tool_call_ids:
-                    self._tool_call_models[(fact.namespace, tool_call_id)] = (
-                        fact.call_id
-                    )
+            elif isinstance(fact, ModelCallFact):
+                if fact.model is not None:
+                    for message_id in fact.output_message_ids:
+                        self._message_model_names[(fact.namespace, message_id)] = (
+                            fact.model
+                        )
+                if fact.phase == "completed":
+                    for tool_call_id in fact.tool_call_ids:
+                        self._tool_call_models[(fact.namespace, tool_call_id)] = (
+                            fact.call_id
+                        )
             elif (
                 isinstance(fact, ToolExecutionFact)
                 and fact.phase == "started"
@@ -379,8 +411,6 @@ class _TracingSession:
                     )
                 else:
                     self._active_subagents.pop(fact.namespace, None)
-            elif isinstance(fact, MiddlewareFact):
-                self._configured_middleware.add(fact.name)
 
     async def observe(self, observation: RuntimeObservation) -> None:
         """Map and enqueue one already ordered Runtime observation.
@@ -567,17 +597,29 @@ class _TracingSession:
                     input_kind=source.input_kind,
                     parent_run_id=source.parent_run_id,
                     input=(
-                        self._capture_structure(public_input, divisor=2)
+                        self._capture_structure(
+                            public_input,
+                            content_kind="custom",
+                            component_name=source.runtime_profile,
+                            divisor=2,
+                        )
                         if source.input_kind in {"ordinary", "branch"}
                         else self._capture(
                             [
                                 item.model_dump(mode="json", by_alias=True)
                                 for item in source.resume
                             ],
+                            content_kind="interaction",
+                            component_name="resume",
                             divisor=2,
                         )
                     ),
-                    config=self._capture_structure(public_config, divisor=2),
+                    config=self._capture_structure(
+                        public_config,
+                        content_kind="custom",
+                        component_name=source.runtime_profile,
+                        divisor=2,
+                    ),
                     interrupt_ids=resume_ids,
                 )
             )
@@ -588,7 +630,10 @@ class _TracingSession:
                 scoped_message_id = _scope_id("message", (), user_message_id)
                 user_key = ((), user_message_id)
                 self._message_seen.add(user_key)
-                captured_user_content = self._capture(user_content)
+                captured_user_content = self._capture(
+                    user_content,
+                    content_kind="message",
+                )
                 self._track_message_content(
                     user_key,
                     captured_user_content,
@@ -633,7 +678,11 @@ class _TracingSession:
                         payload=(
                             None
                             if summary.decision is None
-                            else self._capture({"decision": summary.decision})
+                            else self._capture(
+                                {"decision": summary.decision},
+                                content_kind="interaction",
+                                component_name=pending_interaction.kind,
+                            )
                         ),
                     )
                 )
@@ -659,31 +708,8 @@ class _TracingSession:
                         status="resolved",
                     )
                 )
-            for descriptor in source.middleware:
-                middleware_capture = self._policy.middleware_capture(
-                    name=descriptor.name,
-                    class_name=descriptor.class_name,
-                )
-                if middleware_capture.mode == "disabled":
-                    continue
-                self._configured_middleware.add(descriptor.name)
-                facts.append(
-                    _make_fact(
-                        MiddlewareFact,
-                        common,
-                        middleware_id=_scope_id(
-                            "middleware",
-                            (),
-                            f"{observation.identity.run_id}:{descriptor.name}",
-                        ),
-                        name=descriptor.name,
-                        class_name=descriptor.class_name,
-                        hooks=descriptor.hooks,
-                    )
-                )
             return facts
         if isinstance(observation, AgentStepObservation):
-            middleware_configuration: TraceSemanticFact | None = None
             if observation.step_kind == "middleware":
                 middleware_name = observation.middleware_name
                 if middleware_name is None:  # pragma: no cover - contract validation
@@ -698,35 +724,8 @@ class _TracingSession:
                     name=middleware_name,
                     class_name=class_name,
                 )
-                if (
-                    middleware_capture.mode != "disabled"
-                    and middleware_name not in self._configured_middleware
-                ):
-                    self._configured_middleware.add(middleware_name)
-                    middleware_configuration = _make_fact(
-                        MiddlewareFact,
-                        common,
-                        middleware_id=_scope_id(
-                            "middleware",
-                            (),
-                            f"{observation.identity.run_id}:{middleware_name}",
-                        ),
-                        name=middleware_name,
-                        class_name=class_name,
-                        hooks=(
-                            descriptor.hooks
-                            if descriptor is not None
-                            else (
-                                () if observation.hook is None else (observation.hook,)
-                            )
-                        ),
-                    )
-                if middleware_capture.mode != "visible":
-                    return (
-                        []
-                        if middleware_configuration is None
-                        else [middleware_configuration]
-                    )
+                if middleware_capture.mode == "disabled":
+                    return []
             if observation.step_kind == "agent":
                 call_id = _scope_id(
                     "agent",
@@ -738,6 +737,18 @@ class _TracingSession:
                     "subagent",
                     observation.namespace,
                     observation.namespace[-1],
+                )
+            elif observation.task_id is not None:
+                call_id = _scope_id(
+                    "runtime-task",
+                    observation.namespace,
+                    f"{observation.identity.run_id}:{observation.task_id}",
+                )
+            elif observation.step_kind == "middleware":
+                call_id = _scope_id(
+                    "middleware-call",
+                    observation.namespace,
+                    observation.call_id,
                 )
             else:
                 call_id = _scope_id(
@@ -760,9 +771,7 @@ class _TracingSession:
                 "abandoned",
             }:
                 self._callback_entries.pop(observation.call_id, None)
-            facts = (
-                [] if middleware_configuration is None else [middleware_configuration]
-            )
+            facts: list[TraceSemanticFact] = []
             if observation.failure_origin:
                 self._failure_origin_seen = True
             facts.append(
@@ -781,7 +790,11 @@ class _TracingSession:
                     hook=observation.hook,
                     error_type=observation.error_type,
                     error_message=(
-                        self._capture(observation.error_message)
+                        self._capture(
+                            observation.error_message,
+                            content_kind="custom",
+                            component_name=observation.name,
+                        )
                         if self._policy.include_error_messages
                         and observation.error_message is not None
                         else None
@@ -798,8 +811,13 @@ class _TracingSession:
                 observation.namespace,
                 observation.call_id,
             )
+            component_name = observation.model or self._model_component_names.get(
+                observation.call_id
+            )
             if observation.phase == "started":
                 self._callback_entries[observation.call_id] = call_id
+                if observation.model is not None:
+                    self._model_component_names[observation.call_id] = observation.model
             elif observation.phase in {
                 "completed",
                 "failed",
@@ -808,6 +826,7 @@ class _TracingSession:
                 "abandoned",
             }:
                 self._callback_entries.pop(observation.call_id, None)
+                self._model_component_names.pop(observation.call_id, None)
             if observation.phase == "completed":
                 for tool_call_id in observation.tool_call_ids:
                     self._tool_call_models[(observation.namespace, tool_call_id)] = (
@@ -824,9 +843,16 @@ class _TracingSession:
                         ],
                         "invocation": observation.invocation,
                         "options": observation.options,
-                    }
+                    },
+                    content_kind="model_request",
+                    component_name=component_name,
                 )
             )
+            if component_name is not None:
+                for message_id in observation.output_message_ids:
+                    self._message_model_names[(observation.namespace, message_id)] = (
+                        component_name
+                    )
             return [
                 _make_fact(
                     ModelCallFact,
@@ -843,20 +869,42 @@ class _TracingSession:
                     provider=observation.provider,
                     model=observation.model,
                     request=request,
+                    system_message_positions=(
+                        tuple(
+                            index
+                            for index, message in enumerate(observation.messages)
+                            if message.message_type == "system"
+                        )
+                        if observation.phase == "started"
+                        else ()
+                    ),
+                    output_message_ids=observation.output_message_ids,
                     usage=(
                         None
                         if observation.usage is None
-                        else self._capture(observation.usage)
+                        else self._capture(
+                            observation.usage,
+                            content_kind="model_response",
+                            component_name=component_name,
+                        )
                     ),
                     response_metadata=(
                         None
                         if observation.response_metadata is None
-                        else self._capture(observation.response_metadata)
+                        else self._capture(
+                            observation.response_metadata,
+                            content_kind="model_response",
+                            component_name=component_name,
+                        )
                     ),
                     tool_call_ids=observation.tool_call_ids,
                     error_type=observation.error_type,
                     error_message=(
-                        self._capture(observation.error_message)
+                        self._capture(
+                            observation.error_message,
+                            content_kind="model_response",
+                            component_name=component_name,
+                        )
                         if self._policy.include_error_messages
                         and observation.error_message is not None
                         else None
@@ -911,11 +959,10 @@ class _TracingSession:
                         agent_name=observation.agent_name,
                         source_tool_call_id=observation.tool_call_id,
                         tool_name=observation.tool_name,
-                        input=self._policy.capture_tool(
+                        input=self._capture_tool(
                             tool_name=observation.tool_name,
                             value=observation.input,
                             target="arguments",
-                            max_bytes=self._payload_budget,
                         ),
                     )
                 ]
@@ -936,11 +983,10 @@ class _TracingSession:
             output = (
                 None
                 if observation.output is None
-                else self._policy.capture_tool(
+                else self._capture_tool(
                     tool_name=observation.tool_name,
                     value=observation.output,
                     target="result",
-                    max_bytes=self._payload_budget,
                 )
             )
             facts = [
@@ -957,7 +1003,11 @@ class _TracingSession:
                     output=output,
                     error_type=observation.error_type,
                     error_message=(
-                        self._capture(observation.error_message)
+                        self._capture(
+                            observation.error_message,
+                            content_kind="tool_result",
+                            component_name=observation.tool_name,
+                        )
                         if self._policy.include_error_messages
                         and observation.error_message is not None
                         else None
@@ -966,7 +1016,7 @@ class _TracingSession:
                 )
             ]
             skill = self._successful_skill(pending, observation)
-            if skill is not None:
+            if skill is not None and observation.tool_call_id is not None:
                 skill_name, source_path = skill
                 facts.append(
                     _make_fact(
@@ -979,6 +1029,7 @@ class _TracingSession:
                             observation.execution_id,
                         ),
                         execution_id=execution_id,
+                        source_tool_call_id=observation.tool_call_id,
                         name=skill_name,
                         source_path=source_path,
                         agent_name=observation.agent_name,
@@ -1010,12 +1061,20 @@ class _TracingSession:
                     input=(
                         None
                         if observation.input is None
-                        else self._capture(observation.input)
+                        else self._capture(
+                            observation.input,
+                            content_kind="custom",
+                            component_name=observation.name,
+                        )
                     ),
                     output=(
                         None
                         if observation.output is None
-                        else self._capture(observation.output)
+                        else self._capture(
+                            observation.output,
+                            content_kind="custom",
+                            component_name=observation.name,
+                        )
                     ),
                     error_type=observation.error_type,
                     failure_origin=observation.failure_origin,
@@ -1049,6 +1108,7 @@ class _TracingSession:
             self._active_subagents.clear()
             self._active_runtime_tasks.clear()
             self._callback_entries.clear()
+            self._model_component_names.clear()
             self._tool_executions.clear()
             facts.append(
                 _make_fact(
@@ -1133,6 +1193,8 @@ class _TracingSession:
                                 observation.input,
                                 self._private_state_keys,
                             ),
+                            content_kind="custom",
+                            component_name=observation.name,
                             divisor=2,
                         )
                     ),
@@ -1144,6 +1206,8 @@ class _TracingSession:
                                 observation.result,
                                 self._private_state_keys,
                             ),
+                            content_kind="custom",
+                            component_name=observation.name,
                             divisor=2,
                         )
                     ),
@@ -1314,8 +1378,9 @@ class _TracingSession:
                             common=common,
                         )
                     )
-            captured = self._reasoning_policy.capture(
+            captured = self._capture_pipeline.capture_reasoning(
                 observation.content,
+                component_name=self._message_model_names.get(key),
                 max_bytes=self._payload_budget,
             )
             if captured.disposition == "omitted" and key in self._active_reasoning:
@@ -1335,8 +1400,9 @@ class _TracingSession:
             )
             return facts
 
-        captured = self._reasoning_policy.capture(
+        captured = self._capture_pipeline.capture_reasoning(
             observation.content,
+            component_name=self._message_model_names.get(key),
             max_bytes=self._payload_budget,
         )
         content_matches = (
@@ -1466,6 +1532,7 @@ class _TracingSession:
                 raise TraceCorruption("RemoveMessage requires a stable target ID")
             self._message_seen.discard(key)
             self._message_fingerprints.pop(key, None)
+            self._delivered_message_fingerprints.pop(key, None)
             self._message_contents.pop(key, None)
             self._message_completed.discard(key)
             return [
@@ -1493,26 +1560,28 @@ class _TracingSession:
                     tool_call_id=message.tool_call_id,
                 )
             )
-        if (
-            message.message_type != "tool"
-            and message.content != ""
-            and message.content != []
-        ):
+        if role == "assistant" and message.content not in ("", []):
             captured_content = self._message_content(message)
             self._track_message_content(
                 key,
                 captured_content,
                 append=message.message_type == "assistant_chunk",
             )
+        if role == "assistant" and message.message_type != "assistant_chunk":
+            captured_content = self._message_content(message)
+            fingerprint = self._message_fingerprint(message, observation.namespace)
+            self._delivered_message_fingerprints[key] = fingerprint
+            self._message_completed.add(key)
             facts.append(
                 _make_fact(
                     MessageFact,
                     common,
-                    phase="content",
+                    phase="reconciled",
                     message_id=message_id,
                     source_message_id=message.id,
                     role=role,
                     content=captured_content,
+                    fingerprint=fingerprint,
                     name=message.name,
                     tool_call_id=message.tool_call_id,
                 )
@@ -1533,7 +1602,7 @@ class _TracingSession:
                     common=common,
                 )
             )
-        if message.message_type != "assistant_chunk":
+        if message.message_type != "assistant_chunk" and role != "assistant":
             self._message_completed.add(key)
             facts.append(
                 _make_fact(
@@ -1590,11 +1659,10 @@ class _TracingSession:
                 content = (
                     None
                     if parsed_arguments is None
-                    else self._policy.capture_tool(
+                    else self._capture_tool(
                         tool_name=tool_name,
                         value=parsed_arguments,
                         target="arguments",
-                        max_bytes=self._payload_budget,
                     )
                 )
                 if content is not None:
@@ -1651,11 +1719,10 @@ class _TracingSession:
                             source_tool_call_id=call.id,
                             parent_call_id=self._tool_call_models.get(key),
                             tool_name=call.name,
-                            content=self._policy.capture_tool(
+                            content=self._capture_tool(
                                 tool_name=call.name,
                                 value=call.arguments,
                                 target="arguments",
-                                max_bytes=self._payload_budget,
                             ),
                         )
                     )
@@ -1721,11 +1788,10 @@ class _TracingSession:
                 source_tool_call_id=message.tool_call_id,
                 parent_call_id=self._tool_call_models.get(key),
                 tool_name=tool_name,
-                content=self._policy.capture_tool(
+                content=self._capture_tool(
                     tool_name=tool_name,
                     value=message.content,
                     target="result",
-                    max_bytes=self._payload_budget,
                 ),
                 result_status=result_status,
                 failure_origin=failure_origin,
@@ -1748,15 +1814,34 @@ class _TracingSession:
             "monotonic_ns": observation.monotonic_ns,
         }
         facts: list[TraceSemanticFact] = []
-        public_state = cast(
+        source_state = cast(
             dict[str, JsonValue],
-            self._policy.sanitize(
-                _discard_private_state(
-                    observation.state,
-                    self._private_state_keys,
-                )
+            _discard_private_state(
+                observation.state,
+                self._private_state_keys,
             ),
         )
+        source_plan = source_state.get("tinkerfin_plan")
+        public_state = cast(
+            dict[str, JsonValue],
+            self._capture_pipeline.redact(
+                {
+                    key: item
+                    for key, item in source_state.items()
+                    if key != "tinkerfin_plan"
+                },
+                context=RedactionContext(content_kind="state"),
+            ),
+        )
+        if "tinkerfin_plan" in public_state:
+            raise TraceCaptureRejected(
+                "State redaction introduced the reserved Plan field"
+            )
+        if "tinkerfin_plan" in source_state:
+            public_state["tinkerfin_plan"] = self._capture_pipeline.redact(
+                source_plan,
+                context=RedactionContext(content_kind="plan"),
+            )
         previous = self._states.get(namespace, {})
         changes = {
             key: value
@@ -1778,7 +1863,10 @@ class _TracingSession:
                         namespace,
                         f"{self._observation_index}",
                     ),
-                    changes=self._capture(state_changes),
+                    changes=self._capture_pipeline.bound(
+                        state_changes,
+                        max_bytes=self._payload_budget,
+                    ),
                     removed_keys=removed,
                 )
             )
@@ -1796,7 +1884,10 @@ class _TracingSession:
                     ),
                     revision=plan_revision,
                     status=plan_status,
-                    plan=self._capture(plan_value),
+                    plan=self._capture_pipeline.bound(
+                        plan_value,
+                        max_bytes=self._payload_budget,
+                    ),
                 )
             )
         self._states[namespace] = dict(public_state)
@@ -1810,6 +1901,9 @@ class _TracingSession:
             fingerprint = self._message_fingerprint(message, namespace)
             if self._message_fingerprints.get(key) == fingerprint:
                 continue
+            delivered_matches = (
+                self._delivered_message_fingerprints.get(key) == fingerprint
+            )
             if (
                 key in self._message_seen
                 and key not in self._message_fingerprints
@@ -1831,7 +1925,12 @@ class _TracingSession:
                 and key in self._message_contents
                 and self._message_contents[key] == captured_content.value
             )
-            phase = "completed" if content_matches else "reconciled"
+            role = _message_role(message)
+            phase = (
+                "reconciled"
+                if role == "assistant" and not delivered_matches
+                else ("completed" if content_matches else "reconciled")
+            )
             if captured_content is not None and not content_matches:
                 self._track_message_content(
                     key,
@@ -1846,9 +1945,14 @@ class _TracingSession:
                     phase=phase,
                     message_id=message_id,
                     source_message_id=message.id,
-                    role=_message_role(message),
-                    content=(None if content_matches else captured_content),
+                    role=role,
+                    content=(
+                        captured_content
+                        if role == "assistant" and not delivered_matches
+                        else (None if content_matches else captured_content)
+                    ),
                     fingerprint=fingerprint,
+                    from_state_snapshot=True,
                     name=message.name,
                     tool_call_id=message.tool_call_id,
                 )
@@ -1870,6 +1974,7 @@ class _TracingSession:
         }
         for key in previous_message_keys - current_message_keys:
             self._message_fingerprints.pop(key, None)
+            self._delivered_message_fingerprints.pop(key, None)
             self._message_seen.discard(key)
             self._message_contents.pop(key, None)
             self._message_completed.discard(key)
@@ -1918,7 +2023,10 @@ class _TracingSession:
                     interaction_kind=interaction_kind,
                     tool_call_ids=tool_call_ids,
                     status="pending",
-                    payload=self._capture_interaction(interrupt.value),
+                    payload=self._capture_interaction(
+                        interrupt.value,
+                        interaction_kind=interaction_kind,
+                    ),
                 )
             )
         for key in tuple(self._pending_interactions):
@@ -1996,14 +2104,13 @@ class _TracingSession:
                 input=(
                     None
                     if descriptor is None
-                    else self._policy.capture_tool(
+                    else self._capture_tool(
                         tool_name="task",
                         value={
                             "description": descriptor.description,
                             "subagent_type": descriptor.agent_name,
                         },
                         target="arguments",
-                        max_bytes=self._payload_budget,
                     )
                 ),
                 status="running",
@@ -2159,9 +2266,20 @@ class _TracingSession:
     def _payload_budget(self) -> int:
         return max(1024, self._limits.max_event_bytes // 2)
 
-    def _capture(self, value: JsonValue, *, divisor: int = 1) -> CapturedValue:
-        return self._policy.capture(
+    def _capture(
+        self,
+        value: JsonValue,
+        *,
+        content_kind: RedactionContentKind,
+        component_name: str | None = None,
+        divisor: int = 1,
+    ) -> CapturedValue:
+        return self._capture_pipeline.capture(
             value,
+            context=RedactionContext(
+                content_kind=content_kind,
+                component_name=component_name,
+            ),
             max_bytes=max(1024, self._payload_budget // divisor),
         )
 
@@ -2169,11 +2287,31 @@ class _TracingSession:
         self,
         value: JsonValue,
         *,
+        content_kind: RedactionContentKind,
+        component_name: str | None = None,
         divisor: int = 1,
     ) -> CapturedValue:
-        return self._policy.capture_structure(
+        return self._capture_pipeline.capture_structure(
             value,
+            context=RedactionContext(
+                content_kind=content_kind,
+                component_name=component_name,
+            ),
             max_bytes=max(1024, self._payload_budget // divisor),
+        )
+
+    def _capture_tool(
+        self,
+        *,
+        tool_name: str,
+        value: JsonValue,
+        target: Literal["arguments", "result"],
+    ) -> CapturedValue:
+        return self._capture_pipeline.capture_tool(
+            tool_name=tool_name,
+            value=value,
+            target=target,
+            max_bytes=self._payload_budget,
         )
 
     def _track_message_content(
@@ -2190,7 +2328,10 @@ class _TracingSession:
             self._message_contents[key] = content.value
             return
         combined = _append_json_content(self._message_contents[key], content.value)
-        bounded = self._policy.capture(combined, max_bytes=self._payload_budget)
+        bounded = self._capture_pipeline.bound(
+            combined,
+            max_bytes=self._payload_budget,
+        )
         if bounded.disposition == "inline":
             self._message_contents[key] = bounded.value
         else:
@@ -2210,7 +2351,7 @@ class _TracingSession:
             self._reasoning_contents[key] = content.value
             return
         combined = _append_json_content(self._reasoning_contents[key], content.value)
-        bounded = self._reasoning_policy.capture(
+        bounded = self._capture_pipeline.bound(
             combined,
             max_bytes=self._payload_budget,
         )
@@ -2219,17 +2360,47 @@ class _TracingSession:
         else:
             self._reasoning_contents.pop(key, None)
 
-    def _capture_interaction(self, value: JsonValue) -> CapturedValue:
+    def _capture_interaction(
+        self,
+        value: JsonValue,
+        *,
+        interaction_kind: str,
+    ) -> CapturedValue:
         if not isinstance(value, dict):
-            return self._capture_required_interaction(value)
+            return self._capture_required_interaction(
+                self._capture(
+                    value,
+                    content_kind="interaction",
+                    component_name=interaction_kind,
+                )
+            )
         raw_actions = value.get("action_requests")
         if not isinstance(raw_actions, list):
-            return self._capture_required_interaction(value)
+            return self._capture_required_interaction(
+                self._capture(
+                    value,
+                    content_kind="interaction",
+                    component_name=interaction_kind,
+                )
+            )
+        redacted_base = self._capture_pipeline.redact(
+            {key: item for key, item in value.items() if key != "action_requests"},
+            context=RedactionContext(
+                content_kind="interaction",
+                component_name=interaction_kind,
+            ),
+        )
+        if not isinstance(redacted_base, dict):  # pragma: no cover - shape validation
+            raise TraceCaptureRejected("Interaction redaction must return an object")
         actions: list[JsonValue] = []
         for raw_action in raw_actions:
             if not isinstance(raw_action, dict):
                 actions.append(
-                    self._capture_structure(raw_action).model_dump(
+                    self._capture_structure(
+                        raw_action,
+                        content_kind="interaction",
+                        component_name=interaction_kind,
+                    ).model_dump(
                         mode="json",
                         by_alias=True,
                     )
@@ -2242,11 +2413,10 @@ class _TracingSession:
             raw_arguments = raw_action.get("args")
             arguments: JsonValue = raw_arguments if raw_arguments is not None else {}
             action: dict[str, JsonValue] = {"name": tool_name}
-            captured_arguments = self._policy.capture_tool(
+            captured_arguments = self._capture_tool(
                 tool_name=tool_name,
                 value=arguments,
                 target="arguments",
-                max_bytes=self._payload_budget,
             )
             action["arguments"] = captured_arguments.model_dump(
                 mode="json",
@@ -2259,18 +2429,26 @@ class _TracingSession:
                 and captured_arguments.disposition == "inline"
                 and self._policy.captures_review_description(tool_name)
             ):
-                action["description"] = description
+                captured_description = self._capture(
+                    description,
+                    content_kind="interaction",
+                    component_name=tool_name,
+                )
+                if captured_description.disposition == "inline":
+                    action["description"] = captured_description.value
             actions.append(action)
-        safe_value = {
-            key: item for key, item in value.items() if key != "action_requests"
-        }
-        safe_value["action_requests"] = actions
-        return self._capture_required_interaction(safe_value)
+        redacted_base["action_requests"] = actions
+        return self._capture_required_interaction(
+            self._capture_pipeline.bound(
+                redacted_base,
+                max_bytes=self._payload_budget,
+            )
+        )
 
-    def _capture_required_interaction(self, value: JsonValue) -> CapturedValue:
+    @staticmethod
+    def _capture_required_interaction(captured: CapturedValue) -> CapturedValue:
         """Reject a pause that cannot be reconstructed from its durable Trace."""
 
-        captured = self._capture(value)
         if captured.disposition == "omitted":
             raise TraceCaptureRejected(
                 "Pending interaction payload exceeds the safe Trace boundary"
@@ -2288,11 +2466,10 @@ class _TracingSession:
                 or message.name
                 or "unknown"
             )
-            content = self._policy.capture_tool(
+            content = self._capture_tool(
                 tool_name=tool_name,
                 value=message.content,
                 target="result",
-                max_bytes=self._payload_budget,
             )
         else:
             content = self._message_content(message)
@@ -2300,11 +2477,10 @@ class _TracingSession:
             {
                 "id": call.id,
                 "name": call.name,
-                "arguments": self._policy.capture_tool(
+                "arguments": self._capture_tool(
                     tool_name=call.name,
                     value=call.arguments,
                     target="arguments",
-                    max_bytes=self._payload_budget,
                 ).model_dump(mode="json", by_alias=True),
             }
             for call in message.tool_calls
@@ -2332,7 +2508,11 @@ class _TracingSession:
         )
 
     def _message_content(self, message: NativeMessageRecord) -> CapturedValue:
-        return self._capture(message.content)
+        return self._capture(
+            message.content,
+            content_kind="message",
+            component_name=message.name,
+        )
 
 
 class Tracer:
@@ -2349,6 +2529,8 @@ class Tracer:
         store: TraceStore | None = None,
         capture_policy: CapturePolicy | None = None,
         reasoning_capture_policy: ReasoningCapturePolicy | None = None,
+        redactor: TraceRedactor | None = None,
+        graph_query_limits: TraceGraphQueryLimits | None = None,
         limits: TraceLimits | None = None,
         write_policy: TraceWritePolicy | None = None,
         projections: tuple[TraceProjection[Any, Any], ...] = (),
@@ -2358,10 +2540,14 @@ class Tracer:
         Args:
             store: Borrowed Store. Omitting it creates a bounded in-process Store owned
                 only by this Tracer value.
-            capture_policy: Public semantic capture and redaction policy. Omitting it
-                retains complete sanitized Tool content through ``public_history``.
+            capture_policy: Public semantic retention policy. Omitting it retains
+                complete sanitized Tool content through ``public_history``.
             reasoning_capture_policy: Independent authorization for extracted provider
                 reasoning content.
+            redactor: Optional synchronous business-value Redactor. Framework credential
+                and private-reasoning safety always runs before and after this extension.
+            graph_query_limits: Independent bounds for direct nodes, expanded ancestors,
+                and serialized Graph pages and updates.
             limits: Capacity contract; when supplied it must equal ``store.limits``.
             write_policy: Bounded asynchronous batching and backpressure policy.
             projections: Pure business Projections evaluated and cached only on query.
@@ -2387,6 +2573,15 @@ class Tracer:
             raise TypeError(
                 "reasoning_capture_policy must be a ReasoningCapturePolicy or None"
             )
+        if redactor is not None:
+            _validate_redactor(redactor)
+        if graph_query_limits is not None and not isinstance(
+            graph_query_limits,
+            TraceGraphQueryLimits,
+        ):
+            raise TypeError(
+                "graph_query_limits must be a TraceGraphQueryLimits or None"
+            )
         if write_policy is not None and not isinstance(write_policy, TraceWritePolicy):
             raise TypeError("write_policy must be a TraceWritePolicy or None")
         resolved_limits = (
@@ -2408,6 +2603,8 @@ class Tracer:
             if reasoning_capture_policy is None
             else reasoning_capture_policy
         )
+        self._redactor = redactor
+        self._graph_query_limits = graph_query_limits or TraceGraphQueryLimits()
         self._limits = resolved_limits
         self._write_policy = write_policy or TraceWritePolicy()
         self._projections = _projection_registry(projections)
@@ -2471,6 +2668,7 @@ class Tracer:
                 context=context,
                 capture_policy=self._capture_policy,
                 reasoning_capture_policy=self._reasoning_capture_policy,
+                redactor=self._redactor,
                 limits=self._limits,
                 write_policy=self._write_policy,
                 on_closed=self._session_closed,
@@ -2564,6 +2762,7 @@ class Tracer:
             snapshot=snapshot,
             head_run_id=resolved_head,
             limit=resolved_limit,
+            graph_query_limits=self._graph_query_limits,
             projections=self._projections,
             projection_names=projections,
         )
@@ -2572,29 +2771,12 @@ class Tracer:
         self,
         thread_id: str,
         *,
-        where: TraceFilter | None = None,
+        where: TraceGraphFilter | None = None,
         head_run_id: str | None = None,
         cursor: str | None = None,
         limit: int = 100,
-    ) -> TraceQuery:
-        """Return one directly filtered current entry page with live following.
-
-        Args:
-            thread_id: Canonical Trace thread identity.
-            where: Functional indexed filters. Omitting it selects every entry kind.
-            head_run_id: Optional explicit branch head.
-            cursor: Optional opaque cursor from the same generation and filter.
-            limit: Positive maximum matching entries before requested ancestors.
-
-        Returns:
-            Current page values and a closeable filtered follow iterator.
-
-        Raises:
-            ValueError: An identity, filter, or limit is invalid.
-            InvalidTraceCursor: The cursor belongs to another query.
-            TraceThreadNotFound: The current generation is unavailable.
-            TraceStoreProtocolError: The Store does not support direct entry queries.
-        """
+    ) -> TraceGraphQuery:
+        """Return one directly filtered canonical Graph page."""
 
         if (
             not isinstance(thread_id, str)
@@ -2611,13 +2793,16 @@ class Tracer:
         if (
             isinstance(limit, bool)
             or not isinstance(limit, int)
-            or not 1 <= limit <= 1000
+            or not 1 <= limit <= self._graph_query_limits.max_direct_nodes
         ):
-            raise ValueError("limit must be an integer between 1 and 1000")
-        if where is not None and not isinstance(where, TraceFilter):
-            raise TypeError("where must be a TraceFilter or None")
-        resolved_filter = where or TraceFilter()
-        page, key = await self._query_entry_page(
+            raise ValueError(
+                "limit must be an integer between 1 and "
+                f"{self._graph_query_limits.max_direct_nodes}"
+            )
+        if where is not None and not isinstance(where, TraceGraphFilter):
+            raise TypeError("where must be a TraceGraphFilter or None")
+        resolved_filter = where or TraceGraphFilter()
+        page, key = await self._query_graph_page(
             thread_id,
             where=resolved_filter,
             head_run_id=head_run_id,
@@ -2626,37 +2811,28 @@ class Tracer:
             expected_key=None,
         )
 
-        async def refresh() -> TraceEntryPage:
-            refreshed, _key = await self._query_entry_page(
+        async def refresh() -> TraceGraphPage:
+            refreshed, _key = await self._query_graph_page(
                 thread_id,
                 where=resolved_filter,
                 head_run_id=head_run_id,
-                cursor=cursor,
+                cursor=None,
                 limit=limit,
                 expected_key=key,
             )
             return refreshed
 
-        return TraceQuery(page, store=self._store, key=key, refresh=refresh)
+        return TraceGraphQuery(
+            page,
+            store=self._store,
+            key=key,
+            refresh=refresh,
+            follow_enabled=cursor is None,
+            max_page_bytes=self._graph_query_limits.max_page_bytes,
+        )
 
-    async def rebuild_entries(self, thread_id: str) -> int:
-        """Reconstruct current query entries without changing authoritative facts.
-
-        Active sessions owned by this Tracer are flushed first. A concurrent commit by
-        another process makes the rebuild fail instead of publishing a partial index.
-
-        Args:
-            thread_id: Canonical Trace thread identity.
-
-        Returns:
-            Number of rebuilt query entries in the current generation.
-
-        Raises:
-            ValueError: ``thread_id`` is not canonical non-empty text.
-            TraceThreadNotFound: The current generation is unavailable.
-            TraceStoreProtocolError: The Store cannot rebuild entries or the Ledger
-                changes during reconstruction.
-        """
+    async def rebuild_graph(self, thread_id: str) -> int:
+        """Reconstruct current Graph nodes without changing authoritative facts."""
 
         if (
             not isinstance(thread_id, str)
@@ -2668,116 +2844,121 @@ class Tracer:
         if sessions:
             await asyncio.gather(*(session.flush() for session in sessions))
         store = self._store
-        if not isinstance(store, TraceEntryRebuildStore):
-            raise TraceStoreProtocolError(
-                "Trace Store does not rebuild indexed entries"
-            )
+        if not isinstance(store, TraceGraphRebuildStore):
+            raise TraceStoreProtocolError("Trace Store does not rebuild Graph nodes")
         snapshot = await store.snapshot(thread_id)
-        return await store.rebuild_trace_entries(snapshot.key)
+        return await store.rebuild_trace_graph(snapshot.key)
 
-    async def _query_entry_page(
+    async def _query_graph_page(
         self,
         thread_id: str,
         *,
-        where: TraceFilter,
+        where: TraceGraphFilter,
         head_run_id: str | None,
         cursor: str | None,
         limit: int,
         expected_key: TraceThreadKey | None,
-    ) -> tuple[TraceEntryPage, TraceThreadKey]:
+    ) -> tuple[TraceGraphPage, TraceThreadKey]:
         sessions = tuple(self._sessions.get(thread_id, ()))
         if sessions:
             await asyncio.gather(*(session.flush() for session in sessions))
-        snapshot = await self._store.snapshot(thread_id)
-        if expected_key is not None and snapshot.key != expected_key:
-            raise TraceStoreProtocolError(
-                "Trace entry follow generation changed during the query"
-            )
-        core_state = await load_core_projection_state(
-            self._store,
-            snapshot.key,
-            as_of_seq=snapshot.as_of_seq,
-        )
-        window = select_core_projection_window(
-            core_state,
-            head_run_id=head_run_id,
-            turn_limit=max(1, len(core_state.turn_order)),
-        )
-        core = project_core_checkpoint(
-            core_state,
-            head_run_id=head_run_id,
-            turn_limit=1,
-            active_run_ids=snapshot.active_run_ids,
-        )
-        before_started_at: datetime | None = None
-        before_entry_id: str | None = None
-        if cursor is not None:
-            before_started_at, before_entry_id = decode_entry_cursor(
-                cursor,
-                key=snapshot.key,
-                head_run_id=head_run_id,
-                where=where,
-            )
         store = self._store
-        if not isinstance(store, TraceEntryStore):
+        if not isinstance(store, TraceGraphStore):
             raise TraceStoreProtocolError(
-                "Trace Store does not provide indexed entry queries"
+                "Trace Store does not provide indexed Graph queries"
             )
-        records = await store.query_trace_entries(
-            snapshot.key,
-            run_ids=tuple(sorted(core.selected_run_ids)),
-            where=where,
-            limit=limit,
-            before_started_at=before_started_at,
-            before_entry_id=before_entry_id,
-        )
-        projected_items: list[TraceEntry] = []
-        selected_turn_ids: set[str] = set()
-        for record in records.entries:
-            turn_id = window.run_turns.get(record.run_id)
-            if turn_id is None:
+        for _attempt in range(_GRAPH_QUERY_STABILITY_ATTEMPTS):
+            snapshot = await store.snapshot(thread_id)
+            if expected_key is not None and snapshot.key != expected_key:
                 raise TraceStoreProtocolError(
-                    "Trace entry Run has no selected Turn ownership"
+                    "Trace Graph follow generation changed during the query"
                 )
-            selected_turn_ids.add(turn_id)
-            projected_items.append(project_trace_entry(record, turn_id=turn_id))
-        tracked_run_ids = {
-            fact.identity.run_id
-            for fact in core_state.runs[window.selected_head].tree_facts
-            if isinstance(fact, AgentStepFact)
-            and fact.phase == "started"
-            and fact.step_kind == "agent"
+            core_state = await load_core_projection_state(
+                store,
+                snapshot.key,
+                as_of_seq=snapshot.as_of_seq,
+            )
+            window = select_core_projection_window(
+                core_state,
+                head_run_id=head_run_id,
+                turn_limit=max(1, len(core_state.turn_order)),
+            )
+            before_started_at: datetime | None = None
+            before_node_id: str | None = None
+            if cursor is not None:
+                before_started_at, before_node_id = decode_graph_cursor(
+                    cursor,
+                    key=snapshot.key,
+                    head_run_id=head_run_id,
+                    as_of_seq=snapshot.as_of_seq,
+                    where=where,
+                )
+            records = await store.query_trace_graph(
+                snapshot.key,
+                run_ids=tuple(sorted(window.selected_run_ids)),
+                where=where,
+                limit=limit,
+                max_nodes=self._graph_query_limits.max_total_nodes,
+                before_started_at=before_started_at,
+                before_node_id=before_node_id,
+            )
+            if records.as_of_seq == snapshot.as_of_seq:
+                break
+        else:
+            raise TraceStoreProtocolError(
+                "Trace Graph changed repeatedly during one consistent query"
+            )
+        turn_ids = {
+            window.run_turns[record.run_id]
+            for record in records.nodes
+            if record.run_id in window.run_turns
         }
+        turns = trace_graph_turns(core_state, window, selected_turn_ids=turn_ids)
+        nodes, ordered_ids, roots = project_trace_graph_records(
+            records.nodes,
+            turns=turns,
+            run_turns=window.run_turns,
+            include_technical_nodes=where.include_technical_nodes,
+            include_ancestor_nodes=where.include_ancestor_nodes,
+        )
         next_cursor = (
-            encode_entry_cursor(
+            encode_graph_cursor(
                 key=snapshot.key,
                 head_run_id=head_run_id,
+                as_of_seq=records.as_of_seq,
                 where=where,
                 before_started_at=records.next_started_at,
-                before_entry_id=records.next_entry_id,
+                before_node_id=records.next_node_id,
             )
             if records.has_more
             and records.next_started_at is not None
-            and records.next_entry_id is not None
+            and records.next_node_id is not None
             else None
         )
-        return (
-            TraceEntryPage(
-                turns=_entry_turns(
-                    core_state,
-                    window,
-                    selected_turn_ids=selected_turn_ids,
-                ),
-                items=tuple(projected_items),
+        relationship_missing = any(node.link_issues for node in nodes)
+        details_omitted = any(
+            node.content_omitted or node.request_omitted or node.result_omitted
+            for node in nodes
+        )
+        page = bound_graph_page(
+            TraceGraphPage(
+                turns=turns,
+                nodes=nodes,
+                ordered_node_ids=ordered_ids,
+                root_node_ids=roots,
                 next_cursor=next_cursor,
                 as_of_seq=records.as_of_seq,
                 facets=records.facets,
-                completeness=TraceEntryCompleteness(
+                completeness=TraceGraphCompleteness(
                     call_tracking_missing=not records.call_tracking_present,
-                    execution_tree_missing=not window.selected_run_ids
-                    <= tracked_run_ids,
+                    relationship_evidence_missing=relationship_missing,
+                    details_omitted=details_omitted,
                 ),
             ),
+            max_bytes=self._graph_query_limits.max_page_bytes,
+        )
+        return (
+            page,
             snapshot.key,
         )
 
@@ -2791,62 +2972,6 @@ class Tracer:
         sessions.discard(session)
         if not sessions:
             self._sessions.pop(thread_id, None)
-
-
-def _entry_turns(
-    state: CoreProjectionState,
-    window: CoreProjectionWindow,
-    *,
-    selected_turn_ids: set[str],
-) -> tuple[TraceTurn, ...]:
-    """Resolve only the selected entry page's Turns from the core checkpoint."""
-
-    lineage_turn_ids = {
-        window.run_turns[run_id]
-        for run_id in window.selected_run_ids
-        if run_id in window.run_turns
-    }
-    ordered_turn_ids = [
-        turn_id for turn_id in state.turn_order if turn_id in lineage_turn_ids
-    ]
-    ordinals = {
-        turn_id: ordinal for ordinal, turn_id in enumerate(ordered_turn_ids, start=1)
-    }
-    turns: list[TraceTurn] = []
-    for turn_id in ordered_turn_ids:
-        if turn_id not in selected_turn_ids:
-            continue
-        checkpoint = state.turns.get(turn_id)
-        if checkpoint is None or not checkpoint.run_ids:
-            raise TraceStoreProtocolError("Trace entry Turn checkpoint is unavailable")
-        run_checkpoints = tuple(
-            state.runs[run_id] for run_id in checkpoint.run_ids if run_id in state.runs
-        )
-        if not run_checkpoints:
-            raise TraceStoreProtocolError("Trace entry Turn has no available Run")
-        user_message = None
-        if checkpoint.user_message_id is not None:
-            candidates = (
-                message
-                for run in run_checkpoints
-                for message in run.messages
-                if message.role == "user"
-                and message.source_id == checkpoint.user_message_id
-            )
-            user_message = min(
-                candidates, key=lambda item: item.trace_seq, default=None
-            )
-        turns.append(
-            TraceTurn(
-                id=turn_id,
-                ordinal=ordinals[turn_id],
-                started_at=min(run.started_at for run in run_checkpoints),
-                user_message=(
-                    None if user_message is None else user_message.model_copy(deep=True)
-                ),
-            )
-        )
-    return tuple(turns)
 
 
 def _projection_registry(

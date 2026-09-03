@@ -8,17 +8,14 @@ from pydantic import BaseModel, ConfigDict, Field
 from tinkerfin_studio.conversation.todo_groups import TaskTraceSnapshot
 from tinkerfin_tracing import (
     TraceCompleteness,
-    TraceEntry,
-    TraceEntryCompleteness,
-    TraceEntryDelta,
-    TraceFacets,
+    TraceGraph,
+    TraceGraphDelta,
+    TraceGraphPage,
     TraceInteraction,
     TraceMessage,
-    TraceNode,
     TraceReasoning,
     TraceState,
     TraceStatus,
-    TraceTurn,
     TraceUpdate,
 )
 
@@ -86,7 +83,6 @@ class ConversationHistoryDetail(BaseModel):
     thread_id: str = Field(alias="threadId")
     title: str
     last_model: str | None = Field(default=None, alias="lastModel")
-    runtime_profile: str = Field(alias="runtimeProfile")
     pinned: bool
     as_of_seq: int = Field(alias="asOfSeq", ge=1)
     head_run_id: str = Field(alias="headRunId")
@@ -96,7 +92,7 @@ class ConversationHistoryDetail(BaseModel):
     tool_call_count: int = Field(alias="toolCallCount", ge=0)
     messages: tuple[TraceMessage, ...]
     reasoning: tuple[TraceReasoning, ...]
-    nodes: tuple[TraceNode, ...]
+    graph: TraceGraph
     state: TraceState
     interactions: tuple[TraceInteraction, ...]
     status: TraceStatus
@@ -131,42 +127,21 @@ class ConversationTraceErrorEvent(BaseModel):
     code: Literal["trace_unavailable"] = "trace_unavailable"
 
 
-class ConversationTraceEntryPage(BaseModel):
-    """服务端直接筛选后的当前链路节点页"""
-
-    model_config = ConfigDict(populate_by_name=True)
-
-    turns: tuple[TraceTurn, ...]
-    items: tuple[TraceEntry, ...]
-    next_cursor: str | None = Field(
-        default=None,
-        alias="nextCursor",
-        description="同一筛选条件下的下一页不透明游标",
-    )
-    as_of_seq: int = Field(
-        alias="asOfSeq",
-        ge=1,
-        description="本页读取时对应的 Trace Ledger 尾序号",
-    )
-    facets: TraceFacets
-    completeness: TraceEntryCompleteness
-
-
-class ConversationTraceEntrySnapshotEvent(BaseModel):
+class ConversationTraceGraphSnapshotEvent(BaseModel):
     """链路跟随连接建立后的完整筛选页"""
 
     type: Literal["snapshot"] = "snapshot"
-    snapshot: ConversationTraceEntryPage
+    snapshot: TraceGraphPage
 
 
-class ConversationTraceEntryUpdateEvent(BaseModel):
+class ConversationTraceGraphUpdateEvent(BaseModel):
     """同一筛选条件下的链路节点增删与 Facet 更新"""
 
     type: Literal["update"] = "update"
-    update: TraceEntryDelta
+    update: TraceGraphDelta
 
 
-class ConversationTraceEntryErrorEvent(BaseModel):
+class ConversationTraceGraphErrorEvent(BaseModel):
     """链路跟随开始后可安全重试的终止信号"""
 
     type: Literal["error"] = "error"
@@ -193,11 +168,10 @@ __all__ = [
     "ConversationHistoryListItem",
     "ConversationHistoryListResponse",
     "ConversationThreadUpdate",
-    "ConversationTraceEntryErrorEvent",
-    "ConversationTraceEntryPage",
-    "ConversationTraceEntrySnapshotEvent",
-    "ConversationTraceEntryUpdateEvent",
     "ConversationTraceErrorEvent",
+    "ConversationTraceGraphErrorEvent",
+    "ConversationTraceGraphSnapshotEvent",
+    "ConversationTraceGraphUpdateEvent",
     "ConversationTraceSnapshotEvent",
     "ConversationTraceUpdateEvent",
     "PendingInteractionKind",

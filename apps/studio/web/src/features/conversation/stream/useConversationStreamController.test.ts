@@ -8,6 +8,7 @@ import type {
   ConversationTraceEvent,
 } from '../../../api/conversation/history'
 import type { ChatRequestPayload } from '../../../api/conversation/types'
+import { emptyTraceGraph, emptyTraceGraphDelta } from '../../../test/traceFixtures'
 import type { Conversation, WorkspaceState } from '../../../types'
 import { useConversationStreamController } from './useConversationStreamController'
 
@@ -53,7 +54,6 @@ const traceDetail = (
   threadId: THREAD_ID,
   title: 'Trace authority',
   lastModel: 'main',
-  runtimeProfile: 'deepagents-v2',
   pinned: false,
   asOfSeq: 5,
   headRunId: RUN_ID,
@@ -75,7 +75,6 @@ const traceDetail = (
     completedAt: BASE_TIME,
   }],
   reasoning: [],
-  nodes: [],
   state: { root: {}, subgraphs: {} },
   interactions: [],
   status: { execution: 'succeeded', headRunId: RUN_ID },
@@ -83,6 +82,7 @@ const traceDetail = (
   createdAt: BASE_TIME,
   updatedAt: BASE_TIME,
   ...overrides,
+  graph: overrides.graph ?? emptyTraceGraph(overrides.asOfSeq ?? 5),
   taskTrace: overrides.taskTrace ?? { status: 'ready', todoGroups: [] },
 })
 
@@ -293,7 +293,7 @@ describe('useConversationStreamController', () => {
             removes: [],
           },
           reasoning: { upserts: [], removes: [] },
-          nodes: { upserts: [], removes: [] },
+          graph: emptyTraceGraphDelta(3),
           interactions: { upserts: [], removes: [] },
           state: { root: {}, subgraphs: {} },
           status: { execution: 'succeeded', headRunId: RUN_ID },
@@ -350,7 +350,7 @@ describe('useConversationStreamController', () => {
               facts: [],
               messages: { upserts: terminal.messages, removes: [] },
               reasoning: { upserts: [], removes: [] },
-              nodes: { upserts: [], removes: [] },
+              graph: emptyTraceGraphDelta(4),
               interactions: { upserts: [], removes: [] },
               state: terminal.state,
               status: terminal.status,

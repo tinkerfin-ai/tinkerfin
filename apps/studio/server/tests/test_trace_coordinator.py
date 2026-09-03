@@ -125,9 +125,7 @@ async def _setup_run(database, *, thread_id: str, run_id: str):
             run_id=run_id,
             parent_run_id=None,
             model_id="model-main",
-            runtime_profile="deepagents-v2",
             input_json={"runId": run_id},
-            config_json={"runtimeProfile": "deepagents-v2"},
         )
         thread.last_run_id = run_id
         thread.status = "running"
@@ -436,9 +434,7 @@ async def test_recover_preparing_deletes_empty_thread_without_trace(database) ->
             run_id="run-stale",
             parent_run_id=None,
             model_id="model-main",
-            runtime_profile="deepagents-v2",
             input_json={"runId": "run-stale"},
-            config_json={"runtimeProfile": "deepagents-v2"},
         )
         registration.created_at = datetime.now(UTC).replace(tzinfo=None) - timedelta(
             minutes=1
@@ -478,9 +474,7 @@ async def test_recover_preparing_removes_only_a_missing_new_run_from_existing_tr
             run_id="run-missing-trace",
             parent_run_id="run-existing-trace",
             model_id="model-main",
-            runtime_profile="deepagents-v2",
             input_json={"runId": "run-missing-trace"},
-            config_json={"runtimeProfile": "deepagents-v2"},
         )
         registration.created_at = datetime.now(UTC).replace(tzinfo=None) - timedelta(
             minutes=1
@@ -533,9 +527,7 @@ async def test_recover_preparing_preserves_a_live_messaging_owner(database) -> N
             run_id=identity.run_id,
             parent_run_id=None,
             model_id="model-main",
-            runtime_profile="deepagents-v2",
             input_json={"runId": identity.run_id},
-            config_json={"runtimeProfile": "deepagents-v2"},
         )
         registration.created_at = datetime.now(UTC).replace(tzinfo=None) - timedelta(
             minutes=1
@@ -588,9 +580,7 @@ async def test_owner_preflight_cas_fences_a_stale_recovery_delete(database) -> N
             run_id=identity.run_id,
             parent_run_id=None,
             model_id="model-main",
-            runtime_profile="deepagents-v2",
             input_json={"runId": identity.run_id},
-            config_json={"runtimeProfile": "deepagents-v2"},
         )
         registration.created_at = datetime.now(UTC).replace(tzinfo=None) - timedelta(
             minutes=1
@@ -649,9 +639,7 @@ async def test_abandoned_trace_settles_the_complete_claim_batch_as_cancelled(
             run_id=identity.run_id,
             parent_run_id="run-interrupted",
             model_id="model-main",
-            runtime_profile="deepagents-v2",
             input_json={"runId": identity.run_id},
-            config_json={"runtimeProfile": "deepagents-v2"},
         )
         await repository.create_interrupt_claims(
             thread_pk=thread.id,

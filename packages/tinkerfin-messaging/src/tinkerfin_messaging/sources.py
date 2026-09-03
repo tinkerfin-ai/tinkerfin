@@ -63,11 +63,13 @@ class _DeferredOpenOutcome(Generic[SourceT]):
 
 
 class DeferredMessageSource(Generic[SourceT]):
-    """Open one source on its first owner pull and never for an unused attachment.
+    """Open one owner source during Messaging readiness or its first standalone pull.
 
-    The wrapper owns the opened binding and keeps it available through Messaging's
-    cancellation-versus-settlement decision. Natural exhaustion does not close the
-    binding; the producer owner completes that lifecycle through `aclose()`.
+    Messaging opens the binding only after durable owner selection and before its ready
+    callback; an unused attachment never opens it. Standalone iteration still opens on
+    the first pull. The wrapper owns the binding through cancellation and settlement.
+    Natural exhaustion does not close it; the producer owner completes that lifecycle
+    through `aclose()`.
 
     Args:
         opener: Async factory returning the source and its optional cancel callback.
@@ -77,7 +79,7 @@ class DeferredMessageSource(Generic[SourceT]):
             an item or terminal outcome. Use this when the first item establishes a
             protocol lifecycle that cancellation must not overtake.
         on_owner_preflight: Optional callback settled after durable owner acquisition
-            but before a producer task or source opener can start.
+            and before the request-owned source is opened.
 
     Raises:
         TypeError: The opener or cancellable declaration has an invalid shape.
@@ -132,16 +134,16 @@ class DeferredMessageSource(Generic[SourceT]):
         return callback == self.cancel
 
     async def messaging_owner_preflight(self) -> None:
-        """Settle the one owner-only hook before producer execution can begin."""
+        """Settle the owner hook and open the source before producer execution."""
 
         callback = self._owner_preflight
-        if callback is None:
-            return
         task = self._owner_preflight_task
         if task is None:
 
             async def invoke() -> None:
-                await callback()
+                if callback is not None:
+                    await callback()
+                await self._open()
 
             task = asyncio.create_task(
                 invoke(),
@@ -366,7 +368,7 @@ class ProfiledDeferredMessageSource(
             cancel_after_first_item: Whether remote cancellation waits for the first
                 owner pull to settle.
             on_owner_preflight: Optional owner-only callback completed after durable
-                preparation and before producer or opener execution.
+                preparation and before the source is opened.
 
         Raises:
             TypeError: A profile type or inherited deferred-source option is invalid.

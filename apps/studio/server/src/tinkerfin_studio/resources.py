@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Awaitable, Mapping
+from collections.abc import AsyncIterator, Awaitable
 from contextlib import (
     AbstractAsyncContextManager,
     AsyncExitStack,
     asynccontextmanager,
 )
 from dataclasses import dataclass
-from types import MappingProxyType, TracebackType
+from types import TracebackType
 from typing import NoReturn, TypeVar, cast
 
 import httpx
@@ -31,7 +31,6 @@ from tinkerfin_sandbox.lifecycle.manager import OpenSandboxManager
 from tinkerfin_sandbox.lifecycle.sqlalchemy import SQLAlchemyOpenSandboxState
 from tinkerfin_sandbox.models import OpenSandboxConfig
 from tinkerfin_studio.agent.persistence import AgentPersistence
-from tinkerfin_studio.agent.runtime_profiles import build_runtime_profiles
 from tinkerfin_studio.config.settings import Settings, get_settings
 from tinkerfin_studio.conversation.coordinator import (
     ConversationTraceCoordinator,
@@ -141,7 +140,7 @@ class ApplicationResources:
     redis_control: Redis
     redis_runtime: Redis
     agent_persistence: AgentPersistence
-    tinkerfin_profiles: Mapping[str, TinkerFin]
+    tinkerfin: TinkerFin
     tracer: Tracer
     todo_group_query: TodoGroupQueryExecutor
     messaging: Messaging
@@ -232,16 +231,10 @@ def build_lifespan():
             todo_group_query = TodoGroupQueryExecutor()
             # 每个 Run 由框架打开独立 Trace session，写入失败会让 Agent fail-closed
             # Studio 授权保留有界错误摘要；Tracer 仍不接管共享 Engine，reasoning 默认省略
-            tinkerfin_profiles = MappingProxyType(
-                {
-                    profile_id: TinkerFin(
-                        checkpointer=persistence.checkpointer,
-                        run_coordinator=run_coordinator,
-                        runtime_profile=profile,
-                    ).observe(tracer)
-                    for profile_id, profile in build_runtime_profiles().items()
-                }
-            )
+            tinkerfin = TinkerFin(
+                checkpointer=persistence.checkpointer,
+                run_coordinator=run_coordinator,
+            ).observe(tracer)
             sandbox_settings = settings.sandbox
             sandbox_manager = await _enter_lifespan_context(
                 stack,
@@ -305,7 +298,7 @@ def build_lifespan():
                 redis_control=redis_control,
                 redis_runtime=redis_runtime,
                 agent_persistence=persistence,
-                tinkerfin_profiles=tinkerfin_profiles,
+                tinkerfin=tinkerfin,
                 tracer=tracer,
                 todo_group_query=todo_group_query,
                 messaging=messaging,

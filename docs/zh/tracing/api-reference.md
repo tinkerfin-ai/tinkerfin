@@ -9,6 +9,8 @@ Tracer(
     store=None,
     capture_policy=None,
     reasoning_capture_policy=None,
+    redactor=None,
+    graph_query_limits=None,
     limits=None,
     write_policy=None,
     projections=(),
@@ -18,282 +20,119 @@ Tracer(
 | 成员 | 含义 |
 | --- | --- |
 | `store` | 借用的 `TraceStore`；默认新建 `InMemoryTraceStore` |
+| `capture_policy` | 正文保留、Tool 选择与错误消息策略 |
+| `reasoning_capture_policy` | 独立控制是否保存已提取的 reasoning 正文 |
+| `redactor` | 可选的额外业务 `TraceRedactor` |
+| `graph_query_limits` | Graph 直接节点、总节点与序列化字节上限 |
 | `open_run(context)` | TinkerFin Runtime 使用的 `RuntimeObserver` 入口 |
-| `get(thread_id, head_run_id=None, limit=100, history_cursor=None, projections=())` | 最新或 cursor 固定 as-of 的 `TraceThread` |
-| `query(thread_id, where=None, head_run_id=None, cursor=None, limit=100)` | Store 直接筛选的 `TraceQuery` 页与实时跟随器 |
-| `rebuild_entries(thread_id)` | 重建当前派生查询节点，不改写 Ledger event |
+| `get(thread_id, head_run_id=None, limit=100, history_cursor=None, projections=())` | 固定前缀的会话历史 |
+| `query(thread_id, where=None, head_run_id=None, cursor=None, limit=100)` | 当前索引上的 `TraceGraphQuery` |
+| `rebuild_graph(thread_id)` | 从 Ledger fact 重建可丢弃的 Graph 索引 |
 
-同时传入 `store` 与 `limits` 时，两者必须完全相等。Projection 名必须规范、唯一，并在构造时
-一次性注册。
+同时传入 `store` 与 `limits` 时，两者必须与 `store.limits` 完全一致。
 
-## `TraceFilter`、`TraceQuery` 与节点
+## Graph 数据
 
-`TraceFilter` 支持 `kinds`、`statuses`、`parent_id`、`agent_names`、
+`TraceGraphFilter` 支持 `kinds`、`statuses`、`parent_id`、`agent_names`、
 `middleware_names`、`skill_names`、`providers`、`models`、`namespaces`、`search`、
-`started_after`、`started_before` 和 `include_ancestors`。集合在边界冻结；每个可重复文本条件最多
-接受 64 个值，名称和图命名空间片段必须是最长 1,024 字符的规范文本；时间边界必须是带时区的
-UTC 值。
+`started_after`、`started_before`、`include_technical_nodes` 和
+`include_ancestor_nodes`。
 
-`TraceQuery` 提供 `turns`、`items`、`next_cursor`、`as_of_seq`、`facets`、
-`completeness` 与 `follow()`。`TraceTurn` 解析所选谱系中的轮次和已有用户
-`TraceMessage`，不会再保存一份消息正文。每个 `TraceEntry` 包含 `turn_id`、由 callback 证明的
-结构 `parent_id`；实际 Tool 执行另用 `proposal_id` 关联提议。request/result 与直接
-`TraceFailure` 从引用的 Ledger fact 解码；`request_omitted` 与 `result_omitted` 区分策略或容量
-省略和 JSON null。
-每个 Facet 计数应用除自身维度外的全部当前条件，因此可直接切换类型或状态。直接失败归属写入
-Ledger，不随筛选条件或分页变化。
+`search` 按字面子串过滤节点元数据。只含 ASCII 的查询只折叠查询和元数据中的 ASCII
+`A-Z`，不会把 Unicode 字符映射为外观相近的 ASCII；查询中只要包含非 ASCII 字符，就按
+大小写精确匹配。该定义无需保存重复搜索正文，并保证 SQLite、MySQL 与内存实现返回一致
+结果。
 
-`TraceEntryKind` 覆盖 Agent、技术 Run、graph model/tools step、provider 请求、Tool 提议、实际
-Tool 执行、子 Agent、Skill、middleware、Memory、Guardrail、retrieval、自定义 context 与
-Runtime task。成功节点没有成功徽章契约；只有具备直接失败依据的节点拥有 `failure`。
-`TraceEntryCompleteness.call_tracking_missing` 表示缺少 provider/Tool callback，
-`execution_tree_missing` 表示所选 Run 没有观察到 Agent 执行根。
+`TraceGraphQuery` 提供：
 
-`TraceQuery.follow()` 跟随当前筛选页及其游标并返回 `TraceFollow`，同时发送 `turn_upserts`/`turn_removes` 与节点变化。
-它拥有每次 Store 读取，并在单次或重复取消继续传播前等待上游关闭。消费方必须用
-`turn_id` 和 `parent_id` 构树，不能按名称、时间、到达顺序或 `proposal_id` 重建父级。
-循环可能提前 `break` 时应使用 `TraceFollow` 的 `async with`，否则必须显式调用 `aclose()`。
-进入已关闭的 handle 或并发发起第二次读取时，会抛出 code 为 `tracing.follow_lifecycle` 的
-`TraceFollowLifecycleError`。
+- `snapshot`：完整 `TraceGraphPage` 的防御性副本；
+- `turns`、`nodes`、`ordered_node_ids` 和 `root_node_ids`；
+- `next_cursor`、`as_of_seq`、`facets` 与 `completeness`；
+- `follow()`：只允许当前第一页使用的 `TraceFollow[TraceGraphDelta]`。
 
-## Capture 与容量
+`TraceGraphNodeKind` 包含 HumanMessage、AssistantMessage、SystemMessage、ToolMessage、
+Agent、Model、Tool、Subagent、Skill、middleware、Memory、Guardrail、retrieval、
+custom、Plan、interaction、Run 与 Runtime task。SystemMessage、ToolMessage、
+middleware、Run 和 Runtime task 属于技术节点。
 
-| API | 用途 |
-| --- | --- |
-| `CapturePolicy.public_history(tool_overrides=None, middleware_overrides=None, include_error_messages=False)` | 默认策略；保存经清理的 Tool 历史和可见 middleware 配置，并支持逐项覆盖 |
-| `CapturePolicy.public_safe(tool_rules=(), middleware_overrides=None, include_error_messages=False)` | Tool 默认仅保留元数据，并支持低层 RFC 6901 选择和 middleware 覆盖 |
-| `MiddlewareTraceCapture.visible()` | 保存配置及标准 callback 能证明的执行事实 |
-| `MiddlewareTraceCapture.configuration_only()` | 只保存配置，不记录执行状态和耗时 |
-| `MiddlewareTraceCapture.disabled()` | 不保存 middleware 专属事实且不改变其执行 |
-| `ToolTraceCapture.full_content()` | 保存 Tool 生命周期、完整安全内容与公开审批说明 |
-| `ToolTraceCapture.metadata_only()` | 保存 Tool 生命周期，不保存参数、结果或审批说明 |
-| `ToolTraceCapture.selected_content(...)` | 保存 Tool 生命周期与选定的参数/结果路径 |
-| `ToolTraceCapture.disabled()` | 不保存 Tool 生命周期及其结果消息 fact |
-| `ReasoningCapturePolicy.omitted()` | 默认推理策略，不保存正文或 digest |
-| `ReasoningCapturePolicy.content()` | 显式保存 Runtime 已配置 extractor 提供的有界正文 |
-| `ToolCaptureRule(toolName=..., argumentPaths=..., resultPaths=..., includeReviewDescription=False)` | 为一个 Tool 放行指定 RFC 6901 值与可选审批说明 |
-| `CapturedValue` | 明确的 `inline` 或 `omitted` 捕获 envelope |
-| `TraceLimits` | 不可变的 event、thread、Tracer、reserve 与 follow 上限 |
-| `TraceWritePolicy` | 不可变的 batch、64 MiB pending、背压与等待策略 |
+`TraceGraphDelta` 提供 Turn 和节点的 upsert/remove，以及当前 `next_cursor`、完整的节点
+顺序、根节点、Facet 和 Completeness。带分页 cursor 的查询不能 follow；当前 Ledger 尾序号
+变化后，旧 cursor 会明确失效，因此每个实时 Delta 都会原子替换上一 cursor。
 
-`TraceLimits` 默认值：
+`Tracer.get()` 返回的 `TraceThread.graph` 是与 messages、state 相同固定前缀及已加载 Turn
+窗口对应的完整 `TraceGraph`。`TraceThread.follow()` 通过 `TraceUpdate.graph` 发布
+`TraceGraphDelta`，不再提供另一套树节点模型。当前尾部历史读取可丢弃的 Graph 索引；固定旧
+前缀则从 Ledger fact 重放同一个 reducer。
 
-| 字段 | 默认值 |
-| --- | ---: |
-| `maxEventBytes` | 1 MiB |
-| `maxThreadEvents` | 100,000 |
-| `maxThreadBytes` | 256 MiB |
-| `maxTracerThreads` | 10,000 |
-| `maxTracerBytes` | 1 GiB |
-| `terminalReserveEventsPerRun` | 4 |
-| `terminalReserveBytesPerRun` | 4 MiB |
-| `followBatchSize` | 256 |
+`TraceGraphCompleteness` 分别表达 callback 依据缺失、关系依据缺失和详情被采集或响应上限省略。
 
-普通 append 不能占用 active Run 的终态 reserve。Store 的 mandatory append 只接受
-`run.terminal` 和 `run.closed` facts。字节 reserve 必须覆盖
-`terminalReserveEventsPerRun * maxEventBytes`，保证每个预留 event 都能达到声明的最大值。
-已经失败的 session 仍属于不完整 Trace；reserve 不会在 Observer 失去所有权后伪造 fact。
-无法容纳完整恢复信息的 interaction payload 会在 durable pause 发布前使 Observation 失败，不能静默
-退化为缺少详情的盲审批。
-
-## `TraceThread`
-
-| 成员 | 含义 |
-| --- | --- |
-| `key` | namespace、thread ID 与不可复用 generation |
-| `as_of_seq` | 不可变的全局 Ledger 前缀 |
-| `head_run_id` | 当前选择的 branch head |
-| `available_heads` | 该前缀下所有可选 head |
-| `messages` | 已加载 Turn 窗口中的正序 `TraceMessage` |
-| `reasoning` | 已加载 Turn 窗口中显式提取的 `TraceReasoning` |
-| `tree` | 扁平权威 `TraceTree`；`roots` 与 `children(id)` 是便利视图 |
-| `state` | 所选谱系的完整 root 与无碰撞 subgraph state |
-| `interactions` | 窗口内审批、澄清、review 与输入交互 |
-| `summary` | 所选谱系的完整累计 status、completeness、计数、pending interaction 与来源最大时间 |
-| `status` | `running`、`waiting`、`succeeded`、`failed`、`cancelled`、`abandoned` 或 `unknown` |
-| `completeness` | 独立的 missing-prefix、missing-tail、payload-omitted 信号 |
-| `message_count` / `tool_call_count` | 从 `summary` 计算的便利读取视图 |
-| `projections` | 显式请求业务 Projection 的防御性结果副本 |
-| `has_older` | 是否还有更早完整 Turn |
-| `history_cursor` | 供下一次 `Tracer.get(...)` 使用的 generation/head/as-of opaque cursor |
-| `load_older(limit=100)` | 扩展历史，不改变 as-of 或 follow 起点 |
-| `events(cursor=None, limit=100)` | 升序的所选谱系事件页 |
-| `follow()` | 原始 as-of 之后的 `TraceUpdate` 实时迭代器 |
-| `delete()` | 删除当前 handle 的确切不活跃 generation |
-
-`TraceUpdate` 包含已提交的所选谱系 event/fact，message、reasoning、node、interaction 的
-upsert/remove、当前完整 state 与 `summary`。`update.summary` 是应用该 update 后的累计完整值，
-不是 delta；平铺 status、completeness 与计数字段都从同一个值计算。
-
-`TraceSummary.pending_interactions` 与 `last_occurred_at` 覆盖 fixed-as-of 的完整所选谱系，不受
-已加载 Turn 窗口影响。Pending 按首次出现的 `trace_seq` 排序，resolved 或 cancelled 后移除。
-
-每个 `TraceMessage`、`TraceReasoning`、`TraceNode` 与 `TraceInteraction` 都公开首次创建该
-实体的权威 Ledger `trace_seq`。跨实体类型合并时必须使用该序号，时间戳与 ID 不能替代顺序。
-`TraceInteraction.source_id` 保留规范 Native interrupt ID，使协议客户端无需保存 AG-UI 副本
-即可按已声明规则生成每个 action 的公开 ID。Tool 审批还通过 `tool_call_ids`
-按 action 位置保留 checkpoint 已证明的精确关联；消费方不得按 Tool 名或 node 顺序重建。
-
-`TraceNode.input` 与 `result` 只包含 capture policy 明确保留的值；`inputOmitted` 与
-`resultOmitted` 用于区分省略和 JSON null。`Tracer()` 默认使用
-`CapturePolicy.public_history()`，新出现的 Tool 会自动保存经清理的完整内容与公开审批说明。
-`toolOverrides` 可按准确名称选择 `fullContent`、`metadataOnly`、`selectedContent` 或 `disabled`。
-需要显式选择路径时，仍可通过 `CapturePolicy.public_safe()` 使用低层 `ToolCaptureRule` 与空 RFC 6901
-根路径。
-
-## 语义 Facts
-
-`TraceSemanticFact` 是严格判别联合：
-
-| Fact | 稳定含义 |
-| --- | --- |
-| `TurnFact` | 带权威用户消息 ID 的新普通或 branch 任务 |
-| `RunFact` | start、input/resume、resume checkpoint、Observer failure、terminal 或 close |
-| `MessageFact` | message start/content/completion/reconciliation/removal |
-| `ReasoningFact` | 独立 capture policy 下的显式 extractor 正文、reconciliation 与 completion |
-| `ToolFact` | Tool start、参数快照、proposal end、result、取消或放弃 |
-| `RuntimeTaskFact` | LangGraph task start、完成、失败、interrupt、取消、放弃与结构 payload metadata |
-| `StateRevisionFact` | 一个精确 namespace 中变化的非 message state key |
-| `InteractionFact` | pending 到 resolved/cancelled 的人工交互 |
-| `SubagentFact` | 已校验的非根 Graph scope start、waiting 更新与终态结算 |
-| `PlanRevisionFact` | 公开 `tinkerfin_plan` revision 与 status |
-| `NativeExtraFact` | 允许的额外 Native mode 结构 metadata |
-| `CallTrackingFact` | 标记已启用调用观察能力的 Run |
-| `ModelCallFact` | 最终 provider 请求、首个输出、完成、用量、直接失败或控制流终态 |
-| `ToolExecutionFact` | 审批后实际 Tool 输入及直接失败或控制流终态，与提议分离 |
-| `ContextContributionFact` | 显式 Memory、Guardrail、retrieval 或自定义贡献生命周期 |
-| `MiddlewareFact` | 可见的 middleware 配置元数据，不宣称 hook 已执行 |
-| `SkillFact` | 成功准确读取已配置 Skill 指令文件 |
-
-`TraceEvent` 增加 Store event ID、全局 `traceSeq`、generation 与实际持久字节数。项目协议不包含
-schema 或 protocol version 字段。
-
-`failure` 只由直接 failed 依据投影。cancelled、interrupted 与 abandoned fact 只表达状态，不生成
-错误徽章。
-
-## 业务 Projection
+## 查询上限
 
 ```python
-from pydantic import BaseModel
-
-from tinkerfin_tracing import TraceSemanticFact
-
-
-class State(BaseModel):
-    count: int = 0
-
-
-class Result(BaseModel):
-    count: int
-
-
-class CountTools:
-    name = "count_tools"
-    state_type = State
-    result_type = Result
-
-    def initial_state(self) -> State:
-        return State()
-
-    def apply(self, state: State, fact: TraceSemanticFact) -> State:
-        return State(count=state.count + int(fact.kind == "tool"))
-
-    def finish(self, state: State) -> Result:
-        return Result(count=state.count)
-```
-
-通过 `Tracer(projections=(CountTools(),))` 注册，再用
-`tracer.get(..., projections=("count_tools",))` 显式请求。每次 state transition 和结果都会
-经过声明的 Pydantic 类型校验。请求的 Projection 失败时抛出 `TraceProjectionFailed`，不改变
-Ledger，也不终止 Agent Run。校验后的 state 会按 Run 与 as-of 缓存；子 Run 从最近祖先
-checkpoint 派生，不重新 fold 整段前缀。Projection 必须确定且无外部副作用。
-
-## Store 契约
-
-`TraceStore` 提供 namespace、limits、writer 创建、metadata-only generation snapshot、有界
-正向/反向事件读取、Projection checkpoint load/CAS、follow 与删除。`TraceWriter` 精确绑定一个
-generation 中的一个 Run，支持原子有序 fact batch 与幂等关闭。`StoreThreadSnapshot` 只包含
-`asOfSeq`、字节数与 `StoreWriterSnapshot` metadata，不携带 Ledger 前缀。
-
-`InMemoryTraceStore` 为同一 thread 的并发 Run 分配连续全局序号，拒绝重复或 active Run ID，
-为每个 active writer 预留终态容量，禁止 active delete，删除时唤醒 follower，并始终返回防御性
-副本。
-
-`TraceEntryStore` 是可选的直接查询 Store 能力；`TraceEntryRebuildStore` 从一个精确 Ledger
-generation 重建其派生节点。Backend 分别通过 `TraceQueryBackend` 与
-`TraceEntryRebuildBackend` 提供对应能力；只承担 Ledger 或归档的集成无需实现两者。
-
-### `TraceLedgerBackend` 与 `DurableTraceStore`
-
-`DurableTraceStore(backend, namespace="default", limits=None, options=None, codec=None)`
-在借用的 Backend 上提供完整 Store 与 writer 生命周期。Backend 精确实现以下存储操作：
-
-| 操作 | 必需结果 |
-| --- | --- |
-| `prepare_storage()` | 幂等准备并校验自有存储结构 |
-| `commit_ledger_change(change)` | 原子解析并应用一次框架拥有的 Ledger 变更 |
-| `load_ledger_state(request)` | 返回一致的 namespace、thread、writer 与存储时钟状态 |
-| `read_event_page(request)` | 返回一个有界 exact-generation 原始 event page |
-| `load_projection_checkpoint(request)` | 返回指定 prefix 以内最新的原始 checkpoint |
-
-`commit_ledger_change()` 在事务或条件写循环内取得当前状态，调用
-`resolve_ledger_change()`，再把返回的存储 effect 作为一个单元提交。发生乐观冲突后可重新调用
-resolver；resolver 不执行 I/O。Backend 必须使用存储端时间检查 lease，并在返回或抛出 Store 错误前
-查明未知提交结果。`DurableTraceStore` 借用 Backend 客户端且从不关闭它。
-
-`TraceStoreOptions` 配置 `writer_lease_seconds`、
-`writer_heartbeat_interval_seconds`、`follow_poll_seconds`、
-`commit_retry_attempts` 与 `commit_retry_delay_seconds`。
-
-`verify_trace_ledger_backend(primary_backend, peer_backend)` 使用两个独立客户端验证共享序号、回放、
-checkpoint、follow 与删除契约。供应商特有的事务中断和存储时钟故障仍需 Backend 自己执行故障注入。
-
-### `SqlAlchemyTraceStore`
-
-```python
-SqlAlchemyTraceStore(
-    engine,
-    namespace="default",
-    limits=None,
-    options=None,
-    codec=None,
+TraceGraphQueryLimits(
+    max_direct_nodes=1000,
+    max_total_nodes=4000,
+    max_page_bytes=8 * 1024 * 1024,
 )
 ```
 
-Store 借用 SQLite 或 MySQL 异步 Engine。`setup()` 创建并反射校验唯一当前 Trace Schema，且
-从不销毁 Engine。它使用与 `DurableTraceStore` 相同的 `TraceStoreOptions`。
+直接匹配先受节点上限约束，再补齐祖先。响应超过字节预算时，框架先省略 content、request、
+result、usage 与响应元数据，同时保留权威结构；仅结构仍超限时抛出 `TraceQuotaExceeded`。
 
-| Extra | Engine URL |
+## Capture 策略
+
+| API | 用途 |
 | --- | --- |
-| `tinkerfin-tracing[sqlite]` | `sqlite+aiosqlite:///...` |
-| `tinkerfin-tracing[mysql]` | `mysql+asyncmy://...` |
+| `CapturePolicy.public_history(...)` | 默认保存完整且已脱敏的 Tool 正文 |
+| `CapturePolicy.public_safe(...)` | Tool 默认只保留元数据，除非显式选择路径 |
+| `ToolTraceCapture.full_content()` | 保存 Tool 生命周期、参数、结果和公开审批说明 |
+| `ToolTraceCapture.metadata_only()` | 保存生命周期但不保存正文 |
+| `ToolTraceCapture.selected_content(...)` | 保存选定的 RFC 6901 路径 |
+| `ToolTraceCapture.disabled()` | 不生成该 Tool 的 Trace fact |
+| `MiddlewareTraceCapture.visible()` | 保存 callback 能证明的实际执行生命周期 |
+| `MiddlewareTraceCapture.disabled()` | 不生成 middleware 专属 fact |
+| `ReasoningCapturePolicy.omitted()` | 不保存已提取 reasoning 的正文或 digest |
+| `ReasoningCapturePolicy.content()` | 授权保存有界的已提取 reasoning 正文 |
 
-MySQL writer 使用 `READ COMMITTED` 与行锁，固定读取使用 `REPEATABLE READ`。SQLite writer
-使用 `BEGIN IMMEDIATE`，在 Store 自有有界 retry 期间临时关闭 Driver 阻塞式 busy wait，并在
-连接归还宿主池前恢复原设置。两个方言都分配 generation 内连续全局序号，执行终态 reserve，
-把过期且未完成的 ownership 保留为 missing-tail 证据，支持 fenced takeover，并按有界页轮询
-跨实例 follow。
+`CapturePolicy` 不再提供直接处理原始值的方法。Runtime 值统一进入 `Tracer` 拥有的强制管道。
 
-Projection checkpoint CAS 只允许向前推进；唯一例外是以相同 prefix 与 canonical state 重复
-提交，用于查证未知提交结果。同一 identity/prefix 出现不同 state 时抛出
-`TraceStoreProtocolError`。
+## 业务脱敏
 
-### Canonical payload 与 SQL Schema
+```python
+class TraceRedactor(Protocol):
+    def redact(
+        self,
+        value: JsonValue,
+        *,
+        context: RedactionContext,
+    ) -> JsonValue: ...
+```
 
-`CanonicalTracePayloadCodec` 编码 key 排序、无额外空白、finite 的 UTF-8 JSON。
-`EncodedTracePayload.digest` 是存储转换前 canonical bytes 的 SHA-256。SQL event 与 Projection
-payload 是 opaque bytes；可查询的 Run、fact kind、timestamp、sequence 与 digest metadata 会和
-解码内容交叉校验。
-可逆 Codec 可以保护实际存储的 `data`，但必须保留 canonical digest，在解码时还原数据，并在
-`digest()` 中对还原后的 canonical bytes 计算摘要。
+`RedactionContext.content_kind` 可取 `message`、`model_request`、`model_response`、
+`tool_arguments`、`tool_result`、`state`、`interaction`、`plan`
+或 `custom`。`component_name` 只包含可选的公开组件名，不提供 thread、Run 或用户身份。
 
-`get_trace_store_schema(dialect="sqlite" | "mysql")` 使用与 `setup()` 相同的 metadata，返回
-确定性空库 DDL。Trace 精确拥有 namespace、thread、writer、event、无 payload 的查询 entry 与
-Projection checkpoint 六张表；表内没有外键或项目自有 Schema-version 字段。
+`CompositeRedactor(*redactors)` 按声明顺序传递结果。
+`redact_json_paths(value, paths=(...))` 返回独立副本，并把匹配的 RFC 6901 位置替换为
+`{"$type": "redacted"}`。
 
-## 错误
+Redactor 必须同步、确定、可重入、无 I/O，且不得修改输入。异常、awaitable、原地修改、非法
+JSON、非有限数字或破坏 state、模型消息及 HITL 必需结构时，框架抛出
+`TraceCaptureRejected`，不会回退保存原文。
 
-Tracing 自有失败都继承 `TracingError`，并使用稳定 `tracing.*` code。公开错误族包含 invalid
-cursor、thread not found、ambiguous head、Run not found、Run conflict、Follow lifecycle misuse、corruption、Store
-unavailable/timeout/protocol error、Projection checkpoint conflict、quota exceeded、capture rejected、Observer failed 与
-Projection failed。公开 `context` 只含客户端安全信息；可信诊断与 cause 独立保存。
+框架在业务链前后都执行凭据与已验证私有 reasoning 清理，最终安全检查不能关闭。
+
+## 存储接口
+
+| 接口 | 职责 |
+| --- | --- |
+| `TraceStore` | Ledger generation、固定读取、follow、checkpoint 与删除 |
+| `TraceGraphStore` | 有界的直接 Graph 查询 |
+| `TraceGraphRebuildStore` | 重建可丢弃的 Graph 索引 |
+| `TraceLedgerBackend` | 五操作持久 Ledger 边界 |
+| `TraceGraphQueryBackend` | 可选的持久 Graph 索引查询 |
+| `TraceGraphRebuildBackend` | 可选的持久 Graph 重建 |
+| `CanonicalTracePayloadCodec` | 规范编码或可逆加密转换 |
+
+低层 writer 只持久化已经 Capture 的 fact。需要框架和业务强制脱敏时，应使用能够获得来源
+上下文的 `Tracer` 路径。

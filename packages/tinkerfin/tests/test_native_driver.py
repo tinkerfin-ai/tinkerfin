@@ -12,6 +12,8 @@ from tinkerfin import (
     DeepAgentsRuntimeProfile,
     DeepAgentsV2RuntimeProfile,
     DeepAgentsV2StreamDriver,
+    DeepAgentsV3RuntimeProfile,
+    DeepAgentsV3StreamDriver,
     DeepSeekReasoningExtractor,
     RunIdentity,
     TinkerFin,
@@ -36,11 +38,18 @@ def _context() -> RunSourceContext:
     )
 
 
-def _message_part(message: BaseMessage) -> dict[str, object]:
+def _message_part(
+    message: BaseMessage,
+    *,
+    provider: str | None = None,
+) -> dict[str, object]:
+    metadata = {"langgraph_node": "model"}
+    if provider is not None:
+        metadata["ls_provider"] = provider
     return {
         "type": "messages",
         "ns": (),
-        "data": (message, {"langgraph_node": "model"}),
+        "data": (message, metadata),
     }
 
 
@@ -94,6 +103,35 @@ def test_v2_profile_owns_factory_identity_and_complete_invocation_binding() -> N
     assert bound.arguments["options"] == {"context": {"tenant": "tenant-1"}}
 
 
+def test_v3_profile_owns_explicit_event_stream_binding_without_fallback() -> None:
+    profile = DeepAgentsV3RuntimeProfile()
+    driver = profile.stream_driver
+    identity = RunIdentity(threadId="thread-profile-v3", runId="run-profile-v3")
+
+    assert isinstance(profile, DeepAgentsRuntimeProfile)
+    assert isinstance(driver, DeepAgentsV3StreamDriver)
+    assert profile.profile_id == "deepagents-v3"
+    bound = driver.bind_invocation(
+        inspect.signature(_astream_shape),
+        ({"messages": []},),
+        {},
+        identity=identity,
+        runtime_profile="deepagents-v3",
+    )
+
+    assert bound.arguments["config"] == {
+        "configurable": {
+            "thread_id": "thread-profile-v3",
+            "_tinkerfin_runtime_profile": "deepagents-v3",
+        }
+    }
+    assert bound.arguments["stream_mode"] == ("messages", "tasks", "values")
+    assert bound.arguments["version"] == "v3"
+    assert bound.arguments["subgraphs"] is True
+    with pytest.raises(TypeError, match="must expose astream_events"):
+        profile.graph_stream(object())
+
+
 def test_default_driver_emits_no_provider_reasoning_observation() -> None:
     frame = DeepAgentsV2StreamDriver().normalize(
         _message_part(
@@ -110,6 +148,25 @@ def test_default_driver_emits_no_provider_reasoning_observation() -> None:
     encoded = frame.replay.model_dump_json(by_alias=True)
     assert "visible" in encoded
     assert "private" not in encoded
+
+
+def test_v3_deepseek_extractor_ignores_another_provider_reasoning_delta() -> None:
+    frame = DeepAgentsV3StreamDriver(
+        reasoning_extractors=(DeepSeekReasoningExtractor(),)
+    ).normalize(
+        _message_part(
+            AIMessageChunk(
+                id="message-1",
+                content="",
+                additional_kwargs={"reasoning_content": "other-provider-private"},
+            ),
+            provider="openai",
+        ),
+        context=_context(),
+    )
+
+    assert [item.kind for item in frame.observations] == ["native.message"]
+    assert "other-provider-private" not in frame.replay.model_dump_json(by_alias=True)
 
 
 def test_v2_driver_keeps_idless_followup_tool_data_as_a_chunk() -> None:
@@ -164,7 +221,8 @@ def test_explicit_deepseek_extractor_emits_delta_and_snapshot() -> None:
                 id="message-1",
                 content="",
                 additional_kwargs={"reasoning_content": "first"},
-            )
+            ),
+            provider="deepseek",
         ),
         context=_context(),
     )
@@ -178,6 +236,7 @@ def test_explicit_deepseek_extractor_emits_delta_and_snapshot() -> None:
                         id="message-1",
                         content="visible",
                         additional_kwargs={"reasoning_content": "first second"},
+                        response_metadata={"model_provider": "deepseek"},
                     )
                 ],
                 "reasoning_content": "business value",
@@ -211,8 +270,13 @@ class _MatchingExtractor:
     def name(self) -> str:
         return self._name
 
-    def extract(self, message: BaseMessage) -> JsonValue | None:
-        del message
+    def extract(
+        self,
+        message: BaseMessage,
+        *,
+        provider: str | None,
+    ) -> JsonValue | None:
+        del message, provider
         return "matched"
 
 
@@ -260,7 +324,8 @@ def test_deepseek_extractor_rejects_an_unverified_value_shape() -> None:
                     id="message-1",
                     content="",
                     additional_kwargs={"reasoning_content": {"unexpected": True}},
-                )
+                ),
+                provider="deepseek",
             ),
             context=_context(),
         )

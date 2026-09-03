@@ -89,7 +89,7 @@ async def verify_messaging_backend(
                 runId="completed-run",
             )
             completed = await channel.wrap(
-                FiniteMessageSource.from_events(("first", "second")),
+                FiniteMessageSource[str].from_events(("first", "second")),
                 identity=completed_identity,
                 after=0,
             )
@@ -158,7 +158,7 @@ async def verify_messaging_backend(
                 runId="replacement-run",
             )
             replacement = await channel.wrap(
-                FiniteMessageSource.from_events(("replacement",)),
+                FiniteMessageSource[str].from_events(("replacement",)),
                 identity=replacement_identity,
                 after=0,
             )

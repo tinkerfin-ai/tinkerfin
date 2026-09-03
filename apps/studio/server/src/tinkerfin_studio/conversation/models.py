@@ -100,7 +100,7 @@ class ConversationThread(Base):
 
 
 class ConversationRunRegistration(Base):
-    """主 Run 请求幂等、Profile 与业务状态注册"""
+    """主 Run 请求幂等、模型与业务状态注册"""
 
     __tablename__ = "conversation_run_registrations"
     __table_args__ = (
@@ -121,7 +121,7 @@ class ConversationRunRegistration(Base):
             "status",
             "updated_at",
         ),
-        {"comment": "主 Run 请求幂等、Runtime Profile 与业务状态注册"},
+        {"comment": "主 Run 请求幂等、模型与业务状态注册"},
     )
 
     id: Mapped[int] = mapped_column(
@@ -139,9 +139,6 @@ class ConversationRunRegistration(Base):
     model_id: Mapped[str] = mapped_column(
         String(64), nullable=False, comment="主 Run 使用的稳定模型 ID"
     )
-    runtime_profile: Mapped[str] = mapped_column(
-        String(128), nullable=False, comment="主 Run 固定使用的 Runtime Profile"
-    )
     status: Mapped[str] = mapped_column(
         String(32),
         nullable=False,
@@ -150,9 +147,6 @@ class ConversationRunRegistration(Base):
     )
     input_json: Mapped[dict[str, JsonValue]] = mapped_column(
         JSON, nullable=False, comment="用于同 runId 幂等核验的标准请求"
-    )
-    config_json: Mapped[dict[str, JsonValue]] = mapped_column(
-        JSON, nullable=False, comment="模型与 Runtime Profile 的业务配置快照"
     )
     terminal_outcome: Mapped[str | None] = mapped_column(
         String(32), nullable=True, comment="Trace 终态结果"

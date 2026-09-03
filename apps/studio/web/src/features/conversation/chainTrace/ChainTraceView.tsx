@@ -3,6 +3,7 @@ import {
   ArrowLeft,
 } from 'lucide-react'
 import {
+  useCallback,
   useEffect,
   useId,
   useLayoutEffect,
@@ -14,10 +15,10 @@ import {
 import { createPortal } from 'react-dom'
 
 import type {
-  TraceEntry,
-  TraceEntryKind,
-  TraceEntryStatus,
-} from '../../../api/conversation/traceEntries'
+  TraceGraphNode,
+  TraceGraphNodeKind,
+  TraceGraphNodeStatus,
+} from '../../../api/conversation/traceGraph'
 import { Button, DrawerHeader, FilterPicker, FilterToggle } from '../../../components/ui'
 import { useI18n } from '../../../i18n'
 import type { JsonObject } from '../../../types'
@@ -26,16 +27,17 @@ import {
   durationLabel,
   elapsedMilliseconds,
   traceKindLabel,
+  traceNodeName,
   traceStatusLabel,
 } from './tracePresentation'
 import { TraceTurnTree } from './TraceTurnTree'
 import { useChainTrace } from './useChainTrace'
 
-const SEMANTIC_KINDS: TraceEntryKind[] = [
+const SEMANTIC_KINDS: TraceGraphNodeKind[] = [
+  'human_message',
+  'assistant_message',
   'agent',
   'model',
-  'provider',
-  'tool_proposal',
   'tool',
   'subagent',
   'skill',
@@ -43,9 +45,16 @@ const SEMANTIC_KINDS: TraceEntryKind[] = [
   'guardrail',
   'retrieval',
   'custom',
+  'plan',
+  'interaction',
 ]
 
-const TECHNICAL_KINDS: TraceEntryKind[] = ['middleware', 'run', 'task', 'tools']
+const TECHNICAL_KINDS: TraceGraphNodeKind[] = [
+  'system_message',
+  'middleware',
+  'run',
+  'runtime_task',
+]
 const DETAILS_INLINE_MIN_WIDTH = 800
 
 const useTraceDetailsOverlay = (
@@ -86,7 +95,8 @@ const messageText = (content: unknown) => {
   )).filter(Boolean).join('\n')
 }
 
-const systemPrompt = (entry: TraceEntry) => {
+const systemPrompt = (entry: TraceGraphNode) => {
+  if (entry.kind === 'system_message') return messageText(entry.content)
   if (!entry.request || typeof entry.request !== 'object' || Array.isArray(entry.request)) return ''
   const messages = entry.request.messages
   if (!Array.isArray(messages)) return ''
@@ -98,14 +108,16 @@ const systemPrompt = (entry: TraceEntry) => {
     .join('\n\n')
 }
 
-type DetailTab = 'overview' | 'request' | 'system' | 'usage' | 'metadata' | 'timing' | 'result'
+type DetailTab = 'overview' | 'request' | 'system' | 'response' | 'usage' | 'timing' | 'result'
 
 function TraceDetails({
   entry,
+  responseEntries,
   focusClose,
   onClose,
 }: {
-  entry: TraceEntry
+  entry: TraceGraphNode
+  responseEntries: TraceGraphNode[]
   focusClose: boolean
   onClose: () => void
 }) {
@@ -115,16 +127,36 @@ function TraceDetails({
   const closeButton = useRef<HTMLButtonElement>(null)
   const priorFocusClose = useRef(false)
   const prompt = systemPrompt(entry)
+  const responseMessages = responseEntries
+    .filter((item) => item.kind === 'assistant_message')
+    .map((item) => ({
+      id: item.sourceId ?? item.id,
+      type: 'AIMessage',
+      content: item.content ?? null,
+    }))
+  const responseTools = responseEntries
+    .filter((item) => item.kind === 'tool')
+    .map((item) => ({
+      id: item.sourceId ?? item.id,
+      name: item.name,
+      arguments: item.request ?? null,
+    }))
+  const response = {
+    messages: responseMessages,
+    toolCalls: responseTools,
+    usageMetadata: entry.usage ?? null,
+    responseMetadata: entry.responseMetadata ?? null,
+  }
   const tabs: Array<{ id: DetailTab; label: string }> = [
     { id: 'overview', label: t('概述') },
     ...(entry.request != null || entry.requestOmitted
       ? [{ id: 'request' as const, label: t('请求') }]
       : []),
     ...(prompt ? [{ id: 'system' as const, label: t('系统提示词') }] : []),
-    ...(entry.usage != null ? [{ id: 'usage' as const, label: t('用量') }] : []),
-    ...(entry.responseMetadata != null
-      ? [{ id: 'metadata' as const, label: t('响应元数据') }]
+    ...(entry.kind === 'model'
+      ? [{ id: 'response' as const, label: t('响应') }]
       : []),
+    ...(entry.usage != null ? [{ id: 'usage' as const, label: t('用量') }] : []),
     { id: 'timing', label: t('计时') },
     ...(entry.result != null || entry.resultOmitted || entry.failure
       ? [{ id: 'result' as const, label: t('结果') }]
@@ -147,7 +179,7 @@ function TraceDetails({
       <DrawerHeader
         ref={closeButton}
         className="chain-trace-details-header"
-        title={entry.name}
+        title={traceNodeName(entry, t)}
         description={traceKindLabel(entry.kind, t)}
         closeLabel={t('关闭链路详情')}
         onClose={onClose}
@@ -198,9 +230,9 @@ function TraceDetails({
             <div><dt>{t('图范围')}</dt><dd>{entry.namespace.length ? entry.namespace.join(' / ') : t('根图')}</dd></div>
             {entry.provider && <div><dt>{t('提供方')}</dt><dd>{entry.provider}</dd></div>}
             {entry.model && <div><dt>{t('模型')}</dt><dd>{entry.model}</dd></div>}
+            {entry.kind === 'tool' && <div><dt>{t('工具')}</dt><dd>{entry.name}</dd></div>}
             {entry.agentName && <div><dt>{t('智能体')}</dt><dd>{entry.agentName}</dd></div>}
             {entry.sourceId && <div><dt>{t('来源 ID')}</dt><dd>{entry.sourceId}</dd></div>}
-            {entry.proposalId && <div><dt>{t('提议 ID')}</dt><dd>{entry.proposalId}</dd></div>}
             {entry.sourcePath && <div><dt>{t('来源')}</dt><dd>{entry.sourcePath}</dd></div>}
             {entry.className && <div><dt>{t('实现')}</dt><dd>{entry.className}</dd></div>}
             {entry.hooks.length > 0 && <div><dt>{t('调用钩子')}</dt><dd>{entry.hooks.join(', ')}</dd></div>}
@@ -208,8 +240,10 @@ function TraceDetails({
         )}
         {activeTab === 'request' && <pre>{entry.requestOmitted ? t('请求内容未保留') : json(entry.request)}</pre>}
         {activeTab === 'system' && <MarkdownContent content={prompt} />}
+        {activeTab === 'response' && (
+          <pre>{json(response)}</pre>
+        )}
         {activeTab === 'usage' && <pre>{json(entry.usage)}</pre>}
-        {activeTab === 'metadata' && <pre>{json(entry.responseMetadata)}</pre>}
         {activeTab === 'timing' && (
           <dl className="chain-trace-summary">
             <div><dt>{t('开始时间')}</dt><dd>{new Date(entry.startedAt).toLocaleString()}</dd></div>
@@ -243,38 +277,49 @@ export function ChainTraceView({
   onReturnToConversation: () => void
 }) {
   const { t } = useI18n()
-  const [kind, setKind] = useState<TraceEntryKind | 'all'>('all')
-  const [status, setStatus] = useState<TraceEntryStatus | 'all'>('all')
+  const [kind, setKind] = useState<TraceGraphNodeKind | 'all'>('all')
+  const [status, setStatus] = useState<TraceGraphNodeStatus | 'all'>('all')
   const [showTechnical, setShowTechnical] = useState(false)
+  const [cursor, setCursor] = useState<string | null>(null)
   const [selectedId, setSelectedId] = useState<string>()
   const detailTrigger = useRef<HTMLButtonElement | null>(null)
   const returnButton = useRef<HTMLButtonElement | null>(null)
   const splitRef = useRef<HTMLDivElement>(null)
   const traceRegion = useRef<HTMLElement>(null)
   const filter = useMemo(() => ({
-    kinds: kind === 'all'
-      ? [...SEMANTIC_KINDS, ...(showTechnical ? TECHNICAL_KINDS : [])]
-      : [kind],
+    kinds: kind === 'all' ? undefined : [kind],
     statuses: status === 'all' ? undefined : [status],
-    includeAncestors: true,
+    includeTechnicalNodes: showTechnical,
+    includeAncestorNodes: true,
   }), [kind, showTechnical, status])
-  const trace = useChainTrace({ threadId, active, filter })
+  const returnToLatest = useCallback(() => setCursor(null), [])
+  const trace = useChainTrace({
+    threadId,
+    active,
+    filter,
+    cursor,
+    onCursorExpired: returnToLatest,
+  })
   const page = trace.state.phase === 'ready' ? trace.state.page : undefined
-  const detailsOverlay = useTraceDetailsOverlay(splitRef, Boolean(page?.items.length))
-  const entriesById = useMemo(
-    () => new Map(page?.items.map((entry) => [entry.id, entry]) ?? []),
-    [page?.items],
+  const detailsOverlay = useTraceDetailsOverlay(splitRef, Boolean(page?.nodes.length))
+  const nodesById = useMemo(
+    () => new Map(page?.nodes.map((node) => [node.id, node]) ?? []),
+    [page?.nodes],
   )
-  const selected = selectedId ? entriesById.get(selectedId) : undefined
+  const selected = selectedId ? nodesById.get(selectedId) : undefined
   useEffect(() => {
-    if (selectedId && !entriesById.has(selectedId)) {
+    setCursor(null)
+  }, [threadId])
+
+  useEffect(() => {
+    if (selectedId && !nodesById.has(selectedId)) {
       detailTrigger.current = null
       setSelectedId(undefined)
       window.requestAnimationFrame(() => {
         traceRegion.current?.querySelector<HTMLElement>('.chain-trace-tree-scroll')?.focus()
       })
     }
-  }, [entriesById, selectedId])
+  }, [nodesById, selectedId])
 
   const selectEntry = (entryId: string, trigger: HTMLButtonElement) => {
     detailTrigger.current = trigger
@@ -304,14 +349,14 @@ export function ChainTraceView({
     return () => window.cancelAnimationFrame(frame)
   }, [headerTarget])
 
-  const kindOptions: readonly (TraceEntryKind | 'all')[] = [
+  const kindOptions: readonly (TraceGraphNodeKind | 'all')[] = [
     'all',
     ...SEMANTIC_KINDS,
     ...(showTechnical ? TECHNICAL_KINDS : []),
   ]
-  const statusOptions: readonly (TraceEntryStatus | 'all')[] = [
+  const statusOptions: readonly (TraceGraphNodeStatus | 'all')[] = [
     'all',
-    ...(Object.keys(page?.facets.statuses ?? {}) as TraceEntryStatus[]),
+    ...(Object.keys(page?.facets.statuses ?? {}) as TraceGraphNodeStatus[]),
   ]
 
   const headerControls = (
@@ -329,7 +374,10 @@ export function ChainTraceView({
             renderLabel={(value) => value === 'all'
               ? t('全部类型')
               : `${traceKindLabel(value, t)} · ${page?.facets.kinds[value] ?? 0}`}
-            onChange={setKind}
+            onChange={(value) => {
+              setCursor(null)
+              setKind(value)
+            }}
           />
           <FilterPicker
             value={status}
@@ -338,18 +386,36 @@ export function ChainTraceView({
             renderLabel={(value) => value === 'all'
               ? t('全部状态')
               : `${traceStatusLabel(value, t)} · ${page?.facets.statuses[value] ?? 0}`}
-            onChange={setStatus}
+            onChange={(value) => {
+              setCursor(null)
+              setStatus(value)
+            }}
           />
           <FilterToggle
             pressed={showTechnical}
             label={t('技术节点')}
             onPressedChange={(visible) => {
+              setCursor(null)
               setShowTechnical(visible)
-              if (!visible && TECHNICAL_KINDS.includes(kind as TraceEntryKind)) {
+              if (!visible && TECHNICAL_KINDS.includes(kind as TraceGraphNodeKind)) {
                 setKind('all')
               }
             }}
           />
+          {cursor && (
+            <Button variant="text" size="xs" onClick={returnToLatest}>
+              {t('返回最新节点')}
+            </Button>
+          )}
+          {page?.nextCursor && (
+            <Button
+              variant="text"
+              size="xs"
+              onClick={() => setCursor(page.nextCursor ?? null)}
+            >
+              {t('查看较早节点')}
+            </Button>
+          )}
         </>
       )}
     </>
@@ -367,7 +433,7 @@ export function ChainTraceView({
     )
   }
 
-  const entries = page?.items ?? []
+  const nodes = page?.nodes ?? []
   const forceExpandTree = kind !== 'all' || status !== 'all'
 
   return (
@@ -381,28 +447,29 @@ export function ChainTraceView({
             <Button onClick={trace.retry}>{t('重试')}</Button>
           </div>
         )}
-        {(page?.completeness.executionTreeMissing || page?.completeness.callTrackingMissing) && (
+        {(page?.completeness.relationshipEvidenceMissing || page?.completeness.callTrackingMissing) && (
           <div className="chain-trace-notice">
-            {page.completeness.executionTreeMissing
-              ? t('部分历史运行没有完整执行树')
+            {page.completeness.relationshipEvidenceMissing
+              ? t('部分节点缺少完整关联依据')
               : t('部分历史运行没有调用级跟踪数据')}
           </div>
         )}
-        {trace.state.phase === 'ready' && entries.length === 0 && (
+        {trace.state.phase === 'ready' && nodes.length === 0 && (
           <div className="chain-trace-state"><Activity size={24} /><p>{t('没有匹配的链路节点')}</p></div>
         )}
-        {trace.state.phase === 'ready' && entries.length > 0 && (
+        {trace.state.phase === 'ready' && nodes.length > 0 && (
           <div
             ref={splitRef}
             className={`chain-trace-split${selected ? ' has-details' : ''}${detailsOverlay ? ' uses-overlay' : ''}`}
           >
             <TraceTurnTree
               turns={page?.turns ?? []}
-              entries={entries}
+              nodes={nodes}
+              orderedNodeIds={page?.orderedNodeIds ?? []}
+              rootNodeIds={page?.rootNodeIds ?? []}
               selectedId={selectedId}
               forceExpandAll={forceExpandTree}
               forceExpandKey={forceExpandTree ? `${kind}:${status}` : undefined}
-              hiddenKinds={showTechnical ? [] : TECHNICAL_KINDS}
               backgroundInert={detailsOverlay && Boolean(selected)}
               onSelect={selectEntry}
             />
@@ -410,6 +477,10 @@ export function ChainTraceView({
               <TraceDetails
                 key={selected.id}
                 entry={selected}
+                responseEntries={nodes.filter((node) => (
+                  node.parentId === selected.id
+                  && (node.kind === 'assistant_message' || node.kind === 'tool')
+                ))}
                 focusClose={detailsOverlay}
                 onClose={closeDetails}
               />

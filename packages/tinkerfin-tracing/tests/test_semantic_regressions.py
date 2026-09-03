@@ -301,14 +301,14 @@ async def test_root_tool_capture_populates_bounded_node_input_and_result() -> No
     await _finish(session, context)
 
     thread = await tracer.get("thread-semantic")
-    node = next(item for item in thread.tree.nodes if item.kind == "tool")
+    node = next(item for item in thread.graph.nodes if item.kind == "tool")
     result = next(item for item in thread.messages if item.role == "tool")
 
-    assert node.input == {
+    assert node.request == {
         "query": "public",
         "token": {"$type": "redacted"},
     }
-    assert node.input_omitted is False
+    assert node.request_omitted is False
     assert node.result == {
         "answer": "done",
         "api_key": {"$type": "redacted"},
@@ -395,7 +395,7 @@ async def test_disabled_tool_emits_no_tool_or_result_message_facts() -> None:
         isinstance(event.fact, MessageFact) and event.fact.role == "tool"
         for event in events
     )
-    assert not any(node.kind == "tool" for node in thread.tree.nodes)
+    assert not any(node.kind == "tool" for node in thread.graph.nodes)
 
 
 async def test_subgraph_tool_message_uses_its_scoped_tool_name_for_capture() -> None:
@@ -618,7 +618,7 @@ async def test_interrupted_runtime_task_remains_waiting_in_the_execution_tree() 
     await _finish(session, context, outcome="interrupted")
 
     thread = await tracer.get("thread-semantic")
-    task = next(node for node in thread.tree.nodes if node.kind == "task")
+    task = next(node for node in thread.graph.nodes if node.kind == "runtime_task")
     facts = [
         event.fact
         for event in (await thread.events(limit=100)).items
@@ -697,7 +697,7 @@ async def test_parent_task_result_completes_its_direct_subagent_before_interrupt
         for event in (await thread.events(limit=100)).items
         if isinstance(event.fact, SubagentFact)
     ]
-    node = next(node for node in thread.tree.nodes if node.kind == "subagent")
+    node = next(node for node in thread.graph.nodes if node.kind == "subagent")
 
     assert [fact.phase for fact in facts] == ["started", "completed"]
     assert facts[-1].status == "succeeded"
@@ -814,18 +814,18 @@ async def test_verified_task_tool_adds_subagent_identity_and_input() -> None:
         for event in (await thread.events(limit=100)).items
         if isinstance(event.fact, SubagentFact)
     ]
-    subagent = next(node for node in thread.tree.nodes if node.kind == "subagent")
+    subagent = next(node for node in thread.graph.nodes if node.kind == "subagent")
     parent_tool = next(
         node
-        for node in thread.tree.nodes
-        if node.kind == "tool" and node.label == "task"
+        for node in thread.graph.nodes
+        if node.kind == "tool" and node.name == "task"
     )
 
     assert facts[0].parent_tool_call_id == "call-task"
     assert facts[0].input is not None
     assert subagent.source_id == "call-task"
-    assert subagent.label == "researcher"
-    assert subagent.input == task_arguments
+    assert subagent.name == "researcher"
+    assert subagent.request == task_arguments
     assert parent_tool.result == "Research complete"
 
 
@@ -907,7 +907,7 @@ async def test_grouped_parallel_task_result_completes_every_direct_subagent() ->
     await _finish(session, context)
 
     thread = await tracer.get("thread-semantic")
-    subagents = [node for node in thread.tree.nodes if node.kind == "subagent"]
+    subagents = [node for node in thread.graph.nodes if node.kind == "subagent"]
 
     assert len(subagents) == 2
     assert {node.source_id for node in subagents} == {"call-task-a", "call-task-b"}
@@ -1084,8 +1084,8 @@ async def test_interaction_resolves_across_resume_and_keeps_one_turn() -> None:
     )
     assert thread.interactions[0].status == "resolved"
     assert thread.summary.pending_interactions == ()
-    assert len(thread.tree.roots) == 1
-    assert len([node for node in thread.tree.nodes if node.kind == "run"]) == 2
+    assert len(thread.graph.turns) == 1
+    assert len([node for node in thread.graph.nodes if node.kind == "run"]) == 2
     assert any(
         isinstance(event.fact, MessageFact)
         and event.fact.role == "user"

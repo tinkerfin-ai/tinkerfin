@@ -10,6 +10,7 @@ import {
   type ConversationHistoryDetail,
 } from './history'
 import { clearAuthSession, saveAuthSession } from '../../auth/session'
+import { emptyTraceGraph, emptyTraceGraphDelta } from '../../test/traceFixtures'
 
 function envelope(data: unknown, code = 0, message = 'success', status = 200) {
   return new Response(JSON.stringify({ code, message, data }), {
@@ -23,7 +24,6 @@ const detail = (): ConversationHistoryDetail => ({
   threadId: 'thread-trace',
   title: 'Trace 会话',
   lastModel: 'main',
-  runtimeProfile: 'deepagents-v2',
   pinned: false,
   asOfSeq: 4,
   headRunId: 'run-1',
@@ -33,7 +33,7 @@ const detail = (): ConversationHistoryDetail => ({
   toolCallCount: 0,
   messages: [],
   reasoning: [],
-  nodes: [],
+  graph: emptyTraceGraph(4),
   state: { root: {}, subgraphs: {} },
   interactions: [],
   status: { execution: 'succeeded', headRunId: 'run-1' },
@@ -143,7 +143,7 @@ describe('conversation Trace client', () => {
         facts: [],
         messages: { upserts: [], removes: [] },
         reasoning: { upserts: [], removes: [] },
-        nodes: { upserts: [], removes: [] },
+        graph: emptyTraceGraphDelta(5),
         interactions: { upserts: [], removes: [] },
         state: { root: {}, subgraphs: {} },
         status: { execution: 'succeeded', headRunId: 'run-1' },

@@ -140,23 +140,23 @@ async def test_recoverable_owner_uses_stable_id_and_attach_does_not_open_factory
     )
     owner_factory = _Factory(source)
     unused_factory = _Factory(error=AssertionError("attach must not rebuild source"))
-    owner_starting = 0
+    owner_ready = 0
     owner_not_started = 0
-    attachment_starting = 0
+    attachment_ready = 0
     attachment_not_started = 0
 
-    async def source_starting() -> None:
-        nonlocal owner_starting
-        assert owner_factory.checkpoints == []
-        owner_starting += 1
+    async def source_ready() -> None:
+        nonlocal owner_ready
+        assert owner_factory.checkpoints == [None]
+        owner_ready += 1
 
     async def delivery_not_started() -> None:
         nonlocal owner_not_started
         owner_not_started += 1
 
-    async def attached_source_starting() -> None:
-        nonlocal attachment_starting
-        attachment_starting += 1
+    async def attached_source_ready() -> None:
+        nonlocal attachment_ready
+        attachment_ready += 1
 
     async def attached_delivery_not_started() -> None:
         nonlocal attachment_not_started
@@ -168,7 +168,7 @@ async def test_recoverable_owner_uses_stable_id_and_attach_does_not_open_factory
             owner_factory,
             identity=_identity(),
             after=0,
-            on_source_starting=source_starting,
+            on_source_ready=source_ready,
             on_delivery_not_started=delivery_not_started,
         )
         owner_delivery = aiter(owner)
@@ -177,7 +177,7 @@ async def test_recoverable_owner_uses_stable_id_and_attach_does_not_open_factory
             unused_factory,
             identity=_identity(),
             after=0,
-            on_source_starting=attached_source_starting,
+            on_source_ready=attached_source_ready,
             on_delivery_not_started=attached_delivery_not_started,
         )
         release.set()
@@ -190,9 +190,9 @@ async def test_recoverable_owner_uses_stable_id_and_attach_does_not_open_factory
     assert owner_factory.checkpoints == [None]
     assert unused_factory.checkpoints == []
     assert source.close_calls == 1
-    assert owner_starting == 1
+    assert owner_ready == 1
     assert owner_not_started == 0
-    assert attachment_starting == 0
+    assert attachment_ready == 0
     assert attachment_not_started == 0
 
 

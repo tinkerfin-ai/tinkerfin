@@ -36,6 +36,7 @@ from tinkerfin_contracts import (
     RunObservationSession,
     RunResumeSummary,
     RunSourceContext,
+    RunTerminalObservation,
     RuntimeObservation,
 )
 from tinkerfin_native_stream import NativeStreamPart, NativeValuesStreamPart
@@ -823,8 +824,9 @@ class _FixtureGraph:
         config: object | None = None,
         *,
         fixture_mode: str | None = None,
+        context: object | None = None,
     ) -> AsyncIterator[object]:
-        del input
+        del input, context
         self.options = {"config": config, "fixture_mode": fixture_mode}
         yield {"fixture_payload": "value"}
 
@@ -914,6 +916,12 @@ class _FixtureRuntimeProfile:
     def astream_signature(self) -> inspect.Signature:
         return inspect.signature(self._graph.astream)
 
+    def graph_stream(self, graph: object) -> Callable[..., object]:
+        stream = getattr(graph, "astream", None)
+        if not callable(stream):
+            raise TypeError("fixture graph must expose astream")
+        return stream
+
     def prepare_create_agent(
         self,
         arguments: Mapping[str, object],
@@ -966,6 +974,68 @@ class _AsyncFixtureRuntimeProfile(_FixtureRuntimeProfile):
         self.async_build_calls += 1
         await asyncio.sleep(0)
         return factory(*args, **dict(kwargs))
+
+
+@pytest.mark.asyncio
+async def test_open_run_is_observable_before_output_and_closes_without_iteration() -> (
+    None
+):
+    graph = _FixtureGraph()
+    profile = _FixtureRuntimeProfile(graph)
+    session = _Session()
+    tinkerfin = TinkerFin(runtime_profile=profile).observe(_Observer(session))
+    definition = tinkerfin.create_deep_agent(model="provider:model", tools=[])
+
+    stream = await tinkerfin.open_run(
+        _identity(),
+        agent=definition,
+        input=_input(),
+    )
+
+    assert [item.kind for item in session.observations] == [
+        "run.started",
+        "run.input",
+    ]
+    assert graph.options is None
+    await stream.aclose()
+    assert [item.kind for item in session.observations[-2:]] == [
+        "run.terminal",
+        "run.closed",
+    ]
+    terminal = session.observations[-2]
+    assert isinstance(terminal, RunTerminalObservation)
+    assert terminal.outcome == "cancelled"
+    assert session.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_open_agui_run_is_observable_before_its_first_public_event() -> None:
+    graph = _FixtureGraph()
+    profile = _FixtureRuntimeProfile(graph)
+    session = _Session()
+    tinkerfin = TinkerFin(runtime_profile=profile).observe(_Observer(session))
+    definition = tinkerfin.create_deep_agent(model="provider:model", tools=[])
+
+    stream = await tinkerfin.open_agui_run(
+        _identity(),
+        agent=definition,
+        input=_input(),
+    )
+
+    assert [item.kind for item in session.observations] == [
+        "run.started",
+        "run.input",
+    ]
+    assert graph.options is None
+    await stream.aclose()
+    assert [item.kind for item in session.observations[-2:]] == [
+        "run.terminal",
+        "run.closed",
+    ]
+    terminal = session.observations[-2]
+    assert isinstance(terminal, RunTerminalObservation)
+    assert terminal.outcome == "cancelled"
+    assert session.closed == 1
 
 
 async def test_profile_maps_a_non_v2_source_once_for_observer_and_agui() -> None:

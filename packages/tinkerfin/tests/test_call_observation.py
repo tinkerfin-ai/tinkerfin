@@ -6,7 +6,7 @@ import asyncio
 import gc
 import weakref
 from collections.abc import Awaitable, Callable, Sequence
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 import pytest
@@ -20,14 +20,23 @@ from langchain_core.language_models.fake_chat_models import (
     FakeListChatModel,
     FakeMessagesListChatModel,
 )
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from langchain_core.outputs import LLMResult
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+)
+from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, LLMResult
 from langchain_core.runnables import Runnable
 from langchain_core.tools import BaseTool
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import Command
 
 from tinkerfin import (
+    DeepAgentsRuntimeProfile,
+    DeepAgentsV2RuntimeProfile,
+    DeepAgentsV3RuntimeProfile,
     RunIdentity,
     TinkerFin,
     trace_contribution,
@@ -37,6 +46,7 @@ from tinkerfin_contracts import (
     AgentStepObservation,
     ContextContributionObservation,
     ModelCallObservation,
+    NativeMessageObservation,
     ObservationBoundary,
     RunObservationSession,
     RunSourceContext,
@@ -217,6 +227,17 @@ async def test_model_call_records_final_request_and_first_output_before_native()
         ("system", "final-system", None),
         ("human", "final-user", "final-user-id"),
     )
+    first_output_id = model_calls[1].output_message_ids
+    completed_ids = model_calls[2].output_message_ids
+    assert len(first_output_id) == 1
+    assert first_output_id == completed_ids
+    native_assistant_ids = {
+        observation.message.id
+        for observation in session.observations
+        if observation.kind == "native.message"
+        and observation.message.message_type in {"assistant", "assistant_chunk"}
+    }
+    assert native_assistant_ids == set(completed_ids)
     first_model_index = session.observations.index(model_calls[0])
     first_native_index = next(
         index
@@ -242,6 +263,201 @@ async def test_model_call_records_final_request_and_first_output_before_native()
     started_calls = sum(step.phase == "started" for step in steps) + 1
     assert session.boundaries.count(ObservationBoundary.CALL_STARTED) == started_calls
     assert ObservationBoundary.TERMINAL in session.boundaries
+
+
+@pytest.mark.asyncio
+async def test_managed_ainvoke_records_the_same_runtime_observations() -> None:
+    """Managed invoke keeps tracing while returning only the final root state."""
+
+    session = _Session()
+    tinkerfin = TinkerFin().observe(_Observer(session))
+    definition = tinkerfin.create_deep_agent(
+        model=_StreamingModel(responses=["done"]),
+        tools=[],
+    )
+
+    state = await tinkerfin.ainvoke(
+        _identity("run-managed-invoke"),
+        agent=definition,
+        input={"messages": [HumanMessage(content="invoke", id="invoke-user")]},
+    )
+
+    messages = cast(Sequence[BaseMessage], state["messages"])
+    assert messages[-1].content == "done"
+    assert [
+        observation.phase
+        for observation in session.observations
+        if isinstance(observation, ModelCallObservation)
+    ] == ["started", "first_output", "completed"]
+    assert session.observations[0].kind == "run.started"
+    assert session.observations[-1].kind == "run.closed"
+
+
+@pytest.mark.asyncio
+async def test_v3_managed_ainvoke_preserves_model_and_native_message_identity() -> None:
+    """The explicit v3 source feeds the same protocol-neutral observation boundary."""
+
+    session = _Session()
+    tinkerfin = TinkerFin(
+        runtime_profile=DeepAgentsV3RuntimeProfile(),
+    ).observe(_Observer(session))
+    definition = tinkerfin.create_deep_agent(
+        model=_StreamingModel(responses=["done"]),
+        tools=[],
+    )
+
+    state = await tinkerfin.ainvoke(
+        _identity("run-managed-v3"),
+        agent=definition,
+        input={"messages": [HumanMessage(content="invoke", id="invoke-user-v3")]},
+    )
+
+    messages = cast(Sequence[BaseMessage], state["messages"])
+    assert messages[-1].text == "done"
+    model_calls = [
+        observation
+        for observation in session.observations
+        if isinstance(observation, ModelCallObservation)
+    ]
+    assert [observation.phase for observation in model_calls] == [
+        "started",
+        "first_output",
+        "completed",
+    ]
+    native_assistant_ids = {
+        observation.message.id
+        for observation in session.observations
+        if observation.kind == "native.message"
+        and observation.message.message_type in {"assistant", "assistant_chunk"}
+    }
+    assert native_assistant_ids == set(model_calls[-1].output_message_ids)
+    assert {observation.kind for observation in session.observations}.issuperset(
+        {"native.message", "native.state", "native.task"}
+    )
+
+
+@pytest.mark.asyncio
+async def test_v3_restores_the_stable_tool_message_from_state() -> None:
+    """The v3 messages projection omission must not remove Tool results."""
+
+    @tool
+    async def echo(value: str) -> str:
+        """Return one value.
+
+        Args:
+            value: Value to return.
+
+        Returns:
+            The supplied value.
+        """
+
+        return value
+
+    session = _Session()
+    tinkerfin = TinkerFin(
+        runtime_profile=DeepAgentsV3RuntimeProfile(),
+    ).observe(_Observer(session))
+    definition = tinkerfin.create_deep_agent(
+        model=_MessageModel(
+            responses=[
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "echo",
+                            "args": {"value": "kept"},
+                            "id": "call-v3-tool",
+                            "type": "tool_call",
+                        }
+                    ],
+                ),
+                AIMessage(content="done"),
+            ]
+        ),
+        tools=[echo],
+    )
+
+    await tinkerfin.ainvoke(
+        _identity("run-v3-tool"),
+        agent=definition,
+        input={"messages": [HumanMessage(content="use the Tool")]},
+    )
+
+    tool_messages = [
+        observation.message
+        for observation in session.observations
+        if isinstance(observation, NativeMessageObservation)
+        and observation.message.message_type == "tool"
+    ]
+    assert len(tool_messages) == 1
+    assert tool_messages[0].id is not None
+    assert tool_messages[0].tool_call_id == "call-v3-tool"
+    assert tool_messages[0].content == "kept"
+
+
+@pytest.mark.asyncio
+async def test_v3_preserves_subagent_namespaces_and_model_calls() -> None:
+    """Nested work remains visible after v3 events enter the Native boundary."""
+
+    session = _Session()
+    tinkerfin = TinkerFin(
+        runtime_profile=DeepAgentsV3RuntimeProfile(),
+    ).observe(_Observer(session))
+    definition = tinkerfin.create_deep_agent(
+        model=_MessageModel(
+            responses=[
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "task",
+                            "args": {
+                                "description": "Complete the delegated work",
+                                "subagent_type": "researcher",
+                            },
+                            "id": "call-v3-subagent",
+                            "type": "tool_call",
+                        }
+                    ],
+                ),
+                AIMessage(content="root done"),
+            ]
+        ),
+        tools=[],
+        subagents=[
+            {
+                "name": "researcher",
+                "description": "Complete delegated work",
+                "system_prompt": "Return the result.",
+                "model": _MessageModel(responses=[AIMessage(content="child done")]),
+                "tools": [],
+            }
+        ],
+    )
+
+    await tinkerfin.ainvoke(
+        _identity("run-v3-subagent"),
+        agent=definition,
+        input={"messages": [HumanMessage(content="delegate")]},
+    )
+
+    assert any(
+        observation.kind == "native.task" and observation.namespace
+        for observation in session.observations
+    )
+    assert any(
+        isinstance(observation, ModelCallObservation)
+        and observation.agent_name == "researcher"
+        and observation.namespace
+        for observation in session.observations
+    )
+    assert any(
+        isinstance(observation, NativeMessageObservation)
+        and observation.namespace
+        and observation.message.message_type == "assistant"
+        and observation.message.content == "child done"
+        for observation in session.observations
+    )
 
 
 @pytest.mark.asyncio
@@ -314,9 +530,128 @@ async def test_provider_parent_uses_the_matching_graph_task_when_raw_parent_is_u
 
 
 @pytest.mark.asyncio
-async def test_before_model_failure_is_owned_by_the_middleware_step() -> None:
+async def test_nested_chain_does_not_reuse_the_outer_native_task_identity() -> None:
     session = _Session()
-    tinkerfin = TinkerFin().observe(_Observer(session))
+    context = RunSourceContext(
+        identity=_identity("run-nested-task-callback"),
+        runtime_profile="deepagents-v2",
+        input_kind="ordinary",
+        input={"messages": [{"role": "user", "content": "plan"}]},
+        config={},
+    )
+    hub = RuntimeObservationHub(context=context, observers=(_Observer(session),))
+    await hub.start()
+    handler = hub.call_handler
+    root_run_id = uuid4()
+    task_run_id = uuid4()
+    nested_run_id = uuid4()
+    metadata = {
+        "langgraph_checkpoint_ns": "create_plan:native-task-1",
+        "langgraph_node": "create_plan",
+    }
+
+    await handler.on_chain_start(
+        {}, {}, run_id=root_run_id, name="tinkerfin_planning_workflow"
+    )
+    await handler.on_chain_start(
+        {},
+        {},
+        run_id=task_run_id,
+        parent_run_id=root_run_id,
+        name="create_plan",
+        metadata=metadata,
+    )
+    await handler.on_chain_start(
+        {},
+        {},
+        run_id=nested_run_id,
+        parent_run_id=task_run_id,
+        name="model",
+        metadata=metadata,
+    )
+    await handler.on_chain_end({}, run_id=nested_run_id)
+    await handler.on_chain_end({}, run_id=task_run_id)
+    await handler.on_chain_end({}, run_id=root_run_id)
+    await hub.terminal("succeeded")
+    await hub.close()
+
+    starts = {
+        observation.name: observation
+        for observation in session.observations
+        if isinstance(observation, AgentStepObservation)
+        and observation.phase == "started"
+    }
+    outer = starts["create_plan"]
+    nested = starts["model"]
+    assert starts["tinkerfin_planning_workflow"].step_kind == "agent"
+    assert outer.task_id == "native-task-1"
+    assert nested.task_id is None
+    assert nested.parent_call_id == outer.call_id
+
+
+@pytest.mark.asyncio
+async def test_model_output_ids_complete_when_the_first_chunk_has_no_identity() -> None:
+    """Completion retains stable output IDs without guessing from chunk order."""
+
+    session = _Session()
+    context = RunSourceContext(
+        identity=_identity("run-late-output-id"),
+        runtime_profile="deepagents-v2",
+        input_kind="ordinary",
+        input={"messages": [{"role": "user", "content": "hello"}]},
+        config={},
+    )
+    hub = RuntimeObservationHub(context=context, observers=(_Observer(session),))
+    await hub.start()
+    handler = hub.call_handler
+    provider_run_id = uuid4()
+    await handler.on_chat_model_start(
+        {},
+        [[HumanMessage(content="hello")]],
+        run_id=provider_run_id,
+    )
+    await handler.on_llm_new_token(
+        "a",
+        chunk=ChatGenerationChunk(message=AIMessageChunk(content="a")),
+        run_id=provider_run_id,
+    )
+    await handler.on_llm_end(
+        LLMResult(
+            generations=[
+                [
+                    ChatGeneration(message=AIMessage(content="first", id="output-1")),
+                    ChatGeneration(message=AIMessage(content="second", id="output-2")),
+                ],
+                [ChatGeneration(message=AIMessage(content="repeat", id="output-1"))],
+            ]
+        ),
+        run_id=provider_run_id,
+    )
+    await hub.terminal("succeeded")
+    await hub.close()
+
+    model_calls = [
+        observation
+        for observation in session.observations
+        if isinstance(observation, ModelCallObservation)
+    ]
+    assert model_calls[1].phase == "first_output"
+    assert model_calls[1].output_message_ids == ()
+    assert model_calls[2].phase == "completed"
+    assert model_calls[2].output_message_ids == ("output-1", "output-2")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "runtime_profile",
+    [DeepAgentsV2RuntimeProfile(), DeepAgentsV3RuntimeProfile()],
+    ids=["v2-astream", "v3-astream-events"],
+)
+async def test_before_model_failure_is_owned_by_the_middleware_step(
+    runtime_profile: DeepAgentsRuntimeProfile,
+) -> None:
+    session = _Session()
+    tinkerfin = TinkerFin(runtime_profile=runtime_profile).observe(_Observer(session))
     definition = tinkerfin.create_deep_agent(
         model=_StreamingModel(responses=["unused"]),
         tools=[],
@@ -422,7 +757,14 @@ async def test_tool_execution_records_the_actual_input_and_result() -> None:
 
 
 @pytest.mark.asyncio
-async def test_runtime_cancellation_closes_an_unmatched_tool_execution() -> None:
+@pytest.mark.parametrize(
+    "runtime_profile",
+    [DeepAgentsV2RuntimeProfile(), DeepAgentsV3RuntimeProfile()],
+    ids=["v2-astream", "v3-astream-events"],
+)
+async def test_runtime_cancellation_closes_an_unmatched_tool_execution(
+    runtime_profile: DeepAgentsRuntimeProfile,
+) -> None:
     """Run settlement supplies the terminal callback that BaseTool omits."""
 
     entered = asyncio.Event()
@@ -456,7 +798,7 @@ async def test_runtime_cancellation_closes_an_unmatched_tool_execution() -> None
         ]
     )
     session = _Session()
-    tinkerfin = TinkerFin().observe(_Observer(session))
+    tinkerfin = TinkerFin(runtime_profile=runtime_profile).observe(_Observer(session))
     definition = tinkerfin.create_deep_agent(model=model, tools=[wait_until_cancelled])
     stream = await tinkerfin.open_run(
         _identity("run-cancel"),
@@ -567,7 +909,14 @@ async def test_middleware_description_never_changes_original_execution() -> None
 
 
 @pytest.mark.asyncio
-async def test_rejected_tool_review_never_records_an_execution() -> None:
+@pytest.mark.parametrize(
+    "runtime_profile",
+    [DeepAgentsV2RuntimeProfile(), DeepAgentsV3RuntimeProfile()],
+    ids=["v2-astream", "v3-astream-events"],
+)
+async def test_rejected_tool_review_never_records_an_execution(
+    runtime_profile: DeepAgentsRuntimeProfile,
+) -> None:
     @tool
     async def protected_action(value: str) -> str:
         """Return one reviewed value.
@@ -598,7 +947,10 @@ async def test_rejected_tool_review_never_records_an_execution() -> None:
         ]
     )
     session = _Session()
-    tinkerfin = TinkerFin(checkpointer=MemorySaver()).observe(_Observer(session))
+    tinkerfin = TinkerFin(
+        checkpointer=MemorySaver(),
+        runtime_profile=runtime_profile,
+    ).observe(_Observer(session))
     definition = tinkerfin.create_deep_agent(
         model=model,
         tools=[protected_action],
@@ -649,7 +1001,14 @@ async def test_rejected_tool_review_never_records_an_execution() -> None:
 
 
 @pytest.mark.asyncio
-async def test_edited_tool_review_records_only_the_actual_input() -> None:
+@pytest.mark.parametrize(
+    "runtime_profile",
+    [DeepAgentsV2RuntimeProfile(), DeepAgentsV3RuntimeProfile()],
+    ids=["v2-astream", "v3-astream-events"],
+)
+async def test_edited_tool_review_records_only_the_actual_input(
+    runtime_profile: DeepAgentsRuntimeProfile,
+) -> None:
     @tool
     async def add_reviewed(a: int, b: int) -> str:
         """Add reviewed values.
@@ -681,7 +1040,10 @@ async def test_edited_tool_review_records_only_the_actual_input() -> None:
         ]
     )
     session = _Session()
-    tinkerfin = TinkerFin(checkpointer=MemorySaver()).observe(_Observer(session))
+    tinkerfin = TinkerFin(
+        checkpointer=MemorySaver(),
+        runtime_profile=runtime_profile,
+    ).observe(_Observer(session))
     definition = tinkerfin.create_deep_agent(
         model=model,
         tools=[add_reviewed],

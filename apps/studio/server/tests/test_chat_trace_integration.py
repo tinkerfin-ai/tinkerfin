@@ -36,8 +36,6 @@ def _model(model_id: str = "model-main") -> AgentModelConfig:
         base_url="https://example.invalid/v1",
         api_key=SecretStr("secret"),
         reasoning_enabled=False,
-        runtime_profile="deepagents-v2",
-        updated_at="2026-08-28T00:00:00",
     )
 
 
@@ -94,7 +92,7 @@ def _resume_request(
     )
 
 
-async def test_run_registration_persists_model_and_runtime_profile(session) -> None:
+async def test_run_registration_persists_model_and_input(session) -> None:
     request = _ordinary_request()
     intent = classify_intent(request)
     assert isinstance(intent, StartChatIntent)
@@ -121,8 +119,20 @@ async def test_run_registration_persists_model_and_runtime_profile(session) -> N
     )
     assert registration is not None
     assert registration.model_id == "model-main"
-    assert registration.runtime_profile == "deepagents-v2"
     assert registration.input_json == prepared.input_json
+    assert execution.thread.last_run_id is None
+    assert execution.thread.status == "idle"
+
+    await preparer.activate_started(
+        thread_pk=execution.thread.id,
+        identity_run_id=request.run_id,
+        registered=execution.registered,
+    )
+
+    assert execution.thread.last_run_id == request.run_id
+    assert execution.thread.last_model == "model-main"
+    assert execution.thread.status == "running"
+    assert registration.status == "starting"
 
 
 async def test_resume_registration_stores_only_claim_identity(session) -> None:
@@ -138,9 +148,7 @@ async def test_resume_registration_stores_only_claim_identity(session) -> None:
         run_id="run-interrupted",
         parent_run_id=None,
         model_id="model-main",
-        runtime_profile="deepagents-v2",
         input_json={"runId": "run-interrupted"},
-        config_json={"runtimeProfile": "deepagents-v2"},
     )
     thread.last_run_id = "run-interrupted"
     thread.status = "waiting_approval"
@@ -192,9 +200,7 @@ async def test_continuation_rejects_a_model_different_from_the_source_run(
         run_id="run-source",
         parent_run_id=None,
         model_id="model-main",
-        runtime_profile="deepagents-v2",
         input_json={"runId": "run-source"},
-        config_json={"runtimeProfile": "deepagents-v2"},
     )
     thread.last_run_id = "run-source"
     if continuation == "resume":
@@ -240,8 +246,8 @@ async def test_continuation_rejects_a_model_different_from_the_source_run(
     )
 
 
-async def test_same_run_rejects_a_changed_registered_runtime_profile(session) -> None:
-    request = _ordinary_request(run_id="run-profile")
+async def test_same_run_rejects_a_changed_registered_model(session) -> None:
+    request = _ordinary_request(run_id="run-model")
     intent = classify_intent(request)
     assert isinstance(intent, StartChatIntent)
     preparer = ConversationRunPreparer(session, user_id=1)
@@ -264,7 +270,7 @@ async def test_same_run_rejects_a_changed_registered_runtime_profile(session) ->
         run_id=request.run_id,
     )
     assert registration is not None
-    registration.runtime_profile = "unavailable-profile"
+    registration.model_id = "model-other"
     await repository.commit()
 
     with pytest.raises(BusinessException) as captured:
@@ -289,13 +295,13 @@ class _Channel:
         _source,
         *,
         after: int | None = None,
-        on_source_starting=None,
+        on_source_ready=None,
         on_delivery_not_started=None,
     ):
         del on_delivery_not_started
         self.after = after
-        if on_source_starting is not None:
-            await on_source_starting()
+        if on_source_ready is not None:
+            await on_source_ready()
 
         self.body = _Body(close_error=self._close_error)
         return self.body
@@ -357,7 +363,6 @@ async def test_chat_service_uses_messaging_only_for_delivery(
             model_name="deepseek-chat",
             base_url="https://example.invalid/v1",
             api_key=SecretStr("secret"),
-            runtime_profile="deepagents-v2",
             enabled=True,
             is_default=True,
         )
@@ -370,7 +375,7 @@ async def test_chat_service_uses_messaging_only_for_delivery(
             database=database,
             agent_persistence=object(),
             sandbox_manager=object(),
-            tinkerfin_profiles={"deepagents-v2": TinkerFin()},
+            tinkerfin=TinkerFin(),
             settings=SimpleNamespace(tavily_api_key=None),
             conversation_channel=channel,
             conversation_trace=trace,
@@ -393,6 +398,11 @@ async def test_chat_service_uses_messaging_only_for_delivery(
     assert channel.after is None
     assert len(trace.ensured) == 1
     assert trace.ensured[0].run_id == "run-1"
+    repository = ConversationRepository(session)
+    thread = await repository.get_thread(user_id=1, thread_id=prepared.thread_id)
+    assert thread is not None
+    assert thread.last_run_id == "run-1"
+    assert thread.status == "running"
     assert [chunk async for chunk in prepared.body] == []
 
 
@@ -424,7 +434,6 @@ async def test_chat_service_closes_sse_body_when_trace_follow_cannot_start(
             model_name="deepseek-chat",
             base_url="https://example.invalid/v1",
             api_key=SecretStr("secret"),
-            runtime_profile="deepagents-v2",
             enabled=True,
             is_default=True,
         )
@@ -437,7 +446,7 @@ async def test_chat_service_closes_sse_body_when_trace_follow_cannot_start(
             database=database,
             agent_persistence=object(),
             sandbox_manager=object(),
-            tinkerfin_profiles={"deepagents-v2": TinkerFin()},
+            tinkerfin=TinkerFin(),
             settings=SimpleNamespace(tavily_api_key=None),
             conversation_channel=channel,
             conversation_trace=trace,
@@ -483,7 +492,6 @@ async def test_previous_head_reconcile_releases_the_request_transaction(
             model_name="deepseek-chat",
             base_url="https://example.invalid/v1",
             api_key=SecretStr("secret"),
-            runtime_profile="deepagents-v2",
             enabled=True,
             is_default=True,
         )
@@ -500,9 +508,7 @@ async def test_previous_head_reconcile_releases_the_request_transaction(
         run_id="run-previous",
         parent_run_id=None,
         model_id="model-main",
-        runtime_profile="deepagents-v2",
         input_json={"runId": "run-previous"},
-        config_json={"runtimeProfile": "deepagents-v2"},
     )
     previous.status = "succeeded"
     thread.last_run_id = previous.run_id
@@ -516,7 +522,7 @@ async def test_previous_head_reconcile_releases_the_request_transaction(
             database=database,
             agent_persistence=object(),
             sandbox_manager=object(),
-            tinkerfin_profiles={"deepagents-v2": TinkerFin()},
+            tinkerfin=TinkerFin(),
             settings=SimpleNamespace(tavily_api_key=None),
             conversation_channel=channel,
             conversation_trace=trace,

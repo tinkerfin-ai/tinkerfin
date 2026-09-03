@@ -4,9 +4,10 @@ import { resolve } from 'node:path'
 import type {
   ConversationHistoryDetail,
   TraceMessage,
-  TraceNode,
 } from '../../src/api/conversation/history'
+import type { TraceGraphNode } from '../../src/api/conversation/traceGraph'
 import type { TaskTraceSnapshot, TodoGroup } from '../../src/api/conversation/taskTrace'
+import { traceGraphNode, traceGraphWithNodes } from '../../src/test/traceFixtures'
 
 declare global {
   interface Window {
@@ -66,7 +67,7 @@ const makeGroups = (
 
 const traceEntities = (groups: readonly TodoGroup[]) => {
   const messages: TraceMessage[] = []
-  const nodes: TraceNode[] = []
+  const nodes: TraceGraphNode[] = []
   for (const [position, group] of [...groups].reverse().entries()) {
     const sequence = (position * 2) + 1
     messages.push({
@@ -82,23 +83,21 @@ const traceEntities = (groups: readonly TodoGroup[]) => {
       createdAt: group.createdAt,
       completedAt: group.createdAt,
     })
-    nodes.push({
+    nodes.push(traceGraphNode({
       id: group.groupToolCallId,
-      traceSeq: sequence + 1,
-      parentId: null,
-      kind: 'tool',
-      label: 'write_todos',
+      startedSeq: sequence + 1,
+      updatedSeq: sequence + 1,
+      name: 'write_todos',
       runId: group.id.slice('todo-group:'.length),
-      namespace: [],
       sourceId: group.groupToolCallId,
-      input: null,
-      inputOmitted: true,
+      request: null,
+      requestOmitted: true,
       result: null,
       resultOmitted: true,
       status: group.status === 'running' ? 'running' : 'succeeded',
       startedAt: group.createdAt,
       completedAt: group.status === 'running' ? null : group.createdAt,
-    })
+    }))
   }
   return { messages, nodes }
 }
@@ -123,7 +122,6 @@ const detail = ({
     threadId: THREAD_ID,
     title: '任务轨迹浏览器会话',
     lastModel: 'GPT-5.5',
-    runtimeProfile: 'deepagents-v2',
     pinned: false,
     asOfSeq: Math.max(1, (groups.length * 2) + 1),
     headRunId: RUN_ID,
@@ -133,7 +131,10 @@ const detail = ({
     toolCallCount: entities.nodes.length,
     messages: entities.messages,
     reasoning: [],
-    nodes: entities.nodes,
+    graph: traceGraphWithNodes(
+      entities.nodes,
+      Math.max(1, (groups.length * 2) + 1),
+    ),
     state: { root: {}, subgraphs: {} },
     interactions: [],
     status: {
@@ -192,7 +193,6 @@ async function mockTodoTraceStudio(page: Page, {
           modelId: 'GPT-5.5',
           displayName: 'GPT-5.5',
           reasoningEnabled: false,
-          runtimeProfile: 'deepagents-v2',
           isDefault: true,
         }],
         defaultModelId: 'GPT-5.5',
@@ -424,8 +424,8 @@ test('320px 深色高对比与 reduced-motion 下保持全宽和静态状态反�
   await expect(drawer.getByRole('heading', { name: '任务轨迹' })).toBeVisible()
   await expect(page.locator('.todo-trace-floating-launcher')).toHaveCount(0)
   const headerLayout = await page.evaluate(() => {
-    const header = document.querySelector<HTMLElement>('#todo-trace-drawer .todo-trace-drawer-head')
-    const headingBlock = document.querySelector<HTMLElement>('#todo-trace-drawer .todo-trace-drawer-heading')
+    const header = document.querySelector<HTMLElement>('#todo-trace-drawer .ui-drawer-header')
+    const headingBlock = document.querySelector<HTMLElement>('#todo-trace-drawer .ui-drawer-header__heading')
     const heading = document.querySelector<HTMLElement>('#todo-trace-drawer h2')
     const close = document.querySelector<HTMLElement>(
       '#todo-trace-drawer button[aria-label="关闭任务轨迹"]',
@@ -441,16 +441,12 @@ test('320px 深色高对比与 reduced-motion 下保持全宽和静态状态反�
       closeLeft: closeRect.left,
       closeCenterY: closeRect.top + (closeRect.height / 2),
       topGap: headingBlockRect.top - headerRect.top,
-      bottomGap: headerRect.bottom - headingBlockRect.bottom,
     }
   })
   expect(headerLayout).not.toBeNull()
   expect(headerLayout?.headingRight).toBeLessThanOrEqual(headerLayout?.closeLeft ?? 0)
   expect(Math.abs(
     (headerLayout?.headingCenterY ?? 0) - (headerLayout?.closeCenterY ?? 0),
-  )).toBeLessThanOrEqual(0.5)
-  expect(Math.abs(
-    (headerLayout?.topGap ?? 0) - (headerLayout?.bottomGap ?? 0),
   )).toBeLessThanOrEqual(0.5)
   expect(headerLayout?.topGap ?? 0).toBeGreaterThanOrEqual(8)
   const layout = await drawer.evaluate((element) => {

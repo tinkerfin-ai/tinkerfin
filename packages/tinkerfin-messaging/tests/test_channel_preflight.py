@@ -328,7 +328,7 @@ async def test_close_waits_for_preflight_not_the_callers_later_work() -> None:
     request_continued = asyncio.Event()
     release_request = asyncio.Event()
 
-    async def source_starting() -> None:
+    async def source_ready() -> None:
         callback_started.set()
         await release_callback.wait()
 
@@ -337,7 +337,7 @@ async def test_close_waits_for_preflight_not_the_callers_later_work() -> None:
             await channel.wrap(
                 source,
                 identity=_identity(),
-                on_source_starting=source_starting,
+                on_source_ready=source_ready,
             )
         request_continued.set()
         await release_request.wait()
@@ -356,13 +356,13 @@ async def test_close_waits_for_preflight_not_the_callers_later_work() -> None:
     await request_task
 
 
-async def test_source_starting_can_close_messaging_without_preflight_deadlock() -> None:
+async def test_source_ready_can_close_messaging_without_preflight_deadlock() -> None:
     messaging = Messaging()
     await messaging.__aenter__()
     channel = messaging.channel(name="events", codec=_TextCodec())
     source = _ControlledSource("unused")
 
-    async def source_starting() -> None:
+    async def source_ready() -> None:
         await messaging.aclose()
 
     with pytest.raises(MessagingClosed):
@@ -370,7 +370,7 @@ async def test_source_starting_can_close_messaging_without_preflight_deadlock() 
             channel.wrap(
                 source,
                 identity=_identity(),
-                on_source_starting=source_starting,
+                on_source_ready=source_ready,
             ),
             timeout=1,
         )
@@ -483,12 +483,12 @@ async def test_same_run_attaches_and_closes_the_unused_candidate_source(
     release = asyncio.Event()
     owner = _ControlledSource("first", release=release)
     candidate = _ControlledSource("must-not-run")
-    candidate_starting = 0
+    candidate_ready = 0
     candidate_not_started = 0
 
-    async def candidate_source_starting() -> None:
-        nonlocal candidate_starting
-        candidate_starting += 1
+    async def candidate_source_ready() -> None:
+        nonlocal candidate_ready
+        candidate_ready += 1
 
     async def candidate_delivery_not_started() -> None:
         nonlocal candidate_not_started
@@ -507,7 +507,7 @@ async def test_same_run_attaches_and_closes_the_unused_candidate_source(
             candidate,
             identity=_identity(),
             after=0,
-            on_source_starting=candidate_source_starting,
+            on_source_ready=candidate_source_ready,
             on_delivery_not_started=candidate_delivery_not_started,
         )
 
@@ -522,7 +522,7 @@ async def test_same_run_attaches_and_closes_the_unused_candidate_source(
     assert candidate.close_calls == 1
     assert not candidate.started.is_set()
     assert owner.close_calls == 1
-    assert candidate_starting == 0
+    assert candidate_ready == 0
     assert candidate_not_started == 0
 
 
@@ -541,8 +541,8 @@ async def test_owner_callbacks_run_after_source_preflight_and_before_production(
 
     source = _SourceWithPreflight("message")
 
-    async def source_starting() -> None:
-        order.append("host_starting")
+    async def source_ready() -> None:
+        order.append("host_ready")
 
     async def delivery_not_started() -> None:
         order.append("not_started")
@@ -555,24 +555,24 @@ async def test_owner_callbacks_run_after_source_preflight_and_before_production(
             source,
             identity=_identity(),
             after=0,
-            on_source_starting=source_starting,
+            on_source_ready=source_ready,
             on_delivery_not_started=delivery_not_started,
         )
         assert await _collect_data(subscription) == ["message"]
 
-    assert order[:2] == ["source_preflight", "host_starting"]
+    assert order[:2] == ["source_preflight", "host_ready"]
     assert order.count("source_pull") == 1
     assert "not_started" not in order
 
 
-async def test_source_starting_failure_settles_before_not_started_callback(
+async def test_source_ready_failure_retains_the_started_delivery(
     messaging_backend: MessagingBackend,
 ) -> None:
     source = _ControlledSource("must-not-run")
     order: list[str] = []
 
-    async def source_starting() -> None:
-        order.append("source_starting")
+    async def source_ready() -> None:
+        order.append("source_ready")
         raise RuntimeError("business activation failed")
 
     async def delivery_not_started() -> None:
@@ -585,11 +585,11 @@ async def test_source_starting_failure_settles_before_not_started_callback(
                 source,
                 identity=_identity(),
                 after=0,
-                on_source_starting=source_starting,
+                on_source_ready=source_ready,
                 on_delivery_not_started=delivery_not_started,
             )
 
-    assert order == ["source_starting", "not_started"]
+    assert order == ["source_ready"]
     assert source.close_calls == 1
     assert not source.started.is_set()
 

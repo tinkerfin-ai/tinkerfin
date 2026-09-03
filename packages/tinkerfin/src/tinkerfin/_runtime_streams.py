@@ -37,7 +37,7 @@ if TYPE_CHECKING:
 
 PartT = TypeVar("PartT")
 
-__all__ = ["_finish", "_finish_once", "_observe", "_start"]
+__all__ = ["_finish", "_finish_once", "_observe", "_start", "ready"]
 
 
 def _native_contract_error(
@@ -146,6 +146,9 @@ async def __anext__(self: _GraphRunStream[PartT]) -> PartT:
     cancellation settles the shared Runtime lifecycle before it propagates.
     """
 
+    if self._ready_error is not None and not self._ready_error_delivered:
+        self._ready_error_delivered = True
+        raise self._ready_error.with_traceback(self._ready_error.__traceback__)
     if self._closed:
         raise StopAsyncIteration
     current = cast(asyncio.Task[object] | None, asyncio.current_task())
@@ -197,6 +200,7 @@ async def aclose(self: _GraphRunStream[PartT]) -> None:
     part currently being observed. An external closer cancels an active pull.
     """
 
+    self._ready_error_delivered = True
     current = asyncio.current_task()
     active = self._active_task
     observer_lineage_active = (
@@ -387,6 +391,8 @@ async def _observe(self: _GraphRunStream[PartT], part: PartT) -> None:
 
 
 async def _start(self: _GraphRunStream[PartT]) -> None:
+    if self._started:
+        return
     coordination_factory = self._coordination_factory
     if coordination_factory is not None:
         try:
@@ -414,6 +420,17 @@ async def _start(self: _GraphRunStream[PartT]) -> None:
             self.error = error
         await self._finish(error, outcome=_error_outcome(error))
         raise
+
+
+async def ready(self: _GraphRunStream[PartT]) -> None:
+    """Establish the observable Run boundary while retaining ordinary setup errors."""
+
+    if self._started or self._closed:
+        return
+    try:
+        await self._start()
+    except Exception as error:  # noqa: BLE001 - first consumer receives setup failure
+        self._ready_error = error
 
 
 async def _finish(

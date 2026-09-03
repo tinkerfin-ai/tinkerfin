@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Literal, Never, TypeGuard
 
@@ -14,7 +13,6 @@ from ._identity import required_identifier, required_identity
 from .errors import (
     CodecMismatch,
     InvalidCursor,
-    MessagingQuotaExceeded,
     StreamDeleteConflict,
     StreamDeleted,
     StreamExpired,
@@ -71,71 +69,6 @@ def is_failed_run_status(status: object) -> TypeGuard[FailedRunStatus]:
     """Return whether a terminal state represents failed producer delivery."""
 
     return isinstance(status, str) and status in _FAILED_RUN_STATUSES
-
-
-@dataclass(frozen=True, slots=True)
-class _BackendRunHandle:
-    """Carry one framework-internal run, generation, and optional producer fence.
-
-    The ledger converts public ``MessagingRunReference`` values into exact positive
-    generations. A ``None`` generation exists only before an observer resolves the
-    current generation and never grants producer ownership.
-    """
-
-    channel: str
-    identity: RunIdentity
-    owner_token: str | None
-    fence: int | None
-    generation: int | None = None
-
-
-def _validate_append_input(
-    handle: _BackendRunHandle,
-    *,
-    message_id: str,
-    codec: str,
-    payload: bytes,
-    checkpoint: RecoveryCheckpoint | None,
-    limits: MessagingLimits,
-) -> None:
-    """Reject caller-controlled values before a backend can mutate state."""
-
-    if not isinstance(handle, _BackendRunHandle):
-        raise TypeError("handle must be an internal Messaging run handle")
-    required_identifier("channel", handle.channel)
-    required_identity(handle.identity)
-    required_identifier("message_id", message_id)
-    required_identifier("codec", codec)
-    if not isinstance(payload, bytes):
-        raise TypeError("payload must be bytes")
-    if checkpoint is not None and not isinstance(checkpoint, RecoveryCheckpoint):
-        raise TypeError("checkpoint must be a RecoveryCheckpoint or None")
-    if checkpoint is not None and checkpoint.last_message_id != message_id:
-        raise ValueError("checkpoint.last_message_id must match message_id")
-    if len(payload) > limits.max_message_payload_bytes:
-        raise MessagingQuotaExceeded(
-            resource="message_payload_bytes",
-            limit=limits.max_message_payload_bytes,
-        )
-    if (
-        checkpoint is not None
-        and len(checkpoint.position) > limits.max_checkpoint_bytes
-    ):
-        raise MessagingQuotaExceeded(
-            resource="checkpoint_bytes",
-            limit=limits.max_checkpoint_bytes,
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class _PreparedRun:
-    """Carry the ledger's internal validated cursor and ownership decision."""
-
-    handle: _BackendRunHandle
-    after: int
-    is_owner: bool
-    checkpoint: RecoveryCheckpoint | None = None
-    recovered: bool = False
 
 
 class _RunRecord:

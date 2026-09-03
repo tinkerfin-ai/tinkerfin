@@ -376,6 +376,26 @@ async def test_open_run_manages_a_prebuilt_definition() -> None:
 
 
 @pytest.mark.asyncio
+async def test_managed_ainvoke_closes_a_source_without_root_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A final-result caller must retain the managed stream's cleanup semantics."""
+
+    _, graphs = _install_builder(monkeypatch)
+    tinkerfin = TinkerFin()
+    agent = _definition(tinkerfin)
+
+    with pytest.raises(TinkerFinLifecycleError, match="without a root values"):
+        await tinkerfin.ainvoke(
+            _identity(),
+            agent=agent,
+            input=_graph_input(),
+        )
+
+    assert graphs[0].closed == 1
+
+
+@pytest.mark.asyncio
 async def test_open_run_resolves_an_async_agent_factory_once() -> None:
     tinkerfin = TinkerFin()
     created = 0

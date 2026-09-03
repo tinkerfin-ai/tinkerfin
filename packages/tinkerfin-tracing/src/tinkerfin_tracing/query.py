@@ -10,16 +10,33 @@ from typing import TypeVar, cast
 
 from pydantic import BaseModel, Field, JsonValue, ValidationError, model_validator
 
+from ._graph_projection import (
+    project_trace_graph_records,
+    reduce_trace_graph_records,
+)
 from ._models import TraceModel
 from .errors import (
     InvalidTraceCursor,
     TraceProjectionCheckpointConflict,
     TraceProjectionFailed,
+    TraceQuotaExceeded,
     TraceStoreProtocolError,
     TraceThreadNotFound,
 )
-from .facts import TraceEvent, TraceSemanticFact
-from .follow import TraceFollow, _close_trace_source, _trace_follow
+from .facts import CallTrackingFact, TraceEvent, TraceSemanticFact
+from .follow import TraceFollow, _close_trace_source, create_trace_follow
+from .graph import (
+    TraceGraph,
+    TraceGraphCompleteness,
+    TraceGraphFacets,
+    TraceGraphFilter,
+    TraceGraphNode,
+    TraceGraphNodeKind,
+    TraceGraphNodeStatus,
+    TraceGraphQueryLimits,
+    bound_graph,
+    graph_delta,
+)
 from .projection import (
     CoreProjection,
     CoreProjectionState,
@@ -29,10 +46,13 @@ from .projection import (
     empty_core_projection_state,
     finish_projection,
     project_core_checkpoint,
+    select_core_projection_window,
+    trace_graph_turns,
 )
 from .store import (
     StoreThreadSnapshot,
     StoreWriterSnapshot,
+    TraceGraphStore,
     TraceProjectionCheckpoint,
     TraceStore,
     TraceThreadKey,
@@ -47,7 +67,6 @@ from .views import (
     TraceState,
     TraceStatus,
     TraceSummary,
-    TraceTree,
     TraceUpdate,
 )
 
@@ -91,6 +110,8 @@ class TraceThread:
         snapshot: StoreThreadSnapshot,
         core_state: CoreProjectionState,
         core: CoreProjection,
+        graph: TraceGraph,
+        graph_query_limits: TraceGraphQueryLimits,
         turn_limit: int,
         head_requested: str | None,
         projections: Mapping[str, RegisteredTraceProjection],
@@ -108,6 +129,8 @@ class TraceThread:
             snapshot: Exact generation and fixed global as-of boundary.
             core_state: Incremental framework Projection state at that boundary.
             core: Materialized selected-head view for the initial Turn window.
+            graph: Canonical Graph for the same fixed prefix and Turn window.
+            graph_query_limits: Bounds applied to history Graph materialization.
             turn_limit: Number of latest Turns currently visible.
             head_requested: Optional explicit head retained for follow projection.
             projections: Registered business Projection implementations.
@@ -119,6 +142,8 @@ class TraceThread:
         self._snapshot = snapshot
         self._core_state = core_state
         self._core = core
+        self._graph = graph
+        self._graph_query_limits = graph_query_limits
         self._turn_limit = turn_limit
         self._head_requested = head_requested
         self._projection_registry = projections
@@ -167,11 +192,11 @@ class TraceThread:
         return tuple(item.model_copy(deep=True) for item in self._core.reasoning)
 
     @property
-    def tree(self) -> TraceTree:
-        """Return the flat execution tree in the loaded Turn window."""
+    def graph(self) -> TraceGraph:
+        """Return the canonical execution Graph in the loaded Turn window."""
 
         self._ensure_live()
-        return self._core.tree.model_copy(deep=True)
+        return self._graph.model_copy(deep=True)
 
     @property
     def state(self) -> TraceState:
@@ -288,8 +313,18 @@ class TraceThread:
             turn_limit=next_limit,
             active_run_ids=self._snapshot.active_run_ids,
         )
+        next_graph = await _materialize_history_graph(
+            self._store,
+            key=self.key,
+            as_of_seq=self.as_of_seq,
+            core_state=self._core_state,
+            core=next_core,
+            turn_limit=next_limit,
+            limits=self._graph_query_limits,
+        )
         self._turn_limit = next_limit
         self._core = next_core
+        self._graph = next_graph
         return self
 
     async def events(
@@ -386,6 +421,7 @@ class TraceThread:
             self._ensure_live()
             core_state = self._core_state
             previous = self._core
+            previous_graph = self._graph
             batches = self._store.follow(self.key, after_seq=self.as_of_seq)
             primary_error: BaseException | None = None
             try:
@@ -415,6 +451,15 @@ class TraceThread:
                     if not selected_batch:
                         previous = current
                         continue
+                    current_graph = await _materialize_history_graph(
+                        self._store,
+                        key=self.key,
+                        as_of_seq=core_state.as_of_seq,
+                        core_state=core_state,
+                        core=current,
+                        turn_limit=self._turn_limit,
+                        limits=self._graph_query_limits,
+                    )
                     projection_results = await _projection_results(
                         self._projection_registry,
                         self._projection_names,
@@ -434,7 +479,11 @@ class TraceThread:
                             previous.reasoning,
                             current.reasoning,
                         ),
-                        nodes=_entity_delta(previous.tree.nodes, current.tree.nodes),
+                        graph=graph_delta(
+                            previous_graph,
+                            current_graph,
+                            max_bytes=self._graph_query_limits.max_page_bytes,
+                        ),
                         interactions=_entity_delta(
                             previous.interactions,
                             current.interactions,
@@ -447,6 +496,7 @@ class TraceThread:
                         },
                     )
                     previous = current
+                    previous_graph = current_graph
                     yield update.model_copy(deep=True)
             except BaseException as error:
                 primary_error = error
@@ -457,7 +507,7 @@ class TraceThread:
                     primary_error=primary_error,
                 )
 
-        return _trace_follow(updates)
+        return create_trace_follow(updates)
 
     async def delete(self) -> None:
         """Delete this exact inactive generation and invalidate the handle.
@@ -523,6 +573,7 @@ async def build_trace_thread(
     snapshot: StoreThreadSnapshot,
     head_run_id: str | None,
     limit: int,
+    graph_query_limits: TraceGraphQueryLimits,
     projections: Mapping[str, RegisteredTraceProjection],
     projection_names: tuple[str, ...],
 ) -> TraceThread:
@@ -543,11 +594,22 @@ async def build_trace_thread(
         turn_limit=limit,
         active_run_ids=snapshot.active_run_ids,
     )
+    graph = await _materialize_history_graph(
+        store,
+        key=snapshot.key,
+        as_of_seq=snapshot.as_of_seq,
+        core_state=core_state,
+        core=core,
+        turn_limit=limit,
+        limits=graph_query_limits,
+    )
     return TraceThread(
         store=store,
         snapshot=snapshot,
         core_state=core_state,
         core=core,
+        graph=graph,
+        graph_query_limits=graph_query_limits,
         turn_limit=limit,
         head_requested=head_run_id,
         projections=projections,
@@ -746,6 +808,150 @@ async def _read_events_for_runs(
             event for event in batch if event.fact.identity.run_id in run_ids
         )
     return tuple(selected)
+
+
+async def _materialize_history_graph(
+    store: TraceStore,
+    *,
+    key: TraceThreadKey,
+    as_of_seq: int,
+    core_state: CoreProjectionState,
+    core: CoreProjection,
+    turn_limit: int,
+    limits: TraceGraphQueryLimits,
+) -> TraceGraph:
+    """Build one fixed-prefix Graph without persisting a second Graph copy."""
+
+    window = select_core_projection_window(
+        core_state,
+        head_run_id=core.selected_head,
+        turn_limit=turn_limit,
+    )
+    where = TraceGraphFilter(
+        include_technical_nodes=True,
+        include_ancestor_nodes=True,
+    )
+    records = None
+    facets: TraceGraphFacets | None = None
+    call_tracking_present = False
+    if isinstance(store, TraceGraphStore):
+        current = await store.query_trace_graph(
+            key,
+            run_ids=tuple(sorted(window.visible_run_ids)),
+            where=where,
+            limit=limits.max_direct_nodes,
+            max_nodes=limits.max_total_nodes,
+        )
+        if current.as_of_seq == as_of_seq:
+            if current.has_more:
+                raise TraceQuotaExceeded(
+                    "Trace history Graph exceeds max_direct_nodes",
+                    context={"resource": "graph_direct_nodes"},
+                )
+            records = current.nodes
+            facets = current.facets
+            call_tracking_present = current.call_tracking_present
+    if records is None:
+        events = await _read_events_for_runs(
+            store,
+            key,
+            run_ids=window.visible_run_ids,
+            after_seq=0,
+            as_of_seq=as_of_seq,
+        )
+        records = reduce_trace_graph_records(
+            events,
+            run_ids=window.visible_run_ids,
+        )
+        if len(records) > limits.max_direct_nodes:
+            raise TraceQuotaExceeded(
+                "Trace history Graph exceeds max_direct_nodes",
+                context={"resource": "graph_direct_nodes"},
+            )
+        tracked_runs = {
+            event.fact.identity.run_id
+            for event in events
+            if isinstance(event.fact, CallTrackingFact)
+        }
+        call_tracking_present = (
+            bool(window.visible_run_ids) and window.visible_run_ids <= tracked_runs
+        )
+    selected_turn_ids = {
+        window.run_turns[record.run_id]
+        for record in records
+        if record.run_id in window.run_turns
+    }
+    turns = trace_graph_turns(
+        core_state,
+        window,
+        selected_turn_ids=selected_turn_ids,
+    )
+    nodes, ordered_ids, roots = project_trace_graph_records(
+        records,
+        turns=turns,
+        run_turns=window.run_turns,
+        include_technical_nodes=True,
+        include_ancestor_nodes=True,
+    )
+    if facets is None:
+        facets = _unfiltered_graph_facets(nodes)
+    relationship_missing = any(node.link_issues for node in nodes)
+    details_omitted = any(
+        node.content_omitted or node.request_omitted or node.result_omitted
+        for node in nodes
+    )
+    return bound_graph(
+        TraceGraph(
+            turns=turns,
+            nodes=nodes,
+            ordered_node_ids=ordered_ids,
+            root_node_ids=roots,
+            as_of_seq=as_of_seq,
+            facets=facets,
+            completeness=TraceGraphCompleteness(
+                call_tracking_missing=not call_tracking_present,
+                relationship_evidence_missing=relationship_missing,
+                details_omitted=details_omitted,
+            ),
+        ),
+        max_bytes=limits.max_page_bytes,
+    )
+
+
+def _unfiltered_graph_facets(
+    nodes: tuple[TraceGraphNode, ...],
+) -> TraceGraphFacets:
+    """Count the complete unfiltered history Graph dimensions."""
+
+    kinds: dict[TraceGraphNodeKind, int] = {}
+    statuses: dict[TraceGraphNodeStatus, int] = {}
+    agents: dict[str, int] = {}
+    middleware: dict[str, int] = {}
+    skills: dict[str, int] = {}
+    providers: dict[str, int] = {}
+    models: dict[str, int] = {}
+    for node in nodes:
+        kinds[node.kind] = kinds.get(node.kind, 0) + 1
+        statuses[node.status] = statuses.get(node.status, 0) + 1
+        if node.agent_name is not None:
+            agents[node.agent_name] = agents.get(node.agent_name, 0) + 1
+        if node.kind is TraceGraphNodeKind.MIDDLEWARE:
+            middleware[node.name] = middleware.get(node.name, 0) + 1
+        if node.kind is TraceGraphNodeKind.SKILL:
+            skills[node.name] = skills.get(node.name, 0) + 1
+        if node.provider is not None:
+            providers[node.provider] = providers.get(node.provider, 0) + 1
+        if node.model is not None:
+            models[node.model] = models.get(node.model, 0) + 1
+    return TraceGraphFacets(
+        kinds=kinds,
+        statuses=statuses,
+        agents=agents,
+        middleware=middleware,
+        skills=skills,
+        providers=providers,
+        models=models,
+    )
 
 
 def _validate_limit(value: int) -> None:

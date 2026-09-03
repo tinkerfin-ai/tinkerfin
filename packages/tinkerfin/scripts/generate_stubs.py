@@ -458,6 +458,7 @@ from .errors import TinkerFinErrorCode as TinkerFinErrorCode
 from .errors import TinkerFinLifecycleError as TinkerFinLifecycleError
 from .errors import TinkerFinStreamProtocolError as TinkerFinStreamProtocolError
 from .native_driver import DeepAgentsV2StreamDriver as DeepAgentsV2StreamDriver
+from .native_driver import DeepAgentsV3StreamDriver as DeepAgentsV3StreamDriver
 from .native_driver import DeepSeekReasoningExtractor as DeepSeekReasoningExtractor
 from .native_driver import NativeStreamDriver as NativeStreamDriver
 from .native_driver import ReasoningExtractor as ReasoningExtractor
@@ -484,6 +485,7 @@ from .runtime import TinkerFin as _RuntimeTinkerFin
 from .runtime_profile import DeepAgentsFactoryPreparation as DeepAgentsFactoryPreparation
 from .runtime_profile import DeepAgentsRuntimeProfile as DeepAgentsRuntimeProfile
 from .runtime_profile import DeepAgentsV2RuntimeProfile as DeepAgentsV2RuntimeProfile
+from .runtime_profile import DeepAgentsV3RuntimeProfile as DeepAgentsV3RuntimeProfile
 
 class TinkerFin(_RuntimeTinkerFin):
     """Configure immutable Runtime, Profile, Plan, and Observation capabilities."""

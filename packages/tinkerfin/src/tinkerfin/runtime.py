@@ -29,7 +29,11 @@ from tinkerfin_contracts import (
     RunTerminalOutcome,
     RuntimeObserver,
 )
-from tinkerfin_native_stream import NativeStreamContractError, NativeStreamFrame
+from tinkerfin_native_stream import (
+    NativeStreamContractError,
+    NativeStreamFrame,
+    NativeValuesStreamPart,
+)
 
 from . import _runtime_streams
 from ._observation import RuntimeObservationHub, observer_tuple, source_context
@@ -174,6 +178,8 @@ class _GraphRunStream(Generic[PartT]):
         self._coordination: AbstractAsyncContextManager[None] | None = None
         self._started = False
         self._closed = False
+        self._ready_error: Exception | None = None
+        self._ready_error_delivered = False
         self._active_task: asyncio.Task[object] | None = None
         self._observer_lineage = ContextVar(
             f"tinkerfin_graph_part_observer_lineage_{id(self)}",
@@ -226,6 +232,11 @@ class _GraphRunStream(Generic[PartT]):
         return await _runtime_streams.aclose(
             self,
         )
+
+    async def _ready(self) -> None:
+        """Open the managed Observation and source boundary without pulling output."""
+
+        return await _runtime_streams.ready(self)
 
     def to_sse(
         self,
@@ -453,7 +464,7 @@ class AgUiEventStream:
         )
         self._deadline: float | None = None
         self._upstream = aiter(parts)
-        self._start_parts = parts._start if isinstance(parts, _GraphRunStream) else None
+        self._start_parts = parts._ready if isinstance(parts, _GraphRunStream) else None
         self._upstream_closed = False
         self._adapter = DeepAgentAgUiAdapter(
             identity=identity,
@@ -522,6 +533,13 @@ class AgUiEventStream:
         return await self._runtime_agui.aclose(
             self,
         )
+
+    async def _ready(self) -> None:
+        """Open the managed Native boundary without consuming an AG-UI event."""
+
+        start_parts = self._start_parts
+        if start_parts is not None:
+            await start_parts()
 
     def to_sse(
         self,
@@ -816,9 +834,11 @@ class TinkerFin:
 
         ``agent`` may be a reusable Definition or a synchronous/asynchronous callable
         that creates one after host-specific model, Sandbox, or tool preparation. Graph
-        construction uses the selected Profile's async boundary exactly once. Setup
-        exceptions become a managed native stream that records failed Observation and
-        raises when consumed; process-control exceptions continue to propagate.
+        construction uses the selected Profile's async boundary exactly once. The
+        returned stream has already committed Run start and input observations but has
+        not pulled model output. Setup exceptions become a managed native stream that
+        records failed Observation and raises when consumed; process-control exceptions
+        continue to propagate.
 
         Args:
             identity: Canonical identity shared by Runtime, Graph, Observation, and
@@ -859,7 +879,7 @@ class TinkerFin:
                 raise ValueError(
                     "agent must come from this configured TinkerFin family"
                 )
-            return await definition._open_native_run(
+            stream = await definition._open_native_run(
                 identity=identity,
                 input=input,
                 mode=mode,
@@ -868,6 +888,8 @@ class TinkerFin:
                 on_part=on_native_part,
                 stream_options=stream_options,
             )
+            await stream._ready()
+            return stream
         except Exception as error:  # noqa: BLE001 - Runtime owns failed Observation
             setup_error = error
             input_kind = (
@@ -895,12 +917,78 @@ class TinkerFin:
                     yield {}
                 raise setup_error
 
-            return self._run_native(
+            failed_stream = self._run_native(
                 failed_source,
                 identity=identity,
                 on_part=on_native_part,
                 observation=observation,
             )
+            await failed_stream._ready()
+            return failed_stream
+
+    async def ainvoke(
+        self,
+        identity: RunIdentity,
+        *,
+        agent: _AgentSource,
+        input: InputAgentState | Command[object] | None,
+        mode: AgentMode | None = None,
+        config: RunnableConfig | None = None,
+        context: object | None = None,
+        on_native_part: PartObserver[Mapping[str, object]] | None = None,
+        **stream_options: object,
+    ) -> Mapping[str, object]:
+        """Run one managed invocation and return its final root state.
+
+        This facade consumes the same Profile-owned canonical source as
+        :meth:`open_run`, so Runtime observations, model and Tool callbacks,
+        cancellation, and terminal settlement do not depend on whether the caller wants
+        a stream or one final result.
+
+        Args:
+            identity: Canonical identity shared by Runtime, Graph, and Observation.
+            agent: Existing Definition or lazy Definition factory from this family.
+            input: Ordinary Deep Agent state, native resume command, or ``None``.
+            mode: Optional default or Plan route.
+            config: Optional LangGraph configuration.
+            context: Optional context declared by the Definition.
+            on_native_part: Optional observer after validation and Observation.
+            **stream_options: Advanced options supported by the selected Profile.
+
+        Returns:
+            A defensive copy of the latest root values state. Interrupted output retains
+            the current normalized ``__interrupt__`` list.
+
+        Raises:
+            TinkerFinLifecycleError: The managed source emits no root values boundary.
+            BaseException: Profile binding, execution, observation, or cleanup fails.
+        """
+
+        stream = await self.open_run(
+            identity,
+            agent=agent,
+            input=input,
+            mode=mode,
+            config=config,
+            context=context,
+            on_native_part=on_native_part,
+            **stream_options,
+        )
+        state: dict[str, object] | None = None
+        async for part in stream:
+            canonical = self._runtime_profile.stream_driver.validate(part)
+            if not isinstance(canonical, NativeValuesStreamPart) or canonical.ns != ():
+                continue
+            state = dict(canonical.data)
+            if canonical.interrupts:
+                state["__interrupt__"] = list(canonical.interrupts)
+            else:
+                state.pop("__interrupt__", None)
+        if state is None:
+            raise TinkerFinLifecycleError(
+                "managed invocation completed without a root values boundary"
+            )
+        return state
 
     async def _resolve_agent(
         self,
@@ -943,8 +1031,9 @@ class TinkerFin:
 
         The facade owns asynchronous Agent preparation, Graph construction,
         authoritative checkpoint resolution, durable resume settlement, failed lifecycle
-        conversion, and stream creation. Existing Definitions and low-level Runtime APIs
-        remain available for advanced orchestration.
+        conversion, and stream creation. Before returning, it commits Run start and input
+        observations without consuming the first public event. Existing Definitions and
+        low-level Runtime APIs remain available for advanced orchestration.
 
         Args:
             identity: Canonical identity shared by Runtime, Graph, Observation, AG-UI,
@@ -1060,7 +1149,7 @@ class TinkerFin:
                 raise ValueError(
                     "agent must come from this configured TinkerFin family"
                 )
-            return await definition._open_agui_run(
+            stream = await definition._open_agui_run(
                 identity=identity,
                 input=input,
                 resume_request=resume,
@@ -1078,6 +1167,8 @@ class TinkerFin:
                 on_event=on_agui_event,
                 stream_options=stream_options,
             )
+            await stream._ready()
+            return stream
         # Resume claim settlement covers every setup exit before a request Runtime can
         # install its own marker guard. Ordinary failures become one AG-UI error
         # lifecycle; cancellation and process control settle first and then propagate.
@@ -1108,7 +1199,7 @@ class TinkerFin:
                     )
             if not isinstance(error, Exception):
                 raise
-            return self.failed_agui_run(
+            failed_stream = self.failed_agui_run(
                 error,
                 identity=identity,
                 parent_run_id=parent_run_id,
@@ -1117,6 +1208,8 @@ class TinkerFin:
                 config=config,
                 resume_request=resume,
             )
+            await failed_stream._ready()
+            return failed_stream
 
     async def _settle_resume_not_saved(
         self,

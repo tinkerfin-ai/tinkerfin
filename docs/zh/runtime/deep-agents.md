@@ -208,6 +208,22 @@ stream = await tinkerfin.open_run(
 
 `on_native_part` 会在交付路径中等待。不要在其中执行阻塞网络或数据库访问，应使用异步客户端。
 
+## 只返回 managed 最终 state
+
+调用方不需要逐条消费 stream part 时，继续使用同一个门面：
+
+```python
+state = await tinkerfin.ainvoke(
+    RunIdentity(threadId="project-7", runId="run-1"),
+    agent=agent,
+    input={"messages": [{"role": "user", "content": "检查这个项目"}]},
+)
+```
+
+`ainvoke()` 会在框架内部消费 Profile 提供的 canonical stream，并保留 Runtime Observation、
+Trace、身份绑定、取消、终态结算与资源清理，最后返回根 state 的防御性副本。只有下方明确的
+unmanaged 高级场景才使用 `await agent.create_graph().ainvoke(...)`。
+
 ## 复用 Direct Graph
 
 不需要 managed run 生命周期的高级集成可以创建一个异步 Runnable，并跨 thread ID 复用：

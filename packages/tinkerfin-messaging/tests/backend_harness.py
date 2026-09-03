@@ -5,13 +5,12 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator
 
 from tinkerfin_contracts import RunIdentity
-from tinkerfin_messaging._messaging_ledger import _MessagingLedger
-from tinkerfin_messaging.backend import (
-    FinalRunStatus,
-    RunStatus,
-    _BackendRunHandle,
-    _PreparedRun,
+from tinkerfin_messaging._messaging_ledger import (
+    BackendRunHandle,
+    PreparedRun,
+    _MessagingLedger,
 )
+from tinkerfin_messaging.backend import FinalRunStatus, RunStatus
 from tinkerfin_messaging.backend_contract import (
     CommittedMessagePage,
     CommittedMessageQuery,
@@ -95,7 +94,7 @@ class MessagingBackendHarness:
         after: int | None,
         cancellable: bool,
         recoverable: bool,
-    ) -> _PreparedRun:
+    ) -> PreparedRun:
         return await self._ledger.prepare(
             channel=channel,
             identity=identity,
@@ -107,7 +106,7 @@ class MessagingBackendHarness:
 
     async def append(
         self,
-        handle: _BackendRunHandle,
+        handle: BackendRunHandle,
         *,
         message_id: str,
         codec: str,
@@ -122,12 +121,12 @@ class MessagingBackendHarness:
             checkpoint=checkpoint,
         )
 
-    async def begin_settlement(self, handle: _BackendRunHandle) -> bool:
+    async def begin_settlement(self, handle: BackendRunHandle) -> bool:
         return await self._ledger.begin_settlement(handle)
 
     async def finish(
         self,
-        handle: _BackendRunHandle,
+        handle: BackendRunHandle,
         *,
         status: FinalRunStatus,
         error: BaseException | None = None,
@@ -166,7 +165,7 @@ class MessagingBackendHarness:
         channel: str,
         identity: RunIdentity,
         after: int,
-    ) -> _BackendRunHandle:
+    ) -> BackendRunHandle:
         return await self._ledger.bind_follow(
             channel=channel,
             identity=identity,
@@ -175,25 +174,25 @@ class MessagingBackendHarness:
 
     def follow(
         self,
-        handle: _BackendRunHandle,
+        handle: BackendRunHandle,
         *,
         after: int,
     ) -> AsyncGenerator[MessageEnvelope, None]:
         return self._ledger.follow(handle, after=after)
 
-    async def request_cancel(self, handle: _BackendRunHandle) -> bool:
+    async def request_cancel(self, handle: BackendRunHandle) -> bool:
         return await self._ledger.request_cancel(handle)
 
-    async def wait_for_cancel(self, handle: _BackendRunHandle) -> bool:
+    async def wait_for_cancel(self, handle: BackendRunHandle) -> bool:
         return await self._ledger.wait_for_cancel(handle)
 
-    async def wait_finished(self, handle: _BackendRunHandle) -> RunStatus:
+    async def wait_finished(self, handle: BackendRunHandle) -> RunStatus:
         return await self._ledger.wait_finished(handle)
 
-    async def failure(self, handle: _BackendRunHandle) -> BaseException | None:
+    async def failure(self, handle: BackendRunHandle) -> BaseException | None:
         return await self._ledger.failure(handle)
 
-    async def renew(self, handle: _BackendRunHandle) -> bool:
+    async def renew(self, handle: BackendRunHandle) -> bool:
         return await self._ledger.renew(handle)
 
     async def delete_stream(self, *, channel: str, identity: RunIdentity) -> None:

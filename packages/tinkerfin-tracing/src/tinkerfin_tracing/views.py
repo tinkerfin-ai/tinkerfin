@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field, JsonValue, computed_field, field_validato
 
 from ._models import TraceModel
 from .facts import TraceEvent, TraceSemanticFact
+from .graph import TraceGraphDelta
 
 
 class TraceMessage(TraceModel):
@@ -43,56 +44,6 @@ class TraceReasoning(TraceModel):
     status: Literal["streaming", "completed"]
     created_at: datetime
     completed_at: datetime | None = None
-
-
-class TraceNode(TraceModel):
-    """One stable flat execution-tree node with policy-controlled details.
-
-    ``input`` and ``result`` are present only when the Tracer capture policy explicitly
-    retained those values. The omission flags distinguish unavailable content from a
-    valid JSON null without exposing the omitted bytes.
-    """
-
-    id: str
-    trace_seq: int = Field(ge=1)
-    parent_id: str | None = None
-    kind: Literal["turn", "run", "task", "tool", "subagent", "plan"]
-    label: str
-    run_id: str
-    namespace: tuple[str, ...] = ()
-    source_id: str | None = None
-    input: JsonValue | None = None
-    input_omitted: bool = False
-    result: JsonValue | None = None
-    result_omitted: bool = False
-    status: Literal[
-        "running",
-        "waiting",
-        "succeeded",
-        "failed",
-        "cancelled",
-        "abandoned",
-        "unknown",
-    ]
-    started_at: datetime
-    completed_at: datetime | None = None
-
-
-class TraceTree(TraceModel):
-    """Expose convenience traversal over one authoritative flat node tuple."""
-
-    nodes: tuple[TraceNode, ...] = ()
-
-    @property
-    def roots(self) -> tuple[TraceNode, ...]:
-        """Return top-level Turn nodes in latest-first order."""
-
-        return tuple(node for node in self.nodes if node.parent_id is None)
-
-    def children(self, node_id: str) -> tuple[TraceNode, ...]:
-        """Return direct children in their authoritative flat-node order."""
-
-        return tuple(node for node in self.nodes if node.parent_id == node_id)
 
 
 class TraceInteraction(TraceModel):
@@ -197,7 +148,7 @@ class TraceUpdate(TraceModel):
     facts: tuple[TraceSemanticFact, ...]
     messages: TraceEntityDelta[TraceMessage]
     reasoning: TraceEntityDelta[TraceReasoning]
-    nodes: TraceEntityDelta[TraceNode]
+    graph: TraceGraphDelta
     interactions: TraceEntityDelta[TraceInteraction]
     state: TraceState
     summary: TraceSummary
@@ -238,11 +189,9 @@ __all__ = [
     "TraceEventPage",
     "TraceInteraction",
     "TraceMessage",
-    "TraceNode",
     "TraceReasoning",
     "TraceState",
     "TraceStatus",
     "TraceSummary",
-    "TraceTree",
     "TraceUpdate",
 ]

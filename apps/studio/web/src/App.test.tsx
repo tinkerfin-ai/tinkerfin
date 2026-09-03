@@ -14,6 +14,11 @@ import { clearAuthSession, saveAuthSession } from './auth/session'
 import { ToastViewport } from './components/ui/ToastViewport'
 import type { ToastItem, ToastKind } from './components/ui/ToastViewport'
 import { WorkspaceScreen } from './features/workspace/WorkspaceScreen'
+import {
+  emptyTraceGraph,
+  traceGraphNode,
+  traceGraphWithNodes,
+} from './test/traceFixtures'
 
 const TEST_USER = {
   user_id: 7,
@@ -54,7 +59,6 @@ const MODEL_CATALOG: AgentModelCatalog = {
     modelId: 'main',
     displayName: 'Main Model',
     reasoningEnabled: false,
-    runtimeProfile: 'deepagents-v2',
     isDefault: true,
   }],
   defaultModelId: 'main',
@@ -86,7 +90,6 @@ const traceDetail = (
   threadId: THREAD_ID,
   title: 'Trace 会话',
   lastModel: 'main',
-  runtimeProfile: 'deepagents-v2',
   pinned: false,
   asOfSeq: 5,
   headRunId: RUN_ID,
@@ -108,7 +111,6 @@ const traceDetail = (
     completedAt: BASE_TIME,
   }],
   reasoning: [],
-  nodes: [],
   state: { root: {}, subgraphs: {} },
   interactions: [],
   status: { execution: 'succeeded', headRunId: RUN_ID },
@@ -116,6 +118,7 @@ const traceDetail = (
   createdAt: BASE_TIME,
   updatedAt: BASE_TIME,
   ...overrides,
+  graph: overrides.graph ?? emptyTraceGraph(overrides.asOfSeq ?? 5),
   taskTrace: overrides.taskTrace ?? { status: 'ready', todoGroups: [] },
 })
 
@@ -133,6 +136,16 @@ const sseResponse = (events: ConversationAgUiEvent[], startSeq = 1) => {
           'id: ' + (startSeq + index) + '\ndata: ' + JSON.stringify(event) + '\n\n',
         ))
       })
+      controller.close()
+    },
+  }), { headers: { 'Content-Type': 'text/event-stream' } })
+}
+
+const jsonSseResponse = (event: unknown) => {
+  const encoder = new TextEncoder()
+  return new Response(new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`))
       controller.close()
     },
   }), { headers: { 'Content-Type': 'text/event-stream' } })
@@ -164,6 +177,15 @@ function installFetch(options: {
       const detail = details[threadId]
       if (!detail) throw new Error('missing Trace detail for ' + threadId)
       return jsonResponse(detail)
+    }
+    const traceFollow = url.pathname.match(
+      /\/api\/conversation\/([^/]+)\/trace\/graph\/follow$/,
+    )
+    if (traceFollow) {
+      const threadId = decodeURIComponent(traceFollow[1] ?? '')
+      const detail = details[threadId]
+      if (!detail) throw new Error('missing Trace detail for ' + threadId)
+      return jsonSseResponse({ type: 'snapshot', snapshot: detail.graph })
     }
     if (request.method === 'POST' && url.pathname.endsWith('/api/conversation/chat')) {
       const payload = await request.clone().json() as ChatRequestPayload
@@ -210,6 +232,47 @@ describe('Studio Trace history integration', () => {
     expect(screen.getByText('Trace 会话')).toBeInTheDocument()
   })
 
+  it('returns to chat when selecting another conversation from the Trace view', async () => {
+    const user = userEvent.setup()
+    const secondThreadId = 'thread-second'
+    installFetch({
+      list: [
+        historyItem(),
+        historyItem({
+          id: 2,
+          threadId: secondThreadId,
+          title: '第二个会话',
+          lastRunId: 'run-second',
+        }),
+      ],
+      details: {
+        [THREAD_ID]: traceDetail(),
+        [secondThreadId]: traceDetail({
+          id: 2,
+          threadId: secondThreadId,
+          title: '第二个会话',
+          headRunId: 'run-second',
+          availableHeads: ['run-second'],
+          messages: [{
+            ...traceDetail().messages[0]!,
+            id: 'message-second',
+            runId: 'run-second',
+            content: '第二个会话的聊天内容',
+          }],
+        }),
+      },
+    })
+
+    render(<App />)
+
+    await user.click(await screen.findByRole('button', { name: '链路分析' }))
+    expect(await screen.findByRole('button', { name: '返回对话' })).toBeVisible()
+    await user.click(screen.getByRole('button', { name: '打开会话：第二个会话' }))
+
+    expect(await screen.findByText('第二个会话的聊天内容')).toBeVisible()
+    expect(screen.queryByRole('button', { name: '返回对话' })).not.toBeInTheDocument()
+  })
+
   it('restores a multi-action approval from native Trace interaction facts', async () => {
     const waiting = traceDetail({
       status: { execution: 'waiting', headRunId: RUN_ID },
@@ -240,22 +303,18 @@ describe('Studio Trace history integration', () => {
         openedAt: BASE_TIME,
         resolvedAt: null,
       }],
-      nodes: [{
+      graph: traceGraphWithNodes([traceGraphNode({
         id: 'tool-node',
-        traceSeq: 3,
-        parentId: null,
-        kind: 'tool',
-        label: 'write_file',
+        startedSeq: 3,
+        name: 'write_file',
         runId: RUN_ID,
-        namespace: [],
         sourceId: 'call-write',
-        input: { file_path: '/root-hitl.txt', content: 'ROOT_HITL' },
-        inputOmitted: false,
+        request: { file_path: '/root-hitl.txt', content: 'ROOT_HITL' },
         resultOmitted: true,
         status: 'waiting',
         startedAt: BASE_TIME,
         completedAt: null,
-      }],
+      })], 5),
     })
     installFetch({
       list: [historyItem({
@@ -308,65 +367,56 @@ describe('Studio Trace history integration', () => {
         openedAt: BASE_TIME,
         resolvedAt: null,
       }],
-      nodes: [
-        {
+      graph: traceGraphWithNodes([
+        traceGraphNode({
           id: 'task-tool',
-          traceSeq: 2,
+          startedSeq: 2,
           parentId: 'run-node',
-          kind: 'tool',
-          label: 'task',
+          name: 'task',
           runId: RUN_ID,
-          namespace: [],
           sourceId: 'call-task',
-          input: {
+          request: {
             description: '直接调用 write_file',
             subagent_type: 'general-purpose',
           },
-          inputOmitted: false,
-          resultOmitted: false,
           status: 'waiting',
           startedAt: BASE_TIME,
           completedAt: null,
-        },
-        {
+        }),
+        traceGraphNode({
           id: 'subagent-node',
-          traceSeq: 3,
+          startedSeq: 3,
           parentId: 'run-node',
           kind: 'subagent',
-          label: 'general-purpose',
+          name: 'general-purpose',
           runId: RUN_ID,
           namespace: childNamespace,
           sourceId: 'call-task',
-          input: {
+          request: {
             description: '直接调用 write_file',
             subagent_type: 'general-purpose',
           },
-          inputOmitted: false,
-          resultOmitted: false,
           status: 'waiting',
           startedAt: BASE_TIME,
           completedAt: null,
-        },
-        {
+        }),
+        traceGraphNode({
           id: 'child-tool',
-          traceSeq: 4,
+          startedSeq: 4,
           parentId: 'subagent-node',
-          kind: 'tool',
-          label: 'write_file',
+          name: 'write_file',
           runId: RUN_ID,
           namespace: childNamespace,
           sourceId: 'call-child-write',
-          input: {
+          request: {
             file_path: '/ui-subagent-hitl.txt',
             content: 'UI_SUBAGENT_HITL',
           },
-          inputOmitted: false,
-          resultOmitted: false,
           status: 'waiting',
           startedAt: BASE_TIME,
           completedAt: null,
-        },
-      ],
+        }),
+      ], 5),
     })
     installFetch({
       list: [historyItem({
@@ -427,40 +477,30 @@ describe('Studio Trace history integration', () => {
         openedAt: BASE_TIME,
         resolvedAt: null,
       }],
-      nodes: [
-        {
+      graph: traceGraphWithNodes([
+        traceGraphNode({
           id: 'tool-a',
-          traceSeq: 2,
-          parentId: null,
-          kind: 'tool',
-          label: 'write_file',
+          startedSeq: 2,
+          name: 'write_file',
           runId: RUN_ID,
-          namespace: [],
           sourceId: 'call-a',
-          input: { file_path: '/a.txt', content: 'A' },
-          inputOmitted: false,
-          resultOmitted: false,
+          request: { file_path: '/a.txt', content: 'A' },
           status: 'waiting',
           startedAt: BASE_TIME,
           completedAt: null,
-        },
-        {
+        }),
+        traceGraphNode({
           id: 'tool-b',
-          traceSeq: 3,
-          parentId: null,
-          kind: 'tool',
-          label: 'write_file',
+          startedSeq: 3,
+          name: 'write_file',
           runId: RUN_ID,
-          namespace: [],
           sourceId: 'call-b',
-          input: { file_path: '/b.txt', content: 'B' },
-          inputOmitted: false,
-          resultOmitted: false,
+          request: { file_path: '/b.txt', content: 'B' },
           status: 'waiting',
           startedAt: BASE_TIME,
           completedAt: null,
-        },
-      ],
+        }),
+      ], 5),
     })
     const details: Record<string, ConversationHistoryDetail> = { [THREAD_ID]: waiting }
     const chatPayloads: ChatRequestPayload[] = []
@@ -488,7 +528,7 @@ describe('Studio Trace history integration', () => {
           availableHeads: [payload.runId],
           status: { execution: 'succeeded', headRunId: payload.runId },
           interactions: [],
-          nodes: [],
+          graph: emptyTraceGraph(5),
         })
       },
     })

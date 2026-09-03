@@ -16,8 +16,10 @@ from langgraph.checkpoint.base import BaseCheckpointSaver, CheckpointTuple
 from langgraph.graph.state import CompiledStateGraph
 
 from ._hitl import prepare_hitl_factory_overrides
+from ._v3_stream import graph_v3_stream
 from .native_driver import (
     DeepAgentsV2StreamDriver,
+    DeepAgentsV3StreamDriver,
     NativeStreamDriver,
     ReasoningExtractor,
 )
@@ -130,6 +132,11 @@ class DeepAgentsRuntimeProfile(Protocol):
 
         ...
 
+    def graph_stream(self, graph: object) -> Callable[..., object]:
+        """Return the concrete event source callable for one created Graph."""
+
+        ...
+
     def prepare_create_agent(
         self,
         arguments: Mapping[str, object],
@@ -197,11 +204,10 @@ class DeepAgentsRuntimeProfile(Protocol):
 class DeepAgentsV2RuntimeProfile:
     """Integrate the locked Deep Agents 0.7.5 and LangGraph v2 runtime.
 
-    The Profile is the only production implementation in this distribution. Its
-    factory signature, HITL preparation, invocation binding, checkpoint identity,
-    resume-intent staging, and frame normalization are jointly exercised by the Runtime
-    Profile and lineage contract tests; the non-v2 fixture Profile proves downstream
-    frame independence without claiming another production integration.
+    This is the default stable Runtime Profile. Its factory signature, HITL preparation,
+    invocation binding, checkpoint identity, resume-intent staging, and frame
+    normalization are jointly exercised by the Runtime Profile and lineage contract
+    tests.
 
     Args:
         reasoning_extractors: Verified provider-specific reasoning extractors applied
@@ -257,6 +263,14 @@ class DeepAgentsV2RuntimeProfile:
         """Return the locked bound LangGraph stream contract used by lazy resume."""
 
         return _COMPILED_ASTREAM_SIGNATURE
+
+    def graph_stream(self, graph: object) -> Callable[..., object]:
+        """Return the locked graph's v2 ``astream`` callable."""
+
+        stream = getattr(graph, "astream", None)
+        if not callable(stream):
+            raise TypeError("Deep Agents v2 graph must expose astream")
+        return stream
 
     def prepare_create_agent(
         self,
@@ -431,8 +445,44 @@ class DeepAgentsV2RuntimeProfile:
         return False
 
 
+class DeepAgentsV3RuntimeProfile(DeepAgentsV2RuntimeProfile):
+    """Integrate the locked experimental LangGraph v3 event-stream API.
+
+    The installed LangGraph 1.2.10 implementation still drives its v3 mux from an
+    internal v2 stream. Selecting this Profile nevertheless exercises the public
+    ``astream_events(version="v3")`` contract and never falls back to the v2 Profile.
+
+    Args:
+        reasoning_extractors: Verified provider reasoning extractors applied after v3
+            events enter TinkerFin's canonical Native boundary.
+    """
+
+    def __init__(
+        self,
+        *,
+        reasoning_extractors: tuple[ReasoningExtractor, ...] = (),
+    ) -> None:
+        """Create one request-independent v3 Driver from verified extractors."""
+
+        self._stream_driver = DeepAgentsV3StreamDriver(
+            reasoning_extractors=reasoning_extractors,
+        )
+
+    @property
+    def profile_id(self) -> str:
+        """Return the explicit experimental integration identity."""
+
+        return "deepagents-v3"
+
+    def graph_stream(self, graph: object) -> Callable[..., object]:
+        """Return a canonical source carried by public v3 protocol events."""
+
+        return graph_v3_stream(graph)
+
+
 __all__ = [
     "DeepAgentsFactoryPreparation",
     "DeepAgentsRuntimeProfile",
     "DeepAgentsV2RuntimeProfile",
+    "DeepAgentsV3RuntimeProfile",
 ]

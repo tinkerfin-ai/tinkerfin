@@ -30,11 +30,10 @@ from tinkerfin_studio.conversation.schemas import (
     ConversationHistoryGroupConfig,
     ConversationHistoryListItem,
     ConversationHistoryListResponse,
-    ConversationTraceEntryErrorEvent,
-    ConversationTraceEntryPage,
-    ConversationTraceEntrySnapshotEvent,
-    ConversationTraceEntryUpdateEvent,
     ConversationTraceErrorEvent,
+    ConversationTraceGraphErrorEvent,
+    ConversationTraceGraphSnapshotEvent,
+    ConversationTraceGraphUpdateEvent,
     ConversationTraceSnapshotEvent,
     ConversationTraceUpdateEvent,
     PendingInteractionKind,
@@ -47,8 +46,9 @@ from tinkerfin_studio.conversation.todo_groups import (
 )
 from tinkerfin_tracing import (
     InvalidTraceCursor,
-    TraceFilter,
-    TraceQuery,
+    TraceGraphFilter,
+    TraceGraphPage,
+    TraceGraphQuery,
     Tracer,
     TraceThread,
     TraceThreadNotFound,
@@ -278,39 +278,39 @@ class ConversationHistoryService:
 
         return events()
 
-    async def query_trace_entries(
+    async def query_trace_graph(
         self,
         thread_id: str,
         *,
-        where: TraceFilter,
+        where: TraceGraphFilter,
         cursor: str | None,
         limit: int,
-    ) -> ConversationTraceEntryPage:
+    ) -> TraceGraphPage:
         """在框架 Store 内筛选当前会话链路节点"""
 
-        query = await self._load_entry_query(
+        query = await self._load_graph_query(
             thread_id,
             where=where,
             cursor=cursor,
             limit=limit,
         )
-        return self._entry_page(query)
+        return query.snapshot
 
-    async def follow_trace_entries(
+    async def follow_trace_graph(
         self,
         thread_id: str,
         *,
-        where: TraceFilter,
+        where: TraceGraphFilter,
         limit: int,
     ) -> AsyncGenerator[
-        ConversationTraceEntrySnapshotEvent
-        | ConversationTraceEntryUpdateEvent
-        | ConversationTraceEntryErrorEvent,
+        ConversationTraceGraphSnapshotEvent
+        | ConversationTraceGraphUpdateEvent
+        | ConversationTraceGraphErrorEvent,
         None,
     ]:
         """先发送当前筛选页，再跟随同一 generation 的链路变化"""
 
-        query = await self._load_entry_query(
+        query = await self._load_graph_query(
             thread_id,
             where=where,
             cursor=None,
@@ -318,18 +318,16 @@ class ConversationHistoryService:
         )
 
         async def events() -> AsyncGenerator[
-            ConversationTraceEntrySnapshotEvent
-            | ConversationTraceEntryUpdateEvent
-            | ConversationTraceEntryErrorEvent,
+            ConversationTraceGraphSnapshotEvent
+            | ConversationTraceGraphUpdateEvent
+            | ConversationTraceGraphErrorEvent,
             None,
         ]:
             updates = query.follow()
             try:
-                yield ConversationTraceEntrySnapshotEvent(
-                    snapshot=self._entry_page(query)
-                )
+                yield ConversationTraceGraphSnapshotEvent(snapshot=query.snapshot)
                 async for update in updates:
-                    yield ConversationTraceEntryUpdateEvent(update=update)
+                    yield ConversationTraceGraphUpdateEvent(update=update)
             except asyncio.CancelledError:
                 raise
             except TracingError as error:
@@ -338,20 +336,20 @@ class ConversationHistoryService:
                     thread_id,
                     exc_info=(type(error), error, error.__traceback__),
                 )
-                yield ConversationTraceEntryErrorEvent()
+                yield ConversationTraceGraphErrorEvent()
             finally:
                 await updates.aclose()
 
         return events()
 
-    async def _load_entry_query(
+    async def _load_graph_query(
         self,
         thread_id: str,
         *,
-        where: TraceFilter,
+        where: TraceGraphFilter,
         cursor: str | None,
         limit: int,
-    ) -> TraceQuery:
+    ) -> TraceGraphQuery:
         """校验会话归属并在释放业务连接后查询框架索引"""
 
         thread = await self._require_thread(thread_id)
@@ -371,17 +369,6 @@ class ConversationHistoryService:
             raise BusinessException(ConversationErrorCode.INVALID_CURSOR) from error
         except (TraceThreadNotFound, TracingError) as error:
             raise SystemException(ConversationErrorCode.TRACE_UNAVAILABLE) from error
-
-    @staticmethod
-    def _entry_page(query: TraceQuery) -> ConversationTraceEntryPage:
-        return ConversationTraceEntryPage(
-            turns=query.turns,
-            items=query.items,
-            nextCursor=query.next_cursor,
-            asOfSeq=query.as_of_seq,
-            facets=query.facets,
-            completeness=query.completeness,
-        )
 
     async def _load_trace(
         self,
@@ -444,7 +431,6 @@ class ConversationHistoryService:
             threadId=thread.thread_id,
             title=thread.title,
             lastModel=registration.model_id,
-            runtimeProfile=registration.runtime_profile,
             pinned=thread.pinned,
             asOfSeq=trace.as_of_seq,
             headRunId=trace.head_run_id,
@@ -454,7 +440,7 @@ class ConversationHistoryService:
             toolCallCount=summary.tool_call_count,
             messages=trace.messages,
             reasoning=trace.reasoning,
-            nodes=trace.tree.nodes,
+            graph=trace.graph,
             state=trace.state,
             interactions=tuple(
                 sorted(

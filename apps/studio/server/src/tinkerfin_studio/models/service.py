@@ -45,7 +45,6 @@ class AgentModelService:
                         "modelId": model.model_id,
                         "displayName": model.display_name,
                         "reasoningEnabled": model.reasoning_enabled,
-                        "runtimeProfile": model.runtime_profile,
                         "isDefault": model.is_default,
                     }
                 )
@@ -74,8 +73,6 @@ class AgentModelService:
                     "base_url": model.base_url,
                     "api_key": SecretStr(model.api_key),
                     "reasoning_enabled": model.reasoning_enabled,
-                    "runtime_profile": model.runtime_profile,
-                    "updated_at": model.updated_at.isoformat(),
                 }
             )
         except ValidationError as error:

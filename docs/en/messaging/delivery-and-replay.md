@@ -26,7 +26,7 @@ body = await channel.sse(
     source,
     identity=identity,
     after=lambda: parse_sse_event_id(request.headers.get("Last-Event-ID")),
-    on_source_starting=activate_business_run,
+    on_source_ready=activate_business_run,
     on_delivery_not_started=cleanup_business_run,
 )
 ```
@@ -34,10 +34,10 @@ body = await channel.sse(
 The resolver runs once before durable preparation. `parse_sse_event_id()` accepts only
 canonical non-negative ASCII decimal values. Committed sequence numbers become SSE IDs.
 
-`on_source_starting` runs once for a new owner after source-owned preflight and before
-producer creation. `on_delivery_not_started` runs only when neither producer nor
-attachment was established. Attachments invoke neither callback. The returned body is
-caller-owned and must be closed when it will not be consumed.
+`on_source_ready` runs once for a new owner after the request-owned source is ready and
+before producer creation. `on_delivery_not_started` runs only when readiness was not
+reached and no attachment was established. Attachments invoke neither callback. The
+returned body is caller-owned and must be closed when it will not be consumed.
 
 When a valid attachment is established, Messaging closes the unused single-use
 candidate source without opening it. The candidate cannot be reused.

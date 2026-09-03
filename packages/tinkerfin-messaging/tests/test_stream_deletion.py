@@ -26,7 +26,7 @@ from tinkerfin_messaging import (
     StreamGenerationPurge,
     StreamGenerationPurgeResult,
 )
-from tinkerfin_messaging.backend import _BackendRunHandle, _PreparedRun
+from tinkerfin_messaging._messaging_ledger import BackendRunHandle, PreparedRun
 
 
 def _identity(
@@ -42,7 +42,7 @@ async def _prepare_memory(
     *,
     identity: RunIdentity,
     codec: str = "test.bytes.v1",
-) -> _PreparedRun:
+) -> PreparedRun:
     return await backend.prepare(
         channel="events",
         identity=identity,
@@ -59,7 +59,7 @@ async def _prepare_backend(
     identity: RunIdentity | None = None,
     codec: str = "test.bytes.v1",
     cancellable: bool = False,
-) -> _PreparedRun:
+) -> PreparedRun:
     resolved_identity = identity or _identity()
     return await backend.prepare(
         channel="events",
@@ -389,7 +389,7 @@ async def test_memory_unknown_owner_is_rejected_without_stream_deletion() -> Non
 
     backend = MessagingBackendHarness(MemoryBackend())
     prepared = await _prepare_memory(backend, identity=_identity())
-    unknown_owner = _BackendRunHandle(
+    unknown_owner = BackendRunHandle(
         channel=prepared.handle.channel,
         identity=prepared.handle.identity,
         owner_token="unknown",

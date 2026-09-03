@@ -15,6 +15,7 @@ This page groups the public Runtime capabilities by how you use them. Most appli
 | `TinkerFin.observe(observer)` | Add one managed Runtime observer immutably | A `tinkerfin-contracts` `RuntimeObserver` |
 | `TinkerFin.plan(...)` | Create an immutable Plan-capable factory | Capability and mode defaults, optional Planner model, clarification form, Plan content schema, and review actions |
 | `TinkerFin.create_deep_agent(...)` | Create a reusable agent definition | See [Create and run a Deep Agent](deep-agents.md) |
+| `TinkerFin.ainvoke(identity, *, agent, input, ...)` | Return a final state through the managed lifecycle | A defensive root-state mapping |
 | `TinkerFin.open_run(identity, *, agent, input, ...)` | Open one managed native run | A single-use `NativeGraphRunStream` |
 | `TinkerFin.open_agui_run(identity, *, agent, input=... or resume=..., ...)` | Open one managed AG-UI run | A single-use `AgUiEventStream` |
 | `DeepAgentDefinition.create_graph(mode=...)` | Reuse a direct async Runnable without managed lifecycle | Complete native or Plan-capable `DeepAgentGraph` |
@@ -32,20 +33,23 @@ and cleanup. `open_agui_run()` requires exactly one of `input` and `resume`.
 | `DeepAgentsRuntimeProfile` | Implement a complete upstream integration | Canonical Profile ID, graph factory, Native Stream Driver, and resume checkpoint semantics |
 | `DeepAgentsFactoryPreparation` | Return Profile-owned factory overrides | Read-only override mapping and external-subagent cancellation boundary |
 | `DeepAgentsV2RuntimeProfile(...)` | Use the current built-in integration | Locked graph construction, invocation, validation, observations, reasoning extractors, and replay |
+| `DeepAgentsV3RuntimeProfile(...)` | Explicitly use LangGraph's experimental event stream | The same canonical Runtime boundary carried by v3 events |
 | `DeepAgentDefinition.new(...)` | Create a native Runtime | Required `identity`, optional request `mode` and `on_part` |
 | `DeepAgentDefinition.new_agui(...)` | Create an AG-UI Runtime | Required canonical `identity`; optional parent, mode, resume, checkpoint callback, and observers |
 | `TinkerFin.failed_agui_run(...)` | Represent a setup failure after a Run was accepted | Error, identity, and the real available input/config/resume |
 | `trace_contribution(kind=..., name=..., input=None)` | Publish explicit Memory, Guardrail, retrieval, or custom semantics | Async context manager with optional `set_result(...)` |
 
-`DeepAgentsV2RuntimeProfile` is the default current Profile. TinkerFin selects one
+`DeepAgentsV2RuntimeProfile` is the default stable Profile.
+`DeepAgentsV3RuntimeProfile` is an explicit experimental selection. TinkerFin selects one
 Profile before Definition creation, persists its `profile_id` with checkpoint lineage,
 and rejects branch or resume through another Profile before Graph continuation. It never
 detects or negotiates a Profile from stream data. A verified provider reasoning path is
 enabled only by passing a `ReasoningExtractor`, such as `DeepSeekReasoningExtractor`, to
-the Profile; this does not authorize Trace persistence by itself. A custom Profile also
+the Profile; this does not authorize Trace persistence by itself. Custom extractors
+implement `extract(message, *, provider)` and must reject unverified providers. A custom Profile also
 implements its concrete `stage_resume_intent()`, `pending_resume_values()`, and
 `native_resume_submitted()` checkpointer semantics; TinkerFin does not fall back to v2
-checkpoint behavior for it.
+checkpoint behavior for it. Neither built-in Profile falls back to the other.
 
 Reuse `DeepAgentDefinition`. Treat `DeepAgentRuntime`, `DeepAgentAgUiRuntime`, and
 `DeepAgentAgUiResumeRuntime` as single-use values returned by the entry points rather

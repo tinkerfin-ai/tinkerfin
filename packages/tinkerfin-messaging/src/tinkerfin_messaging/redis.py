@@ -14,6 +14,7 @@ from tinkerfin_contracts import RunIdentity
 
 from . import _redis_control, _redis_journal
 from ._identity import required_identifier, required_identity
+from ._messaging_ledger import BackendRunHandle as _BackendRunHandle
 from ._redis_control import (
     _AsyncRedisClient,
     _RedisKeys,
@@ -25,7 +26,6 @@ from ._redis_control import (
 from ._redis_scripts import _MESSAGING_STATE_SNAPSHOT_SCRIPT
 from .backend import (
     RunStatus,
-    _BackendRunHandle,
     is_final_run_status,
 )
 from .backend_contract import (

@@ -22,8 +22,11 @@ from tinkerfin_messaging import (
     RedisBackend,
     RunProducerFailed,
 )
-from tinkerfin_messaging._messaging_ledger import _MessagingLedger
-from tinkerfin_messaging.backend import _BackendRunHandle, _PreparedRun
+from tinkerfin_messaging._messaging_ledger import (
+    BackendRunHandle,
+    PreparedRun,
+    _MessagingLedger,
+)
 
 
 def _identity(
@@ -99,7 +102,7 @@ async def _prepare(
     *,
     identity: RunIdentity | None = None,
     codec: str = "test.bytes.v1",
-) -> _PreparedRun:
+) -> PreparedRun:
     resolved_identity = identity or _identity()
     return await backend.prepare(
         channel="events",
@@ -190,7 +193,7 @@ async def test_append_rejects_invalid_envelope_identifiers_before_commit(
     """A missing identifier check must not reach either backend commit path."""
 
     prepared = await _prepare(backend)
-    handle: _BackendRunHandle = prepared.handle
+    handle: BackendRunHandle = prepared.handle
     message_id = "message-1"
     codec = "test.bytes.v1"
     if field == "channel":
@@ -549,7 +552,7 @@ async def test_concurrent_first_use_binds_one_channel_codec_atomically(
         return_exceptions=True,
     )
 
-    owners = [outcome for outcome in outcomes if isinstance(outcome, _PreparedRun)]
+    owners = [outcome for outcome in outcomes if isinstance(outcome, PreparedRun)]
     mismatches = [outcome for outcome in outcomes if isinstance(outcome, CodecMismatch)]
     assert len(owners) == 1
     assert len(mismatches) == 1

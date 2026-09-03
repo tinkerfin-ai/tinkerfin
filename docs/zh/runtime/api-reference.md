@@ -15,6 +15,7 @@ Observation 与原生 SSE 属于基础安装。
 | `TinkerFin.observe(observer)` | 不可变地增加一个 Runtime observer | `tinkerfin-contracts` 的 `RuntimeObserver` |
 | `TinkerFin.plan(...)` | 创建不可变的 Plan-capable factory | 能力和 mode 默认值、可选 Planner 模型、澄清表单、计划内容 Schema 与审阅动作 |
 | `TinkerFin.create_deep_agent(...)` | 创建可重复生成 Runtime 的 Agent 定义 | 参数见[创建和运行 Deep Agent](deep-agents.md) |
+| `TinkerFin.ainvoke(identity, *, agent, input, ...)` | 通过 managed 生命周期返回最终 state | 防御性复制的根 state mapping |
 | `TinkerFin.open_run(identity, *, agent, input, ...)` | 打开一次 managed 原生运行 | 单次使用的 `NativeGraphRunStream` |
 | `TinkerFin.open_agui_run(identity, *, agent, input=... or resume=..., ...)` | 打开一次 managed AG-UI 运行 | 单次使用的 `AgUiEventStream` |
 | `DeepAgentDefinition.create_graph(mode=...)` | 在 managed 生命周期外复用异步 Runnable | 完整 native 或 Plan-capable `DeepAgentGraph` |
@@ -31,18 +32,21 @@ Observation 与原生 SSE 属于基础安装。
 | `DeepAgentsRuntimeProfile` | 实现完整上游集成 | canonical Profile ID、Graph factory、Native Stream Driver 与 resume checkpoint 语义 |
 | `DeepAgentsFactoryPreparation` | 返回 Profile 管理的 factory overrides | 只读 override mapping 与外部 subagent 取消边界 |
 | `DeepAgentsV2RuntimeProfile(...)` | 使用当前内置集成 | 锁定的建图、调用、校验、Observation、reasoning extractor 与 replay |
+| `DeepAgentsV3RuntimeProfile(...)` | 显式使用 LangGraph 实验性事件流 | 由 v3 事件承载的相同 canonical Runtime 边界 |
 | `DeepAgentDefinition.new(...)` | 创建原生 Runtime | 必填 `identity`，可选本次请求 `mode` 和 `on_part` |
 | `DeepAgentDefinition.new_agui(...)` | 创建 AG-UI Runtime | 必填 canonical `identity`；可选 parent、mode、resume、checkpoint callback 与 observer |
 | `TinkerFin.failed_agui_run(...)` | 表达 Run 接受后的初始化失败 | 错误、identity，以及真实可用的 input/config/resume |
 | `trace_contribution(kind=..., name=..., input=None)` | 发布显式 Memory、Guardrail、retrieval 或自定义语义 | 可用 `set_result(...)` 补充结果的异步上下文管理器 |
 
-默认当前 Profile 是 `DeepAgentsV2RuntimeProfile`。TinkerFin 在创建 Definition 前选定一个
+`DeepAgentsV2RuntimeProfile` 是默认稳定 Profile；`DeepAgentsV3RuntimeProfile` 需要显式选择，
+并遵循上游实验性 API 约束。TinkerFin 在创建 Definition 前选定一个
 Profile，把其 `profile_id` 写入 checkpoint 谱系，并在 Graph continuation 前拒绝由另一个
 Profile 执行 branch 或 resume；Runtime 不从流数据探测或协商 Profile。只有向 Profile 显式
 传入已验证的 `ReasoningExtractor`（例如 `DeepSeekReasoningExtractor`）才会启用对应 provider
-reasoning 路径；这本身不会授权 Trace 持久化。自定义 Profile 还必须实现自身明确的
+reasoning 路径；这本身不会授权 Trace 持久化。自定义 extractor 实现
+`extract(message, *, provider)`，无法验证 provider 时必须拒绝提取。自定义 Profile 还必须实现自身明确的
 `stage_resume_intent()`、`pending_resume_values()` 与 `native_resume_submitted()` checkpointer
-语义；TinkerFin 不会为它回退到 v2 checkpoint 行为。
+语义；TinkerFin 不会为它回退到 v2 checkpoint 行为，两个内置 Profile 也不会相互回退。
 
 `DeepAgentDefinition` 可以重复使用。`DeepAgentRuntime`、`DeepAgentAgUiRuntime` 和
 `DeepAgentAgUiResumeRuntime` 都是一次性运行对象，不要自行构造。

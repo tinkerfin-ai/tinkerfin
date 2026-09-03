@@ -25,11 +25,15 @@ from tinkerfin_studio.conversation.schemas import (
     ConversationHistoryListItem,
     ConversationHistoryListResponse,
     ConversationThreadUpdate,
-    ConversationTraceEntryPage,
 )
 from tinkerfin_studio.conversation.service import ConversationChatService
 from tinkerfin_studio.resources import get_resources
-from tinkerfin_tracing import TraceEntryKind, TraceEntryStatus, TraceFilter
+from tinkerfin_tracing import (
+    TraceGraphFilter,
+    TraceGraphNodeKind,
+    TraceGraphNodeStatus,
+    TraceGraphPage,
+)
 
 router = APIRouter(prefix="/conversation", tags=["会话"])
 
@@ -43,7 +47,7 @@ ThreadIdPath: TypeAlias = Annotated[
 ]
 
 
-def _entry_namespace(value: str) -> tuple[str, ...]:
+def _graph_namespace(value: str) -> tuple[str, ...]:
     if value == "root":
         return ()
     segments = tuple(value.split("|"))
@@ -52,9 +56,11 @@ def _entry_namespace(value: str) -> tuple[str, ...]:
     return segments
 
 
-async def _trace_entry_filter(
-    kinds: Annotated[list[TraceEntryKind] | None, Query(alias="kind")] = None,
-    statuses: Annotated[list[TraceEntryStatus] | None, Query(alias="status")] = None,
+async def _trace_graph_filter(
+    kinds: Annotated[list[TraceGraphNodeKind] | None, Query(alias="kind")] = None,
+    statuses: Annotated[
+        list[TraceGraphNodeStatus] | None, Query(alias="status")
+    ] = None,
     parent_id: Annotated[str | None, Query(alias="parentId", min_length=1)] = None,
     agents: Annotated[list[str] | None, Query(alias="agent")] = None,
     middleware: Annotated[list[str] | None, Query()] = None,
@@ -67,15 +73,19 @@ async def _trace_entry_filter(
     ] = None,
     started_after: Annotated[datetime | None, Query(alias="startedAfter")] = None,
     started_before: Annotated[datetime | None, Query(alias="startedBefore")] = None,
-    include_ancestors: Annotated[
+    include_technical_nodes: Annotated[
         bool,
-        Query(alias="includeAncestors"),
+        Query(alias="includeTechnicalNodes"),
+    ] = False,
+    include_ancestor_nodes: Annotated[
+        bool,
+        Query(alias="includeAncestorNodes"),
     ] = True,
-) -> TraceFilter:
+) -> TraceGraphFilter:
     """把可读查询参数转换为框架直接过滤条件"""
 
     try:
-        return TraceFilter(
+        return TraceGraphFilter(
             kinds=set(kinds or ()),
             statuses=set(statuses or ()),
             parent_id=parent_id,
@@ -84,11 +94,12 @@ async def _trace_entry_filter(
             skill_names=set(skills or ()),
             providers=set(providers or ()),
             models=set(models or ()),
-            namespaces={_entry_namespace(value) for value in namespaces or ()},
+            namespaces={_graph_namespace(value) for value in namespaces or ()},
             search=search,
             started_after=started_after,
             started_before=started_before,
-            include_ancestors=include_ancestors,
+            include_technical_nodes=include_technical_nodes,
+            include_ancestor_nodes=include_ancestor_nodes,
         )
     except ValidationError as error:
         raise RequestValidationError(error.errors(include_input=False)) from error
@@ -105,7 +116,10 @@ async def _trace_entry_filter(
         ) from error
 
 
-TraceEntryFilterDep: TypeAlias = Annotated[TraceFilter, Depends(_trace_entry_filter)]
+TraceGraphFilterDep: TypeAlias = Annotated[
+    TraceGraphFilter,
+    Depends(_trace_graph_filter),
+]
 
 
 @router.get("/history", response_model=ApiResponse[ConversationHistoryListResponse])
@@ -177,20 +191,20 @@ async def follow_trace(
 
 
 @router.get(
-    "/{thread_id}/trace/entries",
-    response_model=ApiResponse[ConversationTraceEntryPage],
+    "/{thread_id}/trace/graph",
+    response_model=ApiResponse[TraceGraphPage],
 )
-async def query_trace_entries(
+async def query_trace_graph(
     thread_id: ThreadIdPath,
     service: ConversationHistoryDep,
-    where: TraceEntryFilterDep,
+    where: TraceGraphFilterDep,
     cursor: Annotated[str | None, Query(min_length=1, max_length=16_384)] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 100,
-) -> ApiResponse[ConversationTraceEntryPage]:
+) -> ApiResponse[TraceGraphPage]:
     """按当前会话归属直接筛选链路节点"""
 
     return ApiResponse.success(
-        await service.query_trace_entries(
+        await service.query_trace_graph(
             thread_id,
             where=where,
             cursor=cursor,
@@ -199,16 +213,16 @@ async def query_trace_entries(
     )
 
 
-@router.get("/{thread_id}/trace/entries/follow", response_class=StreamingResponse)
-async def follow_trace_entries(
+@router.get("/{thread_id}/trace/graph/follow", response_class=StreamingResponse)
+async def follow_trace_graph(
     thread_id: ThreadIdPath,
     service: ConversationHistoryDep,
-    where: TraceEntryFilterDep,
+    where: TraceGraphFilterDep,
     limit: Annotated[int, Query(ge=1, le=200)] = 100,
 ) -> StreamingResponse:
     """发送链路筛选快照并持续跟随匹配变化"""
 
-    events = await service.follow_trace_entries(
+    events = await service.follow_trace_graph(
         thread_id,
         where=where,
         limit=limit,

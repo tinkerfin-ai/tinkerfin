@@ -203,8 +203,22 @@ class _Recorder(AsyncCallbackHandler):
         parent_run_id: UUID | None = None,
         **kwargs: Any,
     ) -> None:
-        del response, parent_run_id, kwargs
-        self.events.append(("model.completed", str(run_id)))
+        del parent_run_id, kwargs
+        generations = getattr(response, "generations", ())
+        message_ids = tuple(
+            message.id
+            for batch in generations
+            for generation in batch
+            if isinstance(
+                (message := getattr(generation, "message", None)), BaseMessage
+            )
+        )
+        self.events.append(
+            (
+                "model.completed",
+                {"run_id": str(run_id), "message_ids": message_ids},
+            )
+        )
 
     async def on_llm_error(
         self,
@@ -285,14 +299,19 @@ async def test_callbacks_see_the_final_request_and_real_tool_execution() -> None
     )
     recorder = _Recorder()
 
-    async for _part in graph.astream(
+    native_assistant_ids: set[str] = set()
+    async for part in graph.astream(
         {"messages": [HumanMessage(content="original-user", id="original-user-id")]},
         {"callbacks": [recorder]},
         stream_mode=["messages", "tasks", "values"],
         subgraphs=True,
         version="v2",
     ):
-        pass
+        if part.get("type") != "messages":
+            continue
+        message, _metadata = part["data"]
+        if isinstance(message, AIMessage) and message.id is not None:
+            native_assistant_ids.add(message.id)
 
     names = [name for name, _value in recorder.events]
     assert names == [
@@ -309,6 +328,14 @@ async def test_callbacks_see_the_final_request_and_real_tool_execution() -> None
         ("system", "rewritten-system", None),
         ("human", "rewritten-user", "rewritten-user-id"),
     )
+    completed = [
+        value
+        for name, value in recorder.events
+        if name == "model.completed" and isinstance(value, dict)
+    ]
+    assert {
+        message_id for value in completed for message_id in value["message_ids"]
+    } == native_assistant_ids
     tool_start = recorder.events[2][1]
     assert isinstance(tool_start, dict)
     assert tool_start["name"] == "add_values"

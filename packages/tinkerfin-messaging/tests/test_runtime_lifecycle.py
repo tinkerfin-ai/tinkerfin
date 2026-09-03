@@ -29,7 +29,7 @@ from tinkerfin_messaging import (
     RecoveryCheckpoint,
     RunProducerFailed,
 )
-from tinkerfin_messaging.backend import _BackendRunHandle
+from tinkerfin_messaging._messaging_ledger import BackendRunHandle
 
 
 def _identity(*, run_id: str = "run-1") -> RunIdentity:
@@ -147,7 +147,7 @@ def _install_tracking_follow(
     original_follow = messaging._runtime_backend.follow
 
     def tracked_follow(
-        handle: _BackendRunHandle,
+        handle: BackendRunHandle,
         *,
         after: int,
     ) -> AsyncIterator[MessageEnvelope]:
@@ -386,7 +386,7 @@ def _install_delayed_cancel_observer(
 ) -> None:
     original_wait = messaging._runtime_backend.wait_for_cancel
 
-    async def delayed_wait(handle: _BackendRunHandle) -> bool:
+    async def delayed_wait(handle: BackendRunHandle) -> bool:
         requested = await original_wait(handle)
         if requested:
             backend.cancel_is_durable.set()
@@ -1016,7 +1016,7 @@ async def test_immediate_shutdown_after_wrap_closes_source_and_settles_run() -> 
     assert source.close_calls == 1
     status = await asyncio.wait_for(
         messaging._runtime_backend.wait_finished(
-            _BackendRunHandle(
+            BackendRunHandle(
                 channel="events",
                 identity=_identity(),
                 owner_token=None,
@@ -1100,7 +1100,7 @@ async def test_shutdown_honors_durable_cancel_before_watcher_returns() -> None:
     closing = asyncio.create_task(messaging.__aexit__(None, None, None))
     status = await asyncio.wait_for(
         messaging._runtime_backend.wait_finished(
-            _BackendRunHandle(
+            BackendRunHandle(
                 channel="events",
                 identity=_identity(),
                 owner_token=None,

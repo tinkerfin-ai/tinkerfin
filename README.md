@@ -84,7 +84,8 @@ run identity, Trace, AG-UI, or Messaging lifecycle.
 ## Core concepts
 
 - `create_deep_agent(...)` records the installed Deep Agents build call;
-  `open_run()` and `open_agui_run()` are the ordinary managed execution paths.
+  `ainvoke()`, `open_run()`, and `open_agui_run()` are the ordinary managed execution
+  paths.
 - Native Runtime, Plan Mode, Observation, and SSE are included by default;
   `open_agui_run()` requires `tinkerfin[agui]`.
 - `TinkerFin(state_schema=...)` contributes application state to every Deep Agent
@@ -108,11 +109,12 @@ run identity, Trace, AG-UI, or Messaging lifecycle.
   integrations.
 - `.observe(Tracer())` records fail-closed Runtime lifecycle and validated Native semantic
   facts without recording AG-UI, Messaging, SSE, or Redis delivery state.
-- The framework distribution provides the explicit `deepagents-v2` Runtime Profile. It
-  does not provide a Deep Agents v3 Profile or a generic TodoGroups projection/UI.
-  Studio derives its product-specific task trace from canonical Trace facts at query
-  time; another real Profile must emit the same contract without downstream version
-  branches.
+- The default `DeepAgentsV2RuntimeProfile` uses the stable v2 object stream. The explicit
+  Deep Agents v3 integration, `DeepAgentsV3RuntimeProfile`, uses LangGraph's experimental
+  v3 event stream. Both emit the same canonical Runtime observations; Trace, AG-UI,
+  Messaging, and applications do not branch on the selected upstream stream API.
+- `TodoGroups` are Studio projections over canonical Trace facts, not a second Runtime
+  state or persistence format.
 - Archive/S3/Blob, payload encryption/KMS, and OpenTelemetry exporters are not provided.
   Active Trace storage implements `TraceLedgerBackend`; advanced integrations may
   replace `TraceStore`, wrap the canonical codec, observe `RuntimeObserver`, or decorate

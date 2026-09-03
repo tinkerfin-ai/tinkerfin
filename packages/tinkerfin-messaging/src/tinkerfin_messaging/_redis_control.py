@@ -35,6 +35,7 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 from tinkerfin_contracts import RunIdentity
 
 from ._identity import required_identifier, required_identity
+from ._messaging_ledger import BackendRunHandle
 from ._redis_scripts import (
     _BEGIN_DELETE_SCRIPT,
     _BEGIN_EXPIRATION_SCRIPT,
@@ -50,7 +51,6 @@ from ._redis_scripts import (
 from .backend import (
     FinalRunStatus,
     RunStatus,
-    _BackendRunHandle,
     is_final_run_status,
 )
 from .backend_contract import (
@@ -304,7 +304,7 @@ class _RunSnapshot:
         return is_final_run_status(self.status)
 
 
-async def begin_settlement(self: RedisBackend, handle: _BackendRunHandle) -> bool:
+async def begin_settlement(self: RedisBackend, handle: BackendRunHandle) -> bool:
     """Atomically choose an accepted cancellation or ordinary settlement."""
 
     generation = handle.generation
@@ -339,7 +339,7 @@ async def begin_settlement(self: RedisBackend, handle: _BackendRunHandle) -> boo
 
 async def finish(
     self: RedisBackend,
-    handle: _BackendRunHandle,
+    handle: BackendRunHandle,
     *,
     status: FinalRunStatus,
     error: BaseException | None = None,
@@ -402,7 +402,7 @@ async def finish(
         )
 
 
-async def request_cancel(self: RedisBackend, handle: _BackendRunHandle) -> bool:
+async def request_cancel(self: RedisBackend, handle: BackendRunHandle) -> bool:
     """Record one idempotent cancellation request for a cancellable active run."""
 
     keys = await self._keys_for_handle(handle)
@@ -461,7 +461,7 @@ async def _reconcile_current_run_status(
         return snapshot.status
 
 
-async def renew(self: RedisBackend, handle: _BackendRunHandle) -> bool:
+async def renew(self: RedisBackend, handle: BackendRunHandle) -> bool:
     """Renew a lease only while its complete fencing identity still matches."""
 
     generation = handle.generation
@@ -835,7 +835,7 @@ async def _finish_generation_cleanup(
         )
 
 
-async def _complete_generation_cleanup(
+async def complete_generation_cleanup(
     self: RedisBackend,
     *,
     channel: str,
@@ -987,7 +987,7 @@ async def _read_control(
         )
 
 
-async def _keys_for_handle(self: RedisBackend, handle: _BackendRunHandle) -> _RedisKeys:
+async def _keys_for_handle(self: RedisBackend, handle: BackendRunHandle) -> _RedisKeys:
     generation = handle.generation
     if generation is None:
         scope = self._scope(handle.channel, handle.identity)
@@ -1024,7 +1024,7 @@ async def _keys_for_handle(self: RedisBackend, handle: _BackendRunHandle) -> _Re
 
 async def _raise_generation_unavailable(
     self: RedisBackend,
-    handle: _BackendRunHandle,
+    handle: BackendRunHandle,
     *,
     generation: int,
 ) -> Never:
@@ -1489,7 +1489,7 @@ def _snapshot_bytes(value: _RedisScriptValue, *, field: str) -> bytes:
 
 
 def _raise_stream_deleted(
-    handle: _BackendRunHandle,
+    handle: BackendRunHandle,
     *,
     generation: int | None = None,
 ) -> Never:

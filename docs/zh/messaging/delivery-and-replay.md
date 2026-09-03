@@ -31,7 +31,7 @@ body = await channel.sse(
     source,
     identity=identity,
     after=lambda: parse_sse_event_id(request.headers.get("Last-Event-ID")),
-    on_source_starting=activate_business_run,
+    on_source_ready=activate_business_run,
     on_delivery_not_started=cleanup_business_run,
 )
 ```
@@ -39,8 +39,8 @@ body = await channel.sse(
 `after` resolver 只调用一次，并且在 durable prepare 之前执行。`parse_sse_event_id()` 只接受
 canonical 非负 ASCII 十进制值。返回的每帧使用提交序号作为 SSE `id`。
 
-`on_source_starting` 在 source 自有 preflight 之后、producer 创建之前为新 owner 调用一次。
-`on_delivery_not_started` 只在 producer 与 attachment 都未成立时调用；attachment 不调用两者。
+`on_source_ready` 在请求 source 就绪后、producer 创建之前为新 owner 调用一次。
+`on_delivery_not_started` 只在 source 未就绪且 attachment 未成立时调用；attachment 不调用两者。
 返回 body 由调用方拥有，不再消费时必须关闭。
 
 有效 attachment 成立后，Messaging 会关闭未打开的 single-use candidate source，调用方不能复用。

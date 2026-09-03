@@ -81,9 +81,7 @@ async def test_delete_retries_each_destructive_stage_without_restoring_old_autho
         run_id="run-delete",
         parent_run_id=None,
         model_id="main",
-        runtime_profile="deepagents-v2",
         input_json={"runId": "run-delete"},
-        config_json={"runtimeProfile": "deepagents-v2"},
     )
     registration.status = "succeeded"
     registration.terminal_outcome = "succeeded"
@@ -166,9 +164,7 @@ async def test_delete_refuses_an_active_trace_and_restores_summary_status(
         run_id="run-active",
         parent_run_id=None,
         model_id="main",
-        runtime_profile="deepagents-v2",
         input_json={"runId": "run-active"},
-        config_json={"runtimeProfile": "deepagents-v2"},
     )
     registration.status = "waiting"
     thread.last_run_id = registration.run_id

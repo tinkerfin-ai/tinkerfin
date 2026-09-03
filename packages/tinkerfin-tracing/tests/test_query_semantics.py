@@ -8,12 +8,14 @@ from datetime import UTC, datetime
 import pytest
 
 from tinkerfin_contracts import (
+    ModelCallObservation,
     NativeInterruptRecord,
     NativeMessageObservation,
     NativeMessageRecord,
     NativeReasoningObservation,
     NativeStateObservation,
     NativeToolCall,
+    ObservationBoundary,
     RunClosedObservation,
     RunIdentity,
     RunInputKind,
@@ -29,13 +31,103 @@ from tinkerfin_tracing import (
     AmbiguousTraceHead,
     InMemoryTraceStore,
     InvalidTraceCursor,
+    RunFact,
     StateRevisionFact,
     TraceProjectionCheckpoint,
+    TraceQuotaExceeded,
     Tracer,
     TraceRunNotFound,
     TraceThreadNotFound,
     TracingErrorCode,
+    TurnFact,
 )
+from tinkerfin_tracing.graph import (
+    TraceGraphFilter,
+    TraceGraphNodeKind,
+    TraceGraphNodeStatus,
+    TraceGraphQueryLimits,
+)
+from tinkerfin_tracing.store import (
+    TraceGraphNodeRecordPage,
+    TraceThreadKey,
+    TraceWriter,
+)
+
+
+class _RacingGraphStore(InMemoryTraceStore):
+    """Commit one child branch inside the first indexed Graph read."""
+
+    child_writer: TraceWriter | None = None
+
+    async def query_trace_graph(
+        self,
+        key: TraceThreadKey,
+        *,
+        run_ids: tuple[str, ...],
+        where: TraceGraphFilter,
+        limit: int,
+        max_nodes: int = 4000,
+        before_started_at: datetime | None = None,
+        before_node_id: str | None = None,
+    ) -> TraceGraphNodeRecordPage:
+        writer = self.child_writer
+        if writer is not None:
+            self.child_writer = None
+            now = datetime.now(UTC)
+            identity = RunIdentity(threadId="thread-query", runId="race-child")
+            await writer.append(
+                (
+                    RunFact(
+                        source_observation_id="race-child-start",
+                        identity=identity,
+                        occurred_at=now,
+                        monotonic_ns=1,
+                        phase="started",
+                        input_kind="branch",
+                        parent_run_id="race-parent",
+                    ),
+                    TurnFact(
+                        source_observation_id="race-child-turn",
+                        identity=identity,
+                        occurred_at=now,
+                        monotonic_ns=2,
+                        turn_id="turn-race-child",
+                        user_message_id="human-race-child",
+                        parent_run_id="race-parent",
+                    ),
+                )
+            )
+            await writer.append(
+                (
+                    RunFact(
+                        source_observation_id="race-child-terminal",
+                        identity=identity,
+                        occurred_at=now,
+                        monotonic_ns=3,
+                        phase="terminal",
+                        outcome="succeeded",
+                    ),
+                    RunFact(
+                        source_observation_id="race-child-closed",
+                        identity=identity,
+                        occurred_at=now,
+                        monotonic_ns=4,
+                        phase="closed",
+                        outcome="succeeded",
+                    ),
+                ),
+                mandatory=True,
+            )
+            await writer.aclose()
+        return await super().query_trace_graph(
+            key,
+            run_ids=run_ids,
+            where=where,
+            limit=limit,
+            max_nodes=max_nodes,
+            before_started_at=before_started_at,
+            before_node_id=before_node_id,
+        )
 
 
 def _context(
@@ -130,6 +222,214 @@ async def _record(
     await _finish(session, context)
 
 
+async def _record_large_model_call(tracer: Tracer, run_id: str) -> None:
+    context = _context(run_id)
+    session = await _start(tracer, context)
+    now = datetime.now(UTC)
+    await session.observe(
+        ModelCallObservation(
+            identity=context.identity,
+            phase="started",
+            call_id=f"model-{run_id}",
+            model="large-model",
+            messages=(
+                NativeMessageRecord(
+                    message_type="system",
+                    content="s" * 12_000,
+                ),
+                NativeMessageRecord(message_type="human", content="run"),
+            ),
+            observed_at=now,
+            monotonic_ns=3,
+        )
+    )
+    await session.observe(
+        ModelCallObservation(
+            identity=context.identity,
+            phase="completed",
+            call_id=f"model-{run_id}",
+            model="large-model",
+            output_message_ids=(f"assistant-{run_id}",),
+            observed_at=now,
+            monotonic_ns=4,
+        )
+    )
+    await _finish(session, context)
+
+
+async def test_graph_page_prefers_structure_and_marks_omitted_details() -> None:
+    limits = TraceGraphQueryLimits(max_page_bytes=2048)
+    tracer = Tracer(graph_query_limits=limits)
+    await _record_large_model_call(tracer, "bounded-page")
+
+    query = await tracer.query(
+        "thread-query",
+        where=TraceGraphFilter(
+            kinds={TraceGraphNodeKind.MODEL},
+            include_ancestor_nodes=False,
+        ),
+    )
+
+    assert len(query.snapshot.model_dump_json(by_alias=True).encode()) <= 2048
+    assert query.completeness.details_omitted is True
+    assert query.nodes[0].request is None
+    assert query.nodes[0].request_omitted is True
+
+
+async def test_graph_ancestor_expansion_obeys_the_independent_total_limit() -> None:
+    tracer = Tracer(
+        graph_query_limits=TraceGraphQueryLimits(
+            max_direct_nodes=1,
+            max_total_nodes=1,
+        )
+    )
+    await _record_large_model_call(tracer, "bounded-ancestors")
+
+    with pytest.raises(TraceQuotaExceeded) as captured:
+        await tracer.query(
+            "thread-query",
+            where=TraceGraphFilter(
+                kinds={TraceGraphNodeKind.ASSISTANT_MESSAGE},
+                include_ancestor_nodes=True,
+            ),
+            limit=1,
+        )
+    assert captured.value.context["resource"] == "graph_total_nodes"
+
+
+async def test_graph_follow_applies_the_same_page_byte_budget() -> None:
+    tracer = Tracer(graph_query_limits=TraceGraphQueryLimits(max_page_bytes=2048))
+    context = _context("bounded-follow")
+    session = await _start(tracer, context)
+    query = await tracer.query(
+        "thread-query",
+        where=TraceGraphFilter(
+            kinds={TraceGraphNodeKind.ASSISTANT_MESSAGE},
+            include_ancestor_nodes=False,
+        ),
+    )
+    updates = query.follow()
+    pending = asyncio.create_task(anext(updates))
+    now = datetime.now(UTC)
+    await session.observe(
+        NativeMessageObservation(
+            identity=context.identity,
+            namespace=(),
+            message=NativeMessageRecord(
+                message_type="assistant",
+                id="assistant-bounded-follow",
+                content="a" * 12_000,
+            ),
+            observed_at=now,
+            monotonic_ns=3,
+        )
+    )
+    await session.force(ObservationBoundary.CALL_STARTED)
+
+    update = await asyncio.wait_for(pending, timeout=2)
+    assert len(update.model_dump_json(by_alias=True).encode()) <= 2048
+    assert update.completeness.details_omitted is True
+    assert update.node_upserts[0].content is None
+    assert update.node_upserts[0].content_omitted is True
+    await updates.aclose()
+    await _finish(session, context)
+
+
+async def test_graph_cursor_is_fixed_to_filter_head_and_current_tail() -> None:
+    tracer = Tracer()
+    context = _context("graph-cursor")
+    session = await _start(tracer, context)
+    now = datetime.now(UTC)
+    for index in (1, 2):
+        await session.observe(
+            ModelCallObservation(
+                identity=context.identity,
+                phase="started",
+                call_id=f"model-cursor-{index}",
+                model="cursor-model",
+                messages=(NativeMessageRecord(message_type="human", content="cursor"),),
+                observed_at=now,
+                monotonic_ns=2 + index * 2,
+            )
+        )
+        await session.observe(
+            ModelCallObservation(
+                identity=context.identity,
+                phase="completed",
+                call_id=f"model-cursor-{index}",
+                model="cursor-model",
+                observed_at=now,
+                monotonic_ns=3 + index * 2,
+            )
+        )
+    await session.force(ObservationBoundary.CALL_STARTED)
+    where = TraceGraphFilter(
+        kinds={TraceGraphNodeKind.MODEL},
+        include_ancestor_nodes=False,
+    )
+    first = await tracer.query("thread-query", where=where, limit=1)
+    assert first.next_cursor is not None
+    second = await tracer.query(
+        "thread-query",
+        where=where,
+        cursor=first.next_cursor,
+        limit=1,
+    )
+    assert first.nodes[0].id != second.nodes[0].id
+    assert {
+        first.nodes[0].id.rsplit(":", 1)[-1],
+        second.nodes[0].id.rsplit(":", 1)[-1],
+    } == {"model-cursor-1", "model-cursor-2"}
+    with pytest.raises(ValueError, match="current first page"):
+        second.follow()
+
+    updates = first.follow()
+    pending = asyncio.create_task(anext(updates))
+    await session.observe(
+        NativeStateObservation(
+            identity=context.identity,
+            namespace=(),
+            state={"cursor": "advanced-without-a-matching-node"},
+            observed_at=now,
+            monotonic_ns=8,
+        )
+    )
+    await session.force(ObservationBoundary.CALL_STARTED)
+    update = await asyncio.wait_for(pending, timeout=2)
+    assert update.next_cursor is not None
+    assert update.next_cursor != first.next_cursor
+    await updates.aclose()
+    with pytest.raises(InvalidTraceCursor):
+        await tracer.query(
+            "thread-query",
+            where=where,
+            cursor=first.next_cursor,
+            limit=1,
+        )
+    await _finish(session, context)
+
+
+async def test_graph_query_reselects_the_lineage_when_tail_advances_mid_read() -> None:
+    store = _RacingGraphStore()
+    tracer = Tracer(store=store)
+    await _record(tracer, "race-parent")
+    store.child_writer = await store.open_writer(
+        RunIdentity(threadId="thread-query", runId="race-child")
+    )
+
+    query = await tracer.query(
+        "thread-query",
+        head_run_id="race-parent",
+        where=TraceGraphFilter(include_technical_nodes=True),
+        limit=100,
+    )
+
+    assert query.as_of_seq == (await store.snapshot("thread-query")).as_of_seq
+    assert {node.run_id for node in query.nodes} == {"race-parent", "race-child"}
+    assert len(query.turns) == 2
+    assert "turn-race-child" in {turn.id for turn in query.turns}
+
+
 async def test_turn_and_run_status_follow_the_latest_segment_terminal() -> None:
     tracer = Tracer()
     context = _context("status")
@@ -137,16 +437,16 @@ async def test_turn_and_run_status_follow_the_latest_segment_terminal() -> None:
 
     active = await tracer.get("thread-query")
     assert active.status.execution == "running"
-    assert active.tree.roots[0].status == "running"
-    assert next(node for node in active.tree.nodes if node.kind == "run").status == (
+    assert next(node for node in active.graph.nodes if node.kind == "run").status == (
         "running"
     )
 
     await _finish(session, context)
     finished = await tracer.get("thread-query")
-    assert finished.tree.roots[0].status == "succeeded"
-    assert finished.tree.roots[0].completed_at is not None
-    assert next(node for node in finished.tree.nodes if node.kind == "run").status == (
+    finished_run = next(node for node in finished.graph.nodes if node.kind == "run")
+    assert finished_run.status == "succeeded"
+    assert finished_run.completed_at is not None
+    assert next(node for node in finished.graph.nodes if node.kind == "run").status == (
         "succeeded"
     )
 
@@ -177,9 +477,9 @@ async def test_committed_terminal_precedes_the_writer_cleanup_fence() -> None:
         committed = await tracer.get("thread-query")
 
         assert committed.status.execution == "succeeded"
-        assert committed.tree.roots[0].status == "succeeded"
+        assert committed.status.execution == "succeeded"
         assert (
-            next(node for node in committed.tree.nodes if node.kind == "run").status
+            next(node for node in committed.graph.nodes if node.kind == "run").status
             == "succeeded"
         )
     finally:
@@ -208,8 +508,8 @@ async def test_tool_end_does_not_claim_execution_success_before_a_result() -> No
     )
 
     proposed = await tracer.get("thread-query")
-    tool = next(node for node in proposed.tree.nodes if node.kind == "tool")
-    assert tool.status == "running"
+    tool = next(node for node in proposed.graph.nodes if node.kind == "tool")
+    assert tool.status == "waiting"
     assert tool.completed_at is None
 
     await session.observe(
@@ -229,7 +529,7 @@ async def test_tool_end_does_not_claim_execution_success_before_a_result() -> No
         )
     )
     completed = await tracer.get("thread-query")
-    tool = next(node for node in completed.tree.nodes if node.kind == "tool")
+    tool = next(node for node in completed.graph.nodes if node.kind == "tool")
     assert tool.status == "succeeded"
     assert tool.completed_at is not None
     await _finish(session, context)
@@ -317,10 +617,10 @@ async def test_tree_includes_only_the_selected_run_lineage_within_one_turn() -> 
     )
 
     selected = await tracer.get("thread-query", head_run_id="resume-a")
-    run_nodes = tuple(node for node in selected.tree.nodes if node.kind == "run")
+    run_nodes = tuple(node for node in selected.graph.nodes if node.kind == "run")
 
     assert {node.run_id for node in run_nodes} == {"root", "resume-a"}
-    assert selected.tree.roots[0].run_id == "resume-a"
+    assert {turn.id for turn in selected.graph.turns} == {run_nodes[0].turn_id}
 
 
 async def test_missing_prefix_is_scoped_to_the_selected_head_lineage() -> None:
@@ -363,11 +663,11 @@ async def test_implicit_continuation_keeps_the_sole_completed_parent_lineage(
     )
 
     thread = await tracer.get("thread-query")
-    run_nodes = tuple(node for node in thread.tree.nodes if node.kind == "run")
+    run_nodes = tuple(node for node in thread.graph.nodes if node.kind == "run")
 
     assert thread.head_run_id == "implicit-continuation"
     assert thread.completeness.missing_prefix is False
-    assert len(thread.tree.roots) == 1
+    assert len(thread.graph.turns) == 1
     assert {node.run_id for node in run_nodes} == {
         "implicit-parent",
         "implicit-continuation",
@@ -390,7 +690,7 @@ async def test_continuation_without_any_parent_evidence_remains_partial(
     thread = await tracer.get("thread-query")
 
     assert thread.completeness.missing_prefix is True
-    assert thread.tree.roots[0].id.startswith("turn-partial:")
+    assert thread.graph.turns[0].id.startswith("turn-partial:")
 
 
 async def test_implicit_resume_with_multiple_completed_heads_remains_partial() -> None:
@@ -413,7 +713,7 @@ async def test_implicit_resume_with_multiple_completed_heads_remains_partial() -
     thread = await tracer.get("thread-query", head_run_id="ambiguous-resume")
 
     assert thread.completeness.missing_prefix is True
-    assert thread.tree.roots[0].id.startswith("turn-partial:")
+    assert thread.graph.turns[0].id.startswith("turn-partial:")
 
 
 async def test_implicit_resume_does_not_inherit_one_unterminated_head() -> None:
@@ -427,7 +727,7 @@ async def test_implicit_resume_does_not_inherit_one_unterminated_head() -> None:
         thread = await tracer.get("thread-query", head_run_id="active-resume")
 
         assert thread.completeness.missing_prefix is True
-        assert thread.tree.roots[0].id.startswith("turn-partial:")
+        assert thread.graph.turns[0].id.startswith("turn-partial:")
     finally:
         await _finish(active_session, active)
 
@@ -448,7 +748,7 @@ async def test_explicit_continuation_parent_stays_complete(
     thread = await tracer.get("thread-query")
 
     assert thread.completeness.missing_prefix is False
-    assert len(thread.tree.roots) == 1
+    assert len(thread.graph.turns) == 1
 
 
 async def test_follow_skips_commits_from_an_unselected_sibling_branch() -> None:
@@ -518,7 +818,7 @@ async def test_inactive_unterminated_head_is_marked_as_missing_tail() -> None:
     assert thread.completeness.missing_tail is True
 
 
-async def test_nested_subgraph_nodes_parent_work_to_the_nearest_subagent() -> None:
+async def test_nested_subgraph_nodes_do_not_invent_missing_parent_evidence() -> None:
     tracer = Tracer()
     context = _context("nested")
     session = await _start(tracer, context)
@@ -556,13 +856,16 @@ async def test_nested_subgraph_nodes_parent_work_to_the_nearest_subagent() -> No
     )
 
     thread = await tracer.get("thread-query")
-    outer = next(node for node in thread.tree.nodes if node.label == "outer")
-    inner = next(node for node in thread.tree.nodes if node.label == "inner")
-    tool = next(node for node in thread.tree.nodes if node.kind == "tool")
+    outer = next(node for node in thread.graph.nodes if node.name == "outer")
+    inner = next(node for node in thread.graph.nodes if node.name == "inner")
+    tool = next(node for node in thread.graph.nodes if node.kind == "tool")
+    human = next(node for node in thread.graph.nodes if node.kind == "human_message")
 
-    assert outer.parent_id == "run:nested"
-    assert inner.parent_id == outer.id
-    assert tool.parent_id == inner.id
+    assert outer.parent_id == human.id
+    assert inner.parent_id == human.id
+    assert tool.parent_id == human.id
+    assert outer.link_issues
+    assert inner.link_issues
     await _finish(session, context)
 
 
@@ -669,7 +972,7 @@ async def test_resume_with_a_missing_parent_builds_an_explicit_partial_turn() ->
     thread = await tracer.get("thread-query")
 
     assert thread.completeness.missing_prefix is True
-    assert thread.tree.roots[0].id.startswith("turn-partial:")
+    assert thread.graph.turns[0].id.startswith("turn-partial:")
 
 
 async def test_default_window_contains_exactly_the_latest_one_hundred_turns() -> None:
@@ -680,17 +983,17 @@ async def test_default_window_contains_exactly_the_latest_one_hundred_turns() ->
     thread = await tracer.get("thread-query")
 
     assert len(thread.messages) == 100
-    assert len(thread.tree.roots) == 100
+    assert len(thread.graph.turns) == 100
     assert thread.messages[0].source_id == "user-run-005"
     assert thread.messages[-1].source_id == "user-run-104"
-    assert thread.tree.roots[0].run_id == "run-104"
+    assert thread.graph.turns[-1].id.endswith(":run-104")
     assert thread.has_older is True
     assert thread.message_count == 105
     assert thread.tool_call_count == 0
     summary_before = thread.summary
     await thread.load_older(limit=5)
     assert len(thread.messages) == 105
-    assert len(thread.tree.roots) == 105
+    assert len(thread.graph.turns) == 105
     assert thread.has_older is False
     assert thread.message_count == 105
     assert thread.summary == summary_before
@@ -873,7 +1176,7 @@ async def test_same_turn_sibling_resumes_isolate_selected_lineage_views() -> Non
         assert [item.source_id for item in trace.summary.pending_interactions] == [
             expected_interrupt
         ]
-        assert all(node.run_id in selected_runs for node in trace.tree.nodes)
+        assert all(node.run_id in selected_runs for node in trace.graph.nodes)
 
 
 async def test_sibling_message_removal_does_not_mutate_another_head() -> None:
@@ -1083,6 +1386,28 @@ async def test_sibling_reconciliation_result_and_resolution_are_isolated() -> No
     assert [item.source_id for item in selected_b.summary.pending_interactions] == [
         "transition-other"
     ]
+    graph_a = await tracer.query("thread-query", head_run_id="transition-a")
+    graph_b = await tracer.query("thread-query", head_run_id="transition-b")
+    graph_assistant_a = next(
+        node
+        for node in graph_a.nodes
+        if node.kind is TraceGraphNodeKind.ASSISTANT_MESSAGE
+    )
+    graph_assistant_b = next(
+        node
+        for node in graph_b.nodes
+        if node.kind is TraceGraphNodeKind.ASSISTANT_MESSAGE
+    )
+    graph_tool_a = next(
+        node for node in graph_a.nodes if node.kind is TraceGraphNodeKind.TOOL
+    )
+    graph_tool_b = next(
+        node for node in graph_b.nodes if node.kind is TraceGraphNodeKind.TOOL
+    )
+    assert graph_assistant_a.content == "root answer"
+    assert graph_assistant_b.content == "branch-b answer"
+    assert graph_tool_a.status is not TraceGraphNodeStatus.SUCCEEDED
+    assert graph_tool_b.status is TraceGraphNodeStatus.SUCCEEDED
 
 
 async def test_core_summary_rebuild_uses_only_its_current_cache_scope() -> None:
@@ -1172,8 +1497,8 @@ async def test_concurrent_ordinary_runs_remain_independent_heads() -> None:
     await _finish(second, second_context)
     first_head = await tracer.get("thread-query", head_run_id="ordinary-a")
     second_head = await tracer.get("thread-query", head_run_id="ordinary-b")
-    assert first_head.tree.roots[0].run_id == "ordinary-a"
-    assert second_head.tree.roots[0].run_id == "ordinary-b"
+    assert {node.run_id for node in first_head.graph.nodes} == {"ordinary-a"}
+    assert {node.run_id for node in second_head.graph.nodes} == {"ordinary-b"}
     assert first_head.state.root == {"owner": "ordinary-a", "shared": 1}
     assert second_head.state.root == {"owner": "ordinary-b", "shared": 1}
 

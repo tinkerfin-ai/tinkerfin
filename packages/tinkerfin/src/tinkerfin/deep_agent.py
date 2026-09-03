@@ -81,10 +81,6 @@ _NativeAstream = Callable[..., AsyncIterator[Mapping[str, object]]]
 _NativeAstreamFactory = Callable[[], _NativeAstream | Awaitable[_NativeAstream]]
 
 
-class _GraphWithAstream(Protocol):
-    astream: Callable[..., object]
-
-
 class _PlanNativeGraph(Protocol):
     checkpointer: object
 
@@ -117,12 +113,6 @@ _public_create_agent_contract = cast(
     Callable[..., object],
     _deepagents_graph.create_deep_agent,  # pyright: ignore[reportUnknownMemberType]
 )
-
-
-def _graph_astream(graph: object) -> Callable[..., object]:
-    """Read the callable stream boundary from one compiled upstream graph."""
-
-    return cast(_GraphWithAstream, graph).astream
 
 
 def _install_call_handler(
@@ -1866,15 +1856,13 @@ class DeepAgentDefinition(Generic[GraphT, AstreamT]):
 class _EnhancedDeepAgentFactory(Generic[CreateP, GraphT, AstreamT]):
     """Preserve the public factory ParamSpec while resolving each Profile at runtime."""
 
-    __slots__ = ("_factory", "_get_astream")
+    __slots__ = ("_factory",)
 
     def __init__(
         self,
         factory: Callable[CreateP, GraphT],
-        get_astream: Callable[[GraphT], AstreamT],
     ) -> None:
         self._factory = factory
-        self._get_astream = get_astream
 
     @overload
     def __get__(
@@ -1972,7 +1960,10 @@ class _EnhancedDeepAgentFactory(Generic[CreateP, GraphT, AstreamT]):
                 args=cast(tuple[object, ...], args),
                 checkpointer=checkpointer,
                 kwargs=definition_kwargs,
-                get_astream=self._get_astream,
+                get_astream=lambda graph: cast(
+                    AstreamT,
+                    instance._runtime_profile.graph_stream(graph),
+                ),
                 plan_factory=plan_factory,
                 plan_options=instance._plan_options,
                 private_state_keys=private_state_keys,
@@ -1989,9 +1980,10 @@ class _EnhancedDeepAgentFactory(Generic[CreateP, GraphT, AstreamT]):
         return create
 
 
-CREATE_DEEP_AGENT = _EnhancedDeepAgentFactory(
-    _public_create_agent_contract,
-    _graph_astream,
+CREATE_DEEP_AGENT: _EnhancedDeepAgentFactory[..., object, _NativeAstream] = (
+    _EnhancedDeepAgentFactory(
+        _public_create_agent_contract,
+    )
 )
 
 

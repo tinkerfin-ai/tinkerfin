@@ -66,8 +66,10 @@ Graph 关联或持久化身份；Service 会为 Graph 输入与 Trace 快照分�
 `open_agui_run(mode=...)` 使用内部模式，不把该字段重新暴露到 HTTP 契约。command 对象允许
 保留未来命令字段，但当前服务端只解释 `plan`。
 
-模型目录中的 `runtime_profile` 为必填值。当前 Worker 只注册 `deepagents-v2`；Run 注册会固定
-模型与 Profile，同 Run 重试、branch 和 resume 在建图前校验一致性，客户端不能覆盖恢复 Profile。
+Studio 在应用启动时创建一个默认稳定 Runtime，不按模型或 Run 选择底层流实现。Run 注册只固定
+模型和请求快照，同 Run 重试、branch 和 resume 在建图前校验模型一致性。供应商私有思考字段
+默认不解析；产品确需展示思考过程时，应在启动装配处显式启用框架提供的对应解析器，不能写入
+模型配置、会话数据或客户端协议。
 
 ## 会话数据边界
 
@@ -78,16 +80,16 @@ Graph 关联或持久化身份；Service 会为 Graph 输入与 Trace 快照分�
 - `GET /api/conversation/{threadId}/trace` 先发送完整 Trace snapshot，再按提交顺序发送语义增量；
   `includeTaskTrace=true` 时只在任务轨迹实际变化后发送完整 replacement；断连或取消会关闭
   底层 follow iterator 与请求内 projector
-- `GET /api/conversation/{threadId}/trace/entries` 在校验用户归属后由 Trace Store 直接筛选链路
+- `GET /api/conversation/{threadId}/trace/graph` 在校验用户归属后由 Trace Store 直接筛选链路
   节点，支持 kind、status、parent、Agent、middleware、Skill、provider、model、namespace、时间、
   文本、opaque cursor 与祖先补齐；响应中的 Turn 直接引用 Trace 已有 HumanMessage
-- `GET /api/conversation/{threadId}/trace/entries/follow` 先发送同一筛选首页，再持续发送节点
+- `GET /api/conversation/{threadId}/trace/graph/follow` 先发送同一筛选首页，再持续发送节点
   和 Turn 的 upsert/remove、Facet 与完整性变化；断连或取消会关闭底层过滤跟随器
 - `POST /api/conversation/chat` 的当前 owned Run 使用 AG-UI + Messaging；终态会话正文仍以 Trace 为准
 
 Studio 业务表只保存会话归属、Run 注册、interrupt claim 和列表摘要。Trace 的六张表由
 `SqlAlchemyTraceStore.setup()` 自动创建并校验，`database/mysql/schema.sql` 同时提供完整空库 DDL。
-链路查询 entry 表只保存筛选、关系、状态、时间与 Ledger 序号，不保存 request、result、message
+链路 Graph 表只保存筛选、关系、状态、时间与 Ledger 序号，不保存 request、result、message
 或 state payload；详情仍经 Trace codec 读取 Ledger。任务轨迹不写第二份副本、不注册 Projection
 checkpoint，只读取公共 `TraceThread.events()`。
 LangGraph Store 由 `tinkerfin-langgraph-mysql` 通过 asyncmy 管理一条独立连接，进入资源上下文时

@@ -10,7 +10,7 @@ import { ApprovalStatusRow } from '../../conversation/components/ApprovalCard'
 import { ConversationNotice, MessageBlock, ToolCallBatch } from '../../conversation/components/MessageBlock'
 import { PlanQuestionStatusRow } from '../../conversation/components/PlanQuestionComposer'
 import { PlanReviewStatusRow } from '../../conversation/components/PlanReviewCard'
-import { UpdateTasksRow } from '../../conversation/todoTrace/components/UpdateTasksRow'
+import { TodoGroupRow } from '../../conversation/todoTrace/components/TodoGroupRow'
 import type { ConversationDisplayEntry } from '../../conversation/todoTrace/displayEntries'
 import { EmptyConversation } from './EmptyConversation'
 import { WorkspaceStatus } from './WorkspaceStatus'
@@ -146,7 +146,7 @@ export function ConversationViewport({
             {entries.map((entry) => entry.type === 'tools'
               ? <ToolCallBatch key={`batch-${entry.messages[0].id}`} messages={entry.messages} />
               : entry.type === 'todo-group'
-                ? <UpdateTasksRow key={entry.group.id} group={entry.group} message={entry.message} />
+                ? <TodoGroupRow key={entry.group.id} group={entry.group} message={entry.message} />
                 : <MessageBlock
                   key={entry.message.id}
                   message={entry.message}

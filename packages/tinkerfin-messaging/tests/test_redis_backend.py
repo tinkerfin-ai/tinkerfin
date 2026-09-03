@@ -44,7 +44,7 @@ from tinkerfin_messaging import (
 from tinkerfin_messaging import (
     RedisBackend as RedisStorageBackend,
 )
-from tinkerfin_messaging.backend import _BackendRunHandle, _PreparedRun
+from tinkerfin_messaging._messaging_ledger import BackendRunHandle, PreparedRun
 from tinkerfin_messaging.testing import verify_messaging_backend
 
 _RedisStreamEntry = tuple[bytes, dict[bytes, bytes]]
@@ -1183,7 +1183,7 @@ async def test_real_redis_cancelled_consumer_closes_its_pinned_follow_client(
         lease_ttl=30,
         poll_interval=1,
     )
-    prepared: _PreparedRun | None = None
+    prepared: PreparedRun | None = None
     subscription: MessageSubscription[str] | None = None
     consumer: asyncio.Task[None] | None = None
     try:
@@ -1802,7 +1802,7 @@ async def test_real_redis_workers_bind_channel_codec_atomically(
         return_exceptions=True,
     )
 
-    owners = [outcome for outcome in outcomes if isinstance(outcome, _PreparedRun)]
+    owners = [outcome for outcome in outcomes if isinstance(outcome, PreparedRun)]
     mismatches = [outcome for outcome in outcomes if isinstance(outcome, CodecMismatch)]
     assert len(owners) == 1
     assert len(mismatches) == 1
@@ -1814,7 +1814,7 @@ async def test_real_redis_persists_channel_and_stream_metadata_separately(
     redis_backends: tuple[RedisBackendHarness, RedisBackendHarness, Redis],
 ) -> None:
     backend, _, client = redis_backends
-    prepared_runs: list[_PreparedRun] = []
+    prepared_runs: list[PreparedRun] = []
     for index in (1, 2):
         prepared = await backend.prepare(
             channel="events",
@@ -3266,7 +3266,7 @@ async def test_real_redis_recovery_preserves_an_existing_cancel_request(
         recoverable=True,
     )
     requested = await recovering.request_cancel(
-        _BackendRunHandle(
+        BackendRunHandle(
             channel="events",
             identity=_identity(),
             owner_token=None,
@@ -3363,7 +3363,7 @@ async def test_recovered_pending_cancel_survives_source_completion(
     async with Messaging(backend=recovering) as messaging:
         original_wait_for_cancel = messaging._runtime_backend.wait_for_cancel
 
-        async def delayed_wait_for_cancel(handle: _BackendRunHandle) -> bool:
+        async def delayed_wait_for_cancel(handle: BackendRunHandle) -> bool:
             requested = await original_wait_for_cancel(handle)
             if requested:
                 cancel_observed.set()
@@ -3422,7 +3422,7 @@ async def test_public_cancel_settles_an_ownerless_recoverable_run(
             )
 
     replay = recovering.follow(
-        _BackendRunHandle(
+        BackendRunHandle(
             channel="events",
             identity=_identity(),
             owner_token=None,

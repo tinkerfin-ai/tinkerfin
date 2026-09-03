@@ -196,6 +196,7 @@ def test_call_failure_origin_is_exclusive_to_failed_phases() -> None:
             identity=_context().identity,
             phase="failed",
             call_id="model-call",
+            output_message_ids=(),
             error_type="builtins.RuntimeError",
             failure_origin=True,
             observed_at=now,
@@ -244,6 +245,57 @@ def test_call_failure_origin_is_exclusive_to_failed_phases() -> None:
             invalid["error_message"] = None
         with pytest.raises(ValidationError, match="own a failure"):
             type(failure).model_validate(invalid)
+
+
+def test_model_output_message_ids_are_phase_bound_and_canonical() -> None:
+    now = datetime.now(UTC)
+    first_output = ModelCallObservation(
+        identity=_context().identity,
+        phase="first_output",
+        call_id="model-call",
+        output_message_ids=("message-1",),
+        observed_at=now,
+        monotonic_ns=11,
+    )
+    completed = ModelCallObservation(
+        identity=_context().identity,
+        phase="completed",
+        call_id="model-call",
+        output_message_ids=("message-1", "message-2"),
+        observed_at=now,
+        monotonic_ns=12,
+    )
+
+    assert first_output.output_message_ids == ("message-1",)
+    assert completed.output_message_ids == ("message-1", "message-2")
+    with pytest.raises(ValidationError, match="first output or completed"):
+        ModelCallObservation(
+            identity=_context().identity,
+            phase="started",
+            call_id="model-call",
+            messages=(NativeMessageRecord(message_type="human", content="hello"),),
+            output_message_ids=("message-1",),
+            observed_at=now,
+            monotonic_ns=13,
+        )
+    with pytest.raises(ValidationError, match="canonical"):
+        ModelCallObservation(
+            identity=_context().identity,
+            phase="completed",
+            call_id="model-call",
+            output_message_ids=(" message-1",),
+            observed_at=now,
+            monotonic_ns=14,
+        )
+    with pytest.raises(ValidationError, match="unique"):
+        ModelCallObservation(
+            identity=_context().identity,
+            phase="completed",
+            call_id="model-call",
+            output_message_ids=("message-1", "message-1"),
+            observed_at=now,
+            monotonic_ns=15,
+        )
 
 
 def test_resume_and_run_input_contracts_reject_ambiguous_identity() -> None:

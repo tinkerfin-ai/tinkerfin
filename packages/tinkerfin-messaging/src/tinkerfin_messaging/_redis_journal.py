@@ -22,19 +22,19 @@ from uuid import uuid4
 from tinkerfin_contracts import RunIdentity
 
 from ._identity import required_identifier, required_identity
+from ._messaging_ledger import (
+    BackendRunHandle,
+    PreparedRun,
+    validate_append_input,
+)
 from ._redis_control import (
     _SNAPSHOT_PAGE_SIZE,
-    _complete_generation_cleanup,
     _redis_protocol_error,
     _RedisScriptValue,
     _RunSnapshot,
+    complete_generation_cleanup,
 )
 from ._redis_scripts import _APPEND_SCRIPT, _PREPARE_SCRIPT
-from .backend import (
-    _BackendRunHandle,
-    _PreparedRun,
-    _validate_append_input,
-)
 from .errors import (
     BackendOwnershipLost,
     CodecMismatch,
@@ -60,7 +60,7 @@ async def prepare(
     after: int | None,
     cancellable: bool,
     recoverable: bool,
-) -> _PreparedRun:
+) -> PreparedRun:
     """Atomically start, recover, or attach within one thread generation.
 
     The Lua contract validates codec, limits, cursor, active-run exclusion, recovery
@@ -102,7 +102,7 @@ async def prepare(
                 generation=control.generation,
             )
         elif control.state == "expiring":
-            await _complete_generation_cleanup(
+            await complete_generation_cleanup(
                 self,
                 channel=channel,
                 identity=identity,
@@ -153,7 +153,7 @@ async def prepare(
         if code == "GENERATION_CHANGED":
             continue
         if code == "STREAM_EXPIRING":
-            await _complete_generation_cleanup(
+            await complete_generation_cleanup(
                 self,
                 channel=channel,
                 identity=identity,
@@ -207,8 +207,8 @@ async def prepare(
                 position=self._bytes(response[4]),
                 last_message_id=last_id,
             )
-        return _PreparedRun(
-            handle=_BackendRunHandle(
+        return PreparedRun(
+            handle=BackendRunHandle(
                 channel=channel,
                 identity=identity,
                 owner_token=owner_token,
@@ -222,8 +222,8 @@ async def prepare(
         )
     if code != "ATTACH":
         raise _redis_protocol_error(f"unexpected Redis prepare response: {code}")
-    return _PreparedRun(
-        handle=_BackendRunHandle(
+    return PreparedRun(
+        handle=BackendRunHandle(
             channel=channel,
             identity=identity,
             owner_token=None,
@@ -237,7 +237,7 @@ async def prepare(
 
 async def append(
     self: RedisBackend,
-    handle: _BackendRunHandle,
+    handle: BackendRunHandle,
     *,
     message_id: str,
     codec: str,
@@ -265,7 +265,7 @@ async def append(
         MessagingError: Ownership, idempotency, codec, quota, or Redis evidence fails.
     """
 
-    _validate_append_input(
+    validate_append_input(
         handle,
         message_id=message_id,
         codec=codec,

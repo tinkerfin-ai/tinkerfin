@@ -751,7 +751,10 @@ export function WorkspaceScreen({
     hasActiveStream,
     isActiveThread,
     onToast: pushToast,
-    onConversationBoundary: localAttachments.clearAttachments,
+    onConversationBoundary: () => {
+      localAttachments.clearAttachments()
+      setWorkspaceView('conversation')
+    },
   })
 
   const setAgentMode = useCallback((mode: AgentMode) => {

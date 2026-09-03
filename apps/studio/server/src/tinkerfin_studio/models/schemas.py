@@ -16,8 +16,6 @@ from pydantic import (
     model_validator,
 )
 
-from tinkerfin_studio.agent.runtime_profiles import RuntimeProfileId
-
 ModelId = Annotated[
     str,
     StringConstraints(
@@ -32,7 +30,7 @@ ModelId = Annotated[
 class AgentModelWrite(BaseModel):
     """受控模型配置写入使用的边界数据"""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     model_id: ModelId = Field(description="前后端使用的稳定模型 ID")
     display_name: str = Field(min_length=1, max_length=128, description="前端展示名称")
@@ -48,9 +46,6 @@ class AgentModelWrite(BaseModel):
     api_key: SecretStr = Field(description="写入数据库的明文 API 密钥")
     reasoning_enabled: bool = Field(
         default=False, description="是否启用 provider reasoning 参数"
-    )
-    runtime_profile: RuntimeProfileId = Field(
-        description="创建与恢复 Run 使用的已安装 Runtime Profile",
     )
     enabled: bool = Field(default=True, description="是否允许创建新 run")
     is_default: bool = Field(default=False, description="是否设为唯一默认模型")
@@ -80,9 +75,6 @@ class AgentModelCatalogItem(BaseModel):
     reasoning_enabled: bool = Field(
         alias="reasoningEnabled", description="是否启用 reasoning"
     )
-    runtime_profile: RuntimeProfileId = Field(
-        alias="runtimeProfile", description="模型绑定的 Runtime Profile"
-    )
     is_default: bool = Field(alias="isDefault", description="是否为默认模型")
 
 
@@ -109,5 +101,3 @@ class AgentModelConfig(BaseModel):
     base_url: str
     api_key: SecretStr
     reasoning_enabled: bool
-    runtime_profile: RuntimeProfileId
-    updated_at: str

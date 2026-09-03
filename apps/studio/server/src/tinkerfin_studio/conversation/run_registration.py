@@ -112,7 +112,7 @@ class ConversationRunPreparer:
         thread: ConversationThread,
         thread_created: bool = False,
     ) -> PreparedExecution:
-        """原子认领客户端 interrupt ID 并固定 Run 的 Runtime Profile"""
+        """原子认领客户端 interrupt ID 并固定 Run 的模型"""
 
         existing = await self._repository.get_run(
             thread_pk=thread.id,
@@ -281,12 +281,9 @@ class ConversationRunPreparer:
         *,
         model: AgentModelConfig,
     ) -> None:
-        """拒绝客户端用不同模型或 Profile 继续已有 checkpoint"""
+        """拒绝客户端用不同模型继续已有 checkpoint"""
 
-        if (
-            source.model_id != model.model_id
-            or source.runtime_profile != model.runtime_profile
-        ):
+        if source.model_id != model.model_id:
             raise BusinessException(ConversationErrorCode.RUN_IDENTITY_CONFLICT)
 
     async def _create_run(
@@ -306,18 +303,8 @@ class ConversationRunPreparer:
                     run_id=prepared.identity.run_id,
                     parent_run_id=prepared.parent_run_id,
                     model_id=model.model_id,
-                    runtime_profile=model.runtime_profile,
                     input_json=prepared.input_json,
-                    config_json={
-                        "thread_id": prepared.identity.thread_id,
-                        "model_id": model.model_id,
-                        "model_updated_at": model.updated_at,
-                        "runtime_profile": model.runtime_profile,
-                    },
                 )
-                thread.last_run_id = prepared.identity.run_id
-                thread.last_model = model.model_id
-                thread.status = "running"
                 return created, True
         except IntegrityError:
             await self._repository.rollback()
@@ -343,15 +330,11 @@ class ConversationRunPreparer:
         prepared: PreparedRunRequest,
         model: AgentModelConfig,
     ) -> None:
-        """拒绝同 Run 改写输入、模型或 Runtime Profile"""
+        """拒绝同 Run 改写输入或模型"""
 
         if run is None:
             return
-        if (
-            run.input_json != prepared.input_json
-            or run.model_id != model.model_id
-            or run.runtime_profile != model.runtime_profile
-        ):
+        if run.input_json != prepared.input_json or run.model_id != model.model_id:
             raise BusinessException(ConversationErrorCode.RUN_IDENTITY_CONFLICT)
 
 

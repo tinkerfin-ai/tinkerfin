@@ -10,7 +10,7 @@ import pytest
 from pydantic import JsonValue, ValidationError
 
 from tinkerfin_contracts import RunIdentity, RunSourceContext
-from tinkerfin_tracing.capture import CapturedValue, CapturePolicy
+from tinkerfin_tracing.capture import CapturedValue
 from tinkerfin_tracing.codec import CanonicalTracePayloadCodec
 from tinkerfin_tracing.durable_store import InMemoryTraceStore
 from tinkerfin_tracing.errors import (
@@ -34,6 +34,15 @@ from tinkerfin_tracing.tracer import Tracer
 
 def _identity(run_id: str = "run-1") -> RunIdentity:
     return RunIdentity(threadId="thread-1", runId=run_id)
+
+
+def _captured(value: JsonValue) -> CapturedValue:
+    encoded = CanonicalTracePayloadCodec().encode_json(value)
+    return CapturedValue(
+        disposition="inline",
+        safe_size_bytes=len(encoded.data),
+        value=value,
+    )
 
 
 def _fact(
@@ -394,7 +403,7 @@ async def test_append_copies_nested_fact_values_before_returning() -> None:
         message_id="message:copy",
         source_message_id="copy",
         role="assistant",
-        content=CapturePolicy.public_safe().capture(content, max_bytes=4096),
+        content=_captured(content),
     )
     await writer.append((fact,))
     captured = fact.content

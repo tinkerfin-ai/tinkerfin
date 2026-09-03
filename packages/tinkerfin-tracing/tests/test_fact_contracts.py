@@ -133,6 +133,8 @@ def test_failure_origin_serialization_is_stable_for_all_failure_fact_kinds() -> 
                 **_common(),
                 "phase": "failed",
                 "callId": "model:1",
+                "systemMessagePositions": (),
+                "outputMessageIds": (),
                 "errorType": "builtins.RuntimeError",
             }
         ),
@@ -169,6 +171,43 @@ def test_failure_origin_serialization_is_stable_for_all_failure_fact_kinds() -> 
         assert b'"failureOrigin":true' in origin_payload
         assert codec.decode_fact(fallback_payload) == fact
         assert codec.decode_fact(origin_payload) == origin
+
+
+def test_model_call_fact_requires_current_message_link_evidence() -> None:
+    with pytest.raises(ValidationError, match="systemMessagePositions"):
+        ModelCallFact.model_validate(
+            {
+                **_common(),
+                "phase": "failed",
+                "callId": "model:1",
+                "errorType": "builtins.RuntimeError",
+            }
+        )
+    with pytest.raises(ValidationError, match="unique and ordered"):
+        ModelCallFact.model_validate(
+            {
+                **_common(),
+                "phase": "started",
+                "callId": "model:1",
+                "request": CapturedValue(
+                    disposition="inline",
+                    safe_size_bytes=2,
+                    value={},
+                ),
+                "systemMessagePositions": (2, 1),
+                "outputMessageIds": (),
+            }
+        )
+    completed = ModelCallFact.model_validate(
+        {
+            **_common(),
+            "phase": "completed",
+            "callId": "model:1",
+            "systemMessagePositions": (),
+            "outputMessageIds": ("assistant-1",),
+        }
+    )
+    assert completed.output_message_ids == ("assistant-1",)
 
 
 def test_failure_origin_requires_a_failed_terminal_run() -> None:

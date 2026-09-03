@@ -301,7 +301,7 @@ class _OwnedTraceFollow(Generic[_ItemT_co]):
         await _close_trace_source(source, primary_error=None)
 
 
-def _trace_follow(
+def create_trace_follow(
     source_factory: Callable[[], AsyncIterator[_ItemT_co]],
 ) -> TraceFollow[_ItemT_co]:
     return _OwnedTraceFollow(source_factory)

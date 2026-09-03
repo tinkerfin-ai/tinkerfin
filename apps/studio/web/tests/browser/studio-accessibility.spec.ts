@@ -2,6 +2,11 @@ import { expect, test, type Locator, type Page, type Route } from '@playwright/t
 import { resolve } from 'node:path'
 import type { ConversationHistoryDetail } from '../../src/api/conversation/history'
 import type { TaskTraceSnapshot } from '../../src/api/conversation/taskTrace'
+import {
+  emptyTraceGraph,
+  traceGraphNode,
+  traceGraphWithNodes,
+} from '../../src/test/traceFixtures'
 import type { JsonObject, JsonValue, Message } from '../../src/types'
 
 const THREAD_ID = 'browser-thread'
@@ -596,12 +601,17 @@ async function mockStudio(page: Page, {
       }
       return []
     })
-    const subagentNodesByRunId = new Map(
+    const subagentNodeIdsByRunId = new Map(
       historyMessages
         .filter((message) => message.role === 'subagent' && message.meta?.subRunId)
         .map((message) => [message.meta?.subRunId as string, message.id]),
     )
-    const nodes = historyMessages.flatMap((message, index) => {
+    const batchIds = new Set(
+      historyMessages
+        .filter((message) => message.role === 'tool' && message.meta?.batchId)
+        .map((message) => message.meta?.batchId as string),
+    )
+    const graphNodes = historyMessages.flatMap((message, index) => {
       if (
         message.role !== 'tool'
         && message.role !== 'subagent'
@@ -612,38 +622,70 @@ async function mockStudio(page: Page, {
       const status = message.role === 'error'
         ? 'failed' as const
         : rawStatus === 'running'
-        ? 'running' as const
-        : rawStatus === 'paused'
-          ? 'waiting' as const
-          : rawStatus === 'failed'
-            ? 'failed' as const
-            : rawStatus === 'cancelled'
-              ? 'cancelled' as const
-              : 'succeeded' as const
-      return [{
+          ? 'running' as const
+          : rawStatus === 'paused'
+            ? 'waiting' as const
+            : rawStatus === 'failed'
+              ? 'failed' as const
+              : rawStatus === 'cancelled'
+                ? 'cancelled' as const
+                : 'succeeded' as const
+      const request = message.role === 'subagent'
+        ? message.meta?.input
+        : message.meta?.params
+      const result = message.meta?.result
+      return [traceGraphNode({
         id: message.id,
-        traceSeq: (index * 2) + 1,
         parentId: message.role === 'tool'
-          ? subagentNodesByRunId.get(message.meta?.runId ?? '')
+          ? subagentNodeIdsByRunId.get(message.meta?.runId ?? '')
             ?? message.meta?.batchId
             ?? null
           : null,
         kind: message.role === 'tool'
-          ? 'tool' as const
+          ? 'tool'
           : message.role === 'subagent'
-            ? 'subagent' as const
+            ? 'subagent'
             : message.role === 'error'
-              ? 'run' as const
-              : 'plan' as const,
-        label: message.meta?.toolName ?? message.meta?.agentName ?? message.content,
-        runId: 'browser-run',
-        namespace: [],
-        sourceId: message.meta?.toolCallId ?? message.meta?.subRunId ?? message.id,
+              ? 'run'
+              : 'plan',
         status,
+        name: message.meta?.toolName ?? message.meta?.agentName ?? message.content,
+        runId: message.meta?.runId ?? 'browser-run',
+        sourceId: message.role === 'tool'
+          ? message.meta?.toolCallId ?? message.id
+          : message.role === 'subagent'
+            ? message.meta?.subRunId ?? message.id
+            : message.id,
         startedAt: message.createdAt,
-        completedAt: message.meta?.completedAt ?? (status === 'running' ? null : message.createdAt),
-      }]
+        startedSeq: (index * 2) + 1,
+        updatedSeq: (index * 2) + 1,
+        completedAt: status === 'running'
+          ? null
+          : message.meta?.completedAt ?? message.createdAt,
+        request: request ?? null,
+        requestOmitted: request == null,
+        result: result ?? null,
+        resultOmitted: result == null,
+        failure: message.role === 'error'
+          ? { errorType: 'Error', message: message.content }
+          : null,
+      })]
     })
+    const batchParentNodes = [...batchIds].map((batchId) => {
+      const firstChild = graphNodes.find((node) => node.parentId === batchId)
+      return traceGraphNode({
+        id: batchId,
+        kind: 'model',
+        status: firstChild?.status ?? 'succeeded',
+        name: 'Tool batch',
+        runId: firstChild?.runId ?? 'browser-run',
+        startedAt: firstChild?.startedAt ?? BASE_TIME,
+        startedSeq: Math.max(1, (firstChild?.startedSeq ?? 2) - 1),
+        updatedSeq: firstChild?.updatedSeq ?? 1,
+      })
+    })
+    const traceAsOfSeq = Math.max(1, (historyMessages.length * 2) + 1)
+    const graph = traceGraphWithNodes([...batchParentNodes, ...graphNodes], traceAsOfSeq)
     const interactions = approval
       ? [{
           id: 'interaction-browser-approval',
@@ -715,17 +757,16 @@ async function mockStudio(page: Page, {
       threadId: THREAD_ID,
       title: '浏览器会话',
       lastModel: 'GPT-5.5',
-      runtimeProfile: 'deepagents-v2',
       pinned: false,
-      asOfSeq: 151,
+      asOfSeq: traceAsOfSeq,
       headRunId: 'browser-run',
       availableHeads: ['browser-run'],
       historyCursor: null,
       messageCount: traceMessages.filter((message) => message.role !== 'tool').length,
-      toolCallCount: nodes.filter((node) => node.kind === 'tool').length,
+      toolCallCount: historyMessages.filter((message) => message.role === 'tool').length,
       messages: traceMessages,
       reasoning: [],
-      nodes,
+      graph: graphNodes.length > 0 ? graph : emptyTraceGraph(traceAsOfSeq),
       state: {
         root: planQuestion || planReview
           ? { tinkerfin_plan: { effectiveMode: 'plan' } }
@@ -778,8 +819,8 @@ async function mockStudio(page: Page, {
     if (url.pathname === '/api/models') {
       await fulfillJson(route, {
         items: [
-          { modelId: 'GPT-5.5', displayName: 'GPT-5.5', reasoningEnabled: false, runtimeProfile: 'deepagents-v2', isDefault: true },
-          { modelId: 'Qwen-3.7', displayName: 'Qwen-3.7', reasoningEnabled: false, runtimeProfile: 'deepagents-v2', isDefault: false },
+          { modelId: 'GPT-5.5', displayName: 'GPT-5.5', reasoningEnabled: false, isDefault: true },
+          { modelId: 'Qwen-3.7', displayName: 'Qwen-3.7', reasoningEnabled: false, isDefault: false },
         ],
         defaultModelId: 'GPT-5.5',
       })

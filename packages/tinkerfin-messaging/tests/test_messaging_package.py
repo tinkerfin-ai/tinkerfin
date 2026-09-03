@@ -19,6 +19,8 @@ from ag_ui.core import BaseEvent
 
 import tinkerfin_messaging
 import tinkerfin_messaging.backend as backend_module
+import tinkerfin_messaging.messaging as messaging_module
+import tinkerfin_messaging.redis as redis_module
 from tinkerfin_contracts import RunIdentity
 
 
@@ -77,6 +79,8 @@ def test_backend_protocol_exposes_exactly_six_descriptive_operations() -> None:
 def test_removed_backend_handle_shapes_are_not_importable() -> None:
     assert not hasattr(backend_module, "BackendRunHandle")
     assert not hasattr(backend_module, "PreparedRun")
+    assert not hasattr(messaging_module, "PreparedRun")
+    assert not hasattr(redis_module, "BackendRunHandle")
 
 
 @pytest.mark.parametrize(

@@ -2,6 +2,11 @@ import type { PendingInteractionKind, JsonObject, JsonValue } from '../../types'
 import { requestEventStream, requestJson } from '../shared/http'
 import { ConversationError } from './errors'
 import { parseJsonSseStream } from './sse'
+import type {
+  TraceGraph,
+  TraceGraphDelta,
+} from './traceGraph'
+import { parseTraceGraph, parseTraceGraphDelta } from './traceGraph'
 import {
   parseTaskTraceSnapshot,
   type TaskTraceSnapshot,
@@ -62,24 +67,6 @@ export interface TraceReasoning {
   completedAt?: string | null
 }
 
-export interface TraceNode {
-  id: string
-  traceSeq: number
-  parentId?: string | null
-  kind: 'turn' | 'run' | 'task' | 'tool' | 'subagent' | 'plan'
-  label: string
-  runId: string
-  namespace: string[]
-  sourceId?: string | null
-  input?: JsonValue | null
-  inputOmitted: boolean
-  result?: JsonValue | null
-  resultOmitted: boolean
-  status: 'running' | 'waiting' | 'succeeded' | 'failed' | 'cancelled' | 'abandoned' | 'unknown'
-  startedAt: string
-  completedAt?: string | null
-}
-
 export interface TraceInteraction {
   id: string
   traceSeq: number
@@ -116,7 +103,6 @@ export interface ConversationHistoryDetail {
   threadId: string
   title: string
   lastModel?: string | null
-  runtimeProfile: string
   pinned: boolean
   asOfSeq: number
   headRunId: string
@@ -126,7 +112,7 @@ export interface ConversationHistoryDetail {
   toolCallCount: number
   messages: TraceMessage[]
   reasoning: TraceReasoning[]
-  nodes: TraceNode[]
+  graph: TraceGraph
   state: TraceState
   interactions: TraceInteraction[]
   status: TraceStatus
@@ -149,7 +135,7 @@ export interface ConversationTraceUpdate {
   facts: JsonValue[]
   messages: TraceEntityDelta<TraceMessage>
   reasoning: TraceEntityDelta<TraceReasoning>
-  nodes: TraceEntityDelta<TraceNode>
+  graph: TraceGraphDelta
   interactions: TraceEntityDelta<TraceInteraction>
   state: TraceState
   status: TraceStatus
@@ -241,7 +227,11 @@ const parseHistoryDetail = (
   } else if (value.taskTrace !== null) {
     throw new ConversationError('stream_event_invalid')
   }
-  return value as unknown as ConversationHistoryDetail
+  const graph = parseTraceGraph(value.graph)
+  if (graph.asOfSeq !== value.asOfSeq) {
+    throw new ConversationError('stream_event_invalid')
+  }
+  return { ...value, graph } as unknown as ConversationHistoryDetail
 }
 
 const parseTraceEvent = (
@@ -264,7 +254,14 @@ const parseTraceEvent = (
       if (!includeTaskTrace) throw new ConversationError('stream_event_invalid')
       parseTaskTraceSnapshot(record.taskTrace)
     }
-    return record as unknown as ConversationTraceEvent
+    const graph = parseTraceGraphDelta(record.update.graph)
+    if (graph.asOfSeq !== record.update.asOfSeq) {
+      throw new ConversationError('stream_event_invalid')
+    }
+    return {
+      ...record,
+      update: { ...record.update, graph },
+    } as unknown as ConversationTraceEvent
   }
   if (record.type === 'error' && record.code === 'trace_unavailable') {
     return { type: 'error', code: 'trace_unavailable' }

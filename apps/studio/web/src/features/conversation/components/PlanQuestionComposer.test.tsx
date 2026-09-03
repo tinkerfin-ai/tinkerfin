@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { PlanQuestionState } from '../../../types'
 import { PlanQuestionComposer, PlanQuestionStatusRow } from './PlanQuestionComposer'
@@ -43,6 +43,7 @@ const interaction = (): PlanQuestionState => ({
 
 describe('PlanQuestionComposer', () => {
   beforeEach(() => window.sessionStorage.clear())
+  afterEach(() => vi.useRealTimers())
 
   it('takes one question at a time and auto-advances after a selection', () => {
     let current = interaction()
@@ -559,7 +560,9 @@ describe('PlanQuestionComposer', () => {
   })
 
   it('composes bounded date and time selectors without exposing the configured time zone', async () => {
-    const user = userEvent.setup()
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    vi.setSystemTime(new Date('2026-08-28T00:00:00Z'))
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
     let current: PlanQuestionState = {
       ...interaction(),
       activeQuestionIndex: 0,

@@ -536,6 +536,7 @@ describe('前端视觉契约', () => {
     expect(auxiliaryControl).toContain('line-height: var(--type-caption-line);')
     expect(workspaceStyles).toMatch(/\.scroll-to-bottom\s*\{[^}]*opacity:\s*0;[^}]*transition:[^}]*opacity var\(--motion-slow\)/s)
     expect(workspaceStyles).toMatch(/\.scroll-to-bottom\.is-fading\s*\{[^}]*transform:\s*translateY\(var\(--space-2\)\);[^}]*opacity:\s*0;[^}]*pointer-events:\s*none;/s)
+    expect(conversationStyles).toMatch(/\.composer-auxiliary-control\.scroll-to-bottom\s*\{[^}]*border:\s*0;/s)
     expect(workspaceStyles).not.toContain('.scroll-to-bottom::before')
   })
 

@@ -76,7 +76,7 @@ Use channel callbacks for host delivery state:
 ```python
 body = await channel.sse(
     source,
-    on_source_starting=activate_business_run,
+    on_source_ready=activate_business_run,
     on_delivery_not_started=cleanup_business_run,
 )
 ```
@@ -114,13 +114,14 @@ source = DeferredMessageSource(
 | `opener` | Asynchronously creates the source and returns `MessageSourceBinding` |
 | `cancellable` | Declares whether the opened source supports cancellation |
 | `cancel_after_first_item` | Prevents cancellation from overtaking the first protocol event |
-| `on_owner_preflight` | Optional async owner-only activation before producer and opener execution |
+| `on_owner_preflight` | Optional async owner-only source preparation before opener execution |
 
 Attachments and replay-only requests close the deferred wrapper without opening the real source. `cancel_after_first_item=True` is useful for protocols that must emit `RUN_STARTED` first.
 
 Messaging settles `on_owner_preflight` after durable owner selection. A failure releases
 that prepared owner and closes the deferred wrapper before its opener runs. Use it only
-for source-owned preparation; host activation belongs in `on_source_starting`.
+for source-owned preparation; host activation belongs in `on_source_ready` after the
+opener succeeds.
 
 `MessageSourceBinding` holds the source and an optional cancel callback. Leave the callback empty when the source already declares its own.
 

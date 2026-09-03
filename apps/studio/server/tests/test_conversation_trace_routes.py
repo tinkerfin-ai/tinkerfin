@@ -6,7 +6,7 @@ from tinkerfin_studio.api.dependencies import get_conversation_history_service
 from tinkerfin_studio.application import create_application
 
 
-async def test_trace_entry_query_rejects_noncanonical_namespace() -> None:
+async def test_trace_graph_query_rejects_noncanonical_namespace() -> None:
     """非法图命名空间必须在进入业务查询前返回统一校验错误"""
 
     application = create_application(lifespan=None)
@@ -17,7 +17,7 @@ async def test_trace_entry_query_rejects_noncanonical_namespace() -> None:
         base_url="http://test",
     ) as client:
         response = await client.get(
-            "/api/conversation/thread-1/trace/entries",
+            "/api/conversation/thread-1/trace/graph",
             params={"namespace": "tools| invalid"},
         )
 

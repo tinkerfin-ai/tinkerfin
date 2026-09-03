@@ -44,7 +44,7 @@ state = SQLAlchemyOpenSandboxState(
 )
 ```
 
-当前支持 MySQL 5.7 和 MySQL 8.x。MariaDB 不在已验证范围内。
+当前支持 MySQL 5.7 和 MySQL 8.x。
 
 ### 状态参数
 

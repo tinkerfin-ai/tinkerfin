@@ -124,9 +124,9 @@ class ConversationAgentFactory:
         """准备模型、Sandbox、Tool 和 Subagent 后创建 Agent 定义
 
         Args:
-            tinkerfin: 已按模型目录选定并挂载 Trace 的框架门面
+            tinkerfin: 已挂载 Trace 的应用级框架门面
             user_id: 已通过认证的 Studio 用户 ID
-            model_config: 已解密并绑定 Runtime Profile 的模型配置
+            model_config: 已解密的模型连接配置
 
         Returns:
             借用应用级 checkpointer、Store 和 Sandbox 的 Agent 定义

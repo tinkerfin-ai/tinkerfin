@@ -125,11 +125,11 @@ interrupt ID 发生变化时会被拒绝。可选 `RUN_STARTED.input` 中的消�
 | `CancelCallback` | 无参数或接收 `CancelContext`，可返回有限取消尾部 |
 | `CancelContext` | 不可变的 channel 与 RunIdentity |
 | `CommittedCallback` | owner 提交后接收完整 Envelope |
-| `on_source_starting` | source preflight 后、producer 创建前的 owner 专用异步 callback |
-| `on_delivery_not_started` | producer 与 attachment 都未成立时执行的异步清理 |
+| `on_source_ready` | source 就绪后、producer 创建前的 owner 专用异步 callback |
+| `on_delivery_not_started` | source 未就绪且 attachment 未成立时执行的异步清理 |
 
-Attachment 不调用两个 delivery callback。`on_owner_preflight` 属于 source，并且先于
-`on_source_starting`；两者不能互换。
+Attachment 不调用两个 delivery callback。`on_owner_preflight` 属于 source，在 deferred opener
+之前执行；`on_source_ready` 在 opener 完成后执行。
 
 ## 常见错误
 

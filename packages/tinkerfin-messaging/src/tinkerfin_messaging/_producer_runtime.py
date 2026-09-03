@@ -25,7 +25,7 @@ from ._messaging_boundary import (
     _invoke_cancel,
     _read_backend,
 )
-from .backend import _PreparedRun
+from ._messaging_ledger import PreparedRun
 from .errors import BackendOwnershipLost
 from .models import RecoverableMessage, RecoveryCheckpoint
 from .protocols import MessageCodec, MessageSource, RecoverableSource
@@ -117,7 +117,7 @@ def _lease_schedule(self: Messaging) -> tuple[float | None, float | None]:
 async def _renew_lease_forever(
     self: Messaging,
     *,
-    prepared: _PreparedRun,
+    prepared: PreparedRun,
     phase: _LeaseRenewalPhase,
     interval: float,
     timeout: float | None,
@@ -212,7 +212,7 @@ def _log_lease_failure(
 def _start_producer(
     self: Messaging,
     *,
-    prepared: _PreparedRun,
+    prepared: PreparedRun,
     source: MessageSource[ProducedT],
     codec: MessageCodec[SourceT, ReplayT],
     codec_input: Callable[[ProducedT], SourceT] | None,
@@ -247,7 +247,7 @@ def _start_producer(
 async def _open_recoverable_source(
     self: Messaging,
     *,
-    prepared: _PreparedRun,
+    prepared: PreparedRun,
     source: RecoverableSource[SourceT],
 ) -> MessageSource[RecoverableMessage[SourceT]]:
     """Keep distributed ownership alive while a source rebuilds its state."""
@@ -308,7 +308,7 @@ async def _open_recoverable_source(
 def _start_recoverable_producer(
     self: Messaging,
     *,
-    prepared: _PreparedRun,
+    prepared: PreparedRun,
     source: MessageSource[RecoverableMessage[SourceT]],
     codec: MessageCodec[SourceT, ReplayT],
     cancel: _ContextCancelCallback[RecoverableMessage[SourceT]] | None,
@@ -349,7 +349,7 @@ def _start_recoverable_producer(
 def _start_producer_task(
     self: Messaging,
     *,
-    prepared: _PreparedRun,
+    prepared: PreparedRun,
     source: MessageSource[ProducedT],
     codec: MessageCodec[SourceT, ReplayT],
     cancel: _ContextCancelCallback[ProducedT] | None,

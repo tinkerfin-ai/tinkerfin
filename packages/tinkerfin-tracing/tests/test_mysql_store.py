@@ -11,12 +11,13 @@ import sys
 import warnings
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Literal, cast
 from uuid import uuid4
 
 import pytest
 from asyncmy.errors import OperationalError
+from pydantic import JsonValue
 from sqlalchemy import inspect, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError, SAWarning
@@ -26,18 +27,21 @@ from sqlalchemy.pool import AsyncAdaptedQueuePool
 from tinkerfin_contracts import RunIdentity
 from tinkerfin_tracing import (
     CapturedValue,
-    CapturePolicy,
     MessageFact,
     ModelCallFact,
     RunFact,
-    TraceEntryKind,
-    TraceFilter,
+    SubagentFact,
+    ToolExecutionFact,
+    ToolFact,
+    TraceGraphFilter,
+    TraceGraphNodeKind,
     TraceLimits,
     TraceProjectionCheckpoint,
     Tracer,
     TraceStoreOptions,
     verify_trace_ledger_backend,
 )
+from tinkerfin_tracing._graph_projection import project_trace_graph_node
 from tinkerfin_tracing.errors import (
     TraceQuotaExceeded,
     TraceRunConflict,
@@ -50,6 +54,20 @@ from tinkerfin_tracing.sql_store import (
 )
 
 pytestmark = pytest.mark.docker_integration
+
+
+def _captured(value: JsonValue) -> CapturedValue:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    return CapturedValue(
+        disposition="inline",
+        safe_size_bytes=len(encoded),
+        value=value,
+    )
 
 
 async def test_mysql_cancelled_reads_return_pool_capacity(
@@ -67,15 +85,17 @@ async def test_mysql_cancelled_reads_return_pool_capacity(
         snapshot = await store.snapshot(_identity("cancelled-read").thread_id)
         blocker = await blocker_engine.connect()
         try:
-            await blocker.exec_driver_sql("LOCK TABLES tinkerfin_trace_entries WRITE")
+            await blocker.exec_driver_sql(
+                "LOCK TABLES tinkerfin_trace_graph_nodes WRITE"
+            )
             caplog.clear()
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always")
                 query = asyncio.create_task(
-                    store.query_trace_entries(
+                    store.query_trace_graph(
                         snapshot.key,
                         run_ids=("cancelled-read",),
-                        where=TraceFilter(),
+                        where=TraceGraphFilter(),
                         limit=10,
                     )
                 )
@@ -173,97 +193,372 @@ async def test_mysql_cancelled_writes_preserve_data_and_return_pool_capacity(
         await engine.dispose()
 
 
-async def test_mysql_entry_query_filters_and_joins_ledger_details() -> None:
+async def test_mysql_graph_query_filters_and_joins_ledger_details() -> None:
     engine = create_async_engine(_url(), pool_pre_ping=True)
-    namespace = f"mysql-entry-query-{uuid4().hex}"
+    namespace = f"mysql-graph-query-{uuid4().hex}"
     store = SqlAlchemyTraceStore(engine, namespace=namespace)
-    writer = await store.open_writer(_identity("entry-query"))
+    writer = await store.open_writer(_identity("graph-query"))
     marker = "mysql-final-request"
     now = datetime.now(UTC)
     try:
         await writer.append(
             (
-                _fact("entry-query", "started"),
+                _fact("graph-query", "started"),
                 ModelCallFact(
                     source_observation_id="mysql-model-start",
-                    identity=_identity("entry-query"),
+                    identity=_identity("graph-query"),
                     occurred_at=now,
                     monotonic_ns=2,
                     phase="started",
                     call_id="mysql-model-call",
+                    system_message_positions=(),
+                    output_message_ids=(),
                     provider="deepseek",
                     model="deepseek-chat",
-                    request=CapturePolicy.public_history().capture(
-                        {"messages": [{"content": marker}]},
-                        max_bytes=4096,
-                    ),
+                    request=_captured({"messages": [{"content": marker}]}),
                 ),
                 ModelCallFact(
                     source_observation_id="mysql-model-completed",
-                    identity=_identity("entry-query"),
+                    identity=_identity("graph-query"),
                     occurred_at=now,
                     monotonic_ns=3,
                     phase="completed",
                     call_id="mysql-model-call",
+                    system_message_positions=(),
+                    output_message_ids=(),
                 ),
             )
         )
-        snapshot = await store.snapshot(_identity("entry-query").thread_id)
-        page = await store.query_trace_entries(
+        snapshot = await store.snapshot(_identity("graph-query").thread_id)
+        page = await store.query_trace_graph(
             snapshot.key,
-            run_ids=("entry-query",),
-            where=TraceFilter(
-                kinds={TraceEntryKind.PROVIDER},
+            run_ids=("graph-query",),
+            where=TraceGraphFilter(
+                kinds={TraceGraphNodeKind.MODEL},
                 providers={"deepseek"},
                 search="deepseek-chat",
             ),
             limit=10,
         )
 
-        assert len(page.entries) == 1
-        start_fact = page.entries[0].started_event.fact
+        assert len(page.nodes) == 1
+        start_fact = page.nodes[0].started_event.fact
         assert isinstance(start_fact, ModelCallFact)
         assert start_fact.request is not None
         assert start_fact.request.value == {"messages": [{"content": marker}]}
-        literal_wildcard = await store.query_trace_entries(
+        literal_wildcard = await store.query_trace_graph(
             snapshot.key,
-            run_ids=("entry-query",),
-            where=TraceFilter(
-                kinds={TraceEntryKind.PROVIDER},
+            run_ids=("graph-query",),
+            where=TraceGraphFilter(
+                kinds={TraceGraphNodeKind.MODEL},
                 search="%",
             ),
             limit=10,
         )
-        assert literal_wildcard.entries == ()
+        assert literal_wildcard.nodes == ()
         async with engine.connect() as connection:
             plan = (
                 (
                     await connection.execute(
                         text(
-                            "EXPLAIN SELECT entry_id FROM tinkerfin_trace_entries "
-                            "WHERE namespace_hash = SHA2(:namespace, 256) "
-                            "AND thread_hash = SHA2(:thread_id, 256) "
+                            "EXPLAIN SELECT node_id "
+                            "FROM tinkerfin_trace_graph_nodes "
+                            "WHERE namespace_hash = UNHEX(SHA2(:namespace, 256)) "
+                            "AND thread_hash = UNHEX(SHA2(:thread_id, 256)) "
                             "AND generation = :generation "
-                            "AND run_hash = SHA2(:run_id, 256) "
+                            "AND run_hash = UNHEX(SHA2(:run_id, 256)) "
                             "AND kind = 'model'"
                         ),
                         {
                             "namespace": namespace,
                             "thread_id": snapshot.key.thread_id,
                             "generation": snapshot.key.generation,
-                            "run_id": "entry-query",
+                            "run_id": "graph-query",
                         },
                     )
                 )
                 .mappings()
                 .one()
             )
-        assert plan["key"] in {
-            "ix_tinkerfin_trace_entries_run",
-            "ix_tinkerfin_trace_entries_kind_status",
-        }
+            index_names = await connection.run_sync(
+                lambda sync_connection: {
+                    item["name"]
+                    for item in inspect(sync_connection).get_indexes(
+                        "tinkerfin_trace_graph_nodes"
+                    )
+                }
+            )
+        assert plan["key"] in {"PRIMARY", "ix_tinkerfin_trace_graph_run"}
+        assert index_names == {"ix_tinkerfin_trace_graph_run"}
     finally:
         await writer.aclose()
+        await engine.dispose()
+
+
+async def test_mysql_graph_clears_a_tool_parent_gap_after_model_completion() -> None:
+    engine = create_async_engine(_url(), pool_pre_ping=True)
+    store = SqlAlchemyTraceStore(
+        engine,
+        namespace=f"mysql-resolved-tool-parent-{uuid4().hex}",
+    )
+    identity = _identity("resolved-tool-parent")
+    writer = await store.open_writer(identity)
+    now = datetime.now(UTC)
+    model_id = "mysql-parent-model"
+    try:
+        await writer.append(
+            (
+                _fact("resolved-tool-parent", "started"),
+                ModelCallFact(
+                    source_observation_id="mysql-parent-model-start",
+                    identity=identity,
+                    occurred_at=now,
+                    monotonic_ns=2,
+                    phase="started",
+                    call_id=model_id,
+                    parent_call_id="agent-call",
+                    request=_captured({"messages": []}),
+                    system_message_positions=(),
+                    output_message_ids=(),
+                ),
+                ToolFact(
+                    source_observation_id="mysql-parent-tool-start",
+                    identity=identity,
+                    occurred_at=now,
+                    monotonic_ns=3,
+                    phase="started",
+                    tool_call_id="tool-call",
+                    source_tool_call_id="tool-call",
+                    tool_name="read_file",
+                ),
+            )
+        )
+        await writer.append(
+            (
+                ModelCallFact(
+                    source_observation_id="mysql-parent-model-complete",
+                    identity=identity,
+                    occurred_at=now,
+                    monotonic_ns=4,
+                    phase="completed",
+                    call_id=model_id,
+                    system_message_positions=(),
+                    output_message_ids=(),
+                    tool_call_ids=("tool-call",),
+                ),
+            )
+        )
+        await writer.append(
+            (
+                _fact("resolved-tool-parent", "terminal"),
+                _fact("resolved-tool-parent", "closed"),
+            ),
+            mandatory=True,
+        )
+        await writer.aclose()
+        snapshot = await store.snapshot(identity.thread_id)
+        page = await store.query_trace_graph(
+            snapshot.key,
+            run_ids=(identity.run_id,),
+            where=TraceGraphFilter(
+                kinds={TraceGraphNodeKind.TOOL},
+                include_ancestor_nodes=False,
+            ),
+            limit=10,
+        )
+
+        assert len(page.nodes) == 1
+        assert page.nodes[0].structural_parent_id == model_id
+        assert page.nodes[0].link_issue is None
+        await store.delete(snapshot.key)
+    finally:
+        await writer.aclose()
+        await engine.dispose()
+
+
+async def test_mysql_graph_keeps_lineage_parent_and_tool_failure_evidence() -> None:
+    engine = create_async_engine(_url(), pool_pre_ping=True)
+    store = SqlAlchemyTraceStore(
+        engine,
+        namespace=f"mysql-lineage-failure-{uuid4().hex}",
+    )
+    parent_identity = _identity("lineage-parent")
+    child_identity = _identity("lineage-child")
+    parent = await store.open_writer(parent_identity)
+    child = await store.open_writer(child_identity)
+    now = datetime.now(UTC)
+    try:
+        await parent.append(
+            (
+                _fact(parent_identity.run_id, "started"),
+                SubagentFact(
+                    source_observation_id="mysql-subagent-start",
+                    identity=parent_identity,
+                    occurred_at=now,
+                    monotonic_ns=2,
+                    phase="started",
+                    subagent_id="mysql-subagent",
+                    agent_name="KÄ研究Researcher",
+                    parent_tool_call_id="call-task",
+                    input=_captured({"description": "research"}),
+                    status="running",
+                ),
+                ToolFact(
+                    source_observation_id="mysql-tool-start",
+                    identity=parent_identity,
+                    occurred_at=now,
+                    monotonic_ns=3,
+                    phase="started",
+                    tool_call_id="mysql-tool",
+                    source_tool_call_id="mysql-tool",
+                    parent_call_id="mysql-model",
+                    tool_name="read_file",
+                ),
+                ToolExecutionFact(
+                    source_observation_id="mysql-execution-start",
+                    identity=parent_identity,
+                    occurred_at=now,
+                    monotonic_ns=4,
+                    phase="started",
+                    execution_id="mysql-execution",
+                    source_tool_call_id="mysql-tool",
+                    tool_name="read_file",
+                    input=_captured({"path": "missing.txt"}),
+                ),
+                ToolExecutionFact(
+                    source_observation_id="mysql-execution-failed",
+                    identity=parent_identity,
+                    occurred_at=now,
+                    monotonic_ns=5,
+                    phase="failed",
+                    execution_id="mysql-execution",
+                    source_tool_call_id="mysql-tool",
+                    tool_name="read_file",
+                    error_type="FileNotFoundError",
+                    error_message=_captured("missing.txt was not found"),
+                    failure_origin=True,
+                ),
+                ToolFact(
+                    source_observation_id="mysql-tool-result",
+                    identity=parent_identity,
+                    occurred_at=now,
+                    monotonic_ns=6,
+                    phase="result",
+                    tool_call_id="mysql-tool",
+                    source_tool_call_id="mysql-tool",
+                    parent_call_id="mysql-model",
+                    tool_name="read_file",
+                    content=_captured("tool error result"),
+                    result_status="error",
+                ),
+            )
+        )
+        await child.append(
+            (
+                _fact(child_identity.run_id, "started"),
+                SubagentFact(
+                    source_observation_id="mysql-subagent-completed",
+                    identity=child_identity,
+                    occurred_at=now - timedelta(seconds=5),
+                    monotonic_ns=7,
+                    phase="completed",
+                    subagent_id="mysql-subagent",
+                    agent_name="KÄ研究Researcher",
+                    status="succeeded",
+                ),
+            )
+        )
+        snapshot = await store.snapshot(parent_identity.thread_id)
+        page = await store.query_trace_graph(
+            snapshot.key,
+            run_ids=(parent_identity.run_id, child_identity.run_id),
+            where=TraceGraphFilter(
+                kinds={TraceGraphNodeKind.SUBAGENT, TraceGraphNodeKind.TOOL},
+                include_ancestor_nodes=False,
+            ),
+            limit=10,
+        )
+        subagent = next(
+            node for node in page.nodes if node.kind is TraceGraphNodeKind.SUBAGENT
+        )
+        tool = next(node for node in page.nodes if node.kind is TraceGraphNodeKind.TOOL)
+        projected_tool = project_trace_graph_node(
+            tool,
+            turn_id="turn:mysql",
+            parent_id=None,
+            relationship_missing=False,
+        )
+
+        assert subagent.structural_parent_id is not None
+        assert subagent.link_issue is None
+        assert subagent.started_at == now
+        assert projected_tool.result == "tool error result"
+        assert projected_tool.failure is not None
+        assert projected_tool.failure.error_type == "FileNotFoundError"
+        assert projected_tool.failure.message == "missing.txt was not found"
+        exact_unicode = await store.query_trace_graph(
+            snapshot.key,
+            run_ids=(parent_identity.run_id, child_identity.run_id),
+            where=TraceGraphFilter(
+                kinds={TraceGraphNodeKind.SUBAGENT},
+                search="Ä",
+            ),
+            limit=10,
+        )
+        different_unicode_case = await store.query_trace_graph(
+            snapshot.key,
+            run_ids=(parent_identity.run_id, child_identity.run_id),
+            where=TraceGraphFilter(
+                kinds={TraceGraphNodeKind.SUBAGENT},
+                search="ä",
+            ),
+            limit=10,
+        )
+        exact_chinese = await store.query_trace_graph(
+            snapshot.key,
+            run_ids=(parent_identity.run_id, child_identity.run_id),
+            where=TraceGraphFilter(
+                kinds={TraceGraphNodeKind.SUBAGENT},
+                search="研究",
+            ),
+            limit=10,
+        )
+        exact_kelvin = await store.query_trace_graph(
+            snapshot.key,
+            run_ids=(parent_identity.run_id, child_identity.run_id),
+            where=TraceGraphFilter(
+                kinds={TraceGraphNodeKind.SUBAGENT},
+                search="K",
+            ),
+            limit=10,
+        )
+        ascii_does_not_fold_kelvin = await store.query_trace_graph(
+            snapshot.key,
+            run_ids=(parent_identity.run_id, child_identity.run_id),
+            where=TraceGraphFilter(
+                kinds={TraceGraphNodeKind.SUBAGENT},
+                search="k",
+            ),
+            limit=10,
+        )
+        ascii_case_insensitive = await store.query_trace_graph(
+            snapshot.key,
+            run_ids=(parent_identity.run_id, child_identity.run_id),
+            where=TraceGraphFilter(
+                kinds={TraceGraphNodeKind.SUBAGENT},
+                search="RESEARCHER",
+            ),
+            limit=10,
+        )
+        assert len(exact_unicode.nodes) == 1
+        assert different_unicode_case.nodes == ()
+        assert len(exact_chinese.nodes) == 1
+        assert len(exact_kelvin.nodes) == 1
+        assert ascii_does_not_fold_kelvin.nodes == ()
+        assert len(ascii_case_insensitive.nodes) == 1
+    finally:
+        await parent.aclose()
+        await child.aclose()
         await engine.dispose()
 
 
@@ -797,7 +1092,8 @@ async def test_mysql_writer_lease_starts_after_namespace_lock_wait() -> None:
                 text(
                     "SELECT TIMESTAMPDIFF(MICROSECOND, UTC_TIMESTAMP(6), "
                     "lease_expires_at) FROM tinkerfin_trace_writers "
-                    "WHERE namespace_hash = SHA2(:namespace, 256) AND run_id = :run_id"
+                    "WHERE namespace_hash = UNHEX(SHA2(:namespace, 256)) "
+                    "AND run_id = :run_id"
                 ),
                 {"namespace": namespace, "run_id": identity.run_id},
             )

@@ -50,7 +50,7 @@ async with Messaging() as messaging:
     body = await channel.sse(
         source,
         after=0,
-        on_source_starting=activate_business_run,
+        on_source_ready=activate_business_run,
         on_delivery_not_started=cleanup_business_run,
     )
 
@@ -119,10 +119,11 @@ optional `RunAgentInput` is the caller's complete authoritative input and cannot
 changed. Use the advanced unprofiled `map_source()` boundary when the output protocol
 itself must change.
 
-`on_source_starting` belongs to the channel and activates host delivery only for a new
-owner. `on_delivery_not_started` cleans up when neither a producer nor an attachment was
-established. Attachments invoke neither callback. Source-owned `on_owner_preflight`
-remains a separate advanced hook for preparing the source itself.
+`on_source_ready` belongs to the channel and activates host delivery only for a new
+owner after the request-owned source is open and ready. `on_delivery_not_started` cleans
+up only when readiness was never reached and no attachment was established. Attachments
+invoke neither callback. Source-owned `on_owner_preflight` remains a separate advanced
+hook that runs before a deferred source is opened.
 
 An attachment does not open the unused candidate source, but Messaging does close that
 single-use candidate before returning the attached subscription. Callers must not reuse
@@ -134,7 +135,7 @@ Use `DeferredMessageSource` when only the durable owner should build an expensiv
 
 Set `on_owner_preflight` only when a custom source must prepare its own state after
 durable owner selection but before the producer task or opener starts. Host delivery
-activation belongs in the channel's `on_source_starting` callback.
+activation belongs in the channel's `on_source_ready` callback.
 
 Use `RecoverableSource` and `RecoverableMessage` when a producer can rebuild from the last atomically committed checkpoint. Stable message IDs make commits idempotent; external side effects still require application-level idempotency.
 

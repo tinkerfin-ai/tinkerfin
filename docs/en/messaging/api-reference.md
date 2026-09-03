@@ -129,11 +129,11 @@ it never interprets or persists the token.
 | `CancelCallback` | Zero arguments or one `CancelContext`; may return a finite tail |
 | `CancelContext` | Immutable channel and RunIdentity |
 | `CommittedCallback` | Receives owner commits after append |
-| `on_source_starting` | Owner-only async callback after source preflight and before producer creation |
-| `on_delivery_not_started` | Async cleanup when neither producer nor attachment was established |
+| `on_source_ready` | Owner-only async callback after source readiness and before producer creation |
+| `on_delivery_not_started` | Async cleanup when readiness and attachment were both absent |
 
 Attachments invoke neither delivery callback. `on_owner_preflight` belongs to the source
-and runs before `on_source_starting`; the two callbacks are not interchangeable.
+and runs before a deferred opener; `on_source_ready` runs after that opener completes.
 
 ## Common errors
 

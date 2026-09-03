@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field, JsonValue
 
 from tinkerfin_contracts import RunTerminalOutcome
 
+from ._ids import scope_id
 from ._models import TraceModel
 from .capture import CapturedValue
 from .errors import (
@@ -22,36 +23,32 @@ from .errors import (
     TraceRunNotFound,
 )
 from .facts import (
-    AgentStepFact,
     InteractionFact,
     MessageFact,
     PlanRevisionFact,
     ReasoningFact,
     RunFact,
-    RuntimeTaskFact,
     StateRevisionFact,
-    SubagentFact,
     ToolFact,
     TraceEvent,
     TraceSemanticFact,
     TurnFact,
 )
+from .graph import TraceGraphTurn
 from .views import (
     TraceCompleteness,
     TraceInteraction,
     TraceMessage,
-    TraceNode,
     TraceReasoning,
     TraceState,
     TraceStatus,
     TraceSummary,
-    TraceTree,
 )
 
 ProjectionStateT = TypeVar("ProjectionStateT", bound=BaseModel)
 ProjectionResultT = TypeVar("ProjectionResultT", bound=BaseModel)
 MessageRole: TypeAlias = Literal["user", "assistant", "tool", "system", "other"]
-NodeStatus: TypeAlias = Literal[
+ExecutionStatus: TypeAlias = Literal[
     "running",
     "waiting",
     "succeeded",
@@ -139,14 +136,11 @@ class _MutableReasoning:
 class CoreProjection:
     """Internal complete fold used to build one public TraceThread view."""
 
-    facts: tuple[TraceSemanticFact, ...]
-    selected_facts: tuple[TraceSemanticFact, ...]
     selected_run_ids: frozenset[str]
     selected_head: str
     available_heads: tuple[str, ...]
     messages: tuple[TraceMessage, ...]
     reasoning: tuple[TraceReasoning, ...]
-    tree: TraceTree
     state: TraceState
     interactions: tuple[TraceInteraction, ...]
     summary: TraceSummary
@@ -195,9 +189,8 @@ class CoreRunCheckpoint(TraceModel):
     has_state_changes: bool = False
     messages: tuple[TraceMessage, ...] = ()
     reasoning: tuple[TraceReasoning, ...] = ()
-    tree_facts: tuple[TraceSemanticFact, ...] = ()
-    tree_sequences: tuple[int, ...] = ()
     has_view_changes: bool = False
+    own_tool_call_count: int = 0
     payload_omitted: bool = False
     missing_prefix: bool = False
     interaction_facts: tuple[InteractionFact, ...] = ()
@@ -218,8 +211,8 @@ class CoreProjectionState(TraceModel):
     """Serializable incremental state for bounded core Trace queries.
 
     The state keeps Turn paging metadata and one independent cumulative snapshot per
-    Run. A child inherits its parent snapshot once, then message, reasoning, state, and
-    tree transitions advance without sharing mutable sibling materialization.
+    Run. A child inherits its parent snapshot once, then message, reasoning, and state
+    transitions advance without sharing mutable sibling materialization.
     """
 
     generation: str | None = None
@@ -325,15 +318,6 @@ def project_core(
         _status(runs[selected_head], active_run_ids),
         pending_interactions,
     )
-    tree = _tree(
-        visible_facts,
-        trace_sequences=tuple(event.trace_seq for event in visible_events),
-        runs=runs,
-        run_turns=run_turns,
-        visible_turns=visible_turns,
-        visible_run_ids=visible_runs,
-        active_run_ids=active_run_ids,
-    )
     message_count = sum(
         message.role in {"user", "assistant"}
         for message in _messages(
@@ -354,14 +338,11 @@ def project_core(
         last_occurred_at=max(fact.occurred_at for fact in selected_facts),
     )
     return CoreProjection(
-        facts=facts,
-        selected_facts=selected_facts,
         selected_run_ids=frozenset(lineage),
         selected_head=selected_head,
         available_heads=tuple(sorted(heads)),
         messages=messages,
         reasoning=reasoning,
-        tree=tree,
         state=state,
         interactions=interactions,
         summary=summary,
@@ -421,8 +402,6 @@ def advance_core_projection_state(
             ),
             messages=() if parent is None else parent.messages,
             reasoning=() if parent is None else parent.reasoning,
-            tree_facts=() if parent is None else parent.tree_facts,
-            tree_sequences=() if parent is None else parent.tree_sequences,
             payload_omitted=False if parent is None else parent.payload_omitted,
             missing_prefix=(parent_run_id is not None and parent is None)
             or (False if parent is None else parent.missing_prefix),
@@ -460,16 +439,6 @@ def advance_core_projection_state(
                     info.reasoning
                     if info.has_view_changes or parent is None
                     else parent.reasoning
-                ),
-                "tree_facts": (
-                    info.tree_facts
-                    if info.has_view_changes or parent is None
-                    else parent.tree_facts
-                ),
-                "tree_sequences": (
-                    info.tree_sequences
-                    if info.has_view_changes or parent is None
-                    else parent.tree_sequences
                 ),
                 "payload_omitted": info.payload_omitted
                 or (False if parent is None else parent.payload_omitted),
@@ -637,28 +606,15 @@ def advance_core_projection_state(
             fact,
             trace_seq=event.trace_seq,
         )
-        tree_facts = info.tree_facts
-        tree_sequences = info.tree_sequences
-        if isinstance(
-            fact,
-            AgentStepFact
-            | RuntimeTaskFact
-            | ToolFact
-            | SubagentFact
-            | PlanRevisionFact,
-        ):
-            tree_facts = (*tree_facts, fact)
-            tree_sequences = (*tree_sequences, event.trace_seq)
         info = info.model_copy(
             update={
                 "messages": messages,
                 "reasoning": reasoning,
-                "tree_facts": tree_facts,
-                "tree_sequences": tree_sequences,
+                "own_tool_call_count": info.own_tool_call_count
+                + int(isinstance(fact, ToolFact) and fact.phase == "started"),
                 "has_view_changes": info.has_view_changes
                 or messages != info.messages
-                or reasoning != info.reasoning
-                or tree_facts != info.tree_facts,
+                or reasoning != info.reasoning,
             }
         )
 
@@ -786,6 +742,71 @@ def select_core_projection_window(
         first_seq=first_seq,
         has_older=len(selected_turns) > len(visible_turns),
     )
+
+
+def trace_graph_turns(
+    state: CoreProjectionState,
+    window: CoreProjectionWindow,
+    *,
+    selected_turn_ids: set[str],
+) -> tuple[TraceGraphTurn, ...]:
+    """Resolve Graph Turns and their deterministic HumanMessage roots."""
+
+    lineage_turn_ids = {
+        window.run_turns[run_id]
+        for run_id in window.selected_run_ids
+        if run_id in window.run_turns
+    }
+    ordered_turn_ids = [
+        turn_id for turn_id in state.turn_order if turn_id in lineage_turn_ids
+    ]
+    missing_turn_ids = lineage_turn_ids - set(ordered_turn_ids)
+    ordered_turn_ids.extend(
+        sorted(
+            missing_turn_ids,
+            key=lambda turn_id: min(
+                state.runs[run_id].first_seq
+                for run_id in window.selected_run_ids
+                if window.run_turns.get(run_id) == turn_id and run_id in state.runs
+            ),
+        )
+    )
+    ordinals = {
+        turn_id: ordinal for ordinal, turn_id in enumerate(ordered_turn_ids, start=1)
+    }
+    turns: list[TraceGraphTurn] = []
+    for turn_id in ordered_turn_ids:
+        if turn_id not in selected_turn_ids:
+            continue
+        checkpoint = state.turns.get(turn_id)
+        run_ids = (
+            checkpoint.run_ids
+            if checkpoint is not None
+            else tuple(
+                run_id
+                for run_id in window.selected_run_ids
+                if window.run_turns.get(run_id) == turn_id
+            )
+        )
+        if not run_ids:
+            raise TraceCorruption("Trace Graph Turn checkpoint is unavailable")
+        run_checkpoints = tuple(
+            state.runs[run_id] for run_id in run_ids if run_id in state.runs
+        )
+        if not run_checkpoints:
+            raise TraceCorruption("Trace Graph Turn has no available Run")
+        root_source_id = (
+            turn_id if checkpoint is None else checkpoint.user_message_id or turn_id
+        )
+        turns.append(
+            TraceGraphTurn(
+                id=turn_id,
+                ordinal=ordinals[turn_id],
+                root_node_id=scope_id("message", (), root_source_id),
+                started_at=min(run.started_at for run in run_checkpoints),
+            )
+        )
+    return tuple(turns)
 
 
 def select_prior_run_ids(
@@ -1005,19 +1026,6 @@ def project_core_checkpoint(
         item for item in head.reasoning if item.run_id in window.visible_run_ids
     )
     interactions = _selected_interactions(state, window.visible_run_ids)
-    if len(head.tree_facts) != len(head.tree_sequences):
-        raise TraceCorruption("Run tree sequences do not match structural facts")
-    tree_entries = [
-        (fact, sequence)
-        for fact, sequence in zip(
-            head.tree_facts,
-            head.tree_sequences,
-            strict=True,
-        )
-        if fact.identity.run_id in window.visible_run_ids
-    ]
-    tree_facts = tuple(fact for fact, _sequence in tree_entries)
-    tree_sequences = tuple(sequence for _fact, sequence in tree_entries)
     runs = {
         run_id: _RunInfo(
             run_id=run_id,
@@ -1051,8 +1059,9 @@ def project_core_checkpoint(
         message.role in {"user", "assistant"} for message in head.messages
     )
     tool_call_count = sum(
-        isinstance(fact, ToolFact) and fact.phase == "started"
-        for fact in head.tree_facts
+        state.runs[run_id].own_tool_call_count
+        for run_id in window.selected_run_ids
+        if run_id in state.runs
     )
     selected_interactions = _selected_interactions(
         state,
@@ -1077,22 +1086,11 @@ def project_core_checkpoint(
         ),
     )
     return CoreProjection(
-        facts=tree_facts,
-        selected_facts=tree_facts,
         selected_run_ids=window.selected_run_ids,
         selected_head=window.selected_head,
         available_heads=window.available_heads,
         messages=messages,
         reasoning=reasoning,
-        tree=_tree(
-            tree_facts,
-            trace_sequences=tree_sequences,
-            runs=runs,
-            run_turns=dict(window.run_turns),
-            visible_turns=set(window.visible_turns),
-            visible_run_ids=set(window.visible_run_ids),
-            active_run_ids=active_run_ids,
-        ),
         state=head.state.model_copy(deep=True),
         interactions=interactions,
         summary=summary,
@@ -1493,23 +1491,6 @@ def _tool_content_value(value: JsonValue | None) -> JsonValue | None:
     return value
 
 
-def _updated_node_detail(
-    current: JsonValue | None,
-    current_omitted: bool,
-    capture: CapturedValue | None,
-    *,
-    tool_content: bool = False,
-) -> tuple[JsonValue | None, bool]:
-    """Apply one capture envelope without confusing omission with JSON null."""
-
-    if capture is None:
-        return current, current_omitted
-    if capture.disposition == "omitted":
-        return None, True
-    value = _tool_content_value(capture.value) if tool_content else capture.value
-    return value, False
-
-
 def _reasoning(
     facts: tuple[TraceSemanticFact, ...],
     *,
@@ -1680,7 +1661,7 @@ def _status(info: _RunInfo, active_run_ids: tuple[str, ...]) -> TraceStatus:
     # final cleanup. A short-lived active fence must not hide an already committed
     # Agent outcome or leave followers waiting for a non-existent status-only event.
     if info.terminal == "succeeded":
-        execution: NodeStatus = "succeeded"
+        execution: ExecutionStatus = "succeeded"
     elif info.terminal == "interrupted":
         execution = "waiting"
     elif info.terminal == "failed":
@@ -1712,306 +1693,6 @@ def _status_with_pending(
     if pending_interactions and status.execution in {"succeeded", "unknown"}:
         return status.model_copy(update={"execution": "waiting"})
     return status
-
-
-def _tree(
-    facts: tuple[TraceSemanticFact, ...],
-    *,
-    trace_sequences: tuple[int, ...],
-    runs: dict[str, _RunInfo],
-    run_turns: dict[str, str],
-    visible_turns: set[str],
-    visible_run_ids: set[str],
-    active_run_ids: tuple[str, ...],
-) -> TraceTree:
-    """Build the selected execution tree from scoped Runtime, Tool, and Plan facts.
-
-    Namespace-prefix ownership attaches nested work to the nearest verified subagent.
-    Open nodes are reconciled against the Run terminal only after all facts are folded:
-    interrupted work waits, failed work fails, and evidence missing a completion remains
-    distinguishable from a fabricated success.
-    """
-
-    if len(facts) != len(trace_sequences):
-        raise TraceCorruption("Tree fact sequences do not match structural facts")
-    nodes: dict[str, TraceNode] = {}
-    subagent_ids = {
-        fact.namespace: fact.subagent_id
-        for fact in facts
-        if isinstance(fact, SubagentFact)
-    }
-    turn_runs: dict[str, list[_RunInfo]] = {}
-    for run_id, info in runs.items():
-        if run_id not in visible_run_ids:
-            continue
-        turn_id = run_turns.get(run_id)
-        if turn_id not in visible_turns:
-            continue
-        turn_runs.setdefault(turn_id, []).append(info)
-    for turn_id, infos in reversed(tuple(turn_runs.items())):
-        first = infos[0]
-        latest = infos[-1]
-        nodes[turn_id] = TraceNode(
-            id=turn_id,
-            trace_seq=min(info.first_seq for info in infos),
-            kind="turn",
-            label="Turn",
-            run_id=latest.run_id,
-            status=_run_node_status(latest, active_run_ids),
-            started_at=first.started_at,
-            completed_at=latest.completed_at,
-        )
-    for run_id, info in runs.items():
-        if run_id not in visible_run_ids:
-            continue
-        turn_id = run_turns.get(run_id)
-        if turn_id not in visible_turns:
-            continue
-        node_id = f"run:{run_id}"
-        nodes[node_id] = TraceNode(
-            id=node_id,
-            trace_seq=info.first_seq,
-            parent_id=turn_id,
-            kind="run",
-            label=run_id,
-            run_id=run_id,
-            source_id=run_id,
-            status=_run_node_status(info, active_run_ids),
-            started_at=info.started_at,
-            completed_at=info.completed_at,
-        )
-    for fact, trace_seq in zip(facts, trace_sequences, strict=True):
-        run_parent = f"run:{fact.identity.run_id}"
-        scoped_parent = _nearest_subagent_parent(
-            fact.namespace,
-            run_parent=run_parent,
-            subagent_ids=subagent_ids,
-        )
-        if isinstance(fact, RuntimeTaskFact):
-            node_id = fact.task_id
-            previous = nodes.get(node_id)
-            input_value, input_omitted = _updated_node_detail(
-                None if previous is None else previous.input,
-                False if previous is None else previous.input_omitted,
-                fact.input,
-            )
-            result_value, result_omitted = _updated_node_detail(
-                None if previous is None else previous.result,
-                False if previous is None else previous.result_omitted,
-                fact.result,
-            )
-            nodes[node_id] = TraceNode(
-                id=node_id,
-                trace_seq=previous.trace_seq if previous else trace_seq,
-                parent_id=scoped_parent,
-                kind="task",
-                label=fact.task_name,
-                run_id=fact.identity.run_id,
-                namespace=fact.namespace,
-                source_id=fact.source_task_id,
-                input=input_value,
-                input_omitted=input_omitted,
-                result=result_value,
-                result_omitted=result_omitted,
-                status=cast(
-                    NodeStatus,
-                    {
-                        "started": "running",
-                        "completed": "succeeded",
-                        "failed": "failed",
-                        "cancelled": "cancelled",
-                        "interrupted": "waiting",
-                        "abandoned": "abandoned",
-                    }[fact.phase],
-                ),
-                started_at=(previous.started_at if previous else fact.occurred_at),
-                completed_at=(
-                    fact.occurred_at
-                    if fact.phase in {"completed", "failed", "cancelled", "abandoned"}
-                    else None
-                ),
-            )
-        elif isinstance(fact, ToolFact):
-            node_id = fact.tool_call_id
-            previous = nodes.get(node_id)
-            input_value, input_omitted = _updated_node_detail(
-                None if previous is None else previous.input,
-                False if previous is None else previous.input_omitted,
-                fact.content if fact.phase == "arguments" else None,
-                tool_content=True,
-            )
-            result_value, result_omitted = _updated_node_detail(
-                None if previous is None else previous.result,
-                False if previous is None else previous.result_omitted,
-                fact.content if fact.phase == "result" else None,
-                tool_content=True,
-            )
-            nodes[node_id] = TraceNode(
-                id=node_id,
-                trace_seq=previous.trace_seq if previous else trace_seq,
-                parent_id=scoped_parent,
-                kind="tool",
-                label=fact.tool_name,
-                run_id=fact.identity.run_id,
-                namespace=fact.namespace,
-                source_id=fact.source_tool_call_id,
-                input=input_value,
-                input_omitted=input_omitted,
-                result=result_value,
-                result_omitted=result_omitted,
-                status=(
-                    "cancelled"
-                    if fact.phase == "cancelled"
-                    else (
-                        "abandoned"
-                        if fact.phase == "abandoned"
-                        else (
-                            "running"
-                            if fact.phase in {"started", "arguments", "completed"}
-                            else (
-                                "failed"
-                                if fact.result_status == "error"
-                                else "succeeded"
-                            )
-                        )
-                    )
-                ),
-                started_at=previous.started_at if previous else fact.occurred_at,
-                completed_at=(
-                    fact.occurred_at
-                    if fact.phase in {"result", "cancelled", "abandoned"}
-                    else None
-                ),
-            )
-        elif isinstance(fact, SubagentFact):
-            previous = nodes.get(fact.subagent_id)
-            input_value, input_omitted = _updated_node_detail(
-                None if previous is None else previous.input,
-                False if previous is None else previous.input_omitted,
-                fact.input,
-                tool_content=True,
-            )
-            nodes[fact.subagent_id] = TraceNode(
-                id=fact.subagent_id,
-                trace_seq=previous.trace_seq if previous else trace_seq,
-                parent_id=_nearest_subagent_parent(
-                    fact.namespace,
-                    run_parent=run_parent,
-                    subagent_ids=subagent_ids,
-                    strict=True,
-                ),
-                kind="subagent",
-                label=fact.agent_name or "Subagent",
-                run_id=fact.identity.run_id,
-                namespace=fact.namespace,
-                source_id=(
-                    fact.parent_tool_call_id
-                    or (None if previous is None else previous.source_id)
-                ),
-                input=input_value,
-                input_omitted=input_omitted,
-                status=_node_status(fact.status),
-                started_at=previous.started_at if previous else fact.occurred_at,
-                completed_at=(fact.occurred_at if fact.phase == "completed" else None),
-            )
-        elif isinstance(fact, PlanRevisionFact):
-            nodes[fact.revision_id] = TraceNode(
-                id=fact.revision_id,
-                trace_seq=(
-                    nodes[fact.revision_id].trace_seq
-                    if fact.revision_id in nodes
-                    else trace_seq
-                ),
-                parent_id=scoped_parent,
-                kind="plan",
-                label=("Plan" if fact.revision is None else f"Plan r{fact.revision}"),
-                run_id=fact.identity.run_id,
-                namespace=fact.namespace,
-                status=_plan_status(fact.status),
-                started_at=fact.occurred_at,
-            )
-    for node_id, node in tuple(nodes.items()):
-        if node.status != "running" or node.kind not in {"task", "tool", "subagent"}:
-            continue
-        info = runs[node.run_id]
-        if info.terminal is None:
-            continue
-        if node.kind == "subagent":
-            status = _node_status(info.terminal)
-            completed_at = info.completed_at
-        else:
-            status = _unfinished_work_status(info.terminal)
-            completed_at = None
-        nodes[node_id] = node.model_copy(
-            update={"status": status, "completed_at": completed_at}
-        )
-    return TraceTree(nodes=tuple(nodes.values()))
-
-
-def _nearest_subagent_parent(
-    namespace: tuple[str, ...],
-    *,
-    run_parent: str,
-    subagent_ids: Mapping[tuple[str, ...], str],
-    strict: bool = False,
-) -> str:
-    matches = [
-        (len(scope), subagent_id)
-        for scope, subagent_id in subagent_ids.items()
-        if len(scope) <= len(namespace)
-        and (not strict or len(scope) < len(namespace))
-        and namespace[: len(scope)] == scope
-    ]
-    return max(matches)[1] if matches else run_parent
-
-
-def _plan_status(value: str | None) -> NodeStatus:
-    if value in {"awaiting_clarification", "awaiting_review", "awaiting_input"}:
-        return "waiting"
-    if value == "approved":
-        return "succeeded"
-    if value == "cancelled":
-        return "cancelled"
-    if value == "planning":
-        return "running"
-    return "unknown"
-
-
-def _unfinished_work_status(value: str | None) -> NodeStatus:
-    if value == "interrupted":
-        return "waiting"
-    if value == "failed":
-        return "failed"
-    if value == "cancelled":
-        return "cancelled"
-    if value == "abandoned":
-        return "abandoned"
-    return "unknown"
-
-
-def _node_status(value: str | None) -> NodeStatus:
-    if value == "succeeded":
-        return "succeeded"
-    if value == "interrupted":
-        return "waiting"
-    if value == "failed":
-        return "failed"
-    if value == "cancelled":
-        return "cancelled"
-    if value == "abandoned":
-        return "abandoned"
-    if value == "running":
-        return "running"
-    return "unknown"
-
-
-def _run_node_status(
-    info: _RunInfo,
-    active_run_ids: tuple[str, ...],
-) -> NodeStatus:
-    if info.terminal is not None:
-        return _node_status(info.terminal)
-    return "running" if info.run_id in active_run_ids else "unknown"
 
 
 def _payload_omitted(facts: tuple[TraceSemanticFact, ...]) -> bool:

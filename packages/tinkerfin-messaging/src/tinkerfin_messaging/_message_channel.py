@@ -28,10 +28,9 @@ from ._messaging_boundary import (
     _normalize_cancel_callback,
     _validate_optional_cursor,
 )
+from ._messaging_ledger import BackendRunHandle, PreparedRun
 from .backend import (
     RunStatus,
-    _BackendRunHandle,
-    _PreparedRun,
     is_active_run_status,
     is_failed_run_status,
     is_final_run_status,
@@ -624,9 +623,9 @@ async def follow(
             ),
         )
         self._messaging._require_open()
-        return MessageSubscription._create(
+        return MessageSubscription[ReplayT]._create(
             ledger=self._messaging._runtime_backend,
-            prepared=_PreparedRun(handle=handle, after=after, is_owner=False),
+            prepared=PreparedRun(handle=handle, after=after, is_owner=False),
             codec=cast(MessageCodec[object, ReplayT], codec),
             renderer=self._renderer,
         )
@@ -688,7 +687,7 @@ async def wrap(
     after: int | None = None,
     cancel: (CancelCallback[SourceT] | CancelCallback[ProfileSourceT] | None) = None,
     on_committed: CommittedCallback | None = None,
-    on_source_starting: _DeliveryCallback | None = None,
+    on_source_ready: _DeliveryCallback | None = None,
     on_delivery_not_started: _DeliveryCallback | None = None,
 ) -> MessageSubscription[ReplayT] | MessageSubscription[ProfileReplayT]:
     """Open a replayable subscription while preserving the source profile type."""
@@ -701,7 +700,7 @@ async def wrap(
             after=after,
             cancel=cast("CancelCallback[object] | None", cancel),
             on_committed=on_committed,
-            on_source_starting=on_source_starting,
+            on_source_ready=on_source_ready,
             on_delivery_not_started=on_delivery_not_started,
         ),
     )
@@ -715,7 +714,7 @@ async def _wrap(
     after: int | None = None,
     cancel: CancelCallback[object] | None = None,
     on_committed: CommittedCallback | None = None,
-    on_source_starting: _DeliveryCallback | None = None,
+    on_source_ready: _DeliveryCallback | None = None,
     on_delivery_not_started: _DeliveryCallback | None = None,
 ) -> MessageSubscription[object]:
     """Validate and start-or-attach before an HTTP response is constructed.
@@ -767,7 +766,7 @@ async def _wrap(
                 after=after,
                 cancel=cancel,
                 on_committed=on_committed,
-                on_source_starting=on_source_starting,
+                on_source_ready=on_source_ready,
                 on_delivery_not_started=on_delivery_not_started,
                 cancel_requested=cancel_requested,
             )
@@ -802,7 +801,7 @@ async def _wrap_once(
     after: int | None,
     cancel: CancelCallback[object] | None,
     on_committed: CommittedCallback | None,
-    on_source_starting: _DeliveryCallback | None,
+    on_source_ready: _DeliveryCallback | None,
     on_delivery_not_started: _DeliveryCallback | None,
     cancel_requested: asyncio.Event,
 ) -> MessageSubscription[object]:
@@ -810,7 +809,7 @@ async def _wrap_once(
 
     from .messaging import MessageSubscription
 
-    prepared: _PreparedRun | None = None
+    prepared: PreparedRun | None = None
     normalized_cancel: _ContextCancelCallback[object] | None = None
     producer_started = False
     delivery_started = False
@@ -818,7 +817,7 @@ async def _wrap_once(
     producer_codec: MessageCodec[object, object] | None = None
     replay_renderer: SseRenderer[object] | None = None
     try:
-        _validate_delivery_callback("on_source_starting", on_source_starting)
+        _validate_delivery_callback("on_source_ready", on_source_ready)
         _validate_delivery_callback(
             "on_delivery_not_started",
             on_delivery_not_started,
@@ -878,10 +877,11 @@ async def _wrap_once(
                 await result
                 self._messaging._require_open()
                 _raise_if_start_cancelled(cancel_requested)
-            await _invoke_delivery_callback(
-                "on_source_starting",
-                on_source_starting,
-            )
+            # Once owner preflight succeeds, deferred sources have opened and managed
+            # Runtime sources have committed their ready observations. Later failures
+            # retain the host registration so it can reconcile against that Run.
+            delivery_started = True
+            await _invoke_delivery_callback("on_source_ready", on_source_ready)
             self._messaging._require_open()
             _raise_if_start_cancelled(cancel_requested)
         self._commit_inferred_binding(
@@ -906,7 +906,7 @@ async def _wrap_once(
             await source.aclose()
             source_released = True
             self._messaging._require_open()
-        return MessageSubscription._create(
+        return MessageSubscription[object]._create(
             ledger=self._messaging._runtime_backend,
             prepared=prepared,
             codec=producer_codec,
@@ -956,7 +956,7 @@ async def sse(
     after: int | Callable[[], int | None] | None = None,
     cancel: CancelCallback[object] | None = None,
     on_committed: CommittedCallback | None = None,
-    on_source_starting: _DeliveryCallback | None = None,
+    on_source_ready: _DeliveryCallback | None = None,
     on_delivery_not_started: _DeliveryCallback | None = None,
 ) -> AsyncGenerator[bytes, None]:
     """Prepare durable publication and return its SSE response body.
@@ -1013,7 +1013,7 @@ async def sse(
         after=resolved_after,
         cancel=cancel,
         on_committed=on_committed,
-        on_source_starting=on_source_starting,
+        on_source_ready=on_source_ready,
         on_delivery_not_started=on_delivery_not_started,
     )
     try:
@@ -1031,7 +1031,7 @@ async def wrap_recoverable(
     after: int | None = None,
     cancel: CancelCallback[RecoverableMessage[SourceT]] | None = None,
     on_committed: CommittedCallback | None = None,
-    on_source_starting: _DeliveryCallback | None = None,
+    on_source_ready: _DeliveryCallback | None = None,
     on_delivery_not_started: _DeliveryCallback | None = None,
 ) -> MessageSubscription[ReplayT]:
     """Start or rebuild an owner from its last committed checkpoint.
@@ -1079,7 +1079,7 @@ async def wrap_recoverable(
                 after=after,
                 cancel=cancel,
                 on_committed=on_committed,
-                on_source_starting=on_source_starting,
+                on_source_ready=on_source_ready,
                 on_delivery_not_started=on_delivery_not_started,
                 cancel_requested=cancel_requested,
             )
@@ -1114,7 +1114,7 @@ async def _wrap_recoverable_once(
     after: int | None,
     cancel: CancelCallback[RecoverableMessage[SourceT]] | None,
     on_committed: CommittedCallback | None,
-    on_source_starting: _DeliveryCallback | None,
+    on_source_ready: _DeliveryCallback | None,
     on_delivery_not_started: _DeliveryCallback | None,
     cancel_requested: asyncio.Event,
 ) -> MessageSubscription[ReplayT]:
@@ -1122,7 +1122,7 @@ async def _wrap_recoverable_once(
 
     from .messaging import MessageSubscription
 
-    prepared: _PreparedRun | None = None
+    prepared: PreparedRun | None = None
     opened: MessageSource[RecoverableMessage[SourceT]] | None = None
     normalized_cancel: _ContextCancelCallback[RecoverableMessage[SourceT]] | None = None
     producer_started = False
@@ -1130,7 +1130,7 @@ async def _wrap_recoverable_once(
     codec: MessageCodec[SourceT, ReplayT] | None = None
     renderer: SseRenderer[ReplayT] | None = None
     try:
-        _validate_delivery_callback("on_source_starting", on_source_starting)
+        _validate_delivery_callback("on_source_ready", on_source_ready)
         _validate_delivery_callback(
             "on_delivery_not_started",
             on_delivery_not_started,
@@ -1174,10 +1174,14 @@ async def _wrap_recoverable_once(
                 await result
                 self._messaging._require_open()
                 _raise_if_start_cancelled(cancel_requested)
-            await _invoke_delivery_callback(
-                "on_source_starting",
-                on_source_starting,
+            opened = await self._messaging._open_recoverable_source(
+                prepared=prepared,
+                source=source,
             )
+            self._messaging._require_open()
+            _raise_if_start_cancelled(cancel_requested)
+            delivery_started = True
+            await _invoke_delivery_callback("on_source_ready", on_source_ready)
             self._messaging._require_open()
             _raise_if_start_cancelled(cancel_requested)
         self._commit_inferred_binding(
@@ -1186,12 +1190,7 @@ async def _wrap_recoverable_once(
             profile=profile,
         )
         if prepared.is_owner:
-            opened = await self._messaging._open_recoverable_source(
-                prepared=prepared,
-                source=source,
-            )
-            self._messaging._require_open()
-            _raise_if_start_cancelled(cancel_requested)
+            assert opened is not None
             started = self._messaging._start_recoverable_producer(
                 prepared=prepared,
                 source=opened,
@@ -1203,7 +1202,7 @@ async def _wrap_recoverable_once(
             delivery_started = True
             await started.wait()
             self._messaging._require_open()
-        return MessageSubscription._create(
+        return MessageSubscription[ReplayT]._create(
             ledger=self._messaging._runtime_backend,
             prepared=prepared,
             codec=cast(MessageCodec[object, ReplayT], codec),
@@ -1267,7 +1266,7 @@ async def cancel(
     preflight = self._messaging._begin_preflight()
     try:
         required_identity(identity)
-        handle = _BackendRunHandle(
+        handle = BackendRunHandle(
             channel=self.name,
             identity=identity,
             owner_token=None,

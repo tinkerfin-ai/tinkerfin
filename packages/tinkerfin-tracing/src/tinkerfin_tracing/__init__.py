@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from .backend import TraceEntryRebuildBackend as TraceEntryRebuildBackend
+from .backend import TraceGraphQueryBackend as TraceGraphQueryBackend
+from .backend import TraceGraphRebuildBackend as TraceGraphRebuildBackend
 from .backend import TraceLedgerBackend as TraceLedgerBackend
-from .backend import TraceQueryBackend as TraceQueryBackend
 from .backend import TraceStoreOptions as TraceStoreOptions
 from .capture import CapturedValue as CapturedValue
 from .capture import CapturePolicy as CapturePolicy
@@ -18,17 +18,6 @@ from .codec import CanonicalTracePayloadCodec as CanonicalTracePayloadCodec
 from .codec import EncodedTracePayload as EncodedTracePayload
 from .durable_store import DurableTraceStore as DurableTraceStore
 from .durable_store import InMemoryTraceStore as InMemoryTraceStore
-from .entries import TraceEntry as TraceEntry
-from .entries import TraceEntryCompleteness as TraceEntryCompleteness
-from .entries import TraceEntryDelta as TraceEntryDelta
-from .entries import TraceEntryKind as TraceEntryKind
-from .entries import TraceEntryPage as TraceEntryPage
-from .entries import TraceEntryStatus as TraceEntryStatus
-from .entries import TraceFacets as TraceFacets
-from .entries import TraceFailure as TraceFailure
-from .entries import TraceFilter as TraceFilter
-from .entries import TraceTurn as TraceTurn
-from .entry_query import TraceQuery as TraceQuery
 from .errors import AmbiguousTraceHead as AmbiguousTraceHead
 from .errors import InvalidTraceCursor as InvalidTraceCursor
 from .errors import TraceCaptureRejected as TraceCaptureRejected
@@ -56,7 +45,6 @@ from .facts import CallTrackingFact as CallTrackingFact
 from .facts import ContextContributionFact as ContextContributionFact
 from .facts import InteractionFact as InteractionFact
 from .facts import MessageFact as MessageFact
-from .facts import MiddlewareFact as MiddlewareFact
 from .facts import ModelCallFact as ModelCallFact
 from .facts import NativeExtraFact as NativeExtraFact
 from .facts import PlanRevisionFact as PlanRevisionFact
@@ -72,13 +60,32 @@ from .facts import TraceEvent as TraceEvent
 from .facts import TraceSemanticFact as TraceSemanticFact
 from .facts import TurnFact as TurnFact
 from .follow import TraceFollow as TraceFollow
+from .graph import TraceGraph as TraceGraph
+from .graph import TraceGraphCompleteness as TraceGraphCompleteness
+from .graph import TraceGraphDelta as TraceGraphDelta
+from .graph import TraceGraphFacets as TraceGraphFacets
+from .graph import TraceGraphFailure as TraceGraphFailure
+from .graph import TraceGraphFilter as TraceGraphFilter
+from .graph import TraceGraphLinkIssue as TraceGraphLinkIssue
+from .graph import TraceGraphNode as TraceGraphNode
+from .graph import TraceGraphNodeKind as TraceGraphNodeKind
+from .graph import TraceGraphNodeStatus as TraceGraphNodeStatus
+from .graph import TraceGraphPage as TraceGraphPage
+from .graph import TraceGraphQueryLimits as TraceGraphQueryLimits
+from .graph import TraceGraphTurn as TraceGraphTurn
+from .graph_query import TraceGraphQuery as TraceGraphQuery
 from .limits import TraceLimits as TraceLimits
 from .projection import TraceProjection as TraceProjection
 from .query import TraceThread as TraceThread
+from .redaction import CompositeRedactor as CompositeRedactor
+from .redaction import RedactionContentKind as RedactionContentKind
+from .redaction import RedactionContext as RedactionContext
+from .redaction import TraceRedactor as TraceRedactor
+from .redaction import redact_json_paths as redact_json_paths
 from .store import StoreThreadSnapshot as StoreThreadSnapshot
 from .store import StoreWriterSnapshot as StoreWriterSnapshot
-from .store import TraceEntryRebuildStore as TraceEntryRebuildStore
-from .store import TraceEntryStore as TraceEntryStore
+from .store import TraceGraphRebuildStore as TraceGraphRebuildStore
+from .store import TraceGraphStore as TraceGraphStore
 from .store import TraceProjectionCheckpoint as TraceProjectionCheckpoint
 from .store import TraceStore as TraceStore
 from .store import TraceThreadKey as TraceThreadKey
@@ -90,12 +97,10 @@ from .views import TraceEntityDelta as TraceEntityDelta
 from .views import TraceEventPage as TraceEventPage
 from .views import TraceInteraction as TraceInteraction
 from .views import TraceMessage as TraceMessage
-from .views import TraceNode as TraceNode
 from .views import TraceReasoning as TraceReasoning
 from .views import TraceState as TraceState
 from .views import TraceStatus as TraceStatus
 from .views import TraceSummary as TraceSummary
-from .views import TraceTree as TraceTree
 from .views import TraceUpdate as TraceUpdate
 from .writing import TraceWritePolicy as TraceWritePolicy
 
@@ -111,6 +116,7 @@ __all__ = [
     "CanonicalTracePayloadCodec",
     "CapturePolicy",
     "CapturedValue",
+    "CompositeRedactor",
     "ContextContributionFact",
     "DurableTraceStore",
     "EncodedTracePayload",
@@ -121,13 +127,14 @@ __all__ = [
     "InteractionFact",
     "InvalidTraceCursor",
     "MessageFact",
-    "MiddlewareFact",
     "MiddlewareTraceCapture",
     "ModelCallFact",
     "NativeExtraFact",
     "PlanRevisionFact",
     "ReasoningCapturePolicy",
     "ReasoningFact",
+    "RedactionContentKind",
+    "RedactionContext",
     "RunFact",
     "RuntimeTaskFact",
     "SkillFact",
@@ -144,36 +151,40 @@ __all__ = [
     "TraceCompleteness",
     "TraceCorruption",
     "TraceEntityDelta",
-    "TraceEntry",
-    "TraceEntryCompleteness",
-    "TraceEntryDelta",
-    "TraceEntryKind",
-    "TraceEntryPage",
-    "TraceEntryRebuildBackend",
-    "TraceEntryRebuildStore",
-    "TraceEntryStatus",
-    "TraceEntryStore",
     "TraceEvent",
     "TraceEventPage",
-    "TraceFacets",
-    "TraceFailure",
-    "TraceFilter",
     "TraceFollow",
     "TraceFollowLifecycleError",
+    "TraceGraph",
+    "TraceGraphCompleteness",
+    "TraceGraphDelta",
+    "TraceGraphFacets",
+    "TraceGraphFailure",
+    "TraceGraphFilter",
+    "TraceGraphLinkIssue",
+    "TraceGraphNode",
+    "TraceGraphNodeKind",
+    "TraceGraphNodeStatus",
+    "TraceGraphPage",
+    "TraceGraphQuery",
+    "TraceGraphQueryBackend",
+    "TraceGraphQueryLimits",
+    "TraceGraphRebuildBackend",
+    "TraceGraphRebuildStore",
+    "TraceGraphStore",
+    "TraceGraphTurn",
     "TraceInteraction",
     "TraceLedgerBackend",
     "TraceLimits",
     "TraceMessage",
-    "TraceNode",
     "TraceObserverFailed",
     "TraceProjection",
     "TraceProjectionCheckpoint",
     "TraceProjectionCheckpointConflict",
     "TraceProjectionFailed",
-    "TraceQuery",
-    "TraceQueryBackend",
     "TraceQuotaExceeded",
     "TraceReasoning",
+    "TraceRedactor",
     "TraceRunConflict",
     "TraceRunNotFound",
     "TraceSemanticFact",
@@ -189,8 +200,6 @@ __all__ = [
     "TraceThread",
     "TraceThreadKey",
     "TraceThreadNotFound",
-    "TraceTree",
-    "TraceTurn",
     "TraceUpdate",
     "TraceWritePolicy",
     "TraceWriter",
@@ -199,6 +208,7 @@ __all__ = [
     "TracingErrorCode",
     "TurnFact",
     "get_trace_store_schema",
+    "redact_json_paths",
     "verify_trace_ledger_backend",
 ]
 

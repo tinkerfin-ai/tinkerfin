@@ -10,11 +10,12 @@ checkpointer、Store 与 Sandbox 资源仍由宿主管理。
 | 目标 | 使用方式 |
 | --- | --- |
 | 处理已校验的 LangGraph 原生数据 | `TinkerFin.open_run()` |
+| 保留 managed Observation 与清理并返回最终 state | `TinkerFin.ainvoke()` |
 | 给前端发送 AG-UI 事件 | `TinkerFin.open_agui_run()` |
 | 在 managed 生命周期外复用异步 Runnable | `DeepAgentDefinition.create_graph()` |
 
-普通项目从 `open_run()` 开始。Direct Graph 属于高级边界，不会自动创建 run identity、Runtime
-Observation、Trace、AG-UI、Messaging 或业务生命周期。
+只需要最终 state 时从 `ainvoke()` 开始，需要消费过程时使用 `open_run()`。Direct Graph 属于
+高级边界，不会自动创建 run identity、Runtime Observation、Trace、AG-UI、Messaging 或业务生命周期。
 
 ## 安装
 
@@ -85,8 +86,9 @@ identity = RunIdentity(threadId="user-42-support", runId="run-20260820-1")
 
 ## Managed stream 与 Direct Graph
 
-`open_run()` 和 `open_agui_run()` 返回的流都只能消费一次，并支持显式关闭。Agent Definition
-可以复用，也可以同时服务不同 thread ID。
+`open_run()` 和 `open_agui_run()` 返回的流都只能消费一次，并支持显式关闭。两者会先提交 Run
+start 与 input Observation，再在尚未拉取第一条模型输出时返回；不再消费的返回流必须显式关闭。
+Agent Definition 可以复用，也可以同时服务不同 thread ID。
 
 高级集成可以直接创建可复用异步 Runnable：
 
@@ -99,12 +101,13 @@ result = await graph.ainvoke(graph_input, config=config)
 使用原生 LangGraph `Command(resume=...)`。同步 `invoke()`、`stream()` 和 `batch()` 会明确拒绝，
 从而保持异步 checkpointer、Store、Tool 与取消语义。
 
-## 当前能力边界
+## Runtime Profile 选择
 
-框架发行提供显式 `deepagents-v2` Runtime Profile，不提供 Deep Agents v3 Profile 或通用
-TodoGroups Projection/UI。Studio 在查询时从 canonical Trace 事实派生产品任务轨迹。其他具体
-Profile 必须拥有对应上游构造与流合同，同时输出同一 canonical Native Observation；下游
-Runtime、Trace、AG-UI 与 Messaging 不按上游版本分支。
+`DeepAgentsV2RuntimeProfile` 是默认稳定集成；显式的 Deep Agents v3 集成
+`DeepAgentsV3RuntimeProfile` 使用 LangGraph 的实验性 v3 事件流。Runtime 不会在两者之间
+探测、协商或回退。两者输出相同的 canonical Native Observation，因此 Trace、AG-UI、Messaging
+与宿主代码不按上游 stream API 分支。`TodoGroups` 仍由宿主基于 canonical Trace fact 投影，
+不是 Runtime state 或第二套持久化格式。
 
 当前不提供 Archive/S3/Blob、payload Encryption/KMS 或 OpenTelemetry exporter。具体集成只能
 通过 `TraceLedgerBackend` 接入活动 Trace 存储；高级集成可完整替换 `TraceStore`、包装 canonical

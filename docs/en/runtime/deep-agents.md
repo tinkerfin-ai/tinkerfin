@@ -230,6 +230,24 @@ Profile owns required stream modes, version, subgraph scope, and complete state 
 `on_native_part` is awaited in the delivery path. Use asynchronous clients inside it and
 avoid blocking network or database calls.
 
+## Return only the managed final state
+
+Use the same facade when the caller does not need individual stream parts:
+
+```python
+state = await tinkerfin.ainvoke(
+    RunIdentity(threadId="project-7", runId="run-1"),
+    agent=agent,
+    input={"messages": [{"role": "user", "content": "Review this project"}]},
+)
+```
+
+`ainvoke()` consumes the Profile-owned canonical stream internally. It preserves Runtime
+Observation, Trace, identity binding, cancellation, terminal settlement, and cleanup,
+then returns a defensive copy of the last root state. Use
+`await agent.create_graph().ainvoke(...)` only for the explicitly unmanaged advanced
+boundary described below.
+
 ## Reuse a direct Graph
 
 Advanced integrations that do not need managed run lifecycle can create one async

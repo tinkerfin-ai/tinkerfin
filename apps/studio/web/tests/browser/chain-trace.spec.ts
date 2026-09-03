@@ -2,7 +2,11 @@ import { expect, test, type Page, type Route } from '@playwright/test'
 import { resolve } from 'node:path'
 
 import type { ConversationHistoryDetail } from '../../src/api/conversation/history'
-import type { TraceEntryPage } from '../../src/api/conversation/traceEntries'
+import type {
+  TraceGraphNode,
+  TraceGraphPage,
+} from '../../src/api/conversation/traceGraph'
+import { emptyTraceGraph } from '../../src/test/traceFixtures'
 
 const THREAD_ID = 'chain-trace-browser-thread'
 const RUN_ID = 'chain-trace-browser-run'
@@ -23,194 +27,129 @@ const fulfillJson = (route: Route, data: unknown) => route.fulfill({
   body: JSON.stringify(success(data)),
 })
 
-const tracePage: TraceEntryPage = {
+const graphNode = (
+  id: string,
+  kind: TraceGraphNode['kind'],
+  parentId: string | null,
+  startedSeq: number,
+  values: Partial<TraceGraphNode> = {},
+): TraceGraphNode => ({
+  id,
+  turnId: id.startsWith('old-') ? 'turn-browser-1' : 'turn-browser-2',
+  parentId,
+  structuralParentId: parentId,
+  kind,
+  status: 'succeeded',
+  name: kind === 'human_message'
+    ? 'HumanMessage'
+    : kind === 'assistant_message' ? 'AssistantMessage' : id,
+  runId: id.startsWith('old-') ? 'run-browser-1' : RUN_ID,
+  namespace: [],
+  startedAt: '2026-09-01T00:01:00.000Z',
+  completedAt: '2026-09-01T00:01:01.000Z',
+  startedSeq,
+  updatedSeq: startedSeq,
+  contentOmitted: false,
+  requestOmitted: false,
+  resultOmitted: false,
+  hooks: [],
+  linkIssues: [],
+  ...values,
+})
+
+const semanticNodes = [
+  graphNode('old-human', 'human_message', null, 1, { content: '第一轮浏览器任务' }),
+  graphNode('old-agent', 'agent', 'old-human', 2, { name: 'Historical Agent' }),
+  graphNode('human-current', 'human_message', null, 10, { content: '继续核验真实调用树' }),
+  graphNode('agent-current', 'agent', 'human-current', 11, {
+    name: 'Agent',
+    status: 'failed',
+  }),
+  graphNode('model-current', 'model', 'agent-current', 13, {
+    name: 'deepseek-v4-pro',
+    provider: 'deepseek',
+    model: 'deepseek-v4-pro',
+    firstOutputAt: '2026-09-01T00:01:00.500Z',
+    request: {
+      messages: [{ messageType: 'system', content: '浏览器系统提示词' }],
+    },
+  }),
+  graphNode('assistant-current', 'assistant_message', 'model-current', 17, {
+    content: '链路完成',
+  }),
+  graphNode('tool-current', 'tool', 'model-current', 19, {
+    name: 'web_search',
+    status: 'failed',
+    failure: {
+      errorType: 'builtins.TimeoutError',
+      message: '搜索服务在期限内未响应',
+    },
+  }),
+]
+
+const technicalNodes = [
+  ...semanticNodes.slice(0, 4),
+  graphNode('middleware-visible', 'middleware', 'agent-current', 12, {
+    name: 'PromptCacheMiddleware.awrap_model_call',
+    className: 'deepagents.middleware.PromptCacheMiddleware',
+    hooks: ['awrap_model_call'],
+  }),
+  semanticNodes[4],
+  graphNode('system-current', 'system_message', 'model-current', 14, {
+    content: '浏览器系统提示词',
+  }),
+  ...semanticNodes.slice(5),
+]
+
+const tracePage = (nodes: TraceGraphNode[]): TraceGraphPage => ({
   turns: [
     {
       id: 'turn-browser-1',
       ordinal: 1,
+      rootNodeId: 'old-human',
       startedAt: BASE_TIME,
-      userMessage: {
-        id: 'message-browser-1',
-        traceSeq: 1,
-        sourceId: 'user-browser-1',
-        namespace: [],
-        runId: 'run-browser-1',
-        role: 'user',
-        content: '第一轮浏览器任务',
-        contentOmitted: false,
-        status: 'completed',
-        createdAt: BASE_TIME,
-      },
     },
     {
       id: 'turn-browser-2',
       ordinal: 2,
+      rootNodeId: 'human-current',
       startedAt: '2026-09-01T00:01:00.000Z',
-      userMessage: {
-        id: 'message-browser-2',
-        traceSeq: 10,
-        sourceId: 'user-browser-2',
-        namespace: [],
-        runId: RUN_ID,
-        role: 'user',
-        content: '继续核验真实调用树',
-        contentOmitted: false,
-        status: 'completed',
-        createdAt: '2026-09-01T00:01:00.000Z',
-      },
     },
   ],
-  items: [
-    {
-      id: 'agent-old',
-      turnId: 'turn-browser-1',
-      kind: 'agent',
-      status: 'succeeded',
-      name: 'Historical Agent',
-      runId: 'run-browser-1',
-      namespace: [],
-      startedAt: BASE_TIME,
-      completedAt: '2026-09-01T00:00:01.000Z',
-      startedSeq: 2,
-      updatedSeq: 3,
-      requestOmitted: false,
-      resultOmitted: false,
-      hooks: [],
-    },
-    {
-      id: 'agent-current',
-      turnId: 'turn-browser-2',
-      kind: 'agent',
-      status: 'failed',
-      name: 'Agent',
-      runId: RUN_ID,
-      namespace: [],
-      startedAt: '2026-09-01T00:01:00.000Z',
-      completedAt: '2026-09-01T00:01:04.000Z',
-      startedSeq: 11,
-      updatedSeq: 22,
-      requestOmitted: false,
-      resultOmitted: false,
-      hooks: [],
-    },
-    {
-      id: 'middleware-visible',
-      turnId: 'turn-browser-2',
-      parentId: 'agent-current',
-      kind: 'middleware',
-      status: 'configured',
-      name: 'PromptCacheMiddleware.awrap_model_call',
-      runId: RUN_ID,
-      namespace: [],
-      startedAt: '2026-09-01T00:01:00.010Z',
-      completedAt: '2026-09-01T00:01:00.010Z',
-      startedSeq: 12,
-      updatedSeq: 12,
-      requestOmitted: false,
-      resultOmitted: false,
-      className: 'deepagents.middleware.PromptCacheMiddleware',
-      hooks: ['awrap_model_call'],
-    },
-    {
-      id: 'model-current',
-      turnId: 'turn-browser-2',
-      parentId: 'agent-current',
-      kind: 'model',
-      status: 'succeeded',
-      name: 'Model',
-      runId: RUN_ID,
-      namespace: [],
-      startedAt: '2026-09-01T00:01:00.100Z',
-      completedAt: '2026-09-01T00:01:01.500Z',
-      startedSeq: 13,
-      updatedSeq: 17,
-      requestOmitted: false,
-      resultOmitted: false,
-      hooks: [],
-    },
-    {
-      id: 'provider-current',
-      turnId: 'turn-browser-2',
-      parentId: 'model-current',
-      kind: 'provider',
-      status: 'succeeded',
-      name: 'deepseek-v4-pro',
-      runId: RUN_ID,
-      namespace: [],
-      provider: 'deepseek',
-      model: 'deepseek-v4-pro',
-      startedAt: '2026-09-01T00:01:00.200Z',
-      firstOutputAt: '2026-09-01T00:01:00.500Z',
-      completedAt: '2026-09-01T00:01:01.400Z',
-      startedSeq: 14,
-      updatedSeq: 16,
-      request: {
-        messages: [{ messageType: 'system', content: '浏览器系统提示词' }],
-      },
-      requestOmitted: false,
-      resultOmitted: false,
-      hooks: [],
-    },
-    {
-      id: 'tools-current',
-      turnId: 'turn-browser-2',
-      parentId: 'agent-current',
-      kind: 'tools',
-      status: 'failed',
-      name: 'Tools',
-      runId: RUN_ID,
-      namespace: [],
-      startedAt: '2026-09-01T00:01:01.600Z',
-      completedAt: '2026-09-01T00:01:03.800Z',
-      startedSeq: 18,
-      updatedSeq: 21,
-      requestOmitted: false,
-      resultOmitted: false,
-      hooks: [],
-    },
-    {
-      id: 'tool-current',
-      turnId: 'turn-browser-2',
-      parentId: 'tools-current',
-      proposalId: 'proposal-current',
-      kind: 'tool',
-      status: 'failed',
-      name: 'web_search',
-      runId: RUN_ID,
-      namespace: [],
-      startedAt: '2026-09-01T00:01:01.700Z',
-      completedAt: '2026-09-01T00:01:03.700Z',
-      startedSeq: 19,
-      updatedSeq: 20,
-      requestOmitted: false,
-      resultOmitted: false,
-      failure: {
-        errorType: 'builtins.TimeoutError',
-        message: '搜索服务在期限内未响应',
-      },
-      hooks: [],
-    },
-  ],
+  nodes,
+  orderedNodeIds: nodes.map((node) => node.id),
+  rootNodeIds: ['old-human', 'human-current'],
   nextCursor: null,
   asOfSeq: 40,
   facets: {
-    kinds: { agent: 2, middleware: 1, model: 1, provider: 1, tools: 1, tool: 1 },
-    statuses: { succeeded: 3, failed: 3, configured: 1 },
+    kinds: {
+      human_message: 2,
+      assistant_message: 1,
+      agent: 2,
+      middleware: 1,
+      model: 1,
+      system_message: 1,
+      tool: 1,
+    },
+    statuses: { succeeded: nodes.length - 2, failed: 2 },
     agents: {},
     middleware: { PromptCacheMiddleware: 1 },
     skills: {},
     providers: { deepseek: 1 },
     models: { 'deepseek-v4-pro': 1 },
   },
-  completeness: { callTrackingMissing: false, executionTreeMissing: false },
-}
+  completeness: {
+    callTrackingMissing: false,
+    relationshipEvidenceMissing: false,
+    detailsOmitted: false,
+  },
+})
 
 const detail = (includeTaskTrace: boolean): ConversationHistoryDetail => ({
   id: 1,
   threadId: THREAD_ID,
   title: 'Turn 链路浏览器会话',
   lastModel: 'deepseek-v4-pro',
-  runtimeProfile: 'deepagents-v2',
   pinned: false,
   asOfSeq: 22,
   headRunId: RUN_ID,
@@ -232,7 +171,7 @@ const detail = (includeTaskTrace: boolean): ConversationHistoryDetail => ({
     completedAt: `2026-09-01T00:${String(index).padStart(2, '0')}:01.000Z`,
   })),
   reasoning: [],
-  nodes: [],
+  graph: emptyTraceGraph(22),
   state: { root: {}, subgraphs: {} },
   interactions: [],
   status: { execution: 'failed', headRunId: RUN_ID },
@@ -259,13 +198,22 @@ async function mockChainTraceStudio(page: Page, theme: 'light' | 'dark' = 'light
   page.on('console', (message) => {
     if (message.type() === 'error') pageErrors.push(message.text())
   })
-  await page.addInitScript(({ session, threadId, snapshot, selectedTheme }) => {
+  await page.addInitScript(({
+    session,
+    threadId,
+    semanticSnapshot,
+    technicalSnapshot,
+    selectedTheme,
+  }) => {
     window.localStorage.setItem('tinkerfin.auth.session', JSON.stringify(session))
     window.localStorage.setItem('tinkerfin:theme', selectedTheme)
     const originalFetch = window.fetch.bind(window)
     window.fetch = (input, init) => {
       const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
-      if (url.includes(`/api/conversation/${threadId}/trace/entries/follow`)) {
+      if (url.includes(`/api/conversation/${threadId}/trace/graph/follow`)) {
+        const snapshot = url.includes('includeTechnicalNodes=true')
+          ? technicalSnapshot
+          : semanticSnapshot
         const encoder = new TextEncoder()
         const stream = new ReadableStream({
           start(controller) {
@@ -290,7 +238,8 @@ async function mockChainTraceStudio(page: Page, theme: 'light' | 'dark' = 'light
       user,
     },
     threadId: THREAD_ID,
-    snapshot: tracePage,
+    semanticSnapshot: tracePage(semanticNodes),
+    technicalSnapshot: tracePage(technicalNodes),
     selectedTheme: theme,
   })
   await page.route('**/api/**', async (route) => {
@@ -305,7 +254,6 @@ async function mockChainTraceStudio(page: Page, theme: 'light' | 'dark' = 'light
           modelId: 'deepseek-v4-pro',
           displayName: 'DeepSeek V4 Pro',
           reasoningEnabled: false,
-          runtimeProfile: 'deepagents-v2',
           isDefault: true,
         }],
         defaultModelId: 'deepseek-v4-pro',
@@ -393,7 +341,8 @@ async function mockChainTraceStudio(page: Page, theme: 'light' | 'dark' = 'light
   await chainLauncher.click()
   await expect(page.getByRole('region', { name: '链路' })).toBeVisible()
   await expect(page.getByRole('button', { name: '返回对话' })).toBeFocused()
-  await expect(page.getByText('第 2 轮')).toBeVisible()
+  await expect(page.getByRole('button', { name: '用户消息，HumanMessage' }).last())
+    .toBeVisible()
   await expect(page.getByRole('searchbox')).toHaveCount(0)
   await expect(page.getByRole('button', { name: /^提供方：/ })).toHaveCount(0)
   await expect(page.getByRole('button', { name: /^模型：/ })).toHaveCount(0)
@@ -444,13 +393,17 @@ async function mockChainTraceStudio(page: Page, theme: 'light' | 'dark' = 'light
     const firstControl = controls?.querySelector<HTMLElement>('.chain-trace-back')
     const treeScroll = workspace.querySelector<HTMLElement>('.chain-trace-tree-scroll')
     const turn = workspace.querySelector<HTMLElement>('.chain-trace-turn')
-    if (!header || !controls || !firstControl || !treeScroll || !turn) return null
+    const rootRow = workspace.querySelector<HTMLElement>(
+      '.chain-trace-node-list.is-root > .chain-trace-node > .chain-trace-node-row',
+    )
+    if (!header || !controls || !firstControl || !treeScroll || !turn || !rootRow) return null
     const headerStyle = getComputedStyle(header)
     const treeScrollStyle = getComputedStyle(treeScroll)
     const headerRect = header.getBoundingClientRect()
     const firstControlRect = firstControl.getBoundingClientRect()
     const treeScrollRect = treeScroll.getBoundingClientRect()
     const turnRect = turn.getBoundingClientRect()
+    const rootRowRect = rootRow.getBoundingClientRect()
     return {
       headerHeight: headerRect.height,
       expectedHeight: Number.parseFloat(
@@ -464,6 +417,7 @@ async function mockChainTraceStudio(page: Page, theme: 'light' | 'dark' = 'light
           - (headerRect.top + headerRect.height / 2),
       ),
       turnOffset: turnRect.left - treeScrollRect.left,
+      rootRowOffset: rootRowRect.left - treeScrollRect.left,
       turnWidth: turnRect.width,
       treeContentWidth: treeScroll.clientWidth
         - Number.parseFloat(treeScrollStyle.paddingLeft)
@@ -479,10 +433,12 @@ async function mockChainTraceStudio(page: Page, theme: 'light' | 'dark' = 'light
   expect(alignment?.controlCenterOffset).toBeLessThanOrEqual(1)
   expect(Math.abs((alignment?.turnOffset ?? 0) - (alignment?.treePaddingLeft ?? 0)))
     .toBeLessThanOrEqual(1)
+  expect(Math.abs((alignment?.rootRowOffset ?? 0) - (alignment?.treePaddingLeft ?? 0)))
+    .toBeLessThanOrEqual(1)
   expect(Math.abs((alignment?.turnWidth ?? 0) - (alignment?.treeContentWidth ?? 0)))
     .toBeLessThanOrEqual(1)
   const treeButtonSurfaces = await page.locator(
-    '.chain-trace-turn-toggle, .chain-trace-node-toggle, .chain-trace-node-select',
+    '.chain-trace-node-toggle, .chain-trace-node-select',
   ).evaluateAll((buttons) => buttons.map((button) => {
     const style = getComputedStyle(button)
     return {
@@ -511,13 +467,12 @@ test('Turn 树、错误归属、独立收起和详情焦点可真实交互', asy
   const pageErrors = await mockChainTraceStudio(page)
   const traceRegion = page.getByRole('region', { name: '链路' })
 
-  await expect(page.getByText('第 1 轮')).toBeVisible()
+  await expect(page.getByRole('button', { name: '用户消息，HumanMessage' }).first()).toBeVisible()
   await expect(page.getByText('Historical Agent')).toHaveCount(0)
   await expect(traceRegion.getByText('继续核验真实调用树')).toBeVisible()
   await expect(page.locator('.chain-trace-duration', { hasText: '仅配置' })).toHaveCount(0)
   await expect(page.getByText('错误', { exact: true })).toHaveCount(1)
   await expect(page.getByText('搜索服务在期限内未响应')).toBeVisible()
-  await expect(page.getByRole('button', { name: '工具阶段，Tools' })).toHaveCount(0)
   await expect(page.getByRole('button', {
     name: '中间件，PromptCacheMiddleware.awrap_model_call',
   })).toHaveCount(0)
@@ -542,27 +497,27 @@ test('Turn 树、错误归属、独立收起和详情焦点可真实交互', asy
   expect(technicalColors.color).toBe(technicalColors.primary)
   expect(technicalColors.markBackground).toBe(technicalColors.primary)
   await expect(page.locator('.chain-trace-entry-icon.is-middleware')).toHaveCount(1)
-  await expect(page.getByRole('button', { name: '工具阶段，Tools' })).toBeVisible()
+  await expect(page.getByRole('button', { name: '系统消息，system-current' })).toBeVisible()
   await technicalNodes.click()
   await expect(technicalNodes).toHaveAttribute('aria-pressed', 'false')
   await expect(page.locator('.chain-trace-entry-icon.is-middleware')).toHaveCount(0)
-  await expect(page.getByRole('button', { name: '工具阶段，Tools' })).toHaveCount(0)
-  await expect(page.getByRole('button', { name: '工具执行，web_search' })).toBeVisible()
+  await expect(page.getByRole('button', { name: '系统消息，system-current' })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: '工具，web_search' })).toBeVisible()
   await expect(page.locator('table')).toHaveCount(0)
   await expect(page.getByText(/运行 · run-/)).toHaveCount(0)
 
-  await page.getByRole('button', { name: '收起 Model' }).click()
-  await expect(page.getByRole('button', { name: '模型请求，deepseek-v4-pro' })).toHaveCount(0)
-  await page.getByRole('button', { name: '展开 Model' }).click()
-  const provider = page.getByRole('button', { name: '模型请求，deepseek-v4-pro' })
-  const providerNode = page.locator('[data-trace-entry-id="provider-current"]').locator('xpath=../..')
-  const modelNode = page.locator('[data-trace-entry-id="model-current"]').locator('xpath=../..')
-  const siblingToolNode = page.locator('[data-trace-entry-id="tool-current"]').locator('xpath=../..')
-  await provider.click()
-  await expect(providerNode).toHaveClass(/is-on-selected-path/)
+  await page.getByRole('button', { name: '收起 deepseek-v4-pro' }).click()
+  await expect(page.getByRole('button', { name: '助手消息，AssistantMessage' })).toHaveCount(0)
+  await page.getByRole('button', { name: '展开 deepseek-v4-pro' }).click()
+  const assistant = page.getByRole('button', { name: '助手消息，AssistantMessage' })
+  const assistantNode = page.locator('[data-trace-node-id="assistant-current"]').locator('xpath=../..')
+  const modelNode = page.locator('[data-trace-node-id="model-current"]').locator('xpath=../..')
+  const siblingToolNode = page.locator('[data-trace-node-id="tool-current"]').locator('xpath=../..')
+  await assistant.click()
+  await expect(assistantNode).toHaveClass(/is-on-selected-path/)
   await expect(modelNode).toHaveClass(/is-on-selected-path/)
   await expect(siblingToolNode).not.toHaveClass(/is-on-selected-path/)
-  const pathColors = await providerNode.evaluate((node) => {
+  const pathColors = await assistantNode.evaluate((node) => {
     const elbow = node.querySelector<HTMLElement>('.chain-trace-connector-elbow')
     const probe = document.createElement('span')
     probe.style.color = 'var(--color-brand)'
@@ -572,7 +527,7 @@ test('Turn 树、错误归属、独立收起和详情焦点可真实交互', asy
     return { brand, connector: elbow ? getComputedStyle(elbow).borderBottomColor : '' }
   })
   expect(pathColors.connector).toBe(pathColors.brand)
-  const layerOrder = await page.locator('[data-trace-entry-id="provider-current"]').evaluate((button) => {
+  const layerOrder = await page.locator('[data-trace-node-id="assistant-current"]').evaluate((button) => {
     const icon = button.querySelector<HTMLElement>('.chain-trace-entry-icon')
     const connector = button.closest('.chain-trace-node')
       ?.querySelector<HTMLElement>('.chain-trace-connector-elbow')
@@ -596,24 +551,33 @@ test('Turn 树、错误归属、独立收起和详情焦点可真实交互', asy
   await expect(details.getByRole('button', { name: '关闭链路详情' })).toBeFocused()
   await page.setViewportSize({ width: 1440, height: 800 })
   await expect(treeScroll).not.toHaveAttribute('inert')
-  await provider.focus()
+  await assistant.focus()
   await page.setViewportSize({ width: 768, height: 800 })
   await expect(treeScroll).toHaveAttribute('inert', '')
   await expect(details.getByRole('button', { name: '关闭链路详情' })).toBeFocused()
+  await page.keyboard.press('Escape')
+  await expect(details).toBeHidden()
+  await page.getByRole('button', { name: '模型调用，deepseek-v4-pro' }).click()
   await details.getByRole('tab', { name: '系统提示词' }).click()
   await expect(details.getByText('浏览器系统提示词')).toBeVisible()
   await page.keyboard.press('Escape')
   await expect(details).toBeHidden()
-  await expect(provider).toBeFocused()
+  await expect(page.getByRole('button', { name: '模型调用，deepseek-v4-pro' })).toBeFocused()
 
   await page.getByRole('button', { name: '收起 Agent' }).click()
-  await expect(page.getByRole('button', { name: '模型，Model' })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: '模型调用，deepseek-v4-pro' })).toHaveCount(0)
   await page.getByRole('button', { name: '展开 Agent' }).click()
-  await expect(page.getByRole('button', { name: '模型，Model' })).toBeVisible()
+  await expect(page.getByRole('button', { name: '模型调用，deepseek-v4-pro' })).toBeVisible()
 
-  await page.getByRole('button', { name: '展开第 1 轮' }).click()
+  await page.locator('[data-trace-node-id="old-human"]')
+    .locator('xpath=..')
+    .getByRole('button', { name: '展开 HumanMessage' })
+    .click()
   await expect(page.getByText('Historical Agent')).toBeVisible()
-  await page.getByRole('button', { name: '收起第 1 轮' }).click()
+  await page.locator('[data-trace-node-id="old-human"]')
+    .locator('xpath=..')
+    .getByRole('button', { name: '收起 HumanMessage' })
+    .click()
   await expect(page.getByText('Historical Agent')).toHaveCount(0)
   await page.getByRole('button', { name: '返回对话' }).click()
   await expect(page.getByRole('button', { name: '链路分析' })).toBeFocused()
@@ -701,7 +665,8 @@ test('四个视口、深色与 reduced-motion 不产生页面横向溢出', asyn
 
   for (const width of [320, 768, 1024, 1440]) {
     await page.setViewportSize({ width, height: 900 })
-    await expect(page.getByText('第 2 轮')).toBeVisible()
+    await expect(page.getByRole('button', { name: '用户消息，HumanMessage' }).last())
+      .toBeVisible()
     const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)
     expect(overflow).toBeLessThanOrEqual(0)
   }
@@ -709,7 +674,7 @@ test('四个视口、深色与 reduced-motion 不产生页面横向溢出', asyn
   await page.emulateMedia({ reducedMotion: 'reduce' })
   await page.setViewportSize({ width: 320, height: 800 })
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark')
-  const toggle = page.getByRole('button', { name: '收起 Model' })
+  const toggle = page.getByRole('button', { name: '收起 deepseek-v4-pro' })
   await expect(toggle.locator('svg')).toHaveCSS('transition-duration', '0s')
   const cdp = await page.context().newCDPSession(page)
   await cdp.send('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 1 })

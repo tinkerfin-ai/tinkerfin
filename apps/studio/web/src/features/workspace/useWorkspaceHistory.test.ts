@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ConversationHistoryDetail } from '../../api/conversation/history'
 import { upsertConversation } from '../../lib/workspace'
+import { emptyTraceGraph } from '../../test/traceFixtures'
 import type { Conversation, WorkspaceState } from '../../types'
 import { restoreConversationFromTrace } from '../conversation/trace/runtime'
 import {
@@ -53,7 +54,6 @@ const detail = (
   threadId: THREAD_ID,
   title: '分页竞态',
   lastModel: 'main',
-  runtimeProfile: 'deepagents-v2',
   pinned: false,
   asOfSeq: 5,
   headRunId: RUN_ID,
@@ -75,7 +75,6 @@ const detail = (
     completedAt: BASE_TIME,
   }],
   reasoning: [],
-  nodes: [],
   state: { root: {}, subgraphs: {} },
   interactions: [],
   status: { execution: 'running', headRunId: RUN_ID },
@@ -83,6 +82,7 @@ const detail = (
   createdAt: BASE_TIME,
   updatedAt: BASE_TIME,
   ...overrides,
+  graph: overrides.graph ?? emptyTraceGraph(overrides.asOfSeq ?? 5),
   taskTrace: overrides.taskTrace ?? { status: 'ready', todoGroups: [] },
 })
 

@@ -318,7 +318,25 @@ be added, but required semantic modes cannot be removed and state output must re
 complete. `NativeGraphRunStream` returns original upstream objects while transferring
 each Driver-owned canonical frame exactly once to Observation, Native SSE, or Messaging.
 It preserves ordering, backpressure, errors, cancellation, coordination, observer
-ordering, and cleanup.
+ordering, and cleanup. `open_run()` returns after Run start and input observations are
+durable, before the first model output is pulled. The caller must close a returned stream
+that it will not iterate.
+
+When only the final root state is needed, use the same managed lifecycle without
+handling stream parts:
+
+```python
+state = await tinkerfin.ainvoke(
+    identity,
+    agent=agent,
+    input=graph_input,
+    mode="default",
+)
+```
+
+This method consumes the canonical stream internally and retains Observation, Trace,
+terminal settlement, and cleanup. Direct `graph.ainvoke(...)` remains the explicitly
+unmanaged advanced boundary.
 
 ### Managed AG-UI runs
 
@@ -439,9 +457,9 @@ agent = tinkerfin.create_deep_agent(
 )
 ```
 
-`visible()` retains configuration and standard callback lifecycles,
-`configuration_only()` retains configuration without claiming execution, and
-`disabled()` suppresses middleware-specific facts. Every setting retains final model
+`visible()` retains standard callback-proven execution lifecycles, while
+`disabled()` suppresses middleware-specific facts. Configuration alone never creates
+a Trace fact or Graph node. Every setting retains final model
 requests and actual Tool executions. Type settings also apply to framework-injected
 middleware first observed through its standard callback class name; exact public names
 still take precedence. Interrupt, cancellation, abandonment, and generator closure are
@@ -485,7 +503,9 @@ tinkerfin = TinkerFin(runtime_profile=profile).observe(tracer)
 Without an extractor, Runtime emits no reasoning observation. Without the independent
 content policy, Tracing records only explicit omission and stores neither content nor a
 digest. Business fields named `reasoning_content` outside provider metadata remain
-ordinary business data.
+ordinary business data. A custom `ReasoningExtractor` implements
+`extract(message, *, provider)` and must return content only for a provider and source
+shape it can verify.
 
 ### Ownership
 
@@ -510,23 +530,28 @@ task failure remains observable when no caller cancellation outranks it.
 
 ## Advanced Runtime Profile integration
 
-`TinkerFin()` uses `DeepAgentsV2RuntimeProfile` by default. A Profile owns the complete
-third-party integration: Graph construction, invocation options, live-object validation,
-canonical observations, finite replay, and resume marker writes that preserve interrupted
-Graph control. TinkerFin selects it before Definition creation and records its
+`TinkerFin()` uses the stable `DeepAgentsV2RuntimeProfile` by default. Select
+`DeepAgentsV3RuntimeProfile` explicitly to use LangGraph's experimental v3 event stream.
+A Profile owns the complete third-party integration: Graph construction, invocation
+options, live-object validation, canonical observations, finite replay, and resume marker
+writes that preserve interrupted Graph control. TinkerFin selects it before Definition
+creation and records its
 `profile_id` with durable lineage; branch and resume reject a checkpoint created by
 another Profile before Graph continuation.
 
-Hosts with another real integration can implement `DeepAgentsRuntimeProfile` and inject
-it explicitly:
+Both built-in Profiles feed the same protocol-neutral Runtime boundary. There is no
+automatic detection, negotiation, or fallback:
 
 ```python
-from tinkerfin import DeepAgentsV2RuntimeProfile, TinkerFin
+from tinkerfin import DeepAgentsV3RuntimeProfile, TinkerFin
 
 
-profile = DeepAgentsV2RuntimeProfile()
+profile = DeepAgentsV3RuntimeProfile()
 tinkerfin = TinkerFin(runtime_profile=profile)
 ```
+
+Hosts with another real integration can implement `DeepAgentsRuntimeProfile` and inject
+it explicitly.
 
 The Runtime does not infer or negotiate a Profile from stream data. Every Profile must
 produce the same current `NativeStreamFrame` contract so observers, AG-UI, Native SSE,
@@ -553,9 +578,10 @@ Definition intentionally overrides that saver, pass the same object as
 before host setup begins; a returned Definition using another object fails closed and
 does not release the host claim.
 
-This distribution provides `DeepAgentsV2RuntimeProfile`; it does not provide a Deep
-Agents v3 Profile or TodoGroups projection/UI. A new Profile is a concrete integration
-that emits the same canonical contract, not a downstream version branch or placeholder.
+The v3 Profile is experimental because the locked LangGraph API declares v3
+experimental. The current LangGraph implementation internally drives that event stream
+from its v2 object stream; this is an upstream implementation detail and does not create
+a downstream version branch.
 
 ## Documentation
 

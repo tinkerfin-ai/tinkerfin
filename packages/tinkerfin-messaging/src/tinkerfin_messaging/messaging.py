@@ -30,9 +30,10 @@ from ._messaging_boundary import (
 from ._messaging_boundary import (
     _normalize_cancel_callback as _normalize_cancel_callback,
 )
+from ._messaging_ledger import PreparedRun as _PreparedRun
 from ._messaging_ledger import _MessagingLedger
 from ._producer_runtime import _ProducedMessage
-from .backend import MemoryBackend, RunStatus, _PreparedRun
+from .backend import MemoryBackend, RunStatus
 from .backend_contract import MessagingBackend
 from .errors import (
     CodecMismatch,
@@ -403,7 +404,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         after: int | None = None,
         cancel: CancelCallback[SourceT] | None = None,
         on_committed: CommittedCallback | None = None,
-        on_source_starting: Callable[[], Awaitable[None]] | None = None,
+        on_source_ready: Callable[[], Awaitable[None]] | None = None,
         on_delivery_not_started: Callable[[], Awaitable[None]] | None = None,
     ) -> MessageSubscription[ReplayT]: ...
 
@@ -416,7 +417,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         after: int | None = None,
         cancel: CancelCallback[ProfileSourceT] | None = None,
         on_committed: CommittedCallback | None = None,
-        on_source_starting: Callable[[], Awaitable[None]] | None = None,
+        on_source_ready: Callable[[], Awaitable[None]] | None = None,
         on_delivery_not_started: Callable[[], Awaitable[None]] | None = None,
     ) -> MessageSubscription[ProfileReplayT]: ...
 
@@ -433,7 +434,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
             CancelCallback[SourceT] | CancelCallback[ProfileSourceT] | None
         ) = None,
         on_committed: CommittedCallback | None = None,
-        on_source_starting: Callable[[], Awaitable[None]] | None = None,
+        on_source_ready: Callable[[], Awaitable[None]] | None = None,
         on_delivery_not_started: Callable[[], Awaitable[None]] | None = None,
     ) -> MessageSubscription[ReplayT] | MessageSubscription[ProfileReplayT]:
         """Start or attach one source and return its run-bounded subscription.
@@ -454,8 +455,8 @@ class MessageChannel(Generic[SourceT, ReplayT]):
             on_committed: Owner-only async observer invoked after each durable append;
                 attachment never invokes it and observer failure does not change the
                 producer outcome.
-            on_source_starting: Owner-only async callback after durable preparation and
-                source preflight, before the producer task is created.
+            on_source_ready: Owner-only async callback after the source is ready and
+                before the producer task is created.
             on_delivery_not_started: Async cleanup callback used only when neither a
                 producer nor a valid attachment was established.
 
@@ -475,7 +476,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
             after=after,
             cancel=cancel,
             on_committed=on_committed,
-            on_source_starting=on_source_starting,
+            on_source_ready=on_source_ready,
             on_delivery_not_started=on_delivery_not_started,
         )
 
@@ -487,7 +488,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         after: int | None = None,
         cancel: CancelCallback[object] | None = None,
         on_committed: CommittedCallback | None = None,
-        on_source_starting: Callable[[], Awaitable[None]] | None = None,
+        on_source_ready: Callable[[], Awaitable[None]] | None = None,
         on_delivery_not_started: Callable[[], Awaitable[None]] | None = None,
     ) -> MessageSubscription[object]:
         """Validate and start-or-attach before an HTTP response is constructed.
@@ -526,7 +527,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
             after=after,
             cancel=cancel,
             on_committed=on_committed,
-            on_source_starting=on_source_starting,
+            on_source_ready=on_source_ready,
             on_delivery_not_started=on_delivery_not_started,
         )
 
@@ -539,7 +540,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         after: int | Callable[[], int | None] | None = None,
         cancel: CancelCallback[SourceT] | None = None,
         on_committed: CommittedCallback | None = None,
-        on_source_starting: Callable[[], Awaitable[None]] | None = None,
+        on_source_ready: Callable[[], Awaitable[None]] | None = None,
         on_delivery_not_started: Callable[[], Awaitable[None]] | None = None,
     ) -> AsyncGenerator[bytes, None]: ...
 
@@ -552,7 +553,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         after: int | Callable[[], int | None] | None = None,
         cancel: CancelCallback[ProfileSourceT] | None = None,
         on_committed: CommittedCallback | None = None,
-        on_source_starting: Callable[[], Awaitable[None]] | None = None,
+        on_source_ready: Callable[[], Awaitable[None]] | None = None,
         on_delivery_not_started: Callable[[], Awaitable[None]] | None = None,
     ) -> AsyncGenerator[bytes, None]: ...
 
@@ -564,7 +565,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         after: int | Callable[[], int | None] | None = None,
         cancel: CancelCallback[object] | None = None,
         on_committed: CommittedCallback | None = None,
-        on_source_starting: Callable[[], Awaitable[None]] | None = None,
+        on_source_ready: Callable[[], Awaitable[None]] | None = None,
         on_delivery_not_started: Callable[[], Awaitable[None]] | None = None,
     ) -> AsyncGenerator[bytes, None]:
         """Prepare durable publication and return its SSE response body.
@@ -579,7 +580,8 @@ class MessageChannel(Generic[SourceT, ReplayT]):
             cancel: Optional callback used for accepted remote cancellation. Omit it
                 when the source declares its own callback.
             on_committed: Optional owner-only observer for newly committed envelopes.
-            on_source_starting: Owner-only async callback before producer creation.
+            on_source_ready: Owner-only async callback after source readiness and before
+                producer creation.
             on_delivery_not_started: Async cleanup callback when no delivery starts.
 
         Returns:
@@ -599,7 +601,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
             after=after,
             cancel=cancel,
             on_committed=on_committed,
-            on_source_starting=on_source_starting,
+            on_source_ready=on_source_ready,
             on_delivery_not_started=on_delivery_not_started,
         )
 
@@ -611,7 +613,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         after: int | None = None,
         cancel: CancelCallback[RecoverableMessage[SourceT]] | None = None,
         on_committed: CommittedCallback | None = None,
-        on_source_starting: Callable[[], Awaitable[None]] | None = None,
+        on_source_ready: Callable[[], Awaitable[None]] | None = None,
         on_delivery_not_started: Callable[[], Awaitable[None]] | None = None,
     ) -> MessageSubscription[ReplayT]:
         """Start or rebuild an owner from its last committed checkpoint.
@@ -629,7 +631,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
                 arguments is invoked without the context.
             on_committed: Asynchronous owner-only observer invoked after every
                 successful append, including idempotent recovery commits.
-            on_source_starting: Owner-only async callback before source recovery and
+            on_source_ready: Owner-only async callback after source recovery and before
                 producer creation.
             on_delivery_not_started: Async cleanup callback when no producer or valid
                 attachment was established.
@@ -650,7 +652,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
             after=after,
             cancel=cancel,
             on_committed=on_committed,
-            on_source_starting=on_source_starting,
+            on_source_ready=on_source_ready,
             on_delivery_not_started=on_delivery_not_started,
         )
 

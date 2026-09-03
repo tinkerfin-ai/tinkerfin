@@ -38,6 +38,7 @@ from tinkerfin import (
 from tinkerfin_contracts import (
     AgentStepObservation,
     MiddlewareDescriptor,
+    NativeTaskObservation,
     RunClosedObservation,
     RunIdentity,
     RunInputKind,
@@ -55,22 +56,27 @@ from tinkerfin_tracing import (
     FactCountResult,
     InMemoryTraceStore,
     MessageFact,
-    MiddlewareFact,
     MiddlewareTraceCapture,
     ReasoningCapturePolicy,
     ReasoningFact,
     RunFact,
+    RuntimeTaskFact,
     StateRevisionFact,
     ToolFact,
-    TraceEntryKind,
-    TraceEntryStatus,
     TraceEvent,
+    TraceGraph,
     TraceLimits,
     TraceProjectionFailed,
     Tracer,
     TraceSemanticFact,
     TraceThreadKey,
     TurnFact,
+)
+from tinkerfin_tracing.graph import (
+    TECHNICAL_TRACE_GRAPH_NODE_KINDS,
+    TraceGraphFilter,
+    TraceGraphNodeKind,
+    TraceGraphNodeStatus,
 )
 from tinkerfin_tracing.projection import (
     advance_core_projection_state,
@@ -271,6 +277,93 @@ def _parts() -> tuple[Mapping[str, object], ...]:
     )
 
 
+async def test_managed_run_is_queryable_before_native_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ready boundary commits Run input before the first Graph pull."""
+
+    graph = _Graph(_parts())
+
+    def build(*_args: object, **_kwargs: object) -> _Graph:
+        return graph
+
+    monkeypatch.setattr(
+        "tinkerfin.runtime_profile._deepagents_graph.create_deep_agent",
+        build,
+    )
+    tracer = Tracer()
+    tinkerfin = TinkerFin().observe(tracer)
+    definition = tinkerfin.create_deep_agent(model="provider:model", tools=[])
+    identity = RunIdentity(threadId="thread-ready", runId="run-ready")
+
+    stream = await tinkerfin.open_run(
+        identity,
+        agent=definition,
+        input=InputAgentState(
+            messages=[HumanMessage(id="user-ready", content="Start the work")]
+        ),
+    )
+
+    thread = await tracer.get(identity.thread_id, head_run_id=identity.run_id)
+    assert thread.head_run_id == identity.run_id
+    assert [(message.role, message.content) for message in thread.messages] == [
+        ("user", "Start the work")
+    ]
+    assert thread.status.execution == "running"
+    query = await tracer.query(identity.thread_id, head_run_id=identity.run_id)
+    assert query.nodes
+
+    await stream.aclose()
+    settled = await tracer.get(identity.thread_id, head_run_id=identity.run_id)
+    assert settled.status.execution == "cancelled"
+
+
+async def test_in_memory_graph_index_rebuild_matches_online_reduction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = InMemoryTraceStore()
+    tracer = Tracer(store=store)
+    definition = _definition(monkeypatch, _Graph(_parts()), tracer=tracer)
+    identity = RunIdentity(threadId="thread-graph-index", runId="run-graph-index")
+    runtime = definition.new(identity=identity)
+
+    async for _part in runtime.astream(
+        InputAgentState(messages=[HumanMessage(id="user-1", content="do work")]),
+    ):
+        pass
+
+    snapshot = await store.snapshot(identity.thread_id)
+    where = TraceGraphFilter(include_technical_nodes=True)
+    before = await store.query_trace_graph(
+        snapshot.key,
+        run_ids=(identity.run_id,),
+        where=where,
+        limit=100,
+    )
+    rebuilt_count = await store.rebuild_trace_graph(snapshot.key)
+    after = await store.query_trace_graph(
+        snapshot.key,
+        run_ids=(identity.run_id,),
+        where=where,
+        limit=100,
+    )
+
+    assert rebuilt_count == len(before.nodes)
+    assert after == before
+    assert {node.kind for node in after.nodes}.issuperset(
+        {
+            TraceGraphNodeKind.HUMAN_MESSAGE,
+            TraceGraphNodeKind.ASSISTANT_MESSAGE,
+            TraceGraphNodeKind.TOOL,
+        }
+    )
+    graph = await tracer.query(identity.thread_id, limit=100)
+    assert graph.turns[0].root_node_id == graph.ordered_node_ids[0]
+    assert graph.nodes[0].kind is TraceGraphNodeKind.HUMAN_MESSAGE
+    assert [node.kind for node in graph.nodes].count(TraceGraphNodeKind.TOOL) == 1
+    assert graph.root_node_ids == (graph.turns[0].root_node_id,)
+
+
 async def test_runtime_trace_projects_messages_tree_state_todos_and_safe_events(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -302,14 +395,25 @@ async def test_runtime_trace_projects_messages_tree_state_todos_and_safe_events(
         {"content": "Verify", "status": "pending"},
     ]
     assert any(
-        node.kind == "tool" and node.label == "write_todos"
-        for node in thread.tree.nodes
+        node.kind == "tool" and node.name == "write_todos"
+        for node in thread.graph.nodes
+    )
+    indexed = (
+        await tracer.query(
+            "thread-1",
+            where=TraceGraphFilter(include_technical_nodes=True),
+            limit=200,
+        )
+    ).snapshot
+    assert indexed.next_cursor is None
+    assert thread.graph == TraceGraph.model_validate(
+        indexed.model_dump(exclude={"next_cursor"})
     )
     assistant = next(
         message for message in thread.messages if message.role == "assistant"
     )
-    tool = next(node for node in thread.tree.nodes if node.kind == "tool")
-    assert assistant.trace_seq < tool.trace_seq
+    tool = next(node for node in thread.graph.nodes if node.kind == "tool")
+    assert assistant.trace_seq < tool.started_seq
     assert thread.status.execution == "succeeded"
     assert thread.completeness.payload_omitted is False
     result = thread.projections["fact_counts"]
@@ -337,16 +441,9 @@ async def test_runtime_trace_projects_messages_tree_state_todos_and_safe_events(
         "completed",
         "result",
     ]
-    assert [fact.phase for fact in assistant_facts] == [
-        "started",
-        "content",
-        "content",
-        "completed",
-    ]
-    assert all(
-        fact.content is None or fact.content.value != "hello world"
-        for fact in assistant_facts
-    )
+    assert [fact.phase for fact in assistant_facts] == ["started", "reconciled"]
+    assert assistant_facts[-1].content is not None
+    assert assistant_facts[-1].content.value == "hello world"
     assert all(fact.namespace == () for fact in tool_facts)
     assert any(
         isinstance(fact.changes.value, dict) and "todos" in fact.changes.value
@@ -515,16 +612,93 @@ async def test_locked_subagent_hitl_remains_an_interrupt_with_tracing() -> None:
     assert thread.interactions[0].namespace
     assert thread.interactions[0].status == "pending"
     assert thread.status.execution == "waiting"
-    entries = await tracer.query(identity.thread_id, limit=200)
-    assert entries.items
-    assert all(item.failure is None for item in entries.items)
+    graph = await tracer.query(identity.thread_id, limit=200)
+    assert graph.nodes
+    assert all(node.failure is None for node in graph.nodes)
     assert not any(
-        item.status in {TraceEntryStatus.RUNNING, TraceEntryStatus.FAILED}
-        for item in entries.items
+        node.status in {TraceGraphNodeStatus.RUNNING, TraceGraphNodeStatus.FAILED}
+        for node in graph.nodes
     )
 
 
-async def test_real_subagent_cancellation_settles_every_child_entry() -> None:
+async def test_canonical_graph_links_messages_models_and_one_aggregated_tool() -> None:
+    @tool
+    async def graph_tool(value: str) -> str:
+        """Return one Graph test value.
+
+        Args:
+            value: Value to return.
+
+        Returns:
+            The supplied value.
+        """
+
+        return value
+
+    model = _SubagentToolBindingModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "graph_tool",
+                        "args": {"value": "kept"},
+                        "id": "graph-tool-call",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="done"),
+        ]
+    )
+    tracer = Tracer(store=InMemoryTraceStore())
+    tinkerfin = TinkerFin().observe(tracer)
+    definition = tinkerfin.create_deep_agent(
+        model=model,
+        tools=[graph_tool],
+    )
+    identity = RunIdentity(threadId="thread-canonical-graph", runId="run-graph")
+    stream = await tinkerfin.open_run(
+        identity,
+        agent=definition,
+        input={"messages": [HumanMessage(content="Use the Tool", id="human-graph")]},
+    )
+    async for _part in stream:
+        pass
+
+    semantic = await tracer.query(identity.thread_id, limit=200)
+    technical = await tracer.query(
+        identity.thread_id,
+        where=TraceGraphFilter(include_technical_nodes=True),
+        limit=200,
+    )
+
+    assert semantic.nodes[0].kind is TraceGraphNodeKind.HUMAN_MESSAGE
+    assert [node.kind for node in semantic.nodes].count(TraceGraphNodeKind.TOOL) == 1
+    assert [node.kind for node in semantic.nodes].count(
+        TraceGraphNodeKind.ASSISTANT_MESSAGE
+    ) == 2
+    assert all(
+        node.parent_id is None
+        or node.parent_id in {candidate.id for candidate in semantic.nodes}
+        for node in semantic.nodes
+    )
+    tool_node = next(
+        node for node in semantic.nodes if node.kind is TraceGraphNodeKind.TOOL
+    )
+    assert tool_node.request == {"value": "kept"}
+    assert tool_node.result is not None
+    assert not tool_node.link_issues
+    assert not any(
+        node.kind in TECHNICAL_TRACE_GRAPH_NODE_KINDS for node in semantic.nodes
+    )
+    assert any(
+        node.kind is TraceGraphNodeKind.SYSTEM_MESSAGE for node in technical.nodes
+    )
+    assert not any(node.name == "ToolMessage" for node in technical.nodes)
+
+
+async def test_real_subagent_cancellation_settles_every_child_graph_node() -> None:
     entered = asyncio.Event()
     release = asyncio.Event()
 
@@ -592,42 +766,44 @@ async def test_real_subagent_cancellation_settles_every_child_entry() -> None:
     with pytest.raises(asyncio.CancelledError):
         await consumer
 
-    entries = await tracer.query(identity.thread_id, limit=200)
-    child_entries = tuple(
-        item
-        for item in entries.items
-        if item.kind
+    graph = await tracer.query(
+        identity.thread_id,
+        where=TraceGraphFilter(include_technical_nodes=True),
+        limit=200,
+    )
+    child_nodes = tuple(
+        node
+        for node in graph.nodes
+        if node.kind
         in {
-            TraceEntryKind.SUBAGENT,
-            TraceEntryKind.TASK,
-            TraceEntryKind.TOOL,
-            TraceEntryKind.TOOL_PROPOSAL,
+            TraceGraphNodeKind.SUBAGENT,
+            TraceGraphNodeKind.RUNTIME_TASK,
+            TraceGraphNodeKind.TOOL,
         }
     )
-    assert child_entries
-    failures = tuple(item for item in entries.items if item.failure is not None)
+    assert child_nodes
+    failures = tuple(node for node in graph.nodes if node.failure is not None)
     assert not failures, [
-        (item.kind, item.name, item.status, item.failure) for item in failures
+        (node.kind, node.name, node.status, node.failure) for node in failures
     ]
     assert not any(
-        item.status in {TraceEntryStatus.RUNNING, TraceEntryStatus.WAITING}
-        for item in child_entries
+        node.status in {TraceGraphNodeStatus.RUNNING, TraceGraphNodeStatus.WAITING}
+        for node in child_nodes
     )
     assert any(
-        item.kind is TraceEntryKind.SUBAGENT
-        and item.status is TraceEntryStatus.CANCELLED
-        for item in child_entries
+        node.kind is TraceGraphNodeKind.SUBAGENT
+        and node.status is TraceGraphNodeStatus.CANCELLED
+        for node in child_nodes
     )
 
 
-async def test_capture_policy_filters_middleware_configuration_facts() -> None:
+async def test_capture_policy_records_only_visible_middleware_executions() -> None:
     store = InMemoryTraceStore()
     tracer = Tracer(
         store=store,
         capture_policy=CapturePolicy.public_history(
             middleware_overrides={
                 "internal-metrics": MiddlewareTraceCapture.disabled(),
-                "prompt-cache": MiddlewareTraceCapture.configuration_only(),
             }
         ),
     )
@@ -659,7 +835,7 @@ async def test_capture_policy_filters_middleware_configuration_facts() -> None:
 
     session = await tracer.open_run(context)
     now = datetime.now(UTC)
-    for observation in (
+    observations: tuple[RuntimeObservation, ...] = (
         RunStartedObservation(identity=identity, observed_at=now, monotonic_ns=1),
         RunInputObservation(
             identity=identity,
@@ -667,19 +843,75 @@ async def test_capture_policy_filters_middleware_configuration_facts() -> None:
             observed_at=now,
             monotonic_ns=2,
         ),
+        AgentStepObservation(
+            identity=identity,
+            phase="started",
+            call_id="internal-metrics",
+            step_kind="middleware",
+            name="internal-metrics.awrap_model_call",
+            middleware_name="internal-metrics",
+            hook="awrap_model_call",
+            observed_at=now,
+            monotonic_ns=3,
+        ),
+        AgentStepObservation(
+            identity=identity,
+            phase="started",
+            call_id="prompt-cache",
+            step_kind="middleware",
+            name="prompt-cache.awrap_model_call",
+            middleware_name="prompt-cache",
+            hook="awrap_model_call",
+            observed_at=now,
+            monotonic_ns=4,
+        ),
+        AgentStepObservation(
+            identity=identity,
+            phase="completed",
+            call_id="prompt-cache",
+            step_kind="middleware",
+            name="prompt-cache.awrap_model_call",
+            middleware_name="prompt-cache",
+            hook="awrap_model_call",
+            observed_at=now,
+            monotonic_ns=5,
+        ),
+        AgentStepObservation(
+            identity=identity,
+            phase="started",
+            call_id="guardrail",
+            step_kind="middleware",
+            name="guardrail.abefore_model",
+            middleware_name="guardrail",
+            hook="abefore_model",
+            observed_at=now,
+            monotonic_ns=6,
+        ),
+        AgentStepObservation(
+            identity=identity,
+            phase="completed",
+            call_id="guardrail",
+            step_kind="middleware",
+            name="guardrail.abefore_model",
+            middleware_name="guardrail",
+            hook="abefore_model",
+            observed_at=now,
+            monotonic_ns=7,
+        ),
         RunTerminalObservation(
             identity=identity,
             outcome="succeeded",
             observed_at=now,
-            monotonic_ns=3,
+            monotonic_ns=8,
         ),
         RunClosedObservation(
             identity=identity,
             outcome="succeeded",
             observed_at=now,
-            monotonic_ns=4,
+            monotonic_ns=9,
         ),
-    ):
+    )
+    for observation in observations:
         await session.observe(observation)
     await session.aclose()
 
@@ -691,21 +923,39 @@ async def test_capture_policy_filters_middleware_configuration_facts() -> None:
         limit=100,
     )
     middleware = tuple(
-        event.fact for event in events if isinstance(event.fact, MiddlewareFact)
+        event.fact
+        for event in events
+        if isinstance(event.fact, AgentStepFact)
+        and event.fact.step_kind == "middleware"
     )
-    assert [(fact.name, fact.hooks) for fact in middleware] == [
-        ("prompt-cache", ("awrap_model_call",)),
-        ("guardrail", ("abefore_model",)),
-    ]
+    assert {(fact.name, fact.hook) for fact in middleware} == {
+        ("prompt-cache.awrap_model_call", "awrap_model_call"),
+        ("guardrail.abefore_model", "abefore_model"),
+    }
+    assert all(event.fact.kind != "middleware" for event in events)
+    graph = await tracer.query(
+        identity.thread_id,
+        where=TraceGraphFilter(
+            kinds={TraceGraphNodeKind.MIDDLEWARE},
+            include_technical_nodes=True,
+        ),
+    )
+    middleware_nodes = (
+        node for node in graph.nodes if node.kind is TraceGraphNodeKind.MIDDLEWARE
+    )
+    assert {(node.name, node.hooks) for node in middleware_nodes} == {
+        ("prompt-cache.awrap_model_call", ("awrap_model_call",)),
+        ("guardrail.abefore_model", ("abefore_model",)),
+    }
 
 
-async def test_type_policy_covers_callback_only_internal_middleware() -> None:
+async def test_type_policy_disables_callback_only_internal_middleware() -> None:
     store = InMemoryTraceStore()
     tracer = Tracer(
         store=store,
         capture_policy=CapturePolicy.public_history(
             middleware_overrides={
-                PatchToolCallsMiddleware: MiddlewareTraceCapture.configuration_only(),
+                PatchToolCallsMiddleware: MiddlewareTraceCapture.disabled(),
             }
         ),
     )
@@ -773,16 +1023,116 @@ async def test_type_policy_covers_callback_only_internal_middleware() -> None:
         as_of_seq=snapshot.as_of_seq,
         limit=100,
     )
-    middleware = tuple(
-        event.fact for event in events if isinstance(event.fact, MiddlewareFact)
-    )
-    assert len(middleware) == 1
-    assert middleware[0].name == "PatchToolCallsMiddleware"
-    assert middleware[0].class_name == (
-        f"{PatchToolCallsMiddleware.__module__}.{PatchToolCallsMiddleware.__qualname__}"
-    )
-    assert middleware[0].hooks == ("before_agent",)
     assert not any(isinstance(event.fact, AgentStepFact) for event in events)
+    graph = await tracer.query(
+        identity.thread_id,
+        where=TraceGraphFilter(
+            kinds={TraceGraphNodeKind.MIDDLEWARE},
+            include_technical_nodes=True,
+        ),
+    )
+    assert graph.nodes == ()
+
+
+@pytest.mark.parametrize("callback_first", [False, True])
+async def test_native_task_and_middleware_callback_share_one_graph_node(
+    callback_first: bool,
+) -> None:
+    store = InMemoryTraceStore()
+    tracer = Tracer(store=store)
+    identity = RunIdentity(threadId="thread-middleware-task", runId="run-task")
+    context = RunSourceContext(
+        identity=identity,
+        runtime_profile="deepagents-v2",
+        input_kind="ordinary",
+        input={"messages": [{"role": "user", "content": "hello"}]},
+        config={},
+    )
+    session = await tracer.open_run(context)
+    now = datetime.now(UTC)
+    task_started = NativeTaskObservation(
+        identity=identity,
+        namespace=(),
+        phase="start",
+        task_id="middleware-task",
+        name="TodoListMiddleware.after_model",
+        observed_at=now,
+        monotonic_ns=4 if callback_first else 3,
+    )
+    callback_started = AgentStepObservation(
+        identity=identity,
+        phase="started",
+        call_id="middleware-callback",
+        step_kind="middleware",
+        name="TodoListMiddleware.after_model",
+        task_id="middleware-task",
+        middleware_name="TodoListMiddleware",
+        hook="after_model",
+        observed_at=now,
+        monotonic_ns=3 if callback_first else 4,
+    )
+    observations: tuple[RuntimeObservation, ...] = (
+        RunStartedObservation(identity=identity, observed_at=now, monotonic_ns=1),
+        RunInputObservation(
+            identity=identity,
+            source=context,
+            observed_at=now,
+            monotonic_ns=2,
+        ),
+        *(
+            (callback_started, task_started)
+            if callback_first
+            else (task_started, callback_started)
+        ),
+        AgentStepObservation(
+            identity=identity,
+            phase="completed",
+            call_id="middleware-callback",
+            step_kind="middleware",
+            name="TodoListMiddleware.after_model",
+            task_id="middleware-task",
+            middleware_name="TodoListMiddleware",
+            hook="after_model",
+            observed_at=now,
+            monotonic_ns=5,
+        ),
+        NativeTaskObservation(
+            identity=identity,
+            namespace=(),
+            phase="result",
+            task_id="middleware-task",
+            name="TodoListMiddleware.after_model",
+            observed_at=now,
+            monotonic_ns=6,
+        ),
+        RunTerminalObservation(
+            identity=identity,
+            outcome="succeeded",
+            observed_at=now,
+            monotonic_ns=7,
+        ),
+        RunClosedObservation(
+            identity=identity,
+            outcome="succeeded",
+            observed_at=now,
+            monotonic_ns=8,
+        ),
+    )
+    for observation in observations:
+        await session.observe(observation)
+    await session.aclose()
+
+    thread = await tracer.get(identity.thread_id)
+    nodes = [
+        node
+        for node in thread.graph.nodes
+        if node.name == "TodoListMiddleware.after_model"
+    ]
+    assert len(nodes) == 1
+    assert nodes[0].kind is TraceGraphNodeKind.MIDDLEWARE
+    events = (await thread.events(limit=100)).items
+    assert sum(isinstance(event.fact, RuntimeTaskFact) for event in events) == 2
+    assert sum(isinstance(event.fact, AgentStepFact) for event in events) == 2
 
 
 async def _record_run(
@@ -840,10 +1190,10 @@ async def test_branches_require_an_explicit_head_and_window_loads_older_turns() 
     branch = await tracer.get("thread-lineage", head_run_id="branch-a", limit=1)
     assert branch.head_run_id == "branch-a"
     assert branch.has_older is True
-    assert len(branch.tree.roots) == 1
+    assert len(branch.graph.turns) == 1
     await branch.load_older(limit=1)
     assert branch.has_older is False
-    assert len(branch.tree.roots) == 2
+    assert len(branch.graph.turns) == 2
 
 
 async def test_incremental_core_checkpoint_reads_only_the_visible_turn_window() -> None:
@@ -871,7 +1221,7 @@ async def test_incremental_core_checkpoint_reads_only_the_visible_turn_window() 
 
     assert query_calls == ()
     assert thread.messages == baseline.messages
-    assert thread.tree == baseline.tree
+    assert len(thread.graph.turns) == 2
     assert thread.state == baseline.state
     assert thread.status == baseline.status
     assert thread.completeness == baseline.completeness
@@ -930,7 +1280,6 @@ async def test_implicit_resume_matches_full_fold_for_every_incremental_batch() -
         assert projected.available_heads == baseline.available_heads
         assert projected.messages == baseline.messages
         assert projected.reasoning == baseline.reasoning
-        assert projected.tree == baseline.tree
         assert projected.state == baseline.state
         assert projected.interactions == baseline.interactions
         assert projected.summary == baseline.summary
@@ -960,8 +1309,8 @@ async def test_history_cursor_expands_one_fixed_prefix_after_new_commits() -> No
     )
 
     assert older.as_of_seq == first.as_of_seq
-    assert len(older.tree.roots) == 4
-    assert all(node.run_id != "history-newer" for node in older.tree.nodes)
+    assert len(older.graph.turns) == 4
+    assert all(node.run_id != "history-newer" for node in older.graph.nodes)
 
 
 async def test_event_pages_are_fixed_as_of_and_follow_returns_semantic_deltas() -> None:
@@ -1188,6 +1537,7 @@ async def test_runtime_driver_and_tracer_require_both_reasoning_opt_ins(
         id="assistant-reasoning",
         content="visible answer",
         additional_kwargs={"reasoning_content": "first second"},
+        response_metadata={"model_provider": "deepseek"},
     )
     parts: tuple[Mapping[str, object], ...] = (
         {
@@ -1199,7 +1549,7 @@ async def test_runtime_driver_and_tracer_require_both_reasoning_opt_ins(
                     content="visible answer",
                     additional_kwargs={"reasoning_content": "first"},
                 ),
-                {"langgraph_node": "model"},
+                {"langgraph_node": "model", "ls_provider": "deepseek"},
             ),
         },
         {
@@ -1211,7 +1561,7 @@ async def test_runtime_driver_and_tracer_require_both_reasoning_opt_ins(
                     content="",
                     additional_kwargs={"reasoning_content": " second"},
                 ),
-                {"langgraph_node": "model"},
+                {"langgraph_node": "model", "ls_provider": "deepseek"},
             ),
         },
         {
@@ -1262,6 +1612,67 @@ async def test_runtime_driver_and_tracer_require_both_reasoning_opt_ins(
     assert thread.reasoning[0].content == "first second"
     assert thread.reasoning[0].status == "completed"
     assert thread.state.root["reasoning_content"] == "business value"
+
+
+async def test_deepseek_reasoning_opt_in_rejects_another_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parts: tuple[Mapping[str, object], ...] = (
+        {
+            "type": "messages",
+            "ns": (),
+            "data": (
+                AIMessageChunk(
+                    id="assistant-openai",
+                    content="visible answer",
+                    additional_kwargs={"reasoning_content": "private"},
+                ),
+                {"langgraph_node": "model", "ls_provider": "openai"},
+            ),
+        },
+        {
+            "type": "values",
+            "ns": (),
+            "data": {
+                "messages": [
+                    AIMessage(
+                        id="assistant-openai",
+                        content="visible answer",
+                        additional_kwargs={"reasoning_content": "private"},
+                        response_metadata={"model_provider": "openai"},
+                    )
+                ]
+            },
+            "interrupts": (),
+        },
+    )
+    tracer = Tracer(reasoning_capture_policy=ReasoningCapturePolicy.content())
+    definition = _definition(
+        monkeypatch,
+        _Graph(parts),
+        tracer=tracer,
+        runtime_profile=DeepAgentsV2RuntimeProfile(
+            reasoning_extractors=(DeepSeekReasoningExtractor(),)
+        ),
+    )
+    runtime = definition.new(
+        identity=RunIdentity(threadId="thread-openai", runId="run-openai")
+    )
+
+    async for _part in runtime.astream(
+        InputAgentState(messages=[]),
+        config=cast(
+            RunnableConfig,
+            {"configurable": {"thread_id": "thread-openai"}},
+        ),
+    ):
+        pass
+
+    thread = await tracer.get("thread-openai")
+    assert not any(
+        isinstance(item.fact, ReasoningFact)
+        for item in (await thread.events(limit=100)).items
+    )
 
 
 async def test_trace_quota_failure_terminates_the_agent_run_fail_closed(

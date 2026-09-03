@@ -106,6 +106,10 @@ class MessageFact(TraceFactBase):
     role: Literal["user", "assistant", "tool", "system", "other"]
     content: CapturedValue | None = None
     fingerprint: str | None = Field(default=None, min_length=64, max_length=64)
+    from_state_snapshot: bool = Field(
+        default=False,
+        description="Whether this message revision came from complete state values",
+    )
     name: str | None = Field(default=None, min_length=1, max_length=1024)
     tool_call_id: str | None = Field(default=None, min_length=1, max_length=1024)
 
@@ -378,6 +382,12 @@ class ModelCallFact(TraceFactBase):
     request: CapturedValue | None = None
     usage: CapturedValue | None = None
     response_metadata: CapturedValue | None = None
+    system_message_positions: tuple[int, ...] = Field(
+        description="Zero-based SystemMessage positions in the final provider request",
+    )
+    output_message_ids: tuple[str, ...] = Field(
+        description="Stable provider output message identities when exposed",
+    )
     tool_call_ids: tuple[str, ...] = ()
     error_type: str | None = Field(default=None, min_length=1, max_length=1024)
     error_message: CapturedValue | None = None
@@ -391,6 +401,27 @@ class ModelCallFact(TraceFactBase):
             raise ValueError("started model call facts require a request")
         if self.phase != "started" and self.request is not None:
             raise ValueError("only started model call facts may carry a request")
+        if self.phase != "started" and self.system_message_positions:
+            raise ValueError(
+                "only started model call facts may carry SystemMessage positions"
+            )
+        if tuple(sorted(set(self.system_message_positions))) != (
+            self.system_message_positions
+        ):
+            raise ValueError("SystemMessage positions must be unique and ordered")
+        if any(position < 0 for position in self.system_message_positions):
+            raise ValueError("SystemMessage positions must be non-negative")
+        if self.phase not in {"first_output", "completed"} and self.output_message_ids:
+            raise ValueError(
+                "only first output or completed model calls may carry output message IDs"
+            )
+        if any(
+            not message_id or message_id != message_id.strip()
+            for message_id in self.output_message_ids
+        ):
+            raise ValueError("model output message IDs must be canonical text")
+        if len(set(self.output_message_ids)) != len(self.output_message_ids):
+            raise ValueError("model output message IDs must be unique")
         if self.phase not in {"completed"} and (
             self.usage is not None or self.response_metadata is not None
         ):
@@ -502,32 +533,13 @@ class ContextContributionFact(TraceFactBase):
         return self
 
 
-class MiddlewareFact(TraceFactBase):
-    """Record visible middleware configuration without claiming hook execution."""
-
-    kind: Literal["middleware"] = "middleware"
-    middleware_id: str = Field(min_length=1, max_length=2048)
-    name: str = Field(min_length=1, max_length=1024)
-    class_name: str | None = Field(default=None, min_length=1, max_length=1024)
-    hooks: tuple[str, ...] = ()
-
-    @model_validator(mode="after")
-    def hooks_are_canonical(self) -> MiddlewareFact:
-        """Reject duplicate or whitespace-aliased hook names."""
-
-        if any(not hook or hook != hook.strip() for hook in self.hooks):
-            raise ValueError("middleware hooks must be canonical text")
-        if len(set(self.hooks)) != len(self.hooks):
-            raise ValueError("middleware hooks must be unique")
-        return self
-
-
 class SkillFact(TraceFactBase):
     """Record a successful exact read of one configured Skill instruction file."""
 
     kind: Literal["skill"] = "skill"
     skill_id: str = Field(min_length=1, max_length=2048)
     execution_id: str = Field(min_length=1, max_length=2048)
+    source_tool_call_id: str = Field(min_length=1, max_length=1024)
     name: str = Field(min_length=1, max_length=1024)
     source_path: str = Field(min_length=1, max_length=4096)
     agent_name: str | None = Field(default=None, min_length=1, max_length=1024)
@@ -558,7 +570,6 @@ TraceSemanticFact: TypeAlias = Annotated[
     | ModelCallFact
     | ToolExecutionFact
     | ContextContributionFact
-    | MiddlewareFact
     | SkillFact,
     Field(discriminator="kind"),
 ]
@@ -583,7 +594,6 @@ __all__ = [
     "ContextContributionFact",
     "InteractionFact",
     "MessageFact",
-    "MiddlewareFact",
     "ModelCallFact",
     "NativeExtraFact",
     "PlanRevisionFact",

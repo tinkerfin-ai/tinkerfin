@@ -5,7 +5,7 @@ from __future__ import annotations
 import inspect
 from collections.abc import Mapping, Sequence
 from datetime import datetime
-from typing import Protocol, cast, runtime_checkable
+from typing import Literal, Protocol, cast, runtime_checkable
 
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
 from langgraph.types import StreamMode
@@ -41,7 +41,7 @@ _SUPPORTED_EXTRA_MODES: frozenset[StreamMode] = frozenset(
 )
 
 
-def _bind_v2_invocation(
+def _bind_deep_agents_invocation(
     signature: inspect.Signature,
     args: tuple[object, ...],
     options: Mapping[str, object],
@@ -49,13 +49,15 @@ def _bind_v2_invocation(
     identity: RunIdentity | None,
     runtime_profile: str | None,
     require_semantic_modes: bool,
+    version: Literal["v2", "v3"],
 ) -> inspect.BoundArguments:
-    """Apply the complete locked v2 invocation contract before source creation."""
+    """Apply one explicit Deep Agents stream contract before source creation."""
 
     if identity is not None and not isinstance(identity, RunIdentity):
         raise TypeError("identity must be a RunIdentity or None")
     if (identity is None) != (runtime_profile is None):
         raise TypeError("identity and runtime_profile must be supplied together")
+    label = f"Deep Agents {version}"
     bound = signature.bind(*args, **dict(options))
     parameters = signature.parameters
     variable_keyword = next(
@@ -142,14 +144,14 @@ def _bind_v2_invocation(
 
     if read("output_keys") is not None:
         raise ValueError(
-            "Deep Agents v2 output_keys must be None so values remains a complete "
-            "state snapshot"
+            f"{label} output_keys must be None so values remains a complete state "
+            "snapshot"
         )
 
     raw_modes = read("stream_mode")
     if supplied("stream_mode") and raw_modes is None:
         raise ValueError(
-            "Deep Agents v2 stream_mode must include messages, tasks, and values"
+            f"{label} stream_mode must include messages, tasks, and values"
         )
     if raw_modes is None:
         modes: tuple[object, ...] = ()
@@ -158,38 +160,34 @@ def _bind_v2_invocation(
     elif isinstance(raw_modes, Sequence):
         modes = tuple(cast(Sequence[object], raw_modes))
     else:
-        raise TypeError(
-            "Deep Agents v2 stream_mode must be a supported mode or sequence"
-        )
+        raise TypeError(f"{label} stream_mode must be a supported mode or sequence")
     duplicate = tuple(mode for index, mode in enumerate(modes) if mode in modes[:index])
     if duplicate:
-        raise ValueError(
-            f"Deep Agents v2 stream_mode contains duplicate modes: {duplicate!r}"
-        )
+        raise ValueError(f"{label} stream_mode contains duplicate modes: {duplicate!r}")
     supported = frozenset((*_REQUIRED_MODES, *_SUPPORTED_EXTRA_MODES))
     unsupported = tuple(
         mode for mode in modes if not isinstance(mode, str) or mode not in supported
     )
     if unsupported:
         raise ValueError(
-            f"Deep Agents v2 stream_mode contains unsupported modes: {unsupported!r}"
+            f"{label} stream_mode contains unsupported modes: {unsupported!r}"
         )
     if supplied("stream_mode") and require_semantic_modes:
         missing = tuple(mode for mode in _REQUIRED_MODES if mode not in modes)
         if missing:
             raise ValueError(
-                f"Deep Agents v2 stream_mode is missing required modes: {missing!r}"
+                f"{label} stream_mode is missing required modes: {missing!r}"
             )
     extra_modes = tuple(mode for mode in modes if mode not in _REQUIRED_MODES)
     write("stream_mode", (*_REQUIRED_MODES, *extra_modes))
 
-    version = read("version")
-    if version is not None and version != "v2":
-        raise ValueError("Deep Agents v2 Driver requires version='v2'")
-    write("version", "v2")
+    requested_version = read("version")
+    if requested_version is not None and requested_version != version:
+        raise ValueError(f"{label} Driver requires version={version!r}")
+    write("version", version)
     subgraphs = read("subgraphs")
     if subgraphs is not None and subgraphs is not True:
-        raise ValueError("Deep Agents v2 Driver requires subgraphs=True")
+        raise ValueError(f"{label} Driver requires subgraphs=True")
     write("subgraphs", True)
     return bound
 
@@ -255,8 +253,13 @@ class ReasoningExtractor(Protocol):
 
         ...
 
-    def extract(self, message: BaseMessage) -> JsonValue | None:
-        """Return reasoning content or ``None`` when this extractor does not match."""
+    def extract(
+        self,
+        message: BaseMessage,
+        *,
+        provider: str | None,
+    ) -> JsonValue | None:
+        """Return reasoning content only when the provider and message both match."""
 
         ...
 
@@ -276,11 +279,17 @@ class DeepSeekReasoningExtractor:
 
         return "deepseek.additional_kwargs.reasoning_content"
 
-    def extract(self, message: BaseMessage) -> JsonValue | None:
+    def extract(
+        self,
+        message: BaseMessage,
+        *,
+        provider: str | None,
+    ) -> JsonValue | None:
         """Return a non-empty verified reasoning string when present.
 
         Args:
             message: Live LangChain message from a validated Native frame.
+            provider: Canonical provider identity carried by the Native source.
 
         Returns:
             The reasoning string, or ``None`` when the verified path is absent.
@@ -290,6 +299,8 @@ class DeepSeekReasoningExtractor:
                 value that does not match the locked provider contract.
         """
 
+        if provider is None or provider.casefold() != "deepseek":
+            return None
         if not isinstance(message, AIMessage | AIMessageChunk):
             return None
         value = message.additional_kwargs.get("reasoning_content")
@@ -426,13 +437,14 @@ class DeepAgentsV2StreamDriver:
                 with the current Driver contract.
         """
 
-        return _bind_v2_invocation(
+        return _bind_deep_agents_invocation(
             signature,
             args,
             options,
             identity=identity,
             runtime_profile=runtime_profile,
             require_semantic_modes=True,
+            version="v2",
         )
 
     def bind_graph_invocation(
@@ -456,13 +468,14 @@ class DeepAgentsV2StreamDriver:
             Bound v2 Graph arguments without managed Runtime identity state.
         """
 
-        return _bind_v2_invocation(
+        return _bind_deep_agents_invocation(
             signature,
             args,
             options,
             identity=None,
             runtime_profile=None,
             require_semantic_modes=False,
+            version="v2",
         )
 
     def validate(self, part: object) -> NativeValidatedStreamPart:
@@ -522,9 +535,11 @@ class DeepAgentsV2StreamDriver:
     ) -> tuple[NativeObservation, ...]:
         if not self._reasoning_extractors:
             return ()
-        messages: tuple[BaseMessage, ...]
+        messages: tuple[tuple[BaseMessage, str | None], ...]
         if isinstance(part, NativeMessageStreamPart):
-            messages = (part.data.message,)
+            raw_provider = (part.data.metadata.model_extra or {}).get("ls_provider")
+            provider = raw_provider if isinstance(raw_provider, str) else None
+            messages = ((part.data.message, provider),)
         elif isinstance(part, NativeValuesStreamPart):
             raw_messages = part.data.get("messages", ())
             if not isinstance(raw_messages, Sequence) or isinstance(
@@ -535,16 +550,31 @@ class DeepAgentsV2StreamDriver:
             values = cast(Sequence[object], raw_messages)
             if any(not isinstance(value, BaseMessage) for value in values):
                 raise TypeError("values messages must contain LangChain messages")
-            messages = tuple(cast(Sequence[BaseMessage], values))
+            messages = tuple(
+                (
+                    message,
+                    (
+                        raw_provider
+                        if isinstance(
+                            raw_provider := message.response_metadata.get(
+                                "model_provider"
+                            ),
+                            str,
+                        )
+                        else None
+                    ),
+                )
+                for message in cast(Sequence[BaseMessage], values)
+            )
         else:
             return ()
 
         observations: list[NativeObservation] = []
-        for message in messages:
+        for message, provider in messages:
             matches = [
                 (extractor.name, value)
                 for extractor in self._reasoning_extractors
-                if (value := extractor.extract(message)) is not None
+                if (value := extractor.extract(message, provider=provider)) is not None
             ]
             if len(matches) > 1:
                 raise TinkerFinStreamProtocolError(
@@ -573,8 +603,58 @@ class DeepAgentsV2StreamDriver:
         return tuple(observations)
 
 
+class DeepAgentsV3StreamDriver(DeepAgentsV2StreamDriver):
+    """Normalize canonical parts carried by LangGraph's explicit v3 event stream.
+
+    The matching Runtime Profile owns conversion from public v3 ``ProtocolEvent``
+    objects into the same live canonical part boundary used by the rest of TinkerFin.
+    This Driver keeps invocation selection explicit and reuses the shared semantic
+    normalization without exposing v3 to Runtime observers or Trace consumers.
+    """
+
+    def bind_invocation(
+        self,
+        signature: inspect.Signature,
+        args: tuple[object, ...],
+        options: Mapping[str, object],
+        *,
+        identity: RunIdentity,
+        runtime_profile: str,
+    ) -> inspect.BoundArguments:
+        """Bind a managed Graph call to the explicit v3 Profile source."""
+
+        return _bind_deep_agents_invocation(
+            signature,
+            args,
+            options,
+            identity=identity,
+            runtime_profile=runtime_profile,
+            require_semantic_modes=True,
+            version="v3",
+        )
+
+    def bind_graph_invocation(
+        self,
+        signature: inspect.Signature,
+        args: tuple[object, ...],
+        options: Mapping[str, object],
+    ) -> inspect.BoundArguments:
+        """Bind direct Graph streaming to the explicit v3 Profile source."""
+
+        return _bind_deep_agents_invocation(
+            signature,
+            args,
+            options,
+            identity=None,
+            runtime_profile=None,
+            require_semantic_modes=False,
+            version="v3",
+        )
+
+
 __all__ = [
     "DeepAgentsV2StreamDriver",
+    "DeepAgentsV3StreamDriver",
     "DeepSeekReasoningExtractor",
     "NativeStreamDriver",
     "NativeStreamFrame",

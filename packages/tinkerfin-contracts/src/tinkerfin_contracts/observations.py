@@ -332,6 +332,10 @@ class ModelCallObservation(ObservationModel):
     )
     usage: dict[str, JsonValue] | None = None
     response_metadata: dict[str, JsonValue] | None = None
+    output_message_ids: tuple[str, ...] = Field(
+        default=(),
+        description="Stable provider output message identities when exposed",
+    )
     tool_call_ids: tuple[str, ...] = ()
     error_type: str | None = Field(default=None, min_length=1, max_length=1024)
     error_message: str | None = Field(default=None, min_length=1, max_length=4096)
@@ -360,6 +364,17 @@ class ModelCallObservation(ObservationModel):
             raise ValueError("only failed model calls can own a failure")
         if self.phase != "completed" and self.tool_call_ids:
             raise ValueError("only completed model calls may carry Tool call IDs")
+        if self.phase not in {"first_output", "completed"} and self.output_message_ids:
+            raise ValueError(
+                "only first output or completed model calls may carry output message IDs"
+            )
+        if any(
+            not message_id or message_id != message_id.strip()
+            for message_id in self.output_message_ids
+        ):
+            raise ValueError("model output message IDs must be canonical text")
+        if len(set(self.output_message_ids)) != len(self.output_message_ids):
+            raise ValueError("model output message IDs must be unique")
         if any(
             not tool_call_id or tool_call_id != tool_call_id.strip()
             for tool_call_id in self.tool_call_ids

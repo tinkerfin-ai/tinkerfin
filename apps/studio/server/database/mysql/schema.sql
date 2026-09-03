@@ -21,7 +21,6 @@ CREATE TABLE agent_models (
   base_url VARCHAR(1024) NOT NULL COMMENT '模型服务 API 基础地址',
   api_key TEXT NOT NULL COMMENT '模型服务明文 API 密钥，禁止通过接口或日志暴露',
   reasoning_enabled BOOL NOT NULL COMMENT '是否启用已验证的 provider reasoning 参数',
-  runtime_profile VARCHAR(128) NOT NULL COMMENT 'Worker 创建与恢复 Run 使用的 Runtime Profile',
   enabled BOOL NOT NULL COMMENT '是否允许创建新 run',
   is_default BOOL NOT NULL COMMENT '是否为前端默认模型，由应用事务保证唯一',
   sort_order INTEGER NOT NULL COMMENT '模型目录升序排序值',
@@ -62,10 +61,8 @@ CREATE TABLE conversation_run_registrations (
   run_id VARCHAR(128) NOT NULL COMMENT '公开且幂等的主 Run ID',
   parent_run_id VARCHAR(128) COMMENT 'branch 或 resume 来源 Run ID',
   model_id VARCHAR(64) NOT NULL COMMENT '主 Run 使用的稳定模型 ID',
-  runtime_profile VARCHAR(128) NOT NULL COMMENT '主 Run 固定使用的 Runtime Profile',
   status VARCHAR(32) NOT NULL COMMENT 'preparing/starting/running/waiting/succeeded/failed/cancelled/abandoned',
   input_json JSON NOT NULL COMMENT '用于同 runId 幂等核验的标准请求',
-  config_json JSON NOT NULL COMMENT '模型与 Runtime Profile 的业务配置快照',
   terminal_outcome VARCHAR(32) COMMENT 'Trace 终态结果',
   error_code VARCHAR(128) COMMENT '客户端安全的终态错误码',
   started_at DATETIME NOT NULL COMMENT '请求注册时间',
@@ -76,7 +73,7 @@ CREATE TABLE conversation_run_registrations (
   CONSTRAINT uq_conversation_run_registrations_thread_run UNIQUE (conversation_thread_id, run_id),
   KEY ix_conversation_run_registrations_thread_started (conversation_thread_id, started_at, id),
   KEY ix_conversation_run_registrations_thread_status (conversation_thread_id, status, updated_at)
-) COMMENT='主 Run 请求幂等、Runtime Profile 与业务状态注册';
+) COMMENT='主 Run 请求幂等、模型与业务状态注册';
 
 CREATE TABLE conversation_interrupt_claims (
   id BIGINT NOT NULL AUTO_INCREMENT COMMENT '认领主键',
@@ -95,12 +92,12 @@ CREATE TABLE conversation_interrupt_claims (
 ) COMMENT='由框架恢复事实驱动的 interrupt 原子认领与结算';
 
 CREATE TABLE tinkerfin_trace_events (
-  namespace_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 namespace key',
-  thread_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 thread key',
+  namespace_hash BINARY(32) NOT NULL COMMENT 'SHA-256 namespace key',
+  thread_hash BINARY(32) NOT NULL COMMENT 'SHA-256 thread key',
   generation VARCHAR(64) NOT NULL COMMENT 'Exact Trace generation ID',
   trace_seq BIGINT NOT NULL COMMENT 'One-based global sequence in the generation',
   event_id VARCHAR(64) NOT NULL COMMENT 'Idempotent Store event identity',
-  run_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 Run key',
+  run_hash BINARY(32) NOT NULL COMMENT 'SHA-256 Run key',
   run_id TEXT NOT NULL COMMENT 'Semantic Run owning this fact',
   fact_kind VARCHAR(64) NOT NULL COMMENT 'Queryable current semantic fact discriminator',
   occurred_at DATETIME(6) NOT NULL COMMENT 'Source UTC fact timestamp',
@@ -113,58 +110,55 @@ CREATE TABLE tinkerfin_trace_events (
   KEY ix_tinkerfin_trace_events_run (namespace_hash, thread_hash, generation, run_hash, trace_seq)
 ) COMMENT='Authoritative semantic Trace Ledger events';
 
-CREATE TABLE tinkerfin_trace_entries (
-  namespace_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 namespace key',
-  thread_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 thread key',
+CREATE TABLE tinkerfin_trace_graph_nodes (
+  namespace_hash BINARY(32) NOT NULL COMMENT 'SHA-256 namespace key',
+  thread_hash BINARY(32) NOT NULL COMMENT 'SHA-256 thread key',
   generation VARCHAR(64) NOT NULL COMMENT 'Exact Trace generation ID',
-  entry_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 entry identity key',
-  entry_id TEXT NOT NULL COMMENT 'Canonical Trace entry identity',
-  parent_hash VARCHAR(64) COMMENT 'SHA-256 parent identity key when present',
-  parent_id TEXT COMMENT 'Canonical parent entry identity',
-  kind VARCHAR(32) NOT NULL COMMENT 'Functional entry kind',
-  status VARCHAR(32) NOT NULL COMMENT 'Current entry status',
-  name_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 display-name key',
-  name TEXT NOT NULL COMMENT 'Functional entry display name',
-  run_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 Run key',
-  run_id TEXT NOT NULL COMMENT 'Semantic Run owning the entry',
-  graph_namespace_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 canonical graph namespace key',
-  graph_namespace TEXT NOT NULL COMMENT 'Canonical JSON graph namespace',
-  agent_hash VARCHAR(64) COMMENT 'SHA-256 Agent name key when present',
-  agent_name TEXT COMMENT 'Named subagent when present',
-  provider_hash VARCHAR(64) COMMENT 'SHA-256 model provider key when present',
+  node_hash BINARY(32) NOT NULL COMMENT 'SHA-256 Graph node key',
+  node_id TEXT NOT NULL COMMENT 'Canonical Graph node identity',
+  structural_parent_hash BINARY(32) COMMENT 'SHA-256 structural parent key when present',
+  structural_parent_id TEXT COMMENT 'Evidence parent before visible-node projection',
+  kind VARCHAR(32) COMMENT 'Graph node kind, null only on a removal revision',
+  status VARCHAR(32) COMMENT 'Graph node status, null only on a removal revision',
+  name_hash BINARY(32) COMMENT 'SHA-256 display-name key, null on a removal revision',
+  name TEXT COMMENT 'Graph node display name, null on a removal revision',
+  run_hash BINARY(32) NOT NULL COMMENT 'SHA-256 Run revision key',
+  run_id TEXT NOT NULL COMMENT 'Semantic Run owning the node',
+  removed BOOL NOT NULL COMMENT 'Whether this Run revision hides an inherited node',
+  graph_namespace_hash BINARY(32) COMMENT 'SHA-256 graph namespace key, null on a removal revision',
+  graph_namespace TEXT COMMENT 'Canonical JSON graph namespace, null on a removal revision',
+  agent_hash BINARY(32) COMMENT 'SHA-256 Agent name key when present',
+  agent_name TEXT COMMENT 'Named Agent when present',
+  provider_hash BINARY(32) COMMENT 'SHA-256 model provider key when present',
   provider TEXT COMMENT 'Model provider when present',
-  model_hash VARCHAR(64) COMMENT 'SHA-256 model name key when present',
+  model_hash BINARY(32) COMMENT 'SHA-256 model name key when present',
   model TEXT COMMENT 'Model name when present',
-  started_at DATETIME(6) NOT NULL COMMENT 'Source UTC entry start time',
+  started_at DATETIME(6) COMMENT 'Source UTC node start time, null on a removal revision',
   first_output_at DATETIME(6) COMMENT 'Source UTC first model output time',
-  completed_at DATETIME(6) COMMENT 'Source UTC entry completion time',
-  started_seq BIGINT NOT NULL COMMENT 'Ledger event containing authoritative start details',
-  updated_seq BIGINT NOT NULL COMMENT 'Ledger event containing the current entry update',
-  CONSTRAINT pk_tinkerfin_trace_entries PRIMARY KEY (namespace_hash, thread_hash, generation, entry_hash),
-  KEY ix_tinkerfin_trace_entries_agent (namespace_hash, thread_hash, generation, agent_hash, started_at),
-  KEY ix_tinkerfin_trace_entries_kind_status (namespace_hash, thread_hash, generation, kind, status, started_at),
-  KEY ix_tinkerfin_trace_entries_model (namespace_hash, thread_hash, generation, model_hash, started_at),
-  KEY ix_tinkerfin_trace_entries_name (namespace_hash, thread_hash, generation, name_hash, started_at),
-  KEY ix_tinkerfin_trace_entries_namespace (namespace_hash, thread_hash, generation, graph_namespace_hash, started_at),
-  KEY ix_tinkerfin_trace_entries_page (namespace_hash, thread_hash, generation, started_at, entry_hash),
-  KEY ix_tinkerfin_trace_entries_parent (namespace_hash, thread_hash, generation, parent_hash, started_at),
-  KEY ix_tinkerfin_trace_entries_provider_model (namespace_hash, thread_hash, generation, provider_hash, model_hash, started_at),
-  KEY ix_tinkerfin_trace_entries_run (namespace_hash, thread_hash, generation, run_hash, started_at)
-) COMMENT='Disposable directly filterable Trace entry index without fact payloads';
+  completed_at DATETIME(6) COMMENT 'Source UTC node completion time',
+  started_seq BIGINT COMMENT 'Ledger node-creation sequence, null on a removal revision',
+  updated_seq BIGINT NOT NULL COMMENT 'Ledger sequence containing the current lifecycle update',
+  request_seq BIGINT COMMENT 'Ledger sequence containing current request details',
+  result_seq BIGINT COMMENT 'Ledger sequence containing current result details',
+  failure_seq BIGINT COMMENT 'Ledger sequence containing authoritative failure details',
+  link_issue VARCHAR(64) COMMENT 'Missing evidence that prevented one exact relationship',
+  CONSTRAINT pk_tinkerfin_trace_graph_nodes PRIMARY KEY (namespace_hash, thread_hash, generation, node_hash, run_hash),
+  KEY ix_tinkerfin_trace_graph_run (namespace_hash, thread_hash, generation, run_hash, node_hash, updated_seq)
+) COMMENT='Disposable payload-free canonical Trace Graph index';
 
 CREATE TABLE tinkerfin_trace_namespaces (
-  namespace_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 key for the logical namespace',
+  namespace_hash BINARY(32) NOT NULL COMMENT 'SHA-256 key for the logical namespace',
   namespace TEXT NOT NULL COMMENT 'Logical Trace Store namespace',
   created_at DATETIME(6) NOT NULL COMMENT 'Database UTC creation time',
   CONSTRAINT pk_tinkerfin_trace_namespaces PRIMARY KEY (namespace_hash)
 ) COMMENT='Trace namespace ownership';
 
 CREATE TABLE tinkerfin_trace_projection_checkpoints (
-  namespace_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 namespace key',
-  thread_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 thread key',
+  namespace_hash BINARY(32) NOT NULL COMMENT 'SHA-256 namespace key',
+  thread_hash BINARY(32) NOT NULL COMMENT 'SHA-256 thread key',
   generation VARCHAR(64) NOT NULL COMMENT 'Exact Trace generation ID',
-  projection_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 Projection key',
-  run_scope_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 Run scope key',
+  projection_hash BINARY(32) NOT NULL COMMENT 'SHA-256 Projection key',
+  run_scope_hash BINARY(32) NOT NULL COMMENT 'SHA-256 Run scope key',
   projection_name TEXT NOT NULL COMMENT 'Canonical Projection identity',
   run_scope TEXT NOT NULL COMMENT 'Run ID or empty thread-wide scope',
   as_of_seq BIGINT NOT NULL COMMENT 'Fixed Ledger prefix represented by state',
@@ -178,20 +172,12 @@ CREATE TABLE tinkerfin_trace_projection_checkpoints (
     projection_hash,
     run_scope_hash,
     as_of_seq
-  ),
-  KEY ix_tinkerfin_trace_checkpoints_lookup (
-    namespace_hash,
-    thread_hash,
-    generation,
-    projection_hash,
-    run_scope_hash,
-    as_of_seq
   )
 ) COMMENT='Disposable Projection checkpoint history';
 
 CREATE TABLE tinkerfin_trace_threads (
-  namespace_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 namespace key',
-  thread_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 thread key',
+  namespace_hash BINARY(32) NOT NULL COMMENT 'SHA-256 namespace key',
+  thread_hash BINARY(32) NOT NULL COMMENT 'SHA-256 thread key',
   namespace TEXT NOT NULL COMMENT 'Logical Trace namespace',
   thread_id TEXT NOT NULL COMMENT 'Canonical semantic thread ID',
   generation VARCHAR(64) NOT NULL COMMENT 'Non-reusable current generation ID',
@@ -204,10 +190,10 @@ CREATE TABLE tinkerfin_trace_threads (
 ) COMMENT='Current Trace generation and sequence allocator';
 
 CREATE TABLE tinkerfin_trace_writers (
-  namespace_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 namespace key',
-  thread_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 thread key',
+  namespace_hash BINARY(32) NOT NULL COMMENT 'SHA-256 namespace key',
+  thread_hash BINARY(32) NOT NULL COMMENT 'SHA-256 thread key',
   generation VARCHAR(64) NOT NULL COMMENT 'Exact Trace generation ID',
-  run_hash VARCHAR(64) NOT NULL COMMENT 'SHA-256 Run key',
+  run_hash BINARY(32) NOT NULL COMMENT 'SHA-256 Run key',
   run_id TEXT NOT NULL COMMENT 'Canonical semantic Run ID',
   owner_token VARCHAR(64) NOT NULL COMMENT 'Opaque current writer ownership token',
   fence BIGINT NOT NULL COMMENT 'Monotonic writer fencing token',

@@ -44,7 +44,7 @@ async with Messaging() as messaging:
     body = await channel.sse(
         source,
         after=0,
-        on_source_starting=activate_business_run,
+        on_source_ready=activate_business_run,
         on_delivery_not_started=cleanup_business_run,
     )
 
@@ -60,9 +60,9 @@ Tool, snapshot, or interrupt correlation identity. It cannot change any field of
 optional `RUN_STARTED.input`. Protocol-changing transformations belong to the advanced
 unprofiled `map_source()` boundary.
 
-`on_source_starting` activates host delivery for a new owner. If neither a producer nor
-an attachment is established, `on_delivery_not_started` performs host cleanup. An
-attachment invokes neither callback.
+`on_source_ready` activates host delivery for a new owner only after the request-owned
+source is ready. If readiness is never reached and no attachment is established,
+`on_delivery_not_started` performs host cleanup. An attachment invokes neither callback.
 
 An attachment never opens its unused candidate source, but Messaging closes that
 single-use candidate before returning. Do not reuse it after `wrap()` or `sse()`.

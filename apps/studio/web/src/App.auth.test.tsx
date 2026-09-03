@@ -13,6 +13,7 @@ import {
   readActiveRunSession,
   writeActiveRunSession,
 } from './features/conversation/stream/activeRunSession'
+import { emptyTraceGraph } from './test/traceFixtures'
 
 const user = {
   user_id: 7,
@@ -388,7 +389,6 @@ describe('App authentication boundary', () => {
           threadId: 'private-thread',
           title: '私密会话',
           lastModel: 'main',
-          runtimeProfile: 'deepagents-v2',
           asOfSeq: 1,
           headRunId: 'private-run',
           availableHeads: ['private-run'],
@@ -398,7 +398,7 @@ describe('App authentication boundary', () => {
           pinned: false,
           messages: [],
           reasoning: [],
-          nodes: [],
+          graph: emptyTraceGraph(1),
           state: { root: {}, subgraphs: {} },
           interactions: [],
           status: { execution: 'succeeded', headRunId: 'private-run' },

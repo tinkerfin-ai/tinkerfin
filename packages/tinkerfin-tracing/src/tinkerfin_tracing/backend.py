@@ -9,8 +9,14 @@ from typing import Literal, Protocol, runtime_checkable
 
 from tinkerfin_contracts import RunIdentity
 
-from .entries import TraceEntryKind, TraceEntryStatus, TraceFacets, TraceFilter
 from .facts import TraceEvent, TraceSemanticFact
+from .graph import (
+    TraceGraphFacets,
+    TraceGraphFilter,
+    TraceGraphLinkIssue,
+    TraceGraphNodeKind,
+    TraceGraphNodeStatus,
+)
 from .limits import TraceLimits
 from .store import StoreWriterSnapshot, TraceProjectionCheckpoint, TraceThreadKey
 
@@ -95,16 +101,17 @@ class StoredTraceEvent:
 
 
 @dataclass(frozen=True, slots=True)
-class TraceEntryMutation:
-    """Apply one deterministic partial update to the disposable query index."""
+class TraceGraphNodeMutation:
+    """Apply one deterministic partial update to the disposable Graph index."""
 
-    entry_id: str
+    node_id: str
     updated_seq: int
-    kind: TraceEntryKind | None = None
-    status: TraceEntryStatus | None = None
+    run_id: str
+    remove: bool = False
+    kind: TraceGraphNodeKind | None = None
+    status: TraceGraphNodeStatus | None = None
     name: str | None = None
-    run_id: str | None = None
-    parent_id: str | None = None
+    structural_parent_id: str | None = None
     namespace: tuple[str, ...] | None = None
     agent_name: str | None = None
     provider: str | None = None
@@ -113,16 +120,20 @@ class TraceEntryMutation:
     first_output_at: datetime | None = None
     completed_at: datetime | None = None
     started_seq: int | None = None
+    request_seq: int | None = None
+    result_seq: int | None = None
+    failure_seq: int | None = None
+    link_issue: TraceGraphLinkIssue | None = None
 
 
 @dataclass(frozen=True, slots=True)
-class StoredTraceEntry:
-    """Return one indexed row with referenced canonical Ledger evidence."""
+class StoredTraceGraphNode:
+    """Return one indexed Graph row with referenced Ledger evidence."""
 
-    entry_id: str
-    parent_id: str | None
-    kind: TraceEntryKind
-    status: TraceEntryStatus
+    node_id: str
+    structural_parent_id: str | None
+    kind: TraceGraphNodeKind
+    status: TraceGraphNodeStatus
     name: str
     run_id: str
     namespace: tuple[str, ...]
@@ -134,56 +145,70 @@ class StoredTraceEntry:
     completed_at: datetime | None
     started_seq: int
     updated_seq: int
+    request_seq: int | None
+    result_seq: int | None
+    failure_seq: int | None
+    link_issue: TraceGraphLinkIssue | None
     started_event: StoredTraceEvent
     updated_event: StoredTraceEvent
+    request_event: StoredTraceEvent | None
+    result_event: StoredTraceEvent | None
+    failure_event: StoredTraceEvent | None
 
 
 @dataclass(frozen=True, slots=True)
-class TraceEntryQueryRequest:
-    """Select one stable page from a backend-maintained Trace entry index."""
+class TraceGraphQueryRequest:
+    """Select one stable page from the backend-maintained Graph index."""
 
     key: TraceThreadKey
     run_ids: tuple[str, ...]
-    where: TraceFilter
+    where: TraceGraphFilter
     limit: int
+    total_limit: int = 4000
     before_started_at: datetime | None = None
-    before_entry_id: str | None = None
+    before_node_id: str | None = None
 
     def __post_init__(self) -> None:
         """Reject an incomplete or timezone-dependent backend cursor."""
 
+        if isinstance(self.limit, bool) or not isinstance(self.limit, int):
+            raise TypeError("Graph page limit must be an integer")
+        if isinstance(self.total_limit, bool) or not isinstance(self.total_limit, int):
+            raise TypeError("Graph total limit must be an integer")
         if self.limit < 1:
-            raise ValueError("entry page limit must be positive")
-        if (self.before_started_at is None) != (self.before_entry_id is None):
-            raise ValueError("entry cursor time and ID must be supplied together")
+            raise ValueError("Graph page limit must be positive")
+        if self.total_limit < self.limit:
+            raise ValueError("Graph total limit must include every direct match")
+        if (self.before_started_at is None) != (self.before_node_id is None):
+            raise ValueError("Graph cursor time and node ID must be supplied together")
         if self.before_started_at is not None and (
             self.before_started_at.tzinfo is None
             or self.before_started_at.utcoffset()
             != UTC.utcoffset(self.before_started_at)
         ):
-            raise ValueError("entry cursor time must be aware UTC")
+            raise ValueError("Graph cursor time must be aware UTC")
 
 
 @dataclass(frozen=True, slots=True)
-class TraceEntryRebuildRequest:
-    """Replace one generation's disposable entry index at an exact Ledger tail."""
+class TraceGraphRebuildRequest:
+    """Replace one generation's disposable Graph index at an exact Ledger tail."""
 
     key: TraceThreadKey
     as_of_seq: int
-    mutations: tuple[TraceEntryMutation, ...]
+    mutations: tuple[TraceGraphNodeMutation, ...]
 
 
 @dataclass(frozen=True, slots=True)
-class StoredTraceEntryPage:
-    """Return indexed rows, Facets, and whether another stable page exists."""
+class StoredTraceGraphPage:
+    """Return indexed Graph rows, Facets, and older-page cursor evidence."""
 
     key: TraceThreadKey
     as_of_seq: int
-    entries: tuple[StoredTraceEntry, ...]
-    facets: TraceFacets
+    nodes: tuple[StoredTraceGraphNode, ...]
+    facets: TraceGraphFacets
     has_more: bool
     next_started_at: datetime | None
-    next_entry_id: str | None
+    next_node_id: str | None
     call_tracking_present: bool
 
 
@@ -337,7 +362,7 @@ class TraceLedgerStorageEffect:
     remove_writer_run_id: str | None = None
     events: tuple[StoredTraceEvent, ...] = ()
     validated_events: tuple[TraceEvent, ...] = ()
-    entry_mutations: tuple[TraceEntryMutation, ...] = ()
+    graph_node_mutations: tuple[TraceGraphNodeMutation, ...] = ()
     checkpoint: StoredTraceCheckpoint | None = None
     delete_generation: bool = False
     namespace_thread_delta: int = 0
@@ -451,50 +476,24 @@ class TraceLedgerBackend(Protocol):
 
 
 @runtime_checkable
-class TraceQueryBackend(Protocol):
-    """Provide optional direct filtering over a Ledger-derived entry index."""
+class TraceGraphQueryBackend(Protocol):
+    """Query the disposable Graph index without scanning Ledger payloads."""
 
-    async def query_trace_entries(
+    async def query_trace_graph(
         self,
-        request: TraceEntryQueryRequest,
-    ) -> StoredTraceEntryPage:
-        """Return one backend-filtered page without scanning Ledger payloads.
-
-        Args:
-            request: Exact generation, prefix, lineage, filter, and cursor selection.
-
-        Returns:
-            Matching index rows joined to their referenced canonical events.
-
-        Raises:
-            TraceThreadNotFound: The exact generation is unavailable.
-            TraceStoreError: The indexed read fails.
-        """
+        request: TraceGraphQueryRequest,
+    ) -> StoredTraceGraphPage:
+        """Return one backend-filtered Graph page and referenced facts."""
 
         ...
 
 
 @runtime_checkable
-class TraceEntryRebuildBackend(Protocol):
-    """Atomically rebuild disposable query entries without changing Ledger events."""
+class TraceGraphRebuildBackend(Protocol):
+    """Atomically rebuild disposable Graph nodes from Ledger-derived mutations."""
 
-    async def rebuild_trace_entries(
-        self,
-        request: TraceEntryRebuildRequest,
-    ) -> int:
-        """Replace derived entries when the Ledger still has the requested tail.
-
-        Args:
-            request: Exact generation, tail, and deterministic derived mutations.
-
-        Returns:
-            Number of rebuilt entry rows.
-
-        Raises:
-            TraceThreadNotFound: The exact generation is unavailable.
-            TraceStoreProtocolError: The Ledger changed during reconstruction.
-            TraceStoreError: The atomic replacement fails.
-        """
+    async def rebuild_trace_graph(self, request: TraceGraphRebuildRequest) -> int:
+        """Replace Graph nodes when the Ledger still has the requested tail."""
 
         ...
 
@@ -527,17 +526,18 @@ def resolve_ledger_change(
 
 __all__ = [
     "StoredTraceCheckpoint",
-    "StoredTraceEntry",
-    "StoredTraceEntryPage",
     "StoredTraceEvent",
     "StoredTraceEventPage",
+    "StoredTraceGraphNode",
+    "StoredTraceGraphPage",
     "TraceCheckpointRequest",
-    "TraceEntryMutation",
-    "TraceEntryQueryRequest",
-    "TraceEntryRebuildBackend",
-    "TraceEntryRebuildRequest",
     "TraceEventPageDirection",
     "TraceEventPageRequest",
+    "TraceGraphNodeMutation",
+    "TraceGraphQueryBackend",
+    "TraceGraphQueryRequest",
+    "TraceGraphRebuildBackend",
+    "TraceGraphRebuildRequest",
     "TraceLedgerBackend",
     "TraceLedgerChange",
     "TraceLedgerChangeKind",
@@ -547,7 +547,6 @@ __all__ = [
     "TraceLedgerStorageEffect",
     "TraceLedgerThreadState",
     "TraceLedgerWriterState",
-    "TraceQueryBackend",
     "TraceStoreOptions",
     "TraceStoredFact",
     "resolve_ledger_change",

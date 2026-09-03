@@ -67,11 +67,9 @@ class ConversationRepository:
         run_id: str,
         parent_run_id: str | None,
         model_id: str,
-        runtime_profile: str,
         input_json: dict[str, JsonValue],
-        config_json: dict[str, JsonValue],
     ) -> ConversationRunRegistration:
-        """创建固定模型、Profile 与请求快照的主 Run 注册"""
+        """创建固定模型与请求快照的主 Run 注册"""
 
         now = datetime.now(UTC).replace(tzinfo=None)
         entity = ConversationRunRegistration(
@@ -79,10 +77,8 @@ class ConversationRepository:
             run_id=run_id,
             parent_run_id=parent_run_id,
             model_id=model_id,
-            runtime_profile=runtime_profile,
             status="preparing",
             input_json=input_json,
-            config_json=config_json,
             terminal_outcome=None,
             error_code=None,
             started_at=now,
@@ -101,16 +97,24 @@ class ConversationRepository:
         run_pk: int,
         run_id: str,
     ) -> bool:
-        """在 Messaging owner 打开业务源前以 CAS 激活 Run"""
+        """在框架 Run 可查询后以 CAS 发布业务 head"""
 
+        thread = await self.lock_thread(thread_pk)
+        if thread is None or thread.status == "deleting":
+            return False
         run = await self.get_run_for_update(
             thread_pk=thread_pk,
             run_id=run_id,
         )
         if run is None or run.id != run_pk or run.status != "preparing":
             return False
+        now = datetime.now(UTC).replace(tzinfo=None)
         run.status = "starting"
-        run.updated_at = datetime.now(UTC).replace(tzinfo=None)
+        run.updated_at = now
+        thread.last_run_id = run_id
+        thread.last_model = run.model_id
+        thread.status = "running"
+        thread.updated_at = now
         await self._session.flush()
         return True
 

@@ -3,8 +3,12 @@ import type {
   ConversationHistoryDetail,
   ConversationTraceUpdate,
   TraceInteraction,
-  TraceNode,
 } from '../../../api/conversation/history'
+import type {
+  TraceGraph,
+  TraceGraphDelta,
+  TraceGraphNode,
+} from '../../../api/conversation/traceGraph'
 import type { TaskTraceSnapshot } from '../../../api/conversation/taskTrace'
 import { ConversationError } from '../../../api/conversation/errors'
 import { translateCurrent } from '../../../i18n'
@@ -39,7 +43,7 @@ const elapsedMs = (startedAt: string, completedAt?: string | null) => {
 }
 
 const nodeMessageStatus = (
-  status: TraceNode['status'],
+  status: TraceGraphNode['status'],
 ): NonNullable<Message['meta']>['status'] => {
   switch (status) {
     case 'running': return 'running'
@@ -89,6 +93,38 @@ const applyEntityDelta = <T extends { id: string }>(
   return [...values.values()]
 }
 
+const applyTraceGraphDelta = (
+  current: TraceGraph,
+  delta: TraceGraphDelta,
+): TraceGraph => {
+  const nodeValues = applyEntityDelta(
+    current.nodes,
+    delta.nodeUpserts,
+    delta.nodeRemoves,
+  )
+  const nodesById = new Map(nodeValues.map((node) => [node.id, node]))
+  if (
+    delta.orderedNodeIds.length !== nodeValues.length
+    || new Set(delta.orderedNodeIds).size !== nodeValues.length
+    || delta.orderedNodeIds.some((id) => !nodesById.has(id))
+    || delta.rootNodeIds.some((id) => !nodesById.has(id))
+  ) throw new ConversationError('stream_event_invalid')
+  const turns = applyEntityDelta(
+    current.turns,
+    delta.turnUpserts,
+    delta.turnRemoves,
+  ).sort((left, right) => left.ordinal - right.ordinal || left.id.localeCompare(right.id))
+  return {
+    turns,
+    nodes: delta.orderedNodeIds.map((id) => nodesById.get(id) as TraceGraphNode),
+    orderedNodeIds: [...delta.orderedNodeIds],
+    rootNodeIds: [...delta.rootNodeIds],
+    asOfSeq: delta.asOfSeq,
+    facets: structuredClone(delta.facets),
+    completeness: structuredClone(delta.completeness),
+  }
+}
+
 const decodePointerToken = (value: string) => value.replaceAll('~1', '/').replaceAll('~0', '~')
 
 const capturedArguments = (value: JsonValue | undefined): JsonObject => {
@@ -122,7 +158,7 @@ const scopedSourceKey = (namespace: string[], sourceId: string): string => (
 
 const approvalFromInteraction = (
   interaction: TraceInteraction,
-  nodes: TraceNode[],
+  nodes: TraceGraphNode[],
 ): ApprovalState | undefined => {
   if (interaction.kind !== 'tool_approval' || !isObject(interaction.payload)) return undefined
   const actions = interaction.payload.action_requests
@@ -145,7 +181,7 @@ const approvalFromInteraction = (
       node.kind === 'tool'
       && (node.status === 'running' || node.status === 'waiting')
       && node.sourceId === toolCallId
-      && node.label === rawAction.name
+      && node.name === rawAction.name
       && node.namespace.length === interaction.namespace.length
       && node.namespace.every(
         (value, position) => value === interaction.namespace[position],
@@ -172,7 +208,7 @@ const approvalFromInteraction = (
 
 const interactionState = (
   interactions: TraceInteraction[],
-  nodes: TraceNode[],
+  nodes: TraceGraphNode[],
 ): {
   approval?: ApprovalState
   planInteraction?: Conversation['planInteraction']
@@ -227,8 +263,8 @@ const traceMessages = (trace: ConversationHistoryCoreDetail): Message[] => {
         item,
       ]),
   )
-  const nodesById = new Map(trace.nodes.map((node) => [node.id, node]))
-  const verifiedSubagents = trace.nodes.filter((node) => (
+  const nodesById = new Map(trace.graph.nodes.map((node) => [node.id, node]))
+  const verifiedSubagents = trace.graph.nodes.filter((node) => (
     node.kind === 'subagent' && node.sourceId
   ))
   const subagentPartialOutput = new Map<string, Array<{ sequence: number; content: string }>>()
@@ -251,7 +287,7 @@ const traceMessages = (trace: ConversationHistoryCoreDetail): Message[] => {
     scopedSourceKey(node.namespace.slice(0, -1), node.sourceId as string),
     node,
   ]))
-  const owningSubagent = (node: TraceNode): TraceNode | undefined => {
+  const owningSubagent = (node: TraceGraphNode): TraceGraphNode | undefined => {
     let parentId = node.parentId
     const visited = new Set<string>()
     while (parentId && !visited.has(parentId)) {
@@ -285,7 +321,7 @@ const traceMessages = (trace: ConversationHistoryCoreDetail): Message[] => {
       },
     }]
   })
-  trace.nodes.forEach((node) => {
+  trace.graph.nodes.forEach((node) => {
     const failedRun = node.kind === 'run' && node.status === 'failed'
     if (
       node.kind !== 'tool'
@@ -301,12 +337,12 @@ const traceMessages = (trace: ConversationHistoryCoreDetail): Message[] => {
     const result = node.sourceId
       ? toolResults.get(scopedSourceKey(node.namespace, node.sourceId))
       : undefined
-    const retainedInput = node.inputOmitted ? undefined : node.input
+    const retainedInput = node.requestOmitted ? undefined : node.request
     const retainedResult = node.resultOmitted ? undefined : node.result
     const subagent = node.kind === 'tool' ? owningSubagent(node) : undefined
     if (node.kind === 'tool' && node.namespace.length > 0 && !subagent) return
     const parentTool = node.kind === 'subagent' && node.sourceId
-      ? trace.nodes.find((candidate) => (
+      ? trace.graph.nodes.find((candidate) => (
           candidate.kind === 'tool'
           && candidate.sourceId === node.sourceId
           && candidate.namespace.length === node.namespace.length - 1
@@ -327,17 +363,17 @@ const traceMessages = (trace: ConversationHistoryCoreDetail): Message[] => {
           ? 'error'
           : 'process'
     ordered.push({
-      sequence: node.traceSeq,
+      sequence: node.startedSeq,
       value: {
         id: node.id,
         role,
-        content: failedRun ? translateCurrent('对话运行失败') : node.label,
+        content: failedRun ? translateCurrent('对话运行失败') : node.name,
         createdAt: node.startedAt,
         meta: {
-          title: node.label,
-          toolName: node.kind === 'tool' ? node.label : undefined,
-          agentName: node.kind === 'subagent' ? node.label : undefined,
-          sourceAgentName: subagent?.label,
+          title: node.name,
+          toolName: node.kind === 'tool' ? node.name : undefined,
+          agentName: node.kind === 'subagent' ? node.name : undefined,
+          sourceAgentName: subagent?.name,
           params: node.kind === 'tool' ? text(retainedInput) : undefined,
           input: node.kind === 'subagent' ? subagentInput : undefined,
           result: text(
@@ -385,7 +421,8 @@ const assertTraceDetail = (trace: ConversationHistoryCoreDetail) => {
     || !Number.isSafeInteger(trace.asOfSeq)
     || trace.asOfSeq < 1
     || !Array.isArray(trace.messages)
-    || !Array.isArray(trace.nodes)
+    || !Array.isArray(trace.graph?.nodes)
+    || trace.graph.asOfSeq !== trace.asOfSeq
     || !Array.isArray(trace.interactions)
     || !isObject(trace.state?.root)
   ) throw new ConversationError('stream_event_invalid')
@@ -415,7 +452,7 @@ export const restoreConversationFromTrace = (
   const taskTrace = options.includeTaskTrace && wireTaskTrace != null
     ? taskTraceView(wireTaskTrace)
     : options.taskTrace ?? { phase: 'unloaded' as const }
-  const interaction = interactionState(trace.interactions, trace.nodes)
+  const interaction = interactionState(trace.interactions, trace.graph.nodes)
   const projectedStatus = runStatus(trace)
   const status = interaction.pendingInteractionKind && projectedStatus !== 'error'
     ? 'waiting_approval'
@@ -465,13 +502,16 @@ export const applyConversationTraceUpdate = (
   const previous = conversation.trace
   if (!previous) throw new ConversationError('stream_event_invalid')
   if (update.asOfSeq <= previous.asOfSeq) return conversation
+  if (update.graph.asOfSeq !== update.asOfSeq) {
+    throw new ConversationError('stream_event_invalid')
+  }
   const next: ConversationHistoryCoreDetail = {
     ...structuredClone(previous),
     asOfSeq: update.asOfSeq,
     headRunId: update.status.headRunId,
     messages: applyEntityDelta(previous.messages, update.messages.upserts, update.messages.removes),
     reasoning: applyEntityDelta(previous.reasoning, update.reasoning.upserts, update.reasoning.removes),
-    nodes: applyEntityDelta(previous.nodes, update.nodes.upserts, update.nodes.removes),
+    graph: applyTraceGraphDelta(previous.graph, update.graph),
     interactions: applyEntityDelta(
       previous.interactions,
       update.interactions.upserts,

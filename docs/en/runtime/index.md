@@ -11,11 +11,13 @@ the host.
 | Goal | Use |
 | --- | --- |
 | Consume validated native LangGraph data | `TinkerFin.open_run()` |
+| Return the final state with managed observations and cleanup | `TinkerFin.ainvoke()` |
 | Send AG-UI events to a frontend | `TinkerFin.open_agui_run()` |
 | Reuse a direct async Runnable without managed lifecycle | `DeepAgentDefinition.create_graph()` |
 
-Start with `open_run()`. The direct Graph is an advanced boundary and does not create a
-run identity, Runtime Observation, Trace, AG-UI, Messaging, or business lifecycle.
+Start with `ainvoke()` when only the final state is needed, or `open_run()` when the
+caller consumes progress. The direct Graph is an advanced boundary and does not create
+a run identity, Runtime Observation, Trace, AG-UI, Messaging, or business lifecycle.
 
 ## Installation
 
@@ -94,7 +96,9 @@ reuse it only for retry or attachment to that same run.
 ## Managed streams and direct Graphs
 
 Every stream returned by `open_run()` or `open_agui_run()` is single-use and closeable.
-The Agent definition is reusable, including across concurrent thread IDs.
+These methods return after Run start and input observations are committed, but before the
+first model output is pulled. Close a returned stream that will not be iterated. The
+Agent definition is reusable, including across concurrent thread IDs.
 
 Advanced code can create one reusable async Runnable:
 
@@ -108,14 +112,15 @@ composition. It uses native LangGraph `Command(resume=...)` for direct resume. I
 synchronous `invoke()`, `stream()`, and `batch()` paths reject execution so async
 checkpointers, Stores, tools, and cancellation remain native.
 
-## Current capability boundary
+## Runtime Profile selection
 
-The framework distribution provides the explicit `deepagents-v2` Runtime Profile. It
-does not provide a Deep Agents v3 Profile or a generic TodoGroups projection/UI. Studio
-derives its product-specific task trace from canonical Trace facts at query time. Another
-concrete Profile must own its upstream construction and stream contract while emitting
-the same canonical Native observations; downstream Runtime, Trace, AG-UI, and Messaging
-code does not branch on upstream versions.
+`DeepAgentsV2RuntimeProfile` is the default stable integration. The
+`DeepAgentsV3RuntimeProfile` integration for Deep Agents v3 selects LangGraph's
+experimental v3 event stream. The Runtime never detects, negotiates, or falls back
+between them. Both produce the same canonical Native observations, so Trace, AG-UI,
+Messaging, and host code do not branch on the upstream stream API. `TodoGroups` remain
+host projections over canonical Trace facts rather than Runtime state or a second
+persistence format.
 
 Archive/S3/Blob storage, payload encryption/KMS, and OpenTelemetry exporters are not
 provided. Active Trace storage implements `TraceLedgerBackend`; advanced integrations

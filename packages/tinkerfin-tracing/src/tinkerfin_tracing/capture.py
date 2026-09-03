@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 from collections.abc import Mapping
 from typing import Literal, Self
 
@@ -11,30 +10,12 @@ from pydantic import Field, JsonValue, field_validator, model_validator
 
 from ._models import TraceModel
 from .errors import TraceCaptureRejected
-
-_CREDENTIAL_KEYS = frozenset(
-    {
-        "access_token",
-        "auth_token",
-        "api_key",
-        "apikey",
-        "authorization",
-        "client_secret",
-        "cookie",
-        "id_token",
-        "password",
-        "private_key",
-        "proxy_authorization",
-        "refresh_token",
-        "secret",
-        "secret_key",
-        "session_token",
-        "set_cookie",
-        "token",
-        "x_api_key",
-    }
+from .redaction import (
+    RedactionContext,
+    TraceRedactor,
+    _normalize_json,
+    secure_redact,
 )
-_REDACTED: dict[str, JsonValue] = {"$type": "redacted"}
 
 
 class CapturedValue(TraceModel):
@@ -176,21 +157,15 @@ class ToolTraceCapture(TraceModel):
 
 
 class MiddlewareTraceCapture(TraceModel):
-    """Define how one middleware appears in Trace without changing its execution."""
+    """Define whether one middleware execution appears in Trace."""
 
-    mode: Literal["visible", "configuration_only", "disabled"]
+    mode: Literal["visible", "disabled"]
 
     @classmethod
     def visible(cls) -> Self:
-        """Retain configuration and every lifecycle exposed by standard callbacks."""
+        """Retain every execution lifecycle exposed by standard callbacks."""
 
         return cls(mode="visible")
-
-    @classmethod
-    def configuration_only(cls) -> Self:
-        """Retain configuration without claiming hook execution or timing."""
-
-        return cls(mode="configuration_only")
 
     @classmethod
     def disabled(cls) -> Self:
@@ -247,30 +222,6 @@ class ReasoningCapturePolicy(TraceModel):
         """Return an explicit policy that retains bounded extracted content."""
 
         return cls(mode="content")
-
-    def capture(self, value: JsonValue, *, max_bytes: int) -> CapturedValue:
-        """Capture an extracted value only when content retention is authorized."""
-
-        _validate_max_bytes(max_bytes)
-        safe = _sanitize(value)
-        encoded = _encode(safe)
-        if self.mode == "omit":
-            return CapturedValue(
-                disposition="omitted",
-                safe_size_bytes=len(encoded),
-                reason="reasoning_capture_disabled",
-            )
-        if len(encoded) > max_bytes:
-            return CapturedValue(
-                disposition="omitted",
-                safe_size_bytes=len(encoded),
-                reason="payload_too_large",
-            )
-        return CapturedValue(
-            disposition="inline",
-            safe_size_bytes=len(encoded),
-            value=safe,
-        )
 
 
 class CapturePolicy(TraceModel):
@@ -495,28 +446,74 @@ class CapturePolicy(TraceModel):
             None,
         )
 
-    def capture(self, value: JsonValue, *, max_bytes: int) -> CapturedValue:
-        """Sanitize one JSON graph and omit it when the encoded value is too large."""
+
+class TraceCapturePipeline:
+    """Apply one safe redaction and retention path for every Trace payload."""
+
+    __slots__ = ("_policy", "_reasoning_policy", "_redactor")
+
+    def __init__(
+        self,
+        *,
+        policy: CapturePolicy,
+        reasoning_policy: ReasoningCapturePolicy,
+        redactor: TraceRedactor | None,
+    ) -> None:
+        self._policy = policy
+        self._reasoning_policy = reasoning_policy
+        self._redactor = redactor
+
+    def redact(
+        self,
+        value: JsonValue,
+        *,
+        context: RedactionContext,
+    ) -> JsonValue:
+        """Return one detached safe value before retention decisions."""
+
+        safe = secure_redact(value, context=context, redactor=self._redactor)
+        _validate_context_shape(value, safe, context=context)
+        return safe
+
+    def capture(
+        self,
+        value: JsonValue,
+        *,
+        context: RedactionContext,
+        max_bytes: int,
+    ) -> CapturedValue:
+        """Redact and retain one ordinary value within its exact byte budget."""
+
+        return self.bound(
+            self.redact(value, context=context),
+            max_bytes=max_bytes,
+        )
+
+    def capture_reasoning(
+        self,
+        value: JsonValue,
+        *,
+        component_name: str | None,
+        max_bytes: int,
+    ) -> CapturedValue:
+        """Apply the independent reasoning authorization after mandatory redaction."""
 
         _validate_max_bytes(max_bytes)
-        safe = _sanitize(value)
+        safe = self.redact(
+            value,
+            context=RedactionContext(
+                content_kind="model_response",
+                component_name=component_name,
+            ),
+        )
         encoded = _encode(safe)
-        if len(encoded) > max_bytes:
+        if self._reasoning_policy.mode == "omit":
             return CapturedValue(
                 disposition="omitted",
                 safe_size_bytes=len(encoded),
-                reason="payload_too_large",
+                reason="reasoning_capture_disabled",
             )
-        return CapturedValue(
-            disposition="inline",
-            safe_size_bytes=len(encoded),
-            value=safe,
-        )
-
-    def sanitize(self, value: JsonValue) -> JsonValue:
-        """Return a detached public-safe graph without applying retention limits."""
-
-        return _sanitize(value)
+        return self.bound(safe, max_bytes=max_bytes)
 
     def capture_tool(
         self,
@@ -526,14 +523,22 @@ class CapturePolicy(TraceModel):
         target: Literal["arguments", "result"],
         max_bytes: int,
     ) -> CapturedValue:
-        """Capture Tool content according to its resolved high- or low-level setting."""
+        """Redact complete Tool content before applying its retention selection."""
 
         _validate_max_bytes(max_bytes)
-        safe = _sanitize(value)
+        safe = self.redact(
+            value,
+            context=RedactionContext(
+                content_kind=(
+                    "tool_arguments" if target == "arguments" else "tool_result"
+                ),
+                component_name=tool_name,
+            ),
+        )
         encoded_size = len(_encode(safe))
-        capture = self.tool_capture(tool_name)
+        capture = self._policy.tool_capture(tool_name)
         if capture.mode == "full_content":
-            return self.capture(safe, max_bytes=max_bytes)
+            return self.bound(safe, max_bytes=max_bytes)
         if capture.mode == "metadata_only":
             return CapturedValue(
                 disposition="omitted",
@@ -554,19 +559,20 @@ class CapturePolicy(TraceModel):
             found, selected_value = _resolve_pointer(safe, path)
             if found:
                 selected[path] = selected_value
-        return self.capture(selected, max_bytes=max_bytes)
+        return self.bound(selected, max_bytes=max_bytes)
 
     def capture_metadata_only(
         self,
         value: JsonValue,
         *,
+        context: RedactionContext,
         reason: str,
     ) -> CapturedValue:
-        """Measure sanitized content while retaining no value bytes."""
+        """Redact and measure content while retaining no value bytes."""
 
         if not isinstance(reason, str) or not reason or len(reason) > 1024:
             raise ValueError("metadata-only capture requires a bounded reason")
-        safe = _sanitize(value)
+        safe = self.redact(value, context=context)
         return CapturedValue(
             disposition="omitted",
             safe_size_bytes=len(_encode(safe)),
@@ -577,12 +583,13 @@ class CapturePolicy(TraceModel):
         self,
         value: JsonValue,
         *,
+        context: RedactionContext,
         max_bytes: int,
     ) -> CapturedValue:
-        """Retain bounded structural metadata without retaining source values."""
+        """Redact source values before retaining bounded structural metadata."""
 
         _validate_max_bytes(max_bytes)
-        safe = _sanitize(value)
+        safe = self.redact(value, context=context)
         summary: dict[str, JsonValue] = {
             "$type": "structural_metadata",
             "dataType": _json_type(safe),
@@ -592,7 +599,87 @@ class CapturePolicy(TraceModel):
             summary["topLevelKeys"] = list[JsonValue](sorted(safe))
         elif isinstance(safe, list):
             summary["itemCount"] = len(safe)
-        return self.capture(summary, max_bytes=max_bytes)
+        return self.bound(summary, max_bytes=max_bytes)
+
+    @staticmethod
+    def bound(value: JsonValue, *, max_bytes: int) -> CapturedValue:
+        """Apply size retention to an already redacted framework-owned value."""
+
+        _validate_max_bytes(max_bytes)
+        safe = _normalize_json(value)
+        encoded = _encode(safe)
+        if len(encoded) > max_bytes:
+            return CapturedValue(
+                disposition="omitted",
+                safe_size_bytes=len(encoded),
+                reason="payload_too_large",
+            )
+        return CapturedValue(
+            disposition="inline",
+            safe_size_bytes=len(encoded),
+            value=safe,
+        )
+
+
+def _validate_context_shape(
+    source: JsonValue,
+    safe: JsonValue,
+    *,
+    context: RedactionContext,
+) -> None:
+    """Protect only structures required for deterministic Trace interpretation."""
+
+    if context.content_kind == "state" and not isinstance(safe, dict):
+        raise TraceCaptureRejected("Trace state redaction must return an object")
+    if context.content_kind == "model_request":
+        _validate_model_request_shape(source, safe)
+    if context.content_kind == "interaction":
+        _validate_interaction_shape(source, safe)
+
+
+def _validate_model_request_shape(source: JsonValue, safe: JsonValue) -> None:
+    if not isinstance(source, dict) or not isinstance(safe, dict):
+        raise TraceCaptureRejected("Model request redaction must return an object")
+    source_messages = source.get("messages")
+    safe_messages = safe.get("messages")
+    if not isinstance(source_messages, list) or not isinstance(safe_messages, list):
+        raise TraceCaptureRejected("Model request redaction must preserve messages")
+    if len(source_messages) != len(safe_messages):
+        raise TraceCaptureRejected("Model request redaction changed message order")
+    for source_message, safe_message in zip(
+        source_messages, safe_messages, strict=True
+    ):
+        if not isinstance(source_message, dict) or not isinstance(safe_message, dict):
+            raise TraceCaptureRejected(
+                "Model request redaction must preserve message objects"
+            )
+        if safe_message.get("messageType") != source_message.get("messageType"):
+            raise TraceCaptureRejected("Model request redaction changed a message type")
+
+
+def _validate_interaction_shape(source: JsonValue, safe: JsonValue) -> None:
+    if not isinstance(source, dict):
+        return
+    if not isinstance(safe, dict):
+        raise TraceCaptureRejected("Interaction redaction must return an object")
+    source_reviews = source.get("review_configs")
+    if not isinstance(source_reviews, list):
+        return
+    safe_reviews = safe.get("review_configs")
+    if not isinstance(safe_reviews, list) or len(source_reviews) != len(safe_reviews):
+        raise TraceCaptureRejected(
+            "Interaction redaction changed review configuration order"
+        )
+    for source_review, safe_review in zip(source_reviews, safe_reviews, strict=True):
+        if not isinstance(source_review, dict) or not isinstance(safe_review, dict):
+            raise TraceCaptureRejected(
+                "Interaction redaction must preserve review configurations"
+            )
+        for key in ("action_name", "allowed_decisions"):
+            if safe_review.get(key) != source_review.get(key):
+                raise TraceCaptureRejected(
+                    "Interaction redaction changed review configuration semantics"
+                )
 
 
 def _encode(value: JsonValue) -> bytes:
@@ -635,21 +722,6 @@ def _is_canonical_pointer(path: str) -> bool:
     return True
 
 
-def _credential_key(value: str) -> str:
-    separated = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", value)
-    return re.sub(r"[^a-z0-9]+", "_", separated.casefold()).strip("_")
-
-
-def _is_credential_key(value: str) -> bool:
-    """Recognize exact or vendor-prefixed credential field names."""
-
-    normalized = _credential_key(value)
-    return any(
-        normalized == credential or normalized.endswith(f"_{credential}")
-        for credential in _CREDENTIAL_KEYS
-    )
-
-
 def _json_type(value: JsonValue) -> str:
     if value is None:
         return "null"
@@ -662,28 +734,6 @@ def _json_type(value: JsonValue) -> str:
     if isinstance(value, list):
         return "array"
     return "object"
-
-
-def _sanitize(value: JsonValue) -> JsonValue:
-    if isinstance(value, list):
-        return [_sanitize(item) for item in value]
-    if not isinstance(value, dict):
-        return value
-    sanitized: dict[str, JsonValue] = {}
-    for key, item in value.items():
-        if _is_credential_key(key):
-            sanitized[key] = dict(_REDACTED)
-            continue
-        if key == "additional_kwargs" and isinstance(item, dict):
-            metadata = {
-                metadata_key: metadata_value
-                for metadata_key, metadata_value in item.items()
-                if metadata_key != "reasoning_content"
-            }
-            sanitized[key] = _sanitize(metadata)
-            continue
-        sanitized[key] = _sanitize(item)
-    return sanitized
 
 
 def _resolve_pointer(value: JsonValue, path: str) -> tuple[bool, JsonValue]:

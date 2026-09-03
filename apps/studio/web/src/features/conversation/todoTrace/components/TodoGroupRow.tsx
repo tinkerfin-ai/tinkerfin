@@ -7,7 +7,7 @@ import { ToolCallRow } from '../../components/ToolCallRow'
 import { todoProgress } from '../domain'
 import { TodoTree } from './TodoTree'
 
-export function UpdateTasksRow({
+export function TodoGroupRow({
   group,
   message,
 }: {

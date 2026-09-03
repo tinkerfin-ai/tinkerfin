@@ -55,7 +55,6 @@ class AgentModelRepository:
         entity.base_url = str(value.base_url)
         entity.api_key = value.api_key.get_secret_value()
         entity.reasoning_enabled = value.reasoning_enabled
-        entity.runtime_profile = value.runtime_profile
         entity.enabled = value.enabled
         entity.is_default = value.is_default
         entity.sort_order = value.sort_order

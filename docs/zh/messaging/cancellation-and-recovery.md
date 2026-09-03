@@ -73,7 +73,7 @@ Messaging 选定当前调用为 owner 后才会打开 Agent。该 helper 隐藏 
 ```python
 body = await channel.sse(
     source,
-    on_source_starting=activate_business_run,
+    on_source_ready=activate_business_run,
     on_delivery_not_started=cleanup_business_run,
 )
 ```
@@ -110,13 +110,13 @@ source = DeferredMessageSource(
 | `opener` | 异步创建真正 source，并返回 `MessageSourceBinding` |
 | `cancellable` | 声明打开后的 source 是否支持取消 |
 | `cancel_after_first_item` | 是否等第一条协议事件产生后才允许取消超过它 |
-| `on_owner_preflight` | owner 专用的可选异步激活函数，在 producer 与 opener 执行前完成 |
+| `on_owner_preflight` | owner 专用的可选 source 准备函数，在 opener 执行前完成 |
 
 附着或纯回放请求不会调用 opener。`cancel_after_first_item=True` 适合必须先出现 `RUN_STARTED` 的协议。
 
 Messaging 在 durable owner 选定后等待 `on_owner_preflight`。回调失败时会释放本次 owner 并关闭
-deferred wrapper，opener 不会运行。该 hook 只用于 source 自有准备；宿主激活应放在
-`on_source_starting`。
+deferred wrapper，opener 不会运行。该 hook 只用于 source 自有准备；宿主激活应放在 opener
+成功后的 `on_source_ready`。
 
 `MessageSourceBinding` 包含 `source` 和可选 `cancel`。如果 source 自己声明取消函数，可以省略 binding 的 `cancel`。
 

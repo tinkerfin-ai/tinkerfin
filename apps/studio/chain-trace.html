@@ -1,0 +1,1101 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light">
+  <title>TinkerFin Studio · 链路分析</title>
+  <script type="module" src="https://code.iconify.design/iconify-icon/2.1.0/iconify-icon.min.js"></script>
+  <style>
+    :root {
+      --canvas: #ffffff;
+      --sidebar: #fbfcff;
+      --surface: #ffffff;
+      --surface-subtle: #f7f9fc;
+      --surface-selected: #f1f5ff;
+      --ink: #0a1744;
+      --ink-2: #46516d;
+      --ink-3: #7d869d;
+      --line: #e5e9f1;
+      --line-strong: #d8deea;
+      --blue: #3268f6;
+      --blue-soft: #eaf0ff;
+      --violet: #6f4bc7;
+      --violet-soft: #f0eafd;
+      --teal: #079b9b;
+      --teal-soft: #e2f7f5;
+      --orange: #f27d16;
+      --orange-soft: #fff0df;
+      --green: #18a76f;
+      --green-soft: #e7f8f0;
+      --red: #ef3e52;
+      --red-soft: #ffeaed;
+      --shadow-panel: 0 18px 48px rgb(16 32 76 / 8%);
+      --sidebar-width: 80px;
+      --detail-width: 458px;
+      --radius: 10px;
+      --font-ui: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body { width: 100%; min-height: 100%; margin: 0; }
+
+    body {
+      overflow: hidden;
+      background: var(--canvas);
+      color: var(--ink);
+      font-family: var(--font-ui);
+      font-size: 14px;
+      -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
+    }
+
+    button, input, select { font: inherit; }
+    button, select { cursor: pointer; }
+    button:focus-visible, input:focus-visible, select:focus-visible {
+      outline: 2px solid color-mix(in srgb, var(--blue) 78%, white);
+      outline-offset: 2px;
+    }
+
+    iconify-icon { display: block; }
+
+    .app {
+      display: grid;
+      grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+      width: 100vw;
+      height: 100vh;
+      min-height: 680px;
+      overflow: hidden;
+      background: var(--canvas);
+    }
+
+    .sidebar {
+      position: relative;
+      z-index: 6;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      min-height: 0;
+      padding: 20px 12px 18px;
+      border-right: 1px solid var(--line);
+      background: var(--sidebar);
+    }
+
+    .brand {
+      display: grid;
+      width: 48px;
+      height: 42px;
+      margin-bottom: 28px;
+      place-items: center;
+      border-radius: 12px;
+    }
+
+    .brand img { width: 44px; height: 34px; object-fit: contain; }
+
+    .side-nav { display: grid; width: 100%; gap: 8px; }
+
+    .nav-button,
+    .utility-button {
+      position: relative;
+      display: grid;
+      width: 48px;
+      height: 44px;
+      margin-inline: auto;
+      place-items: center;
+      border: 0;
+      border-radius: 12px;
+      background: transparent;
+      color: #667085;
+      transition: background .16s ease, color .16s ease, transform .16s ease;
+    }
+
+    .nav-button:hover,
+    .utility-button:hover { background: #f0f3f8; color: var(--ink); }
+    .nav-button:active,
+    .utility-button:active { transform: scale(.96); }
+    .nav-button.is-active { background: var(--blue-soft); color: var(--blue); }
+    .nav-button iconify-icon,
+    .utility-button iconify-icon { font-size: 22px; }
+
+    .nav-button::after,
+    .utility-button::after {
+      position: absolute;
+      left: calc(100% + 10px);
+      top: 50%;
+      z-index: 40;
+      padding: 6px 9px;
+      transform: translate(-4px, -50%);
+      border-radius: 7px;
+      background: #111a38;
+      color: white;
+      content: attr(data-label);
+      font-size: 12px;
+      white-space: nowrap;
+      opacity: 0;
+      visibility: hidden;
+      pointer-events: none;
+      transition: .15s ease;
+    }
+
+    .nav-button:hover::after,
+    .nav-button:focus-visible::after,
+    .utility-button:hover::after,
+    .utility-button:focus-visible::after {
+      transform: translate(0, -50%);
+      opacity: 1;
+      visibility: visible;
+    }
+
+    .sidebar-foot { display: grid; margin-top: auto; gap: 8px; }
+    .notification::before {
+      position: absolute;
+      top: 8px;
+      right: 9px;
+      width: 7px;
+      height: 7px;
+      border: 2px solid var(--sidebar);
+      border-radius: 50%;
+      background: var(--red);
+      content: "";
+    }
+
+    .avatar {
+      display: grid;
+      width: 38px;
+      height: 38px;
+      margin-top: 8px;
+      place-items: center;
+      border: 0;
+      border-radius: 50%;
+      background: linear-gradient(145deg, #277cfb, #7647e9);
+      color: white;
+      font-weight: 700;
+      box-shadow: 0 6px 16px rgb(16 32 76 / 14%);
+    }
+
+    .shell {
+      display: grid;
+      grid-template-rows: auto auto 90px minmax(0, 1fr);
+      min-width: 0;
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    .topbar {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      min-height: 104px;
+      padding: 18px 18px 0 30px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .title-line { display: flex; align-items: center; gap: 12px; min-width: 0; }
+    h1 { margin: 0; overflow: hidden; font-size: 20px; line-height: 28px; font-weight: 680; letter-spacing: -.02em; text-overflow: ellipsis; white-space: nowrap; }
+
+    .mode {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      height: 28px;
+      padding: 0 9px;
+      border: 1px solid var(--line-strong);
+      border-radius: 8px;
+      color: var(--ink-2);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .mode iconify-icon { color: #7c859b; font-size: 15px; }
+
+    .tabs { display: flex; align-self: end; height: 44px; gap: 28px; }
+    .tab {
+      position: relative;
+      height: 44px;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: var(--ink-2);
+      font-size: 14px;
+    }
+
+    .tab.is-active { color: var(--blue); font-weight: 650; }
+    .tab.is-active::after {
+      position: absolute;
+      right: 0;
+      bottom: 0;
+      left: 0;
+      height: 3px;
+      border-radius: 3px 3px 0 0;
+      background: var(--blue);
+      content: "";
+    }
+
+    .export-button,
+    .ghost-button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 7px;
+      height: 40px;
+      padding: 0 13px;
+      border: 1px solid var(--line-strong);
+      border-radius: 10px;
+      background: white;
+      color: var(--ink);
+      font-weight: 560;
+      box-shadow: 0 1px 2px rgb(11 25 68 / 3%);
+      transition: .15s ease;
+    }
+
+    .export-button:hover,
+    .ghost-button:hover { border-color: #bbc5d7; background: var(--surface-subtle); }
+    .export-button iconify-icon { font-size: 18px; }
+
+    .toolbar {
+      display: flex;
+      height: 40px;
+      min-height: 40px;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 0 26px 0 30px;
+      border-bottom: 1px solid var(--line);
+      background: #fff;
+    }
+
+    .summary { display: flex; align-items: center; gap: 7px; color: var(--ink-2); font-size: 11px; white-space: nowrap; }
+    .summary strong { color: var(--ink); font-size: 13px; font-variant-numeric: tabular-nums; }
+    .summary .separator { color: #c5cad4; }
+
+    .filters { display: flex; align-items: center; justify-content: flex-end; gap: 6px; min-width: 0; }
+    .select-wrap { position: relative; display: flex; min-height: 44px; align-items: center; }
+    .select-wrap select {
+      height: 28px;
+      min-width: 94px;
+      padding: 0 26px 0 10px;
+      appearance: none;
+      border: 1px solid var(--line-strong);
+      border-radius: 7px;
+      outline: none;
+      background: white;
+      color: var(--ink);
+      font-size: 11px;
+    }
+
+    .select-wrap iconify-icon {
+      position: absolute;
+      top: 50%;
+      right: 8px;
+      transform: translateY(-50%);
+      color: var(--ink-3);
+      font-size: 12px;
+      pointer-events: none;
+    }
+
+    .search {
+      position: relative;
+      display: flex;
+      width: min(190px, 18vw);
+      min-width: 150px;
+      min-height: 44px;
+      align-items: center;
+    }
+
+    .search iconify-icon { position: absolute; top: 50%; left: 9px; transform: translateY(-50%); color: var(--ink-3); font-size: 14px; }
+    .search input {
+      width: 100%;
+      height: 28px;
+      padding: 0 52px 0 28px;
+      border: 1px solid var(--line-strong);
+      border-radius: 7px;
+      background: white;
+      color: var(--ink);
+      font-size: 11px;
+      outline: none;
+    }
+
+    .search input::placeholder { color: #9ca4b6; }
+    .shortcut { position: absolute; top: 50%; right: 8px; transform: translateY(-50%); color: var(--ink-3); font-size: 10px; }
+
+    .timeline {
+      display: grid;
+      grid-template-columns: 104px minmax(0, 1fr);
+      min-width: 0;
+      overflow: hidden;
+      border-bottom: 1px solid var(--line);
+      background: #fff;
+    }
+
+    .timeline-labels {
+      display: grid;
+      grid-template-rows: 16px repeat(4, 17px);
+      padding: 3px 0 3px 28px;
+      border-right: 1px solid var(--line);
+    }
+
+    .lane-label { display: flex; align-items: center; gap: 6px; color: var(--ink-2); font-size: 11px; font-weight: 590; }
+    .lane-label iconify-icon { font-size: 14px; }
+    .lane-label.message iconify-icon { color: var(--blue); }
+    .lane-label.agent iconify-icon { color: var(--violet); }
+    .lane-label.model iconify-icon { color: var(--teal); }
+    .lane-label.tool iconify-icon { color: var(--orange); }
+
+    .timeline-scroll { min-width: 0; overflow-x: auto; scrollbar-width: none; }
+    .timeline-scroll::-webkit-scrollbar { display: none; }
+    .timeline-chart {
+      position: relative;
+      display: grid;
+      grid-template-rows: 16px repeat(4, 17px);
+      min-width: 760px;
+      height: 100%;
+      padding: 3px 22px 3px 18px;
+      background-image: repeating-linear-gradient(to right, transparent 0, transparent calc(8.333% - 1px), #e6eaf1 calc(8.333% - 1px), #e6eaf1 8.333%);
+      background-position: 18px 0;
+      background-size: calc(100% - 40px) 100%;
+      background-repeat: no-repeat;
+    }
+
+    .ticks { position: relative; grid-row: 1; color: var(--ink-3); font-size: 11px; font-variant-numeric: tabular-nums; }
+    .ticks span { position: absolute; transform: translateX(-50%); }
+    .ticks span:first-child { transform: none; }
+    .ticks span:last-child { transform: translateX(-100%); }
+
+    .lane { position: relative; }
+    .lane-message { grid-row: 2; }
+    .lane-agent { grid-row: 3; }
+    .lane-model { grid-row: 4; }
+    .lane-tool { grid-row: 5; }
+
+    .timeline-range {
+      position: absolute;
+      z-index: 0;
+      top: 16px;
+      right: 22px;
+      bottom: 3px;
+      left: 62%;
+      border: 1px solid rgb(50 104 246 / 35%);
+      background: rgb(50 104 246 / 4%);
+      pointer-events: none;
+    }
+
+    .range-tag { position: absolute; z-index: 2; top: 2px; padding: 2px 4px; border-radius: 4px; background: var(--blue); color: white; font-size: 9px; font-weight: 650; }
+    .range-tag.start { left: calc(62% - 11px); }
+    .range-tag.end { right: 12px; }
+
+    .timeline-bar {
+      position: absolute;
+      z-index: 2;
+      top: 2px;
+      height: 13px;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: inherit;
+    }
+
+    .timeline-bar::after {
+      position: absolute;
+      top: 5px;
+      right: 0;
+      left: 0;
+      height: 3px;
+      border-radius: 999px;
+      background: currentColor;
+      content: "";
+    }
+
+    .timeline-bar::before {
+      position: absolute;
+      z-index: 3;
+      top: 3px;
+      right: -2px;
+      width: 7px;
+      height: 7px;
+      border: 2px solid white;
+      border-radius: 50%;
+      background: currentColor;
+      content: "";
+      box-shadow: 0 0 0 1px color-mix(in srgb, currentColor 25%, white);
+    }
+
+    .timeline-bar.message { color: var(--blue); }
+    .timeline-bar.agent { color: var(--violet); }
+    .timeline-bar.model { color: var(--teal); }
+    .timeline-bar.tool { color: var(--orange); }
+    .timeline-bar.is-error { color: var(--red); }
+    .timeline-bar:hover::after,
+    .timeline-bar.is-selected::after { height: 5px; top: 5px; }
+
+    .content-grid {
+      display: grid;
+      grid-template-columns: minmax(640px, 1fr) var(--detail-width);
+      min-width: 0;
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    .ledger { min-width: 0; min-height: 0; overflow: auto; background: #fff; }
+    .ledger-header {
+      position: sticky;
+      z-index: 4;
+      top: 0;
+      display: grid;
+      grid-template-columns: 84px 68px minmax(280px, 1fr) 74px;
+      align-items: center;
+      min-width: 720px;
+      height: 34px;
+      padding: 0 26px 0 28px;
+      border-bottom: 1px solid var(--line);
+      background: rgb(255 255 255 / 94%);
+      color: var(--ink-3);
+      font-size: 12px;
+      backdrop-filter: blur(8px);
+    }
+
+    .turn { min-width: 720px; }
+    .turn-heading {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      width: 100%;
+      height: 28px;
+      padding: 0 26px 0 28px;
+      border: 0;
+      border-bottom: 1px solid #eff1f5;
+      background: #fcfdff;
+      color: var(--ink-2);
+      text-align: left;
+      font-size: 12px;
+    }
+
+    .turn-heading:hover { background: #f8faff; }
+    .turn-heading iconify-icon { font-size: 15px; transition: transform .16s ease; }
+    .turn.is-collapsed .turn-heading iconify-icon { transform: rotate(-90deg); }
+    .turn-time { margin-left: auto; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+    .turn-body { position: relative; }
+    .turn.is-collapsed .turn-body { display: none; }
+
+    .trace-row {
+      position: relative;
+      display: grid;
+      grid-template-columns: 84px 68px minmax(280px, 1fr) 74px;
+      width: 100%;
+      min-height: 44px;
+      padding: 0 26px 0 28px;
+      align-items: center;
+      border: 0;
+      border-bottom: 1px solid #eff1f5;
+      background: transparent;
+      color: var(--ink);
+      text-align: left;
+      transition: background .14s ease, box-shadow .14s ease;
+    }
+
+    .trace-row:hover { background: #f8faff; }
+    .trace-row.is-selected {
+      background: var(--surface-selected);
+      box-shadow: inset 3px 0 0 var(--blue), inset 0 0 0 1px rgb(50 104 246 / 23%);
+    }
+
+    .trace-row.has-error {
+      background: #fff9fa;
+      box-shadow: inset 3px 0 0 var(--red);
+    }
+
+    .trace-row.has-error:hover { background: #fff4f6; }
+    .trace-row.has-error.is-selected { background: var(--red-soft); box-shadow: inset 3px 0 0 var(--red), inset 0 0 0 1px rgb(239 62 82 / 24%); }
+
+    .node-rail { position: relative; align-self: stretch; }
+    .node-rail::before {
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      left: 14px;
+      width: 1px;
+      background: #a9bfe9;
+      content: "";
+    }
+
+    .node-rail::after {
+      position: absolute;
+      top: 50%;
+      left: 14px;
+      width: 22px;
+      height: 10px;
+      transform: translateY(-10px);
+      border-bottom: 1px solid #86a7e8;
+      border-left: 1px solid #86a7e8;
+      border-bottom-left-radius: 10px;
+      content: "";
+    }
+
+    .trace-row.depth-1 .node-rail::after { width: 42px; }
+    .trace-row.depth-2 .node-rail::after { width: 58px; }
+    .rail-dot {
+      position: absolute;
+      z-index: 2;
+      top: 50%;
+      left: 10px;
+      width: 9px;
+      height: 9px;
+      transform: translateY(-50%);
+      border: 2px solid var(--blue);
+      border-radius: 50%;
+      background: #fff;
+    }
+
+    .trace-row.is-selected .rail-dot { background: var(--blue); box-shadow: 0 0 0 4px rgb(50 104 246 / 12%); }
+    .trace-row.has-error .node-rail::before,
+    .trace-row.has-error .node-rail::after { border-color: var(--red); background-color: transparent; }
+    .trace-row.has-error .rail-dot { border-color: var(--red); background: var(--red); box-shadow: 0 0 0 3px rgb(239 62 82 / 12%); }
+    .row-type { display: flex; justify-content: flex-start; }
+    .type-pill {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 42px;
+      height: 22px;
+      padding: 0 7px;
+      border-radius: 6px;
+      font-size: 11px;
+      font-weight: 630;
+    }
+
+    .type-system { background: #eef0f4; color: #515b6f; }
+    .type-user { background: var(--blue-soft); color: var(--blue); }
+    .type-agent { background: var(--violet-soft); color: var(--violet); }
+    .type-model { background: var(--teal-soft); color: var(--teal); }
+    .type-tool { background: var(--orange-soft); color: var(--orange); }
+    .type-context { background: var(--green-soft); color: #11845a; }
+    .type-guard { background: var(--red-soft); color: var(--red); }
+
+    .node-main { display: grid; grid-template-columns: 26px minmax(0, 1fr); align-items: center; gap: 8px; min-width: 0; }
+    .node-icon {
+      display: grid;
+      width: 24px;
+      height: 24px;
+      place-items: center;
+      border-radius: 7px;
+      background: #f4f6fa;
+      color: #6f7890;
+    }
+
+    .node-icon iconify-icon { font-size: 16px; }
+    .node-icon.user { background: var(--blue-soft); color: var(--blue); }
+    .node-icon.agent { background: var(--violet-soft); color: var(--violet); }
+    .node-icon.model { background: var(--teal-soft); color: var(--teal); }
+    .node-icon.tool { background: var(--orange-soft); color: var(--orange); }
+    .node-icon.context { background: var(--green-soft); color: #11845a; }
+    .node-icon.guard { background: var(--red-soft); color: var(--red); }
+    .node-copy { display: flex; min-width: 0; align-items: baseline; gap: 10px; overflow: hidden; }
+    .node-title { display: block; flex: 0 1 auto; max-width: 48%; overflow: hidden; color: var(--ink); font-size: 13px; font-weight: 630; text-overflow: ellipsis; white-space: nowrap; }
+    .node-title:only-child { flex: 1 1 auto; max-width: 100%; }
+    .node-preview { display: block; flex: 1 1 auto; min-width: 0; overflow: hidden; color: var(--ink-3); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+    .node-preview.is-error { color: var(--red); font-weight: 560; }
+    .duration { justify-self: end; color: var(--ink-2); font-size: 12px; font-variant-numeric: tabular-nums; }
+    .trace-row.has-error .duration { color: var(--red); }
+    .details {
+      position: relative;
+      z-index: 5;
+      display: grid;
+      grid-template-rows: auto auto minmax(0, 1fr);
+      min-width: 0;
+      min-height: 0;
+      overflow: hidden;
+      border-left: 1px solid var(--line);
+      background: #fff;
+      box-shadow: -12px 0 34px rgb(23 43 88 / 3%);
+    }
+
+    .detail-head { display: flex; align-items: center; gap: 10px; min-height: 64px; padding: 11px 18px; }
+    .detail-head .node-icon { width: 34px; height: 34px; border-radius: 10px; }
+    .detail-head .node-icon iconify-icon { font-size: 20px; }
+    .detail-title { min-width: 0; }
+    .detail-title h2 { margin: 0; overflow: hidden; font-size: 15px; line-height: 21px; text-overflow: ellipsis; white-space: nowrap; }
+    .detail-subtitle { display: flex; align-items: center; gap: 7px; margin-top: 2px; color: var(--ink-3); font-size: 11px; }
+    .detail-close { display: grid; width: 36px; height: 36px; margin-left: auto; place-items: center; border: 0; border-radius: 9px; background: transparent; color: var(--ink-2); }
+    .detail-close:hover { background: var(--surface-subtle); }
+
+    .detail-tabs { display: flex; min-width: 0; height: 44px; padding: 0 12px; overflow-x: auto; border-bottom: 1px solid var(--line); scrollbar-width: none; }
+    .detail-tabs::-webkit-scrollbar { display: none; }
+    .detail-tab { position: relative; flex: 0 0 auto; height: 44px; padding: 0 11px; border: 0; background: transparent; color: var(--ink-2); font-size: 12px; }
+    .detail-tab.is-active { color: var(--blue); font-weight: 650; }
+    .detail-tab.is-active::after { position: absolute; right: 9px; bottom: 0; left: 9px; height: 2px; border-radius: 2px; background: var(--blue); content: ""; }
+    .detail-body { min-height: 0; padding: 14px 18px 28px; overflow: auto; }
+    .section-title { margin: 0 0 14px; font-size: 13px; font-weight: 680; }
+    .kv { display: grid; gap: 12px; margin: 0; }
+    .kv-row { display: grid; grid-template-columns: 98px minmax(0, 1fr); gap: 14px; align-items: start; }
+    .kv dt { color: var(--ink-3); font-size: 12px; }
+    .kv dd { min-width: 0; margin: 0; color: var(--ink-2); font-size: 12px; overflow-wrap: anywhere; }
+    .kv dd.mono { font-family: var(--font-mono); font-size: 11px; }
+    .detail-divider { height: 1px; margin: 20px 0; background: var(--line); }
+    .code-block { margin: 0; padding: 13px 14px; overflow: auto; border-radius: 9px; background: #f5f7fa; color: #293657; font-family: var(--font-mono); font-size: 11px; line-height: 1.7; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .timing-bar { display: grid; grid-template-columns: 8% 82% 10%; height: 8px; margin: 10px 0 8px; overflow: hidden; border-radius: 999px; background: #eef1f5; }
+    .timing-bar span:nth-child(1) { background: #8d72d6; }
+    .timing-bar span:nth-child(2) { background: var(--blue); }
+    .timing-bar span:nth-child(3) { background: var(--orange); }
+    .timing-legend { display: flex; flex-wrap: wrap; gap: 10px 14px; color: var(--ink-3); font-size: 11px; }
+    .legend-item { display: inline-flex; align-items: center; gap: 5px; }
+    .legend-dot { width: 6px; height: 6px; border-radius: 2px; background: currentColor; }
+    .error-panel { display: grid; grid-template-columns: 28px minmax(0, 1fr); gap: 9px; margin-bottom: 14px; padding: 11px; border: 1px solid rgb(239 62 82 / 20%); border-radius: 9px; background: var(--red-soft); }
+    .error-panel > iconify-icon { font-size: 20px; color: var(--red); }
+    .error-panel strong { display: block; color: #b51f36; font-size: 13px; }
+    .error-panel p { margin: 3px 0 9px; color: #7c3442; font-size: 11px; line-height: 1.55; }
+    .error-action { height: 28px; padding: 0 9px; border: 1px solid rgb(239 62 82 / 24%); border-radius: 7px; background: white; color: #b51f36; font-size: 11px; font-weight: 620; }
+    .empty-detail { display: grid; height: 100%; min-height: 260px; place-content: center; justify-items: center; padding: 28px; color: var(--ink-3); text-align: center; }
+    .empty-detail iconify-icon { margin-bottom: 12px; color: #a7b2c7; font-size: 32px; }
+
+    .toast {
+      position: fixed;
+      z-index: 80;
+      right: 24px;
+      bottom: 24px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      max-width: min(360px, calc(100vw - 48px));
+      padding: 11px 14px;
+      transform: translateY(14px);
+      border-radius: 10px;
+      background: #111a38;
+      color: white;
+      box-shadow: var(--shadow-panel);
+      opacity: 0;
+      visibility: hidden;
+      transition: .2s ease;
+    }
+
+    .toast.is-visible { transform: translateY(0); opacity: 1; visibility: visible; }
+    .toast iconify-icon { color: #69e6ad; font-size: 18px; }
+    .is-filtered-out { display: none !important; }
+
+    @media (max-width: 1180px) {
+      :root { --detail-width: 390px; }
+      .content-grid { grid-template-columns: minmax(0, 1fr) var(--detail-width); }
+      .shell { grid-template-rows: auto auto 90px minmax(0, 1fr); }
+    }
+
+    @media (max-width: 920px) {
+      body { overflow: auto; }
+      .app { grid-template-columns: 64px minmax(0, 1fr); min-height: 720px; }
+      .sidebar { padding-inline: 8px; }
+      .content-grid { grid-template-columns: minmax(0, 1fr); }
+      .details {
+        position: fixed;
+        inset: 0 0 0 auto;
+        width: min(430px, 92vw);
+        height: 100vh;
+        box-shadow: -18px 0 48px rgb(16 32 76 / 16%);
+      }
+      .details.is-closed { display: none; }
+      .search { width: min(185px, 27vw); min-width: 140px; }
+      .ledger-header,
+      .turn { min-width: 680px; }
+      .ledger-header,
+      .trace-row { grid-template-columns: 78px 64px minmax(250px, 1fr) 70px; }
+    }
+
+    @media (max-width: 680px) {
+      .app { display: block; min-height: 100vh; }
+      .sidebar { display: none; }
+      .shell { min-height: 100vh; grid-template-rows: auto auto 90px minmax(560px, 1fr); }
+      .topbar { min-height: 96px; padding: 14px 14px 0; }
+      h1 { font-size: 17px; }
+      .mode { display: none; }
+      .export-button { width: 40px; padding: 0; }
+      .export-button span { display: none; }
+      .toolbar { height: auto; min-height: auto; align-items: stretch; flex-direction: column; gap: 0; padding: 2px 14px; }
+      .filters { width: 100%; justify-content: flex-start; overflow-x: auto; }
+      .select-wrap select { min-width: 94px; }
+      .search { flex: 1 0 150px; width: auto; min-width: 150px; }
+      .timeline { grid-template-columns: 84px minmax(0, 1fr); }
+      .timeline-labels { padding-left: 14px; }
+      .ledger { overflow: auto; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0ms !important; animation-duration: 0ms !important; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar" aria-label="主导航">
+      <a class="brand" href="#" aria-label="TinkerFin Studio">
+        <img src="web/public/brand/tinkerfin-mark.png" alt="">
+      </a>
+      <nav class="side-nav">
+        <button class="nav-button" type="button" data-label="对话" aria-label="对话"><iconify-icon icon="solar:chat-round-dots-linear"></iconify-icon></button>
+        <button class="nav-button is-active" type="button" data-label="链路分析" aria-label="链路分析"><iconify-icon icon="solar:graph-up-linear"></iconify-icon></button>
+        <button class="nav-button" type="button" data-label="运行记录" aria-label="运行记录"><iconify-icon icon="solar:layers-linear"></iconify-icon></button>
+        <button class="nav-button" type="button" data-label="文档" aria-label="文档"><iconify-icon icon="solar:document-text-linear"></iconify-icon></button>
+        <button class="nav-button" type="button" data-label="应用" aria-label="应用"><iconify-icon icon="solar:widget-4-linear"></iconify-icon></button>
+        <button class="nav-button" type="button" data-label="数据" aria-label="数据"><iconify-icon icon="solar:database-linear"></iconify-icon></button>
+        <button class="nav-button" type="button" data-label="安全" aria-label="安全"><iconify-icon icon="solar:shield-check-linear"></iconify-icon></button>
+        <button class="nav-button" type="button" data-label="设置" aria-label="设置"><iconify-icon icon="solar:settings-linear"></iconify-icon></button>
+      </nav>
+      <div class="sidebar-foot">
+        <button class="utility-button notification" type="button" data-label="通知" aria-label="通知"><iconify-icon icon="solar:bell-linear"></iconify-icon></button>
+        <button class="utility-button" type="button" data-label="帮助" aria-label="帮助"><iconify-icon icon="solar:question-circle-linear"></iconify-icon></button>
+        <button class="avatar" type="button" aria-label="打开用户菜单">Y</button>
+      </div>
+    </aside>
+
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <div class="title-line">
+            <h1>获取百度实时热搜榜单计划</h1>
+            <span class="mode"><iconify-icon icon="solar:branching-paths-down-linear"></iconify-icon>标准模式</span>
+          </div>
+          <nav class="tabs" aria-label="会话视图">
+            <button class="tab" type="button" data-view="chat">对话</button>
+            <button class="tab is-active" type="button" data-view="trace" aria-current="page">链路分析</button>
+          </nav>
+        </div>
+        <button class="export-button" type="button" id="exportButton"><span>导出日志</span><iconify-icon icon="solar:download-minimalistic-linear"></iconify-icon></button>
+      </header>
+
+      <section class="toolbar" aria-label="链路筛选">
+        <div class="summary" aria-live="polite">
+          <span>总时长 <strong>12.4s</strong></span><span class="separator">/</span>
+          <span><strong>3</strong> 轮</span><span class="separator">/</span>
+          <span><strong id="visibleCount">10</strong> 次调用</span>
+        </div>
+        <div class="filters">
+          <label class="select-wrap">
+            <span hidden>类型</span>
+            <select id="typeFilter" aria-label="按节点类型筛选">
+              <option value="all">全部类型</option>
+              <option value="system">系统</option>
+              <option value="user">用户</option>
+              <option value="agent">助手</option>
+              <option value="model">模型</option>
+              <option value="tool">工具</option>
+              <option value="context">上下文</option>
+              <option value="guard">守护</option>
+            </select>
+            <iconify-icon icon="solar:alt-arrow-down-linear"></iconify-icon>
+          </label>
+          <label class="search">
+            <iconify-icon icon="solar:magnifer-linear"></iconify-icon>
+            <input id="searchInput" type="search" placeholder="搜索节点、内容、ID" aria-label="搜索链路节点">
+            <span class="shortcut">⌘ K</span>
+          </label>
+        </div>
+      </section>
+
+      <section class="timeline" aria-label="调用时间线">
+        <div class="timeline-labels">
+          <span aria-hidden="true"></span>
+          <span class="lane-label message"><iconify-icon icon="solar:chat-round-dots-bold-duotone"></iconify-icon>消息</span>
+          <span class="lane-label agent"><iconify-icon icon="solar:magic-stick-3-bold-duotone"></iconify-icon>Agent</span>
+          <span class="lane-label model"><iconify-icon icon="solar:cpu-bolt-bold-duotone"></iconify-icon>模型</span>
+          <span class="lane-label tool"><iconify-icon icon="solar:link-circle-bold-duotone"></iconify-icon>工具</span>
+        </div>
+        <div class="timeline-scroll">
+          <div class="timeline-chart">
+            <div class="ticks">
+              <span style="left:0">0s</span><span style="left:8.333%">1s</span><span style="left:16.666%">2s</span><span style="left:25%">3s</span><span style="left:33.333%">4s</span><span style="left:41.666%">5s</span><span style="left:50%">6s</span><span style="left:58.333%">7s</span><span style="left:66.666%">8s</span><span style="left:83.333%">10s</span><span style="left:100%">12.4s</span>
+            </div>
+            <div class="timeline-range" aria-hidden="true"></div>
+            <span class="range-tag start">8s</span><span class="range-tag end">12.4s</span>
+            <div class="lane lane-message">
+              <button class="timeline-bar message" type="button" data-node="user" aria-label="选择用户提问" style="left:0;width:7%"></button>
+              <button class="timeline-bar message" type="button" data-node="final" aria-label="选择输出计划" style="left:14%;width:10%"></button>
+              <button class="timeline-bar message" type="button" data-node="final" aria-label="选择输出计划" style="left:68%;width:7%"></button>
+            </div>
+            <div class="lane lane-agent">
+              <button class="timeline-bar agent" type="button" data-node="assistant" aria-label="选择环境确认" style="left:7%;width:8%"></button>
+              <button class="timeline-bar agent" type="button" data-node="assistant" aria-label="选择环境确认" style="left:25%;width:5%"></button>
+              <button class="timeline-bar agent" type="button" data-node="final" aria-label="选择输出计划" style="left:57%;width:9%"></button>
+              <button class="timeline-bar agent" type="button" data-node="final" aria-label="选择输出计划" style="left:75%;width:22%"></button>
+            </div>
+            <div class="lane lane-model">
+              <button class="timeline-bar model" type="button" data-node="model" aria-label="选择 gpt-5" style="left:15%;width:5%"></button>
+              <button class="timeline-bar model" type="button" data-node="model" aria-label="选择 gpt-5" style="left:30%;width:7%"></button>
+              <button class="timeline-bar model" type="button" data-node="model" aria-label="选择 gpt-5" style="left:66%;width:5%"></button>
+              <button class="timeline-bar model" type="button" data-node="model" aria-label="选择 gpt-5" style="left:88%;width:6%"></button>
+            </div>
+            <div class="lane lane-tool">
+              <button class="timeline-bar tool" type="button" data-node="pwd" aria-label="选择 pwd" style="left:37%;width:6%"></button>
+              <button class="timeline-bar tool" type="button" data-node="glob" aria-label="选择 glob" style="left:49%;width:7%"></button>
+              <button class="timeline-bar tool" type="button" data-node="web_search" aria-label="选择 web_search" style="left:78%;width:8%"></button>
+              <button class="timeline-bar is-error" type="button" data-node="guard" aria-label="选择网络请求检查" style="left:94%;width:5%"></button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="content-grid">
+        <div class="ledger" id="ledger" aria-label="链路节点">
+          <div class="ledger-header" aria-hidden="true">
+            <span>节点</span><span>类型</span><span>节点 / 内容预览</span><span>耗时</span>
+          </div>
+
+          <section class="turn" data-turn="1">
+            <button class="turn-heading" type="button" aria-expanded="true"><iconify-icon icon="solar:alt-arrow-down-linear"></iconify-icon><strong>第 1 轮</strong><span class="turn-time">0.00s</span></button>
+            <div class="turn-body">
+              <button class="trace-row" type="button" data-node="system" data-type="system" data-status="success">
+                <span class="node-rail"><span class="rail-dot"></span></span><span class="row-type"><span class="type-pill type-system">系统</span></span>
+                <span class="node-main"><span class="node-icon"><iconify-icon icon="solar:code-square-bold-duotone"></iconify-icon></span><span class="node-copy"><span class="node-title">初始系统提示词</span><span class="node-preview">你是 TinkerFin Studio 的智能分析助手，帮助用户理解链路执行过程并给出...</span></span></span>
+                <span class="duration">320ms</span>
+              </button>
+              <button class="trace-row" type="button" data-node="user" data-type="user" data-status="success">
+                <span class="node-rail"><span class="rail-dot"></span></span><span class="row-type"><span class="type-pill type-user">用户</span></span>
+                <span class="node-main"><span class="node-icon user"><iconify-icon icon="solar:chat-round-dots-bold-duotone"></iconify-icon></span><span class="node-copy"><span class="node-title">快速给我一个获取百度实时热搜榜的计划</span></span></span>
+                <span class="duration">680ms</span>
+              </button>
+              <button class="trace-row" type="button" data-node="assistant" data-type="agent" data-status="success">
+                <span class="node-rail"><span class="rail-dot"></span></span><span class="row-type"><span class="type-pill type-agent">助手</span></span>
+                <span class="node-main"><span class="node-icon agent"><iconify-icon icon="solar:magic-stick-3-bold-duotone"></iconify-icon></span><span class="node-copy"><span class="node-title">我先确认当前环境和可用网络能力</span><span class="node-preview">我来先检查工作目录和网络能力结构，确认是否可以访问百度热搜接口</span></span></span>
+                <span class="duration">1.24s</span>
+              </button>
+              <button class="trace-row" type="button" data-node="pwd" data-type="tool" data-status="success">
+                <span class="node-rail"><span class="rail-dot"></span></span><span class="row-type"><span class="type-pill type-tool">工具</span></span>
+                <span class="node-main"><span class="node-icon tool"><iconify-icon icon="solar:link-circle-bold-duotone"></iconify-icon></span><span class="node-copy"><span class="node-title">pwd</span><span class="node-preview">bash {"command": "pwd"}</span></span></span>
+                <span class="duration">210ms</span>
+              </button>
+              <button class="trace-row" type="button" data-node="glob" data-type="tool" data-status="success">
+                <span class="node-rail"><span class="rail-dot"></span></span><span class="row-type"><span class="type-pill type-tool">工具</span></span>
+                <span class="node-main"><span class="node-icon tool"><iconify-icon icon="solar:link-circle-bold-duotone"></iconify-icon></span><span class="node-copy"><span class="node-title">glob</span><span class="node-preview">glob {"pattern": "packages/web/**/provider"}</span></span></span>
+                <span class="duration">430ms</span>
+              </button>
+              <button class="trace-row" type="button" data-node="context" data-type="context" data-status="success">
+                <span class="node-rail"><span class="rail-dot"></span></span><span class="row-type"><span class="type-pill type-context">上下文</span></span>
+                <span class="node-main"><span class="node-icon context"><iconify-icon icon="solar:folder-with-files-bold-duotone"></iconify-icon></span><span class="node-copy"><span class="node-title">workspace instructions</span><span class="node-preview">&lt;system-reminder&gt; The following workspace instructions may be relevant...</span></span></span>
+                <span class="duration">120ms</span>
+              </button>
+            </div>
+          </section>
+
+          <section class="turn" data-turn="2">
+            <button class="turn-heading" type="button" aria-expanded="true"><iconify-icon icon="solar:alt-arrow-down-linear"></iconify-icon><strong>第 2 轮</strong><span class="turn-time">2.44s</span></button>
+            <div class="turn-body">
+              <button class="trace-row" type="button" data-node="model" data-type="model" data-status="success">
+                <span class="node-rail"><span class="rail-dot"></span></span><span class="row-type"><span class="type-pill type-model">模型</span></span>
+                <span class="node-main"><span class="node-icon model"><iconify-icon icon="solar:cpu-bolt-bold-duotone"></iconify-icon></span><span class="node-copy"><span class="node-title">gpt-5</span><span class="node-preview">推理并生成获取百度实时热搜榜的可执行计划步骤</span></span></span>
+                <span class="duration">2.40s</span>
+              </button>
+              <button class="trace-row" type="button" data-node="web_search" data-type="tool" data-status="running">
+                <span class="node-rail"><span class="rail-dot"></span></span><span class="row-type"><span class="type-pill type-tool">工具</span></span>
+                <span class="node-main"><span class="node-icon tool"><iconify-icon icon="solar:link-circle-bold-duotone"></iconify-icon></span><span class="node-copy"><span class="node-title">web_search</span><span class="node-preview">curl -s --max-time 12 "https://top.baidu.com/board?tab=realtime"</span></span></span>
+                <span class="duration">2.90s</span>
+              </button>
+              <button class="trace-row depth-1 has-error is-selected" type="button" data-node="guard" data-type="guard" data-status="error" aria-current="true">
+                <span class="node-rail"><span class="rail-dot"></span></span><span class="row-type"><span class="type-pill type-guard">守护</span></span>
+                <span class="node-main"><span class="node-icon guard"><iconify-icon icon="solar:shield-warning-bold-duotone"></iconify-icon></span><span class="node-copy"><span class="node-title">网络请求检查</span><span class="node-preview is-error">403 Forbidden · 当前网络策略禁止访问</span></span></span>
+                <span class="duration">180ms</span>
+              </button>
+            </div>
+          </section>
+
+          <section class="turn" data-turn="3">
+            <button class="turn-heading" type="button" aria-expanded="true"><iconify-icon icon="solar:alt-arrow-down-linear"></iconify-icon><strong>第 3 轮</strong><span class="turn-time">8.06s</span></button>
+            <div class="turn-body">
+              <button class="trace-row" type="button" data-node="final" data-type="agent" data-status="success">
+                <span class="node-rail"><span class="rail-dot"></span></span><span class="row-type"><span class="type-pill type-agent">助手</span></span>
+                <span class="node-main"><span class="node-icon agent"><iconify-icon icon="solar:magic-stick-3-bold-duotone"></iconify-icon></span><span class="node-copy"><span class="node-title">输出计划</span><span class="node-preview">基于可用信息，输出获取百度实时热搜榜的计划步骤和注意事项</span></span></span>
+                <span class="duration">1.10s</span>
+              </button>
+            </div>
+          </section>
+        </div>
+
+        <aside class="details" id="details" aria-label="节点详情">
+          <div class="detail-head" id="detailHead"></div>
+          <div class="detail-tabs" role="tablist" aria-label="详情分类">
+            <button class="detail-tab is-active" type="button" role="tab" aria-selected="true" data-tab="overview">概览</button>
+            <button class="detail-tab" type="button" role="tab" aria-selected="false" data-tab="request">请求</button>
+            <button class="detail-tab" type="button" role="tab" aria-selected="false" data-tab="system">系统提示词</button>
+            <button class="detail-tab" type="button" role="tab" aria-selected="false" data-tab="usage">用量</button>
+            <button class="detail-tab" type="button" role="tab" aria-selected="false" data-tab="timing">计时</button>
+            <button class="detail-tab" type="button" role="tab" aria-selected="false" data-tab="result">结果</button>
+          </div>
+          <div class="detail-body" id="detailBody" role="tabpanel"></div>
+        </aside>
+      </section>
+    </main>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"><iconify-icon icon="solar:check-circle-bold"></iconify-icon><span id="toastText"></span></div>
+
+  <script>
+    const nodeData = {
+      system: { name: '初始系统提示词', type: '系统', kind: 'system', icon: 'solar:code-square-bold-duotone', status: 'success', statusText: '成功', duration: '320ms', turn: '第 1 轮', id: 'system_01J2X9Q2F0CX4J84', parent: 'root', started: '2025-05-20 14:32:15.000', content: '你是 TinkerFin Studio 的智能分析助手，帮助用户理解链路执行过程并给出可验证的结论。' },
+      user: { name: '用户提问', type: '用户', kind: 'user', icon: 'solar:chat-round-dots-bold-duotone', status: 'success', statusText: '成功', duration: '680ms', turn: '第 1 轮', id: 'message_01J2X9Q4V8B1', parent: 'system_01J2X9Q2F0CX4J84', started: '2025-05-20 14:32:15.220', content: '快速给我一个获取百度实时热搜榜的计划。' },
+      assistant: { name: '环境确认', type: '助手', kind: 'agent', icon: 'solar:magic-stick-3-bold-duotone', status: 'success', statusText: '成功', duration: '1.24s', turn: '第 1 轮', id: 'agent_01J2X9Q6XBP2', parent: 'message_01J2X9Q4V8B1', started: '2025-05-20 14:32:15.900', content: '我先检查工作目录和网络能力结构，确认是否可以访问百度热搜接口。' },
+      pwd: { name: 'pwd', type: '工具', kind: 'tool', icon: 'solar:link-circle-bold-duotone', status: 'success', statusText: '成功', duration: '210ms', turn: '第 1 轮', id: 'tool_01J2X9Q8PWDX', parent: 'agent_01J2X9Q6XBP2', started: '2025-05-20 14:32:16.120', content: 'bash {"command": "pwd"}' },
+      glob: { name: 'glob', type: '工具', kind: 'tool', icon: 'solar:link-circle-bold-duotone', status: 'success', statusText: '成功', duration: '430ms', turn: '第 1 轮', id: 'tool_01J2X9QA3GLOB', parent: 'agent_01J2X9Q6XBP2', started: '2025-05-20 14:32:16.330', content: 'glob {"pattern": "packages/web/**/provider"}' },
+      context: { name: 'workspace instructions', type: '上下文', kind: 'context', icon: 'solar:folder-with-files-bold-duotone', status: 'success', statusText: '成功', duration: '120ms', turn: '第 1 轮', id: 'context_01J2X9QBWKSP', parent: 'agent_01J2X9Q6XBP2', started: '2025-05-20 14:32:16.760', content: '<system-reminder> The following workspace instructions may be relevant to your work.' },
+      model: { name: 'gpt-5', type: '模型', kind: 'model', icon: 'solar:cpu-bolt-bold-duotone', status: 'success', statusText: '成功', duration: '2.40s', turn: '第 2 轮', id: 'model_01J2X9QD4G5', parent: 'agent_01J2X9Q6XBP2', started: '2025-05-20 14:32:17.440', content: '推理并生成获取百度实时热搜榜的可执行计划步骤。' },
+      web_search: { name: 'web_search', type: '工具', kind: 'tool', icon: 'solar:link-circle-bold-duotone', status: 'running', statusText: '运行中', duration: '2.90s', turn: '第 2 轮', id: 'tool_01J2X9Q8K5F7Z2P2N3Y6', parent: 'model_01J2X9Q7D4FT7ZP2N2X5', started: '2025-05-20 14:32:18.453', content: 'curl -s --max-time 12 \\\n  "https://top.baidu.com/board?tab=realtime" \\\n  -H "User-Agent: TinkerFin-Studio/1.0"' },
+      guard: { name: '网络请求检查', type: '守护', kind: 'guard', icon: 'solar:shield-warning-bold-duotone', status: 'error', statusText: '失败', duration: '180ms', turn: '第 2 轮', id: 'guard_01J2X9QNET18', parent: 'tool_01J2X9Q8K5F7Z2P2N3Y6', started: '2025-05-20 14:32:21.353', request: 'GET https://top.baidu.com/board?tab=realtime\nUser-Agent: TinkerFin-Studio/1.0\nTimeout: 12s', content: '请求返回 403 Forbidden，外部访问被当前网络策略阻止。' },
+      final: { name: '输出计划', type: '助手', kind: 'agent', icon: 'solar:magic-stick-3-bold-duotone', status: 'success', statusText: '成功', duration: '1.10s', turn: '第 3 轮', id: 'agent_01J2X9QFINAL', parent: 'model_01J2X9Q7D4FT7ZP2N2X5', started: '2025-05-20 14:32:23.060', content: '基于当前可用信息，输出获取百度实时热搜榜的计划步骤和注意事项。' }
+    };
+
+    const state = { selected: 'guard', activeTab: 'overview' };
+    const detailHead = document.getElementById('detailHead');
+    const detailBody = document.getElementById('detailBody');
+    const details = document.getElementById('details');
+    const toast = document.getElementById('toast');
+    const toastText = document.getElementById('toastText');
+    let toastTimer;
+
+    function escapeHtml(value) {
+      return String(value).replace(/[&<>'"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#039;', '"': '&quot;' }[char]));
+    }
+
+    function showToast(message) {
+      toastText.textContent = message;
+      toast.classList.add('is-visible');
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => toast.classList.remove('is-visible'), 2200);
+    }
+
+    function detailOverview(node) {
+      const contentPreview = node.status === 'error' ? '' : `
+        <div class="detail-divider"></div>
+        <h3 class="section-title">内容预览</h3>
+        <pre class="code-block">${escapeHtml(node.content)}</pre>`;
+      return `
+        <h3 class="section-title">基本信息</h3>
+        <dl class="kv">
+          <div class="kv-row"><dt>节点类型</dt><dd>${escapeHtml(node.type)}</dd></div>
+          <div class="kv-row"><dt>节点 ID</dt><dd class="mono">${escapeHtml(node.id)}</dd></div>
+          <div class="kv-row"><dt>父节点 ID</dt><dd class="mono">${escapeHtml(node.parent)}</dd></div>
+          <div class="kv-row"><dt>轮次</dt><dd>${escapeHtml(node.turn)}</dd></div>
+          <div class="kv-row"><dt>开始时间</dt><dd>${escapeHtml(node.started)}</dd></div>
+          <div class="kv-row"><dt>持续时间</dt><dd>${escapeHtml(node.duration)}</dd></div>
+          <div class="kv-row"><dt>超时设置</dt><dd>12.00s</dd></div>
+          <div class="kv-row"><dt>重试次数</dt><dd>0</dd></div>
+        </dl>
+        ${contentPreview}
+        <div class="detail-divider"></div>
+        <h3 class="section-title">用量</h3>
+        <dl class="kv"><div class="kv-row"><dt>输入 Tokens</dt><dd>1,256</dd></div><div class="kv-row"><dt>输出 Tokens</dt><dd>${node.status === 'running' ? '—' : '872'}</dd></div></dl>
+        <div class="detail-divider"></div>
+        <h3 class="section-title">计时</h3>
+        <div class="timing-bar" aria-label="排队 8%，执行 82%，等待 10%"><span></span><span></span><span></span></div>
+        <div class="timing-legend"><span class="legend-item" style="color:#8d72d6"><i class="legend-dot"></i>排队 80ms</span><span class="legend-item" style="color:#3268f6"><i class="legend-dot"></i>执行 2.52s</span><span class="legend-item" style="color:#f27d16"><i class="legend-dot"></i>等待 300ms</span></div>`;
+    }
+
+    function detailContent(node, tab) {
+      if (tab === 'overview') return detailOverview(node);
+      if (tab === 'request') return `<h3 class="section-title">请求内容</h3><pre class="code-block">${escapeHtml(node.request || node.content)}</pre>`;
+      if (tab === 'system') return `<h3 class="section-title">系统提示词</h3><pre class="code-block">你是 TinkerFin Studio 的智能分析助手。请基于可验证信息完成任务，并清晰记录调用链与异常。</pre>`;
+      if (tab === 'usage') return `<h3 class="section-title">Token 用量</h3><dl class="kv"><div class="kv-row"><dt>输入 Tokens</dt><dd>1,256</dd></div><div class="kv-row"><dt>输出 Tokens</dt><dd>${node.status === 'running' ? '—' : '872'}</dd></div><div class="kv-row"><dt>缓存命中</dt><dd>64%</dd></div></dl>`;
+      if (tab === 'timing') return `<h3 class="section-title">计时分布（总耗时 ${escapeHtml(node.duration)}）</h3><div class="timing-bar"><span></span><span></span><span></span></div><div class="timing-legend"><span class="legend-item" style="color:#8d72d6"><i class="legend-dot"></i>排队 8%</span><span class="legend-item" style="color:#3268f6"><i class="legend-dot"></i>执行 82%</span><span class="legend-item" style="color:#f27d16"><i class="legend-dot"></i>等待 10%</span></div>`;
+      return `<h3 class="section-title">运行结果</h3><pre class="code-block">${node.status === 'error' ? escapeHtml(node.content) : node.status === 'running' ? '节点仍在运行，结果将在完成后显示。' : '{\n  "content": "' + escapeHtml(node.content) + '"\n}'}</pre>`;
+    }
+
+    function renderDetails() {
+      const node = nodeData[state.selected];
+      if (!node) {
+        detailHead.innerHTML = '';
+        detailBody.innerHTML = '<div class="empty-detail"><iconify-icon icon="solar:cursor-square-bold-duotone"></iconify-icon><strong>选择一个节点</strong><span>查看请求、用量、计时与结果</span></div>';
+        return;
+      }
+      details.classList.remove('is-closed');
+      detailHead.innerHTML = `<span class="node-icon ${node.kind}"><iconify-icon icon="${node.icon}"></iconify-icon></span><div class="detail-title"><h2>${escapeHtml(node.name)}</h2><div class="detail-subtitle"><span>${escapeHtml(node.type)}</span><span>·</span><span>${escapeHtml(node.duration)}</span></div></div><button class="detail-close" type="button" aria-label="关闭节点详情"><iconify-icon icon="solar:close-circle-linear"></iconify-icon></button>`;
+      const errorPanel = node.status === 'error' ? `<section class="error-panel" role="alert"><iconify-icon icon="solar:shield-warning-bold-duotone"></iconify-icon><div><strong>外部访问被阻止</strong><p>请求返回 403 Forbidden，当前网络策略不允许访问该地址</p><button class="error-action" type="button">查看请求参数</button></div></section>` : '';
+      detailBody.innerHTML = errorPanel + detailContent(node, state.activeTab);
+      detailHead.querySelector('.detail-close').addEventListener('click', () => details.classList.add('is-closed'));
+      detailBody.querySelector('.error-action')?.addEventListener('click', () => activateDetailTab('request'));
+    }
+
+    function selectNode(id, focusDetails = false) {
+      if (!nodeData[id]) return;
+      state.selected = id;
+      document.querySelectorAll('.trace-row').forEach((row) => {
+        const selected = row.dataset.node === id;
+        row.classList.toggle('is-selected', selected);
+        if (selected) row.setAttribute('aria-current', 'true'); else row.removeAttribute('aria-current');
+      });
+      document.querySelectorAll('.timeline-bar').forEach((bar) => bar.classList.toggle('is-selected', bar.dataset.node === id));
+      renderDetails();
+      if (focusDetails && window.innerWidth <= 920) detailHead.querySelector('.detail-close')?.focus();
+    }
+
+    function applyFilters() {
+      const type = document.getElementById('typeFilter').value;
+      const query = document.getElementById('searchInput').value.trim().toLowerCase();
+      let count = 0;
+      document.querySelectorAll('.trace-row').forEach((row) => {
+        const data = nodeData[row.dataset.node];
+        const matchesType = type === 'all' || row.dataset.type === type;
+        const haystack = `${data.name} ${data.type} ${data.content} ${data.id}`.toLowerCase();
+        const matchesQuery = !query || haystack.includes(query);
+        const visible = matchesType && matchesQuery;
+        row.classList.toggle('is-filtered-out', !visible);
+        if (visible) count += 1;
+      });
+      document.getElementById('visibleCount').textContent = String(count);
+      document.querySelectorAll('.turn').forEach((turn) => {
+        const anyVisible = [...turn.querySelectorAll('.trace-row')].some((row) => !row.classList.contains('is-filtered-out'));
+        turn.classList.toggle('is-filtered-out', !anyVisible);
+      });
+    }
+
+    document.querySelectorAll('.trace-row').forEach((row) => row.addEventListener('click', () => selectNode(row.dataset.node, true)));
+    document.querySelectorAll('.timeline-bar').forEach((bar) => bar.addEventListener('click', () => {
+      selectNode(bar.dataset.node);
+      document.querySelector(`.trace-row[data-node="${bar.dataset.node}"]`)?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    }));
+
+    document.querySelectorAll('.turn-heading').forEach((button) => button.addEventListener('click', () => {
+      const turn = button.closest('.turn');
+      const collapsed = turn.classList.toggle('is-collapsed');
+      button.setAttribute('aria-expanded', String(!collapsed));
+    }));
+
+    function activateDetailTab(tabName) {
+      state.activeTab = tabName;
+      document.querySelectorAll('.detail-tab').forEach((item) => {
+        const active = item.dataset.tab === tabName;
+        item.classList.toggle('is-active', active);
+        item.setAttribute('aria-selected', String(active));
+        item.tabIndex = active ? 0 : -1;
+      });
+      renderDetails();
+    }
+
+    document.querySelectorAll('.detail-tab').forEach((tab) => tab.addEventListener('click', () => activateDetailTab(tab.dataset.tab)));
+
+    document.getElementById('typeFilter').addEventListener('change', applyFilters);
+    document.getElementById('searchInput').addEventListener('input', applyFilters);
+    document.addEventListener('keydown', (event) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
+        event.preventDefault();
+        document.getElementById('searchInput').focus();
+      }
+      if (event.key === 'Escape' && document.activeElement === document.getElementById('searchInput')) {
+        document.getElementById('searchInput').value = '';
+        applyFilters();
+      }
+    });
+
+    document.getElementById('exportButton').addEventListener('click', () => {
+      const blob = new Blob([JSON.stringify({ title: '获取百度实时热搜榜单计划', duration: '12.4s', nodes: Object.values(nodeData) }, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'tinkerfin-chain-trace.json';
+      link.click();
+      URL.revokeObjectURL(url);
+      showToast('链路日志已导出');
+    });
+
+    document.querySelectorAll('.nav-button, .utility-button').forEach((button) => button.addEventListener('click', () => {
+      if (!button.classList.contains('is-active')) showToast(`${button.dataset.label}为演示入口`);
+    }));
+    document.querySelector('[data-view="chat"]').addEventListener('click', () => showToast('此单文件仅演示链路分析视图'));
+    document.querySelector('.brand').addEventListener('click', (event) => { event.preventDefault(); showToast('TinkerFin Studio'); });
+
+    renderDetails();
+    applyFilters();
+  </script>
+</body>
+</html>

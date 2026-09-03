@@ -83,7 +83,7 @@ LangGraph 风格 `Runnable` 时，才直接调用 `await agent.create_graph()`�
 ## 核心概念
 
 - `create_deep_agent(...)` 记录 Deep Agents 建图参数，普通运行使用 `open_run()` 或
-  `open_agui_run()`
+  `open_agui_run()`；只需要最终 state 时使用 managed `ainvoke()`
 - 原生 Runtime、Plan Mode、Observation 与 SSE 默认可用；`open_agui_run()` 需要安装
   `tinkerfin[agui]`
 - `TinkerFin(state_schema=...)` 为该 factory 创建的所有 Deep Agent Definition 提供
@@ -103,9 +103,11 @@ LangGraph 风格 `Runnable` 时，才直接调用 `await agent.create_graph()`�
   原生 Command、Tool 关联、取消与持久证据；Binding 只保留给高级事件日志集成
 - `.observe(Tracer())` 以 fail-closed 方式记录 Runtime 生命周期与校验后的 Native 语义，
   不记录 AG-UI、Messaging、SSE 或 Redis 投递状态
-- 框架发行只提供显式的 `deepagents-v2` Runtime Profile，不提供 Deep Agents v3 Profile 或通用
-  TodoGroups 投影与界面；Studio 在查询时从 canonical Trace 事实派生产品任务轨迹，新的真实
-  Profile 必须输出同一合同，不能在下游增加版本分支
+- 默认 `DeepAgentsV2RuntimeProfile` 使用稳定的 v2 对象流；显式的 Deep Agents v3 集成
+  `DeepAgentsV3RuntimeProfile` 使用 LangGraph 的实验性 v3 事件流。两者输出相同的 canonical
+  Runtime Observation，Trace、AG-UI、Messaging 与业务应用不按上游 stream API 分支
+- `TodoGroups` 是 Studio 基于 canonical Trace fact 形成的投影，不是第二套 Runtime state 或
+  持久化格式
 - 当前不提供 Archive/S3/Blob、payload Encryption/KMS 或 OpenTelemetry exporter；活动 Trace
   存储实现 `TraceLedgerBackend`，高级集成可替换 `TraceStore`、包装 canonical codec、观察
   `RuntimeObserver` 或装饰 Store/Messaging Backend，不能增加占位 API

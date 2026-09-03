@@ -12,9 +12,15 @@ from pydantic import Field, JsonValue, field_validator, model_validator
 from tinkerfin_contracts import RunIdentity
 
 from ._models import TraceModel
-from .entries import TraceEntryKind, TraceEntryStatus, TraceFacets, TraceFilter
 from .errors import TraceStoreProtocolError
 from .facts import TraceEvent, TraceSemanticFact
+from .graph import (
+    TraceGraphFacets,
+    TraceGraphFilter,
+    TraceGraphLinkIssue,
+    TraceGraphNodeKind,
+    TraceGraphNodeStatus,
+)
 from .limits import TraceLimits
 
 
@@ -107,13 +113,13 @@ class TraceProjectionCheckpoint(TraceModel):
 
 
 @dataclass(frozen=True, slots=True)
-class TraceEntryRecord:
-    """Carry one indexed entry and its decoded authoritative Ledger facts."""
+class TraceGraphNodeRecord:
+    """Carry one indexed Graph node and its decoded authoritative facts."""
 
-    entry_id: str
-    parent_id: str | None
-    kind: TraceEntryKind
-    status: TraceEntryStatus
+    node_id: str
+    structural_parent_id: str | None
+    kind: TraceGraphNodeKind
+    status: TraceGraphNodeStatus
     name: str
     run_id: str
     namespace: tuple[str, ...]
@@ -125,21 +131,28 @@ class TraceEntryRecord:
     completed_at: datetime | None
     started_seq: int
     updated_seq: int
+    request_seq: int | None
+    result_seq: int | None
+    failure_seq: int | None
+    link_issue: TraceGraphLinkIssue | None
     started_event: TraceEvent
     updated_event: TraceEvent
+    request_event: TraceEvent | None
+    result_event: TraceEvent | None
+    failure_event: TraceEvent | None
 
 
 @dataclass(frozen=True, slots=True)
-class TraceEntryRecordPage:
-    """Return decoded indexed rows and cursor evidence from one current read."""
+class TraceGraphNodeRecordPage:
+    """Return decoded Graph rows and cursor evidence from one current read."""
 
     key: TraceThreadKey
     as_of_seq: int
-    entries: tuple[TraceEntryRecord, ...]
-    facets: TraceFacets
+    nodes: tuple[TraceGraphNodeRecord, ...]
+    facets: TraceGraphFacets
     has_more: bool
     next_started_at: datetime | None
-    next_entry_id: str | None
+    next_node_id: str | None
     call_tracking_present: bool
 
 
@@ -411,58 +424,31 @@ class TraceStore(Protocol):
 
 
 @runtime_checkable
-class TraceEntryStore(Protocol):
-    """Optional Store capability for direct indexed Trace entry queries."""
+class TraceGraphStore(Protocol):
+    """Optional Store capability for direct indexed Graph queries."""
 
-    async def query_trace_entries(
+    async def query_trace_graph(
         self,
         key: TraceThreadKey,
         *,
         run_ids: tuple[str, ...],
-        where: TraceFilter,
+        where: TraceGraphFilter,
         limit: int,
+        max_nodes: int = 4000,
         before_started_at: datetime | None = None,
-        before_entry_id: str | None = None,
-    ) -> TraceEntryRecordPage:
-        """Return one backend-filtered current entry page with decoded evidence.
-
-        Args:
-            key: Exact generation to query.
-            run_ids: Selected lineage Runs included in the result.
-            where: Validated functional filter applied before payload decoding.
-            limit: Maximum matching rows before requested ancestors.
-            before_started_at: Optional exclusive aware UTC cursor timestamp.
-            before_entry_id: Entry identity paired with the cursor timestamp.
-
-        Returns:
-            Decoded entry records, Facets, cursor evidence, and completeness metadata.
-
-        Raises:
-            TraceThreadNotFound: The exact generation is unavailable.
-            TraceStoreError: The indexed query or referenced Ledger read fails.
-        """
+        before_node_id: str | None = None,
+    ) -> TraceGraphNodeRecordPage:
+        """Return one Store-filtered current Graph page with bounded ancestors."""
 
         ...
 
 
 @runtime_checkable
-class TraceEntryRebuildStore(Protocol):
-    """Reconstruct disposable query entries from authoritative Ledger events."""
+class TraceGraphRebuildStore(Protocol):
+    """Reconstruct the disposable Graph index from authoritative Ledger facts."""
 
-    async def rebuild_trace_entries(self, key: TraceThreadKey) -> int:
-        """Replace derived entries for one exact generation.
-
-        Args:
-            key: Exact generation whose Ledger remains authoritative.
-
-        Returns:
-            Number of reconstructed entry rows.
-
-        Raises:
-            TraceThreadNotFound: The exact generation is unavailable.
-            TraceStoreProtocolError: The Ledger changes during reconstruction.
-            TraceStoreError: Reading or replacing the derived entries fails.
-        """
+    async def rebuild_trace_graph(self, key: TraceThreadKey) -> int:
+        """Replace derived Graph nodes for one exact generation."""
 
         ...
 
@@ -515,10 +501,10 @@ def _checkpoint_lookup(
 __all__ = [
     "StoreThreadSnapshot",
     "StoreWriterSnapshot",
-    "TraceEntryRebuildStore",
-    "TraceEntryRecord",
-    "TraceEntryRecordPage",
-    "TraceEntryStore",
+    "TraceGraphNodeRecord",
+    "TraceGraphNodeRecordPage",
+    "TraceGraphRebuildStore",
+    "TraceGraphStore",
     "TraceProjectionCheckpoint",
     "TraceStore",
     "TraceThreadKey",

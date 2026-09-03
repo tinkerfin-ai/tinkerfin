@@ -33,8 +33,6 @@ def _model_config() -> AgentModelConfig:
         base_url="https://models.example.test/v1",
         api_key=SecretStr("secret"),
         reasoning_enabled=False,
-        runtime_profile="deepagents-v2",
-        updated_at="2026-08-19T00:00:00",
     )
 
 

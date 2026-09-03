@@ -40,8 +40,9 @@ from tinkerfin_studio.conversation.todo_groups import (
 )
 from tinkerfin_tracing import (
     TraceCompleteness,
-    TraceEntryKind,
-    TraceFilter,
+    TraceGraphFilter,
+    TraceGraphNodeKind,
+    TraceGraphNodeStatus,
     Tracer,
     TraceStatus,
     TraceThread,
@@ -177,9 +178,7 @@ async def _register(
         run_id=run_id,
         parent_run_id=thread.last_run_id,
         model_id="model-main",
-        runtime_profile="deepagents-v2",
         input_json={"runId": run_id},
-        config_json={"runtimeProfile": "deepagents-v2"},
     )
     thread.last_run_id = run_id
     thread.last_model = "model-main"
@@ -232,7 +231,7 @@ async def test_history_reads_fixed_trace_view_without_agui_event_tail(
     assert "events" not in payload
 
 
-async def test_trace_entry_query_returns_the_final_model_request(session) -> None:
+async def test_trace_graph_query_returns_the_final_model_request(session) -> None:
     tracer = Tracer()
     repository = ConversationRepository(session)
     thread = await _register(
@@ -276,20 +275,21 @@ async def test_trace_entry_query_returns_the_final_model_request(session) -> Non
     )
     await _finish_trace(context, trace_session)
 
-    page = await _service(repository, tracer=tracer).query_trace_entries(
+    page = await _service(repository, tracer=tracer).query_trace_graph(
         thread.thread_id,
-        where=TraceFilter(kinds={TraceEntryKind.PROVIDER}),
+        where=TraceGraphFilter(
+            kinds={TraceGraphNodeKind.MODEL},
+            include_ancestor_nodes=False,
+        ),
         cursor=None,
         limit=100,
     )
 
-    assert len(page.items) == 1
+    assert len(page.nodes) == 1
     assert len(page.turns) == 1
     assert page.turns[0].ordinal == 1
-    assert page.turns[0].user_message is not None
-    assert page.turns[0].user_message.content == "request run-entry-history"
-    assert page.items[0].turn_id == page.turns[0].id
-    assert page.items[0].request == {
+    assert page.nodes[0].turn_id == page.turns[0].id
+    assert page.nodes[0].request == {
         "messages": [
             {
                 "messageType": "system",
@@ -319,22 +319,22 @@ async def test_trace_entry_query_returns_the_final_model_request(session) -> Non
         "invocation": {"model": "gpt-test"},
         "options": {"temperature": 0.2},
     }
-    assert page.items[0].usage == {
+    assert page.nodes[0].usage == {
         "input_tokens": 2,
         "output_tokens": 1,
         "total_tokens": 3,
     }
     with pytest.raises(BusinessException) as invalid_cursor:
-        await _service(repository, tracer=tracer).query_trace_entries(
+        await _service(repository, tracer=tracer).query_trace_graph(
             thread.thread_id,
-            where=TraceFilter(),
-            cursor="not-a-trace-entry-cursor",
+            where=TraceGraphFilter(),
+            cursor="not-a-trace-graph-cursor",
             limit=100,
         )
     assert invalid_cursor.value.error_code is ConversationErrorCode.INVALID_CURSOR
 
 
-async def test_trace_entry_follow_sends_snapshot_update_and_closes(session) -> None:
+async def test_trace_graph_follow_sends_snapshot_update_and_closes(session) -> None:
     tracer = Tracer()
     repository = ConversationRepository(session)
     thread = await _register(
@@ -348,15 +348,15 @@ async def test_trace_entry_follow_sends_snapshot_update_and_closes(session) -> N
         thread_id=thread.thread_id,
         run_id="run-entry-follow",
     )
-    events = await _service(repository, tracer=tracer).follow_trace_entries(
+    events = await _service(repository, tracer=tracer).follow_trace_graph(
         thread.thread_id,
-        where=TraceFilter(kinds={TraceEntryKind.PROVIDER}),
+        where=TraceGraphFilter(kinds={TraceGraphNodeKind.MODEL}),
         limit=100,
     )
 
     snapshot = await anext(events)
     assert snapshot.type == "snapshot"
-    assert snapshot.snapshot.items == ()
+    assert snapshot.snapshot.nodes == ()
     assert snapshot.snapshot.turns == ()
     assert session.in_transaction() is False
     pending = asyncio.create_task(anext(events))
@@ -373,14 +373,19 @@ async def test_trace_entry_follow_sends_snapshot_update_and_closes(session) -> N
 
     update = await asyncio.wait_for(pending, timeout=2)
     assert update.type == "update"
-    assert [(item.kind, item.status) for item in update.update.upserts] == [
-        (TraceEntryKind.PROVIDER, "running")
-    ]
-    assert len(update.update.turn_upserts) == 1
-    assert update.update.turn_upserts[0].user_message is not None
-    assert (
-        update.update.turn_upserts[0].user_message.content == "request run-entry-follow"
+    assert any(
+        node.kind is TraceGraphNodeKind.MODEL
+        and node.status is TraceGraphNodeStatus.RUNNING
+        for node in update.update.node_upserts
     )
+    assert len(update.update.turn_upserts) == 1
+    model_node = next(
+        node
+        for node in update.update.node_upserts
+        if node.kind is TraceGraphNodeKind.MODEL
+    )
+    assert model_node.turn_id == update.update.turn_upserts[0].id
+    assert model_node.id in update.update.root_node_ids
     await events.aclose()
     await _finish_trace(context, trace_session)
 
@@ -506,14 +511,14 @@ async def test_history_rejects_another_users_thread_before_trace_lookup(
         await service.get_detail("thread-private")
 
     assert captured.value.error_code is ConversationErrorCode.NOT_FOUND
-    with pytest.raises(BusinessException) as entry_error:
-        await service.query_trace_entries(
+    with pytest.raises(BusinessException) as graph_error:
+        await service.query_trace_graph(
             "thread-private",
-            where=TraceFilter(),
+            where=TraceGraphFilter(),
             cursor=None,
             limit=100,
         )
-    assert entry_error.value.error_code is ConversationErrorCode.NOT_FOUND
+    assert graph_error.value.error_code is ConversationErrorCode.NOT_FOUND
 
 
 async def test_trace_follow_sends_snapshot_then_semantic_update_and_closes(
