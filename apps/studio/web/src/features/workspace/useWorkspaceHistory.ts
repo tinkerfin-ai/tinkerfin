@@ -326,7 +326,6 @@ export function useWorkspaceHistory({
   const prefetchedHistoryDetails = useRef(new Map<string, ConversationHistoryDetail>())
   const hydrationRequests = useRef(new Map<string, AbortController>())
   const taskTraceRequests = useRef(new Map<string, AbortController>())
-  const taskTraceFailureNotifications = useRef(new Set<number>())
   const taskTraceRequestSequence = useRef(0)
   const olderTraceRequests = useRef(new Map<string, AbortController>())
   const initialThreadId = useRef(readThreadFromLocation())
@@ -832,7 +831,6 @@ export function useWorkspaceHistory({
     } catch {
       if (!controller.signal.aborted && hydrationRequests.current.get(threadId) === controller) {
         setHydrationState({ threadId, status: 'failed' })
-        onToast('error', t('会话加载失败，请重试'))
       }
     } finally {
       if (hydrationRequests.current.get(threadId) === controller) {
@@ -842,10 +840,8 @@ export function useWorkspaceHistory({
   }, [
     followDetachedConversation,
     hydrateTaskTrace,
-    onToast,
     prepareTaskTraceOwner,
     setWorkspace,
-    t,
   ])
 
   const loadOlderTrace = useCallback(async (
@@ -978,14 +974,7 @@ export function useWorkspaceHistory({
       const conversation = workspace.conversations.find((item) => item.threadId === threadId)
       if (!ownsTaskTraceFailure(conversation, failure.identity)) {
         stale.set(threadId, failure.requestId)
-        continue
       }
-      if (
-        threadId !== workspace.currentThreadId
-        || taskTraceFailureNotifications.current.has(failure.requestId)
-      ) continue
-      taskTraceFailureNotifications.current.add(failure.requestId)
-      onToast('error', t('任务轨迹加载失败，请重试'))
     }
     if (stale.size === 0) return
     setTaskTraceLoadFailures((current) => {
@@ -997,7 +986,7 @@ export function useWorkspaceHistory({
       }
       return next ?? current
     })
-  }, [onToast, t, taskTraceLoadFailures, workspace])
+  }, [taskTraceLoadFailures, workspace])
   useEffect(() => {
     if (!workspace.currentThreadId || !selectedThreadId) return
     const needsConversation = !selectedIsHydrated
@@ -1045,7 +1034,6 @@ export function useWorkspaceHistory({
     olderTraceRequests.current.clear()
     for (const controller of taskTraceRequests.current.values()) controller.abort()
     taskTraceRequests.current.clear()
-    taskTraceFailureNotifications.current.clear()
   }, [])
 
   return {

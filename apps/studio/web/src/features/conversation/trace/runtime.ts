@@ -108,6 +108,7 @@ const applyTraceGraphDelta = (
     || new Set(delta.orderedNodeIds).size !== nodeValues.length
     || delta.orderedNodeIds.some((id) => !nodesById.has(id))
     || delta.rootNodeIds.some((id) => !nodesById.has(id))
+    || delta.matchedNodeIds.some((id) => !nodesById.has(id))
   ) throw new ConversationError('stream_event_invalid')
   const turns = applyEntityDelta(
     current.turns,
@@ -119,6 +120,7 @@ const applyTraceGraphDelta = (
     nodes: delta.orderedNodeIds.map((id) => nodesById.get(id) as TraceGraphNode),
     orderedNodeIds: [...delta.orderedNodeIds],
     rootNodeIds: [...delta.rootNodeIds],
+    matchedNodeIds: [...delta.matchedNodeIds],
     asOfSeq: delta.asOfSeq,
     facets: structuredClone(delta.facets),
     completeness: structuredClone(delta.completeness),

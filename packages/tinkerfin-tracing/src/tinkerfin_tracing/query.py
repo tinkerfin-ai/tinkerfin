@@ -906,6 +906,7 @@ async def _materialize_history_graph(
             nodes=nodes,
             ordered_node_ids=ordered_ids,
             root_node_ids=roots,
+            matched_node_ids=ordered_ids,
             as_of_seq=as_of_seq,
             facets=facets,
             completeness=TraceGraphCompleteness(

@@ -2,7 +2,6 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 
 import {
   followTraceGraph,
-  queryTraceGraphPage,
   type TraceGraphDelta,
   type TraceGraphFilter,
   type TraceGraphPage,
@@ -44,6 +43,7 @@ const applyUpdate = (
     nodes: orderedNodes,
     orderedNodeIds: update.orderedNodeIds,
     rootNodeIds: update.rootNodeIds,
+    matchedNodeIds: update.matchedNodeIds,
     facets: update.facets,
     completeness: update.completeness,
   }
@@ -53,14 +53,12 @@ export function useChainTrace({
   threadId,
   active,
   filter,
-  cursor,
-  onCursorExpired,
+  limit,
 }: {
   threadId: string
   active: boolean
   filter: TraceGraphFilter
-  cursor?: string | null
-  onCursorExpired?: () => void
+  limit: number
 }) {
   const [retryEpoch, setRetryEpoch] = useState(0)
   const [state, setState] = useState<ChainTraceState>({ phase: 'idle' })
@@ -80,19 +78,8 @@ export function useChainTrace({
 
     const load = async () => {
       try {
-        if (cursor) {
-          const page = await queryTraceGraphPage(threadId, resolvedFilter, {
-            cursor,
-            limit: 200,
-            signal: controller.signal,
-          })
-          if (!disposed && !controller.signal.aborted) {
-            setState({ phase: 'ready', page })
-          }
-          return
-        }
         for await (const event of followTraceGraph(threadId, resolvedFilter, {
-          limit: 200,
+          limit,
           signal: controller.signal,
         })) {
           if (disposed || controller.signal.aborted) return
@@ -116,8 +103,7 @@ export function useChainTrace({
         }
       } catch {
         if (!disposed && !controller.signal.aborted) {
-          if (cursor && onCursorExpired) onCursorExpired()
-          else setState({ phase: 'error' })
+          setState({ phase: 'error' })
         }
       }
     }
@@ -129,7 +115,7 @@ export function useChainTrace({
       disposed = true
       controller.abort()
     }
-  }, [active, cursor, filterKey, onCursorExpired, retryEpoch, threadId])
+  }, [active, filterKey, limit, retryEpoch, threadId])
 
   return {
     state,

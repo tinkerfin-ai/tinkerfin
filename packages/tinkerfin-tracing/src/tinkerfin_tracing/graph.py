@@ -92,8 +92,9 @@ class TraceGraphFilter(TraceModel):
         min_length=1,
         max_length=255,
         description=(
-            "Literal metadata substring; ASCII queries fold only ASCII A-Z while "
-            "queries containing non-ASCII characters are case-sensitive"
+            "Literal substring across visible metadata and retained public details; "
+            "ASCII queries fold only ASCII A-Z while queries containing non-ASCII "
+            "characters are case-sensitive"
         ),
     )
     started_after: datetime | None = Field(
@@ -332,6 +333,12 @@ class TraceGraph(TraceModel):
     nodes: tuple[TraceGraphNode, ...] = ()
     ordered_node_ids: tuple[str, ...] = ()
     root_node_ids: tuple[str, ...] = ()
+    matched_node_ids: tuple[str, ...] = Field(
+        description=(
+            "Direct filter matches in authoritative order; returned ancestors are "
+            "excluded"
+        )
+    )
     as_of_seq: int = Field(ge=1)
     facets: TraceGraphFacets = Field(default_factory=TraceGraphFacets)
     completeness: TraceGraphCompleteness = Field(default_factory=TraceGraphCompleteness)
@@ -353,6 +360,17 @@ class TraceGraph(TraceModel):
             raise ValueError("Trace Graph root node IDs must be unique")
         if not set(self.root_node_ids) <= set(node_ids):
             raise ValueError("Trace Graph roots must reference returned nodes")
+        if len(set(self.matched_node_ids)) != len(self.matched_node_ids):
+            raise ValueError("Trace Graph matched node IDs must be unique")
+        if not set(self.matched_node_ids) <= set(node_ids):
+            raise ValueError("Trace Graph matches must reference returned nodes")
+        expected_matches = tuple(
+            node_id
+            for node_id in self.ordered_node_ids
+            if node_id in set(self.matched_node_ids)
+        )
+        if self.matched_node_ids != expected_matches:
+            raise ValueError("Trace Graph matches must follow authoritative order")
         if any(
             node.parent_id is not None and node.parent_id not in set(node_ids)
             for node in self.nodes
@@ -380,8 +398,37 @@ class TraceGraphDelta(TraceModel):
     node_removes: tuple[str, ...] = ()
     ordered_node_ids: tuple[str, ...] = ()
     root_node_ids: tuple[str, ...] = ()
+    matched_node_ids: tuple[str, ...] = Field(
+        description="Complete current direct-match set in authoritative order"
+    )
     facets: TraceGraphFacets
     completeness: TraceGraphCompleteness
+
+    @model_validator(mode="after")
+    def references_follow_authoritative_order(self) -> TraceGraphDelta:
+        """Reject duplicate or out-of-order root and match references."""
+
+        ordered_ids = set(self.ordered_node_ids)
+        if len(ordered_ids) != len(self.ordered_node_ids):
+            raise ValueError("Trace Graph Delta ordered node IDs must be unique")
+        if len(set(self.root_node_ids)) != len(self.root_node_ids):
+            raise ValueError("Trace Graph Delta root node IDs must be unique")
+        if not set(self.root_node_ids) <= ordered_ids:
+            raise ValueError("Trace Graph Delta roots must reference ordered nodes")
+        if len(set(self.matched_node_ids)) != len(self.matched_node_ids):
+            raise ValueError("Trace Graph Delta matched node IDs must be unique")
+        if not set(self.matched_node_ids) <= ordered_ids:
+            raise ValueError("Trace Graph Delta matches must reference ordered nodes")
+        expected_matches = tuple(
+            node_id
+            for node_id in self.ordered_node_ids
+            if node_id in set(self.matched_node_ids)
+        )
+        if self.matched_node_ids != expected_matches:
+            raise ValueError(
+                "Trace Graph Delta matches must follow authoritative order"
+            )
+        return self
 
 
 def _omit_graph_node_details(node: TraceGraphNode) -> TraceGraphNode:
@@ -526,6 +573,7 @@ def graph_delta(
             ),
             ordered_node_ids=current.ordered_node_ids,
             root_node_ids=current.root_node_ids,
+            matched_node_ids=current.matched_node_ids,
             facets=current.facets,
             completeness=current.completeness,
         ),

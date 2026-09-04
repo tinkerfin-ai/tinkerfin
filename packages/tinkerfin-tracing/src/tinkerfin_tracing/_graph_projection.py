@@ -152,6 +152,127 @@ def _system_message_content(
     return message.get("content"), False
 
 
+def trace_graph_record_search_values(
+    record: TraceGraphNodeRecord,
+) -> tuple[JsonValue, ...]:
+    """Return decoded detail values that the corresponding public node exposes."""
+
+    start = record.started_event.fact
+    update = record.updated_event.fact
+    request_fact = None if record.request_event is None else record.request_event.fact
+    result_fact = None if record.result_event is None else record.result_event.fact
+    failure_fact = None if record.failure_event is None else record.failure_event.fact
+    values: list[JsonValue] = []
+
+    def captured(value: CapturedValue | None, *, tool: bool = False) -> None:
+        if value is None:
+            return
+        public, omitted = _captured_tool(value) if tool else _captured(value)
+        if not omitted:
+            values.append(public)
+
+    if record.kind in {
+        TraceGraphNodeKind.HUMAN_MESSAGE,
+        TraceGraphNodeKind.ASSISTANT_MESSAGE,
+    }:
+        message_fact = result_fact if isinstance(result_fact, MessageFact) else update
+        if isinstance(message_fact, MessageFact):
+            captured(message_fact.content)
+        elif not (
+            record.kind is TraceGraphNodeKind.HUMAN_MESSAGE
+            and isinstance(start, TurnFact)
+        ) and not isinstance(start, ModelCallFact):
+            raise TraceStoreProtocolError("Message Graph node fact is invalid")
+    elif record.kind is TraceGraphNodeKind.SYSTEM_MESSAGE:
+        if (
+            not isinstance(request_fact, ModelCallFact)
+            or request_fact.phase != "started"
+        ):
+            raise TraceStoreProtocolError("SystemMessage Graph node fact is invalid")
+        content, omitted = _system_message_content(record.node_id, request_fact)
+        if not omitted:
+            values.append(content)
+    elif record.kind is TraceGraphNodeKind.MODEL:
+        if (
+            not isinstance(request_fact, ModelCallFact)
+            or request_fact.phase != "started"
+        ):
+            raise TraceStoreProtocolError("Model Graph node start fact is invalid")
+        captured(request_fact.request)
+        if isinstance(failure_fact, ModelCallFact):
+            values.append(failure_fact.error_type or "model_error")
+            captured(failure_fact.error_message)
+    elif record.kind is TraceGraphNodeKind.TOOL:
+        if isinstance(request_fact, ToolExecutionFact):
+            captured(request_fact.input, tool=True)
+        elif isinstance(request_fact, ToolFact):
+            captured(request_fact.content, tool=True)
+        if isinstance(result_fact, ToolExecutionFact):
+            captured(result_fact.output, tool=True)
+        elif isinstance(result_fact, ToolFact):
+            captured(result_fact.content, tool=True)
+        if isinstance(failure_fact, ToolExecutionFact):
+            values.append(failure_fact.error_type or "tool_error")
+            captured(failure_fact.error_message)
+        elif isinstance(failure_fact, ToolFact):
+            values.append("tool_error")
+    elif record.kind in {TraceGraphNodeKind.AGENT, TraceGraphNodeKind.MIDDLEWARE}:
+        step_start = request_fact if isinstance(request_fact, AgentStepFact) else start
+        if not isinstance(step_start, AgentStepFact) or step_start.phase != "started":
+            raise TraceStoreProtocolError("Agent Graph node start fact is invalid")
+        if step_start.hook is not None:
+            values.append(step_start.hook)
+        if isinstance(failure_fact, AgentStepFact):
+            values.append(failure_fact.error_type or "agent_error")
+            captured(failure_fact.error_message)
+    elif record.kind is TraceGraphNodeKind.RUNTIME_TASK:
+        if isinstance(request_fact, RuntimeTaskFact):
+            captured(request_fact.input)
+        if isinstance(result_fact, RuntimeTaskFact):
+            captured(result_fact.result)
+        if isinstance(failure_fact, RuntimeTaskFact):
+            values.append(failure_fact.error_type or "runtime_task_error")
+        elif isinstance(failure_fact, AgentStepFact):
+            values.append(failure_fact.error_type or "runtime_task_error")
+            captured(failure_fact.error_message)
+    elif record.kind is TraceGraphNodeKind.SUBAGENT:
+        if not isinstance(request_fact, SubagentFact):
+            raise TraceStoreProtocolError("Subagent Graph node start fact is invalid")
+        captured(request_fact.input, tool=True)
+    elif record.kind is TraceGraphNodeKind.SKILL:
+        if not isinstance(request_fact, SkillFact):
+            raise TraceStoreProtocolError("Skill Graph node fact is invalid")
+        values.append(request_fact.source_path)
+    elif record.kind in {
+        TraceGraphNodeKind.MEMORY,
+        TraceGraphNodeKind.GUARDRAIL,
+        TraceGraphNodeKind.RETRIEVAL,
+        TraceGraphNodeKind.CUSTOM,
+    }:
+        if isinstance(request_fact, ContextContributionFact):
+            captured(request_fact.input)
+        if isinstance(result_fact, ContextContributionFact):
+            captured(result_fact.output)
+        if isinstance(failure_fact, ContextContributionFact):
+            values.append(failure_fact.error_type or "context_error")
+    elif record.kind is TraceGraphNodeKind.PLAN:
+        if not isinstance(result_fact, PlanRevisionFact):
+            raise TraceStoreProtocolError("Plan Graph node fact is invalid")
+        captured(result_fact.plan)
+    elif record.kind is TraceGraphNodeKind.INTERACTION:
+        if not isinstance(result_fact, InteractionFact):
+            raise TraceStoreProtocolError("Interaction Graph node fact is invalid")
+        captured(result_fact.payload)
+    elif record.kind is TraceGraphNodeKind.RUN:
+        if not isinstance(start, RunFact) or start.phase != "started":
+            raise TraceStoreProtocolError("Run Graph node start fact is invalid")
+        if isinstance(failure_fact, RunFact):
+            values.append(failure_fact.error_type or "run_error")
+            if failure_fact.code is not None:
+                values.append(failure_fact.code)
+    return tuple(values)
+
+
 def project_trace_graph_node(
     record: TraceGraphNodeRecord,
     *,
@@ -501,4 +622,5 @@ __all__ = [
     "project_trace_graph_node",
     "project_trace_graph_records",
     "reduce_trace_graph_records",
+    "trace_graph_record_search_values",
 ]

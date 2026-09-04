@@ -12,10 +12,9 @@ export { TimePicker } from './TimePicker'
 export type { TimePickerProps, TimePickerSize } from './TimePicker'
 export { ErrorBoundary } from './ErrorBoundary'
 export type { ErrorBoundaryProps, ErrorFallbackArguments } from './ErrorBoundary'
-export { FilterPicker } from './FilterPicker'
-export type { FilterPickerProps } from './FilterPicker'
 export { FilterToggle } from './FilterToggle'
 export type { FilterToggleProps } from './FilterToggle'
+export { FeedbackState } from './FeedbackState'
 export { IconButton } from './IconButton'
 export type { IconButtonProps } from './IconButton'
 export { ListboxPicker } from './ListboxPicker'
@@ -37,3 +36,9 @@ export type {
   OverlayScrollbarVisibility,
 } from './OverlayScrollbar'
 export { useThemePreference } from './useThemePreference'
+export { ViewTabs } from './ViewTabs'
+export type {
+  ViewTabOption,
+  ViewTabsDensity,
+  ViewTabsProps,
+} from './ViewTabs'

@@ -105,6 +105,7 @@ const detail = (): ConversationHistoryDetail => ({
     }],
     orderedNodeIds: ['tool-node'],
     rootNodeIds: ['tool-node'],
+    matchedNodeIds: ['tool-node'],
     asOfSeq: 8,
     facets: {
       kinds: { tool: 1 },
@@ -363,6 +364,7 @@ describe('Trace conversation projection', () => {
         nodeRemoves: ['tool-node'],
         orderedNodeIds: [],
         rootNodeIds: [],
+        matchedNodeIds: [],
         facets: {
           kinds: {},
           statuses: {},

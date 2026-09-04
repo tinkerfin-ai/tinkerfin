@@ -105,6 +105,7 @@ export interface TraceGraphPage {
   nodes: TraceGraphNode[]
   orderedNodeIds: string[]
   rootNodeIds: string[]
+  matchedNodeIds: string[]
   nextCursor: string | null
   asOfSeq: number
   facets: TraceGraphFacets
@@ -122,6 +123,7 @@ export interface TraceGraphDelta {
   nodeRemoves: string[]
   orderedNodeIds: string[]
   rootNodeIds: string[]
+  matchedNodeIds: string[]
   facets: TraceGraphFacets
   completeness: TraceGraphCompleteness
 }
@@ -243,6 +245,7 @@ const GRAPH_KEYS = new Set([
   'nodes',
   'orderedNodeIds',
   'rootNodeIds',
+  'matchedNodeIds',
   'asOfSeq',
   'facets',
   'completeness',
@@ -257,6 +260,7 @@ const DELTA_KEYS = new Set([
   'nodeRemoves',
   'orderedNodeIds',
   'rootNodeIds',
+  'matchedNodeIds',
   'facets',
   'completeness',
 ])
@@ -392,6 +396,7 @@ const parseTraceGraphValue = (
     || !Array.isArray(value.nodes)
     || !isStringArray(value.orderedNodeIds)
     || !isStringArray(value.rootNodeIds)
+    || !isStringArray(value.matchedNodeIds)
     || !Number.isSafeInteger(value.asOfSeq)
     || Number(value.asOfSeq) < 1
   ) throw new ConversationError('stream_event_invalid')
@@ -399,19 +404,28 @@ const parseTraceGraphValue = (
   const nodes = value.nodes.map(parseNode)
   const nodeIds = nodes.map((node) => node.id)
   const nodeIdSet = new Set(nodeIds)
+  const orderedNodeIds = value.orderedNodeIds
+  const rootNodeIds = value.rootNodeIds
+  const matchedNodeIds = value.matchedNodeIds
+  const matchedNodeIdSet = new Set(matchedNodeIds)
   if (!uniqueIds(nodeIds)
-    || !uniqueIds(value.orderedNodeIds)
-    || value.orderedNodeIds.length !== nodeIds.length
-    || value.orderedNodeIds.some((id) => !nodeIdSet.has(id))
-    || !uniqueIds(value.rootNodeIds)
-    || value.rootNodeIds.some((id) => !nodeIdSet.has(id))
+    || !uniqueIds(orderedNodeIds)
+    || orderedNodeIds.length !== nodeIds.length
+    || orderedNodeIds.some((id) => !nodeIdSet.has(id))
+    || !uniqueIds(rootNodeIds)
+    || rootNodeIds.some((id) => !nodeIdSet.has(id))
+    || !uniqueIds(matchedNodeIds)
+    || matchedNodeIds.some((id) => !nodeIdSet.has(id))
+    || orderedNodeIds.filter((id) => matchedNodeIdSet.has(id))
+      .some((id, index) => matchedNodeIds[index] !== id)
     || nodes.some((node) => node.parentId && !nodeIdSet.has(node.parentId))
   ) throw new ConversationError('stream_event_invalid')
   return {
     turns,
     nodes,
-    orderedNodeIds: value.orderedNodeIds,
-    rootNodeIds: value.rootNodeIds,
+    orderedNodeIds,
+    rootNodeIds,
+    matchedNodeIds,
     asOfSeq: value.asOfSeq as number,
     facets: parseFacets(value.facets),
     completeness: parseCompleteness(value.completeness),
@@ -444,8 +458,20 @@ export const parseTraceGraphDelta = (value: unknown): TraceGraphDelta => {
     || !isStringArray(value.nodeRemoves)
     || !isStringArray(value.orderedNodeIds)
     || !isStringArray(value.rootNodeIds)
-    || !uniqueIds(value.orderedNodeIds)
-    || !uniqueIds(value.rootNodeIds)
+    || !isStringArray(value.matchedNodeIds)
+  ) throw new ConversationError('stream_event_invalid')
+  const orderedNodeIds = value.orderedNodeIds
+  const rootNodeIds = value.rootNodeIds
+  const matchedNodeIds = value.matchedNodeIds
+  const orderedNodeIdSet = new Set(orderedNodeIds)
+  const matchedNodeIdSet = new Set(matchedNodeIds)
+  if (!uniqueIds(orderedNodeIds)
+    || !uniqueIds(rootNodeIds)
+    || !uniqueIds(matchedNodeIds)
+    || rootNodeIds.some((id) => !orderedNodeIdSet.has(id))
+    || matchedNodeIds.some((id) => !orderedNodeIdSet.has(id))
+    || orderedNodeIds.filter((id) => matchedNodeIdSet.has(id))
+      .some((id, index) => matchedNodeIds[index] !== id)
   ) throw new ConversationError('stream_event_invalid')
   return {
     asOfSeq: value.asOfSeq as number,
@@ -454,8 +480,9 @@ export const parseTraceGraphDelta = (value: unknown): TraceGraphDelta => {
     turnRemoves: value.turnRemoves,
     nodeUpserts: value.nodeUpserts.map(parseNode),
     nodeRemoves: value.nodeRemoves,
-    orderedNodeIds: value.orderedNodeIds,
-    rootNodeIds: value.rootNodeIds,
+    orderedNodeIds,
+    rootNodeIds,
+    matchedNodeIds,
     facets: parseFacets(value.facets),
     completeness: parseCompleteness(value.completeness),
   }
@@ -501,25 +528,23 @@ const appendFilter = (search: URLSearchParams, filter: TraceGraphFilter) => {
 const graphUrl = (
   threadId: string,
   filter: TraceGraphFilter,
-  options: { cursor?: string | null; follow: boolean; limit: number },
+  options: { follow: boolean; limit: number },
 ) => {
   const search = new URLSearchParams()
   appendFilter(search, filter)
   search.set('limit', String(options.limit))
-  if (options.cursor) search.set('cursor', options.cursor)
   const suffix = options.follow ? '/follow' : ''
   return `/api/conversation/${encodeURIComponent(threadId)}/trace/graph${suffix}?${search}`
 }
 
-export const queryTraceGraphPage = async (
+export const queryTraceGraph = async (
   threadId: string,
   filter: TraceGraphFilter,
-  options: { cursor: string; limit?: number; signal?: AbortSignal },
+  options: { limit?: number; signal?: AbortSignal } = {},
 ): Promise<TraceGraphPage> => parseTraceGraphPage(await requestJson<unknown>(
   graphUrl(threadId, filter, {
-    cursor: options.cursor,
     follow: false,
-    limit: options.limit ?? 200,
+    limit: options.limit ?? 100,
   }),
   { signal: options.signal, suppressGlobalError: true },
 ))

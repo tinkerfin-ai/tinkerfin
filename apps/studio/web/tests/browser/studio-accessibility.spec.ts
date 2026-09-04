@@ -537,6 +537,7 @@ interface MockStudioOptions {
   paginatedHistory?: boolean
   paginationPageCount?: number
   paginationResponseDelayMs?: number
+  pinError?: boolean
   planQuestion?: boolean
   planQuestionForm?: JsonObject
   planReview?: boolean
@@ -554,6 +555,7 @@ async function mockStudio(page: Page, {
   paginatedHistory = false,
   paginationPageCount = 2,
   paginationResponseDelayMs = 0,
+  pinError = false,
   planQuestion = false,
   planQuestionForm: planQuestionFormOverride,
   planReview = false,
@@ -843,6 +845,14 @@ async function mockStudio(page: Page, {
       })
       return
     }
+    if (
+      pinError
+      && route.request().method() === 'PATCH'
+      && url.pathname === `/api/conversation/${THREAD_ID}`
+    ) {
+      await route.fulfill({ status: 503, contentType: 'application/json', body: '{}' })
+      return
+    }
     if (url.pathname === '/api/conversation/history') {
       const cursor = url.searchParams.get('cursor')
       onHistoryRequest?.({ cursor, receivedAt: Date.now() })
@@ -1035,19 +1045,47 @@ test('侧栏切换控件共享纵向锚点且 tooltip 避开相邻操作区', as
   await mockStudio(page)
 
   const sidebar = page.locator('#workspace-sidebar')
+  const brand = sidebar.locator('.brand-logo')
+  const searchButton = sidebar.getByRole('button', { name: '搜索会话' }).first()
+  const conversationTab = page.getByRole('tab', { name: '对话' })
+  const traceTab = page.getByRole('tab', { name: '链路' })
   const newChat = page.getByRole('button', { name: '新会话' }).first()
   const collapseButton = page.getByRole('button', { name: '收起侧边栏' })
   const collapseTooltip = sidebar.getByRole('tooltip').filter({ hasText: '收起侧边栏' })
 
-  const collapseBounds = await collapseButton.boundingBox()
+  const [brandBounds, searchBounds, conversationTabBounds, traceTabBounds, collapseBounds] = await Promise.all([
+    brand.boundingBox(),
+    searchButton.boundingBox(),
+    conversationTab.boundingBox(),
+    traceTab.boundingBox(),
+    collapseButton.boundingBox(),
+  ])
   await collapseButton.hover()
   await expect(collapseTooltip).toBeVisible()
   const sidebarBounds = await sidebar.boundingBox()
   const newChatBounds = await newChat.boundingBox()
   const collapseTooltipBounds = await collapseTooltip.boundingBox()
-  if (!sidebarBounds || !newChatBounds || !collapseBounds || !collapseTooltipBounds) {
+  if (
+    !sidebarBounds
+    || !brandBounds
+    || !searchBounds
+    || !conversationTabBounds
+    || !traceTabBounds
+    || !newChatBounds
+    || !collapseBounds
+    || !collapseTooltipBounds
+  ) {
     throw new Error('展开侧栏切换控件几何不可用')
   }
+  const headerCenters = [
+    brandBounds,
+    searchBounds,
+    collapseBounds,
+    conversationTabBounds,
+    traceTabBounds,
+  ].map((bounds) => bounds.y + (bounds.height / 2))
+  headerCenters.forEach((center) => expect(center).toBeCloseTo(32, 5))
+  expect(newChatBounds.y).toBeCloseTo(68, 5)
   expect(collapseTooltipBounds.x).toBeGreaterThanOrEqual(sidebarBounds.x + sidebarBounds.width - 1)
   expect(
     collapseTooltipBounds.x < newChatBounds.x + newChatBounds.width
@@ -1076,6 +1114,8 @@ test('侧栏切换控件共享纵向锚点且 tooltip 避开相邻操作区', as
     (expandBounds.y + (expandBounds.height / 2))
     - (collapseBounds.y + (collapseBounds.height / 2)),
   )).toBeLessThanOrEqual(1)
+  expect(expandBounds.y + (expandBounds.height / 2)).toBeCloseTo(32, 5)
+  expect(nextRailButtonBounds.y).toBeCloseTo(newChatBounds.y, 5)
   expect(nextRailButtonBounds.y - (expandBounds.y + expandBounds.height)).toBeGreaterThanOrEqual(12)
   expect(expandTooltipBounds.y + expandTooltipBounds.height).toBeLessThanOrEqual(nextRailButtonBounds.y)
   expect(expandTooltipBounds.x).toBeGreaterThanOrEqual(railBounds.x + railBounds.width + 8)
@@ -1085,6 +1125,102 @@ test('侧栏切换控件共享纵向锚点且 tooltip 避开相邻操作区', as
     document.body.scrollWidth - document.body.clientWidth,
   ))
   expect(overflow).toBeLessThanOrEqual(0)
+})
+
+test('全局 Toast 与可恢复错误严格等宽并统一错误标记和图标式恢复', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await mockStudio(page, { pinError: true })
+
+  await page.getByRole('button', { name: '管理会话：浏览器会话' }).click()
+  await page.getByRole('button', { name: '置顶', exact: true }).click()
+  const toast = page.locator('.toast-card').filter({ hasText: '置顶状态更新失败，请重试' })
+  await expect(toast).toBeVisible()
+  await toast.hover()
+  await page.getByRole('tab', { name: '链路' }).click()
+
+  const feedback = page.locator('.ui-feedback-state[role="alert"]')
+  await expect(feedback).toContainText('链路加载失败')
+  const retry = feedback.getByRole('button', { name: '重试' })
+  const geometry = await page.evaluate(() => {
+    const toastCard = document.querySelector<HTMLElement>('.toast-card')!
+    const feedbackState = document.querySelector<HTMLElement>('.ui-feedback-state[role="alert"]')!
+    const retryButton = feedbackState.querySelector<HTMLElement>('button[aria-label="重试"]')!
+    const toastMark = toastCard.querySelector<HTMLElement>('.ui-feedback-icon__mark')!
+    const feedbackMark = feedbackState.querySelector<HTMLElement>('.ui-feedback-icon__mark')!
+    const retryStyle = getComputedStyle(retryButton)
+    return {
+      toastWidth: toastCard.getBoundingClientRect().width,
+      toastHeight: toastCard.getBoundingClientRect().height,
+      feedbackWidth: feedbackState.getBoundingClientRect().width,
+      feedbackHeight: feedbackState.getBoundingClientRect().height,
+      retryWidth: retryButton.getBoundingClientRect().width,
+      retryHeight: retryButton.getBoundingClientRect().height,
+      retryBorder: retryStyle.borderTopWidth,
+      retryBackground: retryStyle.backgroundColor,
+      retryShadow: retryStyle.boxShadow,
+      toastMark: toastMark.textContent,
+      feedbackMark: feedbackMark.textContent,
+      toastCircle: Boolean(toastCard.querySelector('.ui-feedback-icon circle')),
+      feedbackCircle: Boolean(feedbackState.querySelector('.ui-feedback-icon circle')),
+    }
+  })
+  expect(geometry).toEqual({
+    toastWidth: 288,
+    toastHeight: 48,
+    feedbackWidth: 288,
+    feedbackHeight: 48,
+    retryWidth: 44,
+    retryHeight: 44,
+    retryBorder: '0px',
+    retryBackground: 'rgba(0, 0, 0, 0)',
+    retryShadow: 'none',
+    toastMark: '!',
+    feedbackMark: '!',
+    toastCircle: false,
+    feedbackCircle: false,
+  })
+  await expect(retry.locator('.ui-button__label')).toHaveCount(0)
+  await toast.getByRole('button').focus()
+
+  for (const colorScheme of ['light', 'dark'] as const) {
+    await page.emulateMedia({ colorScheme })
+    await page.evaluate((theme) => {
+      document.documentElement.dataset.theme = theme
+    }, colorScheme)
+    for (const width of [320, 768, 1024, 1440]) {
+      await page.setViewportSize({ width, height: 900 })
+      const responsive = await page.evaluate(() => {
+        const toastCard = document.querySelector<HTMLElement>('.toast-card')!
+        const feedbackState = document.querySelector<HTMLElement>('.ui-feedback-state[role="alert"]')!
+        return {
+          toastWidth: toastCard.getBoundingClientRect().width,
+          toastHeight: toastCard.getBoundingClientRect().height,
+          feedbackWidth: feedbackState.getBoundingClientRect().width,
+          feedbackHeight: feedbackState.getBoundingClientRect().height,
+          overflow: Math.max(
+            document.documentElement.scrollWidth - document.documentElement.clientWidth,
+            document.body.scrollWidth - document.body.clientWidth,
+          ),
+        }
+      })
+      expect(responsive).toEqual({
+        toastWidth: 288,
+        toastHeight: 48,
+        feedbackWidth: 288,
+        feedbackHeight: 48,
+        overflow: 0,
+      })
+      if (width === 1440 && process.env.TINKERFIN_VISUAL_QA_DIR) {
+        await page.screenshot({
+          path: resolve(
+            process.env.TINKERFIN_VISUAL_QA_DIR,
+            `feedback-system-${colorScheme}-1440.png`,
+          ),
+          fullPage: true,
+        })
+      }
+    }
+  }
 })
 
 test('首页与会话态使用相同的输入卡片高度', async ({ page }) => {

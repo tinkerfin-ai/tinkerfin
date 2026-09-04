@@ -10,6 +10,7 @@ export interface DrawerHeaderProps {
   closeLabel?: string
   onClose?: () => void
   className?: string
+  density?: 'regular' | 'compact'
 }
 
 export const DrawerHeader = forwardRef<HTMLButtonElement, DrawerHeaderProps>(function DrawerHeader({
@@ -18,9 +19,11 @@ export const DrawerHeader = forwardRef<HTMLButtonElement, DrawerHeaderProps>(fun
   closeLabel,
   onClose,
   className,
+  density = 'regular',
 }, ref) {
   const classes = [
     'ui-drawer-header',
+    `ui-drawer-header--${density}`,
     description ? 'has-description' : '',
     className,
   ].filter(Boolean).join(' ')

@@ -5,7 +5,7 @@ import {
   followTraceGraph,
   parseTraceGraph,
   parseTraceGraphPage,
-  queryTraceGraphPage,
+  queryTraceGraph,
   type TraceGraphPage,
 } from './traceGraph'
 
@@ -66,6 +66,7 @@ const page = (): TraceGraphPage => ({
   ],
   orderedNodeIds: ['human-1', 'model-call'],
   rootNodeIds: ['human-1'],
+  matchedNodeIds: ['model-call'],
   nextCursor: null,
   asOfSeq: 8,
   facets: {
@@ -133,6 +134,7 @@ describe('Trace Graph client', () => {
       expect(url.searchParams.get('query')).toBe('deepseek')
       expect(url.searchParams.get('includeTechnicalNodes')).toBe('true')
       expect(url.searchParams.get('includeAncestorNodes')).toBe('true')
+      expect(url.searchParams.get('limit')).toBe('1000')
       return eventStream({ type: 'snapshot', snapshot: page() })
     }))
 
@@ -145,30 +147,32 @@ describe('Trace Graph client', () => {
       query: 'deepseek',
       includeTechnicalNodes: true,
       includeAncestorNodes: true,
-    })) events.push(event)
+    }, { limit: 1000 })) events.push(event)
 
     expect(events[0]).toHaveProperty('snapshot.nodes.0.name', 'HumanMessage')
   })
 
-  it('loads an older fixed page through its opaque cursor', async () => {
+  it('queries one model response from the direct Graph route', async () => {
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = input instanceof Request
         ? input
         : new Request(new URL(String(input), window.location.origin), init)
       const url = new URL(request.url)
       expect(url.pathname).toBe('/api/conversation/thread-1/trace/graph')
-      expect(url.searchParams.get('cursor')).toBe('older-page')
-      expect(url.searchParams.get('limit')).toBe('200')
+      expect(url.searchParams.get('parentId')).toBe('model-call')
+      expect(url.searchParams.getAll('kind')).toEqual(['assistant_message', 'tool'])
+      expect(url.searchParams.get('includeAncestorNodes')).toBe('false')
+      expect(url.searchParams.get('limit')).toBe('1000')
       return new Response(JSON.stringify({ code: 0, message: 'ok', data: page() }), {
         headers: { 'Content-Type': 'application/json' },
       })
     }))
 
-    const result = await queryTraceGraphPage(
-      'thread-1',
-      { includeAncestorNodes: true },
-      { cursor: 'older-page' },
-    )
+    const result = await queryTraceGraph('thread-1', {
+      parentId: 'model-call',
+      kinds: ['assistant_message', 'tool'],
+      includeAncestorNodes: false,
+    }, { limit: 1000 })
 
     expect(result.nodes[0]?.name).toBe('HumanMessage')
   })
@@ -187,6 +191,7 @@ describe('Trace Graph client', () => {
           nodeRemoves: ['model-call'],
           orderedNodeIds: ['human-1'],
           rootNodeIds: ['human-1'],
+          matchedNodeIds: [],
           facets: { ...page().facets, kinds: { human_message: 1 } },
           completeness: page().completeness,
         },
@@ -233,6 +238,14 @@ describe('Trace Graph client', () => {
     const invalidOrder = page()
     invalidOrder.orderedNodeIds = ['model-call']
     expect(() => parseTraceGraphPage(invalidOrder)).toThrow()
+
+    const invalidMatch = page()
+    invalidMatch.matchedNodeIds = ['unknown']
+    expect(() => parseTraceGraphPage(invalidMatch)).toThrow()
+
+    const invalidMatchOrder = page()
+    invalidMatchOrder.matchedNodeIds = ['model-call', 'human-1']
+    expect(() => parseTraceGraphPage(invalidMatchOrder)).toThrow()
 
     const invalidParent = page()
     invalidParent.nodes[1].parentId = 'unknown'

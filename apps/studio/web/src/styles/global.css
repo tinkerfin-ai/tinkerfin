@@ -164,24 +164,6 @@
     color: var(--color-brand);
   }
 
-  .app-error-fallback > div {
-    width: min(100%, 420px);
-    text-align: center;
-  }
-
-  .app-error-fallback h1 {
-    margin: 0 0 var(--space-3);
-    font-size: var(--type-h2-size);
-    line-height: var(--type-h2-line);
-  }
-
-  .app-error-fallback p {
-    margin: 0 0 var(--space-5);
-    color: var(--color-text-secondary);
-    font-size: var(--type-ui-size);
-    line-height: var(--type-ui-line);
-  }
-
   @keyframes global-state-spin {
     to { transform: rotate(360deg); }
   }

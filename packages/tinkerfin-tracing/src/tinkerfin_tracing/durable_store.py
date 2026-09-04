@@ -5,13 +5,16 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from collections.abc import AsyncGenerator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Literal
 from uuid import uuid4
 
+from pydantic import JsonValue
+
 from tinkerfin_contracts import RunIdentity
 
+from ._graph_projection import trace_graph_record_search_values
 from ._graph_reducer import (
     ReducedTraceGraphNode,
     ReducedTraceGraphRevision,
@@ -508,7 +511,7 @@ class DurableTraceStore:
         before_started_at: datetime | None = None,
         before_node_id: str | None = None,
     ) -> TraceGraphNodeRecordPage:
-        """Query indexed Graph metadata and decode only referenced facts."""
+        """Apply metadata and content predicates before returning one Graph page."""
 
         self._validate_key(key)
         if not isinstance(where, TraceGraphFilter):
@@ -519,6 +522,42 @@ class DurableTraceStore:
                 "Trace Store backend does not provide indexed Graph queries"
             )
         await self.setup()
+        if where.search is not None:
+            return await self._query_searched_trace_graph(
+                backend,
+                key,
+                run_ids=run_ids,
+                where=where,
+                limit=limit,
+                max_nodes=max_nodes,
+                before_started_at=before_started_at,
+                before_node_id=before_node_id,
+            )
+        return await self._query_trace_graph_records(
+            backend,
+            key,
+            run_ids=run_ids,
+            where=where,
+            limit=limit,
+            max_nodes=max_nodes,
+            before_started_at=before_started_at,
+            before_node_id=before_node_id,
+        )
+
+    async def _query_trace_graph_records(
+        self,
+        backend: TraceGraphQueryBackend,
+        key: TraceThreadKey,
+        *,
+        run_ids: tuple[str, ...],
+        where: TraceGraphFilter,
+        limit: int,
+        max_nodes: int,
+        node_ids: tuple[str, ...] = (),
+        include_facets: bool = True,
+        before_started_at: datetime | None = None,
+        before_node_id: str | None = None,
+    ) -> TraceGraphNodeRecordPage:
         stored = await backend.query_trace_graph(
             TraceGraphQueryRequest(
                 key=key,
@@ -526,6 +565,8 @@ class DurableTraceStore:
                 where=where,
                 limit=limit,
                 total_limit=max_nodes,
+                node_ids=node_ids,
+                include_facets=include_facets,
                 before_started_at=before_started_at,
                 before_node_id=before_node_id,
             )
@@ -534,6 +575,38 @@ class DurableTraceStore:
             raise TraceStoreProtocolError(
                 "Trace Graph page belongs to another generation"
             )
+        stored_node_ids = tuple(item.node_id for item in stored.nodes)
+        if (
+            len(set(stored.matched_node_ids)) != len(stored.matched_node_ids)
+            or not set(stored.matched_node_ids) <= set(stored_node_ids)
+            or tuple(
+                node_id
+                for node_id in stored_node_ids
+                if node_id in set(stored.matched_node_ids)
+            )
+            != stored.matched_node_ids
+        ):
+            raise TraceStoreProtocolError(
+                "Trace Graph direct matches conflict with returned rows"
+            )
+
+        stored_events: dict[int, StoredTraceEvent] = {}
+        decoded_events: dict[int, TraceEvent] = {}
+
+        def decode_required(event: StoredTraceEvent, sequence: int) -> TraceEvent:
+            existing = stored_events.get(sequence)
+            if existing is not None and existing != event:
+                raise TraceStoreProtocolError(
+                    "Trace Graph locators disagree on one Ledger event"
+                )
+            stored_events[sequence] = event
+            decoded = decoded_events.get(sequence)
+            if decoded is None:
+                decoded = self._decode_graph_event(
+                    event, key=key, expected_seq=sequence
+                )
+                decoded_events[sequence] = decoded
+            return decoded
 
         def decode_optional(
             event: StoredTraceEvent | None,
@@ -545,7 +618,7 @@ class DurableTraceStore:
                         "Trace Graph optional fact locator is incomplete"
                     )
                 return None
-            return self._decode_graph_event(event, key=key, expected_seq=sequence)
+            return decode_required(event, sequence)
 
         return TraceGraphNodeRecordPage(
             key=stored.key,
@@ -571,16 +644,8 @@ class DurableTraceStore:
                     result_seq=item.result_seq,
                     failure_seq=item.failure_seq,
                     link_issue=item.link_issue,
-                    started_event=self._decode_graph_event(
-                        item.started_event,
-                        key=key,
-                        expected_seq=item.started_seq,
-                    ),
-                    updated_event=self._decode_graph_event(
-                        item.updated_event,
-                        key=key,
-                        expected_seq=item.updated_seq,
-                    ),
+                    started_event=decode_required(item.started_event, item.started_seq),
+                    updated_event=decode_required(item.updated_event, item.updated_seq),
                     request_event=decode_optional(
                         item.request_event,
                         item.request_seq,
@@ -596,11 +661,129 @@ class DurableTraceStore:
                 )
                 for item in stored.nodes
             ),
+            matched_node_ids=stored.matched_node_ids,
             facets=stored.facets.model_copy(deep=True),
             has_more=stored.has_more,
             next_started_at=stored.next_started_at,
             next_node_id=stored.next_node_id,
             call_tracking_present=stored.call_tracking_present,
+        )
+
+    async def _query_searched_trace_graph(
+        self,
+        backend: TraceGraphQueryBackend,
+        key: TraceThreadKey,
+        *,
+        run_ids: tuple[str, ...],
+        where: TraceGraphFilter,
+        limit: int,
+        max_nodes: int,
+        before_started_at: datetime | None,
+        before_node_id: str | None,
+    ) -> TraceGraphNodeRecordPage:
+        search = where.search
+        if search is None:  # pragma: no cover - private caller contract
+            raise ValueError("searched Graph query requires search text")
+        candidate_where = where.model_copy(
+            update={
+                "kinds": frozenset(),
+                "statuses": frozenset(),
+                "agent_names": frozenset(),
+                "middleware_names": frozenset(),
+                "skill_names": frozenset(),
+                "providers": frozenset(),
+                "models": frozenset(),
+                "search": None,
+                "include_ancestor_nodes": False,
+            },
+            deep=True,
+        )
+        candidates = await self._query_trace_graph_records(
+            backend,
+            key,
+            run_ids=run_ids,
+            where=candidate_where,
+            limit=max_nodes + 1,
+            max_nodes=max_nodes + 1,
+            include_facets=False,
+        )
+        if candidates.has_more or len(candidates.matched_node_ids) > max_nodes:
+            raise TraceQuotaExceeded(
+                "Trace Graph content search exceeds max_total_nodes",
+                context={"resource": "graph_search_nodes"},
+            )
+        records_by_id = {record.node_id: record for record in candidates.nodes}
+        ordered_candidates = tuple(
+            records_by_id[node_id] for node_id in candidates.matched_node_ids
+        )
+        content_matches = tuple(
+            record
+            for record in ordered_candidates
+            if _graph_record_contains(record, search)
+        )
+        metadata_where = where.model_copy(update={"search": None}, deep=True)
+        facets = _graph_facets(content_matches, metadata_where)
+        direct = [
+            record
+            for record in content_matches
+            if _graph_node_matches(record, metadata_where)
+        ]
+        if before_started_at is not None:
+            if before_node_id is None:  # pragma: no cover - public cursor validation
+                raise ValueError("Graph cursor requires a node ID")
+            cursor = (before_started_at, _node_order_key(before_node_id))
+            direct = [
+                record
+                for record in direct
+                if (record.started_at, _node_order_key(record.node_id)) < cursor
+            ]
+        has_more = len(direct) > limit
+        selected = direct[:limit]
+        selected_ids = tuple(record.node_id for record in selected)
+        cursor_record = selected[-1] if has_more and selected else None
+        if not selected_ids:
+            return TraceGraphNodeRecordPage(
+                key=key,
+                as_of_seq=candidates.as_of_seq,
+                nodes=(),
+                matched_node_ids=(),
+                facets=facets,
+                has_more=False,
+                next_started_at=None,
+                next_node_id=None,
+                call_tracking_present=candidates.call_tracking_present,
+            )
+        exact_where = TraceGraphFilter(
+            include_technical_nodes=where.include_technical_nodes,
+            include_ancestor_nodes=where.include_ancestor_nodes,
+        )
+        exact = await self._query_trace_graph_records(
+            backend,
+            key,
+            run_ids=run_ids,
+            where=exact_where,
+            limit=len(selected_ids),
+            max_nodes=max_nodes,
+            node_ids=selected_ids,
+            include_facets=False,
+        )
+        if (
+            exact.as_of_seq != candidates.as_of_seq
+            or exact.has_more
+            or set(exact.matched_node_ids) != set(selected_ids)
+        ):
+            raise TraceStoreProtocolError(
+                "Trace Graph content matches changed during one Store query"
+            )
+        return replace(
+            exact,
+            matched_node_ids=selected_ids,
+            facets=facets,
+            has_more=has_more,
+            next_started_at=(
+                None if cursor_record is None else cursor_record.started_at
+            ),
+            next_node_id=None if cursor_record is None else cursor_record.node_id,
         )
 
     async def rebuild_trace_graph(self, key: TraceThreadKey) -> int:
@@ -1030,14 +1213,22 @@ class _InMemoryTraceLedgerBackend:
                 row for row in thread.graph_nodes.values() if row.run_id in run_ids
             ]
             candidates = effective_graph_nodes(revisions, run_ids=run_ids)
+            requested_node_ids = frozenset(request.node_ids)
             matching = [
-                row for row in candidates if _graph_node_matches(row, request.where)
+                row
+                for row in candidates
+                if (not requested_node_ids or row.node_id in requested_node_ids)
+                and _graph_node_matches(row, request.where)
             ]
             matching.sort(
                 key=lambda row: (row.started_at, _node_order_key(row.node_id)),
                 reverse=True,
             )
-            facets = _graph_facets(candidates, request.where)
+            facets = (
+                _graph_facets(candidates, request.where)
+                if request.include_facets
+                else TraceGraphFacets()
+            )
             if request.before_started_at is not None:
                 if request.before_node_id is None:
                     raise ValueError("Graph cursor requires a node ID")
@@ -1052,6 +1243,7 @@ class _InMemoryTraceLedgerBackend:
                 ]
             has_more = len(matching) > request.limit
             selected = matching[: request.limit]
+            matched_node_ids = tuple(row.node_id for row in selected)
             cursor_row = selected[-1] if has_more and selected else None
             result_rows: dict[str, ReducedTraceGraphNode] = {
                 row.node_id: row for row in selected
@@ -1103,6 +1295,7 @@ class _InMemoryTraceLedgerBackend:
                         reverse=True,
                     )
                 ),
+                matched_node_ids=matched_node_ids,
                 facets=facets,
                 has_more=has_more,
                 next_started_at=(None if cursor_row is None else cursor_row.started_at),
@@ -1354,7 +1547,7 @@ def _memory_stored_event(
 
 
 def _graph_node_matches(
-    row: ReducedTraceGraphNode,
+    row: ReducedTraceGraphNode | TraceGraphNodeRecord,
     where: TraceGraphFilter,
     *,
     exclude: Literal[
@@ -1368,13 +1561,10 @@ def _graph_node_matches(
     ]
     | None = None,
 ) -> bool:
-    search = where.search
-    case_insensitive_search = search is not None and search.isascii()
-    search_needle = (
-        search.translate(_ASCII_LOWER_TRANSLATION)
-        if search is not None and case_insensitive_search
-        else search
-    )
+    if where.search is not None:
+        raise ValueError(
+            "Graph content search must be resolved before metadata filters"
+        )
     if (
         not where.include_technical_nodes
         and row.kind in TECHNICAL_TRACE_GRAPH_NODE_KINDS
@@ -1416,26 +1606,14 @@ def _graph_node_matches(
         )
         or (where.models and exclude != "models" and row.model not in where.models)
         or (where.namespaces and row.namespace not in where.namespaces)
-        or (
-            search_needle is not None
-            and not any(
-                search_needle
-                in (
-                    value.translate(_ASCII_LOWER_TRANSLATION)
-                    if case_insensitive_search
-                    else value
-                )
-                for value in (row.name, row.agent_name, row.provider, row.model)
-                if value is not None
-            )
-        )
         or (where.started_after is not None and row.started_at <= where.started_after)
         or (where.started_before is not None and row.started_at >= where.started_before)
     )
 
 
 def _graph_facets(
-    rows: list[ReducedTraceGraphNode] | tuple[ReducedTraceGraphNode, ...],
+    rows: list[ReducedTraceGraphNode | TraceGraphNodeRecord]
+    | tuple[ReducedTraceGraphNode | TraceGraphNodeRecord, ...],
     where: TraceGraphFilter,
 ) -> TraceGraphFacets:
     kinds: dict[TraceGraphNodeKind, int] = {}
@@ -1489,6 +1667,50 @@ def _graph_facets(
         providers=providers,
         models=models,
     )
+
+
+def _graph_record_contains(record: TraceGraphNodeRecord, search: str) -> bool:
+    """Match visible metadata and decoded public details with one literal rule."""
+
+    case_insensitive = search.isascii()
+    needle = search.translate(_ASCII_LOWER_TRANSLATION) if case_insensitive else search
+    values = (
+        record.name,
+        record.agent_name,
+        record.provider,
+        record.model,
+        *(
+            text
+            for value in trace_graph_record_search_values(record)
+            for text in _json_search_values(value)
+        ),
+    )
+    return any(
+        needle
+        in (value.translate(_ASCII_LOWER_TRANSLATION) if case_insensitive else value)
+        for value in values
+        if value is not None
+    )
+
+
+def _json_search_values(value: JsonValue) -> tuple[str, ...]:
+    if isinstance(value, dict):
+        return tuple(
+            text
+            for key, child in value.items()
+            for text in (key, *_json_search_values(child))
+        )
+    if isinstance(value, list):
+        return tuple(text for child in value for text in _json_search_values(child))
+    if isinstance(value, str):
+        return (value,)
+    if value is None:
+        return ("null",)
+    if isinstance(value, bool):
+        return ("true" if value else "false",)
+    if isinstance(value, (int, float)):
+        return (str(value),)
+    raise TraceStoreProtocolError("Trace Graph detail contains a non-JSON value")
 
 
 def _stored_memory_graph_node(

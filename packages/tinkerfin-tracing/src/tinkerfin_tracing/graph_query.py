@@ -197,6 +197,12 @@ class TraceGraphQuery:
         return self._page.root_node_ids
 
     @property
+    def matched_node_ids(self) -> tuple[str, ...]:
+        """Return directly matched nodes in authoritative visible order."""
+
+        return self._page.matched_node_ids
+
+    @property
     def next_cursor(self) -> str | None:
         """Return the cursor for the next older matching page."""
 
@@ -245,6 +251,7 @@ class TraceGraphQuery:
                         or delta.node_removes
                         or current.ordered_node_ids != previous.ordered_node_ids
                         or current.root_node_ids != previous.root_node_ids
+                        or current.matched_node_ids != previous.matched_node_ids
                         or current.facets != previous.facets
                         or current.completeness != previous.completeness
                         or current.next_cursor != previous.next_cursor

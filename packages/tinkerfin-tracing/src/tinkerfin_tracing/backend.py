@@ -165,6 +165,8 @@ class TraceGraphQueryRequest:
     where: TraceGraphFilter
     limit: int
     total_limit: int = 4000
+    node_ids: tuple[str, ...] = ()
+    include_facets: bool = True
     before_started_at: datetime | None = None
     before_node_id: str | None = None
 
@@ -179,6 +181,16 @@ class TraceGraphQueryRequest:
             raise ValueError("Graph page limit must be positive")
         if self.total_limit < self.limit:
             raise ValueError("Graph total limit must include every direct match")
+        if self.where.search is not None:
+            raise ValueError("Graph content search must be resolved by the Trace Store")
+        if not isinstance(self.include_facets, bool):
+            raise TypeError("include_facets must be a boolean")
+        if len(set(self.node_ids)) != len(self.node_ids):
+            raise ValueError("Graph node IDs must be unique")
+        if len(self.node_ids) > self.limit:
+            raise ValueError("Graph node ID selection must fit the direct page limit")
+        if any(not value or value != value.strip() for value in self.node_ids):
+            raise ValueError("Graph node IDs must be canonical non-empty text")
         if (self.before_started_at is None) != (self.before_node_id is None):
             raise ValueError("Graph cursor time and node ID must be supplied together")
         if self.before_started_at is not None and (
@@ -205,6 +217,7 @@ class StoredTraceGraphPage:
     key: TraceThreadKey
     as_of_seq: int
     nodes: tuple[StoredTraceGraphNode, ...]
+    matched_node_ids: tuple[str, ...]
     facets: TraceGraphFacets
     has_more: bool
     next_started_at: datetime | None

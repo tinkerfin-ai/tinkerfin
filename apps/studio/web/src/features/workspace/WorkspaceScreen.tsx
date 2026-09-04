@@ -1,11 +1,16 @@
-import { Route } from 'lucide-react'
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 
 import type { AgentMode, ChatRequestPayload } from '../../api/conversation/types'
 import type { TodoGroup } from '../../api/conversation/taskTrace'
 import { conversationErrorMessage } from '../../api/conversation/errors'
 import type { AuthUser } from '../../api/auth/types'
-import { Button, ErrorBoundary, useThemePreference } from '../../components/ui'
+import {
+  Button,
+  ErrorBoundary,
+  FeedbackState,
+  useThemePreference,
+  ViewTabs,
+} from '../../components/ui'
 import type { ToastKind } from '../../components/ui/ToastViewport'
 import { useI18n } from '../../i18n'
 import {
@@ -25,8 +30,6 @@ import {
 import { EmptyConversationBrand } from './components/EmptyConversation'
 import { WorkspaceDialogs } from './components/WorkspaceDialogs'
 import { WorkspaceHeader } from './components/WorkspaceHeader'
-import { WorkspaceStatus } from './components/WorkspaceStatus'
-import { ChainTraceErrorFallback } from './components/ChainTraceErrorFallback'
 import { ScrollToBottomButton } from './components/ScrollToBottomButton'
 import { SettingsDialog } from '../settings/SettingsDialog'
 import { useWorkspaceNavigation } from './useWorkspaceNavigation'
@@ -137,8 +140,6 @@ export function WorkspaceScreen({
   const [pendingResume, setPendingResume] = useState<PendingResume | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [workspaceView, setWorkspaceView] = useState<'conversation' | 'trace'>('conversation')
-  const [chainTraceHeaderTarget, setChainTraceHeaderTarget] = useState<HTMLDivElement | null>(null)
-  const chainTraceLauncherRef = useRef<HTMLButtonElement>(null)
   const settingsRestoreFocus = useRef<HTMLElement | null>(null)
   const theme = useThemePreference()
   const navigation = useWorkspaceNavigation()
@@ -846,31 +847,13 @@ export function WorkspaceScreen({
       onRetry={() => retryTaskTrace(conversation.threadId)}
     />
   )
-  const returnToConversation = () => {
-    setWorkspaceView('conversation')
-    window.requestAnimationFrame(() => chainTraceLauncherRef.current?.focus())
+  const selectWorkspaceView = (view: 'conversation' | 'trace') => {
+    if (view === 'trace') {
+      if (!conversation.threadId) return
+      taskDrawer.close(false)
+    }
+    setWorkspaceView(view)
   }
-  const chainTraceLauncher = conversation.threadId ? (
-    <button
-      ref={chainTraceLauncherRef}
-      type="button"
-      className="composer-auxiliary-control composer-trace-launcher chain-trace-launcher"
-      aria-label={t('链路分析')}
-      onClick={() => {
-        taskDrawer.close(false)
-        setWorkspaceView('trace')
-      }}
-    >
-      <Route size={16} aria-hidden="true" />
-      <span>{t('链路分析')}</span>
-    </button>
-  ) : undefined
-  const conversationAuxiliaryActions = chainTraceLauncher || taskTraceLauncher ? (
-    <>
-      {chainTraceLauncher}
-      {taskTraceLauncher}
-    </>
-  ) : undefined
 
   return (
     <div
@@ -931,14 +914,23 @@ export function WorkspaceScreen({
           conversationTitle={conversation.title}
           overlayTriggerRef={navigation.overlayTriggerRef}
           onOpenOverlay={navigation.openOverlay}
-          actions={workspaceView === 'trace' ? (
-            <div
-              ref={setChainTraceHeaderTarget}
-              className="chain-trace-header-controls"
-              role="group"
-              aria-label={t('链路筛选')}
+          navigation={(
+            <ViewTabs
+              value={workspaceView}
+              label={t('会话视图')}
+              options={[
+                { value: 'conversation', label: t('对话'), controls: 'conversation-panel' },
+                {
+                  value: 'trace',
+                  label: t('链路'),
+                  controls: 'chain-trace-panel',
+                  disabled: !conversation.threadId,
+                },
+              ]}
+              onChange={selectWorkspaceView}
+              className="workspace-view-tabs"
             />
-          ) : undefined}
+          )}
           backgroundInert={taskDrawer.modalActive}
         />
         {workspaceView === 'conversation' ? (
@@ -1024,7 +1016,7 @@ export function WorkspaceScreen({
                   />
                 )
                 : undefined}
-              taskTraceControl={taskDrawer.modalActive ? undefined : conversationAuxiliaryActions}
+              taskTraceControl={taskDrawer.modalActive ? undefined : taskTraceLauncher}
               backgroundInert={taskDrawer.modalActive}
               modelControl={(
                 <ComposerModelPicker
@@ -1069,17 +1061,14 @@ export function WorkspaceScreen({
           <ErrorBoundary
             resetKey={`${conversation.threadId || 'draft'}:chain-trace`}
             fallback={({ reset }) => (
-              <ChainTraceErrorFallback
-                onReturn={returnToConversation}
-                onRetry={reset}
-              />
+              <div className="chain-trace-state">
+                <FeedbackState kind="error" title={t('链路区域无法显示')} onRetry={reset} />
+              </div>
             )}
           >
             <ChainTraceView
               threadId={conversation.threadId}
               active={workspaceView === 'trace'}
-              headerTarget={chainTraceHeaderTarget}
-              onReturnToConversation={returnToConversation}
             />
           </ErrorBoundary>
         )}
@@ -1097,7 +1086,7 @@ export function WorkspaceScreen({
         resetKey={`${conversation.threadId || 'draft'}:${taskDrawer.open ? 'open' : 'closed'}`}
         fallback={({ reset }) => taskDrawer.open ? (
           <aside ref={taskDrawer.drawerRef} id="todo-trace-drawer" className="todo-trace-drawer is-open todo-trace-error" aria-label={t('任务轨迹无法显示')}>
-            <WorkspaceStatus kind="error" title={t('任务轨迹无法显示')} description={t('对话内容未受影响，可以重试或关闭任务轨迹')} onRetry={reset} compact />
+            <FeedbackState kind="error" title={t('任务轨迹无法显示')} onRetry={reset} compact />
             <Button onClick={() => taskDrawer.close(true)}>{t('关闭任务轨迹')}</Button>
           </aside>
         ) : null}

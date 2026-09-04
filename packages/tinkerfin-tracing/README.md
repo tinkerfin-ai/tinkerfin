@@ -49,7 +49,7 @@ graph = await tracer.query(
         kinds={TraceGraphNodeKind.MODEL, TraceGraphNodeKind.TOOL},
     ),
 )
-print(graph.turns, graph.nodes, graph.ordered_node_ids)
+print(graph.turns, graph.nodes, graph.matched_node_ids)
 ```
 
 `TinkerFin.ainvoke()` and managed stream entry points open the same observation
@@ -59,27 +59,33 @@ does not automatically create a complete Trace.
 ## Canonical Graph
 
 Each user Turn is rooted at its existing HumanMessage. Model calls link to
-AssistantMessage nodes by stable provider output message IDs. SystemMessage and
-ToolMessage nodes remain available as technical evidence. One logical Tool node combines
-its proposal, actual post-review execution, and result without duplicating payloads.
+AssistantMessage nodes by stable provider output message IDs. SystemMessage remains
+available as technical evidence. One logical Tool node combines its proposal, actual
+post-review execution, ToolMessage result, and failure without duplicating payloads.
 
 `TraceGraphFilter` supports kind, status, parent, Agent, middleware, Skill, provider,
-model, graph namespace, time, and literal text predicates. Technical nodes are hidden by
-default. `include_technical_nodes=True` includes them, while
+model, graph namespace, time, and literal text predicates over visible metadata and
+retained public details. Technical nodes are hidden by default.
+`include_technical_nodes=True` includes them, while
 `include_ancestor_nodes=True` asks the framework to return and reconnect visible
 ancestors.
 
-`TraceGraphQuery.snapshot` returns the complete current page. `follow()` is available
-only on the current first page and publishes `TraceGraphDelta` values with complete
-authoritative node order, roots, and the current older-page cursor. A pagination cursor
-is bound to its namespace, thread, generation, selected head, filter, and Ledger tail;
-a newer commit replaces the live cursor and invalidates any previously issued cursor
-instead of silently changing its page.
+`TraceGraphQuery.matched_node_ids` identifies only the current page's direct matches in
+authoritative order. `nodes` may additionally contain ancestors needed to preserve the
+execution path. `follow()` is available only on the current first page and publishes
+`TraceGraphDelta` values with complete authoritative node order, roots, matches, and the
+current older-page cursor. A pagination cursor is bound to its namespace, thread,
+generation, selected head, filter, and Ledger tail; a newer commit replaces the live
+cursor and invalidates any previously issued cursor instead of silently changing its
+page.
 
-`TraceGraphQueryLimits` independently bounds direct matches, expanded nodes, and
-serialized page/update bytes. When only details exceed the byte budget, the framework
-keeps the graph structure and marks content, request, or result values as omitted. A
-structure-only page that still exceeds the budget fails with `TraceQuotaExceeded`.
+`TraceGraphQueryLimits` independently bounds direct matches, content-search candidates,
+expanded nodes, and serialized page/update bytes. Content search first applies indexed
+scope and time predicates, then decodes the bounded Ledger locators through the Store's
+Codec and matches only retained, already-redacted public details. When only response
+details exceed the byte budget, the framework keeps the graph structure and marks
+content, request, or result values as omitted. A structure-only page that still exceeds
+the budget fails with `TraceQuotaExceeded`.
 
 `Tracer.get()` exposes the same canonical nodes through `TraceThread.graph` at the
 history handle's exact fixed prefix. `TraceThread.follow()` carries a
@@ -89,7 +95,8 @@ Ledger instead of storing another execution tree or payload copy.
 
 The SQL Graph index stores only identity, relationship, filter, lifecycle, and Ledger
 sequence locators. Fact payloads remain solely in the Ledger and are decoded only for
-selected rows. The index is disposable and can be rebuilt with
+selected rows or a bounded content-search candidate set. No plaintext search document
+or second payload copy is stored. The index is disposable and can be rebuilt with
 `await tracer.rebuild_graph(thread_id)`.
 
 ## Capture and business redaction

@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="light">
-  <title>TinkerFin Studio · 链路分析</title>
+  <title>TinkerFin Studio · 链路</title>
   <script type="module" src="https://code.iconify.design/iconify-icon/2.1.0/iconify-icon.min.js"></script>
   <style>
     :root {
@@ -728,7 +728,7 @@
       </a>
       <nav class="side-nav">
         <button class="nav-button" type="button" data-label="对话" aria-label="对话"><iconify-icon icon="solar:chat-round-dots-linear"></iconify-icon></button>
-        <button class="nav-button is-active" type="button" data-label="链路分析" aria-label="链路分析"><iconify-icon icon="solar:graph-up-linear"></iconify-icon></button>
+        <button class="nav-button is-active" type="button" data-label="链路" aria-label="链路"><iconify-icon icon="solar:graph-up-linear"></iconify-icon></button>
         <button class="nav-button" type="button" data-label="运行记录" aria-label="运行记录"><iconify-icon icon="solar:layers-linear"></iconify-icon></button>
         <button class="nav-button" type="button" data-label="文档" aria-label="文档"><iconify-icon icon="solar:document-text-linear"></iconify-icon></button>
         <button class="nav-button" type="button" data-label="应用" aria-label="应用"><iconify-icon icon="solar:widget-4-linear"></iconify-icon></button>
@@ -752,7 +752,7 @@
           </div>
           <nav class="tabs" aria-label="会话视图">
             <button class="tab" type="button" data-view="chat">对话</button>
-            <button class="tab is-active" type="button" data-view="trace" aria-current="page">链路分析</button>
+            <button class="tab is-active" type="button" data-view="trace" aria-current="page">链路</button>
           </nav>
         </div>
         <button class="export-button" type="button" id="exportButton"><span>导出日志</span><iconify-icon icon="solar:download-minimalistic-linear"></iconify-icon></button>
@@ -1091,7 +1091,7 @@
     document.querySelectorAll('.nav-button, .utility-button').forEach((button) => button.addEventListener('click', () => {
       if (!button.classList.contains('is-active')) showToast(`${button.dataset.label}为演示入口`);
     }));
-    document.querySelector('[data-view="chat"]').addEventListener('click', () => showToast('此单文件仅演示链路分析视图'));
+    document.querySelector('[data-view="chat"]').addEventListener('click', () => showToast('此单文件仅演示链路视图'));
     document.querySelector('.brand').addEventListener('click', (event) => { event.preventDefault(); showToast('TinkerFin Studio'); });
 
     renderDetails();

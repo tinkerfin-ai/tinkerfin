@@ -199,7 +199,7 @@ async def query_trace_graph(
     service: ConversationHistoryDep,
     where: TraceGraphFilterDep,
     cursor: Annotated[str | None, Query(min_length=1, max_length=16_384)] = None,
-    limit: Annotated[int, Query(ge=1, le=200)] = 100,
+    limit: Annotated[int, Query(ge=1, le=1000)] = 100,
 ) -> ApiResponse[TraceGraphPage]:
     """按当前会话归属直接筛选链路节点"""
 
@@ -218,7 +218,7 @@ async def follow_trace_graph(
     thread_id: ThreadIdPath,
     service: ConversationHistoryDep,
     where: TraceGraphFilterDep,
-    limit: Annotated[int, Query(ge=1, le=200)] = 100,
+    limit: Annotated[int, Query(ge=1, le=1000)] = 100,
 ) -> StreamingResponse:
     """发送链路筛选快照并持续跟随匹配变化"""
 

@@ -297,6 +297,119 @@ async def test_graph_ancestor_expansion_obeys_the_independent_total_limit() -> N
     assert captured.value.context["resource"] == "graph_total_nodes"
 
 
+async def test_graph_query_separates_direct_matches_from_path_ancestors() -> None:
+    tracer = Tracer()
+    await _record_large_model_call(tracer, "matched-node-ids")
+
+    query = await tracer.query(
+        "thread-query",
+        where=TraceGraphFilter(
+            kinds={TraceGraphNodeKind.ASSISTANT_MESSAGE},
+            include_ancestor_nodes=True,
+        ),
+    )
+
+    direct = tuple(
+        node.id
+        for node in query.nodes
+        if node.kind is TraceGraphNodeKind.ASSISTANT_MESSAGE
+    )
+    assert direct
+    assert len(query.nodes) > len(direct)
+    assert query.matched_node_ids == direct
+    assert query.snapshot.matched_node_ids == direct
+
+
+async def test_graph_content_search_obeys_total_candidate_limit() -> None:
+    tracer = Tracer(
+        graph_query_limits=TraceGraphQueryLimits(
+            max_direct_nodes=1,
+            max_total_nodes=1,
+        )
+    )
+    await _record_large_model_call(tracer, "bounded-content-search")
+
+    with pytest.raises(TraceQuotaExceeded) as captured:
+        await tracer.query(
+            "thread-query",
+            where=TraceGraphFilter(
+                kinds={TraceGraphNodeKind.MODEL},
+                search="large-model",
+                include_ancestor_nodes=False,
+            ),
+            limit=1,
+        )
+    assert captured.value.context["resource"] == "graph_search_nodes"
+
+
+async def test_graph_content_search_follows_visible_assistant_body() -> None:
+    tracer = Tracer()
+    context = _context("content-search-follow")
+    session = await _start(tracer, context)
+    now = datetime.now(UTC)
+    await session.observe(
+        ModelCallObservation(
+            identity=context.identity,
+            phase="started",
+            call_id="model-content-search",
+            model="content-model",
+            messages=(NativeMessageRecord(message_type="human", content="search"),),
+            observed_at=now,
+            monotonic_ns=3,
+        )
+    )
+    await session.observe(
+        ModelCallObservation(
+            identity=context.identity,
+            phase="completed",
+            call_id="model-content-search",
+            model="content-model",
+            output_message_ids=("assistant-content-search",),
+            observed_at=now,
+            monotonic_ns=4,
+        )
+    )
+    where = TraceGraphFilter(
+        kinds={TraceGraphNodeKind.ASSISTANT_MESSAGE},
+        search="VISIBLE BODY",
+        include_ancestor_nodes=True,
+    )
+    query = await tracer.query("thread-query", where=where)
+    assert query.nodes == ()
+    assert query.matched_node_ids == ()
+
+    updates = query.follow()
+    pending = asyncio.create_task(anext(updates))
+    await session.observe(
+        NativeMessageObservation(
+            identity=context.identity,
+            namespace=(),
+            message=NativeMessageRecord(
+                message_type="assistant",
+                id="assistant-content-search",
+                content="继续核验 visible body",
+            ),
+            observed_at=now,
+            monotonic_ns=5,
+        )
+    )
+    await session.force(ObservationBoundary.CALL_STARTED)
+
+    update = await asyncio.wait_for(pending, timeout=2)
+    assistant_ids = tuple(
+        node.id
+        for node in update.node_upserts
+        if node.kind is TraceGraphNodeKind.ASSISTANT_MESSAGE
+    )
+    assert assistant_ids
+    assert update.matched_node_ids == tuple(
+        node_id for node_id in update.ordered_node_ids if node_id in assistant_ids
+    )
+    assert len(update.ordered_node_ids) > len(update.matched_node_ids)
+    await updates.aclose()
+    await _finish(session, context)
+
+
 async def test_graph_follow_applies_the_same_page_byte_budget() -> None:
     tracer = Tracer(graph_query_limits=TraceGraphQueryLimits(max_page_bytes=2048))
     context = _context("bounded-follow")
@@ -329,6 +442,11 @@ async def test_graph_follow_applies_the_same_page_byte_budget() -> None:
     update = await asyncio.wait_for(pending, timeout=2)
     assert len(update.model_dump_json(by_alias=True).encode()) <= 2048
     assert update.completeness.details_omitted is True
+    assert update.matched_node_ids == tuple(
+        node_id
+        for node_id in update.ordered_node_ids
+        if node_id in {node.id for node in update.node_upserts}
+    )
     assert update.node_upserts[0].content is None
     assert update.node_upserts[0].content_omitted is True
     await updates.aclose()

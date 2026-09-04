@@ -118,7 +118,7 @@
     --layout-content-wide: 840px;
     --layout-conversation-width: 748px;
     --layout-composer-width: 780px;
-    --layout-feedback-card: 360px;
+    --layout-feedback-card: 288px;
     --layout-composer-surface-height: 94px;
     --layout-interaction-card-min-height: clamp(260px, 32dvh, 320px);
     --layout-interaction-card-context-reserve: 120px;
@@ -126,10 +126,9 @@
     --layout-interaction-card-max-height: clamp(var(--layout-interaction-card-min-height), calc(100dvh - var(--layout-header-height) - var(--layout-interaction-card-context-reserve) - var(--space-10)), var(--layout-interaction-card-max-cap));
     --layout-interaction-card-gap: var(--space-6);
     --layout-content-medium: 712px;
-    --layout-task-drawer: 348px;
-    --layout-todo-trace-drawer: 400px;
-    --layout-header-height: 60px;
-    --layout-drawer-header-height: calc(var(--layout-header-height) + var(--space-4));
+    --layout-drawer-width: 400px;
+    --layout-header-height: var(--space-16);
+    --layout-drawer-header-height: calc(var(--layout-header-height) + var(--space-3));
     --layout-settings-dialog: 760px;
     --layout-settings-nav: 180px;
     --layout-settings-height: 540px;
@@ -162,6 +161,9 @@
     --shadow-2: 0 4px 12px rgb(0 0 0 / 2%), 0 2px 8px rgb(0 0 0 / 4%);
     --shadow-3: 0 0 1px rgb(0 0 0 / 20%), 0 0 4px rgb(0 0 0 / 2%), 0 12px 32px rgb(0 0 0 / 8%);
     --shadow-border: 0 0 0 1px var(--color-border);
+    --shadow-drawer-inline: -12px 0 34px rgb(15 17 21 / 4%);
+    --shadow-trace-node-selected: 0 0 0 4px rgb(57 100 254 / 12%);
+    --shadow-trace-node-error: 0 0 0 3px rgb(220 38 38 / 12%);
     --shadow-tool-pulse: 0 0 var(--space-2) color-mix(in srgb, currentColor 55%, transparent);
   }
 
@@ -214,5 +216,8 @@
     --shadow-1: 0 2px 4px rgb(0 0 0 / 24%);
     --shadow-2: 0 4px 12px rgb(0 0 0 / 18%), 0 2px 8px rgb(0 0 0 / 24%);
     --shadow-3: 0 0 1px rgb(255 255 255 / 14%), 0 12px 32px rgb(0 0 0 / 38%);
+    --shadow-drawer-inline: -12px 0 34px rgb(0 0 0 / 38%);
+    --shadow-trace-node-selected: 0 0 0 4px rgb(103 158 254 / 18%);
+    --shadow-trace-node-error: 0 0 0 3px rgb(242 90 90 / 18%);
   }
 }

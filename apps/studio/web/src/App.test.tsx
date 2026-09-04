@@ -265,12 +265,12 @@ describe('Studio Trace history integration', () => {
 
     render(<App />)
 
-    await user.click(await screen.findByRole('button', { name: '链路分析' }))
-    expect(await screen.findByRole('button', { name: '返回对话' })).toBeVisible()
+    await user.click(await screen.findByRole('tab', { name: '链路' }))
+    expect(await screen.findByRole('tabpanel', { name: '链路' })).toBeVisible()
     await user.click(screen.getByRole('button', { name: '打开会话：第二个会话' }))
 
     expect(await screen.findByText('第二个会话的聊天内容')).toBeVisible()
-    expect(screen.queryByRole('button', { name: '返回对话' })).not.toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: '对话' })).toHaveAttribute('aria-selected', 'true')
   })
 
   it('restores a multi-action approval from native Trace interaction facts', async () => {

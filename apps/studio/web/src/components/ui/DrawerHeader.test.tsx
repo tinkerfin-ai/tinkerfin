@@ -24,4 +24,18 @@ describe('DrawerHeader', () => {
     fireEvent.click(closeButton.current!)
     expect(onClose).toHaveBeenCalledOnce()
   })
+
+  it('提供不改变标题与关闭语义的紧凑密度', () => {
+    render(
+      <DrawerHeader
+        density="compact"
+        title="节点详情"
+        closeLabel="关闭节点详情"
+        onClose={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByRole('heading', { name: '节点详情' }).closest('header'))
+      .toHaveClass('ui-drawer-header--compact')
+  })
 })

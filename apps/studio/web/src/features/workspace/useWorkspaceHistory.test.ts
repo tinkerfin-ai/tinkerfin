@@ -1,5 +1,5 @@
 import { act, renderHook, waitFor } from '@testing-library/react'
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ConversationHistoryDetail } from '../../api/conversation/history'
@@ -99,14 +99,17 @@ function deferred<T>() {
 function useHarness(
   initial: ConversationHistoryDetail,
   options: {
+    initiallyHydrated?: boolean
     onToast?: (kind: 'error', message: string) => void
     prepareTaskTraceOwner?: (threadId: string) => Promise<void>
   } = {},
 ) {
+  const followDetachedConversation = useRef(vi.fn()).current
+  const defaultPrepareTaskTraceOwner = useRef(vi.fn(async () => undefined)).current
   const [workspace, setWorkspace] = useState<WorkspaceState>({
     conversations: [{
       ...restoreConversationFromTrace(initial, { model: 'main', includeTaskTrace: true }),
-      isHydrated: true,
+      isHydrated: options.initiallyHydrated ?? true,
     }],
     currentThreadId: initial.threadId,
   })
@@ -115,8 +118,8 @@ function useHarness(
     setWorkspace,
     defaultModelId: 'main',
     modelCatalogStatus: 'loading',
-    followDetachedConversation: vi.fn(),
-    prepareTaskTraceOwner: options.prepareTaskTraceOwner ?? vi.fn(async () => undefined),
+    followDetachedConversation,
+    prepareTaskTraceOwner: options.prepareTaskTraceOwner ?? defaultPrepareTaskTraceOwner,
     onToast: options.onToast ?? vi.fn(),
   })
   const advanceTrace = (next: ConversationHistoryDetail) => {
@@ -330,6 +333,23 @@ describe('useWorkspaceHistory Trace pagination authority', () => {
     })
   })
 
+  it('keeps conversation hydration failure inline without a duplicate toast', async () => {
+    const onToast = vi.fn()
+    const prepareTaskTraceOwner = vi.fn(async () => undefined)
+    historyMocks.detail.mockRejectedValue(new Error('会话恢复失败'))
+    const { result } = renderHook(() => useHarness(detail(), {
+      initiallyHydrated: false,
+      onToast,
+      prepareTaskTraceOwner,
+    }))
+
+    await waitFor(() => expect(result.current.history.hydrationState).toEqual({
+      threadId: THREAD_ID,
+      status: 'failed',
+    }))
+    expect(onToast).not.toHaveBeenCalled()
+  })
+
   it('does not let a retry response replace an owned run started after the request', async () => {
     const response = deferred<ConversationHistoryDetail>()
     const initial = detail({
@@ -464,7 +484,7 @@ describe('useWorkspaceHistory Trace pagination authority', () => {
     expect(onToast).not.toHaveBeenCalled()
   })
 
-  it('keeps a current retry failure recoverable and reports it once', async () => {
+  it('keeps a current retry failure recoverable without a duplicate toast', async () => {
     const response = deferred<ConversationHistoryDetail>()
     const initial = detail({
       taskTrace: {
@@ -483,7 +503,7 @@ describe('useWorkspaceHistory Trace pagination authority', () => {
 
     await waitFor(() => expect(result.current.history.taskTraceLoadFailed).toBe(true))
     expect(result.current.workspace.conversations[0]?.taskTrace.phase).toBe('unloaded')
-    expect(onToast).toHaveBeenCalledOnce()
+    expect(onToast).not.toHaveBeenCalled()
   })
 
   it('does not apply a retry response after a same-batch thread switch', async () => {

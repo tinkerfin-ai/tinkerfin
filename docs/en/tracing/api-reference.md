@@ -38,26 +38,35 @@ Passing both `store` and `limits` requires exact equality with `store.limits`.
 `started_after`, `started_before`, `include_technical_nodes`, and
 `include_ancestor_nodes`.
 
-`search` is a literal substring filter over node metadata. An ASCII-only query folds
-only ASCII `A-Z` in both the query and metadata. It does not map Unicode characters to
-ASCII lookalikes. A query containing any non-ASCII character is case-sensitive, which
-keeps SQLite, MySQL, and in-memory results identical without storing a duplicate search
-document.
+`search` is a literal substring filter over visible node metadata and retained public
+details: content, request, result, failure information, middleware hooks, and Skill
+paths. JSON keys, string values, and scalar values are searchable. Omitted values,
+identifiers, and private reasoning are not searched. An ASCII-only query folds only
+ASCII `A-Z`; a query containing any non-ASCII character is case-sensitive.
+
+The Store first applies indexed scope, time, parent, and technical-node constraints,
+then decodes a bounded candidate set through its Codec. This preserves encrypted Codec
+behavior and avoids a plaintext search document or payload copy. Content-search
+candidates are bounded by `max_total_nodes`; exceeding that bound fails with
+`TraceQuotaExceeded` instead of returning partial results.
 
 `TraceGraphQuery` exposes:
 
 - `snapshot`: defensive `TraceGraphPage` copy;
-- `turns`, `nodes`, `ordered_node_ids`, and `root_node_ids`;
+- `turns`, `nodes`, `ordered_node_ids`, `root_node_ids`, and `matched_node_ids`;
 - `next_cursor`, `as_of_seq`, `facets`, and `completeness`;
 - `follow()`: closeable current-first-page `TraceFollow[TraceGraphDelta]`.
 
-`TraceGraphNodeKind` contains HumanMessage, AssistantMessage, SystemMessage,
-ToolMessage, Agent, Model, Tool, Subagent, Skill, middleware, Memory, Guardrail,
-retrieval, custom, Plan, interaction, Run, and Runtime task nodes. SystemMessage,
-ToolMessage, middleware, Run, and Runtime task are technical nodes.
+`TraceGraphNodeKind` contains HumanMessage, AssistantMessage, SystemMessage, Agent,
+Model, Tool, Subagent, Skill, middleware, Memory, Guardrail, retrieval, custom, Plan,
+interaction, Run, and Runtime task nodes. A Tool node owns its ToolMessage result.
+SystemMessage, middleware, Run, and Runtime task are technical nodes.
 
-`TraceGraphDelta` carries Turn and node upserts/removals plus the current
-`next_cursor`, complete `ordered_node_ids`, `root_node_ids`, Facets, and Completeness.
+`matched_node_ids` contains only direct filter matches in authoritative order; `nodes`
+may also contain ancestors required to preserve the path. An unfiltered history Graph
+matches every returned node. `TraceGraphDelta` carries Turn and node upserts/removals
+plus the current `next_cursor`, complete `ordered_node_ids`, `root_node_ids`,
+`matched_node_ids`, Facets, and Completeness.
 Follow is rejected for a paginated cursor. A cursor is invalid after the current Ledger
 tail changes, so every live Delta replaces the previous cursor atomically.
 
@@ -80,7 +89,8 @@ TraceGraphQueryLimits(
 )
 ```
 
-Direct matches are limited before ancestor expansion. When a page exceeds its byte
+Direct matches are limited before ancestor expansion. `max_total_nodes` also bounds the
+decoded candidate set needed for exact content search. When a page exceeds its byte
 budget, content, request, result, usage, and response metadata are omitted first while
 structure remains authoritative. A structure-only page that remains too large raises
 `TraceQuotaExceeded`.

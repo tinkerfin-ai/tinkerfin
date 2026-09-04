@@ -38,26 +38,32 @@ Tracer(
 `started_after`、`started_before`、`include_technical_nodes` 和
 `include_ancestor_nodes`。
 
-`search` 按字面子串过滤节点元数据。只含 ASCII 的查询只折叠查询和元数据中的 ASCII
-`A-Z`，不会把 Unicode 字符映射为外观相近的 ASCII；查询中只要包含非 ASCII 字符，就按
-大小写精确匹配。该定义无需保存重复搜索正文，并保证 SQLite、MySQL 与内存实现返回一致
-结果。
+`search` 按字面子串过滤可见节点元数据及已保留的公开详情，包括正文、请求、结果、失败信息、
+middleware hook 和 Skill 路径；JSON key、字符串值和标量值均可搜索。采集策略已省略的值、
+身份 ID 和私有 reasoning 不参与搜索。只含 ASCII 的查询只折叠 ASCII `A-Z`；查询中包含
+非 ASCII 字符时按大小写精确匹配。
+
+Store 先按索引过滤 scope、时间、父节点及技术节点策略，再通过当前 Codec 解码有界候选集。
+因此加密 Codec 无需暴露明文搜索文档，也不会复制正文。正文搜索候选受 `max_total_nodes`
+约束，超限时抛出 `TraceQuotaExceeded`，不会返回不完整结果。
 
 `TraceGraphQuery` 提供：
 
 - `snapshot`：完整 `TraceGraphPage` 的防御性副本；
-- `turns`、`nodes`、`ordered_node_ids` 和 `root_node_ids`；
+- `turns`、`nodes`、`ordered_node_ids`、`root_node_ids` 和 `matched_node_ids`；
 - `next_cursor`、`as_of_seq`、`facets` 与 `completeness`；
 - `follow()`：只允许当前第一页使用的 `TraceFollow[TraceGraphDelta]`。
 
-`TraceGraphNodeKind` 包含 HumanMessage、AssistantMessage、SystemMessage、ToolMessage、
-Agent、Model、Tool、Subagent、Skill、middleware、Memory、Guardrail、retrieval、
-custom、Plan、interaction、Run 与 Runtime task。SystemMessage、ToolMessage、
+`TraceGraphNodeKind` 包含 HumanMessage、AssistantMessage、SystemMessage、Agent、Model、
+Tool、Subagent、Skill、middleware、Memory、Guardrail、retrieval、custom、Plan、
+interaction、Run 与 Runtime task。ToolMessage 结果由对应 Tool 节点持有；SystemMessage、
 middleware、Run 和 Runtime task 属于技术节点。
 
-`TraceGraphDelta` 提供 Turn 和节点的 upsert/remove，以及当前 `next_cursor`、完整的节点
-顺序、根节点、Facet 和 Completeness。带分页 cursor 的查询不能 follow；当前 Ledger 尾序号
-变化后，旧 cursor 会明确失效，因此每个实时 Delta 都会原子替换上一 cursor。
+`matched_node_ids` 只包含按权威顺序排列的直接匹配；`nodes` 还可包含保持路径所需的祖先。
+未筛选历史 Graph 的全部节点均为直接匹配。`TraceGraphDelta` 提供 Turn 和节点的
+upsert/remove，以及当前 `next_cursor`、完整的节点顺序、根节点、直接匹配、Facet 和
+Completeness。带分页 cursor 的查询不能 follow；当前 Ledger 尾序号变化后，旧 cursor 会明确
+失效，因此每个实时 Delta 都会原子替换上一 cursor。
 
 `Tracer.get()` 返回的 `TraceThread.graph` 是与 messages、state 相同固定前缀及已加载 Turn
 窗口对应的完整 `TraceGraph`。`TraceThread.follow()` 通过 `TraceUpdate.graph` 发布
@@ -76,8 +82,9 @@ TraceGraphQueryLimits(
 )
 ```
 
-直接匹配先受节点上限约束，再补齐祖先。响应超过字节预算时，框架先省略 content、request、
-result、usage 与响应元数据，同时保留权威结构；仅结构仍超限时抛出 `TraceQuotaExceeded`。
+直接匹配先受节点上限约束，再补齐祖先；`max_total_nodes` 同时限制精确正文搜索需要解码的
+候选节点。响应超过字节预算时，框架先省略 content、request、result、usage 与响应元数据，
+同时保留权威结构；仅结构仍超限时抛出 `TraceQuotaExceeded`。
 
 ## Capture 策略
 

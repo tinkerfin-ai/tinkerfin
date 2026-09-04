@@ -14,7 +14,6 @@ from types import CoroutineType
 from typing import Any, Concatenate, Literal, ParamSpec, TypeVar, cast
 
 from sqlalchemy import (
-    LargeBinary,
     and_,
     case,
     delete,
@@ -22,7 +21,6 @@ from sqlalchemy import (
     func,
     insert,
     inspect,
-    literal,
     or_,
     select,
     text,
@@ -99,26 +97,6 @@ _ResultT = TypeVar("_ResultT")
 _BackendT = TypeVar("_BackendT")
 _OperationP = ParamSpec("_OperationP")
 _GRAPH_PREFETCH_PAIR_LIMIT = 400
-_ASCII_CASE_PAIRS = tuple(
-    zip(
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
-        "abcdefghijklmnopqrstuvwxyz",
-        strict=True,
-    )
-)
-_ASCII_LOWER_TRANSLATION = str.maketrans(
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
-    "abcdefghijklmnopqrstuvwxyz",
-)
-
-
-def _ascii_lower_expression(column: ColumnElement[Any]) -> ColumnElement[Any]:
-    """Fold only ASCII letters so SQLite and MySQL search the same text."""
-
-    folded = column
-    for uppercase, lowercase in _ASCII_CASE_PAIRS:
-        folded = func.replace(folded, uppercase, lowercase)
-    return folded
 
 
 async def _join_owned_task(
@@ -695,11 +673,15 @@ class _SqlAlchemyTraceLedgerBackend:
                 request,
                 source=effective_nodes,
             )
-            facets = await _trace_graph_facets(
-                connection,
-                self,
-                request,
-                source=effective_nodes,
+            facets = (
+                await _trace_graph_facets(
+                    connection,
+                    self,
+                    request,
+                    source=effective_nodes,
+                )
+                if request.include_facets
+                else TraceGraphFacets()
             )
             page_criteria = list(base_criteria)
             if request.before_started_at is not None:
@@ -732,8 +714,13 @@ class _SqlAlchemyTraceLedgerBackend:
             )
             for row in rows:
                 _validate_graph_node_row(row, where=request.where)
+                if request.node_ids and row["node_id"] not in request.node_ids:
+                    raise TraceStoreProtocolError(
+                        "Trace Graph node ID filter digest collision"
+                    )
             has_more = len(rows) > request.limit
             selected = list(rows[: request.limit])
+            matched_node_ids = tuple(cast(str, row["node_id"]) for row in selected)
             cursor_row = selected[-1] if has_more and selected else None
             result_rows: dict[str, RowMapping] = {
                 cast(str, row["node_id"]): row for row in selected
@@ -848,6 +835,7 @@ class _SqlAlchemyTraceLedgerBackend:
                         reverse=True,
                     )
                 ),
+                matched_node_ids=matched_node_ids,
                 facets=facets,
                 has_more=has_more,
                 next_started_at=(
@@ -2325,6 +2313,10 @@ def _trace_graph_criteria(
                 tuple(value.value for value in TECHNICAL_TRACE_GRAPH_NODE_KINDS)
             )
         )
+    if request.node_ids:
+        criteria.append(
+            nodes.node_hash.in_(tuple(_digest(value) for value in request.node_ids))
+        )
     if where.kinds and exclude != "kinds":
         criteria.append(nodes.kind.in_(tuple(value.value for value in where.kinds)))
     if where.statuses and exclude != "statuses":
@@ -2367,32 +2359,6 @@ def _trace_graph_criteria(
         criteria.append(
             nodes.graph_namespace_hash.in_(
                 tuple(_digest(_encode_namespace(value)) for value in where.namespaces)
-            )
-        )
-    if where.search is not None:
-        case_insensitive = where.search.isascii()
-        search = (
-            where.search.translate(_ASCII_LOWER_TRANSLATION)
-            if case_insensitive
-            else where.search
-        )
-
-        def contains_literal(column: ColumnElement[Any]) -> ColumnElement[bool]:
-            candidate = _ascii_lower_expression(column) if case_insensitive else column
-            return (
-                func.instr(
-                    candidate.cast(LargeBinary),
-                    literal(search).cast(LargeBinary),
-                )
-                > 0
-            )
-
-        criteria.append(
-            or_(
-                contains_literal(nodes.name),
-                contains_literal(nodes.agent_name),
-                contains_literal(nodes.provider),
-                contains_literal(nodes.model),
             )
         )
     if where.started_after is not None:

@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 
 from tinkerfin_contracts import RunIdentity
 from tinkerfin_tracing._graph_projection import project_trace_graph_node
+from tinkerfin_tracing._ids import scope_id
 from tinkerfin_tracing.backend import TraceLedgerStateRequest, TraceStoreOptions
 from tinkerfin_tracing.capture import CapturedValue
 from tinkerfin_tracing.codec import CanonicalTracePayloadCodec, EncodedTracePayload
@@ -31,11 +32,16 @@ from tinkerfin_tracing.errors import (
     TraceThreadNotFound,
 )
 from tinkerfin_tracing.facts import (
+    AgentStepFact,
     CallTrackingFact,
+    ContextContributionFact,
+    InteractionFact,
     MessageFact,
     ModelCallFact,
+    PlanRevisionFact,
     RunFact,
     RuntimeTaskFact,
+    SkillFact,
     SubagentFact,
     ToolExecutionFact,
     ToolFact,
@@ -836,6 +842,16 @@ async def test_sqlite_graph_query_reads_details_through_a_custom_encrypted_codec
             where=TraceGraphFilter(kinds={TraceGraphNodeKind.MODEL}),
             limit=10,
         )
+        searched = await store.query_trace_graph(
+            snapshot.key,
+            run_ids=(_identity().run_id,),
+            where=TraceGraphFilter(
+                kinds={TraceGraphNodeKind.MODEL},
+                search="ENCRYPTED-FINAL-REQUEST-MARKER",
+                include_ancestor_nodes=False,
+            ),
+            limit=10,
+        )
         node = project_trace_graph_node(
             page.nodes[0],
             turn_id="turn:test",
@@ -854,6 +870,10 @@ async def test_sqlite_graph_query_reads_details_through_a_custom_encrypted_codec
             )
 
         assert node.request == {"messages": [{"content": marker}]}
+        assert searched.matched_node_ids == (page.nodes[0].node_id,)
+        assert tuple(item.node_id for item in searched.nodes) == (
+            page.nodes[0].node_id,
+        )
         assert all(marker.encode() not in bytes(payload) for payload in payloads)
     finally:
         await writer.aclose()
@@ -948,6 +968,408 @@ async def test_memory_and_sql_facets_exclude_their_own_active_filter(
             assert kind_page.facets.kinds[TraceGraphNodeKind.MODEL] == 2
             assert status_page.facets.statuses[TraceGraphNodeStatus.FAILED] == 1
             assert status_page.facets.statuses[TraceGraphNodeStatus.SUCCEEDED] == 2
+    finally:
+        await engine.dispose()
+
+
+async def test_memory_and_sql_search_decoded_content_without_ancestor_pollution(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'content-search.db'}"
+    )
+    stores = (
+        InMemoryTraceStore(namespace="graph-content-search"),
+        SqlAlchemyTraceStore(engine, namespace="graph-content-search"),
+    )
+    now = datetime.now(UTC)
+    try:
+        for store in stores:
+            writer = await store.open_writer(_identity())
+            await writer.append(
+                (
+                    _fact("started"),
+                    ContextContributionFact(
+                        source_observation_id="search-parent-start",
+                        identity=_identity(),
+                        occurred_at=now,
+                        monotonic_ns=2,
+                        phase="started",
+                        contribution_id="search-parent",
+                        context_kind="custom",
+                        name="parent-context",
+                        input=_captured({"note": "ancestor only"}),
+                    ),
+                    ContextContributionFact(
+                        source_observation_id="search-parent-completed",
+                        identity=_identity(),
+                        occurred_at=now,
+                        monotonic_ns=3,
+                        phase="completed",
+                        contribution_id="search-parent",
+                        context_kind="custom",
+                        name="parent-context",
+                        output=_captured({"result": "parent result"}),
+                    ),
+                    ContextContributionFact(
+                        source_observation_id="search-child-start",
+                        identity=_identity(),
+                        occurred_at=now + timedelta(seconds=1),
+                        monotonic_ns=4,
+                        phase="started",
+                        contribution_id="search-child",
+                        parent_call_id="search-parent",
+                        context_kind="custom",
+                        name="child-context",
+                        input=_captured(
+                            {
+                                "customer_note": "Child Visible Marker",
+                                "sequence": 42,
+                            }
+                        ),
+                    ),
+                    ContextContributionFact(
+                        source_observation_id="search-child-completed",
+                        identity=_identity(),
+                        occurred_at=now + timedelta(seconds=2),
+                        monotonic_ns=5,
+                        phase="completed",
+                        contribution_id="search-child",
+                        context_kind="custom",
+                        name="child-context",
+                        output=_captured({"result": "核验完成"}),
+                    ),
+                )
+            )
+            snapshot = await store.snapshot(_identity().thread_id)
+
+            page = await store.query_trace_graph(
+                snapshot.key,
+                run_ids=(_identity().run_id,),
+                where=TraceGraphFilter(
+                    kinds={TraceGraphNodeKind.CUSTOM},
+                    search="CHILD VISIBLE MARKER",
+                    include_ancestor_nodes=True,
+                ),
+                limit=10,
+            )
+            key_match = await store.query_trace_graph(
+                snapshot.key,
+                run_ids=(_identity().run_id,),
+                where=TraceGraphFilter(
+                    kinds={TraceGraphNodeKind.CUSTOM},
+                    search="customer_note",
+                    include_ancestor_nodes=False,
+                ),
+                limit=10,
+            )
+            scalar_match = await store.query_trace_graph(
+                snapshot.key,
+                run_ids=(_identity().run_id,),
+                where=TraceGraphFilter(
+                    kinds={TraceGraphNodeKind.CUSTOM},
+                    search="42",
+                    include_ancestor_nodes=False,
+                ),
+                limit=10,
+            )
+            unicode_match = await store.query_trace_graph(
+                snapshot.key,
+                run_ids=(_identity().run_id,),
+                where=TraceGraphFilter(
+                    kinds={TraceGraphNodeKind.CUSTOM},
+                    search="核验完成",
+                    include_ancestor_nodes=False,
+                ),
+                limit=10,
+            )
+
+            assert {item.node_id for item in page.nodes} == {
+                "search-parent",
+                "search-child",
+            }
+            assert page.matched_node_ids == ("search-child",)
+            assert page.facets.kinds == {TraceGraphNodeKind.CUSTOM: 1}
+            assert key_match.matched_node_ids == ("search-child",)
+            assert scalar_match.matched_node_ids == ("search-child",)
+            assert unicode_match.matched_node_ids == ("search-child",)
+            await writer.aclose()
+    finally:
+        await engine.dispose()
+
+
+async def test_memory_and_sql_search_every_public_graph_detail_source(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'detail-search.db'}")
+    stores = (
+        InMemoryTraceStore(namespace="graph-detail-search"),
+        SqlAlchemyTraceStore(engine, namespace="graph-detail-search"),
+    )
+    now = datetime.now(UTC)
+    human_id = scope_id("message", (), "search-human")
+    assistant_id = scope_id("message", (), "search-assistant")
+    omitted = CapturedValue(
+        disposition="omitted",
+        safe_size_bytes=0,
+        reason="policy",
+    )
+    expected = (
+        (TraceGraphNodeKind.HUMAN_MESSAGE, "human body marker"),
+        (TraceGraphNodeKind.ASSISTANT_MESSAGE, "assistant body marker"),
+        (TraceGraphNodeKind.SYSTEM_MESSAGE, "system body marker"),
+        (TraceGraphNodeKind.MODEL, "model request marker"),
+        (TraceGraphNodeKind.TOOL, "tool result marker"),
+        (TraceGraphNodeKind.CUSTOM, "context result marker"),
+        (TraceGraphNodeKind.PLAN, "plan body marker"),
+        (TraceGraphNodeKind.INTERACTION, "interaction body marker"),
+        (TraceGraphNodeKind.MIDDLEWARE, "middleware failure marker"),
+        (TraceGraphNodeKind.RUNTIME_TASK, "runtime result marker"),
+        (TraceGraphNodeKind.SKILL, "/skills/search-marker/SKILL.md"),
+    )
+    try:
+        for store in stores:
+            writer = await store.open_writer(_identity())
+            await writer.append(
+                (
+                    _fact("started"),
+                    TurnFact(
+                        source_observation_id="search-turn",
+                        identity=_identity(),
+                        occurred_at=now,
+                        monotonic_ns=2,
+                        turn_id="turn:search",
+                        user_message_id="search-human",
+                    ),
+                    MessageFact(
+                        source_observation_id="search-human-message",
+                        identity=_identity(),
+                        occurred_at=now,
+                        monotonic_ns=3,
+                        phase="reconciled",
+                        message_id=human_id,
+                        source_message_id="search-human",
+                        role="user",
+                        content=_captured("human body marker"),
+                    ),
+                    MessageFact(
+                        source_observation_id="search-assistant-message",
+                        identity=_identity(),
+                        occurred_at=now,
+                        monotonic_ns=4,
+                        phase="reconciled",
+                        message_id=assistant_id,
+                        source_message_id="search-assistant",
+                        role="assistant",
+                        content=_captured("assistant body marker shared facet marker"),
+                    ),
+                    ModelCallFact(
+                        source_observation_id="search-model-start",
+                        identity=_identity(),
+                        occurred_at=now,
+                        monotonic_ns=5,
+                        phase="started",
+                        call_id="search-model",
+                        model="search-model",
+                        request=_captured(
+                            {
+                                "messages": [
+                                    {
+                                        "messageType": "system",
+                                        "content": "system body marker",
+                                    },
+                                    {
+                                        "messageType": "human",
+                                        "content": "model request marker",
+                                    },
+                                ]
+                            }
+                        ),
+                        system_message_positions=(0,),
+                        output_message_ids=(),
+                    ),
+                    ModelCallFact(
+                        source_observation_id="search-model-completed",
+                        identity=_identity(),
+                        occurred_at=now,
+                        monotonic_ns=6,
+                        phase="completed",
+                        call_id="search-model",
+                        model="search-model",
+                        system_message_positions=(),
+                        output_message_ids=(),
+                    ),
+                    ToolExecutionFact(
+                        source_observation_id="search-tool-start",
+                        identity=_identity(),
+                        occurred_at=now,
+                        monotonic_ns=7,
+                        phase="started",
+                        execution_id="search-tool",
+                        tool_name="search_tool",
+                        input=_captured({"query": "tool request marker"}),
+                    ),
+                    ToolExecutionFact(
+                        source_observation_id="search-tool-completed",
+                        identity=_identity(),
+                        occurred_at=now,
+                        monotonic_ns=8,
+                        phase="completed",
+                        execution_id="search-tool",
+                        tool_name="search_tool",
+                        output=_captured(
+                            {"answer": "tool result marker shared facet marker"}
+                        ),
+                    ),
+                    ContextContributionFact(
+                        source_observation_id="search-context-start",
+                        identity=_identity(),
+                        occurred_at=now,
+                        monotonic_ns=9,
+                        phase="started",
+                        contribution_id="search-context",
+                        context_kind="custom",
+                        name="search-context",
+                        input=omitted,
+                    ),
+                    ContextContributionFact(
+                        source_observation_id="search-context-completed",
+                        identity=_identity(),
+                        occurred_at=now,
+                        monotonic_ns=10,
+                        phase="completed",
+                        contribution_id="search-context",
+                        context_kind="custom",
+                        name="search-context",
+                        output=_captured({"answer": "context result marker"}),
+                    ),
+                    PlanRevisionFact(
+                        source_observation_id="search-plan",
+                        identity=_identity(),
+                        occurred_at=now,
+                        monotonic_ns=11,
+                        revision_id="search-plan-revision",
+                        revision=1,
+                        status="draft",
+                        plan=_captured({"summary": "plan body marker"}),
+                    ),
+                    InteractionFact(
+                        source_observation_id="search-interaction",
+                        identity=_identity(),
+                        occurred_at=now,
+                        monotonic_ns=12,
+                        phase="opened",
+                        interaction_id="search-interaction",
+                        source_interaction_id="search-interaction-source",
+                        interaction_kind="clarification",
+                        status="pending",
+                        payload=_captured({"question": "interaction body marker"}),
+                    ),
+                    AgentStepFact(
+                        source_observation_id="search-middleware-start",
+                        identity=_identity(),
+                        occurred_at=now,
+                        monotonic_ns=13,
+                        phase="started",
+                        call_id="search-middleware",
+                        step_kind="middleware",
+                        name="SearchMiddleware.before_model",
+                        middleware_name="SearchMiddleware",
+                        hook="before_model",
+                    ),
+                    AgentStepFact(
+                        source_observation_id="search-middleware-failed",
+                        identity=_identity(),
+                        occurred_at=now,
+                        monotonic_ns=14,
+                        phase="failed",
+                        call_id="search-middleware",
+                        step_kind="middleware",
+                        name="SearchMiddleware.before_model",
+                        middleware_name="SearchMiddleware",
+                        hook="before_model",
+                        error_type="builtins.RuntimeError",
+                        error_message=_captured("middleware failure marker"),
+                        failure_origin=True,
+                    ),
+                    RuntimeTaskFact(
+                        source_observation_id="search-runtime-start",
+                        identity=_identity(),
+                        occurred_at=now,
+                        monotonic_ns=15,
+                        phase="started",
+                        task_id="search-runtime-task",
+                        source_task_id="search-runtime-source",
+                        task_name="search-runtime",
+                        input=_captured({"request": "runtime request marker"}),
+                    ),
+                    RuntimeTaskFact(
+                        source_observation_id="search-runtime-completed",
+                        identity=_identity(),
+                        occurred_at=now,
+                        monotonic_ns=16,
+                        phase="completed",
+                        task_id="search-runtime-task",
+                        source_task_id="search-runtime-source",
+                        task_name="search-runtime",
+                        result=_captured({"answer": "runtime result marker"}),
+                    ),
+                    SkillFact(
+                        source_observation_id="search-skill",
+                        identity=_identity(),
+                        occurred_at=now,
+                        monotonic_ns=17,
+                        skill_id="search-skill",
+                        execution_id="search-skill-execution",
+                        source_tool_call_id="search-skill-tool",
+                        name="search-skill",
+                        source_path="/skills/search-marker/SKILL.md",
+                    ),
+                )
+            )
+            snapshot = await store.snapshot(_identity().thread_id)
+            for kind, marker in expected:
+                page = await store.query_trace_graph(
+                    snapshot.key,
+                    run_ids=(_identity().run_id,),
+                    where=TraceGraphFilter(
+                        kinds={kind},
+                        search=marker,
+                        include_technical_nodes=True,
+                        include_ancestor_nodes=False,
+                    ),
+                    limit=10,
+                )
+                assert len(page.matched_node_ids) == 1, (kind, marker)
+                assert page.nodes[0].kind is kind
+
+            omitted_page = await store.query_trace_graph(
+                snapshot.key,
+                run_ids=(_identity().run_id,),
+                where=TraceGraphFilter(
+                    kinds={TraceGraphNodeKind.CUSTOM},
+                    search="policy",
+                    include_ancestor_nodes=False,
+                ),
+                limit=10,
+            )
+            facet_page = await store.query_trace_graph(
+                snapshot.key,
+                run_ids=(_identity().run_id,),
+                where=TraceGraphFilter(
+                    kinds={TraceGraphNodeKind.ASSISTANT_MESSAGE},
+                    search="shared facet marker",
+                    include_ancestor_nodes=False,
+                ),
+                limit=10,
+            )
+            assert omitted_page.nodes == ()
+            assert facet_page.matched_node_ids == (assistant_id,)
+            assert facet_page.facets.kinds == {
+                TraceGraphNodeKind.ASSISTANT_MESSAGE: 1,
+                TraceGraphNodeKind.TOOL: 1,
+            }
+            await writer.aclose()
     finally:
         await engine.dispose()
 

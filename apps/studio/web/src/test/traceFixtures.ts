@@ -20,6 +20,7 @@ export const emptyTraceGraph = (asOfSeq: number): TraceGraph => ({
   nodes: [],
   orderedNodeIds: [],
   rootNodeIds: [],
+  matchedNodeIds: [],
   asOfSeq,
   facets: structuredClone(EMPTY_FACETS),
   completeness: {
@@ -38,6 +39,7 @@ export const emptyTraceGraphDelta = (asOfSeq: number): TraceGraphDelta => ({
   nodeRemoves: [],
   orderedNodeIds: [],
   rootNodeIds: [],
+  matchedNodeIds: [],
   facets: structuredClone(EMPTY_FACETS),
   completeness: {
     callTrackingMissing: false,
@@ -103,6 +105,7 @@ export const traceGraphWithNodes = (
     nodes: orderedNodes,
     orderedNodeIds: orderedNodes.map((node) => node.id),
     rootNodeIds,
+    matchedNodeIds: orderedNodes.map((node) => node.id),
     asOfSeq,
     facets: { ...structuredClone(EMPTY_FACETS), kinds, statuses },
     completeness: {

@@ -42,7 +42,6 @@ HumanMessage
     │   ├── SystemMessage
     │   └── AssistantMessage
     └── Tool
-        ├── ToolMessage
         ├── Skill
         └── Subagent
 ```
@@ -52,14 +51,17 @@ proposals, or executions are reported as link issues; the framework does not cor
 parallel work by time or arrival order. Tool proposal, post-review execution, and result
 are one logical Tool node. Rejected HITL actions do not fabricate executions.
 
-SystemMessage, ToolMessage, middleware, Run, and Runtime task nodes are technical and
-hidden by default. When hidden, the framework reconnects each visible node to its
-nearest visible ancestor before returning authoritative order and roots.
+SystemMessage, middleware, Run, and Runtime task nodes are technical and hidden by
+default. ToolMessage results remain evidence on their logical Tool nodes. When technical
+nodes are hidden, the framework reconnects each visible node to its nearest visible
+ancestor before returning authoritative order and roots.
 
 Graph filtering runs in the Store. Request, result, message, and state content remain in
-the Ledger and are decoded only for selected nodes. SQL stores one row per node and Run
-revision so sibling branches remain isolated. A removal writes a lineage-local tombstone
-instead of deleting an ancestor or sibling node.
+the Ledger. Content search applies indexed structural constraints first and decodes only
+a bounded candidate set through the configured Codec; no plaintext search document is
+stored. SQL stores one row per node and Run revision so sibling branches remain isolated.
+A removal writes a lineage-local tombstone instead of deleting an ancestor or sibling
+node.
 
 ## History and live updates
 

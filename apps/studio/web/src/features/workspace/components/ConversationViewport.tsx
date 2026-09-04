@@ -1,6 +1,6 @@
 import { useMemo, type RefObject } from 'react'
 
-import { Button, ErrorBoundary, OverlayScrollbar } from '../../../components/ui'
+import { Button, ErrorBoundary, FeedbackState, OverlayScrollbar } from '../../../components/ui'
 import type {
   Conversation,
   Message,
@@ -13,7 +13,6 @@ import { PlanReviewStatusRow } from '../../conversation/components/PlanReviewCar
 import { TodoGroupRow } from '../../conversation/todoTrace/components/TodoGroupRow'
 import type { ConversationDisplayEntry } from '../../conversation/todoTrace/displayEntries'
 import { EmptyConversation } from './EmptyConversation'
-import { WorkspaceStatus } from './WorkspaceStatus'
 import { useI18n } from '../../../i18n'
 
 function collectCopyableAssistantIds(entries: ConversationDisplayEntry[], currentTurnRunning: boolean) {
@@ -102,11 +101,14 @@ export function ConversationViewport({
     <ErrorBoundary
       resetKey={conversation.threadId || 'draft'}
       fallback={({ reset }) => (
-        <WorkspaceStatus kind="error" title={t('对话区域无法显示')} description={t('消息渲染遇到问题，其他工作区功能仍可继续使用')} onRetry={reset} />
+        <FeedbackState kind="error" title={t('对话区域无法显示')} onRetry={reset} />
       )}
     >
       <div
+        id="conversation-panel"
         className="conversation-region"
+        role="tabpanel"
+        aria-label={t('对话')}
         aria-hidden={backgroundInert || undefined}
         inert={backgroundInert || undefined}
       >
@@ -122,13 +124,13 @@ export function ConversationViewport({
           onTouchStart={onUserScrollIntent}
         >
         {!isHistoryBootstrapped || historyStatus === 'loading' ? (
-          <WorkspaceStatus kind="loading" title={t('正在加载历史会话')} description={t('正在恢复最近的对话和工作区状态')} />
+          <FeedbackState kind="loading" title={t('正在加载历史会话')} />
         ) : isInitialHistoryUnavailable ? (
-          <WorkspaceStatus kind="error" title={t('历史会话加载失败')} description={t('无法读取历史记录，请重试；现有数据不会被修改')} onRetry={onRetryHistory} />
+          <FeedbackState kind="error" title={t('历史会话加载失败')} onRetry={onRetryHistory} />
         ) : isHydrating ? (
-          <WorkspaceStatus kind="loading" title={t('正在加载会话')} />
+          <FeedbackState kind="loading" title={t('正在加载会话')} />
         ) : isHydrationFailed ? (
-          <WorkspaceStatus kind="error" title={t('会话加载失败')} description={t('该会话尚未完整恢复，重试前不会发送新消息')} onRetry={onRetryHydration} />
+          <FeedbackState kind="error" title={t('会话加载失败')} onRetry={onRetryHydration} />
         ) : isEmpty ? (
           <EmptyConversation />
         ) : (

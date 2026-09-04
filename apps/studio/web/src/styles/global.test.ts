@@ -135,9 +135,9 @@ describe('前端视觉契约', () => {
       '--layout-sidebar-expanded: 261px;',
       '--layout-sidebar-rail: 56px;',
       '--layout-content-wide: 840px;',
-      '--layout-task-drawer: 348px;',
-      '--layout-todo-trace-drawer: 400px;',
-      '--layout-drawer-header-height: calc(var(--layout-header-height) + var(--space-4));',
+      '--layout-drawer-width: 400px;',
+      '--layout-header-height: var(--space-16);',
+      '--layout-drawer-header-height: calc(var(--layout-header-height) + var(--space-3));',
       '--layout-settings-dialog: 760px;',
       '--layout-settings-nav: 180px;',
       '--layout-settings-height: 540px;',
@@ -175,26 +175,27 @@ describe('前端视觉契约', () => {
 
   it('工作区状态和全局提示使用统一反馈卡片宽度', () => {
     const uiStyles = cssFiles['../components/ui/ui.css']
-    const workspaceStyles = cssFiles['../features/workspace/workspace.css']
 
-    expect(tokensStyles).toContain('--layout-feedback-card: 360px;')
+    expect(tokensStyles).toContain('--layout-feedback-card: 288px;')
+    expect(uiStyles).toMatch(/\.ui-feedback-state\s*\{[^}]*width:\s*min\(calc\(100vw - var\(--space-6\)\), var\(--layout-feedback-card\)\);/s)
     expect(uiStyles).toMatch(/\.toast-viewport\s*\{[^}]*width:\s*min\(calc\(100vw - var\(--space-6\)\), var\(--layout-feedback-card\)\);/s)
     expect(uiStyles).toMatch(/\.toast-card\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*100%;/s)
-    expect(workspaceStyles).toMatch(/\.workspace-status\s*\{[^}]*width:\s*min\(calc\(100% - var\(--space-8\)\), var\(--layout-feedback-card\)\);/s)
+    expect(uiStyles).toMatch(/\.ui-feedback-state__retry,[\s\S]*?border:\s*0;[^}]*background:\s*transparent;[^}]*box-shadow:\s*none;/s)
   })
 
-  it('所有抽屉使用同一头部高度、标题层级和关闭按钮布局', () => {
+  it('所有实际抽屉使用同一宽度、头部高度、标题层级和关闭按钮布局', () => {
     const uiStyles = cssFiles['../components/ui/ui.css']
-    const workspaceStyles = cssFiles['../features/workspace/workspace.css']
     const todoTraceStyles = cssFiles['../features/conversation/todoTrace/todoTrace.css']
     const chainTraceStyles = cssFiles['../features/conversation/chainTrace/chainTrace.css']
 
     expect(uiStyles).toMatch(/\.ui-drawer-header\s*\{[^}]*height:\s*var\(--layout-drawer-header-height\);[^}]*padding:\s*calc\(var\(--space-2\) \+ var\(--space-4\)\) 0 var\(--space-2\);/s)
     expect(uiStyles).toMatch(/\.ui-drawer-header > \.ui-icon-button-wrap\s*\{[^}]*grid-row:\s*1;/s)
-    expect(workspaceStyles).toMatch(/\.task-drawer\s*\{[^}]*grid-template-rows:\s*var\(--layout-drawer-header-height\) minmax\(0, 1fr\);/s)
+    expect(tokensStyles).toContain('--layout-drawer-width: 400px;')
     expect(todoTraceStyles).toMatch(/\.todo-trace-drawer\s*\{[^}]*grid-template-rows:\s*var\(--layout-drawer-header-height\) minmax\(0, 1fr\);/s)
-    expect(chainTraceStyles).toMatch(/\.chain-trace-details\s*\{[^}]*position:\s*fixed;[^}]*z-index:\s*var\(--layer-drawer\);[^}]*top:\s*0;[^}]*right:\s*0;[^}]*grid-template-rows:\s*var\(--layout-drawer-header-height\) auto minmax\(0, 1fr\);[^}]*height:\s*100dvh;/s)
-    expect(chainTraceStyles).not.toMatch(/\.chain-trace-split\.uses-overlay \.chain-trace-details\s*\{[^}]*position:\s*absolute;/s)
+    expect(todoTraceStyles).toMatch(/\.todo-trace-drawer\s*\{[^}]*width:\s*min\(var\(--layout-drawer-width\), 100vw\);/s)
+    expect(chainTraceStyles).toMatch(/\.chain-trace-details\s*\{[^}]*position:\s*relative;[^}]*grid-template-rows:\s*var\(--space-16\) var\(--chain-trace-detail-tabs-height\) minmax\(0, 1fr\);/s)
+    expect(chainTraceStyles).toMatch(/\.chain-trace-details\s*\{[^}]*width:\s*var\(--layout-drawer-width\);/s)
+    expect(chainTraceStyles).toMatch(/\.chain-trace-content-grid\.uses-overlay \.chain-trace-details\s*\{[^}]*position:\s*fixed;[^}]*z-index:\s*var\(--layer-drawer\);[^}]*top:\s*0;[^}]*right:\s*0;[^}]*height:\s*100dvh;/s)
   })
 
   it('ThemePicker 以固定完整宽度和 scaleX 展开表面', () => {
@@ -396,7 +397,7 @@ describe('前端视觉契约', () => {
     expect(unregisteredRadii).toEqual([])
     expect(unregisteredShadows).toEqual([])
     expect(unregisteredLayers).toEqual([])
-    expect(breakpointValues).toEqual(['440', '767', '1023', '1281'])
+    expect(breakpointValues).toEqual(['440', '767', '920', '1023', '1281'])
     expect(ownerLocalMotionValues).toEqual([])
   })
 
@@ -405,9 +406,9 @@ describe('前端视觉契约', () => {
     const todoTraceStyles = cssFiles['../features/conversation/todoTrace/todoTrace.css']
     const drawerRegion = todoTraceStyles.match(/\.todo-trace-drawer-region\s*\{([^}]*)\}/s)?.[1] ?? ''
 
-    expect(tokensStyles).toContain('--layout-todo-trace-drawer: 400px;')
-    expect(todoTraceStyles).toMatch(/\.todo-trace-drawer\s*\{[^}]*width:\s*min\(var\(--layout-todo-trace-drawer\), 100vw\);/s)
-    expect(todoTraceStyles).toMatch(/@media \(min-width: 1281px\)[\s\S]*\.app-shell\.has-todo-trace \.workspace-main\s*\{[^}]*margin-right:\s*var\(--layout-todo-trace-drawer\);/s)
+    expect(tokensStyles).toContain('--layout-drawer-width: 400px;')
+    expect(todoTraceStyles).toMatch(/\.todo-trace-drawer\s*\{[^}]*width:\s*min\(var\(--layout-drawer-width\), 100vw\);/s)
+    expect(todoTraceStyles).toMatch(/@media \(min-width: 1281px\)[\s\S]*\.app-shell\.has-todo-trace \.workspace-main\s*\{[^}]*margin-right:\s*var\(--layout-drawer-width\);/s)
     expect(todoTraceStyles).toMatch(/@media \(max-width: 440px\)[\s\S]*\.todo-trace-drawer\s*\{[^}]*width:\s*100vw;/s)
     expect(conversationStyles).toMatch(/@media \(any-hover: none\), \(any-pointer: coarse\)[\s\S]*\.composer-auxiliary-control\s*\{[^}]*min-height:\s*var\(--control-lg\);/s)
     expect(todoTraceStyles).toMatch(/@media \(forced-colors: active\)[\s\S]*\.todo-trace-todo::before\s*\{[^}]*background:\s*ButtonText;/s)
@@ -451,14 +452,6 @@ describe('前端视觉契约', () => {
     }
   })
 
-  it('Todo 状态项不声明虚假的按钮交互样式', () => {
-    const workspaceStyles = cssFiles['../features/workspace/workspace.css']
-    expect(workspaceStyles).toContain('.todo-item {')
-    expect(workspaceStyles).not.toContain('.todo-item:hover')
-    expect(workspaceStyles).not.toContain('.todo-item:active')
-    expect(workspaceStyles).not.toContain('.todo-item:focus-visible')
-  })
-
   it('Markdown 使用编辑型表格并具备完整文章语义和显式 compact variant', () => {
     const markdownStyles = cssFiles['../features/conversation/conversation.css']
     expect(markdownStyles).toMatch(/\.markdown-content h1[\s\S]*\.markdown-content h6/)
@@ -471,22 +464,22 @@ describe('前端视觉契约', () => {
     expect(markdownStyles).not.toMatch(/tbody tr:nth-child|tbody tr:hover/)
   })
 
-  it('三态侧栏、头部 search、任务抽屉与必要断点均由 workspace 所有', () => {
+  it('三态侧栏、头部 search 与必要断点均由 workspace 所有', () => {
     const workspaceStyles = cssFiles['../features/workspace/workspace.css']
     expect(workspaceStyles).toMatch(/grid-template-columns:\s*var\(--layout-sidebar-expanded\)/)
     expect(workspaceStyles).toMatch(/data-sidebar-mode='rail'[\s\S]*var\(--layout-sidebar-rail\)/)
     expect(workspaceStyles).toContain('.sidebar-head.is-search-open')
     expect(workspaceStyles).toMatch(/\.workspace-sidebar\s*\{[^}]*overflow:\s*visible;/s)
-    expect(workspaceStyles).toMatch(/\.sidebar-rail\s*\{[^}]*gap:\s*var\(--space-3\);[^}]*padding:\s*var\(--space-5\) var\(--space-1-5\) var\(--space-3\);/s)
+    expect(workspaceStyles).toMatch(/\.sidebar-rail\s*\{[^}]*--sidebar-rail-control-size:\s*var\(--control-sm\);[^}]*gap:\s*calc\(var\(--space-4\) \+ var\(--space-0-5\)\);[^}]*padding:\s*calc\(\(var\(--layout-header-height\) - var\(--sidebar-rail-control-size\)\) \/ 2\) var\(--space-1-5\) var\(--space-3\);/s)
     expect(workspaceStyles).toMatch(/\.sidebar-rail \.ui-icon-button\s*\{[^}]*width:\s*var\(--control-sm\);[^}]*min-width:\s*var\(--control-sm\);[^}]*min-height:\s*var\(--control-sm\);[^}]*height:\s*var\(--control-sm\);/s)
-    expect(workspaceStyles).toMatch(/\.sidebar-head\s*\{[^}]*align-items:\s*center;[^}]*gap:\s*var\(--space-2\);[^}]*min-height:\s*calc\(var\(--control-xl\) \+ var\(--space-4\)\);[^}]*margin-bottom:\s*var\(--space-1\);/s)
+    expect(workspaceStyles).toMatch(/\.sidebar-head\s*\{[^}]*align-items:\s*center;[^}]*gap:\s*var\(--space-2\);[^}]*min-height:\s*var\(--layout-header-height\);[^}]*margin-bottom:\s*var\(--space-1\);/s)
     expect(workspaceStyles).toMatch(/\.sidebar-head-actions\s*\{[^}]*margin-left:\s*auto;[^}]*flex:\s*0 0 auto;[^}]*align-items:\s*center;[^}]*gap:\s*var\(--space-1\);/s)
     expect(workspaceStyles).toMatch(/\.brand\s*\{[^}]*overflow:\s*hidden;[^}]*flex:\s*1 1 auto;[^}]*padding:\s*0;/s)
     expect(workspaceStyles).not.toContain('.brand > span')
     expect(workspaceStyles).not.toMatch(/\.brand-(?:name|plus)|\.empty-brand-name/)
     expect(workspaceStyles).toMatch(/\.sidebar-head-actions \.ui-icon-button\s*\{[^}]*width:\s*var\(--control-xs\);[^}]*min-height:\s*var\(--control-xs\);[^}]*height:\s*var\(--control-xs\);/s)
     expect(workspaceStyles).toMatch(/@media \(any-hover:\s*none\), \(any-pointer:\s*coarse\)[\s\S]*\.sidebar-head-actions \.ui-icon-button\s*\{[^}]*width:\s*var\(--control-lg\);[^}]*min-width:\s*var\(--control-lg\);[^}]*height:\s*var\(--control-lg\);/s)
-    expect(workspaceStyles).toMatch(/@media \(any-hover:\s*none\), \(any-pointer:\s*coarse\)[\s\S]*\.sidebar-rail\s*\{[^}]*gap:\s*var\(--space-2\);[^}]*padding-top:\s*var\(--space-4\);/s)
+    expect(workspaceStyles).toMatch(/@media \(any-hover:\s*none\), \(any-pointer:\s*coarse\)[\s\S]*\.sidebar-rail\s*\{[^}]*--sidebar-rail-control-size:\s*var\(--control-lg\);/s)
     expect(workspaceStyles).toMatch(/@media \(any-hover:\s*none\), \(any-pointer:\s*coarse\)[\s\S]*\.sidebar-rail \.ui-icon-button\s*\{[^}]*width:\s*var\(--control-lg\);[^}]*min-width:\s*var\(--control-lg\);[^}]*min-height:\s*var\(--control-lg\);[^}]*height:\s*var\(--control-lg\);/s)
     expect(workspaceStyles).toMatch(/@media \(any-hover:\s*none\), \(any-pointer:\s*coarse\)[\s\S]*\.sidebar-head\s*\{[^}]*gap:\s*var\(--space-1\);[^}]*\}[\s\S]*\.sidebar-head-actions\s*\{[^}]*gap:\s*var\(--space-0\);/s)
     expect(workspaceStyles).toMatch(/\.brand:hover,[\s\S]*\.brand:active\s*{[^}]*background:\s*transparent;[^}]*box-shadow:\s*none;[^}]*color:\s*var\(--color-text-primary\);/s)
@@ -496,12 +489,8 @@ describe('前端视觉契约', () => {
     expect(workspaceStyles).toMatch(/\.sidebar-rail \.ui-tooltip\s*\{[^}]*top:\s*50%;[^}]*left:\s*calc\(100% \+ var\(--space-5\)\);[^}]*transform:\s*translate\(var\(--space-0-5\), -50%\);/s)
     expect(workspaceStyles).toMatch(/\.sidebar-rail \.ui-icon-button-wrap:hover \.ui-tooltip,[\s\S]*\.sidebar-rail \.ui-icon-button:focus-visible \+ \.ui-tooltip\s*\{[^}]*transform:\s*translate\(0, -50%\);/s)
     expect(workspaceStyles).toMatch(/@media \(max-width:\s*767px\)/)
-    expect(workspaceStyles).toMatch(/@media \(min-width:\s*1281px\)/)
     expect(workspaceStyles).not.toMatch(/\.app-shell\s*\{[^}]*transition:\s*grid-template-columns/s)
     expect(workspaceStyles).not.toMatch(/\.workspace-main\s*\{[^}]*transition:\s*margin-right/s)
-    expect(workspaceStyles).toMatch(/\.app-shell\.has-drawer \.workspace-main\s*\{[^}]*margin-right:\s*var\(--layout-task-drawer\)/s)
-    expect(workspaceStyles).toMatch(/\.task-drawer\s*\{[^}]*position:\s*fixed;[^}]*box-shadow:\s*var\(--shadow-3\)/s)
-    expect(workspaceStyles).not.toMatch(/\.task-drawer\s*\{[^}]*transition:/s)
     expect(workspaceStyles).toMatch(/\[data-workspace-layout-target\]\.is-layout-flipping\s*\{[^}]*will-change:\s*transform, opacity;/s)
     expect(workspaceLayoutAnimation).toContain('Flip.getState')
     expect(workspaceLayoutAnimation).toContain('Flip.from')
@@ -646,7 +635,6 @@ describe('前端视觉契约', () => {
     expect(conversationStyles).toMatch(/\.composer-attachment-remove:focus-visible\s*\{[^}]*outline:\s*0;/s)
     expect(conversationStyles).not.toMatch(/\.message-list :is\([^}]*\.subagent-card[^}]*\)/s)
     expect(conversationStyles).toMatch(/\.tool-row-title\s*\{[^}]*font-weight:\s*var\(--weight-regular\)/s)
-    expect(workspaceStyles).toMatch(/\.task-drawer :is\([^}]*\.todo-item[^}]*\) \*\s*\{[^}]*font-weight:\s*var\(--weight-regular\)/s)
   })
 
   it('Header 只保留全局操作，模型选择归属 Composer 工具行', () => {

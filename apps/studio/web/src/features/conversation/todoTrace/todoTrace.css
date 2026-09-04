@@ -27,7 +27,7 @@
     right: 0;
     display: grid;
     grid-template-rows: var(--layout-drawer-header-height) minmax(0, 1fr);
-    width: min(var(--layout-todo-trace-drawer), 100vw);
+    width: min(var(--layout-drawer-width), 100vw);
     height: 100dvh;
     padding: 0 var(--space-4) max(var(--space-4), env(safe-area-inset-bottom));
     transform: translateX(100%);
@@ -375,7 +375,7 @@
 
   @media (min-width: 1281px) {
     .app-shell.has-todo-trace .workspace-main {
-      margin-right: var(--layout-todo-trace-drawer);
+      margin-right: var(--layout-drawer-width);
     }
 
     .todo-trace-scrim { display: none; }

@@ -126,6 +126,9 @@ describe('ToastViewport', () => {
     expect(screen.getByRole('alert')).toHaveProperty('tagName', 'P')
     expect(screen.getByRole('status')).toHaveProperty('tagName', 'P')
     expect(screen.getByRole('alert').closest('li')).toHaveClass('toast-card')
+    expect(screen.getByRole('alert').closest('li')?.querySelector('.ui-feedback-icon__mark'))
+      .toHaveTextContent('!')
+    expect(screen.getByRole('alert').closest('li')?.querySelector('circle')).toBeNull()
   })
 
   it('removes only one trailing full stop and preserves sentence boundaries', () => {

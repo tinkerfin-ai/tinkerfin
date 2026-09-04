@@ -8,11 +8,9 @@ import type {
 import { useChainTrace } from './useChainTrace'
 
 const followTraceGraph = vi.hoisted(() => vi.fn())
-const queryTraceGraphPage = vi.hoisted(() => vi.fn())
 vi.mock('../../../api/conversation/traceGraph', async (importOriginal) => ({
   ...await importOriginal<typeof import('../../../api/conversation/traceGraph')>(),
   followTraceGraph,
-  queryTraceGraphPage,
 }))
 
 const page: TraceGraphPage = {
@@ -45,6 +43,7 @@ const page: TraceGraphPage = {
   }],
   orderedNodeIds: ['human-1'],
   rootNodeIds: ['human-1'],
+  matchedNodeIds: ['human-1'],
   nextCursor: null,
   asOfSeq: 1,
   facets: {
@@ -71,24 +70,17 @@ const waitForAbort = (signal?: AbortSignal) => new Promise<void>((resolve) => {
 describe('useChainTrace', () => {
   beforeEach(() => {
     followTraceGraph.mockReset()
-    queryTraceGraphPage.mockReset()
   })
 
-  it('loads a cursor page without opening a second live follower', async () => {
-    queryTraceGraphPage.mockResolvedValue({ ...page, nextCursor: 'older-again' })
+  it('stays idle without opening a follower until the view is active', () => {
     const { result } = renderHook(() => useChainTrace({
       threadId: 'thread-1',
-      active: true,
+      active: false,
       filter: {},
-      cursor: 'older-page',
+      limit: 1000,
     }))
 
-    await waitFor(() => expect(result.current.state.phase).toBe('ready'))
-    expect(queryTraceGraphPage).toHaveBeenCalledWith(
-      'thread-1',
-      {},
-      expect.objectContaining({ cursor: 'older-page', limit: 200 }),
-    )
+    expect(result.current.state.phase).toBe('idle')
     expect(followTraceGraph).not.toHaveBeenCalled()
   })
 
@@ -109,6 +101,7 @@ describe('useChainTrace', () => {
       threadId: 'thread-1',
       active: true,
       filter: { kinds: ['tool'] },
+      limit: 1000,
     }), { reactStrictMode: true })
 
     await waitFor(() => expect(result.current.state.phase).toBe('ready'))
@@ -117,6 +110,37 @@ describe('useChainTrace', () => {
     expect(signals[0].aborted).toBe(false)
     unmount()
     await waitFor(() => expect(signals[0].aborted).toBe(true))
+  })
+
+  it('keeps one follower when only the presentation view rerenders', async () => {
+    followTraceGraph.mockImplementation((
+      _threadId: string,
+      _filter: unknown,
+      options: { signal?: AbortSignal } = {},
+    ) => (
+      async function* (): AsyncGenerator<TraceGraphEvent> {
+        yield { type: 'snapshot', snapshot: page }
+        await waitForAbort(options.signal)
+      }
+    )())
+    const { result, rerender, unmount } = renderHook(
+      ({ view }: { view: 'timeline' | 'tree' }) => {
+        void view
+        return useChainTrace({
+          threadId: 'thread-1',
+          active: true,
+          filter: {},
+          limit: 1000,
+        })
+      },
+      { initialProps: { view: 'timeline' as 'timeline' | 'tree' } },
+    )
+
+    await waitFor(() => expect(result.current.state.phase).toBe('ready'))
+    rerender({ view: 'tree' })
+    await Promise.resolve()
+    expect(followTraceGraph).toHaveBeenCalledTimes(1)
+    unmount()
   })
 
   it('applies node changes in the framework-provided order', async () => {
@@ -149,6 +173,7 @@ describe('useChainTrace', () => {
             nodeRemoves: [],
             orderedNodeIds: ['human-1', 'assistant-1'],
             rootNodeIds: ['human-1'],
+            matchedNodeIds: ['human-1', 'assistant-1'],
             facets: {
               ...page.facets,
               kinds: { human_message: 1, assistant_message: 1 },
@@ -163,6 +188,7 @@ describe('useChainTrace', () => {
       threadId: 'thread-1',
       active: true,
       filter: {},
+      limit: 1000,
     }))
 
     await waitFor(() => expect(result.current.state.phase).toBe('ready'))
@@ -181,7 +207,7 @@ describe('useChainTrace', () => {
     unmount()
   })
 
-  it('replaces a stale older-page cursor when no matching node changes', async () => {
+  it('applies the latest completeness cursor when no matching node changes', async () => {
     followTraceGraph.mockImplementation((
       _threadId: string,
       _filter: unknown,
@@ -203,6 +229,7 @@ describe('useChainTrace', () => {
             nodeRemoves: [],
             orderedNodeIds: page.orderedNodeIds,
             rootNodeIds: page.rootNodeIds,
+            matchedNodeIds: page.matchedNodeIds,
             facets: page.facets,
             completeness: page.completeness,
           },
@@ -214,6 +241,7 @@ describe('useChainTrace', () => {
       threadId: 'thread-1',
       active: true,
       filter: { kinds: ['model'] },
+      limit: 1000,
     }))
 
     await waitFor(() => {
@@ -241,6 +269,7 @@ describe('useChainTrace', () => {
             nodeRemoves: [],
             orderedNodeIds: ['missing'],
             rootNodeIds: ['missing'],
+            matchedNodeIds: ['missing'],
             facets: page.facets,
             completeness: page.completeness,
           },
@@ -251,6 +280,7 @@ describe('useChainTrace', () => {
       threadId: 'thread-1',
       active: true,
       filter: {},
+      limit: 1000,
     }))
     await waitFor(() => expect(result.current.state.phase).toBe('error'))
   })
@@ -284,6 +314,7 @@ describe('useChainTrace', () => {
       threadId: 'thread-1',
       active: true,
       filter: { kinds },
+      limit: 1000,
     }), { initialProps: { kinds: ['tool'] } })
 
     await waitFor(() => expect(result.current.state.phase).toBe('ready'))
@@ -320,6 +351,7 @@ describe('useChainTrace', () => {
         threadId: 'thread-1',
         active: true,
         filter: {},
+        limit: 1000,
       }))
       await waitFor(() => expect(result.current.state.phase).toBe('error'))
     },

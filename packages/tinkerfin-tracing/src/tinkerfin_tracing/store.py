@@ -149,6 +149,7 @@ class TraceGraphNodeRecordPage:
     key: TraceThreadKey
     as_of_seq: int
     nodes: tuple[TraceGraphNodeRecord, ...]
+    matched_node_ids: tuple[str, ...]
     facets: TraceGraphFacets
     has_more: bool
     next_started_at: datetime | None

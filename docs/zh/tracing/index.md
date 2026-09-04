@@ -39,7 +39,6 @@ HumanMessage
     │   ├── SystemMessage
     │   └── AssistantMessage
     └── Tool
-        ├── ToolMessage
         ├── Skill
         └── Subagent
 ```
@@ -48,12 +47,14 @@ HumanMessage
 不会按时间或到达顺序关联并行工作。Tool 提议、审批后的真实执行和结果会聚合为一个 Tool 节点；
 被 HITL 拒绝的动作不会伪造执行。
 
-SystemMessage、ToolMessage、middleware、Run 和 Runtime task 属于技术节点，默认不返回。隐藏
-技术节点时，框架会把每个可见节点重连到最近的可见祖先，再返回权威顺序和根节点。
+SystemMessage、middleware、Run 和 Runtime task 属于技术节点，默认不返回；ToolMessage 结果
+保留在对应的 Tool 节点中。隐藏技术节点时，框架会把每个可见节点重连到最近的可见祖先，再
+返回权威顺序和根节点。
 
-Graph 筛选直接在 Store 中执行。request、result、message 和 state 正文只保存在 Ledger，只有
-命中节点才会按序号读取。SQL 按节点和 Run revision 存储，因此 sibling branch 互不覆盖；删除
-消息会写入当前 lineage 的 tombstone，不会删除祖先或 sibling 节点。
+Graph 筛选直接在 Store 中执行。request、result、message 和 state 正文只保存在 Ledger；正文
+搜索会先应用有索引的结构条件，再通过当前 Codec 解码有界候选集，不保存明文搜索文档。SQL
+按节点和 Run revision 存储，因此 sibling branch 互不覆盖；删除消息会写入当前 lineage 的
+tombstone，不会删除祖先或 sibling 节点。
 
 ## 历史与实时更新
 

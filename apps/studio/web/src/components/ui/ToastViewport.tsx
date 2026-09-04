@@ -1,10 +1,11 @@
 import { useGSAP } from '@gsap/react'
 import gsap from 'gsap'
-import { CheckCircle2, CircleAlert, Info, X } from 'lucide-react'
+import { X } from 'lucide-react'
 import { useCallback, useEffect, useRef } from 'react'
 
 import { MOTION_DURATION_SECONDS } from './motion'
 import { useI18n } from '../../i18n'
+import { FeedbackIcon } from './FeedbackState'
 
 gsap.registerPlugin(useGSAP)
 
@@ -20,12 +21,6 @@ const TOAST_DURATION_MS: Record<ToastItem['kind'], number> = {
   success: 3000,
   info: 4000,
   error: 6000,
-}
-
-const TOAST_ICON = {
-  success: CheckCircle2,
-  info: Info,
-  error: CircleAlert,
 }
 
 function ToastCard({
@@ -148,7 +143,6 @@ function ToastCard({
     return clearTimer
   }, [clearTimer, duration, scheduleDismiss])
 
-  const Icon = TOAST_ICON[toast.kind]
   const message = toast.message.replace(/。$/, '')
 
   return (
@@ -175,7 +169,7 @@ function ToastCard({
         resumeDismiss()
       }}
     >
-      <span className="toast-icon" aria-hidden="true"><Icon size={16} /></span>
+      <FeedbackIcon kind={toast.kind} />
       <p role={toast.kind === 'error' ? 'alert' : 'status'}>{message}</p>
       <button type="button" aria-label={t('关闭提示：{message}', { message })} onClick={() => requestDismissRef.current()}>
         <X size={13} />

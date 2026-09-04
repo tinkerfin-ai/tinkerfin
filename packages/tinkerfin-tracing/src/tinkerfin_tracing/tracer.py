@@ -2921,6 +2921,10 @@ class Tracer:
             include_technical_nodes=where.include_technical_nodes,
             include_ancestor_nodes=where.include_ancestor_nodes,
         )
+        direct_ids = frozenset(records.matched_node_ids)
+        matched_node_ids = tuple(
+            node_id for node_id in ordered_ids if node_id in direct_ids
+        )
         next_cursor = (
             encode_graph_cursor(
                 key=snapshot.key,
@@ -2946,6 +2950,7 @@ class Tracer:
                 nodes=nodes,
                 ordered_node_ids=ordered_ids,
                 root_node_ids=roots,
+                matched_node_ids=matched_node_ids,
                 next_cursor=next_cursor,
                 as_of_seq=records.as_of_seq,
                 facets=records.facets,
