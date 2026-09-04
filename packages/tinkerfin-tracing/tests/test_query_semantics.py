@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import UTC, datetime
 
 import pytest
+from pydantic import JsonValue
 
 from tinkerfin_contracts import (
     ModelCallObservation,
@@ -29,10 +31,12 @@ from tinkerfin_contracts import (
 )
 from tinkerfin_tracing import (
     AmbiguousTraceHead,
+    CapturedValue,
     InMemoryTraceStore,
     InvalidTraceCursor,
     RunFact,
     StateRevisionFact,
+    SubagentFact,
     TraceProjectionCheckpoint,
     TraceQuotaExceeded,
     Tracer,
@@ -41,6 +45,7 @@ from tinkerfin_tracing import (
     TracingErrorCode,
     TurnFact,
 )
+from tinkerfin_tracing._ids import scope_id
 from tinkerfin_tracing.graph import (
     TraceGraphFilter,
     TraceGraphNodeKind,
@@ -257,6 +262,99 @@ async def _record_large_model_call(tracer: Tracer, run_id: str) -> None:
     await _finish(session, context)
 
 
+async def _record_subagent_scope(
+    *,
+    limits: TraceGraphQueryLimits | None = None,
+) -> tuple[Tracer, tuple[str, ...]]:
+    store = InMemoryTraceStore()
+    tracer = Tracer(store=store, graph_query_limits=limits)
+    identity = RunIdentity(threadId="thread-query", runId="subagent-scope")
+    writer = await store.open_writer(identity)
+    now = datetime.now(UTC)
+    namespace = ("tools:child",)
+    subagent_id = scope_id("subagent", namespace, namespace[-1])
+    input_value: JsonValue = {"description": "inspect scope"}
+    captured_input = CapturedValue(
+        disposition="inline",
+        safe_size_bytes=len(
+            json.dumps(
+                input_value,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            ).encode()
+        ),
+        value=input_value,
+    )
+    await writer.append(
+        (
+            RunFact(
+                source_observation_id="subagent-run-start",
+                identity=identity,
+                occurred_at=now,
+                monotonic_ns=1,
+                phase="started",
+                input_kind="ordinary",
+            ),
+            TurnFact(
+                source_observation_id="subagent-turn",
+                identity=identity,
+                occurred_at=now,
+                monotonic_ns=2,
+                turn_id="turn-subagent",
+                user_message_id="user-subagent",
+            ),
+            SubagentFact(
+                source_observation_id="subagent-start",
+                identity=identity,
+                namespace=namespace,
+                occurred_at=now,
+                monotonic_ns=3,
+                phase="started",
+                subagent_id=subagent_id,
+                agent_name="reviewer",
+                parent_tool_call_id="call-child",
+                input=captured_input,
+                status="running",
+            ),
+            SubagentFact(
+                source_observation_id="subagent-complete",
+                identity=identity,
+                namespace=namespace,
+                occurred_at=now,
+                monotonic_ns=4,
+                phase="completed",
+                subagent_id=subagent_id,
+                agent_name="reviewer",
+                status="succeeded",
+            ),
+        )
+    )
+    await writer.append(
+        (
+            RunFact(
+                source_observation_id="subagent-run-terminal",
+                identity=identity,
+                occurred_at=now,
+                monotonic_ns=5,
+                phase="terminal",
+                outcome="succeeded",
+            ),
+            RunFact(
+                source_observation_id="subagent-run-closed",
+                identity=identity,
+                occurred_at=now,
+                monotonic_ns=6,
+                phase="closed",
+                outcome="succeeded",
+            ),
+        ),
+        mandatory=True,
+    )
+    await writer.aclose()
+    return tracer, namespace
+
+
 async def test_graph_page_prefers_structure_and_marks_omitted_details() -> None:
     limits = TraceGraphQueryLimits(max_page_bytes=2048)
     tracer = Tracer(graph_query_limits=limits)
@@ -266,7 +364,6 @@ async def test_graph_page_prefers_structure_and_marks_omitted_details() -> None:
         "thread-query",
         where=TraceGraphFilter(
             kinds={TraceGraphNodeKind.MODEL},
-            include_ancestor_nodes=False,
         ),
     )
 
@@ -276,46 +373,43 @@ async def test_graph_page_prefers_structure_and_marks_omitted_details() -> None:
     assert query.nodes[0].request_omitted is True
 
 
-async def test_graph_ancestor_expansion_obeys_the_independent_total_limit() -> None:
-    tracer = Tracer(
-        graph_query_limits=TraceGraphQueryLimits(
+async def test_graph_subagent_scope_expansion_obeys_the_total_limit() -> None:
+    tracer, namespace = await _record_subagent_scope(
+        limits=TraceGraphQueryLimits(
             max_direct_nodes=1,
             max_total_nodes=1,
         )
     )
-    await _record_large_model_call(tracer, "bounded-ancestors")
 
     with pytest.raises(TraceQuotaExceeded) as captured:
         await tracer.query(
             "thread-query",
             where=TraceGraphFilter(
-                kinds={TraceGraphNodeKind.ASSISTANT_MESSAGE},
-                include_ancestor_nodes=True,
+                kinds={TraceGraphNodeKind.HUMAN_MESSAGE},
+                namespaces={namespace},
             ),
             limit=1,
         )
     assert captured.value.context["resource"] == "graph_total_nodes"
 
 
-async def test_graph_query_separates_direct_matches_from_path_ancestors() -> None:
-    tracer = Tracer()
-    await _record_large_model_call(tracer, "matched-node-ids")
+async def test_graph_query_separates_direct_matches_from_scope_parents() -> None:
+    tracer, namespace = await _record_subagent_scope()
 
     query = await tracer.query(
         "thread-query",
         where=TraceGraphFilter(
-            kinds={TraceGraphNodeKind.ASSISTANT_MESSAGE},
-            include_ancestor_nodes=True,
+            kinds={TraceGraphNodeKind.HUMAN_MESSAGE},
+            namespaces={namespace},
         ),
     )
 
     direct = tuple(
-        node.id
-        for node in query.nodes
-        if node.kind is TraceGraphNodeKind.ASSISTANT_MESSAGE
+        node.id for node in query.nodes if node.kind is TraceGraphNodeKind.HUMAN_MESSAGE
     )
-    assert direct
-    assert len(query.nodes) > len(direct)
+    assert len(direct) == 1
+    assert len(query.nodes) == 2
+    assert any(node.kind is TraceGraphNodeKind.SUBAGENT for node in query.nodes)
     assert query.matched_node_ids == direct
     assert query.snapshot.matched_node_ids == direct
 
@@ -333,9 +427,7 @@ async def test_graph_content_search_obeys_total_candidate_limit() -> None:
         await tracer.query(
             "thread-query",
             where=TraceGraphFilter(
-                kinds={TraceGraphNodeKind.MODEL},
-                search="large-model",
-                include_ancestor_nodes=False,
+                search="run",
             ),
             limit=1,
         )
@@ -372,7 +464,6 @@ async def test_graph_content_search_follows_visible_assistant_body() -> None:
     where = TraceGraphFilter(
         kinds={TraceGraphNodeKind.ASSISTANT_MESSAGE},
         search="VISIBLE BODY",
-        include_ancestor_nodes=True,
     )
     query = await tracer.query("thread-query", where=where)
     assert query.nodes == ()
@@ -405,7 +496,7 @@ async def test_graph_content_search_follows_visible_assistant_body() -> None:
     assert update.matched_node_ids == tuple(
         node_id for node_id in update.ordered_node_ids if node_id in assistant_ids
     )
-    assert len(update.ordered_node_ids) > len(update.matched_node_ids)
+    assert update.ordered_node_ids == update.matched_node_ids
     await updates.aclose()
     await _finish(session, context)
 
@@ -418,7 +509,6 @@ async def test_graph_follow_applies_the_same_page_byte_budget() -> None:
         "thread-query",
         where=TraceGraphFilter(
             kinds={TraceGraphNodeKind.ASSISTANT_MESSAGE},
-            include_ancestor_nodes=False,
         ),
     )
     updates = query.follow()
@@ -483,7 +573,6 @@ async def test_graph_cursor_is_fixed_to_filter_head_and_current_tail() -> None:
     await session.force(ObservationBoundary.CALL_STARTED)
     where = TraceGraphFilter(
         kinds={TraceGraphNodeKind.MODEL},
-        include_ancestor_nodes=False,
     )
     first = await tracer.query("thread-query", where=where, limit=1)
     assert first.next_cursor is not None
@@ -538,7 +627,7 @@ async def test_graph_query_reselects_the_lineage_when_tail_advances_mid_read() -
     query = await tracer.query(
         "thread-query",
         head_run_id="race-parent",
-        where=TraceGraphFilter(include_technical_nodes=True),
+        where=TraceGraphFilter(),
         limit=100,
     )
 
@@ -548,25 +637,21 @@ async def test_graph_query_reselects_the_lineage_when_tail_advances_mid_read() -
     assert "turn-race-child" in {turn.id for turn in query.turns}
 
 
-async def test_turn_and_run_status_follow_the_latest_segment_terminal() -> None:
+async def test_turn_and_thread_status_follow_the_latest_segment_terminal() -> None:
     tracer = Tracer()
     context = _context("status")
     session = await _start(tracer, context)
 
     active = await tracer.get("thread-query")
     assert active.status.execution == "running"
-    assert next(node for node in active.graph.nodes if node.kind == "run").status == (
-        "running"
-    )
+    assert len(active.graph.turns) == 1
+    assert all(node.kind != "run" for node in active.graph.nodes)
 
     await _finish(session, context)
     finished = await tracer.get("thread-query")
-    finished_run = next(node for node in finished.graph.nodes if node.kind == "run")
-    assert finished_run.status == "succeeded"
-    assert finished_run.completed_at is not None
-    assert next(node for node in finished.graph.nodes if node.kind == "run").status == (
-        "succeeded"
-    )
+    assert finished.status.execution == "succeeded"
+    assert len(finished.graph.turns) == 1
+    assert all(node.kind != "run" for node in finished.graph.nodes)
 
 
 async def test_committed_terminal_precedes_the_writer_cleanup_fence() -> None:
@@ -595,11 +680,8 @@ async def test_committed_terminal_precedes_the_writer_cleanup_fence() -> None:
         committed = await tracer.get("thread-query")
 
         assert committed.status.execution == "succeeded"
-        assert committed.status.execution == "succeeded"
-        assert (
-            next(node for node in committed.graph.nodes if node.kind == "run").status
-            == "succeeded"
-        )
+        assert len(committed.graph.turns) == 1
+        assert all(node.kind != "run" for node in committed.graph.nodes)
     finally:
         await session.aclose()
 
@@ -718,7 +800,7 @@ async def test_event_pages_include_only_the_selected_head_lineage() -> None:
     }
 
 
-async def test_tree_includes_only_the_selected_run_lineage_within_one_turn() -> None:
+async def test_graph_excludes_a_sibling_lineage_and_keeps_one_turn() -> None:
     tracer = Tracer()
     await _record(tracer, "root")
     await _record(
@@ -735,10 +817,11 @@ async def test_tree_includes_only_the_selected_run_lineage_within_one_turn() -> 
     )
 
     selected = await tracer.get("thread-query", head_run_id="resume-a")
-    run_nodes = tuple(node for node in selected.graph.nodes if node.kind == "run")
 
-    assert {node.run_id for node in run_nodes} == {"root", "resume-a"}
-    assert {turn.id for turn in selected.graph.turns} == {run_nodes[0].turn_id}
+    assert selected.graph.nodes
+    assert {node.run_id for node in selected.graph.nodes} <= {"root", "resume-a"}
+    assert all(node.run_id != "resume-b" for node in selected.graph.nodes)
+    assert len(selected.graph.turns) == 1
 
 
 async def test_missing_prefix_is_scoped_to_the_selected_head_lineage() -> None:
@@ -781,15 +864,11 @@ async def test_implicit_continuation_keeps_the_sole_completed_parent_lineage(
     )
 
     thread = await tracer.get("thread-query")
-    run_nodes = tuple(node for node in thread.graph.nodes if node.kind == "run")
 
     assert thread.head_run_id == "implicit-continuation"
     assert thread.completeness.missing_prefix is False
     assert len(thread.graph.turns) == 1
-    assert {node.run_id for node in run_nodes} == {
-        "implicit-parent",
-        "implicit-continuation",
-    }
+    assert all(node.kind != "run" for node in thread.graph.nodes)
 
 
 @pytest.mark.parametrize("input_kind", ["resume", "abandon"])
@@ -936,7 +1015,7 @@ async def test_inactive_unterminated_head_is_marked_as_missing_tail() -> None:
     assert thread.completeness.missing_tail is True
 
 
-async def test_nested_subgraph_nodes_do_not_invent_missing_parent_evidence() -> None:
+async def test_nested_subgraphs_without_task_provenance_remain_flat() -> None:
     tracer = Tracer()
     context = _context("nested")
     session = await _start(tracer, context)
@@ -974,16 +1053,13 @@ async def test_nested_subgraph_nodes_do_not_invent_missing_parent_evidence() -> 
     )
 
     thread = await tracer.get("thread-query")
-    outer = next(node for node in thread.graph.nodes if node.name == "outer")
-    inner = next(node for node in thread.graph.nodes if node.name == "inner")
-    tool = next(node for node in thread.graph.nodes if node.kind == "tool")
-    human = next(node for node in thread.graph.nodes if node.kind == "human_message")
+    subagents = [node for node in thread.graph.nodes if node.kind == "subagent"]
+    nested = [node for node in thread.graph.nodes if node.namespace]
 
-    assert outer.parent_id == human.id
-    assert inner.parent_id == human.id
-    assert tool.parent_id == human.id
-    assert outer.link_issues
-    assert inner.link_issues
+    assert subagents == []
+    assert nested
+    assert all(node.parent_subagent_id is None for node in nested)
+    assert any(node.kind == "tool" for node in nested)
     await _finish(session, context)
 
 

@@ -1,13 +1,12 @@
 """AG-UI 实时流、Trace 历史和会话命令 HTTP 入口"""
 
-from collections.abc import AsyncGenerator
 from datetime import datetime
 from typing import Annotated, TypeAlias
 
 from ag_ui.core import RunAgentInput
 from fastapi import APIRouter, Depends, Header, Path, Query, Request
 from fastapi.exceptions import RequestValidationError
-from pydantic import BaseModel, ValidationError
+from pydantic import ValidationError
 from starlette.responses import Response, StreamingResponse
 
 from tinkerfin_studio.api.dependencies import (
@@ -16,7 +15,11 @@ from tinkerfin_studio.api.dependencies import (
     SessionDep,
     UserContextDep,
 )
-from tinkerfin_studio.api.responses import ApiResponse
+from tinkerfin_studio.api.responses import (
+    ApiResponse,
+    sse_response,
+    trace_sse_response,
+)
 from tinkerfin_studio.conversation.request import ChatRequest
 from tinkerfin_studio.conversation.schemas import (
     CancelRunResponse,
@@ -61,10 +64,10 @@ async def _trace_graph_filter(
     statuses: Annotated[
         list[TraceGraphNodeStatus] | None, Query(alias="status")
     ] = None,
-    parent_id: Annotated[str | None, Query(alias="parentId", min_length=1)] = None,
+    model_call_id: Annotated[
+        str | None, Query(alias="modelCallId", min_length=1)
+    ] = None,
     agents: Annotated[list[str] | None, Query(alias="agent")] = None,
-    middleware: Annotated[list[str] | None, Query()] = None,
-    skills: Annotated[list[str] | None, Query(alias="skill")] = None,
     providers: Annotated[list[str] | None, Query(alias="provider")] = None,
     models: Annotated[list[str] | None, Query(alias="model")] = None,
     namespaces: Annotated[list[str] | None, Query(alias="namespace")] = None,
@@ -73,14 +76,6 @@ async def _trace_graph_filter(
     ] = None,
     started_after: Annotated[datetime | None, Query(alias="startedAfter")] = None,
     started_before: Annotated[datetime | None, Query(alias="startedBefore")] = None,
-    include_technical_nodes: Annotated[
-        bool,
-        Query(alias="includeTechnicalNodes"),
-    ] = False,
-    include_ancestor_nodes: Annotated[
-        bool,
-        Query(alias="includeAncestorNodes"),
-    ] = True,
 ) -> TraceGraphFilter:
     """把可读查询参数转换为框架直接过滤条件"""
 
@@ -88,18 +83,14 @@ async def _trace_graph_filter(
         return TraceGraphFilter(
             kinds=set(kinds or ()),
             statuses=set(statuses or ()),
-            parent_id=parent_id,
+            model_call_id=model_call_id,
             agent_names=set(agents or ()),
-            middleware_names=set(middleware or ()),
-            skill_names=set(skills or ()),
             providers=set(providers or ()),
             models=set(models or ()),
             namespaces={_graph_namespace(value) for value in namespaces or ()},
             search=search,
             started_after=started_after,
             started_before=started_before,
-            include_technical_nodes=include_technical_nodes,
-            include_ancestor_nodes=include_ancestor_nodes,
         )
     except ValidationError as error:
         raise RequestValidationError(error.errors(include_input=False)) from error
@@ -183,11 +174,7 @@ async def follow_trace(
         thread_id,
         include_task_trace=include_task_trace,
     )
-    return StreamingResponse(
-        _trace_sse(events),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+    return trace_sse_response(events)
 
 
 @router.get(
@@ -227,11 +214,7 @@ async def follow_trace_graph(
         where=where,
         limit=limit,
     )
-    return StreamingResponse(
-        _trace_sse(events),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+    return trace_sse_response(events)
 
 
 @router.patch("/{thread_id}", response_model=ApiResponse[ConversationHistoryListItem])
@@ -280,11 +263,7 @@ async def chat(
         user=user,
         resources=get_resources(request.app),
     ).start(chat_request, last_event_id=last_event_id)
-    return StreamingResponse(
-        prepared.body,
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+    return sse_response(prepared.body)
 
 
 @router.post(
@@ -306,19 +285,3 @@ async def cancel_run(
         resources=get_resources(request.app),
     )
     return ApiResponse.success(await service.cancel(thread_id=thread_id, run_id=run_id))
-
-
-async def _trace_sse(
-    events: AsyncGenerator[BaseModel, None],
-) -> AsyncGenerator[bytes, None]:
-    """逐条编码 Trace 事件，并在断连时关闭框架 follow iterator"""
-
-    try:
-        async for event in events:
-            payload = event.model_dump_json(
-                by_alias=True,
-                exclude_none=False,
-            ).encode()
-            yield b"event: trace\ndata: " + payload + b"\n\n"
-    finally:
-        await events.aclose()

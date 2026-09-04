@@ -18,18 +18,24 @@
     --primitive-blue-300: #8ca3fe;
     --primitive-blue-600: #3964fe;
     --primitive-blue-700: #3158e6;
+    --primitive-blue-800: #284bc4;
     --primitive-red-50: #fef2f2;
     --primitive-red-600: #dc2626;
     --primitive-red-700: #c81e1e;
+    --primitive-rose-300: #ff8fa3;
+    --primitive-rose-700: #b52235;
     --primitive-green-50: #effbf3;
     --primitive-green-600: #22c55e;
     --primitive-green-700: #167a3c;
+    --primitive-green-800: #166534;
     --primitive-amber-50: #fff8e8;
     --primitive-amber-100: #fef5e7;
     --primitive-amber-400: #f7ad31;
     --primitive-amber-500: #f59e0b;
     --primitive-amber-800: #8a4b00;
     --primitive-amber-900: #27241f;
+    --primitive-violet-300: #c2a2f2;
+    --primitive-violet-700: #7040b8;
 
     --color-canvas: var(--primitive-white);
     --color-sidebar: var(--primitive-gray-sidebar);
@@ -71,6 +77,12 @@
     --color-on-warning: var(--primitive-gray-950);
     --color-warning-panel-accent: var(--primitive-amber-500);
     --color-warning-panel-background: var(--primitive-amber-100);
+    --color-trace-user: var(--color-text-secondary);
+    --color-trace-context: var(--primitive-blue-800);
+    --color-trace-model: var(--primitive-rose-700);
+    --color-trace-tool: var(--primitive-green-800);
+    --color-trace-subagent: var(--color-warning-text);
+    --color-trace-assistant: var(--primitive-violet-700);
     --color-focus: var(--primitive-blue-600);
     --color-focus-soft: rgb(57 100 254 / 18%);
     --color-code-surface: #f3f4f6;
@@ -208,6 +220,10 @@
     --color-on-warning: #151517;
     --color-warning-panel-accent: var(--primitive-amber-500);
     --color-warning-panel-background: var(--primitive-amber-900);
+    --color-trace-model: var(--primitive-rose-300);
+    --color-trace-context: var(--color-brand-text);
+    --color-trace-tool: var(--color-success-text);
+    --color-trace-assistant: var(--primitive-violet-300);
     --color-focus: #8ab4ff;
     --color-focus-soft: rgb(103 158 254 / 24%);
     --color-code-surface: #23262b;

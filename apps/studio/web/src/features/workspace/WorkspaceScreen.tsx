@@ -321,11 +321,12 @@ export function WorkspaceScreen({
     writeThreadToLocation(workspace.currentThreadId)
   }, [isHistoryBootstrapped, workspace.currentThreadId])
 
-  // 浏览器后退/前进到带其他 `?thread=` 的记录时，轻量同步当前会话（不走 selectConversation
-  // 的流断开确认，避免后退突弹确认框）
+  // 浏览器后退/前进时回到目标会话的对话页，并轻量同步当前会话；这里不走
+  // selectConversation 的流断开确认，避免历史导航突然弹出确认框
   useEffect(() => {
     const onPopState = () => {
       const threadId = readThreadFromLocation()
+      setWorkspaceView('conversation')
       setWorkspace((state) =>
         state.currentThreadId === threadId
           ? state

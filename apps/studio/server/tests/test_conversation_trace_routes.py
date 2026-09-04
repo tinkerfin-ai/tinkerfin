@@ -65,3 +65,46 @@ def test_trace_graph_routes_publish_the_complete_view_limit() -> None:
             parameter for parameter in parameters if parameter["name"] == "limit"
         )
         assert limit["schema"]["maximum"] == 1000
+
+
+def test_trace_graph_routes_publish_only_the_current_filter_contract() -> None:
+    """链路路由只公开平级事件与精确关系筛选参数"""
+
+    schema = create_application(lifespan=None).openapi()
+    expected_common = {
+        "thread_id",
+        "kind",
+        "status",
+        "modelCallId",
+        "agent",
+        "provider",
+        "model",
+        "namespace",
+        "query",
+        "startedAfter",
+        "startedBefore",
+        "limit",
+        "authorization",
+    }
+    query_parameters = {
+        parameter["name"]
+        for parameter in schema["paths"]["/api/conversation/{thread_id}/trace/graph"][
+            "get"
+        ]["parameters"]
+    }
+    follow_parameters = {
+        parameter["name"]
+        for parameter in schema["paths"][
+            "/api/conversation/{thread_id}/trace/graph/follow"
+        ]["get"]["parameters"]
+    }
+
+    assert query_parameters == expected_common | {"cursor"}
+    assert follow_parameters == expected_common
+    assert not {
+        "parentId",
+        "middleware",
+        "skill",
+        "includeTechnicalNodes",
+        "includeAncestorNodes",
+    } & (query_parameters | follow_parameters)

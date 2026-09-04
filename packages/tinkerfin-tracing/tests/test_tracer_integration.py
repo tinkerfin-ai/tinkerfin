@@ -5,19 +5,19 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from importlib.metadata import version
 from typing import Any, cast
 
 import pytest
 from ag_ui.core import RunFinishedEvent
-from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
 from langchain.agents.middleware.types import InputAgentState
 from langchain.tools import tool
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import (
     AIMessage,
     AIMessageChunk,
+    BaseMessage,
     HumanMessage,
     ToolMessage,
 )
@@ -31,13 +31,13 @@ from pydantic import BaseModel
 from tinkerfin import (
     DeepAgentDefinition,
     DeepAgentsV2RuntimeProfile,
-    DeepSeekReasoningExtractor,
+    DeepAgentsV3RuntimeProfile,
     RunObservationError,
     TinkerFin,
 )
 from tinkerfin_contracts import (
-    AgentStepObservation,
-    MiddlewareDescriptor,
+    ModelCallObservation,
+    NativeMessageRecord,
     NativeTaskObservation,
     RunClosedObservation,
     RunIdentity,
@@ -47,21 +47,19 @@ from tinkerfin_contracts import (
     RunStartedObservation,
     RunTerminalObservation,
     RuntimeObservation,
+    ToolExecutionObservation,
 )
 from tinkerfin_tracing import (
-    AgentStepFact,
     AmbiguousTraceHead,
-    CapturePolicy,
     FactCountProjection,
     FactCountResult,
     InMemoryTraceStore,
     MessageFact,
-    MiddlewareTraceCapture,
     ReasoningCapturePolicy,
     ReasoningFact,
     RunFact,
-    RuntimeTaskFact,
     StateRevisionFact,
+    SubagentFact,
     ToolFact,
     TraceEvent,
     TraceGraph,
@@ -73,7 +71,6 @@ from tinkerfin_tracing import (
     TurnFact,
 )
 from tinkerfin_tracing.graph import (
-    TECHNICAL_TRACE_GRAPH_NODE_KINDS,
     TraceGraphFilter,
     TraceGraphNodeKind,
     TraceGraphNodeStatus,
@@ -84,6 +81,23 @@ from tinkerfin_tracing.projection import (
     project_core,
     project_core_checkpoint,
 )
+
+
+class _ProviderReasoningExtractor:
+    @property
+    def name(self) -> str:
+        return "fixture.provider_reasoning"
+
+    def extract(
+        self,
+        message: BaseMessage,
+        *,
+        provider: str | None,
+    ) -> str | None:
+        if provider != "deepseek":
+            return None
+        value = message.additional_kwargs.get("reasoning_content")
+        return value if isinstance(value, str) and value else None
 
 
 class _Graph:
@@ -136,6 +150,863 @@ class _ReadCountingStore(InMemoryTraceStore):
             as_of_seq=as_of_seq,
             limit=limit,
         )
+
+
+async def _record_run(
+    tracer: Tracer,
+    *,
+    run_id: str,
+    parent_run_id: str | None = None,
+    input_kind: RunInputKind = "ordinary",
+) -> None:
+    identity = RunIdentity(threadId="thread-lineage", runId=run_id)
+    context = RunSourceContext(
+        identity=identity,
+        runtime_profile="deepagents-v2",
+        input_kind=input_kind,
+        parent_run_id=parent_run_id,
+        input={"messages": [{"role": "user", "id": f"user-{run_id}"}]},
+        config={},
+    )
+    session = await tracer.open_run(context)
+    now = datetime.now(UTC)
+    observations: tuple[RuntimeObservation, ...] = (
+        RunStartedObservation(identity=identity, observed_at=now, monotonic_ns=1),
+        RunInputObservation(
+            identity=identity,
+            source=context,
+            observed_at=now,
+            monotonic_ns=2,
+        ),
+        RunTerminalObservation(
+            identity=identity,
+            outcome="succeeded",
+            observed_at=now,
+            monotonic_ns=3,
+        ),
+        RunClosedObservation(
+            identity=identity,
+            outcome="succeeded",
+            observed_at=now,
+            monotonic_ns=4,
+        ),
+    )
+    for observation in observations:
+        await session.observe(observation)
+    await session.aclose()
+
+
+async def test_model_context_spans_preparation_without_duplicating_model_request() -> (
+    None
+):
+    tracer = Tracer(store=InMemoryTraceStore())
+    identity = RunIdentity(threadId="thread-context-time", runId="run-context-time")
+    source = RunSourceContext(
+        identity=identity,
+        runtime_profile="deepagents-v2",
+        input_kind="ordinary",
+        input={
+            "messages": [{"role": "user", "id": "context-user", "content": "question"}]
+        },
+        config={},
+    )
+    session = await tracer.open_run(source)
+    started = datetime(2026, 9, 5, 0, 0, tzinfo=UTC)
+    observations: tuple[RuntimeObservation, ...] = (
+        RunStartedObservation(
+            identity=identity,
+            observed_at=started,
+            monotonic_ns=1,
+        ),
+        RunInputObservation(
+            identity=identity,
+            source=source,
+            observed_at=started + timedelta(milliseconds=1),
+            monotonic_ns=2,
+        ),
+        ModelCallObservation(
+            identity=identity,
+            phase="started",
+            call_id="model-first",
+            messages=(
+                NativeMessageRecord(message_type="system", content="final system"),
+                NativeMessageRecord(message_type="human", content="question"),
+            ),
+            observed_at=started + timedelta(milliseconds=20),
+            monotonic_ns=3,
+        ),
+        ModelCallObservation(
+            identity=identity,
+            phase="completed",
+            call_id="model-first",
+            observed_at=started + timedelta(milliseconds=120),
+            monotonic_ns=4,
+        ),
+        ToolExecutionObservation(
+            identity=identity,
+            phase="started",
+            execution_id="tool-first",
+            tool_call_id="tool-call-first",
+            tool_name="search",
+            input={"query": "context"},
+            observed_at=started + timedelta(milliseconds=130),
+            monotonic_ns=5,
+        ),
+        ToolExecutionObservation(
+            identity=identity,
+            phase="completed",
+            execution_id="tool-first",
+            tool_call_id="tool-call-first",
+            tool_name="search",
+            output="result",
+            observed_at=started + timedelta(milliseconds=160),
+            monotonic_ns=6,
+        ),
+        ModelCallObservation(
+            identity=identity,
+            phase="started",
+            call_id="model-second",
+            messages=(
+                NativeMessageRecord(message_type="system", content="updated system"),
+                NativeMessageRecord(message_type="human", content="question"),
+            ),
+            observed_at=started + timedelta(milliseconds=175),
+            monotonic_ns=7,
+        ),
+        ModelCallObservation(
+            identity=identity,
+            phase="completed",
+            call_id="model-second",
+            observed_at=started + timedelta(milliseconds=220),
+            monotonic_ns=8,
+        ),
+        RunTerminalObservation(
+            identity=identity,
+            outcome="succeeded",
+            observed_at=started + timedelta(milliseconds=230),
+            monotonic_ns=9,
+        ),
+        RunClosedObservation(
+            identity=identity,
+            outcome="succeeded",
+            observed_at=started + timedelta(milliseconds=231),
+            monotonic_ns=10,
+        ),
+    )
+    for observation in observations:
+        await session.observe(observation)
+    await session.aclose()
+
+    graph = await tracer.query(identity.thread_id, limit=100)
+    contexts = [node for node in graph.nodes if node.kind is TraceGraphNodeKind.CONTEXT]
+
+    assert [
+        (node.started_at, node.completed_at, node.content) for node in contexts
+    ] == [
+        (
+            started + timedelta(milliseconds=1),
+            started + timedelta(milliseconds=20),
+            "final system",
+        ),
+        (
+            started + timedelta(milliseconds=160),
+            started + timedelta(milliseconds=175),
+            "updated system",
+        ),
+    ]
+    model_requests = [
+        node.request for node in graph.nodes if node.kind is TraceGraphNodeKind.MODEL
+    ]
+    assert len(model_requests) == 2
+
+
+async def test_resumed_subagent_context_excludes_prior_wait_time() -> None:
+    store = InMemoryTraceStore()
+    tracer = Tracer(store=store)
+    thread_id = "thread-resumed-subagent-context"
+    parent_identity = RunIdentity(threadId=thread_id, runId="run-parent")
+    parent_source = RunSourceContext(
+        identity=parent_identity,
+        runtime_profile="deepagents-v2",
+        input_kind="ordinary",
+        input={"messages": [{"role": "user", "content": "delegate"}]},
+        config={},
+    )
+    parent = await tracer.open_run(parent_source)
+    started = datetime(2026, 9, 5, 1, 0, tzinfo=UTC)
+    child_namespace = ("tools:delegation",)
+    parent_observations: tuple[RuntimeObservation, ...] = (
+        RunStartedObservation(
+            identity=parent_identity,
+            observed_at=started,
+            monotonic_ns=1_000,
+        ),
+        RunInputObservation(
+            identity=parent_identity,
+            source=parent_source,
+            observed_at=started + timedelta(milliseconds=1),
+            monotonic_ns=1_001,
+        ),
+        NativeTaskObservation(
+            identity=parent_identity,
+            namespace=(),
+            phase="start",
+            task_id="delegation",
+            name="tools",
+            input=[
+                {
+                    "name": "task",
+                    "id": "task-call",
+                    "args": {
+                        "description": "Delegate the work",
+                        "subagent_type": "researcher",
+                    },
+                }
+            ],
+            observed_at=started + timedelta(milliseconds=5),
+            monotonic_ns=1_005,
+        ),
+        NativeTaskObservation(
+            identity=parent_identity,
+            namespace=child_namespace,
+            phase="start",
+            task_id="child-model-task",
+            name="model",
+            input={},
+            observed_at=started + timedelta(milliseconds=8),
+            monotonic_ns=1_008,
+        ),
+        RunTerminalObservation(
+            identity=parent_identity,
+            outcome="interrupted",
+            observed_at=started + timedelta(milliseconds=20),
+            monotonic_ns=1_020,
+        ),
+        RunClosedObservation(
+            identity=parent_identity,
+            outcome="interrupted",
+            observed_at=started + timedelta(milliseconds=21),
+            monotonic_ns=1_021,
+        ),
+    )
+    for observation in parent_observations:
+        await parent.observe(observation)
+    await parent.aclose()
+
+    resumed_identity = RunIdentity(threadId=thread_id, runId="run-resumed")
+    resumed_source = RunSourceContext(
+        identity=resumed_identity,
+        runtime_profile="deepagents-v2",
+        input_kind="resume",
+        parent_run_id=parent_identity.run_id,
+        input=None,
+        config={},
+    )
+    resumed = await tracer.open_run(resumed_source)
+    resumed_at = started + timedelta(minutes=5)
+    resumed_observations: tuple[RuntimeObservation, ...] = (
+        RunStartedObservation(
+            identity=resumed_identity,
+            observed_at=resumed_at,
+            monotonic_ns=1,
+        ),
+        RunInputObservation(
+            identity=resumed_identity,
+            source=resumed_source,
+            observed_at=resumed_at + timedelta(milliseconds=1),
+            monotonic_ns=2,
+        ),
+        ModelCallObservation(
+            identity=resumed_identity,
+            namespace=child_namespace,
+            phase="started",
+            call_id="resumed-child-model",
+            messages=(
+                NativeMessageRecord(
+                    message_type="system",
+                    content="resumed child system",
+                ),
+            ),
+            observed_at=resumed_at + timedelta(milliseconds=18),
+            monotonic_ns=3,
+        ),
+        ModelCallObservation(
+            identity=resumed_identity,
+            namespace=child_namespace,
+            phase="completed",
+            call_id="resumed-child-model",
+            observed_at=resumed_at + timedelta(milliseconds=40),
+            monotonic_ns=4,
+        ),
+        NativeTaskObservation(
+            identity=resumed_identity,
+            namespace=(),
+            phase="result",
+            task_id="delegation",
+            name="tools",
+            result={},
+            observed_at=resumed_at + timedelta(milliseconds=45),
+            monotonic_ns=5,
+        ),
+        RunTerminalObservation(
+            identity=resumed_identity,
+            outcome="succeeded",
+            observed_at=resumed_at + timedelta(milliseconds=50),
+            monotonic_ns=6,
+        ),
+        RunClosedObservation(
+            identity=resumed_identity,
+            outcome="succeeded",
+            observed_at=resumed_at + timedelta(milliseconds=51),
+            monotonic_ns=7,
+        ),
+    )
+    for observation in resumed_observations:
+        await resumed.observe(observation)
+    await resumed.aclose()
+
+    graph = await tracer.query(
+        thread_id,
+        head_run_id=resumed_identity.run_id,
+        limit=100,
+    )
+    context = next(
+        node
+        for node in graph.nodes
+        if node.kind is TraceGraphNodeKind.CONTEXT
+        and node.content == "resumed child system"
+    )
+
+    assert context.started_at == resumed_at + timedelta(milliseconds=1)
+    assert context.completed_at == resumed_at + timedelta(milliseconds=18)
+    assert context.content == "resumed child system"
+    assert context.parent_subagent_id is not None
+
+
+async def test_parallel_subagents_keep_independent_context_boundaries() -> None:
+    tracer = Tracer(store=InMemoryTraceStore())
+    identity = RunIdentity(threadId="thread-parallel-context", runId="run-parallel")
+    source = RunSourceContext(
+        identity=identity,
+        runtime_profile="deepagents-v2",
+        input_kind="ordinary",
+        input={"messages": [{"role": "user", "content": "delegate twice"}]},
+        config={},
+    )
+    session = await tracer.open_run(source)
+    started = datetime(2026, 9, 5, 1, 30, tzinfo=UTC)
+    first_namespace = ("tools:delegation:0",)
+    second_namespace = ("tools:delegation:1",)
+    observations: tuple[RuntimeObservation, ...] = (
+        RunStartedObservation(
+            identity=identity,
+            observed_at=started,
+            monotonic_ns=1,
+        ),
+        RunInputObservation(
+            identity=identity,
+            source=source,
+            observed_at=started + timedelta(milliseconds=1),
+            monotonic_ns=2,
+        ),
+        NativeTaskObservation(
+            identity=identity,
+            namespace=(),
+            phase="start",
+            task_id="delegation",
+            name="tools",
+            input=[
+                {
+                    "name": "task",
+                    "id": "task-first",
+                    "args": {
+                        "description": "First task",
+                        "subagent_type": "researcher",
+                    },
+                },
+                {
+                    "name": "task",
+                    "id": "task-second",
+                    "args": {
+                        "description": "Second task",
+                        "subagent_type": "reviewer",
+                    },
+                },
+            ],
+            observed_at=started + timedelta(milliseconds=5),
+            monotonic_ns=3,
+        ),
+        NativeTaskObservation(
+            identity=identity,
+            namespace=first_namespace,
+            phase="start",
+            task_id="first-model-task",
+            name="model",
+            input={},
+            observed_at=started + timedelta(milliseconds=10),
+            monotonic_ns=4,
+        ),
+        NativeTaskObservation(
+            identity=identity,
+            namespace=second_namespace,
+            phase="start",
+            task_id="second-model-task",
+            name="model",
+            input={},
+            observed_at=started + timedelta(milliseconds=15),
+            monotonic_ns=5,
+        ),
+        ModelCallObservation(
+            identity=identity,
+            namespace=second_namespace,
+            phase="started",
+            call_id="second-model",
+            messages=(
+                NativeMessageRecord(message_type="system", content="second system"),
+            ),
+            observed_at=started + timedelta(milliseconds=25),
+            monotonic_ns=6,
+        ),
+        ModelCallObservation(
+            identity=identity,
+            namespace=first_namespace,
+            phase="started",
+            call_id="first-model",
+            messages=(
+                NativeMessageRecord(message_type="system", content="first system"),
+            ),
+            observed_at=started + timedelta(milliseconds=30),
+            monotonic_ns=7,
+        ),
+        ModelCallObservation(
+            identity=identity,
+            namespace=second_namespace,
+            phase="completed",
+            call_id="second-model",
+            observed_at=started + timedelta(milliseconds=40),
+            monotonic_ns=8,
+        ),
+        ModelCallObservation(
+            identity=identity,
+            namespace=first_namespace,
+            phase="completed",
+            call_id="first-model",
+            observed_at=started + timedelta(milliseconds=45),
+            monotonic_ns=9,
+        ),
+        NativeTaskObservation(
+            identity=identity,
+            namespace=(),
+            phase="result",
+            task_id="delegation",
+            name="tools",
+            result={},
+            observed_at=started + timedelta(milliseconds=50),
+            monotonic_ns=10,
+        ),
+        RunTerminalObservation(
+            identity=identity,
+            outcome="succeeded",
+            observed_at=started + timedelta(milliseconds=51),
+            monotonic_ns=11,
+        ),
+        RunClosedObservation(
+            identity=identity,
+            outcome="succeeded",
+            observed_at=started + timedelta(milliseconds=52),
+            monotonic_ns=12,
+        ),
+    )
+    for observation in observations:
+        await session.observe(observation)
+    await session.aclose()
+
+    graph = await tracer.query(identity.thread_id, limit=100)
+    contexts = {
+        node.content: node
+        for node in graph.nodes
+        if node.kind is TraceGraphNodeKind.CONTEXT
+    }
+
+    assert contexts["first system"].started_at == started + timedelta(milliseconds=10)
+    assert contexts["second system"].started_at == started + timedelta(milliseconds=15)
+    assert contexts["first system"].parent_subagent_id is not None
+    assert contexts["second system"].parent_subagent_id is not None
+    assert (
+        contexts["first system"].parent_subagent_id
+        != contexts["second system"].parent_subagent_id
+    )
+
+
+async def test_non_subagent_graph_context_uses_the_turn_root_boundary() -> None:
+    tracer = Tracer(store=InMemoryTraceStore())
+    identity = RunIdentity(threadId="thread-planning-context", runId="run-planning")
+    source = RunSourceContext(
+        identity=identity,
+        runtime_profile="deepagents-v2",
+        input_kind="ordinary",
+        input={"messages": [{"role": "user", "content": "make a plan"}]},
+        config={},
+    )
+    session = await tracer.open_run(source)
+    started = datetime(2026, 9, 5, 1, 45, tzinfo=UTC)
+    planning_namespace = ("planning:model",)
+    observations: tuple[RuntimeObservation, ...] = (
+        RunStartedObservation(
+            identity=identity,
+            observed_at=started,
+            monotonic_ns=1,
+        ),
+        RunInputObservation(
+            identity=identity,
+            source=source,
+            observed_at=started + timedelta(milliseconds=1),
+            monotonic_ns=2,
+        ),
+        ModelCallObservation(
+            identity=identity,
+            namespace=planning_namespace,
+            phase="started",
+            call_id="planning-model",
+            messages=(
+                NativeMessageRecord(message_type="system", content="planning system"),
+            ),
+            observed_at=started + timedelta(milliseconds=15),
+            monotonic_ns=3,
+        ),
+        ModelCallObservation(
+            identity=identity,
+            namespace=planning_namespace,
+            phase="completed",
+            call_id="planning-model",
+            observed_at=started + timedelta(milliseconds=40),
+            monotonic_ns=4,
+        ),
+        RunTerminalObservation(
+            identity=identity,
+            outcome="succeeded",
+            observed_at=started + timedelta(milliseconds=41),
+            monotonic_ns=5,
+        ),
+        RunClosedObservation(
+            identity=identity,
+            outcome="succeeded",
+            observed_at=started + timedelta(milliseconds=42),
+            monotonic_ns=6,
+        ),
+    )
+    for observation in observations:
+        await session.observe(observation)
+    await session.aclose()
+
+    graph = await tracer.query(identity.thread_id, limit=100)
+    context = next(
+        node for node in graph.nodes if node.kind is TraceGraphNodeKind.CONTEXT
+    )
+
+    assert context.namespace == planning_namespace
+    assert context.parent_subagent_id is None
+    assert context.started_at == started + timedelta(milliseconds=1)
+    assert context.completed_at == started + timedelta(milliseconds=15)
+
+
+async def test_cancelled_model_keeps_completed_context_without_system_message() -> None:
+    tracer = Tracer(store=InMemoryTraceStore())
+    identity = RunIdentity(threadId="thread-cancelled-context", runId="run-cancelled")
+    source = RunSourceContext(
+        identity=identity,
+        runtime_profile="deepagents-v2",
+        input_kind="ordinary",
+        input={"messages": [{"role": "user", "content": "question"}]},
+        config={},
+    )
+    session = await tracer.open_run(source)
+    started = datetime(2026, 9, 5, 2, 0, tzinfo=UTC)
+    observations: tuple[RuntimeObservation, ...] = (
+        RunStartedObservation(
+            identity=identity,
+            observed_at=started,
+            monotonic_ns=1,
+        ),
+        RunInputObservation(
+            identity=identity,
+            source=source,
+            observed_at=started + timedelta(milliseconds=1),
+            monotonic_ns=2,
+        ),
+        ModelCallObservation(
+            identity=identity,
+            phase="started",
+            call_id="cancelled-model",
+            messages=(NativeMessageRecord(message_type="human", content="question"),),
+            observed_at=started + timedelta(milliseconds=12),
+            monotonic_ns=3,
+        ),
+        ModelCallObservation(
+            identity=identity,
+            phase="cancelled",
+            call_id="cancelled-model",
+            observed_at=started + timedelta(milliseconds=30),
+            monotonic_ns=4,
+        ),
+        RunTerminalObservation(
+            identity=identity,
+            outcome="cancelled",
+            observed_at=started + timedelta(milliseconds=31),
+            monotonic_ns=5,
+        ),
+        RunClosedObservation(
+            identity=identity,
+            outcome="cancelled",
+            observed_at=started + timedelta(milliseconds=32),
+            monotonic_ns=6,
+        ),
+    )
+    for observation in observations:
+        await session.observe(observation)
+    await session.aclose()
+
+    graph = await tracer.query(identity.thread_id, limit=100)
+    context = next(
+        node for node in graph.nodes if node.kind is TraceGraphNodeKind.CONTEXT
+    )
+    model = next(node for node in graph.nodes if node.kind is TraceGraphNodeKind.MODEL)
+
+    assert context.status is TraceGraphNodeStatus.SUCCEEDED
+    assert context.started_at == started + timedelta(milliseconds=1)
+    assert context.completed_at == started + timedelta(milliseconds=12)
+    assert context.content is None
+    assert context.content_omitted is False
+    assert model.status is TraceGraphNodeStatus.CANCELLED
+
+
+async def test_model_retry_starts_context_at_the_failed_attempt_boundary() -> None:
+    tracer = Tracer(store=InMemoryTraceStore())
+    identity = RunIdentity(threadId="thread-retry-context", runId="run-retry")
+    source = RunSourceContext(
+        identity=identity,
+        runtime_profile="deepagents-v2",
+        input_kind="ordinary",
+        input={"messages": [{"role": "user", "content": "retry"}]},
+        config={},
+    )
+    session = await tracer.open_run(source)
+    started = datetime(2026, 9, 5, 3, 0, tzinfo=UTC)
+    observations: tuple[RuntimeObservation, ...] = (
+        RunStartedObservation(
+            identity=identity,
+            observed_at=started,
+            monotonic_ns=1,
+        ),
+        RunInputObservation(
+            identity=identity,
+            source=source,
+            observed_at=started + timedelta(milliseconds=1),
+            monotonic_ns=2,
+        ),
+        ModelCallObservation(
+            identity=identity,
+            phase="started",
+            call_id="model-attempt-1",
+            messages=(
+                NativeMessageRecord(message_type="system", content="attempt one"),
+            ),
+            observed_at=started + timedelta(milliseconds=10),
+            monotonic_ns=3,
+        ),
+        ModelCallObservation(
+            identity=identity,
+            phase="failed",
+            call_id="model-attempt-1",
+            error_type="builtins.RuntimeError",
+            observed_at=started + timedelta(milliseconds=25),
+            monotonic_ns=4,
+        ),
+        ModelCallObservation(
+            identity=identity,
+            phase="started",
+            call_id="model-attempt-2",
+            messages=(
+                NativeMessageRecord(message_type="system", content="attempt two"),
+            ),
+            observed_at=started + timedelta(milliseconds=40),
+            monotonic_ns=5,
+        ),
+        ModelCallObservation(
+            identity=identity,
+            phase="completed",
+            call_id="model-attempt-2",
+            observed_at=started + timedelta(milliseconds=60),
+            monotonic_ns=6,
+        ),
+        RunTerminalObservation(
+            identity=identity,
+            outcome="succeeded",
+            observed_at=started + timedelta(milliseconds=61),
+            monotonic_ns=7,
+        ),
+        RunClosedObservation(
+            identity=identity,
+            outcome="succeeded",
+            observed_at=started + timedelta(milliseconds=62),
+            monotonic_ns=8,
+        ),
+    )
+    for observation in observations:
+        await session.observe(observation)
+    await session.aclose()
+
+    graph = await tracer.query(identity.thread_id, limit=100)
+    contexts = sorted(
+        (node for node in graph.nodes if node.kind is TraceGraphNodeKind.CONTEXT),
+        key=lambda node: node.started_at,
+    )
+
+    assert [
+        (node.started_at, node.completed_at, node.content) for node in contexts
+    ] == [
+        (
+            started + timedelta(milliseconds=1),
+            started + timedelta(milliseconds=10),
+            "attempt one",
+        ),
+        (
+            started + timedelta(milliseconds=25),
+            started + timedelta(milliseconds=40),
+            "attempt two",
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    "runtime_profile",
+    [DeepAgentsV2RuntimeProfile(), DeepAgentsV3RuntimeProfile()],
+    ids=["v2-astream", "v3-astream-events"],
+)
+async def test_managed_ainvoke_builds_the_same_context_boundary(
+    runtime_profile: DeepAgentsV2RuntimeProfile | DeepAgentsV3RuntimeProfile,
+) -> None:
+    tracer = Tracer(store=InMemoryTraceStore())
+    tinkerfin = TinkerFin(runtime_profile=runtime_profile).observe(tracer)
+    definition = tinkerfin.create_deep_agent(
+        model=_SubagentToolBindingModel(responses=[AIMessage(content="done")]),
+        tools=[],
+        system_prompt="Use concise answers.",
+    )
+    identity = RunIdentity(
+        threadId=f"thread-context-{runtime_profile.profile_id}",
+        runId=f"run-context-{runtime_profile.profile_id}",
+    )
+
+    await tinkerfin.ainvoke(
+        identity,
+        agent=definition,
+        input={"messages": [HumanMessage(content="question", id="user-question")]},
+    )
+
+    graph = await tracer.query(identity.thread_id, limit=100)
+    context = next(
+        node for node in graph.nodes if node.kind is TraceGraphNodeKind.CONTEXT
+    )
+    model = next(node for node in graph.nodes if node.kind is TraceGraphNodeKind.MODEL)
+
+    assert context.completed_at is not None
+    assert context.completed_at == model.started_at
+    assert context.started_at <= context.completed_at
+    assert isinstance(context.content, str)
+    assert "Use concise answers." in context.content
+    assert any(
+        node.kind is TraceGraphNodeKind.ASSISTANT_MESSAGE and node.content == "done"
+        for node in graph.nodes
+    )
+
+
+@pytest.mark.parametrize(
+    "runtime_profile",
+    [DeepAgentsV2RuntimeProfile(), DeepAgentsV3RuntimeProfile()],
+    ids=["v2-astream", "v3-astream-events"],
+)
+async def test_managed_ainvoke_stores_one_delegated_task_payload(
+    runtime_profile: DeepAgentsV2RuntimeProfile | DeepAgentsV3RuntimeProfile,
+) -> None:
+    tracer = Tracer(store=InMemoryTraceStore())
+    tinkerfin = TinkerFin(runtime_profile=runtime_profile).observe(tracer)
+    task_description = "Complete the delegated work"
+    definition = tinkerfin.create_deep_agent(
+        model=_SubagentToolBindingModel(
+            responses=[
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "task",
+                            "args": {
+                                "description": task_description,
+                                "subagent_type": "researcher",
+                            },
+                            "id": "call-task",
+                            "type": "tool_call",
+                        }
+                    ],
+                ),
+                AIMessage(content="root done"),
+            ]
+        ),
+        tools=[],
+        subagents=[
+            {
+                "name": "researcher",
+                "description": "Complete delegated work",
+                "system_prompt": "Return the result.",
+                "model": _SubagentToolBindingModel(
+                    responses=[AIMessage(content="child done")]
+                ),
+                "tools": [],
+            }
+        ],
+    )
+    identity = RunIdentity(
+        threadId=f"thread-subagent-{runtime_profile.profile_id}",
+        runId=f"run-subagent-{runtime_profile.profile_id}",
+    )
+
+    await tinkerfin.ainvoke(
+        identity,
+        agent=definition,
+        input={"messages": [HumanMessage(content="delegate", id="user-delegate")]},
+    )
+
+    thread = await tracer.get(identity.thread_id)
+    events = (await thread.events(limit=100)).items
+    subagent = next(
+        event.fact
+        for event in events
+        if isinstance(event.fact, SubagentFact) and event.fact.phase == "started"
+    )
+    scoped_user_messages = [
+        event.fact
+        for event in events
+        if isinstance(event.fact, MessageFact)
+        and event.fact.namespace == subagent.namespace
+        and event.fact.role == "user"
+    ]
+    subagent_node = next(
+        node for node in thread.graph.nodes if node.kind is TraceGraphNodeKind.SUBAGENT
+    )
+    input_node = next(
+        node
+        for node in thread.graph.nodes
+        if node.kind is TraceGraphNodeKind.HUMAN_MESSAGE
+        and node.parent_subagent_id == subagent_node.id
+    )
+
+    assert subagent.input is not None
+    assert subagent.input.value == {
+        "description": task_description,
+        "subagent_type": "researcher",
+    }
+    assert scoped_user_messages == []
+    assert input_node.content == task_description
 
 
 setattr(
@@ -333,7 +1204,7 @@ async def test_in_memory_graph_index_rebuild_matches_online_reduction(
         pass
 
     snapshot = await store.snapshot(identity.thread_id)
-    where = TraceGraphFilter(include_technical_nodes=True)
+    where = TraceGraphFilter()
     before = await store.query_trace_graph(
         snapshot.key,
         run_ids=(identity.run_id,),
@@ -358,10 +1229,8 @@ async def test_in_memory_graph_index_rebuild_matches_online_reduction(
         }
     )
     graph = await tracer.query(identity.thread_id, limit=100)
-    assert graph.turns[0].root_node_id == graph.ordered_node_ids[0]
     assert graph.nodes[0].kind is TraceGraphNodeKind.HUMAN_MESSAGE
     assert [node.kind for node in graph.nodes].count(TraceGraphNodeKind.TOOL) == 1
-    assert graph.root_node_ids == (graph.turns[0].root_node_id,)
 
 
 async def test_runtime_trace_projects_messages_tree_state_todos_and_safe_events(
@@ -401,7 +1270,7 @@ async def test_runtime_trace_projects_messages_tree_state_todos_and_safe_events(
     indexed = (
         await tracer.query(
             "thread-1",
-            where=TraceGraphFilter(include_technical_nodes=True),
+            where=TraceGraphFilter(),
             limit=200,
         )
     ).snapshot
@@ -667,20 +1536,14 @@ async def test_canonical_graph_links_messages_models_and_one_aggregated_tool() -
         pass
 
     semantic = await tracer.query(identity.thread_id, limit=200)
-    technical = await tracer.query(
-        identity.thread_id,
-        where=TraceGraphFilter(include_technical_nodes=True),
-        limit=200,
-    )
-
     assert semantic.nodes[0].kind is TraceGraphNodeKind.HUMAN_MESSAGE
     assert [node.kind for node in semantic.nodes].count(TraceGraphNodeKind.TOOL) == 1
     assert [node.kind for node in semantic.nodes].count(
         TraceGraphNodeKind.ASSISTANT_MESSAGE
     ) == 2
     assert all(
-        node.parent_id is None
-        or node.parent_id in {candidate.id for candidate in semantic.nodes}
+        node.parent_subagent_id is None
+        or node.parent_subagent_id in {candidate.id for candidate in semantic.nodes}
         for node in semantic.nodes
     )
     tool_node = next(
@@ -689,13 +1552,15 @@ async def test_canonical_graph_links_messages_models_and_one_aggregated_tool() -
     assert tool_node.request == {"value": "kept"}
     assert tool_node.result is not None
     assert not tool_node.link_issues
-    assert not any(
-        node.kind in TECHNICAL_TRACE_GRAPH_NODE_KINDS for node in semantic.nodes
+    contexts = [
+        node for node in semantic.nodes if node.kind is TraceGraphNodeKind.CONTEXT
+    ]
+    assert contexts
+    assert all(
+        node.completed_at is not None and node.completed_at >= node.started_at
+        for node in contexts
     )
-    assert any(
-        node.kind is TraceGraphNodeKind.SYSTEM_MESSAGE for node in technical.nodes
-    )
-    assert not any(node.name == "ToolMessage" for node in technical.nodes)
+    assert not any(node.name == "ToolMessage" for node in semantic.nodes)
 
 
 async def test_real_subagent_cancellation_settles_every_child_graph_node() -> None:
@@ -768,7 +1633,7 @@ async def test_real_subagent_cancellation_settles_every_child_graph_node() -> No
 
     graph = await tracer.query(
         identity.thread_id,
-        where=TraceGraphFilter(include_technical_nodes=True),
+        where=TraceGraphFilter(),
         limit=200,
     )
     child_nodes = tuple(
@@ -777,7 +1642,6 @@ async def test_real_subagent_cancellation_settles_every_child_graph_node() -> No
         if node.kind
         in {
             TraceGraphNodeKind.SUBAGENT,
-            TraceGraphNodeKind.RUNTIME_TASK,
             TraceGraphNodeKind.TOOL,
         }
     )
@@ -795,388 +1659,6 @@ async def test_real_subagent_cancellation_settles_every_child_graph_node() -> No
         and node.status is TraceGraphNodeStatus.CANCELLED
         for node in child_nodes
     )
-
-
-async def test_capture_policy_records_only_visible_middleware_executions() -> None:
-    store = InMemoryTraceStore()
-    tracer = Tracer(
-        store=store,
-        capture_policy=CapturePolicy.public_history(
-            middleware_overrides={
-                "internal-metrics": MiddlewareTraceCapture.disabled(),
-            }
-        ),
-    )
-    identity = RunIdentity(threadId="thread-middleware-policy", runId="run-policy")
-    context = RunSourceContext(
-        identity=identity,
-        runtime_profile="deepagents-v2",
-        input_kind="ordinary",
-        input={"messages": [{"role": "user", "content": "hello"}]},
-        config={},
-        middleware=(
-            MiddlewareDescriptor(
-                name="internal-metrics",
-                class_name="acme.InternalMetricsMiddleware",
-                hooks=("awrap_model_call",),
-            ),
-            MiddlewareDescriptor(
-                name="prompt-cache",
-                class_name="acme.PromptCacheMiddleware",
-                hooks=("awrap_model_call",),
-            ),
-            MiddlewareDescriptor(
-                name="guardrail",
-                class_name="acme.GuardrailMiddleware",
-                hooks=("abefore_model",),
-            ),
-        ),
-    )
-
-    session = await tracer.open_run(context)
-    now = datetime.now(UTC)
-    observations: tuple[RuntimeObservation, ...] = (
-        RunStartedObservation(identity=identity, observed_at=now, monotonic_ns=1),
-        RunInputObservation(
-            identity=identity,
-            source=context,
-            observed_at=now,
-            monotonic_ns=2,
-        ),
-        AgentStepObservation(
-            identity=identity,
-            phase="started",
-            call_id="internal-metrics",
-            step_kind="middleware",
-            name="internal-metrics.awrap_model_call",
-            middleware_name="internal-metrics",
-            hook="awrap_model_call",
-            observed_at=now,
-            monotonic_ns=3,
-        ),
-        AgentStepObservation(
-            identity=identity,
-            phase="started",
-            call_id="prompt-cache",
-            step_kind="middleware",
-            name="prompt-cache.awrap_model_call",
-            middleware_name="prompt-cache",
-            hook="awrap_model_call",
-            observed_at=now,
-            monotonic_ns=4,
-        ),
-        AgentStepObservation(
-            identity=identity,
-            phase="completed",
-            call_id="prompt-cache",
-            step_kind="middleware",
-            name="prompt-cache.awrap_model_call",
-            middleware_name="prompt-cache",
-            hook="awrap_model_call",
-            observed_at=now,
-            monotonic_ns=5,
-        ),
-        AgentStepObservation(
-            identity=identity,
-            phase="started",
-            call_id="guardrail",
-            step_kind="middleware",
-            name="guardrail.abefore_model",
-            middleware_name="guardrail",
-            hook="abefore_model",
-            observed_at=now,
-            monotonic_ns=6,
-        ),
-        AgentStepObservation(
-            identity=identity,
-            phase="completed",
-            call_id="guardrail",
-            step_kind="middleware",
-            name="guardrail.abefore_model",
-            middleware_name="guardrail",
-            hook="abefore_model",
-            observed_at=now,
-            monotonic_ns=7,
-        ),
-        RunTerminalObservation(
-            identity=identity,
-            outcome="succeeded",
-            observed_at=now,
-            monotonic_ns=8,
-        ),
-        RunClosedObservation(
-            identity=identity,
-            outcome="succeeded",
-            observed_at=now,
-            monotonic_ns=9,
-        ),
-    )
-    for observation in observations:
-        await session.observe(observation)
-    await session.aclose()
-
-    snapshot = await store.snapshot(identity.thread_id)
-    events = await store.read_events(
-        snapshot.key,
-        after_seq=0,
-        as_of_seq=snapshot.as_of_seq,
-        limit=100,
-    )
-    middleware = tuple(
-        event.fact
-        for event in events
-        if isinstance(event.fact, AgentStepFact)
-        and event.fact.step_kind == "middleware"
-    )
-    assert {(fact.name, fact.hook) for fact in middleware} == {
-        ("prompt-cache.awrap_model_call", "awrap_model_call"),
-        ("guardrail.abefore_model", "abefore_model"),
-    }
-    assert all(event.fact.kind != "middleware" for event in events)
-    graph = await tracer.query(
-        identity.thread_id,
-        where=TraceGraphFilter(
-            kinds={TraceGraphNodeKind.MIDDLEWARE},
-            include_technical_nodes=True,
-        ),
-    )
-    middleware_nodes = (
-        node for node in graph.nodes if node.kind is TraceGraphNodeKind.MIDDLEWARE
-    )
-    assert {(node.name, node.hooks) for node in middleware_nodes} == {
-        ("prompt-cache.awrap_model_call", ("awrap_model_call",)),
-        ("guardrail.abefore_model", ("abefore_model",)),
-    }
-
-
-async def test_type_policy_disables_callback_only_internal_middleware() -> None:
-    store = InMemoryTraceStore()
-    tracer = Tracer(
-        store=store,
-        capture_policy=CapturePolicy.public_history(
-            middleware_overrides={
-                PatchToolCallsMiddleware: MiddlewareTraceCapture.disabled(),
-            }
-        ),
-    )
-    identity = RunIdentity(threadId="thread-internal-middleware", runId="run-policy")
-    context = RunSourceContext(
-        identity=identity,
-        runtime_profile="deepagents-v2",
-        input_kind="ordinary",
-        input={"messages": [{"role": "user", "content": "hello"}]},
-        config={},
-    )
-    session = await tracer.open_run(context)
-    now = datetime.now(UTC)
-    observations: tuple[RuntimeObservation, ...] = (
-        RunStartedObservation(identity=identity, observed_at=now, monotonic_ns=1),
-        RunInputObservation(
-            identity=identity,
-            source=context,
-            observed_at=now,
-            monotonic_ns=2,
-        ),
-        AgentStepObservation(
-            identity=identity,
-            phase="started",
-            call_id="internal-before-agent",
-            step_kind="middleware",
-            name="PatchToolCallsMiddleware.before_agent",
-            middleware_name="PatchToolCallsMiddleware",
-            hook="before_agent",
-            observed_at=now,
-            monotonic_ns=3,
-        ),
-        AgentStepObservation(
-            identity=identity,
-            phase="completed",
-            call_id="internal-before-agent",
-            step_kind="middleware",
-            name="PatchToolCallsMiddleware.before_agent",
-            middleware_name="PatchToolCallsMiddleware",
-            hook="before_agent",
-            observed_at=now,
-            monotonic_ns=4,
-        ),
-        RunTerminalObservation(
-            identity=identity,
-            outcome="succeeded",
-            observed_at=now,
-            monotonic_ns=5,
-        ),
-        RunClosedObservation(
-            identity=identity,
-            outcome="succeeded",
-            observed_at=now,
-            monotonic_ns=6,
-        ),
-    )
-    for observation in observations:
-        await session.observe(observation)
-    await session.aclose()
-
-    snapshot = await store.snapshot(identity.thread_id)
-    events = await store.read_events(
-        snapshot.key,
-        after_seq=0,
-        as_of_seq=snapshot.as_of_seq,
-        limit=100,
-    )
-    assert not any(isinstance(event.fact, AgentStepFact) for event in events)
-    graph = await tracer.query(
-        identity.thread_id,
-        where=TraceGraphFilter(
-            kinds={TraceGraphNodeKind.MIDDLEWARE},
-            include_technical_nodes=True,
-        ),
-    )
-    assert graph.nodes == ()
-
-
-@pytest.mark.parametrize("callback_first", [False, True])
-async def test_native_task_and_middleware_callback_share_one_graph_node(
-    callback_first: bool,
-) -> None:
-    store = InMemoryTraceStore()
-    tracer = Tracer(store=store)
-    identity = RunIdentity(threadId="thread-middleware-task", runId="run-task")
-    context = RunSourceContext(
-        identity=identity,
-        runtime_profile="deepagents-v2",
-        input_kind="ordinary",
-        input={"messages": [{"role": "user", "content": "hello"}]},
-        config={},
-    )
-    session = await tracer.open_run(context)
-    now = datetime.now(UTC)
-    task_started = NativeTaskObservation(
-        identity=identity,
-        namespace=(),
-        phase="start",
-        task_id="middleware-task",
-        name="TodoListMiddleware.after_model",
-        observed_at=now,
-        monotonic_ns=4 if callback_first else 3,
-    )
-    callback_started = AgentStepObservation(
-        identity=identity,
-        phase="started",
-        call_id="middleware-callback",
-        step_kind="middleware",
-        name="TodoListMiddleware.after_model",
-        task_id="middleware-task",
-        middleware_name="TodoListMiddleware",
-        hook="after_model",
-        observed_at=now,
-        monotonic_ns=3 if callback_first else 4,
-    )
-    observations: tuple[RuntimeObservation, ...] = (
-        RunStartedObservation(identity=identity, observed_at=now, monotonic_ns=1),
-        RunInputObservation(
-            identity=identity,
-            source=context,
-            observed_at=now,
-            monotonic_ns=2,
-        ),
-        *(
-            (callback_started, task_started)
-            if callback_first
-            else (task_started, callback_started)
-        ),
-        AgentStepObservation(
-            identity=identity,
-            phase="completed",
-            call_id="middleware-callback",
-            step_kind="middleware",
-            name="TodoListMiddleware.after_model",
-            task_id="middleware-task",
-            middleware_name="TodoListMiddleware",
-            hook="after_model",
-            observed_at=now,
-            monotonic_ns=5,
-        ),
-        NativeTaskObservation(
-            identity=identity,
-            namespace=(),
-            phase="result",
-            task_id="middleware-task",
-            name="TodoListMiddleware.after_model",
-            observed_at=now,
-            monotonic_ns=6,
-        ),
-        RunTerminalObservation(
-            identity=identity,
-            outcome="succeeded",
-            observed_at=now,
-            monotonic_ns=7,
-        ),
-        RunClosedObservation(
-            identity=identity,
-            outcome="succeeded",
-            observed_at=now,
-            monotonic_ns=8,
-        ),
-    )
-    for observation in observations:
-        await session.observe(observation)
-    await session.aclose()
-
-    thread = await tracer.get(identity.thread_id)
-    nodes = [
-        node
-        for node in thread.graph.nodes
-        if node.name == "TodoListMiddleware.after_model"
-    ]
-    assert len(nodes) == 1
-    assert nodes[0].kind is TraceGraphNodeKind.MIDDLEWARE
-    events = (await thread.events(limit=100)).items
-    assert sum(isinstance(event.fact, RuntimeTaskFact) for event in events) == 2
-    assert sum(isinstance(event.fact, AgentStepFact) for event in events) == 2
-
-
-async def _record_run(
-    tracer: Tracer,
-    *,
-    run_id: str,
-    parent_run_id: str | None = None,
-    input_kind: RunInputKind = "ordinary",
-) -> None:
-    identity = RunIdentity(threadId="thread-lineage", runId=run_id)
-    context = RunSourceContext(
-        identity=identity,
-        runtime_profile="deepagents-v2",
-        input_kind=input_kind,
-        parent_run_id=parent_run_id,
-        input={"messages": [{"role": "user", "id": f"user-{run_id}"}]},
-        config={},
-    )
-    session = await tracer.open_run(context)
-    now = datetime.now(UTC)
-    observations: tuple[RuntimeObservation, ...] = (
-        RunStartedObservation(identity=identity, observed_at=now, monotonic_ns=1),
-        RunInputObservation(
-            identity=identity,
-            source=context,
-            observed_at=now,
-            monotonic_ns=2,
-        ),
-        RunTerminalObservation(
-            identity=identity,
-            outcome="succeeded",
-            observed_at=now,
-            monotonic_ns=3,
-        ),
-        RunClosedObservation(
-            identity=identity,
-            outcome="succeeded",
-            observed_at=now,
-            monotonic_ns=4,
-        ),
-    )
-    for observation in observations:
-        await session.observe(observation)
-    await session.aclose()
 
 
 async def test_branches_require_an_explicit_head_and_window_loads_older_turns() -> None:
@@ -1580,7 +2062,7 @@ async def test_runtime_driver_and_tracer_require_both_reasoning_opt_ins(
         _Graph(parts),
         tracer=tracer,
         runtime_profile=DeepAgentsV2RuntimeProfile(
-            reasoning_extractors=(DeepSeekReasoningExtractor(),)
+            reasoning_extractors=(_ProviderReasoningExtractor(),)
         ),
     )
     runtime = definition.new(
@@ -1614,7 +2096,7 @@ async def test_runtime_driver_and_tracer_require_both_reasoning_opt_ins(
     assert thread.state.root["reasoning_content"] == "business value"
 
 
-async def test_deepseek_reasoning_opt_in_rejects_another_provider(
+async def test_host_reasoning_opt_in_rejects_another_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     parts: tuple[Mapping[str, object], ...] = (
@@ -1652,7 +2134,7 @@ async def test_deepseek_reasoning_opt_in_rejects_another_provider(
         _Graph(parts),
         tracer=tracer,
         runtime_profile=DeepAgentsV2RuntimeProfile(
-            reasoning_extractors=(DeepSeekReasoningExtractor(),)
+            reasoning_extractors=(_ProviderReasoningExtractor(),)
         ),
     )
     runtime = definition.new(

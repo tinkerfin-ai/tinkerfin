@@ -13,11 +13,19 @@ from typing import Literal
 
 import pytest
 from pydantic import JsonValue
+from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy import inspect, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 
-from tinkerfin_contracts import RunIdentity
+from tinkerfin_contracts import (
+    RunClosedObservation,
+    RunIdentity,
+    RunInputObservation,
+    RunSourceContext,
+    RunStartedObservation,
+    RunTerminalObservation,
+)
 from tinkerfin_tracing._graph_projection import project_trace_graph_node
 from tinkerfin_tracing._ids import scope_id
 from tinkerfin_tracing.backend import TraceLedgerStateRequest, TraceStoreOptions
@@ -26,22 +34,18 @@ from tinkerfin_tracing.codec import CanonicalTracePayloadCodec, EncodedTracePayl
 from tinkerfin_tracing.durable_store import InMemoryTraceStore
 from tinkerfin_tracing.errors import (
     TraceProjectionCheckpointConflict,
+    TraceQuotaExceeded,
     TraceStoreError,
     TraceStoreProtocolError,
     TraceStoreTimeout,
     TraceThreadNotFound,
 )
 from tinkerfin_tracing.facts import (
-    AgentStepFact,
     CallTrackingFact,
     ContextContributionFact,
-    InteractionFact,
     MessageFact,
     ModelCallFact,
-    PlanRevisionFact,
     RunFact,
-    RuntimeTaskFact,
-    SkillFact,
     SubagentFact,
     ToolExecutionFact,
     ToolFact,
@@ -173,7 +177,7 @@ def _backend(store: SqlAlchemyTraceStore) -> _SqlAlchemyTraceLedgerBackend:
     return backend
 
 
-async def test_sql_batch_admission_reuses_one_canonical_encoding_per_fact(
+async def test_sql_batch_admission_estimates_before_store_encoding(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -205,7 +209,132 @@ async def test_sql_batch_admission_reuses_one_canonical_encoding_per_fact(
     assert encoded_observations == [
         "observation-run-sql-started",
         "observation-run-sql-input",
+        "observation-run-sql-started",
+        "observation-run-sql-input",
     ]
+
+
+async def test_sql_batch_commits_through_the_store_codec(tmp_path: Path) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'batch-codec.db'}")
+    store = SqlAlchemyTraceStore(
+        engine,
+        namespace="batch-codec",
+        codec=_EncryptedTraceCodec(),
+    )
+    writer = TraceBatchWriter(
+        await store.open_writer(_identity()),
+        policy=TraceWritePolicy(max_batch_delay_seconds=0),
+        on_committed=_ignore_committed,
+    )
+    try:
+        facts = (_fact("started"), _fact("input"))
+        await writer.submit(facts, mandatory=False)
+        await writer.force()
+        snapshot = await store.snapshot(_identity().thread_id)
+        events = await store.read_events(
+            snapshot.key,
+            after_seq=0,
+            as_of_seq=snapshot.as_of_seq,
+            limit=10,
+        )
+        async with engine.connect() as connection:
+            payloads = (
+                (
+                    await connection.execute(
+                        text("SELECT payload FROM tinkerfin_trace_events")
+                    )
+                )
+                .scalars()
+                .all()
+            )
+
+        assert tuple(event.fact.source_observation_id for event in events) == tuple(
+            fact.source_observation_id for fact in facts
+        )
+        assert len(payloads) == len(facts)
+        assert all(not bytes(payload).startswith(b"{") for payload in payloads)
+    finally:
+        await writer.aclose()
+        await engine.dispose()
+
+
+async def test_tracer_uses_the_protected_codec_for_capture_search_and_rebuild(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'tracer-codec.db'}")
+    store = SqlAlchemyTraceStore(
+        engine, namespace="tracer-codec", codec=_EncryptedTraceCodec()
+    )
+    tracer = Tracer(store=store)
+    marker = "protected-task-marker"
+    source = RunSourceContext(
+        identity=_identity(),
+        runtime_profile="deepagents-v2",
+        input_kind="ordinary",
+        input={"messages": [{"id": "user-codec", "role": "user", "content": marker}]},
+        config={},
+    )
+    session = await tracer.open_run(source)
+    now = datetime.now(UTC)
+    try:
+        await session.observe(
+            RunStartedObservation(
+                identity=source.identity, observed_at=now, monotonic_ns=1
+            )
+        )
+        await session.observe(
+            RunInputObservation(
+                identity=source.identity, source=source, observed_at=now, monotonic_ns=2
+            )
+        )
+        await session.observe(
+            RunTerminalObservation(
+                identity=source.identity,
+                outcome="succeeded",
+                observed_at=now,
+                monotonic_ns=3,
+            )
+        )
+        await session.observe(
+            RunClosedObservation(
+                identity=source.identity,
+                outcome="succeeded",
+                observed_at=now,
+                monotonic_ns=4,
+            )
+        )
+        await session.aclose()
+        page = await tracer.query(
+            source.identity.thread_id, where=TraceGraphFilter(search=marker)
+        )
+        assert [node.content for node in page.nodes] == [marker]
+        assert await tracer.rebuild_graph(source.identity.thread_id) == 1
+        rebuilt = await tracer.query(
+            source.identity.thread_id, where=TraceGraphFilter(search=marker)
+        )
+        assert rebuilt.nodes == page.nodes
+        assert (await tracer.get(source.identity.thread_id)).messages[
+            0
+        ].content == marker
+        async with engine.connect() as connection:
+            payloads = (
+                (
+                    await connection.execute(
+                        text("SELECT payload FROM tinkerfin_trace_events")
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        assert payloads
+        assert all(
+            not bytes(payload).startswith(b"{")
+            and marker.encode() not in bytes(payload)
+            for payload in payloads
+        )
+    finally:
+        await session.aclose()
+        await engine.dispose()
 
 
 async def test_sqlite_graph_index_filters_without_repeating_fact_payloads(
@@ -233,6 +362,7 @@ async def test_sqlite_graph_index_filters_without_repeating_fact_payloads(
                     occurred_at=now,
                     monotonic_ns=3,
                     phase="started",
+                    context_started_at=now,
                     call_id="model-call",
                     system_message_positions=(),
                     output_message_ids=(),
@@ -269,8 +399,9 @@ async def test_sqlite_graph_index_filters_without_repeating_fact_payloads(
         node = project_trace_graph_node(
             page.nodes[0],
             turn_id="turn:test",
-            parent_id=None,
+            parent_subagent_id=None,
             relationship_missing=False,
+            allowed_run_ids=frozenset({_identity().run_id}),
         )
         assert node.request == {"messages": [{"content": marker}]}
         rebuilt = await store.rebuild_trace_graph(snapshot.key)
@@ -446,8 +577,9 @@ async def test_sqlite_graph_query_keeps_latest_non_null_lineage_values(
     sql = SqlAlchemyTraceStore(engine, namespace="graph-lineage-values")
     stores = (memory, sql)
     origin_started_at = datetime(2026, 1, 1, 0, 0, 10, tzinfo=UTC)
-    later_revision_at = origin_started_at - timedelta(seconds=5)
+    later_revision_at = origin_started_at + timedelta(seconds=5)
     subagent_id = "subagent:shared"
+    subagent_namespace = ("tools:shared",)
     try:
         for store in stores:
             root = await store.open_writer(_identity("graph-parent"))
@@ -458,6 +590,7 @@ async def test_sqlite_graph_query_keeps_latest_non_null_lineage_values(
                     SubagentFact(
                         source_observation_id="graph-parent-subagent",
                         identity=_identity("graph-parent"),
+                        namespace=subagent_namespace,
                         occurred_at=origin_started_at,
                         monotonic_ns=2,
                         phase="started",
@@ -475,6 +608,7 @@ async def test_sqlite_graph_query_keeps_latest_non_null_lineage_values(
                     SubagentFact(
                         source_observation_id="graph-child-subagent",
                         identity=_identity("graph-child"),
+                        namespace=subagent_namespace,
                         occurred_at=later_revision_at,
                         monotonic_ns=3,
                         phase="completed",
@@ -498,15 +632,18 @@ async def test_sqlite_graph_query_keeps_latest_non_null_lineage_values(
             )
             observed.append(
                 (
-                    page.nodes[0].structural_parent_id,
+                    page.nodes[0].parent_subagent_id,
                     page.nodes[0].link_issue,
                     page.nodes[0].started_at,
+                    page.nodes[0].status,
+                    page.nodes[0].run_id,
                 )
             )
 
-        assert observed[0][0] is not None
+        assert observed[0][0] is None
         assert observed == [observed[0], observed[0]]
         assert observed[0][2] == origin_started_at
+        assert observed[0][3:] == (TraceGraphNodeStatus.SUCCEEDED, "graph-child")
 
         for store in stores:
             snapshot = await store.snapshot(_identity().thread_id)
@@ -566,7 +703,6 @@ async def test_sqlite_graph_query_keeps_latest_non_null_lineage_values(
                 limit=10,
             )
             assert len(exact_unicode.nodes) == 1
-            assert exact_unicode.facets.kinds[TraceGraphNodeKind.SUBAGENT] == 1
             assert different_unicode_case.nodes == ()
             assert len(exact_chinese.nodes) == 1
             assert len(exact_kelvin.nodes) == 1
@@ -581,12 +717,12 @@ async def test_sqlite_graph_query_keeps_latest_non_null_lineage_values(
                     SubagentFact(
                         source_observation_id="graph-conflicting-subagent",
                         identity=_identity("graph-conflict"),
+                        namespace=subagent_namespace,
                         occurred_at=later_revision_at + timedelta(seconds=1),
                         monotonic_ns=4,
                         phase="completed",
                         subagent_id=subagent_id,
                         agent_name="KÄ研究Researcher",
-                        parent_tool_call_id="another-call",
                         status="succeeded",
                     ),
                 )
@@ -599,8 +735,451 @@ async def test_sqlite_graph_query_keeps_latest_non_null_lineage_values(
                 where=TraceGraphFilter(kinds={TraceGraphNodeKind.SUBAGENT}),
                 limit=10,
             )
-            assert page.nodes[0].structural_parent_id is not None
-            assert page.nodes[0].structural_parent_id.endswith(":another-call")
+            assert page.nodes[0].parent_subagent_id is None
+    finally:
+        await engine.dispose()
+
+
+async def test_graph_store_accepts_64_subagent_levels_and_rejects_level_65(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'graph-scope-depth.db'}"
+    )
+    stores = (
+        InMemoryTraceStore(namespace="graph-scope-depth-memory"),
+        SqlAlchemyTraceStore(engine, namespace="graph-scope-depth-sql"),
+    )
+    run_id = "graph-scope-depth"
+    namespaces = tuple(
+        tuple(f"tools:{index}" for index in range(depth)) for depth in range(1, 66)
+    )
+    try:
+        for store in stores:
+            writer = await store.open_writer(_identity(run_id))
+            await writer.append(
+                (
+                    _fact("started", run_id=run_id),
+                    *(
+                        SubagentFact(
+                            source_observation_id=f"subagent-depth-{depth}",
+                            identity=_identity(run_id),
+                            namespace=namespace,
+                            occurred_at=datetime(2026, 1, 1, tzinfo=UTC)
+                            + timedelta(milliseconds=depth),
+                            monotonic_ns=depth + 1,
+                            phase="started",
+                            subagent_id=scope_id(
+                                "subagent",
+                                namespace,
+                                namespace[-1],
+                            ),
+                            agent_name=f"agent-{depth}",
+                            parent_tool_call_id=f"task-{depth}",
+                            model_call_id=f"model-{depth}",
+                            status="running",
+                        )
+                        for depth, namespace in enumerate(namespaces, start=1)
+                    ),
+                )
+            )
+            await writer.aclose()
+
+        for store in stores:
+            snapshot = await store.snapshot(_identity().thread_id)
+            legal = await store.query_trace_graph(
+                snapshot.key,
+                run_ids=(run_id,),
+                where=TraceGraphFilter(
+                    kinds={TraceGraphNodeKind.SUBAGENT},
+                    namespaces={namespaces[63]},
+                ),
+                limit=1,
+                max_nodes=65,
+            )
+            assert len(legal.nodes) == 64
+            assert len(legal.matched_node_ids) == 1
+
+            with pytest.raises(TraceStoreProtocolError, match="at most 64 levels"):
+                await store.query_trace_graph(
+                    snapshot.key,
+                    run_ids=(run_id,),
+                    where=TraceGraphFilter(
+                        kinds={TraceGraphNodeKind.SUBAGENT},
+                        agent_names={"agent-65"},
+                    ),
+                    limit=1,
+                    max_nodes=65,
+                )
+    finally:
+        await engine.dispose()
+
+
+async def test_sql_append_reuses_locked_state_and_one_graph_prefetch(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'graph-prefetch.db'}"
+    )
+    store = SqlAlchemyTraceStore(engine, namespace="graph-prefetch")
+    writer = await store.open_writer(_identity("graph-prefetch"))
+    identity = _identity("graph-prefetch")
+    now = datetime.now(UTC)
+    statements: list[str] = []
+
+    def record_statement(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        statements.append(statement)
+
+    sqlalchemy_event.listen(
+        engine.sync_engine,
+        "before_cursor_execute",
+        record_statement,
+    )
+    try:
+        await writer.append(
+            tuple(
+                ToolExecutionFact(
+                    source_observation_id=f"prefetch-start-{index}",
+                    identity=identity,
+                    occurred_at=now + timedelta(microseconds=index),
+                    monotonic_ns=index + 1,
+                    phase="started",
+                    execution_id=f"execution-{index}",
+                    source_tool_call_id=f"call-{index}",
+                    tool_name="read_file",
+                    input=_captured({"path": str(index)}),
+                )
+                for index in range(20)
+            )
+        )
+        first_append_statements = tuple(statements)
+        assert not any(
+            statement.lstrip().upper().startswith("SELECT")
+            and "tinkerfin_trace_events" in statement
+            for statement in first_append_statements
+        )
+
+        statements.clear()
+        await writer.append(
+            tuple(
+                ToolExecutionFact(
+                    source_observation_id=f"prefetch-end-{index}",
+                    identity=identity,
+                    occurred_at=now + timedelta(seconds=1, microseconds=index),
+                    monotonic_ns=100 + index,
+                    phase="completed",
+                    execution_id=f"execution-{index}",
+                    source_tool_call_id=f"call-{index}",
+                    tool_name="read_file",
+                    output=_captured("ok"),
+                )
+                for index in range(20)
+            )
+        )
+        graph_selects = tuple(
+            statement
+            for statement in statements
+            if statement.lstrip().upper().startswith("SELECT")
+            and "tinkerfin_trace_graph_nodes" in statement
+        )
+        assert len(graph_selects) == 1
+    finally:
+        sqlalchemy_event.remove(
+            engine.sync_engine,
+            "before_cursor_execute",
+            record_statement,
+        )
+        await writer.aclose()
+        await engine.dispose()
+
+
+async def test_sqlite_graph_lineage_limit_stays_below_the_bind_boundary(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'graph-lineage-limit.db'}"
+    )
+    store = SqlAlchemyTraceStore(engine, namespace="graph-lineage-limit")
+    writer = await store.open_writer(_identity("lineage-00000"))
+    try:
+        await writer.append((_fact("started", run_id="lineage-00000"),))
+        await writer.aclose()
+        snapshot = await store.snapshot(_identity().thread_id)
+        run_ids = tuple(f"lineage-{index:05d}" for index in range(10_000))
+
+        page = await store.query_trace_graph(
+            snapshot.key,
+            run_ids=run_ids,
+            where=TraceGraphFilter(),
+            limit=1,
+            max_nodes=1,
+        )
+        assert page.nodes == ()
+
+        with pytest.raises(TraceQuotaExceeded) as captured:
+            await store.query_trace_graph(
+                snapshot.key,
+                run_ids=(*run_ids, "lineage-overflow"),
+                where=TraceGraphFilter(),
+                limit=1,
+                max_nodes=1,
+            )
+        assert captured.value.context["resource"] == "graph_lineage_runs"
+    finally:
+        await writer.aclose()
+        await engine.dispose()
+
+
+async def test_tool_lineage_uses_execution_time_and_clears_stale_completion(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'tool-lineage-time.db'}"
+    )
+    stores = (
+        InMemoryTraceStore(namespace="tool-lineage-time-memory"),
+        SqlAlchemyTraceStore(engine, namespace="tool-lineage-time-sql"),
+    )
+    proposal_at = datetime(2026, 1, 1, 0, 0, 1, tzinfo=UTC)
+    execution_at = proposal_at + timedelta(seconds=1)
+    completed_at = proposal_at + timedelta(seconds=2)
+    resumed_at = proposal_at + timedelta(seconds=3)
+    selected_runs = ("tool-proposal", "tool-execution", "tool-resume")
+    try:
+        for store in stores:
+            proposal = await store.open_writer(_identity("tool-proposal"))
+            await proposal.append(
+                (
+                    _fact("started", run_id="tool-proposal"),
+                    ToolFact(
+                        source_observation_id="tool-proposal",
+                        identity=_identity("tool-proposal"),
+                        occurred_at=proposal_at,
+                        monotonic_ns=2,
+                        phase="started",
+                        tool_call_id=scope_id("tool", (), "shared-tool"),
+                        source_tool_call_id="shared-tool",
+                        parent_call_id="model-call",
+                        tool_name="read_file",
+                    ),
+                )
+            )
+            await proposal.aclose()
+
+            execution = await store.open_writer(_identity("tool-execution"))
+            await execution.append(
+                (
+                    _fact("started", run_id="tool-execution"),
+                    ToolExecutionFact(
+                        source_observation_id="tool-execution-start",
+                        identity=_identity("tool-execution"),
+                        occurred_at=execution_at,
+                        monotonic_ns=2,
+                        phase="started",
+                        execution_id="shared-execution",
+                        parent_call_id="model-call",
+                        source_tool_call_id="shared-tool",
+                        tool_name="read_file",
+                        input=_captured({"path": "a"}),
+                    ),
+                    ToolExecutionFact(
+                        source_observation_id="tool-execution-complete",
+                        identity=_identity("tool-execution"),
+                        occurred_at=completed_at,
+                        monotonic_ns=3,
+                        phase="completed",
+                        execution_id="shared-execution",
+                        parent_call_id="model-call",
+                        source_tool_call_id="shared-tool",
+                        tool_name="read_file",
+                        output=_captured("ok"),
+                    ),
+                )
+            )
+            await execution.aclose()
+
+            snapshot = await store.snapshot(_identity().thread_id)
+            completed = await store.query_trace_graph(
+                snapshot.key,
+                run_ids=selected_runs[:2],
+                where=TraceGraphFilter(kinds={TraceGraphNodeKind.TOOL}),
+                limit=10,
+            )
+            assert completed.nodes[0].started_at == execution_at
+            assert completed.nodes[0].completed_at == completed_at
+            assert completed.nodes[0].status is TraceGraphNodeStatus.SUCCEEDED
+
+            resumed = await store.open_writer(_identity("tool-resume"))
+            await resumed.append(
+                (
+                    _fact("started", run_id="tool-resume"),
+                    ToolExecutionFact(
+                        source_observation_id="tool-resume-start",
+                        identity=_identity("tool-resume"),
+                        occurred_at=resumed_at,
+                        monotonic_ns=2,
+                        phase="started",
+                        execution_id="shared-execution",
+                        parent_call_id="model-call",
+                        source_tool_call_id="shared-tool",
+                        tool_name="read_file",
+                        input=_captured({"path": "a"}),
+                    ),
+                )
+            )
+            await resumed.aclose()
+
+            snapshot = await store.snapshot(_identity().thread_id)
+            running = await store.query_trace_graph(
+                snapshot.key,
+                run_ids=selected_runs,
+                where=TraceGraphFilter(kinds={TraceGraphNodeKind.TOOL}),
+                limit=10,
+            )
+            observed = (
+                running.nodes[0].started_at,
+                running.nodes[0].completed_at,
+                running.nodes[0].status,
+            )
+            assert observed == (resumed_at, None, TraceGraphNodeStatus.RUNNING)
+
+            await store.rebuild_trace_graph(snapshot.key)
+            rebuilt = await store.query_trace_graph(
+                snapshot.key,
+                run_ids=selected_runs,
+                where=TraceGraphFilter(kinds={TraceGraphNodeKind.TOOL}),
+                limit=10,
+            )
+            assert (
+                rebuilt.nodes[0].started_at,
+                rebuilt.nodes[0].completed_at,
+                rebuilt.nodes[0].status,
+            ) == observed
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.parametrize("terminal_status", ["succeeded", "failed", "cancelled"])
+async def test_subagent_lineage_survives_two_interrupts_and_rebuild(
+    tmp_path: Path,
+    terminal_status: Literal["succeeded", "failed", "cancelled"],
+) -> None:
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / f'subagent-{terminal_status}.db'}"
+    )
+    stores = (
+        InMemoryTraceStore(namespace=f"subagent-{terminal_status}-memory"),
+        SqlAlchemyTraceStore(engine, namespace=f"subagent-{terminal_status}-sql"),
+    )
+    namespace = ("tools:shared-subagent",)
+    subagent_id = scope_id("subagent", namespace, namespace[-1])
+    first_start = datetime(2026, 1, 1, 0, 0, 1, tzinfo=UTC)
+    second_start = first_start + timedelta(seconds=2)
+    final_start = first_start + timedelta(seconds=4)
+    terminal_at = first_start + timedelta(seconds=5)
+    run_ids = ("subagent-first", "subagent-second", "subagent-final")
+    try:
+        for store in stores:
+            for run_id, started_at in zip(
+                run_ids,
+                (first_start, second_start, final_start),
+                strict=True,
+            ):
+                writer = await store.open_writer(_identity(run_id))
+                facts: list[TraceSemanticFact] = [
+                    _fact("started", run_id=run_id),
+                    SubagentFact(
+                        source_observation_id=f"{run_id}-start",
+                        identity=_identity(run_id),
+                        namespace=namespace,
+                        occurred_at=started_at,
+                        monotonic_ns=2,
+                        phase="started",
+                        subagent_id=subagent_id,
+                        agent_name="researcher",
+                        parent_tool_call_id="task-call",
+                        parent_execution_id="task-execution",
+                        model_call_id="model-call",
+                        status="running",
+                    ),
+                ]
+                if run_id != "subagent-final":
+                    facts.append(
+                        SubagentFact(
+                            source_observation_id=f"{run_id}-waiting",
+                            identity=_identity(run_id),
+                            namespace=namespace,
+                            occurred_at=started_at + timedelta(seconds=1),
+                            monotonic_ns=3,
+                            phase="updated",
+                            subagent_id=subagent_id,
+                            agent_name="researcher",
+                            status="waiting",
+                        )
+                    )
+                else:
+                    facts.append(
+                        SubagentFact(
+                            source_observation_id=f"{run_id}-terminal",
+                            identity=_identity(run_id),
+                            namespace=namespace,
+                            occurred_at=terminal_at,
+                            monotonic_ns=3,
+                            phase="completed",
+                            subagent_id=subagent_id,
+                            agent_name="researcher",
+                            status=terminal_status,
+                        )
+                    )
+                await writer.append(tuple(facts))
+                await writer.aclose()
+
+                if run_id == "subagent-second":
+                    interrupted_snapshot = await store.snapshot(_identity().thread_id)
+                    interrupted = await store.query_trace_graph(
+                        interrupted_snapshot.key,
+                        run_ids=run_ids[:2],
+                        where=TraceGraphFilter(kinds={TraceGraphNodeKind.SUBAGENT}),
+                        limit=10,
+                    )
+                    assert interrupted.nodes[0].started_at == second_start
+                    assert interrupted.nodes[0].completed_at is None
+                    assert interrupted.nodes[0].status is TraceGraphNodeStatus.WAITING
+
+            snapshot = await store.snapshot(_identity().thread_id)
+            page = await store.query_trace_graph(
+                snapshot.key,
+                run_ids=run_ids,
+                where=TraceGraphFilter(kinds={TraceGraphNodeKind.SUBAGENT}),
+                limit=10,
+            )
+            expected_status = TraceGraphNodeStatus(terminal_status)
+            observed = (
+                page.nodes[0].started_at,
+                page.nodes[0].completed_at,
+                page.nodes[0].status,
+            )
+            assert observed == (final_start, terminal_at, expected_status)
+
+            await store.rebuild_trace_graph(snapshot.key)
+            rebuilt = await store.query_trace_graph(
+                snapshot.key,
+                run_ids=run_ids,
+                where=TraceGraphFilter(kinds={TraceGraphNodeKind.SUBAGENT}),
+                limit=10,
+            )
+            assert (
+                rebuilt.nodes[0].started_at,
+                rebuilt.nodes[0].completed_at,
+                rebuilt.nodes[0].status,
+            ) == observed
     finally:
         await engine.dispose()
 
@@ -636,7 +1215,6 @@ async def test_memory_and_sql_graph_removal_isolated_to_one_sibling_lineage(
                 run_ids=("remove-root",),
                 where=TraceGraphFilter(
                     kinds={TraceGraphNodeKind.HUMAN_MESSAGE},
-                    include_ancestor_nodes=False,
                 ),
                 limit=10,
             )
@@ -668,7 +1246,6 @@ async def test_memory_and_sql_graph_removal_isolated_to_one_sibling_lineage(
                 run_ids=("remove-root", "remove-branch"),
                 where=TraceGraphFilter(
                     kinds={TraceGraphNodeKind.HUMAN_MESSAGE},
-                    include_ancestor_nodes=False,
                 ),
                 limit=10,
             )
@@ -677,11 +1254,10 @@ async def test_memory_and_sql_graph_removal_isolated_to_one_sibling_lineage(
                 run_ids=("remove-root", "keep-branch"),
                 where=TraceGraphFilter(
                     kinds={TraceGraphNodeKind.HUMAN_MESSAGE},
-                    include_ancestor_nodes=False,
                 ),
                 limit=10,
             )
-            assert removed_page.nodes == ()
+            assert removed_page.nodes == (), type(store).__name__
             assert tuple(node.node_id for node in sibling_page.nodes) == (
                 human_node_id,
             )
@@ -692,7 +1268,6 @@ async def test_memory_and_sql_graph_removal_isolated_to_one_sibling_lineage(
                 run_ids=("remove-root", "remove-branch"),
                 where=TraceGraphFilter(
                     kinds={TraceGraphNodeKind.HUMAN_MESSAGE},
-                    include_ancestor_nodes=False,
                 ),
                 limit=10,
             )
@@ -723,6 +1298,7 @@ async def test_sqlite_graph_clears_a_tool_parent_gap_after_model_completion(
                     occurred_at=now,
                     monotonic_ns=1,
                     phase="started",
+                    context_started_at=now,
                     call_id=model_id,
                     parent_call_id="agent-call",
                     request=_captured({"messages": []}),
@@ -762,29 +1338,27 @@ async def test_sqlite_graph_clears_a_tool_parent_gap_after_model_completion(
             run_ids=(_identity().run_id,),
             where=TraceGraphFilter(
                 kinds={TraceGraphNodeKind.TOOL},
-                include_ancestor_nodes=False,
             ),
             limit=10,
         )
 
         assert len(page.nodes) == 1
-        assert page.nodes[0].structural_parent_id == model_id
+        assert page.nodes[0].model_call_id == model_id
         assert page.nodes[0].link_issue is None
 
         await writer.aclose()
         async with engine.begin() as connection:
             await connection.execute(text("DELETE FROM tinkerfin_trace_graph_nodes"))
-        assert await Tracer(store=store).rebuild_graph(_identity().thread_id) == 2
+        assert await Tracer(store=store).rebuild_graph(_identity().thread_id) == 3
         rebuilt = await store.query_trace_graph(
             (await store.snapshot(_identity().thread_id)).key,
             run_ids=(_identity().run_id,),
             where=TraceGraphFilter(
                 kinds={TraceGraphNodeKind.TOOL},
-                include_ancestor_nodes=False,
             ),
             limit=10,
         )
-        assert rebuilt.nodes[0].structural_parent_id == model_id
+        assert rebuilt.nodes[0].model_call_id == model_id
         assert rebuilt.nodes[0].link_issue is None
     finally:
         await writer.aclose()
@@ -815,10 +1389,13 @@ async def test_sqlite_graph_query_reads_details_through_a_custom_encrypted_codec
                     occurred_at=now,
                     monotonic_ns=2,
                     phase="started",
+                    context_started_at=now,
                     call_id="encrypted-model-call",
-                    system_message_positions=(),
+                    system_message_positions=(0,),
                     output_message_ids=(),
-                    request=_captured({"messages": [{"content": marker}]}),
+                    request=_captured(
+                        {"messages": [{"messageType": "system", "content": marker}]}
+                    ),
                 ),
                 ModelCallFact(
                     source_observation_id="encrypted-model-completed",
@@ -848,15 +1425,28 @@ async def test_sqlite_graph_query_reads_details_through_a_custom_encrypted_codec
             where=TraceGraphFilter(
                 kinds={TraceGraphNodeKind.MODEL},
                 search="ENCRYPTED-FINAL-REQUEST-MARKER",
-                include_ancestor_nodes=False,
             ),
+            limit=10,
+        )
+        context_page = await store.query_trace_graph(
+            snapshot.key,
+            run_ids=(_identity().run_id,),
+            where=TraceGraphFilter(kinds={TraceGraphNodeKind.CONTEXT}),
             limit=10,
         )
         node = project_trace_graph_node(
             page.nodes[0],
             turn_id="turn:test",
-            parent_id=None,
+            parent_subagent_id=None,
             relationship_missing=False,
+            allowed_run_ids=frozenset({_identity().run_id}),
+        )
+        context = project_trace_graph_node(
+            context_page.nodes[0],
+            turn_id="turn:test",
+            parent_subagent_id=None,
+            relationship_missing=False,
+            allowed_run_ids=frozenset({_identity().run_id}),
         )
         async with engine.connect() as connection:
             payloads = (
@@ -869,7 +1459,12 @@ async def test_sqlite_graph_query_reads_details_through_a_custom_encrypted_codec
                 .all()
             )
 
-        assert node.request == {"messages": [{"content": marker}]}
+        assert node.request == {
+            "messages": [{"messageType": "system", "content": marker}]
+        }
+        assert context.content == marker
+        assert context.request is None
+        assert context_page.nodes[0].request_seq == page.nodes[0].request_seq
         assert searched.matched_node_ids == (page.nodes[0].node_id,)
         assert tuple(item.node_id for item in searched.nodes) == (
             page.nodes[0].node_id,
@@ -877,98 +1472,6 @@ async def test_sqlite_graph_query_reads_details_through_a_custom_encrypted_codec
         assert all(marker.encode() not in bytes(payload) for payload in payloads)
     finally:
         await writer.aclose()
-        await engine.dispose()
-
-
-async def test_memory_and_sql_facets_exclude_their_own_active_filter(
-    tmp_path: Path,
-) -> None:
-    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'facets.db'}")
-    stores = (
-        InMemoryTraceStore(namespace="graph-facets"),
-        SqlAlchemyTraceStore(engine, namespace="graph-facets"),
-    )
-    now = datetime.now(UTC)
-    request = _captured({"messages": []})
-    try:
-        for store in stores:
-            writer = await store.open_writer(_identity())
-            await writer.append(
-                (
-                    _fact("started"),
-                    ModelCallFact(
-                        source_observation_id="facet-success-start",
-                        identity=_identity(),
-                        occurred_at=now,
-                        monotonic_ns=2,
-                        phase="started",
-                        call_id="facet-success",
-                        system_message_positions=(),
-                        output_message_ids=(),
-                        request=request,
-                    ),
-                    ModelCallFact(
-                        source_observation_id="facet-success-completed",
-                        identity=_identity(),
-                        occurred_at=now,
-                        monotonic_ns=3,
-                        phase="completed",
-                        call_id="facet-success",
-                        system_message_positions=(),
-                        output_message_ids=(),
-                    ),
-                    ModelCallFact(
-                        source_observation_id="facet-failure-start",
-                        identity=_identity(),
-                        occurred_at=now,
-                        monotonic_ns=4,
-                        phase="started",
-                        call_id="facet-failure",
-                        system_message_positions=(),
-                        output_message_ids=(),
-                        request=request,
-                    ),
-                    ModelCallFact(
-                        source_observation_id="facet-failure-completed",
-                        identity=_identity(),
-                        occurred_at=now,
-                        monotonic_ns=5,
-                        phase="failed",
-                        call_id="facet-failure",
-                        system_message_positions=(),
-                        output_message_ids=(),
-                        error_type="builtins.RuntimeError",
-                    ),
-                )
-            )
-            await writer.append((_fact("terminal"), _fact("closed")), mandatory=True)
-            await writer.aclose()
-            snapshot = await store.snapshot(_identity().thread_id)
-
-            kind_page = await store.query_trace_graph(
-                snapshot.key,
-                run_ids=(_identity().run_id,),
-                where=TraceGraphFilter(
-                    kinds={TraceGraphNodeKind.MODEL},
-                    include_technical_nodes=True,
-                ),
-                limit=10,
-            )
-            status_page = await store.query_trace_graph(
-                snapshot.key,
-                run_ids=(_identity().run_id,),
-                where=TraceGraphFilter(
-                    statuses={TraceGraphNodeStatus.FAILED},
-                    include_technical_nodes=True,
-                ),
-                limit=10,
-            )
-
-            assert kind_page.facets.kinds[TraceGraphNodeKind.RUN] == 1
-            assert kind_page.facets.kinds[TraceGraphNodeKind.MODEL] == 2
-            assert status_page.facets.statuses[TraceGraphNodeStatus.FAILED] == 1
-            assert status_page.facets.statuses[TraceGraphNodeStatus.SUCCEEDED] == 2
-    finally:
         await engine.dispose()
 
 
@@ -1049,7 +1552,6 @@ async def test_memory_and_sql_search_decoded_content_without_ancestor_pollution(
                 where=TraceGraphFilter(
                     kinds={TraceGraphNodeKind.CUSTOM},
                     search="CHILD VISIBLE MARKER",
-                    include_ancestor_nodes=True,
                 ),
                 limit=10,
             )
@@ -1059,7 +1561,6 @@ async def test_memory_and_sql_search_decoded_content_without_ancestor_pollution(
                 where=TraceGraphFilter(
                     kinds={TraceGraphNodeKind.CUSTOM},
                     search="customer_note",
-                    include_ancestor_nodes=False,
                 ),
                 limit=10,
             )
@@ -1069,7 +1570,6 @@ async def test_memory_and_sql_search_decoded_content_without_ancestor_pollution(
                 where=TraceGraphFilter(
                     kinds={TraceGraphNodeKind.CUSTOM},
                     search="42",
-                    include_ancestor_nodes=False,
                 ),
                 limit=10,
             )
@@ -1079,296 +1579,15 @@ async def test_memory_and_sql_search_decoded_content_without_ancestor_pollution(
                 where=TraceGraphFilter(
                     kinds={TraceGraphNodeKind.CUSTOM},
                     search="核验完成",
-                    include_ancestor_nodes=False,
                 ),
                 limit=10,
             )
 
-            assert {item.node_id for item in page.nodes} == {
-                "search-parent",
-                "search-child",
-            }
+            assert {item.node_id for item in page.nodes} == {"search-child"}
             assert page.matched_node_ids == ("search-child",)
-            assert page.facets.kinds == {TraceGraphNodeKind.CUSTOM: 1}
             assert key_match.matched_node_ids == ("search-child",)
             assert scalar_match.matched_node_ids == ("search-child",)
             assert unicode_match.matched_node_ids == ("search-child",)
-            await writer.aclose()
-    finally:
-        await engine.dispose()
-
-
-async def test_memory_and_sql_search_every_public_graph_detail_source(
-    tmp_path: Path,
-) -> None:
-    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'detail-search.db'}")
-    stores = (
-        InMemoryTraceStore(namespace="graph-detail-search"),
-        SqlAlchemyTraceStore(engine, namespace="graph-detail-search"),
-    )
-    now = datetime.now(UTC)
-    human_id = scope_id("message", (), "search-human")
-    assistant_id = scope_id("message", (), "search-assistant")
-    omitted = CapturedValue(
-        disposition="omitted",
-        safe_size_bytes=0,
-        reason="policy",
-    )
-    expected = (
-        (TraceGraphNodeKind.HUMAN_MESSAGE, "human body marker"),
-        (TraceGraphNodeKind.ASSISTANT_MESSAGE, "assistant body marker"),
-        (TraceGraphNodeKind.SYSTEM_MESSAGE, "system body marker"),
-        (TraceGraphNodeKind.MODEL, "model request marker"),
-        (TraceGraphNodeKind.TOOL, "tool result marker"),
-        (TraceGraphNodeKind.CUSTOM, "context result marker"),
-        (TraceGraphNodeKind.PLAN, "plan body marker"),
-        (TraceGraphNodeKind.INTERACTION, "interaction body marker"),
-        (TraceGraphNodeKind.MIDDLEWARE, "middleware failure marker"),
-        (TraceGraphNodeKind.RUNTIME_TASK, "runtime result marker"),
-        (TraceGraphNodeKind.SKILL, "/skills/search-marker/SKILL.md"),
-    )
-    try:
-        for store in stores:
-            writer = await store.open_writer(_identity())
-            await writer.append(
-                (
-                    _fact("started"),
-                    TurnFact(
-                        source_observation_id="search-turn",
-                        identity=_identity(),
-                        occurred_at=now,
-                        monotonic_ns=2,
-                        turn_id="turn:search",
-                        user_message_id="search-human",
-                    ),
-                    MessageFact(
-                        source_observation_id="search-human-message",
-                        identity=_identity(),
-                        occurred_at=now,
-                        monotonic_ns=3,
-                        phase="reconciled",
-                        message_id=human_id,
-                        source_message_id="search-human",
-                        role="user",
-                        content=_captured("human body marker"),
-                    ),
-                    MessageFact(
-                        source_observation_id="search-assistant-message",
-                        identity=_identity(),
-                        occurred_at=now,
-                        monotonic_ns=4,
-                        phase="reconciled",
-                        message_id=assistant_id,
-                        source_message_id="search-assistant",
-                        role="assistant",
-                        content=_captured("assistant body marker shared facet marker"),
-                    ),
-                    ModelCallFact(
-                        source_observation_id="search-model-start",
-                        identity=_identity(),
-                        occurred_at=now,
-                        monotonic_ns=5,
-                        phase="started",
-                        call_id="search-model",
-                        model="search-model",
-                        request=_captured(
-                            {
-                                "messages": [
-                                    {
-                                        "messageType": "system",
-                                        "content": "system body marker",
-                                    },
-                                    {
-                                        "messageType": "human",
-                                        "content": "model request marker",
-                                    },
-                                ]
-                            }
-                        ),
-                        system_message_positions=(0,),
-                        output_message_ids=(),
-                    ),
-                    ModelCallFact(
-                        source_observation_id="search-model-completed",
-                        identity=_identity(),
-                        occurred_at=now,
-                        monotonic_ns=6,
-                        phase="completed",
-                        call_id="search-model",
-                        model="search-model",
-                        system_message_positions=(),
-                        output_message_ids=(),
-                    ),
-                    ToolExecutionFact(
-                        source_observation_id="search-tool-start",
-                        identity=_identity(),
-                        occurred_at=now,
-                        monotonic_ns=7,
-                        phase="started",
-                        execution_id="search-tool",
-                        tool_name="search_tool",
-                        input=_captured({"query": "tool request marker"}),
-                    ),
-                    ToolExecutionFact(
-                        source_observation_id="search-tool-completed",
-                        identity=_identity(),
-                        occurred_at=now,
-                        monotonic_ns=8,
-                        phase="completed",
-                        execution_id="search-tool",
-                        tool_name="search_tool",
-                        output=_captured(
-                            {"answer": "tool result marker shared facet marker"}
-                        ),
-                    ),
-                    ContextContributionFact(
-                        source_observation_id="search-context-start",
-                        identity=_identity(),
-                        occurred_at=now,
-                        monotonic_ns=9,
-                        phase="started",
-                        contribution_id="search-context",
-                        context_kind="custom",
-                        name="search-context",
-                        input=omitted,
-                    ),
-                    ContextContributionFact(
-                        source_observation_id="search-context-completed",
-                        identity=_identity(),
-                        occurred_at=now,
-                        monotonic_ns=10,
-                        phase="completed",
-                        contribution_id="search-context",
-                        context_kind="custom",
-                        name="search-context",
-                        output=_captured({"answer": "context result marker"}),
-                    ),
-                    PlanRevisionFact(
-                        source_observation_id="search-plan",
-                        identity=_identity(),
-                        occurred_at=now,
-                        monotonic_ns=11,
-                        revision_id="search-plan-revision",
-                        revision=1,
-                        status="draft",
-                        plan=_captured({"summary": "plan body marker"}),
-                    ),
-                    InteractionFact(
-                        source_observation_id="search-interaction",
-                        identity=_identity(),
-                        occurred_at=now,
-                        monotonic_ns=12,
-                        phase="opened",
-                        interaction_id="search-interaction",
-                        source_interaction_id="search-interaction-source",
-                        interaction_kind="clarification",
-                        status="pending",
-                        payload=_captured({"question": "interaction body marker"}),
-                    ),
-                    AgentStepFact(
-                        source_observation_id="search-middleware-start",
-                        identity=_identity(),
-                        occurred_at=now,
-                        monotonic_ns=13,
-                        phase="started",
-                        call_id="search-middleware",
-                        step_kind="middleware",
-                        name="SearchMiddleware.before_model",
-                        middleware_name="SearchMiddleware",
-                        hook="before_model",
-                    ),
-                    AgentStepFact(
-                        source_observation_id="search-middleware-failed",
-                        identity=_identity(),
-                        occurred_at=now,
-                        monotonic_ns=14,
-                        phase="failed",
-                        call_id="search-middleware",
-                        step_kind="middleware",
-                        name="SearchMiddleware.before_model",
-                        middleware_name="SearchMiddleware",
-                        hook="before_model",
-                        error_type="builtins.RuntimeError",
-                        error_message=_captured("middleware failure marker"),
-                        failure_origin=True,
-                    ),
-                    RuntimeTaskFact(
-                        source_observation_id="search-runtime-start",
-                        identity=_identity(),
-                        occurred_at=now,
-                        monotonic_ns=15,
-                        phase="started",
-                        task_id="search-runtime-task",
-                        source_task_id="search-runtime-source",
-                        task_name="search-runtime",
-                        input=_captured({"request": "runtime request marker"}),
-                    ),
-                    RuntimeTaskFact(
-                        source_observation_id="search-runtime-completed",
-                        identity=_identity(),
-                        occurred_at=now,
-                        monotonic_ns=16,
-                        phase="completed",
-                        task_id="search-runtime-task",
-                        source_task_id="search-runtime-source",
-                        task_name="search-runtime",
-                        result=_captured({"answer": "runtime result marker"}),
-                    ),
-                    SkillFact(
-                        source_observation_id="search-skill",
-                        identity=_identity(),
-                        occurred_at=now,
-                        monotonic_ns=17,
-                        skill_id="search-skill",
-                        execution_id="search-skill-execution",
-                        source_tool_call_id="search-skill-tool",
-                        name="search-skill",
-                        source_path="/skills/search-marker/SKILL.md",
-                    ),
-                )
-            )
-            snapshot = await store.snapshot(_identity().thread_id)
-            for kind, marker in expected:
-                page = await store.query_trace_graph(
-                    snapshot.key,
-                    run_ids=(_identity().run_id,),
-                    where=TraceGraphFilter(
-                        kinds={kind},
-                        search=marker,
-                        include_technical_nodes=True,
-                        include_ancestor_nodes=False,
-                    ),
-                    limit=10,
-                )
-                assert len(page.matched_node_ids) == 1, (kind, marker)
-                assert page.nodes[0].kind is kind
-
-            omitted_page = await store.query_trace_graph(
-                snapshot.key,
-                run_ids=(_identity().run_id,),
-                where=TraceGraphFilter(
-                    kinds={TraceGraphNodeKind.CUSTOM},
-                    search="policy",
-                    include_ancestor_nodes=False,
-                ),
-                limit=10,
-            )
-            facet_page = await store.query_trace_graph(
-                snapshot.key,
-                run_ids=(_identity().run_id,),
-                where=TraceGraphFilter(
-                    kinds={TraceGraphNodeKind.ASSISTANT_MESSAGE},
-                    search="shared facet marker",
-                    include_ancestor_nodes=False,
-                ),
-                limit=10,
-            )
-            assert omitted_page.nodes == ()
-            assert facet_page.matched_node_ids == (assistant_id,)
-            assert facet_page.facets.kinds == {
-                TraceGraphNodeKind.ASSISTANT_MESSAGE: 1,
-                TraceGraphNodeKind.TOOL: 1,
-            }
             await writer.aclose()
     finally:
         await engine.dispose()
@@ -1407,6 +1626,7 @@ async def test_memory_and_sql_graph_paging_share_the_digest_tie_breaker(
                                 occurred_at=occurred_at,
                                 monotonic_ns=2,
                                 phase="started",
+                                context_started_at=occurred_at,
                                 call_id=call_id,
                                 system_message_positions=(),
                                 output_message_ids=(),
@@ -1618,6 +1838,7 @@ async def test_tracer_rebuilds_graph_without_rewriting_ledger(
                     occurred_at=now,
                     monotonic_ns=3,
                     phase="started",
+                    context_started_at=now,
                     call_id="model-call-rebuild",
                     system_message_positions=(),
                     output_message_ids=(),
@@ -1663,92 +1884,11 @@ async def test_tracer_rebuilds_graph_without_rewriting_ledger(
         assert project_trace_graph_node(
             page.nodes[0],
             turn_id="turn:test",
-            parent_id=None,
+            parent_subagent_id=None,
             relationship_missing=False,
+            allowed_run_ids=frozenset({_identity().run_id}),
         ).request == {"messages": [{"content": "rebuild-marker"}]}
     finally:
-        await engine.dispose()
-
-
-async def test_rebuild_keeps_historical_task_missing_parent_evidence(
-    tmp_path: Path,
-) -> None:
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{tmp_path / 'rebuild-missing-parent.db'}"
-    )
-    store = SqlAlchemyTraceStore(engine, namespace="graph-rebuild-missing-parent")
-    writer = await store.open_writer(_identity())
-    now = datetime.now(UTC)
-    try:
-        await writer.append(
-            (
-                _fact("started"),
-                TurnFact(
-                    source_observation_id="historical-turn",
-                    identity=_identity(),
-                    occurred_at=now,
-                    monotonic_ns=2,
-                    turn_id="turn:historical",
-                    user_message_id="human:historical",
-                ),
-                RuntimeTaskFact(
-                    source_observation_id="historical-task-start",
-                    identity=_identity(),
-                    occurred_at=now,
-                    monotonic_ns=2,
-                    phase="started",
-                    task_id="historical-task",
-                    source_task_id="historical-task",
-                    task_name="model",
-                ),
-                RuntimeTaskFact(
-                    source_observation_id="historical-task-completed",
-                    identity=_identity(),
-                    occurred_at=now,
-                    monotonic_ns=3,
-                    phase="completed",
-                    task_id="historical-task",
-                    source_task_id="historical-task",
-                    task_name="model",
-                ),
-            )
-        )
-        await writer.append((_fact("terminal"), _fact("closed")), mandatory=True)
-        await writer.aclose()
-        async with engine.begin() as connection:
-            await connection.execute(text("DELETE FROM tinkerfin_trace_graph_nodes"))
-
-        assert await Tracer(store=store).rebuild_graph(_identity().thread_id) == 3
-        page = await store.query_trace_graph(
-            (await store.snapshot(_identity().thread_id)).key,
-            run_ids=(_identity().run_id,),
-            where=TraceGraphFilter(
-                kinds={TraceGraphNodeKind.RUNTIME_TASK},
-                include_ancestor_nodes=False,
-                include_technical_nodes=True,
-            ),
-            limit=10,
-        )
-
-        assert len(page.nodes) == 1
-        assert page.nodes[0].structural_parent_id is not None
-        public = await Tracer(store=store).query(
-            _identity().thread_id,
-            where=TraceGraphFilter(
-                kinds={TraceGraphNodeKind.RUNTIME_TASK},
-                include_technical_nodes=True,
-            ),
-            limit=10,
-        )
-        task = next(
-            node
-            for node in public.nodes
-            if node.kind is TraceGraphNodeKind.RUNTIME_TASK
-        )
-        assert task.parent_id is None
-        assert task.link_issues
-    finally:
-        await writer.aclose()
         await engine.dispose()
 
 
@@ -1783,6 +1923,7 @@ async def test_rebuild_merges_lifecycle_revisions_across_event_pages(
                     occurred_at=now,
                     monotonic_ns=3,
                     phase="started",
+                    context_started_at=now,
                     call_id="model-page-boundary",
                     system_message_positions=(),
                     output_message_ids=(),
@@ -1809,84 +1950,18 @@ async def test_rebuild_merges_lifecycle_revisions_across_event_pages(
         page = await store.query_trace_graph(
             (await store.snapshot(_identity().thread_id)).key,
             run_ids=(_identity().run_id,),
-            where=TraceGraphFilter(include_technical_nodes=True),
+            where=TraceGraphFilter(),
             limit=10,
         )
-        run = next(node for node in page.nodes if node.kind is TraceGraphNodeKind.RUN)
         model = next(
             node for node in page.nodes if node.kind is TraceGraphNodeKind.MODEL
         )
 
         assert len(page.nodes) == 3
-        assert run.status is TraceGraphNodeStatus.SUCCEEDED
         assert model.status is TraceGraphNodeStatus.SUCCEEDED
         assert model.started_seq < model.updated_seq
     finally:
         await writer.aclose()
-        await engine.dispose()
-
-
-async def test_graph_index_scopes_replayed_runtime_tasks_to_their_run(
-    tmp_path: Path,
-) -> None:
-    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'task-replay.db'}")
-    store = SqlAlchemyTraceStore(engine, namespace="task-replay")
-    try:
-        for run_id in ("run-task-first", "run-task-resume"):
-            writer = await store.open_writer(_identity(run_id))
-            now = datetime.now(UTC)
-            await writer.append(
-                (
-                    _fact("started", run_id=run_id),
-                    _fact("input", run_id=run_id),
-                    RuntimeTaskFact(
-                        source_observation_id=f"{run_id}-task-start",
-                        identity=_identity(run_id),
-                        occurred_at=now,
-                        monotonic_ns=2,
-                        phase="started",
-                        task_id="task:root:replayed",
-                        source_task_id="replayed",
-                        task_name="tools",
-                    ),
-                    RuntimeTaskFact(
-                        source_observation_id=f"{run_id}-task-result",
-                        identity=_identity(run_id),
-                        occurred_at=now,
-                        monotonic_ns=3,
-                        phase="completed",
-                        task_id="task:root:replayed",
-                        source_task_id="replayed",
-                        task_name="tools",
-                    ),
-                )
-            )
-            await writer.append(
-                (
-                    _fact("terminal", run_id=run_id),
-                    _fact("closed", run_id=run_id),
-                ),
-                mandatory=True,
-            )
-            await writer.aclose()
-
-        snapshot = await store.snapshot(_identity().thread_id)
-        page = await store.query_trace_graph(
-            snapshot.key,
-            run_ids=("run-task-first", "run-task-resume"),
-            where=TraceGraphFilter(
-                kinds={TraceGraphNodeKind.RUNTIME_TASK},
-                include_technical_nodes=True,
-            ),
-            limit=10,
-        )
-
-        assert {node.run_id for node in page.nodes} == {
-            "run-task-first",
-            "run-task-resume",
-        }
-        assert len({node.node_id for node in page.nodes}) == 2
-    finally:
         await engine.dispose()
 
 

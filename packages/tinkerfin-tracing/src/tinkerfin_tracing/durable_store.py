@@ -5,9 +5,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from collections.abc import AsyncGenerator
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Literal
 from uuid import uuid4
 
 from pydantic import JsonValue
@@ -23,7 +22,7 @@ from ._graph_reducer import (
     graph_node_mutations,
     reduce_graph_mutations,
 )
-from ._prepared import PreparedTraceFact, prepare_trace_facts
+from ._prepared import prepare_trace_facts
 from .backend import (
     StoredTraceCheckpoint,
     StoredTraceEvent,
@@ -56,11 +55,10 @@ from .errors import (
 )
 from .facts import TraceEvent, TraceSemanticFact
 from .graph import (
-    TECHNICAL_TRACE_GRAPH_NODE_KINDS,
-    TraceGraphFacets,
+    MAX_SUBAGENT_SCOPE_DEPTH,
+    MAX_TRACE_GRAPH_LINEAGE_RUNS,
     TraceGraphFilter,
-    TraceGraphNodeKind,
-    TraceGraphNodeStatus,
+    _validate_trace_graph_subagent_scopes,
 )
 from .limits import TraceLimits
 from .store import (
@@ -177,23 +175,6 @@ class _DurableTraceWriter:
                 cause=self._failure,
             )
         prepared = prepare_trace_facts(facts, codec=self._store._codec)
-        return await self._append_prepared(prepared, mandatory=mandatory)
-
-    async def _append_prepared(
-        self,
-        prepared: tuple[PreparedTraceFact, ...],
-        *,
-        mandatory: bool,
-    ) -> tuple[TraceEvent, ...]:
-        """Append using canonical evidence already computed before queue admission."""
-
-        if self._closed:
-            raise TraceStoreProtocolError("Trace writer is closed")
-        if self._failure is not None:
-            raise TraceStoreProtocolError(
-                "Trace writer heartbeat failed",
-                cause=self._failure,
-            )
         async with self._mutation_lock:
             result = await self._store._commit_ledger_change(
                 TraceLedgerChange(
@@ -553,11 +534,14 @@ class DurableTraceStore:
         where: TraceGraphFilter,
         limit: int,
         max_nodes: int,
-        node_ids: tuple[str, ...] = (),
-        include_facets: bool = True,
         before_started_at: datetime | None = None,
         before_node_id: str | None = None,
     ) -> TraceGraphNodeRecordPage:
+        if len(run_ids) > MAX_TRACE_GRAPH_LINEAGE_RUNS:
+            raise TraceQuotaExceeded(
+                "Trace Graph lineage exceeds the supported Run count",
+                context={"resource": "graph_lineage_runs"},
+            )
         stored = await backend.query_trace_graph(
             TraceGraphQueryRequest(
                 key=key,
@@ -565,8 +549,6 @@ class DurableTraceStore:
                 where=where,
                 limit=limit,
                 total_limit=max_nodes,
-                node_ids=node_ids,
-                include_facets=include_facets,
                 before_started_at=before_started_at,
                 before_node_id=before_node_id,
             )
@@ -576,14 +558,12 @@ class DurableTraceStore:
                 "Trace Graph page belongs to another generation"
             )
         stored_node_ids = tuple(item.node_id for item in stored.nodes)
+        matched_ids = set(stored.matched_node_ids)
         if (
-            len(set(stored.matched_node_ids)) != len(stored.matched_node_ids)
-            or not set(stored.matched_node_ids) <= set(stored_node_ids)
-            or tuple(
-                node_id
-                for node_id in stored_node_ids
-                if node_id in set(stored.matched_node_ids)
-            )
+            len(set(stored_node_ids)) != len(stored_node_ids)
+            or len(set(stored.matched_node_ids)) != len(stored.matched_node_ids)
+            or not matched_ids <= set(stored_node_ids)
+            or tuple(node_id for node_id in stored_node_ids if node_id in matched_ids)
             != stored.matched_node_ids
         ):
             raise TraceStoreProtocolError(
@@ -592,6 +572,7 @@ class DurableTraceStore:
 
         stored_events: dict[int, StoredTraceEvent] = {}
         decoded_events: dict[int, TraceEvent] = {}
+        allowed_run_ids = frozenset(run_ids)
 
         def decode_required(event: StoredTraceEvent, sequence: int) -> TraceEvent:
             existing = stored_events.get(sequence)
@@ -606,6 +587,10 @@ class DurableTraceStore:
                     event, key=key, expected_seq=sequence
                 )
                 decoded_events[sequence] = decoded
+            if decoded.fact.identity.run_id not in allowed_run_ids:
+                raise TraceStoreProtocolError(
+                    "Trace Graph locator belongs to another Run lineage"
+                )
             return decoded
 
         def decode_optional(
@@ -620,53 +605,68 @@ class DurableTraceStore:
                 return None
             return decode_required(event, sequence)
 
+        if any(item.run_id not in allowed_run_ids for item in stored.nodes):
+            raise TraceStoreProtocolError(
+                "Trace Graph node belongs to another Run lineage"
+            )
+        records = tuple(
+            TraceGraphNodeRecord(
+                node_id=item.node_id,
+                parent_subagent_id=item.parent_subagent_id,
+                model_call_id=item.model_call_id,
+                kind=item.kind,
+                status=item.status,
+                name=item.name,
+                run_id=item.run_id,
+                namespace=item.namespace,
+                agent_name=item.agent_name,
+                provider=item.provider,
+                model=item.model,
+                started_at=item.started_at,
+                first_output_at=item.first_output_at,
+                completed_at=item.completed_at,
+                started_seq=item.started_seq,
+                updated_seq=item.updated_seq,
+                request_seq=item.request_seq,
+                result_seq=item.result_seq,
+                failure_seq=item.failure_seq,
+                link_issue=item.link_issue,
+                started_event=decode_required(item.started_event, item.started_seq),
+                updated_event=decode_required(item.updated_event, item.updated_seq),
+                request_event=decode_optional(
+                    item.request_event,
+                    item.request_seq,
+                ),
+                result_event=decode_optional(
+                    item.result_event,
+                    item.result_seq,
+                ),
+                failure_event=decode_optional(
+                    item.failure_event,
+                    item.failure_seq,
+                ),
+            )
+            for item in stored.nodes
+        )
+        try:
+            _validate_trace_graph_subagent_scopes(
+                {
+                    record.node_id: (record.parent_subagent_id, record.kind)
+                    for record in records
+                }
+            )
+        except ValueError as error:
+            raise TraceStoreProtocolError(str(error)) from error
         return TraceGraphNodeRecordPage(
             key=stored.key,
             as_of_seq=stored.as_of_seq,
-            nodes=tuple(
-                TraceGraphNodeRecord(
-                    node_id=item.node_id,
-                    structural_parent_id=item.structural_parent_id,
-                    kind=item.kind,
-                    status=item.status,
-                    name=item.name,
-                    run_id=item.run_id,
-                    namespace=item.namespace,
-                    agent_name=item.agent_name,
-                    provider=item.provider,
-                    model=item.model,
-                    started_at=item.started_at,
-                    first_output_at=item.first_output_at,
-                    completed_at=item.completed_at,
-                    started_seq=item.started_seq,
-                    updated_seq=item.updated_seq,
-                    request_seq=item.request_seq,
-                    result_seq=item.result_seq,
-                    failure_seq=item.failure_seq,
-                    link_issue=item.link_issue,
-                    started_event=decode_required(item.started_event, item.started_seq),
-                    updated_event=decode_required(item.updated_event, item.updated_seq),
-                    request_event=decode_optional(
-                        item.request_event,
-                        item.request_seq,
-                    ),
-                    result_event=decode_optional(
-                        item.result_event,
-                        item.result_seq,
-                    ),
-                    failure_event=decode_optional(
-                        item.failure_event,
-                        item.failure_seq,
-                    ),
-                )
-                for item in stored.nodes
-            ),
+            nodes=records,
             matched_node_ids=stored.matched_node_ids,
-            facets=stored.facets.model_copy(deep=True),
             has_more=stored.has_more,
             next_started_at=stored.next_started_at,
             next_node_id=stored.next_node_id,
             call_tracking_present=stored.call_tracking_present,
+            relationship_evidence_missing=stored.relationship_evidence_missing,
         )
 
     async def _query_searched_trace_graph(
@@ -684,20 +684,7 @@ class DurableTraceStore:
         search = where.search
         if search is None:  # pragma: no cover - private caller contract
             raise ValueError("searched Graph query requires search text")
-        candidate_where = where.model_copy(
-            update={
-                "kinds": frozenset(),
-                "statuses": frozenset(),
-                "agent_names": frozenset(),
-                "middleware_names": frozenset(),
-                "skill_names": frozenset(),
-                "providers": frozenset(),
-                "models": frozenset(),
-                "search": None,
-                "include_ancestor_nodes": False,
-            },
-            deep=True,
-        )
+        candidate_where = where.model_copy(update={"search": None}, deep=True)
         candidates = await self._query_trace_graph_records(
             backend,
             key,
@@ -705,7 +692,6 @@ class DurableTraceStore:
             where=candidate_where,
             limit=max_nodes + 1,
             max_nodes=max_nodes + 1,
-            include_facets=False,
         )
         if candidates.has_more or len(candidates.matched_node_ids) > max_nodes:
             raise TraceQuotaExceeded(
@@ -716,17 +702,14 @@ class DurableTraceStore:
         ordered_candidates = tuple(
             records_by_id[node_id] for node_id in candidates.matched_node_ids
         )
-        content_matches = tuple(
-            record
-            for record in ordered_candidates
-            if _graph_record_contains(record, search)
-        )
-        metadata_where = where.model_copy(update={"search": None}, deep=True)
-        facets = _graph_facets(content_matches, metadata_where)
         direct = [
             record
-            for record in content_matches
-            if _graph_node_matches(record, metadata_where)
+            for record in ordered_candidates
+            if _graph_record_contains(
+                record,
+                search,
+                allowed_run_ids=frozenset(run_ids),
+            )
         ]
         if before_started_at is not None:
             if before_node_id is None:  # pragma: no cover - public cursor validation
@@ -747,43 +730,50 @@ class DurableTraceStore:
                 as_of_seq=candidates.as_of_seq,
                 nodes=(),
                 matched_node_ids=(),
-                facets=facets,
                 has_more=False,
                 next_started_at=None,
                 next_node_id=None,
                 call_tracking_present=candidates.call_tracking_present,
+                relationship_evidence_missing=(
+                    candidates.relationship_evidence_missing
+                ),
             )
-        exact_where = TraceGraphFilter(
-            include_technical_nodes=where.include_technical_nodes,
-            include_ancestor_nodes=where.include_ancestor_nodes,
-        )
-        exact = await self._query_trace_graph_records(
-            backend,
-            key,
-            run_ids=run_ids,
-            where=exact_where,
-            limit=len(selected_ids),
-            max_nodes=max_nodes,
-            node_ids=selected_ids,
-            include_facets=False,
-        )
-        if (
-            exact.as_of_seq != candidates.as_of_seq
-            or exact.has_more
-            or set(exact.matched_node_ids) != set(selected_ids)
-        ):
-            raise TraceStoreProtocolError(
-                "Trace Graph content matches changed during one Store query"
-            )
-        return replace(
-            exact,
+        selected_records = {record.node_id: record for record in selected}
+        pending = [record.parent_subagent_id for record in selected]
+        while pending:
+            parent_id = pending.pop()
+            if parent_id is None or parent_id in selected_records:
+                continue
+            parent = records_by_id.get(parent_id)
+            if parent is None:
+                continue
+            if len(selected_records) >= max_nodes:
+                raise TraceQuotaExceeded(
+                    "Trace Graph Subagent path exceeds max_total_nodes",
+                    context={"resource": "graph_total_nodes"},
+                )
+            selected_records[parent_id] = parent
+            pending.append(parent.parent_subagent_id)
+        candidate_order = {
+            record.node_id: index for index, record in enumerate(candidates.nodes)
+        }
+        return TraceGraphNodeRecordPage(
+            key=key,
+            as_of_seq=candidates.as_of_seq,
+            nodes=tuple(
+                sorted(
+                    selected_records.values(),
+                    key=lambda record: candidate_order[record.node_id],
+                )
+            ),
             matched_node_ids=selected_ids,
-            facets=facets,
             has_more=has_more,
             next_started_at=(
                 None if cursor_record is None else cursor_record.started_at
             ),
             next_node_id=None if cursor_record is None else cursor_record.node_id,
+            call_tracking_present=candidates.call_tracking_present,
+            relationship_evidence_missing=(candidates.relationship_evidence_missing),
         )
 
     async def rebuild_trace_graph(self, key: TraceThreadKey) -> int:
@@ -979,7 +969,10 @@ class DurableTraceStore:
             invalid = any(
                 sequence <= after or sequence > as_of or sequence > page.tail_seq
                 for sequence in sequences
-            ) or any(left >= right for left, right in zip(sequences, sequences[1:]))
+            ) or any(right != left + 1 for left, right in zip(sequences, sequences[1:]))
+            expected_last = min(as_of, page.tail_seq)
+            if after < expected_last and (not sequences or sequences[0] != after + 1):
+                invalid = True
         else:
             before = (
                 page.tail_seq + 1
@@ -989,7 +982,14 @@ class DurableTraceStore:
             invalid = any(
                 sequence < 1 or sequence >= before or sequence > page.tail_seq
                 for sequence in sequences
-            ) or any(left <= right for left, right in zip(sequences, sequences[1:]))
+            ) or any(right != left - 1 for left, right in zip(sequences, sequences[1:]))
+            expected_first = min(before - 1, page.tail_seq)
+            if (
+                before <= page.tail_seq + 1
+                and expected_first >= 1
+                and (not sequences or sequences[0] != expected_first)
+            ):
+                invalid = True
         if invalid:
             raise TraceStoreProtocolError(
                 "Trace event page violates requested ordering"
@@ -1213,21 +1213,12 @@ class _InMemoryTraceLedgerBackend:
                 row for row in thread.graph_nodes.values() if row.run_id in run_ids
             ]
             candidates = effective_graph_nodes(revisions, run_ids=run_ids)
-            requested_node_ids = frozenset(request.node_ids)
             matching = [
-                row
-                for row in candidates
-                if (not requested_node_ids or row.node_id in requested_node_ids)
-                and _graph_node_matches(row, request.where)
+                row for row in candidates if _graph_node_matches(row, request.where)
             ]
             matching.sort(
                 key=lambda row: (row.started_at, _node_order_key(row.node_id)),
                 reverse=True,
-            )
-            facets = (
-                _graph_facets(candidates, request.where)
-                if request.include_facets
-                else TraceGraphFacets()
             )
             if request.before_started_at is not None:
                 if request.before_node_id is None:
@@ -1248,34 +1239,42 @@ class _InMemoryTraceLedgerBackend:
             result_rows: dict[str, ReducedTraceGraphNode] = {
                 row.node_id: row for row in selected
             }
-            if request.where.include_ancestor_nodes:
-                pending = [
-                    row.structural_parent_id
-                    for row in selected
-                    if row.structural_parent_id is not None
-                ]
-                while pending:
-                    node_id = pending.pop()
-                    if node_id in result_rows:
-                        continue
-                    parent = next(
-                        (
-                            candidate
-                            for candidate in candidates
-                            if candidate.node_id == node_id
-                        ),
-                        None,
+            candidates_by_id = {row.node_id: row for row in candidates}
+            pending = {
+                row.parent_subagent_id
+                for row in selected
+                if row.parent_subagent_id is not None
+                and row.parent_subagent_id not in result_rows
+            }
+            for depth in range(1, MAX_SUBAGENT_SCOPE_DEPTH + 2):
+                if not pending:
+                    break
+                parents = tuple(
+                    candidates_by_id[node_id]
+                    for node_id in sorted(pending)
+                    if node_id in candidates_by_id
+                    and candidates_by_id[node_id].run_id in run_ids
+                )
+                if depth > MAX_SUBAGENT_SCOPE_DEPTH and parents:
+                    raise TraceStoreProtocolError(
+                        "Trace Graph Subagent scope exceeds 64 levels"
                     )
-                    if parent is None or parent.run_id not in run_ids:
+                next_parent_ids: set[str] = set()
+                for parent in parents:
+                    if parent.node_id in result_rows:
                         continue
                     if len(result_rows) >= request.total_limit:
                         raise TraceQuotaExceeded(
-                            "Trace Graph ancestors exceed max_total_nodes",
+                            "Trace Graph Subagent path exceeds max_total_nodes",
                             context={"resource": "graph_total_nodes"},
                         )
-                    result_rows[node_id] = parent
-                    if parent.structural_parent_id is not None:
-                        pending.append(parent.structural_parent_id)
+                    result_rows[parent.node_id] = parent
+                    if (
+                        parent.parent_subagent_id is not None
+                        and parent.parent_subagent_id not in result_rows
+                    ):
+                        next_parent_ids.add(parent.parent_subagent_id)
+                pending = next_parent_ids
             tracked_runs = {
                 event.run_id
                 for event in thread.events
@@ -1296,11 +1295,13 @@ class _InMemoryTraceLedgerBackend:
                     )
                 ),
                 matched_node_ids=matched_node_ids,
-                facets=facets,
                 has_more=has_more,
                 next_started_at=(None if cursor_row is None else cursor_row.started_at),
                 next_node_id=None if cursor_row is None else cursor_row.node_id,
                 call_tracking_present=bool(run_ids) and run_ids <= tracked_runs,
+                relationship_evidence_missing=any(
+                    row.link_issue is not None for row in candidates
+                ),
             )
 
     async def rebuild_trace_graph(self, request: TraceGraphRebuildRequest) -> int:
@@ -1324,7 +1325,13 @@ class _InMemoryTraceLedgerBackend:
                 thread.graph_nodes = current
                 raise
             self._condition.notify_all()
-            return len(rebuilt)
+            return len(
+                {
+                    revision.node_id
+                    for revision in rebuilt.values()
+                    if isinstance(revision, ReducedTraceGraphNode)
+                }
+            )
 
     async def load_projection_checkpoint(
         self,
@@ -1549,127 +1556,32 @@ def _memory_stored_event(
 def _graph_node_matches(
     row: ReducedTraceGraphNode | TraceGraphNodeRecord,
     where: TraceGraphFilter,
-    *,
-    exclude: Literal[
-        "kinds",
-        "statuses",
-        "agent_names",
-        "middleware_names",
-        "skill_names",
-        "providers",
-        "models",
-    ]
-    | None = None,
 ) -> bool:
     if where.search is not None:
         raise ValueError(
             "Graph content search must be resolved before metadata filters"
         )
-    if (
-        not where.include_technical_nodes
-        and row.kind in TECHNICAL_TRACE_GRAPH_NODE_KINDS
-    ):
-        return False
     return not (
-        (where.kinds and exclude != "kinds" and row.kind not in where.kinds)
+        (where.kinds and row.kind not in where.kinds)
+        or (where.statuses and row.status not in where.statuses)
         or (
-            where.statuses
-            and exclude != "statuses"
-            and row.status not in where.statuses
+            where.model_call_id is not None and row.model_call_id != where.model_call_id
         )
-        or (where.parent_id is not None and row.structural_parent_id != where.parent_id)
-        or (
-            where.agent_names
-            and exclude != "agent_names"
-            and row.agent_name not in where.agent_names
-        )
-        or (
-            where.middleware_names
-            and exclude != "middleware_names"
-            and (
-                row.kind is not TraceGraphNodeKind.MIDDLEWARE
-                or row.name not in where.middleware_names
-            )
-        )
-        or (
-            where.skill_names
-            and exclude != "skill_names"
-            and (
-                row.kind is not TraceGraphNodeKind.SKILL
-                or row.name not in where.skill_names
-            )
-        )
-        or (
-            where.providers
-            and exclude != "providers"
-            and row.provider not in where.providers
-        )
-        or (where.models and exclude != "models" and row.model not in where.models)
+        or (where.agent_names and row.agent_name not in where.agent_names)
+        or (where.providers and row.provider not in where.providers)
+        or (where.models and row.model not in where.models)
         or (where.namespaces and row.namespace not in where.namespaces)
         or (where.started_after is not None and row.started_at <= where.started_after)
         or (where.started_before is not None and row.started_at >= where.started_before)
     )
 
 
-def _graph_facets(
-    rows: list[ReducedTraceGraphNode | TraceGraphNodeRecord]
-    | tuple[ReducedTraceGraphNode | TraceGraphNodeRecord, ...],
-    where: TraceGraphFilter,
-) -> TraceGraphFacets:
-    kinds: dict[TraceGraphNodeKind, int] = {}
-    statuses: dict[TraceGraphNodeStatus, int] = {}
-    agents: dict[str, int] = {}
-    middleware: dict[str, int] = {}
-    skills: dict[str, int] = {}
-    providers: dict[str, int] = {}
-    models: dict[str, int] = {}
-    for row in rows:
-        if _graph_node_matches(row, where, exclude="kinds"):
-            kinds[row.kind] = kinds.get(row.kind, 0) + 1
-        if _graph_node_matches(row, where, exclude="statuses"):
-            statuses[row.status] = statuses.get(row.status, 0) + 1
-        if row.agent_name is not None and _graph_node_matches(
-            row,
-            where,
-            exclude="agent_names",
-        ):
-            agents[row.agent_name] = agents.get(row.agent_name, 0) + 1
-        if row.kind is TraceGraphNodeKind.MIDDLEWARE and _graph_node_matches(
-            row,
-            where,
-            exclude="middleware_names",
-        ):
-            middleware[row.name] = middleware.get(row.name, 0) + 1
-        if row.kind is TraceGraphNodeKind.SKILL and _graph_node_matches(
-            row,
-            where,
-            exclude="skill_names",
-        ):
-            skills[row.name] = skills.get(row.name, 0) + 1
-        if row.provider is not None and _graph_node_matches(
-            row,
-            where,
-            exclude="providers",
-        ):
-            providers[row.provider] = providers.get(row.provider, 0) + 1
-        if row.model is not None and _graph_node_matches(
-            row,
-            where,
-            exclude="models",
-        ):
-            models[row.model] = models.get(row.model, 0) + 1
-    return TraceGraphFacets(
-        kinds=kinds,
-        statuses=statuses,
-        agents=agents,
-        middleware=middleware,
-        skills=skills,
-        providers=providers,
-        models=models,
-    )
-
-
-def _graph_record_contains(record: TraceGraphNodeRecord, search: str) -> bool:
+def _graph_record_contains(
+    record: TraceGraphNodeRecord,
+    search: str,
+    *,
+    allowed_run_ids: frozenset[str],
+) -> bool:
     """Match visible metadata and decoded public details with one literal rule."""
 
     case_insensitive = search.isascii()
@@ -1681,7 +1593,10 @@ def _graph_record_contains(record: TraceGraphNodeRecord, search: str) -> bool:
         record.model,
         *(
             text
-            for value in trace_graph_record_search_values(record)
+            for value in trace_graph_record_search_values(
+                record,
+                allowed_run_ids=allowed_run_ids,
+            )
             for text in _json_search_values(value)
         ),
     )
@@ -1733,7 +1648,8 @@ def _stored_memory_graph_node(
         raise TraceStoreProtocolError("Trace Graph node lacks lifecycle facts")
     return StoredTraceGraphNode(
         node_id=row.node_id,
-        structural_parent_id=row.structural_parent_id,
+        parent_subagent_id=row.parent_subagent_id,
+        model_call_id=row.model_call_id,
         kind=row.kind,
         status=row.status,
         name=row.name,

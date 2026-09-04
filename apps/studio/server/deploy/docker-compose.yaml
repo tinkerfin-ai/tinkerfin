@@ -12,6 +12,7 @@ services:
     secrets: [mysql_password, mysql_root_password]
     volumes:
       - mysql-data:/var/lib/mysql
+      - ../database/mysql/schema.sql:/docker-entrypoint-initdb.d/10-studio-business.sql:ro
     healthcheck:
       test: [CMD-SHELL, "mysqladmin ping -h 127.0.0.1 -uroot -p$$(cat /run/secrets/mysql_root_password) --silent"]
       interval: 10s
@@ -72,20 +73,6 @@ services:
       start_period: 20s
     restart: unless-stopped
 
-  database-init:
-    profiles: [bundled, tools]
-    image: mysql:8.4@sha256:b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb
-    env_file: ${STUDIO_ENV_FILE:-.env}
-    entrypoint: [/bin/sh, /opt/tinkerfin/init-database.sh]
-    secrets: [mysql_password]
-    volumes:
-      - ./scripts/init-database.sh:/opt/tinkerfin/init-database.sh:ro
-      - ../database/mysql/schema.sql:/opt/tinkerfin/schema.sql:ro
-    depends_on:
-      mysql:
-        condition: service_healthy
-        required: false
-
   studio:
     build:
       context: ../../../..
@@ -127,9 +114,6 @@ services:
         required: false
       opensandbox:
         condition: service_healthy
-        required: false
-      database-init:
-        condition: service_completed_successfully
         required: false
     healthcheck:
       test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health/ready', timeout=3)"]

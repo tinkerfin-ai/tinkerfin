@@ -62,9 +62,6 @@ from .errors import TinkerFinError as TinkerFinError
 from .errors import TinkerFinErrorCode as TinkerFinErrorCode
 from .errors import TinkerFinLifecycleError as TinkerFinLifecycleError
 from .errors import TinkerFinStreamProtocolError as TinkerFinStreamProtocolError
-from .native_driver import DeepAgentsV2StreamDriver as DeepAgentsV2StreamDriver
-from .native_driver import DeepAgentsV3StreamDriver as DeepAgentsV3StreamDriver
-from .native_driver import DeepSeekReasoningExtractor as DeepSeekReasoningExtractor
 from .native_driver import NativeStreamDriver as NativeStreamDriver
 from .native_driver import ReasoningExtractor as ReasoningExtractor
 from .plan import AgentMode as AgentMode

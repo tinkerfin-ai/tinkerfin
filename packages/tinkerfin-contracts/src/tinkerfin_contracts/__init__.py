@@ -2,12 +2,10 @@
 
 from .identity import RunIdentity as RunIdentity
 from .observations import RUNTIME_OBSERVATION_ADAPTER as RUNTIME_OBSERVATION_ADAPTER
-from .observations import AgentStepObservation as AgentStepObservation
 from .observations import (
     ContextContributionObservation as ContextContributionObservation,
 )
 from .observations import ContextKind as ContextKind
-from .observations import MiddlewareDescriptor as MiddlewareDescriptor
 from .observations import ModelCallObservation as ModelCallObservation
 from .observations import NativeExtraMode as NativeExtraMode
 from .observations import NativeExtraObservation as NativeExtraObservation
@@ -36,17 +34,14 @@ from .observations import RunStartedObservation as RunStartedObservation
 from .observations import RunTerminalObservation as RunTerminalObservation
 from .observations import RunTerminalOutcome as RunTerminalOutcome
 from .observations import RuntimeObservation as RuntimeObservation
-from .observations import SkillSourceDescriptor as SkillSourceDescriptor
 from .observations import ToolExecutionObservation as ToolExecutionObservation
 from .protocols import RunObservationSession as RunObservationSession
 from .protocols import RuntimeObserver as RuntimeObserver
 
 __all__ = [
     "RUNTIME_OBSERVATION_ADAPTER",
-    "AgentStepObservation",
     "ContextContributionObservation",
     "ContextKind",
-    "MiddlewareDescriptor",
     "ModelCallObservation",
     "NativeExtraMode",
     "NativeExtraObservation",
@@ -76,6 +71,5 @@ __all__ = [
     "RunTerminalOutcome",
     "RuntimeObservation",
     "RuntimeObserver",
-    "SkillSourceDescriptor",
     "ToolExecutionObservation",
 ]

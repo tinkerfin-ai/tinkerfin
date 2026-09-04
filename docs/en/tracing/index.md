@@ -29,39 +29,77 @@ Calling a compiled graph directly is an unmanaged advanced operation.
 
 The stable v2 and experimental v3 Runtime Profiles normalize their upstream streams
 into the same observations. Tracing facts, Graph queries, SQL, and applications do not
-inspect upstream stream modes or versions.
+inspect upstream stream modes or versions. Profile identity remains framework integration
+and recovery metadata; it is not a Graph field or an application query dimension.
 
 ## Ledger and Graph
 
-The Graph represents each Turn as:
+Each Turn is a container for one user task, not a Graph node. Events in the Turn's
+top-level scope are siblings. Only a Subagent owns a nested scope, whose events are again
+siblings in real start order. A possible scope layout is:
 
 ```text
-HumanMessage
-└── Run / Agent
-    ├── Model
-    │   ├── SystemMessage
-    │   └── AssistantMessage
-    └── Tool
-        ├── Skill
-        └── Subagent
+Turn
+├── HumanMessage
+├── Context / Memory / Guardrail / retrieval / custom / Plan / interaction
+├── Model
+├── Tool
+├── Subagent
+│   ├── HumanMessage
+│   ├── Model / Tool / context events
+│   └── AssistantMessage
+└── AssistantMessage
 ```
 
-The exact shape follows available evidence. Missing parents, model output IDs, Tool
-proposals, or executions are reported as link issues; the framework does not correlate
-parallel work by time or arrival order. Tool proposal, post-review execution, and result
-are one logical Tool node. Rejected HITL actions do not fabricate executions.
+The current kinds are `human_message`, `assistant_message`, `context`, `model`,
+`tool`, `subagent`, `memory`, `guardrail`, `retrieval`, `custom`, `plan`, and
+`interaction`. ToolMessage results remain evidence on their logical Tool event. A Tool
+proposal, post-review execution, result, and failure are one event. A validated Deep
+Agents `task` execution is exactly one Subagent event, with no separate Tool event.
+Rejected HITL actions do not fabricate executions.
 
-SystemMessage, middleware, Run, and Runtime task nodes are technical and hidden by
-default. ToolMessage results remain evidence on their logical Tool nodes. When technical
-nodes are hidden, the framework reconnects each visible node to its nearest visible
-ancestor before returning authoritative order and roots.
+`parent_subagent_id` names the nearest owning Subagent and is the only display-nesting
+relationship. `model_call_id` associates an AssistantMessage, Tool, or Subagent with the
+Model call that emitted it; it does not make the Model a display parent. Missing exact
+evidence is reported through link issues rather than inferred from time or arrival order.
+A non-empty namespace alone does not establish a Subagent. Only validated Subagent
+provenance marks a fact as inside that scope; ordinary LangGraph subgraphs remain in the
+Turn's top-level scope.
+
+Each provider attempt creates one Context event immediately before its Model event. The
+Context starts at the preceding visible execution boundary in the same scope and ends at
+the final provider request boundary. Resuming an active Subagent opens a new Context at
+the resume input, excluding approval wait time. Its content is projected from the final
+SystemMessage content already held by the Model request, so the Ledger does not store a
+duplicate payload. Requests without a SystemMessage retain the measured Context interval
+with no content. The duration is wall-clock preparation latency, not a CPU profile.
+
+Middleware execution is not a Trace event and generic chain or middleware callbacks are
+not captured. Middleware may publish an explicit Memory, Guardrail, retrieval, or custom
+event through `trace_contribution(...)`. There is no Skill kind or fact. A model reading
+`SKILL.md` produces the ordinary `read_file` Tool event and no second event.
+
+The first HumanMessage inside a validated Subagent scope projects only the captured
+`task.description`. The Subagent request retains the complete captured task arguments;
+both views reference the same Ledger fact and do not duplicate stored content.
+
+Within one scope, events use `started_seq`; equal sequences use the stable order user,
+context, model, Tool, Subagent, assistant, then event ID. The projection generates the
+public sequence with an iterative depth-first traversal, so an expanded Subagent is
+immediately followed by its own sequence without relying on the Python call stack.
 
 Graph filtering runs in the Store. Request, result, message, and state content remain in
-the Ledger. Content search applies indexed structural constraints first and decodes only
-a bounded candidate set through the configured Codec; no plaintext search document is
-stored. SQL stores one row per node and Run revision so sibling branches remain isolated.
-A removal writes a lineage-local tombstone instead of deleting an ancestor or sibling
-node.
+the Ledger. Content search applies indexed metadata, namespace, and time constraints
+first and decodes only a bounded candidate set through the configured Codec; no plaintext
+search document is stored. SQL stores one row per node and Run revision so sibling
+branches remain isolated. A removal writes a lineage-local tombstone without deleting an
+event from another Run branch.
+
+Filtering selects direct matches first. The Store then adds only their owning Subagent
+chain through a bounded breadth-first lookup; those containers are excluded from
+`matched_node_ids`. Subagent nesting is limited to 64 levels, `max_total_nodes` bounds the
+complete page, and SQL Subagent and Ledger-locator reads use batches of 500 keys. One
+Graph query may select at most 10,000 Runs in its lineage.
 
 ## History and live updates
 
@@ -72,7 +110,8 @@ updates carry the same Graph through `TraceUpdate.graph`. Multiple heads require
 
 `Tracer.query()` returns the current canonical Graph. Its opaque pagination cursor is
 valid only for the exact current tail and filter. `TraceGraphQuery.follow()` is available
-only on the current first page and publishes complete order and roots with every delta.
+only on the current first page and publishes complete event order and direct matches with
+every delta.
 
 Every follow handle owns and closes its upstream Store iterator. Normal completion,
 failure, cancellation, repeated cancellation, and early consumer exit preserve the

@@ -331,15 +331,12 @@ async def test_framework_safety_and_business_redaction_cover_model_tool_and_stat
         where=TraceGraphFilter(
             kinds={TraceGraphNodeKind.HUMAN_MESSAGE},
             search="business-reasoning",
-            include_ancestor_nodes=False,
         ),
     )
     private_search = await tracer.query(
         context.identity.thread_id,
         where=TraceGraphFilter(
             search="private-reasoning",
-            include_technical_nodes=True,
-            include_ancestor_nodes=False,
         ),
     )
     assert len(public_search.matched_node_ids) == 1
@@ -731,7 +728,6 @@ async def test_codec_receives_only_the_redacted_fact_graph(tmp_path: Path) -> No
             where=TraceGraphFilter(
                 kinds={TraceGraphNodeKind.HUMAN_MESSAGE},
                 search="redacted",
-                include_ancestor_nodes=False,
             ),
         )
         pii_search = await tracer.query(
@@ -739,7 +735,6 @@ async def test_codec_receives_only_the_redacted_fact_graph(tmp_path: Path) -> No
             where=TraceGraphFilter(
                 kinds={TraceGraphNodeKind.HUMAN_MESSAGE},
                 search="13800000000",
-                include_ancestor_nodes=False,
             ),
         )
         credential_search = await tracer.query(
@@ -747,7 +742,6 @@ async def test_codec_receives_only_the_redacted_fact_graph(tmp_path: Path) -> No
             where=TraceGraphFilter(
                 kinds={TraceGraphNodeKind.HUMAN_MESSAGE},
                 search="codec-credential",
-                include_ancestor_nodes=False,
             ),
         )
         assert len(safe_search.matched_node_ids) == 1

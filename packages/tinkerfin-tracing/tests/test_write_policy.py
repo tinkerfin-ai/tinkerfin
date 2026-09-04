@@ -211,7 +211,7 @@ async def test_cancelled_force_does_not_cancel_owned_commit_or_leave_tasks() -> 
     }
 
 
-async def test_memory_batch_admission_reuses_one_canonical_encoding_per_fact(
+async def test_memory_batch_admission_estimates_before_store_encoding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     original = CanonicalTracePayloadCodec.encode_fact
@@ -236,4 +236,9 @@ async def test_memory_batch_admission_reuses_one_canonical_encoding_per_fact(
     await writer.force()
     await writer.aclose()
 
-    assert encoded_observations == ["observation-1", "observation-2"]
+    assert encoded_observations == [
+        "observation-1",
+        "observation-2",
+        "observation-1",
+        "observation-2",
+    ]

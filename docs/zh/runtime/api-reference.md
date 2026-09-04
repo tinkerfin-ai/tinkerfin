@@ -41,12 +41,15 @@ Observation 与原生 SSE 属于基础安装。
 `DeepAgentsV2RuntimeProfile` 是默认稳定 Profile；`DeepAgentsV3RuntimeProfile` 需要显式选择，
 并遵循上游实验性 API 约束。TinkerFin 在创建 Definition 前选定一个
 Profile，把其 `profile_id` 写入 checkpoint 谱系，并在 Graph continuation 前拒绝由另一个
-Profile 执行 branch 或 resume；Runtime 不从流数据探测或协商 Profile。只有向 Profile 显式
-传入已验证的 `ReasoningExtractor`（例如 `DeepSeekReasoningExtractor`）才会启用对应 provider
-reasoning 路径；这本身不会授权 Trace 持久化。自定义 extractor 实现
-`extract(message, *, provider)`，无法验证 provider 时必须拒绝提取。自定义 Profile 还必须实现自身明确的
-`stage_resume_intent()`、`pending_resume_values()` 与 `native_resume_submitted()` checkpointer
-语义；TinkerFin 不会为它回退到 v2 checkpoint 行为，两个内置 Profile 也不会相互回退。
+Profile 执行 branch 或 resume；Runtime 不从流数据探测或协商 Profile。`profile_id` 是框架私有的
+集成与恢复元数据，不应复制到业务数据库模型、请求 payload 或应用响应 Schema。
+
+Provider reasoning 只有在 Profile 显式接收宿主提供的 `ReasoningExtractor` 后才可能启用；
+TinkerFin 不提供供应商专用 extractor，这项配置本身也不会授权 Trace 持久化。Extractor 实现
+`extract(message, *, provider)`，并且只有在 provider 与来源结构均通过验证后才能返回正文。
+自定义 Profile 还必须实现自身明确的 `stage_resume_intent()`、`pending_resume_values()` 与
+`native_resume_submitted()` checkpointer 语义；TinkerFin 不会为它回退到 v2 checkpoint 行为，
+两个内置 Profile 也不会相互回退。
 
 `DeepAgentDefinition` 可以重复使用。`DeepAgentRuntime`、`DeepAgentAgUiRuntime` 和
 `DeepAgentAgUiResumeRuntime` 都是一次性运行对象，不要自行构造。

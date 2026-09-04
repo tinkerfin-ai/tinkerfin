@@ -17,7 +17,6 @@ from langgraph.errors import GraphBubbleUp, GraphInterrupt
 from pydantic import JsonValue
 
 from tinkerfin_contracts import (
-    AgentStepObservation,
     ContextContributionObservation,
     ContextKind,
     ModelCallObservation,
@@ -77,11 +76,6 @@ def reset_observation_hub(token: Token[RuntimeObservationHub | None]) -> None:
     _CURRENT_HUB.reset(token)
 
 
-_MIDDLEWARE_NODE_HOOKS = frozenset(
-    {"before_agent", "before_model", "after_model", "after_agent"}
-)
-
-
 def _checkpoint_segments(
     metadata: Mapping[str, object] | None,
 ) -> tuple[str, ...]:
@@ -107,16 +101,6 @@ def _callback_namespace(metadata: Mapping[str, object] | None) -> tuple[str, ...
 
     segments = _checkpoint_segments(metadata)
     return segments[:-1]
-
-
-def _callback_task_id(metadata: Mapping[str, object] | None) -> str | None:
-    """Read the Native task ID embedded in the locked callback checkpoint scope."""
-
-    segments = _checkpoint_segments(metadata)
-    if not segments:
-        return None
-    _node, separator, task_id = segments[-1].partition(":")
-    return task_id if separator and task_id else None
 
 
 def _optional_text(value: object) -> str | None:
@@ -270,26 +254,14 @@ class _ToolCallState:
     tool_name: str
 
 
-@dataclass(frozen=True, slots=True)
-class _AgentStepState:
-    parent_call_id: str | None
-    namespace: tuple[str, ...]
-    agent_name: str | None
-    step_kind: Literal["agent", "middleware", "model", "tools", "subagent", "task"]
-    name: str
-    task_id: str | None
-    middleware_name: str | None
-    hook: str | None
-
-
 class RuntimeCallHandler(AsyncCallbackHandler):
     """Translate one managed LangChain callback tree into Runtime observations.
 
     The handler is request-scoped and borrowed by LangChain through the invocation
-    config. It records standard Agent steps plus provider and Tool callbacks. Native
+    config. It records provider and Tool callbacks; chain and middleware callbacks are
+    deliberately ignored because they do not define product execution events. Native
     state, task payloads, interrupts, messages, and subagent completion remain owned by
-    the Native Driver. Parallel callbacks are serialized before Observer delivery, while
-    callback methods still await every accepted observation and preserve cancellation.
+    the Native Driver. Parallel callbacks are serialized before Observer delivery.
     """
 
     def __init__(self, hub: RuntimeObservationHub) -> None:
@@ -300,236 +272,25 @@ class RuntimeCallHandler(AsyncCallbackHandler):
         # the hub remains the single ordered delivery boundary.
         self.run_inline = True
         self._hub = hub
-        self._steps: dict[str, _AgentStepState] = {}
-        self._graph_tasks: dict[tuple[tuple[str, ...], str], str] = {}
-        self._agents_by_namespace: dict[tuple[str, ...], str] = {}
         self._models: dict[str, _ModelCallState] = {}
         self._tools: dict[str, _ToolCallState] = {}
         self._first_outputs: set[str] = set()
         self._call_tokens: dict[str, Token[str | None]] = {}
         self._namespace_tokens: dict[str, Token[tuple[str, ...]]] = {}
 
-    async def on_chain_start(
-        self,
-        serialized: dict[str, Any] | None,
-        inputs: Any,
-        *,
-        run_id: UUID,
-        parent_run_id: UUID | None = None,
-        metadata: dict[str, Any] | None = None,
-        name: str | None = None,
-        **kwargs: Any,
-    ) -> None:
-        """Record a real Agent graph step before its body executes."""
+    @property
+    def ignore_chain(self) -> bool:
+        """Exclude chain and middleware callbacks from semantic observations."""
 
-        del inputs, kwargs
-        step_name = _optional_text(name)
-        if step_name is None and isinstance(serialized, Mapping):
-            step_name = _optional_text(serialized.get("name"))
-        step_name = step_name or "Agent step"
-        call_id = str(run_id)
-        if call_id in self._steps:
-            raise ValueError("Agent step callback run ID started more than once")
-        state = self._step_state(
-            name=step_name,
-            parent_run_id=parent_run_id,
-            metadata=metadata,
-        )
-        self._steps[call_id] = state
-        if state.task_id is not None:
-            self._graph_tasks[(state.namespace, state.task_id)] = call_id
-        if state.step_kind in {"agent", "subagent"}:
-            self._agents_by_namespace[state.namespace] = call_id
-        await self._observe_step(call_id, state, phase="started")
-        await self._hub.force(ObservationBoundary.CALL_STARTED)
-
-    async def on_chain_end(
-        self,
-        outputs: Any,
-        *,
-        run_id: UUID,
-        parent_run_id: UUID | None = None,
-        **kwargs: Any,
-    ) -> None:
-        """Close one successful Agent graph step without retaining its state payload."""
-
-        del outputs, parent_run_id, kwargs
-        await self._close_step(str(run_id), phase="completed")
-
-    async def on_chain_error(
-        self,
-        error: BaseException,
-        *,
-        run_id: UUID,
-        parent_run_id: UUID | None = None,
-        **kwargs: Any,
-    ) -> None:
-        """Close one failed or cancelled Agent graph step."""
-
-        del parent_run_id, kwargs
-        if _settles_with_run(error):
-            return
-        control_phase = _control_flow_phase(error)
-        if control_phase is not None:
-            await self._close_step(str(run_id), phase=control_phase)
-            return
-        await self._close_step(
-            str(run_id),
-            phase="failed",
-            error_type=_qualified_name(error),
-            error_message=_error_message(error),
-            failure_origin=self._claim_error(error),
-        )
-
-    def _step_state(
-        self,
-        *,
-        name: str,
-        parent_run_id: UUID | None,
-        metadata: Mapping[str, object] | None,
-    ) -> _AgentStepState:
-        segments = _checkpoint_segments(metadata)
-        namespace = segments[:-1]
-        task_id = _callback_task_id(metadata)
-        # LangGraph repeats the current task ID on nested chain callbacks. Only the
-        # first chain in that task represents the Native task itself; retaining the ID
-        # on descendants would collapse distinct callback nodes into one Graph node.
-        if task_id is not None and (namespace, task_id) in self._graph_tasks:
-            task_id = None
-        raw_parent = _parent_id(parent_run_id)
-        middleware_name, separator, hook = name.rpartition(".")
-        is_middleware = separator and hook in _MIDDLEWARE_NODE_HOOKS
-        parent_tool = None if raw_parent is None else self._tools.get(raw_parent)
-        is_subagent = (
-            bool(segments)
-            and name not in {"model", "tools"}
-            and not is_middleware
-            and parent_tool is not None
-            and parent_tool.tool_name == "task"
-        )
-        if not segments and raw_parent is None:
-            step_kind: Literal[
-                "agent", "middleware", "model", "tools", "subagent", "task"
-            ] = "agent"
-            namespace = ()
-            parent_call_id = None
-        elif is_subagent:
-            step_kind = "subagent"
-            namespace = segments
-            parent_call_id = raw_parent
-        elif is_middleware:
-            step_kind = "middleware"
-            parent_call_id = self._known_step_parent(raw_parent, namespace)
-        elif name == "model":
-            step_kind = "model"
-            parent_call_id = self._known_step_parent(raw_parent, namespace)
-        elif name == "tools":
-            step_kind = "tools"
-            parent_call_id = self._known_step_parent(raw_parent, namespace)
-        else:
-            step_kind = "task"
-            parent_call_id = self._known_step_parent(raw_parent, namespace)
-        return _AgentStepState(
-            parent_call_id=parent_call_id,
-            namespace=namespace,
-            agent_name=(name if step_kind == "subagent" else _agent_name(metadata)),
-            step_kind=step_kind,
-            name=name,
-            task_id=task_id,
-            middleware_name=middleware_name if step_kind == "middleware" else None,
-            hook=hook if step_kind == "middleware" else None,
-        )
-
-    def _known_step_parent(
-        self,
-        raw_parent: str | None,
-        namespace: tuple[str, ...],
-    ) -> str | None:
-        if raw_parent in self._steps:
-            return raw_parent
-        return self._agents_by_namespace.get(namespace)
+        return True
 
     def _call_parent(
         self,
         parent_run_id: UUID | None,
         metadata: Mapping[str, object] | None,
     ) -> str | None:
-        raw_parent = _parent_id(parent_run_id)
-        if raw_parent in self._steps:
-            return raw_parent
-        task_id = _callback_task_id(metadata)
-        if task_id is None:
-            return raw_parent
-        return self._graph_tasks.get(
-            (_callback_namespace(metadata), task_id), raw_parent
-        )
-
-    async def _observe_step(
-        self,
-        call_id: str,
-        state: _AgentStepState,
-        *,
-        phase: Literal[
-            "started",
-            "completed",
-            "failed",
-            "cancelled",
-            "interrupted",
-            "abandoned",
-        ],
-        error_type: str | None = None,
-        error_message: str | None = None,
-        failure_origin: bool = False,
-    ) -> None:
-        observed_at, monotonic_ns = _stamp()
-        await self._hub.observe(
-            AgentStepObservation(
-                identity=self._hub.context.identity,
-                observed_at=observed_at,
-                monotonic_ns=monotonic_ns,
-                phase=phase,
-                call_id=call_id,
-                parent_call_id=state.parent_call_id,
-                namespace=state.namespace,
-                agent_name=state.agent_name,
-                step_kind=state.step_kind,
-                name=state.name,
-                task_id=state.task_id,
-                middleware_name=state.middleware_name,
-                hook=state.hook,
-                error_type=error_type,
-                error_message=error_message,
-                failure_origin=failure_origin,
-            )
-        )
-
-    async def _close_step(
-        self,
-        call_id: str,
-        *,
-        phase: _CallTerminalPhase,
-        error_type: str | None = None,
-        error_message: str | None = None,
-        failure_origin: bool = False,
-    ) -> None:
-        state = self._steps.get(call_id)
-        if state is None:
-            return
-        await self._observe_step(
-            call_id,
-            state,
-            phase=phase,
-            error_type=error_type,
-            error_message=error_message,
-            failure_origin=failure_origin,
-        )
-        self._steps.pop(call_id, None)
-        if state.task_id is not None:
-            key = (state.namespace, state.task_id)
-            if self._graph_tasks.get(key) == call_id:
-                self._graph_tasks.pop(key, None)
-        if self._agents_by_namespace.get(state.namespace) == call_id:
-            self._agents_by_namespace.pop(state.namespace, None)
+        del metadata
+        return _parent_id(parent_run_id)
 
     async def on_chat_model_start(
         self,
@@ -888,12 +649,8 @@ class RuntimeCallHandler(AsyncCallbackHandler):
             phase = "abandoned"
         models = tuple(self._models.items())
         tools = tuple(self._tools.items())
-        steps = tuple(reversed(tuple(self._steps.items())))
         self._models.clear()
         self._tools.clear()
-        self._steps.clear()
-        self._graph_tasks.clear()
-        self._agents_by_namespace.clear()
         self._first_outputs.clear()
         for call_id, state in models:
             observed_at, monotonic_ns = _stamp()
@@ -925,12 +682,6 @@ class RuntimeCallHandler(AsyncCallbackHandler):
                     tool_call_id=state.tool_call_id,
                     tool_name=state.tool_name,
                 )
-            )
-        for call_id, state in steps:
-            await self._observe_step(
-                call_id,
-                state,
-                phase=phase,
             )
         self._call_tokens.clear()
         self._namespace_tokens.clear()

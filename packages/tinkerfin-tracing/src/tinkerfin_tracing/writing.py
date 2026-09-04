@@ -6,9 +6,7 @@ import asyncio
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
 
-from ._prepared import PreparedTraceFact, prepare_trace_facts
 from .codec import CanonicalTracePayloadCodec
 from .errors import TraceQuotaExceeded, TraceStoreProtocolError
 from .facts import TraceEvent, TraceSemanticFact
@@ -68,24 +66,9 @@ class TraceWritePolicy:
 
 @dataclass(slots=True)
 class _PendingFacts:
-    prepared: tuple[PreparedTraceFact, ...]
+    facts: tuple[TraceSemanticFact, ...]
     encoded_bytes: int
     committed: asyncio.Future[None]
-
-
-@runtime_checkable
-class _PreparedTraceWriter(Protocol):
-    """Accept canonical fact evidence without changing the public writer contract."""
-
-    async def _append_prepared(
-        self,
-        prepared: tuple[PreparedTraceFact, ...],
-        *,
-        mandatory: bool,
-    ) -> tuple[TraceEvent, ...]:
-        """Append facts using the canonical bytes already computed for admission."""
-
-        ...
 
 
 class TraceBatchWriter:
@@ -113,7 +96,7 @@ class TraceBatchWriter:
         if not callable(on_committed):
             raise TypeError("on_committed must be callable")
         self._writer = writer
-        self._codec = CanonicalTracePayloadCodec()
+        self._admission_codec = CanonicalTracePayloadCodec()
         self._policy = policy
         self._on_committed = on_committed
         self._condition = asyncio.Condition()
@@ -153,15 +136,17 @@ class TraceBatchWriter:
                 await self.force()
                 self._raise_if_failed()
                 try:
-                    prepared = prepare_trace_facts(facts, codec=self._codec)
-                    events = await self._append(prepared, mandatory=True)
+                    events = await self._writer.append(facts, mandatory=True)
                     await self._notify_committed(events)
                 except BaseException as error:
                     self._record_failure(error)
                     raise
             return
-        prepared_facts = prepare_trace_facts(facts, codec=self._codec)
-        encoded_bytes = sum(item.exact_byte_count for item in prepared_facts)
+        snapshotted_facts = tuple(fact.model_copy(deep=True) for fact in facts)
+        encoded_bytes = sum(
+            len(self._admission_codec.encode_fact(fact).data)
+            for fact in snapshotted_facts
+        )
         if (
             len(facts) > self._policy.max_pending_events
             or encoded_bytes > self._policy.max_pending_bytes
@@ -181,7 +166,7 @@ class TraceBatchWriter:
                 await self._condition.wait()
                 self._require_open()
             pending = _PendingFacts(
-                prepared=prepared_facts,
+                facts=snapshotted_facts,
                 encoded_bytes=encoded_bytes,
                 committed=committed,
             )
@@ -271,9 +256,9 @@ class TraceBatchWriter:
                 batch = await self._next_batch()
                 if batch is None:
                     return
-                prepared = tuple(fact for item in batch for fact in item.prepared)
+                facts = tuple(fact for item in batch for fact in item.facts)
                 try:
-                    events = await self._append(prepared, mandatory=False)
+                    events = await self._writer.append(facts, mandatory=False)
                     await self._notify_committed(events)
                 except BaseException as error:  # noqa: BLE001 - producer outcome
                     async with self._condition:
@@ -285,7 +270,7 @@ class TraceBatchWriter:
                     return
                 async with self._condition:
                     for item in batch:
-                        self._pending_events -= len(item.prepared)
+                        self._pending_events -= len(item.facts)
                         self._pending_bytes -= item.encoded_bytes
                         if not item.committed.done():
                             item.committed.set_result(None)
@@ -329,7 +314,7 @@ class TraceBatchWriter:
             while self._queue:
                 candidate = self._queue[0]
                 would_exceed = selected and (
-                    selected_events + len(candidate.prepared)
+                    selected_events + len(candidate.facts)
                     > self._policy.max_batch_events
                     or selected_bytes + candidate.encoded_bytes
                     > self._policy.max_batch_bytes
@@ -337,34 +322,17 @@ class TraceBatchWriter:
                 if would_exceed:
                     break
                 selected.append(self._pop_queued())
-                selected_events += len(candidate.prepared)
+                selected_events += len(candidate.facts)
                 selected_bytes += candidate.encoded_bytes
             if not self._queue:
                 self._force_requested = False
             return tuple(selected)
 
-    async def _append(
-        self,
-        prepared: tuple[PreparedTraceFact, ...],
-        *,
-        mandatory: bool,
-    ) -> tuple[TraceEvent, ...]:
-        writer = self._writer
-        if isinstance(writer, _PreparedTraceWriter):
-            return await writer._append_prepared(
-                prepared,
-                mandatory=mandatory,
-            )
-        return await writer.append(
-            tuple(item.fact for item in prepared),
-            mandatory=mandatory,
-        )
-
     def _pop_queued(self) -> _PendingFacts:
         """Remove one queued submission and update only queue-local counters."""
 
         item = self._queue.popleft()
-        self._queued_events -= len(item.prepared)
+        self._queued_events -= len(item.facts)
         self._queued_bytes -= item.encoded_bytes
         return item
 
@@ -381,7 +349,7 @@ class TraceBatchWriter:
         error: BaseException,
     ) -> None:
         for item in batch:
-            self._pending_events -= len(item.prepared)
+            self._pending_events -= len(item.facts)
             self._pending_bytes -= item.encoded_bytes
             if not item.committed.done():
                 item.committed.set_exception(error)

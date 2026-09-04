@@ -976,7 +976,7 @@ class TinkerFin:
         )
         state: dict[str, object] | None = None
         async for part in stream:
-            canonical = self._runtime_profile.stream_driver.validate(part)
+            canonical = stream._take_frame(part).canonical
             if not isinstance(canonical, NativeValuesStreamPart) or canonical.ns != ():
                 continue
             state = dict(canonical.data)

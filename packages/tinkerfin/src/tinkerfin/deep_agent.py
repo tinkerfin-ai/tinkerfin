@@ -40,11 +40,6 @@ from ._agui_lineage_state import (
     RESUME_MARKER_STATE_KEY,
     lineage_state_update,
 )
-from ._definition_trace import (
-    DefinitionTraceContext,
-    describe_middleware,
-    skill_sources,
-)
 from ._observation import RuntimeObservationHub, source_context
 from ._optional_dependencies import require_agui
 from ._state_schema import compose_deep_agent_base_schema
@@ -368,7 +363,6 @@ def _wrap_native_astream(
     identity: RunIdentity,
     mode: AgentMode,
     private_state_keys: frozenset[str],
-    trace_context: DefinitionTraceContext,
     on_part: PartObserver[Mapping[str, object]] | None,
 ) -> AstreamT:
     """Bind one Definition stream to its Profile, identity, and Observer lifecycle.
@@ -409,8 +403,6 @@ def _wrap_native_astream(
             config=raw_config,
             private_state_keys=private_state_keys,
             call_tracking_enabled=True,
-            middleware=trace_context.middleware,
-            skill_sources=trace_context.skill_sources,
         )
         observation = tinkerfin._observation_hub(context)
         _install_call_handler(bound, observation)
@@ -451,7 +443,6 @@ def _create_graph_agui_stream(
     expose_reasoning_events: bool,
     expose_subagent_events: bool,
     private_state_keys: frozenset[str],
-    trace_context: DefinitionTraceContext,
     checkpointer: object | None,
     resume: AgUiResumeBinding | None,
     on_resume_checkpointed: AgUiResumeCheckpointObserver | None,
@@ -493,8 +484,6 @@ def _create_graph_agui_stream(
         config=raw_config,
         private_state_keys=private_state_keys,
         call_tracking_enabled=True,
-        middleware=trace_context.middleware,
-        skill_sources=trace_context.skill_sources,
         resume=() if resume is None else resume._observation_summaries(),
     )
     observation = tinkerfin._observation_hub(context)
@@ -683,7 +672,6 @@ def _wrap_agui_astream(
     expose_reasoning_events: bool,
     expose_subagent_events: bool,
     private_state_keys: frozenset[str],
-    trace_context: DefinitionTraceContext,
     on_event: EventObserver | None,
 ) -> AstreamT:
     """Preserve the Graph input signature for an ordinary AG-UI run."""
@@ -725,7 +713,6 @@ def _wrap_agui_astream(
             expose_reasoning_events=expose_reasoning_events,
             expose_subagent_events=expose_subagent_events,
             private_state_keys=private_state_keys,
-            trace_context=trace_context,
             checkpointer=None,
             resume=None,
             on_resume_checkpointed=None,
@@ -785,7 +772,6 @@ def _wrap_agui_resume_astream(
     expose_reasoning_events: bool,
     expose_subagent_events: bool,
     private_state_keys: frozenset[str],
-    trace_context: DefinitionTraceContext,
     checkpointer: object | None,
     resume: AgUiResumeBinding,
     on_resume_checkpointed: AgUiResumeCheckpointObserver | None,
@@ -824,8 +810,6 @@ def _wrap_agui_resume_astream(
                 config=bound.arguments.get("config", {}),
                 private_state_keys=private_state_keys,
                 call_tracking_enabled=True,
-                middleware=trace_context.middleware,
-                skill_sources=trace_context.skill_sources,
                 resume=resume._observation_summaries(),
             )
             observation = tinkerfin._observation_hub(context)
@@ -864,7 +848,6 @@ def _wrap_agui_resume_astream(
             expose_reasoning_events=expose_reasoning_events,
             expose_subagent_events=expose_subagent_events,
             private_state_keys=private_state_keys,
-            trace_context=trace_context,
             checkpointer=checkpointer,
             resume=resume,
             on_resume_checkpointed=on_resume_checkpointed,
@@ -1129,7 +1112,6 @@ class DeepAgentRuntime(Generic[AstreamT]):
         identity: RunIdentity,
         mode: AgentMode,
         private_state_keys: frozenset[str],
-        trace_context: DefinitionTraceContext,
         on_part: PartObserver[Mapping[str, object]] | None,
     ) -> None:
         """Bind a fresh native Graph stream to one canonical request.
@@ -1140,7 +1122,6 @@ class DeepAgentRuntime(Generic[AstreamT]):
             identity: Canonical thread and Run identity.
             mode: Resolved default or Plan routing mode.
             private_state_keys: Runtime-owned channels omitted from public facts.
-            trace_context: Visible middleware and configured Skill sources.
             on_part: Optional callback invoked after validation and Observation.
         """
 
@@ -1150,7 +1131,6 @@ class DeepAgentRuntime(Generic[AstreamT]):
             identity=identity,
             mode=mode,
             private_state_keys=private_state_keys,
-            trace_context=trace_context,
             on_part=on_part,
         )
 
@@ -1174,7 +1154,6 @@ class DeepAgentAgUiRuntime(Generic[AstreamT]):
         expose_reasoning_events: bool,
         expose_subagent_events: bool,
         private_state_keys: frozenset[str],
-        trace_context: DefinitionTraceContext,
         on_event: EventObserver | None,
     ) -> None:
         """Bind a fresh Graph to one canonical ordinary AG-UI request.
@@ -1191,7 +1170,6 @@ class DeepAgentAgUiRuntime(Generic[AstreamT]):
             expose_reasoning_events: Whether verified public reasoning is emitted.
             expose_subagent_events: Whether validated subagent events are emitted.
             private_state_keys: Runtime-owned state channels omitted from output.
-            trace_context: Visible middleware and configured Skill sources.
             on_event: Optional callback awaited before public event delivery.
         """
 
@@ -1207,7 +1185,6 @@ class DeepAgentAgUiRuntime(Generic[AstreamT]):
             expose_reasoning_events=expose_reasoning_events,
             expose_subagent_events=expose_subagent_events,
             private_state_keys=private_state_keys,
-            trace_context=trace_context,
             on_event=on_event,
         )
 
@@ -1231,7 +1208,6 @@ class DeepAgentAgUiResumeRuntime(Generic[AstreamT]):
         expose_reasoning_events: bool,
         expose_subagent_events: bool,
         private_state_keys: frozenset[str],
-        trace_context: DefinitionTraceContext,
         checkpointer: object | None,
         resume: AgUiResumeBinding,
         on_resume_checkpointed: AgUiResumeCheckpointObserver | None,
@@ -1255,7 +1231,6 @@ class DeepAgentAgUiResumeRuntime(Generic[AstreamT]):
             expose_reasoning_events: Whether verified public reasoning is emitted.
             expose_subagent_events: Whether validated subagent events are emitted.
             private_state_keys: Runtime-owned state channels omitted from output.
-            trace_context: Visible middleware and configured Skill sources.
             checkpointer: Borrowed saver used for Graph-independent durable marker probes.
             resume: Framework-resolved immutable resume facts.
             on_resume_checkpointed: Idempotent callback after marker durability.
@@ -1280,7 +1255,6 @@ class DeepAgentAgUiResumeRuntime(Generic[AstreamT]):
             expose_reasoning_events=expose_reasoning_events,
             expose_subagent_events=expose_subagent_events,
             private_state_keys=private_state_keys,
-            trace_context=trace_context,
             checkpointer=checkpointer,
             resume=resume,
             on_resume_checkpointed=on_resume_checkpointed,
@@ -1302,7 +1276,6 @@ class DeepAgentDefinition(Generic[GraphT, AstreamT]):
         "_plan_options",
         "_private_state_keys",
         "_tinkerfin",
-        "_trace_context",
         "_uncontracted_external_subagents",
     )
 
@@ -1318,7 +1291,6 @@ class DeepAgentDefinition(Generic[GraphT, AstreamT]):
         plan_factory: Callable[..., object] | None,
         plan_options: PlanOptions | None,
         private_state_keys: frozenset[str],
-        trace_context: DefinitionTraceContext,
         uncontracted_external_subagents: frozenset[str],
     ) -> None:
         """Freeze graph construction inputs while borrowing shared resources.
@@ -1339,7 +1311,6 @@ class DeepAgentDefinition(Generic[GraphT, AstreamT]):
             plan_factory: Optional fresh Planning Graph factory.
             plan_options: Optional immutable Plan configuration.
             private_state_keys: Runtime-owned channels excluded from public output.
-            trace_context: Visible middleware and configured Skill source metadata.
             uncontracted_external_subagents: External graph names that cannot execute
                 mixed Tool cancellation safely.
         """
@@ -1353,7 +1324,6 @@ class DeepAgentDefinition(Generic[GraphT, AstreamT]):
         self._plan_factory = plan_factory
         self._plan_options = plan_options
         self._private_state_keys = private_state_keys
-        self._trace_context = trace_context
         self._uncontracted_external_subagents = uncontracted_external_subagents
 
     def _deferred_astream(self, mode: AgentMode) -> AstreamT:
@@ -1495,7 +1465,6 @@ class DeepAgentDefinition(Generic[GraphT, AstreamT]):
             identity=identity,
             mode=resolved_mode,
             private_state_keys=self._private_state_keys,
-            trace_context=self._trace_context,
             on_part=on_part,
         )
         return cast(
@@ -1549,7 +1518,6 @@ class DeepAgentDefinition(Generic[GraphT, AstreamT]):
                 expose_reasoning_events=expose_reasoning_events,
                 expose_subagent_events=expose_subagent_events,
                 private_state_keys=self._private_state_keys,
-                trace_context=self._trace_context,
                 on_event=on_event,
             )
             return cast(
@@ -1584,7 +1552,6 @@ class DeepAgentDefinition(Generic[GraphT, AstreamT]):
             expose_reasoning_events=expose_reasoning_events,
             expose_subagent_events=expose_subagent_events,
             private_state_keys=self._private_state_keys,
-            trace_context=self._trace_context,
             checkpointer=self._checkpointer,
             resume=binding,
             on_resume_checkpointed=on_resume_checkpointed,
@@ -1631,7 +1598,6 @@ class DeepAgentDefinition(Generic[GraphT, AstreamT]):
             identity=identity,
             mode=resolved_mode,
             private_state_keys=self._private_state_keys,
-            trace_context=self._trace_context,
             on_part=on_part,
         )
 
@@ -1829,7 +1795,6 @@ class DeepAgentDefinition(Generic[GraphT, AstreamT]):
                 expose_reasoning_events=expose_reasoning_events,
                 expose_subagent_events=expose_subagent_events,
                 private_state_keys=self._private_state_keys,
-                trace_context=self._trace_context,
                 checkpointer=self._checkpointer,
                 resume=resume,
                 on_resume_checkpointed=on_resume_checkpointed,
@@ -1848,7 +1813,6 @@ class DeepAgentDefinition(Generic[GraphT, AstreamT]):
             expose_reasoning_events=expose_reasoning_events,
             expose_subagent_events=expose_subagent_events,
             private_state_keys=self._private_state_keys,
-            trace_context=self._trace_context,
             on_event=on_event,
         )
 
@@ -1906,15 +1870,7 @@ class _EnhancedDeepAgentFactory(Generic[CreateP, GraphT, AstreamT]):
             bound = selected_signature.bind(*args, **kwargs)
             bound.apply_defaults()
             definition_kwargs = dict(kwargs)
-            resolved_middleware, middleware_descriptors = describe_middleware(
-                bound.arguments.get("middleware", ())
-            )
-            bound.arguments["middleware"] = resolved_middleware
-            definition_kwargs["middleware"] = resolved_middleware
-            trace_context = DefinitionTraceContext(
-                middleware=middleware_descriptors,
-                skill_sources=skill_sources(dict(bound.arguments)),
-            )
+            definition_kwargs["middleware"] = bound.arguments.get("middleware", ())
             checkpointer = bound.arguments.get("checkpointer")
             if checkpointer is None and instance._checkpointer is not None:
                 checkpointer = instance._checkpointer
@@ -1967,7 +1923,6 @@ class _EnhancedDeepAgentFactory(Generic[CreateP, GraphT, AstreamT]):
                 plan_factory=plan_factory,
                 plan_options=instance._plan_options,
                 private_state_keys=private_state_keys,
-                trace_context=trace_context,
                 uncontracted_external_subagents=(
                     preparation.uncontracted_external_subagents
                 ),

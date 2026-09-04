@@ -55,6 +55,18 @@ _BUSINESS_MODELS = (
     ConversationRunRegistration,
     ConversationInterruptClaim,
 )
+_BUSINESS_TABLES = frozenset(model.__tablename__ for model in _BUSINESS_MODELS)
+
+
+def test_studio_schema_contains_only_business_tables() -> None:
+    """Studio SQL 不得复制由框架维护的表结构"""
+
+    ddl = _SCHEMA_PATH.read_text(encoding="utf-8")
+    declared_tables = frozenset(
+        re.findall(r"^CREATE TABLE ([^ (]+)", ddl, flags=re.MULTILINE)
+    )
+
+    assert declared_tables == _BUSINESS_TABLES
 
 
 class _ReflectedColumn(TypedDict):
@@ -242,10 +254,10 @@ async def _drop_database(admin_engine: AsyncEngine, database_name: str) -> None:
 
 
 @pytest.mark.studio_mysql_integration
-async def test_full_schema_sql_matches_runtime_generated_mysql_schema(
+async def test_business_sql_and_framework_setups_compose_the_current_mysql_schema(
     mysql_admin_url: str,
 ) -> None:
-    """全量脚本必须与四个当前 Schema 所有者逐项一致"""
+    """业务 SQL 与三个框架初始化入口组合后必须得到唯一当前 Schema"""
 
     admin_url = make_url(mysql_admin_url)
     token = secrets.token_hex(8)
@@ -264,6 +276,11 @@ async def test_full_schema_sql_matches_runtime_generated_mysql_schema(
         sql_engine = create_async_engine(sql_url)
         runtime_engine = create_async_engine(runtime_url)
         await _execute_ddl(sql_engine, _SCHEMA_PATH.read_text(encoding="utf-8"))
+        async with sql_engine.connect() as connection:
+            business_schema = await connection.run_sync(_reflect_schema)
+        assert set(business_schema.tables) == _BUSINESS_TABLES
+
+        await _create_runtime_schema(sql_engine, sql_url)
         await _create_runtime_schema(runtime_engine, runtime_url)
 
         async with sql_engine.connect() as connection:
@@ -278,20 +295,19 @@ async def test_full_schema_sql_matches_runtime_generated_mysql_schema(
         assert (
             sql_schema.tables["conversation_run_registrations"].check_constraints == {}
         )
-        business_table_names = {model.__tablename__ for model in _BUSINESS_MODELS}
         assert {
             table_name: sql_schema.table_comments[table_name]
-            for table_name in business_table_names
+            for table_name in _BUSINESS_TABLES
         } == {
             table_name: runtime_schema.table_comments[table_name]
-            for table_name in business_table_names
+            for table_name in _BUSINESS_TABLES
         }
         assert {
             table_name: sql_schema.column_comments[table_name]
-            for table_name in business_table_names
+            for table_name in _BUSINESS_TABLES
         } == {
             table_name: runtime_schema.column_comments[table_name]
-            for table_name in business_table_names
+            for table_name in _BUSINESS_TABLES
         }
         assert (
             sql_schema.table_comments["store"]

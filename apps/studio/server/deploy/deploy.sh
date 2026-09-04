@@ -125,14 +125,6 @@ build_release_artifacts() {
     clean_build_artifacts
 }
 
-prepare_external_database() {
-    STUDIO_ENV_FILE=$ENV_FILE VERSION=${APP_VERSION:-0.1.0} docker compose \
-        --env-file "$ENV_FILE" \
-        -f "$COMPOSE_FILE" \
-        --profile tools \
-        run --rm database-init
-}
-
 app_version_from_wheel() {
     local wheel
     wheel=$(find "$PROJECT_ROOT/dist" -maxdepth 1 \
@@ -154,6 +146,7 @@ validate_environment() {
         "$PROJECT_ROOT/pyproject.toml" \
         "$PROJECT_ROOT/uv.lock" \
         "$PROJECT_ROOT/apps/studio/server/Dockerfile" \
+        "$PROJECT_ROOT/apps/studio/server/database/mysql/schema.sql" \
         "$COMPOSE_FILE" \
         "$ENV_FILE" \
         "$SCRIPT_DIR/secrets/database_url" \
@@ -210,9 +203,6 @@ run_stage "构建发布产物" build_release_artifacts
 APP_VERSION=$(app_version_from_wheel)
 readonly APP_VERSION
 run_stage "构建生产镜像" compose build --pull studio
-if ((EXTERNAL_MODE == 1)); then
-    run_stage "准备外部数据库" prepare_external_database
-fi
 WAIT_TIMEOUT=$(deploy_wait_timeout)
 readonly WAIT_TIMEOUT
 run_stage "启动并等待后端" compose up -d --remove-orphans --wait \

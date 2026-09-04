@@ -24,7 +24,6 @@ from langchain_core.messages import (
 from pydantic import JsonValue
 
 from tinkerfin_contracts import (
-    MiddlewareDescriptor,
     NativeExtraObservation,
     NativeInterruptRecord,
     NativeMessageObservation,
@@ -50,7 +49,6 @@ from tinkerfin_contracts import (
     RunTerminalOutcome,
     RuntimeObservation,
     RuntimeObserver,
-    SkillSourceDescriptor,
 )
 from tinkerfin_native_stream import (
     NativeExtraStreamPart,
@@ -302,8 +300,6 @@ def source_context(
     private_state_keys: frozenset[str],
     resume: tuple[RunResumeSummary, ...] = (),
     call_tracking_enabled: bool = False,
-    middleware: tuple[MiddlewareDescriptor, ...] = (),
-    skill_sources: tuple[SkillSourceDescriptor, ...] = (),
 ) -> RunSourceContext:
     """Build one finite source snapshot before opening Observer resources."""
 
@@ -322,8 +318,6 @@ def source_context(
         resume=resume,
         private_state_keys=tuple(sorted(private_state_keys)),
         call_tracking_enabled=call_tracking_enabled,
-        middleware=middleware,
-        skill_sources=skill_sources,
     )
 
 

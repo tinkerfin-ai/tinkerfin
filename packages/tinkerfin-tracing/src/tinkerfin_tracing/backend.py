@@ -11,7 +11,7 @@ from tinkerfin_contracts import RunIdentity
 
 from .facts import TraceEvent, TraceSemanticFact
 from .graph import (
-    TraceGraphFacets,
+    MAX_TRACE_GRAPH_LINEAGE_RUNS,
     TraceGraphFilter,
     TraceGraphLinkIssue,
     TraceGraphNodeKind,
@@ -111,7 +111,8 @@ class TraceGraphNodeMutation:
     kind: TraceGraphNodeKind | None = None
     status: TraceGraphNodeStatus | None = None
     name: str | None = None
-    structural_parent_id: str | None = None
+    parent_subagent_id: str | None = None
+    model_call_id: str | None = None
     namespace: tuple[str, ...] | None = None
     agent_name: str | None = None
     provider: str | None = None
@@ -131,7 +132,8 @@ class StoredTraceGraphNode:
     """Return one indexed Graph row with referenced Ledger evidence."""
 
     node_id: str
-    structural_parent_id: str | None
+    parent_subagent_id: str | None
+    model_call_id: str | None
     kind: TraceGraphNodeKind
     status: TraceGraphNodeStatus
     name: str
@@ -165,14 +167,22 @@ class TraceGraphQueryRequest:
     where: TraceGraphFilter
     limit: int
     total_limit: int = 4000
-    node_ids: tuple[str, ...] = ()
-    include_facets: bool = True
     before_started_at: datetime | None = None
     before_node_id: str | None = None
 
     def __post_init__(self) -> None:
         """Reject an incomplete or timezone-dependent backend cursor."""
 
+        if (
+            not self.run_ids
+            or len(self.run_ids) > MAX_TRACE_GRAPH_LINEAGE_RUNS
+            or len(set(self.run_ids)) != len(self.run_ids)
+            or any(
+                not run_id or len(run_id) > 1024 or run_id != run_id.strip()
+                for run_id in self.run_ids
+            )
+        ):
+            raise ValueError("Graph run lineage is invalid or exceeds 10000 Runs")
         if isinstance(self.limit, bool) or not isinstance(self.limit, int):
             raise TypeError("Graph page limit must be an integer")
         if isinstance(self.total_limit, bool) or not isinstance(self.total_limit, int):
@@ -183,14 +193,6 @@ class TraceGraphQueryRequest:
             raise ValueError("Graph total limit must include every direct match")
         if self.where.search is not None:
             raise ValueError("Graph content search must be resolved by the Trace Store")
-        if not isinstance(self.include_facets, bool):
-            raise TypeError("include_facets must be a boolean")
-        if len(set(self.node_ids)) != len(self.node_ids):
-            raise ValueError("Graph node IDs must be unique")
-        if len(self.node_ids) > self.limit:
-            raise ValueError("Graph node ID selection must fit the direct page limit")
-        if any(not value or value != value.strip() for value in self.node_ids):
-            raise ValueError("Graph node IDs must be canonical non-empty text")
         if (self.before_started_at is None) != (self.before_node_id is None):
             raise ValueError("Graph cursor time and node ID must be supplied together")
         if self.before_started_at is not None and (
@@ -212,17 +214,17 @@ class TraceGraphRebuildRequest:
 
 @dataclass(frozen=True, slots=True)
 class StoredTraceGraphPage:
-    """Return indexed Graph rows, Facets, and older-page cursor evidence."""
+    """Return indexed Graph rows, direct matches, and page cursor evidence."""
 
     key: TraceThreadKey
     as_of_seq: int
     nodes: tuple[StoredTraceGraphNode, ...]
     matched_node_ids: tuple[str, ...]
-    facets: TraceGraphFacets
     has_more: bool
     next_started_at: datetime | None
     next_node_id: str | None
     call_tracking_present: bool
+    relationship_evidence_missing: bool
 
 
 @dataclass(frozen=True, slots=True)

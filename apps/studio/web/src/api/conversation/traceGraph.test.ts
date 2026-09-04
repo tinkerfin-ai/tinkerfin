@@ -2,8 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { clearAuthSession, saveAuthSession } from '../../auth/session'
 import {
+  compareTraceGraphIds,
   followTraceGraph,
   parseTraceGraph,
+  parseTraceGraphDelta,
   parseTraceGraphPage,
   queryTraceGraph,
   type TraceGraphPage,
@@ -13,15 +15,14 @@ const page = (): TraceGraphPage => ({
   turns: [{
     id: 'turn-1',
     ordinal: 1,
-    rootNodeId: 'human-1',
     startedAt: '2026-08-31T00:00:00Z',
   }],
   nodes: [
     {
       id: 'human-1',
       turnId: 'turn-1',
-      parentId: null,
-      structuralParentId: null,
+      parentSubagentId: null,
+      modelCallId: null,
       kind: 'human_message',
       status: 'succeeded',
       name: 'HumanMessage',
@@ -33,16 +34,16 @@ const page = (): TraceGraphPage => ({
       updatedSeq: 2,
       content: 'Show the current trace',
       contentOmitted: false,
+      toolCallOnly: false,
       requestOmitted: false,
       resultOmitted: false,
-      hooks: [],
       linkIssues: [],
     },
     {
       id: 'model-call',
       turnId: 'turn-1',
-      parentId: 'human-1',
-      structuralParentId: 'human-1',
+      parentSubagentId: null,
+      modelCallId: null,
       kind: 'model',
       status: 'succeeded',
       name: 'deepseek-chat',
@@ -56,28 +57,18 @@ const page = (): TraceGraphPage => ({
       startedSeq: 4,
       updatedSeq: 6,
       contentOmitted: false,
+      toolCallOnly: false,
       request: { messages: [] },
       requestOmitted: false,
       resultOmitted: false,
       usage: { input_tokens: 2, output_tokens: 1 },
-      hooks: [],
       linkIssues: [],
     },
   ],
   orderedNodeIds: ['human-1', 'model-call'],
-  rootNodeIds: ['human-1'],
   matchedNodeIds: ['model-call'],
   nextCursor: null,
   asOfSeq: 8,
-  facets: {
-    kinds: { human_message: 1, model: 1 },
-    statuses: { succeeded: 2 },
-    agents: {},
-    middleware: {},
-    skills: {},
-    providers: { deepseek: 1 },
-    models: { 'deepseek-chat': 1 },
-  },
   completeness: {
     callTrackingMissing: false,
     relationshipEvidenceMissing: false,
@@ -127,26 +118,24 @@ describe('Trace Graph client', () => {
       const url = new URL(request.url)
       expect(request.headers.get('Authorization')).toBe('Bearer trace-token')
       expect(url.pathname).toBe('/api/conversation/thread-1/trace/graph/follow')
-      expect(url.searchParams.getAll('kind')).toEqual(['model', 'skill'])
+      expect(url.searchParams.getAll('kind')).toEqual(['model', 'subagent'])
       expect(url.searchParams.getAll('status')).toEqual(['failed'])
       expect(url.searchParams.getAll('provider')).toEqual(['deepseek'])
       expect(url.searchParams.get('namespace')).toBe('root')
       expect(url.searchParams.get('query')).toBe('deepseek')
-      expect(url.searchParams.get('includeTechnicalNodes')).toBe('true')
-      expect(url.searchParams.get('includeAncestorNodes')).toBe('true')
+      expect(url.searchParams.has('includeTechnicalNodes')).toBe(false)
+      expect(url.searchParams.has('includeAncestorNodes')).toBe(false)
       expect(url.searchParams.get('limit')).toBe('1000')
       return eventStream({ type: 'snapshot', snapshot: page() })
     }))
 
     const events = []
     for await (const event of followTraceGraph('thread-1', {
-      kinds: ['model', 'skill'],
+      kinds: ['model', 'subagent'],
       statuses: ['failed'],
       providers: ['deepseek'],
       namespaces: [[]],
       query: 'deepseek',
-      includeTechnicalNodes: true,
-      includeAncestorNodes: true,
     }, { limit: 1000 })) events.push(event)
 
     expect(events[0]).toHaveProperty('snapshot.nodes.0.name', 'HumanMessage')
@@ -159,9 +148,12 @@ describe('Trace Graph client', () => {
         : new Request(new URL(String(input), window.location.origin), init)
       const url = new URL(request.url)
       expect(url.pathname).toBe('/api/conversation/thread-1/trace/graph')
-      expect(url.searchParams.get('parentId')).toBe('model-call')
-      expect(url.searchParams.getAll('kind')).toEqual(['assistant_message', 'tool'])
-      expect(url.searchParams.get('includeAncestorNodes')).toBe('false')
+      expect(url.searchParams.get('modelCallId')).toBe('model-call')
+      expect(url.searchParams.getAll('kind')).toEqual([
+        'assistant_message',
+        'tool',
+        'subagent',
+      ])
       expect(url.searchParams.get('limit')).toBe('1000')
       return new Response(JSON.stringify({ code: 0, message: 'ok', data: page() }), {
         headers: { 'Content-Type': 'application/json' },
@@ -169,9 +161,8 @@ describe('Trace Graph client', () => {
     }))
 
     const result = await queryTraceGraph('thread-1', {
-      parentId: 'model-call',
-      kinds: ['assistant_message', 'tool'],
-      includeAncestorNodes: false,
+      modelCallId: 'model-call',
+      kinds: ['assistant_message', 'tool', 'subagent'],
     }, { limit: 1000 })
 
     expect(result.nodes[0]?.name).toBe('HumanMessage')
@@ -190,9 +181,7 @@ describe('Trace Graph client', () => {
           nodeUpserts: [],
           nodeRemoves: ['model-call'],
           orderedNodeIds: ['human-1'],
-          rootNodeIds: ['human-1'],
           matchedNodeIds: [],
-          facets: { ...page().facets, kinds: { human_message: 1 } },
           completeness: page().completeness,
         },
       },
@@ -226,14 +215,10 @@ describe('Trace Graph client', () => {
     }).rejects.toThrow()
   })
 
-  it('rejects malformed nodes, facets, ordering and completeness', () => {
+  it('rejects malformed nodes, ordering and completeness', () => {
     const invalid = page()
     Reflect.deleteProperty(invalid.nodes[0] as object, 'startedSeq')
     expect(() => parseTraceGraphPage(invalid)).toThrow()
-
-    const invalidFacet = page()
-    invalidFacet.facets.kinds.model = -1
-    expect(() => parseTraceGraphPage(invalidFacet)).toThrow()
 
     const invalidOrder = page()
     invalidOrder.orderedNodeIds = ['model-call']
@@ -248,7 +233,7 @@ describe('Trace Graph client', () => {
     expect(() => parseTraceGraphPage(invalidMatchOrder)).toThrow()
 
     const invalidParent = page()
-    invalidParent.nodes[1].parentId = 'unknown'
+    invalidParent.nodes[1].parentSubagentId = 'unknown'
     expect(() => parseTraceGraphPage(invalidParent)).toThrow()
 
     const invalidCompleteness = page()
@@ -264,5 +249,174 @@ describe('Trace Graph client', () => {
     expect(() => parseTraceGraphPage(graphWithoutCursor)).toThrow()
     expect(parseTraceGraph(graphWithoutCursor).asOfSeq).toBe(8)
     expect(() => parseTraceGraph(page())).toThrow()
+  })
+
+  it('uses Python-compatible Unicode code point ordering', () => {
+    expect(compareTraceGraphIds('node-\uE000', 'node-😀')).toBeLessThan(0)
+    expect(compareTraceGraphIds('node-😀', 'node-\uE000')).toBeGreaterThan(0)
+    expect(compareTraceGraphIds('node-😀', 'node-😀')).toBe(0)
+  })
+
+  it('parses the four-thousand-node Store boundary iteratively', () => {
+    const source = page()
+    const nodes = Array.from({ length: 4000 }, (_, index) => ({
+      ...source.nodes[0]!,
+      id: `human-${String(index).padStart(4, '0')}`,
+      startedSeq: index + 1,
+      updatedSeq: index + 1,
+    }))
+    const ids = nodes.map((node) => node.id)
+
+    expect(parseTraceGraphPage({
+      ...source,
+      nodes,
+      orderedNodeIds: ids,
+      matchedNodeIds: ids,
+      asOfSeq: 4000,
+    }).nodes).toHaveLength(4000)
+  })
+
+  it('accepts 64 Subagent levels and rejects level 65 without recursion', () => {
+    const source = page()
+    const nodes = Array.from({ length: 64 }, (_, index) => ({
+      ...source.nodes[0]!,
+      id: `subagent-${index}`,
+      parentSubagentId: index === 0 ? null : `subagent-${index - 1}`,
+      kind: 'subagent' as const,
+      name: `subagent-${index}`,
+      namespace: Array.from({ length: index + 1 }, (__, part) => `tools:${part}`),
+      startedSeq: index + 1,
+      updatedSeq: index + 1,
+    }))
+    const ids = nodes.map((node) => node.id)
+    expect(parseTraceGraphPage({
+      ...source,
+      nodes,
+      orderedNodeIds: ids,
+      matchedNodeIds: ids,
+      asOfSeq: 64,
+    }).nodes).toHaveLength(64)
+
+    const tooDeep = [
+      ...nodes,
+      {
+        ...nodes[63]!,
+        id: 'subagent-64',
+        parentSubagentId: 'subagent-63',
+        name: 'subagent-64',
+        startedSeq: 65,
+        updatedSeq: 65,
+      },
+    ]
+    expect(() => parseTraceGraphPage({
+      ...source,
+      nodes: tooDeep,
+      orderedNodeIds: tooDeep.map((node) => node.id),
+      matchedNodeIds: tooDeep.map((node) => node.id),
+      asOfSeq: 65,
+    })).toThrow()
+  })
+
+  it('rejects cyclic, non-Subagent, cross-Turn and future references', () => {
+    const source = page()
+    const first = {
+      ...source.nodes[0]!,
+      id: 'subagent-a',
+      parentSubagentId: 'subagent-b',
+      kind: 'subagent' as const,
+      name: 'subagent-a',
+      namespace: ['tools:a'],
+      startedSeq: 1,
+      updatedSeq: 1,
+    }
+    const second = {
+      ...first,
+      id: 'subagent-b',
+      parentSubagentId: 'subagent-a',
+      name: 'subagent-b',
+      namespace: ['tools:a', 'tools:b'],
+      startedSeq: 2,
+      updatedSeq: 2,
+    }
+    expect(() => parseTraceGraph({
+      ...source,
+      nodes: [first, second],
+      orderedNodeIds: [first.id, second.id],
+      matchedNodeIds: [first.id, second.id],
+      asOfSeq: 2,
+    })).toThrow()
+
+    const toolParent = { ...source.nodes[0]!, id: 'tool-parent', kind: 'tool' as const }
+    const nonSubagentChild = { ...first, parentSubagentId: toolParent.id }
+    expect(() => parseTraceGraph({
+      ...source,
+      nodes: [toolParent, nonSubagentChild],
+      orderedNodeIds: [toolParent.id, nonSubagentChild.id],
+      matchedNodeIds: [toolParent.id, nonSubagentChild.id],
+      asOfSeq: 2,
+    })).toThrow()
+
+    const secondTurn = {
+      id: 'turn-2',
+      ordinal: 2,
+      startedAt: source.turns[0]!.startedAt,
+    }
+    expect(() => parseTraceGraph({
+      ...source,
+      turns: [...source.turns, secondTurn],
+      nodes: [
+        { ...first, parentSubagentId: null },
+        { ...second, parentSubagentId: first.id, turnId: secondTurn.id },
+      ],
+      orderedNodeIds: [first.id, second.id],
+      matchedNodeIds: [first.id, second.id],
+      asOfSeq: 2,
+    })).toThrow()
+
+    expect(() => parseTraceGraph({
+      ...source,
+      nodes: [{ ...source.nodes[0]!, updatedSeq: 9 }],
+      orderedNodeIds: ['human-1'],
+      matchedNodeIds: ['human-1'],
+      asOfSeq: 8,
+    })).toThrow()
+  })
+
+  it('rejects overlapping, duplicate, unordered and future Delta references', () => {
+    const source = page()
+    const valid = {
+      asOfSeq: 9,
+      nextCursor: null,
+      turnUpserts: [],
+      turnRemoves: [],
+      nodeUpserts: [],
+      nodeRemoves: ['model-call'],
+      orderedNodeIds: ['human-1'],
+      matchedNodeIds: ['human-1'],
+      completeness: source.completeness,
+    }
+    expect(parseTraceGraphDelta(valid).asOfSeq).toBe(9)
+    expect(() => parseTraceGraphDelta({
+      ...valid,
+      nodeRemoves: ['model-call', 'model-call'],
+    })).toThrow()
+    expect(() => parseTraceGraphDelta({
+      ...valid,
+      nodeUpserts: [source.nodes[1]],
+      nodeRemoves: ['model-call'],
+      orderedNodeIds: ['human-1', 'model-call'],
+    })).toThrow()
+    expect(() => parseTraceGraphDelta({
+      ...valid,
+      nodeRemoves: [],
+      matchedNodeIds: ['model-call', 'human-1'],
+      orderedNodeIds: ['human-1', 'model-call'],
+    })).toThrow()
+    expect(() => parseTraceGraphDelta({
+      ...valid,
+      nodeUpserts: [{ ...source.nodes[1]!, updatedSeq: 10 }],
+      nodeRemoves: [],
+      orderedNodeIds: ['human-1', 'model-call'],
+    })).toThrow()
   })
 })

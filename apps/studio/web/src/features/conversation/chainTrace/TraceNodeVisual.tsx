@@ -1,24 +1,4 @@
-import {
-  BookOpen,
-  Bot,
-  Cpu,
-  Database,
-  GitFork,
-  Link2,
-  MessageCircle,
-  MessageCircleMore,
-  Puzzle,
-  Search,
-  ShieldCheck,
-  SquareCode,
-  WandSparkles,
-  Waypoints,
-} from 'lucide-react'
-
-import type {
-  TraceGraphNode,
-  TraceGraphNodeKind,
-} from '../../../api/conversation/traceGraph'
+import type { TraceGraphNode } from '../../../api/conversation/traceGraph'
 import { useI18n } from '../../../i18n'
 import {
   durationLabel,
@@ -29,49 +9,24 @@ import {
   traceVisualCategory,
 } from './tracePresentation'
 
-const nodeIcon = (kind: TraceGraphNodeKind) => {
-  switch (kind) {
-    case 'human_message': return <MessageCircleMore size={14} aria-hidden="true" />
-    case 'assistant_message': return <MessageCircle size={14} aria-hidden="true" />
-    case 'system_message': return <SquareCode size={14} aria-hidden="true" />
-    case 'agent': return <WandSparkles size={14} aria-hidden="true" />
-    case 'model': return <Cpu size={14} aria-hidden="true" />
-    case 'tool': return <Link2 size={14} aria-hidden="true" />
-    case 'subagent': return <GitFork size={14} aria-hidden="true" />
-    case 'skill': return <BookOpen size={14} aria-hidden="true" />
-    case 'memory': return <Database size={14} aria-hidden="true" />
-    case 'retrieval': return <Search size={14} aria-hidden="true" />
-    case 'guardrail': return <ShieldCheck size={14} aria-hidden="true" />
-    case 'middleware': return <Link2 size={14} aria-hidden="true" />
-    case 'run': return <Bot size={14} aria-hidden="true" />
-    case 'runtime_task': return <Waypoints size={14} aria-hidden="true" />
-    default: return <Puzzle size={14} aria-hidden="true" />
-  }
-}
-
-export function TraceNodeIcon({ kind }: { kind: TraceGraphNodeKind }) {
-  const category = traceVisualCategory(kind)
-  return (
-    <span className={`chain-trace-entry-icon is-${kind} is-category-${category}`}>
-      {nodeIcon(kind)}
-    </span>
-  )
-}
-
 export function TraceNodeCopy({
   node,
   showKind = true,
   showPreview = true,
+  previewFallback,
 }: {
   node: TraceGraphNode
   showKind?: boolean
   showPreview?: boolean
+  previewFallback?: string
 }) {
   const { t } = useI18n()
-  const preview = traceNodePreview(node)
-  const title = node.kind.endsWith('_message')
+  const nodePreview = traceNodePreview(node)
+  const preview = nodePreview || previewFallback || ''
+  const fallbackPreview = !nodePreview && Boolean(previewFallback)
+  const title = node.kind.endsWith('_message') || node.kind === 'context'
     ? ''
-    : node.kind === 'tool' ? node.name : traceNodeName(node, t)
+    : node.kind === 'tool' ? node.name : traceNodeName(node)
   return (
     <span className="chain-trace-node-copy">
       {(title || showKind) && (
@@ -84,6 +39,7 @@ export function TraceNodeCopy({
         <span className={[
           'chain-trace-node-content',
           node.failure ? 'is-error' : '',
+          fallbackPreview ? 'is-muted' : '',
           !title ? 'is-primary' : '',
         ].filter(Boolean).join(' ')}>
           {preview}
@@ -105,6 +61,7 @@ export function TraceNodeType({ node }: { node: TraceGraphNode }) {
 
 export function TraceNodeMeta({ node }: { node: TraceGraphNode }) {
   const { t } = useI18n()
+  const elapsed = elapsedMilliseconds(node)
   return (
     <span className="chain-trace-node-meta">
       {node.failure && <span className="chain-trace-error-badge">{t('错误')}</span>}
@@ -114,9 +71,9 @@ export function TraceNodeMeta({ node }: { node: TraceGraphNode }) {
       {!node.failure && node.status === 'running' && (
         <span className="chain-trace-running-badge">{t('运行中')}</span>
       )}
-      <span className="chain-trace-duration">
-        {durationLabel(elapsedMilliseconds(node), t)}
-      </span>
+      {elapsed != null && (
+        <span className="chain-trace-duration">{durationLabel(elapsed, t)}</span>
+      )}
     </span>
   )
 }

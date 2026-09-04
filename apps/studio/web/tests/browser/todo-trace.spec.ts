@@ -579,6 +579,7 @@ test('5k Group 冷水化、windowing、键盘与 heap 门禁', async ({ page }) 
   const cdp = await page.context().newCDPSession(page)
   await cdp.send('HeapProfiler.collectGarbage')
   const baseConversation = await cdp.send('Runtime.getHeapUsage') as { usedSize: number }
+  await page.goto('about:blank')
   await page.unroute('**/api/**')
   const evidence = await mockTodoTraceStudio(page, { groups })
   const launcher = page.getByRole('button', { name: '任务轨迹 5000' })

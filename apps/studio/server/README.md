@@ -66,10 +66,12 @@ Graph 关联或持久化身份；Service 会为 Graph 输入与 Trace 快照分�
 `open_agui_run(mode=...)` 使用内部模式，不把该字段重新暴露到 HTTP 契约。command 对象允许
 保留未来命令字段，但当前服务端只解释 `plan`。
 
-Studio 在应用启动时创建一个默认稳定 Runtime，不按模型或 Run 选择底层流实现。Run 注册只固定
-模型和请求快照，同 Run 重试、branch 和 resume 在建图前校验模型一致性。供应商私有思考字段
-默认不解析；产品确需展示思考过程时，应在启动装配处显式启用框架提供的对应解析器，不能写入
-模型配置、会话数据或客户端协议。
+Studio 在应用启动时选定默认稳定 Runtime Profile，不按模型或 Run 选择底层流实现。Profile 只
+负责框架与上游实现的集成及 checkpoint 恢复一致性；`profile_id` 不进入 Studio 业务表、HTTP
+请求或响应、Trace Graph 查询。Run 注册只固定模型和请求快照，同 Run 重试、branch 和 resume
+在建图前校验模型一致性。供应商私有思考字段默认不解析；产品确需展示思考过程时，由宿主在启动
+装配处提供能够验证 provider 与消息结构的 `ReasoningExtractor`，不能写入模型配置、会话数据或
+客户端协议。框架不提供供应商专用 extractor。
 
 ## 会话数据边界
 
@@ -81,21 +83,57 @@ Studio 在应用启动时创建一个默认稳定 Runtime，不按模型或 Run 
   `includeTaskTrace=true` 时只在任务轨迹实际变化后发送完整 replacement；断连或取消会关闭
   底层 follow iterator 与请求内 projector
 - `GET /api/conversation/{threadId}/trace/graph` 在校验用户归属后由 Trace Store 直接筛选链路
-  节点，支持 kind、status、parent、Agent、middleware、Skill、provider、model、namespace、时间、
-  文本、opaque cursor 与祖先补齐；响应中的 Turn 直接引用 Trace 已有 HumanMessage
+  节点，支持 `kind`、`status`、`modelCallId`、`agent`、`provider`、`model`、`namespace`、
+  `query`、`startedAfter`、`startedBefore`、opaque `cursor` 与 `limit`；响应中的 Turn 是容器，
+  `matchedNodeIds` 只包含直接命中，Store 会补入直接命中所属的 Subagent 链
 - `GET /api/conversation/{threadId}/trace/graph/follow` 先发送同一筛选首页，再持续发送节点
-  和 Turn 的 upsert/remove、Facet 与完整性变化；断连或取消会关闭底层过滤跟随器
+  和 Turn 的 upsert/remove、完整 `orderedNodeIds`、`matchedNodeIds`、`nextCursor`、`asOfSeq`
+  与 `completeness`；断连或取消会关闭底层过滤跟随器
 - `POST /api/conversation/chat` 的当前 owned Run 使用 AG-UI + Messaging；终态会话正文仍以 Trace 为准
 
-Studio 业务表只保存会话归属、Run 注册、interrupt claim 和列表摘要。Trace 的六张表由
-`SqlAlchemyTraceStore.setup()` 自动创建并校验，`database/mysql/schema.sql` 同时提供完整空库 DDL。
+Trace Graph 中，同一 Turn 作用域的节点按真实开始序号平级排列，只有 Subagent 形成嵌套。
+`parentSubagentId` 是唯一展示嵌套关系；`modelCallId` 只关联 Assistant、Tool、Subagent 与产生它的
+Model。Assistant 没有可见正文但对应 Model 确实发出 Tool 调用时，`toolCallOnly` 为 `true`，且不受
+API 查询是否返回 Tool 节点影响。非空 `namespace` 只表示 Graph 作用域，必须有经过校验的 Subagent 来源才能形成嵌套。
+公共顺序使用显式栈进行迭代式深度优先遍历；Store 通过受 `max_total_nodes` 约束的有界广度优先
+查询补齐所属 Subagent，最多接受 64 层，SQL key 每批最多读取 500 个。
+
+Studio 把 Graph kind 固定映射为六类：
+
+| Graph kind | Studio 分类 |
+| --- | --- |
+| `human_message` | 用户 |
+| `context`、`memory`、`guardrail`、`retrieval`、`custom`、`plan`、`interaction` | 上下文 |
+| `model` | 模型 |
+| `tool` | 工具 |
+| `subagent` | 子智能体 |
+| `assistant_message` | 助手 |
+
+链路页面始终读取完整六类，不提供节点类型筛选；节点和内容搜索通过 `query` 直接交给 Store。
+Subagent 内的首个“用户”只显示已采集的 `task.description`，Subagent 详情仍显示完整任务参数；
+两种视图共用同一个 Ledger Fact，不重复入库。
+
+每次模型调用前都有一个“上下文”节点：开始时间取同一作用域中的上一项可见执行边界，结束时间与
+模型节点开始时间一致。恢复仍在执行的子智能体时从本次恢复输入重新计时，不包含人工等待时间。
+详情中的最终 SystemMessage 直接从同一条模型请求投影，不重复写入 Trace Ledger；请求没有
+SystemMessage 时仍显示准备耗时，并明确内容不可用。该时长是墙钟准备延迟，不是 CPU 耗时。
+
+Middleware 正常参与 Agent 执行，但通用 chain 和 middleware callback 不进入 Trace。业务需要可见
+上下文时应显式使用 `trace_contribution(...)`。Trace 不定义 Skill 节点；模型读取 `SKILL.md`
+只显示为普通 `read_file` Tool。
+
+`database/mysql/schema.sql` 只定义 Studio 拥有的用户、模型、会话归属、Run 注册、
+interrupt claim 和列表摘要表，不复制框架表结构。Trace 表由
+`SqlAlchemyTraceStore.setup()` 创建并校验；LangGraph Store 在进入资源上下文时初始化；
+OpenSandbox State 在 Manager 启动时初始化。Studio 只装配这些公开入口。
 链路 Graph 表只保存筛选、关系、状态、时间与 Ledger 序号，不保存 request、result、message
-或 state payload；详情仍经 Trace codec 读取 Ledger。任务轨迹不写第二份副本、不注册 Projection
-checkpoint，只读取公共 `TraceThread.events()`。
+或 state payload；关系字段只包含所属 Subagent 和产生事件的 Model call，详情仍经 Trace codec
+读取 Ledger。任务轨迹不写第二份副本、不注册 Projection checkpoint，只读取公共
+`TraceThread.events()`。
 LangGraph Store 由 `tinkerfin-langgraph-mysql` 通过 asyncmy 管理一条独立连接，进入资源上下文时
 自动执行当前 Store DDL，退出、异常或取消时自动关闭。
 
-## 单机部署
+## 快速部署
 
 要求 Bash、OpenSSL、uv、Docker 和 Docker Compose 2.24 或更高版本。在仓库根目录
 执行：
@@ -106,8 +144,9 @@ LangGraph Store 由 `tinkerfin-langgraph-mysql` 通过 asyncmy 管理一条独�
 ```
 
 `setup.sh` 创建部署专用 `.env` 和权限为 `0600` 的文件型 Secrets。默认部署启动
-Studio、MySQL、Redis Control、Redis Runtime、OpenSandbox 和一次性数据库初始化服务，只向
-宿主机回环地址发布 Studio 端口。两个 Redis 使用独立 Secret、AOF 卷与健康检查。
+Studio、MySQL、Redis Control、Redis Runtime 和 OpenSandbox，只向宿主机回环地址发布 Studio
+端口。内置 MySQL 仅在全新数据卷首次启动时导入 Studio 业务 SQL。两个 Redis 使用独立 Secret、
+AOF 卷与健康检查。
 OpenSandbox 的 SQLite Store 与 Docker runtime metadata 分别使用持久卷；后者保留运行中 Sandbox
 续期后的过期时间，使 OpenSandbox Server 容器重建后不会退回创建时的旧时间。
 
@@ -119,8 +158,6 @@ OpenSandbox 的 SQLite Store 与 Docker runtime metadata 分别使用持久卷�
 ```bash
 ./apps/studio/server/deploy/deploy.sh --external
 ```
-
-部署命令会自动初始化空数据库。应用只接受当前完整 Schema，不包含运行时兼容分支或迁移链。
 
 ## 运行约束
 

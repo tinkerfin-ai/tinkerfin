@@ -33,20 +33,28 @@ export function useTraceModelResponse({
     const controller = new AbortController()
     setState({ phase: 'loading', modelId, responseRevision })
     void queryTraceGraph(threadId, {
-      parentId: modelId,
-      kinds: ['assistant_message', 'tool'],
-      includeTechnicalNodes: false,
-      includeAncestorNodes: false,
+      modelCallId: modelId,
     }, {
       limit: 1000,
       signal: controller.signal,
     }).then((page) => {
       if (controller.signal.aborted) return
-      if (page.nextCursor != null || page.completeness.detailsOmitted) {
+      if (
+        page.nextCursor != null
+        || page.completeness.callTrackingMissing
+        || page.completeness.relationshipEvidenceMissing
+        || page.completeness.detailsOmitted
+      ) {
         setState({ phase: 'error', modelId, responseRevision })
         return
       }
-      setState({ phase: 'ready', modelId, responseRevision, entries: page.nodes })
+      const matches = new Set(page.matchedNodeIds)
+      setState({
+        phase: 'ready',
+        modelId,
+        responseRevision,
+        entries: page.nodes.filter((node) => matches.has(node.id)),
+      })
     }).catch(() => {
       if (!controller.signal.aborted) {
         setState({ phase: 'error', modelId, responseRevision })

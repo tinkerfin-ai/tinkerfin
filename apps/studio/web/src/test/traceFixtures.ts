@@ -1,33 +1,27 @@
 import type {
   TraceGraph,
   TraceGraphDelta,
-  TraceGraphFacets,
   TraceGraphNode,
+  TraceGraphTurn,
 } from '../api/conversation/traceGraph'
+import {
+  compareTraceGraphIds,
+  compareTraceGraphNodes,
+} from '../api/conversation/traceGraphOrder'
 
-const EMPTY_FACETS: TraceGraphFacets = {
-  kinds: {},
-  statuses: {},
-  agents: {},
-  middleware: {},
-  skills: {},
-  providers: {},
-  models: {},
-}
+const completeness = () => ({
+  callTrackingMissing: false,
+  relationshipEvidenceMissing: false,
+  detailsOmitted: false,
+})
 
 export const emptyTraceGraph = (asOfSeq: number): TraceGraph => ({
   turns: [],
   nodes: [],
   orderedNodeIds: [],
-  rootNodeIds: [],
   matchedNodeIds: [],
   asOfSeq,
-  facets: structuredClone(EMPTY_FACETS),
-  completeness: {
-    callTrackingMissing: false,
-    relationshipEvidenceMissing: false,
-    detailsOmitted: false,
-  },
+  completeness: completeness(),
 })
 
 export const emptyTraceGraphDelta = (asOfSeq: number): TraceGraphDelta => ({
@@ -38,14 +32,8 @@ export const emptyTraceGraphDelta = (asOfSeq: number): TraceGraphDelta => ({
   nodeUpserts: [],
   nodeRemoves: [],
   orderedNodeIds: [],
-  rootNodeIds: [],
   matchedNodeIds: [],
-  facets: structuredClone(EMPTY_FACETS),
-  completeness: {
-    callTrackingMissing: false,
-    relationshipEvidenceMissing: false,
-    detailsOmitted: false,
-  },
+  completeness: completeness(),
 })
 
 export const traceGraphNode = (
@@ -54,64 +42,81 @@ export const traceGraphNode = (
   const startedSeq = overrides.startedSeq ?? 1
   return {
     turnId: 'turn-fixture',
-    parentId: null,
-    structuralParentId: null,
+    parentSubagentId: null,
+    modelCallId: null,
     kind: 'tool',
     status: 'succeeded',
     name: 'tool',
     runId: 'run-fixture',
     namespace: [],
     startedAt: '2026-08-28T00:00:00Z',
+    completedAt: '2026-08-28T00:00:00Z',
     startedSeq,
     updatedSeq: overrides.updatedSeq ?? startedSeq,
     contentOmitted: false,
+    toolCallOnly: false,
     requestOmitted: false,
     resultOmitted: false,
-    hooks: [],
     linkIssues: [],
     ...overrides,
   }
+}
+
+const orderNodes = (turns: readonly TraceGraphTurn[], nodes: TraceGraphNode[]) => {
+  const byTurn = new Map<string, TraceGraphNode[]>()
+  nodes.forEach((node) => byTurn.set(node.turnId, [
+    ...(byTurn.get(node.turnId) ?? []),
+    node,
+  ]))
+  const ordered: TraceGraphNode[] = []
+  turns.forEach((turn) => {
+    const children = new Map<string | null, TraceGraphNode[]>()
+    ;(byTurn.get(turn.id) ?? []).forEach((node) => {
+      const owner = node.parentSubagentId ?? null
+      children.set(owner, [...(children.get(owner) ?? []), node])
+    })
+    children.forEach((values) => values.sort(compareTraceGraphNodes))
+    const stack = [...(children.get(null) ?? [])].reverse()
+    while (stack.length > 0) {
+      const node = stack.pop()
+      if (!node) continue
+      ordered.push(node)
+      if (node.kind === 'subagent') {
+        stack.push(...[...(children.get(node.id) ?? [])].reverse())
+      }
+    }
+  })
+  if (ordered.length !== nodes.length) throw new Error('invalid Trace fixture scope')
+  return ordered
 }
 
 export const traceGraphWithNodes = (
   nodes: TraceGraphNode[],
   asOfSeq: number,
 ): TraceGraph => {
-  const nodeIds = new Set(nodes.map((node) => node.id))
-  const orderedNodes = nodes.map((node) => ({
-    ...node,
-    parentId: node.parentId && nodeIds.has(node.parentId) ? node.parentId : null,
-  })).sort((left, right) => (
-    left.startedSeq - right.startedSeq || left.id.localeCompare(right.id)
-  ))
-  const kinds: TraceGraphFacets['kinds'] = {}
-  const statuses: TraceGraphFacets['statuses'] = {}
-  orderedNodes.forEach((node) => {
-    kinds[node.kind] = (kinds[node.kind] ?? 0) + 1
-    statuses[node.status] = (statuses[node.status] ?? 0) + 1
+  const turnStarts = new Map<string, TraceGraphNode>()
+  nodes.forEach((node) => {
+    const current = turnStarts.get(node.turnId)
+    if (!current || node.startedSeq < current.startedSeq) turnStarts.set(node.turnId, node)
   })
-  const rootNodeIds = orderedNodes
-    .filter((node) => node.parentId == null)
-    .map((node) => node.id)
+  const turns = [...turnStarts.entries()]
+    .sort(([, left], [, right]) => (
+      left.startedSeq - right.startedSeq
+      || compareTraceGraphIds(left.turnId, right.turnId)
+    ))
+    .map(([id, first], index) => ({
+      id,
+      ordinal: index + 1,
+      startedAt: first.startedAt,
+    }))
+  const orderedNodes = orderNodes(turns, nodes)
+  const orderedNodeIds = orderedNodes.map((node) => node.id)
   return {
-    turns: orderedNodes.length === 0
-      ? []
-      : [{
-          id: 'turn-fixture',
-          ordinal: 1,
-          rootNodeId: rootNodeIds[0] ?? orderedNodes[0]!.id,
-          startedAt: orderedNodes[0]!.startedAt,
-        }],
+    turns,
     nodes: orderedNodes,
-    orderedNodeIds: orderedNodes.map((node) => node.id),
-    rootNodeIds,
-    matchedNodeIds: orderedNodes.map((node) => node.id),
+    orderedNodeIds,
+    matchedNodeIds: orderedNodeIds,
     asOfSeq,
-    facets: { ...structuredClone(EMPTY_FACETS), kinds, statuses },
-    completeness: {
-      callTrackingMissing: false,
-      relationshipEvidenceMissing: false,
-      detailsOmitted: false,
-    },
+    completeness: completeness(),
   }
 }

@@ -28,11 +28,7 @@ from .follow import TraceFollow, _close_trace_source, create_trace_follow
 from .graph import (
     TraceGraph,
     TraceGraphCompleteness,
-    TraceGraphFacets,
     TraceGraphFilter,
-    TraceGraphNode,
-    TraceGraphNodeKind,
-    TraceGraphNodeStatus,
     TraceGraphQueryLimits,
     bound_graph,
     graph_delta,
@@ -827,13 +823,10 @@ async def _materialize_history_graph(
         head_run_id=core.selected_head,
         turn_limit=turn_limit,
     )
-    where = TraceGraphFilter(
-        include_technical_nodes=True,
-        include_ancestor_nodes=True,
-    )
+    where = TraceGraphFilter()
     records = None
-    facets: TraceGraphFacets | None = None
     call_tracking_present = False
+    relationship_evidence_missing = False
     if isinstance(store, TraceGraphStore):
         current = await store.query_trace_graph(
             key,
@@ -849,8 +842,8 @@ async def _materialize_history_graph(
                     context={"resource": "graph_direct_nodes"},
                 )
             records = current.nodes
-            facets = current.facets
             call_tracking_present = current.call_tracking_present
+            relationship_evidence_missing = current.relationship_evidence_missing
     if records is None:
         events = await _read_events_for_runs(
             store,
@@ -876,26 +869,20 @@ async def _materialize_history_graph(
         call_tracking_present = (
             bool(window.visible_run_ids) and window.visible_run_ids <= tracked_runs
         )
-    selected_turn_ids = {
-        window.run_turns[record.run_id]
-        for record in records
-        if record.run_id in window.run_turns
-    }
     turns = trace_graph_turns(
         core_state,
         window,
-        selected_turn_ids=selected_turn_ids,
+        selected_turn_ids=set(window.visible_turns),
     )
-    nodes, ordered_ids, roots = project_trace_graph_records(
+    nodes, ordered_ids = project_trace_graph_records(
         records,
         turns=turns,
         run_turns=window.run_turns,
-        include_technical_nodes=True,
-        include_ancestor_nodes=True,
+        selected_run_ids=window.visible_run_ids,
     )
-    if facets is None:
-        facets = _unfiltered_graph_facets(nodes)
-    relationship_missing = any(node.link_issues for node in nodes)
+    relationship_missing = relationship_evidence_missing or any(
+        node.link_issues for node in nodes
+    )
     details_omitted = any(
         node.content_omitted or node.request_omitted or node.result_omitted
         for node in nodes
@@ -905,10 +892,8 @@ async def _materialize_history_graph(
             turns=turns,
             nodes=nodes,
             ordered_node_ids=ordered_ids,
-            root_node_ids=roots,
             matched_node_ids=ordered_ids,
             as_of_seq=as_of_seq,
-            facets=facets,
             completeness=TraceGraphCompleteness(
                 call_tracking_missing=not call_tracking_present,
                 relationship_evidence_missing=relationship_missing,
@@ -916,42 +901,6 @@ async def _materialize_history_graph(
             ),
         ),
         max_bytes=limits.max_page_bytes,
-    )
-
-
-def _unfiltered_graph_facets(
-    nodes: tuple[TraceGraphNode, ...],
-) -> TraceGraphFacets:
-    """Count the complete unfiltered history Graph dimensions."""
-
-    kinds: dict[TraceGraphNodeKind, int] = {}
-    statuses: dict[TraceGraphNodeStatus, int] = {}
-    agents: dict[str, int] = {}
-    middleware: dict[str, int] = {}
-    skills: dict[str, int] = {}
-    providers: dict[str, int] = {}
-    models: dict[str, int] = {}
-    for node in nodes:
-        kinds[node.kind] = kinds.get(node.kind, 0) + 1
-        statuses[node.status] = statuses.get(node.status, 0) + 1
-        if node.agent_name is not None:
-            agents[node.agent_name] = agents.get(node.agent_name, 0) + 1
-        if node.kind is TraceGraphNodeKind.MIDDLEWARE:
-            middleware[node.name] = middleware.get(node.name, 0) + 1
-        if node.kind is TraceGraphNodeKind.SKILL:
-            skills[node.name] = skills.get(node.name, 0) + 1
-        if node.provider is not None:
-            providers[node.provider] = providers.get(node.provider, 0) + 1
-        if node.model is not None:
-            models[node.model] = models.get(node.model, 0) + 1
-    return TraceGraphFacets(
-        kinds=kinds,
-        statuses=statuses,
-        agents=agents,
-        middleware=middleware,
-        skills=skills,
-        providers=providers,
-        models=models,
     )
 
 

@@ -4,10 +4,11 @@ import type {
   ConversationTraceUpdate,
   TraceInteraction,
 } from '../../../api/conversation/history'
-import type {
-  TraceGraph,
-  TraceGraphDelta,
-  TraceGraphNode,
+import {
+  parseTraceGraph,
+  type TraceGraph,
+  type TraceGraphDelta,
+  type TraceGraphNode,
 } from '../../../api/conversation/traceGraph'
 import type { TaskTraceSnapshot } from '../../../api/conversation/taskTrace'
 import { ConversationError } from '../../../api/conversation/errors'
@@ -97,6 +98,26 @@ const applyTraceGraphDelta = (
   current: TraceGraph,
   delta: TraceGraphDelta,
 ): TraceGraph => {
+  if (delta.asOfSeq <= current.asOfSeq) throw new ConversationError('stream_event_invalid')
+  const currentTurns = new Map(current.turns.map((turn) => [turn.id, turn]))
+  delta.turnUpserts.forEach((turn) => {
+    const previous = currentTurns.get(turn.id)
+    if (previous && (
+      previous.ordinal !== turn.ordinal
+      || previous.startedAt !== turn.startedAt
+    )) throw new ConversationError('stream_event_invalid')
+  })
+  const currentNodes = new Map(current.nodes.map((node) => [node.id, node]))
+  delta.nodeUpserts.forEach((node) => {
+    const previous = currentNodes.get(node.id)
+    if (previous && (
+      node.updatedSeq < previous.updatedSeq
+      || node.turnId !== previous.turnId
+      || node.kind !== previous.kind
+      || node.name !== previous.name
+      || JSON.stringify(node.namespace) !== JSON.stringify(previous.namespace)
+    )) throw new ConversationError('stream_event_invalid')
+  })
   const nodeValues = applyEntityDelta(
     current.nodes,
     delta.nodeUpserts,
@@ -107,7 +128,6 @@ const applyTraceGraphDelta = (
     delta.orderedNodeIds.length !== nodeValues.length
     || new Set(delta.orderedNodeIds).size !== nodeValues.length
     || delta.orderedNodeIds.some((id) => !nodesById.has(id))
-    || delta.rootNodeIds.some((id) => !nodesById.has(id))
     || delta.matchedNodeIds.some((id) => !nodesById.has(id))
   ) throw new ConversationError('stream_event_invalid')
   const turns = applyEntityDelta(
@@ -115,16 +135,14 @@ const applyTraceGraphDelta = (
     delta.turnUpserts,
     delta.turnRemoves,
   ).sort((left, right) => left.ordinal - right.ordinal || left.id.localeCompare(right.id))
-  return {
+  return parseTraceGraph({
     turns,
     nodes: delta.orderedNodeIds.map((id) => nodesById.get(id) as TraceGraphNode),
     orderedNodeIds: [...delta.orderedNodeIds],
-    rootNodeIds: [...delta.rootNodeIds],
     matchedNodeIds: [...delta.matchedNodeIds],
     asOfSeq: delta.asOfSeq,
-    facets: structuredClone(delta.facets),
     completeness: structuredClone(delta.completeness),
-  }
+  })
 }
 
 const decodePointerToken = (value: string) => value.replaceAll('~1', '/').replaceAll('~0', '~')
@@ -285,21 +303,10 @@ const traceMessages = (trace: ConversationHistoryCoreDetail): Message[] => {
     existing.push({ sequence: message.traceSeq, content })
     subagentPartialOutput.set(owner.id, existing)
   })
-  const subagentByParentTool = new Map(verifiedSubagents.map((node) => [
-    scopedSourceKey(node.namespace.slice(0, -1), node.sourceId as string),
-    node,
-  ]))
   const owningSubagent = (node: TraceGraphNode): TraceGraphNode | undefined => {
-    let parentId = node.parentId
-    const visited = new Set<string>()
-    while (parentId && !visited.has(parentId)) {
-      visited.add(parentId)
-      const parent = nodesById.get(parentId)
-      if (!parent) return undefined
-      if (parent.kind === 'subagent' && parent.sourceId) return parent
-      parentId = parent.parentId
-    }
-    return undefined
+    if (!node.parentSubagentId) return undefined
+    const parent = nodesById.get(node.parentSubagentId)
+    return parent?.kind === 'subagent' ? parent : undefined
   }
   const ordered: Array<{ value: Message; sequence: number }> = trace.messages.flatMap((item) => {
     if (item.namespace.length > 0) return []
@@ -324,35 +331,22 @@ const traceMessages = (trace: ConversationHistoryCoreDetail): Message[] => {
     }]
   })
   trace.graph.nodes.forEach((node) => {
-    const failedRun = node.kind === 'run' && node.status === 'failed'
     if (
       node.kind !== 'tool'
       && node.kind !== 'subagent'
       && node.kind !== 'plan'
-      && !failedRun
     ) return
     if (node.kind === 'subagent' && !node.sourceId) return
-    const delegatedSubagent = node.kind === 'tool' && node.sourceId
-      ? subagentByParentTool.get(scopedSourceKey(node.namespace, node.sourceId))
-      : undefined
-    if (delegatedSubagent) return
+    const resultNamespace = node.kind === 'subagent'
+      ? node.namespace.slice(0, -1)
+      : node.namespace
     const result = node.sourceId
-      ? toolResults.get(scopedSourceKey(node.namespace, node.sourceId))
+      ? toolResults.get(scopedSourceKey(resultNamespace, node.sourceId))
       : undefined
     const retainedInput = node.requestOmitted ? undefined : node.request
     const retainedResult = node.resultOmitted ? undefined : node.result
     const subagent = node.kind === 'tool' ? owningSubagent(node) : undefined
     if (node.kind === 'tool' && node.namespace.length > 0 && !subagent) return
-    const parentTool = node.kind === 'subagent' && node.sourceId
-      ? trace.graph.nodes.find((candidate) => (
-          candidate.kind === 'tool'
-          && candidate.sourceId === node.sourceId
-          && candidate.namespace.length === node.namespace.length - 1
-          && candidate.namespace.every(
-            (value, position) => value === node.namespace[position],
-          )
-        ))
-      : undefined
     const subagentInput = isObject(retainedInput)
       && typeof retainedInput.description === 'string'
       ? retainedInput.description
@@ -361,15 +355,13 @@ const traceMessages = (trace: ConversationHistoryCoreDetail): Message[] => {
       ? 'tool'
       : node.kind === 'subagent'
         ? 'subagent'
-        : failedRun
-          ? 'error'
-          : 'process'
+        : 'process'
     ordered.push({
       sequence: node.startedSeq,
       value: {
         id: node.id,
         role,
-        content: failedRun ? translateCurrent('对话运行失败') : node.name,
+        content: node.name,
         createdAt: node.startedAt,
         meta: {
           title: node.name,
@@ -380,8 +372,8 @@ const traceMessages = (trace: ConversationHistoryCoreDetail): Message[] => {
           input: node.kind === 'subagent' ? subagentInput : undefined,
           result: text(
             node.kind === 'subagent'
-              ? parentTool?.result
-                ?? retainedResult
+              ? retainedResult
+                ?? result?.content
                 ?? subagentPartialOutput.get(node.id)
                   ?.sort((left, right) => left.sequence - right.sequence)
                   .map((item) => item.content)
@@ -391,7 +383,7 @@ const traceMessages = (trace: ConversationHistoryCoreDetail): Message[] => {
           status: nodeMessageStatus(node.status),
           toolCallId: node.kind === 'tool' ? node.sourceId ?? undefined : undefined,
           batchId: node.kind === 'tool' && !subagent
-            ? node.parentId ?? undefined
+            ? node.modelCallId ?? undefined
             : undefined,
           subRunId: node.kind === 'subagent' ? node.id : undefined,
           runId: subagent?.id ?? node.runId,

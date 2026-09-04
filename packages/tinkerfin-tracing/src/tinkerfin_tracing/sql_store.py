@@ -11,7 +11,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from functools import wraps
 from types import CoroutineType
-from typing import Any, Concatenate, Literal, ParamSpec, TypeVar, cast
+from typing import Any, Concatenate, ParamSpec, TypeVar, cast
 
 from sqlalchemy import (
     and_,
@@ -68,8 +68,7 @@ from .errors import (
 )
 from .facts import TraceEvent
 from .graph import (
-    TECHNICAL_TRACE_GRAPH_NODE_KINDS,
-    TraceGraphFacets,
+    MAX_SUBAGENT_SCOPE_DEPTH,
     TraceGraphFilter,
     TraceGraphLinkIssue,
     TraceGraphNodeKind,
@@ -97,6 +96,7 @@ _ResultT = TypeVar("_ResultT")
 _BackendT = TypeVar("_BackendT")
 _OperationP = ParamSpec("_OperationP")
 _GRAPH_PREFETCH_PAIR_LIMIT = 400
+_SQL_IN_CHUNK_SIZE = 500
 
 
 async def _join_owned_task(
@@ -487,11 +487,13 @@ class _SqlAlchemyTraceLedgerBackend:
         await self.setup()
         delete_generation_was_observed = False
         expected_renewal_expiry: datetime | None = None
+        append_commit_was_attempted = False
         checkpoint_commit_was_attempted = False
 
         async def operation(connection: AsyncConnection) -> TraceLedgerCommitResult:
             nonlocal delete_generation_was_observed
             nonlocal expected_renewal_expiry
+            nonlocal append_commit_was_attempted
             nonlocal checkpoint_commit_was_attempted
             await self._locked_namespace(connection)
             # Every Trace writer locks namespace before thread or writer rows. Sampling
@@ -499,7 +501,7 @@ class _SqlAlchemyTraceLedgerBackend:
             # complete configured lease instead of a deadline already spent in the queue.
             now = await _database_now(connection)
             existing = None
-            if change.kind == "append_events":
+            if change.kind == "append_events" and append_commit_was_attempted:
                 existing = await self._existing_backend_append(connection, change)
             if (
                 change.kind == "save_projection_checkpoint"
@@ -555,7 +557,15 @@ class _SqlAlchemyTraceLedgerBackend:
             effect = resolve_ledger_change(resolved_change, state)
             if change.kind == "renew_writer" and effect.writer is not None:
                 expected_renewal_expiry = effect.writer.lease_expires_at
-            await self._apply_backend_effect(connection, change, effect, now=now)
+            if change.kind == "append_events":
+                append_commit_was_attempted = True
+            await self._apply_backend_effect(
+                connection,
+                change,
+                effect,
+                previous_state=state,
+                now=now,
+            )
             if change.kind == "save_projection_checkpoint":
                 checkpoint_commit_was_attempted = True
             return effect.result
@@ -673,16 +683,6 @@ class _SqlAlchemyTraceLedgerBackend:
                 request,
                 source=effective_nodes,
             )
-            facets = (
-                await _trace_graph_facets(
-                    connection,
-                    self,
-                    request,
-                    source=effective_nodes,
-                )
-                if request.include_facets
-                else TraceGraphFacets()
-            )
             page_criteria = list(base_criteria)
             if request.before_started_at is not None:
                 assert request.before_node_id is not None
@@ -714,10 +714,6 @@ class _SqlAlchemyTraceLedgerBackend:
             )
             for row in rows:
                 _validate_graph_node_row(row, where=request.where)
-                if request.node_ids and row["node_id"] not in request.node_ids:
-                    raise TraceStoreProtocolError(
-                        "Trace Graph node ID filter digest collision"
-                    )
             has_more = len(rows) > request.limit
             selected = list(rows[: request.limit])
             matched_node_ids = tuple(cast(str, row["node_id"]) for row in selected)
@@ -725,53 +721,69 @@ class _SqlAlchemyTraceLedgerBackend:
             result_rows: dict[str, RowMapping] = {
                 cast(str, row["node_id"]): row for row in selected
             }
-            if request.where.include_ancestor_nodes:
-                parent_hashes = tuple(
-                    cast(str, row["structural_parent_hash"])
-                    for row in selected
-                    if row["structural_parent_hash"] is not None
+            parent_hashes = {
+                cast(bytes, row["parent_subagent_hash"])
+                for row in selected
+                if row["parent_subagent_hash"] is not None
+            }
+            if parent_hashes:
+                scope = (
+                    effective_nodes.c.namespace_hash == self._namespace_hash,
+                    effective_nodes.c.thread_hash == _digest(request.key.thread_id),
+                    effective_nodes.c.generation == request.key.generation,
                 )
-                if parent_hashes:
-                    scope = (
-                        effective_nodes.c.namespace_hash == self._namespace_hash,
-                        effective_nodes.c.thread_hash == _digest(request.key.thread_id),
-                        effective_nodes.c.generation == request.key.generation,
-                    )
-                    ancestors = (
-                        select(effective_nodes)
-                        .where(*scope, effective_nodes.c.node_hash.in_(parent_hashes))
-                        .cte("trace_graph_ancestors", recursive=True)
-                    )
-                    parent = effective_nodes.alias("trace_graph_parent")
-                    ancestors = ancestors.union(
-                        select(parent).where(
-                            parent.c.namespace_hash == self._namespace_hash,
-                            parent.c.thread_hash == _digest(request.key.thread_id),
-                            parent.c.generation == request.key.generation,
-                            parent.c.node_hash == ancestors.c.structural_parent_hash,
-                        )
-                    )
-                    ancestor_rows = (
-                        (
-                            await connection.execute(
-                                select(ancestors).limit(request.total_limit + 1)
+                known_hashes = {
+                    cast(bytes, row["node_hash"]) for row in result_rows.values()
+                }
+                pending_hashes = parent_hashes - known_hashes
+                for depth in range(1, MAX_SUBAGENT_SCOPE_DEPTH + 2):
+                    if not pending_hashes:
+                        break
+                    parent_rows: list[RowMapping] = []
+                    ordered_hashes = tuple(sorted(pending_hashes))
+                    for offset in range(0, len(ordered_hashes), _SQL_IN_CHUNK_SIZE):
+                        selected_hashes = ordered_hashes[
+                            offset : offset + _SQL_IN_CHUNK_SIZE
+                        ]
+                        parent_rows.extend(
+                            (
+                                await connection.execute(
+                                    select(effective_nodes).where(
+                                        *scope,
+                                        effective_nodes.c.node_hash.in_(
+                                            selected_hashes
+                                        ),
+                                    )
+                                )
                             )
+                            .mappings()
+                            .all()
                         )
-                        .mappings()
-                        .all()
-                    )
-                    for row in ancestor_rows:
+                    if depth > MAX_SUBAGENT_SCOPE_DEPTH and parent_rows:
+                        raise TraceStoreProtocolError(
+                            "Trace Graph Subagent scope exceeds 64 levels"
+                        )
+                    next_hashes: set[bytes] = set()
+                    for row in parent_rows:
                         _validate_graph_node_row(row, where=None)
-                        node_id = cast(str, row["node_id"])
-                        if (
-                            node_id not in result_rows
-                            and len(result_rows) >= request.total_limit
-                        ):
+                        node_hash = cast(bytes, row["node_hash"])
+                        if node_hash in known_hashes:
+                            continue
+                        if len(result_rows) >= request.total_limit:
                             raise TraceQuotaExceeded(
-                                "Trace Graph ancestors exceed max_total_nodes",
+                                "Trace Graph Subagent path exceeds max_total_nodes",
                                 context={"resource": "graph_total_nodes"},
                             )
+                        node_id = cast(str, row["node_id"])
                         result_rows[node_id] = row
+                        known_hashes.add(node_hash)
+                        parent_hash = cast(
+                            bytes | None,
+                            row["parent_subagent_hash"],
+                        )
+                        if parent_hash is not None and parent_hash not in known_hashes:
+                            next_hashes.add(parent_hash)
+                    pending_hashes = next_hashes
             sequences = {
                 cast(int, row[column])
                 for row in result_rows.values()
@@ -784,26 +796,53 @@ class _SqlAlchemyTraceLedgerBackend:
                 )
                 if row[column] is not None
             }
-            event_rows: Sequence[RowMapping] = (
-                (
-                    await connection.execute(
-                        select(events).where(
-                            events.c.namespace_hash == self._namespace_hash,
-                            events.c.thread_hash == _digest(request.key.thread_id),
-                            events.c.generation == request.key.generation,
-                            events.c.trace_seq.in_(tuple(sequences)),
+            event_rows: list[RowMapping] = []
+            ordered_sequences = tuple(sorted(sequences))
+            for offset in range(0, len(ordered_sequences), _SQL_IN_CHUNK_SIZE):
+                selected_sequences = ordered_sequences[
+                    offset : offset + _SQL_IN_CHUNK_SIZE
+                ]
+                event_rows.extend(
+                    (
+                        await connection.execute(
+                            select(events).where(
+                                events.c.namespace_hash == self._namespace_hash,
+                                events.c.thread_hash == _digest(request.key.thread_id),
+                                events.c.generation == request.key.generation,
+                                events.c.trace_seq.in_(selected_sequences),
+                            )
                         )
                     )
+                    .mappings()
+                    .all()
                 )
-                .mappings()
-                .all()
-                if sequences
-                else ()
-            )
             event_records = {
                 cast(int, row["trace_seq"]): _stored_event_from_row(row)
                 for row in event_rows
             }
+            relationship_evidence_missing = (
+                await connection.scalar(
+                    select(effective_nodes.c.node_hash)
+                    .where(
+                        or_(
+                            effective_nodes.c.link_issue
+                            == TraceGraphLinkIssue.MISSING_TOOL_PROPOSAL.value,
+                            and_(
+                                effective_nodes.c.link_issue
+                                == TraceGraphLinkIssue.MISSING_SUBAGENT.value,
+                                effective_nodes.c.parent_subagent_id.is_(None),
+                            ),
+                            and_(
+                                effective_nodes.c.link_issue
+                                == TraceGraphLinkIssue.MISSING_MODEL_CALL.value,
+                                effective_nodes.c.model_call_id.is_(None),
+                            ),
+                        )
+                    )
+                    .limit(1)
+                )
+                is not None
+            )
             tracked_rows = (
                 await connection.execute(
                     select(events.c.run_id)
@@ -836,7 +875,6 @@ class _SqlAlchemyTraceLedgerBackend:
                     )
                 ),
                 matched_node_ids=matched_node_ids,
-                facets=facets,
                 has_more=has_more,
                 next_started_at=(
                     None
@@ -849,6 +887,7 @@ class _SqlAlchemyTraceLedgerBackend:
                 call_tracking_present=(
                     bool(requested_run_ids) and requested_run_ids <= tracked_run_ids
                 ),
+                relationship_evidence_missing=relationship_evidence_missing,
             )
 
     async def rebuild_trace_graph(self, request: TraceGraphRebuildRequest) -> int:
@@ -1129,20 +1168,23 @@ class _SqlAlchemyTraceLedgerBackend:
     ) -> TraceLedgerCommitResult | None:
         if not change.facts:
             return None
-        rows = (
-            (
-                await connection.execute(
-                    select(events).where(
-                        events.c.namespace_hash == self._namespace_hash,
-                        events.c.event_id.in_(
-                            tuple(item.event_id for item in change.facts)
-                        ),
+        rows: list[RowMapping] = []
+        event_ids = tuple(item.event_id for item in change.facts)
+        for offset in range(0, len(event_ids), _SQL_IN_CHUNK_SIZE):
+            rows.extend(
+                (
+                    await connection.execute(
+                        select(events).where(
+                            events.c.namespace_hash == self._namespace_hash,
+                            events.c.event_id.in_(
+                                event_ids[offset : offset + _SQL_IN_CHUNK_SIZE]
+                            ),
+                        )
                     )
                 )
+                .mappings()
+                .all()
             )
-            .mappings()
-            .all()
-        )
         if not rows:
             return None
         by_id = {cast(str, row["event_id"]): row for row in rows}
@@ -1236,6 +1278,7 @@ class _SqlAlchemyTraceLedgerBackend:
         change: TraceLedgerChange,
         effect: TraceLedgerStorageEffect,
         *,
+        previous_state: TraceLedgerState,
         now: datetime,
     ) -> None:
         key = effect.result.key or change.key
@@ -1304,15 +1347,7 @@ class _SqlAlchemyTraceLedgerBackend:
             return
         if effect.thread is not None:
             thread_hash = _digest(effect.thread.key.thread_id)
-            existing = await connection.scalar(
-                select(func.count())
-                .select_from(threads)
-                .where(
-                    threads.c.namespace_hash == self._namespace_hash,
-                    threads.c.thread_hash == thread_hash,
-                )
-            )
-            if cast(int, existing) == 0:
+            if previous_state.thread is None:
                 await connection.execute(
                     insert(threads).values(
                         namespace_hash=self._namespace_hash,
@@ -1327,6 +1362,10 @@ class _SqlAlchemyTraceLedgerBackend:
                     )
                 )
             else:
+                if previous_state.thread.key != effect.thread.key:
+                    raise TraceStoreProtocolError(
+                        "Trace thread effect conflicts with locked state"
+                    )
                 await connection.execute(
                     update(threads)
                     .where(
@@ -1352,9 +1391,6 @@ class _SqlAlchemyTraceLedgerBackend:
             )
         if effect.writer is not None:
             where = _writer_where(self, key, effect.writer.run_id)
-            exists = await connection.scalar(
-                select(func.count()).select_from(writers).where(where)
-            )
             values = dict(
                 owner_token=effect.writer.owner_token,
                 fence=effect.writer.fence,
@@ -1367,7 +1403,7 @@ class _SqlAlchemyTraceLedgerBackend:
                 remaining_byte_reserve=effect.writer.remaining_byte_reserve,
                 updated_at=now,
             )
-            if cast(int, exists) == 0:
+            if previous_state.target_writer is None:
                 await connection.execute(
                     insert(writers).values(
                         namespace_hash=self._namespace_hash,
@@ -1380,6 +1416,10 @@ class _SqlAlchemyTraceLedgerBackend:
                     )
                 )
             else:
+                if previous_state.target_writer.run_id != effect.writer.run_id:
+                    raise TraceStoreProtocolError(
+                        "Trace writer effect conflicts with locked state"
+                    )
                 await connection.execute(update(writers).where(where).values(**values))
         if effect.events:
             await connection.execute(
@@ -1491,7 +1531,7 @@ class _SqlAlchemyTraceLedgerBackend:
             for row in rows
         }
         inserts: list[dict[str, object]] = []
-        updates: list[TraceGraphNodeMutation] = []
+        updates: list[tuple[TraceGraphNodeMutation, RowMapping]] = []
         for mutation, storage_key in zip(mutations, storage_keys, strict=True):
             row = existing.get(storage_key)
             if row is None:
@@ -1501,11 +1541,11 @@ class _SqlAlchemyTraceLedgerBackend:
                 continue
             if row["node_id"] != mutation.node_id or row["run_id"] != mutation.run_id:
                 raise TraceStoreProtocolError("Trace Graph node digest collision")
-            updates.append(mutation)
+            updates.append((mutation, row))
         if inserts:
             await connection.execute(insert(graph_nodes), inserts)
-        for mutation in updates:
-            await self._apply_graph_node_mutation(connection, key, mutation)
+        for mutation, row in updates:
+            await self._apply_graph_node_mutation(connection, key, mutation, row)
 
     def _new_graph_node_values(
         self,
@@ -1527,11 +1567,12 @@ class _SqlAlchemyTraceLedgerBackend:
         if mutation.remove:
             return {
                 **common,
-                "structural_parent_hash": None,
-                "structural_parent_id": None,
+                "parent_subagent_hash": None,
+                "parent_subagent_id": None,
+                "model_call_hash": None,
+                "model_call_id": None,
                 "kind": None,
                 "status": None,
-                "name_hash": None,
                 "name": None,
                 "removed": True,
                 "graph_namespace_hash": None,
@@ -1562,15 +1603,20 @@ class _SqlAlchemyTraceLedgerBackend:
         namespace = _encode_namespace(mutation.namespace)
         return {
             **common,
-            "structural_parent_hash": (
+            "parent_subagent_hash": (
                 None
-                if mutation.structural_parent_id is None
-                else _digest(mutation.structural_parent_id)
+                if mutation.parent_subagent_id is None
+                else _digest(mutation.parent_subagent_id)
             ),
-            "structural_parent_id": mutation.structural_parent_id,
+            "parent_subagent_id": mutation.parent_subagent_id,
+            "model_call_hash": (
+                None
+                if mutation.model_call_id is None
+                else _digest(mutation.model_call_id)
+            ),
+            "model_call_id": mutation.model_call_id,
             "kind": mutation.kind.value,
             "status": mutation.status.value,
-            "name_hash": _digest(mutation.name),
             "name": mutation.name,
             "removed": False,
             "graph_namespace_hash": _digest(namespace),
@@ -1604,7 +1650,8 @@ class _SqlAlchemyTraceLedgerBackend:
                 None
                 if (
                     issue := resolve_graph_link_issue(
-                        mutation.structural_parent_id,
+                        mutation.parent_subagent_id,
+                        mutation.model_call_id,
                         mutation.link_issue,
                     )
                 )
@@ -1618,8 +1665,9 @@ class _SqlAlchemyTraceLedgerBackend:
         connection: AsyncConnection,
         key: TraceThreadKey,
         mutation: TraceGraphNodeMutation,
+        row: RowMapping,
     ) -> None:
-        """Apply one payload-free canonical Graph mutation atomically with facts."""
+        """Apply one prefetched Graph mutation atomically with its Ledger facts."""
 
         node_hash = _digest(mutation.node_id)
         criteria = and_(
@@ -1629,44 +1677,53 @@ class _SqlAlchemyTraceLedgerBackend:
             graph_nodes.c.node_hash == node_hash,
             graph_nodes.c.run_hash == _digest(mutation.run_id),
         )
-        row = (
-            (
-                await connection.execute(
-                    select(graph_nodes).where(criteria).with_for_update()
+        if mutation.remove:
+            if row["node_id"] != mutation.node_id:
+                raise TraceStoreProtocolError("Trace Graph node digest collision")
+            if mutation.updated_seq < cast(int, row["updated_seq"]):
+                raise TraceStoreProtocolError(
+                    "Trace Graph node sequence moved backwards"
+                )
+            await connection.execute(
+                update(graph_nodes)
+                .where(criteria)
+                .values(
+                    removed=True,
+                    updated_seq=mutation.updated_seq,
+                    parent_subagent_hash=None,
+                    parent_subagent_id=None,
+                    model_call_hash=None,
+                    model_call_id=None,
+                    kind=None,
+                    status=None,
+                    name=None,
+                    graph_namespace_hash=None,
+                    graph_namespace=None,
+                    agent_hash=None,
+                    agent_name=None,
+                    provider_hash=None,
+                    provider=None,
+                    model_hash=None,
+                    model=None,
+                    started_at=None,
+                    first_output_at=None,
+                    completed_at=None,
+                    started_seq=None,
+                    request_seq=None,
+                    result_seq=None,
+                    failure_seq=None,
+                    link_issue=None,
                 )
             )
-            .mappings()
-            .one_or_none()
-        )
-        if mutation.remove:
-            if row is None:
-                new_values = self._new_graph_node_values(key, mutation)
-                assert new_values is not None
-                await connection.execute(insert(graph_nodes).values(**new_values))
-            else:
-                if row["node_id"] != mutation.node_id:
-                    raise TraceStoreProtocolError("Trace Graph node digest collision")
-                if mutation.updated_seq < cast(int, row["updated_seq"]):
-                    raise TraceStoreProtocolError(
-                        "Trace Graph node sequence moved backwards"
-                    )
-                await connection.execute(
-                    update(graph_nodes)
-                    .where(criteria)
-                    .values(removed=True, updated_seq=mutation.updated_seq)
-                )
             return
-        if row is not None and cast(bool, row["removed"]):
+        if cast(bool, row["removed"]):
             if not _graph_mutation_creates_node(mutation):
                 raise TraceStoreProtocolError(
                     "Trace Graph removal revision cannot accept a partial update"
                 )
             await connection.execute(delete(graph_nodes).where(criteria))
-            row = None
-        if row is None:
             new_values = self._new_graph_node_values(key, mutation)
-            if new_values is None:
-                return
+            assert new_values is not None
             await connection.execute(insert(graph_nodes).values(**new_values))
             return
         if row["node_id"] != mutation.node_id:
@@ -1688,24 +1745,47 @@ class _SqlAlchemyTraceLedgerBackend:
             values["kind"] = cast(TraceGraphNodeKind, resolved_kind).value
         if mutation.status is not None:
             values["status"] = mutation.status.value
-        if mutation.structural_parent_id is not None:
+            if mutation.status in {
+                TraceGraphNodeStatus.RUNNING,
+                TraceGraphNodeStatus.WAITING,
+            }:
+                values["completed_at"] = None
+        if (
+            current_kind is TraceGraphNodeKind.TOOL
+            and row["status"] == TraceGraphNodeStatus.WAITING.value
+            and mutation.status is TraceGraphNodeStatus.RUNNING
+            and mutation.started_at is not None
+            and mutation.started_seq is not None
+        ):
+            values["started_at"] = _database_naive(mutation.started_at)
+            values["started_seq"] = mutation.started_seq
+        if mutation.parent_subagent_id is not None:
             if (
-                row["structural_parent_id"] is not None
-                and row["structural_parent_id"] != mutation.structural_parent_id
+                row["parent_subagent_id"] is not None
+                and row["parent_subagent_id"] != mutation.parent_subagent_id
             ):
-                raise TraceStoreProtocolError("Trace Graph structural parent changed")
-            values["structural_parent_id"] = mutation.structural_parent_id
-            values["structural_parent_hash"] = _digest(mutation.structural_parent_id)
+                raise TraceStoreProtocolError("Trace Graph Subagent owner changed")
+            values["parent_subagent_id"] = mutation.parent_subagent_id
+            values["parent_subagent_hash"] = _digest(mutation.parent_subagent_id)
+        if mutation.model_call_id is not None:
+            if (
+                row["model_call_id"] is not None
+                and row["model_call_id"] != mutation.model_call_id
+            ):
+                raise TraceStoreProtocolError("Trace Graph model call changed")
+            values["model_call_id"] = mutation.model_call_id
+            values["model_call_hash"] = _digest(mutation.model_call_id)
         current_link_issue = (
             None
             if row["link_issue"] is None
             else TraceGraphLinkIssue(cast(str, row["link_issue"]))
         )
-        effective_parent_id = mutation.structural_parent_id or cast(
-            str | None, row["structural_parent_id"]
+        effective_parent_id = mutation.parent_subagent_id or cast(
+            str | None, row["parent_subagent_id"]
         )
         resolved_current_issue = resolve_graph_link_issue(
             effective_parent_id,
+            mutation.model_call_id or cast(str | None, row["model_call_id"]),
             current_link_issue,
         )
         if resolved_current_issue is not current_link_issue:
@@ -1734,6 +1814,7 @@ class _SqlAlchemyTraceLedgerBackend:
             values["failure_seq"] = mutation.failure_seq
         resolved_issue = resolve_graph_link_issue(
             effective_parent_id,
+            mutation.model_call_id or cast(str | None, row["model_call_id"]),
             mutation.link_issue,
         )
         if resolved_issue is not None and resolved_current_issue is None:
@@ -2147,8 +2228,26 @@ def _trace_graph_effective_source(
         graph_nodes.c.generation,
         graph_nodes.c.node_hash,
     )
+    execution_kind = graph_nodes.c.kind.in_(
+        (TraceGraphNodeKind.TOOL.value, TraceGraphNodeKind.SUBAGENT.value)
+    )
+    execution_start = and_(
+        execution_kind,
+        graph_nodes.c.request_seq.is_not(None),
+        graph_nodes.c.request_seq == graph_nodes.c.started_seq,
+    )
     origin_order = (
-        case((graph_nodes.c.started_seq.is_(None), 1), else_=0),
+        case(
+            (
+                and_(
+                    execution_kind,
+                    ~execution_start,
+                ),
+                1,
+            ),
+            else_=0,
+        ),
+        case((execution_start, graph_nodes.c.updated_seq), else_=None).desc(),
         graph_nodes.c.started_seq.asc(),
         graph_nodes.c.updated_seq.asc(),
         graph_nodes.c.run_hash.asc(),
@@ -2207,13 +2306,15 @@ def _trace_graph_effective_source(
             .over(partition_by=partition)
             .label("_failure_seq"),
             latest_present(
-                graph_nodes.c.structural_parent_hash,
-                "_structural_parent_hash",
+                graph_nodes.c.parent_subagent_hash,
+                "_parent_subagent_hash",
             ),
             latest_present(
-                graph_nodes.c.structural_parent_id,
-                "_structural_parent_id",
+                graph_nodes.c.parent_subagent_id,
+                "_parent_subagent_id",
             ),
+            latest_present(graph_nodes.c.model_call_hash, "_model_call_hash"),
+            latest_present(graph_nodes.c.model_call_id, "_model_call_id"),
             latest_present(graph_nodes.c.agent_hash, "_agent_hash"),
             latest_present(graph_nodes.c.agent_name, "_agent_name"),
             latest_present(graph_nodes.c.provider_hash, "_provider_hash"),
@@ -2241,8 +2342,10 @@ def _trace_graph_effective_source(
             "started_at",
             "started_seq",
             "first_output_at",
-            "structural_parent_hash",
-            "structural_parent_id",
+            "parent_subagent_hash",
+            "parent_subagent_id",
+            "model_call_hash",
+            "model_call_id",
             "agent_hash",
             "agent_name",
             "provider_hash",
@@ -2262,15 +2365,31 @@ def _trace_graph_effective_source(
             ranked.c._origin_started_at.label("started_at"),
             ranked.c._origin_started_seq.label("started_seq"),
             ranked.c._first_output_at.label("first_output_at"),
-            ranked.c._structural_parent_hash.label("structural_parent_hash"),
-            ranked.c._structural_parent_id.label("structural_parent_id"),
+            ranked.c._parent_subagent_hash.label("parent_subagent_hash"),
+            ranked.c._parent_subagent_id.label("parent_subagent_id"),
+            ranked.c._model_call_hash.label("model_call_hash"),
+            ranked.c._model_call_id.label("model_call_id"),
             ranked.c._agent_hash.label("agent_hash"),
             ranked.c._agent_name.label("agent_name"),
             ranked.c._provider_hash.label("provider_hash"),
             ranked.c._provider.label("provider"),
             ranked.c._model_hash.label("model_hash"),
             ranked.c._model.label("model"),
-            ranked.c._completed_at.label("completed_at"),
+            type_coerce(
+                case(
+                    (
+                        ranked.c.status.in_(
+                            (
+                                TraceGraphNodeStatus.RUNNING.value,
+                                TraceGraphNodeStatus.WAITING.value,
+                            )
+                        ),
+                        None,
+                    ),
+                    else_=ranked.c._completed_at,
+                ),
+                graph_nodes.c.completed_at.type,
+            ).label("completed_at"),
             ranked.c._request_seq.label("request_seq"),
             ranked.c._result_seq.label("result_seq"),
             ranked.c._failure_seq.label("failure_seq"),
@@ -2289,16 +2408,6 @@ def _trace_graph_criteria(
     request: TraceGraphQueryRequest,
     *,
     source: Subquery,
-    exclude: Literal[
-        "kinds",
-        "statuses",
-        "agent_names",
-        "middleware_names",
-        "skill_names",
-        "providers",
-        "models",
-    ]
-    | None = None,
 ) -> tuple[ColumnElement[bool], ...]:
     where = request.where
     nodes = source.c
@@ -2307,51 +2416,23 @@ def _trace_graph_criteria(
         nodes.thread_hash == _digest(request.key.thread_id),
         nodes.generation == request.key.generation,
     ]
-    if not where.include_technical_nodes:
-        criteria.append(
-            nodes.kind.not_in(
-                tuple(value.value for value in TECHNICAL_TRACE_GRAPH_NODE_KINDS)
-            )
-        )
-    if request.node_ids:
-        criteria.append(
-            nodes.node_hash.in_(tuple(_digest(value) for value in request.node_ids))
-        )
-    if where.kinds and exclude != "kinds":
+    if where.kinds:
         criteria.append(nodes.kind.in_(tuple(value.value for value in where.kinds)))
-    if where.statuses and exclude != "statuses":
+    if where.statuses:
         criteria.append(
             nodes.status.in_(tuple(value.value for value in where.statuses))
         )
-    if where.parent_id is not None:
-        criteria.append(nodes.structural_parent_hash == _digest(where.parent_id))
-    if where.agent_names and exclude != "agent_names":
+    if where.model_call_id is not None:
+        criteria.append(nodes.model_call_hash == _digest(where.model_call_id))
+    if where.agent_names:
         criteria.append(
             nodes.agent_hash.in_(tuple(_digest(value) for value in where.agent_names))
         )
-    if where.middleware_names and exclude != "middleware_names":
-        criteria.extend(
-            (
-                nodes.kind == TraceGraphNodeKind.MIDDLEWARE.value,
-                nodes.name_hash.in_(
-                    tuple(_digest(value) for value in where.middleware_names)
-                ),
-            )
-        )
-    if where.skill_names and exclude != "skill_names":
-        criteria.extend(
-            (
-                nodes.kind == TraceGraphNodeKind.SKILL.value,
-                nodes.name_hash.in_(
-                    tuple(_digest(value) for value in where.skill_names)
-                ),
-            )
-        )
-    if where.providers and exclude != "providers":
+    if where.providers:
         criteria.append(
             nodes.provider_hash.in_(tuple(_digest(value) for value in where.providers))
         )
-    if where.models and exclude != "models":
+    if where.models:
         criteria.append(
             nodes.model_hash.in_(tuple(_digest(value) for value in where.models))
         )
@@ -2368,68 +2449,6 @@ def _trace_graph_criteria(
     return tuple(criteria)
 
 
-async def _trace_graph_facets(
-    connection: AsyncConnection,
-    backend: _SqlAlchemyTraceLedgerBackend,
-    request: TraceGraphQueryRequest,
-    *,
-    source: Subquery,
-) -> TraceGraphFacets:
-    nodes = source.c
-
-    async def grouped(
-        column: ColumnElement[Any],
-        *extra: ColumnElement[bool],
-        exclude: Literal[
-            "kinds",
-            "statuses",
-            "agent_names",
-            "middleware_names",
-            "skill_names",
-            "providers",
-            "models",
-        ],
-    ) -> dict[str, int]:
-        criteria = _trace_graph_criteria(
-            backend,
-            request,
-            source=source,
-            exclude=exclude,
-        )
-        rows = (
-            await connection.execute(
-                select(column, func.count()).where(*criteria, *extra).group_by(column)
-            )
-        ).all()
-        return {
-            cast(str, value): cast(int, count)
-            for value, count in rows
-            if value is not None
-        }
-
-    raw_kinds = await grouped(nodes.kind, exclude="kinds")
-    raw_statuses = await grouped(nodes.status, exclude="statuses")
-    return TraceGraphFacets(
-        kinds={TraceGraphNodeKind(value): count for value, count in raw_kinds.items()},
-        statuses={
-            TraceGraphNodeStatus(value): count for value, count in raw_statuses.items()
-        },
-        agents=await grouped(nodes.agent_name, exclude="agent_names"),
-        middleware=await grouped(
-            nodes.name,
-            nodes.kind == TraceGraphNodeKind.MIDDLEWARE.value,
-            exclude="middleware_names",
-        ),
-        skills=await grouped(
-            nodes.name,
-            nodes.kind == TraceGraphNodeKind.SKILL.value,
-            exclude="skill_names",
-        ),
-        providers=await grouped(nodes.provider, exclude="providers"),
-        models=await grouped(nodes.model, exclude="models"),
-    )
-
-
 def _validate_graph_node_row(
     row: object,
     *,
@@ -2438,12 +2457,12 @@ def _validate_graph_node_row(
     mapping = cast(dict[str, object], row)
     required_pairs = (
         ("node_id", "node_hash"),
-        ("name", "name_hash"),
         ("run_id", "run_hash"),
         ("graph_namespace", "graph_namespace_hash"),
     )
     optional_pairs = (
-        ("structural_parent_id", "structural_parent_hash"),
+        ("parent_subagent_id", "parent_subagent_hash"),
+        ("model_call_id", "model_call_hash"),
         ("agent_name", "agent_hash"),
         ("provider", "provider_hash"),
         ("model", "model_hash"),
@@ -2452,6 +2471,8 @@ def _validate_graph_node_row(
         value = mapping[value_column]
         if not isinstance(value, str) or mapping[hash_column] != _digest(value):
             raise TraceStoreProtocolError("Trace Graph searchable metadata conflicts")
+    if not isinstance(mapping["name"], str):
+        raise TraceStoreProtocolError("Trace Graph display name is not text")
     for value_column, hash_column in optional_pairs:
         value = mapping[value_column]
         digest = mapping[hash_column]
@@ -2463,16 +2484,12 @@ def _validate_graph_node_row(
     if where is None:
         return
     if (
-        where.parent_id is not None
-        and mapping["structural_parent_id"] != where.parent_id
+        where.model_call_id is not None
+        and mapping["model_call_id"] != where.model_call_id
     ):
-        raise TraceStoreProtocolError("Trace Graph parent filter digest collision")
+        raise TraceStoreProtocolError("Trace Graph model-call filter digest collision")
     if where.agent_names and mapping["agent_name"] not in where.agent_names:
         raise TraceStoreProtocolError("Trace Graph Agent filter digest collision")
-    if where.middleware_names and mapping["name"] not in where.middleware_names:
-        raise TraceStoreProtocolError("Trace Graph middleware filter digest collision")
-    if where.skill_names and mapping["name"] not in where.skill_names:
-        raise TraceStoreProtocolError("Trace Graph Skill filter digest collision")
     if where.providers and mapping["provider"] not in where.providers:
         raise TraceStoreProtocolError("Trace Graph provider filter digest collision")
     if where.models and mapping["model"] not in where.models:
@@ -2522,7 +2539,8 @@ def _stored_graph_node_from_row(
         ) from error
     return StoredTraceGraphNode(
         node_id=cast(str, mapping["node_id"]),
-        structural_parent_id=cast(str | None, mapping["structural_parent_id"]),
+        parent_subagent_id=cast(str | None, mapping["parent_subagent_id"]),
+        model_call_id=cast(str | None, mapping["model_call_id"]),
         kind=kind,
         status=status,
         name=cast(str, mapping["name"]),
@@ -2548,7 +2566,8 @@ def _stored_graph_node_from_row(
         result_seq=result_seq,
         failure_seq=failure_seq,
         link_issue=resolve_graph_link_issue(
-            cast(str | None, mapping["structural_parent_id"]),
+            cast(str | None, mapping["parent_subagent_id"]),
+            cast(str | None, mapping["model_call_id"]),
             stored_link_issue,
         ),
         started_event=started_event,

@@ -3,14 +3,17 @@ import { resolve } from 'node:path'
 
 import type { ConversationHistoryDetail } from '../../src/api/conversation/history'
 import type {
+  TraceGraph,
   TraceGraphNode,
   TraceGraphPage,
 } from '../../src/api/conversation/traceGraph'
-import { emptyTraceGraph } from '../../src/test/traceFixtures'
 
 const THREAD_ID = 'chain-trace-browser-thread'
+const OTHER_THREAD_ID = 'chain-trace-other-thread'
 const RUN_ID = 'chain-trace-browser-run'
 const BASE_TIME = '2026-09-01T00:00:00.000Z'
+const SECOND_TURN_OFFSET = 60 * 60 * 1_000
+
 const user = {
   user_id: 27,
   username: 'chain-browser-user',
@@ -27,46 +30,66 @@ const fulfillJson = (route: Route, data: unknown) => route.fulfill({
   body: JSON.stringify(success(data)),
 })
 
+const timestamp = (offset: number) => new Date(
+  Date.parse(BASE_TIME) + offset,
+).toISOString()
+
 const graphNode = (
   id: string,
   kind: TraceGraphNode['kind'],
-  parentId: string | null,
   startedSeq: number,
   values: Partial<TraceGraphNode> = {},
 ): TraceGraphNode => ({
   id,
-  turnId: id.startsWith('old-') ? 'turn-browser-1' : 'turn-browser-2',
-  parentId,
-  structuralParentId: parentId,
+  turnId: 'turn-browser-2',
+  parentSubagentId: null,
+  modelCallId: null,
   kind,
   status: 'succeeded',
   name: kind === 'human_message'
     ? 'HumanMessage'
     : kind === 'assistant_message' ? 'AssistantMessage' : id,
-  runId: id.startsWith('old-') ? 'run-browser-1' : RUN_ID,
+  runId: RUN_ID,
   namespace: [],
-  startedAt: '2026-09-01T00:01:00.000Z',
-  completedAt: '2026-09-01T00:01:01.000Z',
+  startedAt: timestamp(
+    (startedSeq < 10 ? 0 : SECOND_TURN_OFFSET) + startedSeq * 100,
+  ),
+  completedAt: timestamp(
+    (startedSeq < 10 ? 0 : SECOND_TURN_OFFSET) + startedSeq * 100 + 80,
+  ),
   startedSeq,
   updatedSeq: startedSeq,
   contentOmitted: false,
+  toolCallOnly: false,
   requestOmitted: false,
   resultOmitted: false,
-  hooks: [],
   linkIssues: [],
   ...values,
 })
 
-const semanticNodes = [
-  graphNode('old-human', 'human_message', null, 1, { content: '第一轮浏览器任务' }),
-  graphNode('old-agent', 'agent', 'old-human', 2, { name: 'Historical Agent' }),
-  graphNode('human-current', 'human_message', null, 10, { content: '继续核验真实调用树' }),
-  graphNode('agent-current', 'agent', 'human-current', 11, { name: 'Agent' }),
-  graphNode('model-current', 'model', 'agent-current', 13, {
+const nodes: TraceGraphNode[] = [
+  graphNode('old-human', 'human_message', 1, {
+    turnId: 'turn-browser-1',
+    runId: 'run-browser-1',
+    content: '第一轮浏览器任务',
+  }),
+  graphNode('old-assistant', 'assistant_message', 2, {
+    turnId: 'turn-browser-1',
+    runId: 'run-browser-1',
+    content: '第一轮已完成',
+  }),
+  graphNode('human-current', 'human_message', 10, {
+    content: '继续核验真实链路',
+  }),
+  graphNode('context-current', 'context', 11, {
+    name: 'Context',
+    content: '# 浏览器系统提示词',
+  }),
+  graphNode('model-current', 'model', 12, {
     name: 'deepseek-v4-pro',
     provider: 'deepseek',
     model: 'deepseek-v4-pro',
-    firstOutputAt: '2026-09-01T00:01:00.500Z',
+    firstOutputAt: timestamp(SECOND_TURN_OFFSET + 1_260),
     request: {
       messages: [{ messageType: 'system', content: '# 浏览器系统提示词' }],
     },
@@ -79,13 +102,100 @@ const semanticNodes = [
     },
     responseMetadata: { finish_reason: 'tool_calls' },
   }),
-  graphNode('assistant-current', 'assistant_message', 'model-current', 17, {
+  graphNode('assistant-stage', 'assistant_message', 13, {
+    modelCallId: 'model-current',
+    content: '准备委派任务',
+  }),
+  graphNode('tool-current', 'tool', 14, {
+    modelCallId: 'model-current',
+    name: 'web_search',
+    sourceId: 'web-search-call',
+    request: { query: '真实链路' },
+    result: '搜索完成',
+  }),
+  graphNode('subagent-outer', 'subagent', 15, {
+    modelCallId: 'model-current',
+    name: 'researcher',
+    namespace: ['tools:outer'],
+    request: { description: '核验链路来源' },
+  }),
+  graphNode('subagent-human', 'human_message', 16, {
+    parentSubagentId: 'subagent-outer',
+    namespace: ['tools:outer'],
+    content: '核验链路来源',
+  }),
+  graphNode('subagent-context', 'plan', 17, {
+    parentSubagentId: 'subagent-outer',
+    namespace: ['tools:outer'],
+    name: 'Plan',
+    result: { title: '子智能体计划' },
+  }),
+  graphNode('subagent-model', 'model', 18, {
+    parentSubagentId: 'subagent-outer',
+    namespace: ['tools:outer'],
+    name: 'deepseek-v4-flash',
+    provider: 'deepseek',
+    model: 'deepseek-v4-flash',
+    request: { messages: [] },
+  }),
+  graphNode('subagent-tool', 'tool', 19, {
+    parentSubagentId: 'subagent-outer',
+    modelCallId: 'subagent-model',
+    namespace: ['tools:outer'],
+    name: 'read_file',
+    request: { file_path: 'README.md' },
+    result: '读取完成',
+  }),
+  graphNode('subagent-inner', 'subagent', 20, {
+    parentSubagentId: 'subagent-outer',
+    modelCallId: 'subagent-model',
+    namespace: ['tools:outer', 'tools:inner'],
+    name: 'researcher',
+    request: { description: '继续核验嵌套链路' },
+  }),
+  graphNode('inner-human', 'human_message', 21, {
+    parentSubagentId: 'subagent-inner',
+    namespace: ['tools:outer', 'tools:inner'],
+    content: '继续核验嵌套链路',
+  }),
+  graphNode('inner-assistant', 'assistant_message', 22, {
+    parentSubagentId: 'subagent-inner',
+    namespace: ['tools:outer', 'tools:inner'],
+    content: '嵌套核验完成',
+  }),
+  graphNode('subagent-assistant', 'assistant_message', 23, {
+    parentSubagentId: 'subagent-outer',
+    modelCallId: 'subagent-model',
+    namespace: ['tools:outer'],
+    content: '',
+    toolCallOnly: true,
+  }),
+  graphNode('subagent-leaf', 'subagent', 24, {
+    name: 'researcher',
+    namespace: ['tools:leaf'],
+    request: { description: '无子节点任务' },
+  }),
+  graphNode('model-final', 'model', 25, {
+    name: 'deepseek-v4-pro',
+    provider: 'deepseek',
+    model: 'deepseek-v4-pro',
+    request: { messages: [] },
+  }),
+  graphNode('assistant-current', 'assistant_message', 26, {
+    modelCallId: 'model-final',
     content: '链路完成',
   }),
-  graphNode('tool-current', 'tool', 'model-current', 19, {
+  graphNode('skill-read', 'tool', 27, {
+    modelCallId: 'model-final',
+    name: 'read_file',
+    request: { file_path: '/skills/research/SKILL.md' },
+    result: 'Skill 内容',
+  }),
+  graphNode('failed-tool', 'tool', 28, {
+    modelCallId: 'model-final',
     name: 'web_search',
     status: 'failed',
-    request: { query: '真实链路' },
+    request: { query: '失败场景' },
     failure: {
       errorType: 'builtins.TimeoutError',
       message: '搜索服务在期限内未响应',
@@ -93,58 +203,45 @@ const semanticNodes = [
   }),
 ]
 
-const technicalNodes = [
-  ...semanticNodes.slice(0, 4),
-  graphNode('middleware-visible', 'middleware', 'agent-current', 12, {
-    name: 'PromptCacheMiddleware.awrap_model_call',
-    className: 'deepagents.middleware.PromptCacheMiddleware',
-    hooks: ['awrap_model_call'],
-  }),
-  semanticNodes[4],
-  graphNode('system-current', 'system_message', 'model-current', 14, {
-    content: '# 浏览器系统提示词',
-  }),
-  ...semanticNodes.slice(5),
-]
-
-const tracePage = (nodes: TraceGraphNode[]): TraceGraphPage => ({
+const tracePage = (
+  sourceNodes: TraceGraphNode[] = nodes,
+  detailsOmitted = false,
+): TraceGraphPage => ({
   turns: [
-    {
-      id: 'turn-browser-1',
-      ordinal: 1,
-      rootNodeId: 'old-human',
-      startedAt: BASE_TIME,
-    },
+    { id: 'turn-browser-1', ordinal: 1, startedAt: BASE_TIME },
     {
       id: 'turn-browser-2',
       ordinal: 2,
-      rootNodeId: 'human-current',
-      startedAt: '2026-09-01T00:01:00.000Z',
+      startedAt: timestamp(SECOND_TURN_OFFSET + 1_000),
     },
-  ],
-  nodes,
-  orderedNodeIds: nodes.map((node) => node.id),
-  rootNodeIds: ['old-human', 'human-current'],
-  matchedNodeIds: nodes.map((node) => node.id),
+  ].filter((turn) => sourceNodes.some((node) => node.turnId === turn.id)),
+  nodes: sourceNodes,
+  orderedNodeIds: sourceNodes.map((node) => node.id),
+  matchedNodeIds: sourceNodes.map((node) => node.id),
   nextCursor: null,
   asOfSeq: 40,
-  facets: {
-    kinds: {
-      human_message: 2,
-      assistant_message: 1,
-      agent: 2,
-      middleware: 1,
-      model: 1,
-      system_message: 1,
-      tool: 1,
-    },
-    statuses: { succeeded: nodes.length - 1, failed: 1 },
-    agents: {},
-    middleware: { PromptCacheMiddleware: 1 },
-    skills: {},
-    providers: { deepseek: 1 },
-    models: { 'deepseek-v4-pro': 1 },
+  completeness: {
+    callTrackingMissing: false,
+    relationshipEvidenceMissing: false,
+    detailsOmitted,
   },
+})
+
+const responseNodes = nodes.filter((node) => (
+  node.modelCallId === 'model-current'
+  && ['assistant_message', 'tool', 'subagent'].includes(node.kind)
+))
+const responsePage = (detailsOmitted = false) => tracePage(
+  responseNodes,
+  detailsOmitted,
+)
+
+const emptyGraph = (asOfSeq: number): TraceGraph => ({
+  turns: [],
+  nodes: [],
+  orderedNodeIds: [],
+  matchedNodeIds: [],
+  asOfSeq,
   completeness: {
     callTrackingMissing: false,
     relationshipEvidenceMissing: false,
@@ -152,61 +249,71 @@ const tracePage = (nodes: TraceGraphNode[]): TraceGraphPage => ({
   },
 })
 
-const detail = (includeTaskTrace: boolean): ConversationHistoryDetail => ({
-  id: 1,
-  threadId: THREAD_ID,
-  title: 'Turn 链路浏览器会话',
+const detail = (
+  threadId = THREAD_ID,
+  includeTaskTrace = true,
+): ConversationHistoryDetail => ({
+  id: threadId === THREAD_ID ? 1 : 2,
+  threadId,
+  title: threadId === THREAD_ID ? '链路浏览器会话' : '另一个会话',
   lastModel: 'deepseek-v4-pro',
   pinned: false,
-  asOfSeq: 22,
+  asOfSeq: 30,
   headRunId: RUN_ID,
   availableHeads: [RUN_ID],
   historyCursor: null,
-  messageCount: 24,
-  toolCallCount: 1,
-  messages: Array.from({ length: 24 }, (_, index) => ({
-    id: `history-message-${index + 1}`,
+  messageCount: 30,
+  toolCallCount: 2,
+  messages: Array.from({ length: 30 }, (_, index) => ({
+    id: `${threadId}-message-${index + 1}`,
     traceSeq: index + 1,
     sourceId: `assistant-history-${index + 1}`,
     namespace: [],
     runId: RUN_ID,
     role: 'assistant' as const,
-    content: `第 ${index + 1} 段历史回复，用于验证链路与对话切换后仍能精确恢复用户阅读位置。`,
+    content: `第 ${index + 1} 段历史回复，用于验证链路与对话切换后仍能精确恢复阅读位置。`,
     contentOmitted: false,
     status: 'completed' as const,
-    createdAt: `2026-09-01T00:${String(index).padStart(2, '0')}:00.000Z`,
-    completedAt: `2026-09-01T00:${String(index).padStart(2, '0')}:01.000Z`,
+    createdAt: timestamp(index * 1_000),
+    completedAt: timestamp(index * 1_000 + 500),
   })),
   reasoning: [],
-  graph: emptyTraceGraph(22),
+  graph: emptyGraph(30),
   state: { root: {}, subgraphs: {} },
   interactions: [],
-  status: { execution: 'failed', headRunId: RUN_ID },
+  status: { execution: 'succeeded', headRunId: RUN_ID },
   completeness: { missingPrefix: false, missingTail: false, payloadOmitted: false },
   taskTrace: includeTaskTrace ? {
     status: 'ready',
     todoGroups: [{
       id: 'trace-browser-todos',
-      userMessageId: 'turn-two-user',
-      userMessagePreview: '继续核验真实调用树',
+      userMessageId: 'human-current',
+      userMessagePreview: '继续核验真实链路',
       groupToolCallId: 'todo-tool-call',
-      createdAt: '2026-09-01T00:01:00.000Z',
+      createdAt: timestamp(1_000),
       status: 'completed',
-      todos: [{ id: 'verify-tree', content: '核验调用树', status: 'completed' }],
+      todos: [{ id: 'verify-trace', content: '核验链路', status: 'completed' }],
     }],
   } : null,
   createdAt: BASE_TIME,
-  updatedAt: '2026-09-01T00:01:04.000Z',
+  updatedAt: timestamp(30_000),
 })
 
 async function mockChainTraceStudio(
   page: Page,
-  theme: 'light' | 'dark' = 'light',
-  semanticSnapshot: TraceGraphPage = tracePage(semanticNodes),
-  directSnapshot?: TraceGraphPage,
-  language: 'zh-CN' | 'en' = 'zh-CN',
-  technicalSnapshot: TraceGraphPage = tracePage(technicalNodes),
+  options: {
+    theme?: 'light' | 'dark'
+    language?: 'zh-CN' | 'en'
+    snapshot?: TraceGraphPage
+    directSnapshot?: TraceGraphPage
+  } = {},
 ) {
+  const {
+    theme = 'light',
+    language = 'zh-CN',
+    snapshot = tracePage(),
+    directSnapshot = responsePage(),
+  } = options
   const pageErrors: string[] = []
   page.on('pageerror', (error) => pageErrors.push(error.message))
   page.on('console', (message) => {
@@ -215,39 +322,66 @@ async function mockChainTraceStudio(
   await page.addInitScript(({
     session,
     threadId,
-    semanticSnapshot,
-    technicalSnapshot,
     selectedTheme,
     selectedLanguage,
+    initialSnapshot,
   }) => {
     window.localStorage.setItem('tinkerfin.auth.session', JSON.stringify(session))
     window.localStorage.setItem('tinkerfin:theme', selectedTheme)
     window.localStorage.setItem('tinkerfin:language', selectedLanguage)
-    const traceWindow = window as typeof window & { __traceFollowUrls: string[] }
+    const traceWindow = window as typeof window & {
+      __traceFollowUrls: string[]
+      __traceDirectUrls: string[]
+    }
     traceWindow.__traceFollowUrls = []
+    traceWindow.__traceDirectUrls = []
     const originalFetch = window.fetch.bind(window)
     window.fetch = (input, init) => {
-      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
-      if (url.includes(`/api/conversation/${threadId}/trace/graph/follow`)) {
-        traceWindow.__traceFollowUrls.push(url)
-        const configuredSnapshot = url.includes('includeTechnicalNodes=true')
-          ? technicalSnapshot
-          : semanticSnapshot
-        const requestedKinds = new Set(new URL(url, window.location.origin).searchParams.getAll('kind'))
-        const configuredMatches = new Set(configuredSnapshot.matchedNodeIds)
-        const snapshot = {
-          ...configuredSnapshot,
-          matchedNodeIds: configuredSnapshot.orderedNodeIds.filter((nodeId) => {
-            const node = configuredSnapshot.nodes.find((item) => item.id === nodeId)
-            return Boolean(node && configuredMatches.has(nodeId) && requestedKinds.has(node.kind))
-          }),
+      const rawUrl = typeof input === 'string'
+        ? input
+        : input instanceof URL ? input.href : input.url
+      const url = new URL(rawUrl, window.location.origin)
+      if (url.pathname === `/api/conversation/${threadId}/trace/graph/follow`) {
+        traceWindow.__traceFollowUrls.push(url.href)
+        const kinds = new Set(url.searchParams.getAll('kind'))
+        const query = url.searchParams.get('query')?.toLocaleLowerCase() ?? ''
+        const direct = initialSnapshot.nodes.filter((node) => (
+          (kinds.size === 0 || kinds.has(node.kind))
+          && (!query || JSON.stringify(node).toLocaleLowerCase().includes(query))
+        ))
+        const byId = new Map(initialSnapshot.nodes.map((node) => [node.id, node]))
+        const included = new Set(direct.map((node) => node.id))
+        const pending = direct.map((node) => node.parentSubagentId)
+        while (pending.length > 0) {
+          const parentId = pending.pop()
+          if (!parentId || included.has(parentId)) continue
+          const parent = byId.get(parentId)
+          if (!parent) throw new Error('Fixture contains a missing Subagent parent')
+          included.add(parentId)
+          pending.push(parent.parentSubagentId)
+        }
+        const filteredNodes = initialSnapshot.nodes.filter((node) => included.has(node.id))
+        const directIds = new Set(direct.map((node) => node.id))
+        const filteredSnapshot = {
+          ...initialSnapshot,
+          turns: initialSnapshot.turns.filter((turn) => (
+            filteredNodes.some((node) => node.turnId === turn.id)
+          )),
+          nodes: filteredNodes,
+          orderedNodeIds: filteredNodes.map((node) => node.id),
+          matchedNodeIds: filteredNodes
+            .filter((node) => directIds.has(node.id))
+            .map((node) => node.id),
         }
         const encoder = new TextEncoder()
         const stream = new ReadableStream({
           start(controller) {
             let closed = false
             controller.enqueue(encoder.encode(
-              `event: trace\ndata: ${JSON.stringify({ type: 'snapshot', snapshot })}\n\n`,
+              `event: trace\ndata: ${JSON.stringify({
+                type: 'snapshot',
+                snapshot: filteredSnapshot,
+              })}\n\n`,
             ))
             init?.signal?.addEventListener('abort', () => {
               if (closed) return
@@ -261,6 +395,9 @@ async function mockChainTraceStudio(
           headers: { 'Content-Type': 'text/event-stream' },
         }))
       }
+      if (url.pathname === `/api/conversation/${threadId}/trace/graph`) {
+        traceWindow.__traceDirectUrls.push(url.href)
+      }
       return originalFetch(input, init)
     }
   }, {
@@ -271,11 +408,11 @@ async function mockChainTraceStudio(
       user,
     },
     threadId: THREAD_ID,
-    semanticSnapshot,
-    technicalSnapshot,
     selectedTheme: theme,
     selectedLanguage: language,
+    initialSnapshot: snapshot,
   })
+
   await page.route('**/api/**', async (route) => {
     const url = new URL(route.request().url())
     if (url.pathname === '/api/auth/me') {
@@ -300,27 +437,37 @@ async function mockChainTraceStudio(
     }
     if (url.pathname === '/api/conversation/history') {
       await fulfillJson(route, {
-        items: [{
-          id: 1,
-          threadId: THREAD_ID,
-          title: 'Turn 链路浏览器会话',
+        items: [THREAD_ID, OTHER_THREAD_ID].map((threadId, index) => ({
+          id: index + 1,
+          threadId,
+          title: threadId === THREAD_ID ? '链路浏览器会话' : '另一个会话',
           status: 'idle',
           lastRunId: RUN_ID,
           lastModel: 'deepseek-v4-pro',
-          messageCount: 24,
-          toolCallCount: 1,
+          messageCount: 30,
+          toolCallCount: 2,
           hasPendingInterrupt: false,
           pendingInteractionKind: null,
           pinned: false,
           createdAt: BASE_TIME,
-          updatedAt: '2026-09-01T00:01:04.000Z',
-        }],
+          updatedAt: timestamp(30_000 - index),
+        })),
         nextCursor: null,
       })
       return
     }
     if (url.pathname === `/api/conversation/${THREAD_ID}/history`) {
-      await fulfillJson(route, detail(url.searchParams.get('includeTaskTrace') !== 'false'))
+      await fulfillJson(
+        route,
+        detail(THREAD_ID, url.searchParams.get('includeTaskTrace') !== 'false'),
+      )
+      return
+    }
+    if (url.pathname === `/api/conversation/${OTHER_THREAD_ID}/history`) {
+      await fulfillJson(
+        route,
+        detail(OTHER_THREAD_ID, url.searchParams.get('includeTaskTrace') !== 'false'),
+      )
       return
     }
     if (url.pathname === `/api/conversation/${THREAD_ID}/trace`) {
@@ -330,17 +477,18 @@ async function mockChainTraceStudio(
         contentType: 'text/event-stream',
         body: `event: trace\ndata: ${JSON.stringify({
           type: 'snapshot',
-          snapshot: detail(includeTaskTrace),
+          snapshot: detail(THREAD_ID, includeTaskTrace),
         })}\n\n`,
       })
       return
     }
-    if (url.pathname === `/api/conversation/${THREAD_ID}/trace/graph` && directSnapshot) {
+    if (url.pathname === `/api/conversation/${THREAD_ID}/trace/graph`) {
       await fulfillJson(route, directSnapshot)
       return
     }
     await route.fulfill({ status: 404, contentType: 'application/json', body: '{}' })
   })
+
   await page.goto(`/?thread=${THREAD_ID}`)
   const conversationLabel = language === 'en' ? 'Conversation' : '对话'
   const traceLabel = language === 'en' ? 'Trace' : '链路'
@@ -349,48 +497,25 @@ async function mockChainTraceStudio(
     'true',
   )
   await expect(page.getByRole('tab', { name: traceLabel })).toBeVisible()
-  await expect(page.getByRole('button', { name: traceLabel, exact: true })).toHaveCount(0)
   return pageErrors
 }
 
-const followUrls = (page: Page) => page.evaluate(() => (
-  (window as typeof window & { __traceFollowUrls: string[] }).__traceFollowUrls
-))
-
-async function verifyTraceViewports(
-  page: Page,
-  theme: 'light' | 'dark',
-) {
-  for (const width of [320, 768, 1024, 1440]) {
-    await page.setViewportSize({ width, height: 900 })
-    await expect(page.getByRole('tabpanel', { name: '链路' })).toBeVisible()
-    await expect(page.locator('.is-layout-flipping')).toHaveCount(0)
-    if (width < 768) {
-      await expect(page.locator('.workspace-sidebar')).toHaveCSS('visibility', 'hidden')
-    } else if (width < 1024) {
-      await expect(page.locator('.app-shell')).toHaveAttribute('data-sidebar-mode', 'rail')
-      await expect(page.locator('.sidebar-wide')).toHaveCSS('opacity', '0')
-      await expect(page.locator('.sidebar-rail')).toHaveCSS('visibility', 'visible')
-    } else {
-      await expect(page.locator('.app-shell')).toHaveAttribute('data-sidebar-mode', 'expanded')
-      await expect(page.locator('.sidebar-wide')).toHaveCSS('opacity', '1')
-    }
-    const detailsBox = await page.getByRole('complementary', { name: '链路详情' })
-      .boundingBox()
-    expect(Math.round(detailsBox?.width ?? 0)).toBe(Math.min(width, 400))
-    expect(Math.round(detailsBox?.x ?? -1)).toBe(Math.max(0, width - 400))
-    const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)
-    expect(overflow).toBeLessThanOrEqual(0)
-    if (process.env.TINKERFIN_VISUAL_QA_DIR) {
-      await page.screenshot({
-        path: resolve(process.env.TINKERFIN_VISUAL_QA_DIR, `chain-trace-${theme}-${width}.png`),
-        fullPage: true,
-      })
-    }
+const traceRequests = (page: Page) => page.evaluate(() => {
+  const traceWindow = window as typeof window & {
+    __traceFollowUrls: string[]
+    __traceDirectUrls: string[]
   }
-}
+  return {
+    follow: traceWindow.__traceFollowUrls,
+    direct: traceWindow.__traceDirectUrls,
+  }
+})
 
-test('Header、时间线、Turn 台账、树形和详情形成同一条可交互链路', async ({ page }) => {
+const traceRow = (page: Page, nodeId: string) => (
+  page.locator(`[data-trace-node-id="${nodeId}"]`)
+)
+
+test('六类时间线、平级台账、Subagent 作用域和详情保持同一权威顺序', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 })
   const pageErrors = await mockChainTraceStudio(page)
   const traceTab = page.getByRole('tab', { name: '链路' })
@@ -399,467 +524,386 @@ test('Header、时间线、Turn 台账、树形和详情形成同一条可交互
     traceTab.boundingBox(),
     sidebarToggle.boundingBox(),
   ])
-  expect(traceTabBox).not.toBeNull()
-  expect(sidebarToggleBox).not.toBeNull()
   expect(Math.abs(
     (traceTabBox?.y ?? 0) + (traceTabBox?.height ?? 0) / 2
       - ((sidebarToggleBox?.y ?? 0) + (sidebarToggleBox?.height ?? 0) / 2),
   )).toBeLessThanOrEqual(1)
-  expect((traceTabBox?.y ?? 0) + (traceTabBox?.height ?? 0) / 2).toBeCloseTo(32, 5)
 
   await traceTab.click()
-  const tracePanel = page.getByRole('tabpanel', { name: '链路' })
-  await expect(tracePanel).toBeVisible()
-  await expect(page.getByRole('tab', { name: '时间线' })).toHaveAttribute('aria-selected', 'true')
+  await expect(page.getByRole('tabpanel', { name: '链路' })).toBeVisible()
+  await expect.poll(async () => (await traceRequests(page)).follow.length).toBe(1)
   await expect(page.getByRole('region', { name: '调用时间线' })).toBeVisible()
   await expect(page.getByLabel('链路节点', { exact: true })).toBeVisible()
-  const initialDetails = page.getByRole('complementary', { name: '链路详情' })
-  await expect(initialDetails.getByText('搜索服务在期限内未响应')).toBeVisible()
-  await expect(initialDetails).toBeVisible()
-  await expect(traceTab).toBeFocused()
-  await expect.poll(async () => (await followUrls(page)).length).toBe(1)
-  expect(new URL(
-    (await followUrls(page))[0]!,
-    'http://127.0.0.1',
-  ).searchParams.get('limit')).toBe('1000')
+  await expect.poll(() => page.getByLabel('链路节点', { exact: true }).evaluate(
+    (element) => Math.abs(element.scrollHeight - element.clientHeight - element.scrollTop),
+  )).toBeLessThanOrEqual(1)
+  await expect(page.getByRole('tab', { name: '树形' })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: '技术' })).toHaveCount(0)
 
-  const headerLayout = await page.locator('.workspace-main').evaluate((workspace) => {
-    const header = workspace.querySelector<HTMLElement>('.chat-header')!
-    const toolbar = workspace.querySelector<HTMLElement>('.chain-trace-toolbar')!
-    const timeline = workspace.querySelector<HTMLElement>('.chain-trace-timeline')!
-    const timelineLabels = workspace.querySelector<HTMLElement>('.chain-trace-timeline-labels')!
-    const ledgerHeader = workspace.querySelector<HTMLElement>('.chain-trace-ledger-header')!
-    const turnHeading = workspace.querySelector<HTMLElement>('.chain-trace-turn-heading')!
-    const ledgerRow = workspace.querySelector<HTMLElement>('.chain-trace-ledger-row')!
-    const ledgerRail = workspace.querySelector<HTMLElement>('.chain-trace-ledger-rail')!
-    const ledgerDot = ledgerRail.querySelector<HTMLElement>('i')!
-    const typePill = ledgerRow.querySelector<HTMLElement>('.chain-trace-type-pill')!
-    const duration = ledgerRow.querySelector<HTMLElement>('.chain-trace-duration')!
-    const ledgerMain = ledgerRow.querySelector<HTMLElement>('.chain-trace-ledger-main')!
-    const details = workspace.querySelector<HTMLElement>('.chain-trace-details')!
-    const detailHeader = workspace.querySelector<HTMLElement>('.chain-trace-details-header')!
-    const detailTabs = workspace.querySelector<HTMLElement>('.chain-trace-detail-tabs')!
-    const firstHeaderTab = workspace.querySelector<HTMLElement>('.workspace-view-tabs > button')!
-    const rangeSummary = workspace.querySelector<HTMLElement>('.chain-trace-range-summary')!
-    const headerStyle = getComputedStyle(header)
-    const toolbarStyle = getComputedStyle(toolbar)
-    const ledgerHeaderStyle = getComputedStyle(ledgerHeader)
-    const ledgerRowStyle = getComputedStyle(ledgerRow)
-    const detailsStyle = getComputedStyle(details)
-    const rowRect = ledgerRow.getBoundingClientRect()
-    const headerCells = Array.from(ledgerHeader.children).map((element) => (
-      element.getBoundingClientRect()
-    ))
-    const railCenter = ledgerRail.getBoundingClientRect().left
-      + Number.parseFloat(getComputedStyle(ledgerRail, '::before').left)
-    return {
-      headerHeight: header.getBoundingClientRect().height,
-      headerTabLeft: firstHeaderTab.getBoundingClientRect().left,
-      toolbarContentLeft: rangeSummary.getBoundingClientRect().left,
-      toolbarHeight: toolbar.getBoundingClientRect().height,
-      toolbarPaddingLeft: toolbarStyle.paddingLeft,
-      toolbarPaddingRight: toolbarStyle.paddingRight,
-      timelineHeight: timeline.getBoundingClientRect().height,
-      timelineLabelsWidth: timelineLabels.getBoundingClientRect().width,
-      ledgerHeaderHeight: ledgerHeader.getBoundingClientRect().height,
-      ledgerColumns: ledgerHeaderStyle.gridTemplateColumns,
-      ledgerPaddingLeft: ledgerHeaderStyle.paddingLeft,
-      ledgerPaddingRight: ledgerHeaderStyle.paddingRight,
-      turnHeight: turnHeading.getBoundingClientRect().height,
-      rowHeight: ledgerRow.getBoundingClientRect().height,
-      railLeft: getComputedStyle(ledgerRail, '::before').left,
-      rootInset: ledgerRail.getBoundingClientRect().left - rowRect.left,
-      durationInset: rowRect.right - duration.getBoundingClientRect().right,
-      nodeColumnDelta: headerCells[0]!.left - railCenter,
-      typeColumnDelta: headerCells[1]!.left - typePill.getBoundingClientRect().left,
-      contentColumnDelta: headerCells[2]!.left - ledgerMain.getBoundingClientRect().left,
-      durationColumnDelta: headerCells[3]!.right - duration.getBoundingClientRect().right,
-      railBranchWidth: getComputedStyle(ledgerRail, '::after').width,
-      railBranchHeight: getComputedStyle(ledgerRail, '::after').height,
-      railBranchRadius: getComputedStyle(ledgerRail, '::after').borderBottomLeftRadius,
-      railDotSize: ledgerDot.getBoundingClientRect().width,
-      typePillWidth: typePill.getBoundingClientRect().width,
-      typePillHeight: typePill.getBoundingClientRect().height,
-      typePillFontSize: getComputedStyle(typePill).fontSize,
-      typePillFontWeight: getComputedStyle(typePill).fontWeight,
-      ledgerHasTypeIcon: Boolean(ledgerRow.querySelector('.chain-trace-entry-icon')),
-      borderTop: headerStyle.borderTopWidth,
-      borderBottom: headerStyle.borderBottomWidth,
-      detailsPosition: detailsStyle.position,
-      detailsWidth: details.getBoundingClientRect().width,
-      detailHeaderHeight: detailHeader.getBoundingClientRect().height,
-      detailTabsHeight: detailTabs.getBoundingClientRect().height,
-      rowPaddingLeft: ledgerRowStyle.paddingLeft,
-      rowPaddingRight: ledgerRowStyle.paddingRight,
-    }
-  })
-  expect(headerLayout).toMatchObject({
-    headerHeight: 64,
-    toolbarHeight: 40,
-    timelineLabelsWidth: 104,
-    ledgerHeaderHeight: 34,
-    toolbarPaddingLeft: '28px',
-    toolbarPaddingRight: '28px',
-    ledgerColumns: '36px 68px 545px 74px',
-    ledgerPaddingLeft: '28px',
-    ledgerPaddingRight: '28px',
-    turnHeight: 28,
-    rowHeight: 44,
-    railLeft: '0px',
-    rootInset: 28,
-    durationInset: 28,
-    railBranchWidth: '22px',
-    railBranchHeight: '10px',
-    railBranchRadius: '10px',
-    railDotSize: 9,
-    typePillWidth: 42,
-    typePillHeight: 22,
-    typePillFontSize: '11px',
-    typePillFontWeight: '600',
-    ledgerHasTypeIcon: false,
-    borderTop: '0px',
-    borderBottom: '0px',
-    detailsPosition: 'relative',
-    detailsWidth: 400,
-    detailHeaderHeight: 64,
-    detailTabsHeight: 44,
-    rowPaddingLeft: '28px',
-    rowPaddingRight: '28px',
-  })
-  expect(headerLayout.timelineHeight).toBeGreaterThanOrEqual(90)
-  expect(Math.abs(headerLayout.headerTabLeft - headerLayout.toolbarContentLeft)).toBeLessThanOrEqual(1)
-  expect(Math.abs(headerLayout.nodeColumnDelta)).toBeLessThanOrEqual(1)
-  expect(Math.abs(headerLayout.typeColumnDelta)).toBeLessThanOrEqual(1)
-  expect(Math.abs(headerLayout.contentColumnDelta)).toBeLessThanOrEqual(1)
-  expect(Math.abs(headerLayout.durationColumnDelta)).toBeLessThanOrEqual(1)
   expect(await page.locator('.chain-trace-lane-label').allTextContents()).toEqual([
     '用户',
-    '助手',
+    '上下文',
+    '模型',
     '工具',
+    '子智能体',
+    '助手',
   ])
-  await expect(page.locator('[data-trace-node-id="agent-current"]')).toHaveCount(0)
-  await expect(page.locator('[data-trace-node-id="model-current"]')).toHaveCount(0)
-  const categoryColors = await page.locator('.chain-trace').evaluate((trace) => {
-    const color = (selector: string) => getComputedStyle(
-      trace.querySelector<HTMLElement>(selector)!,
-    ).color
-    return {
-      user: [color('.chain-trace-lane-label.is-user'), color('[data-trace-node-id="human-current"] .chain-trace-type-pill')],
-      assistant: [color('.chain-trace-lane-label.is-assistant'), color('[data-trace-node-id="assistant-current"] .chain-trace-type-pill')],
-      tool: [color('.chain-trace-lane-label.is-tool'), color('[data-trace-node-id="tool-current"] .chain-trace-type-pill')],
-    }
-  })
-  Object.values(categoryColors).forEach((colors) => expect(new Set(colors).size).toBe(1))
-  if (process.env.TINKERFIN_VISUAL_QA_DIR) {
-    await page.screenshot({
-      path: resolve(process.env.TINKERFIN_VISUAL_QA_DIR, 'prototype-aligned-trace-light-1440.png'),
-      fullPage: true,
-    })
+  await expect(page.getByRole('group', { name: '节点类型' })).toHaveCount(0)
+
+  const outerShell = traceRow(page, 'subagent-outer').locator('..')
+  const outerToggle = outerShell.locator('.chain-trace-ledger-toggle')
+  await expect(outerToggle).toHaveAttribute('aria-expanded', 'true')
+  const controlledIds = (await outerToggle.getAttribute('aria-controls'))?.split(' ') ?? []
+  expect(controlledIds).toContain('trace-ledger-node-subagent-inner')
+  for (const controlledId of controlledIds) {
+    await expect(page.locator(`#${controlledId}`)).toHaveCount(1)
   }
-  await expect(page.locator('.chain-trace-detail-resizer')).toHaveCount(0)
-  await expect(page.getByRole('button', { name: '状态：全部状态' })).toHaveCount(0)
-  const collapsedSearchGeometry = await page.locator('.chain-trace-filters').evaluate((filters) => {
-    const control = filters.querySelector<HTMLElement>('.chain-trace-search-control')!
-    const trigger = filters.querySelector<HTMLElement>('.chain-trace-search-trigger')!
-    const controlRect = control.getBoundingClientRect()
-    const triggerRect = trigger.getBoundingClientRect()
-    return {
-      overflow: filters.scrollWidth - filters.clientWidth,
-      centerDelta: triggerRect.top + triggerRect.height / 2
-        - (controlRect.top + controlRect.height / 2),
-    }
-  })
-  expect(collapsedSearchGeometry.overflow).toBeLessThanOrEqual(0)
-  expect(Math.abs(collapsedSearchGeometry.centerDelta)).toBeLessThanOrEqual(1)
-  await page.getByRole('button', { name: '搜索链路节点' }).click()
-  await expect(page.getByRole('searchbox', { name: '搜索链路节点' }))
-    .toHaveAttribute('placeholder', '搜索节点、内容')
-  await expect(page.getByRole('searchbox', { name: '搜索链路节点' }))
-    .toHaveAttribute('type', 'text')
-  await expect(page.getByRole('button', { name: '清除链路搜索' })).toHaveCount(1)
-  const expandedSearchOverflow = await page.locator('.chain-trace-filters').evaluate(
-    (filters) => filters.scrollWidth - filters.clientWidth,
-  )
-  expect(expandedSearchOverflow).toBeLessThanOrEqual(0)
-  await expect(page.getByRole('button', { name: /全部类型/ })).toHaveCount(0)
-  const categoryFilters = page.getByRole('group', { name: '节点类型' })
-  for (const label of ['用户', '助手', '工具', '上下文']) {
-    await expect(categoryFilters.getByRole('button', { name: label, exact: true }))
-      .toHaveAttribute('aria-pressed', 'true')
-  }
-  await expect(tracePanel.getByRole('button', {
-    name: /HumanMessage|AssistantMessage|ToolMessage/,
-  })).toHaveCount(0)
+  await expect(
+    traceRow(page, 'subagent-inner').locator('..').locator('.chain-trace-ledger-toggle'),
+  ).toHaveAttribute('aria-expanded', 'true')
+  await expect(
+    traceRow(page, 'subagent-leaf').locator('..').locator('.chain-trace-ledger-toggle'),
+  ).toHaveCount(0)
 
-  await initialDetails.getByRole('button', { name: '关闭链路详情' }).click()
-  await expect(initialDetails).toBeHidden()
+  await traceRow(page, 'inner-assistant').click()
+  const details = page.locator('.chain-trace-details')
+  await expect(details).toBeVisible()
+  await outerToggle.click()
+  await expect(traceRow(page, 'inner-assistant')).toBeHidden()
+  await expect(details).toBeHidden()
+  await expect(outerToggle).toBeFocused()
+  await outerToggle.click()
+  await expect(traceRow(page, 'inner-assistant')).toBeVisible()
 
-  await page.getByRole('button', {
-    name: '助手，链路完成，查看详情',
-  }).click()
-  await expect(initialDetails.getByRole('heading', {
-    name: '助手 第 2 轮 · 步骤 2',
-  })).toBeVisible()
-  await expect(page.locator('.chain-trace-ledger-row .chain-trace-entry-icon')).toHaveCount(0)
-  await expect(page.getByText('AssistantMessage', { exact: true })).toHaveCount(0)
-  await expect(initialDetails.locator('.markdown-content--compact')).toHaveCSS('font-size', '13px')
-  await expect(initialDetails.locator('.markdown-content--compact')).toHaveCSS('line-height', '20px')
-  if (process.env.TINKERFIN_VISUAL_QA_DIR) {
-    await page.screenshot({
-      path: resolve(
-        process.env.TINKERFIN_VISUAL_QA_DIR,
-        'prototype-aligned-assistant-detail-light-1440.png',
-      ),
-      fullPage: true,
-    })
-  }
+  await traceRow(page, 'failed-tool').click()
+  await expect(details.getByText('搜索服务在期限内未响应')).toBeVisible()
+  await details.getByRole('button', { name: '关闭链路详情' }).click()
+  await expect(details).toBeHidden()
+  await expect(traceRow(page, 'failed-tool')).toBeFocused()
 
-  const technical = page.getByRole('button', { name: '技术' })
-  await technical.click()
-  await expect.poll(async () => (await followUrls(page)).length).toBe(2)
-  await expect(page.getByRole('button', {
-    name: '技术，PromptCacheMiddleware.awrap_model_call，查看详情',
-  })).toBeVisible()
-  await expect(page.locator('[data-trace-node-id="system-current"] .chain-trace-type-pill'))
-    .toHaveText('技术')
-  const technicalColors = await page.locator('.chain-trace').evaluate((trace) => [
-    getComputedStyle(trace.querySelector<HTMLElement>('.chain-trace-lane-label.is-technical')!).color,
-    getComputedStyle(trace.querySelector<HTMLElement>(
-      '[data-trace-node-id="system-current"] .chain-trace-type-pill',
-    )!).color,
-    getComputedStyle(trace.querySelector<HTMLElement>(
-      '[data-trace-node-id="model-current"] .chain-trace-type-pill',
-    )!).color,
-  ])
-  expect(new Set(technicalColors).size).toBe(1)
-  const requestsBeforeViewChange = (await followUrls(page)).length
-  await page.getByRole('tab', { name: '树形' }).click()
-  await expect(page.getByRole('tab', { name: '树形' })).toHaveAttribute('aria-selected', 'true')
-  await expect(page.getByLabel('链路树')).toBeVisible()
-  expect((await followUrls(page)).length).toBe(requestsBeforeViewChange)
-  const treeGeometry = await page.locator('.chain-trace-tree-scroll').evaluate((tree) => {
-    const treeRect = tree.getBoundingClientRect()
-    const root = tree.querySelector<HTMLElement>('[data-trace-node-id="human-current"]')!
-    const icon = root.querySelector<HTMLElement>('.chain-trace-entry-icon')!
-    const duration = root.querySelector<HTMLElement>('.chain-trace-duration')!
-    const toggleLefts = Array.from(tree.querySelectorAll<HTMLElement>('.chain-trace-node-toggle'))
-      .map((toggle) => Math.round(toggle.getBoundingClientRect().left - treeRect.left))
-    return {
-      rootInset: Math.round(icon.getBoundingClientRect().left - treeRect.left),
-      durationInset: Math.round(treeRect.right - duration.getBoundingClientRect().right),
-      toggleLefts,
-    }
-  })
-  expect(treeGeometry.rootInset).toBe(28)
-  expect(treeGeometry.durationInset).toBe(28)
-  expect(new Set(treeGeometry.toggleLefts)).toEqual(new Set([0]))
-  const crossViewAssistant = page.getByRole('button', {
-    name: '助手，链路完成，查看详情',
-  })
-  await initialDetails.getByRole('button', { name: '关闭链路详情' }).click()
-  await expect(crossViewAssistant).toBeFocused()
-  await crossViewAssistant.click()
-
-  await page.getByRole('button', { name: '收起 技术，deepseek-v4-pro' }).click()
-  await expect(page.getByRole('button', {
-    name: '助手，链路完成，查看详情',
-  })).toHaveCount(0)
-  await page.getByRole('button', { name: '展开 技术，deepseek-v4-pro' }).click()
-  const assistant = page.getByRole('button', {
-    name: '助手，链路完成，查看详情',
-  })
-  await assistant.click()
-  const assistantNode = page.locator('[data-trace-node-id="assistant-current"]').locator('xpath=../..')
-  const modelNode = page.locator('[data-trace-node-id="model-current"]').locator('xpath=../..')
-  const siblingToolNode = page.locator('[data-trace-node-id="tool-current"]').locator('xpath=../..')
-  await expect(assistantNode).toHaveClass(/is-on-selected-path/)
-  await expect(modelNode).toHaveClass(/is-on-selected-path/)
-  await expect(siblingToolNode).not.toHaveClass(/is-on-selected-path/)
-  const selectionStyle = await assistantNode.locator('.chain-trace-node-row').evaluate((row) => ({
-    background: getComputedStyle(row, '::before').backgroundColor,
-    stripeContent: getComputedStyle(row, '::after').content,
-  }))
-  expect(selectionStyle.background).not.toBe('rgba(0, 0, 0, 0)')
-  expect(selectionStyle.stripeContent).toBe('none')
-  const connectorLayer = await assistant.evaluate((button) => {
-    const icon = button.querySelector<HTMLElement>('.chain-trace-entry-icon')!
-    const treeNode = button.closest('.chain-trace-node')
-    const connector = treeNode?.querySelector<HTMLElement>('.chain-trace-connector-elbow')
-    if (!connector) throw new Error('Selected node connector is unavailable')
-    const iconRect = icon.getBoundingClientRect()
-    const connectorRect = connector.getBoundingClientRect()
-    return {
-      iconLayer: Number(getComputedStyle(icon).zIndex),
-      connectorLayer: Number(getComputedStyle(connector).zIndex),
-      connectorRight: connectorRect.right,
-      iconLeft: iconRect.left,
-      iconRight: iconRect.right,
-    }
-  })
-  expect(connectorLayer.iconLayer).toBeGreaterThan(connectorLayer.connectorLayer)
-  expect(connectorLayer.connectorRight).toBeGreaterThan(connectorLayer.iconLeft)
-  expect(connectorLayer.connectorRight).toBeLessThan(connectorLayer.iconRight)
-
-  const details = page.getByRole('complementary', { name: '链路详情' })
-  await page.getByRole('button', { name: '技术，deepseek-v4-pro，查看详情' }).click()
+  await traceRow(page, 'model-current').click()
   await details.getByRole('tab', { name: '响应' }).click()
-  await expect(details.getByText('链路完成')).toBeVisible()
-  await expect(details.locator('.markdown-content--compact')).toHaveCSS('font-size', '13px')
-  await expect(details.locator('.markdown-content--compact')).toHaveCSS('line-height', '20px')
+  await expect(details.getByText('准备委派任务')).toBeVisible()
   await expect(details.getByText(/"name": "web_search"/)).toBeVisible()
   await expect(details.getByText(/"finish_reason": "tool_calls"/)).toBeVisible()
-  if (process.env.TINKERFIN_VISUAL_QA_DIR) {
-    await page.screenshot({
-      path: resolve(process.env.TINKERFIN_VISUAL_QA_DIR, 'prototype-aligned-response-light-1440.png'),
-      fullPage: true,
-    })
-  }
   await details.getByRole('tab', { name: '用量' }).click()
-  await expect(details.getByRole('heading', { name: 'Token 用量' })).toBeVisible()
-  await expect(details.getByText('输入 Tokens')).toBeVisible()
   await expect(details.getByText('4,872')).toBeVisible()
-  await expect(details.getByText('缓存读取 Tokens')).toBeVisible()
   await expect(details.getByText('4,736')).toBeVisible()
-  await expect(details.getByText('推理 Tokens')).toBeVisible()
   await expect(details.getByText('123')).toBeVisible()
-  await expect(details.getByText(/input_token_details|cache_read/)).toHaveCount(0)
-  if (process.env.TINKERFIN_VISUAL_QA_DIR) {
-    await page.screenshot({
-      path: resolve(process.env.TINKERFIN_VISUAL_QA_DIR, 'prototype-aligned-usage-light-1440.png'),
-      fullPage: true,
-    })
-  }
   await details.getByRole('tab', { name: '系统提示词' }).click()
   await expect(details.getByRole('heading', { name: '浏览器系统提示词' })).toBeVisible()
-  expect(pageErrors).toEqual([])
-})
 
-test('搜索只在防抖完成后替换一次 SSE，视图切换不重连', async ({ page }) => {
-  await page.setViewportSize({ width: 1440, height: 800 })
-  const pageErrors = await mockChainTraceStudio(page)
-  await page.getByRole('tab', { name: '链路' }).click()
-  await expect.poll(async () => (await followUrls(page)).length).toBe(1)
+  await expect(traceRow(page, 'skill-read')).toContainText('read_file')
+  await expect(traceRow(page, 'skill-read')).toContainText('SKILL.md')
+  await expect(page.getByText('Skill', { exact: true })).toHaveCount(0)
+  await expect(page.locator('.chain-trace-detail-resizer')).toHaveCount(0)
 
-  await page.getByRole('button', { name: '搜索链路节点' }).click()
-  const search = page.getByRole('searchbox', { name: '搜索链路节点' })
-  await search.pressSequentially('model', { delay: 20 })
-  await page.waitForTimeout(180)
-  expect((await followUrls(page)).length).toBe(1)
-  await expect.poll(async () => (await followUrls(page)).length).toBe(2)
-  const latest = new URL((await followUrls(page)).at(-1)!, 'http://127.0.0.1')
-  expect(latest.searchParams.get('query')).toBe('model')
-
-  await page.getByRole('tab', { name: '树形' }).click()
-  await page.getByRole('tab', { name: '时间线' }).click()
-  expect((await followUrls(page)).length).toBe(2)
-  expect(pageErrors).toEqual([])
-})
-
-test('四类筛选直接查询对应底层节点而不在前端全量过滤', async ({ page }) => {
-  await page.setViewportSize({ width: 1440, height: 800 })
-  const pageErrors = await mockChainTraceStudio(page)
-  await page.getByRole('tab', { name: '链路' }).click()
-  await expect.poll(async () => (await followUrls(page)).length).toBe(1)
-
-  const initialQuery = new URL((await followUrls(page))[0]!, 'http://127.0.0.1')
-  expect(initialQuery.searchParams.getAll('kind')).toEqual([
-    'human_message',
-    'interaction',
-    'assistant_message',
-    'subagent',
-    'tool',
-    'skill',
-    'memory',
-    'guardrail',
-    'retrieval',
-    'custom',
-    'plan',
-  ])
-  const categoryFilters = page.getByRole('group', { name: '节点类型' })
-  await categoryFilters.getByRole('button', { name: '用户', exact: true }).click()
-  await expect.poll(async () => (await followUrls(page)).length).toBe(2)
-  await categoryFilters.getByRole('button', { name: '工具', exact: true }).click()
-  await expect.poll(async () => (await followUrls(page)).length).toBe(3)
-  await categoryFilters.getByRole('button', { name: '上下文', exact: true }).click()
-  await expect.poll(async () => (await followUrls(page)).length).toBe(4)
-  const assistantQuery = new URL((await followUrls(page)).at(-1)!, 'http://127.0.0.1')
-  expect(assistantQuery.searchParams.getAll('kind')).toEqual([
-    'assistant_message',
-    'subagent',
-  ])
-  expect(assistantQuery.searchParams.has('status')).toBe(false)
-
-  await categoryFilters.getByRole('button', { name: '上下文', exact: true }).click()
-  await expect.poll(async () => (await followUrls(page)).length).toBe(5)
-  await categoryFilters.getByRole('button', { name: '助手', exact: true }).click()
-  await expect.poll(async () => (await followUrls(page)).length).toBe(6)
-  const contextQuery = new URL((await followUrls(page)).at(-1)!, 'http://127.0.0.1')
-  expect(contextQuery.searchParams.getAll('kind')).toEqual([
-    'skill',
-    'memory',
-    'guardrail',
-    'retrieval',
-    'custom',
-    'plan',
-  ])
-  await expect(categoryFilters.getByRole('button', { name: '上下文', exact: true })).toBeDisabled()
-  await expect(page.getByText('没有匹配的链路节点')).toBeVisible()
-  await expect(page.getByLabel('链路筛选')).toBeVisible()
-  expect(pageErrors).toEqual([])
-})
-
-test('英文单轮文案正确且省略详情不会被展示为完整响应', async ({ page }) => {
-  await page.setViewportSize({ width: 1440, height: 900 })
-  const oneTurnPage: TraceGraphPage = {
-    ...tracePage(semanticNodes.slice(2)),
-    turns: [{
-      id: 'turn-browser-2',
-      ordinal: 2,
-      rootNodeId: 'human-current',
-      startedAt: '2026-09-01T00:01:00.000Z',
-    }],
-    rootNodeIds: ['human-current'],
-    completeness: {
-      ...tracePage(semanticNodes).completeness,
-      detailsOmitted: true,
-    },
-  }
-  const omittedResponsePage: TraceGraphPage = {
-    ...tracePage(semanticNodes.slice(5)),
-    completeness: {
-      ...tracePage(semanticNodes).completeness,
-      detailsOmitted: true,
-    },
-  }
-  const pageErrors = await mockChainTraceStudio(
-    page,
-    'light',
-    oneTurnPage,
-    omittedResponsePage,
-    'en',
-    oneTurnPage,
-  )
-
-  await page.getByRole('tab', { name: 'Trace' }).click()
-  await expect(page.locator('.chain-trace-range-summary')).toContainText('1 turn')
-  await page.getByRole('button', { name: 'Technical' }).click()
-  await page.getByRole('button', {
-    name: 'Technical，deepseek-v4-pro，View details',
-  }).click()
-  const details = page.getByRole('complementary', { name: 'Trace details' })
-  await details.getByRole('tab', { name: 'Response' }).click()
-  await expect(details.getByRole('alert')).toContainText('Failed to load the complete response')
-  await expect(details.getByRole('button', { name: 'Retry' })).toBeVisible()
-  await expect(details.getByText('链路完成')).toHaveCount(0)
-  if (process.env.TINKERFIN_VISUAL_QA_DIR) {
-    await page.screenshot({
-      path: resolve(
-        process.env.TINKERFIN_VISUAL_QA_DIR,
-        'omitted-response-fail-closed-en-1440.png',
+  const geometry = await page.locator('.workspace-main').evaluate((workspace) => {
+    const header = workspace.querySelector<HTMLElement>('.chat-header')!
+    const toolbar = workspace.querySelector<HTMLElement>('.chain-trace-toolbar')!
+    const summary = workspace.querySelector<HTMLElement>('.chain-trace-range-summary')!
+    const search = workspace.querySelector<HTMLElement>('.chain-trace-search-control')!
+    const ledgerHeader = workspace.querySelector<HTMLElement>('.chain-trace-ledger-header')!
+    const rootRow = workspace.querySelector<HTMLElement>(
+      '[data-trace-node-id="human-current"]',
+    )!
+    const rail = rootRow.querySelector<HTMLElement>('.chain-trace-ledger-rail')!
+    const typePill = rootRow.querySelector<HTMLElement>('.chain-trace-type-pill')!
+    const main = rootRow.querySelector<HTMLElement>('.chain-trace-ledger-main')!
+    const duration = rootRow.querySelector<HTMLElement>('.chain-trace-duration')!
+    const drawerHeader = workspace.querySelector<HTMLElement>('.chain-trace-details-header')!
+    const drawerTitle = drawerHeader.querySelector<HTMLElement>('.chain-trace-details-context')!
+    const close = drawerHeader.querySelector<HTMLElement>('.ui-icon-button')!
+    const searchIcon = search.querySelector<SVGElement>('.ui-icon-button__icon svg')!
+    const closeIcon = close.querySelector<SVGElement>('.ui-icon-button__icon svg')!
+    const rootRect = rootRow.getBoundingClientRect()
+    const railRect = rail.getBoundingClientRect()
+    const typePillRect = typePill.getBoundingClientRect()
+    const typeHeaderRect = ledgerHeader.children[1]!.getBoundingClientRect()
+    const mainRect = main.getBoundingClientRect()
+    const subagentRow = workspace.querySelector<HTMLElement>(
+      '[data-trace-node-id="subagent-outer"]',
+    )!
+    const subagentTitleRect = subagentRow.querySelector<HTMLElement>(
+      '.chain-trace-node-title strong',
+    )!.getBoundingClientRect()
+    const subagentPreviewRect = subagentRow.querySelector<HTMLElement>(
+      '.chain-trace-node-content',
+    )!.getBoundingClientRect()
+    const titleRect = drawerTitle.getBoundingClientRect()
+    const closeRect = close.getBoundingClientRect()
+    return {
+      headerHeight: header.getBoundingClientRect().height,
+      headerBorderTop: getComputedStyle(header).borderTopWidth,
+      headerBorderBottom: getComputedStyle(header).borderBottomWidth,
+      toolbarPadding: getComputedStyle(toolbar).paddingLeft,
+      ledgerPadding: getComputedStyle(ledgerHeader).paddingLeft,
+      summaryInset: summary.getBoundingClientRect().left
+        - toolbar.getBoundingClientRect().left,
+      searchInset: toolbar.getBoundingClientRect().right
+        - search.getBoundingClientRect().right,
+      rootInset: rail.getBoundingClientRect().left - rootRect.left,
+      rootHeight: rootRect.height,
+      railToTypeGap: typePillRect.left - (
+        railRect.left + Number.parseFloat(getComputedStyle(rail, '::after').width)
       ),
-      fullPage: true,
-    })
-  }
+      typeToContentGap: mainRect.left - typePillRect.right,
+      titlePreviewAlignment: Math.abs(
+        subagentTitleRect.top + subagentTitleRect.height / 2
+          - (subagentPreviewRect.top + subagentPreviewRect.height / 2),
+      ),
+      typeWidths: [...workspace.querySelectorAll<HTMLElement>('.chain-trace-type-pill')]
+        .map((element) => element.getBoundingClientRect().width),
+      typeHeaderAlignment: Math.abs(
+        typeHeaderRect.left + typeHeaderRect.width / 2
+          - (typePillRect.left + typePillRect.width / 2),
+      ),
+      toolOnlyColor: getComputedStyle(
+        workspace.querySelector<HTMLElement>(
+          '[data-trace-node-id="subagent-assistant"] .chain-trace-node-content',
+        )!,
+      ).color,
+      previewColor: getComputedStyle(
+        workspace.querySelector<HTMLElement>(
+          '[data-trace-node-id="subagent-outer"] .chain-trace-node-content',
+        )!,
+      ).color,
+      durationInset: rootRect.right - duration.getBoundingClientRect().right,
+      drawerWidth: workspace.querySelector<HTMLElement>('.chain-trace-details')!
+        .getBoundingClientRect().width,
+      drawerHeaderHeight: drawerHeader.getBoundingClientRect().height,
+      drawerAlignment: Math.abs(
+        titleRect.top + titleRect.height / 2 - (closeRect.top + closeRect.height / 2),
+      ),
+      actionAlignment: Math.abs(
+        search.getBoundingClientRect().left + search.getBoundingClientRect().width / 2
+          - (closeRect.left + closeRect.width / 2),
+      ),
+      actionIconLeftAlignment: Math.abs(
+        searchIcon.getBoundingClientRect().left - closeIcon.getBoundingClientRect().left,
+      ),
+      actionIconRightAlignment: Math.abs(
+        searchIcon.getBoundingClientRect().right - closeIcon.getBoundingClientRect().right,
+      ),
+      selectedBackground: getComputedStyle(
+        workspace.querySelector<HTMLElement>(
+          '[data-trace-node-id="model-current"]',
+        )!,
+      ).backgroundColor,
+    }
+  })
+  expect(geometry).toMatchObject({
+    headerHeight: 64,
+    headerBorderTop: '0px',
+    headerBorderBottom: '0px',
+    toolbarPadding: geometry.ledgerPadding,
+    drawerWidth: 400,
+    drawerHeaderHeight: 64,
+    rootHeight: 40,
+  })
+  expect(Math.abs(geometry.rootInset - geometry.durationInset)).toBeLessThanOrEqual(1)
+  expect(Math.abs(geometry.summaryInset - geometry.searchInset)).toBeLessThanOrEqual(1)
+  expect(geometry.titlePreviewAlignment).toBeLessThanOrEqual(0.5)
+  expect(Math.abs(geometry.railToTypeGap - geometry.typeToContentGap)).toBeLessThanOrEqual(0.5)
+  expect(Math.max(...geometry.typeWidths) - Math.min(...geometry.typeWidths))
+    .toBeLessThanOrEqual(0.5)
+  expect(geometry.typeHeaderAlignment).toBeLessThanOrEqual(0.5)
+  expect(geometry.toolOnlyColor).toBe(geometry.previewColor)
+  expect(geometry.drawerAlignment).toBeLessThanOrEqual(1)
+  expect(geometry.actionAlignment).toBeLessThanOrEqual(1)
+  expect(geometry.actionIconLeftAlignment).toBeLessThanOrEqual(0.5)
+  expect(geometry.actionIconRightAlignment).toBeLessThanOrEqual(0.5)
+  expect(geometry.selectedBackground).not.toBe('rgba(0, 0, 0, 0)')
+
+  expect(pageErrors).toEqual([])
+})
+
+test('固定列标题独立于节点滚动并同步横向列位置', async ({ page }) => {
+  await page.setViewportSize({ width: 640, height: 800 })
+  const pageErrors = await mockChainTraceStudio(page)
+  await page.getByRole('tab', { name: '链路' }).click()
+  const ledger = page.getByLabel('链路节点', { exact: true })
+  const headerViewport = page.locator('.chain-trace-ledger-header-viewport')
+  const headerTop = await headerViewport.evaluate((element) => (
+    element.getBoundingClientRect().top
+  ))
+
+  await ledger.evaluate((element) => element.scrollTo({
+    top: 160,
+    left: 80,
+    behavior: 'instant',
+  }))
+  await ledger.hover()
+  await expect.poll(() => headerViewport.evaluate((element) => element.scrollLeft)).toBe(80)
+  const geometry = await page.locator('.chain-trace-ledger-host').evaluate((host) => {
+    const header = host.querySelector<HTMLElement>('.chain-trace-ledger-header-viewport')!
+    const turnHeading = host.querySelector<HTMLElement>('.chain-trace-turn-heading')!
+    const scrollbar = host.querySelector<HTMLElement>(
+      '.chain-trace-ledger-scroll-host > .ui-overlay-scrollbar--vertical',
+    )!
+    const headerRect = header.getBoundingClientRect()
+    const scrollbarRect = scrollbar.getBoundingClientRect()
+    const turnCaps = [...host.querySelectorAll<HTMLElement>('.chain-trace-ledger-turn')]
+      .map((turn) => {
+        const firstRail = turn.querySelector<HTMLElement>(
+          '.chain-trace-ledger-row.is-turn-root-start .chain-trace-ledger-rail',
+        )!
+        const lastRail = turn.querySelector<HTMLElement>(
+          '.chain-trace-ledger-row.is-turn-root-end .chain-trace-ledger-rail',
+        )!
+        return {
+          firstTop: Number.parseFloat(getComputedStyle(firstRail, '::before').top),
+          firstHalf: firstRail.getBoundingClientRect().height / 2,
+          firstElbowTop: Number.parseFloat(getComputedStyle(firstRail, '::after').top),
+          firstElbowHeight: Number.parseFloat(getComputedStyle(firstRail, '::after').height),
+          firstElbowBorderLeft: getComputedStyle(firstRail, '::after').borderLeftWidth,
+          firstElbowRadius: getComputedStyle(firstRail, '::after').borderBottomLeftRadius,
+          lastBottom: Number.parseFloat(getComputedStyle(lastRail, '::before').bottom),
+          lastHalf: lastRail.getBoundingClientRect().height / 2,
+        }
+      })
+    return {
+      headerTop: headerRect.top,
+      turnHeadingPosition: getComputedStyle(turnHeading).position,
+      scrollbarGap: scrollbarRect.top - headerRect.bottom,
+      turnCaps,
+    }
+  })
+  expect(geometry).toMatchObject({
+    headerTop,
+    turnHeadingPosition: 'static',
+    scrollbarGap: 3,
+  })
+  expect(geometry.turnCaps).toHaveLength(2)
+  geometry.turnCaps.forEach((cap) => {
+    expect(Math.abs(cap.firstTop - cap.firstHalf)).toBeLessThanOrEqual(0.5)
+    expect(Math.abs(cap.firstElbowTop - cap.firstHalf)).toBeLessThanOrEqual(0.5)
+    expect(cap.firstElbowHeight).toBeLessThanOrEqual(1)
+    expect(cap.firstElbowBorderLeft).toBe('0px')
+    expect(cap.firstElbowRadius).toBe('0px')
+    expect(Math.abs(cap.lastBottom - cap.lastHalf)).toBeLessThanOrEqual(0.5)
+  })
+  expect(pageErrors).toEqual([])
+})
+
+test('选中节点只展示所属 Turn 且蓝色选区严格对齐节点条', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 800 })
+  const pageErrors = await mockChainTraceStudio(page)
+  await page.getByRole('tab', { name: '链路' }).click()
+  const summary = page.locator('.chain-trace-range-summary')
+  const lastTick = page.locator('.chain-trace-ticks span').last()
+
+  await traceRow(page, 'old-human').click()
+  await expect(summary).not.toContainText('当前范围')
+  await expect(summary).toContainText('第 1 轮')
+  await expect(summary).toContainText('2 节点')
+  await expect(lastTick).toHaveText('280 毫秒')
+  const firstTurnAlignment = await page.evaluate(() => {
+    const bar = document.querySelector<HTMLElement>('.chain-trace-timeline-bar.is-selected')!
+    const selection = document.querySelector<HTMLElement>('.chain-trace-timeline-selection')!
+    const barRect = bar.getBoundingClientRect()
+    const selectionRect = selection.getBoundingClientRect()
+    return {
+      left: Math.abs(barRect.left - selectionRect.left),
+      right: Math.abs(barRect.right - selectionRect.right),
+    }
+  })
+  expect(firstTurnAlignment.left).toBeLessThanOrEqual(0.5)
+  expect(firstTurnAlignment.right).toBeLessThanOrEqual(0.5)
+
+  await traceRow(page, 'human-current').click()
+  await expect(summary).toContainText('第 2 轮')
+  await expect(summary).toContainText('19 节点')
+  await expect(lastTick).toHaveText('1.88 秒')
+  const secondTurnAlignment = await page.evaluate(() => {
+    const bar = document.querySelector<HTMLElement>('.chain-trace-timeline-bar.is-selected')!
+    const selection = document.querySelector<HTMLElement>('.chain-trace-timeline-selection')!
+    const barRect = bar.getBoundingClientRect()
+    const selectionRect = selection.getBoundingClientRect()
+    return {
+      left: Math.abs(barRect.left - selectionRect.left),
+      right: Math.abs(barRect.right - selectionRect.right),
+    }
+  })
+  expect(secondTurnAlignment.left).toBeLessThanOrEqual(0.5)
+  expect(secondTurnAlignment.right).toBeLessThanOrEqual(0.5)
+  expect(pageErrors).toEqual([])
+})
+
+test('搜索只替换一条 SSE，Studio 不再发送节点类型筛选', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 850 })
+  const pageErrors = await mockChainTraceStudio(page)
+  await page.getByRole('tab', { name: '链路' }).click()
+  await expect.poll(async () => (await traceRequests(page)).follow.length).toBe(1)
+  const initial = new URL((await traceRequests(page)).follow[0]!)
+  expect(initial.searchParams.getAll('kind')).toEqual([])
+
+  const searchTrigger = page.getByRole('button', { name: '搜索链路节点' })
+  await expect(searchTrigger).toHaveCount(1)
+  await searchTrigger.click()
+  await expect(searchTrigger).toHaveCount(0)
+  const search = page.getByRole('searchbox', { name: '搜索链路节点' })
+  await expect(search).toBeVisible()
+  await expect(page.getByRole('button', { name: '清除链路搜索' })).toHaveCount(1)
+  await search.pressSequentially('deepseek', { delay: 20 })
+  await page.waitForTimeout(180)
+  expect((await traceRequests(page)).follow).toHaveLength(1)
+  await expect.poll(async () => (await traceRequests(page)).follow.length).toBe(2)
+  expect(new URL((await traceRequests(page)).follow.at(-1)!).searchParams.get('query'))
+    .toBe('deepseek')
+
+  await page.getByRole('button', { name: '清除链路搜索' }).click()
+  await expect(search).toHaveCount(0)
+  await expect(searchTrigger).toHaveCount(1)
+  await expect.poll(async () => (await traceRequests(page)).follow.length).toBe(3)
+  const restored = new URL((await traceRequests(page)).follow.at(-1)!)
+  expect(restored.searchParams.getAll('kind')).toEqual([])
+  expect(restored.searchParams.has('includeTechnicalNodes')).toBe(false)
+  expect(restored.searchParams.has('includeAncestorNodes')).toBe(false)
+  await expect(page.getByRole('group', { name: '节点类型' })).toHaveCount(0)
+  expect(pageErrors).toEqual([])
+})
+
+test('搜索结果中的 Model 详情只补取一次完整响应且不新增 SSE', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 850 })
+  const pageErrors = await mockChainTraceStudio(page)
+  await page.getByRole('tab', { name: '链路' }).click()
+  await page.getByRole('button', { name: '搜索链路节点' }).click()
+  await page.getByRole('searchbox', { name: '搜索链路节点' }).fill('4872')
+  await expect.poll(async () => (await traceRequests(page)).follow.length).toBe(2)
+  const followCount = (await traceRequests(page)).follow.length
+
+  await expect.poll(async () => (await traceRequests(page)).direct.length).toBe(1)
+  const requests = await traceRequests(page)
+  expect(requests.follow).toHaveLength(followCount)
+  const direct = new URL(requests.direct[0]!)
+  expect(direct.searchParams.get('modelCallId')).toBe('model-current')
+  expect(direct.searchParams.getAll('kind')).toEqual([])
+  const details = page.locator('.chain-trace-details')
+  await details.getByRole('tab', { name: '响应' }).click()
+  await expect(details.getByText('准备委派任务')).toBeVisible()
+  await expect(details.getByText(/"name": "researcher"/)).toBeVisible()
+  expect(pageErrors).toEqual([])
+})
+
+test('详情省略时 fail-closed，英文界面不会把空响应展示为成功', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 850 })
+  const pageErrors = await mockChainTraceStudio(page, {
+    language: 'en',
+    directSnapshot: responsePage(true),
+  })
+  await page.getByRole('tab', { name: 'Trace' }).click()
+  await page.getByRole('button', { name: 'Search trace nodes' }).click()
+  await page.getByRole('searchbox', { name: 'Search trace nodes' })
+    .fill('4872')
+  await expect.poll(async () => (await traceRequests(page)).follow.length).toBe(2)
+  const details = page.locator('.chain-trace-details')
+  await details.getByRole('tab', { name: 'Response' }).click()
+  await expect(details.getByRole('alert')).toContainText(
+    'Failed to load the complete response',
+  )
+  await expect(details.getByRole('button', { name: 'Retry' })).toBeVisible()
+  await expect(details.getByText('准备委派任务')).toHaveCount(0)
   expect(pageErrors).toEqual([])
 })
 
@@ -902,89 +946,333 @@ test('链路与对话往返恢复阅读位置和末尾跟随状态', async ({ pa
     const dockRect = dock.getBoundingClientRect()
     return {
       composerHeight: dockRect.height,
-      measuredHeight: Number.parseFloat(getComputedStyle(shell).getPropertyValue('--composer-height')),
+      measuredHeight: Number.parseFloat(
+        getComputedStyle(shell).getPropertyValue('--composer-height'),
+      ),
       reservedHeight: Number.parseFloat(getComputedStyle(list).paddingBottom),
-      contentBottom: Math.max(...content.map((element) => element.getBoundingClientRect().bottom)),
+      contentBottom: Math.max(
+        ...content.map((element) => element.getBoundingClientRect().bottom),
+      ),
       endBottom: end.getBoundingClientRect().bottom,
       composerTop: dockRect.top,
     }
   })
-  expect(Math.abs(bottomLayout.composerHeight - bottomLayout.measuredHeight)).toBeLessThanOrEqual(1)
-  expect(Math.abs(bottomLayout.composerHeight - bottomLayout.reservedHeight)).toBeLessThanOrEqual(1)
+  expect(Math.abs(bottomLayout.composerHeight - bottomLayout.measuredHeight))
+    .toBeLessThanOrEqual(1)
+  expect(Math.abs(bottomLayout.composerHeight - bottomLayout.reservedHeight))
+    .toBeLessThanOrEqual(1)
   expect(bottomLayout.contentBottom).toBeLessThanOrEqual(bottomLayout.composerTop + 1)
   expect(bottomLayout.endBottom).toBeLessThanOrEqual(bottomLayout.composerTop + 1)
   expect(pageErrors).toEqual([])
 })
 
-test('浅色四视口保持统一抽屉边界且不产生页面溢出', async ({ page }) => {
+test('全部模式按执行顺序等宽排列，并以一条竖线分隔每轮', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 })
-  const pageErrors = await mockChainTraceStudio(page, 'light')
+  const pageErrors = await mockChainTraceStudio(page)
   await page.getByRole('tab', { name: '链路' }).click()
 
-  await verifyTraceViewports(page, 'light')
+  const details = page.locator('.chain-trace-details')
+  await expect(details).toBeVisible()
+  await details.getByRole('button', { name: '关闭链路详情' }).click()
 
-  await expect(page.locator('html')).toHaveAttribute('data-theme', 'light')
+  await expect(page.getByRole('region', { name: '执行序列', exact: true })).toBeVisible()
+  const summary = page.locator('.chain-trace-range-summary')
+  await expect(summary).toContainText('共 2 轮')
+  await expect(summary).toContainText(`${nodes.length} 节点`)
+  await expect(page.locator('.chain-trace-ticks')).toHaveCount(0)
+
+  const blocks = page.locator('.chain-trace-sequence-block')
+  await expect(blocks).toHaveCount(nodes.length)
+  const widths = await blocks.evaluateAll((elements) => (
+    elements.map((element) => element.getBoundingClientRect().width)
+  ))
+  expect(Math.max(...widths) - Math.min(...widths)).toBeLessThanOrEqual(0.5)
+  const sequenceEdges = await page.locator('.chain-trace-sequence-grid').evaluate((grid) => {
+    const items = [...grid.querySelectorAll<HTMLElement>('.chain-trace-sequence-block')]
+    const gridRect = grid.getBoundingClientRect()
+    const chartRect = grid.parentElement!.getBoundingClientRect()
+    const itemRects = items.map((item) => item.getBoundingClientRect())
+    const boundaryRect = grid.querySelector<HTMLElement>(
+      '.chain-trace-sequence-turn-boundary',
+    )!.getBoundingClientRect()
+    const previousRect = itemRects
+      .filter((rect) => rect.right <= boundaryRect.left)
+      .reduce((nearest, rect) => rect.right > nearest.right ? rect : nearest)
+    const nextRect = itemRects
+      .filter((rect) => rect.left > boundaryRect.right)
+      .reduce((nearest, rect) => rect.left < nearest.left ? rect : nearest)
+    return {
+      left: Math.min(...itemRects.map((rect) => rect.left)) - chartRect.left,
+      beforeBoundary: boundaryRect.left - previousRect.right,
+      afterBoundary: nextRect.left - boundaryRect.right,
+      gridLeft: Math.abs(Math.min(...itemRects.map((rect) => rect.left)) - gridRect.left),
+      right: chartRect.right - Math.max(...itemRects.map((rect) => rect.right)),
+      gridRight: Math.abs(Math.max(...itemRects.map((rect) => rect.right)) - gridRect.right),
+    }
+  })
+  expect(sequenceEdges.left).toBeCloseTo(1, 1)
+  expect(sequenceEdges.beforeBoundary).toBeCloseTo(1, 1)
+  expect(sequenceEdges.afterBoundary).toBeCloseTo(1, 1)
+  expect(sequenceEdges.right).toBeCloseTo(1, 1)
+  expect(sequenceEdges.gridLeft).toBeLessThanOrEqual(0.5)
+  expect(sequenceEdges.gridRight).toBeLessThanOrEqual(0.5)
+
+  const boundaries = page.locator('.chain-trace-sequence-turn-boundary')
+  await expect(boundaries).toHaveCount(1)
+  const separation = await page.evaluate(() => {
+    const previous = document.querySelector<HTMLElement>(
+      '[data-trace-sequence-node-id="old-assistant"]',
+    )!.getBoundingClientRect()
+    const next = document.querySelector<HTMLElement>(
+      '[data-trace-sequence-node-id="human-current"]',
+    )!.getBoundingClientRect()
+    const boundary = document.querySelector<HTMLElement>(
+      '.chain-trace-sequence-turn-boundary',
+    )!.getBoundingClientRect()
+    const grid = document.querySelector<HTMLElement>(
+      '.chain-trace-sequence-grid',
+    )!.getBoundingClientRect()
+    return {
+      previousRight: previous.right,
+      nextLeft: next.left,
+      boundaryX: boundary.x,
+      boundaryWidth: boundary.width,
+      boundaryTop: boundary.top,
+      boundaryBottom: boundary.bottom,
+      gridTop: grid.top,
+      gridBottom: grid.bottom,
+    }
+  })
+  expect(separation.boundaryX).toBeGreaterThan(separation.previousRight)
+  expect(separation.boundaryX + separation.boundaryWidth)
+    .toBeLessThan(separation.nextLeft)
+  expect(Math.abs(
+    separation.boundaryX + separation.boundaryWidth / 2
+      - (separation.previousRight + separation.nextLeft) / 2,
+  )).toBeLessThanOrEqual(1)
+  expect(Math.abs(separation.boundaryTop - separation.gridTop)).toBeLessThanOrEqual(1)
+  expect(Math.abs(separation.boundaryBottom - separation.gridBottom)).toBeLessThanOrEqual(1)
+
+  await page.locator('[data-trace-sequence-node-id="human-current"]').click()
+  await expect(page.getByRole('region', { name: '调用时间线' })).toBeVisible()
+  await expect(summary).toContainText('第 2 轮')
+  await expect(summary).toContainText(
+    `${nodes.filter((node) => node.turnId === 'turn-browser-2').length} 节点`,
+  )
+  await expect(page.locator('.chain-trace-ticks')).toBeVisible()
   expect(pageErrors).toEqual([])
 })
 
-test('四视口、深色、触控与 reduced-motion 保持可用且不产生页面溢出', async ({ page }) => {
-  await page.setViewportSize({ width: 1440, height: 900 })
-  const pageErrors = await mockChainTraceStudio(page, 'dark')
+test('从链路页选择其他会话始终返回对话页', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 800 })
+  const pageErrors = await mockChainTraceStudio(page)
   await page.getByRole('tab', { name: '链路' }).click()
+  await page.getByText('另一个会话', { exact: true }).click()
+  await expect(page).toHaveURL(new RegExp(`thread=${OTHER_THREAD_ID}`))
+  await expect(page.getByRole('tab', { name: '对话' })).toHaveAttribute(
+    'aria-selected',
+    'true',
+  )
+  await expect(page.getByRole('tabpanel', { name: '链路' })).toHaveCount(0)
+  expect(pageErrors).toEqual([])
+})
 
-  await verifyTraceViewports(page, 'dark')
+async function verifyViewports(
+  page: Page,
+  theme: 'light' | 'dark',
+) {
+  for (const width of [320, 768, 1024, 1440]) {
+    await page.setViewportSize({ width, height: 900 })
+    await expect(page.locator('#chain-trace-panel')).toBeVisible()
+    const details = page.locator('.chain-trace-details')
+    await expect(details).toBeVisible()
+    const box = await details.boundingBox()
+    expect(Math.round(box?.width ?? 0)).toBe(Math.min(width, 400))
+    expect(Math.round((box?.x ?? 0) + (box?.width ?? 0))).toBe(width)
+    const actionAlignment = await page.evaluate(() => {
+      const search = document.querySelector<HTMLElement>('.chain-trace-search-control')!
+        .getBoundingClientRect()
+      const close = document.querySelector<HTMLElement>(
+        '.chain-trace-details-header .ui-icon-button',
+      )!.getBoundingClientRect()
+      const searchIcon = document.querySelector<SVGElement>(
+        '.chain-trace-search-trigger .ui-icon-button__icon svg',
+      )!.getBoundingClientRect()
+      const closeIcon = document.querySelector<SVGElement>(
+        '.chain-trace-details-header .ui-icon-button__icon svg',
+      )!.getBoundingClientRect()
+      return {
+        center: Math.abs(
+          search.left + search.width / 2 - (close.left + close.width / 2),
+        ),
+        left: Math.abs(searchIcon.left - closeIcon.left),
+        right: Math.abs(searchIcon.right - closeIcon.right),
+      }
+    })
+    expect(actionAlignment.center).toBeLessThanOrEqual(1)
+    expect(actionAlignment.left).toBeLessThanOrEqual(0.5)
+    expect(actionAlignment.right).toBeLessThanOrEqual(0.5)
+    const overflow = await page.evaluate(() => (
+      document.documentElement.scrollWidth - window.innerWidth
+    ))
+    expect(overflow).toBeLessThanOrEqual(0)
+    if (width === 320) {
+      await expect(page.getByRole('region', { name: '调用时间线' })).toBeHidden()
+    }
+    if (process.env.TINKERFIN_VISUAL_QA_DIR) {
+      await page.screenshot({
+        path: resolve(
+          process.env.TINKERFIN_VISUAL_QA_DIR,
+          `chain-trace-${theme}-${width}.png`,
+        ),
+        fullPage: true,
+      })
+    }
+  }
+}
+
+test('浅色与深色四视口、overlay 焦点和 reduced-motion 保持可用', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 })
+  const pageErrors = await mockChainTraceStudio(page, { theme: 'dark' })
+  await page.getByRole('tab', { name: '链路' }).click()
+  await verifyViewports(page, 'dark')
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark')
 
   await page.setViewportSize({ width: 768, height: 900 })
-  const details = page.getByRole('complementary', { name: '链路详情' })
-  await expect(details).toHaveCSS('position', 'fixed')
+  const dialog = page.getByRole('dialog', { name: '链路详情' })
+  await expect(dialog).toBeVisible()
+  const close = dialog.getByRole('button', { name: '关闭链路详情' })
+  await expect(close).toBeFocused()
+  const overlayGeometry = await dialog.evaluate((element) => {
+    const header = element.querySelector<HTMLElement>('.chain-trace-details-header')!
+    const tabs = element.querySelector<HTMLElement>('.chain-trace-detail-tabs')!
+    const style = getComputedStyle(element)
+    return {
+      margin: style.margin,
+      padding: style.padding,
+      maxWidth: style.maxWidth,
+      maxHeight: style.maxHeight,
+      gridTemplateRows: style.gridTemplateRows,
+      headerTabGap: tabs.getBoundingClientRect().top
+        - header.getBoundingClientRect().bottom,
+    }
+  })
+  expect(overlayGeometry).toMatchObject({
+    margin: '0px',
+    padding: '0px',
+    maxWidth: 'none',
+    maxHeight: 'none',
+  })
+  expect(overlayGeometry.gridTemplateRows).toMatch(/^64px 44px /)
+  expect(Math.abs(overlayGeometry.headerTabGap)).toBeLessThanOrEqual(1)
   await expect(page.locator('.chain-trace-toolbar-host')).toHaveAttribute('inert', '')
+  await expect(page.locator('#root')).toHaveAttribute('aria-hidden', 'true')
+  await page.keyboard.press('Shift+Tab')
+  await expect(dialog.locator(':focus')).toHaveCount(1)
   await page.keyboard.press('Escape')
-  await expect(details).toBeHidden()
+  await expect(dialog).toBeHidden()
+  await expect(traceRow(page, 'failed-tool')).toBeFocused()
 
   await page.emulateMedia({ reducedMotion: 'reduce' })
   await page.evaluate(() => {
-    const traceWindow = window as typeof window & { __traceScrollBehaviors: ScrollBehavior[] }
+    const traceWindow = window as typeof window & {
+      __traceScrollBehaviors: ScrollBehavior[]
+    }
     traceWindow.__traceScrollBehaviors = []
     const original = Element.prototype.scrollIntoView
-    Element.prototype.scrollIntoView = function scrollIntoView(options?: boolean | ScrollIntoViewOptions) {
+    Element.prototype.scrollIntoView = function scrollIntoView(
+      options?: boolean | ScrollIntoViewOptions,
+    ) {
       if (typeof options === 'object' && options.behavior) {
         traceWindow.__traceScrollBehaviors.push(options.behavior)
       }
       original.call(this, options)
     }
   })
-  await page.locator('.chain-trace-timeline-bar').first().click()
+  await page.locator('.chain-trace-sequence-block').first().click()
   await expect.poll(() => page.evaluate(() => (
     (window as typeof window & { __traceScrollBehaviors: ScrollBehavior[] })
       .__traceScrollBehaviors.at(-1)
   ))).toBe('auto')
   await page.keyboard.press('Escape')
+
   const cdp = await page.context().newCDPSession(page)
-  await cdp.send('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 1 })
+  await cdp.send('Emulation.setTouchEmulationEnabled', {
+    enabled: true,
+    maxTouchPoints: 1,
+  })
   await page.setViewportSize({ width: 320, height: 800 })
-  await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark')
-  await expect(page.getByRole('region', { name: '调用时间线' })).toBeHidden()
-  const categoryTarget = await page.getByRole('group', { name: '节点类型' })
-    .getByRole('button', { name: '用户', exact: true })
+  await traceRow(page, 'failed-tool').click()
+  const mobileDialog = page.getByRole('dialog', { name: '链路详情' })
+  const closeTarget = await mobileDialog
+    .getByRole('button', { name: '关闭链路详情' })
     .boundingBox()
-  expect(categoryTarget?.width).toBeGreaterThanOrEqual(44)
-  expect(categoryTarget?.height).toBeGreaterThanOrEqual(44)
-  await page.getByRole('tab', { name: '树形' }).click()
-  const toggle = page.getByRole('button', { name: '收起 用户，继续核验真实调用树' })
-  const touchTarget = await toggle.boundingBox()
-  expect(touchTarget?.width).toBeGreaterThanOrEqual(44)
-  expect(touchTarget?.height).toBeGreaterThanOrEqual(44)
-  await expect(toggle.locator('svg')).toHaveCSS('transition-duration', '0s')
-  await page.getByRole('button', {
-    name: '助手，链路完成，查看详情',
-  }).first().click()
-  const closeTarget = await page.getByRole('button', { name: '关闭链路详情' }).boundingBox()
   expect(closeTarget?.width).toBeGreaterThanOrEqual(44)
   expect(closeTarget?.height).toBeGreaterThanOrEqual(44)
-  const detailTabTarget = await page.getByRole('tab', { name: '概述' }).boundingBox()
-  expect(detailTabTarget?.width).toBeGreaterThanOrEqual(44)
-  expect(detailTabTarget?.height).toBeGreaterThanOrEqual(44)
-  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)
-  expect(overflow).toBeLessThanOrEqual(0)
+  await page.keyboard.press('Escape')
+  const searchTarget = await page.getByRole('button', { name: '搜索链路节点' })
+    .boundingBox()
+  expect(searchTarget?.width).toBeGreaterThanOrEqual(44)
+  expect(searchTarget?.height).toBeGreaterThanOrEqual(44)
+  const rowTarget = await traceRow(page, 'failed-tool').boundingBox()
+  expect(rowTarget?.height).toBeGreaterThanOrEqual(44)
+  expect(pageErrors).toEqual([])
+})
+
+test('浅色四视口不产生页面溢出', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 })
+  const pageErrors = await mockChainTraceStudio(page, { theme: 'light' })
+  await page.getByRole('tab', { name: '链路' }).click()
+  await verifyViewports(page, 'light')
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'light')
+  expect(pageErrors).toEqual([])
+})
+
+test('窄屏首次进入滚到底，触控搜索与详情关闭图标同轴', async ({ page }) => {
+  await page.setViewportSize({ width: 768, height: 900 })
+  const cdp = await page.context().newCDPSession(page)
+  await cdp.send('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 1 })
+  const pageErrors = await mockChainTraceStudio(page)
+  await page.getByRole('tab', { name: '链路' }).click()
+  const ledger = page.getByLabel('链路节点', { exact: true })
+  await expect(ledger).toBeVisible()
+  await expect.poll(() => ledger.evaluate((element) => (
+    Math.abs(element.scrollHeight - element.clientHeight - element.scrollTop)
+  ))).toBeLessThanOrEqual(1)
+  await expect(page.getByRole('dialog', { name: '链路详情' })).toHaveCount(0)
+
+  for (const width of [320, 768, 1024, 1440]) {
+    await page.setViewportSize({ width, height: 900 })
+    await traceRow(page, 'failed-tool').click()
+    const geometry = await page.evaluate(() => {
+      const search = document.querySelector<SVGElement>(
+        '.chain-trace-search-trigger .ui-icon-button__icon svg',
+      )!.getBoundingClientRect()
+      const close = document.querySelector<SVGElement>(
+        '.chain-trace-details-header .ui-icon-button__icon svg',
+      )!.getBoundingClientRect()
+      return { left: Math.abs(search.left - close.left), right: Math.abs(search.right - close.right) }
+    })
+    expect(geometry.left).toBeLessThanOrEqual(0.5)
+    expect(geometry.right).toBeLessThanOrEqual(0.5)
+    await page.keyboard.press('Escape')
+  }
+  expect(pageErrors).toEqual([])
+})
+
+test('序列选择收起的子节点会展开所属作用域并在关闭详情后恢复焦点', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 })
+  const pageErrors = await mockChainTraceStudio(page)
+  await page.getByRole('tab', { name: '链路' }).click()
+  await page.getByRole('button', { name: '关闭链路详情' }).click()
+  const outer = traceRow(page, 'subagent-outer').locator('..')
+    .getByRole('button', { name: /^收起子智能体/ })
+  await outer.click()
+  await expect(traceRow(page, 'inner-assistant')).toBeHidden()
+  await page.getByRole('region', { name: '执行序列' })
+    .getByRole('button', { name: /选择 助手，嵌套核验完成/ }).click()
+  await expect(traceRow(page, 'inner-assistant')).toBeVisible()
+  await page.getByRole('button', { name: '关闭链路详情' }).click()
+  await expect(traceRow(page, 'inner-assistant')).toBeFocused()
   expect(pageErrors).toEqual([])
 })

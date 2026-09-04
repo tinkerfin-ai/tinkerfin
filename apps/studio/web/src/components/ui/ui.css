@@ -691,21 +691,15 @@
 
   .ui-feedback-state {
     display: grid;
-    grid-template-columns: var(--control-xs) minmax(0, 1fr) var(--control-lg);
+    grid-template-columns: var(--control-lg) minmax(0, 1fr) var(--control-lg);
     width: min(calc(100vw - var(--space-6)), var(--layout-feedback-card));
     min-height: var(--control-xl);
     align-self: center;
     align-items: center;
     justify-self: center;
-    gap: var(--space-3);
-    padding: 0 var(--space-2) 0 calc(var(--space-2) + var(--space-0-5));
+    gap: var(--space-2);
+    padding: 0 var(--space-2);
     color: var(--color-text-primary);
-  }
-
-  .ui-feedback-state.is-title-only {
-    grid-template-columns: var(--control-xs) minmax(0, auto);
-    justify-content: center;
-    padding-right: calc(var(--space-2) + var(--space-0-5));
   }
 
   .ui-feedback-state.is-compact { margin: var(--space-4); }
@@ -715,9 +709,15 @@
     font-size: var(--type-ui-size);
     font-weight: var(--weight-semibold);
     line-height: var(--type-ui-line);
+    text-align: center;
   }
 
-  .ui-feedback-state > .ui-icon-button-wrap { justify-self: end; }
+  .ui-feedback-state > .ui-feedback-icon,
+  .toast-card > .ui-feedback-icon { justify-self: center; }
+  .ui-feedback-state > .ui-icon-button-wrap {
+    justify-self: end;
+    translate: calc(var(--space-2) - 1px) 0;
+  }
   .ui-feedback-state__retry,
   .ui-feedback-state__retry:hover:not(:disabled),
   .ui-feedback-state__retry:active:not(:disabled),
@@ -1201,13 +1201,13 @@
 
   .toast-card {
     display: grid;
-    grid-template-columns: var(--control-xs) minmax(0, 1fr) var(--control-lg);
+    grid-template-columns: var(--control-lg) minmax(0, 1fr) var(--control-lg);
     align-items: center;
     gap: var(--space-2);
     width: 100%;
     max-width: 100%;
     min-height: var(--control-xl);
-    padding: 0 var(--space-2) 0 calc(var(--space-2) + var(--space-0-5));
+    padding: 0 var(--space-2);
     border: 1px solid var(--color-border);
     border-radius: var(--radius-lg);
     background: var(--color-layer-1);
@@ -1222,6 +1222,7 @@
     overflow-wrap: anywhere;
     font-size: var(--type-meta-size);
     line-height: var(--type-meta-line);
+    text-align: center;
   }
 
   .toast-card > button {
@@ -1236,6 +1237,7 @@
     background: transparent;
     color: var(--color-text-tertiary);
     cursor: pointer;
+    translate: var(--space-2) 0;
   }
 
   .toast-card > button:hover { background: var(--color-hover); color: var(--color-text-primary); }

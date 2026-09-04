@@ -184,12 +184,6 @@ const spacingAuditMessages: Message[] = [
     createdAt: BASE_TIME,
   },
   {
-    id: 'spacing-error',
-    role: 'error',
-    content: '错误反馈',
-    createdAt: BASE_TIME,
-  },
-  {
     id: 'spacing-user-d',
     role: 'user',
     content: '气泡 D',
@@ -608,10 +602,13 @@ async function mockStudio(page: Page, {
         .filter((message) => message.role === 'subagent' && message.meta?.subRunId)
         .map((message) => [message.meta?.subRunId as string, message.id]),
     )
-    const batchIds = new Set(
+    const subagentNamespacesByRunId = new Map<string, string[]>(
       historyMessages
-        .filter((message) => message.role === 'tool' && message.meta?.batchId)
-        .map((message) => message.meta?.batchId as string),
+        .filter((message) => message.role === 'subagent' && message.meta?.subRunId)
+        .map((message) => [
+          message.meta?.subRunId as string,
+          [`tools:${message.meta?.subRunId as string}`],
+        ] as [string, string[]]),
     )
     const graphNodes = historyMessages.flatMap((message, index) => {
       if (
@@ -638,21 +635,28 @@ async function mockStudio(page: Page, {
       const result = message.meta?.result
       return [traceGraphNode({
         id: message.id,
-        parentId: message.role === 'tool'
+        parentSubagentId: message.role === 'tool'
           ? subagentNodeIdsByRunId.get(message.meta?.runId ?? '')
-            ?? message.meta?.batchId
             ?? null
+          : null,
+        modelCallId: message.role === 'tool'
+          ? message.meta?.batchId ?? null
           : null,
         kind: message.role === 'tool'
           ? 'tool'
           : message.role === 'subagent'
             ? 'subagent'
             : message.role === 'error'
-              ? 'run'
+              ? 'custom'
               : 'plan',
         status,
         name: message.meta?.toolName ?? message.meta?.agentName ?? message.content,
         runId: message.meta?.runId ?? 'browser-run',
+        namespace: message.role === 'subagent'
+          ? subagentNamespacesByRunId.get(message.meta?.subRunId ?? '') ?? []
+          : message.role === 'tool'
+            ? subagentNamespacesByRunId.get(message.meta?.runId ?? '') ?? []
+            : [],
         sourceId: message.role === 'tool'
           ? message.meta?.toolCallId ?? message.id
           : message.role === 'subagent'
@@ -661,7 +665,7 @@ async function mockStudio(page: Page, {
         startedAt: message.createdAt,
         startedSeq: (index * 2) + 1,
         updatedSeq: (index * 2) + 1,
-        completedAt: status === 'running'
+        completedAt: status === 'running' || status === 'waiting'
           ? null
           : message.meta?.completedAt ?? message.createdAt,
         request: request ?? null,
@@ -673,21 +677,8 @@ async function mockStudio(page: Page, {
           : null,
       })]
     })
-    const batchParentNodes = [...batchIds].map((batchId) => {
-      const firstChild = graphNodes.find((node) => node.parentId === batchId)
-      return traceGraphNode({
-        id: batchId,
-        kind: 'model',
-        status: firstChild?.status ?? 'succeeded',
-        name: 'Tool batch',
-        runId: firstChild?.runId ?? 'browser-run',
-        startedAt: firstChild?.startedAt ?? BASE_TIME,
-        startedSeq: Math.max(1, (firstChild?.startedSeq ?? 2) - 1),
-        updatedSeq: firstChild?.updatedSeq ?? 1,
-      })
-    })
     const traceAsOfSeq = Math.max(1, (historyMessages.length * 2) + 1)
-    const graph = traceGraphWithNodes([...batchParentNodes, ...graphNodes], traceAsOfSeq)
+    const graph = traceGraphWithNodes(graphNodes, traceAsOfSeq)
     const interactions = approval
       ? [{
           id: 'interaction-browser-approval',
@@ -1135,6 +1126,7 @@ test('全局 Toast 与可恢复错误严格等宽并统一错误标记和图标�
   await page.getByRole('button', { name: '置顶', exact: true }).click()
   const toast = page.locator('.toast-card').filter({ hasText: '置顶状态更新失败，请重试' })
   await expect(toast).toBeVisible()
+  await expect(toast).toHaveCSS('transform', 'none')
   await toast.hover()
   await page.getByRole('tab', { name: '链路' }).click()
 
@@ -1145,6 +1137,12 @@ test('全局 Toast 与可恢复错误严格等宽并统一错误标记和图标�
     const toastCard = document.querySelector<HTMLElement>('.toast-card')!
     const feedbackState = document.querySelector<HTMLElement>('.ui-feedback-state[role="alert"]')!
     const retryButton = feedbackState.querySelector<HTMLElement>('button[aria-label="重试"]')!
+    const toastText = toastCard.querySelector<HTMLElement>('p')!
+    const feedbackTitle = feedbackState.querySelector<HTMLElement>('.ui-feedback-state__title')!
+    const toastIcon = toastCard.querySelector<HTMLElement>('.ui-feedback-icon')!
+    const toastCloseIcon = toastCard.querySelector<SVGElement>('button svg')!
+    const feedbackIcon = feedbackState.querySelector<HTMLElement>('.ui-feedback-icon')!
+    const feedbackRetryIcon = feedbackState.querySelector<SVGElement>('button svg')!
     const toastMark = toastCard.querySelector<HTMLElement>('.ui-feedback-icon__mark')!
     const feedbackMark = feedbackState.querySelector<HTMLElement>('.ui-feedback-icon__mark')!
     const retryStyle = getComputedStyle(retryButton)
@@ -1162,6 +1160,24 @@ test('全局 Toast 与可恢复错误严格等宽并统一错误标记和图标�
       feedbackMark: feedbackMark.textContent,
       toastCircle: Boolean(toastCard.querySelector('.ui-feedback-icon circle')),
       feedbackCircle: Boolean(feedbackState.querySelector('.ui-feedback-icon circle')),
+      toastTextCenterOffset: Math.abs(
+        toastText.getBoundingClientRect().x
+          + toastText.getBoundingClientRect().width / 2
+          - (toastCard.getBoundingClientRect().x + toastCard.getBoundingClientRect().width / 2),
+      ),
+      feedbackTitleCenterOffset: Math.abs(
+        feedbackTitle.getBoundingClientRect().x
+          + feedbackTitle.getBoundingClientRect().width / 2
+          - (feedbackState.getBoundingClientRect().x + feedbackState.getBoundingClientRect().width / 2),
+      ),
+      toastLeftVisualInset: toastIcon.getBoundingClientRect().x
+        - toastCard.getBoundingClientRect().x,
+      toastRightVisualInset: toastCard.getBoundingClientRect().right
+        - toastCloseIcon.getBoundingClientRect().right,
+      feedbackLeftVisualInset: feedbackIcon.getBoundingClientRect().x
+        - feedbackState.getBoundingClientRect().x,
+      feedbackRightVisualInset: feedbackState.getBoundingClientRect().right
+        - feedbackRetryIcon.getBoundingClientRect().right,
     }
   })
   expect(geometry).toEqual({
@@ -1178,6 +1194,12 @@ test('全局 Toast 与可恢复错误严格等宽并统一错误标记和图标�
     feedbackMark: '!',
     toastCircle: false,
     feedbackCircle: false,
+    toastTextCenterOffset: 0,
+    feedbackTitleCenterOffset: 0,
+    toastLeftVisualInset: 15,
+    toastRightVisualInset: 15,
+    feedbackLeftVisualInset: 15,
+    feedbackRightVisualInset: 15,
   })
   await expect(retry.locator('.ui-button__label')).toHaveCount(0)
   await toast.getByRole('button').focus()
@@ -1266,6 +1288,11 @@ test('macOS Composer 支持 Control+U 且不接管 Command+U', async ({ page }) 
 test('Composer 在已有文本前插入 Slash 时保持光标并安全取消建议', async ({ page }) => {
   await mockStudio(page, { emptyHistory: true })
   const input = page.getByRole('textbox', { name: '消息输入' })
+  const expectCaret = async (position: number) => {
+    await expect.poll(() => input.evaluate((element) => (
+      element as HTMLTextAreaElement
+    ).selectionStart)).toBe(position)
+  }
   await input.fill('已有内容')
   await input.evaluate((element) => {
     const textarea = element as HTMLTextAreaElement
@@ -1274,20 +1301,20 @@ test('Composer 在已有文本前插入 Slash 时保持光标并安全取消建�
 
   await input.press('/')
   await expect(input).toHaveValue('/已有内容')
-  expect(await input.evaluate((element) => (element as HTMLTextAreaElement).selectionStart)).toBe(1)
+  await expectCaret(1)
   await expect(page.getByRole('listbox', { name: '命令和技能建议' })).toBeVisible()
 
   await input.press('x')
   await expect(input).toHaveValue('/已有内容')
-  expect(await input.evaluate((element) => (element as HTMLTextAreaElement).selectionStart)).toBe(1)
+  await expectCaret(1)
 
   await input.press('Escape')
   await expect(input).toHaveValue('已有内容')
-  expect(await input.evaluate((element) => (element as HTMLTextAreaElement).selectionStart)).toBe(0)
+  await expectCaret(0)
 
   await input.press('a')
   await expect(input).toHaveValue('a已有内容')
-  expect(await input.evaluate((element) => (element as HTMLTextAreaElement).selectionStart)).toBe(1)
+  await expectCaret(1)
 
   await input.fill('已有内容')
   await input.evaluate((element) => {
@@ -1300,7 +1327,7 @@ test('Composer 在已有文本前插入 Slash 时保持光标并安全取消建�
   await expect(page.getByRole('listbox', { name: '命令和技能建议' })).toHaveCount(0)
   await expect(input).toHaveValue('已有内容')
   await expect(input).toBeFocused()
-  expect(await input.evaluate((element) => (element as HTMLTextAreaElement).selectionStart)).toBe(0)
+  await expectCaret(0)
 })
 
 test('Plan 澄清按后端题型渲染单选、多选、文本与日期控件', async ({ page }) => {
@@ -2018,7 +2045,6 @@ test('普通用户与回答使用角色化节奏且卡片边界保持16px', asyn
     assistantBCopy: page.locator('#spacing-assistant-b .message-action-row--assistant .ui-icon-button'),
     userC: page.locator('#spacing-user-c .message-markdown'),
     userCAction: page.locator('#spacing-user-c .message-action-row--user'),
-    error: page.locator('#spacing-error'),
     userD: page.locator('#spacing-user-d .message-markdown'),
   }
   const gap = (before: { y: number; height: number }, after: { y: number }) => (
@@ -2056,8 +2082,6 @@ test('普通用户与回答使用角色化节奏且卡片边界保持16px', asyn
       expect(gap(bounds.assistantBMarkdown, bounds.userC)).toBeCloseTo(94, 5)
       expect(gap(bounds.assistantB, bounds.userC)).toBeCloseTo(48, 5)
       expect(gap(bounds.assistantBCopy, bounds.userC)).toBeCloseTo(57, 5)
-      expect(gap(bounds.userC, bounds.error)).toBeCloseTo(56, 5)
-      expect(gap(bounds.userCAction, bounds.error)).toBeCloseTo(16, 5)
     }
   }
 })

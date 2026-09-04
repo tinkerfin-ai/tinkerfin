@@ -57,6 +57,13 @@ const contrastRatio = (firstColor: string, secondColor: string) => {
   return (Math.max(first, second) + 0.05) / (Math.min(first, second) + 0.05)
 }
 
+const blendColor = (foreground: string, background: string, alpha: number) => (
+  '#' + [1, 3, 5].map((offset) => Math.round(
+    Number.parseInt(foreground.slice(offset, offset + 2), 16) * alpha
+    + Number.parseInt(background.slice(offset, offset + 2), 16) * (1 - alpha),
+  ).toString(16).padStart(2, '0')).join('')
+)
+
 describe('前端视觉契约', () => {
   it('每个 CSS owner 恰好归属一个预声明 layer', () => {
     const layerOrder = tokensStyles.match(/@layer\s+([^;]+);/)?.[1]
@@ -180,6 +187,12 @@ describe('前端视觉契约', () => {
     expect(uiStyles).toMatch(/\.ui-feedback-state\s*\{[^}]*width:\s*min\(calc\(100vw - var\(--space-6\)\), var\(--layout-feedback-card\)\);/s)
     expect(uiStyles).toMatch(/\.toast-viewport\s*\{[^}]*width:\s*min\(calc\(100vw - var\(--space-6\)\), var\(--layout-feedback-card\)\);/s)
     expect(uiStyles).toMatch(/\.toast-card\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*100%;/s)
+    expect(uiStyles).toMatch(/\.ui-feedback-state\s*\{[^}]*grid-template-columns:\s*var\(--control-lg\) minmax\(0, 1fr\) var\(--control-lg\);/s)
+    expect(uiStyles).toMatch(/\.toast-card\s*\{[^}]*grid-template-columns:\s*var\(--control-lg\) minmax\(0, 1fr\) var\(--control-lg\);/s)
+    expect(uiStyles).toMatch(/\.ui-feedback-state__title\s*\{[^}]*text-align:\s*center;/s)
+    expect(uiStyles).toMatch(/\.toast-card p\s*\{[^}]*text-align:\s*center;/s)
+    expect(uiStyles).toMatch(/\.ui-feedback-state > \.ui-icon-button-wrap\s*\{[^}]*translate:\s*calc\(var\(--space-2\) - 1px\) 0;/s)
+    expect(uiStyles).toMatch(/\.toast-card > button\s*\{[^}]*translate:\s*var\(--space-2\) 0;/s)
     expect(uiStyles).toMatch(/\.ui-feedback-state__retry,[\s\S]*?border:\s*0;[^}]*background:\s*transparent;[^}]*box-shadow:\s*none;/s)
   })
 
@@ -195,7 +208,9 @@ describe('前端视觉契约', () => {
     expect(todoTraceStyles).toMatch(/\.todo-trace-drawer\s*\{[^}]*width:\s*min\(var\(--layout-drawer-width\), 100vw\);/s)
     expect(chainTraceStyles).toMatch(/\.chain-trace-details\s*\{[^}]*position:\s*relative;[^}]*grid-template-rows:\s*var\(--space-16\) var\(--chain-trace-detail-tabs-height\) minmax\(0, 1fr\);/s)
     expect(chainTraceStyles).toMatch(/\.chain-trace-details\s*\{[^}]*width:\s*var\(--layout-drawer-width\);/s)
-    expect(chainTraceStyles).toMatch(/\.chain-trace-content-grid\.uses-overlay \.chain-trace-details\s*\{[^}]*position:\s*fixed;[^}]*z-index:\s*var\(--layer-drawer\);[^}]*top:\s*0;[^}]*right:\s*0;[^}]*height:\s*100dvh;/s)
+    expect(uiStyles).toMatch(/\.modal-backdrop\s*\{[^}]*position:\s*fixed;[^}]*z-index:\s*var\(--layer-modal\);[^}]*inset:\s*0;/s)
+    expect(chainTraceStyles).toMatch(/\.chain-trace-details-backdrop\s*\{[^}]*place-items:\s*stretch;[^}]*justify-items:\s*end;[^}]*padding:\s*0;/s)
+    expect(chainTraceStyles).toMatch(/\.chain-trace-details-backdrop \.chain-trace-details\s*\{[^}]*width:\s*min\(var\(--layout-drawer-width\), calc\(100vw - var\(--space-8\)\)\);[^}]*height:\s*100dvh;/s)
   })
 
   it('ThemePicker 以固定完整宽度和 scaleX 展开表面', () => {
@@ -360,6 +375,33 @@ describe('前端视觉契约', () => {
     expect(tokensStyles).toContain('--color-on-selection: var(--primitive-gray-950);')
     expect(tokensStyles).toMatch(/:root\[data-theme='dark'\]\s*\{[^}]*--color-selection:\s*var\(--color-brand\);[^}]*--color-on-selection:\s*var\(--color-on-brand\);/s)
     expect(globalStyles).toMatch(/::selection\s*\{[^}]*background:\s*var\(--color-selection\);[^}]*color:\s*var\(--color-on-selection\);/s)
+  })
+
+  it('链路六类节点在浅深主题中使用唯一且可读的语义色', () => {
+    const traceColors = [
+      '--color-trace-user',
+      '--color-trace-context',
+      '--color-trace-model',
+      '--color-trace-tool',
+      '--color-trace-subagent',
+      '--color-trace-assistant',
+    ]
+    for (const tokens of themeBlocks()) {
+      const canvas = resolveToken(tokens, '--color-canvas')
+      const colors = traceColors.map((name) => resolveToken(tokens, name))
+      expect(new Set(colors).size).toBe(traceColors.length)
+      for (const color of colors) {
+        expect(color).toMatch(/^#[0-9a-f]{6}$/i)
+        expect(contrastRatio(color, canvas)).toBeGreaterThanOrEqual(4.5)
+      }
+      for (const [index, color] of colors.entries()) {
+        const alpha = [0.1, 0.12, 0.1, 0.12, 0.1, 0.1][index]
+        for (const background of [canvas, resolveToken(tokens, '--color-brand-soft')]) {
+          expect(contrastRatio(color, blendColor(color, background, alpha)), traceColors[index])
+            .toBeGreaterThanOrEqual(4.5)
+        }
+      }
+    }
   })
 
   it('所有功能 CSS 入口都受扫描且不直接声明十六进制色或原始色令牌', () => {

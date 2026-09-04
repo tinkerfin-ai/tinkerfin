@@ -135,7 +135,7 @@ class ConversationTraceGraphSnapshotEvent(BaseModel):
 
 
 class ConversationTraceGraphUpdateEvent(BaseModel):
-    """同一筛选条件下的链路节点增删与 Facet 更新"""
+    """同一筛选条件下的链路增删、完整顺序、直接命中与完整性更新"""
 
     type: Literal["update"] = "update"
     update: TraceGraphDelta

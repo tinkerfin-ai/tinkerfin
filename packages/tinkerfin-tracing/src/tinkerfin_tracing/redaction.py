@@ -68,7 +68,7 @@ class RedactionContext:
 
     Attributes:
         content_kind: Stable content role used to select business redaction rules.
-        component_name: Public model, Tool, middleware, or contribution name when the
+        component_name: Public model, Tool, or contribution name when the
             source has one. Thread, Run, and user identities are never included.
     """
 
@@ -265,8 +265,18 @@ def _apply_redactor(
 
 
 def _normalize_json(value: object) -> JsonValue:
-    """Detach finite standard JSON without coercing third-party objects."""
+    """Detach finite acyclic JSON without coercing third-party objects."""
 
+    try:
+        return _normalize_json_value(value, active=set())
+    except RecursionError as error:
+        raise TraceCaptureRejected(
+            "Trace capture requires bounded acyclic JSON",
+            cause=error,
+        ) from error
+
+
+def _normalize_json_value(value: object, *, active: set[int]) -> JsonValue:
     if value is None or isinstance(value, str | bool | int):
         return value
     if isinstance(value, float):
@@ -274,12 +284,30 @@ def _normalize_json(value: object) -> JsonValue:
             raise TraceCaptureRejected("Trace capture requires a finite JSON value")
         return value
     if isinstance(value, list):
-        return [_normalize_json(item) for item in cast(list[object], value)]
+        sequence = cast(list[object], value)
+        identity = id(sequence)
+        if identity in active:
+            raise TraceCaptureRejected("Trace capture requires acyclic JSON")
+        active.add(identity)
+        try:
+            return [_normalize_json_value(item, active=active) for item in sequence]
+        finally:
+            active.remove(identity)
     if isinstance(value, dict):
         mapping = cast(dict[object, object], value)
         if any(not isinstance(key, str) for key in mapping):
             raise TraceCaptureRejected("Trace JSON object keys must be strings")
-        return {cast(str, key): _normalize_json(item) for key, item in mapping.items()}
+        identity = id(mapping)
+        if identity in active:
+            raise TraceCaptureRejected("Trace capture requires acyclic JSON")
+        active.add(identity)
+        try:
+            return {
+                cast(str, key): _normalize_json_value(item, active=active)
+                for key, item in mapping.items()
+            }
+        finally:
+            active.remove(identity)
     raise TraceCaptureRejected(
         "Trace capture requires standard JSON values",
         diagnostic_context={"value_type": _qualified_name(value)},
@@ -301,6 +329,12 @@ def _is_credential_key(value: str) -> bool:
 
 def _redact_credentials(value: JsonValue) -> JsonValue:
     if isinstance(value, list):
+        if (
+            len(value) == 2
+            and isinstance(value[0], str)
+            and _is_credential_key(value[0])
+        ):
+            return [value[0], _redacted_marker()]
         return [_redact_credentials(item) for item in value]
     if not isinstance(value, dict):
         return value
@@ -385,7 +419,10 @@ def _replace_pointer(value: JsonValue, path: str) -> None:
 
 def _is_array_index(value: str) -> bool:
     return value == "0" or (
-        bool(value) and value[0] in "123456789" and value.isdecimal()
+        bool(value)
+        and value.isascii()
+        and value[0] in "123456789"
+        and value.isdecimal()
     )
 
 

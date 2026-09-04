@@ -15,8 +15,7 @@ const responsePage = (modelId: string): TraceGraphPage => ({
   ...traceGraphWithNodes([
     traceGraphNode({
       id: `assistant-${modelId}`,
-      parentId: null,
-      structuralParentId: modelId,
+      modelCallId: modelId,
       kind: 'assistant_message',
       name: 'AssistantMessage',
       content: '完整响应',
@@ -53,10 +52,7 @@ describe('useTraceModelResponse', () => {
     expect(queryTraceGraph).toHaveBeenCalledWith(
       'thread-1',
       {
-        parentId: 'model-1',
-        kinds: ['assistant_message', 'tool'],
-        includeTechnicalNodes: false,
-        includeAncestorNodes: false,
+        modelCallId: 'model-1',
       },
       expect.objectContaining({ limit: 1000, signal: expect.any(AbortSignal) }),
     )

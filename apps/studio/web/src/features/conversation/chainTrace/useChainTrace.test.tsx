@@ -2,6 +2,7 @@ import { act, renderHook, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type {
+  TraceGraphDelta,
   TraceGraphEvent,
   TraceGraphPage,
 } from '../../../api/conversation/traceGraph'
@@ -17,14 +18,13 @@ const page: TraceGraphPage = {
   turns: [{
     id: 'turn-1',
     ordinal: 1,
-    rootNodeId: 'human-1',
     startedAt: '2026-08-31T00:00:00Z',
   }],
   nodes: [{
     id: 'human-1',
     turnId: 'turn-1',
-    parentId: null,
-    structuralParentId: null,
+    parentSubagentId: null,
+    modelCallId: null,
     kind: 'human_message',
     status: 'succeeded',
     name: 'HumanMessage',
@@ -36,31 +36,57 @@ const page: TraceGraphPage = {
     updatedSeq: 1,
     content: 'Find data',
     contentOmitted: false,
+    toolCallOnly: false,
     requestOmitted: false,
     resultOmitted: false,
-    hooks: [],
     linkIssues: [],
   }],
   orderedNodeIds: ['human-1'],
-  rootNodeIds: ['human-1'],
   matchedNodeIds: ['human-1'],
   nextCursor: null,
   asOfSeq: 1,
-  facets: {
-    kinds: { human_message: 1 },
-    statuses: { succeeded: 1 },
-    agents: {},
-    middleware: {},
-    skills: {},
-    providers: {},
-    models: {},
-  },
   completeness: {
     callTrackingMissing: false,
     relationshipEvidenceMissing: false,
     detailsOmitted: false,
   },
 }
+
+const stableIdentityChanges: Array<[string, Partial<TraceGraphDelta>]> = [
+  [
+    'Turn',
+    {
+      turnUpserts: [{
+        ...page.turns[0]!,
+        startedAt: '2026-09-01T00:00:00Z',
+      }],
+    },
+  ],
+  [
+    'kind',
+    {
+      nodeUpserts: [{
+        ...page.nodes[0]!,
+        kind: 'assistant_message',
+        updatedSeq: 2,
+      }],
+    },
+  ],
+  [
+    'name',
+    { nodeUpserts: [{ ...page.nodes[0]!, name: 'Changed', updatedSeq: 2 }] },
+  ],
+  [
+    'namespace',
+    {
+      nodeUpserts: [{
+        ...page.nodes[0]!,
+        namespace: ['changed'],
+        updatedSeq: 2,
+      }],
+    },
+  ],
+]
 
 const waitForAbort = (signal?: AbortSignal) => new Promise<void>((resolve) => {
   if (signal?.aborted) resolve()
@@ -112,7 +138,7 @@ describe('useChainTrace', () => {
     await waitFor(() => expect(signals[0].aborted).toBe(true))
   })
 
-  it('keeps one follower when only the presentation view rerenders', async () => {
+  it('keeps one follower when only local presentation state rerenders', async () => {
     followTraceGraph.mockImplementation((
       _threadId: string,
       _filter: unknown,
@@ -124,8 +150,8 @@ describe('useChainTrace', () => {
       }
     )())
     const { result, rerender, unmount } = renderHook(
-      ({ view }: { view: 'timeline' | 'tree' }) => {
-        void view
+      ({ compact }: { compact: boolean }) => {
+        void compact
         return useChainTrace({
           threadId: 'thread-1',
           active: true,
@@ -133,11 +159,11 @@ describe('useChainTrace', () => {
           limit: 1000,
         })
       },
-      { initialProps: { view: 'timeline' as 'timeline' | 'tree' } },
+      { initialProps: { compact: false } },
     )
 
     await waitFor(() => expect(result.current.state.phase).toBe('ready'))
-    rerender({ view: 'tree' })
+    rerender({ compact: true })
     await Promise.resolve()
     expect(followTraceGraph).toHaveBeenCalledTimes(1)
     unmount()
@@ -163,8 +189,8 @@ describe('useChainTrace', () => {
             nodeUpserts: [{
               ...page.nodes[0],
               id: 'assistant-1',
-              parentId: 'human-1',
-              structuralParentId: 'human-1',
+              parentSubagentId: null,
+              modelCallId: 'model-1',
               kind: 'assistant_message',
               name: 'AssistantMessage',
               startedSeq: 2,
@@ -172,12 +198,7 @@ describe('useChainTrace', () => {
             }],
             nodeRemoves: [],
             orderedNodeIds: ['human-1', 'assistant-1'],
-            rootNodeIds: ['human-1'],
             matchedNodeIds: ['human-1', 'assistant-1'],
-            facets: {
-              ...page.facets,
-              kinds: { human_message: 1, assistant_message: 1 },
-            },
             completeness: page.completeness,
           },
         }
@@ -200,7 +221,6 @@ describe('useChainTrace', () => {
           'human-1',
           'assistant-1',
         ])
-        expect(result.current.state.page.rootNodeIds).toEqual(['human-1'])
         expect(result.current.state.page.nextCursor).toBe('fresh-older-page')
       }
     })
@@ -228,9 +248,7 @@ describe('useChainTrace', () => {
             nodeUpserts: [],
             nodeRemoves: [],
             orderedNodeIds: page.orderedNodeIds,
-            rootNodeIds: page.rootNodeIds,
             matchedNodeIds: page.matchedNodeIds,
-            facets: page.facets,
             completeness: page.completeness,
           },
         }
@@ -255,7 +273,14 @@ describe('useChainTrace', () => {
   })
 
   it('rejects a delta whose authoritative order references missing state', async () => {
-    followTraceGraph.mockImplementation(() => (
+    let signal: AbortSignal | undefined
+    followTraceGraph.mockImplementation((
+      _threadId: string,
+      _filter: unknown,
+      options: { signal?: AbortSignal } = {},
+    ) => {
+      signal = options.signal
+      return (
       async function* (): AsyncGenerator<TraceGraphEvent> {
         yield { type: 'snapshot', snapshot: page }
         yield {
@@ -268,9 +293,101 @@ describe('useChainTrace', () => {
             nodeUpserts: [],
             nodeRemoves: [],
             orderedNodeIds: ['missing'],
-            rootNodeIds: ['missing'],
             matchedNodeIds: ['missing'],
-            facets: page.facets,
+            completeness: page.completeness,
+          },
+        }
+      }
+      )()
+    })
+    const { result } = renderHook(() => useChainTrace({
+      threadId: 'thread-1',
+      active: true,
+      filter: {},
+      limit: 1000,
+    }))
+    await waitFor(() => expect(result.current.state.phase).toBe('error'))
+    expect(signal?.aborted).toBe(true)
+  })
+
+  it('rejects a second snapshot from the same follower and closes it', async () => {
+    let signal: AbortSignal | undefined
+    followTraceGraph.mockImplementation((
+      _threadId: string,
+      _filter: unknown,
+      options: { signal?: AbortSignal } = {},
+    ) => {
+      signal = options.signal
+      return (async function* (): AsyncGenerator<TraceGraphEvent> {
+        yield { type: 'snapshot', snapshot: page }
+        yield { type: 'snapshot', snapshot: { ...page, asOfSeq: 2 } }
+      })()
+    })
+    const { result } = renderHook(() => useChainTrace({
+      threadId: 'thread-1',
+      active: true,
+      filter: {},
+      limit: 1000,
+    }))
+
+    await waitFor(() => expect(result.current.state.phase).toBe('error'))
+    expect(signal?.aborted).toBe(true)
+  })
+
+  it.each(stableIdentityChanges)(
+    'rejects a Delta that changes stable %s identity',
+    async (_label, changes) => {
+      followTraceGraph.mockImplementation(() => (
+        async function* (): AsyncGenerator<TraceGraphEvent> {
+          yield { type: 'snapshot', snapshot: page }
+          yield {
+            type: 'update',
+            update: {
+              asOfSeq: 2,
+              nextCursor: null,
+              turnUpserts: [],
+              turnRemoves: [],
+              nodeUpserts: [],
+              nodeRemoves: [],
+              orderedNodeIds: page.orderedNodeIds,
+              matchedNodeIds: page.matchedNodeIds,
+              completeness: page.completeness,
+              ...changes,
+            },
+          }
+        }
+      )())
+      const { result } = renderHook(() => useChainTrace({
+        threadId: 'thread-1',
+        active: true,
+        filter: {},
+        limit: 1000,
+      }))
+
+      await waitFor(() => expect(result.current.state.phase).toBe('error'))
+    },
+  )
+
+  it('rejects a node revision that moves backwards', async () => {
+    const current = {
+      ...page,
+      asOfSeq: 2,
+      nodes: [{ ...page.nodes[0]!, updatedSeq: 2 }],
+    }
+    followTraceGraph.mockImplementation(() => (
+      async function* (): AsyncGenerator<TraceGraphEvent> {
+        yield { type: 'snapshot', snapshot: current }
+        yield {
+          type: 'update',
+          update: {
+            asOfSeq: 3,
+            nextCursor: null,
+            turnUpserts: [],
+            turnRemoves: [],
+            nodeUpserts: [{ ...page.nodes[0]!, updatedSeq: 1 }],
+            nodeRemoves: [],
+            orderedNodeIds: page.orderedNodeIds,
+            matchedNodeIds: page.matchedNodeIds,
             completeness: page.completeness,
           },
         }
@@ -282,6 +399,7 @@ describe('useChainTrace', () => {
       filter: {},
       limit: 1000,
     }))
+
     await waitFor(() => expect(result.current.state.phase).toBe('error'))
   })
 

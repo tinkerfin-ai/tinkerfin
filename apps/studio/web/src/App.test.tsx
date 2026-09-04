@@ -369,24 +369,9 @@ describe('Studio Trace history integration', () => {
       }],
       graph: traceGraphWithNodes([
         traceGraphNode({
-          id: 'task-tool',
-          startedSeq: 2,
-          parentId: 'run-node',
-          name: 'task',
-          runId: RUN_ID,
-          sourceId: 'call-task',
-          request: {
-            description: '直接调用 write_file',
-            subagent_type: 'general-purpose',
-          },
-          status: 'waiting',
-          startedAt: BASE_TIME,
-          completedAt: null,
-        }),
-        traceGraphNode({
           id: 'subagent-node',
           startedSeq: 3,
-          parentId: 'run-node',
+          parentSubagentId: null,
           kind: 'subagent',
           name: 'general-purpose',
           runId: RUN_ID,
@@ -403,7 +388,7 @@ describe('Studio Trace history integration', () => {
         traceGraphNode({
           id: 'child-tool',
           startedSeq: 4,
-          parentId: 'subagent-node',
+          parentSubagentId: 'subagent-node',
           name: 'write_file',
           runId: RUN_ID,
           namespace: childNamespace,

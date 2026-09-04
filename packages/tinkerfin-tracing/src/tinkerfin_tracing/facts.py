@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Annotated, Literal, TypeAlias
 
 from pydantic import Field, TypeAdapter, model_validator
@@ -22,6 +23,11 @@ class TraceFactBase(TimedTraceModel):
     source_observation_id: str = Field(min_length=1, max_length=1024)
     identity: RunIdentity
     namespace: tuple[str, ...] = ()
+    in_subagent_scope: bool = Field(
+        default=False,
+        exclude_if=_omit_false,
+        description="Whether namespace is a proven Subagent execution scope",
+    )
 
 
 class TurnFact(TraceFactBase):
@@ -190,43 +196,6 @@ class ToolFact(TraceFactBase):
         return self
 
 
-class RuntimeTaskFact(TraceFactBase):
-    """Describe one scoped LangGraph runtime task phase."""
-
-    kind: Literal["task"] = "task"
-    phase: Literal[
-        "started",
-        "completed",
-        "failed",
-        "cancelled",
-        "interrupted",
-        "abandoned",
-    ]
-    task_id: str = Field(min_length=1, max_length=2048)
-    source_task_id: str = Field(min_length=1, max_length=1024)
-    task_name: str = Field(min_length=1, max_length=1024)
-    triggers: tuple[str, ...] = ()
-    input: CapturedValue | None = None
-    result: CapturedValue | None = None
-    error_type: str | None = Field(default=None, min_length=1, max_length=1024)
-    interrupt_ids: tuple[str, ...] = ()
-    failure_origin: bool = Field(default=False, exclude_if=_omit_false)
-
-    @model_validator(mode="after")
-    def evidence_matches_phase(self) -> RuntimeTaskFact:
-        """Keep Native task errors and interrupts exclusive to proven outcomes."""
-
-        if self.phase == "failed" and self.error_type is None:
-            raise ValueError("failed Runtime tasks require an error type")
-        if self.phase != "failed" and self.error_type is not None:
-            raise ValueError("non-failure Runtime tasks cannot carry an error type")
-        if self.phase != "interrupted" and self.interrupt_ids:
-            raise ValueError("only interrupted Runtime tasks can carry interrupt IDs")
-        if self.failure_origin and self.phase != "failed":
-            raise ValueError("only failed Runtime tasks can own a failure")
-        return self
-
-
 class StateRevisionFact(TraceFactBase):
     """Store changed top-level state keys without duplicating message snapshots."""
 
@@ -267,7 +236,14 @@ class InteractionFact(TraceFactBase):
 
 
 class SubagentFact(TraceFactBase):
-    """Open or close one validated non-root Agent graph scope."""
+    """Record one validated child Agent execution or its waiting/terminal state.
+
+    ``started`` requires ``running``; ``updated`` requires ``waiting``; ``completed``
+    accepts ``succeeded``, ``failed``, ``cancelled``, or ``abandoned``. Only started
+    facts carry ``input``, ``parent_tool_call_id``, ``parent_execution_id``, and
+    ``model_call_id``. Subsequent facts retain the same ``subagent_id`` and namespace
+    while inherited opening evidence supplies their request and relationships.
+    """
 
     kind: Literal["subagent"] = "subagent"
     phase: Literal["started", "updated", "completed"]
@@ -285,6 +261,7 @@ class SubagentFact(TraceFactBase):
         max_length=2048,
         description="Actual task Tool execution that opened this subagent",
     )
+    model_call_id: str | None = Field(default=None, min_length=1, max_length=2048)
     input: CapturedValue | None = None
     status: Literal[
         "running",
@@ -294,6 +271,29 @@ class SubagentFact(TraceFactBase):
         "cancelled",
         "abandoned",
     ]
+
+    @model_validator(mode="after")
+    def phase_fields_are_consistent(self) -> SubagentFact:
+        """Keep lifecycle state and immutable opening evidence unambiguous."""
+
+        expected_statuses = {
+            "started": {"running"},
+            "updated": {"waiting"},
+            "completed": {"succeeded", "failed", "cancelled", "abandoned"},
+        }
+        if self.status not in expected_statuses[self.phase]:
+            raise ValueError("Subagent status does not match its lifecycle phase")
+        if self.phase != "started" and any(
+            value is not None
+            for value in (
+                self.parent_tool_call_id,
+                self.parent_execution_id,
+                self.model_call_id,
+                self.input,
+            )
+        ):
+            raise ValueError("Subagent opening evidence belongs only to started facts")
+        return self
 
 
 class PlanRevisionFact(TraceFactBase):
@@ -315,52 +315,6 @@ class NativeExtraFact(TraceFactBase):
     top_level_keys: tuple[str, ...] = ()
 
 
-class AgentStepFact(TraceFactBase):
-    """Describe one standard-callback Agent graph step lifecycle."""
-
-    kind: Literal["agent.step"] = "agent.step"
-    phase: Literal[
-        "started",
-        "completed",
-        "failed",
-        "cancelled",
-        "interrupted",
-        "abandoned",
-    ]
-    call_id: str = Field(min_length=1, max_length=2048)
-    parent_call_id: str | None = Field(default=None, min_length=1, max_length=2048)
-    step_kind: Literal["agent", "middleware", "model", "tools", "subagent", "task"]
-    name: str = Field(min_length=1, max_length=1024)
-    source_task_id: str | None = Field(default=None, min_length=1, max_length=1024)
-    agent_name: str | None = Field(default=None, min_length=1, max_length=1024)
-    middleware_name: str | None = Field(default=None, min_length=1, max_length=1024)
-    hook: str | None = Field(default=None, min_length=1, max_length=1024)
-    error_type: str | None = Field(default=None, min_length=1, max_length=1024)
-    error_message: CapturedValue | None = None
-    failure_origin: bool = False
-
-    @model_validator(mode="after")
-    def phase_and_step_fields_are_consistent(self) -> AgentStepFact:
-        """Keep middleware and failure details exclusive to their real owners."""
-
-        is_middleware = self.step_kind == "middleware"
-        if is_middleware != (
-            self.middleware_name is not None and self.hook is not None
-        ):
-            raise ValueError(
-                "middleware step facts require a middleware name and hook exclusively"
-            )
-        if self.phase == "failed" and self.error_type is None:
-            raise ValueError("failed Agent step facts require an error type")
-        if self.phase != "failed" and (
-            self.error_type is not None or self.error_message is not None
-        ):
-            raise ValueError("non-failure Agent step facts cannot carry an error")
-        if self.failure_origin and self.phase != "failed":
-            raise ValueError("only failed Agent step facts can own a failure")
-        return self
-
-
 class ModelCallFact(TraceFactBase):
     """Describe one provider call independently of Native response delivery."""
 
@@ -379,6 +333,13 @@ class ModelCallFact(TraceFactBase):
     agent_name: str | None = Field(default=None, min_length=1, max_length=1024)
     provider: str | None = Field(default=None, min_length=1, max_length=1024)
     model: str | None = Field(default=None, min_length=1, max_length=1024)
+    context_started_at: datetime | None = Field(
+        default=None,
+        description=(
+            "UTC time of the preceding visible execution boundary that opened "
+            "context preparation for this provider attempt"
+        ),
+    )
     request: CapturedValue | None = None
     usage: CapturedValue | None = None
     response_metadata: CapturedValue | None = None
@@ -401,6 +362,23 @@ class ModelCallFact(TraceFactBase):
             raise ValueError("started model call facts require a request")
         if self.phase != "started" and self.request is not None:
             raise ValueError("only started model call facts may carry a request")
+        if self.phase == "started" and self.context_started_at is None:
+            raise ValueError("started model call facts require context_started_at")
+        if self.phase != "started" and self.context_started_at is not None:
+            raise ValueError(
+                "only started model call facts may carry context_started_at"
+            )
+        if self.context_started_at is not None:
+            if (
+                self.context_started_at.tzinfo is None
+                or self.context_started_at.utcoffset()
+                != UTC.utcoffset(self.context_started_at)
+            ):
+                raise ValueError("context_started_at must be an aware UTC timestamp")
+            if self.context_started_at > self.occurred_at:
+                raise ValueError(
+                    "context preparation cannot start after the model call"
+                )
         if self.phase != "started" and self.system_message_positions:
             raise ValueError(
                 "only started model call facts may carry SystemMessage positions"
@@ -533,34 +511,12 @@ class ContextContributionFact(TraceFactBase):
         return self
 
 
-class SkillFact(TraceFactBase):
-    """Record a successful exact read of one configured Skill instruction file."""
-
-    kind: Literal["skill"] = "skill"
-    skill_id: str = Field(min_length=1, max_length=2048)
-    execution_id: str = Field(min_length=1, max_length=2048)
-    source_tool_call_id: str = Field(min_length=1, max_length=1024)
-    name: str = Field(min_length=1, max_length=1024)
-    source_path: str = Field(min_length=1, max_length=4096)
-    agent_name: str | None = Field(default=None, min_length=1, max_length=1024)
-
-    @model_validator(mode="after")
-    def source_path_is_canonical(self) -> SkillFact:
-        """Keep the exact successful instruction path free from aliases."""
-
-        if self.source_path != self.source_path.strip():
-            raise ValueError("Skill source path must be canonical text")
-        return self
-
-
 TraceSemanticFact: TypeAlias = Annotated[
-    AgentStepFact
-    | TurnFact
+    TurnFact
     | RunFact
     | MessageFact
     | ReasoningFact
     | ToolFact
-    | RuntimeTaskFact
     | StateRevisionFact
     | InteractionFact
     | SubagentFact
@@ -569,8 +525,7 @@ TraceSemanticFact: TypeAlias = Annotated[
     | CallTrackingFact
     | ModelCallFact
     | ToolExecutionFact
-    | ContextContributionFact
-    | SkillFact,
+    | ContextContributionFact,
     Field(discriminator="kind"),
 ]
 
@@ -589,7 +544,6 @@ class TraceEvent(TraceModel):
 
 __all__ = [
     "TRACE_FACT_ADAPTER",
-    "AgentStepFact",
     "CallTrackingFact",
     "ContextContributionFact",
     "InteractionFact",
@@ -599,8 +553,6 @@ __all__ = [
     "PlanRevisionFact",
     "ReasoningFact",
     "RunFact",
-    "RuntimeTaskFact",
-    "SkillFact",
     "StateRevisionFact",
     "SubagentFact",
     "ToolExecutionFact",

@@ -42,6 +42,7 @@ from tinkerfin_tracing import (
     verify_trace_ledger_backend,
 )
 from tinkerfin_tracing._graph_projection import project_trace_graph_node
+from tinkerfin_tracing._ids import scope_id
 from tinkerfin_tracing.errors import (
     TraceQuotaExceeded,
     TraceRunConflict,
@@ -210,12 +211,15 @@ async def test_mysql_graph_query_filters_and_joins_ledger_details() -> None:
                     occurred_at=now,
                     monotonic_ns=2,
                     phase="started",
+                    context_started_at=now,
                     call_id="mysql-model-call",
-                    system_message_positions=(),
+                    system_message_positions=(0,),
                     output_message_ids=(),
                     provider="deepseek",
                     model="deepseek-chat",
-                    request=_captured({"messages": [{"content": marker}]}),
+                    request=_captured(
+                        {"messages": [{"messageType": "system", "content": marker}]}
+                    ),
                 ),
                 ModelCallFact(
                     source_observation_id="mysql-model-completed",
@@ -245,7 +249,25 @@ async def test_mysql_graph_query_filters_and_joins_ledger_details() -> None:
         start_fact = page.nodes[0].started_event.fact
         assert isinstance(start_fact, ModelCallFact)
         assert start_fact.request is not None
-        assert start_fact.request.value == {"messages": [{"content": marker}]}
+        assert start_fact.request.value == {
+            "messages": [{"messageType": "system", "content": marker}]
+        }
+        context_page = await store.query_trace_graph(
+            snapshot.key,
+            run_ids=("graph-query",),
+            where=TraceGraphFilter(kinds={TraceGraphNodeKind.CONTEXT}),
+            limit=10,
+        )
+        context = project_trace_graph_node(
+            context_page.nodes[0],
+            turn_id="turn",
+            parent_subagent_id=None,
+            relationship_missing=False,
+            allowed_run_ids=frozenset({"graph-query"}),
+        )
+        assert context.content == marker
+        assert context.request is None
+        assert context_page.nodes[0].request_seq == page.nodes[0].request_seq
         literal_wildcard = await store.query_trace_graph(
             snapshot.key,
             run_ids=("graph-query",),
@@ -295,6 +317,82 @@ async def test_mysql_graph_query_filters_and_joins_ledger_details() -> None:
         await engine.dispose()
 
 
+async def test_mysql_graph_scope_closure_accepts_64_levels_and_rejects_65() -> None:
+    engine = create_async_engine(_url(), pool_pre_ping=True)
+    store = SqlAlchemyTraceStore(
+        engine,
+        namespace=f"mysql-scope-depth-{uuid4().hex}",
+    )
+    identity = _identity("scope-depth")
+    writer = await store.open_writer(identity)
+    namespaces = tuple(
+        tuple(f"tools:{index}" for index in range(depth)) for depth in range(1, 66)
+    )
+    try:
+        await writer.append(
+            (
+                _fact(identity.run_id, "started"),
+                *(
+                    SubagentFact(
+                        source_observation_id=f"mysql-depth-{depth}",
+                        identity=identity,
+                        namespace=namespace,
+                        occurred_at=datetime(2026, 1, 1, tzinfo=UTC)
+                        + timedelta(milliseconds=depth),
+                        monotonic_ns=depth + 1,
+                        phase="started",
+                        subagent_id=scope_id(
+                            "subagent",
+                            namespace,
+                            namespace[-1],
+                        ),
+                        agent_name=f"agent-{depth}",
+                        parent_tool_call_id=f"task-{depth}",
+                        model_call_id=f"model-{depth}",
+                        status="running",
+                    )
+                    for depth, namespace in enumerate(namespaces, start=1)
+                ),
+            )
+        )
+        await writer.aclose()
+        snapshot = await store.snapshot(identity.thread_id)
+
+        legal = await asyncio.wait_for(
+            store.query_trace_graph(
+                snapshot.key,
+                run_ids=(identity.run_id,),
+                where=TraceGraphFilter(
+                    kinds={TraceGraphNodeKind.SUBAGENT},
+                    namespaces={namespaces[63]},
+                ),
+                limit=1,
+                max_nodes=65,
+            ),
+            timeout=5,
+        )
+        assert len(legal.nodes) == 64
+
+        with pytest.raises(TraceStoreProtocolError, match="at most 64 levels"):
+            await asyncio.wait_for(
+                store.query_trace_graph(
+                    snapshot.key,
+                    run_ids=(identity.run_id,),
+                    where=TraceGraphFilter(
+                        kinds={TraceGraphNodeKind.SUBAGENT},
+                        agent_names={"agent-65"},
+                    ),
+                    limit=1,
+                    max_nodes=65,
+                ),
+                timeout=5,
+            )
+        await store.delete(snapshot.key)
+    finally:
+        await writer.aclose()
+        await engine.dispose()
+
+
 async def test_mysql_graph_clears_a_tool_parent_gap_after_model_completion() -> None:
     engine = create_async_engine(_url(), pool_pre_ping=True)
     store = SqlAlchemyTraceStore(
@@ -315,6 +413,7 @@ async def test_mysql_graph_clears_a_tool_parent_gap_after_model_completion() -> 
                     occurred_at=now,
                     monotonic_ns=2,
                     phase="started",
+                    context_started_at=now,
                     call_id=model_id,
                     parent_call_id="agent-call",
                     request=_captured({"messages": []}),
@@ -360,15 +459,12 @@ async def test_mysql_graph_clears_a_tool_parent_gap_after_model_completion() -> 
         page = await store.query_trace_graph(
             snapshot.key,
             run_ids=(identity.run_id,),
-            where=TraceGraphFilter(
-                kinds={TraceGraphNodeKind.TOOL},
-                include_ancestor_nodes=False,
-            ),
+            where=TraceGraphFilter(kinds={TraceGraphNodeKind.TOOL}),
             limit=10,
         )
 
         assert len(page.nodes) == 1
-        assert page.nodes[0].structural_parent_id == model_id
+        assert page.nodes[0].model_call_id == model_id
         assert page.nodes[0].link_issue is None
         await store.delete(snapshot.key)
     finally:
@@ -394,12 +490,14 @@ async def test_mysql_graph_keeps_lineage_parent_and_tool_failure_evidence() -> N
                 SubagentFact(
                     source_observation_id="mysql-subagent-start",
                     identity=parent_identity,
+                    namespace=("tools:mysql-subagent",),
                     occurred_at=now,
                     monotonic_ns=2,
                     phase="started",
                     subagent_id="mysql-subagent",
                     agent_name="KÄ研究Researcher",
                     parent_tool_call_id="call-task",
+                    model_call_id="mysql-model",
                     input=_captured({"description": "research"}),
                     status="running",
                 ),
@@ -459,7 +557,8 @@ async def test_mysql_graph_keeps_lineage_parent_and_tool_failure_evidence() -> N
                 SubagentFact(
                     source_observation_id="mysql-subagent-completed",
                     identity=child_identity,
-                    occurred_at=now - timedelta(seconds=5),
+                    namespace=("tools:mysql-subagent",),
+                    occurred_at=now + timedelta(seconds=5),
                     monotonic_ns=7,
                     phase="completed",
                     subagent_id="mysql-subagent",
@@ -473,8 +572,7 @@ async def test_mysql_graph_keeps_lineage_parent_and_tool_failure_evidence() -> N
             snapshot.key,
             run_ids=(parent_identity.run_id, child_identity.run_id),
             where=TraceGraphFilter(
-                kinds={TraceGraphNodeKind.SUBAGENT, TraceGraphNodeKind.TOOL},
-                include_ancestor_nodes=False,
+                kinds={TraceGraphNodeKind.SUBAGENT, TraceGraphNodeKind.TOOL}
             ),
             limit=10,
         )
@@ -485,11 +583,13 @@ async def test_mysql_graph_keeps_lineage_parent_and_tool_failure_evidence() -> N
         projected_tool = project_trace_graph_node(
             tool,
             turn_id="turn:mysql",
-            parent_id=None,
+            parent_subagent_id=None,
             relationship_missing=False,
+            allowed_run_ids=frozenset({parent_identity.run_id, child_identity.run_id}),
         )
 
-        assert subagent.structural_parent_id is not None
+        assert subagent.parent_subagent_id is None
+        assert subagent.model_call_id == "mysql-model"
         assert subagent.link_issue is None
         assert subagent.started_at == now
         assert projected_tool.result == "tool error result"

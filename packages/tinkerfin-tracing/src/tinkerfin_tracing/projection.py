@@ -13,7 +13,6 @@ from pydantic import BaseModel, Field, JsonValue
 
 from tinkerfin_contracts import RunTerminalOutcome
 
-from ._ids import scope_id
 from ._models import TraceModel
 from .capture import CapturedValue
 from .errors import (
@@ -795,14 +794,10 @@ def trace_graph_turns(
         )
         if not run_checkpoints:
             raise TraceCorruption("Trace Graph Turn has no available Run")
-        root_source_id = (
-            turn_id if checkpoint is None else checkpoint.user_message_id or turn_id
-        )
         turns.append(
             TraceGraphTurn(
                 id=turn_id,
                 ordinal=ordinals[turn_id],
-                root_node_id=scope_id("message", (), root_source_id),
                 started_at=min(run.started_at for run in run_checkpoints),
             )
         )

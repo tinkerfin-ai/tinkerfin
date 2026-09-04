@@ -121,10 +121,24 @@ def test_compose_supports_bundled_and_external_service_sets(tmp_path: Path) -> N
         "redis-control",
         "redis-runtime",
         "opensandbox",
-        "database-init",
         "studio",
     }
     assert external == ["studio"]
+
+
+def test_bundled_mysql_uses_its_official_one_time_schema_bootstrap() -> None:
+    """内置 MySQL 仅在新数据卷首次启动时导入 Studio 业务 SQL"""
+
+    compose = (DEPLOY_DIR / "docker-compose.yaml").read_text(encoding="utf-8")
+    deploy = (DEPLOY_DIR / "deploy.sh").read_text(encoding="utf-8")
+
+    assert (
+        "../database/mysql/schema.sql:"
+        "/docker-entrypoint-initdb.d/10-studio-business.sql:ro"
+    ) in compose
+    assert "database-init:" not in compose
+    assert "init-database.sh" not in compose
+    assert "prepare_external_database" not in deploy
 
 
 def test_bundled_opensandbox_persists_runtime_expiration_metadata() -> None:

@@ -43,13 +43,18 @@ and cleanup. `open_agui_run()` requires exactly one of `input` and `resume`.
 `DeepAgentsV3RuntimeProfile` is an explicit experimental selection. TinkerFin selects one
 Profile before Definition creation, persists its `profile_id` with checkpoint lineage,
 and rejects branch or resume through another Profile before Graph continuation. It never
-detects or negotiates a Profile from stream data. A verified provider reasoning path is
-enabled only by passing a `ReasoningExtractor`, such as `DeepSeekReasoningExtractor`, to
-the Profile; this does not authorize Trace persistence by itself. Custom extractors
-implement `extract(message, *, provider)` and must reject unverified providers. A custom Profile also
-implements its concrete `stage_resume_intent()`, `pending_resume_values()`, and
-`native_resume_submitted()` checkpointer semantics; TinkerFin does not fall back to v2
-checkpoint behavior for it. Neither built-in Profile falls back to the other.
+detects or negotiates a Profile from stream data. `profile_id` is framework-private
+integration and recovery metadata. It must not be copied into business database models,
+request payloads, or application response schemas.
+
+A verified provider reasoning path is enabled only by passing a host-supplied
+`ReasoningExtractor` to the Profile; TinkerFin provides no vendor-specific extractor.
+This does not authorize Trace persistence by itself. The extractor implements
+`extract(message, *, provider)` and returns content only after verifying both provider
+and source shape. A custom Profile also implements its concrete `stage_resume_intent()`,
+`pending_resume_values()`, and `native_resume_submitted()` checkpointer semantics;
+TinkerFin does not fall back to v2 checkpoint behavior for it. Neither built-in Profile
+falls back to the other.
 
 Reuse `DeepAgentDefinition`. Treat `DeepAgentRuntime`, `DeepAgentAgUiRuntime`, and
 `DeepAgentAgUiResumeRuntime` as single-use values returned by the entry points rather

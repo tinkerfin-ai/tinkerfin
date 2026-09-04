@@ -279,7 +279,6 @@ async def test_trace_graph_query_returns_the_final_model_request(session) -> Non
         thread.thread_id,
         where=TraceGraphFilter(
             kinds={TraceGraphNodeKind.MODEL},
-            include_ancestor_nodes=False,
         ),
         cursor=None,
         limit=100,
@@ -385,7 +384,8 @@ async def test_trace_graph_follow_sends_snapshot_update_and_closes(session) -> N
         if node.kind is TraceGraphNodeKind.MODEL
     )
     assert model_node.turn_id == update.update.turn_upserts[0].id
-    assert model_node.id in update.update.root_node_ids
+    assert model_node.parent_subagent_id is None
+    assert model_node.id in update.update.ordered_node_ids
     await events.aclose()
     await _finish_trace(context, trace_session)
 

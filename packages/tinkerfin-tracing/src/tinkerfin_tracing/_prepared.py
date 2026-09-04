@@ -16,7 +16,7 @@ def prepare_trace_facts(
     *,
     codec: CanonicalTracePayloadCodec,
 ) -> tuple[PreparedTraceFact, ...]:
-    """Encode each fact once and retain its exact admission and Store evidence."""
+    """Encode each fact once and retain its exact Store evidence."""
 
     prepared: list[PreparedTraceFact] = []
     for fact in facts:

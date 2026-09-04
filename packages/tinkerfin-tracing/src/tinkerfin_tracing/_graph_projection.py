@@ -1,4 +1,4 @@
-"""Materialize public Graph nodes from index metadata and referenced facts."""
+"""Materialize public timeline events from index metadata and referenced facts."""
 
 from __future__ import annotations
 
@@ -13,18 +13,16 @@ from ._graph_reducer import (
     effective_graph_nodes,
     graph_node_mutations,
 )
+from ._ids import scope_id
+from .backend import TraceGraphNodeMutation
 from .capture import CapturedValue
 from .errors import TraceStoreProtocolError
 from .facts import (
-    AgentStepFact,
     ContextContributionFact,
     InteractionFact,
     MessageFact,
     ModelCallFact,
     PlanRevisionFact,
-    RunFact,
-    RuntimeTaskFact,
-    SkillFact,
     SubagentFact,
     ToolExecutionFact,
     ToolFact,
@@ -32,12 +30,13 @@ from .facts import (
     TurnFact,
 )
 from .graph import (
-    TECHNICAL_TRACE_GRAPH_NODE_KINDS,
     TraceGraphFailure,
     TraceGraphLinkIssue,
     TraceGraphNode,
     TraceGraphNodeKind,
+    TraceGraphNodeStatus,
     TraceGraphTurn,
+    canonical_trace_graph_node_order,
 )
 from .store import TraceGraphNodeRecord
 
@@ -47,7 +46,7 @@ def reduce_trace_graph_records(
     *,
     run_ids: frozenset[str],
 ) -> tuple[TraceGraphNodeRecord, ...]:
-    """Replay canonical Graph mutations and bind their exact Ledger facts."""
+    """Replay canonical mutations and bind their exact Ledger facts."""
 
     revisions: dict[tuple[str, str], ReducedTraceGraphRevision] = {}
     for mutation in graph_node_mutations(events):
@@ -69,11 +68,12 @@ def reduce_trace_graph_records(
         started_event = event_at(node.started_seq)
         updated_event = event_at(node.updated_seq)
         if started_event is None or updated_event is None:
-            raise TraceStoreProtocolError("Trace Graph node lacks lifecycle facts")
+            raise TraceStoreProtocolError("Trace Graph event lacks lifecycle facts")
         records.append(
             TraceGraphNodeRecord(
                 node_id=node.node_id,
-                structural_parent_id=node.structural_parent_id,
+                parent_subagent_id=node.parent_subagent_id,
+                model_call_id=node.model_call_id,
                 kind=node.kind,
                 status=node.status,
                 name=node.name,
@@ -108,30 +108,76 @@ def _captured(value: CapturedValue | None) -> tuple[JsonValue | None, bool]:
 
 
 def _captured_tool(value: CapturedValue | None) -> tuple[JsonValue | None, bool]:
-    """Unwrap an explicitly selected RFC 6901 Tool root value."""
-
     captured, omitted = _captured(value)
     if isinstance(captured, dict) and set(captured) == {""}:
         return captured[""], omitted
     return captured, omitted
 
 
+def _subagent_task_content(
+    value: CapturedValue | None,
+) -> tuple[JsonValue | None, bool]:
+    """Project the delegated task text without duplicating its stored arguments."""
+
+    request, omitted = _captured_tool(value)
+    if omitted:
+        return None, True
+    if not isinstance(request, dict):
+        raise TraceStoreProtocolError("Subagent input is not a task argument object")
+    description = request.get("description")
+    if description is None:
+        return None, True
+    if not isinstance(description, str):
+        raise TraceStoreProtocolError("Subagent task description is not text")
+    return description, False
+
+
+def _assistant_tool_call_only(
+    record: TraceGraphNodeRecord,
+    *,
+    content: JsonValue | None,
+    content_omitted: bool,
+) -> bool:
+    """Identify an empty Assistant output backed by a completed Tool proposal."""
+
+    if content_omitted:
+        return False
+    if isinstance(content, str):
+        content_is_empty = not content.strip()
+    else:
+        content_is_empty = content is None or content == []
+    if not content_is_empty:
+        return False
+    return any(
+        isinstance(event.fact, ModelCallFact)
+        and bool(event.fact.tool_call_ids)
+        and any(
+            scope_id("message", event.fact.namespace, source_id) == record.node_id
+            for source_id in event.fact.output_message_ids
+        )
+        for event in (
+            record.started_event,
+            record.request_event,
+            record.result_event,
+            record.failure_event,
+        )
+        if event is not None
+    )
+
+
 def _failure(
     error_type: str,
     *,
     message: CapturedValue | None = None,
-    code: str | None = None,
 ) -> TraceGraphFailure:
     value, _omitted = _captured(message)
     return TraceGraphFailure(
         error_type=error_type,
         message=value if isinstance(value, str) else None,
-        code=code,
     )
 
 
-def _system_message_content(
-    node_id: str,
+def _context_content(
     fact: ModelCallFact,
 ) -> tuple[JsonValue | None, bool]:
     request, omitted = _captured(fact.request)
@@ -140,136 +186,417 @@ def _system_message_content(
     messages = request.get("messages")
     if not isinstance(messages, list):
         raise TraceStoreProtocolError("Model request messages are unavailable")
-    _prefix, separator, raw_position = node_id.rpartition(":")
-    if not separator or not raw_position.isdecimal():
-        raise TraceStoreProtocolError("SystemMessage node identity is invalid")
-    position = int(raw_position)
-    if position >= len(messages) or not isinstance(messages[position], dict):
-        raise TraceStoreProtocolError("SystemMessage position is outside the request")
-    message = cast(dict[str, JsonValue], messages[position])
-    if message.get("messageType") != "system":
-        raise TraceStoreProtocolError("SystemMessage position references another role")
-    return message.get("content"), False
-
-
-def trace_graph_record_search_values(
-    record: TraceGraphNodeRecord,
-) -> tuple[JsonValue, ...]:
-    """Return decoded detail values that the corresponding public node exposes."""
-
-    start = record.started_event.fact
-    update = record.updated_event.fact
-    request_fact = None if record.request_event is None else record.request_event.fact
-    result_fact = None if record.result_event is None else record.result_event.fact
-    failure_fact = None if record.failure_event is None else record.failure_event.fact
     values: list[JsonValue] = []
+    for position in fact.system_message_positions:
+        if position >= len(messages) or not isinstance(messages[position], dict):
+            raise TraceStoreProtocolError(
+                "Context SystemMessage position is outside the request"
+            )
+        message = cast(dict[str, JsonValue], messages[position])
+        if message.get("messageType") != "system":
+            raise TraceStoreProtocolError(
+                "Context SystemMessage position references another role"
+            )
+        values.append(message.get("content"))
+    if not values:
+        return None, False
+    return (values[0] if len(values) == 1 else values), False
 
-    def captured(value: CapturedValue | None, *, tool: bool = False) -> None:
-        if value is None:
-            return
-        public, omitted = _captured_tool(value) if tool else _captured(value)
-        if not omitted:
-            values.append(public)
 
-    if record.kind in {
-        TraceGraphNodeKind.HUMAN_MESSAGE,
-        TraceGraphNodeKind.ASSISTANT_MESSAGE,
-    }:
-        message_fact = result_fact if isinstance(result_fact, MessageFact) else update
-        if isinstance(message_fact, MessageFact):
-            captured(message_fact.content)
-        elif not (
-            record.kind is TraceGraphNodeKind.HUMAN_MESSAGE
-            and isinstance(start, TurnFact)
-        ) and not isinstance(start, ModelCallFact):
-            raise TraceStoreProtocolError("Message Graph node fact is invalid")
-    elif record.kind is TraceGraphNodeKind.SYSTEM_MESSAGE:
+def _tool_node(namespace: tuple[str, ...], source_id: str) -> str:
+    return scope_id("tool", namespace, source_id)
+
+
+def _subagent_input_node(fact: SubagentFact) -> str:
+    return scope_id("subagent-input", fact.namespace, fact.subagent_id)
+
+
+def _subagent_owner(namespace: tuple[str, ...]) -> str | None:
+    if not namespace:
+        return None
+    return scope_id("subagent", namespace, namespace[-1])
+
+
+def _outer_subagent_owner(namespace: tuple[str, ...]) -> str | None:
+    return _subagent_owner(namespace[:-1])
+
+
+def _message_fact_for(record: TraceGraphNodeRecord) -> MessageFact | None:
+    facts = (
+        None if record.result_event is None else record.result_event.fact,
+        record.updated_event.fact,
+        record.started_event.fact,
+    )
+    return next((fact for fact in facts if isinstance(fact, MessageFact)), None)
+
+
+def _validate_locator_slots(record: TraceGraphNodeRecord) -> None:
+    """Prove every stored locator was produced for its declared Graph slot."""
+
+    slots = (
+        ("started", record.started_seq, record.started_event),
+        ("updated", record.updated_seq, record.updated_event),
+        ("request", record.request_seq, record.request_event),
+        ("result", record.result_seq, record.result_event),
+        ("failure", record.failure_seq, record.failure_event),
+    )
+    mutations: dict[int, TraceGraphNodeMutation] = {}
+    for name, sequence, event in slots:
+        if sequence is None:
+            if event is not None:
+                raise TraceStoreProtocolError(
+                    f"Trace Graph {name} locator has no sequence"
+                )
+            continue
+        if event is None or event.trace_seq != sequence:
+            raise TraceStoreProtocolError(
+                f"Trace Graph {name} locator does not match its sequence"
+            )
+        mutation = next(
+            (
+                candidate
+                for candidate in graph_node_mutations((event,))
+                if candidate.node_id == record.node_id
+                and getattr(candidate, f"{name}_seq") == sequence
+            ),
+            None,
+        )
+        if mutation is None or mutation.remove:
+            raise TraceStoreProtocolError(
+                f"Trace Graph {name} locator does not produce that slot"
+            )
+        mutations[sequence] = mutation
+        if mutation.kind is not None and mutation.kind is not record.kind:
+            raise TraceStoreProtocolError(
+                f"Trace Graph {name} locator produces another node kind"
+            )
+        if mutation.namespace is not None and mutation.namespace != record.namespace:
+            raise TraceStoreProtocolError(
+                f"Trace Graph {name} locator produces another namespace"
+            )
         if (
-            not isinstance(request_fact, ModelCallFact)
-            or request_fact.phase != "started"
+            mutation.parent_subagent_id is not None
+            and mutation.parent_subagent_id != record.parent_subagent_id
         ):
-            raise TraceStoreProtocolError("SystemMessage Graph node fact is invalid")
-        content, omitted = _system_message_content(record.node_id, request_fact)
-        if not omitted:
-            values.append(content)
-    elif record.kind is TraceGraphNodeKind.MODEL:
+            raise TraceStoreProtocolError(
+                f"Trace Graph {name} locator produces another Subagent owner"
+            )
         if (
-            not isinstance(request_fact, ModelCallFact)
-            or request_fact.phase != "started"
+            mutation.model_call_id is not None
+            and mutation.model_call_id != record.model_call_id
         ):
-            raise TraceStoreProtocolError("Model Graph node start fact is invalid")
-        captured(request_fact.request)
-        if isinstance(failure_fact, ModelCallFact):
-            values.append(failure_fact.error_type or "model_error")
-            captured(failure_fact.error_message)
+            raise TraceStoreProtocolError(
+                f"Trace Graph {name} locator produces another model relationship"
+            )
+    if record.updated_event.fact.identity.run_id != record.run_id:
+        raise TraceStoreProtocolError(
+            "Trace Graph latest update belongs to another Run"
+        )
+    if any(sequence > record.updated_seq for sequence in mutations):
+        raise TraceStoreProtocolError("Trace Graph locator follows its latest update")
+    if mutations[record.started_seq].started_at != record.started_at:
+        raise TraceStoreProtocolError("Trace Graph start time conflicts with its fact")
+    latest_status = max(
+        (mutation for mutation in mutations.values() if mutation.status is not None),
+        key=lambda mutation: mutation.updated_seq,
+        default=None,
+    )
+    if latest_status is None or latest_status.status is not record.status:
+        raise TraceStoreProtocolError("Trace Graph status conflicts with its facts")
+    expected_completion = (
+        None
+        if record.status in {TraceGraphNodeStatus.RUNNING, TraceGraphNodeStatus.WAITING}
+        else latest_status.completed_at
+    )
+    if record.completed_at != expected_completion:
+        raise TraceStoreProtocolError(
+            "Trace Graph completion time conflicts with its facts"
+        )
+
+
+def _validate_locator_ownership(
+    record: TraceGraphNodeRecord,
+    *,
+    allowed_run_ids: frozenset[str],
+) -> None:
+    """Reject valid facts that belong to another semantic timeline event."""
+
+    events = (
+        record.started_event,
+        record.updated_event,
+        record.request_event,
+        record.result_event,
+        record.failure_event,
+    )
+    for event in events:
+        if event is None:
+            continue
+        fact = event.fact
+        if fact.identity.run_id not in allowed_run_ids:
+            raise TraceStoreProtocolError(
+                "Trace Graph locator belongs to another Run lineage"
+            )
+        if fact.namespace != record.namespace and not isinstance(fact, TurnFact):
+            raise TraceStoreProtocolError(
+                "Trace Graph locator belongs to another namespace"
+            )
+
+    subagent_fact = next(
+        (
+            event.fact
+            for event in events
+            if event is not None and isinstance(event.fact, SubagentFact)
+        ),
+        None,
+    )
+    if record.kind is TraceGraphNodeKind.SUBAGENT:
+        if not record.namespace:
+            raise TraceStoreProtocolError("Subagent Graph event requires a namespace")
+        expected_parent_subagent_id = _outer_subagent_owner(record.namespace)
+    elif record.kind is TraceGraphNodeKind.HUMAN_MESSAGE and isinstance(
+        subagent_fact, SubagentFact
+    ):
+        expected_parent_subagent_id = subagent_fact.subagent_id
+    else:
+        scope_evidence = {
+            event.fact.in_subagent_scope
+            for event in events
+            if event is not None and not isinstance(event.fact, TurnFact)
+        }
+        if len(scope_evidence) > 1:
+            raise TraceStoreProtocolError(
+                "Trace Graph facts disagree on Subagent scope ownership"
+            )
+        expected_parent_subagent_id = (
+            _subagent_owner(record.namespace) if scope_evidence == {True} else None
+        )
+    if record.parent_subagent_id != expected_parent_subagent_id:
+        raise TraceStoreProtocolError(
+            "Trace Graph Subagent owner conflicts with its namespace"
+        )
+
+    model_call_ids: set[str] = set()
+    for event in events:
+        if event is None:
+            continue
+        fact = event.fact
+        if record.kind is TraceGraphNodeKind.ASSISTANT_MESSAGE and isinstance(
+            fact, ModelCallFact
+        ):
+            if any(
+                scope_id("message", fact.namespace, source_id) == record.node_id
+                for source_id in fact.output_message_ids
+            ):
+                model_call_ids.add(fact.call_id)
+        elif record.kind is TraceGraphNodeKind.TOOL:
+            if isinstance(fact, ModelCallFact) and any(
+                _tool_node(fact.namespace, source_id) == record.node_id
+                for source_id in fact.tool_call_ids
+            ):
+                model_call_ids.add(fact.call_id)
+            elif isinstance(fact, ToolFact) and fact.parent_call_id is not None:
+                model_call_ids.add(fact.parent_call_id)
+            elif (
+                isinstance(fact, ToolExecutionFact) and fact.parent_call_id is not None
+            ):
+                model_call_ids.add(fact.parent_call_id)
+        elif (
+            record.kind is TraceGraphNodeKind.SUBAGENT
+            and isinstance(fact, SubagentFact)
+            and fact.model_call_id is not None
+        ):
+            model_call_ids.add(fact.model_call_id)
+    if len(model_call_ids) > 1:
+        raise TraceStoreProtocolError(
+            "Trace Graph model relationship has conflicting evidence"
+        )
+    expected_model_call_id = next(iter(model_call_ids), None)
+    if record.model_call_id != expected_model_call_id:
+        raise TraceStoreProtocolError(
+            "Trace Graph model relationship conflicts with its facts"
+        )
+    if record.kind is TraceGraphNodeKind.MODEL:
+        if any(
+            isinstance(event.fact, ModelCallFact)
+            and event.fact.call_id != record.node_id
+            for event in events
+            if event is not None
+        ):
+            raise TraceStoreProtocolError("Model locator belongs to another call")
+    elif record.kind is TraceGraphNodeKind.CONTEXT:
+        if any(
+            not isinstance(event.fact, ModelCallFact)
+            or event.fact.phase != "started"
+            or record.node_id
+            != scope_id("context", event.fact.namespace, event.fact.call_id)
+            for event in events
+            if event is not None
+        ):
+            raise TraceStoreProtocolError(
+                "Context locator belongs to another model request"
+            )
     elif record.kind is TraceGraphNodeKind.TOOL:
-        if isinstance(request_fact, ToolExecutionFact):
-            captured(request_fact.input, tool=True)
-        elif isinstance(request_fact, ToolFact):
-            captured(request_fact.content, tool=True)
-        if isinstance(result_fact, ToolExecutionFact):
-            captured(result_fact.output, tool=True)
-        elif isinstance(result_fact, ToolFact):
-            captured(result_fact.content, tool=True)
-        if isinstance(failure_fact, ToolExecutionFact):
-            values.append(failure_fact.error_type or "tool_error")
-            captured(failure_fact.error_message)
-        elif isinstance(failure_fact, ToolFact):
-            values.append("tool_error")
-    elif record.kind in {TraceGraphNodeKind.AGENT, TraceGraphNodeKind.MIDDLEWARE}:
-        step_start = request_fact if isinstance(request_fact, AgentStepFact) else start
-        if not isinstance(step_start, AgentStepFact) or step_start.phase != "started":
-            raise TraceStoreProtocolError("Agent Graph node start fact is invalid")
-        if step_start.hook is not None:
-            values.append(step_start.hook)
-        if isinstance(failure_fact, AgentStepFact):
-            values.append(failure_fact.error_type or "agent_error")
-            captured(failure_fact.error_message)
-    elif record.kind is TraceGraphNodeKind.RUNTIME_TASK:
-        if isinstance(request_fact, RuntimeTaskFact):
-            captured(request_fact.input)
-        if isinstance(result_fact, RuntimeTaskFact):
-            captured(result_fact.result)
-        if isinstance(failure_fact, RuntimeTaskFact):
-            values.append(failure_fact.error_type or "runtime_task_error")
-        elif isinstance(failure_fact, AgentStepFact):
-            values.append(failure_fact.error_type or "runtime_task_error")
-            captured(failure_fact.error_message)
+        for event in events:
+            if event is None:
+                continue
+            fact = event.fact
+            if (
+                isinstance(fact, ToolFact)
+                and _tool_node(fact.namespace, fact.source_tool_call_id)
+                != record.node_id
+            ):
+                raise TraceStoreProtocolError("Tool locator belongs to another call")
+            if (
+                isinstance(fact, ToolExecutionFact)
+                and fact.source_tool_call_id is not None
+                and _tool_node(fact.namespace, fact.source_tool_call_id)
+                != record.node_id
+            ):
+                raise TraceStoreProtocolError("Tool execution belongs to another call")
+            if (
+                isinstance(fact, ToolExecutionFact)
+                and fact.source_tool_call_id is None
+                and fact.execution_id != record.node_id
+            ):
+                raise TraceStoreProtocolError("Tool execution belongs to another call")
     elif record.kind is TraceGraphNodeKind.SUBAGENT:
-        if not isinstance(request_fact, SubagentFact):
-            raise TraceStoreProtocolError("Subagent Graph node start fact is invalid")
-        captured(request_fact.input, tool=True)
-    elif record.kind is TraceGraphNodeKind.SKILL:
-        if not isinstance(request_fact, SkillFact):
-            raise TraceStoreProtocolError("Skill Graph node fact is invalid")
-        values.append(request_fact.source_path)
+        if any(
+            isinstance(event.fact, SubagentFact)
+            and event.fact.subagent_id != record.node_id
+            for event in events
+            if event is not None
+        ):
+            raise TraceStoreProtocolError("Subagent locator belongs to another scope")
+    elif record.kind is TraceGraphNodeKind.HUMAN_MESSAGE:
+        for event in events:
+            if event is None:
+                continue
+            fact = event.fact
+            if (
+                isinstance(fact, SubagentFact)
+                and _subagent_input_node(fact) != record.node_id
+            ):
+                raise TraceStoreProtocolError(
+                    "Subagent input locator belongs to another event"
+                )
+            if isinstance(fact, MessageFact) and fact.message_id != record.node_id:
+                raise TraceStoreProtocolError(
+                    "Message locator belongs to another event"
+                )
+            if isinstance(fact, TurnFact):
+                source_id = fact.user_message_id or fact.turn_id
+                if scope_id("message", (), source_id) != record.node_id:
+                    raise TraceStoreProtocolError(
+                        "Turn locator belongs to another HumanMessage"
+                    )
+    elif record.kind is TraceGraphNodeKind.ASSISTANT_MESSAGE:
+        message = _message_fact_for(record)
+        if message is not None and message.message_id != record.node_id:
+            raise TraceStoreProtocolError(
+                "Assistant locator belongs to another message"
+            )
     elif record.kind in {
         TraceGraphNodeKind.MEMORY,
         TraceGraphNodeKind.GUARDRAIL,
         TraceGraphNodeKind.RETRIEVAL,
         TraceGraphNodeKind.CUSTOM,
     }:
-        if isinstance(request_fact, ContextContributionFact):
-            captured(request_fact.input)
-        if isinstance(result_fact, ContextContributionFact):
-            captured(result_fact.output)
-        if isinstance(failure_fact, ContextContributionFact):
-            values.append(failure_fact.error_type or "context_error")
+        if any(
+            not isinstance(event.fact, ContextContributionFact)
+            or event.fact.contribution_id != record.node_id
+            for event in events
+            if event is not None
+        ):
+            raise TraceStoreProtocolError("Context locator belongs to another event")
     elif record.kind is TraceGraphNodeKind.PLAN:
-        if not isinstance(result_fact, PlanRevisionFact):
-            raise TraceStoreProtocolError("Plan Graph node fact is invalid")
-        captured(result_fact.plan)
-    elif record.kind is TraceGraphNodeKind.INTERACTION:
-        if not isinstance(result_fact, InteractionFact):
-            raise TraceStoreProtocolError("Interaction Graph node fact is invalid")
-        captured(result_fact.payload)
-    elif record.kind is TraceGraphNodeKind.RUN:
-        if not isinstance(start, RunFact) or start.phase != "started":
-            raise TraceStoreProtocolError("Run Graph node start fact is invalid")
-        if isinstance(failure_fact, RunFact):
-            values.append(failure_fact.error_type or "run_error")
-            if failure_fact.code is not None:
-                values.append(failure_fact.code)
+        if any(
+            not isinstance(event.fact, PlanRevisionFact)
+            or scope_id(
+                "plan",
+                event.fact.namespace,
+                event.fact.identity.run_id,
+            )
+            != record.node_id
+            for event in events
+            if event is not None
+        ):
+            raise TraceStoreProtocolError("Plan locator belongs to another event")
+    elif record.kind is TraceGraphNodeKind.INTERACTION and any(
+        not isinstance(event.fact, InteractionFact)
+        or event.fact.interaction_id != record.node_id
+        for event in events
+        if event is not None
+    ):
+        raise TraceStoreProtocolError("Interaction locator belongs to another event")
+
+    _validate_locator_slots(record)
+
+    expected_issue: TraceGraphLinkIssue | None = None
+    if (
+        record.kind is TraceGraphNodeKind.ASSISTANT_MESSAGE
+        and record.model_call_id is None
+    ):
+        expected_issue = TraceGraphLinkIssue.MISSING_MODEL_CALL
+    elif record.kind is TraceGraphNodeKind.TOOL:
+        if any(
+            isinstance(event.fact, ToolExecutionFact)
+            and event.fact.source_tool_call_id is None
+            for event in events
+            if event is not None
+        ):
+            expected_issue = TraceGraphLinkIssue.MISSING_TOOL_PROPOSAL
+        elif record.model_call_id is None and any(
+            (
+                isinstance(event.fact, ToolExecutionFact)
+                and event.fact.source_tool_call_id is not None
+            )
+            or (
+                isinstance(event.fact, ToolFact)
+                and event.fact.phase in {"started", "arguments"}
+            )
+            for event in events
+            if event is not None
+        ):
+            expected_issue = TraceGraphLinkIssue.MISSING_MODEL_CALL
+    elif record.kind is TraceGraphNodeKind.SUBAGENT:
+        if not isinstance(subagent_fact, SubagentFact):
+            raise TraceStoreProtocolError("Subagent Graph event has no source fact")
+        if subagent_fact.parent_tool_call_id is None:
+            expected_issue = TraceGraphLinkIssue.MISSING_TOOL_PROPOSAL
+        elif record.model_call_id is None:
+            expected_issue = TraceGraphLinkIssue.MISSING_MODEL_CALL
+    if record.link_issue is not expected_issue:
+        raise TraceStoreProtocolError(
+            "Trace Graph link issue conflicts with its relationship facts"
+        )
+
+
+def trace_graph_record_search_values(
+    record: TraceGraphNodeRecord,
+    *,
+    allowed_run_ids: frozenset[str],
+) -> tuple[JsonValue, ...]:
+    """Return decoded detail values exposed by the corresponding public event."""
+
+    node = project_trace_graph_node(
+        record,
+        turn_id="search",
+        parent_subagent_id=record.parent_subagent_id,
+        relationship_missing=False,
+        allowed_run_ids=allowed_run_ids,
+    )
+    values: list[JsonValue] = []
+    for value, omitted in (
+        (node.content, node.content_omitted),
+        (node.request, node.request_omitted),
+        (node.result, node.result_omitted),
+    ):
+        if value is not None and not omitted:
+            values.append(value)
+    if node.failure is not None:
+        values.append(node.failure.error_type)
+        if node.failure.message is not None:
+            values.append(node.failure.message)
     return tuple(values)
 
 
@@ -277,13 +604,14 @@ def project_trace_graph_node(
     record: TraceGraphNodeRecord,
     *,
     turn_id: str,
-    parent_id: str | None,
+    parent_subagent_id: str | None,
     relationship_missing: bool,
+    allowed_run_ids: frozenset[str],
 ) -> TraceGraphNode:
-    """Build one public node without trusting duplicated index detail fields."""
+    """Build one public event while validating every Ledger locator owner."""
 
+    _validate_locator_ownership(record, allowed_run_ids=allowed_run_ids)
     start = record.started_event.fact
-    update = record.updated_event.fact
     request_fact = None if record.request_event is None else record.request_event.fact
     result_fact = None if record.result_event is None else record.result_event.fact
     failure_fact = None if record.failure_event is None else record.failure_event.fact
@@ -297,39 +625,58 @@ def project_trace_graph_node(
     response_metadata: JsonValue | None = None
     failure: TraceGraphFailure | None = None
     source_id: str | None = None
-    class_name: str | None = None
-    hooks: tuple[str, ...] = ()
-    source_path: str | None = None
+    tool_call_only = False
 
-    if record.kind in {
-        TraceGraphNodeKind.HUMAN_MESSAGE,
-        TraceGraphNodeKind.ASSISTANT_MESSAGE,
-    }:
-        message_fact = result_fact if isinstance(result_fact, MessageFact) else update
-        if not isinstance(message_fact, MessageFact):
-            if record.kind is TraceGraphNodeKind.HUMAN_MESSAGE and isinstance(
-                start, TurnFact
-            ):
-                source_id = start.user_message_id
-            elif not isinstance(start, ModelCallFact):
-                raise TraceStoreProtocolError("Message Graph node fact is invalid")
-        else:
+    if record.kind is TraceGraphNodeKind.HUMAN_MESSAGE:
+        message_fact = _message_fact_for(record)
+        subagent_fact = next(
+            (
+                event.fact
+                for event in (
+                    record.result_event,
+                    record.request_event,
+                    record.started_event,
+                )
+                if event is not None and isinstance(event.fact, SubagentFact)
+            ),
+            None,
+        )
+        if message_fact is not None:
             source_id = message_fact.source_message_id
             content, content_omitted = _captured(message_fact.content)
-    elif record.kind is TraceGraphNodeKind.SYSTEM_MESSAGE:
+        elif isinstance(subagent_fact, SubagentFact):
+            source_id = subagent_fact.parent_tool_call_id
+            content, content_omitted = _subagent_task_content(subagent_fact.input)
+        elif isinstance(start, TurnFact):
+            source_id = start.user_message_id
+        else:
+            raise TraceStoreProtocolError("HumanMessage Graph event is invalid")
+    elif record.kind is TraceGraphNodeKind.ASSISTANT_MESSAGE:
+        message_fact = _message_fact_for(record)
+        if message_fact is not None:
+            source_id = message_fact.source_message_id
+            content, content_omitted = _captured(message_fact.content)
+        elif not isinstance(start, ModelCallFact):
+            raise TraceStoreProtocolError("AssistantMessage Graph event is invalid")
+        tool_call_only = _assistant_tool_call_only(
+            record,
+            content=content,
+            content_omitted=content_omitted,
+        )
+    elif record.kind is TraceGraphNodeKind.CONTEXT:
         if (
             not isinstance(request_fact, ModelCallFact)
             or request_fact.phase != "started"
         ):
-            raise TraceStoreProtocolError("SystemMessage Graph node fact is invalid")
-        content, content_omitted = _system_message_content(record.node_id, request_fact)
-        source_id = record.node_id.rpartition(":")[2]
+            raise TraceStoreProtocolError("Context Graph event is invalid")
+        content, content_omitted = _context_content(request_fact)
+        source_id = request_fact.call_id
     elif record.kind is TraceGraphNodeKind.MODEL:
         if (
             not isinstance(request_fact, ModelCallFact)
             or request_fact.phase != "started"
         ):
-            raise TraceStoreProtocolError("Model Graph node start fact is invalid")
+            raise TraceStoreProtocolError("Model Graph event is invalid")
         request, request_omitted = _captured(request_fact.request)
         source_id = request_fact.call_id
         if isinstance(result_fact, ModelCallFact):
@@ -361,47 +708,14 @@ def project_trace_graph_node(
             )
         elif isinstance(failure_fact, ToolFact):
             failure = TraceGraphFailure(error_type="tool_error")
-    elif record.kind in {
-        TraceGraphNodeKind.AGENT,
-        TraceGraphNodeKind.MIDDLEWARE,
-    }:
-        step_start = request_fact if isinstance(request_fact, AgentStepFact) else start
-        if not isinstance(step_start, AgentStepFact) or step_start.phase != "started":
-            raise TraceStoreProtocolError("Agent Graph node start fact is invalid")
-        source_id = step_start.source_task_id
-        hooks = () if step_start.hook is None else (step_start.hook,)
-        if isinstance(failure_fact, AgentStepFact):
-            failure = _failure(
-                failure_fact.error_type or "agent_error",
-                message=failure_fact.error_message,
-            )
-    elif record.kind is TraceGraphNodeKind.RUNTIME_TASK:
-        if isinstance(request_fact, RuntimeTaskFact):
-            source_id = request_fact.source_task_id
-            request, request_omitted = _captured(request_fact.input)
-        elif isinstance(request_fact, AgentStepFact):
-            source_id = request_fact.source_task_id
-        if isinstance(result_fact, RuntimeTaskFact):
-            result, result_omitted = _captured(result_fact.result)
-        if isinstance(failure_fact, RuntimeTaskFact):
-            failure = TraceGraphFailure(
-                error_type=failure_fact.error_type or "runtime_task_error"
-            )
-        elif isinstance(failure_fact, AgentStepFact):
-            failure = _failure(
-                failure_fact.error_type or "runtime_task_error",
-                message=failure_fact.error_message,
-            )
     elif record.kind is TraceGraphNodeKind.SUBAGENT:
-        if not isinstance(request_fact, SubagentFact):
-            raise TraceStoreProtocolError("Subagent Graph node start fact is invalid")
-        source_id = request_fact.parent_tool_call_id
-        request, request_omitted = _captured_tool(request_fact.input)
-    elif record.kind is TraceGraphNodeKind.SKILL:
-        if not isinstance(request_fact, SkillFact):
-            raise TraceStoreProtocolError("Skill Graph node fact is invalid")
-        source_id = request_fact.execution_id
-        source_path = request_fact.source_path
+        subagent_request_fact = (
+            request_fact if isinstance(request_fact, SubagentFact) else start
+        )
+        if not isinstance(subagent_request_fact, SubagentFact):
+            raise TraceStoreProtocolError("Subagent Graph event is invalid")
+        source_id = subagent_request_fact.parent_tool_call_id
+        request, request_omitted = _captured_tool(subagent_request_fact.input)
     elif record.kind in {
         TraceGraphNodeKind.MEMORY,
         TraceGraphNodeKind.GUARDRAIL,
@@ -418,42 +732,25 @@ def project_trace_graph_node(
             )
     elif record.kind is TraceGraphNodeKind.PLAN:
         if not isinstance(result_fact, PlanRevisionFact):
-            raise TraceStoreProtocolError("Plan Graph node fact is invalid")
+            raise TraceStoreProtocolError("Plan Graph event is invalid")
         result, result_omitted = _captured(result_fact.plan)
         source_id = result_fact.revision_id
     elif record.kind is TraceGraphNodeKind.INTERACTION:
         if not isinstance(result_fact, InteractionFact):
-            raise TraceStoreProtocolError("Interaction Graph node fact is invalid")
+            raise TraceStoreProtocolError("Interaction Graph event is invalid")
         result, result_omitted = _captured(result_fact.payload)
         source_id = result_fact.source_interaction_id
-    elif record.kind is TraceGraphNodeKind.RUN:
-        if not isinstance(start, RunFact) or start.phase != "started":
-            raise TraceStoreProtocolError("Run Graph node start fact is invalid")
-        source_id = start.identity.run_id
-        if isinstance(failure_fact, RunFact):
-            failure = _failure(
-                failure_fact.error_type or "run_error",
-                code=failure_fact.code,
-            )
-    else:  # pragma: no cover - exhaustive enum handling above
-        raise TraceStoreProtocolError("Trace Graph node kind has no projection")
+    else:
+        raise TraceStoreProtocolError("Trace Graph event kind has no projection")
 
     issues = () if record.link_issue is None else (record.link_issue,)
-    if relationship_missing:
-        inferred = {
-            TraceGraphNodeKind.ASSISTANT_MESSAGE: (
-                TraceGraphLinkIssue.MISSING_MODEL_OUTPUT
-            ),
-            TraceGraphNodeKind.TOOL: TraceGraphLinkIssue.MISSING_TOOL_PROPOSAL,
-            TraceGraphNodeKind.SKILL: TraceGraphLinkIssue.MISSING_TOOL_EXECUTION,
-        }.get(record.kind, TraceGraphLinkIssue.MISSING_PARENT)
-        if inferred not in issues:
-            issues = (*issues, inferred)
+    if relationship_missing and TraceGraphLinkIssue.MISSING_SUBAGENT not in issues:
+        issues = (*issues, TraceGraphLinkIssue.MISSING_SUBAGENT)
     return TraceGraphNode(
         id=record.node_id,
         turn_id=turn_id,
-        parent_id=parent_id,
-        structural_parent_id=record.structural_parent_id,
+        parent_subagent_id=parent_subagent_id,
+        model_call_id=record.model_call_id,
         kind=record.kind,
         status=record.status,
         name=record.name,
@@ -470,6 +767,7 @@ def project_trace_graph_node(
         updated_seq=record.updated_seq,
         content=content,
         content_omitted=content_omitted,
+        tool_call_only=tool_call_only,
         request=request,
         request_omitted=request_omitted,
         result=result,
@@ -477,9 +775,6 @@ def project_trace_graph_node(
         usage=usage,
         response_metadata=response_metadata,
         failure=failure,
-        class_name=class_name,
-        hooks=hooks,
-        source_path=source_path,
         link_issues=issues,
     )
 
@@ -489,133 +784,34 @@ def project_trace_graph_records(
     *,
     turns: tuple[TraceGraphTurn, ...],
     run_turns: Mapping[str, str],
-    include_technical_nodes: bool,
-    include_ancestor_nodes: bool,
-) -> tuple[
-    tuple[TraceGraphNode, ...],
-    tuple[str, ...],
-    tuple[str, ...],
-]:
-    """Project visible parents and authoritative order from Graph records."""
+    selected_run_ids: frozenset[str],
+) -> tuple[tuple[TraceGraphNode, ...], tuple[str, ...]]:
+    """Project flat scopes and deterministic display order from Graph records."""
 
     turn_by_id = {turn.id: turn for turn in turns}
-    records_by_id = {record.node_id: record for record in records}
-    visible_records = {
-        node_id: record
-        for node_id, record in records_by_id.items()
-        if include_technical_nodes
-        or record.kind not in TECHNICAL_TRACE_GRAPH_NODE_KINDS
-    }
+    record_ids = {record.node_id for record in records}
     projected: dict[str, TraceGraphNode] = {}
-    for node_id, record in visible_records.items():
+    for record in records:
         turn_id = run_turns.get(record.run_id)
         turn = None if turn_id is None else turn_by_id.get(turn_id)
         if turn is None:
             raise TraceStoreProtocolError(
-                "Trace Graph node has no selected Turn ownership"
+                "Trace Graph event has no selected Turn ownership"
             )
-        parent_id, relationship_missing = _visible_graph_parent(
-            record,
-            turn=turn,
-            records=records_by_id,
-            visible_node_ids=frozenset(visible_records),
-            include_ancestor_nodes=include_ancestor_nodes,
-        )
-        projected[node_id] = project_trace_graph_node(
+        parent_id = record.parent_subagent_id
+        missing = parent_id is not None and parent_id not in record_ids
+        projected[record.node_id] = project_trace_graph_node(
             record,
             turn_id=turn.id,
-            parent_id=parent_id,
-            relationship_missing=relationship_missing,
+            parent_subagent_id=None if missing else parent_id,
+            relationship_missing=missing,
+            allowed_run_ids=selected_run_ids,
         )
-    ordered_ids = _ordered_graph_node_ids(turns, projected)
-    nodes = tuple(projected[node_id] for node_id in ordered_ids)
-    roots = tuple(node.id for node in nodes if node.parent_id is None)
-    return nodes, ordered_ids, roots
-
-
-def _visible_graph_parent(
-    record: TraceGraphNodeRecord,
-    *,
-    turn: TraceGraphTurn,
-    records: Mapping[str, TraceGraphNodeRecord],
-    visible_node_ids: frozenset[str],
-    include_ancestor_nodes: bool,
-) -> tuple[str | None, bool]:
-    """Resolve the nearest visible ancestor without hiding missing evidence."""
-
-    if record.node_id == turn.root_node_id:
-        return None, False
-    relationship_missing = record.structural_parent_id is None and record.kind not in {
-        TraceGraphNodeKind.HUMAN_MESSAGE,
-        TraceGraphNodeKind.RUN,
-    }
-    candidate = record.structural_parent_id
-    visited = {record.node_id}
-    while candidate is not None:
-        if candidate in visited:
-            raise TraceStoreProtocolError("Trace Graph contains a parent cycle")
-        visited.add(candidate)
-        if candidate in visible_node_ids:
-            return candidate, relationship_missing
-        parent = records.get(candidate)
-        if parent is None:
-            relationship_missing = include_ancestor_nodes
-            break
-        candidate = parent.structural_parent_id
-    if turn.root_node_id in visible_node_ids:
-        return turn.root_node_id, relationship_missing
-    return None, relationship_missing
-
-
-def _ordered_graph_node_ids(
-    turns: tuple[TraceGraphTurn, ...],
-    nodes: Mapping[str, TraceGraphNode],
-) -> tuple[str, ...]:
-    """Return deterministic Turn-first depth-first order for visible nodes."""
-
-    by_turn: dict[str, list[TraceGraphNode]] = {}
-    for node in nodes.values():
-        by_turn.setdefault(node.turn_id, []).append(node)
-    ordered: list[str] = []
-    for turn in sorted(turns, key=lambda item: (item.ordinal, item.id)):
-        turn_nodes = by_turn.get(turn.id, [])
-        node_ids = {node.id for node in turn_nodes}
-        children: dict[str, list[TraceGraphNode]] = {}
-        roots: list[TraceGraphNode] = []
-        for node in turn_nodes:
-            if node.parent_id is None or node.parent_id not in node_ids:
-                roots.append(node)
-            else:
-                children.setdefault(node.parent_id, []).append(node)
-
-        def key(item: TraceGraphNode) -> tuple[int, str]:
-            return item.started_seq, item.id
-
-        roots.sort(key=key)
-        for values in children.values():
-            values.sort(key=key)
-        visiting: set[str] = set()
-        visited: set[str] = set()
-
-        def visit(node: TraceGraphNode) -> None:
-            if node.id in visited:
-                return
-            if node.id in visiting:
-                raise TraceStoreProtocolError("Trace Graph contains a visible cycle")
-            visiting.add(node.id)
-            ordered.append(node.id)
-            for child in children.get(node.id, ()):
-                visit(child)
-            visiting.remove(node.id)
-            visited.add(node.id)
-
-        for root in roots:
-            visit(root)
-        if visited != node_ids:
-            raise TraceStoreProtocolError("Trace Graph ordering omitted a node")
-    if set(ordered) != set(nodes):
-        raise TraceStoreProtocolError("Trace Graph ordering omitted a Turn")
-    return tuple(ordered)
+    try:
+        ordered_ids = canonical_trace_graph_node_order(turns, projected)
+    except ValueError as error:
+        raise TraceStoreProtocolError(str(error), cause=error) from error
+    return tuple(projected[node_id] for node_id in ordered_ids), ordered_ids
 
 
 __all__ = [

@@ -1,627 +1,970 @@
-"""Canonical Graph reduction from current semantic facts."""
+"""Flat timeline reduction, scope ordering, and locator ownership contracts."""
 
 from __future__ import annotations
 
-import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from typing import TypeVar
+from typing import TypedDict
 
-from pydantic import JsonValue
+import pytest
+from pydantic import JsonValue, ValidationError
 
 from tinkerfin_contracts import RunIdentity
+from tinkerfin_tracing import (
+    CapturedValue,
+    ContextContributionFact,
+    InteractionFact,
+    MessageFact,
+    ModelCallFact,
+    PlanRevisionFact,
+    SubagentFact,
+    ToolExecutionFact,
+    ToolFact,
+    TraceGraph,
+    TraceGraphCompleteness,
+    TraceGraphFailure,
+    TraceGraphNode,
+    TraceGraphNodeKind,
+    TraceGraphNodeStatus,
+    TraceGraphTurn,
+    TraceSemanticFact,
+    TurnFact,
+)
 from tinkerfin_tracing._graph_projection import (
     project_trace_graph_node,
+    project_trace_graph_records,
     reduce_trace_graph_records,
 )
 from tinkerfin_tracing._graph_reducer import (
-    apply_graph_node_mutation,
-    effective_graph_nodes,
     graph_node_mutations,
     reduce_graph_mutations,
 )
 from tinkerfin_tracing._ids import scope_id
-from tinkerfin_tracing.capture import CapturedValue
-from tinkerfin_tracing.facts import (
-    AgentStepFact,
-    MessageFact,
-    ModelCallFact,
-    RunFact,
-    RuntimeTaskFact,
-    SkillFact,
-    SubagentFact,
-    ToolExecutionFact,
-    ToolFact,
-    TraceEvent,
-    TraceFactBase,
-    TraceSemanticFact,
-    TurnFact,
-)
-from tinkerfin_tracing.graph import (
-    TraceGraphLinkIssue,
-    TraceGraphNodeKind,
-    TraceGraphNodeStatus,
-)
+from tinkerfin_tracing.errors import TraceStoreProtocolError
+from tinkerfin_tracing.facts import TraceEvent
 
-_START = datetime(2026, 9, 2, tzinfo=UTC)
-_IDENTITY = RunIdentity(threadId="thread-graph", runId="run-graph")
-FactT = TypeVar("FactT", bound=TraceFactBase)
+NOW = datetime(2026, 9, 4, 4, 0, tzinfo=UTC)
+IDENTITY = RunIdentity(threadId="thread", runId="run")
+
+
+class _CommonFactArgs(TypedDict):
+    source_observation_id: str
+    identity: RunIdentity
+    namespace: tuple[str, ...]
+    occurred_at: datetime
+    monotonic_ns: int
 
 
 def _captured(value: JsonValue) -> CapturedValue:
-    encoded = json.dumps(
-        value,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode()
+    import json
+
     return CapturedValue(
         disposition="inline",
-        safe_size_bytes=len(encoded),
+        safe_size_bytes=len(
+            json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()
+        ),
         value=value,
     )
 
 
-def _fact(
-    fact_type: type[FactT],
+def _common(
     sequence: int,
-    **values: object,
-) -> FactT:
-    return fact_type.model_validate(
+    *,
+    namespace: tuple[str, ...] = (),
+) -> _CommonFactArgs:
+    return {
+        "source_observation_id": f"observation-{sequence}",
+        "identity": IDENTITY,
+        "namespace": namespace,
+        "occurred_at": NOW + timedelta(milliseconds=sequence),
+        "monotonic_ns": sequence,
+    }
+
+
+def _event(sequence: int, fact: TraceSemanticFact) -> TraceEvent:
+    return TraceEvent.model_validate(
         {
-            "sourceObservationId": f"observation-{sequence}",
-            "identity": _IDENTITY,
-            "occurredAt": _START + timedelta(milliseconds=sequence),
-            "monotonicNs": sequence,
-            **values,
+            "eventId": f"event-{sequence}",
+            "traceSeq": sequence,
+            "generation": "generation",
+            "fact": fact,
+            "persistedBytes": 1,
         }
     )
 
 
-def _event(sequence: int, fact: TraceSemanticFact) -> TraceEvent:
-    return TraceEvent(
-        event_id=f"event-{sequence}",
-        trace_seq=sequence,
-        generation="generation-graph",
-        fact=fact,
-        persisted_bytes=1,
-    )
-
-
-def test_graph_reducer_roots_each_turn_at_human_message() -> None:
-    human_id = scope_id("message", (), "human-1")
+def test_turn_fact_is_the_only_root_human_creator() -> None:
+    user_id = scope_id("message", (), "user")
     events = (
         _event(
             1,
-            _fact(RunFact, 1, phase="started", inputKind="ordinary"),
+            TurnFact(
+                **_common(1),
+                turn_id="turn",
+                user_message_id="user",
+            ),
         ),
         _event(
             2,
-            _fact(
-                TurnFact,
-                2,
-                turnId="turn-1",
-                userMessageId="human-1",
+            MessageFact(
+                **_common(2),
+                phase="reconciled",
+                message_id=user_id,
+                source_message_id="user",
+                role="user",
+                content=_captured("real input"),
             ),
         ),
         _event(
             3,
-            _fact(
-                MessageFact,
-                3,
+            MessageFact(
+                **_common(3),
                 phase="reconciled",
-                messageId=human_id,
-                sourceMessageId="human-1",
+                message_id=scope_id("message", (), "internal"),
+                source_message_id="internal",
                 role="user",
-                content=_captured("value"),
+                content=_captured("internal input"),
+            ),
+        ),
+    )
+
+    records = reduce_trace_graph_records(events, run_ids=frozenset({"run"}))
+
+    humans = [
+        record for record in records if record.kind is TraceGraphNodeKind.HUMAN_MESSAGE
+    ]
+    assert [record.node_id for record in humans] == [user_id]
+    assert humans[0].result_seq == 2
+
+
+def test_model_tool_and_assistant_are_flat_siblings_with_explicit_model_links() -> None:
+    model_id = "model-call"
+    context_id = scope_id("context", (), model_id)
+    tool_id = scope_id("tool", (), "tool-call")
+    assistant_id = scope_id("message", (), "assistant")
+    events = (
+        _event(
+            1,
+            TurnFact(**_common(1), turn_id="turn", user_message_id="user"),
+        ),
+        _event(
+            2,
+            ModelCallFact(
+                **_common(2),
+                phase="started",
+                context_started_at=NOW + timedelta(milliseconds=1),
+                call_id=model_id,
+                request=_captured({"messages": []}),
+                system_message_positions=(),
+                output_message_ids=(),
+            ),
+        ),
+        _event(
+            3,
+            ModelCallFact(
+                **_common(3),
+                phase="completed",
+                call_id=model_id,
+                system_message_positions=(),
+                output_message_ids=("assistant",),
+                tool_call_ids=("tool-call",),
+            ),
+        ),
+        _event(
+            4,
+            ToolFact(
+                **_common(4),
+                phase="started",
+                tool_call_id=tool_id,
+                source_tool_call_id="tool-call",
+                parent_call_id=model_id,
+                tool_name="read_file",
+            ),
+        ),
+    )
+    records = reduce_trace_graph_records(events, run_ids=frozenset({"run"}))
+    turns = (TraceGraphTurn(id="turn", ordinal=1, started_at=NOW),)
+    nodes, ordered = project_trace_graph_records(
+        records,
+        turns=turns,
+        run_turns={"run": "turn"},
+        selected_run_ids=frozenset({"run"}),
+    )
+    by_id = {node.id: node for node in nodes}
+
+    assert by_id[model_id].parent_subagent_id is None
+    assert by_id[context_id].parent_subagent_id is None
+    assert by_id[context_id].started_at == NOW + timedelta(milliseconds=1)
+    assert by_id[context_id].completed_at == NOW + timedelta(milliseconds=2)
+    assert by_id[tool_id].parent_subagent_id is None
+    assert by_id[assistant_id].parent_subagent_id is None
+    assert by_id[tool_id].model_call_id == model_id
+    assert by_id[assistant_id].model_call_id == model_id
+    assert by_id[assistant_id].tool_call_only is True
+    assert (
+        ordered.index(context_id)
+        < ordered.index(model_id)
+        < ordered.index(assistant_id)
+        < ordered.index(tool_id)
+    )
+
+
+def test_tool_call_only_is_restricted_to_observed_assistant_content() -> None:
+    with pytest.raises(ValueError, match="AssistantMessage"):
+        TraceGraphNode(
+            id="tool",
+            turn_id="turn",
+            kind=TraceGraphNodeKind.TOOL,
+            status=TraceGraphNodeStatus.SUCCEEDED,
+            name="read_file",
+            run_id="run",
+            started_at=NOW,
+            completed_at=NOW,
+            started_seq=1,
+            updated_seq=1,
+            content_omitted=False,
+            tool_call_only=True,
+            request_omitted=False,
+            result_omitted=False,
+        )
+
+    with pytest.raises(ValidationError, match="failed event status"):
+        TraceGraphNode(
+            id="model",
+            turn_id="turn",
+            kind=TraceGraphNodeKind.MODEL,
+            status=TraceGraphNodeStatus.SUCCEEDED,
+            name="model",
+            run_id="run",
+            started_at=NOW,
+            completed_at=NOW,
+            started_seq=1,
+            updated_seq=1,
+            failure=TraceGraphFailure(error_type="provider_error"),
+            content_omitted=False,
+            request_omitted=False,
+            result_omitted=False,
+        )
+
+    with pytest.raises(ValueError, match="observed"):
+        TraceGraphNode(
+            id="assistant",
+            turn_id="turn",
+            kind=TraceGraphNodeKind.ASSISTANT_MESSAGE,
+            status=TraceGraphNodeStatus.SUCCEEDED,
+            name="AssistantMessage",
+            run_id="run",
+            started_at=NOW,
+            completed_at=NOW,
+            started_seq=1,
+            updated_seq=1,
+            content_omitted=True,
+            tool_call_only=True,
+            request_omitted=False,
+            result_omitted=False,
+        )
+
+
+def test_task_tool_produces_only_one_subagent_with_an_input_child() -> None:
+    namespace = ("tools:native-task",)
+    subagent_id = scope_id("subagent", namespace, namespace[-1])
+    events = (
+        _event(
+            1,
+            ToolFact(
+                **_common(1),
+                phase="started",
+                tool_call_id=scope_id("tool", (), "task-call"),
+                source_tool_call_id="task-call",
+                parent_call_id="model-call",
+                tool_name="task",
+            ),
+        ),
+        _event(
+            2,
+            ToolExecutionFact(
+                **_common(2),
+                phase="started",
+                execution_id="task-execution",
+                parent_call_id="model-call",
+                source_tool_call_id="task-call",
+                tool_name="task",
+                input=_captured({"description": "inspect"}),
+            ),
+        ),
+        _event(
+            3,
+            SubagentFact(
+                **_common(3, namespace=namespace),
+                phase="started",
+                subagent_id=subagent_id,
+                agent_name="researcher",
+                parent_tool_call_id="task-call",
+                parent_execution_id="task-execution",
+                model_call_id="model-call",
+                input=_captured({"description": "inspect"}),
+                status="running",
             ),
         ),
     )
 
     mutations = graph_node_mutations(events)
 
-    human = [item for item in mutations if item.node_id == human_id]
-    run = [item for item in mutations if item.kind is TraceGraphNodeKind.RUN]
-    assert human[0].kind is TraceGraphNodeKind.HUMAN_MESSAGE
-    assert len(human) == 1
-    assert human[-1].result_seq == 3
-    assert len(run) == 1
-    assert (
-        next(
-            item.structural_parent_id
-            for item in mutations
-            if item.node_id == run[0].node_id and item.structural_parent_id is not None
-        )
-        == human_id
+    assert not any(
+        mutation.kind is TraceGraphNodeKind.TOOL and mutation.name == "task"
+        for mutation in mutations
     )
+    subagents = [
+        mutation
+        for mutation in mutations
+        if mutation.kind is TraceGraphNodeKind.SUBAGENT
+    ]
+    assert len(subagents) == 1
+    assert subagents[0].node_id == subagent_id
+    assert subagents[0].model_call_id == "model-call"
+    input_nodes = [
+        mutation
+        for mutation in mutations
+        if mutation.kind is TraceGraphNodeKind.HUMAN_MESSAGE
+    ]
+    assert len(input_nodes) == 1
+    assert input_nodes[0].parent_subagent_id == subagent_id
 
 
-def test_graph_reducer_uses_a_functional_name_for_the_main_agent() -> None:
+def test_nested_subagent_scope_uses_only_nearest_subagent_owner() -> None:
+    outer_namespace = ("tools:outer",)
+    inner_namespace = (*outer_namespace, "tools:inner")
+    outer_id = scope_id("subagent", outer_namespace, outer_namespace[-1])
+    inner_id = scope_id("subagent", inner_namespace, inner_namespace[-1])
     events = (
         _event(
             1,
-            _fact(
-                AgentStepFact,
-                1,
+            SubagentFact(
+                **_common(1, namespace=outer_namespace),
                 phase="started",
-                callId="root-callback",
-                stepKind="agent",
-                name="LangGraph",
+                subagent_id=outer_id,
+                agent_name="outer",
+                parent_tool_call_id="outer-call",
+                status="running",
+            ),
+        ),
+        _event(
+            2,
+            SubagentFact(
+                **_common(2, namespace=inner_namespace),
+                phase="started",
+                subagent_id=inner_id,
+                agent_name="inner",
+                parent_tool_call_id="inner-call",
+                status="running",
             ),
         ),
     )
+    mutations = graph_node_mutations(events)
+    inner = next(mutation for mutation in mutations if mutation.node_id == inner_id)
 
-    (mutation,) = graph_node_mutations(events)
-
-    assert mutation.kind is TraceGraphNodeKind.AGENT
-    assert mutation.name == "Agent"
+    assert inner.parent_subagent_id == outer_id
 
 
-def test_graph_reducer_keeps_internal_user_messages_out_of_the_turn_tree() -> None:
-    event = _event(
-        1,
-        _fact(
-            MessageFact,
+def test_tool_execution_start_replaces_proposal_time_and_interrupt_has_no_completion() -> (
+    None
+):
+    tool_id = scope_id("tool", (), "call")
+    events = (
+        _event(
             1,
-            namespace=("create_plan:task-1",),
-            phase="reconciled",
-            messageId=scope_id(
-                "message",
-                ("create_plan:task-1",),
-                "internal-context",
+            ToolFact(
+                **_common(1),
+                phase="started",
+                tool_call_id=tool_id,
+                source_tool_call_id="call",
+                parent_call_id="model",
+                tool_name="read_file",
             ),
-            sourceMessageId="internal-context",
-            role="user",
-            content=_captured("Trusted Plan workflow context"),
+        ),
+        _event(
+            2,
+            ToolExecutionFact(
+                **_common(2),
+                phase="started",
+                execution_id="execution",
+                parent_call_id="model",
+                source_tool_call_id="call",
+                tool_name="read_file",
+                input=_captured({"file_path": "/tmp/a"}),
+            ),
+        ),
+        _event(
+            3,
+            ToolExecutionFact(
+                **_common(3),
+                phase="interrupted",
+                execution_id="execution",
+                parent_call_id="model",
+                source_tool_call_id="call",
+                tool_name="read_file",
+            ),
         ),
     )
+    records = reduce_trace_graph_records(events, run_ids=frozenset({"run"}))
+    tool = next(record for record in records if record.node_id == tool_id)
 
-    assert graph_node_mutations((event,)) == ()
+    assert tool.started_seq == 2
+    assert tool.started_at == events[1].fact.occurred_at
+    assert tool.status is TraceGraphNodeStatus.WAITING
+    assert tool.completed_at is None
 
 
-def test_graph_reducer_keeps_tool_messages_inside_the_tool_node() -> None:
-    event = _event(
-        1,
-        _fact(
-            MessageFact,
+def test_rebuild_reduction_preserves_scope_and_model_relations() -> None:
+    mutations = graph_node_mutations(
+        (
+            _event(
+                1,
+                ToolFact(
+                    **_common(1, namespace=("tools:parent",)),
+                    in_subagent_scope=True,
+                    phase="started",
+                    tool_call_id=scope_id("tool", ("tools:parent",), "call"),
+                    source_tool_call_id="call",
+                    parent_call_id="model",
+                    tool_name="read_file",
+                ),
+            ),
+        )
+    )
+
+    reduced = reduce_graph_mutations(mutations)
+
+    assert len(reduced) == 1
+    assert reduced[0].parent_subagent_id == scope_id(
+        "subagent", ("tools:parent",), "tools:parent"
+    )
+    assert reduced[0].model_call_id == "model"
+
+
+def _subagent_node(
+    index: int,
+    *,
+    parent: str | None,
+    namespace_depth: int | None = None,
+) -> TraceGraphNode:
+    timestamp = NOW + timedelta(milliseconds=index)
+    return TraceGraphNode(
+        id=f"subagent-{index}",
+        turn_id="turn",
+        parent_subagent_id=parent,
+        kind=TraceGraphNodeKind.SUBAGENT,
+        status=TraceGraphNodeStatus.SUCCEEDED,
+        name=f"subagent-{index}",
+        run_id="run",
+        namespace=tuple(
+            f"tools:{value}"
+            for value in range(
+                namespace_depth if namespace_depth is not None else index + 1
+            )
+        ),
+        started_at=timestamp,
+        completed_at=timestamp,
+        started_seq=index + 1,
+        updated_seq=index + 1,
+        content_omitted=False,
+        request_omitted=False,
+        result_omitted=False,
+        link_issues=(),
+    )
+
+
+def test_subagent_scope_accepts_64_levels_without_language_recursion() -> None:
+    nodes: list[TraceGraphNode] = []
+    parent: str | None = None
+    for index in range(64):
+        node = _subagent_node(index, parent=parent)
+        nodes.append(node)
+        parent = node.id
+    graph = TraceGraph(
+        turns=(TraceGraphTurn(id="turn", ordinal=1, started_at=NOW),),
+        nodes=tuple(nodes),
+        ordered_node_ids=tuple(node.id for node in nodes),
+        matched_node_ids=tuple(node.id for node in nodes),
+        as_of_seq=64,
+        completeness=TraceGraphCompleteness(),
+    )
+
+    assert len(graph.nodes) == 64
+
+
+def test_flat_scope_orders_the_four_thousand_node_store_boundary_iteratively() -> None:
+    nodes = tuple(
+        TraceGraphNode(
+            id=f"context-{index:04d}",
+            turn_id="turn",
+            kind=TraceGraphNodeKind.CUSTOM,
+            status=TraceGraphNodeStatus.SUCCEEDED,
+            name="Context",
+            run_id="run",
+            started_at=NOW + timedelta(microseconds=index),
+            completed_at=NOW + timedelta(microseconds=index),
+            started_seq=index + 1,
+            updated_seq=index + 1,
+            content_omitted=False,
+            request_omitted=False,
+            result_omitted=False,
+            link_issues=(),
+        )
+        for index in range(4000)
+    )
+    graph = TraceGraph(
+        turns=(TraceGraphTurn(id="turn", ordinal=1, started_at=NOW),),
+        nodes=nodes,
+        ordered_node_ids=tuple(node.id for node in nodes),
+        matched_node_ids=tuple(node.id for node in nodes),
+        as_of_seq=4000,
+        completeness=TraceGraphCompleteness(),
+    )
+
+    assert len(graph.nodes) == 4000
+
+
+def test_subagent_scope_accepts_a_leaf_inside_level_64() -> None:
+    nodes: list[TraceGraphNode] = []
+    parent: str | None = None
+    for index in range(64):
+        node = _subagent_node(index, parent=parent)
+        nodes.append(node)
+        parent = node.id
+    assistant = TraceGraphNode(
+        id="assistant-at-limit",
+        turn_id="turn",
+        parent_subagent_id=parent,
+        kind=TraceGraphNodeKind.ASSISTANT_MESSAGE,
+        status=TraceGraphNodeStatus.SUCCEEDED,
+        name="AssistantMessage",
+        run_id="run",
+        namespace=tuple(f"tools:{value}" for value in range(64)),
+        started_at=NOW + timedelta(milliseconds=64),
+        completed_at=NOW + timedelta(milliseconds=64),
+        started_seq=65,
+        updated_seq=65,
+        content_omitted=False,
+        request_omitted=False,
+        result_omitted=False,
+        link_issues=(),
+    )
+    nodes.append(assistant)
+
+    graph = TraceGraph(
+        turns=(TraceGraphTurn(id="turn", ordinal=1, started_at=NOW),),
+        nodes=tuple(nodes),
+        ordered_node_ids=tuple(node.id for node in nodes),
+        matched_node_ids=tuple(node.id for node in nodes),
+        as_of_seq=65,
+        completeness=TraceGraphCompleteness(),
+    )
+
+    assert graph.nodes[-1].parent_subagent_id == "subagent-63"
+
+
+def test_subagent_scope_rejects_more_than_64_levels() -> None:
+    nodes: list[TraceGraphNode] = []
+    parent: str | None = None
+    for index in range(65):
+        node = _subagent_node(
+            index,
+            parent=parent,
+            namespace_depth=min(index + 1, 64),
+        )
+        nodes.append(node)
+        parent = node.id
+
+    with pytest.raises(ValidationError, match="64 levels"):
+        TraceGraph(
+            turns=(TraceGraphTurn(id="turn", ordinal=1, started_at=NOW),),
+            nodes=tuple(nodes),
+            ordered_node_ids=tuple(node.id for node in nodes),
+            matched_node_ids=tuple(node.id for node in nodes),
+            as_of_seq=65,
+            completeness=TraceGraphCompleteness(),
+        )
+
+
+def test_subagent_scope_rejects_a_cycle() -> None:
+    first = _subagent_node(0, parent="subagent-1")
+    second = _subagent_node(1, parent="subagent-0")
+
+    with pytest.raises(ValidationError, match="cannot form a cycle"):
+        TraceGraph(
+            turns=(TraceGraphTurn(id="turn", ordinal=1, started_at=NOW),),
+            nodes=(first, second),
+            ordered_node_ids=(first.id, second.id),
+            matched_node_ids=(first.id, second.id),
+            as_of_seq=2,
+            completeness=TraceGraphCompleteness(),
+        )
+
+
+def test_subagent_scope_rejects_a_non_subagent_parent() -> None:
+    parent = TraceGraphNode(
+        id="tool-parent",
+        turn_id="turn",
+        kind=TraceGraphNodeKind.TOOL,
+        status=TraceGraphNodeStatus.SUCCEEDED,
+        name="read_file",
+        run_id="run",
+        started_at=NOW,
+        completed_at=NOW,
+        started_seq=1,
+        updated_seq=1,
+        content_omitted=False,
+        request_omitted=False,
+        result_omitted=False,
+        link_issues=(),
+    )
+    child = _subagent_node(1, parent=parent.id)
+
+    with pytest.raises(ValidationError, match="returned Subagents"):
+        TraceGraph(
+            turns=(TraceGraphTurn(id="turn", ordinal=1, started_at=NOW),),
+            nodes=(parent, child),
+            ordered_node_ids=(parent.id, child.id),
+            matched_node_ids=(parent.id, child.id),
+            as_of_seq=2,
+            completeness=TraceGraphCompleteness(),
+        )
+
+
+def test_locator_cannot_reuse_another_tool_result() -> None:
+    events = (
+        _event(
             1,
-            phase="reconciled",
-            messageId=scope_id("message", (), "tool-message"),
-            sourceMessageId="tool-message",
-            role="tool",
-            toolCallId="tool-call",
-            content=_captured("result"),
+            ToolExecutionFact(
+                **_common(1),
+                phase="started",
+                execution_id="a",
+                source_tool_call_id="a",
+                tool_name="read_file",
+                input=_captured({"file_path": "a"}),
+            ),
+        ),
+        _event(
+            2,
+            ToolExecutionFact(
+                **_common(2),
+                phase="completed",
+                execution_id="b",
+                source_tool_call_id="b",
+                tool_name="read_file",
+                output=_captured("b"),
+            ),
         ),
     )
+    records = reduce_trace_graph_records(events, run_ids=frozenset({"run"}))
+    record = next(record for record in records if record.node_id.endswith(":a"))
+    corrupted = replace(record, result_seq=2, result_event=events[1])
 
-    assert graph_node_mutations((event,)) == ()
+    with pytest.raises(TraceStoreProtocolError, match="another call"):
+        project_trace_graph_node(
+            corrupted,
+            turn_id="turn",
+            parent_subagent_id=None,
+            relationship_missing=False,
+            allowed_run_ids=frozenset({"run"}),
+        )
 
 
-def test_rebuild_reduces_one_node_across_ledger_page_boundaries() -> None:
+def test_model_context_locator_cannot_reuse_another_model_request() -> None:
+    events = tuple(
+        _event(
+            index,
+            ModelCallFact(
+                **_common(index),
+                phase="started",
+                context_started_at=NOW + timedelta(milliseconds=index - 1),
+                call_id=f"model-{index}",
+                request=_captured(
+                    {
+                        "messages": [
+                            {
+                                "messageType": "system",
+                                "content": f"system-{index}",
+                            }
+                        ]
+                    }
+                ),
+                system_message_positions=(0,),
+                output_message_ids=(),
+            ),
+        )
+        for index in (1, 2)
+    )
+    records = reduce_trace_graph_records(events, run_ids=frozenset({"run"}))
+    first = next(
+        record
+        for record in records
+        if record.kind is TraceGraphNodeKind.CONTEXT and "model-1" in record.node_id
+    )
+    projected = project_trace_graph_node(
+        first,
+        turn_id="turn",
+        parent_subagent_id=None,
+        relationship_missing=False,
+        allowed_run_ids=frozenset({"run"}),
+    )
+    assert projected.content == "system-1"
+    assert projected.started_at == NOW
+    assert projected.completed_at == NOW + timedelta(milliseconds=1)
+    corrupted = replace(first, request_seq=2, request_event=events[1])
+
+    with pytest.raises(TraceStoreProtocolError, match="another model request"):
+        project_trace_graph_node(
+            corrupted,
+            turn_id="turn",
+            parent_subagent_id=None,
+            relationship_missing=False,
+            allowed_run_ids=frozenset({"run"}),
+        )
+
+
+def test_model_result_locator_rejects_the_started_phase_of_the_same_call() -> None:
+    events = (
+        _event(
+            1,
+            ModelCallFact(
+                **_common(1),
+                phase="started",
+                context_started_at=NOW,
+                call_id="model",
+                request=_captured({"messages": []}),
+                system_message_positions=(),
+                output_message_ids=(),
+            ),
+        ),
+        _event(
+            2,
+            ModelCallFact(
+                **_common(2),
+                phase="completed",
+                call_id="model",
+                system_message_positions=(),
+                output_message_ids=(),
+            ),
+        ),
+    )
+    record = next(
+        item
+        for item in reduce_trace_graph_records(
+            events,
+            run_ids=frozenset({"run"}),
+        )
+        if item.node_id == "model"
+    )
+
+    with pytest.raises(TraceStoreProtocolError, match="result locator"):
+        project_trace_graph_node(
+            replace(record, result_seq=1, result_event=events[0]),
+            turn_id="turn",
+            parent_subagent_id=None,
+            relationship_missing=False,
+            allowed_run_ids=frozenset({"run"}),
+        )
+
+    for corrupted in (
+        replace(record, status=TraceGraphNodeStatus.RUNNING, completed_at=None),
+        replace(record, started_at=NOW),
+        replace(record, completed_at=NOW + timedelta(seconds=1)),
+    ):
+        with pytest.raises(TraceStoreProtocolError, match="conflicts with"):
+            project_trace_graph_node(
+                corrupted,
+                turn_id="turn",
+                parent_subagent_id=None,
+                relationship_missing=False,
+                allowed_run_ids=frozenset({"run"}),
+            )
+
+
+def test_model_failure_locator_rejects_a_completed_phase_of_the_same_call() -> None:
     started = _event(
         1,
-        _fact(
-            ToolFact,
-            1,
+        ModelCallFact(
+            **_common(1),
             phase="started",
-            toolCallId="tool-1",
-            sourceToolCallId="tool-1",
-            toolName="search",
+            context_started_at=NOW,
+            call_id="model",
+            request=_captured({"messages": []}),
+            system_message_positions=(),
+            output_message_ids=(),
+        ),
+    )
+    failed = _event(
+        2,
+        ModelCallFact(
+            **_common(2),
+            phase="failed",
+            call_id="model",
+            system_message_positions=(),
+            output_message_ids=(),
+            error_type="builtins.RuntimeError",
+            failure_origin=True,
         ),
     )
     completed = _event(
         2,
-        _fact(
-            ToolFact,
-            2,
-            phase="result",
-            toolCallId="tool-1",
-            sourceToolCallId="tool-1",
-            toolName="search",
-            content=_captured({"ok": True}),
-            resultStatus="success",
+        ModelCallFact(
+            **_common(2),
+            phase="completed",
+            call_id="model",
+            system_message_positions=(),
+            output_message_ids=(),
         ),
     )
-
-    mutations = reduce_graph_mutations(
-        (*graph_node_mutations((started,)), *graph_node_mutations((completed,)))
+    record = next(
+        item
+        for item in reduce_trace_graph_records(
+            (started, failed),
+            run_ids=frozenset({"run"}),
+        )
+        if item.node_id == "model"
     )
 
-    assert len(mutations) == 1
-    assert mutations[0].started_seq == 1
-    assert mutations[0].updated_seq == 2
-    assert mutations[0].result_seq == 2
-    assert mutations[0].status is TraceGraphNodeStatus.SUCCEEDED
+    with pytest.raises(TraceStoreProtocolError, match="failure locator"):
+        project_trace_graph_node(
+            replace(record, failure_event=completed),
+            turn_id="turn",
+            parent_subagent_id=None,
+            relationship_missing=False,
+            allowed_run_ids=frozenset({"run"}),
+        )
 
 
-def test_graph_reducer_merges_runtime_and_callback_task_identity() -> None:
-    task_id = "native-task"
-    node_id = scope_id("runtime-task", (), f"{_IDENTITY.run_id}:{task_id}")
+def test_context_locator_cannot_reuse_another_contribution() -> None:
+    events = tuple(
+        _event(
+            index,
+            ContextContributionFact(
+                **_common(index),
+                phase="started",
+                contribution_id=f"context-{index}",
+                context_kind="custom",
+                name=f"context-{index}",
+                input=_captured({"value": index}),
+            ),
+        )
+        for index in (1, 2)
+    )
+    records = reduce_trace_graph_records(events, run_ids=frozenset({"run"}))
+    first = next(record for record in records if record.node_id == "context-1")
+    corrupted = replace(first, request_seq=2, request_event=events[1])
+
+    with pytest.raises(TraceStoreProtocolError, match="another event"):
+        project_trace_graph_node(
+            corrupted,
+            turn_id="turn",
+            parent_subagent_id=None,
+            relationship_missing=False,
+            allowed_run_ids=frozenset({"run"}),
+        )
+
+
+def test_plan_locator_cannot_reuse_another_run_revision() -> None:
+    first_identity = RunIdentity(threadId="thread", runId="plan-a")
+    second_identity = RunIdentity(threadId="thread", runId="plan-b")
     events = (
         _event(
             1,
-            _fact(
-                RuntimeTaskFact,
-                1,
-                phase="started",
-                taskId=scope_id("task", (), task_id),
-                sourceTaskId=task_id,
-                taskName="model",
+            PlanRevisionFact(
+                source_observation_id="plan-a",
+                identity=first_identity,
+                occurred_at=NOW,
+                monotonic_ns=1,
+                revision_id="revision-a",
+                revision=1,
+                status="active",
+                plan=_captured({"title": "a"}),
             ),
         ),
         _event(
             2,
-            _fact(
-                AgentStepFact,
-                2,
-                phase="started",
-                callId=node_id,
-                parentCallId="intermediate-chain",
-                stepKind="model",
-                name="model",
-                sourceTaskId=task_id,
+            PlanRevisionFact(
+                source_observation_id="plan-b",
+                identity=second_identity,
+                occurred_at=NOW + timedelta(milliseconds=1),
+                monotonic_ns=2,
+                revision_id="revision-b",
+                revision=1,
+                status="active",
+                plan=_captured({"title": "b"}),
             ),
         ),
     )
-
-    mutations = graph_node_mutations(events)
-
-    assert {item.node_id for item in mutations} == {node_id}
-    assert all(item.kind is TraceGraphNodeKind.RUNTIME_TASK for item in mutations)
-    assert mutations[-1].structural_parent_id == scope_id("agent", (), _IDENTITY.run_id)
-
-
-def test_graph_reducer_rebuilds_historical_task_backed_middleware_identity() -> None:
-    task_id = "middleware-task"
-    node_id = scope_id("runtime-task", (), f"{_IDENTITY.run_id}:{task_id}")
-    events = (
-        _event(
-            1,
-            _fact(
-                AgentStepFact,
-                1,
-                phase="started",
-                callId=scope_id("middleware-call", (), "historical-callback"),
-                stepKind="middleware",
-                name="TodoListMiddleware.after_model",
-                sourceTaskId=task_id,
-                middlewareName="TodoListMiddleware",
-                hook="after_model",
-            ),
-        ),
-        _event(
-            2,
-            _fact(
-                RuntimeTaskFact,
-                2,
-                phase="started",
-                taskId=scope_id("task", (), task_id),
-                sourceTaskId=task_id,
-                taskName="TodoListMiddleware.after_model",
-            ),
-        ),
+    records = reduce_trace_graph_records(
+        events,
+        run_ids=frozenset({"plan-a", "plan-b"}),
     )
+    first = next(record for record in records if record.run_id == "plan-a")
+    corrupted = replace(first, result_seq=2, result_event=events[1])
 
-    mutations = graph_node_mutations(events)
+    with pytest.raises(TraceStoreProtocolError, match="another event"):
+        project_trace_graph_node(
+            corrupted,
+            turn_id="turn",
+            parent_subagent_id=None,
+            relationship_missing=False,
+            allowed_run_ids=frozenset({"plan-a", "plan-b"}),
+        )
 
-    assert {item.node_id for item in mutations} == {node_id}
-    assert all(item.kind is TraceGraphNodeKind.MIDDLEWARE for item in mutations)
+
+def test_interaction_locator_cannot_reuse_another_interaction() -> None:
+    events = tuple(
+        _event(
+            index,
+            InteractionFact(
+                **_common(index),
+                phase="opened",
+                interaction_id=f"interaction-{index}",
+                source_interaction_id=f"native-{index}",
+                interaction_kind="tool_review",
+                status="pending",
+            ),
+        )
+        for index in (1, 2)
+    )
+    records = reduce_trace_graph_records(events, run_ids=frozenset({"run"}))
+    first = next(record for record in records if record.node_id == "interaction-1")
+    corrupted = replace(first, result_seq=2, result_event=events[1])
+
+    with pytest.raises(TraceStoreProtocolError, match="another event"):
+        project_trace_graph_node(
+            corrupted,
+            turn_id="turn",
+            parent_subagent_id=None,
+            relationship_missing=False,
+            allowed_run_ids=frozenset({"run"}),
+        )
 
 
-def test_graph_reducer_links_an_internal_subgraph_to_its_native_parent_task() -> None:
-    source_task_id = "plan-task"
-    namespace = (f"create_plan:{source_task_id}",)
+def test_link_issue_cannot_be_removed_from_standalone_assistant() -> None:
     event = _event(
         1,
-        _fact(
-            SubagentFact,
-            1,
-            namespace=namespace,
-            phase="started",
-            subagentId=scope_id("subagent", namespace, namespace[-1]),
-            status="running",
+        MessageFact(
+            **_common(1),
+            phase="reconciled",
+            message_id="assistant-without-model",
+            source_message_id="assistant-without-model",
+            role="assistant",
+            content=_captured("answer"),
         ),
     )
-
-    (mutation,) = graph_node_mutations((event,))
-
-    assert mutation.structural_parent_id == scope_id(
-        "runtime-task", (), f"{_IDENTITY.run_id}:{source_task_id}"
-    )
-    assert mutation.link_issue is None
-
-
-def test_graph_reducer_links_model_system_and_assistant_without_token_updates() -> None:
-    model_id = scope_id("model-call", (), "provider-call")
-    assistant_id = scope_id("message", (), "assistant-1")
-    request = _captured({})
-    events = (
-        _event(
-            1,
-            _fact(
-                ModelCallFact,
-                1,
-                phase="started",
-                callId=model_id,
-                parentCallId=scope_id("agent", (), _IDENTITY.run_id),
-                model="deepseek-chat",
-                request=request,
-                systemMessagePositions=(0,),
-                outputMessageIds=(),
-            ),
-        ),
-        _event(
-            2,
-            _fact(
-                ModelCallFact,
-                2,
-                phase="first_output",
-                callId=model_id,
-                outputMessageIds=("assistant-1",),
-                systemMessagePositions=(),
-            ),
-        ),
-        _event(
-            3,
-            _fact(
-                MessageFact,
-                3,
-                phase="content",
-                messageId=assistant_id,
-                sourceMessageId="assistant-1",
-                role="assistant",
-                content=_captured("value"),
-            ),
-        ),
-        _event(
-            4,
-            _fact(
-                MessageFact,
-                4,
-                phase="reconciled",
-                messageId=assistant_id,
-                sourceMessageId="assistant-1",
-                role="assistant",
-                content=_captured("value"),
-            ),
-        ),
-    )
-
-    mutations = graph_node_mutations(events)
-
-    assert not any(item.updated_seq == 3 for item in mutations)
-    assistant = [item for item in mutations if item.node_id == assistant_id]
-    assert len(assistant) == 1
-    assert assistant[0].structural_parent_id == model_id
-    assert assistant[-1].result_seq == 4
-    system = next(
-        item for item in mutations if item.kind is TraceGraphNodeKind.SYSTEM_MESSAGE
-    )
-    assert system.structural_parent_id == model_id
-    assert system.request_seq == 1
-
-
-def test_graph_reducer_aggregates_tool_execution_result_and_skill() -> None:
-    model_id = scope_id("model-call", (), "provider-call")
-    tool_id = scope_id("tool", (), "tool-call")
-    execution_id = scope_id("tool-execution", (), "execution")
-    events = (
-        _event(
-            1,
-            _fact(
-                ToolFact,
-                1,
-                phase="started",
-                toolCallId=tool_id,
-                sourceToolCallId="tool-call",
-                parentCallId=model_id,
-                toolName="read_file",
-            ),
-        ),
-        _event(
-            2,
-            _fact(
-                ToolExecutionFact,
-                2,
-                phase="started",
-                executionId=execution_id,
-                sourceToolCallId="tool-call",
-                toolName="read_file",
-                input=_captured({}),
-            ),
-        ),
-        _event(
-            3,
-            _fact(
-                SkillFact,
-                3,
-                skillId=scope_id("skill", (), "execution"),
-                executionId=execution_id,
-                sourceToolCallId="tool-call",
-                name="testing",
-                sourcePath="/skills/testing/SKILL.md",
-            ),
-        ),
-        _event(
-            4,
-            _fact(
-                ToolExecutionFact,
-                4,
-                phase="completed",
-                executionId=execution_id,
-                sourceToolCallId="tool-call",
-                toolName="read_file",
-                output=_captured({}),
-            ),
-        ),
-    )
-
-    mutations = graph_node_mutations(events)
-
-    tool_mutations = [item for item in mutations if item.node_id == tool_id]
-    assert {item.node_id for item in tool_mutations} == {tool_id}
-    assert tool_mutations[0].structural_parent_id == model_id
-    assert tool_mutations[-1].status is TraceGraphNodeStatus.SUCCEEDED
-    skill = next(item for item in mutations if item.kind is TraceGraphNodeKind.SKILL)
-    assert skill.structural_parent_id == tool_id
-
-
-def test_model_completion_resolves_an_earlier_tool_parent_gap() -> None:
-    model_id = scope_id("model-call", (), "provider-call")
-    tool_id = scope_id("tool", (), "tool-call")
-    started = _event(
-        1,
-        _fact(
-            ToolFact,
-            1,
-            phase="started",
-            toolCallId=tool_id,
-            sourceToolCallId="tool-call",
-            toolName="read_file",
-        ),
-    )
-    linked = _event(
-        2,
-        _fact(
-            ModelCallFact,
-            2,
-            phase="completed",
-            callId=model_id,
-            systemMessagePositions=(),
-            outputMessageIds=(),
-            toolCallIds=("tool-call",),
-        ),
-    )
-
-    same_batch = next(
-        mutation
-        for mutation in graph_node_mutations((started, linked))
-        if mutation.node_id == tool_id
-    )
-    split_batches = next(
-        mutation
-        for mutation in reduce_graph_mutations(
-            (
-                *graph_node_mutations((started,)),
-                *graph_node_mutations((linked,)),
-            )
-        )
-        if mutation.node_id == tool_id
-    )
-
-    for mutation in (same_batch, split_batches):
-        assert mutation.structural_parent_id == model_id
-        assert mutation.link_issue is not TraceGraphLinkIssue.MISSING_PARENT
-
-
-def test_child_lineage_parent_evidence_does_not_restore_an_ancestor_gap() -> None:
-    parent = _event(
-        1,
-        _fact(
-            ToolFact,
-            1,
-            phase="started",
-            toolCallId="tool-call",
-            sourceToolCallId="tool-call",
-            toolName="read_file",
-        ),
-    )
-    child_identity = RunIdentity(threadId=_IDENTITY.thread_id, runId="run-child")
-    child = _event(
-        2,
-        _fact(
-            ToolFact,
-            2,
-            identity=child_identity,
-            phase="started",
-            toolCallId="tool-call",
-            sourceToolCallId="tool-call",
-            parentCallId="child-model",
-            toolName="read_file",
-        ),
-    )
-    revisions = {}
-    for mutation in graph_node_mutations((parent, child)):
-        apply_graph_node_mutation(revisions, mutation)
-
-    nodes = effective_graph_nodes(
-        revisions.values(),
-        run_ids=frozenset({_IDENTITY.run_id, child_identity.run_id}),
-    )
-
-    assert len(nodes) == 1
-    assert nodes[0].structural_parent_id == "child-model"
-    assert nodes[0].link_issue is None
-
-
-def test_tool_result_does_not_replace_the_execution_failure_evidence() -> None:
-    tool_id = scope_id("tool", (), "tool-call")
-    events = (
-        _event(
-            1,
-            _fact(
-                ToolFact,
-                1,
-                phase="started",
-                toolCallId=tool_id,
-                sourceToolCallId="tool-call",
-                parentCallId="model-call",
-                toolName="read_file",
-            ),
-        ),
-        _event(
-            2,
-            _fact(
-                ToolExecutionFact,
-                2,
-                phase="started",
-                executionId="execution",
-                sourceToolCallId="tool-call",
-                toolName="read_file",
-                input=_captured({"path": "missing.txt"}),
-            ),
-        ),
-        _event(
-            3,
-            _fact(
-                ToolExecutionFact,
-                3,
-                phase="failed",
-                executionId="execution",
-                sourceToolCallId="tool-call",
-                toolName="read_file",
-                errorType="FileNotFoundError",
-                errorMessage=_captured("missing.txt was not found"),
-                failureOrigin=True,
-            ),
-        ),
-        _event(
-            4,
-            _fact(
-                ToolFact,
-                4,
-                phase="result",
-                toolCallId=tool_id,
-                sourceToolCallId="tool-call",
-                parentCallId="model-call",
-                toolName="read_file",
-                content=_captured("tool error result"),
-                resultStatus="error",
-            ),
-        ),
-    )
-
     record = reduce_trace_graph_records(
-        events,
-        run_ids=frozenset({_IDENTITY.run_id}),
+        (event,),
+        run_ids=frozenset({"run"}),
     )[0]
-    node = project_trace_graph_node(
-        record,
-        turn_id="turn:failure",
-        parent_id=None,
-        relationship_missing=False,
-    )
+    assert record.link_issue is not None
 
-    assert node.result == "tool error result"
-    assert node.failure is not None
-    assert node.failure.error_type == "FileNotFoundError"
-    assert node.failure.message == "missing.txt was not found"
+    with pytest.raises(TraceStoreProtocolError, match="link issue"):
+        project_trace_graph_node(
+            replace(record, link_issue=None),
+            turn_id="turn",
+            parent_subagent_id=None,
+            relationship_missing=False,
+            allowed_run_ids=frozenset({"run"}),
+        )

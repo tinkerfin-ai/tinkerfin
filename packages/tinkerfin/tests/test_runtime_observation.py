@@ -23,13 +23,13 @@ from tinkerfin import (
     DeepAgentsFactoryPreparation,
     DeepAgentsRuntimeProfile,
     DeepAgentsV2RuntimeProfile,
-    DeepAgentsV2StreamDriver,
     NativeStreamFrame,
     RunIdentity,
     RunObservationError,
     TinkerFin,
     TinkerFinStreamProtocolError,
 )
+from tinkerfin.native_driver import DeepAgentsV2StreamDriver
 from tinkerfin_contracts import (
     NativeStateObservation,
     ObservationBoundary,

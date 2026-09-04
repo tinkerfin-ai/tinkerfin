@@ -172,7 +172,7 @@ function ToastCard({
       <FeedbackIcon kind={toast.kind} />
       <p role={toast.kind === 'error' ? 'alert' : 'status'}>{message}</p>
       <button type="button" aria-label={t('关闭提示：{message}', { message })} onClick={() => requestDismissRef.current()}>
-        <X size={13} />
+        <X size={16} />
       </button>
     </li>
   )

@@ -6,17 +6,18 @@ import {
   useRef,
   useState,
   type RefObject,
+  type KeyboardEvent as ReactKeyboardEvent,
 } from 'react'
+import { createPortal } from 'react-dom'
 
 import type {
   TraceGraphNode,
-  TraceGraphNodeKind,
 } from '../../../api/conversation/traceGraph'
+import { compareTraceGraphNodes } from '../../../api/conversation/traceGraph'
 import {
   Button,
   DrawerHeader,
   FeedbackState,
-  FilterToggle,
   IconButton,
   OverlayScrollbar,
   ViewTabs,
@@ -24,12 +25,11 @@ import {
 import { useI18n } from '../../../i18n'
 import type { JsonObject, JsonValue } from '../../../types'
 import { MarkdownContent } from '../components/MarkdownContent'
-import { TraceCategoryFilters } from './TraceCategoryFilters'
 import { TraceLedger } from './TraceLedger'
 import { TraceNodeType } from './TraceNodeVisual'
 import { TraceTimeline } from './TraceTimeline'
-import { TraceTurnTree } from './TraceTurnTree'
 import {
+  buildTraceSequenceLayout,
   buildTraceTimelineLayout,
   groupTraceNodesByTurn,
   preferredTraceNode,
@@ -37,40 +37,25 @@ import {
 import {
   durationLabel,
   elapsedMilliseconds,
-  TRACE_PUBLIC_CATEGORIES,
-  TRACE_PUBLIC_CATEGORY_KINDS,
-  TRACE_TECHNICAL_KINDS,
+  traceContentText,
   traceKindLabel,
   traceStatusLabel,
-  type TracePublicCategory,
 } from './tracePresentation'
 import { useChainTrace } from './useChainTrace'
 import { useTraceModelResponse } from './useTraceModelResponse'
 
-const TRACE_VIEW_STORAGE_KEY = 'tinkerfin.chain-trace.view'
 const TRACE_SEARCH_DELAY_MS = 250
 const DETAILS_INLINE_MIN_WIDTH = 920
+const FOCUSABLE = [
+  'button:not([disabled])',
+  'input:not([disabled])',
+  'textarea:not([disabled])',
+  'select:not([disabled])',
+  '[href]',
+  '[tabindex]:not([tabindex="-1"])',
+].join(',')
 
-type TraceViewMode = 'timeline' | 'tree'
 type DetailTab = 'overview' | 'request' | 'system' | 'response' | 'usage' | 'timing' | 'result'
-
-const readTraceView = (): TraceViewMode => {
-  try {
-    return window.localStorage.getItem(TRACE_VIEW_STORAGE_KEY) === 'tree'
-      ? 'tree'
-      : 'timeline'
-  } catch {
-    return 'timeline'
-  }
-}
-
-const saveTraceView = (value: TraceViewMode) => {
-  try {
-    window.localStorage.setItem(TRACE_VIEW_STORAGE_KEY, value)
-  } catch {
-    // 浏览器禁用持久化时仍保留当前页面内的选择
-  }
-}
 
 const json = (value: unknown) => value == null ? '' : JSON.stringify(value, null, 2)
 
@@ -107,9 +92,7 @@ const mergeTraceNodes = (
     const current = byId.get(node.id)
     if (!current || node.updatedSeq >= current.updatedSeq) byId.set(node.id, node)
   })
-  return [...byId.values()].sort((left, right) => (
-    left.startedSeq - right.startedSeq || left.id.localeCompare(right.id)
-  ))
+  return [...byId.values()].sort(compareTraceGraphNodes)
 }
 
 const findTraceNodeTrigger = (
@@ -134,25 +117,14 @@ const restoreTraceNodeFocus = (
   })
 }
 
-const messageText = (content: unknown) => {
-  if (typeof content === 'string') return content
-  if (!Array.isArray(content)) return json(content)
-  return content.map((block) => (
-    isJsonObject(block) && block.type === 'text' && typeof block.text === 'string'
-      ? block.text
-      : json(block)
-  )).filter(Boolean).join('\n')
-}
-
 const systemPrompt = (entry: TraceGraphNode) => {
-  if (entry.kind === 'system_message') return messageText(entry.content)
   if (!entry.request || typeof entry.request !== 'object' || Array.isArray(entry.request)) return ''
   const messages = entry.request.messages
   if (!Array.isArray(messages)) return ''
   return messages
     .filter(isJsonObject)
     .filter((message) => message.messageType === 'system')
-    .map((message) => messageText(message.content))
+    .map((message) => traceContentText(message.content))
     .filter(Boolean)
     .join('\n\n')
 }
@@ -161,9 +133,12 @@ const useTraceDetailsOverlay = (
   containerRef: RefObject<HTMLDivElement | null>,
   enabled: boolean,
 ) => {
-  const [overlay, setOverlay] = useState(false)
+  const [overlay, setOverlay] = useState<boolean | undefined>()
   useLayoutEffect(() => {
-    if (!enabled) return undefined
+    if (!enabled) {
+      setOverlay(undefined)
+      return undefined
+    }
     const container = containerRef.current
     if (!container) return undefined
     const measure = () => {
@@ -183,27 +158,13 @@ const useTraceDetailsOverlay = (
   return overlay
 }
 
-const useTraceNow = (nodes: readonly TraceGraphNode[], active: boolean) => {
-  const [now, setNow] = useState(() => Date.now())
-  const running = active && nodes.some((node) => (
-    !node.completedAt && (node.status === 'running' || node.status === 'waiting')
-  ))
-  useEffect(() => {
-    setNow(Date.now())
-    if (!running) return undefined
-    const timer = window.setInterval(() => setNow(Date.now()), 1000)
-    return () => window.clearInterval(timer)
-  }, [running])
-  return now
-}
-
 function TraceDetails({
   entry,
   responseEntries,
   responseStatus,
   turnOrdinal,
   stepOrdinal,
-  focusClose,
+  overlay,
   onRetryResponse,
   onClose,
 }: {
@@ -212,7 +173,7 @@ function TraceDetails({
   responseStatus: 'loading' | 'ready' | 'error'
   turnOrdinal?: number
   stepOrdinal?: number
-  focusClose: boolean
+  overlay: boolean
   onRetryResponse: () => void
   onClose: () => void
 }) {
@@ -220,17 +181,18 @@ function TraceDetails({
   const [tab, setTab] = useState<DetailTab>('overview')
   const closeButton = useRef<HTMLButtonElement>(null)
   const bodyRef = useRef<HTMLDivElement>(null)
-  const priorFocusClose = useRef(false)
+  const dialogRef = useRef<HTMLDialogElement>(null)
+  const overlayRef = useRef<HTMLDivElement>(null)
   const prompt = systemPrompt(entry)
   const responseMessages = responseEntries
     .filter((item) => item.kind === 'assistant_message')
     .map((item) => ({
       id: item.sourceId ?? item.id,
       type: 'AIMessage',
-      content: messageText(item.content),
+      content: traceContentText(item.content),
     }))
   const responseTools = responseEntries
-    .filter((item) => item.kind === 'tool')
+    .filter((item) => item.kind === 'tool' || item.kind === 'subagent')
     .map((item) => ({
       id: item.sourceId ?? item.id,
       name: item.name,
@@ -242,8 +204,8 @@ function TraceDetails({
     usageMetadata: entry.usage ?? null,
     responseMetadata: entry.responseMetadata ?? null,
   }
-  const messageContent = entry.kind.endsWith('_message')
-    ? messageText(entry.content)
+  const messageContent = entry.kind.endsWith('_message') || entry.kind === 'context'
+    ? traceContentText(entry.content)
     : ''
   const usageRows = entry.usage == null ? [] : flattenUsage(entry.usage)
   const usageLabels: Record<string, string> = {
@@ -276,9 +238,53 @@ function TraceDetails({
   const activeTab = tabs.some((item) => item.id === tab) ? tab : 'overview'
 
   useLayoutEffect(() => {
-    if (focusClose && !priorFocusClose.current) closeButton.current?.focus()
-    priorFocusClose.current = focusClose
-  }, [focusClose])
+    if (!overlay) return undefined
+    const overlayElement = overlayRef.current
+    if (!overlayElement) return undefined
+    const background = Array.from(document.body.children)
+      .filter((element): element is HTMLElement => (
+        element instanceof HTMLElement && element !== overlayElement
+      ))
+      .map((element) => ({
+        element,
+        inert: element.inert,
+        ariaHidden: element.getAttribute('aria-hidden'),
+      }))
+    background.forEach(({ element }) => {
+      element.inert = true
+      element.setAttribute('aria-hidden', 'true')
+    })
+    closeButton.current?.focus()
+    return () => background.forEach(({ element, inert, ariaHidden }) => {
+      element.inert = inert
+      if (ariaHidden == null) element.removeAttribute('aria-hidden')
+      else element.setAttribute('aria-hidden', ariaHidden)
+    })
+  }, [overlay])
+
+  const trapFocus = (event: ReactKeyboardEvent<HTMLElement>) => {
+    if (!overlay || event.defaultPrevented || event.key !== 'Tab') return
+    const focusable = Array.from(
+      dialogRef.current?.querySelectorAll<HTMLElement>(FOCUSABLE) ?? [],
+    )
+    if (focusable.length === 0) {
+      event.preventDefault()
+      dialogRef.current?.focus()
+      return
+    }
+    const first = focusable[0]
+    const last = focusable[focusable.length - 1]
+    if (event.shiftKey && (
+      document.activeElement === first
+      || !dialogRef.current?.contains(document.activeElement)
+    )) {
+      event.preventDefault()
+      last?.focus()
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault()
+      first?.focus()
+    }
+  }
 
   const total = elapsedMilliseconds(entry)
   const ttft = entry.firstOutputAt
@@ -288,8 +294,8 @@ function TraceDetails({
     ? t('第 {turn} 轮 · 步骤 {step}', { turn: turnOrdinal, step: stepOrdinal })
     : durationLabel(total, t)
 
-  return (
-    <aside id="chain-trace-details" className="chain-trace-details" aria-label={t('链路详情')}>
+  const detailsBody = (
+    <>
       <DrawerHeader
         ref={closeButton}
         density="compact"
@@ -342,6 +348,13 @@ function TraceDetails({
                   <MarkdownContent content={messageContent} variant="compact" />
                 </div>
               )}
+              {entry.kind === 'context' && !messageContent && (
+                <div className="chain-trace-detail-message is-empty">
+                  <p>{entry.contentOmitted
+                    ? t('最终系统提示词未保留')
+                    : t('本次模型请求没有最终系统提示词')}</p>
+                </div>
+              )}
               <h3 className="chain-trace-section-title">{t('基本信息')}</h3>
               <dl className="chain-trace-summary">
                 <div><dt>{t('状态')}</dt><dd>{traceStatusLabel(entry.status, t)}</dd></div>
@@ -354,9 +367,6 @@ function TraceDetails({
                 {entry.kind === 'tool' && <div><dt>{t('工具')}</dt><dd>{entry.name}</dd></div>}
                 {entry.agentName && <div><dt>{t('智能体')}</dt><dd>{entry.agentName}</dd></div>}
                 {entry.sourceId && <div><dt>{t('来源 ID')}</dt><dd>{entry.sourceId}</dd></div>}
-                {entry.sourcePath && <div><dt>{t('来源')}</dt><dd>{entry.sourcePath}</dd></div>}
-                {entry.className && <div><dt>{t('实现')}</dt><dd>{entry.className}</dd></div>}
-                {entry.hooks.length > 0 && <div><dt>{t('调用钩子')}</dt><dd>{entry.hooks.join(', ')}</dd></div>}
               </dl>
             </>
           )}
@@ -365,14 +375,13 @@ function TraceDetails({
           {activeTab === 'response' && (
             <div className="chain-trace-response">
               {responseStatus === 'loading' ? (
-                <div className="chain-trace-response-state" role="status">
-                  {t('正在加载完整响应…')}
-                </div>
+                <FeedbackState kind="loading" title={t('正在加载完整响应…')} />
               ) : responseStatus === 'error' ? (
-                <div className="chain-trace-response-state is-error" role="alert">
-                  <p>{t('完整响应加载失败')}</p>
-                  <Button size="xs" onClick={onRetryResponse}>{t('重试')}</Button>
-                </div>
+                <FeedbackState
+                  kind="error"
+                  title={t('完整响应加载失败')}
+                  onRetry={onRetryResponse}
+                />
               ) : (
                 <>
                   {responseMessages.map((message) => message.content && (
@@ -407,7 +416,7 @@ function TraceDetails({
           {activeTab === 'timing' && (
             <dl className="chain-trace-summary">
               <div><dt>{t('开始时间')}</dt><dd>{new Date(entry.startedAt).toLocaleString()}</dd></div>
-              <div><dt>{t('总时长')}</dt><dd>{durationLabel(total, t)}</dd></div>
+              <div><dt>{t('总时长')}</dt><dd>{total == null ? traceStatusLabel(entry.status, t) : durationLabel(total, t)}</dd></div>
               <div><dt>{t('首 token 延迟')}</dt><dd>{ttft == null ? t('不可用') : durationLabel(ttft, t)}</dd></div>
             </dl>
           )}
@@ -416,14 +425,50 @@ function TraceDetails({
               ? json({
                   errorType: entry.failure.errorType,
                   message: entry.failure.message ?? null,
-                  code: entry.failure.code ?? null,
                 })
               : entry.resultOmitted ? t('结果内容未保留') : json(entry.result)}</pre>
           )}
         </div>
         <OverlayScrollbar viewportRef={bodyRef} />
       </div>
+    </>
+  )
+  const details = overlay ? (
+    <dialog
+      ref={dialogRef}
+      open
+      id="chain-trace-details"
+      className="chain-trace-details"
+      aria-modal="true"
+      aria-label={t('链路详情')}
+      tabIndex={-1}
+      onKeyDown={trapFocus}
+    >
+      {detailsBody}
+    </dialog>
+  ) : (
+    <aside
+      id="chain-trace-details"
+      className="chain-trace-details"
+      aria-label={t('链路详情')}
+    >
+      {detailsBody}
     </aside>
+  )
+  if (!overlay) return details
+  return createPortal(
+    // 遮罩只响应抽屉外的指针操作，键盘关闭与焦点循环由抽屉自身负责
+    // eslint-disable-next-line jsx-a11y/no-static-element-interactions
+    <div
+      ref={overlayRef}
+      className="modal-backdrop chain-trace-details-backdrop"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onClose()
+      }}
+    >
+      {details}
+    </div>,
+    document.body,
   )
 }
 
@@ -435,20 +480,16 @@ export function ChainTraceView({
   active: boolean
 }) {
   const { locale, t } = useI18n()
-  const [view, setView] = useState<TraceViewMode>(readTraceView)
-  const [categories, setCategories] = useState<ReadonlySet<TracePublicCategory>>(
-    () => new Set(TRACE_PUBLIC_CATEGORIES),
-  )
-  const [showTechnical, setShowTechnical] = useState(false)
   const [isSearchOpen, setSearchOpen] = useState(false)
   const [searchInput, setSearchInput] = useState('')
   const [searchQuery, setSearchQuery] = useState('')
   const [selectedId, setSelectedId] = useState<string>()
   const detailTrigger = useRef<HTMLButtonElement | null>(null)
   const manualClose = useRef(false)
+  const scrollLatestIntoView = useRef(false)
+  const initiallyScrolledThread = useRef<string | undefined>(undefined)
   const contentRef = useRef<HTMLDivElement>(null)
   const traceRegion = useRef<HTMLElement>(null)
-  const filtersRef = useRef<HTMLDivElement>(null)
   const searchControlRef = useRef<HTMLDivElement>(null)
   const searchInputRef = useRef<HTMLInputElement>(null)
   const searchTriggerRef = useRef<HTMLButtonElement>(null)
@@ -473,21 +514,9 @@ export function ChainTraceView({
     return () => document.removeEventListener('pointerdown', handleOutsidePointerDown)
   }, [isSearchOpen, searchInput])
 
-  const categoryKey = TRACE_PUBLIC_CATEGORIES
-    .filter((category) => categories.has(category))
-    .join(':')
-  const requestedKinds = useMemo<TraceGraphNodeKind[]>(() => [
-    ...TRACE_PUBLIC_CATEGORIES.flatMap((category) => (
-      categories.has(category) ? TRACE_PUBLIC_CATEGORY_KINDS[category] : []
-    )),
-    ...(showTechnical ? TRACE_TECHNICAL_KINDS : []),
-  ], [categories, showTechnical])
   const filter = useMemo(() => ({
-    kinds: requestedKinds,
     query: searchQuery || undefined,
-    includeTechnicalNodes: showTechnical,
-    includeAncestorNodes: true,
-  }), [requestedKinds, searchQuery, showTechnical])
+  }), [searchQuery])
   const trace = useChainTrace({ threadId, active, filter, limit: 1000 })
   const page = trace.state.phase === 'ready' ? trace.state.page : undefined
   const graphNodes = useMemo(() => page?.nodes ?? [], [page?.nodes])
@@ -499,24 +528,47 @@ export function ChainTraceView({
     () => graphNodes.filter((node) => matchedNodeIds.has(node.id)),
     [graphNodes, matchedNodeIds],
   )
-  const visibleNodeIds = useMemo(
-    () => new Set(nodes.map((node) => node.id)),
-    [nodes],
-  )
-  const now = useTraceNow(nodes, active)
-  const timeline = useMemo(
-    () => buildTraceTimelineLayout(nodes, now),
-    [nodes, now],
-  )
-  const turnRows = useMemo(
-    () => groupTraceNodesByTurn(page?.turns ?? [], nodes),
-    [nodes, page?.turns],
-  )
   const nodesById = useMemo(
-    () => new Map(nodes.map((node) => [node.id, node])),
-    [nodes],
+    () => new Map(graphNodes.map((node) => [node.id, node])),
+    [graphNodes],
   )
   const selected = selectedId ? nodesById.get(selectedId) : undefined
+  const timelineNodes = useMemo(
+    () => selected
+      ? nodes.filter((node) => node.turnId === selected.turnId)
+      : nodes,
+    [nodes, selected],
+  )
+  const timelineTurns = useMemo(
+    () => selected
+      ? (page?.turns ?? []).filter((turn) => turn.id === selected.turnId)
+      : page?.turns ?? [],
+    [page?.turns, selected],
+  )
+  const timeline = useMemo(
+    () => selected
+      ? buildTraceTimelineLayout(timelineTurns, timelineNodes)
+      : null,
+    [selected, timelineNodes, timelineTurns],
+  )
+  const sequence = useMemo(
+    () => buildTraceSequenceLayout(page?.turns ?? [], nodes),
+    [nodes, page?.turns],
+  )
+  const turnRows = useMemo(
+    () => groupTraceNodesByTurn(page?.turns ?? [], graphNodes),
+    [graphNodes, page?.turns],
+  )
+  const timelineTurn = selected
+    ? timelineTurns.find((turn) => turn.id === selected.turnId)
+    : undefined
+  const turnSummary = timelineTurn
+    ? locale === 'en'
+      ? <>{t('第')} <strong>{timelineTurn.ordinal}</strong></>
+      : <>{t('第')} <strong>{timelineTurn.ordinal}</strong> {t('轮')}</>
+    : locale === 'en'
+      ? <>{t('共')} <strong>{timelineTurns.length}</strong> {t('轮')}{timelineTurns.length === 1 ? '' : 's'}</>
+      : <>{t('共')} <strong>{timelineTurns.length}</strong> {t('轮')}</>
   const selectedPosition = useMemo(() => {
     if (!selected) return undefined
     for (const { turn, nodes: turnNodes } of turnRows) {
@@ -526,12 +578,16 @@ export function ChainTraceView({
     return undefined
   }, [selected, turnRows])
   const localResponseEntries = useMemo(() => nodes.filter((node) => (
-    node.parentId === selected?.id
-    && (node.kind === 'assistant_message' || node.kind === 'tool')
+    node.modelCallId === selected?.id
+    && (
+      node.kind === 'assistant_message'
+      || node.kind === 'tool'
+      || node.kind === 'subagent'
+    )
   )), [nodes, selected?.id])
-  const mainResponseEntriesComplete = categories.has('assistant')
-    && categories.has('tool')
-    && !searchQuery
+  const mainResponseEntriesComplete = !searchQuery
+    && !page?.completeness.callTrackingMissing
+    && !page?.completeness.relationshipEvidenceMissing
     && !page?.completeness.detailsOmitted
   const responseQueryEnabled = selected?.kind === 'model'
     && !mainResponseEntriesComplete
@@ -565,7 +621,9 @@ export function ChainTraceView({
     ? t('部分节点缺少完整关联依据')
     : page?.completeness.callTrackingMissing
       ? t('部分历史运行没有调用级跟踪数据')
-      : undefined
+      : page?.completeness.detailsOmitted
+        ? t('部分链路内容未保留')
+        : undefined
 
   useEffect(() => {
     manualClose.current = false
@@ -573,13 +631,34 @@ export function ChainTraceView({
     setSelectedId(undefined)
   }, [threadId])
 
+  useLayoutEffect(() => {
+    if (
+      !active || !page || incomplete || nodes.length === 0
+      || initiallyScrolledThread.current === threadId
+    ) return
+    const ledger = traceRegion.current?.querySelector<HTMLElement>('.chain-trace-ledger')
+    if (!ledger) return
+    ledger.scrollTop = ledger.scrollHeight
+    initiallyScrolledThread.current = threadId
+  }, [active, incomplete, nodes.length, page, threadId])
+
   useEffect(() => {
-    if (!page || incomplete || nodes.length === 0) return
+    if (!page || incomplete || nodes.length === 0 || detailsOverlay !== false) return
     if (selectedId && nodesById.has(selectedId)) return
     if (manualClose.current && !selectedId) return
     detailTrigger.current = null
-    setSelectedId(preferredTraceNode(nodes)?.id)
-  }, [incomplete, nodes, nodesById, page, selectedId])
+    const preferred = preferredTraceNode(nodes)
+    if (!preferred) return
+    scrollLatestIntoView.current = true
+    setSelectedId(preferred.id)
+  }, [detailsOverlay, incomplete, nodes, nodesById, page, selectedId])
+
+  useLayoutEffect(() => {
+    if (!scrollLatestIntoView.current || !selectedId) return
+    scrollLatestIntoView.current = false
+    const ledger = traceRegion.current?.querySelector<HTMLElement>('.chain-trace-ledger')
+    if (ledger) ledger.scrollTop = ledger.scrollHeight
+  }, [selectedId])
 
   useEffect(() => {
     if (!selectedId) return undefined
@@ -631,20 +710,11 @@ export function ChainTraceView({
     restoreTraceNodeFocus(traceRegion.current, nodeId, trigger)
   }
 
-  const changeView = (next: TraceViewMode) => {
-    setView(next)
-    saveTraceView(next)
-    if (selectedId) locateNode(selectedId)
-  }
-
-  const toggleCategory = (category: TracePublicCategory) => {
-    setCategories((current) => {
-      if (current.has(category) && current.size === 1) return current
-      const next = new Set(current)
-      if (next.has(category)) next.delete(category)
-      else next.add(category)
-      return next
-    })
+  const hideDetailsForCollapse = (fallback: HTMLButtonElement) => {
+    manualClose.current = true
+    detailTrigger.current = fallback
+    setSelectedId(undefined)
+    window.requestAnimationFrame(() => fallback.focus())
   }
 
   const openSearch = () => {
@@ -669,22 +739,18 @@ export function ChainTraceView({
 
   return (
     <section ref={traceRegion} id="chain-trace-panel" className="chain-trace" role="tabpanel" aria-label={t('链路')}>
-      <div
-        className="chain-trace-toolbar-host"
-        aria-hidden={detailsOverlay && Boolean(selected) || undefined}
-        inert={detailsOverlay && Boolean(selected) || undefined}
-      >
-        <div className="chain-trace-toolbar" aria-label={t('链路筛选')}>
+      {trace.state.phase === 'ready' && (
+        <div
+          className="chain-trace-toolbar-host"
+          aria-hidden={detailsOverlay === true && Boolean(selected) || undefined}
+          inert={detailsOverlay === true && Boolean(selected) || undefined}
+        >
+          <div className="chain-trace-toolbar" aria-label={t('链路操作')}>
           <div className="chain-trace-toolbar-context">
             <div className="chain-trace-range-summary" aria-live="polite">
-              <span>{t('当前范围')} <strong>{durationLabel(timeline?.durationMilliseconds ?? 0, t)}</strong></span>
+              <span>{turnSummary}</span>
               <i aria-hidden="true">/</i>
-              <span>
-                <strong>{page?.turns.length ?? 0}</strong>{' '}
-                {t('轮')}{locale === 'en' && page?.turns.length !== 1 ? 's' : ''}
-              </span>
-              <i aria-hidden="true">/</i>
-              <span><strong>{nodes.length}</strong> {t('节点')}</span>
+              <span><strong>{timelineNodes.length}</strong> {t('节点')}</span>
             </div>
             {completenessMessage && (
               <span className="chain-trace-completeness" role="status">
@@ -692,46 +758,28 @@ export function ChainTraceView({
               </span>
             )}
           </div>
-          <div className="chain-trace-filters-host">
-            <div ref={filtersRef} className="chain-trace-filters">
-              <ViewTabs
-                value={view}
-                density="compact"
-                label={t('链路布局')}
-                options={[
-                  { value: 'timeline', label: t('时间线'), controls: 'chain-trace-timeline-panel' },
-                  { value: 'tree', label: t('树形'), controls: 'chain-trace-tree-panel' },
-                ]}
-                onChange={changeView}
-              />
-              <TraceCategoryFilters selected={categories} onToggle={toggleCategory} />
-              <FilterToggle
-                pressed={showTechnical}
-                label={t('技术')}
-                onPressedChange={setShowTechnical}
-              />
-              <div
-                ref={searchControlRef}
-                className={`chain-trace-search-control${isSearchOpen ? ' is-open' : ''}`}
-              >
+          <div className="chain-trace-actions">
+            <div
+              ref={searchControlRef}
+              className={`chain-trace-search-control${isSearchOpen ? ' is-open' : ''}`}
+            >
+              {!isSearchOpen ? (
                 <IconButton
                   ref={searchTriggerRef}
                   className="chain-trace-search-trigger"
                   size="sm"
                   label={t('搜索链路节点')}
                   tooltip={t('搜索链路节点')}
-                  icon={<Search size={16} />}
-                  selected={isSearchOpen || Boolean(searchInput)}
-                  tabIndex={isSearchOpen ? -1 : 0}
-                  aria-expanded={isSearchOpen}
+                  icon={<Search size={18} />}
+                  selected={Boolean(searchInput)}
+                  aria-expanded="false"
                   aria-controls="chain-trace-search"
                   onClick={openSearch}
                 />
+              ) : (
                 <label
                   id="chain-trace-search"
                   className="chain-trace-search"
-                  aria-hidden={!isSearchOpen || undefined}
-                  inert={!isSearchOpen || undefined}
                 >
                   <Search size={14} aria-hidden="true" />
                   <input
@@ -755,70 +803,61 @@ export function ChainTraceView({
                     onClick={clearAndCloseSearch}
                   />
                 </label>
-              </div>
+              )}
             </div>
-            <OverlayScrollbar viewportRef={filtersRef} axis="horizontal" size="compact" />
+          </div>
           </div>
         </div>
-      </div>
+      )}
 
       {trace.state.phase === 'loading' && (
-        <div className="chain-trace-state">
+        <div className="chain-trace-state is-feedback">
           <FeedbackState kind="loading" title={t('正在加载链路…')} />
         </div>
       )}
       {trace.state.phase === 'error' && (
-        <div className="chain-trace-state">
+        <div className="chain-trace-state is-feedback">
           <FeedbackState kind="error" title={t('链路加载失败')} onRetry={trace.retry} />
         </div>
       )}
       {incomplete && (
         <div className="chain-trace-state is-warning" role="status">
-          <p>{t('链路超过完整视图上限，请使用筛选或搜索缩小范围')}</p>
+          <p>{t('链路超过完整视图上限，请使用搜索缩小范围')}</p>
         </div>
       )}
       {trace.state.phase === 'ready' && !incomplete && nodes.length === 0 && (
         <div className="chain-trace-state"><Activity size={24} /><p>{t('没有匹配的链路节点')}</p></div>
       )}
-      {trace.state.phase === 'ready' && !incomplete && nodes.length > 0 && timeline && (
+      {trace.state.phase === 'ready' && !incomplete && nodes.length > 0 && (
         <>
-          {view === 'timeline' && (
+          {selected && timeline ? (
             <TraceTimeline
+              mode="timeline"
               layout={timeline}
               selected={selected}
-              backgroundInert={detailsOverlay && Boolean(selected)}
+              backgroundInert={detailsOverlay === true}
+              onSelect={(nodeId, trigger) => selectEntry(nodeId, trigger, true)}
+            />
+          ) : (
+            <TraceTimeline
+              mode="sequence"
+              layout={sequence}
+              backgroundInert={false}
               onSelect={(nodeId, trigger) => selectEntry(nodeId, trigger, true)}
             />
           )}
           <div
             ref={contentRef}
-            id={view === 'timeline' ? 'chain-trace-timeline-panel' : 'chain-trace-tree-panel'}
-            role="tabpanel"
-            aria-label={view === 'timeline' ? t('时间线') : t('树形')}
             className={`chain-trace-content-grid${selected ? ' has-details' : ''}${detailsOverlay ? ' uses-overlay' : ''}`}
           >
-            {view === 'timeline' ? (
-              <TraceLedger
-                groups={turnRows}
-                now={now}
-                selectedId={selectedId}
-                backgroundInert={detailsOverlay && Boolean(selected)}
-                onSelect={selectEntry}
-              />
-            ) : (
-              <TraceTurnTree
-                turns={page!.turns}
-                nodes={graphNodes}
-                orderedNodeIds={page!.orderedNodeIds}
-                rootNodeIds={page!.rootNodeIds}
-                visibleNodeIds={visibleNodeIds}
-                selectedId={selectedId}
-                forceExpandAll={categories.size !== TRACE_PUBLIC_CATEGORIES.length || Boolean(searchQuery)}
-                forceExpandKey={`${categoryKey}:${showTechnical}:${searchQuery}`}
-                backgroundInert={detailsOverlay && Boolean(selected)}
-                onSelect={selectEntry}
-              />
-            )}
+            <TraceLedger
+              groups={turnRows}
+              directNodeIds={matchedNodeIds}
+              selectedId={selectedId}
+              backgroundInert={detailsOverlay === true && Boolean(selected)}
+              onSelect={selectEntry}
+              onHideSelection={hideDetailsForCollapse}
+            />
             {selected && (
               <TraceDetails
                 key={selected.id}
@@ -827,7 +866,7 @@ export function ChainTraceView({
                 responseStatus={responseStatus === 'idle' ? 'loading' : responseStatus}
                 turnOrdinal={selectedPosition?.turnOrdinal}
                 stepOrdinal={selectedPosition?.stepOrdinal}
-                focusClose={detailsOverlay && Boolean(detailTrigger.current)}
+                overlay={detailsOverlay === true}
                 onRetryResponse={modelResponse.retry}
                 onClose={closeDetails}
               />

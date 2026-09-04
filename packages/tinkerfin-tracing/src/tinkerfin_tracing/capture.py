@@ -156,56 +156,6 @@ class ToolTraceCapture(TraceModel):
         return self
 
 
-class MiddlewareTraceCapture(TraceModel):
-    """Define whether one middleware execution appears in Trace."""
-
-    mode: Literal["visible", "disabled"]
-
-    @classmethod
-    def visible(cls) -> Self:
-        """Retain every execution lifecycle exposed by standard callbacks."""
-
-        return cls(mode="visible")
-
-    @classmethod
-    def disabled(cls) -> Self:
-        """Suppress middleware-specific facts without changing model or Tool evidence."""
-
-        return cls(mode="disabled")
-
-
-def _normalize_middleware_overrides(
-    values: Mapping[str | type[object], MiddlewareTraceCapture] | None,
-) -> tuple[tuple[str, MiddlewareTraceCapture], ...]:
-    """Normalize user-facing names and types into serializable stable selectors."""
-
-    if values is None:
-        return ()
-    if not isinstance(values, Mapping):
-        raise TypeError("middleware_overrides must be a mapping or None")
-    normalized: list[tuple[str, MiddlewareTraceCapture]] = []
-    for selector, capture in values.items():
-        if not isinstance(capture, MiddlewareTraceCapture):
-            raise TypeError(
-                "middleware_overrides values must be MiddlewareTraceCapture values"
-            )
-        if isinstance(selector, str):
-            if not selector or selector != selector.strip():
-                raise ValueError(
-                    "middleware override names must be canonical non-empty text"
-                )
-            key = f"name:{selector}"
-        elif isinstance(selector, type):
-            qualname = selector.__qualname__
-            if "<locals>" in qualname:
-                raise ValueError("middleware override types must be importable")
-            key = f"class:{selector.__module__}.{qualname}"
-        else:
-            raise TypeError("middleware_overrides keys must be names or types")
-        normalized.append((key, capture))
-    return tuple(normalized)
-
-
 class ReasoningCapturePolicy(TraceModel):
     """Control provider reasoning retention independently from public messages."""
 
@@ -225,7 +175,7 @@ class ReasoningCapturePolicy(TraceModel):
 
 
 class CapturePolicy(TraceModel):
-    """Define public-safe retention for messages, state, Tools, and middleware."""
+    """Define public-safe retention for messages, state, and Tools."""
 
     include_error_messages: bool = False
     default_tool_capture: ToolTraceCapture = Field(
@@ -233,27 +183,20 @@ class CapturePolicy(TraceModel):
     )
     tool_overrides: tuple[tuple[str, ToolTraceCapture], ...] = ()
     tool_rules: tuple[ToolCaptureRule, ...] = ()
-    default_middleware_capture: MiddlewareTraceCapture = Field(
-        default_factory=MiddlewareTraceCapture.visible
-    )
-    middleware_overrides: tuple[tuple[str, MiddlewareTraceCapture], ...] = ()
 
     @classmethod
     def public_safe(
         cls,
         *,
         tool_rules: tuple[ToolCaptureRule, ...] = (),
-        middleware_overrides: Mapping[str | type[object], MiddlewareTraceCapture]
-        | None = None,
         include_error_messages: bool = False,
     ) -> CapturePolicy:
-        """Return a metadata-only Tool policy with middleware visibility overrides."""
+        """Return a metadata-only Tool policy for public diagnostics."""
 
         return cls(
             include_error_messages=include_error_messages,
             default_tool_capture=ToolTraceCapture.metadata_only(),
             tool_rules=tool_rules,
-            middleware_overrides=_normalize_middleware_overrides(middleware_overrides),
         )
 
     @classmethod
@@ -261,8 +204,6 @@ class CapturePolicy(TraceModel):
         cls,
         *,
         tool_overrides: Mapping[str, ToolTraceCapture] | None = None,
-        middleware_overrides: Mapping[str | type[object], MiddlewareTraceCapture]
-        | None = None,
         include_error_messages: bool = False,
     ) -> CapturePolicy:
         """Capture every Tool's sanitized public content with exact-name overrides.
@@ -270,8 +211,6 @@ class CapturePolicy(TraceModel):
         Args:
             tool_overrides: Optional settings for Tools whose content or lifecycle
                 retention differs from the full-content default.
-            middleware_overrides: Optional settings selected by a public middleware
-                name or implementation type.
             include_error_messages: Whether bounded exception messages may be retained.
 
         Returns:
@@ -300,7 +239,6 @@ class CapturePolicy(TraceModel):
             include_error_messages=include_error_messages,
             default_tool_capture=ToolTraceCapture.full_content(),
             tool_overrides=overrides,
-            middleware_overrides=_normalize_middleware_overrides(middleware_overrides),
         )
 
     @field_validator("tool_rules")
@@ -327,36 +265,6 @@ class CapturePolicy(TraceModel):
             raise ValueError("Tool trace override names must be non-empty and bounded")
         if len(set(names)) != len(names):
             raise ValueError("Tool trace overrides must use unique Tool names")
-        return overrides
-
-    @field_validator("middleware_overrides")
-    @classmethod
-    def middleware_selectors_are_unique(
-        cls,
-        overrides: tuple[tuple[str, MiddlewareTraceCapture], ...],
-    ) -> tuple[tuple[str, MiddlewareTraceCapture], ...]:
-        """Reject ambiguous or malformed middleware selectors."""
-
-        selectors = [selector for selector, _capture in overrides]
-        if any(
-            not selector
-            or len(selector) > 2048
-            or selector != selector.strip()
-            or not selector.startswith(("name:", "class:"))
-            for selector in selectors
-        ):
-            raise ValueError("middleware Trace selectors must be canonical and bounded")
-        if len(set(selectors)) != len(selectors):
-            raise ValueError("middleware Trace selectors must be unique")
-        simple_types = [
-            selector.rsplit(".", 1)[-1]
-            for selector in selectors
-            if selector.startswith("class:")
-        ]
-        if len(set(simple_types)) != len(simple_types):
-            raise ValueError(
-                "middleware override types must have unique callback class names"
-            )
         return overrides
 
     @model_validator(mode="after")
@@ -409,42 +317,6 @@ class CapturePolicy(TraceModel):
         """Return whether one Tool may retain its public review description."""
 
         return self.tool_capture(tool_name).include_review_description
-
-    def middleware_capture(
-        self,
-        *,
-        name: str,
-        class_name: str | None,
-    ) -> MiddlewareTraceCapture:
-        """Resolve middleware visibility by exact public name before implementation."""
-
-        values = dict(self.middleware_overrides)
-        exact = values.get(f"name:{name}")
-        if exact is not None:
-            return exact
-        if class_name is not None:
-            selected = values.get(f"class:{class_name}")
-            if selected is not None:
-                return selected
-        else:
-            inferred = self._middleware_class_name(name)
-            if inferred is not None:
-                selected = values.get(f"class:{inferred}")
-                if selected is not None:
-                    return selected
-        return self.default_middleware_capture
-
-    def _middleware_class_name(self, name: str) -> str | None:
-        """Resolve one unique type selector from a callback-only class name."""
-
-        return next(
-            (
-                selector.removeprefix("class:")
-                for selector, _capture in self.middleware_overrides
-                if selector.startswith("class:") and selector.rsplit(".", 1)[-1] == name
-            ),
-            None,
-        )
 
 
 class TraceCapturePipeline:
@@ -746,7 +618,10 @@ def _resolve_pointer(value: JsonValue, path: str) -> tuple[bool, JsonValue]:
             current = current[component]
             continue
         valid_index = component == "0" or (
-            bool(component) and component[0] in "123456789" and component.isdecimal()
+            bool(component)
+            and component.isascii()
+            and component[0] in "123456789"
+            and component.isdecimal()
         )
         if isinstance(current, list) and valid_index:
             index = int(component)
@@ -761,7 +636,6 @@ def _resolve_pointer(value: JsonValue, path: str) -> tuple[bool, JsonValue]:
 __all__ = [
     "CapturePolicy",
     "CapturedValue",
-    "MiddlewareTraceCapture",
     "ReasoningCapturePolicy",
     "ToolCaptureRule",
     "ToolTraceCapture",

@@ -59,54 +59,6 @@ class RunResumeSummary(ContractModel):
         return self
 
 
-class MiddlewareDescriptor(ContractModel):
-    """Describe one visible middleware contribution without carrying its instance."""
-
-    name: str = Field(min_length=1, max_length=1024)
-    class_name: str = Field(
-        min_length=1,
-        max_length=1024,
-        description="Fully qualified implementation class for diagnostic display",
-    )
-    hooks: tuple[str, ...] = Field(
-        default=(),
-        description="Implemented LangChain hook names when full visibility is enabled",
-    )
-
-    @model_validator(mode="after")
-    def values_are_canonical(self) -> MiddlewareDescriptor:
-        """Reject ambiguous names and duplicate hook labels."""
-
-        if self.name != self.name.strip() or self.class_name != self.class_name.strip():
-            raise ValueError("middleware names must be canonical text")
-        if any(not hook or hook != hook.strip() for hook in self.hooks):
-            raise ValueError("middleware hooks must be canonical text")
-        if len(set(self.hooks)) != len(self.hooks):
-            raise ValueError("middleware hooks must be unique")
-        return self
-
-
-class SkillSourceDescriptor(ContractModel):
-    """Bind one configured Skill source to its root or named subagent catalog."""
-
-    path: str = Field(
-        min_length=1,
-        max_length=4096,
-        description="Configured Skill catalog root, not evidence of a Skill invocation",
-    )
-    agent_name: str | None = Field(default=None, min_length=1, max_length=1024)
-
-    @model_validator(mode="after")
-    def values_are_canonical(self) -> SkillSourceDescriptor:
-        """Reject whitespace aliases before matching a successful Skill read."""
-
-        if self.path != self.path.strip():
-            raise ValueError("Skill source path must be canonical text")
-        if self.agent_name is not None and self.agent_name != self.agent_name.strip():
-            raise ValueError("Skill source agent name must be canonical text")
-        return self
-
-
 class RunSourceContext(ContractModel):
     """Describe the real input and lineage used to open one Runtime request.
 
@@ -128,8 +80,6 @@ class RunSourceContext(ContractModel):
         default=False,
         description="Whether the managed request installed provider and Tool callbacks",
     )
-    middleware: tuple[MiddlewareDescriptor, ...] = ()
-    skill_sources: tuple[SkillSourceDescriptor, ...] = ()
 
     @model_validator(mode="after")
     def identifiers_and_collections_are_canonical(self) -> RunSourceContext:
@@ -142,12 +92,6 @@ class RunSourceContext(ContractModel):
             raise ValueError("resume interrupt IDs must be unique")
         if len(set(self.private_state_keys)) != len(self.private_state_keys):
             raise ValueError("private state keys must be unique")
-        middleware_names = tuple(item.name for item in self.middleware)
-        if len(set(middleware_names)) != len(middleware_names):
-            raise ValueError("middleware names must be unique")
-        skill_keys = tuple((item.agent_name, item.path) for item in self.skill_sources)
-        if len(set(skill_keys)) != len(skill_keys):
-            raise ValueError("Skill sources must be unique per Agent")
         return self
 
 
@@ -248,54 +192,6 @@ class RunClosedObservation(ObservationModel):
     kind: Literal["run.closed"] = "run.closed"
     identity: RunIdentity
     outcome: RunTerminalOutcome
-
-
-class AgentStepObservation(ObservationModel):
-    """Record one actual Agent graph step independently of Native stream delivery."""
-
-    kind: Literal["call.agent_step"] = "call.agent_step"
-    identity: RunIdentity
-    phase: Literal[
-        "started",
-        "completed",
-        "failed",
-        "cancelled",
-        "interrupted",
-        "abandoned",
-    ]
-    call_id: str = Field(min_length=1, max_length=1024)
-    parent_call_id: str | None = Field(default=None, min_length=1, max_length=1024)
-    namespace: tuple[str, ...] = ()
-    agent_name: str | None = Field(default=None, min_length=1, max_length=1024)
-    step_kind: Literal["agent", "middleware", "model", "tools", "subagent", "task"]
-    name: str = Field(min_length=1, max_length=1024)
-    task_id: str | None = Field(default=None, min_length=1, max_length=1024)
-    middleware_name: str | None = Field(default=None, min_length=1, max_length=1024)
-    hook: str | None = Field(default=None, min_length=1, max_length=1024)
-    error_type: str | None = Field(default=None, min_length=1, max_length=1024)
-    error_message: str | None = Field(default=None, min_length=1, max_length=4096)
-    failure_origin: bool = False
-
-    @model_validator(mode="after")
-    def phase_and_step_fields_are_consistent(self) -> AgentStepObservation:
-        """Keep middleware identity and terminal failures attached to real phases."""
-
-        is_middleware = self.step_kind == "middleware"
-        if is_middleware != (
-            self.middleware_name is not None and self.hook is not None
-        ):
-            raise ValueError(
-                "middleware steps require a middleware name and hook exclusively"
-            )
-        if self.phase == "failed" and self.error_type is None:
-            raise ValueError("failed Agent steps require an error type")
-        if self.phase != "failed" and (
-            self.error_type is not None or self.error_message is not None
-        ):
-            raise ValueError("non-failure Agent step phases cannot carry an error")
-        if self.failure_origin and self.phase != "failed":
-            raise ValueError("only failed Agent steps can own a failure")
-        return self
 
 
 class ModelCallObservation(ObservationModel):
@@ -572,7 +468,6 @@ RuntimeObservation: TypeAlias = Annotated[
     | RunObserverFailedObservation
     | RunTerminalObservation
     | RunClosedObservation
-    | AgentStepObservation
     | ModelCallObservation
     | ToolExecutionObservation
     | ContextContributionObservation
@@ -591,10 +486,8 @@ RUNTIME_OBSERVATION_ADAPTER: TypeAdapter[RuntimeObservation] = TypeAdapter(
 
 __all__ = [
     "RUNTIME_OBSERVATION_ADAPTER",
-    "AgentStepObservation",
     "ContextContributionObservation",
     "ContextKind",
-    "MiddlewareDescriptor",
     "ModelCallObservation",
     "NativeExtraMode",
     "NativeExtraObservation",
@@ -621,6 +514,5 @@ __all__ = [
     "RunTerminalObservation",
     "RunTerminalOutcome",
     "RuntimeObservation",
-    "SkillSourceDescriptor",
     "ToolExecutionObservation",
 ]

@@ -435,39 +435,18 @@ and subagents. Observer failure terminates the Run fail-closed, while Runtime st
 settles and closes every opened session. Registration is preserved by `.plan(...)`;
 registering the same Observer object twice is rejected.
 
-Middleware retention belongs to each Tracer, while TinkerFin always passes the original
-instances to Deep Agents in their declared order:
-
-```python
-from tinkerfin import TinkerFin
-from tinkerfin_tracing import CapturePolicy, MiddlewareTraceCapture, Tracer
-
-tracer = Tracer(
-    capture_policy=CapturePolicy.public_history(
-        middleware_overrides={
-            InternalMetricsMiddleware: MiddlewareTraceCapture.disabled(),
-        }
-    )
-)
-tinkerfin = TinkerFin().observe(tracer)
-agent = tinkerfin.create_deep_agent(
-    model=model,
-    tools=tools,
-    middleware=[customer_memory, internal_metrics],
-)
-```
-
-`visible()` retains standard callback-proven execution lifecycles, while
-`disabled()` suppresses middleware-specific facts. Configuration alone never creates
-a Trace fact or Graph node. Every setting retains final model
-requests and actual Tool executions. Type settings also apply to framework-injected
-middleware first observed through its standard callback class name; exact public names
-still take precedence. Interrupt, cancellation, abandonment, and generator closure are
-control flow rather than failures, and Runtime settlement closes unmatched callback work
-without assigning the Run error to every ancestor. Reusable middleware and Tools can expose an explicit
-Memory, Guardrail, retrieval, or custom action with
+Runtime records provider and Tool callbacks, not generic chain or middleware callbacks.
+Middleware still executes in its declared Deep Agents order, and its final model requests
+and actual Tool executions remain observable. A reusable middleware or Tool can publish
+an explicit Memory, Guardrail, retrieval, or custom action with
 `async with trace_contribution(kind="memory", name="Customer memory")` without
-depending on a Tracer implementation.
+depending on a Tracer implementation. SkillsMiddleware discovery is not a Trace event;
+when a model reads `SKILL.md`, the operation is recorded only as its ordinary `read_file`
+Tool execution.
+
+Interrupt, cancellation, abandonment, and generator closure are control flow rather
+than failures. Runtime settlement closes unmatched callback work without assigning one
+Run failure to unrelated events.
 
 The Runtime selects the Agent outcome before terminal broadcast. If an Observer rejects
 that already selected terminal, callers still fail closed and healthy Observers receive
@@ -485,16 +464,42 @@ Provider reasoning persistence requires two independent opt-ins. Configure a ver
 extractor on the Native Driver and content retention on the Tracer:
 
 ```python
+from langchain_core.messages import BaseMessage
+from pydantic import JsonValue
+
 from tinkerfin import (
     DeepAgentsV2RuntimeProfile,
-    DeepSeekReasoningExtractor,
+    ReasoningExtractor,
     TinkerFin,
+    TinkerFinStreamProtocolError,
 )
 from tinkerfin_tracing import ReasoningCapturePolicy, Tracer
 
 
+class HostReasoningExtractor:
+    @property
+    def name(self) -> str:
+        return "acme.reasoning"
+
+    def extract(
+        self,
+        message: BaseMessage,
+        *,
+        provider: str | None,
+    ) -> JsonValue | None:
+        if provider != "acme":
+            return None
+        value = message.additional_kwargs.get("acme_reasoning")
+        if value is None or value == "":
+            return None
+        if not isinstance(value, str):
+            raise TinkerFinStreamProtocolError("acme reasoning must be a string")
+        return value
+
+
+extractor: ReasoningExtractor = HostReasoningExtractor()
 profile = DeepAgentsV2RuntimeProfile(
-    reasoning_extractors=(DeepSeekReasoningExtractor(),),
+    reasoning_extractors=(extractor,),
 )
 tracer = Tracer(reasoning_capture_policy=ReasoningCapturePolicy.content())
 tinkerfin = TinkerFin(runtime_profile=profile).observe(tracer)
@@ -503,9 +508,9 @@ tinkerfin = TinkerFin(runtime_profile=profile).observe(tracer)
 Without an extractor, Runtime emits no reasoning observation. Without the independent
 content policy, Tracing records only explicit omission and stores neither content nor a
 digest. Business fields named `reasoning_content` outside provider metadata remain
-ordinary business data. A custom `ReasoningExtractor` implements
-`extract(message, *, provider)` and must return content only for a provider and source
-shape it can verify.
+ordinary business data. TinkerFin does not provide a vendor-specific extractor. A
+host-supplied `ReasoningExtractor` implements `extract(message, *, provider)` and must
+return content only for a provider and source shape it can verify.
 
 ### Ownership
 
@@ -538,6 +543,10 @@ writes that preserve interrupted Graph control. TinkerFin selects it before Defi
 creation and records its
 `profile_id` with durable lineage; branch and resume reject a checkpoint created by
 another Profile before Graph continuation.
+
+The Profile identity is framework-private integration and recovery metadata. Hosts select
+the integration during framework assembly, but must not copy `profile_id` into business
+database models, request payloads, or application response schemas.
 
 Both built-in Profiles feed the same protocol-neutral Runtime boundary. There is no
 automatic detection, negotiation, or fallback:

@@ -11,14 +11,12 @@ from pydantic import JsonValue
 from tinkerfin import (
     DeepAgentsRuntimeProfile,
     DeepAgentsV2RuntimeProfile,
-    DeepAgentsV2StreamDriver,
     DeepAgentsV3RuntimeProfile,
-    DeepAgentsV3StreamDriver,
-    DeepSeekReasoningExtractor,
     RunIdentity,
     TinkerFin,
     TinkerFinStreamProtocolError,
 )
+from tinkerfin.native_driver import DeepAgentsV2StreamDriver, DeepAgentsV3StreamDriver
 from tinkerfin_contracts import (
     NativeMessageObservation,
     NativeReasoningObservation,
@@ -26,6 +24,27 @@ from tinkerfin_contracts import (
     NativeToolCallChunk,
     RunSourceContext,
 )
+
+
+class _ProviderReasoningExtractor:
+    @property
+    def name(self) -> str:
+        return "fixture.provider_reasoning"
+
+    def extract(
+        self,
+        message: BaseMessage,
+        *,
+        provider: str | None,
+    ) -> JsonValue | None:
+        if provider != "deepseek":
+            return None
+        value = message.additional_kwargs.get("reasoning_content")
+        if value is None or value == "":
+            return None
+        if not isinstance(value, str):
+            raise TinkerFinStreamProtocolError("fixture reasoning must be a string")
+        return value
 
 
 def _context() -> RunSourceContext:
@@ -150,9 +169,9 @@ def test_default_driver_emits_no_provider_reasoning_observation() -> None:
     assert "private" not in encoded
 
 
-def test_v3_deepseek_extractor_ignores_another_provider_reasoning_delta() -> None:
+def test_v3_host_extractor_ignores_another_provider_reasoning_delta() -> None:
     frame = DeepAgentsV3StreamDriver(
-        reasoning_extractors=(DeepSeekReasoningExtractor(),)
+        reasoning_extractors=(_ProviderReasoningExtractor(),)
     ).normalize(
         _message_part(
             AIMessageChunk(
@@ -211,9 +230,9 @@ def test_v2_driver_still_rejects_a_complete_tool_call_without_an_id() -> None:
         )
 
 
-def test_explicit_deepseek_extractor_emits_delta_and_snapshot() -> None:
+def test_explicit_host_extractor_emits_delta_and_snapshot() -> None:
     driver = DeepAgentsV2StreamDriver(
-        reasoning_extractors=(DeepSeekReasoningExtractor(),)
+        reasoning_extractors=(_ProviderReasoningExtractor(),)
     )
     delta = driver.normalize(
         _message_part(
@@ -312,9 +331,9 @@ def test_driver_rejects_duplicate_or_invalid_extractor_names() -> None:
         )
 
 
-def test_deepseek_extractor_rejects_an_unverified_value_shape() -> None:
+def test_host_extractor_rejects_an_unverified_value_shape() -> None:
     driver = DeepAgentsV2StreamDriver(
-        reasoning_extractors=(DeepSeekReasoningExtractor(),)
+        reasoning_extractors=(_ProviderReasoningExtractor(),)
     )
 
     with pytest.raises(TinkerFinStreamProtocolError, match="must be a string"):

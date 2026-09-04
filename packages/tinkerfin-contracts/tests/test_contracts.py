@@ -10,7 +10,6 @@ from pydantic import ValidationError
 
 from tinkerfin_contracts import (
     RUNTIME_OBSERVATION_ADAPTER,
-    AgentStepObservation,
     ContextContributionObservation,
     ModelCallObservation,
     NativeMessageObservation,
@@ -130,62 +129,6 @@ def test_reasoning_observation_is_explicit_and_strict() -> None:
                 **observation.model_dump(mode="python"),
                 "schema_version": 1,
             }
-        )
-
-
-def test_agent_step_requires_real_middleware_and_failure_evidence() -> None:
-    now = datetime.now(UTC)
-    step = AgentStepObservation(
-        identity=_context().identity,
-        phase="started",
-        call_id="step-1",
-        parent_call_id="agent-1",
-        step_kind="middleware",
-        name="guardrail.before_model",
-        middleware_name="guardrail",
-        hook="before_model",
-        observed_at=now,
-        monotonic_ns=4,
-    )
-
-    restored = RUNTIME_OBSERVATION_ADAPTER.validate_python(
-        step.model_dump(mode="python", by_alias=True)
-    )
-    assert isinstance(restored, AgentStepObservation)
-    missing_hook = step.model_dump(mode="python")
-    missing_hook["hook"] = None
-    with pytest.raises(ValidationError, match="middleware name and hook"):
-        AgentStepObservation.model_validate(missing_hook)
-    with pytest.raises(ValidationError, match="require an error type"):
-        AgentStepObservation(
-            identity=_context().identity,
-            phase="failed",
-            call_id="step-1",
-            step_kind="model",
-            name="model",
-            observed_at=now,
-            monotonic_ns=5,
-        )
-    interrupted = AgentStepObservation(
-        identity=_context().identity,
-        phase="interrupted",
-        call_id="step-interrupted",
-        step_kind="model",
-        name="model",
-        observed_at=now,
-        monotonic_ns=6,
-    )
-    assert interrupted.error_type is None
-    with pytest.raises(ValidationError, match="non-failure"):
-        AgentStepObservation(
-            identity=_context().identity,
-            phase="cancelled",
-            call_id="step-cancelled",
-            step_kind="model",
-            name="model",
-            error_type="asyncio.exceptions.CancelledError",
-            observed_at=now,
-            monotonic_ns=7,
         )
 
 

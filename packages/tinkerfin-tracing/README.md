@@ -58,38 +58,79 @@ does not automatically create a complete Trace.
 
 ## Canonical Graph
 
-Each user Turn is rooted at its existing HumanMessage. Model calls link to
-AssistantMessage nodes by stable provider output message IDs. SystemMessage remains
-available as technical evidence. One logical Tool node combines its proposal, actual
-post-review execution, ToolMessage result, and failure without duplicating payloads.
+Each `TraceGraphTurn` is a container, not an execution node. Events in the Turn's
+top-level scope are siblings in real start order. A Subagent is the only event that owns
+a nested scope; events inside that scope are siblings under the nearest owning Subagent.
 
-`TraceGraphFilter` supports kind, status, parent, Agent, middleware, Skill, provider,
-model, graph namespace, time, and literal text predicates over visible metadata and
-retained public details. Technical nodes are hidden by default.
-`include_technical_nodes=True` includes them, while
-`include_ancestor_nodes=True` asks the framework to return and reconnect visible
-ancestors.
+```text
+Turn
+├── HumanMessage
+├── Context / Memory / Guardrail / retrieval / custom / Plan / interaction
+├── Model
+├── Tool
+├── Subagent
+│   ├── HumanMessage
+│   ├── Model / Tool / context events
+│   └── AssistantMessage
+└── AssistantMessage
+```
 
-`TraceGraphQuery.matched_node_ids` identifies only the current page's direct matches in
-authoritative order. `nodes` may additionally contain ancestors needed to preserve the
-execution path. `follow()` is available only on the current first page and publishes
-`TraceGraphDelta` values with complete authoritative node order, roots, matches, and the
-current older-page cursor. A pagination cursor is bound to its namespace, thread,
-generation, selected head, filter, and Ledger tail; a newer commit replaces the live
-cursor and invalidates any previously issued cursor instead of silently changing its
-page.
+`parent_subagent_id` is the only display-nesting relationship. `model_call_id` links an
+AssistantMessage, Tool, or Subagent to the Model call that emitted it without making the
+Model a display parent. A non-empty graph `namespace` is queryable metadata, but does not
+by itself prove a Subagent scope; the Ledger must carry validated Subagent provenance.
+
+Every provider attempt has one `context` event immediately before its Model event. Its
+wall-clock interval starts at the preceding visible execution boundary in the same scope
+and ends when the final provider request starts. A resumed active Subagent starts a new
+preparation interval at the resume input, so approval wait time is excluded. The Context
+content projects the final SystemMessage content from that Model request; it does not
+store a second payload. A request without a SystemMessage still has a timed Context event
+with no content. This interval describes observable preparation latency, not CPU usage.
+
+One logical Tool event combines proposal, post-review execution, ToolMessage result, and
+failure. A validated Deep Agents `task` execution is represented by its Subagent event,
+not by a second Tool event. Tracing has no Skill event: reading `SKILL.md` is an ordinary
+`read_file` Tool execution. Generic chain and middleware callbacks are not captured;
+middleware can publish an explicit semantic context event through
+`trace_contribution(...)` when its product behavior needs to be visible.
+
+The first HumanMessage inside a validated Subagent scope projects only the captured
+`task.description`. The Subagent request retains the complete captured task arguments;
+both views reference the same Ledger fact, so tracing does not store a second payload.
+
+`TraceGraphFilter` supports `kinds`, `statuses`, `model_call_id`, `agent_names`,
+`providers`, `models`, `namespaces`, `search`, `started_after`, and `started_before`.
+`TraceGraphQuery.matched_node_ids` contains only the current page's direct matches. The
+Store automatically adds their owning Subagent chain to `nodes`, but those containers do
+not become matches.
+
+Within each scope, events are ordered by `started_seq`, then by the stable product order
+user, context, model, Tool, Subagent, assistant, and finally by `node_id`. The public
+projection uses an iterative depth-first traversal so each expanded Subagent is followed
+by its own event sequence. Store-side owning-Subagent expansion is a bounded
+breadth-first lookup: it accepts at most 64 Subagent levels, obeys `max_total_nodes`, and
+batches SQL keys in groups of 500.
+
+`follow()` is available only on the current first page. Each `TraceGraphDelta` carries
+Turn and node upserts/removals, complete `ordered_node_ids` and `matched_node_ids`, the
+current `next_cursor`, `as_of_seq`, and completeness. A pagination cursor is bound to its
+namespace, thread, generation, selected head, filter, and Ledger tail; a newer commit
+replaces the live cursor and invalidates any previously issued cursor instead of silently
+changing its page.
 
 `TraceGraphQueryLimits` independently bounds direct matches, content-search candidates,
-expanded nodes, and serialized page/update bytes. Content search first applies indexed
-scope and time predicates, then decodes the bounded Ledger locators through the Store's
-Codec and matches only retained, already-redacted public details. When only response
-details exceed the byte budget, the framework keeps the graph structure and marks
-content, request, or result values as omitted. A structure-only page that still exceeds
-the budget fails with `TraceQuotaExceeded`.
+Subagent-expanded nodes, and serialized page/update bytes. One query may select at most
+10,000 Runs in its lineage. Content search first applies indexed metadata, namespace, and
+time predicates, then decodes the bounded Ledger locators through the Store's Codec and
+matches only retained, already-redacted public details. When only response details exceed
+the byte budget, the framework keeps the graph structure and marks content, request, or
+result values as omitted. A structure-only page that still exceeds the budget fails with
+`TraceQuotaExceeded`.
 
 `Tracer.get()` exposes the same canonical nodes through `TraceThread.graph` at the
 history handle's exact fixed prefix. `TraceThread.follow()` carries a
-`TraceUpdate.graph` delta with the same ordering and root contract. Current-tail history
+`TraceUpdate.graph` delta with the same ordering contract. Current-tail history
 uses the disposable index; an older fixed prefix replays the same Graph reducer from the
 Ledger instead of storing another execution tree or payload copy.
 
@@ -147,9 +188,8 @@ tracer = Tracer(
 Each Redactor receives detached finite JSON after mandatory credential and private
 reasoning cleanup. It never receives LangChain messages, provider objects, thread IDs,
 Run IDs, or user identities. `RedactionContext.content_kind` identifies message, model
-request/response, Tool arguments/result, state, middleware configuration, interaction,
-plan, or custom content; `component_name` contains only the public component name when
-one exists.
+request/response, Tool arguments/result, state, interaction, plan, or custom content;
+`component_name` contains only the public component name when one exists.
 
 Redactors are synchronous, deterministic, reentrant, free of I/O, and must not mutate
 their input. Every result is validated before the next Redactor runs. The framework
@@ -190,7 +230,7 @@ await engine.dispose()
 The Store owns exactly six current tables. Hash search keys use 32-byte SHA-256 binary
 values. The Graph table has one lineage index in addition to its primary key, so a new
 node revision updates two B-Trees rather than maintaining one index per filter field.
-Filtering and Facets run after selected-lineage revisions are merged.
+Filtering runs after selected-lineage revisions are merged.
 Literal metadata search folds only ASCII `A-Z` for ASCII-only queries and is
 case-sensitive when the query contains non-ASCII characters. Unicode characters are
 never mapped to ASCII lookalikes, keeping the built-in Stores equivalent without a

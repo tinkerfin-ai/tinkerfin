@@ -15,7 +15,6 @@ from ._models import TraceModel
 from .errors import TraceStoreProtocolError
 from .facts import TraceEvent, TraceSemanticFact
 from .graph import (
-    TraceGraphFacets,
     TraceGraphFilter,
     TraceGraphLinkIssue,
     TraceGraphNodeKind,
@@ -117,7 +116,8 @@ class TraceGraphNodeRecord:
     """Carry one indexed Graph node and its decoded authoritative facts."""
 
     node_id: str
-    structural_parent_id: str | None
+    parent_subagent_id: str | None
+    model_call_id: str | None
     kind: TraceGraphNodeKind
     status: TraceGraphNodeStatus
     name: str
@@ -150,11 +150,11 @@ class TraceGraphNodeRecordPage:
     as_of_seq: int
     nodes: tuple[TraceGraphNodeRecord, ...]
     matched_node_ids: tuple[str, ...]
-    facets: TraceGraphFacets
     has_more: bool
     next_started_at: datetime | None
     next_node_id: str | None
     call_tracking_present: bool
+    relationship_evidence_missing: bool
 
 
 @runtime_checkable
@@ -439,7 +439,7 @@ class TraceGraphStore(Protocol):
         before_started_at: datetime | None = None,
         before_node_id: str | None = None,
     ) -> TraceGraphNodeRecordPage:
-        """Return one Store-filtered current Graph page with bounded ancestors."""
+        """Return direct matches plus their bounded parent Subagent scopes."""
 
         ...
 

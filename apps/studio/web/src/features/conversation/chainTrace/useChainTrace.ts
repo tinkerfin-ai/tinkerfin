@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 
 import {
   followTraceGraph,
+  parseTraceGraphPage,
   type TraceGraphDelta,
   type TraceGraphFilter,
   type TraceGraphPage,
@@ -18,13 +19,32 @@ const applyUpdate = (
   page: TraceGraphPage,
   update: TraceGraphDelta,
 ): TraceGraphPage => {
-  if (update.asOfSeq <= page.asOfSeq) return page
+  if (update.asOfSeq <= page.asOfSeq) {
+    throw new ConversationError('stream_event_invalid')
+  }
   const turns = new Map(page.turns.map((turn) => [turn.id, turn]))
   update.turnRemoves.forEach((turnId) => turns.delete(turnId))
-  update.turnUpserts.forEach((turn) => turns.set(turn.id, turn))
+  update.turnUpserts.forEach((turn) => {
+    const current = turns.get(turn.id)
+    if (current && (
+      current.ordinal !== turn.ordinal
+      || current.startedAt !== turn.startedAt
+    )) throw new ConversationError('stream_event_invalid')
+    turns.set(turn.id, turn)
+  })
   const nodes = new Map(page.nodes.map((node) => [node.id, node]))
   update.nodeRemoves.forEach((nodeId) => nodes.delete(nodeId))
-  update.nodeUpserts.forEach((node) => nodes.set(node.id, node))
+  update.nodeUpserts.forEach((node) => {
+    const current = nodes.get(node.id)
+    if (current && (
+      node.updatedSeq < current.updatedSeq
+      || node.turnId !== current.turnId
+      || node.kind !== current.kind
+      || node.name !== current.name
+      || JSON.stringify(node.namespace) !== JSON.stringify(current.namespace)
+    )) throw new ConversationError('stream_event_invalid')
+    nodes.set(node.id, node)
+  })
   const orderedNodes = update.orderedNodeIds.map((nodeId) => {
     const node = nodes.get(nodeId)
     if (!node) throw new ConversationError('stream_event_invalid')
@@ -33,7 +53,7 @@ const applyUpdate = (
   if (orderedNodes.length !== nodes.size) {
     throw new ConversationError('stream_event_invalid')
   }
-  return {
+  return parseTraceGraphPage({
     ...page,
     asOfSeq: update.asOfSeq,
     nextCursor: update.nextCursor,
@@ -42,11 +62,9 @@ const applyUpdate = (
     )),
     nodes: orderedNodes,
     orderedNodeIds: update.orderedNodeIds,
-    rootNodeIds: update.rootNodeIds,
     matchedNodeIds: update.matchedNodeIds,
-    facets: update.facets,
     completeness: update.completeness,
-  }
+  })
 }
 
 export function useChainTrace({
@@ -73,6 +91,7 @@ export function useChainTrace({
     }
     const controller = new AbortController()
     let disposed = false
+    let currentPage: TraceGraphPage | undefined
     const resolvedFilter = currentFilter.current
     setState({ phase: 'loading' })
 
@@ -84,25 +103,25 @@ export function useChainTrace({
         })) {
           if (disposed || controller.signal.aborted) return
           if (event.type === 'snapshot') {
+            if (currentPage) throw new ConversationError('stream_event_invalid')
+            currentPage = event.snapshot
             setState({ phase: 'ready', page: event.snapshot })
           } else if (event.type === 'update') {
-            setState((current) => {
-              if (current.phase !== 'ready') return current
-              try {
-                return { phase: 'ready', page: applyUpdate(current.page, event.update) }
-              } catch {
-                return { phase: 'error' }
-              }
-            })
+            if (!currentPage) throw new ConversationError('stream_event_invalid')
+            currentPage = applyUpdate(currentPage, event.update)
+            setState({ phase: 'ready', page: currentPage })
           } else {
+            controller.abort()
             setState({ phase: 'error' })
+            return
           }
         }
         if (!disposed && !controller.signal.aborted) {
           setState({ phase: 'error' })
         }
       } catch {
-        if (!disposed && !controller.signal.aborted) {
+        if (!disposed) {
+          controller.abort()
           setState({ phase: 'error' })
         }
       }

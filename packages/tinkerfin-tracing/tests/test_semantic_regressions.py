@@ -9,7 +9,6 @@ import pytest
 from pydantic import JsonValue
 
 from tinkerfin_contracts import (
-    NativeExtraObservation,
     NativeInterruptRecord,
     NativeMessageObservation,
     NativeMessageRecord,
@@ -32,12 +31,11 @@ from tinkerfin_contracts import (
 )
 from tinkerfin_tracing import (
     CapturePolicy,
+    InMemoryTraceStore,
     InteractionFact,
     MessageFact,
-    NativeExtraFact,
     PlanRevisionFact,
     RunFact,
-    RuntimeTaskFact,
     StateRevisionFact,
     SubagentFact,
     ToolCaptureRule,
@@ -45,6 +43,7 @@ from tinkerfin_tracing import (
     ToolFact,
     ToolTraceCapture,
     TraceCaptureRejected,
+    TraceGraphNodeKind,
     TraceLimits,
     Tracer,
 )
@@ -462,174 +461,6 @@ async def test_subgraph_tool_message_uses_its_scoped_tool_name_for_capture() -> 
     )
 
 
-async def test_runtime_task_payloads_are_structural_metadata_only() -> None:
-    tracer = Tracer()
-    context = _context(run_id="tasks")
-    session = await _start(tracer, context)
-    now = datetime.now(UTC)
-    await session.observe(
-        NativeTaskObservation(
-            identity=context.identity,
-            namespace=(),
-            phase="start",
-            task_id="task-1",
-            name="model",
-            triggers=("branch:to:model",),
-            input={"messages": [{"content": "duplicated state"}]},
-            observed_at=now,
-            monotonic_ns=3,
-        )
-    )
-    await session.observe(
-        NativeTaskObservation(
-            identity=context.identity,
-            namespace=(),
-            phase="result",
-            task_id="task-1",
-            name="model",
-            result={"messages": [{"content": "duplicated result"}]},
-            observed_at=now,
-            monotonic_ns=4,
-        )
-    )
-    await _finish(session, context)
-    events = (await (await tracer.get("thread-semantic")).events(limit=100)).items
-    tasks = [event.fact for event in events if isinstance(event.fact, RuntimeTaskFact)]
-
-    assert tasks[0].input is not None
-    assert tasks[0].input.disposition == "inline"
-    assert tasks[0].input.value == {
-        "$type": "structural_metadata",
-        "dataType": "object",
-        "sourceSafeSizeBytes": 45,
-        "topLevelKeys": ["messages"],
-    }
-    assert tasks[1].result is not None
-    assert tasks[1].result.disposition == "inline"
-    assert tasks[1].result.value == {
-        "$type": "structural_metadata",
-        "dataType": "object",
-        "sourceSafeSizeBytes": 46,
-        "topLevelKeys": ["messages"],
-    }
-    assert "duplicated state" not in json.dumps(
-        [event.model_dump(mode="json", by_alias=True) for event in events]
-    )
-    assert "duplicated result" not in json.dumps(
-        [event.model_dump(mode="json", by_alias=True) for event in events]
-    )
-
-
-async def test_private_channels_do_not_affect_task_or_extra_structural_metadata() -> (
-    None
-):
-    tracer = Tracer()
-    context = _context(
-        run_id="private-structural-metadata",
-        private_state_keys=("_private_runtime",),
-    )
-    session = await _start(tracer, context)
-    now = datetime.now(UTC)
-    await session.observe(
-        NativeTaskObservation(
-            identity=context.identity,
-            namespace=(),
-            phase="start",
-            task_id="private-task",
-            name="model",
-            triggers=("branch:to:model",),
-            input={"public": "visible", "_private_runtime": "x" * 500},
-            observed_at=now,
-            monotonic_ns=3,
-        )
-    )
-    await session.observe(
-        NativeExtraObservation(
-            identity=context.identity,
-            namespace=(),
-            mode="debug",
-            data_type="builtins.dict",
-            safe_size_bytes=10_000,
-            top_level_keys=("_private_runtime", "public"),
-            observed_at=now,
-            monotonic_ns=4,
-        )
-    )
-    await _finish(session, context)
-
-    events = (await (await tracer.get("thread-semantic")).events(limit=100)).items
-    task = next(
-        event.fact for event in events if isinstance(event.fact, RuntimeTaskFact)
-    )
-    extra = next(
-        event.fact for event in events if isinstance(event.fact, NativeExtraFact)
-    )
-    encoded = "".join(event.model_dump_json(by_alias=True) for event in events)
-
-    assert task.input is not None
-    assert task.input.value == {
-        "$type": "structural_metadata",
-        "dataType": "object",
-        "sourceSafeSizeBytes": 20,
-        "topLevelKeys": ["public"],
-    }
-    assert extra.top_level_keys == ("public",)
-    assert "safeSizeBytes" not in extra.model_dump(mode="json", by_alias=True)
-    assert "_private_runtime" not in encoded
-    assert "x" * 100 not in encoded
-
-
-async def test_interrupted_runtime_task_remains_waiting_in_the_execution_tree() -> None:
-    tracer = Tracer()
-    context = _context(run_id="interrupted-task")
-    session = await _start(tracer, context)
-    now = datetime.now(UTC)
-    await session.observe(
-        NativeTaskObservation(
-            identity=context.identity,
-            namespace=(),
-            phase="start",
-            task_id="task-review",
-            name="review_plan",
-            triggers=("branch:to:review_plan",),
-            input={},
-            observed_at=now,
-            monotonic_ns=3,
-        )
-    )
-    await session.observe(
-        NativeTaskObservation(
-            identity=context.identity,
-            namespace=(),
-            phase="result",
-            task_id="task-review",
-            name="review_plan",
-            result={},
-            interrupts=(
-                NativeInterruptRecord(
-                    id="interrupt-review",
-                    value={"kind": "plan_review"},
-                ),
-            ),
-            observed_at=now,
-            monotonic_ns=4,
-        )
-    )
-    await _finish(session, context, outcome="interrupted")
-
-    thread = await tracer.get("thread-semantic")
-    task = next(node for node in thread.graph.nodes if node.kind == "runtime_task")
-    facts = [
-        event.fact
-        for event in (await thread.events(limit=100)).items
-        if isinstance(event.fact, RuntimeTaskFact)
-    ]
-
-    assert facts[-1].interrupt_ids == ("interrupt-review",)
-    assert task.status == "waiting"
-    assert task.completed_at is None
-
-
 async def test_parent_task_result_completes_its_direct_subagent_before_interrupt() -> (
     None
 ):
@@ -638,16 +469,25 @@ async def test_parent_task_result_completes_its_direct_subagent_before_interrupt
     session = await _start(tracer, context)
     now = datetime.now(UTC)
     parent_task_id = "parent-task"
-    namespace = (f"create_plan:{parent_task_id}",)
+    namespace = (f"tools:{parent_task_id}",)
     await session.observe(
         NativeTaskObservation(
             identity=context.identity,
             namespace=(),
             phase="start",
             task_id=parent_task_id,
-            name="create_plan",
-            triggers=("branch:to:create_plan",),
-            input={},
+            name="tools",
+            triggers=("branch:to:tools",),
+            input=[
+                {
+                    "name": "task",
+                    "id": "task-call",
+                    "args": {
+                        "description": "Complete the delegated task",
+                        "subagent_type": "general-purpose",
+                    },
+                }
+            ],
             observed_at=now,
             monotonic_ns=3,
         )
@@ -683,7 +523,7 @@ async def test_parent_task_result_completes_its_direct_subagent_before_interrupt
             namespace=(),
             phase="result",
             task_id=parent_task_id,
-            name="create_plan",
+            name="tools",
             result={},
             observed_at=now,
             monotonic_ns=6,
@@ -705,7 +545,10 @@ async def test_parent_task_result_completes_its_direct_subagent_before_interrupt
     assert node.completed_at is not None
 
 
-async def test_verified_task_tool_adds_subagent_identity_and_input() -> None:
+@pytest.mark.parametrize("rewrite_first_input", [False, True])
+async def test_verified_task_tool_adds_subagent_identity_and_input(
+    rewrite_first_input: bool,
+) -> None:
     tracer = Tracer(
         capture_policy=CapturePolicy.public_safe(
             tool_rules=(
@@ -778,6 +621,53 @@ async def test_verified_task_tool_adds_subagent_identity_and_input() -> None:
             monotonic_ns=5,
         )
     )
+    child_input = NativeMessageRecord(
+        message_type="human",
+        id="child-task-input",
+        content="Rewritten task"
+        if rewrite_first_input
+        else task_arguments["description"],
+    )
+    await session.observe(
+        NativeStateObservation(
+            identity=context.identity,
+            namespace=namespace,
+            state={},
+            messages=(child_input,),
+            observed_at=now,
+            monotonic_ns=6,
+        )
+    )
+    await session.observe(
+        NativeMessageObservation(
+            identity=context.identity,
+            namespace=namespace,
+            message=NativeMessageRecord(
+                message_type="human",
+                id="child-follow-up",
+                content=task_arguments["description"],
+            ),
+            observed_at=now,
+            monotonic_ns=7,
+        )
+    )
+    await session.observe(
+        NativeStateObservation(
+            identity=context.identity,
+            namespace=namespace,
+            state={},
+            messages=(
+                child_input,
+                NativeMessageRecord(
+                    message_type="human",
+                    id="child-follow-up",
+                    content=task_arguments["description"],
+                ),
+            ),
+            observed_at=now,
+            monotonic_ns=7,
+        )
+    )
     await session.observe(
         NativeTaskObservation(
             identity=context.identity,
@@ -787,7 +677,7 @@ async def test_verified_task_tool_adds_subagent_identity_and_input() -> None:
             name="tools",
             result={},
             observed_at=now,
-            monotonic_ns=6,
+            monotonic_ns=8,
         )
     )
     await session.observe(
@@ -803,7 +693,7 @@ async def test_verified_task_tool_adds_subagent_identity_and_input() -> None:
                 tool_status="success",
             ),
             observed_at=now,
-            monotonic_ns=7,
+            monotonic_ns=9,
         )
     )
     await _finish(session, context)
@@ -815,18 +705,156 @@ async def test_verified_task_tool_adds_subagent_identity_and_input() -> None:
         if isinstance(event.fact, SubagentFact)
     ]
     subagent = next(node for node in thread.graph.nodes if node.kind == "subagent")
-    parent_tool = next(
+    subagent_input = next(
         node
         for node in thread.graph.nodes
-        if node.kind == "tool" and node.name == "task"
+        if node.kind == "human_message" and node.parent_subagent_id == subagent.id
     )
+    scoped_user_messages = [
+        event.fact
+        for event in (await thread.events(limit=100)).items
+        if isinstance(event.fact, MessageFact)
+        and event.fact.namespace == namespace
+        and event.fact.role == "user"
+    ]
 
     assert facts[0].parent_tool_call_id == "call-task"
     assert facts[0].input is not None
     assert subagent.source_id == "call-task"
     assert subagent.name == "researcher"
     assert subagent.request == task_arguments
-    assert parent_tool.result == "Research complete"
+    assert subagent_input.content == task_arguments["description"]
+    assert subagent_input.source_id == "call-task"
+    captured_messages = {
+        fact.source_message_id: fact.content.value
+        for fact in scoped_user_messages
+        if fact.content is not None
+    }
+    assert captured_messages == (
+        {
+            "child-task-input": "Rewritten task",
+            "child-follow-up": task_arguments["description"],
+        }
+        if rewrite_first_input
+        else {"child-follow-up": task_arguments["description"]}
+    )
+    assert subagent.status == "succeeded"
+    assert all(node.name != "task" for node in thread.graph.nodes)
+
+
+@pytest.mark.parametrize("select_root_path", [False, True])
+@pytest.mark.parametrize("existing_message", [False, True])
+async def test_resumed_subagent_keeps_its_task_input_in_one_fact(
+    select_root_path: bool,
+    existing_message: bool,
+) -> None:
+    store = InMemoryTraceStore()
+    policy = (
+        CapturePolicy.public_safe(
+            tool_rules=(ToolCaptureRule(tool_name="task", argument_paths=("",)),)
+        )
+        if select_root_path
+        else CapturePolicy.public_history()
+    )
+    tracer = Tracer(store=store, capture_policy=policy)
+    context = _context(run_id="delegation-initial")
+    session = await _start(tracer, context)
+    namespace = ("tools:delegation",)
+    message = NativeMessageRecord(
+        message_type="human", id="initial", content="original task"
+    )
+    await session.observe(
+        NativeTaskObservation(
+            identity=context.identity,
+            namespace=(),
+            phase="start",
+            task_id="delegation",
+            name="tools",
+            input=[
+                {
+                    "name": "task",
+                    "id": "call-task",
+                    "args": {
+                        "description": "original task",
+                        "subagent_type": "researcher",
+                    },
+                }
+            ],
+            observed_at=datetime.now(UTC),
+            monotonic_ns=3,
+        )
+    )
+    await session.observe(
+        NativeStateObservation(
+            identity=context.identity,
+            namespace=namespace,
+            state={},
+            messages=(message,),
+            observed_at=datetime.now(UTC),
+            monotonic_ns=4,
+        )
+    )
+    if existing_message:
+        message = NativeMessageRecord(
+            message_type="human", id="later", content="original task"
+        )
+        await session.observe(
+            NativeStateObservation(
+                identity=context.identity,
+                namespace=namespace,
+                state={},
+                messages=(message,),
+                observed_at=datetime.now(UTC),
+                monotonic_ns=5,
+            )
+        )
+    await _finish(session, context, outcome="interrupted")
+
+    resumed = _context(
+        run_id="delegation-resumed",
+        input_kind="resume",
+        parent_run_id=context.identity.run_id,
+    )
+    resumed_tracer = Tracer(store=store, capture_policy=policy)
+    resumed_session = await _start(resumed_tracer, resumed)
+    await resumed_session.observe(
+        NativeStateObservation(
+            identity=resumed.identity,
+            namespace=namespace,
+            state={},
+            messages=(message,),
+            observed_at=datetime.now(UTC),
+            monotonic_ns=3,
+        )
+    )
+    await resumed_session.observe(
+        NativeStateObservation(
+            identity=resumed.identity,
+            namespace=namespace,
+            state={},
+            messages=(),
+            observed_at=datetime.now(UTC),
+            monotonic_ns=4,
+        )
+    )
+    await _finish(resumed_session, resumed, outcome="interrupted")
+    events = (
+        await (await resumed_tracer.get("thread-semantic")).events(limit=100)
+    ).items
+    assert not any(
+        isinstance(event.fact, MessageFact)
+        and event.fact.namespace == namespace
+        and event.fact.source_message_id == "initial"
+        for event in events
+    )
+    if existing_message:
+        assert any(
+            isinstance(event.fact, MessageFact)
+            and event.fact.source_message_id == "later"
+            and event.fact.phase == "removed"
+            and event.fact.identity.run_id == resumed.identity.run_id
+            for event in events
+        )
 
 
 async def test_grouped_parallel_task_result_completes_every_direct_subagent() -> None:
@@ -1085,7 +1113,7 @@ async def test_interaction_resolves_across_resume_and_keeps_one_turn() -> None:
     assert thread.interactions[0].status == "resolved"
     assert thread.summary.pending_interactions == ()
     assert len(thread.graph.turns) == 1
-    assert len([node for node in thread.graph.nodes if node.kind == "run"]) == 2
+    assert all(node.kind != "run" for node in thread.graph.nodes)
     assert any(
         isinstance(event.fact, MessageFact)
         and event.fact.role == "user"
@@ -1117,13 +1145,17 @@ async def test_root_and_colliding_subgraph_paths_remain_separate_state_scopes() 
             )
         )
     await _finish(session, context)
-    state = (await tracer.get("thread-semantic")).state
+    thread = await tracer.get("thread-semantic")
+    state = thread.state
 
     assert state.root == {"value": "root"}
     assert state.subgraphs == {
         '["a/b"]': {"value": "single-component"},
         '["a","b"]': {"value": "two-components"},
     }
+    assert not any(
+        node.kind is TraceGraphNodeKind.SUBAGENT for node in thread.graph.nodes
+    )
 
 
 async def test_tool_review_interaction_applies_the_tool_argument_allowlist() -> None:

@@ -43,7 +43,6 @@ from tinkerfin import (
 )
 from tinkerfin._observation import RuntimeObservationHub
 from tinkerfin_contracts import (
-    AgentStepObservation,
     ContextContributionObservation,
     ModelCallObservation,
     NativeMessageObservation,
@@ -245,23 +244,10 @@ async def test_model_call_records_final_request_and_first_output_before_native()
         if observation.kind == "native.message"
     )
     assert first_model_index < first_native_index
-    steps = [
-        observation
-        for observation in session.observations
-        if isinstance(observation, AgentStepObservation)
-    ]
-    assert [(step.step_kind, step.name, step.phase) for step in steps] == [
-        ("agent", "LangGraph", "started"),
-        ("middleware", "PatchToolCallsMiddleware.before_agent", "started"),
-        ("middleware", "PatchToolCallsMiddleware.before_agent", "completed"),
-        ("model", "model", "started"),
-        ("model", "model", "completed"),
-        ("agent", "LangGraph", "completed"),
-    ]
-    model_step = next(step for step in steps if step.step_kind == "model")
-    assert model_calls[0].parent_call_id == model_step.call_id
-    started_calls = sum(step.phase == "started" for step in steps) + 1
-    assert session.boundaries.count(ObservationBoundary.CALL_STARTED) == started_calls
+    assert not any(
+        observation.kind == "call.agent_step" for observation in session.observations
+    )
+    assert session.boundaries.count(ObservationBoundary.CALL_STARTED) == 1
     assert ObservationBoundary.TERMINAL in session.boundaries
 
 
@@ -461,135 +447,6 @@ async def test_v3_preserves_subagent_namespaces_and_model_calls() -> None:
 
 
 @pytest.mark.asyncio
-async def test_provider_parent_uses_the_matching_graph_task_when_raw_parent_is_unknown() -> (
-    None
-):
-    session = _Session()
-    context = RunSourceContext(
-        identity=_identity("run-normalized-parent"),
-        runtime_profile="deepagents-v2",
-        input_kind="ordinary",
-        input={"messages": [{"role": "user", "content": "hello"}]},
-        config={},
-    )
-    hub = RuntimeObservationHub(context=context, observers=(_Observer(session),))
-    await hub.start()
-    handler = hub.call_handler
-    root_run_id = uuid4()
-    model_run_id = uuid4()
-    provider_run_id = uuid4()
-    unknown_parent_id = uuid4()
-    metadata = {
-        "langgraph_checkpoint_ns": "model:native-task-1",
-        "langgraph_node": "model",
-    }
-    await handler.on_chain_start(
-        {},
-        {},
-        run_id=root_run_id,
-        name="LangGraph",
-    )
-    await handler.on_chain_start(
-        {},
-        {},
-        run_id=model_run_id,
-        parent_run_id=root_run_id,
-        name="model",
-        metadata=metadata,
-    )
-    await handler.on_chat_model_start(
-        {},
-        [[HumanMessage(content="hello")]],
-        run_id=provider_run_id,
-        parent_run_id=unknown_parent_id,
-        metadata=metadata,
-    )
-    await handler.on_llm_end(
-        LLMResult(generations=[[]]),
-        run_id=provider_run_id,
-    )
-    await handler.on_chain_end({}, run_id=model_run_id)
-    await handler.on_chain_end({}, run_id=root_run_id)
-    await hub.terminal("succeeded")
-    await hub.close()
-
-    model_start = next(
-        observation
-        for observation in session.observations
-        if isinstance(observation, AgentStepObservation)
-        and observation.step_kind == "model"
-        and observation.phase == "started"
-    )
-    provider_start = next(
-        observation
-        for observation in session.observations
-        if isinstance(observation, ModelCallObservation)
-        and observation.phase == "started"
-    )
-    assert provider_start.parent_call_id == model_start.call_id
-
-
-@pytest.mark.asyncio
-async def test_nested_chain_does_not_reuse_the_outer_native_task_identity() -> None:
-    session = _Session()
-    context = RunSourceContext(
-        identity=_identity("run-nested-task-callback"),
-        runtime_profile="deepagents-v2",
-        input_kind="ordinary",
-        input={"messages": [{"role": "user", "content": "plan"}]},
-        config={},
-    )
-    hub = RuntimeObservationHub(context=context, observers=(_Observer(session),))
-    await hub.start()
-    handler = hub.call_handler
-    root_run_id = uuid4()
-    task_run_id = uuid4()
-    nested_run_id = uuid4()
-    metadata = {
-        "langgraph_checkpoint_ns": "create_plan:native-task-1",
-        "langgraph_node": "create_plan",
-    }
-
-    await handler.on_chain_start(
-        {}, {}, run_id=root_run_id, name="tinkerfin_planning_workflow"
-    )
-    await handler.on_chain_start(
-        {},
-        {},
-        run_id=task_run_id,
-        parent_run_id=root_run_id,
-        name="create_plan",
-        metadata=metadata,
-    )
-    await handler.on_chain_start(
-        {},
-        {},
-        run_id=nested_run_id,
-        parent_run_id=task_run_id,
-        name="model",
-        metadata=metadata,
-    )
-    await handler.on_chain_end({}, run_id=nested_run_id)
-    await handler.on_chain_end({}, run_id=task_run_id)
-    await handler.on_chain_end({}, run_id=root_run_id)
-    await hub.terminal("succeeded")
-    await hub.close()
-
-    starts = {
-        observation.name: observation
-        for observation in session.observations
-        if isinstance(observation, AgentStepObservation)
-        and observation.phase == "started"
-    }
-    outer = starts["create_plan"]
-    nested = starts["model"]
-    assert starts["tinkerfin_planning_workflow"].step_kind == "agent"
-    assert outer.task_id == "native-task-1"
-    assert nested.task_id is None
-    assert nested.parent_call_id == outer.call_id
-
-
-@pytest.mark.asyncio
 async def test_model_output_ids_complete_when_the_first_chunk_has_no_identity() -> None:
     """Completion retains stable output IDs without guessing from chunk order."""
 
@@ -647,7 +504,7 @@ async def test_model_output_ids_complete_when_the_first_chunk_has_no_identity() 
     [DeepAgentsV2RuntimeProfile(), DeepAgentsV3RuntimeProfile()],
     ids=["v2-astream", "v3-astream-events"],
 )
-async def test_before_model_failure_is_owned_by_the_middleware_step(
+async def test_before_model_failure_does_not_create_middleware_observations(
     runtime_profile: DeepAgentsRuntimeProfile,
 ) -> None:
     session = _Session()
@@ -667,25 +524,15 @@ async def test_before_model_failure_is_owned_by_the_middleware_step(
         async for _part in stream:
             pass
 
-    failed = [
-        observation
-        for observation in session.observations
-        if isinstance(observation, AgentStepObservation)
-        and observation.phase == "failed"
-        and observation.failure_origin
-    ]
-    assert [(item.middleware_name, item.hook) for item in failed] == [
-        ("guardrail", "before_model")
-    ]
     assert not any(
         isinstance(observation, ModelCallObservation)
         for observation in session.observations
     )
+    assert not any(
+        observation.kind == "call.agent_step" for observation in session.observations
+    )
     assert any(
-        isinstance(observation, AgentStepObservation)
-        and observation.step_kind == "agent"
-        and observation.phase == "failed"
-        and not observation.failure_origin
+        observation.kind == "run.terminal" and observation.outcome == "failed"
         for observation in session.observations
     )
 
@@ -833,33 +680,14 @@ async def test_runtime_cancellation_closes_an_unmatched_tool_execution(
         if observation.kind == "run.terminal"
     )
     assert session.observations.index(executions[-1]) < terminal_index
-    steps = [
-        observation
-        for observation in session.observations
-        if isinstance(observation, AgentStepObservation)
-    ]
-    phases_by_call: dict[str, set[str]] = {}
-    for step in steps:
-        phases_by_call.setdefault(step.call_id, set()).add(step.phase)
-    assert all(
-        "started" in phases
-        and bool(
-            phases.intersection(
-                {"completed", "failed", "cancelled", "interrupted", "abandoned"}
-            )
-        )
-        for phases in phases_by_call.values()
-    )
-    assert all(
-        step.error_type is None and not step.failure_origin
-        for step in steps
-        if step.phase == "cancelled"
+    assert not any(
+        observation.kind == "call.agent_step" for observation in session.observations
     )
 
 
 @pytest.mark.asyncio
-async def test_middleware_description_never_changes_original_execution() -> None:
-    """Definition metadata preserves every original middleware instance and order."""
+async def test_middleware_execution_is_preserved_without_trace_metadata() -> None:
+    """Middleware keeps its behavior without entering observation metadata."""
 
     calls: list[str] = []
     metrics = _ContributingMiddleware("internal-metrics", calls)
@@ -883,13 +711,7 @@ async def test_middleware_description_never_changes_original_execution() -> None
 
     assert calls == ["internal-metrics", "customer-memory"]
     assert len(observer.contexts) == 1
-    assert [item.name for item in observer.contexts[0].middleware] == [
-        "internal-metrics",
-        "customer-memory",
-    ]
-    assert all(
-        item.hooks == ("awrap_model_call",) for item in observer.contexts[0].middleware
-    )
+    assert not hasattr(observer.contexts[0], "middleware")
     contributions = [
         observation
         for observation in session.observations
@@ -968,17 +790,9 @@ async def test_rejected_tool_review_never_records_an_execution(
     async for _part in first:
         pass
     interrupted_observations = tuple(session.observations)
-    interrupted_steps = tuple(
-        observation
+    assert not any(
+        observation.kind == "call.agent_step"
         for observation in interrupted_observations
-        if isinstance(observation, AgentStepObservation)
-    )
-    assert any(step.phase == "interrupted" for step in interrupted_steps)
-    assert not any(step.phase == "failed" for step in interrupted_steps)
-    assert all(
-        step.error_type is None and not step.failure_origin
-        for step in interrupted_steps
-        if step.phase == "interrupted"
     )
     assert any(
         observation.kind == "run.terminal" and observation.outcome == "interrupted"

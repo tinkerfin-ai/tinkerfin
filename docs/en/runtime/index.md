@@ -122,6 +122,10 @@ Messaging, and host code do not branch on the upstream stream API. `TodoGroups` 
 host projections over canonical Trace facts rather than Runtime state or a second
 persistence format.
 
+The selected Profile and its `profile_id` form a framework-private integration and
+checkpoint-recovery boundary. A host selects that boundary during framework assembly;
+the identity is not an application database field or HTTP request/response value.
+
 Archive/S3/Blob storage, payload encryption/KMS, and OpenTelemetry exporters are not
 provided. Active Trace storage implements `TraceLedgerBackend`; advanced integrations
 may replace `TraceStore`, wrap the canonical payload codec, observe `RuntimeObserver`,

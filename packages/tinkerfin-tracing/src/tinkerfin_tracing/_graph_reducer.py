@@ -1,4 +1,4 @@
-"""Single deterministic reducer from committed facts to Graph index mutations."""
+"""Reduce committed facts into one flat, Subagent-scoped timeline index."""
 
 from __future__ import annotations
 
@@ -11,19 +11,16 @@ from ._ids import scope_id
 from .backend import TraceGraphNodeMutation
 from .errors import TraceStoreProtocolError
 from .facts import (
-    AgentStepFact,
     ContextContributionFact,
     InteractionFact,
     MessageFact,
     ModelCallFact,
     PlanRevisionFact,
-    RunFact,
-    RuntimeTaskFact,
-    SkillFact,
     SubagentFact,
     ToolExecutionFact,
     ToolFact,
     TraceEvent,
+    TraceSemanticFact,
     TurnFact,
 )
 from .graph import TraceGraphLinkIssue, TraceGraphNodeKind, TraceGraphNodeStatus
@@ -31,10 +28,11 @@ from .graph import TraceGraphLinkIssue, TraceGraphNodeKind, TraceGraphNodeStatus
 
 @dataclass(slots=True)
 class ReducedTraceGraphNode:
-    """Hold one payload-free node revision produced by Graph mutations."""
+    """Hold one payload-free event revision produced by Graph mutations."""
 
     node_id: str
-    structural_parent_id: str | None
+    parent_subagent_id: str | None
+    model_call_id: str | None
     kind: TraceGraphNodeKind
     status: TraceGraphNodeStatus
     name: str
@@ -56,7 +54,7 @@ class ReducedTraceGraphNode:
 
 @dataclass(frozen=True, slots=True)
 class ReducedTraceGraphTombstone:
-    """Hide an inherited logical node in one selected Run lineage."""
+    """Hide an inherited logical event in one selected Run lineage."""
 
     node_id: str
     run_id: str
@@ -68,37 +66,43 @@ ReducedTraceGraphRevision: TypeAlias = (
 )
 
 
-def _run_node(event: TraceEvent) -> str:
-    return f"run:{event.generation}:{event.fact.identity.run_id}"
-
-
-def _agent_node(run_id: str, namespace: tuple[str, ...]) -> str:
-    if namespace:
-        return scope_id("subagent", namespace, namespace[-1])
-    return scope_id("agent", (), run_id)
-
-
-def _runtime_task_node(fact: RuntimeTaskFact) -> str:
-    return scope_id(
-        "runtime-task",
-        fact.namespace,
-        f"{fact.identity.run_id}:{fact.source_task_id}",
-    )
-
-
 def _tool_node(namespace: tuple[str, ...], source_tool_call_id: str) -> str:
     return scope_id("tool", namespace, source_tool_call_id)
 
 
+def _subagent_owner(namespace: tuple[str, ...]) -> str | None:
+    if not namespace:
+        return None
+    return scope_id("subagent", namespace, namespace[-1])
+
+
+def _outer_subagent_owner(namespace: tuple[str, ...]) -> str | None:
+    return _subagent_owner(namespace[:-1])
+
+
+def _fact_subagent_owner(fact: TraceSemanticFact) -> str | None:
+    return _subagent_owner(fact.namespace) if fact.in_subagent_scope else None
+
+
+def _subagent_input_node(fact: SubagentFact) -> str:
+    return scope_id("subagent-input", fact.namespace, fact.subagent_id)
+
+
 def resolve_graph_link_issue(
-    structural_parent_id: str | None,
+    parent_subagent_id: str | None,
+    model_call_id: str | None,
     link_issue: TraceGraphLinkIssue | None,
 ) -> TraceGraphLinkIssue | None:
-    """Drop a transient missing-parent marker once exact parent evidence exists."""
+    """Drop a missing-link marker once its exact relationship is available."""
 
     if (
-        structural_parent_id is not None
-        and link_issue is TraceGraphLinkIssue.MISSING_PARENT
+        parent_subagent_id is not None
+        and link_issue is TraceGraphLinkIssue.MISSING_SUBAGENT
+    ):
+        return None
+    if (
+        model_call_id is not None
+        and link_issue is TraceGraphLinkIssue.MISSING_MODEL_CALL
     ):
         return None
     return link_issue
@@ -108,46 +112,28 @@ def resolve_graph_node_kind(
     current: TraceGraphNodeKind | None,
     incoming: TraceGraphNodeKind | None,
 ) -> TraceGraphNodeKind | None:
-    """Merge the two valid views of one task-backed middleware execution.
-
-    Native task observations and middleware callbacks describe the same execution
-    when they share a canonical node identity. Middleware is the more specific
-    presentation kind regardless of event arrival order. Every other kind change
-    remains a protocol violation.
-
-    Args:
-        current: Kind already retained for the canonical node.
-        incoming: Kind supplied by the next mutation.
-
-    Returns:
-        The single canonical kind for the node.
-
-    Raises:
-        TraceStoreProtocolError: If two unrelated kinds claim the same identity.
-    """
+    """Keep one immutable semantic kind for every stable event identity."""
 
     if current is None:
         return incoming
     if incoming is None or incoming is current:
         return current
-    if {current, incoming} == {
-        TraceGraphNodeKind.RUNTIME_TASK,
-        TraceGraphNodeKind.MIDDLEWARE,
-    }:
-        return TraceGraphNodeKind.MIDDLEWARE
     raise TraceStoreProtocolError(
         f"Trace Graph node kind changed from {current.value} to {incoming.value}"
     )
 
 
-def _terminal_status(value: str) -> TraceGraphNodeStatus:
-    return {
-        "succeeded": TraceGraphNodeStatus.SUCCEEDED,
-        "interrupted": TraceGraphNodeStatus.WAITING,
-        "failed": TraceGraphNodeStatus.FAILED,
-        "cancelled": TraceGraphNodeStatus.CANCELLED,
-        "abandoned": TraceGraphNodeStatus.ABANDONED,
-    }.get(value, TraceGraphNodeStatus.UNKNOWN)
+def _subagent_status(value: str) -> TraceGraphNodeStatus:
+    try:
+        return {
+            "succeeded": TraceGraphNodeStatus.SUCCEEDED,
+            "failed": TraceGraphNodeStatus.FAILED,
+            "cancelled": TraceGraphNodeStatus.CANCELLED,
+            "abandoned": TraceGraphNodeStatus.ABANDONED,
+            "waiting": TraceGraphNodeStatus.WAITING,
+        }[value]
+    except KeyError as error:  # pragma: no cover - SubagentFact validates this boundary
+        raise TraceStoreProtocolError("Subagent status is not projectable") from error
 
 
 def _phase_status(value: str) -> TraceGraphNodeStatus:
@@ -161,85 +147,41 @@ def _phase_status(value: str) -> TraceGraphNodeStatus:
     }.get(value, TraceGraphNodeStatus.UNKNOWN)
 
 
+def _terminal_time(
+    status: TraceGraphNodeStatus, occurred_at: datetime
+) -> datetime | None:
+    if status in {TraceGraphNodeStatus.RUNNING, TraceGraphNodeStatus.WAITING}:
+        return None
+    return occurred_at
+
+
 def graph_node_mutations(
     events: tuple[TraceEvent, ...],
 ) -> tuple[TraceGraphNodeMutation, ...]:
-    """Reduce one ordered fact batch into payload-free Graph index changes.
-
-    The same function drives online append and full rebuild. Message content deltas do
-    not update the index; only a final reconciliation supplies a detail locator.
-    """
+    """Reduce one ordered fact batch into payload-free timeline mutations."""
 
     mutations: list[TraceGraphNodeMutation] = []
     for event in events:
         fact = event.fact
-        if isinstance(fact, RunFact):
-            node_id = _run_node(event)
-            if fact.phase == "started":
-                mutations.append(
-                    TraceGraphNodeMutation(
-                        node_id=node_id,
-                        updated_seq=event.trace_seq,
-                        kind=TraceGraphNodeKind.RUN,
-                        status=TraceGraphNodeStatus.RUNNING,
-                        name="Run",
-                        run_id=fact.identity.run_id,
-                        namespace=(),
-                        started_at=fact.occurred_at,
-                        started_seq=event.trace_seq,
-                    )
-                )
-            elif fact.phase == "terminal" and fact.outcome is not None:
-                mutations.append(
-                    TraceGraphNodeMutation(
-                        node_id=node_id,
-                        updated_seq=event.trace_seq,
-                        run_id=fact.identity.run_id,
-                        status=_terminal_status(fact.outcome),
-                        completed_at=fact.occurred_at,
-                        result_seq=event.trace_seq,
-                        failure_seq=(
-                            event.trace_seq
-                            if fact.outcome == "failed" and fact.failure_origin
-                            else None
-                        ),
-                    )
-                )
-            continue
         if isinstance(fact, TurnFact):
             source_message_id = fact.user_message_id or fact.turn_id
-            human_id = scope_id("message", (), source_message_id)
-            mutations.extend(
-                (
-                    TraceGraphNodeMutation(
-                        node_id=human_id,
-                        updated_seq=event.trace_seq,
-                        kind=TraceGraphNodeKind.HUMAN_MESSAGE,
-                        status=TraceGraphNodeStatus.SUCCEEDED,
-                        name="HumanMessage",
-                        run_id=fact.identity.run_id,
-                        namespace=(),
-                        started_at=fact.occurred_at,
-                        completed_at=fact.occurred_at,
-                        started_seq=event.trace_seq,
-                        link_issue=(
-                            None
-                            if fact.user_message_id is not None
-                            else TraceGraphLinkIssue.MISSING_PARENT
-                        ),
-                    ),
-                    TraceGraphNodeMutation(
-                        node_id=_run_node(event),
-                        updated_seq=event.trace_seq,
-                        run_id=fact.identity.run_id,
-                        structural_parent_id=human_id,
-                    ),
+            mutations.append(
+                TraceGraphNodeMutation(
+                    node_id=scope_id("message", (), source_message_id),
+                    updated_seq=event.trace_seq,
+                    kind=TraceGraphNodeKind.HUMAN_MESSAGE,
+                    status=TraceGraphNodeStatus.SUCCEEDED,
+                    name="HumanMessage",
+                    run_id=fact.identity.run_id,
+                    namespace=(),
+                    started_at=fact.occurred_at,
+                    completed_at=fact.occurred_at,
+                    started_seq=event.trace_seq,
+                    link_issue=None,
                 )
             )
             continue
         if isinstance(fact, MessageFact):
-            if fact.role == "tool" or (fact.role == "user" and fact.namespace):
-                continue
             if fact.phase == "removed":
                 mutations.append(
                     TraceGraphNodeMutation(
@@ -250,169 +192,72 @@ def graph_node_mutations(
                     )
                 )
                 continue
-            kind = {
-                "user": TraceGraphNodeKind.HUMAN_MESSAGE,
-                "assistant": TraceGraphNodeKind.ASSISTANT_MESSAGE,
-                "system": TraceGraphNodeKind.SYSTEM_MESSAGE,
-            }.get(fact.role)
-            if kind is None or fact.phase == "content":
+            if fact.role == "tool" or fact.role == "other" or fact.role == "system":
                 continue
-            parent_id = (
-                _tool_node(fact.namespace, fact.tool_call_id)
-                if fact.role == "tool" and fact.tool_call_id is not None
-                else None
+            if fact.role == "user":
+                if fact.namespace or fact.phase == "content":
+                    continue
+                mutations.append(
+                    TraceGraphNodeMutation(
+                        node_id=fact.message_id,
+                        updated_seq=event.trace_seq,
+                        run_id=fact.identity.run_id,
+                        result_seq=(
+                            event.trace_seq if fact.content is not None else None
+                        ),
+                    )
+                )
+                continue
+            if fact.phase == "content":
+                continue
+            status = (
+                TraceGraphNodeStatus.RUNNING
+                if fact.phase == "started"
+                else TraceGraphNodeStatus.SUCCEEDED
             )
             mutations.append(
                 TraceGraphNodeMutation(
                     node_id=fact.message_id,
                     updated_seq=event.trace_seq,
-                    kind=kind,
-                    status=(
-                        TraceGraphNodeStatus.RUNNING
-                        if fact.phase == "started"
-                        else TraceGraphNodeStatus.SUCCEEDED
-                    ),
-                    name={
-                        "user": "HumanMessage",
-                        "assistant": "AssistantMessage",
-                        "tool": "ToolMessage",
-                        "system": "SystemMessage",
-                    }[fact.role],
+                    kind=TraceGraphNodeKind.ASSISTANT_MESSAGE,
+                    status=status,
+                    name="AssistantMessage",
                     run_id=fact.identity.run_id,
-                    structural_parent_id=parent_id,
+                    parent_subagent_id=_fact_subagent_owner(fact),
                     namespace=fact.namespace,
                     started_at=fact.occurred_at,
-                    completed_at=(
-                        None if fact.phase == "started" else fact.occurred_at
-                    ),
+                    completed_at=_terminal_time(status, fact.occurred_at),
                     started_seq=event.trace_seq,
                     result_seq=(event.trace_seq if fact.content is not None else None),
+                    link_issue=TraceGraphLinkIssue.MISSING_MODEL_CALL,
                 )
             )
             continue
-        if isinstance(fact, AgentStepFact):
-            if fact.step_kind == "subagent":
-                continue
-            node_id = (
-                scope_id(
-                    "runtime-task",
-                    fact.namespace,
-                    f"{fact.identity.run_id}:{fact.source_task_id}",
-                )
-                if fact.step_kind == "middleware" and fact.source_task_id is not None
-                else fact.call_id
-            )
-            semantic_agent = fact.step_kind == "agent"
-            kind = (
-                TraceGraphNodeKind.AGENT
-                if semantic_agent
-                else (
-                    TraceGraphNodeKind.MIDDLEWARE
-                    if fact.step_kind == "middleware"
-                    else TraceGraphNodeKind.RUNTIME_TASK
-                )
-            )
-            # Native task identity owns the canonical Agent/Subagent parent. LangChain
-            # may report an intermediate chain callback as the raw parent inside the
-            # same task, but that callback must not rewrite the merged task node.
-            parent_id = (
-                _agent_node(fact.identity.run_id, fact.namespace)
-                if fact.source_task_id is not None
-                else fact.parent_call_id
-            )
-            if semantic_agent and parent_id is None:
-                parent_id = _run_node(event)
+        if isinstance(fact, ModelCallFact):
             if fact.phase == "started":
+                if fact.context_started_at is None:  # pragma: no cover - Fact contract
+                    raise TraceStoreProtocolError(
+                        "Model call context start is unavailable"
+                    )
                 mutations.append(
                     TraceGraphNodeMutation(
-                        node_id=node_id,
+                        node_id=scope_id("context", fact.namespace, fact.call_id),
                         updated_seq=event.trace_seq,
-                        kind=kind,
-                        status=TraceGraphNodeStatus.RUNNING,
-                        name=(fact.agent_name or "Agent")
-                        if semantic_agent
-                        else fact.name,
+                        kind=TraceGraphNodeKind.CONTEXT,
+                        status=TraceGraphNodeStatus.SUCCEEDED,
+                        name="Context",
                         run_id=fact.identity.run_id,
-                        structural_parent_id=parent_id,
+                        parent_subagent_id=_fact_subagent_owner(fact),
                         namespace=fact.namespace,
                         agent_name=fact.agent_name,
-                        started_at=fact.occurred_at,
-                        started_seq=event.trace_seq,
-                        request_seq=(
-                            event.trace_seq
-                            if kind
-                            in {
-                                TraceGraphNodeKind.AGENT,
-                                TraceGraphNodeKind.MIDDLEWARE,
-                            }
-                            else None
-                        ),
-                        link_issue=(
-                            None
-                            if parent_id is not None or semantic_agent
-                            else TraceGraphLinkIssue.MISSING_PARENT
-                        ),
-                    )
-                )
-            else:
-                mutations.append(
-                    TraceGraphNodeMutation(
-                        node_id=node_id,
-                        updated_seq=event.trace_seq,
-                        run_id=fact.identity.run_id,
-                        status=_phase_status(fact.phase),
+                        provider=fact.provider,
+                        model=fact.model,
+                        started_at=fact.context_started_at,
                         completed_at=fact.occurred_at,
-                        result_seq=event.trace_seq,
-                        failure_seq=(
-                            event.trace_seq
-                            if fact.phase == "failed" and fact.failure_origin
-                            else None
-                        ),
-                    )
-                )
-            continue
-        if isinstance(fact, RuntimeTaskFact):
-            node_id = _runtime_task_node(fact)
-            if fact.phase == "started":
-                mutations.append(
-                    TraceGraphNodeMutation(
-                        node_id=node_id,
-                        updated_seq=event.trace_seq,
-                        kind=TraceGraphNodeKind.RUNTIME_TASK,
-                        status=TraceGraphNodeStatus.RUNNING,
-                        name=fact.task_name,
-                        run_id=fact.identity.run_id,
-                        structural_parent_id=_agent_node(
-                            fact.identity.run_id,
-                            fact.namespace,
-                        ),
-                        namespace=fact.namespace,
-                        started_at=fact.occurred_at,
                         started_seq=event.trace_seq,
                         request_seq=event.trace_seq,
                     )
                 )
-            else:
-                mutations.append(
-                    TraceGraphNodeMutation(
-                        node_id=node_id,
-                        updated_seq=event.trace_seq,
-                        run_id=fact.identity.run_id,
-                        status=_phase_status(fact.phase),
-                        completed_at=(
-                            None if fact.phase == "interrupted" else fact.occurred_at
-                        ),
-                        result_seq=event.trace_seq,
-                        failure_seq=(
-                            event.trace_seq
-                            if fact.phase == "failed" and fact.failure_origin
-                            else None
-                        ),
-                    )
-                )
-            continue
-        if isinstance(fact, ModelCallFact):
-            if fact.phase == "started":
                 mutations.append(
                     TraceGraphNodeMutation(
                         node_id=fact.call_id,
@@ -421,7 +266,7 @@ def graph_node_mutations(
                         status=TraceGraphNodeStatus.RUNNING,
                         name=fact.model or "Model",
                         run_id=fact.identity.run_id,
-                        structural_parent_id=fact.parent_call_id,
+                        parent_subagent_id=_fact_subagent_owner(fact),
                         namespace=fact.namespace,
                         agent_name=fact.agent_name,
                         provider=fact.provider,
@@ -429,37 +274,8 @@ def graph_node_mutations(
                         started_at=fact.occurred_at,
                         started_seq=event.trace_seq,
                         request_seq=event.trace_seq,
-                        link_issue=(
-                            None
-                            if fact.parent_call_id is not None
-                            else TraceGraphLinkIssue.MISSING_PARENT
-                        ),
                     )
                 )
-                for position in fact.system_message_positions:
-                    mutations.append(
-                        TraceGraphNodeMutation(
-                            node_id=scope_id(
-                                "system-message",
-                                fact.namespace,
-                                f"{fact.call_id}:{position}",
-                            ),
-                            updated_seq=event.trace_seq,
-                            kind=TraceGraphNodeKind.SYSTEM_MESSAGE,
-                            status=TraceGraphNodeStatus.SUCCEEDED,
-                            name="SystemMessage",
-                            run_id=fact.identity.run_id,
-                            structural_parent_id=fact.call_id,
-                            namespace=fact.namespace,
-                            agent_name=fact.agent_name,
-                            provider=fact.provider,
-                            model=fact.model,
-                            started_at=fact.occurred_at,
-                            completed_at=fact.occurred_at,
-                            started_seq=event.trace_seq,
-                            request_seq=event.trace_seq,
-                        )
-                    )
             elif fact.phase == "first_output":
                 mutations.append(
                     TraceGraphNodeMutation(
@@ -482,7 +298,8 @@ def graph_node_mutations(
                             status=TraceGraphNodeStatus.RUNNING,
                             name="AssistantMessage",
                             run_id=fact.identity.run_id,
-                            structural_parent_id=fact.call_id,
+                            parent_subagent_id=_fact_subagent_owner(fact),
+                            model_call_id=fact.call_id,
                             namespace=fact.namespace,
                             agent_name=fact.agent_name,
                             started_at=fact.occurred_at,
@@ -490,13 +307,14 @@ def graph_node_mutations(
                         )
                     )
             else:
+                status = _phase_status(fact.phase)
                 mutations.append(
                     TraceGraphNodeMutation(
                         node_id=fact.call_id,
                         updated_seq=event.trace_seq,
                         run_id=fact.identity.run_id,
-                        status=_phase_status(fact.phase),
-                        completed_at=fact.occurred_at,
+                        status=status,
+                        completed_at=_terminal_time(status, fact.occurred_at),
                         result_seq=event.trace_seq,
                         failure_seq=(
                             event.trace_seq
@@ -519,12 +337,14 @@ def graph_node_mutations(
                                 status=TraceGraphNodeStatus.SUCCEEDED,
                                 name="AssistantMessage",
                                 run_id=fact.identity.run_id,
-                                structural_parent_id=fact.call_id,
+                                parent_subagent_id=_fact_subagent_owner(fact),
+                                model_call_id=fact.call_id,
                                 namespace=fact.namespace,
                                 agent_name=fact.agent_name,
                                 started_at=fact.occurred_at,
                                 completed_at=fact.occurred_at,
                                 started_seq=event.trace_seq,
+                                request_seq=event.trace_seq,
                             )
                         )
                     for source_tool_call_id in fact.tool_call_ids:
@@ -536,13 +356,15 @@ def graph_node_mutations(
                                 ),
                                 updated_seq=event.trace_seq,
                                 run_id=fact.identity.run_id,
-                                structural_parent_id=fact.call_id,
+                                model_call_id=fact.call_id,
                             )
                         )
             continue
         if isinstance(fact, ToolFact):
+            if fact.tool_name == "task":
+                continue
             node_id = _tool_node(fact.namespace, fact.source_tool_call_id)
-            if fact.phase == "started":
+            if fact.phase in {"started", "arguments"}:
                 mutations.append(
                     TraceGraphNodeMutation(
                         node_id=node_id,
@@ -551,51 +373,43 @@ def graph_node_mutations(
                         status=TraceGraphNodeStatus.WAITING,
                         name=fact.tool_name,
                         run_id=fact.identity.run_id,
-                        structural_parent_id=fact.parent_call_id,
+                        parent_subagent_id=_fact_subagent_owner(fact),
+                        model_call_id=fact.parent_call_id,
                         namespace=fact.namespace,
                         started_at=fact.occurred_at,
                         started_seq=event.trace_seq,
+                        request_seq=(
+                            event.trace_seq
+                            if fact.phase == "arguments" and fact.content is not None
+                            else None
+                        ),
                         link_issue=(
                             None
                             if fact.parent_call_id is not None
-                            else TraceGraphLinkIssue.MISSING_PARENT
+                            else TraceGraphLinkIssue.MISSING_MODEL_CALL
                         ),
-                    )
-                )
-            elif fact.phase == "arguments" and fact.content is not None:
-                mutations.append(
-                    TraceGraphNodeMutation(
-                        node_id=node_id,
-                        updated_seq=event.trace_seq,
-                        run_id=fact.identity.run_id,
-                        kind=TraceGraphNodeKind.TOOL,
-                        status=TraceGraphNodeStatus.WAITING,
-                        name=fact.tool_name,
-                        structural_parent_id=fact.parent_call_id,
-                        namespace=fact.namespace,
-                        started_at=fact.occurred_at,
-                        started_seq=event.trace_seq,
-                        request_seq=event.trace_seq,
                     )
                 )
             elif fact.phase == "result":
+                status = (
+                    TraceGraphNodeStatus.SUCCEEDED
+                    if fact.result_status == "success"
+                    else TraceGraphNodeStatus.FAILED
+                )
                 mutations.append(
                     TraceGraphNodeMutation(
                         node_id=node_id,
                         updated_seq=event.trace_seq,
-                        run_id=fact.identity.run_id,
                         kind=TraceGraphNodeKind.TOOL,
-                        status=(
-                            TraceGraphNodeStatus.SUCCEEDED
-                            if fact.result_status == "success"
-                            else TraceGraphNodeStatus.FAILED
-                        ),
+                        status=status,
                         name=fact.tool_name,
-                        structural_parent_id=fact.parent_call_id,
+                        run_id=fact.identity.run_id,
+                        parent_subagent_id=_fact_subagent_owner(fact),
+                        model_call_id=fact.parent_call_id,
                         namespace=fact.namespace,
                         started_at=fact.occurred_at,
-                        started_seq=event.trace_seq,
                         completed_at=fact.occurred_at,
+                        started_seq=event.trace_seq,
                         result_seq=event.trace_seq,
                         failure_seq=(
                             event.trace_seq
@@ -605,23 +419,27 @@ def graph_node_mutations(
                     )
                 )
             elif fact.phase in {"cancelled", "abandoned"}:
+                status = _phase_status(fact.phase)
                 mutations.append(
                     TraceGraphNodeMutation(
                         node_id=node_id,
                         updated_seq=event.trace_seq,
-                        run_id=fact.identity.run_id,
                         kind=TraceGraphNodeKind.TOOL,
-                        status=_phase_status(fact.phase),
+                        status=status,
                         name=fact.tool_name,
-                        structural_parent_id=fact.parent_call_id,
+                        run_id=fact.identity.run_id,
+                        parent_subagent_id=_fact_subagent_owner(fact),
+                        model_call_id=fact.parent_call_id,
                         namespace=fact.namespace,
                         started_at=fact.occurred_at,
-                        started_seq=event.trace_seq,
                         completed_at=fact.occurred_at,
+                        started_seq=event.trace_seq,
                     )
                 )
             continue
         if isinstance(fact, ToolExecutionFact):
+            if fact.tool_name == "task":
+                continue
             node_id = (
                 _tool_node(fact.namespace, fact.source_tool_call_id)
                 if fact.source_tool_call_id is not None
@@ -636,11 +454,8 @@ def graph_node_mutations(
                         status=TraceGraphNodeStatus.RUNNING,
                         name=fact.tool_name,
                         run_id=fact.identity.run_id,
-                        structural_parent_id=(
-                            fact.parent_call_id
-                            if fact.source_tool_call_id is None
-                            else None
-                        ),
+                        parent_subagent_id=_fact_subagent_owner(fact),
+                        model_call_id=fact.parent_call_id,
                         namespace=fact.namespace,
                         agent_name=fact.agent_name,
                         started_at=fact.occurred_at,
@@ -649,18 +464,23 @@ def graph_node_mutations(
                         link_issue=(
                             TraceGraphLinkIssue.MISSING_TOOL_PROPOSAL
                             if fact.source_tool_call_id is None
-                            else None
+                            else (
+                                TraceGraphLinkIssue.MISSING_MODEL_CALL
+                                if fact.parent_call_id is None
+                                else None
+                            )
                         ),
                     )
                 )
             else:
+                status = _phase_status(fact.phase)
                 mutations.append(
                     TraceGraphNodeMutation(
                         node_id=node_id,
                         updated_seq=event.trace_seq,
                         run_id=fact.identity.run_id,
-                        status=_phase_status(fact.phase),
-                        completed_at=fact.occurred_at,
+                        status=status,
+                        completed_at=_terminal_time(status, fact.occurred_at),
                         result_seq=event.trace_seq,
                         failure_seq=(
                             event.trace_seq
@@ -671,29 +491,7 @@ def graph_node_mutations(
                 )
             continue
         if isinstance(fact, SubagentFact):
-            internal_parent_id = None
-            if (
-                fact.phase == "started"
-                and fact.parent_tool_call_id is None
-                and fact.parent_execution_id is None
-                and fact.namespace
-            ):
-                _node_name, separator, source_task_id = fact.namespace[-1].partition(
-                    ":"
-                )
-                if separator and source_task_id:
-                    # A non-Tool subgraph, such as the Plan planner, still carries its
-                    # owning Native task in the locked LangGraph namespace segment.
-                    internal_parent_id = scope_id(
-                        "runtime-task",
-                        fact.namespace[:-1],
-                        f"{fact.identity.run_id}:{source_task_id}",
-                    )
-            parent_id = (
-                _tool_node(fact.namespace[:-1], fact.parent_tool_call_id)
-                if fact.parent_tool_call_id is not None
-                else fact.parent_execution_id or internal_parent_id
-            )
+            parent_subagent_id = _outer_subagent_owner(fact.namespace)
             if fact.phase == "started":
                 mutations.append(
                     TraceGraphNodeMutation(
@@ -703,65 +501,61 @@ def graph_node_mutations(
                         status=TraceGraphNodeStatus.RUNNING,
                         name=fact.agent_name or "Subagent",
                         run_id=fact.identity.run_id,
-                        structural_parent_id=parent_id,
+                        parent_subagent_id=parent_subagent_id,
+                        model_call_id=fact.model_call_id,
                         namespace=fact.namespace,
                         agent_name=fact.agent_name,
                         started_at=fact.occurred_at,
                         started_seq=event.trace_seq,
                         request_seq=event.trace_seq,
                         link_issue=(
-                            None
-                            if fact.parent_tool_call_id is not None
-                            or internal_parent_id is not None
-                            else TraceGraphLinkIssue.MISSING_TOOL_PROPOSAL
+                            TraceGraphLinkIssue.MISSING_TOOL_PROPOSAL
+                            if fact.parent_tool_call_id is None
+                            else (
+                                TraceGraphLinkIssue.MISSING_MODEL_CALL
+                                if fact.model_call_id is None
+                                else None
+                            )
                         ),
                     )
                 )
+                if fact.input is not None:
+                    mutations.append(
+                        TraceGraphNodeMutation(
+                            node_id=_subagent_input_node(fact),
+                            updated_seq=event.trace_seq,
+                            kind=TraceGraphNodeKind.HUMAN_MESSAGE,
+                            status=TraceGraphNodeStatus.SUCCEEDED,
+                            name="HumanMessage",
+                            run_id=fact.identity.run_id,
+                            parent_subagent_id=fact.subagent_id,
+                            namespace=fact.namespace,
+                            agent_name=fact.agent_name,
+                            started_at=fact.occurred_at,
+                            completed_at=fact.occurred_at,
+                            started_seq=event.trace_seq,
+                            result_seq=event.trace_seq,
+                        )
+                    )
             else:
+                status = _subagent_status(fact.status)
                 mutations.append(
                     TraceGraphNodeMutation(
                         node_id=fact.subagent_id,
                         updated_seq=event.trace_seq,
-                        run_id=fact.identity.run_id,
                         kind=TraceGraphNodeKind.SUBAGENT,
-                        status=_terminal_status(fact.status),
+                        run_id=fact.identity.run_id,
+                        status=status,
                         name=fact.agent_name or "Subagent",
-                        structural_parent_id=parent_id,
+                        parent_subagent_id=parent_subagent_id,
                         namespace=fact.namespace,
                         agent_name=fact.agent_name,
                         started_at=fact.occurred_at,
+                        completed_at=_terminal_time(status, fact.occurred_at),
                         started_seq=event.trace_seq,
-                        completed_at=(
-                            fact.occurred_at
-                            if fact.status
-                            in {"succeeded", "failed", "cancelled", "abandoned"}
-                            else None
-                        ),
                         result_seq=event.trace_seq,
                     )
                 )
-            continue
-        if isinstance(fact, SkillFact):
-            mutations.append(
-                TraceGraphNodeMutation(
-                    node_id=fact.skill_id,
-                    updated_seq=event.trace_seq,
-                    kind=TraceGraphNodeKind.SKILL,
-                    status=TraceGraphNodeStatus.SUCCEEDED,
-                    name=fact.name,
-                    run_id=fact.identity.run_id,
-                    structural_parent_id=(
-                        _tool_node(fact.namespace, fact.source_tool_call_id)
-                    ),
-                    namespace=fact.namespace,
-                    agent_name=fact.agent_name,
-                    started_at=fact.occurred_at,
-                    completed_at=fact.occurred_at,
-                    started_seq=event.trace_seq,
-                    request_seq=event.trace_seq,
-                    link_issue=(None),
-                )
-            )
             continue
         if isinstance(fact, ContextContributionFact):
             kind = {
@@ -770,10 +564,6 @@ def graph_node_mutations(
                 "retrieval": TraceGraphNodeKind.RETRIEVAL,
                 "custom": TraceGraphNodeKind.CUSTOM,
             }[fact.context_kind]
-            parent_id = fact.parent_call_id or _agent_node(
-                fact.identity.run_id,
-                fact.namespace,
-            )
             if fact.phase == "started":
                 mutations.append(
                     TraceGraphNodeMutation(
@@ -783,7 +573,7 @@ def graph_node_mutations(
                         status=TraceGraphNodeStatus.RUNNING,
                         name=fact.name,
                         run_id=fact.identity.run_id,
-                        structural_parent_id=parent_id,
+                        parent_subagent_id=_fact_subagent_owner(fact),
                         namespace=fact.namespace,
                         started_at=fact.occurred_at,
                         started_seq=event.trace_seq,
@@ -791,13 +581,14 @@ def graph_node_mutations(
                     )
                 )
             else:
+                status = _phase_status(fact.phase)
                 mutations.append(
                     TraceGraphNodeMutation(
                         node_id=fact.contribution_id,
                         updated_seq=event.trace_seq,
                         run_id=fact.identity.run_id,
-                        status=_phase_status(fact.phase),
-                        completed_at=fact.occurred_at,
+                        status=status,
+                        completed_at=_terminal_time(status, fact.occurred_at),
                         result_seq=event.trace_seq,
                         failure_seq=(
                             event.trace_seq
@@ -808,41 +599,33 @@ def graph_node_mutations(
                 )
             continue
         if isinstance(fact, PlanRevisionFact):
+            waiting = bool(
+                fact.status
+                and fact.status in {"awaiting_input", "awaiting_review", "draft"}
+            )
+            status = (
+                TraceGraphNodeStatus.WAITING
+                if waiting
+                else TraceGraphNodeStatus.SUCCEEDED
+            )
             mutations.append(
                 TraceGraphNodeMutation(
-                    node_id=scope_id(
-                        "plan",
-                        fact.namespace,
-                        fact.identity.run_id,
-                    ),
+                    node_id=scope_id("plan", fact.namespace, fact.identity.run_id),
                     updated_seq=event.trace_seq,
                     kind=TraceGraphNodeKind.PLAN,
-                    status=(
-                        TraceGraphNodeStatus.WAITING
-                        if fact.status
-                        and fact.status
-                        in {"awaiting_input", "awaiting_review", "draft"}
-                        else TraceGraphNodeStatus.SUCCEEDED
-                    ),
+                    status=status,
                     name="Plan",
                     run_id=fact.identity.run_id,
-                    structural_parent_id=_agent_node(
-                        fact.identity.run_id,
-                        fact.namespace,
-                    ),
+                    parent_subagent_id=_fact_subagent_owner(fact),
                     namespace=fact.namespace,
                     started_at=fact.occurred_at,
+                    completed_at=_terminal_time(status, fact.occurred_at),
                     started_seq=event.trace_seq,
                     result_seq=event.trace_seq,
                 )
             )
             continue
         if isinstance(fact, InteractionFact):
-            parent_id = (
-                _tool_node(fact.namespace, fact.tool_call_ids[0])
-                if len(fact.tool_call_ids) == 1
-                else _agent_node(fact.identity.run_id, fact.namespace)
-            )
             status = (
                 TraceGraphNodeStatus.WAITING
                 if fact.status == "pending"
@@ -860,12 +643,10 @@ def graph_node_mutations(
                     status=status,
                     name=fact.interaction_kind,
                     run_id=fact.identity.run_id,
-                    structural_parent_id=parent_id,
+                    parent_subagent_id=_fact_subagent_owner(fact),
                     namespace=fact.namespace,
                     started_at=fact.occurred_at,
-                    completed_at=(
-                        None if fact.status == "pending" else fact.occurred_at
-                    ),
+                    completed_at=_terminal_time(status, fact.occurred_at),
                     started_seq=event.trace_seq,
                     result_seq=event.trace_seq,
                 )
@@ -876,7 +657,7 @@ def graph_node_mutations(
 def _coalesce_graph_mutations(
     mutations: list[TraceGraphNodeMutation],
 ) -> tuple[TraceGraphNodeMutation, ...]:
-    """Collapse one commit batch to at most one write per node revision."""
+    """Collapse one commit batch to at most one write per event revision."""
 
     ordered_keys: list[tuple[str, str]] = []
     values: dict[tuple[str, str], TraceGraphNodeMutation] = {}
@@ -890,17 +671,35 @@ def _coalesce_graph_mutations(
         if mutation.remove or current.remove:
             values[key] = mutation
             continue
-        structural_parent_id = (
-            mutation.structural_parent_id or current.structural_parent_id
+        kind = resolve_graph_node_kind(current.kind, mutation.kind)
+        replace_tool_start = (
+            kind is TraceGraphNodeKind.TOOL
+            and current.status is TraceGraphNodeStatus.WAITING
+            and mutation.status is TraceGraphNodeStatus.RUNNING
+            and mutation.started_at is not None
+            and mutation.started_seq is not None
         )
+        status = mutation.status or current.status
+        completed_at = (
+            None
+            if status
+            in {
+                TraceGraphNodeStatus.RUNNING,
+                TraceGraphNodeStatus.WAITING,
+            }
+            else mutation.completed_at or current.completed_at
+        )
+        parent_subagent_id = mutation.parent_subagent_id or current.parent_subagent_id
+        model_call_id = mutation.model_call_id or current.model_call_id
         values[key] = TraceGraphNodeMutation(
             node_id=mutation.node_id,
             updated_seq=mutation.updated_seq,
             run_id=mutation.run_id,
-            kind=resolve_graph_node_kind(current.kind, mutation.kind),
-            status=mutation.status or current.status,
+            kind=kind,
+            status=status,
             name=current.name or mutation.name,
-            structural_parent_id=structural_parent_id,
+            parent_subagent_id=parent_subagent_id,
+            model_call_id=model_call_id,
             namespace=(
                 current.namespace
                 if current.namespace is not None
@@ -909,15 +708,24 @@ def _coalesce_graph_mutations(
             agent_name=mutation.agent_name or current.agent_name,
             provider=mutation.provider or current.provider,
             model=mutation.model or current.model,
-            started_at=current.started_at or mutation.started_at,
+            started_at=(
+                mutation.started_at
+                if replace_tool_start
+                else current.started_at or mutation.started_at
+            ),
             first_output_at=mutation.first_output_at or current.first_output_at,
-            completed_at=mutation.completed_at or current.completed_at,
-            started_seq=current.started_seq or mutation.started_seq,
+            completed_at=completed_at,
+            started_seq=(
+                mutation.started_seq
+                if replace_tool_start
+                else current.started_seq or mutation.started_seq
+            ),
             request_seq=mutation.request_seq or current.request_seq,
             result_seq=mutation.result_seq or current.result_seq,
             failure_seq=mutation.failure_seq or current.failure_seq,
             link_issue=resolve_graph_link_issue(
-                structural_parent_id,
+                parent_subagent_id,
+                model_call_id,
                 current.link_issue or mutation.link_issue,
             ),
         )
@@ -928,7 +736,7 @@ def apply_graph_node_mutation(
     revisions: MutableMapping[tuple[str, str], ReducedTraceGraphRevision],
     mutation: TraceGraphNodeMutation,
 ) -> None:
-    """Apply one mutation while preserving immutable node identity fields."""
+    """Apply one mutation while preserving immutable event identity fields."""
 
     storage_key = (mutation.node_id, mutation.run_id)
     if mutation.remove:
@@ -958,7 +766,8 @@ def apply_graph_node_mutation(
             return
         revisions[storage_key] = ReducedTraceGraphNode(
             node_id=mutation.node_id,
-            structural_parent_id=mutation.structural_parent_id,
+            parent_subagent_id=mutation.parent_subagent_id,
+            model_call_id=mutation.model_call_id,
             kind=mutation.kind,
             status=mutation.status,
             name=mutation.name,
@@ -976,12 +785,13 @@ def apply_graph_node_mutation(
             result_seq=mutation.result_seq,
             failure_seq=mutation.failure_seq,
             link_issue=resolve_graph_link_issue(
-                mutation.structural_parent_id,
+                mutation.parent_subagent_id,
+                mutation.model_call_id,
                 mutation.link_issue,
             ),
         )
         return
-    if not isinstance(row, ReducedTraceGraphNode):  # pragma: no cover - narrowed above
+    if not isinstance(row, ReducedTraceGraphNode):
         raise TraceStoreProtocolError("Trace Graph revision type is invalid")
     if mutation.updated_seq < row.updated_seq:
         raise TraceStoreProtocolError("Trace Graph node sequence moved backwards")
@@ -991,23 +801,39 @@ def apply_graph_node_mutation(
     )
     if mutation.name is not None and mutation.name != row.name:
         raise TraceStoreProtocolError("Trace Graph node name changed")
-    if mutation.run_id != row.run_id:
-        raise TraceStoreProtocolError("Trace Graph node Run changed")
     if mutation.namespace is not None and mutation.namespace != row.namespace:
         raise TraceStoreProtocolError("Trace Graph node namespace changed")
-    if mutation.structural_parent_id is not None:
+    if mutation.parent_subagent_id is not None:
         if (
-            row.structural_parent_id is not None
-            and mutation.structural_parent_id != row.structural_parent_id
+            row.parent_subagent_id is not None
+            and mutation.parent_subagent_id != row.parent_subagent_id
         ):
-            raise TraceStoreProtocolError("Trace Graph structural parent changed")
-        row.structural_parent_id = mutation.structural_parent_id
-        row.link_issue = resolve_graph_link_issue(
-            row.structural_parent_id,
-            row.link_issue,
-        )
+            raise TraceStoreProtocolError("Trace Graph Subagent owner changed")
+        row.parent_subagent_id = mutation.parent_subagent_id
+    if mutation.model_call_id is not None:
+        if (
+            row.model_call_id is not None
+            and mutation.model_call_id != row.model_call_id
+        ):
+            raise TraceStoreProtocolError("Trace Graph model call changed")
+        row.model_call_id = mutation.model_call_id
+    replace_tool_start = (
+        row.kind is TraceGraphNodeKind.TOOL
+        and row.status is TraceGraphNodeStatus.WAITING
+        and mutation.status is TraceGraphNodeStatus.RUNNING
+        and mutation.started_at is not None
+        and mutation.started_seq is not None
+    )
+    if replace_tool_start:
+        row.started_at = cast(datetime, mutation.started_at)
+        row.started_seq = cast(int, mutation.started_seq)
     if mutation.status is not None:
         row.status = mutation.status
+        if mutation.status in {
+            TraceGraphNodeStatus.RUNNING,
+            TraceGraphNodeStatus.WAITING,
+        }:
+            row.completed_at = None
     if mutation.agent_name is not None:
         row.agent_name = mutation.agent_name
     if mutation.provider is not None:
@@ -1024,8 +850,14 @@ def apply_graph_node_mutation(
         row.result_seq = mutation.result_seq
     if mutation.failure_seq is not None:
         row.failure_seq = mutation.failure_seq
+    row.link_issue = resolve_graph_link_issue(
+        row.parent_subagent_id,
+        row.model_call_id,
+        row.link_issue,
+    )
     resolved_issue = resolve_graph_link_issue(
-        row.structural_parent_id,
+        row.parent_subagent_id,
+        row.model_call_id,
         mutation.link_issue,
     )
     if resolved_issue is not None and row.link_issue is None:
@@ -1038,7 +870,7 @@ def effective_graph_nodes(
     *,
     run_ids: frozenset[str],
 ) -> tuple[ReducedTraceGraphNode, ...]:
-    """Merge selected-lineage revisions into one current node per stable ID."""
+    """Merge selected-lineage revisions into one current event per stable ID."""
 
     grouped: dict[str, list[ReducedTraceGraphRevision]] = {}
     for revision in revisions:
@@ -1063,14 +895,31 @@ def effective_graph_nodes(
                 None,
             )
 
-        structural_parent_id = cast(
-            str | None,
-            latest_value("structural_parent_id"),
+        execution_starts = [
+            item
+            for item in nodes
+            if item.request_seq is not None and item.request_seq == item.started_seq
+        ]
+        timing_origin = (
+            max(execution_starts, key=lambda item: item.updated_seq)
+            if execution_starts
+            and latest.kind in {TraceGraphNodeKind.TOOL, TraceGraphNodeKind.SUBAGENT}
+            else origin
+        )
+        completed_at = (
+            None
+            if latest.status
+            in {
+                TraceGraphNodeStatus.RUNNING,
+                TraceGraphNodeStatus.WAITING,
+            }
+            else cast(datetime | None, latest_value("completed_at"))
         )
         effective.append(
             ReducedTraceGraphNode(
                 node_id=node_id,
-                structural_parent_id=structural_parent_id,
+                parent_subagent_id=cast(str | None, latest_value("parent_subagent_id")),
+                model_call_id=cast(str | None, latest_value("model_call_id")),
                 kind=latest.kind,
                 status=latest.status,
                 name=latest.name,
@@ -1079,7 +928,7 @@ def effective_graph_nodes(
                 agent_name=cast(str | None, latest_value("agent_name")),
                 provider=cast(str | None, latest_value("provider")),
                 model=cast(str | None, latest_value("model")),
-                started_at=origin.started_at,
+                started_at=timing_origin.started_at,
                 first_output_at=min(
                     (
                         item.first_output_at
@@ -1088,11 +937,8 @@ def effective_graph_nodes(
                     ),
                     default=None,
                 ),
-                completed_at=cast(
-                    datetime | None,
-                    latest_value("completed_at"),
-                ),
-                started_seq=origin.started_seq,
+                completed_at=completed_at,
+                started_seq=timing_origin.started_seq,
                 updated_seq=latest.updated_seq,
                 request_seq=max(
                     (
@@ -1115,11 +961,9 @@ def effective_graph_nodes(
                     default=None,
                 ),
                 link_issue=resolve_graph_link_issue(
-                    structural_parent_id,
-                    cast(
-                        TraceGraphLinkIssue | None,
-                        latest_value("link_issue"),
-                    ),
+                    cast(str | None, latest_value("parent_subagent_id")),
+                    cast(str | None, latest_value("model_call_id")),
+                    cast(TraceGraphLinkIssue | None, latest_value("link_issue")),
                 ),
             )
         )
@@ -1154,7 +998,8 @@ def reduce_graph_mutations(
                 kind=revision.kind,
                 status=revision.status,
                 name=revision.name,
-                structural_parent_id=revision.structural_parent_id,
+                parent_subagent_id=revision.parent_subagent_id,
+                model_call_id=revision.model_call_id,
                 namespace=revision.namespace,
                 agent_name=revision.agent_name,
                 provider=revision.provider,

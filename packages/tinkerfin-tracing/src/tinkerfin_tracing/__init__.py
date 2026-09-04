@@ -10,7 +10,6 @@ from .backend import TraceLedgerBackend as TraceLedgerBackend
 from .backend import TraceStoreOptions as TraceStoreOptions
 from .capture import CapturedValue as CapturedValue
 from .capture import CapturePolicy as CapturePolicy
-from .capture import MiddlewareTraceCapture as MiddlewareTraceCapture
 from .capture import ReasoningCapturePolicy as ReasoningCapturePolicy
 from .capture import ToolCaptureRule as ToolCaptureRule
 from .capture import ToolTraceCapture as ToolTraceCapture
@@ -40,7 +39,6 @@ from .errors import TracingErrorCode as TracingErrorCode
 from .examples import FactCountProjection as FactCountProjection
 from .examples import FactCountResult as FactCountResult
 from .examples import FactCountState as FactCountState
-from .facts import AgentStepFact as AgentStepFact
 from .facts import CallTrackingFact as CallTrackingFact
 from .facts import ContextContributionFact as ContextContributionFact
 from .facts import InteractionFact as InteractionFact
@@ -50,8 +48,6 @@ from .facts import NativeExtraFact as NativeExtraFact
 from .facts import PlanRevisionFact as PlanRevisionFact
 from .facts import ReasoningFact as ReasoningFact
 from .facts import RunFact as RunFact
-from .facts import RuntimeTaskFact as RuntimeTaskFact
-from .facts import SkillFact as SkillFact
 from .facts import StateRevisionFact as StateRevisionFact
 from .facts import SubagentFact as SubagentFact
 from .facts import ToolExecutionFact as ToolExecutionFact
@@ -63,7 +59,6 @@ from .follow import TraceFollow as TraceFollow
 from .graph import TraceGraph as TraceGraph
 from .graph import TraceGraphCompleteness as TraceGraphCompleteness
 from .graph import TraceGraphDelta as TraceGraphDelta
-from .graph import TraceGraphFacets as TraceGraphFacets
 from .graph import TraceGraphFailure as TraceGraphFailure
 from .graph import TraceGraphFilter as TraceGraphFilter
 from .graph import TraceGraphLinkIssue as TraceGraphLinkIssue
@@ -110,7 +105,6 @@ if TYPE_CHECKING:
     from .sql_store import SqlAlchemyTraceStore as SqlAlchemyTraceStore
 
 __all__ = [
-    "AgentStepFact",
     "AmbiguousTraceHead",
     "CallTrackingFact",
     "CanonicalTracePayloadCodec",
@@ -127,7 +121,6 @@ __all__ = [
     "InteractionFact",
     "InvalidTraceCursor",
     "MessageFact",
-    "MiddlewareTraceCapture",
     "ModelCallFact",
     "NativeExtraFact",
     "PlanRevisionFact",
@@ -136,8 +129,6 @@ __all__ = [
     "RedactionContentKind",
     "RedactionContext",
     "RunFact",
-    "RuntimeTaskFact",
-    "SkillFact",
     "SqlAlchemyTraceStore",
     "StateRevisionFact",
     "StoreThreadSnapshot",
@@ -158,7 +149,6 @@ __all__ = [
     "TraceGraph",
     "TraceGraphCompleteness",
     "TraceGraphDelta",
-    "TraceGraphFacets",
     "TraceGraphFailure",
     "TraceGraphFilter",
     "TraceGraphLinkIssue",

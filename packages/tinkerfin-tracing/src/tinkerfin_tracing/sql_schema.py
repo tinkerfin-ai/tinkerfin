@@ -332,16 +332,28 @@ graph_nodes = Table(
     Column("node_hash", _HASH_KEY, primary_key=True, comment="SHA-256 Graph node key"),
     Column("node_id", Text, nullable=False, comment="Canonical Graph node identity"),
     Column(
-        "structural_parent_hash",
+        "parent_subagent_hash",
         _HASH_KEY,
         nullable=True,
-        comment="SHA-256 structural parent key when present",
+        comment="SHA-256 owning Subagent key when present",
     ),
     Column(
-        "structural_parent_id",
+        "parent_subagent_id",
         Text,
         nullable=True,
-        comment="Evidence parent before visible-node projection",
+        comment="Nearest owning Subagent, null for the Turn root scope",
+    ),
+    Column(
+        "model_call_hash",
+        _HASH_KEY,
+        nullable=True,
+        comment="SHA-256 emitting model-call key when present",
+    ),
+    Column(
+        "model_call_id",
+        Text,
+        nullable=True,
+        comment="Model call that emitted this Assistant, Tool, or Subagent",
     ),
     Column(
         "kind",
@@ -354,12 +366,6 @@ graph_nodes = Table(
         String(32),
         nullable=True,
         comment="Graph node status, null only on a removal revision",
-    ),
-    Column(
-        "name_hash",
-        _HASH_KEY,
-        nullable=True,
-        comment="SHA-256 display-name key, null on a removal revision",
     ),
     Column(
         "name",
@@ -476,7 +482,6 @@ Index(
     graph_nodes.c.generation,
     graph_nodes.c.run_hash,
     graph_nodes.c.node_hash,
-    graph_nodes.c.updated_seq,
 )
 
 

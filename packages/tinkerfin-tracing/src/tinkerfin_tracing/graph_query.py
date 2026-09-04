@@ -16,7 +16,6 @@ from .follow import TraceFollow, _close_trace_source, create_trace_follow
 from .graph import (
     TraceGraphCompleteness,
     TraceGraphDelta,
-    TraceGraphFacets,
     TraceGraphFilter,
     TraceGraphNode,
     TraceGraphPage,
@@ -50,10 +49,8 @@ def _filter_digest(where: TraceGraphFilter) -> str:
     canonical = {
         "kinds": sorted(value.value for value in where.kinds),
         "statuses": sorted(value.value for value in where.statuses),
-        "parentId": where.parent_id,
+        "modelCallId": where.model_call_id,
         "agentNames": sorted(where.agent_names),
-        "middlewareNames": sorted(where.middleware_names),
-        "skillNames": sorted(where.skill_names),
         "providers": sorted(where.providers),
         "models": sorted(where.models),
         "namespaces": sorted(list(value) for value in where.namespaces),
@@ -64,8 +61,6 @@ def _filter_digest(where: TraceGraphFilter) -> str:
         "startedBefore": (
             None if where.started_before is None else where.started_before.isoformat()
         ),
-        "includeTechnicalNodes": where.include_technical_nodes,
-        "includeAncestorNodes": where.include_ancestor_nodes,
     }
     encoded = json.dumps(
         canonical,
@@ -191,12 +186,6 @@ class TraceGraphQuery:
         return self._page.ordered_node_ids
 
     @property
-    def root_node_ids(self) -> tuple[str, ...]:
-        """Return the ordered visible roots."""
-
-        return self._page.root_node_ids
-
-    @property
     def matched_node_ids(self) -> tuple[str, ...]:
         """Return directly matched nodes in authoritative visible order."""
 
@@ -213,12 +202,6 @@ class TraceGraphQuery:
         """Return the Ledger tail represented by this page."""
 
         return self._page.as_of_seq
-
-    @property
-    def facets(self) -> TraceGraphFacets:
-        """Return server-computed Graph filter counts."""
-
-        return self._page.facets.model_copy(deep=True)
 
     @property
     def completeness(self) -> TraceGraphCompleteness:
@@ -249,10 +232,9 @@ class TraceGraphQuery:
                         or delta.turn_removes
                         or delta.node_upserts
                         or delta.node_removes
+                        or current.as_of_seq != previous.as_of_seq
                         or current.ordered_node_ids != previous.ordered_node_ids
-                        or current.root_node_ids != previous.root_node_ids
                         or current.matched_node_ids != previous.matched_node_ids
-                        or current.facets != previous.facets
                         or current.completeness != previous.completeness
                         or current.next_cursor != previous.next_cursor
                     ):

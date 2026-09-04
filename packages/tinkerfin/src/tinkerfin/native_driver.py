@@ -1,4 +1,4 @@
-"""Deep Agents v2 invocation Driver and verified reasoning extractors."""
+"""Deep Agents invocation Drivers and host-defined reasoning extraction."""
 
 from __future__ import annotations
 
@@ -7,9 +7,9 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Literal, Protocol, cast, runtime_checkable
 
-from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
+from langchain_core.messages import AIMessageChunk, BaseMessage
 from langgraph.types import StreamMode
-from pydantic import JsonValue
+from pydantic import JsonValue, TypeAdapter, ValidationError
 
 from tinkerfin_contracts import (
     NativeObservation,
@@ -34,6 +34,8 @@ from tinkerfin_native_stream import (
 from ._agui_lineage_state import RUNTIME_PROFILE_METADATA_KEY
 from ._observation import native_observation
 from .errors import TinkerFinStreamProtocolError
+
+_JSON_VALUE_ADAPTER: TypeAdapter[JsonValue] = TypeAdapter(JsonValue)
 
 _REQUIRED_MODES: tuple[StreamMode, ...] = ("messages", "tasks", "values")
 _SUPPORTED_EXTRA_MODES: frozenset[StreamMode] = frozenset(
@@ -245,7 +247,12 @@ def _canonical_replay(
 
 @runtime_checkable
 class ReasoningExtractor(Protocol):
-    """Extract one verified provider reasoning value from a native message."""
+    """Synchronously extract one host-verified reasoning value from a message.
+
+    Each call receives a detached message copy. Implementations must perform no I/O and
+    return only standard JSON values; the Driver validates and detaches the result again
+    before it can enter a Runtime observation.
+    """
 
     @property
     def name(self) -> str:
@@ -262,55 +269,6 @@ class ReasoningExtractor(Protocol):
         """Return reasoning content only when the provider and message both match."""
 
         ...
-
-
-class DeepSeekReasoningExtractor:
-    """Extract the verified DeepSeek reasoning metadata path.
-
-    The supported source is
-    ``AIMessage.additional_kwargs.reasoning_content`` and the equivalent
-    ``AIMessageChunk`` field observed in the locked Deep Agents corpus. The
-    extractor never scans arbitrary same-named business fields.
-    """
-
-    @property
-    def name(self) -> str:
-        """Return the stable provider-path identity."""
-
-        return "deepseek.additional_kwargs.reasoning_content"
-
-    def extract(
-        self,
-        message: BaseMessage,
-        *,
-        provider: str | None,
-    ) -> JsonValue | None:
-        """Return a non-empty verified reasoning string when present.
-
-        Args:
-            message: Live LangChain message from a validated Native frame.
-            provider: Canonical provider identity carried by the Native source.
-
-        Returns:
-            The reasoning string, or ``None`` when the verified path is absent.
-
-        Raises:
-            TinkerFinStreamProtocolError: The provider path contains a non-string
-                value that does not match the locked provider contract.
-        """
-
-        if provider is None or provider.casefold() != "deepseek":
-            return None
-        if not isinstance(message, AIMessage | AIMessageChunk):
-            return None
-        value = message.additional_kwargs.get("reasoning_content")
-        if value is None or value == "":
-            return None
-        if not isinstance(value, str):
-            raise TinkerFinStreamProtocolError(
-                "DeepSeek reasoning_content must be a string"
-            )
-        return value
 
 
 @runtime_checkable
@@ -571,11 +529,21 @@ class DeepAgentsV2StreamDriver:
 
         observations: list[NativeObservation] = []
         for message, provider in messages:
-            matches = [
-                (extractor.name, value)
-                for extractor in self._reasoning_extractors
-                if (value := extractor.extract(message, provider=provider)) is not None
-            ]
+            matches: list[tuple[str, JsonValue]] = []
+            for extractor in self._reasoning_extractors:
+                value = extractor.extract(
+                    message.model_copy(deep=True),
+                    provider=provider,
+                )
+                if value is None:
+                    continue
+                try:
+                    detached = _JSON_VALUE_ADAPTER.validate_python(value)
+                except ValidationError as error:
+                    raise TinkerFinStreamProtocolError(
+                        "reasoning extractors must return standard JSON values"
+                    ) from error
+                matches.append((extractor.name, detached))
             if len(matches) > 1:
                 raise TinkerFinStreamProtocolError(
                     "multiple reasoning extractors matched one message"
@@ -655,7 +623,6 @@ class DeepAgentsV3StreamDriver(DeepAgentsV2StreamDriver):
 __all__ = [
     "DeepAgentsV2StreamDriver",
     "DeepAgentsV3StreamDriver",
-    "DeepSeekReasoningExtractor",
     "NativeStreamDriver",
     "NativeStreamFrame",
     "ReasoningExtractor",
