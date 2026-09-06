@@ -78,19 +78,20 @@ class RedisBackend(RedisBackendHarness):
 
 
 _REDIS_SCRIPT_DIGESTS = {
-    "_APPEND_SCRIPT": "34b6443e16fd55fe6cb0cfcc11ab893f4ac18c8cccf34be80e26651602b60525",
+    "_DUE_EXPIRATIONS_SCRIPT": "f06bfc6798e6f5a5b711abd2c3ddd5f4d478a501a1343e22afb74530cd41900d",
+    "_APPEND_SCRIPT": "70c347dbcacd0421b0c263f218b2d73cc4ba8d08e7e88f5148e1571f43145b34",
     "_BEGIN_DELETE_SCRIPT": "6b52a1e68a9183d72ca6902d042ab80164b1f148a8aa628e8b447dca5364cf32",
     "_BEGIN_EXPIRATION_SCRIPT": "bd522a5be66f40c1e2a049019071a322a817a5890d6253360659d99dd1735a11",
     "_BEGIN_SETTLEMENT_SCRIPT": "554621573ed7a50c3b5ea0be5bb7166f051d2fdba213db0493423a84f5423414",
     "_CANCEL_SCRIPT": "c4d82de1405dffc62a13ec7efbc11790e5bcab99c746b02fb8cb397ad59fce09",
     "_DELETE_BATCH_SCRIPT": "c018e231de54762346bc095581f23d9bca9107667273102dae4b7d51e20bbf10",
-    "_FINALIZE_DELETE_SCRIPT": "c6623e079d25a0d250977b2fc44fbd423f80a7eee440f3ab88f4723df2e207cf",
-    "_FINISH_SCRIPT": "1c61107eaa22defa2480c0966975a15f4e6a89dbca3b7f714ae596e2d6e0fece",
+    "_FINALIZE_DELETE_SCRIPT": "aa107e4445ee6e4e224ac80fe80cbb51c14db815f5d21a1d07698e02c5f833bf",
+    "_FINISH_SCRIPT": "63e951aacdd317030aa9e776a3eeeab2a5632689d598a2c512fa08b2609cee27",
     "_MESSAGING_STATE_SNAPSHOT_SCRIPT": "40d5362e08cf6dfbad004a3fb1b7d9b3293b1e600012bc23ca624d3fc2f2c429",
-    "_PREPARE_SCRIPT": "737da97459a473c59e887419e746c31d3e9180f5764c049e9cf512e99bccd62a",
+    "_PREPARE_SCRIPT": "951969db97404f1e2dd95b8594873d903dcd98e4a96ed7e02dc97e8170d48bca",
     "_READ_CONTROL_SCRIPT": "0cda87dabd7a112208ade6abe7f2ed806f9ac216b6ed0913c5fc194223a0703c",
     "_RENEW_SCRIPT": "90a2c24ed5f4e9c64f84a41fa6b4bc69e03206c5df48c5f75ec4b66be6c62113",
-    "_RUN_SNAPSHOT_SCRIPT": "3986e780233a7f925ae605bfeab9afb88b50bfb77b9ea45ec20c063509f7aefd",
+    "_RUN_SNAPSHOT_SCRIPT": "7c84daacb1f71539cc0b31773961f0d8640b0026cb30fad884424540b4ea7a33",
 }
 
 
@@ -848,7 +849,8 @@ async def test_real_redis_retention_expires_data_and_preserves_generation_tombst
         channel_scope = hashlib.sha256(b"events").hexdigest()
         stream_scope = hashlib.sha256(b"conversation-1").hexdigest()
         generation_base = (
-            f"{prefix}:{{{channel_scope}}}:stream:{stream_scope}:generation:1"
+            f"{prefix}:{{{hashlib.sha256(prefix.encode()).hexdigest()}}}:channel:{channel_scope}"
+            f":stream:{stream_scope}:generation:1"
         )
         remaining = await second_client.keys(f"{generation_base}:*")
         assert remaining == [f"{generation_base}:tombstone".encode()]
@@ -1046,7 +1048,8 @@ async def test_real_redis_rejects_invalid_append_before_lua_or_state_change(
     run_digest = hashlib.sha256(b"run-1").hexdigest()
     message_digest = hashlib.sha256(message_id.encode()).hexdigest()
     generation_base = (
-        f"{prefix}:{{{channel_scope}}}:stream:{stream_digest}:generation:1"
+        f"{prefix}:{{{hashlib.sha256(prefix.encode()).hexdigest()}}}:channel:{channel_scope}"
+        f":stream:{stream_digest}:generation:1"
     )
     meta_key = f"{generation_base}:meta"
     run_key = f"{generation_base}:run:{run_digest}"
@@ -1869,6 +1872,8 @@ async def test_real_redis_persists_channel_and_stream_metadata_separately(
         b"retention_ms": b"0",
         b"max_thread_messages": b"100000",
         b"max_thread_payload_bytes": b"1073741824",
+        b"max_total_bytes": b"1073741824",
+        b"max_total_records": b"100000",
     }
     controls = [
         await cast(Awaitable[dict[bytes, bytes]], client.hgetall(key))
@@ -2472,7 +2477,8 @@ async def test_real_redis_delete_fences_an_expired_producer(
         with pytest.raises(StreamDeleted):
             await stale.renew(prepared.handle)
         remaining = [key async for key in client.scan_iter(match=f"{prefix}:*")]
-        assert len(remaining) == 4
+        assert len(remaining) == 5
+        assert any(key.endswith(b":capacity") for key in remaining)
         assert any(key.endswith(b":channel") for key in remaining)
         assert any(key.endswith(b":control") for key in remaining)
         assert any(key.endswith(b":signals") for key in remaining)

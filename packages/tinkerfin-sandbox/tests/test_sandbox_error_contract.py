@@ -6,6 +6,7 @@ from tinkerfin_sandbox import (
     OpenSandboxBackendTimeoutError,
     OpenSandboxError,
     OpenSandboxErrorCode,
+    OpenSandboxInitializationError,
     OpenSandboxSettlementTimeoutError,
     OpenSandboxStateUnavailableError,
     OpenSandboxWarmPoolUnavailableError,
@@ -69,3 +70,15 @@ def test_warm_pool_failure_is_public_and_machine_classifiable() -> None:
     assert isinstance(error, RuntimeError)
     assert error.code is OpenSandboxErrorCode.WARM_POOL_UNAVAILABLE
     assert dict(error.context) == {"target_capacity": 1}
+
+
+def test_initialization_error_is_distinct_and_preserves_its_cause() -> None:
+    cause = TimeoutError("private initializer details")
+    error = OpenSandboxInitializationError("Sandbox initialization failed", cause=cause)
+    assert isinstance(error, OpenSandboxError)
+    assert error.code is OpenSandboxErrorCode.INITIALIZATION_FAILED
+    assert error.cause is cause
+    assert error.__cause__ is cause
+    assert dict(error.context) == {}
+    assert not hasattr(error.context, "__setitem__")
+    assert "private" not in str(error)

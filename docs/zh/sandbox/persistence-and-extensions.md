@@ -4,6 +4,10 @@
 
 默认状态只存在当前进程。应用有多个 worker，或者进程重启后仍要恢复 Sandbox 绑定时，使用 SQLAlchemy 状态。
 
+State 保存绑定和租约，不保存容器文件。工作区需要保留到明确清理时，应同时使用持久 State 和
+`OpenSandboxConfig(ttl=None)`；Manager 正常关闭后会保留绑定和远端实例。文件必须跨实例或
+存储故障保留时，仍需要持久卷和备份策略。
+
 ## SQLite：单机多进程
 
 ```bash
@@ -86,25 +90,30 @@ manager = OpenSandboxManager(
 
 预热实例尚未属于具体 key。`get()` 消费 ready slot 时会原子地绑定它，不会先暴露无主实例。
 
-## 如果创建后要初始化环境
+## 准备工作区
 
 给 client 传入异步 initializer：
 
 ```python
-async def install_project(backend) -> None:
-    await backend.aexecute(
-        "git clone https://example.com/project.git /workspace/project"
+async def prepare_project(backend) -> None:
+    result = await backend.aexecute(
+        "mkdir -p /workspace/project /workspace/output"
     )
+    if result.exit_code != 0:
+        raise RuntimeError("Could not prepare workspace directories")
 
 
 client = OpenSandboxClient(
     connection_config=connection_config,
     config=config,
-    initializers=[install_project],
+    initializers=[prepare_project],
 )
 ```
 
-initializer 在新 Sandbox 可用后执行。它应当可取消、可观察，并在重复创建的新实例上得到一致结果；连接已有 Sandbox 时不会再次执行。
+初始化函数会在创建及每次连接已有 Sandbox 后执行，必须幂等并保留已有工作区内容。I/O 使用异步
+回调并传播取消；同步回调必须非阻塞。连接和初始化共用 Client 与恢复策略中较早的截止时间。
+初始化失败会抛出 `OpenSandboxInitializationError`，不会触发重试或重建。回调和时限约束见
+[使用参考](api-reference.md)。
 
 ## 如果已有自己的状态存储
 

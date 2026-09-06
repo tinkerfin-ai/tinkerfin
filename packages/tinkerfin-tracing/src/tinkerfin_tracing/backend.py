@@ -47,7 +47,7 @@ class TraceStoreOptions:
 
     writer_lease_seconds: float = 30.0
     writer_heartbeat_interval_seconds: float = 10.0
-    follow_poll_seconds: float = 0.05
+    follow_poll_seconds: float = 0.5
     commit_retry_attempts: int = 5
     commit_retry_delay_seconds: float = 0.02
 
@@ -102,7 +102,12 @@ class StoredTraceEvent:
 
 @dataclass(frozen=True, slots=True)
 class TraceGraphNodeMutation:
-    """Apply one deterministic partial update to the disposable Graph index."""
+    """Apply one deterministic partial update to the disposable Graph index.
+
+    Attributes:
+        model_call_seq: Ledger sequence proving ``model_call_id``, retained across
+            independent lifecycle, input, and output updates.
+    """
 
     node_id: str
     updated_seq: int
@@ -113,6 +118,7 @@ class TraceGraphNodeMutation:
     name: str | None = None
     parent_subagent_id: str | None = None
     model_call_id: str | None = None
+    model_call_seq: int | None = None
     namespace: tuple[str, ...] | None = None
     agent_name: str | None = None
     provider: str | None = None
@@ -126,14 +132,37 @@ class TraceGraphNodeMutation:
     failure_seq: int | None = None
     link_issue: TraceGraphLinkIssue | None = None
 
+    def __post_init__(self) -> None:
+        """Require a retained Ledger proof whenever a Model relationship is supplied."""
+
+        if (self.model_call_id is None) != (self.model_call_seq is None):
+            raise ValueError(
+                "model_call_id and model_call_seq must be supplied together"
+            )
+        if self.model_call_seq is not None and (
+            isinstance(self.model_call_seq, bool)
+            or not isinstance(self.model_call_seq, int)
+            or not 1 <= self.model_call_seq <= self.updated_seq
+        ):
+            raise ValueError(
+                "model_call_seq must identify a fact at or before updated_seq"
+            )
+
 
 @dataclass(frozen=True, slots=True)
 class StoredTraceGraphNode:
-    """Return one indexed Graph row with referenced Ledger evidence."""
+    """Return one indexed Graph row with referenced Ledger evidence.
+
+    Attributes:
+        model_call_seq: Ledger sequence proving the emitting Model relationship.
+        model_call_event: The corresponding Model, Tool, or Subagent fact, independent
+            of the current lifecycle and payload locators.
+    """
 
     node_id: str
     parent_subagent_id: str | None
     model_call_id: str | None
+    model_call_seq: int | None
     kind: TraceGraphNodeKind
     status: TraceGraphNodeStatus
     name: str
@@ -156,6 +185,7 @@ class StoredTraceGraphNode:
     request_event: StoredTraceEvent | None
     result_event: StoredTraceEvent | None
     failure_event: StoredTraceEvent | None
+    model_call_event: StoredTraceEvent | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,7 +253,6 @@ class StoredTraceGraphPage:
     has_more: bool
     next_started_at: datetime | None
     next_node_id: str | None
-    call_tracking_present: bool
     relationship_evidence_missing: bool
 
 
@@ -311,11 +340,17 @@ class TraceEventPageRequest:
 
 @dataclass(frozen=True, slots=True)
 class StoredTraceEventPage:
-    """Return raw records and the exact generation tail observed with them."""
+    """Return raw records, generation tail, and storage-clock active Run identities.
+
+    Ownership is observed with the tail, independently of event content. Expired
+    leases are excluded even when no writer has committed another event.
+    """
 
     key: TraceThreadKey
     tail_seq: int
     events: tuple[StoredTraceEvent, ...]
+    active_run_ids: tuple[str, ...]
+    observed_at: datetime
 
 
 @dataclass(frozen=True, slots=True)

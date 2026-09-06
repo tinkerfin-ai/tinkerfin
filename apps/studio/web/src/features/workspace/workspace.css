@@ -109,6 +109,8 @@
   .sidebar-head-actions {
     display: flex;
     margin-left: auto;
+    /* 将操作图标的可见右边缘与新会话对齐，保留完整点击区域 */
+    margin-right: calc(-1 * var(--space-2));
     flex: 0 0 auto;
     align-items: center;
     gap: var(--space-1);

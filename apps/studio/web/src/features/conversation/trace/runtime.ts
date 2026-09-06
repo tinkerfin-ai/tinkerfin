@@ -4,6 +4,7 @@ import type {
   ConversationTraceUpdate,
   TraceInteraction,
 } from '../../../api/conversation/history'
+import { traceObservationTime } from '../../../api/conversation/history'
 import {
   parseTraceGraph,
   type TraceGraph,
@@ -98,7 +99,14 @@ const applyTraceGraphDelta = (
   current: TraceGraph,
   delta: TraceGraphDelta,
 ): TraceGraph => {
-  if (delta.asOfSeq <= current.asOfSeq) throw new ConversationError('stream_event_invalid')
+  if (delta.asOfSeq < current.asOfSeq) throw new ConversationError('stream_event_invalid')
+  if (delta.asOfSeq === current.asOfSeq && (
+    delta.turnUpserts.length || delta.turnRemoves.length
+    || delta.nodeUpserts.length || delta.nodeRemoves.length
+    || JSON.stringify(delta.orderedNodeIds) !== JSON.stringify(current.orderedNodeIds)
+    || JSON.stringify(delta.matchedNodeIds) !== JSON.stringify(current.matchedNodeIds)
+    || JSON.stringify(delta.completeness) !== JSON.stringify(current.completeness)
+  )) throw new ConversationError('stream_event_invalid')
   const currentTurns = new Map(current.turns.map((turn) => [turn.id, turn]))
   delta.turnUpserts.forEach((turn) => {
     const previous = currentTurns.get(turn.id)
@@ -411,6 +419,7 @@ const runStatus = (trace: ConversationHistoryCoreDetail): Conversation['runStatu
 const assertTraceDetail = (trace: ConversationHistoryCoreDetail) => {
   if (
     !trace.threadId
+    || !trace.generation
     || !trace.headRunId
     || !Number.isSafeInteger(trace.asOfSeq)
     || trace.asOfSeq < 1
@@ -420,6 +429,46 @@ const assertTraceDetail = (trace: ConversationHistoryCoreDetail) => {
     || !Array.isArray(trace.interactions)
     || !isObject(trace.state?.root)
   ) throw new ConversationError('stream_event_invalid')
+  traceObservationTime(trace.observedAt)
+}
+
+const compareTraceObservation = (
+  current: ConversationHistoryCoreDetail,
+  incoming: Pick<ConversationHistoryCoreDetail,
+    'generation' | 'asOfSeq' | 'observedAt' | 'status' | 'completeness' | 'messageCount' | 'toolCallCount' | 'state'>,
+): number => {
+  if (incoming.generation !== current.generation) throw new ConversationError('stream_event_invalid')
+  if (incoming.asOfSeq !== current.asOfSeq) return incoming.asOfSeq - current.asOfSeq
+  const incomingTime = traceObservationTime(incoming.observedAt)
+  const currentTime = traceObservationTime(current.observedAt)
+  if (incomingTime !== currentTime) return incomingTime > currentTime ? 1 : -1
+  if (!sameTraceValue(incoming.status, current.status)
+    || !sameTraceValue(incoming.completeness, current.completeness)
+    || incoming.messageCount !== current.messageCount
+    || incoming.toolCallCount !== current.toolCallCount
+    || !sameTraceValue(incoming.state, current.state)) {
+    throw new ConversationError('stream_event_invalid')
+  }
+  return 0
+}
+
+const sameTraceValue = (left: unknown, right: unknown): boolean => {
+  if (left === right) return true
+  if (Array.isArray(left) && Array.isArray(right)) {
+    return left.length === right.length && left.every((value, index) => sameTraceValue(value, right[index]))
+  }
+  if (!isObject(left) || !isObject(right)) return false
+  const keys = Object.keys(left)
+  return keys.length === Object.keys(right).length
+    && keys.every((key) => Object.hasOwn(right, key) && sameTraceValue(left[key], right[key]))
+}
+
+const assertMatchingTraceEntities = <T extends { id: string }>(current: T[], incoming: T[]) => {
+  const previous = new Map(current.map((item) => [item.id, item]))
+  for (const item of incoming) {
+    const known = previous.get(item.id)
+    if (known && !sameTraceValue(known, item)) throw new ConversationError('stream_event_invalid')
+  }
 }
 
 const taskTraceView = (snapshot: TaskTraceSnapshot): WebTaskTraceViewState => (
@@ -435,8 +484,45 @@ export const restoreConversationFromTrace = (
     lastDeliveredSeq?: number
     includeTaskTrace: boolean
     taskTrace?: WebTaskTraceViewState
+    previous?: Conversation
+    expandHistory?: boolean
+    preserveHistory?: boolean
   },
 ): Conversation => {
+  const current = options.previous?.trace
+  const order = current ? compareTraceObservation(current, detail) : 1
+  const preserveHistory = options.preserveHistory && current?.asOfSeq === detail.asOfSeq
+    && current?.headRunId === detail.headRunId
+  if (current && (order === 0 || preserveHistory) && current.headRunId === detail.headRunId) {
+    // 分页可补入同一前缀的历史实体；已存在的实体不能在相同观测内变成不同内容
+    assertMatchingTraceEntities(current.messages, detail.messages)
+    assertMatchingTraceEntities(current.reasoning, detail.reasoning)
+    assertMatchingTraceEntities(current.interactions, detail.interactions)
+    assertMatchingTraceEntities(current.graph.turns, detail.graph.turns)
+    assertMatchingTraceEntities(current.graph.nodes, detail.graph.nodes)
+  }
+  if (current && preserveHistory && order >= 0) {
+    // 同一持久化前缀只重验运行观测，保留用户已经展开的历史窗口
+    detail = {
+      ...detail,
+      messages: current.messages,
+      reasoning: current.reasoning,
+      graph: current.graph,
+      interactions: current.interactions,
+      historyCursor: current.historyCursor,
+    }
+  }
+  if (current && order < 0) {
+    if (!options.expandHistory || detail.asOfSeq !== current.asOfSeq
+      || detail.headRunId !== current.headRunId) return options.previous!
+    // 固定前缀的旧分页补充历史实体，运行状态仍使用更新的存储观测
+    detail = {
+      ...detail,
+      observedAt: current.observedAt,
+      status: current.status,
+      completeness: current.completeness,
+    }
+  }
   const { taskTrace: wireTaskTrace, ...wireCore } = detail
   const trace = structuredClone(wireCore)
   assertTraceDetail(trace)
@@ -495,13 +581,27 @@ export const applyConversationTraceUpdate = (
 ): Conversation => {
   const previous = conversation.trace
   if (!previous) throw new ConversationError('stream_event_invalid')
-  if (update.asOfSeq <= previous.asOfSeq) return conversation
+  if (compareTraceObservation(previous, update) < 0) return conversation
+  if (update.asOfSeq === previous.asOfSeq) {
+    if (update.events.length || update.facts.length) return conversation
+    if (update.messages.upserts.length || update.messages.removes.length
+      || update.reasoning.upserts.length || update.reasoning.removes.length
+      || update.interactions.upserts.length || update.interactions.removes.length
+      || update.status.headRunId !== previous.headRunId
+      || update.messageCount !== previous.messageCount
+      || update.toolCallCount !== previous.toolCallCount
+      || JSON.stringify(update.state) !== JSON.stringify(previous.state)) {
+      throw new ConversationError('stream_event_invalid')
+    }
+  }
   if (update.graph.asOfSeq !== update.asOfSeq) {
     throw new ConversationError('stream_event_invalid')
   }
   const next: ConversationHistoryCoreDetail = {
     ...structuredClone(previous),
     asOfSeq: update.asOfSeq,
+    generation: update.generation,
+    observedAt: update.observedAt,
     headRunId: update.status.headRunId,
     messages: applyEntityDelta(previous.messages, update.messages.upserts, update.messages.removes),
     reasoning: applyEntityDelta(previous.reasoning, update.reasoning.upserts, update.reasoning.removes),
@@ -516,7 +616,7 @@ export const applyConversationTraceUpdate = (
     completeness: structuredClone(update.completeness),
     messageCount: update.messageCount,
     toolCallCount: update.toolCallCount,
-    historyCursor: null,
+    historyCursor: update.asOfSeq === previous.asOfSeq ? previous.historyCursor : null,
   }
   const taskTrace = includeTaskTrace && taskTraceReplacement != null
     ? taskTraceView(taskTraceReplacement)

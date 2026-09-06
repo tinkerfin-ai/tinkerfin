@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from types import TracebackType
 from typing import Self
@@ -70,8 +71,14 @@ class Database:
 
         if self._resources is not None:
             raise RuntimeError("数据库已经启动")
+        logging_name = "studio"
+        # SQL 可见性由应用配置决定，输出沿用宿主处理器，避免 echo 自建重复输出
+        logging.getLogger(f"sqlalchemy.engine.Engine.{logging_name}").setLevel(
+            logging.INFO if self._echo else logging.WARNING
+        )
         options: dict[str, object] = {
-            "echo": self._echo,
+            "echo": False,
+            "logging_name": logging_name,
             "pool_pre_ping": True,
             "pool_recycle": self._pool_recycle,
         }

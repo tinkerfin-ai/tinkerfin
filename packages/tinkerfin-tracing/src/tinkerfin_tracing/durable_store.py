@@ -17,10 +17,10 @@ from ._graph_projection import trace_graph_record_search_values
 from ._graph_reducer import (
     ReducedTraceGraphNode,
     ReducedTraceGraphRevision,
+    apply_graph_events,
     apply_graph_node_mutation,
     effective_graph_nodes,
-    graph_node_mutations,
-    reduce_graph_mutations,
+    graph_revision_mutations,
 )
 from ._prepared import prepare_trace_facts
 from .backend import (
@@ -31,7 +31,6 @@ from .backend import (
     StoredTraceGraphPage,
     TraceCheckpointRequest,
     TraceEventPageRequest,
-    TraceGraphNodeMutation,
     TraceGraphQueryBackend,
     TraceGraphQueryRequest,
     TraceGraphRebuildBackend,
@@ -67,6 +66,7 @@ from .store import (
     TraceGraphNodeRecord,
     TraceGraphNodeRecordPage,
     TraceProjectionCheckpoint,
+    TraceStoreUpdate,
     TraceThreadKey,
     TraceWriter,
     _checkpoint_lookup,
@@ -255,6 +255,15 @@ class _DurableTraceWriter:
             )
 
 
+class _FollowChange:
+    """Keep notifications only while an exact generation has local followers."""
+
+    def __init__(self) -> None:
+        self.condition = asyncio.Condition()
+        self.revision = 0
+        self.followers = 0
+
+
 class DurableTraceStore:
     """Provide the complete Trace Store contract over borrowed durable storage.
 
@@ -316,7 +325,7 @@ class DurableTraceStore:
         self._codec = codec or CanonicalTracePayloadCodec()
         self._setup_lock = asyncio.Lock()
         self._setup_task: asyncio.Task[None] | None = None
-        self._local_change = asyncio.Condition()
+        self._follow_changes: dict[TraceThreadKey, _FollowChange] = {}
         self._enforce_writer_leases = True
 
     @property
@@ -614,6 +623,7 @@ class DurableTraceStore:
                 node_id=item.node_id,
                 parent_subagent_id=item.parent_subagent_id,
                 model_call_id=item.model_call_id,
+                model_call_seq=item.model_call_seq,
                 kind=item.kind,
                 status=item.status,
                 name=item.name,
@@ -645,6 +655,10 @@ class DurableTraceStore:
                     item.failure_event,
                     item.failure_seq,
                 ),
+                model_call_event=decode_optional(
+                    item.model_call_event,
+                    item.model_call_seq,
+                ),
             )
             for item in stored.nodes
         )
@@ -665,7 +679,6 @@ class DurableTraceStore:
             has_more=stored.has_more,
             next_started_at=stored.next_started_at,
             next_node_id=stored.next_node_id,
-            call_tracking_present=stored.call_tracking_present,
             relationship_evidence_missing=stored.relationship_evidence_missing,
         )
 
@@ -733,7 +746,6 @@ class DurableTraceStore:
                 has_more=False,
                 next_started_at=None,
                 next_node_id=None,
-                call_tracking_present=candidates.call_tracking_present,
                 relationship_evidence_missing=(
                     candidates.relationship_evidence_missing
                 ),
@@ -772,7 +784,6 @@ class DurableTraceStore:
                 None if cursor_record is None else cursor_record.started_at
             ),
             next_node_id=None if cursor_record is None else cursor_record.node_id,
-            call_tracking_present=candidates.call_tracking_present,
             relationship_evidence_missing=(candidates.relationship_evidence_missing),
         )
 
@@ -786,7 +797,7 @@ class DurableTraceStore:
                 "Trace Store backend does not rebuild indexed Graph nodes"
             )
         snapshot = await self.snapshot_key(key)
-        mutations: list[TraceGraphNodeMutation] = []
+        revisions: dict[tuple[str, str], ReducedTraceGraphRevision] = {}
         after_seq = 0
         while after_seq < snapshot.as_of_seq:
             page = await self.read_events(
@@ -799,13 +810,13 @@ class DurableTraceStore:
                 raise TraceStoreProtocolError(
                     "Trace Ledger ended before the Graph rebuild prefix"
                 )
-            mutations.extend(graph_node_mutations(page))
+            apply_graph_events(revisions, page)
             after_seq = page[-1].trace_seq
         return await backend.rebuild_trace_graph(
             TraceGraphRebuildRequest(
                 key=key,
                 as_of_seq=snapshot.as_of_seq,
-                mutations=reduce_graph_mutations(mutations),
+                mutations=graph_revision_mutations(revisions.values()),
             )
         )
 
@@ -877,35 +888,66 @@ class DurableTraceStore:
         key: TraceThreadKey,
         *,
         after_seq: int,
-    ) -> AsyncGenerator[tuple[TraceEvent, ...], None]:
-        """Follow bounded committed pages with local wakeups and polling fallback."""
+    ) -> AsyncGenerator[TraceStoreUpdate, None]:
+        """Follow bounded pages with exact-generation wakeups and cross-instance reads.
+
+        An empty read checks the tail and active Runs without loading quota aggregates.
+        Local revisions close the read-to-wait gap; notification state lives only
+        as long as a generation has followers. Database I/O runs outside the condition.
+        """
 
         self._validate_key(key)
         if after_seq < 0:
             raise ValueError("after_seq must be non-negative")
 
-        async def iterate() -> AsyncGenerator[tuple[TraceEvent, ...], None]:
+        async def iterate() -> AsyncGenerator[TraceStoreUpdate, None]:
+            await self.setup()
+            signal = self._follow_changes.get(key)
+            if signal is None:
+                signal = _FollowChange()
+                self._follow_changes[key] = signal
+            signal.followers += 1
             cursor = after_seq
-            while True:
-                snapshot = await self.snapshot_key(key)
-                batch = await self.read_events(
-                    key,
-                    after_seq=cursor,
-                    as_of_seq=snapshot.as_of_seq,
-                    limit=self._limits.follow_batch_size,
-                )
-                if batch:
-                    cursor = batch[-1].trace_seq
-                    yield batch
-                    continue
-                async with self._local_change:
-                    try:
-                        await asyncio.wait_for(
-                            self._local_change.wait(),
-                            timeout=self._options.follow_poll_seconds,
+            active_run_ids: tuple[str, ...] | None = None
+            try:
+                while True:
+                    revision = signal.revision
+                    request = TraceEventPageRequest(
+                        key=key,
+                        direction="forward",
+                        after_seq=cursor,
+                        limit=self._limits.follow_batch_size,
+                    )
+                    page = await self._backend.read_event_page(request)
+                    batch = self._decode_event_page(page, expected_request=request)
+                    if batch:
+                        cursor = batch[-1].trace_seq
+                    if batch or active_run_ids != page.active_run_ids:
+                        active_run_ids = page.active_run_ids
+                        yield TraceStoreUpdate(
+                            as_of_seq=cursor,
+                            events=batch,
+                            active_run_ids=active_run_ids,
+                            observed_at=page.observed_at,
                         )
-                    except TimeoutError:
-                        pass
+                    if batch:
+                        continue
+                    async with signal.condition:
+                        if signal.revision != revision:
+                            continue
+                        try:
+                            await asyncio.wait_for(
+                                signal.condition.wait_for(
+                                    lambda: signal.revision != revision
+                                ),
+                                timeout=self._options.follow_poll_seconds,
+                            )
+                        except TimeoutError:
+                            pass
+            finally:
+                signal.followers -= 1
+                if not signal.followers:
+                    self._follow_changes.pop(key, None)
 
         return iterate()
 
@@ -937,8 +979,16 @@ class DurableTraceStore:
                 "Trace Ledger backend returned an invalid commit result"
             )
         _validate_commit_result(change, result)
-        async with self._local_change:
-            self._local_change.notify_all()
+        signal = (
+            None
+            if result.key is None
+            or change.kind in {"renew_writer", "save_projection_checkpoint"}
+            else self._follow_changes.get(result.key)
+        )
+        if signal is not None:
+            async with signal.condition:
+                signal.revision += 1
+                signal.condition.notify_all()
         return result
 
     def _decode_event_page(
@@ -947,10 +997,27 @@ class DurableTraceStore:
         *,
         expected_request: TraceEventPageRequest,
     ) -> tuple[TraceEvent, ...]:
+        if (
+            not isinstance(page.observed_at, datetime)
+            or page.observed_at.tzinfo is None
+            or page.observed_at.utcoffset() != UTC.utcoffset(page.observed_at)
+        ):
+            raise TraceStoreProtocolError(
+                "Trace event page has invalid observation time"
+            )
         if page.key != expected_request.key:
             raise TraceStoreProtocolError(
                 "Trace event page does not match the requested generation"
             )
+        if (
+            not isinstance(page.active_run_ids, tuple)
+            or any(
+                not isinstance(run_id, str) or not run_id or run_id != run_id.strip()
+                for run_id in page.active_run_ids
+            )
+            or len(set(page.active_run_ids)) != len(page.active_run_ids)
+        ):
+            raise TraceStoreProtocolError("Trace event page has invalid active Runs")
         records = page.events
         if len(records) > expected_request.limit:
             raise TraceStoreProtocolError(
@@ -1177,6 +1244,7 @@ class _InMemoryTraceLedgerBackend:
             if thread is None or thread.state.key != request.key:
                 raise TraceThreadNotFound("Trace generation does not exist")
             tail = thread.state.next_seq - 1
+            now = datetime.now(UTC)
             if request.direction == "forward":
                 after = 0 if request.after_seq is None else request.after_seq
                 as_of = tail if request.as_of_seq is None else request.as_of_seq
@@ -1195,6 +1263,14 @@ class _InMemoryTraceLedgerBackend:
                 key=request.key,
                 tail_seq=tail,
                 events=records,
+                active_run_ids=tuple(
+                    sorted(
+                        writer.run_id
+                        for writer in thread.writers.values()
+                        if writer.active and writer.lease_expires_at > now
+                    )
+                ),
+                observed_at=now,
             )
 
     async def query_trace_graph(
@@ -1275,11 +1351,6 @@ class _InMemoryTraceLedgerBackend:
                     ):
                         next_parent_ids.add(parent.parent_subagent_id)
                 pending = next_parent_ids
-            tracked_runs = {
-                event.run_id
-                for event in thread.events
-                if event.fact_kind == "call.tracking"
-            }
             return StoredTraceGraphPage(
                 key=request.key,
                 as_of_seq=tail,
@@ -1298,7 +1369,6 @@ class _InMemoryTraceLedgerBackend:
                 has_more=has_more,
                 next_started_at=(None if cursor_row is None else cursor_row.started_at),
                 next_node_id=None if cursor_row is None else cursor_row.node_id,
-                call_tracking_present=bool(run_ids) and run_ids <= tracked_runs,
                 relationship_evidence_missing=any(
                     row.link_issue is not None for row in candidates
                 ),
@@ -1502,8 +1572,7 @@ class _InMemoryTraceLedgerBackend:
                     strict=True,
                 )
             )
-        for mutation in effect.graph_node_mutations:
-            apply_graph_node_mutation(thread.graph_nodes, mutation)
+        apply_graph_events(thread.graph_nodes, effect.validated_events)
         if effect.checkpoint is not None:
             thread.checkpoints.setdefault(
                 (effect.checkpoint.projection_name, effect.checkpoint.run_id),
@@ -1650,6 +1719,7 @@ def _stored_memory_graph_node(
         node_id=row.node_id,
         parent_subagent_id=row.parent_subagent_id,
         model_call_id=row.model_call_id,
+        model_call_seq=row.model_call_seq,
         kind=row.kind,
         status=row.status,
         name=row.name,
@@ -1672,6 +1742,7 @@ def _stored_memory_graph_node(
         request_event=event(row.request_seq),
         result_event=event(row.result_seq),
         failure_event=event(row.failure_seq),
+        model_call_event=event(row.model_call_seq),
     )
 
 
@@ -1701,6 +1772,7 @@ def _snapshot_from_state(
         as_of_seq=thread.next_seq - 1,
         persisted_bytes=thread.persisted_bytes,
         active_writers=state.active_writers,
+        observed_at=state.observed_at,
     )
 
 

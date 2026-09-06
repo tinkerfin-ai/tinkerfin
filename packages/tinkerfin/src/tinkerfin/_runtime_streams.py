@@ -243,29 +243,61 @@ async def _next_or_observer_failure(
         self._observation.wait_failure(),
         name="tinkerfin-observer-failure-wait",
     )
+    primary: BaseException | None = None
     try:
         done, _pending = await asyncio.wait(
             (pull, failure),
             return_when=asyncio.FIRST_COMPLETED,
         )
         if failure in done:
-            if not pull.done():
-                pull.cancel()
-            await asyncio.gather(pull, return_exceptions=True)
             await failure
             raise AssertionError("Observer failure waiter returned without failing")
         return await pull
-    except BaseException:
-        if not pull.done():
-            pull.cancel()
+    except BaseException as error:
+        primary = error
         raise
     finally:
-        if not failure.done():
-            failure.cancel()
-        await asyncio.gather(failure, return_exceptions=True)
-        if not pull.done():
-            pull.cancel()
-        await asyncio.gather(pull, return_exceptions=True)
+        # Cancel each owned task once and let its cleanup settle. A second cancel
+        # can interrupt LangGraph 1.2.10's AsyncPregelLoop.__aexit__ before its
+        # provider tasks close. join_task also keeps repeated caller cancellation
+        # from propagating into that cleanup while preserving the caller's signal.
+        cancellation: asyncio.CancelledError | None = None
+        process_control = (
+            primary
+            if primary is not None
+            and not isinstance(primary, Exception | asyncio.CancelledError)
+            else None
+        )
+        settlement_error: BaseException | None = None
+        for owned in (failure, pull):
+            try:
+                await join_task(owned, cancel=True, suppress_task_cancellation=True)
+            except asyncio.CancelledError as error:
+                cancellation = cancellation or error
+            except Exception as error:  # noqa: BLE001 - settle both owners
+                if error is not primary:
+                    settlement_error = settlement_error or error
+            except BaseException as error:  # noqa: BLE001 - preserve control after joins
+                if process_control is None:
+                    process_control = error
+                elif error is not process_control:
+                    process_control.add_note(
+                        "Another owned task raised process control: "
+                        f"{type(error).__name__}: {error}"
+                    )
+        # Process control stays observable even when an Observer or caller failed
+        # first; cancellation still outranks ordinary provider/cleanup failures.
+        if process_control is not None:
+            raise process_control
+        if cancellation is not None:
+            raise cancellation
+        if settlement_error is not None:
+            if primary is None:
+                raise settlement_error
+            primary.add_note(
+                "Upstream pull settlement also failed: "
+                f"{type(settlement_error).__name__}: {settlement_error}"
+            )
 
 
 def _error_outcome(error: BaseException) -> RunTerminalOutcome:
@@ -528,6 +560,30 @@ async def _finish_once(
             observation_errors.append(observation_error)
 
     all_secondary = [*cleanup_errors, *observation_errors]
+    candidates = ([error] if error is not None else []) + all_secondary
+    control = next(
+        (
+            item
+            for item in candidates
+            if not isinstance(item, Exception | asyncio.CancelledError)
+        ),
+        None,
+    )
+    if control is None:
+        control = next(
+            (item for item in candidates if isinstance(item, asyncio.CancelledError)),
+            None,
+        )
+    if control is not None and control is not error:
+        # A prior execution failure cannot hide cancellation or process control
+        # raised while closing a coordinator, source, or Observer session.
+        for secondary in candidates:
+            if secondary is not control:
+                control.add_note(
+                    "Graph run settlement also observed: "
+                    f"{type(secondary).__name__}: {secondary}"
+                )
+        raise control
     if error is not None:
         for secondary in all_secondary:
             error.add_note(

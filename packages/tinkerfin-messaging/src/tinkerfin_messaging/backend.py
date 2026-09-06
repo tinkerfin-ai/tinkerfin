@@ -9,10 +9,12 @@ from typing import TYPE_CHECKING, Literal, Never, TypeGuard
 
 from tinkerfin_contracts import RunIdentity
 
+from ._capacity import _ExpiryIndex, checkpoint_bytes
 from ._identity import required_identifier, required_identity
 from .errors import (
     CodecMismatch,
     InvalidCursor,
+    MessagingQuotaExceeded,
     StreamDeleteConflict,
     StreamDeleted,
     StreamExpired,
@@ -116,6 +118,8 @@ class _StreamState:
         self.runs: dict[str, _RunRecord] = {}
         self.active_identity: RunIdentity | None = None
         self.payload_bytes = 0
+        self.retained_bytes = 0
+        self.retained_records = 1
         self.expires_at_monotonic: float | None = None
         self.control_sequence = 0
 
@@ -123,7 +127,8 @@ class _StreamState:
 class _ChannelState:
     """Coordinate thread generations and retain stale-handle dispositions."""
 
-    def __init__(self) -> None:
+    def __init__(self, channel: str) -> None:
+        self.channel = channel
         self.lock = asyncio.Lock()
         self.codec: str | None = None
         self.streams: dict[str, _StreamState] = {}
@@ -143,7 +148,7 @@ class MemoryBackend:
         """Initialize process-local streams with capacity and retention limits.
 
         Args:
-            limits: Immutable payload and per-thread capacity contract.
+            limits: Immutable individual, per-thread, and instance-wide capacity contract.
             retention_policy: Terminal replay deadline policy; disabled by default.
 
         Raises:
@@ -155,6 +160,9 @@ class MemoryBackend:
         if not isinstance(retention_policy, MessagingRetentionPolicy):
             raise TypeError("retention_policy must be a MessagingRetentionPolicy")
         self._channels: dict[str, _ChannelState] = {}
+        self._total_bytes = 0
+        self._total_records = 0
+        self._expirations = _ExpiryIndex()
         self._limits = limits
         self._retention_policy = retention_policy
 
@@ -215,6 +223,8 @@ class MemoryBackend:
                 else transition.run_reference.generation
             )
         )
+        if transition.kind in {"prepare_run", "append_message"}:
+            self._reclaim_expired()
         channel_state = self._channel(transition.channel)
         async with channel_state.lock:
             stream_state = self._expire_if_due(
@@ -506,10 +516,17 @@ class MemoryBackend:
                 while stream_state.messages and removed < purge.maximum_records:
                     message = stream_state.messages.pop()
                     stream_state.by_message_id.pop(message.message_id, None)
-                    stream_state.signatures.pop(message.message_id, None)
+                    signature = stream_state.signatures.pop(message.message_id, None)
+                    released_bytes = len(message.payload) + checkpoint_bytes(
+                        None if signature is None else signature[3]
+                    )
+                    self._release_memory_records(stream_state, released_bytes, 1)
                     removed += 1
                 while stream_state.runs and removed < purge.maximum_records:
-                    stream_state.runs.pop(next(iter(stream_state.runs)))
+                    run = stream_state.runs.pop(next(iter(stream_state.runs)))
+                    self._release_memory_records(
+                        stream_state, checkpoint_bytes(run.checkpoint), 1
+                    )
                     removed += 1
                 complete = not stream_state.messages and not stream_state.runs
                 return StreamGenerationPurgeResult(
@@ -685,9 +702,23 @@ class MemoryBackend:
         identity: RunIdentity,
         effect: MessagingStorageEffect,
     ) -> None:
+        # Every quota check and charge runs without yielding, including across channel
+        # locks. Rejected transitions leave no channel, generation, or counter behind.
+        total_bytes, total_records, generation_records = self._effect_capacity(
+            channel_state, identity, effect
+        )
+        if self._total_bytes + total_bytes > self._limits.max_total_bytes:
+            raise MessagingQuotaExceeded(
+                resource="total_bytes", limit=self._limits.max_total_bytes
+            )
+        if self._total_records + total_records > self._limits.max_total_records:
+            raise MessagingQuotaExceeded(
+                resource="total_records", limit=self._limits.max_total_records
+            )
         if effect.channel is not None:
             if channel_state.codec is None:
                 channel_state.codec = effect.channel.codec_id
+                self._channels[channel_state.channel] = channel_state
             elif channel_state.codec != effect.channel.codec_id:
                 raise CodecMismatch(
                     expected=channel_state.codec,
@@ -700,6 +731,11 @@ class MemoryBackend:
         ):
             stream_state = _StreamState(generation=stream_effect.generation)
             channel_state.streams[identity.thread_id] = stream_state
+        self._total_bytes += total_bytes
+        self._total_records += total_records
+        if stream_state is not None:
+            stream_state.retained_bytes += total_bytes
+            stream_state.retained_records += generation_records
         if stream_effect is not None:
             assert stream_state is not None
             stream_state.disposition = stream_effect.disposition
@@ -759,21 +795,82 @@ class MemoryBackend:
                 stream_state.expires_at_monotonic = (
                     None if terminal_ttl is None else time.monotonic() + terminal_ttl
                 )
+            if effect.retention_action != "none":
+                self._expirations.set(
+                    (channel_state.channel, identity.thread_id),
+                    stream_state.expires_at_monotonic,
+                )
         if effect.tombstone_reason is not None:
             if stream_state is None:
                 raise RuntimeError("Messaging tombstone effect requires a stream")
-            stream_state.deleted = True
-            stream_state.disposition = effect.tombstone_reason
-            channel_state.streams.pop(identity.thread_id, None)
-            channel_state.next_generations[identity.thread_id] = (
-                stream_state.generation + 1
+            self._retire_memory_generation(
+                channel_state, identity.thread_id, stream_state, effect.tombstone_reason
             )
-            self._record_tombstone(
-                channel_state,
-                identity.thread_id,
-                generation=stream_state.generation,
-                reason=effect.tombstone_reason,
+
+    def _effect_capacity(
+        self,
+        channel: _ChannelState,
+        identity: RunIdentity,
+        effect: MessagingStorageEffect,
+    ) -> tuple[int, int, int]:
+        state = channel.streams.get(identity.thread_id)
+        records = int(channel.codec is None and effect.channel is not None)
+        if effect.stream is not None and state is None:
+            records += 1 + int(identity.thread_id not in channel.next_generations)
+        generation_records = 0
+        retained_bytes = 0
+        for run in effect.runs:
+            previous = None if state is None else state.runs.get(run.identity.run_id)
+            generation_records += int(previous is None)
+            retained_bytes += checkpoint_bytes(run.checkpoint) - checkpoint_bytes(
+                None if previous is None else previous.checkpoint
             )
+        message = effect.message
+        if message is not None and (
+            state is None or message.envelope.message_id not in state.by_message_id
+        ):
+            generation_records += 1
+            retained_bytes += len(message.envelope.payload) + checkpoint_bytes(
+                message.checkpoint
+            )
+        return retained_bytes, records + generation_records, generation_records
+
+    def _release_memory_records(
+        self, state: _StreamState, released_bytes: int, records: int
+    ) -> None:
+        self._total_bytes -= released_bytes
+        self._total_records -= records
+        state.retained_bytes -= released_bytes
+        state.retained_records -= records
+
+    def _retire_memory_generation(
+        self,
+        channel: _ChannelState,
+        thread_id: str,
+        state: _StreamState,
+        reason: Literal["deleted", "expired"],
+    ) -> None:
+        # The generation record becomes its tombstone; cleanup never needs spare quota.
+        self._total_bytes -= state.retained_bytes
+        self._total_records -= state.retained_records - 1
+        state.deleted = True
+        state.disposition = reason
+        channel.streams.pop(thread_id, None)
+        channel.next_generations[thread_id] = state.generation + 1
+        self._record_tombstone(
+            channel, thread_id, generation=state.generation, reason=reason
+        )
+        self._expirations.set((channel.channel, thread_id), None)
+
+    def _reclaim_expired(self) -> None:
+        # Bounded admission work can release other threads without scanning all channels.
+        now = time.monotonic()
+        for _ in range(64):
+            key = self._expirations.pop_due(now)
+            if key is None:
+                return
+            channel, thread = key
+            self._expire_if_due(self._channels[channel], thread)
 
     def _raise_memory_generation_unavailable(
         self,
@@ -845,15 +942,7 @@ class MemoryBackend:
         deadline = state.expires_at_monotonic
         if deadline is None or time.monotonic() < deadline:
             return state
-        state.deleted = True
-        del channel_state.streams[thread_id]
-        channel_state.next_generations[thread_id] = state.generation + 1
-        self._record_tombstone(
-            channel_state,
-            thread_id,
-            generation=state.generation,
-            reason="expired",
-        )
+        self._retire_memory_generation(channel_state, thread_id, state, "expired")
         return None
 
     @staticmethod
@@ -898,6 +987,5 @@ class MemoryBackend:
     def _channel(self, channel: str) -> _ChannelState:
         state = self._channels.get(channel)
         if state is None:
-            state = _ChannelState()
-            self._channels[channel] = state
+            state = _ChannelState(channel)
         return state

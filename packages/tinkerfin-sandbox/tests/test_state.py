@@ -930,7 +930,7 @@ async def test_sqlite_state_fences_ready_warm_reconciliation(tmp_path: Path) -> 
         ready = await state.claim_ready_warm_slot(exclude_slots=())
         assert ready is not None
         assert ready.sandbox_id == "warm-1"
-        assert not await state.warm_pool_ready()
+        assert await state.warm_pool_ready()
         assert await state.claim_ready_warm_slot(exclude_slots=(ready.slot,)) is None
 
         await state.publish_warm(ready, "warm-1")

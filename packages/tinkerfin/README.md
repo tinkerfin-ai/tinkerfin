@@ -435,6 +435,15 @@ and subagents. Observer failure terminates the Run fail-closed, while Runtime st
 settles and closes every opened session. Registration is preserved by `.plan(...)`;
 registering the same Observer object twice is rejected.
 
+A failure before Agent execution uses `runtime_initialization_error` in its terminal
+Observation. The original exception remains on the stream, and no Model or Tool call
+is invented. Cancellation and Observer failures retain their own classifications.
+
+Synchronous and asynchronous Tools both support observers. A call's start observation
+is settled before execution; a rejected start prevents the call from running.
+Cancelling a Run cannot forcibly stop a synchronous function that has already started.
+Such functions must bound their own blocking I/O and release resources on completion.
+
 Runtime records provider and Tool callbacks, not generic chain or middleware callbacks.
 Middleware still executes in its declared Deep Agents order, and its final model requests
 and actual Tool executions remain observable. A reusable middleware or Tool can publish

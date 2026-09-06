@@ -35,6 +35,8 @@ import { SettingsDialog } from '../settings/SettingsDialog'
 import { useWorkspaceNavigation } from './useWorkspaceNavigation'
 import { useModelCatalog } from './useModelCatalog'
 import { useWorkspaceHistory } from './useWorkspaceHistory'
+import { ConversationNavigator } from '../conversation/navigation/ConversationNavigator'
+import { conversationTurns } from '../conversation/navigation/turns'
 import { useConversationScroll } from './useConversationScroll'
 import { useConversationManagement } from './useConversationManagement'
 import { useConversationMessageWindow } from './useConversationMessageWindow'
@@ -201,6 +203,7 @@ export function WorkspaceScreen({
     setWorkspace,
     defaultModelId,
     modelCatalogStatus,
+    refreshOnActivation: workspaceView === 'trace',
     followDetachedConversation,
     prepareTaskTraceOwner: handoffTaskTraceFollow,
     onToast: pushToast,
@@ -256,6 +259,7 @@ export function WorkspaceScreen({
     scrollToBottomImmediately: scrollConversationToBottomImmediately,
     syncToBottomIfFollowing: syncConversationToBottomIfFollowing,
     markUserScrollIntent,
+    pauseFollowing,
     scrollBy: scrollConversationBy,
     scrollToBottom: scrollConversationToBottom,
     pauseScrollToBottomFade,
@@ -391,13 +395,48 @@ export function WorkspaceScreen({
     [conversation],
   )
 
+  const [directoryThreadId, setDirectoryThreadId] = useState<string | null>(null)
+  const rawNavigationTurns = useMemo(() => conversationTurns(conversation.messages), [conversation.messages])
+  const navigationTurnsRef = useRef(rawNavigationTurns)
+  if (rawNavigationTurns.length !== navigationTurnsRef.current.length || rawNavigationTurns.some((turn, index) => {
+    const previous = navigationTurnsRef.current[index]
+    return turn.messageId !== previous.messageId || turn.prompt !== previous.prompt || turn.response !== previous.response
+  })) navigationTurnsRef.current = rawNavigationTurns
+  const navigationTurns = navigationTurnsRef.current
+  useEffect(() => { setDirectoryThreadId(null) }, [conversation.threadId, workspaceView])
+  useEffect(() => {
+    if (navigationTurns.length < 2 || taskDrawer.modalActive || isConversationHydrating || isConversationHydrationFailed) setDirectoryThreadId(null)
+  }, [navigationTurns.length, taskDrawer.modalActive, isConversationHydrating, isConversationHydrationFailed])
+  const directoryOpen = directoryThreadId === conversation.threadId && workspaceView === 'conversation'
+  const changeDirectoryOpen = useCallback((open: boolean) => {
+    setDirectoryThreadId(open ? conversation.threadId : null)
+  }, [conversation.threadId])
+
   const messageWindow = useConversationMessageWindow({
     threadId: conversation.threadId,
     entries: displayMessages,
+    active: workspaceView === 'conversation',
     historyCursor: conversation.trace?.historyCursor,
     paneRef: conversationPane,
     loadOlderTrace,
   })
+  const navigationScope = useRef('')
+  navigationScope.current = `${conversation.threadId}:${workspaceView}`
+  const { revealMessage } = messageWindow
+  const navigateToQuestion = useCallback(async (messageId: string) => {
+    pauseFollowing()
+    const scope = navigationScope.current
+    try {
+      const result = await revealMessage(messageId, 'start')
+      if (scope !== navigationScope.current) return
+      if (result === 'not-found') pushToast('error', t('未找到对应的提问'))
+      else if (result === 'failed') pushToast('error', t('定位消息失败，请重试'))
+    } catch {
+      if (scope !== navigationScope.current) return
+      pushToast('error', t('定位消息失败，请重试'))
+    }
+  }, [pauseFollowing, pushToast, revealMessage, t])
+
   const returnToLatestMessages = useCallback(() => {
     messageWindow.restoreTail()
     window.requestAnimationFrame(() => {
@@ -837,7 +876,7 @@ export function WorkspaceScreen({
   }, [messageWindow, pushToast, t, taskDrawer])
 
   // Portal 对话框打开时整块工作区退出辅助技术与键盘路径，只保留最上层操作
-  const portalModalActive = settingsOpen || dialog != null
+  const portalModalActive = settingsOpen || dialog != null || directoryOpen
   const taskTraceLauncher = taskTraceBlocked ? undefined : (
     <TodoTraceLauncher
       ref={taskDrawer.launcherRef}
@@ -939,6 +978,12 @@ export function WorkspaceScreen({
             <ConversationViewport
               conversation={conversation}
               entries={messageWindow.visibleEntries}
+              navigation={!taskDrawer.modalActive && !isConversationHydrating && !isConversationHydrationFailed
+                && isHistoryBootstrapped && !isInitialHistoryUnavailable && navigationTurns.length >= 2 ? (
+                  <ConversationNavigator key={conversation.threadId} turns={navigationTurns}
+                    paneRef={conversationPane} open={directoryOpen} onOpenChange={changeDirectoryOpen}
+                    onNavigate={navigateToQuestion} />
+                ) : undefined}
               hasEarlierMessages={messageWindow.hasEarlierMessages}
               childToolsByRunId={childToolsByRunId}
               paneRef={conversationPane}
@@ -1070,6 +1115,8 @@ export function WorkspaceScreen({
             <ChainTraceView
               threadId={conversation.threadId}
               active={workspaceView === 'trace'}
+              live={conversation.runStatus === 'streaming' || conversation.runStatus === 'detached'}
+              observedAt={conversation.trace?.observedAt}
             />
           </ErrorBoundary>
         )}

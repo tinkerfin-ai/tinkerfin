@@ -28,7 +28,8 @@ vi.mock('../../../api/conversation/client', () => ({
   cancelConversationRun: clientMocks.cancel,
 }))
 
-vi.mock('../../../api/conversation/history', () => ({
+vi.mock(import('../../../api/conversation/history'), async (importOriginal) => ({
+  ...await importOriginal(),
   fetchConversationHistoryDetail: traceMocks.detail,
   followConversationTrace: traceMocks.follow,
 }))
@@ -56,6 +57,8 @@ const traceDetail = (
   lastModel: 'main',
   pinned: false,
   asOfSeq: 5,
+  generation: 'generation-test',
+  observedAt: '2026-09-05T00:00:00.000000Z',
   headRunId: RUN_ID,
   availableHeads: [RUN_ID],
   historyCursor: null,
@@ -283,6 +286,8 @@ describe('useConversationStreamController', () => {
         taskTrace: null,
         update: {
           asOfSeq: 3,
+          generation: 'generation-test',
+          observedAt: '2026-09-05T00:00:00.000001Z',
           events: [],
           facts: [],
           messages: {
@@ -346,6 +351,8 @@ describe('useConversationStreamController', () => {
             taskTrace: null,
             update: {
               asOfSeq: 4,
+              generation: 'generation-test',
+              observedAt: '2026-09-05T00:00:00.000001Z',
               events: [],
               facts: [],
               messages: { upserts: terminal.messages, removes: [] },

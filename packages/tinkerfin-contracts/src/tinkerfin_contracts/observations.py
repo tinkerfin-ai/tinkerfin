@@ -5,8 +5,9 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Annotated, Literal, TypeAlias
 
-from pydantic import Field, JsonValue, TypeAdapter, model_validator
+from pydantic import Field, TypeAdapter, model_validator
 
+from ._json import FiniteJsonValue
 from ._models import ContractModel, ObservationModel
 from .identity import RunIdentity
 
@@ -63,8 +64,8 @@ class RunSourceContext(ContractModel):
     """Describe the real input and lineage used to open one Runtime request.
 
     Input and configuration values are finite JSON snapshots produced by the Runtime.
-    Observer implementations must treat them as borrowed immutable evidence and apply
-    their own retention policy before storing content.
+    Nested dictionaries and lists remain mutable. Observer implementations must treat
+    received evidence as read-only and apply their retention policy before storing it.
     """
 
     identity: RunIdentity
@@ -72,8 +73,8 @@ class RunSourceContext(ContractModel):
     input_kind: RunInputKind
     parent_run_id: str | None = Field(default=None, min_length=1, max_length=1024)
     mode: RunMode = "default"
-    input: JsonValue
-    config: JsonValue
+    input: FiniteJsonValue
+    config: FiniteJsonValue
     resume: tuple[RunResumeSummary, ...] = ()
     private_state_keys: tuple[str, ...] = ()
     call_tracking_enabled: bool = Field(
@@ -100,7 +101,7 @@ class NativeToolCall(ContractModel):
 
     id: str = Field(min_length=1, max_length=1024)
     name: str = Field(min_length=1, max_length=1024)
-    arguments: dict[str, JsonValue]
+    arguments: dict[str, FiniteJsonValue]
 
 
 class NativeToolCallChunk(ContractModel):
@@ -118,20 +119,20 @@ class NativeMessageRecord(ContractModel):
     message_type: NativeMessageType
     id: str | None = Field(default=None, min_length=1, max_length=1024)
     name: str | None = Field(default=None, min_length=1, max_length=1024)
-    content: JsonValue
+    content: FiniteJsonValue
     tool_calls: tuple[NativeToolCall, ...] = ()
     tool_call_chunks: tuple[NativeToolCallChunk, ...] = ()
     tool_call_id: str | None = Field(default=None, min_length=1, max_length=1024)
     tool_status: Literal["success", "error"] | None = None
-    response_metadata: dict[str, JsonValue] = Field(default_factory=dict)
-    usage_metadata: dict[str, JsonValue] | None = None
+    response_metadata: dict[str, FiniteJsonValue] = Field(default_factory=dict)
+    usage_metadata: dict[str, FiniteJsonValue] | None = None
 
 
 class NativeInterruptRecord(ContractModel):
     """Preserve one native interrupt ID and its finite public value."""
 
     id: str = Field(min_length=1, max_length=1024)
-    value: JsonValue
+    value: FiniteJsonValue
 
 
 class RunStartedObservation(ObservationModel):
@@ -181,7 +182,15 @@ class RunTerminalObservation(ObservationModel):
     kind: Literal["run.terminal"] = "run.terminal"
     identity: RunIdentity
     outcome: RunTerminalOutcome
-    code: str | None = Field(default=None, min_length=1, max_length=1024)
+    code: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=1024,
+        description=(
+            "Client-safe terminal code; runtime_initialization_error identifies "
+            "a failure before Agent execution"
+        ),
+    )
     error_type: str | None = Field(default=None, min_length=1, max_length=1024)
     interrupt_ids: tuple[str, ...] = ()
 
@@ -218,16 +227,16 @@ class ModelCallObservation(ObservationModel):
         default=(),
         description="Final middleware-processed messages sent to the provider",
     )
-    invocation: JsonValue | None = Field(
+    invocation: FiniteJsonValue | None = Field(
         default=None,
         description="Provider invocation parameters exposed by the locked callback",
     )
-    options: JsonValue | None = Field(
+    options: FiniteJsonValue | None = Field(
         default=None,
         description="Bound model options exposed by the locked callback",
     )
-    usage: dict[str, JsonValue] | None = None
-    response_metadata: dict[str, JsonValue] | None = None
+    usage: dict[str, FiniteJsonValue] | None = None
+    response_metadata: dict[str, FiniteJsonValue] | None = None
     output_message_ids: tuple[str, ...] = Field(
         default=(),
         description="Stable provider output message identities when exposed",
@@ -300,11 +309,11 @@ class ToolExecutionObservation(ObservationModel):
     agent_name: str | None = Field(default=None, min_length=1, max_length=1024)
     tool_call_id: str | None = Field(default=None, min_length=1, max_length=1024)
     tool_name: str = Field(min_length=1, max_length=1024)
-    input: JsonValue | None = Field(
+    input: FiniteJsonValue | None = Field(
         default=None,
         description="Actual post-review Tool input carried only by the start phase",
     )
-    output: JsonValue | None = Field(
+    output: FiniteJsonValue | None = Field(
         default=None,
         description="Actual Tool result carried only by a terminal phase",
     )
@@ -353,11 +362,11 @@ class ContextContributionObservation(ObservationModel):
     namespace: tuple[str, ...] = ()
     context_kind: ContextKind
     name: str = Field(min_length=1, max_length=1024)
-    input: JsonValue | None = Field(
+    input: FiniteJsonValue | None = Field(
         default=None,
         description="Public contribution input carried only by the start phase",
     )
-    output: JsonValue | None = Field(
+    output: FiniteJsonValue | None = Field(
         default=None,
         description="Public contribution result carried only by successful completion",
     )
@@ -390,7 +399,7 @@ class NativeMessageObservation(ObservationModel):
     identity: RunIdentity
     namespace: tuple[str, ...]
     message: NativeMessageRecord
-    metadata: dict[str, JsonValue] = Field(default_factory=dict)
+    metadata: dict[str, FiniteJsonValue] = Field(default_factory=dict)
 
 
 class NativeReasoningObservation(ObservationModel):
@@ -406,7 +415,7 @@ class NativeReasoningObservation(ObservationModel):
     namespace: tuple[str, ...]
     message_id: str = Field(min_length=1, max_length=1024)
     extractor: str = Field(min_length=1, max_length=1024)
-    content: JsonValue
+    content: FiniteJsonValue
     snapshot: bool = Field(
         description="Whether content is a complete message snapshot rather than a delta"
     )
@@ -422,11 +431,11 @@ class NativeTaskObservation(ObservationModel):
     task_id: str = Field(min_length=1, max_length=1024)
     name: str = Field(min_length=1, max_length=1024)
     triggers: tuple[str, ...] = ()
-    input: JsonValue | None = None
-    result: JsonValue | None = None
+    input: FiniteJsonValue | None = None
+    result: FiniteJsonValue | None = None
     error_type: str | None = Field(default=None, min_length=1, max_length=1024)
     interrupts: tuple[NativeInterruptRecord, ...] = ()
-    metadata: dict[str, JsonValue] = Field(default_factory=dict)
+    metadata: dict[str, FiniteJsonValue] = Field(default_factory=dict)
 
 
 class NativeStateObservation(ObservationModel):
@@ -435,7 +444,7 @@ class NativeStateObservation(ObservationModel):
     kind: Literal["native.state"] = "native.state"
     identity: RunIdentity
     namespace: tuple[str, ...]
-    state: dict[str, JsonValue]
+    state: dict[str, FiniteJsonValue]
     messages: tuple[NativeMessageRecord, ...] = ()
     interrupts: tuple[NativeInterruptRecord, ...] = ()
 

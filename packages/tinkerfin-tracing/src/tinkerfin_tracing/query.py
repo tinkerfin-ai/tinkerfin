@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 from collections.abc import AsyncIterator, Mapping
+from datetime import datetime
 from types import MappingProxyType
 from typing import TypeVar, cast
 
@@ -23,7 +24,7 @@ from .errors import (
     TraceStoreProtocolError,
     TraceThreadNotFound,
 )
-from .facts import CallTrackingFact, TraceEvent, TraceSemanticFact
+from .facts import TraceEvent, TraceSemanticFact
 from .follow import TraceFollow, _close_trace_source, create_trace_follow
 from .graph import (
     TraceGraph,
@@ -51,6 +52,7 @@ from .store import (
     TraceGraphStore,
     TraceProjectionCheckpoint,
     TraceStore,
+    TraceStoreUpdate,
     TraceThreadKey,
 )
 from .views import (
@@ -93,6 +95,7 @@ class _HistoryCursorPayload(TraceModel):
     page_as_of_seq: int = Field(ge=1)
     persisted_bytes: int = Field(ge=1)
     active_writers: tuple[StoreWriterSnapshot, ...]
+    observed_at: datetime
     loaded_turns: int = Field(ge=1)
 
 
@@ -158,6 +161,11 @@ class TraceThread:
         """Return the immutable global Ledger prefix used by this handle."""
 
         return self._snapshot.as_of_seq
+
+    @property
+    def observed_at(self) -> datetime:
+        """Return the storage UTC time when this fixed view's ownership was read."""
+        return self._snapshot.observed_at
 
     @property
     def head_run_id(self) -> str:
@@ -268,6 +276,7 @@ class TraceThread:
                 page_as_of_seq=self.as_of_seq,
                 persisted_bytes=self._snapshot.persisted_bytes,
                 active_writers=self._snapshot.active_writers,
+                observed_at=self.observed_at,
                 loaded_turns=self._turn_limit,
             )
         )
@@ -392,11 +401,12 @@ class TraceThread:
         )
 
     def follow(self) -> TraceFollow[TraceUpdate]:
-        """Return a closeable follower for commits after this handle's original as-of.
+        """Follow committed events and execution changes after this fixed view.
 
         The iterator follows the exact generation and selected head. Sibling-branch
-        batches advance internal projection state but are not emitted. Normal
-        exhaustion, cancellation, and explicit close settle the borrowed Store
+        batches advance internal projection state but are not emitted. Writer loss
+        updates status and completeness at the same sequence without inventing events.
+        Normal exhaustion, cancellation, and explicit close settle the borrowed Store
         follower. Use ``async with`` when the consumer may break early.
 
         Returns:
@@ -421,30 +431,34 @@ class TraceThread:
             batches = self._store.follow(self.key, after_seq=self.as_of_seq)
             primary_error: BaseException | None = None
             try:
-                async for batch in batches:
+                async for stored_update in batches:
+                    if not isinstance(stored_update, TraceStoreUpdate):
+                        raise TraceStoreProtocolError(
+                            "Trace Store returned an invalid follow update"
+                        )
+                    batch = stored_update.events
                     _validate_event_batch(
                         batch,
                         key=self.key,
                         expected_after=core_state.as_of_seq,
                     )
                     core_state = advance_core_projection_state(core_state, batch)
-                    current_snapshot = await self._store.snapshot_key(self.key)
-                    if not isinstance(current_snapshot, StoreThreadSnapshot):
+                    if stored_update.as_of_seq != core_state.as_of_seq:
                         raise TraceStoreProtocolError(
-                            "Trace Store returned an invalid thread snapshot"
+                            "Trace Store follow cursor conflicts with its events"
                         )
                     current = project_core_checkpoint(
                         core_state,
                         head_run_id=self._head_requested,
                         turn_limit=self._turn_limit,
-                        active_run_ids=current_snapshot.active_run_ids,
+                        active_run_ids=stored_update.active_run_ids,
                     )
                     selected_batch = tuple(
                         event
                         for event in batch
                         if event.fact.identity.run_id in current.selected_run_ids
                     )
-                    if not selected_batch:
+                    if not selected_batch and current.summary == previous.summary:
                         previous = current
                         continue
                     current_graph = await _materialize_history_graph(
@@ -467,7 +481,9 @@ class TraceThread:
                         as_of_seq=core_state.as_of_seq,
                     )
                     update = TraceUpdate(
-                        as_of_seq=batch[-1].trace_seq,
+                        generation=self.key.generation,
+                        observed_at=stored_update.observed_at,
+                        as_of_seq=core_state.as_of_seq,
                         events=selected_batch,
                         facts=tuple(event.fact for event in selected_batch),
                         messages=_entity_delta(previous.messages, current.messages),
@@ -557,6 +573,7 @@ async def resolve_history_request(
             as_of_seq=payload.page_as_of_seq,
             persisted_bytes=payload.persisted_bytes,
             active_writers=payload.active_writers,
+            observed_at=payload.observed_at,
         ),
         payload.head_run_id,
         payload.loaded_turns + limit,
@@ -825,7 +842,9 @@ async def _materialize_history_graph(
     )
     where = TraceGraphFilter()
     records = None
-    call_tracking_present = False
+    call_history_known = bool(window.visible_run_ids) and all(
+        core_state.runs[run_id].call_history_known for run_id in window.visible_run_ids
+    )
     relationship_evidence_missing = False
     if isinstance(store, TraceGraphStore):
         current = await store.query_trace_graph(
@@ -842,7 +861,6 @@ async def _materialize_history_graph(
                     context={"resource": "graph_direct_nodes"},
                 )
             records = current.nodes
-            call_tracking_present = current.call_tracking_present
             relationship_evidence_missing = current.relationship_evidence_missing
     if records is None:
         events = await _read_events_for_runs(
@@ -861,14 +879,6 @@ async def _materialize_history_graph(
                 "Trace history Graph exceeds max_direct_nodes",
                 context={"resource": "graph_direct_nodes"},
             )
-        tracked_runs = {
-            event.fact.identity.run_id
-            for event in events
-            if isinstance(event.fact, CallTrackingFact)
-        }
-        call_tracking_present = (
-            bool(window.visible_run_ids) and window.visible_run_ids <= tracked_runs
-        )
     turns = trace_graph_turns(
         core_state,
         window,
@@ -895,7 +905,7 @@ async def _materialize_history_graph(
             matched_node_ids=ordered_ids,
             as_of_seq=as_of_seq,
             completeness=TraceGraphCompleteness(
-                call_tracking_missing=not call_tracking_present,
+                call_tracking_missing=not call_history_known,
                 relationship_evidence_missing=relationship_missing,
                 details_omitted=details_omitted,
             ),
@@ -1098,7 +1108,7 @@ def _validate_event_batch(
     key: TraceThreadKey,
     expected_after: int,
 ) -> None:
-    if not isinstance(batch, tuple) or not batch:
+    if not isinstance(batch, tuple):
         raise TraceStoreProtocolError("Trace Store returned an invalid event batch")
     expected = expected_after + 1
     for event in batch:

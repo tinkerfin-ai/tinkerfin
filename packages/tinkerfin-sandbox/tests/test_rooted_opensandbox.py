@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import secrets
 import shlex
-import shutil
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -17,17 +16,20 @@ from docker import DockerClient
 from opensandbox.config import ConnectionConfig
 from testcontainers.core.container import DockerContainer
 from tests.support.docker_services import (
+    OpenSandboxDockerRuntime,
     OpenSandboxTestService,
-    _MappedPortHttpWaitStrategy,
     _opensandbox_config,
-    _opensandbox_docker_socket,
-    _with_opensandbox_port,
+    _stop_owned_container,
 )
 
 from tinkerfin_sandbox import (
+    OpenSandboxBackendUnavailableError,
     OpenSandboxClient,
     OpenSandboxConfig,
+    OpenSandboxLifecycleEvent,
+    OpenSandboxLifecycleEventType,
     OpenSandboxManager,
+    OpenSandboxRecoveryPolicy,
     SQLAlchemyOpenSandboxState,
 )
 from tinkerfin_sandbox.backends import _rooted_protocol
@@ -195,7 +197,8 @@ async def _wait_for_child_cleanup(
     label, value = next(iter(metadata.items()))
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
-        owned = docker_client.containers.list(
+        owned = await asyncio.to_thread(
+            docker_client.containers.list,
             all=True,
             filters={"label": f"{label}={value}"},
         )
@@ -249,46 +252,29 @@ def _recreated_opensandbox_server(
     api_key: str,
     config_path: Path,
     metadata_dir: Path,
-    run_id: str,
+    runtime: OpenSandboxDockerRuntime,
 ) -> DockerContainer:
-    """Build one disposable Server sharing only Docker and runtime metadata."""
+    """Build a Server sharing only the test daemon and test-owned metadata."""
 
-    wait = (
-        _MappedPortHttpWaitStrategy(8090, "/health")
-        .with_poll_interval(0.5)
-        .with_startup_timeout(180)
-    )
-    return (
-        _with_opensandbox_port(
-            DockerContainer(
-                "opensandbox/server:v0.2.2@sha256:"
-                "8f8762af7565ed9c6f9dbcf009dd56727aa1fef8ce58a17f2b007b88cfe542bb"
-            )
+    return runtime.configure_server(
+        DockerContainer(
+            "opensandbox/server:v0.2.2@sha256:"
+            "8f8762af7565ed9c6f9dbcf009dd56727aa1fef8ce58a17f2b007b88cfe542bb"
         )
         .with_env("OPENSANDBOX_SERVER_API_KEY", api_key)
-        .with_volume_mapping(
-            _opensandbox_docker_socket(),
-            "/var/run/docker.sock",
-            "rw",
-        )
         .with_volume_mapping(
             str(metadata_dir),
             "/root/.opensandbox/metadata",
             "rw",
         )
         .with_copy_into_container(config_path, "/etc/opensandbox/config.toml")
-        .with_kwargs(
-            extra_hosts={"host.docker.internal": "host-gateway"},
-            labels={"tinkerfin.test/run": run_id},
-        )
-        .waiting_for(wait)
     )
 
 
 @pytest.mark.opensandbox_e2e
 async def test_real_rooted_descriptor_transfers_reject_symlink_races(
     opensandbox_test_service: OpenSandboxTestService,
-    docker_test_client: DockerClient,
+    opensandbox_docker_runtime: OpenSandboxDockerRuntime,
 ) -> None:
     """Exercise one real Sandbox and prove every owned container is destroyed."""
 
@@ -301,6 +287,7 @@ async def test_real_rooted_descriptor_transfers_reject_symlink_races(
             use_server_proxy=True,
         ),
         config=OpenSandboxConfig(
+            image=opensandbox_docker_runtime.image,
             workspace_root="/workspace",
             warm_pool_size=0,
             ttl=timedelta(minutes=20),
@@ -350,15 +337,106 @@ async def test_real_rooted_descriptor_transfers_reject_symlink_races(
         "race_multilevel",
     ]
     await _wait_for_child_cleanup(
-        docker_test_client,
+        opensandbox_docker_runtime.client,
         opensandbox_test_service.sandbox_metadata,
     )
 
 
 @pytest.mark.opensandbox_e2e
+async def test_real_manual_cleanup_sandbox_preserves_files_across_manager_restart(
+    opensandbox_test_service: OpenSandboxTestService,
+    opensandbox_docker_runtime: OpenSandboxDockerRuntime,
+    tmp_path: Path,
+) -> None:
+    """Manual lifetime keeps remote files and durable bindings until explicit destroy."""
+
+    purpose = f"manual-lifetime-{uuid4().hex}"
+    config = OpenSandboxConfig(
+        image=opensandbox_docker_runtime.image,
+        workspace_root="/workspace",
+        warm_pool_size=1,
+        ttl=None,
+        metadata={"purpose": purpose, **opensandbox_test_service.sandbox_metadata},
+    )
+    connection = ConnectionConfig(
+        domain=opensandbox_test_service.domain,
+        api_key=opensandbox_test_service.api_key,
+        request_timeout=timedelta(minutes=2),
+        use_server_proxy=True,
+    )
+    state_url = f"sqlite+aiosqlite:///{tmp_path / 'manual-lifetime.db'}"
+    first_client = OpenSandboxClient(connection_config=connection, config=config)
+    first = OpenSandboxManager[str](
+        client=first_client,
+        key_resolver=lambda value: value,
+        state=SQLAlchemyOpenSandboxState(url=state_url, namespace=purpose),
+        fail_on_startup_warmup_error=True,
+    )
+    second: OpenSandboxManager[str] | None = None
+    try:
+        await first.start()
+        await first.check_ready()
+        owner = await first.get("project")
+        original_id = owner.id
+        write = await owner.aexecute(
+            "printf manual-lifetime-content > /workspace/manual-lifetime.txt"
+        )
+        assert write.exit_code == 0
+        details = await first.get_details("project")
+        assert details is not None and details.available and details.healthy
+        assert details.expires_at is None
+        await _wait_for_owned_sandbox_count(
+            opensandbox_docker_runtime.client,
+            label="purpose",
+            value=purpose,
+            count=2,
+        )
+        await first.aclose()
+
+        second_client = OpenSandboxClient(connection_config=connection, config=config)
+        second = OpenSandboxManager[str](
+            client=second_client,
+            key_resolver=lambda value: value,
+            state=SQLAlchemyOpenSandboxState(url=state_url, namespace=purpose),
+            fail_on_startup_warmup_error=True,
+        )
+        await second.start()
+        await second.check_ready()
+        restored = await second.reconnect("project")
+        assert restored.id == original_id
+        assert await second.get("project") is restored
+        read = await restored.aexecute("cat /workspace/manual-lifetime.txt")
+        assert read.exit_code == 0
+        assert read.output == "manual-lifetime-content"
+        for sandbox_id in await _owned_sandbox_ids(
+            opensandbox_docker_runtime.client, label="purpose", value=purpose
+        ):
+            info = await second_client.inspect(sandbox_id)
+            assert info.available and info.healthy
+            assert info.expires_at is None
+        await second.destroy("project")
+        assert await second.get_details("project") is None
+        assert (
+            await second_client.inspect(original_id)
+        ).unavailable_reason == "not_found"
+    finally:
+        if second is not None:
+            await second.aclose()
+        await first.aclose()
+        cleanup_client = OpenSandboxClient(connection_config=connection, config=config)
+        try:
+            for sandbox_id in await _owned_sandbox_ids(
+                opensandbox_docker_runtime.client, label="purpose", value=purpose
+            ):
+                await cleanup_client.destroy(sandbox_id)
+        finally:
+            await cleanup_client.aclose()
+
+
+@pytest.mark.opensandbox_e2e
 async def test_real_manager_renews_warm_ttl_and_replaces_it_after_restart(
     opensandbox_test_service: OpenSandboxTestService,
-    docker_test_client: DockerClient,
+    opensandbox_docker_runtime: OpenSandboxDockerRuntime,
     tmp_path: Path,
 ) -> None:
     """Prove running renewal and durable stale-slot recovery against Docker."""
@@ -366,6 +444,7 @@ async def test_real_manager_renews_warm_ttl_and_replaces_it_after_restart(
     purpose = f"warm-lifecycle-{uuid4().hex}"
     purpose_label = "purpose"
     config = OpenSandboxConfig(
+        image=opensandbox_docker_runtime.image,
         workspace_root="/workspace",
         warm_pool_size=1,
         ttl=timedelta(seconds=60),
@@ -399,7 +478,7 @@ async def test_real_manager_renews_warm_ttl_and_replaces_it_after_restart(
     try:
         await first.start()
         (original_id,) = await _wait_for_owned_sandbox_count(
-            docker_test_client,
+            opensandbox_docker_runtime.client,
             label=purpose_label,
             value=purpose,
             count=1,
@@ -412,7 +491,7 @@ async def test_real_manager_renews_warm_ttl_and_replaces_it_after_restart(
         assert renewed_info.expires_at is not None
         assert renewed_info.expires_at > initial_info.expires_at
         assert await _owned_sandbox_ids(
-            docker_test_client,
+            opensandbox_docker_runtime.client,
             label=purpose_label,
             value=purpose,
         ) == (original_id,)
@@ -426,7 +505,7 @@ async def test_real_manager_renews_warm_ttl_and_replaces_it_after_restart(
             await expiring_backend.aclose()
             await expiry_client.aclose()
         await _wait_for_owned_sandbox_count(
-            docker_test_client,
+            opensandbox_docker_runtime.client,
             label=purpose_label,
             value=purpose,
             count=0,
@@ -449,7 +528,7 @@ async def test_real_manager_renews_warm_ttl_and_replaces_it_after_restart(
         await second.start()
         await second.check_ready()
         (replacement_id,) = await _wait_for_owned_sandbox_count(
-            docker_test_client,
+            opensandbox_docker_runtime.client,
             label=purpose_label,
             value=purpose,
             count=1,
@@ -464,14 +543,14 @@ async def test_real_manager_renews_warm_ttl_and_replaces_it_after_restart(
         await first.aclose()
         cleanup_client = OpenSandboxClient(connection_config=connection, config=config)
         for sandbox_id in await _owned_sandbox_ids(
-            docker_test_client,
+            opensandbox_docker_runtime.client,
             label=purpose_label,
             value=purpose,
         ):
             await cleanup_client.destroy(sandbox_id)
         await cleanup_client.aclose()
         await _wait_for_owned_sandbox_count(
-            docker_test_client,
+            opensandbox_docker_runtime.client,
             label=purpose_label,
             value=purpose,
             count=0,
@@ -481,7 +560,7 @@ async def test_real_manager_renews_warm_ttl_and_replaces_it_after_restart(
 @pytest.mark.docker_integration
 @pytest.mark.opensandbox_e2e
 async def test_recreated_server_restores_persisted_expiration_override(
-    docker_test_client: DockerClient,
+    opensandbox_docker_runtime: OpenSandboxDockerRuntime,
     docker_test_run_id: str,
     tmp_path: Path,
 ) -> None:
@@ -491,19 +570,11 @@ async def test_recreated_server_restores_persisted_expiration_override(
     config_path = tmp_path / "config.toml"
     await asyncio.to_thread(
         config_path.write_text,
-        _opensandbox_config(),
+        _opensandbox_config(docker_host="127.0.0.1"),
         encoding="utf-8",
     )
     metadata_dir = tmp_path / "metadata"
     await asyncio.to_thread(metadata_dir.mkdir)
-    host_metadata_dir = Path.home() / ".opensandbox" / "metadata"
-    if await asyncio.to_thread(host_metadata_dir.is_dir):
-        await asyncio.to_thread(
-            shutil.copytree,
-            host_metadata_dir,
-            metadata_dir,
-            dirs_exist_ok=True,
-        )
     purpose = f"server-restart-{uuid4().hex}"
     purpose_label = "purpose"
     sandbox_id: str | None = None
@@ -512,16 +583,11 @@ async def test_recreated_server_restores_persisted_expiration_override(
             api_key=api_key,
             config_path=config_path,
             metadata_dir=metadata_dir,
-            run_id=docker_test_run_id,
+            runtime=opensandbox_docker_runtime,
         )
-        await asyncio.to_thread(first_server.start)
         try:
-            first_domain = await asyncio.to_thread(
-                lambda: (
-                    f"{first_server.get_container_host_ip()}:"
-                    f"{first_server.get_exposed_port(8090)}"
-                )
-            )
+            await asyncio.to_thread(first_server.start)
+            first_domain = opensandbox_docker_runtime.domain
             connection = ConnectionConfig(
                 domain=first_domain,
                 api_key=api_key,
@@ -531,6 +597,7 @@ async def test_recreated_server_restores_persisted_expiration_override(
             client = OpenSandboxClient(
                 connection_config=connection,
                 config=OpenSandboxConfig(
+                    image=opensandbox_docker_runtime.image,
                     workspace_root="/workspace",
                     warm_pool_size=0,
                     ttl=timedelta(seconds=60),
@@ -550,30 +617,149 @@ async def test_recreated_server_restores_persisted_expiration_override(
             expiration_file = metadata_dir / "_expiration" / f"{sandbox_id}.json"
             assert await asyncio.to_thread(expiration_file.is_file)
         finally:
-            await asyncio.to_thread(first_server.stop)
+            await asyncio.to_thread(_stop_owned_container, first_server)
 
         second_server = _recreated_opensandbox_server(
             api_key=api_key,
             config_path=config_path,
             metadata_dir=metadata_dir,
-            run_id=docker_test_run_id,
+            runtime=opensandbox_docker_runtime,
         )
-        await asyncio.to_thread(second_server.start)
         try:
+            await asyncio.to_thread(second_server.start)
             await _wait_for_owned_sandbox_count(
-                docker_test_client,
+                opensandbox_docker_runtime.client,
                 label=purpose_label,
                 value=purpose,
                 count=0,
                 timeout=20.0,
             )
         finally:
-            await asyncio.to_thread(second_server.stop)
+            await asyncio.to_thread(_stop_owned_container, second_server)
     finally:
         remaining = await asyncio.to_thread(
-            docker_test_client.containers.list,
+            opensandbox_docker_runtime.client.containers.list,
             all=True,
             filters={"label": f"{purpose_label}={purpose}"},
         )
         for container in remaining:
             await asyncio.to_thread(container.remove, force=True)
+
+
+@pytest.mark.opensandbox_e2e
+async def test_real_recovery_preserves_files_and_requires_opt_in_for_recreation(
+    opensandbox_test_service: OpenSandboxTestService,
+    opensandbox_docker_runtime: OpenSandboxDockerRuntime,
+    tmp_path: Path,
+) -> None:
+    """Verify recovery and lifecycle notices against real test-owned container files."""
+
+    events: list[OpenSandboxLifecycleEvent] = []
+
+    class Observer:
+        async def on_sandbox_event(self, event: OpenSandboxLifecycleEvent) -> None:
+            events.append(event)
+
+    observer = Observer()
+    owner = "recovery-owner"
+    namespace = f"recovery-{uuid4().hex}"
+    url = f"sqlite+aiosqlite:///{tmp_path / 'recovery.db'}"
+    config = OpenSandboxConfig(
+        image=opensandbox_docker_runtime.image,
+        warm_pool_size=0,
+        workspace_root="/workspace",
+        ttl=timedelta(minutes=20),
+        health_command="test ! -e /workspace/.probe-down",
+        metadata=opensandbox_test_service.sandbox_metadata,
+    )
+    connection = ConnectionConfig(
+        domain=opensandbox_test_service.domain,
+        api_key=opensandbox_test_service.api_key,
+        use_server_proxy=True,
+    )
+    async with OpenSandboxManager[str](
+        client=OpenSandboxClient(connection_config=connection, config=config),
+        state=SQLAlchemyOpenSandboxState(url=url, namespace=namespace),
+        key_resolver=lambda key: key,
+        observers=(observer,),
+    ) as preserving:
+        backend = await preserving.get(owner)
+        original_id = backend.id
+        upload = await backend.aupload_files([("/sentinel.txt", b"preserved contents")])
+        assert upload[0].error is None
+        await backend.aexecute("touch /workspace/.probe-down")
+
+        with pytest.raises(OpenSandboxBackendUnavailableError):
+            await preserving.get(owner)
+        assert backend.id == original_id
+        assert (await backend.adownload_files(["/sentinel.txt"]))[
+            0
+        ].content == b"preserved contents"
+        await backend.aexecute("rm /workspace/.probe-down")
+        assert (await preserving.get(owner)).id == original_id
+        assert (await backend.adownload_files(["/sentinel.txt"]))[
+            0
+        ].content == b"preserved contents"
+
+        await backend.aexecute("touch /workspace/.probe-down")
+        async with OpenSandboxManager[str](
+            client=OpenSandboxClient(connection_config=connection, config=config),
+            state=SQLAlchemyOpenSandboxState(url=url, namespace=namespace),
+            key_resolver=lambda key: key,
+            recovery_policy=OpenSandboxRecoveryPolicy(
+                max_attempts=1, on_failure="recreate"
+            ),
+            observers=(observer,),
+        ) as recreating:
+            replacement = await recreating.get(owner)
+            assert replacement.id != original_id
+            assert (await replacement.adownload_files(["/sentinel.txt"]))[
+                0
+            ].error is not None
+            await recreating.destroy(owner)
+
+    replaced = [
+        event
+        for event in events
+        if event.type is OpenSandboxLifecycleEventType.REPLACED
+    ]
+    assert len(replaced) == 1
+    assert replaced[0].workspace_may_have_changed
+    assert any(
+        event.type is OpenSandboxLifecycleEventType.RECOVERED for event in events
+    )
+    assert (
+        sum(event.type is OpenSandboxLifecycleEventType.DESTROYED for event in events)
+        == 1
+    )
+
+
+async def test_recreated_server_start_failure_closes_its_container(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Settle a partially started test Server before handing control to Pytest."""
+    from unittest.mock import Mock
+
+    container = Mock(spec=DockerContainer)
+    container.start.side_effect = RuntimeError("synthetic Server readiness failure")
+    docker_client = Mock(spec=DockerClient)
+    docker_client.containers.list.return_value = []
+    runtime = OpenSandboxDockerRuntime(
+        client=docker_client,
+        container_id="synthetic-daemon",
+        domain="127.0.0.1:1",
+        image="synthetic-image",
+        run_id="synthetic-run",
+    )
+    monkeypatch.setitem(
+        globals(),
+        "_recreated_opensandbox_server",
+        lambda **kwargs: container,
+    )
+
+    with pytest.raises(RuntimeError, match="readiness failure"):
+        await test_recreated_server_restores_persisted_expiration_override(
+            runtime, "synthetic-run", tmp_path
+        )
+    container.stop.assert_called_once_with()

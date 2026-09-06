@@ -12,7 +12,10 @@ class MessagingRetentionPolicy:
 
     Active producers never expire. A new Run admitted before the deadline clears the
     timer and continues the same generation. Disabled retention keeps terminal streams
-    until explicit deletion or a backend capacity boundary.
+    until explicit deletion. Capacity exhaustion rejects new storage; it never evicts
+    active or unexpired history. Enabled retention is reclaimed on subsequent backend
+    activity, including writes to other threads. Identity and tombstone records remain
+    counted against total record capacity after generation cleanup.
 
     Attributes:
         terminal_ttl_seconds: Positive terminal replay window, or ``None`` to disable

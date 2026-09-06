@@ -59,6 +59,17 @@ beforeEach(() => {
 })
 
 describe('useConversationMessageWindow', () => {
+  it('目录可按顶部对齐定位窗口外消息，且不额外请求历史', async () => {
+    const loadOlderTrace = vi.fn(async () => false)
+    render(<Harness entries={Array.from({ length: 250 }, (_, index) => entry(index))} loadOlderTrace={loadOlderTrace} />)
+    let locating: Promise<string> | undefined
+    act(() => { locating = current?.revealMessage('message-10', 'start') })
+    expect(await locating).toBe('found')
+    expect(screen.getByText('消息 10')).toHaveFocus()
+    expect(HTMLElement.prototype.scrollIntoView).toHaveBeenCalledWith(expect.objectContaining({ block: 'start' }))
+    expect(loadOlderTrace).not.toHaveBeenCalled()
+  })
+
   it('keeps the latest batch mounted and expands earlier hydrated entries', async () => {
     const loadOlderTrace = vi.fn(async () => false)
     render(

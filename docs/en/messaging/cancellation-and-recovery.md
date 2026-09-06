@@ -176,6 +176,11 @@ Closing a mapped source or subscription retains the underlying close task across
 cancellation. A later `aclose()` joins the same task; the backend iterator is not dropped
 while its close is incomplete.
 
+A subscription allows one active pull. Calling `subscription.aclose()` cancels and
+settles that pull before closing its decoder and backend iterator; a consumer waiting
+for the next message receives `CancelledError`. The producer continues independently,
+and a later subscription can replay any committed messages.
+
 A transform may change the data type, so the mapped source no longer claims the original built-in codec profile. Configure the channel codec explicitly.
 
 ## Recover after producer owner loss

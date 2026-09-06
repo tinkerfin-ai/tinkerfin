@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Protocol, runtime_checkable
 
 from pydantic import Field, JsonValue, field_validator, model_validator
@@ -63,6 +63,17 @@ class StoreThreadSnapshot(TraceModel):
     as_of_seq: int = Field(ge=0)
     persisted_bytes: int = Field(ge=0)
     active_writers: tuple[StoreWriterSnapshot, ...]
+    observed_at: datetime = Field(
+        description="Storage UTC time of the consistent event and ownership read"
+    )
+
+    @field_validator("observed_at")
+    @classmethod
+    def observed_at_is_utc(cls, value: datetime) -> datetime:
+        """Keep ownership observation time separate from the last event time."""
+        if value.tzinfo is None or value.utcoffset() != UTC.utcoffset(value):
+            raise ValueError("observed_at must be aware UTC")
+        return value
 
     @field_validator("active_writers")
     @classmethod
@@ -82,6 +93,22 @@ class StoreThreadSnapshot(TraceModel):
         """Return active Run IDs in the snapshot's canonical writer order."""
 
         return tuple(writer.run_id for writer in self.active_writers)
+
+
+@dataclass(frozen=True, slots=True)
+class TraceStoreUpdate:
+    """Deliver committed events and the currently active Run identities.
+
+    The first update also supplies current ownership when no events follow the
+    requested cursor. Later updates with no events report ownership changes, including
+    writer close and lease expiry. They preserve ``as_of_seq`` and do not invent an
+    Agent result. Event pages remain bounded independently of append transactions.
+    """
+
+    as_of_seq: int
+    events: tuple[TraceEvent, ...]
+    active_run_ids: tuple[str, ...]
+    observed_at: datetime
 
 
 class TraceProjectionCheckpoint(TraceModel):
@@ -113,11 +140,18 @@ class TraceProjectionCheckpoint(TraceModel):
 
 @dataclass(frozen=True, slots=True)
 class TraceGraphNodeRecord:
-    """Carry one indexed Graph node and its decoded authoritative facts."""
+    """Carry one indexed Graph node and its decoded authoritative facts.
+
+    Attributes:
+        model_call_seq: Ledger sequence proving the emitting Model relationship.
+        model_call_event: The corresponding fact, retained even when later lifecycle
+            or payload facts omit that relationship.
+    """
 
     node_id: str
     parent_subagent_id: str | None
     model_call_id: str | None
+    model_call_seq: int | None
     kind: TraceGraphNodeKind
     status: TraceGraphNodeStatus
     name: str
@@ -140,6 +174,7 @@ class TraceGraphNodeRecord:
     request_event: TraceEvent | None
     result_event: TraceEvent | None
     failure_event: TraceEvent | None
+    model_call_event: TraceEvent | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,7 +188,6 @@ class TraceGraphNodeRecordPage:
     has_more: bool
     next_started_at: datetime | None
     next_node_id: str | None
-    call_tracking_present: bool
     relationship_evidence_missing: bool
 
 
@@ -391,16 +425,17 @@ class TraceStore(Protocol):
         key: TraceThreadKey,
         *,
         after_seq: int,
-    ) -> AsyncGenerator[tuple[TraceEvent, ...], None]:
-        """Return a closeable iterator of bounded committed event pages.
+    ) -> AsyncGenerator[TraceStoreUpdate, None]:
+        """Follow bounded committed event pages and active Run ownership.
 
         Args:
             key: Exact generation to follow.
             after_seq: Last sequence already consumed by the caller.
 
         Returns:
-            Iterator preserving sequence order and backpressure. A page may split one
-            append or combine multiple committed appends.
+            Iterator preserving sequence order and backpressure. The first update
+            supplies current ownership. A page may split one append or combine
+            multiple committed appends; an empty page reports only ownership.
 
         Raises:
             TraceThreadNotFound: The generation is deleted or replaced.
@@ -508,6 +543,7 @@ __all__ = [
     "TraceGraphStore",
     "TraceProjectionCheckpoint",
     "TraceStore",
+    "TraceStoreUpdate",
     "TraceThreadKey",
     "TraceWriter",
     "_checkpoint_lookup",

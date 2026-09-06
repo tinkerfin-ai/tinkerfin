@@ -662,7 +662,7 @@ async def test_checkpoint_callback_failure_retries_without_reexecuting_decision(
         parent_run_id="run-parent",
         resume=binding,
         on_resume_checkpointed=fail_after_recording,
-        on_resume_initialization_failed=release_unprepared,
+        on_resume_not_saved=release_unprepared,
     )
     failed_stream = failed_runtime.astream()
     failed_events = [event async for event in failed_stream]
@@ -690,7 +690,7 @@ async def test_checkpoint_callback_failure_retries_without_reexecuting_decision(
         parent_run_id="run-parent",
         resume=binding,
         on_resume_checkpointed=checkpointed,
-        on_resume_initialization_failed=release_unprepared,
+        on_resume_not_saved=release_unprepared,
         on_part=observe,
     )
     retry_stream = retry_runtime.astream()
@@ -739,7 +739,7 @@ async def test_resume_staging_failure_releases_unprepared_host_claim_once(
         parent_run_id="run-parent",
         resume=binding,
         on_resume_checkpointed=checkpointed,
-        on_resume_initialization_failed=release_unprepared,
+        on_resume_not_saved=release_unprepared,
     )
     stream = runtime.astream()
     events = [event async for event in stream]
@@ -764,7 +764,7 @@ async def test_resume_staging_failure_releases_unprepared_host_claim_once(
         parent_run_id="run-parent",
         resume=binding,
         on_resume_checkpointed=retry_checkpointed,
-        on_resume_initialization_failed=release_unprepared,
+        on_resume_not_saved=release_unprepared,
     )
     retry_events = [event async for event in retry.astream()]
 
@@ -804,7 +804,7 @@ async def test_resume_staging_cancellation_releases_unprepared_host_claim_once(
         identity=identity,
         parent_run_id="run-parent",
         resume=binding,
-        on_resume_initialization_failed=release_unprepared,
+        on_resume_not_saved=release_unprepared,
     )
     stream = runtime.astream()
     assert (await anext(stream)).type.value == "RUN_STARTED"
@@ -854,7 +854,7 @@ async def test_resume_post_write_cancellation_keeps_the_durable_host_claim(
         identity=identity,
         parent_run_id="run-parent",
         resume=binding,
-        on_resume_initialization_failed=release_unprepared,
+        on_resume_not_saved=release_unprepared,
     )
     stream = runtime.astream()
     assert (await anext(stream)).type.value == "RUN_STARTED"
@@ -904,7 +904,7 @@ async def test_resume_graph_factory_failure_uses_pre_marker_settlement(
         identity=identity,
         parent_run_id="run-parent",
         resume=binding,
-        on_resume_initialization_failed=release_unprepared,
+        on_resume_not_saved=release_unprepared,
     )
     stream = runtime.astream()
     if isinstance(error, Exception):
@@ -965,7 +965,7 @@ async def test_resume_graph_factory_failure_preserves_a_durable_retry_claim(
         identity=identity,
         parent_run_id="run-parent",
         resume=binding,
-        on_resume_initialization_failed=release_unprepared,
+        on_resume_not_saved=release_unprepared,
     )
     retry_events = [event async for event in retry.astream()]
 
@@ -1001,7 +1001,7 @@ async def test_resume_staging_keeps_primary_failure_when_claim_release_fails(
         identity=identity,
         parent_run_id="run-parent",
         resume=binding,
-        on_resume_initialization_failed=fail_release,
+        on_resume_not_saved=fail_release,
     )
     stream = runtime.astream()
     events = [event async for event in stream]

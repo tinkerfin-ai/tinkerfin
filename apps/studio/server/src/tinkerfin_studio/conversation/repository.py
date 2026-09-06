@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Literal
 
 from ag_ui.core.types import ResumeEntry
 from pydantic import JsonValue
@@ -375,32 +376,67 @@ class ConversationRepository:
         pending_interaction_kind: str | None,
         terminal_outcome: str | None,
         updated_at: datetime,
-    ) -> None:
-        """写入 Trace 派生列表摘要与主 Run 业务状态"""
+        trace_generation: str,
+        trace_as_of_seq: int,
+        trace_observed_at: datetime,
+    ) -> Literal["applied", "stale", "ambiguous", "generation_conflict"]:
+        """按 Trace 前缀和存储观测时间拒绝迟到的旧摘要"""
 
         thread = await self.lock_thread(thread_pk)
         if thread is None:
-            return
+            return "applied"
         registration = await self.get_run_for_update(thread_pk=thread_pk, run_id=run_id)
         if registration is not None:
+            generation = registration.trace_generation
+            if generation is not None and generation != trace_generation:
+                return "generation_conflict"
+            previous_seq = registration.trace_as_of_seq
+            previous_time = registration.trace_observed_at
+            if previous_seq is not None and previous_time is not None:
+                current_order = (previous_seq, previous_time)
+                incoming_order = (trace_as_of_seq, trace_observed_at)
+                if incoming_order < current_order:
+                    return "stale"
+                if incoming_order == current_order:
+                    same_result = (
+                        registration.status
+                        == _registration_status(status, terminal_outcome)
+                        and registration.terminal_outcome == terminal_outcome
+                    )
+                    if thread.last_run_id in (None, run_id):
+                        same_result = same_result and (
+                            thread.status == status
+                            and thread.message_count == message_count
+                            and thread.tool_call_count == tool_call_count
+                            and thread.has_pending_interrupt == has_pending_interrupt
+                            and thread.pending_interaction_kind
+                            == pending_interaction_kind
+                        )
+                    # 数据库时间精度内可能发生两次不同观测；不猜先后，调用方需重新读取
+                    if not same_result:
+                        return "ambiguous"
+            registration.trace_generation = trace_generation
+            registration.trace_as_of_seq = trace_as_of_seq
+            registration.trace_observed_at = trace_observed_at
             registration.status = _registration_status(status, terminal_outcome)
             registration.terminal_outcome = terminal_outcome
             registration.finished_at = (
                 updated_at if terminal_outcome is not None else None
             )
-            registration.updated_at = updated_at
+            registration.updated_at = max(registration.updated_at, updated_at)
         # 较早 Run 的延迟终态不能覆盖已经注册的新 head 摘要
         if thread.last_run_id not in (None, run_id):
             await self._session.flush()
-            return
+            return "applied"
         thread.last_run_id = run_id
         thread.status = status
         thread.message_count = message_count
         thread.tool_call_count = tool_call_count
         thread.has_pending_interrupt = has_pending_interrupt
         thread.pending_interaction_kind = pending_interaction_kind
-        thread.updated_at = updated_at
+        thread.updated_at = max(thread.updated_at, updated_at)
         await self._session.flush()
+        return "applied"
 
     async def lock_thread(self, thread_pk: int) -> ConversationThread | None:
         """锁定会话业务记录"""

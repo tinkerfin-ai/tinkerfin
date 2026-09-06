@@ -65,7 +65,7 @@ if TYPE_CHECKING:
         AgUiResumeCheckpointObserver as AgUiResumeCheckpointObserver,
     )
     from .agui_resume import (
-        AgUiResumeInitializationFailureObserver as AgUiResumeInitializationFailureObserver,
+        AgUiResumeNotSavedObserver as AgUiResumeNotSavedObserver,
     )
     from .agui_resume import AgUiResumeRequest as AgUiResumeRequest
 
@@ -74,7 +74,7 @@ _AGUI_RESUME_EXPORTS = frozenset(
         "AgUiResumeBinding",
         "AgUiResumeCheckpoint",
         "AgUiResumeCheckpointObserver",
-        "AgUiResumeInitializationFailureObserver",
+        "AgUiResumeNotSavedObserver",
         "AgUiResumeRequest",
     }
 )
@@ -100,7 +100,7 @@ __all__ = [
     "AgUiResumeBindingError",
     "AgUiResumeCheckpoint",
     "AgUiResumeCheckpointObserver",
-    "AgUiResumeInitializationFailureObserver",
+    "AgUiResumeNotSavedObserver",
     "AgUiResumeRequest",
     "AgUiSettlementTimeoutError",
     "AgentMode",

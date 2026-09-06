@@ -17,6 +17,7 @@ from typing import (
 import orjson
 from langgraph.store.base import (
     GetOp,
+    InvalidNamespaceError,
     Item,
     ListNamespacesOp,
     Op,
@@ -29,8 +30,10 @@ from typing_extensions import TypedDict
 _STORE_TABLE_COMMENT = "Deep Agents long-term memory Store"
 _STORE_SCHEMA_STATEMENT = """
 CREATE TABLE IF NOT EXISTS store (
-    prefix VARCHAR(500) NOT NULL COMMENT 'Store document namespace',
-    `key` VARCHAR(150) NOT NULL COMMENT 'Document key within the namespace',
+    prefix VARCHAR(500) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin
+        NOT NULL COMMENT 'Store document namespace',
+    `key` VARCHAR(150) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin
+        NOT NULL COMMENT 'Document key within the namespace',
     value JSON NOT NULL COMMENT 'Document JSON value',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT 'Document creation time',
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT 'Document update time',
@@ -390,14 +393,47 @@ def row_to_search_item(
 
 
 def group_ops(ops: Iterable[Op]) -> tuple[GroupedOps, int]:
-    """Group a stable operation sequence by concrete LangGraph operation type."""
+    """Validate document operations before grouping a single batch for execution.
+
+    LangGraph BaseStore validates convenience writes, but explicit PutOp and GetOp
+    values also enter here. Reject ambiguous document paths and unsupported TTLs
+    before any database work. Search and listing paths retain their separate matching
+    semantics, including empty prefixes and listing wildcards.
+
+    Args:
+        ops: Document and namespace operations in their original result order.
+
+    Returns:
+        Operations grouped by concrete type and the expected result count.
+
+    Raises:
+        InvalidNamespaceError: A document path violates LangGraph's namespace rules.
+        NotImplementedError: A document operation requests an unsupported TTL.
+    """
 
     grouped_ops: GroupedOps = defaultdict(list)
     tot = 0
     for idx, op in enumerate(ops):
+        if isinstance(op, GetOp | PutOp):
+            _validate_document_namespace(op.namespace)
+        if isinstance(op, PutOp) and op.ttl is not None:
+            raise NotImplementedError("TTL is not supported by the MySQL Store")
         grouped_ops[type(op)].append((idx, op))
         tot += 1
     return grouped_ops, tot
+
+
+def _validate_document_namespace(namespace: tuple[str, ...]) -> None:
+    """Keep document identities within the locked BaseStore namespace contract."""
+    if not namespace:
+        raise InvalidNamespaceError("Namespace cannot be empty")
+    for label in namespace:
+        if not isinstance(label, str) or not label or "." in label:
+            raise InvalidNamespaceError(
+                "Namespace labels must be non-empty strings without periods"
+            )
+    if namespace[0] == "langgraph":
+        raise InvalidNamespaceError("The langgraph root namespace is reserved")
 
 
 def _json_loads(content: bytes | orjson.Fragment) -> dict[str, Any]:

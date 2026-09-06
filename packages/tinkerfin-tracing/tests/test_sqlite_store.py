@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import pytest
 from pydantic import JsonValue
@@ -17,6 +17,7 @@ from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy import inspect, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
+from sqlalchemy.sql import Executable
 
 from tinkerfin_contracts import (
     RunClosedObservation,
@@ -394,7 +395,8 @@ async def test_sqlite_graph_index_filters_without_repeating_fact_payloads(
             limit=10,
         )
 
-        assert page.call_tracking_present is True
+        graph = await Tracer(store=store).query(_identity().thread_id)
+        assert graph.completeness.call_tracking_missing is False
         assert len(page.nodes) == 1
         node = project_trace_graph_node(
             page.nodes[0],
@@ -2459,18 +2461,22 @@ async def test_sqlite_fixed_event_read_does_not_cross_concurrent_commit(
     writer = await store.open_writer(_identity())
     await writer.append((_fact("started"),))
     snapshot = await store.snapshot(_identity().thread_id)
-    backend = _backend(store)
-    original = backend._thread_row
+    original = AsyncConnection.execute
     head_observed = asyncio.Event()
     continue_read = asyncio.Event()
 
-    async def pause_after_head(connection: AsyncConnection, *, thread_id: str):
-        row = await original(connection, thread_id=thread_id)
-        head_observed.set()
-        await continue_read.wait()
-        return row
+    async def pause_after_head(
+        connection: AsyncConnection, statement: Executable, *args: Any, **kwargs: Any
+    ):
+        result = await original(connection, statement, *args, **kwargs)
+        if not head_observed.is_set() and str(statement).startswith(
+            "SELECT tinkerfin_trace_threads."
+        ):
+            head_observed.set()
+            await continue_read.wait()
+        return result
 
-    monkeypatch.setattr(backend, "_thread_row", pause_after_head)
+    monkeypatch.setattr(AsyncConnection, "execute", pause_after_head)
     read = asyncio.create_task(
         store.read_events(
             snapshot.key,
@@ -2481,7 +2487,7 @@ async def test_sqlite_fixed_event_read_does_not_cross_concurrent_commit(
     )
     append = None
     try:
-        await head_observed.wait()
+        await asyncio.wait_for(head_observed.wait(), timeout=2)
         append = asyncio.create_task(writer.append((_fact("input"),)))
         await asyncio.sleep(0.05)
         continue_read.set()
@@ -2497,7 +2503,7 @@ async def test_sqlite_fixed_event_read_does_not_cross_concurrent_commit(
         if append is not None and not append.done():
             append.cancel()
             await asyncio.gather(append, return_exceptions=True)
-        monkeypatch.setattr(backend, "_thread_row", original)
+        monkeypatch.setattr(AsyncConnection, "execute", original)
         await writer.aclose()
         await engine.dispose()
 

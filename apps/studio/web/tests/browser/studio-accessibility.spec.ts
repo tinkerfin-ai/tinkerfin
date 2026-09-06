@@ -1,6 +1,6 @@
 import { expect, test, type Locator, type Page, type Route } from '@playwright/test'
 import { resolve } from 'node:path'
-import type { ConversationHistoryDetail } from '../../src/api/conversation/history'
+import type { ConversationHistoryDetail, TraceMessage } from '../../src/api/conversation/history'
 import type { TaskTraceSnapshot } from '../../src/api/conversation/taskTrace'
 import {
   emptyTraceGraph,
@@ -562,7 +562,7 @@ async function mockStudio(page: Page, {
   const historyMessages = conversationMessages
     ?? (approval ? approvalMessages : runningActivity ? runningActivityMessages : messages)
   const buildTraceDetail = (includeTaskTrace = true): ConversationHistoryDetail => {
-    const traceMessages = historyMessages.flatMap((message, index) => {
+    const traceMessages = historyMessages.flatMap<TraceMessage>((message, index) => {
       if (message.role === 'user' || message.role === 'assistant') {
         return [{
           id: message.id,
@@ -717,6 +717,7 @@ async function mockStudio(page: Page, {
             namespace: [],
             runId: 'browser-run',
             kind: 'tinkerfin:plan_clarification',
+            toolCallIds: [],
             status: 'pending' as const,
             payloadOmitted: false,
             payload: createPlanQuestionPayload(planQuestionFormOverride ?? planQuestionForm),
@@ -731,6 +732,7 @@ async function mockStudio(page: Page, {
               namespace: [],
               runId: 'browser-run',
               kind: 'tinkerfin:plan_review',
+              toolCallIds: [],
               status: 'pending' as const,
               payloadOmitted: false,
               payload: planReviewPayload,
@@ -752,6 +754,8 @@ async function mockStudio(page: Page, {
       lastModel: 'GPT-5.5',
       pinned: false,
       asOfSeq: traceAsOfSeq,
+      generation: `browser-generation:${THREAD_ID}`,
+      observedAt: '2026-09-05T00:00:00.000000Z',
       headRunId: 'browser-run',
       availableHeads: ['browser-run'],
       historyCursor: null,
@@ -3260,7 +3264,7 @@ test('布局动效不逐帧触发布局且冷缓存只请求允许的西文字�
 
   const session = await page.context().newCDPSession(page)
   await session.send('Performance.enable')
-  const traceComplete = new Promise<{ stream: string }>((resolve) => {
+  const traceComplete = new Promise<{ stream?: string }>((resolve) => {
     session.once('Tracing.tracingComplete', resolve)
   })
   await session.send('Tracing.start', {
@@ -3279,6 +3283,7 @@ test('布局动效不逐帧触发布局且冷缓存只请求允许的西文字�
   const layoutDelta = (await layoutCount()) - before
   await session.send('Tracing.end')
   const { stream } = await traceComplete
+  if (stream === undefined) throw new Error('Chrome trace did not provide a result stream')
   let traceJson = ''
   let traceEof = false
   while (!traceEof) {
@@ -3440,3 +3445,157 @@ test.describe('touch/coarse pointer', () => {
     )))).toBeGreaterThanOrEqual(8)
   })
 })
+
+
+test('对话目录在四视口浅深主题定位已加载但未渲染的提问', async ({ page }) => {
+  const conversationMessages: Message[] = Array.from({ length: 120 }, (_, index) => ([
+    { id: `outline-question-${index}`, role: 'user' as const, content: `目录提问 ${index}`, createdAt: BASE_TIME },
+    { id: `outline-answer-${index}`, role: 'assistant' as const, content: `目录回答 ${index}：这是公开回答摘要`, createdAt: BASE_TIME },
+  ])).flat()
+  await mockStudio(page, { conversationMessages, expectedMessageText: '目录提问 119' })
+  for (const theme of ['light', 'dark']) {
+    await page.evaluate(value => { document.documentElement.dataset.theme = value }, theme)
+    for (const width of [320, 768, 1024, 1440]) {
+      await page.setViewportSize({ width, height: 900 })
+      await page.emulateMedia({ reducedMotion: 'reduce' })
+      const rail = page.getByRole('navigation', { name: '对话目录', exact: true })
+      if (width === 1440) {
+        await expect(rail).toBeVisible()
+        await rail.getByRole('button', { name: '跳转到提问：目录提问 0', exact: true }).focus()
+        await expect(page.getByRole('tooltip')).toContainText('目录回答 0')
+        await page.screenshot({ path: `/tmp/studio-outline-${theme}-${width}.png` })
+        await rail.getByRole('button', { name: '跳转到提问：目录提问 0', exact: true }).press('Enter')
+      } else {
+        await page.getByRole('button', { name: '对话目录', exact: true }).click()
+        const dialog = page.getByRole('dialog', { name: '对话目录' })
+        await expect(dialog).toBeVisible()
+        await expect(dialog).toContainText('仅显示已加载的对话')
+        await page.screenshot({ path: `/tmp/studio-outline-${theme}-${width}.png` })
+        await dialog.getByRole('button').filter({ hasText: '目录提问 0' }).click()
+        await expect(dialog).not.toBeVisible()
+      }
+      await expect(page.locator('#outline-question-0')).toBeFocused()
+      const pane = page.getByRole('region', { name: '对话内容' })
+      const targetBox = await page.locator('#outline-question-0').boundingBox()
+      const paneBox = await pane.boundingBox()
+      expect(targetBox!.y).toBeGreaterThanOrEqual(paneBox!.y)
+      expect(targetBox!.y).toBeLessThan(paneBox!.y + 100)
+      const insets = await pane.evaluate(element => {
+        const bounds = element.getBoundingClientRect()
+        const content = element.firstElementChild!.getBoundingClientRect()
+        return { left: content.left - bounds.left, right: bounds.right - content.right }
+      })
+      expect(Math.abs(insets.left - insets.right)).toBeLessThanOrEqual(1)
+      expect(insets.left).toBeGreaterThanOrEqual(24)
+      await page.screenshot({ path: `/tmp/studio-outline-landed-${theme}-${width}.png` })
+      await page.getByRole('button', { name: '回到底部', exact: true }).click()
+      await expect(page.locator('#outline-question-119')).toBeVisible()
+    }
+  }
+})
+
+
+test('触屏对话目录保持完整点击区、模态隔离及关闭焦点恢复', async ({ browser }) => {
+  const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, hasTouch: true })
+  try {
+    const page = await context.newPage()
+    await mockStudio(page, { conversationMessages: [
+      { id: 'touch-first', role: 'user', content: '触屏第一个问题', createdAt: BASE_TIME },
+      { id: 'touch-answer', role: 'assistant', content: '回答', createdAt: BASE_TIME },
+      { id: 'touch-last', role: 'user', content: '触屏最后一个问题', createdAt: BASE_TIME },
+    ], expectedMessageText: '触屏最后一个问题' })
+    const trigger = page.getByRole('button', { name: '对话目录', exact: true })
+    await expect(trigger).toBeVisible()
+    const box = await trigger.boundingBox()
+    expect(box!.width).toBeGreaterThanOrEqual(44)
+    expect(box!.height).toBeGreaterThanOrEqual(44)
+    await trigger.tap()
+    await expect(page.locator('.app-shell')).toHaveAttribute('inert', '')
+    const dialog = page.getByRole('dialog', { name: '对话目录' })
+    await dialog.press('Escape')
+    await expect(trigger).toBeFocused()
+    await trigger.tap()
+    await dialog.getByRole('button', { name: '触屏第一个问题 回答', exact: true }).tap()
+    await expect(page.locator('#touch-first')).toBeFocused()
+    await expect(page.locator('.app-shell')).not.toHaveAttribute('inert', '')
+  } finally { await context.close() }
+})
+
+test('设置在窄屏按内容收紧并保持分类与内容相邻', async ({ page }) => {
+  await mockStudio(page)
+  await page.getByRole('button', { name: '打开用户菜单' }).click()
+  await page.getByRole('menuitem', { name: '设置' }).click()
+  const dialog = page.getByRole('dialog', { name: '设置' })
+  for (const theme of ['light', 'dark']) {
+    await page.evaluate(value => { document.documentElement.dataset.theme = value }, theme)
+    for (const width of [320, 768, 1024, 1440]) {
+      await page.setViewportSize({ width, height: 900 })
+      for (const section of ['账号管理', '通用']) {
+        await dialog.getByRole('button', { name: section, exact: true }).click()
+        const bounds = await dialog.boundingBox()
+        expect(bounds!.y).toBeGreaterThanOrEqual(0)
+        expect(bounds!.y + bounds!.height).toBeLessThanOrEqual(900)
+        if (width === 320) {
+          const nav = await dialog.getByRole('navigation', { name: '设置分类' }).boundingBox()
+          const content = await dialog.getByRole('region', { name: '设置', exact: true }).boundingBox()
+          expect(nav!.height).toBeLessThanOrEqual(64)
+          expect(Math.abs(content!.y - nav!.y - nav!.height)).toBeLessThanOrEqual(1)
+          expect(bounds!.height).toBeLessThan(650)
+        }
+        await page.screenshot({ path: `/tmp/studio-settings-${theme}-${width}-${section === '通用' ? 'general' : 'account'}.png` })
+      }
+    }
+  }
+})
+
+for (const { approval, touch } of [{ approval: false, touch: false }, { approval: true, touch: false }, { approval: true, touch: true }]) {
+  test(`辅助操作显隐保持目录与阅读区稳定：${touch ? '触控审批' : approval ? '审批' : '普通输入'}`, async ({ page }) => {
+    test.setTimeout(90_000)
+    if (touch) {
+      const cdp = await page.context().newCDPSession(page)
+      await cdp.send('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 1 })
+    }
+    const conversationMessages: Message[] = Array.from({ length: 20 }, (_, index) => ([
+      { id: `stable-question-${index}`, role: 'user' as const, content: `稳定布局提问 ${index}`, createdAt: BASE_TIME },
+      { id: `stable-answer-${index}`, role: 'assistant' as const, content: `稳定布局回答 ${index}`, createdAt: BASE_TIME },
+    ])).flat()
+    await mockStudio(page, { approval, conversationMessages: approval ? [...conversationMessages, ...approvalMessages] : conversationMessages, expectedMessageText: '稳定布局提问 19' })
+    await page.emulateMedia({ reducedMotion: 'reduce' })
+    const pane = page.locator('.conversation-pane')
+    const measure = () => page.evaluate(() => ['.composer-dock', '.conversation-region', '.conversation-navigation'].map(selector => {
+      const rect = document.querySelector(selector)!.getBoundingClientRect()
+      return { y: rect.y, height: rect.height }
+    }))
+    for (const theme of ['light', 'dark']) {
+      await page.evaluate(value => { document.documentElement.dataset.theme = value }, theme)
+      for (const width of [320, 768, 1024, 1440]) {
+        await page.setViewportSize({ width, height: 900 })
+        await pane.evaluate(element => { element.scrollTop = element.scrollHeight; element.dispatchEvent(new Event('scroll', { bubbles: true })) })
+        const button = page.getByRole('button', { name: '回到底部', exact: true })
+        await expect(button).toHaveCount(0)
+        const baseline = await measure()
+        await pane.evaluate(element => {
+          element.dispatchEvent(new WheelEvent('wheel', { deltaY: -120, bubbles: true }))
+          element.scrollTop = 0
+          element.dispatchEvent(new Event('scroll', { bubbles: true }))
+        })
+        await expect(button).toBeVisible()
+        await button.focus()
+        expect(await measure()).toEqual(baseline)
+        const control = await button.boundingBox()
+        if (touch) {
+          expect(control!.width).toBeGreaterThanOrEqual(44)
+          expect(control!.height).toBeGreaterThanOrEqual(44)
+        }
+        const content = await page.locator(approval ? '.approval-composer' : '.composer').boundingBox()
+        expect(control!.y + control!.height).toBeLessThanOrEqual(content!.y)
+        expect(control!.x).toBeGreaterThanOrEqual(0)
+        expect(control!.x + control!.width).toBeLessThanOrEqual(width)
+        await page.screenshot({ path: `/tmp/stable-navigation-${touch ? 'touch' : approval ? 'approval' : 'input'}-${theme}-${width}.png` })
+        await page.getByRole('tab', { name: '对话', exact: true }).click()
+        await expect(button).toHaveCount(0)
+        expect(await measure()).toEqual(baseline)
+      }
+    }
+  })
+}

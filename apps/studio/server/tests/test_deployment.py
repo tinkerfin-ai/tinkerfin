@@ -4,31 +4,22 @@ from __future__ import annotations
 
 import os
 import re
-import shlex
 import shutil
 import stat
 import subprocess
+import sys
 from pathlib import Path
+
+from scripts.build_wheels import PROJECT_PATHS
 
 APP_ROOT = Path(__file__).resolve().parents[1]
 DEPLOY_DIR = APP_ROOT / "deploy"
 
 
-def _release_project_paths() -> tuple[str, ...]:
-    script = (DEPLOY_DIR / "deploy.sh").read_text(encoding="utf-8")
-    match = re.search(
-        r"readonly -a PROJECT_PATHS=\(\n(?P<body>.*?)\n\)",
-        script,
-        flags=re.DOTALL,
-    )
-    assert match is not None
-    return tuple(shlex.split(match.group("body")))
-
-
 def test_deploy_builds_the_complete_workspace_release_set() -> None:
     """生产镜像必须包含 Studio 导入链需要的全部本地发行包"""
 
-    assert _release_project_paths() == (
+    assert PROJECT_PATHS == (
         "packages/tinkerfin-contracts",
         "packages/tinkerfin-native-stream",
         "packages/tinkerfin-agui-adapter",
@@ -39,6 +30,91 @@ def test_deploy_builds_the_complete_workspace_release_set() -> None:
         "packages/tinkerfin-langgraph-mysql",
         "apps/studio/server",
     )
+
+
+def test_deploy_calls_shared_build_without_removing_working_tree_artifacts(
+    tmp_path: Path,
+) -> None:
+    """部署通过统一构建入口生成 wheel，并保留工作树中的构建文件"""
+
+    root = tmp_path / "workspace"
+    deploy = root / "apps/studio/server/deploy"
+    deploy.mkdir(parents=True)
+    shutil.copy2(DEPLOY_DIR / "deploy.sh", deploy / "deploy.sh")
+    for filename in (
+        "pyproject.toml",
+        "uv.lock",
+        "apps/studio/server/Dockerfile",
+        "apps/studio/server/database/mysql/schema.sql",
+        "apps/studio/server/deploy/docker-compose.yaml",
+        "apps/studio/server/deploy/.env",
+        "apps/studio/server/deploy/secrets/database_url",
+        "apps/studio/server/deploy/secrets/mysql_password",
+        "apps/studio/server/deploy/secrets/mysql_root_password",
+        "apps/studio/server/deploy/secrets/redis_control_password",
+        "apps/studio/server/deploy/secrets/redis_runtime_password",
+        "apps/studio/server/deploy/secrets/opensandbox_api_key",
+    ):
+        target = root / filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.touch()
+    artifacts = (
+        root / "packages/tinkerfin/build/lib/retained.py",
+        root / "packages/tinkerfin/src/tinkerfin.egg-info/retained.txt",
+    )
+    for artifact in artifacts:
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_text("caller-owned\n", encoding="utf-8")
+    builder = root / "scripts/build_wheels.py"
+    builder.parent.mkdir()
+    builder.write_text(
+        "from pathlib import Path\n"
+        "import sys\n"
+        "output = Path(sys.argv[sys.argv.index('--out-dir') + 1])\n"
+        "(output / 'tinkerfin_studio-0.1.0-py3-none-any.whl').touch()\n"
+        "Path('build-invoked.txt').write_text(' '.join(sys.argv[1:]))\n",
+        encoding="utf-8",
+    )
+    commands = root / "bin"
+    commands.mkdir()
+    uv = commands / "uv"
+    uv.write_text(
+        '#!/usr/bin/env bash\nset -euo pipefail\ncase "$1" in\n'
+        "  lock|export) exit 0 ;;\n"
+        "  run)\n"
+        "    shift\n"
+        '    while [[ "$1" != python ]]; do shift; done\n'
+        "    shift\n"
+        '    exec "$BUILD_TEST_PYTHON" "$@" ;;\n'
+        "  *) exit 71 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    docker = commands / "docker"
+    docker.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$*" == "compose version --short" ]]; then echo 2.24.0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    for command in (uv, docker):
+        command.chmod(0o700)
+    environment = dict(os.environ)
+    environment["PATH"] = str(commands) + os.pathsep + environment["PATH"]
+    environment["BUILD_TEST_PYTHON"] = sys.executable
+
+    result = subprocess.run(
+        ["bash", str(deploy / "deploy.sh")],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (root / "build-invoked.txt").read_text() == f"--out-dir {root / 'dist'}"
+    assert all(artifact.read_text() == "caller-owned\n" for artifact in artifacts)
 
 
 def test_setup_generates_private_file_secrets_without_printing_values(

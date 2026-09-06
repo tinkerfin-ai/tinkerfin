@@ -1,4 +1,4 @@
-import { Activity, Search, ShieldAlert, X } from 'lucide-react'
+import { Activity, ChevronRight, Search, ShieldAlert, X } from 'lucide-react'
 import {
   useEffect,
   useLayoutEffect,
@@ -337,10 +337,10 @@ function TraceDetails({
                   <div>
                     <strong>{entry.failure.errorType}</strong>
                     {entry.failure.message && <p>{entry.failure.message}</p>}
-                    {(entry.request != null || entry.requestOmitted) && (
-                      <Button size="xs" onClick={() => setTab('request')}>{t('查看请求')}</Button>
-                    )}
                   </div>
+                  {(entry.request != null || entry.requestOmitted) && (
+                    <Button className="chain-trace-feedback-action" size="xs" variant="text" trailingIcon={<ChevronRight size={16} />} onClick={() => setTab('request')}>{t('查看请求')}</Button>
+                  )}
                 </section>
               )}
               {messageContent && (
@@ -475,9 +475,13 @@ function TraceDetails({
 export function ChainTraceView({
   threadId,
   active,
+  live,
+  observedAt,
 }: {
   threadId: string
   active: boolean
+  live: boolean
+  observedAt?: string
 }) {
   const { locale, t } = useI18n()
   const [isSearchOpen, setSearchOpen] = useState(false)
@@ -517,7 +521,7 @@ export function ChainTraceView({
   const filter = useMemo(() => ({
     query: searchQuery || undefined,
   }), [searchQuery])
-  const trace = useChainTrace({ threadId, active, filter, limit: 1000 })
+  const trace = useChainTrace({ threadId, active, live, observedAt, filter, limit: 1000 })
   const page = trace.state.phase === 'ready' ? trace.state.page : undefined
   const graphNodes = useMemo(() => page?.nodes ?? [], [page?.nodes])
   const matchedNodeIds = useMemo(

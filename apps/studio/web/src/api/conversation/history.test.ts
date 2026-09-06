@@ -26,6 +26,8 @@ const detail = (): ConversationHistoryDetail => ({
   lastModel: 'main',
   pinned: false,
   asOfSeq: 4,
+  generation: 'generation-test',
+  observedAt: '2026-09-05T00:00:00.000000Z',
   headRunId: 'run-1',
   availableHeads: ['run-1'],
   historyCursor: null,
@@ -139,6 +141,8 @@ describe('conversation Trace client', () => {
       taskTrace: null,
       update: {
         asOfSeq: 5,
+        generation: 'generation-test',
+        observedAt: '2026-09-05T00:00:00.000001Z',
         events: [],
         facts: [],
         messages: { upserts: [], removes: [] },

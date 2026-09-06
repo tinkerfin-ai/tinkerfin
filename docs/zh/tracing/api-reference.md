@@ -96,7 +96,9 @@ Ledger 尾序号变化后，旧 cursor 会明确失效，因此每个实时 Delt
 `TraceGraphDelta`；历史与查询入口共用这套平级且仅按 Subagent 分域的时间线模型。当前尾部历史
 读取可丢弃的 Graph 索引；固定旧前缀则从 Ledger fact 重放同一个 reducer。
 
-`TraceGraphCompleteness` 分别表达 callback 依据缺失、关系依据缺失和详情被采集或响应上限省略。
+`TraceGraphCompleteness` 分别表达调用历史无法确认、关系依据缺失和详情被采集或响应上限省略。
+`call_tracking_missing` 不包含有明确 `runtime_initialization_error` 终态证据的执行前初始化失败；
+其他未跟踪 Run 仍需报告，不能仅凭失败状态或没有调用事件判定历史完整。
 
 ## 查询上限
 
@@ -156,6 +158,16 @@ JSON、非有限数字或破坏 state、模型消息及 HITL 必需结构时，�
 
 ## 存储接口
 
+`RunFact` 表示整个 Runtime 调用，`namespace` 必须为空，`in_subagent_scope` 必须为 false；
+子 Agent 执行使用 `SubagentFact`。构造时会拒绝其他作用域。Writer 也会在提交前原子拒绝含有
+非法 Run 作用域的整批事实，包括通过不执行校验的模型复制方式构造的输入。
+
+`MessageFact.phase` 包含 `started`、`content`、`completed`、`reconciled`、`removed`、
+`cancelled`、`interrupted` 和 `abandoned`。最后三项表示 Run 结算时仍未完整交付的助手消息，
+可以携带已保留的部分正文，不能表示状态快照或其他消息角色。`TraceMessage.status` 在交付结束
+或暂停时使用 `completed`；Graph 单独表达成功、取消、等待或放弃。恢复后的消息可以重新进入
+`streaming`，且不会重复已有正文。
+
 `SubagentFact` 的阶段与状态对应为 `started/running`、`updated/waiting`；`completed`
 只接受 `succeeded`、`failed`、`cancelled` 或 `abandoned`。`input`、`parent_tool_call_id`、
 `parent_execution_id` 和 `model_call_id` 只在 `started` 保存。后续事实沿用相同的
@@ -173,3 +185,8 @@ JSON、非有限数字或破坏 state、模型消息及 HITL 必需结构时，�
 
 低层 writer 只持久化已经 Capture 的 fact。需要框架和业务强制脱敏时，应使用能够获得来源
 上下文的 `Tracer` 路径。
+
+`TraceGraphNodeMutation` 建立 Model 关联时必须同时提供 `model_call_id` 和 `model_call_seq`。
+`StoredTraceGraphNode` 与 `TraceGraphNodeRecord` 用该序号及 `model_call_event` 单独保留关联
+依据，不随生命周期或正文引用更新而丢失。该事实必须证明同一节点在所选作用域与 Run 分支中的
+关联；无关的 Model 事实或后续入参更新不能充当关系依据。

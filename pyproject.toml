@@ -74,6 +74,7 @@ select = [
 [tool.pyright]
 include = [
     "conftest.py",
+    "scripts",
     "tests",
     "packages/tinkerfin/src",
     "packages/tinkerfin/tests",

@@ -220,7 +220,11 @@ class TraceGraphQuery:
             batches = self._store.follow(self._key, after_seq=self._page.as_of_seq)
             primary_error: BaseException | None = None
             try:
-                async for _batch in batches:
+                async for batch in batches:
+                    # Graph nodes describe committed call evidence. Ownership-only
+                    # changes affect Run completeness, not this independent model.
+                    if not batch.events:
+                        continue
                     current = await self._refresh()
                     delta = graph_delta(
                         previous,

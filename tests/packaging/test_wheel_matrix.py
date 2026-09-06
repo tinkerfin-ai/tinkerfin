@@ -6,8 +6,6 @@ import ast
 import importlib.metadata
 import json
 import os
-import re
-import shlex
 import subprocess
 import sys
 import tomllib
@@ -18,9 +16,9 @@ from pathlib import Path
 import pytest
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
+from scripts.build_wheels import PROJECT_PATHS
 
 _ROOT = Path(__file__).resolve().parents[2]
-_DEPLOY_SCRIPT = _ROOT / "apps" / "studio" / "server" / "deploy" / "deploy.sh"
 
 
 @dataclass(frozen=True, slots=True)
@@ -286,17 +284,6 @@ _STUDIO_CASE = _InstallCase(
 _CASES = (*_CORE_CASES, *_FULL_CASES, _STUDIO_CASE)
 
 
-def _release_project_paths() -> tuple[str, ...]:
-    script = _DEPLOY_SCRIPT.read_text(encoding="utf-8")
-    match = re.search(
-        r"readonly -a PROJECT_PATHS=\(\n(?P<body>.*?)\n\)",
-        script,
-        flags=re.DOTALL,
-    )
-    assert match is not None
-    return tuple(shlex.split(match.group("body")))
-
-
 def _run(command: list[str], *, environment: dict[str, str] | None = None) -> None:
     completed = subprocess.run(
         command,
@@ -409,20 +396,15 @@ def wheel_directory(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """Build current wheels once and verify package metadata and stale-file absence."""
 
     output = tmp_path_factory.mktemp("wheel-matrix-dist")
-    for project in _PROJECTS:
-        _run(
-            [
-                "uv",
-                "build",
-                "--offline",
-                "--quiet",
-                "--wheel",
-                "--out-dir",
-                str(output),
-                "--no-create-gitignore",
-                str(project.path),
-            ]
-        )
+    _run(
+        [
+            sys.executable,
+            str(_ROOT / "scripts/build_wheels.py"),
+            "--offline",
+            "--out-dir",
+            str(output),
+        ]
+    )
     wheels = tuple(output.glob("*.whl"))
     assert len(wheels) == len(_PROJECTS)
     for project in _PROJECTS:
@@ -562,7 +544,7 @@ def test_studio_deploy_wheel_set_is_self_contained(
     expected_paths = tuple(
         str(project.path.relative_to(_ROOT)) for project in _PROJECTS
     )
-    release_paths = _release_project_paths()
+    release_paths = PROJECT_PATHS
     assert release_paths == expected_paths
 
     requirements = tmp_path / "requirements.txt"

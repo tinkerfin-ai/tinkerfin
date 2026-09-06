@@ -17,6 +17,7 @@ from deepagents.backends.protocol import INVALID_PATH, ExecuteResponse
 from opensandbox import Sandbox
 from opensandbox import SandboxManager as OpenSandboxSDKManager
 from opensandbox.config import ConnectionConfig
+from opensandbox.exceptions import SandboxApiException, SandboxInternalException
 from opensandbox.models.execd import RunCommandOpts
 from opensandbox.models.sandboxes import (
     PVC,
@@ -31,13 +32,71 @@ from pydantic import ValidationError
 
 from tinkerfin_sandbox import (
     OpenSandboxBackend,
+    OpenSandboxBackendError,
     OpenSandboxBackendTimeoutError,
     OpenSandboxBackendUnavailableError,
     OpenSandboxClient,
     OpenSandboxConfig,
+    OpenSandboxInitializationError,
     OpenSandboxRuntimeInfo,
     UnexpectedOpenSandboxBackendError,
 )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "reason"),
+    [
+        (SandboxApiException(status_code=404), "not_found"),
+        (SandboxApiException(status_code=503), "unreachable"),
+        (SandboxApiException(status_code=401), "authentication"),
+        (SandboxApiException(status_code=403), "permission"),
+        (SandboxApiException(status_code=400), "provider_rejected"),
+        (
+            SandboxInternalException(cause=httpx.ConnectError("private endpoint")),
+            "unreachable",
+        ),
+        (
+            SandboxInternalException(cause=httpx.ReadTimeout("private endpoint")),
+            "timeout",
+        ),
+        (RuntimeError("404 not found does not exist"), None),
+    ],
+)
+async def test_client_classifies_only_structured_connection_evidence(
+    monkeypatch: pytest.MonkeyPatch, failure: Exception, reason: str | None
+) -> None:
+    monkeypatch.setattr(
+        "tinkerfin_sandbox.lifecycle.client.Sandbox.connect",
+        AsyncMock(side_effect=failure),
+    )
+    client = OpenSandboxClient(connection_config=ConnectionConfig())
+    try:
+        with pytest.raises(OpenSandboxBackendError) as raised:
+            await client.connect("existing")
+        assert raised.value.context.get("reason") == reason
+        assert raised.value.cause is failure
+        assert raised.value.__cause__ is failure
+        assert "private endpoint" not in str(raised.value)
+        assert "404" not in str(raised.value)
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_destroy_cannot_treat_error_text_as_proof_of_absence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "tinkerfin_sandbox.lifecycle.client.Sandbox.connect",
+        AsyncMock(side_effect=RuntimeError("404 not found")),
+    )
+    client = OpenSandboxClient(connection_config=ConnectionConfig())
+    try:
+        with pytest.raises(UnexpectedOpenSandboxBackendError):
+            await client.destroy("existing")
+    finally:
+        await client.aclose()
 
 
 class _ObservedTransport(httpx.AsyncBaseTransport):
@@ -384,6 +443,7 @@ class OpenSandboxConfigTests(unittest.TestCase):
             {"image": " "},
             {"command_timeout": -1},
             {"warm_pool_size": -1},
+            {"ttl": timedelta(0)},
             {"ttl": timedelta(seconds=-1)},
             {"lifecycle_request_timeout": timedelta(0)},
             {"ready_timeout": timedelta(seconds=-1)},
@@ -394,6 +454,49 @@ class OpenSandboxConfigTests(unittest.TestCase):
         for values in invalid_values:
             with self.subTest(values=values), self.assertRaises(ValidationError):
                 OpenSandboxConfig.model_validate(values)
+
+
+@pytest.mark.parametrize("ttl", (timedelta(hours=2), None))
+def test_sandbox_lifetime_config_round_trips(ttl: timedelta | None) -> None:
+    """Preserve finite lifetime and explicit manual cleanup through serialization."""
+
+    config = OpenSandboxConfig(ttl=ttl)
+    assert config.ttl == ttl
+    assert OpenSandboxConfig.model_validate_json(config.model_dump_json()).ttl == ttl
+    assert OpenSandboxConfig().ttl == timedelta(hours=2)
+
+
+async def test_client_creates_manual_cleanup_sandbox_and_preserves_null_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The SDK receives manual cleanup and exposes it in stable runtime details."""
+
+    sandbox = _FakeSandbox()
+    sandbox.info.expires_at = None
+    sandbox.commands.result.exit_code = 0
+    create = AsyncMock(return_value=sandbox)
+    monkeypatch.setattr("tinkerfin_sandbox.lifecycle.client.Sandbox.create", create)
+    client = OpenSandboxClient(
+        connection_config=ConnectionConfig(domain="sandbox.example"),
+        config=OpenSandboxConfig(ttl=None, warm_pool_size=0),
+    )
+    try:
+        backend = await client.create()
+        try:
+            assert create.call_args.kwargs["timeout"] is None
+            details = await backend.aget_runtime_info()
+            assert details.available
+            assert details.healthy
+            assert details.expires_at is None
+            assert details.model_dump(mode="json")["expires_at"] is None
+            assert sandbox.files.created_directories
+        finally:
+            await backend.akill()
+            await backend.aclose()
+    finally:
+        await client.aclose()
+    assert sandbox.killed
+    assert sandbox.closed
 
 
 class OpenSandboxBackendTests(unittest.IsolatedAsyncioTestCase):
@@ -1305,7 +1408,7 @@ class OpenSandboxClientTests(unittest.IsolatedAsyncioTestCase):
                 "tinkerfin_sandbox.lifecycle.client.Sandbox.create",
                 return_value=sandbox,
             ),
-            self.assertRaisesRegex(RuntimeError, "seed failed"),
+            self.assertRaises(OpenSandboxInitializationError),
         ):
             await client.create()
 
@@ -1361,7 +1464,7 @@ class OpenSandboxClientTests(unittest.IsolatedAsyncioTestCase):
                 "tinkerfin_sandbox.lifecycle.client.Sandbox.create",
                 return_value=sandbox,
             ),
-            self.assertRaisesRegex(RuntimeError, "seed failed"),
+            self.assertRaises(OpenSandboxInitializationError),
         ):
             await client.create()
 
@@ -1382,7 +1485,7 @@ class OpenSandboxClientTests(unittest.IsolatedAsyncioTestCase):
                 "tinkerfin_sandbox.lifecycle.client.Sandbox.connect",
                 return_value=sandbox,
             ) as connect,
-            self.assertRaisesRegex(RuntimeError, "restore failed"),
+            self.assertRaises(OpenSandboxInitializationError),
         ):
             await client.connect("existing")
 
@@ -1488,7 +1591,7 @@ class OpenSandboxClientTests(unittest.IsolatedAsyncioTestCase):
                 "tinkerfin_sandbox.lifecycle.client.Sandbox.connect",
                 return_value=sandbox,
             ),
-            self.assertRaises(OpenSandboxBackendTimeoutError),
+            self.assertRaises(OpenSandboxInitializationError),
         ):
             await asyncio.wait_for(client.connect("existing"), timeout=0.5)
 
@@ -1556,7 +1659,7 @@ class OpenSandboxClientTests(unittest.IsolatedAsyncioTestCase):
 
         with patch(
             "tinkerfin_sandbox.lifecycle.client.Sandbox.connect",
-            side_effect=RuntimeError("sandbox not found"),
+            side_effect=SandboxApiException("sandbox not found", status_code=404),
         ):
             details = await client.inspect("missing")
 
@@ -1698,7 +1801,7 @@ class OpenSandboxClientTests(unittest.IsolatedAsyncioTestCase):
 
         with patch(
             "tinkerfin_sandbox.lifecycle.client.Sandbox.connect",
-            side_effect=RuntimeError("sandbox not found"),
+            side_effect=SandboxApiException("sandbox not found", status_code=404),
         ):
             await client.destroy("missing")
 
@@ -2027,8 +2130,10 @@ async def test_workspace_root_none_disables_initialization_and_shell_cwd(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("ttl", (timedelta(hours=2), None))
 async def test_workspace_initialization_failure_reclaims_new_sandbox(
     monkeypatch: pytest.MonkeyPatch,
+    ttl: timedelta | None,
 ) -> None:
     sandbox = _FakeSandbox()
     sandbox.files.create_directories_error = RuntimeError("mkdir failed")
@@ -2038,10 +2143,10 @@ async def test_workspace_initialization_failure_reclaims_new_sandbox(
     )
     client = OpenSandboxClient(
         connection_config=ConnectionConfig(),
-        config=OpenSandboxConfig(warm_pool_size=0),
+        config=OpenSandboxConfig(ttl=ttl, warm_pool_size=0),
     )
 
-    with pytest.raises(UnexpectedOpenSandboxBackendError) as captured:
+    with pytest.raises(OpenSandboxInitializationError) as captured:
         await client.create()
 
     assert isinstance(captured.value.cause, RuntimeError)
@@ -2051,8 +2156,10 @@ async def test_workspace_initialization_failure_reclaims_new_sandbox(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("ttl", (timedelta(hours=2), None))
 async def test_workspace_initialization_failure_only_closes_reconnected_sandbox(
     monkeypatch: pytest.MonkeyPatch,
+    ttl: timedelta | None,
 ) -> None:
     sandbox = _FakeSandbox("existing")
     sandbox.files.create_directories_error = RuntimeError("mkdir failed")
@@ -2062,10 +2169,10 @@ async def test_workspace_initialization_failure_only_closes_reconnected_sandbox(
     )
     client = OpenSandboxClient(
         connection_config=ConnectionConfig(),
-        config=OpenSandboxConfig(warm_pool_size=0),
+        config=OpenSandboxConfig(ttl=ttl, warm_pool_size=0),
     )
 
-    with pytest.raises(UnexpectedOpenSandboxBackendError) as captured:
+    with pytest.raises(OpenSandboxInitializationError) as captured:
         await client.connect("existing")
 
     assert isinstance(captured.value.cause, RuntimeError)

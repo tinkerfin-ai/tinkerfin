@@ -203,19 +203,34 @@ Explicit `delete_stream()` is separate: it rejects an active producer and record
 
 ## Capacity limits
 
-`MessagingLimits` is immutable and enforced by both built-in backends before durable
-mutation. Defaults are 16 MiB per encoded message, 1 MiB per checkpoint, 100,000
-messages per thread generation, and 1 GiB of encoded payload per thread generation.
-`delete_stream()` starts a new generation with empty counters.
+`MessagingLimits` is immutable and enforced by both built-in backends before mutation.
+Defaults are 16 MiB per encoded message, 1 MiB per checkpoint position, 100,000 messages
+and 1 GiB of payload per thread generation, plus **1 GiB and 100,000 records in total**.
+The total scope is one `MemoryBackend` instance or one Redis `key_prefix`, including all
+channels. Set `max_total_bytes` and `max_total_records` to change these totals.
 
-Redis stores the complete limits fingerprint in channel metadata and tracks
-`payload_bytes` atomically with append and idempotency. Every worker sharing a key prefix
-and channel must use the same limits. A mismatch fails without changing existing state;
-an idempotent retry of an already committed message succeeds even when the thread is now
-at its quota.
+Total bytes include encoded payloads and retained checkpoint positions and message IDs
+as UTF-8. Each message retains its checkpoint evidence, and each Run also retains its
+latest checkpoint; replacing that latest checkpoint charges only the size difference.
+Total records count each channel, thread, live generation, Run, message, and generation
+tombstone once. These logical limits do not measure allocator or Redis key overhead.
 
-Redis also stores the retention fingerprint. Workers sharing a key prefix and channel
-must use the same retention policy; a mismatch fails before mutation.
+`MessagingQuotaExceeded.resource` identifies the exhausted limit. An idempotent retry
+of an existing message is not charged again. Exhaustion allows cancellation, settlement,
+and deletion to complete. Cleanup releases message and Run capacity and converts the
+generation record to its tombstone. Channel, thread, and tombstone records remain
+counted so empty Runs and repeated generations cannot grow without a bound.
+
+Retention is disabled by default. With `MessagingRetentionPolicy.expire_after(...)`,
+new Run and message writes reclaim a bounded batch of other threads' expired generations
+through the shared expiry index. No background task is required, and active or unexpired
+data is never evicted to make room. `delete_stream()` resets the thread counters while
+retaining its charged identity and tombstone records.
+
+Redis workers sharing a prefix must use the same total limits; workers sharing a channel
+must also agree on all other limits and retention. All channels under the prefix occupy
+one Redis Cluster hash slot so admissions and counters commit atomically. A mismatch
+fails before admission. These settings and counters never enter `MessageEnvelope`.
 
 ## Built-in codecs
 
@@ -232,6 +247,10 @@ Deep Agents or LangGraph mapping. Both codecs render durable SSE with the commit
 sequence as the event ID.
 
 ## Cancellation and cleanup
+
+`subscription.aclose()` detaches one subscriber without stopping its producer. It
+cancels and settles any active pull before closing backend resources. The waiting
+consumer receives `CancelledError`; repeated close calls await the same cleanup.
 
 A cancel callback accepts zero arguments or one `CancelContext(channel, identity)`. It may return a finite terminal tail. TinkerFin AG-UI streams already own their cancellation callback.
 

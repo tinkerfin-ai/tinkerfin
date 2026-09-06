@@ -88,12 +88,35 @@ content projects the final SystemMessage content from that Model request; it doe
 store a second payload. A request without a SystemMessage still has a timed Context event
 with no content. This interval describes observable preparation latency, not CPU usage.
 
+A proven Subagent's parent `task` Tool start establishes its preparation boundary.
+The Subagent opens once even when a child Model or Tool callback arrives before the
+first Native part; its start time remains the observed parent execution time.
+
 One logical Tool event combines proposal, post-review execution, ToolMessage result, and
 failure. A validated Deep Agents `task` execution is represented by its Subagent event,
 not by a second Tool event. Tracing has no Skill event: reading `SKILL.md` is an ordinary
 `read_file` Tool execution. Generic chain and middleware callbacks are not captured;
 middleware can publish an explicit semantic context event through
 `trace_contribution(...)` when its product behavior needs to be visible.
+
+A Tool keeps its proven Model association while execution updates its timing and actual
+input. Graph storage retains that relationship's source fact independently of request,
+result, and lifecycle facts, so each committed streaming prefix remains verifiable.
+
+An unfinished Assistant without a completed Model result retains the safe content
+actually received before Run settlement. Cancellation marks it `cancelled`, interruption
+marks it `waiting`, and other missing results are `abandoned`. A proven completed Model
+output stays `succeeded`; if no complete message snapshot was captured, its body is
+explicitly omitted as `incomplete_message`, even when some fragments were received.
+Complete message snapshots and independent approval waits retain their own state.
+A terminal Run also closes any still-running Assistant whose Ledger contains no message
+settlement; this supplies no missing content. Payload limits and explicit omission
+apply to accumulated responses.
+
+Graph completeness reports Runs whose call history cannot be established. A proven
+initialization failure retains its failed Run and input without creating Model or Tool
+calls, and does not make the call history incomplete. An untracked execution failure
+still reports missing call history, even when no call events were retained.
 
 The first HumanMessage inside a validated Subagent scope projects only the captured
 `task.description`. The Subagent request retains the complete captured task arguments;
@@ -119,6 +142,16 @@ namespace, thread, generation, selected head, filter, and Ledger tail; a newer c
 replaces the live cursor and invalidates any previously issued cursor instead of silently
 changing its page.
 
+Local commits wake followers of the exact thread generation. Cross-instance changes
+are checked every 0.5 seconds by default; configure `TraceStoreOptions.follow_poll_seconds`
+to change that interval. Each idle SQL check uses one bounded query for the generation,
+event tail, and active Run identities. Followers return the connection to the pool before
+waiting. Each MySQL read transaction provides a consistent snapshot without changing
+the session's isolation or autocommit setting. Writer close and lease expiry can change
+a Run to `unknown` with `missing_tail=True` without committing another event. A valid writer
+takeover can restore `running` at that same sequence; ownership does not imply an Agent
+terminal. Graph-only followers publish changes to committed call evidence.
+
 `TraceGraphQueryLimits` independently bounds direct matches, content-search candidates,
 Subagent-expanded nodes, and serialized page/update bytes. One query may select at most
 10,000 Runs in its lineage. Content search first applies indexed metadata, namespace, and
@@ -133,6 +166,19 @@ history handle's exact fixed prefix. `TraceThread.follow()` carries a
 `TraceUpdate.graph` delta with the same ordering contract. Current-tail history
 uses the disposable index; an older fixed prefix replays the same Graph reducer from the
 Ledger instead of storing another execution tree or payload copy.
+
+`TraceThread.observed_at` is the storage UTC time of the fixed view's event and ownership
+read. `TraceUpdate` includes `generation`, `as_of_seq`, and `observed_at`; status-only
+updates have empty `events` and `facts`. Within one generation, consumers compare
+`(as_of_seq, observed_at)` and retain timestamp precision. Equal observations with
+conflicting contents require a fresh read. History cursors retain the original view's
+ownership and observation time while expanding its event window.
+
+Custom Stores return `TraceStoreUpdate` from `TraceStore.follow()`, including current
+ownership in the first update even when there are no later events. Custom Ledger
+Backends provide `active_run_ids` and storage-clock `observed_at` together with the tail
+in `StoredTraceEventPage`; expired leases are excluded. The common `Tracer` calls need
+no additional parameters.
 
 The SQL Graph index stores only identity, relationship, filter, lifecycle, and Ledger
 sequence locators. Fact payloads remain solely in the Ledger and are decoded only for
@@ -238,8 +284,14 @@ duplicate search payload.
 
 Custom shared storage implements the five-operation `TraceLedgerBackend`; optional
 indexed Graph queries use `TraceGraphQueryBackend` and rebuilds use
-`TraceGraphRebuildBackend`. A codec may encrypt canonical fact and checkpoint bytes
-without changing their pre-transform digest. Runtime observers and Backend decorators
+`TraceGraphRebuildBackend`. Graph backends return indexed rows and relationship evidence;
+the Tracer derives call-history completeness from Run facts. A codec may encrypt
+canonical fact and checkpoint bytes without changing their pre-transform digest.
+
+Graph mutations supply `model_call_seq` together with `model_call_id` when establishing
+that relationship. Stored and decoded Graph records return `model_call_event` at that
+sequence; its fact must prove the association for the same node, scope, and Run lineage.
+Runtime observers and Backend decorators
 remain the integration points for telemetry or archival. The package does not provide
 an S3, KMS, or OpenTelemetry implementation.
 

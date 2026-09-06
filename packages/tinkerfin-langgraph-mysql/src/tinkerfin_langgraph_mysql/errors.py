@@ -10,10 +10,14 @@ from langgraph.store.mysql.errors import (
 from langgraph.store.mysql.errors import (
     LangGraphMySQLSchemaError as LangGraphMySQLSchemaError,
 )
+from langgraph.store.mysql.errors import (
+    LangGraphMySQLStoreClosedError as LangGraphMySQLStoreClosedError,
+)
 
 __all__ = [
     "LangGraphMySQLDriverError",
     "LangGraphMySQLError",
     "LangGraphMySQLErrorCode",
     "LangGraphMySQLSchemaError",
+    "LangGraphMySQLStoreClosedError",
 ]

@@ -177,7 +177,7 @@ class AgUiResumeCheckpoint:
 AgUiResumeCheckpointObserver: TypeAlias = Callable[
     [AgUiResumeCheckpoint], Awaitable[None]
 ]
-AgUiResumeInitializationFailureObserver: TypeAlias = Callable[[], Awaitable[None]]
+AgUiResumeNotSavedObserver: TypeAlias = Callable[[], Awaitable[None]]
 
 
 class AgUiResumeBinding(BaseModel):
@@ -615,7 +615,7 @@ __all__ = [
     "AgUiResumeBinding",
     "AgUiResumeCheckpoint",
     "AgUiResumeCheckpointObserver",
-    "AgUiResumeInitializationFailureObserver",
+    "AgUiResumeNotSavedObserver",
     "AgUiResumeRequest",
     "parse_resume_marker",
 ]

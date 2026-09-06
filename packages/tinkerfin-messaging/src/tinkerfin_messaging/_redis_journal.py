@@ -130,6 +130,8 @@ async def prepare(
                 keys.lease_key,
                 keys.index,
                 keys.signals,
+                self._capacity_key,
+                self._expirations_key,
             ],
             [
                 str(generation),
@@ -147,6 +149,8 @@ async def prepare(
                 str(self._limits.max_thread_messages),
                 str(self._limits.max_thread_payload_bytes),
                 str(self._retention_ms),
+                str(self._limits.max_total_bytes),
+                str(self._limits.max_total_records),
             ],
         )
         code = self._text(response[0])
@@ -169,6 +173,10 @@ async def prepare(
         if code == "INVALID_CONTROL_STATE":
             raise _redis_protocol_error(
                 f"Redis stream control has invalid state: {self._text(response[1])!r}"
+            )
+        if code == "QUOTA_EXCEEDED":
+            raise MessagingQuotaExceeded(
+                resource=self._text(response[1]), limit=int(self._text(response[2]))
             )
         if code == "LIMITS_MISMATCH":
             raise _redis_protocol_error(
@@ -302,6 +310,7 @@ async def append(
             keys.messages,
             dedupe,
             keys.index,
+            self._capacity_key,
         ],
         [
             str(generation),
@@ -319,6 +328,8 @@ async def append(
             else checkpoint.last_message_id,
             str(self._limits.max_thread_messages),
             str(self._limits.max_thread_payload_bytes),
+            str(self._limits.max_total_bytes),
+            str(self._limits.max_total_records),
         ],
     )
     code = self._text(response[0])
@@ -337,6 +348,10 @@ async def append(
         raise MessageIdConflict(
             identity=handle.identity,
             message_id=message_id,
+        )
+    if code == "LIMITS_MISMATCH":
+        raise _redis_protocol_error(
+            "Redis scope was opened with different total capacity limits"
         )
     if code == "QUOTA_EXCEEDED":
         raise MessagingQuotaExceeded(

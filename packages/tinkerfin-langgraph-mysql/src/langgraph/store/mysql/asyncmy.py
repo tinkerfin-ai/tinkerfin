@@ -1,10 +1,11 @@
 """Asyncmy-owned connection lifecycle for the current LangGraph MySQL Store."""
 
+import asyncio
 import urllib.parse
 from collections.abc import AsyncGenerator, Callable, Iterable
 from contextlib import asynccontextmanager
 from types import TracebackType
-from typing import Protocol, Self, cast
+from typing import Protocol, Self, TypedDict, cast
 
 from asyncmy import Connection
 from asyncmy import (
@@ -34,16 +35,99 @@ class _ConnectionContext(Protocol):
 _open_connection = cast(Callable[..., _ConnectionContext], _untyped_connect)
 
 
+class _ConnectionArguments(TypedDict):
+    """Typed connection arguments accepted by the asyncmy driver."""
+
+    host: str
+    user: str | None
+    password: str
+    db: str | None
+    port: int
+    unix_socket: str | None
+
+
+async def _close_owned_connection(
+    store: BaseAsyncMySQLStore[Connection, DictCursor] | None,
+    context: _ConnectionContext,
+    primary: BaseException | None,
+) -> None:
+    """Settle accepted operations before closing the connection on every exit."""
+    store_error: BaseException | None = None
+    if store is not None:
+        try:
+            await store.aclose()
+        except BaseException as error:  # noqa: BLE001 - always release owned connection
+            store_error = error
+    active_error = store_error if store_error is not None else primary
+    try:
+        await context.__aexit__(
+            None if active_error is None else type(active_error),
+            active_error,
+            None if active_error is None else active_error.__traceback__,
+        )
+    except AsyncMyError as error:
+        if active_error is not None:
+            active_error.add_note(
+                "The owned asyncmy connection also failed while closing "
+                f"({type(error).__name__})"
+            )
+        else:
+            raise LangGraphMySQLDriverError(
+                operation="close_connection", cause=error
+            ) from error
+    if store_error is not None:
+        if primary is not None and isinstance(store_error, Exception):
+            primary.add_note(
+                f"Store settlement also failed: {type(store_error).__name__}"
+            )
+        else:
+            raise store_error
+
+
+async def _settle_owned_close(task: asyncio.Task[None]) -> None:
+    """Retain close ownership until completion, then propagate caller cancellation."""
+    current = asyncio.current_task()
+    cancel_count = current.cancelling() if current is not None else 0
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as error:
+            next_count = current.cancelling() if current is not None else 0
+            if next_count > cancel_count:
+                cancellation = cancellation or error
+                cancel_count = next_count
+            elif not task.done():
+                raise
+        except BaseException:
+            if not task.done():
+                raise
+    close_error: BaseException | None = None
+    try:
+        task.result()
+    except BaseException as error:  # noqa: BLE001 - preserve cleanup outcome
+        close_error = error
+    if cancellation is not None:
+        if close_error is not None:
+            cancellation.add_note(
+                f"Store close also failed: {type(close_error).__name__}"
+            )
+        raise cancellation
+    if close_error is not None:
+        raise close_error
+
+
 class AsyncMyStore(BaseAsyncMySQLStore[Connection, DictCursor]):
     """Persist LangGraph Store documents through an asyncmy connection.
 
     ``from_conn_string()`` owns exactly one connection for the duration of its
-    asynchronous context. Direct construction borrows the supplied connection and
-    leaves its lifecycle with the caller.
+    asynchronous context. It settles accepted operations before closing that
+    connection. Direct construction borrows the supplied connection; ``aclose`` stops
+    the Store without closing the caller's connection or pool.
     """
 
     @staticmethod
-    def parse_conn_string(conn_string: str) -> dict[str, str | int | None]:
+    def parse_conn_string(conn_string: str) -> _ConnectionArguments:
         """Parse a MySQL URL into the keyword arguments accepted by asyncmy.
 
         Args:
@@ -115,6 +199,7 @@ class AsyncMyStore(BaseAsyncMySQLStore[Connection, DictCursor]):
             ) from error
 
         active_error: BaseException | None = None
+        store: Self | None = None
         try:
             store = cls(conn=conn)
             await store.setup()
@@ -126,23 +211,11 @@ class AsyncMyStore(BaseAsyncMySQLStore[Connection, DictCursor]):
             active_error = error
             raise
         finally:
-            try:
-                await connection_context.__aexit__(
-                    None if active_error is None else type(active_error),
-                    active_error,
-                    None if active_error is None else active_error.__traceback__,
-                )
-            except AsyncMyError as error:
-                if active_error is not None:
-                    active_error.add_note(
-                        "The owned asyncmy connection also failed while closing "
-                        f"({type(error).__name__})"
-                    )
-                else:
-                    raise LangGraphMySQLDriverError(
-                        operation="close_connection",
-                        cause=error,
-                    ) from error
+            close_task = asyncio.create_task(
+                _close_owned_connection(store, connection_context, active_error),
+                name="tinkerfin-langgraph-mysql-close",
+            )
+            await _settle_owned_close(close_task)
 
     @override
     async def setup(self) -> None:

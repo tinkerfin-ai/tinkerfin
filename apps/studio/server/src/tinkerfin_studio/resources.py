@@ -251,6 +251,8 @@ def build_lifespan():
                             ),
                         ),
                         config=OpenSandboxConfig(
+                            # 用户工作区跨会话保留，由明确的清理操作结束生命周期
+                            ttl=None,
                             workspace_root=sandbox_settings.workspace_root,
                             warm_pool_size=sandbox_settings.warm_pool_size,
                         ),

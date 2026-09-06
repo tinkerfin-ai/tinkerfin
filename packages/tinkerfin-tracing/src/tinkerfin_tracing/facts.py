@@ -40,7 +40,11 @@ class TurnFact(TraceFactBase):
 
 
 class RunFact(TraceFactBase):
-    """Describe one Runtime lifecycle phase without transport state."""
+    """Describe the root Runtime lifecycle without transport or Subagent state.
+
+    Run observations describe the whole invocation. Their namespace is always empty
+    and ``in_subagent_scope`` is false; child execution belongs to ``SubagentFact``.
+    """
 
     kind: Literal["run"] = "run"
     phase: Literal[
@@ -55,7 +59,15 @@ class RunFact(TraceFactBase):
     input_kind: RunInputKind | None = None
     parent_run_id: str | None = Field(default=None, min_length=1, max_length=1024)
     outcome: RunTerminalOutcome | None = None
-    code: str | None = Field(default=None, min_length=1, max_length=1024)
+    code: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=1024,
+        description=(
+            "Client-safe terminal code; runtime_initialization_error proves "
+            "that Agent execution did not start"
+        ),
+    )
     error_type: str | None = Field(default=None, min_length=1, max_length=1024)
     observer_name: str | None = Field(default=None, min_length=1, max_length=1024)
     interrupt_ids: tuple[str, ...] = ()
@@ -67,6 +79,8 @@ class RunFact(TraceFactBase):
     def phase_fields_are_consistent(self) -> RunFact:
         """Require the evidence needed to interpret each lifecycle phase."""
 
+        if self.namespace != () or self.in_subagent_scope is not False:
+            raise ValueError("Run lifecycle facts require the root scope")
         if self.phase == "started" and self.input_kind is None:
             raise ValueError("started Run facts require input_kind")
         if self.phase == "input" and self.input_kind not in {"ordinary", "branch"}:
@@ -103,10 +117,23 @@ class RunFact(TraceFactBase):
 
 
 class MessageFact(TraceFactBase):
-    """Append, reconcile, complete, or remove one scoped conversation message."""
+    """Record content and delivery state for one scoped conversation message.
+
+    A cancelled, interrupted, or abandoned Assistant retains only the content actually
+    observed before Run settlement. Those phases never assert a complete response.
+    """
 
     kind: Literal["message"] = "message"
-    phase: Literal["started", "content", "completed", "reconciled", "removed"]
+    phase: Literal[
+        "started",
+        "content",
+        "completed",
+        "reconciled",
+        "removed",
+        "cancelled",
+        "interrupted",
+        "abandoned",
+    ]
     message_id: str = Field(min_length=1, max_length=2048)
     source_message_id: str | None = Field(default=None, min_length=1, max_length=1024)
     role: Literal["user", "assistant", "tool", "system", "other"]
@@ -123,6 +150,10 @@ class MessageFact(TraceFactBase):
     def content_phase_is_explicit(self) -> MessageFact:
         """Require content ownership or an explicit Tool-result reference."""
 
+        if self.phase in {"cancelled", "interrupted", "abandoned"} and (
+            self.role != "assistant" or self.from_state_snapshot
+        ):
+            raise ValueError("settled message phases require an Assistant delivery")
         tool_result_reference = (
             self.phase == "reconciled"
             and self.role == "tool"

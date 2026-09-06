@@ -19,7 +19,8 @@ const historyMocks = vi.hoisted(() => ({
   list: vi.fn(),
 }))
 
-vi.mock('../../api/conversation/history', () => ({
+vi.mock(import('../../api/conversation/history'), async (importOriginal) => ({
+  ...await importOriginal(),
   fetchConversationHistoryDetail: historyMocks.detail,
   fetchConversationHistoryGroupConfig: historyMocks.groupConfig,
   fetchConversationHistoryList: historyMocks.list,
@@ -56,6 +57,8 @@ const detail = (
   lastModel: 'main',
   pinned: false,
   asOfSeq: 5,
+  generation: 'generation-test',
+  observedAt: '2026-09-05T00:00:00.000000Z',
   headRunId: RUN_ID,
   availableHeads: [RUN_ID],
   historyCursor: 'cursor-1',
@@ -176,6 +179,7 @@ function useHarness(
     advanceDelivery,
     advanceTrace,
     history,
+    followDetachedConversation,
     startOwnedRun,
     switchThread,
     workspace,
@@ -187,6 +191,130 @@ describe('useWorkspaceHistory Trace pagination authority', () => {
     vi.clearAllMocks()
     historyMocks.list.mockResolvedValue({ items: [], nextCursor: null })
     historyMocks.groupConfig.mockResolvedValue({ dayRanges: [] })
+  })
+
+  it('重新激活的历史详情不能覆盖等待期间新启动的本地 Run', async () => {
+    const response = deferred<ConversationHistoryDetail>()
+    historyMocks.detail.mockReturnValue(response.promise)
+    const initial = detail({ status: { execution: 'succeeded', headRunId: RUN_ID } })
+    const { result } = renderHook(() => useHarness(initial))
+    let refreshing: Promise<void> = Promise.resolve()
+    act(() => { refreshing = result.current.history.hydrateConversation(THREAD_ID, { refresh: true }) })
+    await waitFor(() => expect(historyMocks.detail).toHaveBeenCalledOnce())
+    act(() => result.current.startOwnedRun())
+    await act(async () => {
+      response.resolve(detail({ observedAt: '2026-09-05T00:00:02.000000Z' }))
+      await refreshing
+    })
+    const current = result.current.workspace.conversations[0]!
+    expect(current.runStatus).toBe('streaming')
+    expect(current.activeRunId).toBe('run-owned-new')
+    expect(current.messages[0]!.content).toBe('本次新输入')
+    expect(result.current.history.hydrationState).toBeNull()
+    await act(() => result.current.history.hydrateConversation(THREAD_ID, { refresh: true }))
+    expect(historyMocks.detail).toHaveBeenCalledOnce()
+  })
+
+  it('刷新合并并发触发，取消旧请求后允许重新激活且忽略迟到详情', async () => {
+    const response = deferred<ConversationHistoryDetail>()
+    historyMocks.detail.mockReturnValueOnce(response.promise)
+    const initial = detail({ status: { execution: 'succeeded', headRunId: RUN_ID } })
+    const { result } = renderHook(() => useHarness(initial))
+    const controller = new AbortController()
+    let refreshing: Promise<void> = Promise.resolve()
+    act(() => {
+      refreshing = result.current.history.hydrateConversation(THREAD_ID, {
+        refresh: true, signal: controller.signal,
+      })
+    })
+    await waitFor(() => expect(historyMocks.detail).toHaveBeenCalledOnce())
+    await act(() => result.current.history.hydrateConversation(THREAD_ID, { refresh: true }))
+    expect(historyMocks.detail).toHaveBeenCalledOnce()
+    const requestSignal = historyMocks.detail.mock.calls[0]![1].signal as AbortSignal
+    act(() => controller.abort())
+    expect(requestSignal.aborted).toBe(true)
+    historyMocks.detail.mockResolvedValueOnce(detail({
+      asOfSeq: 6, observedAt: '2026-09-05T00:00:03.000000Z',
+      status: { execution: 'succeeded', headRunId: RUN_ID },
+    }))
+    await act(() => result.current.history.hydrateConversation(THREAD_ID, { refresh: true }))
+    expect(result.current.workspace.conversations[0]?.trace?.asOfSeq).toBe(6)
+    await act(async () => {
+      response.resolve(detail({ asOfSeq: 8, observedAt: '2026-09-05T00:00:04.000000Z' }))
+      await refreshing
+    })
+    expect(result.current.workspace.conversations[0]?.trace?.asOfSeq).toBe(6)
+    expect(result.current.history.hydrationState).toBeNull()
+  })
+
+  it('刷新失败保持已有会话并提示可重试，下一次刷新可以恢复', async () => {
+    historyMocks.detail.mockRejectedValueOnce(new Error('offline'))
+    const onToast = vi.fn()
+    const initial = detail({ status: { execution: 'unknown', headRunId: RUN_ID } })
+    const { result } = renderHook(() => useHarness(initial, { onToast }))
+    await act(() => result.current.history.hydrateConversation(THREAD_ID, { refresh: true }))
+    expect(onToast).toHaveBeenCalledWith('error', '会话加载失败，请重试')
+    expect(result.current.workspace.conversations[0]?.trace?.status.execution).toBe('unknown')
+    historyMocks.detail.mockResolvedValueOnce(detail({ observedAt: '2026-09-05T00:00:01.000000Z' }))
+    await act(() => result.current.history.hydrateConversation(THREAD_ID, { refresh: true }))
+    expect(result.current.workspace.conversations[0]?.runStatus).toBe('detached')
+    expect(result.current.history.hydrationState).toBeNull()
+  })
+
+  it('重新激活时重验同一运行中的 Run，并重新连接已结束的会话观察', async () => {
+    const response = deferred<ConversationHistoryDetail>()
+    historyMocks.detail.mockReturnValueOnce(response.promise)
+    const { result } = renderHook(() => useHarness(detail()))
+    await waitFor(() => expect(result.current.followDetachedConversation).toHaveBeenCalledOnce())
+    let refreshing: Promise<void> = Promise.resolve()
+    act(() => { refreshing = result.current.history.hydrateConversation(THREAD_ID, { refresh: true }) })
+    await waitFor(() => expect(historyMocks.detail).toHaveBeenCalledOnce())
+    await act(async () => {
+      response.resolve(detail({ observedAt: '2026-09-05T00:00:01.000000Z' }))
+      await refreshing
+    })
+    await waitFor(() => expect(result.current.followDetachedConversation).toHaveBeenCalledTimes(2))
+  })
+
+  it('同一持久化前缀的刷新保留已展开历史，Run 前进后使用新的权威窗口', async () => {
+    const currentMessages = [{ ...detail().messages[0]!, traceSeq: 2 }]
+    const initial = detail({
+      historyCursor: null,
+      status: { execution: 'succeeded', headRunId: RUN_ID },
+      messages: [{ ...detail().messages[0]!, id: 'older-message', traceSeq: 1 }, ...currentMessages],
+    })
+    historyMocks.detail.mockResolvedValueOnce(detail({
+      observedAt: '2026-09-05T00:00:01.000000Z',
+      status: { execution: 'succeeded', headRunId: RUN_ID },
+      messages: currentMessages,
+    }))
+    const { result } = renderHook(() => useHarness(initial))
+    await act(() => result.current.history.hydrateConversation(THREAD_ID, { refresh: true }))
+    expect(result.current.workspace.conversations[0]?.trace?.messages).toHaveLength(2)
+    expect(result.current.workspace.conversations[0]?.trace?.historyCursor).toBeNull()
+    expect(result.current.workspace.conversations[0]?.trace?.observedAt).toBe('2026-09-05T00:00:01.000000Z')
+    historyMocks.detail.mockResolvedValueOnce(detail({
+      asOfSeq: 6,
+      observedAt: '2026-09-05T00:00:02.000000Z',
+      status: { execution: 'succeeded', headRunId: RUN_ID },
+      messages: currentMessages,
+    }))
+    await act(() => result.current.history.hydrateConversation(THREAD_ID, { refresh: true }))
+    expect(result.current.workspace.conversations[0]?.trace?.messages).toHaveLength(1)
+    expect(result.current.workspace.conversations[0]?.trace?.asOfSeq).toBe(6)
+  })
+
+  it('刷新拒绝同一持久化前缀中的实体冲突，并保留已知内容', async () => {
+    const initial = detail({ status: { execution: 'succeeded', headRunId: RUN_ID } })
+    historyMocks.detail.mockResolvedValueOnce(detail({
+      observedAt: '2026-09-05T00:00:01.000000Z',
+      messages: [{ ...initial.messages[0]!, content: '冲突内容' }],
+    }))
+    const onToast = vi.fn()
+    const { result } = renderHook(() => useHarness(initial, { onToast }))
+    await act(() => result.current.history.hydrateConversation(THREAD_ID, { refresh: true }))
+    expect(result.current.workspace.conversations[0]?.trace?.messages).toEqual(initial.messages)
+    expect(onToast).toHaveBeenCalledWith('error', '会话加载失败，请重试')
   })
 
   it('discards an old fixed-as-of page after follow advances the Trace', async () => {
@@ -226,6 +354,38 @@ describe('useWorkspaceHistory Trace pagination authority', () => {
     expect(current?.trace?.asOfSeq).toBe(6)
     expect(current?.runStatus).toBe('idle')
     expect(current?.messages[0]?.content).toBe('并发终态内容')
+  })
+
+  it('adds fixed-prefix history without reverting a same-sequence ownership update', async () => {
+    const response = deferred<ConversationHistoryDetail>()
+    historyMocks.detail.mockReturnValue(response.promise)
+    const initial = detail()
+    const newer = detail({
+      observedAt: '2026-09-05T00:00:00.000001Z',
+      status: { execution: 'unknown', headRunId: RUN_ID },
+      completeness: { ...initial.completeness, missingTail: true },
+    })
+    const olderPage = detail({
+      historyCursor: 'cursor-2',
+      messages: [{ ...initial.messages[0]!, id: 'older-message', content: '历史内容' }, ...initial.messages],
+    })
+    const { result } = renderHook(() => useHarness(initial))
+    let loading: Promise<boolean> = Promise.resolve(false)
+    act(() => { loading = result.current.history.loadOlderTrace(THREAD_ID) })
+    await waitFor(() => expect(historyMocks.detail).toHaveBeenCalledOnce())
+    act(() => result.current.advanceTrace(newer))
+    let loaded = false
+    await act(async () => {
+      response.resolve(olderPage)
+      loaded = await loading
+    })
+    const current = result.current.workspace.conversations[0]
+    expect(loaded).toBe(true)
+    expect(current?.trace?.observedAt).toBe(newer.observedAt)
+    expect(current?.runStatus).toBe('error')
+    expect(current?.trace?.completeness.missingTail).toBe(true)
+    expect(current?.trace?.historyCursor).toBe('cursor-2')
+    expect(current?.messages[0]?.content).toBe('历史内容')
   })
 
   it('discards an old page after an owned run starts before Trace advances', async () => {

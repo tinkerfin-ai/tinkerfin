@@ -545,7 +545,7 @@ class SQLAlchemyOpenSandboxState(OpenSandboxState):
 
     @_state_operation("warm_pool_ready")
     async def warm_pool_ready(self) -> bool:
-        """Return whether every configured slot is published and unclaimed."""
+        """Return whether every configured slot retains a published Sandbox."""
 
         return await _sql_state_ops.warm_pool_ready(self)
 

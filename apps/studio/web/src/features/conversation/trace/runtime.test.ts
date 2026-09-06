@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import type { ConversationHistoryDetail } from '../../../api/conversation/history'
+import type { ConversationHistoryDetail, ConversationTraceUpdate } from '../../../api/conversation/history'
 import { applyConversationTraceUpdate, restoreConversationFromTrace } from './runtime'
 
 const detail = (): ConversationHistoryDetail => ({
@@ -10,6 +10,8 @@ const detail = (): ConversationHistoryDetail => ({
   lastModel: 'main',
   pinned: false,
   asOfSeq: 8,
+  generation: 'generation-test',
+  observedAt: '2026-09-05T00:00:00.000000Z',
   headRunId: 'run-1',
   availableHeads: ['run-1'],
   historyCursor: null,
@@ -127,6 +129,97 @@ const detail = (): ConversationHistoryDetail => ({
 })
 
 describe('Trace conversation projection', () => {
+  it('orders HTTP snapshots within one millisecond and allows observed owner recovery', () => {
+    const first = detail()
+    first.status = { execution: 'running', headRunId: first.headRunId }
+    const lost: ConversationHistoryDetail = {
+      ...first, observedAt: '2026-09-05T00:00:00.000002Z',
+      status: { execution: 'unknown', headRunId: first.headRunId },
+      completeness: { ...first.completeness, missingTail: true },
+    }
+    const current = restoreConversationFromTrace(lost, { model: 'main', includeTaskTrace: true })
+    const stale = { ...first, observedAt: '2026-09-05T00:00:00.000001Z' }
+    expect(restoreConversationFromTrace(stale, {
+      previous: current, model: 'main', includeTaskTrace: true,
+    })).toBe(current)
+    expect(() => restoreConversationFromTrace({ ...first, observedAt: lost.observedAt }, {
+      previous: current, model: 'main', includeTaskTrace: true,
+    })).toThrow('stream_event_invalid')
+    const recovered = restoreConversationFromTrace({
+      ...first, observedAt: '2026-09-05T00:00:00.000003Z',
+    }, { previous: current, model: 'main', includeTaskTrace: true })
+    expect(recovered.runStatus).toBe('detached')
+    expect(recovered.trace?.completeness.missingTail).toBe(false)
+  })
+
+  it('rejects conflicting contents at an identical observation', () => {
+    const source = detail()
+    const current = restoreConversationFromTrace(source, { model: 'main', includeTaskTrace: true })
+    for (const conflicting of [
+      { ...source, messageCount: source.messageCount + 1 },
+      { ...source, state: { root: { changed: true }, subgraphs: {} } },
+      { ...source, messages: [{ ...source.messages[0]!, content: '矛盾内容' }, ...source.messages.slice(1)] },
+    ]) {
+      expect(() => restoreConversationFromTrace(conflicting, {
+        previous: current, model: 'main', includeTaskTrace: true,
+      })).toThrow('stream_event_invalid')
+    }
+  })
+
+  it('applies ownership changes at the same sequence without replaying content', () => {
+    const source = detail()
+    source.status = { execution: 'running', headRunId: source.headRunId }
+    const initial = restoreConversationFromTrace(source, {
+      model: 'main', includeTaskTrace: true, lastDeliveredSeq: 73,
+    })
+    const update: ConversationTraceUpdate = {
+      asOfSeq: source.asOfSeq,
+      generation: source.generation,
+      observedAt: '2026-09-05T00:00:00.000001Z',
+      events: [],
+      facts: [],
+      messages: { upserts: [], removes: [] },
+      reasoning: { upserts: [], removes: [] },
+      interactions: { upserts: [], removes: [] },
+      graph: {
+        asOfSeq: source.asOfSeq,
+        nextCursor: null,
+        turnUpserts: [],
+        turnRemoves: [],
+        nodeUpserts: [],
+        nodeRemoves: [],
+        orderedNodeIds: source.graph.orderedNodeIds,
+        matchedNodeIds: source.graph.matchedNodeIds,
+        completeness: source.graph.completeness,
+      },
+      state: source.state,
+      status: { execution: 'unknown', headRunId: source.headRunId },
+      completeness: { ...source.completeness, missingTail: true },
+      messageCount: source.messageCount,
+      toolCallCount: source.toolCallCount,
+      projections: {},
+    }
+
+    const updated = applyConversationTraceUpdate(initial, update, null, true)
+    expect(updated.runStatus).toBe('error')
+    expect(updated.activeRunId).toBeUndefined()
+    expect(updated.trace?.completeness.missingTail).toBe(true)
+    expect(updated.trace?.asOfSeq).toBe(source.asOfSeq)
+    expect(updated.trace?.messages).toEqual(source.messages)
+    expect(updated.trace?.graph).toEqual(source.graph)
+    expect(updated.lastSeq).toBe(73)
+    const repeated = applyConversationTraceUpdate(updated, update, null, true)
+    expect(repeated.messages).toEqual(updated.messages)
+    expect(repeated.trace).toEqual(updated.trace)
+    expect(applyConversationTraceUpdate(updated, {
+      ...update, asOfSeq: source.asOfSeq - 1, status: source.status,
+    }, null, true)).toBe(updated)
+    expect(() => applyConversationTraceUpdate(updated, {
+      ...update,
+      messages: { upserts: [{ ...source.messages[1]!, content: '不应替换' }], removes: [] },
+    }, null, true)).toThrow('stream_event_invalid')
+  })
+
   it('hydrates messages, tools, reasoning, todos and status without AG-UI replay', () => {
     const restored = restoreConversationFromTrace(detail(), { model: 'fallback', includeTaskTrace: true })
 
@@ -331,6 +424,8 @@ describe('Trace conversation projection', () => {
 
     const updated = applyConversationTraceUpdate(initial, {
       asOfSeq: 10,
+      generation: 'generation-test',
+      observedAt: '2026-09-05T00:00:00.000001Z',
       events: [],
       facts: [],
       messages: {

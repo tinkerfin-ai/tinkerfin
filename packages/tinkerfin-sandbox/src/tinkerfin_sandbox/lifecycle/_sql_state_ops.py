@@ -418,7 +418,7 @@ async def discard_ready_warm_slot(
 
 
 async def warm_pool_ready(self: SQLAlchemyOpenSandboxState) -> bool:
-    """Return whether every configured slot has an unclaimed published Sandbox."""
+    """Return whether every configured slot retains a published Sandbox."""
 
     self._ensure_open()
     async with self._engine.connect() as connection:
@@ -428,7 +428,6 @@ async def warm_pool_ready(self: SQLAlchemyOpenSandboxState) -> bool:
             .where(
                 _warm_slots.c.namespace == self._namespace,
                 _warm_slots.c.sandbox_id.is_not(None),
-                _warm_slots.c.claim_token.is_(None),
             )
         )
     return int(ready or 0) == self._warm_pool_size

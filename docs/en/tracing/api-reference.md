@@ -108,8 +108,11 @@ publishes `TraceUpdate.graph` as a `TraceGraphDelta`; history and query paths sh
 flat, Subagent-scoped timeline model. Current-tail history reads the disposable Graph
 index, while an older fixed prefix replays the same reducer from Ledger facts.
 
-`TraceGraphCompleteness` distinguishes missing callback evidence, missing relationship
-evidence, and details omitted by capture or response limits.
+`TraceGraphCompleteness` distinguishes unknown call history, missing relationship
+evidence, and details omitted by capture or response limits. `call_tracking_missing`
+excludes pre-execution initialization failures proven by a `runtime_initialization_error`
+terminal. Other untracked Runs remain incomplete; failure or absent call events alone
+does not establish complete history.
 
 ## Query limits
 
@@ -175,6 +178,19 @@ chain. The final safety pass cannot be disabled.
 
 ## Storage interfaces
 
+`RunFact` describes the whole Runtime invocation. Its `namespace` must be empty and
+`in_subagent_scope` must be false; child execution uses `SubagentFact`. Construction
+rejects another scope. A writer also rejects invalid Run scope atomically before
+committing any fact in a batch, including input made through unchecked model copying.
+
+`MessageFact.phase` is `started`, `content`, `completed`, `reconciled`, `removed`,
+`cancelled`, `interrupted`, or `abandoned`. The last three describe an unfinished
+Assistant delivery at Run settlement and may carry its retained partial content;
+they cannot represent state snapshots or another message role. `TraceMessage.status`
+uses `completed` when delivery ends or pauses. The Graph separately records its
+success, cancellation, waiting, or abandonment. A resumed delivery can become
+`streaming` again without duplicating already retained content.
+
 `SubagentFact` uses `started/running`, `updated/waiting`, and `completed` with
 `succeeded`, `failed`, `cancelled`, or `abandoned`. Only `started` carries `input`,
 `parent_tool_call_id`, `parent_execution_id`, and `model_call_id`. Later facts keep
@@ -192,3 +208,9 @@ the same `subagent_id` and namespace and inherit the opening request and relatio
 
 The low-level writer persists already captured facts. Mandatory framework and business
 redaction is guaranteed on the `Tracer` path, where source context is available.
+
+`TraceGraphNodeMutation` supplies `model_call_seq` together with `model_call_id` when it
+establishes a Model association. `StoredTraceGraphNode` and `TraceGraphNodeRecord` retain
+that sequence and its `model_call_event` independently of lifecycle and payload locators.
+The referenced fact must establish the same node's association in the selected scope and
+Run lineage; an unrelated Model fact or a later input update is not sufficient evidence.

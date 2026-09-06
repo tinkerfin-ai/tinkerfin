@@ -7,6 +7,7 @@ import logging
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Literal
 
 from ag_ui.core import BaseEvent
 from ag_ui.core.types import ResumeEntry
@@ -14,6 +15,7 @@ from ag_ui.core.types import ResumeEntry
 from tinkerfin import AgUiResumeCheckpoint, RunIdentity
 from tinkerfin_messaging import RunNotFound, is_active_run_status
 from tinkerfin_messaging.messaging import MessageChannel
+from tinkerfin_studio.api.errors import ConversationErrorCode, SystemException
 from tinkerfin_studio.infrastructure.database import Database
 from tinkerfin_tracing import (
     Tracer,
@@ -28,6 +30,7 @@ from .repository import ConversationRepository
 _STALE_PREPARING_SECONDS = 30
 _FOLLOW_RETRY_INITIAL_SECONDS = 0.05
 _FOLLOW_RETRY_MAX_SECONDS = 2.0
+_SUMMARY_REFRESH_TIMEOUT_SECONDS = 2.0
 logger = logging.getLogger(__name__)
 
 
@@ -78,12 +81,31 @@ class ConversationTraceCoordinator:
     async def reconcile(self, *, thread_pk: int, identity: RunIdentity) -> int:
         """读取固定 Trace 前缀并同步列表摘要"""
 
-        trace = await self._tracer.get(
-            identity.thread_id,
-            head_run_id=identity.run_id,
-        )
-        await self._persist_thread(thread_pk=thread_pk, trace=trace)
-        return trace.as_of_seq
+        return (
+            await self._reconcile_view(thread_pk=thread_pk, identity=identity)
+        ).as_of_seq
+
+    async def _reconcile_view(
+        self, *, thread_pk: int, identity: RunIdentity
+    ) -> TraceThread:
+        # 短事务只比较存储提供的顺序；相同时间精度内的冲突必须取得新观测后再结算
+        try:
+            async with asyncio.timeout(_SUMMARY_REFRESH_TIMEOUT_SECONDS):
+                while True:
+                    trace = await self._tracer.get(
+                        identity.thread_id,
+                        head_run_id=identity.run_id,
+                    )
+                    result = await self._persist_thread(
+                        thread_pk=thread_pk, trace=trace
+                    )
+                    if result == "applied":
+                        return trace
+                    if result == "generation_conflict":
+                        raise SystemException(ConversationErrorCode.TRACE_UNAVAILABLE)
+                    await asyncio.sleep(_FOLLOW_RETRY_INITIAL_SECONDS)
+        except TimeoutError as error:
+            raise SystemException(ConversationErrorCode.TRACE_UNAVAILABLE) from error
 
     async def settle_resume(
         self,
@@ -231,31 +253,35 @@ class ConversationTraceCoordinator:
     ) -> bool:
         """从一个最新固定前缀恢复，并报告是否已经到达终态"""
 
-        trace = await self._tracer.get(
-            identity.thread_id,
-            head_run_id=identity.run_id,
-        )
-        await self._persist_thread(thread_pk=thread_pk, trace=trace)
+        trace = await self._reconcile_view(thread_pk=thread_pk, identity=identity)
         if trace.summary.status.execution != "running":
             return True
         updates = trace.follow()
         try:
             async for update in updates:
-                await self._persist_update(
+                result = await self._persist_update(
                     thread_pk=thread_pk,
                     update=update,
                     generation=trace.key.generation,
                 )
+                if result != "applied":
+                    # 迟到或不可比较的快照不能决定 follow 终止；下一轮重新获取权威观测
+                    return False
                 if update.summary.status.execution != "running":
                     return True
         finally:
             await updates.aclose()
         return False
 
-    async def _persist_thread(self, *, thread_pk: int, trace: TraceThread) -> None:
+    async def _persist_thread(
+        self,
+        *,
+        thread_pk: int,
+        trace: TraceThread,
+    ) -> Literal["applied", "stale", "ambiguous", "generation_conflict"]:
         summary = trace.summary
         pending = summary.pending_interactions
-        await self._write_summary(
+        return await self._write_summary(
             thread_pk=thread_pk,
             run_id=trace.head_run_id,
             execution=summary.status.execution,
@@ -265,6 +291,9 @@ class ConversationTraceCoordinator:
             pending_interaction_kind=_pending_kind(item.kind for item in pending),
             updated_at=_database_time(summary.last_occurred_at),
             settlement_id=f"trace:{trace.key.generation}:{trace.as_of_seq}",
+            generation=trace.key.generation,
+            as_of_seq=trace.as_of_seq,
+            observed_at=trace.observed_at,
         )
 
     async def _persist_update(
@@ -273,10 +302,10 @@ class ConversationTraceCoordinator:
         thread_pk: int,
         update: TraceUpdate,
         generation: str,
-    ) -> None:
+    ) -> Literal["applied", "stale", "ambiguous", "generation_conflict"]:
         summary = update.summary
         pending = summary.pending_interactions
-        await self._write_summary(
+        return await self._write_summary(
             thread_pk=thread_pk,
             run_id=summary.status.head_run_id,
             execution=summary.status.execution,
@@ -286,6 +315,9 @@ class ConversationTraceCoordinator:
             pending_interaction_kind=_pending_kind(item.kind for item in pending),
             updated_at=_database_time(summary.last_occurred_at),
             settlement_id=f"trace:{generation}:{update.as_of_seq}",
+            generation=generation,
+            as_of_seq=update.as_of_seq,
+            observed_at=update.observed_at,
         )
 
     async def _write_summary(
@@ -300,11 +332,14 @@ class ConversationTraceCoordinator:
         pending_interaction_kind: str | None,
         updated_at: datetime,
         settlement_id: str,
-    ) -> None:
+        generation: str,
+        as_of_seq: int,
+        observed_at: datetime,
+    ) -> Literal["applied", "stale", "ambiguous", "generation_conflict"]:
         status, outcome = _summary_status(execution, has_pending_interrupt)
         async with self._database.session() as session:
             repository = ConversationRepository(session)
-            await repository.update_trace_summary(
+            result = await repository.update_trace_summary(
                 thread_pk=thread_pk,
                 run_id=run_id,
                 status=status,
@@ -314,14 +349,18 @@ class ConversationTraceCoordinator:
                 pending_interaction_kind=pending_interaction_kind,
                 terminal_outcome=outcome,
                 updated_at=updated_at,
+                trace_generation=generation,
+                trace_as_of_seq=as_of_seq,
+                trace_observed_at=_database_time(observed_at),
             )
-            if outcome == "abandoned":
+            if result == "applied" and outcome == "abandoned":
                 await repository.cancel_claims(
                     thread_pk=thread_pk,
                     run_id=run_id,
                     resolution_id=settlement_id,
                 )
             await repository.commit()
+        return result
 
     def _finished(
         self,
@@ -344,6 +383,8 @@ def _summary_status(execution: str, pending: bool) -> tuple[str, str | None]:
         return "idle", "succeeded"
     if execution in {"cancelled", "abandoned"}:
         return "idle", execution
+    if execution == "unknown":
+        return "error", None
     return "error", "failed"
 
 

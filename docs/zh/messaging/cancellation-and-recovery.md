@@ -172,6 +172,10 @@ mapped = map_source(source, enrich)
 mapped source 或 subscription 关闭时，即使调用方被取消，底层 close task 仍由对象持有。后续
 `aclose()` 会等待同一 task；backend iterator 不会在 close 尚未完成时丢失。
 
+一个订阅只允许一次正在进行的拉取。调用 `subscription.aclose()` 会先取消并结算该次拉取，再关闭
+解码与后端迭代器；等待下一条消息的消费方会收到 `CancelledError`。生产者继续独立运行，后续订阅
+仍可重播已提交的消息。
+
 ## 进程失效后恢复 source
 
 如果 source 可以从稳定位置重建，实现 `RecoverableSource` 并使用 `wrap_recoverable()`：

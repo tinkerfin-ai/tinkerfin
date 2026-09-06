@@ -282,7 +282,7 @@ describe('前端视觉契约', () => {
     expect(conversationStyles).toMatch(/\.composer\s*\{[^}]*width:\s*min\(100%, var\(--layout-composer-width\)\);[^}]*min-height:\s*var\(--layout-composer-surface-height\);/s)
     expect(conversationStyles).toMatch(/\.approval-composer,[\s\S]*\.plan-review-composer\s*\{[^}]*width:\s*min\(100%, var\(--layout-composer-width\)\);/s)
     expect(conversationStyles).toMatch(/\.approval-composer,[\s\S]*\.plan-review-composer\s*\{[^}]*height:\s*var\(--interaction-card-height, var\(--layout-interaction-card-min-height\)\);[^}]*min-height:\s*var\(--layout-interaction-card-min-height\);[^}]*max-height:\s*var\(--layout-interaction-card-max-height\);/s)
-    expect(conversationStyles).toMatch(/\.composer-dock\.is-taken-over\s*\{[^}]*grid-row:\s*3;[^}]*padding-top:\s*var\(--layout-interaction-card-gap\);/s)
+    expect(conversationStyles).toMatch(/\.composer-dock\.is-taken-over\s*\{[^}]*--composer-top-inset:\s*var\(--layout-interaction-card-gap\);[^}]*grid-row:\s*3;/s)
     expect(conversationStyles).toMatch(/\.composer-dock\.is-taken-over::before\s*\{[^}]*display:\s*none;/s)
     expect(conversationStyles).toMatch(/\.plan-question-composer\.is-minimized\s*\{[^}]*height:\s*auto;[^}]*min-height:\s*var\(--layout-composer-surface-height\);[^}]*max-height:\s*none;/s)
     const minimizedSurfaceRule = conversationStyles.match(
@@ -552,7 +552,7 @@ describe('前端视觉契约', () => {
       /\.message-list\s*\{[^}]*padding:[^;}]*var\(--composer-height\);/s,
     )
     expect(conversationStyles).toMatch(
-      /\.composer-auxiliary-controls\s*\{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*minmax\(0, 1fr\) auto minmax\(0, 1fr\);[^}]*width:\s*min\(100%, var\(--layout-composer-width\)\);[^}]*align-items:\s*center;/s,
+      /\.composer-auxiliary-controls\s*\{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*minmax\(0, 1fr\) auto minmax\(0, 1fr\);[^}]*width:\s*min\(calc\(100% - 2 \* var\(--composer-inline-inset\)\), var\(--layout-composer-width\)\);[^}]*align-items:\s*center;/s,
     )
     expect(conversationStyles).toMatch(/\.composer-scroll-to-bottom-control\s*\{[^}]*grid-column:\s*2;[^}]*justify-self:\s*center;/s)
     expect(conversationStyles).toMatch(/\.composer-task-trace-control\s*\{[^}]*grid-column:\s*3;[^}]*justify-self:\s*end;/s)

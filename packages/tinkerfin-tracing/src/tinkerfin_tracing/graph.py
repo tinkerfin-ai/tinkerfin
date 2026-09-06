@@ -484,7 +484,13 @@ def canonical_trace_graph_node_order(
 class TraceGraphCompleteness(TraceModel):
     """Expose missing call or relationship evidence without inventing events."""
 
-    call_tracking_missing: bool = False
+    call_tracking_missing: bool = Field(
+        default=False,
+        description=(
+            "Some selected Runs lack call tracking and have no proven failure "
+            "before Agent execution"
+        ),
+    )
     relationship_evidence_missing: bool = False
     details_omitted: bool = False
 

@@ -41,7 +41,7 @@ messaging = Messaging(backend=backend)
 | `key_prefix` | `tinkerfin-messaging` | 当前应用独占的 Redis key 前缀 |
 | `producer_lease_seconds` | `15.0` | Redis 时钟上的生产者所有权持续秒数 |
 | `generation_cleanup_retry_seconds` | `0.1` | generation 清理所有权的重试间隔秒数 |
-| `limits` | `MessagingLimits()` | 编码 Payload、checkpoint、消息数和 thread 字节上限 |
+| `limits` | `MessagingLimits()` | 单条、单线程和保留数据总量上限 |
 | `retention_policy` | 关闭 | thread generation 终态后的重播窗口 |
 
 Redis client 是调用方提供的资源，应用关闭时自行关闭。连接池容量要覆盖同时等待消息、等待取消和普通命令的连接数。
@@ -83,14 +83,27 @@ durable scope。Native Runtime source 还会通过 `MessageCodecInputSource` 转
 `NativeStreamPart`，codec 不会再次解析 live 上游 Mapping。自定义 source 必须显式配置 codec，
 并在调用时提供 RunIdentity。
 
-RedisBackend 保存完整 limits fingerprint、每个 generation 的 `payload_bytes`，以及当前 owner 和
-上一个 owner 的成功续租次数与 UTC 时间，仅用于可信故障取证。共享同一 channel 的 worker 必须
-使用完全相同的 limits 与 retention policy。配额检查与计数会在 message ID 幂等检查后，与 append 原子完成；
+RedisBackend 保存限额、每个 generation 的 Payload 计数，以及当前和上一个 owner 的成功
+续租次数与 UTC 时间，用于可信故障取证。共享同一 channel 的 worker 必须使用相同的全部
+限额和保留策略；共享同一 `key_prefix` 的 worker 必须使用相同的总限额。同一前缀下的所有
+channel 位于一个 Redis Cluster hash slot，容量准入、写入和计数在同一事务中完成。
 这些字段不会进入 `MessageEnvelope`。
 
-默认上限为：单条编码消息 16 MiB、checkpoint 1 MiB、每个 thread generation 100,000 条消息，
-以及每个 thread generation 1 GiB 编码 Payload。自定义 backend 通过
-`messaging_settings` 提供同一不可变 limits，并在修改数据前拒绝超额写入。
+默认上限为单条编码消息 16 MiB、checkpoint position 1 MiB、每个 thread generation
+100,000 条消息与 1 GiB Payload，以及每个 MemoryBackend 实例或 Redis 前缀合计
+1 GiB 字节和 100,000 条记录。通过 `MessagingLimits.max_total_bytes` 和
+`max_total_records` 调整总限额。
+
+总字节包括编码 Payload、每条消息保留的 checkpoint 证据，以及每个 Run 最新的 checkpoint。
+checkpoint 按 position 和 UTF-8 消息 ID 的字节数计费；替换 Run 最新 checkpoint 时只计算差额。
+每个 channel、thread、存活 generation、Run、消息和墓碑各计一条记录。这是逻辑存储限额，
+不是 Python 或 Redis 实际分配内存的测量值。自定义 backend 通过 `messaging_settings`
+提供相同的限额，并在修改数据前拒绝超额写入。
+
+已提交消息的幂等重试不会重复计费。`MessagingQuotaExceeded` 标明耗尽的资源；满额时仍可
+取消、结算和删除。清理释放消息和 Run 占用，并将 generation 记录转为墓碑；channel、thread
+和墓碑仍占用记录配额。自动过期默认关闭，显式开启后，新写入会通过有界到期索引回收其他
+已到期线程，无需再次访问原线程或启动后台任务；不会为腾出空间驱逐活跃或未到期历史。
 
 ## 自定义消息格式
 

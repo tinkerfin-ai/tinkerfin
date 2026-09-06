@@ -38,6 +38,9 @@ RUN_FINISHED
 
 有工具调用时，文字和工具事件可能交错；并行工具也可能同时处于开放状态。只要按 ID 更新各自的 UI 即可。
 
+工具参数片段不会结束同一模型消息的文字输出。即使工具片段之后还有文字，这条消息也只开始
+和结束一次。工具事件中的父消息 ID 与消息快照中的身份保持一致。
+
 ## 主 Agent 和子 Agent
 
 子 Agent 来自非根 namespace。转换器会保留完整 namespace 和来源信息，避免不同子 Agent 的消息、工具和状态混在一起。
@@ -70,6 +73,8 @@ events = await tinkerfin.open_agui_run(
 你可能收到 `REASONING_START`、`REASONING_MESSAGE_*` 和 `REASONING_END`。不是所有模型都会产生可公开的推理事件，也不能假设内容为空的模型 chunk 就是心跳。
 
 无论开关是否启用，provider 私有推理元数据都不会作为普通状态、消息或 raw payload 直接公开。
+该规则也覆盖公开中断元数据的每一份副本，包括持久化的恢复关联信息。无关的业务字段仍会保留，
+用于响应校验。
 
 ## `messages`、`tasks`、`values` 分别做什么
 

@@ -40,7 +40,10 @@ The observation union contains:
   values;
 - stable full namespace, IDs, UTC time, and monotonic clock evidence.
 
-Runtime observers receive live immutable models rather than captured Python `repr`.
+Runtime observers receive validated models rather than captured Python `repr`.
+JSON fields reject non-finite numbers during Python and JSON validation. Model fields
+cannot be reassigned, but nested dictionaries and lists remain mutable. Treat received
+evidence as read-only; the Runtime supplies an independent copy to each observer.
 `Command(resume=...)` remains invocation input and is represented only through the
 protocol-neutral Run source summary and checkpoint Observation.
 

@@ -13,7 +13,7 @@ class RunObservationSession(Protocol):
     """Own observation work and failure propagation for one Runtime request."""
 
     async def observe(self, observation: RuntimeObservation) -> None:
-        """Accept one immutable observation in Runtime order."""
+        """Accept one observation in Runtime order and treat its values as read-only."""
 
         ...
 

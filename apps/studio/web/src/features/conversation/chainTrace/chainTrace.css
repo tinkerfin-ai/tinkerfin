@@ -961,10 +961,11 @@
   .chain-trace-summary dd { min-width: 0; margin: 0; color: var(--color-text-secondary); overflow-wrap: anywhere; }
   .chain-trace-error-panel {
     display: grid;
-    grid-template-columns: calc(var(--space-6) + var(--space-1)) minmax(0, 1fr);
-    gap: calc(var(--space-2) + var(--space-0-5));
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: center;
+    gap: var(--space-2);
     margin-bottom: calc(var(--space-3) + var(--space-0-5));
-    padding: var(--space-3);
+    padding: var(--space-2) var(--space-3);
     border: 1px solid color-mix(in srgb, var(--color-danger) 24%, transparent);
     border-radius: var(--radius-md);
     background: var(--color-danger-soft);
@@ -972,9 +973,35 @@
   }
 
   .chain-trace-error-panel > svg { color: var(--color-danger); }
-  .chain-trace-error-panel strong { display: block; }
+  .chain-trace-error-panel strong { display: block; overflow-wrap: anywhere; font-size: var(--type-meta-size); font-weight: var(--weight-medium); }
   .chain-trace-error-panel p { margin: 0; font-size: var(--type-caption-size); line-height: var(--type-caption-line); }
-  .chain-trace-error-panel .ui-button { width: fit-content; margin-top: var(--space-1); }
+  .chain-trace-error-panel .ui-button { width: fit-content; margin: 0; }
+
+  .chain-trace-feedback-action.ui-button {
+    padding-inline: var(--space-1);
+    color: var(--color-text-secondary);
+    font-size: var(--type-meta-size);
+    font-weight: var(--weight-medium);
+    border: 0;
+    box-shadow: none;
+    background: transparent;
+  }
+  .chain-trace-feedback-action.ui-button:hover:not(:disabled) { background: transparent; color: var(--color-brand-text); }
+  .chain-trace-feedback-action.ui-button:active:not(:disabled) { background: transparent; color: var(--color-text-primary); }
+  :is(.chain-trace, .chain-trace-details) .ui-feedback-state {
+    width: fit-content;
+    max-width: 100%;
+    min-height: var(--control-lg);
+    grid-template-columns: auto minmax(0, 1fr);
+    padding: var(--space-2) var(--space-3);
+    border: 0;
+    box-shadow: none;
+    background: transparent;
+  }
+  :is(.chain-trace, .chain-trace-details) .ui-feedback-state.has-action { grid-template-columns: auto minmax(0, 1fr) auto; }
+  :is(.chain-trace, .chain-trace-details) .ui-feedback-state__title { text-align: left; font-size: var(--type-meta-size); font-weight: var(--weight-medium); }
+  :is(.chain-trace, .chain-trace-details) .ui-feedback-icon { width: var(--icon-lg); height: var(--icon-lg); background: transparent; }
+  :is(.chain-trace, .chain-trace-details) .ui-feedback-state > .ui-icon-button-wrap { translate: none; }
 
   .chain-trace-state,
   .chain-trace-empty {

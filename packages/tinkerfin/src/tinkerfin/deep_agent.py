@@ -57,7 +57,7 @@ if TYPE_CHECKING:
     from .agui_resume import (
         AgUiResumeBinding,
         AgUiResumeCheckpointObserver,
-        AgUiResumeInitializationFailureObserver,
+        AgUiResumeNotSavedObserver,
         AgUiResumeRequest,
     )
     from .runtime import (
@@ -114,7 +114,7 @@ def _install_call_handler(
     bound: inspect.BoundArguments,
     observation: RuntimeObservationHub,
 ) -> None:
-    """Append the request callback while preserving caller callback ownership."""
+    """Append native sync/async callbacks without taking caller callback ownership."""
 
     if not observation.enabled:
         return
@@ -127,15 +127,16 @@ def _install_call_handler(
         raise TypeError("bound Graph config must be a mapping or None")
     callbacks = config.get("callbacks")
     if callbacks is None:
-        configured_callbacks: object = [observation.call_handler]
+        configured_callbacks: object = list(observation.call_handlers)
     elif isinstance(callbacks, list):
         configured_callbacks = [
             *cast(list[object], callbacks),
-            observation.call_handler,
+            *observation.call_handlers,
         ]
     elif isinstance(callbacks, BaseCallbackManager):
         manager = callbacks.copy()
-        manager.add_handler(observation.call_handler, inherit=True)
+        for call_handler in observation.call_handlers:
+            manager.add_handler(call_handler, inherit=True)
         configured_callbacks = manager
     else:
         raise TypeError("config callbacks must be a callback list or manager")
@@ -314,7 +315,7 @@ class _ResumeInitializationGuard:
 
     def __init__(
         self,
-        callback: AgUiResumeInitializationFailureObserver | None,
+        callback: AgUiResumeNotSavedObserver | None,
         marker_probe: Callable[[], Awaitable[bool]] | None,
     ) -> None:
         self._callback = callback
@@ -446,7 +447,7 @@ def _create_graph_agui_stream(
     checkpointer: object | None,
     resume: AgUiResumeBinding | None,
     on_resume_checkpointed: AgUiResumeCheckpointObserver | None,
-    on_resume_initialization_failed: (AgUiResumeInitializationFailureObserver | None),
+    on_resume_not_saved: (AgUiResumeNotSavedObserver | None),
     on_event: EventObserver | None,
 ) -> AgUiEventStream:
     """Create one lazy AG-UI stream from an already bound Graph call."""
@@ -515,7 +516,7 @@ def _create_graph_agui_stream(
         return resolution.resume_phase in {"prepared", "accepted"}
 
     resume_guard = _ResumeInitializationGuard(
-        on_resume_initialization_failed,
+        on_resume_not_saved,
         resume_marker_is_readable if resume is not None else None,
     )
 
@@ -716,7 +717,7 @@ def _wrap_agui_astream(
             checkpointer=None,
             resume=None,
             on_resume_checkpointed=None,
-            on_resume_initialization_failed=None,
+            on_resume_not_saved=None,
             on_event=on_event,
         )
 
@@ -775,7 +776,7 @@ def _wrap_agui_resume_astream(
     checkpointer: object | None,
     resume: AgUiResumeBinding,
     on_resume_checkpointed: AgUiResumeCheckpointObserver | None,
-    on_resume_initialization_failed: (AgUiResumeInitializationFailureObserver | None),
+    on_resume_not_saved: (AgUiResumeNotSavedObserver | None),
     on_event: EventObserver | None,
 ) -> Callable[..., AgUiEventStream]:
     """Bind native resume input internally and expose only Graph options."""
@@ -851,7 +852,7 @@ def _wrap_agui_resume_astream(
             checkpointer=checkpointer,
             resume=resume,
             on_resume_checkpointed=on_resume_checkpointed,
-            on_resume_initialization_failed=on_resume_initialization_failed,
+            on_resume_not_saved=on_resume_not_saved,
             on_event=on_event,
         )
 
@@ -1211,9 +1212,7 @@ class DeepAgentAgUiResumeRuntime(Generic[AstreamT]):
         checkpointer: object | None,
         resume: AgUiResumeBinding,
         on_resume_checkpointed: AgUiResumeCheckpointObserver | None,
-        on_resume_initialization_failed: (
-            AgUiResumeInitializationFailureObserver | None
-        ),
+        on_resume_not_saved: (AgUiResumeNotSavedObserver | None),
         on_event: EventObserver | None,
     ) -> None:
         """Bind one validated resume without exposing its native Command.
@@ -1234,7 +1233,7 @@ class DeepAgentAgUiResumeRuntime(Generic[AstreamT]):
             checkpointer: Borrowed saver used for Graph-independent durable marker probes.
             resume: Framework-resolved immutable resume facts.
             on_resume_checkpointed: Idempotent callback after marker durability.
-            on_resume_initialization_failed: Idempotent host settlement invoked only
+            on_resume_not_saved: Idempotent host settlement invoked only
                 when the stream closes before a resume marker is saver-readable.
             on_event: Optional callback awaited before public event delivery.
         """
@@ -1258,7 +1257,7 @@ class DeepAgentAgUiResumeRuntime(Generic[AstreamT]):
             checkpointer=checkpointer,
             resume=resume,
             on_resume_checkpointed=on_resume_checkpointed,
-            on_resume_initialization_failed=on_resume_initialization_failed,
+            on_resume_not_saved=on_resume_not_saved,
             on_event=on_event,
         )
 
@@ -1488,9 +1487,7 @@ class DeepAgentDefinition(Generic[GraphT, AstreamT]):
         config: RunnableConfig | None,
         context: object | None,
         on_resume_checkpointed: AgUiResumeCheckpointObserver | None,
-        on_resume_initialization_failed: (
-            AgUiResumeInitializationFailureObserver | None
-        ),
+        on_resume_not_saved: (AgUiResumeNotSavedObserver | None),
         timeout: float | None,
         settlement_timeout: float | None,
         expose_reasoning_events: bool,
@@ -1555,7 +1552,7 @@ class DeepAgentDefinition(Generic[GraphT, AstreamT]):
             checkpointer=self._checkpointer,
             resume=binding,
             on_resume_checkpointed=on_resume_checkpointed,
-            on_resume_initialization_failed=on_resume_initialization_failed,
+            on_resume_not_saved=on_resume_not_saved,
             on_event=on_event,
         )
         return resume_runtime.astream(
@@ -1686,9 +1683,7 @@ class DeepAgentDefinition(Generic[GraphT, AstreamT]):
         expose_subagent_events: bool = True,
         resume: AgUiResumeBinding | None = None,
         on_resume_checkpointed: AgUiResumeCheckpointObserver | None = None,
-        on_resume_initialization_failed: (
-            AgUiResumeInitializationFailureObserver | None
-        ) = None,
+        on_resume_not_saved: (AgUiResumeNotSavedObserver | None) = None,
         on_event: EventObserver | None = None,
     ) -> DeepAgentAgUiRuntime[AstreamT] | DeepAgentAgUiResumeRuntime[AstreamT]:
         """Create one canonical ordinary or resume AG-UI Runtime.
@@ -1707,7 +1702,7 @@ class DeepAgentDefinition(Generic[GraphT, AstreamT]):
                 AG-UI resume source.
             on_resume_checkpointed: Optional idempotent callback invoked after the exact
                 resume marker is readable and before continuation output.
-            on_resume_initialization_failed: Optional idempotent host settlement invoked
+            on_resume_not_saved: Optional idempotent host settlement invoked
                 after a pre-marker failure, cancellation, or close. It is never invoked
                 after a prepared or accepted marker becomes saver-readable.
             on_event: Optional observer awaited before each public event is delivered.
@@ -1740,12 +1735,8 @@ class DeepAgentDefinition(Generic[GraphT, AstreamT]):
             raise TypeError("resume must be an AgUiResumeBinding or None")
         if on_resume_checkpointed is not None and not callable(on_resume_checkpointed):
             raise TypeError("on_resume_checkpointed must be an async callable or None")
-        if on_resume_initialization_failed is not None and not callable(
-            on_resume_initialization_failed
-        ):
-            raise TypeError(
-                "on_resume_initialization_failed must be an async callable or None"
-            )
+        if on_resume_not_saved is not None and not callable(on_resume_not_saved):
+            raise TypeError("on_resume_not_saved must be an async callable or None")
         if (
             resume is not None
             and resume.mode == "resume"
@@ -1762,10 +1753,8 @@ class DeepAgentDefinition(Generic[GraphT, AstreamT]):
                 )
         if resume is None and on_resume_checkpointed is not None:
             raise ValueError("on_resume_checkpointed requires an AgUiResumeBinding")
-        if resume is None and on_resume_initialization_failed is not None:
-            raise ValueError(
-                "on_resume_initialization_failed requires an AgUiResumeBinding"
-            )
+        if resume is None and on_resume_not_saved is not None:
+            raise ValueError("on_resume_not_saved requires an AgUiResumeBinding")
         resolved_mode = resolve_agent_mode(mode, options=self._plan_options)
         if resume is not None:
             deferred_astream = self._deferred_astream(resolved_mode)
@@ -1798,7 +1787,7 @@ class DeepAgentDefinition(Generic[GraphT, AstreamT]):
                 checkpointer=self._checkpointer,
                 resume=resume,
                 on_resume_checkpointed=on_resume_checkpointed,
-                on_resume_initialization_failed=on_resume_initialization_failed,
+                on_resume_not_saved=on_resume_not_saved,
                 on_event=on_event,
             )
         return DeepAgentAgUiRuntime(

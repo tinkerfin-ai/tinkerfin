@@ -291,9 +291,9 @@ def _process_ai_chunk(
 ) -> list[BaseEvent]:
     """Emit balanced reasoning, text, and Tool events for one AI message frame.
 
-    Provider-final frames are hard boundaries even when empty. Reasoning closes before
-    visible text, text closes before Tool fragments, and every final frame closes any
-    provider stream left open without requiring a synthetic upstream chunk.
+    Provider-final frames are hard boundaries even when empty. Tool fragments may
+    interleave with text from the same message without ending it. AG-UI 0.1.19 marks
+    TextMessageEnd as final; test_interleaved_public_stream.py covers these sequences.
     """
 
     events: list[BaseEvent] = []
@@ -311,6 +311,14 @@ def _process_ai_chunk(
             events.extend(self._close_reasoning(source.namespace, raw_event))
             events.extend(self._close_message(source.namespace, raw_event))
         return events
+
+    active_message_id = self._active_messages.get(source.namespace)
+    if (
+        chunk.id is not None
+        and active_message_id is not None
+        and self._message_id(source.namespace, chunk.id) != active_message_id
+    ):
+        events.extend(self._close_message(source.namespace, raw_event))
 
     events.extend(reasoning_events)
 
@@ -348,7 +356,6 @@ def _process_ai_chunk(
 
     if chunk.tool_call_chunks:
         events.extend(self._close_reasoning(source.namespace, raw_event))
-        events.extend(self._close_message(source.namespace, raw_event))
         for tool_chunk in chunk.tool_call_chunks:
             events.extend(
                 self._process_tool_chunk(
@@ -358,11 +365,7 @@ def _process_ai_chunk(
                     raw_event,
                 )
             )
-        if chunk.chunk_position == "last":
-            events.extend(self._close_tools(source.namespace, raw_event))
-    # Heartbeats were filtered above, so a Tool-free chunk here carries text or
-    # reasoning. Only a final chunk closes all remaining lifecycles.
-    elif chunk.chunk_position == "last":
+    if chunk.chunk_position == "last":
         events.extend(self._close_tools(source.namespace, raw_event))
         events.extend(self._close_reasoning(source.namespace, raw_event))
         events.extend(self._close_message(source.namespace, raw_event))

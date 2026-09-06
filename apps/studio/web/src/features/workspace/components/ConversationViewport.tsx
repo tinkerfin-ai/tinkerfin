@@ -1,4 +1,4 @@
-import { useMemo, type RefObject } from 'react'
+import { useMemo, type ReactNode, type RefObject } from 'react'
 
 import { Button, ErrorBoundary, FeedbackState, OverlayScrollbar } from '../../../components/ui'
 import type {
@@ -65,6 +65,7 @@ export function ConversationViewport({
   isHydrationFailed,
   isRunning,
   backgroundInert = false,
+  navigation,
   onScroll,
   onUserScrollIntent,
   onRetryHistory,
@@ -84,6 +85,7 @@ export function ConversationViewport({
   isHydrationFailed: boolean
   isRunning: boolean
   backgroundInert?: boolean
+  navigation?: ReactNode
   onScroll: (pane: HTMLElement) => void
   onUserScrollIntent: () => void
   onRetryHistory: () => void
@@ -171,6 +173,7 @@ export function ConversationViewport({
         )}
         </section>
         {/* eslint-enable jsx-a11y/no-noninteractive-tabindex */}
+        {navigation}
         <OverlayScrollbar
           viewportRef={paneRef}
           visibility="persistent"

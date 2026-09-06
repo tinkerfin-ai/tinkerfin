@@ -22,7 +22,7 @@ from tinkerfin_contracts import RunIdentity as RunIdentity
 from .agui_resume import (
     AgUiResumeBinding,
     AgUiResumeCheckpointObserver,
-    AgUiResumeInitializationFailureObserver,
+    AgUiResumeNotSavedObserver,
     AgUiResumeRequest,
 )
 from .plan import AgentMode
@@ -254,7 +254,7 @@ class DeepAgentDefinition(Generic[ContextT]):
         config: RunnableConfig | None,
         context: object | None,
         on_resume_checkpointed: AgUiResumeCheckpointObserver | None,
-        on_resume_initialization_failed: AgUiResumeInitializationFailureObserver | None,
+        on_resume_not_saved: AgUiResumeNotSavedObserver | None,
         timeout: float | None,
         settlement_timeout: float | None,
         expose_reasoning_events: bool,
@@ -326,7 +326,7 @@ class DeepAgentDefinition(Generic[ContextT]):
         expose_subagent_events: bool = True,
         resume: None = None,
         on_resume_checkpointed: None = None,
-        on_resume_initialization_failed: None = None,
+        on_resume_not_saved: None = None,
         on_event: EventObserver | None = None,
     ) -> DeepAgentAgUiRuntime[ContextT]:
         """Create one canonical ordinary or resume AG-UI Runtime.
@@ -345,7 +345,7 @@ class DeepAgentDefinition(Generic[ContextT]):
                 AG-UI resume source.
             on_resume_checkpointed: Optional idempotent callback invoked after the exact
                 resume marker is readable and before continuation output.
-            on_resume_initialization_failed: Optional idempotent host settlement invoked
+            on_resume_not_saved: Optional idempotent host settlement invoked
                 after a pre-marker failure, cancellation, or close. It is never invoked
                 after a prepared or accepted marker becomes saver-readable.
             on_event: Optional observer awaited before each public event is delivered.
@@ -374,8 +374,7 @@ class DeepAgentDefinition(Generic[ContextT]):
         expose_subagent_events: bool = True,
         resume: AgUiResumeBinding,
         on_resume_checkpointed: AgUiResumeCheckpointObserver | None = None,
-        on_resume_initialization_failed: AgUiResumeInitializationFailureObserver
-        | None = None,
+        on_resume_not_saved: AgUiResumeNotSavedObserver | None = None,
         on_event: EventObserver | None = None,
     ) -> DeepAgentAgUiResumeRuntime[ContextT]:
         """Create one canonical ordinary or resume AG-UI Runtime.
@@ -394,7 +393,7 @@ class DeepAgentDefinition(Generic[ContextT]):
                 AG-UI resume source.
             on_resume_checkpointed: Optional idempotent callback invoked after the exact
                 resume marker is readable and before continuation output.
-            on_resume_initialization_failed: Optional idempotent host settlement invoked
+            on_resume_not_saved: Optional idempotent host settlement invoked
                 after a pre-marker failure, cancellation, or close. It is never invoked
                 after a prepared or accepted marker becomes saver-readable.
             on_event: Optional observer awaited before each public event is delivered.

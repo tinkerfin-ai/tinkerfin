@@ -244,8 +244,13 @@ class _TracingSession:
             tuple[tuple[str, ...], str], str
         ] = {}
         self._message_seen: set[tuple[tuple[str, ...], str]] = set()
-        self._message_contents: dict[tuple[tuple[str, ...], str], JsonValue] = {}
+        self._message_contents: dict[tuple[tuple[str, ...], str], CapturedValue] = {}
         self._message_completed: set[tuple[tuple[str, ...], str]] = set()
+        self._pending_assistant_messages: dict[
+            tuple[tuple[str, ...], str], tuple[str | None, str | None, bool]
+        ] = {}
+        self._waiting_assistant_messages: set[tuple[tuple[str, ...], str]] = set()
+        self._completed_model_messages: set[tuple[tuple[str, ...], str]] = set()
         self._reasoning_contents: dict[tuple[tuple[str, ...], str], JsonValue] = {}
         self._reasoning_extractors: dict[tuple[tuple[str, ...], str], str] = {}
         self._message_model_names: dict[tuple[tuple[str, ...], str], str] = {}
@@ -304,8 +309,12 @@ class _TracingSession:
                         fact.content,
                         append=fact.phase == "content",
                     )
-                if fact.phase in {"completed", "reconciled"}:
+                if fact.phase in {"completed", "reconciled", "cancelled", "abandoned"}:
                     self._message_completed.add(key)
+                    self._waiting_assistant_messages.discard(key)
+                elif fact.phase == "interrupted":
+                    self._waiting_assistant_messages.add(key)
+                    self._message_completed.discard(key)
                 if fact.fingerprint is not None:
                     target = (
                         self._message_fingerprints
@@ -350,6 +359,10 @@ class _TracingSession:
                             fact.model
                         )
                 if fact.phase == "completed":
+                    self._completed_model_messages.update(
+                        (fact.namespace, message_id)
+                        for message_id in fact.output_message_ids
+                    )
                     for tool_call_id in fact.tool_call_ids:
                         self._tool_call_models[(fact.namespace, tool_call_id)] = (
                             fact.call_id
@@ -437,6 +450,17 @@ class _TracingSession:
             completions = self._complete_open_reasoning(common)
             if completions:
                 await self._append(tuple(completions), mandatory=False)
+        if (
+            isinstance(observation, (ModelCallObservation, ToolExecutionObservation))
+            and observation.phase == "started"
+        ):
+            # A child callback may arrive before its first Native part. The verified
+            # parent task and its observed Tool start already establish the same
+            # Subagent boundary that the Native path will use.
+            openings = tuple(self._subagent_start(observation, source_id=source_id))
+            if openings:
+                await self._append(openings, mandatory=False)
+                self._advance_context_anchors(openings)
         facts = self._facts(observation, source_id=source_id)
         if not facts:
             return
@@ -858,6 +882,19 @@ class _TracingSession:
                     self._message_model_names[(observation.namespace, message_id)] = (
                         component_name
                     )
+            for message_id in observation.output_message_ids:
+                message_key = (observation.namespace, message_id)
+                if observation.phase == "completed":
+                    self._completed_model_messages.add(message_key)
+                if message_key not in self._message_completed:
+                    self._pending_assistant_messages.setdefault(
+                        message_key,
+                        (
+                            message_id,
+                            None,
+                            self._in_subagent_scope(observation.namespace),
+                        ),
+                    )
             return [
                 _make_fact(
                     ModelCallFact,
@@ -1185,6 +1222,52 @@ class _TracingSession:
         else:
             terminal_phase = "abandoned"
         facts: list[TraceSemanticFact] = []
+        # Native error callbacks do not promise a final Assistant snapshot (LangGraph
+        # StreamMessagesHandler.on_llm_error). Wait for Runtime's observation drain so
+        # every accepted Native fragment precedes this one bounded delivery snapshot.
+        for key, (source_message_id, name, in_subagent_scope) in sorted(
+            self._pending_assistant_messages.items()
+        ):
+            namespace, message_source_id = key
+            if key in self._message_completed:
+                continue
+            content = self._message_contents.get(key)
+            model_completed = key in self._completed_model_messages
+            if model_completed:
+                # A completed provider output proves success, but it contains no
+                # complete response body in the observation contract. Preserve that
+                # success and explicitly omit incomplete capture instead of presenting
+                # a received prefix as the complete successful message.
+                content = CapturedValue(
+                    disposition="omitted",
+                    safe_size_bytes=0 if content is None else content.safe_size_bytes,
+                    reason="incomplete_message",
+                )
+            elif content is not None and content.disposition == "inline":
+                # Redaction must also see the assembled value: a sensitive token
+                # or business pattern can span individually safe Native fragments.
+                content = self._capture(
+                    content.value,
+                    content_kind="message",
+                    component_name=self._message_model_names.get(key),
+                )
+            facts.append(
+                _make_fact(
+                    MessageFact,
+                    common,
+                    namespace=namespace,
+                    in_subagent_scope=in_subagent_scope,
+                    phase="completed" if model_completed else terminal_phase,
+                    message_id=_scope_id("message", namespace, message_source_id),
+                    source_message_id=source_message_id,
+                    role="assistant",
+                    content=content,
+                    name=name,
+                )
+            )
+            if model_completed or terminal_phase != "interrupted":
+                self._message_completed.add(key)
+        self._pending_assistant_messages.clear()
         for namespace, (subagent_id, agent_name) in sorted(
             self._active_subagents.items()
         ):
@@ -1439,6 +1522,8 @@ class _TracingSession:
             self._delivered_message_fingerprints.pop(key, None)
             self._message_contents.pop(key, None)
             self._message_completed.discard(key)
+            self._pending_assistant_messages.pop(key, None)
+            self._waiting_assistant_messages.discard(key)
             self._subagent_task_message_keys.discard(key)
             if suppressed:
                 return []
@@ -1470,7 +1555,7 @@ class _TracingSession:
             captured = self._message_content(message)
             unchanged = (
                 key in self._message_contents
-                and self._message_contents[key] == captured.value
+                and self._message_contents[key] == captured
             )
             self._message_seen.add(key)
             self._message_completed.add(key)
@@ -1492,8 +1577,9 @@ class _TracingSession:
                 )
             ]
         role = _message_role(message)
-        if key not in self._message_seen:
+        if key not in self._message_seen or key in self._waiting_assistant_messages:
             self._message_seen.add(key)
+            self._waiting_assistant_messages.discard(key)
             facts.append(
                 _make_fact(
                     MessageFact,
@@ -1505,6 +1591,19 @@ class _TracingSession:
                     name=message.name,
                     tool_call_id=message.tool_call_id,
                 )
+            )
+        if (
+            role == "assistant"
+            and message.message_type == "assistant_chunk"
+            and key not in self._message_completed
+        ):
+            self._pending_assistant_messages.setdefault(
+                key,
+                (
+                    message.id,
+                    message.name,
+                    self._in_subagent_scope(observation.namespace),
+                ),
             )
         if role == "assistant" and message.content not in ("", []):
             captured_content = self._message_content(message)
@@ -1518,6 +1617,7 @@ class _TracingSession:
             fingerprint = self._message_fingerprint(message, observation.namespace)
             self._delivered_message_fingerprints[key] = fingerprint
             self._message_completed.add(key)
+            self._pending_assistant_messages.pop(key, None)
             facts.append(
                 _make_fact(
                     MessageFact,
@@ -1879,7 +1979,7 @@ class _TracingSession:
                 captured_content is not None
                 and captured_content.disposition == "inline"
                 and key in self._message_contents
-                and self._message_contents[key] == captured_content.value
+                and self._message_contents[key] == captured_content
             )
             role = _message_role(message)
             if role == "user" and content_matches:
@@ -1897,6 +1997,8 @@ class _TracingSession:
                     append=False,
                 )
             self._message_completed.add(key)
+            self._pending_assistant_messages.pop(key, None)
+            self._waiting_assistant_messages.discard(key)
             facts.append(
                 _make_fact(
                     MessageFact,
@@ -1938,6 +2040,8 @@ class _TracingSession:
             self._message_seen.discard(key)
             self._message_contents.pop(key, None)
             self._message_completed.discard(key)
+            self._pending_assistant_messages.pop(key, None)
+            self._waiting_assistant_messages.discard(key)
             self._subagent_task_message_keys.discard(key)
             if suppressed:
                 continue
@@ -2016,9 +2120,29 @@ class _TracingSession:
         *,
         source_id: str,
     ) -> list[TraceSemanticFact]:
+        """Open one proven child scope before its first observed work.
+
+        Child callbacks can precede Native parts. Their verified parent task Tool
+        execution supplies the existing preparation boundary; a callback's own start
+        time must not replace missing evidence. Native-only observations retain their
+        first-child-part boundary when no Tool callback was captured.
+
+        Args:
+            observation: Native child activity or the start of a child callback.
+            source_id: Identity of the observation that first exposes this scope.
+
+        Returns:
+            One opening fact, or no facts for an existing or unproven child scope.
+
+        Raises:
+            TraceCorruption: A proven child callback lacks its parent execution evidence.
+        """
+
         if not isinstance(
             observation,
             (
+                ModelCallObservation,
+                ToolExecutionObservation,
                 NativeMessageObservation,
                 NativeReasoningObservation,
                 NativeTaskObservation,
@@ -2034,6 +2158,11 @@ class _TracingSession:
             return []
         descriptor = self._subagent_descriptors.get(namespace)
         if descriptor is None:
+            return []
+        callback_start = isinstance(
+            observation, (ModelCallObservation, ToolExecutionObservation)
+        )
+        if callback_start and observation.phase != "started":
             return []
         agent_name: str | None = descriptor.agent_name
         if isinstance(observation, NativeMessageObservation):
@@ -2053,6 +2182,21 @@ class _TracingSession:
             if parent_execution_id is None
             else self._tool_executions.get(parent_execution_id)
         )
+        if callback_start and (
+            parent_execution is None or parent_execution.tool_name != "task"
+        ):
+            raise TraceCorruption(
+                "Subagent callback has no observed parent task execution boundary"
+            )
+        if (
+            callback_start
+            and parent_execution is not None
+            and (
+                parent_execution.observed_at > observation.observed_at
+                or parent_execution.monotonic_ns > observation.monotonic_ns
+            )
+        ):
+            raise TraceCorruption("Subagent execution boundary follows child callback")
         parent_tool_call_id = descriptor.parent_tool_call_id
         model_call_id = self._tool_call_models.get(
             (namespace[:-1], descriptor.parent_tool_call_id)
@@ -2281,21 +2425,22 @@ class _TracingSession:
         *,
         append: bool,
     ) -> None:
-        if content.disposition == "omitted":
-            self._message_contents.pop(key, None)
-            return
         if not append or key not in self._message_contents:
-            self._message_contents[key] = content.value
+            self._message_contents[key] = content
             return
-        combined = _append_json_content(self._message_contents[key], content.value)
-        bounded = self._capture_pipeline.bound(
+        previous = self._message_contents[key]
+        # Once any prefix is omitted, later fragments cannot recover the whole
+        # delivery. Only an authoritative complete snapshot can replace omission.
+        if previous.disposition == "omitted":
+            return
+        if content.disposition == "omitted":
+            self._message_contents[key] = content
+            return
+        combined = _append_json_content(previous.value, content.value)
+        self._message_contents[key] = self._capture_pipeline.bound(
             combined,
             max_bytes=self._payload_budget,
         )
-        if bounded.disposition == "inline":
-            self._message_contents[key] = bounded.value
-        else:
-            self._message_contents.pop(key, None)
 
     def _track_reasoning_content(
         self,
@@ -2964,7 +3109,10 @@ class Tracer:
                 next_cursor=next_cursor,
                 as_of_seq=records.as_of_seq,
                 completeness=TraceGraphCompleteness(
-                    call_tracking_missing=not records.call_tracking_present,
+                    call_tracking_missing=not all(
+                        core_state.runs[run_id].call_history_known
+                        for run_id in window.selected_run_ids
+                    ),
                     relationship_evidence_missing=relationship_missing,
                     details_omitted=details_omitted,
                 ),

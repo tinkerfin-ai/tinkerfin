@@ -13,6 +13,7 @@ from sqlalchemy import (
     String,
     UniqueConstraint,
 )
+from sqlalchemy.dialects.mysql import DATETIME
 from sqlalchemy.orm import Mapped, mapped_column
 
 from tinkerfin_studio.infrastructure.database import Base
@@ -153,6 +154,17 @@ class ConversationRunRegistration(Base):
     )
     error_code: Mapped[str | None] = mapped_column(
         String(128), nullable=True, comment="客户端安全的终态错误码"
+    )
+    trace_generation: Mapped[str | None] = mapped_column(
+        String(2048), nullable=True, comment="首次观测绑定的 Trace generation"
+    )
+    trace_as_of_seq: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True, comment="列表摘要已消费的 Trace 事件前缀"
+    )
+    trace_observed_at: Mapped[datetime | None] = mapped_column(
+        DateTime().with_variant(DATETIME(fsp=6), "mysql"),
+        nullable=True,
+        comment="Trace 存储观测时间，UTC 微秒，用于同前缀状态排序",
     )
     started_at: Mapped[datetime] = mapped_column(
         DateTime(), nullable=False, comment="请求注册时间"

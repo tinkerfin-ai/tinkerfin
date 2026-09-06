@@ -13,8 +13,13 @@ from tinkerfin_contracts import RunIdentity
 from .backend import TraceLedgerBackend, TraceStoreOptions
 from .durable_store import DurableTraceStore
 from .errors import TraceThreadNotFound
-from .facts import RunFact, TraceEvent
-from .store import TraceProjectionCheckpoint, TraceThreadKey, TraceWriter
+from .facts import RunFact
+from .store import (
+    TraceProjectionCheckpoint,
+    TraceStoreUpdate,
+    TraceThreadKey,
+    TraceWriter,
+)
 
 
 async def verify_trace_ledger_backend(
@@ -75,8 +80,8 @@ async def verify_trace_ledger_backend(
     second_identity = RunIdentity(threadId=thread_id, runId="contract-second")
     writers: list[TraceWriter] = []
     generation_key: TraceThreadKey | None = None
-    follower: AsyncGenerator[tuple[TraceEvent, ...], None] | None = None
-    waiting: asyncio.Task[tuple[TraceEvent, ...]] | None = None
+    follower: AsyncGenerator[TraceStoreUpdate, None] | None = None
+    waiting: asyncio.Task[TraceStoreUpdate] | None = None
     primary_error: BaseException | None = None
     cleanup_errors: list[BaseException] = []
     try:
@@ -158,11 +163,15 @@ async def verify_trace_ledger_backend(
         third_identity = RunIdentity(threadId=thread_id, runId="contract-third")
         third = await primary.open_writer(third_identity)
         writers.append(third)
+        current = await anext(follower)
+        assert current.events == ()
+        assert current.as_of_seq == snapshot.as_of_seq
+        assert current.active_run_ids == (third_identity.run_id,)
         waiting = asyncio.create_task(anext(follower))
         await third.append((_run_fact(third_identity, "started"),))
         followed = await asyncio.wait_for(waiting, timeout=2)
         waiting = None
-        assert [event.trace_seq for event in followed] == [7]
+        assert [event.trace_seq for event in followed.events] == [7]
         await third.append(
             (
                 _run_fact(third_identity, "terminal"),

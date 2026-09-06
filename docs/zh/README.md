@@ -57,3 +57,7 @@ TinkerFin 用来运行 Deep Agents、记录语义执行轨迹、把实时过程�
 | MySQL 持久化 Sandbox 状态 | `pip install "tinkerfin-sandbox[mysql]"` |
 
 不必一次安装全部组件。先安装当前要用的部分，后面需要时再增加。
+
+## 仓库开发
+
+[构建当前工作树的 wheel 并验证打包](development.md)。

@@ -6,7 +6,7 @@ import asyncio
 import inspect
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from contextlib import nullcontext
+from contextlib import aclosing
 from typing import Any, Protocol, TypeAlias, cast
 
 from langchain_core.messages import HumanMessage
@@ -40,7 +40,7 @@ from ._config import PlanOptions
 from ._content import PlanContentBinding
 from ._handoff import (
     PLAN_HANDOFF_STATE_KEY,
-    activate_plan_handoff_instruction,
+    PlanHandoffStream,
 )
 from ._state import (
     PLAN_CHECKPOINT_RUN_ID,
@@ -716,13 +716,14 @@ class PlanCapableGraphRuntime:
                 and handoff is not None
                 and handoff.phase is PlanHandoffPhase.ACCEPTED
             ):
-                handoff_context = activate_plan_handoff_instruction(
-                    _handoff_text(overlay, self._content)
-                )
+                instruction = _handoff_text(overlay, self._content)
             else:
-                handoff_context = nullcontext()
-            with handoff_context:
-                async for part in self._native.astream(*bound.args, **bound.kwargs):
+                instruction = None
+            source = PlanHandoffStream(
+                self._native.astream(*bound.args, **bound.kwargs), instruction
+            )
+            async with aclosing(source):
+                async for part in source:
                     if part.get("type") == "values" and part.get("ns") == ():
                         native_interrupted = bool(part.get("interrupts", ()))
                     yield part if overlay is None else _overlay_plan(part, overlay)
@@ -820,7 +821,7 @@ class PlanCapableGraphRuntime:
                         "native Graph has pending work before Plan handoff"
                     )
                 message = _handoff_user_message(final_state, final_plan)
-                native_config = await self._native.aupdate_state(
+                staged_config = await self._native.aupdate_state(
                     config,
                     {
                         "messages": [message],
@@ -835,12 +836,16 @@ class PlanCapableGraphRuntime:
                 )
                 native_checkpoint_id = cast(
                     str,
-                    native_config.get("configurable", {}).get("checkpoint_id"),
+                    staged_config.get("configurable", {}).get("checkpoint_id"),
                 )
                 if not native_checkpoint_id:
                     raise PlanStateConflictError(
                         "native handoff update returned no checkpoint_id"
                     )
+                # LangGraph 1.2.10 returns the saver checkpoint coordinates here,
+                # not the invocation config. Keep callbacks, Run identity, tags,
+                # metadata, and execution limits when selecting the staged work.
+                native_config = _select_checkpoint(config, native_checkpoint_id)
                 native_snapshot = await self._native.aget_state(native_config)
             else:
                 native_checkpoint_id = _checkpoint_id(native_snapshot)
@@ -895,13 +900,12 @@ class PlanCapableGraphRuntime:
             raise PlanModeConfigurationError("Plan handoff requires durability='sync'")
         native_bound.arguments["durability"] = "sync"
         native_interrupted = False
-        with activate_plan_handoff_instruction(
-            _handoff_text(final_plan, self._content)
-        ):
-            async for part in self._native.astream(
-                *native_bound.args,
-                **native_bound.kwargs,
-            ):
+        source = PlanHandoffStream(
+            self._native.astream(*native_bound.args, **native_bound.kwargs),
+            _handoff_text(final_plan, self._content),
+        )
+        async with aclosing(source):
+            async for part in source:
                 if part.get("type") == "values" and part.get("ns") == ():
                     native_interrupted = bool(part.get("interrupts", ()))
                 yield _overlay_plan(part, final_plan)

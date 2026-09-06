@@ -274,6 +274,16 @@ def _resolve_append_events(
             "mandatory append is reserved for terminal and closed Run facts"
         )
 
+    # Public model_copy/model_construct can bypass Pydantic construction checks.
+    # Reject invalid lifecycle scope before producing any batch storage effect, so
+    # writer flags, quotas, and Graph rows cannot commit a contradictory Run terminal.
+    if any(
+        isinstance(fact, RunFact)
+        and (fact.namespace != () or fact.in_subagent_scope is not False)
+        for fact in facts
+    ):
+        raise TraceStoreProtocolError("Run lifecycle facts require the root scope")
+
     terminal_committed = writer.terminal_committed
     closed_committed = writer.closed_committed
     if change.mandatory:

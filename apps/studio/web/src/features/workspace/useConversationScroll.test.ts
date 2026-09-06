@@ -62,6 +62,36 @@ describe('useConversationScroll', () => {
     vi.unstubAllGlobals()
   })
 
+  it('定位历史时不会因窗口暂时接近底部恢复跟随，返回底部后恢复', () => {
+    const { result, rerender, unmount } = renderHook(({ currentConversation }) => useConversationScroll({
+      conversation: currentConversation,
+      isRunning: true,
+    }), { initialProps: { currentConversation: conversation } })
+    const pane = document.createElement('section')
+    Object.defineProperties(pane, {
+      clientHeight: { configurable: true, value: 400 },
+      scrollHeight: { configurable: true, value: 1200 },
+      scrollTop: { configurable: true, writable: true, value: 800 },
+    })
+    result.current.paneRef.current = pane
+    pane.scrollTo = vi.fn()
+    act(() => {
+      result.current.pauseFollowing()
+      result.current.handleScroll(pane)
+      vi.advanceTimersByTime(20)
+    })
+    pane.scrollTop = 100
+    rerender({ currentConversation: { ...conversation, messages: [{ id: 'stream', role: 'assistant', content: '继续流式回答', createdAt: '' }] } })
+    act(() => vi.advanceTimersByTime(20))
+    expect(pane.scrollTop).toBe(100)
+    act(() => result.current.syncToBottomIfFollowing())
+    expect(pane.scrollTop).toBe(100)
+    act(() => result.current.scrollToBottom())
+    act(() => result.current.syncToBottomIfFollowing())
+    expect(pane.scrollTop).toBe(1200)
+    unmount()
+  })
+
   it('resets idle timing, fades after 1500ms, hides after 1800ms, and pauses while hovered', () => {
     const { result } = renderHook(() => useConversationScroll({ conversation, isRunning: false }))
     const pane = document.createElement('section')

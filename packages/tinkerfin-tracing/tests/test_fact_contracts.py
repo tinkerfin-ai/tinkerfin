@@ -290,3 +290,38 @@ def test_failure_origin_requires_a_failed_terminal_run() -> None:
                 "failureOrigin": True,
             }
         )
+
+
+@pytest.mark.parametrize(
+    "phase_fields",
+    (
+        {"phase": "started", "input_kind": "ordinary"},
+        {"phase": "input", "input_kind": "ordinary"},
+        {"phase": "resumed", "input_kind": "resume"},
+        {"phase": "resume_checkpointed", "interrupt_ids": ("approval",)},
+        {
+            "phase": "observer_failed",
+            "observer_name": "observer",
+            "error_type": "ValueError",
+        },
+        {"phase": "terminal", "outcome": "cancelled"},
+        {"phase": "closed", "outcome": "cancelled"},
+    ),
+)
+@pytest.mark.parametrize(
+    "scope", ({"namespace": ("child",)}, {"in_subagent_scope": True})
+)
+def test_all_run_lifecycle_phases_are_root_scoped(
+    phase_fields: dict[str, object],
+    scope: dict[str, object],
+) -> None:
+    fields = {**_common(), **phase_fields}
+    if phase_fields["phase"] in {"input", "resumed"}:
+        fields.update(
+            input=CapturedValue(disposition="inline", safe_size_bytes=4),
+            config=CapturedValue(disposition="inline", safe_size_bytes=4),
+        )
+    valid = RunFact.model_validate(fields)
+    assert valid.namespace == () and valid.in_subagent_scope is False
+    with pytest.raises(ValidationError, match="root scope"):
+        RunFact.model_validate({**fields, **scope})

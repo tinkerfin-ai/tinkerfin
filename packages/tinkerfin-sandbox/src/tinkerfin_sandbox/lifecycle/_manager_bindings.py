@@ -29,10 +29,14 @@ from ..errors import (
     OpenSandboxDestroyError,
     OpenSandboxResetError,
     OpenSandboxStateError,
+    OpenSandboxStateOwnershipError,
 )
 from ..middleware.filesystem import build_rooted_filesystem_middleware
 from ..models import OpenSandboxDetails, _normalize_workspace_root
+from ._manager_recovery import _check_health, recover_binding
 from ._manager_resources import _ManagedBackend
+from ._notifications import failure_reason
+from .notifications import OpenSandboxLifecycleReason as Reason
 from .state import OpenSandboxBinding, OpenSandboxOwnerClaim
 
 if TYPE_CHECKING:
@@ -178,14 +182,20 @@ async def _replace(
         else:
             handle = existing_handle
     self._handles[owner_key] = handle
+    # The State commit and stable handle publication make replacement observable.
+    # Subsequent old-resource cleanup cannot revoke this confirmed transition.
+    self._notifications.published(owner_key, backend.id, old_id)
 
     cleanup_tasks: list[asyncio.Task[None]] = []
     retire_ids = set(acquisition.retire_after_commit_ids)
     retire_ids.discard(backend.id)
     if old_backend is not None:
-        cleanup_tasks.append(
-            asyncio.create_task(self._retire_replaced_backend(handle, old_backend))
+        retire = (
+            self._retire_replaced_backend(handle, old_backend)
+            if old_backend.id == old_id or old_backend.id in retire_ids
+            else self._close_replaced_backend(handle, old_backend)
         )
+        cleanup_tasks.append(asyncio.create_task(retire))
         retire_ids.discard(old_backend.id)
     if old_id is not None and old_id not in {
         backend.id,
@@ -284,7 +294,8 @@ async def get(self: OpenSandboxManager[KeyT], key: KeyT) -> _ManagedBackend:
     """Return the healthy stable backend for one caller-defined key.
 
     Resolution checks the local handle, committed State binding, warm pool, and
-    on-demand creation in that order. An unavailable binding is replaced. Calls
+    on-demand creation in that order. An unavailable binding follows the recovery
+    policy; defaults preserve it. Calls
     resolving to the same owner receive the same stable handle.
 
     Args:
@@ -315,66 +326,29 @@ async def _get_locked(
     handle = self._handles.get(owner_key)
     stored_id = claim.binding.sandbox_id if claim.binding is not None else None
 
-    if handle is not None and stored_id == handle.id:
-        if handle.is_closed:
-            old_id = handle.id
-            self._handles.pop(owner_key, None)
-            return await self._replace(
-                owner_key,
-                claim,
-                None,
-                old_id=old_id,
-            )
-        if await self._is_backend_healthy(handle):
-            await self._renew_backend(handle)
-            return handle
-        return await self._replace(
-            owner_key,
-            claim,
-            handle,
-            old_id=handle.id,
-        )
-
     if stored_id is not None:
-        try:
-            backend = await self._client.connect(stored_id)
-        except Exception:  # noqa: BLE001 - reconnect failure triggers replacement
-            pass
-        else:
-            if await self._check_owned_backend(
-                backend,
-                destroy_on_cancel=False,
-            ):
-                if handle is not None and not handle.is_closed:
-                    old_backend = handle._replace_backend(backend)
-                    cleanup_task = asyncio.create_task(
-                        self._close_replaced_backend(handle, old_backend)
-                    )
-                    self._track_cleanup_task(cleanup_task)
-                    await asyncio.shield(cleanup_task)
-                else:
-                    handle = OpenSandboxHandle(backend)
-                self._handles[owner_key] = handle
-                await self._renew_backend(handle)
-                return handle
-            await self._cleanup_owned_backend(backend, destroy=False)
-        replaceable_handle = (
-            handle if handle is not None and not handle.is_closed else None
+        return await recover_binding(self, owner_key, claim)
+    if handle is not None:
+        raise OpenSandboxStateOwnershipError(
+            "The local Sandbox no longer has an authoritative owner binding"
         )
-        return await self._replace(
-            owner_key,
-            claim,
-            replaceable_handle,
-            old_id=stored_id,
-        )
-
-    replaceable_handle = handle if handle is not None and not handle.is_closed else None
     return await self._replace(
         owner_key,
         claim,
-        replaceable_handle,
-        old_id=handle.id if handle is not None else None,
+        None,
+        old_id=None,
     )
+
+
+async def reconnect(self: OpenSandboxManager[KeyT], key: KeyT) -> _ManagedBackend:
+    """Open a verified connection to an existing binding without recreating it."""
+    owner_key = self._resolve_owner_key(key)
+    async with self._operation():
+        async with self._claim_owner(owner_key) as claim:
+            handle = await recover_binding(
+                self, owner_key, claim, reconnect=True, allow_recreate=False
+            )
+            return self._backend_view(owner_key, handle)
 
 
 async def _close_replaced_backend(
@@ -404,24 +378,31 @@ async def recreate(self: OpenSandboxManager[KeyT], key: KeyT) -> _ManagedBackend
         async with self._claim_owner(owner_key) as claim:
             self._ensure_open()
             handle = self._handles.get(owner_key)
-            old_id = (
-                claim.binding.sandbox_id
-                if claim.binding is not None
-                else handle.id
-                if handle is not None
-                else None
-            )
+            if claim.binding is None and handle is not None:
+                raise OpenSandboxStateOwnershipError(
+                    "The local Sandbox no longer has an authoritative owner binding"
+                )
+            old_id = claim.binding.sandbox_id if claim.binding is not None else None
             replaceable_handle = (
                 handle if handle is not None and not handle.is_closed else None
             )
             if handle is not None and handle.is_closed:
                 self._handles.pop(owner_key, None)
-            replaced = await self._replace(
-                owner_key,
-                claim,
-                replaceable_handle,
-                old_id=old_id,
-            )
+            if old_id is not None:
+                self._notifications.recovering(
+                    owner_key, old_id, Reason.EXPLICIT_RECREATE
+                )
+            try:
+                replaced = await self._replace(
+                    owner_key,
+                    claim,
+                    replaceable_handle,
+                    old_id=old_id,
+                )
+            except Exception as error:
+                if old_id is not None:
+                    self._notifications.failed(owner_key, old_id, failure_reason(error))
+                raise
             return self._backend_view(owner_key, replaced)
 
 
@@ -447,10 +428,13 @@ async def reset(self: OpenSandboxManager[KeyT], key: KeyT) -> None:
 
     async with self._operation():
         async with self._claim_owner(owner_key) as claim:
-            handle = await self._get_locked(owner_key, claim)
-            reset_task = asyncio.create_task(
-                handle._areset_workspace_from_manager(workspace_root)
-            )
+            handle = await recover_binding(self, owner_key, claim, allow_recreate=False)
+
+            async def reset_workspace() -> None:
+                await handle._areset_workspace_from_manager(workspace_root)
+                self._notifications.workspace_reset(owner_key, handle.id)
+
+            reset_task = asyncio.create_task(reset_workspace())
             try:
                 await asyncio.shield(reset_task)
             except asyncio.CancelledError as cancellation:
@@ -486,11 +470,22 @@ async def is_healthy(self: OpenSandboxManager[KeyT], key: KeyT) -> bool:
     owner_key = self._resolve_owner_key(key)
     async with self._operation():
         handle = self._handles.get(owner_key)
-        return (
-            handle is not None
-            and not handle.is_closed
-            and await self._is_backend_healthy(handle)
-        )
+        if handle is None or handle.is_closed:
+            return False
+        sandbox_id = handle.id
+        check = self._notifications.begin_check(owner_key)
+        try:
+            try:
+                await _check_health(self, handle)
+            except Exception as error:  # noqa: BLE001 - preserve this boolean check's contract
+                self._notifications.checked(
+                    owner_key, sandbox_id, check, failure_reason(error)
+                )
+                return False
+            self._notifications.checked(owner_key, sandbox_id, check, None)
+            return True
+        finally:
+            self._notifications.end_check(owner_key, check)
 
 
 async def get_details(
@@ -513,28 +508,44 @@ async def get_details(
     """
     owner_key = self._resolve_owner_key(key)
     async with self._operation():
-        binding = await self._state.read_binding(owner_key)
-        if binding is None:
-            return None
-        handle = self._handles.get(owner_key)
-        if handle is not None and handle.id == binding.sandbox_id:
-            if handle.is_closed:
-                runtime = await self._client.inspect(handle.id)
-                cached = False
-            else:
+        check = self._notifications.begin_check(owner_key)
+        try:
+            binding = await self._state.read_binding(owner_key)
+            if binding is None:
+                return None
+            handle = self._handles.get(owner_key)
+            if (
+                handle is not None
+                and handle.id == binding.sandbox_id
+                and not handle.is_closed
+            ):
                 runtime = await handle.aget_runtime_info()
                 cached = True
+            else:
+                runtime = await self._client.inspect(binding.sandbox_id)
+                cached = False
+            reason = None
+            if not runtime.available:
+                reason = (
+                    Reason.NOT_FOUND
+                    if runtime.unavailable_reason == "not_found"
+                    else Reason.UNREACHABLE
+                )
+            elif not runtime.healthy:
+                reason = Reason.UNHEALTHY
+            # A temporary inspection can discover an outage, but cannot confirm
+            # managed recovery before this manager publishes a usable handle.
+            if reason is not None or cached:
+                self._notifications.checked(
+                    owner_key, binding.sandbox_id, check, reason
+                )
             return OpenSandboxDetails.from_runtime(
                 runtime,
                 owner_key=owner_key,
                 cached=cached,
             )
-        runtime = await self._client.inspect(binding.sandbox_id)
-        return OpenSandboxDetails.from_runtime(
-            runtime,
-            owner_key=owner_key,
-            cached=False,
-        )
+        finally:
+            self._notifications.end_check(owner_key, check)
 
 
 async def _delete_locked(
@@ -561,6 +572,13 @@ async def _delete_locked(
         backend = await handle._aretire()
         remaining_ids.add(backend.id)
 
+    had_instances = bool(remaining_ids)
+    notification_id = (
+        stored_id
+        if stored_id is not None
+        else (backend.id if backend is not None else next(iter(remaining_ids), None))
+    )
+
     try:
         if backend is not None:
             await self._dispose_backend(backend, strict=True)
@@ -574,6 +592,8 @@ async def _delete_locked(
 
     self._pending_destroy_ids.pop(owner_key, None)
     await self._state.unbind_owner(claim)
+    if had_instances:
+        self._notifications.destroyed(owner_key, notification_id)
 
 
 async def delete(self: OpenSandboxManager[KeyT], key: KeyT) -> None:

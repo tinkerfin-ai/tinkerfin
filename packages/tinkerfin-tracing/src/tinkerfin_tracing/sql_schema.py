@@ -356,6 +356,12 @@ graph_nodes = Table(
         comment="Model call that emitted this Assistant, Tool, or Subagent",
     ),
     Column(
+        "model_call_seq",
+        BigInteger,
+        nullable=True,
+        comment="Ledger sequence proving the emitting Model relationship",
+    ),
+    Column(
         "kind",
         String(32),
         nullable=True,

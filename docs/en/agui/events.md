@@ -38,6 +38,10 @@ RUN_FINISHED
 
 With tools, text and tool events may interleave, and several tools may remain open in parallel. Keep separate UI state for each ID.
 
+Tool argument fragments do not end text from the same model message. That message has
+one text start and one text end, including when more text follows a Tool fragment.
+Its Tool events and message snapshots use the same parent message identity.
+
 ## Root agent and subagents
 
 Subagents run in non-root namespaces. The converter preserves full namespaces and provenance so messages, tools, and state from different scopes are not mixed.
@@ -70,6 +74,8 @@ events = await tinkerfin.open_agui_run(
 Supported providers may produce `REASONING_START`, `REASONING_MESSAGE_*`, and `REASONING_END`. Not every model emits public reasoning, and an empty text chunk is not automatically a heartbeat.
 
 Provider-private reasoning metadata is removed from normal messages, state, and raw payloads regardless of this setting.
+The same rule applies to every public interrupt metadata copy, including persisted
+resume correlation. Unrelated business fields remain available for response validation.
 
 ## What `messages`, `tasks`, and `values` contribute
 

@@ -252,7 +252,9 @@ def validate_native_stream_part(part: object) -> NativeValidatedStreamPart:
         part: Live upstream envelope.
 
     Returns:
-        The immutable mode-specific validated envelope.
+        The mode-specific validated envelope. Its fields remain mutable, and message
+        objects are borrowed from the input. Consumers must treat both as read-only
+        while processing the part; validation does not freeze upstream objects.
 
     Raises:
         NativeStreamContractError: The envelope or payload is malformed.

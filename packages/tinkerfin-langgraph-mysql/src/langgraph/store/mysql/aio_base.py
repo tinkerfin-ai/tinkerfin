@@ -9,6 +9,7 @@ from typing import Any, Generic, cast
 
 import orjson
 from langgraph.store.base import (
+    BaseStore,
     GetOp,
     ListNamespacesOp,
     Op,
@@ -16,7 +17,6 @@ from langgraph.store.base import (
     Result,
     SearchOp,
 )
-from langgraph.store.base.batch import AsyncBatchedBaseStore
 
 from langgraph.store.mysql import _ainternal
 from langgraph.store.mysql.base import (
@@ -33,7 +33,10 @@ from langgraph.store.mysql.base import (
     row_to_item,
     row_to_search_item,
 )
-from langgraph.store.mysql.errors import LangGraphMySQLSchemaError
+from langgraph.store.mysql.errors import (
+    LangGraphMySQLSchemaError,
+    LangGraphMySQLStoreClosedError,
+)
 
 
 def _required_text(row: dict[str, Any], key: str) -> str:
@@ -70,10 +73,14 @@ async def _validate_current_schema(cur: _ainternal.AsyncDictCursor) -> None:
 
     await cur.execute(
         """
-        SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, COLUMN_COMMENT
-        FROM information_schema.COLUMNS
-        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'store'
-        ORDER BY ORDINAL_POSITION
+        SELECT c.COLUMN_NAME, c.COLUMN_TYPE, c.IS_NULLABLE, c.COLUMN_DEFAULT,
+               c.COLUMN_COMMENT, c.CHARACTER_SET_NAME, c.COLLATION_NAME,
+               collation.PAD_ATTRIBUTE
+        FROM information_schema.COLUMNS AS c
+        LEFT JOIN information_schema.COLLATIONS AS collation
+            ON collation.COLLATION_NAME = c.COLLATION_NAME
+        WHERE c.TABLE_SCHEMA = DATABASE() AND c.TABLE_NAME = 'store'
+        ORDER BY c.ORDINAL_POSITION
         """
     )
     column_rows = await cur.fetchall()
@@ -89,10 +96,17 @@ async def _validate_current_schema(cur: _ainternal.AsyncDictCursor) -> None:
     )
     if columns != _STORE_COLUMN_CONTRACTS:
         raise LangGraphMySQLSchemaError(reason="column contract mismatch")
+    for row in column_rows:
+        if row["COLUMN_NAME"] in {"prefix", "key"} and (
+            row.get("CHARACTER_SET_NAME") != "utf8mb4"
+            or row.get("COLLATION_NAME") != "utf8mb4_0900_bin"
+            or row.get("PAD_ATTRIBUTE") != "NO PAD"
+        ):
+            raise LangGraphMySQLSchemaError(reason="identity collation mismatch")
 
     await cur.execute(
         """
-        SELECT INDEX_NAME, NON_UNIQUE, SEQ_IN_INDEX, COLUMN_NAME, INDEX_TYPE
+        SELECT INDEX_NAME, NON_UNIQUE, SEQ_IN_INDEX, COLUMN_NAME, INDEX_TYPE, SUB_PART
         FROM information_schema.STATISTICS
         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'store'
         ORDER BY INDEX_NAME, SEQ_IN_INDEX
@@ -109,7 +123,11 @@ async def _validate_current_schema(cur: _ainternal.AsyncDictCursor) -> None:
         )
         for row in index_rows
     )
-    if indexes != _STORE_INDEX_CONTRACTS:
+    # Prefix indexes compare only part of each identity. Matching column names and
+    # collation is insufficient: every key column must participate at full length.
+    if indexes != _STORE_INDEX_CONTRACTS or any(
+        "SUB_PART" not in row or row["SUB_PART"] is not None for row in index_rows
+    ):
         raise LangGraphMySQLSchemaError(reason="index contract mismatch")
 
     await cur.execute(
@@ -146,11 +164,17 @@ async def _store_table_exists(cur: _ainternal.AsyncDictCursor) -> bool:
 
 
 class BaseAsyncMySQLStore(
-    AsyncBatchedBaseStore,
+    BaseStore,
     BaseMySQLStore,
     Generic[_ainternal.C, _ainternal.R],
 ):
-    """Execute the shared Store query plan through an async MySQL connection."""
+    """Execute explicit Store batches without an idle background worker.
+
+    LangGraph BaseStore convenience methods call ``abatch`` directly. Accepted
+    operations remain owned by their callers; closing waits for their transactions
+    before an owned connection is released. Network deadlines remain configurable
+    through the borrowed driver or the caller's asynchronous timeout scope.
+    """
 
     __slots__ = ("_deserializer", "lock")
 
@@ -172,6 +196,87 @@ class BaseAsyncMySQLStore(
         self.conn = conn
         self.lock = asyncio.Lock()
         self.loop = asyncio.get_running_loop()
+        self._closed = False
+        self._active_operations = 0
+        self._operations_done = asyncio.Event()
+        self._operations_done.set()
+
+    def batch(self, ops: Iterable[Op]) -> list[Result]:
+        """Run a Store batch from a thread outside the creating event loop.
+
+        This bridges LangGraph's synchronous Store methods to native async I/O.
+        The calling thread waits for completion; its owner controls thread capacity
+        and driver timeouts. Interrupting that wait cancels the submitted operation.
+
+        Args:
+            ops: Ordered LangGraph Store operations.
+
+        Returns:
+            Results in the original operation order.
+
+        Raises:
+            asyncio.InvalidStateError: Called from the Store loop or while it is stopped.
+            LangGraphMySQLStoreClosedError: The Store has begun closing.
+        """
+
+        if self._closed:
+            raise LangGraphMySQLStoreClosedError()
+        try:
+            caller_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            caller_loop = None
+        if caller_loop is self.loop or not self.loop.is_running():
+            raise asyncio.InvalidStateError(
+                "Synchronous Store calls require a worker thread and a running "
+                "Store event loop; use the asynchronous methods in the Store loop"
+            )
+        submitted = asyncio.run_coroutine_threadsafe(self.abatch(ops), self.loop)
+        try:
+            return submitted.result()
+        except BaseException:
+            submitted.cancel()
+            raise
+
+    @asynccontextmanager
+    async def _operation(self) -> AsyncGenerator[None, None]:
+        if asyncio.get_running_loop() is not self.loop:
+            raise RuntimeError("Use the Store from its creating event loop")
+        if self._closed:
+            raise LangGraphMySQLStoreClosedError()
+        self._active_operations += 1
+        self._operations_done.clear()
+        try:
+            yield
+        finally:
+            self._active_operations -= 1
+            if not self._active_operations:
+                self._operations_done.set()
+
+    async def aclose(self) -> None:
+        """Stop accepting operations and settle every accepted transaction.
+
+        Closing is idempotent and never closes a borrowed connection or pool. Caller
+        cancellation is propagated after accepted operations settle. Set operation
+        deadlines or cancel the tasks that own those operations when bounded shutdown
+        is required; no Store worker or hidden queue continues after close.
+
+        Raises:
+            asyncio.CancelledError: The close caller was cancelled during settlement.
+            RuntimeError: Called from an event loop other than the creating loop.
+        """
+
+        if asyncio.get_running_loop() is not self.loop:
+            raise RuntimeError("Close the Store from its creating event loop")
+        self._closed = True
+        cancellation: asyncio.CancelledError | None = None
+        while not self._operations_done.is_set():
+            try:
+                await self._operations_done.wait()
+            except asyncio.CancelledError as error:
+                if cancellation is None:
+                    cancellation = error
+        if cancellation is not None:
+            raise cancellation
 
     @staticmethod
     def _get_cursor_from_connection(conn: _ainternal.C) -> _ainternal.R:
@@ -180,11 +285,12 @@ class BaseAsyncMySQLStore(
     async def abatch(self, ops: Iterable[Op]) -> list[Result]:
         """Execute one ordered LangGraph Store operation batch atomically."""
 
-        grouped_ops, num_ops = group_ops(ops)
-        results: list[Result] = [None] * num_ops
+        async with self._operation():
+            grouped_ops, num_ops = group_ops(ops)
+            results: list[Result] = [None] * num_ops
 
-        async with _ainternal.get_connection(self.conn) as conn:
-            await self._execute_batch(grouped_ops, results, conn)
+            async with _ainternal.get_connection(self.conn) as conn:
+                await self._execute_batch(grouped_ops, results, conn)
 
         return results
 
@@ -199,10 +305,10 @@ class BaseAsyncMySQLStore(
 
         Raises:
             LangGraphMySQLSchemaError: The existing table differs from the current
-                columns, primary key, index, defaults, or comments.
+                columns, complete primary key, index, defaults, or comments.
         """
 
-        async with _ainternal.get_connection(self.conn) as conn:
+        async with self._operation(), _ainternal.get_connection(self.conn) as conn:
             async with self._cursor(conn) as cur:
                 # Avoid the driver's noisy TABLE_EXISTS warning on every normal startup.
                 # The DDL still uses IF NOT EXISTS so two empty-database starters remain

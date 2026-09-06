@@ -14,7 +14,7 @@
 | `metadata` | `{}` | Application metadata; reserved ownership fields are rejected |
 | `resource` | `cpu=1, memory=2Gi` | Resource request |
 | `volumes` | `()` | OpenSandbox volumes |
-| `ttl` | 2 hours | Positive Sandbox lifetime |
+| `ttl` | 2 hours | Positive lifetime from creation or renewal; `None` requires explicit cleanup |
 | `lifecycle_request_timeout` | 10 minutes | Create, connect, and destroy request limit |
 | `ready_timeout` | 5 minutes | Wait for a new Sandbox to become ready |
 | `connect_timeout` | 30 seconds | Data-plane connection limit |
@@ -25,15 +25,28 @@
 | `command_env` | `{}` | Environment added to each Shell command |
 | `enable_capture_offload` | `False` | Allow large command output to be saved to a file |
 
+`ttl=None` creates instances without automatic expiry and skips remote renewal.
+It retains health checks and State ownership rules. Connecting does not change an
+existing expiry. See [remote lifetime](lifecycle.md#remote-lifetime) for close and
+storage behavior.
+
 ### `OpenSandboxClient`
 
 | Parameter | Default | Purpose |
 | --- | --- | --- |
 | `connection_config` | required, may be `None` | Explicit OpenSandbox connection or SDK environment configuration |
 | `config` | `None` | TinkerFin Sandbox settings |
-| `initializers` | `()` | Async functions run for new ready instances |
+| `initializers` | `()` | Idempotent callbacks run in order after creation or connection |
 
 Public methods are `create(metadata=None)`, `connect(sandbox_id)`, `inspect(sandbox_id)`, `destroy(sandbox_id)`, and `aclose()`. All are asynchronous.
+
+Initializers receive an `OpenSandboxBackend` and may return an awaitable or `None`.
+Use native asynchronous callbacks for I/O. Synchronous callbacks run on the event
+loop and must be non-blocking; the client does not move them into a thread. Connect
+and initialization share `connect_timeout`, shortened to the recovery deadline when
+called by a manager. Timeout and cancellation are cooperative
+and cannot interrupt blocking synchronous work. Initialization failures raise
+`OpenSandboxInitializationError` and do not authorize recovery retries or recreation.
 
 ## Manager
 
@@ -42,6 +55,20 @@ See [Sandbox lifecycle](lifecycle.md) for constructor parameters and operations.
 `await manager.check_ready()` returns `None` only when configured warm capacity is
 verified. It raises `OpenSandboxWarmPoolUnavailableError` for startup or background
 capacity failure and `OpenSandboxManagerClosedError` after shutdown.
+
+Optional lifecycle notification contracts:
+
+| API | Purpose |
+| --- | --- |
+| `OpenSandboxLifecycleObserver.on_sandbox_event(event)` | Borrowed asynchronous observer; cannot reenter its manager |
+| `OpenSandboxNotificationOptions(max_pending_events=128, timeout=1.0)` | Independent pending limit and per-call seconds for each observer |
+| `OpenSandboxLifecycleEvent` | Immutable event identity, type, owner, UTC time, reason, effects, and trusted diagnostics |
+| `OpenSandboxLifecycleEventType` | User Sandbox changes, explicit workspace reset, and separate warm-capacity changes |
+| `OpenSandboxLifecycleReason` | Enumerated connection, health, initialization, State, and explicit-operation causes |
+
+Configure `observers=()` and `notification_options=None` on the manager. See
+[Lifecycle notifications](lifecycle.md#lifecycle-notifications) for event and delivery
+semantics. `diagnostic_context` is trusted-only and is not a client response.
 
 ## Backends and handles
 
@@ -78,7 +105,8 @@ Synchronous remote methods fail explicitly; use the asynchronous forms.
 | `get_sqlalchemy_opensandbox_state_schema(dialect=...)` | Generate complete schema DDL |
 | `SQLAlchemyOpenSandboxStateSchema` | Immutable dialect, table names, and DDL |
 
-`OpenSandboxInitializer` is the asynchronous initializer callable type that receives a newly ready backend.
+`OpenSandboxInitializer` receives a ready backend after creation or connection and
+returns `Awaitable[None] | None`; synchronous callbacks must be non-blocking.
 
 ### Immutable claims and bindings
 
@@ -110,7 +138,10 @@ These types mainly support custom `OpenSandboxState` implementations.
 | `OpenSandboxStateOwnershipError` | Claim expired, was replaced, or belongs to another worker |
 | `OpenSandboxStateConfigurationError` | Unsupported state, database, or schema configuration |
 | `OpenSandboxDestroyError` | Remote destruction could not settle reliably |
+| `OpenSandboxInitializationError` | Workspace setup or an initializer failed; not eligible for recovery retries |
+| `OpenSandboxBackendUnavailableError` | Existing instance recovery failed or a provider rejected access |
 | `OpenSandboxResetError` | No safe workspace root or reset failed |
 | `OpenSandboxHandleOwnershipError` | Backend ownership is no longer valid |
 | `OpenSandboxManagerClosedError` | A closed manager was used |
+| `OpenSandboxObserverReentryError` | A lifecycle observer tried to operate or close its own manager |
 | `OpenSandboxSettlementTimeoutError` | Caller wait for protected close expired |

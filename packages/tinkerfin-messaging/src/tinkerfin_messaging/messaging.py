@@ -104,7 +104,10 @@ class MessageSubscription(Generic[ReplayT]):
     ``MessageChannel.follow()``. Direct construction is unsupported because the channel
     must first bind the codec, exact generation, cursor, and parent Messaging lifecycle.
     A subscription is single-use; its consumer owns iteration and may call ``aclose()``
-    to detach without cancelling the producer.
+    to detach without cancelling the producer. Only one pull may be active at a time.
+    Closing cancels and settles a pending pull before releasing its backend iterator;
+    the waiting consumer observes ``CancelledError``. Repeated close calls share the
+    same completed cleanup.
     """
 
     _ledger: _MessagingLedger

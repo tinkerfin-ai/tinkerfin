@@ -27,11 +27,13 @@ class OpenSandboxErrorCode(StrEnum):
     BACKEND_TIMEOUT = "sandbox.backend_timeout"
     BACKEND_PROTOCOL_ERROR = "sandbox.backend_protocol_error"
     BACKEND_UNEXPECTED_FAILURE = "sandbox.backend_unexpected_failure"
+    INITIALIZATION_FAILED = "sandbox.initialization_failed"
     DESTROY_FAILED = "sandbox.destroy_failed"
     RESET_FAILED = "sandbox.reset_failed"
     HANDLE_OWNERSHIP = "sandbox.handle_ownership"
     HANDLE_CLOSED = "sandbox.handle_closed"
     MANAGER_CLOSED = "sandbox.manager_closed"
+    OBSERVER_REENTRY = "sandbox.observer_reentry"
     WARM_POOL_UNAVAILABLE = "sandbox.warm_pool_unavailable"
     SETTLEMENT_TIMEOUT = "sandbox.settlement_timeout"
 
@@ -161,6 +163,12 @@ class UnexpectedOpenSandboxBackendError(OpenSandboxBackendError):
     code = OpenSandboxErrorCode.BACKEND_UNEXPECTED_FAILURE
 
 
+class OpenSandboxInitializationError(OpenSandboxBackendError):
+    """Workspace preparation or a caller initializer failed; recovery cannot retry it."""
+
+    code = OpenSandboxErrorCode.INITIALIZATION_FAILED
+
+
 class OpenSandboxDestroyError(OpenSandboxError, RuntimeError):
     """Explicit destruction was not confirmed, so the target remains retryable."""
 
@@ -189,6 +197,12 @@ class OpenSandboxManagerClosedError(OpenSandboxError, RuntimeError):
     """A lifecycle operation was requested after manager shutdown began."""
 
     code = OpenSandboxErrorCode.MANAGER_CLOSED
+
+
+class OpenSandboxObserverReentryError(OpenSandboxError, RuntimeError):
+    """A lifecycle observer tried to operate or close the manager delivering it."""
+
+    code = OpenSandboxErrorCode.OBSERVER_REENTRY
 
 
 class OpenSandboxWarmPoolUnavailableError(OpenSandboxError, RuntimeError):
@@ -222,7 +236,9 @@ __all__ = [
     "OpenSandboxErrorCode",
     "OpenSandboxHandleClosedError",
     "OpenSandboxHandleOwnershipError",
+    "OpenSandboxInitializationError",
     "OpenSandboxManagerClosedError",
+    "OpenSandboxObserverReentryError",
     "OpenSandboxResetError",
     "OpenSandboxSettlementTimeoutError",
     "OpenSandboxStateCommitUncertainError",

@@ -49,6 +49,8 @@ class OpenSandboxConfig(BaseModel):
     This external configuration boundary validates time and capacity limits. Time
     fields use ``timedelta`` except ``command_timeout``, which uses integer seconds
     for the Deep Agents protocol. A zero command timeout disables the SDK limit.
+    Set ``ttl=None`` to require explicit remote cleanup; this does not change
+    State ownership at manager close or provide persistent file storage.
     """
 
     image: str = Field(
@@ -82,10 +84,13 @@ class OpenSandboxConfig(BaseModel):
             "change creation parameters."
         ),
     )
-    ttl: timedelta = Field(
+    ttl: timedelta | None = Field(
         default=timedelta(hours=2),
         gt=timedelta(0),
-        description="Remote sandbox lifetime from creation or renewal.",
+        description=(
+            "Positive remote sandbox lifetime from creation or renewal. None "
+            "requires explicit cleanup and disables automatic expiry and renewal."
+        ),
     )
     lifecycle_request_timeout: timedelta = Field(
         default=timedelta(minutes=10),
@@ -231,7 +236,10 @@ class OpenSandboxRuntimeInfo(BaseModel):
     )
     expires_at: datetime | None = Field(
         default=None,
-        description="Scheduled automatic termination time for the remote sandbox.",
+        description=(
+            "Scheduled automatic termination time. None means manual cleanup when "
+            "available, or unknown expiry when remote details are unavailable."
+        ),
     )
     image: str | None = Field(
         default=None,

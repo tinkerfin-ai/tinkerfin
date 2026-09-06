@@ -37,19 +37,42 @@ async with AsyncMyStore.from_conn_string(
 
 - `AsyncMyStore.from_conn_string()` accepts `mysql://` and `mysql+asyncmy://`, owns
   exactly one asyncmy connection, creates the current Store tables before yielding,
-  and closes the connection when its context exits.
+  and settles accepted operations before closing the connection on context exit.
+- Direct construction borrows a connection or pool. Call `await store.setup()` before
+  use and `await store.aclose()` to stop the Store; the borrowed resource stays owned
+  by the caller. Closed Stores raise `LangGraphMySQLStoreClosedError`.
+- Namespace labels and document keys use exact Unicode comparison, including case,
+  accents, and trailing spaces. `setup()` verifies the `utf8mb4_0900_bin` identity
+  collation, its `NO PAD` behavior, and complete identity indexes.
 - MySQL 8.0.19 or later is required by the Store queries.
 - MariaDB and alternate MySQL SQL dialect branches are not part of this package.
 - The public distribution intentionally supports asyncmy only. It does not expose
   aiomysql or PyMySQL driver classes.
 - The LangGraph Store remains separate from a graph checkpointer. A host can use Redis
   or another supported checkpointer independently.
+- Document namespaces follow LangGraph's constraints: labels are non-empty, contain
+  no periods, and do not use the reserved `langgraph` root. These constraints also
+  apply to explicit batch document operations; search and listing retain their own
+  prefix and wildcard matching rules.
+- This Store does not support document TTL; an explicit TTL is rejected before writing,
+  including in `batch()` and `abatch()`.
 - `setup()` creates and reflects the single current `store` table. The package has no
   Schema version table, numbered migration chain, or old-shape runtime branch.
 
 Schema and ordinary driver failures use `LangGraphMySQLSchemaError` and
 `LangGraphMySQLDriverError`, both derived from `LangGraphMySQLError`. Cancellation and
 caller exceptions retain their original semantics.
+
+Use `abatch()` for explicit bulk operations. Individual asynchronous Store calls execute
+directly and do not create an idle batching worker. Synchronous LangGraph Store methods
+may be used from a caller-owned worker thread while the Store's event loop is running;
+calling them from that event loop raises `asyncio.InvalidStateError`.
+
+Close waits for accepted operations, including when the close waiter is cancelled.
+Use an asynchronous timeout around operations, or configure the borrowed driver's
+network timeouts, to bound database work. Cancelling in-flight I/O may invalidate the
+connection under the driver's protocol rules; the Store still settles the operation
+before releasing its owned connection.
 
 ## Documentation
 

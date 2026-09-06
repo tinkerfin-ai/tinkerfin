@@ -18,6 +18,7 @@ from datetime import timedelta
 from pathlib import PurePosixPath
 from typing import Literal, NoReturn, TypeVar
 
+import httpx
 from deepagents.backends.protocol import (
     FILE_NOT_FOUND,
     INVALID_PATH,
@@ -31,7 +32,11 @@ from deepagents.backends.protocol import (
 )
 from deepagents.backends.sandbox import BaseSandbox
 from opensandbox import Sandbox
-from opensandbox.exceptions import SandboxApiException
+from opensandbox.exceptions import (
+    SandboxApiException,
+    SandboxInternalException,
+    SandboxUnhealthyException,
+)
 from opensandbox.models import OutputMessage, WriteEntry
 from opensandbox.models.execd import RunCommandOpts
 
@@ -158,13 +163,42 @@ def _rooted_transfer_file_error(
 
 
 def unavailable_reason(exc: Exception) -> OpenSandboxUnavailableReason:
-    """Map variable SDK query failures to stable module-level reason codes."""
+    """Confirm remote absence only from the SDK's structured HTTP status."""
     if isinstance(exc, SandboxApiException) and exc.status_code == 404:
         return "not_found"
-    message = str(exc).lower()
-    if "not found" in message or "404" in message or "does not exist" in message:
-        return "not_found"
     return "unreachable"
+
+
+def _connection_failure_reason(error: Exception) -> str | None:
+    """Separate transient failures from authorization and protocol rejections."""
+    if isinstance(error, SandboxInternalException) and isinstance(
+        error.__cause__, Exception
+    ):
+        # The locked SDK wraps HTTPX network errors in SandboxInternalException.
+        # Follow its typed cause, never its provider-controlled message text.
+        return _connection_failure_reason(error.__cause__)
+    if isinstance(error, httpx.TimeoutException):
+        return "timeout"
+    if isinstance(error, httpx.NetworkError):
+        return "unreachable"
+    if isinstance(error, SandboxApiException):
+        status = error.status_code
+        if status == 404:
+            return "not_found"
+        if status in {408, 429, 500, 502, 503, 504}:
+            return "unreachable"
+        if status == 401:
+            return "authentication"
+        if status == 403:
+            return "permission"
+        return "provider_rejected"
+    if isinstance(error, PermissionError):
+        return "permission"
+    if isinstance(error, ConnectionError):
+        return "unreachable"
+    if isinstance(error, SandboxUnhealthyException):
+        return "unhealthy"
+    return None
 
 
 async def _backend_call(
@@ -188,6 +222,7 @@ async def _backend_call(
     except SandboxApiException as error:
         translated = OpenSandboxBackendUnavailableError(
             f"OpenSandbox is unavailable for {operation}",
+            context={"reason": _connection_failure_reason(error)},
             diagnostic_context={
                 "implementation": "opensandbox_sdk",
                 "operation": operation,
@@ -210,6 +245,7 @@ async def _backend_call(
     except OSError as error:
         translated = OpenSandboxBackendUnavailableError(
             f"OpenSandbox is unavailable for {operation}",
+            context={"reason": _connection_failure_reason(error)},
             diagnostic_context={
                 "implementation": "opensandbox_sdk",
                 "operation": operation,
@@ -218,6 +254,17 @@ async def _backend_call(
         )
         raise translated from error
     except Exception as error:
+        reason = _connection_failure_reason(error)
+        if reason is not None:
+            raise OpenSandboxBackendUnavailableError(
+                f"OpenSandbox is unavailable for {operation}",
+                context={"reason": reason},
+                diagnostic_context={
+                    "implementation": "opensandbox_sdk",
+                    "operation": operation,
+                },
+                cause=error,
+            ) from error
         translated = UnexpectedOpenSandboxBackendError(
             f"OpenSandbox {operation} failed",
             diagnostic_context={

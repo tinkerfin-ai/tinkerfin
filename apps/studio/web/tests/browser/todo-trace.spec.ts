@@ -5,7 +5,7 @@ import type {
   ConversationHistoryDetail,
   TraceMessage,
 } from '../../src/api/conversation/history'
-import type { TraceGraphNode } from '../../src/api/conversation/traceGraph'
+import type { TraceGraphNode, TraceGraphTurn } from '../../src/api/conversation/traceGraph'
 import type { TaskTraceSnapshot, TodoGroup } from '../../src/api/conversation/taskTrace'
 import { traceGraphNode, traceGraphWithNodes } from '../../src/test/traceFixtures'
 
@@ -65,11 +65,16 @@ const makeGroups = (
   }))
 )
 
-const traceEntities = (groups: readonly TodoGroup[]) => {
+const traceEntities = (groups: readonly TodoGroup[], visibleGroups: readonly TodoGroup[]) => {
   const messages: TraceMessage[] = []
   const nodes: TraceGraphNode[] = []
+  const turns: TraceGraphTurn[] = []
+  const visibleIds = new Set(visibleGroups.map((group) => group.id))
   for (const [position, group] of [...groups].reverse().entries()) {
+    if (!visibleIds.has(group.id)) continue
     const sequence = (position * 2) + 1
+    const turnId = `turn:${group.id}`
+    turns.push({ id: turnId, ordinal: position + 1, startedAt: group.createdAt })
     messages.push({
       id: group.userMessageId,
       traceSeq: sequence,
@@ -85,6 +90,7 @@ const traceEntities = (groups: readonly TodoGroup[]) => {
     })
     nodes.push(traceGraphNode({
       id: group.groupToolCallId,
+      turnId,
       startedSeq: sequence + 1,
       updatedSeq: sequence + 1,
       name: 'write_todos',
@@ -99,23 +105,25 @@ const traceEntities = (groups: readonly TodoGroup[]) => {
       completedAt: group.status === 'running' ? null : group.createdAt,
     }))
   }
-  return { messages, nodes }
+  return { messages, nodes, turns }
 }
 
 const detail = ({
   groups,
   visibleGroups = groups,
+  taskTraceGroups = groups,
   includeTaskTrace,
   historyCursor = null,
 }: {
   groups: readonly TodoGroup[]
   visibleGroups?: readonly TodoGroup[]
+  taskTraceGroups?: readonly TodoGroup[]
   includeTaskTrace: boolean
   historyCursor?: string | null
 }): ConversationHistoryDetail => {
-  const entities = traceEntities(visibleGroups)
+  const entities = traceEntities(groups, visibleGroups)
   const taskTrace: TaskTraceSnapshot | null = includeTaskTrace
-    ? { status: 'ready', todoGroups: [...groups] }
+    ? { status: 'ready', todoGroups: [...taskTraceGroups] }
     : null
   return {
     id: 1,
@@ -124,17 +132,19 @@ const detail = ({
     lastModel: 'GPT-5.5',
     pinned: false,
     asOfSeq: Math.max(1, (groups.length * 2) + 1),
+    generation: `browser-generation:${THREAD_ID}`,
+    observedAt: '2026-09-05T00:00:00.000000Z',
     headRunId: RUN_ID,
     availableHeads: [RUN_ID],
     historyCursor,
-    messageCount: entities.messages.length,
-    toolCallCount: entities.nodes.length,
+    messageCount: groups.length,
+    toolCallCount: groups.length,
     messages: entities.messages,
     reasoning: [],
-    graph: traceGraphWithNodes(
-      entities.nodes,
-      Math.max(1, (groups.length * 2) + 1),
-    ),
+    graph: {
+      ...traceGraphWithNodes(entities.nodes, Math.max(1, (groups.length * 2) + 1)),
+      turns: entities.turns,
+    },
     state: { root: {}, subgraphs: {} },
     interactions: [],
     status: {
@@ -212,8 +222,8 @@ async function mockTodoTraceStudio(page: Page, {
           status: visibleGroups[0]?.status === 'running' ? 'running' : 'idle',
           lastRunId: RUN_ID,
           lastModel: 'GPT-5.5',
-          messageCount: visibleGroups.length,
-          toolCallCount: visibleGroups.length,
+          messageCount: groups.length,
+          toolCallCount: groups.length,
           hasPendingInterrupt: false,
           pendingInteractionKind: null,
           pinned: false,
@@ -230,15 +240,17 @@ async function mockTodoTraceStudio(page: Page, {
       if (cursor && olderGroups) {
         olderRequests += 1
         await fulfillJson(route, detail({
-          groups: taskTraceGroups,
-          visibleGroups: olderGroups,
+          groups,
+          taskTraceGroups,
+          visibleGroups: [...visibleGroups, ...olderGroups],
           includeTaskTrace: false,
           historyCursor: null,
         }))
         return
       }
       await fulfillJson(route, detail({
-        groups: taskTraceGroups,
+        groups,
+        taskTraceGroups,
         visibleGroups,
         includeTaskTrace,
         historyCursor,
@@ -253,7 +265,8 @@ async function mockTodoTraceStudio(page: Page, {
         body: `event: trace\ndata: ${JSON.stringify({
           type: 'snapshot',
           snapshot: detail({
-            groups: taskTraceGroups,
+            groups,
+            taskTraceGroups,
             visibleGroups,
             includeTaskTrace,
             historyCursor,

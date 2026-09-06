@@ -37,7 +37,9 @@ from .errors import OpenSandboxHandleClosedError as OpenSandboxHandleClosedError
 from .errors import (
     OpenSandboxHandleOwnershipError as OpenSandboxHandleOwnershipError,
 )
+from .errors import OpenSandboxInitializationError as OpenSandboxInitializationError
 from .errors import OpenSandboxManagerClosedError as OpenSandboxManagerClosedError
+from .errors import OpenSandboxObserverReentryError as OpenSandboxObserverReentryError
 from .errors import OpenSandboxResetError as OpenSandboxResetError
 from .errors import (
     OpenSandboxSettlementTimeoutError as OpenSandboxSettlementTimeoutError,
@@ -71,9 +73,15 @@ from .lifecycle import OpenSandboxBinding as OpenSandboxBinding
 from .lifecycle import OpenSandboxCleanupClaim as OpenSandboxCleanupClaim
 from .lifecycle import OpenSandboxClient as OpenSandboxClient
 from .lifecycle import OpenSandboxInitializer as OpenSandboxInitializer
+from .lifecycle import OpenSandboxLifecycleEvent as OpenSandboxLifecycleEvent
+from .lifecycle import OpenSandboxLifecycleEventType as OpenSandboxLifecycleEventType
+from .lifecycle import OpenSandboxLifecycleObserver as OpenSandboxLifecycleObserver
+from .lifecycle import OpenSandboxLifecycleReason as OpenSandboxLifecycleReason
 from .lifecycle import OpenSandboxManager as OpenSandboxManager
+from .lifecycle import OpenSandboxNotificationOptions as OpenSandboxNotificationOptions
 from .lifecycle import OpenSandboxOwnerClaim as OpenSandboxOwnerClaim
 from .lifecycle import OpenSandboxReadyWarmClaim as OpenSandboxReadyWarmClaim
+from .lifecycle import OpenSandboxRecoveryPolicy as OpenSandboxRecoveryPolicy
 from .lifecycle import OpenSandboxState as OpenSandboxState
 from .lifecycle import OpenSandboxWarmClaim as OpenSandboxWarmClaim
 from .middleware import (

@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   followTraceGraph,
   parseTraceGraphPage,
+  queryTraceGraph,
   type TraceGraphDelta,
   type TraceGraphFilter,
   type TraceGraphPage,
@@ -70,22 +71,36 @@ const applyUpdate = (
 export function useChainTrace({
   threadId,
   active,
+  live,
+  observedAt,
   filter,
   limit,
 }: {
   threadId: string
   active: boolean
+  live: boolean
+  /** 会话权威观测到达后，重新读取终态链路以补齐最后提交的节点 */
+  observedAt?: string
   filter: TraceGraphFilter
   limit: number
 }) {
   const [retryEpoch, setRetryEpoch] = useState(0)
+  const [visible, setVisible] = useState(document.visibilityState !== 'hidden')
   const [state, setState] = useState<ChainTraceState>({ phase: 'idle' })
   const filterKey = useMemo(() => JSON.stringify(filter), [filter])
   const currentFilter = useRef(filter)
   currentFilter.current = filter
+  const snapshotObservedAt = live ? undefined : observedAt
+  const displayedQuery = useRef<string | null>(null)
 
   useEffect(() => {
-    if (!active || !threadId) {
+    const updateVisibility = () => setVisible(document.visibilityState !== 'hidden')
+    document.addEventListener('visibilitychange', updateVisibility)
+    return () => document.removeEventListener('visibilitychange', updateVisibility)
+  }, [])
+
+  useEffect(() => {
+    if (!active || !visible || !threadId) {
       setState({ phase: 'idle' })
       return
     }
@@ -93,10 +108,22 @@ export function useChainTrace({
     let disposed = false
     let currentPage: TraceGraphPage | undefined
     const resolvedFilter = currentFilter.current
-    setState({ phase: 'loading' })
+    const queryKey = JSON.stringify([threadId, filterKey, limit])
+    const sameQuery = displayedQuery.current === queryKey
+    displayedQuery.current = queryKey
+    // 同一查询刷新时保留阅读内容，新快照到达后再替换；查询范围变化则显示加载状态
+    setState(current => sameQuery && current.phase === 'ready' ? current : { phase: 'loading' })
 
     const load = async () => {
       try {
+        if (!live) {
+          const page = await queryTraceGraph(threadId, resolvedFilter, {
+            limit,
+            signal: controller.signal,
+          })
+          if (!disposed && !controller.signal.aborted) setState({ phase: 'ready', page })
+          return
+        }
         for await (const event of followTraceGraph(threadId, resolvedFilter, {
           limit,
           signal: controller.signal,
@@ -126,7 +153,7 @@ export function useChainTrace({
         }
       }
     }
-    // StrictMode 会先同步重放 setup/cleanup；只让仍存活的 Effect 在微任务中建立外部流
+    // StrictMode 会先同步重放 setup/cleanup；只让仍存活的 Effect 发起读取
     queueMicrotask(() => {
       if (!disposed) void load()
     })
@@ -134,7 +161,7 @@ export function useChainTrace({
       disposed = true
       controller.abort()
     }
-  }, [active, filterKey, limit, retryEpoch, threadId])
+  }, [active, filterKey, limit, live, retryEpoch, snapshotObservedAt, threadId, visible])
 
   return {
     state,

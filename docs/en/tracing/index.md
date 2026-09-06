@@ -74,10 +74,19 @@ SystemMessage content already held by the Model request, so the Ledger does not 
 duplicate payload. Requests without a SystemMessage retain the measured Context interval
 with no content. The duration is wall-clock preparation latency, not a CPU profile.
 
+A proven Subagent's parent `task` Tool start establishes its preparation boundary.
+The Subagent opens once even when a child Model or Tool callback precedes its first
+Native part, using the already observed parent execution time.
+
 Middleware execution is not a Trace event and generic chain or middleware callbacks are
 not captured. Middleware may publish an explicit Memory, Guardrail, retrieval, or custom
 event through `trace_contribution(...)`. There is no Skill kind or fact. A model reading
 `SKILL.md` produces the ordinary `read_file` Tool event and no second event.
+
+Both synchronous and asynchronous Tools can be observed without application wrappers.
+Start observation completes before execution, and an observation failure prevents that
+call from starting. Run cancellation cannot forcibly stop a synchronous function that
+already began; its blocking I/O and resource lifetime must remain bounded.
 
 The first HumanMessage inside a validated Subagent scope projects only the captured
 `task.description`. The Subagent request retains the complete captured task arguments;
@@ -101,7 +110,26 @@ chain through a bounded breadth-first lookup; those containers are excluded from
 complete page, and SQL Subagent and Ledger-locator reads use batches of 500 keys. One
 Graph query may select at most 10,000 Runs in its lineage.
 
+A Tool keeps its proven Model association while execution updates its timing and actual
+input. The Graph retains the source fact for that relationship independently of request,
+result, and lifecycle facts, including during streaming updates.
+
+An unfinished Assistant without a completed Model result retains the safe content
+actually received before Run settlement. Cancellation marks it `cancelled`, interruption
+marks it `waiting`, and other missing results are `abandoned`. A proven completed Model
+output stays `succeeded`; if no complete message snapshot was captured, its body is
+explicitly omitted as `incomplete_message`, even when some fragments were received.
+Complete message snapshots and independent approval waits retain their own state.
+A terminal Run also closes any still-running Assistant whose Ledger contains no message
+settlement; this supplies no missing content. Payload limits and explicit omission
+apply to accumulated responses.
+
 ## History and live updates
+
+Graph completeness reports Runs whose call history cannot be established. A proven
+initialization failure retains its failed Run and input without inventing Model or Tool
+calls, and does not make the call history incomplete. Untracked execution failures
+still report missing call history, including when no call events were retained.
 
 `Tracer.get()` returns fixed-prefix messages, reasoning, state, interactions, summary,
 event pages, and the canonical `TraceThread.graph` for a selected lineage. Its live
@@ -112,6 +140,30 @@ updates carry the same Graph through `TraceUpdate.graph`. Multiple heads require
 valid only for the exact current tail and filter. `TraceGraphQuery.follow()` is available
 only on the current first page and publishes complete event order and direct matches with
 every delta.
+
+Following uses local notifications for the exact thread generation. Changes committed
+through another Store instance are checked at `TraceStoreOptions.follow_poll_seconds`,
+which defaults to 0.5 seconds. Each idle SQL check reads the generation, tail, and active
+Run identities in one bounded query without reloading write-side quota aggregates.
+Followers return the connection to the pool before waiting. Each MySQL read transaction
+provides a consistent snapshot without changing the session's isolation or autocommit
+setting.
+
+`TraceThread.follow()` also reports writer close and lease expiry without new events:
+the Run becomes `unknown` with `missing_tail=True`, retaining the same `as_of_seq`.
+A valid takeover can restore `running` at that sequence. Neither transition creates an
+Agent terminal or changes the independent Graph model.
+
+The fixed view exposes `TraceThread.observed_at`, the storage UTC time of its event and
+ownership read. Each `TraceUpdate` carries `generation`, `as_of_seq`, and `observed_at`.
+Consumers compare `(as_of_seq, observed_at)` within one generation, preserve timestamp
+precision, and read a fresh view when equal observations have conflicting contents.
+History cursors retain the original observation while expanding the fixed event window.
+
+Custom Stores return `TraceStoreUpdate` from `TraceStore.follow()`, including current
+ownership in the first update even with empty events. Custom Ledger Backends return
+`StoredTraceEventPage.active_run_ids` and storage-clock `observed_at` with the same
+observed tail, excluding expired leases. Common `Tracer` calls need no extra arguments.
 
 Every follow handle owns and closes its upstream Store iterator. Normal completion,
 failure, cancellation, repeated cancellation, and early consumer exit preserve the

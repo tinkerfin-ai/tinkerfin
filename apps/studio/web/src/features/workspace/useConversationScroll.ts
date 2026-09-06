@@ -67,6 +67,7 @@ export function useConversationScroll({
   const paneRef = useRef<HTMLElement>(null)
   const messageEndRef = useRef<HTMLDivElement>(null)
   const followLatest = useRef(true)
+  const readingHistory = useRef(false)
   const pendingImmediateScroll = useRef(false)
   const scrollingToBottom = useRef(false)
   const followScrollFrame = useRef<number | null>(null)
@@ -157,7 +158,7 @@ export function useConversationScroll({
       userHasScrolled.current = !isNearBottom
       followLatest.current = isNearBottom
     }
-    if (isNearBottom) {
+    if (isNearBottom && !readingHistory.current) {
       followLatest.current = true
       scrollingToBottom.current = false
       userHasScrolled.current = false
@@ -172,7 +173,7 @@ export function useConversationScroll({
     scrollMeasureFrame.current = window.requestAnimationFrame(() => {
       scrollMeasureFrame.current = null
       const isNearBottom = pane.scrollHeight - pane.scrollTop - pane.clientHeight <= 96
-      if (isNearBottom) {
+      if (isNearBottom && !readingHistory.current) {
         followLatest.current = true
         scrollingToBottom.current = false
         clearScrollButtonTimers()
@@ -196,6 +197,7 @@ export function useConversationScroll({
   }, [armScrollButtonFade, clearScrollButtonTimers, conversation.threadId, scheduleScrollPersistence, setScrollButtonPhase])
 
   const scrollToBottomImmediately = useCallback(() => {
+    readingHistory.current = false
     pendingImmediateScroll.current = true
     followLatest.current = true
     scrollingToBottom.current = false
@@ -230,12 +232,30 @@ export function useConversationScroll({
     pane.scrollTop = pane.scrollHeight
   }, [])
 
+  // 阅读历史前同步暂停跟随，避免定位期间的新消息把视口拉回末尾
+  const pauseFollowing = useCallback(() => {
+    readingHistory.current = true
+    followLatest.current = false
+    pendingImmediateScroll.current = false
+    scrollingToBottom.current = false
+    pendingUserScrollIntent.current = false
+    userHasScrolled.current = true
+    if (followScrollFrame.current != null) {
+      window.cancelAnimationFrame(followScrollFrame.current)
+      followScrollFrame.current = null
+    }
+    clearScrollButtonTimers()
+    setScrollButtonPhase('visible')
+  }, [clearScrollButtonTimers, setScrollButtonPhase])
+
   const markUserScrollIntent = useCallback(() => {
+    readingHistory.current = false
     scrollingToBottom.current = false
     pendingUserScrollIntent.current = true
   }, [])
 
   const scrollToBottom = useCallback(() => {
+    readingHistory.current = false
     // 操作完成后按钮会退出可访问树，焦点必须交给仍可继续阅读的对话区域
     paneRef.current?.focus({ preventScroll: true })
     followLatest.current = true
@@ -292,6 +312,7 @@ export function useConversationScroll({
       ? { threadId: conversation.threadId, state: savedScroll }
       : null
     lastForcedApprovalIdentity.current = null
+    readingHistory.current = false
     followLatest.current = savedScroll?.followLatest ?? true
     scrollingToBottom.current = false
     if (followScrollFrame.current != null) {
@@ -437,6 +458,7 @@ export function useConversationScroll({
     handleScroll,
     scrollToBottomImmediately,
     syncToBottomIfFollowing,
+    pauseFollowing,
     markUserScrollIntent,
     scrollBy,
     scrollToBottom,

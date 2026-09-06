@@ -21,7 +21,8 @@ class NativeStreamFrame:
     stream profile into this contract.
 
     Attributes:
-        canonical: Validated live-object representation used by protocol adapters.
+        canonical: Validated envelope borrowing live upstream objects. Consumers must
+            treat it as read-only; the frozen frame does not freeze nested objects.
         observations: Ordered protocol-neutral facts emitted for Runtime observers.
         replay: Detached finite representation used by native persistence and SSE.
         root_interrupt_ids: Root interrupt IDs observed at this exact part boundary.

@@ -1,7 +1,9 @@
 """Byte-stable Lua state machines used by the Redis messaging backend.
 
-Every script is one atomic transition over a generation-fenced stream. Redis ``TIME``
-is the only retention clock: active production has no deadline, terminal settlement or
+Every script is one atomic transition over same-slot, generation-fenced storage.
+Admission charges the prefix total together with messages, checkpoints, or records.
+A generation reserves its own tombstone record, so cleanup does not need free quota.
+Redis ``TIME`` is the only retention clock: active production has no deadline, terminal settlement or
 owner loss starts one, and the first operation after the deadline moves ``active`` to
 ``expiring``. Expiration and explicit deletion retain generation tombstones so stale
 handles fail instead of attaching to recreated data. The byte hashes and transition
@@ -44,6 +46,8 @@ local run_key = KEYS[4]
 local lease_key = KEYS[5]
 local key_index = KEYS[6]
 local signals = KEYS[7]
+local capacity = KEYS[8]
+local expirations = KEYS[9]
 local requested_generation = tonumber(ARGV[1])
 local requested_run = ARGV[2]
 local requested_codec = ARGV[3]
@@ -59,10 +63,13 @@ local max_checkpoint_bytes = ARGV[12]
 local max_thread_messages = ARGV[13]
 local max_thread_payload_bytes = ARGV[14]
 local retention_ms = tonumber(ARGV[15])
+local max_total_bytes = ARGV[16]
+local max_total_records = ARGV[17]
 
 local function set_retention_deadline()
     if retention_ms == 0 then
         redis.call('HDEL', control, 'retention_deadline_ms')
+        redis.call('ZREM', expirations, control)
         return
     end
     local retention_now = redis.call('TIME')
@@ -70,6 +77,7 @@ local function set_retention_deadline()
         + math.floor(tonumber(retention_now[2]) / 1000)
         + retention_ms
     redis.call('HSET', control, 'retention_deadline_ms', tostring(deadline))
+    redis.call('ZADD', expirations, deadline, control)
 end
 
 local function write_signal(kind, signal_run)
@@ -147,6 +155,46 @@ local stored_codec = redis.call('HGET', channel_meta, 'codec')
 if stored_codec and stored_codec ~= requested_codec then
     return {'CODEC_MISMATCH', stored_codec}
 end
+if stored_codec then
+    if redis.call('HGET', channel_meta, 'max_message_payload_bytes') ~= max_message_payload_bytes
+        or redis.call('HGET', channel_meta, 'max_checkpoint_bytes') ~= max_checkpoint_bytes
+        or redis.call('HGET', channel_meta, 'max_thread_messages') ~= max_thread_messages
+        or redis.call('HGET', channel_meta, 'max_thread_payload_bytes') ~= max_thread_payload_bytes
+        or redis.call('HGET', channel_meta, 'max_total_bytes') ~= max_total_bytes
+        or redis.call('HGET', channel_meta, 'max_total_records') ~= max_total_records then
+        return {'LIMITS_MISMATCH'}
+    end
+    if redis.call('HGET', channel_meta, 'retention_ms') ~= tostring(retention_ms) then
+        return {'RETENTION_MISMATCH'}
+    end
+end
+if redis.call('EXISTS', capacity) == 1 then
+    if redis.call('HGET', capacity, 'max_total_bytes') ~= max_total_bytes
+        or redis.call('HGET', capacity, 'max_total_records') ~= max_total_records then
+        return {'LIMITS_MISMATCH'}
+    end
+end
+local new_run = redis.call('EXISTS', run_key) == 0
+if new_run then
+    local active_key = redis.call('HGET', meta, 'active_key')
+    local active_lease = redis.call('HGET', meta, 'active_lease')
+    if active_key and active_lease and redis.call('EXISTS', active_lease) == 1 then
+        return {'RUN_ACTIVE', redis.call('HGET', meta, 'active_run') or ''}
+    end
+end
+local additional_records = 0
+if not stored_codec then additional_records = additional_records + 1 end
+if not control_state then additional_records = additional_records + 1 end
+if activate_generation then additional_records = additional_records + 1 end
+if new_run then additional_records = additional_records + 1 end
+local total_records = tonumber(redis.call('HGET', capacity, 'total_records') or '0')
+if total_records + additional_records > tonumber(max_total_records) then
+    return {'QUOTA_EXCEEDED', 'total_records', max_total_records}
+end
+redis.call('HSETNX', capacity, 'max_total_bytes', max_total_bytes)
+redis.call('HSETNX', capacity, 'max_total_records', max_total_records)
+redis.call('HSETNX', capacity, 'total_bytes', '0')
+redis.call('HINCRBY', capacity, 'total_records', additional_records)
 if not stored_codec then
     redis.call('HSET', channel_meta,
         'channel', requested_channel,
@@ -155,15 +203,9 @@ if not stored_codec then
         'max_checkpoint_bytes', max_checkpoint_bytes,
         'max_thread_messages', max_thread_messages,
         'max_thread_payload_bytes', max_thread_payload_bytes,
+        'max_total_bytes', max_total_bytes,
+        'max_total_records', max_total_records,
         'retention_ms', tostring(retention_ms))
-elseif redis.call('HGET', channel_meta, 'max_message_payload_bytes') ~= max_message_payload_bytes
-    or redis.call('HGET', channel_meta, 'max_checkpoint_bytes') ~= max_checkpoint_bytes
-    or redis.call('HGET', channel_meta, 'max_thread_messages') ~= max_thread_messages
-    or redis.call('HGET', channel_meta, 'max_thread_payload_bytes') ~= max_thread_payload_bytes then
-    return {'LIMITS_MISMATCH'}
-end
-if redis.call('HGET', channel_meta, 'retention_ms') ~= tostring(retention_ms) then
-    return {'RETENTION_MISMATCH'}
 end
 
 if activate_generation then
@@ -171,10 +213,15 @@ if activate_generation then
         'channel', requested_channel,
         'stream', requested_stream,
         'generation', tostring(requested_generation),
-        'state', 'active')
+        'state', 'active',
+        'retained_bytes', '0',
+        'retained_records', '1')
     redis.call('HSETNX', control, 'signal_seq', '0')
 end
 
+if new_run then
+    redis.call('HINCRBY', control, 'retained_records', 1)
+end
 redis.call('HSET', meta,
     'channel', requested_channel,
     'stream', requested_stream,
@@ -228,6 +275,7 @@ if redis.call('EXISTS', run_key) == 1 then
             'active_lease', lease_key)
         initialize_lease_diagnostics()
         redis.call('HDEL', control, 'retention_deadline_ms')
+        redis.call('ZREM', expirations, control)
         redis.call('SET', lease_key, owner_token .. ':' .. tostring(fence), 'PX', lease_ms)
         write_signal('recover', requested_run)
         return {
@@ -288,6 +336,7 @@ redis.call('HSET', meta,
     'active_lease', lease_key)
 initialize_lease_diagnostics()
 redis.call('HDEL', control, 'retention_deadline_ms')
+        redis.call('ZREM', expirations, control)
 redis.call('SET', lease_key, owner_token .. ':' .. tostring(fence), 'PX', lease_ms)
 return {'START', tostring(cursor), tostring(fence)}
 """
@@ -304,6 +353,7 @@ local lease_key = KEYS[5]
 local messages = KEYS[6]
 local dedupe = KEYS[7]
 local key_index = KEYS[8]
+local capacity = KEYS[9]
 local generation = ARGV[1]
 local owner_token = ARGV[2]
 local fence = ARGV[3]
@@ -317,6 +367,8 @@ local checkpoint_position = ARGV[10]
 local checkpoint_message_id = ARGV[11]
 local max_thread_messages = tonumber(ARGV[12])
 local max_thread_payload_bytes = tonumber(ARGV[13])
+local max_total_bytes = tonumber(ARGV[14])
+local max_total_records = tonumber(ARGV[15])
 local expected_owner = owner_token .. ':' .. fence
 
 if redis.call('HGET', control, 'state') ~= 'active' or redis.call('HGET', control, 'generation') ~= generation then
@@ -336,6 +388,11 @@ end
 local stored_codec = redis.call('HGET', channel_meta, 'codec')
 if not stored_codec or stored_codec ~= codec then
     return {'CODEC_MISMATCH', stored_codec or ''}
+end
+
+if tonumber(redis.call('HGET', capacity, 'max_total_bytes')) ~= max_total_bytes
+    or tonumber(redis.call('HGET', capacity, 'max_total_records')) ~= max_total_records then
+    return {'LIMITS_MISMATCH'}
 end
 
 local existing_signature = redis.call('HGET', dedupe, 'signature')
@@ -360,6 +417,26 @@ if payload_bytes + string.len(payload) > max_thread_payload_bytes then
     return {'QUOTA_EXCEEDED', 'thread_payload_bytes', tostring(max_thread_payload_bytes)}
 end
 
+local checkpoint_bytes = 0
+local previous_checkpoint_bytes = 0
+if checkpoint_present == '1' then
+    checkpoint_bytes = string.len(checkpoint_position) + string.len(checkpoint_message_id)
+    previous_checkpoint_bytes = string.len(redis.call('HGET', run_key, 'checkpoint_position') or '')
+        + string.len(redis.call('HGET', run_key, 'checkpoint_message_id') or '')
+end
+local additional_bytes = string.len(payload) + 2 * checkpoint_bytes - previous_checkpoint_bytes
+local total_bytes = tonumber(redis.call('HGET', capacity, 'total_bytes'))
+local total_records = tonumber(redis.call('HGET', capacity, 'total_records'))
+if total_bytes + additional_bytes > max_total_bytes then
+    return {'QUOTA_EXCEEDED', 'total_bytes', tostring(max_total_bytes)}
+end
+if total_records + 1 > max_total_records then
+    return {'QUOTA_EXCEEDED', 'total_records', tostring(max_total_records)}
+end
+redis.call('HINCRBY', capacity, 'total_bytes', additional_bytes)
+redis.call('HINCRBY', capacity, 'total_records', 1)
+redis.call('HINCRBY', control, 'retained_bytes', additional_bytes)
+redis.call('HINCRBY', control, 'retained_records', 1)
 local seq = redis.call('HINCRBY', meta, 'seq', 1)
 redis.call('HINCRBY', meta, 'payload_bytes', string.len(payload))
 local now = redis.call('TIME')
@@ -374,6 +451,9 @@ redis.call('XADD', messages, tostring(seq) .. '-0',
     'created_microseconds', created_microseconds)
 redis.call('HSET', dedupe,
     'signature', signature,
+    'checkpoint_present', checkpoint_present,
+    'checkpoint_position', checkpoint_position,
+    'checkpoint_message_id', checkpoint_message_id,
     'seq', tostring(seq),
     'created_seconds', created_seconds,
     'created_microseconds', created_microseconds)
@@ -432,6 +512,7 @@ local meta = KEYS[2]
 local run_key = KEYS[3]
 local lease_key = KEYS[4]
 local signals = KEYS[5]
+local expirations = KEYS[6]
 local generation = ARGV[1]
 local owner_token = ARGV[2]
 local fence = ARGV[3]
@@ -478,12 +559,14 @@ end
 redis.call('DEL', lease_key)
 if retention_ms == 0 then
     redis.call('HDEL', control, 'retention_deadline_ms')
+    redis.call('ZREM', expirations, control)
 else
     local retention_now = redis.call('TIME')
     local deadline = tonumber(retention_now[1]) * 1000
         + math.floor(tonumber(retention_now[2]) / 1000)
         + retention_ms
     redis.call('HSET', control, 'retention_deadline_ms', tostring(deadline))
+    redis.call('ZADD', expirations, deadline, control)
 end
 write_signal('finish', redis.call('HGET', run_key, 'run') or '')
 return {'OK'}
@@ -542,6 +625,7 @@ local lease_key = KEYS[4]
 local messages = KEYS[5]
 local signals = KEYS[6]
 local channel_meta = KEYS[7]
+local expirations = KEYS[8]
 local generation = ARGV[1]
 local requested_after = ARGV[2]
 local retention_ms = tonumber(ARGV[3])
@@ -549,6 +633,7 @@ local retention_ms = tonumber(ARGV[3])
 local function set_retention_deadline()
     if retention_ms == 0 then
         redis.call('HDEL', control, 'retention_deadline_ms')
+        redis.call('ZREM', expirations, control)
         return
     end
     local retention_now = redis.call('TIME')
@@ -556,6 +641,7 @@ local function set_retention_deadline()
         + math.floor(tonumber(retention_now[2]) / 1000)
         + retention_ms
     redis.call('HSET', control, 'retention_deadline_ms', tostring(deadline))
+    redis.call('ZADD', expirations, deadline, control)
 end
 
 local function write_signal(kind, signal_run)
@@ -947,9 +1033,24 @@ if redis.call('SCARD', key_index) ~= 0 then
     return {'MORE'}
 end
 redis.call('UNLINK', key_index)
+local retained_bytes = tonumber(redis.call('HGET', control, 'retained_bytes'))
+local retained_records = tonumber(redis.call('HGET', control, 'retained_records'))
+redis.call('HINCRBY', KEYS[5], 'total_bytes', -retained_bytes)
+redis.call('HINCRBY', KEYS[5], 'total_records', 1 - retained_records)
+redis.call('HDEL', control, 'retained_bytes', 'retained_records')
+redis.call('ZREM', KEYS[6], control)
 redis.call('SET', KEYS[4], final_state)
 redis.call('HSET', control, 'state', final_state)
 redis.call('HDEL', control, 'retention_deadline_ms')
 redis.call('DEL', delete_lease)
 return {'DONE'}
+"""
+
+
+# Admission discovers a bounded page of elapsed terminal controls using server time.
+# Members remain until fenced finalization, so cancellation cannot lose cleanup work.
+_DUE_EXPIRATIONS_SCRIPT = r"""
+local now = redis.call('TIME')
+local now_ms = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+return redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', tostring(now_ms), 'LIMIT', '0', '16')
 """

@@ -57,3 +57,7 @@ Python 3.11 or newer is required.
 | MySQL Sandbox state | `pip install "tinkerfin-sandbox[mysql]"` |
 
 You do not need every package at once. Start with the capability you need now.
+
+## Repository development
+
+[Build working-tree wheels and validate packaging](development.md).

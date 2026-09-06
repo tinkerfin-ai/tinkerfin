@@ -41,7 +41,7 @@ messaging = Messaging(backend=backend)
 | `key_prefix` | `tinkerfin-messaging` | Prefix reserved for this application |
 | `producer_lease_seconds` | `15.0` | Producer ownership duration on the Redis clock |
 | `generation_cleanup_retry_seconds` | `0.1` | Delay before retrying cleanup ownership |
-| `limits` | `MessagingLimits()` | Encoded payload, checkpoint, message-count, and thread-byte limits |
+| `limits` | `MessagingLimits()` | Individual, thread, and total retained-storage limits |
 | `retention_policy` | disabled | Terminal thread-generation replay window |
 
 The caller owns the Redis client and closes it during application shutdown. Size the connection pool for blocked followers, cancellation waiters, and ordinary commands.
@@ -50,7 +50,8 @@ An enabled retention policy starts at terminal settlement. Active producers do n
 expire, and a new Run before the deadline clears the timer. An expired generation raises
 `StreamExpired`; an explicit `after=0` start creates the next empty generation. Redis
 uses its server clock and performs resumable physical cleanup when a backend operation
-first observes the deadline. `delete_stream()` remains an explicit, distinct
+first observes the deadline. New Run and message writes also reclaim a bounded
+page of expired threads across channels through the prefix-wide expiry index. `delete_stream()` remains an explicit, distinct
 `StreamDeleted` lifecycle.
 
 ## Select a built-in codec explicitly
@@ -85,17 +86,31 @@ name-only channel infers both. Native Runtime sources additionally transfer the
 Driver-owned `NativeStreamPart` through `MessageCodecInputSource`; the codec never
 reparses a live upstream mapping. Custom sources need an explicit codec and RunIdentity.
 
-RedisBackend stores the complete limits fingerprint, per-generation `payload_bytes`,
-and the current and immediately previous owner's successful lease-renewal counts and UTC
-timestamps for trusted postmortem diagnostics. Workers sharing a channel must use
-identical limits and retention policies.
-Quota checks and counters are atomic with append after message-ID idempotency. These
-fields never enter `MessageEnvelope`.
+RedisBackend stores the limits, per-generation payload counters, and the current and
+immediately previous owner's successful lease-renewal counts and UTC timestamps for
+trusted diagnostics. Workers sharing a channel must agree on all limits and retention;
+workers sharing a prefix must agree on total limits. All channels in that prefix use
+one Redis Cluster hash slot so capacity admission and counters commit atomically.
+These fields never enter `MessageEnvelope`.
 
-Default limits are 16 MiB per encoded message, 1 MiB per checkpoint, 100,000 messages
-per thread generation, and 1 GiB of encoded payload per thread generation. Custom
-backends expose the same immutable limits through `messaging_settings` and must reject
-quota overflow before mutation.
+Default limits are 16 MiB per encoded message, 1 MiB per checkpoint position, 100,000
+messages and 1 GiB of payload per thread generation, and 1 GiB / 100,000 retained records
+across one MemoryBackend instance or Redis prefix. Configure `max_total_bytes` and
+`max_total_records` in `MessagingLimits` to change the totals.
+
+Total bytes count payloads, per-message checkpoint evidence, and each Run's latest
+checkpoint. Checkpoint size includes its position and UTF-8 message ID; replacing the
+latest Run checkpoint charges only the difference. Each channel, thread, live
+generation, Run, message, and tombstone counts as one record. These are logical limits,
+not a measurement of Python or Redis allocation. Custom backends expose the same limits
+through `messaging_settings` and reject quota overflow before mutation.
+
+An idempotent message retry consumes no additional quota. `MessagingQuotaExceeded`
+identifies the exhausted resource. Cancellation, settlement, and deletion remain
+available when full. Cleanup releases messages and Runs and converts the generation
+record to a tombstone. Channel, thread, and tombstone records remain charged. Retention
+is opt-in; the bounded expiry index lets new writes reclaim other expired threads,
+without a background worker or eviction of active or unexpired history.
 
 ## Define a custom message format
 

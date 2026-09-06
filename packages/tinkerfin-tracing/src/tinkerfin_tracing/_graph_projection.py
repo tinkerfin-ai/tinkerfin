@@ -9,7 +9,8 @@ from pydantic import JsonValue
 
 from ._graph_reducer import (
     ReducedTraceGraphRevision,
-    apply_graph_node_mutation,
+    apply_graph_events,
+    assistant_run_terminal_status,
     effective_graph_nodes,
     graph_node_mutations,
 )
@@ -23,6 +24,7 @@ from .facts import (
     MessageFact,
     ModelCallFact,
     PlanRevisionFact,
+    RunFact,
     SubagentFact,
     ToolExecutionFact,
     ToolFact,
@@ -49,8 +51,7 @@ def reduce_trace_graph_records(
     """Replay canonical mutations and bind their exact Ledger facts."""
 
     revisions: dict[tuple[str, str], ReducedTraceGraphRevision] = {}
-    for mutation in graph_node_mutations(events):
-        apply_graph_node_mutation(revisions, mutation)
+    apply_graph_events(revisions, events)
     by_sequence = {event.trace_seq: event for event in events}
 
     def event_at(sequence: int | None) -> TraceEvent | None:
@@ -74,6 +75,7 @@ def reduce_trace_graph_records(
                 node_id=node.node_id,
                 parent_subagent_id=node.parent_subagent_id,
                 model_call_id=node.model_call_id,
+                model_call_seq=node.model_call_seq,
                 kind=node.kind,
                 status=node.status,
                 name=node.name,
@@ -96,6 +98,7 @@ def reduce_trace_graph_records(
                 request_event=event_at(node.request_seq),
                 result_event=event_at(node.result_seq),
                 failure_event=event_at(node.failure_seq),
+                model_call_event=event_at(node.model_call_seq),
             )
         )
     return tuple(records)
@@ -233,12 +236,17 @@ def _message_fact_for(record: TraceGraphNodeRecord) -> MessageFact | None:
 def _validate_locator_slots(record: TraceGraphNodeRecord) -> None:
     """Prove every stored locator was produced for its declared Graph slot."""
 
+    if (record.model_call_id is None) != (record.model_call_seq is None):
+        raise TraceStoreProtocolError(
+            "Trace Graph Model relationship and evidence locator must be paired"
+        )
     slots = (
         ("started", record.started_seq, record.started_event),
         ("updated", record.updated_seq, record.updated_event),
         ("request", record.request_seq, record.request_event),
         ("result", record.result_seq, record.result_event),
         ("failure", record.failure_seq, record.failure_event),
+        ("model_call", record.model_call_seq, record.model_call_event),
     )
     mutations: dict[int, TraceGraphNodeMutation] = {}
     for name, sequence, event in slots:
@@ -261,6 +269,8 @@ def _validate_locator_slots(record: TraceGraphNodeRecord) -> None:
             ),
             None,
         )
+        if mutation is None and name == "updated":
+            mutation = _assistant_run_terminal_locator(record, event)
         if mutation is None or mutation.remove:
             raise TraceStoreProtocolError(
                 f"Trace Graph {name} locator does not produce that slot"
@@ -314,6 +324,61 @@ def _validate_locator_slots(record: TraceGraphNodeRecord) -> None:
         )
 
 
+def _assistant_run_terminal_locator(
+    record: TraceGraphNodeRecord,
+    event: TraceEvent,
+) -> TraceGraphNodeMutation | None:
+    """Prove a stopped delivery from its own lifecycle and same-Run terminal.
+
+    This compound locator cannot replace a completed message, an explicit terminal,
+    another Run, or any interaction. Original message and model locators remain
+    independently validated; the Run contributes no content or model relationship.
+    """
+
+    fact = event.fact
+    if (
+        record.kind is not TraceGraphNodeKind.ASSISTANT_MESSAGE
+        or not isinstance(fact, RunFact)
+        or fact.namespace
+        or fact.identity.run_id != record.run_id
+    ):
+        return None
+    status = assistant_run_terminal_status(fact)
+    if status is None:
+        return None
+    basis = tuple(
+        source
+        for source in (
+            record.started_event,
+            record.request_event,
+            record.result_event,
+            record.failure_event,
+            record.model_call_event,
+        )
+        if source is not None
+    )
+    if any(source.trace_seq >= event.trace_seq for source in basis):
+        return None
+    prior = [
+        mutation
+        for source in basis
+        for mutation in graph_node_mutations((source,))
+        if mutation.node_id == record.node_id and mutation.status is not None
+    ]
+    latest = max(prior, key=lambda mutation: mutation.updated_seq, default=None)
+    if latest is None or latest.status is not TraceGraphNodeStatus.RUNNING:
+        return None
+    return TraceGraphNodeMutation(
+        node_id=record.node_id,
+        run_id=record.run_id,
+        updated_seq=event.trace_seq,
+        status=status,
+        completed_at=None
+        if status is TraceGraphNodeStatus.WAITING
+        else fact.occurred_at,
+    )
+
+
 def _validate_locator_ownership(
     record: TraceGraphNodeRecord,
     *,
@@ -327,6 +392,7 @@ def _validate_locator_ownership(
         record.request_event,
         record.result_event,
         record.failure_event,
+        record.model_call_event,
     )
     for event in events:
         if event is None:
@@ -336,7 +402,15 @@ def _validate_locator_ownership(
             raise TraceStoreProtocolError(
                 "Trace Graph locator belongs to another Run lineage"
             )
-        if fact.namespace != record.namespace and not isinstance(fact, TurnFact):
+        run_terminal = (
+            event is record.updated_event
+            and _assistant_run_terminal_locator(record, event) is not None
+        )
+        if (
+            fact.namespace != record.namespace
+            and not isinstance(fact, TurnFact)
+            and not run_terminal
+        ):
             raise TraceStoreProtocolError(
                 "Trace Graph locator belongs to another namespace"
             )
@@ -361,7 +435,7 @@ def _validate_locator_ownership(
         scope_evidence = {
             event.fact.in_subagent_scope
             for event in events
-            if event is not None and not isinstance(event.fact, TurnFact)
+            if event is not None and not isinstance(event.fact, (TurnFact, RunFact))
         }
         if len(scope_evidence) > 1:
             raise TraceStoreProtocolError(
@@ -658,6 +732,21 @@ def project_trace_graph_node(
             content, content_omitted = _captured(message_fact.content)
         elif not isinstance(start, ModelCallFact):
             raise TraceStoreProtocolError("AssistantMessage Graph event is invalid")
+        if source_id is None and record.model_call_event is not None:
+            model_fact = record.model_call_event.fact
+            if isinstance(model_fact, ModelCallFact):
+                # The separately validated Model locator keeps the exact Native
+                # identity when a Run terminal replaces the latest message locator.
+                # Match the scoped output evidence; never decode a generated node ID.
+                source_id = next(
+                    (
+                        candidate
+                        for candidate in model_fact.output_message_ids
+                        if scope_id("message", model_fact.namespace, candidate)
+                        == record.node_id
+                    ),
+                    None,
+                )
         tool_call_only = _assistant_tool_call_only(
             record,
             content=content,

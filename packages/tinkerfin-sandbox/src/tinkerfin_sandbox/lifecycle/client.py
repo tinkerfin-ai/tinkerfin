@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextvars import ContextVar
 from uuid import uuid4
 
 from opensandbox import Sandbox
@@ -18,18 +19,29 @@ from opensandbox.exceptions import SandboxReadyTimeoutException
 from opensandbox.models import WriteEntry
 from opensandbox.models.sandboxes import SandboxFilter, SandboxInfo
 
-from ..backends.sdk import OpenSandboxBackend, unavailable_reason
+from ..backends.sdk import (
+    OpenSandboxBackend,
+    _connection_failure_reason,
+    unavailable_reason,
+)
 from ..errors import (
     OpenSandboxBackendError,
     OpenSandboxBackendProtocolError,
     OpenSandboxBackendTimeoutError,
     OpenSandboxBackendUnavailableError,
+    OpenSandboxInitializationError,
     UnexpectedOpenSandboxBackendError,
 )
 from ..models import OpenSandboxConfig, OpenSandboxRuntimeInfo
 from ._protocols import _SandboxClient
 
 _CREATE_TOKEN_METADATA_KEY = "tinkerfin.ai/create-token"
+# Manager recovery scopes this deadline to its same-instance work. Child SDK tasks
+# inherit it so cancellation can settle under the owner claim without extending
+# connection or initialization work to the client's longer standalone deadline.
+_connection_deadline: ContextVar[float | None] = ContextVar(
+    "tinkerfin_sandbox_connection_deadline", default=None
+)
 
 
 async def _join_owned_task(
@@ -95,10 +107,8 @@ def _backend_error(
             diagnostic_context=diagnostic_context,
             cause=error,
         )
-    reason = unavailable_reason(error)
-    if reason in {"not_found", "unhealthy", "unavailable"} or isinstance(
-        error, OSError
-    ):
+    reason = _connection_failure_reason(error)
+    if reason is not None:
         return OpenSandboxBackendUnavailableError(
             f"OpenSandbox is unavailable for {operation}",
             context={"reason": reason},
@@ -144,6 +154,10 @@ class OpenSandboxClient(_SandboxClient):
                 environment variables.
             config: Image, resources, mounts, timeouts, metadata, and health policy.
             initializers: Idempotent callbacks run in order after creation or connect.
+                Use native async callbacks for I/O. Synchronous callbacks run on the
+                event loop and must not block. Connect and initialization share
+                ``config.connect_timeout``; cancellation and timeouts cannot preempt
+                blocking code. Async callbacks must propagate cancellation.
         """
         self.config = config or OpenSandboxConfig()
         self.connection_config = self._resolve_connection_config(connection_config)
@@ -212,10 +226,15 @@ class OpenSandboxClient(_SandboxClient):
 
     async def _initialize(self, backend: OpenSandboxBackend) -> None:
         """Run initializers in declaration order and stop at the first failure."""
-        for initializer in self._initializers:
-            result = initializer(backend)
-            if inspect.isawaitable(result):
-                await result
+        try:
+            for initializer in self._initializers:
+                result = initializer(backend)
+                if inspect.isawaitable(result):
+                    await result
+        except Exception as error:
+            raise OpenSandboxInitializationError(
+                "OpenSandbox initializer failed", cause=error
+            ) from error
 
     async def _initialize_workspace(self, sandbox: Sandbox) -> None:
         """Idempotently create the shell and file-tool workspace through the SDK."""
@@ -288,7 +307,9 @@ class OpenSandboxClient(_SandboxClient):
             except Exception:  # noqa: BLE001 - preserve initialization failure
                 pass
             await self._close_quietly(backend)
-            translated = _backend_error("workspace initialization", error)
+            translated = OpenSandboxInitializationError(
+                "OpenSandbox workspace initialization failed", cause=error
+            )
             raise translated from error
         try:
             await self._initialize(backend)
@@ -444,52 +465,48 @@ class OpenSandboxClient(_SandboxClient):
                 pass
             raise cancellation
 
-    async def _connect_without_deadline(
+    async def _connect(
         self,
         sandbox_id: str,
     ) -> OpenSandboxBackend:
-        """Reconnect and initialize while the caller owns the outer deadline."""
+        """Bound lookup and initialization while preserving their recovery semantics.
+
+        OpenSandbox 0.1.14 does not include every endpoint request in its connect
+        timeout. Both phases share one deadline; initialization failures remain
+        distinct so a retry policy cannot repeat a caller's initializer.
+        """
+        deadline = (
+            asyncio.get_running_loop().time()
+            + self.config.connect_timeout.total_seconds()
+        )
+        recovery_deadline = _connection_deadline.get()
+        if recovery_deadline is not None:
+            deadline = min(deadline, recovery_deadline)
         try:
-            sandbox = await Sandbox.connect(
-                sandbox_id,
-                connection_config=self._sdk_connection_config,
-                connect_timeout=self.config.connect_timeout,
-            )
+            async with asyncio.timeout_at(deadline):
+                sandbox = await Sandbox.connect(
+                    sandbox_id,
+                    connection_config=self._sdk_connection_config,
+                    connect_timeout=self.config.connect_timeout,
+                )
         except Exception as error:
             translated = _backend_error("connect", error)
             raise translated from error
         backend = self._wrap(sandbox)
         try:
-            await self._initialize_workspace(sandbox)
-        except Exception as error:
+            async with asyncio.timeout_at(deadline):
+                await self._initialize_workspace(sandbox)
+                await self._initialize(backend)
+        except BaseException as error:
             await self._close_quietly(backend)
-            translated = _backend_error("workspace initialization", error)
-            raise translated from error
-        try:
-            await self._initialize(backend)
-        except BaseException:
-            await self._close_quietly(backend)
-            raise
+            if not isinstance(error, Exception) or isinstance(
+                error, OpenSandboxInitializationError
+            ):
+                raise
+            raise OpenSandboxInitializationError(
+                "OpenSandbox initialization failed", cause=error
+            ) from error
         return backend
-
-    async def _connect(self, sandbox_id: str) -> OpenSandboxBackend:
-        """Strictly reconnect within the complete configured connection deadline.
-
-        The SDK's ``connect_timeout`` does not bound every endpoint request made while
-        resolving an existing Sandbox. The outer timeout therefore covers endpoint
-        lookup, workspace health, and host initializers as one observable reconnect.
-        Unlike create, reconnect allocates no new remote resource; every partially
-        opened local backend is closed by the inner operation before timeout escapes.
-        """
-
-        try:
-            async with asyncio.timeout(self.config.connect_timeout.total_seconds()):
-                return await self._connect_without_deadline(sandbox_id)
-        except OpenSandboxBackendError:
-            raise
-        except TimeoutError as error:
-            translated = _backend_error("connect", error)
-            raise translated from error
 
     async def connect(self, sandbox_id: str) -> OpenSandboxBackend:
         """Connect to an existing Sandbox without creating a replacement."""
@@ -502,9 +519,12 @@ class OpenSandboxClient(_SandboxClient):
             )
             self._track_cleanup_task(cleanup_task)
             try:
-                await asyncio.shield(cleanup_task)
+                await _join_owned_task(
+                    cleanup_task, failure_label="Cancelled connection cleanup"
+                )
             except asyncio.CancelledError:
-                # Repeated cancellation affects only the waiter; cleanup stays retained.
+                # Even repeated cancellation must settle initialization before a
+                # manager can release its owner claim to the next operation.
                 pass
             raise cancellation
 

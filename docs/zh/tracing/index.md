@@ -65,10 +65,17 @@ AssistantMessage、Tool 或 Subagent 与产生它的 Model 调用关联起来，
 投影，不在 Ledger 重复保存正文。请求没有 SystemMessage 时仍保留真实计时的 Context，但内容
 为空。该时长表示可观测的墙钟准备延迟，不是 CPU 性能分析。
 
+已确认的 Subagent 使用父级 `task` Tool 的真实执行开始时间作为准备边界。即使子级 Model 或
+Tool 回调先于首个 Native part 到达，也只记录一次 Subagent 开场，并保留已观测到的父执行时间。
+
 Middleware 的执行过程不是 Trace 事件，通用 chain 和 middleware callback 不参与采集。业务确需
 展示时，middleware 可以通过 `trace_contribution(...)` 显式发布 Memory、Guardrail、retrieval
 或 custom 事件。Trace 不定义 Skill kind 或 fact；模型读取 `SKILL.md` 时只产生普通
 `read_file` Tool 事件，不生成第二个节点。
+
+同步和异步 Tool 都可以直接接入观察者，无需应用层额外包装。调用开始的观察记录完成后才执行
+对应操作；记录失败会阻止该次调用开始。Run 取消无法强制终止已经开始执行的同步函数，因此
+同步函数自身的阻塞 I/O 和资源生命周期仍需有明确边界。
 
 经过校验的 Subagent 作用域内，首个 HumanMessage 只投影已采集的 `task.description`；Subagent
 的 request 仍保留完整任务参数。两种视图引用同一个 Ledger Fact，不会重复保存正文。
@@ -86,7 +93,21 @@ Graph 筛选直接在 Store 中执行。request、result、message 和 state 正
 `matched_node_ids`。Subagent 最多嵌套 64 层，`max_total_nodes` 限制完整页面，SQL Subagent 和
 Ledger locator 每批最多读取 500 个 key。一次 Graph 查询最多选择 10,000 个 lineage Run。
 
+Tool 开始执行或更新实际入参时，会保留有事实依据的 Model 关联。Graph 单独保留证明该关联的
+源事实引用，使请求、结果和生命周期更新不会覆盖运行中关系的依据。
+
+没有 Model 完成结果的未结束助手消息，会在 Run 结算时保留实际收到且经过安全处理的正文。
+取消对应 `cancelled`，中断对应 `waiting`，其他缺少结果的情况对应 `abandoned`。有明确 Model
+完成结果的助手保持 `succeeded`；如果没有采集到完整消息快照，即使已收到部分片段，正文也会
+以 `incomplete_message` 明确省略。完整消息快照和独立的审批等待保留各自状态。Run 终态也会
+关闭同一 Run 中仍为运行中、但 Ledger 缺少消息结算事实的助手节点；这一状态依据不能补出缺失
+正文。累积正文仍受内容容量和显式省略规则约束。
+
 ## 历史与实时更新
+
+Graph 完整性会标记无法确认调用历史的 Run。明确发生在执行前的初始化失败会保留失败 Run 和
+输入，不生成 Model 或 Tool 调用，也不会使调用历史被标记为缺失。未启用调用跟踪的执行失败
+仍会报告缺失，即使没有保留下任何调用事件。
 
 `Tracer.get()` 返回所选 lineage 的固定前缀 messages、reasoning、state、interactions、summary、
 事件页和权威 `TraceThread.graph`；实时更新通过 `TraceUpdate.graph` 携带同一 Graph。存在多个
@@ -98,6 +119,24 @@ head 时必须指定 `head_run_id`。
 
 每个 follow handle 都拥有并关闭上游 Store iterator。正常结束、异常、取消、重复取消和消费方
 提前退出遵守相同的资源所有权与背压规则。
+
+同一 Store 实例只唤醒对应会话及存储代的订阅。其他 Store 实例提交的变化按
+`TraceStoreOptions.follow_poll_seconds` 检查，默认间隔为 0.5 秒。空闲 SQL 订阅用一次有界查询
+读取当前代、活跃 Run 和末尾序号，不反复加载写入侧配额统计。订阅在等待前将连接归还连接池。
+每个 MySQL 读取事务提供一致快照，不改变连接会话的隔离级别或自动提交设置。
+
+`TraceThread.follow()` 也交付没有新事件的 writer 关闭和 lease 到期观测：Run 变为 `unknown`，
+`missing_tail=True`，`as_of_seq` 保持不变。有效接管可在相同序号恢复 `running`；这些变化不会
+创建 Agent 终态，也不会改变独立的 Graph 模型。
+
+固定视图的 `TraceThread.observed_at` 是存储读取事件与所有权时的 UTC 时间。每个 `TraceUpdate`
+携带 `generation`、`as_of_seq` 和 `observed_at`；消费方在同一代按 `(as_of_seq, observed_at)`
+排序并保留时间精度。相同观测发生内容冲突时需重新读取。历史 cursor 扩展固定事件窗口时保留
+原始观测，不把旧分页当作较新的存活状态。
+
+自定义 Store 的 `TraceStore.follow()` 返回 `TraceStoreUpdate`，首个更新即使没有事件也提供
+当前所有权。自定义 Ledger Backend 在 `StoredTraceEventPage` 中返回与尾序号共同观测的
+`active_run_ids` 和存储时间 `observed_at`，排除已过期 lease。常见 `Tracer` 调用无需额外参数。
 
 ## 安全
 

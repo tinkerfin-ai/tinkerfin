@@ -56,6 +56,11 @@ def test_message_and_values_parts_preserve_live_objects_and_namespaces() -> None
     assert isinstance(validated_values, NativeValuesStreamPart)
     assert validated_values.interrupts[0].id == "interrupt-1"
 
+    validated_message.ns = ("tools:updated",)
+    message.content = "changed upstream"
+    assert validated_message.ns == ("tools:updated",)
+    assert validated_message.data.message.content == "changed upstream"
+
 
 @pytest.mark.parametrize(
     "part",

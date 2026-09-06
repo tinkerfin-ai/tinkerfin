@@ -82,7 +82,7 @@ if TYPE_CHECKING:
     from .agui_resume import (
         AgUiResumeBinding,
         AgUiResumeCheckpointObserver,
-        AgUiResumeInitializationFailureObserver,
+        AgUiResumeNotSavedObserver,
         AgUiResumeRequest,
     )
 
@@ -910,7 +910,9 @@ class TinkerFin:
                 )
                 | PLAN_PRIVATE_STATE_KEYS,
             )
-            observation = self._observation_hub(source)
+            observation = self._observation_hub(
+                source, initialization_error=setup_error
+            )
 
             async def failed_source() -> AsyncIterator[Mapping[str, object]]:
                 if False:  # pragma: no cover - establish async iterator shape
@@ -1017,7 +1019,7 @@ class TinkerFin:
         config: RunnableConfig | None = None,
         context: object | None = None,
         on_resume_saved: AgUiResumeCheckpointObserver | None = None,
-        on_resume_not_saved: AgUiResumeInitializationFailureObserver | None = None,
+        on_resume_not_saved: AgUiResumeNotSavedObserver | None = None,
         resume_checkpointer: _CheckpointSaver | None = None,
         stream_timeout: float | None = None,
         cleanup_timeout: float | None = None,
@@ -1158,7 +1160,7 @@ class TinkerFin:
                 config=config,
                 context=context,
                 on_resume_checkpointed=on_resume_saved,
-                on_resume_initialization_failed=on_resume_not_saved,
+                on_resume_not_saved=on_resume_not_saved,
                 timeout=stream_timeout,
                 settlement_timeout=cleanup_timeout,
                 expose_reasoning_events=include_reasoning_events,
@@ -1216,7 +1218,7 @@ class TinkerFin:
         *,
         identity: RunIdentity,
         checkpointer: object | None,
-        callback: AgUiResumeInitializationFailureObserver,
+        callback: AgUiResumeNotSavedObserver,
     ) -> None:
         """Probe and settle one pre-marker claim as a single owned operation."""
 
@@ -1334,7 +1336,7 @@ class TinkerFin:
             private_state_keys=frozenset(),
             resume=() if resume is None else resume._observation_summaries(),
         )
-        observation = self._observation_hub(context)
+        observation = self._observation_hub(context, initialization_error=error)
 
         async def failed_parts() -> AsyncIterator[Mapping[str, object]]:
             if False:  # pragma: no cover - supplies the async iterator shape
@@ -1558,10 +1560,19 @@ class TinkerFin:
             native_frame_resolver=native._take_frame,
         )
 
-    def _observation_hub(self, context: RunSourceContext) -> RuntimeObservationHub:
-        """Create one lazy request-scoped fan-out over frozen Observer registration."""
+    def _observation_hub(
+        self,
+        context: RunSourceContext,
+        *,
+        initialization_error: Exception | None = None,
+    ) -> RuntimeObservationHub:
+        """Bind observers and preserve one known pre-Graph initialization failure."""
 
-        return RuntimeObservationHub(context=context, observers=self._observers)
+        return RuntimeObservationHub(
+            context=context,
+            observers=self._observers,
+            initialization_error=initialization_error,
+        )
 
 
 __all__ = [

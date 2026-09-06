@@ -41,7 +41,7 @@ class RuntimeInterruptEnvelope(NativeRuntimeInterruptEnvelope):
 
 
 class PersistedRuntimeInterrupt(RuntimeModel):
-    """Correlation persisted in an AG-UI interrupt for a later request."""
+    """Public correlation persisted in an AG-UI interrupt for a later request."""
 
     schema_id: Literal["tinkerfin.runtime-interrupt"] = Field(
         default=RUNTIME_INTERRUPT_SCHEMA,
@@ -53,7 +53,7 @@ class PersistedRuntimeInterrupt(RuntimeModel):
         description="Original LangGraph interrupt ID",
     )
     envelope: RuntimeInterruptEnvelope = Field(
-        description="Validated runtime interrupt emitted by the graph"
+        description="Runtime interrupt with provider-private metadata removed"
     )
 
 
@@ -91,20 +91,26 @@ def prepare_runtime_ag_ui_interrupt(
         native_interrupt_id=native.id,
         envelope=published,
     )
+    # Both serialized copies reach clients and durable AG-UI replay. The resume
+    # correlation must obey the same privacy boundary as the displayed envelope.
+    # test_interleaved_public_stream.py verifies SSE, persistence, and resume together.
+    metadata = sanitize_public_data(
+        {
+            "langgraphValue": public_value,
+            "source": dict(source),
+            "runtimeInterrupt": correlation.model_dump(
+                mode="json", by_alias=True, exclude_none=False
+            ),
+        }
+    )
+    if not isinstance(metadata, dict):
+        raise TypeError("runtime interrupt metadata must serialize to an object")
     return AgUiInterrupt(
         id=native.id,
         reason=published.kind,
         message=published.message,
         response_schema=published.response_schema,
-        metadata={
-            "langgraphValue": public_value,
-            "source": dict(source),
-            "runtimeInterrupt": correlation.model_dump(
-                mode="json",
-                by_alias=True,
-                exclude_none=False,
-            ),
-        },
+        metadata=metadata,
     )
 
 

@@ -20,7 +20,7 @@ async def join_task(
 
     Args:
         task: Runtime-owned task that must settle before this call returns.
-        cancel: Whether to request task cancellation before joining.
+        cancel: Whether to request cancellation if no cancellation is already pending.
         suppress_task_cancellation: Whether owned task cancellation is expected.
 
     Returns:
@@ -28,36 +28,37 @@ async def join_task(
 
     Raises:
         asyncio.CancelledError: The caller or owned task is cancelled.
-        BaseException: The owned task fails and no caller cancellation outranks it.
+        Exception: The owned task fails without caller cancellation.
+        BaseException: The owned task raises a process-control exception, which
+            propagates unchanged even if the caller has requested cancellation.
     """
 
-    if cancel and not task.done():
+    if cancel and not task.done() and not task.cancelling():
         task.cancel()
-    current = asyncio.current_task()
-    cancel_count = current.cancelling() if current is not None else 0
     caller_cancellation: asyncio.CancelledError | None = None
-    while not task.done():
+    while True:
         try:
-            await asyncio.shield(task)
+            # wait() neither cancels the owned task nor propagates its outcome.
+            # Every cancellation here therefore belongs to the joining caller;
+            # ordinary failure and owned cancellation are read once below. Always
+            # await once so a pending caller cancellation is delivered even when
+            # the owned task has already completed.
+            await asyncio.wait((task,))
         except asyncio.CancelledError as error:
-            next_cancel_count = current.cancelling() if current is not None else 0
-            if next_cancel_count > cancel_count:
-                if caller_cancellation is None:
-                    caller_cancellation = error
-                cancel_count = next_cancel_count
+            if caller_cancellation is None:
+                caller_cancellation = error
+            if not task.done():
                 continue
-            if task.done():
-                break
-            raise
+        break
 
-    task_error: BaseException | None = None
+    task_error: Exception | asyncio.CancelledError | None = None
     result: _TaskResult | None = None
     try:
         result = task.result()
     except asyncio.CancelledError as error:
         if not suppress_task_cancellation:
             task_error = error
-    except BaseException as error:  # noqa: BLE001 - preserve the owned task outcome
+    except Exception as error:  # noqa: BLE001 - retain failure behind caller cancellation
         task_error = error
 
     if caller_cancellation is not None:

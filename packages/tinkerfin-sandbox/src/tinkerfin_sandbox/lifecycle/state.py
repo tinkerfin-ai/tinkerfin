@@ -246,10 +246,15 @@ class OpenSandboxState(Protocol):
         ...
 
     async def warm_pool_ready(self) -> bool:
-        """Return whether every configured slot is published and unclaimed.
+        """Return whether every configured slot retains verified published capacity.
+
+        A temporary verification claim retains its published Sandbox. Consumption
+        and confirmed invalidation remove it, so neither counts as ready capacity.
+        Persistent publication does not establish fresh startup verification; the
+        manager separately verifies its initial capacity before reporting ready.
 
         Returns:
-            Whether the configured warm capacity is currently consumable.
+            Whether the configured warm capacity remains published.
 
         Raises:
             OpenSandboxStateError: State is closed or capacity evidence is unavailable.
@@ -928,13 +933,10 @@ class InMemoryOpenSandboxState(OpenSandboxState):
         self._cleanup.setdefault(claim.sandbox_id, _MemoryCleanupRecord())
 
     async def warm_pool_ready(self) -> bool:
-        """Return whether every process-local warm slot is published and unclaimed."""
+        """Return whether every process-local warm slot retains a published Sandbox."""
 
         self._ensure_open()
-        return all(
-            slot.sandbox_id is not None and slot.active_token is None
-            for slot in self._warm_slots
-        )
+        return all(slot.sandbox_id is not None for slot in self._warm_slots)
 
     def _claimed_warm_slot(
         self,

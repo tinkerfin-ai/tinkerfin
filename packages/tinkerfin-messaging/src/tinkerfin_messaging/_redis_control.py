@@ -382,6 +382,7 @@ async def finish(
             keys.run_key,
             keys.lease_key,
             keys.signals,
+            self._expirations_key,
         ],
         [
             str(generation),
@@ -818,7 +819,14 @@ async def _finish_generation_cleanup(
             continue
         response = await self._eval(
             _FINALIZE_DELETE_SCRIPT,
-            [keys.control, keys.delete_lease, keys.index, keys.tombstone],
+            [
+                keys.control,
+                keys.delete_lease,
+                keys.index,
+                keys.tombstone,
+                self._capacity_key,
+                self._expirations_key,
+            ],
             [str(generation), claimed_token, expected_state, reason],
         )
         code = self._text(response[0])
@@ -888,7 +896,7 @@ def _scope(
     self: RedisBackend, channel: str, identity: RunIdentity
 ) -> _RedisStreamScope:
     channel_scope = self._digest(channel)
-    base = f"{self._prefix}:{{{channel_scope}}}"
+    base = f"{self._namespace}:channel:{channel_scope}"
     stream_digest = self._digest(identity.thread_id)
     stream_base = f"{base}:stream:{stream_digest}"
     return _RedisStreamScope(
@@ -910,9 +918,8 @@ def _keys(
 ) -> _RedisKeys:
     """Derive generation-scoped keys under one Redis Cluster hash slot.
 
-    Channel and thread digests select the shared hash tag; generation and run digests
-    then isolate replacement histories and producer ownership without exposing caller
-    identifiers in raw Redis keys.
+    The prefix selects one shared hash tag for atomic total-capacity accounting.
+    Channel, thread, and run digests isolate identities inside that slot.
     """
 
     scope = self._scope(channel, identity)
@@ -1079,7 +1086,7 @@ async def _run_snapshot(
         "run snapshot",
         self._client.eval(
             _RUN_SNAPSHOT_SCRIPT,
-            7,
+            8,
             keys.control,
             keys.meta,
             keys.run_key,
@@ -1087,6 +1094,7 @@ async def _run_snapshot(
             keys.messages,
             keys.signals,
             keys.channel_meta,
+            self._expirations_key,
             str(keys.generation),
             "__none__" if after is None else str(after),
             str(self._retention_ms),

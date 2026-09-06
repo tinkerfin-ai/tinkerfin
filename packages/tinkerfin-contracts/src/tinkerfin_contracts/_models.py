@@ -9,7 +9,11 @@ from pydantic.alias_generators import to_camel
 
 
 class ContractModel(BaseModel):
-    """Provide strict immutable validation for cross-package boundary values."""
+    """Validate finite boundary values and prevent field reassignment.
+
+    Nested dictionaries and lists remain mutable. Consumers must treat received
+    evidence as read-only; Runtime observer delivery supplies independent copies.
+    """
 
     model_config = ConfigDict(
         alias_generator=to_camel,

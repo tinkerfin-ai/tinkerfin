@@ -185,6 +185,9 @@ async def test_follow_yields_bounded_new_batches_and_releases_on_cancel() -> Non
     store = InMemoryTraceStore(limits=TraceLimits(follow_batch_size=1))
     writer = await store.open_writer(_identity())
     follower = store.follow(writer.key, after_seq=0)
+    current = await anext(follower)
+    assert current.events == ()
+    assert current.active_run_ids == (writer.run_id,)
     waiting = asyncio.ensure_future(anext(follower))
     await asyncio.sleep(0)
 
@@ -192,8 +195,8 @@ async def test_follow_yields_bounded_new_batches_and_releases_on_cancel() -> Non
     first = await waiting
     second = await anext(follower)
 
-    assert [event.trace_seq for event in first] == [1]
-    assert [event.trace_seq for event in second] == [2]
+    assert [event.trace_seq for event in first.events] == [1]
+    assert [event.trace_seq for event in second.events] == [2]
     await follower.aclose()
     await writer.aclose()
 
@@ -500,6 +503,7 @@ async def test_cancelled_follow_wait_releases_the_condition() -> None:
     store = InMemoryTraceStore()
     writer = await store.open_writer(_identity())
     follower = store.follow(writer.key, after_seq=0)
+    assert (await anext(follower)).events == ()
     waiting = asyncio.ensure_future(anext(follower))
     await asyncio.sleep(0)
 
@@ -522,6 +526,7 @@ async def test_delete_wakes_old_followers_and_recreation_uses_a_new_generation()
     key = writer.key
     await writer.aclose()
     follower = store.follow(key, after_seq=1)
+    assert (await anext(follower)).events == ()
     waiting = asyncio.ensure_future(anext(follower))
     await asyncio.sleep(0)
 

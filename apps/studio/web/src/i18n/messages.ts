@@ -1,4 +1,11 @@
 export const englishMessages = {
+  '对话目录': 'Conversation outline',
+  '仅显示已加载的对话': 'Only loaded turns are shown',
+  '已加载的提问': 'Loaded questions',
+  '未命名提问': 'Untitled question',
+  '跳转到提问：{prompt}': 'Jump to question: {prompt}',
+  '未找到对应的提问': 'The question could not be found',
+
   'TinkerFin AI Agent 对话工作台': 'TinkerFin AI Agent workspace',
   '跟随系统': 'Follow system',
   '简体中文': '简体中文',

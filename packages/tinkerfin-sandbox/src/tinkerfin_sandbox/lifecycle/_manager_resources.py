@@ -224,10 +224,13 @@ async def _is_backend_healthy(
 async def _renew_backend(
     self: OpenSandboxManager[KeyT], backend: _HealthBackend
 ) -> None:
-    """Best-effort renewal without invalidating an otherwise healthy owner handle."""
+    """Best-effort finite expiry renewal that preserves healthy owner handles."""
 
+    ttl = self._client.config.ttl
+    if ttl is None:
+        return
     try:
-        await backend.arenew(self._client.config.ttl)
+        await backend.arenew(ttl)
     except Exception:  # noqa: BLE001 - preserve the established owner reuse contract
         pass
 
@@ -235,9 +238,11 @@ async def _renew_backend(
 async def _renew_ready_backend(
     self: OpenSandboxManager[KeyT], backend: _HealthBackend
 ) -> None:
-    """Renew warm capacity strictly because readiness depends on its expiry."""
+    """Renew finite warm expiry strictly; manual-cleanup instances need no renewal."""
 
-    await backend.arenew(self._client.config.ttl)
+    ttl = self._client.config.ttl
+    if ttl is not None:
+        await backend.arenew(ttl)
 
 
 async def _close_backend(
@@ -564,6 +569,7 @@ async def _fill_warm_pool(self: OpenSandboxManager[KeyT]) -> tuple[str, ...]:
 
             async with self._warm_lock:
                 self._warm_backends.append(backend)
+            self._initial_warm_verified.add(claim.slot)
             published_ids.append(backend.id)
 
 
@@ -712,6 +718,12 @@ async def _reconcile_ready_warm_slot(
 
     backend = await _probe_ready_warm_with_renewal(self, claim)
     if backend is None:
+        self._warm_ready.clear()
+        self._notifications.warm_capacity(ready=False)
+        self._warm_failure = OpenSandboxWarmPoolUnavailableError(
+            "A published warm Sandbox is unavailable",
+            context={"target_capacity": self._warm_pool_size},
+        )
         await self._state.discard_ready_warm_slot(claim)
         self._cleanup_wakeup.set()
         return None
@@ -722,6 +734,7 @@ async def _reconcile_ready_warm_slot(
         raise
     async with self._warm_lock:
         self._warm_backends.append(backend)
+    self._initial_warm_verified.add(claim.slot)
     return backend.id
 
 
@@ -753,7 +766,6 @@ async def _maintain_warm_pool(
         self._warm_failure = None
         self._warm_ready.set()
         return
-    self._warm_ready.clear()
     try:
         if not self._state.supports_warm_pool_reconciliation:
             raise OpenSandboxWarmPoolUnavailableError(
@@ -785,6 +797,15 @@ async def _maintain_warm_pool(
                     )
                     await self._await_claim_release(release_task)
         verified_ids.update(await self._fill_warm_pool())
+        if len(self._initial_warm_verified) != self._warm_pool_size:
+            # A restarting worker must not trust stale publication while a peer's
+            # first verification is still unresolved. Keep its own bounded progress
+            # across rounds; established managers need not reacquire every slot to
+            # remain ready during routine concurrent verification.
+            raise OpenSandboxWarmPoolUnavailableError(
+                "OpenSandbox initial warm capacity has not been verified",
+                context={"target_capacity": self._warm_pool_size},
+            )
         if not await self._state.warm_pool_ready():
             raise OpenSandboxStateOwnershipError(
                 "OpenSandbox warm capacity is still being filled by another worker"
@@ -795,6 +816,8 @@ async def _maintain_warm_pool(
     except Exception as error:
         previous_failure = self._warm_failure
         self._warm_failure = error
+        self._warm_ready.clear()
+        self._notifications.warm_capacity(ready=False)
         if fail_on_error:
             raise
         if previous_failure is None or type(previous_failure) is not type(error):
@@ -805,16 +828,19 @@ async def _maintain_warm_pool(
         return
     self._warm_failure = None
     self._warm_ready.set()
+    self._notifications.warm_capacity(ready=True)
 
 
 async def _warm_maintenance_loop(self: OpenSandboxManager[KeyT]) -> None:
-    """Periodically renew ready instances and retry degraded capacity."""
+    """Keep checking warm health and retrying capacity, even without remote expiry."""
 
-    ttl_seconds = self._client.config.ttl.total_seconds()
-    interval = max(
-        _WARM_MAINTENANCE_MIN_SECONDS,
-        min(ttl_seconds / 3, _WARM_MAINTENANCE_MAX_SECONDS),
-    )
+    ttl = self._client.config.ttl
+    interval = _WARM_MAINTENANCE_MAX_SECONDS
+    if ttl is not None:
+        interval = max(
+            _WARM_MAINTENANCE_MIN_SECONDS,
+            min(ttl.total_seconds() / 3, _WARM_MAINTENANCE_MAX_SECONDS),
+        )
     while True:
         try:
             await asyncio.wait_for(
@@ -832,6 +858,7 @@ def _schedule_replenish(self: OpenSandboxManager[KeyT]) -> None:
     if self._closed or not self._started or self._warm_pool_size == 0:
         return
     self._warm_ready.clear()
+    self._notifications.warm_capacity(ready=False)
     self._warm_maintenance_wakeup.set()
 
 
@@ -855,8 +882,8 @@ async def _acquire_backend(
 
     State first transfers a global warm slot atomically to the owner. Instances
     created by this process reuse their local backend; instances created by other
-    workers reconnect by remote ID. Unhealthy instances are destroyed before the
-    manager tries another warm slot or creates on demand.
+    workers reconnect by remote ID. Unusable remote IDs are reclaimed only after a
+    healthy candidate becomes authoritative.
 
     Returns:
         Candidate backend, optional committed binding, warm-slot fact, and remote

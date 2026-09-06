@@ -36,8 +36,10 @@ export function useConversationMessageWindow({
   historyCursor,
   paneRef,
   loadOlderTrace,
+  active = true,
 }: {
   threadId: string
+  active?: boolean
   entries: ConversationDisplayEntry[]
   historyCursor?: string | null
   paneRef: RefObject<HTMLElement | null>
@@ -194,12 +196,12 @@ export function useConversationMessageWindow({
     return null
   }, [])
 
-  const highlight = useCallback((target: HTMLElement) => {
+  const highlight = useCallback((target: HTMLElement, alignment: ScrollLogicalPosition) => {
     highlightCleanup.current?.()
     const previousTabIndex = target.getAttribute('tabindex')
     target.setAttribute('tabindex', '-1')
     target.scrollIntoView({
-      block: 'center',
+      block: alignment,
       behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches
         ? 'auto'
         : 'smooth',
@@ -223,6 +225,7 @@ export function useConversationMessageWindow({
 
   const revealMessage = useCallback(async (
     messageId: string,
+    alignment: ScrollLogicalPosition = 'center',
   ): Promise<MessageLocateResult> => {
     locateController.current?.abort()
     const controller = new AbortController()
@@ -232,7 +235,7 @@ export function useConversationMessageWindow({
       while (!signal.aborted) {
         const rendered = document.getElementById(messageId)
         if (rendered) {
-          highlight(rendered)
+          highlight(rendered, alignment)
           return 'found'
         }
 
@@ -249,7 +252,7 @@ export function useConversationMessageWindow({
           })
           const target = await waitForElement(messageId, signal)
           if (!target) return signal.aborted ? 'cancelled' : 'failed'
-          highlight(target)
+          highlight(target, alignment)
           return 'found'
         }
 
@@ -271,6 +274,7 @@ export function useConversationMessageWindow({
   }, [highlight, loadOlderTrace, threadId, waitForElement, waitForRevision])
 
   const restoreTail = useCallback(() => {
+    locateController.current?.abort()
     const currentEntries = entriesRef.current
     setWindowState({
       threadId,
@@ -283,7 +287,7 @@ export function useConversationMessageWindow({
   useEffect(() => {
     locateController.current?.abort()
     highlightCleanup.current?.()
-  }, [threadId])
+  }, [threadId, active])
 
   useEffect(() => () => {
     locateController.current?.abort()

@@ -177,7 +177,7 @@ describe('ChainTraceView', () => {
   })
 
   it('renders the six product lanes and complete Model details', async () => {
-    render(<ChainTraceView threadId="thread-1" active />)
+    render(<ChainTraceView threadId="thread-1" active live={false} />)
 
     expect([...document.querySelectorAll('.chain-trace-lane-label')].map(
       (element) => element.textContent,
@@ -228,7 +228,7 @@ describe('ChainTraceView', () => {
       state: { phase: 'ready', page: graphPage([context]) },
       retry: vi.fn(),
     })
-    render(<ChainTraceView threadId="thread-empty-context" active />)
+    render(<ChainTraceView threadId="thread-empty-context" active live={false} />)
 
     fireEvent.click(row('上下文，不可用，已完成，查看详情'))
 
@@ -258,7 +258,7 @@ describe('ChainTraceView', () => {
       state: { phase: 'ready', page: graphPage(toolOnlyNodes) },
       retry: vi.fn(),
     })
-    render(<ChainTraceView threadId="thread-tool-only" active />)
+    render(<ChainTraceView threadId="thread-tool-only" active live={false} />)
 
     const toolOnly = row('助手，（仅工具调用），已完成，查看详情')
     expect(within(toolOnly).getByText('（仅工具调用）')).toHaveClass('is-muted')
@@ -266,7 +266,7 @@ describe('ChainTraceView', () => {
   })
 
   it('scopes the timeline summary to the selected Turn', () => {
-    const { container } = render(<ChainTraceView threadId="thread-1" active />)
+    const { container } = render(<ChainTraceView threadId="thread-1" active live={false} />)
     const summary = container.querySelector('.chain-trace-range-summary')
     const lastTick = () => container.querySelector('.chain-trace-ticks span:last-child')
 
@@ -283,14 +283,14 @@ describe('ChainTraceView', () => {
   })
 
   it('requests the complete Graph without a Studio kind filter', () => {
-    render(<ChainTraceView threadId="thread-1" active />)
+    render(<ChainTraceView threadId="thread-1" active live={false} />)
 
     expect(useChainTrace.mock.calls.at(-1)?.[0].filter).toEqual({ query: undefined })
     expect(screen.queryByRole('group', { name: '节点类型' })).not.toBeInTheDocument()
   })
 
   it('collapses and expands only one nested Subagent scope', () => {
-    render(<ChainTraceView threadId="thread-1" active />)
+    render(<ChainTraceView threadId="thread-1" active live={false} />)
 
     expect(row('用户，核验子任务，已完成，查看详情')).toBeVisible()
     expect(row('模型，deepseek-chat，已完成，查看详情')).toBeVisible()
@@ -310,7 +310,7 @@ describe('ChainTraceView', () => {
     queryTraceGraph.mockResolvedValue(graphPage(
       nodes.filter((item) => item.modelCallId === 'model-2'),
     ))
-    render(<ChainTraceView threadId="thread-1" active />)
+    render(<ChainTraceView threadId="thread-1" active live={false} />)
 
     fireEvent.click(screen.getByRole('button', { name: '搜索链路节点' }))
     fireEvent.change(screen.getByRole('searchbox', { name: '搜索链路节点' }), {
@@ -333,7 +333,7 @@ describe('ChainTraceView', () => {
   })
 
   it('opens one compact search control and clears it with Escape', async () => {
-    render(<ChainTraceView threadId="thread-1" active />)
+    render(<ChainTraceView threadId="thread-1" active live={false} />)
 
     const trigger = screen.getByRole('button', { name: '搜索链路节点' })
     expect(screen.queryByRole('searchbox', { name: '搜索链路节点' }))
@@ -356,7 +356,7 @@ describe('ChainTraceView', () => {
       state: { phase: 'loading' },
       retry: vi.fn(),
     })
-    const rendered = render(<ChainTraceView threadId="thread-1" active />)
+    const rendered = render(<ChainTraceView threadId="thread-1" active live={false} />)
     expect(screen.queryByLabelText('链路操作')).not.toBeInTheDocument()
     expect(screen.getByText('正在加载链路…')).toBeVisible()
 
@@ -365,14 +365,14 @@ describe('ChainTraceView', () => {
       state: { phase: 'ready', page: graphPage([]) },
       retry: vi.fn(),
     })
-    const empty = render(<ChainTraceView threadId="thread-1" active />)
+    const empty = render(<ChainTraceView threadId="thread-1" active live={false} />)
     expect(screen.getByLabelText('链路操作')).toBeVisible()
     expect(screen.getByText('没有匹配的链路节点')).toBeVisible()
 
     empty.unmount()
     const retry = vi.fn()
     useChainTrace.mockReturnValue({ state: { phase: 'error' }, retry })
-    const failed = render(<ChainTraceView threadId="thread-1" active />)
+    const failed = render(<ChainTraceView threadId="thread-1" active live={false} />)
     expect(screen.queryByLabelText('链路操作')).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: '重试' }))
     expect(retry).toHaveBeenCalledOnce()
@@ -385,7 +385,7 @@ describe('ChainTraceView', () => {
       },
       retry: vi.fn(),
     })
-    render(<ChainTraceView threadId="thread-1" active />)
+    render(<ChainTraceView threadId="thread-1" active live={false} />)
     expect(screen.getByRole('status')).toHaveTextContent(
       '链路超过完整视图上限，请使用搜索缩小范围',
     )
@@ -418,7 +418,7 @@ describe('ChainTraceView', () => {
     })
 
     const { container } = render(
-      <ChainTraceView threadId="thread-boundary" active />,
+      <ChainTraceView threadId="thread-boundary" active live={false} />,
     )
 
     expect(container.querySelectorAll('.chain-trace-ledger-row')).toHaveLength(1000)
@@ -433,7 +433,7 @@ describe('ChainTraceView', () => {
     })
     render(
       <LocaleProvider>
-        <ChainTraceView threadId="thread-1" active />
+        <ChainTraceView threadId="thread-1" active live={false} />
       </LocaleProvider>,
     )
 

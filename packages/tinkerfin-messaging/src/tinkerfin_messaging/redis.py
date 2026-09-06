@@ -12,7 +12,7 @@ from redis.asyncio import Redis
 
 from tinkerfin_contracts import RunIdentity
 
-from . import _redis_control, _redis_journal
+from . import _redis_capacity, _redis_control, _redis_journal
 from ._identity import required_identifier, required_identity
 from ._messaging_ledger import BackendRunHandle as _BackendRunHandle
 from ._redis_control import (
@@ -58,7 +58,9 @@ class RedisBackend:
     """Persist ordered streams and distributed run leases in real Redis.
 
     The injected client is borrowed and must use ``decode_responses=False`` so
-    arbitrary payload bytes survive round trips unchanged.
+    arbitrary payload bytes survive round trips unchanged. Total limits are shared by
+    all channels under ``key_prefix``; every key in that scope uses one Cluster hash
+    slot. Terminal retention is opt-in and indexed across threads for later admission.
     """
 
     def __init__(
@@ -78,7 +80,7 @@ class RedisBackend:
             key_prefix: Deployment namespace for every durable key.
             producer_lease_seconds: Producer ownership duration on the Redis clock.
             generation_cleanup_retry_seconds: Delay before retrying cleanup ownership.
-            limits: Immutable payload and per-thread capacity contract.
+            limits: Immutable individual, per-thread, and prefix-wide capacity contract.
             retention_policy: Terminal replay deadline policy; disabled by default.
 
         Raises:
@@ -115,6 +117,9 @@ class RedisBackend:
             raise ValueError("RedisBackend requires decode_responses=False")
         self._client = cast(_AsyncRedisClient, client)
         self._prefix = key_prefix
+        self._namespace = f"{key_prefix}:{{{self._digest(key_prefix)}}}"
+        self._capacity_key = f"{self._namespace}:capacity"
+        self._expirations_key = f"{self._namespace}:expirations"
         self._lease_ttl = resolved_lease_ttl
         self._lease_ms = max(1, math.ceil(resolved_lease_ttl * 1000))
         self._poll_interval = resolved_poll_interval
@@ -158,9 +163,9 @@ class RedisBackend:
     ) -> MessagingTransitionResult:
         """Commit one framework transition through the current Redis state machines.
 
-        Redis retains its existing byte-stable Lua programs and durable key shape. This
-        method translates storage-neutral transition values into those atomic programs
-        and normalizes their results without exposing Redis response codes.
+        Generation fencing, idempotency, and total-capacity accounting commit in the
+        same Lua transition. Framework values are translated at this Redis boundary;
+        callers receive storage-neutral results and stable package exceptions.
 
         Args:
             transition: Complete framework-defined lifecycle intent.
@@ -177,6 +182,8 @@ class RedisBackend:
         if not isinstance(transition, MessagingTransition):
             raise TypeError("transition must be a MessagingTransition")
         kind = transition.kind
+        if kind in {"prepare_run", "append_message"}:
+            await _redis_capacity.reclaim_expired(self)
         if kind == "prepare_run":
             codec_id = self._required_transition_text(
                 "codec_id",
@@ -1053,6 +1060,8 @@ class RedisBackend:
             "max_checkpoint_bytes": self._limits.max_checkpoint_bytes,
             "max_thread_messages": self._limits.max_thread_messages,
             "max_thread_payload_bytes": self._limits.max_thread_payload_bytes,
+            "max_total_bytes": self._limits.max_total_bytes,
+            "max_total_records": self._limits.max_total_records,
         }
         for field, expected in expected_limits.items():
             if self._hash_integer(values, field) != expected:
@@ -1233,17 +1242,11 @@ class RedisBackend:
                 "Redis idempotency evidence conflicts with its message"
             )
         checkpoint = None
-        if (
-            self._hash_text(
-                target_values,
-                "checkpoint_message_id",
-                default="",
-            )
-            == message_id
-        ):
+        if self._hash_text(dedupe_values, "checkpoint_present") == "1":
             checkpoint = RecoveryCheckpoint(
-                position=bytes(target_values.get("checkpoint_position", b"")),
-                last_message_id=message_id,
+                position=bytes(dedupe_values.get("checkpoint_position", b"")),
+                last_message_id=self._hash_text(dedupe_values, "checkpoint_message_id")
+                or None,
             )
         return StoredMessageEvidence(
             envelope=envelope,

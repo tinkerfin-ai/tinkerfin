@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import time
 from typing import Any, TypedDict, cast
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from ag_ui.core import (
@@ -36,7 +36,11 @@ from langchain.agents.middleware.types import (
     InputAgentState,
 )
 from langchain.tools import tool
-from langchain_core.callbacks.manager import CallbackManagerForLLMRun
+from langchain_core.callbacks import AsyncCallbackHandler
+from langchain_core.callbacks.manager import (
+    AsyncCallbackManagerForLLMRun,
+    CallbackManagerForLLMRun,
+)
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import (
     AIMessage,
@@ -52,6 +56,7 @@ from langchain_core.tools import BaseTool
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.redis.aio import AsyncRedisSaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+from langgraph.config import get_config
 from langgraph.runtime import Runtime
 from langgraph.store.memory import InMemoryStore
 from langgraph.types import Command, Interrupt, interrupt
@@ -66,6 +71,7 @@ from tinkerfin import (
     AgUiResumeCheckpoint,
     AgUiResumeRequest,
     RunIdentity,
+    RunObservationError,
     TinkerFin,
 )
 from tinkerfin._agui_lineage import (
@@ -106,6 +112,15 @@ from tinkerfin_agui_adapter import (
     ResumeMapper,
     RuntimeInterruptEnvelope,
     ScopedIdCodec,
+)
+from tinkerfin_contracts import (
+    ModelCallObservation,
+    ObservationBoundary,
+    RunObservationSession,
+    RunSourceContext,
+    RunTerminalObservation,
+    RuntimeObservation,
+    ToolExecutionObservation,
 )
 
 
@@ -150,6 +165,108 @@ class _FakeModel(FakeMessagesListChatModel):
             )
         )
         return self
+
+
+class _InvocationModel(_FakeModel):
+    _configs: list[RunnableConfig] = PrivateAttr(default_factory=list)
+
+    @property
+    def configs(self) -> tuple[RunnableConfig, ...]:
+        return tuple(self._configs)
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        self._configs.append(get_config())
+        return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+
+class _BlockingNativeModel(_FakeModel):
+    block_first_call: bool = False
+    _started: asyncio.Event = PrivateAttr(default_factory=asyncio.Event)
+    _settled: asyncio.Event = PrivateAttr(default_factory=asyncio.Event)
+    _release: asyncio.Event = PrivateAttr(default_factory=asyncio.Event)
+
+    @property
+    def started(self) -> asyncio.Event:
+        return self._started
+
+    @property
+    def settled(self) -> asyncio.Event:
+        return self._settled
+
+    @property
+    def release(self) -> asyncio.Event:
+        return self._release
+
+    async def _agenerate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: AsyncCallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        if not self.model_inputs and not self.block_first_call:
+            return await super()._agenerate(
+                messages, stop=stop, run_manager=run_manager, **kwargs
+            )
+        self._started.set()
+        try:
+            await self._release.wait()
+            raise RuntimeError("native provider failed")
+        finally:
+            self._settled.set()
+
+
+class _PlanSession:
+    def __init__(self) -> None:
+        self.observations: list[RuntimeObservation] = []
+        self.closed = 0
+        self.failure: asyncio.Future[BaseException] = (
+            asyncio.get_running_loop().create_future()
+        )
+
+    async def observe(self, observation: RuntimeObservation) -> None:
+        self.observations.append(observation)
+
+    async def force(self, boundary: ObservationBoundary) -> None:
+        del boundary
+
+    def failure_waiter(self) -> asyncio.Future[BaseException]:
+        return self.failure
+
+    async def aclose(self) -> None:
+        self.closed += 1
+
+
+class _PlanObserver:
+    def __init__(self) -> None:
+        self.sessions: dict[str, _PlanSession] = {}
+
+    async def open_run(self, context: RunSourceContext) -> RunObservationSession:
+        session = _PlanSession()
+        self.sessions[context.identity.run_id] = session
+        return session
+
+
+class _HostModelCallbacks(AsyncCallbackHandler):
+    def __init__(self) -> None:
+        self.model_calls: list[UUID] = []
+
+    async def on_chat_model_start(
+        self,
+        serialized: dict[str, Any],
+        messages: list[list[BaseMessage]],
+        *,
+        run_id: UUID,
+        **kwargs: Any,
+    ) -> None:
+        del serialized, messages, kwargs
+        self.model_calls.append(run_id)
 
 
 class _GlobalState(DeepAgentState):
@@ -1592,20 +1709,28 @@ async def test_planner_retries_one_provider_invalid_json_tool_call() -> None:
 
 
 @pytest.mark.asyncio
-async def test_plan_approval_hands_off_to_native_with_the_same_message_id() -> None:
-    model = _FakeModel(responses=[_planner(), AIMessage(content="native done")])
-    definition = (
-        TinkerFin()
-        .plan(enabled=True)
-        .create_deep_agent(
-            model=model,
-            tools=[],
-            checkpointer=InMemorySaver(
-                serde=JsonPlusSerializer(allowed_msgpack_modules=None)
-            ),
-        )
+@pytest.mark.parametrize("observed", [False, True])
+async def test_plan_approval_hands_off_to_native_with_the_same_message_id(
+    observed: bool,
+) -> None:
+    model = _InvocationModel(responses=[_planner(), AIMessage(content="native done")])
+    observer = _PlanObserver()
+    callbacks = _HostModelCallbacks()
+    factory = TinkerFin().observe(observer) if observed else TinkerFin()
+    definition = factory.plan(enabled=True).create_deep_agent(
+        model=model,
+        tools=[],
+        checkpointer=InMemorySaver(
+            serde=JsonPlusSerializer(allowed_msgpack_modules=None)
+        ),
     )
-    config: RunnableConfig = {"configurable": {"thread_id": "plan-thread"}}
+    config: RunnableConfig = {
+        "configurable": {"thread_id": "plan-thread", "caller_policy": "restricted"},
+        "callbacks": [callbacks],
+        "tags": ["caller-tag"],
+        "metadata": {"caller_note": "retained"},
+        "recursion_limit": 18,
+    }
     first = await _parts(
         definition,
         {"messages": [HumanMessage(content="Implement", id="request-1")]},
@@ -1656,6 +1781,217 @@ async def test_plan_approval_hands_off_to_native_with_the_same_message_id() -> N
         for part in completed
     )
     assert _root_interrupts(first)[0].value["kind"] == "tinkerfin:plan_review"
+    assert len(callbacks.model_calls) == 2
+    execution_config = model.configs[-1]
+    assert execution_config.get("recursion_limit") == 18
+    assert "caller-tag" in execution_config.get("tags", [])
+    assert execution_config.get("metadata", {}).get("caller_note") == "retained"
+    assert execution_config.get("configurable", {}).get("caller_policy") == "restricted"
+    if observed:
+        session = observer.sessions["approve-2"]
+        calls = [
+            item
+            for item in session.observations
+            if isinstance(item, ModelCallObservation)
+        ]
+        assert [item.phase for item in calls] == ["started", "completed"]
+        assert calls[0].call_id == calls[1].call_id
+        assert any(
+            item.message_type == "system"
+            and "<tinkerfin-approved-plan" in str(item.content)
+            for item in calls[0].messages
+        )
+        terminals = [
+            item
+            for item in session.observations
+            if isinstance(item, RunTerminalObservation)
+        ]
+        assert [item.outcome for item in terminals] == ["succeeded"]
+        assert session.closed == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("planned", "observed", "ending"),
+    [
+        (planned, observed, ending)
+        for planned in (False, True)
+        for observed in (False, True)
+        for ending in (
+            "cancel",
+            "repeat_cancel",
+            "close",
+            "timeout",
+            "provider",
+            "observer",
+        )
+        if ending != "observer" or observed
+    ],
+)
+async def test_runtime_settles_native_work_after_interruption(
+    planned: bool,
+    observed: bool,
+    ending: str,
+) -> None:
+    model = _BlockingNativeModel(
+        responses=[_planner(), AIMessage(content="unused")],
+        block_first_call=not planned,
+    )
+    observer = _PlanObserver()
+    healthy_observer = _PlanObserver()
+    factory = TinkerFin()
+    if observed:
+        factory = factory.observe(observer).observe(healthy_observer)
+    if planned:
+        factory = factory.plan(enabled=True)
+    definition = factory.create_deep_agent(
+        model=model, tools=[], checkpointer=InMemorySaver()
+    )
+    config: RunnableConfig = {"configurable": {"thread_id": "plan-thread"}}
+    graph_input: InputAgentState | Command[object] = {
+        "messages": [HumanMessage(content="Implement", id="request")]
+    }
+    if planned:
+        await _parts(
+            definition,
+            graph_input,
+            run_id="interruption-review",
+            config=config,
+            mode="plan",
+        )
+        graph_input = Command(resume={"type": "approve", "baseRevision": 1})
+    stream = definition.new(identity=_identity("interruption-execution")).astream(
+        graph_input,
+        config=config,
+        stream_mode=["messages", "tasks", "values"],
+        version="v2",
+        subgraphs=True,
+    )
+
+    async def consume() -> None:
+        async for _part in stream:
+            pass
+
+    consumer = asyncio.create_task(consume())
+    try:
+        await asyncio.wait_for(model.started.wait(), 5)
+        if ending == "provider":
+            model.release.set()
+            with pytest.raises(RuntimeError, match="native provider failed"):
+                await consumer
+        elif ending == "observer":
+            session = observer.sessions["interruption-execution"]
+            session.failure.set_result(RuntimeError("observer delivery failed"))
+            with pytest.raises(RunObservationError):
+                await consumer
+        elif ending == "timeout":
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(consumer, 0.01)
+        else:
+            if ending == "close":
+                await stream.aclose()
+            else:
+                consumer.cancel()
+                if ending == "repeat_cancel":
+                    await asyncio.sleep(0)
+                    consumer.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await consumer
+        await stream.aclose()
+        await stream.aclose()
+        assert model.settled.is_set()
+        if observed:
+            assert observer.sessions["interruption-execution"].closed == 1
+            terminals = [
+                item
+                for item in healthy_observer.sessions[
+                    "interruption-execution"
+                ].observations
+                if isinstance(item, RunTerminalObservation)
+            ]
+            assert [item.outcome for item in terminals] == [
+                "failed" if ending in {"provider", "observer"} else "cancelled"
+            ]
+        with pytest.raises(StopAsyncIteration):
+            await anext(stream)
+    finally:
+        if not consumer.done():
+            consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
+        await stream.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("observed", [False, True])
+async def test_plan_handoff_close_between_parts_is_scoped_and_idempotent(
+    observed: bool,
+) -> None:
+    model = _FakeModel(responses=[_planner(), AIMessage(content="native response")])
+    observer = _PlanObserver()
+    factory = TinkerFin().observe(observer) if observed else TinkerFin()
+    definition = factory.plan(enabled=True).create_deep_agent(
+        model=model, tools=[], checkpointer=InMemorySaver()
+    )
+    config: RunnableConfig = {"configurable": {"thread_id": "plan-thread"}}
+    await _parts(
+        definition,
+        {"messages": [HumanMessage(content="Implement", id="request")]},
+        run_id="closing-review",
+        config=config,
+        mode="plan",
+    )
+    unopened = definition.new(identity=_identity("unopened-execution")).astream(
+        Command(resume={"type": "approve", "baseRevision": 1}), config=config
+    )
+    await unopened.aclose()
+    await unopened.aclose()
+    assert len(model.model_inputs) == 1
+    assert "unopened-execution" not in observer.sessions
+    stream = definition.new(identity=_identity("closing-execution")).astream(
+        Command(resume={"type": "approve", "baseRevision": 1}),
+        config=config,
+        stream_mode=["messages", "tasks", "values"],
+        version="v2",
+        subgraphs=True,
+    )
+    try:
+        async for part in stream:
+            if part["type"] != "messages" or len(model.model_inputs) != 2:
+                continue
+            unrelated = _FakeModel(responses=[AIMessage(content="ordinary response")])
+            ordinary = (
+                TinkerFin()
+                .plan(enabled=True)
+                .create_deep_agent(
+                    model=unrelated, tools=[], checkpointer=InMemorySaver()
+                )
+            )
+            ordinary_stream = ordinary.new(
+                identity=_identity("unrelated-run", thread_id="unrelated-thread")
+            ).astream(
+                {"messages": [HumanMessage(content="Ordinary", id="unrelated")]},
+                config={"configurable": {"thread_id": "unrelated-thread"}},
+            )
+            async for _ordinary_part in ordinary_stream:
+                pass
+            assert all(
+                "<tinkerfin-approved-plan" not in str(message.content)
+                for message in unrelated.model_inputs[-1]
+            )
+            break
+        else:
+            pytest.fail("native model produced no message part")
+    finally:
+        await stream.aclose()
+        await stream.aclose()
+    if observed:
+        session = observer.sessions["closing-execution"]
+        assert session.closed == 1
+        assert [
+            item.outcome
+            for item in session.observations
+            if isinstance(item, RunTerminalObservation)
+        ] == ["cancelled"]
 
 
 @pytest.mark.asyncio
@@ -1710,8 +2046,10 @@ async def test_plan_handoff_preserves_user_content_blocks_exactly() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.redis_e2e
+@pytest.mark.parametrize("observed", [False, True])
 async def test_real_redis_plan_approval_executes_native_handoff(
     redis_checkpoint_url: str,
+    observed: bool,
 ) -> None:
     token = uuid4().hex
     thread_id = f"tinkerfin-plan-handoff-{token}"
@@ -1730,11 +2068,13 @@ async def test_real_redis_plan_approval_executes_native_handoff(
     )
     try:
         await saver.asetup()
-        model = _FakeModel(responses=[_planner(), AIMessage(content="native done")])
-        definition = (
-            TinkerFin()
-            .plan(enabled=True)
-            .create_deep_agent(model=model, tools=[], checkpointer=saver)
+        model = _InvocationModel(
+            responses=[_planner(), AIMessage(content="native done")]
+        )
+        observer = _PlanObserver()
+        factory = TinkerFin().observe(observer) if observed else TinkerFin()
+        definition = factory.plan(enabled=True).create_deep_agent(
+            model=model, tools=[], checkpointer=saver
         )
         config = {"configurable": {"thread_id": thread_id}}
         review = await _agui_events(
@@ -1780,6 +2120,18 @@ async def test_real_redis_plan_approval_executes_native_handoff(
             event.model_dump_json(by_alias=True) for event in completed
         )
         assert "<tinkerfin-approved-plan" not in serialized_events
+        assert (
+            model.configs[-1].get("configurable", {}).get(RUN_ID_METADATA_KEY)
+            == "redis-execution"
+        )
+        if observed:
+            session = observer.sessions["redis-execution"]
+            assert [
+                item.phase
+                for item in session.observations
+                if isinstance(item, ModelCallObservation)
+            ] == ["started", "completed"]
+            assert session.closed == 1
     finally:
         try:
             await saver.adelete_thread(thread_id)
@@ -2222,7 +2574,10 @@ async def test_native_conversation_continues_after_plan_handoff() -> None:
 
 
 @pytest.mark.asyncio
-async def test_concurrent_plan_handoffs_isolate_transient_system_context() -> None:
+@pytest.mark.parametrize("managed", [False, True])
+async def test_concurrent_plan_handoffs_isolate_transient_system_context(
+    managed: bool,
+) -> None:
     model = _FakeModel(
         responses=[
             _planner(goal="Execute alpha"),
@@ -2231,25 +2586,30 @@ async def test_concurrent_plan_handoffs_isolate_transient_system_context() -> No
             AIMessage(content="beta done"),
         ]
     )
-    definition = (
-        TinkerFin()
-        .plan(enabled=True)
-        .create_deep_agent(
-            model=model,
-            tools=[],
-            checkpointer=InMemorySaver(),
-        )
+    factory = TinkerFin().observe(_PlanObserver()) if managed else TinkerFin()
+    definition = factory.plan(enabled=True).create_deep_agent(
+        model=model,
+        tools=[],
+        checkpointer=InMemorySaver(),
     )
-    graph = await definition.create_graph(mode="plan")
+    graph = None if managed else await definition.create_graph(mode="plan")
 
     async def collect(
         graph_input: InputAgentState | Command[object] | None,
         *,
         thread_id: str,
     ) -> list[Mapping[str, object]]:
+        if managed:
+            stream = definition.new(
+                identity=_identity(uuid4().hex, thread_id=thread_id),
+                mode="plan",
+            ).astream
+        else:
+            assert graph is not None
+            stream = graph.astream
         return [
             part
-            async for part in graph.astream(
+            async for part in stream(
                 graph_input,
                 config={"configurable": {"thread_id": thread_id}},
                 stream_mode=["messages", "tasks", "values"],
@@ -3450,8 +3810,11 @@ def approved_tool(value: str) -> str:
 
 
 @pytest.mark.asyncio
-async def test_plan_handoff_tool_interrupt_resumes_as_native_default() -> None:
-    model = _FakeModel(
+@pytest.mark.parametrize("observed", [False, True])
+async def test_plan_handoff_tool_interrupt_resumes_as_native_default(
+    observed: bool,
+) -> None:
+    model = _InvocationModel(
         responses=[
             _planner(),
             AIMessage(
@@ -3468,15 +3831,13 @@ async def test_plan_handoff_tool_interrupt_resumes_as_native_default() -> None:
             AIMessage(content="tool complete"),
         ]
     )
-    definition = (
-        TinkerFin()
-        .plan(enabled=True)
-        .create_deep_agent(
-            model=model,
-            tools=[approved_tool],
-            interrupt_on={"approved_tool": {"allowed_decisions": ["approve"]}},
-            checkpointer=InMemorySaver(),
-        )
+    observer = _PlanObserver()
+    factory = TinkerFin().observe(observer) if observed else TinkerFin()
+    definition = factory.plan(enabled=True).create_deep_agent(
+        model=model,
+        tools=[approved_tool],
+        interrupt_on={"approved_tool": {"allowed_decisions": ["approve"]}},
+        checkpointer=InMemorySaver(),
     )
     config = {"configurable": {"thread_id": "plan-thread"}}
     review = await _agui_events(
@@ -3538,6 +3899,34 @@ async def test_plan_handoff_tool_interrupt_resumes_as_native_default() -> None:
         if isinstance(event, StateDeltaEvent)
         for operation in event.delta
     )
+    assert [
+        invocation.get("configurable", {}).get(RUN_ID_METADATA_KEY)
+        for invocation in model.configs
+    ] == ["tool-review", "tool-execution", "tool-resume"]
+    for execution_input in model.model_inputs[1:]:
+        assert any(
+            isinstance(message, SystemMessage)
+            and "<tinkerfin-approved-plan" in message.text
+            for message in execution_input
+        )
+    if observed:
+        for run_id in ("tool-review", "tool-execution", "tool-resume"):
+            session = observer.sessions[run_id]
+            calls = [
+                item
+                for item in session.observations
+                if isinstance(item, ModelCallObservation)
+            ]
+            assert [item.phase for item in calls] == ["started", "completed"]
+            assert calls[0].call_id == calls[1].call_id
+            assert session.closed == 1
+        tools = [
+            item
+            for item in observer.sessions["tool-resume"].observations
+            if isinstance(item, ToolExecutionObservation)
+        ]
+        assert [item.phase for item in tools] == ["started", "completed"]
+        assert tools[0].tool_call_id == tools[1].tool_call_id == "approved-call"
 
 
 @pytest.mark.asyncio

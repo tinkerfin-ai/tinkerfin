@@ -82,6 +82,10 @@ Studio 在应用启动时选定默认稳定 Runtime Profile，不按模型或 Ru
 - `GET /api/conversation/{threadId}/trace` 先发送完整 Trace snapshot，再按提交顺序发送语义增量；
   `includeTaskTrace=true` 时只在任务轨迹实际变化后发送完整 replacement；断连或取消会关闭
   底层 follow iterator 与请求内 projector
+- Trace 视图和增量携带 `generation`、`asOfSeq`、`observedAt`。同一代按事件序号和存储 UTC
+  观测时间排序，保留微秒；writer 失活或有效接管可以在同一序号更新运行状态。列表摘要用相同
+  规则拒绝迟到快照；相同观测发生内容冲突时重新读取 Trace。历史分页保留固定前缀的原始观测，
+  补充历史内容时保留前端已收到的较新运行状态
 - `GET /api/conversation/{threadId}/trace/graph` 在校验用户归属后由 Trace Store 直接筛选链路
   节点，支持 `kind`、`status`、`modelCallId`、`agent`、`provider`、`model`、`namespace`、
   `query`、`startedAfter`、`startedBefore`、opaque `cursor` 与 `limit`；响应中的 Turn 是容器，
@@ -161,6 +165,9 @@ OpenSandbox 的 SQLite Store 与 Docker runtime metadata 分别使用持久卷�
 
 ## 运行约束
 
+- 用户级 Sandbox 工作区使用手动清理生命周期，不会因闲置到期；同一用户的会话共用该工作区，
+  持久绑定支持后端正常重启后重连。实例会持续占用资源，需通过明确的清理操作结束使用。
+  该策略不提供文件备份，外部删除、宿主机或存储故障仍可能造成文件丢失
 - `/health/live` 只表示进程存活
 - `/health/ready` 独立检查 MySQL、Redis Control、Redis Runtime、OpenSandbox 控制面与真实预热容量，
   就绪失败返回 503
@@ -168,7 +175,9 @@ OpenSandbox 的 SQLite Store 与 Docker runtime metadata 分别使用持久卷�
   启动时还会用 `@@max_connections` 校验 `DATABASE_MANAGEMENT_CONNECTION_RESERVE`
 - `MESSAGING_RETENTION_SECONDS` 默认 `86400`，只定义终态后的网络重播窗口；`0` 关闭自动过期
 - 容器日志默认只写 stdout；设置 `LOG_FILE_ENABLED=true` 后写入持久日志卷
-- `dist/` 保存本次发布依赖与 wheel；`build/` 和 `.egg-info` 在构建后删除
+- `DATABASE_ECHO` 独立于 `LOG_LEVEL` 控制 SQL 语句与参数的日志输出；SQL 日志使用应用日志格式，
+  写入标准输出和已启用的文件日志，每个输出各记录一次
+- `dist/` 保存本次发布依赖与 wheel；部署通过仓库统一入口在临时副本中构建，并逐字节核对源码、类型声明和包资源；工作树中的 `build/` 与 `.egg-info` 不参与构建
 - `docker compose down -v` 会永久删除 MySQL、两个 Redis、OpenSandbox 和日志卷数据
 - 文件型 Secrets 优先于普通环境变量；缺失、不可读或内容为空会阻止启动
 

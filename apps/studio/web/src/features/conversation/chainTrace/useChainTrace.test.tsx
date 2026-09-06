@@ -102,6 +102,7 @@ describe('useChainTrace', () => {
     const { result } = renderHook(() => useChainTrace({
       threadId: 'thread-1',
       active: false,
+      live: false,
       filter: {},
       limit: 1000,
     }))
@@ -126,6 +127,7 @@ describe('useChainTrace', () => {
     const { result, unmount } = renderHook(() => useChainTrace({
       threadId: 'thread-1',
       active: true,
+      live: true,
       filter: { kinds: ['tool'] },
       limit: 1000,
     }), { reactStrictMode: true })
@@ -155,6 +157,7 @@ describe('useChainTrace', () => {
         return useChainTrace({
           threadId: 'thread-1',
           active: true,
+          live: true,
           filter: {},
           limit: 1000,
         })
@@ -208,6 +211,7 @@ describe('useChainTrace', () => {
     const { result, unmount } = renderHook(() => useChainTrace({
       threadId: 'thread-1',
       active: true,
+      live: true,
       filter: {},
       limit: 1000,
     }))
@@ -258,6 +262,7 @@ describe('useChainTrace', () => {
     const { result, unmount } = renderHook(() => useChainTrace({
       threadId: 'thread-1',
       active: true,
+      live: true,
       filter: { kinds: ['model'] },
       limit: 1000,
     }))
@@ -303,6 +308,7 @@ describe('useChainTrace', () => {
     const { result } = renderHook(() => useChainTrace({
       threadId: 'thread-1',
       active: true,
+      live: true,
       filter: {},
       limit: 1000,
     }))
@@ -326,6 +332,7 @@ describe('useChainTrace', () => {
     const { result } = renderHook(() => useChainTrace({
       threadId: 'thread-1',
       active: true,
+      live: true,
       filter: {},
       limit: 1000,
     }))
@@ -360,6 +367,7 @@ describe('useChainTrace', () => {
       const { result } = renderHook(() => useChainTrace({
         threadId: 'thread-1',
         active: true,
+        live: true,
         filter: {},
         limit: 1000,
       }))
@@ -396,6 +404,7 @@ describe('useChainTrace', () => {
     const { result } = renderHook(() => useChainTrace({
       threadId: 'thread-1',
       active: true,
+      live: true,
       filter: {},
       limit: 1000,
     }))
@@ -431,6 +440,7 @@ describe('useChainTrace', () => {
     }: { kinds: Array<'tool' | 'model'> }) => useChainTrace({
       threadId: 'thread-1',
       active: true,
+      live: true,
       filter: { kinds },
       limit: 1000,
     }), { initialProps: { kinds: ['tool'] } })
@@ -468,6 +478,7 @@ describe('useChainTrace', () => {
       const { result } = renderHook(() => useChainTrace({
         threadId: 'thread-1',
         active: true,
+        live: true,
         filter: {},
         limit: 1000,
       }))

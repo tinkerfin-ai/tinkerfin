@@ -1,4 +1,6 @@
-"""Nominal implementation links used by IDE protocol navigation."""
+"""Built-in instances satisfy the public runtime-checkable protocols."""
+
+from redis.asyncio import Redis
 
 from tinkerfin_messaging import (
     AgUiCodec,
@@ -11,16 +13,22 @@ from tinkerfin_messaging import (
 )
 
 
-def test_messaging_builtin_implementations_declare_their_protocols() -> None:
-    implementations = {
-        MemoryBackend(): (MessagingBackend,),
-        object.__new__(RedisBackend): (MessagingBackend,),
-        AgUiCodec(): (MessageCodec, SseRenderer),
-        NativeStreamPartCodec(): (MessageCodec, SseRenderer),
-    }
+async def test_messaging_builtin_implementations_declare_their_protocols() -> None:
+    # Construction opens no connection. Runtime checks may read settings properties,
+    # which belong to initialized instances just like ordinary public access.
+    client = Redis()
+    try:
+        implementations = {
+            MemoryBackend(): (MessagingBackend,),
+            RedisBackend(client): (MessagingBackend,),
+            AgUiCodec(): (MessageCodec, SseRenderer),
+            NativeStreamPartCodec(): (MessageCodec, SseRenderer),
+        }
 
-    for implementation, protocols in implementations.items():
-        assert all(isinstance(implementation, protocol) for protocol in protocols)
+        for implementation, protocols in implementations.items():
+            assert all(isinstance(implementation, protocol) for protocol in protocols)
+    finally:
+        await client.aclose()
 
 
 def test_builtin_backends_do_not_expose_framework_lifecycle_operations() -> None:

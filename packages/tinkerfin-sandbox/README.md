@@ -5,7 +5,7 @@
 `tinkerfin-sandbox` adapts OpenSandbox SDK 0.1.14 to asynchronous Deep Agents backend
 and lifecycle contracts. It provides stable caller-keyed Sandboxes, reconnection,
 health replacement, warm capacity, rooted paths, reset and destroy operations,
-cancellation-safe cleanup, and optional multi-worker allocation state.
+cancellation-safe cleanup, optional lifecycle observers, and multi-worker allocation state.
 
 The package does not depend on `tinkerfin`. Authentication, tenancy policy, key
 selection, graph construction, and HTTP behavior belong to the host.
@@ -94,14 +94,63 @@ in remote OpenSandbox owner labels; those labels use stable digests.
 ## Lifecycle
 
 - `get(key)` creates, reconnects, or reuses a healthy backend;
-- `reconnect(key)` is an alias for `get(key)`, including creation when no binding
-  exists;
+- `reconnect(key)` connects an existing binding without creating or replacing it;
 - `recreate(key)` commits a replacement and retires the previous instance;
 - `reset(key)` clears the configured `workspace_root` without changing the binding;
 - `destroy(key)` destroys known remote instances and removes the binding;
 - `get_details(key)` returns a stable owner-aware runtime snapshot;
 - `check_ready()` raises when configured warm capacity is degraded;
 - `aclose()` waits for active operations and closes owned local resources.
+
+Existing bindings are preserved by default when recovery fails. The default
+`OpenSandboxRecoveryPolicy` allows three attempts with a 30-second work budget and exponential
+delays from 0.5 to 2 seconds. Set
+`recovery_policy=OpenSandboxRecoveryPolicy(on_failure="recreate")` only when a new
+instance may replace the old workspace; files are not copied. Authentication,
+permission, protocol, initialization, and State failures never trigger recreation.
+An unresolved connection at the total deadline also preserves the binding.
+`reconnect()` and `reset()` retain identity regardless of this policy. Ordinary
+commands, writes, and resets are never replayed.
+
+Native connection and initialization use the earlier client or recovery deadline.
+The budget covers connection, health checks, and retry waits; necessary cancellation
+and resource settlement complete before releasing the owner claim and can extend
+elapsed time. Blocking callbacks cannot be forcibly interrupted.
+
+`OpenSandboxConfig.ttl` defaults to two hours from creation or renewal. For a remote
+workspace whose lifetime ends with explicit cleanup, use
+`OpenSandboxConfig(ttl=None)`. Newly created instances then have no automatic expiry,
+and the manager skips remote renewal while continuing warm health maintenance.
+Connecting to an existing instance does not remove its scheduled expiry.
+
+Resource ownership still determines close behavior: default in-memory State destroys
+its remote instances when the manager closes, while persistent State retains bindings
+for other workers. Non-expiring instances keep consuming resources until destroyed;
+call `manager.destroy(key)` when their work is complete. A finite TTL, external
+deletion, or storage failure can remove files. Manual cleanup is not a backup; use
+volumes and an appropriate backup policy when files must survive instance loss.
+
+For lifecycle observations, pass `observers=[observer]`, where the observer implements
+`async on_sandbox_event(event: OpenSandboxLifecycleEvent)`. Immutable events report
+unavailability, recovery, replacement, explicit reset/destruction, and separate warm
+capacity changes. Successful replacement is reported only after binding and handle
+publication; first creation and normal close do not report replacement or failure.
+Remote IDs are confined to trusted-only `diagnostic_context`. Do not forward that
+mapping to browsers.
+
+`workspace_may_have_changed` also covers confirmed remote absence and possible
+initializer side effects during connection and recovery. `False` means the event
+supplies no such evidence; it does not certify file integrity. Retaining a remote
+instance does not roll back initialization effects.
+
+Notifications are process-local and best effort, with one ordered queue per borrowed
+observer. `OpenSandboxNotificationOptions(max_pending_events=128, timeout=1.0)` controls
+pending capacity and callback seconds through `notification_options`. Full queues
+drop new events; observer failures do not affect Sandbox operations. Close drains
+accepted notifications without closing observers. Callbacks must be non-blocking,
+propagate cancellation, and never reenter their manager's resource operations or
+close. Existing access and warm maintenance discover changes; notifications add no
+user Sandbox polling or durable delivery.
 
 `settlement_timeout=None` keeps the default complete wait. A finite constructor value
 limits only each caller's wait: expiry raises `OpenSandboxSettlementTimeoutError`,
@@ -128,19 +177,29 @@ values; booleans are rejected before State startup or task creation. State and
 SQLAlchemy constructors apply the same boundary so invalid capacity cannot fail later
 inside warmup.
 
-Published warm slots are fenced, reconnected, health-checked, and renewed before they
-count as ready. Missing or expired instances are replaced atomically. The manager keeps
-ready instances renewed while it is open and retries failed background replenishment;
+Published warm slots are fenced, reconnected, health-checked, and renewed when they
+have a configured finite TTL before they count as ready. Missing or expired instances
+are replaced atomically. The manager checks warm health while it is open, renews finite
+expiry, and retries failed background replenishment;
 `check_ready()` exposes degraded capacity to a host without leaking provider details.
+Routine verification retains previously published capacity; the check reads shared
+State to detect consumption by other workers without waiting for local maintenance.
 With `fail_on_startup_warmup_error=True`, authentication, reconnect, health, renewal,
 creation, or publication failure prevents startup.
+
+A manager first verifies the full configured capacity before reporting ready.
+Concurrent peer checks can leave this initial verification incomplete; strict startup
+fails, while ordinary startup stays degraded and resumes through existing maintenance.
+Initial progress is retained across rounds. After it completes, routine peer checks
+continue to preserve published readiness.
 
 With `InMemoryOpenSandboxState`, shutdown destroys remote Sandboxes owned only by that
 process because no later worker can recover them. Persistent state keeps committed
 bindings, warm slots, and durable cleanup work available to other workers.
-It stores lifecycle identity rather than container contents. An expired owner binding
-is replaced on the next `get()`; durable workspace contents require an OpenSandbox
-volume or snapshot policy selected by the host.
+It stores lifecycle identity rather than container contents. If an owner instance has
+expired, `get()` reports failure and preserves the binding by default; replacement
+requires an explicit recreation policy. Durable workspace contents require an
+OpenSandbox volume or another storage policy selected by the host.
 
 ## Rooted backend
 

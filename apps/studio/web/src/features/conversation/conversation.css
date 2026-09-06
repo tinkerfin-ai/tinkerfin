@@ -1589,6 +1589,8 @@
   }
 
   .composer-dock {
+    --composer-inline-inset: var(--space-4);
+    --composer-top-inset: var(--space-2);
     grid-row: 2;
     grid-column: 1;
     align-self: end;
@@ -1597,16 +1599,21 @@
     isolation: isolate;
     min-width: 0;
     pointer-events: none;
-    padding: var(--space-2) var(--space-4) max(var(--space-3), env(safe-area-inset-bottom));
+    padding: var(--composer-top-inset) var(--composer-inline-inset) max(var(--space-3), env(safe-area-inset-bottom));
     background: transparent;
   }
 
+  /* 临时辅助操作浮于内容上沿，不改变阅读区域及目录的高度 */
   .composer-auxiliary-controls {
+    position: absolute;
+    bottom: calc(100% - var(--composer-top-inset) + var(--space-1-5));
+    left: 50%;
+    transform: translateX(-50%);
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
-    width: min(100%, var(--layout-composer-width));
+    width: min(calc(100% - 2 * var(--composer-inline-inset)), var(--layout-composer-width));
     min-height: var(--control-sm);
-    margin: 0 auto var(--space-1-5);
+    margin: 0;
     align-items: center;
     gap: var(--space-3);
     pointer-events: none;
@@ -1683,8 +1690,8 @@
   .composer-auxiliary-control.scroll-to-bottom { border: 0; }
 
   .composer-dock.is-taken-over {
+    --composer-top-inset: var(--layout-interaction-card-gap);
     grid-row: 3;
-    padding-top: var(--layout-interaction-card-gap);
   }
 
   .composer-dock::before {
@@ -1858,7 +1865,7 @@
 
   @media (max-width: 767px) {
     .user-message .message-markdown { max-width: 88%; }
-    .composer-dock { padding-right: var(--space-4); padding-left: var(--space-4); }
+    .composer-dock { --composer-inline-inset: var(--space-4); }
     .composer textarea { font-size: var(--type-body-size); }
     .approval-composer,
     .plan-question-composer,
@@ -1888,7 +1895,7 @@
   }
 
   @media (max-width: 440px) {
-    .composer-dock { padding-right: var(--space-3); padding-left: var(--space-3); }
+    .composer-dock { --composer-inline-inset: var(--space-3); }
     .composer-auxiliary-controls { gap: var(--space-4); }
     .composer-auxiliary-control { padding-inline: var(--space-1-5); }
     .composer-task-trace-control { gap: var(--space-1); }

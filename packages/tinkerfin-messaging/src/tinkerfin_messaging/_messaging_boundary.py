@@ -16,7 +16,7 @@ import asyncio
 import hashlib
 import inspect
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable
-from typing import TYPE_CHECKING, TypeAlias, TypeVar, cast
+from typing import TYPE_CHECKING, Generic, TypeAlias, TypeVar, cast
 
 from tinkerfin_contracts import RunIdentity
 
@@ -180,7 +180,7 @@ def _normalize_cancel_callback(
     return cast(_ContextCancelCallback[ProducedT], callback)
 
 
-async def _join_owned_task(task: asyncio.Task[None]) -> None:
+async def _join_owned_task(task: asyncio.Task[BackendResultT]) -> None:
     """Settle an owned task while preserving caller cancellation and task failure."""
 
     current = asyncio.current_task()
@@ -220,13 +220,92 @@ async def _join_owned_task(task: asyncio.Task[None]) -> None:
         raise task_error.with_traceback(task_error.__traceback__)
 
 
+class _SubscriptionIterator(Generic[ReplayT]):
+    """Own one decoded pull so detachment never closes a running generator.
+
+    The consumer owns its waiting task; this iterator owns the underlying pull and
+    close tasks. Their settlement preserves backpressure and consumer cancellation.
+    """
+
+    def __init__(self, source: AsyncGenerator[DecodedMessage[ReplayT], None]) -> None:
+        self._source = source
+        self._pull: asyncio.Task[DecodedMessage[ReplayT]] | None = None
+        self._close_task: asyncio.Task[None] | None = None
+        self._closed = False
+
+    def __aiter__(self) -> _SubscriptionIterator[ReplayT]:
+        return self
+
+    async def __anext__(self) -> DecodedMessage[ReplayT]:
+        if self._closed:
+            raise StopAsyncIteration
+        if self._pull is not None:
+            raise RuntimeError("a message subscription supports only one active pull")
+        task = asyncio.create_task(
+            self._next_message(), name="tinkerfin-messaging-subscription-pull"
+        )
+        self._pull = task
+        try:
+            return await asyncio.shield(task)
+        except StopAsyncIteration:
+            self._closed = True
+            raise
+        except asyncio.CancelledError as cancellation:
+            if not task.done() and not task.cancelling():
+                task.cancel()
+            try:
+                await _join_owned_task(task)
+            except asyncio.CancelledError:
+                # The owned pull is settled; the consumer's cancellation remains
+                # the public outcome, including when detachment cancelled the pull.
+                pass
+            except Exception as error:  # noqa: BLE001 - keep cancellation primary
+                cancellation.add_note(
+                    f"Messaging pull cleanup also failed: {type(error).__name__}"
+                )
+            raise cancellation
+        finally:
+            self._pull = None
+
+    async def _next_message(self) -> DecodedMessage[ReplayT]:
+        return await anext(self._source)
+
+    async def aclose(self) -> None:
+        self._closed = True
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(
+                self._close_once(), name="tinkerfin-messaging-decoder-close"
+            )
+            self._close_task.add_done_callback(_close_task_finished)
+        await _join_owned_task(self._close_task)
+
+    async def _close_once(self) -> None:
+        task = self._pull
+        try:
+            if task is not None and not task.done():
+                if not task.cancelling():
+                    task.cancel()
+                try:
+                    await _join_owned_task(task)
+                except (asyncio.CancelledError, StopAsyncIteration):
+                    # This close task is retained independently of its waiters.
+                    # Cancellation here belongs to the pull it deliberately stopped.
+                    current = asyncio.current_task()
+                    if current is not None and current.cancelling():
+                        raise
+        finally:
+            await self._source.aclose()
+
+
 def __aiter__(
     self: MessageSubscription[ReplayT],
 ) -> AsyncIterator[DecodedMessage[ReplayT]]:
     if self._claimed:
         raise RuntimeError("a message subscription can only be consumed once")
+    if self._close_task is not None:
+        raise RuntimeError("a message subscription is closed")
     self._claimed = True
-    delivery = self._iterate()
+    delivery = _SubscriptionIterator(self._iterate())
     self._delivery = delivery
     return delivery
 

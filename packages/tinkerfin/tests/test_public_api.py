@@ -37,7 +37,7 @@ def test_top_level_exposes_the_stateless_runtime_contract() -> None:
         "AgUiResumeBindingError",
         "AgUiResumeCheckpoint",
         "AgUiResumeCheckpointObserver",
-        "AgUiResumeInitializationFailureObserver",
+        "AgUiResumeNotSavedObserver",
         "AgUiResumeRequest",
         "AgentMode",
         "ContextKind",

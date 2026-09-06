@@ -35,7 +35,11 @@ from sqlalchemy.pool import PoolProxiedConnection
 from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.sql.selectable import Subquery
 
-from ._graph_reducer import resolve_graph_link_issue, resolve_graph_node_kind
+from ._graph_reducer import (
+    assistant_run_terminal_status,
+    resolve_graph_link_issue,
+    resolve_graph_node_kind,
+)
 from .backend import (
     StoredTraceCheckpoint,
     StoredTraceEvent,
@@ -66,7 +70,7 @@ from .errors import (
     TraceStoreTimeout,
     TraceThreadNotFound,
 )
-from .facts import TraceEvent
+from .facts import RunFact, TraceEvent
 from .graph import (
     MAX_SUBAGENT_SCOPE_DEPTH,
     TraceGraphFilter,
@@ -618,13 +622,59 @@ class _SqlAlchemyTraceLedgerBackend:
             raise ValueError("event page limit must be positive")
         await self.setup()
         async with self._read_connection() as connection:
-            thread = await self._thread_row(
-                connection,
-                thread_id=request.key.thread_id,
+            # One bounded metadata read also detects a vanished writer when the
+            # event tail is unchanged. Use the database's UTC clock for lease facts;
+            # local wall time cannot establish distributed ownership.
+            now = (
+                func.utc_timestamp(6)
+                if connection.dialect.name == "mysql"
+                else func.strftime("%Y-%m-%d %H:%M:%f", "now")
             )
+            rows = (
+                (
+                    await connection.execute(
+                        select(
+                            threads,
+                            writers.c.run_id.label("active_run_id"),
+                            now.label("observed_at"),
+                        )
+                        .select_from(
+                            threads.outerjoin(
+                                writers,
+                                and_(
+                                    writers.c.namespace_hash
+                                    == threads.c.namespace_hash,
+                                    writers.c.thread_hash == threads.c.thread_hash,
+                                    writers.c.generation == threads.c.generation,
+                                    writers.c.active.is_(True),
+                                    writers.c.lease_expires_at > now,
+                                ),
+                            )
+                        )
+                        .where(
+                            threads.c.namespace_hash == self._namespace_hash,
+                            threads.c.thread_hash == _digest(request.key.thread_id),
+                        )
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            if not rows:
+                raise TraceThreadNotFound("Trace thread does not exist")
+            thread = rows[0]
+            _verify_thread_row(thread, self._namespace, request.key.thread_id)
             if thread["generation"] != request.key.generation:
                 raise TraceThreadNotFound("Trace generation does not exist")
             tail = cast(int, thread["next_seq"]) - 1
+            observed_at = _as_utc(_database_timestamp(thread["observed_at"]))
+            active_run_ids = tuple(
+                sorted(
+                    cast(str, row["active_run_id"])
+                    for row in rows
+                    if row["active_run_id"] is not None
+                )
+            )
             criteria = [
                 events.c.namespace_hash == self._namespace_hash,
                 events.c.thread_hash == _digest(request.key.thread_id),
@@ -633,6 +683,15 @@ class _SqlAlchemyTraceLedgerBackend:
             if request.direction == "forward":
                 after = 0 if request.after_seq is None else request.after_seq
                 as_of = tail if request.as_of_seq is None else request.as_of_seq
+                # Idle follow must not query event rows or write-side quota totals.
+                if after >= min(as_of, tail):
+                    return StoredTraceEventPage(
+                        key=request.key,
+                        tail_seq=tail,
+                        events=(),
+                        active_run_ids=active_run_ids,
+                        observed_at=observed_at,
+                    )
                 criteria.extend(
                     (events.c.trace_seq > after, events.c.trace_seq <= as_of)
                 )
@@ -656,6 +715,8 @@ class _SqlAlchemyTraceLedgerBackend:
                 key=request.key,
                 tail_seq=tail,
                 events=tuple(_stored_event_from_row(row) for row in rows),
+                active_run_ids=active_run_ids,
+                observed_at=observed_at,
             )
 
     @_owned_database_operation
@@ -793,6 +854,7 @@ class _SqlAlchemyTraceLedgerBackend:
                     "request_seq",
                     "result_seq",
                     "failure_seq",
+                    "model_call_seq",
                 )
                 if row[column] is not None
             }
@@ -843,23 +905,6 @@ class _SqlAlchemyTraceLedgerBackend:
                 )
                 is not None
             )
-            tracked_rows = (
-                await connection.execute(
-                    select(events.c.run_id)
-                    .where(
-                        events.c.namespace_hash == self._namespace_hash,
-                        events.c.thread_hash == _digest(request.key.thread_id),
-                        events.c.generation == request.key.generation,
-                        events.c.fact_kind == "call.tracking",
-                        events.c.run_hash.in_(
-                            tuple(_digest(value) for value in request.run_ids)
-                        ),
-                    )
-                    .distinct()
-                )
-            ).scalars()
-            tracked_run_ids = frozenset(cast(str, value) for value in tracked_rows)
-            requested_run_ids = frozenset(request.run_ids)
             return StoredTraceGraphPage(
                 key=request.key,
                 as_of_seq=tail,
@@ -883,9 +928,6 @@ class _SqlAlchemyTraceLedgerBackend:
                 ),
                 next_node_id=(
                     None if cursor_row is None else cast(str, cursor_row["node_id"])
-                ),
-                call_tracking_present=(
-                    bool(requested_run_ids) and requested_run_ids <= tracked_run_ids
                 ),
                 relationship_evidence_missing=relationship_evidence_missing,
             )
@@ -998,11 +1040,23 @@ class _SqlAlchemyTraceLedgerBackend:
         )
         if lock:
             thread_statement = thread_statement.with_for_update()
+        else:
+            # The first table read establishes the database snapshot. Its clock
+            # belongs to that same observation, including when a read was delayed
+            # after connection acquisition. Do not timestamp it before the read.
+            clock = (
+                func.utc_timestamp(6)
+                if connection.dialect.name == "mysql"
+                else func.strftime("%Y-%m-%d %H:%M:%f", "now")
+            )
+            thread_statement = thread_statement.add_columns(clock.label("observed_at"))
         thread_row = (
             (await connection.execute(thread_statement)).mappings().one_or_none()
         )
         if thread_row is not None:
             _verify_thread_row(thread_row, self._namespace, thread_id)
+            if not lock:
+                now = _database_timestamp(thread_row["observed_at"])
 
         namespace_totals = (
             await connection.execute(
@@ -1448,6 +1502,38 @@ class _SqlAlchemyTraceLedgerBackend:
             key,
             effect.graph_node_mutations,
         )
+        for event in effect.validated_events:
+            fact = event.fact
+            if not isinstance(fact, RunFact):
+                continue
+            status = assistant_run_terminal_status(fact)
+            if status is None:
+                continue
+            # The Run index bounds this one terminal UPDATE to its own revisions.
+            # No payload scan or extra SELECT is needed. The same predicate and
+            # compound Ledger proof are used by memory commits and Graph rebuilds.
+            await connection.execute(
+                update(graph_nodes)
+                .where(
+                    graph_nodes.c.namespace_hash == self._namespace_hash,
+                    graph_nodes.c.thread_hash == _digest(key.thread_id),
+                    graph_nodes.c.generation == key.generation,
+                    graph_nodes.c.run_hash == _digest(fact.identity.run_id),
+                    graph_nodes.c.run_id == fact.identity.run_id,
+                    graph_nodes.c.kind == TraceGraphNodeKind.ASSISTANT_MESSAGE.value,
+                    graph_nodes.c.status == TraceGraphNodeStatus.RUNNING.value,
+                    graph_nodes.c.updated_seq < event.trace_seq,
+                )
+                .values(
+                    status=status.value,
+                    completed_at=(
+                        None
+                        if status is TraceGraphNodeStatus.WAITING
+                        else _database_naive(fact.occurred_at)
+                    ),
+                    updated_seq=event.trace_seq,
+                )
+            )
         if effect.checkpoint is not None:
             scope = effect.checkpoint.run_id or ""
             await connection.execute(
@@ -1571,6 +1657,7 @@ class _SqlAlchemyTraceLedgerBackend:
                 "parent_subagent_id": None,
                 "model_call_hash": None,
                 "model_call_id": None,
+                "model_call_seq": None,
                 "kind": None,
                 "status": None,
                 "name": None,
@@ -1615,6 +1702,7 @@ class _SqlAlchemyTraceLedgerBackend:
                 else _digest(mutation.model_call_id)
             ),
             "model_call_id": mutation.model_call_id,
+            "model_call_seq": mutation.model_call_seq,
             "kind": mutation.kind.value,
             "status": mutation.status.value,
             "name": mutation.name,
@@ -1694,6 +1782,7 @@ class _SqlAlchemyTraceLedgerBackend:
                     parent_subagent_id=None,
                     model_call_hash=None,
                     model_call_id=None,
+                    model_call_seq=None,
                     kind=None,
                     status=None,
                     name=None,
@@ -1774,6 +1863,7 @@ class _SqlAlchemyTraceLedgerBackend:
             ):
                 raise TraceStoreProtocolError("Trace Graph model call changed")
             values["model_call_id"] = mutation.model_call_id
+            values["model_call_seq"] = mutation.model_call_seq
             values["model_call_hash"] = _digest(mutation.model_call_id)
         current_link_issue = (
             None
@@ -1992,12 +2082,15 @@ class _SqlAlchemyTraceLedgerBackend:
     async def _read_connection(self) -> AsyncGenerator[AsyncConnection, None]:
         """Read one fixed database snapshot and translate infrastructure failure.
 
-        A host may configure MySQL for READ COMMITTED, which would let the metadata and
-        active-writer statements observe different commits. The temporary connection
-        option gives each Store read a REPEATABLE READ transaction; SQLAlchemy restores
-        the borrowed pool connection's original isolation level on return. Cancellation
-        invalidates only the current borrowed connection because asyncmy cannot safely
-        roll back a command interrupted in flight. Contract coverage lives in
+        MySQL reads use next-transaction REPEATABLE READ and an explicit read-only
+        transaction, including when the host uses READ COMMITTED or AUTOCOMMIT. The
+        session settings stay untouched, and connection close rolls back the read
+        before returning it to the pool. MySQL's SET TRANSACTION scope is documented
+        at https://dev.mysql.com/doc/refman/8.4/en/set-transaction.html; consistency,
+        settings, and complete server-command budgets are covered by
+        ``tests/test_mysql_read_transactions.py``. Cancellation invalidates only the
+        current borrowed connection because asyncmy cannot safely roll back a command
+        interrupted in flight; repeated cancellation and pool recovery are covered by
         ``tests/test_mysql_store.py::test_mysql_cancelled_reads_return_pool_capacity``.
         """
 
@@ -2005,15 +2098,16 @@ class _SqlAlchemyTraceLedgerBackend:
             connection = await self._engine.connect()
             pooled: PoolProxiedConnection | None = None
             primary_error: BaseException | None = None
+            mysql_transaction_started = False
             try:
                 pooled = await connection.get_raw_connection()
                 if self._dialect == "mysql":
-                    connection = await connection.execution_options(
-                        isolation_level="REPEATABLE READ"
+                    await connection.exec_driver_sql(
+                        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"
                     )
-                    transaction = await connection.begin()
+                    await connection.exec_driver_sql("START TRANSACTION READ ONLY")
+                    mysql_transaction_started = True
                     yield connection
-                    await transaction.commit()
                 else:
                     # Python's SQLite driver legacy mode does not BEGIN for SELECT.
                     # An explicit transaction fixes generation metadata and event rows
@@ -2041,8 +2135,31 @@ class _SqlAlchemyTraceLedgerBackend:
                 raise
             finally:
                 if not connection.closed:
+
+                    async def close_connection() -> None:
+                        try:
+                            if self._dialect == "mysql" and not connection.invalidated:
+                                if not mysql_transaction_started:
+                                    # A failed START can leave next-transaction settings
+                                    # pending. Discard that connection even if rollback
+                                    # appeared to succeed; no later borrower may inherit
+                                    # an unconsumed Trace transaction configuration.
+                                    await connection.invalidate()
+                                elif connection.dialect.skip_autocommit_rollback:
+                                    # SQLAlchemy skips driver rollback in AUTOCOMMIT
+                                    # mode, but our explicit transaction still needs to
+                                    # end. This host option must not retain a read view
+                                    # or READ ONLY state across pool borrowers.
+                                    try:
+                                        await connection.exec_driver_sql("ROLLBACK")
+                                    except BaseException:
+                                        await connection.invalidate()
+                                        raise
+                        finally:
+                            await connection.close()
+
                     await _complete_connection_cleanup(
-                        connection.close(),
+                        close_connection(),
                         task_name="tinkerfin-trace-read-connection-close",
                         primary_error=primary_error,
                     )
@@ -2315,6 +2432,7 @@ def _trace_graph_effective_source(
             ),
             latest_present(graph_nodes.c.model_call_hash, "_model_call_hash"),
             latest_present(graph_nodes.c.model_call_id, "_model_call_id"),
+            latest_present(graph_nodes.c.model_call_seq, "_model_call_seq"),
             latest_present(graph_nodes.c.agent_hash, "_agent_hash"),
             latest_present(graph_nodes.c.agent_name, "_agent_name"),
             latest_present(graph_nodes.c.provider_hash, "_provider_hash"),
@@ -2346,6 +2464,7 @@ def _trace_graph_effective_source(
             "parent_subagent_id",
             "model_call_hash",
             "model_call_id",
+            "model_call_seq",
             "agent_hash",
             "agent_name",
             "provider_hash",
@@ -2369,6 +2488,7 @@ def _trace_graph_effective_source(
             ranked.c._parent_subagent_id.label("parent_subagent_id"),
             ranked.c._model_call_hash.label("model_call_hash"),
             ranked.c._model_call_id.label("model_call_id"),
+            ranked.c._model_call_seq.label("model_call_seq"),
             ranked.c._agent_hash.label("agent_hash"),
             ranked.c._agent_name.label("agent_name"),
             ranked.c._provider_hash.label("provider_hash"),
@@ -2508,6 +2628,7 @@ def _stored_graph_node_from_row(
     request_seq = cast(int | None, mapping["request_seq"])
     result_seq = cast(int | None, mapping["result_seq"])
     failure_seq = cast(int | None, mapping["failure_seq"])
+    model_call_seq = cast(int | None, mapping["model_call_seq"])
 
     def event(sequence: int | None) -> StoredTraceEvent | None:
         if sequence is None:
@@ -2541,6 +2662,7 @@ def _stored_graph_node_from_row(
         node_id=cast(str, mapping["node_id"]),
         parent_subagent_id=cast(str | None, mapping["parent_subagent_id"]),
         model_call_id=cast(str | None, mapping["model_call_id"]),
+        model_call_seq=model_call_seq,
         kind=kind,
         status=status,
         name=cast(str, mapping["name"]),
@@ -2575,6 +2697,7 @@ def _stored_graph_node_from_row(
         request_event=event(request_seq),
         result_event=event(result_seq),
         failure_event=event(failure_seq),
+        model_call_event=event(model_call_seq),
     )
 
 
@@ -2752,6 +2875,14 @@ def _retryable(error: DBAPIError, *, dialect: str) -> bool:
     return code in {5, 6, 261, 262, 517, 773}
 
 
+def _database_timestamp(value: object) -> datetime:
+    if isinstance(value, str):
+        value = datetime.fromisoformat(value)
+    if not isinstance(value, datetime):
+        raise TraceStoreProtocolError("database did not return a timestamp")
+    return value.replace(tzinfo=None)
+
+
 async def _database_now(connection: AsyncConnection) -> datetime:
     # MySQL CURRENT_TIMESTAMP follows the session time zone of the borrowed Engine.
     # UTC_TIMESTAMP is independent of host session configuration; SQLite's documented
@@ -2762,11 +2893,7 @@ async def _database_now(connection: AsyncConnection) -> datetime:
         value = await connection.scalar(
             text("SELECT strftime('%Y-%m-%d %H:%M:%f', 'now')")
         )
-        if isinstance(value, str):
-            value = datetime.fromisoformat(value)
-    if not isinstance(value, datetime):
-        raise TraceStoreProtocolError("database did not return a timestamp")
-    return value.replace(tzinfo=None)
+    return _database_timestamp(value)
 
 
 def _consume_task_exception(task: asyncio.Task[object]) -> None:

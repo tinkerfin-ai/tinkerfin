@@ -83,6 +83,7 @@ from .store import TraceGraphRebuildStore as TraceGraphRebuildStore
 from .store import TraceGraphStore as TraceGraphStore
 from .store import TraceProjectionCheckpoint as TraceProjectionCheckpoint
 from .store import TraceStore as TraceStore
+from .store import TraceStoreUpdate as TraceStoreUpdate
 from .store import TraceThreadKey as TraceThreadKey
 from .store import TraceWriter as TraceWriter
 from .testing import verify_trace_ledger_backend as verify_trace_ledger_backend
@@ -186,6 +187,7 @@ __all__ = [
     "TraceStoreProtocolError",
     "TraceStoreSchema",
     "TraceStoreTimeout",
+    "TraceStoreUpdate",
     "TraceSummary",
     "TraceThread",
     "TraceThreadKey",

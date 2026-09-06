@@ -737,6 +737,34 @@ async def test_failed_agui_run_records_input_terminal_and_close() -> None:
     assert terminal.kind == "run.terminal"
     assert terminal.outcome == "failed"
     assert terminal.error_type == "builtins.RuntimeError"
+    assert terminal.code == "runtime_initialization_error"
+    assert observer.contexts[0].call_tracking_enabled is False
+
+
+async def test_initialization_failure_keeps_a_later_observer_failure_distinct() -> None:
+    failed = _Session(fail_kind="run.input")
+    healthy = _Session()
+    runtime = TinkerFin().observe(_Observer(failed)).observe(_Observer(healthy))
+
+    async def create_agent() -> DeepAgentDefinition[None]:
+        raise RuntimeError("test-owned initialization failure")
+
+    stream = await runtime.open_run(_identity(), agent=create_agent, input=_input())
+    try:
+        with pytest.raises(RunObservationError):
+            await anext(stream)
+    finally:
+        await stream.aclose()
+
+    terminals = [
+        item
+        for item in healthy.observations
+        if isinstance(item, RunTerminalObservation)
+    ]
+    assert len(terminals) == 1
+    assert terminals[0].code == "observer_failed"
+    assert terminals[0].outcome == "failed"
+    assert failed.closed == healthy.closed == 1
 
 
 async def test_failed_resume_resolution_preserves_resume_input_kind() -> None:

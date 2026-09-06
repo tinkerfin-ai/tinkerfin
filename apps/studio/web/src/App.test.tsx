@@ -92,6 +92,8 @@ const traceDetail = (
   lastModel: 'main',
   pinned: false,
   asOfSeq: 5,
+  generation: 'generation-test',
+  observedAt: '2026-09-05T00:00:00.000000Z',
   headRunId: RUN_ID,
   availableHeads: [RUN_ID],
   historyCursor: null,
@@ -179,13 +181,16 @@ function installFetch(options: {
       return jsonResponse(detail)
     }
     const traceFollow = url.pathname.match(
-      /\/api\/conversation\/([^/]+)\/trace\/graph\/follow$/,
+      /\/api\/conversation\/([^/]+)\/trace\/graph(\/follow)?$/,
     )
     if (traceFollow) {
       const threadId = decodeURIComponent(traceFollow[1] ?? '')
       const detail = details[threadId]
       if (!detail) throw new Error('missing Trace detail for ' + threadId)
-      return jsonSseResponse({ type: 'snapshot', snapshot: detail.graph })
+      const snapshot = { ...detail.graph, nextCursor: null }
+      return traceFollow[2]
+        ? jsonSseResponse({ type: 'snapshot', snapshot })
+        : jsonResponse(snapshot)
     }
     if (request.method === 'POST' && url.pathname.endsWith('/api/conversation/chat')) {
       const payload = await request.clone().json() as ChatRequestPayload
@@ -271,6 +276,142 @@ describe('Studio Trace history integration', () => {
 
     expect(await screen.findByText('第二个会话的聊天内容')).toBeVisible()
     expect(screen.getByRole('tab', { name: '对话' })).toHaveAttribute('aria-selected', 'true')
+  })
+
+  it.each(['succeeded', 'failed', 'cancelled', 'abandoned', 'waiting', 'unknown'] as const)(
+    '运行转为 %s 后链路关闭跟随并读取最终快照',
+    async (execution) => {
+      const user = userEvent.setup()
+      const initial = traceDetail({ status: { execution: 'running', headRunId: RUN_ID } })
+      const details = { [THREAD_ID]: initial }
+      const fetch = installFetch({ list: [historyItem({ status: 'running' })], details })
+      const defaultFetch = fetch.getMockImplementation()!
+      let traceController: ReadableStreamDefaultController<Uint8Array> | undefined
+      const graphClosed = vi.fn()
+      const requests: Request[] = []
+      fetch.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = input instanceof Request
+          ? input : new Request(new URL(String(input), window.location.origin), init)
+        requests.push(request)
+        const path = new URL(request.url).pathname
+        if (path === `/api/conversation/${THREAD_ID}/trace`) {
+          return new Response(new ReadableStream<Uint8Array>({
+            start(controller) {
+              traceController = controller
+              controller.enqueue(new TextEncoder().encode(
+                `event: trace\ndata: ${JSON.stringify({ type: 'snapshot', snapshot: initial })}\n\n`,
+              ))
+            },
+          }), { headers: { 'Content-Type': 'text/event-stream' } })
+        }
+        if (path === `/api/conversation/${THREAD_ID}/trace/graph/follow`) {
+          return new Response(new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode(`event: trace\ndata: ${JSON.stringify({
+                type: 'snapshot', snapshot: { ...initial.graph, nextCursor: null },
+              })}\n\n`))
+            },
+            cancel: graphClosed,
+          }), { headers: { 'Content-Type': 'text/event-stream' } })
+        }
+        return defaultFetch(input, init)
+      })
+      const { unmount } = render(<App />)
+      await screen.findByText('来自 Trace 的历史回复')
+      await user.click(screen.getByRole('tab', { name: '链路' }))
+      const graphRequests = () => requests.filter((request) => (
+        new URL(request.url).pathname.endsWith('/trace/graph/follow')
+      ))
+      await waitFor(() => expect(graphRequests()).toHaveLength(1))
+      const finalGraph = traceGraphWithNodes([traceGraphNode({
+        id: 'final-answer', kind: 'assistant_message', name: 'AssistantMessage',
+        content: '最终链路内容', startedSeq: 6, updatedSeq: 7,
+      })], 7)
+      details[THREAD_ID] = traceDetail({
+        asOfSeq: 7,
+        observedAt: '2026-09-05T00:00:02.000000Z',
+        graph: finalGraph,
+        status: { execution, headRunId: RUN_ID },
+        completeness: { missingPrefix: false, missingTail: execution === 'unknown', payloadOmitted: false },
+      })
+      await act(async () => traceController!.enqueue(new TextEncoder().encode(
+        `event: trace\ndata: ${JSON.stringify({
+          type: 'update',
+          update: {
+            asOfSeq: 6, generation: initial.generation, observedAt: '2026-09-05T00:00:01.000000Z',
+            events: [], facts: [], messages: { upserts: [], removes: [] },
+            reasoning: { upserts: [], removes: [] }, interactions: { upserts: [], removes: [] },
+            graph: {
+              asOfSeq: 6, nextCursor: null, turnUpserts: [], turnRemoves: [], nodeUpserts: [],
+              nodeRemoves: [], orderedNodeIds: [], matchedNodeIds: [], completeness: initial.graph.completeness,
+            },
+            state: initial.state, status: { execution, headRunId: RUN_ID },
+            completeness: details[THREAD_ID].completeness,
+            messageCount: initial.messageCount, toolCallCount: 0, projections: {},
+          },
+          taskTrace: null,
+        })}\n\n`,
+      )))
+      await waitFor(() => expect(graphClosed).toHaveBeenCalledTimes(1))
+      expect(graphRequests()[0]!.signal.aborted).toBe(true)
+      expect(await screen.findAllByText('最终链路内容')).not.toHaveLength(0)
+      expect(graphRequests()).toHaveLength(1)
+      expect(requests.some((request) => new URL(request.url).pathname.endsWith('/trace/graph'))).toBe(true)
+      unmount()
+    },
+  )
+
+  it('静态链路重新激活只刷新一次会话，并发现其他标签页启动的新 Run', async () => {
+    const user = userEvent.setup()
+    const details = { [THREAD_ID]: traceDetail() }
+    const fetch = installFetch({ list: [historyItem()], details })
+    const defaultFetch = fetch.getMockImplementation()!
+    const requests: Request[] = []
+    fetch.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = input instanceof Request
+        ? input : new Request(new URL(String(input), window.location.origin), init)
+      requests.push(request)
+      const path = new URL(request.url).pathname
+      if (path.endsWith('/trace') || path.endsWith('/trace/graph/follow')) {
+        const snapshot = path.endsWith('/trace')
+          ? details[THREAD_ID]
+          : { ...details[THREAD_ID].graph, nextCursor: null }
+        return new Response(new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(
+              `event: trace\ndata: ${JSON.stringify({ type: 'snapshot', snapshot })}\n\n`,
+            ))
+          },
+        }), { headers: { 'Content-Type': 'text/event-stream' } })
+      }
+      return defaultFetch(input, init)
+    })
+    const { unmount } = render(<App />)
+    await screen.findByText('来自 Trace 的历史回复')
+    await user.click(screen.getByRole('tab', { name: '链路' }))
+    await waitFor(() => expect(requests.some((request) => new URL(request.url).pathname.endsWith('/trace/graph'))).toBe(true))
+    const historyCount = () => requests.filter((request) => (
+      new URL(request.url).pathname === `/api/conversation/${THREAD_ID}/history`
+    )).length
+    const before = historyCount()
+    details[THREAD_ID] = traceDetail({
+      headRunId: 'run-other-tab', availableHeads: [RUN_ID, 'run-other-tab'],
+      observedAt: '2026-09-05T00:00:01.000000Z',
+      status: { execution: 'running', headRunId: 'run-other-tab' },
+    })
+    const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden')
+    act(() => {
+      window.dispatchEvent(new Event('blur'))
+      document.dispatchEvent(new Event('visibilitychange'))
+    })
+    visibility.mockReturnValue('visible')
+    act(() => document.dispatchEvent(new Event('visibilitychange')))
+    await waitFor(() => expect(historyCount()).toBe(before + 1))
+    act(() => window.dispatchEvent(new Event('focus')))
+    await waitFor(() => expect(requests.some((request) => new URL(request.url).pathname.endsWith('/trace/graph/follow'))).toBe(true))
+    expect(historyCount()).toBe(before + 1)
+    unmount()
+    visibility.mockRestore()
   })
 
   it('restores a multi-action approval from native Trace interaction facts', async () => {

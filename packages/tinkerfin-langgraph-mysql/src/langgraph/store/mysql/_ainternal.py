@@ -80,7 +80,11 @@ COut = TypeVar("COut", bound=AsyncConnection, covariant=True)
 
 
 class AsyncConnectionLease(Protocol, Generic[COut]):
-    """Yield one acquired connection and release it when the context exits."""
+    """Yield one acquired connection and release it when the context exits.
+
+    Python passes exit arguments positionally. Driver contexts such as asyncmy's
+    ``_PoolAcquireContextManager`` may name those arguments differently.
+    """
 
     async def __aenter__(self) -> COut: ...
     async def __aexit__(
@@ -88,6 +92,7 @@ class AsyncConnectionLease(Protocol, Generic[COut]):
         exc_type: type[BaseException] | None,
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
+        /,
     ) -> object: ...
 
 

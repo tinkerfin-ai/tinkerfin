@@ -6,6 +6,7 @@ from .errors import LangGraphMySQLDriverError as LangGraphMySQLDriverError
 from .errors import LangGraphMySQLError as LangGraphMySQLError
 from .errors import LangGraphMySQLErrorCode as LangGraphMySQLErrorCode
 from .errors import LangGraphMySQLSchemaError as LangGraphMySQLSchemaError
+from .errors import LangGraphMySQLStoreClosedError as LangGraphMySQLStoreClosedError
 
 __all__ = [
     "AsyncMyStore",
@@ -13,4 +14,5 @@ __all__ = [
     "LangGraphMySQLError",
     "LangGraphMySQLErrorCode",
     "LangGraphMySQLSchemaError",
+    "LangGraphMySQLStoreClosedError",
 ]

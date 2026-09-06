@@ -196,6 +196,9 @@ Profile 允许调用方通过 `astream(stream_mode=...)` 增加受支持的
 fail-closed，Runtime 仍会关闭全部已打开 session。配套语义实现是 `tinkerfin-tracing.Tracer`。
 AG-UI event、Messaging commit、SSE frame 和 Redis ownership 不属于 Runtime Observation。
 
+Agent 执行前发生的初始化失败在终态 Observation 中使用 `runtime_initialization_error`。
+流保留原始异常，不生成 Model 或 Tool 调用；取消和 Observer 失败保留各自的分类。
+
 Agent 终态在 Observer 广播前已经选定。某个 Observer 在终态广播时失败会让调用方失败，并通知
 其他健康 Observer，但不会事后改写已经结束的 Agent 执行结果。
 
@@ -239,7 +242,7 @@ Agent 终态在 Observer 广播前已经选定。某个 Observer 在终态广播
 | `expose_subagent_events` | `True` | 是否交付子 Agent 事件 |
 | `resume` | `None` | 恢复请求使用的完整可信 `AgUiResumeBinding` |
 | `on_resume_checkpointed` | `None` | 确切 resume marker 可读取后的幂等 callback |
-| `on_resume_initialization_failed` | `None` | marker 持久前失败、取消或关闭时执行的幂等结算 |
+| `on_resume_not_saved` | `None` | marker 持久前失败、取消或关闭时执行的幂等结算 |
 | `on_event` | `None` | AG-UI 事件交付前的观察函数 |
 
 返回的 Runtime 保留已安装 Graph 的 `astream(...)` 参数形状。框架会把同一个 `RunIdentity`

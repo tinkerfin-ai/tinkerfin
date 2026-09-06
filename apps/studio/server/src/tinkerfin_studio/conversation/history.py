@@ -242,6 +242,8 @@ class ConversationHistoryService:
             updates = trace.follow()
             last_revision = projector.revision if projector is not None else 0
             last_task_trace = task_trace
+            last_status = trace.status
+            last_completeness = trace.completeness
             try:
                 yield ConversationTraceSnapshotEvent(snapshot=detail)
                 async for update in updates:
@@ -249,12 +251,18 @@ class ConversationHistoryService:
                     if projector is not None:
                         for event in update.events:
                             projector.consume(event)
-                        if projector.revision != last_revision:
+                        if (
+                            projector.revision != last_revision
+                            or update.status != last_status
+                            or update.completeness != last_completeness
+                        ):
                             candidate = projector.snapshot(
                                 status=update.status,
                                 completeness=update.completeness,
                             )
                             last_revision = projector.revision
+                            last_status = update.status
+                            last_completeness = update.completeness
                             if candidate != last_task_trace:
                                 task_trace_update = candidate
                                 last_task_trace = candidate
@@ -433,6 +441,8 @@ class ConversationHistoryService:
             lastModel=registration.model_id,
             pinned=thread.pinned,
             asOfSeq=trace.as_of_seq,
+            generation=trace.key.generation,
+            observedAt=trace.observed_at,
             headRunId=trace.head_run_id,
             availableHeads=trace.available_heads,
             historyCursor=trace.history_cursor,

@@ -224,6 +224,10 @@ fail-closed; Runtime still closes all opened sessions. `tinkerfin-tracing.Tracer
 provided semantic implementation. AG-UI events, Messaging commits, SSE frames, and
 Redis ownership are not Runtime observations.
 
+A failure before Agent execution uses `runtime_initialization_error` in its terminal
+Observation. The original exception remains on the stream, and no Model or Tool call
+is invented. Cancellation and Observer failures retain their own classifications.
+
 An Agent terminal is selected before Observer broadcast. A terminal-broadcast Observer
 failure fails the caller and is reported to healthy Observers without rewriting that
 already selected execution outcome.
@@ -268,7 +272,7 @@ Advanced orchestration may use `DeepAgentDefinition.new_agui(...)` directly:
 | `expose_subagent_events` | `True` | Deliver subagent events |
 | `resume` | `None` | Complete trusted `AgUiResumeBinding` for a resumed request |
 | `on_resume_checkpointed` | `None` | Idempotent callback after the exact resume marker is readable |
-| `on_resume_initialization_failed` | `None` | Idempotent settlement if failure, cancellation, or close occurs before marker durability |
+| `on_resume_not_saved` | `None` | Idempotent settlement if failure, cancellation, or close occurs before marker durability |
 | `on_event` | `None` | Observer called before AG-UI event delivery |
 
 The returned Runtime preserves the installed Graph `astream(...)` parameter shape. It

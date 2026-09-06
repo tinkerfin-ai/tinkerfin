@@ -1,0 +1,54 @@
+# Repository development
+
+[中文](../zh/development.md)
+
+Run repository commands from the checkout root. Python 3.11 or newer and uv are required.
+
+## Install the workspace
+
+```bash
+uv sync --locked --all-packages --group dev
+```
+
+## Build wheels
+
+The shared build command produces the eight framework wheels and the Studio server wheel:
+
+```bash
+uv run --no-project --python 3.11 python scripts/build_wheels.py --out-dir dist
+```
+
+Choose an output directory without existing wheels. To build selected projects, pass their
+repository-relative paths:
+
+```bash
+uv run --no-project --python 3.11 python scripts/build_wheels.py \
+  packages/tinkerfin-contracts packages/tinkerfin-native-stream \
+  --out-dir dist/selected
+```
+
+The command copies current project files into temporary directories, including uncommitted
+edits and untracked source files. It excludes build directories, caches, and generated
+package metadata. Builds do not change or remove those files in the working tree.
+Avoid editing source files while preparing a release so that all projects use one consistent
+set of inputs.
+
+Every wheel must match its copied source files byte for byte, including Python modules,
+stubs, typing markers, and package resources. All selected projects pass this check before
+any wheel is written to the output directory. A missing, extra, or changed file fails the
+command. Add `--offline` when build requirements are already present in the uv cache.
+
+Local builds, the packaging tests used by CI, and the Studio deployment script use this
+entry point. The deployment script prepares `dist/` and exports its locked production
+requirements separately.
+
+## Validate packaging
+
+```bash
+uv run --locked --no-sync pytest tests/packaging -m packaging_e2e
+```
+
+The suite checks contaminated build directories, current source contents, wheel metadata,
+licenses, declared dependencies, and installation into isolated environments. CI runs the
+core installation cases on Python 3.11–3.14. Python 3.11 also runs every optional dependency
+combination and the complete Studio deployment wheel set.

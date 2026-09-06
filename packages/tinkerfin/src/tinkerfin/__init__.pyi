@@ -35,9 +35,7 @@ from ._tasks import join_task as join_task
 from .agui_resume import AgUiResumeBinding as AgUiResumeBinding
 from .agui_resume import AgUiResumeCheckpoint as AgUiResumeCheckpoint
 from .agui_resume import AgUiResumeCheckpointObserver as AgUiResumeCheckpointObserver
-from .agui_resume import (
-    AgUiResumeInitializationFailureObserver as AgUiResumeInitializationFailureObserver,
-)
+from .agui_resume import AgUiResumeNotSavedObserver as AgUiResumeNotSavedObserver
 from .agui_resume import AgUiResumeRequest as AgUiResumeRequest
 from .coordination import InMemoryRunCoordinator as InMemoryRunCoordinator
 from .coordination import RunCoordinator as RunCoordinator

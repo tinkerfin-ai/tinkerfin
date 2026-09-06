@@ -735,12 +735,15 @@ async def test_mysql_cross_instance_sequence_follow_and_expired_writer_fencing()
 
         snapshot = await second_store.snapshot(_identity("run-a").thread_id)
         follower = second_store.follow(snapshot.key, after_seq=snapshot.as_of_seq)
+        current = await anext(follower)
+        assert current.events == ()
+        assert current.active_run_ids == ("run-a", "run-b")
         waiting = asyncio.create_task(anext(follower))
         terminal = await first.append(
             (_fact("run-a", "terminal"), _fact("run-a", "closed")),
             mandatory=True,
         )
-        assert await asyncio.wait_for(waiting, timeout=2) == terminal
+        assert (await asyncio.wait_for(waiting, timeout=2)).events == terminal
         await follower.aclose()
 
         async with second_engine.begin() as connection:

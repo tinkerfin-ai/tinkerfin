@@ -2,17 +2,6 @@
 
 set -Eeuo pipefail
 
-readonly -a PROJECT_PATHS=(
-    "packages/tinkerfin-contracts"
-    "packages/tinkerfin-native-stream"
-    "packages/tinkerfin-agui-adapter"
-    "packages/tinkerfin"
-    "packages/tinkerfin-messaging"
-    "packages/tinkerfin-tracing"
-    "packages/tinkerfin-sandbox"
-    "packages/tinkerfin-langgraph-mysql"
-    "apps/studio/server"
-)
 readonly MINIMUM_COMPOSE_VERSION="2.24.0"
 DEPLOY_STARTED_AT=$SECONDS
 CURRENT_STAGE="初始化"
@@ -89,21 +78,7 @@ compose() {
     STUDIO_ENV_FILE=$ENV_FILE VERSION=${APP_VERSION:-0.1.0} "${command[@]}" "$@"
 }
 
-clean_build_artifacts() {
-    local project
-    for project in "${PROJECT_PATHS[@]}"; do
-        rm -rf -- "$PROJECT_ROOT/$project/build"
-        if [[ -d "$PROJECT_ROOT/$project/src" ]]; then
-            find "$PROJECT_ROOT/$project/src" \
-                -maxdepth 1 -type d -name '*.egg-info' \
-                -exec rm -rf -- {} +
-        fi
-    done
-}
-
 build_release_artifacts() {
-    local project
-    clean_build_artifacts
     rm -rf -- "$PROJECT_ROOT/dist"
     mkdir -p "$PROJECT_ROOT/dist"
     uv lock --check
@@ -115,14 +90,9 @@ build_release_artifacts() {
         --no-header \
         --format requirements.txt \
         --output-file "$PROJECT_ROOT/dist/requirements.txt"
-    for project in "${PROJECT_PATHS[@]}"; do
-        uv build --quiet \
-            --wheel \
-            --out-dir "$PROJECT_ROOT/dist" \
-            --no-create-gitignore \
-            "$PROJECT_ROOT/$project"
-    done
-    clean_build_artifacts
+    uv run --no-project --python 3.11 \
+        python "$PROJECT_ROOT/scripts/build_wheels.py" \
+        --out-dir "$PROJECT_ROOT/dist"
 }
 
 app_version_from_wheel() {
@@ -145,6 +115,7 @@ validate_environment() {
     for required in \
         "$PROJECT_ROOT/pyproject.toml" \
         "$PROJECT_ROOT/uv.lock" \
+        "$PROJECT_ROOT/scripts/build_wheels.py" \
         "$PROJECT_ROOT/apps/studio/server/Dockerfile" \
         "$PROJECT_ROOT/apps/studio/server/database/mysql/schema.sql" \
         "$COMPOSE_FILE" \

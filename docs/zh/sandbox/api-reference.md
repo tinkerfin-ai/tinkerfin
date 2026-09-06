@@ -14,7 +14,7 @@
 | `metadata` | `{}` | 创建时附加的业务 metadata；保留字段不能覆盖 |
 | `resource` | `cpu=1, memory=2Gi` | 资源规格 |
 | `volumes` | `()` | OpenSandbox volume 配置 |
-| `ttl` | 2 小时 | Sandbox 生存时间，必须大于 0 |
+| `ttl` | 2 小时 | 从创建或续期起计算的生存时间，必须大于 0；`None` 表示手动清理 |
 | `lifecycle_request_timeout` | 10 分钟 | 创建、连接和销毁请求时限 |
 | `ready_timeout` | 5 分钟 | 等待新 Sandbox ready 的时限 |
 | `connect_timeout` | 30 秒 | 连接数据面的时限 |
@@ -25,13 +25,22 @@
 | `command_env` | `{}` | 每次 Shell 命令附加的环境变量 |
 | `enable_capture_offload` | `False` | 是否允许大输出写入文件 |
 
+`ttl=None` 创建的实例没有自动到期时间，Manager 不会为其续期，但仍执行健康检查并遵守 State
+资源所有权规则。重连不会改变已有实例的到期时间。关闭和文件存储行为见[远端实例生存时间](lifecycle.md#远端实例生存时间)。
+
 ### `OpenSandboxClient`
 
 | 参数 | 默认值 | 作用 |
 | --- | --- | --- |
 | `connection_config` | 必填，可传 `None` | OpenSandbox 连接配置；`None` 时使用 SDK 环境配置 |
 | `config` | `None` | TinkerFin Sandbox 配置 |
-| `initializers` | `()` | 新实例 ready 后依次执行的异步初始化函数 |
+| `initializers` | `()` | 创建或连接完成后依次执行的幂等初始化函数 |
+
+初始化函数接收 `OpenSandboxBackend`，可以返回可等待对象或 `None`。I/O 应使用原生异步回调；
+同步回调直接在事件循环执行，必须保持非阻塞，Client 不会把它移入线程。连接和初始化共用
+`connect_timeout`；经 Manager 恢复时，还受更早的恢复截止时间约束。超时与取消依赖协作式执行，
+不能打断阻塞的同步代码。初始化失败抛出
+`OpenSandboxInitializationError`，不会触发恢复重试或重建。
 
 公共方法为 `create(metadata=None)`、`connect(sandbox_id)`、`inspect(sandbox_id)`、`destroy(sandbox_id)` 和 `aclose()`。这些方法都是异步的。
 
@@ -42,6 +51,19 @@
 只有配置的预热容量已经通过真实验证时，`await manager.check_ready()` 才会正常返回。启动或后台容量
 失败会抛出 `OpenSandboxWarmPoolUnavailableError`，Manager 关闭后会抛出
 `OpenSandboxManagerClosedError`。
+
+可选生命周期通知契约：
+
+| API | 用途 |
+| --- | --- |
+| `OpenSandboxLifecycleObserver.on_sandbox_event(event)` | 借用的异步观察者，不得重入当前 Manager |
+| `OpenSandboxNotificationOptions(max_pending_events=128, timeout=1.0)` | 每个观察者独立的待投递上限和单次执行秒数 |
+| `OpenSandboxLifecycleEvent` | 不可变的事件标识、类型、所有者、UTC 时间、原因、效果与可信诊断 |
+| `OpenSandboxLifecycleEventType` | 用户 Sandbox 变化、显式工作区重置及独立的预热容量变化 |
+| `OpenSandboxLifecycleReason` | 连接、健康、初始化、State 及显式操作的原因枚举 |
+
+Manager 通过 `observers=()` 和 `notification_options=None` 配置通知。事件与交付语义见
+[生命周期通知](lifecycle.md#生命周期通知)。`diagnostic_context` 仅供可信诊断，不属于客户端响应。
 
 ## Backend 和 handle
 
@@ -78,7 +100,8 @@
 | `get_sqlalchemy_opensandbox_state_schema(dialect=...)` | 生成完整建表 SQL |
 | `SQLAlchemyOpenSandboxStateSchema` | 不可变的 dialect、table names 和 DDL |
 
-`OpenSandboxInitializer` 是新 Sandbox ready 后接收 backend 的异步初始化函数类型。
+`OpenSandboxInitializer` 在创建或连接完成后接收可用 backend，返回 `Awaitable[None] | None`。
+同步回调必须保持非阻塞。
 
 ### 不可变 claim 和 binding
 
@@ -110,7 +133,10 @@
 | `OpenSandboxStateOwnershipError` | claim 已过期、被替换或不属于当前 worker |
 | `OpenSandboxStateConfigurationError` | 状态配置、数据库或 schema 不支持 |
 | `OpenSandboxDestroyError` | 远端销毁未能可靠完成 |
+| `OpenSandboxInitializationError` | 工作区准备或初始化函数失败，不适用恢复重试 |
+| `OpenSandboxBackendUnavailableError` | 原实例恢复失败，或供应商拒绝访问 |
 | `OpenSandboxResetError` | workspace 无安全根或重置失败 |
 | `OpenSandboxHandleOwnershipError` | 使用了不再有效的 backend 所有权 |
 | `OpenSandboxManagerClosedError` | manager 关闭后仍被使用 |
+| `OpenSandboxObserverReentryError` | 生命周期观察者尝试操作或关闭正在向其投递的 Manager |
 | `OpenSandboxSettlementTimeoutError` | 调用方等待安全关闭超过时限 |

@@ -85,6 +85,10 @@ class ConversationHistoryDetail(BaseModel):
     last_model: str | None = Field(default=None, alias="lastModel")
     pinned: bool
     as_of_seq: int = Field(alias="asOfSeq", ge=1)
+    generation: str
+    observed_at: datetime = Field(
+        alias="observedAt", description="Trace 存储的 UTC 观测时间"
+    )
     head_run_id: str = Field(alias="headRunId")
     available_heads: tuple[str, ...] = Field(alias="availableHeads")
     history_cursor: str | None = Field(default=None, alias="historyCursor")

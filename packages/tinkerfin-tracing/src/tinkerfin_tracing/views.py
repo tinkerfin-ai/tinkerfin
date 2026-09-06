@@ -13,7 +13,12 @@ from .graph import TraceGraphDelta
 
 
 class TraceMessage(TraceModel):
-    """One projected conversation message in chronological order."""
+    """One projected message with the content actually retained from delivery.
+
+    ``completed`` means delivery ended or paused, not that the provider succeeded.
+    The corresponding Graph node distinguishes success, cancellation, waiting, and
+    abandonment. A later resumed delivery can return the message to ``streaming``.
+    """
 
     id: str
     trace_seq: int = Field(ge=1)
@@ -141,8 +146,17 @@ class TraceEntityDelta(TraceModel, Generic[EntityT]):
 
 
 class TraceUpdate(TraceModel):
-    """One live semantic update after a committed event batch."""
+    """A committed event update or execution-status change at the same sequence.
 
+    Writer close or lease expiry can change status and completeness with empty
+    ``events`` and ``facts``. Consumers must apply those updates even when
+    ``as_of_seq`` has not advanced; no Agent terminal is inferred from ownership.
+    """
+
+    generation: str = Field(min_length=1)
+    observed_at: datetime = Field(
+        description="Storage UTC time of this event and ownership observation"
+    )
     as_of_seq: int
     events: tuple[TraceEvent, ...]
     facts: tuple[TraceSemanticFact, ...]

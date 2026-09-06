@@ -105,6 +105,8 @@ export interface ConversationHistoryDetail {
   lastModel?: string | null
   pinned: boolean
   asOfSeq: number
+  generation: string
+  observedAt: string
   headRunId: string
   availableHeads: string[]
   historyCursor?: string | null
@@ -131,6 +133,8 @@ export interface TraceEntityDelta<T> {
 
 export interface ConversationTraceUpdate {
   asOfSeq: number
+  generation: string
+  observedAt: string
   events: JsonValue[]
   facts: JsonValue[]
   messages: TraceEntityDelta<TraceMessage>
@@ -155,6 +159,23 @@ export type ConversationTraceEvent =
   | { type: 'error'; code: 'trace_unavailable' }
 
 const CONVERSATION_API_PATH = '/api/conversation'
+
+export const traceObservationTime = (value: string): bigint => {
+  const match = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?(?:Z|\+00:00)$/.exec(value)
+  if (!match) throw new ConversationError('stream_event_invalid')
+  const seconds = Date.parse(`${match[1]}Z`)
+  if (!Number.isFinite(seconds)) throw new ConversationError('stream_event_invalid')
+  // 保留数据库微秒精度；Date.parse 单独使用会把不同观测压缩到同一毫秒
+  return BigInt(seconds) * 1000n + BigInt((match[2] ?? '').padEnd(6, '0'))
+}
+
+const validateTraceObservation = (value: Record<string, unknown>) => {
+  if (typeof value.generation !== 'string' || !value.generation
+    || typeof value.observedAt !== 'string') {
+    throw new ConversationError('stream_event_invalid')
+  }
+  traceObservationTime(value.observedAt)
+}
 
 export const fetchConversationHistoryList = (
   params: {
@@ -221,6 +242,7 @@ const parseHistoryDetail = (
   if (!isRecord(value) || !Object.hasOwn(value, 'taskTrace')) {
     throw new ConversationError('stream_event_invalid')
   }
+  validateTraceObservation(value)
   if (includeTaskTrace) {
     if (value.taskTrace === null) throw new ConversationError('stream_event_invalid')
     parseTaskTraceSnapshot(value.taskTrace)
@@ -250,6 +272,7 @@ const parseTraceEvent = (
     if (!isRecord(record.update) || !Object.hasOwn(record, 'taskTrace')) {
       throw new ConversationError('stream_event_invalid')
     }
+    validateTraceObservation(record.update)
     if (record.taskTrace !== null) {
       if (!includeTaskTrace) throw new ConversationError('stream_event_invalid')
       parseTaskTraceSnapshot(record.taskTrace)

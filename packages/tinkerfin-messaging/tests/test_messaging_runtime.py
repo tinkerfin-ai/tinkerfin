@@ -124,6 +124,60 @@ async def test_detach_does_not_stop_the_producer_and_cursor_reconnects(
     assert not unused.started.is_set()
 
 
+async def test_close_settles_an_active_pull_without_stopping_the_producer(
+    messaging_backend: MessagingBackend,
+) -> None:
+    release = asyncio.Event()
+    source = _Source(("first",), release=release, after_release=("second",))
+    async with Messaging(backend=messaging_backend) as messaging:
+        channel = messaging.channel(name="events", codec=_TextCodec())
+        subscription = await channel.wrap(source, identity=_identity(), after=0)
+        delivery = aiter(subscription)
+        assert (await anext(delivery)).data == "first"
+        pending = asyncio.ensure_future(anext(delivery))
+        await asyncio.sleep(0)
+        try:
+            await asyncio.wait_for(subscription.aclose(), timeout=2)
+            assert pending.done()
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+            await subscription.aclose()
+            with pytest.raises(StopAsyncIteration):
+                await anext(delivery)
+            assert not source.closed.is_set()
+            release.set()
+            await asyncio.wait_for(source.closed.wait(), timeout=2)
+            replay = await channel.follow(identity=_identity(), after=1)
+            assert await _data(replay) == ["second"]
+        finally:
+            release.set()
+            if not pending.done():
+                pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+
+
+async def test_subscription_rejects_a_second_concurrent_pull(
+    messaging_backend: MessagingBackend,
+) -> None:
+    release = asyncio.Event()
+    source = _Source(("first",), release=release)
+    async with Messaging(backend=messaging_backend) as messaging:
+        channel = messaging.channel(name="events", codec=_TextCodec())
+        subscription = await channel.wrap(source, identity=_identity(), after=0)
+        delivery = aiter(subscription)
+        assert (await anext(delivery)).data == "first"
+        pending = asyncio.ensure_future(anext(delivery))
+        await asyncio.sleep(0)
+        try:
+            with pytest.raises(RuntimeError):
+                await anext(delivery)
+        finally:
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+            await subscription.aclose()
+            release.set()
+
+
 async def test_completed_run_attachment_never_opens_deferred_source(
     messaging_backend: MessagingBackend,
 ) -> None:

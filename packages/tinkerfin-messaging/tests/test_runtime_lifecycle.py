@@ -635,9 +635,68 @@ async def test_never_iterated_subscription_closes_without_claiming_delivery() ->
         )
 
         await subscription.aclose()
+        with pytest.raises(RuntimeError, match="closed"):
+            aiter(subscription)
 
     assert backend.follow_close_calls == 0
     assert source.close_calls == 1
+
+
+async def test_close_waiter_cancellation_settles_the_active_pull_and_backend() -> None:
+    backend = _BlockingFollowerBackend()
+    release = asyncio.Event()
+    source = _Source("one", release=release)
+    async with Messaging(backend=backend) as messaging:
+        _install_tracking_follow(messaging, backend, block_close=True)
+        channel = messaging.channel(name="events", codec=_TextCodec())
+        subscription = await channel.wrap(source, identity=_identity(), after=0)
+        delivery = aiter(subscription)
+        assert (await anext(delivery)).data == "one"
+        pending = asyncio.ensure_future(anext(delivery))
+        await asyncio.sleep(0)
+        closing = asyncio.create_task(subscription.aclose())
+        try:
+            await asyncio.wait_for(backend.close_started.wait(), timeout=1)
+            closing.cancel("stop waiting for close")
+            await asyncio.sleep(0)
+            closing.cancel("stop waiting again")
+            assert not closing.done()
+            backend.close_release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(closing, timeout=1)
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+            await subscription.aclose()
+            assert backend.follow_close_calls == 1
+            assert not source.closed.is_set()
+        finally:
+            backend.close_release.set()
+            release.set()
+            await asyncio.gather(closing, pending, return_exceptions=True)
+
+
+async def test_messaging_close_settles_a_waiting_subscription() -> None:
+    release = asyncio.Event()
+    source = _Source("one", release=release)
+    async with Messaging() as messaging:
+        channel = messaging.channel(name="events", codec=_TextCodec())
+        subscription = await channel.wrap(source, identity=_identity(), after=0)
+        delivery = aiter(subscription)
+        assert (await anext(delivery)).data == "one"
+        pending = asyncio.ensure_future(anext(delivery))
+        await asyncio.sleep(0)
+        try:
+            await asyncio.wait_for(messaging.aclose(), timeout=1)
+            with pytest.raises(RunProducerFailed) as failed:
+                await asyncio.wait_for(pending, timeout=1)
+            assert isinstance(failed.value.cause, asyncio.CancelledError)
+            await subscription.aclose()
+            assert source.closed.is_set()
+        finally:
+            release.set()
+            if not pending.done():
+                pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
 
 
 async def test_backend_subscription_closes_on_producer_failure() -> None:

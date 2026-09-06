@@ -19,6 +19,7 @@ from tinkerfin_langgraph_mysql import (
     LangGraphMySQLError,
     LangGraphMySQLErrorCode,
     LangGraphMySQLSchemaError,
+    LangGraphMySQLStoreClosedError,
 )
 
 
@@ -29,12 +30,15 @@ def test_public_api_exposes_the_store_and_stable_error_boundary() -> None:
         "LangGraphMySQLError",
         "LangGraphMySQLErrorCode",
         "LangGraphMySQLSchemaError",
+        "LangGraphMySQLStoreClosedError",
     ]
     assert issubclass(AsyncMyStore, BaseStore)
     assert issubclass(LangGraphMySQLDriverError, LangGraphMySQLError)
     assert issubclass(LangGraphMySQLSchemaError, LangGraphMySQLError)
+    assert issubclass(LangGraphMySQLStoreClosedError, LangGraphMySQLError)
     assert LangGraphMySQLDriverError.code is LangGraphMySQLErrorCode.DRIVER_FAILURE
     assert LangGraphMySQLSchemaError.code is LangGraphMySQLErrorCode.SCHEMA_MISMATCH
+    assert LangGraphMySQLStoreClosedError.code is LangGraphMySQLErrorCode.STORE_CLOSED
     assert files("tinkerfin_langgraph_mysql").joinpath("py.typed").is_file()
 
 

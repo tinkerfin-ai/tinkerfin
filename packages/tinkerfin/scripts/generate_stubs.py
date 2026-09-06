@@ -245,7 +245,7 @@ from typing_extensions import Unpack
 
 from tinkerfin_contracts import RunIdentity as RunIdentity
 
-from .agui_resume import AgUiResumeBinding, AgUiResumeCheckpointObserver, AgUiResumeInitializationFailureObserver, AgUiResumeRequest
+from .agui_resume import AgUiResumeBinding, AgUiResumeCheckpointObserver, AgUiResumeNotSavedObserver, AgUiResumeRequest
 from .plan import AgentMode
 from .runtime import AgUiEventStream, EventObserver, NativeGraphRunStream, PartObserver
 
@@ -357,7 +357,7 @@ class DeepAgentDefinition(Generic[ContextT]):
         expose_subagent_events: bool = True,
         resume: None = None,
         on_resume_checkpointed: None = None,
-        on_resume_initialization_failed: None = None,
+        on_resume_not_saved: None = None,
         on_event: EventObserver | None = None,
     ) -> DeepAgentAgUiRuntime[ContextT]:
 {new_agui_doc}
@@ -376,7 +376,7 @@ class DeepAgentDefinition(Generic[ContextT]):
         expose_subagent_events: bool = True,
         resume: AgUiResumeBinding,
         on_resume_checkpointed: AgUiResumeCheckpointObserver | None = None,
-        on_resume_initialization_failed: AgUiResumeInitializationFailureObserver | None = None,
+        on_resume_not_saved: AgUiResumeNotSavedObserver | None = None,
         on_event: EventObserver | None = None,
     ) -> DeepAgentAgUiResumeRuntime[ContextT]:
 {new_agui_doc}
@@ -434,7 +434,7 @@ from ._tasks import join_task as join_task
 from .agui_resume import AgUiResumeBinding as AgUiResumeBinding
 from .agui_resume import AgUiResumeCheckpoint as AgUiResumeCheckpoint
 from .agui_resume import AgUiResumeCheckpointObserver as AgUiResumeCheckpointObserver
-from .agui_resume import AgUiResumeInitializationFailureObserver as AgUiResumeInitializationFailureObserver
+from .agui_resume import AgUiResumeNotSavedObserver as AgUiResumeNotSavedObserver
 from .agui_resume import AgUiResumeRequest as AgUiResumeRequest
 from .coordination import InMemoryRunCoordinator as InMemoryRunCoordinator
 from .coordination import RunCoordinator as RunCoordinator

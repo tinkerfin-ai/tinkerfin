@@ -6,11 +6,12 @@ import asyncio
 import json
 import time
 from collections.abc import Awaitable, Callable, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import cast
+from typing import NoReturn, cast
 
-from langchain_core.callbacks import AsyncCallbackHandler
+from langchain_core.callbacks import AsyncCallbackHandler, BaseCallbackHandler
 from langchain_core.messages import (
     AIMessage,
     AIMessageChunk,
@@ -63,11 +64,16 @@ from tinkerfin_native_stream import (
     to_json_value,
 )
 
+from ._tasks import join_task
 from .errors import RunObservationError
+
+_CALLBACK_TIMESTAMP: ContextVar[tuple[datetime, int] | None] = ContextVar(
+    "tinkerfin_callback_timestamp", default=None
+)
 
 
 def _stamp() -> tuple[datetime, int]:
-    return datetime.now(UTC), time.monotonic_ns()
+    return _CALLBACK_TIMESTAMP.get() or (datetime.now(UTC), time.monotonic_ns())
 
 
 def _json_value(value: object) -> JsonValue:
@@ -336,7 +342,7 @@ class _ObserverDelivery:
 
     operation: Callable[[], Awaitable[None]]
     settled: asyncio.Future[None]
-    active: bool = False
+    task: asyncio.Task[BaseException | None] | None = None
     cancel_requested: bool = False
 
 
@@ -348,13 +354,16 @@ class RuntimeObservationHub:
         *,
         context: RunSourceContext,
         observers: tuple[RuntimeObserver, ...],
+        initialization_error: Exception | None = None,
     ) -> None:
-        """Bind immutable Run context to ordered borrowed Observer registrations."""
+        """Bind Run context to ordered borrowed Observer registrations."""
 
         from ._call_observation import RuntimeCallHandler
+        from ._sync_call_observation import SyncRuntimeCallHandler
 
         self.context = context
         self._observers = observers
+        self._initialization_error = initialization_error
         self._slots: list[_SessionSlot] = []
         self._failure: asyncio.Future[tuple[_SessionSlot, BaseException]] | None = None
         self._started = False
@@ -364,7 +373,10 @@ class RuntimeObservationHub:
         self._delivery_queue: asyncio.Queue[_ObserverDelivery | None] | None = None
         self._delivery_worker: asyncio.Task[None] | None = None
         self._delivery_stop: asyncio.Task[None] | None = None
+        self._call_loop: asyncio.AbstractEventLoop | None = None
+        self._thread_callbacks: set[asyncio.Task[None]] = set()
         self._call_handler = RuntimeCallHandler(self)
+        self._sync_call_handler = SyncRuntimeCallHandler(self, self._call_handler)
 
     @property
     def enabled(self) -> bool:
@@ -383,6 +395,47 @@ class RuntimeObservationHub:
         """Return the request-owned LangChain callback for invocation configuration."""
 
         return self._call_handler
+
+    @property
+    def call_handlers(self) -> tuple[BaseCallbackHandler, ...]:
+        """Return distinct native async and sync callbacks over the same Run state."""
+        return self._call_handler, self._sync_call_handler
+
+    @property
+    def call_loop(self) -> asyncio.AbstractEventLoop:
+        """Return the loop that owns callback state and Observer delivery."""
+        if self._call_loop is None:
+            raise RuntimeError("Runtime callbacks require an opened observation Run")
+        return self._call_loop
+
+    def in_call_loop(self) -> bool:
+        """Return whether a callback arrived directly on its owning event loop."""
+        try:
+            return asyncio.get_running_loop() is self._call_loop
+        except RuntimeError:
+            return False
+
+    async def deliver_thread_callback(
+        self, deliver: Callable[[], Awaitable[None]]
+    ) -> None:
+        """Own one foreign-thread delivery and reject callbacks after termination."""
+        if self._closed or self._terminal is not None:
+            raise asyncio.CancelledError("Runtime callback outlived its Run")
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("Runtime callback delivery requires an owned task")
+        self._thread_callbacks.add(task)
+        try:
+            await deliver()
+        finally:
+            self._thread_callbacks.discard(task)
+
+    async def _settle_thread_callbacks(self) -> None:
+        callbacks = tuple(self._thread_callbacks)
+        for callback in callbacks:
+            callback.cancel()
+        if callbacks:
+            await asyncio.gather(*callbacks, return_exceptions=True)
 
     def claim_error(self, error: BaseException) -> bool:
         """Return whether one propagated failure has no more specific recorded owner."""
@@ -405,6 +458,7 @@ class RuntimeObservationHub:
         if self._started:
             return
         loop = asyncio.get_running_loop()
+        self._call_loop = loop
         self._failure = loop.create_future()
         opening_failures: list[tuple[str, BaseException]] = []
         for index, observer in enumerate(self._observers):
@@ -527,47 +581,137 @@ class RuntimeObservationHub:
                 if not delivery.settled.done():
                     delivery.settled.set_exception(asyncio.CancelledError())
                 continue
-            delivery.active = True
+            operation = asyncio.create_task(
+                self._run_delivery_operation(delivery.operation),
+                name="tinkerfin-observer-operation",
+            )
+            delivery.task = operation
+            owner_cancelled = False
             try:
-                await delivery.operation()
-            except BaseException as error:  # noqa: BLE001 - relay process control
-                if (
-                    isinstance(error, asyncio.CancelledError)
-                    and delivery.cancel_requested
-                ):
-                    current = asyncio.current_task()
-                    if current is not None:
-                        current.uncancel()
+                try:
+                    # Request cancellation targets the operation, while host
+                    # shutdown targets its worker. Separate ownership prevents
+                    # Runner cancellation from keeping the worker alive for
+                    # another delivery.
+                    await asyncio.wait((operation,))
+                except asyncio.CancelledError as cancellation:
+                    owner_cancelled = True
+                    if not operation.done() and not operation.cancelling():
+                        operation.cancel()
+                    error = await join_task(operation, suppress_task_cancellation=True)
+                    if error is not None:
+                        if not isinstance(error, Exception | asyncio.CancelledError):
+                            raise error
+                        cancellation.add_note(
+                            "Observer operation cleanup also failed: "
+                            f"{type(error).__name__}: {error}"
+                        )
+                    raise cancellation
+                error = operation.result()
+                if error is not None:
+                    raise error
+            except BaseException as error:
                 if not delivery.settled.done():
                     delivery.settled.set_exception(error)
+                if owner_cancelled:
+                    raise
             else:
                 if not delivery.settled.done():
                     delivery.settled.set_result(None)
             finally:
-                delivery.active = False
+                delivery.task = None
+
+    @staticmethod
+    async def _run_delivery_operation(
+        operation: Callable[[], Awaitable[None]],
+    ) -> BaseException | None:
+        """Return the exact failure for rethrowing on the delivery caller's task.
+
+        A private task must not make SystemExit or KeyboardInterrupt bypass the
+        caller's exception boundary. Cancellation uses the same receipt path;
+        the worker keeps request cancellation separate from its own shutdown.
+        """
+
+        try:
+            await operation()
+        except BaseException as error:  # noqa: BLE001 - transport without conversion
+            return error
+        return None
 
     async def _enqueue_delivery(
         self,
         operation: Callable[[], Awaitable[None]],
     ) -> None:
-        """Apply bounded backpressure and await one accepted serial operation."""
+        """Wait for bounded delivery while detecting loss of its owned worker.
+
+        Host shutdown can cancel the worker before Runtime terminal cleanup runs.
+        Queue admission and each receipt must both observe that exit so cleanup
+        cannot wait indefinitely for an operation that no task can deliver.
+        """
 
         queue = self._delivery_queue
         if queue is None:
             await operation()
             return
+        worker = self._delivery_worker
+        if worker is None:  # pragma: no cover - queue construction invariant
+            raise RuntimeError("Observer delivery worker is unavailable")
         settled = asyncio.get_running_loop().create_future()
         delivery = _ObserverDelivery(operation=operation, settled=settled)
-        await queue.put(delivery)
         try:
-            await asyncio.shield(settled)
+            await self._put_delivery(queue, worker, delivery)
+            await asyncio.wait((settled, worker), return_when=asyncio.FIRST_COMPLETED)
+            if not settled.done():
+                self._raise_delivery_worker_stopped(worker)
+            settled.result()
         except asyncio.CancelledError:
             delivery.cancel_requested = True
-            worker = self._delivery_worker
-            if delivery.active and worker is not None:
-                worker.cancel()
+            operation_task = delivery.task
+            if (
+                operation_task is not None
+                and not operation_task.done()
+                and not operation_task.cancelling()
+            ):
+                operation_task.cancel()
             settled.add_done_callback(_consume_delivery_exception)
             raise
+        finally:
+            if worker.done() and not settled.done():
+                settled.cancel()
+
+    async def _put_delivery(
+        self,
+        queue: asyncio.Queue[_ObserverDelivery | None],
+        worker: asyncio.Task[None],
+        delivery: _ObserverDelivery | None,
+    ) -> None:
+        """Own bounded queue admission until it succeeds or the consumer stops."""
+
+        if worker.done():
+            self._raise_delivery_worker_stopped(worker)
+        queued = asyncio.create_task(
+            queue.put(delivery), name="tinkerfin-observer-enqueue"
+        )
+        try:
+            await asyncio.wait((queued, worker), return_when=asyncio.FIRST_COMPLETED)
+            if not queued.done():
+                self._raise_delivery_worker_stopped(worker)
+            queued.result()
+        finally:
+            await join_task(queued, cancel=True, suppress_task_cancellation=True)
+
+    def _raise_delivery_worker_stopped(self, worker: asyncio.Task[None]) -> NoReturn:
+        """Preserve cancellation or fail explicitly after an unexpected normal exit."""
+
+        worker.result()
+        raise self._observation_error(
+            (
+                (
+                    "runtime.delivery_worker",
+                    RuntimeError("Observer delivery worker stopped"),
+                ),
+            )
+        )
 
     async def _deliver_observation(self, observation: RuntimeObservation) -> None:
         async def broadcast() -> None:
@@ -672,7 +816,16 @@ class RuntimeObservationHub:
 
         if self._terminal is not None:
             return
+        if (
+            outcome == "failed"
+            and error is not None
+            and error is self._initialization_error
+        ):
+            # Preserve a proven pre-Graph failure without relabeling later observer
+            # or cleanup failures, or changing cancellation into initialization failure.
+            code = "runtime_initialization_error"
         self._terminal = outcome
+        await self._settle_thread_callbacks()
         await self._call_handler.settle(outcome, error=error)
         observed_at, monotonic_ns = _stamp()
         await self.observe(
@@ -737,10 +890,25 @@ class RuntimeObservationHub:
             if process_control is None:
                 process_control = error
                 return
+            if isinstance(process_control, asyncio.CancelledError) and not isinstance(
+                error, Exception | asyncio.CancelledError
+            ):
+                # Registration order cannot let cancellation mask process control.
+                error.add_note(
+                    "Runtime Observer cleanup was also cancelled: "
+                    f"{type(process_control).__name__}: {process_control}"
+                )
+                process_control = error
+                return
             process_control.add_note(
                 "another Runtime Observer process-control outcome occurred in "
                 f"{source}: {type(error).__name__}: {error}"
             )
+
+        try:
+            await self._settle_thread_callbacks()
+        except asyncio.CancelledError as error:
+            retain_process_control(error, source="thread callback settlement")
 
         if self._started and self._terminal is not None:
             observed_at, monotonic_ns = _stamp()
@@ -812,8 +980,9 @@ class RuntimeObservationHub:
         if stop is None:
 
             async def stop_worker() -> None:
-                await queue.put(None)
-                await worker
+                if not worker.done():
+                    await self._put_delivery(queue, worker, None)
+                await join_task(worker)
 
             stop = asyncio.create_task(
                 stop_worker(),
@@ -821,10 +990,7 @@ class RuntimeObservationHub:
             )
             self._delivery_stop = stop
         try:
-            await asyncio.shield(stop)
-        except asyncio.CancelledError:
-            await asyncio.shield(stop)
-            raise
+            await join_task(stop)
         finally:
             if stop.done() and not stop.cancelled() and stop.exception() is None:
                 self._delivery_worker = None

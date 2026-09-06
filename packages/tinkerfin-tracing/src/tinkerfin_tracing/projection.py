@@ -22,6 +22,7 @@ from .errors import (
     TraceRunNotFound,
 )
 from .facts import (
+    CallTrackingFact,
     InteractionFact,
     MessageFact,
     PlanRevisionFact,
@@ -185,6 +186,12 @@ class CoreRunCheckpoint(TraceModel):
     terminal: RunTerminalOutcome | None = None
     completed_at: datetime | None = None
     state: TraceState = Field(default_factory=TraceState)
+    call_history_known: bool = Field(
+        default=False,
+        description=(
+            "Whether callbacks cover this Run or initialization failed before execution"
+        ),
+    )
     has_state_changes: bool = False
     messages: tuple[TraceMessage, ...] = ()
     reasoning: tuple[TraceReasoning, ...] = ()
@@ -592,8 +599,15 @@ def advance_core_projection_state(
                 update={
                     "terminal": fact.outcome,
                     "completed_at": fact.occurred_at,
+                    "call_history_known": info.call_history_known
+                    or (
+                        fact.outcome == "failed"
+                        and fact.code == "runtime_initialization_error"
+                    ),
                 }
             )
+        elif isinstance(fact, CallTrackingFact):
+            info = info.model_copy(update={"call_history_known": True})
 
         messages = _advance_messages(
             info.messages,
@@ -899,7 +913,17 @@ def _advance_messages(
             fact.content,
             replace=fact.phase != "content",
         )
-    if fact.phase in {"completed", "reconciled"}:
+    if fact.phase == "started":
+        message = message.model_copy(
+            update={"status": "streaming", "completed_at": None}
+        )
+    if fact.phase in {
+        "completed",
+        "reconciled",
+        "cancelled",
+        "interrupted",
+        "abandoned",
+    }:
         message = message.model_copy(
             update={"status": "completed", "completed_at": fact.occurred_at}
         )
@@ -1439,7 +1463,15 @@ def _messages(
                 fact.content,
                 replace=fact.phase != "content",
             )
-        if fact.phase in {"completed", "reconciled"}:
+        if fact.phase == "started":
+            message.completed_at = None
+        if fact.phase in {
+            "completed",
+            "reconciled",
+            "cancelled",
+            "interrupted",
+            "abandoned",
+        }:
             message.completed_at = fact.occurred_at
     return tuple(
         TraceMessage(

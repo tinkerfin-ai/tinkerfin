@@ -36,7 +36,10 @@ from ._manager_resources import (
     _ManagedBackend,
     _owner_key,
 )
+from ._notifications import _LifecycleNotifications
 from ._protocols import _SandboxClient, _SandboxClientBoundary
+from .notifications import OpenSandboxLifecycleObserver, OpenSandboxNotificationOptions
+from .recovery import OpenSandboxRecoveryPolicy
 from .state import (
     InMemoryOpenSandboxState,
     OpenSandboxBinding,
@@ -62,6 +65,11 @@ class OpenSandboxManager(Generic[KeyT]):
     Cancellation cannot abandon a Sandbox after it leaves the warm pool or client.
     Explicit destruction is strict and retryable; cleanup after a successful
     replacement is durable when the configured State is persistent.
+
+    Optional observers receive confirmed lifecycle changes without participating in
+    resource decisions. Reentering this manager from an observer raises
+    ``OpenSandboxObserverReentryError``. The manager drains owned delivery tasks on
+    close but never closes the borrowed observers themselves.
     """
 
     def __init__(
@@ -73,6 +81,9 @@ class OpenSandboxManager(Generic[KeyT]):
         warm_pool_size: int | None = None,
         fail_on_startup_warmup_error: bool = False,
         settlement_timeout: float | None = None,
+        recovery_policy: OpenSandboxRecoveryPolicy | None = None,
+        observers: Sequence[OpenSandboxLifecycleObserver] = (),
+        notification_options: OpenSandboxNotificationOptions | None = None,
     ) -> None:
         """Configure the manager without opening resources or creating a Sandbox.
 
@@ -90,6 +101,14 @@ class OpenSandboxManager(Generic[KeyT]):
             settlement_timeout: Optional per-caller close wait in seconds. ``None``
                 waits for complete cleanup. A finite timeout never cancels the shared
                 close task.
+            recovery_policy: Limits for existing-instance connection and health
+                recovery. Omit it to retry briefly, then preserve the binding and
+                report failure. Recreation requires an explicit policy choice.
+            observers: Borrowed asynchronous observers of confirmed lifecycle changes.
+                Each receives events in order through an independent bounded queue.
+                Observers must not reenter this manager's resource operations or close.
+            notification_options: Per-observer queue capacity and execution timeout.
+                Omit it for 128 pending events and one second per callback.
 
         Raises:
             TypeError: ``settlement_timeout`` is not numeric or is a boolean.
@@ -106,6 +125,26 @@ class OpenSandboxManager(Generic[KeyT]):
             raise ValueError("warm_pool_size must not be negative")
         if not callable(key_resolver):
             raise TypeError("key_resolver must be callable")
+        if recovery_policy is not None and not isinstance(
+            recovery_policy, OpenSandboxRecoveryPolicy
+        ):
+            raise TypeError(
+                "recovery_policy must be an OpenSandboxRecoveryPolicy or None"
+            )
+        if notification_options is not None and not isinstance(
+            notification_options, OpenSandboxNotificationOptions
+        ):
+            raise TypeError(
+                "notification_options must be an OpenSandboxNotificationOptions or None"
+            )
+        resolved_observers = tuple(observers)
+        for observer in resolved_observers:
+            if not callable(getattr(observer, "on_sandbox_event", None)):
+                raise TypeError("Each observer must provide on_sandbox_event")
+        if len({id(observer) for observer in resolved_observers}) != len(
+            resolved_observers
+        ):
+            raise ValueError("observers must not contain the same observer twice")
         if settlement_timeout is None:
             resolved_timeout = None
         else:
@@ -124,6 +163,10 @@ class OpenSandboxManager(Generic[KeyT]):
         self._warm_pool_size = resolved_warm_size
         self._fail_on_startup_warmup_error = fail_on_startup_warmup_error
         self._settlement_timeout = resolved_timeout
+        self._recovery_policy = recovery_policy or OpenSandboxRecoveryPolicy()
+        self._notifications = _LifecycleNotifications(
+            resolved_observers, notification_options or OpenSandboxNotificationOptions()
+        )
         self._handles: dict[str, OpenSandboxHandle] = {}
         self._backend_views: dict[str, tuple[OpenSandboxHandle, _ManagedBackend]] = {}
         self._warm_backends: list[OpenSandboxBackend] = []
@@ -132,6 +175,11 @@ class OpenSandboxManager(Generic[KeyT]):
         self._warm_maintenance_task: asyncio.Task[None] | None = None
         self._warm_maintenance_wakeup = asyncio.Event()
         self._warm_ready = asyncio.Event()
+        # Persistent publication alone cannot certify this manager's startup. Each
+        # slot must be verified or created here once; progress across maintenance
+        # rounds is bounded by the configured capacity and survives peer claims.
+        self._initial_warm_verified: set[int] = set()
+        self._startup_complete = False
         self._warm_failure: BaseException | None = None
         self._cleanup_tasks: set[asyncio.Task[None]] = set()
         self._cleanup_wakeup = asyncio.Event()
@@ -148,6 +196,7 @@ class OpenSandboxManager(Generic[KeyT]):
 
     def _resolve_owner_key(self, key: KeyT) -> str:
         """Resolve one opaque application key at the manager boundary."""
+        self._notifications.check_reentry()
         return _owner_key(self._key_resolver(key))
 
     async def __aenter__(self) -> Self:
@@ -210,7 +259,10 @@ class OpenSandboxManager(Generic[KeyT]):
         Raises:
             OpenSandboxManagerClosedError: The manager has begun closing.
             OpenSandboxStateError: The allocation State cannot start safely.
+            OpenSandboxWarmPoolUnavailableError: Strict warmup could not verify
+                initial capacity, including slots currently held by another worker.
         """
+        self._notifications.check_reentry()
         async with self._state_lock:
             if self._closed:
                 raise OpenSandboxManagerClosedError("OpenSandbox manager is closed")
@@ -234,17 +286,21 @@ class OpenSandboxManager(Generic[KeyT]):
             self._warm_maintenance_loop(),
             name="tinkerfin-opensandbox-warm-maintenance",
         )
+        self._startup_complete = True
 
     def _ensure_open(self) -> None:
+        self._notifications.check_reentry()
         if self._closed:
             raise OpenSandboxManagerClosedError("OpenSandbox manager is closed")
 
     async def check_ready(self) -> None:
         """Raise when the configured ready Sandbox capacity is unavailable.
 
-        Hosts can use this side-effect-free check in their readiness endpoint. It
-        reports startup or background warm-pool failures without exposing provider
-        responses, credentials, or remote identifiers.
+        Hosts can use this check in their readiness endpoint. It
+        reads shared capacity and reports startup or background warm-pool failures.
+        Routine verification retains published capacity until a failure is known;
+        consumption removes capacity immediately. Provider responses, credentials,
+        and remote identifiers are never included in the public failure.
 
         Raises:
             OpenSandboxManagerClosedError: The manager is not available for work.
@@ -253,15 +309,18 @@ class OpenSandboxManager(Generic[KeyT]):
         """
 
         self._ensure_open()
-        if not self._started:
+        if not self._startup_complete:
             raise OpenSandboxWarmPoolUnavailableError(
                 "OpenSandbox warm capacity has not started",
                 context={"target_capacity": self._warm_pool_size},
             )
         if self._warm_pool_size == 0:
             return
-        if self._warm_ready.is_set() and self._warm_failure is None:
-            return
+        async with self._operation():
+            ready = self._warm_failure is None and await self._state.warm_pool_ready()
+            self._notifications.warm_capacity(ready=ready)
+            if ready:
+                return
         failure = self._warm_failure
         raise OpenSandboxWarmPoolUnavailableError(
             "OpenSandbox warm capacity is unavailable",
@@ -390,7 +449,7 @@ class OpenSandboxManager(Generic[KeyT]):
         )
 
     async def _renew_backend(self, backend: _HealthBackend) -> None:
-        """Best-effort renewal without invalidating an otherwise healthy handle."""
+        """Best-effort finite expiry renewal that preserves healthy owner handles."""
 
         return await _manager_resources._renew_backend(
             self,
@@ -398,7 +457,7 @@ class OpenSandboxManager(Generic[KeyT]):
         )
 
     async def _renew_ready_backend(self, backend: _HealthBackend) -> None:
-        """Renew warm capacity strictly so readiness never hides expiry failure."""
+        """Renew finite warm expiry strictly; manual-cleanup instances need no renewal."""
 
         return await _manager_resources._renew_ready_backend(
             self,
@@ -603,7 +662,7 @@ class OpenSandboxManager(Generic[KeyT]):
         )
 
     async def _warm_maintenance_loop(self) -> None:
-        """Renew or replace ready capacity until manager shutdown."""
+        """Check warm health, renew finite expiry, and restore capacity until close."""
 
         return await _manager_resources._warm_maintenance_loop(self)
 
@@ -633,8 +692,8 @@ class OpenSandboxManager(Generic[KeyT]):
 
         State first transfers a global warm slot atomically to the owner. Instances
         created by this process reuse their local backend; instances created by other
-        workers reconnect by remote ID. Unhealthy instances are destroyed before the
-        manager tries another warm slot or creates on demand.
+        workers reconnect by remote ID. Unusable remote IDs are reclaimed only after
+        a healthy candidate becomes authoritative.
 
         Returns:
             Candidate backend, optional committed binding, warm-slot fact, and remote
@@ -775,7 +834,8 @@ class OpenSandboxManager(Generic[KeyT]):
         """Return the healthy stable backend for one caller-defined key.
 
         Resolution checks the local handle, committed State binding, warm pool, and
-        on-demand creation in that order. An unavailable binding is replaced. Calls
+        on-demand creation in that order. An unavailable binding follows the recovery
+        policy; defaults preserve it. Calls
         resolving to the same owner receive the same stable handle.
 
         Args:
@@ -840,8 +900,22 @@ class OpenSandboxManager(Generic[KeyT]):
         )
 
     async def reconnect(self, key: KeyT) -> _ManagedBackend:
-        """Alias for ``get()`` that also creates when no binding exists."""
-        return await self.get(key)
+        """Reconnect an existing binding while preserving its remote identity.
+
+        Uses the recovery retry limits but never creates or recreates an instance,
+        even when the configured failure action permits recreation for ``get()``.
+
+        Args:
+            key: Opaque application identity accepted by ``key_resolver``.
+
+        Returns:
+            A stable backend view connected to the same remote instance.
+
+        Raises:
+            OpenSandboxBackendUnavailableError: No binding exists or recovery fails.
+            OpenSandboxStateError: Authoritative ownership cannot be established.
+        """
+        return await _manager_bindings.reconnect(self, key)
 
     async def reset(self, key: KeyT) -> None:
         """Clear the configured workspace while retaining identity and binding.
@@ -944,9 +1018,12 @@ class OpenSandboxManager(Generic[KeyT]):
         )
 
     async def _close_resources(self) -> None:
-        return await _manager_resources._close_resources(
-            self,
-        )
+        try:
+            await _manager_resources._close_resources(self)
+        finally:
+            # Public operations and warm maintenance have settled before delivery
+            # stops accepting events. Observer objects remain owned by the host.
+            await self._notifications.aclose()
 
     async def aclose(self) -> None:
         """Idempotently close every resource owned by this manager.
@@ -956,11 +1033,16 @@ class OpenSandboxManager(Generic[KeyT]):
         available to another worker. The client and State are both closed. A finite
         ``settlement_timeout`` limits only the current caller's wait; the same close
         task remains owned and can be awaited by calling ``aclose`` again.
+        Accepted lifecycle notifications are drained after resources settle. Observer
+        objects remain borrowed; slow cooperative observers can extend this wait by
+        their bounded pending capacity and per-callback timeout.
 
         Raises:
             OpenSandboxSettlementTimeoutError: The configured caller wait expires
                 before the shared close task settles.
+            OpenSandboxObserverReentryError: An observer reenters its own manager.
         """
+        self._notifications.check_reentry()
         async with self._state_lock:
             close_task = self._close_task
             if close_task is None:

@@ -16,6 +16,7 @@ class LangGraphMySQLErrorCode(StrEnum):
     ERROR = "tinkerfin_langgraph_mysql.error"
     DRIVER_FAILURE = "tinkerfin_langgraph_mysql.driver_failure"
     SCHEMA_MISMATCH = "tinkerfin_langgraph_mysql.schema_mismatch"
+    STORE_CLOSED = "tinkerfin_langgraph_mysql.store_closed"
 
 
 class LangGraphMySQLError(Exception):
@@ -69,6 +70,16 @@ class LangGraphMySQLDriverError(LangGraphMySQLError, RuntimeError):
         )
 
 
+class LangGraphMySQLStoreClosedError(LangGraphMySQLError, RuntimeError):
+    """The Store no longer accepts operations after close begins."""
+
+    code = LangGraphMySQLErrorCode.STORE_CLOSED
+
+    def __init__(self) -> None:
+        """Report closure without exposing connection or driver information."""
+        super().__init__("The LangGraph MySQL Store is closed")
+
+
 class LangGraphMySQLSchemaError(LangGraphMySQLError, RuntimeError):
     """The existing Store table does not match the only current Schema."""
 
@@ -89,4 +100,5 @@ __all__ = [
     "LangGraphMySQLError",
     "LangGraphMySQLErrorCode",
     "LangGraphMySQLSchemaError",
+    "LangGraphMySQLStoreClosedError",
 ]

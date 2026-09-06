@@ -473,7 +473,13 @@ def _resolve_append_message(
             payload_bytes=stream.payload_bytes + len(payload),
             message_sequence=next_sequence,
         ),
-        runs=(replace(run, end_sequence=next_sequence, checkpoint=checkpoint),),
+        runs=(
+            replace(
+                run,
+                end_sequence=next_sequence,
+                checkpoint=run.checkpoint if checkpoint is None else checkpoint,
+            ),
+        ),
         message=StoredMessageEvidence(
             envelope=envelope,
             signature=signature,

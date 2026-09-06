@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Generator
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Awaitable, Callable, Generator, Mapping
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from typing import Any, NotRequired, cast
 
@@ -85,7 +85,7 @@ def create_plan_handoff_middleware() -> AgentMiddleware[Any, Any, Any]:
 
 @contextmanager
 def activate_plan_handoff_instruction(instruction: str) -> Generator[None]:
-    """Scope one approved Plan instruction to the current native execution task."""
+    """Scope approved Plan context to one pull or close without crossing a yield."""
 
     if not isinstance(instruction, str) or not instruction:
         raise ValueError("Plan handoff instruction must be non-empty text")
@@ -96,8 +96,57 @@ def activate_plan_handoff_instruction(instruction: str) -> Generator[None]:
         _ACTIVE_HANDOFF_INSTRUCTION.reset(token)
 
 
+class PlanHandoffStream(AsyncIterator[Mapping[str, object]]):
+    """Keep approved Plan context local to each native stream operation.
+
+    Managed Observation can consume successive parts in different asyncio tasks.
+    A ContextVar token must therefore be restored before returning a part, while
+    native model tasks inherit the instruction from the pull that starts them.
+    Explicit closure establishes its own context and owns the upstream iterator.
+    ``test_plan_approval_hands_off_to_native_with_the_same_message_id`` covers the
+    public observed and unobserved Runtime paths.
+    """
+
+    def __init__(
+        self,
+        source: AsyncIterator[Mapping[str, object]],
+        instruction: str | None,
+    ) -> None:
+        self._source = source
+        self._instruction = instruction
+        self._closed = False
+
+    async def __anext__(self) -> Mapping[str, object]:
+        if self._closed:
+            raise StopAsyncIteration
+        context = (
+            nullcontext()
+            if self._instruction is None
+            else activate_plan_handoff_instruction(self._instruction)
+        )
+        with context:
+            return await anext(self._source)
+
+    async def aclose(self) -> None:
+        """Close native work once with task-local approved Plan context."""
+
+        if self._closed:
+            return
+        self._closed = True
+        close = getattr(self._source, "aclose", None)
+        if close is None:
+            return
+        context = (
+            nullcontext()
+            if self._instruction is None
+            else activate_plan_handoff_instruction(self._instruction)
+        )
+        with context:
+            await cast(Callable[[], Awaitable[object]], close)()
+
+
 __all__ = [
     "PLAN_HANDOFF_STATE_KEY",
-    "activate_plan_handoff_instruction",
+    "PlanHandoffStream",
     "create_plan_handoff_middleware",
 ]

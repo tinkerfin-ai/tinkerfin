@@ -60,6 +60,7 @@ _CURRENT_NAMESPACE: ContextVar[tuple[str, ...]] = ContextVar(
     "tinkerfin_current_call_namespace",
     default=(),
 )
+_SYNC_CALLBACK: ContextVar[bool] = ContextVar("tinkerfin_sync_callback", default=False)
 
 
 def bind_observation_hub(
@@ -284,6 +285,21 @@ class RuntimeCallHandler(AsyncCallbackHandler):
 
         return True
 
+    @property
+    def ignore_llm(self) -> bool:
+        """Leave synchronous provider callbacks to the native thread adapter."""
+        return not self._hub.in_call_loop()
+
+    @property
+    def ignore_chat_model(self) -> bool:
+        """Handle model starts only on the Run's asynchronous callback surface."""
+        return not self._hub.in_call_loop()
+
+    @property
+    def ignore_agent(self) -> bool:
+        """Leave synchronous Tool callbacks to the native thread adapter."""
+        return not self._hub.in_call_loop()
+
     def _call_parent(
         self,
         parent_run_id: UUID | None,
@@ -345,8 +361,9 @@ class RuntimeCallHandler(AsyncCallbackHandler):
         self._models[call_id] = state
         await self._hub.observe(observation)
         await self._hub.force(ObservationBoundary.CALL_STARTED)
-        self._call_tokens[call_id] = _CURRENT_CALL_ID.set(call_id)
-        self._namespace_tokens[call_id] = _CURRENT_NAMESPACE.set(state.namespace)
+        if not _SYNC_CALLBACK.get():
+            self._call_tokens[call_id] = _CURRENT_CALL_ID.set(call_id)
+            self._namespace_tokens[call_id] = _CURRENT_NAMESPACE.set(state.namespace)
 
     async def on_llm_new_token(
         self,
@@ -548,8 +565,11 @@ class RuntimeCallHandler(AsyncCallbackHandler):
         self._tools[execution_id] = state
         await self._hub.observe(observation)
         await self._hub.force(ObservationBoundary.CALL_STARTED)
-        self._call_tokens[execution_id] = _CURRENT_CALL_ID.set(execution_id)
-        self._namespace_tokens[execution_id] = _CURRENT_NAMESPACE.set(state.namespace)
+        if not _SYNC_CALLBACK.get():
+            self._call_tokens[execution_id] = _CURRENT_CALL_ID.set(execution_id)
+            self._namespace_tokens[execution_id] = _CURRENT_NAMESPACE.set(
+                state.namespace
+            )
 
     async def on_tool_end(
         self,

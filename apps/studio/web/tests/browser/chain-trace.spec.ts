@@ -259,6 +259,8 @@ const detail = (
   lastModel: 'deepseek-v4-pro',
   pinned: false,
   asOfSeq: 30,
+  generation: `browser-generation:${threadId}`,
+  observedAt: '2026-09-05T00:00:00.000000Z',
   headRunId: RUN_ID,
   availableHeads: [RUN_ID],
   historyCursor: null,
@@ -324,16 +326,19 @@ async function mockChainTraceStudio(
     threadId,
     selectedTheme,
     selectedLanguage,
-    initialSnapshot,
+    initialSnapshotJson,
   }) => {
+    const initialSnapshot = JSON.parse(initialSnapshotJson) as TraceGraphPage
     window.localStorage.setItem('tinkerfin.auth.session', JSON.stringify(session))
     window.localStorage.setItem('tinkerfin:theme', selectedTheme)
     window.localStorage.setItem('tinkerfin:language', selectedLanguage)
     const traceWindow = window as typeof window & {
       __traceFollowUrls: string[]
+      __traceSnapshotUrls: string[]
       __traceDirectUrls: string[]
     }
     traceWindow.__traceFollowUrls = []
+    traceWindow.__traceSnapshotUrls = []
     traceWindow.__traceDirectUrls = []
     const originalFetch = window.fetch.bind(window)
     window.fetch = (input, init) => {
@@ -343,6 +348,9 @@ async function mockChainTraceStudio(
       const url = new URL(rawUrl, window.location.origin)
       if (url.pathname === `/api/conversation/${threadId}/trace/graph/follow`) {
         traceWindow.__traceFollowUrls.push(url.href)
+      }
+      if (url.pathname === `/api/conversation/${threadId}/trace/graph` && !url.searchParams.has('modelCallId')) {
+        traceWindow.__traceSnapshotUrls.push(url.href)
         const kinds = new Set(url.searchParams.getAll('kind'))
         const query = url.searchParams.get('query')?.toLocaleLowerCase() ?? ''
         const direct = initialSnapshot.nodes.filter((node) => (
@@ -373,27 +381,7 @@ async function mockChainTraceStudio(
             .filter((node) => directIds.has(node.id))
             .map((node) => node.id),
         }
-        const encoder = new TextEncoder()
-        const stream = new ReadableStream({
-          start(controller) {
-            let closed = false
-            controller.enqueue(encoder.encode(
-              `event: trace\ndata: ${JSON.stringify({
-                type: 'snapshot',
-                snapshot: filteredSnapshot,
-              })}\n\n`,
-            ))
-            init?.signal?.addEventListener('abort', () => {
-              if (closed) return
-              closed = true
-              controller.close()
-            }, { once: true })
-          },
-        })
-        return Promise.resolve(new Response(stream, {
-          status: 200,
-          headers: { 'Content-Type': 'text/event-stream' },
-        }))
+        return Promise.resolve(Response.json({ code: 0, message: 'success', data: filteredSnapshot }))
       }
       if (url.pathname === `/api/conversation/${threadId}/trace/graph`) {
         traceWindow.__traceDirectUrls.push(url.href)
@@ -410,7 +398,7 @@ async function mockChainTraceStudio(
     threadId: THREAD_ID,
     selectedTheme: theme,
     selectedLanguage: language,
-    initialSnapshot: snapshot,
+    initialSnapshotJson: JSON.stringify(snapshot),
   })
 
   await page.route('**/api/**', async (route) => {
@@ -503,10 +491,12 @@ async function mockChainTraceStudio(
 const traceRequests = (page: Page) => page.evaluate(() => {
   const traceWindow = window as typeof window & {
     __traceFollowUrls: string[]
+    __traceSnapshotUrls: string[]
     __traceDirectUrls: string[]
   }
   return {
     follow: traceWindow.__traceFollowUrls,
+    snapshots: traceWindow.__traceSnapshotUrls,
     direct: traceWindow.__traceDirectUrls,
   }
 })
@@ -531,7 +521,7 @@ test('六类时间线、平级台账、Subagent 作用域和详情保持同一�
 
   await traceTab.click()
   await expect(page.getByRole('tabpanel', { name: '链路' })).toBeVisible()
-  await expect.poll(async () => (await traceRequests(page)).follow.length).toBe(1)
+  await expect.poll(async () => (await traceRequests(page)).snapshots.length).toBe(1)
   await expect(page.getByRole('region', { name: '调用时间线' })).toBeVisible()
   await expect(page.getByLabel('链路节点', { exact: true })).toBeVisible()
   await expect.poll(() => page.getByLabel('链路节点', { exact: true }).evaluate(
@@ -830,12 +820,13 @@ test('选中节点只展示所属 Turn 且蓝色选区严格对齐节点条', as
   expect(pageErrors).toEqual([])
 })
 
-test('搜索只替换一条 SSE，Studio 不再发送节点类型筛选', async ({ page }) => {
+test('历史链路搜索只读取筛选快照，不发送节点类型筛选', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 850 })
   const pageErrors = await mockChainTraceStudio(page)
   await page.getByRole('tab', { name: '链路' }).click()
-  await expect.poll(async () => (await traceRequests(page)).follow.length).toBe(1)
-  const initial = new URL((await traceRequests(page)).follow[0]!)
+  await expect.poll(async () => (await traceRequests(page)).snapshots.length).toBe(1)
+  expect((await traceRequests(page)).follow).toHaveLength(0)
+  const initial = new URL((await traceRequests(page)).snapshots[0]!)
   expect(initial.searchParams.getAll('kind')).toEqual([])
 
   const searchTrigger = page.getByRole('button', { name: '搜索链路节点' })
@@ -847,16 +838,16 @@ test('搜索只替换一条 SSE，Studio 不再发送节点类型筛选', async 
   await expect(page.getByRole('button', { name: '清除链路搜索' })).toHaveCount(1)
   await search.pressSequentially('deepseek', { delay: 20 })
   await page.waitForTimeout(180)
-  expect((await traceRequests(page)).follow).toHaveLength(1)
-  await expect.poll(async () => (await traceRequests(page)).follow.length).toBe(2)
-  expect(new URL((await traceRequests(page)).follow.at(-1)!).searchParams.get('query'))
+  expect((await traceRequests(page)).snapshots).toHaveLength(1)
+  await expect.poll(async () => (await traceRequests(page)).snapshots.length).toBe(2)
+  expect(new URL((await traceRequests(page)).snapshots.at(-1)!).searchParams.get('query'))
     .toBe('deepseek')
 
   await page.getByRole('button', { name: '清除链路搜索' }).click()
   await expect(search).toHaveCount(0)
   await expect(searchTrigger).toHaveCount(1)
-  await expect.poll(async () => (await traceRequests(page)).follow.length).toBe(3)
-  const restored = new URL((await traceRequests(page)).follow.at(-1)!)
+  await expect.poll(async () => (await traceRequests(page)).snapshots.length).toBe(3)
+  const restored = new URL((await traceRequests(page)).snapshots.at(-1)!)
   expect(restored.searchParams.getAll('kind')).toEqual([])
   expect(restored.searchParams.has('includeTechnicalNodes')).toBe(false)
   expect(restored.searchParams.has('includeAncestorNodes')).toBe(false)
@@ -864,18 +855,18 @@ test('搜索只替换一条 SSE，Studio 不再发送节点类型筛选', async 
   expect(pageErrors).toEqual([])
 })
 
-test('搜索结果中的 Model 详情只补取一次完整响应且不新增 SSE', async ({ page }) => {
+test('搜索结果中的 Model 详情只补取一次完整响应且不重复读取列表', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 850 })
   const pageErrors = await mockChainTraceStudio(page)
   await page.getByRole('tab', { name: '链路' }).click()
   await page.getByRole('button', { name: '搜索链路节点' }).click()
   await page.getByRole('searchbox', { name: '搜索链路节点' }).fill('4872')
-  await expect.poll(async () => (await traceRequests(page)).follow.length).toBe(2)
-  const followCount = (await traceRequests(page)).follow.length
+  await expect.poll(async () => (await traceRequests(page)).snapshots.length).toBe(2)
+  const snapshotCount = (await traceRequests(page)).snapshots.length
 
   await expect.poll(async () => (await traceRequests(page)).direct.length).toBe(1)
   const requests = await traceRequests(page)
-  expect(requests.follow).toHaveLength(followCount)
+  expect(requests.snapshots).toHaveLength(snapshotCount)
   const direct = new URL(requests.direct[0]!)
   expect(direct.searchParams.get('modelCallId')).toBe('model-current')
   expect(direct.searchParams.getAll('kind')).toEqual([])
@@ -896,7 +887,7 @@ test('详情省略时 fail-closed，英文界面不会把空响应展示为成�
   await page.getByRole('button', { name: 'Search trace nodes' }).click()
   await page.getByRole('searchbox', { name: 'Search trace nodes' })
     .fill('4872')
-  await expect.poll(async () => (await traceRequests(page)).follow.length).toBe(2)
+  await expect.poll(async () => (await traceRequests(page)).snapshots.length).toBe(2)
   const details = page.locator('.chain-trace-details')
   await details.getByRole('tab', { name: 'Response' }).click()
   await expect(details.getByRole('alert')).toContainText(
@@ -1275,4 +1266,28 @@ test('序列选择收起的子节点会展开所属作用域并在关闭详情�
   await page.getByRole('button', { name: '关闭链路详情' }).click()
   await expect(traceRow(page, 'inner-assistant')).toBeFocused()
   expect(pageErrors).toEqual([])
+})
+
+test('错误详情将请求入口与错误摘要紧凑并排', async ({ page }) => {
+  await mockChainTraceStudio(page)
+  await page.getByRole('tab', { name: '链路', exact: true }).click()
+  for (const theme of ['light', 'dark']) {
+    await page.evaluate(value => { document.documentElement.dataset.theme = value }, theme)
+    for (const width of [320, 768, 1024, 1440]) {
+      await page.setViewportSize({ width, height: 900 })
+      const close = page.getByRole('button', { name: '关闭链路详情' })
+      if (await close.isVisible()) await close.click()
+      await traceRow(page, 'failed-tool').click()
+      const panel = page.getByRole('region', { name: '错误详情' })
+      await expect(panel).toContainText('搜索服务在期限内未响应')
+      const request = panel.getByRole('button', { name: '查看请求' })
+      const titleBox = await panel.getByText('builtins.TimeoutError', { exact: true }).boundingBox()
+      const actionBox = await request.boundingBox()
+      expect(actionBox!.x).toBeGreaterThan(titleBox!.x + titleBox!.width)
+      await page.screenshot({ path: `/tmp/trace-error-compact-${theme}-${width}.png` })
+      await request.click()
+      await expect(page.getByRole('tab', { name: '请求', exact: true })).toHaveAttribute('aria-selected', 'true')
+      await page.getByRole('button', { name: '关闭链路详情' }).click()
+    }
+  }
 })

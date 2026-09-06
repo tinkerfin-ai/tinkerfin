@@ -761,6 +761,96 @@ async def test_detached_follow_can_skip_task_trace_without_losing_base_updates(
     await _finish_trace(context, trace_session)
 
 
+async def test_history_follow_publishes_ownership_without_fabricating_graph_events(
+    session,
+) -> None:
+    """失活更新同时抵达公开摘要与任务视图，事件和 Graph 保持原有事实"""
+    tracer = Tracer()
+    repository = ConversationRepository(session)
+    thread = await _register(
+        repository,
+        user_id=1,
+        thread_id="thread-follow-owner",
+        run_id="run-follow-owner",
+    )
+    context, trace_session = await _open_trace(
+        tracer,
+        thread_id=thread.thread_id,
+        run_id="run-follow-owner",
+    )
+    await trace_session.observe(
+        NativeMessageObservation(
+            identity=context.identity,
+            namespace=(),
+            message=NativeMessageRecord(
+                message_type="assistant_chunk",
+                id="assistant-owner",
+                content="",
+                tool_call_chunks=(
+                    NativeToolCallChunk(
+                        index=0,
+                        id="todos-owner",
+                        name="write_todos",
+                        arguments='{"todos":[{"content":"等待任务","status":"in_progress"}]}',
+                    ),
+                ),
+            ),
+            observed_at=datetime.now(UTC),
+            monotonic_ns=3,
+        )
+    )
+    await trace_session.observe(
+        NativeMessageObservation(
+            identity=context.identity,
+            namespace=(),
+            message=NativeMessageRecord(
+                message_type="tool",
+                id="todos-result-owner",
+                name="write_todos",
+                tool_call_id="todos-owner",
+                content="Updated todo list",
+                tool_status="success",
+            ),
+            observed_at=datetime.now(UTC),
+            monotonic_ns=4,
+        )
+    )
+    await trace_session.observe(
+        NativeStateObservation(
+            identity=context.identity,
+            namespace=(),
+            state={"todos": [{"content": "等待任务", "status": "in_progress"}]},
+            interrupts=(),
+            observed_at=datetime.now(UTC),
+            monotonic_ns=5,
+        )
+    )
+    await trace_session.force(ObservationBoundary.TERMINAL)
+    events = await _service(repository, tracer=tracer).follow_trace(
+        thread.thread_id,
+        include_task_trace=True,
+    )
+    try:
+        initial = await anext(events)
+        assert initial.type == "snapshot"
+        await trace_session.aclose()
+        update = await asyncio.wait_for(anext(events), 2)
+        assert update.type == "update"
+        assert update.update.as_of_seq == initial.snapshot.as_of_seq
+        assert update.update.generation == initial.snapshot.generation
+        assert update.update.observed_at >= initial.snapshot.observed_at
+        assert update.update.status.execution == "unknown"
+        assert update.update.events == ()
+        assert update.update.graph.node_upserts == ()
+        assert update.update.graph.turn_upserts == ()
+        assert update.task_trace is not None
+        assert update.task_trace.todo_groups[0].status == "failed"
+        assert update.task_trace.todo_groups[0].todos[0].status == "failed"
+    finally:
+        await events.aclose()
+        await trace_session.aclose()
+
+
 async def test_history_route_returns_one_validated_json_body_with_task_trace(
     session,
 ) -> None:

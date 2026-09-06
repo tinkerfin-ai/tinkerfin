@@ -4,6 +4,11 @@
 
 Default state exists only in the current process. Use SQLAlchemy state when multiple workers share bindings or when a restart must recover them.
 
+State stores bindings and leases, not container files. For a workspace kept until
+explicit cleanup, combine persistent State with `OpenSandboxConfig(ttl=None)`.
+Normal manager close then preserves its binding and remote instance. Volumes and a
+backup policy are still needed when files must survive instance or storage loss.
+
 ## SQLite for multiple local processes
 
 ```bash
@@ -87,23 +92,31 @@ manager = OpenSandboxManager(
 
 Warm instances are not bound to an application key until `get()` atomically consumes a ready slot.
 
-## Initialize newly created instances
+## Prepare workspaces
 
 ```python
-async def install_project(backend) -> None:
-    await backend.aexecute(
-        "git clone https://example.com/project.git /workspace/project"
+async def prepare_project(backend) -> None:
+    result = await backend.aexecute(
+        "mkdir -p /workspace/project /workspace/output"
     )
+    if result.exit_code != 0:
+        raise RuntimeError("Could not prepare workspace directories")
 
 
 client = OpenSandboxClient(
     connection_config=connection_config,
     config=config,
-    initializers=[install_project],
+    initializers=[prepare_project],
 )
 ```
 
-Initializers run after a new Sandbox becomes ready. Keep them asynchronous, cancellable, observable, and deterministic for each fresh instance.
+Initializers run after creation and each connection to an existing Sandbox. Make
+them idempotent and preserve existing workspace contents. Use asynchronous callbacks
+for I/O and propagate cancellation; synchronous callbacks must be non-blocking.
+Connection and initialization share the earlier client or recovery deadline.
+Initializer failure is reported as `OpenSandboxInitializationError` and does not
+authorize retries or recreation. See the [usage reference](api-reference.md) for
+callback and timeout constraints.
 
 ## Bring your own state store
 

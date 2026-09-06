@@ -358,6 +358,7 @@ export function useConversationStreamController({
           setWorkspace((state) => updateConversation(state, threadId, (item) => {
             if (event.type === 'snapshot') {
               return restoreConversationFromTrace(event.snapshot, {
+                previous: item,
                 model: item.model,
                 lastDeliveredSeq: item.lastSeq,
                 includeTaskTrace,
@@ -385,6 +386,7 @@ export function useConversationStreamController({
                 state,
                 threadId,
                 (item) => restoreConversationFromTrace(detail, {
+                  previous: item,
                   model: item.model,
                   lastDeliveredSeq: item.lastSeq,
                   includeTaskTrace,
@@ -412,6 +414,7 @@ export function useConversationStreamController({
           state,
           threadId,
           (item) => restoreConversationFromTrace(detail, {
+            previous: item,
             model: item.model,
             lastDeliveredSeq: item.lastSeq,
             includeTaskTrace,
@@ -690,6 +693,7 @@ export function useConversationStreamController({
           suppressGlobalError: true,
         })
         const authoritative = restoreConversationFromTrace(detail, {
+          previous: validationTarget ?? undefined,
           model: validationTarget?.model ?? payload.forwardedProps.model,
           lastDeliveredSeq: lastAppliedSeq ?? undefined,
           includeTaskTrace: true,
@@ -701,7 +705,12 @@ export function useConversationStreamController({
           (state) => updateConversation(
             state,
             targetThreadId,
-            () => authoritative,
+            (item) => restoreConversationFromTrace(detail, {
+              previous: item,
+              model: authoritative.model,
+              lastDeliveredSeq: authoritative.lastSeq,
+              includeTaskTrace: true,
+            }),
           ),
         )
       }
