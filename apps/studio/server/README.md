@@ -175,6 +175,9 @@ OpenSandbox 的 SQLite Store 与 Docker runtime metadata 分别使用持久卷�
   启动时还会用 `@@max_connections` 校验 `DATABASE_MANAGEMENT_CONNECTION_RESERVE`
 - `MESSAGING_RETENTION_SECONDS` 默认 `86400`，只定义终态后的网络重播窗口；`0` 关闭自动过期
 - 容器日志默认只写 stdout；设置 `LOG_FILE_ENABLED=true` 后写入持久日志卷
+- 沙箱生命周期回调记录事件、原因、用户绑定身份和工作区变化提示，沿用上述日志输出及 `LOG_LEVEL`。
+  不可用和预热容量不足为 WARNING，恢复失败为 ERROR，恢复、重建、重置、销毁及预热恢复等为 INFO。
+  用户实例故障在实际访问或检查发现后记录，不保证容器停止时立即通知；进程内回调也不提供可靠审计交付
 - `DATABASE_ECHO` 独立于 `LOG_LEVEL` 控制 SQL 语句与参数的日志输出；SQL 日志使用应用日志格式，
   写入标准输出和已启用的文件日志，每个输出各记录一次
 - `dist/` 保存本次发布依赖与 wheel；部署通过仓库统一入口在临时副本中构建，并逐字节核对源码、类型声明和包资源；工作树中的 `build/` 与 `.egg-info` 不参与构建

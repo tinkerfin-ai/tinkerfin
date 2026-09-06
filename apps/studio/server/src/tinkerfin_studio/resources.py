@@ -39,6 +39,7 @@ from tinkerfin_studio.conversation.todo_groups import TodoGroupQueryExecutor
 from tinkerfin_studio.health import ReadinessService
 from tinkerfin_studio.infrastructure.database import Database
 from tinkerfin_studio.infrastructure.redis_client import create_redis_client
+from tinkerfin_studio.infrastructure.sandbox_events import SandboxEventLogger
 from tinkerfin_tracing import (
     CapturePolicy,
     SqlAlchemyTraceStore,
@@ -265,6 +266,8 @@ def build_lifespan():
                     ),
                     warm_pool_size=sandbox_settings.warm_pool_size,
                     fail_on_startup_warmup_error=True,
+                    # 已确认的沙箱与预热容量变化复用应用日志输出
+                    observers=(SandboxEventLogger(),),
                 ),
             )
             messaging_backend = RedisBackend(
