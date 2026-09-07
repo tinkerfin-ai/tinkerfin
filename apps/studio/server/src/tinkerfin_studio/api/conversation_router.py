@@ -234,14 +234,15 @@ async def update_thread(
     )
 
 
-@router.delete("/{thread_id}", status_code=204)
+@router.delete("/{thread_id}", response_model=ApiResponse[None])
 async def delete_thread(
     thread_id: ThreadIdPath,
     service: ConversationCommandDep,
-) -> None:
+) -> ApiResponse[None]:
     """删除已终止会话的全部关联数据"""
 
     await service.delete(thread_id=thread_id)
+    return ApiResponse.success()
 
 
 @router.post("/chat", response_class=StreamingResponse)

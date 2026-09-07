@@ -8,11 +8,22 @@ from pathlib import Path
 from typing import Literal
 
 from dotenv import dotenv_values
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    TypeAdapter,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import make_url
 
+from tinkerfin_studio.models.transport import normalize_model_origin
+
 _DEFAULT_ENV_FILE = Path(__file__).resolve().parents[3] / ".env"
+_DEFAULT_ATTACHMENT_DIRECTORY = Path(".data/attachments")
 _SECRET_FILE_TARGETS = {
     "database_url_file": "database_url",
     "redis_control_password_file": "redis_control_password",
@@ -125,6 +136,34 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    attachment_directory: Path = Field(
+        default=_DEFAULT_ATTACHMENT_DIRECTORY,
+        description="附件持久化目录；相对路径以配置文件所在目录为基准，不依赖启动工作目录",
+    )
+
+    @field_validator("attachment_directory")
+    @classmethod
+    def resolve_attachment_directory(cls, value: Path) -> Path:
+        """固定附件存储位置，避免从不同目录启动时读写不同的数据卷"""
+        return (_DEFAULT_ENV_FILE.parent / value).resolve()
+
+    model_allowed_origins: tuple[str, ...] = Field(
+        default=(),
+        description="管理员允许访问的 HTTP、本机或内网模型服务来源，精确匹配协议、主机和端口",
+    )
+
+    @field_validator("model_allowed_origins", mode="before")
+    @classmethod
+    def validate_model_allowed_origins(cls, value: object) -> tuple[str, ...]:
+        """从环境 JSON 数组或配置序列读取允许的模型服务来源"""
+        adapter = TypeAdapter(tuple[str, ...])
+        origins = (
+            adapter.validate_json(value)
+            if isinstance(value, str)
+            else adapter.validate_python(value)
+        )
+        return tuple(dict.fromkeys(normalize_model_origin(item) for item in origins))
 
     database_url: str = Field(
         min_length=1, repr=False, description="异步 MySQL 连接地址"
@@ -321,9 +360,14 @@ def get_settings() -> Settings:
 
 
 def load_settings(*, env_file: str | Path | None = _DEFAULT_ENV_FILE) -> Settings:
-    """从指定环境文件读取配置，供 CLI 与隔离测试复用"""
+    """读取配置，附件相对目录以指定配置文件或应用默认配置目录为基准"""
 
     values: dict[str, str] = {}
+    config_directory = (
+        Path(env_file).resolve().parent
+        if env_file is not None
+        else _DEFAULT_ENV_FILE.parent
+    )
     if env_file is not None:
         values.update(
             {
@@ -341,4 +385,8 @@ def load_settings(*, env_file: str | Path | None = _DEFAULT_ENV_FILE) -> Setting
         }
     )
     _apply_secret_files(values)
+    directory = Path(
+        values.get("attachment_directory", str(_DEFAULT_ATTACHMENT_DIRECTORY))
+    )
+    values["attachment_directory"] = str((config_directory / directory).resolve())
     return Settings.model_validate(values)

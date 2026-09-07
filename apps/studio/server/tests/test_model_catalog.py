@@ -2,7 +2,7 @@ from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tinkerfin_studio.models.repository import AgentModelRepository
-from tinkerfin_studio.models.schemas import AgentModelWrite
+from tinkerfin_studio.models.schemas import AgentModelSave
 from tinkerfin_studio.models.service import AgentModelService
 
 
@@ -11,9 +11,9 @@ async def test_model_catalog_returns_only_enabled_safe_fields(
 ) -> None:
     """模型目录不得暴露 provider 连接和明文密钥"""
 
-    service = AgentModelService(AgentModelRepository(session))
-    await service.upsert(
-        AgentModelWrite(
+    service = AgentModelService(AgentModelRepository(session, user_id=1))
+    await service.save_settings(
+        AgentModelSave(
             model_id="deepseek-v4-pro",
             display_name="DeepSeek V4 Pro",
             provider="deepseek",
@@ -26,8 +26,8 @@ async def test_model_catalog_returns_only_enabled_safe_fields(
             sort_order=20,
         )
     )
-    await service.upsert(
-        AgentModelWrite(
+    await service.save_settings(
+        AgentModelSave(
             model_id="disabled",
             display_name="Disabled",
             provider="openai",
@@ -50,6 +50,7 @@ async def test_model_catalog_returns_only_enabled_safe_fields(
         "modelId",
         "displayName",
         "reasoningEnabled",
+        "imageSupport",
         "isDefault",
     }
     assert "database-plain-secret" not in serialized
@@ -62,10 +63,10 @@ async def test_setting_a_new_default_clears_the_previous_default(
 ) -> None:
     """同一事务中只能留下一个启用的默认模型"""
 
-    service = AgentModelService(AgentModelRepository(session))
+    service = AgentModelService(AgentModelRepository(session, user_id=1))
     for model_id, is_default in (("first", True), ("second", True)):
-        await service.upsert(
-            AgentModelWrite(
+        await service.save_settings(
+            AgentModelSave(
                 model_id=model_id,
                 display_name=model_id.title(),
                 provider="openai",

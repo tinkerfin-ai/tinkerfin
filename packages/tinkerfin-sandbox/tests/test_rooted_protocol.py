@@ -34,7 +34,7 @@ def test_rooted_helper_resource_remains_byte_stable() -> None:
     )
     assert resource == _rooted_protocol._ROOTED_HELPER_SCRIPT
     assert sha256(resource.encode()).hexdigest() == (
-        "2b96bbd079876b54ad1cba19ec8b9ba4357357d20f9769914820dcad8ec272c4"
+        "962d62c0d2837a9a96ab2a5d4bea109120b4428b80ca2038d57284ac59f2873b"
     )
 
 
@@ -1456,7 +1456,11 @@ def test_rooted_transfer_helper_emits_live_descriptor_handshake(
 
 @pytest.mark.parametrize(
     ("path", "expected_code"),
-    [("/outside-link", "invalid_path"), ("/missing.bin", "not_found")],
+    [
+        ("/outside-link", "invalid_path"),
+        ("/missing.bin", "not_found"),
+        ("/missing/nested/file.bin", "not_found"),
+    ],
 )
 def test_rooted_transfer_helper_emits_correlated_target_error(
     tmp_path: Path,
@@ -1481,6 +1485,7 @@ def test_rooted_transfer_helper_emits_correlated_target_error(
 
     assert isinstance(record, _RootedError)
     assert record.code == expected_code
+    assert not (workspace / "missing").exists()
 
 
 def test_rooted_helper_offload_returns_small_output_inline(tmp_path: Path) -> None:

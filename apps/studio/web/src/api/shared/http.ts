@@ -202,10 +202,7 @@ apiClient.interceptors.request.use((config) => {
 apiClient.interceptors.response.use(
   (response: AxiosResponse<unknown>) => {
     const policy = requestPolicy(response.config as ApiAxiosRequestConfig)
-    if (response.status === 204) {
-      response.data = undefined
-      return response
-    }
+    if (response.config.responseType === 'blob' && response.data instanceof Blob) return response
     response.data = unwrapApiEnvelope(response.data, response.status, policy)
     return response
   },

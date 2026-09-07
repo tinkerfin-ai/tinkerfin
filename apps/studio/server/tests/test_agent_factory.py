@@ -5,23 +5,35 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import cast
 
+import httpx
 import pytest
 from ag_ui.core import RunAgentInput
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from pydantic import SecretStr, ValidationError
 
 from tinkerfin import TinkerFin
+from tinkerfin.media import AttachmentSupport
 from tinkerfin.plan import PlanReviewAction
 from tinkerfin_sandbox import OpenSandboxBackendUnavailableError
 from tinkerfin_sandbox.lifecycle.manager import OpenSandboxManager
 from tinkerfin_studio.agent import factory as factory_module
-from tinkerfin_studio.agent.factory import ConversationAgentFactory, _create_model
+from tinkerfin_studio.agent.factory import ConversationAgentFactory
 from tinkerfin_studio.agent.persistence import AgentPersistence
 from tinkerfin_studio.agent.plan_clarification import StudioPlanClarificationForm
 from tinkerfin_studio.agent.plan_content import StudioMarkdownPlanContent
 from tinkerfin_studio.conversation.request import ChatRequest
 from tinkerfin_studio.conversation.run_preparation import prepare_run_request
+from tinkerfin_studio.models import providers as providers_module
+from tinkerfin_studio.models.chat import create_chat_model
 from tinkerfin_studio.models.schemas import AgentModelConfig
+
+
+@pytest.fixture
+async def model_http_client():
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200))
+    ) as client:
+        yield client
 
 
 def _model_config() -> AgentModelConfig:
@@ -104,7 +116,7 @@ def test_create_deepseek_model_explicitly_controls_thinking(
         captured.update(kwargs)
         return model
 
-    monkeypatch.setattr(factory_module, "init_chat_model", init_model)
+    monkeypatch.setattr(providers_module, "init_chat_model", init_model)
     config = _model_config().model_copy(
         update={
             "provider": "deepseek",
@@ -113,20 +125,26 @@ def test_create_deepseek_model_explicitly_controls_thinking(
         }
     )
 
-    assert _create_model(config) is model
+    assert create_chat_model(config) is model
     assert captured["extra_body"] == {"thinking": {"type": thinking_type}}
     assert ("reasoning_effort" in captured) is has_reasoning_effort
 
 
 async def test_create_agent_configures_plan_tools_and_borrowed_resources(
     monkeypatch: pytest.MonkeyPatch,
+    attachments,
+    model_http_client,
 ) -> None:
     """创建 Agent 时保留产品 Plan、审批和应用资源配置"""
 
     root_model = FakeListChatModel(responses=["root"])
     plan_model = FakeListChatModel(responses=["plan"])
     reasoning_overrides: list[bool | None] = []
-    sandbox = object()
+    from unittest.mock import create_autospec
+
+    from tinkerfin_sandbox import RootedOpenSandboxBackend
+
+    sandbox = create_autospec(RootedOpenSandboxBackend, instance=True)
     composite_backend = object()
     composite_options: dict[str, object] = {}
 
@@ -134,6 +152,7 @@ async def test_create_agent_configures_plan_tools_and_borrowed_resources(
         config: AgentModelConfig,
         *,
         reasoning_enabled: bool | None = None,
+        http_async_client=None,
     ):
         del config
         reasoning_overrides.append(reasoning_enabled)
@@ -152,6 +171,11 @@ async def test_create_agent_configures_plan_tools_and_borrowed_resources(
         def __init__(self) -> None:
             self.plan_options: dict[str, object] = {}
             self.definition_options: dict[str, object] = {}
+            self.attachment_support: AttachmentSupport | None = None
+
+        def attachments(self, support: AttachmentSupport):
+            self.attachment_support = support
+            return self
 
         def plan(self, **options: object):
             self.plan_options = options
@@ -161,7 +185,7 @@ async def test_create_agent_configures_plan_tools_and_borrowed_resources(
             self.definition_options = options
             return SimpleNamespace()
 
-    monkeypatch.setattr(factory_module, "_create_model", create_model)
+    monkeypatch.setattr(factory_module, "create_chat_model", create_model)
 
     def create_composite_backend(**options: object) -> object:
         composite_options.update(options)
@@ -182,6 +206,10 @@ async def test_create_agent_configures_plan_tools_and_borrowed_resources(
     store = object()
     tinkerfin = RecordingTinkerFin()
     factory = ConversationAgentFactory(
+        attachments=attachments,
+        thread_id="thread",
+        image_model=None,
+        model_http_client=model_http_client,
         persistence=cast(
             AgentPersistence,
             SimpleNamespace(checkpointer=checkpointer, store=store),
@@ -203,6 +231,7 @@ async def test_create_agent_configures_plan_tools_and_borrowed_resources(
         model_config=config,
     )
 
+    assert isinstance(tinkerfin.attachment_support, AttachmentSupport)
     assert reasoning_overrides == [None, False]
     assert tinkerfin.plan_options == {
         "enabled": True,
@@ -228,7 +257,9 @@ async def test_create_agent_configures_plan_tools_and_borrowed_resources(
     }
 
 
-async def test_create_agent_propagates_sandbox_creation_failure() -> None:
+async def test_create_agent_propagates_sandbox_creation_failure(
+    attachments, model_http_client
+) -> None:
     """Sandbox 恢复或创建失败必须让当前 Agent Run 明确失败"""
 
     expected = OpenSandboxBackendUnavailableError("Sandbox control plane unavailable")
@@ -239,6 +270,10 @@ async def test_create_agent_propagates_sandbox_creation_failure() -> None:
             raise expected
 
     factory = ConversationAgentFactory(
+        attachments=attachments,
+        thread_id="thread",
+        image_model=None,
+        model_http_client=model_http_client,
         persistence=cast(
             AgentPersistence,
             SimpleNamespace(checkpointer=object(), store=object()),

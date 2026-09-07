@@ -233,7 +233,7 @@ def _render_deep_agent_stub() -> str:
     content = f'''"""Typed public Runtime and Definition contracts generated from locked source."""
 
 # Generated from locked dependencies by scripts/generate_stubs.py; do not edit signatures manually.
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from typing import Any, Generic, Literal, overload
 
 from langchain.agents.middleware.types import InputAgentState
@@ -383,6 +383,7 @@ class DeepAgentDefinition(Generic[ContextT]):
         ...
 
 CREATE_DEEP_AGENT: object
+_public_create_agent_contract: Callable[..., object]
 '''
     formatted = _format(content, target=_DEEP_AGENT_STUB)
     return _with_pyright_ignores(
@@ -431,6 +432,7 @@ from ._call_observation import TraceContribution as TraceContribution
 from ._call_observation import trace_contribution as trace_contribution
 from ._hitl import TINKERFIN_HITL_CONTRACT as TINKERFIN_HITL_CONTRACT
 from ._tasks import join_task as join_task
+from .agui_input import AgUiUserInput as AgUiUserInput
 from .agui_resume import AgUiResumeBinding as AgUiResumeBinding
 from .agui_resume import AgUiResumeCheckpoint as AgUiResumeCheckpoint
 from .agui_resume import AgUiResumeCheckpointObserver as AgUiResumeCheckpointObserver
@@ -478,6 +480,8 @@ from .runtime import SseEventIdResolver as SseEventIdResolver
 from .runtime import SseMapper as SseMapper
 from .runtime import SsePayload as SsePayload
 from .runtime import SsePreflight as SsePreflight
+from .media import AttachmentImage as AttachmentImage
+from .media import AttachmentSupport as AttachmentSupport
 from .runtime import TinkerFin as _RuntimeTinkerFin
 from .runtime_profile import DeepAgentsFactoryPreparation as DeepAgentsFactoryPreparation
 from .runtime_profile import DeepAgentsRuntimeProfile as DeepAgentsRuntimeProfile
@@ -486,6 +490,13 @@ from .runtime_profile import DeepAgentsV3RuntimeProfile as DeepAgentsV3RuntimePr
 
 class TinkerFin(_RuntimeTinkerFin):
     """Configure immutable Runtime, Profile, Plan, and Observation capabilities."""
+
+{
+        _method(
+            RuntimeTinkerFin.attachments,
+            return_type="TinkerFin",
+        )
+    }
 
 {
         _method(

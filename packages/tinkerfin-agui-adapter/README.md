@@ -142,6 +142,40 @@ data. `require_valid_schema(...)` and `validate_json_schema_instance(...)` expos
 same generic validation boundary to framework integrations. The graph that emitted the
 envelope remains responsible for domain validation such as revision checks.
 
+## Durable attachment content
+
+`user_message_to_langchain()` from `tinkerfin_agui_adapter.media` converts text and
+image inputs into LangChain messages. A durable image or document uses the AG-UI
+`source.value` URI `attachment:<id>` and a validated Attachment descriptor in `metadata`.
+Hosts authorize the reference before invoking an agent. Snapshot conversion preserves
+these typed content fragments rather than serializing them into answer text.
+
+Tool results expose an `attachments` array alongside the standard text `content`.
+Assistant attachment blocks emit `CUSTOM` with name `tinkerfin.message.attachments`
+and value `{ "messageId": "...", "attachments": [...] }`, within a balanced message
+Start/End lifecycle. Consumers merge additions by attachment ID. Authoritative assistant
+and Tool snapshots carry the same descriptors in `attachments`; snapshot arrays replace
+prior descriptors. IDs and raw-event namespaces retain the ordinary scoped correlation
+contract. Attachment descriptors have `id`, `name`, `mime_type`, and `size_bytes` fields;
+`Attachment.model_json_schema()` in `tinkerfin_contracts.media` provides their schema.
+File bytes, signed download URLs, and credentials are not attachment descriptors.
+
+`MessageAttachments` in `tinkerfin_agui_adapter.media` validates the CUSTOM event
+payload. `AttachmentToolCallResultEvent`, `AttachmentAssistantMessage`, and
+`AttachmentToolMessage` declare the `attachments` field. The adapter publishes
+`AttachmentMessagesSnapshotEvent` to validate and serialize these messages together
+with standard AG-UI user, system, developer, activity, and reasoning messages.
+`parse_attachment_output_event()` validates decoded tool results or message snapshots,
+including events returned by the generic `AgUiCodec`, and returns these public types.
+
+The packaged `contracts/message-attachments.schema.json`, `tool-call-result.schema.json`,
+`assistant-message.schema.json`, `tool-message.schema.json`, and
+`messages-snapshot.schema.json` describe the corresponding wire contracts. Their shared
+fixture includes actual LangChain tool output, balanced assistant events, and matching
+checkpoint snapshots. Native messages use standard `image` or `file` blocks with
+`file_id`, `mime_type`, and `extras.attachment`; hosts resolve these IDs with
+`AttachmentMiddleware` before the model request.
+
 ## Documentation
 
 - [AG-UI guide](https://github.com/tinkerfin-ai/tinkerfin/blob/main/docs/en/agui/index.md)

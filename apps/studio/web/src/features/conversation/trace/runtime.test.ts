@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import mediaFixture from '../agui/contracts/message-attachments.fixture.json'
 
 import type { ConversationHistoryDetail, ConversationTraceUpdate } from '../../../api/conversation/history'
 import { applyConversationTraceUpdate, restoreConversationFromTrace } from './runtime'
@@ -129,6 +130,34 @@ const detail = (): ConversationHistoryDetail => ({
 })
 
 describe('Trace conversation projection', () => {
+  it('从持久记录恢复用户、助手和工具图片，不把附件引用显示为文字', () => {
+    const snapshot = detail()
+    snapshot.messages = snapshot.messages.map(message => ({
+      ...message,
+      content: [{ type: 'text', text: '查看图片' }, ...mediaFixture.toolContent],
+    }))
+    const conversation = restoreConversationFromTrace(snapshot, { model: 'main', includeTaskTrace: true })
+    for (const role of ['user', 'assistant', 'tool']) {
+      const message = conversation.messages.find(item => item.role === role)
+      expect(message?.attachments).toEqual([mediaFixture.attachment])
+      expect(role === 'tool' ? message?.meta?.result : message?.content).toBe('查看图片')
+    }
+  })
+  it('子智能体仅返回图片时也能从历史恢复到对应卡片', () => {
+    const snapshot = detail()
+    snapshot.graph.nodes = [{
+      ...snapshot.graph.nodes[0]!, id: 'child', kind: 'subagent', name: 'researcher',
+      namespace: ['tools:child'], sourceId: 'call-child', result: null,
+    }]
+    snapshot.messages = [{
+      ...snapshot.messages[1]!, namespace: ['tools:child'], content: mediaFixture.toolContent,
+    }]
+    const conversation = restoreConversationFromTrace(snapshot, { model: 'main', includeTaskTrace: true })
+    expect(conversation.messages).toHaveLength(1)
+    expect(conversation.messages[0].role).toBe('subagent')
+    expect(conversation.messages[0].attachments).toEqual([mediaFixture.attachment])
+    expect(conversation.messages[0].meta?.result).toBe('')
+  })
   it('orders HTTP snapshots within one millisecond and allows observed owner recovery', () => {
     const first = detail()
     first.status = { execution: 'running', headRunId: first.headRunId }

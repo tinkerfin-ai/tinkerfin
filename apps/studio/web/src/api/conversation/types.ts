@@ -16,7 +16,7 @@ export interface ConversationForwardedProps extends JsonObject {
 export interface ChatMessageInput {
   id: string
   role: "user"
-  content: string
+  content: string | JsonObject[]
 }
 
 export type PlanClarificationAnswer =
@@ -133,6 +133,9 @@ export interface RunStartedEvent {
 }
 
 export interface MessageSnapshotItem {
+  toolCallId?: string
+  error?: string
+  attachments?: import('../../features/conversation/attachments/content').Attachment[]
   id: string
   role: string
   content?: JsonValue
@@ -236,6 +239,7 @@ export interface ToolCallEndEvent {
 }
 
 export interface ToolCallResultEvent {
+  attachments?: import('../../features/conversation/attachments/content').Attachment[]
   type: "TOOL_CALL_RESULT"
   rawEvent?: RawEventContext
   messageId: string

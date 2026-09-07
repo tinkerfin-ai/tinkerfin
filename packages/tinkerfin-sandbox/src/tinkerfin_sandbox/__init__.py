@@ -30,16 +30,22 @@ from .errors import OpenSandboxBackendTimeoutError as OpenSandboxBackendTimeoutE
 from .errors import (
     OpenSandboxBackendUnavailableError as OpenSandboxBackendUnavailableError,
 )
+from .errors import OpenSandboxBusyError as OpenSandboxBusyError
 from .errors import OpenSandboxDestroyError as OpenSandboxDestroyError
 from .errors import OpenSandboxError as OpenSandboxError
 from .errors import OpenSandboxErrorCode as OpenSandboxErrorCode
+from .errors import OpenSandboxFileTooLargeError as OpenSandboxFileTooLargeError
 from .errors import OpenSandboxHandleClosedError as OpenSandboxHandleClosedError
 from .errors import (
     OpenSandboxHandleOwnershipError as OpenSandboxHandleOwnershipError,
 )
 from .errors import OpenSandboxInitializationError as OpenSandboxInitializationError
+from .errors import (
+    OpenSandboxLifecycleUncertainError as OpenSandboxLifecycleUncertainError,
+)
 from .errors import OpenSandboxManagerClosedError as OpenSandboxManagerClosedError
 from .errors import OpenSandboxObserverReentryError as OpenSandboxObserverReentryError
+from .errors import OpenSandboxPausedError as OpenSandboxPausedError
 from .errors import OpenSandboxResetError as OpenSandboxResetError
 from .errors import (
     OpenSandboxSettlementTimeoutError as OpenSandboxSettlementTimeoutError,
@@ -84,11 +90,17 @@ from .lifecycle import OpenSandboxReadyWarmClaim as OpenSandboxReadyWarmClaim
 from .lifecycle import OpenSandboxRecoveryPolicy as OpenSandboxRecoveryPolicy
 from .lifecycle import OpenSandboxState as OpenSandboxState
 from .lifecycle import OpenSandboxWarmClaim as OpenSandboxWarmClaim
+from .lifecycle.availability import OpenSandboxAvailability as OpenSandboxAvailability
+from .lifecycle.availability import (
+    OpenSandboxAvailabilityPhase as OpenSandboxAvailabilityPhase,
+)
+from .lifecycle.availability import OpenSandboxHolderUpdate as OpenSandboxHolderUpdate
 from .middleware import (
     build_rooted_filesystem_middleware as build_rooted_filesystem_middleware,
 )
 from .models import OpenSandboxConfig as OpenSandboxConfig
 from .models import OpenSandboxDetails as OpenSandboxDetails
+from .models import OpenSandboxDiagnosticContent as OpenSandboxDiagnosticContent
 from .models import OpenSandboxPlatformInfo as OpenSandboxPlatformInfo
 from .models import OpenSandboxRuntimeInfo as OpenSandboxRuntimeInfo
 from .models import OpenSandboxStatusInfo as OpenSandboxStatusInfo

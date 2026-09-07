@@ -1,3 +1,4 @@
+import { isAttachment } from '../../features/conversation/attachments/content'
 import type { JsonObject, JsonValue } from '../../types'
 import type {
   ConversationAgUiEvent,
@@ -131,7 +132,11 @@ const isMessageSnapshot = (value: unknown) => (
   isRecord(value)
   && typeof value.id === 'string'
   && typeof value.role === 'string'
+  && (value.role !== 'tool' || (typeof value.toolCallId === 'string' && value.toolCallId.length > 0 && typeof value.content === 'string'))
+  && hasOptionalString(value, 'toolCallId')
+  && hasOptionalString(value, 'error')
   && (value.content === undefined || isJsonValue(value.content))
+  && (value.attachments === undefined || (Array.isArray(value.attachments) && value.attachments.every(isAttachment)))
 )
 
 const isJsonPointer = (value: string) => {
@@ -240,13 +245,15 @@ const isConversationAgUiEvent = (value: unknown): value is ConversationAgUiEvent
       return hasOptionalRawEvent(value) && typeof value.toolCallId === 'string'
 
     case 'TOOL_CALL_RESULT':
-      return hasOptionalRawEvent(value)
+      return (value.attachments === undefined || (Array.isArray(value.attachments) && value.attachments.every(isAttachment)))
+        && hasOptionalRawEvent(value)
         && typeof value.messageId === 'string'
         && typeof value.toolCallId === 'string'
         && typeof value.content === 'string'
         && typeof value.role === 'string'
 
     case 'CUSTOM':
+      if (value.name === 'tinkerfin.message.attachments') return hasOptionalRawEvent(value) && isRecord(value.value) && typeof value.value.messageId === 'string' && Array.isArray(value.value.attachments) && value.value.attachments.every(isAttachment)
       return hasOptionalRawEvent(value)
         && typeof value.name === 'string'
         && isJsonValue(value.value)

@@ -863,3 +863,41 @@ async def test_real_custom_stream_is_consistent_across_all_consumers() -> None:
     assert len(raw_events) == 1
     assert raw_events[0].source == "langgraph.custom"
     assert raw_events[0].event["data"] == {"progress": 1}
+
+
+async def test_agui_run_source_accepts_typed_product_fields_and_rejects_changed_identity() -> (
+    None
+):
+    class LabeledRunStart(RunStartedEvent):
+        label: str
+
+    identity = _identity()
+    for change_identity in (False, True):
+        opened = _StaticAgUiSource(
+            identity,
+            LabeledRunStart(
+                thread_id=identity.thread_id, run_id=identity.run_id, label="Report"
+            ),
+        )
+
+        async def open_events(_identity: RunIdentity) -> MessageSource[BaseEvent]:
+            return opened
+
+        def transform(event: BaseEvent) -> BaseEvent:
+            return event.model_copy(
+                update={"runId": "other"} if change_identity else {"label": "Chart"}
+            )
+
+        source = create_agui_run_source(
+            identity, open_events=open_events, transform_event=transform
+        )
+        try:
+            if change_identity:
+                with pytest.raises(ValueError, match="protocol identity"):
+                    await anext(aiter(source))
+            else:
+                event = await anext(aiter(source))
+                assert event.model_extra == {"label": "Chart"}
+        finally:
+            await source.aclose()
+        assert opened.closed

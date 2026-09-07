@@ -75,6 +75,41 @@ class ModelErrorCode(ErrorCode):
     NOT_FOUND = _ErrorCodeValue(1_001_005_000, 422, "模型不存在")
     DISABLED = _ErrorCodeValue(1_001_005_001, 409, "模型已停用")
     CATALOG_UNAVAILABLE = _ErrorCodeValue(1_001_005_002, 503, "模型目录暂不可用")
+    INVALID_CONFIGURATION = _ErrorCodeValue(1_001_005_003, 422, "模型配置不正确")
+    IN_USE = _ErrorCodeValue(
+        1_001_005_004, 409, "该模型仍有运行或审批未结束，请结束后再修改或删除"
+    )
+    KEY_REQUIRED = _ErrorCodeValue(1_001_005_005, 422, "新增模型需要填写 API 密钥")
+    KEY_ENDPOINT_CHANGED = _ErrorCodeValue(
+        1_001_005_006, 422, "更换服务地址时需要重新填写对应密钥"
+    )
+    PURPOSE_MISMATCH = _ErrorCodeValue(
+        1_001_005_007, 409, "模型用途不匹配，请选择对应用途的模型"
+    )
+    CONFIGURATION_CHANGED = _ErrorCodeValue(
+        1_001_005_008, 409, "模型配置已变化，请重新发送"
+    )
+    IMAGE_UNSUPPORTED = _ErrorCodeValue(
+        1_001_005_009, 422, "当前模型不支持图片或能力未确认，请切换模型"
+    )
+
+
+class AttachmentErrorCode(ErrorCode):
+    """附件校验、权限和交付错误"""
+
+    INVALID_FILE = _ErrorCodeValue(
+        1_001_006_000, 422, "文件内容或名称不符合要求，请检查后重新上传"
+    )
+    TOO_LARGE = _ErrorCodeValue(
+        1_001_006_001, 413, "单个附件不能超过 10 MiB，一次附件总大小不能超过 25 MiB"
+    )
+    NOT_FOUND = _ErrorCodeValue(
+        1_001_006_002, 404, "附件不可用或不属于当前会话，请重新上传"
+    )
+    THREAD_UNAVAILABLE = _ErrorCodeValue(1_001_006_003, 404, "附件所属会话不可用")
+    INVALID_VARIANT = _ErrorCodeValue(1_001_006_004, 422, "当前附件不支持所选预览方式")
+    ALREADY_SENT = _ErrorCodeValue(1_001_006_005, 409, "已发送的附件随会话保留")
+    UPLOAD_TIMEOUT = _ErrorCodeValue(1_001_006_006, 408, "附件上传超时，请重试")
 
 
 class ConversationErrorCode(ErrorCode):

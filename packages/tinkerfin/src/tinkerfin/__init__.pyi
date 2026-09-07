@@ -32,6 +32,7 @@ from ._call_observation import TraceContribution as TraceContribution
 from ._call_observation import trace_contribution as trace_contribution
 from ._hitl import TINKERFIN_HITL_CONTRACT as TINKERFIN_HITL_CONTRACT
 from ._tasks import join_task as join_task
+from .agui_input import AgUiUserInput as AgUiUserInput
 from .agui_resume import AgUiResumeBinding as AgUiResumeBinding
 from .agui_resume import AgUiResumeCheckpoint as AgUiResumeCheckpoint
 from .agui_resume import AgUiResumeCheckpointObserver as AgUiResumeCheckpointObserver
@@ -83,6 +84,8 @@ from .runtime import SseEventIdResolver as SseEventIdResolver
 from .runtime import SseMapper as SseMapper
 from .runtime import SsePayload as SsePayload
 from .runtime import SsePreflight as SsePreflight
+from .media import AttachmentImage as AttachmentImage
+from .media import AttachmentSupport as AttachmentSupport
 from .runtime import TinkerFin as _RuntimeTinkerFin
 from .runtime_profile import (
     DeepAgentsFactoryPreparation as DeepAgentsFactoryPreparation,
@@ -93,6 +96,24 @@ from .runtime_profile import DeepAgentsV3RuntimeProfile as DeepAgentsV3RuntimePr
 
 class TinkerFin(_RuntimeTinkerFin):
     """Configure immutable Runtime, Profile, Plan, and Observation capabilities."""
+
+    def attachments(self, support: AttachmentSupport) -> TinkerFin:
+        """Configure authorized attachment access for agents created by this factory.
+
+        Automatic integration requires the locked native Deep Agents factory.
+        Decorated or replaced factories are rejected at graph construction before
+        model/backend preparation. Caller-owned custom graphs can install the
+        support's middleware explicitly at their final model-request boundary.
+
+        Args:
+            support: Borrowed per-model image policy and host-authorized file reader.
+
+        Returns:
+            An independent factory retaining Plan, observers, and resource ownership.
+
+        Raises:
+            TypeError: Support is not an AttachmentSupport instance."""
+        ...
 
     def observe(self, observer: _RuntimeObserver) -> TinkerFin:
         """Return a factory with one additional ordered Runtime observer.

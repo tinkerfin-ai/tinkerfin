@@ -66,6 +66,34 @@ describe('shared HTTP client', () => {
     expect(fetchMock).toHaveBeenCalledOnce()
   })
 
+  it('unwraps a successful null JSON result', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(null)))
+
+    await expect(requestJson<null>('/api/conversation/thread-idle', {
+      method: 'DELETE',
+      requiresAuth: false,
+    })).resolves.toBeNull()
+  })
+
+  it('preserves file bodies for blob requests', async () => {
+    const fileResponse = new Response('file content', {
+      headers: { 'Content-Type': 'text/plain' },
+    })
+    // 使用与测试环境原生 Response 相同的 Blob，避免混用 jsdom 的构造器
+    vi.stubGlobal('Blob', (await fileResponse.clone().blob()).constructor)
+    vi.stubGlobal('fetch', vi.fn(async () => fileResponse))
+    const config: ApiAxiosRequestConfig = {
+      url: '/api/attachments/file/content',
+      responseType: 'blob',
+      requiresAuth: false,
+    }
+
+    const response = await apiClient.request<Blob>(config)
+
+    expect(response.data).toBeInstanceOf(Blob)
+    expect(await response.data.text()).toBe('file content')
+  })
+
   it('preserves backend messages verbatim while the frontend language is English', async () => {
     window.localStorage.setItem(LANGUAGE_STORAGE_KEY, 'en')
     vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(
@@ -447,13 +475,13 @@ describe('shared HTTP client', () => {
     expect(cancel).toHaveBeenCalledOnce()
   })
 
-  it('accepts an empty 204 response as undefined', async () => {
+  it('rejects a successful response without a JSON envelope', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 204 })))
 
-    await expect(requestJson<void>('/api/conversation/thread-idle', {
+    await expect(requestJson<null>('/api/conversation/thread-idle', {
       method: 'DELETE',
       requiresAuth: false,
-    })).resolves.toBeUndefined()
+    })).rejects.toMatchObject({ status: 204 })
   })
 
   it.each([

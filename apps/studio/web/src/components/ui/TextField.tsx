@@ -5,7 +5,7 @@ import type { InputHTMLAttributes, ReactNode } from 'react'
 import { useI18n } from '../../i18n'
 
 export type TextFieldSize = 'md' | 'lg'
-export type TextFieldShape = 'round' | 'capsule'
+export type TextFieldShape = 'round' | 'capsule' | 'standard'
 
 export interface TextFieldProps extends Omit<InputHTMLAttributes<HTMLInputElement>, 'size'> {
   label: ReactNode

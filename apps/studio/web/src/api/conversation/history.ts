@@ -326,7 +326,7 @@ export const patchConversation = (
 
 /** 删除 Trace、Checkpoint、Messaging 与 Studio 自有会话记录 */
 export const deleteConversation = async (threadId: string): Promise<void> => {
-  await requestJson<void>(CONVERSATION_API_PATH + '/' + encodeURIComponent(threadId), {
+  await requestJson<null>(CONVERSATION_API_PATH + '/' + encodeURIComponent(threadId), {
     method: 'DELETE',
     suppressGlobalError: true,
   })

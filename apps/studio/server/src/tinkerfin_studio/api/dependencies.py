@@ -98,10 +98,12 @@ async def get_user_context(
 UserContextDep = Annotated[UserContext, Depends(get_user_context)]
 
 
-async def get_model_service(session: SessionDep) -> AgentModelService:
+async def get_model_service(
+    session: SessionDep, user: UserContextDep
+) -> AgentModelService:
     """按请求会话构造模型目录服务"""
 
-    return AgentModelService(AgentModelRepository(session))
+    return AgentModelService(AgentModelRepository(session, user_id=user.user_id))
 
 
 ModelServiceDep = Annotated[AgentModelService, Depends(get_model_service)]

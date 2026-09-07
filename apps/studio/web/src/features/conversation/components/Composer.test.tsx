@@ -185,13 +185,13 @@ describe('Composer', () => {
     expect(onExitPlan).toHaveBeenCalledTimes(1)
   })
 
-  it('selects and removes local-only attachments without changing send behavior', () => {
+  it('shows ready attachments and allows removing them before sending', () => {
     const onAddAttachments = vi.fn()
     const onRemoveAttachment = vi.fn()
     const attachment = {
       id: 'attachment-1',
       file: new File(['pdf'], 'brief.pdf', { type: 'application/pdf' }),
-      kind: 'pdf' as const,
+      kind: 'document' as const, name: 'brief.pdf', size: 3, state: 'ready' as const, progress: 100,
     }
     const { container } = render(
       <Composer
@@ -699,4 +699,14 @@ describe('Composer', () => {
     expect(screen.queryByRole('listbox', { name: '命令和技能建议' })).not.toBeInTheDocument()
     expect(target).toHaveFocus()
   })
+})
+
+
+it('引用附件后保留草稿并聚焦输入框', async () => {
+  const props = { ...composerChromeProps(), value: '继续说明图中的内容', isRunning: false, onChange: vi.fn(), onSend: vi.fn(), onStop: vi.fn() }
+  const { rerender } = render(<Composer {...props} />)
+  rerender(<Composer {...props} attachments={[{ id: 'reference', name: '报告.pdf', size: 12, kind: 'document', state: 'ready', progress: 100, reference: true }]} />)
+  await waitFor(() => expect(screen.getByRole('textbox', { name: '消息输入' })).toHaveFocus())
+  expect(screen.getByRole('textbox', { name: '消息输入' })).toHaveValue('继续说明图中的内容')
+  expect(props.onSend).not.toHaveBeenCalled()
 })

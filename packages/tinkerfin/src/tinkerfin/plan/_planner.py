@@ -15,7 +15,11 @@ from langchain.chat_models import init_chat_model
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import BaseTool
 from langgraph.typing import ContextT
+
+from tinkerfin._attachment_agents import attachment_filesystem
+from tinkerfin.media import AttachmentSupport
 
 from ._clarification import ClarificationSchemaBinding, stateless_child_config
 from ._content import PlanContentBinding
@@ -180,6 +184,8 @@ def create_planner_agent(
     clarification: ClarificationSchemaBinding,
     content: PlanContentBinding,
     response_type: type[PlannerOutcomeBase],
+    attachments: AttachmentSupport | None = None,
+    read_only_tools: Sequence[BaseTool] = (),
     context_schema: type[ContextT] | None,
 ) -> _StructuredAgent:
     """Build a Planner with an explicit read-only filesystem action space."""
@@ -193,18 +199,23 @@ def create_planner_agent(
     middleware = cast(
         tuple[AgentMiddleware[Any, ContextT, Any], ...],
         (
-            filesystem,
+            (
+                attachment_filesystem(filesystem, attachments)
+                if attachments is not None
+                else filesystem
+            ),
             ModelCallLimitMiddleware[ContextT, Any](
                 run_limit=_PLANNER_MODEL_CALL_LIMIT,
                 exit_behavior="error",
             ),
+            *((attachments.middleware(),) if attachments is not None else ()),
         ),
     )
     return cast(
         _StructuredAgent,
         create_agent(
             model=model,
-            tools=(),
+            tools=read_only_tools,
             system_prompt=_planner_system_prompt(clarification, content),
             middleware=middleware,
             response_format=ToolStrategy(
@@ -303,6 +314,7 @@ async def invoke_plan_review_reply(
     plan: PlanState[PlanContentModel],
     *,
     config: RunnableConfig,
+    attachments: AttachmentSupport | None = None,
 ) -> AIMessage:
     """Generate the sole visible reply after a rejected or cancelled draft.
 
@@ -315,6 +327,7 @@ async def invoke_plan_review_reply(
         messages: Current user-visible Planning conversation.
         plan: Durable state containing the resolved review decision.
         config: Current parent Runnable configuration.
+        attachments: Optional authorized request-time attachment access.
 
     Returns:
         One non-empty assistant message to append to Planning state.
@@ -344,6 +357,8 @@ async def invoke_plan_review_reply(
             )
         ),
     }
+    if attachments is not None:
+        messages = await attachments._prepare_messages(messages, model=model)
     response = await model.ainvoke(
         [
             SystemMessage(content=_PLAN_REVIEW_REPLY_PROMPT),

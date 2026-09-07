@@ -13,24 +13,28 @@ CREATE TABLE users (
 ) COMMENT='TinkerFin Studio 登录用户';
 
 CREATE TABLE agent_models (
-  id INTEGER NOT NULL AUTO_INCREMENT COMMENT '模型配置主键',
-  model_id VARCHAR(64) NOT NULL COMMENT '前后端使用的稳定模型 ID',
-  display_name VARCHAR(128) NOT NULL COMMENT '前端展示名称',
-  provider VARCHAR(32) NOT NULL COMMENT '已安装的 LangChain provider：deepseek 或 openai',
-  model_name VARCHAR(128) NOT NULL COMMENT '供应商实际模型名称',
-  base_url VARCHAR(1024) NOT NULL COMMENT '模型服务 API 基础地址',
-  api_key TEXT NOT NULL COMMENT '模型服务明文 API 密钥，禁止通过接口或日志暴露',
-  reasoning_enabled BOOL NOT NULL COMMENT '是否启用已验证的 provider reasoning 参数',
-  enabled BOOL NOT NULL COMMENT '是否允许创建新 run',
-  is_default BOOL NOT NULL COMMENT '是否为前端默认模型，由应用事务保证唯一',
-  sort_order INTEGER NOT NULL COMMENT '模型目录升序排序值',
-  created_at DATETIME NOT NULL COMMENT '创建时间',
-  updated_at DATETIME NOT NULL COMMENT '更新时间',
-  CONSTRAINT pk_agent_models PRIMARY KEY (id),
-  CONSTRAINT uq_agent_models_model_id UNIQUE (model_id),
-  KEY ix_agent_models_default (is_default, enabled),
-  KEY ix_agent_models_enabled_order (enabled, sort_order, id)
-) COMMENT='可由前端选择的 Agent 模型与连接配置';
+	id INTEGER NOT NULL COMMENT '模型配置主键' AUTO_INCREMENT,
+	generation_options JSON NOT NULL COMMENT '生图接口附加参数，不包含认证信息',
+	user_id INTEGER NOT NULL COMMENT '模型及密钥所属用户 ID',
+	purpose VARCHAR(16) NOT NULL COMMENT 'chat 对话模型或 image 生图服务' DEFAULT 'chat',
+	model_id VARCHAR(64) NOT NULL COMMENT '前后端使用的稳定模型 ID',
+	display_name VARCHAR(128) NOT NULL COMMENT '前端展示名称',
+	provider VARCHAR(32) NOT NULL COMMENT '已安装的 LangChain provider：deepseek 或 openai',
+	model_name VARCHAR(128) NOT NULL COMMENT '供应商实际模型名称',
+	base_url VARCHAR(1024) NOT NULL COMMENT '模型服务 API 基础地址',
+	api_key TEXT NOT NULL COMMENT '模型服务明文 API 密钥，禁止通过接口或日志暴露',
+	image_support VARCHAR(16) NOT NULL COMMENT '图片输入能力：supported、unsupported 或 unknown' DEFAULT 'unknown',
+	reasoning_enabled BOOL NOT NULL COMMENT '是否启用已验证的 provider reasoning 参数',
+	enabled BOOL NOT NULL COMMENT '是否允许创建新 run',
+	is_default BOOL NOT NULL COMMENT '是否为前端默认模型，由应用事务保证唯一',
+	sort_order INTEGER NOT NULL COMMENT '模型目录升序排序值',
+	created_at DATETIME NOT NULL COMMENT '创建时间',
+	updated_at DATETIME NOT NULL COMMENT '更新时间',
+	PRIMARY KEY (id),
+	CONSTRAINT uq_agent_models_owner_model UNIQUE (user_id, model_id)
+)COMMENT='可由前端选择的 Agent 模型与连接配置';
+CREATE INDEX ix_agent_models_default ON agent_models (user_id, purpose, is_default, enabled);
+CREATE INDEX ix_agent_models_enabled_order ON agent_models (user_id, enabled, sort_order, id);
 
 CREATE TABLE conversation_threads (
   id BIGINT NOT NULL AUTO_INCREMENT COMMENT '会话主键',
@@ -93,3 +97,20 @@ CREATE TABLE conversation_interrupt_claims (
   CONSTRAINT uq_conversation_interrupt_claims_thread_interrupt UNIQUE (conversation_thread_id, interrupt_id),
   KEY ix_conversation_interrupt_claims_run_status (conversation_thread_id, claimed_run_id, status)
 ) COMMENT='由框架恢复事实驱动的 interrupt 原子认领与结算';
+
+CREATE TABLE conversation_attachments (
+	id VARCHAR(32) NOT NULL COMMENT '服务端随机附件 ID，同时作为不透明存储标识',
+	user_id INTEGER NOT NULL COMMENT '附件所属用户 ID',
+	thread_id VARCHAR(128) COMMENT '附件绑定的会话 ID；空值表示未发送草稿',
+	message_id VARCHAR(128) COMMENT '首次使用或生成附件的权威消息 ID',
+	name VARCHAR(255) NOT NULL COMMENT '用户可见文件名，不用于存储路径',
+	mime_type VARCHAR(128) NOT NULL COMMENT '经服务端验证的文件媒体类型',
+	size_bytes BIGINT NOT NULL COMMENT '原件大小，单位为字节',
+	sha256 VARCHAR(64) NOT NULL COMMENT '原件完整内容的 SHA-256 校验值',
+	status VARCHAR(16) NOT NULL COMMENT 'uploading、ready 或 deleting；仅 ready 可用',
+	source VARCHAR(16) NOT NULL COMMENT 'user 表示用户上传，tool 表示工具生成',
+	created_at DATETIME NOT NULL COMMENT 'UTC 创建时间，用于未发送附件的清理',
+	PRIMARY KEY (id)
+)COMMENT='会话上传和生成附件的持久化引用';
+CREATE INDEX ix_conversation_attachments_cleanup ON conversation_attachments (thread_id, created_at);
+CREATE INDEX ix_conversation_attachments_owner ON conversation_attachments (user_id, thread_id);

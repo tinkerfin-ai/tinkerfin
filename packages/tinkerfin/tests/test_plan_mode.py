@@ -4295,3 +4295,577 @@ async def test_planner_and_native_preserve_runtime_context() -> None:
         context={"tenant": "tenant-1"},
     )
     assert model.contexts == ({"tenant": "tenant-1"}, {"tenant": "tenant-1"})
+
+
+@pytest.mark.asyncio
+async def test_planner_receives_only_explicit_read_only_host_tools() -> None:
+    """Planning includes declared safe host tools while excluding write-capable tools."""
+    from langchain_core.tools import tool
+
+    @tool
+    async def inspect_report() -> str:
+        """Read a report without changing stored content."""
+        return "report"
+
+    @tool
+    async def publish_report() -> str:
+        """Publish a report."""
+        raise AssertionError("Planning cannot publish")
+
+    inspect_report.metadata = {"read_only": True}
+    model = _FakeModel(responses=[_planner()])
+    definition = (
+        TinkerFin()
+        .plan(enabled=True)
+        .create_deep_agent(
+            model=model,
+            tools=[inspect_report, publish_report],
+            checkpointer=InMemorySaver(),
+        )
+    )
+    await _parts(
+        definition,
+        {"messages": [HumanMessage(content="Plan", id="message")]},
+        run_id="planner-host-tools",
+        config={"configurable": {"thread_id": "plan-thread"}},
+        mode="plan",
+    )
+    planner_bindings = [
+        set(names) for names in model.bound_tool_names if "PlannerOutcome" in names
+    ]
+    assert planner_bindings
+    assert all(
+        "inspect_report" in names and "publish_report" not in names
+        for names in planner_bindings
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("planner_images", [True, False])
+async def test_attachment_capabilities_follow_planner_and_review_model(planner_images):
+    """Planner and rejected-review calls use their own destination capability."""
+    from tinkerfin.media import Attachment, AttachmentImage, AttachmentSupport
+
+    attachment = Attachment(
+        id="chart", name="chart.png", mime_type="image/png", size_bytes=4
+    )
+    root = _FakeModel(
+        responses=[AIMessage(content="unused")],
+        profile={"image_inputs": not planner_images},
+    )
+    planner = _FakeModel(
+        responses=[
+            _planner(),
+            AIMessage(content="Please clarify the requested revision"),
+        ],
+        profile={"image_inputs": planner_images},
+    )
+    reads = []
+
+    async def read_image(item):
+        reads.append(item.id)
+        return AttachmentImage(data=b"test", mime_type="image/png")
+
+    definition = (
+        TinkerFin()
+        .attachments(AttachmentSupport(read_image=read_image))
+        .plan(
+            planner_model=planner,
+        )
+        .create_deep_agent(model=root, checkpointer=InMemorySaver())
+    )
+    message = HumanMessage(
+        content=[attachment.content_block()], id="attachment-message"
+    )
+    config = {"configurable": {"thread_id": "plan-thread"}}
+    first = await _parts(
+        definition,
+        {"messages": [message]},
+        run_id="attachment-1",
+        config=config,
+        mode="plan",
+    )
+    assert _root_interrupts(first)
+    await _parts(
+        definition,
+        Command(resume={"type": "reject", "baseRevision": 1}),
+        run_id="attachment-2",
+        config=config,
+        mode="plan",
+    )
+    assert len(planner.model_inputs) == 2
+    assert reads == ([attachment.id, attachment.id] if planner_images else [])
+    for request in planner.model_inputs:
+        assert ("data:image/png;base64" in str(request)) == planner_images
+        assert ("cannot view images" in str(request)) != planner_images, [
+            m.content for m in request if isinstance(m, HumanMessage)
+        ]
+    assert not root.model_inputs
+    assert message.content == [attachment.content_block()]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("agent_name", ["general-purpose", "researcher"])
+async def test_root_and_subagents_resolve_tool_images_with_host_capabilities(
+    agent_name,
+):
+    """Native delegation retains structured responses and per-call attachment access."""
+    from tinkerfin.media import Attachment, AttachmentImage, AttachmentSupport
+
+    attachment = Attachment(
+        id="chart", name="chart.png", mime_type="image/png", size_bytes=4
+    )
+    reads = []
+
+    async def read_image(item):
+        reads.append(item.id)
+        return AttachmentImage(data=b"test", mime_type="image/png")
+
+    @tool
+    async def picture():
+        """Return a chart reference."""
+        return [attachment.content_block()]
+
+    model = _FakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "delegate",
+                        "name": "task",
+                        "args": {
+                            "subagent_type": agent_name,
+                            "description": "Call picture and summarize it",
+                        },
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[{"id": "image-tool", "name": "picture", "args": {}}],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "summary",
+                        "name": "PictureSummary",
+                        "args": {"summary": "chart reviewed"},
+                    }
+                ],
+            ),
+            AIMessage(content="done"),
+        ],
+        profile={"image_inputs": False},
+    )
+    definition = (
+        TinkerFin()
+        .attachments(
+            AttachmentSupport(
+                read_image=read_image,
+                supports_images=lambda candidate: candidate is model,
+            )
+        )
+        .create_deep_agent(
+            model=model,
+            tools=[picture],
+            subagents=[]
+            if agent_name == "general-purpose"
+            else [
+                {
+                    "name": agent_name,
+                    "description": "Research charts",
+                    "system_prompt": "Read charts",
+                }
+            ],
+            checkpointer=InMemorySaver(),
+        )
+    )
+    message = HumanMessage(content=[attachment.content_block()], id="root-image")
+    graph = await definition.create_graph()
+    result = await graph.ainvoke(
+        {"messages": [message]},
+        config={
+            "configurable": {
+                "thread_id": "media-delegation",
+                "__deepagents_subagent_response_format": {
+                    "title": "PictureSummary",
+                    "type": "object",
+                    "properties": {"summary": {"type": "string"}},
+                    "required": ["summary"],
+                },
+            }
+        },
+    )
+    assert len(model.model_inputs) == 4
+    assert "data:image/png;base64" in str(model.model_inputs[0])
+    assert "data:image/png;base64" in str(model.model_inputs[2])
+    assert len(reads) == 3
+    assert "chart reviewed" in str(result)
+    assert "data:image" not in str(result)
+    assert "tinkerfin_attachment" not in str(result)
+    assert message.content == [attachment.content_block()]
+
+
+@pytest.mark.asyncio
+async def test_attachment_projection_preserves_filesystem_eviction_and_custom_hooks():
+    """Only request copies carry image bytes; eviction retains durable descriptors."""
+    from deepagents.backends import StateBackend
+    from deepagents.middleware.filesystem import FilesystemMiddleware
+
+    from tinkerfin.media import Attachment, AttachmentImage, AttachmentSupport
+
+    hooks = []
+
+    class ObservedFilesystem(FilesystemMiddleware):
+        @property
+        def name(self):
+            return "FilesystemMiddleware"
+
+        async def abefore_model(self, state, runtime):
+            hooks.append("before")
+            return None
+
+    backend = StateBackend()
+    filesystem = ObservedFilesystem(
+        backend=backend, tools=["read_file"], human_message_token_limit_before_evict=10
+    )
+    model = _FakeModel(
+        responses=[AIMessage(content="done")], profile={"image_inputs": True}
+    )
+    attachment = Attachment(
+        id="chart", name="chart.png", mime_type="image/png", size_bytes=4
+    )
+
+    async def read_image(item):
+        return AttachmentImage(data=b"test", mime_type="image/png")
+
+    graph = (
+        await TinkerFin()
+        .attachments(AttachmentSupport(read_image=read_image))
+        .create_deep_agent(
+            model=model,
+            backend=backend,
+            middleware=[filesystem],
+            checkpointer=InMemorySaver(),
+        )
+        .create_graph()
+    )
+    original = HumanMessage(
+        content=[
+            {"type": "text", "text": "large request " * 100},
+            attachment.content_block(),
+        ],
+        id="large-input",
+    )
+    result = await graph.ainvoke(
+        {"messages": [original]},
+        config={"configurable": {"thread_id": "attachment-eviction"}},
+    )
+    assert hooks == ["before"]
+    assert "read_file" in model.bound_tool_names[0]
+    assert "write_file" not in model.bound_tool_names[0]
+    assert "data:image/png;base64" in str(model.model_inputs[0])
+    assert "tinkerfin_attachment" not in str(result)
+    assert "data:image" not in str(result)
+    saved_messages = result["messages"]
+    assert isinstance(saved_messages, list)
+    saved = saved_messages[0]
+    assert isinstance(saved, HumanMessage)
+    assert saved.content == original.content
+    assert saved.additional_kwargs.get("lc_evicted_to")
+    assert not original.additional_kwargs
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_attachment_support_preserves_native_general_purpose_profile(
+    monkeypatch, enabled
+):
+    """Native GP enablement and dedicated prompt precedence remain authoritative."""
+    from deepagents import GeneralPurposeSubagentProfile, HarnessProfile
+
+    from tinkerfin.media import AttachmentSupport
+
+    profile = HarnessProfile(
+        base_system_prompt="Root instructions",
+        system_prompt_suffix="Suffix",
+        general_purpose_subagent=GeneralPurposeSubagentProfile(
+            enabled=enabled,
+            description="Chart researcher",
+            system_prompt="Dedicated GP instructions",
+        ),
+    )
+    monkeypatch.setattr(
+        "deepagents.graph._harness_profile_for_model", lambda model, spec: profile
+    )
+    monkeypatch.setattr(
+        "tinkerfin._attachment_agents._harness_profile_for_model",
+        lambda model, spec: profile,
+    )
+    responses: list[BaseMessage] = (
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "delegate",
+                        "name": "task",
+                        "args": {
+                            "subagent_type": "general-purpose",
+                            "description": "Read instructions",
+                        },
+                    }
+                ],
+            ),
+            AIMessage(content="GP complete"),
+            AIMessage(content="done"),
+        ]
+        if enabled
+        else [AIMessage(content="done")]
+    )
+    model = _FakeModel(responses=responses)
+
+    async def read_image(item):
+        pytest.fail("text-only run must not resolve attachments")
+
+    graph = (
+        await TinkerFin()
+        .attachments(AttachmentSupport(read_image=read_image))
+        .create_deep_agent(model=model)
+        .create_graph()
+    )
+    await graph.ainvoke({"messages": [HumanMessage(content="hello")]})
+    assert ("task" in model.bound_tool_names[0]) == enabled
+    if enabled:
+        assert model.model_inputs[1][0].content == "Dedicated GP instructions\n\nSuffix"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("destination_images", [True, False])
+async def test_attachment_capability_uses_final_model_after_profile_routing(
+    monkeypatch, destination_images
+):
+    """Root and automatic GP projection occurs after model-routing middleware."""
+    from deepagents import HarnessProfile
+
+    from tinkerfin.media import Attachment, AttachmentImage, AttachmentSupport
+
+    attachment = Attachment(
+        id="chart", name="chart.png", mime_type="image/png", size_bytes=4
+    )
+    initial = _FakeModel(
+        responses=[AIMessage(content="must not run")],
+        profile={"image_inputs": not destination_images},
+    )
+    destination = _FakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "delegate",
+                        "name": "task",
+                        "args": {
+                            "subagent_type": "general-purpose",
+                            "description": "Call picture",
+                        },
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[{"id": "chart-tool", "name": "picture", "args": {}}],
+            ),
+            AIMessage(content="chart reviewed"),
+            AIMessage(content="done"),
+        ],
+        profile={"image_inputs": destination_images},
+    )
+
+    class Route(AgentMiddleware):
+        async def awrap_model_call(self, request, handler):
+            return await handler(request.override(model=destination))
+
+    from deepagents import graph as native_graph
+    from deepagents.middleware import subagents as native_subagents
+
+    original_dependencies = (
+        native_graph.create_deep_agent.__globals__["create_agent"],
+        native_graph.create_deep_agent.__globals__["SubAgentMiddleware"],
+        native_subagents.create_sub_agent,
+        native_subagents._build_task_tool,
+        native_subagents.SubAgentMiddleware.private_state_keys,
+    )
+    profile = HarnessProfile(extra_middleware=[Route()])
+    monkeypatch.setattr(
+        "deepagents.graph._harness_profile_for_model", lambda model, spec: profile
+    )
+    monkeypatch.setattr(
+        "tinkerfin._attachment_agents._harness_profile_for_model",
+        lambda model, spec: profile,
+    )
+    reads = []
+
+    async def read_image(item):
+        reads.append(item.id)
+        return AttachmentImage(data=b"test", mime_type="image/png")
+
+    @tool
+    async def picture():
+        """Return a chart reference."""
+        return [attachment.content_block()]
+
+    graph = (
+        await TinkerFin()
+        .attachments(AttachmentSupport(read_image=read_image))
+        .create_deep_agent(model=initial, tools=[picture])
+        .create_graph()
+    )
+    result = await graph.ainvoke(
+        {"messages": [HumanMessage(content=[attachment.content_block()])]}
+    )
+    assert not initial.model_inputs
+    assert len(destination.model_inputs) == 4
+    for index in [0, 2, 3]:
+        assert (
+            "data:image/png;base64" in str(destination.model_inputs[index])
+        ) == destination_images
+        assert (
+            "cannot view images" in str(destination.model_inputs[index])
+        ) != destination_images
+    assert len(reads) == (3 if destination_images else 0)
+    assert "data:image" not in str(result)
+    assert "tinkerfin_attachment" not in str(result)
+
+    assert original_dependencies == (
+        native_graph.create_deep_agent.__globals__["create_agent"],
+        native_graph.create_deep_agent.__globals__["SubAgentMiddleware"],
+        native_subagents.create_sub_agent,
+        native_subagents._build_task_tool,
+        native_subagents.SubAgentMiddleware.private_state_keys,
+    )
+
+
+@pytest.mark.asyncio
+async def test_attachment_support_rejects_instrumented_factory_without_side_effects(
+    monkeypatch,
+):
+    """Automatic attachment integration rejects factory replacement before execution."""
+    from functools import wraps
+
+    from deepagents import graph as native_graph
+
+    from tinkerfin import TinkerFinLifecycleError
+    from tinkerfin.media import AttachmentSupport
+
+    original = native_graph.create_deep_agent
+    calls = []
+
+    @wraps(original)
+    def instrumented(*args, **kwargs):
+        calls.append("build")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(native_graph, "create_deep_agent", instrumented)
+
+    async def read_image(item):
+        pytest.fail("rejected build must not read images")
+
+    model = _FakeModel(responses=[AIMessage(content="done")])
+    await TinkerFin().create_deep_agent(model=model).create_graph()
+    assert calls == ["build"]
+    with pytest.raises(TinkerFinLifecycleError, match="unmodified native"):
+        await (
+            TinkerFin()
+            .attachments(AttachmentSupport(read_image=read_image))
+            .create_deep_agent(model=model)
+            .create_graph()
+        )
+    assert calls == ["build"]
+    assert native_graph.create_deep_agent is instrumented
+    assert instrumented.__wrapped__ is original
+
+
+@pytest.mark.asyncio
+async def test_native_summarization_history_preserves_attachment_discovery():
+    """Compacted history keeps attachment IDs and names without image bytes."""
+    from deepagents.backends import StateBackend
+    from deepagents.middleware.summarization import SummarizationMiddleware
+
+    from tinkerfin.media import Attachment, AttachmentSupport
+
+    backend = StateBackend()
+    summary_model = _FakeModel(
+        responses=[
+            AIMessage(content="The chart remains available by its attachment ID")
+        ]
+    )
+    summary = SummarizationMiddleware(
+        summary_model, backend=backend, trigger=("messages", 2), keep=("messages", 1)
+    )
+    model = _FakeModel(responses=[AIMessage(content="done")])
+    attachment = Attachment(
+        id="chart-for-followup", name="revenue.png", mime_type="image/png", size_bytes=4
+    )
+
+    async def read_image(item):
+        pytest.fail("compacted image must remain a reference")
+
+    graph = (
+        await TinkerFin()
+        .attachments(AttachmentSupport(read_image=read_image))
+        .create_deep_agent(
+            model=model,
+            backend=backend,
+            middleware=[summary],
+            checkpointer=InMemorySaver(),
+        )
+        .create_graph()
+    )
+    original = HumanMessage(content=[attachment.content_block()], id="old-image")
+    result = await graph.ainvoke(
+        {
+            "messages": [
+                original,
+                AIMessage(content="ack"),
+                HumanMessage(content="continue"),
+            ]
+        },
+        config={"configurable": {"thread_id": "attachment-summary"}},
+    )
+    assert attachment.id in str(result["files"])
+    assert attachment.name in str(result["files"])
+    assert attachment.id in str(summary_model.model_inputs)
+    assert attachment.name in str(summary_model.model_inputs)
+    assert "tinkerfin_attachment" not in str(result)
+    assert "data:image" not in str(result)
+    assert original.content == [attachment.content_block()]
+
+
+@pytest.mark.asyncio
+async def test_automatic_attachments_do_not_construct_extra_model_clients(monkeypatch):
+    """The native builder resolves a string model once for the whole agent tree."""
+    from tinkerfin.media import AttachmentSupport
+
+    model = _FakeModel(responses=[AIMessage(content="done")])
+    resolutions = []
+
+    def resolve(spec):
+        resolutions.append(spec)
+        return model
+
+    monkeypatch.setattr("deepagents.graph.resolve_model", resolve)
+
+    async def read_image(item):
+        pytest.fail("text run must not resolve images")
+
+    graph = (
+        await TinkerFin()
+        .attachments(AttachmentSupport(read_image=read_image))
+        .create_deep_agent(model="test:attachment-model")
+        .create_graph()
+    )
+    await graph.ainvoke({"messages": [HumanMessage(content="hello")]})
+    assert resolutions == ["test:attachment-model"]

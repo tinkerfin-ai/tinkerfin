@@ -347,7 +347,7 @@ from tinkerfin import AgUiResumeRequest, RunIdentity
 events = await tinkerfin.open_agui_run(
     RunIdentity(threadId="thread-1", runId="run-1"),
     agent=agent,
-    input=graph_input,
+    messages=[{"id": "message-1", "role": "user", "content": "Hello"}],
     parent_run_id=parent_run_id,
     mode="default",
     config=config,
@@ -600,6 +600,70 @@ The v3 Profile is experimental because the locked LangGraph API declares v3
 experimental. The current LangGraph implementation internally drives that event stream
 from its v2 object stream; this is an upstream implementation detail and does not create
 a downstream version branch.
+
+## User input
+
+`open_agui_run(messages=...)` accepts standard AG-UI user messages with final,
+distinct message IDs. It validates and converts their text, image, and document
+content before creating the agent. Submit only the next user messages when a
+checkpointer already owns conversation history. Invalid message content produces
+one `RUN_STARTED` / `RUN_ERROR` lifecycle without creating the agent.
+Use exactly one of `messages`, advanced native `input`, or `resume`.
+
+Hosts assigning their own IDs can inspect an ID-free submission with
+`AgUiUserInput` from `tinkerfin`. Its `text` and `attachment_ids` properties are
+available before authorization. Load the referenced files through your authenticated
+repository, then call `submission.with_attachments(authorized_files)` to replace
+client metadata. The resulting `attachments` are typed descriptors for your own
+transactional binding. Assign final IDs when constructing the standard messages
+for persistence and `open_agui_run`; no placeholder ID or LangChain conversion is
+required in the host. The framework never grants file access or opens storage.
+
+## Attachments
+
+Configure attachment access once on the factory:
+
+```python
+from tinkerfin import AttachmentSupport, TinkerFin
+
+agents = TinkerFin().attachments(AttachmentSupport(read_image=read_authorized_image))
+definition = agents.create_deep_agent(model=model)
+```
+
+The asynchronous resolver authorizes each attachment in its user or tenant scope and
+returns `AttachmentImage(data=..., mime_type=...)`. The host owns storage and bounds
+image bytes; report missing files with `FileNotFoundError`. Other failures and
+cancellation propagate. `Attachment` describes a durable file with an opaque ID,
+name, MIME type, and byte size; messages store its `content_block()` reference.
+
+Root agents, the default general-purpose agent, declarative subagents, and Plan
+planner/review calls use their own model's `profile.image_inputs` capability.
+Only an explicit `True` enables images. For host-configured models, supply
+`supports_images=lambda model: ...` to `AttachmentSupport`; the predicate must
+check each destination model and return a boolean. Capability never grants access:
+the resolver must authorize every requested attachment independently.
+
+At most `max_images` distinct recent images are loaded per request (default 5).
+Tool images follow the complete tool-result batch. Unsupported and missing images
+remain explicit text references. Native filesystem tools, permissions, eviction,
+and general-purpose profile settings remain active. Compacted conversation history
+retains readable attachment IDs, names, and MIME types. Checkpoints contain durable
+references; trace replaces request-only image bytes with their descriptors.
+
+Automatic integration uses the built-in native Deep Agents factory. A decorated
+or replaced factory is rejected before model or backend preparation; its callbacks
+are never bypassed. Use runtime observers for supported observation, or configure
+attachment middleware explicitly in caller-owned custom graphs.
+
+Compiled and remote custom agents own their attachment access and do not inherit
+the parent's resolver. Configure their own TinkerFin factory, or install
+`support.middleware()` after model-routing middleware in an independently
+constructed LangChain agent. Hosts should provide bounded document-reading and
+image-reading tools for references reopened after context compaction.
+
+Tools explicitly declared with `metadata={"read_only": True}` are available to the
+Plan planner; hosts must apply that marker only to operations safe for read-only
+planning. Unmarked tools remain excluded from the planning action space.
 
 ## Documentation
 

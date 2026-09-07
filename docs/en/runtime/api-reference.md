@@ -17,14 +17,15 @@ This page groups the public Runtime capabilities by how you use them. Most appli
 | `TinkerFin.create_deep_agent(...)` | Create a reusable agent definition | See [Create and run a Deep Agent](deep-agents.md) |
 | `TinkerFin.ainvoke(identity, *, agent, input, ...)` | Return a final state through the managed lifecycle | A defensive root-state mapping |
 | `TinkerFin.open_run(identity, *, agent, input, ...)` | Open one managed native run | A single-use `NativeGraphRunStream` |
-| `TinkerFin.open_agui_run(identity, *, agent, input=... or resume=..., ...)` | Open one managed AG-UI run | A single-use `AgUiEventStream` |
+| `TinkerFin.attachments(support)` | Configure authorized attachment access for native agents | An independent factory; custom/decorated native factories are explicitly rejected during graph construction |
+| `TinkerFin.open_agui_run(identity, *, agent, messages=... or input=... or resume=..., ...)` | Open one managed AG-UI run | A single-use `AgUiEventStream` |
 | `DeepAgentDefinition.create_graph(mode=...)` | Reuse a direct async Runnable without managed lifecycle | Complete native or Plan-capable `DeepAgentGraph` |
 | `RunIdentity(threadId=..., runId=...)` | Identify one framework run | Thread and run only |
 
 `agent` may be an existing Definition or a synchronous/asynchronous callable returning
 one. The managed facade owns Definition resolution, asynchronous Graph construction,
 identity binding, Observation, coordination, setup-failure conversion, cancellation,
-and cleanup. `open_agui_run()` requires exactly one of `input` and `resume`.
+and cleanup. `open_agui_run()` requires exactly one of `messages`, `input`, and `resume`.
 
 ## Advanced integration APIs
 
@@ -242,13 +243,17 @@ already selected execution outcome.
 | `tinkerfin.plan.PlanModeConfigurationError` | A Plan definition lacks a concrete saver or explicit model, has an incompatible state schema, or requests non-sync durability |
 | `AgUiSettlementTimeoutError` | Caller wait ended before protected Runtime cleanup settled |
 
-`TinkerFin.open_agui_run(...)` is the ordinary entry point:
+`TinkerFin.open_agui_run(...)` is the ordinary entry point. Use `messages` for chat;
+the framework validates IDs and converts content before agent creation. `AgUiUserInput`
+provides text and attachment inspection without a message ID, and authorized descriptor
+replacement through `with_attachments`. Storage, authorization, and ID allocation remain
+host-owned. Send only new user messages when history is checkpointed:
 
 | Parameter | Default | Purpose |
 | --- | --- | --- |
 | `identity` | required | Canonical thread and run identity |
 | `agent` | required | Definition or sync/async callable returning one |
-| `input` / `resume` | exactly one | Ordinary Graph input or client-only `AgUiResumeRequest` |
+| `messages` / `input` / `resume` | exactly one | Standard AG-UI user messages with final IDs, advanced Graph input, or client-only `AgUiResumeRequest` |
 | `parent_run_id` | `None` | Optional checkpoint lineage exposed on `RUN_STARTED` |
 | `mode` | Definition default | Native default or Plan route |
 | `config` / `context` | `None` | Graph configuration and declared Runtime context |

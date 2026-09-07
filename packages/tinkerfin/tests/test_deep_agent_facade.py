@@ -11,6 +11,7 @@ import pytest
 from ag_ui.core import BaseEvent, RunErrorEvent, RunStartedEvent
 from deepagents.graph import create_deep_agent as upstream_create_deep_agent
 from langchain.agents.middleware.types import InputAgentState
+from langchain_core.callbacks import AsyncCallbackHandler
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
@@ -1079,3 +1080,83 @@ def test_runtime_astream_is_single_use_for_agui(
     assert isinstance(stream, AgUiEventStream)
     with pytest.raises(RuntimeError, match="only one object stream"):
         runtime.astream(_graph_input())
+
+
+@pytest.mark.asyncio
+async def test_agui_user_messages_preserve_authoritative_ids_and_content() -> None:
+    seen: list[BaseMessage] = []
+
+    class CaptureMessages(AsyncCallbackHandler):
+        async def on_chat_model_start(self, serialized, messages, **kwargs):
+            seen.extend(messages[0])
+
+    tinkerfin = TinkerFin()
+    agent = tinkerfin.create_deep_agent(
+        model=_FakeModel(
+            responses=[AIMessage(content="received")], callbacks=[CaptureMessages()]
+        ),
+        tools=[],
+    )
+    stream = await tinkerfin.open_agui_run(
+        _identity(),
+        agent=agent,
+        messages=[
+            {"id": "user-one", "role": "user", "name": "reader", "content": "hello"},
+            {"id": "user-two", "role": "user", "content": "follow up"},
+        ],
+    )
+    events = [event async for event in stream]
+    assert events[-1].type.value == "RUN_FINISHED"
+    users = [message for message in seen if isinstance(message, HumanMessage)]
+    assert [(message.id, message.content) for message in users] == [
+        ("user-one", "hello"),
+        ("user-two", "follow up"),
+    ]
+    assert users[0].name == "reader"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "messages",
+    [
+        [],
+        [{"content": "missing id"}],
+        [{"id": "m", "role": "assistant", "content": "no"}],
+        [{"id": "m", "content": "one"}, {"id": "m", "content": "two"}],
+    ],
+)
+async def test_invalid_agui_messages_fail_before_agent_creation(messages) -> None:
+    tinkerfin = TinkerFin()
+    created = False
+
+    async def create_agent() -> DeepAgentDefinition[None]:
+        nonlocal created
+        created = True
+        return _real_definition()
+
+    stream = await tinkerfin.open_agui_run(
+        _identity(), agent=create_agent, messages=messages
+    )
+    events = [event async for event in stream]
+    assert [event.type.value for event in events] == ["RUN_STARTED", "RUN_ERROR"]
+    assert not created
+
+
+@pytest.mark.asyncio
+async def test_agui_messages_cannot_be_combined_with_native_input_or_resume() -> None:
+    tinkerfin = TinkerFin()
+    agent = _definition(tinkerfin)
+    messages = [{"id": "m", "content": "hello"}]
+    with pytest.raises(ValueError, match="exactly one"):
+        await tinkerfin.open_agui_run(
+            _identity(), agent=agent, messages=messages, input=_graph_input()
+        )
+    with pytest.raises(ValueError, match="exactly one"):
+        await tinkerfin.open_agui_run(
+            _identity(),
+            agent=agent,
+            messages=messages,
+            resume=AgUiResumeRequest.model_validate(
+                {"entries": [{"interruptId": "i", "status": "cancelled"}]}
+            ),
+        )

@@ -405,6 +405,106 @@ Index(
 )
 
 
+_availability = Table(
+    "tinkerfin_opensandbox_availability",
+    _metadata,
+    Column(
+        "namespace",
+        String(64),
+        nullable=False,
+        comment="Logical OpenSandbox State deployment namespace",
+    ),
+    Column(
+        "owner_digest",
+        String(43),
+        nullable=False,
+        comment="URL-safe SHA-256 digest of the namespace and owner key",
+    ),
+    Column(
+        "sandbox_id",
+        String(255),
+        nullable=False,
+        comment="Remote OpenSandbox identifier of the registered binding",
+    ),
+    Column(
+        "binding_generation",
+        BigInteger,
+        nullable=False,
+        comment="Owner fencing generation that committed this binding",
+    ),
+    Column(
+        "sequence",
+        BigInteger,
+        nullable=False,
+        comment="Monotonic availability intent sequence within this binding",
+    ),
+    Column(
+        "phase",
+        String(16),
+        nullable=False,
+        comment="Current intent: running, draining, pausing, paused, resuming, or uncertain",
+    ),
+    Column(
+        "connection_generation",
+        BigInteger,
+        nullable=False,
+        comment="Connection refresh counter required before admitting operations",
+    ),
+    PrimaryKeyConstraint("namespace", "owner_digest"),
+    comment="Authoritative availability intent used to coordinate all handle holders",
+)
+
+_holders = Table(
+    "tinkerfin_opensandbox_holders",
+    _metadata,
+    Column(
+        "namespace",
+        String(64),
+        nullable=False,
+        comment="Logical OpenSandbox State deployment namespace",
+    ),
+    Column(
+        "owner_digest",
+        String(43),
+        nullable=False,
+        comment="URL-safe SHA-256 digest of the namespace and owner key",
+    ),
+    Column(
+        "sandbox_id",
+        String(255),
+        nullable=False,
+        comment="Remote OpenSandbox identifier of the registered binding",
+    ),
+    Column(
+        "binding_generation",
+        BigInteger,
+        nullable=False,
+        comment="Owner fencing generation that committed this binding",
+    ),
+    Column(
+        "holder_id",
+        String(36),
+        nullable=False,
+        comment="Unique manager lifetime identity never reused after shutdown",
+    ),
+    Column(
+        "acknowledged_sequence",
+        BigInteger,
+        nullable=True,
+        comment="Explicit current drain sequence acknowledged after local operations settle",
+    ),
+    PrimaryKeyConstraint("namespace", "holder_id", "owner_digest"),
+    comment="Durable handle registrations requiring explicit idle evidence",
+)
+
+Index(
+    "ix_tinkerfin_opensandbox_holders_binding",
+    _holders.c.namespace,
+    _holders.c.owner_digest,
+    _holders.c.binding_generation,
+)
+
+
 def get_sqlalchemy_opensandbox_state_schema(
     *,
     dialect: Literal["mysql", "sqlite"],

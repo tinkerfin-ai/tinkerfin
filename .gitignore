@@ -52,3 +52,6 @@ htmlcov/
 **/.mcp.json
 **/AGENTS.md
 **/CLAUDE.md
+
+# Studio local attachment data
+.data/

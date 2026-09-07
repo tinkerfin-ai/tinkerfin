@@ -42,5 +42,5 @@ pids_limit = 4096
 mode = "direct"
 
 [egress]
-image = "opensandbox/egress:v1.1.6"
+image = "opensandbox/egress:v1.1.7"
 mode = "dns"

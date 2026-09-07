@@ -1,9 +1,11 @@
-import { ArrowUp, FileImage, FileText, Plus, Square, X } from 'lucide-react'
+import { ArrowUp, Plus, Square } from 'lucide-react'
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { KeyboardEvent, ReactNode } from 'react'
 
+import { DraftAttachmentCard } from '../attachments/DraftAttachmentCard'
+import { useAttachmentPicker } from '../attachments/useAttachmentPicker'
 import { IconButton } from '../../../components/ui'
-import { useI18n } from '../../../i18n'
+import { isTranslationKey, useI18n } from '../../../i18n'
 import {
   applyAtomicPlanDeletion,
   cancelComposerSuggestion,
@@ -15,7 +17,7 @@ import {
   planClaimParts,
   replaceSlashTokenWithPlan,
 } from '../composerSuggestions'
-import type { LocalAttachment } from '../useLocalAttachments'
+import type { DraftAttachment } from '../useAttachments'
 import { ComposerPlanChip } from './ComposerPlanChip'
 import { ComposerSuggestionMenu } from './ComposerSuggestionMenu'
 
@@ -56,6 +58,8 @@ export function Composer({
   onExitPlan,
   onAddAttachments,
   onRemoveAttachment,
+  onRetryAttachment,
+  attachmentBlocked = false,
   onScrollConversation,
 }: {
   value: string
@@ -72,7 +76,7 @@ export function Composer({
   modelControl: ReactNode
   planActive: boolean
   planLocked?: boolean
-  attachments: readonly LocalAttachment[]
+  attachments: readonly DraftAttachment[]
   attachmentError?: string
   onChange: (value: string) => void
   onSend: () => void
@@ -80,12 +84,16 @@ export function Composer({
   onExitPlan: () => void
   onAddAttachments: (files: readonly File[]) => void
   onRemoveAttachment: (id: string) => void
+  onRetryAttachment?: (id: string) => void
+  attachmentBlocked?: boolean
   onScrollConversation?: (deltaY: number) => void
 }) {
   const { t } = useI18n()
+  const errorText = (message: string) => isTranslationKey(message) ? t(message) : message
   const input = useRef<HTMLTextAreaElement>(null)
   const inputScroll = useRef<HTMLDivElement>(null)
-  const fileInput = useRef<HTMLInputElement>(null)
+  const attachmentPicker = useAttachmentPicker()
+  const previousAttachments = useRef(attachments)
   const pendingCaret = useRef<number | null>(null)
   const acceptedCaret = useRef(value.length)
   const menuId = `composer-suggestions-${useId()}`
@@ -113,7 +121,7 @@ export function Composer({
     ? activeSuggestionId
     : enabledIds[0]
   const planClaim = planClaimParts(value)
-  const canSubmitDraft = Boolean(value.trim()) && isSubmittableComposerDraft(value)
+  const canSubmitDraft = (Boolean(value.trim()) || attachments.length > 0) && (!value.trim() || isSubmittableComposerDraft(value)) && !attachmentBlocked && attachments.every(item => item.state === 'ready')
   const cancelSuggestionMenu = useCallback(() => {
     const cancellation = cancelComposerSuggestion(value, slashHit ?? undefined)
     pendingCaret.current = cancellation.caret
@@ -136,6 +144,14 @@ export function Composer({
     const frame = window.requestAnimationFrame(() => input.current?.focus())
     return () => window.cancelAnimationFrame(frame)
   }, [isDisabled, takeover])
+
+  useEffect(() => {
+    const addedReference = attachments.some(item => item.reference && !previousAttachments.current.some(previous => previous.id === item.id))
+    previousAttachments.current = attachments
+    if (!addedReference || isDisabled || backgroundInert || takeover) return
+    const frame = window.requestAnimationFrame(() => input.current?.focus())
+    return () => window.cancelAnimationFrame(frame)
+  }, [attachments, backgroundInert, isDisabled, takeover])
 
   const pickSuggestion = (id: string) => {
     if (id !== 'command-plan' || !slashHit) return
@@ -249,31 +265,15 @@ export function Composer({
           />
         )}
         {attachments.length > 0 && (
-          <div className="composer-attachments" aria-label={t('本地附件')}>
-            <span className="visually-hidden">{t('附件仅在本地预览，不会随消息发送')}</span>
+          <div className="composer-attachments" aria-label={t('待发送附件')}>
+
             {attachments.map((attachment) => (
-              <div
-                key={attachment.id}
-                className="composer-attachment"
-                title={t('仅在本地预览，不会随消息发送')}
-              >
-                <span className="composer-attachment-icon" aria-hidden="true">
-                  {attachment.kind === 'image' ? <FileImage size={16} /> : <FileText size={16} />}
-                </span>
-                <strong>{attachment.file.name}</strong>
-                <button
-                  type="button"
-                  className="composer-attachment-remove"
-                  aria-label={t('移除附件：{name}', { name: attachment.file.name })}
-                  onClick={() => onRemoveAttachment(attachment.id)}
-                >
-                  <X size={14} aria-hidden="true" />
-                </button>
-              </div>
+              <DraftAttachmentCard key={attachment.id} attachment={attachment} onRemove={onRemoveAttachment} onRetry={onRetryAttachment} />
             ))}
           </div>
         )}
-        {attachmentError && <p className="composer-attachment-error" role="status" aria-live="polite">{attachmentError}</p>}
+        {attachmentError && <p className="composer-attachment-error" role="status" aria-live="polite">{errorText(attachmentError)}</p>}
+        {attachmentPicker.failed && <p className="composer-attachment-error" role="status">{t('无法打开文件选择器，请重试')}</p>}
         <div ref={inputScroll} className="composer-input-scroll">
           <div className="composer-input-grow">
             <div className={`composer-input-backdrop${isDisabled ? ' is-disabled' : ''}`} aria-hidden="true">
@@ -295,6 +295,9 @@ export function Composer({
               aria-autocomplete="list"
               disabled={isDisabled}
               value={value}
+              onPaste={(event) => { const files = [...event.clipboardData.files]; if (files.length) { event.preventDefault(); onAddAttachments(files) } }}
+              onDragOver={(event) => event.preventDefault()}
+              onDrop={(event) => { event.preventDefault(); onAddAttachments([...event.dataTransfer.files]) }}
               onChange={(event) => {
                 const nextValue = event.target.value
                 const nextCaret = event.target.selectionStart
@@ -333,23 +336,25 @@ export function Composer({
         <div className="composer-toolbar">
           <div className="composer-toolbar-leading">
             <input
-              ref={fileInput}
+              ref={attachmentPicker.inputRef}
               type="file"
               hidden
               multiple
-              accept="image/png,image/jpeg,image/webp,image/gif,application/pdf"
+              accept=".png,.jpg,.jpeg,.webp,.gif,.pdf,.docx,.xlsx"
               onChange={(event) => {
                 onAddAttachments(Array.from(event.target.files ?? []))
                 event.target.value = ''
               }}
             />
             <IconButton
+              ref={attachmentPicker.buttonRef}
               size="sm"
               className="composer-add-button"
               label={t('添加本地附件')}
               tooltip={t('添加本地附件')}
               icon={<Plus size={18} />}
-              onClick={() => fileInput.current?.click()}
+              loading={attachmentPicker.pending}
+              onClick={attachmentPicker.open}
             />
             {planActive && (
               <ComposerPlanChip locked={planLocked} onExitPlan={onExitPlan} />

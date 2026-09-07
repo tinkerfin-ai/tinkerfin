@@ -1,0 +1,533 @@
+@layer conversation {
+  .message-attachments {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    gap: var(--space-3);
+    margin-block: var(--space-3);
+    min-width: 0;
+  }
+  .attachment-card {
+    width: var(--layout-image-width);
+    max-width: 100%;
+    min-width: 0;
+    border: 0;
+    border-radius: var(--radius-xl);
+    background: var(--color-layer-2);
+  }
+  .attachment-card--image {
+    width: min(
+      var(--layout-image-width),
+      max(
+        var(--layout-image-min-width),
+        calc(var(--layout-image-height) * var(--attachment-ratio, 1))
+      )
+    );
+    background: transparent;
+  }
+  .message-attachments--multiple {
+    --layout-image-width: var(--layout-image-multiple-width);
+  }
+  .attachment-media {
+    position: relative;
+    isolation: isolate;
+    border-radius: inherit;
+  }
+  .attachment-preview {
+    display: block;
+    width: 100%;
+    max-width: 100%;
+    padding: 0;
+    border: 0;
+    border-radius: inherit;
+    outline: 0;
+    overflow: hidden;
+    background: var(--color-layer-2);
+    color: var(--color-text-secondary);
+    cursor: zoom-in;
+  }
+  .attachment-preview img {
+    display: block;
+    width: 100%;
+    height: auto;
+    border: 0;
+  }
+  .attachment-preview:focus-visible {
+    filter: brightness(0.88);
+  }
+  .attachment-preview:active {
+    filter: brightness(0.94);
+  }
+  .attachment-preview:disabled {
+    cursor: default;
+  }
+  .attachment-loading {
+    display: grid;
+    place-items: center;
+    min-height: var(--layout-image-min-width);
+    padding: var(--space-4);
+    font-size: var(--type-caption-size);
+  }
+  .attachment-media[data-state='ready']::after {
+    content: '';
+    position: absolute;
+    inset: auto 0 0;
+    height: calc(var(--space-16) + var(--space-8));
+    border-radius: 0 0 var(--radius-xl) var(--radius-xl);
+    background: linear-gradient(transparent, var(--color-media-shade));
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity var(--motion-normal) var(--ease-out);
+  }
+  .attachment-image-actions {
+    display: flex;
+    gap: var(--space-0-5);
+    position: absolute;
+    bottom: var(--space-2);
+    left: var(--space-2);
+    z-index: var(--layer-local);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity var(--motion-normal) var(--ease-out);
+  }
+  .attachment-media:hover::after,
+  .attachment-media:focus-within::after,
+  .attachment-media:hover .attachment-image-actions,
+  .attachment-media:focus-within .attachment-image-actions {
+    opacity: 1;
+  }
+  .attachment-media:hover .attachment-image-actions,
+  .attachment-media:focus-within .attachment-image-actions {
+    pointer-events: auto;
+  }
+  .attachment-image-actions .ui-button {
+    color: var(--color-media-ink);
+    width: var(--control-composer);
+    height: var(--control-composer);
+    border: 0;
+    box-shadow: none;
+    background: transparent;
+  }
+  .attachment-image-actions .ui-button:hover:not(:disabled),
+  .attachment-image-actions .ui-button:active:not(:disabled),
+  .attachment-image-actions .ui-button:focus-visible {
+    background: var(--color-media-hover);
+    outline: 0;
+  }
+  .attachment-image-actions .ui-tooltip {
+    background: var(--color-media-shade);
+    color: var(--color-media-ink);
+    left: 0;
+    top: auto;
+    bottom: calc(100% + var(--space-2));
+    transform: none;
+    border: 0;
+    box-shadow: none;
+  }
+  .attachment-media[data-state='error'] .attachment-loading {
+    min-height: calc(var(--space-16) + var(--space-16));
+    padding-bottom: calc(var(--control-composer) + var(--space-4));
+  }
+  .attachment-media[data-state='error'] .attachment-image-actions {
+    opacity: 1;
+    pointer-events: auto;
+  }
+  .attachment-media[data-state='error'] .attachment-image-actions .ui-button {
+    color: var(--color-text-secondary);
+  }
+  .attachment-media[data-state='error'] .attachment-image-actions .ui-button:hover:not(:disabled),
+  .attachment-media[data-state='error'] .attachment-image-actions .ui-button:active:not(:disabled),
+  .attachment-media[data-state='error'] .attachment-image-actions .ui-button:focus-visible {
+    color: var(--color-text-primary);
+    background: var(--color-active);
+  }
+  .attachment-description {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-3);
+  }
+  .attachment-description__text {
+    flex: 1;
+    min-width: 0;
+  }
+  .attachment-description strong {
+    display: block;
+    overflow-wrap: anywhere;
+    font-size: var(--type-caption-size);
+    font-weight: var(--weight-medium);
+  }
+  .attachment-description small {
+    display: block;
+    color: var(--color-text-secondary);
+    font-size: var(--type-micro-size);
+    margin-top: var(--space-1);
+  }
+  .attachment-error {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-2);
+    color: var(--color-danger-text);
+    font-size: var(--type-caption-size);
+  }
+  .attachment-card .ui-button:focus-visible,
+  .composer-attachment .ui-button:focus-visible {
+    outline: 0;
+    background: var(--color-active);
+  }
+  .attachment-card .attachment-image-actions .ui-button:focus-visible {
+    background: var(--color-media-hover);
+  }
+
+  .modal-backdrop:has(.attachment-viewer) {
+    padding: 0;
+    backdrop-filter: none;
+  }
+  .attachment-viewer {
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+    height: 100dvh;
+    max-height: 100dvh;
+    min-width: 0;
+    border: 0;
+    border-radius: 0;
+    box-shadow: none;
+    animation: none;
+    background: var(--color-canvas);
+  }
+  .attachment-viewer .modal-dialog-head {
+    flex: 0 0 auto;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-3) var(--space-5);
+  }
+  .attachment-viewer .modal-dialog-head > div:first-child {
+    flex: 1;
+  }
+  .attachment-viewer .modal-dialog-head h2 {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: var(--type-caption-size);
+    font-weight: var(--weight-medium);
+    letter-spacing: normal;
+  }
+  .attachment-viewer-actions {
+    display: flex;
+    gap: var(--space-1);
+  }
+  .attachment-viewer .ui-button {
+    border: 0;
+    box-shadow: none;
+  }
+  .attachment-viewer .ui-button:focus-visible,
+  .attachment-viewer .ui-button[aria-pressed='true'] {
+    outline: 0;
+    background: var(--color-active);
+  }
+  .attachment-viewer .modal-dialog-close {
+    background: transparent;
+  }
+  .attachment-viewer .modal-dialog-close:hover {
+    background: var(--color-hover);
+  }
+  .attachment-viewer-body {
+    position: relative;
+    flex: 1;
+    display: flex;
+    min-height: 0;
+    min-width: 0;
+    margin: 0 var(--space-5);
+  }
+  .attachment-viewer-stage {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    overflow: hidden;
+    touch-action: none;
+    user-select: none;
+  }
+  .attachment-viewer-stage[data-pannable='true'] {
+    cursor: grab;
+  }
+  .attachment-viewer-stage[data-pannable='true']:active {
+    cursor: grabbing;
+  }
+  .attachment-viewer-image {
+    display: block;
+    flex: none;
+    max-width: none;
+    max-height: none;
+    object-fit: contain;
+    border: 0;
+  }
+  .attachment-viewer-empty {
+    color: var(--color-text-secondary);
+    font-size: var(--type-caption-size);
+  }
+  .attachment-viewer-status {
+    position: absolute;
+    z-index: var(--layer-local);
+    bottom: var(--space-3);
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    max-width: 100%;
+    padding: var(--space-1) var(--space-3);
+    border-radius: var(--radius-lg);
+    background: var(--color-layer-1);
+    color: var(--color-text-secondary);
+    font-size: var(--type-caption-size);
+    box-shadow: var(--shadow-2);
+  }
+  .attachment-viewer-info {
+    width: var(--layout-image-multiple-width);
+    flex: 0 0 auto;
+    padding: var(--space-5);
+    overflow: auto;
+    background: var(--color-layer-2);
+    border-radius: var(--radius-xl);
+  }
+  .attachment-viewer-info h3 {
+    margin: 0 0 var(--space-6);
+    font-size: var(--type-body-size);
+  }
+  .attachment-viewer-info dl {
+    margin: 0;
+    font-size: var(--type-caption-size);
+  }
+  .attachment-viewer-info dt {
+    color: var(--color-text-secondary);
+    margin-bottom: var(--space-1);
+  }
+  .attachment-viewer-info dd {
+    margin: 0 0 var(--space-5);
+    overflow-wrap: anywhere;
+  }
+  .attachment-viewer-footer {
+    flex: 0 0 auto;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-3) var(--space-5);
+    min-width: 0;
+  }
+  .attachment-viewer-gallery {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    max-width: 100%;
+  }
+  .attachment-viewer-gallery .ui-button[aria-disabled='true'] {
+    opacity: .48;
+    cursor: default;
+  }
+  .attachment-viewer-thumbnails {
+    display: flex;
+    gap: var(--space-2);
+    overflow-x: auto;
+    min-width: 0;
+    padding: var(--space-1);
+  }
+  .attachment-viewer-thumbnail {
+    flex: 0 0 var(--control-xl);
+    width: var(--control-xl);
+    height: var(--control-xl);
+    padding: var(--space-1);
+    border: 0;
+    outline: 0;
+    border-radius: var(--radius-md);
+    background: transparent;
+    cursor: pointer;
+  }
+  .attachment-viewer-thumbnail img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+  }
+  .attachment-viewer-thumbnail span {
+    display: block;
+    overflow: hidden;
+    font-size: var(--type-micro-size);
+  }
+  .attachment-viewer-thumbnail:hover,
+  .attachment-viewer-thumbnail:active,
+  .attachment-viewer-thumbnail:focus-visible,
+  .attachment-viewer-thumbnail[aria-pressed='true'] {
+    background: var(--color-active);
+  }
+  .attachment-viewer-zoom {
+    display: flex;
+    align-items: center;
+    gap: var(--space-1);
+  }
+  .attachment-viewer-zoom output {
+    min-width: var(--control-xl);
+    text-align: center;
+    font-size: var(--type-caption-size);
+    font-variant-numeric: tabular-nums;
+  }
+  .attachment-viewer .modal-dialog-head .ui-tooltip {
+    left: auto;
+    right: 0;
+    transform: none;
+    top: calc(100% + var(--space-2));
+    bottom: auto;
+  }
+
+  .composer-attachments {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-1-5);
+    min-width: 0;
+    max-height: var(--layout-image-min-width);
+    padding: 0 var(--space-3);
+    overflow: auto;
+  }
+  .composer-attachment {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    flex: 0 0 auto;
+    min-width: 0;
+    max-width: min(100%, var(--layout-image-multiple-width));
+    height: var(--control-md);
+    padding: var(--space-1) var(--space-0-5) var(--space-1) var(--space-1);
+    border: 0;
+    border-radius: var(--radius-md);
+    background: var(--color-subtle);
+    color: var(--color-text-primary);
+  }
+  .composer-attachment-thumbnail {
+    display: block;
+    flex: 0 0 auto;
+    width: var(--control-xs);
+    height: var(--control-xs);
+    object-fit: contain;
+    border-radius: var(--radius-xs);
+  }
+  .composer-attachment-icon {
+    display: grid;
+    width: var(--control-xs);
+    flex: 0 0 auto;
+    place-items: center;
+    color: var(--color-text-secondary);
+  }
+  .composer-attachment-copy {
+    min-width: 0;
+  }
+  .composer-attachment .composer-attachment-remove-control {
+    --button-control-size: var(--space-6);
+  }
+  .composer-attachment:has(.composer-attachment-state) {
+    height: auto;
+    min-height: var(--control-md);
+  }
+  .composer-attachment-copy strong {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: var(--type-meta-size);
+    font-weight: var(--weight-regular);
+    line-height: var(--type-meta-line);
+  }
+  .composer-attachment-state {
+    display: block;
+    color: var(--color-text-secondary);
+    font-size: var(--type-micro-size);
+  }
+  .composer-attachment-state[data-error='true'] {
+    color: var(--color-danger-text);
+  }
+
+  @media (max-width: 767px) {
+    .attachment-viewer .modal-dialog-head {
+      padding: var(--space-2);
+      gap: var(--space-1);
+    }
+    .attachment-viewer-body {
+      margin-inline: var(--space-2);
+    }
+    .attachment-viewer-footer {
+      padding: var(--space-2);
+    }
+    .attachment-viewer-info {
+      position: absolute;
+      inset: 0 0 0 auto;
+      max-width: 100%;
+      z-index: var(--layer-local-raised);
+    }
+    .attachment-viewer-status {
+      width: max-content;
+      max-width: 100%;
+      flex-wrap: wrap;
+      justify-content: center;
+    }
+    .attachment-viewer-actions {
+      gap: 0;
+    }
+  }
+  @media (any-hover: none), (any-pointer: coarse) {
+    .attachment-image-actions,
+    .attachment-media::after {
+      opacity: 1;
+    }
+    .attachment-image-actions {
+      pointer-events: auto;
+    }
+    .attachment-card .ui-button,
+    .attachment-viewer .ui-button,
+    .composer-attachment .ui-button {
+      min-width: var(--control-lg);
+      min-height: var(--control-lg);
+      height: var(--control-lg);
+    }
+    .composer-attachment {
+      height: auto;
+      min-height: var(--control-lg);
+    }
+    .attachment-card .ui-tooltip,
+    .attachment-viewer .ui-tooltip {
+      display: none;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .attachment-image-actions,
+    .attachment-media::after {
+      transition: none;
+    }
+  }
+  @media (forced-colors: active) {
+    .attachment-preview:focus-visible,
+    .attachment-viewer-thumbnail:focus-visible {
+      outline: 2px solid ButtonText;
+      outline-offset: -2px;
+    }
+    .attachment-image-actions {
+      background: Canvas;
+    }
+    .attachment-image-actions .ui-button {
+      color: ButtonText;
+    }
+    .attachment-viewer .ui-button:focus-visible,
+    .attachment-card .ui-button:focus-visible {
+      outline: 2px solid ButtonText;
+    }
+    .attachment-viewer-thumbnail[aria-pressed='true'] {
+      outline: 2px solid ButtonText;
+    }
+  }
+}

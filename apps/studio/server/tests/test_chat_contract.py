@@ -277,8 +277,8 @@ def test_chat_request_rejects_self_referential_parent_run() -> None:
         )
 
 
-def test_from_agui_rejects_full_history_and_multimodal_content_for_current_ui() -> None:
-    """当前 UI 尚未提供附件历史时不得执行后再静默丢失输入"""
+def test_from_agui_rejects_full_history_in_a_single_increment_request() -> None:
+    """普通请求只提交一条增量消息，不能把完整历史重复作为新输入"""
 
     protocol_input = RunAgentInput.model_validate(
         {
@@ -355,12 +355,12 @@ def test_from_agui_rejects_full_history_and_multimodal_content_for_current_ui() 
         }
     )
 
-    with pytest.raises(ValidationError, match="一条文本 user 消息"):
+    with pytest.raises(ValidationError, match="一条 user 消息"):
         ChatRequest.from_agui(protocol_input)
 
 
-def test_multimodal_start_is_rejected_until_history_support_is_complete() -> None:
-    with pytest.raises(ValidationError, match="非空文本 user 消息"):
+def test_image_input_rejects_external_urls_instead_of_stored_references() -> None:
+    with pytest.raises(ValidationError, match="附件引用不合法"):
         ChatRequest.from_agui(
             RunAgentInput.model_validate(
                 {

@@ -36,6 +36,7 @@ export type JsonValue =
   | JsonValue[]
 
 export interface Message {
+  attachments?: import('./features/conversation/attachments/content').Attachment[]
   id: string
   role: MessageRole
   content: string

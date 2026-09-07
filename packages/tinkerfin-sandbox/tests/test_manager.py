@@ -27,6 +27,8 @@ from opensandbox.config import ConnectionConfig
 import tinkerfin_sandbox
 from tinkerfin_sandbox import (
     InMemoryOpenSandboxState,
+    OpenSandboxAvailability,
+    OpenSandboxAvailabilityPhase,
     OpenSandboxBackend,
     OpenSandboxBackendTimeoutError,
     OpenSandboxBackendUnavailableError,
@@ -36,8 +38,10 @@ from tinkerfin_sandbox import (
     OpenSandboxConfig,
     OpenSandboxDestroyError,
     OpenSandboxDetails,
+    OpenSandboxDiagnosticContent,
     OpenSandboxHandle,
     OpenSandboxHandleOwnershipError,
+    OpenSandboxHolderUpdate,
     OpenSandboxManager,
     OpenSandboxManagerClosedError,
     OpenSandboxOwnerClaim,
@@ -244,6 +248,25 @@ class _FakeClient:
     async def inspect(self, sandbox_id: str) -> OpenSandboxRuntimeInfo:
         self.inspect_calls.append(sandbox_id)
         return self.inspection_results[sandbox_id]
+
+    async def get_runtime_info(self, sandbox_id: str) -> OpenSandboxRuntimeInfo:
+        return await self.inspect(sandbox_id)
+
+    async def pause(self, sandbox_id: str) -> None:
+        raise AssertionError(f"unexpected pause for {sandbox_id}")
+
+    async def resume(self, sandbox_id: str) -> None:
+        raise AssertionError(f"unexpected resume for {sandbox_id}")
+
+    async def get_diagnostic_logs(
+        self, sandbox_id: str, *, scope: str = "container"
+    ) -> OpenSandboxDiagnosticContent:
+        raise AssertionError(f"unexpected log diagnostics for {sandbox_id}: {scope}")
+
+    async def get_diagnostic_events(
+        self, sandbox_id: str, *, scope: str = "runtime"
+    ) -> OpenSandboxDiagnosticContent:
+        raise AssertionError(f"unexpected event diagnostics for {sandbox_id}: {scope}")
 
     async def destroy(self, sandbox_id: str) -> None:
         self.destroy_calls.append(sandbox_id)
@@ -486,6 +509,46 @@ class _WarmLeaseState(OpenSandboxState):
 
     async def release_owner(self, claim: OpenSandboxOwnerClaim) -> None:
         await self._inner.release_owner(claim)
+
+    async def register_holder(
+        self, claim: OpenSandboxOwnerClaim, holder_id: str
+    ) -> OpenSandboxAvailability:
+        return await self._inner.register_holder(claim, holder_id)
+
+    async def read_availability(self, owner_key: str) -> OpenSandboxAvailability | None:
+        return await self._inner.read_availability(owner_key)
+
+    async def get_holder_updates(
+        self, holder_id: str
+    ) -> tuple[OpenSandboxHolderUpdate, ...]:
+        return await self._inner.get_holder_updates(holder_id)
+
+    async def change_availability(
+        self,
+        claim: OpenSandboxOwnerClaim,
+        expected: OpenSandboxAvailability,
+        *,
+        phase: OpenSandboxAvailabilityPhase,
+        refresh_connection: bool = False,
+    ) -> OpenSandboxAvailability:
+        return await self._inner.change_availability(
+            claim, expected, phase=phase, refresh_connection=refresh_connection
+        )
+
+    async def acknowledge_idle(
+        self, holder_id: str, availability: OpenSandboxAvailability
+    ) -> bool:
+        return await self._inner.acknowledge_idle(holder_id, availability)
+
+    async def holders_are_idle(
+        self, claim: OpenSandboxOwnerClaim, availability: OpenSandboxAvailability
+    ) -> bool:
+        return await self._inner.holders_are_idle(claim, availability)
+
+    async def unregister_holder(
+        self, holder_id: str, availability: OpenSandboxAvailability
+    ) -> None:
+        await self._inner.unregister_holder(holder_id, availability)
 
     async def claim_warm_slot(self) -> OpenSandboxWarmClaim | None:
         return await self._inner.claim_warm_slot()
@@ -2775,8 +2838,9 @@ async def test_manager_close_timeout_retains_shared_cleanup_for_second_close(
             await manager.get("owner-1")
 
         backend.close_gate.set()
-        if settlement_timeout == 0:
-            await _eventually(lambda: client.close_calls == 1)
+        # Each close caller has its own wait budget. Completion of the released
+        # worker thread and dependent resources is observed explicitly.
+        await _eventually(lambda: client.close_calls == 1)
         await manager.aclose()
 
         assert backend.close_calls == 1
@@ -3606,3 +3670,70 @@ async def test_manager_wraps_an_undeclared_custom_state_failure() -> None:
     assert str(captured.value.cause) == "driver-specific state failure"
     assert dict(captured.value.context) == {}
     assert captured.value.diagnostic_context["operation"] == "acquire_owner"
+
+
+class _RegistrationInterruptedState(InMemoryOpenSandboxState):
+    """Fail or suspend the public holder registration after a connection changes."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.failure: str | None = None
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    @property
+    def persistent(self) -> bool:
+        return True
+
+    async def register_holder(self, claim: OpenSandboxOwnerClaim, holder_id: str):
+        if self.failure is not None:
+            self.entered.set()
+            if self.failure == "cancel":
+                await self.release.wait()
+            raise OpenSandboxStateError("Holder registration is unavailable")
+        return await super().register_holder(claim, holder_id)
+
+
+@pytest.mark.parametrize("operation", ["reconnect", "recreate"])
+@pytest.mark.parametrize("failure", ["error", "cancel"])
+async def test_registration_failure_retains_old_resource_cleanup(
+    operation: str, failure: str
+) -> None:
+    client = _FakeClient()
+    state = _RegistrationInterruptedState()
+    manager = _new_manager(client=client, state=state, warm_pool_size=0)
+    await manager.start()
+    task: asyncio.Task[object] | None = None
+    try:
+        handle = await manager.get("owner")
+        original = client.backends[0]
+        replacement = _FakeBackend(original.id)
+        client.connected[original.id] = replacement
+        state.failure = failure
+        action = manager.reconnect if operation == "reconnect" else manager.recreate
+        task = asyncio.create_task(action("owner"))
+        await asyncio.wait_for(state.entered.wait(), 1)
+        if failure == "cancel":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            with pytest.raises(OpenSandboxStateError):
+                await task
+        await _eventually(lambda: original.close_calls == 1)
+        binding = await state.read_binding("owner")
+        assert binding is not None
+        assert binding.sandbox_id == handle.id
+        if operation == "recreate":
+            assert original.id in client.destroy_calls
+            assert binding.sandbox_id != original.id
+        else:
+            assert client.destroy_calls == []
+            assert binding.sandbox_id == original.id
+        assert original.close_calls == 1
+    finally:
+        state.release.set()
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await manager.aclose()

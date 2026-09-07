@@ -9,7 +9,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tinkerfin import AgUiResumeRequest
-from tinkerfin_studio.api.errors import BusinessException, ConversationErrorCode
+from tinkerfin_studio.api.errors import (
+    BusinessException,
+    ConversationErrorCode,
+    ModelErrorCode,
+)
+from tinkerfin_studio.attachments.service import AttachmentService
 from tinkerfin_studio.conversation.models import (
     ConversationRunRegistration,
     ConversationThread,
@@ -22,6 +27,7 @@ from tinkerfin_studio.conversation.run_preparation import (
     ResumeChatIntent,
     StartChatIntent,
 )
+from tinkerfin_studio.models.repository import AgentModelRepository
 from tinkerfin_studio.models.schemas import AgentModelConfig
 
 
@@ -46,7 +52,10 @@ class PreparedExecution:
 class ConversationRunPreparer:
     """拥有 chat 启动前短事务，不读取 Agent 内部状态或审批 payload"""
 
-    def __init__(self, session: AsyncSession, *, user_id: int) -> None:
+    def __init__(
+        self, session: AsyncSession, *, user_id: int, attachments: AttachmentService
+    ) -> None:
+        self._attachments = attachments
         self._session = session
         self._user_id = user_id
         self._repository = ConversationRepository(session)
@@ -121,6 +130,25 @@ class ConversationRunPreparer:
         self._require_same_registration(existing, prepared=prepared, model=model)
         claimed_ids: frozenset[str] = frozenset()
         try:
+            models = AgentModelRepository(self._session, user_id=self._user_id)
+            await models.lock_owner()
+            current_model = await models.get_for_update(model.model_id)
+            if (
+                current_model is None
+                or not current_model.enabled
+                or any(
+                    (
+                        current_model.provider != model.provider,
+                        current_model.purpose != model.purpose,
+                        current_model.model_name != model.model_name,
+                        current_model.base_url != model.base_url,
+                        current_model.api_key != model.api_key.get_secret_value(),
+                        current_model.reasoning_enabled != model.reasoning_enabled,
+                        current_model.image_support != model.image_support,
+                    )
+                )
+            ):
+                raise BusinessException(ModelErrorCode.CONFIGURATION_CHANGED)
             locked = await self._repository.lock_thread(thread.id)
             if locked is None or locked.status == "deleting":
                 raise BusinessException(ConversationErrorCode.NOT_FOUND)
@@ -150,6 +178,15 @@ class ConversationRunPreparer:
             elif existing is None and thread.has_pending_interrupt:
                 raise BusinessException(ConversationErrorCode.PENDING_INTERRUPT)
 
+            if isinstance(intent, StartChatIntent):
+                ids = [attachment.id for attachment in intent.attachments]
+                await self._attachments.bind(
+                    self._session,
+                    ids,
+                    user_id=self._user_id,
+                    thread_id=thread.thread_id,
+                    message_id=prepared.message_ids[0],
+                )
             created = False
             if existing is None:
                 existing, created = await self._create_run(

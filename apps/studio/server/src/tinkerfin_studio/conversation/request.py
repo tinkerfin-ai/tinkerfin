@@ -20,6 +20,7 @@ from pydantic import (
     model_validator,
 )
 
+from tinkerfin import AgUiUserInput
 from tinkerfin_studio.api.errors import BusinessException, ConversationErrorCode
 
 MAX_USER_MESSAGE_BYTES = 256 * 1024
@@ -129,25 +130,57 @@ class ChatRequest(BaseModel):
 
     @model_validator(mode="after")
     def messages_follow_the_current_delta_contract(self) -> ChatRequest:
-        """限制为当前产品实际执行的一条文本增量或无消息恢复"""
+        """限制为一条文字及附件增量，或无消息的审批恢复"""
 
         if self.resume is not None:
             if self.messages:
                 raise ValueError("恢复运行不得同时提交新消息")
             return self
-        if len(self.messages) != 1:
-            raise ValueError("普通运行必须且只能提交一条文本 user 消息")
-        message = self.messages[0]
-        content = message.get("content")
-        if (
-            message.get("role") != "user"
-            or not isinstance(content, str)
-            or not content.strip()
-        ):
-            raise ValueError("当前普通运行只接受非空文本 user 消息")
-        if _utf8_byte_length(content) > MAX_USER_MESSAGE_BYTES:
+        if len(self.messages) != 1 or self.messages[0].get("role") != "user":
+            raise ValueError("普通运行必须且只能提交一条 user 消息")
+        content = self.messages[0].get("content")
+        if isinstance(content, str):
+            texts = [content]
+            attachment_ids: list[str] = []
+        elif isinstance(content, list):
+            texts = []
+            attachment_ids = []
+            for block in content:
+                if not isinstance(block, dict):
+                    raise ValueError("消息内容块必须是对象")  # noqa: TRY004 - Pydantic 边界需要返回校验错误
+                if block.get("type") == "text" and isinstance(block.get("text"), str):
+                    texts.append(str(block["text"]))
+                elif block.get("type") in {"image", "document"}:
+                    source = block.get("source")
+                    if not isinstance(source, dict) or source.get("type") != "url":
+                        raise ValueError("附件只能使用服务端稳定引用")
+                    value = source.get("value")
+                    if (
+                        not isinstance(value, str)
+                        or not value.startswith("attachment:")
+                        or not value.removeprefix("attachment:")
+                    ):
+                        raise ValueError("附件引用不合法")
+                    attachment_ids.append(value.removeprefix("attachment:"))
+                else:
+                    raise ValueError("消息内容类型不支持")
+        else:
+            raise ValueError("用户消息必须包含文字或附件")  # noqa: TRY004 - Pydantic 边界需要返回校验错误
+        if not any(text.strip() for text in texts) and not attachment_ids:
+            raise ValueError("用户消息必须包含文字或附件")
+        if len(attachment_ids) > 5 or len(set(attachment_ids)) != len(attachment_ids):
+            raise ValueError("最多提交 5 个不同附件")
+        if sum(_utf8_byte_length(text) for text in texts) > MAX_USER_MESSAGE_BYTES:
             raise ValueError("用户消息超过当前 UTF-8 字节上限")
         return self
+
+    @property
+    def user_input(self) -> AgUiUserInput:
+        """读取文字及附件引用；附件权限由当前用户的仓储查询确认"""
+
+        if self.resume is not None:
+            raise ValueError("恢复请求没有新的用户输入")
+        return AgUiUserInput.model_validate(self.messages[0])
 
     @classmethod
     def from_agui(cls, value: RunAgentInput) -> ChatRequest:

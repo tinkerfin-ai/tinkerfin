@@ -89,6 +89,14 @@
     --color-scroll-thumb: #e5e5e5;
     --color-scroll-thumb-hover: #d4d4d4;
 
+    --color-media-ink: var(--primitive-white);
+    --color-media-shade: rgb(0 0 0 / 76%);
+    --color-media-hover: rgb(255 255 255 / 20%);
+    --layout-image-width: 416px;
+    --layout-image-height: 344px;
+    --layout-image-min-width: 180px;
+    --layout-image-multiple-width: 280px;
+
     --space-0: 0;
     --space-0-5: 2px;
     --space-1: 4px;

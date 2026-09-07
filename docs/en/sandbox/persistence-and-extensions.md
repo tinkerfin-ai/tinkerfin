@@ -63,6 +63,12 @@ MySQL 5.7 and MySQL 8.x are supported. MariaDB is not currently in the verified 
 
 All workers in one namespace must use the same warm-pool size. The database account needs schema and data permissions during first startup.
 
+Cancellation waits for database results to be consumed and the connection to return
+to its pool. A cancellation observed before COMMIT begins rolls back the write;
+once COMMIT has been issued, State waits for its confirmed or uncertain outcome.
+This necessary settlement can extend the caller's work deadline. It does not
+serialize independent transactions or change the SQLite lock retry budget.
+
 ## Generate schema before deployment
 
 ```python

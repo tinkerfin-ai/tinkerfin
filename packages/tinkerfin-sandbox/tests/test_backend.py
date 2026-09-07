@@ -5,6 +5,7 @@ import base64
 import json
 import shlex
 import unittest
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any, cast
@@ -18,7 +19,7 @@ from opensandbox import Sandbox
 from opensandbox import SandboxManager as OpenSandboxSDKManager
 from opensandbox.config import ConnectionConfig
 from opensandbox.exceptions import SandboxApiException, SandboxInternalException
-from opensandbox.models.execd import RunCommandOpts
+from opensandbox.models.execd import ExecutionHandlers, RunCommandOpts
 from opensandbox.models.sandboxes import (
     PVC,
     PagedSandboxInfos,
@@ -37,8 +38,11 @@ from tinkerfin_sandbox import (
     OpenSandboxBackendUnavailableError,
     OpenSandboxClient,
     OpenSandboxConfig,
+    OpenSandboxFileTooLargeError,
+    OpenSandboxHandle,
     OpenSandboxInitializationError,
     OpenSandboxRuntimeInfo,
+    RootedOpenSandboxBackend,
     UnexpectedOpenSandboxBackendError,
 )
 
@@ -166,13 +170,18 @@ def _assert_scoped_sdk_connection(
     actual: ConnectionConfig,
     public: ConnectionConfig,
 ) -> None:
-    """Require an equivalent SDK config with one client-scoped transport."""
+    """Preserve caller options while applying owned-task and safe-retry defaults."""
 
     assert actual is not public
     assert actual.transport is not None
-    assert actual.model_dump(exclude={"transport"}) == public.model_dump(
-        exclude={"transport"}
-    )
+    assert actual.model_dump(
+        exclude={"transport", "retry_policy", "disable_metrics"}
+    ) == public.model_dump(exclude={"transport", "retry_policy", "disable_metrics"})
+    assert actual.disable_metrics
+    if "retry_policy" in public.model_fields_set:
+        assert actual.retry_policy == public.retry_policy
+    else:
+        assert actual.retry_policy.max_retries == 0
 
 
 class _FakeCommands:
@@ -187,7 +196,14 @@ class _FakeCommands:
         )
         self.error: Exception | None = None
 
-    async def run(self, command: str, *, opts: object | None = None) -> object:
+    async def run(
+        self,
+        command: str,
+        *,
+        opts: object | None = None,
+        handlers: ExecutionHandlers | None = None,
+    ) -> object:
+        del handlers
         self.calls.append((command, opts))
         if self.error is not None:
             raise self.error
@@ -287,7 +303,14 @@ class _FakeDescriptorCommands(_FakeCommands):
         self.status_error: Exception | None = None
         self.running = True
 
-    async def run(self, command: str, *, opts: object | None = None) -> object:
+    async def run(
+        self,
+        command: str,
+        *,
+        opts: object | None = None,
+        handlers: ExecutionHandlers | None = None,
+    ) -> object:
+        del handlers
         self.calls.append((command, opts))
         encoded_request = shlex.split(command)[-1]
         request = json.loads(base64.b64decode(encoded_request).decode("utf-8"))
@@ -352,7 +375,14 @@ class _FakeOffloadCommands(_FakeCommands):
         self.malformed = False
         self.request: dict[str, Any] | None = None
 
-    async def run(self, command: str, *, opts: object | None = None) -> object:
+    async def run(
+        self,
+        command: str,
+        *,
+        opts: object | None = None,
+        handlers: ExecutionHandlers | None = None,
+    ) -> object:
+        del handlers
         self.calls.append((command, opts))
         encoded_request = shlex.split(command)[-1]
         request = cast(
@@ -1888,7 +1918,7 @@ async def test_connect_timeout_retains_owned_transport_until_client_close(
         await asyncio.wait_for(client.connect("existing"), timeout=0.5)
 
     assert entered.is_set()
-    assert observed_configs[0].transport is transport
+    await observed_configs[0].close_transport_if_owned()
     assert transport.closed is False
     await client.aclose()
     assert transport.closed is True
@@ -1932,7 +1962,7 @@ async def test_inspect_cancellation_retains_owned_transport_until_client_close(
     with pytest.raises(asyncio.CancelledError):
         await inspection
 
-    assert observed_configs[0].transport is transport
+    await observed_configs[0].close_transport_if_owned()
     assert transport.closed is False
     await client.aclose()
     assert transport.closed is True
@@ -2414,3 +2444,234 @@ async def test_create_rejects_and_cleans_multiple_discovered_candidates(
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _BoundedResponseStream(httpx.AsyncByteStream):
+    """Expose externally observable body reads and response closure."""
+
+    def __init__(self, chunks: list[bytes], *, wait: bool = False) -> None:
+        self.chunks = chunks
+        self.wait = wait
+        self.reads = 0
+        self.closed = False
+        self.started = asyncio.Event()
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        self.started.set()
+        if self.wait:
+            await asyncio.Event().wait()
+        for chunk in self.chunks:
+            self.reads += 1
+            yield chunk
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _BoundedDownloadSandbox(_FakeSandbox):
+    def __init__(self, transport: httpx.AsyncBaseTransport) -> None:
+        super().__init__()
+        self.connection_config = ConnectionConfig(transport=transport)
+        self.commands = _FakeDescriptorCommands()
+
+    async def get_endpoint(self, port: int) -> object:
+        assert port == 44772
+        return SimpleNamespace(endpoint="execd.test", headers={"X-Endpoint": "token"})
+
+
+def _bounded_backend(
+    stream: _BoundedResponseStream,
+    *,
+    status: int = 200,
+    rooted: bool = True,
+) -> tuple[RootedOpenSandboxBackend | OpenSandboxHandle, _BoundedDownloadSandbox]:
+    def respond(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/files/download"
+        assert request.url.params["path"] == (
+            "/proc/4321/fd/9" if rooted else "/file.bin"
+        )
+        assert request.headers["X-Endpoint"] == "token"
+        assert request.headers["Accept-Encoding"] == "identity"
+        return httpx.Response(status, stream=stream)
+
+    sandbox = _BoundedDownloadSandbox(httpx.MockTransport(respond))
+    handle = OpenSandboxHandle(OpenSandboxBackend(sandbox=cast(Sandbox, sandbox)))
+    backend = RootedOpenSandboxBackend(handle) if rooted else handle
+    return backend, sandbox
+
+
+@pytest.mark.parametrize("rooted", [False, True])
+@pytest.mark.parametrize("content", [b"", b"\x00\xff\x80", b"a" * (128 * 1024)])
+async def test_bounded_binary_read_returns_complete_bytes_at_limit(
+    content: bytes, rooted: bool
+) -> None:
+    stream = _BoundedResponseStream([content])
+    backend, sandbox = _bounded_backend(stream, rooted=rooted)
+    assert await backend.aread_bytes("/file.bin", max_bytes=len(content)) == content
+    assert stream.closed
+    if rooted:
+        assert not sandbox.commands.running
+
+
+async def test_bounded_binary_read_stops_before_consuming_excess_body() -> None:
+    stream = _BoundedResponseStream([b"a" * 65536] * 100)
+    backend, sandbox = _bounded_backend(stream)
+    with pytest.raises(OpenSandboxFileTooLargeError) as captured:
+        await backend.aread_bytes("/file.bin", max_bytes=65536)
+    assert captured.value.context == {"max_bytes": 65536}
+    assert stream.reads == 2
+    assert stream.closed
+    assert not sandbox.commands.running
+
+
+@pytest.mark.parametrize("rooted", [False, True])
+async def test_bounded_binary_read_cancel_closes_response_and_helper(
+    rooted: bool,
+) -> None:
+    stream = _BoundedResponseStream([], wait=True)
+    backend, sandbox = _bounded_backend(stream, rooted=rooted)
+    task = asyncio.create_task(backend.aread_bytes("/file.bin", max_bytes=65536))
+    await stream.started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert stream.closed
+    if rooted:
+        assert not sandbox.commands.running
+
+
+async def test_bounded_binary_read_timeout_closes_response_and_helper() -> None:
+    stream = _BoundedResponseStream([], wait=True)
+    backend, sandbox = _bounded_backend(stream)
+    with pytest.raises(OpenSandboxBackendTimeoutError):
+        await backend.aread_bytes("/file.bin", max_bytes=65536, timeout=0.05)
+    assert stream.closed
+    assert not sandbox.commands.running
+
+
+@pytest.mark.parametrize("status", [403, 404, 500, 302, 206])
+async def test_bounded_binary_read_does_not_buffer_error_or_partial_responses(
+    status: int,
+) -> None:
+    stream = _BoundedResponseStream([b"a" * 65536] * 100)
+    backend, sandbox = _bounded_backend(stream, status=status)
+    expected = {403: PermissionError, 404: FileNotFoundError}.get(
+        status, OpenSandboxBackendError
+    )
+    with pytest.raises(expected):
+        await backend.aread_bytes("/file.bin", max_bytes=65536)
+    assert stream.reads == 0
+    assert stream.closed
+    assert not sandbox.commands.running
+
+
+@pytest.mark.parametrize("path", ["/../escape", "/workspace/../escape", "bad\x00name"])
+async def test_bounded_rooted_read_rejects_invalid_paths_before_io(path: str) -> None:
+    stream = _BoundedResponseStream([])
+    backend, sandbox = _bounded_backend(stream)
+    with pytest.raises(ValueError):
+        await backend.aread_bytes(path, max_bytes=1)
+    assert not sandbox.commands.calls
+    assert not stream.started.is_set()
+
+
+@pytest.mark.parametrize(
+    ("max_bytes", "timeout"),
+    [(-1, 30), (True, 30), (1, 0), (1, 291), (1, float("nan"))],
+)
+async def test_bounded_read_rejects_invalid_limits_before_io(
+    max_bytes: int, timeout: float
+) -> None:
+    stream = _BoundedResponseStream([])
+    backend, sandbox = _bounded_backend(stream)
+    with pytest.raises(ValueError):
+        await backend.aread_bytes("/file.bin", max_bytes=max_bytes, timeout=timeout)
+    assert not sandbox.commands.calls
+
+
+async def test_bounded_read_preserves_borrowed_transport() -> None:
+    class Transport(httpx.MockTransport):
+        closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    stream = _BoundedResponseStream([b"binary"])
+    transport = Transport(lambda request: httpx.Response(200, stream=stream))
+    sandbox = _BoundedDownloadSandbox(transport)
+    backend = OpenSandboxBackend(sandbox=cast(Sandbox, sandbox))
+    assert await backend.aread_bytes("/file.bin", max_bytes=6) == b"binary"
+    assert stream.closed
+    assert not transport.closed
+
+
+async def test_bounded_read_repeated_cancel_keeps_response_cleanup_owned() -> None:
+    closing = asyncio.Event()
+    release = asyncio.Event()
+
+    class SlowCloseStream(_BoundedResponseStream):
+        async def aclose(self) -> None:
+            closing.set()
+            await release.wait()
+            self.closed = True
+
+    stream = SlowCloseStream([], wait=True)
+    backend, sandbox = _bounded_backend(stream)
+    task = asyncio.create_task(backend.aread_bytes("/file.bin", max_bytes=100))
+    await stream.started.wait()
+    task.cancel()
+    await closing.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert stream.closed
+    assert not sandbox.commands.running
+
+
+async def test_bounded_read_deadline_during_response_close_awaits_cleanup() -> None:
+    closing = asyncio.Event()
+    release = asyncio.Event()
+
+    class SlowCloseStream(_BoundedResponseStream):
+        async def aclose(self) -> None:
+            closing.set()
+            await release.wait()
+            self.closed = True
+
+    stream = SlowCloseStream([b"binary"])
+    backend, sandbox = _bounded_backend(stream)
+    task = asyncio.create_task(
+        backend.aread_bytes("/file.bin", max_bytes=100, timeout=0.05)
+    )
+    await closing.wait()
+    await asyncio.sleep(0.08)
+    assert not task.done()
+    release.set()
+    with pytest.raises(OpenSandboxBackendTimeoutError):
+        await task
+    assert stream.closed
+    assert not sandbox.commands.running
+
+
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    [
+        ("not_found", FileNotFoundError),
+        ("permission_denied", PermissionError),
+        ("not_a_file", IsADirectoryError),
+        ("invalid_path", OpenSandboxBackendError),
+    ],
+)
+async def test_bounded_rooted_read_rejects_helper_confirmed_file_conditions(
+    code: str, expected: type[Exception]
+) -> None:
+    stream = _BoundedResponseStream([])
+    backend, sandbox = _bounded_backend(stream)
+    sandbox.commands.helper_error = (code, "target rejected")
+    with pytest.raises(expected):
+        await backend.aread_bytes("/file.bin", max_bytes=100)
+    assert not stream.started.is_set()
+    assert not sandbox.commands.running

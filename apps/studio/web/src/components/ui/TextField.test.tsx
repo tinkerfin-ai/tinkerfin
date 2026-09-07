@@ -21,11 +21,11 @@ describe('TextField', () => {
     expect(screen.getByRole('alert')).toHaveTextContent('邮箱格式无效')
   })
 
-  it('uses a generated id and exposes the requested size and shape', () => {
-    const { container } = render(<TextField label="搜索" fieldSize="md" shape="capsule" />)
+  it.each(['round', 'capsule', 'standard'] as const)('uses a generated id and exposes shape %s', (shape) => {
+    const { container } = render(<TextField label="搜索" fieldSize="md" shape={shape} />)
     const input = screen.getByLabelText('搜索')
     expect(input.id).not.toBe('')
-    expect(container.querySelector('.ui-text-field')).toHaveClass('ui-text-field--md', 'ui-text-field--capsule')
+    expect(container.querySelector('.ui-text-field')).toHaveClass('ui-text-field--md', `ui-text-field--${shape}`)
   })
 
   it('forwards disabled and read-only semantics and exposes loading state', () => {

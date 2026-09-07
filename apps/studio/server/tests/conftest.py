@@ -23,3 +23,12 @@ async def session(database: Database) -> AsyncIterator[AsyncSession]:
 
     async with database.session() as value:
         yield value
+
+
+@pytest_asyncio.fixture
+async def attachments(database, tmp_path):
+    """提供使用真实磁盘和业务仓储的附件服务"""
+    from tinkerfin_studio.attachments.service import AttachmentService
+    from tinkerfin_studio.attachments.storage import DiskAttachmentStorage
+
+    return AttachmentService(database, DiskAttachmentStorage(tmp_path / "attachments"))

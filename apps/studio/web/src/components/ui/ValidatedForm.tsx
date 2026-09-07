@@ -3,7 +3,7 @@ import gsap from 'gsap'
 import { useRef } from 'react'
 import type { FormHTMLAttributes } from 'react'
 
-import { MOTION_DURATION_SECONDS } from '../../../components/ui/motion'
+import { MOTION_DURATION_SECONDS } from './motion'
 
 gsap.registerPlugin(useGSAP)
 

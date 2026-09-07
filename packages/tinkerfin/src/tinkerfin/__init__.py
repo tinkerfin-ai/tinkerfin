@@ -36,6 +36,8 @@ from .errors import TinkerFinError as TinkerFinError
 from .errors import TinkerFinErrorCode as TinkerFinErrorCode
 from .errors import TinkerFinLifecycleError as TinkerFinLifecycleError
 from .errors import TinkerFinStreamProtocolError as TinkerFinStreamProtocolError
+from .media import AttachmentImage as AttachmentImage
+from .media import AttachmentSupport as AttachmentSupport
 from .native_driver import NativeStreamDriver as NativeStreamDriver
 from .native_driver import ReasoningExtractor as ReasoningExtractor
 from .plan import AgentMode as AgentMode
@@ -59,6 +61,7 @@ from .runtime_profile import DeepAgentsV2RuntimeProfile as DeepAgentsV2RuntimePr
 from .runtime_profile import DeepAgentsV3RuntimeProfile as DeepAgentsV3RuntimeProfile
 
 if TYPE_CHECKING:
+    from .agui_input import AgUiUserInput as AgUiUserInput
     from .agui_resume import AgUiResumeBinding as AgUiResumeBinding
     from .agui_resume import AgUiResumeCheckpoint as AgUiResumeCheckpoint
     from .agui_resume import (
@@ -81,8 +84,14 @@ _AGUI_RESUME_EXPORTS = frozenset(
 
 
 def __getattr__(name: str) -> object:
-    """Load AG-UI resume contracts only when their optional extra is present."""
+    """Load AG-UI input and resume contracts only when their optional extra is present."""
 
+    if name == "AgUiUserInput":
+        require_agui()
+        from .agui_input import AgUiUserInput
+
+        globals()[name] = AgUiUserInput
+        return AgUiUserInput
     if name not in _AGUI_RESUME_EXPORTS:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     require_agui()
@@ -103,7 +112,10 @@ __all__ = [
     "AgUiResumeNotSavedObserver",
     "AgUiResumeRequest",
     "AgUiSettlementTimeoutError",
+    "AgUiUserInput",
     "AgentMode",
+    "AttachmentImage",
+    "AttachmentSupport",
     "ContextKind",
     "DeepAgentAgUiResumeRuntime",
     "DeepAgentAgUiRuntime",

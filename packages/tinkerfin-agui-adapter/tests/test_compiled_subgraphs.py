@@ -7,10 +7,8 @@ import pytest
 from ag_ui.core import AssistantMessage as AgUiAssistantMessage
 from ag_ui.core import (
     BaseEvent,
-    MessagesSnapshotEvent,
     RawEvent,
     StateSnapshotEvent,
-    ToolCallResultEvent,
 )
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
@@ -20,7 +18,12 @@ from langgraph.graph.message import add_messages
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import interrupt
 
-from tinkerfin_agui_adapter import DeepAgentAgUiAdapter, RunIdentity
+from tinkerfin_agui_adapter import (
+    AttachmentMessagesSnapshotEvent,
+    AttachmentToolCallResultEvent,
+    DeepAgentAgUiAdapter,
+    RunIdentity,
+)
 from tinkerfin_agui_adapter.ids import ScopedIdCodec
 
 
@@ -286,17 +289,17 @@ async def test_child_interrupt_waits_for_root_and_merges_scoped_messages() -> No
     snapshots = [
         event
         for event in events
-        if isinstance(event, StateSnapshotEvent | MessagesSnapshotEvent)
+        if isinstance(event, StateSnapshotEvent | AttachmentMessagesSnapshotEvent)
     ]
     assert [type(event) for event in snapshots[-2:]] == [
         StateSnapshotEvent,
-        MessagesSnapshotEvent,
+        AttachmentMessagesSnapshotEvent,
     ]
     state_snapshot = snapshots[-2]
     assert isinstance(state_snapshot, StateSnapshotEvent)
     assert state_snapshot.snapshot == {"value": 1}
     message_snapshot = snapshots[-1]
-    assert isinstance(message_snapshot, MessagesSnapshotEvent)
+    assert isinstance(message_snapshot, AttachmentMessagesSnapshotEvent)
     assert len(message_snapshot.messages) == 1
     proposal = message_snapshot.messages[0]
     assert isinstance(proposal, AgUiAssistantMessage)
@@ -438,11 +441,11 @@ def test_exact_child_and_root_interrupt_replays_are_idempotent() -> None:
 
     assert [type(event) for event in first[-2:]] == [
         StateSnapshotEvent,
-        MessagesSnapshotEvent,
+        AttachmentMessagesSnapshotEvent,
     ]
     assert [type(event) for event in replay] == [
         StateSnapshotEvent,
-        MessagesSnapshotEvent,
+        AttachmentMessagesSnapshotEvent,
     ]
     assert len(adapter.main_outcome().interrupts) == 1
     assert adapter.finish() == []
@@ -506,7 +509,9 @@ def test_child_interrupt_replay_rejects_a_changed_message_snapshot_atomically() 
         }
     )
     snapshot = next(
-        event for event in root_events if isinstance(event, MessagesSnapshotEvent)
+        event
+        for event in root_events
+        if isinstance(event, AttachmentMessagesSnapshotEvent)
     )
     proposal = snapshot.messages[0]
     assert isinstance(proposal, AgUiAssistantMessage)
@@ -595,7 +600,9 @@ def test_multiple_child_snapshots_merge_in_scope_registration_order() -> None:
     )
     assert state.snapshot == {"root_state": True}
     snapshot = next(
-        event for event in root_events if isinstance(event, MessagesSnapshotEvent)
+        event
+        for event in root_events
+        if isinstance(event, AttachmentMessagesSnapshotEvent)
     )
     assert [message.content for message in snapshot.messages] == [
         "root",
@@ -634,9 +641,9 @@ def test_scoped_prior_tool_result_does_not_replay_proposal_lifecycle() -> None:
         }
     )
 
-    assert [type(event) for event in events] == [ToolCallResultEvent]
+    assert [type(event) for event in events] == [AttachmentToolCallResultEvent]
     result = events[0]
-    assert isinstance(result, ToolCallResultEvent)
+    assert isinstance(result, AttachmentToolCallResultEvent)
     assert result.tool_call_id == scoped_tool_id
 
 

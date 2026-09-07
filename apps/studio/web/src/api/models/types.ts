@@ -1,6 +1,7 @@
 export interface AgentModelCatalogItem {
   modelId: string
   displayName: string
+  imageSupport: 'supported' | 'unsupported' | 'unknown'
   reasoningEnabled: boolean
   isDefault: boolean
 }

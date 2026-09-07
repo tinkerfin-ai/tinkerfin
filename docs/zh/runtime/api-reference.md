@@ -17,13 +17,14 @@ Observation 与原生 SSE 属于基础安装。
 | `TinkerFin.create_deep_agent(...)` | 创建可重复生成 Runtime 的 Agent 定义 | 参数见[创建和运行 Deep Agent](deep-agents.md) |
 | `TinkerFin.ainvoke(identity, *, agent, input, ...)` | 通过 managed 生命周期返回最终 state | 防御性复制的根 state mapping |
 | `TinkerFin.open_run(identity, *, agent, input, ...)` | 打开一次 managed 原生运行 | 单次使用的 `NativeGraphRunStream` |
-| `TinkerFin.open_agui_run(identity, *, agent, input=... or resume=..., ...)` | 打开一次 managed AG-UI 运行 | 单次使用的 `AgUiEventStream` |
+| `TinkerFin.attachments(support)` | 配置原生 Agent 的授权附件访问 | 独立工厂；构造 Graph 时明确拒绝替换或包装过的原生构建器 |
+| `TinkerFin.open_agui_run(identity, *, agent, messages=... or input=... or resume=..., ...)` | 打开一次 managed AG-UI 运行 | 单次使用的 `AgUiEventStream` |
 | `DeepAgentDefinition.create_graph(mode=...)` | 在 managed 生命周期外复用异步 Runnable | 完整 native 或 Plan-capable `DeepAgentGraph` |
 | `RunIdentity(threadId=..., runId=...)` | 表示一次框架运行 | 只包含 thread 和 run |
 
 `agent` 可以是已有 Definition，也可以是返回 Definition 的同步或异步 callable。Managed 门面
 负责 Definition 解析、异步 Graph 构造、身份绑定、Observation、协调、setup 失败转换、取消与
-清理。`open_agui_run()` 要求 `input` 与 `resume` 严格二选一。
+清理。`open_agui_run()` 要求 `messages`、`input` 与 `resume` 严格三选一。
 
 ## 高级集成入口
 
@@ -214,11 +215,16 @@ Agent 终态在 Observer 广播前已经选定。某个 Observer 在终态广播
 
 `TinkerFin.open_agui_run(...)` 是普通入口：
 
+普通聊天使用 `messages`，框架在创建 Agent 前校验正式消息 ID 并转换内容。
+`AgUiUserInput` 可在消息分配 ID 前读取文字和附件引用，并通过 `with_attachments`
+替换为宿主已授权的附件描述。存储、权限和 ID 分配由宿主负责；已有 checkpoint
+保存历史时，仅提交本次新增的用户消息。
+
 | 参数 | 默认值 | 作用 |
 | --- | --- | --- |
 | `identity` | 必填 | canonical thread 与 run 身份 |
 | `agent` | 必填 | Definition，或返回 Definition 的同步/异步 callable |
-| `input` / `resume` | 严格二选一 | 普通 Graph 输入或只含客户端决定的 `AgUiResumeRequest` |
+| `messages` / `input` / `resume` | 严格三选一 | 带正式 ID 的标准 AG-UI 用户消息、高级 Graph 输入或只含客户端决定的 `AgUiResumeRequest` |
 | `parent_run_id` | `None` | `RUN_STARTED` 暴露的可选 checkpoint 谱系 |
 | `mode` | Definition 默认值 | 原生 default 或 Plan 路径 |
 | `config` / `context` | `None` | Graph 配置与声明的 Runtime context |

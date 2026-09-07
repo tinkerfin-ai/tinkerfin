@@ -50,3 +50,6 @@ def setup_logging(settings: LoggingSettings | None = None) -> None:
         handlers=handlers,
         force=True,
     )
+
+    # 第三方请求日志可能包含临时图片签名地址，应用不输出其 URL 级别日志
+    logging.getLogger("httpx").setLevel(logging.WARNING)

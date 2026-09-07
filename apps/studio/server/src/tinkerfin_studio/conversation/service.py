@@ -6,7 +6,6 @@ from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 
 from ag_ui.core import BaseEvent
-from langchain.agents.middleware.types import InputAgentState
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tinkerfin import AgUiResumeCheckpoint, RunIdentity
@@ -22,8 +21,10 @@ from tinkerfin_messaging.errors import (
 )
 from tinkerfin_studio.agent.factory import ConversationAgentFactory
 from tinkerfin_studio.api.errors import (
+    AttachmentErrorCode,
     BusinessException,
     ConversationErrorCode,
+    ModelErrorCode,
     SystemException,
 )
 from tinkerfin_studio.auth.types import UserContext
@@ -33,7 +34,6 @@ from tinkerfin_studio.conversation.run_preparation import (
     PreparedRunRequest,
     ResumeChatIntent,
     StartChatIntent,
-    bind_start_graph_input,
     classify_intent,
     conversation_identity,
     decorate_main_event,
@@ -186,20 +186,25 @@ class ConversationChatService:
         """完成业务校验、Agent 事件源准备和 Messaging 预握手"""
 
         after = parse_last_event_id(last_event_id)
+        model = await AgentModelService(
+            AgentModelRepository(self._session, user_id=self._user.user_id)
+        ).resolve(request.forwarded_props.model)
+        request = await self._resolve_attachments(request, model)
         intent = classify_intent(request)
-        model = await AgentModelService(AgentModelRepository(self._session)).resolve(
-            request.forwarded_props.model
-        )
         run_preparer, prepared, execution = await self._prepare_execution(
             request,
             intent=intent,
             model=model,
         )
+        image_model = await AgentModelService(
+            AgentModelRepository(self._session, user_id=self._user.user_id)
+        ).resolve_image_model()
         events = self._create_events(
             intent=intent,
             execution=execution,
             prepared=prepared,
             model=model,
+            image_model=image_model,
         )
         body = await self._start_delivery(
             events,
@@ -209,6 +214,33 @@ class ConversationChatService:
             run_preparer=run_preparer,
         )
         return PreparedChat(body=body, thread_id=execution.thread.thread_id)
+
+    async def _resolve_attachments(
+        self, request: ChatRequest, model: AgentModelConfig
+    ) -> ChatRequest:
+        """以仓储信息替换客户端附件描述，检查模型能力和文件总量"""
+        if not request.messages:
+            return request
+        submission = request.user_input
+        attachments = []
+        total = 0
+        for attachment_id in submission.attachment_ids:
+            attachment = await self._resources.attachments.get(
+                attachment_id,
+                user_id=self._user.user_id,
+                thread_id=request.thread_id or None,
+            )
+            if attachment.kind == "image" and model.image_support != "supported":
+                raise BusinessException(ModelErrorCode.IMAGE_UNSUPPORTED)
+            total += attachment.size_bytes
+            attachments.append(attachment)
+        if total > 25 * 1024 * 1024:
+            raise BusinessException(AttachmentErrorCode.TOO_LARGE)
+        payload = request.model_dump()
+        payload["messages"] = [
+            submission.with_attachments(attachments).model_dump(mode="json")
+        ]
+        return ChatRequest.model_validate(payload)
 
     async def _prepare_execution(
         self,
@@ -222,6 +254,7 @@ class ConversationChatService:
         run_preparer = ConversationRunPreparer(
             self._session,
             user_id=self._user.user_id,
+            attachments=self._resources.attachments,
         )
         resolved_thread = await run_preparer.resolve_thread(
             request,
@@ -296,21 +329,26 @@ class ConversationChatService:
         execution: PreparedExecution,
         prepared: PreparedRunRequest,
         model: AgentModelConfig,
+        image_model: AgentModelConfig | None,
     ) -> ProfiledMessageSource[BaseEvent, BaseEvent]:
         """创建仅由 Messaging owner 打开的统一 AG-UI 事件源"""
 
-        graph_input: InputAgentState | None
         resume_request = None
         if isinstance(intent, StartChatIntent):
-            graph_input = bind_start_graph_input(intent, prepared)
+            messages = prepared.messages
         else:
             if execution.resume is None:
                 raise RuntimeError("恢复请求缺少 AgUiResumeRequest")
-            graph_input = None
+            messages = None
             resume_request = execution.resume
         tinkerfin = self._resources.tinkerfin
         factory = ConversationAgentFactory(
             persistence=self._resources.agent_persistence,
+            model_http_client=self._resources.model_http_client,
+            model_allowed_origins=self._resources.settings.model_allowed_origins,
+            attachments=self._resources.attachments,
+            thread_id=execution.thread.thread_id,
+            image_model=image_model,
             sandbox_manager=self._resources.sandbox_manager,
             tavily_api_key=(
                 None
@@ -348,7 +386,7 @@ class ConversationChatService:
             return await tinkerfin.open_agui_run(
                 identity,
                 agent=create_agent,
-                input=graph_input,
+                messages=messages,
                 resume=resume_request,
                 parent_run_id=prepared.parent_run_id,
                 mode=prepared.mode,

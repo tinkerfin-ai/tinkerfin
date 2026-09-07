@@ -30,8 +30,15 @@ from deepagents.backends.protocol import (
 )
 from deepagents.backends.sandbox import BaseSandbox
 
-from ..errors import OpenSandboxHandleClosedError, OpenSandboxHandleOwnershipError
+from ..errors import (
+    OpenSandboxBusyError,
+    OpenSandboxHandleClosedError,
+    OpenSandboxHandleOwnershipError,
+    OpenSandboxLifecycleUncertainError,
+    OpenSandboxPausedError,
+)
 from ..models import OpenSandboxRuntimeInfo
+from ._operations import RemoteOperations
 from ._rooted_protocol import _build_rooted_command, _parse_rooted_response
 from .sdk import OpenSandboxBackend
 
@@ -65,6 +72,8 @@ class OpenSandboxHandle(BaseSandbox):
             list[tuple[asyncio.AbstractEventLoop, asyncio.Future[None]]],
         ] = {}
         self._closed = False
+        self._blocked_reason: str | None = None
+        self._remote_operations: dict[int, tuple[str, RemoteOperations]] = {}
 
     @property
     def id(self) -> str:
@@ -100,7 +109,20 @@ class OpenSandboxHandle(BaseSandbox):
         """Lease a backend without performing remote I/O during registration."""
         backend = self._acquire_backend()
         try:
-            yield backend
+            with self._condition:
+                entry = self._remote_operations.get(id(backend))
+                if entry is None:
+                    # Native SDK initialization can leave remote work before this
+                    # handle exists. Preserve that same execution ownership.
+                    operations = (
+                        backend._remote_operations
+                        if isinstance(backend, OpenSandboxBackend)
+                        else RemoteOperations()
+                    )
+                    entry = (backend.id, operations)
+                    self._remote_operations[id(backend)] = entry
+            with entry[1].activate():
+                yield backend
         finally:
             self._release_backend(backend)
 
@@ -109,10 +131,53 @@ class OpenSandboxHandle(BaseSandbox):
         with self._condition:
             if self._closed:
                 raise OpenSandboxHandleClosedError("OpenSandbox handle is closed")
+            if self._blocked_reason == "paused":
+                raise OpenSandboxPausedError(
+                    "Sandbox is paused; call resume before using it"
+                )
+            if self._blocked_reason in {"pausing", "resuming", "uncertain"}:
+                raise OpenSandboxLifecycleUncertainError(
+                    "Sandbox lifecycle transition is not yet confirmed"
+                )
+            if self._blocked_reason is not None:
+                raise OpenSandboxBusyError(
+                    "Sandbox is not accepting operations during lifecycle coordination"
+                )
             backend = self._backend
             backend_key = id(backend)
             self._active_calls[backend_key] = self._active_calls.get(backend_key, 0) + 1
             return backend
+
+    def _suspend_calls(self, reason: str) -> None:
+        """Close local admission before acknowledging a shared pause request."""
+        with self._condition:
+            self._blocked_reason = reason
+
+    def _allow_calls(self) -> None:
+        """Reopen local admission only after authoritative lifecycle coordination."""
+        with self._condition:
+            self._blocked_reason = None
+
+    def _accepts_calls(self) -> bool:
+        """Report local readiness without issuing a data-plane operation."""
+        with self._condition:
+            return not self._closed and self._blocked_reason is None
+
+    def _is_idle(self) -> bool:
+        """Require local completion and confirmed remote settlement before pause."""
+        with self._condition:
+            if self._active_calls:
+                return False
+            if (
+                isinstance(self._backend, OpenSandboxBackend)
+                and not self._backend._remote_operations.is_idle
+            ):
+                return False
+            return all(
+                operations.is_idle
+                for remote_id, operations in self._remote_operations.values()
+                if remote_id == self._backend.id
+            )
 
     def _release_backend(self, backend: OpenSandboxBackend) -> None:
         """Decrement a lease count and wake thread and event-loop waiters."""
@@ -168,11 +233,19 @@ class OpenSandboxHandle(BaseSandbox):
         backend_key = id(backend)
         entry = (loop, waiter)
         with self._condition:
-            if not self._active_calls.get(backend_key, 0):
-                return
-            self._idle_waiters.setdefault(backend_key, []).append(entry)
+            active = bool(self._active_calls.get(backend_key, 0))
+            if active:
+                self._idle_waiters.setdefault(backend_key, []).append(entry)
         try:
-            await waiter
+            if active:
+                await waiter
+            operations = self._remote_operations.get(backend_key)
+            if operations is not None:
+                await operations[1].wait()
+                if backend is not self._backend and operations[1].is_idle:
+                    self._remote_operations.pop(backend_key, None)
+            elif isinstance(backend, OpenSandboxBackend):
+                await backend._remote_operations.wait()
         except BaseException:
             with self._condition:
                 waiters = self._idle_waiters.get(backend_key)
@@ -652,6 +725,30 @@ class OpenSandboxHandle(BaseSandbox):
         """
         with self._lease() as backend:
             return backend.download_files(paths)
+
+    async def aread_bytes(
+        self, path: str, *, max_bytes: int, timeout: float = 30
+    ) -> bytes:
+        """Read a complete binary file under a stable backend lease.
+
+        Args:
+            path: Absolute Sandbox path; use a rooted view for workspace confinement.
+            max_bytes: Maximum accepted file size in bytes.
+            timeout: Read deadline in seconds, greater than zero and at most 290.
+
+        Returns:
+            Complete bytes, never a partial result.
+
+        Raises:
+            ValueError: The path or limits are invalid.
+            OpenSandboxFileTooLargeError: The file exceeds the byte limit.
+            OpenSandboxBackendError: The read failed or timed out.
+            OSError: The file was not found or access was denied.
+
+        Cancellation closes the response before releasing this lease.
+        """
+        async with self._alease() as backend:
+            return await backend.aread_bytes(path, max_bytes=max_bytes, timeout=timeout)
 
     async def adownload_files(
         self,

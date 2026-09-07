@@ -50,8 +50,8 @@ _REDIS_STACK_IMAGE = (
     "798ab84d9f266936b034ab11c4d04a2b8e4b441884c5aa7d17ac951eefdf742a"
 )
 _OPENSANDBOX_SERVER_IMAGE = (
-    "opensandbox/server:v0.2.2@sha256:"
-    "8f8762af7565ed9c6f9dbcf009dd56727aa1fef8ce58a17f2b007b88cfe542bb"
+    "opensandbox/server:v0.2.3@sha256:"
+    "ae8dfbb277f40a39ff01ef35e5e1c10675acfe0fa9db15259b8f323e5efab778"
 )
 _DIND_IMAGE = (
     "docker:28.3.3-dind@sha256:"
@@ -417,7 +417,7 @@ pids_limit = 4096
 mode = "direct"
 
 [egress]
-image = "opensandbox/egress:v1.1.6"
+image = "opensandbox/egress:v1.1.7"
 mode = "dns"
 """
 

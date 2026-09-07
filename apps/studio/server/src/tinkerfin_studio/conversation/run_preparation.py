@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import cast
 from uuid import NAMESPACE_URL, uuid5
 
 from ag_ui.core import (
@@ -11,12 +12,11 @@ from ag_ui.core import (
     RunStartedEvent,
 )
 from ag_ui.core.types import ResumeEntry
-from langchain.agents.middleware.types import InputAgentState
-from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
 from pydantic import JsonValue
 
 from tinkerfin import AgentMode, RunIdentity
+from tinkerfin_contracts.media import Attachment
 from tinkerfin_studio.api.errors import BusinessException, ConversationErrorCode
 from tinkerfin_studio.conversation.request import ChatRequest
 
@@ -29,9 +29,9 @@ def conversation_identity(thread_id: str, run_id: str) -> RunIdentity:
 
 @dataclass(frozen=True, slots=True)
 class StartChatIntent:
-    """一次普通用户输入及其 Agent 消息"""
+    """一次普通提问的会话标题与已授权附件"""
 
-    graph_message: HumanMessage
+    attachments: tuple[Attachment, ...]
     title: str
 
 
@@ -50,6 +50,7 @@ class PreparedRunRequest:
     """数据库、Messaging、Agent 与主开始事件共用的权威请求事实"""
 
     input_json: dict[str, JsonValue]
+    messages: tuple[dict[str, JsonValue], ...]
     identity: RunIdentity
     parent_run_id: str | None
     graph_config: RunnableConfig
@@ -76,12 +77,10 @@ def classify_intent(request: ChatRequest) -> ChatIntent:
             raise BusinessException(ConversationErrorCode.RESUME_REQUIRED)
         return ResumeChatIntent(entries=tuple(request.resume))
 
-    content = request.messages[0].get("content")
-    if not isinstance(content, str) or not content.strip():
-        raise RuntimeError("ChatRequest 丢失已验证的单条文本消息")
+    submission = request.user_input
     return StartChatIntent(
-        graph_message=HumanMessage(content=content),
-        title=content.strip()[:60],
+        attachments=submission.attachments,
+        title=submission.text.strip()[:60] or "附件提问",
     )
 
 
@@ -118,22 +117,13 @@ def prepare_run_request(
     }
     return PreparedRunRequest(
         input_json=input_json,
+        messages=tuple(cast(list[dict[str, JsonValue]], input_json["messages"])),
         identity=identity,
         parent_run_id=request.parent_run_id,
         graph_config=graph_config,
         message_ids=message_ids,
         mode=request.forwarded_props.agent_mode,
     )
-
-
-def bind_start_graph_input(
-    intent: StartChatIntent,
-    prepared: PreparedRunRequest,
-) -> InputAgentState:
-    """为本次选中的用户消息绑定服务端权威消息 ID"""
-
-    message = intent.graph_message.model_copy(update={"id": prepared.message_ids[0]})
-    return InputAgentState(messages=[message])
 
 
 def decorate_main_event(
@@ -164,7 +154,6 @@ __all__ = [
     "RegisteredRun",
     "ResumeChatIntent",
     "StartChatIntent",
-    "bind_start_graph_input",
     "classify_intent",
     "conversation_identity",
     "decorate_main_event",

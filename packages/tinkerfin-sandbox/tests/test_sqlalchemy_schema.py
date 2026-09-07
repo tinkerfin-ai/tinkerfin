@@ -17,7 +17,9 @@ import tinkerfin_sandbox
 from tinkerfin_sandbox.lifecycle import sqlalchemy as sqlalchemy_lifecycle
 
 _TABLE_NAMES = (
+    "tinkerfin_opensandbox_availability",
     "tinkerfin_opensandbox_cleanup",
+    "tinkerfin_opensandbox_holders",
     "tinkerfin_opensandbox_owners",
     "tinkerfin_opensandbox_warm_slots",
     "tinkerfin_opensandbox_workers",
@@ -25,6 +27,7 @@ _TABLE_NAMES = (
 
 _INDEX_NAMES = (
     "ix_tinkerfin_opensandbox_cleanup_lease",
+    "ix_tinkerfin_opensandbox_holders_binding",
     "ix_tinkerfin_opensandbox_owners_lease",
     "ix_tinkerfin_opensandbox_warm_slots_available",
     "ix_tinkerfin_opensandbox_workers_lease",
@@ -83,11 +86,11 @@ def test_public_schema_descriptor_is_frozen_and_stable() -> None:
     [
         (
             "mysql",
-            "b1f087c300aee2ac9a9d20aa69f2873bcf1242e28e2ad7cc7366d8b3c09cd086",
+            "7c6aab57a572efdcbd19384063d90ee77f9b76aca82c254ba03f7b8b5f67e43f",
         ),
         (
             "sqlite",
-            "c1e0868f9ce6f99f4955be2e23af09e31a37c082b87899e9ca986b3a3b1b06b7",
+            "a892b592c861102a82a6ff0de1ccdbd93005b2cc5df55a805eefed6873bfe400",
         ),
     ],
 )
@@ -173,15 +176,17 @@ def test_schema_ddl_has_complete_deterministic_statement_order(
     statements = tuple(statement.strip() for statement in schema.ddl.split(";\n\n"))
 
     assert schema.ddl.endswith(";\n")
-    assert len(statements) == 8
-    assert tuple(statement.split("\n", 1)[0] for statement in statements[:4]) == (
+    assert len(statements) == 11
+    assert tuple(statement.split("\n", 1)[0] for statement in statements[:6]) == (
+        "CREATE TABLE tinkerfin_opensandbox_availability (",
         "CREATE TABLE tinkerfin_opensandbox_cleanup (",
+        "CREATE TABLE tinkerfin_opensandbox_holders (",
         "CREATE TABLE tinkerfin_opensandbox_owners (",
         "CREATE TABLE tinkerfin_opensandbox_warm_slots (",
         "CREATE TABLE tinkerfin_opensandbox_workers (",
     )
     assert (
-        tuple(statement.split(" ", 3)[2] for statement in statements[4:])
+        tuple(statement.split(" ", 3)[2] for statement in statements[6:])
         == _INDEX_NAMES
     )
     assert "tinkerfin_opensandbox_schema_versions" not in schema.ddl
@@ -190,8 +195,8 @@ def test_schema_ddl_has_complete_deterministic_statement_order(
 def test_mysql_ddl_uses_only_the_common_mysql_57_contract() -> None:
     ddl = tinkerfin_sandbox.get_sqlalchemy_opensandbox_state_schema(dialect="mysql").ddl
 
-    assert ddl.count(" COMMENT ") == 28
-    assert ddl.count(")COMMENT='") == 4
+    assert ddl.count(" COMMENT ") == 41
+    assert ddl.count(")COMMENT='") == 6
     assert "schema version" not in ddl
     assert "COMMENT 'UTC expiry of the current cleanup lease'" in ddl
     assert "IF NOT EXISTS" not in ddl

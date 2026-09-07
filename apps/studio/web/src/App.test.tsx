@@ -58,7 +58,7 @@ const MODEL_CATALOG: AgentModelCatalog = {
   items: [{
     modelId: 'main',
     displayName: 'Main Model',
-    reasoningEnabled: false,
+    reasoningEnabled: false, imageSupport: 'unknown',
     isDefault: true,
   }],
   defaultModelId: 'main',

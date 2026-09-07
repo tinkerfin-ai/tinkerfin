@@ -611,6 +611,7 @@
 
   .ui-text-field--md .ui-text-field__control { min-height: var(--control-md); }
   .ui-text-field--lg .ui-text-field__control { min-height: var(--control-lg); }
+  .ui-text-field--standard .ui-text-field__control { border-radius: var(--radius-md); }
   .ui-text-field--capsule .ui-text-field__control { border-radius: var(--radius-3xl); }
 
   .ui-text-field__control:focus-within,

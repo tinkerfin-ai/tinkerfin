@@ -161,6 +161,7 @@ async def test_auth_user_and_model_routes_keep_the_public_contract() -> None:
                 "modelId": "main",
                 "displayName": "Main Model",
                 "reasoningEnabled": True,
+                "imageSupport": "unknown",
                 "isDefault": True,
             }
         ],

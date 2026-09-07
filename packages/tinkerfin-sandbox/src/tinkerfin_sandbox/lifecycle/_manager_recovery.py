@@ -70,6 +70,7 @@ async def _connect_existing(
     owner_key: str,
     sandbox_id: str,
     handle: OpenSandboxHandle | None,
+    claim: OpenSandboxOwnerClaim,
 ) -> OpenSandboxHandle:
     """Publish a verified local connection without ever deleting a remote instance."""
     backend = await self._client.connect(sandbox_id)
@@ -93,6 +94,9 @@ async def _connect_existing(
     if old_backend is not None and old_backend is not backend:
         cleanup = asyncio.create_task(self._close_replaced_backend(handle, old_backend))
         self._track_cleanup_task(cleanup)
+    # The handle owns the new connection; old cleanup must survive a failed
+    # holder-registration response or cancellation.
+    await self._availability.register(owner_key, claim, handle)
     return handle
 
 
@@ -120,6 +124,9 @@ async def recover_binding(
     connecting = False
     uncertain_connection = False
     deadline = asyncio.get_running_loop().time() + policy.timeout
+    inherited_deadline = _connection_deadline.get()
+    if inherited_deadline is not None:
+        deadline = min(deadline, inherited_deadline)
     deadline_token = _connection_deadline.set(deadline)
     try:
         async with asyncio.timeout_at(deadline):
@@ -131,13 +138,18 @@ async def recover_binding(
                         and handle is not None
                         and not handle.is_closed
                         and handle.id == sandbox_id
+                        and handle._accepts_calls()
                     ):
                         await _check_health(self, handle)
                     else:
+                        # A running binding may retain a closed local gate after
+                        # failed registration or resume refresh. Reconnect that
+                        # same instance; the gate is not a remote health failure
+                        # and must never select recreation as its recovery action.
                         self._notifications.recovery_started(owner_key, sandbox_id)
                         connecting = True
                         handle = await _connect_existing(
-                            self, owner_key, sandbox_id, handle
+                            self, owner_key, sandbox_id, handle, claim
                         )
                         connecting = False
                     reason = None

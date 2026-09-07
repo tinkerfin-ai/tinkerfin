@@ -1,4 +1,7 @@
 import { describe, expect, it } from 'vitest'
+import mediaFixture from './contracts/message-attachments.fixture.json'
+import { parseConversationAgUiEvent } from '../../../api/conversation/eventParser'
+import { messageAttachments, messageText } from '../attachments/content'
 
 import type { ConversationAgUiEvent, InterruptEvent } from '../../../api/conversation/types'
 import { buildEmptyConversation } from '../../../lib/workspace'
@@ -14,6 +17,80 @@ import {
 
 const THREAD_ID = 'thread-order-check'
 const RUN_ID = 'run-order-check'
+
+it('真实工具输出在流式文字之后仍保留图片，快照可以替换附件', () => {
+  const events = mediaFixture.events.map(parseConversationAgUiEvent)
+  let conversation = events.reduce(applyConversationEvent, buildEmptyConversation({ now: "2026-09-07T00:00:00Z" }))
+  const assistant = conversation.messages.find(message => message.role === 'assistant')
+  expect(assistant?.content).toBe('Generated chart')
+  expect(assistant?.attachments).toEqual([mediaFixture.attachment])
+  expect(conversation.messages.find(message => message.role === 'tool')?.attachments).toEqual([mediaFixture.attachment])
+  expect(messageAttachments(mediaFixture.toolContent)).toEqual([mediaFixture.attachment])
+  expect(messageText(mediaFixture.toolContent)).toBe('')
+  expect(assistant).toBeDefined()
+  conversation = applyConversationEvent(conversation, {
+    type: 'MESSAGES_SNAPSHOT',
+    messages: [{ id: assistant!.id, role: 'assistant', content: 'Generated chart', attachments: [] }],
+  })
+  expect(conversation.messages.find(message => message.id === assistant!.id)?.attachments).toEqual([])
+})
+
+it('框架生成的历史快照保留工具和助手附件描述', () => {
+  const initial = buildEmptyConversation({ now: '2026-09-07T00:00:00Z' })
+  const live = mediaFixture.events.map(parseConversationAgUiEvent).reduce(applyConversationEvent, initial)
+  const snapshots = mediaFixture.snapshots.map(parseConversationAgUiEvent)
+  const replay = snapshots.reduce(applyConversationEvent, initial)
+  for (const role of ['assistant', 'tool']) {
+    const liveMessage = live.messages.find(message => message.role === role)
+    const replayMessage = replay.messages.find(message => message.role === role)
+    expect(replayMessage?.id).toEqual(liveMessage?.id)
+    expect(replayMessage?.attachments).toEqual([mediaFixture.attachment])
+    if (role === 'tool') expect(replayMessage?.meta?.result).toEqual(liveMessage?.meta?.result)
+    else expect(replayMessage?.content).toEqual(liveMessage?.content)
+  }
+})
+
+it('工具快照按工具调用 ID 替换附件并保留已有卡片的状态和来源', () => {
+  const initial = buildEmptyConversation({ now: '2026-09-07T00:00:00Z' })
+  const live = mediaFixture.events.map(parseConversationAgUiEvent).reduce(applyConversationEvent, initial)
+  const tool = live.messages.find(message => message.role === 'tool')!
+  const snapshot = structuredClone(mediaFixture.snapshots[0])
+  const toolSnapshot = snapshot.messages.find(message => message.role === 'tool')!
+  expect(toolSnapshot.id).not.toBe(tool.id)
+  toolSnapshot.attachments = []
+  const event = parseConversationAgUiEvent(snapshot)
+  const replay = applyConversationEvent(applyConversationEvent(live, event), event)
+  const updated = replay.messages.find(message => message.id === tool.id)!
+  expect(updated.attachments).toEqual([])
+  expect(updated.meta).toEqual(tool.meta)
+  expect(updated.content).toEqual(tool.content)
+  expect(replay.messages.length).toBe(live.messages.length)
+})
+
+it('工具快照必须提供稳定工具调用 ID 和合法附件', () => {
+  for (const patch of [{ toolCallId: undefined }, { toolCallId: '' }, { attachments: [{}] }]) {
+    const snapshot = structuredClone(mediaFixture.snapshots[0])
+    const tool = snapshot.messages.find(message => message.role === 'tool')!
+    Object.assign(tool, patch)
+    expect(() => parseConversationAgUiEvent(snapshot)).toThrow()
+  }
+})
+
+it('子智能体图片留在对应卡片中，重复附件事件不会复制图片', () => {
+  const events = nativeContractEvents()
+  let conversation = events.slice(0, 8).reduce(applyConversationEvent, buildEmptyConversation({ now: "2026-09-07T00:00:00Z" }))
+  const subagent = conversation.messages.find(message => message.role === 'subagent')
+  const sourceEvent = events.find(event => event.type === 'TOOL_CALL_START' && event.toolCallId === 'call-read')
+  if (sourceEvent?.type !== 'TOOL_CALL_START' || !subagent) throw new Error('缺少子智能体场景')
+  const event: ConversationAgUiEvent = {
+    type: 'CUSTOM', name: 'tinkerfin.message.attachments',
+    value: { messageId: 'child-picture', attachments: [mediaFixture.attachment] },
+    rawEvent: sourceEvent.rawEvent,
+  }
+  conversation = applyConversationEvent(applyConversationEvent(conversation, event), event)
+  expect(conversation.messages.find(message => message.id === subagent.id)?.attachments).toEqual([mediaFixture.attachment])
+  expect(conversation.messages.some(message => message.id === 'child-picture')).toBe(false)
+})
 
 function nativeContractEvents(): ConversationAgUiEvent[] {
   const subRunId = 'subagent-11111111-1111-5111-8111-111111111111'

@@ -32,8 +32,8 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Literal, cast
 
 from ag_ui.core import (
-    AssistantMessage,
     BaseEvent,
+    CustomEvent,
     ReasoningEndEvent,
     ReasoningMessageContentEvent,
     ReasoningMessageEndEvent,
@@ -45,12 +45,10 @@ from ag_ui.core import (
     ToolCall,
     ToolCallArgsEvent,
     ToolCallEndEvent,
-    ToolCallResultEvent,
     ToolCallStartEvent,
     UserMessage,
 )
 from ag_ui.core import SystemMessage as AgUiSystemMessage
-from ag_ui.core import ToolMessage as AgUiToolMessage
 from ag_ui.core.types import FunctionCall, Message
 from langchain_core.messages import (
     AIMessage,
@@ -63,6 +61,7 @@ from langchain_core.messages import (
 )
 from pydantic import JsonValue
 
+from tinkerfin_contracts.media import Attachment, attachment_from_block
 from tinkerfin_native_stream import NativeMessageStreamPart as MessageStreamPart
 from tinkerfin_native_stream import NativeStreamMode as StreamMode
 
@@ -74,6 +73,12 @@ from ._adapter_contracts import (
     JsonPatchOperation,
     ToolResultFingerprint,
     _to_json_value,
+)
+from .media import MessageAttachments, content_attachments, user_content_to_agui
+from .media_events import (
+    AttachmentAssistantMessage,
+    AttachmentToolCallResultEvent,
+    AttachmentToolMessage,
 )
 from .reasoning import (
     json_values_equal,
@@ -152,6 +157,8 @@ def _normalize_tool_content(content: object) -> str:
     if isinstance(content, list):
         parts: list[str] = []
         for block in cast(list[object], content):
+            if attachment_from_block(block) is not None:
+                continue
             if isinstance(block, str):
                 parts.append(block)
             elif (
@@ -177,6 +184,16 @@ def _visible_ai_content(message: AIMessage) -> str:
     unwrapped merely because their ``type`` resembles provider reasoning.
     """
 
+    if isinstance(message.content, list) and content_attachments(message.content):
+        message = message.model_copy(
+            update={
+                "content": [
+                    block
+                    for block in message.content
+                    if attachment_from_block(block) is None
+                ]
+            }
+        )
     if isinstance(message.content, list):
         has_non_text_block = any(
             not (
@@ -298,6 +315,7 @@ def _process_ai_chunk(
 
     events: list[BaseEvent] = []
     visible_content = _visible_ai_content(chunk)
+    attachments = content_attachments(chunk.content)
     reasoning_events = self._convert_reasoning_events(
         chunk,
         source,
@@ -305,7 +323,12 @@ def _process_ai_chunk(
     )
     # An empty final frame is a provider-declared hard boundary. Only an empty
     # non-final frame is a heartbeat that leaves active lifecycles unchanged.
-    if not visible_content and not chunk.tool_call_chunks and not reasoning_events:
+    if (
+        not visible_content
+        and not attachments
+        and not chunk.tool_call_chunks
+        and not reasoning_events
+    ):
         if chunk.chunk_position == "last":
             events.extend(self._close_tools(source.namespace, raw_event))
             events.extend(self._close_reasoning(source.namespace, raw_event))
@@ -350,6 +373,30 @@ def _process_ai_chunk(
             TextMessageContentEvent(
                 message_id=message_id,
                 delta=text,
+                raw_event=raw_event,
+            )
+        )
+
+    if attachments:
+        message_id = self._message_id(source.namespace, self._stable_message_id(chunk))
+        events.extend(self._close_reasoning(source.namespace, raw_event))
+        if self._active_messages.get(source.namespace) != message_id:
+            events.extend(self._close_message(source.namespace, raw_event))
+            self._active_messages[source.namespace] = message_id
+            events.append(
+                TextMessageStartEvent(
+                    message_id=message_id,
+                    role="assistant",
+                    name=source.agent_name,
+                    raw_event=raw_event,
+                )
+            )
+        events.append(
+            CustomEvent(
+                name="tinkerfin.message.attachments",
+                value=MessageAttachments.model_validate(
+                    {"messageId": message_id, "attachments": attachments}
+                ).model_dump(mode="json", by_alias=True),
                 raw_event=raw_event,
             )
         )
@@ -488,7 +535,11 @@ def _process_tool_result(
     fingerprint = ToolResultFingerprint(
         message_id=message_id,
         tool_name=effective_tool_name,
-        content=normalized_content,
+        content=json.dumps(
+            [normalized_content, content_attachments(message.content)],
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
         status=message.status,
     )
     previous = self._result_fingerprints.get(tool_call_id)
@@ -530,12 +581,16 @@ def _process_tool_result(
     self._result_fingerprints[tool_call_id] = fingerprint
     self._prior_tool_call_ids.discard(tool_call_id)
     events.append(
-        ToolCallResultEvent(
+        AttachmentToolCallResultEvent(
             message_id=message_id,
             tool_call_id=tool_call_id,
             content=normalized_content,
             role="tool",
             raw_event=raw_event,
+            attachments=[
+                Attachment.model_validate(item)
+                for item in content_attachments(message.content)
+            ],
         )
     )
     return events
@@ -905,10 +960,12 @@ def _convert_messages(
         message_id = self._message_id(namespace, raw_message_id)
         if isinstance(message, HumanMessage):
             converted.append(
-                UserMessage(
-                    id=message_id,
-                    content=_normalize_tool_content(message.content),
-                    name=message.name,
+                UserMessage.model_validate(
+                    {
+                        "id": message_id,
+                        "content": user_content_to_agui(message.content),
+                        "name": message.name,
+                    }
                 )
             )
             continue
@@ -923,13 +980,23 @@ def _convert_messages(
             continue
         if isinstance(message, ToolMessage):
             converted.append(
-                AgUiToolMessage(
+                AttachmentToolMessage(
                     id=message_id,
                     content=_normalize_tool_content(message.content),
+                    error=(
+                        _normalize_tool_content(message.content)
+                        or "Tool execution failed"
+                        if message.status == "error"
+                        else None
+                    ),
                     tool_call_id=self._tool_call_id(
                         namespace,
                         str(message.tool_call_id),
                     ),
+                    attachments=[
+                        Attachment.model_validate(item)
+                        for item in content_attachments(message.content)
+                    ],
                 )
             )
             continue
@@ -965,10 +1032,11 @@ def _convert_messages(
             if not isinstance(public_metadata, dict):
                 raise TypeError("assistant metadata must be a JSON object")
             converted.append(
-                AssistantMessage.model_validate(
+                AttachmentAssistantMessage.model_validate(
                     {
                         "id": message_id,
                         "content": _visible_ai_content(message),
+                        "attachments": content_attachments(message.content),
                         "name": message.name,
                         "toolCalls": tool_calls or None,
                         **public_metadata,

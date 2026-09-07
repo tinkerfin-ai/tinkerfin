@@ -15,8 +15,9 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from ..errors import OpenSandboxStateOwnershipError
+from . import _sql_availability
 from ._sql_schema import _cleanup, _owners, _warm_slots
-from ._sql_transactions import _apply_claim_lock
+from ._sql_transactions import _apply_claim_lock, _read_rows
 from .state import (
     OpenSandboxBinding,
     OpenSandboxCleanupClaim,
@@ -151,6 +152,8 @@ async def bind_owner(
                 f"Owner claim for {claim.owner_key!r} is no longer current"
             )
 
+        await _sql_availability.initialize_binding(self, connection, claim, sandbox_id)
+
     await self._run_write_transaction(bind)
     return OpenSandboxBinding(
         sandbox_id=sandbox_id,
@@ -213,6 +216,8 @@ async def unbind_owner(
                 f"Owner claim for {claim.owner_key!r} is no longer current"
             )
 
+        await _sql_availability.remove_binding(self, connection, claim)
+
     await self._run_write_transaction(unbind)
 
 
@@ -222,23 +227,19 @@ async def read_binding(
     """Read the latest committed owner binding without claiming it."""
     self._ensure_open()
     digest = _owner_digest(self._namespace, owner_key)
-    async with self._engine.connect() as connection:
-        row = (
-            await connection.execute(
-                select(
-                    _owners.c.sandbox_id,
-                    _owners.c.binding_generation,
-                ).where(
-                    _owners.c.namespace == self._namespace,
-                    _owners.c.owner_digest == digest,
-                )
-            )
-        ).one_or_none()
-    if row is None or row.sandbox_id is None:
+    rows = await _read_rows(
+        self,
+        select(_owners.c.sandbox_id, _owners.c.binding_generation).where(
+            _owners.c.namespace == self._namespace,
+            _owners.c.owner_digest == digest,
+        ),
+    )
+    row = rows[0] if rows else None
+    if row is None or row["sandbox_id"] is None:
         return None
     return OpenSandboxBinding(
-        sandbox_id=str(row.sandbox_id),
-        generation=int(row.binding_generation),
+        sandbox_id=str(row["sandbox_id"]),
+        generation=int(row["binding_generation"]),
     )
 
 
@@ -421,16 +422,16 @@ async def warm_pool_ready(self: SQLAlchemyOpenSandboxState) -> bool:
     """Return whether every configured slot retains a published Sandbox."""
 
     self._ensure_open()
-    async with self._engine.connect() as connection:
-        ready = await connection.scalar(
-            select(func.count())
-            .select_from(_warm_slots)
-            .where(
-                _warm_slots.c.namespace == self._namespace,
-                _warm_slots.c.sandbox_id.is_not(None),
-            )
-        )
-    return int(ready or 0) == self._warm_pool_size
+    rows = await _read_rows(
+        self,
+        select(func.count().label("ready_count"))
+        .select_from(_warm_slots)
+        .where(
+            _warm_slots.c.namespace == self._namespace,
+            _warm_slots.c.sandbox_id.is_not(None),
+        ),
+    )
+    return int(rows[0]["ready_count"]) == self._warm_pool_size
 
 
 async def publish_warm(
@@ -594,6 +595,7 @@ async def consume_warm(
             raise OpenSandboxStateOwnershipError(
                 f"Owner claim for {claim.owner_key!r} is no longer current"
             )
+        await _sql_availability.initialize_binding(self, connection, claim, sandbox_id)
         return OpenSandboxBinding(
             sandbox_id=sandbox_id,
             generation=claim.generation,

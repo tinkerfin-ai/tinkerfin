@@ -1,7 +1,7 @@
 """Typed public Runtime and Definition contracts generated from locked source."""
 
 # Generated from locked dependencies by scripts/generate_stubs.py; do not edit signatures manually.
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from typing import Any, Generic, Literal, overload
 
 from langchain.agents.middleware.types import InputAgentState
@@ -410,3 +410,4 @@ class DeepAgentDefinition(Generic[ContextT]):
         ...
 
 CREATE_DEEP_AGENT: object
+_public_create_agent_contract: Callable[..., object]

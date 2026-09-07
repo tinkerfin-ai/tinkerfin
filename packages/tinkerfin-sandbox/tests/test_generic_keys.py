@@ -11,6 +11,7 @@ import pytest
 from tinkerfin_sandbox import (
     OpenSandboxBackend,
     OpenSandboxConfig,
+    OpenSandboxDiagnosticContent,
     OpenSandboxManager,
     OpenSandboxRuntimeInfo,
 )
@@ -71,6 +72,25 @@ class _Client:
 
     async def inspect(self, sandbox_id: str) -> OpenSandboxRuntimeInfo:
         raise AssertionError(f"unexpected inspect for {sandbox_id}")
+
+    async def get_runtime_info(self, sandbox_id: str) -> OpenSandboxRuntimeInfo:
+        return await self.inspect(sandbox_id)
+
+    async def pause(self, sandbox_id: str) -> None:
+        raise AssertionError(f"unexpected pause for {sandbox_id}")
+
+    async def resume(self, sandbox_id: str) -> None:
+        raise AssertionError(f"unexpected resume for {sandbox_id}")
+
+    async def get_diagnostic_logs(
+        self, sandbox_id: str, *, scope: str = "container"
+    ) -> OpenSandboxDiagnosticContent:
+        raise AssertionError(f"unexpected log diagnostics for {sandbox_id}: {scope}")
+
+    async def get_diagnostic_events(
+        self, sandbox_id: str, *, scope: str = "runtime"
+    ) -> OpenSandboxDiagnosticContent:
+        raise AssertionError(f"unexpected event diagnostics for {sandbox_id}: {scope}")
 
     async def destroy(self, sandbox_id: str) -> None:
         self.destroyed.append(sandbox_id)

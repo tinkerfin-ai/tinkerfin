@@ -1,6 +1,7 @@
 """业务错误码的整数身份与响应元数据契约"""
 
 from tinkerfin_studio.api.errors import (
+    AttachmentErrorCode,
     AuthErrorCode,
     ConversationErrorCode,
     ErrorCode,
@@ -15,11 +16,12 @@ def test_all_error_codes_keep_integer_values_and_response_metadata() -> None:
     members: tuple[ErrorCode, ...] = (
         *GlobalErrorCode,
         *AuthErrorCode,
+        *AttachmentErrorCode,
         *ModelErrorCode,
         *ConversationErrorCode,
     )
 
-    assert len(members) == 35
+    assert len(members) == 49
     assert len({int(member) for member in members}) == len(members)
     assert all(type(member.value) is int for member in members)
     assert all(400 <= member.http_status <= 599 for member in members)

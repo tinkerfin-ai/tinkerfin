@@ -1,5 +1,8 @@
 """OpenSandbox creation, reuse, ownership, and lifecycle components."""
 
+from .availability import OpenSandboxAvailability as OpenSandboxAvailability
+from .availability import OpenSandboxAvailabilityPhase as OpenSandboxAvailabilityPhase
+from .availability import OpenSandboxHolderUpdate as OpenSandboxHolderUpdate
 from .client import OpenSandboxClient as OpenSandboxClient
 from .client import OpenSandboxInitializer as OpenSandboxInitializer
 from .manager import OpenSandboxManager as OpenSandboxManager

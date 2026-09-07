@@ -10,6 +10,61 @@ def _clear_settings_environment(monkeypatch) -> None:
         monkeypatch.delenv(field_name.upper(), raising=False)
 
 
+@pytest.mark.parametrize("configured", [".data/attachments", "../files", None])
+def test_attachment_directory_is_stable_across_working_directories(
+    tmp_path: Path, monkeypatch, configured: str | None
+) -> None:
+    """同一配置在不同工作目录启动时必须读取同一份附件"""
+    _clear_settings_environment(monkeypatch)
+    config_directory = tmp_path / "config"
+    config_directory.mkdir()
+    env_file = config_directory / ".env"
+    content = "DATABASE_URL=mysql+asyncmy://studio:secret@db:3306/studio\n"
+    if configured is not None:
+        content += f"ATTACHMENT_DIRECTORY={configured}\n"
+    env_file.write_text(content, encoding="utf-8")
+    expected = (config_directory / (configured or ".data/attachments")).resolve()
+    for cwd in [tmp_path, config_directory]:
+        monkeypatch.chdir(cwd)
+        assert load_settings(env_file=env_file).attachment_directory == expected
+
+
+def test_absolute_attachment_directory_overrides_file_without_changing_location(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """环境变量中的绝对数据卷路径不受配置位置和工作目录影响"""
+    _clear_settings_environment(monkeypatch)
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "DATABASE_URL=mysql+asyncmy://studio:secret@db:3306/studio\n"
+        "ATTACHMENT_DIRECTORY=local-files\n",
+        encoding="utf-8",
+    )
+    expected = tmp_path / "volume"
+    monkeypatch.setenv("ATTACHMENT_DIRECTORY", str(expected))
+    assert load_settings(env_file=env_file).attachment_directory == expected
+    assert load_settings(env_file=None).attachment_directory == expected
+
+
+def test_default_attachment_directory_is_independent_of_working_directory(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """直接构建和默认配置读取都采用固定的应用配置目录"""
+    _clear_settings_environment(monkeypatch)
+    monkeypatch.setenv("DATABASE_URL", "mysql+asyncmy://studio:secret@db:3306/studio")
+    before = load_settings(env_file=None).attachment_directory
+    monkeypatch.chdir(tmp_path)
+    assert load_settings(env_file=None).attachment_directory == before
+    assert (
+        Settings(
+            database_url="mysql+asyncmy://studio:secret@db:3306/studio",
+            attachment_directory=Path(".data/attachments"),
+        ).attachment_directory
+        == before
+    )
+    assert before.is_absolute()
+
+
 def test_load_settings_groups_external_resource_configuration(
     tmp_path: Path,
     monkeypatch,

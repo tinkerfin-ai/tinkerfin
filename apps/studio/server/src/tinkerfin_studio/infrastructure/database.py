@@ -78,6 +78,7 @@ class Database:
         )
         options: dict[str, object] = {
             "echo": False,
+            "hide_parameters": True,
             "logging_name": logging_name,
             "pool_pre_ping": True,
             "pool_recycle": self._pool_recycle,

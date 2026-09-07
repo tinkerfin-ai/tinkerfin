@@ -1,3 +1,4 @@
+import { AttachmentList } from '../attachments/AttachmentList'
 import {
   Bot,
   Check,
@@ -60,11 +61,13 @@ function ToolDetails({ message }: { message: Message }) {
         <span className="tool-field-label">{t('输入')}</span>
         <CodeField value={message.meta?.params} status={message.meta?.status} />
       </div>
-      <span className="tool-detail-divider" aria-hidden="true" />
-      <div className="tool-detail-section tool-detail-section--result">
-        <span className="tool-field-label">{t('输出')}</span>
-        <RichField value={message.meta?.result} status={message.meta?.status} />
-      </div>
+      {(message.meta?.result || !message.attachments?.length) && <>
+        <span className="tool-detail-divider" aria-hidden="true" />
+        <div className="tool-detail-section tool-detail-section--result">
+          <span className="tool-field-label">{t('输出')}</span>
+          <RichField value={message.meta?.result} status={message.meta?.status} />
+        </div>
+      </>}
     </div>
   )
 }
@@ -139,6 +142,8 @@ function SubagentToolTraceRow({
   onOpenChange: (open: boolean) => void
 }) {
   return (
+    <>
+    <AttachmentList attachments={message.attachments} />
     <ToolCallRow
       message={message}
       className="subagent-tool-row"
@@ -147,6 +152,7 @@ function SubagentToolTraceRow({
     >
       <ToolDetails message={message} />
     </ToolCallRow>
+    </>
   )
 }
 
@@ -179,6 +185,7 @@ function SubagentOutputNode({ message }: { message: Message }) {
       <div className="subagent-output-copy">
         <strong>{label}</strong>
         {result ? <RichField value={result} status={status} className="subagent-trace-output" /> : null}
+        <AttachmentList attachments={message.attachments} />
       </div>
     </li>
   )
@@ -298,6 +305,7 @@ function MessageBlockView({
     return (
       <article id={message.id} className="message user-message">
         <MarkdownContent content={message.content} className="message-markdown" />
+        <AttachmentList attachments={message.attachments} />
         <MessageActionRow content={message.content} kind="user" />
       </article>
     )
@@ -314,10 +322,11 @@ function MessageBlockView({
   if (message.role === 'error') {
     return <article id={message.id} className="error-message"><CircleAlert size={17} /><div><strong>{t('任务遇到问题')}</strong><MarkdownContent content={message.content} className="error-markdown" variant="compact" /></div></article>
   }
-  if (!message.content) return null
+  if (!message.content && !message.attachments?.length) return null
   return (
     <article id={message.id} className="message assistant-message">
       <MarkdownContent content={message.content} className="message-markdown" />
+        <AttachmentList attachments={message.attachments} />
       {showActions && message.meta?.status !== 'running' && <MessageActionRow content={message.content} kind="assistant" />}
     </article>
   )
@@ -347,6 +356,7 @@ export function ConversationNotice({ notice }: { notice: ConversationNoticeType 
 }
 
 export function ToolCallCard({ message, className }: { message: Message; className?: string }) {
+  const [open, setOpen] = useState(false)
   const { t } = useI18n()
   const isTodoUpdate = message.meta?.toolName === 'write_todos'
   const todoStatus = message.meta?.status === 'failed'
@@ -357,11 +367,14 @@ export function ToolCallCard({ message, className }: { message: Message; classNa
         ? t('正在更新任务清单')
         : t('未生成任务清单')
   return (
-    <ToolCallRow message={message} className={`tool-card${className ? ` ${className}` : ''}`}>
+    <>
+    <AttachmentList attachments={message.attachments} />
+    <ToolCallRow message={message} open={open} onOpenChange={setOpen} className={`tool-card${className ? ` ${className}` : ''}`}>
       {isTodoUpdate
         ? <div className="todo-trace-tool-status">{todoStatus}</div>
         : <ToolDetails message={message} />}
     </ToolCallRow>
+    </>
   )
 }
 

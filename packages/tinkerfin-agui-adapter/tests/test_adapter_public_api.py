@@ -19,6 +19,13 @@ from tinkerfin_agui_adapter import (
 )
 
 _PUBLIC_EXPORTS = {
+    "AttachmentAssistantMessage",
+    "AttachmentMessagesSnapshotEvent",
+    "AttachmentOutputEvent",
+    "AttachmentSnapshotMessage",
+    "AttachmentToolCallResultEvent",
+    "AttachmentToolMessage",
+    "parse_attachment_output_event",
     "AgUiAdapterError",
     "AgUiAdapterErrorCode",
     "AgUiConversionError",

@@ -19,7 +19,6 @@ from typing import TYPE_CHECKING, Literal, cast
 
 from ag_ui.core import (
     BaseEvent,
-    MessagesSnapshotEvent,
     RawEvent,
     StateDeltaEvent,
     StateSnapshotEvent,
@@ -58,6 +57,7 @@ from ._adapter_contracts import (
     _to_json_value,
 )
 from ._adapter_messages import _json_patch
+from .media_events import AttachmentMessagesSnapshotEvent
 from .reasoning import normalize_operational_data, sanitize_public_data
 from .subagent import SubagentTaskInput, create_subagent_provenance
 
@@ -670,7 +670,7 @@ def _emit_values_part(
     if prepared_interrupts:
         events.append(StateSnapshotEvent(snapshot=current, raw_event=raw_event))
         events.append(
-            MessagesSnapshotEvent(
+            AttachmentMessagesSnapshotEvent(
                 messages=converted_messages or [],
                 raw_event=raw_event,
             )

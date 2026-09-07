@@ -2,10 +2,15 @@
 
 ## What it is
 
-`tinkerfin-sandbox` adapts OpenSandbox SDK 0.1.14 to asynchronous Deep Agents backend
+`tinkerfin-sandbox` adapts OpenSandbox SDK 0.1.16 to asynchronous Deep Agents backend
 and lifecycle contracts. It provides stable caller-keyed Sandboxes, reconnection,
-health replacement, warm capacity, rooted paths, reset and destroy operations,
-cancellation-safe cleanup, optional lifecycle observers, and multi-worker allocation state.
+health replacement, warm capacity, rooted paths, pause/resume, scoped diagnostics,
+reset and destroy operations, cancellation-safe cleanup, optional lifecycle observers,
+and multi-worker allocation state. Lifecycle operations use official OpenSandbox Server 0.2.3.
+
+The default image is a digest-pinned [TinkerFin Sandbox Runtime](https://github.com/tinkerfin-ai/sandbox-runtime),
+including Playwright and headless Chromium for web navigation and screenshots.
+Use `OpenSandboxConfig(image=...)` when a different runtime is required.
 
 The package does not depend on `tinkerfin`. Authentication, tenancy policy, key
 selection, graph construction, and HTTP behavior belong to the host.
@@ -66,6 +71,14 @@ OpenSandbox SDK reads `OPEN_SANDBOX_DOMAIN` and `OPEN_SANDBOX_API_KEY` when a cl
 uses its environment configuration. Credentials, image policy, volumes, and physical
 paths must remain host configuration.
 
+Client-managed SDK connections disable implicit transport retries. Explicit
+`ConnectionConfig(retry_policy=...)` settings are retained when they cannot replay
+POST/PATCH response failures; configurations permitting that replay are rejected.
+Existing-instance recovery is configured through `OpenSandboxRecoveryPolicy`.
+Caller-supplied transports retain their own policy and lifetime. SDK creation telemetry
+is disabled in the managed configuration because its reporting tasks cannot be joined
+at client close. Headers and SDK settings are copied without changing caller configuration.
+
 ## Caller-defined keys
 
 The manager has no built-in user, agent, thread, or workspace isolation enum. The
@@ -97,10 +110,18 @@ in remote OpenSandbox owner labels; those labels use stable digests.
 - `reconnect(key)` connects an existing binding without creating or replacing it;
 - `recreate(key)` commits a replacement and retires the previous instance;
 - `reset(key)` clears the configured `workspace_root` without changing the binding;
+- `pause(key, timeout=30.0)` waits for admitted work across registered processes, then pauses the instance;
+- `resume(key, timeout=30.0)` resumes the same instance and returns a ready backend;
 - `destroy(key)` destroys known remote instances and removes the binding;
 - `get_details(key)` returns a stable owner-aware runtime snapshot;
+- `get_diagnostic_logs(key, scope="container")` and `get_diagnostic_events(key, scope="runtime")` read provider diagnostics;
 - `check_ready()` raises when configured warm capacity is degraded;
 - `aclose()` waits for active operations and closes owned local resources.
+
+`get_details()` includes `access_state`, the framework's shared coordination phase,
+alongside the provider's runtime status. A remotely running instance can still be
+draining or awaiting lifecycle confirmation. `cached` indicates local handle presence,
+not permission to start work; `access_state=None` means no coordination snapshot was supplied.
 
 Existing bindings are preserved by default when recovery fails. The default
 `OpenSandboxRecoveryPolicy` allows three attempts with a 30-second work budget and exponential
@@ -150,7 +171,8 @@ drop new events; observer failures do not affect Sandbox operations. Close drain
 accepted notifications without closing observers. Callbacks must be non-blocking,
 propagate cancellation, and never reenter their manager's resource operations or
 close. Existing access and warm maintenance discover changes; notifications add no
-user Sandbox polling or durable delivery.
+remote user Sandbox polling or durable delivery. Shared-State polling for pause/resume
+coordination runs independently of notification delivery.
 
 `settlement_timeout=None` keeps the default complete wait. A finite constructor value
 limits only each caller's wait: expiry raises `OpenSandboxSettlementTimeoutError`,
@@ -201,6 +223,52 @@ expired, `get()` reports failure and preserves the binding by default; replaceme
 requires an explicit recreation policy. Durable workspace contents require an
 OpenSandbox volume or another storage policy selected by the host.
 
+## Pause and resume
+
+```python
+backend = await manager.get(project_key)
+await manager.pause(project_key, timeout=30.0)
+backend = await manager.resume(project_key, timeout=30.0)
+```
+
+Pause retains the binding, files, and stable handles. Every registered manager sharing
+the State must stop accepting new operations and acknowledge that its admitted work,
+including remote command and transfer settlement, has finished before the pause request
+is sent. Existing handles in other processes observe the shared intent asynchronously;
+pause waits for all acknowledgements. Lost workers and unknown remote outcomes cannot
+be treated as idle. Normal operations on an admitted handle do not query State per call.
+
+The positive `timeout` is a work budget in seconds. If waiting for work to finish times
+out or is cancelled, admission reopens only after State confirms the pause request was
+not dispatched and cancels that intent. An unknown result after dispatch keeps access
+closed until control-plane evidence resolves it. Protective settlement can extend
+elapsed time beyond the work budget.
+
+Paused instances require explicit `resume()`: `get()`, `reconnect()`, and `reset()` do
+not wake them. Resume returns a ready connection for the calling manager; every other
+registered manager refreshes its connection before reopening its existing handle.
+The remote ID is preserved, and connection initializers still run. Official Docker
+resume unpauses a paused container; it cannot start a container stopped through Docker.
+Pausing neither freezes nor extends the remote TTL, so a finite-lived paused instance
+can expire.
+
+## Diagnostics
+
+```python
+logs = await manager.get_diagnostic_logs(project_key, scope="container")
+events = await manager.get_diagnostic_events(project_key, scope="runtime")
+```
+
+These queries read the existing binding through the control plane without creating,
+reconnecting, renewing, or waking the instance. Docker supports log scopes `container`
+and `all`, and event scopes `runtime` and `all`. Docker event diagnostics provide a
+current state summary, not a complete historical event stream.
+
+`OpenSandboxDiagnosticContent` describes inline text or an expiring content URL, with
+`content_type`, optional byte length, `truncated`, and `warnings`. The framework does
+not fetch returned URLs. Diagnostic text and references are trusted operational data;
+the host controls access and retention.
+
 ## Rooted backend
 
 When `OpenSandboxConfig.workspace_root` is set, `get()` returns a rooted view. Deep
@@ -225,6 +293,22 @@ fall back to reopening the requested pathname. All remote OpenSandbox I/O is
 asynchronous-only. Valid synchronous upload, download, write, and capture-offload
 calls raise the backend's explicit async-only error before file I/O; empty and locally
 invalid batches can still return without remote work.
+
+Use `await backend.aread_bytes("/report.pdf", max_bytes=10 * 1024 * 1024)` to
+retrieve a complete binary file within a byte limit. This method is available on
+raw backends, managed handles, and rooted views; use a rooted view when paths must
+stay inside a workspace. It raises `OpenSandboxFileTooLargeError` instead of
+returning truncated content. Missing and unreadable files retain Python filesystem
+exceptions. Zero bytes accepts only an empty file. Memory consumption is proportional
+to the byte limit, with one transport chunk and a final bytes copy.
+
+The read deadline defaults to 30 seconds and accepts `timeout` values greater than
+zero and at most 290 seconds, within the finite descriptor lifetime. HTTP responses
+close on success, overflow, provider errors, timeout, and cancellation. Rooted reads
+allow up to five seconds each for response and descriptor-helper cleanup before
+releasing the Handle lease. A failed helper cleanup remains an unresolved remote
+operation and does not authorize lifecycle reuse. The download does not retry or
+follow redirects, decode compressed bodies, or close the SDK's borrowed transport.
 
 Batch transfers process valid items in input order and retain one response per input.
 A confirmed invalid path affects only that item. Transport failures and uncertain
@@ -341,8 +425,11 @@ is immutable and exposes `dialect`, `table_names`, and `ddl`. Non-current owned 
 columns, missing or extra indexes, and changed index uniqueness fail startup and must be
 rebuilt before a DML-only runtime account is started.
 
-Persistent state coordinates allocation, binding, warm slots, owner fencing, and
-cleanup. It does not serialize complete graph runs; use an application run coordinator
+Persistent state coordinates allocation, binding, warm slots, owner fencing, pause/resume
+intent, registered handle holders, and cleanup. Custom State implementations provide
+`OpenSandboxAvailability` and `OpenSandboxHolderUpdate` snapshots with atomic holder
+registration, intent changes, and drain acknowledgements. A previous binding or intent
+cannot acknowledge a later one. It does not serialize complete graph runs; use an application run coordinator
 when graph execution also requires per-RunIdentity exclusion.
 
 Consuming a ready warm slot atomically commits that Sandbox as the owner binding; the

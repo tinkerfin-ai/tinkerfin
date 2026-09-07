@@ -22,7 +22,7 @@ from tinkerfin_studio.conversation.run_preparation import (
 from tinkerfin_studio.conversation.run_registration import ConversationRunPreparer
 from tinkerfin_studio.conversation.service import ConversationChatService
 from tinkerfin_studio.models.repository import AgentModelRepository
-from tinkerfin_studio.models.schemas import AgentModelConfig, AgentModelWrite
+from tinkerfin_studio.models.schemas import AgentModelConfig, AgentModelSave
 from tinkerfin_studio.models.service import AgentModelService
 from tinkerfin_studio.resources import ApplicationResources
 
@@ -37,6 +37,16 @@ def _model(model_id: str = "model-main") -> AgentModelConfig:
         api_key=SecretStr("secret"),
         reasoning_enabled=False,
     )
+
+
+@pytest.fixture(autouse=True)
+async def stored_model_configs(session):
+    """登记测试使用的真实模型配置，运行登记校验当前配置未变化"""
+    service = AgentModelService(AgentModelRepository(session, user_id=1))
+    for model_id in ("model-main", "model-other"):
+        await service.save_settings(
+            AgentModelSave.model_validate(_model(model_id).model_dump())
+        )
 
 
 def _ordinary_request(
@@ -92,11 +102,11 @@ def _resume_request(
     )
 
 
-async def test_run_registration_persists_model_and_input(session) -> None:
+async def test_run_registration_persists_model_and_input(session, attachments) -> None:
     request = _ordinary_request()
     intent = classify_intent(request)
     assert isinstance(intent, StartChatIntent)
-    preparer = ConversationRunPreparer(session, user_id=1)
+    preparer = ConversationRunPreparer(session, user_id=1, attachments=attachments)
     resolved = await preparer.resolve_thread(request, intent=intent)
     prepared = prepare_run_request(
         request,
@@ -135,7 +145,9 @@ async def test_run_registration_persists_model_and_input(session) -> None:
     assert registration.status == "starting"
 
 
-async def test_resume_registration_stores_only_claim_identity(session) -> None:
+async def test_resume_registration_stores_only_claim_identity(
+    session, attachments
+) -> None:
     repository = ConversationRepository(session)
     thread = await repository.create_thread(
         user_id=1,
@@ -164,7 +176,9 @@ async def test_resume_registration_stores_only_claim_identity(session) -> None:
         thread_id=thread.thread_id,
     )
 
-    execution = await ConversationRunPreparer(session, user_id=1).register(
+    execution = await ConversationRunPreparer(
+        session, user_id=1, attachments=attachments
+    ).register(
         intent=intent,
         prepared=prepared,
         model=_model(),
@@ -187,6 +201,7 @@ async def test_resume_registration_stores_only_claim_identity(session) -> None:
 async def test_continuation_rejects_a_model_different_from_the_source_run(
     session,
     continuation: str,
+    attachments,
 ) -> None:
     repository = ConversationRepository(session)
     thread = await repository.create_thread(
@@ -229,7 +244,9 @@ async def test_continuation_rejects_a_model_different_from_the_source_run(
     )
 
     with pytest.raises(BusinessException) as captured:
-        await ConversationRunPreparer(session, user_id=1).register(
+        await ConversationRunPreparer(
+            session, user_id=1, attachments=attachments
+        ).register(
             intent=intent,
             prepared=prepared,
             model=_model("model-other"),
@@ -246,11 +263,13 @@ async def test_continuation_rejects_a_model_different_from_the_source_run(
     )
 
 
-async def test_same_run_rejects_a_changed_registered_model(session) -> None:
+async def test_same_run_rejects_a_changed_registered_model(
+    session, attachments
+) -> None:
     request = _ordinary_request(run_id="run-model")
     intent = classify_intent(request)
     assert isinstance(intent, StartChatIntent)
-    preparer = ConversationRunPreparer(session, user_id=1)
+    preparer = ConversationRunPreparer(session, user_id=1, attachments=attachments)
     resolved = await preparer.resolve_thread(request, intent=intent)
     prepared = prepare_run_request(
         request,
@@ -354,9 +373,10 @@ class _FailingTraceCoordinator(_TraceCoordinator):
 async def test_chat_service_uses_messaging_only_for_delivery(
     database,
     session,
+    attachments,
 ) -> None:
-    await AgentModelService(AgentModelRepository(session)).upsert(
-        AgentModelWrite(
+    await AgentModelService(AgentModelRepository(session, user_id=1)).save_settings(
+        AgentModelSave(
             model_id="model-main",
             display_name="主模型",
             provider="deepseek",
@@ -373,10 +393,12 @@ async def test_chat_service_uses_messaging_only_for_delivery(
         ApplicationResources,
         SimpleNamespace(
             database=database,
+            attachments=attachments,
+            model_http_client=None,
             agent_persistence=object(),
             sandbox_manager=object(),
             tinkerfin=TinkerFin(),
-            settings=SimpleNamespace(tavily_api_key=None),
+            settings=SimpleNamespace(tavily_api_key=None, model_allowed_origins=()),
             conversation_channel=channel,
             conversation_trace=trace,
         ),
@@ -421,13 +443,14 @@ async def test_chat_service_uses_messaging_only_for_delivery(
 async def test_chat_service_closes_sse_body_when_trace_follow_cannot_start(
     database,
     session,
+    attachments,
     close_error: BaseException | None,
     expected_error: type[BaseException],
 ) -> None:
     """Trace follow 注册失败时立即释放尚未交给 HTTP 的 SSE 内容"""
 
-    await AgentModelService(AgentModelRepository(session)).upsert(
-        AgentModelWrite(
+    await AgentModelService(AgentModelRepository(session, user_id=1)).save_settings(
+        AgentModelSave(
             model_id="model-main",
             display_name="主模型",
             provider="deepseek",
@@ -444,10 +467,12 @@ async def test_chat_service_closes_sse_body_when_trace_follow_cannot_start(
         ApplicationResources,
         SimpleNamespace(
             database=database,
+            attachments=attachments,
+            model_http_client=None,
             agent_persistence=object(),
             sandbox_manager=object(),
             tinkerfin=TinkerFin(),
-            settings=SimpleNamespace(tavily_api_key=None),
+            settings=SimpleNamespace(tavily_api_key=None, model_allowed_origins=()),
             conversation_channel=channel,
             conversation_trace=trace,
         ),
@@ -481,11 +506,12 @@ async def test_chat_service_closes_sse_body_when_trace_follow_cannot_start(
 async def test_previous_head_reconcile_releases_the_request_transaction(
     database,
     session,
+    attachments,
 ) -> None:
     """共享 Trace 查询前必须归还业务 Session 的池连接"""
 
-    await AgentModelService(AgentModelRepository(session)).upsert(
-        AgentModelWrite(
+    await AgentModelService(AgentModelRepository(session, user_id=1)).save_settings(
+        AgentModelSave(
             model_id="model-main",
             display_name="主模型",
             provider="deepseek",
@@ -520,10 +546,12 @@ async def test_previous_head_reconcile_releases_the_request_transaction(
         ApplicationResources,
         SimpleNamespace(
             database=database,
+            attachments=attachments,
+            model_http_client=None,
             agent_persistence=object(),
             sandbox_manager=object(),
             tinkerfin=TinkerFin(),
-            settings=SimpleNamespace(tavily_api_key=None),
+            settings=SimpleNamespace(tavily_api_key=None, model_allowed_origins=()),
             conversation_channel=channel,
             conversation_trace=trace,
         ),

@@ -23,8 +23,12 @@ class OpenSandboxErrorCode(StrEnum):
     STATE_COMMIT_UNCERTAIN = "sandbox.state_commit_uncertain"
     STATE_UNEXPECTED_FAILURE = "sandbox.state_unexpected_failure"
     BACKEND_ERROR = "sandbox.backend_error"
+    FILE_TOO_LARGE = "sandbox.file_too_large"
     BACKEND_UNAVAILABLE = "sandbox.backend_unavailable"
     BACKEND_TIMEOUT = "sandbox.backend_timeout"
+    PAUSED = "sandbox.paused"
+    BUSY = "sandbox.busy"
+    LIFECYCLE_UNCERTAIN = "sandbox.lifecycle_uncertain"
     BACKEND_PROTOCOL_ERROR = "sandbox.backend_protocol_error"
     BACKEND_UNEXPECTED_FAILURE = "sandbox.backend_unexpected_failure"
     INITIALIZATION_FAILED = "sandbox.initialization_failed"
@@ -149,6 +153,34 @@ class OpenSandboxBackendTimeoutError(OpenSandboxBackendError):
     """A remote Sandbox operation exceeded its bounded wait."""
 
     code = OpenSandboxErrorCode.BACKEND_TIMEOUT
+
+
+class OpenSandboxPausedError(OpenSandboxBackendError):
+    """The Sandbox requires an explicit successful resume before ordinary use."""
+
+    code = OpenSandboxErrorCode.PAUSED
+
+
+class OpenSandboxBusyError(OpenSandboxBackendError):
+    """A lifecycle transition has temporarily stopped accepting new operations."""
+
+    code = OpenSandboxErrorCode.BUSY
+
+
+class OpenSandboxLifecycleUncertainError(OpenSandboxBackendError):
+    """A dispatched lifecycle request has no confirmed remote outcome.
+
+    The existing instance and binding remain authoritative. Conflicting lifecycle
+    requests must wait for evidence of the issued request's outcome.
+    """
+
+    code = OpenSandboxErrorCode.LIFECYCLE_UNCERTAIN
+
+
+class OpenSandboxFileTooLargeError(OpenSandboxBackendError):
+    """A binary file exceeds the caller's byte limit; no partial bytes are returned."""
+
+    code = OpenSandboxErrorCode.FILE_TOO_LARGE
 
 
 class OpenSandboxBackendProtocolError(OpenSandboxBackendError):

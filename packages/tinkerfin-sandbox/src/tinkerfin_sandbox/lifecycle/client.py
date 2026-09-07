@@ -1,6 +1,6 @@
 """Native asynchronous lifecycle client for OpenSandbox instances.
 
-The client uses the asynchronous OpenSandbox 0.1.14 API. It retains creation and
+The client uses the asynchronous OpenSandbox 0.1.16 API. It retains creation and
 connection tasks after caller cancellation so late resources are reclaimed.
 """
 
@@ -10,14 +10,16 @@ import asyncio
 import inspect
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextvars import ContextVar
+from typing import Literal
 from uuid import uuid4
 
 from opensandbox import Sandbox
 from opensandbox import SandboxManager as OpenSandboxSDKManager
 from opensandbox.config import ConnectionConfig
-from opensandbox.exceptions import SandboxReadyTimeoutException
+from opensandbox.exceptions import SandboxApiException, SandboxReadyTimeoutException
 from opensandbox.models import WriteEntry
 from opensandbox.models.sandboxes import SandboxFilter, SandboxInfo
+from opensandbox.transport import RetryPolicy
 
 from ..backends.sdk import (
     OpenSandboxBackend,
@@ -32,8 +34,13 @@ from ..errors import (
     OpenSandboxInitializationError,
     UnexpectedOpenSandboxBackendError,
 )
-from ..models import OpenSandboxConfig, OpenSandboxRuntimeInfo
+from ..models import (
+    OpenSandboxConfig,
+    OpenSandboxDiagnosticContent,
+    OpenSandboxRuntimeInfo,
+)
 from ._protocols import _SandboxClient
+from ._transport import _join_owned_task, _SDKRequestTracker
 
 _CREATE_TOKEN_METADATA_KEY = "tinkerfin.ai/create-token"
 # Manager recovery scopes this deadline to its same-instance work. Child SDK tasks
@@ -42,46 +49,6 @@ _CREATE_TOKEN_METADATA_KEY = "tinkerfin.ai/create-token"
 _connection_deadline: ContextVar[float | None] = ContextVar(
     "tinkerfin_sandbox_connection_deadline", default=None
 )
-
-
-async def _join_owned_task(
-    task: asyncio.Task[None],
-    *,
-    failure_label: str,
-) -> None:
-    """Settle one owned task before propagating cancellation of its waiter."""
-
-    current = asyncio.current_task()
-    cancel_count = current.cancelling() if current is not None else 0
-    cancellation: asyncio.CancelledError | None = None
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError as error:
-            next_count = current.cancelling() if current is not None else 0
-            if next_count > cancel_count:
-                cancellation = cancellation or error
-                cancel_count = next_count
-                continue
-            if task.done():
-                break
-            raise
-        except BaseException:  # noqa: BLE001 - inspect the retained task below
-            break
-    task_error: BaseException | None = None
-    try:
-        task.result()
-    except BaseException as error:  # noqa: BLE001 - preserve exact task outcome
-        task_error = error
-    if cancellation is not None:
-        if task_error is not None:
-            cancellation.add_note(
-                f"{failure_label} also failed: "
-                f"{type(task_error).__name__}: {task_error}"
-            )
-        raise cancellation.with_traceback(cancellation.__traceback__)
-    if task_error is not None:
-        raise task_error.with_traceback(task_error.__traceback__)
 
 
 def _backend_error(
@@ -151,7 +118,11 @@ class OpenSandboxClient(_SandboxClient):
         Args:
             connection_config: SDK endpoint, authentication, and asynchronous
                 transport configuration. ``None`` lets the SDK read its standard
-                environment variables.
+                environment variables. Implicit SDK transport retries are disabled;
+                explicit policies must not replay POST/PATCH response failures.
+                SDK creation telemetry is disabled in the managed copy because its
+                background tasks cannot be joined at client close. Caller transports
+                remain borrowed and keep their original policy and lifetime.
             config: Image, resources, mounts, timeouts, metadata, and health policy.
             initializers: Idempotent callbacks run in order after creation or connect.
                 Use native async callbacks for I/O. Synchronous callbacks run on the
@@ -161,6 +132,7 @@ class OpenSandboxClient(_SandboxClient):
         """
         self.config = config or OpenSandboxConfig()
         self.connection_config = self._resolve_connection_config(connection_config)
+        self._sdk_requests = _SDKRequestTracker()
         (
             self._owned_connection_config,
             self._sdk_connection_config,
@@ -187,13 +159,13 @@ class OpenSandboxClient(_SandboxClient):
             }
         )
 
-    @staticmethod
     def _scope_sdk_transport(
+        self,
         connection_config: ConnectionConfig,
     ) -> tuple[ConnectionConfig | None, ConnectionConfig]:
         """Give every SDK call one client-scoped borrowed transport.
 
-        ``opensandbox==0.1.14`` creates a transport inside ``Sandbox.connect`` when
+        ``opensandbox==0.1.16`` creates a transport inside ``Sandbox.connect`` when
         the supplied config has none, but its exception cleanup does not catch task
         cancellation. The client therefore creates that transport before any SDK
         coroutine starts and retains the only owning config until :meth:`aclose`.
@@ -202,15 +174,34 @@ class OpenSandboxClient(_SandboxClient):
         remains borrowed and is never closed here.
         """
 
+        policy = connection_config.retry_policy
+        if policy.max_retries > 0 and policy.retryable_status_codes_non_idempotent:
+            raise ValueError(
+                "OpenSandbox retry_policy must not replay POST/PATCH response failures"
+            )
+        # Configuration construction may add the SDK client-IP header in place.
+        # Only our own copied headers may be changed during SDK validation.
+        managed_config = connection_config.model_copy(
+            update={
+                "headers": dict(connection_config.headers),
+                "disable_metrics": True,
+                "retry_policy": (
+                    policy
+                    if "retry_policy" in connection_config.model_fields_set
+                    else RetryPolicy.disabled()
+                ),
+            }
+        )
         owner = (
-            connection_config.with_transport_if_missing()
-            if connection_config.transport is None
+            managed_config.with_transport_if_missing()
+            if managed_config.transport is None
             else None
         )
-        source = connection_config if owner is None else owner
+        source = managed_config if owner is None else owner
         sdk_config = ConnectionConfig.model_validate(source.model_dump(mode="python"))
         if sdk_config.transport is None:
             raise RuntimeError("OpenSandbox SDK transport initialization failed")
+        sdk_config.transport = self._sdk_requests.borrow(sdk_config.transport)
         return owner, sdk_config
 
     def _wrap(self, sandbox: Sandbox) -> OpenSandboxBackend:
@@ -227,10 +218,11 @@ class OpenSandboxClient(_SandboxClient):
     async def _initialize(self, backend: OpenSandboxBackend) -> None:
         """Run initializers in declaration order and stop at the first failure."""
         try:
-            for initializer in self._initializers:
-                result = initializer(backend)
-                if inspect.isawaitable(result):
-                    await result
+            with self._sdk_requests.caller_work():
+                for initializer in self._initializers:
+                    result = initializer(backend)
+                    if inspect.isawaitable(result):
+                        await result
         except Exception as error:
             raise OpenSandboxInitializationError(
                 "OpenSandbox initializer failed", cause=error
@@ -242,7 +234,7 @@ class OpenSandboxClient(_SandboxClient):
         if workspace_root is None:
             return
         await sandbox.files.create_directories(
-            # SDK 0.1.14 expects decimal Unix permission text, not 0o755.
+            # SDK 0.1.16 expects decimal Unix permission text, not 0o755.
             [WriteEntry(path=workspace_root, mode=755)]
         )
 
@@ -269,58 +261,59 @@ class OpenSandboxClient(_SandboxClient):
         metadata: Mapping[str, str] | None,
     ) -> OpenSandboxBackend:
         """Create and initialize a sandbox, reclaiming it on initialization failure."""
-        volumes = [volume.model_copy(deep=True) for volume in self.config.volumes]
-        creation_metadata = dict(self.config.metadata)
-        creation_metadata.update(metadata or {})
-        creation_metadata[_CREATE_TOKEN_METADATA_KEY] = uuid4().hex
-        try:
-            sandbox = await Sandbox.create(
-                self.config.image,
-                entrypoint=list(self.config.entrypoint),
-                env=dict(self.config.env),
-                metadata=creation_metadata,
-                resource=dict(self.config.resource),
-                volumes=volumes or None,
-                timeout=self.config.ttl,
-                ready_timeout=self.config.ready_timeout,
-                connection_config=self._sdk_connection_config,
-            )
-        except Exception as error:
+        async with self._sdk_requests.operation():
+            volumes = [volume.model_copy(deep=True) for volume in self.config.volumes]
+            creation_metadata = dict(self.config.metadata)
+            creation_metadata.update(metadata or {})
+            creation_metadata[_CREATE_TOKEN_METADATA_KEY] = uuid4().hex
             try:
-                sandbox = await self._recover_unknown_create(creation_metadata)
-            except Exception as recovery_error:  # noqa: BLE001 - SDK recovery boundary
-                error.add_note(
-                    "OpenSandbox create recovery also failed: "
-                    f"{type(recovery_error).__name__}"
+                sandbox = await Sandbox.create(
+                    self.config.image,
+                    entrypoint=list(self.config.entrypoint),
+                    env=dict(self.config.env),
+                    metadata=creation_metadata,
+                    resource=dict(self.config.resource),
+                    volumes=volumes or None,
+                    timeout=self.config.ttl,
+                    ready_timeout=self.config.ready_timeout,
+                    connection_config=self._sdk_connection_config,
                 )
-                translated = _backend_error("create", error)
-                raise translated from error
-            if sandbox is None:
-                translated = _backend_error("create", error)
-                raise translated from error
-        backend = self._wrap(sandbox)
-        try:
-            await self._initialize_workspace(sandbox)
-        except Exception as error:
+            except Exception as error:
+                try:
+                    sandbox = await self._recover_unknown_create(creation_metadata)
+                except Exception as recovery_error:  # noqa: BLE001 - SDK recovery boundary
+                    error.add_note(
+                        "OpenSandbox create recovery also failed: "
+                        f"{type(recovery_error).__name__}"
+                    )
+                    translated = _backend_error("create", error)
+                    raise translated from error
+                if sandbox is None:
+                    translated = _backend_error("create", error)
+                    raise translated from error
+            backend = self._wrap(sandbox)
             try:
-                await backend.akill()
-            except Exception:  # noqa: BLE001 - preserve initialization failure
-                pass
-            await self._close_quietly(backend)
-            translated = OpenSandboxInitializationError(
-                "OpenSandbox workspace initialization failed", cause=error
-            )
-            raise translated from error
-        try:
-            await self._initialize(backend)
-        except BaseException:
+                await self._initialize_workspace(sandbox)
+            except Exception as error:
+                try:
+                    await backend.akill()
+                except Exception:  # noqa: BLE001 - preserve initialization failure
+                    pass
+                await self._close_quietly(backend)
+                translated = OpenSandboxInitializationError(
+                    "OpenSandbox workspace initialization failed", cause=error
+                )
+                raise translated from error
             try:
-                await backend.akill()
-            except Exception:  # noqa: BLE001 - preserve initializer failure
-                pass
-            await self._close_quietly(backend)
-            raise
-        return backend
+                await self._initialize(backend)
+            except BaseException:
+                try:
+                    await backend.akill()
+                except Exception:  # noqa: BLE001 - preserve initializer failure
+                    pass
+                await self._close_quietly(backend)
+                raise
+            return backend
 
     async def _recover_unknown_create(
         self,
@@ -450,20 +443,21 @@ class OpenSandboxClient(_SandboxClient):
         Returns:
             An initialized asynchronous backend owned by the caller.
         """
-        creation_task = asyncio.create_task(self._create(metadata))
-        try:
-            return await asyncio.shield(creation_task)
-        except asyncio.CancelledError as cancellation:
-            cleanup_task = asyncio.create_task(
-                self._reclaim_cancelled_create(creation_task)
-            )
-            self._track_cleanup_task(cleanup_task)
+        with self._sdk_requests.owned_call():
+            creation_task = asyncio.create_task(self._create(metadata))
             try:
-                await asyncio.shield(cleanup_task)
-            except asyncio.CancelledError:
-                # Repeated cancellation affects only the waiter; cleanup stays retained.
-                pass
-            raise cancellation
+                return await asyncio.shield(creation_task)
+            except asyncio.CancelledError as cancellation:
+                cleanup_task = asyncio.create_task(
+                    self._reclaim_cancelled_create(creation_task)
+                )
+                self._track_cleanup_task(cleanup_task)
+                try:
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError:
+                    # Repeated cancellation affects only the waiter; cleanup stays retained.
+                    pass
+                raise cancellation
 
     async def _connect(
         self,
@@ -471,110 +465,318 @@ class OpenSandboxClient(_SandboxClient):
     ) -> OpenSandboxBackend:
         """Bound lookup and initialization while preserving their recovery semantics.
 
-        OpenSandbox 0.1.14 does not include every endpoint request in its connect
+        OpenSandbox 0.1.16 does not include every endpoint request in its connect
         timeout. Both phases share one deadline; initialization failures remain
         distinct so a retry policy cannot repeat a caller's initializer.
         """
-        deadline = (
-            asyncio.get_running_loop().time()
-            + self.config.connect_timeout.total_seconds()
+        async with self._sdk_requests.operation():
+            deadline = (
+                asyncio.get_running_loop().time()
+                + self.config.connect_timeout.total_seconds()
+            )
+            recovery_deadline = _connection_deadline.get()
+            if recovery_deadline is not None:
+                deadline = min(deadline, recovery_deadline)
+            try:
+                async with asyncio.timeout_at(deadline):
+                    sandbox = await Sandbox.connect(
+                        sandbox_id,
+                        connection_config=self._sdk_connection_config,
+                        connect_timeout=self.config.connect_timeout,
+                    )
+            except Exception as error:
+                translated = _backend_error("connect", error)
+                raise translated from error
+            backend = self._wrap(sandbox)
+            try:
+                async with asyncio.timeout_at(deadline):
+                    await self._initialize_workspace(sandbox)
+                    await self._initialize(backend)
+            except BaseException as error:
+                await self._close_quietly(backend)
+                if not isinstance(error, Exception) or isinstance(
+                    error, OpenSandboxInitializationError
+                ):
+                    raise
+                raise OpenSandboxInitializationError(
+                    "OpenSandbox initialization failed", cause=error
+                ) from error
+            return backend
+
+    async def connect(self, sandbox_id: str) -> OpenSandboxBackend:
+        """Connect to an existing Sandbox without creating a replacement."""
+        with self._sdk_requests.owned_call():
+            connection_task = asyncio.create_task(self._connect(sandbox_id))
+            try:
+                return await asyncio.shield(connection_task)
+            except asyncio.CancelledError as cancellation:
+                cleanup_task = asyncio.create_task(
+                    self._close_cancelled_connect(connection_task)
+                )
+                self._track_cleanup_task(cleanup_task)
+                try:
+                    await _join_owned_task(
+                        cleanup_task, failure_label="Cancelled connection cleanup"
+                    )
+                except asyncio.CancelledError:
+                    # Even repeated cancellation must settle initialization before a
+                    # manager can release its owner claim to the next operation.
+                    pass
+                raise cancellation
+
+    async def _change_lifecycle(
+        self, sandbox_id: str, operation: Literal["pause", "resume"]
+    ) -> None:
+        """Settle one issued control-plane mutation within its shared deadline."""
+        async with self._sdk_requests.operation():
+            deadline = (
+                asyncio.get_running_loop().time()
+                + self._sdk_connection_config.request_timeout.total_seconds()
+            )
+            shared_deadline = _connection_deadline.get()
+            if shared_deadline is not None:
+                deadline = min(deadline, shared_deadline)
+            manager: OpenSandboxSDKManager | None = None
+            try:
+                async with asyncio.timeout_at(deadline):
+                    manager = await OpenSandboxSDKManager.create(
+                        connection_config=self._sdk_connection_config
+                    )
+                    if operation == "pause":
+                        await manager.pause_sandbox(sandbox_id)
+                    else:
+                        await manager.resume_sandbox(sandbox_id)
+            except Exception as error:
+                failure = _backend_error(operation, error)
+                status = (
+                    error.status_code
+                    if isinstance(error, SandboxApiException)
+                    else None
+                )
+                # A timeout or server failure cannot prove that the remote state
+                # stayed unchanged. Managers must preserve that uncertain state
+                # until an explicit inspection resolves it; never replay here.
+                outcome = (
+                    "rejected"
+                    if status in {400, 401, 403, 404, 409, 422}
+                    else "unknown"
+                )
+                translated = type(failure)(
+                    failure.message,
+                    context={
+                        **failure.context,
+                        "request_outcome": outcome,
+                        "status_code": status,
+                    },
+                    diagnostic_context=failure.diagnostic_context,
+                    cause=error,
+                )
+                raise translated from error
+            finally:
+                if manager is not None:
+                    await manager.close()
+
+    async def pause(self, sandbox_id: str) -> None:
+        """Pause an existing instance through the official control-plane API.
+
+        The request does not reconnect, initialize, replace, or close the remote
+        instance. Caller cancellation waits for the issued request to settle before
+        propagating. A transport timeout leaves the remote outcome unknown.
+
+        Args:
+            sandbox_id: Existing remote Sandbox identity.
+
+        Raises:
+            ValueError: The ID is empty.
+            OpenSandboxBackendError: The request fails. ``request_outcome`` is
+                ``"rejected"`` only for a confirmed client-error response; otherwise
+                it is ``"unknown"`` and cannot authorize replay or state rollback.
+            asyncio.CancelledError: Cancellation propagates after request settlement.
+        """
+        if not sandbox_id:
+            raise ValueError("sandbox_id must not be empty")
+        task = asyncio.create_task(
+            self._change_lifecycle(sandbox_id, "pause"),
+            name="tinkerfin-sandbox-pause-request",
         )
-        recovery_deadline = _connection_deadline.get()
-        if recovery_deadline is not None:
-            deadline = min(deadline, recovery_deadline)
-        try:
-            async with asyncio.timeout_at(deadline):
+        self._track_cleanup_task(task)
+        await _join_owned_task(task, failure_label="OpenSandbox pause")
+
+    async def resume(self, sandbox_id: str) -> None:
+        """Resume an existing paused instance through the official control-plane API.
+
+        This call only submits the state change. Reconnection and readiness belong
+        to the manager holding the Sandbox owner claim. It never initializes or
+        replaces an instance. Cancellation and unknown outcomes follow :meth:`pause`.
+
+        Args:
+            sandbox_id: Existing remote Sandbox identity.
+
+        Raises:
+            ValueError: The ID is empty.
+            OpenSandboxBackendError: The request fails with the outcome classification
+                documented by :meth:`pause`.
+            asyncio.CancelledError: Cancellation propagates after request settlement.
+        """
+        if not sandbox_id:
+            raise ValueError("sandbox_id must not be empty")
+        task = asyncio.create_task(
+            self._change_lifecycle(sandbox_id, "resume"),
+            name="tinkerfin-sandbox-resume-request",
+        )
+        self._track_cleanup_task(task)
+        await _join_owned_task(task, failure_label="OpenSandbox resume")
+
+    async def _get_diagnostic_content(
+        self,
+        sandbox_id: str,
+        *,
+        kind: Literal["logs", "events"],
+        scope: str,
+    ) -> OpenSandboxDiagnosticContent:
+        async with self._sdk_requests.operation():
+            manager: OpenSandboxSDKManager | None = None
+            try:
+                manager = await OpenSandboxSDKManager.create(
+                    connection_config=self._sdk_connection_config
+                )
+                result = (
+                    await manager.get_diagnostic_logs(sandbox_id, scope)
+                    if kind == "logs"
+                    else await manager.get_diagnostic_events(sandbox_id, scope)
+                )
+                return OpenSandboxDiagnosticContent.model_validate(
+                    {
+                        **result.model_dump(by_alias=False),
+                        "warnings": tuple(result.warnings or ()),
+                    }
+                )
+            except Exception as error:
+                translated = _backend_error(f"diagnostic {kind}", error)
+                raise translated from error
+            finally:
+                if manager is not None:
+                    await manager.close()
+
+    async def get_diagnostic_logs(
+        self, sandbox_id: str, *, scope: str = "container"
+    ) -> OpenSandboxDiagnosticContent:
+        """Read provider diagnostic logs without reconnecting or renewing a Sandbox.
+
+        Args:
+            sandbox_id: Existing remote Sandbox identity.
+            scope: Provider-supported log scope, such as ``"container"`` for Docker.
+
+        Returns:
+            Validated inline content or a provider-managed content URL.
+
+        Raises:
+            OpenSandboxBackendError: Reading or validating the diagnostic result fails.
+        """
+        return await self._get_diagnostic_content(sandbox_id, kind="logs", scope=scope)
+
+    async def get_diagnostic_events(
+        self, sandbox_id: str, *, scope: str = "runtime"
+    ) -> OpenSandboxDiagnosticContent:
+        """Read provider diagnostic events without reconnecting or renewing a Sandbox.
+
+        Args:
+            sandbox_id: Existing remote Sandbox identity.
+            scope: Provider-supported event scope, such as ``"runtime"`` for Docker.
+
+        Returns:
+            Validated inline content or a provider-managed content URL.
+
+        Raises:
+            OpenSandboxBackendError: Reading or validating the diagnostic result fails.
+        """
+        return await self._get_diagnostic_content(
+            sandbox_id, kind="events", scope=scope
+        )
+
+    async def get_runtime_info(self, sandbox_id: str) -> OpenSandboxRuntimeInfo:
+        """Read control-plane details without endpoint discovery or health checks.
+
+        ``healthy=False`` means that this read did not perform a health probe; it
+        does not establish that a running instance is unhealthy. Control-plane
+        access remains available while the Sandbox is paused.
+
+        Args:
+            sandbox_id: Existing remote Sandbox identity.
+
+        Returns:
+            The provider's current runtime details with no data-plane health claim.
+
+        Raises:
+            OpenSandboxBackendError: Reading or validating the runtime details fails.
+        """
+        async with self._sdk_requests.operation():
+            manager: OpenSandboxSDKManager | None = None
+            try:
+                manager = await OpenSandboxSDKManager.create(
+                    connection_config=self._sdk_connection_config
+                )
+                info = await manager.get_sandbox_info(sandbox_id)
+                return OpenSandboxRuntimeInfo.from_sdk(info, healthy=False)
+            except Exception as error:
+                translated = _backend_error("runtime info", error)
+                raise translated from error
+            finally:
+                if manager is not None:
+                    await manager.close()
+
+    async def inspect(self, sandbox_id: str) -> OpenSandboxRuntimeInfo:
+        """Read remote details without initialization or lifecycle mutation."""
+        async with self._sdk_requests.operation():
+            sandbox: Sandbox | None = None
+            try:
                 sandbox = await Sandbox.connect(
                     sandbox_id,
                     connection_config=self._sdk_connection_config,
                     connect_timeout=self.config.connect_timeout,
+                    skip_health_check=True,
                 )
-        except Exception as error:
-            translated = _backend_error("connect", error)
-            raise translated from error
-        backend = self._wrap(sandbox)
-        try:
-            async with asyncio.timeout_at(deadline):
-                await self._initialize_workspace(sandbox)
-                await self._initialize(backend)
-        except BaseException as error:
-            await self._close_quietly(backend)
-            if not isinstance(error, Exception) or isinstance(
-                error, OpenSandboxInitializationError
-            ):
-                raise
-            raise OpenSandboxInitializationError(
-                "OpenSandbox initialization failed", cause=error
-            ) from error
-        return backend
-
-    async def connect(self, sandbox_id: str) -> OpenSandboxBackend:
-        """Connect to an existing Sandbox without creating a replacement."""
-        connection_task = asyncio.create_task(self._connect(sandbox_id))
-        try:
-            return await asyncio.shield(connection_task)
-        except asyncio.CancelledError as cancellation:
-            cleanup_task = asyncio.create_task(
-                self._close_cancelled_connect(connection_task)
-            )
-            self._track_cleanup_task(cleanup_task)
-            try:
-                await _join_owned_task(
-                    cleanup_task, failure_label="Cancelled connection cleanup"
+                backend = self._wrap(sandbox)
+                return await backend.aget_runtime_info()
+            except Exception as exc:  # noqa: BLE001 - inspection returns unavailable details
+                return OpenSandboxRuntimeInfo.unavailable(
+                    sandbox_id,
+                    unavailable_reason(exc),
                 )
-            except asyncio.CancelledError:
-                # Even repeated cancellation must settle initialization before a
-                # manager can release its owner claim to the next operation.
-                pass
-            raise cancellation
-
-    async def inspect(self, sandbox_id: str) -> OpenSandboxRuntimeInfo:
-        """Read remote details without initialization or lifecycle mutation."""
-        sandbox: Sandbox | None = None
-        try:
-            sandbox = await Sandbox.connect(
-                sandbox_id,
-                connection_config=self._sdk_connection_config,
-                connect_timeout=self.config.connect_timeout,
-                skip_health_check=True,
-            )
-            backend = self._wrap(sandbox)
-            return await backend.aget_runtime_info()
-        except Exception as exc:  # noqa: BLE001 - inspection returns unavailable details
-            return OpenSandboxRuntimeInfo.unavailable(
-                sandbox_id,
-                unavailable_reason(exc),
-            )
-        finally:
-            if sandbox is not None:
-                await self._close_sdk_quietly(sandbox)
+            finally:
+                if sandbox is not None:
+                    await self._close_sdk_quietly(sandbox)
 
     async def _destroy_once(self, sandbox_id: str) -> None:
         """Connect, kill, and close one Sandbox while preserving the kill outcome."""
 
-        try:
-            sandbox = await Sandbox.connect(
-                sandbox_id,
-                connection_config=self._sdk_connection_config,
-                connect_timeout=self.config.connect_timeout,
-                skip_health_check=True,
-            )
-        except Exception as exc:
-            if unavailable_reason(exc) == "not_found":
-                return
-            translated = _backend_error("destroy lookup", exc)
-            raise translated from exc
-        kill_error: Exception | None = None
-        try:
-            await sandbox.kill()
-        except Exception as error:  # noqa: BLE001 - preserve SDK kill failure through close
-            kill_error = error
-        finally:
-            await self._close_sdk_quietly(sandbox)
-        if kill_error is not None:
-            error = kill_error
-            translated = _backend_error("destroy", error)
-            raise translated from error
+        async with self._sdk_requests.operation():
+            try:
+                sandbox = await Sandbox.connect(
+                    sandbox_id,
+                    connection_config=self._sdk_connection_config,
+                    connect_timeout=self.config.connect_timeout,
+                    skip_health_check=True,
+                )
+            except Exception as exc:
+                if unavailable_reason(exc) == "not_found":
+                    return
+                translated = _backend_error("destroy lookup", exc)
+                raise translated from exc
+            kill_error: Exception | None = None
+            try:
+                await sandbox.kill()
+            except Exception as error:  # noqa: BLE001 - preserve SDK kill failure through close
+                # A repeated DELETE can confirm absence after its first response was
+                # lost. Only the structured SDK status proves idempotent destruction.
+                if unavailable_reason(error) != "not_found":
+                    kill_error = error
+            finally:
+                await self._close_sdk_quietly(sandbox)
+            if kill_error is not None:
+                error = kill_error
+                translated = _backend_error("destroy", error)
+                raise translated from error
 
     async def destroy(self, sandbox_id: str) -> None:
         """Idempotently destroy one remote Sandbox through a retained task.
@@ -620,6 +822,13 @@ class OpenSandboxClient(_SandboxClient):
         while self._cleanup_tasks:
             tasks = tuple(self._cleanup_tasks)
             await asyncio.gather(*tasks, return_exceptions=True)
+        await self._sdk_requests.aclose()
+        # Cancellation can register late-result reclamation after close started
+        # waiting for an active create/connect call. Recheck after SDK scopes and
+        # public result handoff have settled, while their transport is still open.
+        while self._cleanup_tasks:
+            tasks = tuple(self._cleanup_tasks)
+            await asyncio.gather(*tasks, return_exceptions=True)
         owned_connection_config = self._owned_connection_config
         if owned_connection_config is None:
             return
@@ -627,7 +836,7 @@ class OpenSandboxClient(_SandboxClient):
             transport = owned_connection_config.transport
             if transport is None:
                 raise RuntimeError("OpenSandbox owned transport is missing")
-            # OpenSandbox 0.1.14's ownership helper suppresses ordinary close
+            # OpenSandbox 0.1.16's ownership helper suppresses ordinary close
             # failures. This client has already proven ownership in
             # ``_scope_sdk_transport``, so it closes the transport directly and keeps
             # the owner reachable until a successful result. The retry contract is

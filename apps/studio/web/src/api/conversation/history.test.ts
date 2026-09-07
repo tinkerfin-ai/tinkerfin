@@ -93,7 +93,7 @@ describe('conversation Trace client', () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const sentRequest = input instanceof Request ? input : new Request(input)
       expect(sentRequest.headers.get('Authorization')).toBe('Bearer history-token')
-      if (sentRequest.method === 'DELETE') return new Response(null, { status: 204 })
+      if (sentRequest.method === 'DELETE') return envelope(null)
       return envelope({ items: [], nextCursor: null, dayRanges: [7, 30], ...detail() })
     })
     vi.stubGlobal('fetch', fetchMock)
@@ -195,7 +195,7 @@ describe('conversation Trace client', () => {
     })).rejects.toThrow()
   })
 
-  it('keeps delete conflict and empty 204 behavior', async () => {
+  it('preserves delete conflicts and accepts a null success envelope', async () => {
     vi.stubGlobal('fetch', vi.fn()
       .mockResolvedValueOnce(envelope(
         null,
@@ -203,7 +203,7 @@ describe('conversation Trace client', () => {
         '会话仍在运行，请先停止并等待运行结束',
         409,
       ))
-      .mockResolvedValueOnce(new Response(null, { status: 204 })))
+      .mockResolvedValueOnce(envelope(null)))
 
     await expect(deleteConversation('thread-running')).rejects.toThrow(
       '会话仍在运行，请先停止并等待运行结束',

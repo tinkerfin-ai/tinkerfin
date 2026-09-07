@@ -419,6 +419,26 @@ class _LifecycleNotifications:
                 workspace_may_have_changed=True,
             )
 
+    def paused(self, owner_key: str, sandbox_id: str) -> None:
+        """Observe an intentional pause without reporting a connectivity outage."""
+        self.invalidate_checks(owner_key)
+        self._outages.pop(owner_key, None)
+        self._emit(
+            EventType.PAUSED, owner_key, Reason.EXPLICIT_PAUSE, sandbox_id=sandbox_id
+        )
+
+    def resumed(self, owner_key: str, sandbox_id: str) -> None:
+        """Observe successful explicit resume after connection initialization."""
+        self.invalidate_checks(owner_key)
+        self._outages.pop(owner_key, None)
+        self._emit(
+            EventType.RESUMED,
+            owner_key,
+            Reason.EXPLICIT_RESUME,
+            sandbox_id=sandbox_id,
+            workspace_may_have_changed=True,
+        )
+
     def workspace_reset(self, owner_key: str, sandbox_id: str) -> None:
         self._emit(
             EventType.WORKSPACE_RESET,

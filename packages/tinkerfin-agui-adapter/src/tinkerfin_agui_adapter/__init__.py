@@ -33,6 +33,15 @@ from .hitl import HitlRequest as HitlRequest
 from .hitl import HitlReviewConfig as HitlReviewConfig
 from .ids import ScopedIdCodec as ScopedIdCodec
 from .lifecycle import AgUiLifecycleEventFactory as AgUiLifecycleEventFactory
+from .media_events import (
+    AttachmentAssistantMessage,
+    AttachmentMessagesSnapshotEvent,
+    AttachmentOutputEvent,
+    AttachmentSnapshotMessage,
+    AttachmentToolCallResultEvent,
+    AttachmentToolMessage,
+    parse_attachment_output_event,
+)
 from .microbatch import micro_batch as micro_batch
 from .models import AgentRuntimeInterrupt as AgentRuntimeInterrupt
 from .resume import ResumeMapper as ResumeMapper
@@ -64,6 +73,12 @@ __all__ = [
     "AgUiStreamContractError",
     "AgentRunOutcome",
     "AgentRuntimeInterrupt",
+    "AttachmentAssistantMessage",
+    "AttachmentMessagesSnapshotEvent",
+    "AttachmentOutputEvent",
+    "AttachmentSnapshotMessage",
+    "AttachmentToolCallResultEvent",
+    "AttachmentToolMessage",
     "DeepAgentAgUiAdapter",
     "HitlActionRequest",
     "HitlCorrelationError",
@@ -93,6 +108,7 @@ __all__ = [
     "create_subagent_provenance",
     "encode_sse",
     "micro_batch",
+    "parse_attachment_output_event",
     "parse_tool_review_interrupt",
     "require_valid_schema",
     "subagent_invocation_id",

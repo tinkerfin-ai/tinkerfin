@@ -2,15 +2,43 @@
 
 from __future__ import annotations
 
+import pytest
+
 from tinkerfin_sandbox import (
+    OpenSandboxBackendError,
     OpenSandboxBackendTimeoutError,
+    OpenSandboxBusyError,
     OpenSandboxError,
     OpenSandboxErrorCode,
+    OpenSandboxFileTooLargeError,
     OpenSandboxInitializationError,
+    OpenSandboxLifecycleUncertainError,
+    OpenSandboxPausedError,
     OpenSandboxSettlementTimeoutError,
     OpenSandboxStateUnavailableError,
     OpenSandboxWarmPoolUnavailableError,
 )
+
+
+@pytest.mark.parametrize(
+    ("error_type", "code"),
+    [
+        (OpenSandboxFileTooLargeError, OpenSandboxErrorCode.FILE_TOO_LARGE),
+        (OpenSandboxPausedError, OpenSandboxErrorCode.PAUSED),
+        (OpenSandboxBusyError, OpenSandboxErrorCode.BUSY),
+        (OpenSandboxLifecycleUncertainError, OpenSandboxErrorCode.LIFECYCLE_UNCERTAIN),
+    ],
+)
+def test_admission_errors_preserve_the_public_backend_error_contract(
+    error_type: type[OpenSandboxBackendError], code: OpenSandboxErrorCode
+) -> None:
+    cause = RuntimeError("private provider response")
+    error = error_type("Sandbox is not ready for use", cause=cause)
+    assert isinstance(error, OpenSandboxError)
+    assert error.code is code
+    assert error.cause is error.__cause__ is cause
+    assert dict(error.context) == {}
+    assert "private" not in str(error)
 
 
 def test_error_codes_are_unique_and_namespaced() -> None:

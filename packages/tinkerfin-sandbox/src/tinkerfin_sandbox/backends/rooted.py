@@ -912,6 +912,45 @@ class RootedOpenSandboxBackend(BaseSandbox):
             paths,
         )
 
+    async def aread_bytes(
+        self, path: str, *, max_bytes: int, timeout: float = 30
+    ) -> bytes:
+        """Read a complete workspace binary file within an explicit byte limit.
+
+        Args:
+            path: Virtual file path within this view's workspace root.
+            max_bytes: Maximum accepted size in bytes; zero permits only empty files.
+            timeout: Read deadline in seconds, greater than zero and at most 290.
+                Response and helper cleanup may each take up to five additional seconds.
+
+        Returns:
+            Complete bytes. No partial content is returned on overflow or failure.
+
+        Raises:
+            ValueError: The virtual path or limits are invalid.
+            FileNotFoundError: The workspace file does not exist.
+            PermissionError: The file is not readable.
+            IsADirectoryError: The target is not a regular file.
+            OpenSandboxFileTooLargeError: The content exceeds ``max_bytes``.
+            OpenSandboxBackendError: The read or descriptor cleanup failed.
+            OpenSandboxBackendTimeoutError: The read deadline expired.
+
+        File descriptors enforce the workspace boundary even during path replacement.
+        Cancellation stops the transfer and retains the Handle lease until response
+        and descriptor cleanup finish. Memory retains bounded content, one transport
+        chunk, and the final bytes copy.
+        """
+        mapped = self._map_path(path)
+        if mapped is None:
+            raise ValueError("path must be a valid workspace file path")
+        async with self._handle._alease() as backend:
+            return await backend._aread_rooted_bytes(
+                root=self._root,
+                path=mapped.virtual,
+                max_bytes=max_bytes,
+                timeout=timeout,
+            )
+
     async def adownload_files(
         self,
         paths: list[str],

@@ -192,10 +192,11 @@ async def test_mysql57_borrowed_settlement_restores_or_invalidates_session(
         raise failure
 
     entered = asyncio.Event()
+    release_operation = asyncio.Event()
 
     async def block_operation(_connection: AsyncConnection) -> None:
         entered.set()
-        await asyncio.Event().wait()
+        await release_operation.wait()
 
     with pytest.raises(RuntimeError) as captured:
         await state._run_write_transaction(fail_operation)
@@ -205,6 +206,10 @@ async def test_mysql57_borrowed_settlement_restores_or_invalidates_session(
     operation = asyncio.create_task(state._run_write_transaction(block_operation))
     await asyncio.wait_for(entered.wait(), timeout=2)
     operation.cancel("borrowed MySQL operation cancelled")
+    await asyncio.sleep(0)
+    # Complete the operation owned by the test so State can roll it back and
+    # return the connection without interrupting unconsumed driver results.
+    release_operation.set()
     with pytest.raises(
         asyncio.CancelledError,
         match="borrowed MySQL operation cancelled",
@@ -475,13 +480,14 @@ async def test_mysql8_export_and_runtime_claims_are_compatible(
     assert table_names == schema.table_names
     assert index_names == (
         "ix_tinkerfin_opensandbox_cleanup_lease",
+        "ix_tinkerfin_opensandbox_holders_binding",
         "ix_tinkerfin_opensandbox_owners_lease",
         "ix_tinkerfin_opensandbox_warm_slots_available",
         "ix_tinkerfin_opensandbox_workers_lease",
     )
-    assert len(table_comments) == 4
+    assert len(table_comments) == 6
     assert all(table_comments)
-    assert len(column_comments) == 28
+    assert len(column_comments) == 41
     assert all(column_comments)
     claim_sql = tuple(sql for sql in observed_sql if " FOR UPDATE" in sql)
     assert claim_sql

@@ -9,7 +9,9 @@ from collections.abc import Awaitable
 from dataclasses import dataclass
 from typing import Literal, Protocol, TypeAlias, cast, runtime_checkable
 
-from pydantic import JsonValue
+from pydantic import JsonValue, ValidationError
+
+from tinkerfin_contracts.media import Attachment
 
 from .errors import TraceCaptureRejected
 
@@ -206,11 +208,15 @@ def secure_redact(
     """Apply non-replaceable framework safety before and after business redaction."""
 
     normalized = _normalize_json(value)
-    safe = _strip_private_reasoning(_redact_credentials(normalized))
+    safe = _strip_private_reasoning(
+        _redact_credentials(_restore_attachment_references(normalized))
+    )
     if redactor is None:
         return safe
     business_safe = _apply_redactor(redactor, safe, context=context)
-    return _strip_private_reasoning(_redact_credentials(business_safe))
+    return _strip_private_reasoning(
+        _redact_credentials(_restore_attachment_references(business_safe))
+    )
 
 
 def _apply_redactor(
@@ -325,6 +331,27 @@ def _is_credential_key(value: str) -> bool:
         normalized == credential or normalized.endswith(f"_{credential}")
         for credential in _CREDENTIAL_KEYS
     )
+
+
+def _restore_attachment_references(value: JsonValue) -> JsonValue:
+    """Remove request-only image bytes using the explicit attachment metadata contract."""
+    if isinstance(value, list):
+        return [_restore_attachment_references(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    extras = value.get("extras")
+    if (
+        value.get("type") == "image_url"
+        and isinstance(extras, dict)
+        and "attachment" in extras
+    ):
+        try:
+            return Attachment.model_validate(extras["attachment"]).content_block()
+        except ValidationError as error:
+            raise TraceCaptureRejected(
+                "Trace attachment metadata is invalid", cause=error
+            ) from error
+    return {key: _restore_attachment_references(item) for key, item in value.items()}
 
 
 def _redact_credentials(value: JsonValue) -> JsonValue:

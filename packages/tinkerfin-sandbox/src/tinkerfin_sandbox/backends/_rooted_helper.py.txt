@@ -1050,7 +1050,7 @@ def prepare_offload_capture(root, virtual_parts):
         canonical = canonical_parts(root, virtual_parts)
         if not canonical:
             raise OSError(errno.EXDEV, "unsafe capture path")
-        parent_descriptor = open_transfer_parent(root_descriptor, canonical[:-1])
+        parent_descriptor = open_transfer_parent(root_descriptor, canonical[:-1], create=True)
         state["parent_descriptor"] = parent_descriptor
         target_name = canonical[-1]
         state["target_name"] = target_name
@@ -1269,7 +1269,7 @@ def offload_command(root, arguments):
         cleanup_offload_capture(capture)
 
 
-def open_transfer_parent(root_descriptor, canonical_parts_value):
+def open_transfer_parent(root_descriptor, canonical_parts_value, create):
     descriptor = os.dup(root_descriptor)
     try:
         for part in canonical_parts_value:
@@ -1277,6 +1277,8 @@ def open_transfer_parent(root_descriptor, canonical_parts_value):
             try:
                 next_descriptor = os.open(part, flags, dir_fd=descriptor)
             except FileNotFoundError:
+                if not create:
+                    raise
                 os.mkdir(part, 0o755, dir_fd=descriptor)
                 next_descriptor = os.open(part, flags, dir_fd=descriptor)
             os.close(descriptor)
@@ -1310,7 +1312,9 @@ def transfer_file(root, arguments):
     target_descriptor = None
     try:
         canonical = canonical_parts(root, virtual_parts)
-        parent_descriptor = open_transfer_parent(root_descriptor, canonical[:-1])
+        parent_descriptor = open_transfer_parent(
+            root_descriptor, canonical[:-1], create=mode == "upload"
+        )
         target_name = canonical[-1]
         flags = os.O_NOFOLLOW | os.O_CLOEXEC
         if mode == "upload":
@@ -1328,9 +1332,10 @@ def transfer_file(root, arguments):
                     dir_fd=parent_descriptor,
                 )
         else:
+            # A FIFO must reach fstat rejection without waiting for a writer.
             target_descriptor = os.open(
                 target_name,
-                flags | os.O_RDONLY,
+                flags | os.O_RDONLY | os.O_NONBLOCK,
                 dir_fd=parent_descriptor,
             )
         target = os.fstat(target_descriptor)

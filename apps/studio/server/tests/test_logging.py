@@ -165,5 +165,10 @@ print(json.dumps({"executed": executed, "values": values, "failures": failures})
             assert len(sql_lines) == (2 if echo else 0)
             assert all("[INFO] [sqlalchemy.engine.Engine" in line for line in sql_lines)
         parameter_lines = [line for line in lines if line.endswith("(271828,)")]
-        assert len(parameter_lines) == (2 if echo else 0)
+        assert parameter_lines == []
+        assert (
+            "SQL parameters hidden" in output
+            if echo
+            else "SQL parameters hidden" not in output
+        )
         assert sum(line.endswith("query_failure_delivered") for line in lines) == 2

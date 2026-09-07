@@ -43,10 +43,14 @@ values; booleans are rejected before State startup or task creation.
 | `reconnect(key)` | Reconnect an existing binding; fail if none exists | No |
 | `recreate(key)` | Commit a replacement and retire the old instance | Yes |
 | `reset(key)` | Clear workspace-root contents | No |
+| `pause(key, timeout=30.0)` | Drain registered holders and confirm remote pause | No |
+| `resume(key, timeout=30.0)` | Resume and return a ready backend for the original instance | No |
 | `destroy(key)` | Destroy known instances and remove the binding | Binding is removed |
 | `delete(key)` | Alias for `destroy()` | Binding is removed |
 | `is_healthy(key)` | Probe the current instance | No |
 | `get_details(key)` | Return runtime and owner information | No |
+| `get_diagnostic_logs(key, scope="container")` | Read scoped provider logs through the control plane | No |
+| `get_diagnostic_events(key, scope="runtime")` | Read scoped provider event diagnostics | No |
 | `check_ready()` | Raise unless configured warm capacity is verified | No |
 
 ```python
@@ -56,6 +60,63 @@ details = await manager.get_details(project_key)
 ```
 
 Most requests only need `get()`. Recreating on every request defeats reuse and warm capacity.
+
+## Pause and resume
+
+```python
+backend = await manager.get(project_key)
+await manager.pause(project_key, timeout=30.0)
+backend = await manager.resume(project_key, timeout=30.0)
+```
+
+`pause()` preserves the binding, remote ID, files, and stable handle objects. Managers
+sharing the same State coordinate the pause across their registered handles. Each
+holder stops accepting new operations and acknowledges the current pause intent only
+after admitted operations and their remote command or transfer settlement finish.
+The remote pause request is sent only after all registered holders acknowledge.
+
+Other processes observe the shared intent asynchronously, so an existing handle can
+accept work until its manager observes that intent. The pause waits for that work as
+well. Holder registration and pause intent compete atomically in State. Ordinary
+operations on an admitted handle use local admission and do not add a State query per
+call. Worker expiry or missing heartbeats cannot substitute for settled work; a lost
+holder or an unresolved remote operation can prevent pause from completing.
+
+The default work budget is 30 seconds. `timeout` must be finite and positive and covers
+coordination plus remote confirmation. If draining times out or is cancelled, access
+reopens only when State confirms the intent is still undispatched and cancels it.
+An uncertain result after dispatch keeps access closed until control-plane evidence
+resolves the request; it does not authorize automatic replay. Necessary request and
+resource settlement can extend elapsed time beyond the work budget.
+
+Instances paused through the manager require explicit `resume()`. `get()`,
+`reconnect()`, and `reset()` do not wake them. Resume can cancel a confirmed undispatched
+drain; for a paused instance, it resumes the original remote ID and refreshes the calling
+manager's connection before returning a ready backend. Other registered managers each
+refresh their connection before reopening their existing handle. Connection initializers
+still run, and a failed refresh leaves that handle closed to new work.
+
+Official OpenSandbox Server 0.2.3 uses Docker pause/unpause. `resume()` cannot start a
+container stopped through Docker or recover an expired instance. Pause does not freeze
+or extend the remote TTL; a paused instance with a finite lifetime can expire.
+
+## Diagnostics
+
+```python
+logs = await manager.get_diagnostic_logs(project_key, scope="container")
+events = await manager.get_diagnostic_events(project_key, scope="runtime")
+```
+
+Both queries use the existing binding and the control plane. They do not create,
+connect, initialize, renew, or wake a Sandbox. A missing binding raises a backend error.
+Docker log scopes are `container` and `all`; event scopes are `runtime` and `all`.
+Docker events describe current runtime state, not a complete historical event stream.
+
+The immutable `OpenSandboxDiagnosticContent` result distinguishes inline `content`
+from `content_url` with an expiration. `content_type`, optional byte length,
+`truncated`, and `warnings` describe the returned content and source limitations.
+The framework does not fetch URLs automatically. Hosts control who can read diagnostic
+text and references and how that operational data is retained.
 
 ## Remote lifetime
 
@@ -114,7 +175,7 @@ verification retains previously published capacity. The check reads shared State
 so consumption by another worker is visible immediately; only a confirmed failure
 withdraws capacity during verification.
 
-Close waits for active creation, replacement, reset, and cleanup to settle safely. A finite `settlement_timeout` only limits this caller's wait. It raises `OpenSandboxSettlementTimeoutError` without cancelling owned cleanup; call `aclose()` later to continue waiting.
+Close waits for active creation, replacement, reset, pause/resume coordination, and cleanup to settle safely. A finite `settlement_timeout` only limits this caller's wait. It raises `OpenSandboxSettlementTimeoutError` without cancelling owned cleanup; call `aclose()` later to continue waiting.
 
 The default in-memory State owns remote instances for the manager lifetime and
 destroys them during close. Persistent State retains remote bindings for other
@@ -192,6 +253,8 @@ manager = OpenSandboxManager(
 | `recovery_failed` | Recovery or requested replacement failed; the operation still reports its error |
 | `workspace_reset` | An explicit reset finished clearing the configured workspace |
 | `destroyed` | Explicit destruction and binding removal completed |
+| `paused` | Explicit pause was confirmed for the bound instance |
+| `resumed` | Explicit resume returned a ready local handle for the same instance |
 | `warm_capacity_degraded` / `warm_capacity_restored` | Verified unbound capacity became unavailable or available |
 
 Events contain a unique `event_id`, `type`, host-resolved `owner_key`, UTC
@@ -221,8 +284,9 @@ close produces no user failure or destruction event. Warm events have
 `owner_key=None` and do not masquerade as user Sandbox failures.
 
 External changes are discovered through existing `get()`, `is_healthy()`,
-`get_details()`, or warm maintenance checks. Notifications add no user Sandbox
-polling, persistent outbox, or cross-process delivery guarantee. Observations are
+`get_details()`, or warm maintenance checks. Notifications add no remote user Sandbox
+polling, persistent outbox, or cross-process delivery guarantee. Shared-State polling
+for pause/resume coordination is independent of notification delivery. Observations are
 local to a manager; consumers requiring durable records own their storage.
 
 Each observer has an independent ordered queue. The defaults are 128 pending events
@@ -248,10 +312,10 @@ After creation, health checking, replacement, reset, destroy, or close begins, t
 
 `OpenSandboxClient.destroy()` retains one task per Sandbox ID. Concurrent callers join
 that same remote kill and local close. Caller cancellation waits for settlement and then
-propagates. Once kill succeeds, an SDK close failure is logged as cleanup evidence rather
-than reported as a remote destruction failure. Client close waits for all active destroy
-tasks before closing the shared transport it created when `ConnectionConfig` omitted
-one. Concurrent client-close callers join one retained settlement. Cancelling a waiter
+propagates. Once kill succeeds, an SDK close failure does not turn it into a remote
+destruction failure. Client close waits for create/connect result handoff, cancelled-result
+reclamation, SDK child requests, and active destruction before closing the shared transport
+it created when `ConnectionConfig` omitted one. Concurrent client-close callers join one retained settlement. Cancelling a waiter
 does not cancel transport closure, and a close task that fails can be retried without
 losing ownership. A caller-supplied transport remains borrowed and is never closed by
 the client.
@@ -264,10 +328,18 @@ if details is not None:
     print(details.sandbox_id)
     print(details.available, details.healthy)
     print(details.owner_key, details.cached)
+    print(details.access_state)
 ```
 
 `None` means no known binding. When `available=False`, `unavailable_reason` is `not_found` or `unreachable`.
 An available snapshot with `expires_at=None` identifies a manual-cleanup instance.
 When details are unavailable, a null expiry is unknown.
+
+`access_state` reports the framework's shared coordination phase independently of the
+provider's `status.state`. A remote instance can still report `Running` while the
+framework is `draining`, `pausing`, or awaiting confirmation. `None` means a coordination
+snapshot was not supplied. During suspension, details use only the control plane;
+`healthy=False` then means no data-plane probe was performed. A cached handle may remain
+closed to work while its connection is being refreshed.
 
 Next: [Rooted files and commands](rooted-filesystem.md).

@@ -20,6 +20,8 @@ class OpenSandboxLifecycleEventType(StrEnum):
     REPLACED = "replaced"
     RECOVERY_FAILED = "recovery_failed"
     DESTROYED = "destroyed"
+    PAUSED = "paused"
+    RESUMED = "resumed"
     WORKSPACE_RESET = "workspace_reset"
     WARM_CAPACITY_DEGRADED = "warm_capacity_degraded"
     WARM_CAPACITY_RESTORED = "warm_capacity_restored"
@@ -44,6 +46,8 @@ class OpenSandboxLifecycleReason(StrEnum):
     EXPLICIT_RECREATE = "explicit_recreate"
     EXPLICIT_RESET = "explicit_reset"
     EXPLICIT_DESTROY = "explicit_destroy"
+    EXPLICIT_PAUSE = "explicit_pause"
+    EXPLICIT_RESUME = "explicit_resume"
     WARM_CAPACITY_UNAVAILABLE = "warm_capacity_unavailable"
     WARM_CAPACITY_AVAILABLE = "warm_capacity_available"
 
@@ -94,6 +98,7 @@ class OpenSandboxLifecycleEvent:
         """Whether this event confirms restored Sandbox or warm availability."""
         return self.type in {
             OpenSandboxLifecycleEventType.RECOVERED,
+            OpenSandboxLifecycleEventType.RESUMED,
             OpenSandboxLifecycleEventType.REPLACED,
             OpenSandboxLifecycleEventType.WARM_CAPACITY_RESTORED,
         }

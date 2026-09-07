@@ -15,6 +15,7 @@ from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import BaseMessage, HumanMessage
 from langchain_core.runnables import Runnable, RunnableConfig
+from langchain_core.tools import BaseTool
 from langgraph.cache.base import BaseCache
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
@@ -24,6 +25,7 @@ from langgraph.types import StateSnapshot, interrupt
 from langgraph.typing import ContextT
 from pydantic import ConfigDict, JsonValue, TypeAdapter
 
+from tinkerfin.media import AttachmentSupport
 from tinkerfin_contracts import RunIdentity
 from tinkerfin_native_stream import RuntimeInterruptEnvelope
 
@@ -505,13 +507,15 @@ setattr(
 class _PlanningGraphFactory(Generic[ContextT]):
     """Deferred builder that borrows one Deep Agent definition's resources."""
 
-    __slots__ = ("_options", "_signature")
+    __slots__ = ("_attachments", "_options", "_signature")
 
     def __init__(
         self,
         signature: inspect.Signature,
         options: PlanOptions,
+        attachments: AttachmentSupport | None,
     ) -> None:
+        self._attachments = attachments
         self._signature = signature
         self._options = options
 
@@ -558,10 +562,24 @@ class _PlanningGraphFactory(Generic[ContextT]):
             base_state_schema,
             middleware=caller_middleware,
         )
+        supplied_tools = arguments.get("tools", ())
+        read_only_tools = (
+            tuple(
+                tool
+                for tool in supplied_tools
+                if isinstance(tool, BaseTool)
+                and tool.metadata
+                and tool.metadata.get("read_only") is True
+            )
+            if isinstance(supplied_tools, Sequence)
+            else ()
+        )
         resolved_model = resolve_planner_model(self._options.planner_model or model)
         planner = create_planner_agent(
             resolved_model,
             backend=backend,
+            attachments=self._attachments,
+            read_only_tools=read_only_tools,
             clarification=self._options.clarification,
             content=self._options.content,
             response_type=self._options.contracts.planner_response_type,
@@ -570,6 +588,8 @@ class _PlanningGraphFactory(Generic[ContextT]):
         edit_planner = create_planner_agent(
             resolved_model,
             backend=backend,
+            attachments=self._attachments,
+            read_only_tools=read_only_tools,
             clarification=self._options.clarification,
             content=self._options.content,
             response_type=self._options.contracts.planner_edit_response_type,
@@ -878,11 +898,13 @@ class _PlanningGraphFactory(Generic[ContextT]):
             current = read_plan_state(mapped, self._options.content)
             if current.status is not PlanStatus.AWAITING_INPUT:
                 raise RuntimeError("Plan review reply requires awaiting input state")
+            reply_messages = _messages(mapped)
             reply = await invoke_plan_review_reply(
                 resolved_model,
-                _messages(mapped),
+                reply_messages,
                 current,
                 config=config,
+                attachments=self._attachments,
             )
             return {"messages": [reply]}
 
@@ -944,12 +966,14 @@ class _PlanningGraphFactory(Generic[ContextT]):
 def prepare_plan_factory(
     signature: inspect.Signature,
     options: PlanOptions,
+    *,
+    attachments: AttachmentSupport | None = None,
 ) -> _PlanningFactory:
     """Return a lazy standalone Planning graph factory for one Definition."""
 
     return cast(
         _PlanningFactory,
-        _PlanningGraphFactory(signature, options),
+        _PlanningGraphFactory(signature, options, attachments),
     )
 
 

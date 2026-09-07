@@ -1,3 +1,4 @@
+import { attachmentInput, isAttachment, messageText, messageAttachments, type Attachment } from '../attachments/content'
 import type {
   AgentMode,
   ChatMessageInput,
@@ -798,6 +799,7 @@ const syncEffectiveModeFromState = (
 export const buildInitialPayload = (
   conversation: Conversation,
   content: string,
+  attachments: readonly Attachment[] = [],
 ): ChatRequestPayload => {
   const runId = createRunId()
   return {
@@ -808,7 +810,7 @@ export const buildInitialPayload = (
       {
         id: `request-${runId}`,
         role: "user",
-        content,
+        content: attachments.length ? [...(content ? [{ type: "text", text: content }] : []), ...attachments.map(attachmentInput)] : content,
       } satisfies ChatMessageInput,
     ],
     tools: [],
@@ -1230,22 +1232,60 @@ export const applyConversationEvent = (
       }
     }
 
+    case "CUSTOM": {
+      if (event.name !== 'tinkerfin.message.attachments' || !isJsonObject(event.value)) return conversation
+      const messageId = event.value.messageId
+      const attachments = event.value.attachments
+      if (typeof messageId !== 'string' || !Array.isArray(attachments)) return conversation
+      const additions = attachments.filter(isAttachment)
+      const mergeAttachments = (message: Message | null) =>
+        [...new Map([...(message?.attachments ?? []), ...additions].map(item => [item.id, item])).values()]
+      const rawEvent = rawEventOrMain(conversation, event.rawEvent)
+      if (rawEvent.source.agentType === 'subagent') {
+        return updateSubagentRun(conversation, rawEvent, message => ({
+          ...message,
+          attachments: mergeAttachments(message),
+        }))
+      }
+      return upsertAssistantMessage(conversation, messageId, message => ({
+        id: messageId, role: 'assistant', content: message?.content ?? '', createdAt: message?.createdAt ?? nowIso(),
+        meta: message?.meta,
+        attachments: mergeAttachments(message),
+      }))
+    }
+
     case "MESSAGES_SNAPSHOT":
-      // MESSAGES_SNAPSHOT 是标准 AG-UI 对话投影，不是完整 UI 快照，不能作为会话
-      // 权威状态；Todo、工具和子智能体卡片仍由事件流驱动，仅在助手文本为空时替换，
-      // 避免覆盖正在流式生成的内容
+      // 快照按工具调用 ID 同步附件；已有卡片的文本、运行状态和来源仍由实时事件维护
       return {
         ...conversation,
         messages: conversation.messages.length === 0
           ? event.messages
-            .filter((message) => message.role === "user" || message.role === "assistant")
-            .map((message) => ({
+            .filter((message) => message.role === "user" || message.role === "assistant" || message.role === "tool")
+            .map((message): Message => message.role === "tool" ? {
+              id: message.toolCallId!,
+              role: "tool",
+              content: "tool",
+              attachments: message.attachments ?? messageAttachments(message.content),
+              createdAt: nowIso(),
+              meta: { toolCallId: message.toolCallId, result: messageText(message.content), status: message.error ? "failed" : "completed" },
+            } : {
               id: message.id,
               role: message.role === "user" ? "user" : "assistant",
-              content: typeof message.content === "string" ? message.content : "",
+              content: messageText(message.content),
+              attachments: message.attachments ?? messageAttachments(message.content),
               createdAt: nowIso(),
-            }))
-          : conversation.messages,
+            })
+          : conversation.messages.map(message => {
+              const snapshot = event.messages.find(item => item.role === message.role && (
+                message.role === "tool"
+                  ? item.toolCallId === message.meta?.toolCallId
+                  : item.id === message.id
+              ))
+              return snapshot ? {
+                ...message,
+                attachments: snapshot.attachments ?? messageAttachments(snapshot.content),
+              } : message
+            }),
       }
 
     case "STATE_SNAPSHOT":
@@ -1279,6 +1319,7 @@ export const applyConversationEvent = (
         id: event.messageId,
         role: "assistant",
         content: message?.content ?? "",
+        attachments: message?.attachments,
         createdAt: message?.createdAt ?? nowIso(),
         meta: {
           ...message?.meta,
@@ -1305,6 +1346,7 @@ export const applyConversationEvent = (
         id: event.messageId,
         role: "assistant",
         content: `${message?.content ?? ""}${event.delta}`,
+        attachments: message?.attachments,
         createdAt: message?.createdAt ?? nowIso(),
         meta: {
           ...message?.meta,
@@ -1420,6 +1462,7 @@ export const applyConversationEvent = (
             id: message?.id ?? event.toolCallId,
             role: "tool",
             content: message?.content ?? message?.meta?.toolName ?? "tool",
+            attachments: event.attachments,
             createdAt,
             meta: {
               ...message?.meta,

@@ -12,3 +12,5 @@ export {
 } from './locale'
 export type { LanguagePreference, ResolvedLanguage } from './locale'
 export type { TranslationKey, TranslationParams } from './messages'
+
+export { isTranslationKey } from './messages'

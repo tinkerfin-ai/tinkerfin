@@ -51,6 +51,31 @@ async for event in events:
 独立转换器无法推断宿主的私有字段，因此 `private_state_keys` 需要显式提供，并且只过滤顶层
 channel，不会递归删除嵌套同名业务字段。TinkerFin Plan Definition 会自动提供自己的内部 key。
 
+## 持久图片与文档
+
+`tinkerfin_contracts.media` 的 `Attachment` 包含 `id`、`name`、`mime_type`
+和 `size_bytes`。调用 `content_block()` 会得到 LangChain 的 `image` 或 `file`
+内容块，带有 `file_id`、`mime_type` 和 `extras.attachment`。消息保存该引用；宿主
+负责访问授权，并通过 `TinkerFin().attachments(AttachmentSupport(read_image=...))`
+在模型请求时提供图片字节。每个目标模型独立判断图片能力；自定义编译 Agent 单独配置附件访问。
+
+普通运行直接向 `TinkerFin.open_agui_run(messages=...)` 提交标准用户消息，由框架校验并转换。宿主自行分配消息 ID 时，可用 `AgUiUserInput` 提前读取文字和附件引用、替换已授权的附件描述。
+
+自定义适配集成可使用底层 `tinkerfin_agui_adapter.media` 的 `user_message_to_langchain()` 转换 AG-UI
+用户输入。持久图片使用 `type: "image"`，文档使用 `type: "document"`，
+`source` 为 `{"type": "url", "value": "attachment:<id>"}`，`metadata` 放附件描述。
+用户消息快照保留这一形态。
+
+工具结果与助手快照通过 `attachments` 数组提供附件描述。助手流式输出使用 CUSTOM
+事件 `tinkerfin.message.attachments`，值为
+`{"messageId": "<scoped-id>", "attachments": [...]}`，位于对应的
+TEXT_MESSAGE_START 与 TEXT_MESSAGE_END 之间。增量按附件 ID 合并，快照数组替换
+已有描述。子 Agent 输出依据 `rawEvent.source` 归入对应调用。
+
+`tinkerfin_agui_adapter.media` 的 `MessageAttachments` 校验该 CUSTOM 载荷。
+包内提供 `contracts/message-attachments.schema.json`，以及经过真实 LangChain
+工具调用的 Fixture。附件描述不包含文件字节、密钥或临时下载地址。
+
 ## 编码成 SSE
 
 ```python
@@ -158,3 +183,12 @@ Deep Agents `task` 调用发布 `tinkerfin.subagent-provenance` 形状的
 AG-UI `parentRunId` 继续只表达分支和时间旅行谱系。
 
 下一篇：[AG-UI 使用参考](api-reference.md)。
+
+`AttachmentToolCallResultEvent`、`AttachmentAssistantMessage` 和
+`AttachmentToolMessage` 正式声明 `attachments` 字段；
+`AttachmentMessagesSnapshotEvent` 校验并序列化包含附件的历史消息。
+从通用 AG-UI 回放取得事件后，可调用 `parse_attachment_output_event(event)`，
+将工具结果或消息快照校验为公开的附件类型。包内 `contracts/` 同时提供
+`tool-call-result.schema.json`、`assistant-message.schema.json`、
+`tool-message.schema.json` 和 `messages-snapshot.schema.json`，共享 Fixture
+覆盖实时输出及其对应历史快照。

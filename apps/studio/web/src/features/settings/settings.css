@@ -1,10 +1,13 @@
 @layer settings {
   .settings-dialog {
+    --settings-content-inset: var(--space-5);
     display: grid;
     grid-template-rows: auto minmax(0, 1fr);
     width: min(var(--layout-settings-dialog), calc(100vw - var(--space-8)));
     height: min(var(--layout-settings-height), calc(100dvh - var(--space-8)));
   }
+
+  .settings-dialog .modal-dialog-head { padding-inline: var(--settings-content-inset); }
 
   .settings-layout {
     position: relative;
@@ -46,7 +49,7 @@
   .settings-content {
     min-width: 0;
     overflow-y: auto;
-    padding: var(--space-6);
+    padding: var(--settings-content-inset);
   }
 
   .settings-section + .settings-section { margin-top: var(--space-8); }
@@ -97,9 +100,9 @@
   .settings-theme-option.is-selected { border-color: var(--color-brand); background: var(--color-brand-soft); color: var(--color-brand-text); }
   .settings-theme-option input { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 
-  .settings-language-picker { position: relative; width: min(100%, 280px); margin-top: var(--space-4); }
-  .settings-language-trigger,
-  .settings-language-option {
+  .settings-choice-picker { position: relative; width: min(100%, 280px); margin-top: var(--space-4); }
+  .settings-choice-trigger,
+  .settings-choice-option {
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -113,25 +116,28 @@
     color: var(--color-text-primary);
     cursor: pointer;
   }
-  .settings-language-trigger:hover { background: var(--color-hover); }
-  .settings-language-trigger:active { background: var(--color-active); }
-  .settings-language-trigger:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 0; }
-  .settings-language-trigger:disabled { cursor: not-allowed; opacity: .48; }
-  .settings-language-options { position: absolute; z-index: var(--layer-dropdown); right: 0; left: 0; margin-top: var(--space-1); padding: var(--space-1); border: 1px solid var(--color-border); border-radius: var(--radius-xl); background: var(--color-layer-1); box-shadow: var(--shadow-3); outline: 0; }
-  .settings-language-option { border: 0; border-radius: var(--radius-lg); }
-  .settings-language-option:hover,
-  .settings-language-option[data-active='true'] { background: var(--color-hover); }
-  .settings-language-option:active { background: var(--color-active); }
-  .settings-language-option:focus-visible { outline: 2px solid var(--color-focus); outline-offset: -2px; }
-  .settings-language-check { display: grid; width: var(--icon-md); height: var(--icon-md); flex: 0 0 auto; place-items: center; color: var(--color-brand-text); }
+  .settings-choice-trigger:hover { background: var(--color-hover); }
+  .settings-choice-trigger:active { background: var(--color-active); }
+  .settings-choice-trigger:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 0; }
+  .settings-choice-trigger:disabled { cursor: not-allowed; opacity: .48; }
+  .settings-choice-options { position: absolute; z-index: var(--layer-dropdown); right: 0; left: 0; margin-top: var(--space-1); padding: var(--space-1); border: 1px solid var(--color-border); border-radius: var(--radius-xl); background: var(--color-layer-1); box-shadow: var(--shadow-3); outline: 0; }
+  .settings-choice-option { border: 0; border-radius: var(--radius-lg); }
+  .settings-choice-option:hover,
+  .settings-choice-option[data-active='true'] { background: var(--color-hover); }
+  .settings-choice-option:active { background: var(--color-active); }
+  .settings-choice-option:focus-visible { outline: 2px solid var(--color-focus); outline-offset: -2px; }
+  .settings-choice-check { display: grid; width: var(--icon-md); height: var(--icon-md); flex: 0 0 auto; place-items: center; color: var(--color-brand-text); }
 
   @media (max-width: 767px) {
     .settings-dialog { height: auto; }
+    .settings-dialog--models { height: calc(100dvh - var(--space-8)); }
     .settings-layout { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
-    .settings-nav { grid-template-columns: repeat(2, minmax(0, 1fr)); padding: var(--space-2) var(--space-4); border-right: 0; border-bottom: 1px solid var(--color-border-subtle); }
-    .settings-content { padding: var(--space-4); }
+    .settings-nav { grid-template-columns: repeat(3, minmax(0, 1fr)); padding: var(--space-2) var(--space-4); border-right: 0; border-bottom: 1px solid var(--color-border-subtle); }
+    .settings-nav__item { justify-content:center; padding-inline:var(--space-1); gap:var(--space-1); font-size:var(--type-caption-size); white-space:nowrap; }
+    .settings-nav__item svg { flex-shrink:0; }
+    .settings-dialog { --settings-content-inset: var(--space-4); }
     .settings-theme-options { grid-template-columns: minmax(0, 1fr); }
-    .settings-language-picker { width: 100%; }
+    .settings-choice-picker { width: 100%; }
   }
 
   @media (max-width: 440px) {

@@ -25,7 +25,7 @@ from ag_ui.core import (
     ToolMessage,
     UserMessage,
 )
-from pydantic import JsonValue, TypeAdapter
+from pydantic import BaseModel, JsonValue, TypeAdapter
 
 from tinkerfin_contracts import RunIdentity
 
@@ -63,10 +63,23 @@ class _RawEventCarrier(Protocol):
     raw_event: object
 
 
+def _protocol_model_type(value: BaseModel) -> type[BaseModel]:
+    """Compare standard AG-UI identity while permitting typed extension fields.
+
+    The durable AG-UI union reconstructs standard models, keeping extension data
+    as extras. A declared subclass therefore has the identity of its nearest
+    AG-UI model, without weakening discriminator or correlation field checks.
+    """
+    for model_type in type(value).__mro__:
+        if model_type.__module__.startswith("ag_ui.core."):
+            return model_type
+    return type(value)
+
+
 def _tool_call_identity(value: ToolCall) -> tuple[object, ...]:
     function = value.function
     return (
-        type(value),
+        _protocol_model_type(value),
         value.id,
         value.type,
         function.name,
@@ -86,7 +99,7 @@ def _snapshot_message_identity(value: Message) -> tuple[object, ...]:
         DeveloperMessage | SystemMessage | AssistantMessage | UserMessage,
     )
     return (
-        type(value),
+        _protocol_model_type(value),
         value.id,
         value.role,
         value.name if named_message else None,
@@ -131,7 +144,7 @@ def _run_outcome_identity(value: RunFinishedOutcome) -> tuple[object, ...]:
         if raw_interrupts is not None
         else None
     )
-    return type(value), value.type, interrupts
+    return _protocol_model_type(value), value.type, interrupts
 
 
 def _run_input_identity(event: BaseEvent) -> object:
@@ -143,6 +156,7 @@ def _run_input_identity(event: BaseEvent) -> object:
         mode="json",
         by_alias=False,
         exclude_none=False,
+        serialize_as_any=True,
     )
     return _freeze_protocol_value(_JSON_VALUE_ADAPTER.validate_python(value))
 
@@ -199,7 +213,7 @@ def _event_protocol_identity(event: BaseEvent) -> tuple[object, ...]:
         else None
     )
     return (
-        type(event),
+        _protocol_model_type(event),
         event.type,
         stable,
         messages,
@@ -225,7 +239,7 @@ def _validate_run_started_input(event: BaseEvent) -> None:
 def _canonical_event(
     event: BaseEvent,
     *,
-    expected_type: type[BaseEvent],
+    expected_type: type[BaseModel],
     expected_identity: tuple[object, ...],
     expected_interrupt_metadata: tuple[JsonValue | None, ...],
 ) -> BaseEvent:
@@ -235,9 +249,10 @@ def _canonical_event(
         event.model_dump_json(
             by_alias=True,
             exclude_none=False,
+            serialize_as_any=True,
         )
     )
-    if type(canonical) is not expected_type:
+    if _protocol_model_type(canonical) is not expected_type:
         raise TypeError("AG-UI event type changed during canonical encoding")
     if _event_protocol_identity(canonical) != expected_identity:
         raise ValueError("AG-UI event changed protocol identity")
@@ -355,7 +370,7 @@ def create_agui_run_source(
             event_transform = transform_event
 
             async def transform(event: BaseEvent) -> BaseEvent:
-                expected_type = type(event)
+                expected_type = _protocol_model_type(event)
                 expected_identity = _event_protocol_identity(event)
                 expected_metadata = _interrupt_metadata(event)
                 if event_transform is None:
@@ -365,7 +380,7 @@ def create_agui_run_source(
                     if inspect.isawaitable(value):
                         value = await value
                 validated = _EVENT_ADAPTER.validate_python(value)
-                if type(validated) is not expected_type:
+                if _protocol_model_type(validated) is not expected_type:
                     raise TypeError(
                         "transform_event must preserve the AG-UI event type"
                     )
@@ -428,7 +443,7 @@ class AgUiCodec(
         event = _EVENT_ADAPTER.validate_python(item)
         canonical = _canonical_event(
             event,
-            expected_type=type(event),
+            expected_type=_protocol_model_type(event),
             expected_identity=_event_protocol_identity(event),
             expected_interrupt_metadata=_interrupt_metadata(event),
         )

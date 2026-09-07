@@ -1897,11 +1897,22 @@ class _EnhancedDeepAgentFactory(Generic[CreateP, GraphT, AstreamT]):
                 plan_factory = prepare_plan_factory(
                     selected_signature,
                     instance._plan_options,
+                    attachments=instance._attachments,
                 )
                 private_state_keys |= PLAN_PRIVATE_STATE_KEYS
+            definition_factory = selected_factory
+            if instance._attachments is not None:
+                from ._attachment_agents import attachment_agent_factory
+
+                definition_factory = cast(
+                    Callable[..., GraphT],
+                    attachment_agent_factory(
+                        selected_factory, selected_signature, instance._attachments
+                    ),
+                )
             return DeepAgentDefinition(
                 tinkerfin=instance,
-                factory=selected_factory,
+                factory=definition_factory,
                 args=cast(tuple[object, ...], args),
                 checkpointer=checkpointer,
                 kwargs=definition_kwargs,

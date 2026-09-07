@@ -10,7 +10,6 @@ import pytest
 from ag_ui.core import (
     AssistantMessage,
     BaseEvent,
-    MessagesSnapshotEvent,
     RawEvent,
     StateDeltaEvent,
     StateSnapshotEvent,
@@ -18,7 +17,6 @@ from ag_ui.core import (
     TextMessageStartEvent,
     ToolCallArgsEvent,
     ToolCallEndEvent,
-    ToolCallResultEvent,
     ToolCallStartEvent,
 )
 from ag_ui.core import (
@@ -39,6 +37,8 @@ from tinkerfin_agui_adapter import (
     TOOL_REVIEW_SCHEMA,
     AgUiAdapterErrorCode,
     AgUiStreamContractError,
+    AttachmentMessagesSnapshotEvent,
+    AttachmentToolCallResultEvent,
     HitlCorrelationError,
     RunIdentity,
     create_subagent_provenance,
@@ -570,19 +570,19 @@ def test_parallel_task_results_use_parent_tool_call_id_not_result_order() -> Non
     result_b = next(
         event
         for event in adapter.process(_task_tool_result(tool_call_id="call-parent-b"))
-        if isinstance(event, ToolCallResultEvent)
+        if isinstance(event, AttachmentToolCallResultEvent)
     )
     result_a = next(
         event
         for event in adapter.process(_task_tool_result(tool_call_id="call-parent-a"))
-        if isinstance(event, ToolCallResultEvent)
+        if isinstance(event, AttachmentToolCallResultEvent)
     )
 
     assert _raw_event(result_b)["relatedNamespace"] == ["tools:graph-b"]
     assert _raw_event(result_a)["relatedNamespace"] == ["tools:graph-a"]
     payload = result_b.model_dump(mode="json", by_alias=True, exclude_none=True)
     assert "relatedRunId" not in payload
-    ToolCallResultEvent.model_validate(payload)
+    AttachmentToolCallResultEvent.model_validate(payload)
 
 
 def test_one_tool_node_correlates_multiple_parallel_subagent_invocations() -> None:
@@ -905,7 +905,7 @@ def test_tool_message_error_status_is_preserved_in_raw_event() -> None:
                 ),
             }
         )
-        if isinstance(event, ToolCallResultEvent)
+        if isinstance(event, AttachmentToolCallResultEvent)
     )
 
     assert _raw_event(result)["toolResultStatus"] == "error"
@@ -975,10 +975,14 @@ def test_tool_result_preserves_reasoning_shaped_business_data() -> None:
         }
     )
     result = next(
-        event for event in live_events if isinstance(event, ToolCallResultEvent)
+        event
+        for event in live_events
+        if isinstance(event, AttachmentToolCallResultEvent)
     )
     snapshot = next(
-        event for event in interrupt_events if isinstance(event, MessagesSnapshotEvent)
+        event
+        for event in interrupt_events
+        if isinstance(event, AttachmentMessagesSnapshotEvent)
     )
     serialized = "\n".join(
         event.model_dump_json(by_alias=True, exclude_none=True)
@@ -1151,12 +1155,12 @@ def test_real_sample_shape_keeps_parallel_chunks_namespaces_and_results() -> Non
         _tool_id(("tools:graph-a",), "call-child-search"): ('{"query":"业务 A"}'),
     }
 
-    results: list[ToolCallResultEvent] = []
+    results: list[AttachmentToolCallResultEvent] = []
     for tool_call_id in ("call-parent-b", "call-parent-a"):
         results.extend(
             event
             for event in adapter.process(_task_tool_result(tool_call_id=tool_call_id))
-            if isinstance(event, ToolCallResultEvent)
+            if isinstance(event, AttachmentToolCallResultEvent)
         )
 
     # Results at mainagent.txt:524/525 arrive in B/A order and still correlate by
@@ -1341,7 +1345,7 @@ def test_write_todos_content_comes_only_from_values_state() -> None:
                 ),
             }
         )
-        if isinstance(event, ToolCallResultEvent)
+        if isinstance(event, AttachmentToolCallResultEvent)
     )
     assert result.tool_call_id == _tool_id((), "call-todos")
     assert result.content == (
@@ -1739,7 +1743,7 @@ def test_hitl_operational_args_remain_exact_under_reasoning_privacy(
     )
 
     snapshot = next(
-        event for event in events if isinstance(event, MessagesSnapshotEvent)
+        event for event in events if isinstance(event, AttachmentMessagesSnapshotEvent)
     )
     assistant = snapshot.messages[0]
     assert isinstance(assistant, AssistantMessage)
@@ -1821,7 +1825,7 @@ def test_interrupt_emits_closed_stream_and_authoritative_snapshots_in_order() ->
     assert [type(event) for event in interrupt_events] == [
         ToolCallEndEvent,
         StateSnapshotEvent,
-        MessagesSnapshotEvent,
+        AttachmentMessagesSnapshotEvent,
     ]
     start = next(
         event for event in live_events if isinstance(event, ToolCallStartEvent)
@@ -1832,7 +1836,7 @@ def test_interrupt_emits_closed_stream_and_authoritative_snapshots_in_order() ->
     assert isinstance(arguments, ToolCallArgsEvent)
     assert arguments.delta == '{"file_path":"a.txt"}'
     messages = interrupt_events[-1]
-    assert isinstance(messages, MessagesSnapshotEvent)
+    assert isinstance(messages, AttachmentMessagesSnapshotEvent)
     assistant = messages.messages[0]
     assert isinstance(assistant, AssistantMessage)
     assert assistant.id == _message_id((), "message-pending")
@@ -3025,11 +3029,11 @@ def test_resumed_adapter_suppresses_only_verified_prior_tool_lifecycles() -> Non
         }
     )
 
-    assert [type(event) for event in prior_events] == [ToolCallResultEvent]
+    assert [type(event) for event in prior_events] == [AttachmentToolCallResultEvent]
     assert [type(event) for event in new_events] == [
         ToolCallStartEvent,
         ToolCallEndEvent,
-        ToolCallResultEvent,
+        AttachmentToolCallResultEvent,
     ]
     orphan_start = new_events[0]
     assert isinstance(orphan_start, ToolCallStartEvent)
@@ -3042,3 +3046,28 @@ def test_resumed_adapter_rejects_unscoped_prior_tool_ids() -> None:
             identity=_identity(run_id="run-resumed"),
             prior_tool_call_ids=frozenset({"call-prior"}),
         )
+
+
+def test_failed_tool_snapshot_preserves_error_status_for_history_consumers() -> None:
+    adapter = _adapter()
+    assistant = AIMessage(
+        id="a", content="", tool_calls=[{"id": "call", "name": "read_file", "args": {}}]
+    )
+    failed = ToolMessage(
+        id="result", tool_call_id="call", content="file missing", status="error"
+    )
+    events = adapter.process(
+        {
+            "type": "values",
+            "ns": (),
+            "data": {"messages": [assistant, failed]},
+            "interrupts": ({"id": "review", "value": {"pause": "review"}},),
+        }
+    )
+    snapshot = next(
+        event for event in events if isinstance(event, AttachmentMessagesSnapshotEvent)
+    )
+    result = snapshot.messages[-1]
+    assert isinstance(result, AgUiToolMessage)
+    assert result.error == "file missing"
+    assert result.content == "file missing"

@@ -21,14 +21,16 @@ from langchain.agents.middleware import AgentMiddleware
 from ..backends.handle import OpenSandboxHandle
 from ..backends.sdk import OpenSandboxBackend
 from ..errors import (
+    OpenSandboxBackendUnavailableError,
     OpenSandboxManagerClosedError,
     OpenSandboxSettlementTimeoutError,
     OpenSandboxStateError,
     OpenSandboxStateOwnershipError,
     OpenSandboxWarmPoolUnavailableError,
 )
-from ..models import OpenSandboxDetails
+from ..models import OpenSandboxDetails, OpenSandboxDiagnosticContent
 from . import _manager_bindings, _manager_resources
+from ._manager_availability import _SandboxAvailability
 from ._manager_bindings import _BindingResolution
 from ._manager_resources import (
     _BackendAcquisition,
@@ -193,6 +195,7 @@ class OpenSandboxManager(Generic[KeyT]):
         self._close_task: asyncio.Task[None] | None = None
         self._started = False
         self._closed = False
+        self._availability = _SandboxAvailability(self)
 
     def _resolve_owner_key(self, key: KeyT) -> str:
         """Resolve one opaque application key at the manager boundary."""
@@ -935,6 +938,100 @@ class OpenSandboxManager(Generic[KeyT]):
             self,
             key,
         )
+
+    async def pause(self, key: KeyT, *, timeout: float = 30.0) -> None:
+        """Pause the original instance after all registered processes finish work.
+
+        Holders close local admission and confirm remote settlement before the
+        official pause request. A drain timeout cancels the intent only when State
+        confirms no request was dispatched. Pausing does not extend expiration.
+
+        Args:
+            key: Caller-defined identity resolved to an existing binding.
+            timeout: Positive total work budget in seconds, including coordination.
+
+        Raises:
+            OpenSandboxBackendError: Pause or remote confirmation fails.
+            OpenSandboxStateError: Shared ownership cannot be verified.
+        """
+        await self._availability.pause(self._resolve_owner_key(key), timeout)
+
+    async def resume(self, key: KeyT, *, timeout: float = 30.0) -> _ManagedBackend:
+        """Resume the original paused instance and return its ready stable backend.
+
+        A definitely undispatched drain is cancelled. Unconfirmed requests are not
+        replayed. Each holder refreshes its connection before reopening admission.
+        No instance is recreated.
+
+        Args:
+            key: Caller-defined identity resolved to an existing binding.
+            timeout: Positive total work budget in seconds, including readiness.
+
+        Returns:
+            The manager-owned backend view for the original instance.
+
+        Raises:
+            OpenSandboxBackendError: The instance is stopped, missing, or not ready.
+            OpenSandboxStateError: Shared ownership cannot be verified.
+        """
+        owner_key = self._resolve_owner_key(key)
+        handle = await self._availability.resume(owner_key, timeout)
+        return self._backend_view(owner_key, handle)
+
+    async def get_diagnostic_logs(
+        self, key: KeyT, *, scope: str = "container"
+    ) -> OpenSandboxDiagnosticContent:
+        """Read scoped logs without creating, reconnecting, or renewing an instance.
+
+        Args:
+            key: Caller-defined identity resolved to an existing binding.
+            scope: Provider log scope; Docker supports ``container`` and ``all``.
+
+        Returns:
+            Trusted diagnostic content including truncation and completeness.
+
+        Raises:
+            OpenSandboxBackendError: The binding is absent or the query is rejected.
+            OpenSandboxStateError: The authoritative binding cannot be read.
+        """
+        owner_key = self._resolve_owner_key(key)
+        async with self._operation():
+            binding = await self._state.read_binding(owner_key)
+            if binding is None:
+                raise OpenSandboxBackendUnavailableError(
+                    "No Sandbox is bound to this owner", context={"reason": "not_bound"}
+                )
+            return await self._client.get_diagnostic_logs(
+                binding.sandbox_id, scope=scope
+            )
+
+    async def get_diagnostic_events(
+        self, key: KeyT, *, scope: str = "runtime"
+    ) -> OpenSandboxDiagnosticContent:
+        """Read scoped event diagnostics without waking or changing an instance.
+
+        Args:
+            key: Caller-defined identity resolved to an existing binding.
+            scope: Provider event scope; Docker supports ``runtime`` and ``all``.
+
+        Returns:
+            Trusted diagnostic content. Docker supplies a state summary, not a
+            complete historical event stream.
+
+        Raises:
+            OpenSandboxBackendError: The binding is absent or the query is rejected.
+            OpenSandboxStateError: The authoritative binding cannot be read.
+        """
+        owner_key = self._resolve_owner_key(key)
+        async with self._operation():
+            binding = await self._state.read_binding(owner_key)
+            if binding is None:
+                raise OpenSandboxBackendUnavailableError(
+                    "No Sandbox is bound to this owner", context={"reason": "not_bound"}
+                )
+            return await self._client.get_diagnostic_events(
+                binding.sandbox_id, scope=scope
+            )
 
     async def destroy(self, key: KeyT) -> None:
         """Destroy known remote instances and remove the committed binding."""

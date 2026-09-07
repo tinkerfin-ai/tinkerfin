@@ -31,7 +31,7 @@ from ..errors import (
     OpenSandboxStateUnavailableError,
     UnexpectedOpenSandboxStateError,
 )
-from . import _sql_schema, _sql_state_ops, _sql_transactions
+from . import _sql_availability, _sql_schema, _sql_state_ops, _sql_transactions
 from ._sql_schema import _cleanup as _cleanup
 from ._sql_schema import _warm_slots as _warm_slots
 from ._sql_schema import _workers
@@ -43,6 +43,11 @@ from ._sql_transactions import (
 from ._sql_transactions import _apply_claim_lock as _apply_claim_lock
 from ._sql_transactions import (
     _resolve_dialect_capabilities as _resolve_dialect_capabilities,
+)
+from .availability import (
+    OpenSandboxAvailability,
+    OpenSandboxAvailabilityPhase,
+    OpenSandboxHolderUpdate,
 )
 from .state import (
     OpenSandboxBinding,
@@ -512,6 +517,60 @@ class SQLAlchemyOpenSandboxState(OpenSandboxState):
             self,
             claim,
         )
+
+    @_state_operation("register_holder")
+    async def register_holder(
+        self, claim: OpenSandboxOwnerClaim, holder_id: str
+    ) -> OpenSandboxAvailability:
+        """Register before publishing a handle under the current running intent."""
+        return await _sql_availability.register_holder(self, claim, holder_id)
+
+    @_state_operation("read_availability")
+    async def read_availability(self, owner_key: str) -> OpenSandboxAvailability | None:
+        """Read current intent without waiting for an active owner claim."""
+        return await _sql_availability.read_availability(self, owner_key)
+
+    @_state_operation("get_holder_updates")
+    async def get_holder_updates(
+        self, holder_id: str
+    ) -> tuple[OpenSandboxHolderUpdate, ...]:
+        """Read all registrations and availability intents for one manager."""
+        return await _sql_availability.get_holder_updates(self, holder_id)
+
+    @_state_operation("change_availability")
+    async def change_availability(
+        self,
+        claim: OpenSandboxOwnerClaim,
+        expected: OpenSandboxAvailability,
+        *,
+        phase: OpenSandboxAvailabilityPhase,
+        refresh_connection: bool = False,
+    ) -> OpenSandboxAvailability:
+        """Advance the exact expected intent under the current owner fence."""
+        return await _sql_availability.change_availability(
+            self, claim, expected, phase=phase, refresh_connection=refresh_connection
+        )
+
+    @_state_operation("acknowledge_idle")
+    async def acknowledge_idle(
+        self, holder_id: str, availability: OpenSandboxAvailability
+    ) -> bool:
+        """Acknowledge a current drain after admission closes and operations settle."""
+        return await _sql_availability.acknowledge_idle(self, holder_id, availability)
+
+    @_state_operation("holders_are_idle")
+    async def holders_are_idle(
+        self, claim: OpenSandboxOwnerClaim, availability: OpenSandboxAvailability
+    ) -> bool:
+        """Require explicit current-drain acknowledgements from every holder."""
+        return await _sql_availability.holders_are_idle(self, claim, availability)
+
+    @_state_operation("unregister_holder")
+    async def unregister_holder(
+        self, holder_id: str, availability: OpenSandboxAvailability
+    ) -> None:
+        """Release an exact binding registration after proving local idle."""
+        return await _sql_availability.unregister_holder(self, holder_id, availability)
 
     @_state_operation("claim_warm_slot")
     async def claim_warm_slot(self) -> OpenSandboxWarmClaim | None:

@@ -11,15 +11,64 @@ from pathlib import PurePosixPath
 from typing import Literal, Self
 
 from opensandbox.models.sandboxes import SandboxInfo, Volume
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 DEFAULT_SANDBOX_IMAGE = (
     "ghcr.io/tinkerfin-ai/sandbox-runtime@"
-    "sha256:d940061954b3b7f5a068f2cab1ff483669d58c4cb8af9c2753deab600d479590"
+    "sha256:babb5d624ebfd0509577dc87a6862e89f8499c4ef7d42a09145db214b9d1e524"
 )
 _RESERVED_METADATA_PREFIX = "tinkerfin.ai/"
 
 OpenSandboxUnavailableReason = Literal["not_found", "unreachable"]
+_AccessState = Literal[
+    "running", "draining", "pausing", "paused", "resuming", "uncertain"
+]
+
+
+class OpenSandboxDiagnosticContent(BaseModel):
+    """Best-effort diagnostic text or an expiring download reference.
+
+    Content and URLs are for trusted diagnostics and are never fetched or logged
+    automatically. ``warnings`` describe retention gaps or unavailable sources;
+    ``truncated`` describes a deliberate limit on the returned payload.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    sandbox_id: str
+    kind: Literal["logs", "events"]
+    scope: str
+    delivery: Literal["inline", "url"]
+    content_type: str = Field(description="Media type of the diagnostic text")
+    truncated: bool
+    content: str | None = Field(default=None, repr=False)
+    content_url: str | None = Field(default=None, repr=False)
+    content_length: int | None = Field(
+        default=None, ge=0, description="Payload size in bytes, when known"
+    )
+    expires_at: datetime | None = None
+    warnings: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def _validate_delivery(self) -> Self:
+        if self.delivery == "inline":
+            if (
+                self.content is None
+                or self.content_url is not None
+                or self.expires_at is not None
+            ):
+                raise ValueError(
+                    "Inline diagnostics require text without a download reference"
+                )
+        elif (
+            self.content_url is None
+            or self.expires_at is None
+            or self.content is not None
+        ):
+            raise ValueError(
+                "URL diagnostics require a download reference and expiration without inline text"
+            )
+        return self
 
 
 def _normalize_workspace_root(value: str | None) -> str | None:
@@ -331,6 +380,10 @@ class OpenSandboxDetails(OpenSandboxRuntimeInfo):
     cached: bool = Field(
         description="Whether the manager currently holds an in-memory handle."
     )
+    access_state: _AccessState | None = Field(
+        default=None,
+        description="Framework admission state, separate from remote runtime status; None when not queried",
+    )
 
     @classmethod
     def from_runtime(
@@ -339,6 +392,7 @@ class OpenSandboxDetails(OpenSandboxRuntimeInfo):
         *,
         owner_key: str,
         cached: bool,
+        access_state: _AccessState | None = None,
     ) -> Self:
         """Add ownership and local handle state to a runtime snapshot.
 
@@ -346,6 +400,7 @@ class OpenSandboxDetails(OpenSandboxRuntimeInfo):
             runtime: Runtime snapshot without business ownership.
             owner_key: User ID or another stable business key.
             cached: Whether an open in-memory handle exists at query time.
+            access_state: Authoritative framework admission state when queried.
 
         Returns:
             User sandbox details preserving every runtime field.
@@ -354,4 +409,5 @@ class OpenSandboxDetails(OpenSandboxRuntimeInfo):
             **runtime.model_dump(),
             owner_key=owner_key,
             cached=cached,
+            access_state=access_state,
         )

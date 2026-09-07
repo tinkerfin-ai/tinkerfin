@@ -53,7 +53,7 @@ services:
 
   opensandbox:
     profiles: [bundled]
-    image: opensandbox/server:v0.2.2@sha256:8f8762af7565ed9c6f9dbcf009dd56727aa1fef8ce58a17f2b007b88cfe542bb
+    image: opensandbox/server:v0.2.3@sha256:ae8dfbb277f40a39ff01ef35e5e1c10675acfe0fa9db15259b8f323e5efab778
     entrypoint: [/bin/sh, -ec]
     command:
       - export OPENSANDBOX_SERVER_API_KEY="$$(cat /run/secrets/opensandbox_api_key)"; exec opensandbox-server --config /etc/opensandbox/config.toml
@@ -87,6 +87,7 @@ services:
       REDIS_CONTROL_PASSWORD_FILE: /run/secrets/redis_control_password
       REDIS_RUNTIME_PASSWORD_FILE: /run/secrets/redis_runtime_password
       OPEN_SANDBOX_API_KEY_FILE: /run/secrets/opensandbox_api_key
+      ATTACHMENT_DIRECTORY: /app/attachments
     extra_hosts:
       - host.docker.internal:host-gateway
     secrets: [database_url, redis_control_password, redis_runtime_password, opensandbox_api_key]
@@ -94,6 +95,7 @@ services:
       - "${STUDIO_BIND_ADDRESS:-127.0.0.1}:${STUDIO_PORT:-8090}:8090"
     volumes:
       - studio-logs:/app/logs
+      - studio-attachments:/app/attachments
     read_only: true
     tmpfs:
       - /tmp
@@ -142,4 +144,5 @@ volumes:
   redis-runtime-data:
   opensandbox-data:
   opensandbox-metadata:
+  studio-attachments:
   studio-logs:

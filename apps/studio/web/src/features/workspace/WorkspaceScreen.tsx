@@ -1,3 +1,5 @@
+import { AttachmentReferenceContext } from '../conversation/attachments/context'
+import { messageText, messageAttachments } from '../conversation/attachments/content'
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 
 import type { AgentMode, ChatRequestPayload } from '../../api/conversation/types'
@@ -21,7 +23,7 @@ import { Composer } from '../conversation/components/Composer'
 import { PlanQuestionComposer } from '../conversation/components/PlanQuestionComposer'
 import { PlanReviewCard } from '../conversation/components/PlanReviewCard'
 import { parseComposerSubmission } from '../conversation/composerCommand'
-import { useLocalAttachments } from '../conversation/useLocalAttachments'
+import { useAttachments } from '../conversation/useAttachments'
 import { ComposerModelPicker } from './components/ComposerModelPicker'
 import { Sidebar } from './components/Sidebar'
 import {
@@ -138,6 +140,7 @@ export function WorkspaceScreen({
   const [draftConversation, setDraftConversation] = useState<Conversation | null>(null)
   const [draftModel, setDraftModel] = useState('')
   const [draft, setDraft] = useState('')
+  const draftRevision = useRef(0)
   const [isModelPickerOpen, setModelPickerOpen] = useState(false)
   const [pendingResume, setPendingResume] = useState<PendingResume | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -146,13 +149,14 @@ export function WorkspaceScreen({
   const theme = useThemePreference()
   const navigation = useWorkspaceNavigation()
   const {
+    imageSupport,
     status: modelCatalogStatus,
     modelIds,
     defaultModelId,
     displayName: modelDisplayName,
     retry: retryModelCatalog,
   } = useModelCatalog()
-  const localAttachments = useLocalAttachments()
+  const localAttachments = useAttachments()
   const appShell = useRef<HTMLDivElement>(null)
   const latestWorkspace = useRef(workspace)
   const startedResumeRunIds = useRef(new Set<string>())
@@ -446,7 +450,15 @@ export function WorkspaceScreen({
 
   const beginSend = useCallback((content: string, modeOverride?: AgentMode) => {
     const trimmed = content.trim()
-    if (!trimmed || isRunning || !conversation.model) return
+    const readyAttachments = localAttachments.attachments.flatMap(item => item.attachment ? [item.attachment] : [])
+    if ((!trimmed && !readyAttachments.length) || isRunning || !conversation.model || localAttachments.attachments.some(item => item.state !== 'ready')) return
+    if (readyAttachments.some(item => item.mime_type.startsWith('image/')) && imageSupport(conversation.model) !== 'supported') return
+    const submittedRevision = draftRevision.current
+    const submittedIds = localAttachments.attachments.map(item => item.id)
+    const onAccepted = () => {
+      if (draftRevision.current === submittedRevision) setDraft('')
+      localAttachments.completeSend(submittedIds)
+    }
     messageWindow.restoreTail()
     const effectiveMode = modeOverride ?? conversation.mode
 
@@ -457,7 +469,7 @@ export function WorkspaceScreen({
         model: draftConversation?.model ?? draftModel,
         mode: effectiveMode,
       })
-      const payload = buildInitialPayload(nextConversation, trimmed)
+      const payload = buildInitialPayload(nextConversation, trimmed, readyAttachments)
       const requestMessage = payload.messages.at(0)
       if (!requestMessage) return
       const seededConversation: Conversation = {
@@ -465,7 +477,8 @@ export function WorkspaceScreen({
         messages: [{
           id: requestMessage.id,
           role: 'user',
-          content: requestMessage.content,
+          content: messageText(requestMessage.content),
+          attachments: messageAttachments(requestMessage.content),
           createdAt: now,
           meta: { runId: payload.runId },
         }],
@@ -483,8 +496,8 @@ export function WorkspaceScreen({
       void streamRun(nextConversation.threadId, payload, 'start', {
         target: 'draft',
         initialConversation: seededConversation,
+        onAccepted,
       })
-      setDraft('')
       return
     }
 
@@ -508,7 +521,7 @@ export function WorkspaceScreen({
     const sendingConversation = currentConversation.mode === effectiveMode
       ? currentConversation
       : { ...currentConversation, mode: effectiveMode }
-    const payload = buildInitialPayload(sendingConversation, trimmed)
+    const payload = buildInitialPayload(sendingConversation, trimmed, readyAttachments)
     const requestMessage = payload.messages.at(0)
     if (!requestMessage) return
     scrollConversationToBottomImmediately()
@@ -526,15 +539,15 @@ export function WorkspaceScreen({
         messages: [...item.messages, {
           id: requestMessage.id,
           role: 'user',
-          content: requestMessage.content,
+          content: messageText(requestMessage.content),
+          attachments: messageAttachments(requestMessage.content),
           createdAt: now,
           meta: { runId: payload.runId },
         }],
       }))
     })
-    void streamRun(currentConversation.threadId, payload, 'start')
-    setDraft('')
-  }, [conversation.mode, conversation.model, draftConversation?.model, draftModel, hydrateConversation, isRunning, messageWindow, scrollConversationToBottomImmediately, streamRun, t, workspace.conversations, workspace.currentThreadId])
+    void streamRun(currentConversation.threadId, payload, 'start', { target: 'workspace', onAccepted })
+  }, [localAttachments, imageSupport, conversation.mode, conversation.model, draftConversation?.model, draftModel, hydrateConversation, isRunning, messageWindow, scrollConversationToBottomImmediately, streamRun, t, workspace.conversations, workspace.currentThreadId])
 
   useEffect(() => {
     if (!pendingResume) return
@@ -793,6 +806,7 @@ export function WorkspaceScreen({
     isActiveThread,
     onToast: pushToast,
     onConversationBoundary: () => {
+      draftRevision.current += 1
       localAttachments.clearAttachments()
       setWorkspaceView('conversation')
     },
@@ -896,6 +910,7 @@ export function WorkspaceScreen({
   }
 
   return (
+    <AttachmentReferenceContext.Provider value={localAttachments.addReference}>
     <div
       ref={appShell}
       className={`app-shell ${taskDrawer.open ? 'has-todo-trace' : ''}`}
@@ -1080,7 +1095,9 @@ export function WorkspaceScreen({
               planActive={conversation.mode === 'plan'}
               planLocked={isRunning}
               attachments={localAttachments.attachments}
-              attachmentError={localAttachments.error}
+              attachmentBlocked={localAttachments.attachments.some(item => item.kind === 'image') && imageSupport(conversation.model) !== 'supported'}
+              attachmentError={localAttachments.attachments.some(item => item.kind === 'image') && imageSupport(conversation.model) !== 'supported' ? t('当前模型不支持看图或能力未确认，请切换模型；草稿仍保留') : localAttachments.error}
+              onRetryAttachment={localAttachments.retryAttachment}
               disabledReason={isConversationHydrationFailed
                 ? t('会话加载失败，请先重试')
                 : modelCatalogStatus === 'loading'
@@ -1094,7 +1111,7 @@ export function WorkspaceScreen({
                         : isInitialHistoryUnavailable
                           ? t('历史会话加载失败，请先重试')
                           : undefined}
-              onChange={setDraft}
+              onChange={(value) => { draftRevision.current += 1; setDraft(value) }}
               onSend={send}
               onStop={() => void stop()}
               onExitPlan={exitPlanMode}
@@ -1159,6 +1176,7 @@ export function WorkspaceScreen({
         onCancel={closeDialog}
       />
       <SettingsDialog
+        onModelsChanged={retryModelCatalog}
         open={settingsOpen}
         user={user}
         themePreference={theme.preference}
@@ -1167,5 +1185,6 @@ export function WorkspaceScreen({
         onClose={() => setSettingsOpen(false)}
       />
     </div>
+    </AttachmentReferenceContext.Provider>
   )
 }

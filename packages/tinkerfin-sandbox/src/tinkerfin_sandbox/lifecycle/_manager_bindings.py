@@ -26,13 +26,18 @@ from ..backends.handle import OpenSandboxHandle
 from ..backends.rooted import RootedOpenSandboxBackend
 from ..backends.sdk import OpenSandboxBackend
 from ..errors import (
+    OpenSandboxBackendError,
     OpenSandboxDestroyError,
     OpenSandboxResetError,
     OpenSandboxStateError,
     OpenSandboxStateOwnershipError,
 )
 from ..middleware.filesystem import build_rooted_filesystem_middleware
-from ..models import OpenSandboxDetails, _normalize_workspace_root
+from ..models import (
+    OpenSandboxDetails,
+    OpenSandboxRuntimeInfo,
+    _normalize_workspace_root,
+)
 from ._manager_recovery import _check_health, recover_binding
 from ._manager_resources import _ManagedBackend
 from ._notifications import failure_reason
@@ -209,6 +214,9 @@ async def _replace(
     # task so cancellation cannot orphan the remainder.
     for cleanup_task in cleanup_tasks:
         self._track_cleanup_task(cleanup_task)
+    # Registration can fail or be cancelled. Every old resource must already
+    # belong to cleanup before that new I/O boundary is entered.
+    await self._availability.register(owner_key, claim, handle)
     for cleanup_task in cleanup_tasks:
         await asyncio.shield(cleanup_task)
 
@@ -312,7 +320,9 @@ async def get(self: OpenSandboxManager[KeyT], key: KeyT) -> _ManagedBackend:
     owner_key = self._resolve_owner_key(key)
     async with self._operation():
         async with self._claim_owner(owner_key) as claim:
+            await self._availability.require_running(owner_key)
             handle = await self._get_locked(owner_key, claim)
+            await self._availability.register(owner_key, claim, handle)
             return self._backend_view(owner_key, handle)
 
 
@@ -345,9 +355,11 @@ async def reconnect(self: OpenSandboxManager[KeyT], key: KeyT) -> _ManagedBacken
     owner_key = self._resolve_owner_key(key)
     async with self._operation():
         async with self._claim_owner(owner_key) as claim:
+            await self._availability.require_running(owner_key)
             handle = await recover_binding(
                 self, owner_key, claim, reconnect=True, allow_recreate=False
             )
+            await self._availability.register(owner_key, claim, handle)
             return self._backend_view(owner_key, handle)
 
 
@@ -377,6 +389,7 @@ async def recreate(self: OpenSandboxManager[KeyT], key: KeyT) -> _ManagedBackend
     async with self._operation():
         async with self._claim_owner(owner_key) as claim:
             self._ensure_open()
+            await self._availability.require_resolved(owner_key, claim)
             handle = self._handles.get(owner_key)
             if claim.binding is None and handle is not None:
                 raise OpenSandboxStateOwnershipError(
@@ -428,7 +441,9 @@ async def reset(self: OpenSandboxManager[KeyT], key: KeyT) -> None:
 
     async with self._operation():
         async with self._claim_owner(owner_key) as claim:
+            await self._availability.require_running(owner_key)
             handle = await recover_binding(self, owner_key, claim, allow_recreate=False)
+            await self._availability.register(owner_key, claim, handle)
 
             async def reset_workspace() -> None:
                 await handle._areset_workspace_from_manager(workspace_root)
@@ -472,6 +487,8 @@ async def is_healthy(self: OpenSandboxManager[KeyT], key: KeyT) -> bool:
         handle = self._handles.get(owner_key)
         if handle is None or handle.is_closed:
             return False
+        if self._availability.is_suspended(owner_key):
+            return False
         sandbox_id = handle.id
         check = self._notifications.begin_check(owner_key)
         try:
@@ -514,6 +531,40 @@ async def get_details(
             if binding is None:
                 return None
             handle = self._handles.get(owner_key)
+            availability = await self._state.read_availability(owner_key)
+            suspended = availability is not None and availability.phase != "running"
+            refreshing = (
+                handle is not None
+                and not handle.is_closed
+                and not handle._accepts_calls()
+            )
+            if suspended or refreshing:
+                try:
+                    runtime = await self._client.get_runtime_info(binding.sandbox_id)
+                except OpenSandboxBackendError as error:
+                    runtime = OpenSandboxRuntimeInfo.unavailable(
+                        binding.sandbox_id,
+                        "not_found"
+                        if error.context.get("reason") == "not_found"
+                        else "unreachable",
+                    )
+                if not runtime.available:
+                    self._notifications.checked(
+                        owner_key,
+                        binding.sandbox_id,
+                        check,
+                        Reason.NOT_FOUND
+                        if runtime.unavailable_reason == "not_found"
+                        else Reason.UNREACHABLE,
+                    )
+                return OpenSandboxDetails.from_runtime(
+                    runtime,
+                    owner_key=owner_key,
+                    cached=handle is not None and not handle.is_closed,
+                    access_state=availability.phase
+                    if availability is not None
+                    else None,
+                )
             if (
                 handle is not None
                 and handle.id == binding.sandbox_id
@@ -543,6 +594,7 @@ async def get_details(
                 runtime,
                 owner_key=owner_key,
                 cached=cached,
+                access_state="running" if availability is not None else None,
             )
         finally:
             self._notifications.end_check(owner_key, check)
@@ -592,6 +644,7 @@ async def _delete_locked(
 
     self._pending_destroy_ids.pop(owner_key, None)
     await self._state.unbind_owner(claim)
+    self._availability.forget(owner_key)
     if had_instances:
         self._notifications.destroyed(owner_key, notification_id)
 
@@ -614,6 +667,7 @@ async def delete(self: OpenSandboxManager[KeyT], key: KeyT) -> None:
     async with self._operation():
         async with self._claim_owner(owner_key) as claim:
             self._ensure_open()
+            await self._availability.require_resolved(owner_key, claim)
             delete_task = asyncio.create_task(self._delete_locked(owner_key, claim))
             try:
                 await asyncio.shield(delete_task)

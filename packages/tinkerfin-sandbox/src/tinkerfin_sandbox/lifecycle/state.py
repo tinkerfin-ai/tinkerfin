@@ -6,7 +6,7 @@ import asyncio
 import base64
 import hashlib
 from collections.abc import Awaitable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol, cast, runtime_checkable
 from uuid import uuid4
 
@@ -15,6 +15,13 @@ from ..errors import (
     OpenSandboxStateError,
     OpenSandboxStateOwnershipError,
     UnexpectedOpenSandboxStateError,
+)
+from .availability import (
+    OpenSandboxAvailability,
+    OpenSandboxAvailabilityPhase,
+    OpenSandboxHolderUpdate,
+    _next_availability,
+    _validate_holder_id,
 )
 
 
@@ -194,6 +201,165 @@ class OpenSandboxState(Protocol):
             OpenSandboxStateError: Durable release fails.
         """
 
+        ...
+
+    async def register_holder(
+        self, claim: OpenSandboxOwnerClaim, holder_id: str
+    ) -> OpenSandboxAvailability:
+        """Register a manager before publishing a handle for a running binding.
+
+        The current owner fence and running intent are checked atomically. Repeated
+        registration of the same holder is idempotent. A stale claim or non-running
+        binding raises ``OpenSandboxStateOwnershipError``. A holder ID identifies
+        one manager lifetime and must not be reused after that manager closes.
+
+        Args:
+            claim: Current owner claim, including after it commits a new binding.
+            holder_id: Unique manager identity of at most 36 characters.
+
+        Returns:
+            Running availability atomically associated with the registration.
+
+        Raises:
+            OpenSandboxStateOwnershipError: Claim is stale or binding is not running.
+            OpenSandboxStateError: The registration cannot be committed.
+            ValueError: The holder identity is empty or too long.
+        """
+        ...
+
+    async def read_availability(self, owner_key: str) -> OpenSandboxAvailability | None:
+        """Read current intent without waiting for an active owner claim.
+
+        Return ``None`` only when no binding exists. Storage failures raise
+        ``OpenSandboxStateError`` and must never imply that admission is safe.
+
+        Args:
+            owner_key: Host identity selecting the current owner binding.
+
+        Returns:
+            Current availability snapshot, or ``None`` without a binding.
+
+        Raises:
+            OpenSandboxStateError: State is closed or availability cannot be read.
+        """
+        ...
+
+    async def get_holder_updates(
+        self, holder_id: str
+    ) -> tuple[OpenSandboxHolderUpdate, ...]:
+        """Read this manager's registrations in one batch without owner claims.
+
+        Results include each holder's binding identity and current owner intent.
+        A missing registration means the handle is no longer registered; a changed
+        binding identity requires retiring the old handle.
+
+        Args:
+            holder_id: Manager lifetime identity used for handle registration.
+
+        Returns:
+            Registered bindings and current intents, ordered by owner digest.
+
+        Raises:
+            OpenSandboxStateError: State is closed or current intent is unavailable.
+        """
+        ...
+
+    async def change_availability(
+        self,
+        claim: OpenSandboxOwnerClaim,
+        expected: OpenSandboxAvailability,
+        *,
+        phase: OpenSandboxAvailabilityPhase,
+        refresh_connection: bool = False,
+    ) -> OpenSandboxAvailability:
+        """Advance a fenced intent only if its full expected snapshot is current.
+
+        Dispatch into ``pausing`` requires every current holder to have acknowledged
+        the drain. A failed fence, stale snapshot, illegal phase transition, or
+        incomplete drain raises ``OpenSandboxStateOwnershipError``. Increment the
+        connection generation with ``refresh_connection`` when publishing running
+        availability that requires holders to reconnect. Returning from ``pausing``
+        to ``running`` or ``resuming`` to ``paused`` requires an explicit upstream
+        rejection and authoritative confirmation of the preceding remote state;
+        an unknown request outcome never authorizes these reversals.
+        Explicit recovery from an externally paused or resumed Sandbox may enter
+        ``resuming`` from ``running`` or ``draining`` from ``paused`` only after
+        authoritative control-plane confirmation of that remote state.
+
+        Args:
+            claim: Current exclusive owner fence.
+            expected: Exact snapshot that must still be authoritative.
+            phase: Permitted next phase of the pause or resume operation.
+            refresh_connection: Require holder reconnection on returning to running.
+
+        Returns:
+            Committed snapshot with its availability sequence incremented.
+
+        Raises:
+            OpenSandboxStateOwnershipError: Fence, snapshot, or transition is invalid.
+            OpenSandboxStateError: The new intent cannot be committed.
+            ValueError: Connection refresh is requested for a non-running phase.
+        """
+        ...
+
+    async def acknowledge_idle(
+        self, holder_id: str, availability: OpenSandboxAvailability
+    ) -> bool:
+        """Confirm closed admission and settled operations for an exact drain.
+
+        The caller must retain closed admission until a later intent permits it.
+        Return ``False`` for missing holders or stale intent/binding evidence.
+        This operation must remain available while another manager owns the claim.
+
+        Args:
+            holder_id: Manager whose previously admitted operations have settled.
+            availability: Exact draining intent observed before closing admission.
+
+        Returns:
+            Whether the exact current drain acknowledgement was committed.
+
+        Raises:
+            OpenSandboxStateError: The acknowledgement cannot be committed.
+        """
+        ...
+
+    async def holders_are_idle(
+        self, claim: OpenSandboxOwnerClaim, availability: OpenSandboxAvailability
+    ) -> bool:
+        """Check every current holder's explicit ACK under the exact drain fence.
+
+        Expired worker leases and lost heartbeats never count as idle. A stale
+        owner claim or availability snapshot raises ``OpenSandboxStateOwnershipError``.
+
+        Args:
+            claim: Current exclusive owner fence protecting the pause operation.
+            availability: Exact draining snapshot requiring acknowledgements.
+
+        Returns:
+            Whether every current holder acknowledged this precise drain.
+
+        Raises:
+            OpenSandboxStateOwnershipError: The owner fence or drain is stale.
+            OpenSandboxStateError: Holder evidence cannot be read reliably.
+        """
+        ...
+
+    async def unregister_holder(
+        self, holder_id: str, availability: OpenSandboxAvailability
+    ) -> None:
+        """Release an exact binding registration after local operations settle.
+
+        The caller must first close admission and prove local idle. Stale releases
+        are harmless; an earlier binding cannot remove a successor's registration.
+        State shutdown must not implicitly release unconfirmed registrations.
+
+        Args:
+            holder_id: Manager whose admission is closed and operations have settled.
+            availability: Snapshot identifying the exact binding being released.
+
+        Raises:
+            OpenSandboxStateError: Registration removal cannot be committed.
+        """
         ...
 
     async def claim_warm_slot(self) -> OpenSandboxWarmClaim | None:
@@ -713,6 +879,99 @@ class _OpenSandboxStateBoundary(  # pyright: ignore[reportUnusedClass]
     async def aclose(self) -> None:
         await _call_state(self._state, "close", self._state.aclose())
 
+    async def register_holder(
+        self, claim: OpenSandboxOwnerClaim, holder_id: str
+    ) -> OpenSandboxAvailability:
+        """Register before publishing a handle under the current running intent."""
+        return cast(
+            OpenSandboxAvailability,
+            await _call_state(
+                self._state,
+                "register_holder",
+                self._state.register_holder(claim, holder_id),
+            ),
+        )
+
+    async def read_availability(self, owner_key: str) -> OpenSandboxAvailability | None:
+        """Read current intent without waiting for an active owner claim."""
+        return cast(
+            OpenSandboxAvailability | None,
+            await _call_state(
+                self._state,
+                "read_availability",
+                self._state.read_availability(owner_key),
+            ),
+        )
+
+    async def get_holder_updates(
+        self, holder_id: str
+    ) -> tuple[OpenSandboxHolderUpdate, ...]:
+        """Read all registrations and availability intents for one manager."""
+        return cast(
+            tuple[OpenSandboxHolderUpdate, ...],
+            await _call_state(
+                self._state,
+                "get_holder_updates",
+                self._state.get_holder_updates(holder_id),
+            ),
+        )
+
+    async def change_availability(
+        self,
+        claim: OpenSandboxOwnerClaim,
+        expected: OpenSandboxAvailability,
+        *,
+        phase: OpenSandboxAvailabilityPhase,
+        refresh_connection: bool = False,
+    ) -> OpenSandboxAvailability:
+        """Advance the exact expected intent under the current owner fence."""
+        return cast(
+            OpenSandboxAvailability,
+            await _call_state(
+                self._state,
+                "change_availability",
+                self._state.change_availability(
+                    claim, expected, phase=phase, refresh_connection=refresh_connection
+                ),
+            ),
+        )
+
+    async def acknowledge_idle(
+        self, holder_id: str, availability: OpenSandboxAvailability
+    ) -> bool:
+        """Acknowledge a current drain after admission closes and operations settle."""
+        return cast(
+            bool,
+            await _call_state(
+                self._state,
+                "acknowledge_idle",
+                self._state.acknowledge_idle(holder_id, availability),
+            ),
+        )
+
+    async def holders_are_idle(
+        self, claim: OpenSandboxOwnerClaim, availability: OpenSandboxAvailability
+    ) -> bool:
+        """Require explicit current-drain acknowledgements from every holder."""
+        return cast(
+            bool,
+            await _call_state(
+                self._state,
+                "holders_are_idle",
+                self._state.holders_are_idle(claim, availability),
+            ),
+        )
+
+    async def unregister_holder(
+        self, holder_id: str, availability: OpenSandboxAvailability
+    ) -> None:
+        """Release an exact binding registration after proving local idle."""
+        await _call_state(
+            self._state,
+            "unregister_holder",
+            self._state.unregister_holder(holder_id, availability),
+        )
+
 
 @dataclass(slots=True)
 class _MemoryOwnerRecord:
@@ -720,6 +979,7 @@ class _MemoryOwnerRecord:
     generation: int = 0
     binding: OpenSandboxBinding | None = None
     active_token: str | None = None
+    availability: OpenSandboxAvailability | None = None
 
 
 @dataclass(slots=True)
@@ -748,6 +1008,7 @@ class InMemoryOpenSandboxState(OpenSandboxState):
         self._warm_slots: list[_MemoryWarmSlot] = []
         self._warm_pool_size: int | None = None
         self._cleanup: dict[str, _MemoryCleanupRecord] = {}
+        self._holders: dict[tuple[str, str], OpenSandboxHolderUpdate] = {}
         self._started = False
         self._closed = False
 
@@ -841,11 +1102,34 @@ class InMemoryOpenSandboxState(OpenSandboxState):
     ) -> OpenSandboxBinding:
         """Commit a Sandbox ID only for the current fencing claim."""
         record = self._claimed_record(claim)
+        return self._commit_binding(record, claim, sandbox_id)
+
+    @staticmethod
+    def _commit_binding(
+        record: _MemoryOwnerRecord,
+        claim: OpenSandboxOwnerClaim,
+        sandbox_id: str,
+    ) -> OpenSandboxBinding:
+        """Publish binding and intent without yielding or invoking public overrides.
+
+        Warm consumption commits its own binding atomically with slot removal.
+        It must not call the replaceable standalone binding operation.
+        """
         binding = OpenSandboxBinding(
             sandbox_id=sandbox_id,
             generation=claim.generation,
         )
+        if record.binding == binding and record.availability is not None:
+            return binding
         record.binding = binding
+        record.availability = OpenSandboxAvailability(
+            owner_digest=claim.owner_digest,
+            sandbox_id=binding.sandbox_id,
+            binding_generation=binding.generation,
+            sequence=0,
+            phase="running",
+            connection_generation=0,
+        )
         return binding
 
     async def renew_owner(self, claim: OpenSandboxOwnerClaim) -> bool:
@@ -865,7 +1149,141 @@ class InMemoryOpenSandboxState(OpenSandboxState):
     async def unbind_owner(self, claim: OpenSandboxOwnerClaim) -> None:
         """Remove the binding protected by the current owner claim."""
         record = self._claimed_record(claim)
+        # Explicit unbinding retires all generations of this owner. Keeping an
+        # older holder would resurrect an orphan registration on a later bind.
+        self._holders = {
+            key: holder
+            for key, holder in self._holders.items()
+            if holder.owner_digest != claim.owner_digest
+        }
         record.binding = None
+        record.availability = None
+
+    @staticmethod
+    def _holder_matches(
+        holder: OpenSandboxHolderUpdate, availability: OpenSandboxAvailability
+    ) -> bool:
+        return (
+            holder.owner_digest == availability.owner_digest
+            and holder.sandbox_id == availability.sandbox_id
+            and holder.binding_generation == availability.binding_generation
+        )
+
+    def _expected_availability(
+        self, claim: OpenSandboxOwnerClaim, expected: OpenSandboxAvailability
+    ) -> _MemoryOwnerRecord:
+        record = self._claimed_record(claim)
+        if record.availability != expected:
+            raise OpenSandboxStateOwnershipError(
+                "Sandbox availability is no longer current"
+            )
+        return record
+
+    async def register_holder(
+        self, claim: OpenSandboxOwnerClaim, holder_id: str
+    ) -> OpenSandboxAvailability:
+        """Register a manager atomically with the current running binding."""
+        _validate_holder_id(holder_id)
+        record = self._claimed_record(claim)
+        availability = record.availability
+        if availability is None or availability.phase != "running":
+            raise OpenSandboxStateOwnershipError("Sandbox binding is not running")
+        self._holders[(holder_id, claim.owner_digest)] = OpenSandboxHolderUpdate(
+            holder_id=holder_id,
+            owner_digest=claim.owner_digest,
+            sandbox_id=availability.sandbox_id,
+            binding_generation=availability.binding_generation,
+            acknowledged_sequence=None,
+            availability=availability,
+        )
+        return availability
+
+    async def read_availability(self, owner_key: str) -> OpenSandboxAvailability | None:
+        """Read committed intent without acquiring the owner's transition lock."""
+        self._ensure_open()
+        record = self._records.get(_owner_digest(self._namespace, owner_key))
+        return None if record is None else record.availability
+
+    async def get_holder_updates(
+        self, holder_id: str
+    ) -> tuple[OpenSandboxHolderUpdate, ...]:
+        """Read this manager's holder identities and each owner's latest intent."""
+        self._ensure_open()
+        updates: list[OpenSandboxHolderUpdate] = []
+        for (registered_holder, digest), holder in self._holders.items():
+            if registered_holder != holder_id:
+                continue
+            record = self._records.get(digest)
+            if record is not None and record.availability is not None:
+                updates.append(replace(holder, availability=record.availability))
+        return tuple(sorted(updates, key=lambda holder: holder.owner_digest))
+
+    def _all_holders_idle(self, availability: OpenSandboxAvailability) -> bool:
+        return all(
+            holder.acknowledged_sequence == availability.sequence
+            for holder in self._holders.values()
+            if self._holder_matches(holder, availability)
+        )
+
+    async def change_availability(
+        self,
+        claim: OpenSandboxOwnerClaim,
+        expected: OpenSandboxAvailability,
+        *,
+        phase: OpenSandboxAvailabilityPhase,
+        refresh_connection: bool = False,
+    ) -> OpenSandboxAvailability:
+        """Advance an exact intent without yielding between fencing and mutation."""
+        record = self._expected_availability(claim, expected)
+        updated = _next_availability(
+            expected, phase=phase, refresh_connection=refresh_connection
+        )
+        if phase == "pausing" and not self._all_holders_idle(expected):
+            raise OpenSandboxStateOwnershipError(
+                "Sandbox holders have not all acknowledged idle"
+            )
+        record.availability = updated
+        return updated
+
+    async def acknowledge_idle(
+        self, holder_id: str, availability: OpenSandboxAvailability
+    ) -> bool:
+        """Record explicit drain evidence without waiting for the owner claim."""
+        self._ensure_open()
+        record = self._records.get(availability.owner_digest)
+        key = (holder_id, availability.owner_digest)
+        holder = self._holders.get(key)
+        if (
+            availability.phase != "draining"
+            or record is None
+            or record.availability != availability
+            or holder is None
+            or not self._holder_matches(holder, availability)
+        ):
+            return False
+        self._holders[key] = replace(
+            holder, acknowledged_sequence=availability.sequence
+        )
+        return True
+
+    async def holders_are_idle(
+        self, claim: OpenSandboxOwnerClaim, availability: OpenSandboxAvailability
+    ) -> bool:
+        """Require explicit ACKs for the exact current drain and owner fence."""
+        self._expected_availability(claim, availability)
+        if availability.phase != "draining":
+            raise OpenSandboxStateOwnershipError("Sandbox availability is not draining")
+        return self._all_holders_idle(availability)
+
+    async def unregister_holder(
+        self, holder_id: str, availability: OpenSandboxAvailability
+    ) -> None:
+        """Remove only the exact binding registration after local idle is proven."""
+        self._ensure_open()
+        key = (holder_id, availability.owner_digest)
+        holder = self._holders.get(key)
+        if holder is not None and self._holder_matches(holder, availability):
+            del self._holders[key]
 
     async def release_owner(self, claim: OpenSandboxOwnerClaim) -> None:
         """Release a current claim; stale releases cannot unlock a successor."""
@@ -986,16 +1404,12 @@ class InMemoryOpenSandboxState(OpenSandboxState):
         claim: OpenSandboxOwnerClaim,
     ) -> OpenSandboxBinding | None:
         """Atomically consume and authoritatively bind one ready warm Sandbox."""
-        owner = self._claimed_record(claim)
+        record = self._claimed_record(claim)
         for slot in self._warm_slots:
             if slot.sandbox_id is None or slot.active_token is not None:
                 continue
-            binding = OpenSandboxBinding(
-                sandbox_id=slot.sandbox_id,
-                generation=claim.generation,
-            )
+            binding = self._commit_binding(record, claim, slot.sandbox_id)
             slot.sandbox_id = None
-            owner.binding = binding
             return binding
         return None
 

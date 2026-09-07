@@ -48,6 +48,7 @@ from .errors import (
     TinkerFinLifecycleError,
     TinkerFinStreamProtocolError,
 )
+from .media import AttachmentSupport
 from .native import NativeStreamPart
 from .native_driver import (
     NativeStreamDriver,
@@ -77,7 +78,7 @@ from .sse import (
 PartT = TypeVar("PartT")
 
 if TYPE_CHECKING:
-    from ag_ui.core import BaseEvent
+    from ag_ui.core import BaseEvent, UserMessage
 
     from .agui_resume import (
         AgUiResumeBinding,
@@ -710,6 +711,7 @@ class TinkerFin:
     """Globally shareable factory for request-scoped Deep Agent definitions."""
 
     __slots__ = (
+        "_attachments",
         "_checkpointer",
         "_family",
         "_observers",
@@ -781,12 +783,44 @@ class TinkerFin:
         self._runtime_profile = resolved_profile
         self._observers: tuple[RuntimeObserver, ...] = ()
         self._plan_options: PlanOptions | None = None
+        self._attachments: AttachmentSupport | None = None
 
     @property
     def runtime_profile(self) -> DeepAgentsRuntimeProfile:
         """Return the immutable borrowed integration used by future Definitions."""
 
         return self._runtime_profile
+
+    def attachments(self, support: AttachmentSupport) -> TinkerFin:
+        """Configure authorized attachment access for agents created by this factory.
+
+        Automatic integration requires the locked native Deep Agents factory.
+        Decorated or replaced factories are rejected at graph construction before
+        model/backend preparation. Caller-owned custom graphs can install the
+        support's middleware explicitly at their final model-request boundary.
+
+        Args:
+            support: Borrowed per-model image policy and host-authorized file reader.
+
+        Returns:
+            An independent factory retaining Plan, observers, and resource ownership.
+
+        Raises:
+            TypeError: Support is not an AttachmentSupport instance.
+        """
+        if not isinstance(support, AttachmentSupport):
+            raise TypeError("support must be AttachmentSupport")
+        configured = TinkerFin(
+            checkpointer=self._checkpointer,
+            run_coordinator=self._run_coordinator,
+            state_schema=self._state_schema,
+            runtime_profile=self._runtime_profile,
+        )
+        configured._observers = self._observers
+        configured._plan_options = self._plan_options
+        configured._family = self._family
+        configured._attachments = support
+        return configured
 
     def observe(self, observer: RuntimeObserver) -> TinkerFin:
         """Return a factory with one additional ordered Runtime observer.
@@ -816,6 +850,7 @@ class TinkerFin:
         configured._plan_options = self._plan_options
         configured._observers = observers
         configured._family = self._family
+        configured._attachments = self._attachments
         return configured
 
     async def open_run(
@@ -1012,6 +1047,7 @@ class TinkerFin:
         identity: RunIdentity,
         *,
         agent: _AgentSource,
+        messages: Sequence[UserMessage | Mapping[str, object]] | None = None,
         input: InputAgentState | None = None,
         resume: AgUiResumeRequest | None = None,
         parent_run_id: str | None = None,
@@ -1042,7 +1078,11 @@ class TinkerFin:
                 checkpoint lineage, and optional durable delivery.
             agent: Existing Definition or synchronous/asynchronous callable returning one
                 from this configured TinkerFin family.
-            input: Ordinary Deep Agent input; mutually exclusive with ``resume``.
+            messages: Standard AG-UI user messages with final, distinct host-assigned
+                IDs. The framework validates and converts text and media before Agent
+                preparation. Hosts authorize durable attachment references first.
+            input: Advanced explicit Graph state; mutually exclusive with ``messages``
+                and ``resume``. Use ``messages`` for ordinary chat input.
             resume: Untrusted AG-UI decisions resolved from the Definition checkpointer;
                 mutually exclusive with ``input``.
             parent_run_id: Optional branch or interrupted source in the same thread.
@@ -1080,8 +1120,10 @@ class TinkerFin:
         self._validate_run_binding(identity=identity, on_part=on_native_part)
         if not isinstance(agent, DeepAgentDefinition) and not callable(agent):
             raise TypeError("agent must be a DeepAgentDefinition or callable")
-        if (input is None) == (resume is None):
-            raise ValueError("exactly one of input or resume must be provided")
+        if sum(value is not None for value in (messages, input, resume)) != 1:
+            raise ValueError(
+                "exactly one of messages, input or resume must be provided"
+            )
         if resume is not None and not isinstance(resume, AgUiResumeRequestType):
             raise TypeError("resume must be an AgUiResumeRequest or None")
         if resume_checkpointer is not None and not isinstance(
@@ -1139,6 +1181,10 @@ class TinkerFin:
         resolved_mode = validate_agent_mode(requested_mode, name="mode")
         definition: _DefinitionAny | None = None
         try:
+            if messages is not None:
+                from .agui_input import _user_messages_to_input
+
+                input = _user_messages_to_input(messages)
             definition = await self._resolve_agent(cast(_AgentSource, agent))
             if resume is not None and lazy_agent:
                 effective_checkpointer = definition._resume_checkpointer()
@@ -1435,6 +1481,7 @@ class TinkerFin:
         )
         configured._observers = self._observers
         configured._family = self._family
+        configured._attachments = self._attachments
         if enabled:
             clarification = create_clarification_binding(
                 clarification_schema,

@@ -8,11 +8,12 @@ from typing import Never, cast
 
 import aiosqlite
 import pytest
-from sqlalchemy import text
+from sqlalchemy import Table, text
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 from sqlalchemy.sql import Executable
+from sqlalchemy.sql.dml import Update
 
 import tinkerfin_sandbox
 from tinkerfin_sandbox.lifecycle.state import OpenSandboxState
@@ -289,9 +290,11 @@ async def test_borrowed_sqlite_restores_session_setting_after_failure_and_cancel
 
     entered = asyncio.Event()
 
+    release_operation = asyncio.Event()
+
     async def block_operation(_connection: AsyncConnection) -> None:
         entered.set()
-        await asyncio.Event().wait()
+        await release_operation.wait()
 
     try:
         await state.start(warm_pool_size=0)
@@ -303,6 +306,9 @@ async def test_borrowed_sqlite_restores_session_setting_after_failure_and_cancel
         operation = asyncio.create_task(state._run_write_transaction(block_operation))
         await asyncio.wait_for(entered.wait(), timeout=2)
         operation.cancel("borrowed operation cancelled")
+        # The transaction owns database work through cancellation and rolls back
+        # before COMMIT once that work has completed.
+        release_operation.set()
         with pytest.raises(
             asyncio.CancelledError,
             match="borrowed operation cancelled",
@@ -672,14 +678,19 @@ async def test_sqlite_state_retries_only_after_statement_rollback_and_close(
         statement: Executable,
     ) -> CursorResult[tuple[object, ...]]:
         nonlocal execute_attempts
-        execute_attempts += 1
-        if execute_attempts == 1:
-            raise _sqlite_lock_operational_error(
-                "UPDATE owners",
-                code=lock_code,
-            )
-        assert rollback_calls >= 1
-        assert close_calls >= 1
+        if (
+            isinstance(statement, Update)
+            and isinstance(statement.table, Table)
+            and statement.table.name == "tinkerfin_opensandbox_owners"
+        ):
+            execute_attempts += 1
+            if execute_attempts == 1:
+                raise _sqlite_lock_operational_error(
+                    "UPDATE owners",
+                    code=lock_code,
+                )
+            assert rollback_calls >= 1
+            assert close_calls >= 1
         return cast(
             CursorResult[tuple[object, ...]],
             await original_execute(connection, statement),
@@ -787,7 +798,12 @@ async def test_sqlite_state_retries_commit_without_replaying_the_transaction(
         statement: Executable,
     ) -> CursorResult[tuple[object, ...]]:
         nonlocal transaction_body_calls
-        transaction_body_calls += 1
+        if (
+            isinstance(statement, Update)
+            and isinstance(statement.table, Table)
+            and statement.table.name == "tinkerfin_opensandbox_owners"
+        ):
+            transaction_body_calls += 1
         return cast(
             CursorResult[tuple[object, ...]],
             await original_execute(connection, statement),

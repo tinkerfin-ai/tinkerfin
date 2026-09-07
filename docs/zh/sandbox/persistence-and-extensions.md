@@ -48,7 +48,7 @@ state = SQLAlchemyOpenSandboxState(
 )
 ```
 
-当前支持 MySQL 5.7 和 MySQL 8.x。
+当前支持 MySQL 5.7 和 MySQL 8.x。MariaDB 不在已验证范围内。
 
 ### 状态参数
 
@@ -61,6 +61,10 @@ state = SQLAlchemyOpenSandboxState(
 | `sqlite_retry_timeout` | `5.0` | SQLite 锁冲突的总重试预算 |
 
 同一 namespace 的所有 worker 必须配置相同的 warm pool 大小。数据库账号在首次启动时需要建表和读写权限。
+
+取消调用时，State 会等待数据库结果读取完毕、连接归还连接池。COMMIT 开始前已收到取消请求的
+写入会回滚；COMMIT 已发出时，则等待确定其成功或结果未知。必要收尾可能超过调用方的工作
+时限，但不会串行化独立事务，也不会改变 SQLite 锁冲突的重试预算。
 
 ## 由基础设施提前建表
 

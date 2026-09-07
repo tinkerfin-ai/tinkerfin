@@ -5,7 +5,11 @@ from typing import Protocol, TypeVar
 
 from ..backends.sdk import OpenSandboxBackend
 from ..errors import OpenSandboxBackendError, UnexpectedOpenSandboxBackendError
-from ..models import OpenSandboxConfig, OpenSandboxRuntimeInfo
+from ..models import (
+    OpenSandboxConfig,
+    OpenSandboxDiagnosticContent,
+    OpenSandboxRuntimeInfo,
+)
 
 __all__ = ["_SandboxClientBoundary"]
 
@@ -24,6 +28,20 @@ class _SandboxClient(Protocol):
     async def connect(self, sandbox_id: str) -> OpenSandboxBackend: ...
 
     async def inspect(self, sandbox_id: str) -> OpenSandboxRuntimeInfo: ...
+
+    async def get_runtime_info(self, sandbox_id: str) -> OpenSandboxRuntimeInfo: ...
+
+    async def pause(self, sandbox_id: str) -> None: ...
+
+    async def resume(self, sandbox_id: str) -> None: ...
+
+    async def get_diagnostic_logs(
+        self, sandbox_id: str, *, scope: str = "container"
+    ) -> OpenSandboxDiagnosticContent: ...
+
+    async def get_diagnostic_events(
+        self, sandbox_id: str, *, scope: str = "runtime"
+    ) -> OpenSandboxDiagnosticContent: ...
 
     async def destroy(self, sandbox_id: str) -> None: ...
 
@@ -98,6 +116,35 @@ class _SandboxClientBoundary(_SandboxClient):
             self._client,
             "destroy",
             self._client.destroy(sandbox_id),
+        )
+
+    async def get_runtime_info(self, sandbox_id: str) -> OpenSandboxRuntimeInfo:
+        return await _call_client(
+            self._client, "runtime info", self._client.get_runtime_info(sandbox_id)
+        )
+
+    async def pause(self, sandbox_id: str) -> None:
+        await _call_client(self._client, "pause", self._client.pause(sandbox_id))
+
+    async def resume(self, sandbox_id: str) -> None:
+        await _call_client(self._client, "resume", self._client.resume(sandbox_id))
+
+    async def get_diagnostic_logs(
+        self, sandbox_id: str, *, scope: str = "container"
+    ) -> OpenSandboxDiagnosticContent:
+        return await _call_client(
+            self._client,
+            "diagnostic logs",
+            self._client.get_diagnostic_logs(sandbox_id, scope=scope),
+        )
+
+    async def get_diagnostic_events(
+        self, sandbox_id: str, *, scope: str = "runtime"
+    ) -> OpenSandboxDiagnosticContent:
+        return await _call_client(
+            self._client,
+            "diagnostic events",
+            self._client.get_diagnostic_events(sandbox_id, scope=scope),
         )
 
     async def aclose(self) -> None:

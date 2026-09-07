@@ -1,3 +1,4 @@
+import { messageAttachments, messageText, type Attachment } from '../attachments/content'
 import type {
   ConversationHistoryCoreDetail,
   ConversationHistoryDetail,
@@ -295,7 +296,7 @@ const traceMessages = (trace: ConversationHistoryCoreDetail): Message[] => {
   const verifiedSubagents = trace.graph.nodes.filter((node) => (
     node.kind === 'subagent' && node.sourceId
   ))
-  const subagentPartialOutput = new Map<string, Array<{ sequence: number; content: string }>>()
+  const subagentPartialOutput = new Map<string, Array<{ sequence: number; content: string; attachments: Attachment[] }>>()
   trace.messages.forEach((message) => {
     if (message.role !== 'assistant' || message.namespace.length === 0) return
     const owner = verifiedSubagents
@@ -305,10 +306,11 @@ const traceMessages = (trace: ConversationHistoryCoreDetail): Message[] => {
       ))
       .sort((left, right) => right.namespace.length - left.namespace.length)[0]
     if (!owner) return
-    const content = text(message.content)
-    if (!content) return
+    const content = messageText(message.content)
+    const attachments = messageAttachments(message.content)
+    if (!content && !attachments.length) return
     const existing = subagentPartialOutput.get(owner.id) ?? []
-    existing.push({ sequence: message.traceSeq, content })
+    existing.push({ sequence: message.traceSeq, content, attachments })
     subagentPartialOutput.set(owner.id, existing)
   })
   const owningSubagent = (node: TraceGraphNode): TraceGraphNode | undefined => {
@@ -324,7 +326,8 @@ const traceMessages = (trace: ConversationHistoryCoreDetail): Message[] => {
       value: {
         id: item.id,
         role: item.role,
-        content: text(item.content),
+        content: messageText(item.content),
+        attachments: messageAttachments(item.content),
         createdAt: item.createdAt,
         meta: item.role === 'assistant'
           ? {
@@ -370,6 +373,10 @@ const traceMessages = (trace: ConversationHistoryCoreDetail): Message[] => {
         id: node.id,
         role,
         content: node.name,
+        attachments: [...new Map([
+          ...messageAttachments(result?.content ?? retainedResult),
+          ...(subagentPartialOutput.get(node.id) ?? []).flatMap(item => item.attachments),
+        ].map(attachment => [attachment.id, attachment])).values()],
         createdAt: node.startedAt,
         meta: {
           title: node.name,
@@ -378,7 +385,7 @@ const traceMessages = (trace: ConversationHistoryCoreDetail): Message[] => {
           sourceAgentName: subagent?.name,
           params: node.kind === 'tool' ? text(retainedInput) : undefined,
           input: node.kind === 'subagent' ? subagentInput : undefined,
-          result: text(
+          result: messageText(
             node.kind === 'subagent'
               ? retainedResult
                 ?? result?.content

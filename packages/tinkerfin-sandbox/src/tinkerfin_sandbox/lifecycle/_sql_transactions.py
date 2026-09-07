@@ -19,13 +19,13 @@ __all__ = [
 import asyncio
 import math
 import sqlite3
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, Literal, TypeVar
 
 from sqlalchemy import delete, insert, select, update
-from sqlalchemy.engine import Connection
+from sqlalchemy.engine import Connection, RowMapping
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncConnection
 from sqlalchemy.sql import Select
@@ -92,6 +92,7 @@ class _WriteConnectionDisposition:
     """Carry connection reuse safety independently from the primary exception."""
 
     discard_connection: bool = False
+    cancellation: asyncio.CancelledError | None = None
 
 
 _SelectRowT = TypeVar("_SelectRowT", bound=tuple[object, ...])
@@ -280,6 +281,9 @@ async def _commit_write_transaction(
     deadline = loop.time() + self._sqlite_retry_timeout
     delay = min(self._poll_interval, _SQLITE_RETRY_MAX_DELAY_SECONDS)
     while True:
+        if disposition.cancellation is not None:
+            await connection.rollback()
+            raise disposition.cancellation
 
         async def commit_once() -> None:
             if self._dialect == "sqlite":
@@ -317,6 +321,8 @@ async def _commit_write_transaction(
             except BaseException as error:  # noqa: BLE001 - preserve DB outcome
                 commit_error = error
 
+        if cancellation is None:
+            cancellation = disposition.cancellation
         if cancellation is not None:
             if commit_error is None:
                 cancellation.add_note(
@@ -381,15 +387,86 @@ async def _write_transaction_once(
     self: SQLAlchemyOpenSandboxState,
     operation: Callable[[AsyncConnection], Awaitable[_ResultT]],
 ) -> _ResultT:
+    """Finish database I/O before applying cancellation at the commit boundary.
+
+    SQLAlchemy's aiosqlite cursor execution can retain an unconsumed cursor when
+    cancelled between execute and fetchall. Even closing its connection can then
+    retain SQLite locks. Keep the complete attempt owned, record caller intent,
+    and roll back before COMMIT when cancellation has been requested. An already
+    issued COMMIT retains its confirmed or uncertain outcome handling.
+    """
+    disposition = _WriteConnectionDisposition()
+    task = asyncio.create_task(
+        _execute_write_transaction(self, operation, disposition),
+        name="tinkerfin-sandbox-state-write",
+    )
+    return await _await_database_task(task, disposition)
+
+
+async def _read_rows(
+    self: SQLAlchemyOpenSandboxState, statement: Select[_SelectRowT]
+) -> Sequence[RowMapping]:
+    """Consume a read and return its connection before propagating cancellation."""
+
+    async def read() -> Sequence[RowMapping]:
+        async with self._engine.connect() as connection:
+            return (await connection.execute(statement)).mappings().all()
+
+    task = asyncio.create_task(read(), name="tinkerfin-sandbox-state-read")
+    return await _await_database_task(task)
+
+
+async def _await_database_task(
+    task: asyncio.Task[_ResultT],
+    disposition: _WriteConnectionDisposition | None = None,
+) -> _ResultT:
+    """Keep driver results and connection return owned through repeated cancellation."""
+    try:
+        await asyncio.wait((task,))
+        return task.result()
+    except asyncio.CancelledError as cancellation:
+        current = asyncio.current_task()
+        if (
+            current is not None
+            and current.cancelling()
+            and disposition is not None
+            and disposition.cancellation is None
+        ):
+            disposition.cancellation = cancellation
+        while not task.done():
+            try:
+                await asyncio.wait((task,))
+            except asyncio.CancelledError:
+                continue
+            except BaseException:  # noqa: BLE001 - retrieve the owned outcome below
+                break
+        try:
+            task.result()
+        except BaseException as error:  # noqa: BLE001 - caller cancellation remains primary
+            if not isinstance(error, asyncio.CancelledError):
+                cancellation.add_note(
+                    f"Sandbox State transaction settlement also failed: {type(error).__name__}"
+                )
+        raise cancellation
+
+
+async def _execute_write_transaction(
+    self: SQLAlchemyOpenSandboxState,
+    operation: Callable[[AsyncConnection], Awaitable[_ResultT]],
+    connection_disposition: _WriteConnectionDisposition,
+) -> _ResultT:
     """Run one write attempt and expose only safely retryable SQLite locks."""
 
     connection = await self._engine.connect()
     retryable_error: DBAPIError | None = None
     connection_setting: _WriteConnectionSetting | None = None
-    connection_disposition = _WriteConnectionDisposition()
     primary_error: BaseException | None = None
     try:
+        if connection_disposition.cancellation is not None:
+            raise connection_disposition.cancellation
         connection_setting = await _capture_write_connection_setting(self, connection)
+        if connection_disposition.cancellation is not None:
+            raise connection_disposition.cancellation
         try:
             await self._begin_write_transaction(connection)
         except DBAPIError as error:
@@ -408,7 +485,11 @@ async def _write_transaction_once(
 
         if retryable_error is None:
             try:
+                if connection_disposition.cancellation is not None:
+                    raise connection_disposition.cancellation
                 result = await operation(connection)
+                if connection_disposition.cancellation is not None:
+                    raise connection_disposition.cancellation
             except BaseException as operation_error:
                 try:
                     await connection.rollback()
@@ -434,6 +515,8 @@ async def _write_transaction_once(
         primary_error = error
         raise
     finally:
+        # Connection return has the same owner as statement consumption. Caller
+        # cancellation must not interrupt pool reset or lose a borrowed slot.
         cleanup_error: BaseException | None = None
         discard_connection = (
             connection_disposition.discard_connection

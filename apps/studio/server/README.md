@@ -28,6 +28,13 @@ uv run python -m tinkerfin_studio --host 127.0.0.1 --port 8090 --reload
 地址必须能从宿主机访问，数据库应先由部署流程自动准备。Control 只承载认证与 Run 协调，
 Runtime 只承载 Checkpointer 与 Messaging；两者必须配置为不同物理服务地址。
 
+## HTTP 响应
+
+`/api` 下普通业务 JSON 接口成功时统一返回 HTTP 200 和
+`{ "code": 0, "message": "success", "data": ... }`。保存、删除和登出等不返回业务数据的操作使用 `data: null`。
+错误使用相同包络并保留对应的 HTTP 状态码，客户端应同时读取 HTTP 状态和业务 `code`。
+附件原件与预览返回文件内容，会话与 Trace 订阅返回原生 SSE；`/health/live` 和 `/health/ready` 使用独立的健康检查响应。
+
 ## 认证会话
 
 `AUTH_TOKEN_EXPIRE_SECONDS` 控制访问令牌从签发时刻起的固定有效期，默认值为 `86400`。
@@ -51,7 +58,7 @@ Redis Control 记录及其固定到期时间为准，过期、撤销或无效令
 | `runId` | 新输入使用新值；同一次网络重试或附着复用原值 |
 | `parentRunId` | 保留在标准请求快照中，不作为框架 RunIdentity 或子 Agent 关系 |
 | `state` | 保留在标准请求快照中，不自动成为 Graph 输入 |
-| `messages` | 普通运行只接受一条非空文本 user 消息；resume 必须为空 |
+| `messages` | 普通运行接受一条文字及附件 user 消息，也可仅附件；resume 必须为空 |
 | `tools` | 仅保留客户端工具描述，不授予服务端工具执行权限 |
 | `context` | 保留在标准请求快照中，由业务决定是否使用 |
 | `forwardedProps` | `model` 与 `command.plan` 必填；Plan 只接受 `on/off`，未知 command 与其他扩展字段完整保留 |
@@ -72,6 +79,36 @@ Studio 在应用启动时选定默认稳定 Runtime Profile，不按模型或 Ru
 在建图前校验模型一致性。供应商私有思考字段默认不解析；产品确需展示思考过程时，由宿主在启动
 装配处提供能够验证 provider 与消息结构的 `ReasoningExtractor`，不能写入模型配置、会话数据或
 客户端协议。框架不提供供应商专用 extractor。
+
+## 个人模型与附件
+
+“设置 → 模型配置”通过 `/api/models/configurations` 管理当前用户的对话模型和 OpenAI 兼容生图服务；`GET /api/models` 只返回本人启用的对话模型。配置响应不包含密钥，更新时留空保留本人密钥。模型与默认选择按用户和用途隔离。生图只调用明确设置且启用的默认模型，没有默认项时提示完成配置。
+
+`PUT /api/models/configurations/{model_id}/default` 不接收请求体，只启用目标模型并切换本人同一用途的默认选择。目标必须配置密钥；该操作不覆盖连接、密钥或生成参数，也不影响正在运行的会话。
+
+`POST /api/models/configurations/test` 接收 `{"kind":"basic","configuration":{...}}`；`configuration` 使用保存接口相同的配置字段，测试不会保存配置。`kind` 可选 `basic`、`text`、`vision`、`image`，总超时分别为 10、30、45、120 秒。已有密钥仅可在本人同一配置 ID、同一 Base URL 下复用，改地址必须提供密钥。聊天与测试共用 OpenAI 兼容和 DeepSeek 的模型构建入口及地址访问规则。
+
+测试结果位于 `ApiResponse.data`，包含 `kind`、`outcome`（`success`、`failed`、`inconclusive`）、`elapsed_ms`、`code`、可空的 `text` 与 `image`。图片包含 `mime_type` 和 `data_base64`；视觉测试返回测试图和实际回复，生图测试返回经校验、限额的预览。基础检查无法取得模型列表时返回未确认，不据此否定模型能力。供应商错误转为安全错误码，不返回密钥或供应商原始错误正文。测试不自动重试、不修改能力标记、不创建会话附件，能力调用可能产生供应商费用。
+
+`generation_options` 是最多 64 KiB、64 层容器嵌套的严格 JSON 对象，数值必须有限；顶层不能覆盖 `model`、`prompt`、`n`、`api_key` 或 `authorization`（忽略大小写）。`size` 和 `output_format` 如提供则必须为非空字符串，其他供应商字段保留并交给生图接口。
+
+公网模型默认使用 HTTPS。接入 Ollama 或内网模型时，管理员在后端环境配置中设置 `MODEL_ALLOWED_ORIGINS`，列出允许访问的准确协议、主机与端口：
+
+```dotenv
+MODEL_ALLOWED_ORIGINS=["http://127.0.0.1:11434","http://localhost:11434"]
+```
+
+重新启动后端后，在模型配置中选择 OpenAI 兼容接口，Base URL 填写 `http://127.0.0.1:11434/v1`，Model ID 填写 Ollama 已安装的模型名称；未启用认证的 Ollama 可以填写占位 API Key `ollama`。图片输入和工具调用取决于所选模型的实际能力。
+
+允许列表不包含 `/v1`、查询参数、账户信息或通配符。HTTP、本机及内网访问按协议、主机和端口精确匹配，不因域名指向同一 IP 而自动互相授权。该设置适用于所有用户的聊天、生图和生成图片下载；允许的 HTTP 服务应位于受信任网络。更改设置后需重启后端。
+
+本机地址指 Studio 后端所在的网络空间。Docker 部署访问宿主机 Ollama 时，在 `deploy/.env` 中填写 `MODEL_ALLOWED_ORIGINS=["http://host.docker.internal:11434"]`，模型 Base URL 使用 `http://host.docker.internal:11434/v1`；Ollama 需监听容器可达的地址。连接另一台服务器时，使用该服务器可达的主机名或 IP 并添加对应来源。
+
+附件使用 `POST /api/attachments?name=...` 上传原始文件流，`GET /api/attachments/{id}/content` 读取原件，`variant=preview` 获取图片预览，`DELETE /api/attachments/{id}` 删除本人未发送草稿。图片及文档输入使用 AG-UI 内容块，`source.value` 为 `attachment:<id>`；后端以仓储信息重建 metadata 并在运行登记事务内绑定会话。消息文本仍受 UTF-8 大小限制。
+
+设置 `ATTACHMENT_DIRECTORY` 保存原件与派生图。相对路径以所读取 `.env` 文件所在目录为基准；未指定配置文件时，以应用默认配置目录为基准，默认值为该目录下的 `.data/attachments`。从不同工作目录启动不会改变存储位置。已有附件应配置其实际所在目录；容器使用 `/app/attachments` 数据卷绝对路径。上传总并发与解析并发均有界，文档解析运行在可取消、最长 30 秒的子进程中。未发送附件保留至少 24 小时，上传及启动时回收过期草稿和已删除会话的对象。相关格式、模型配置与工具用法见根目录 [MultiModal.md](../../../MultiModal.md)。
+
+Studio 使用框架默认的 Sandbox Runtime 镜像，预装 Playwright 和无界面 Chromium，可直接执行网页截图。镜像更新只影响随后创建的容器，已有用户工作区不会自动重建。生图使用用户配置，供应商 URL 或 Base64 结果均在保存后才对外发布。
 
 ## 会话数据边界
 
@@ -151,6 +188,8 @@ LangGraph Store 由 `tinkerfin-langgraph-mysql` 通过 asyncmy 管理一条独�
 Studio、MySQL、Redis Control、Redis Runtime 和 OpenSandbox，只向宿主机回环地址发布 Studio
 端口。内置 MySQL 仅在全新数据卷首次启动时导入 Studio 业务 SQL。两个 Redis 使用独立 Secret、
 AOF 卷与健康检查。
+Compose 使用固定摘要的官方 `opensandbox/server:v0.2.3`，Studio 的 Python SDK 依赖为
+`opensandbox==0.1.16`。该服务的 Docker 恢复操作用于解除暂停，不能启动已通过 Docker 停止的容器。
 OpenSandbox 的 SQLite Store 与 Docker runtime metadata 分别使用持久卷；后者保留运行中 Sandbox
 续期后的过期时间，使 OpenSandbox Server 容器重建后不会退回创建时的旧时间。
 

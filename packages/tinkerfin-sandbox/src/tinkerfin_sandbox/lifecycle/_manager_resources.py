@@ -978,6 +978,7 @@ async def _close_resources(self: OpenSandboxManager[KeyT]) -> None:
     self._warm_ready.clear()
 
     await self._operations_done.wait()
+    await self._availability.stop_polling()
 
     cleanup_queue_task = self._cleanup_queue_task
     if cleanup_queue_task is not None:
@@ -1033,6 +1034,7 @@ async def _close_resources(self: OpenSandboxManager[KeyT]) -> None:
     self._pending_destroy_ids.clear()
 
     try:
+        await self._availability.release_idle_holders()
         await self._state.aclose()
     except Exception as error:  # noqa: BLE001 - close supervisor owns State closure
         logger.warning(

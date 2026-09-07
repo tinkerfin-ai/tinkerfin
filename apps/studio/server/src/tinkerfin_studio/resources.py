@@ -31,6 +31,8 @@ from tinkerfin_sandbox.lifecycle.manager import OpenSandboxManager
 from tinkerfin_sandbox.lifecycle.sqlalchemy import SQLAlchemyOpenSandboxState
 from tinkerfin_sandbox.models import OpenSandboxConfig
 from tinkerfin_studio.agent.persistence import AgentPersistence
+from tinkerfin_studio.attachments.service import AttachmentService
+from tinkerfin_studio.attachments.storage import DiskAttachmentStorage
 from tinkerfin_studio.config.settings import Settings, get_settings
 from tinkerfin_studio.conversation.coordinator import (
     ConversationTraceCoordinator,
@@ -40,6 +42,7 @@ from tinkerfin_studio.health import ReadinessService
 from tinkerfin_studio.infrastructure.database import Database
 from tinkerfin_studio.infrastructure.redis_client import create_redis_client
 from tinkerfin_studio.infrastructure.sandbox_events import SandboxEventLogger
+from tinkerfin_studio.models.transport import ModelTransport
 from tinkerfin_tracing import (
     CapturePolicy,
     SqlAlchemyTraceStore,
@@ -137,6 +140,8 @@ class ApplicationResources:
     """请求处理期间借用的应用级资源"""
 
     settings: Settings
+    model_http_client: httpx.AsyncClient
+    attachments: AttachmentService
     database: Database
     redis_control: Redis
     redis_runtime: Redis
@@ -193,6 +198,18 @@ def build_lifespan():
             stack.push_async_callback(redis_runtime.aclose)
             http_client = await _enter_lifespan_context(
                 stack, outcome, httpx.AsyncClient(trust_env=False)
+            )
+            model_http_client = await _enter_lifespan_context(
+                stack,
+                outcome,
+                httpx.AsyncClient(
+                    transport=ModelTransport(
+                        allowed_origins=settings.model_allowed_origins
+                    ),
+                    trust_env=False,
+                    follow_redirects=False,
+                    timeout=600,
+                ),
             )
             control_ready, runtime_ready = await asyncio.gather(
                 cast(Awaitable[bool], redis_control.ping()),
@@ -299,6 +316,10 @@ def build_lifespan():
             await conversation_trace.recover_preparing()
             application.state.resources = ApplicationResources(
                 settings=settings,
+                model_http_client=model_http_client,
+                attachments=AttachmentService(
+                    database, DiskAttachmentStorage(settings.attachment_directory)
+                ),
                 database=database,
                 redis_control=redis_control,
                 redis_runtime=redis_runtime,
@@ -320,6 +341,7 @@ def build_lifespan():
                 ),
             )
             resources_published = True
+            await application.state.resources.attachments.cleanup()
             yield
         except BaseException as error:  # noqa: BLE001 - 生命周期必须保留所有主因
             outcome.capture(error)

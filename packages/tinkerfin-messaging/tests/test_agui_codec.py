@@ -227,3 +227,37 @@ def test_agui_codec_rejects_an_unknown_event_type() -> None:
 
     with pytest.raises(ValidationError):
         codec.decode(b'{"type":"NOT_AN_AGUI_EVENT"}')
+
+
+def test_agui_codec_preserves_declared_extension_fields_and_rejects_identity_changes() -> (
+    None
+):
+    class LabeledTextStart(TextMessageStartEvent):
+        label: str
+
+    codec = AgUiCodec()
+    event = LabeledTextStart(message_id="answer", role="assistant", label="Chart")
+    replay = codec.decode(codec.encode(event))
+    assert isinstance(replay, TextMessageStartEvent)
+    assert replay.model_extra == {"label": "Chart"}
+    with pytest.raises(ValueError, match="protocol identity"):
+        codec.encode(event.model_copy(update={"messageId": "other"}))
+    with pytest.raises((ValueError, TypeError)):
+        codec.encode(event.model_copy(update={"type": "TEXT_MESSAGE_END"}))
+
+
+def test_agui_codec_preserves_typed_fields_within_authoritative_run_input() -> None:
+    class LabeledUserMessage(UserMessage):
+        label: str
+
+    run_input = _run_agent_input()
+    run_input.messages = [
+        LabeledUserMessage(id="user", content="hello", label="Image request")
+    ]
+    event = RunStartedEvent(
+        thread_id="thread-1", run_id="run-1", parent_run_id="parent-1", input=run_input
+    )
+    replay = AgUiCodec().decode(AgUiCodec().encode(event))
+    assert isinstance(replay, RunStartedEvent)
+    assert replay.input is not None
+    assert replay.input.messages[0].model_extra == {"label": "Image request"}

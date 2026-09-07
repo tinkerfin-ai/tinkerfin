@@ -13,7 +13,7 @@ import type { FormEvent } from 'react'
 import { BrandLogo, Button, IconButton, MOTION_DURATION_SECONDS, TextField } from '../../components/ui'
 import { ThemePicker } from '../../components/ui/ThemePicker'
 import { useI18n } from '../../i18n'
-import { ValidatedForm } from './components/ValidatedForm'
+import { ValidatedForm } from '../../components/ui/ValidatedForm'
 import { ProviderBrandLogo } from './ProviderBrandLogo'
 import './auth.css'
 

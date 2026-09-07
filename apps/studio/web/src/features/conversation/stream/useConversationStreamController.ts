@@ -99,6 +99,7 @@ const waitForReconnect = (delay: number, signal: AbortSignal): Promise<void> => 
 )
 
 export interface StreamRunOptions {
+  onAccepted?: () => void
   target: 'draft' | 'workspace'
   initialConversation?: Conversation
   initialAfterSeq?: number
@@ -521,6 +522,7 @@ export function useConversationStreamController({
         ? current
         : { ...current, taskTrace: projectedTaskTrace }
     }
+    let inputAccepted = false
     let receivedEvent = false
     let mainTerminalReceived = false
     let traceAuthorityLoaded = false
@@ -555,6 +557,10 @@ export function useConversationStreamController({
               : lastAppliedSeq ?? undefined,
           )) {
         receivedEvent = true
+        if (!inputAccepted && event.type === 'RUN_STARTED' && !controller.signal.aborted && streamEpoch === activeStreamEpoch.current) {
+          inputAccepted = true
+          options.onAccepted?.()
+        }
         const eventReceivedAt = new Date().toISOString()
         const reportedThreadId: string = 'threadId' in event && typeof event.threadId === 'string'
           ? event.threadId

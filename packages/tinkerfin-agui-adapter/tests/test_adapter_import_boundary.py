@@ -32,6 +32,13 @@ from langchain_core.messages import AIMessageChunk
 import tinkerfin_agui_adapter
 
 expected_exports = {
+    "AttachmentAssistantMessage",
+    "AttachmentMessagesSnapshotEvent",
+    "AttachmentOutputEvent",
+    "AttachmentSnapshotMessage",
+    "AttachmentToolCallResultEvent",
+    "AttachmentToolMessage",
+    "parse_attachment_output_event",
     "AgUiAdapterError", "AgUiAdapterErrorCode", "AgUiConversionError",
     "AgUiLifecycleError", "AgUiSerializationError", "AgUiStreamContractError",
     "AgUiLifecycleEventFactory", "AgentRunOutcome", "AgentRuntimeInterrupt",
@@ -134,6 +141,12 @@ def test_built_wheel_contains_only_current_contract_artifacts(tmp_path: Path) ->
         name for name in names if name.startswith("tinkerfin_agui_adapter/contracts/")
     }
     assert contract_names == {
+        "tinkerfin_agui_adapter/contracts/tool-call-result.schema.json",
+        "tinkerfin_agui_adapter/contracts/tool-message.schema.json",
+        "tinkerfin_agui_adapter/contracts/assistant-message.schema.json",
+        "tinkerfin_agui_adapter/contracts/messages-snapshot.schema.json",
+        "tinkerfin_agui_adapter/contracts/message-attachments.fixture.json",
+        "tinkerfin_agui_adapter/contracts/message-attachments.schema.json",
         "tinkerfin_agui_adapter/contracts/subagent-provenance.fixture.json",
         "tinkerfin_agui_adapter/contracts/subagent-provenance.schema.json",
         "tinkerfin_agui_adapter/contracts/tool-review.fixture.json",

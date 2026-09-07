@@ -24,6 +24,8 @@ export interface DialogProps {
   closeDisabled?: boolean
   restoreFocusTo?: HTMLElement | null
   initialFocusRef?: RefObject<HTMLElement | null>
+  headerActions?: ReactNode
+  onKeyDown?: (event: KeyboardEvent<HTMLDivElement>) => void
   onClose: () => void
 }
 
@@ -36,6 +38,8 @@ export function Dialog({
   closeDisabled = false,
   restoreFocusTo,
   initialFocusRef,
+  headerActions,
+  onKeyDown,
   onClose,
 }: DialogProps) {
   const { t } = useI18n()
@@ -56,6 +60,7 @@ export function Dialog({
   if (!open) return null
 
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    onKeyDown?.(event)
     // 内层列表框等浮层先处理键盘事件时，外层对话框必须保持不变
     if (event.defaultPrevented) return
     if (event.key === 'Escape' && !closeDisabled) {
@@ -115,6 +120,7 @@ export function Dialog({
               <div id={descriptionId} className="modal-dialog-description">{description}</div>
             )}
           </div>
+          {headerActions}
           <IconButton
             ref={closeRef}
             className="modal-dialog-close"

@@ -8,6 +8,7 @@ protocol methods retain the Deep Agents shape but reject remote I/O explicitly.
 from __future__ import annotations
 
 import asyncio
+import math
 import posixpath
 import secrets
 import shlex
@@ -33,12 +34,18 @@ from deepagents.backends.protocol import (
 from deepagents.backends.sandbox import BaseSandbox
 from opensandbox import Sandbox
 from opensandbox.exceptions import (
+    InvalidArgumentException,
     SandboxApiException,
     SandboxInternalException,
     SandboxUnhealthyException,
 )
 from opensandbox.models import OutputMessage, WriteEntry
-from opensandbox.models.execd import RunCommandOpts
+from opensandbox.models.execd import (
+    Execution,
+    ExecutionHandlers,
+    ExecutionInit,
+    RunCommandOpts,
+)
 
 from ..errors import (
     OpenSandboxBackendError,
@@ -48,6 +55,8 @@ from ..errors import (
     UnexpectedOpenSandboxBackendError,
 )
 from ..models import OpenSandboxRuntimeInfo, OpenSandboxUnavailableReason
+from ._bounded_read import await_owned_read, read_binary, validate_read_limits
+from ._operations import RemoteOperations, current_remote_operations
 from ._rooted_protocol import (
     _build_rooted_command,
     _build_rooted_transfer_command,
@@ -73,6 +82,8 @@ _ROOTED_TRANSFER_TERMINAL_LOG_SECONDS = 0.5
 _ROOTED_TRANSFER_MAX_LOG_BYTES = 64 * 1024
 _ROOTED_OFFLOAD_MAX_CAPTURE_BYTES = 10 * 1024 * 1024
 _TERMINAL_SANDBOX_STATES = frozenset({"failed", "stopping", "terminated"})
+_INACTIVE_SANDBOX_STATES = _TERMINAL_SANDBOX_STATES | {"pausing", "paused", "resuming"}
+_COMMAND_SETTLEMENT_POLL_SECONDS = 0.05
 _ASYNC_ONLY_MESSAGE = (
     "OpenSandboxBackend supports asynchronous remote I/O only; "
     "use the corresponding async method"
@@ -135,7 +146,7 @@ def _file_error(exc: Exception, *, default: str) -> str:
         if exc.status_code == 403:
             return PERMISSION_DENIED
 
-    # OpenSandbox 0.1.14 does not always preserve file errors as
+    # The SDK does not always preserve file errors as
     # SandboxApiException, so HTTP wrappers and execd text remain fallbacks.
     message = str(exc).lower()
     if "not found" in message or "no such file" in message:
@@ -199,6 +210,22 @@ def _connection_failure_reason(error: Exception) -> str | None:
     if isinstance(error, SandboxUnhealthyException):
         return "unhealthy"
     return None
+
+
+def _request_was_rejected(error: BaseException) -> bool:
+    """Recognize explicit refusal without treating timeouts as non-execution."""
+    if isinstance(error, SandboxApiException):
+        status = error.status_code
+        return status is not None and 400 <= status < 500 and status != 408
+    return isinstance(
+        error,
+        (
+            InvalidArgumentException,
+            FileNotFoundError,
+            IsADirectoryError,
+            PermissionError,
+        ),
+    )
 
 
 async def _backend_call(
@@ -323,6 +350,7 @@ class OpenSandboxBackend(BaseSandbox):
         )
         self._health_command = health_command
         self.enable_capture_offload = enable_capture_offload
+        self._remote_operations = RemoteOperations()
 
     @contextmanager
     def _rooted_file_operation(self) -> Generator[None]:
@@ -381,13 +409,56 @@ class OpenSandboxBackend(BaseSandbox):
         *,
         timeout: int | None = None,
     ) -> ExecuteResponse:
-        """Execute a Shell command through the native asynchronous command service."""
+        """Execute once and retain uncertain remote work after cancellation or failure.
+
+        Cancellation returns to the caller while a bounded owned check interrupts
+        and verifies any identified command. Unknown outcomes remain non-idle for
+        lifecycle coordination. Successful commands need no extra remote request.
+        """
+        options = self._command_options(timeout)
+        operations = current_remote_operations(self._remote_operations)
+        execution_id: str | None = None
+
+        async def initialized(event: object) -> None:
+            nonlocal execution_id
+            # SDK ExecutionEventDispatcher._handle_init supplies ExecutionInit,
+            # although ExecutionHandlers annotates its callback input as Any.
+            if not isinstance(event, ExecutionInit) or not event.id.strip():
+                raise ValueError("OpenSandbox command returned an invalid execution ID")
+            execution_id = event.id
+
+        async def execute_once() -> Execution:
+            try:
+                execution = await self._sandbox.commands.run(
+                    command,
+                    opts=options,
+                    handlers=ExecutionHandlers(on_init=initialized),
+                )
+            except BaseException as error:
+                if execution_id is not None:
+                    command_id = execution_id
+                    operations.start_settlement(
+                        lambda: self._settle_command(command_id)
+                    )
+                elif not _request_was_rejected(error):
+                    operations.mark_unresolved()
+                raise
+            if execution.exit_code is None:
+                # An exhausted SSE stream alone is not a terminal event. In
+                # particular, SDK execution_complete for background commands only
+                # confirms submission; this path uses foreground commands.
+                command_id = execution_id or execution.id
+                if command_id:
+                    operations.start_settlement(
+                        lambda: self._settle_command(command_id)
+                    )
+                else:
+                    operations.mark_unresolved()
+            return execution
+
         result = await _backend_call(
             "command execution",
-            self._sandbox.commands.run(
-                command,
-                opts=self._command_options(timeout),
-            ),
+            execute_once(),
         )
         stdout = _join_output_messages(result.logs.stdout)
         stderr = _join_output_messages(result.logs.stderr).strip()
@@ -399,6 +470,41 @@ class OpenSandboxBackend(BaseSandbox):
             exit_code=result.exit_code,
             truncated=False,
         )
+
+    async def _settle_command(self, execution_id: str) -> None:
+        """Interrupt at most once and require the SDK's remote terminal evidence.
+
+        RemoteOperations owns the total deadline. An interrupt response does not
+        itself prove that the command has stopped, and missing status is unresolved.
+        """
+        status = await self._sandbox.commands.get_command_status(execution_id)
+        if status.running is False or (
+            status.running is None and status.exit_code is not None
+        ):
+            return
+        await self._sandbox.commands.interrupt(execution_id)
+        while True:
+            status = await self._sandbox.commands.get_command_status(execution_id)
+            if status.running is False or (
+                status.running is None and status.exit_code is not None
+            ):
+                return
+            await asyncio.sleep(_COMMAND_SETTLEMENT_POLL_SECONDS)
+
+    async def _file_request(self, request: Awaitable[_TransferT]) -> _TransferT:
+        """Retain uncertainty when a file request ends without a confirmed outcome.
+
+        The SDK request is directly awaited through completion or cancellation
+        cleanup. File operations expose no remote request ID for later status
+        reconciliation, so an unconfirmed response cannot authorize pause.
+        """
+        operations = current_remote_operations(self._remote_operations)
+        try:
+            return await request
+        except BaseException as error:
+            if not _request_was_rejected(error):
+                operations.mark_unresolved()
+            raise
 
     async def _await_rooted_transfer_handshake(
         self,
@@ -436,7 +542,7 @@ class OpenSandboxBackend(BaseSandbox):
             if status.running is False or (
                 status.running is None and status.exit_code is not None
             ):
-                # OpenSandbox 0.1.14 can publish terminal command status before
+                # The execd service can publish terminal command status before
                 # the final log cursor is visible. Drain only that cursor within
                 # a bounded grace period; the contract is fixed by
                 # test_rooted_descriptor_drains_final_logs_after_terminal_status.
@@ -545,6 +651,7 @@ class OpenSandboxBackend(BaseSandbox):
         path: str,
         mode: Literal["upload", "download"],
         transfer: Callable[[str], Awaitable[_TransferT]],
+        hold_seconds: int = _ROOTED_TRANSFER_HOLD_SECONDS,
     ) -> _TransferT:
         """Own one background helper from startup through descriptor settlement."""
         request = _build_rooted_transfer_command(
@@ -552,11 +659,19 @@ class OpenSandboxBackend(BaseSandbox):
             path=path,
             mode=mode,
             token=secrets.token_hex(32),
-            hold_seconds=_ROOTED_TRANSFER_HOLD_SECONDS,
+            hold_seconds=hold_seconds,
         )
         execution_id: str | None = None
+        operations = current_remote_operations(self._remote_operations)
         result: _TransferT | None = None
         primary: BaseException | None = None
+
+        async def initialized(event: object) -> None:
+            nonlocal execution_id
+            if not isinstance(event, ExecutionInit) or not event.id.strip():
+                raise ValueError("rooted transfer helper returned no execution ID")
+            execution_id = event.id
+
         try:
             execution = await _backend_call(
                 "rooted transfer command",
@@ -565,9 +680,10 @@ class OpenSandboxBackend(BaseSandbox):
                     opts=RunCommandOpts(
                         background=True,
                         working_directory="/",
-                        timeout=timedelta(seconds=_ROOTED_TRANSFER_HOLD_SECONDS + 5),
+                        timeout=timedelta(seconds=hold_seconds + 5),
                         envs=dict(_ROOTED_INTERNAL_COMMAND_ENV),
                     ),
+                    handlers=ExecutionHandlers(on_init=initialized),
                 ),
             )
             if not isinstance(execution.id, str) or not execution.id.strip():
@@ -580,6 +696,10 @@ class OpenSandboxBackend(BaseSandbox):
             result = await transfer(descriptor_path)
         except BaseException as exc:  # noqa: BLE001 - settle before propagation
             primary = exc
+            if execution_id is None:
+                cause = exc.cause if isinstance(exc, OpenSandboxBackendError) else exc
+                if cause is None or not _request_was_rejected(cause):
+                    operations.mark_unresolved()
 
         if execution_id is not None:
             settlement = asyncio.create_task(
@@ -609,6 +729,7 @@ class OpenSandboxBackend(BaseSandbox):
             try:
                 settlement.result()
             except BaseException as cleanup_error:  # noqa: BLE001 - preserve primary
+                operations.mark_unresolved()
                 if primary is None:
                     primary = cleanup_error
                 else:
@@ -635,10 +756,12 @@ class OpenSandboxBackend(BaseSandbox):
         async def transfer(descriptor_path: str) -> FileUploadResponse:
             await _backend_call(
                 "rooted file upload",
-                self._sandbox.files.write_file(
-                    descriptor_path,
-                    content,
-                    mode=644,
+                self._file_request(
+                    self._sandbox.files.write_file(
+                        descriptor_path,
+                        content,
+                        mode=644,
+                    ),
                 ),
             )
             return FileUploadResponse(path=path, error=None)
@@ -659,6 +782,75 @@ class OpenSandboxBackend(BaseSandbox):
                 ),
             )
 
+    async def aread_bytes(
+        self, path: str, *, max_bytes: int, timeout: float = 30
+    ) -> bytes:
+        """Read one binary file, rejecting excess content without returning a prefix.
+
+        Args:
+            path: Absolute Sandbox file path; this raw backend does not confine paths.
+            max_bytes: Maximum accepted file size in bytes, including zero for empty files.
+            timeout: Total read deadline in seconds, greater than zero and at most 290.
+                Response cleanup is awaited before cancellation or failure propagates.
+
+        Returns:
+            Complete binary content, with retained content bounded by ``max_bytes``
+            plus one transport chunk and the final bytes copy.
+
+        Raises:
+            ValueError: The path or limits are invalid.
+            FileNotFoundError: The file does not exist.
+            PermissionError: File access is denied.
+            OpenSandboxFileTooLargeError: The file exceeds ``max_bytes``.
+            OpenSandboxBackendError: Download or protocol validation failed.
+            OpenSandboxBackendTimeoutError: The read deadline expired.
+        """
+        validate_read_limits(max_bytes, timeout)
+        if not _is_absolute_sandbox_path(path):
+            raise ValueError("path must be an absolute Sandbox path")
+
+        async def read() -> bytes:
+            async with asyncio.timeout(timeout):
+                return await read_binary(self._sandbox, path, max_bytes=max_bytes)
+
+        return await await_owned_read(lambda: _backend_call("binary file read", read()))
+
+    async def _aread_rooted_bytes(
+        self, *, root: str, path: str, max_bytes: int, timeout: float
+    ) -> bytes:
+        """Pin a regular file and close the HTTP response before releasing its helper."""
+        validate_read_limits(max_bytes, timeout)
+
+        async def read() -> bytes:
+            try:
+                async with asyncio.timeout(timeout):
+                    return await self._run_rooted_transfer(
+                        root=root,
+                        path=path,
+                        mode="download",
+                        hold_seconds=math.ceil(timeout) + 5,
+                        transfer=lambda descriptor: read_binary(
+                            self._sandbox, descriptor, max_bytes=max_bytes
+                        ),
+                    )
+            except _RootedTransferOperationError as error:
+                code = error.error.code
+                if code == "not_found":
+                    raise FileNotFoundError("Sandbox file was not found") from error
+                if code == "permission_denied":
+                    raise PermissionError("Sandbox file access was denied") from error
+                if code == "not_a_file":
+                    raise IsADirectoryError(
+                        "Sandbox path is not a regular file"
+                    ) from error
+                raise OpenSandboxBackendProtocolError(
+                    "Sandbox file path was rejected", context={"reason": code}
+                ) from error
+
+        return await await_owned_read(
+            lambda: _backend_call("rooted binary file read", read())
+        )
+
     async def _adownload_rooted_file(
         self,
         *,
@@ -670,7 +862,7 @@ class OpenSandboxBackend(BaseSandbox):
         async def transfer(descriptor_path: str) -> FileDownloadResponse:
             content = await _backend_call(
                 "rooted file download",
-                self._sandbox.files.read_bytes(descriptor_path),
+                self._file_request(self._sandbox.files.read_bytes(descriptor_path)),
             )
             return FileDownloadResponse(path=path, content=content, error=None)
 
@@ -759,7 +951,7 @@ class OpenSandboxBackend(BaseSandbox):
                 )
                 continue
             try:
-                content = await self._sandbox.files.read_bytes(path)
+                content = await self._file_request(self._sandbox.files.read_bytes(path))
             except Exception as exc:  # noqa: BLE001 - per-file SDK isolation
                 responses.append(
                     FileDownloadResponse(
@@ -795,12 +987,16 @@ class OpenSandboxBackend(BaseSandbox):
             try:
                 parent = str(PurePosixPath(path).parent)
                 if parent != "/":
-                    await self._sandbox.files.create_directories(
-                        # SDK 0.1.14 expects Unix octal permissions as decimal digits;
-                        # Python's 0o755 serializes as "493", which execd rejects.
-                        [WriteEntry(path=parent, mode=755)]
+                    await self._file_request(
+                        self._sandbox.files.create_directories(
+                            # The SDK expects octal permissions as decimal digits;
+                            # Python's 0o755 serializes as "493", which execd rejects.
+                            [WriteEntry(path=parent, mode=755)]
+                        )
                     )
-                await self._sandbox.files.write_file(path, content, mode=644)
+                await self._file_request(
+                    self._sandbox.files.write_file(path, content, mode=644)
+                )
             except Exception as exc:  # noqa: BLE001 - per-file SDK isolation
                 responses.append(
                     FileUploadResponse(
@@ -840,7 +1036,12 @@ class OpenSandboxBackend(BaseSandbox):
         self._reject_sync()
 
     async def aclose(self) -> None:
-        """Close the local SDK connection without changing remote lifecycle."""
+        """Settle standalone remote checks, then close only the local connection.
+
+        Managed handles own their activated trackers and await them separately.
+        Unconfirmed outcomes remain recorded even after bounded checks finish.
+        """
+        await self._remote_operations.wait()
         await _backend_call("close", self._sandbox.close())
 
     def kill(self) -> None:
@@ -865,10 +1066,10 @@ class OpenSandboxBackend(BaseSandbox):
                 unavailable_reason(exc),
             )
 
-        # OpenSandbox 0.1.14 defines these states as irreversible transitions away
-        # from usable capacity. Avoid a data-plane command that cannot succeed and can
-        # otherwise consume the full endpoint timeout after Docker has already exited.
-        if info.status.state.casefold() in _TERMINAL_SANDBOX_STATES:
+        # Terminal and suspended lifecycle states cannot serve data-plane probes.
+        # In particular, a paused Sandbox keeps its lifecycle status instead of
+        # waiting for a health-command timeout or implicitly resuming execution.
+        if info.status.state.casefold() in _INACTIVE_SANDBOX_STATES:
             return OpenSandboxRuntimeInfo.from_sdk(info, healthy=False)
 
         try:

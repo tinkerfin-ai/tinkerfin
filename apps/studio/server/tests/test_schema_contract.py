@@ -1,5 +1,6 @@
 from sqlalchemy import MetaData
 
+from tinkerfin_studio.attachments.entity import AttachmentFile
 from tinkerfin_studio.auth.models import User
 from tinkerfin_studio.conversation.models import (
     ConversationInterruptClaim,
@@ -15,6 +16,7 @@ def test_business_schema_contains_no_foreign_keys() -> None:
 
     registered = (
         User,
+        AttachmentFile,
         AgentModel,
         ConversationThread,
         ConversationRunRegistration,
@@ -32,6 +34,7 @@ def test_business_schema_exposes_only_current_studio_tables() -> None:
 
     assert set(metadata.tables) == {
         "users",
+        "conversation_attachments",
         "agent_models",
         "conversation_threads",
         "conversation_run_registrations",

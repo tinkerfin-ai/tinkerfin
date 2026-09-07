@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import (
 
 from langgraph.store.mysql.asyncmy import AsyncMyStore
 from tinkerfin_sandbox import get_sqlalchemy_opensandbox_state_schema
+from tinkerfin_studio.attachments.entity import AttachmentFile
 from tinkerfin_studio.auth.models import User
 from tinkerfin_studio.conversation.models import (
     ConversationInterruptClaim,
@@ -31,6 +32,7 @@ _DATABASE_NAME_PATTERN = re.compile(r"\Atinkerfin_schema_[a-f0-9]{16}_(sql|runti
 _EXPECTED_TABLES = frozenset(
     {
         "users",
+        "conversation_attachments",
         "agent_models",
         "conversation_threads",
         "conversation_run_registrations",
@@ -40,6 +42,8 @@ _EXPECTED_TABLES = frozenset(
         "tinkerfin_opensandbox_workers",
         "tinkerfin_opensandbox_warm_slots",
         "tinkerfin_opensandbox_cleanup",
+        "tinkerfin_opensandbox_availability",
+        "tinkerfin_opensandbox_holders",
         "tinkerfin_trace_events",
         "tinkerfin_trace_graph_nodes",
         "tinkerfin_trace_namespaces",
@@ -50,6 +54,7 @@ _EXPECTED_TABLES = frozenset(
 )
 _BUSINESS_MODELS = (
     User,
+    AttachmentFile,
     AgentModel,
     ConversationThread,
     ConversationRunRegistration,

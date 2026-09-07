@@ -706,7 +706,7 @@ async def test_real_stopped_warm_container_reports_capacity_loss_and_restoration
         opensandbox_docker_runtime,
         fault_docker,
         warm_pool_size=1,
-        # Server v0.2.2 CreateSandboxRequest.timeout requires at least 60 seconds.
+        # The server's CreateSandboxRequest.timeout requires at least 60 seconds.
         # The public TTL setting yields a 20-second warm maintenance interval.
         ttl=timedelta(seconds=60),
     )

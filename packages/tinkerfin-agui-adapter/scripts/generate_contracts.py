@@ -3,19 +3,30 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 from pathlib import Path
+
+from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
+from langchain_core.tools import tool
 
 from tinkerfin_agui_adapter import (
     SUBAGENT_PROVENANCE_SCHEMA,
     TOOL_REVIEW_SCHEMA,
+    AttachmentAssistantMessage,
+    AttachmentMessagesSnapshotEvent,
+    AttachmentToolCallResultEvent,
+    AttachmentToolMessage,
+    DeepAgentAgUiAdapter,
     RunIdentity,
     ScopedIdCodec,
     SubagentProvenance,
     ToolReviewInterruptMetadata,
     create_subagent_provenance,
 )
+from tinkerfin_agui_adapter.media import MessageAttachments
 from tinkerfin_agui_adapter.models import JsonObject
+from tinkerfin_contracts.media import Attachment
 
 _SCRIPT_PATH = Path(__file__).resolve()
 _PACKAGE_ROOT = _SCRIPT_PATH.parents[1]
@@ -38,7 +49,91 @@ def _serialized(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
 
 
+async def _media_fixture() -> str:
+    """Capture actual tool formatting and balanced assistant attachment events."""
+    attachment = Attachment(
+        id="fixture-image", name="chart.png", mime_type="image/png", size_bytes=42
+    )
+
+    @tool
+    async def picture():
+        """Return a durable image."""
+        return [attachment.content_block()]
+
+    message = await picture.ainvoke(
+        {"type": "tool_call", "id": "media-call", "name": "picture", "args": {}}
+    )
+    assert isinstance(message, ToolMessage)
+    adapter = DeepAgentAgUiAdapter(
+        identity=RunIdentity(threadId="thread-media", runId="run-media")
+    )
+    events = adapter.process(
+        {
+            "type": "messages",
+            "ns": (),
+            "data": (message, {"lc_agent_name": None, "langgraph_node": "tools"}),
+        }
+    )
+    events += adapter.process(
+        {
+            "type": "messages",
+            "ns": (),
+            "data": (
+                AIMessageChunk(id="answer", content=[attachment.content_block()]),
+                {"lc_agent_name": None, "langgraph_node": "model"},
+            ),
+        }
+    )
+    events += adapter.process(
+        {
+            "type": "messages",
+            "ns": (),
+            "data": (
+                AIMessageChunk(
+                    id="answer", content="Generated chart", chunk_position="last"
+                ),
+                {"lc_agent_name": None, "langgraph_node": "model"},
+            ),
+        }
+    )
+    snapshot_events = adapter.process(
+        {
+            "type": "values",
+            "ns": (),
+            "data": {
+                "messages": [
+                    message,
+                    AIMessage(
+                        id="answer",
+                        content=[
+                            {"type": "text", "text": "Generated chart"},
+                            attachment.content_block(),
+                        ],
+                    ),
+                ]
+            },
+            "interrupts": ({"id": "media-review", "value": {"pause": "review"}},),
+        }
+    )
+    return _serialized(
+        {
+            "attachment": attachment.model_dump(mode="json"),
+            "toolContent": message.content,
+            "snapshots": [
+                event.model_dump(mode="json", by_alias=True, exclude_none=True)
+                for event in snapshot_events
+                if isinstance(event, AttachmentMessagesSnapshotEvent)
+            ],
+            "events": [
+                event.model_dump(mode="json", by_alias=True, exclude_none=True)
+                for event in events
+            ],
+        }
+    )
+
+
 def _artifacts() -> dict[Path, str]:
+    media_fixture = asyncio.run(_media_fixture())
     tool_schema = ToolReviewInterruptMetadata.model_json_schema(by_alias=True)
     tool_schema["$schema"] = "https://json-schema.org/draft/2020-12/schema"
     tool_schema["$id"] = (
@@ -80,7 +175,24 @@ def _artifacts() -> dict[Path, str]:
     ).model_dump(mode="json", by_alias=True)
     assert subagent_fixture["schema"] == SUBAGENT_PROVENANCE_SCHEMA
     subagent_fixture_text = _serialized(subagent_fixture)
+    attachment_schemas = {
+        "tool-call-result": AttachmentToolCallResultEvent,
+        "assistant-message": AttachmentAssistantMessage,
+        "tool-message": AttachmentToolMessage,
+        "messages-snapshot": AttachmentMessagesSnapshotEvent,
+    }
     return {
+        **{
+            _CONTRACT_ROOT / f"{name}.schema.json": _serialized(
+                model.model_json_schema(by_alias=True)
+            )
+            for name, model in attachment_schemas.items()
+        },
+        _CONTRACT_ROOT / "message-attachments.schema.json": _serialized(
+            MessageAttachments.model_json_schema(by_alias=True)
+        ),
+        _CONTRACT_ROOT / "message-attachments.fixture.json": media_fixture,
+        _WEB_CONTRACT_ROOT / "message-attachments.fixture.json": media_fixture,
         _CONTRACT_ROOT / "tool-review.schema.json": _serialized(tool_schema),
         _CONTRACT_ROOT / "tool-review.fixture.json": tool_fixture_text,
         _WEB_CONTRACT_ROOT / "tool-review.fixture.json": tool_fixture_text,

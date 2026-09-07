@@ -40,3 +40,5 @@ export type {
   ViewTabsDensity,
   ViewTabsProps,
 } from './ViewTabs'
+
+export { ValidatedForm } from './ValidatedForm'

@@ -2,7 +2,17 @@
 
 from datetime import UTC, datetime
 
-from sqlalchemy import Boolean, DateTime, Index, Integer, String, Text, UniqueConstraint
+from pydantic import JsonValue
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from tinkerfin_studio.infrastructure.database import Base
@@ -17,14 +27,29 @@ class AgentModel(Base):
 
     __tablename__ = "agent_models"
     __table_args__ = (
-        UniqueConstraint("model_id", name="uq_agent_models_model_id"),
-        Index("ix_agent_models_enabled_order", "enabled", "sort_order", "id"),
-        Index("ix_agent_models_default", "is_default", "enabled"),
+        UniqueConstraint("user_id", "model_id", name="uq_agent_models_owner_model"),
+        Index(
+            "ix_agent_models_enabled_order", "user_id", "enabled", "sort_order", "id"
+        ),
+        Index("ix_agent_models_default", "user_id", "purpose", "is_default", "enabled"),
         {"comment": "可由前端选择的 Agent 模型与连接配置"},
     )
 
     id: Mapped[int] = mapped_column(
         Integer, primary_key=True, autoincrement=True, comment="模型配置主键"
+    )
+    generation_options: Mapped[dict[str, JsonValue]] = mapped_column(
+        JSON, nullable=False, default=dict, comment="生图接口附加参数，不包含认证信息"
+    )
+    user_id: Mapped[int] = mapped_column(
+        Integer, nullable=False, comment="模型及密钥所属用户 ID"
+    )
+    purpose: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="chat",
+        server_default="chat",
+        comment="chat 对话模型或 image 生图服务",
     )
     model_id: Mapped[str] = mapped_column(
         String(64), nullable=False, comment="前后端使用的稳定模型 ID"
@@ -45,6 +70,13 @@ class AgentModel(Base):
     )
     api_key: Mapped[str] = mapped_column(
         Text, nullable=False, comment="模型服务明文 API 密钥，禁止通过接口或日志暴露"
+    )
+    image_support: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="unknown",
+        server_default="unknown",
+        comment="图片输入能力：supported、unsupported 或 unknown",
     )
     reasoning_enabled: Mapped[bool] = mapped_column(
         Boolean,

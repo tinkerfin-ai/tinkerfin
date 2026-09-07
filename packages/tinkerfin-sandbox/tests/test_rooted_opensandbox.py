@@ -23,13 +23,17 @@ from tests.support.docker_services import (
 )
 
 from tinkerfin_sandbox import (
+    OpenSandboxBackendProtocolError,
     OpenSandboxBackendUnavailableError,
     OpenSandboxClient,
     OpenSandboxConfig,
+    OpenSandboxFileTooLargeError,
+    OpenSandboxHandle,
     OpenSandboxLifecycleEvent,
     OpenSandboxLifecycleEventType,
     OpenSandboxManager,
     OpenSandboxRecoveryPolicy,
+    RootedOpenSandboxBackend,
     SQLAlchemyOpenSandboxState,
 )
 from tinkerfin_sandbox.backends import _rooted_protocol
@@ -258,8 +262,8 @@ def _recreated_opensandbox_server(
 
     return runtime.configure_server(
         DockerContainer(
-            "opensandbox/server:v0.2.2@sha256:"
-            "8f8762af7565ed9c6f9dbcf009dd56727aa1fef8ce58a17f2b007b88cfe542bb"
+            "opensandbox/server:v0.2.3@sha256:"
+            "ae8dfbb277f40a39ff01ef35e5e1c10675acfe0fa9db15259b8f323e5efab778"
         )
         .with_env("OPENSANDBOX_SERVER_API_KEY", api_key)
         .with_volume_mapping(
@@ -318,6 +322,28 @@ async def test_real_rooted_descriptor_transfers_reject_symlink_races(
         assert downloaded.error is None
         assert downloaded.content == content
         completed.append("descriptor_transfer_16mib")
+        view = RootedOpenSandboxBackend(OpenSandboxHandle(backend))
+        assert await view.aread_bytes(large_path, max_bytes=len(content)) == content
+        with pytest.raises(OpenSandboxFileTooLargeError):
+            await view.aread_bytes(large_path, max_bytes=10 * 1024 * 1024)
+        with pytest.raises(FileNotFoundError):
+            await view.aread_bytes(f"/{token}/missing/nested/file.bin", max_bytes=4096)
+        assert (
+            await backend.aexecute(f"test ! -e /workspace/{token}/missing")
+        ).exit_code == 0
+        empty_path = f"/{token}/empty.bin"
+        assert (await view.aupload_files([(empty_path, b"")]))[0].error is None
+        assert await view.aread_bytes(empty_path, max_bytes=0) == b""
+        assert (
+            await backend.aexecute(
+                f"ln -s /etc/passwd /workspace/{token}/escape; "
+                f"mkfifo /workspace/{token}/fifo"
+            )
+        ).exit_code == 0
+        with pytest.raises(OpenSandboxBackendProtocolError):
+            await view.aread_bytes(f"/{token}/escape", max_bytes=4096)
+        with pytest.raises(IsADirectoryError):
+            await view.aread_bytes(f"/{token}/fifo", max_bytes=4096, timeout=5)
 
         for case in _race_cases(token):
             await _run_race(backend, case, token=token)
