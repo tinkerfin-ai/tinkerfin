@@ -12,6 +12,7 @@ interface ValidatedFormProps<FieldName extends string>
   errors: Partial<Record<FieldName, string>>
   validationAttempt: number
 }
+/** 统一字段错误反馈与焦点定位，不显示浏览器原生校验气泡 */
 export function ValidatedForm<FieldName extends string>({
   errors,
   validationAttempt,
