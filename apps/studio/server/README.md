@@ -210,9 +210,6 @@ OpenSandbox 的 SQLite Store 与 Docker runtime metadata 分别使用持久卷�
 - `/health/live` 只表示进程存活
 - `/health/ready` 独立检查 MySQL、Redis Control、Redis Runtime、OpenSandbox 控制面与真实预热容量，
   就绪失败返回 503
-- `DATABASE_CONNECTION_BUDGET` 必须覆盖共享 SQLAlchemy 池和一条 Agent Store connection；
-  启动时还会用 `@@max_connections` 校验 `DATABASE_MANAGEMENT_CONNECTION_RESERVE`
-- `MESSAGING_RETENTION_SECONDS` 默认 `86400`，只定义终态后的网络重播窗口；`0` 关闭自动过期
 - 容器日志默认只写 stdout；设置 `LOG_FILE_ENABLED=true` 后写入持久日志卷
 - 沙箱生命周期回调记录事件、原因、用户绑定身份和工作区变化提示，沿用上述日志输出及 `LOG_LEVEL`。
   不可用和预热容量不足为 WARNING，恢复失败为 ERROR，恢复、重建、重置、销毁及预热恢复等为 INFO。
