@@ -1,6 +1,6 @@
 # Streams and SSE
 
-[Create and run a Deep Agent](deep-agents.md) · [中文](../../zh/runtime/streams-and-sse.md)
+[Create and run a Deep Agent](deep-agents.md) · [中文](../../cn/runtime/streams-and-sse.md)
 
 `astream()` returns an object stream. You can process its objects on the server or encode them as SSE for a browser.
 

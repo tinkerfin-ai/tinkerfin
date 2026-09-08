@@ -19,6 +19,7 @@ from tinkerfin import SseBody
 from tinkerfin_contracts import RunIdentity
 from tinkerfin_studio.api.dependencies import SessionDep, get_session
 from tinkerfin_studio.api.responses import trace_sse_response
+from tinkerfin_studio.conversation.failures import ConversationFailureProjection
 from tinkerfin_tracing import RunFact, SqlAlchemyTraceStore, Tracer, TurnFact
 
 
@@ -198,7 +199,9 @@ async def test_native_trace_response_settles_wrapped_mysql_follow_before_return(
             ),
         )
     )
-    trace = await Tracer(store=store).get(
+    trace = await Tracer(
+        projections=(ConversationFailureProjection(),), store=store
+    ).get(
         identity.thread_id,
         head_run_id=identity.run_id,
     )

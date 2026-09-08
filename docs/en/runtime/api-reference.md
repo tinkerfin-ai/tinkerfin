@@ -1,6 +1,6 @@
 # Runtime usage reference
 
-[Runtime basics](index.md) · [中文](../../zh/runtime/api-reference.md)
+[Runtime basics](index.md) · [中文](../../cn/runtime/api-reference.md)
 
 AG-UI Runtime entrypoints require `pip install "tinkerfin[agui]"`. Native Runtime,
 Plan Mode, Observation, and native SSE are part of the base installation.

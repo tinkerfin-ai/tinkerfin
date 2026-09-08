@@ -1,6 +1,6 @@
 # Messaging basics
 
-[Documentation](../README.md) · [中文](../../zh/messaging/index.md)
+[Documentation](../index.md) · [中文](../../cn/messaging/index.md)
 
 Messaging turns a single-use object stream into a durable producer that supports replay, attachment, and remote cancellation. An agent can keep running after a browser disconnects, and a later request resumes from the last durable sequence.
 

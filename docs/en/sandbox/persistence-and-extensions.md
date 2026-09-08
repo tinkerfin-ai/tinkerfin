@@ -1,6 +1,6 @@
 # Persistent state and extensions
 
-[Rooted files and commands](rooted-filesystem.md) · [中文](../../zh/sandbox/persistence-and-extensions.md)
+[Rooted files and commands](rooted-filesystem.md) · [中文](../../cn/sandbox/persistence-and-extensions.md)
 
 Default state exists only in the current process. Use SQLAlchemy state when multiple workers share bindings or when a restart must recover them.
 

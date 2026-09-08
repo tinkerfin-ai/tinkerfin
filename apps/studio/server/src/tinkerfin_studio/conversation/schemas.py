@@ -5,6 +5,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from tinkerfin_studio.conversation.failures import ConversationRunFailure
 from tinkerfin_studio.conversation.models import TitleGenerationStatus, TitleSource
 from tinkerfin_studio.conversation.todo_groups import TaskTraceSnapshot
 from tinkerfin_tracing import (
@@ -107,6 +108,7 @@ class ConversationHistoryDetail(ConversationTitle):
     message_count: int = Field(alias="messageCount", ge=0)
     tool_call_count: int = Field(alias="toolCallCount", ge=0)
     messages: tuple[TraceMessage, ...]
+    run_failures: tuple[ConversationRunFailure, ...] = Field(alias="runFailures")
     reasoning: tuple[TraceReasoning, ...]
     graph: TraceGraph
     state: TraceState
@@ -133,6 +135,7 @@ class ConversationTraceUpdateEvent(BaseModel):
 
     type: Literal["update"] = "update"
     update: TraceUpdate
+    run_failures: tuple[ConversationRunFailure, ...] = Field(alias="runFailures")
     task_trace: TaskTraceSnapshot | None = Field(alias="taskTrace")
 
 

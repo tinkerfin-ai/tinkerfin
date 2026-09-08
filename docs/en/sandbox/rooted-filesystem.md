@@ -1,6 +1,6 @@
 # Rooted files and commands
 
-[Sandbox lifecycle](lifecycle.md) · [中文](../../zh/sandbox/rooted-filesystem.md)
+[Sandbox lifecycle](lifecycle.md) · [中文](../../cn/sandbox/rooted-filesystem.md)
 
 When `workspace_root` is set, the agent's virtual `/` maps to that physical Sandbox directory. With `/workspace`, an agent path such as `/src/app.txt` maps to `/workspace/src/app.txt` remotely.
 

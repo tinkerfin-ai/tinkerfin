@@ -852,8 +852,7 @@ describe('AG-UI runtime reducer', () => {
     )
 
     expect(current.runStatus).toBe('error')
-    expect(current.notice).toMatchObject({ kind: 'error', content: '对话运行失败' })
-    expect(current.notice?.content).not.toContain('主 run 失败')
+    expect(current.notice).toBeUndefined()
     expect(subagent?.meta?.status).toBe('failed')
     expect(childTool?.meta?.status).toBe('failed')
   })
@@ -891,10 +890,7 @@ describe('AG-UI runtime reducer', () => {
 
     expect(next.runStatus).toBe('idle')
     expect(next.activeRunId).toBeUndefined()
-    expect(next.notice).toMatchObject({
-      kind: 'info',
-      content: '任务已停止',
-    })
+    expect(next.notice).toBeUndefined()
     expect(next.messages).toHaveLength(1)
     expect(next.messages.some((message) => message.id.includes('client-notice'))).toBe(false)
     expect(next.messages[0]?.meta).toMatchObject({
@@ -1833,4 +1829,16 @@ it('标题通知仅更新目标会话且不被旧事件覆盖', () => {
   expect(applyConversationEvent(updated, parsed)).toEqual(updated)
   expect(applyConversationEvent(initial, parseConversationAgUiEvent({ ...event, value: { ...event.value, threadId: 'other' } }))).toBe(initial)
   expect(() => parseConversationAgUiEvent({ ...event, value: { ...event.value, title: '中'.repeat(33) } })).toThrow()
+})
+
+it('旧运行错误到达时只记录原运行失败，不停止当前新运行', () => {
+  const current = buildEmptyConversation({ now: '2026-09-08T00:00:00Z', threadId: THREAD_ID })
+  current.activeRunId = 'new-run'
+  current.runStatus = 'streaming'
+  current.messages = [{ id: 'old-question', role: 'user', content: '旧问题', createdAt: current.updatedAt, meta: { runId: 'old-run' } }]
+  const updated = applyConversationEvent(current, { type: 'RUN_ERROR', code: 'runtime_initialization_error', message: 'private diagnostic', rawEvent: { runId: 'old-run' } })
+  expect(updated.runStatus).toBe('streaming')
+  expect(updated.activeRunId).toBe('new-run')
+  expect(updated.runFailures).toMatchObject([{ runId: 'old-run', retryable: true }])
+  expect(updated.notice).toBeUndefined()
 })

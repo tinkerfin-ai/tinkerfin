@@ -478,5 +478,6 @@
   "updatedAt": "2026-09-06T21:02:48",
   "titleSource": "unknown",
   "titleGenerationStatus": "skipped",
-  "titleSeq": 0
+  "titleSeq": 0,
+  "runFailures": []
 }

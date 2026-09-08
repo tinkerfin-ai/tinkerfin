@@ -7,10 +7,11 @@ from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
 import pytest
-from sqlalchemy import inspect
+from sqlalchemy import inspect, select, text
 from sqlalchemy.engine import URL, Connection, make_url
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
+    AsyncSession,
     create_async_engine,
 )
 
@@ -18,6 +19,7 @@ from langgraph.store.mysql.asyncmy import AsyncMyStore
 from tinkerfin_sandbox import get_sqlalchemy_opensandbox_state_schema
 from tinkerfin_studio.attachments.entity import AttachmentFile
 from tinkerfin_studio.auth.models import User
+from tinkerfin_studio.auth.passwords import verify_password
 from tinkerfin_studio.conversation.models import (
     ConversationInterruptClaim,
     ConversationRunRegistration,
@@ -72,6 +74,29 @@ def test_studio_schema_contains_only_business_tables() -> None:
     )
 
     assert declared_tables == _BUSINESS_TABLES
+
+
+async def test_business_sql_initializes_the_documented_login(
+    session: AsyncSession,
+) -> None:
+    """初始化 SQL 提供可登录的默认账号，不保存明文密码"""
+
+    statements = _SCHEMA_PATH.read_text(encoding="utf-8").split(";")
+    seeds = [
+        statement
+        for statement in statements
+        if statement.strip().startswith("INSERT INTO users")
+    ]
+    assert len(seeds) == 1
+    await session.execute(text(seeds[0]))
+    user = (await session.scalars(select(User))).one()
+    assert user.username == "tinkerfin"
+    assert user.display_name == "TinkerFin"
+    assert user.roles == []
+    assert user.disabled is False
+    assert user.password_hash != "123456"
+    assert await verify_password("123456", user.password_hash)
+    assert not await verify_password("wrong-password", user.password_hash)
 
 
 class _ReflectedColumn(TypedDict):
@@ -281,6 +306,13 @@ async def test_business_sql_and_framework_setups_compose_the_current_mysql_schem
         sql_engine = create_async_engine(sql_url)
         runtime_engine = create_async_engine(runtime_url)
         await _execute_ddl(sql_engine, _SCHEMA_PATH.read_text(encoding="utf-8"))
+        async with AsyncSession(sql_engine) as session:
+            initial_user = (await session.scalars(select(User))).one()
+            assert initial_user.username == "tinkerfin"
+            assert initial_user.display_name == "TinkerFin"
+            assert initial_user.roles == []
+            assert initial_user.disabled is False
+            assert await verify_password("123456", initial_user.password_hash)
         async with sql_engine.connect() as connection:
             business_schema = await connection.run_sync(_reflect_schema)
         assert set(business_schema.tables) == _BUSINESS_TABLES

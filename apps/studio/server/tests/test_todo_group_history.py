@@ -12,6 +12,7 @@ import pytest
 from pydantic import JsonValue
 
 from tinkerfin_contracts import RunIdentity
+from tinkerfin_studio.conversation.failures import ConversationFailureProjection
 from tinkerfin_studio.conversation.todo_groups import (
     TaskTraceQueryTimeout,
     TaskTraceSnapshot,
@@ -167,7 +168,7 @@ async def _tracer_with_facts() -> tuple[Tracer, TraceWriter]:
     store = InMemoryTraceStore()
     writer = await store.open_writer(_IDENTITY)
     await writer.append(_trace_facts())
-    return Tracer(store=store), writer
+    return Tracer(projections=(ConversationFailureProjection(),), store=store), writer
 
 
 async def test_query_executor_projects_a_fixed_public_trace_prefix() -> None:

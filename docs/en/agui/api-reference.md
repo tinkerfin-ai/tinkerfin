@@ -1,6 +1,6 @@
 # AG-UI usage reference
 
-[AG-UI basics](index.md) · [中文](../../zh/agui/api-reference.md)
+[AG-UI basics](index.md) · [中文](../../cn/agui/api-reference.md)
 
 ## Common managed APIs
 

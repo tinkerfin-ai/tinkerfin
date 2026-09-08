@@ -99,6 +99,30 @@ export interface TraceCompleteness {
   payloadOmitted: boolean
 }
 
+export interface ConversationRunFailure {
+  runId: string
+  errorCode: string | null
+  failedAt: string
+  retryable: boolean
+}
+
+export const parseRunFailures = (value: unknown): ConversationRunFailure[] => {
+  if (!Array.isArray(value)) throw new ConversationError('stream_event_invalid')
+  const ids = new Set<string>()
+  return value.map(item => {
+    if (!isRecord(item) || typeof item.runId !== 'string' || !item.runId.trim()
+      || item.runId !== item.runId.trim() || ids.has(item.runId)
+      || !(item.errorCode === null || typeof item.errorCode === 'string')
+      || typeof item.failedAt !== 'string' || typeof item.retryable !== 'boolean'
+      || (item.retryable && item.errorCode !== 'runtime_initialization_error')) {
+      throw new ConversationError('stream_event_invalid')
+    }
+    traceObservationTime(item.failedAt)
+    ids.add(item.runId)
+    return { runId: item.runId, errorCode: item.errorCode, failedAt: item.failedAt, retryable: item.retryable }
+  })
+}
+
 export interface ConversationHistoryDetail extends ConversationTitleSnapshot {
   id: number
   threadId: string
@@ -114,6 +138,7 @@ export interface ConversationHistoryDetail extends ConversationTitleSnapshot {
   messageCount: number
   toolCallCount: number
   messages: TraceMessage[]
+  runFailures: ConversationRunFailure[]
   reasoning: TraceReasoning[]
   graph: TraceGraph
   state: TraceState
@@ -133,6 +158,7 @@ export interface TraceEntityDelta<T> {
 }
 
 export interface ConversationTraceUpdate {
+  runFailures: ConversationRunFailure[]
   asOfSeq: number
   generation: string
   observedAt: string
@@ -254,7 +280,7 @@ const parseHistoryDetail = (
   if (graph.asOfSeq !== value.asOfSeq) {
     throw new ConversationError('stream_event_invalid')
   }
-  return { ...value, graph } as unknown as ConversationHistoryDetail
+  return { ...value, graph, runFailures: parseRunFailures(value.runFailures) } as unknown as ConversationHistoryDetail
 }
 
 const parseTraceEvent = (
@@ -284,7 +310,7 @@ const parseTraceEvent = (
     }
     return {
       ...record,
-      update: { ...record.update, graph },
+      update: { ...record.update, graph, runFailures: parseRunFailures(record.runFailures) },
     } as unknown as ConversationTraceEvent
   }
   if (record.type === 'error' && record.code === 'trace_unavailable') {

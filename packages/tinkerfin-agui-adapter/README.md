@@ -180,7 +180,7 @@ checkpoint snapshots. Native messages use standard `image` or `file` blocks with
 
 - [AG-UI guide](https://github.com/tinkerfin-ai/tinkerfin/blob/main/docs/en/agui/index.md)
 - [Adapter extensions](https://github.com/tinkerfin-ai/tinkerfin/blob/main/docs/en/agui/adapter-extensions.md)
-- [Complete documentation](https://github.com/tinkerfin-ai/tinkerfin/blob/main/docs/en/README.md)
+- [Complete documentation](https://github.com/tinkerfin-ai/tinkerfin/blob/main/docs/en/index.md)
 
 ## License
 

@@ -1,6 +1,6 @@
 # Contributing to TinkerFin
 
-[中文](docs/CONTRIBUTING.zh.md)
+[中文](docs/CONTRIBUTING.cn.md)
 
 Use [Issues](https://github.com/tinkerfin-ai/tinkerfin/issues) for reproducible bugs and feature requests. Report security vulnerabilities privately to **1090116461@qq.com**; see [SECURITY.md](SECURITY.md).
 
@@ -37,6 +37,8 @@ pnpm test:browser
 ```
 
 Browser tests build the application before running. Docker integration and isolated wheel checks are described in [repository development](docs/en/development.md). Report any checks you could not run and why.
+
+When running selected tests with `pnpm exec playwright test` directly, run `pnpm build` first. Use `--workers=1` for tests tagged `@performance`.
 
 ## License
 

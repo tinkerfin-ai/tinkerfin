@@ -38,6 +38,7 @@ from tinkerfin_studio.config.settings import Settings, get_settings
 from tinkerfin_studio.conversation.coordinator import (
     ConversationTraceCoordinator,
 )
+from tinkerfin_studio.conversation.failures import ConversationFailureProjection
 from tinkerfin_studio.conversation.todo_groups import TodoGroupQueryExecutor
 from tinkerfin_studio.health import ReadinessService
 from tinkerfin_studio.infrastructure.database import Database
@@ -244,6 +245,7 @@ def build_lifespan():
                 # Trace Store 借用业务 Engine 并在接收请求前校验唯一当前 Schema
                 await trace_store.setup()
                 tracer = Tracer(
+                    projections=(ConversationFailureProjection(),),
                     store=trace_store,
                     capture_policy=CapturePolicy.public_history(
                         include_error_messages=True

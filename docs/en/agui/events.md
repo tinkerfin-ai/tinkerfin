@@ -1,6 +1,6 @@
 # Understand AG-UI events
 
-[AG-UI basics](index.md) · [中文](../../zh/agui/events.md)
+[AG-UI basics](index.md) · [中文](../../cn/agui/events.md)
 
 A normal run begins with `RUN_STARTED` and ends with one `RUN_FINISHED` or `RUN_ERROR`. Events in between follow the actual execution order.
 

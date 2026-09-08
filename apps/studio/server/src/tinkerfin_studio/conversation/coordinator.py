@@ -25,6 +25,7 @@ from tinkerfin_tracing import (
     TraceUpdate,
 )
 
+from .failures import FAILURE_PROJECTION, ConversationFailures
 from .repository import ConversationRepository
 
 _STALE_PREPARING_SECONDS = 30
@@ -95,6 +96,7 @@ class ConversationTraceCoordinator:
                     trace = await self._tracer.get(
                         identity.thread_id,
                         head_run_id=identity.run_id,
+                        projections=(FAILURE_PROJECTION,),
                     )
                     result = await self._persist_thread(
                         thread_pk=thread_pk, trace=trace
@@ -284,6 +286,16 @@ class ConversationTraceCoordinator:
         return await self._write_summary(
             thread_pk=thread_pk,
             run_id=trace.head_run_id,
+            error_code=next(
+                (
+                    item.error_code
+                    for item in ConversationFailures.model_validate(
+                        trace.projections[FAILURE_PROJECTION]
+                    ).failures
+                    if item.run_id == trace.head_run_id
+                ),
+                None,
+            ),
             execution=summary.status.execution,
             message_count=summary.message_count,
             tool_call_count=summary.tool_call_count,
@@ -308,6 +320,16 @@ class ConversationTraceCoordinator:
         return await self._write_summary(
             thread_pk=thread_pk,
             run_id=summary.status.head_run_id,
+            error_code=next(
+                (
+                    item.error_code
+                    for item in ConversationFailures.model_validate(
+                        update.projections[FAILURE_PROJECTION]
+                    ).failures
+                    if item.run_id == summary.status.head_run_id
+                ),
+                None,
+            ),
             execution=summary.status.execution,
             message_count=summary.message_count,
             tool_call_count=summary.tool_call_count,
@@ -326,6 +348,7 @@ class ConversationTraceCoordinator:
         thread_pk: int,
         run_id: str,
         execution: str,
+        error_code: str | None,
         message_count: int,
         tool_call_count: int,
         has_pending_interrupt: bool,
@@ -348,6 +371,7 @@ class ConversationTraceCoordinator:
                 has_pending_interrupt=has_pending_interrupt,
                 pending_interaction_kind=pending_interaction_kind,
                 terminal_outcome=outcome,
+                error_code=error_code,
                 updated_at=updated_at,
                 trace_generation=generation,
                 trace_as_of_seq=as_of_seq,

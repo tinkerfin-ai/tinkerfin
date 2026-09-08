@@ -23,6 +23,7 @@ export const buildEmptyConversation = (
   model: options.model ?? 'GPT-5.5',
   mode: options.mode ?? 'default',
   messages: [],
+  runFailures: [],
   todos: [],
   taskTrace: unloadedTaskTrace(),
   runStatus: 'idle',

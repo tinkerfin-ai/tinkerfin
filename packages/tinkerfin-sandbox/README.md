@@ -443,7 +443,7 @@ connection so an uncertain authoritative remote is preserved.
 
 - [Sandbox guide](https://github.com/tinkerfin-ai/tinkerfin/blob/main/docs/en/sandbox/index.md)
 - [Persistent state and extensions](https://github.com/tinkerfin-ai/tinkerfin/blob/main/docs/en/sandbox/persistence-and-extensions.md)
-- [Complete documentation](https://github.com/tinkerfin-ai/tinkerfin/blob/main/docs/en/README.md)
+- [Complete documentation](https://github.com/tinkerfin-ai/tinkerfin/blob/main/docs/en/index.md)
 
 ## License
 

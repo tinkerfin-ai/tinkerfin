@@ -1,6 +1,6 @@
 # Delivery, replay, and SSE
 
-[Messaging basics](index.md) · [中文](../../zh/messaging/delivery-and-replay.md)
+[Messaging basics](index.md) · [中文](../../cn/messaging/delivery-and-replay.md)
 
 ## Start or attach
 

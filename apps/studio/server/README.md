@@ -1,7 +1,7 @@
 # TinkerFin Studio 后端
 
 提供用户认证、模型配置、Agent 会话、附件、会话历史和 Sandbox 工作区。
-HTTP 接口见 [API 参考](docs/api.md)。
+首次使用见 [Studio 上手指南](../../../docs/cn/studio/quick_start.md)；HTTP 接口见 [API 参考](docs/api.md)。
 
 ## 快速部署
 
@@ -19,7 +19,8 @@ cd tinkerfin/apps/studio/server/deploy
 
 Docker 项目名为 `tinkerfin-studio`，包含 `server`、`mysql`、`redis-control`、
 `redis-runtime` 和 `opensandbox`。只部署后端，不包含 Web 页面。
-当前没有公开注册接口，登录前需要管理员预置用户账号。
+全新数据库初始化时预置账号 `tinkerfin`，密码 `123456`。已有数据卷不重新初始化或覆盖账号。
+当前没有公开注册接口；对外开放前按[上手指南](../../../docs/cn/studio/quick_start.md#修改初始密码)修改初始密码。
 
 脚本可以从任意目录通过完整路径执行；配置默认读取脚本所在目录的 `.env`：
 

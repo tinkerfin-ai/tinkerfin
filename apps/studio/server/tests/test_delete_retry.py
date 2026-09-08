@@ -19,6 +19,7 @@ from tinkerfin_contracts import (
 )
 from tinkerfin_studio.api.errors import BusinessException, ConversationErrorCode
 from tinkerfin_studio.conversation.command import ConversationCommandService
+from tinkerfin_studio.conversation.failures import ConversationFailureProjection
 from tinkerfin_studio.conversation.repository import ConversationRepository
 from tinkerfin_studio.resources import ApplicationResources
 from tinkerfin_tracing import Tracer, TraceThreadNotFound
@@ -91,7 +92,9 @@ async def test_delete_retries_each_destructive_stage_without_restoring_old_autho
     thread_pk = thread.id
     thread_id = thread.thread_id
     identity = RunIdentity(threadId=thread_id, runId=registration.run_id)
-    tracer = Tracer()
+    tracer = Tracer(
+        projections=(ConversationFailureProjection(),),
+    )
     await _completed_trace(tracer, identity)
     calls = {"messaging": 0, "checkpoint": 0, "database": 0}
 
@@ -170,7 +173,9 @@ async def test_delete_refuses_an_active_trace_and_restores_summary_status(
     thread.last_run_id = registration.run_id
     thread.status = "waiting_approval"
     await repository.commit()
-    tracer = Tracer()
+    tracer = Tracer(
+        projections=(ConversationFailureProjection(),),
+    )
     identity = RunIdentity(threadId=thread.thread_id, runId=registration.run_id)
     context = RunSourceContext(
         identity=identity,

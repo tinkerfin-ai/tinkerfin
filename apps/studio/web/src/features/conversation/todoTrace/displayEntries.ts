@@ -1,7 +1,9 @@
+import type { ConversationRunFailure } from '../../../api/conversation/history'
 import type { TodoGroup } from '../../../api/conversation/taskTrace'
 import type { Conversation, Message } from '../../../types'
 
 export type ConversationDisplayEntry =
+  | { type: 'run-failure'; message: Message; failure: ConversationRunFailure }
   | { type: 'message'; message: Message }
   | { type: 'tools'; messages: Message[] }
   | { type: 'todo-group'; group: TodoGroup; message: Message }
@@ -114,5 +116,15 @@ export const buildConversationDisplayEntries = (
     }
     index = cursor
   }
-  return entries
+  const failures = new Map((conversation.runFailures ?? []).map(failure => [failure.runId, failure]))
+  let question: Message | undefined
+  return entries.flatMap((entry, index): ConversationDisplayEntry[] => {
+    if (entry.type === 'message' && entry.message.role === 'user') question = entry.message
+    const next = entries[index + 1]
+    const turnEnded = !next || (next.type === 'message' && next.message.role === 'user')
+    const failure = question?.meta?.runId ? failures.get(question.meta.runId) : undefined
+    return turnEnded && question && failure
+      ? [entry, { type: 'run-failure', message: question, failure }]
+      : [entry]
+  })
 }

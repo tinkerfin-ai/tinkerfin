@@ -4,10 +4,22 @@
 
 在仓库根目录执行以下命令。需要 Python 3.11 或更高版本以及 uv。
 
+提交 PR 和运行常规 Python、Studio Web 检查的步骤见[参与开发](../CONTRIBUTING.cn.md)。
+
 ## 安装工作区
 
 ```bash
 uv sync --locked --all-packages --group dev
+```
+
+## 验证 Studio Web
+
+在 `apps/studio/web` 执行 `pnpm test:browser`，构建应用并运行浏览器测试。
+直接运行指定测试文件时，先构建应用：
+
+```bash
+pnpm build
+pnpm exec playwright test tests/browser/todo-trace.spec.ts --workers=1
 ```
 
 ## 构建 wheel

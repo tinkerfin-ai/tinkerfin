@@ -17,6 +17,7 @@ const detail = (): ConversationHistoryDetail => ({
   generation: 'generation-test',
   observedAt: '2026-09-05T00:00:00.000000Z',
   headRunId: 'run-1',
+  runFailures: [],
   availableHeads: ['run-1'],
   historyCursor: null,
   messageCount: 2,
@@ -229,7 +230,7 @@ describe('Trace conversation projection', () => {
       completeness: { ...source.completeness, missingTail: true },
       messageCount: source.messageCount,
       toolCallCount: source.toolCallCount,
-      projections: {},
+      projections: {}, runFailures: [],
     }
 
     const updated = applyConversationTraceUpdate(initial, update, null, true)
@@ -489,7 +490,7 @@ describe('Trace conversation projection', () => {
       completeness: { missingPrefix: false, missingTail: true, payloadOmitted: false },
       messageCount: 2,
       toolCallCount: 1,
-      projections: {},
+      projections: {}, runFailures: [],
     }, null, true)
 
     expect(updated.trace?.asOfSeq).toBe(10)
@@ -826,4 +827,13 @@ it('较旧Trace快照中的较新标题独立合并，不回退正文或运行�
   expect(result.messages).toBe(current.messages)
   expect(result.trace).toBe(current.trace)
   expect(result.runStatus).toBe(current.runStatus)
+})
+
+describe('运行失败历史反馈', () => {
+  it('未知运行结果不合成失败消息', () => {
+    const source = detail()
+    source.status.execution = 'unknown'
+    const restored = restoreConversationFromTrace(source, { model: 'main', includeTaskTrace: false })
+    expect(restored.messages.some(message => message.role === 'error')).toBe(false)
+  })
 })

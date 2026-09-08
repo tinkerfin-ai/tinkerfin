@@ -63,6 +63,7 @@ const detail = (
   generation: 'generation-test',
   observedAt: '2026-09-05T00:00:00.000000Z',
   headRunId: RUN_ID,
+  runFailures: [],
   availableHeads: [RUN_ID],
   historyCursor: 'cursor-1',
   messageCount: 1,

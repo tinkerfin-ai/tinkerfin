@@ -1,6 +1,6 @@
 # Sandbox basics
 
-[Documentation](../README.md) · [中文](../../zh/sandbox/index.md)
+[Documentation](../index.md) · [中文](../../cn/sandbox/index.md)
 
 `tinkerfin-sandbox` connects OpenSandbox to Deep Agents. An agent can run commands and work with files in an isolated environment instead of using the application server directly.
 
