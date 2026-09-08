@@ -12,11 +12,13 @@ from pathlib import Path
 from typing import Any, Literal, TypeVar
 
 import pytest
+from aiosqlite import Connection as AioSqliteConnection
 from pydantic import JsonValue
 from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy import inspect, text
+from sqlalchemy.engine import AdaptedConnection
 from sqlalchemy.exc import DBAPIError
-from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 from sqlalchemy.sql import Executable
 
 from tinkerfin_contracts import (
@@ -29,7 +31,11 @@ from tinkerfin_contracts import (
 )
 from tinkerfin_tracing._graph_projection import project_trace_graph_node
 from tinkerfin_tracing._ids import scope_id
-from tinkerfin_tracing.backend import TraceLedgerStateRequest, TraceStoreOptions
+from tinkerfin_tracing.backend import (
+    TraceEventPageRequest,
+    TraceLedgerStateRequest,
+    TraceStoreOptions,
+)
 from tinkerfin_tracing.capture import CapturedValue
 from tinkerfin_tracing.codec import CanonicalTracePayloadCodec, EncodedTracePayload
 from tinkerfin_tracing.durable_store import InMemoryTraceStore
@@ -71,6 +77,34 @@ from tinkerfin_tracing.tracer import Tracer
 from tinkerfin_tracing.writing import TraceBatchWriter, TraceWritePolicy
 
 _WriteResultT = TypeVar("_WriteResultT")
+
+
+class _SqliteClock:
+    """Share controllable UTC time across every SQL clock query on selected engines."""
+
+    def __init__(self) -> None:
+        self.now = datetime.now(UTC).replace(microsecond=0)
+
+    def advance(self, seconds: float) -> None:
+        self.now += timedelta(seconds=seconds)
+
+    def install(self, engine: AsyncEngine) -> None:
+        """Register the clock on each connection before the engine opens it."""
+
+        def connected(dbapi_connection: Any, _connection_record: object) -> None:
+            assert isinstance(dbapi_connection, AdaptedConnection)
+
+            async def register(driver_connection: Any) -> None:
+                assert isinstance(driver_connection, AioSqliteConnection)
+                await driver_connection.create_function("strftime", 2, self._strftime)
+
+            dbapi_connection.run_async(register)
+
+        sqlalchemy_event.listen(engine.sync_engine, "connect", connected)
+
+    def _strftime(self, format_string: str, time_value: str) -> str:
+        assert (format_string, time_value) == ("%Y-%m-%d %H:%M:%f", "now")
+        return self.now.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
 
 async def _wait_for_committed_write(
@@ -2238,18 +2272,93 @@ async def test_sqlite_unknown_commit_reuses_event_and_checkpoint_evidence(
         await engine.dispose()
 
 
+async def test_sqlite_controlled_clock_is_shared_by_reads_writes_and_peers(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "controlled-clock.db"
+    first_engine = create_async_engine(f"sqlite+aiosqlite:///{database}")
+    peer_engine = create_async_engine(f"sqlite+aiosqlite:///{database}")
+    clock = _SqliteClock()
+    clock.advance(0.125)
+    clock.install(first_engine)
+    clock.install(peer_engine)
+    first_store = SqlAlchemyTraceStore(first_engine)
+    peer_store = SqlAlchemyTraceStore(peer_engine)
+    identity = _identity()
+    writer = await first_store.open_writer(identity)
+    replacement = None
+    try:
+        committed = await writer.append((_fact("started"),))
+        expected_expiry = clock.now + timedelta(
+            seconds=first_store.options.writer_lease_seconds
+        )
+
+        async def check_clocks(active_run_ids: tuple[str, ...], fence: int) -> None:
+            for store in (first_store, peer_store):
+                state = await _backend(store).load_ledger_state(
+                    TraceLedgerStateRequest(
+                        namespace=store.namespace,
+                        thread_id=identity.thread_id,
+                        run_id=identity.run_id,
+                        include_active_writers=True,
+                    )
+                )
+                snapshot = await store.snapshot(identity.thread_id)
+                page = await _backend(store).read_event_page(
+                    TraceEventPageRequest(
+                        key=writer.key,
+                        direction="forward",
+                        after_seq=0,
+                        as_of_seq=1,
+                        limit=10,
+                    )
+                )
+                assert state.observed_at == snapshot.observed_at == clock.now
+                assert page.observed_at == clock.now
+                assert snapshot.active_run_ids == page.active_run_ids == active_run_ids
+                assert state.target_writer is not None
+                assert state.target_writer.fence == fence
+                assert state.target_writer.lease_expires_at == expected_expiry
+                assert [event.event_id for event in page.events] == [
+                    event.event_id for event in committed
+                ]
+
+        await check_clocks((identity.run_id,), 1)
+        clock.advance(first_store.options.writer_lease_seconds + 1)
+        await check_clocks((), 1)
+        replacement = await peer_store.open_writer(identity)
+        expected_expiry = clock.now + timedelta(
+            seconds=peer_store.options.writer_lease_seconds
+        )
+        await check_clocks((identity.run_id,), 2)
+    finally:
+        try:
+            if replacement is not None:
+                await replacement.aclose()
+        finally:
+            try:
+                await writer.aclose()
+            finally:
+                try:
+                    await first_engine.dispose()
+                finally:
+                    await peer_engine.dispose()
+
+
 async def test_sqlite_unknown_writer_open_commit_reuses_owner_token(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'unknown-open.db'}")
+    clock = _SqliteClock()
+    clock.install(engine)
     store = SqlAlchemyTraceStore(
         engine,
         options=TraceStoreOptions(
             writer_lease_seconds=0.2,
             writer_heartbeat_interval_seconds=0.1,
             commit_retry_attempts=2,
-            commit_retry_delay_seconds=0.3,
+            commit_retry_delay_seconds=0.001,
         ),
     )
     await store.setup()
@@ -2263,6 +2372,7 @@ async def test_sqlite_unknown_writer_open_commit_reuses_owner_token(
             yield connection
         if remaining:
             remaining -= 1
+            clock.advance(store.options.writer_lease_seconds + 1)
             original_error = sqlite3.OperationalError("database is locked")
             original_error.sqlite_errorcode = sqlite3.SQLITE_BUSY
             raise DBAPIError(None, None, original_error, False)
@@ -2274,27 +2384,44 @@ async def test_sqlite_unknown_writer_open_commit_reuses_owner_token(
         committed = await writer.append((_fact("started"),))
         snapshot = await store.snapshot(_identity().thread_id)
         assert snapshot.active_run_ids == (_identity().run_id,)
+        assert snapshot.observed_at == clock.now
         assert snapshot.as_of_seq == 1
         assert committed[0].trace_seq == 1
+        state = await _backend(store).load_ledger_state(
+            TraceLedgerStateRequest(
+                namespace=store.namespace,
+                thread_id=_identity().thread_id,
+                run_id=_identity().run_id,
+            )
+        )
+        assert state.target_writer is not None
+        assert state.target_writer.fence == 1
+        assert state.target_writer.lease_expires_at == clock.now + timedelta(
+            seconds=store.options.writer_lease_seconds
+        )
     finally:
         monkeypatch.setattr(_backend(store), "_raw_write_connection", original)
-        if writer is not None:
-            await writer.aclose()
-        await engine.dispose()
+        try:
+            if writer is not None:
+                await writer.aclose()
+        finally:
+            await engine.dispose()
 
 
-async def test_sqlite_unknown_append_commit_renews_short_writer_lease(
+async def test_sqlite_unknown_append_commit_renews_expired_writer_lease(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'append-lease.db'}")
+    clock = _SqliteClock()
+    clock.install(engine)
     store = SqlAlchemyTraceStore(
         engine,
         options=TraceStoreOptions(
             writer_lease_seconds=0.2,
             writer_heartbeat_interval_seconds=0.1,
             commit_retry_attempts=2,
-            commit_retry_delay_seconds=0.3,
+            commit_retry_delay_seconds=0.001,
         ),
     )
     writer = await store.open_writer(_identity())
@@ -2309,6 +2436,7 @@ async def test_sqlite_unknown_append_commit_renews_short_writer_lease(
             yield connection
         if remaining:
             remaining -= 1
+            clock.advance(store.options.writer_lease_seconds + 1)
             original_error = sqlite3.OperationalError("database is locked")
             original_error.sqlite_errorcode = sqlite3.SQLITE_BUSY
             raise DBAPIError(None, None, original_error, False)
@@ -2319,10 +2447,23 @@ async def test_sqlite_unknown_append_commit_renews_short_writer_lease(
         second = await writer.append((_fact("input"),))
 
         assert [first[0].trace_seq, second[0].trace_seq] == [1, 2]
+        snapshot = await store.snapshot(_identity().thread_id)
+        stored = await store.read_events(
+            snapshot.key, after_seq=0, as_of_seq=snapshot.as_of_seq, limit=10
+        )
+        assert snapshot.observed_at == clock.now
+        assert snapshot.active_run_ids == (_identity().run_id,)
+        assert snapshot.as_of_seq == 2
+        assert [event.event_id for event in stored] == [
+            first[0].event_id,
+            second[0].event_id,
+        ]
     finally:
         monkeypatch.setattr(backend, "_raw_write_connection", original)
-        await writer.aclose()
-        await engine.dispose()
+        try:
+            await writer.aclose()
+        finally:
+            await engine.dispose()
 
 
 async def test_sqlite_proven_append_survives_peer_takeover_during_retry(
@@ -2332,6 +2473,9 @@ async def test_sqlite_proven_append_survives_peer_takeover_during_retry(
     database = tmp_path / "append-takeover.db"
     first_engine = create_async_engine(f"sqlite+aiosqlite:///{database}")
     peer_engine = create_async_engine(f"sqlite+aiosqlite:///{database}")
+    clock = _SqliteClock()
+    clock.install(first_engine)
+    clock.install(peer_engine)
     namespace = "append-takeover"
     options = TraceStoreOptions(
         writer_lease_seconds=0.15,
@@ -2378,23 +2522,19 @@ async def test_sqlite_proven_append_survives_peer_takeover_during_retry(
     replacement = None
     try:
         await _wait_for_committed_write(append, first_commit_finished)
-        async with asyncio.timeout(3):
-            while True:
-                state = await peer_backend.load_ledger_state(
-                    TraceLedgerStateRequest(
-                        namespace=namespace,
-                        thread_id=identity.thread_id,
-                        generation=writer.key.generation,
-                        run_id=identity.run_id,
-                    )
-                )
-                assert state.target_writer is not None
-                remaining_lease = (
-                    state.target_writer.lease_expires_at - state.observed_at
-                ).total_seconds()
-                if remaining_lease <= 0:
-                    break
-                await asyncio.sleep(remaining_lease)
+        clock.advance(options.writer_lease_seconds + 1)
+        state = await peer_backend.load_ledger_state(
+            TraceLedgerStateRequest(
+                namespace=namespace,
+                thread_id=identity.thread_id,
+                generation=writer.key.generation,
+                run_id=identity.run_id,
+            )
+        )
+        assert state.observed_at == clock.now
+        assert state.target_writer is not None
+        assert state.target_writer.lease_expires_at < state.observed_at
+        assert (await peer_store.snapshot(identity.thread_id)).active_run_ids == ()
         assert not append.done()
         replacement = await peer_store.open_writer(identity)
         release_retry.set()
@@ -2654,10 +2794,12 @@ async def test_sqlite_cancelled_lock_wait_releases_connection_for_retry(
         await blocker_engine.dispose()
 
 
-async def test_sqlite_subsecond_heartbeat_keeps_writer_lease_current(
+async def test_sqlite_background_heartbeat_renews_across_initial_lease(
     tmp_path: Path,
 ) -> None:
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'clock.db'}")
+    clock = _SqliteClock()
+    clock.install(engine)
     store = SqlAlchemyTraceStore(
         engine,
         options=TraceStoreOptions(
@@ -2667,12 +2809,79 @@ async def test_sqlite_subsecond_heartbeat_keeps_writer_lease_current(
     )
     writer = await store.open_writer(_identity())
     try:
-        await asyncio.sleep(1.2)
+        request = TraceLedgerStateRequest(
+            namespace=store.namespace,
+            thread_id=_identity().thread_id,
+            run_id=_identity().run_id,
+        )
+        state = await _backend(store).load_ledger_state(request)
+        assert state.target_writer is not None
+        initial_expiry = previous_expiry = state.target_writer.lease_expires_at
+        for _ in range(5):
+            clock.advance(store.options.writer_heartbeat_interval_seconds)
+            expected_expiry = clock.now + timedelta(
+                seconds=store.options.writer_lease_seconds
+            )
+            async with asyncio.timeout(3):
+                while True:
+                    state = await _backend(store).load_ledger_state(request)
+                    assert state.target_writer is not None
+                    if state.target_writer.lease_expires_at == expected_expiry:
+                        break
+                    await asyncio.sleep(store.options.writer_heartbeat_interval_seconds)
+            assert state.target_writer.lease_expires_at > previous_expiry
+            previous_expiry = state.target_writer.lease_expires_at
+        assert clock.now > initial_expiry
         committed = await writer.append((_fact("started"),))
         assert committed[0].trace_seq == 1
     finally:
-        await writer.aclose()
-        await engine.dispose()
+        try:
+            await writer.aclose()
+        finally:
+            await engine.dispose()
+
+
+async def test_sqlite_real_clock_observations_advance_with_millisecond_precision(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'real-clock.db'}")
+    store = SqlAlchemyTraceStore(engine)
+    writer = await store.open_writer(_identity())
+    try:
+        committed = await writer.append((_fact("started"),))
+        snapshot_times: set[datetime] = set()
+        page_times: set[datetime] = set()
+        async with asyncio.timeout(3):
+            while True:
+                snapshot = await store.snapshot(_identity().thread_id)
+                page = await _backend(store).read_event_page(
+                    TraceEventPageRequest(
+                        key=writer.key,
+                        direction="forward",
+                        after_seq=0,
+                        as_of_seq=1,
+                        limit=10,
+                    )
+                )
+                snapshot_times.add(snapshot.observed_at)
+                page_times.add(page.observed_at)
+                assert snapshot.observed_at.microsecond % 1000 == 0
+                assert page.observed_at.microsecond % 1000 == 0
+                assert [event.event_id for event in page.events] == [
+                    committed[0].event_id
+                ]
+                if all(
+                    len(observations) >= 2
+                    and any(observed.microsecond for observed in observations)
+                    for observations in (snapshot_times, page_times)
+                ):
+                    break
+                await asyncio.sleep(0.001)
+    finally:
+        try:
+            await writer.aclose()
+        finally:
+            await engine.dispose()
 
 
 async def test_sqlite_unknown_heartbeat_commit_renews_expired_retry(
@@ -2680,20 +2889,25 @@ async def test_sqlite_unknown_heartbeat_commit_renews_expired_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'renew.db'}")
+    clock = _SqliteClock()
+    clock.install(engine)
     store = SqlAlchemyTraceStore(
         engine,
         options=TraceStoreOptions(
             writer_lease_seconds=0.2,
             writer_heartbeat_interval_seconds=0.1,
             commit_retry_attempts=2,
-            commit_retry_delay_seconds=0.3,
+            commit_retry_delay_seconds=0.001,
         ),
     )
     writer = await store.open_writer(_identity())
     backend = _backend(store)
     original = backend._raw_write_connection
-    injected = asyncio.Event()
+    renewal_committed = asyncio.Event()
     remaining = 1
+    # The first heartbeat must persist a later expiry than the writer's open,
+    # so its retry can distinguish a committed renewal from an unchanged row.
+    clock.advance(store.options.writer_heartbeat_interval_seconds)
 
     @asynccontextmanager
     async def fail_after_commit() -> AsyncIterator[AsyncConnection]:
@@ -2702,21 +2916,32 @@ async def test_sqlite_unknown_heartbeat_commit_renews_expired_retry(
             yield connection
         if remaining:
             remaining -= 1
-            injected.set()
+            clock.advance(store.options.writer_lease_seconds + 1)
             original_error = sqlite3.OperationalError("database is locked")
             original_error.sqlite_errorcode = sqlite3.SQLITE_BUSY
             raise DBAPIError(None, None, original_error, False)
+        renewal_committed.set()
 
     monkeypatch.setattr(backend, "_raw_write_connection", fail_after_commit)
     try:
-        await asyncio.wait_for(injected.wait(), timeout=2)
-        await asyncio.sleep(0.35)
+        async with asyncio.timeout(3):
+            await renewal_committed.wait()
         committed = await writer.append((_fact("started"),))
         assert committed[0].trace_seq == 1
+        snapshot = await store.snapshot(_identity().thread_id)
+        assert snapshot.observed_at == clock.now
+        assert snapshot.active_run_ids == (_identity().run_id,)
+        assert snapshot.as_of_seq == 1
+        stored = await store.read_events(
+            snapshot.key, after_seq=0, as_of_seq=snapshot.as_of_seq, limit=10
+        )
+        assert [event.event_id for event in stored] == [committed[0].event_id]
     finally:
         monkeypatch.setattr(backend, "_raw_write_connection", original)
-        await writer.aclose()
-        await engine.dispose()
+        try:
+            await writer.aclose()
+        finally:
+            await engine.dispose()
 
 
 async def test_sqlite_zero_event_close_removes_checkpoint_rows(tmp_path: Path) -> None:
