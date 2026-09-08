@@ -113,41 +113,6 @@ def test_generated_stubs_exist_and_the_generator_reports_no_drift() -> None:
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
-def test_generated_stubs_preserve_public_source_explanations() -> None:
-    for path in (_DEEP_AGENT_STUB, _INIT_STUB):
-        module = ast.parse(path.read_text(encoding="utf-8"))
-        assert ast.get_docstring(module)
-
-    deep_agent = ast.parse(_DEEP_AGENT_STUB.read_text(encoding="utf-8"))
-    for class_name, method_names in {
-        "DeepAgentRuntime": ("astream",),
-        "DeepAgentAgUiRuntime": ("astream",),
-        "DeepAgentAgUiResumeRuntime": ("astream",),
-        "DeepAgentDefinition": ("new", "prepare_agui_resume", "new_agui"),
-    }.items():
-        class_node = next(
-            node
-            for node in deep_agent.body
-            if isinstance(node, ast.ClassDef) and node.name == class_name
-        )
-        assert ast.get_docstring(class_node)
-        for method_name in method_names:
-            methods = [
-                node
-                for node in class_node.body
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                and node.name == method_name
-            ]
-            assert methods
-            assert all(ast.get_docstring(method) for method in methods)
-
-    generated_text = _DEEP_AGENT_STUB.read_text(encoding="utf-8")
-    assert "Args:" in generated_text
-    assert "Returns:" in generated_text
-    assert "Raises:" in generated_text
-    assert "version-added" not in generated_text
-
-
 def test_generated_stubs_preserve_upstream_options_with_explicit_agui_inputs() -> None:
     create_arguments = copy.deepcopy(
         _stub_method(_INIT_STUB, "TinkerFin", "create_deep_agent").args

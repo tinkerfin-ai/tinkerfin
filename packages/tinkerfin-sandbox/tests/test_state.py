@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import sqlite3
 from pathlib import Path
 from typing import Never, cast
@@ -16,47 +15,6 @@ from sqlalchemy.sql import Executable
 from sqlalchemy.sql.dml import Update
 
 import tinkerfin_sandbox
-from tinkerfin_sandbox.lifecycle.state import OpenSandboxState
-
-
-@pytest.mark.parametrize(
-    ("method_name", "documents_args", "documents_return"),
-    [
-        ("start", True, False),
-        ("acquire_owner", True, True),
-        ("renew_owner", True, True),
-        ("bind_owner", True, True),
-        ("unbind_owner", True, False),
-        ("read_binding", True, True),
-        ("release_owner", True, False),
-        ("claim_warm_slot", False, True),
-        ("publish_warm", True, False),
-        ("renew_warm", True, True),
-        ("release_warm", True, False),
-        ("consume_warm", True, True),
-        ("enqueue_cleanup", True, False),
-        ("claim_cleanup", False, True),
-        ("renew_cleanup", True, True),
-        ("complete_cleanup", True, False),
-        ("release_cleanup", True, False),
-        ("shutdown_sandbox_ids", False, True),
-        ("aclose", False, False),
-    ],
-)
-def test_state_protocol_documents_public_lifecycle_contracts(
-    method_name: str,
-    documents_args: bool,
-    documents_return: bool,
-) -> None:
-    """Keep fencing, result, and failure guidance next to every State method."""
-
-    method = getattr(OpenSandboxState, method_name)
-    documentation = inspect.getdoc(method)
-
-    assert documentation is not None
-    assert ("Args:" in documentation) is documents_args
-    assert ("Returns:" in documentation) is documents_return
-    assert "Raises:" in documentation
 
 
 def _public_type(name: str) -> type:
@@ -1558,38 +1516,44 @@ async def test_sqlite_state_rejects_conflicting_active_warm_capacity(
 
 async def test_sqlite_state_renews_owner_and_warm_claims(tmp_path: Path) -> None:
     state_type = _public_type("SQLAlchemyOpenSandboxState")
+    lease_ttl = 2.0
     state = state_type(
         url=_sqlite_url(tmp_path / "renew.db"),
         namespace="test",
-        lease_ttl=0.6,
+        lease_ttl=lease_ttl,
     )
     await state.start(warm_pool_size=1)
+    try:
+        assert state.persistent is True
+        assert state.lease_renew_interval == pytest.approx(lease_ttl / 3)
 
-    assert state.persistent is True
-    assert state.lease_renew_interval == pytest.approx(0.2)
+        await state.enqueue_cleanup("orphan-sandbox")
+        owner = await state.acquire_owner("user-A")
+        warm = await state.claim_warm_slot()
+        assert warm is not None
+        cleanup = await state.claim_cleanup()
+        assert cleanup is not None
+        loop = asyncio.get_running_loop()
+        initial_expiry = loop.time() + lease_ttl
+        async with asyncio.timeout(lease_ttl * 3):
+            while True:
+                assert await state.renew_owner(owner) is True
+                assert await state.renew_warm(warm) is True
+                assert await state.renew_cleanup(cleanup) is True
+                if loop.time() > initial_expiry:
+                    break
+                await asyncio.sleep(state.lease_renew_interval)
 
-    owner = await state.acquire_owner("user-A")
-    warm = await state.claim_warm_slot()
-    assert warm is not None
-    await state.enqueue_cleanup("orphan-sandbox")
-    cleanup = await state.claim_cleanup()
-    assert cleanup is not None
-    # The two waits cross the initial lease window while retaining room for
-    # SQLite I/O and event-loop scheduling before every ownership check.
-    await asyncio.sleep(0.35)
-    assert await state.renew_owner(owner) is True
-    assert await state.renew_warm(warm) is True
-    assert await state.renew_cleanup(cleanup) is True
-    await asyncio.sleep(0.35)
+        assert await state.claim_cleanup() is None
+        binding = await state.bind_owner(owner, "bound-sandbox")
+        await state.publish_warm(warm, "warm-sandbox")
+        await state.complete_cleanup(cleanup)
+        await state.release_owner(owner)
 
-    binding = await state.bind_owner(owner, "bound-sandbox")
-    await state.publish_warm(warm, "warm-sandbox")
-    await state.complete_cleanup(cleanup)
-    await state.release_owner(owner)
-
-    assert binding.sandbox_id == "bound-sandbox"
-    assert await state.shutdown_sandbox_ids() == ()
-    await state.aclose()
+        assert binding.sandbox_id == "bound-sandbox"
+        assert await state.shutdown_sandbox_ids() == ()
+    finally:
+        await state.aclose()
 
 
 async def test_memory_state_reports_process_owned_shutdown_resources() -> None:

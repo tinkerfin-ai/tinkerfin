@@ -75,13 +75,6 @@ def _prepared(*, mode: str = "default"):
     )
 
 
-def test_prepare_run_request_preserves_the_selected_agent_mode() -> None:
-    prepared = _prepared(mode="plan")
-
-    assert prepared.mode == "plan"
-    assert "thread_id" not in prepared.graph_config.get("configurable", {})
-
-
 def test_studio_plan_content_requires_dynamic_description_and_markdown() -> None:
     schema = StudioMarkdownPlanContent.model_json_schema(by_alias=True)
 

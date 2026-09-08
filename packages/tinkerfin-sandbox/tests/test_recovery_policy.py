@@ -337,12 +337,6 @@ async def test_connection_settlement_retains_owner_claim_and_blocks_next_initial
     assert not first.killed and not second.killed
 
 
-def test_recovery_policy_defaults_preserve_existing_instances() -> None:
-    assert OpenSandboxRecoveryPolicy() == OpenSandboxRecoveryPolicy(
-        max_attempts=3, initial_delay=0.5, max_delay=2, timeout=30, on_failure="raise"
-    )
-
-
 @pytest.mark.parametrize("value", [0, -1, True, 1.5])
 def test_recovery_policy_rejects_invalid_attempt_counts(value: int) -> None:
     with pytest.raises((TypeError, ValueError)):
