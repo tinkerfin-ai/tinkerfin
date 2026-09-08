@@ -51,9 +51,66 @@ function seedAuthSession(token = 'token-123') {
 
 describe('shared HTTP client', () => {
   afterEach(() => {
+    vi.useRealTimers()
     clearAuthSession()
     vi.unstubAllGlobals()
     vi.unstubAllEnvs()
+  })
+
+  it('bounds response-header waiting without presenting timeout as caller cancellation', async () => {
+    vi.useFakeTimers()
+    const caller = new AbortController()
+    let requestSignal: AbortSignal | undefined
+    vi.stubGlobal('fetch', vi.fn((_input, init: RequestInit) => new Promise((_resolve, reject) => {
+      requestSignal = init.signal ?? undefined
+      requestSignal?.addEventListener('abort', () => reject(requestSignal?.reason), { once: true })
+    })))
+    const request = requestEventStream('/api/conversation/chat', {
+      requiresAuth: false, signal: caller.signal, suppressGlobalError: true,
+    })
+    const assertion = expect(request).rejects.toMatchObject({ name: 'ApiError', status: 0 })
+    await vi.advanceTimersByTimeAsync(45_000)
+    await assertion
+    expect(requestSignal?.aborted).toBe(true)
+    expect(caller.signal.aborted).toBe(false)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('clears the header deadline while keeping caller cancellation connected to a long response', async () => {
+    vi.useFakeTimers()
+    const caller = new AbortController()
+    const addListener = vi.spyOn(caller.signal, 'addEventListener')
+    let requestSignal: AbortSignal | undefined
+    const body = new ReadableStream<Uint8Array>()
+    vi.stubGlobal('fetch', vi.fn(async (_input, init: RequestInit) => {
+      requestSignal = init.signal ?? undefined
+      return new Response(body, { headers: { 'Content-Type': 'text/event-stream' } })
+    }))
+    const response = await requestEventStream('/api/conversation/chat', { requiresAuth: false, signal: caller.signal })
+    await vi.advanceTimersByTimeAsync(180_000)
+    expect(requestSignal?.aborted).toBe(false)
+    expect(vi.getTimerCount()).toBe(0)
+    // 原生组合信号不在长寿命调用方上累积手动转发监听器
+    expect(addListener).not.toHaveBeenCalled()
+    caller.abort()
+    expect(requestSignal?.aborted).toBe(true)
+    await response.body?.cancel()
+  })
+
+  it.each([false, true])('preserves caller abort before headers (already aborted: %s)', async (alreadyAborted) => {
+    vi.useFakeTimers()
+    const caller = new AbortController()
+    const reason = new Error('调用方结束接收')
+    if (alreadyAborted) caller.abort(reason)
+    vi.stubGlobal('fetch', vi.fn((_input, init: RequestInit) => new Promise((_resolve, reject) => {
+      if (init.signal?.aborted) reject(init.signal.reason)
+      else init.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true })
+    })))
+    const request = requestEventStream('/api/conversation/chat', { requiresAuth: false, signal: caller.signal })
+    const assertion = expect(request).rejects.toBe(reason)
+    caller.abort(reason)
+    await assertion
+    expect(vi.getTimerCount()).toBe(0)
   })
 
   it('unwraps a successful JSON envelope through the Axios instance', async () => {

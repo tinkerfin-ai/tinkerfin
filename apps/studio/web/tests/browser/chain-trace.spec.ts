@@ -890,10 +890,11 @@ test('详情省略时 fail-closed，英文界面不会把空响应展示为成�
   await expect.poll(async () => (await traceRequests(page)).snapshots.length).toBe(2)
   const details = page.locator('.chain-trace-details')
   await details.getByRole('tab', { name: 'Response' }).click()
-  await expect(details.getByRole('alert')).toContainText(
-    'Failed to load the complete response',
-  )
-  await expect(details.getByRole('button', { name: 'Retry' })).toBeVisible()
+  const notifications = page.getByRole('list', { name: 'System notifications' })
+  await expect(notifications.getByRole('alert')).toHaveText('Failed to load the complete response')
+  await expect(page.getByText('Failed to load the complete response', { exact: true })).toHaveCount(1)
+  await expect(details.getByRole('alert')).toHaveCount(0)
+  await expect(details.getByRole('button', { name: 'Reload', exact: true })).toBeVisible()
   await expect(details.getByText('准备委派任务')).toHaveCount(0)
   expect(pageErrors).toEqual([])
 })

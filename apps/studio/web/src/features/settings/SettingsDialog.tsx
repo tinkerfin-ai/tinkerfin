@@ -2,10 +2,11 @@ import { Check, ChevronDown, Cpu, Monitor, MoonStar, Settings2, Sun, UserRound }
 import { useId, useRef, useState } from 'react'
 
 import type { AuthUser } from '../../api/auth/types'
-import { Dialog, ErrorBoundary, FeedbackState, ListboxPicker, OverlayScrollbar, UserAvatar } from '../../components/ui'
+import { Button, Dialog, ErrorBoundary, ListboxPicker, OverlayScrollbar, UserAvatar } from '../../components/ui'
 import { useI18n, type LanguagePreference } from '../../i18n'
 import type { ThemePreference } from '../../theme'
 import './settings.css'
+import type { ToastKind } from '../../components/ui/ToastViewport'
 import { ModelSettingsPanel } from './ModelSettingsPanel'
 
 const APPEARANCE_OPTIONS = [
@@ -27,6 +28,7 @@ export interface SettingsDialogProps {
   restoreFocusTo?: HTMLElement | null
   onThemePreferenceChange: (preference: ThemePreference) => void
   onModelsChanged?: () => void
+  onToast: (kind: ToastKind, message: string) => void
   onClose: () => void
 }
 
@@ -38,6 +40,7 @@ export function SettingsDialog({
   onThemePreferenceChange,
   onClose,
   onModelsChanged,
+  onToast,
 }: SettingsDialogProps) {
   const appearanceName = useId()
   const contentRef = useRef<HTMLDivElement>(null)
@@ -81,7 +84,7 @@ export function SettingsDialog({
           <button type="button" className={`settings-nav__item${activeSection === 'models' ? ' is-selected' : ''}`} aria-current={activeSection === 'models' ? 'page' : undefined} onClick={() => setActiveSection('models')}><Cpu size={18} aria-hidden="true" />{t('模型配置')}</button>
         </nav>
         {activeSection === 'models' ? <div className="settings-models-host">
-          <ErrorBoundary fallback={({ reset }) => <FeedbackState kind="error" title={t('模型加载失败，请先重试')} onRetry={reset} />}><ModelSettingsPanel onChanged={onModelsChanged} /></ErrorBoundary>
+          <ErrorBoundary onError={() => onToast('error', t('模型加载失败，请先重试'))} fallback={({ reset }) => <Button type="button" onClick={reset}>{t('重新加载模型')}</Button>}><ModelSettingsPanel onToast={onToast} onChanged={onModelsChanged} /></ErrorBoundary>
         </div> : <div
           ref={contentRef}
           className="settings-content ui-scrollbar"

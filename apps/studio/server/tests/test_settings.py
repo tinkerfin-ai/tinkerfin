@@ -43,6 +43,7 @@ def test_absolute_attachment_directory_overrides_file_without_changing_location(
     expected = tmp_path / "volume"
     monkeypatch.setenv("ATTACHMENT_DIRECTORY", str(expected))
     assert load_settings(env_file=env_file).attachment_directory == expected
+    monkeypatch.setenv("DATABASE_URL", "mysql+asyncmy://studio:secret@db:3306/studio")
     assert load_settings(env_file=None).attachment_directory == expected
 
 
@@ -270,3 +271,133 @@ def test_redis_control_and_runtime_must_use_distinct_services(
 
     with pytest.raises(ValueError, match="不同物理服务地址"):
         load_settings(env_file=env_file)
+
+
+@pytest.mark.parametrize("configured", ["logs/studio.log", "../logs/app.log", None])
+def test_logging_settings_load_dotenv_and_resolve_paths(
+    tmp_path, monkeypatch, configured
+):
+    """日志配置读取同一份环境文件，路径不随工作目录变化"""
+    _clear_settings_environment(monkeypatch)
+    env_file = tmp_path / ".env"
+    content = (
+        "DATABASE_URL=mysql+asyncmy://studio:secret@db:3306/studio\n"
+        "LOG_LEVEL=DEBUG\nLOG_FILE_ENABLED=true\n"
+        "LOG_FILE_MAX_BYTES=2048\nLOG_FILE_BACKUP_COUNT=2\n"
+    )
+    if configured:
+        content += f"LOG_FILE_PATH={configured}\n"
+    env_file.write_text(content)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    for cwd in (tmp_path, elsewhere):
+        monkeypatch.chdir(cwd)
+        settings = load_settings(env_file=env_file)
+        assert settings.log_level == "DEBUG"
+        assert settings.log_file_enabled
+        assert settings.log_file_max_bytes == 2048
+        assert settings.log_file_backup_count == 2
+        assert (
+            settings.log_file_path
+            == (tmp_path / (configured or "logs/studio.log")).resolve()
+        )
+    monkeypatch.setenv("LOG_LEVEL", "ERROR")
+    monkeypatch.setenv("LOG_FILE_ENABLED", "false")
+    monkeypatch.setenv("LOG_FILE_PATH", str(tmp_path / "volume" / "app.log"))
+    settings = load_settings(env_file=env_file)
+    assert settings.log_level == "ERROR"
+    assert not settings.log_file_enabled
+    assert settings.log_file_path == tmp_path / "volume" / "app.log"
+
+
+def test_logging_defaults_and_validation(tmp_path, monkeypatch):
+    """文件日志默认关闭，滚动阈值为 50 MiB，错误配置阻止启动"""
+    _clear_settings_environment(monkeypatch)
+    monkeypatch.setenv("DATABASE_URL", "mysql+asyncmy://studio:secret@db:3306/studio")
+    settings = load_settings(env_file=None)
+    assert settings.log_level == "INFO"
+    assert not settings.log_file_enabled
+    assert settings.log_file_max_bytes == 50 * 1024 * 1024
+    assert settings.log_file_backup_count == 3
+    assert settings.log_file_path.is_absolute()
+    monkeypatch.chdir(tmp_path)
+    assert load_settings(env_file=None).log_file_path == settings.log_file_path
+    for key, value in (
+        ("LOG_LEVEL", "INVALID"),
+        ("LOG_FILE_MAX_BYTES", "0"),
+        ("LOG_FILE_BACKUP_COUNT", "0"),
+    ):
+        monkeypatch.setenv(key, value)
+        with pytest.raises(ValueError):
+            load_settings(env_file=None)
+        monkeypatch.delenv(key)
+
+
+@pytest.mark.parametrize("use_file", [False, True])
+def test_load_settings_requires_database_from_selected_source(
+    tmp_path, monkeypatch, use_file
+):
+    """缺失的必填配置不能从另一个本地环境文件补入"""
+    _clear_settings_environment(monkeypatch)
+    env_file = tmp_path / ".env"
+    env_file.write_text("LOG_LEVEL=WARNING\n")
+    with pytest.raises(ValueError, match="database_url"):
+        load_settings(env_file=env_file if use_file else None)
+
+
+def test_selected_env_file_uses_defaults_for_omitted_settings(tmp_path, monkeypatch):
+    """指定配置未填写的日志字段使用默认值，不混入其他环境文件"""
+    _clear_settings_environment(monkeypatch)
+    env_file = tmp_path / ".env"
+    env_file.write_text("DATABASE_URL=mysql+asyncmy://studio:secret@db:3306/studio\n")
+    settings = load_settings(env_file=env_file)
+    assert not settings.log_file_enabled
+    assert settings.log_level == "INFO"
+    assert settings.attachment_directory == tmp_path / ".data/attachments"
+
+
+def test_dotenv_sources_are_isolated_from_an_existing_default_file(tmp_path):
+    """隔离安装目录内即使存在默认配置，选定文件和禁用文件读取仍保持独立"""
+    import os
+    import shutil
+    import subprocess
+    import sys
+
+    import tinkerfin_studio.config.settings as settings_module
+
+    module_file = tmp_path / "src/isolated/config/settings.py"
+    module_file.parent.mkdir(parents=True)
+    shutil.copyfile(settings_module.__file__, module_file)
+    (tmp_path / ".env").write_text(
+        "DATABASE_URL=mysql+asyncmy://default:unused@isolated/studio\n"
+        "LOG_FILE_ENABLED=true\n"
+    )
+    selected = tmp_path / "selected.env"
+    selected.write_text(
+        "DATABASE_URL=mysql+asyncmy://selected:unused@isolated/studio\n"
+    )
+    program = """
+import importlib.util
+import sys
+spec = importlib.util.spec_from_file_location('isolated_settings', sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+assert module.load_settings().log_file_enabled
+assert not module.load_settings(env_file=sys.argv[2]).log_file_enabled
+try:
+    module.load_settings(env_file=None)
+except ValueError as error:
+    assert 'database_url' in str(error)
+else:
+    raise AssertionError('disabled dotenv read inherited the default database')
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", program, str(module_file), str(selected)],
+        env={"PATH": os.defpath},
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr

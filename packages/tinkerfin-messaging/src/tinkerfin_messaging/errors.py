@@ -23,6 +23,7 @@ class MessagingErrorCode(StrEnum):
     CODEC_MISMATCH = "messaging.codec_mismatch"
     SOURCE_PROFILE_MISMATCH = "messaging.source_profile_mismatch"
     MESSAGE_ID_CONFLICT = "messaging.message_id_conflict"
+    PUBLICATION_REJECTED = "messaging.publication_rejected"
     QUOTA_EXCEEDED = "messaging.quota_exceeded"
     RUN_ALREADY_ACTIVE = "messaging.run_already_active"
     RUN_NOT_FOUND = "messaging.run_not_found"
@@ -166,6 +167,24 @@ class SourceProfileMismatch(MessagingError):
         super().__init__(
             f"Source profile {profile!r} is incompatible: {reason}",
             context={"profile": profile},
+        )
+
+
+class PublicationRejected(MessagingError):
+    """An existing run or its protocol does not accept an external message.
+
+    Args:
+        identity: Exact run targeted by the publisher.
+        reason: Safe rejection category identifying the violated publication rule.
+    """
+
+    code = MessagingErrorCode.PUBLICATION_REJECTED
+
+    def __init__(self, *, identity: RunIdentity, reason: str) -> None:
+        """Retain safe run identity and rejection reason for the caller."""
+        super().__init__(
+            "The run does not accept this publication",
+            context={**_identity_context(identity), "reason": reason},
         )
 
 

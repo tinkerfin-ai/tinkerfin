@@ -15,7 +15,6 @@ export interface ModalDialogProps {
   inputPlaceholder?: string
   initialValue?: string
   isPending?: boolean
-  error?: string
   restoreFocusTo?: HTMLElement | null
   onConfirm: (value?: string) => void | Promise<void>
   onCancel: () => void
@@ -32,7 +31,6 @@ export function ModalDialog({
   inputPlaceholder,
   initialValue = '',
   isPending = false,
-  error,
   restoreFocusTo,
   onConfirm,
   onCancel,
@@ -84,7 +82,6 @@ export function ModalDialog({
             onChange={(event) => setValue(event.target.value)}
           />
         )}
-        {error && <p className="modal-dialog-error" role="alert">{error}</p>}
         <footer className="modal-dialog-actions">
           <Button ref={cancelRef} variant="secondary" disabled={isPending} onClick={onCancel}>{cancelLabel ?? t('取消')}</Button>
           <Button

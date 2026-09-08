@@ -18,6 +18,7 @@ import inspect
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Generic, NoReturn, TypeAlias, TypeVar, cast
+from uuid import uuid4
 
 from tinkerfin_contracts import RunIdentity
 
@@ -29,6 +30,7 @@ from ._messaging_boundary import (
     _validate_optional_cursor,
 )
 from ._messaging_ledger import BackendRunHandle, PreparedRun
+from ._producer_runtime import _open_recoverable_source, _OwnerLease
 from .backend import (
     RunStatus,
     is_active_run_status,
@@ -43,9 +45,10 @@ from .errors import (
     RunProducerFailed,
     SourceProfileMismatch,
 )
-from .models import DecodedMessage, RecoverableMessage
+from .models import DecodedMessage, MessageEnvelope, RecoverableMessage
 from .protocols import (
     MessageCodec,
+    MessagePublicationPolicy,
     MessageSource,
     ProfiledMessageSource,
     RecoverableSource,
@@ -180,6 +183,8 @@ async def _await_retained_preflight(
                 "Messaging preflight also failed: "
                 f"{type(outcome.error).__name__}: {outcome.error}"
             )
+            for note in getattr(outcome.error, "__notes__", ()):
+                caller_cancellation.add_note(note)
         raise caller_cancellation.with_traceback(caller_cancellation.__traceback__)
     if outcome.error is not None:
         raise outcome.error.with_traceback(outcome.error.__traceback__)
@@ -554,6 +559,35 @@ async def get_run_status(
         self._messaging._finish_preflight(preflight)
 
 
+async def publish(
+    self: MessageChannel[SourceT, ReplayT],
+    message: SourceT,
+    *,
+    identity: RunIdentity,
+    message_id: str | None = None,
+) -> MessageEnvelope:
+    """Commit an external value through the channel's bound codec and durable log."""
+    preflight = self._messaging._begin_preflight()
+    try:
+        required_identity(identity)
+        codec = self._require_read_codec()
+        if isinstance(codec, MessagePublicationPolicy):
+            codec.validate_publication(message, identity=identity)
+        payload = codec.encode(message)
+        return await _await_backend(
+            "publish",
+            self._messaging._runtime_backend.publish(
+                channel=self.name,
+                identity=identity,
+                message_id=uuid4().hex if message_id is None else message_id,
+                codec=codec.codec_id,
+                payload=payload,
+            ),
+        )
+    finally:
+        self._messaging._finish_preflight(preflight)
+
+
 async def read(
     self: MessageChannel[SourceT, ReplayT],
     *,
@@ -810,6 +844,7 @@ async def _wrap_once(
     from .messaging import MessageSubscription
 
     prepared: PreparedRun | None = None
+    lease: _OwnerLease | None = None
     normalized_cancel: _ContextCancelCallback[object] | None = None
     producer_started = False
     delivery_started = False
@@ -857,6 +892,15 @@ async def _wrap_once(
                 recoverable=False,
             ),
         )
+        if prepared.is_owner:
+            lease = _OwnerLease(self._messaging, prepared)
+            owner_task = asyncio.current_task()
+            assert owner_task is not None
+
+            def interrupt_preparation() -> None:
+                owner_task.cancel()
+
+            lease.protect(interrupt_preparation)
         if not prepared.is_owner:
             # A validated attachment is already a real delivery. Candidate-source or
             # response construction failures must never roll back host business state.
@@ -890,8 +934,12 @@ async def _wrap_once(
             profile=profile,
         )
         if prepared.is_owner:
+            assert lease is not None
+            lease.check()
+            lease.protect(None)
             started = self._messaging._start_producer(
                 prepared=prepared,
+                lease=lease,
                 source=source,
                 codec=producer_codec,
                 codec_input=codec_input,
@@ -915,7 +963,11 @@ async def _wrap_once(
     # Preflight settlement must cover cancellation and process-control outcomes while
     # preserving the initiating failure after owned cleanup.
     except BaseException as error:
-        primary = error
+        if lease is not None and not producer_started:
+            lease.protect(None)
+        primary = (
+            lease.error if lease is not None and lease.error is not None else error
+        )
         if not producer_started and not source_released:
             try:
                 await source.aclose()
@@ -946,6 +998,10 @@ async def _wrap_once(
         if primary is not error:
             raise primary.with_traceback(primary.__traceback__) from error
         raise error.with_traceback(error.__traceback__)
+
+    finally:
+        if lease is not None and not producer_started:
+            await lease.aclose()
 
 
 async def sse(
@@ -1123,6 +1179,7 @@ async def _wrap_recoverable_once(
     from .messaging import MessageSubscription
 
     prepared: PreparedRun | None = None
+    lease: _OwnerLease | None = None
     opened: MessageSource[RecoverableMessage[SourceT]] | None = None
     normalized_cancel: _ContextCancelCallback[RecoverableMessage[SourceT]] | None = None
     producer_started = False
@@ -1157,6 +1214,15 @@ async def _wrap_recoverable_once(
                 recoverable=True,
             ),
         )
+        if prepared.is_owner:
+            lease = _OwnerLease(self._messaging, prepared)
+            owner_task = asyncio.current_task()
+            assert owner_task is not None
+
+            def interrupt_preparation() -> None:
+                owner_task.cancel()
+
+            lease.protect(interrupt_preparation)
         if not prepared.is_owner:
             delivery_started = True
         self._messaging._require_open()
@@ -1174,9 +1240,9 @@ async def _wrap_recoverable_once(
                 await result
                 self._messaging._require_open()
                 _raise_if_start_cancelled(cancel_requested)
-            opened = await self._messaging._open_recoverable_source(
-                prepared=prepared,
-                source=source,
+            assert lease is not None
+            opened = await _open_recoverable_source(
+                self._messaging, source, prepared, lease
             )
             self._messaging._require_open()
             _raise_if_start_cancelled(cancel_requested)
@@ -1191,8 +1257,12 @@ async def _wrap_recoverable_once(
         )
         if prepared.is_owner:
             assert opened is not None
+            assert lease is not None
+            lease.check()
+            lease.protect(None)
             started = self._messaging._start_recoverable_producer(
                 prepared=prepared,
+                lease=lease,
                 source=opened,
                 codec=codec,
                 cancel=normalized_cancel,
@@ -1211,7 +1281,11 @@ async def _wrap_recoverable_once(
     # Recoverable preparation owns opened sources and backend settlement for every
     # failure category, including cancellation and process control.
     except BaseException as error:
-        primary = error
+        if lease is not None and not producer_started:
+            lease.protect(None)
+        primary = (
+            lease.error if lease is not None and lease.error is not None else error
+        )
         if prepared is not None and prepared.is_owner and not producer_started:
             if opened is not None:
                 try:
@@ -1242,6 +1316,10 @@ async def _wrap_recoverable_once(
         if primary is not error:
             raise primary.with_traceback(primary.__traceback__) from error
         raise error.with_traceback(error.__traceback__)
+
+    finally:
+        if lease is not None and not producer_started:
+            await lease.aclose()
 
 
 async def cancel(

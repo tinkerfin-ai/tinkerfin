@@ -11,6 +11,7 @@ const conversationErrorMessageKeys = {
   state_patch_invalid: '会话状态更新失败，请重试',
   run_request_failed: '对话请求失败，请重试',
   run_failed: '对话运行失败',
+  run_initialization_failed: '任务初始化失败，请重试',
   resume_failed: '继续任务失败，请重新提交',
   approval_stale: '当前审批已更新，请重新检查',
   approval_incomplete: '请先处理所有待审批项',

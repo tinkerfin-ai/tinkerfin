@@ -20,6 +20,9 @@ function envelope(data: unknown, code = 0, message = 'success', status = 200) {
 }
 
 const detail = (): ConversationHistoryDetail => ({
+  titleSource: 'default',
+  titleGenerationStatus: 'idle',
+  titleSeq: 0,
   id: 1,
   threadId: 'thread-trace',
   title: 'Trace 会话',

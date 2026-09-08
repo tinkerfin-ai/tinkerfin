@@ -6,8 +6,10 @@ from typing import Literal
 
 from ag_ui.core.types import ResumeEntry
 from pydantic import JsonValue
-from sqlalchemy import and_, delete, func, or_, select
+from sqlalchemy import and_, delete, func, or_, select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.dml import Update
 
 from tinkerfin_studio.conversation.models import (
     ConversationInterruptClaim,
@@ -358,11 +360,68 @@ class ConversationRepository:
     ) -> None:
         """更新产品元信息且不伪造 Trace 最近活动时间"""
 
+        # SQL 内递增序号，避免读到的 ORM 快照覆盖并发完成的标题
+        values: dict[str, str | bool] = {}
         if title is not None:
-            thread.title = title
+            values.update(
+                title=title, title_source="user", title_generation_status="skipped"
+            )
         if pinned is not None:
-            thread.pinned = pinned
-        await self._session.flush()
+            values["pinned"] = pinned
+        statement = (
+            update(ConversationThread)
+            .where(ConversationThread.id == thread.id)
+            .values(**values)
+        )
+        if title is not None:
+            statement = statement.values(title_seq=ConversationThread.title_seq + 1)
+        await self._update_title_row(statement)
+        await self._session.refresh(thread)
+
+    async def claim_title(self, thread_pk: int) -> bool:
+        """持久认领一次自动总结；只有未尝试的临时标题可以调用模型"""
+        return await self._update_title_row(
+            update(ConversationThread)
+            .where(
+                ConversationThread.id == thread_pk,
+                ConversationThread.title_source == "default",
+                ConversationThread.title_generation_status == "idle",
+                ConversationThread.deleted_at.is_(None),
+                ConversationThread.status != "deleting",
+            )
+            .values(
+                title_generation_status="running",
+                title_seq=ConversationThread.title_seq + 1,
+            )
+        )
+
+    async def finish_title(self, thread_pk: int, title: str | None) -> bool:
+        """只结算仍由自动总结持有的标题；失败也不再自动尝试"""
+        statement = (
+            update(ConversationThread)
+            .where(
+                ConversationThread.id == thread_pk,
+                ConversationThread.title_source == "default",
+                ConversationThread.title_generation_status == "running",
+                ConversationThread.deleted_at.is_(None),
+                ConversationThread.status != "deleting",
+            )
+            .values(
+                title_generation_status="succeeded" if title else "failed",
+                title_seq=ConversationThread.title_seq + 1,
+            )
+        )
+        if title is not None:
+            statement = statement.values(title=title, title_source="generated")
+        return await self._update_title_row(statement)
+
+    async def _update_title_row(self, statement: Update) -> bool:
+        result = await self._session.execute(
+            statement.execution_options(synchronize_session=False)
+        )
+        if not isinstance(result, CursorResult):
+            raise TypeError("会话更新未返回行数")
+        return result.rowcount == 1
 
     async def update_trace_summary(
         self,

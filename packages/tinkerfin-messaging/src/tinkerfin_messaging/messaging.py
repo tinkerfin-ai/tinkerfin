@@ -32,7 +32,7 @@ from ._messaging_boundary import (
 )
 from ._messaging_ledger import PreparedRun as _PreparedRun
 from ._messaging_ledger import _MessagingLedger
-from ._producer_runtime import _ProducedMessage
+from ._producer_runtime import _OwnerLease, _ProducedMessage
 from .backend import MemoryBackend, RunStatus
 from .backend_contract import MessagingBackend
 from .errors import (
@@ -306,6 +306,39 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         return _message_channel._validate_page(
             after=after,
             limit=limit,
+        )
+
+    async def publish(
+        self,
+        message: SourceT,
+        *,
+        identity: RunIdentity,
+        message_id: str | None = None,
+    ) -> MessageEnvelope:
+        """Publish one message to an existing run and its current subscribers.
+
+        The run must have committed its first source message and remain active.
+        Publication does not open a source, hold its lease, or change its checkpoint.
+        AG-UI channels accept only CUSTOM events and close publication at the main
+        terminal. The host remains responsible for authorizing the target identity.
+
+        Args:
+            message: A value accepted by the channel codec and publication policy.
+            identity: Existing thread and run to notify.
+            message_id: Optional idempotency key; omitted keys are generated per call.
+
+        Returns:
+            The persisted envelope. Same-key, same-content retries return the original
+            envelope while it is retained, including after the run has finished.
+
+        Raises:
+            PublicationRejected: The run or protocol rejects a new publication.
+            RunNotFound: The target run does not exist.
+            MessageIdConflict: The key already identifies different content.
+            MessagingError: Storage, capacity, codec binding, or facade lifecycle fails.
+        """
+        return await _message_channel.publish(
+            self, message, identity=identity, message_id=message_id
         )
 
     async def latest_seq(self, *, identity: RunIdentity) -> int:
@@ -1031,6 +1064,7 @@ class Messaging:
         self,
         *,
         prepared: _PreparedRun,
+        lease: _OwnerLease,
         source: MessageSource[ProducedT],
         codec: MessageCodec[SourceT, ReplayT],
         codec_input: Callable[[ProducedT], SourceT] | None,
@@ -1040,6 +1074,7 @@ class Messaging:
         return _producer_runtime._start_producer(
             self,
             prepared=prepared,
+            lease=lease,
             source=source,
             codec=codec,
             codec_input=codec_input,
@@ -1047,24 +1082,11 @@ class Messaging:
             on_committed=on_committed,
         )
 
-    async def _open_recoverable_source(
-        self,
-        *,
-        prepared: _PreparedRun,
-        source: RecoverableSource[SourceT],
-    ) -> MessageSource[RecoverableMessage[SourceT]]:
-        """Keep distributed ownership alive while a source rebuilds its state."""
-
-        return await _producer_runtime._open_recoverable_source(
-            self,
-            prepared=prepared,
-            source=source,
-        )
-
     def _start_recoverable_producer(
         self,
         *,
         prepared: _PreparedRun,
+        lease: _OwnerLease,
         source: MessageSource[RecoverableMessage[SourceT]],
         codec: MessageCodec[SourceT, ReplayT],
         cancel: _ContextCancelCallback[RecoverableMessage[SourceT]] | None,
@@ -1073,6 +1095,7 @@ class Messaging:
         return _producer_runtime._start_recoverable_producer(
             self,
             prepared=prepared,
+            lease=lease,
             source=source,
             codec=codec,
             cancel=cancel,
@@ -1083,6 +1106,7 @@ class Messaging:
         self,
         *,
         prepared: _PreparedRun,
+        lease: _OwnerLease,
         source: MessageSource[ProducedT],
         codec: MessageCodec[SourceT, ReplayT],
         cancel: _ContextCancelCallback[ProducedT] | None,
@@ -1092,6 +1116,7 @@ class Messaging:
         return _producer_runtime._start_producer_task(
             self,
             prepared=prepared,
+            lease=lease,
             source=source,
             codec=codec,
             cancel=cancel,

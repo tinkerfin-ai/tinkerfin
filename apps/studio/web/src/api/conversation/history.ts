@@ -1,3 +1,4 @@
+import type { ConversationTitleSnapshot } from "./titles"
 import type { PendingInteractionKind, JsonObject, JsonValue } from '../../types'
 import { requestEventStream, requestJson } from '../shared/http'
 import { ConversationError } from './errors'
@@ -12,7 +13,7 @@ import {
   type TaskTraceSnapshot,
 } from './taskTrace'
 
-export interface ConversationHistoryListItem {
+export interface ConversationHistoryListItem extends ConversationTitleSnapshot {
   id: number
   threadId: string
   title: string
@@ -98,7 +99,7 @@ export interface TraceCompleteness {
   payloadOmitted: boolean
 }
 
-export interface ConversationHistoryDetail {
+export interface ConversationHistoryDetail extends ConversationTitleSnapshot {
   id: number
   threadId: string
   title: string

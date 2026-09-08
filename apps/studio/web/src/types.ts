@@ -1,3 +1,4 @@
+import type { ConversationTitleSnapshot } from "./api/conversation/titles"
 import type { ConversationHistoryCoreDetail } from './api/conversation/history'
 import type {
   ReadyTaskTraceSnapshot,
@@ -68,6 +69,9 @@ export interface Message {
 export interface ConversationNotice {
   kind: 'error' | 'info'
   content: string
+  /** 同一终态的实时通知与历史回放共享标识，手动重试产生独立通知 */
+  id?: string
+  recovery?: 'connection' | 'history'
 }
 
 export interface TodoItem {
@@ -210,7 +214,7 @@ export interface PlanReviewState {
 
 export type PlanInteraction = PlanQuestionState | PlanReviewState
 
-export interface Conversation {
+export interface Conversation extends Partial<Pick<ConversationTitleSnapshot, "titleSource" | "titleGenerationStatus" | "titleSeq">> {
   threadId: string
   title: string
   pinned: boolean

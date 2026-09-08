@@ -580,3 +580,50 @@ async def test_control_plane_info_never_reconnects_or_probes_health() -> None:
         assert transport.calls == Counter({("GET", "/v1/sandboxes/existing"): 1})
     finally:
         await client.aclose()
+
+
+@pytest.mark.parametrize("operation", ["connect", "create"])
+async def test_cancelled_native_open_owns_late_initializer_failure(
+    operation: Literal["connect", "create"],
+) -> None:
+    """Late failure is reclaimed without invoking the loop's exception handler."""
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    transport = _ServiceTransport()
+    unhandled: list[dict[str, object]] = []
+    loop = asyncio.get_running_loop()
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
+
+    async def initialize(backend: OpenSandboxBackend) -> None:
+        assert backend.id
+        entered.set()
+        await release.wait()
+        raise RuntimeError("private initializer failure")
+
+    client = OpenSandboxClient(
+        connection_config=ConnectionConfig(domain="audit.invalid", transport=transport),
+        config=OpenSandboxConfig(workspace_root=None),
+        initializers=[initialize],
+    )
+    try:
+        task = asyncio.create_task(
+            client.connect("existing") if operation == "connect" else client.create()
+        )
+        await asyncio.wait_for(entered.wait(), 2)
+        task.cancel()
+        await asyncio.sleep(0)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await client.aclose()
+        await asyncio.sleep(0)
+        assert unhandled == []
+        assert not transport.closed
+        assert transport.calls["DELETE", "/v1/sandboxes/existing"] == 0
+        if operation == "create":
+            assert transport.calls["DELETE", "/v1/sandboxes/bad"] == 1
+    finally:
+        release.set()
+        await client.aclose()
+        loop.set_exception_handler(previous)

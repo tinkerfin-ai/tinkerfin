@@ -5,6 +5,9 @@ import type { ConversationHistoryDetail, ConversationTraceUpdate } from '../../.
 import { applyConversationTraceUpdate, restoreConversationFromTrace } from './runtime'
 
 const detail = (): ConversationHistoryDetail => ({
+  titleSource: 'default',
+  titleGenerationStatus: 'idle',
+  titleSeq: 0,
   id: 1,
   threadId: 'thread-trace',
   title: 'Trace 会话',
@@ -812,4 +815,15 @@ describe('Trace conversation projection', () => {
     expect(restored.pendingInteractionKind).toBe('plan_clarification')
     expect(restored.runStatus).toBe('waiting_approval')
   })
+})
+
+
+it('较旧Trace快照中的较新标题独立合并，不回退正文或运行状态', () => {
+  const original = detail()
+  const current = restoreConversationFromTrace({ ...original, observedAt: '2026-09-05T00:00:00.000002Z' }, { model: 'main', includeTaskTrace: true })
+  const result = restoreConversationFromTrace({ ...original, observedAt: '2026-09-05T00:00:00.000001Z', title: '用户新标题', titleSource: 'user', titleGenerationStatus: 'skipped', titleSeq: 3 }, { previous: current, model: 'main', includeTaskTrace: true })
+  expect(result.title).toBe('用户新标题')
+  expect(result.messages).toBe(current.messages)
+  expect(result.trace).toBe(current.trace)
+  expect(result.runStatus).toBe(current.runStatus)
 })

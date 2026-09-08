@@ -476,7 +476,7 @@ describe('Sidebar', () => {
 
     rerender(<Sidebar {...baseProps} loadMoreError="加载历史失败" />)
     expect(scroll.querySelector('.history-pagination-slot')).toBe(slot)
-    expect(screen.getByRole('alert')).toHaveTextContent('加载历史失败')
+    expect(screen.queryByText('加载历史失败')).not.toBeInTheDocument()
 
     rerender(<Sidebar {...baseProps} hasMore={false} />)
     expect(scroll.querySelector('.history-pagination-slot')).not.toBeInTheDocument()
@@ -605,7 +605,7 @@ describe('Sidebar', () => {
     fireEvent.scroll(scroll)
     expect(onRetryLoadMore).toHaveBeenCalledOnce()
     expect(onLoadMore).not.toHaveBeenCalled()
-    expect(screen.getByRole('alert')).toHaveTextContent('加载历史失败')
+    expect(screen.queryByText('加载历史失败')).not.toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: '重试加载历史' }))
     expect(onRetryLoadMore).toHaveBeenCalledTimes(2)
   })

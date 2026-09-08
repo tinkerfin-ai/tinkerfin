@@ -114,6 +114,10 @@ source = DeferredMessageSource(
 
 附着或纯回放请求不会调用 opener。`cancel_after_first_item=True` 适合必须先出现 `RUN_STARTED` 的协议。
 
+Messaging 从取得所有权起持续续租，覆盖源准备、就绪回调、消息输出和结束清理。
+源工厂无需管理租约。准备期间收到取消时，会中断待完成的工作并等待资源清理；
+失去所有权后不会继续发布消息。
+
 Messaging 在 durable owner 选定后等待 `on_owner_preflight`。回调失败时会释放本次 owner 并关闭
 deferred wrapper，opener 不会运行。该 hook 只用于 source 自有准备；宿主激活应放在 opener
 成功后的 `on_source_ready`。

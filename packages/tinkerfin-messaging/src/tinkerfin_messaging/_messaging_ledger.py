@@ -200,6 +200,8 @@ class _MessagingLedger:
         codec: str,
         payload: bytes,
         checkpoint: RecoveryCheckpoint | None = None,
+        closes_publication: bool = False,
+        opens_publication: bool = True,
     ) -> MessageEnvelope:
         """Validate and idempotently commit one encoded message."""
 
@@ -223,11 +225,55 @@ class _MessagingLedger:
                 message_id=message_id,
                 payload=payload,
                 checkpoint=checkpoint,
+                closes_publication=closes_publication,
+                opens_publication=opens_publication,
             )
         )
         if result.envelope is None:
             raise MessagingBackendProtocolError(
                 "Messaging backend returned no envelope for an append"
+            )
+        return result.envelope
+
+    async def publish(
+        self,
+        *,
+        channel: str,
+        identity: RunIdentity,
+        message_id: str,
+        codec: str,
+        payload: bytes,
+    ) -> MessageEnvelope:
+        """Append as an observer without acquiring or renewing producer ownership."""
+        state = await self._load_current_state(channel=channel, identity=identity)
+        run = state.target_run
+        if run is None:
+            raise RunNotFound(identity=identity)
+        handle = BackendRunHandle(channel, identity, None, None, run.generation)
+        validate_append_input(
+            handle,
+            message_id=message_id,
+            codec=codec,
+            payload=payload,
+            checkpoint=None,
+            limits=self.limits,
+        )
+        result = await self._backend.commit_messaging_transition(
+            MessagingTransition(
+                kind="publish_message",
+                transition_id=message_id,
+                channel=channel,
+                identity=identity,
+                settings=self._backend.messaging_settings,
+                run_reference=self._storage_reference(handle, require_owner=False),
+                codec_id=codec,
+                message_id=message_id,
+                payload=payload,
+            )
+        )
+        if result.envelope is None:
+            raise MessagingBackendProtocolError(
+                "Messaging backend returned no published envelope"
             )
         return result.envelope
 

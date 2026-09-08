@@ -1,4 +1,4 @@
-import { ArrowUp, Plus, Square } from 'lucide-react'
+import { ArrowUp, Info, Plus, Square } from 'lucide-react'
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { KeyboardEvent, ReactNode } from 'react'
 
@@ -52,6 +52,7 @@ export function Composer({
   planLocked = false,
   attachments,
   attachmentError,
+  attachmentNotice,
   onChange,
   onSend,
   onStop,
@@ -78,6 +79,7 @@ export function Composer({
   planLocked?: boolean
   attachments: readonly DraftAttachment[]
   attachmentError?: string
+  attachmentNotice?: ReactNode
   onChange: (value: string) => void
   onSend: () => void
   onStop: () => void
@@ -333,6 +335,12 @@ export function Composer({
             <div className="composer-input-mirror" aria-hidden="true">{`${value}\n`}</div>
           </div>
         </div>
+        {attachmentNotice && (
+          <div className="composer-attachment-notice" role="status">
+            <Info size={14} aria-hidden="true" />
+            {attachmentNotice}
+          </div>
+        )}
         <div className="composer-toolbar">
           <div className="composer-toolbar-leading">
             <input

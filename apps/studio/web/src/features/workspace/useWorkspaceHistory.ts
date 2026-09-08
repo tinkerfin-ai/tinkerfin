@@ -22,6 +22,7 @@ import { restoreConversationFromTrace } from '../conversation/trace/runtime'
 import { readThreadFromLocation } from '../../lib/threadRoute'
 import {
   selectCurrentConversation,
+  mergeConversationTitle,
   updateConversation,
   upsertConversation,
 } from '../../lib/workspace'
@@ -193,6 +194,9 @@ export const historyItemFromDetail = (
     id: detail.id,
     threadId: detail.threadId,
     title: detail.title,
+    titleSource: detail.titleSource,
+    titleGenerationStatus: detail.titleGenerationStatus,
+    titleSeq: detail.titleSeq,
     status,
     lastRunId: detail.headRunId,
     lastModel: detail.lastModel,
@@ -211,7 +215,7 @@ const conversationFromHistoryItem = (
   fallbackModel: string,
 ): Conversation => ({
   threadId: item.threadId,
-  title: item.title,
+  ...mergeConversationTitle(undefined, item),
   pinned: item.pinned,
   updatedAt: item.updatedAt,
   model: item.lastModel ?? fallbackModel,
@@ -259,7 +263,7 @@ export const mergeHistoryConversations = (
       || Boolean(existing.isHydrated && !advanceHydratedRuntime)
     byId.set(item.threadId, {
       ...existing,
-      title: item.title,
+      ...mergeConversationTitle(existing, item),
       pinned: item.pinned,
       updatedAt: preserveRuntime ? existing.updatedAt : item.updatedAt,
       model: preserveRuntime ? existing.model : summary.model,
@@ -343,7 +347,19 @@ export function useWorkspaceHistory({
   const olderTraceRequests = useRef(new Map<string, AbortController>())
   const initialThreadId = useRef(readThreadFromLocation())
   const latestWorkspace = useRef(workspace)
+  const latestToast = useRef(onToast)
+  latestToast.current = onToast
+  const notifiedTaskTraceRequest = useRef<number | null>(null)
   latestWorkspace.current = workspace
+
+  useEffect(() => {
+    const failure = taskTraceLoadFailures.get(workspace.currentThreadId)
+    const current = workspace.conversations.find((item) => item.threadId === workspace.currentThreadId)
+    if (!failure || !ownsTaskTraceFailure(current, failure.identity)
+      || notifiedTaskTraceRequest.current === failure.requestId) return
+    notifiedTaskTraceRequest.current = failure.requestId
+    latestToast.current('error', t('任务轨迹不可用'))
+  }, [taskTraceLoadFailures, workspace, t])
 
   const refreshHistoryList = useCallback(async (
     options: { preferredThreadId?: string; signal?: AbortSignal } = {},
@@ -366,7 +382,7 @@ export function useWorkspaceHistory({
         fetchConversationHistoryGroupConfig({ signal: options.signal }),
       ])
       if (options.signal?.aborted) return false
-      const activeSession = readActiveRunSession()
+      const activeSession = readActiveRunSession(preferredThreadId)
       const preferredExists = preferredThreadId
         ? Boolean(preferredDetail || response.items.some((item) => item.threadId === preferredThreadId))
         : true
@@ -508,7 +524,10 @@ export function useWorkspaceHistory({
         if (
           !controller.signal.aborted
           && historySearchGeneration.current === generation
-        ) setSearchLoadError(t('搜索会话失败'))
+        ) {
+          setSearchLoadError(t('搜索会话失败'))
+          latestToast.current('error', t('搜索会话失败'))
+        }
       }).finally(() => {
         if (historySearchGeneration.current !== generation) return
         if (historySearchAbortController.current === controller) {
@@ -600,6 +619,7 @@ export function useWorkspaceHistory({
         historyLoadingRef.current = false
         setHistoryLoadingMore(false)
         setHistoryLoadError(t('历史记录加载失败'))
+        latestToast.current('error', t('历史记录加载失败'))
       }
     }).finally(() => {
       if (historyInFlightCursor.current !== cursor) return
@@ -675,6 +695,7 @@ export function useWorkspaceHistory({
         historySearchLoadingRef.current = false
         setSearchLoadingMore(false)
         setSearchLoadError(t('搜索会话失败'))
+        latestToast.current('error', t('搜索会话失败'))
       }
     }).finally(() => {
       if (historySearchInFlightCursor.current !== cursor) return
@@ -868,7 +889,7 @@ export function useWorkspaceHistory({
       if (!controller.signal.aborted && hydrationRequests.current.get(threadId) === controller
         && (!requestIdentity || matchesTaskTraceRequestIdentity(current, requestIdentity))) {
         setHydrationState({ threadId, status: 'failed' })
-        if (options.refresh) onToast('error', t('会话加载失败，请重试'))
+        onToast('error', t('会话加载失败，请重试'))
       }
     } finally {
       options.signal?.removeEventListener('abort', abortFromCaller)

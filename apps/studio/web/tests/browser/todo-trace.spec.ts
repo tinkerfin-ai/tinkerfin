@@ -279,7 +279,7 @@ async function mockTodoTraceStudio(page: Page, {
   })
   await page.goto(`/?thread=${THREAD_ID}`)
   if (taskTraceGroups.length > 0) {
-    await expect(page.getByRole('button', { name: `任务轨迹 ${taskTraceGroups.length}` }))
+    await expect(page.getByRole('button', { name: `任务轨迹 ${taskTraceGroups.length}`, exact: true }))
       .toBeVisible()
   } else {
     await expect(page.getByRole('textbox', { name: '消息输入' })).toBeVisible()
@@ -595,7 +595,7 @@ test('5k Group 冷水化、windowing、键盘与 heap 门禁', async ({ page }) 
   await page.goto('about:blank')
   await page.unroute('**/api/**')
   const evidence = await mockTodoTraceStudio(page, { groups })
-  const launcher = page.getByRole('button', { name: '任务轨迹 5000' })
+  const launcher = page.getByRole('button', { name: '任务轨迹 5000', exact: true })
   const hydrationMs = await page.evaluate(() => (
     performance.now() - (window.__todoTraceStartedAt ?? performance.now())
   ))

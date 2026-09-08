@@ -18,7 +18,8 @@ describe('attachment uploads', () => {
         mime_type: 'image/png',
         size_bytes: 3,
       })
-    const { result } = renderHook(() => useAttachments())
+    const onError = vi.fn()
+    const { result } = renderHook(() => useAttachments(onError))
     act(() =>
       result.current.addFiles([
         new File(['png'], 'chart.png', { type: 'image/png' }),
@@ -27,6 +28,7 @@ describe('attachment uploads', () => {
     await waitFor(() =>
       expect(result.current.attachments[0]?.state).toBe('error'),
     )
+    expect(onError).toHaveBeenCalledExactlyOnceWith('network')
     act(() => result.current.retryAttachment(result.current.attachments[0].id))
     await waitFor(() =>
       expect(result.current.attachments[0]?.state).toBe('ready'),
@@ -50,13 +52,15 @@ describe('attachment uploads', () => {
     let rejectDelete: (error: Error) => void = () => undefined
     vi.mocked(uploadAttachment).mockResolvedValueOnce({id: 'stored', name: 'a.png', mime_type: 'image/png', size_bytes: 3})
     vi.mocked(removeDraftAttachment).mockImplementationOnce(() => new Promise((_, reject) => { rejectDelete = reject }))
-    const { result } = renderHook(() => useAttachments())
+    const onError = vi.fn()
+    const { result } = renderHook(() => useAttachments(onError))
     act(() => result.current.addFiles([new File(['png'], 'a.png')]))
     await waitFor(() => expect(result.current.attachments[0]?.state).toBe('ready'))
     act(() => result.current.removeAttachment(result.current.attachments[0].id))
     act(() => result.current.clearAttachments())
     await act(async () => rejectDelete(new Error('old deletion failed')))
     expect(result.current.error).toBeUndefined()
+    expect(onError).not.toHaveBeenCalled()
   })
 
 })

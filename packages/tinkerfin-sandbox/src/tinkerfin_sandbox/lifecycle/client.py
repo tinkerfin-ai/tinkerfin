@@ -395,7 +395,7 @@ class OpenSandboxClient(_SandboxClient):
         self,
         creation_task: asyncio.Task[OpenSandboxBackend],
     ) -> None:
-        """Await a shielded creation and take ownership of any returned backend."""
+        """Await a retained creation and take ownership of any returned backend."""
         try:
             backend = await creation_task
         except asyncio.CancelledError:
@@ -446,7 +446,11 @@ class OpenSandboxClient(_SandboxClient):
         with self._sdk_requests.owned_call():
             creation_task = asyncio.create_task(self._create(metadata))
             try:
-                return await asyncio.shield(creation_task)
+                # Waiting does not cancel the owned operation. Unlike shield on
+                # Python 3.14, it does not report a late failure before reclamation
+                # can consume it (test_cancelled_native_open_owns_late_initializer_failure).
+                await asyncio.wait((creation_task,))
+                return creation_task.result()
             except asyncio.CancelledError as cancellation:
                 cleanup_task = asyncio.create_task(
                     self._reclaim_cancelled_create(creation_task)
@@ -508,7 +512,10 @@ class OpenSandboxClient(_SandboxClient):
         with self._sdk_requests.owned_call():
             connection_task = asyncio.create_task(self._connect(sandbox_id))
             try:
-                return await asyncio.shield(connection_task)
+                # The late-result cleanup owns any failure after caller cancellation;
+                # asyncio.wait keeps that task alive without shield's extra error log.
+                await asyncio.wait((connection_task,))
+                return connection_task.result()
             except asyncio.CancelledError as cancellation:
                 cleanup_task = asyncio.create_task(
                     self._close_cancelled_connect(connection_task)

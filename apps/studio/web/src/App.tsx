@@ -39,11 +39,12 @@ export default function App() {
   const [phase, setPhase] = useState<AuthPhase>(() => (
     getAuthSession() ? 'checking' : 'signedOut'
   ))
-  const [loginError, setLoginError] = useState<string>()
   const [isLoginPending, setLoginPending] = useState(false)
   const [authCheckVersion, setAuthCheckVersion] = useState(0)
   const [toasts, setToasts] = useState<ToastItem[]>([])
   const authEntry = useRef<AuthEntry>('restore')
+  const loginRequest = useRef<AbortController | null>(null)
+  useEffect(() => () => loginRequest.current?.abort(), [])
   const isAuthRetrying = useAuthVerification({
     enabled: phase === 'checking',
     version: authCheckVersion,
@@ -110,27 +111,31 @@ export default function App() {
   } else if (phase === 'signedOut') {
     content = (
       <AuthScreen
-        error={loginError}
         pending={isLoginPending}
         onLogin={async (credentials) => {
+          if (loginRequest.current) return
+          const controller = new AbortController()
+          loginRequest.current = controller
           setLoginPending(true)
-          setLoginError(undefined)
           try {
-            const payload = await login(credentials)
+            const payload = await login(credentials, controller.signal)
+            if (controller.signal.aborted) return
             authEntry.current = 'manual'
             saveAuthSession(createAuthSession(payload))
             setPhase('checking')
             setAuthCheckVersion((current) => current + 1)
           } catch (error) {
+            if (controller.signal.aborted) return
             if (error instanceof AuthError) {
-              setLoginError(error.message)
+              pushToast('error', error.message)
             } else if (error instanceof AuthSessionStorageError) {
-              setLoginError(t('浏览器无法保存登录状态，请检查隐私或存储设置后重试'))
+              pushToast('error', t('浏览器无法保存登录状态，请检查隐私或存储设置后重试'))
             } else if (!(error instanceof ApiError)) {
               pushToast('error', t('登录失败，请稍后重试'))
             }
           } finally {
-            setLoginPending(false)
+            if (loginRequest.current === controller) loginRequest.current = null
+            if (!controller.signal.aborted) setLoginPending(false)
           }
         }}
       />

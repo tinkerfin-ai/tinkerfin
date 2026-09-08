@@ -852,7 +852,7 @@ describe('AG-UI runtime reducer', () => {
     )
 
     expect(current.runStatus).toBe('error')
-    expect(current.notice).toEqual({ kind: 'error', content: '对话运行失败' })
+    expect(current.notice).toMatchObject({ kind: 'error', content: '对话运行失败' })
     expect(current.notice?.content).not.toContain('主 run 失败')
     expect(subagent?.meta?.status).toBe('failed')
     expect(childTool?.meta?.status).toBe('failed')
@@ -891,7 +891,7 @@ describe('AG-UI runtime reducer', () => {
 
     expect(next.runStatus).toBe('idle')
     expect(next.activeRunId).toBeUndefined()
-    expect(next.notice).toEqual({
+    expect(next.notice).toMatchObject({
       kind: 'info',
       content: '任务已停止',
     })
@@ -917,7 +917,7 @@ describe('AG-UI runtime reducer', () => {
 
     const detached = markConversationDetached(conversation, '实时连接已断开')
 
-    expect(detached.notice).toEqual({
+    expect(detached.notice).toMatchObject({
       kind: 'info',
       content: '实时连接已断开',
     })
@@ -1743,7 +1743,7 @@ describe('AG-UI runtime reducer', () => {
     expect(failed.messages.find(
       (message) => message.meta?.toolCallId === 'call-init-failure',
     )?.meta?.status).toBe('paused')
-    expect(failed.notice).toEqual({ kind: 'error', content: '继续任务失败，请重新提交' })
+    expect(failed.notice).toMatchObject({ kind: 'error', content: '继续任务失败，请重新提交' })
   })
 
   it('marks only the related subagent when its parent task result fails', () => {
@@ -1815,4 +1815,22 @@ describe('AG-UI runtime reducer', () => {
     expect(failed.activeRunId).toBe(RUN_ID)
     expect(failed.messages.some((message) => message.role === 'error')).toBe(false)
   })
+})
+
+
+it('标题通知仅更新目标会话且不被旧事件覆盖', () => {
+  const initial = buildEmptyConversation({ threadId: 'title-thread', now: '2026-09-08T00:00:00Z' })
+  const event = { type: 'CUSTOM', name: 'studio.conversation.title.updated', value: {
+    threadId: 'title-thread', title: '自动标题', titleSource: 'generated', titleGenerationStatus: 'succeeded', titleSeq: 2,
+  } }
+  const parsed = parseConversationAgUiEvent(event)
+  const updated = applyConversationEvent(initial, parsed)
+  expect(updated.title).toBe('自动标题')
+  expect(updated.messages).toBe(initial.messages)
+  expect(updated.runStatus).toBe(initial.runStatus)
+  const manual = { ...updated, title: '用户标题', titleSource: 'user' as const, titleGenerationStatus: 'skipped' as const, titleSeq: 3 }
+  expect(applyConversationEvent(manual, parsed).title).toBe('用户标题')
+  expect(applyConversationEvent(updated, parsed)).toEqual(updated)
+  expect(applyConversationEvent(initial, parseConversationAgUiEvent({ ...event, value: { ...event.value, threadId: 'other' } }))).toBe(initial)
+  expect(() => parseConversationAgUiEvent({ ...event, value: { ...event.value, title: '中'.repeat(33) } })).toThrow()
 })

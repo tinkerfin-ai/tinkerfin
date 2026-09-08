@@ -3,8 +3,7 @@
  * 让浏览器刷新后能回到原会话（页面无 react-router，也无工作区持久化）
  *
  * 用 `history.replaceState` 同步而非 `pushState`——只保证 URL 始终反映当前
- * 会话、刷新可还原，不在会话间产生历史条目，避免「后退键在会话间跳转」
- * 触发实时流断开确认的复杂度
+ * 会话、刷新可还原，不为每次选择追加浏览器历史条目
  */
 
 const THREAD_PARAM = 'thread'

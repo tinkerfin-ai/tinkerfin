@@ -17,6 +17,7 @@ from .retention import MessagingRetentionPolicy
 MessagingTransitionKind = Literal[
     "prepare_run",
     "append_message",
+    "publish_message",
     "begin_settlement",
     "finish_run",
     "request_cancellation",
@@ -189,6 +190,8 @@ class StoredMessagingRun:
         producer_lease_active: Whether storage still recognizes the current owner.
         producer_lease_remaining_seconds: Storage-clock duration until ownership may
             expire, or ``None`` when no finite lease controls the next observation.
+        publication_closed: Whether a committed protocol terminal forbids publication.
+        publication_ready: Whether the source committed the required run start.
         checkpoint: Last checkpoint committed atomically with a message.
         failure_class: Bounded trusted failure class name for remote diagnostics.
         failure_message: Bounded trusted failure message for remote diagnostics.
@@ -211,6 +214,8 @@ class StoredMessagingRun:
     failure_message: str
     local_failure: BaseException | None = None
     producer_lease_remaining_seconds: float | None = None
+    publication_closed: bool = False
+    publication_ready: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -297,6 +302,8 @@ class MessagingTransition:
         message_id: Stable semantic message identity for append.
         payload: Encoded message bytes for append.
         checkpoint: Recovery position committed atomically with append.
+        closes_publication: Seal external publication atomically with a source message.
+        opens_publication: Permit external publication after the required source start.
         final_status: Terminal producer status for settlement.
         failure: Trusted local failure associated with a failed producer.
         cleanup_generation: Exact positive generation returned by cleanup sealing and
@@ -320,6 +327,8 @@ class MessagingTransition:
     message_id: str | None = None
     payload: bytes | None = None
     checkpoint: RecoveryCheckpoint | None = None
+    closes_publication: bool = False
+    opens_publication: bool = True
     final_status: FinalRunStatus | None = None
     failure: BaseException | None = None
     cleanup_generation: int | None = None

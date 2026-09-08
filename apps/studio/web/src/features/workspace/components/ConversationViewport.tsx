@@ -7,7 +7,7 @@ import type {
 } from '../../../types'
 import { ActivityDots } from '../../conversation/components/ActivityDots'
 import { ApprovalStatusRow } from '../../conversation/components/ApprovalCard'
-import { ConversationNotice, MessageBlock, ToolCallBatch } from '../../conversation/components/MessageBlock'
+import { MessageBlock, ToolCallBatch } from '../../conversation/components/MessageBlock'
 import { PlanQuestionStatusRow } from '../../conversation/components/PlanQuestionComposer'
 import { PlanReviewStatusRow } from '../../conversation/components/PlanReviewCard'
 import { TodoGroupRow } from '../../conversation/todoTrace/components/TodoGroupRow'
@@ -70,6 +70,8 @@ export function ConversationViewport({
   onUserScrollIntent,
   onRetryHistory,
   onRetryHydration,
+  onRecoverConversation,
+  onError,
   onLoadEarlierMessages,
 }: {
   conversation: Conversation
@@ -90,6 +92,8 @@ export function ConversationViewport({
   onUserScrollIntent: () => void
   onRetryHistory: () => void
   onRetryHydration: () => void
+  onRecoverConversation?: () => void
+  onError?: (message: string) => void
   onLoadEarlierMessages: (trigger: HTMLButtonElement) => void
 }) {
   const { t } = useI18n()
@@ -101,9 +105,10 @@ export function ConversationViewport({
 
   return (
     <ErrorBoundary
+      onError={() => onError?.(t('对话区域无法显示'))}
       resetKey={conversation.threadId || 'draft'}
       fallback={({ reset }) => (
-        <FeedbackState kind="error" title={t('对话区域无法显示')} onRetry={reset} />
+        <Button type="button" variant="text" onClick={reset}>{t('重新加载')}</Button>
       )}
     >
       <div
@@ -128,11 +133,11 @@ export function ConversationViewport({
         {!isHistoryBootstrapped || historyStatus === 'loading' ? (
           <FeedbackState kind="loading" title={t('正在加载历史会话')} />
         ) : isInitialHistoryUnavailable ? (
-          <FeedbackState kind="error" title={t('历史会话加载失败')} onRetry={onRetryHistory} />
+          <Button type="button" variant="text" onClick={onRetryHistory}>{t('重新加载')}</Button>
         ) : isHydrating ? (
           <FeedbackState kind="loading" title={t('正在加载会话')} />
         ) : isHydrationFailed ? (
-          <FeedbackState kind="error" title={t('会话加载失败')} onRetry={onRetryHydration} />
+          <Button type="button" variant="text" onClick={onRetryHydration}>{t('重新加载')}</Button>
         ) : isEmpty ? (
           <EmptyConversation />
         ) : (
@@ -166,7 +171,11 @@ export function ConversationViewport({
             {conversation.planInteraction?.kind === 'review' && (
               <PlanReviewStatusRow interaction={conversation.planInteraction} />
             )}
-            {conversation.notice && <ConversationNotice notice={conversation.notice} />}
+            {(conversation.runStatus === 'detached' || conversation.notice?.recovery === 'history') && onRecoverConversation && (
+              <Button type="button" variant="text" onClick={onRecoverConversation}>
+                {t(conversation.notice?.recovery === 'history' ? '重新加载' : '恢复连接')}
+              </Button>
+            )}
             {isRunning && <p className="message-stream-tail stream-pending-tail"><ActivityDots label={t('任务仍在继续')} /></p>}
             <div ref={messageEndRef} />
           </div>

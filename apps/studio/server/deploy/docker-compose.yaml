@@ -1,86 +1,21 @@
 name: tinkerfin-studio
 
+include:
+  - docker-compose-base.yaml
+
 services:
-  mysql:
-    profiles: [bundled]
-    image: mysql:8.4@sha256:b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb
-    environment:
-      MYSQL_DATABASE: ${MYSQL_DATABASE:-tinkerfin}
-      MYSQL_USER: ${MYSQL_USER:-studio}
-      MYSQL_PASSWORD_FILE: /run/secrets/mysql_password
-      MYSQL_ROOT_PASSWORD_FILE: /run/secrets/mysql_root_password
-    secrets: [mysql_password, mysql_root_password]
-    volumes:
-      - mysql-data:/var/lib/mysql
-      - ../database/mysql/schema.sql:/docker-entrypoint-initdb.d/10-studio-business.sql:ro
-    healthcheck:
-      test: [CMD-SHELL, "mysqladmin ping -h 127.0.0.1 -uroot -p$$(cat /run/secrets/mysql_root_password) --silent"]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 30s
-    restart: unless-stopped
-
-  redis-control:
-    profiles: [bundled]
-    image: redis/redis-stack-server:7.4.0-v8@sha256:798ab84d9f266936b034ab11c4d04a2b8e4b441884c5aa7d17ac951eefdf742a
-    entrypoint: [/bin/sh, -ec]
-    command: ['export REDIS_ARGS="--appendonly yes --requirepass $$(cat /run/secrets/redis_control_password)"; exec /entrypoint.sh']
-    secrets: [redis_control_password]
-    volumes:
-      - redis-control-data:/data
-    healthcheck:
-      test: [CMD-SHELL, "redis-cli -a $$(cat /run/secrets/redis_control_password) ping | grep -q PONG"]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-    restart: unless-stopped
-
-  redis-runtime:
-    profiles: [bundled]
-    image: redis/redis-stack-server:7.4.0-v8@sha256:798ab84d9f266936b034ab11c4d04a2b8e4b441884c5aa7d17ac951eefdf742a
-    entrypoint: [/bin/sh, -ec]
-    command: ['export REDIS_ARGS="--appendonly yes --requirepass $$(cat /run/secrets/redis_runtime_password)"; exec /entrypoint.sh']
-    secrets: [redis_runtime_password]
-    volumes:
-      - redis-runtime-data:/data
-    healthcheck:
-      test: [CMD-SHELL, "redis-cli -a $$(cat /run/secrets/redis_runtime_password) ping | grep -q PONG"]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-    restart: unless-stopped
-
-  opensandbox:
-    profiles: [bundled]
-    image: opensandbox/server:v0.2.3@sha256:ae8dfbb277f40a39ff01ef35e5e1c10675acfe0fa9db15259b8f323e5efab778
-    entrypoint: [/bin/sh, -ec]
-    command:
-      - export OPENSANDBOX_SERVER_API_KEY="$$(cat /run/secrets/opensandbox_api_key)"; exec opensandbox-server --config /etc/opensandbox/config.toml
-    extra_hosts:
-      - host.docker.internal:host-gateway
-    secrets: [opensandbox_api_key]
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - opensandbox-data:/data
-      - opensandbox-metadata:/root/.opensandbox/metadata
-      - ./opensandbox/config.toml:/etc/opensandbox/config.toml:ro
-    healthcheck:
-      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=3)"]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 20s
-    restart: unless-stopped
-
-  studio:
+  server:
+    image: ${STUDIO_IMAGE:-ghcr.io/tinkerfin-ai/studio-server:0.1.0}
     build:
       context: ../../../..
       dockerfile: apps/studio/server/Dockerfile
       args:
-        APP_VERSION: ${VERSION:-0.1.0}
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
-    image: tinkerfin-studio:${VERSION:-0.1.0}
+    logging:
+      driver: local
+      options:
+        max-size: "50m"
+        max-file: "3"
     env_file: ${STUDIO_ENV_FILE:-.env}
     environment:
       DATABASE_URL_FILE: /run/secrets/database_url
@@ -94,7 +29,6 @@ services:
     ports:
       - "${STUDIO_BIND_ADDRESS:-127.0.0.1}:${STUDIO_PORT:-8090}:8090"
     volumes:
-      - studio-logs:/app/logs
       - studio-attachments:/app/attachments
     read_only: true
     tmpfs:
@@ -121,28 +55,8 @@ services:
       test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health/ready', timeout=3)"]
       interval: 15s
       timeout: 5s
-      retries: 8
+      retries: 60
       start_period: 30s
 
-secrets:
-  mysql_root_password:
-    file: ${SECRETS_DIR:-./secrets}/mysql_root_password
-  mysql_password:
-    file: ${SECRETS_DIR:-./secrets}/mysql_password
-  redis_control_password:
-    file: ${SECRETS_DIR:-./secrets}/redis_control_password
-  redis_runtime_password:
-    file: ${SECRETS_DIR:-./secrets}/redis_runtime_password
-  opensandbox_api_key:
-    file: ${SECRETS_DIR:-./secrets}/opensandbox_api_key
-  database_url:
-    file: ${SECRETS_DIR:-./secrets}/database_url
-
 volumes:
-  mysql-data:
-  redis-control-data:
-  redis-runtime-data:
-  opensandbox-data:
-  opensandbox-metadata:
   studio-attachments:
-  studio-logs:

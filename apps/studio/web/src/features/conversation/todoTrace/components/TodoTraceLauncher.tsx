@@ -43,7 +43,7 @@ export const TodoTraceLauncher = forwardRef<HTMLButtonElement, {
         onClick={onRetry}
       >
         <TriangleAlert size={16} aria-hidden="true" />
-        <span>{t('任务轨迹不可用')}</span>
+        <span>{t('重试任务轨迹')}</span>
       </button>
     )
   }

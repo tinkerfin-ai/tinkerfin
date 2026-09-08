@@ -3,7 +3,6 @@ import {
   Bot,
   Check,
   ChevronDown,
-  CircleAlert,
   Copy,
   Pause,
   TriangleAlert,
@@ -12,7 +11,7 @@ import {
 import { memo, useEffect, useId, useRef, useState } from 'react'
 
 import { IconButton } from '../../../components/ui'
-import type { ConversationNotice as ConversationNoticeType, Message } from '../../../types'
+import type { Message } from '../../../types'
 import { MarkdownContent } from './MarkdownContent'
 import { ToolCallRow } from './ToolCallRow'
 import { COPY_FEEDBACK_DURATION_MS } from './copyFeedback'
@@ -300,7 +299,6 @@ function MessageBlockView({
   childTools?: Message[]
   showActions?: boolean
 }) {
-  const { t } = useI18n()
   if (message.role === 'user') {
     return (
       <article id={message.id} className="message user-message">
@@ -320,7 +318,7 @@ function MessageBlockView({
     return <ToolCallCard message={message} />
   }
   if (message.role === 'error') {
-    return <article id={message.id} className="error-message"><CircleAlert size={17} /><div><strong>{t('任务遇到问题')}</strong><MarkdownContent content={message.content} className="error-markdown" variant="compact" /></div></article>
+    return null
   }
   if (!message.content && !message.attachments?.length) return null
   return (
@@ -341,19 +339,6 @@ export const MessageBlock = memo(
     && sameMessageReferences(previous.childTools ?? [], next.childTools ?? [])
     && (previous.showActions ?? true) === (next.showActions ?? true),
 )
-
-export function ConversationNotice({ notice }: { notice: ConversationNoticeType }) {
-  const { t } = useI18n()
-  return (
-    <article className={`error-message conversation-notice is-${notice.kind}`} role={notice.kind === 'error' ? 'alert' : 'status'}>
-      <CircleAlert size={17} />
-      <div>
-        <strong>{notice.kind === 'error' ? t('任务遇到问题') : t('连接状态')}</strong>
-        <MarkdownContent content={notice.content} className="error-markdown" />
-      </div>
-    </article>
-  )
-}
 
 export function ToolCallCard({ message, className }: { message: Message; className?: string }) {
   const [open, setOpen] = useState(false)

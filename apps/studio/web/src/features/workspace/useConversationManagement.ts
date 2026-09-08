@@ -10,6 +10,7 @@ import type { Conversation, WorkspaceState } from '../../types'
 import { clearPlanQuestionCollapsed } from '../conversation/planQuestionCollapse'
 import {
   createNewConversation,
+  mergeConversationTitle,
   removeConversation,
   selectCurrentConversation,
   updateConversation,
@@ -26,10 +27,7 @@ export function useConversationManagement({
   setDraftModel,
   followDetachedConversation,
   abandonPlanInteraction,
-  cancelActiveRun,
-  detachThreadStream,
-  getActiveThreadId,
-  hasActiveStream,
+  cancelRun,
   isActiveThread,
   onToast,
   onConversationBoundary,
@@ -42,10 +40,7 @@ export function useConversationManagement({
   setDraftModel: Dispatch<SetStateAction<string>>
   followDetachedConversation: (threadId: string) => Promise<void>
   abandonPlanInteraction: (threadId: string) => void
-  cancelActiveRun: () => Promise<boolean>
-  detachThreadStream: (threadId: string, reason: string) => void
-  getActiveThreadId: () => string | null
-  hasActiveStream: () => boolean
+  cancelRun: (threadId: string) => Promise<boolean>
   isActiveThread: (threadId: string) => boolean
   onToast: (kind: ToastKind, message: string) => void
   onConversationBoundary: () => void
@@ -53,7 +48,6 @@ export function useConversationManagement({
   const { t } = useI18n()
   const [dialog, setDialog] = useState<WorkspaceDialog | null>(null)
   const [dialogPending, setDialogPending] = useState(false)
-  const [dialogError, setDialogError] = useState<string>()
   const [pinPendingThreadIds, setPinPendingThreadIds] = useState<ReadonlySet<string>>(
     () => new Set(),
   )
@@ -62,8 +56,9 @@ export function useConversationManagement({
   const latest = useRef({ workspace, conversation })
   latest.current = { workspace, conversation }
 
-  useEffect(() => () => {
-    isMounted.current = false
+  useEffect(() => {
+    isMounted.current = true
+    return () => { isMounted.current = false }
   }, [])
 
   const findConversation = (threadId: string) => (
@@ -87,31 +82,16 @@ export function useConversationManagement({
   }
 
   const openDialog = (nextDialog: WorkspaceDialog) => {
-    setDialogError(undefined)
     setDialog(nextDialog)
   }
 
   const closeDialog = () => {
     if (dialogPending) return
     setDialog(null)
-    setDialogError(undefined)
   }
 
-  const selectConversation = (threadId: string) => {
-    if (hasActiveStream() && getActiveThreadId() !== threadId) {
-      openDialog({ kind: 'detach-select', threadId })
-      return
-    }
-    performSelectConversation(threadId)
-  }
-
-  const newConversation = () => {
-    if (hasActiveStream()) {
-      openDialog({ kind: 'detach-new' })
-      return
-    }
-    performNewConversation()
-  }
+  const selectConversation = (threadId: string) => performSelectConversation(threadId)
+  const newConversation = () => performNewConversation()
 
   const pinConversation = (threadId: string) => {
     const target = findConversation(threadId)
@@ -181,59 +161,45 @@ export function useConversationManagement({
   const confirmDialog = async (value?: string) => {
     if (!dialog || dialogPending) return
     setDialogPending(true)
-    setDialogError(undefined)
     try {
       if (dialog.kind === 'rename') {
         const title = value?.trim()
         if (!title) throw new Error(t('会话名称不能为空'))
-        if (title !== dialog.initialValue) {
-          await patchConversation(dialog.threadId, { title })
-          setWorkspace((state) => updateConversation(
-            state,
-            dialog.threadId,
-            (item) => ({ ...item, title }),
-          ))
-        }
+        if (Array.from(title).length > 32) throw new Error(t('会话名称最多32个字符'))
+        const summary = await patchConversation(dialog.threadId, { title })
+        if (!isMounted.current) return
+        setWorkspace((state) => updateConversation(
+          state, dialog.threadId,
+          (item) => ({ ...item, ...mergeConversationTitle(item, summary) }),
+        ))
       } else if (dialog.kind === 'disable-plan') {
         abandonPlanInteraction(dialog.threadId)
         onToast('info', t('已关闭 Plan，下一条消息将使用 default 模式'))
       } else if (dialog.kind === 'delete') {
-        if (dialog.isRunning) await cancelActiveRun()
+        if (dialog.isRunning) await cancelRun(dialog.threadId)
+        if (!isMounted.current) return
         await deleteConversationApi(dialog.threadId)
+        if (!isMounted.current) return
         clearPlanQuestionCollapsed(dialog.threadId)
         if (dialog.threadId === latest.current.workspace.currentThreadId) {
           onConversationBoundary()
         }
         setWorkspace((state) => removeConversation(state, dialog.threadId))
-      } else {
-        if (hasActiveStream()) {
-          const runningThreadId = getActiveThreadId()
-            ?? latest.current.conversation.threadId
-          detachThreadStream(
-            runningThreadId,
-            dialog.kind === 'detach-new'
-              ? t('已新建会话，之前会话的实时输出连接已断开')
-              : t('已切换到其他会话，当前会话的实时输出连接已断开'),
-          )
-        }
-        if (dialog.kind === 'detach-new') performNewConversation()
-        else performSelectConversation(dialog.threadId)
-        onToast('info', t('已断开当前会话的实时输出'))
       }
       setDialog(null)
     } catch (error) {
-      setDialogError(error instanceof Error && error.message
+      if (!isMounted.current) return
+      onToast('error', error instanceof Error && error.message
         ? error.message
         : t('操作失败，请稍后重试'))
     } finally {
-      setDialogPending(false)
+      if (isMounted.current) setDialogPending(false)
     }
   }
 
   return {
     dialog,
     dialogPending,
-    dialogError,
     closeDialog,
     confirmDialog,
     selectConversation,

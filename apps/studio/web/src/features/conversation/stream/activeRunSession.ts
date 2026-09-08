@@ -73,40 +73,42 @@ const parseActiveRunSession = (value: unknown): ActiveRunSession | null => {
   }
 }
 
-export const readActiveRunSession = (): ActiveRunSession | null => {
+export const readActiveRunSessions = (): ActiveRunSession[] => {
   try {
     const raw = window.sessionStorage.getItem(ACTIVE_RUN_STORAGE_KEY)
-    if (!raw) return null
-    const parsed = parseActiveRunSession(JSON.parse(raw) as unknown)
-    if (parsed) return parsed
-    window.sessionStorage.removeItem(ACTIVE_RUN_STORAGE_KEY)
-    return null
-  } catch {
-    try {
-      window.sessionStorage.removeItem(ACTIVE_RUN_STORAGE_KEY)
-    } catch {
-      // 存储完全不可用时不能让刷新重连状态阻断页面初始化
+    if (!raw) return []
+    const value: unknown = JSON.parse(raw)
+    if (Array.isArray(value)) {
+      const sessions = value.map(parseActiveRunSession)
+      if (sessions.every((item): item is ActiveRunSession => item !== null)) return sessions
     }
-    return null
+    window.sessionStorage.removeItem(ACTIVE_RUN_STORAGE_KEY)
+  } catch {
+    // 缓存不可用不阻断页面；会话正文仍由服务端历史恢复
+  }
+  return []
+}
+
+export const readActiveRunSession = (threadId: string): ActiveRunSession | null => (
+  readActiveRunSessions().find((session) => session.threadId === threadId) ?? null
+)
+
+const saveActiveRunSessions = (sessions: ActiveRunSession[]) => {
+  try {
+    if (sessions.length) window.sessionStorage.setItem(ACTIVE_RUN_STORAGE_KEY, JSON.stringify(sessions))
+    else window.sessionStorage.removeItem(ACTIVE_RUN_STORAGE_KEY)
+  } catch {
+    // 浏览器禁用存储时，当前连接仍继续接收
   }
 }
 
 export const writeActiveRunSession = (session: ActiveRunSession): void => {
-  try {
-    window.sessionStorage.setItem(ACTIVE_RUN_STORAGE_KEY, JSON.stringify(session))
-  } catch {
-    // 浏览器禁用存储时，当前连接仍可正常工作，只是不具备刷新重连能力
-  }
+  saveActiveRunSessions([
+    ...readActiveRunSessions().filter((item) => item.payload.runId !== session.payload.runId),
+    session,
+  ])
 }
 
 export const clearActiveRunSession = (runId?: string): void => {
-  if (runId) {
-    const active = readActiveRunSession()
-    if (active && active.payload.runId !== runId) return
-  }
-  try {
-    window.sessionStorage.removeItem(ACTIVE_RUN_STORAGE_KEY)
-  } catch {
-    // 与写入失败一致，存储不可用时无需额外处理
-  }
+  saveActiveRunSessions(runId ? readActiveRunSessions().filter((item) => item.payload.runId !== runId) : [])
 }

@@ -105,7 +105,7 @@ test('现有 Studio 中的附件输入、模型限制与个人模型设置', asy
   })
   await page.goto('/')
   await page.locator('input[type=file]').setInputFiles(sample)
-  await expect(page.getByLabel('待发送附件').getByRole('img', { name: '验收图表.png' })).toBeVisible()
+  await expect(page.getByLabel('待发送附件').getByRole('img', { name: 'multimodal.png', exact: true })).toBeVisible()
   await page.getByRole('textbox', { name: '消息输入' }).fill('这张图里是什么？')
   await expect(
     page.getByRole('button', { name: '发送消息', exact: true }),
@@ -140,8 +140,7 @@ test('现有 Studio 中的附件输入、模型限制与个人模型设置', asy
         path: testInfo.outputPath( `settings-${theme}-${width}.png`),
       })
       await page.getByRole('button', { name: '添加模型', exact: true }).click()
-      await page.getByRole('button', { name: '用途', exact: true }).click()
-      await page.getByRole('option', { name: '图片生成', exact: true }).click()
+      await page.getByRole('radio', { name: '图片生成', exact: true }).check()
       await page.getByLabel('显示名称', { exact: true }).fill('我的生图服务')
       await page.getByLabel('Model ID', { exact: true }).fill('image-model')
       await expect(page.getByLabel('API Key', { exact: true })).toHaveAttribute('type', 'password')

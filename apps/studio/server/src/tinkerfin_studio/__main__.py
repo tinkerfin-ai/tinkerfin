@@ -1,16 +1,14 @@
 """TinkerFin Studio 服务进程入口"""
 
-import logging
 from argparse import ArgumentParser, BooleanOptionalAction, Namespace
 from collections.abc import Sequence
 
 import uvicorn
 
 from tinkerfin_studio.application import create_application
-from tinkerfin_studio.config.logging import setup_logging
+from tinkerfin_studio.config.logging import setup_console_logging
+from tinkerfin_studio.config.settings import get_settings
 from tinkerfin_studio.resources import build_lifespan
-
-logger = logging.getLogger(__name__)
 
 app = create_application(lifespan=build_lifespan())
 
@@ -39,9 +37,8 @@ def parse_args(args: Sequence[str] | None = None) -> Namespace:
 def main(args: Sequence[str] | None = None) -> None:
     """按命令行参数启动 HTTP 服务"""
 
-    setup_logging()
     options = parse_args(args)
-    logger.info("服务器已加载")
+    setup_console_logging(get_settings().log_level)
     uvicorn.run(
         "tinkerfin_studio.__main__:app",
         host=options.host,

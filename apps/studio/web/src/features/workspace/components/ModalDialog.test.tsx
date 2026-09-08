@@ -72,7 +72,7 @@ describe('ModalDialog', () => {
     expect(opener).toHaveFocus()
   })
 
-  it('submits the edited value without closing itself and exposes pending errors', async () => {
+  it('submits without closing itself and keeps pending controls unavailable', async () => {
     const user = userEvent.setup()
     const onConfirm = vi.fn()
     const { rerender } = render(
@@ -82,7 +82,6 @@ describe('ModalDialog', () => {
         description="此操作不可恢复。"
         confirmLabel="删除"
         tone="danger"
-        error="删除失败，请重试"
         onConfirm={onConfirm}
         onCancel={vi.fn()}
       />,
@@ -91,7 +90,7 @@ describe('ModalDialog', () => {
     await user.click(screen.getByRole('button', { name: '删除' }))
     expect(onConfirm).toHaveBeenCalledWith(undefined)
     expect(screen.getByRole('dialog')).toHaveClass('modal-dialog--action', 'is-danger')
-    expect(screen.getByRole('alert')).toHaveTextContent('删除失败，请重试')
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
 
     rerender(
       <ModalDialog

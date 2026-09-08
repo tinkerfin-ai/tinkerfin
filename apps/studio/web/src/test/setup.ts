@@ -1,5 +1,18 @@
+import { Blob, File } from 'node:buffer'
+import { transferableAbortController } from 'node:util'
 import '@testing-library/jest-dom/vitest'
 import { beforeEach, vi } from 'vitest'
+
+// 页面事件仍由 jsdom 处理，保留其原生取消构造器供 DOM 回归使用
+export const DomAbortController = globalThis.AbortController
+// 请求使用 Node 原生 fetch 家族，文件和取消信号与 Request 保持同源
+const requestAbortController = transferableAbortController()
+Object.defineProperties(globalThis, {
+  Blob: {configurable: true, writable: true, value: Blob},
+  File: {configurable: true, writable: true, value: File},
+  AbortController: {configurable: true, writable: true, value: requestAbortController.constructor},
+  AbortSignal: {configurable: true, writable: true, value: requestAbortController.signal.constructor},
+})
 
 const memory = new Map<string, string>()
 Object.defineProperty(window, 'localStorage', {

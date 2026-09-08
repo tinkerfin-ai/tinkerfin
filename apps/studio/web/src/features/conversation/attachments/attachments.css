@@ -399,12 +399,12 @@
   .composer-attachment {
     display: flex;
     align-items: center;
-    gap: var(--space-2);
+    gap: var(--space-0-5);
     flex: 0 0 auto;
     min-width: 0;
     max-width: min(100%, var(--layout-image-multiple-width));
     height: var(--control-md);
-    padding: var(--space-1) var(--space-0-5) var(--space-1) var(--space-1);
+    padding: var(--space-1);
     border: 0;
     border-radius: var(--radius-md);
     background: var(--color-subtle);
@@ -420,23 +420,31 @@
   }
   .composer-attachment-icon {
     display: grid;
-    width: var(--control-xs);
+    width: var(--space-6);
     flex: 0 0 auto;
     place-items: center;
     color: var(--color-text-secondary);
   }
   .composer-attachment-copy {
+    display: flex;
+    align-items: center;
+    gap: var(--space-1-5);
     min-width: 0;
   }
-  .composer-attachment .composer-attachment-remove-control {
+  .composer-attachment-actions {
+    display: flex;
+    align-items: center;
+    flex: 0 0 auto;
+    gap: 0;
+  }
+  .composer-attachment-actions .ui-button {
     --button-control-size: var(--space-6);
+    /* 附件操作在触屏沿用紧凑宽度，高度仍保留触控空间 */
+    min-width: var(--button-control-size);
   }
-  .composer-attachment:has(.composer-attachment-state) {
-    height: auto;
-    min-height: var(--control-md);
-  }
-  .composer-attachment-copy strong {
+  .composer-attachment-name-text {
     display: block;
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -444,13 +452,64 @@
     font-weight: var(--weight-regular);
     line-height: var(--type-meta-line);
   }
-  .composer-attachment-state {
+  .composer-attachment .composer-attachment-name {
+    min-width: 0;
+    min-height: var(--space-6);
+    padding: 0;
+    border: 0;
+    color: var(--color-text-primary);
+    text-align: start;
+  }
+  .composer-attachment-name .ui-button__label {
+    min-width: 0;
+  }
+  .ui-tooltip.composer-attachment-name-tooltip {
     display: block;
+    position: fixed;
+    max-width: min(var(--layout-image-multiple-width), calc(100vw - var(--space-6)));
+    overflow-wrap: anywhere;
+    transform: none;
+    opacity: 1;
+    visibility: visible;
+    pointer-events: auto;
+    transition: none;
+  }
+  .composer-attachment-state {
+    display: flex;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: var(--space-1);
     color: var(--color-text-secondary);
     font-size: var(--type-micro-size);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
   }
-  .composer-attachment-state[data-error='true'] {
+  .composer-attachment[data-state='error'] .composer-attachment-state {
+    padding: var(--space-0-5) var(--space-1-5);
+    border-radius: var(--radius-xs);
+    background: var(--color-danger-soft);
     color: var(--color-danger-text);
+  }
+  .composer-attachment-state svg {
+    flex: 0 0 auto;
+  }
+  .composer-attachment-notice {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--space-1);
+    padding: 0 var(--space-3);
+    color: var(--color-text-secondary);
+    font-size: var(--type-caption-size);
+    line-height: var(--type-caption-line);
+  }
+  .composer-attachment-notice > svg {
+    flex: 0 0 auto;
+    color: var(--color-warning-text);
+  }
+  .composer-attachment-notice .ui-button {
+    color: var(--color-brand-text);
+    font-size: inherit;
   }
 
   @media (max-width: 767px) {
@@ -489,15 +548,28 @@
       pointer-events: auto;
     }
     .attachment-card .ui-button,
-    .attachment-viewer .ui-button,
-    .composer-attachment .ui-button {
+    .attachment-viewer .ui-button {
       min-width: var(--control-lg);
       min-height: var(--control-lg);
       height: var(--control-lg);
     }
+    .composer-attachment .ui-button {
+      min-height: var(--control-lg);
+      height: var(--control-lg);
+    }
+    .composer-attachment .composer-attachment-name {
+      min-width: var(--control-lg);
+    }
     .composer-attachment {
       height: auto;
       min-height: var(--control-lg);
+      padding-block: 0;
+    }
+    .composer-attachment-copy {
+      gap: var(--space-1);
+    }
+    .composer-attachment[data-state='error'] .composer-attachment-state {
+      padding-inline: var(--space-1);
     }
     .attachment-card .ui-tooltip,
     .attachment-viewer .ui-tooltip {

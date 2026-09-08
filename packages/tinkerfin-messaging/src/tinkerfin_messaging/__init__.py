@@ -55,6 +55,7 @@ from .errors import MessagingErrorCode as MessagingErrorCode
 from .errors import MessagingNotStarted as MessagingNotStarted
 from .errors import MessagingQuotaExceeded as MessagingQuotaExceeded
 from .errors import MessagingSettlementTimeout as MessagingSettlementTimeout
+from .errors import PublicationRejected as PublicationRejected
 from .errors import RecoveryUnsupported as RecoveryUnsupported
 from .errors import RunAlreadyActive as RunAlreadyActive
 from .errors import RunNotFound as RunNotFound
@@ -78,6 +79,7 @@ from .models import RecoverableMessage as RecoverableMessage
 from .models import RecoveryCheckpoint as RecoveryCheckpoint
 from .protocols import MessageCodec as MessageCodec
 from .protocols import MessageCodecInputSource as MessageCodecInputSource
+from .protocols import MessagePublicationPolicy as MessagePublicationPolicy
 from .protocols import MessageSource as MessageSource
 from .protocols import ProfiledMessageSource as ProfiledMessageSource
 from .protocols import RecoverableSource as RecoverableSource
@@ -122,6 +124,7 @@ __all__ = [
     "MessageCodecInputSource",
     "MessageEnvelope",
     "MessageIdConflict",
+    "MessagePublicationPolicy",
     "MessageSource",
     "MessageSourceBinding",
     "MessageSubscription",
@@ -157,6 +160,7 @@ __all__ = [
     "NativeStreamPartCodec",
     "ProfiledDeferredMessageSource",
     "ProfiledMessageSource",
+    "PublicationRejected",
     "RecoverableMessage",
     "RecoverableSource",
     "RecoveryCheckpoint",

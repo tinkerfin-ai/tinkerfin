@@ -118,6 +118,10 @@ source = DeferredMessageSource(
 
 Attachments and replay-only requests close the deferred wrapper without opening the real source. `cancel_after_first_item=True` is useful for protocols that must emit `RUN_STARTED` first.
 
+Messaging renews acquired ownership throughout source preparation, ready callbacks,
+source streaming, and settlement. Factories do not manage leases. Cancelling preparation
+interrupts pending work and joins owned cleanup; lease loss prevents further source commits.
+
 Messaging settles `on_owner_preflight` after durable owner selection. A failure releases
 that prepared owner and closes the deferred wrapper before its opener runs. Use it only
 for source-owned preparation; host activation belongs in `on_source_ready` after the

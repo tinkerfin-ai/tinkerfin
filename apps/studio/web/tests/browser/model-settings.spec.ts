@@ -409,6 +409,9 @@ test('保存失败后返回或取消不会把编辑错误和密钥带入列表',
     await expect(page.getByRole('alert')).toContainText('该模型仍有运行或审批未结束')
     await page.getByRole('button', {name: leave, exact: true}).click()
     await expect(page.getByRole('button', {name: '添加模型', exact: true})).toBeVisible()
+    await expect(page.getByRole('dialog', {name: '设置', exact: true}).getByRole('alert')).toHaveCount(0)
+    await expect(page.getByLabel('API Key', {exact: true})).toHaveCount(0)
+    await page.getByRole('button', {name: '关闭提示：该模型仍有运行或审批未结束，请结束后再修改或删除', exact: true}).click()
     await expect(page.getByRole('alert')).toHaveCount(0)
   }
 })

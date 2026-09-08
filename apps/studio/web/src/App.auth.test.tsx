@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -10,7 +10,7 @@ import {
 } from './auth/session'
 import {
   clearActiveRunSession,
-  readActiveRunSession,
+  readActiveRunSessions,
   writeActiveRunSession,
 } from './features/conversation/stream/activeRunSession'
 import { emptyTraceGraph } from './test/traceFixtures'
@@ -273,7 +273,7 @@ describe('App authentication boundary', () => {
     expect(screen.getByRole('heading', { name: '欢迎回来' })).toBeInTheDocument()
   })
 
-  it('keeps rejected credentials inline without creating a global toast', async () => {
+  it('shows rejected credentials once through the global toast', async () => {
     const browserUser = userEvent.setup()
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
       const request = input instanceof Request ? input : new Request(input)
@@ -289,8 +289,29 @@ describe('App authentication boundary', () => {
     await browserUser.click(screen.getByRole('button', { name: '登录' }))
 
     expect(await screen.findByRole('alert')).toHaveTextContent('用户名或密码错误')
-    expect(screen.getByRole('alert')).toHaveClass('auth-form-error')
-    expect(document.querySelector('.toast-card')).toBeNull()
+    expect(screen.getAllByRole('alert')).toHaveLength(1)
+    expect(screen.getByRole('alert').closest('.toast-card')).not.toBeNull()
+    expect(document.querySelector('.auth-form-error')).toBeNull()
+  })
+
+  it('卸载登录页面后取消请求且不保存晚到的登录结果', async () => {
+    const browserUser = userEvent.setup()
+    let respond!: (value: Response) => void
+    let signal: AbortSignal | undefined
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+      const request = input instanceof Request ? input : new Request(input)
+      signal = request.signal
+      return new Promise<Response>(resolve => { respond = resolve })
+    }))
+    const view = render(<App />)
+    await browserUser.type(await screen.findByLabelText('用户名'), 'yunsan')
+    await browserUser.type(screen.getByLabelText('密码'), 'password')
+    await browserUser.click(screen.getByRole('button', {name: '登录'}))
+    await waitFor(() => expect(signal).toBeDefined())
+    view.unmount()
+    expect(signal?.aborted).toBe(true)
+    await act(async () => { respond(envelope(loginPayload())); await new Promise(resolve => setTimeout(resolve, 10)) })
+    expect(window.localStorage.getItem(AUTH_SESSION_STORAGE_KEY)).toBeNull()
   })
 
   it('rejects login atomically when the browser cannot persist the session', async () => {
@@ -314,7 +335,8 @@ describe('App authentication boundary', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent(
       '浏览器无法保存登录状态，请检查隐私或存储设置后重试',
     )
-    expect(screen.getByRole('alert')).toHaveClass('auth-form-error')
+    expect(screen.getAllByRole('alert')).toHaveLength(1)
+    expect(screen.getByRole('alert').closest('.toast-card')).not.toBeNull()
     expect(screen.queryByLabelText('正在检查登录状态')).not.toBeInTheDocument()
     expect(window.localStorage.getItem(AUTH_SESSION_STORAGE_KEY)).toBeNull()
   })
@@ -431,14 +453,14 @@ describe('App authentication boundary', () => {
       mode: 'start',
       lastSeq: 7,
     })
-    expect(readActiveRunSession()).not.toBeNull()
+    expect((readActiveRunSessions()[0] ?? null)).not.toBeNull()
     await browserUser.click(screen.getByRole('button', { name: '打开用户菜单' }))
     await browserUser.click(screen.getByRole('menuitem', { name: '退出登录' }))
 
     expect(await screen.findByRole('heading', { name: '欢迎回来' })).toBeInTheDocument()
     expect(screen.queryByLabelText('对话内容')).not.toBeInTheDocument()
     expect(window.location.search).toBe('')
-    expect(readActiveRunSession()).toBeNull()
+    expect((readActiveRunSessions()[0] ?? null)).toBeNull()
     expect(fetchMock.mock.calls.some(([input]) => {
       const request = input instanceof Request ? input : new Request(input)
       return new URL(request.url).pathname.endsWith('/api/auth/logout') && request.method === 'POST'

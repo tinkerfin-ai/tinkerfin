@@ -41,6 +41,7 @@ from .errors import (
     InvalidCursor,
     MessageIdConflict,
     MessagingQuotaExceeded,
+    PublicationRejected,
     RunAlreadyActive,
     StreamDeleted,
     StreamExpired,
@@ -251,6 +252,9 @@ async def append(
     codec: str,
     payload: bytes,
     checkpoint: RecoveryCheckpoint | None = None,
+    external: bool = False,
+    closes_publication: bool = False,
+    opens_publication: bool = True,
 ) -> MessageEnvelope:
     """Append one fenced, quota-checked, idempotent message and checkpoint.
 
@@ -265,6 +269,9 @@ async def append(
         codec: Codec identity already bound during preparation.
         payload: Finite encoded message bytes.
         checkpoint: Optional source position committed atomically with the message.
+        external: Publish as an observer without producer ownership or checkpoint changes.
+        closes_publication: Seal subsequent external messages at this source commit.
+        opens_publication: Permit publication after the required source start.
 
     Returns:
         The committed immutable envelope, including its allocated sequence.
@@ -282,7 +289,13 @@ async def append(
         limits=self._limits,
     )
     generation = handle.generation
-    if handle.owner_token is None or handle.fence is None or generation is None:
+    if external and (checkpoint is not None or closes_publication):
+        raise ValueError(
+            "External publication cannot change source recovery or lifecycle"
+        )
+    if generation is None or (
+        not external and (handle.owner_token is None or handle.fence is None)
+    ):
         raise BackendOwnershipLost(
             f"Run {handle.identity.run_id!r} has no complete producer ownership "
             "identity"
@@ -314,8 +327,8 @@ async def append(
         ],
         [
             str(generation),
-            handle.owner_token,
-            str(handle.fence),
+            handle.owner_token or "",
+            "" if handle.fence is None else str(handle.fence),
             message_id,
             handle.identity.run_id,
             codec,
@@ -330,11 +343,18 @@ async def append(
             str(self._limits.max_thread_payload_bytes),
             str(self._limits.max_total_bytes),
             str(self._limits.max_total_records),
+            "1" if external else "0",
+            "1" if closes_publication else "0",
+            "1" if opens_publication and not external else "0",
         ],
     )
     code = self._text(response[0])
     if code == "STREAM_DELETED":
         self._raise_stream_deleted(handle)
+    if code == "PUBLICATION_REJECTED":
+        raise PublicationRejected(
+            identity=handle.identity, reason=self._text(response[1])
+        )
     if code == "OWNERSHIP_LOST":
         raise BackendOwnershipLost(
             f"Producer for run {handle.identity.run_id!r} lost its Redis fence"

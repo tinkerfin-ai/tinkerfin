@@ -38,9 +38,8 @@ stubs, typing markers, and package resources. All selected projects pass this ch
 any wheel is written to the output directory. A missing, extra, or changed file fails the
 command. Add `--offline` when build requirements are already present in the uv cache.
 
-Local builds, the packaging tests used by CI, and the Studio deployment script use this
-entry point. The deployment script prepares `dist/` and exports its locked production
-requirements separately.
+Local builds, packaging tests, and the Studio Dockerfile use this entry point.
+The Dockerfile exports locked production dependencies and builds wheels inside Docker.
 
 ## Validate packaging
 

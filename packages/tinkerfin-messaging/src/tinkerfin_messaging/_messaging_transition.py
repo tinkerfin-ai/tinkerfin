@@ -29,6 +29,7 @@ from .errors import (
     MessageIdConflict,
     MessagingBackendProtocolError,
     MessagingQuotaExceeded,
+    PublicationRejected,
     RunAlreadyActive,
     RunNotFound,
     StreamDeleteConflict,
@@ -118,7 +119,7 @@ def resolve_messaging_transition(
     _validate_transition_identity(transition)
     if transition.kind == "prepare_run":
         return _resolve_prepare_run(transition, state)
-    if transition.kind == "append_message":
+    if transition.kind in {"append_message", "publish_message"}:
         return _resolve_append_message(transition, state)
     if transition.kind == "begin_settlement":
         return _resolve_begin_settlement(transition, state)
@@ -391,7 +392,21 @@ def _resolve_append_message(
     transition: MessagingTransition,
     state: MessagingStateSnapshot,
 ) -> MessagingStorageEffect:
-    run, stream, reference = _owned_run(transition, state)
+    external = transition.kind == "publish_message"
+    if external:
+        run = _required_target_run(transition, state)
+        stream = _required_stream(transition, state)
+        reference = transition.run_reference
+        if reference is None or reference.generation != stream.generation:
+            raise PublicationRejected(
+                identity=transition.identity, reason="generation_changed"
+            )
+        if transition.checkpoint is not None or transition.closes_publication:
+            raise ValueError(
+                "External publication cannot change source recovery or lifecycle"
+            )
+    else:
+        run, stream, reference = _owned_run(transition, state)
     codec_id = _required_text("codec_id", transition.codec_id)
     message_id = _required_text("message_id", transition.message_id)
     payload = transition.payload
@@ -441,6 +456,17 @@ def _resolve_append_message(
                 run_status=run.status,
             )
         )
+    # Deduplicated retries return their original envelope even after settlement.
+    # New publications race terminal commits under the backend serialization boundary.
+    if external:
+        if run.status != "running" or run.settlement_started or run.publication_closed:
+            raise PublicationRejected(identity=transition.identity, reason="run_closed")
+        if not run.producer_lease_active:
+            raise PublicationRejected(identity=transition.identity, reason="owner_lost")
+        if not run.publication_ready:
+            raise PublicationRejected(
+                identity=transition.identity, reason="run_not_ready"
+            )
     if stream.latest_sequence >= limits.max_thread_messages:
         raise MessagingQuotaExceeded(
             resource="thread_messages",
@@ -477,6 +503,10 @@ def _resolve_append_message(
             replace(
                 run,
                 end_sequence=next_sequence,
+                publication_ready=run.publication_ready
+                or (not external and transition.opens_publication),
+                publication_closed=run.publication_closed
+                or transition.closes_publication,
                 checkpoint=run.checkpoint if checkpoint is None else checkpoint,
             ),
         ),
@@ -485,7 +515,7 @@ def _resolve_append_message(
             signature=signature,
             checkpoint=checkpoint,
         ),
-        lease_run_id=reference.identity.run_id,
+        lease_run_id=None if external else reference.identity.run_id,
     )
 
 

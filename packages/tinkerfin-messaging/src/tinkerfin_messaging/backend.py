@@ -92,6 +92,8 @@ class _RunRecord:
         self.recoverable = recoverable
         self.status: RunStatus = "running"
         self.settling = False
+        self.publication_closed = False
+        self.publication_ready = False
         self.error: BaseException | None = None
         self.checkpoint: RecoveryCheckpoint | None = None
 
@@ -223,7 +225,7 @@ class MemoryBackend:
                 else transition.run_reference.generation
             )
         )
-        if transition.kind in {"prepare_run", "append_message"}:
+        if transition.kind in {"prepare_run", "append_message", "publish_message"}:
             self._reclaim_expired()
         channel_state = self._channel(transition.channel)
         async with channel_state.lock:
@@ -678,6 +680,8 @@ class MemoryBackend:
             end_sequence=record.end_seq,
             status=record.status,
             settlement_started=record.settling,
+            publication_closed=record.publication_closed,
+            publication_ready=record.publication_ready,
             cancellable=record.cancellable,
             recoverable=record.recoverable,
             producer_token=record.owner_token,
@@ -772,6 +776,8 @@ class MemoryBackend:
                 record.recoverable = stored_run.recoverable
                 record.status = stored_run.status
                 record.settling = stored_run.settlement_started
+                record.publication_closed = stored_run.publication_closed
+                record.publication_ready = stored_run.publication_ready
                 record.error = stored_run.local_failure
                 record.checkpoint = stored_run.checkpoint
         if effect.message is not None:

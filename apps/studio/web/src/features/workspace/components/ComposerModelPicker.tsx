@@ -38,9 +38,8 @@ export function ComposerModelPicker({
   const { t } = useI18n()
   if (status === 'error') {
     return (
-      <div className="composer-model-error" role="alert">
-        <span>{t('模型加载失败')}</span>
-        <Button size="sm" variant="text" onClick={onRetry}>{t('重试')}</Button>
+      <div className="composer-model-error">
+        <Button type="button" size="sm" variant="text" onClick={onRetry}>{t('重新加载模型')}</Button>
       </div>
     )
   }

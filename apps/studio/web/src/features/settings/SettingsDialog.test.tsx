@@ -19,6 +19,7 @@ describe('SettingsDialog', () => {
     const onThemePreferenceChange = vi.fn()
     render(<LocaleProvider>
       <SettingsDialog
+        onToast={vi.fn()}
         open
         user={user}
         themePreference="system"
@@ -67,6 +68,7 @@ describe('SettingsDialog', () => {
     const onClose = vi.fn()
     const { unmount } = render(<LocaleProvider>
       <SettingsDialog
+        onToast={vi.fn()}
         open
         user={{ ...user, avatar_url: null }}
         themePreference="light"
@@ -87,6 +89,7 @@ describe('SettingsDialog', () => {
     const onClose = vi.fn()
     render(<LocaleProvider>
       <SettingsDialog
+        onToast={vi.fn()}
         open
         user={user}
         themePreference="light"

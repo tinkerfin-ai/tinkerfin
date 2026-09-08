@@ -31,7 +31,7 @@ describe('personal model settings', () => {
       .mockResolvedValueOnce(null)
       .mockResolvedValueOnce([{ ...model, display_name: 'Updated' }])
     const changed = vi.fn()
-    render(<ModelSettingsPanel onChanged={changed} />)
+    render(<ModelSettingsPanel onToast={vi.fn()} onChanged={changed} />)
     await screen.findByText('Mine')
     expect(screen.queryByText('model', {exact: true})).not.toBeInTheDocument()
     expect(screen.getByText(/已配置密钥/)).toBeVisible()
@@ -49,15 +49,16 @@ describe('personal model settings', () => {
   })
   it.each(['返回模型列表', '取消'])('preserves a failed draft until leaving with %s', async (leave) => {
     vi.mocked(requestJson).mockResolvedValueOnce([]).mockRejectedValueOnce(new Error('模型仍在运行，请结束后再修改'))
-    render(<ModelSettingsPanel />)
+    render(<ModelSettingsPanel onToast={vi.fn()} />)
     await screen.findByText('还没有模型配置，请先添加')
     fireEvent.click(screen.getByRole('button', { name: '添加模型' }))
     fireEvent.change(screen.getByLabelText('显示名称'), {target: {value: 'My model'}})
     fireEvent.change(screen.getByLabelText('Model ID'), {target: {value: 'provider-model'}})
     fireEvent.change(screen.getByLabelText('API Key'), {target: {value: 'secret'}})
     fireEvent.click(screen.getByRole('button', {name: '保存'}))
-    await screen.findByRole('alert')
-    expect(screen.getByRole('alert')).toHaveTextContent('模型仍在运行，请结束后再修改')
+    await waitFor(() => expect(screen.getByRole('button', {name: '保存'})).toBeEnabled())
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(vi.mocked(requestJson).mock.calls[1][1]?.suppressGlobalError).not.toBe(true)
     expect(screen.getByLabelText('显示名称')).toHaveValue('My model')
     expect(screen.getByRole('button', {name: '保存'})).toBeEnabled()
     fireEvent.click(screen.getByRole('button', {name: leave}))
@@ -69,7 +70,7 @@ describe('personal model settings', () => {
 
   it('uses the shared keyboard picker and restores focus', async () => {
     vi.mocked(requestJson).mockResolvedValueOnce([])
-    render(<ModelSettingsPanel />)
+    render(<ModelSettingsPanel onToast={vi.fn()} />)
     await screen.findByText('还没有模型配置，请先添加')
     fireEvent.click(screen.getByRole('button', {name: '添加模型'}))
     fireEvent.click(screen.getByRole('radio', {name: '图片生成'}))
@@ -86,7 +87,7 @@ describe('personal model settings', () => {
   it('keeps the chat provider and reasoning selection when switching purpose', async () => {
     const model = {...newModel(), display_name: 'DeepSeek', model_name: 'deepseek-model', provider: 'deepseek', reasoning_enabled: true, has_key: true}
     vi.mocked(requestJson).mockResolvedValueOnce([model]).mockResolvedValueOnce(null).mockResolvedValueOnce([model])
-    render(<ModelSettingsPanel />)
+    render(<ModelSettingsPanel onToast={vi.fn()} />)
     await screen.findByText('DeepSeek')
     fireEvent.click(screen.getByRole('button', {name: '编辑'}))
     fireEvent.click(screen.getByRole('radio', {name: '图片生成'}))
@@ -101,7 +102,7 @@ describe('personal model settings', () => {
     const model = {...newModel(), display_name: 'Mine', has_key: true, enabled}
     vi.mocked(requestJson).mockResolvedValueOnce([model]).mockResolvedValueOnce(null).mockResolvedValueOnce([{...model, enabled: true, is_default: true}])
     const changed = vi.fn()
-    render(<ModelSettingsPanel onChanged={changed} />)
+    render(<ModelSettingsPanel onToast={vi.fn()} onChanged={changed} />)
     fireEvent.click(await screen.findByRole('button', {name: enabled ? '设为默认' : '启用并设为默认'}))
     await screen.findByText('默认', {exact: true})
     const [path, request] = vi.mocked(requestJson).mock.calls[1]
@@ -114,7 +115,7 @@ describe('personal model settings', () => {
 
   it('requires a key before choosing a default', async () => {
     vi.mocked(requestJson).mockResolvedValueOnce([{...newModel(), display_name: 'Missing key'}])
-    render(<ModelSettingsPanel />)
+    render(<ModelSettingsPanel onToast={vi.fn()} />)
     expect(await screen.findByRole('button', {name: '设为默认'})).toBeDisabled()
     expect(screen.getByRole('button', {name: '设为默认'})).toHaveAttribute('title', '请先配置密钥')
     expect(requestJson).toHaveBeenCalledOnce()
@@ -123,7 +124,7 @@ describe('personal model settings', () => {
   it('requires a new key for a different address and accepts the saved endpoint again', async () => {
     const model = {...newModel(), display_name: 'Mine', model_name: 'example', has_key: true}
     vi.mocked(requestJson).mockResolvedValueOnce([model])
-    render(<ModelSettingsPanel />)
+    render(<ModelSettingsPanel onToast={vi.fn()} />)
     fireEvent.click(await screen.findByRole('button', {name: '编辑'}))
     const key = screen.getByLabelText('API Key')
     expect(key).not.toBeRequired()
@@ -144,9 +145,10 @@ describe('personal model settings', () => {
   it('preserves the list and allows another default attempt after failure', async () => {
     const model = {...newModel(), display_name: 'Mine', has_key: true}
     vi.mocked(requestJson).mockResolvedValueOnce([model]).mockRejectedValueOnce(new Error('服务暂不可用')).mockResolvedValueOnce(null).mockResolvedValueOnce([{...model, is_default: true}])
-    render(<ModelSettingsPanel />)
+    render(<ModelSettingsPanel onToast={vi.fn()} />)
     fireEvent.click(await screen.findByRole('button', {name: '设为默认'}))
-    expect(await screen.findByRole('alert')).toHaveTextContent('服务暂不可用')
+    await waitFor(() => expect(screen.getByRole('button', {name: '设为默认'})).toBeEnabled())
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
     expect(screen.getByText('Mine')).toBeVisible()
     fireEvent.click(screen.getByRole('button', {name: '设为默认'}))
     await screen.findByText('默认', {exact: true})

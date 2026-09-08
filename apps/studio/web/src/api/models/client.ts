@@ -5,5 +5,4 @@ export const fetchModelCatalog = (
   signal?: AbortSignal,
 ): Promise<AgentModelCatalog> => requestJson<AgentModelCatalog>('/api/models', {
   signal,
-  suppressGlobalError: true,
 })

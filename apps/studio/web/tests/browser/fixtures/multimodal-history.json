@@ -1,7 +1,7 @@
 {
   "id": 59,
   "threadId": "thread-35bbf8ca-3353-5262-a2f0-8dc62bf35644",
-  "title": "请调用 create_file 生成一张测试柱状图，name=验收图表.png，kind=png，values=[12,",
+  "title": "请调用 create_file 生成一张测试柱状图，name=验",
   "lastModel": "deepseek-v4-flash",
   "pinned": false,
   "asOfSeq": 27,
@@ -475,5 +475,8 @@
     "todoGroups": []
   },
   "createdAt": "2026-09-06T21:02:44",
-  "updatedAt": "2026-09-06T21:02:48"
+  "updatedAt": "2026-09-06T21:02:48",
+  "titleSource": "unknown",
+  "titleGenerationStatus": "skipped",
+  "titleSeq": 0
 }

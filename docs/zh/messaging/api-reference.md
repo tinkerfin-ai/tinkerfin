@@ -18,6 +18,7 @@
 | 方法 | 关键参数 | 结果 |
 | --- | --- | --- |
 | `sse(...)` | source、可选 identity、after、callback | 调用方拥有且可关闭的 SSE bytes 迭代器 |
+| `publish(...)` | message、identity、可选 message_id | 向已有运行持久化通知，返回 MessageEnvelope |
 | `wrap(...)` | source、可选 identity、after、callback | `MessageSubscription` |
 | `wrap_recoverable(...)` | recoverable source、可选 identity、after、callback | 可恢复 subscription |
 | `read(...)` | `identity`、`after=0`、`limit=100` | 升序历史元组 |
@@ -86,6 +87,7 @@ interrupt ID 发生变化时会被拒绝。可选 `RUN_STARTED.input` 中的消�
 
 | API | 用途 |
 | --- | --- |
+| `MessagePublicationPolicy` | 可选的 codec 外部消息校验与主运行发布边界 |
 | `MessageCodec` | `encode()`、`decode()` 和稳定 `codec_id` |
 | `SseRenderer` | `render(seq=..., payload=...) -> bytes` |
 | `AgUiCodec` | 安装 `[agui]` 后可用的 AG-UI codec 与 renderer |
@@ -138,6 +140,7 @@ Attachment 不调用两个 delivery callback。`on_owner_preflight` 属于 sourc
 | `MessagingNotStarted` / `MessagingClosed` | 生命周期状态不允许当前操作 |
 | `MessagingSettlementTimeout` | 调用方等待安全清理超时 |
 | `InvalidCursor` | 游标非法或超出末尾 |
+| `PublicationRejected` | 运行状态或协议不接受新的外部消息 |
 | `CodecMismatch` | channel codec 不一致 |
 | `SourceProfileMismatch` | source profile 缺失或矛盾 |
 | `MessageIdConflict` | 同一消息 ID 对应不同内容 |

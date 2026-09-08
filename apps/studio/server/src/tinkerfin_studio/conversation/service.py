@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
+import asyncio
+import logging
+from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import dataclass
 
-from ag_ui.core import BaseEvent
+from ag_ui.core import BaseEvent, CustomEvent, RunStartedEvent
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from tinkerfin import AgUiResumeCheckpoint, RunIdentity
+from tinkerfin import AgUiResumeCheckpoint, RunIdentity, SseBody
+from tinkerfin.deep_agent import DeepAgentDefinition
 from tinkerfin_messaging import (
+    AgUiCodec,
+    MessageEnvelope,
     ProfiledMessageSource,
+    PublicationRejected,
     create_agui_run_source,
     parse_sse_event_id,
 )
@@ -46,11 +52,15 @@ from tinkerfin_studio.conversation.run_registration import (
 from tinkerfin_studio.conversation.schemas import (
     CancelRunResponse,
 )
+from tinkerfin_studio.conversation.titles import summarize_conversation_title
+from tinkerfin_studio.models.chat import create_chat_model
 from tinkerfin_studio.models.repository import AgentModelRepository
 from tinkerfin_studio.models.schemas import AgentModelConfig
 from tinkerfin_studio.models.service import AgentModelService
 from tinkerfin_studio.resources import ApplicationResources
 from tinkerfin_tracing import TraceThreadNotFound, TracingError
+
+logger = logging.getLogger(__name__)
 
 _MESSAGING_ERRORS: dict[
     MessagingErrorCode,
@@ -75,6 +85,10 @@ _MESSAGING_ERRORS: dict[
         False,
     ),
     MessagingErrorCode.SOURCE_PROFILE_MISMATCH: (
+        ConversationErrorCode.MESSAGING_FAILURE,
+        False,
+    ),
+    MessagingErrorCode.PUBLICATION_REJECTED: (
         ConversationErrorCode.MESSAGING_FAILURE,
         False,
     ),
@@ -158,7 +172,7 @@ def parse_last_event_id(value: str | None) -> int | None:
 class PreparedChat:
     """完成 Messaging 预握手后的 HTTP SSE 内容"""
 
-    body: AsyncGenerator[bytes, None]
+    body: AsyncGenerator[bytes, None] | SseBody[bytes]
     thread_id: str
 
 
@@ -166,11 +180,11 @@ class ConversationChatService:
     """准备请求级 Agent 事件源并启动或附着 durable AG-UI run"""
 
     def __init__(
-        self,
-        session: AsyncSession,
-        *,
-        user: UserContext,
-        resources: ApplicationResources,
+            self,
+            session: AsyncSession,
+            *,
+            user: UserContext,
+            resources: ApplicationResources,
     ) -> None:
         self._session = session
         self._user = user
@@ -178,10 +192,10 @@ class ConversationChatService:
         self._repository = ConversationRepository(session)
 
     async def start(
-        self,
-        request: ChatRequest,
-        *,
-        last_event_id: str | None,
+            self,
+            request: ChatRequest,
+            *,
+            last_event_id: str | None,
     ) -> PreparedChat:
         """完成业务校验、Agent 事件源准备和 Messaging 预握手"""
 
@@ -212,11 +226,15 @@ class ConversationChatService:
             prepared=prepared,
             execution=execution,
             run_preparer=run_preparer,
+            title_text=request.user_input.text
+            if isinstance(intent, StartChatIntent)
+            else "",
+            model=model,
         )
         return PreparedChat(body=body, thread_id=execution.thread.thread_id)
 
     async def _resolve_attachments(
-        self, request: ChatRequest, model: AgentModelConfig
+            self, request: ChatRequest, model: AgentModelConfig
     ) -> ChatRequest:
         """以仓储信息替换客户端附件描述，检查模型能力和文件总量"""
         if not request.messages:
@@ -243,11 +261,11 @@ class ConversationChatService:
         return ChatRequest.model_validate(payload)
 
     async def _prepare_execution(
-        self,
-        request: ChatRequest,
-        *,
-        intent: StartChatIntent | ResumeChatIntent,
-        model: AgentModelConfig,
+            self,
+            request: ChatRequest,
+            *,
+            intent: StartChatIntent | ResumeChatIntent,
+            model: AgentModelConfig,
     ) -> tuple[ConversationRunPreparer, PreparedRunRequest, PreparedExecution]:
         """完成 thread 解析、权威快照和短事务 run 注册"""
 
@@ -323,13 +341,13 @@ class ConversationChatService:
         return run_preparer, prepared, execution
 
     def _create_events(
-        self,
-        *,
-        intent: StartChatIntent | ResumeChatIntent,
-        execution: PreparedExecution,
-        prepared: PreparedRunRequest,
-        model: AgentModelConfig,
-        image_model: AgentModelConfig | None,
+            self,
+            *,
+            intent: StartChatIntent | ResumeChatIntent,
+            execution: PreparedExecution,
+            prepared: PreparedRunRequest,
+            model: AgentModelConfig,
+            image_model: AgentModelConfig | None,
     ) -> ProfiledMessageSource[BaseEvent, BaseEvent]:
         """创建仅由 Messaging owner 打开的统一 AG-UI 事件源"""
 
@@ -375,7 +393,7 @@ class ConversationChatService:
                 )
                 await repository.commit()
 
-        async def create_agent():
+        async def create_agent() -> DeepAgentDefinition[None]:
             return await factory.create_agent(
                 tinkerfin=tinkerfin,
                 user_id=self._user.user_id,
@@ -406,6 +424,9 @@ class ConversationChatService:
                 event,
                 prepared=prepared,
                 title=execution.thread.title,
+                title_source=execution.thread.title_source,
+                title_seq=execution.thread.title_seq,
+                title_generation_status=execution.thread.title_generation_status,
             )
 
         return create_agui_run_source(
@@ -415,19 +436,40 @@ class ConversationChatService:
         )
 
     async def _start_delivery(
-        self,
-        events: ProfiledMessageSource[BaseEvent, BaseEvent],
-        *,
-        after: int | None,
-        prepared: PreparedRunRequest,
-        execution: PreparedExecution,
-        run_preparer: ConversationRunPreparer,
-    ) -> AsyncGenerator[bytes, None]:
+            self,
+            events: ProfiledMessageSource[BaseEvent, BaseEvent],
+            *,
+            after: int | None,
+            prepared: PreparedRunRequest,
+            execution: PreparedExecution,
+            run_preparer: ConversationRunPreparer,
+            title_text: str,
+            model: AgentModelConfig,
+    ) -> AsyncGenerator[bytes, None] | SseBody[bytes]:
         """让 Messaging 完成 owner/attachment 选择并返回 SSE 内容"""
+
+        title_ready = asyncio.Event()
+        owner = False
+        title_finished = False
+        codec = AgUiCodec()
+
+        async def title_run_committed(envelope: MessageEnvelope) -> None:
+            """只在当前主运行开始提交后启动标题，附着和重放不会调用"""
+            nonlocal title_finished
+            event = codec.decode(envelope.payload)
+            if (
+                    isinstance(event, RunStartedEvent)
+                    and event.run_id == prepared.identity.run_id
+            ):
+                title_ready.set()
+            if codec.ends_publication(event, identity=prepared.identity):
+                title_finished = True
 
         async def activate_ready_source() -> None:
             """在框架 Run 可查询后发布业务 head"""
 
+            nonlocal owner
+            owner = True
             await run_preparer.activate_started(
                 thread_pk=execution.thread.id,
                 identity_run_id=prepared.identity.run_id,
@@ -449,6 +491,7 @@ class ConversationChatService:
                 events,
                 after=after,
                 on_source_ready=activate_ready_source,
+                on_committed=title_run_committed,
                 on_delivery_not_started=cleanup_not_started,
             )
         except MessagingError as error:
@@ -463,7 +506,7 @@ class ConversationChatService:
                 await body.aclose()
             except BaseException as close_error:
                 if isinstance(error, Exception) and not isinstance(
-                    close_error, Exception
+                        close_error, Exception
                 ):
                     close_error.add_note(
                         "SSE 内容关闭前的 Trace follow 注册也失败: "
@@ -478,7 +521,65 @@ class ConversationChatService:
                 )
                 raise error.with_traceback(error.__traceback__) from close_error
             raise
-        return body
+        if (
+                not owner
+                or not title_text.strip()
+                or execution.thread.title_source != "default"
+                or execution.thread.title_generation_status != "idle"
+        ):
+            return body
+
+        title_task: asyncio.Task[None] | None = None
+
+        async def generate_title() -> None:
+            await title_ready.wait()
+            if title_finished:
+                return
+            try:
+                title = await summarize_conversation_title(
+                    database=self._resources.database,
+                    thread_pk=execution.thread.id,
+                    text=title_text,
+                    model=create_chat_model(
+                        model,
+                        reasoning_enabled=False,
+                        max_retries=0,
+                        max_tokens=64,
+                        timeout=60,
+                        http_async_client=self._resources.model_http_client,
+                    ),
+                )
+                if title is not None:
+                    await self._resources.conversation_channel.publish(
+                        CustomEvent(
+                            name="studio.conversation.title.updated",
+                            value=title.model_dump(mode="json", by_alias=True),
+                        ),
+                        identity=prepared.identity,
+                        message_id=f"conversation-title:{title.thread_id}:{title.title_seq}",
+                    )
+            except PublicationRejected:
+                pass  # 主流已结束时保留数据库标题，由历史同步读取
+            except Exception as error:  # noqa: BLE001 - 标题通知失败不影响主回复，不记录异常正文
+                logger.warning("会话标题通知失败 reason=%s", type(error).__name__)
+
+        def start_response() -> AsyncIterator[bytes]:
+            nonlocal title_task
+            title_task = asyncio.create_task(
+                generate_title(), name="conversation-title"
+            )
+            return body
+
+        async def close_response() -> None:
+            try:
+                if title_task is not None:
+                    title_task.cancel()
+                    await asyncio.gather(title_task, return_exceptions=True)
+            finally:
+                await body.aclose()
+
+        # 借用框架响应生命周期，保证未消费、正常结束和重复断连都回收标题任务
+        return SseBody(source_factory=start_response, close=close_response)
 
     async def cancel(self, *, thread_id: str, run_id: str) -> CancelRunResponse:
         """验证用户归属后请求并等待 durable run 取消"""
@@ -509,10 +610,10 @@ class ConversationChatService:
         return CancelRunResponse(cancelled=cancelled)
 
     async def _reconcile_trace(
-        self,
-        *,
-        thread_pk: int,
-        identity: RunIdentity,
+            self,
+            *,
+            thread_pk: int,
+            identity: RunIdentity,
     ) -> None:
         """把取消后的 Runtime 终态同步为列表摘要"""
 
@@ -526,14 +627,14 @@ class ConversationChatService:
 
     @staticmethod
     def _messaging_error(
-        error: MessagingError,
-        *,
-        operation: str = "chat",
+            error: MessagingError,
+            *,
+            operation: str = "chat",
     ) -> BusinessException | SystemException:
         error_code, business = _MESSAGING_ERRORS[error.code]
         if (
-            operation == "cancel"
-            and error.code is MessagingErrorCode.RUN_PRODUCER_FAILED
+                operation == "cancel"
+                and error.code is MessagingErrorCode.RUN_PRODUCER_FAILED
         ):
             error_code = ConversationErrorCode.RUN_CANCEL_FAILED
         exception_type = BusinessException if business else SystemException

@@ -18,6 +18,7 @@ The default backend is `MemoryBackend`.
 | Method | Main parameters | Result |
 | --- | --- | --- |
 | `sse(...)` | source, optional identity, after, callbacks | Caller-owned closeable SSE byte iterator |
+| `publish(...)` | message, identity, optional message_id | Persist a notification in the existing run; return MessageEnvelope |
 | `wrap(...)` | source, optional identity, after, callbacks | `MessageSubscription` |
 | `wrap_recoverable(...)` | recoverable source, optional identity, after, callbacks | Recoverable subscription |
 | `read(...)` | RunIdentity, `after=0`, `limit=100` | Ascending finite page |
@@ -88,6 +89,7 @@ changing the output protocol is intentional.
 
 | API | Purpose |
 | --- | --- |
+| `MessagePublicationPolicy` | Optional codec validation and main-run publication boundaries |
 | `MessageCodec` | Stable `codec_id` plus `encode()` and `decode()` |
 | `SseRenderer` | `render(seq=..., payload=...) -> bytes` |
 | `AgUiCodec` | `[agui]` AG-UI codec and renderer |
@@ -142,6 +144,7 @@ and runs before a deferred opener; `on_source_ready` runs after that opener comp
 | `MessagingNotStarted` / `MessagingClosed` | Lifecycle does not allow the operation |
 | `MessagingSettlementTimeout` | Caller wait for protected cleanup expired |
 | `InvalidCursor` | Cursor is invalid or beyond the tail |
+| `PublicationRejected` | Run or protocol does not accept a new external message |
 | `CodecMismatch` | Channel codec differs |
 | `SourceProfileMismatch` | Source profile is incomplete or contradictory |
 | `MessageIdConflict` | One message ID maps to different content |

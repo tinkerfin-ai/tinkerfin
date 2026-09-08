@@ -1,6 +1,6 @@
 import { AttachmentReferenceContext } from '../conversation/attachments/context'
 import { messageText, messageAttachments } from '../conversation/attachments/content'
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type SetStateAction } from 'react'
 
 import type { AgentMode, ChatRequestPayload } from '../../api/conversation/types'
 import type { TodoGroup } from '../../api/conversation/taskTrace'
@@ -9,12 +9,11 @@ import type { AuthUser } from '../../api/auth/types'
 import {
   Button,
   ErrorBoundary,
-  FeedbackState,
   useThemePreference,
   ViewTabs,
 } from '../../components/ui'
 import type { ToastKind } from '../../components/ui/ToastViewport'
-import { useI18n } from '../../i18n'
+import { isTranslationKey, useI18n } from '../../i18n'
 import {
   ApprovalCard,
   type ApprovalSubmissionDecision,
@@ -63,6 +62,7 @@ import { useConversationStreamController } from '../conversation/stream/useConve
 import {
   clearActiveRunSession,
   readActiveRunSession,
+  readActiveRunSessions,
 } from '../conversation/stream/activeRunSession'
 import {
   buildEmptyConversation,
@@ -139,8 +139,12 @@ export function WorkspaceScreen({
   const [workspace, setWorkspace] = useState<WorkspaceState>(createEmptyWorkspace)
   const [draftConversation, setDraftConversation] = useState<Conversation | null>(null)
   const [draftModel, setDraftModel] = useState('')
-  const [draft, setDraft] = useState('')
+  const [draft, setDraftValue] = useState('')
   const draftRevision = useRef(0)
+  const setDraft = useCallback((value: SetStateAction<string>) => {
+    draftRevision.current += 1
+    setDraftValue(value)
+  }, [])
   const [isModelPickerOpen, setModelPickerOpen] = useState(false)
   const [pendingResume, setPendingResume] = useState<PendingResume | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -156,31 +160,44 @@ export function WorkspaceScreen({
     displayName: modelDisplayName,
     retry: retryModelCatalog,
   } = useModelCatalog()
-  const localAttachments = useAttachments()
+  const localAttachments = useAttachments((message) => onToast('error', isTranslationKey(message) ? t(message) : message))
   const appShell = useRef<HTMLDivElement>(null)
   const latestWorkspace = useRef(workspace)
   const startedResumeRunIds = useRef(new Set<string>())
+  const [initialActiveSessions] = useState(readActiveRunSessions)
+  const autoRecoveredRunIds = useRef(new Set<string>())
+  const notifiedConversationEvents = useRef(new Set<string>())
   latestWorkspace.current = workspace
   const pushToast = onToast
+  const notifyConversation = useCallback((notice: NonNullable<Conversation['notice']>) => {
+    const key = notice.id ?? `${notice.kind}:${notice.content}`
+    if (notifiedConversationEvents.current.has(key)) return
+    notifiedConversationEvents.current.add(key)
+    if (notifiedConversationEvents.current.size > 256) {
+      const oldest = notifiedConversationEvents.current.values().next().value
+      if (oldest) notifiedConversationEvents.current.delete(oldest)
+    }
+    pushToast(notice.kind, notice.content)
+  }, [pushToast])
 
   useEffect(() => {
     if (defaultModelId) setDraftModel((current) => current || defaultModelId)
   }, [defaultModelId])
 
   const {
-    cancelActiveRun,
+    cancelRun,
     cancelPendingRunId,
     followDetachedConversation,
-    detachThreadStream,
-    getActiveThreadId,
+    releaseDraft,
     handoffTaskTraceFollow,
-    hasActiveStream,
     isActiveThread,
     streamRun,
+    recoverConversation,
   } = useConversationStreamController({
     workspace,
     setWorkspace,
     setDraftConversation,
+    onNotice: notifyConversation,
   })
   const {
     historyConversations,
@@ -228,6 +245,26 @@ export function WorkspaceScreen({
     }
     return draftConversation ?? buildEmptyConversation({ now: new Date().toISOString(), model: draftModel })
   }, [draftConversation, draftModel, selectedConversation, workspace.currentThreadId])
+
+  useEffect(() => {
+    let notification = conversation.notice
+    let runId = conversation.activeRunId
+    for (let index = conversation.messages.length - 1; index >= 0; index -= 1) {
+      const message = conversation.messages[index]!
+      if (!notification && conversation.runStatus === 'error' && message.role === 'error') {
+        notification = { kind: 'error', content: message.content, id: `${message.meta?.runId}:terminal` }
+        runId = message.meta?.runId
+      }
+      if (notification && !runId && message.role === 'user') runId = message.meta?.runId
+      if (notification && runId) break
+    }
+    if (!notification) return
+    const key = notification.id ?? JSON.stringify([
+      conversation.threadId, runId ?? conversation.trace?.headRunId,
+      notification.kind, notification.content,
+    ])
+    notifyConversation({ ...notification, id: key })
+  }, [conversation, notifyConversation])
 
   useEffect(() => {
     document.title = conversation.threadId && conversation.title.trim()
@@ -329,10 +366,10 @@ export function WorkspaceScreen({
     writeThreadToLocation(workspace.currentThreadId)
   }, [isHistoryBootstrapped, workspace.currentThreadId])
 
-  // 浏览器后退/前进时回到目标会话的对话页，并轻量同步当前会话；这里不走
-  // selectConversation 的流断开确认，避免历史导航突然弹出确认框
+  // 历史导航释放草稿的页面选择权，迟到的首帧只能更新原会话
   useEffect(() => {
     const onPopState = () => {
+      releaseDraft()
       const threadId = readThreadFromLocation()
       setWorkspaceView('conversation')
       setWorkspace((state) =>
@@ -345,11 +382,11 @@ export function WorkspaceScreen({
     }
     window.addEventListener('popstate', onPopState)
     return () => window.removeEventListener('popstate', onPopState)
-  }, [])
+  }, [releaseDraft])
 
   useEffect(() => {
     if (!workspace.currentThreadId || !selectedConversation?.isHydrated) return
-    const active = readActiveRunSession()
+    const active = readActiveRunSession(selectedConversation.threadId)
     if (!active || (active.threadId && active.threadId !== selectedConversation.threadId)) return
     const runMatches = selectedConversation.activeRunId === active.payload.runId
     if (selectedConversation.runStatus !== 'detached' || !runMatches) {
@@ -358,7 +395,11 @@ export function WorkspaceScreen({
       }
       return
     }
-    if (hasActiveStream()) return
+    if (isActiveThread(selectedConversation.threadId)) return
+    // 仅恢复进入页面时留下的连接；本页失联后的恢复必须由用户明确发起
+    if (!initialActiveSessions.some((item) => item.payload.runId === active.payload.runId)
+      || autoRecoveredRunIds.current.has(active.payload.runId)) return
+    autoRecoveredRunIds.current.add(active.payload.runId)
 
     const threadId = selectedConversation.threadId
     const payload = { ...active.payload, threadId }
@@ -373,7 +414,8 @@ export function WorkspaceScreen({
       initialAfterSeq: afterSeq,
     })
   }, [
-    hasActiveStream,
+    isActiveThread,
+    initialActiveSessions,
     selectedConversation?.activeRunId,
     selectedConversation?.isHydrated,
     selectedConversation?.lastSeq,
@@ -453,11 +495,18 @@ export function WorkspaceScreen({
     const readyAttachments = localAttachments.attachments.flatMap(item => item.attachment ? [item.attachment] : [])
     if ((!trimmed && !readyAttachments.length) || isRunning || !conversation.model || localAttachments.attachments.some(item => item.state !== 'ready')) return
     if (readyAttachments.some(item => item.mime_type.startsWith('image/')) && imageSupport(conversation.model) !== 'supported') return
-    const submittedRevision = draftRevision.current
     const submittedIds = localAttachments.attachments.map(item => item.id)
+    const submittedThreadId = workspace.currentThreadId
+    const submittedDraft = draft
+    const clearedDraftRevision = draftRevision.current + 1
     const onAccepted = () => {
-      if (draftRevision.current === submittedRevision) setDraft('')
       localAttachments.completeSend(submittedIds)
+    }
+    const onRequestRejected = () => {
+      if (draftRevision.current === clearedDraftRevision
+        && latestWorkspace.current.currentThreadId === submittedThreadId) {
+        setDraft(submittedDraft)
+      }
     }
     messageWindow.restoreTail()
     const effectiveMode = modeOverride ?? conversation.mode
@@ -493,10 +542,12 @@ export function WorkspaceScreen({
 
       scrollConversationToBottomImmediately()
       setDraftConversation(seededConversation)
+      setDraft('')
       void streamRun(nextConversation.threadId, payload, 'start', {
         target: 'draft',
         initialConversation: seededConversation,
         onAccepted,
+        onRequestRejected,
       })
       return
     }
@@ -546,8 +597,9 @@ export function WorkspaceScreen({
         }],
       }))
     })
-    void streamRun(currentConversation.threadId, payload, 'start', { target: 'workspace', onAccepted })
-  }, [localAttachments, imageSupport, conversation.mode, conversation.model, draftConversation?.model, draftModel, hydrateConversation, isRunning, messageWindow, scrollConversationToBottomImmediately, streamRun, t, workspace.conversations, workspace.currentThreadId])
+    setDraft('')
+    void streamRun(currentConversation.threadId, payload, 'start', { target: 'workspace', onAccepted, onRequestRejected })
+  }, [localAttachments, imageSupport, conversation.mode, conversation.model, draft, draftConversation?.model, draftModel, hydrateConversation, isRunning, messageWindow, scrollConversationToBottomImmediately, setDraft, streamRun, t, workspace.conversations, workspace.currentThreadId])
 
   useEffect(() => {
     if (!pendingResume) return
@@ -780,7 +832,6 @@ export function WorkspaceScreen({
   const {
     dialog,
     dialogPending,
-    dialogError,
     closeDialog,
     confirmDialog,
     selectConversation,
@@ -799,13 +850,11 @@ export function WorkspaceScreen({
     setDraftModel,
     followDetachedConversation,
     abandonPlanInteraction,
-    cancelActiveRun,
-    detachThreadStream,
-    getActiveThreadId,
-    hasActiveStream,
+    cancelRun,
     isActiveThread,
     onToast: pushToast,
     onConversationBoundary: () => {
+      releaseDraft()
       draftRevision.current += 1
       localAttachments.clearAttachments()
       setWorkspaceView('conversation')
@@ -836,9 +885,9 @@ export function WorkspaceScreen({
   }, [conversation.mode, conversation.planInteraction, conversation.threadId, isRunning, pushToast, requestDisablePlan, setAgentMode, t])
 
   const stop = async () => {
-    if (!hasActiveStream()) return
+    if (!isActiveThread(conversation.threadId)) return
     try {
-      const cancelled = await cancelActiveRun()
+      const cancelled = await cancelRun(conversation.threadId)
       pushToast('info', cancelled ? t('任务已停止') : t('任务已经结束'))
     } catch {
       pushToast('error', t('停止任务失败，请重试'))
@@ -969,7 +1018,7 @@ export function WorkspaceScreen({
           conversationTitle={conversation.title}
           overlayTriggerRef={navigation.overlayTriggerRef}
           onOpenOverlay={navigation.openOverlay}
-          navigation={(
+          navigation={conversation.threadId ? (
             <ViewTabs
               value={workspaceView}
               label={t('会话视图')}
@@ -985,7 +1034,7 @@ export function WorkspaceScreen({
               onChange={selectWorkspaceView}
               className="workspace-view-tabs"
             />
-          )}
+          ) : undefined}
           backgroundInert={taskDrawer.modalActive}
         />
         {workspaceView === 'conversation' ? (
@@ -1014,6 +1063,8 @@ export function WorkspaceScreen({
               onUserScrollIntent={markUserScrollIntent}
               onRetryHistory={retryHistoryBootstrap}
               onRetryHydration={() => void hydrateConversation(conversation.threadId)}
+              onError={(message) => pushToast('error', message)}
+              onRecoverConversation={() => void recoverConversation(conversation.threadId)}
               onLoadEarlierMessages={(trigger) => void messageWindow.loadEarlierMessages(trigger)}
             />
             <Composer
@@ -1096,7 +1147,13 @@ export function WorkspaceScreen({
               planLocked={isRunning}
               attachments={localAttachments.attachments}
               attachmentBlocked={localAttachments.attachments.some(item => item.kind === 'image') && imageSupport(conversation.model) !== 'supported'}
-              attachmentError={localAttachments.attachments.some(item => item.kind === 'image') && imageSupport(conversation.model) !== 'supported' ? t('当前模型不支持看图或能力未确认，请切换模型；草稿仍保留') : localAttachments.error}
+              attachmentError={localAttachments.error}
+              attachmentNotice={localAttachments.attachments.some(item => item.kind === 'image') && imageSupport(conversation.model) !== 'supported' ? (
+                <>
+                  <span>{imageSupport(conversation.model) === 'unsupported' ? t('当前模型不支持图片') : t('当前模型的图片能力未确认')}</span>
+                  <Button type="button" variant="text" disabled={modelCatalogStatus !== 'ready'} onClick={() => setModelPickerOpen(true)}>{t('切换模型')}</Button>
+                </>
+              ) : undefined}
               onRetryAttachment={localAttachments.retryAttachment}
               disabledReason={isConversationHydrationFailed
                 ? t('会话加载失败，请先重试')
@@ -1111,7 +1168,7 @@ export function WorkspaceScreen({
                         : isInitialHistoryUnavailable
                           ? t('历史会话加载失败，请先重试')
                           : undefined}
-              onChange={(value) => { draftRevision.current += 1; setDraft(value) }}
+              onChange={setDraft}
               onSend={send}
               onStop={() => void stop()}
               onExitPlan={exitPlanMode}
@@ -1122,14 +1179,16 @@ export function WorkspaceScreen({
           </>
         ) : (
           <ErrorBoundary
+            onError={() => pushToast('error', t('链路区域无法显示'))}
             resetKey={`${conversation.threadId || 'draft'}:chain-trace`}
             fallback={({ reset }) => (
               <div className="chain-trace-state">
-                <FeedbackState kind="error" title={t('链路区域无法显示')} onRetry={reset} />
+                <Button type="button" variant="text" onClick={reset}>{t('重新加载')}</Button>
               </div>
             )}
           >
             <ChainTraceView
+              onError={(message) => pushToast('error', message)}
               threadId={conversation.threadId}
               active={workspaceView === 'trace'}
               live={conversation.runStatus === 'streaming' || conversation.runStatus === 'detached'}
@@ -1148,10 +1207,11 @@ export function WorkspaceScreen({
         />
       )}
       <ErrorBoundary
+        onError={() => pushToast('error', t('任务轨迹无法显示'))}
         resetKey={`${conversation.threadId || 'draft'}:${taskDrawer.open ? 'open' : 'closed'}`}
         fallback={({ reset }) => taskDrawer.open ? (
           <aside ref={taskDrawer.drawerRef} id="todo-trace-drawer" className="todo-trace-drawer is-open todo-trace-error" aria-label={t('任务轨迹无法显示')}>
-            <FeedbackState kind="error" title={t('任务轨迹无法显示')} onRetry={reset} compact />
+            <Button type="button" variant="text" onClick={reset}>{t('重新加载')}</Button>
             <Button onClick={() => taskDrawer.close(true)}>{t('关闭任务轨迹')}</Button>
           </aside>
         ) : null}
@@ -1171,11 +1231,11 @@ export function WorkspaceScreen({
       <WorkspaceDialogs
         dialog={dialog}
         pending={dialogPending}
-        error={dialogError}
         onConfirm={confirmDialog}
         onCancel={closeDialog}
       />
       <SettingsDialog
+        onToast={pushToast}
         onModelsChanged={retryModelCatalog}
         open={settingsOpen}
         user={user}

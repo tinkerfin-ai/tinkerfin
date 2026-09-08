@@ -39,10 +39,9 @@ interface AuthValidationErrors {
 interface AuthScreenProps {
   onLogin: (credentials: Credentials) => Promise<void> | void
   pending?: boolean
-  error?: string
 }
 
-export function AuthScreen({ onLogin, pending = false, error }: AuthScreenProps) {
+export function AuthScreen({ onLogin, pending = false }: AuthScreenProps) {
   const { t } = useI18n()
   const rootRef = useRef<HTMLElement>(null)
   const [username, setUsername] = useState('')
@@ -216,8 +215,6 @@ export function AuthScreen({ onLogin, pending = false, error }: AuthScreenProps)
               <h2>{t('欢迎回来')}</h2>
               <p>{t('登录后继续与你的智能体团队协作')}</p>
             </header>
-
-            {error && <p className="auth-form-error" role="alert">{error}</p>}
 
             <ValidatedForm className="auth-form" errors={validationErrors} validationAttempt={validationAttempt} onSubmit={submitLogin}>
               <TextField

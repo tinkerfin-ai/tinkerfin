@@ -1122,131 +1122,57 @@ test('侧栏切换控件共享纵向锚点且 tooltip 避开相邻操作区', as
   expect(overflow).toBeLessThanOrEqual(0)
 })
 
-test('全局 Toast 与可恢复错误严格等宽并统一错误标记和图标式恢复', async ({ page }) => {
+test('操作与读取异常只显示一条全局 Toast，并保留独立恢复入口', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 })
   await mockStudio(page, { pinError: true })
 
   await page.getByRole('button', { name: '管理会话：浏览器会话' }).click()
   await page.getByRole('button', { name: '置顶', exact: true }).click()
-  const toast = page.locator('.toast-card').filter({ hasText: '置顶状态更新失败，请重试' })
-  await expect(toast).toBeVisible()
-  await expect(toast).toHaveCSS('transform', 'none')
-  await toast.hover()
+  const notifications = page.getByRole('list', { name: '系统提示' })
+  await expect(notifications.getByRole('alert')).toHaveText('置顶状态更新失败，请重试')
+  await expect(page.getByText('置顶状态更新失败，请重试', { exact: true })).toHaveCount(1)
+  await notifications.getByRole('button', { name: '关闭提示：置顶状态更新失败，请重试' }).click()
+  await expect(page.getByRole('alert')).toHaveCount(0)
   await page.getByRole('tab', { name: '链路' }).click()
 
-  const feedback = page.locator('.ui-feedback-state[role="alert"]')
-  await expect(feedback).toContainText('链路加载失败')
-  const retry = feedback.getByRole('button', { name: '重试' })
-  const geometry = await page.evaluate(() => {
-    const toastCard = document.querySelector<HTMLElement>('.toast-card')!
-    const feedbackState = document.querySelector<HTMLElement>('.ui-feedback-state[role="alert"]')!
-    const retryButton = feedbackState.querySelector<HTMLElement>('button[aria-label="重试"]')!
-    const toastText = toastCard.querySelector<HTMLElement>('p')!
-    const feedbackTitle = feedbackState.querySelector<HTMLElement>('.ui-feedback-state__title')!
-    const toastIcon = toastCard.querySelector<HTMLElement>('.ui-feedback-icon')!
-    const toastCloseIcon = toastCard.querySelector<SVGElement>('button svg')!
-    const feedbackIcon = feedbackState.querySelector<HTMLElement>('.ui-feedback-icon')!
-    const feedbackRetryIcon = feedbackState.querySelector<SVGElement>('button svg')!
-    const toastMark = toastCard.querySelector<HTMLElement>('.ui-feedback-icon__mark')!
-    const feedbackMark = feedbackState.querySelector<HTMLElement>('.ui-feedback-icon__mark')!
-    const retryStyle = getComputedStyle(retryButton)
-    return {
-      toastWidth: toastCard.getBoundingClientRect().width,
-      toastHeight: toastCard.getBoundingClientRect().height,
-      feedbackWidth: feedbackState.getBoundingClientRect().width,
-      feedbackHeight: feedbackState.getBoundingClientRect().height,
-      retryWidth: retryButton.getBoundingClientRect().width,
-      retryHeight: retryButton.getBoundingClientRect().height,
-      retryBorder: retryStyle.borderTopWidth,
-      retryBackground: retryStyle.backgroundColor,
-      retryShadow: retryStyle.boxShadow,
-      toastMark: toastMark.textContent,
-      feedbackMark: feedbackMark.textContent,
-      toastCircle: Boolean(toastCard.querySelector('.ui-feedback-icon circle')),
-      feedbackCircle: Boolean(feedbackState.querySelector('.ui-feedback-icon circle')),
-      toastTextCenterOffset: Math.abs(
-        toastText.getBoundingClientRect().x
-          + toastText.getBoundingClientRect().width / 2
-          - (toastCard.getBoundingClientRect().x + toastCard.getBoundingClientRect().width / 2),
-      ),
-      feedbackTitleCenterOffset: Math.abs(
-        feedbackTitle.getBoundingClientRect().x
-          + feedbackTitle.getBoundingClientRect().width / 2
-          - (feedbackState.getBoundingClientRect().x + feedbackState.getBoundingClientRect().width / 2),
-      ),
-      toastLeftVisualInset: toastIcon.getBoundingClientRect().x
-        - toastCard.getBoundingClientRect().x,
-      toastRightVisualInset: toastCard.getBoundingClientRect().right
-        - toastCloseIcon.getBoundingClientRect().right,
-      feedbackLeftVisualInset: feedbackIcon.getBoundingClientRect().x
-        - feedbackState.getBoundingClientRect().x,
-      feedbackRightVisualInset: feedbackState.getBoundingClientRect().right
-        - feedbackRetryIcon.getBoundingClientRect().right,
-    }
-  })
-  expect(geometry).toEqual({
-    toastWidth: 288,
-    toastHeight: 48,
-    feedbackWidth: 288,
-    feedbackHeight: 48,
-    retryWidth: 44,
-    retryHeight: 44,
-    retryBorder: '0px',
-    retryBackground: 'rgba(0, 0, 0, 0)',
-    retryShadow: 'none',
-    toastMark: '!',
-    feedbackMark: '!',
-    toastCircle: false,
-    feedbackCircle: false,
-    toastTextCenterOffset: 0,
-    feedbackTitleCenterOffset: 0,
-    toastLeftVisualInset: 15,
-    toastRightVisualInset: 15,
-    feedbackLeftVisualInset: 15,
-    feedbackRightVisualInset: 15,
-  })
-  await expect(retry.locator('.ui-button__label')).toHaveCount(0)
+  const trace = page.getByRole('tabpanel', { name: '链路', exact: true })
+  const retry = trace.getByRole('button', { name: '重新加载', exact: true })
+  await expect(notifications.getByRole('alert')).toHaveText('链路加载失败')
+  await expect(page.getByText('链路加载失败', { exact: true })).toHaveCount(1)
+  await expect(trace.getByRole('alert')).toHaveCount(0)
+  await expect(retry).toBeEnabled()
+  const toast = page.locator('.toast-card').filter({ hasText: '链路加载失败' })
+  await expect(toast).toHaveCSS('transform', 'none')
   await toast.getByRole('button').focus()
 
   for (const colorScheme of ['light', 'dark'] as const) {
     await page.emulateMedia({ colorScheme })
-    await page.evaluate((theme) => {
-      document.documentElement.dataset.theme = theme
-    }, colorScheme)
+    await page.evaluate((theme) => { document.documentElement.dataset.theme = theme }, colorScheme)
     for (const width of [320, 768, 1024, 1440]) {
       await page.setViewportSize({ width, height: 900 })
-      const responsive = await page.evaluate(() => {
-        const toastCard = document.querySelector<HTMLElement>('.toast-card')!
-        const feedbackState = document.querySelector<HTMLElement>('.ui-feedback-state[role="alert"]')!
-        return {
-          toastWidth: toastCard.getBoundingClientRect().width,
-          toastHeight: toastCard.getBoundingClientRect().height,
-          feedbackWidth: feedbackState.getBoundingClientRect().width,
-          feedbackHeight: feedbackState.getBoundingClientRect().height,
-          overflow: Math.max(
-            document.documentElement.scrollWidth - document.documentElement.clientWidth,
-            document.body.scrollWidth - document.body.clientWidth,
-          ),
-        }
-      })
-      expect(responsive).toEqual({
-        toastWidth: 288,
-        toastHeight: 48,
-        feedbackWidth: 288,
-        feedbackHeight: 48,
-        overflow: 0,
-      })
+      await expect(toast).toBeInViewport()
+      await expect(retry).toBeInViewport()
+      const toastBounds = (await toast.boundingBox())!
+      expect(toastBounds.width).toBe(288)
+      expect(toastBounds.height).toBe(48)
+      expect(await page.evaluate(() => Math.max(
+        document.documentElement.scrollWidth - document.documentElement.clientWidth,
+        document.body.scrollWidth - document.body.clientWidth,
+      ))).toBe(0)
       if (width === 1440 && process.env.TINKERFIN_VISUAL_QA_DIR) {
         await page.screenshot({
-          path: resolve(
-            process.env.TINKERFIN_VISUAL_QA_DIR,
-            `feedback-system-${colorScheme}-1440.png`,
-          ),
+          path: resolve(process.env.TINKERFIN_VISUAL_QA_DIR, `feedback-system-${colorScheme}-1440.png`),
           fullPage: true,
         })
       }
     }
   }
+  await toast.getByRole('button').click()
+  await expect(page.getByRole('alert')).toHaveCount(0)
+  await retry.focus()
+  await retry.press('Enter')
+  await expect(notifications.getByRole('alert')).toHaveText('链路加载失败')
+  await expect(page.getByText('链路加载失败', { exact: true })).toHaveCount(1)
 })
 
 test('首页与会话态使用相同的输入卡片高度', async ({ page }) => {

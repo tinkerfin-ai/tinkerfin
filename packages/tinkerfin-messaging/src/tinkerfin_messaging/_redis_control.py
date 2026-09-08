@@ -281,6 +281,8 @@ class _RunSnapshot:
     observed_microseconds: int
     start_seq: int
     settling: bool
+    publication_closed: bool
+    publication_ready: bool
     cancellable: bool
     recoverable: bool
     owner_token: str
@@ -1127,7 +1129,7 @@ async def _run_snapshot(
         raise _redis_protocol_error(
             "Redis run snapshot has an invalid message boundary"
         )
-    if code != "OK" or len(response) != 32:
+    if code != "OK" or len(response) != 34:
         raise _redis_protocol_error(f"unexpected Redis run snapshot response: {code}")
 
     status_text = self._snapshot_text(response[1], field="status")
@@ -1277,6 +1279,12 @@ async def _run_snapshot(
         observed_microseconds=observed_microseconds,
         start_seq=start_seq,
         settling=settling,
+        publication_ready=_snapshot_boolean(
+            self, response[33], field="publication_ready"
+        ),
+        publication_closed=_snapshot_boolean(
+            self, response[32], field="publication_closed"
+        ),
         cancellable=cancellable,
         recoverable=recoverable,
         owner_token=owner_token,

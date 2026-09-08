@@ -18,6 +18,7 @@ from pydantic import JsonValue
 from tinkerfin import AgentMode, RunIdentity
 from tinkerfin_contracts.media import Attachment
 from tinkerfin_studio.api.errors import BusinessException, ConversationErrorCode
+from tinkerfin_studio.conversation.models import TitleGenerationStatus, TitleSource
 from tinkerfin_studio.conversation.request import ChatRequest
 
 
@@ -80,7 +81,7 @@ def classify_intent(request: ChatRequest) -> ChatIntent:
     submission = request.user_input
     return StartChatIntent(
         attachments=submission.attachments,
-        title=submission.text.strip()[:60] or "附件提问",
+        title=submission.text.strip()[:16] or "附件提问",
     )
 
 
@@ -131,12 +132,22 @@ def decorate_main_event(
     *,
     prepared: PreparedRunRequest,
     title: str,
+    title_source: TitleSource = "default",
+    title_generation_status: TitleGenerationStatus = "idle",
+    title_seq: int = 0,
 ) -> BaseEvent:
     """只补充 Studio 产品标题和取消文案"""
 
     run_id = prepared.identity.run_id
     if isinstance(event, RunStartedEvent) and event.run_id == run_id:
-        return event.model_copy(update={"title": title})
+        return event.model_copy(
+            update={
+                "title": title,
+                "titleSource": title_source,
+                "titleGenerationStatus": title_generation_status,
+                "titleSeq": title_seq,
+            }
+        )
     if isinstance(event, RunErrorEvent):
         raw_event = event.raw_event
         if not isinstance(raw_event, dict):

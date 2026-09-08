@@ -2,184 +2,101 @@
 
 set -Eeuo pipefail
 
-readonly MINIMUM_COMPOSE_VERSION="2.24.0"
-DEPLOY_STARTED_AT=$SECONDS
-CURRENT_STAGE="初始化"
-CURRENT_COMMAND=""
-EXTERNAL_MODE=0
-
-fail() {
-    printf '✗ %s\n' "$*" >&2
-    return 1
-}
-
-handle_error() {
-    local exit_code=$?
-    trap - ERR
-    printf '\n✗ 部署失败\n  阶段：%s\n' "$CURRENT_STAGE" >&2
-    if [[ -n "$CURRENT_COMMAND" ]]; then
-        printf '  命令：%s\n' "$CURRENT_COMMAND" >&2
-    fi
-    printf '  退出码：%d\n' "$exit_code" >&2
-    exit "$exit_code"
-}
-
-handle_interrupt() {
-    trap - INT TERM
-    printf '\n⚠ 部署已取消\n' >&2
-    exit 130
-}
-
-run_stage() {
-    local title=$1
-    local started_at=$SECONDS
-    shift
-    CURRENT_STAGE=$title
-    printf -v CURRENT_COMMAND '%q ' "$@"
-    CURRENT_COMMAND=${CURRENT_COMMAND% }
-    printf '\n[%s]\n  $ %s\n' "$title" "$CURRENT_COMMAND"
-    "$@"
-    printf '✓ %s完成（%ds）\n' "$title" "$((SECONDS - started_at))"
-}
-
-usage() {
-    cat <<EOF
-Usage: $0 [--external] [--env-file FILE]
-
-Options:
-  --external       只启动 Studio，连接外部 MySQL、Redis 和 OpenSandbox
-  --env-file FILE  指定部署环境文件
-  -h, --help       显示帮助
-EOF
-}
-
-version_at_least() {
-    local actual=$1
-    local required=$2
-    awk -v actual="$actual" -v required="$required" 'BEGIN {
-        split(actual, a, "."); split(required, r, ".")
-        for (i = 1; i <= 3; i++) {
-            if ((a[i] + 0) > (r[i] + 0)) exit 0
-            if ((a[i] + 0) < (r[i] + 0)) exit 1
-        }
-        exit 0
-    }'
-}
-
-compose() {
-    local -a command=(
-        docker compose
-        --env-file "$ENV_FILE"
-        -f "$COMPOSE_FILE"
-    )
-    if ((EXTERNAL_MODE == 0)); then
-        command+=(--profile bundled)
-    fi
-    STUDIO_ENV_FILE=$ENV_FILE VERSION=${APP_VERSION:-0.1.0} "${command[@]}" "$@"
-}
-
-build_release_artifacts() {
-    rm -rf -- "$PROJECT_ROOT/dist"
-    mkdir -p "$PROJECT_ROOT/dist"
-    uv lock --check
-    uv export --quiet \
-        --frozen \
-        --package tinkerfin-studio \
-        --no-dev \
-        --no-emit-workspace \
-        --no-header \
-        --format requirements.txt \
-        --output-file "$PROJECT_ROOT/dist/requirements.txt"
-    uv run --no-project --python 3.11 \
-        python "$PROJECT_ROOT/scripts/build_wheels.py" \
-        --out-dir "$PROJECT_ROOT/dist"
-}
-
-app_version_from_wheel() {
-    local wheel
-    wheel=$(find "$PROJECT_ROOT/dist" -maxdepth 1 \
-        -name 'tinkerfin_studio-*.whl' -print -quit)
-    [[ -n "$wheel" ]] || fail "未找到 Studio wheel"
-    basename "$wheel" | sed -E 's/^tinkerfin_studio-//; s/-py3-none-any\.whl$//'
-}
-
-validate_environment() {
-    local required
-    local compose_version
-    command -v docker >/dev/null 2>&1 || fail "未找到 Docker"
-    command -v uv >/dev/null 2>&1 || fail "未找到 uv"
-    docker info >/dev/null
-    compose_version=$(docker compose version --short)
-    version_at_least "$compose_version" "$MINIMUM_COMPOSE_VERSION" \
-        || fail "Docker Compose 至少需要 ${MINIMUM_COMPOSE_VERSION}，当前为 ${compose_version}"
-    for required in \
-        "$PROJECT_ROOT/pyproject.toml" \
-        "$PROJECT_ROOT/uv.lock" \
-        "$PROJECT_ROOT/scripts/build_wheels.py" \
-        "$PROJECT_ROOT/apps/studio/server/Dockerfile" \
-        "$PROJECT_ROOT/apps/studio/server/database/mysql/schema.sql" \
-        "$COMPOSE_FILE" \
-        "$ENV_FILE" \
-        "$SCRIPT_DIR/secrets/database_url" \
-        "$SCRIPT_DIR/secrets/mysql_password" \
-        "$SCRIPT_DIR/secrets/mysql_root_password" \
-        "$SCRIPT_DIR/secrets/redis_control_password" \
-        "$SCRIPT_DIR/secrets/redis_runtime_password" \
-        "$SCRIPT_DIR/secrets/opensandbox_api_key"; do
-        [[ -f "$required" ]] || fail "缺少部署文件：$required"
-    done
-    compose config --quiet
-}
-
-deploy_wait_timeout() {
-    local value
-    value=$(awk -F '=' '$1 == "DEPLOY_WAIT_TIMEOUT" { print $2; exit }' "$ENV_FILE")
-    printf '%s\n' "${value:-180}"
-}
-
-trap handle_error ERR
-trap handle_interrupt INT TERM
-
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/../../../.." && pwd)"
-COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yaml"
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="$SCRIPT_DIR/.env"
+BUILD=0
+EXTERNAL=0
+STARTED=0
 
+fail() { printf '部署失败：%s\n' "$*" >&2; exit 1; }
+usage() {
+    printf '用法：%s [--build] [--external] [--env-file FILE]\n' "$0"
+    printf '  --build       从当前仓库源码构建后端镜像\n'
+    printf '  --external    只启动后端，使用配置中的外部依赖\n'
+    printf '  --env-file    使用指定的环境文件及其相邻 secrets 目录\n'
+}
 while (($#)); do
     case "$1" in
-        --external)
-            EXTERNAL_MODE=1
-            shift
-            ;;
-        --env-file)
-            [[ $# -ge 2 ]] || fail "--env-file 需要文件路径"
-            ENV_FILE=$2
-            shift 2
-            ;;
-        -h|--help)
-            usage
-            exit 0
-            ;;
-        *)
-            fail "未知参数：$1"
-            ;;
+        --build) BUILD=1; shift ;;
+        --external) EXTERNAL=1; shift ;;
+        --env-file) [[ $# -ge 2 ]] || fail "--env-file 需要路径"; ENV_FILE=$2; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) fail "未知参数：$1" ;;
     esac
 done
+[[ $ENV_FILE = /* ]] || ENV_FILE="$PWD/$ENV_FILE"
+export STUDIO_ENV_FILE="$ENV_FILE"
+export SECRETS_DIR="$(dirname -- "$ENV_FILE")/secrets"
+if ((EXTERNAL)); then
+    [[ -f "$ENV_FILE" ]] || fail "请先执行 setup.sh，并配置外部依赖地址和密码"
+    export COMPOSE_PROFILES=""
+fi
 
-readonly SCRIPT_DIR PROJECT_ROOT COMPOSE_FILE ENV_FILE EXTERNAL_MODE
-cd "$PROJECT_ROOT"
+compose() {
+    docker compose --env-file "$ENV_FILE" -f "$SCRIPT_DIR/docker-compose.yaml" "$@"
+}
+handle_error() {
+    local code=$?
+    trap - ERR
+    printf '\n部署失败（退出码 %s）\n' "$code" >&2
+    if ((STARTED)); then
+        compose ps || true
+        compose logs --no-color --tail 60 server || true
+    fi
+    exit "$code"
+}
+trap handle_error ERR
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-run_stage "校验部署环境" validate_environment
-run_stage "构建发布产物" build_release_artifacts
-APP_VERSION=$(app_version_from_wheel)
-readonly APP_VERSION
-run_stage "构建生产镜像" compose build --pull studio
-WAIT_TIMEOUT=$(deploy_wait_timeout)
-readonly WAIT_TIMEOUT
-run_stage "启动并等待后端" compose up -d --remove-orphans --wait \
-    --wait-timeout "$WAIT_TIMEOUT"
+command -v docker >/dev/null 2>&1 || fail "请先安装 Docker 和 Docker Compose"
+docker info >/dev/null
+version=$(docker compose version --short)
+awk -v version="$version" 'BEGIN {
+    sub(/^v/, "", version); split(version, n, ".");
+    exit !((n[1]+0)>2 || ((n[1]+0)==2 && (n[2]+0)>=24))
+}' || fail "Docker Compose 至少需要 2.24，当前为 $version"
 
-CURRENT_STAGE="完成"
-CURRENT_COMMAND=""
-printf '\n🚀 Studio 后端部署完成，版本 %s（总耗时 %ds）\n' \
-    "$APP_VERSION" "$((SECONDS - DEPLOY_STARTED_AT))"
+"$SCRIPT_DIR/setup.sh" "$ENV_FILE"
+compose config --quiet
+configuration=$(compose config --environment)
+image=ghcr.io/tinkerfin-ai/studio-server:0.1.0
+bind_address=127.0.0.1
+port=8090
+wait_timeout=600
+while IFS='=' read -r key value; do
+    case "$key" in
+        STUDIO_IMAGE) image=$value ;;
+        STUDIO_BIND_ADDRESS) bind_address=$value ;;
+        STUDIO_PORT) port=$value ;;
+        DEPLOY_WAIT_TIMEOUT) wait_timeout=$value ;;
+    esac
+done <<< "$configuration"
+[[ "$wait_timeout" =~ ^[1-9][0-9]*$ ]] || fail "DEPLOY_WAIT_TIMEOUT 必须是正整数秒数"
+
+if ((BUILD)); then
+    if [[ "$image" == ghcr.io/tinkerfin-ai/studio-server:0.1.0 ]]; then
+        export STUDIO_IMAGE=tinkerfin-studio-server:local
+        image=$STUDIO_IMAGE
+    fi
+    export STUDIO_IMAGE="$image"
+    printf '构建后端镜像：%s\n' "$image"
+    compose build --pull server
+    services=$(compose config --services)
+    dependencies=()
+    while IFS= read -r service; do
+        [[ "$service" == server || -z "$service" ]] || dependencies+=("$service")
+    done <<< "$services"
+    if ((${#dependencies[@]})); then compose pull "${dependencies[@]}"; fi
+else
+    printf '拉取后端与依赖镜像\n'
+    compose pull
+fi
+
+printf '启动服务并等待就绪\n'
+STARTED=1
+compose up -d --force-recreate --no-build --pull never --wait --wait-timeout "$wait_timeout"
+case "$bind_address" in 0.0.0.0|::) bind_address=127.0.0.1 ;; esac
+[[ "$bind_address" != *:* || "$bind_address" == \[*\] ]] || bind_address="[$bind_address]"
+printf '\nStudio 后端已就绪\n镜像：%s\nAPI：http://%s:%s/api\n健康检查：http://%s:%s/health/ready\n' \
+    "$image" "$bind_address" "$port" "$bind_address" "$port"

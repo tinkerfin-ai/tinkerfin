@@ -704,8 +704,7 @@ export function Sidebar({
                       {t('正在加载更多历史会话')}
                     </div>
                   ) : loadMoreError ? (
-                    <div className="history-pagination-status is-error" role="alert">
-                      <span>{loadMoreError}</span>
+                    <div className="history-pagination-status">
                       {onRetryLoadMore && (
                         <Button size="sm" variant="text" onClick={onRetryLoadMore}>
                           {t('重试加载历史')}

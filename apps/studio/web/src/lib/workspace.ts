@@ -112,3 +112,13 @@ export function removeConversation(
     currentThreadId: state.currentThreadId,
   }, currentThreadId)
 }
+
+
+type TitleFields = Pick<Conversation, 'title' | 'titleSource' | 'titleGenerationStatus' | 'titleSeq'>
+
+/** 只有标题自身的提交序号决定覆盖关系，Trace 与 HTTP 响应先后不参与判断 */
+export function mergeConversationTitle(current: TitleFields | undefined, incoming: TitleFields): TitleFields {
+  const value = current?.titleSeq !== undefined && (incoming.titleSeq === undefined || incoming.titleSeq < current.titleSeq)
+    ? current : incoming
+  return { title: value.title, titleSource: value.titleSource, titleGenerationStatus: value.titleGenerationStatus, titleSeq: value.titleSeq }
+}

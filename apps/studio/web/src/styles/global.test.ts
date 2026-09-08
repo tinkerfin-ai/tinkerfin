@@ -333,9 +333,9 @@ describe('前端视觉契约', () => {
     expect(workspaceStyles).not.toMatch(/\.brand-(?:name|plus)|\.empty-brand-name/)
     expect(uiStyles).toMatch(/\.brand-logo\s*\{[^}]*--brand-logo-height:\s*22px;[^}]*height:\s*var\(--brand-logo-height\);[^}]*aspect-ratio:\s*2010 \/ 458;/s)
     expect(uiStyles).toContain('.brand-logo--md { --brand-logo-height: 30px; }')
-    expect(uiStyles).toContain('.brand-logo--lg { --brand-logo-height: 34px; }')
+    expect(uiStyles).toContain('.brand-logo--lg { --brand-logo-height: 42px; }')
     expect(uiStyles).toMatch(/:root\[data-theme='dark'\] \.brand-logo__wordmark\s*\{[^}]*filter:\s*brightness\(0\) invert\(1\);/s)
-    expect(uiStyles).toMatch(/@media \(max-width:\s*440px\)[\s\S]*\.brand-logo--lg\s*\{[^}]*--brand-logo-height:\s*32px;/s)
+    expect(uiStyles).toMatch(/@media \(max-width:\s*440px\)[\s\S]*\.brand-logo--lg\s*\{[^}]*--brand-logo-height:\s*38px;/s)
   })
 
   it('浅色和深色普通文本、辅助文本及状态文本均达到 4.5:1', () => {

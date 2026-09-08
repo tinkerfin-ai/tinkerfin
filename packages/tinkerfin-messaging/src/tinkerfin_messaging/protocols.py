@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Coroutine
 from typing import ClassVar, Protocol, TypeVar, runtime_checkable
 
 from tinkerfin_contracts import RunIdentity
@@ -26,8 +26,8 @@ class MessageSource(Protocol[SourceT_co]):
 
         ...
 
-    async def aclose(self) -> None:
-        """Close the source and settle owned upstream cleanup idempotently."""
+    def aclose(self) -> Coroutine[object, object, None]:
+        """Return coroutine cleanup, including native async-generator close operations."""
 
         ...
 
@@ -119,6 +119,32 @@ class MessageCodec(Protocol[SourceT_contra, ReplayT_co]):
     def decode(self, payload: bytes) -> ReplayT_co:
         """Decode one committed payload into its replay type."""
 
+        ...
+
+
+@runtime_checkable
+class MessagePublicationPolicy(Protocol[SourceT_contra]):
+    """Optional codec rules for external messages and protocol termination.
+
+    Codecs without protocol lifecycle events need not implement this extension.
+    Publications require a live run with at least one committed source message.
+    A terminal source message closes publication in the same durable commit.
+    """
+
+    def validate_publication(
+        self, item: SourceT_contra, *, identity: RunIdentity
+    ) -> None:
+        """Reject external messages that would violate the codec's protocol."""
+        ...
+
+    def starts_publication(
+        self, item: SourceT_contra, *, identity: RunIdentity
+    ) -> bool:
+        """Identify the target run start that permits external publication."""
+        ...
+
+    def ends_publication(self, item: SourceT_contra, *, identity: RunIdentity) -> bool:
+        """Identify the target run's terminal source message, excluding child runs."""
         ...
 
 

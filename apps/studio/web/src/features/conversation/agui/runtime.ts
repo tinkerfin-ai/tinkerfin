@@ -1,3 +1,5 @@
+import { isConversationTitle } from '../../../api/conversation/titles'
+import { mergeConversationTitle } from "../../../lib/workspace"
 import { attachmentInput, isAttachment, messageText, messageAttachments, type Attachment } from '../attachments/content'
 import type {
   AgentMode,
@@ -91,9 +93,10 @@ const setConversationNotice = (
   conversation: Conversation,
   content: string,
   kind: ConversationNotice["kind"],
+  id?: string,
 ): Conversation => ({
   ...conversation,
-  notice: { kind, content },
+  notice: { kind, content, id },
 })
 
 const markInterruptedToolCards = (
@@ -1211,7 +1214,7 @@ export const applyConversationEvent = (
       return {
         ...pending,
         threadId: event.threadId,
-        title: event.title?.trim() || conversation.title,
+        ...(event.title !== undefined ? mergeConversationTitle(conversation, { ...event, title: event.title.trim() || conversation.title }) : {}),
         activeRunId: preservePending ? undefined : event.runId,
         runStatus: preservePending ? "waiting_approval" : "streaming",
         notice: undefined,
@@ -1233,6 +1236,10 @@ export const applyConversationEvent = (
     }
 
     case "CUSTOM": {
+      if (event.name === 'studio.conversation.title.updated') {
+        if (!isConversationTitle(event.value) || event.value.threadId !== conversation.threadId) return conversation
+        return { ...conversation, ...mergeConversationTitle(conversation, event.value) }
+      }
       if (event.name !== 'tinkerfin.message.attachments' || !isJsonObject(event.value)) return conversation
       const messageId = event.value.messageId
       const attachments = event.value.attachments
@@ -1592,7 +1599,7 @@ export const applyConversationEvent = (
         const rawEvent = rawEventOrMain(conversation, event.rawEvent)
         const completedAt = nowIso()
         const errorMessage = conversationErrorMessage(
-          new ConversationError('run_failed', event.message),
+          new ConversationError(event.code === 'runtime_initialization_error' ? 'run_initialization_failed' : 'run_failed', event.message),
           'run_failed',
         )
         const isCancelled = event.code === "cancelled" || event.code === "resume_cancelled"
@@ -1611,6 +1618,7 @@ export const applyConversationEvent = (
               'resume_failed',
             ),
             "error",
+            `${errorRunId}:terminal`,
           )
         }
         // 用户主动停止是正常业务终态，不能把未完成工作渲染成系统故障
@@ -1650,6 +1658,7 @@ export const applyConversationEvent = (
           },
           visibleMessage,
           isCancelled ? "info" : "error",
+          `${errorRunId}:terminal`,
         )
       }
 

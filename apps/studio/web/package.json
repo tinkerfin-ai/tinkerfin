@@ -12,6 +12,7 @@
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "test": "vitest run",
+    "test:proxy": "node --test tests/server/*.test.mjs",
     "test:browser": "playwright test",
     "test:watch": "vitest",
     "preview": "vite preview"

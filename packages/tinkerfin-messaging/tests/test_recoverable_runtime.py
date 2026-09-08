@@ -264,7 +264,7 @@ async def test_ownership_loss_dominates_a_simultaneous_source_open_failure(
         if record.getMessage() == "Messaging producer lease renewal failed"
     )
     fields = vars(record)
-    assert fields["tinkerfin_renewal_phase"] == "source_open"
+    assert fields["tinkerfin_renewal_phase"] == "owner"
     assert fields["tinkerfin_renewal_outcome"] == "backend_exception"
     assert fields["tinkerfin_error_type"] == "BackendOwnershipLost"
 

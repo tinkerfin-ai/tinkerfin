@@ -1,3 +1,4 @@
+import type { ConversationTitleSnapshot } from "./titles"
 import type { AgentMode, JsonObject, JsonValue } from "../../types"
 
 export type { AgentMode }
@@ -121,7 +122,7 @@ export interface RawEventContext {
   toolResultStatus?: "success" | "error"
 }
 
-export interface RunStartedEvent {
+export interface RunStartedEvent extends Partial<Pick<ConversationTitleSnapshot, "titleSource" | "titleGenerationStatus" | "titleSeq">> {
   type: "RUN_STARTED"
   threadId: string
   runId: string

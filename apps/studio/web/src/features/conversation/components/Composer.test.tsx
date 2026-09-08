@@ -3,6 +3,7 @@ import { useState } from 'react'
 import { describe, expect, it, vi } from 'vitest'
 
 import { Composer } from './Composer'
+import type { DraftAttachment } from '../useAttachments'
 
 const composerChromeProps = () => ({
   modelControl: <button type="button">测试模型</button>,
@@ -14,6 +15,63 @@ const composerChromeProps = () => ({
 })
 
 describe('Composer', () => {
+  it.each(['queued', 'uploading', 'error'] as const)('附件为 %s 时禁用发送并阻止 Enter，全部就绪后恢复', (state) => {
+    const onSend = vi.fn()
+    const ready: DraftAttachment = {
+      id: 'ready', name: '已上传.pdf', kind: 'document', size: 3,
+      state: 'ready', progress: 100,
+      attachment: { id: 'stored', name: '已上传.pdf', size_bytes: 3, mime_type: 'application/pdf' },
+    }
+    const pending: DraftAttachment = { ...ready, id: 'pending', name: '待处理.pdf', state, progress: 25, attachment: undefined }
+    const props = {
+      ...composerChromeProps(), value: '保留正文', isRunning: false,
+      onChange: vi.fn(), onSend, onStop: vi.fn(),
+    }
+    const { rerender } = render(<Composer {...props} attachments={[ready, pending]} />)
+    const send = screen.getByRole('button', { name: '发送消息' })
+    const input = screen.getByRole('textbox', { name: '消息输入' })
+    expect(send).toBeDisabled()
+    fireEvent.click(send)
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(onSend).not.toHaveBeenCalled()
+    expect(input).toHaveValue('保留正文')
+    rerender(<Composer {...props} attachments={[ready, { ...pending, state: 'ready', attachment: ready.attachment }]} />)
+    expect(send).toBeEnabled()
+    fireEvent.click(send)
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(onSend).toHaveBeenCalledTimes(2)
+  })
+
+  it('失败卡片显示明确状态，支持重试和移除，移除后可发送正文', () => {
+    const failed: DraftAttachment = {
+      id: 'failed', name: '报告.pdf', kind: 'document', size: 3,
+      state: 'error', progress: 0, error: '网络请求失败，请稍后重试',
+    }
+    const onRetryAttachment = vi.fn()
+    const onRemoveAttachment = vi.fn()
+    const props = {
+      ...composerChromeProps(), value: '保留正文', isRunning: false,
+      onChange: vi.fn(), onSend: vi.fn(), onStop: vi.fn(), onRetryAttachment, onRemoveAttachment,
+    }
+    const { rerender } = render(<Composer {...props} attachments={[failed]} />)
+    const card = screen.getByRole('group', { name: '报告.pdf' })
+    expect(within(card).getByRole('status')).toHaveTextContent('上传失败')
+    expect(within(card).getByRole('status')).toHaveAttribute('title', failed.error)
+    fireEvent.click(within(card).getByRole('button', { name: '重试附件：报告.pdf' }))
+    expect(onRetryAttachment).toHaveBeenCalledWith('failed')
+    rerender(<Composer {...props} attachments={[{ ...failed, state: 'uploading', progress: 42 }]} />)
+    expect(card).toHaveAttribute('aria-busy', 'true')
+    expect(within(card).getByRole('status')).toHaveTextContent('上传中 42%')
+    expect(within(card).queryByText('上传失败')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '发送消息' })).toBeDisabled()
+    rerender(<Composer {...props} attachments={[failed]} />)
+    fireEvent.click(within(card).getByRole('button', { name: '移除附件：报告.pdf' }))
+    expect(onRemoveAttachment).toHaveBeenCalledWith('failed')
+    rerender(<Composer {...props} attachments={[]} />)
+    expect(screen.getByRole('button', { name: '发送消息' })).toBeEnabled()
+    expect(screen.getByRole('textbox', { name: '消息输入' })).toHaveValue('保留正文')
+  })
+
   it('places centered scroll and ordered trace actions in one auxiliary row without an empty fallback', () => {
     const { container, rerender } = render(
       <Composer

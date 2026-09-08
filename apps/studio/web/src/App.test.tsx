@@ -1,5 +1,5 @@
 import { StrictMode, useCallback, useEffect, useState } from 'react'
-import { act, render, screen, waitFor } from '@testing-library/react'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -14,6 +14,7 @@ import { clearAuthSession, saveAuthSession } from './auth/session'
 import { ToastViewport } from './components/ui/ToastViewport'
 import type { ToastItem, ToastKind } from './components/ui/ToastViewport'
 import { WorkspaceScreen } from './features/workspace/WorkspaceScreen'
+import { readActiveRunSessions, writeActiveRunSession } from './features/conversation/stream/activeRunSession'
 import {
   emptyTraceGraph,
   traceGraphNode,
@@ -67,6 +68,9 @@ const MODEL_CATALOG: AgentModelCatalog = {
 const historyItem = (
   overrides: Partial<ConversationHistoryListItem> = {},
 ): ConversationHistoryListItem => ({
+  titleSource: 'default',
+  titleGenerationStatus: 'idle',
+  titleSeq: 0,
   id: 1,
   threadId: THREAD_ID,
   title: 'Trace 会话',
@@ -86,6 +90,9 @@ const historyItem = (
 const traceDetail = (
   overrides: Partial<ConversationHistoryDetail> = {},
 ): ConversationHistoryDetail => ({
+  titleSource: 'default',
+  titleGenerationStatus: 'idle',
+  titleSeq: 0,
   id: 1,
   threadId: THREAD_ID,
   title: 'Trace 会话',
@@ -178,7 +185,7 @@ function installFetch(options: {
       const threadId = decodeURIComponent(history[1] ?? '')
       const detail = details[threadId]
       if (!detail) throw new Error('missing Trace detail for ' + threadId)
-      return jsonResponse(detail)
+      return jsonResponse({ ...detail, taskTrace: url.searchParams.get('includeTaskTrace') === 'false' ? null : detail.taskTrace })
     }
     const traceFollow = url.pathname.match(
       /\/api\/conversation\/([^/]+)\/trace\/graph(\/follow)?$/,
@@ -225,6 +232,87 @@ describe('Studio Trace history integration', () => {
     vi.unstubAllGlobals()
   })
 
+  it('新会话首页不显示会话视图切换', async () => {
+    installFetch({ list: [], details: {} })
+    render(<App />)
+
+    expect(await screen.findByRole('heading', { name: '暂无消息' })).toBeInTheDocument()
+    expect(screen.queryByRole('tablist', { name: '会话视图' })).not.toBeInTheDocument()
+  })
+
+  it.each([false, true])('提交时清空输入，迟到的开始事件保留新草稿（已有会话：%s）', async (existing) => {
+    const user = userEvent.setup()
+    const fetch = installFetch({
+      list: existing ? [historyItem()] : [],
+      details: { [THREAD_ID]: traceDetail() },
+    })
+    const defaultFetch = fetch.getMockImplementation()!
+    let events: ReadableStreamDefaultController<Uint8Array> | undefined
+    let submitted: ChatRequestPayload | undefined
+    fetch.mockImplementation(async (input, init) => {
+      if (String(input).endsWith('/api/conversation/chat')) {
+        submitted = JSON.parse(String(init?.body)) as ChatRequestPayload
+        return new Response(new ReadableStream<Uint8Array>({
+          start(controller) { events = controller },
+        }), { headers: { 'Content-Type': 'text/event-stream' } })
+      }
+      return defaultFetch(input, init)
+    })
+    const { unmount } = render(<App />)
+    try {
+      if (existing) await screen.findByText('来自 Trace 的历史回复')
+      const input = await screen.findByRole('textbox', { name: '消息输入' })
+      await waitFor(() => expect(input).toBeEnabled())
+      await user.type(input, '你好{Enter}')
+      expect(within(screen.getByRole('region', { name: '对话内容' })).getByText('你好')).toBeVisible()
+      expect(input).toHaveValue('')
+      await waitFor(() => expect(submitted).toBeDefined())
+      await user.type(input, '下一条草稿')
+      await act(async () => {
+        const event = { type: 'RUN_STARTED', threadId: THREAD_ID, runId: submitted!.runId }
+        events!.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`))
+      })
+      expect(input).toHaveValue('下一条草稿')
+    } finally {
+      unmount()
+    }
+  })
+
+  it('首帧前浏览器历史导航释放草稿选择权', async () => {
+    const user = userEvent.setup()
+    const fetch = installFetch({ list: [historyItem()], details: { [THREAD_ID]: traceDetail() } })
+    const defaultFetch = fetch.getMockImplementation()!
+    let events: ReadableStreamDefaultController<Uint8Array> | undefined
+    let submitted: ChatRequestPayload | undefined
+    fetch.mockImplementation(async (input, init) => {
+      if (String(input).endsWith('/api/conversation/chat')) {
+        submitted = JSON.parse(String(init?.body)) as ChatRequestPayload
+        return new Response(new ReadableStream<Uint8Array>({ start(controller) { events = controller } }), { headers: { 'Content-Type': 'text/event-stream' } })
+      }
+      return defaultFetch(input, init)
+    })
+    const { unmount } = render(<App />)
+    try {
+      await screen.findByText('来自 Trace 的历史回复')
+      await user.click(screen.getByRole('button', { name: /新会话/ }))
+      const input = screen.getByRole('textbox', { name: '消息输入' })
+      await user.type(input, '新草稿{Enter}')
+      await waitFor(() => expect(submitted).toBeDefined())
+      act(() => {
+        window.history.pushState({}, '', '/?thread=' + THREAD_ID)
+        window.dispatchEvent(new PopStateEvent('popstate'))
+      })
+      await screen.findByText('来自 Trace 的历史回复')
+      await act(async () => {
+        events!.enqueue(new TextEncoder().encode('id: 1\ndata: ' + JSON.stringify({ type: 'RUN_STARTED', threadId: 'late-draft', runId: submitted!.runId }) + '\n\n'))
+      })
+      expect(new URL(window.location.href).searchParams.get('thread')).toBe(THREAD_ID)
+      expect(screen.getByText('来自 Trace 的历史回复')).toBeVisible()
+    } finally {
+      unmount()
+    }
+  })
+
   it('hydrates a selected historical conversation directly from Trace', async () => {
     installFetch({
       list: [historyItem()],
@@ -235,6 +323,148 @@ describe('Studio Trace history integration', () => {
 
     expect(await screen.findByText('来自 Trace 的历史回复')).toBeInTheDocument()
     expect(screen.getByText('Trace 会话')).toBeInTheDocument()
+  })
+
+  it.each([
+    [false, false], [true, false], [false, true], [true, true],
+  ])('服务端拒绝未受理提交时恢复文字但不覆盖新草稿（已有：%s，已编辑：%s）', async (existing, edited) => {
+    const user = userEvent.setup()
+    const fetch = installFetch({
+      list: existing ? [historyItem()] : [], details: { [THREAD_ID]: traceDetail() },
+    })
+    const defaultFetch = fetch.getMockImplementation()!
+    let rejectRequest: ((response: Response) => void) | undefined
+    fetch.mockImplementation(async (input, init) => {
+      if (String(input).endsWith('/api/conversation/chat')) {
+        return new Promise<Response>((resolve) => { rejectRequest = resolve })
+      }
+      return defaultFetch(input, init)
+    })
+    render(<App />)
+    if (existing) await screen.findByText('来自 Trace 的历史回复')
+    const input = await screen.findByRole('textbox', { name: '消息输入' })
+    await waitFor(() => expect(input).toBeEnabled())
+    await user.type(input, '保留这次提交')
+    await user.click(screen.getByRole('button', { name: '发送消息' }))
+    expect(input).toHaveValue('')
+    await waitFor(() => expect(rejectRequest).toBeDefined())
+    if (edited) await user.type(input, '下一条草稿')
+    await act(async () => {
+      rejectRequest!(new Response(JSON.stringify({ code: 422, message: '请求参数无效', data: null }), {
+        status: 422, headers: { 'Content-Type': 'application/json' },
+      }))
+    })
+    await waitFor(() => expect(input).toHaveValue(edited ? '下一条草稿' : '保留这次提交'))
+    expect((readActiveRunSessions()[0] ?? null)).toBeNull()
+    expect(screen.getAllByRole('alert')).toHaveLength(1)
+  })
+
+  it.each([false, true])('offers explicit recovery for an unconfirmed submission without automatically resending (existing: %s)', async (existing) => {
+    const user = userEvent.setup()
+    const details = { [THREAD_ID]: traceDetail() }
+    const submitted: ChatRequestPayload[] = []
+    installFetch({
+      list: existing ? [historyItem()] : [], details,
+      streamStartSeq: existing ? 76 : 1,
+      stream: [
+        { type: 'RUN_STARTED', threadId: THREAD_ID, runId: RUN_ID },
+        { type: 'RUN_FINISHED', threadId: THREAD_ID, runId: RUN_ID, outcome: { type: 'success' } },
+      ],
+      onChat: (payload) => {
+        submitted.push(payload)
+        if (submitted.length === 1) throw new TypeError('connection lost before headers')
+        details[THREAD_ID] = traceDetail({
+          asOfSeq: 6, observedAt: '2026-09-05T00:00:01.000000Z',
+          headRunId: payload.runId, availableHeads: [payload.runId],
+          status: { execution: 'succeeded', headRunId: payload.runId },
+        })
+      },
+    })
+    render(<App />)
+    const input = await screen.findByRole('textbox', { name: '消息输入' })
+    await waitFor(() => expect(input).toBeEnabled())
+    await user.type(input, '请求连接恢复验证')
+    await user.click(screen.getByRole('button', { name: '发送消息' }))
+    const reconnect = await screen.findByRole('button', { name: '恢复连接' })
+    expect(input).toHaveValue('')
+    expect(screen.getByText('连接已中断，尚无法确认任务状态，请恢复连接')).toBeInTheDocument()
+    expect((readActiveRunSessions()[0] ?? null)?.payload.runId).toBe(submitted[0]?.runId)
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 300)) })
+    expect(submitted).toHaveLength(1)
+    await user.click(reconnect)
+    await waitFor(() => expect(submitted).toHaveLength(2))
+    expect(submitted[1]).toEqual(submitted[0])
+    await waitFor(() => expect(screen.queryByRole('button', { name: '恢复连接' })).not.toBeInTheDocument())
+  })
+
+  it('notifies again when an explicit recovery fails after the previous toast was dismissed', async () => {
+    const user = userEvent.setup()
+    let attempts = 0
+    installFetch({ onChat: () => { attempts += 1; throw new TypeError('offline') } })
+    render(<App />)
+    const input = await screen.findByRole('textbox', { name: '消息输入' })
+    await waitFor(() => expect(input).toBeEnabled())
+    await user.type(input, '恢复同一提交')
+    await user.click(screen.getByRole('button', { name: '发送消息' }))
+    const message = '连接已中断，尚无法确认任务状态，请恢复连接'
+    await user.click(await screen.findByRole('button', { name: `关闭提示：${message}` }))
+    await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument())
+    await user.click(screen.getByRole('button', { name: '恢复连接' }))
+    expect(await screen.findByRole('alert', {}, { timeout: 4000 })).toHaveTextContent(message)
+    expect(attempts).toBe(5)
+  })
+
+  it('announces one localized initialization failure across the live event and authoritative history', async () => {
+    const user = userEvent.setup()
+    const details = { [THREAD_ID]: traceDetail() }
+    installFetch({
+      details,
+      stream: [
+        { type: 'RUN_STARTED', threadId: THREAD_ID, runId: RUN_ID },
+        { type: 'RUN_ERROR', code: 'runtime_initialization_error', message: 'Agent run failed' },
+      ],
+      onChat: (payload) => {
+        details[THREAD_ID] = traceDetail({
+          headRunId: payload.runId, availableHeads: [payload.runId],
+          status: { execution: 'failed', headRunId: payload.runId },
+        })
+      },
+    })
+    render(<App />)
+    const input = await screen.findByRole('textbox', { name: '消息输入' })
+    await waitFor(() => expect(input).toBeEnabled())
+    await user.type(input, '初始化验证')
+    await user.click(screen.getByRole('button', { name: '发送消息' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('任务初始化失败，请重试')
+    await waitFor(() => expect((readActiveRunSessions()[0] ?? null)).toBeNull())
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 100)) })
+    expect(screen.getAllByRole('alert')).toHaveLength(1)
+    expect(screen.queryByText('Agent run failed')).not.toBeInTheDocument()
+    expect(screen.queryByText('任务遇到问题')).not.toBeInTheDocument()
+    expect(screen.queryByText('对话运行失败')).not.toBeInTheDocument()
+  })
+
+  it('restores a saved run once and keeps exhausted automatic recovery stopped across page renders', async () => {
+    const user = userEvent.setup()
+    const payload: ChatRequestPayload = {
+      threadId: THREAD_ID, runId: RUN_ID, state: {}, messages: [], tools: [], context: [],
+      forwardedProps: { model: 'main', command: { plan: 'off' } },
+    }
+    writeActiveRunSession({ threadId: THREAD_ID, payload, mode: 'start', lastSeq: 0 })
+    let submitted = 0
+    installFetch({
+      list: [historyItem({ status: 'running' })],
+      details: { [THREAD_ID]: traceDetail({ status: { execution: 'running', headRunId: RUN_ID } }) },
+      onChat: () => { submitted += 1; throw new TypeError('offline') },
+    })
+    render(<App />)
+    const reconnect = await screen.findByRole('button', { name: '恢复连接' }, { timeout: 4000 })
+    expect(submitted).toBe(4)
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 300)) })
+    expect(submitted).toBe(4)
+    expect((readActiveRunSessions()[0] ?? null)?.payload.runId).toBe(RUN_ID)
+    await user.click(reconnect)
+    await waitFor(() => expect(submitted).toBeGreaterThan(4))
   })
 
   it('returns to chat when selecting another conversation from the Trace view', async () => {
@@ -276,6 +506,8 @@ describe('Studio Trace history integration', () => {
 
     expect(await screen.findByText('第二个会话的聊天内容')).toBeVisible()
     expect(screen.getByRole('tab', { name: '对话' })).toHaveAttribute('aria-selected', 'true')
+    await user.click(screen.getByRole('button', { name: /新会话/ }))
+    expect(screen.queryByRole('tablist', { name: '会话视图' })).not.toBeInTheDocument()
   })
 
   it.each(['succeeded', 'failed', 'cancelled', 'abandoned', 'waiting', 'unknown'] as const)(

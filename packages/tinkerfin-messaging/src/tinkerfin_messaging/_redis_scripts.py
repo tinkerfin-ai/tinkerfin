@@ -321,6 +321,8 @@ redis.call('HSET', run_key,
     'run', requested_run,
     'status', 'running',
     'settling', '0',
+    'publication_closed', '0',
+    'publication_ready', '0',
     'start_seq', tostring(latest),
     'end_seq', tostring(latest),
     'owner_token', owner_token,
@@ -369,20 +371,25 @@ local max_thread_messages = tonumber(ARGV[12])
 local max_thread_payload_bytes = tonumber(ARGV[13])
 local max_total_bytes = tonumber(ARGV[14])
 local max_total_records = tonumber(ARGV[15])
+local external = ARGV[16] == '1'
+local closes_publication = ARGV[17] == '1'
+local opens_publication = ARGV[18] == '1'
 local expected_owner = owner_token .. ':' .. fence
 
 if redis.call('HGET', control, 'state') ~= 'active' or redis.call('HGET', control, 'generation') ~= generation then
     return {'STREAM_DELETED'}
 end
-if redis.call('GET', lease_key) ~= expected_owner then
-    return {'OWNERSHIP_LOST'}
-end
-if redis.call('HGET', run_key, 'owner_token') ~= owner_token or redis.call('HGET', run_key, 'fence') ~= fence then
-    return {'OWNERSHIP_LOST'}
-end
 local status = redis.call('HGET', run_key, 'status')
-if status ~= 'running' and status ~= 'cancel_requested' then
-    return {'OWNERSHIP_LOST'}
+if not external then
+    if redis.call('GET', lease_key) ~= expected_owner then
+        return {'OWNERSHIP_LOST'}
+    end
+    if redis.call('HGET', run_key, 'owner_token') ~= owner_token or redis.call('HGET', run_key, 'fence') ~= fence then
+        return {'OWNERSHIP_LOST'}
+    end
+    if status ~= 'running' and status ~= 'cancel_requested' then
+        return {'OWNERSHIP_LOST'}
+    end
 end
 
 local stored_codec = redis.call('HGET', channel_meta, 'codec')
@@ -406,6 +413,23 @@ if existing_signature then
         redis.call('HGET', dedupe, 'created_seconds'),
         redis.call('HGET', dedupe, 'created_microseconds')
     }
+end
+
+-- Observe the producer lease without acquiring or extending it. The same Lua
+-- commit arbitrates publication against protocol terminals and cancellation.
+if external then
+    if status ~= 'running' or redis.call('HGET', run_key, 'settling') ~= '0'
+        or redis.call('HGET', run_key, 'publication_closed') ~= '0' then
+        return {'PUBLICATION_REJECTED', 'run_closed'}
+    end
+    local active_owner = redis.call('HGET', run_key, 'owner_token')
+    local active_fence = redis.call('HGET', run_key, 'fence')
+    if not active_owner or not active_fence or redis.call('GET', lease_key) ~= active_owner .. ':' .. active_fence then
+        return {'PUBLICATION_REJECTED', 'owner_lost'}
+    end
+    if redis.call('HGET', run_key, 'publication_ready') ~= '1' then
+        return {'PUBLICATION_REJECTED', 'run_not_ready'}
+    end
 end
 
 local latest = tonumber(redis.call('HGET', meta, 'seq') or '0')
@@ -459,6 +483,8 @@ redis.call('HSET', dedupe,
     'created_microseconds', created_microseconds)
 redis.call('SADD', key_index, messages, dedupe)
 redis.call('HSET', run_key, 'end_seq', tostring(seq))
+if closes_publication then redis.call('HSET', run_key, 'publication_closed', '1') end
+if opens_publication then redis.call('HSET', run_key, 'publication_ready', '1') end
 if checkpoint_present == '1' then
     redis.call('HSET', run_key,
         'checkpoint_present', '1',
@@ -744,7 +770,9 @@ return {
     redis.call('HGET', channel_meta, 'max_checkpoint_bytes') or '',
     redis.call('HGET', channel_meta, 'max_thread_messages') or '',
     redis.call('HGET', channel_meta, 'max_thread_payload_bytes') or '',
-    redis.call('HGET', channel_meta, 'retention_ms') or ''
+    redis.call('HGET', channel_meta, 'retention_ms') or '',
+    redis.call('HGET', run_key, 'publication_closed') or '',
+    redis.call('HGET', run_key, 'publication_ready') or ''
 }
 """
 

@@ -9,6 +9,8 @@ export async function uploadAttachment(
   const config: ApiAxiosRequestConfig = {
     url: '/api/attachments',
     method: 'POST',
+    // 使用浏览器原生上传进度，在 HTTP/1.1 下也能发送文件并响应取消
+    adapter: 'xhr',
     params: { name: file.name },
     data: file,
     headers: { 'Content-Type': 'application/octet-stream' },

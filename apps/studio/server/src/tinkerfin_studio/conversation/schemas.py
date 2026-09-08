@@ -5,6 +5,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from tinkerfin_studio.conversation.models import TitleGenerationStatus, TitleSource
 from tinkerfin_studio.conversation.todo_groups import TaskTraceSnapshot
 from tinkerfin_tracing import (
     TraceCompleteness,
@@ -27,14 +28,29 @@ PendingInteractionKind = Literal[
 ]
 
 
-class ConversationHistoryListItem(BaseModel):
+class ConversationTitle(BaseModel):
+    """标题更新按独立序号合并，不受聊天流或历史响应先后影响"""
+
+    model_config = ConfigDict(populate_by_name=True, from_attributes=True)
+
+    thread_id: str = Field(alias="threadId")
+    title: str = Field(min_length=1, max_length=32)
+    title_source: TitleSource = Field(default="default", alias="titleSource")
+    title_generation_status: TitleGenerationStatus = Field(
+        default="idle", alias="titleGenerationStatus"
+    )
+    title_seq: int = Field(
+        default=0,
+        ge=0,
+        alias="titleSeq",
+        description="标题及生成状态每次提交递增的序号",
+    )
+
+
+class ConversationHistoryListItem(ConversationTitle):
     """历史列表中的会话摘要"""
 
-    model_config = ConfigDict(populate_by_name=True)
-
     id: int = Field(ge=1)
-    thread_id: str = Field(alias="threadId")
-    title: str
     status: str
     last_run_id: str | None = Field(default=None, alias="lastRunId")
     last_model: str | None = Field(default=None, alias="lastModel")
@@ -74,14 +90,10 @@ class ConversationHistoryGroupConfig(BaseModel):
     )
 
 
-class ConversationHistoryDetail(BaseModel):
+class ConversationHistoryDetail(ConversationTitle):
     """用户归属校验后的固定前缀 Trace 会话视图"""
 
-    model_config = ConfigDict(populate_by_name=True)
-
     id: int = Field(ge=1)
-    thread_id: str = Field(alias="threadId")
-    title: str
     last_model: str | None = Field(default=None, alias="lastModel")
     pinned: bool
     as_of_seq: int = Field(alias="asOfSeq", ge=1)
@@ -155,7 +167,7 @@ class ConversationTraceGraphErrorEvent(BaseModel):
 class ConversationThreadUpdate(BaseModel):
     """重命名或置顶请求"""
 
-    title: str | None = Field(default=None, min_length=1, max_length=255)
+    title: str | None = Field(default=None, min_length=1, max_length=32)
     pinned: bool | None = None
 
 

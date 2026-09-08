@@ -182,7 +182,7 @@ class RedisBackend:
         if not isinstance(transition, MessagingTransition):
             raise TypeError("transition must be a MessagingTransition")
         kind = transition.kind
-        if kind in {"prepare_run", "append_message"}:
+        if kind in {"prepare_run", "append_message", "publish_message"}:
             await _redis_capacity.reclaim_expired(self)
         if kind == "prepare_run":
             codec_id = self._required_transition_text(
@@ -206,7 +206,7 @@ class RedisBackend:
                 checkpoint=prepared.checkpoint,
                 recovered=prepared.recovered,
             )
-        if kind == "append_message":
+        if kind in {"append_message", "publish_message"}:
             reference = self._required_transition_reference(transition)
             message_id = self._required_transition_text(
                 "message_id",
@@ -226,6 +226,9 @@ class RedisBackend:
                 codec=codec_id,
                 payload=payload,
                 checkpoint=transition.checkpoint,
+                external=kind == "publish_message",
+                closes_publication=transition.closes_publication,
+                opens_publication=transition.opens_publication,
             )
             return MessagingTransitionResult(kind=kind, envelope=envelope)
         if kind == "begin_settlement":
@@ -545,6 +548,8 @@ class RedisBackend:
             observed_microseconds=0,
             start_seq=0,
             settling=False,
+            publication_closed=False,
+            publication_ready=False,
             cancellable=False,
             recoverable=False,
             owner_token="",
@@ -964,6 +969,8 @@ class RedisBackend:
             end_sequence=snapshot.end_seq,
             status=snapshot.status,
             settlement_started=snapshot.settling,
+            publication_closed=snapshot.publication_closed,
+            publication_ready=snapshot.publication_ready,
             cancellable=snapshot.cancellable,
             recoverable=snapshot.recoverable,
             producer_token=(
@@ -1135,6 +1142,12 @@ class RedisBackend:
             start_sequence=self._hash_integer(values, "start_seq", default=0),
             end_sequence=self._hash_integer(values, "end_seq", default=0),
             status=status,
+            publication_ready=self._snapshot_boolean(
+                values.get("publication_ready", b""), field="publication_ready"
+            ),
+            publication_closed=self._snapshot_boolean(
+                values.get("publication_closed", b""), field="publication_closed"
+            ),
             settlement_started=self._hash_boolean(
                 values,
                 "settling",

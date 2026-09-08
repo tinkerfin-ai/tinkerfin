@@ -1,7 +1,8 @@
-"""Studio 后端部署入口测试"""
+"""部署配置、初始化及命令行可观察行为"""
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -10,217 +11,388 @@ import subprocess
 import sys
 from pathlib import Path
 
-from scripts.build_wheels import PROJECT_PATHS
+import pytest
+from sqlalchemy.engine import make_url
 
 APP_ROOT = Path(__file__).resolve().parents[1]
 DEPLOY_DIR = APP_ROOT / "deploy"
+PASSWORDS = (
+    "mysql_root_password",
+    "mysql_password",
+    "redis_control_password",
+    "redis_runtime_password",
+    "opensandbox_api_key",
+)
 
 
-def test_deploy_builds_the_complete_workspace_release_set() -> None:
-    """生产镜像必须包含 Studio 导入链需要的全部本地发行包"""
-
-    assert PROJECT_PATHS == (
-        "packages/tinkerfin-contracts",
-        "packages/tinkerfin-native-stream",
-        "packages/tinkerfin-agui-adapter",
-        "packages/tinkerfin",
-        "packages/tinkerfin-messaging",
-        "packages/tinkerfin-tracing",
-        "packages/tinkerfin-sandbox",
-        "packages/tinkerfin-langgraph-mysql",
-        "apps/studio/server",
-    )
-
-
-def test_deploy_calls_shared_build_without_removing_working_tree_artifacts(
-    tmp_path: Path,
-) -> None:
-    """部署通过统一构建入口生成 wheel，并保留工作树中的构建文件"""
-
-    root = tmp_path / "workspace"
+@pytest.fixture
+def deployment(tmp_path):
+    root = tmp_path / "workspace with spaces"
     deploy = root / "apps/studio/server/deploy"
-    deploy.mkdir(parents=True)
-    shutil.copy2(DEPLOY_DIR / "deploy.sh", deploy / "deploy.sh")
-    for filename in (
-        "pyproject.toml",
-        "uv.lock",
-        "apps/studio/server/Dockerfile",
-        "apps/studio/server/database/mysql/schema.sql",
-        "apps/studio/server/deploy/docker-compose.yaml",
-        "apps/studio/server/deploy/.env",
-        "apps/studio/server/deploy/secrets/database_url",
-        "apps/studio/server/deploy/secrets/mysql_password",
-        "apps/studio/server/deploy/secrets/mysql_root_password",
-        "apps/studio/server/deploy/secrets/redis_control_password",
-        "apps/studio/server/deploy/secrets/redis_runtime_password",
-        "apps/studio/server/deploy/secrets/opensandbox_api_key",
-    ):
-        target = root / filename
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.touch()
-    artifacts = (
-        root / "packages/tinkerfin/build/lib/retained.py",
-        root / "packages/tinkerfin/src/tinkerfin.egg-info/retained.txt",
+    shutil.copytree(
+        DEPLOY_DIR, deploy, ignore=shutil.ignore_patterns(".env", "secrets")
     )
-    for artifact in artifacts:
-        artifact.parent.mkdir(parents=True, exist_ok=True)
-        artifact.write_text("caller-owned\n", encoding="utf-8")
-    builder = root / "scripts/build_wheels.py"
-    builder.parent.mkdir()
-    builder.write_text(
-        "from pathlib import Path\n"
-        "import sys\n"
-        "output = Path(sys.argv[sys.argv.index('--out-dir') + 1])\n"
-        "(output / 'tinkerfin_studio-0.1.0-py3-none-any.whl').touch()\n"
-        "Path('build-invoked.txt').write_text(' '.join(sys.argv[1:]))\n",
-        encoding="utf-8",
+    schema = deploy.parent / "database/mysql/schema.sql"
+    schema.parent.mkdir(parents=True)
+    shutil.copyfile(APP_ROOT / "database/mysql/schema.sql", schema)
+    environment = os.environ.copy()
+    for line in (deploy / ".env.example").read_text().splitlines():
+        if "=" in line and not line.startswith("#"):
+            environment.pop(line.split("=", 1)[0], None)
+    for key in ("SECRETS_DIR", "STUDIO_ENV_FILE", "COMPOSE_PROJECT_NAME"):
+        environment.pop(key, None)
+    return root, deploy, environment
+
+
+def setup(deploy, environment):
+    return subprocess.run(
+        ["bash", str(deploy / "setup.sh")],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
     )
-    commands = root / "bin"
+
+
+def configure(deploy, **values):
+    path = deploy / ".env"
+    content = path.read_text()
+    for key, value in values.items():
+        content, count = re.subn(
+            rf"(?m)^{key}=.*$", lambda _: f"{key}={value}", content
+        )
+        assert count == 1
+    path.write_text(content)
+
+
+def compose_config(deploy, environment, *, base=False):
+    command = [
+        "docker",
+        "compose",
+        "--env-file",
+        str(deploy / ".env"),
+        "-f",
+        str(deploy / ("docker-compose-base.yaml" if base else "docker-compose.yaml")),
+        "config",
+        "--format",
+        "json",
+    ]
+    result = subprocess.run(
+        command, env=environment, capture_output=True, text=True, timeout=20, check=True
+    )
+    return json.loads(result.stdout)
+
+
+def fake_docker(tmp_path, environment):
+    """只替代会操作服务的 Docker 命令，配置解析仍使用真实 Compose"""
+    executable = shutil.which("docker")
+    assert executable
+    commands = tmp_path / "commands"
     commands.mkdir()
-    uv = commands / "uv"
-    uv.write_text(
-        '#!/usr/bin/env bash\nset -euo pipefail\ncase "$1" in\n'
-        "  lock|export) exit 0 ;;\n"
-        "  run)\n"
-        "    shift\n"
-        '    while [[ "$1" != python ]]; do shift; done\n'
-        "    shift\n"
-        '    exec "$BUILD_TEST_PYTHON" "$@" ;;\n'
-        "  *) exit 71 ;;\n"
-        "esac\n",
-        encoding="utf-8",
-    )
+    calls = tmp_path / "calls.jsonl"
     docker = commands / "docker"
     docker.write_text(
-        "#!/usr/bin/env bash\n"
-        'if [[ "$*" == "compose version --short" ]]; then echo 2.24.0; fi\n'
-        "exit 0\n",
-        encoding="utf-8",
+        f"#!{sys.executable}\n"
+        + """
+import json, os, subprocess, sys
+from pathlib import Path
+args = sys.argv[1:]
+with Path(os.environ['CALLS']).open('a') as stream:
+    stream.write(json.dumps({'args':args, 'image':os.getenv('STUDIO_IMAGE')}) + '\\n')
+if args[0] == 'info':
+    sys.exit(0)
+if args[0] != 'compose':
+    sys.exit(70)
+if 'config' in args or 'version' in args:
+    sys.exit(subprocess.call([os.environ['REAL_DOCKER'], *args]))
+if os.getenv('FAIL_COMMAND') in args:
+    print('isolated docker failure', file=sys.stderr)
+    sys.exit(42)
+if 'logs' in args:
+    print('isolated service diagnostics')
+"""
     )
-    for command in (uv, docker):
-        command.chmod(0o700)
-    environment = dict(os.environ)
-    environment["PATH"] = str(commands) + os.pathsep + environment["PATH"]
-    environment["BUILD_TEST_PYTHON"] = sys.executable
+    docker.chmod(0o700)
+    return {
+        **environment,
+        "PATH": str(commands) + os.pathsep + environment["PATH"],
+        "REAL_DOCKER": executable,
+        "CALLS": str(calls),
+    }, calls
 
+
+def read_calls(path):
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def test_setup_preserves_credentials_and_restricts_host_directory(deployment):
+    _, deploy, environment = deployment
+    result = setup(deploy, environment)
+    assert result.returncode == 0, result.stderr
+    credentials = {name: (deploy / "secrets" / name).read_bytes() for name in PASSWORDS}
+    assert len(set(credentials.values())) == len(PASSWORDS)
+    for value in credentials.values():
+        assert re.fullmatch(rb"[a-f0-9]{64}\n", value)
+        assert value.decode().strip() not in result.stdout + result.stderr
+    assert stat.S_IMODE((deploy / "secrets").stat().st_mode) == 0o700
+    assert stat.S_IMODE((deploy / ".env").stat().st_mode) == 0o600
+    for path in (deploy / "secrets").iterdir():
+        assert stat.S_IMODE(path.stat().st_mode) == 0o644
+    configure(deploy, STUDIO_PORT="19090")
+    assert setup(deploy, environment).returncode == 0
+    assert "STUDIO_PORT=19090" in (deploy / ".env").read_text()
+    assert all(
+        (deploy / "secrets" / name).read_bytes() == value
+        for name, value in credentials.items()
+    )
+
+
+@pytest.mark.parametrize("missing_directory", [False, True])
+def test_setup_does_not_replace_missing_existing_credentials(
+    deployment, missing_directory
+):
+    _, deploy, environment = deployment
+    assert setup(deploy, environment).returncode == 0
+    secrets = deploy / "secrets"
+    retained = (secrets / "mysql_password").read_bytes()
+    if missing_directory:
+        shutil.rmtree(secrets)
+    else:
+        (secrets / "redis_control_password").unlink()
+    result = setup(deploy, environment)
+    assert result.returncode != 0
+    if missing_directory:
+        assert not secrets.exists()
+    else:
+        assert not (secrets / "redis_control_password").exists()
+        assert (secrets / "mysql_password").read_bytes() == retained
+
+
+def test_mysql_configuration_and_password_changes_update_connection_secret(deployment):
+    _, deploy, environment = deployment
+    assert setup(deploy, environment).returncode == 0
+    configure(
+        deploy,
+        MYSQL_HOST="::1",
+        MYSQL_PORT="3307",
+        MYSQL_DATABASE="example-db",
+        MYSQL_USER='"user name"',
+        MYSQL_PUBLISHED_PORT="23306",
+    )
+    password = "special:@/#% 中文"
+    (deploy / "secrets/mysql_password").write_text(password + "\n")
+    result = setup(deploy, environment)
+    assert result.returncode == 0, result.stderr
+    url = make_url((deploy / "secrets/database_url").read_text().strip())
+    assert (url.host, url.port, url.database, url.username, url.password) == (
+        "::1",
+        3307,
+        "example-db",
+        "user name",
+        password,
+    )
+    mysql = compose_config(deploy, environment)["services"]["mysql"]
+    assert mysql["ports"][0]["published"] == "23306"
+    assert mysql["ports"][0]["target"] == 3306
+    assert mysql["environment"]["MYSQL_DATABASE"] == "example-db"
+    assert password not in result.stdout + result.stderr
+
+
+def test_setup_does_not_execute_environment_values(deployment):
+    root, deploy, environment = deployment
+    assert setup(deploy, environment).returncode == 0
+    marker = root / "executed"
+    configure(deploy, MYSQL_USER=f"$(touch '{marker}')")
+    result = setup(deploy, environment)
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists()
+    assert (
+        make_url((deploy / "secrets/database_url").read_text().strip()).username
+        == f"$(touch '{marker}')"
+    )
+
+
+def test_compose_groups_backend_and_supports_base_and_external_services(deployment):
+    _, deploy, environment = deployment
+    assert setup(deploy, environment).returncode == 0
+    full = compose_config(deploy, environment)
+    dependencies = {"mysql", "redis-control", "redis-runtime", "opensandbox"}
+    assert full["name"] == "tinkerfin-studio"
+    assert set(full["services"]) == dependencies | {"server"}
+    assert (
+        set(compose_config(deploy, environment, base=True)["services"]) == dependencies
+    )
+    external = compose_config(deploy, {**environment, "COMPOSE_PROFILES": ""})
+    assert set(external["services"]) == {"server"}
+    partial = compose_config(
+        deploy,
+        {**environment, "COMPOSE_PROFILES": "redis-control,redis-runtime,opensandbox"},
+    )
+    assert set(partial["services"]) == {
+        "server",
+        "redis-control",
+        "redis-runtime",
+        "opensandbox",
+    }
+    server = full["services"]["server"]
+    assert server["logging"] == {
+        "driver": "local",
+        "options": {"max-size": "50m", "max-file": "3"},
+    }
+    assert all(volume["target"] != "/app/logs" for volume in server["volumes"])
+    assert (
+        full["services"]["mysql"]["environment"]["MYSQL_PASSWORD_FILE"]
+        == "/run/secrets/mysql_password"
+    )
+    assert any(
+        volume["target"] == "/docker-entrypoint-initdb.d/10-studio-business.sql"
+        for volume in full["services"]["mysql"]["volumes"]
+    )
+    assert (
+        full["volumes"]["studio-attachments"]["name"]
+        == "tinkerfin-studio_studio-attachments"
+    )
+    assert any(
+        volume["target"] == "/root/.opensandbox/metadata"
+        for volume in full["services"]["opensandbox"]["volumes"]
+    )
+
+
+@pytest.mark.parametrize("location", ["root", "deploy", "outside", "cdpath"])
+def test_default_deploy_bootstraps_and_pulls_from_any_working_directory(
+    deployment, tmp_path, location
+):
+    root, deploy, environment = deployment
+    environment, calls = fake_docker(tmp_path, environment)
+    outside = tmp_path / "caller directory"
+    outside.mkdir()
+    cwd = {"root": root, "deploy": deploy, "outside": outside, "cdpath": root}[location]
+    script = str(deploy / "deploy.sh")
+    if location == "cdpath":
+        environment["CDPATH"] = str(root)
+        script = "apps/studio/server/deploy/deploy.sh"
     result = subprocess.run(
-        ["bash", str(deploy / "deploy.sh")],
+        ["bash", script],
+        cwd=cwd,
         env=environment,
-        check=False,
         capture_output=True,
         text=True,
         timeout=30,
     )
-
     assert result.returncode == 0, result.stdout + result.stderr
-    assert (root / "build-invoked.txt").read_text() == f"--out-dir {root / 'dist'}"
-    assert all(artifact.read_text() == "caller-owned\n" for artifact in artifacts)
+    operations = read_calls(calls)
+    assert any("pull" in item["args"] for item in operations)
+    assert not any("build" in item["args"] for item in operations)
+    up = next(item["args"] for item in operations if "up" in item["args"])
+    assert all(flag in up for flag in ("--force-recreate", "--no-build", "--wait"))
+    assert up[up.index("--pull") + 1] == "never"
+    assert (deploy / ".env").exists()
+    assert not (cwd / "secrets").exists() if cwd != deploy else True
+    assert "http://127.0.0.1:8090/api" in result.stdout
 
 
-def test_setup_generates_private_file_secrets_without_printing_values(
-    tmp_path: Path,
-) -> None:
-    """初始化脚本必须生成私有文件且不把密钥写到输出"""
-
-    target = tmp_path / "deploy"
-    target.mkdir()
-    shutil.copy2(DEPLOY_DIR / "setup.sh", target / "setup.sh")
-    shutil.copy2(DEPLOY_DIR / ".env.example", target / ".env.example")
-
+@pytest.mark.parametrize(
+    "custom_image",
+    [None, "registry.example/custom:dev", "ghcr.io/tinkerfin-ai/studio-server:custom"],
+)
+def test_source_build_uses_local_or_custom_image_without_pulling_server(
+    deployment, tmp_path, custom_image
+):
+    root, deploy, environment = deployment
+    assert setup(deploy, environment).returncode == 0
+    if custom_image:
+        configure(deploy, STUDIO_IMAGE=custom_image)
+    artifact = root / "dist/caller-owned.whl"
+    artifact.parent.mkdir()
+    artifact.write_text("retained")
+    environment, calls = fake_docker(tmp_path, environment)
     result = subprocess.run(
-        ["sh", str(target / "setup.sh")],
-        check=False,
+        ["bash", str(deploy / "deploy.sh"), "--build"],
+        env=environment,
+        cwd=tmp_path,
         capture_output=True,
         text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    operations = read_calls(calls)
+    build = next(item for item in operations if "build" in item["args"])
+    assert build["image"] == (custom_image or "tinkerfin-studio-server:local")
+    assert build["args"][-1] == "server"
+    for item in operations:
+        if "pull" in item["args"]:
+            assert "server" not in item["args"]
+            assert "mysql" in item["args"]
+    assert artifact.read_text() == "retained"
+
+
+@pytest.mark.parametrize("failure", ["pull", "build", "up"])
+def test_failed_deployment_reports_failure_and_keeps_credentials(
+    deployment, tmp_path, failure
+):
+    _, deploy, environment = deployment
+    assert setup(deploy, environment).returncode == 0
+    expected = (deploy / "secrets/mysql_password").read_bytes()
+    environment, calls = fake_docker(tmp_path, environment)
+    environment["FAIL_COMMAND"] = failure
+    args = ["bash", str(deploy / "deploy.sh")]
+    if failure == "build":
+        args.append("--build")
+    result = subprocess.run(
+        args, env=environment, capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 42
+    assert "已就绪" not in result.stdout
+    assert (deploy / "secrets/mysql_password").read_bytes() == expected
+    operations = read_calls(calls)
+    if failure == "up":
+        assert "isolated service diagnostics" in result.stdout
+    else:
+        assert not any("up" in item["args"] for item in operations)
+
+
+def test_external_deploy_uses_explicit_environment_file_outside_checkout(
+    deployment, tmp_path
+):
+    _, deploy, environment = deployment
+    config = tmp_path / "custom config/.env"
+    result = subprocess.run(
+        ["bash", str(deploy / "setup.sh"), str(config)],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
+    environment, calls = fake_docker(tmp_path, environment)
+    result = subprocess.run(
+        [
+            "bash",
+            str(deploy / "deploy.sh"),
+            "--external",
+            "--env-file",
+            "custom config/.env",
+        ],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not (deploy / ".env").exists()
+    assert all(
+        str(config) in item["args"]
+        for item in read_calls(calls)
+        if item["args"][0] == "compose" and "version" not in item["args"]
     )
 
-    assert result.returncode == 0, result.stderr
-    secret_files = {
-        "mysql_root_password",
-        "mysql_password",
-        "redis_control_password",
-        "redis_runtime_password",
-        "opensandbox_api_key",
-        "database_url",
-    }
-    assert {path.name for path in (target / "secrets").iterdir()} == secret_files
-    for path in (target / "secrets").iterdir():
-        assert path.read_text(encoding="utf-8").strip()
-        assert stat.S_IMODE(path.stat().st_mode) == 0o600
-        assert path.read_text(encoding="utf-8").strip() not in result.stdout
-    assert stat.S_IMODE((target / "secrets").stat().st_mode) == 0o700
 
-
-def test_compose_supports_bundled_and_external_service_sets(tmp_path: Path) -> None:
-    """同一 Compose 必须支持完整后端栈和仅 Studio 两种模式"""
-
-    secrets = tmp_path / "secrets"
-    secrets.mkdir()
-    for name in (
-        "mysql_root_password",
-        "mysql_password",
-        "redis_control_password",
-        "redis_runtime_password",
-        "opensandbox_api_key",
-        "database_url",
-    ):
-        (secrets / name).write_text("test-secret\n", encoding="utf-8")
-    env = os.environ.copy()
-    env["SECRETS_DIR"] = str(secrets)
-    env["STUDIO_ENV_FILE"] = str(DEPLOY_DIR / ".env.example")
-    base = [
-        "docker",
-        "compose",
-        "--env-file",
-        str(DEPLOY_DIR / ".env.example"),
-        "-f",
-        str(DEPLOY_DIR / "docker-compose.yaml"),
-    ]
-
-    bundled = subprocess.run(
-        [*base, "--profile", "bundled", "config", "--services"],
-        env=env,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.splitlines()
-    external = subprocess.run(
-        [*base, "config", "--services"],
-        env=env,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.splitlines()
-
-    assert set(bundled) == {
-        "mysql",
-        "redis-control",
-        "redis-runtime",
-        "opensandbox",
-        "studio",
-    }
-    assert external == ["studio"]
-
-
-def test_bundled_mysql_uses_its_official_one_time_schema_bootstrap() -> None:
-    """内置 MySQL 仅在新数据卷首次启动时导入 Studio 业务 SQL"""
-
-    compose = (DEPLOY_DIR / "docker-compose.yaml").read_text(encoding="utf-8")
-    deploy = (DEPLOY_DIR / "deploy.sh").read_text(encoding="utf-8")
-
-    assert (
-        "../database/mysql/schema.sql:"
-        "/docker-entrypoint-initdb.d/10-studio-business.sql:ro"
-    ) in compose
-    assert "database-init:" not in compose
-    assert "init-database.sh" not in compose
-    assert "prepare_external_database" not in deploy
-
-
-def test_bundled_opensandbox_persists_runtime_expiration_metadata() -> None:
-    """Server 重建后必须保留 Docker runtime 已续期的过期时间"""
-
-    compose = (DEPLOY_DIR / "docker-compose.yaml").read_text(encoding="utf-8")
-
-    assert "opensandbox-metadata:/root/.opensandbox/metadata" in compose
-    assert re.search(r"(?m)^  opensandbox-metadata:\s*$", compose)
+def test_first_setup_can_retry_after_invalid_configuration(deployment):
+    _, deploy, environment = deployment
+    result = setup(deploy, {**environment, "MYSQL_PORT": "0"})
+    assert result.returncode != 0
+    assert not (deploy / ".env").exists()
+    assert not (deploy / "secrets").exists()
+    assert setup(deploy, environment).returncode == 0

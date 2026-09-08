@@ -118,7 +118,7 @@ class DeferredMessageSource(Generic[SourceT]):
         self._active_task: asyncio.Task[object] | None = None
         self._close_task: asyncio.Task[None] | None = None
         self._owner_preflight = on_owner_preflight
-        self._owner_preflight_task: asyncio.Task[None] | None = None
+        self._owner_preflight_task: asyncio.Task[BaseException | None] | None = None
 
     @property
     def messaging_cancel_callback(self) -> CancelCallback[SourceT] | None:
@@ -140,17 +140,49 @@ class DeferredMessageSource(Generic[SourceT]):
         task = self._owner_preflight_task
         if task is None:
 
-            async def invoke() -> None:
-                if callback is not None:
-                    await callback()
-                await self._open()
+            async def invoke() -> BaseException | None:
+                # Return failures as data so shield cancellation cannot log a late
+                # provider error independently of the retained preparation owner.
+                try:
+                    if callback is not None:
+                        await callback()
+                    await self._open()
+                except BaseException as error:  # noqa: BLE001 - re-raised by the owner
+                    return error
+                return None
 
             task = asyncio.create_task(
                 invoke(),
                 name="tinkerfin-messaging-owner-preflight",
             )
             self._owner_preflight_task = task
-        await _join_owned_task(task)
+        try:
+            error = await asyncio.shield(task)
+        except asyncio.CancelledError as cancellation:
+            # Preparation is interruptible. Joining an uncancelled opener here would
+            # prevent the owner from reaching aclose(), which owns the pending binding.
+            if not task.done():
+                task.cancel()
+            try:
+                await _join_owned_task(task)
+            except BaseException as cleanup_error:  # noqa: BLE001 - preserve cancellation
+                if not isinstance(cleanup_error, asyncio.CancelledError):
+                    cancellation.add_note(
+                        "Owner preparation cleanup also failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+            if not task.cancelled():
+                cleanup_error = task.result()
+                if cleanup_error is not None and not isinstance(
+                    cleanup_error, asyncio.CancelledError
+                ):
+                    cancellation.add_note(
+                        "Owner preparation cleanup also failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+            raise cancellation
+        if error is not None:
+            raise error.with_traceback(error.__traceback__)
 
     def __aiter__(self) -> DeferredMessageSource[SourceT]:
         """Claim and return this source's single-use asynchronous iterator."""

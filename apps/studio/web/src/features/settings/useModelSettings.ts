@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
 import { requestJson } from '../../api/shared/http'
-import { useI18n } from '../../i18n'
 import type { JsonObject } from '../../types'
 import { splitModelOptions } from './modelOptions'
 
@@ -46,10 +45,9 @@ function normalizedEndpoint(value: string): string | null {
 
 /** 管理本人模型配置，取消过期读取并串行提交，失败时保留编辑内容 */
 export function useModelSettings(onChanged?: () => void) {
-  const { t } = useI18n()
   const [models, setModels] = useState<ModelSettings[]>([])
   const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string>()
+  const [loadFailed, setLoadFailed] = useState(false)
   const [revision, setRevision] = useState(0)
   const [editing, setEditing] = useState<ModelSettings>()
   const [key, setKey] = useState('')
@@ -69,27 +67,21 @@ export function useModelSettings(onChanged?: () => void) {
     const controller = new AbortController()
     loadRequest.current = controller
     setLoading(true)
-    setError(undefined)
+    setLoadFailed(false)
     void requestJson<ModelSettings[]>('/api/models/configurations', {
       signal: controller.signal,
-      suppressGlobalError: true,
     })
       .then((value) => {
         if (!controller.signal.aborted) setModels(value)
       })
-      .catch((reason) => {
-        if (!controller.signal.aborted)
-          setError(
-            reason instanceof Error
-              ? reason.message
-              : t('模型加载失败，请先重试'),
-          )
+      .catch(() => {
+        if (!controller.signal.aborted) setLoadFailed(true)
       })
       .finally(() => {
         if (!controller.signal.aborted) setLoading(false)
       })
     return () => controller.abort()
-  }, [revision, t])
+  }, [revision])
   const edit = (model: ModelSettings) => {
     setDeleting(undefined)
     setEditing(model)
@@ -98,7 +90,6 @@ export function useModelSettings(onChanged?: () => void) {
     setOptions(split.advanced)
     setImageSize(split.size)
     setImageFormat(split.format)
-    setError(undefined)
   }
   const cancelEdit = () => {
     if (activeRequest.current) return
@@ -107,7 +98,6 @@ export function useModelSettings(onChanged?: () => void) {
     setOptions('{}')
     setImageSize('')
     setImageFormat('')
-    setError(undefined)
   }
   const save = async (generationOptions: JsonObject) => {
     if (!editing || activeRequest.current) return
@@ -115,7 +105,6 @@ export function useModelSettings(onChanged?: () => void) {
     loadRequest.current?.abort()
     activeRequest.current = controller
     setSaving(true)
-    setError(undefined)
     try {
       const model = { ...editing, has_key: undefined }
       await requestJson<null>(
@@ -124,7 +113,6 @@ export function useModelSettings(onChanged?: () => void) {
           method: 'PUT',
           body: { ...model, api_key: key, generation_options: generationOptions },
           signal: controller.signal,
-          suppressGlobalError: true,
         },
       )
       if (controller.signal.aborted) return
@@ -132,11 +120,8 @@ export function useModelSettings(onChanged?: () => void) {
       setKey('')
       setRevision((value) => value + 1)
       onChanged?.()
-    } catch (reason) {
-      if (!controller.signal.aborted)
-        setError(
-          reason instanceof Error ? reason.message : t('保存失败，请重试'),
-        )
+    } catch {
+      // 请求异常由全局提示展示，保留当前草稿或操作入口以便重试
     } finally {
       if (activeRequest.current === controller) activeRequest.current = null
       if (!controller.signal.aborted) setSaving(false)
@@ -148,25 +133,20 @@ export function useModelSettings(onChanged?: () => void) {
     loadRequest.current?.abort()
     activeRequest.current = controller
     setSaving(true)
-    setError(undefined)
     try {
       await requestJson<null>(
         `/api/models/configurations/${encodeURIComponent(modelId)}`,
         {
           method: 'DELETE',
           signal: controller.signal,
-          suppressGlobalError: true,
         },
       )
       if (controller.signal.aborted) return
       setDeleting(undefined)
       setRevision((value) => value + 1)
       onChanged?.()
-    } catch (reason) {
-      if (!controller.signal.aborted)
-        setError(
-          reason instanceof Error ? reason.message : t('删除失败，请重试'),
-        )
+    } catch {
+      // 请求异常由全局提示展示，保留当前草稿或操作入口以便重试
     } finally {
       if (activeRequest.current === controller) activeRequest.current = null
       if (!controller.signal.aborted) setSaving(false)
@@ -178,23 +158,21 @@ export function useModelSettings(onChanged?: () => void) {
     loadRequest.current?.abort()
     activeRequest.current = controller
     setSaving(true)
-    setError(undefined)
     try {
       await requestJson<null>(`/api/models/configurations/${encodeURIComponent(modelId)}/default`, {
-        method: 'PUT', signal: controller.signal, suppressGlobalError: true,
+        method: 'PUT', signal: controller.signal,
       })
       if (controller.signal.aborted) return
       setRevision((value) => value + 1)
       onChanged?.()
-    } catch (reason) {
-      if (!controller.signal.aborted)
-        setError(reason instanceof Error ? reason.message : t('默认模型设置失败，请重试'))
+    } catch {
+      // 请求异常由全局提示展示，保留当前草稿或操作入口以便重试
     } finally {
       if (activeRequest.current === controller) activeRequest.current = null
       if (!controller.signal.aborted) setSaving(false)
     }
   }
-  return { models, loading, error, editing, key, options, saving, deleting,
+  return { models, loading, loadFailed, editing, key, options, saving, deleting,
     setRevision, setEditing, setKey, setOptions, setDeleting, edit, cancelEdit, save, remove, makeDefault,
     imageSize, setImageSize, imageFormat, setImageFormat, canReuseKey }
 }

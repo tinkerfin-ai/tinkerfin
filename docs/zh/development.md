@@ -34,8 +34,8 @@ uv run --no-project --python 3.11 python scripts/build_wheels.py \
 类型标记和包资源。所有选定项目都通过核对后，命令才向输出目录写入 wheel。
 缺少文件、多出文件或内容不同都会导致命令失败。uv 缓存已包含构建依赖时，可添加 `--offline`。
 
-本地构建、CI 执行的打包测试和 Studio 部署脚本都调用此入口。
-部署脚本另行准备 `dist/`，并导出锁定的生产依赖。
+本地构建、打包测试和 Studio Dockerfile 都调用此入口。
+Dockerfile 在容器内导出锁定的生产依赖并构建 wheel。
 
 ## 验证打包
 

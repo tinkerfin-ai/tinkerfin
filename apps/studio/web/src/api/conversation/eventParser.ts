@@ -1,3 +1,4 @@
+import { isConversationTitle } from "./titles"
 import { isAttachment } from '../../features/conversation/attachments/content'
 import type { JsonObject, JsonValue } from '../../types'
 import type {
@@ -190,7 +191,7 @@ const isConversationAgUiEvent = (value: unknown): value is ConversationAgUiEvent
       return typeof value.threadId === 'string'
         && typeof value.runId === 'string'
         && hasOptionalString(value, 'parentRunId')
-        && hasOptionalString(value, 'title')
+        && (value.title === undefined || isConversationTitle(value))
         && hasOptionalRawEvent(value)
         && value.input === undefined
 
@@ -253,6 +254,7 @@ const isConversationAgUiEvent = (value: unknown): value is ConversationAgUiEvent
         && typeof value.role === 'string'
 
     case 'CUSTOM':
+      if (value.name === 'studio.conversation.title.updated') return hasOptionalRawEvent(value) && isConversationTitle(value.value)
       if (value.name === 'tinkerfin.message.attachments') return hasOptionalRawEvent(value) && isRecord(value.value) && typeof value.value.messageId === 'string' && Array.isArray(value.value.attachments) && value.value.attachments.every(isAttachment)
       return hasOptionalRawEvent(value)
         && typeof value.name === 'string'

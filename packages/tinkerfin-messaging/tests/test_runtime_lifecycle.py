@@ -799,7 +799,7 @@ async def test_lease_failure_log_classifies_backend_outcomes(
     assert len(records) == 1
     record = records[0]
     fields = vars(record)
-    assert fields["tinkerfin_renewal_phase"] == "producer"
+    assert fields["tinkerfin_renewal_phase"] == "owner"
     assert fields["tinkerfin_renewal_outcome"] == outcome
     assert fields["tinkerfin_attempt"] == 1
     assert fields["tinkerfin_deadline_elapsed"] is False

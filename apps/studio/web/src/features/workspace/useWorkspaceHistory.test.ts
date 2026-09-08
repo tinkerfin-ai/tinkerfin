@@ -51,6 +51,9 @@ const readyTaskTrace = (suffix: string): ReadyTaskTrace => ({
 const detail = (
   overrides: Partial<ConversationHistoryDetail> = {},
 ): ConversationHistoryDetail => ({
+  titleSource: 'default',
+  titleGenerationStatus: 'idle',
+  titleSeq: 0,
   id: 1,
   threadId: THREAD_ID,
   title: '分页竞态',
@@ -493,7 +496,7 @@ describe('useWorkspaceHistory Trace pagination authority', () => {
     })
   })
 
-  it('keeps conversation hydration failure inline without a duplicate toast', async () => {
+  it('keeps conversation hydration recoverable and emits one toast', async () => {
     const onToast = vi.fn()
     const prepareTaskTraceOwner = vi.fn(async () => undefined)
     historyMocks.detail.mockRejectedValue(new Error('会话恢复失败'))
@@ -507,7 +510,7 @@ describe('useWorkspaceHistory Trace pagination authority', () => {
       threadId: THREAD_ID,
       status: 'failed',
     }))
-    expect(onToast).not.toHaveBeenCalled()
+    expect(onToast).toHaveBeenCalledExactlyOnceWith('error', '会话加载失败，请重试')
   })
 
   it('does not let a retry response replace an owned run started after the request', async () => {
@@ -663,7 +666,7 @@ describe('useWorkspaceHistory Trace pagination authority', () => {
 
     await waitFor(() => expect(result.current.history.taskTraceLoadFailed).toBe(true))
     expect(result.current.workspace.conversations[0]?.taskTrace.phase).toBe('unloaded')
-    expect(onToast).not.toHaveBeenCalled()
+    expect(onToast).toHaveBeenCalledExactlyOnceWith('error', '任务轨迹不可用')
   })
 
   it('does not apply a retry response after a same-batch thread switch', async () => {

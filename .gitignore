@@ -6,9 +6,6 @@
 .env.*
 !.env.example
 /*.sh
-*.toml
-!pyproject.toml
-!apps/studio/server/deploy/opensandbox/config.toml
 .venv/
 /.pnpm-store/
 
@@ -23,10 +20,6 @@ build/
 
 # Runtime data
 *.log
-/logs/
-/uploads/
-/workspace/
-/apps/studio/server/deploy/secrets/
 
 # IDE
 .idea/
@@ -52,6 +45,3 @@ htmlcov/
 **/.mcp.json
 **/AGENTS.md
 **/CLAUDE.md
-
-# Studio local attachment data
-.data/

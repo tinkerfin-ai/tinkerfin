@@ -315,9 +315,10 @@ class _Channel:
         *,
         after: int | None = None,
         on_source_ready=None,
+        on_committed=None,
         on_delivery_not_started=None,
     ):
-        del on_delivery_not_started
+        del on_delivery_not_started, on_committed
         self.after = after
         if on_source_ready is not None:
             await on_source_ready()
@@ -575,3 +576,157 @@ async def test_previous_head_reconcile_releases_the_request_transaction(
 
     assert trace.reconcile_transaction_states == [False]
     assert [chunk async for chunk in prepared.body] == []
+
+
+@pytest.mark.parametrize("ending", ["title", "finish", "disconnect"])
+async def test_title_notification_shares_chat_stream_and_response_lifetime(
+    database,
+    session,
+    attachments,
+    monkeypatch,
+    ending,
+):
+    """真实Messaging与模型HTTP边界覆盖同流标题、结束不等待及断连清理"""
+    import json
+    from collections.abc import AsyncGenerator
+
+    import httpx
+    from ag_ui.core import BaseEvent, RunFinishedEvent, RunStartedEvent
+
+    from tinkerfin_messaging import Messaging
+
+    main_release, model_requested, model_release = (asyncio.Event() for _ in range(3))
+    model_calls = 0
+    source_opens = 0
+
+    class Source:
+        messaging_cancel_waits_for_first_item = True
+
+        def __init__(self, identity: RunIdentity):
+            self.messaging_identity = identity
+            self.iterator = self.events()
+
+        async def events(self) -> AsyncGenerator[BaseEvent, None]:
+            identity = self.messaging_identity
+            yield RunStartedEvent(thread_id=identity.thread_id, run_id=identity.run_id)
+            await main_release.wait()
+            yield RunFinishedEvent(thread_id=identity.thread_id, run_id=identity.run_id)
+
+        def __aiter__(self):
+            return self.iterator
+
+        async def aclose(self):
+            await self.iterator.aclose()
+
+        async def messaging_cancel_callback(self, context):
+            del context
+            identity = self.messaging_identity
+            return [
+                RunFinishedEvent(thread_id=identity.thread_id, run_id=identity.run_id)
+            ]
+
+    async def open_run(self, identity, **kwargs):
+        nonlocal source_opens
+        del self, kwargs
+        source_opens += 1
+        return Source(identity)
+
+    async def model_http(request):
+        nonlocal model_calls
+        del request
+        model_calls += 1
+        model_requested.set()
+        await model_release.wait()
+        payload = {
+            "id": "title",
+            "object": "chat.completion.chunk",
+            "model": "deepseek-chat",
+            "choices": [
+                {"index": 0, "delta": {"content": "任务标题"}, "finish_reason": "stop"}
+            ],
+        }
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content="data: " + json.dumps(payload) + "\n\ndata: [DONE]\n\n",
+        )
+
+    monkeypatch.setattr(TinkerFin, "open_agui_run", open_run)
+    async with (
+        Messaging() as messaging,
+        httpx.AsyncClient(transport=httpx.MockTransport(model_http)) as client,
+    ):
+        resources = cast(
+            ApplicationResources,
+            SimpleNamespace(
+                database=database,
+                attachments=attachments,
+                model_http_client=client,
+                agent_persistence=object(),
+                sandbox_manager=object(),
+                tinkerfin=TinkerFin(),
+                settings=SimpleNamespace(tavily_api_key=None, model_allowed_origins=()),
+                conversation_channel=messaging.channel(name="conversation"),
+                conversation_trace=_TraceCoordinator(),
+            ),
+        )
+        service = ConversationChatService(
+            session,
+            user=UserContext(
+                user_id=1,
+                username="user",
+                display_name="用户",
+                roles=(),
+                disabled=False,
+            ),
+            resources=resources,
+        )
+        prepared = await service.start(_ordinary_request(), last_event_id=None)
+        try:
+            first = await anext(prepared.body)
+            assert b'"type":"RUN_STARTED"' in first
+            await asyncio.wait_for(model_requested.wait(), 2)
+            # 同Run重连只附着原源；新的响应不拥有标题生成任务
+            attached = await service.start(
+                _ordinary_request(thread_id=prepared.thread_id), last_event_id="1"
+            )
+            await attached.body.aclose()
+            assert source_opens == 1 and model_calls == 1
+            if ending == "title":
+                model_release.set()
+                frame = await asyncio.wait_for(anext(prepared.body), 2)
+                assert b'"name":"studio.conversation.title.updated"' in frame
+                assert frame.startswith(b"id: 2\n")
+                value = json.loads(frame.split(b"data: ", 1)[1])["value"]
+                assert value["title"] == "任务标题" and value["titleSeq"] == 2
+                main_release.set()
+                tail = [frame async for frame in prepared.body]
+                assert len(tail) == 1 and b'"type":"RUN_FINISHED"' in tail[0]
+            elif ending == "finish":
+                main_release.set()
+                tail = await asyncio.wait_for(_collect_body(prepared.body), 2)
+                assert len(tail) == 1 and b'"type":"RUN_FINISHED"' in tail[0]
+            else:
+                await asyncio.wait_for(prepared.body.aclose(), 2)
+                assert (
+                    await resources.conversation_channel.get_run_status(
+                        identity=RunIdentity(threadId=prepared.thread_id, runId="run-1")
+                    )
+                    == "running"
+                )
+            async with database.session() as check:
+                thread = await ConversationRepository(check).get_thread(
+                    user_id=1, thread_id=prepared.thread_id
+                )
+                assert thread is not None
+                assert thread.title_generation_status == (
+                    "succeeded" if ending == "title" else "failed"
+                )
+        finally:
+            main_release.set()
+            model_release.set()
+            await prepared.body.aclose()
+
+
+async def _collect_body(body):
+    return [chunk async for chunk in body]

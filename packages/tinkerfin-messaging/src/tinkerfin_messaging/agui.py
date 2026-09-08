@@ -11,6 +11,7 @@ from ag_ui.core import (
     ActivityMessage,
     AssistantMessage,
     BaseEvent,
+    CustomEvent,
     DeveloperMessage,
     Event,
     Message,
@@ -30,6 +31,7 @@ from pydantic import BaseModel, JsonValue, TypeAdapter
 from tinkerfin_contracts import RunIdentity
 
 from ._identity import required_identity
+from .errors import PublicationRejected
 from .protocols import MessageCodec, MessageSource, ProfiledMessageSource, SseRenderer
 from .sources import (
     MessageSourceBinding,
@@ -436,6 +438,33 @@ class AgUiCodec(
     codec_id: ClassVar[str] = "agui.event"
     messaging_source_type: ClassVar[type[BaseEvent]] = BaseEvent
     messaging_replay_type: ClassVar[type[BaseEvent]] = BaseEvent
+
+    def validate_publication(self, item: BaseEvent, *, identity: RunIdentity) -> None:
+        """Allow custom notifications without injecting AG-UI source lifecycles."""
+        if not isinstance(item, CustomEvent):
+            raise PublicationRejected(identity=identity, reason="custom_event_required")
+
+    def starts_publication(self, item: BaseEvent, *, identity: RunIdentity) -> bool:
+        """Open publication only when the main run has started."""
+        return (
+            isinstance(item, RunStartedEvent)
+            and item.thread_id == identity.thread_id
+            and item.run_id == identity.run_id
+        )
+
+    def ends_publication(self, item: BaseEvent, *, identity: RunIdentity) -> bool:
+        """Seal publication at the main terminal defined by AG-UI 0.1.19."""
+        if isinstance(item, RunFinishedEvent):
+            return (
+                item.thread_id == identity.thread_id and item.run_id == identity.run_id
+            )
+        if isinstance(item, RunErrorEvent):
+            raw = item.raw_event
+            source = raw.get("source") if isinstance(raw, dict) else None
+            return not (
+                isinstance(source, dict) and source.get("agentType") == "subagent"
+            )
+        return False
 
     def encode(self, item: BaseEvent) -> bytes:
         """Validate and encode one event with protocol field aliases."""

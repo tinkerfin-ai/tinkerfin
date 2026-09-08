@@ -1,5 +1,3 @@
-import logging
-
 import tinkerfin_studio.__main__ as server_entrypoint
 from tinkerfin_studio.__main__ import parse_args
 
@@ -36,47 +34,40 @@ def test_server_arguments_allow_container_runtime_values() -> None:
     assert options.graceful_shutdown_timeout_seconds == 30
 
 
-def test_main_initializes_logging_before_starting_server(tmp_path, monkeypatch) -> None:
-    """服务入口必须在启动 Uvicorn 前写出进程加载日志"""
+def test_main_keeps_file_logging_in_application_lifespan(tmp_path, monkeypatch) -> None:
+    """父进程只配置控制台，文件日志由服务应用持有"""
+    from tinkerfin_studio.config.settings import load_settings
 
-    root_logger = logging.getLogger()
-    previous_handlers = list(root_logger.handlers)
-    previous_level = root_logger.level
-    for handler in previous_handlers:
-        root_logger.removeHandler(handler)
-
-    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DATABASE_URL", "mysql+asyncmy://studio:secret@db:3306/studio")
+    monkeypatch.setenv("LOG_LEVEL", "INFO")
     monkeypatch.setenv("LOG_FILE_ENABLED", "true")
+    monkeypatch.setenv("LOG_FILE_PATH", str(tmp_path / "logs/studio.log"))
+    settings = load_settings(env_file=None)
+    levels = []
+    monkeypatch.setattr(server_entrypoint, "get_settings", lambda: settings)
+    monkeypatch.setattr(server_entrypoint, "setup_console_logging", levels.append)
     monkeypatch.setattr(
-        server_entrypoint.uvicorn,
-        "run",
-        lambda *_args, **_kwargs: None,
+        server_entrypoint.uvicorn, "run", lambda *_args, **_kwargs: None
     )
-
-    try:
-        server_entrypoint.main(["--no-reload"])
-        for handler in root_logger.handlers:
-            handler.flush()
-    finally:
-        for handler in list(root_logger.handlers):
-            handler.close()
-            root_logger.removeHandler(handler)
-        for handler in previous_handlers:
-            root_logger.addHandler(handler)
-        root_logger.setLevel(previous_level)
-
-    log_file = tmp_path / "logs/tinkerfin-studio.log"
-    assert "服务器已加载" in log_file.read_text(encoding="utf-8")
+    server_entrypoint.main(["--no-reload"])
+    assert levels == ["INFO"]
+    assert not settings.log_file_path.exists()
 
 
 def test_main_applies_bounded_graceful_shutdown(monkeypatch) -> None:
     """服务入口必须让长驻 SSE 在单次关闭信号后进入有界取消"""
 
+    from tinkerfin_studio.config.settings import load_settings
+
+    monkeypatch.setenv("DATABASE_URL", "mysql+asyncmy://studio:secret@db:3306/studio")
+    monkeypatch.setattr(
+        server_entrypoint, "get_settings", lambda: load_settings(env_file=None)
+    )
     captured: dict[str, object] = {}
     monkeypatch.setattr(
         server_entrypoint,
-        "setup_logging",
-        lambda: None,
+        "setup_console_logging",
+        lambda _level: None,
     )
     monkeypatch.setattr(
         server_entrypoint.uvicorn,

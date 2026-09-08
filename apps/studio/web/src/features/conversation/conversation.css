@@ -423,27 +423,6 @@
     line-height: var(--type-meta-line);
   }
 
-  .error-message {
-    display: grid;
-    grid-template-columns: var(--icon-lg) minmax(0, 1fr);
-    gap: var(--space-3);
-    margin: 0 0 var(--space-5);
-    padding: var(--space-4);
-    border: 1px solid color-mix(in srgb, var(--color-danger) 28%, transparent);
-    border-radius: var(--radius-xl);
-    background: var(--color-danger-soft);
-    color: var(--color-danger-text);
-  }
-
-  .error-message strong {
-    display: block;
-    margin-bottom: var(--space-1);
-    font-size: var(--type-meta-size);
-    line-height: var(--type-meta-line);
-  }
-
-  .error-markdown { color: var(--color-text-primary); }
-
   .subagent-card {
     --subagent-avatar-size: var(--icon-sm);
     --subagent-tree-indent: var(--space-6);
@@ -1583,8 +1562,8 @@
     height: var(--control-plan-chip);
   }
 
-  .message-list :is(.error-message, .tool-card, .tool-batch),
-  .message-list :is(.error-message, .tool-card, .tool-batch) * {
+  .message-list :is(.tool-card, .tool-batch),
+  .message-list :is(.tool-card, .tool-batch) * {
     font-weight: var(--weight-regular);
   }
 
@@ -1981,7 +1960,6 @@
 
     .user-message .message-markdown,
     .markdown-code-block,
-    .error-message,
     .tool-detail-card,
     .approval-composer,
     .plan-question-composer,

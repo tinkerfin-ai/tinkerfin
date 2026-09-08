@@ -15,7 +15,9 @@ export interface DraftAttachment {
   reference?: boolean
 }
 
-export function useAttachments() {
+export function useAttachments(onError?: (message: string) => void) {
+  const latestErrorHandler = useRef(onError)
+  latestErrorHandler.current = onError
   const [attachments, setAttachments] = useState<DraftAttachment[]>([])
   const [error, setError] = useState<string>()
   const latest = useRef(attachments)
@@ -65,6 +67,8 @@ export function useAttachments() {
           })
           .catch((reason) => {
             if (!alive.current || controller.signal.aborted) return
+            const message = reason instanceof Error ? reason.message : '上传失败，请重试'
+            latestErrorHandler.current?.(message)
             update(
               latest.current.map((value) =>
                 value.id === item.id
@@ -155,7 +159,7 @@ export function useAttachments() {
       if (item?.attachment && !item.reference)
         void removeDraftAttachment(item.attachment.id).catch(() => {
           if (alive.current && epoch === draftEpoch.current)
-            setError('附件已移出草稿，服务端会清理未发送文件')
+            latestErrorHandler.current?.('附件已移出草稿，服务端会清理未发送文件')
         })
       setError(undefined)
     },

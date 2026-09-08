@@ -1,10 +1,11 @@
 import { type SyntheticEvent, lazy, Suspense, useCallback, useId, useMemo, useRef, useState } from 'react'
 import { ArrowLeft, Check, ChevronDown, Code2, FlaskConical, Image, KeyRound, Link2, MessageSquare, Settings2 } from 'lucide-react'
 import { Button, ErrorBoundary, ListboxPicker, OverlayScrollbar, TextField, ValidatedForm } from '../../components/ui'
-import { isTranslationKey, useI18n, type TranslationKey } from '../../i18n'
+import { useI18n, type TranslationKey } from '../../i18n'
 import { newModel, useModelSettings, type ModelSettings } from './useModelSettings'
 import { combineModelOptions, MAX_MODEL_OPTIONS_BYTES, parseModelOptions, type OptionsIssue } from './modelOptions'
 import { ModelTestPanel } from './ModelTestPanel'
+import type { ToastKind } from '../../components/ui/ToastViewport'
 import { useModelTest, type ModelTestKind } from './useModelTest'
 import { useSettingsDisclosureScroll } from './useSettingsDisclosureScroll'
 import { useModelFormValidation } from './useModelFormValidation'
@@ -35,7 +36,7 @@ function ModelChoice<T extends string>({ label, value, options, onChange, text, 
   </div>
 }
 
-export function ModelSettingsPanel({ onChanged }: { onChanged?: () => void }) {
+export function ModelSettingsPanel({ onChanged, onToast }: { onChanged?: () => void; onToast: (kind: ToastKind, message: string) => void }) {
   const { t } = useI18n()
   const id = useId()
   const scrollViewport = useRef<HTMLDivElement>(null)
@@ -45,9 +46,9 @@ export function ModelSettingsPanel({ onChanged }: { onChanged?: () => void }) {
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const [testOpen, setTestOpen] = useState(false)
   const state = useModelSettings(onChanged)
-  const test = useModelTest()
+  const test = useModelTest(onToast)
   const revealDisclosure = useSettingsDisclosureScroll()
-  const { models, loading, error, editing, key, options, saving, deleting, imageSize, imageFormat, canReuseKey } = state
+  const { models, loading, loadFailed, editing, key, options, saving, deleting, imageSize, imageFormat, canReuseKey } = state
   const validation = useModelFormValidation(editing, key, canReuseKey)
   const parsed = useMemo(() => parseModelOptions(options), [options])
   const merged = parsed.value ? combineModelOptions(parsed.value, imageSize, imageFormat) : null
@@ -88,7 +89,7 @@ export function ModelSettingsPanel({ onChanged }: { onChanged?: () => void }) {
       <Button type="button" variant="primary" size="xs" disabled={loading || saving} onClick={() => startEditing(newModel())}>{t('添加模型')}</Button>
     </div>}
     {editing && <Button type="button" className="settings-models__back" variant="text" leadingIcon={<ArrowLeft size={16} />} disabled={saving} onClick={leaveEditing}>{t('返回模型列表')}</Button>}
-    {error && <div className="settings-models__error-row" role="alert"><span>{isTranslationKey(error) ? t(error) : error}</span>{!editing && <Button type="button" size="xs" disabled={saving} onClick={() => state.setRevision((value) => value + 1)}>{t('重试')}</Button>}</div>}
+    {loadFailed && !editing && <div className="settings-models__error-row"><Button type="button" size="xs" disabled={saving} onClick={() => state.setRevision((value) => value + 1)}>{t('重新加载模型')}</Button></div>}
     {editing ? <>
       <ValidatedForm id={`${id}-form`} errors={validation.errors} validationAttempt={validation.attempt} onSubmit={(event) => { event.preventDefault(); if (validation.validate() && !invalidOptions) { test.invalidate(); void state.save(editing.purpose === 'image' ? merged ?? {} : {}) } }}>
         <fieldset className="settings-models__form" disabled={saving}>
@@ -125,8 +126,7 @@ export function ModelSettingsPanel({ onChanged }: { onChanged?: () => void }) {
               <summary><Code2 size={15} aria-hidden="true" /><span>{t('高级参数')}</span><small>{optionsCount ? t('{count} 项', { count: optionsCount }) : t('可选')}</small>{optionsError && <span className="settings-models__invalid-dot">{t('需要修正')}</span>}</summary>
               <div className="settings-models__advanced-body">
                 <div className="settings-models__editor-toolbar"><span>JSON</span><Button type="button" variant="text" disabled={saving || !parsed.value} onClick={() => state.setOptions(JSON.stringify(parsed.value, null, 2))}>{t('格式化')}</Button></div>
-                {advancedOpen && <ErrorBoundary fallback={() => <>
-                  <p role="alert" className="settings-models__hint">{t('高级编辑器不可用，可继续使用纯文本编辑')}</p>
+                {advancedOpen && <ErrorBoundary onError={() => onToast('error', t('高级编辑器不可用，可继续使用纯文本编辑'))} fallback={() => <>
                   <textarea className="model-options-plain" aria-label={t('高级参数 JSON')} aria-describedby={`${id}-options-help`} aria-invalid={Boolean(optionsError)} value={options} disabled={saving} spellCheck={false} onChange={(event) => { test.invalidate(); state.setOptions(event.target.value) }} />
                 </>}>
                   <Suspense fallback={<p role="status">{t('正在加载编辑器…')}</p>}><ModelOptionsEditor descriptionId={`${id}-options-help`} value={options} onChange={(value) => { test.invalidate(); state.setOptions(value) }} disabled={saving} issues={parsed.issues} issueMessage={issueMessage} /></Suspense>
@@ -146,7 +146,7 @@ export function ModelSettingsPanel({ onChanged }: { onChanged?: () => void }) {
           <ModelTestPanel purpose={editing.purpose} disabled={saving || Boolean(invalidOptions)} {...test} onRun={runTest} onCancel={test.cancel} />
         </details>
       </ValidatedForm>
-    </> : loading ? <p className="settings-models__empty" role="status">{t('加载中')}</p> : models.length === 0 ? <div className="settings-models__empty"><Settings2 size={26} aria-hidden="true" /><p>{t('还没有模型配置，请先添加')}</p></div> : (['chat', 'image'] as const).map((purpose) => {
+    </> : loading ? <p className="settings-models__empty" role="status">{t('加载中')}</p> : loadFailed && models.length === 0 ? null : models.length === 0 ? <div className="settings-models__empty"><Settings2 size={26} aria-hidden="true" /><p>{t('还没有模型配置，请先添加')}</p></div> : (['chat', 'image'] as const).map((purpose) => {
       const group = models.filter((model) => model.purpose === purpose)
       if (!group.length) return null
       return <section className="settings-models__group" key={purpose} aria-label={t(purpose === 'chat' ? '对话模型' : '图片生成')}>

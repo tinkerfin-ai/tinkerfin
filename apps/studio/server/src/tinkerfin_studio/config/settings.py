@@ -24,6 +24,7 @@ from tinkerfin_studio.models.transport import normalize_model_origin
 
 _DEFAULT_ENV_FILE = Path(__file__).resolve().parents[3] / ".env"
 _DEFAULT_ATTACHMENT_DIRECTORY = Path(".data/attachments")
+_DEFAULT_LOG_FILE_PATH = Path("logs/studio.log")
 _SECRET_FILE_TARGETS = {
     "database_url_file": "database_url",
     "redis_control_password_file": "redis_control_password",
@@ -97,7 +98,7 @@ class RedisControlSettings(RedisConnectionSettings):
 
 
 class RedisRuntimeSettings(RedisConnectionSettings):
-    """Checkpointer 与 Messaging 使用的 Redis Runtime 配置"""
+    """checkpointer 与 Messaging 使用的 Redis Runtime 配置"""
 
     checkpoint_database: int = Field(
         ge=0, le=0, description="支持 RediSearch 的 checkpoint 逻辑库"
@@ -131,11 +132,24 @@ class SandboxSettings(BaseModel):
 class Settings(BaseSettings):
     """Studio 服务进程配置"""
 
-    model_config = SettingsConfigDict(
-        env_file=_DEFAULT_ENV_FILE,
-        env_file_encoding="utf-8",
-        extra="ignore",
+    model_config = SettingsConfigDict(extra="ignore")
+
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+    log_file_enabled: bool = False
+    log_file_path: Path = Field(
+        default=_DEFAULT_LOG_FILE_PATH,
+        description="日志文件路径；相对路径以配置文件所在目录为基准",
     )
+    log_file_max_bytes: int = Field(
+        default=50 * 1024 * 1024, ge=1024, description="文件日志滚动阈值，单位为字节"
+    )
+    log_file_backup_count: int = Field(default=3, ge=1)
+
+    @field_validator("log_file_path")
+    @classmethod
+    def resolve_log_file_path(cls, value: Path) -> Path:
+        """固定日志位置，避免启动工作目录改变输出文件"""
+        return (_DEFAULT_ENV_FILE.parent / value).resolve()
 
     attachment_directory: Path = Field(
         default=_DEFAULT_ATTACHMENT_DIRECTORY,
@@ -360,7 +374,7 @@ def get_settings() -> Settings:
 
 
 def load_settings(*, env_file: str | Path | None = _DEFAULT_ENV_FILE) -> Settings:
-    """读取配置，附件相对目录以指定配置文件或应用默认配置目录为基准"""
+    """读取配置，相对路径以指定配置文件或应用默认配置目录为基准"""
 
     values: dict[str, str] = {}
     config_directory = (
@@ -389,4 +403,6 @@ def load_settings(*, env_file: str | Path | None = _DEFAULT_ENV_FILE) -> Setting
         values.get("attachment_directory", str(_DEFAULT_ATTACHMENT_DIRECTORY))
     )
     values["attachment_directory"] = str((config_directory / directory).resolve())
+    log_path = Path(values.get("log_file_path", str(_DEFAULT_LOG_FILE_PATH)))
+    values["log_file_path"] = str((config_directory / log_path).resolve())
     return Settings.model_validate(values)

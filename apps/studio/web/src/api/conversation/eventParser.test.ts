@@ -35,6 +35,9 @@ describe('AG-UI 事件边界解析', () => {
       runId: 'run-1',
       parentRunId: 'run-parent',
       title: '权威标题',
+      titleSource: 'default',
+      titleGenerationStatus: 'idle',
+      titleSeq: 0,
       rawEvent: {
         streamMode: 'tasks',
         runId: 'run-1',

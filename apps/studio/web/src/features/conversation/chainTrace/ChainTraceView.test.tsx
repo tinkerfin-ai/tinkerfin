@@ -371,10 +371,13 @@ describe('ChainTraceView', () => {
 
     empty.unmount()
     const retry = vi.fn()
+    const onError = vi.fn()
     useChainTrace.mockReturnValue({ state: { phase: 'error' }, retry })
-    const failed = render(<ChainTraceView threadId="thread-1" active live={false} />)
+    const failed = render(<ChainTraceView threadId="thread-1" active live={false} onError={onError} />)
     expect(screen.queryByLabelText('链路操作')).not.toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: '重试' }))
+    expect(onError).toHaveBeenCalledExactlyOnceWith('链路加载失败')
+    expect(screen.queryByText('链路加载失败')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '重新加载' }))
     expect(retry).toHaveBeenCalledOnce()
 
     failed.unmount()

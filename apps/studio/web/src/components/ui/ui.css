@@ -1001,7 +1001,7 @@
   }
 
   .brand-logo--md { --brand-logo-height: 30px; }
-  .brand-logo--lg { --brand-logo-height: 34px; }
+  .brand-logo--lg { --brand-logo-height: 42px; }
 
   .brand-logo__mark,
   .brand-logo__wordmark {
@@ -1040,7 +1040,7 @@
   }
 
   @media (max-width: 440px) {
-    .brand-logo--lg { --brand-logo-height: 32px; }
+    .brand-logo--lg { --brand-logo-height: 38px; }
   }
 
   @media (forced-colors: active) {

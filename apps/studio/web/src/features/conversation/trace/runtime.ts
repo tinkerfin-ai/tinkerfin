@@ -1,3 +1,4 @@
+import { mergeConversationTitle } from "../../../lib/workspace"
 import { messageAttachments, messageText, type Attachment } from '../attachments/content'
 import type {
   ConversationHistoryCoreDetail,
@@ -521,7 +522,11 @@ export const restoreConversationFromTrace = (
   }
   if (current && order < 0) {
     if (!options.expandHistory || detail.asOfSeq !== current.asOfSeq
-      || detail.headRunId !== current.headRunId) return options.previous!
+      || detail.headRunId !== current.headRunId) {
+      const previous = options.previous!
+      const title = mergeConversationTitle(previous, detail)
+      return title.titleSeq === previous.titleSeq ? previous : { ...previous, ...title }
+    }
     // 固定前缀的旧分页补充历史实体，运行状态仍使用更新的存储观测
     detail = {
       ...detail,
@@ -559,7 +564,7 @@ export const restoreConversationFromTrace = (
   }
   return {
     threadId: trace.threadId,
-    title: trace.title,
+    ...mergeConversationTitle(options.previous, trace),
     pinned: trace.pinned,
     updatedAt: trace.updatedAt,
     model: trace.lastModel ?? options.model,

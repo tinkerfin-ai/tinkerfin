@@ -4,7 +4,6 @@ from __future__ import annotations
 
 __all__ = [
     "_codec_id",
-    "_open_recoverable_source",
     "_producer_finished",
     "_start_producer",
     "_start_producer_task",
@@ -28,7 +27,12 @@ from ._messaging_boundary import (
 from ._messaging_ledger import PreparedRun
 from .errors import BackendOwnershipLost
 from .models import RecoverableMessage, RecoveryCheckpoint
-from .protocols import MessageCodec, MessageSource, RecoverableSource
+from .protocols import (
+    MessageCodec,
+    MessagePublicationPolicy,
+    MessageSource,
+    RecoverableSource,
+)
 
 if TYPE_CHECKING:
     from .messaging import CommittedCallback, Messaging
@@ -48,7 +52,7 @@ _ProducerFailureStage: TypeAlias = Literal[
     "source_close",
     "tail",
 ]
-_LeaseRenewalPhase: TypeAlias = Literal["producer", "source_open"]
+_LeaseRenewalPhase: TypeAlias = Literal["owner"]
 _LeaseRenewalOutcome: TypeAlias = Literal[
     "backend_exception",
     "ownership_rejected",
@@ -209,10 +213,75 @@ def _log_lease_failure(
     )
 
 
+class _OwnerLease:
+    """Keep one acquired owner alive through preparation, publication and cleanup.
+
+    The preflight owns this supervisor until it synchronously transfers it to the
+    producer. A failure interrupts only the currently protected operation; settlement
+    disarms that interruption and still joins the renewal task. No caller must renew
+    or coordinate a handoff. See test_preparation_lease for the stage invariants.
+    """
+
+    def __init__(self, messaging: Messaging, prepared: PreparedRun) -> None:
+        self.error: BaseException | None = None
+        self._interrupt: Callable[[], None] | None = None
+        self._task: asyncio.Task[None] | None = None
+        interval, timeout = _lease_schedule(messaging)
+        if interval is not None:
+            baseline = asyncio.get_running_loop().time()
+
+            async def renew() -> None:
+                try:
+                    await _renew_lease_forever(
+                        messaging,
+                        prepared=prepared,
+                        phase="owner",
+                        interval=interval,
+                        timeout=timeout,
+                        initial_last_success=baseline,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except BaseException as error:  # noqa: BLE001 - returned to the owner
+                    self.error = error
+                    interrupt = self._interrupt
+                    if interrupt is not None:
+                        interrupt()
+
+            self._task = asyncio.create_task(
+                renew(),
+                name=f"tinkerfin-messaging-lease:{prepared.handle.identity.run_id}",
+            )
+
+    def protect(self, interrupt: Callable[[], None] | None) -> None:
+        """Transfer failure interruption without stopping or restarting renewal."""
+
+        self._interrupt = interrupt
+        if interrupt is not None and self.error is not None:
+            interrupt()
+
+    def check(self) -> None:
+        """Reject publication after a renewal failure, even during handoff."""
+
+        if self.error is not None:
+            raise self.error.with_traceback(self.error.__traceback__)
+
+    async def aclose(self) -> None:
+        """Join the only renewal task after durable or failed settlement."""
+
+        self.protect(None)
+        task = self._task
+        if task is not None:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
 def _start_producer(
     self: Messaging,
     *,
     prepared: PreparedRun,
+    lease: _OwnerLease,
     source: MessageSource[ProducedT],
     codec: MessageCodec[SourceT, ReplayT],
     codec_input: Callable[[ProducedT], SourceT] | None,
@@ -236,6 +305,7 @@ def _start_producer(
 
     return self._start_producer_task(
         prepared=prepared,
+        lease=lease,
         source=source,
         codec=codec,
         cancel=cancel,
@@ -244,71 +314,109 @@ def _start_producer(
     )
 
 
-async def _open_recoverable_source(
-    self: Messaging,
-    *,
-    prepared: PreparedRun,
-    source: RecoverableSource[SourceT],
-) -> MessageSource[RecoverableMessage[SourceT]]:
-    """Keep distributed ownership alive while a source rebuilds its state."""
+@dataclass(frozen=True, slots=True)
+class _SourceOpenOutcome(Generic[SourceT]):
+    source: MessageSource[RecoverableMessage[SourceT]] | None = None
+    error: BaseException | None = None
 
-    interval, timeout = _lease_schedule(self)
-    if interval is None:
+
+async def _open_recoverable_source(
+    messaging: Messaging,
+    source: RecoverableSource[SourceT],
+    prepared: PreparedRun,
+    lease: _OwnerLease,
+) -> MessageSource[RecoverableMessage[SourceT]]:
+    """Join reconstruction and close any late result when ownership is lost.
+
+    Reconstruction has a separate task so simultaneous opening and lease failures
+    both remain observable. Exceptions travel as data because asyncio.shield may log
+    a late child failure after cancellation (Python 3.14). The caller retains renewal
+    throughout reconstruction and cleanup.
+    """
+
+    if lease._task is None:
         return await source.open(prepared.checkpoint)
 
-    renewal_baseline = asyncio.get_running_loop().time()
-    opening = asyncio.create_task(
-        source.open(prepared.checkpoint),
-        name=(f"tinkerfin-messaging-source-open:{prepared.handle.identity.run_id}"),
-    )
+    async def open_source() -> _SourceOpenOutcome[SourceT]:
+        try:
+            return _SourceOpenOutcome(source=await source.open(prepared.checkpoint))
+        except BaseException as error:  # noqa: BLE001 - re-raised by the owner
+            return _SourceOpenOutcome(error=error)
 
-    renewing = asyncio.create_task(
-        _renew_lease_forever(
-            self,
-            prepared=prepared,
-            phase="source_open",
-            interval=interval,
-            timeout=timeout,
-            initial_last_success=renewal_baseline,
-        ),
-        name=(f"tinkerfin-messaging-open-lease:{prepared.handle.identity.run_id}"),
+    opening = asyncio.create_task(
+        open_source(),
+        name=f"tinkerfin-messaging-source-open:{prepared.handle.identity.run_id}",
     )
-    claimed = False
-    try:
-        done, _ = await asyncio.wait(
-            {opening, renewing},
-            return_when=asyncio.FIRST_COMPLETED,
+    # The child owns reconstruction, including its cancellation cleanup. Naming it
+    # temporarily lets an opener close Messaging without waiting on its own preflight.
+    # The parent resumes ownership only after that child settles, before source close
+    # or ready callbacks execute.
+    parent = asyncio.current_task()
+    registration = next(
+        (item for item in messaging._preflight_tasks if item.owner is parent),
+        None,
+    )
+    if registration is not None:
+        messaging._bind_preflight_owner(
+            registration, cast(asyncio.Task[object], opening)
         )
-        if renewing in done:
-            renewal_error = renewing.exception()
-            if renewal_error is not None:
-                if opening.done() and not opening.cancelled():
-                    try:
-                        opening.result()
-                    except BaseException as opening_error:
-                        raise renewal_error from opening_error
-                raise renewal_error
-        opened = opening.result()
+    claimed = False
+    failure: BaseException | None = None
+    try:
+        outcome = await asyncio.shield(opening)
+        if outcome.error is not None:
+            raise outcome.error
+        lease.check()
+        assert outcome.source is not None
         claimed = True
-        return opened
+        return outcome.source
+    except BaseException as error:
+        failure = error
+        if (
+            isinstance(error, asyncio.CancelledError)
+            and lease.error is not None
+            and opening.done()
+            and not opening.cancelled()
+        ):
+            opening_error = opening.result().error
+            if opening_error is not None:
+                failure = opening_error
+                raise opening_error
+        raise
     finally:
+        if not claimed:
+            lease.protect(None)
         if not opening.done():
             opening.cancel()
-        if not renewing.done():
-            renewing.cancel()
-        opening_result, _ = await asyncio.gather(
-            opening,
-            renewing,
-            return_exceptions=True,
-        )
-        if not claimed and not isinstance(opening_result, BaseException):
-            await opening_result.aclose()
+        try:
+            (result,) = await asyncio.gather(opening, return_exceptions=True)
+        finally:
+            if registration is not None:
+                assert parent is not None
+                messaging._bind_preflight_owner(
+                    registration, cast(asyncio.Task[object], parent)
+                )
+        if not claimed and isinstance(result, _SourceOpenOutcome):
+            if result.source is not None:
+                await result.source.aclose()
+            secondary = result.error
+            if (
+                failure is not None
+                and secondary is not None
+                and secondary is not failure
+                and not isinstance(secondary, asyncio.CancelledError)
+            ):
+                failure.add_note(
+                    "Source reconstruction cleanup also failed: "
+                    f"{type(secondary).__name__}: {secondary}"
+                )
 
 
 def _start_recoverable_producer(
     self: Messaging,
     *,
     prepared: PreparedRun,
+    lease: _OwnerLease,
     source: MessageSource[RecoverableMessage[SourceT]],
     codec: MessageCodec[SourceT, ReplayT],
     cancel: _ContextCancelCallback[RecoverableMessage[SourceT]] | None,
@@ -338,6 +446,7 @@ def _start_recoverable_producer(
 
     return self._start_producer_task(
         prepared=prepared,
+        lease=lease,
         source=source,
         codec=codec,
         cancel=cancel,
@@ -350,6 +459,7 @@ def _start_producer_task(
     self: Messaging,
     *,
     prepared: PreparedRun,
+    lease: _OwnerLease,
     source: MessageSource[ProducedT],
     codec: MessageCodec[SourceT, ReplayT],
     cancel: _ContextCancelCallback[ProducedT] | None,
@@ -388,7 +498,6 @@ def _start_producer_task(
         cancel_watcher: asyncio.Task[Iterable[ProducedT] | None] | None = None
         cancel_callback_task: asyncio.Task[Iterable[ProducedT] | None] | None = None
         settlement_task: asyncio.Task[bool] | None = None
-        lease_renewer: asyncio.Task[None] | None = None
         pending_commits: asyncio.Queue[_PendingCommit[ProducedT]] = asyncio.Queue(
             maxsize=1
         )
@@ -396,8 +505,6 @@ def _start_producer_task(
         commit_error: BaseException | None = None
         next_ordinal = 1
         shutdown_requested = False
-        renew_interval, lease_timeout = _lease_schedule(self)
-        renewal_baseline = asyncio.get_running_loop().time()
 
         def retain_secondary_failure(
             *,
@@ -475,6 +582,18 @@ def _start_producer_task(
                             codec=self._codec_id(codec),
                             payload=payload,
                             checkpoint=produced.checkpoint,
+                            opens_publication=(
+                                not isinstance(codec, MessagePublicationPolicy)
+                                or codec.starts_publication(
+                                    produced.data, identity=prepared.handle.identity
+                                )
+                            ),
+                            closes_publication=(
+                                isinstance(codec, MessagePublicationPolicy)
+                                and codec.ends_publication(
+                                    produced.data, identity=prepared.handle.identity
+                                )
+                            ),
                         ),
                     )
                     next_ordinal += 1
@@ -619,29 +738,12 @@ def _start_producer_task(
                 name=(f"tinkerfin-messaging-cancel:{prepared.handle.identity.run_id}"),
             )
 
-        async def observe_lease() -> None:
-            assert renew_interval is not None
-            try:
-                await _renew_lease_forever(
-                    self,
-                    prepared=prepared,
-                    phase="producer",
-                    interval=renew_interval,
-                    timeout=lease_timeout,
-                    initial_last_success=renewal_baseline,
-                )
-            except asyncio.CancelledError:
-                raise
-            except BaseException as renew_error:  # noqa: BLE001 - fence safety
-                state.ownership_lost = True
-                state.ownership_error = renew_error
-                source_consumer.cancel()
+        def ownership_lost() -> None:
+            state.ownership_lost = True
+            state.ownership_error = lease.error
+            source_consumer.cancel()
 
-        if renew_interval is not None:
-            lease_renewer = asyncio.create_task(
-                observe_lease(),
-                name=(f"tinkerfin-messaging-lease:{prepared.handle.identity.run_id}"),
-            )
+        lease.protect(ownership_lost)
         try:
             await asyncio.shield(source_consumer)
             if state.cancel_requested:
@@ -685,6 +787,7 @@ def _start_producer_task(
             except BaseException as settlement_error:  # noqa: BLE001
                 record_failure(stage="settlement", failure=settlement_error)
             state.settling = True
+            lease.protect(None)
             cancel_watcher_settled = False
             cancel_error: BaseException | None = None
             cancel_tail: Iterable[ProducedT] | None = None
@@ -813,10 +916,7 @@ def _start_producer_task(
                         cancel_watcher,
                         return_exceptions=True,
                     )
-                if lease_renewer is not None:
-                    if not lease_renewer.done():
-                        lease_renewer.cancel()
-                    await asyncio.gather(lease_renewer, return_exceptions=True)
+                await lease.aclose()
 
     task = asyncio.create_task(
         produce(),

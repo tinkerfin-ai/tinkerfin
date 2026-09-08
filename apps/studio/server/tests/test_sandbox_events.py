@@ -110,14 +110,15 @@ from tinkerfin_sandbox import (
     OpenSandboxLifecycleEvent, OpenSandboxLifecycleEventType,
     OpenSandboxLifecycleReason,
 )
-from tinkerfin_studio.config.logging import LoggingSettings, setup_logging
-setup_logging(LoggingSettings(
-    level=sys.argv[1], file_enabled=json.loads(sys.argv[2]),
-    file_path=Path('runtime/studio.log'),
-))
-logging.getLogger('studio.host').error('host_before_import')
-from tinkerfin_studio.infrastructure.sandbox_events import SandboxEventLogger
-async def main():
+from tinkerfin_studio.config.logging import setup_logging
+from tinkerfin_studio.config.settings import Settings
+settings = Settings(
+    _env_file=None, database_url="mysql+asyncmy://studio:secret@db:3306/studio",
+    log_level=sys.argv[1], log_file_enabled=json.loads(sys.argv[2]),
+    log_file_path=Path("runtime/studio.log").resolve(),
+)
+async def emit_events():
+    from tinkerfin_studio.infrastructure.sandbox_events import SandboxEventLogger
     observer = SandboxEventLogger()
     for kind in (
         OpenSandboxLifecycleEventType.RECOVERED,
@@ -131,8 +132,12 @@ async def main():
             workspace_may_have_changed=False,
             diagnostic_context={'secret': 'PRIVATE_DIAGNOSTIC'},
         ))
+async def main():
+    async with setup_logging(settings):
+        logging.getLogger('studio.host').error('host_before_import')
+        await emit_events()
+        logging.getLogger('studio.host').error('host_after_import')
 asyncio.run(main())
-logging.getLogger('studio.host').error('host_after_import')
 """
     result = subprocess.run(
         [sys.executable, "-c", program, level, json.dumps(file_enabled)],
@@ -146,7 +151,7 @@ logging.getLogger('studio.host').error('host_after_import')
     assert result.returncode == 0, result.stderr
     outputs = [result.stdout]
     log_file = tmp_path / "runtime/studio.log"
-    if file_enabled and level != "CRITICAL":
+    if file_enabled:
         outputs.append(log_file.read_text())
     else:
         assert not log_file.exists()

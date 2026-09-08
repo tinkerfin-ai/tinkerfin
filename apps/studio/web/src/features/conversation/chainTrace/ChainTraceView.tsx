@@ -377,11 +377,7 @@ function TraceDetails({
               {responseStatus === 'loading' ? (
                 <FeedbackState kind="loading" title={t('正在加载完整响应…')} />
               ) : responseStatus === 'error' ? (
-                <FeedbackState
-                  kind="error"
-                  title={t('完整响应加载失败')}
-                  onRetry={onRetryResponse}
-                />
+                <Button type="button" variant="text" onClick={onRetryResponse}>{t('重新加载')}</Button>
               ) : (
                 <>
                   {responseMessages.map((message) => message.content && (
@@ -477,13 +473,17 @@ export function ChainTraceView({
   active,
   live,
   observedAt,
+  onError,
 }: {
   threadId: string
   active: boolean
   live: boolean
   observedAt?: string
+  onError?: (message: string) => void
 }) {
   const { locale, t } = useI18n()
+  const latestErrorHandler = useRef(onError)
+  latestErrorHandler.current = onError
   const [isSearchOpen, setSearchOpen] = useState(false)
   const [searchInput, setSearchInput] = useState('')
   const [searchQuery, setSearchQuery] = useState('')
@@ -522,6 +522,9 @@ export function ChainTraceView({
     query: searchQuery || undefined,
   }), [searchQuery])
   const trace = useChainTrace({ threadId, active, live, observedAt, filter, limit: 1000 })
+  useEffect(() => {
+    if (trace.state.phase === 'error') latestErrorHandler.current?.(t('链路加载失败'))
+  }, [trace.state.phase, t])
   const page = trace.state.phase === 'ready' ? trace.state.page : undefined
   const graphNodes = useMemo(() => page?.nodes ?? [], [page?.nodes])
   const matchedNodeIds = useMemo(
@@ -614,6 +617,9 @@ export function ChainTraceView({
   const responseStatus = responseQueryEnabled
     ? queriedResponseMatches ? modelResponse.state.phase : 'loading'
     : 'ready'
+  useEffect(() => {
+    if (responseStatus === 'error') latestErrorHandler.current?.(t('完整响应加载失败'))
+  }, [responseStatus, t])
   const responseEntries = responseQueryEnabled
     && queriedResponseMatches
     && modelResponse.state.phase === 'ready'
@@ -821,7 +827,7 @@ export function ChainTraceView({
       )}
       {trace.state.phase === 'error' && (
         <div className="chain-trace-state is-feedback">
-          <FeedbackState kind="error" title={t('链路加载失败')} onRetry={trace.retry} />
+          <Button type="button" variant="text" onClick={trace.retry}>{t('重新加载')}</Button>
         </div>
       )}
       {incomplete && (

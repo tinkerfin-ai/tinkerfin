@@ -47,6 +47,8 @@ type ApiErrorListener = (error: ApiError) => void
 
 const apiErrorListeners = new Set<ApiErrorListener>()
 const finalizedErrors = new WeakSet<ApiError>()
+// 只限制等待响应头；收到响应后，长流继续由调用方的取消信号控制
+const STREAM_RESPONSE_TIMEOUT_MS = 45_000
 
 export class ApiError extends Error {
   code: number
@@ -281,22 +283,33 @@ function buildStreamHeaders(options: RequestOptions, contentType: string | null)
 async function fetchStreamResponse(path: string, options: RequestOptions) {
   const { body, contentType } = normalizeRequestBody(options.body)
   const headers = buildStreamHeaders(options, contentType)
+  const deadline = new AbortController()
+  const signal = options.signal
+    ? AbortSignal.any([options.signal, deadline.signal])
+    : deadline.signal
+  const timer = setTimeout(() => {
+    deadline.abort(new DOMException('等待实时连接响应超时', 'TimeoutError'))
+  }, STREAM_RESPONSE_TIMEOUT_MS)
 
   try {
     const response = await fetch(buildApiUrl(path), {
       method: options.method ?? 'GET',
       headers,
       body,
-      signal: options.signal,
+      signal,
       credentials: options.credentials,
     })
     return { response, authorization: headers.get('Authorization') }
-  } catch (error) {
-    if (error instanceof DOMException && error.name === 'AbortError') throw error
+  } catch {
+    if (options.signal?.aborted) throw options.signal.reason
     throw finalizeError(
-      new ApiError(translateCurrent('网络请求失败，请稍后重试'), { status: 0 }),
-      options,
+      new ApiError(translateCurrent(deadline.signal.aborted
+        ? '等待实时连接响应超时，请恢复连接'
+        : '网络请求失败，请稍后重试'), { status: 0 }),
+      { ...options, authorization: headers.get('Authorization') },
     )
+  } finally {
+    clearTimeout(timer)
   }
 }
 

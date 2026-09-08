@@ -1,0 +1,132 @@
+name: Studio server image
+
+on:
+  pull_request:
+    paths:
+      - apps/studio/server/**
+      - packages/**
+      - scripts/build_wheels.py
+      - pyproject.toml
+      - uv.lock
+      - .github/workflows/studio-image.yml
+  push:
+    tags: ["studio-v*.*.*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: studio-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/tinkerfin-ai/studio-server
+
+jobs:
+  build:
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux/amd64
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read application version
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          version=$(python3 -c 'import runpy; print(runpy.run_path("apps/studio/server/src/tinkerfin_studio/version.py")["__version__"])')
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || exit 1
+          if [[ "$REF_TYPE" == tag && "$RELEASE_TAG" != "studio-v$version" ]]; then
+            echo "Tag must match the Studio application version" >&2
+            exit 1
+          fi
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/studio/server/Dockerfile
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: studio-server:test
+          labels: |
+            org.opencontainers.image.version=${{ steps.version.outputs.value }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=studio-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=studio-${{ matrix.arch }}
+      - name: Verify runtime and file secrets
+        env:
+          EXPECTED_VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          mkdir -m 700 "$RUNNER_TEMP/studio-secrets"
+          printf 'fixture-secret' > "$RUNNER_TEMP/studio-secrets/test"
+          chmod 644 "$RUNNER_TEMP/studio-secrets/test"
+          docker run --rm --mount "type=bind,src=$RUNNER_TEMP/studio-secrets/test,dst=/run/secrets/test,readonly" \
+            --env EXPECTED_VERSION studio-server:test python -c '
+          import os
+          from pathlib import Path
+          from tinkerfin_studio.__main__ import app
+          from tinkerfin_studio.version import __version__
+          assert os.getuid() == 10001
+          assert __version__ == os.environ["EXPECTED_VERSION"]
+          assert Path("/run/secrets/test").read_text() == "fixture-secret"
+          assert app.title
+          assert os.access("/app/attachments", os.W_OK)
+          '
+      - name: Log in to GHCR
+        if: startsWith(github.ref, 'refs/tags/studio-v')
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish tested platform image
+        if: startsWith(github.ref, 'refs/tags/studio-v')
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          docker tag studio-server:test "$IMAGE:$VERSION-$ARCH"
+          docker push "$IMAGE:$VERSION-$ARCH"
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/studio-v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish multi-platform image
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          version=${RELEASE_TAG#studio-v}
+          docker buildx imagetools create --tag "$IMAGE:$version" \
+            "$IMAGE:$version-amd64" "$IMAGE:$version-arm64"
+      - name: Verify public image access
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          anonymous_config=$(mktemp -d)
+          trap 'rm -rf "$anonymous_config"' EXIT
+          docker --config "$anonymous_config" buildx imagetools inspect "$IMAGE:${RELEASE_TAG#studio-v}"

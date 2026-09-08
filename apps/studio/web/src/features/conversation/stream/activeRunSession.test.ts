@@ -29,20 +29,20 @@ describe('active run session', () => {
       lastSeq: 41,
     })
 
-    expect(readActiveRunSession()).toEqual({
+    expect(readActiveRunSession('thread-active')).toEqual({
       threadId: 'thread-active',
       payload,
       mode: 'start',
       lastSeq: 41,
     })
     clearActiveRunSession('other-run')
-    expect(readActiveRunSession()?.payload.runId).toBe('run-active')
+    expect(readActiveRunSession('thread-active')?.payload.runId).toBe('run-active')
     clearActiveRunSession('run-active')
-    expect(readActiveRunSession()).toBeNull()
+    expect(readActiveRunSession('thread-active')).toBeNull()
   })
 
   it('rejects a persisted protocol message without its required ID', () => {
-    window.sessionStorage.setItem('tinkerfin:active-conversation-run', JSON.stringify({
+    window.sessionStorage.setItem('tinkerfin:active-conversation-run', JSON.stringify([{
       threadId: 'thread-active',
       payload: {
         ...payload,
@@ -50,22 +50,22 @@ describe('active run session', () => {
       },
       mode: 'start',
       lastSeq: 1,
-    }))
+    }]))
 
-    expect(readActiveRunSession()).toBeNull()
+    expect(readActiveRunSession('thread-active')).toBeNull()
     expect(window.sessionStorage.getItem('tinkerfin:active-conversation-run')).toBeNull()
   })
 
-  it('rejects the removed versioned storage shape', () => {
-    window.sessionStorage.setItem('tinkerfin:active-conversation-run', JSON.stringify({
-      schemaVersion: 1,
+  it('rejects an unexpected field in a stored run', () => {
+    window.sessionStorage.setItem('tinkerfin:active-conversation-run', JSON.stringify([{
+      unexpected: true,
       threadId: 'thread-active',
       payload,
       mode: 'start',
       lastSeq: 1,
-    }))
+    }]))
 
-    expect(readActiveRunSession()).toBeNull()
+    expect(readActiveRunSession('thread-active')).toBeNull()
     expect(window.sessionStorage.getItem('tinkerfin:active-conversation-run')).toBeNull()
   })
 
@@ -77,6 +77,17 @@ describe('active run session', () => {
       throw new DOMException('blocked', 'SecurityError')
     })
 
-    expect(readActiveRunSession()).toBeNull()
+    expect(readActiveRunSession('thread-active')).toBeNull()
   })
+})
+
+it('多个会话的游标独立保存和清理', () => {
+  window.sessionStorage.clear()
+  writeActiveRunSession({ threadId: 'thread-active', payload, mode: 'start', lastSeq: 3 })
+  writeActiveRunSession({ threadId: 'second', payload: { ...payload, threadId: 'second', runId: 'second-run' }, mode: 'start', lastSeq: 8 })
+  expect(readActiveRunSession('thread-active')?.lastSeq).toBe(3)
+  expect(readActiveRunSession('second')?.lastSeq).toBe(8)
+  clearActiveRunSession('second-run')
+  expect(readActiveRunSession('thread-active')?.lastSeq).toBe(3)
+  expect(readActiveRunSession('second')).toBeNull()
 })

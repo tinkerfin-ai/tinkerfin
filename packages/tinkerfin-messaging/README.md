@@ -101,6 +101,26 @@ A custom source must receive one explicit RunIdentity. A profiled source may omi
 `failed`, or `owner_lost`. A leased backend can atomically classify an expired owner as
 `owner_lost` during this lookup; the method never grants producer ownership.
 
+## Publish while a run is active
+
+```python
+from ag_ui.core import CustomEvent
+
+await channel.publish(
+    CustomEvent(name="report.progress", value={"completed": 3, "total": 10}),
+    identity=identity,
+    message_id="report-progress-3",
+)
+```
+
+The message enters the same durable log as source events. Existing subscribers receive it, and reconnecting subscribers replay it using the same sequence cursor. Publication does not open a source, acquire or renew its lease, or advance its message ordinal or recovery checkpoint. The host authorizes the target identity.
+
+The codec must be bound, including on a separate worker. Use `codec=AgUiCodec()` when that worker does not open the source. Ordinary codecs accept publication after the first source commit. AG-UI accepts only `CustomEvent` after the target main `RUN_STARTED`; the main terminal atomically closes publication. Child run events do not open or close the main run. Cancellation, settlement, or producer ownership loss reject new publications with `PublicationRejected`.
+
+Omitting `message_id` generates a fresh key per call. Repeating the same key and content returns the retained envelope, including after completion; different content raises `MessageIdConflict`. A rejected publication never starts a new run.
+
+Codecs with protocol lifecycles can implement `MessagePublicationPolicy`: `validate_publication()` checks external values, while `starts_publication()` and `ends_publication()` identify the target run boundaries. These decisions are committed atomically with source messages; storage backends remain protocol-neutral.
+
 ## Durable values
 
 `MessageEnvelope` contains channel, nested RunIdentity, sequence, message ID, codec,
@@ -136,6 +156,11 @@ Use `DeferredMessageSource` when only the durable owner should build an expensiv
 Set `on_owner_preflight` only when a custom source must prepare its own state after
 durable owner selection but before the producer task or opener starts. Host delivery
 activation belongs in the channel's `on_source_ready` callback.
+
+Messaging renews distributed ownership from acquisition through source preparation,
+ready callbacks, source streaming, and settlement. Source factories do not manage leases.
+Cancelling preparation interrupts the pending factory and waits for owned cleanup;
+lease loss prevents further source commits.
 
 Use `RecoverableSource` and `RecoverableMessage` when a producer can rebuild from the last atomically committed checkpoint. Stable message IDs make commits idempotent; external side effects still require application-level idempotency.
 

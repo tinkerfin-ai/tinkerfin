@@ -1,0 +1,128 @@
+# Studio HTTP API
+
+[返回后端使用说明](../README.md)
+
+## HTTP 响应
+
+`/api` 下普通业务 JSON 接口成功时统一返回 HTTP 200 和
+`{ "code": 0, "message": "success", "data": ... }`。保存、删除和登出等不返回业务数据的操作使用 `data: null`。
+错误使用相同包络并保留对应的 HTTP 状态码，客户端应同时读取 HTTP 状态和业务 `code`。
+附件原件与预览返回文件内容，会话与 Trace 订阅返回原生 SSE；`/health/live` 和 `/health/ready` 使用独立的健康检查响应。
+
+## 认证会话
+
+`AUTH_TOKEN_EXPIRE_SECONDS` 控制访问令牌从签发时刻起的固定有效期，默认值为 `86400`。
+请求和用户操作不会延长到期时间。`POST /api/auth/login` 返回访问令牌、UTC `expires_at`
+和用户信息；`GET /api/auth/me` 返回同一 `expires_at` 和当前用户。后端在每个认证请求上以
+Redis Control 记录及其固定到期时间为准，过期、撤销或无效令牌统一返回 401。
+
+登录、`/api/auth/me` 和用户查询响应中的 `avatar_url` 为可空 HTTPS 头像地址。
+`PATCH /api/user/me` 修改当前登录用户资料：`display_name` 必须是 1～128 个字符，
+`avatar_url` 最大 2048 个字符且必须使用 HTTPS，传入 `null` 可清空头像。
+
+配置只作用于服务重新加载后签发的令牌，已有令牌保持签发时确定的到期时间。
+
+## 对话请求边界
+
+`POST /api/conversation/chat` 接收标准 AG-UI `RunAgentInput`，并返回可回放的 AG-UI SSE。请求会校验模型、会话归属、请求模式和恢复参数。
+
+| 字段 | Studio 的处理方式 |
+| --- | --- |
+| `threadId` | 空字符串表示新会话；已有值必须属于当前用户 |
+| `runId` | 新输入使用新值；同一次网络重试或附着复用原值 |
+| `parentRunId` | 保留在标准请求快照中，不改变会话或子智能体的归属关系 |
+| `state` | 保留在标准请求快照中，不自动成为 Graph 输入 |
+| `messages` | 普通运行接受一条文字及附件 user 消息，也可仅附件；resume 必须为空 |
+| `tools` | 仅保留客户端工具描述，不授予服务端工具执行权限 |
+| `context` | 保留在标准请求快照中，由业务决定是否使用 |
+| `forwardedProps` | `model` 与 `command.plan` 必填；Plan 只接受 `on/off`，未知 command 与其他扩展字段完整保留 |
+| `resume` | 提交待处理交互的公开 ID 和决策；必须完整覆盖当前待处理项，并与对应工具调用匹配 |
+
+每条标准 AG-UI 消息必须带非空客户端 ID。该 ID 只用于通过 HTTP 协议校验，不参与权限、幂等、
+执行关联或持久化身份；服务端会分配实际使用的消息 ID。
+`RUN_STARTED` 返回 服务端确认的 `threadId`、`runId`、标题及其来源、生成状态和递增 `titleSeq`，不携带 input。
+
+会话标题最多 32 个 Unicode 字符，临时标题截取用户输入前 16 个字符。首条有效文本使用当前会话模型并行总结一次，关闭标题调用的推理和自动重试。标题保存成功后通过原会话 SSE 发送 `CUSTOM` 事件 `studio.conversation.title.updated`，值包含 `threadId`、`title`、`titleSource`、`titleGenerationStatus`、`titleSeq`。手动命名包括同名保存都会固定标题，自动生成不能覆盖。
+
+标题任务属于发起运行的原响应，响应结束或断连时取消未完成任务；主回复不等待标题。超时和失败不自动重试。通知未送达时，已经保存的标题通过历史查询或 Trace 初始快照读取。
+
+`forwardedProps.command.plan` 必须为 `on` 或 `off`，用于开启或关闭计划模式。
+不接受 `forwardedProps.mode`；`command` 中的其他字段会保留，但当前服务端只处理 `plan`。
+同一次运行重试、分支和恢复必须保持模型一致。
+
+## 个人模型与附件
+
+“设置 → 模型配置”通过 `/api/models/configurations` 管理当前用户的对话模型和 OpenAI 兼容生图服务；`GET /api/models` 只返回本人启用的对话模型。配置响应不包含密钥，更新时留空保留本人密钥。模型与默认选择按用户和用途隔离。生图只调用明确设置且启用的默认模型，没有默认项时提示完成配置。
+
+`PUT /api/models/configurations/{model_id}/default` 不接收请求体，只启用目标模型并切换本人同一用途的默认选择。目标必须配置密钥；该操作不覆盖连接、密钥或生成参数，也不影响正在运行的会话。
+
+`POST /api/models/configurations/test` 接收 `{"kind":"basic","configuration":{...}}`；`configuration` 使用保存接口相同的配置字段，测试不会保存配置。`kind` 可选 `basic`、`text`、`vision`、`image`，总超时分别为 10、30、45、120 秒。已有密钥仅可在本人同一配置 ID、同一 Base URL 下复用，改地址必须提供密钥。聊天与测试共用 OpenAI 兼容和 DeepSeek 的模型构建入口及地址访问规则。
+
+测试结果位于 `ApiResponse.data`，包含 `kind`、`outcome`（`success`、`failed`、`inconclusive`）、`elapsed_ms`、`code`、可空的 `text` 与 `image`。图片包含 `mime_type` 和 `data_base64`；视觉测试返回测试图和实际回复，生图测试返回经校验、限额的预览。基础检查无法取得模型列表时返回未确认，不据此否定模型能力。供应商错误转为安全错误码，不返回密钥或供应商原始错误正文。测试不自动重试、不修改能力标记、不创建会话附件，能力调用可能产生供应商费用。
+
+`generation_options` 是最多 64 KiB、64 层容器嵌套的严格 JSON 对象，数值必须有限；顶层不能覆盖 `model`、`prompt`、`n`、`api_key` 或 `authorization`（忽略大小写）。`size` 和 `output_format` 如提供则必须为非空字符串，其他供应商字段保留并交给生图接口。
+
+公网模型默认使用 HTTPS。接入 Ollama 或内网模型时，管理员在后端环境配置中设置 `MODEL_ALLOWED_ORIGINS`，列出允许访问的准确协议、主机与端口：
+
+```dotenv
+MODEL_ALLOWED_ORIGINS=["http://127.0.0.1:11434","http://localhost:11434"]
+```
+
+重新启动后端后，在模型配置中选择 OpenAI 兼容接口，Base URL 填写 `http://127.0.0.1:11434/v1`，Model ID 填写 Ollama 已安装的模型名称；未启用认证的 Ollama 可以填写占位 API Key `ollama`。图片输入和工具调用取决于所选模型的实际能力。
+
+允许列表不包含 `/v1`、查询参数、账户信息或通配符。HTTP、本机及内网访问按协议、主机和端口精确匹配，不因域名指向同一 IP 而自动互相授权。该设置适用于所有用户的聊天、生图和生成图片下载；允许的 HTTP 服务应位于受信任网络。更改设置后需重启后端。
+
+本机地址指 Studio 后端所在的网络空间。Docker 部署访问宿主机 Ollama 时，在 `deploy/.env` 中填写 `MODEL_ALLOWED_ORIGINS=["http://host.docker.internal:11434"]`，模型 Base URL 使用 `http://host.docker.internal:11434/v1`；Ollama 需监听容器可达的地址。连接另一台服务器时，使用该服务器可达的主机名或 IP 并添加对应来源。
+
+附件使用 `POST /api/attachments?name=...` 上传原始文件流，`GET /api/attachments/{id}/content` 读取原件，`variant=preview` 获取图片预览，`DELETE /api/attachments/{id}` 删除本人未发送草稿。图片及文档输入使用 AG-UI 内容块，`source.value` 为 `attachment:<id>`；后端以仓储信息重建 metadata 并在运行登记事务内绑定会话。消息文本仍受 UTF-8 大小限制。
+
+设置 `ATTACHMENT_DIRECTORY` 保存原件与派生图。相对路径以所读取 `.env` 文件所在目录为基准；未指定配置文件时，以应用默认配置目录为基准，默认值为该目录下的 `.data/attachments`。从不同工作目录启动不会改变存储位置。已有附件应配置其实际所在目录；容器使用 `/app/attachments` 数据卷绝对路径。上传总并发与解析并发均有界，文档解析运行在可取消、最长 30 秒的子进程中。未发送附件保留至少 24 小时，上传及启动时回收过期草稿和已删除会话的对象。
+
+Studio 使用框架默认的 Sandbox Runtime 镜像，预装 Playwright 和无界面 Chromium，可直接执行网页截图。镜像更新只影响随后创建的容器，已有用户工作区不会自动重建。生图使用用户配置，供应商 URL 或 Base64 结果均在保存后才对外发布。
+
+## 会话历史与事件
+
+- `GET /api/conversation/history` 只读取 Studio 列表摘要
+- `GET /api/conversation/{threadId}/history` 在校验用户归属后返回固定 `asOfSeq` 的 Trace 视图；
+  `historyCursor` 只扩展同一固定前缀的 Turn 窗口；`includeTaskTrace=true` 会从同一 Trace 前缀
+  查询重建根 Agent 任务轨迹，`false` 跳过该投影
+- `GET /api/conversation/{threadId}/trace` 先发送完整 Trace snapshot，再按提交顺序发送语义增量；
+  `includeTaskTrace=true` 时只在任务轨迹实际变化后发送完整 replacement；断连或取消会停止本次订阅
+- Trace 视图和增量携带 `generation`、`asOfSeq`、`observedAt`。同一代按事件序号和存储 UTC
+  观测时间排序，保留微秒；writer 失活或有效接管可以在同一序号更新运行状态。列表摘要用相同
+  规则拒绝迟到快照；相同观测发生内容冲突时重新读取 Trace。历史分页保留固定前缀的原始观测，
+  补充历史内容时保留前端已收到的较新运行状态
+- `GET /api/conversation/{threadId}/trace/graph` 在校验用户归属后筛选链路节点，支持 `kind`、`status`、`modelCallId`、`agent`、`provider`、`model`、`namespace`、
+  `query`、`startedAfter`、`startedBefore`、opaque `cursor` 与 `limit`；响应中的 Turn 是容器，
+  `matchedNodeIds` 只包含直接命中，响应会补入直接命中所属的 Subagent 链
+- `GET /api/conversation/{threadId}/trace/graph/follow` 先发送同一筛选首页，再持续发送节点
+  和 Turn 的 upsert/remove、完整 `orderedNodeIds`、`matchedNodeIds`、`nextCursor`、`asOfSeq`
+  与 `completeness`；断连或取消会停止本次订阅
+- `POST /api/conversation/chat` 返回当前运行的 AG-UI 事件；终态会话正文仍以 Trace 为准
+
+Trace Graph 中，同一 Turn 作用域的节点按真实开始序号平级排列，只有 Subagent 形成嵌套。
+`parentSubagentId` 是唯一展示嵌套关系；`modelCallId` 只关联 Assistant、Tool、Subagent 与产生它的
+Model。Assistant 没有可见正文但对应 Model 确实发出 Tool 调用时，`toolCallOnly` 为 `true`，且不受
+API 查询是否返回 Tool 节点影响。非空 `namespace` 只表示 Graph 作用域，必须有经过校验的 Subagent 来源才能形成嵌套。
+节点以深度优先顺序返回，子智能体嵌套最多 64 层。
+
+Studio 把 Graph kind 固定映射为六类：
+
+| Graph kind | Studio 分类 |
+| --- | --- |
+| `human_message` | 用户 |
+| `context`、`memory`、`guardrail`、`retrieval`、`custom`、`plan`、`interaction` | 上下文 |
+| `model` | 模型 |
+| `tool` | 工具 |
+| `subagent` | 子智能体 |
+| `assistant_message` | 助手 |
+
+链路页面始终读取完整六类，不提供节点类型筛选；节点和内容搜索使用 `query` 参数。
+Subagent 内的首个“用户”只显示已采集的 `task.description`，Subagent 详情显示完整任务参数。
+
+每次模型调用前都有一个“上下文”节点：开始时间取同一作用域中的上一项可见执行边界，结束时间与
+模型节点开始时间一致。恢复仍在执行的子智能体时从本次恢复输入重新计时，不包含人工等待时间。
+详情显示同一次模型请求中的最终 SystemMessage；请求没有
+SystemMessage 时仍显示准备耗时，并明确内容不可用。该时长是墙钟准备延迟，不是 CPU 耗时。
+
+模型读取 `SKILL.md` 显示为普通 `read_file` 工具调用。

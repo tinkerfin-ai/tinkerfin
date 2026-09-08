@@ -459,6 +459,8 @@ from .errors import TinkerFinError as TinkerFinError
 from .errors import TinkerFinErrorCode as TinkerFinErrorCode
 from .errors import TinkerFinLifecycleError as TinkerFinLifecycleError
 from .errors import TinkerFinStreamProtocolError as TinkerFinStreamProtocolError
+from .media import AttachmentImage as AttachmentImage
+from .media import AttachmentSupport as AttachmentSupport
 from .native_driver import NativeStreamDriver as NativeStreamDriver
 from .native_driver import ReasoningExtractor as ReasoningExtractor
 from .plan import AgentMode as AgentMode
@@ -480,8 +482,6 @@ from .runtime import SseEventIdResolver as SseEventIdResolver
 from .runtime import SseMapper as SseMapper
 from .runtime import SsePayload as SsePayload
 from .runtime import SsePreflight as SsePreflight
-from .media import AttachmentImage as AttachmentImage
-from .media import AttachmentSupport as AttachmentSupport
 from .runtime import TinkerFin as _RuntimeTinkerFin
 from .runtime_profile import DeepAgentsFactoryPreparation as DeepAgentsFactoryPreparation
 from .runtime_profile import DeepAgentsRuntimeProfile as DeepAgentsRuntimeProfile

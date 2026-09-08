@@ -1,6 +1,7 @@
 """会话归属、Run 注册与恢复认领 ORM 实体"""
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import JsonValue
 from sqlalchemy import (
@@ -17,6 +18,9 @@ from sqlalchemy.dialects.mysql import DATETIME
 from sqlalchemy.orm import Mapped, mapped_column
 
 from tinkerfin_studio.infrastructure.database import Base
+
+TitleSource = Literal["default", "generated", "user", "unknown"]
+TitleGenerationStatus = Literal["idle", "running", "succeeded", "failed", "skipped"]
 
 _PRIMARY_KEY = BigInteger().with_variant(Integer, "sqlite")
 
@@ -61,7 +65,30 @@ class ConversationThread(Base):
     thread_id: Mapped[str] = mapped_column(
         String(128), nullable=False, comment="公开 AG-UI 与 Trace 共用的 threadId"
     )
-    title: Mapped[str] = mapped_column(String(255), nullable=False, comment="会话标题")
+    title: Mapped[str] = mapped_column(
+        String(32), nullable=False, comment="会话标题，最多32个字符"
+    )
+    title_source: Mapped[TitleSource] = mapped_column(
+        String(16),
+        nullable=False,
+        default="default",
+        server_default="default",
+        comment="标题来源：default 临时、generated 总结、user 手动、unknown 未记录",
+    )
+    title_generation_status: Mapped[TitleGenerationStatus] = mapped_column(
+        String(16),
+        nullable=False,
+        default="idle",
+        server_default="idle",
+        comment="标题生成状态：idle 未尝试、running 已认领、succeeded 成功、failed 失败、skipped 跳过",
+    )
+    title_seq: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+        comment="标题及生成状态每次提交递增的序号，与 Trace 序号无关",
+    )
     status: Mapped[str] = mapped_column(
         String(32),
         nullable=False,
