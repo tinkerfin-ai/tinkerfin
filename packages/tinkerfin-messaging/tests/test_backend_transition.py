@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -706,6 +707,94 @@ async def test_memory_backend_implements_the_storage_oriented_contract() -> None
         )
     )
     assert [message.message_id for message in page.messages] == ["message-1"]
+
+
+@pytest.mark.parametrize("timeout_seconds", [None, 1.0])
+async def test_memory_change_wait_preserves_cancellation_during_notification(
+    monkeypatch: pytest.MonkeyPatch,
+    timeout_seconds: float | None,
+) -> None:
+    backend = MemoryBackend()
+    settings = backend.messaging_settings
+    prepared = await backend.commit_messaging_transition(
+        _prepare_transition(settings=settings)
+    )
+    assert prepared.run_reference is not None
+    query = CommittedMessageQuery(
+        channel="events",
+        identity=_identity(),
+        generation=prepared.run_reference.generation,
+        after_sequence=0,
+        through_sequence=None,
+        limit=10,
+    )
+    page = await backend.read_committed_messages(query)
+    entered = asyncio.Event()
+    condition_wait = asyncio.Condition.wait
+
+    async def cancel_after_notification(condition: asyncio.Condition) -> bool:
+        entered.set()
+        result = await condition_wait(condition)
+        pending.cancel()
+        return result
+
+    monkeypatch.setattr(asyncio.Condition, "wait", cancel_after_notification)
+    pending = asyncio.create_task(
+        backend.wait_for_messaging_change(
+            MessagingChangeWait(
+                channel="events",
+                identity=_identity(),
+                generation=prepared.run_reference.generation,
+                after=page.change_cursor,
+                timeout_seconds=timeout_seconds,
+            )
+        )
+    )
+    append = MessagingTransition(
+        kind="append_message",
+        transition_id="append-notification",
+        channel="events",
+        identity=_identity(),
+        settings=settings,
+        run_reference=prepared.run_reference,
+        codec_id="tests.bytes",
+        message_id="message-1",
+        payload=b"first",
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        await backend.commit_messaging_transition(append)
+        done, _ = await asyncio.wait({pending}, timeout=1)
+        assert pending in done
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        async with asyncio.timeout(1):
+            await backend.commit_messaging_transition(
+                replace(
+                    append,
+                    transition_id="append-after-cancellation",
+                    message_id="message-2",
+                    payload=b"second",
+                )
+            )
+            page = await backend.read_committed_messages(query)
+            assert [message.payload for message in page.messages] == [
+                b"first",
+                b"second",
+            ]
+            await backend.wait_for_messaging_change(
+                MessagingChangeWait(
+                    channel="events",
+                    identity=_identity(),
+                    generation=prepared.run_reference.generation,
+                    after=page.change_cursor,
+                    timeout_seconds=0.01,
+                )
+            )
+    finally:
+        if not pending.done():
+            pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
 
 
 async def test_framework_ledger_preserves_memory_run_and_replay_behavior() -> None:

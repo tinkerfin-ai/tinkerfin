@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import cast
 
 import pytest
@@ -17,6 +18,8 @@ from tinkerfin_messaging import (
     MessagingBackendProtocolError,
     MessagingBackendTimeout,
     MessagingBackendUnavailable,
+    MessagingChangeCursor,
+    MessagingChangeWait,
     MessagingError,
     MessagingErrorCode,
     MessagingStateQuery,
@@ -62,6 +65,120 @@ class _ProtocolRedis:
     async def eval(self, script: str, numkeys: int, *keys: str) -> object:
         del script, numkeys, keys
         return [b"OK", b"1", b"corrupt"]
+
+
+class _CancellationSuppressingRedis(Redis):
+    """Inject a driver that consumes cancellation before returning or failing."""
+
+    def __init__(self, error: BaseException | None) -> None:
+        super().__init__(decode_responses=False)
+        self.error = error
+        self.entered = asyncio.Event()
+
+    async def execute_command(self, *args: object, **options: object) -> object:
+        del args, options
+        if self.entered.is_set():
+            raise AssertionError("a cancelled operation issued another Redis command")
+        self.entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            if self.error is not None:
+                raise self.error from None
+            return None
+
+
+@pytest.mark.parametrize("cancel_requests", [1, 2])
+@pytest.mark.parametrize(
+    "driver_error",
+    [
+        None,
+        RedisConnectionError("connection lost after cancellation"),
+        RedisTimeoutError("command timed out after cancellation"),
+        RuntimeError("driver failed after cancellation"),
+    ],
+)
+async def test_redis_change_wait_preserves_cancellation_consumed_by_driver(
+    driver_error: Exception | None,
+    cancel_requests: int,
+) -> None:
+    client = _CancellationSuppressingRedis(driver_error)
+    backend = RedisBackend(client)
+    pending = asyncio.create_task(
+        backend.wait_for_messaging_change(
+            MessagingChangeWait(
+                channel="events",
+                identity=RunIdentity(threadId="thread-1", runId="run-1"),
+                generation=1,
+                after=MessagingChangeCursor(message_sequence=0, control_sequence=0),
+                timeout_seconds=1,
+            )
+        )
+    )
+    try:
+        await asyncio.wait_for(client.entered.wait(), timeout=1)
+        for _ in range(cancel_requests):
+            pending.cancel()
+        done, _ = await asyncio.wait({pending}, timeout=1)
+        assert pending in done
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await pending
+        assert raised.value.__cause__ is driver_error
+    finally:
+        if not pending.done():
+            pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+        await client.aclose()
+
+
+async def test_redis_change_wait_preserves_a_timeout_consumed_by_driver() -> None:
+    client = _CancellationSuppressingRedis(None)
+    backend = RedisBackend(client)
+    try:
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.01):
+                await backend.wait_for_messaging_change(
+                    MessagingChangeWait(
+                        channel="events",
+                        identity=RunIdentity(threadId="thread-1", runId="run-1"),
+                        generation=1,
+                        after=MessagingChangeCursor(
+                            message_sequence=0, control_sequence=0
+                        ),
+                        timeout_seconds=1,
+                    )
+                )
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.parametrize(
+    "driver_error", [asyncio.CancelledError("driver cancellation"), GeneratorExit()]
+)
+async def test_redis_backend_preserves_driver_control_exceptions(
+    driver_error: BaseException,
+) -> None:
+    client = _CancellationSuppressingRedis(driver_error)
+    backend = RedisBackend(client)
+    pending = asyncio.create_task(
+        backend.load_messaging_state(
+            MessagingStateQuery(
+                channel="events",
+                identity=RunIdentity(threadId="thread-1", runId="run-1"),
+            )
+        )
+    )
+    try:
+        await asyncio.wait_for(client.entered.wait(), timeout=1)
+        pending.cancel()
+        with pytest.raises(type(driver_error)) as raised:
+            await pending
+        assert raised.value is driver_error
+    finally:
+        if not pending.done():
+            pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+        await client.aclose()
 
 
 def test_error_codes_are_unique_and_namespaced() -> None:

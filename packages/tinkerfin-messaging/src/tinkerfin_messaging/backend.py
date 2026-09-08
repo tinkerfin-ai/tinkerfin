@@ -417,7 +417,7 @@ class MemoryBackend:
         """Wait for an in-memory message or control change with a bounded timeout.
 
         Args:
-            wait: Exact generation, observed cursor, and finite wait duration.
+            wait: Exact generation, observed cursor, and optional wait duration.
 
         Returns:
             ``None`` after a change, spurious wakeup, or timeout.
@@ -456,14 +456,11 @@ class MemoryBackend:
                 or stream_state.control_sequence != wait.after.control_sequence
             ):
                 return
-            if wait.timeout_seconds is None:
-                await stream_state.condition.wait()
-                return
             try:
-                await asyncio.wait_for(
-                    stream_state.condition.wait(),
-                    timeout=wait.timeout_seconds,
-                )
+                # Keep notification and cancellation in the caller's task so a
+                # completed condition wait cannot consume concurrent cancellation.
+                async with asyncio.timeout(wait.timeout_seconds):
+                    await stream_state.condition.wait()
             except TimeoutError:
                 return
 
