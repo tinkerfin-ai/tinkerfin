@@ -518,14 +518,14 @@ class OpenSandboxBackend(BaseSandbox):
         cursor: int | None = None
         content = ""
         while loop.time() < deadline:
-            remaining = deadline - loop.time()
-            logs = await asyncio.wait_for(
-                self._sandbox.commands.get_background_command_logs(
+            # Direct awaits preserve an outer cancellation when the response and
+            # deadline coincide (CPython 3.11 asyncio.wait_for can swallow it).
+            # Covered by test_bounded_binary_read_timeout_closes_response_and_helper.
+            async with asyncio.timeout_at(deadline):
+                logs = await self._sandbox.commands.get_background_command_logs(
                     execution_id,
                     cursor=cursor,
-                ),
-                timeout=remaining,
-            )
+                )
             if logs.content:
                 content += logs.content
                 descriptor = _rooted_transfer_descriptor(content, request=request)
@@ -535,10 +535,8 @@ class OpenSandboxBackend(BaseSandbox):
             remaining = deadline - loop.time()
             if remaining <= 0:
                 break
-            status = await asyncio.wait_for(
-                self._sandbox.commands.get_command_status(execution_id),
-                timeout=remaining,
-            )
+            async with asyncio.timeout_at(deadline):
+                status = await self._sandbox.commands.get_command_status(execution_id)
             if status.running is False or (
                 status.running is None and status.exit_code is not None
             ):
@@ -560,13 +558,13 @@ class OpenSandboxBackend(BaseSandbox):
                     terminal_remaining = terminal_deadline - loop.time()
                     if terminal_remaining <= 0:
                         break
-                    final_logs = await asyncio.wait_for(
-                        self._sandbox.commands.get_background_command_logs(
-                            execution_id,
-                            cursor=cursor,
-                        ),
-                        timeout=terminal_remaining,
-                    )
+                    async with asyncio.timeout_at(terminal_deadline):
+                        final_logs = (
+                            await self._sandbox.commands.get_background_command_logs(
+                                execution_id,
+                                cursor=cursor,
+                            )
+                        )
                     cursor = final_logs.cursor
                     if not final_logs.content:
                         continue

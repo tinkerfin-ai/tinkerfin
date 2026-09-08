@@ -1,6 +1,6 @@
 # Semantic tracing
 
-[API reference](api-reference.md) · [中文](../../zh/tracing/index.md)
+[API reference](api-reference.md) · [中文](../../cn/tracing/index.md)
 
 TinkerFin Tracing turns normalized Runtime observations into one append-only semantic
 Ledger and one rebuildable execution Graph. The Ledger is authoritative; Graph rows and

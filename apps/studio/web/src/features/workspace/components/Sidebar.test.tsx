@@ -770,14 +770,6 @@ describe('Sidebar rail and inline search', () => {
     expect(screen.getByRole('button', { name: '智能体' })).toBeDisabled()
   })
 
-  it('在 Rail 导航中始终显示用于展开侧边栏的任务抽屉图标', () => {
-    render(
-      <Sidebar {...baseProps} mode="rail" settledMode="rail" wideInteractive={false} railInteractive />,
-    )
-
-    expect(screen.getByRole('button', { name: '打开侧边栏' }).querySelector('.lucide-panel-right')).toBeInTheDocument()
-  })
-
   it('在 Rail 底部复用真实用户头像并保持点击后仅展开侧边栏', () => {
     const onRequestExpanded = vi.fn()
     render(

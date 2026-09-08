@@ -16,6 +16,7 @@ from sqlalchemy.pool import AsyncAdaptedQueuePool
 
 from tinkerfin_contracts import RunIdentity
 from tinkerfin_studio.api.responses import ApiResponse
+from tinkerfin_studio.conversation.failures import ConversationFailureProjection
 from tinkerfin_studio.conversation.todo_groups import TodoGroupQueryExecutor
 from tinkerfin_tracing import (
     CapturedValue,
@@ -212,7 +213,7 @@ async def test_12k_trace_projects_and_encodes_without_checkpoint(
             thread_id="todo-trace-12k",
             run_id="run-12k",
         )
-        tracer = Tracer(store=store)
+        tracer = Tracer(projections=(ConversationFailureProjection(),), store=store)
         trace = await tracer.get("todo-trace-12k", head_run_id="run-12k")
         executor = TodoGroupQueryExecutor(capacity=2)
 

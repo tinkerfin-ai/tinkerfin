@@ -5,6 +5,7 @@ import type {
   Conversation,
   Message,
 } from '../../../types'
+import { ConversationRunFailure } from '../../conversation/components/ConversationRunFailure'
 import { ActivityDots } from '../../conversation/components/ActivityDots'
 import { ApprovalStatusRow } from '../../conversation/components/ApprovalCard'
 import { MessageBlock, ToolCallBatch } from '../../conversation/components/MessageBlock'
@@ -23,6 +24,7 @@ function collectCopyableAssistantIds(entries: ConversationDisplayEntry[], curren
   }
 
   for (const entry of entries) {
+    if (entry.type === 'run-failure') continue
     if (entry.type === 'tools') {
       candidate = null
       continue
@@ -71,6 +73,8 @@ export function ConversationViewport({
   onRetryHistory,
   onRetryHydration,
   onRecoverConversation,
+  onRetryRun,
+  retryDisabled = false,
   onError,
   onLoadEarlierMessages,
 }: {
@@ -93,6 +97,8 @@ export function ConversationViewport({
   onRetryHistory: () => void
   onRetryHydration: () => void
   onRecoverConversation?: () => void
+  onRetryRun?: (message: Message) => void
+  retryDisabled?: boolean
   onError?: (message: string) => void
   onLoadEarlierMessages: (trigger: HTMLButtonElement) => void
 }) {
@@ -152,7 +158,9 @@ export function ConversationViewport({
                 </Button>
               </div>
             )}
-            {entries.map((entry) => entry.type === 'tools'
+            {entries.map((entry) => entry.type === 'run-failure'
+              ? <ConversationRunFailure key={`failure:${entry.failure.runId}`} retryable={entry.failure.retryable && !entry.message.meta?.contentOmitted && Boolean(entry.message.content || entry.message.attachments?.length)} disabled={retryDisabled} onRetry={onRetryRun ? () => onRetryRun(entry.message) : undefined} />
+              : entry.type === 'tools'
               ? <ToolCallBatch key={`batch-${entry.messages[0].id}`} messages={entry.messages} />
               : entry.type === 'todo-group'
                 ? <TodoGroupRow key={entry.group.id} group={entry.group} message={entry.message} />

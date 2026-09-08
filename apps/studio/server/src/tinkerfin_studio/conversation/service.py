@@ -180,11 +180,11 @@ class ConversationChatService:
     """准备请求级 Agent 事件源并启动或附着 durable AG-UI run"""
 
     def __init__(
-            self,
-            session: AsyncSession,
-            *,
-            user: UserContext,
-            resources: ApplicationResources,
+        self,
+        session: AsyncSession,
+        *,
+        user: UserContext,
+        resources: ApplicationResources,
     ) -> None:
         self._session = session
         self._user = user
@@ -192,10 +192,10 @@ class ConversationChatService:
         self._repository = ConversationRepository(session)
 
     async def start(
-            self,
-            request: ChatRequest,
-            *,
-            last_event_id: str | None,
+        self,
+        request: ChatRequest,
+        *,
+        last_event_id: str | None,
     ) -> PreparedChat:
         """完成业务校验、Agent 事件源准备和 Messaging 预握手"""
 
@@ -234,7 +234,7 @@ class ConversationChatService:
         return PreparedChat(body=body, thread_id=execution.thread.thread_id)
 
     async def _resolve_attachments(
-            self, request: ChatRequest, model: AgentModelConfig
+        self, request: ChatRequest, model: AgentModelConfig
     ) -> ChatRequest:
         """以仓储信息替换客户端附件描述，检查模型能力和文件总量"""
         if not request.messages:
@@ -261,11 +261,11 @@ class ConversationChatService:
         return ChatRequest.model_validate(payload)
 
     async def _prepare_execution(
-            self,
-            request: ChatRequest,
-            *,
-            intent: StartChatIntent | ResumeChatIntent,
-            model: AgentModelConfig,
+        self,
+        request: ChatRequest,
+        *,
+        intent: StartChatIntent | ResumeChatIntent,
+        model: AgentModelConfig,
     ) -> tuple[ConversationRunPreparer, PreparedRunRequest, PreparedExecution]:
         """完成 thread 解析、权威快照和短事务 run 注册"""
 
@@ -341,13 +341,13 @@ class ConversationChatService:
         return run_preparer, prepared, execution
 
     def _create_events(
-            self,
-            *,
-            intent: StartChatIntent | ResumeChatIntent,
-            execution: PreparedExecution,
-            prepared: PreparedRunRequest,
-            model: AgentModelConfig,
-            image_model: AgentModelConfig | None,
+        self,
+        *,
+        intent: StartChatIntent | ResumeChatIntent,
+        execution: PreparedExecution,
+        prepared: PreparedRunRequest,
+        model: AgentModelConfig,
+        image_model: AgentModelConfig | None,
     ) -> ProfiledMessageSource[BaseEvent, BaseEvent]:
         """创建仅由 Messaging owner 打开的统一 AG-UI 事件源"""
 
@@ -436,15 +436,15 @@ class ConversationChatService:
         )
 
     async def _start_delivery(
-            self,
-            events: ProfiledMessageSource[BaseEvent, BaseEvent],
-            *,
-            after: int | None,
-            prepared: PreparedRunRequest,
-            execution: PreparedExecution,
-            run_preparer: ConversationRunPreparer,
-            title_text: str,
-            model: AgentModelConfig,
+        self,
+        events: ProfiledMessageSource[BaseEvent, BaseEvent],
+        *,
+        after: int | None,
+        prepared: PreparedRunRequest,
+        execution: PreparedExecution,
+        run_preparer: ConversationRunPreparer,
+        title_text: str,
+        model: AgentModelConfig,
     ) -> AsyncGenerator[bytes, None] | SseBody[bytes]:
         """让 Messaging 完成 owner/attachment 选择并返回 SSE 内容"""
 
@@ -458,8 +458,8 @@ class ConversationChatService:
             nonlocal title_finished
             event = codec.decode(envelope.payload)
             if (
-                    isinstance(event, RunStartedEvent)
-                    and event.run_id == prepared.identity.run_id
+                isinstance(event, RunStartedEvent)
+                and event.run_id == prepared.identity.run_id
             ):
                 title_ready.set()
             if codec.ends_publication(event, identity=prepared.identity):
@@ -506,7 +506,7 @@ class ConversationChatService:
                 await body.aclose()
             except BaseException as close_error:
                 if isinstance(error, Exception) and not isinstance(
-                        close_error, Exception
+                    close_error, Exception
                 ):
                     close_error.add_note(
                         "SSE 内容关闭前的 Trace follow 注册也失败: "
@@ -522,10 +522,10 @@ class ConversationChatService:
                 raise error.with_traceback(error.__traceback__) from close_error
             raise
         if (
-                not owner
-                or not title_text.strip()
-                or execution.thread.title_source != "default"
-                or execution.thread.title_generation_status != "idle"
+            not owner
+            or not title_text.strip()
+            or execution.thread.title_source != "default"
+            or execution.thread.title_generation_status != "idle"
         ):
             return body
 
@@ -610,10 +610,10 @@ class ConversationChatService:
         return CancelRunResponse(cancelled=cancelled)
 
     async def _reconcile_trace(
-            self,
-            *,
-            thread_pk: int,
-            identity: RunIdentity,
+        self,
+        *,
+        thread_pk: int,
+        identity: RunIdentity,
     ) -> None:
         """把取消后的 Runtime 终态同步为列表摘要"""
 
@@ -627,14 +627,14 @@ class ConversationChatService:
 
     @staticmethod
     def _messaging_error(
-            error: MessagingError,
-            *,
-            operation: str = "chat",
+        error: MessagingError,
+        *,
+        operation: str = "chat",
     ) -> BusinessException | SystemException:
         error_code, business = _MESSAGING_ERRORS[error.code]
         if (
-                operation == "cancel"
-                and error.code is MessagingErrorCode.RUN_PRODUCER_FAILED
+            operation == "cancel"
+            and error.code is MessagingErrorCode.RUN_PRODUCER_FAILED
         ):
             error_code = ConversationErrorCode.RUN_CANCEL_FAILED
         exception_type = BusinessException if business else SystemException

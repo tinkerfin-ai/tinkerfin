@@ -102,6 +102,7 @@ const traceDetail = (
   generation: 'generation-test',
   observedAt: '2026-09-05T00:00:00.000000Z',
   headRunId: RUN_ID,
+  runFailures: [],
   availableHeads: [RUN_ID],
   historyCursor: null,
   messageCount: 1,
@@ -278,6 +279,68 @@ describe('Studio Trace history integration', () => {
     }
   })
 
+  it('会话受理后可独立提交新会话，旧流结束不会重复提交仍待受理的草稿', async () => {
+    const user = userEvent.setup()
+    const details: Record<string, ConversationHistoryDetail> = {}
+    const requests: { payload: ChatRequestPayload; events: ReadableStreamDefaultController<Uint8Array> }[] = []
+    const fetch = installFetch({ details })
+    const defaultFetch = fetch.getMockImplementation()!
+    fetch.mockImplementation(async (input, init) => {
+      if (String(input).endsWith('/api/conversation/chat')) {
+        const payload = JSON.parse(String(init?.body)) as ChatRequestPayload
+        return new Response(new ReadableStream<Uint8Array>({
+          start(events) { requests.push({ payload, events }) },
+        }), { headers: { 'Content-Type': 'text/event-stream' } })
+      }
+      return defaultFetch(input, init)
+    })
+    const view = render(<App />)
+    try {
+      const input = await screen.findByRole('textbox', { name: '消息输入' })
+      await waitFor(() => expect(input).toBeEnabled())
+      await user.type(input, '会话A{Enter}')
+      await waitFor(() => expect(requests).toHaveLength(1))
+      const first = requests[0]!
+      details['thread-a'] = traceDetail({
+        threadId: 'thread-a', headRunId: first.payload.runId,
+        availableHeads: [first.payload.runId],
+        status: { execution: 'succeeded', headRunId: first.payload.runId },
+      })
+      await act(async () => {
+        first.events.enqueue(new TextEncoder().encode('id: 1\ndata: ' + JSON.stringify({
+          type: 'RUN_STARTED', threadId: 'thread-a', runId: first.payload.runId,
+        }) + '\n\n'))
+      })
+      await waitFor(() => expect(new URL(window.location.href).searchParams.get('thread')).toBe('thread-a'))
+      await user.click(screen.getByRole('button', { name: '新会话' }))
+      await user.type(input, '会话B{Enter}')
+      await waitFor(() => expect(requests).toHaveLength(2))
+      const second = requests[1]!
+      expect(second.payload.runId).not.toBe(first.payload.runId)
+      await act(async () => {
+        first.events.enqueue(new TextEncoder().encode('id: 2\ndata: ' + JSON.stringify({
+          type: 'RUN_FINISHED', threadId: 'thread-a', runId: first.payload.runId,
+          outcome: { type: 'success' },
+        }) + '\n\n'))
+        first.events.close()
+      })
+      await waitFor(() => expect(readActiveRunSessions().map(item => item.payload.runId)).toEqual([second.payload.runId]))
+      await user.type(input, '下一条草稿{Enter}{Enter}')
+      expect(requests).toHaveLength(2)
+      expect(input).toHaveValue('下一条草稿')
+      await act(async () => {
+        second.events.enqueue(new TextEncoder().encode('id: 1\ndata: ' + JSON.stringify({
+          type: 'RUN_STARTED', threadId: 'thread-b', runId: second.payload.runId,
+        }) + '\n\n'))
+      })
+      await waitFor(() => expect(new URL(window.location.href).searchParams.get('thread')).toBe('thread-b'))
+      expect(requests).toHaveLength(2)
+      expect(input).toHaveValue('下一条草稿')
+    } finally {
+      view.unmount()
+    }
+  })
+
   it('首帧前浏览器历史导航释放草稿选择权', async () => {
     const user = userEvent.setup()
     const fetch = installFetch({ list: [historyItem()], details: { [THREAD_ID]: traceDetail() } })
@@ -414,7 +477,7 @@ describe('Studio Trace history integration', () => {
     expect(attempts).toBe(5)
   })
 
-  it('announces one localized initialization failure across the live event and authoritative history', async () => {
+  it('初始化失败在会话中持久展示且不弹 Toast', async () => {
     const user = userEvent.setup()
     const details = { [THREAD_ID]: traceDetail() }
     installFetch({
@@ -427,6 +490,8 @@ describe('Studio Trace history integration', () => {
         details[THREAD_ID] = traceDetail({
           headRunId: payload.runId, availableHeads: [payload.runId],
           status: { execution: 'failed', headRunId: payload.runId },
+          messages: [{ ...traceDetail().messages[0]!, id: 'accepted-input', role: 'user', runId: payload.runId, content: '初始化验证' }],
+          runFailures: [{ runId: payload.runId, errorCode: 'runtime_initialization_error', failedAt: BASE_TIME, retryable: true }],
         })
       },
     })
@@ -435,13 +500,82 @@ describe('Studio Trace history integration', () => {
     await waitFor(() => expect(input).toBeEnabled())
     await user.type(input, '初始化验证')
     await user.click(screen.getByRole('button', { name: '发送消息' }))
-    expect(await screen.findByRole('alert')).toHaveTextContent('任务初始化失败，请重试')
+    expect(await screen.findByText('会话异常')).toBeInTheDocument()
     await waitFor(() => expect((readActiveRunSessions()[0] ?? null)).toBeNull())
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 100)) })
-    expect(screen.getAllByRole('alert')).toHaveLength(1)
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
     expect(screen.queryByText('Agent run failed')).not.toBeInTheDocument()
     expect(screen.queryByText('任务遇到问题')).not.toBeInTheDocument()
     expect(screen.queryByText('对话运行失败')).not.toBeInTheDocument()
+  })
+
+  it('重试较早问题会追加新一轮，保留草稿、原失败及附件且只提交一次', async () => {
+    const user = userEvent.setup()
+    const attachment = { id: 'original-document', name: '说明.txt', mime_type: 'text/plain', size_bytes: 12 }
+    const original = traceDetail().messages[0]!
+    const source = traceDetail({
+      messages: [
+        { ...original, id: 'failed-question', role: 'user', runId: 'old-failed', content: [{ type: 'text', text: '原问题' }, { type: 'document', source: { type: 'url', value: 'attachment:original-document', mimeType: 'text/plain' }, metadata: attachment }] },
+        { ...original, id: 'later-question', role: 'user', content: '后来的问题' },
+        { ...original, id: 'later-answer', content: '后来的回答' },
+      ],
+      runFailures: [{ runId: 'old-failed', errorCode: 'runtime_initialization_error', failedAt: BASE_TIME, retryable: true }],
+    })
+    const details = { [THREAD_ID]: source }
+    let submitted: ChatRequestPayload | undefined
+    let submissions = 0
+    const fetchMock = installFetch({ list: [historyItem()], details })
+    const originalFetch = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input).endsWith('/api/conversation/chat')) {
+        submitted = JSON.parse(String(init?.body)) as ChatRequestPayload
+        submissions += 1
+        return new Response(new ReadableStream<Uint8Array>(), { headers: { 'Content-Type': 'text/event-stream' } })
+      }
+      return originalFetch(input, init)
+    })
+    window.history.replaceState({}, '', '/?thread=' + THREAD_ID)
+    const view = render(<App />)
+    try {
+      const retry = await screen.findByRole('button', { name: '重试' })
+      const input = screen.getByRole('textbox', { name: '消息输入' })
+      await user.type(input, '还未发送的草稿')
+      await user.dblClick(retry)
+      await waitFor(() => expect(submissions).toBe(1))
+      expect(input).toHaveValue('还未发送的草稿')
+      expect(submitted?.runId).not.toBe('old-failed')
+      expect(submitted?.parentRunId).toBeUndefined()
+      expect(submitted?.messages[0]?.content).toEqual(source.messages[0]?.content)
+      expect(submitted?.forwardedProps.model).toBe('main')
+      expect(screen.getAllByText('原问题')).toHaveLength(2)
+      expect(screen.getByText('后来的回答')).toBeInTheDocument()
+      expect(retry).toBeDisabled()
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    } finally {
+      view.unmount()
+    }
+  })
+
+  it('三个历史失败会话切换及重新打开时不弹错误提示', async () => {
+    const user = userEvent.setup()
+    const list = [1, 2, 3].map(id => historyItem({ id, threadId: `failed-${id}`, title: `失败会话${id}`, status: 'error' }))
+    const details = Object.fromEntries(list.map(item => [item.threadId, traceDetail({
+      threadId: item.threadId, title: item.title,
+      messages: [{ ...traceDetail().messages[0]!, role: 'user', content: '你好', id: `question-${item.id}` }],
+      status: { execution: 'failed', headRunId: RUN_ID },
+      runFailures: [{ runId: RUN_ID, errorCode: 'runtime_initialization_error', failedAt: BASE_TIME, retryable: true }],
+    })]))
+    installFetch({ list, details })
+    const view = render(<App />)
+    for (const item of list) {
+      await user.click(await screen.findByRole('button', { name: `打开会话：${item.title}` }))
+      expect(await screen.findByText('会话异常')).toBeInTheDocument()
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    }
+    view.unmount()
+    render(<App />)
+    expect(await screen.findByText('会话异常')).toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
   })
 
   it('restores a saved run once and keeps exhausted automatic recovery stopped across page renders', async () => {
@@ -487,6 +621,7 @@ describe('Studio Trace history integration', () => {
           threadId: secondThreadId,
           title: '第二个会话',
           headRunId: 'run-second',
+          runFailures: [],
           availableHeads: ['run-second'],
           messages: [{
             ...traceDetail().messages[0]!,
@@ -568,7 +703,7 @@ describe('Studio Trace history integration', () => {
       })
       await act(async () => traceController!.enqueue(new TextEncoder().encode(
         `event: trace\ndata: ${JSON.stringify({
-          type: 'update',
+          type: 'update', runFailures: [],
           update: {
             asOfSeq: 6, generation: initial.generation, observedAt: '2026-09-05T00:00:01.000000Z',
             events: [], facts: [], messages: { upserts: [], removes: [] },
@@ -579,7 +714,7 @@ describe('Studio Trace history integration', () => {
             },
             state: initial.state, status: { execution, headRunId: RUN_ID },
             completeness: details[THREAD_ID].completeness,
-            messageCount: initial.messageCount, toolCallCount: 0, projections: {},
+            messageCount: initial.messageCount, toolCallCount: 0, projections: {}, runFailures: [],
           },
           taskTrace: null,
         })}\n\n`,
@@ -883,6 +1018,7 @@ describe('Studio Trace history integration', () => {
         chatPayloads.push(payload)
         details[THREAD_ID] = traceDetail({
           headRunId: payload.runId,
+          runFailures: [],
           availableHeads: [payload.runId],
           status: { execution: 'succeeded', headRunId: payload.runId },
           interactions: [],

@@ -1,6 +1,6 @@
 # Interrupts and resume
 
-[Understand AG-UI events](events.md) · [中文](../../zh/agui/interrupts-and-resume.md)
+[Understand AG-UI events](events.md) · [中文](../../cn/agui/interrupts-and-resume.md)
 
 An agent can pause before a sensitive tool action and return an interrupt. After the user decides, resume the same checkpointed thread.
 

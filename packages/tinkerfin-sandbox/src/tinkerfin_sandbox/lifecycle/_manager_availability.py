@@ -7,6 +7,8 @@ settlement. Expired workers never stand in for that evidence.
 
 from __future__ import annotations
 
+__all__ = ["_SandboxAvailability"]
+
 import asyncio
 import math
 from contextvars import Context

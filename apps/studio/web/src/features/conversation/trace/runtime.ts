@@ -6,7 +6,7 @@ import type {
   ConversationTraceUpdate,
   TraceInteraction,
 } from '../../../api/conversation/history'
-import { traceObservationTime } from '../../../api/conversation/history'
+import { parseRunFailures, traceObservationTime } from '../../../api/conversation/history'
 import {
   parseTraceGraph,
   type TraceGraph,
@@ -15,7 +15,6 @@ import {
 } from '../../../api/conversation/traceGraph'
 import type { TaskTraceSnapshot } from '../../../api/conversation/taskTrace'
 import { ConversationError } from '../../../api/conversation/errors'
-import { translateCurrent } from '../../../i18n'
 import type {
   ApprovalAllowedDecision,
   ApprovalItem,
@@ -338,7 +337,7 @@ const traceMessages = (trace: ConversationHistoryCoreDetail): Message[] => {
               completedAt: item.completedAt ?? undefined,
               durationMs: elapsedMs(item.createdAt, item.completedAt),
             }
-          : { runId: item.runId },
+          : { runId: item.runId, contentOmitted: item.contentOmitted },
       },
     }]
   })
@@ -504,6 +503,7 @@ export const restoreConversationFromTrace = (
   if (current && (order === 0 || preserveHistory) && current.headRunId === detail.headRunId) {
     // 分页可补入同一前缀的历史实体；已存在的实体不能在相同观测内变成不同内容
     assertMatchingTraceEntities(current.messages, detail.messages)
+    assertMatchingTraceEntities(current.runFailures.map(item => ({ ...item, id: item.runId })), detail.runFailures.map(item => ({ ...item, id: item.runId })))
     assertMatchingTraceEntities(current.reasoning, detail.reasoning)
     assertMatchingTraceEntities(current.interactions, detail.interactions)
     assertMatchingTraceEntities(current.graph.turns, detail.graph.turns)
@@ -514,6 +514,7 @@ export const restoreConversationFromTrace = (
     detail = {
       ...detail,
       messages: current.messages,
+      runFailures: current.runFailures,
       reasoning: current.reasoning,
       graph: current.graph,
       interactions: current.interactions,
@@ -550,18 +551,7 @@ export const restoreConversationFromTrace = (
     ? 'waiting_approval'
     : projectedStatus
   const messages = traceMessages(trace)
-  if (
-    (trace.status.execution === 'failed' || trace.status.execution === 'unknown')
-    && !messages.some((message) => message.role === 'error')
-  ) {
-    messages.push({
-      id: 'trace-error:' + trace.headRunId,
-      role: 'error',
-      content: translateCurrent('对话运行失败'),
-      createdAt: trace.updatedAt,
-      meta: { runId: trace.headRunId, status: 'failed' },
-    })
-  }
+
   return {
     threadId: trace.threadId,
     ...mergeConversationTitle(options.previous, trace),
@@ -570,6 +560,7 @@ export const restoreConversationFromTrace = (
     model: trace.lastModel ?? options.model,
     mode: modeFromState(trace.state.root),
     messages,
+    runFailures: parseRunFailures(trace.runFailures),
     todos: todosFromState(trace.state.root),
     taskTrace,
     approval: interaction.approval,
@@ -596,7 +587,8 @@ export const applyConversationTraceUpdate = (
   if (compareTraceObservation(previous, update) < 0) return conversation
   if (update.asOfSeq === previous.asOfSeq) {
     if (update.events.length || update.facts.length) return conversation
-    if (update.messages.upserts.length || update.messages.removes.length
+    if (!sameTraceValue(update.runFailures, previous.runFailures)
+      || update.messages.upserts.length || update.messages.removes.length
       || update.reasoning.upserts.length || update.reasoning.removes.length
       || update.interactions.upserts.length || update.interactions.removes.length
       || update.status.headRunId !== previous.headRunId
@@ -616,6 +608,7 @@ export const applyConversationTraceUpdate = (
     observedAt: update.observedAt,
     headRunId: update.status.headRunId,
     messages: applyEntityDelta(previous.messages, update.messages.upserts, update.messages.removes),
+    runFailures: parseRunFailures(update.runFailures),
     reasoning: applyEntityDelta(previous.reasoning, update.reasoning.upserts, update.reasoning.removes),
     graph: applyTraceGraphDelta(previous.graph, update.graph),
     interactions: applyEntityDelta(

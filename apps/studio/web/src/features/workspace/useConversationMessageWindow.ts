@@ -9,7 +9,7 @@ const LOCATE_CONTEXT_BEFORE = 20
 export type MessageLocateResult = 'found' | 'not-found' | 'failed' | 'cancelled'
 
 const entryMessageId = (entry: ConversationDisplayEntry) => (
-  entry.type === 'tools'
+  entry.type === 'run-failure' ? `failure:${entry.failure.runId}` : entry.type === 'tools'
     ? entry.messages.find((message) => message.role === 'user')?.id
     : entry.message.id
 )

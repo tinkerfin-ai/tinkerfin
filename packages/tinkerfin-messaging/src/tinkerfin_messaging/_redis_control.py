@@ -35,6 +35,7 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 from tinkerfin_contracts import RunIdentity
 
 from ._identity import required_identifier, required_identity
+from ._messaging_boundary import _join_owned_task
 from ._messaging_ledger import BackendRunHandle
 from ._redis_scripts import (
     _BEGIN_DELETE_SCRIPT,
@@ -90,14 +91,29 @@ async def _redis_call(
     operation: str,
     awaitable: Awaitable[_RedisResultT],
 ) -> _RedisResultT:
-    """Translate Redis transport failures without intercepting cancellation.
+    """Translate transport failures while preserving newly requested cancellation.
 
     Client-safe errors expose only the logical operation. The concrete Redis failure is
     retained as trusted causal evidence and never serialized into a durable message.
+    A driver may consume cancellation while settling a command; its result or failure
+    must not let the cancelled caller continue into another read or lifecycle wait.
+    Redis AbstractConnection.send_packed_command uses asyncio.wait_for, whose CPython
+    3.11 implementation can return a completed write despite caller cancellation.
     """
 
+    current = asyncio.current_task()
+    cancel_count = current.cancelling() if current is not None else 0
     try:
-        return await awaitable
+        try:
+            result = await awaitable
+        except Exception as error:
+            if current is not None and current.cancelling() > cancel_count:
+                raise asyncio.CancelledError from error
+            raise
+        else:
+            if current is not None and current.cancelling() > cancel_count:
+                raise asyncio.CancelledError
+            return result
     except RedisTimeoutError as error:
         translated = MessagingBackendTimeout(
             f"Messaging backend {operation} timed out",
@@ -149,7 +165,9 @@ def _redis_protocol_error(
 
 
 class _RedisConnection(Protocol):
-    """Expose the cancellation-safe disconnect operation used by blocking reads."""
+    """Describe the exclusively pinned connection's wait budget and disconnect."""
+
+    socket_timeout: float | None
 
     async def disconnect(self, *, nowait: bool = False) -> None: ...
 
@@ -1364,30 +1382,66 @@ async def _wait_for_snapshot_change(
     """Block on durable data or lifecycle signals, then require a new snapshot."""
 
     blocking_client = self._client.client()
+    closing = False
+    close_error: Exception | None = None
+    read_error: BaseException | None = None
 
     # The task owns the pinned client from initialization through close. HTTP response
     # cancellation can abandon a nested async-generator await before its outer finally
     # resumes; keeping cleanup inside the loop-owned task prevents that transport race
     # from leaking the connection. The caller still cancels and joins the task normally.
     async def read() -> None:
+        nonlocal closing, close_error, read_error
         try:
             await _redis_call(
                 "blocking client initialization",
                 blocking_client.initialize(),
             )
-            await _redis_call(
-                "stream wait",
-                blocking_client.xread(
-                    {
-                        keys.messages: f"{snapshot.end_seq}-0",
-                        keys.signals: f"{snapshot.signal_cursor}-0",
+            connection = blocking_client.connection
+            assert connection is not None
+            socket_timeout = connection.socket_timeout
+            # This pinned connection is exclusive until aclose returns it to the
+            # borrowed pool. Its socket timeout bounds the whole XREAD, including
+            # retries, so Redis cannot consume cancellation in CPython 3.11 wait_for.
+            connection.socket_timeout = None
+            try:
+                async with asyncio.timeout(socket_timeout):
+                    await _redis_call(
+                        "stream wait",
+                        blocking_client.xread(
+                            {
+                                keys.messages: f"{snapshot.end_seq}-0",
+                                keys.signals: f"{snapshot.signal_cursor}-0",
+                            },
+                            count=1,
+                            block=self._wait_block_ms(snapshot.lease_ttl_ms),
+                        ),
+                    )
+            except TimeoutError as error:
+                raise MessagingBackendTimeout(
+                    "Messaging backend stream wait timed out",
+                    diagnostic_context={
+                        "implementation": "redis",
+                        "operation": "stream wait",
                     },
-                    count=1,
-                    block=self._wait_block_ms(snapshot.lease_ttl_ms),
-                ),
-            )
+                    cause=error,
+                ) from error
+            finally:
+                connection.socket_timeout = socket_timeout
+        except BaseException as error:
+            read_error = error
+            raise
         finally:
-            await _redis_call("blocking client close", blocking_client.aclose())
+            closing = True
+            try:
+                await _redis_call("blocking client close", blocking_client.aclose())
+            except Exception as error:
+                close_error = error
+                if read_error is None:
+                    raise
+                read_error.add_note(
+                    f"Redis blocking client close also failed: {type(error).__name__}: {error}"
+                )
 
     read_task = asyncio.create_task(
         read(),
@@ -1396,7 +1450,7 @@ async def _wait_for_snapshot_change(
     owner_task = asyncio.current_task()
 
     def cancel_when_owner_finishes(_task: asyncio.Task[object]) -> None:
-        if not read_task.done() and read_task.cancelling() == 0:
+        if not closing and not read_task.done() and read_task.cancelling() == 0:
             read_task.cancel()
 
     def read_finished(task: asyncio.Task[None]) -> None:
@@ -1408,17 +1462,39 @@ async def _wait_for_snapshot_change(
     if owner_task is not None:
         owner_task.add_done_callback(cancel_when_owner_finishes)
     read_task.add_done_callback(read_finished)
+    caller_error: BaseException | None = None
     try:
         await asyncio.shield(read_task)
-    except asyncio.CancelledError as cancellation:
-        if not read_task.done() and read_task.cancelling() == 0:
-            read_task.cancel()
-        await asyncio.gather(read_task, return_exceptions=True)
-        raise cancellation.with_traceback(cancellation.__traceback__)
+    except BaseException as error:
+        caller_error = error
+        raise
     finally:
-        if not read_task.done() and read_task.cancelling() == 0:
-            read_task.cancel()
-        await asyncio.gather(read_task, return_exceptions=True)
+        if not read_task.done():
+            if not closing and read_task.cancelling() == 0:
+                read_task.cancel()
+            try:
+                await _join_owned_task(read_task)
+            except asyncio.CancelledError:
+                if caller_error is None:
+                    raise
+            except Exception as cleanup_error:
+                if caller_error is None:
+                    raise
+                if cleanup_error is not close_error:
+                    caller_error.add_note(
+                        "Redis blocking read cleanup also failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+        if (
+            caller_error is not None
+            and caller_error is not read_error
+            and caller_error is not close_error
+            and close_error is not None
+        ):
+            caller_error.add_note(
+                "Redis blocking client close also failed: "
+                f"{type(close_error).__name__}: {close_error}"
+            )
 
 
 def _wait_block_ms(self: RedisBackend, lease_ttl_ms: int) -> int:

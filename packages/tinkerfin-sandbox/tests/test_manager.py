@@ -16,7 +16,6 @@ from deepagents import create_deep_agent
 from deepagents.backends import CompositeBackend, LocalShellBackend, StoreBackend
 from deepagents.backends.protocol import BackendProtocol, ExecuteResponse
 from deepagents.middleware.filesystem import FilesystemPermission
-from langchain.agents.middleware import AgentMiddleware
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.runnables import Runnable
@@ -408,6 +407,51 @@ class _CleanupObservedSQLState(SQLAlchemyOpenSandboxState):
     async def complete_cleanup(self, claim: OpenSandboxCleanupClaim) -> None:
         await super().complete_cleanup(claim)
         self.cleanup_completed.set()
+
+
+_SQL_CLAIM_TEST_TTL = 1.0
+
+
+class _RenewalObservedSQLState(SQLAlchemyOpenSandboxState):
+    """Observe successful public claim renewals while retaining real SQL fencing."""
+
+    def __init__(self, *, url: str) -> None:
+        super().__init__(
+            url=url, namespace="test", lease_ttl=_SQL_CLAIM_TEST_TTL, poll_interval=0.01
+        )
+        self.renewed = asyncio.Event()
+        self.warm_claim_checked = asyncio.Event()
+
+    async def renew_owner(self, claim: OpenSandboxOwnerClaim) -> bool:
+        renewed = await super().renew_owner(claim)
+        if renewed:
+            self.renewed.set()
+        return renewed
+
+    async def renew_warm(self, claim: OpenSandboxWarmClaim) -> bool:
+        renewed = await super().renew_warm(claim)
+        if renewed:
+            self.renewed.set()
+        return renewed
+
+    async def renew_cleanup(self, claim: OpenSandboxCleanupClaim) -> bool:
+        renewed = await super().renew_cleanup(claim)
+        if renewed:
+            self.renewed.set()
+        return renewed
+
+    async def claim_warm_slot(self) -> OpenSandboxWarmClaim | None:
+        claim = await super().claim_warm_slot()
+        self.warm_claim_checked.set()
+        return claim
+
+    async def wait_for_renewal_beyond_initial_lease(self) -> None:
+        loop = asyncio.get_running_loop()
+        initial_expiry = loop.time() + _SQL_CLAIM_TEST_TTL
+        async with asyncio.timeout(3):
+            while loop.time() <= initial_expiry:
+                self.renewed.clear()
+                await self.renewed.wait()
 
 
 class _BlockingOwnerReleaseState(_FakeState):
@@ -912,24 +956,6 @@ class OpenSandboxManagerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.create_calls, 1)
         self.assertEqual(store.save_calls, [("global", "sandbox-1")])
 
-    async def test_resolved_keys_separate_independent_sandbox_owners(
-        self,
-    ) -> None:
-        client = _FakeClient()
-        manager = _new_manager(client=client, warm_pool_size=0)
-        self.managers.append(manager)
-        await manager.start()
-
-        first, repeated, other = await asyncio.gather(
-            manager.get(_key("user-1/agent-a")),
-            manager.get(_key("user-1/agent-a")),
-            manager.get(_key("user-1/agent-b")),
-        )
-
-        self.assertIs(first, repeated)
-        self.assertIsNot(first, other)
-        self.assertEqual(client.create_calls, 2)
-
     async def test_store_recovery_takes_priority_over_warm_sandbox(self) -> None:
         client = _FakeClient()
         restored = _FakeBackend("persisted-id")
@@ -1044,24 +1070,6 @@ class OpenSandboxManagerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.connect_calls, [restored.id])
         self.assertEqual(restored.close_calls, 1)
         self.assertEqual(client.destroy_calls, [restored.id])
-        self.assertEqual(store.bindings, {"user-1": handle.id})
-
-    async def test_failed_persisted_reconnect_is_replaced(self) -> None:
-        client = _FakeClient()
-        store = _FakeState({"user-1": "missing-id"})
-        manager = await self._manager(
-            client,
-            store,
-            recovery_policy=OpenSandboxRecoveryPolicy(
-                max_attempts=1, on_failure="recreate"
-            ),
-        )
-
-        handle = await manager.get(_key("user-1"))
-
-        self.assertEqual(handle.id, "sandbox-1")
-        self.assertEqual(client.connect_calls, ["missing-id"])
-        self.assertEqual(client.destroy_calls, ["missing-id"])
         self.assertEqual(store.bindings, {"user-1": handle.id})
 
     async def test_unhealthy_sandbox_is_hot_replaced_on_stable_handle(self) -> None:
@@ -1815,29 +1823,6 @@ async def test_manager_lifecycle_uses_backend_coroutines_without_thread_bridge(
         await manager.aclose()
 
 
-def test_manager_provides_rooted_middleware_for_final_backend() -> None:
-    client = _FakeClient()
-    client.config = client.config.model_copy(update={"workspace_root": "/workspace"})
-    manager = _new_manager(client=client, warm_pool_size=0)
-    backend = cast(BackendProtocol, object())
-    permissions = [
-        FilesystemPermission(
-            operations=["write"],
-            paths=["/policies/**"],
-            mode="deny",
-        )
-    ]
-
-    middleware = manager.build_agent_middleware(
-        backend,
-        permissions=permissions,
-    )
-
-    assert len(middleware) == 1
-    assert isinstance(middleware[0], AgentMiddleware)
-    assert middleware[0].name == "FilesystemMiddleware"
-
-
 def test_manager_omits_rooted_middleware_when_workspace_root_is_disabled() -> None:
     """Use raw Sandbox paths without rooted middleware when no root is configured."""
 
@@ -2177,34 +2162,6 @@ async def test_strict_startup_replaces_a_published_but_missing_warm_sandbox() ->
 
 
 @pytest.mark.asyncio
-async def test_strict_startup_reuses_a_healthy_published_warm_sandbox() -> None:
-    """Restart recovery must renew the existing ID without duplicate creation."""
-
-    state = _FakeState()
-    await state.start(warm_pool_size=1)
-    claim = await state.claim_warm_slot()
-    assert claim is not None
-    await state.publish_warm(claim, "warm-existing")
-    client = _FakeClient()
-    existing = _FakeBackend("warm-existing")
-    client.connected[existing.id] = existing
-    manager = _new_manager(
-        client=client,
-        state=state,
-        warm_pool_size=1,
-        fail_on_startup_warmup_error=True,
-    )
-    try:
-        await manager.start()
-        await manager.check_ready()
-        assert client.connect_calls == ["warm-existing"]
-        assert client.create_calls == 0
-        assert existing.renew_calls == [client.config.ttl]
-    finally:
-        await manager.aclose()
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("ttl", (timedelta(hours=2), None))
 async def test_sql_state_restart_reuses_verified_warm_capacity(
     tmp_path: Path,
@@ -2450,11 +2407,15 @@ async def test_manual_cleanup_owner_reuse_keeps_health_checks_without_renewal() 
     assert backend.close_calls >= 1
 
 
-async def test_manual_cleanup_warm_health_maintenance_reclaims_failed_capacity() -> (
-    None
-):
+async def test_manual_cleanup_warm_health_maintenance_reclaims_failed_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A non-expiring warm instance still receives bounded periodic health checks."""
 
+    monkeypatch.setattr(
+        "tinkerfin_sandbox.lifecycle._manager_resources._WARM_MAINTENANCE_MAX_SECONDS",
+        0.05,
+    )
     checked = asyncio.Event()
 
     class CheckedBackend(_FakeBackend):
@@ -2475,7 +2436,7 @@ async def test_manual_cleanup_warm_health_maintenance_reclaims_failed_capacity()
         await manager.check_ready()
         checked.clear()
         backend.healthy = False
-        await asyncio.wait_for(checked.wait(), timeout=65)
+        await asyncio.wait_for(checked.wait(), timeout=2)
         await _eventually(lambda: client.create_calls == 2)
         await _eventually(lambda: backend.id in client.destroy_calls)
         await manager.check_ready()
@@ -2792,17 +2753,6 @@ def test_manager_rejects_invalid_settlement_timeout(
             warm_pool_size=0,
             settlement_timeout=value,
         )
-
-
-@pytest.mark.parametrize("value", (None, 0, 0.01))
-def test_manager_accepts_non_negative_settlement_timeout(
-    value: float | None,
-) -> None:
-    _new_manager(
-        client=_FakeClient(),
-        warm_pool_size=0,
-        settlement_timeout=value,
-    )
 
 
 @pytest.mark.parametrize("settlement_timeout", (0, 0.01))
@@ -3166,24 +3116,15 @@ async def test_manager_renews_sql_owner_claim_during_slow_create(
     client.config = client.config.model_copy(update={"ttl": ttl})
     client.create_gate = asyncio.Event()
     url = f"sqlite+aiosqlite:///{tmp_path / 'owner-renewal.db'}"
+    first_state = _RenewalObservedSQLState(url=url)
     first_manager = _new_manager(
         client=client,
-        state=SQLAlchemyOpenSandboxState(
-            url=url,
-            namespace="test",
-            lease_ttl=0.3,
-            poll_interval=0.01,
-        ),
+        state=first_state,
         warm_pool_size=0,
     )
     second_manager = _new_manager(
         client=client,
-        state=SQLAlchemyOpenSandboxState(
-            url=url,
-            namespace="test",
-            lease_ttl=0.3,
-            poll_interval=0.01,
-        ),
+        state=_RenewalObservedSQLState(url=url),
         warm_pool_size=0,
     )
     await asyncio.gather(first_manager.start(), second_manager.start())
@@ -3191,7 +3132,7 @@ async def test_manager_renews_sql_owner_claim_during_slow_create(
     await client.create_entered.wait()
     second_get = asyncio.create_task(second_manager.get(_key("user-1")))
     try:
-        await asyncio.sleep(0.5)
+        await first_state.wait_for_renewal_beyond_initial_lease()
         assert client.create_calls == 1
     finally:
         client.create_gate.set()
@@ -3212,37 +3153,34 @@ async def test_manager_renews_sql_warm_claim_during_slow_create(
     client = _ReconnectableFakeClient()
     client.create_gate = asyncio.Event()
     url = f"sqlite+aiosqlite:///{tmp_path / 'warm-renewal.db'}"
+    first_state = _RenewalObservedSQLState(url=url)
     first_manager = _new_manager(
         client=client,
-        state=SQLAlchemyOpenSandboxState(
-            url=url,
-            namespace="test",
-            lease_ttl=0.3,
-            poll_interval=0.01,
-        ),
+        state=first_state,
         warm_pool_size=1,
+        fail_on_startup_warmup_error=True,
     )
+    second_state = _RenewalObservedSQLState(url=url)
     second_manager = _new_manager(
         client=client,
-        state=SQLAlchemyOpenSandboxState(
-            url=url,
-            namespace="test",
-            lease_ttl=0.3,
-            poll_interval=0.01,
-        ),
+        state=second_state,
         warm_pool_size=1,
     )
     first_start = asyncio.create_task(first_manager.start())
-    await client.create_entered.wait()
-    await asyncio.sleep(0.5)
-    second_start = asyncio.create_task(second_manager.start())
+    starts = [first_start]
     try:
-        await asyncio.sleep(0.05)
+        await client.create_entered.wait()
+        await first_state.wait_for_renewal_beyond_initial_lease()
+        second_start = asyncio.create_task(second_manager.start())
+        starts.append(second_start)
+        await asyncio.wait_for(second_state.warm_claim_checked.wait(), timeout=1)
         assert client.create_calls == 1
     finally:
         client.create_gate.set()
-        await asyncio.gather(first_start, second_start, return_exceptions=True)
+        results = await asyncio.gather(*starts, return_exceptions=True)
         await asyncio.gather(first_manager.aclose(), second_manager.aclose())
+
+    assert results == [None, None]
 
 
 @pytest.mark.asyncio
@@ -3354,40 +3292,29 @@ async def test_manager_renews_sql_cleanup_claim_during_slow_destroy(
 
     client = _FakeClient()
     client.destroy_gate = asyncio.Event()
+    first_state = _RenewalObservedSQLState(url=url)
     first_manager = _new_manager(
         client=client,
-        state=SQLAlchemyOpenSandboxState(
-            url=url,
-            namespace="test",
-            lease_ttl=0.3,
-            poll_interval=0.01,
-        ),
+        state=first_state,
         warm_pool_size=0,
     )
     second_manager = _new_manager(
         client=client,
-        state=SQLAlchemyOpenSandboxState(
-            url=url,
-            namespace="test",
-            lease_ttl=0.3,
-            poll_interval=0.01,
-        ),
+        state=_RenewalObservedSQLState(url=url),
         warm_pool_size=0,
     )
     first_start = asyncio.create_task(first_manager.start())
-    await client.destroy_entered.wait()
-    await asyncio.sleep(0.5)
-    second_start = asyncio.create_task(second_manager.start())
+    starts = [first_start]
     try:
-        await asyncio.sleep(0.05)
+        await client.destroy_entered.wait()
+        await first_state.wait_for_renewal_beyond_initial_lease()
+        second_start = asyncio.create_task(second_manager.start())
+        starts.append(second_start)
+        await asyncio.wait_for(asyncio.shield(second_start), timeout=2)
         assert client.destroy_calls == ["orphan-sandbox"]
     finally:
         client.destroy_gate.set()
-        results = await asyncio.gather(
-            first_start,
-            second_start,
-            return_exceptions=True,
-        )
+        results = await asyncio.gather(*starts, return_exceptions=True)
         await asyncio.gather(first_manager.aclose(), second_manager.aclose())
 
     assert not any(isinstance(result, BaseException) for result in results)

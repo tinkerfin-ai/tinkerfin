@@ -12,7 +12,9 @@ import { traceGraphNode, traceGraphWithNodes } from '../../src/test/traceFixture
 declare global {
   interface Window {
     __todoTraceStartedAt?: number
-    __todoTraceLongTasks?: number[]
+    __todoTraceReadyAt?: number
+    __todoTraceOpenMs?: number
+    __todoTraceLongTasks?: { startTime: number; duration: number }[]
   }
 }
 
@@ -135,6 +137,7 @@ const detail = ({
     generation: `browser-generation:${THREAD_ID}`,
     observedAt: '2026-09-05T00:00:00.000000Z',
     headRunId: RUN_ID,
+    runFailures: [],
     availableHeads: [RUN_ID],
     historyCursor,
     messageCount: groups.length,
@@ -577,41 +580,95 @@ test('浅深主题和四个目标视口保持无描边、无提示与对齐', as
   expect(evidence.pageErrors).toEqual([])
 })
 
-test('5k Group 冷水化、windowing、键盘与 heap 门禁', async ({ page }) => {
+test('5k Group 冷水化、windowing、键盘与 heap 门禁', { tag: '@performance' }, async ({ page }) => {
   test.setTimeout(60_000)
   await page.setViewportSize({ width: 1440, height: 900 })
   await page.addInitScript(() => {
     window.__todoTraceStartedAt = performance.now()
     window.__todoTraceLongTasks = []
+    // 页面内记录入口首次可见时刻，避免把测试驱动端的轮询等待计入水化耗时
+    const observer = new MutationObserver(() => {
+      const launcher = document.querySelector<HTMLButtonElement>('button[aria-label="任务轨迹 5000"]')
+      if (!launcher || !launcher.checkVisibility({ visibilityProperty: true })) return
+      window.__todoTraceReadyAt = performance.now()
+      observer.disconnect()
+    })
+    observer.observe(document, { childList: true, subtree: true, attributes: true })
     new PerformanceObserver((list) => {
-      window.__todoTraceLongTasks?.push(...list.getEntries().map((entry) => entry.duration))
+      window.__todoTraceLongTasks?.push(...list.getEntries().map(({ startTime, duration }) => ({
+        startTime, duration,
+      })))
     }).observe({ type: 'longtask', buffered: true })
   })
   const groups = makeGroups(5_000, true, 10)
-  await mockTodoTraceStudio(page, { groups, taskTraceGroups: [] })
+  // 消息遵循服务端最新 100 轮窗口，任务轨迹仍包含全部 5,000 组
+  const historyPage = {
+    groups,
+    visibleGroups: groups.slice(0, 100),
+    historyCursor: 'todo-trace-before-latest-100-turns',
+  }
+  await mockTodoTraceStudio(page, { ...historyPage, taskTraceGroups: [] })
   const cdp = await page.context().newCDPSession(page)
   await cdp.send('HeapProfiler.collectGarbage')
   const baseConversation = await cdp.send('Runtime.getHeapUsage') as { usedSize: number }
   await page.goto('about:blank')
   await page.unroute('**/api/**')
-  const evidence = await mockTodoTraceStudio(page, { groups })
+  const evidence = await mockTodoTraceStudio(page, historyPage)
   const launcher = page.getByRole('button', { name: '任务轨迹 5000', exact: true })
-  const hydrationMs = await page.evaluate(() => (
-    performance.now() - (window.__todoTraceStartedAt ?? performance.now())
-  ))
-  expect(hydrationMs).toBeLessThanOrEqual(2_000)
+  const hydrationMs = await page.evaluate(() => {
+    if (window.__todoTraceStartedAt === undefined || window.__todoTraceReadyAt === undefined) {
+      throw new Error('任务轨迹入口尚未记录水化完成时刻')
+    }
+    return window.__todoTraceReadyAt - window.__todoTraceStartedAt
+  })
 
   await cdp.send('HeapProfiler.collectGarbage')
   const before = await cdp.send('Runtime.getHeapUsage') as { usedSize: number }
   const taskTraceHeapDelta = Math.max(0, before.usedSize - baseConversation.usedSize)
-  expect(taskTraceHeapDelta).toBeLessThanOrEqual(256 * 1024 * 1024)
-  const openedAt = Date.now()
+  // 从真实点击计时，直到任务组进入视口且经过一次绘制机会
+  await launcher.evaluate((button) => {
+    button.addEventListener('click', () => {
+      const started = performance.now()
+      const observer = new MutationObserver(() => {
+        const group = document.querySelector<HTMLButtonElement>(
+          'button[aria-label="收起任务组：整理当前交付清单"]',
+        )
+        if (!group) return
+        observer.disconnect()
+        let visibleLastFrame = false
+        const measure = () => {
+          const now = performance.now()
+          if (now - started >= 5_000) return
+          const rect = group.getBoundingClientRect()
+          const visible = group.checkVisibility({ visibilityProperty: true, opacityProperty: true })
+            && rect.width > 0 && rect.height > 0
+            && rect.right > 0 && rect.left < window.innerWidth
+            && rect.bottom > 0 && rect.top < window.innerHeight
+          if (visible && visibleLastFrame) {
+            window.__todoTraceOpenMs = now - started
+            return
+          }
+          visibleLastFrame = visible
+          window.requestAnimationFrame(measure)
+        }
+        window.requestAnimationFrame(measure)
+      })
+      observer.observe(document, { childList: true, subtree: true, attributes: true })
+    }, { once: true, capture: true })
+  })
   await launcher.click()
   await expect(page.getByRole('button', { name: '收起任务组：整理当前交付清单' }))
     .toBeVisible()
-  const openMs = Date.now() - openedAt
+  await page.waitForFunction(() => window.__todoTraceOpenMs !== undefined, undefined, {
+    timeout: 5_000,
+  })
+  const openMs = await page.evaluate(() => {
+    if (window.__todoTraceOpenMs === undefined) {
+      throw new Error('任务轨迹尚未记录展开完成时刻')
+    }
+    return window.__todoTraceOpenMs
+  })
   const initialDomRoots = await page.locator('.todo-trace-group').count()
-  expect(openMs).toBeLessThanOrEqual(500)
   expect(initialDomRoots).toBeLessThanOrEqual(80)
   expect(await page.locator('.todo-trace-group-panel').count()).toBe(1)
 
@@ -635,16 +692,13 @@ test('5k Group 冷水化、windowing、键盘与 heap 门禁', async ({ page }) 
     return durations
   })
   const p95 = [...latencies].sort((left, right) => left - right)[47] ?? 0
-  expect(p95).toBeLessThanOrEqual(100)
   expect(await page.locator('.todo-trace-group').count()).toBeLessThanOrEqual(80)
 
   await cdp.send('HeapProfiler.collectGarbage')
   const after = await cdp.send('Runtime.getHeapUsage') as { usedSize: number }
   const heapDelta = Math.max(0, after.usedSize - before.usedSize)
-  expect(heapDelta).toBeLessThanOrEqual(256 * 1024 * 1024)
   const longTasks = await page.evaluate(() => window.__todoTraceLongTasks ?? [])
-  const maxLongTask = Math.max(0, ...longTasks)
-  expect(maxLongTask).toBeLessThanOrEqual(200)
+  const maxLongTask = Math.max(0, ...longTasks.map((entry) => entry.duration))
   console.log(JSON.stringify({
     hydrationMs,
     openMs,
@@ -652,7 +706,15 @@ test('5k Group 冷水化、windowing、键盘与 heap 门禁', async ({ page }) 
     heapDelta,
     taskTraceHeapDelta,
     maxLongTaskMs: maxLongTask,
+    longTasks,
     initialDomRoots,
   }))
+  expect(hydrationMs).toBeLessThanOrEqual(2_000)
+  expect(taskTraceHeapDelta).toBeLessThanOrEqual(256 * 1024 * 1024)
+  expect(openMs).toBeLessThanOrEqual(500)
+  expect(p95).toBeLessThanOrEqual(100)
+  expect(heapDelta).toBeLessThanOrEqual(256 * 1024 * 1024)
+  expect(maxLongTask).toBeLessThanOrEqual(200)
+  await expect(page.getByText('实时输出数据量过大，请重试', { exact: true })).not.toBeVisible()
   expect(evidence.pageErrors).toEqual([])
 })

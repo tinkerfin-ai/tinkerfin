@@ -29,6 +29,7 @@ from tinkerfin_messaging.agui import AgUiCodec
 from tinkerfin_messaging.errors import RunProducerFailed
 from tinkerfin_studio.auth.types import UserContext
 from tinkerfin_studio.conversation.coordinator import ConversationTraceCoordinator
+from tinkerfin_studio.conversation.failures import ConversationFailureProjection
 from tinkerfin_studio.conversation.models import ConversationRunRegistration
 from tinkerfin_studio.conversation.repository import ConversationRepository
 from tinkerfin_studio.conversation.service import ConversationChatService
@@ -104,6 +105,7 @@ class _DelayedTraceLookup:
         thread_id: str,
         *,
         head_run_id: str | None = None,
+        projections: tuple[str, ...] = (),
     ) -> TraceThread:
         self.attempts += 1
         if self.attempts <= 2:
@@ -117,7 +119,9 @@ class _DelayedTraceLookup:
 
 
 async def _setup_run(database, *, thread_id: str, run_id: str):
-    tracer = Tracer()
+    tracer = Tracer(
+        projections=(ConversationFailureProjection(),),
+    )
     async with database.session() as session:
         repository = ConversationRepository(session)
         thread = await repository.create_thread(
@@ -186,17 +190,28 @@ async def test_delayed_same_run_snapshot_cannot_restore_stale_running_status(
     tracer, context, trace_session, thread_pk = await _setup_run(
         database, thread_id="thread-late-snapshot", run_id="run-late-snapshot"
     )
-    old_view = await tracer.get(context.identity.thread_id)
+    old_view = await tracer.get(
+        context.identity.thread_id, projections=("studio.conversation.failures",)
+    )
     read_started = asyncio.Event()
     release_read = asyncio.Event()
     original_get = tracer.get
 
-    async def delayed_get(thread_id: str, *, head_run_id: str | None = None):
+    async def delayed_get(
+        thread_id: str,
+        *,
+        head_run_id: str | None = None,
+        projections: tuple[str, ...] = (),
+    ):
         if not read_started.is_set():
             read_started.set()
             await release_read.wait()
             return old_view
-        return await original_get(thread_id, head_run_id=head_run_id)
+        return await original_get(
+            thread_id,
+            head_run_id=head_run_id,
+            projections=("studio.conversation.failures",),
+        )
 
     monkeypatch.setattr(tracer, "get", delayed_get)
     messaging, channel = await _messaging_channel()
@@ -265,7 +280,9 @@ async def test_summary_timestamp_collision_requires_a_fresh_trace_observation(
         run_id="run-clock-collision",
     )
     await trace_session.aclose()
-    collided = await tracer.get(context.identity.thread_id)
+    collided = await tracer.get(
+        context.identity.thread_id, projections=("studio.conversation.failures",)
+    )
     async with database.session() as session:
         repository = ConversationRepository(session)
         await repository.update_trace_summary(
@@ -286,12 +303,21 @@ async def test_summary_timestamp_collision_requires_a_fresh_trace_observation(
     original_get = tracer.get
     reads = 0
 
-    async def get(thread_id: str, *, head_run_id: str | None = None) -> TraceThread:
+    async def get(
+        thread_id: str,
+        *,
+        head_run_id: str | None = None,
+        projections: tuple[str, ...] = (),
+    ) -> TraceThread:
         nonlocal reads
         reads += 1
         if reads == 1:
             return collided
-        return await original_get(thread_id, head_run_id=head_run_id)
+        return await original_get(
+            thread_id,
+            head_run_id=head_run_id,
+            projections=("studio.conversation.failures",),
+        )
 
     monkeypatch.setattr(tracer, "get", get)
     messaging, channel = await _messaging_channel()
@@ -352,7 +378,9 @@ async def test_follow_converges_the_list_when_a_writer_closes_without_a_terminal
         await asyncio.sleep(0.02)
         await trace_session.aclose()
         await _wait_for(database, thread_pk, lambda item: item.status == "error")
-        current = await tracer.get(context.identity.thread_id)
+        current = await tracer.get(
+            context.identity.thread_id, projections=("studio.conversation.failures",)
+        )
         assert current.as_of_seq == before
         assert current.status.execution == "unknown"
         assert current.completeness.missing_tail
@@ -425,7 +453,10 @@ async def test_cancel_after_producer_failure_reconciles_missing_trace_tail(
         current = await _thread(database, thread_pk)
         assert current is not None and current.status == "error"
         assert (
-            await tracer.get(context.identity.thread_id)
+            await tracer.get(
+                context.identity.thread_id,
+                projections=("studio.conversation.failures",),
+            )
         ).status.execution == "unknown"
     finally:
         await trace_session.aclose()
@@ -636,6 +667,7 @@ async def test_trace_coordinator_waits_for_not_started_run_without_corruption_wa
     trace = await tracer.get(
         context.identity.thread_id,
         head_run_id=context.identity.run_id,
+        projections=("studio.conversation.failures",),
     )
     delayed = _DelayedTraceLookup(trace)
     messaging, channel = await _messaging_channel()
@@ -661,7 +693,9 @@ async def test_trace_coordinator_waits_for_not_started_run_without_corruption_wa
 
 
 async def test_recover_preparing_deletes_empty_thread_without_trace(database) -> None:
-    tracer = Tracer()
+    tracer = Tracer(
+        projections=(ConversationFailureProjection(),),
+    )
     async with database.session() as session:
         repository = ConversationRepository(session)
         thread = await repository.create_thread(
@@ -753,7 +787,9 @@ async def test_recover_preparing_removes_only_a_missing_new_run_from_existing_tr
 async def test_recover_preparing_preserves_a_live_messaging_owner(database) -> None:
     """慢初始化 producer 活跃时不得按 Trace 暂缺删除 Run"""
 
-    tracer = Tracer()
+    tracer = Tracer(
+        projections=(ConversationFailureProjection(),),
+    )
     identity = RunIdentity(threadId="thread-slow", runId="run-slow")
     async with database.session() as session:
         repository = ConversationRepository(session)
@@ -834,7 +870,9 @@ async def test_owner_preflight_cas_fences_a_stale_recovery_delete(database) -> N
     barrier = _MissingRunBarrierChannel()
     coordinator = ConversationTraceCoordinator(
         database=database,
-        tracer=Tracer(),
+        tracer=Tracer(
+            projections=(ConversationFailureProjection(),),
+        ),
         conversation_channel=cast(
             MessageChannel[BaseEvent, BaseEvent],
             barrier,
@@ -865,7 +903,9 @@ async def test_owner_preflight_cas_fences_a_stale_recovery_delete(database) -> N
 async def test_abandoned_trace_settles_the_complete_claim_batch_as_cancelled(
     database,
 ) -> None:
-    tracer = Tracer()
+    tracer = Tracer(
+        projections=(ConversationFailureProjection(),),
+    )
     identity = RunIdentity(threadId="thread-abandon", runId="run-abandon")
     async with database.session() as session:
         repository = ConversationRepository(session)
@@ -963,3 +1003,36 @@ async def test_abandoned_trace_settles_the_complete_claim_batch_as_cancelled(
     assert stored_registration.status == "abandoned"
     await coordinator.aclose()
     await messaging.aclose()
+
+
+async def test_initialization_error_code_is_persisted(database):
+    tracer, context, source, thread_pk = await _setup_run(
+        database, thread_id="thread-setup-error", run_id="run-setup-error"
+    )
+    await source.observe(
+        RunTerminalObservation(
+            identity=context.identity,
+            outcome="failed",
+            code="runtime_initialization_error",
+            error_type="builtins.RuntimeError",
+            observed_at=datetime.now(UTC),
+            monotonic_ns=3,
+        )
+    )
+    await source.aclose()
+    messaging, channel = await _messaging_channel()
+    coordinator = ConversationTraceCoordinator(
+        database=database, tracer=tracer, conversation_channel=channel
+    )
+    try:
+        await coordinator.reconcile(thread_pk=thread_pk, identity=context.identity)
+        async with database.session() as session:
+            run = await ConversationRepository(session).get_run(
+                thread_pk=thread_pk, run_id=context.identity.run_id
+            )
+            assert run is not None
+            assert run.error_code == "runtime_initialization_error"
+            assert run.terminal_outcome == "failed"
+    finally:
+        await coordinator.aclose()
+        await messaging.__aexit__(None, None, None)

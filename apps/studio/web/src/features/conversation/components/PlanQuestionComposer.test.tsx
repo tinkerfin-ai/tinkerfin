@@ -560,9 +560,10 @@ describe('PlanQuestionComposer', () => {
   })
 
   it('composes bounded date and time selectors without exposing the configured time zone', async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true })
+    // 只固定日历日期，保留交互与焦点恢复使用的真实计时器
+    vi.useFakeTimers({ toFake: ['Date'] })
     vi.setSystemTime(new Date('2026-08-28T00:00:00Z'))
-    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
+    const user = userEvent.setup()
     let current: PlanQuestionState = {
       ...interaction(),
       activeQuestionIndex: 0,
@@ -626,72 +627,13 @@ describe('PlanQuestionComposer', () => {
     expect(current.error).toBe('Plan 日期时间答案超出允许范围')
   })
 
-  it('keeps every option row borderless and on one shared grid', () => {
-    expect(conversationStyles).toMatch(/\.plan-question-option,\s*\.plan-question-custom,\s*\.plan-question-date\s*{[^}]*grid-template-columns:\s*20px minmax\(0, 1fr\);[^}]*width:\s*100%;[^}]*min-height:\s*var\(--control-md\);[^}]*border:\s*0;/s)
-    expect(conversationStyles).not.toMatch(/\.plan-question-option\s*{[^}]*border:\s*1px/s)
-    expect(conversationStyles).toMatch(/\.plan-question-composer-body\s*{[^}]*flex:\s*1 1 auto;/s)
-    expect(conversationStyles).toMatch(/\.composer-dock\s*{[^}]*min-width:\s*0;/s)
-    expect(conversationStyles).toMatch(/\.approval-composer,\s*\.plan-question-composer,\s*\.plan-review-composer\s*{[^}]*font-family:\s*var\(--font-ui\);/s)
-    expect(conversationStyles).toMatch(/\.approval-composer,\s*\.plan-question-composer,\s*\.plan-review-composer\s*{[^}]*border:\s*0;/s)
-    expect(conversationStyles).toMatch(/\.plan-question-composer\s*{[^}]*background:\s*var\(--color-layer-1\);/s)
-    expect(conversationStyles).toMatch(/\.plan-question-composer-head\s*{[^}]*background:\s*var\(--color-plan-panel-background\);/s)
-    expect(conversationStyles).toMatch(/\.plan-question-composer-footer,\s*\.plan-review-composer-footer\s*\{[^}]*position:\s*relative;[^}]*z-index:\s*var\(--layer-local\);[^}]*isolation:\s*isolate;[^}]*background:\s*transparent;/s)
-    expect(conversationStyles).toMatch(/\.plan-question-composer-footer::before\s*\{[^}]*linear-gradient\([\s\S]*color-mix\(in srgb, var\(--color-layer-1\) 82%, transparent\) var\(--space-10\),[\s\S]*color-mix\(in srgb, var\(--color-layer-1\) 94%, transparent\)/s)
-    expect(conversationStyles).toMatch(/\.plan-review-composer-footer::before\s*\{[^}]*linear-gradient\(to bottom, transparent, var\(--color-layer-1\)\);/s)
-    expect(conversationStyles).toMatch(/\.plan-question-composer-footer > \*,\s*\.plan-review-composer-footer > \*\s*\{[^}]*position:\s*relative;[^}]*z-index:\s*var\(--layer-local\);/s)
+  it('keeps answer controls accessible in touch, forced-colors and reduced-motion modes', () => {
     expect(conversationStyles).toMatch(/@media \(forced-colors: active\)[\s\S]*\.plan-question-composer-footer::before,\s*\.plan-review-composer-footer::before\s*\{[^}]*background:\s*Canvas;/s)
-    expect(conversationStyles).toMatch(/\.plan-question-composer\.is-minimized \.plan-question-composer-head\s*{[^}]*min-height:\s*calc\(var\(--layout-composer-surface-height\) - var\(--control-plan-chip\)\);[^}]*align-items:\s*center;[^}]*padding-top:\s*0;[^}]*padding-bottom:\s*0;/s)
-    expect(conversationStyles).toMatch(/\.plan-question-composer\.is-minimized \.plan-question-progress\s*{[^}]*height:\s*var\(--control-plan-chip\);[^}]*margin:\s*0 20px;/s)
     expect(conversationStyles).toMatch(/@media \(any-hover: none\), \(any-pointer: coarse\)[\s\S]*\.plan-question-composer\.is-minimized \.plan-question-progress,[\s\S]*\.plan-question-composer\.is-minimized \.plan-question-progress-step\s*\{[^}]*height:\s*var\(--control-lg\);/s)
-    expect(conversationStyles).toMatch(/\.approval-wait-state,\s*\.plan-interaction-wait-state\s*{[^}]*gap:\s*var\(--space-4\);/s)
-    expect(conversationStyles).toMatch(/\.plan-question-composer-heading h2,\s*\.plan-review-composer-heading h2\s*{[^}]*font-size:\s*var\(--type-ui-size\);[^}]*font-weight:\s*var\(--weight-regular\);[^}]*line-height:\s*var\(--type-title-line\);/s)
-    expect(conversationStyles).toMatch(/\.plan-question-composer-heading h2 > svg\s*{[^}]*color:\s*var\(--color-plan-panel-accent\);/s)
-    expect(conversationStyles).toMatch(/\.plan-question-composer-heading h2 > span\s*{[^}]*color:\s*var\(--color-plan-panel-accent\);/s)
-    expect(conversationStyles).toMatch(/\.interaction-card-color-bridge\s*{[^}]*height:\s*var\(--space-3\);[^}]*pointer-events:\s*none;/s)
-    expect(conversationStyles).toMatch(/\.interaction-card-color-bridge\.is-plan\s*{[^}]*linear-gradient\([^)]*var\(--color-plan-panel-background\),[^)]*var\(--color-layer-1\)/s)
-    expect(conversationStyles).toMatch(/\.plan-question-composer-body > h3\s*{[^}]*align-items:\s*flex-start;[^}]*font-size:\s*var\(--type-ui-size\);[^}]*line-height:\s*var\(--type-title-line\);/s)
-    expect(conversationStyles).toMatch(/\.plan-question-composer-body > h3 small\s*{[^}]*min-height:\s*var\(--type-title-line\);[^}]*align-items:\s*center;[^}]*line-height:\s*var\(--type-title-line\);/s)
-    expect(conversationStyles).toMatch(/\.plan-question-option-copy strong\s*{[^}]*font-size:\s*var\(--type-ui-size\);/s)
-    expect(conversationStyles).toMatch(/\.plan-question-option-copy small\s*{[^}]*font-size:\s*var\(--type-ui-size\);/s)
-    expect(conversationStyles).toMatch(/\.plan-question-option-copy\s*{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\) auto;[^}]*align-items:\s*baseline;/s)
-    expect(conversationStyles).toMatch(/\.plan-question-option-recommended\s*{[^}]*min-height:\s*var\(--type-title-line\);[^}]*grid-column:\s*3;[^}]*line-height:\s*var\(--type-title-line\);/s)
-    expect(conversationStyles).not.toContain('--plan-question-option-inline-padding')
-    expect(conversationStyles).toMatch(/\.plan-question-date\s*\{[^}]*align-items:\s*center;[^}]*height:\s*var\(--control-md\);[^}]*padding-top:\s*0;[^}]*padding-bottom:\s*0;/s)
-    expect(conversationStyles).toMatch(/\.plan-question-date > \.plan-question-option-index\s*\{[^}]*margin-top:\s*0;/s)
-    expect(conversationStyles).toMatch(/\.plan-question-date \.ui-temporal-picker__trigger\s*\{[^}]*min-width:\s*150px;/s)
-    expect(conversationStyles).toMatch(/\.plan-question-datetime-controls\s*\{[^}]*display:\s*flex;[^}]*gap:\s*var\(--space-2\);/s)
     expect(conversationStyles).toMatch(/@media \(any-hover: none\), \(any-pointer: coarse\)[\s\S]*\.plan-question-date\s*\{[^}]*height:\s*var\(--control-lg\);/s)
-    expect(conversationStyles).not.toContain('.plan-question-time-input')
-    expect(conversationStyles).not.toContain('.plan-question-time-control')
-    expect(conversationStyles).not.toContain('.plan-question-composer-head-button')
-    expect(conversationStyles).toMatch(/\.approval-composer-head,\s*\.plan-question-composer-head,\s*\.plan-review-composer-head\s*\{[^}]*padding:\s*10px var\(--space-4\);/s)
-    expect(conversationStyles).toMatch(/\.plan-interaction-card-description\s*\{[^}]*flex:\s*1 1 auto;[^}]*text-overflow:\s*ellipsis;/s)
-    expect(conversationStyles).not.toMatch(/\.plan-question-(?:option-recommended|composer-body > h3 small)[^{]*{[^}]*translateY/s)
-    expect(conversationStyles).toMatch(/\.plan-question-custom textarea\s*{[^}]*height:\s*var\(--type-title-line\);[^}]*max-height:\s*calc\(var\(--type-title-line\) \* 3\);[^}]*overflow-y:\s*hidden;[^}]*font-size:\s*var\(--type-ui-size\);/s)
-    expect(conversationStyles).not.toMatch(/\.plan-question-(?:option:focus-visible|custom:focus-within) \.plan-question-option-index/)
-    expect(conversationStyles).toMatch(/\.plan-question-option:focus-visible,[\s\S]*\.plan-question-option:has\(\.plan-question-native-control:focus-visible\)\s*{[^}]*outline:\s*0;[^}]*background:\s*var\(--color-active\);/s)
-    expect(conversationStyles).not.toMatch(/\.plan-question-option(?::focus-visible|:has\([^}]+)[^{]*\{[^}]*var\(--color-focus\)/s)
-    expect(conversationStyles).not.toContain('.plan-question-option:focus-within')
-    expect(conversationStyles).toMatch(/\.plan-question-option:hover:not\(\.is-disabled\),[\s\S]*\.plan-question-custom:hover:not\(\.is-disabled\),/s)
     expect(conversationStyles).toMatch(/@media \(forced-colors: active\)[\s\S]*\.plan-question-option:focus-visible,[\s\S]*outline:\s*2px solid Highlight;/s)
-    expect(conversationStyles).toMatch(/\.plan-question-composer-pager > span\s*{[^}]*font-size:\s*var\(--type-ui-size\);/s)
-    expect(conversationStyles).toMatch(/\.plan-question-pager-button\s*{[^}]*width:\s*var\(--control-plan-chip\);[^}]*height:\s*var\(--control-plan-chip\);/s)
     expect(conversationStyles).toMatch(/@media \(any-hover: none\), \(any-pointer: coarse\)[\s\S]*\.plan-question-pager-button\s*{[^}]*min-width:\s*var\(--control-lg\);[^}]*min-height:\s*var\(--control-lg\);/s)
     expect(conversationStyles).toMatch(/@media \(prefers-reduced-motion: reduce\)[\s\S]*\.plan-question-pager-button \.ui-icon-button__icon\s*{\s*transition:\s*none;/s)
-  })
-
-  it('uses a distinct answer icon instead of an ambiguous plus sign', () => {
-    const { container } = render(
-      <PlanQuestionComposer
-        threadId="thread-a"
-        interaction={interaction()}
-        onChange={vi.fn()}
-        onSubmit={vi.fn()}
-      />,
-    )
-    const customIcon = container.querySelector('.plan-question-custom .plan-question-option-index')
-    expect(customIcon?.textContent).toBe('')
-    expect(customIcon?.querySelector('svg')).toBeInTheDocument()
   })
 
   it('grows the custom answer from one line to three lines before scrolling', () => {

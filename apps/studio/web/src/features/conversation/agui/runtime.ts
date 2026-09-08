@@ -1607,6 +1607,18 @@ export const applyConversationEvent = (
           ? translateCurrent(event.code === "resume_cancelled" ? '已取消' : '任务已停止')
           : errorMessage
         const errorRunId = rawEvent.runId ?? conversation.activeRunId
+        const runFailures = !isCancelled && errorRunId
+              && conversation.messages.some(message => message.role === 'user' && message.meta?.runId === errorRunId)
+              ? [...(conversation.runFailures ?? []).filter(item => item.runId !== errorRunId), {
+                  runId: errorRunId,
+                  errorCode: event.code ?? null,
+                  failedAt: completedAt,
+                  retryable: event.code === 'runtime_initialization_error',
+                }]
+              : conversation.runFailures
+        if (conversation.activeRunId && errorRunId && conversation.activeRunId !== errorRunId) {
+          return { ...conversation, runFailures }
+        }
         if (
           rawEvent.initializationFailed === true
           && (conversation.approval || conversation.planInteraction)
@@ -1622,9 +1634,10 @@ export const applyConversationEvent = (
           )
         }
         // 用户主动停止是正常业务终态，不能把未完成工作渲染成系统故障
-        return setConversationNotice(
-          {
+        return {
             ...conversation,
+            notice: undefined,
+            runFailures,
             runStatus: isCancelled ? "idle" : "error",
             activeRunId: undefined,
             approval: undefined,
@@ -1655,11 +1668,7 @@ export const applyConversationEvent = (
                 ? { ...todo, status: "cancelled" as const }
                 : todo
             )),
-          },
-          visibleMessage,
-          isCancelled ? "info" : "error",
-          `${errorRunId}:terminal`,
-        )
+          }
       }
 
     default:

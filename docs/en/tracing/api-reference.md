@@ -1,6 +1,6 @@
 # Tracing API reference
 
-[Semantic tracing](index.md) · [中文](../../zh/tracing/api-reference.md)
+[Semantic tracing](index.md) · [中文](../../cn/tracing/api-reference.md)
 
 ## `Tracer`
 

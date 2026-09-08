@@ -123,6 +123,7 @@ export const englishMessages = {
   '正在加载更多历史会话': 'Loading more conversation history',
   '重试加载历史': 'Retry loading history',
   '重试': 'Retry',
+  '会话异常': 'Conversation error',
   '打开用户菜单': 'Open user menu',
   '关闭用户菜单': 'Close user menu',
   '退出登录': 'Sign out',

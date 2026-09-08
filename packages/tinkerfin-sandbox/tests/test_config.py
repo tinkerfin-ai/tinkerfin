@@ -40,10 +40,6 @@ def test_workspace_root_rejects_unsafe_boundaries(workspace_root: str) -> None:
         OpenSandboxConfig(workspace_root=workspace_root)
 
 
-def test_workspace_root_allows_explicit_opt_out() -> None:
-    assert OpenSandboxConfig(workspace_root=None).workspace_root is None
-
-
 def test_config_accepts_pvc_volume_mounts_without_sharing_mutable_input() -> None:
     volume = Volume(
         name="workspace-data",

@@ -1,6 +1,6 @@
 # Create and run a Deep Agent
 
-[Runtime basics](index.md) · [中文](../../zh/runtime/deep-agents.md)
+[Runtime basics](index.md) · [中文](../../cn/runtime/deep-agents.md)
 
 This guide starts with the settings most applications need, then covers the optional run controls. You do not need to fill every parameter.
 

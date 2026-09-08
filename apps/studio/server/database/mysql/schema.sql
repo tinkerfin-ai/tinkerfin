@@ -117,3 +117,6 @@ CREATE TABLE conversation_attachments (
 )COMMENT='会话上传和生成附件的持久化引用';
 CREATE INDEX ix_conversation_attachments_cleanup ON conversation_attachments (thread_id, created_at);
 CREATE INDEX ix_conversation_attachments_owner ON conversation_attachments (user_id, thread_id);
+
+INSERT INTO users (username, display_name, avatar_url, password_hash, roles, disabled)
+VALUES ('tinkerfin', 'TinkerFin', NULL, '$pbkdf2-sha256$600000$1ZFendL8broCk5OyW_zBQA$FHwGHqHzxz2n3-ksjSWYySw1tq6sE3X83sIsAGB1REI', '[]', FALSE);

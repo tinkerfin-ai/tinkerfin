@@ -1,13 +1,25 @@
 # Repository development
 
-[中文](../zh/development.md)
+[中文](../cn/development.md)
 
 Run repository commands from the checkout root. Python 3.11 or newer and uv are required.
+
+See [Contributing](../../CONTRIBUTING.md) for pull requests and routine Python and Studio Web checks.
 
 ## Install the workspace
 
 ```bash
 uv sync --locked --all-packages --group dev
+```
+
+## Validate Studio Web
+
+Run `pnpm test:browser` from `apps/studio/web` to build and run the browser suite.
+To run a selected test file directly, build the application first:
+
+```bash
+pnpm build
+pnpm exec playwright test tests/browser/todo-trace.spec.ts --workers=1
 ```
 
 ## Build wheels
@@ -51,3 +63,11 @@ The suite checks contaminated build directories, current source contents, wheel 
 licenses, declared dependencies, and installation into isolated environments. CI runs the
 core installation cases on Python 3.11–3.14. Python 3.11 also runs every optional dependency
 combination and the complete Studio deployment wheel set.
+
+## Validate Docker integrations
+
+Start Docker, then run tests that create and clean up their own disposable services:
+
+```bash
+uv run pytest packages apps/studio/server/tests -m docker_integration
+```

@@ -9,6 +9,7 @@ __all__ = [
     "_is_retryable_mysql_conflict",
     "_is_retryable_sqlite_lock",
     "_is_retryable_start_failure",
+    "_read_rows",
     "_renew_worker_loop",
     "_run_claim_transaction",
     "_run_write_transaction",

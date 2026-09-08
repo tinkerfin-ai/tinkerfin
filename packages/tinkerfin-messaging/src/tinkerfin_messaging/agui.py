@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from copy import deepcopy
 from typing import ClassVar, Protocol, cast
 
@@ -460,9 +460,14 @@ class AgUiCodec(
             )
         if isinstance(item, RunErrorEvent):
             raw = item.raw_event
-            source = raw.get("source") if isinstance(raw, dict) else None
+            source = (
+                cast(Mapping[object, object], raw).get("source")
+                if isinstance(raw, dict)
+                else None
+            )
             return not (
-                isinstance(source, dict) and source.get("agentType") == "subagent"
+                isinstance(source, dict)
+                and cast(Mapping[object, object], source).get("agentType") == "subagent"
             )
         return False
 

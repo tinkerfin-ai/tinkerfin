@@ -32,6 +32,7 @@ const detail = (): ConversationHistoryDetail => ({
   generation: 'generation-test',
   observedAt: '2026-09-05T00:00:00.000000Z',
   headRunId: 'run-1',
+  runFailures: [],
   availableHeads: ['run-1'],
   historyCursor: null,
   messageCount: 1,
@@ -141,6 +142,7 @@ describe('conversation Trace client', () => {
     const snapshot = { type: 'snapshot' as const, snapshot: detail() }
     const update = {
       type: 'update' as const,
+      runFailures: [],
       taskTrace: null,
       update: {
         asOfSeq: 5,
@@ -157,7 +159,7 @@ describe('conversation Trace client', () => {
         completeness: { missingPrefix: false, missingTail: false, payloadOmitted: false },
         messageCount: 1,
         toolCallCount: 0,
-        projections: {},
+        projections: {}, runFailures: [],
       },
     }
     vi.stubGlobal('fetch', vi.fn(async () => streamResponse(snapshot, update)))

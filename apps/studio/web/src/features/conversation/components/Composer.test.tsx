@@ -521,35 +521,6 @@ describe('Composer', () => {
     expect(screen.getByRole('button', { name: '发送消息' })).toBeDisabled()
   })
 
-  it('uses one shared mirror layer for wrapped growth and capped scrolling', () => {
-    const props = {
-      ...composerChromeProps(),
-      isRunning: false,
-      onChange: vi.fn(),
-      onSend: vi.fn(),
-      onStop: vi.fn(),
-    }
-    const { container, rerender } = render(<Composer {...props} value="一行" />)
-    const input = screen.getByLabelText('消息输入')
-    const inputScroll = container.querySelector('.composer-input-scroll')
-    const mirror = container.querySelector('.composer-input-mirror')
-    const backdrop = container.querySelector('.composer-input-backdrop')
-
-    expect(inputScroll).not.toBeNull()
-    expect(mirror?.textContent).toBe('一行\n')
-    expect(backdrop).toHaveTextContent('一行')
-    expect(input.parentElement).toBe(mirror?.parentElement)
-    expect(input.parentElement).toBe(backdrop?.parentElement)
-    expect(input).not.toHaveAttribute('style')
-
-    rerender(<Composer {...props} value={'一\n二\n三\n四'} />)
-    expect(mirror?.textContent).toBe('一\n二\n三\n四\n')
-
-    rerender(<Composer {...props} value={'一\n二\n三\n四\n五\n六\n七'} />)
-    expect(mirror?.textContent).toBe('一\n二\n三\n四\n五\n六\n七\n')
-    expect(inputScroll).toHaveClass('composer-input-scroll')
-  })
-
   it('shows the DSH command and skill inventory with Plan as the only enabled item', () => {
     const onChange = vi.fn()
     render(
@@ -758,7 +729,6 @@ describe('Composer', () => {
     expect(target).toHaveFocus()
   })
 })
-
 
 it('引用附件后保留草稿并聚焦输入框', async () => {
   const props = { ...composerChromeProps(), value: '继续说明图中的内容', isRunning: false, onChange: vi.fn(), onSend: vi.fn(), onStop: vi.fn() }

@@ -1,6 +1,6 @@
 # Sandbox 入门
 
-[文档首页](../README.md) · [English](../../en/sandbox/index.md)
+[文档首页](../index.md) · [English](../../en/sandbox/index.md)
 
 `tinkerfin-sandbox` 把 OpenSandbox 接入 Deep Agents。Agent 可以在隔离环境中执行命令、读写文件，而不是直接操作应用服务器。
 

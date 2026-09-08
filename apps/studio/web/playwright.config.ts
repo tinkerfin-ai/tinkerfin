@@ -6,8 +6,8 @@ const artifactRoot = join(tmpdir(), 'tinkerfin-studio-playwright')
 
 export default defineConfig({
   testDir: './tests/browser',
-  fullyParallel: false,
-  workers: 1,
+  fullyParallel: true,
+  workers: 2,
   timeout: 30_000,
   expect: { timeout: 5_000 },
   outputDir: join(artifactRoot, 'test-results'),
@@ -18,9 +18,9 @@ export default defineConfig({
     trace: 'retain-on-failure',
   },
   webServer: {
-    command: 'pnpm build && pnpm preview --host 127.0.0.1 --port 4173',
+    command: 'pnpm preview --host 127.0.0.1 --port 4173',
     url: 'http://127.0.0.1:4173',
-    reuseExistingServer: !process.env.CI,
+    reuseExistingServer: false,
     timeout: 120_000,
   },
   projects: [{

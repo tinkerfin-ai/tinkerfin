@@ -1,6 +1,6 @@
 # Runtime basics
 
-[Documentation](../README.md) · [中文](../../zh/runtime/index.md)
+[Documentation](../index.md) · [中文](../../cn/runtime/index.md)
 
 TinkerFin opens one managed Agent run and exposes its progress as an asynchronous
 stream. Models, databases, checkpointers, Stores, and Sandbox resources remain owned by

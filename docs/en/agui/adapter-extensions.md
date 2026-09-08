@@ -1,6 +1,6 @@
 # Use the AG-UI converter directly
 
-[Interrupts and resume](interrupts-and-resume.md) · [中文](../../zh/agui/adapter-extensions.md)
+[Interrupts and resume](interrupts-and-resume.md) · [中文](../../cn/agui/adapter-extensions.md)
 
 Use `tinkerfin-agui-adapter` by itself when your application already creates and runs LangGraph and only needs native-v2-to-AG-UI conversion.
 

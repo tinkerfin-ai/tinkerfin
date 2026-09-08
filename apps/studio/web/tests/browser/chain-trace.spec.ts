@@ -262,6 +262,7 @@ const detail = (
   generation: `browser-generation:${threadId}`,
   observedAt: '2026-09-05T00:00:00.000000Z',
   headRunId: RUN_ID,
+  runFailures: [],
   availableHeads: [RUN_ID],
   historyCursor: null,
   messageCount: 30,
@@ -1285,7 +1286,7 @@ test('错误详情将请求入口与错误摘要紧凑并排', async ({ page }) 
       const titleBox = await panel.getByText('builtins.TimeoutError', { exact: true }).boundingBox()
       const actionBox = await request.boundingBox()
       expect(actionBox!.x).toBeGreaterThan(titleBox!.x + titleBox!.width)
-      await page.screenshot({ path: `/tmp/trace-error-compact-${theme}-${width}.png` })
+
       await request.click()
       await expect(page.getByRole('tab', { name: '请求', exact: true })).toHaveAttribute('aria-selected', 'true')
       await page.getByRole('button', { name: '关闭链路详情' }).click()

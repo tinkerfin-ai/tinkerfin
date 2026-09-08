@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import Literal
+from typing import Any, Literal, cast
 
 from ag_ui.core import UserMessage
 from ag_ui.core.types import DocumentInputContent, ImageInputContent, InputContentPart
 from langchain.agents.middleware.types import InputAgentState
-from pydantic import BaseModel, ConfigDict, model_validator
+from langchain_core.messages import AnyMessage
+from pydantic import BaseModel, ConfigDict, JsonValue, model_validator
 
 from tinkerfin_agui_adapter.media import user_message_to_langchain
 from tinkerfin_contracts.media import Attachment
+
+__all__ = ["AgUiUserInput", "_user_messages_to_input"]
 
 
 class AgUiUserInput(BaseModel):
@@ -32,8 +35,11 @@ class AgUiUserInput(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _exclude_identity(cls, value: object) -> object:
-        if isinstance(value, Mapping) and "id" in value:
-            raise ValueError("user input must not contain a message ID")
+        if isinstance(value, Mapping):
+            mapping = cast(Mapping[object, object], value)
+            if "id" in mapping:
+                raise ValueError("user input must not contain a message ID")
+            return mapping
         return value
 
     @property
@@ -106,7 +112,7 @@ class AgUiUserInput(BaseModel):
             )
         payload = self.model_dump(mode="json", by_alias=True)
         if not isinstance(self.content, str):
-            parts = []
+            parts: list[dict[str, JsonValue]] = []
             for part in self.content:
                 if (
                     isinstance(part, (ImageInputContent, DocumentInputContent))
@@ -139,7 +145,7 @@ def _user_messages_to_input(
     """Validate authoritative message identities before native graph construction."""
     if isinstance(messages, (str, bytes)) or not messages:
         raise ValueError("messages must contain at least one user message")
-    converted = []
+    converted: list[AnyMessage | dict[str, Any]] = []
     ids: set[str] = set()
     for value in messages:
         message = UserMessage.model_validate(value)

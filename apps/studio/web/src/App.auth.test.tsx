@@ -1,6 +1,6 @@
 import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 
 import App from './App'
 import {
@@ -60,6 +60,11 @@ function seedSession(
 }
 
 describe('App authentication boundary', () => {
+  beforeAll(async () => {
+    // 认证用例验证挂载时机，先完成真实工作区模块加载以隔离测试转译耗时
+    await import('./features/workspace/WorkspaceScreen')
+  })
+
   afterEach(() => {
     cleanup()
     clearAuthSession()
@@ -413,6 +418,7 @@ describe('App authentication boundary', () => {
           lastModel: 'main',
           asOfSeq: 1,
           headRunId: 'private-run',
+          runFailures: [],
           availableHeads: ['private-run'],
           historyCursor: null,
           messageCount: 0,

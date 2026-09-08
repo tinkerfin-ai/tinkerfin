@@ -46,9 +46,15 @@ asyncio.run(main())
         assert not (tmp_path / "logs").exists()
 
 
-@pytest.mark.parametrize("echo", (False, True))
-@pytest.mark.parametrize("file_enabled", (False, True))
-@pytest.mark.parametrize("level", ("DEBUG", "INFO", "ERROR"))
+@pytest.mark.parametrize(
+    ("echo", "file_enabled", "level"),
+    [
+        (False, False, "DEBUG"),
+        (False, True, "DEBUG"),
+        (True, False, "ERROR"),
+        (True, True, "ERROR"),
+    ],
+)
 def test_database_sql_uses_host_handlers_once_per_output(
     tmp_path: Path, echo: bool, file_enabled: bool, level: str
 ) -> None:

@@ -668,6 +668,7 @@
     .tool-card,
     .tool-batch,
     .todo-trace-update-row,
+    .conversation-run-failure,
     .approval-wait-state,
     .plan-interaction-wait-state,
     .message-history-loader,
@@ -683,6 +684,7 @@
     .tool-card,
     .tool-batch,
     .todo-trace-update-row,
+    .conversation-run-failure,
     .approval-wait-state,
     .plan-interaction-wait-state,
     .message-history-loader,
@@ -694,6 +696,7 @@
     .tool-card,
     .tool-batch,
     .todo-trace-update-row,
+    .conversation-run-failure,
     .approval-wait-state,
     .plan-interaction-wait-state,
     .message-history-loader,
@@ -702,12 +705,12 @@
     margin-top: var(--conversation-flow-gap);
   }
 
-  /* 普通轮次复用参考会话节奏，Tool、Task 和反馈卡片仍走默认16px */
-  .message-list > .user-message + .assistant-message {
+  /* 异常提示沿用普通回答的轮次间距，工具和任务内容仍走默认16px */
+  .message-list > .user-message + :is(.assistant-message, .conversation-run-failure) {
     margin-top: 0;
   }
 
-  .message-list > .assistant-message:has(> .message-action-row--assistant) + .user-message {
+  .message-list > :is(.assistant-message:has(> .message-action-row--assistant), .conversation-run-failure) + .user-message {
     margin-top: var(--space-12);
   }
 

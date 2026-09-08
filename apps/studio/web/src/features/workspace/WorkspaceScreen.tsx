@@ -74,6 +74,7 @@ import { readThreadFromLocation, writeThreadToLocation } from '../../lib/threadR
 import type {
   ApprovalState,
   Conversation,
+  Message,
   PlanInteraction,
   PlanQuestionState,
   PlanReviewState,
@@ -140,6 +141,7 @@ export function WorkspaceScreen({
   const [draftConversation, setDraftConversation] = useState<Conversation | null>(null)
   const [draftModel, setDraftModel] = useState('')
   const [draft, setDraftValue] = useState('')
+  const submissionLocks = useRef(new Map<string, string>())
   const draftRevision = useRef(0)
   const setDraft = useCallback((value: SetStateAction<string>) => {
     draftRevision.current += 1
@@ -170,6 +172,7 @@ export function WorkspaceScreen({
   latestWorkspace.current = workspace
   const pushToast = onToast
   const notifyConversation = useCallback((notice: NonNullable<Conversation['notice']>) => {
+    if (notice.id?.endsWith(':terminal')) return
     const key = notice.id ?? `${notice.kind}:${notice.content}`
     if (notifiedConversationEvents.current.has(key)) return
     notifiedConversationEvents.current.add(key)
@@ -247,23 +250,8 @@ export function WorkspaceScreen({
   }, [draftConversation, draftModel, selectedConversation, workspace.currentThreadId])
 
   useEffect(() => {
-    let notification = conversation.notice
-    let runId = conversation.activeRunId
-    for (let index = conversation.messages.length - 1; index >= 0; index -= 1) {
-      const message = conversation.messages[index]!
-      if (!notification && conversation.runStatus === 'error' && message.role === 'error') {
-        notification = { kind: 'error', content: message.content, id: `${message.meta?.runId}:terminal` }
-        runId = message.meta?.runId
-      }
-      if (notification && !runId && message.role === 'user') runId = message.meta?.runId
-      if (notification && runId) break
-    }
-    if (!notification) return
-    const key = notification.id ?? JSON.stringify([
-      conversation.threadId, runId ?? conversation.trace?.headRunId,
-      notification.kind, notification.content,
-    ])
-    notifyConversation({ ...notification, id: key })
+    const notification = conversation.notice
+    if (notification && !notification.id?.endsWith(':terminal')) notifyConversation(notification)
   }, [conversation, notifyConversation])
 
   useEffect(() => {
@@ -490,20 +478,32 @@ export function WorkspaceScreen({
     })
   }, [messageWindow, scrollConversationToBottom])
 
-  const beginSend = useCallback((content: string, modeOverride?: AgentMode) => {
+  const beginSend = useCallback((content: string, modeOverride?: AgentMode, resubmission?: Message) => {
     const trimmed = content.trim()
-    const readyAttachments = localAttachments.attachments.flatMap(item => item.attachment ? [item.attachment] : [])
-    if ((!trimmed && !readyAttachments.length) || isRunning || !conversation.model || localAttachments.attachments.some(item => item.state !== 'ready')) return
-    if (readyAttachments.some(item => item.mime_type.startsWith('image/')) && imageSupport(conversation.model) !== 'supported') return
+    const readyAttachments = resubmission ? resubmission.attachments ?? [] : localAttachments.attachments.flatMap(item => item.attachment ? [item.attachment] : [])
+    const submissionKey = workspace.currentThreadId
+    if (submissionLocks.current.has(submissionKey) || isActiveThread(submissionKey)) return
+    if ((!trimmed && !readyAttachments.length) || isRunning || !conversation.model || (!resubmission && localAttachments.attachments.some(item => item.state !== 'ready'))) return
+    if (resubmission && (conversation.runStatus === 'detached' || conversation.pendingInteractionKind || conversation.approval || conversation.planInteraction)) return
+    if (readyAttachments.some(item => item.mime_type.startsWith('image/')) && imageSupport(conversation.model) !== 'supported') {
+      if (resubmission) pushToast('error', t('当前模型不支持图片或能力未确认，请切换模型'))
+      return
+    }
     const submittedIds = localAttachments.attachments.map(item => item.id)
     const submittedThreadId = workspace.currentThreadId
     const submittedDraft = draft
     const clearedDraftRevision = draftRevision.current + 1
+    const releaseSubmission = (runId: string) => {
+      // 旧请求只能释放自己的提交入口，不能影响随后开始的新草稿
+      if (submissionLocks.current.get(submissionKey) === runId) {
+        submissionLocks.current.delete(submissionKey)
+      }
+    }
     const onAccepted = () => {
-      localAttachments.completeSend(submittedIds)
+      if (!resubmission) localAttachments.completeSend(submittedIds)
     }
     const onRequestRejected = () => {
-      if (draftRevision.current === clearedDraftRevision
+      if (!resubmission && draftRevision.current === clearedDraftRevision
         && latestWorkspace.current.currentThreadId === submittedThreadId) {
         setDraft(submittedDraft)
       }
@@ -540,15 +540,20 @@ export function WorkspaceScreen({
         serverState: {},
       }
 
+      submissionLocks.current.set(submissionKey, payload.runId)
       scrollConversationToBottomImmediately()
       setDraftConversation(seededConversation)
-      setDraft('')
+      if (!resubmission) setDraft('')
       void streamRun(nextConversation.threadId, payload, 'start', {
         target: 'draft',
         initialConversation: seededConversation,
-        onAccepted,
+        onAccepted: () => {
+          // 已受理的运行按正式会话隔离，空白入口可继续创建新会话
+          releaseSubmission(payload.runId)
+          onAccepted()
+        },
         onRequestRejected,
-      })
+      }).finally(() => releaseSubmission(payload.runId))
       return
     }
 
@@ -575,6 +580,7 @@ export function WorkspaceScreen({
     const payload = buildInitialPayload(sendingConversation, trimmed, readyAttachments)
     const requestMessage = payload.messages.at(0)
     if (!requestMessage) return
+    submissionLocks.current.set(submissionKey, payload.runId)
     scrollConversationToBottomImmediately()
     setWorkspace((state) => {
       return updateConversation(state, currentConversation.threadId, (item) => ({
@@ -597,9 +603,17 @@ export function WorkspaceScreen({
         }],
       }))
     })
-    setDraft('')
-    void streamRun(currentConversation.threadId, payload, 'start', { target: 'workspace', onAccepted, onRequestRejected })
-  }, [localAttachments, imageSupport, conversation.mode, conversation.model, draft, draftConversation?.model, draftModel, hydrateConversation, isRunning, messageWindow, scrollConversationToBottomImmediately, setDraft, streamRun, t, workspace.conversations, workspace.currentThreadId])
+    if (!resubmission) setDraft('')
+    void streamRun(currentConversation.threadId, payload, 'start', { target: 'workspace', onAccepted, onRequestRejected }).finally(() => releaseSubmission(payload.runId))
+  }, [isActiveThread, pushToast, t, conversation, localAttachments, imageSupport, draft, draftConversation?.model, draftModel, hydrateConversation, isRunning, messageWindow, scrollConversationToBottomImmediately, setDraft, streamRun, workspace.conversations, workspace.currentThreadId])
+
+  const retryRun = useCallback((message: Message) => {
+    const current = latestWorkspace.current.conversations.find(item => item.threadId === workspace.currentThreadId)
+    const original = current?.messages.find(item => item.id === message.id && item.role === 'user')
+    if (!current?.isHydrated || !original || original.meta?.contentOmitted) return
+    if (!current.runFailures?.some(item => item.runId === original.meta?.runId && item.retryable)) return
+    beginSend(original.content, undefined, original)
+  }, [beginSend, workspace.currentThreadId])
 
   useEffect(() => {
     if (!pendingResume) return
@@ -1065,6 +1079,8 @@ export function WorkspaceScreen({
               onRetryHydration={() => void hydrateConversation(conversation.threadId)}
               onError={(message) => pushToast('error', message)}
               onRecoverConversation={() => void recoverConversation(conversation.threadId)}
+              onRetryRun={retryRun}
+              retryDisabled={isRunning || conversation.runStatus === 'detached' || !conversation.isHydrated || !modelIds.includes(conversation.model) || Boolean(conversation.pendingInteractionKind || conversation.approval || conversation.planInteraction)}
               onLoadEarlierMessages={(trigger) => void messageWindow.loadEarlierMessages(trigger)}
             />
             <Composer

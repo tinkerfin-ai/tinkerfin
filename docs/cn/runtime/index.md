@@ -1,6 +1,6 @@
 # Runtime 入门
 
-[文档首页](../README.md) · [English](../../en/runtime/index.md)
+[文档首页](../index.md) · [English](../../en/runtime/index.md)
 
 TinkerFin 打开一次 managed Agent run，并把运行过程作为异步流交给调用方。模型、数据库、
 checkpointer、Store 与 Sandbox 资源仍由宿主管理。

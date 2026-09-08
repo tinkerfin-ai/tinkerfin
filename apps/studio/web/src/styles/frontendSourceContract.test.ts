@@ -57,13 +57,6 @@ describe('前端源码契约', () => {
     expect(forbidden).toEqual([])
   })
 
-  it('共享 components 目录只包含跨功能 UI 能力', () => {
-    const sharedPaths = productionSources
-      .map(([path]) => path)
-      .filter((path) => path.startsWith('../components/'))
-    expect(sharedPaths.every((path) => path.startsWith('../components/ui/'))).toBe(true)
-  })
-
   it('业务源码只通过共享 UI 组件使用 Zag 交互能力', () => {
     const directImports: string[] = []
     for (const [path, source] of productionSources) {

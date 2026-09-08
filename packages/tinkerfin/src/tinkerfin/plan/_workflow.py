@@ -566,7 +566,7 @@ class _PlanningGraphFactory(Generic[ContextT]):
         read_only_tools = (
             tuple(
                 tool
-                for tool in supplied_tools
+                for tool in cast(Sequence[object], supplied_tools)
                 if isinstance(tool, BaseTool)
                 and tool.metadata
                 and tool.metadata.get("read_only") is True

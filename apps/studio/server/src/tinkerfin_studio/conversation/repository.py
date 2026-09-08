@@ -434,6 +434,7 @@ class ConversationRepository:
         has_pending_interrupt: bool,
         pending_interaction_kind: str | None,
         terminal_outcome: str | None,
+        error_code: str | None = None,
         updated_at: datetime,
         trace_generation: str,
         trace_as_of_seq: int,
@@ -461,6 +462,7 @@ class ConversationRepository:
                         registration.status
                         == _registration_status(status, terminal_outcome)
                         and registration.terminal_outcome == terminal_outcome
+                        and registration.error_code == error_code
                     )
                     if thread.last_run_id in (None, run_id):
                         same_result = same_result and (
@@ -479,6 +481,7 @@ class ConversationRepository:
             registration.trace_observed_at = trace_observed_at
             registration.status = _registration_status(status, terminal_outcome)
             registration.terminal_outcome = terminal_outcome
+            registration.error_code = error_code
             registration.finished_at = (
                 updated_at if terminal_outcome is not None else None
             )

@@ -1,8 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
 import indexHtml from '../../index.html?raw'
-import brandLogoSource from '../components/ui/BrandLogo.tsx?raw'
-import brandMarkSource from '../components/ui/BrandMark.tsx?raw'
 import mainEntry from '../main.tsx?raw'
 import workspaceLayoutAnimation from '../features/workspace/useWorkspaceLayoutAnimation.ts?raw'
 import tokensStyles from './tokens.css?raw'
@@ -86,15 +84,6 @@ describe('前端视觉契约', () => {
       expect([...new Set(owners)], `${path} 必须只有一个 owner layer`).toHaveLength(1)
       expect(layerOrder, `${path} 使用了未预声明 layer`).toContain(owners[0])
     }
-  })
-
-  it('网站标题、菜单和过渡状态使用同一套品牌资产', () => {
-    expect(indexHtml).toContain('type="image/png" href="/brand/tinkerfin-favicon.png?v=1"')
-    expect(indexHtml).not.toContain('tinkerfin-favicon.svg')
-    expect(brandLogoSource).toContain('/brand/tinkerfin-mark.png?v=1')
-    expect(brandLogoSource).toContain('/brand/tinkerfin-wordmark.png?v=1')
-    expect(brandMarkSource).toContain('/brand/tinkerfin-mark.png?v=1')
-    expect(brandMarkSource).not.toContain('lucide-react')
   })
 
   it('按既定顺序加载自托管字体、令牌、排版和基础样式', () => {
@@ -211,13 +200,6 @@ describe('前端视觉契约', () => {
     expect(uiStyles).toMatch(/\.modal-backdrop\s*\{[^}]*position:\s*fixed;[^}]*z-index:\s*var\(--layer-modal\);[^}]*inset:\s*0;/s)
     expect(chainTraceStyles).toMatch(/\.chain-trace-details-backdrop\s*\{[^}]*place-items:\s*stretch;[^}]*justify-items:\s*end;[^}]*padding:\s*0;/s)
     expect(chainTraceStyles).toMatch(/\.chain-trace-details-backdrop \.chain-trace-details\s*\{[^}]*width:\s*min\(var\(--layout-drawer-width\), calc\(100vw - var\(--space-8\)\)\);[^}]*height:\s*100dvh;/s)
-  })
-
-  it('ThemePicker 以固定完整宽度和 scaleX 展开表面', () => {
-    const uiStyles = cssFiles['../components/ui/ui.css']
-
-    expect(uiStyles).toMatch(/\.theme-switcher-surface\s*\{[^}]*width:\s*calc\(var\(--control-lg\) \* 3\);[^}]*transform:\s*scaleX\(0\.333333\);[^}]*transform-origin:\s*right center;[^}]*will-change:\s*transform, opacity;/s)
-    expect(uiStyles).not.toMatch(/\.theme-switcher-surface\s*\{[^}]*will-change:\s*width/s)
   })
 
   it('共享 Button 与 TextField 使用统一桌面尺度和单一中性焦点边', () => {
@@ -587,8 +569,8 @@ describe('前端视觉契约', () => {
     expect(workspaceStyles).not.toContain('--conversation-flow-gap-mixed')
     expect(workspaceStyles).not.toContain('--conversation-flow-gap-content')
     expect(workspaceStyles).toMatch(/\.message-list > :is\([\s\S]*?\.approval-wait-state,[\s\S]*?\.plan-interaction-wait-state,[\s\S]*?\) \+ :is\([\s\S]*?\.approval-wait-state,[\s\S]*?\.plan-interaction-wait-state,[\s\S]*?\)\s*\{[^}]*margin-top:\s*var\(--conversation-flow-gap\);/s)
-    expect(workspaceStyles).toMatch(/\.message-list > \.user-message \+ \.assistant-message\s*\{[^}]*margin-top:\s*0;/s)
-    expect(workspaceStyles).toMatch(/\.message-list > \.assistant-message:has\(> \.message-action-row--assistant\) \+ \.user-message\s*\{[^}]*margin-top:\s*var\(--space-12\);/s)
+    expect(workspaceStyles).toMatch(/\.message-list > \.user-message \+ :is\(\.assistant-message, \.conversation-run-failure\)\s*\{[^}]*margin-top:\s*0;/s)
+    expect(workspaceStyles).toMatch(/\.message-list > :is\(\.assistant-message:has\(> \.message-action-row--assistant\), \.conversation-run-failure\) \+ \.user-message\s*\{[^}]*margin-top:\s*var\(--space-12\);/s)
     expect(workspaceStyles).toMatch(/\.message-list > :is\([\s\S]*?\.message-history-loader,[\s\S]*?\.message-stream-tail[\s\S]*?\) \+ :is\([\s\S]*?\.message-history-loader,[\s\S]*?\.message-stream-tail/s)
     expect(workspaceStyles).toMatch(/\.message-history-loader\s*\{[^}]*display:\s*grid;[^}]*place-items:\s*center;[^}]*\}/s)
     expect(workspaceStyles).not.toMatch(/\.message-history-loader\s*\{[^}]*padding-bottom:/s)

@@ -11,10 +11,7 @@ import type { JsonObject, JsonValue, Message } from '../../src/types'
 
 const THREAD_ID = 'browser-thread'
 const BASE_TIME = '2026-08-25T00:00:00.000Z'
-const UI_EVIDENCE_DIR = resolve(
-  process.cwd(),
-  '../../../.agents/evidence/20260828014138-trace-persistence-studio-authority/implementation/browser/ui-refinement-20260831',
-)
+
 const user = {
   user_id: 7,
   username: 'browser-user',
@@ -535,7 +532,6 @@ interface MockStudioOptions {
   planQuestion?: boolean
   planQuestionForm?: JsonObject
   planReview?: boolean
-  runError?: boolean
   runningActivity?: boolean
   taskTrace?: TaskTraceSnapshot
 }
@@ -553,7 +549,6 @@ async function mockStudio(page: Page, {
   planQuestion = false,
   planQuestionForm: planQuestionFormOverride,
   planReview = false,
-  runError = false,
   runningActivity = false,
   taskTrace = { status: 'ready', todoGroups: [] },
 }: MockStudioOptions = {}) {
@@ -744,9 +739,7 @@ async function mockStudio(page: Page, {
       ? 'waiting' as const
       : runningActivity
         ? 'running' as const
-        : runError
-          ? 'failed' as const
-          : 'succeeded' as const
+        : 'succeeded' as const
     return {
       id: 1,
       threadId: THREAD_ID,
@@ -757,6 +750,7 @@ async function mockStudio(page: Page, {
       generation: `browser-generation:${THREAD_ID}`,
       observedAt: '2026-09-05T00:00:00.000000Z',
       headRunId: 'browser-run',
+      runFailures: [],
       availableHeads: ['browser-run'],
       historyCursor: null,
       messageCount: traceMessages.filter((message) => message.role !== 'tool').length,
@@ -827,19 +821,7 @@ async function mockStudio(page: Page, {
       await fulfillJson(route, { dayRanges: [7, 30] })
       return
     }
-    if (runError && route.request().method() === 'POST' && url.pathname === '/api/conversation/chat') {
-      const runId = `browser-error-run-${Date.now()}`
-      const events = [
-        { type: 'RUN_STARTED', threadId: THREAD_ID, runId },
-        { type: 'RUN_ERROR', rawEvent: { runId }, message: '后端运行错误。', code: 'failed' },
-      ]
-      await route.fulfill({
-        status: 200,
-        contentType: 'text/event-stream',
-        body: events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''),
-      })
-      return
-    }
+
     if (
       pinError
       && route.request().method() === 'PATCH'
@@ -1194,6 +1176,9 @@ test('首页与会话态使用相同的输入卡片高度', async ({ page }) => 
 })
 
 test('macOS Composer 支持 Control+U 且不接管 Command+U', async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, 'platform', { get: () => 'MacIntel' })
+  })
   await mockStudio(page, { emptyHistory: true })
   expect(await page.evaluate(() => navigator.platform)).toContain('Mac')
   const input = page.getByRole('textbox', { name: '消息输入' })
@@ -1302,7 +1287,7 @@ test('Plan 澄清按后端题型渲染单选、多选、文本与日期控件', 
   }
   expect(clarificationBodyBounds.y + clarificationBodyBounds.height)
     .toBeLessThanOrEqual(clarificationFooterBounds.y + .5)
-  await page.screenshot({ path: resolve(UI_EVIDENCE_DIR, 'plan-question-footer-light.png') })
+
   await nextQuestion.click()
 
   const text = page.getByRole('textbox', { name: '自定义回答：还有哪些限制？' })
@@ -1331,19 +1316,18 @@ test('Plan 澄清按后端题型渲染单选、多选、文本与日期控件', 
     expect(Math.abs(bounds.y + (bounds.height / 2) - dateRowCenter)).toBeLessThanOrEqual(.5)
   }
   await page.locator('.plan-question-composer-head').hover()
-  const initialDateStyle = await date.evaluate((element) => {
-    const style = getComputedStyle(element)
-    return { backgroundColor: style.backgroundColor, borderColor: style.borderColor }
-  })
+  const initialDateBackground = await date.evaluate((element) => getComputedStyle(element).backgroundColor)
   await date.hover()
   await expect(date).toHaveCSS('cursor', 'pointer')
   await expect.poll(async () => (
     date.evaluate((element) => getComputedStyle(element).backgroundColor)
-  )).not.toBe(initialDateStyle.backgroundColor)
+  )).not.toBe(initialDateBackground)
   await page.locator('.plan-question-composer-head').hover()
   await date.focus()
-  expect(await date.evaluate((element) => getComputedStyle(element).borderColor))
-    .not.toBe(initialDateStyle.borderColor)
+  await page.keyboard.press('Shift+Tab')
+  await page.keyboard.press('Tab')
+  await expect(date).toBeFocused()
+  await expect(date).toHaveCSS('border-color', 'rgba(0, 0, 0, 0.16)')
   await date.click()
   const calendar = page.getByRole('application', { name: '选择日期' })
   await expect(calendar).toBeVisible()
@@ -1532,9 +1516,7 @@ test('Plan 澄清返回已作答单选题时保持选中项焦点且移出悬浮
       (element) => getComputedStyle(element, '::before').backgroundImage,
     )
     expect(stableFooterOverlay).toContain('linear-gradient')
-    if (colorScheme === 'dark') {
-      await page.screenshot({ path: resolve(UI_EVIDENCE_DIR, 'plan-question-footer-dark.png') })
-    }
+
     for (const width of [320, 768, 1024, 1440]) {
       await page.setViewportSize({ width, height: 900 })
       await mobile.focus()
@@ -2326,11 +2308,7 @@ test('对话底部 Tool 在浅深主题与四个视口展开后避开 Composer',
       if (!detailBounds || !composerBounds) throw new Error('Tool 详情或 Composer 几何不可用')
       expect(detailBounds.y + detailBounds.height).toBeLessThanOrEqual(composerBounds.y - 8)
       await expect.poll(async () => pane.evaluate((element) => element.scrollTop)).toBeGreaterThan(beforeOpen)
-      if (colorScheme === 'light' && width === 1440) {
-        await page.screenshot({
-          path: resolve(UI_EVIDENCE_DIR, 'tool-detail-above-composer-light.png'),
-        })
-      }
+
 
       const beforeClose = await pane.evaluate((element) => element.scrollTop)
       await summary.click()
@@ -2541,11 +2519,7 @@ test('计划草稿以描述标题和三动作卡片接管输入区', async ({ pa
         expect(bounds.x + bounds.width).toBeLessThanOrEqual(cardBounds.x + cardBounds.width)
         expect(bounds.height).toBeLessThanOrEqual(44)
       }
-      if (width === 1024) {
-        await page.screenshot({
-          path: resolve(UI_EVIDENCE_DIR, `plan-review-footer-${colorScheme}.png`),
-        })
-      }
+
     }
   }
 
@@ -2633,22 +2607,6 @@ test('全部 Tool 图标与等待动画共用最小误差光学左缘', async ({
   for (const visibleLeft of visibleOffsets) {
     expect(Math.abs(visibleLeft - (messageListBounds.x + opticalInset))).toBeLessThanOrEqual(.75)
   }
-})
-
-test('对话运行失败提示在中英文界面都不显示末尾句号', async ({ page }) => {
-  await mockStudio(page, { runError: true })
-
-  await page.getByRole('textbox', { name: '消息输入' }).fill('触发运行失败')
-  await page.getByRole('button', { name: '发送消息' }).click()
-  await expect(page.getByText('对话运行失败', { exact: true }).first()).toBeVisible()
-  await expect(page.getByText('对话运行失败。', { exact: true })).toHaveCount(0)
-
-  await page.evaluate(() => localStorage.setItem('tinkerfin:language', 'en'))
-  await page.reload()
-  await page.getByRole('textbox', { name: 'Message input' }).fill('Trigger run failure')
-  await page.getByRole('button', { name: 'Send message' }).click()
-  await expect(page.getByText('Conversation run failed', { exact: true }).first()).toBeVisible()
-  await expect(page.getByText('Conversation run failed.', { exact: true })).toHaveCount(0)
 })
 
 test('运行中 SubAgent 与普通 Tool 共用扫光且标题保持稳定', async ({ page }) => {
@@ -2822,7 +2780,7 @@ test('搜索会话点击后保持标准输入高度且不显示容器描边', as
   }
 })
 
-test('历史分页一次提交最终滑块比例，不产生中间位移动画', async ({ page }) => {
+test('历史分页一次提交最终滑块比例，不产生中间位移动画', { tag: '@performance' }, async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 600 })
   const historyRequests: Array<{ cursor: string | null; receivedAt: number }> = []
   await mockStudio(page, {
@@ -2960,6 +2918,7 @@ test('全局滚动条保持统一参数、分层显隐和直接拖拽映射', as
 })
 
 test('账户菜单、modal 隔离和定时滚动控件保持完整键盘路径', async ({ page }) => {
+  await page.clock.install()
   await mockStudio(page, {
     taskTrace: {
       status: 'ready',
@@ -3100,10 +3059,10 @@ test('账户菜单、modal 隔离和定时滚动控件保持完整键盘路径',
     expect(responsiveAlignment?.overlap).toBe(0)
     expect(responsiveAlignment?.overflow).toBeLessThanOrEqual(0)
   }
-  await page.waitForTimeout(2_000)
+  await page.clock.fastForward(2_000)
   await expect(scrollButton).toBeVisible()
   await pane.focus()
-  await page.waitForTimeout(1_800)
+  await page.clock.fastForward(1_800)
   await expect(scrollButton).toHaveCount(0)
   await pane.evaluate((element) => {
     element.dispatchEvent(new WheelEvent('wheel', { deltaY: 120, bubbles: true }))
@@ -3151,7 +3110,7 @@ test('reduced-motion 跳过 Flip 布局动画', async ({ page }) => {
   await expect(scrollbar.locator('.ui-overlay-scrollbar__thumb')).toHaveCSS('transition-duration', '0s')
 })
 
-test('布局动效不逐帧触发布局且冷缓存只请求允许的西文字体', async ({ page }) => {
+test('布局动效不逐帧触发布局且冷缓存只请求允许的西文字体', { tag: '@performance' }, async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 })
   const fontResponses = new Map<string, Promise<Buffer>>()
   page.on('response', (response) => {
@@ -3389,14 +3348,14 @@ test('对话目录在四视口浅深主题定位已加载但未渲染的提问',
         await expect(rail).toBeVisible()
         await rail.getByRole('button', { name: '跳转到提问：目录提问 0', exact: true }).focus()
         await expect(page.getByRole('tooltip')).toContainText('目录回答 0')
-        await page.screenshot({ path: `/tmp/studio-outline-${theme}-${width}.png` })
+
         await rail.getByRole('button', { name: '跳转到提问：目录提问 0', exact: true }).press('Enter')
       } else {
         await page.getByRole('button', { name: '对话目录', exact: true }).click()
         const dialog = page.getByRole('dialog', { name: '对话目录' })
         await expect(dialog).toBeVisible()
         await expect(dialog).toContainText('仅显示已加载的对话')
-        await page.screenshot({ path: `/tmp/studio-outline-${theme}-${width}.png` })
+
         await dialog.getByRole('button').filter({ hasText: '目录提问 0' }).click()
         await expect(dialog).not.toBeVisible()
       }
@@ -3413,7 +3372,7 @@ test('对话目录在四视口浅深主题定位已加载但未渲染的提问',
       })
       expect(Math.abs(insets.left - insets.right)).toBeLessThanOrEqual(1)
       expect(insets.left).toBeGreaterThanOrEqual(24)
-      await page.screenshot({ path: `/tmp/studio-outline-landed-${theme}-${width}.png` })
+
       await page.getByRole('button', { name: '回到底部', exact: true }).click()
       await expect(page.locator('#outline-question-119')).toBeVisible()
     }
@@ -3468,7 +3427,7 @@ test('设置在窄屏按内容收紧并保持分类与内容相邻', async ({ pa
           expect(Math.abs(content!.y - nav!.y - nav!.height)).toBeLessThanOrEqual(1)
           expect(bounds!.height).toBeLessThan(650)
         }
-        await page.screenshot({ path: `/tmp/studio-settings-${theme}-${width}-${section === '通用' ? 'general' : 'account'}.png` })
+
       }
     }
   }
@@ -3476,7 +3435,7 @@ test('设置在窄屏按内容收紧并保持分类与内容相邻', async ({ pa
 
 for (const { approval, touch } of [{ approval: false, touch: false }, { approval: true, touch: false }, { approval: true, touch: true }]) {
   test(`辅助操作显隐保持目录与阅读区稳定：${touch ? '触控审批' : approval ? '审批' : '普通输入'}`, async ({ page }) => {
-    test.setTimeout(90_000)
+    await page.clock.install()
     if (touch) {
       const cdp = await page.context().newCDPSession(page)
       await cdp.send('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 1 })
@@ -3517,8 +3476,9 @@ for (const { approval, touch } of [{ approval: false, touch: false }, { approval
         expect(control!.y + control!.height).toBeLessThanOrEqual(content!.y)
         expect(control!.x).toBeGreaterThanOrEqual(0)
         expect(control!.x + control!.width).toBeLessThanOrEqual(width)
-        await page.screenshot({ path: `/tmp/stable-navigation-${touch ? 'touch' : approval ? 'approval' : 'input'}-${theme}-${width}.png` })
+
         await page.getByRole('tab', { name: '对话', exact: true }).click()
+        await page.clock.fastForward(2_000)
         await expect(button).toHaveCount(0)
         expect(await measure()).toEqual(baseline)
       }

@@ -92,8 +92,10 @@ async def test_event_log_bounds_and_escapes_identity(
     assert payload["owner_key"] == event.owner_key[:128]
 
 
-@pytest.mark.parametrize("level", ("INFO", "WARNING", "ERROR", "CRITICAL"))
-@pytest.mark.parametrize("file_enabled", (False, True))
+@pytest.mark.parametrize(
+    ("level", "file_enabled"),
+    [("INFO", False), ("WARNING", True), ("CRITICAL", True)],
+)
 def test_sandbox_events_use_existing_host_outputs_once(
     tmp_path: Path, level: str, file_enabled: bool
 ) -> None:

@@ -5,12 +5,13 @@ import { describe, expect, it, vi } from 'vitest'
 import { DrawerHeader } from './DrawerHeader'
 
 describe('DrawerHeader', () => {
-  it('呈现统一的标题、辅助信息和关闭操作', () => {
+  it.each(['regular', 'compact'] as const)('%s 密度下呈现标题、辅助信息和可用的关闭操作', (density) => {
     const closeButton = createRef<HTMLButtonElement>()
     const onClose = vi.fn()
     render(
       <DrawerHeader
         ref={closeButton}
+        density={density}
         title="任务轨迹"
         description="当前会话 · 2 组"
         closeLabel="关闭任务轨迹"
@@ -25,17 +26,4 @@ describe('DrawerHeader', () => {
     expect(onClose).toHaveBeenCalledOnce()
   })
 
-  it('提供不改变标题与关闭语义的紧凑密度', () => {
-    render(
-      <DrawerHeader
-        density="compact"
-        title="节点详情"
-        closeLabel="关闭节点详情"
-        onClose={vi.fn()}
-      />,
-    )
-
-    expect(screen.getByRole('heading', { name: '节点详情' }).closest('header'))
-      .toHaveClass('ui-drawer-header--compact')
-  })
 })

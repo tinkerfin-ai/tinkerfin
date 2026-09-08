@@ -43,6 +43,7 @@ export interface Message {
   content: string
   createdAt: string
   meta?: {
+    contentOmitted?: boolean
     title?: string
     toolName?: string
     params?: string
@@ -69,7 +70,7 @@ export interface Message {
 export interface ConversationNotice {
   kind: 'error' | 'info'
   content: string
-  /** 同一终态的实时通知与历史回放共享标识，手动重试产生独立通知 */
+  /** 同一次请求或连接恢复提示的去重标识 */
   id?: string
   recovery?: 'connection' | 'history'
 }
@@ -222,6 +223,8 @@ export interface Conversation extends Partial<Pick<ConversationTitleSnapshot, "t
   model: string
   mode: AgentMode
   messages: Message[]
+  /** 尚未加载或发生失败时可为空；运行结果不属于消息正文 */
+  runFailures?: import('./api/conversation/history').ConversationRunFailure[]
   notice?: ConversationNotice
   todos: TodoItem[]
   taskTrace: WebTaskTraceViewState

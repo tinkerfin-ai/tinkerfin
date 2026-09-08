@@ -22,9 +22,13 @@ from tinkerfin import RunIdentity
 from tinkerfin_messaging import (
     BackendOwnershipLost,
     CodecMismatch,
+    CommittedMessageQuery,
     MessageSubscription,
     Messaging,
     MessagingBackendProtocolError,
+    MessagingBackendTimeout,
+    MessagingChangeCursor,
+    MessagingChangeWait,
     MessagingLimits,
     MessagingQuotaExceeded,
     MessagingRetentionPolicy,
@@ -141,6 +145,7 @@ def _redis_client(
     redis_url: str,
     *,
     max_connections: int | None = None,
+    socket_timeout: float | None = 5,
 ) -> _RedisT:
     return cast(
         _RedisT,
@@ -148,7 +153,7 @@ def _redis_client(
             redis_url,
             decode_responses=False,
             socket_connect_timeout=5,
-            socket_timeout=5,
+            socket_timeout=socket_timeout,
             max_connections=max_connections,
         ),
     )
@@ -423,6 +428,37 @@ class _ConnectionTrackingRedis(Redis):
         client.blocking_children = self.blocking_children
         self.blocking_children.append(client)
         return client
+
+
+class _GatedCloseRedis(_ConnectionTrackingRedis):
+    """Hold the pinned client's release to exercise concurrent caller cancellation."""
+
+    reading: asyncio.Event
+    closing: asyncio.Event
+    close_release: asyncio.Event
+    fail_close: bool
+
+    def client(self) -> _GatedCloseRedis:
+        client = super().client()
+        assert isinstance(client, _GatedCloseRedis)
+        client.reading = self.reading
+        client.closing = self.closing
+        client.close_release = self.close_release
+        client.fail_close = self.fail_close
+        return client
+
+    async def execute_command(self, *args: object, **options: object) -> object:
+        if args and str(args[0]).casefold() == "xread":
+            self.reading.set()
+        return await super().execute_command(*args, **options)
+
+    async def aclose(self, close_connection_pool: bool | None = None) -> None:
+        if self.single_connection_client:
+            self.closing.set()
+            await self.close_release.wait()
+        await super().aclose(close_connection_pool)
+        if self.single_connection_client and self.fail_close:
+            raise RedisError("pinned close diagnostic")
 
 
 class _GatedXreadRedis(Redis):
@@ -1576,6 +1612,176 @@ async def test_real_redis_cancelled_block_releases_the_only_connection(
     finally:
         if waiting is not None and not waiting.done():
             waiting.cancel()
+            await asyncio.gather(waiting, return_exceptions=True)
+        await _delete_prefix(client, prefix)
+        await client.aclose()
+
+
+async def test_real_redis_cancellation_cleanup_can_read_current_run_state(
+    redis_backends: tuple[RedisBackendHarness, RedisBackendHarness, Redis],
+) -> None:
+    backend, _, _ = redis_backends
+    await backend.prepare(
+        channel="events",
+        identity=_identity(),
+        codec="test.bytes.v1",
+        after=0,
+        cancellable=False,
+        recoverable=False,
+    )
+    entered = asyncio.Event()
+    observed = asyncio.Event()
+
+    async def observe_during_cleanup() -> None:
+        try:
+            entered.set()
+            await asyncio.Event().wait()
+        finally:
+            snapshot = await backend.storage_backend.load_messaging_state(
+                MessagingStateQuery(channel="events", identity=_identity())
+            )
+            assert snapshot.target_run is not None
+            assert snapshot.target_run.status == "running"
+            observed.set()
+
+    waiting = asyncio.create_task(observe_during_cleanup())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        waiting.cancel("close after observing current state")
+        with pytest.raises(asyncio.CancelledError, match="close after observing"):
+            await asyncio.wait_for(waiting, timeout=1)
+        assert observed.is_set()
+    finally:
+        if not waiting.done():
+            waiting.cancel()
+        await asyncio.gather(waiting, return_exceptions=True)
+
+
+@pytest.mark.parametrize("fail_close", [False, True])
+async def test_real_redis_repeated_wait_cancellation_settles_pinned_client_close(
+    redis_url: str,
+    fail_close: bool,
+) -> None:
+    client = _redis_client(_GatedCloseRedis, redis_url, max_connections=1)
+    client.blocking_children = []
+    client.reading = asyncio.Event()
+    client.closing = asyncio.Event()
+    client.close_release = asyncio.Event()
+    client.fail_close = fail_close
+    prefix = f"tfmsg:repeat-close:{uuid4().hex}"
+    backend = RedisBackend(client, key_prefix=prefix, lease_ttl=3)
+    waiting: asyncio.Task[None] | None = None
+    try:
+        prepared = await backend.prepare(
+            channel="events",
+            identity=_identity(),
+            codec="test.bytes.v1",
+            after=0,
+            cancellable=False,
+            recoverable=False,
+        )
+        assert prepared.handle.generation is not None
+        page = await backend.storage_backend.read_committed_messages(
+            CommittedMessageQuery(
+                channel="events",
+                identity=_identity(),
+                generation=prepared.handle.generation,
+                after_sequence=0,
+                through_sequence=None,
+                limit=1,
+            )
+        )
+        waiting = asyncio.create_task(
+            backend.storage_backend.wait_for_messaging_change(
+                MessagingChangeWait(
+                    channel="events",
+                    identity=_identity(),
+                    generation=prepared.handle.generation,
+                    after=page.change_cursor,
+                    timeout_seconds=3,
+                )
+            )
+        )
+        await asyncio.wait_for(client.reading.wait(), timeout=1)
+        waiting.cancel("detach requested")
+        await asyncio.wait_for(client.closing.wait(), timeout=1)
+        connection = client.blocking_children[-1].connection
+        assert connection is not None
+        waiting.cancel("caller cancelled again")
+        await asyncio.sleep(0)
+        assert not waiting.done()
+        client.close_release.set()
+        with pytest.raises(asyncio.CancelledError, match="detach requested") as raised:
+            await asyncio.wait_for(waiting, timeout=1)
+        if fail_close:
+            assert any(
+                "blocking client close" in note for note in raised.value.__notes__
+            )
+        assert connection.socket_timeout == 5
+        assert all(child.connection is None for child in client.blocking_children)
+        assert await cast(Awaitable[bool], client.ping()) is True
+    finally:
+        client.close_release.set()
+        if waiting is not None and not waiting.done():
+            waiting.cancel()
+        if waiting is not None:
+            await asyncio.gather(waiting, return_exceptions=True)
+        await _delete_prefix(client, prefix)
+        await client.aclose()
+
+
+@pytest.mark.parametrize("socket_timeout", [None, 0.02])
+async def test_real_redis_blocking_wait_restores_the_borrowed_socket_budget(
+    redis_url: str,
+    socket_timeout: float | None,
+) -> None:
+    client = _redis_client(_GatedXreadRedis, redis_url, socket_timeout=socket_timeout)
+    client.xread_entered = asyncio.Event()
+    client.xread_release = asyncio.Event()
+    prefix = f"tfmsg:socket-budget:{uuid4().hex}"
+    backend = RedisBackend(client, key_prefix=prefix, lease_ttl=3)
+    waiting: asyncio.Task[None] | None = None
+    try:
+        prepared = await backend.prepare(
+            channel="events",
+            identity=_identity(),
+            codec="test.bytes.v1",
+            after=0,
+            cancellable=False,
+            recoverable=False,
+        )
+        assert prepared.handle.generation is not None
+        client.gate_next_xread = True
+        waiting = asyncio.create_task(
+            backend.storage_backend.wait_for_messaging_change(
+                MessagingChangeWait(
+                    channel="events",
+                    identity=_identity(),
+                    generation=prepared.handle.generation,
+                    after=MessagingChangeCursor(message_sequence=0, control_sequence=0),
+                    timeout_seconds=0.01,
+                )
+            )
+        )
+        await asyncio.wait_for(client.xread_entered.wait(), timeout=1)
+        if socket_timeout is None:
+            client.xread_release.set()
+            await asyncio.wait_for(waiting, timeout=1)
+        else:
+            with pytest.raises(MessagingBackendTimeout) as raised:
+                await asyncio.wait_for(waiting, timeout=1)
+            assert raised.value.diagnostic_context["operation"] == "stream wait"
+        connection = await client.connection_pool.get_connection()
+        try:
+            assert connection.socket_timeout == socket_timeout
+        finally:
+            await client.connection_pool.release(connection)
+        assert await cast(Awaitable[bool], client.ping()) is True
+    finally:
+        client.xread_release.set()
+        if waiting is not None and not waiting.done():
+            waiting.cancel()
+        if waiting is not None:
             await asyncio.gather(waiting, return_exceptions=True)
         await _delete_prefix(client, prefix)
         await client.aclose()
