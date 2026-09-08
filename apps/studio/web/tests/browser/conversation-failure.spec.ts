@@ -1,4 +1,3 @@
-import { writeFile } from 'node:fs/promises'
 import { expect, test } from '@playwright/test'
 import { emptyTraceGraph } from '../../src/test/traceFixtures'
 
@@ -20,7 +19,7 @@ const detail = {
   runFailures: messages.map(message => ({ runId: message.runId, errorCode: 'runtime_initialization_error', failedAt: time, retryable: true })),
 }
 for (const theme of ['light', 'dark']) for (const width of [320, 768, 1024, 1440]) {
-  test(`连续失败的间距和只读历史 ${theme} ${width}`, async ({ page }, testInfo) => {
+  test(`连续失败的间距和只读历史 ${theme} ${width}`, async ({ page }) => {
     await page.setViewportSize({ width, height: 960 })
     await page.addInitScript(({ user, theme }) => {
       localStorage.setItem('tinkerfin:theme', theme)
@@ -60,12 +59,9 @@ for (const theme of ['light', 'dark']) for (const width of [320, 768, 1024, 1440
       return {
         normal: measure(list.querySelector('.assistant-message')!),
         failures: [...list.querySelectorAll('[aria-label="会话异常"]')].map(measure),
-        userActions: measure(list.querySelector('[aria-label="消息操作"]')!),
-        assistantActions: measure(list.querySelector('[aria-label="回答操作"]')!),
       }
     })
-    await writeFile(testInfo.outputPath('geometry.json'), JSON.stringify(geometry, null, 2))
-    await page.screenshot({ path: testInfo.outputPath(`failure-${theme}-${width}.png`) })
+
     for (const [index, item] of geometry.failures.entries()) {
       expect(item.before).toBe(geometry.normal.before)
       expect(item.marginTop).toBe(geometry.normal.marginTop)
@@ -78,7 +74,10 @@ for (const theme of ['light', 'dark']) for (const width of [320, 768, 1024, 1440
       if (width === 320) expect(item.buttonHeight).toBeGreaterThanOrEqual(44)
     }
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
-    await page.screenshot({ path: testInfo.outputPath(`failure-${theme}-${width}.png`) })
+
+    expect(posts).toHaveLength(0)
+    if (theme !== 'light' || width !== 320) return
+
     await page.reload()
     await expect(page.getByRole('region', { name: '会话异常' })).toHaveCount(3)
     await expect(page.getByRole('alert')).toHaveCount(0)

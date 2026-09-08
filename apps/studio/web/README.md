@@ -149,7 +149,6 @@ VITE_API_PROXY_TARGET=http://127.0.0.1:8092 pnpm dev
 pnpm test
 pnpm test:proxy
 pnpm lint
-pnpm build
 pnpm test:browser
 ```
 
@@ -160,6 +159,18 @@ pnpm exec playwright install chromium
 ```
 
 `pnpm test:proxy` 会启动隔离的 HTTP/1.1 服务与 Vite 代理，通过真实浏览器验证附件字节、进度、鉴权、错误和取消，不访问实际后端或数据库。
+
+`pnpm test:browser` 构建一次后，用两个工作进程运行普通交互测试，再串行运行标记为
+`@performance` 的耗时、帧和内存测试。任一阶段失败即停止，保留该阶段的失败截图和 Trace；
+控制台分别输出两个阶段的结果。
+
+单项复测使用已有生产构建；修改源码后先重新构建。性能用例应单独使用一个工作进程：
+
+```bash
+pnpm build
+pnpm exec playwright test tests/browser/conversation-failure.spec.ts
+pnpm exec playwright test --grep @performance --workers=1
+```
 
 浏览器门禁覆盖 320、768、1024、1440px，浅色与深色主题、键盘焦点、touch/coarse pointer、
 `prefers-reduced-motion`、forced colors 和页面级横向溢出。Vite 生产构建使用其 Baseline

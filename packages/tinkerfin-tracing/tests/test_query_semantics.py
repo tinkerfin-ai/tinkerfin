@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Iterable
 from datetime import UTC, datetime
 
 import pytest
@@ -34,6 +35,7 @@ from tinkerfin_tracing import (
     CapturedValue,
     InMemoryTraceStore,
     InvalidTraceCursor,
+    MessageFact,
     RunFact,
     StateRevisionFact,
     SubagentFact,
@@ -225,6 +227,77 @@ async def _record(
     )
     session = await _start(tracer, context)
     await _finish(session, context)
+
+
+async def _seed_completed_turns(
+    store: InMemoryTraceStore, run_ids: Iterable[str]
+) -> None:
+    """Seed completed ordinary turns through the public ledger for window queries."""
+    for run_id in run_ids:
+        identity = RunIdentity(threadId="thread-query", runId=run_id)
+        writer = await store.open_writer(identity)
+        now = datetime.now(UTC)
+        message_id = f"user-{run_id}"
+        content = f"request {run_id}"
+        try:
+            await writer.append(
+                (
+                    RunFact(
+                        source_observation_id=f"{run_id}-started",
+                        identity=identity,
+                        occurred_at=now,
+                        monotonic_ns=1,
+                        phase="started",
+                        input_kind="ordinary",
+                    ),
+                    TurnFact(
+                        source_observation_id=f"{run_id}-input",
+                        identity=identity,
+                        occurred_at=now,
+                        monotonic_ns=2,
+                        turn_id=f"turn:{writer.key.generation}:{run_id}",
+                        user_message_id=message_id,
+                    ),
+                    MessageFact(
+                        source_observation_id=f"{run_id}-input",
+                        identity=identity,
+                        occurred_at=now,
+                        monotonic_ns=2,
+                        phase="reconciled",
+                        message_id=scope_id("message", (), message_id),
+                        source_message_id=message_id,
+                        role="user",
+                        content=CapturedValue(
+                            disposition="inline",
+                            safe_size_bytes=len(json.dumps(content).encode()),
+                            value=content,
+                        ),
+                    ),
+                )
+            )
+            await writer.append(
+                (
+                    RunFact(
+                        source_observation_id=f"{run_id}-terminal",
+                        identity=identity,
+                        occurred_at=now,
+                        monotonic_ns=3,
+                        phase="terminal",
+                        outcome="succeeded",
+                    ),
+                    RunFact(
+                        source_observation_id=f"{run_id}-closed",
+                        identity=identity,
+                        occurred_at=now,
+                        monotonic_ns=4,
+                        phase="closed",
+                        outcome="succeeded",
+                    ),
+                ),
+                mandatory=True,
+            )
+        finally:
+            await writer.aclose()
 
 
 async def _record_large_model_call(tracer: Tracer, run_id: str) -> None:
@@ -1170,9 +1243,10 @@ async def test_resume_with_a_missing_parent_builds_an_explicit_partial_turn() ->
 
 
 async def test_default_window_contains_exactly_the_latest_one_hundred_turns() -> None:
-    tracer = Tracer()
-    for index in range(105):
-        await _record(tracer, f"run-{index:03d}")
+    store = InMemoryTraceStore()
+    tracer = Tracer(store=store)
+    await _seed_completed_turns(store, (f"run-{index:03d}" for index in range(104)))
+    await _record(tracer, "run-104")
 
     thread = await tracer.get("thread-query")
 
@@ -1194,7 +1268,8 @@ async def test_default_window_contains_exactly_the_latest_one_hundred_turns() ->
 
 
 async def test_summary_keeps_pending_interactions_outside_the_visible_window() -> None:
-    tracer = Tracer()
+    store = InMemoryTraceStore()
+    tracer = Tracer(store=store)
     context = _context("pending-first")
     session = await _start(tracer, context)
     await session.observe(
@@ -1213,8 +1288,8 @@ async def test_summary_keeps_pending_interactions_outside_the_visible_window() -
         )
     )
     await _finish(session, context, outcome="interrupted")
-    for index in range(104):
-        await _record(tracer, f"later-{index:03d}")
+    await _seed_completed_turns(store, (f"later-{index:03d}" for index in range(103)))
+    await _record(tracer, "later-103")
 
     thread = await tracer.get("thread-query")
 

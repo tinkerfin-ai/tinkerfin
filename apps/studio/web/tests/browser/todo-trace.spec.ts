@@ -580,7 +580,7 @@ test('浅深主题和四个目标视口保持无描边、无提示与对齐', as
   expect(evidence.pageErrors).toEqual([])
 })
 
-test('5k Group 冷水化、windowing、键盘与 heap 门禁', async ({ page }) => {
+test('5k Group 冷水化、windowing、键盘与 heap 门禁', { tag: '@performance' }, async ({ page }) => {
   test.setTimeout(60_000)
   await page.setViewportSize({ width: 1440, height: 900 })
   await page.addInitScript(() => {

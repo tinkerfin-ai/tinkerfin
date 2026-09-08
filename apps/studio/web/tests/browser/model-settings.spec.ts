@@ -1,8 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
-import { resolve } from 'node:path'
-import { mkdir } from 'node:fs/promises'
 
-const evidence = resolve(process.cwd(), '../../../.agents/evidence/20260907181353-model-settings/browser')
 const user = { user_id: 17, username: 'settings-test', display_name: '配置验收', avatar_url: null, roles: [], disabled: false }
 const models = [
   {model_id:'pro',display_name:'deepseek-v4-pro',purpose:'chat',provider:'deepseek',model_name:'deepseek-v4-pro',base_url:'https://api.deepseek.com',has_key:true,image_support:'unknown',reasoning_enabled:true,enabled:true,is_default:true,sort_order:0,generation_options:{}},
@@ -47,7 +44,6 @@ for (const language of ['zh-CN','en'] as const) for (const theme of ['light','da
     const failures: string[] = []
     page.on('pageerror', error => failures.push(error.message))
     await setup(page)
-    await mkdir(evidence,{recursive:true})
     await openSettings(page,language,theme)
     const edit = language==='en'?'Edit':'编辑'
     const save = language==='en'?'Save':'保存'
@@ -56,7 +52,7 @@ for (const language of ['zh-CN','en'] as const) for (const theme of ['light','da
     for (const width of [320,768,1024,1440]) {
       await page.setViewportSize({width,height:960})
       await expect(page.getByRole('button',{name:edit,exact:true})).toHaveCount(3)
-      await dialog.screenshot({path:resolve(evidence,`list-${language}-${theme}-${width}.png`)})
+
       await page.getByRole('button',{name:edit,exact:true}).last().click()
       await expect(dialog.getByRole('heading', {name: language === 'en' ? 'Models' : '模型配置', exact: true})).toHaveCount(0)
       await expect(page.getByRole('button', {name: back, exact: true}).locator('svg')).toHaveCount(1)
@@ -76,10 +72,10 @@ for (const language of ['zh-CN','en'] as const) for (const theme of ['light','da
       expect(returnAlignment.centers).toBeLessThanOrEqual(1)
       expect(returnAlignment.left).toBeLessThanOrEqual(1)
       expect(Math.abs(returnAlignment.gap - returnAlignment.expectedGap)).toBeLessThanOrEqual(1)
-      await dialog.screenshot({path: resolve(evidence, `form-top-${language}-${theme}-${width}.png`)})
+
       await page.getByText(language==='en'?'Advanced parameters':'高级参数',{exact:true}).click()
       await page.getByRole('textbox',{name:language==='en'?'Advanced parameters JSON':'高级参数 JSON'}).waitFor()
-      await dialog.screenshot({path:resolve(evidence,`editor-${language}-${theme}-${width}.png`)})
+
       const dimensions = await page.evaluate(() => {
         const dialog = document.querySelector('.settings-dialog')!
         const save = dialog.querySelector('button[type=submit]')!
@@ -144,7 +140,7 @@ test('草稿 JSON 与测试结果可恢复且不保存配置', async ({page}) =>
   await editor.fill('{"watermark":false,}')
   await expect(page.getByRole('button',{name:'保存',exact:true})).toBeDisabled()
   await expect(page.getByRole('alert')).toContainText('行')
-  await page.getByRole('dialog',{name:'设置',exact:true}).screenshot({path:resolve(evidence,'json-error.png')})
+
   await editor.fill('{"watermark":false}')
   await expect(page.getByRole('button',{name:'保存',exact:true})).toBeEnabled()
   await page.getByText('测试当前配置',{exact:true}).click()
@@ -171,7 +167,7 @@ test('编辑器下载失败后仍可编辑并校验当前草稿', async ({page})
   await expect(page.getByRole('button', {name: '保存', exact: true})).toBeDisabled()
   await editor.fill('{"watermark":false}')
   await expect(page.getByRole('button', {name: '保存', exact: true})).toBeEnabled()
-  await page.getByRole('dialog', {name: '设置', exact: true}).screenshot({path: resolve(evidence, 'editor-plain-recovery.png')})
+
 })
 
 test('模型设置触控操作和减少动态效果保持可用', async ({browser}) => {
@@ -197,7 +193,7 @@ test('模型设置触控操作和减少动态效果保持可用', async ({browse
       const box = await save.boundingBox()
       expect(box?.height).toBeGreaterThanOrEqual(44)
       expect(box?.width).toBeGreaterThanOrEqual(44)
-      await page.getByRole('dialog', {name: '设置', exact: true}).screenshot({path: resolve(evidence, `editor-touch-${theme}.png`)})
+
     } finally {
       await context.close()
     }
@@ -222,7 +218,7 @@ test('展开测试配置后完整操作区进入可见范围', async ({page}) =>
   await page.getByRole('button', {name: '检查连接', exact: true}).click()
   await expect(page.getByText('基础检查通过，服务已列出该模型', {exact: true})).toBeVisible()
   await expect.poll(async () => (await geometry()).bottom).toBeGreaterThanOrEqual(0)
-  await page.getByRole('dialog', {name: '设置', exact: true}).screenshot({path: resolve(evidence, 'disclosure-test-open.png')})
+
 })
 
 test('延迟编辑器展开后可见且滚动条匹配实际内容', async ({page}) => {
@@ -249,7 +245,7 @@ test('延迟编辑器展开后可见且滚动条匹配实际内容', async ({pag
       const thumb = document.querySelector('.settings-models .ui-overlay-scrollbar__thumb')!.getBoundingClientRect()
       return Math.abs(thumb.height - Math.max(24, track.height * viewport.clientHeight / viewport.scrollHeight))
     })).toBeLessThan(1)
-    await page.getByRole('dialog', {name: '设置', exact: true}).screenshot({path: resolve(evidence, 'disclosure-editor-open.png')})
+
   } finally {
     releaseEditor()
   }
@@ -364,7 +360,7 @@ test('底部保存和测试只在弹窗内定位错误，不触发浏览器气�
     await name.fill('')
     if (action === '保存') await page.getByText('测试当前配置', {exact: true}).click()
   }
-  await dialog.screenshot({path: resolve(evidence, 'custom-validation-position.png')})
+
 })
 
 test('基础检查未确认时明确提示下一步实际测试', async ({page}) => {
@@ -377,7 +373,7 @@ test('基础检查未确认时明确提示下一步实际测试', async ({page})
   await page.getByRole('button', {name: '检查连接', exact: true}).click()
   await expect(page.getByText('还不能确认这个模型能否使用', {exact: true})).toBeVisible()
   await expect(page.getByText('请点击“生成测试图片”，看看能否成功生成', {exact: true})).toBeVisible()
-  await page.getByRole('dialog', {name: '设置', exact: true}).screenshot({path: resolve(evidence, 'basic-check-next-action.png')})
+
 })
 
 test('对话能力选择与推理开关水平居中且没有多余密钥提示', async ({page}) => {
@@ -391,7 +387,7 @@ test('对话能力选择与推理开关水平居中且没有多余密钥提示',
   const reasoningBox = (await reasoning.boundingBox())!
   expect(Math.abs(choiceBox.y + choiceBox.height / 2 - reasoningBox.y - reasoningBox.height / 2)).toBeLessThanOrEqual(1)
   await expect(page.getByText('密钥不会在列表中显示', {exact: true})).toHaveCount(0)
-  await page.getByRole('dialog', {name: '设置', exact: true}).screenshot({path: resolve(evidence, 'chat-capability-alignment.png')})
+
 })
 
 test('保存失败后返回或取消不会把编辑错误和密钥带入列表', async ({page}) => {

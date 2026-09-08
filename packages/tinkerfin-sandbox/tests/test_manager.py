@@ -2450,11 +2450,15 @@ async def test_manual_cleanup_owner_reuse_keeps_health_checks_without_renewal() 
     assert backend.close_calls >= 1
 
 
-async def test_manual_cleanup_warm_health_maintenance_reclaims_failed_capacity() -> (
-    None
-):
+async def test_manual_cleanup_warm_health_maintenance_reclaims_failed_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A non-expiring warm instance still receives bounded periodic health checks."""
 
+    monkeypatch.setattr(
+        "tinkerfin_sandbox.lifecycle._manager_resources._WARM_MAINTENANCE_MAX_SECONDS",
+        0.05,
+    )
     checked = asyncio.Event()
 
     class CheckedBackend(_FakeBackend):
@@ -2475,7 +2479,7 @@ async def test_manual_cleanup_warm_health_maintenance_reclaims_failed_capacity()
         await manager.check_ready()
         checked.clear()
         backend.healthy = False
-        await asyncio.wait_for(checked.wait(), timeout=65)
+        await asyncio.wait_for(checked.wait(), timeout=2)
         await _eventually(lambda: client.create_calls == 2)
         await _eventually(lambda: backend.id in client.destroy_calls)
         await manager.check_ready()

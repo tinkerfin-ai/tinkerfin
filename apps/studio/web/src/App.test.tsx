@@ -279,6 +279,68 @@ describe('Studio Trace history integration', () => {
     }
   })
 
+  it('会话受理后可独立提交新会话，旧流结束不会重复提交仍待受理的草稿', async () => {
+    const user = userEvent.setup()
+    const details: Record<string, ConversationHistoryDetail> = {}
+    const requests: { payload: ChatRequestPayload; events: ReadableStreamDefaultController<Uint8Array> }[] = []
+    const fetch = installFetch({ details })
+    const defaultFetch = fetch.getMockImplementation()!
+    fetch.mockImplementation(async (input, init) => {
+      if (String(input).endsWith('/api/conversation/chat')) {
+        const payload = JSON.parse(String(init?.body)) as ChatRequestPayload
+        return new Response(new ReadableStream<Uint8Array>({
+          start(events) { requests.push({ payload, events }) },
+        }), { headers: { 'Content-Type': 'text/event-stream' } })
+      }
+      return defaultFetch(input, init)
+    })
+    const view = render(<App />)
+    try {
+      const input = await screen.findByRole('textbox', { name: '消息输入' })
+      await waitFor(() => expect(input).toBeEnabled())
+      await user.type(input, '会话A{Enter}')
+      await waitFor(() => expect(requests).toHaveLength(1))
+      const first = requests[0]!
+      details['thread-a'] = traceDetail({
+        threadId: 'thread-a', headRunId: first.payload.runId,
+        availableHeads: [first.payload.runId],
+        status: { execution: 'succeeded', headRunId: first.payload.runId },
+      })
+      await act(async () => {
+        first.events.enqueue(new TextEncoder().encode('id: 1\ndata: ' + JSON.stringify({
+          type: 'RUN_STARTED', threadId: 'thread-a', runId: first.payload.runId,
+        }) + '\n\n'))
+      })
+      await waitFor(() => expect(new URL(window.location.href).searchParams.get('thread')).toBe('thread-a'))
+      await user.click(screen.getByRole('button', { name: '新会话' }))
+      await user.type(input, '会话B{Enter}')
+      await waitFor(() => expect(requests).toHaveLength(2))
+      const second = requests[1]!
+      expect(second.payload.runId).not.toBe(first.payload.runId)
+      await act(async () => {
+        first.events.enqueue(new TextEncoder().encode('id: 2\ndata: ' + JSON.stringify({
+          type: 'RUN_FINISHED', threadId: 'thread-a', runId: first.payload.runId,
+          outcome: { type: 'success' },
+        }) + '\n\n'))
+        first.events.close()
+      })
+      await waitFor(() => expect(readActiveRunSessions().map(item => item.payload.runId)).toEqual([second.payload.runId]))
+      await user.type(input, '下一条草稿{Enter}{Enter}')
+      expect(requests).toHaveLength(2)
+      expect(input).toHaveValue('下一条草稿')
+      await act(async () => {
+        second.events.enqueue(new TextEncoder().encode('id: 1\ndata: ' + JSON.stringify({
+          type: 'RUN_STARTED', threadId: 'thread-b', runId: second.payload.runId,
+        }) + '\n\n'))
+      })
+      await waitFor(() => expect(new URL(window.location.href).searchParams.get('thread')).toBe('thread-b'))
+      expect(requests).toHaveLength(2)
+      expect(input).toHaveValue('下一条草稿')
+    } finally {
+      view.unmount()
+    }
+  })
+
   it('首帧前浏览器历史导航释放草稿选择权', async () => {
     const user = userEvent.setup()
     const fetch = installFetch({ list: [historyItem()], details: { [THREAD_ID]: traceDetail() } })

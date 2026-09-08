@@ -498,26 +498,19 @@ async def test_real_redis_renews_and_fences_takeover(redis_url: str) -> None:
     first = RedisLeaseLock.from_client(
         client,
         key_prefix=prefix,
-        lease_ttl_seconds=0.12,
-        renew_interval_seconds=0.03,
-        wait_poll_seconds=0.005,
+        lease_ttl_seconds=1,
+        renew_interval_seconds=0.2,
+        wait_poll_seconds=0.02,
     )
     second = RedisLeaseLock.from_client(
         client,
         key_prefix=prefix,
-        lease_ttl_seconds=0.12,
-        renew_interval_seconds=0.03,
-        wait_poll_seconds=0.005,
+        lease_ttl_seconds=1,
+        renew_interval_seconds=0.2,
+        wait_poll_seconds=0.02,
     )
     second_entered = asyncio.Event()
-    release_first = asyncio.Event()
     tokens: list[int] = []
-
-    async def first_owner() -> None:
-        async with first.hold("resource") as lease:
-            tokens.append(lease.fencing_token)
-            await asyncio.sleep(0.4)
-            release_first.set()
 
     async def second_owner() -> None:
         async with second.hold("resource") as lease:
@@ -525,15 +518,17 @@ async def test_real_redis_renews_and_fences_takeover(redis_url: str) -> None:
             second_entered.set()
 
     try:
-        async with first, second:
-            first_task = asyncio.create_task(first_owner())
-            await asyncio.sleep(0.2)
-            second_task = asyncio.create_task(second_owner())
-            await asyncio.sleep(0.15)
-            assert not second_entered.is_set()
-            await release_first.wait()
-            await first_task
-            await asyncio.wait_for(second_task, timeout=1)
+        async with asyncio.timeout(10), first, second:
+            async with asyncio.TaskGroup() as owners:
+                # The test owns this lease so ownership loss propagates directly.
+                # Settle the contender before either lease manager closes.
+                async with first.hold("resource") as lease:
+                    tokens.append(lease.fencing_token)
+                    second_task = owners.create_task(second_owner())
+                    await asyncio.sleep(1.5)
+                    assert not second_entered.is_set()
+                async with asyncio.timeout(3):
+                    await second_task
         assert tokens == [1, 2]
         lease_keys = [key async for key in client.scan_iter(match=f"{prefix}:*:lease")]
         assert lease_keys == []

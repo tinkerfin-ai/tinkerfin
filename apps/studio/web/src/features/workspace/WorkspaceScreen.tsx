@@ -141,7 +141,7 @@ export function WorkspaceScreen({
   const [draftConversation, setDraftConversation] = useState<Conversation | null>(null)
   const [draftModel, setDraftModel] = useState('')
   const [draft, setDraftValue] = useState('')
-  const submissionLocks = useRef(new Set<string>())
+  const submissionLocks = useRef(new Map<string, string>())
   const draftRevision = useRef(0)
   const setDraft = useCallback((value: SetStateAction<string>) => {
     draftRevision.current += 1
@@ -493,6 +493,12 @@ export function WorkspaceScreen({
     const submittedThreadId = workspace.currentThreadId
     const submittedDraft = draft
     const clearedDraftRevision = draftRevision.current + 1
+    const releaseSubmission = (runId: string) => {
+      // 旧请求只能释放自己的提交入口，不能影响随后开始的新草稿
+      if (submissionLocks.current.get(submissionKey) === runId) {
+        submissionLocks.current.delete(submissionKey)
+      }
+    }
     const onAccepted = () => {
       if (!resubmission) localAttachments.completeSend(submittedIds)
     }
@@ -534,16 +540,20 @@ export function WorkspaceScreen({
         serverState: {},
       }
 
-      submissionLocks.current.add(submissionKey)
+      submissionLocks.current.set(submissionKey, payload.runId)
       scrollConversationToBottomImmediately()
       setDraftConversation(seededConversation)
       if (!resubmission) setDraft('')
       void streamRun(nextConversation.threadId, payload, 'start', {
         target: 'draft',
         initialConversation: seededConversation,
-        onAccepted,
+        onAccepted: () => {
+          // 已受理的运行按正式会话隔离，空白入口可继续创建新会话
+          releaseSubmission(payload.runId)
+          onAccepted()
+        },
         onRequestRejected,
-      }).finally(() => submissionLocks.current.delete(submissionKey))
+      }).finally(() => releaseSubmission(payload.runId))
       return
     }
 
@@ -570,7 +580,7 @@ export function WorkspaceScreen({
     const payload = buildInitialPayload(sendingConversation, trimmed, readyAttachments)
     const requestMessage = payload.messages.at(0)
     if (!requestMessage) return
-    submissionLocks.current.add(submissionKey)
+    submissionLocks.current.set(submissionKey, payload.runId)
     scrollConversationToBottomImmediately()
     setWorkspace((state) => {
       return updateConversation(state, currentConversation.threadId, (item) => ({
@@ -594,7 +604,7 @@ export function WorkspaceScreen({
       }))
     })
     if (!resubmission) setDraft('')
-    void streamRun(currentConversation.threadId, payload, 'start', { target: 'workspace', onAccepted, onRequestRejected }).finally(() => submissionLocks.current.delete(submissionKey))
+    void streamRun(currentConversation.threadId, payload, 'start', { target: 'workspace', onAccepted, onRequestRejected }).finally(() => releaseSubmission(payload.runId))
   }, [isActiveThread, pushToast, t, conversation, localAttachments, imageSupport, draft, draftConversation?.model, draftModel, hydrateConversation, isRunning, messageWindow, scrollConversationToBottomImmediately, setDraft, streamRun, workspace.conversations, workspace.currentThreadId])
 
   const retryRun = useCallback((message: Message) => {
