@@ -60,9 +60,17 @@ jobs:
         run: pnpm build
       - name: Test browser behavior and accessibility
         run: pnpm test:browser
+      - name: Upload browser failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-browser-results
+          path: /tmp/tinkerfin-studio-playwright/
+          retention-days: 7
 
   packages:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -96,6 +104,7 @@ jobs:
         if: matrix.python-version == '3.11'
         run: >-
           uv run pytest packages tests/test_package_logging_contract.py
+          -o faulthandler_timeout=60
           --cov=tinkerfin
           --cov=tinkerfin_contracts
           --cov=tinkerfin_native_stream
