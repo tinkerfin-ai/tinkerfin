@@ -154,7 +154,8 @@ uv run pyright apps/studio/server/src apps/studio/server/tests
 更新 `src/tinkerfin_studio/version.py` 中的版本、部署示例和 Compose 默认镜像版本后，
 推送对应的 `studio-v<版本>` Git tag。GitHub Actions 会构建、检查并发布 `amd64` 和 `arm64`
 镜像到 `ghcr.io/tinkerfin-ai/studio-server`。首次发布需在 GitHub Packages 中把该镜像设为公开，
-使用者才能匿名拉取。
+使用者才能匿名拉取。若首次公开拉取检查失败，调整可见性后只需重跑失败的
+`Verify public Studio image` 任务。
 
 ## 许可证
 
