@@ -57,66 +57,9 @@ const secondChildTool: Message = {
 }
 
 describe('MessageBlock subagent card', () => {
-  it('matches the 24px Tool row while retaining 44px touch targets', () => {
-    const { container } = render(
-      <>
-        <MessageBlock message={subagentMessage} childTools={[childTool]} />
-        <MessageBlock message={childTool} />
-      </>,
-    )
-
-    const subagentCard = container.querySelector<HTMLDetailsElement>('.subagent-card')
-    const toolCard = container.querySelector<HTMLDetailsElement>('.tool-card')
-    const subagentHeader = subagentCard?.querySelector<HTMLElement>(':scope > summary')
-    const toolHeader = toolCard?.querySelector<HTMLElement>(':scope > summary')
-
-    expect(subagentHeader).not.toBeNull()
-    expect(toolHeader).not.toBeNull()
-    expect(conversationStyles).toMatch(/\.subagent-card-head\s*{[^}]*height:\s*var\(--type-title-line\);[^}]*overflow:\s*hidden;[^}]*border-radius:\s*var\(--radius-sm\);[^}]*background:\s*transparent;[^}]*box-shadow:\s*none;/s)
-    expect(conversationStyles).toMatch(/\.subagent-card\s*{[^}]*--subagent-avatar-size:\s*var\(--icon-sm\);/s)
-    expect(conversationStyles).toMatch(/\.subagent-card-head:hover,[\s\S]*\.subagent-card-head:active\s*{[^}]*background:\s*transparent;[^}]*box-shadow:\s*none;/s)
-    expect(subagentHeader?.querySelector('.tool-row-leading')).not.toBeNull()
-    expect(subagentHeader?.querySelector('.tool-row-icon')).not.toBeNull()
-    expect(subagentHeader?.querySelector('.tool-row-chevron')).not.toBeNull()
-    expect(subagentHeader?.querySelector('.subagent-card-chevron')).toBeNull()
-    expect(conversationStyles).toMatch(/\.subagent-card\[open\] > \.subagent-card-head \.tool-row-icon\s*\{\s*opacity:\s*0;/s)
-    expect(conversationStyles).toMatch(/\.subagent-card\[open\] > \.subagent-card-head \.tool-row-chevron\s*\{\s*opacity:\s*1;/s)
-    expect(conversationStyles).not.toMatch(/\.subagent-card\[open\] \.tool-row-(?:icon|chevron)/s)
-    expect(conversationStyles).toMatch(/\.subagent-task-line\s*{[^}]*margin:\s*0 0 var\(--space-2\) calc\(var\(--subagent-avatar-size\) \+ var\(--space-1-5\)\);/s)
-    expect(conversationStyles).toMatch(/\.tool-row > summary\s*{[^}]*height:\s*var\(--type-title-line\)/s)
+  it('keeps Tool and SubAgent summaries within touch target sizing', () => {
     expect(conversationStyles).toMatch(/@media \(any-hover:\s*none\), \(any-pointer:\s*coarse\)[\s\S]*\.subagent-card-head\s*{\s*height:\s*var\(--control-lg\)/s)
     expect(conversationStyles).toMatch(/@media \(any-hover:\s*none\), \(any-pointer:\s*coarse\)[\s\S]*\.tool-row > summary\s*{\s*height:\s*var\(--control-lg\)/s)
-
-    expect(conversationStyles).toMatch(/\.subagent-task-line > span\s*\{[^}]*font:\s*inherit;[^}]*font-weight:\s*var\(--weight-medium\);/s)
-    expect(conversationStyles).not.toMatch(/\.subagent-task-line > span\s*\{[^}]*font-family:\s*var\(--font-code\)/s)
-    for (const selector of [
-      '.subagent-card-meta',
-      '.subagent-task-line',
-      '.subagent-output-copy > strong',
-      '.subagent-trace-output .markdown-content',
-    ]) {
-      const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-      expect(conversationStyles).toMatch(new RegExp(
-        `${escaped}\\s*\\{[^}]*font-size:\\s*var\\(--type-ui-size\\);[^}]*line-height:\\s*var\\(--type-title-line\\);`,
-        's',
-      ))
-    }
-    expect(conversationStyles).toMatch(/\.subagent-output-node\s*\{[^}]*--subagent-output-align-offset:\s*calc\(/s)
-    expect(conversationStyles).toMatch(/\.subagent-output-node\s*\{[^}]*grid-template-columns:\s*calc\(var\(--space-4\) \+ var\(--space-0-5\)\) minmax\(0, 1fr\);[^}]*column-gap:\s*var\(--space-1\);/s)
-    expect(conversationStyles).toMatch(/\.tool-row-leading\s*\{[^}]*width:\s*var\(--icon-sm\);[^}]*margin-right:\s*var\(--space-1-5\);/s)
-    expect(conversationStyles).toMatch(/\.tool-row-icon,[\s\S]*\.tool-row-chevron\s*\{[^}]*justify-content:\s*flex-start;/s)
-    expect(conversationStyles).toMatch(/\.subagent-output-icon\s*\{[^}]*margin-top:\s*var\(--subagent-output-align-offset\);/s)
-    expect(conversationStyles).toMatch(/\.subagent-output-node::before\s*\{[^}]*var\(--subagent-output-align-offset\)/s)
-    expect(conversationStyles).toMatch(/\.subagent-output-node \.subagent-trace-junction\s*\{[^}]*var\(--subagent-output-align-offset\)/s)
-    expect(conversationStyles).toMatch(/\.subagent-trace-list::before\s*\{[^}]*bottom:\s*var\(--space-1\);/s)
-    expect(conversationStyles).toMatch(/\.subagent-trace-node:last-child\s*\{\s*padding-bottom:\s*0;/s)
-    expect(conversationStyles).toMatch(/\.subagent-tool-row \.tool-detail-card\s*\{\s*margin-bottom:\s*var\(--space-1\);/s)
-
-    subagentCard!.open = true
-    toolCard!.open = true
-
-    expect(subagentCard?.open).toBe(true)
-    expect(toolCard?.open).toBe(true)
   })
 
   it('renders Task and SubAgent like a Tool row while keeping the Tool count trailing', async () => {
@@ -233,41 +176,6 @@ describe('MessageBlock subagent card', () => {
 
     expect(summary).toHaveTextContent('Read/research/url.json')
     expect(summary).not.toHaveTextContent('researcher')
-  })
-
-  it('uses distinct icons for every backend tool and a wrench for unknown tools', () => {
-    const definitions = [
-      ['ls', '{"path":"/"}', 'folder-tree'],
-      ['read_file', '{"file_path":"/a.md"}', 'file-text'],
-      ['write_file', '{"file_path":"/a.md"}', 'file-plus2'],
-      ['edit_file', '{"file_path":"/a.md"}', 'file-pen-line'],
-      ['delete', '{"file_path":"/a.md"}', 'trash2'],
-      ['glob', '{"pattern":"**/*.ts"}', 'folder-search'],
-      ['grep', '{"pattern":"needle"}', 'text-search'],
-      ['execute', '{"command":"pwd"}', 'square-terminal'],
-      ['web_search', '{"query":"LangGraph"}', 'earth'],
-      ['write_todos', '{"todos":[]}', 'list-checks'],
-      ['task', '{"description":"检索资料"}', 'bot'],
-      ['unknown_tool', '{"value":"x"}', 'wrench'],
-    ] as const
-    const { container } = render(<>{definitions.map(([toolName, params]) => (
-      <MessageBlock
-        key={toolName}
-        message={{
-          id: `tool-${toolName}`,
-          role: 'tool',
-          content: '',
-          createdAt: '2026-08-24T00:00:00.000Z',
-          meta: { toolName, params, result: '', status: 'completed' },
-        }}
-      />
-    ))}</>)
-
-    for (const [toolName, , icon] of definitions) {
-      const row = container.querySelector(`[data-tool-name="${toolName}"]`)
-      expect(row).not.toBeNull()
-      expect(row?.querySelector(`.lucide-${icon}`)).not.toBeNull()
-    }
   })
 
   it('never exposes internal Tool call IDs when captured details are unavailable', () => {

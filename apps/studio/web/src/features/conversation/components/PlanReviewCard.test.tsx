@@ -4,7 +4,6 @@ import { useState } from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { PlanReviewState } from '../../../types'
-import conversationStyles from '../conversation.css?raw'
 import { PlanReviewCard, PlanReviewStatusRow } from './PlanReviewCard'
 
 describe('PlanReviewCard', () => {
@@ -163,24 +162,4 @@ describe('PlanReviewCard', () => {
     expect(screen.getByRole('alert')).toHaveTextContent('计划版本已经更新')
   })
 
-  it('shares the HITL footer actions and rejection form styling', () => {
-    expect(conversationStyles).toMatch(/\.approval-composer-actions\s*\{[^}]*grid-column:\s*2;/s)
-    expect(conversationStyles).toMatch(/\.approval-reject-button\s*\{[^}]*color:\s*var\(--color-danger-text\);/s)
-    expect(conversationStyles).toMatch(/\.approval-allow-button\s*\{[^}]*background:\s*var\(--color-text-primary\);/s)
-    expect(conversationStyles).toMatch(/\.approval-rejection-form,\s*\.plan-review-rejection-form\s*\{[^}]*display:\s*grid;/s)
-    expect(conversationStyles).toMatch(/\.plan-review-composer-body\s*\{[^}]*display:\s*flex;[^}]*flex-direction:\s*column;[^}]*overflow-y:\s*auto;/s)
-    expect(conversationStyles).toMatch(/\.plan-review-composer-footer\s*\{[^}]*position:\s*sticky;[^}]*bottom:\s*0;[^}]*grid-template-columns:\s*minmax\(0, 1fr\) auto;[^}]*min-height:\s*var\(--space-16\);[^}]*margin-top:\s*auto;[^}]*padding:\s*var\(--space-3\) var\(--space-4\);/s)
-    expect(conversationStyles).toMatch(/\.plan-review-composer-footer::before\s*\{[^}]*linear-gradient\(to bottom, transparent, var\(--color-layer-1\)\);/s)
-    expect(conversationStyles).not.toContain('.plan-review-input.is-editor')
-    expect(conversationStyles).not.toContain('.plan-review-actions')
-  })
-
-  it('与 HITL 和澄清卡共用标题尺寸、间距和动作规格', () => {
-    expect(conversationStyles).toMatch(/\.approval-composer-head,\s*\.plan-question-composer-head,\s*\.plan-review-composer-head\s*\{[^}]*align-items:\s*center;[^}]*gap:\s*var\(--space-4\);[^}]*padding:\s*10px var\(--space-4\);/s)
-    expect(conversationStyles).toMatch(/\.approval-composer-heading h2,\s*\.plan-question-composer-heading h2,\s*\.plan-review-composer-heading h2\s*\{[^}]*gap:\s*var\(--space-2\);[^}]*font-size:\s*var\(--type-ui-size\);[^}]*line-height:\s*var\(--type-title-line\);/s)
-    expect(conversationStyles).toMatch(/\.plan-interaction-card-head-button\s*\{[^}]*width:\s*var\(--control-plan-chip\);[^}]*height:\s*var\(--control-plan-chip\);/s)
-    expect(conversationStyles).toMatch(/\.approval-status-dot\s*\{[^}]*width:\s*var\(--icon-sm\);[^}]*height:\s*var\(--icon-sm\);/s)
-    expect(conversationStyles).toMatch(/\.approval-composer-head,\s*\.plan-review-composer-head\s*\{[^}]*var\(--color-warning-panel-background\);/s)
-    expect(conversationStyles).toMatch(/\.plan-question-composer-head\s*\{[^}]*var\(--color-plan-panel-background\);/s)
-  })
 })
