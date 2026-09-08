@@ -13,6 +13,7 @@ declare global {
   interface Window {
     __todoTraceStartedAt?: number
     __todoTraceReadyAt?: number
+    __todoTraceOpenMs?: number
     __todoTraceLongTasks?: number[]
   }
 }
@@ -617,11 +618,30 @@ test('5k Group 冷水化、windowing、键盘与 heap 门禁', async ({ page }) 
   const before = await cdp.send('Runtime.getHeapUsage') as { usedSize: number }
   const taskTraceHeapDelta = Math.max(0, before.usedSize - baseConversation.usedSize)
   expect(taskTraceHeapDelta).toBeLessThanOrEqual(256 * 1024 * 1024)
-  const openedAt = Date.now()
+  // 从浏览器收到真实点击计时，直到展开后的任务组可见
+  await launcher.evaluate((button) => {
+    button.addEventListener('click', () => {
+      const started = performance.now()
+      const observer = new MutationObserver(() => {
+        const group = document.querySelector<HTMLButtonElement>(
+          'button[aria-label="收起任务组：整理当前交付清单"]',
+        )
+        if (!group || !group.checkVisibility({ visibilityProperty: true })) return
+        window.__todoTraceOpenMs = performance.now() - started
+        observer.disconnect()
+      })
+      observer.observe(document, { childList: true, subtree: true, attributes: true })
+    }, { once: true, capture: true })
+  })
   await launcher.click()
   await expect(page.getByRole('button', { name: '收起任务组：整理当前交付清单' }))
     .toBeVisible()
-  const openMs = Date.now() - openedAt
+  const openMs = await page.evaluate(() => {
+    if (window.__todoTraceOpenMs === undefined) {
+      throw new Error('任务轨迹尚未记录展开完成时刻')
+    }
+    return window.__todoTraceOpenMs
+  })
   const initialDomRoots = await page.locator('.todo-trace-group').count()
   expect(openMs).toBeLessThanOrEqual(500)
   expect(initialDomRoots).toBeLessThanOrEqual(80)

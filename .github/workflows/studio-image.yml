@@ -2,6 +2,7 @@ name: Studio server image
 
 on:
   pull_request:
+    branches: [main]
     paths:
       - apps/studio/server/**
       - packages/**
