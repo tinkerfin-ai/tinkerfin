@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 import pytest
 from pydantic import JsonValue
@@ -69,6 +69,27 @@ from tinkerfin_tracing.sql_store import (
 from tinkerfin_tracing.store import TraceProjectionCheckpoint
 from tinkerfin_tracing.tracer import Tracer
 from tinkerfin_tracing.writing import TraceBatchWriter, TraceWritePolicy
+
+_WriteResultT = TypeVar("_WriteResultT")
+
+
+async def _wait_for_committed_write(
+    writing: asyncio.Task[_WriteResultT], committed: asyncio.Event
+) -> None:
+    """Observe the committed result or immediately propagate an earlier write failure."""
+
+    observed = asyncio.create_task(committed.wait())
+    try:
+        done, _ = await asyncio.wait(
+            (writing, observed), timeout=3, return_when=asyncio.FIRST_COMPLETED
+        )
+        if writing in done:
+            await writing
+            pytest.fail("write completed before the committed-result gate")
+        assert observed in done, "write did not reach the committed-result gate"
+    finally:
+        observed.cancel()
+        await asyncio.gather(observed, return_exceptions=True)
 
 
 class _EncryptedTraceCodec(CanonicalTracePayloadCodec):
@@ -2316,7 +2337,7 @@ async def test_sqlite_proven_append_survives_peer_takeover_during_retry(
         writer_lease_seconds=0.15,
         writer_heartbeat_interval_seconds=0.14,
         commit_retry_attempts=2,
-        commit_retry_delay_seconds=2,
+        commit_retry_delay_seconds=0.001,
     )
     first_store = SqlAlchemyTraceStore(
         first_engine,
@@ -2326,7 +2347,6 @@ async def test_sqlite_proven_append_survives_peer_takeover_during_retry(
     peer_store = SqlAlchemyTraceStore(
         peer_engine,
         namespace=namespace,
-        options=options,
     )
     identity = _identity()
     writer = await first_store.open_writer(identity)
@@ -2334,6 +2354,7 @@ async def test_sqlite_proven_append_survives_peer_takeover_during_retry(
     peer_backend = _backend(peer_store)
     original = backend._raw_write_connection
     first_commit_finished = asyncio.Event()
+    release_retry = asyncio.Event()
     remaining = 1
 
     @asynccontextmanager
@@ -2344,6 +2365,10 @@ async def test_sqlite_proven_append_survives_peer_takeover_during_retry(
         if remaining:
             remaining -= 1
             first_commit_finished.set()
+            # Keep the unknown result pending after SQLite released its write lock,
+            # so the peer can take ownership before the append retries.
+            async with asyncio.timeout(3):
+                await release_retry.wait()
             original_error = sqlite3.OperationalError("database is locked")
             original_error.sqlite_errorcode = sqlite3.SQLITE_BUSY
             raise DBAPIError(None, None, original_error, False)
@@ -2352,9 +2377,27 @@ async def test_sqlite_proven_append_survives_peer_takeover_during_retry(
     append = asyncio.create_task(writer.append((_fact("started"),)))
     replacement = None
     try:
-        await first_commit_finished.wait()
-        await asyncio.sleep(1.2)
+        await _wait_for_committed_write(append, first_commit_finished)
+        async with asyncio.timeout(3):
+            while True:
+                state = await peer_backend.load_ledger_state(
+                    TraceLedgerStateRequest(
+                        namespace=namespace,
+                        thread_id=identity.thread_id,
+                        generation=writer.key.generation,
+                        run_id=identity.run_id,
+                    )
+                )
+                assert state.target_writer is not None
+                remaining_lease = (
+                    state.target_writer.lease_expires_at - state.observed_at
+                ).total_seconds()
+                if remaining_lease <= 0:
+                    break
+                await asyncio.sleep(remaining_lease)
+        assert not append.done()
         replacement = await peer_store.open_writer(identity)
+        release_retry.set()
         committed = await append
         state = await peer_backend.load_ledger_state(
             TraceLedgerStateRequest(
@@ -2364,26 +2407,39 @@ async def test_sqlite_proven_append_survives_peer_takeover_during_retry(
                 run_id=identity.run_id,
             )
         )
+        snapshot = await peer_store.snapshot(identity.thread_id)
         stored = await peer_store.read_events(
             replacement.key,
             after_seq=0,
-            as_of_seq=1,
+            as_of_seq=snapshot.as_of_seq,
             limit=10,
         )
 
-        assert [event.event_id for event in committed] == [stored[0].event_id]
+        assert snapshot.as_of_seq == 1
+        assert [event.event_id for event in committed] == [
+            event.event_id for event in stored
+        ]
         assert state.target_writer is not None
         assert state.target_writer.fence == 2
+        assert state.target_writer.lease_expires_at > state.observed_at
     finally:
+        release_retry.set()
         monkeypatch.setattr(backend, "_raw_write_connection", original)
         if not append.done():
             append.cancel()
-            await asyncio.gather(append, return_exceptions=True)
-        await writer.aclose()
-        if replacement is not None:
-            await replacement.aclose()
-        await first_engine.dispose()
-        await peer_engine.dispose()
+        await asyncio.gather(append, return_exceptions=True)
+        try:
+            # Stop the current owner's heartbeats before closing the stale writer.
+            if replacement is not None:
+                await replacement.aclose()
+        finally:
+            try:
+                await writer.aclose()
+            finally:
+                try:
+                    await first_engine.dispose()
+                finally:
+                    await peer_engine.dispose()
 
 
 async def test_sqlite_retry_exhaustion_uses_stable_store_timeout(
@@ -2698,7 +2754,7 @@ async def test_sqlite_unknown_checkpoint_survives_peer_advancement(
     peer_engine = create_async_engine(f"sqlite+aiosqlite:///{database}")
     options = TraceStoreOptions(
         commit_retry_attempts=2,
-        commit_retry_delay_seconds=0.5,
+        commit_retry_delay_seconds=0.001,
     )
     first = SqlAlchemyTraceStore(
         first_engine,
@@ -2715,6 +2771,7 @@ async def test_sqlite_unknown_checkpoint_survives_peer_advancement(
     backend = _backend(first)
     original = backend._raw_write_connection
     first_commit_finished = asyncio.Event()
+    release_retry = asyncio.Event()
     remaining = 1
 
     @asynccontextmanager
@@ -2725,6 +2782,8 @@ async def test_sqlite_unknown_checkpoint_survives_peer_advancement(
         if remaining:
             remaining -= 1
             first_commit_finished.set()
+            async with asyncio.timeout(3):
+                await release_retry.wait()
             original_error = sqlite3.OperationalError("database is locked")
             original_error.sqlite_errorcode = sqlite3.SQLITE_BUSY
             raise DBAPIError(None, None, original_error, False)
@@ -2747,7 +2806,7 @@ async def test_sqlite_unknown_checkpoint_survives_peer_advancement(
         )
     )
     try:
-        await first_commit_finished.wait()
+        await _wait_for_committed_write(saving, first_commit_finished)
         assert (
             await peer.save_projection_checkpoint(
                 second_checkpoint,
@@ -2755,15 +2814,30 @@ async def test_sqlite_unknown_checkpoint_survives_peer_advancement(
             )
             == second_checkpoint
         )
+        release_retry.set()
         assert await saving == first_checkpoint
+        assert (
+            await peer.load_projection_checkpoint(
+                writer.key,
+                projection_name=second_checkpoint.projection_name,
+                run_id=None,
+                as_of_seq=2,
+            )
+            == second_checkpoint
+        )
     finally:
+        release_retry.set()
         monkeypatch.setattr(backend, "_raw_write_connection", original)
         if not saving.done():
             saving.cancel()
-            await asyncio.gather(saving, return_exceptions=True)
-        await writer.aclose()
-        await first_engine.dispose()
-        await peer_engine.dispose()
+        await asyncio.gather(saving, return_exceptions=True)
+        try:
+            await writer.aclose()
+        finally:
+            try:
+                await first_engine.dispose()
+            finally:
+                await peer_engine.dispose()
 
 
 async def test_sqlite_rejects_historical_checkpoint_as_new_cas_retry(
