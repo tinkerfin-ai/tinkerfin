@@ -135,6 +135,7 @@ const detail = ({
     generation: `browser-generation:${THREAD_ID}`,
     observedAt: '2026-09-05T00:00:00.000000Z',
     headRunId: RUN_ID,
+    runFailures: [],
     availableHeads: [RUN_ID],
     historyCursor,
     messageCount: groups.length,

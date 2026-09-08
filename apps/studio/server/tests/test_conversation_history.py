@@ -28,6 +28,7 @@ from tinkerfin_contracts import (
 )
 from tinkerfin_studio.api.conversation_router import follow_trace, get_history
 from tinkerfin_studio.api.errors import BusinessException, ConversationErrorCode
+from tinkerfin_studio.conversation.failures import ConversationFailureProjection
 from tinkerfin_studio.conversation.history import ConversationHistoryService
 from tinkerfin_studio.conversation.repository import ConversationRepository
 from tinkerfin_studio.conversation.schemas import (
@@ -189,7 +190,9 @@ async def _register(
 async def test_history_reads_fixed_trace_view_without_agui_event_tail(
     session,
 ) -> None:
-    tracer = Tracer()
+    tracer = Tracer(
+        projections=(ConversationFailureProjection(),),
+    )
     repository = ConversationRepository(session)
     thread = await _register(
         repository,
@@ -232,7 +235,9 @@ async def test_history_reads_fixed_trace_view_without_agui_event_tail(
 
 
 async def test_trace_graph_query_returns_the_final_model_request(session) -> None:
-    tracer = Tracer()
+    tracer = Tracer(
+        projections=(ConversationFailureProjection(),),
+    )
     repository = ConversationRepository(session)
     thread = await _register(
         repository,
@@ -334,7 +339,9 @@ async def test_trace_graph_query_returns_the_final_model_request(session) -> Non
 
 
 async def test_trace_graph_follow_sends_snapshot_update_and_closes(session) -> None:
-    tracer = Tracer()
+    tracer = Tracer(
+        projections=(ConversationFailureProjection(),),
+    )
     repository = ConversationRepository(session)
     thread = await _register(
         repository,
@@ -391,7 +398,9 @@ async def test_trace_graph_follow_sends_snapshot_update_and_closes(session) -> N
 
 
 async def test_history_cursor_keeps_original_as_of_after_new_turn(session) -> None:
-    tracer = Tracer()
+    tracer = Tracer(
+        projections=(ConversationFailureProjection(),),
+    )
     repository = ConversationRepository(session)
     thread = await _register(
         repository,
@@ -441,7 +450,9 @@ async def test_history_cursor_keeps_original_as_of_after_new_turn(session) -> No
 async def test_history_keeps_pending_interactions_outside_the_visible_turn(
     session,
 ) -> None:
-    tracer = Tracer()
+    tracer = Tracer(
+        projections=(ConversationFailureProjection(),),
+    )
     repository = ConversationRepository(session)
     thread = await _register(
         repository,
@@ -505,7 +516,12 @@ async def test_history_rejects_another_users_thread_before_trace_lookup(
         thread_id="thread-private",
         run_id="run-private",
     )
-    service = _service(repository, tracer=Tracer())
+    service = _service(
+        repository,
+        tracer=Tracer(
+            projections=(ConversationFailureProjection(),),
+        ),
+    )
 
     with pytest.raises(BusinessException) as captured:
         await service.get_detail("thread-private")
@@ -524,7 +540,9 @@ async def test_history_rejects_another_users_thread_before_trace_lookup(
 async def test_trace_follow_sends_snapshot_then_semantic_update_and_closes(
     session,
 ) -> None:
-    tracer = Tracer()
+    tracer = Tracer(
+        projections=(ConversationFailureProjection(),),
+    )
     repository = ConversationRepository(session)
     thread = await _register(
         repository,
@@ -570,7 +588,9 @@ async def test_trace_follow_sends_snapshot_then_semantic_update_and_closes(
 async def test_trace_follow_closes_projector_when_disconnected_after_snapshot(
     session,
 ) -> None:
-    tracer = Tracer()
+    tracer = Tracer(
+        projections=(ConversationFailureProjection(),),
+    )
     repository = ConversationRepository(session)
     thread = await _register(
         repository,
@@ -607,7 +627,9 @@ async def test_trace_follow_closes_projector_when_disconnected_after_snapshot(
 async def test_trace_follow_replaces_task_trace_only_after_authoritative_state(
     session,
 ) -> None:
-    tracer = Tracer()
+    tracer = Tracer(
+        projections=(ConversationFailureProjection(),),
+    )
     repository = ConversationRepository(session)
     thread = await _register(
         repository,
@@ -717,7 +739,9 @@ async def test_trace_follow_replaces_task_trace_only_after_authoritative_state(
 async def test_detached_follow_can_skip_task_trace_without_losing_base_updates(
     session,
 ) -> None:
-    tracer = Tracer()
+    tracer = Tracer(
+        projections=(ConversationFailureProjection(),),
+    )
     repository = ConversationRepository(session)
     thread = await _register(
         repository,
@@ -765,7 +789,9 @@ async def test_history_follow_publishes_ownership_without_fabricating_graph_even
     session,
 ) -> None:
     """失活更新同时抵达公开摘要与任务视图，事件和 Graph 保持原有事实"""
-    tracer = Tracer()
+    tracer = Tracer(
+        projections=(ConversationFailureProjection(),),
+    )
     repository = ConversationRepository(session)
     thread = await _register(
         repository,
@@ -854,7 +880,9 @@ async def test_history_follow_publishes_ownership_without_fabricating_graph_even
 async def test_history_route_returns_one_validated_json_body_with_task_trace(
     session,
 ) -> None:
-    tracer = Tracer()
+    tracer = Tracer(
+        projections=(ConversationFailureProjection(),),
+    )
     repository = ConversationRepository(session)
     thread = await _register(
         repository,
@@ -943,3 +971,76 @@ async def test_trace_route_serializes_one_complete_sse_frame() -> None:
     assert b"".join(chunks) == (
         b'event: trace\ndata: {"type":"error","code":"trace_unavailable"}\n\n'
     )
+
+
+async def test_failures_follow_the_history_window_and_fixed_prefix(session):
+    tracer = Tracer(projections=(ConversationFailureProjection(),))
+    repository = ConversationRepository(session)
+    for run_id in ("old-failed", "latest-failed"):
+        await _register(
+            repository, user_id=1, thread_id="failure-history", run_id=run_id
+        )
+        context, source = await _open_trace(
+            tracer, thread_id="failure-history", run_id=run_id
+        )
+        await source.observe(
+            RunTerminalObservation(
+                identity=context.identity,
+                outcome="failed",
+                code="runtime_initialization_error",
+                error_type="builtins.RuntimeError",
+                observed_at=datetime.now(UTC),
+                monotonic_ns=3,
+            )
+        )
+        await source.aclose()
+    service = _service(repository, tracer=tracer)
+    current = await service.get_detail(
+        "failure-history", limit=1, include_task_trace=False
+    )
+    assert [item.run_id for item in current.run_failures] == ["latest-failed"]
+    assert current.run_failures[0].retryable
+    assert current.history_cursor
+    older = await service.get_detail(
+        "failure-history",
+        history_cursor=current.history_cursor,
+        limit=1,
+        include_task_trace=False,
+    )
+    assert {item.run_id for item in older.run_failures} == {
+        "old-failed",
+        "latest-failed",
+    }
+    assert all(message.role != "assistant" for message in older.messages)
+
+
+async def test_live_failure_and_snapshot_have_identical_results(session):
+    tracer = Tracer(projections=(ConversationFailureProjection(),))
+    repository = ConversationRepository(session)
+    await _register(repository, user_id=1, thread_id="failure-live", run_id="run-live")
+    context, source = await _open_trace(
+        tracer, thread_id="failure-live", run_id="run-live"
+    )
+    service = _service(repository, tracer=tracer)
+    stream = await service.follow_trace("failure-live", include_task_trace=False)
+    first = await anext(stream)
+    assert first.type == "snapshot" and first.snapshot.run_failures == ()
+    await source.observe(
+        RunTerminalObservation(
+            identity=context.identity,
+            outcome="failed",
+            code="runtime_initialization_error",
+            observed_at=datetime.now(UTC),
+            monotonic_ns=3,
+        )
+    )
+    await source.force(ObservationBoundary.TERMINAL)
+    try:
+        update = await anext(stream)
+        assert update.type == "update"
+        assert len(update.run_failures) == 1
+        detail = await service.get_detail("failure-live", include_task_trace=False)
+        assert update.run_failures == detail.run_failures
+    finally:
+        await stream.aclose()
+        await source.aclose()

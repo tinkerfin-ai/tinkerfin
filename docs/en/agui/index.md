@@ -1,6 +1,6 @@
 # AG-UI basics
 
-[Documentation](../README.md) · [中文](../../zh/agui/index.md)
+[Documentation](../index.md) · [中文](../../cn/agui/index.md)
 
 AG-UI represents Agent text, tool calls, state, approvals, and outcomes as
 frontend-friendly events. TinkerFin uses one canonical `RunIdentity` for public

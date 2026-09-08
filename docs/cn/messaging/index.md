@@ -1,6 +1,6 @@
 # Messaging 入门
 
-[文档首页](../README.md) · [English](../../en/messaging/index.md)
+[文档首页](../index.md) · [English](../../en/messaging/index.md)
 
 Messaging 把一次性对象流变成可以保存、回放、附着和远程取消的生产者。浏览器断开后，Agent 可以继续运行；重新连接时从最后一个 durable 序号继续读取。
 

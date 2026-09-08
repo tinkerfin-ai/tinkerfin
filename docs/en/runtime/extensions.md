@@ -1,6 +1,6 @@
 # Run coordination and Redis leases
 
-[Streams and SSE](streams-and-sse.md) · [中文](../../zh/runtime/extensions.md)
+[Streams and SSE](streams-and-sse.md) · [中文](../../cn/runtime/extensions.md)
 
 Configure a run coordinator when matching business identities must not execute at the
 same time. The coordinator applies to every Runtime created by that TinkerFin factory.

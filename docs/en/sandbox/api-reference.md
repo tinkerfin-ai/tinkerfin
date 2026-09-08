@@ -1,6 +1,6 @@
 # Sandbox usage reference
 
-[Sandbox basics](index.md) · [中文](../../zh/sandbox/api-reference.md)
+[Sandbox basics](index.md) · [中文](../../cn/sandbox/api-reference.md)
 
 ## Configuration and connection
 

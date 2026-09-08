@@ -1,6 +1,6 @@
 # Messaging usage reference
 
-[Messaging basics](index.md) · [中文](../../zh/messaging/api-reference.md)
+[Messaging basics](index.md) · [中文](../../cn/messaging/api-reference.md)
 
 ## Application entry points
 

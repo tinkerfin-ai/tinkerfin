@@ -1,6 +1,6 @@
 # Sandbox lifecycle
 
-[Sandbox basics](index.md) · [中文](../../zh/sandbox/lifecycle.md)
+[Sandbox basics](index.md) · [中文](../../cn/sandbox/lifecycle.md)
 
 `OpenSandboxManager` keeps one stable handle for each business key. The same handle remains usable when its remote Sandbox reconnects or is replaced.
 

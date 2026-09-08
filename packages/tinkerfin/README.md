@@ -670,7 +670,7 @@ planning. Unmarked tools remain excluded from the planning action space.
 - [Runtime guide](https://github.com/tinkerfin-ai/tinkerfin/blob/main/docs/en/runtime/index.md)
 - [AG-UI guide](https://github.com/tinkerfin-ai/tinkerfin/blob/main/docs/en/agui/index.md)
 - [Tracing guide](https://github.com/tinkerfin-ai/tinkerfin/blob/main/docs/en/tracing/index.md)
-- [Complete documentation](https://github.com/tinkerfin-ai/tinkerfin/blob/main/docs/en/README.md)
+- [Complete documentation](https://github.com/tinkerfin-ai/tinkerfin/blob/main/docs/en/index.md)
 
 ## License
 

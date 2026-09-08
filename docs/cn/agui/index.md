@@ -1,6 +1,6 @@
 # AG-UI 入门
 
-[文档首页](../README.md) · [English](../../en/agui/index.md)
+[文档首页](../index.md) · [English](../../en/agui/index.md)
 
 AG-UI 把 Agent 文字、工具调用、状态、审批和结果表示成前端事件。TinkerFin 使用一个 canonical
 `RunIdentity` 统一公开生命周期、Graph、checkpoint、协调与持久投递。

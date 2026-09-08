@@ -1,6 +1,6 @@
 # Cancellation, deferred sources, and recovery
 
-[Delivery, replay, and SSE](delivery-and-replay.md) · [中文](../../zh/messaging/cancellation-and-recovery.md)
+[Delivery, replay, and SSE](delivery-and-replay.md) · [中文](../../cn/messaging/cancellation-and-recovery.md)
 
 This guide covers remote cancellation, creating an expensive source only for the producer owner, and rebuilding a source after owner loss.
 

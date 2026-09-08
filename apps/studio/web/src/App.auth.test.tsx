@@ -413,6 +413,7 @@ describe('App authentication boundary', () => {
           lastModel: 'main',
           asOfSeq: 1,
           headRunId: 'private-run',
+          runFailures: [],
           availableHeads: ['private-run'],
           historyCursor: null,
           messageCount: 0,

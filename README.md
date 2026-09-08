@@ -1,144 +1,91 @@
-# TinkerFin
+<p align="center">
+  <img src="apps/studio/web/public/brand/tinkerfin-mark.png" alt="TinkerFin" width="88" />
+</p>
+<h1 align="center">TinkerFin</h1>
+<p align="center"><strong>Build and deliver enterprise agent applications, faster.</strong></p>
+<p align="center">
+  <a href="README.md">English</a> · <a href="README.cn.md">简体中文</a> ·
+  <a href="docs/en/index.md">Documentation</a> · <a href="docs/en/quick_start.md">Quick Start</a>
+</p>
+<p align="center">
+  <a href="docs/en/runtime/quick_start.md"><img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&amp;logo=python&amp;logoColor=white" /></a>
+  <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/License-Apache--2.0-52617A?style=flat-square" /></a>
+  <a href="https://github.com/tinkerfin-ai/tinkerfin/actions/workflows/packages-quality.yml"><img alt="Package checks" src="https://github.com/tinkerfin-ai/tinkerfin/actions/workflows/packages-quality.yml/badge.svg" /></a>
+  <a href="docs/en/index.md"><img alt="Docs: English / 中文" src="https://img.shields.io/badge/Docs-English%20%2F%20中文-2563EB?style=flat-square" /></a>
+</p>
 
-[中文](docs/README.zh.md)
+**TinkerFin is an agent application framework built for enterprise workflows.** It combines task orchestration, human collaboration, execution tracing, and isolated environments to turn business workflows into applications that **plan, act, and keep people in control**.
 
-## What it is
+Connect model capabilities to your business—from research and document workflows to data processing and file generation.
+**Build the application core with Python and deliver the workspace with Studio.** Cover model and tool integration, user interactions, execution management, and results with less application infrastructure to build from scratch.
 
-TinkerFin adds native, AG-UI, SSE, semantic Trace, and durable Messaging delivery to Deep Agents.
-Models, tools, backends, checkpoints, stores, and Sandbox resources remain host-owned.
+![Studio demo with a conversation, task checklist, and report](docs/assets/screenshots/studio-en.png)
 
-```text
-packages/
-├── tinkerfin-contracts/       protocol-neutral run and observation contracts
-├── tinkerfin-native-stream/   current Deep Agents/LangGraph stream contract
-├── tinkerfin/                 Deep Agents runtime, optional AG-UI, SSE, coordination
-├── tinkerfin-agui-adapter/    LangGraph v2 StreamPart to AG-UI conversion
-├── tinkerfin-tracing/         semantic Ledger, queries, and projections
-├── tinkerfin-langgraph-mysql/ asyncmy-only LangGraph MySQL Store
-├── tinkerfin-messaging/       durable delivery, replay, cancellation, Redis
-└── tinkerfin-sandbox/         OpenSandbox backend and lifecycle management
-apps/studio/
-├── server/                    Studio server application
-└── web/                       Studio web application
-```
+## Built for business workflows
 
-## Installation
+- **Complete application delivery** — Connect agent execution to a user workspace with frontend interactions, persistent conversations, and file outputs. Deploy Studio directly or integrate the framework into your business systems.
+- **Complex task orchestration** — Turn business goals into execution plans, coordinate tools and subagents, and follow progress as each step moves toward completion.
+- **Human decisions in the workflow** — Require review for plans and selected tool operations. Support approval, rejection, and cancellation to keep business judgment part of automated execution.
+- **Unified execution tracing** — Connect conversations, model calls, tools, and subagents in one execution record. Inspect relationships, timing, and results to diagnose issues and improve workflows.
+- **Persistent conversations and isolated execution** — Store conversations and events, reconnect to receive output, replay streams, and cancel runs. Use isolated file and command environments for business tasks that need ongoing follow-up.
+- **Deployment and integration on your terms** — Built on Deep Agents, with your choice of models, business tools, and storage. Connect frontends through AG-UI and compose the capabilities your application needs in your own environment.
 
-Python 3.11 or newer is required.
+## Studio: the workspace for business agents
 
-```bash
-pip install tinkerfin
-```
+### Turn business goals into execution plans
 
-The Quick Start uses LangChain's OpenAI model adapter:
+Turn a business goal into a reviewable plan, then confirm the scope and steps before execution.
 
-```bash
-pip install langchain-openai
-```
+![Studio plan review demo](docs/assets/screenshots/plan-en.png)
 
-Optional integrations:
+### Understand how each task runs
 
-```bash
-pip install "tinkerfin[agui]"
-pip install "tinkerfin[redis]"
-pip install tinkerfin-tracing
-pip install "tinkerfin-tracing[mysql]"
-pip install tinkerfin-langgraph-mysql
-pip install "tinkerfin-messaging[agui,redis]"
-pip install "tinkerfin-sandbox[sqlite]"
-```
+Follow a business conversation through model calls, tools, and subagents to see how the task ran and where time was spent.
+
+![Studio execution trace demo](docs/assets/screenshots/trace-en.png)
+
+*Screenshots show the current Studio interface with demonstration data.*
 
 ## Quick Start
 
-```python
-import asyncio
+### Try Studio
 
-from tinkerfin import RunIdentity, TinkerFin
+Prepare Docker and Docker Compose, then start the backend and Web client. Sign in with the initial username `tinkerfin` and password `123456`, then configure your model.
 
-tinkerfin = TinkerFin()
-agent = tinkerfin.create_deep_agent(
-    model="openai:gpt-5.4",
-    tools=[],
-)
+[Open the Studio setup guide →](docs/en/studio/quick_start.md)
 
+### Build with Python
 
-async def main() -> None:
-    identity = RunIdentity(threadId="thread-1", runId="run-1")
-    parts = await tinkerfin.open_run(
-        identity,
-        agent=agent,
-        input={"messages": [{"role": "user", "content": "Hello"}]},
-    )
-    async for part in parts:
-        print(part)
+Requires Python 3.11 or newer.
 
-
-asyncio.run(main())
+```bash
+pip install tinkerfin langchain-openai
 ```
 
-`open_run()` owns definition resolution, asynchronous Graph construction, observation,
-coordination, cancellation, and cleanup. Use `await agent.create_graph()` only when an
-advanced integration needs a reusable direct LangGraph-style `Runnable` without managed
-run identity, Trace, AG-UI, or Messaging lifecycle.
+Set your model credentials, create an agent, and consume its output.
 
-## Core concepts
+[Run your first agent →](docs/en/runtime/quick_start.md)
 
-- `create_deep_agent(...)` records the installed Deep Agents build call;
-  `ainvoke()`, `open_run()`, and `open_agui_run()` are the ordinary managed execution
-  paths.
-- Native Runtime, Plan Mode, Observation, and SSE are included by default;
-  `open_agui_run()` requires `tinkerfin[agui]`.
-- `TinkerFin(state_schema=...)` contributes application state to every Deep Agent
-  Definition created by that factory; Definition state and middleware state are merged
-  without weakening reducers or requiredness.
-- `.plan(enabled=True)` adds one stable parent workflow without changing the installed
-  `create_deep_agent(...)` signature. Choose `mode="default"` or `mode="plan"` on each
-  managed run or direct Graph; selecting Plan requires a concrete checkpointer.
-- One explicit Runtime Profile owns graph construction, required stream options,
-  Native validation, observations, and canonical replay; conflicting or partial
-  upstream options fail before iteration or lifecycle events.
-- Runtime and Adapter enforce event ordering, subagent provenance, interrupt/resume,
-  reasoning privacy, cancellation, backpressure, and cleanup.
-- Object streams provide direct SSE and can be passed unencoded to Messaging for
-  persistence, replay, attachment, and remote cancellation.
-- AG-UI Runtime uses one `RunIdentity` for public events, Graph execution, checkpoints, and
-  durable delivery; optional `parent_run_id` creates a real checkpoint branch.
-- `open_agui_run(resume=...)` accepts an `AgUiResumeRequest`, reads the canonical
-  checkpoint, and owns native commands, Tool correlation, cancellation, and durable
-  checkpoint evidence. Binding APIs remain available only for advanced event-log
-  integrations.
-- `.observe(Tracer())` records fail-closed Runtime lifecycle and validated Native semantic
-  facts without recording AG-UI, Messaging, SSE, or Redis delivery state.
-- The default `DeepAgentsV2RuntimeProfile` uses the stable v2 object stream. The explicit
-  Deep Agents v3 integration, `DeepAgentsV3RuntimeProfile`, uses LangGraph's experimental
-  v3 event stream. Both emit the same canonical Runtime observations; Trace, AG-UI,
-  Messaging, and applications do not branch on the selected upstream stream API.
-- `TodoGroups` are Studio projections over canonical Trace facts, not a second Runtime
-  state or persistence format.
-- Archive/S3/Blob, payload encryption/KMS, and OpenTelemetry exporters are not provided.
-  Active Trace storage implements `TraceLedgerBackend`; advanced integrations may
-  replace `TraceStore`, wrap the canonical codec, observe `RuntimeObserver`, or decorate
-  Store/Messaging Backend operations.
+## Project layout
+
+| Part | Purpose |
+| --- | --- |
+| `packages/` | Core framework for enterprise agent applications: task orchestration, human collaboration, execution tracing, and isolated environments |
+| `apps/studio/` | A deployable, extensible agent workspace for business interactions, plan approval, and execution tracing |
+| `docs/` | Bilingual documentation for application development, deployment, operations, and advanced integration |
 
 ## Documentation
 
-- [Complete documentation](docs/en/README.md)
-- [Runtime](docs/en/runtime/index.md)
-- [AG-UI](docs/en/agui/index.md)
-- [Messaging](docs/en/messaging/index.md)
-- [Tracing](docs/en/tracing/index.md)
-- [Sandbox](docs/en/sandbox/index.md)
-- [Core package](packages/tinkerfin/README.md)
-- [Shared contracts](packages/tinkerfin-contracts/README.md)
-- [AG-UI adapter](packages/tinkerfin-agui-adapter/README.md)
-- [Tracing package](packages/tinkerfin-tracing/README.md)
-- [LangGraph MySQL Store](packages/tinkerfin-langgraph-mysql/README.md)
-- [Studio server](apps/studio/server/README.md)
-- [Studio web client](apps/studio/web/README.md)
+[English documentation →](docs/en/index.md)
+
+From application development to deployment and operations: getting-started guides, architecture documentation, and integration references.
+
+## Contributing
+
+Issue reports, documentation improvements, and code contributions are welcome. See the [development guide](docs/en/development.md) for environment setup and validation commands.
 
 ## License
 
-Apache License 2.0 is the repository default; see [LICENSE](LICENSE).
-`tinkerfin-langgraph-mysql`, derived from the upstream LangGraph MySQL Store, is
-distributed under its packaged [MIT LICENSE](packages/tinkerfin-langgraph-mysql/LICENSE)
-and [NOTICE](packages/tinkerfin-langgraph-mysql/NOTICE).
+[Apache License 2.0](LICENSE) is the repository default. The `tinkerfin-langgraph-mysql` package,
+derived from the upstream LangGraph MySQL Store, uses its packaged
+[MIT License](packages/tinkerfin-langgraph-mysql/LICENSE) and [NOTICE](packages/tinkerfin-langgraph-mysql/NOTICE).

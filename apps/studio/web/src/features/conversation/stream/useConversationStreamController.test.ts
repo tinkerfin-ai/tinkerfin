@@ -65,6 +65,7 @@ const traceDetail = (
   generation: 'generation-test',
   observedAt: '2026-09-05T00:00:00.000000Z',
   headRunId: RUN_ID,
+  runFailures: [],
   availableHeads: [RUN_ID],
   historyCursor: null,
   messageCount: 1,
@@ -408,7 +409,7 @@ describe('useConversationStreamController', () => {
           completeness: { missingPrefix: false, missingTail: false, payloadOmitted: false },
           messageCount: 1,
           toolCallCount: 0,
-          projections: {},
+          projections: {}, runFailures: [],
         },
       },
     ]))
@@ -467,7 +468,7 @@ describe('useConversationStreamController', () => {
               completeness: terminal.completeness,
               messageCount: terminal.messageCount,
               toolCallCount: terminal.toolCallCount,
-              projections: {},
+              projections: {}, runFailures: [],
             },
           }])
     })
@@ -570,10 +571,11 @@ describe('useConversationStreamController', () => {
     })
   })
 
-  it('clears the temporary live notice after a failed Trace becomes authoritative', async () => {
+  it('从权威历史恢复独立运行错误，不合成消息或 Toast 通知', async () => {
     traceMocks.detail.mockResolvedValue(traceDetail({
       status: { execution: 'failed', headRunId: RUN_ID },
       messages: [],
+      runFailures: [{ runId: RUN_ID, errorCode: 'failed', failedAt: '2026-09-08T00:00:00Z', retryable: false }],
     }))
     clientMocks.start.mockImplementation(() => streamItems([
       { seq: 1, event: { type: 'RUN_STARTED', threadId: THREAD_ID, runId: RUN_ID } },
@@ -595,7 +597,8 @@ describe('useConversationStreamController', () => {
 
     await waitFor(() => {
       const current = result.current.workspace.conversations[0]
-      expect(current?.messages.filter((message) => message.role === 'error')).toHaveLength(1)
+      expect(current?.messages.filter((message) => message.role === 'error')).toHaveLength(0)
+      expect(current?.runFailures).toMatchObject([{ runId: RUN_ID, retryable: false }])
       expect(current?.notice).toBeUndefined()
     })
   })

@@ -757,6 +757,7 @@ async function mockStudio(page: Page, {
       generation: `browser-generation:${THREAD_ID}`,
       observedAt: '2026-09-05T00:00:00.000000Z',
       headRunId: 'browser-run',
+      runFailures: [],
       availableHeads: ['browser-run'],
       historyCursor: null,
       messageCount: traceMessages.filter((message) => message.role !== 'tool').length,

@@ -100,6 +100,17 @@ Studio 使用框架默认的 Sandbox Runtime 镜像，预装 Playwright 和无�
   与 `completeness`；断连或取消会停止本次订阅
 - `POST /api/conversation/chat` 返回当前运行的 AG-UI 事件；终态会话正文仍以 Trace 为准
 
+会话详情和 Trace 初始快照必须包含 `runFailures`；实时更新事件在外层携带同名数组，
+与 `update` 并列。数组来自同一固定前缀中的公开运行事实，仅包含当前历史窗口内普通提问的
+失败记录；分页扩展时客户端按 `runId` 合并，不能通过缺少助手消息推断失败。
+每项包含 `runId`、可空的 `errorCode`、UTC 时间 `failedAt` 和 `retryable`。
+只有错误码为 `runtime_initialization_error` 的执行前失败可重新发送；取消、成功和恢复操作
+不会生成普通提问失败记录。列表仓储的 `error_code` 保存当前运行的错误码摘要，Trace 是权威来源。
+
+“重试”使用普通 `POST /api/conversation/chat`，携带新的运行和用户消息 ID；
+输入为原问题及原附件引用，使用当前上下文、模型和模式。它不会恢复或修改原运行，也不修改链路。
+界面统一显示“会话异常”，不直接展示底层异常信息。
+
 Trace Graph 中，同一 Turn 作用域的节点按真实开始序号平级排列，只有 Subagent 形成嵌套。
 `parentSubagentId` 是唯一展示嵌套关系；`modelCallId` 只关联 Assistant、Tool、Subagent 与产生它的
 Model。Assistant 没有可见正文但对应 Model 确实发出 Tool 调用时，`toolCallOnly` 为 `true`，且不受

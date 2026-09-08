@@ -23,6 +23,10 @@ from tinkerfin_studio.api.errors import (
     ConversationErrorCode,
     SystemException,
 )
+from tinkerfin_studio.conversation.failures import (
+    FAILURE_PROJECTION,
+    visible_run_failures,
+)
 from tinkerfin_studio.conversation.models import ConversationThread
 from tinkerfin_studio.conversation.repository import ConversationRepository
 from tinkerfin_studio.conversation.schemas import (
@@ -245,11 +249,21 @@ class ConversationHistoryService:
             updates = trace.follow()
             last_revision = projector.revision if projector is not None else 0
             last_task_trace = task_trace
+            user_runs = {
+                item.id: item.run_id
+                for item in trace.messages
+                if item.role == "user" and not item.namespace
+            }
             last_status = trace.status
             last_completeness = trace.completeness
             try:
                 yield ConversationTraceSnapshotEvent(snapshot=detail)
                 async for update in updates:
+                    for message_id in update.messages.removes:
+                        user_runs.pop(message_id, None)
+                    for item in update.messages.upserts:
+                        if item.role == "user" and not item.namespace:
+                            user_runs[item.id] = item.run_id
                     task_trace_update = None
                     if projector is not None:
                         for event in update.events:
@@ -271,6 +285,10 @@ class ConversationHistoryService:
                                 last_task_trace = candidate
                     yield ConversationTraceUpdateEvent(
                         update=update,
+                        runFailures=visible_run_failures(
+                            update.projections[FAILURE_PROJECTION],
+                            set(user_runs.values()),
+                        ),
                         taskTrace=task_trace_update,
                     )
             except asyncio.CancelledError:
@@ -401,6 +419,7 @@ class ConversationHistoryService:
                 thread.thread_id,
                 head_run_id=None if history_cursor is not None else head_run_id,
                 history_cursor=history_cursor,
+                projections=(FAILURE_PROJECTION,),
                 limit=min(max(limit, 1), _HISTORY_PAGE_SIZE_MAX),
             )
         except InvalidTraceCursor as error:
@@ -455,6 +474,14 @@ class ConversationHistoryService:
             messageCount=summary.message_count,
             toolCallCount=summary.tool_call_count,
             messages=trace.messages,
+            runFailures=visible_run_failures(
+                trace.projections[FAILURE_PROJECTION],
+                {
+                    item.run_id
+                    for item in trace.messages
+                    if item.role == "user" and not item.namespace
+                },
+            ),
             reasoning=trace.reasoning,
             graph=trace.graph,
             state=trace.state,

@@ -1,6 +1,6 @@
 # Repository development
 
-[中文](../zh/development.md)
+[中文](../cn/development.md)
 
 Run repository commands from the checkout root. Python 3.11 or newer and uv are required.
 
