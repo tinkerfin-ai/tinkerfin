@@ -8,12 +8,13 @@ real test failures.
 
 from __future__ import annotations
 
+import json
 import re
 import secrets
 import sys
 import time
-from collections.abc import AsyncIterator, Iterator
-from contextlib import ExitStack, contextmanager
+from collections.abc import AsyncIterator, Generator, Iterator
+from contextlib import ExitStack, closing, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -31,7 +32,7 @@ import docker
 import pytest
 import pytest_asyncio
 from docker import DockerClient
-from docker.errors import DockerException, ImageNotFound, NotFound
+from docker.errors import DockerException, ImageLoadError, ImageNotFound, NotFound
 from docker.models.networks import Network
 from requests import Response
 from sqlalchemy import text
@@ -507,17 +508,17 @@ def _copy_runtime_image(
     reference: str,
     repository: str,
     tag: str,
-    archive: Path,
     export_budget_seconds: float = 300.0,
 ) -> None:
-    """Copy one immutable ID through the selected source session, then verify its tag.
+    """Stream one immutable image between owned sessions, then verify its tag.
 
     Docker 7.2 Image.save() disables socket timeouts in _stream_raw_result. The
-    public requests Session interface retains the selected daemon/transport while
-    preserving a 30-second idle-read limit and checking the export budget between
-    1 MiB chunks. It cannot forcibly interrupt an in-flight read or OS file write;
-    this synchronous fixture owns one export at a time. Response, file, and partial
-    archive are always closed/removed. Import retains the target SDK timeout.
+    public requests Session interface preserves the selected daemon and its
+    30-second read timeout, including the wait for response headers. Export checks
+    its total budget between 1 MiB chunks; in-flight I/O cannot be interrupted
+    by that check. Requests streams the iterable upload with backpressure, without
+    a host archive or a whole-image buffer. Both HTTP responses and the upload
+    iterator close on failure. Import retains the target SDK's request timeout.
     """
     if export_budget_seconds <= 0:
         raise ValueError("Image export budget must be positive")
@@ -533,38 +534,61 @@ def _copy_runtime_image(
         raise RuntimeError("The selected source image has no immutable content ID")
     endpoint = f"{source.api.base_url}/v{source.api.api_version}/images/{source_id}/get"
     deadline = time.monotonic() + export_budget_seconds
-    created = False
-    try:
-        response: Response
-        with source.api.get(
-            endpoint, stream=True, timeout=min(30.0, export_budget_seconds)
-        ) as response:
-            response.raise_for_status()
-            with archive.open("xb") as output:
-                created = True
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError("Docker image export exceeded its budget")
-                    output.write(chunk)
+    response: Response
+    with source.api.get(
+        endpoint, stream=True, timeout=min(30.0, export_budget_seconds)
+    ) as response:
+        response.raise_for_status()
+
+        def chunks() -> Generator[bytes, None, None]:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
                 if time.monotonic() >= deadline:
                     raise TimeoutError("Docker image export exceeded its budget")
-        with archive.open("rb") as stream:
-            target.images.load(stream)
-        imported = target.images.get(source_id)
-        if imported.id != source_id or not imported.tag(repository, tag=tag):
-            raise RuntimeError("The imported image ID or tag does not match its source")
-        if target.images.get(f"{repository}:{tag}").id != source_id:
-            raise RuntimeError("The imported runtime tag resolves to a different image")
-    finally:
-        if created:
-            archive.unlink(missing_ok=True)
+                yield chunk
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Docker image export exceeded its budget")
+
+        target_endpoint = f"{target.api.base_url}/v{target.api.api_version}/images/load"
+        with (
+            closing(chunks()) as body,
+            target.api.post(
+                target_endpoint,
+                data=body,
+                stream=True,
+                timeout=target.api.timeout,
+                headers={"Content-Type": "application/x-tar"},
+            ) as result,
+        ):
+            result.raise_for_status()
+            for line in result.iter_lines():
+                if not line:
+                    continue
+                progress = json.loads(line)
+                if not isinstance(progress, dict):
+                    raise TypeError("Docker returned invalid image import progress")
+                if "error" in progress or "errorDetail" in progress:
+                    detail = progress.get("errorDetail")
+                    message = (
+                        detail.get("message")
+                        if isinstance(detail, dict)
+                        else progress.get("error")
+                    )
+                    raise ImageLoadError(
+                        message
+                        if isinstance(message, str)
+                        else "Docker reported an image import failure"
+                    )
+    imported = target.images.get(source_id)
+    if imported.id != source_id or not imported.tag(repository, tag=tag):
+        raise RuntimeError("The imported image ID or tag does not match its source")
+    if target.images.get(f"{repository}:{tag}").id != source_id:
+        raise RuntimeError("The imported runtime tag resolves to a different image")
 
 
 @pytest.fixture(scope="session")
 def opensandbox_docker_runtime(
     docker_test_client: DockerClient,
     docker_test_run_id: str,
-    tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[OpenSandboxDockerRuntime]:
     """Own a separate daemon so test Servers cannot restore or delete host Sandboxes.
 
@@ -610,16 +634,13 @@ def opensandbox_docker_runtime(
             raise RuntimeError(
                 "The test runtime must start with an empty Docker inventory"
             )
-        image_directory = tmp_path_factory.mktemp("sandbox-runtime-images")
-        for index, (reference, repository, tag) in enumerate(
+        for reference, repository, tag in (
             (
-                (
-                    OpenSandboxConfig().image,
-                    "tinkerfin-sandbox-e2e",
-                    docker_test_run_id,
-                ),
-                ("opensandbox/execd:v1.0.22", "opensandbox/execd", "v1.0.22"),
-            )
+                OpenSandboxConfig().image,
+                "tinkerfin-sandbox-e2e",
+                docker_test_run_id,
+            ),
+            ("opensandbox/execd:v1.0.22", "opensandbox/execd", "v1.0.22"),
         ):
             _copy_runtime_image(
                 docker_test_client,
@@ -627,7 +648,6 @@ def opensandbox_docker_runtime(
                 reference=reference,
                 repository=repository,
                 tag=tag,
-                archive=image_directory / f"image-{index}.tar",
             )
         container_id = daemon.get_wrapped_container().id
         if not isinstance(container_id, str):
