@@ -1316,19 +1316,18 @@ test('Plan 澄清按后端题型渲染单选、多选、文本与日期控件', 
     expect(Math.abs(bounds.y + (bounds.height / 2) - dateRowCenter)).toBeLessThanOrEqual(.5)
   }
   await page.locator('.plan-question-composer-head').hover()
-  const initialDateStyle = await date.evaluate((element) => {
-    const style = getComputedStyle(element)
-    return { backgroundColor: style.backgroundColor, borderColor: style.borderColor }
-  })
+  const initialDateBackground = await date.evaluate((element) => getComputedStyle(element).backgroundColor)
   await date.hover()
   await expect(date).toHaveCSS('cursor', 'pointer')
   await expect.poll(async () => (
     date.evaluate((element) => getComputedStyle(element).backgroundColor)
-  )).not.toBe(initialDateStyle.backgroundColor)
+  )).not.toBe(initialDateBackground)
   await page.locator('.plan-question-composer-head').hover()
   await date.focus()
-  expect(await date.evaluate((element) => getComputedStyle(element).borderColor))
-    .not.toBe(initialDateStyle.borderColor)
+  await page.keyboard.press('Shift+Tab')
+  await page.keyboard.press('Tab')
+  await expect(date).toBeFocused()
+  await expect(date).toHaveCSS('border-color', 'rgba(0, 0, 0, 0.16)')
   await date.click()
   const calendar = page.getByRole('application', { name: '选择日期' })
   await expect(calendar).toBeVisible()
