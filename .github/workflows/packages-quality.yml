@@ -3,7 +3,7 @@ name: Packages quality
 on:
   pull_request:
   push:
-    branches: ["**"]
+    branches: [main]
 
 permissions:
   contents: read
@@ -49,14 +49,14 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Test web behavior
         run: pnpm test
+      - name: Install Chromium
+        run: pnpm exec playwright install --with-deps chromium
       - name: Test web proxy
         run: pnpm test:proxy
       - name: Lint web source
         run: pnpm lint
       - name: Build production web assets
         run: pnpm build
-      - name: Install Chromium
-        run: pnpm exec playwright install --with-deps chromium
       - name: Test browser behavior and accessibility
         run: pnpm test:browser
 

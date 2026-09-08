@@ -17,7 +17,7 @@ permissions:
 
 concurrency:
   group: studio-image-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   IMAGE: ghcr.io/tinkerfin-ai/studio-server

@@ -30,9 +30,9 @@ For Studio web changes, run these commands from `apps/studio/web`:
 ```bash
 pnpm install --frozen-lockfile
 pnpm test
+pnpm exec playwright install chromium
 pnpm test:proxy
 pnpm lint
-pnpm exec playwright install chromium
 pnpm test:browser
 ```
 

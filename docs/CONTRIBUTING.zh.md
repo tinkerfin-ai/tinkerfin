@@ -30,9 +30,9 @@ uv run pytest
 ```bash
 pnpm install --frozen-lockfile
 pnpm test
+pnpm exec playwright install chromium
 pnpm test:proxy
 pnpm lint
-pnpm exec playwright install chromium
 pnpm test:browser
 ```
 
