@@ -9,7 +9,7 @@ settle them before lifecycle ownership may move to another caller.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncGenerator, Generator
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 
@@ -118,7 +118,7 @@ class _SDKRequestTracker:
         self._closing = False
 
     @contextmanager
-    def owned_call(self) -> Iterator[None]:
+    def owned_call(self) -> Generator[None]:
         """Keep resource handoff and cancellation reclamation ahead of close.
 
         A create/connect SDK task can finish before its public caller receives the
@@ -141,7 +141,7 @@ class _SDKRequestTracker:
             operation.register()
 
     @contextmanager
-    def caller_work(self) -> Iterator[None]:
+    def caller_work(self) -> Generator[None]:
         """Keep caller-owned initializer tasks outside SDK child ownership.
 
         The surrounding lifecycle operation still waits for the initializer itself.
@@ -155,7 +155,7 @@ class _SDKRequestTracker:
             self._current.reset(token)
 
     @asynccontextmanager
-    async def operation(self) -> AsyncIterator[None]:
+    async def operation(self) -> AsyncGenerator[None]:
         """Keep failed SDK children inside the call that owns their resources."""
         if self._current.get() is not None:
             yield

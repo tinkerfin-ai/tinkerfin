@@ -136,6 +136,9 @@ run identity, Trace, AG-UI, or Messaging lifecycle.
 - [Studio server](apps/studio/server/README.md)
 - [Studio web client](apps/studio/web/README.md)
 
+- [Contributing](CONTRIBUTING.md)
+- [Security reports](SECURITY.md)
+
 ## License
 
 Apache License 2.0 is the repository default; see [LICENSE](LICENSE).

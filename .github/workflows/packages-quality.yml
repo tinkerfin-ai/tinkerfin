@@ -3,6 +3,14 @@ name: Packages quality
 on:
   pull_request:
   push:
+    branches: ["**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   repository-and-studio:
@@ -41,6 +49,8 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Test web behavior
         run: pnpm test
+      - name: Test web proxy
+        run: pnpm test:proxy
       - name: Lint web source
         run: pnpm lint
       - name: Build production web assets
@@ -138,3 +148,18 @@ jobs:
         run: >-
           uv run pytest packages apps/studio/server/tests
           -m docker_integration
+
+  quality-gate:
+    name: Quality gate
+    if: always()
+    needs: [repository-and-studio, web, packages, wheel-boundaries, docker-integrations]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every check to succeed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for result in $RESULTS; do
+            [[ "$result" == success ]] || exit 1
+          done

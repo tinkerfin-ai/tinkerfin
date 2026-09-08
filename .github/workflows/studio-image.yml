@@ -24,9 +24,6 @@ env:
 
 jobs:
   build:
-    permissions:
-      contents: read
-      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -87,29 +84,79 @@ jobs:
           assert app.title
           assert os.access("/app/attachments", os.W_OK)
           '
-      - name: Log in to GHCR
-        if: startsWith(github.ref, 'refs/tags/studio-v')
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Publish tested platform image
+      - name: Export tested platform image
         if: startsWith(github.ref, 'refs/tags/studio-v')
         env:
-          VERSION: ${{ steps.version.outputs.value }}
           ARCH: ${{ matrix.arch }}
-        run: |
-          docker tag studio-server:test "$IMAGE:$VERSION-$ARCH"
-          docker push "$IMAGE:$VERSION-$ARCH"
+        run: docker save studio-server:test | gzip > "$RUNNER_TEMP/studio-server-$ARCH.tar.gz"
+      - name: Upload tested platform image
+        if: startsWith(github.ref, 'refs/tags/studio-v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: studio-server-${{ matrix.arch }}
+          path: ${{ runner.temp }}/studio-server-${{ matrix.arch }}.tar.gz
+          compression-level: 0
+          retention-days: 1
 
   publish:
     if: startsWith(github.ref, 'refs/tags/studio-v')
     needs: build
     runs-on: ubuntu-latest
     permissions:
+      contents: read
+      checks: read
       packages: write
+    timeout-minutes: 20
     steps:
+      - name: Require successful quality checks for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          conclusion=$(gh api "repos/$REPOSITORY/commits/$COMMIT/check-runs" \
+            --jq '[.check_runs[] | select(.name == "Quality gate" and .app.slug == "github-actions")][0].conclusion')
+          [[ "$conclusion" == success ]] || { echo "Quality gate must pass before publishing" >&2; exit 1; }
+      - name: Reject existing image tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_ACTOR: ${{ github.actor }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PYTHON'
+          import base64
+          import json
+          import os
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          repository = os.environ["IMAGE"].removeprefix("ghcr.io/")
+          version = os.environ["RELEASE_TAG"].removeprefix("studio-v")
+          credentials = f'{os.environ["GH_ACTOR"]}:{os.environ["GH_TOKEN"]}'
+          query = urllib.parse.urlencode({"service": "ghcr.io", "scope": f"repository:{repository}:pull"})
+          request = urllib.request.Request("https://ghcr.io/token?" + query, headers={
+              "Authorization": "Basic " + base64.b64encode(credentials.encode()).decode(),
+          })
+          with urllib.request.urlopen(request, timeout=30) as response:
+              token = json.load(response)["token"]
+          for tag in (version, version + "-amd64", version + "-arm64"):
+              request = urllib.request.Request(
+                  f"https://ghcr.io/v2/{repository}/manifests/{tag}", method="HEAD",
+                  headers={"Authorization": "Bearer " + token, "Accept": "application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json"},
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=30):
+                      raise SystemExit(f"Image tag already exists: {repository}:{tag}")
+              except urllib.error.HTTPError as error:
+                  if error.code != 404:
+                      raise
+          PYTHON
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: studio-server-*
+          path: images
+          merge-multiple: true
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -121,6 +168,11 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           version=${RELEASE_TAG#studio-v}
+          for arch in amd64 arm64; do
+            docker load --input "images/studio-server-$arch.tar.gz"
+            docker tag studio-server:test "$IMAGE:$version-$arch"
+            docker push "$IMAGE:$version-$arch"
+          done
           docker buildx imagetools create --tag "$IMAGE:$version" \
             "$IMAGE:$version-amd64" "$IMAGE:$version-arm64"
       - name: Verify public image access

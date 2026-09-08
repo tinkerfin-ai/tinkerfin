@@ -2540,11 +2540,24 @@ async def test_bounded_binary_read_cancel_closes_response_and_helper(
         assert not sandbox.commands.running
 
 
-async def test_bounded_binary_read_timeout_closes_response_and_helper() -> None:
+@pytest.mark.parametrize("timeout", [0.000001, 0.05], ids=["handshake", "body"])
+async def test_bounded_binary_read_timeout_closes_response_and_helper(
+    timeout: float,
+) -> None:
     stream = _BoundedResponseStream([], wait=True)
     backend, sandbox = _bounded_backend(stream)
-    with pytest.raises(OpenSandboxBackendTimeoutError):
-        await backend.aread_bytes("/file.bin", max_bytes=65536, timeout=0.05)
+    task = asyncio.create_task(
+        backend.aread_bytes("/file.bin", max_bytes=65536, timeout=timeout)
+    )
+    try:
+        done, _ = await asyncio.wait({task}, timeout=2)
+        assert done, "The read deadline must stop the transfer and settle its helper"
+        with pytest.raises(OpenSandboxBackendTimeoutError):
+            await task
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
     assert stream.closed
     assert not sandbox.commands.running
 

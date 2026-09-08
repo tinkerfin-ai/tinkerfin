@@ -4,6 +4,7 @@ from __future__ import annotations
 
 __all__ = [
     "_codec_id",
+    "_open_recoverable_source",
     "_producer_finished",
     "_start_producer",
     "_start_producer_task",
@@ -584,13 +585,17 @@ def _start_producer_task(
                             checkpoint=produced.checkpoint,
                             opens_publication=(
                                 not isinstance(codec, MessagePublicationPolicy)
-                                or codec.starts_publication(
+                                or cast(
+                                    MessagePublicationPolicy[SourceT], codec
+                                ).starts_publication(
                                     produced.data, identity=prepared.handle.identity
                                 )
                             ),
                             closes_publication=(
                                 isinstance(codec, MessagePublicationPolicy)
-                                and codec.ends_publication(
+                                and cast(
+                                    MessagePublicationPolicy[SourceT], codec
+                                ).ends_publication(
                                     produced.data, identity=prepared.handle.identity
                                 )
                             ),

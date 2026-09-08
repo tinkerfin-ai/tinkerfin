@@ -572,7 +572,8 @@ async def publish(
         required_identity(identity)
         codec = self._require_read_codec()
         if isinstance(codec, MessagePublicationPolicy):
-            codec.validate_publication(message, identity=identity)
+            policy = cast(MessagePublicationPolicy[SourceT], codec)
+            policy.validate_publication(message, identity=identity)
         payload = codec.encode(message)
         return await _await_backend(
             "publish",

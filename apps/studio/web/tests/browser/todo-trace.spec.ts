@@ -12,6 +12,7 @@ import { traceGraphNode, traceGraphWithNodes } from '../../src/test/traceFixture
 declare global {
   interface Window {
     __todoTraceStartedAt?: number
+    __todoTraceReadyAt?: number
     __todoTraceLongTasks?: number[]
   }
 }
@@ -583,6 +584,14 @@ test('5k Group 冷水化、windowing、键盘与 heap 门禁', async ({ page }) 
   await page.addInitScript(() => {
     window.__todoTraceStartedAt = performance.now()
     window.__todoTraceLongTasks = []
+    // 页面内记录入口首次可见时刻，避免把测试驱动端的轮询等待计入水化耗时
+    const observer = new MutationObserver(() => {
+      const launcher = document.querySelector<HTMLButtonElement>('button[aria-label="任务轨迹 5000"]')
+      if (!launcher || !launcher.checkVisibility({ visibilityProperty: true })) return
+      window.__todoTraceReadyAt = performance.now()
+      observer.disconnect()
+    })
+    observer.observe(document, { childList: true, subtree: true, attributes: true })
     new PerformanceObserver((list) => {
       window.__todoTraceLongTasks?.push(...list.getEntries().map((entry) => entry.duration))
     }).observe({ type: 'longtask', buffered: true })
@@ -596,9 +605,12 @@ test('5k Group 冷水化、windowing、键盘与 heap 门禁', async ({ page }) 
   await page.unroute('**/api/**')
   const evidence = await mockTodoTraceStudio(page, { groups })
   const launcher = page.getByRole('button', { name: '任务轨迹 5000', exact: true })
-  const hydrationMs = await page.evaluate(() => (
-    performance.now() - (window.__todoTraceStartedAt ?? performance.now())
-  ))
+  const hydrationMs = await page.evaluate(() => {
+    if (window.__todoTraceStartedAt === undefined || window.__todoTraceReadyAt === undefined) {
+      throw new Error('任务轨迹入口尚未记录水化完成时刻')
+    }
+    return window.__todoTraceReadyAt - window.__todoTraceStartedAt
+  })
   expect(hydrationMs).toBeLessThanOrEqual(2_000)
 
   await cdp.send('HeapProfiler.collectGarbage')

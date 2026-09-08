@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import replace
 from functools import wraps
 from importlib.metadata import version
 from types import FunctionType
-from typing import Any, TypeVar, cast
+from typing import Any, Concatenate, ParamSpec, TypeVar, cast
 from uuid import uuid4
 
 from deepagents.backends import StateBackend
@@ -36,24 +36,28 @@ from .errors import TinkerFinLifecycleError
 from .media import AttachmentSupport
 
 _MessageT = TypeVar("_MessageT", bound=BaseMessage)
+_HookParams = ParamSpec("_HookParams")
 
 
 def _reference_messages(
     messages: Sequence[_MessageT], *, shield: bool, token: str
 ) -> list[_MessageT]:
     """Keep references outside native media scrubbing and text eviction payloads."""
-    result = []
+    result: list[_MessageT] = []
     for message in messages:
         if isinstance(message.content, str):
             result.append(message)
             continue
-        blocks = []
+        blocks: list[str | dict[Any, Any]] = []
         for block in message.content:
             if not shield and isinstance(block, dict):
                 extras = block.get("extras")
                 if (
                     isinstance(extras, dict)
-                    and extras.get("tinkerfin_attachment_caption") == token
+                    and cast(Mapping[object, object], extras).get(
+                        "tinkerfin_attachment_caption"
+                    )
+                    == token
                 ):
                     continue
             attachment = attachment_from_block(block)
@@ -65,7 +69,7 @@ def _reference_messages(
                 value = block.get("value")
                 if (
                     isinstance(value, dict)
-                    and value.get("token") == token
+                    and cast(Mapping[object, object], value).get("token") == token
                     and "tinkerfin_attachment" in value
                 ):
                     attachment = Attachment.model_validate(
@@ -119,11 +123,17 @@ class _AttachmentFilesystem(AgentMiddleware):
     def name(self) -> str:
         return self._filesystem.name
 
-    def wrap_model_call(self, request, handler):
+    def wrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], ModelResponse],
+    ) -> ModelResponse | ExtendedModelResponse | AIMessage:
         raise NotImplementedError("Attachment access requires async model invocation")
 
     async def awrap_model_call(
-        self, request: ModelRequest, handler
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
     ) -> ModelResponse | ExtendedModelResponse | AIMessage:
         token = uuid4().hex
 
@@ -141,16 +151,21 @@ class _AttachmentFilesystem(AgentMiddleware):
             self._support._reference_token.reset(binding)
         if isinstance(result, ExtendedModelResponse) and result.command is not None:
             update = result.command.update
-            if isinstance(update, Mapping) and isinstance(update.get("messages"), list):
-                restored = _reference_messages(
-                    update["messages"], shield=False, token=token
-                )
-                result = replace(
-                    result,
-                    command=replace(
-                        result.command, update={**update, "messages": restored}
-                    ),
-                )
+            if isinstance(update, Mapping):
+                update_mapping = cast(Mapping[object, object], update)
+                if isinstance(update_mapping.get("messages"), list):
+                    restored = _reference_messages(
+                        cast(Sequence[BaseMessage], update_mapping["messages"]),
+                        shield=False,
+                        token=token,
+                    )
+                    result = replace(
+                        result,
+                        command=replace(
+                            result.command,
+                            update={**update_mapping, "messages": restored},
+                        ),
+                    )
         return result
 
 
@@ -181,17 +196,27 @@ def attachment_filesystem(
         original = getattr(filesystem, name)
 
         # The bound original retains ownership of configuration, tools and state.
-        def delegate(method):
+        def delegate(
+            method: Callable[_HookParams, Any],
+        ) -> Callable[Concatenate[_AttachmentFilesystem, _HookParams], Any]:
             if inspect.iscoroutinefunction(method):
 
                 @wraps(method)
-                async def async_hook(self, *args, **kwargs):
+                async def async_hook(
+                    self: _AttachmentFilesystem,
+                    *args: _HookParams.args,
+                    **kwargs: _HookParams.kwargs,
+                ) -> Any:
                     return await method(*args, **kwargs)
 
                 return async_hook
 
             @wraps(method)
-            def sync_hook(self, *args, **kwargs):
+            def sync_hook(
+                self: _AttachmentFilesystem,
+                *args: _HookParams.args,
+                **kwargs: _HookParams.kwargs,
+            ) -> Any:
                 return method(*args, **kwargs)
 
             return sync_hook
@@ -266,10 +291,12 @@ def _native_attachment_factory(
 
         return create_with_attachments
 
+    # Deep Agents 0.7.5 annotates create_sub_agent with an unparameterized
+    # Runnable. Cloning inspects only the function, never that unknown output.
     subagent_factory = _bind_dependencies(
-        native_subagents.create_sub_agent,
+        native_subagents.create_sub_agent,  # type: ignore[reportUnknownMemberType, reportUnknownArgumentType]
         create_agent=final_projection(
-            native_subagents.create_sub_agent.__globals__["create_agent"]
+            native_subagents.create_sub_agent.__globals__["create_agent"]  # type: ignore[reportUnknownMemberType]
         ),
     )
     task_factory = _bind_dependencies(
@@ -362,7 +389,7 @@ def attachment_agent_factory(
             cast(str | BaseChatModel, raw_model or model),
             arguments.get("permissions"),
         )
-        subagents = []
+        subagents: list[dict[str, object]] = []
         for original in cast(
             Sequence[Mapping[str, object]], arguments.get("subagents") or ()
         ):

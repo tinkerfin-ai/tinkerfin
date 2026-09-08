@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from typing import cast
 
 from ag_ui.core import UserMessage
@@ -31,7 +32,7 @@ def content_attachments(content: object) -> list[dict[str, JsonValue]]:
     if not isinstance(content, list):
         return []
     result: list[dict[str, JsonValue]] = []
-    for block in content:
+    for block in cast(Sequence[object], content):
         attachment = attachment_from_block(block)
         if attachment is not None:
             result.append(attachment.model_dump(mode="json"))
@@ -47,7 +48,7 @@ def user_message_to_langchain(message: UserMessage) -> HumanMessage:
     """
     if isinstance(message.content, str):
         return HumanMessage(content=message.content, id=message.id, name=message.name)
-    blocks: list[dict[str, JsonValue]] = []
+    blocks: list[str | dict[str, JsonValue]] = []
     for part in message.content:
         if part.type == "text":
             blocks.append({"type": "text", "text": part.text})
@@ -74,9 +75,7 @@ def user_message_to_langchain(message: UserMessage) -> HumanMessage:
                 raise ValueError("documents require a durable attachment reference")
         else:
             raise ValueError(f"unsupported input content: {part.type}")
-    return HumanMessage(
-        content=cast(list[str | dict], blocks), id=message.id, name=message.name
-    )
+    return HumanMessage(content=blocks, id=message.id, name=message.name)
 
 
 def user_content_to_agui(content: object) -> str | list[dict[str, JsonValue]]:
@@ -86,8 +85,11 @@ def user_content_to_agui(content: object) -> str | list[dict[str, JsonValue]]:
     if not isinstance(content, list):
         raise TypeError("user content must be text or a list of content blocks")
     result: list[dict[str, JsonValue]] = []
-    for block in content:
+    for block in cast(Sequence[object], content):
         attachment = attachment_from_block(block)
+        mapping: Mapping[object, object] = (
+            cast(Mapping[object, object], block) if isinstance(block, dict) else {}
+        )
         if attachment is not None:
             result.append(
                 {
@@ -104,13 +106,17 @@ def user_content_to_agui(content: object) -> str | list[dict[str, JsonValue]]:
             result.append({"type": "text", "text": block})
         elif (
             isinstance(block, dict)
-            and block.get("type") == "text"
-            and isinstance(block.get("text"), str)
+            and mapping.get("type") == "text"
+            and isinstance(text := mapping.get("text"), str)
         ):
-            result.append({"type": "text", "text": block["text"]})
-        elif isinstance(block, dict) and block.get("type") == "image_url":
-            image_url = block.get("image_url")
-            url = image_url.get("url") if isinstance(image_url, dict) else image_url
+            result.append({"type": "text", "text": text})
+        elif isinstance(block, dict) and mapping.get("type") == "image_url":
+            image_url = mapping.get("image_url")
+            url = (
+                cast(Mapping[object, object], image_url).get("url")
+                if isinstance(image_url, dict)
+                else image_url
+            )
             if not isinstance(url, str):
                 raise ValueError("image_url blocks require a URL")
             result.append({"type": "image", "source": {"type": "url", "value": url}})

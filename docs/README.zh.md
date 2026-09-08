@@ -128,6 +128,9 @@ LangGraph 风格 `Runnable` 时，才直接调用 `await agent.create_graph()`�
 - [Studio 服务端](../apps/studio/server/README.md)
 - [Studio Web 客户端](../apps/studio/web/README.md)
 
+- [参与开发](CONTRIBUTING.zh.md)
+- [安全漏洞报告](../SECURITY.md)
+
 ## 许可证
 
 仓库默认采用 Apache License 2.0，详见 [LICENSE](../LICENSE)。源自上游 LangGraph MySQL Store 的

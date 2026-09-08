@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Annotated, TypeAlias
+from collections.abc import Sequence
+from typing import Annotated, TypeAlias, cast
 
 from ag_ui.core import (
     ActivityMessage,
@@ -30,19 +31,19 @@ from tinkerfin_contracts.media import Attachment
 class AttachmentToolCallResultEvent(ToolCallResultEvent):
     """Publish durable files with the text result of a completed tool call."""
 
-    attachments: list[Attachment] = Field(default_factory=list)
+    attachments: list[Attachment] = Field(default_factory=list[Attachment])
 
 
 class AttachmentAssistantMessage(AssistantMessage):
     """Preserve an assistant's durable files in an authoritative message snapshot."""
 
-    attachments: list[Attachment] = Field(default_factory=list)
+    attachments: list[Attachment] = Field(default_factory=list[Attachment])
 
 
 class AttachmentToolMessage(ToolMessage):
     """Preserve a tool result's durable files in an authoritative message snapshot."""
 
-    attachments: list[Attachment] = Field(default_factory=list)
+    attachments: list[Attachment] = Field(default_factory=list[Attachment])
 
 
 AttachmentSnapshotMessage: TypeAlias = Annotated[
@@ -55,7 +56,9 @@ AttachmentSnapshotMessage: TypeAlias = Annotated[
     | ReasoningMessage,
     Field(discriminator="role"),
 ]
-_SNAPSHOT_MESSAGES = TypeAdapter(list[AttachmentSnapshotMessage])
+_SNAPSHOT_MESSAGES: TypeAdapter[list[AttachmentSnapshotMessage]] = TypeAdapter(
+    list[AttachmentSnapshotMessage]
+)
 
 
 class AttachmentMessagesSnapshotEvent(MessagesSnapshotEvent):
@@ -83,7 +86,7 @@ class AttachmentMessagesSnapshotEvent(MessagesSnapshotEvent):
                 item.model_dump(mode="python", by_alias=True)
                 if isinstance(item, _MESSAGE_TYPES)
                 else item
-                for item in value
+                for item in cast(Sequence[object], value)
             ]
         return list(_SNAPSHOT_MESSAGES.validate_python(value))
 
@@ -109,7 +112,9 @@ AttachmentOutputEvent: TypeAlias = Annotated[
     AttachmentToolCallResultEvent | AttachmentMessagesSnapshotEvent,
     Field(discriminator="type"),
 ]
-_ATTACHMENT_OUTPUT = TypeAdapter(AttachmentOutputEvent)
+_ATTACHMENT_OUTPUT: TypeAdapter[AttachmentOutputEvent] = TypeAdapter(
+    AttachmentOutputEvent
+)
 
 
 def parse_attachment_output_event(value: object) -> AttachmentOutputEvent:

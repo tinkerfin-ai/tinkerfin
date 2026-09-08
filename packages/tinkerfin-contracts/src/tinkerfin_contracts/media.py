@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Literal
+from typing import Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
@@ -44,16 +44,19 @@ class Attachment(BaseModel):
 
 def attachment_from_block(value: object) -> Attachment | None:
     """Validate a declared attachment block, leaving unrelated domain blocks alone."""
-    if not isinstance(value, Mapping) or value.get("type") not in {"image", "file"}:
+    if not isinstance(value, Mapping):
         return None
-    extras = value.get("extras")
+    block = cast(Mapping[object, object], value)
+    if block.get("type") not in {"image", "file"}:
+        return None
+    extras = block.get("extras")
     if not isinstance(extras, Mapping) or "attachment" not in extras:
         return None
     attachment = Attachment.model_validate(extras["attachment"])
     if (
-        value.get("file_id") != attachment.id
-        or value.get("mime_type") != attachment.mime_type
-        or value.get("type") != ("image" if attachment.kind == "image" else "file")
+        block.get("file_id") != attachment.id
+        or block.get("mime_type") != attachment.mime_type
+        or block.get("type") != ("image" if attachment.kind == "image" else "file")
     ):
         raise ValueError("attachment source and descriptor must identify the same file")
     return attachment

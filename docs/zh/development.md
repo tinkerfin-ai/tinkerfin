@@ -46,3 +46,11 @@ uv run --locked --no-sync pytest tests/packaging -m packaging_e2e
 测试覆盖构建残留、当前源码内容、wheel 元数据、许可证、依赖声明和隔离环境安装。
 CI 在 Python 3.11–3.14 上运行核心安装场景，另在 Python 3.11 上运行全部可选依赖组合和
 Studio 部署所需的完整 wheel 集合。
+
+## 验证 Docker 集成
+
+启动 Docker 后执行以下测试；测试会创建并清理专用的临时服务：
+
+```bash
+uv run pytest packages apps/studio/server/tests -m docker_integration
+```

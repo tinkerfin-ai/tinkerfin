@@ -560,9 +560,10 @@ describe('PlanQuestionComposer', () => {
   })
 
   it('composes bounded date and time selectors without exposing the configured time zone', async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true })
+    // 只固定日历日期，保留交互与焦点恢复使用的真实计时器
+    vi.useFakeTimers({ toFake: ['Date'] })
     vi.setSystemTime(new Date('2026-08-28T00:00:00Z'))
-    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
+    const user = userEvent.setup()
     let current: PlanQuestionState = {
       ...interaction(),
       activeQuestionIndex: 0,

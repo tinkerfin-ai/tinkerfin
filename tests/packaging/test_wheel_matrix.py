@@ -400,7 +400,6 @@ def wheel_directory(tmp_path_factory: pytest.TempPathFactory) -> Path:
         [
             sys.executable,
             str(_ROOT / "scripts/build_wheels.py"),
-            "--offline",
             "--out-dir",
             str(output),
         ]

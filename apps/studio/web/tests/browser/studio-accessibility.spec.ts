@@ -1194,6 +1194,9 @@ test('首页与会话态使用相同的输入卡片高度', async ({ page }) => 
 })
 
 test('macOS Composer 支持 Control+U 且不接管 Command+U', async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, 'platform', { get: () => 'MacIntel' })
+  })
   await mockStudio(page, { emptyHistory: true })
   expect(await page.evaluate(() => navigator.platform)).toContain('Mac')
   const input = page.getByRole('textbox', { name: '消息输入' })

@@ -2,6 +2,14 @@
 
 from __future__ import annotations
 
+__all__ = [
+    "OpenSandboxAvailability",
+    "OpenSandboxAvailabilityPhase",
+    "OpenSandboxHolderUpdate",
+    "_next_availability",
+    "_validate_holder_id",
+]
+
 from dataclasses import dataclass, replace
 from typing import Literal
 

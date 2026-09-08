@@ -51,3 +51,11 @@ The suite checks contaminated build directories, current source contents, wheel 
 licenses, declared dependencies, and installation into isolated environments. CI runs the
 core installation cases on Python 3.11–3.14. Python 3.11 also runs every optional dependency
 combination and the complete Studio deployment wheel set.
+
+## Validate Docker integrations
+
+Start Docker, then run tests that create and clean up their own disposable services:
+
+```bash
+uv run pytest packages apps/studio/server/tests -m docker_integration
+```
