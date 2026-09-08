@@ -69,5 +69,5 @@ combination and the complete Studio deployment wheel set.
 Start Docker, then run tests that create and clean up their own disposable services:
 
 ```bash
-uv run pytest packages apps/studio/server/tests -m docker_integration
+uv run pytest -m docker_integration
 ```

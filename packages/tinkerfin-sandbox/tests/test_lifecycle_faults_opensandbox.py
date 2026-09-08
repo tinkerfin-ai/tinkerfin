@@ -698,8 +698,15 @@ async def test_real_stopped_warm_container_reports_capacity_loss_and_restoration
     fault_evidence: _Evidence,
     additional_lifecycle_observers: list[OpenSandboxLifecycleObserver],
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Real background warm checks report capacity changes independently of owners."""
+    # Use a short maintenance interval to observe background health changes
+    # while keeping the remote Sandbox lifetime valid.
+    monkeypatch.setattr(
+        "tinkerfin_sandbox.lifecycle._manager_resources._WARM_MAINTENANCE_MAX_SECONDS",
+        1.0,
+    )
     observer = _Recorder(fault_evidence)
     client = _client(
         opensandbox_test_service,
@@ -707,7 +714,6 @@ async def test_real_stopped_warm_container_reports_capacity_loss_and_restoration
         fault_docker,
         warm_pool_size=1,
         # The server's CreateSandboxRequest.timeout requires at least 60 seconds.
-        # The public TTL setting yields a 20-second warm maintenance interval.
         ttl=timedelta(seconds=60),
     )
     async with OpenSandboxManager[str](

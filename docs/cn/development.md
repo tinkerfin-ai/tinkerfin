@@ -64,5 +64,5 @@ Studio 部署所需的完整 wheel 集合。
 启动 Docker 后执行以下测试；测试会创建并清理专用的临时服务：
 
 ```bash
-uv run pytest packages apps/studio/server/tests -m docker_integration
+uv run pytest -m docker_integration
 ```
