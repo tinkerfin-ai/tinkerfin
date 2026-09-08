@@ -618,7 +618,7 @@ test('5k Group 冷水化、windowing、键盘与 heap 门禁', async ({ page }) 
   const before = await cdp.send('Runtime.getHeapUsage') as { usedSize: number }
   const taskTraceHeapDelta = Math.max(0, before.usedSize - baseConversation.usedSize)
   expect(taskTraceHeapDelta).toBeLessThanOrEqual(256 * 1024 * 1024)
-  // 从浏览器收到真实点击计时，直到展开后的任务组可见
+  // 从真实点击计时，直到任务组进入视口且经过一次绘制机会
   await launcher.evaluate((button) => {
     button.addEventListener('click', () => {
       const started = performance.now()
@@ -626,9 +626,25 @@ test('5k Group 冷水化、windowing、键盘与 heap 门禁', async ({ page }) 
         const group = document.querySelector<HTMLButtonElement>(
           'button[aria-label="收起任务组：整理当前交付清单"]',
         )
-        if (!group || !group.checkVisibility({ visibilityProperty: true })) return
-        window.__todoTraceOpenMs = performance.now() - started
+        if (!group) return
         observer.disconnect()
+        let visibleLastFrame = false
+        const measure = () => {
+          const now = performance.now()
+          if (now - started >= 5_000) return
+          const rect = group.getBoundingClientRect()
+          const visible = group.checkVisibility({ visibilityProperty: true, opacityProperty: true })
+            && rect.width > 0 && rect.height > 0
+            && rect.right > 0 && rect.left < window.innerWidth
+            && rect.bottom > 0 && rect.top < window.innerHeight
+          if (visible && visibleLastFrame) {
+            window.__todoTraceOpenMs = now - started
+            return
+          }
+          visibleLastFrame = visible
+          window.requestAnimationFrame(measure)
+        }
+        window.requestAnimationFrame(measure)
       })
       observer.observe(document, { childList: true, subtree: true, attributes: true })
     }, { once: true, capture: true })
@@ -636,6 +652,9 @@ test('5k Group 冷水化、windowing、键盘与 heap 门禁', async ({ page }) 
   await launcher.click()
   await expect(page.getByRole('button', { name: '收起任务组：整理当前交付清单' }))
     .toBeVisible()
+  await page.waitForFunction(() => window.__todoTraceOpenMs !== undefined, undefined, {
+    timeout: 5_000,
+  })
   const openMs = await page.evaluate(() => {
     if (window.__todoTraceOpenMs === undefined) {
       throw new Error('任务轨迹尚未记录展开完成时刻')
