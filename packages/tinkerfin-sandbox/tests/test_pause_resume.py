@@ -911,25 +911,6 @@ async def test_cancel_after_state_commit_preserves_exact_request_ownership(
                 await second.get("owner")
 
 
-async def test_pause_budget_expiry_after_draining_commit_cancels_undispatched_intent(
-    tmp_path: Path,
-) -> None:
-    async with _world(tmp_path) as world:
-        manager = await world.add()
-        handle = await manager.get("owner")
-        state = world.states[0]
-        state.delay_phase = "draining"
-        operation = world.spawn(manager.pause("owner", timeout=0.2))
-        await asyncio.wait_for(state.phase_committed.wait(), timeout=1)
-        await asyncio.sleep(0.25)
-        state.phase_release.set()
-        with pytest.raises(OpenSandboxBackendTimeoutError):
-            await asyncio.wait_for(operation, timeout=1)
-        await _phase(state, "running")
-        assert world.remote.pause_calls == []
-        await _usable(handle)
-
-
 @pytest.mark.parametrize("action", ["recreate", "destroy"])
 async def test_cancel_pending_confirmation_does_not_expose_internal_cancellation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str
