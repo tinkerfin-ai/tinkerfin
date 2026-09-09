@@ -1,0 +1,451 @@
+# tinkerfin-sandbox
+
+## What it is
+
+`tinkerfin-sandbox` adapts OpenSandbox SDK 0.1.16 to asynchronous Deep Agents backend
+and lifecycle contracts. It provides stable caller-keyed Sandboxes, reconnection,
+health replacement, warm capacity, rooted paths, pause/resume, scoped diagnostics,
+reset and destroy operations, cancellation-safe cleanup, optional lifecycle observers,
+and multi-worker allocation state. Lifecycle operations use official OpenSandbox Server 0.2.3.
+
+The default image is a digest-pinned [TinkerFin Sandbox Runtime](https://github.com/tinkerfin-ai/sandbox-runtime),
+including Playwright and headless Chromium for web navigation and screenshots.
+Use `OpenSandboxConfig(image=...)` when a different runtime is required.
+
+The package does not depend on `tinkerfin`. Authentication, tenancy policy, key
+selection, graph construction, and HTTP behavior belong to the host.
+
+## Installation
+
+Python 3.11 or newer is required.
+
+```bash
+pip install tinkerfin-sandbox
+```
+
+The default allocation state is process-local. Install one asynchronous database
+extra when multiple workers must share bindings and cleanup work:
+
+```bash
+pip install "tinkerfin-sandbox[sqlite]"
+pip install "tinkerfin-sandbox[mysql]"
+```
+
+## Quick Start
+
+`key_resolver` is required and accepts any application key type. Obtain the Sandbox
+backend before constructing the graph:
+
+```python
+from deepagents import create_deep_agent
+from opensandbox.config import ConnectionConfig
+
+from tinkerfin_sandbox import (
+    OpenSandboxClient,
+    OpenSandboxConfig,
+    OpenSandboxManager,
+)
+
+manager = OpenSandboxManager[str](
+    client=OpenSandboxClient(
+        connection_config=ConnectionConfig(domain="127.0.0.1:8091"),
+        config=OpenSandboxConfig(workspace_root="/workspace"),
+    ),
+    key_resolver=lambda owner: owner,
+)
+
+async with manager:
+    backend = await manager.get("tenant-1/user-7")
+    graph = create_deep_agent(
+        model=model,
+        backend=backend,
+        middleware=manager.build_agent_middleware(backend),
+    )
+```
+
+The manager owns its client and state. The backend returned by `get()` is borrowed by
+the graph and remains valid until the manager closes or that key is explicitly
+destroyed.
+
+OpenSandbox SDK reads `OPEN_SANDBOX_DOMAIN` and `OPEN_SANDBOX_API_KEY` when a client
+uses its environment configuration. Credentials, image policy, volumes, and physical
+paths must remain host configuration.
+
+Client-managed SDK connections disable implicit transport retries. Explicit
+`ConnectionConfig(retry_policy=...)` settings are retained when they cannot replay
+POST/PATCH response failures; configurations permitting that replay are rejected.
+Existing-instance recovery is configured through `OpenSandboxRecoveryPolicy`.
+Caller-supplied transports retain their own policy and lifetime. SDK creation telemetry
+is disabled in the managed configuration because its reporting tasks cannot be joined
+at client close. Headers and SDK settings are copied without changing caller configuration.
+
+## Caller-defined keys
+
+The manager has no built-in user, agent, thread, or workspace isolation enum. The
+host chooses a key type and a stable non-blank string resolver:
+
+```python
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectKey:
+    organization: str
+    project: str
+
+
+manager = OpenSandboxManager[ProjectKey](
+    client=client,
+    key_resolver=lambda key: f"{key.organization}/{key.project}",
+)
+```
+
+Calls resolving to the same string share one stable handle and serialized lifecycle
+transitions. Different resolved keys can proceed concurrently. Raw keys are not placed
+in remote OpenSandbox owner labels; those labels use stable digests.
+
+## Lifecycle
+
+- `get(key)` creates, reconnects, or reuses a healthy backend;
+- `reconnect(key)` connects an existing binding without creating or replacing it;
+- `recreate(key)` commits a replacement and retires the previous instance;
+- `reset(key)` clears the configured `workspace_root` without changing the binding;
+- `pause(key, timeout=30.0)` waits for admitted work across registered processes, then pauses the instance;
+- `resume(key, timeout=30.0)` resumes the same instance and returns a ready backend;
+- `destroy(key)` destroys known remote instances and removes the binding;
+- `get_details(key)` returns a stable owner-aware runtime snapshot;
+- `get_diagnostic_logs(key, scope="container")` and `get_diagnostic_events(key, scope="runtime")` read provider diagnostics;
+- `check_ready()` raises when configured warm capacity is degraded;
+- `aclose()` waits for active operations and closes owned local resources.
+
+`get_details()` includes `access_state`, the framework's shared coordination phase,
+alongside the provider's runtime status. A remotely running instance can still be
+draining or awaiting lifecycle confirmation. `cached` indicates local handle presence,
+not permission to start work; `access_state=None` means no coordination snapshot was supplied.
+
+Existing bindings are preserved by default when recovery fails. The default
+`OpenSandboxRecoveryPolicy` allows three attempts with a 30-second work budget and exponential
+delays from 0.5 to 2 seconds. Set
+`recovery_policy=OpenSandboxRecoveryPolicy(on_failure="recreate")` only when a new
+instance may replace the old workspace; files are not copied. Authentication,
+permission, protocol, initialization, and State failures never trigger recreation.
+An unresolved connection at the total deadline also preserves the binding.
+`reconnect()` and `reset()` retain identity regardless of this policy. Ordinary
+commands, writes, and resets are never replayed.
+
+Native connection and initialization use the earlier client or recovery deadline.
+The budget covers connection, health checks, and retry waits; necessary cancellation
+and resource settlement complete before releasing the owner claim and can extend
+elapsed time. Blocking callbacks cannot be forcibly interrupted.
+
+`OpenSandboxConfig.ttl` defaults to two hours from creation or renewal. For a remote
+workspace whose lifetime ends with explicit cleanup, use
+`OpenSandboxConfig(ttl=None)`. Newly created instances then have no automatic expiry,
+and the manager skips remote renewal while continuing warm health maintenance.
+Connecting to an existing instance does not remove its scheduled expiry.
+
+Resource ownership still determines close behavior: default in-memory State destroys
+its remote instances when the manager closes, while persistent State retains bindings
+for other workers. Non-expiring instances keep consuming resources until destroyed;
+call `manager.destroy(key)` when their work is complete. A finite TTL, external
+deletion, or storage failure can remove files. Manual cleanup is not a backup; use
+volumes and an appropriate backup policy when files must survive instance loss.
+
+For lifecycle observations, pass `observers=[observer]`, where the observer implements
+`async on_sandbox_event(event: OpenSandboxLifecycleEvent)`. Immutable events report
+unavailability, recovery, replacement, explicit reset/destruction, and separate warm
+capacity changes. Successful replacement is reported only after binding and handle
+publication; first creation and normal close do not report replacement or failure.
+Remote IDs are confined to trusted-only `diagnostic_context`. Do not forward that
+mapping to browsers.
+
+`workspace_may_have_changed` also covers confirmed remote absence and possible
+initializer side effects during connection and recovery. `False` means the event
+supplies no such evidence; it does not certify file integrity. Retaining a remote
+instance does not roll back initialization effects.
+
+Notifications are process-local and best effort, with one ordered queue per borrowed
+observer. `OpenSandboxNotificationOptions(max_pending_events=128, timeout=1.0)` controls
+pending capacity and callback seconds through `notification_options`. Full queues
+drop new events; observer failures do not affect Sandbox operations. Close drains
+accepted notifications without closing observers. Callbacks must be non-blocking,
+propagate cancellation, and never reenter their manager's resource operations or
+close. Existing access and warm maintenance discover changes; notifications add no
+remote user Sandbox polling or durable delivery. Shared-State polling for pause/resume
+coordination runs independently of notification delivery.
+
+`settlement_timeout=None` keeps the default complete wait. A finite constructor value
+limits only each caller's wait: expiry raises `OpenSandboxSettlementTimeoutError`,
+leaves the manager unavailable to new work, and does not cancel the owned close task.
+Call `aclose()` again to continue waiting for that same task.
+
+Existing handles keep object identity across remote replacement. In-flight operations
+finish against their acquired backend before the old instance is retired, and the
+replacement call waits for that retirement before returning. Creation, health
+checking, replacement, reset, destroy, and shutdown retain cleanup ownership when the
+calling task is cancelled.
+
+`OpenSandboxClient.destroy()` uses one retained task per Sandbox ID. Concurrent callers
+join the same kill and local-close lifecycle. Caller cancellation waits for that owned
+settlement and then propagates; a confirmed remote kill is not reported as failed only
+because the SDK close step also fails. `aclose()` waits for every active destroy task
+before closing the transport that the client created when `ConnectionConfig` omitted
+one. Concurrent close callers join one retained settlement; cancelling a waiter does
+not cancel transport closure, and a failed close remains retryable. A transport supplied
+by the caller remains borrowed and is never closed by the client.
+
+Warm-pool capacities are strict integers, and command timeouts are strict finite numeric
+values; booleans are rejected before State startup or task creation. State and
+SQLAlchemy constructors apply the same boundary so invalid capacity cannot fail later
+inside warmup.
+
+Published warm slots are fenced, reconnected, health-checked, and renewed when they
+have a configured finite TTL before they count as ready. Missing or expired instances
+are replaced atomically. The manager checks warm health while it is open, renews finite
+expiry, and retries failed background replenishment;
+`check_ready()` exposes degraded capacity to a host without leaking provider details.
+Routine verification retains previously published capacity; the check reads shared
+State to detect consumption by other workers without waiting for local maintenance.
+With `fail_on_startup_warmup_error=True`, authentication, reconnect, health, renewal,
+creation, or publication failure prevents startup.
+
+A manager first verifies the full configured capacity before reporting ready.
+Concurrent peer checks can leave this initial verification incomplete; strict startup
+fails, while ordinary startup stays degraded and resumes through existing maintenance.
+Initial progress is retained across rounds. After it completes, routine peer checks
+continue to preserve published readiness.
+
+With `InMemoryOpenSandboxState`, shutdown destroys remote Sandboxes owned only by that
+process because no later worker can recover them. Persistent state keeps committed
+bindings, warm slots, and durable cleanup work available to other workers.
+It stores lifecycle identity rather than container contents. If an owner instance has
+expired, `get()` reports failure and preserves the binding by default; replacement
+requires an explicit recreation policy. Durable workspace contents require an
+OpenSandbox volume or another storage policy selected by the host.
+
+## Pause and resume
+
+```python
+backend = await manager.get(project_key)
+await manager.pause(project_key, timeout=30.0)
+backend = await manager.resume(project_key, timeout=30.0)
+```
+
+Pause retains the binding, files, and stable handles. Every registered manager sharing
+the State must stop accepting new operations and acknowledge that its admitted work,
+including remote command and transfer settlement, has finished before the pause request
+is sent. Existing handles in other processes observe the shared intent asynchronously;
+pause waits for all acknowledgements. Lost workers and unknown remote outcomes cannot
+be treated as idle. Normal operations on an admitted handle do not query State per call.
+
+The positive `timeout` is a work budget in seconds. If waiting for work to finish times
+out or is cancelled, admission reopens only after State confirms the pause request was
+not dispatched and cancels that intent. An unknown result after dispatch keeps access
+closed until control-plane evidence resolves it. Protective settlement can extend
+elapsed time beyond the work budget.
+
+Paused instances require explicit `resume()`: `get()`, `reconnect()`, and `reset()` do
+not wake them. Resume returns a ready connection for the calling manager; every other
+registered manager refreshes its connection before reopening its existing handle.
+The remote ID is preserved, and connection initializers still run. Official Docker
+resume unpauses a paused container; it cannot start a container stopped through Docker.
+Pausing neither freezes nor extends the remote TTL, so a finite-lived paused instance
+can expire.
+
+## Diagnostics
+
+```python
+logs = await manager.get_diagnostic_logs(project_key, scope="container")
+events = await manager.get_diagnostic_events(project_key, scope="runtime")
+```
+
+These queries read the existing binding through the control plane without creating,
+reconnecting, renewing, or waking the instance. Docker supports log scopes `container`
+and `all`, and event scopes `runtime` and `all`. Docker event diagnostics provide a
+current state summary, not a complete historical event stream.
+
+`OpenSandboxDiagnosticContent` describes inline text or an expiring content URL, with
+`content_type`, optional byte length, `truncated`, and `warnings`. The framework does
+not fetch returned URLs. Diagnostic text and references are trusted operational data;
+the host controls access and retention.
+
+## Rooted backend
+
+When `OpenSandboxConfig.workspace_root` is set, `get()` returns a rooted view. Deep
+Agents file-tool `/` maps to that physical directory and shell commands start there.
+`reset()` refuses to delete when no safe root is configured.
+
+Rooted file tools resolve and access each target in one isolated in-Sandbox helper.
+The helper pins the configured root directory, resolves stable links whose targets
+remain under that root, and reopens every canonical component without following
+links. Links to external paths and components replaced while an operation is running
+are rejected or cause that operation to stop without accessing the external target.
+Read, edit, delete, list, glob, grep, capture offload, and reset use descriptor-relative
+operations. Reset retains the configured root and removes its children without
+following child links.
+
+Native upload and download hold the validated file descriptor in a finite background
+helper while the OpenSandbox filesystem service transfers through
+`/proc/<helper-pid>/fd/<fd>`. The Sandbox image must provide Python 3, Linux procfs,
+and shared process visibility between the command and filesystem services. A runtime
+that cannot satisfy this descriptor path contract fails the operation; it does not
+fall back to reopening the requested pathname. All remote OpenSandbox I/O is
+asynchronous-only. Valid synchronous upload, download, write, and capture-offload
+calls raise the backend's explicit async-only error before file I/O; empty and locally
+invalid batches can still return without remote work.
+
+Use `await backend.aread_bytes("/report.pdf", max_bytes=10 * 1024 * 1024)` to
+retrieve a complete binary file within a byte limit. This method is available on
+raw backends, managed handles, and rooted views; use a rooted view when paths must
+stay inside a workspace. It raises `OpenSandboxFileTooLargeError` instead of
+returning truncated content. Missing and unreadable files retain Python filesystem
+exceptions. Zero bytes accepts only an empty file. Memory consumption is proportional
+to the byte limit, with one transport chunk and a final bytes copy.
+
+The read deadline defaults to 30 seconds and accepts `timeout` values greater than
+zero and at most 290 seconds, within the finite descriptor lifetime. HTTP responses
+close on success, overflow, provider errors, timeout, and cancellation. Rooted reads
+allow up to five seconds each for response and descriptor-helper cleanup before
+releasing the Handle lease. A failed helper cleanup remains an unresolved remote
+operation and does not authorize lifecycle reuse. The download does not retry or
+follow redirects, decode compressed bodies, or close the SDK's borrowed transport.
+
+Batch transfers process valid items in input order and retain one response per input.
+A confirmed invalid path affects only that item. Transport failures and uncertain
+mutation results propagate and are never retried, so a completed write, edit, delete,
+offload, or reset is not replayed after cancellation or response loss. Once remote
+work starts, the Handle lease remains owned until helper and transfer cleanup settle.
+Raw Shell execution is not confined by the file-tool root and remains a separate,
+unrestricted Sandbox capability governed by the host's tool and approval policy.
+
+Pass the final backend to `manager.build_agent_middleware()`. This replaces Deep
+Agents' default filesystem middleware with matching virtual-file and Shell-path
+guidance. When a `CompositeBackend` adds virtual routes, pass that composed backend
+rather than its OpenSandbox default.
+
+Filesystem permissions on an executable CompositeBackend must be fully scoped to
+non-Shell routes. Pass the same rules to Deep Agents and the rooted middleware:
+
+```python
+from deepagents.backends import CompositeBackend, StoreBackend
+from deepagents.middleware.filesystem import FilesystemPermission
+from langgraph.store.memory import InMemoryStore
+
+permissions = [
+    FilesystemPermission(
+        operations=["write"],
+        paths=["/policies/private/**"],
+        mode="deny",
+    )
+]
+store = InMemoryStore()
+sandbox_backend = await manager.get("tenant-1/user-7")
+backend = CompositeBackend(
+    default=sandbox_backend,
+    routes={
+        "/policies/": StoreBackend(
+            namespace=lambda _runtime: ("tenant-1", "policies"),
+        ),
+    },
+)
+graph = create_deep_agent(
+    model=model,
+    backend=backend,
+    middleware=manager.build_agent_middleware(
+        backend,
+        permissions=permissions,
+    ),
+    permissions=permissions,
+    store=store,
+)
+```
+
+Deep Agents rejects permission patterns for the executable default Sandbox because
+Shell commands can bypass file-tool enforcement. Interrupt-mode permissions also
+require a checkpointer. Hosts constructing rooted backends without a manager can call
+`build_rooted_filesystem_middleware()` with the same backend and permissions.
+
+## Persistent multi-worker state
+
+`SQLAlchemyOpenSandboxState` uses SQLAlchemy Core with asynchronous drivers:
+
+```python
+from tinkerfin_sandbox import (
+    OpenSandboxManager,
+    SQLAlchemyOpenSandboxState,
+)
+
+manager = OpenSandboxManager[ProjectKey](
+    client=client,
+    key_resolver=lambda key: f"{key.organization}/{key.project}",
+    state=SQLAlchemyOpenSandboxState(
+        url="sqlite+aiosqlite:////var/lib/app/opensandbox.db",
+        namespace="production",
+        sqlite_retry_timeout=5.0,
+    ),
+)
+```
+
+SQLite write transactions use `BEGIN IMMEDIATE` with package-controlled retry. Each
+attempt permits at most 10 milliseconds of SQLite busy waiting;
+`sqlite_retry_timeout` is the total monotonic budget for replaying `SQLITE_BUSY` and
+`SQLITE_LOCKED` attempts that either never began or completed rollback and connection
+release. Backoff starts at `poll_interval` and is capped at 0.5 seconds. Cancellation
+during backoff propagates immediately. A failed or
+cancelled `COMMIT` never replays the transaction body. SQLite `SQLITE_BUSY` retries
+only `COMMIT` on the same open transaction because that result is known to be
+uncommitted; every other commit error is treated as an uncertain database outcome.
+
+Use `mysql+asyncmy://...` for workers on different hosts. The built-in State supports
+SQLite, MySQL 5.7, and MySQL 8.x. MariaDB and other MySQL server versions are rejected
+until their transaction behavior is verified. MySQL 8.x uses `SKIP LOCKED`; MySQL 5.7
+uses a bounded row-lock wait with the same claim, fencing, and lease semantics.
+
+`start()` creates the complete schema in an empty database and otherwise validates the
+existing TinkerFin-owned tables against the current exact structure. The
+database account needs DDL and DML permissions when workers initialize the database.
+Workers in one database namespace must use the same warm-pool size.
+
+Infrastructure-managed deployments can generate a complete empty-database script
+without creating an engine or opening a connection:
+
+```python
+from pathlib import Path
+
+from tinkerfin_sandbox import get_sqlalchemy_opensandbox_state_schema
+
+schema = get_sqlalchemy_opensandbox_state_schema(dialect="mysql")
+Path("schema.sql").write_text(schema.ddl, encoding="utf-8")
+```
+
+Use `dialect="sqlite"` for SQLite. One MySQL script targets both MySQL 5.7 and 8.x and
+contains every current table, explicit index, and comment. After that script is applied,
+`start()` validates the deployed structure before it registers a worker. The descriptor
+is immutable and exposes `dialect`, `table_names`, and `ddl`. Non-current owned tables or
+columns, missing or extra indexes, and changed index uniqueness fail startup and must be
+rebuilt before a DML-only runtime account is started.
+
+Persistent state coordinates allocation, binding, warm slots, owner fencing, pause/resume
+intent, registered handle holders, and cleanup. Custom State implementations provide
+`OpenSandboxAvailability` and `OpenSandboxHolderUpdate` snapshots with atomic holder
+registration, intent changes, and drain acknowledgements. A previous binding or intent
+cannot acknowledge a later one. It does not serialize complete graph runs; use an application run coordinator
+when graph execution also requires per-RunIdentity exclusion.
+
+Consuming a ready warm slot atomically commits that Sandbox as the owner binding; the
+manager does not bind it a second time. An on-demand bind whose response fails or is
+cancelled is reconciled through `read_binding()`. An exact Sandbox ID and generation is
+authoritative and is never destroyed. A confirmed missing or superseded candidate can
+be destroyed idempotently; an unreadable result closes only the current worker's local
+connection so an uncertain authoritative remote is preserved.
+
+## Documentation
+
+- [Sandbox guide](https://github.com/tinkerfin-ai/tinkerfin/blob/main/docs/en/sandbox/index.md)
+- [Persistent state and extensions](https://github.com/tinkerfin-ai/tinkerfin/blob/main/docs/en/sandbox/persistence-and-extensions.md)
+- [Complete documentation](https://github.com/tinkerfin-ai/tinkerfin/blob/main/docs/en/index.md)
+
+## License
+
+Apache License 2.0. See the
+[repository license](https://github.com/tinkerfin-ai/tinkerfin/blob/main/LICENSE).

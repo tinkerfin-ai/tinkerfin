@@ -1,0 +1,157 @@
+"""使用会话模型完成一次标题总结，不持有连接或事件流"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import unicodedata
+
+import anyio
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+
+from tinkerfin_studio.conversation.repository import ConversationRepository
+from tinkerfin_studio.conversation.schemas import ConversationTitle
+from tinkerfin_studio.infrastructure.database import Database
+
+logger = logging.getLogger(__name__)
+_TITLE_TIMEOUT_SECONDS = 60
+_TITLE_MAX_INPUT_BYTES = 4096
+_TITLE_MAX_OUTPUT_TOKENS = 64
+_TITLE_CAPACITY = anyio.CapacityLimiter(4)
+_TITLE_CLEANUP_SECONDS = 5
+
+
+def _title_prompt(text: str) -> str:
+    low, high = 0, len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if (
+            len(json.dumps(text[:middle], ensure_ascii=False).encode())
+            <= _TITLE_MAX_INPUT_BYTES
+        ):
+            low = middle
+        else:
+            high = middle - 1
+    return json.dumps(text[:low], ensure_ascii=False)
+
+
+async def summarize_conversation_title(
+    *,
+    database: Database,
+    thread_pk: int,
+    text: str,
+    model: BaseChatModel,
+) -> ConversationTitle | None:
+    """认领一次总结，只返回成功提交且未被用户覆盖的标题
+
+    Args:
+        database: 应用数据库，模型调用期间不持有连接
+        thread_pk: 已完成用户归属校验的会话主键
+        text: 本次普通提问的用户文本，空文本不消耗总结机会
+        model: 当前对话所选模型，调用方构建时关闭推理和 SDK 重试
+
+    Returns:
+        已提交的标题快照；无需总结、失败或已手动命名时为 None
+
+    Raises:
+        asyncio.CancelledError: 所属会话任务取消，结算后继续传播
+    """
+    if not text.strip():
+        return None
+    claimed = False
+
+    async def claim() -> bool:
+        nonlocal claimed
+        # 认领提交独立完成后再判断所有权，避免取消时误结算另一个请求的认领
+        async with asyncio.timeout(min(_TITLE_TIMEOUT_SECONDS, _TITLE_CLEANUP_SECONDS)):
+            async with database.session() as session:
+                repository = ConversationRepository(session)
+                won = await repository.claim_title(thread_pk)
+                await repository.commit()
+                claimed = won
+                return won
+
+    claim_task: asyncio.Task[bool] | None = None
+    saved = False
+    try:
+        async with asyncio.timeout(_TITLE_TIMEOUT_SECONDS):
+            claim_task = asyncio.create_task(claim(), name="conversation-title-claim")
+            claimed = await asyncio.shield(claim_task)
+            if not claimed:
+                return None
+            async with _TITLE_CAPACITY:
+                async with database.session() as session:
+                    thread = await ConversationRepository(session).get_thread_by_pk(
+                        thread_pk
+                    )
+                    if (
+                        thread is None
+                        or thread.title_source != "default"
+                        or thread.title_generation_status != "running"
+                        or thread.status == "deleting"
+                    ):
+                        return None
+                result = await model.ainvoke(
+                    [
+                        SystemMessage(
+                            content="根据用户输入生成简短会话标题。使用输入的语言，中文约10个字，其他语言约5个单词。只返回一行自然语言标题，不加引号、解释、Markdown或代码。"
+                        ),
+                        HumanMessage(content=_title_prompt(text.strip())),
+                    ],
+                    max_tokens=_TITLE_MAX_OUTPUT_TOKENS,
+                )
+                if (
+                    not isinstance(result, AIMessage)
+                    or result.tool_calls
+                    or result.response_metadata.get("finish_reason")
+                    in {"length", "tool_calls"}
+                ):
+                    raise ValueError("标题模型未返回完整文本")
+                title = " ".join(
+                    "".join(
+                        char
+                        for char in result.text
+                        if char.isspace()
+                        or unicodedata.category(char) not in {"Cc", "Cf"}
+                    ).split()
+                ).strip("\"'` ")
+                title = title[:32]
+                if not title:
+                    raise ValueError("标题模型返回空文本")
+                async with database.session() as session:
+                    repository = ConversationRepository(session)
+                    updated = await repository.finish_title(thread_pk, title)
+                    await repository.commit()
+                    saved = updated
+                    if saved:
+                        thread = await repository.get_thread_by_pk(thread_pk)
+                        if thread is not None and thread.title_source == "generated":
+                            return ConversationTitle.model_validate(thread)
+    except Exception as error:  # noqa: BLE001 - 辅助模型失败不影响主回复，不记录敏感异常正文
+        logger.warning(
+            "会话标题总结失败 thread=%s reason=%s", thread_pk, type(error).__name__
+        )
+    finally:
+        # 响应取消仍等待有界认领完成；只有确认提交成功的认领才能结算
+        with anyio.CancelScope(shield=True):
+            if claim_task is not None:
+                try:
+                    claimed = await asyncio.shield(claim_task)
+                except Exception:  # noqa: BLE001 - 提交结果不明时不修改可能属于其他请求的记录
+                    pass
+            if claimed and not saved:
+                try:
+                    async with asyncio.timeout(_TITLE_CLEANUP_SECONDS):
+                        async with database.session() as session:
+                            repository = ConversationRepository(session)
+                            await repository.finish_title(thread_pk, None)
+                            await repository.commit()
+                except Exception as error:  # noqa: BLE001 - 辅助任务清理失败不覆盖主回复或取消结果
+                    logger.warning(
+                        "会话标题结算失败 thread=%s reason=%s",
+                        thread_pk,
+                        type(error).__name__,
+                    )
+    return None

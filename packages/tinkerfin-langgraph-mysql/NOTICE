@@ -1,0 +1,14 @@
+This distribution contains source derived from langgraph-checkpoint-mysql 3.0.0:
+https://github.com/tjni/langgraph-checkpoint-mysql
+
+The derived source remains available under the MIT License in LICENSE. The copied
+source inputs and their SHA-256 digests are:
+
+cf199dc5f3c724e00c46d26025684abece2e978ac4573710582b08df1f9f4acf  langgraph/checkpoint/mysql/_ainternal.py
+5b6ef8a2bf9c9cdc6558447b793c327c5eb470c84036a2a170e000d0c3c2f3aa  langgraph/store/mysql/base.py
+ef6fd284c0e67dda47b9da6d2fdf514c618c9beeea04ae525f2fd32a657633af  langgraph/store/mysql/aio_base.py
+996a5f4ac1c9e88d81a092a2821f79c120994c3d043eeb659f5bf91bc47428f2  langgraph/store/mysql/asyncmy.py
+
+The async connection helper derived from the first input now lives at
+langgraph/store/mysql/_ainternal.py. This distribution ships no
+langgraph.checkpoint.mysql package or CheckpointSaver implementation.

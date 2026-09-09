@@ -1,0 +1,360 @@
+import type { ConversationTitleSnapshot } from "./titles"
+import type { PendingInteractionKind, JsonObject, JsonValue } from '../../types'
+import { requestEventStream, requestJson } from '../shared/http'
+import { ConversationError } from './errors'
+import { parseJsonSseStream } from './sse'
+import type {
+  TraceGraph,
+  TraceGraphDelta,
+} from './traceGraph'
+import { parseTraceGraph, parseTraceGraphDelta } from './traceGraph'
+import {
+  parseTaskTraceSnapshot,
+  type TaskTraceSnapshot,
+} from './taskTrace'
+
+export interface ConversationHistoryListItem extends ConversationTitleSnapshot {
+  id: number
+  threadId: string
+  title: string
+  status: string
+  lastRunId?: string | null
+  lastModel?: string | null
+  messageCount: number
+  toolCallCount: number
+  hasPendingInterrupt: boolean
+  pendingInteractionKind: PendingInteractionKind | null
+  pinned: boolean
+  createdAt: string
+  updatedAt: string
+}
+
+export interface ConversationHistoryListResponse {
+  items: ConversationHistoryListItem[]
+  nextCursor?: string | null
+}
+
+export interface ConversationHistoryGroupConfig {
+  dayRanges: number[]
+}
+
+export interface TraceMessage {
+  id: string
+  traceSeq: number
+  sourceId?: string | null
+  namespace: string[]
+  runId: string
+  role: 'user' | 'assistant' | 'tool' | 'system' | 'other'
+  content?: JsonValue | null
+  contentOmitted: boolean
+  name?: string | null
+  toolCallId?: string | null
+  status: 'streaming' | 'completed'
+  createdAt: string
+  completedAt?: string | null
+}
+
+export interface TraceReasoning {
+  id: string
+  traceSeq: number
+  messageId: string
+  namespace: string[]
+  runId: string
+  extractor: string
+  content?: JsonValue | null
+  contentOmitted: boolean
+  status: 'streaming' | 'completed'
+  createdAt: string
+  completedAt?: string | null
+}
+
+export interface TraceInteraction {
+  id: string
+  traceSeq: number
+  sourceId: string
+  namespace: string[]
+  runId: string
+  kind: string
+  toolCallIds: string[]
+  status: 'pending' | 'resolved' | 'cancelled'
+  payload?: JsonValue | null
+  payloadOmitted: boolean
+  openedAt: string
+  resolvedAt?: string | null
+}
+
+export interface TraceState {
+  root: JsonObject
+  subgraphs: Record<string, JsonObject>
+}
+
+export interface TraceStatus {
+  execution: 'running' | 'waiting' | 'succeeded' | 'failed' | 'cancelled' | 'abandoned' | 'unknown'
+  headRunId: string
+}
+
+export interface TraceCompleteness {
+  missingPrefix: boolean
+  missingTail: boolean
+  payloadOmitted: boolean
+}
+
+export interface ConversationRunFailure {
+  runId: string
+  errorCode: string | null
+  failedAt: string
+  retryable: boolean
+}
+
+export const parseRunFailures = (value: unknown): ConversationRunFailure[] => {
+  if (!Array.isArray(value)) throw new ConversationError('stream_event_invalid')
+  const ids = new Set<string>()
+  return value.map(item => {
+    if (!isRecord(item) || typeof item.runId !== 'string' || !item.runId.trim()
+      || item.runId !== item.runId.trim() || ids.has(item.runId)
+      || !(item.errorCode === null || typeof item.errorCode === 'string')
+      || typeof item.failedAt !== 'string' || typeof item.retryable !== 'boolean'
+      || (item.retryable && item.errorCode !== 'runtime_initialization_error')) {
+      throw new ConversationError('stream_event_invalid')
+    }
+    traceObservationTime(item.failedAt)
+    ids.add(item.runId)
+    return { runId: item.runId, errorCode: item.errorCode, failedAt: item.failedAt, retryable: item.retryable }
+  })
+}
+
+export interface ConversationHistoryDetail extends ConversationTitleSnapshot {
+  id: number
+  threadId: string
+  title: string
+  lastModel?: string | null
+  pinned: boolean
+  asOfSeq: number
+  generation: string
+  observedAt: string
+  headRunId: string
+  availableHeads: string[]
+  historyCursor?: string | null
+  messageCount: number
+  toolCallCount: number
+  messages: TraceMessage[]
+  runFailures: ConversationRunFailure[]
+  reasoning: TraceReasoning[]
+  graph: TraceGraph
+  state: TraceState
+  interactions: TraceInteraction[]
+  status: TraceStatus
+  completeness: TraceCompleteness
+  taskTrace: TaskTraceSnapshot | null
+  createdAt: string
+  updatedAt: string
+}
+
+export type ConversationHistoryCoreDetail = Omit<ConversationHistoryDetail, 'taskTrace'>
+
+export interface TraceEntityDelta<T> {
+  upserts: T[]
+  removes: string[]
+}
+
+export interface ConversationTraceUpdate {
+  runFailures: ConversationRunFailure[]
+  asOfSeq: number
+  generation: string
+  observedAt: string
+  events: JsonValue[]
+  facts: JsonValue[]
+  messages: TraceEntityDelta<TraceMessage>
+  reasoning: TraceEntityDelta<TraceReasoning>
+  graph: TraceGraphDelta
+  interactions: TraceEntityDelta<TraceInteraction>
+  state: TraceState
+  status: TraceStatus
+  completeness: TraceCompleteness
+  messageCount: number
+  toolCallCount: number
+  projections: Record<string, JsonValue>
+}
+
+export type ConversationTraceEvent =
+  | { type: 'snapshot'; snapshot: ConversationHistoryDetail }
+  | {
+      type: 'update'
+      update: ConversationTraceUpdate
+      taskTrace: TaskTraceSnapshot | null
+    }
+  | { type: 'error'; code: 'trace_unavailable' }
+
+const CONVERSATION_API_PATH = '/api/conversation'
+
+export const traceObservationTime = (value: string): bigint => {
+  const match = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?(?:Z|\+00:00)$/.exec(value)
+  if (!match) throw new ConversationError('stream_event_invalid')
+  const seconds = Date.parse(`${match[1]}Z`)
+  if (!Number.isFinite(seconds)) throw new ConversationError('stream_event_invalid')
+  // 保留数据库微秒精度；Date.parse 单独使用会把不同观测压缩到同一毫秒
+  return BigInt(seconds) * 1000n + BigInt((match[2] ?? '').padEnd(6, '0'))
+}
+
+const validateTraceObservation = (value: Record<string, unknown>) => {
+  if (typeof value.generation !== 'string' || !value.generation
+    || typeof value.observedAt !== 'string') {
+    throw new ConversationError('stream_event_invalid')
+  }
+  traceObservationTime(value.observedAt)
+}
+
+export const fetchConversationHistoryList = (
+  params: {
+    pageSize?: number
+    cursor?: string | null
+    query?: string | null
+    signal?: AbortSignal
+    suppressGlobalError?: boolean
+  } = {},
+): Promise<ConversationHistoryListResponse> => {
+  const search = new URLSearchParams()
+  if (params.pageSize) search.set('pageSize', String(params.pageSize))
+  if (params.cursor) search.set('cursor', params.cursor)
+  if (params.query) search.set('query', params.query)
+  const query = search.toString() ? '?' + search.toString() : ''
+  return requestJson<ConversationHistoryListResponse>(
+    CONVERSATION_API_PATH + '/history' + query,
+    {
+      signal: params.signal,
+      suppressGlobalError: params.suppressGlobalError,
+    },
+  )
+}
+
+export const fetchConversationHistoryGroupConfig = (
+  options: { signal?: AbortSignal; suppressGlobalError?: boolean } = {},
+): Promise<ConversationHistoryGroupConfig> => requestJson<ConversationHistoryGroupConfig>(
+  CONVERSATION_API_PATH + '/config',
+  options,
+)
+
+export const fetchConversationHistoryDetail = (
+  threadId: string,
+  options: {
+    includeTaskTrace: boolean
+    historyCursor?: string | null
+    limit?: number
+    signal?: AbortSignal
+    suppressGlobalError?: boolean
+  },
+): Promise<ConversationHistoryDetail> => {
+  const search = new URLSearchParams()
+  search.set('includeTaskTrace', String(options.includeTaskTrace))
+  if (options.historyCursor) search.set('historyCursor', options.historyCursor)
+  if (options.limit) search.set('limit', String(options.limit))
+  const query = search.toString() ? '?' + search.toString() : ''
+  return requestJson<unknown>(
+    CONVERSATION_API_PATH + '/' + encodeURIComponent(threadId) + '/history' + query,
+    {
+      signal: options.signal,
+      suppressGlobalError: options.suppressGlobalError,
+    },
+  ).then((value) => parseHistoryDetail(value, options.includeTaskTrace))
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> => (
+  value !== null && typeof value === 'object' && !Array.isArray(value)
+)
+
+const parseHistoryDetail = (
+  value: unknown,
+  includeTaskTrace: boolean,
+): ConversationHistoryDetail => {
+  if (!isRecord(value) || !Object.hasOwn(value, 'taskTrace')) {
+    throw new ConversationError('stream_event_invalid')
+  }
+  validateTraceObservation(value)
+  if (includeTaskTrace) {
+    if (value.taskTrace === null) throw new ConversationError('stream_event_invalid')
+    parseTaskTraceSnapshot(value.taskTrace)
+  } else if (value.taskTrace !== null) {
+    throw new ConversationError('stream_event_invalid')
+  }
+  const graph = parseTraceGraph(value.graph)
+  if (graph.asOfSeq !== value.asOfSeq) {
+    throw new ConversationError('stream_event_invalid')
+  }
+  return { ...value, graph, runFailures: parseRunFailures(value.runFailures) } as unknown as ConversationHistoryDetail
+}
+
+const parseTraceEvent = (
+  value: unknown,
+  includeTaskTrace: boolean,
+): ConversationTraceEvent => {
+  if (!isRecord(value)) throw new ConversationError('stream_event_invalid')
+  const record = value as Record<string, unknown>
+  if (record.type === 'snapshot') {
+    return {
+      type: 'snapshot',
+      snapshot: parseHistoryDetail(record.snapshot, includeTaskTrace),
+    }
+  }
+  if (record.type === 'update') {
+    if (!isRecord(record.update) || !Object.hasOwn(record, 'taskTrace')) {
+      throw new ConversationError('stream_event_invalid')
+    }
+    validateTraceObservation(record.update)
+    if (record.taskTrace !== null) {
+      if (!includeTaskTrace) throw new ConversationError('stream_event_invalid')
+      parseTaskTraceSnapshot(record.taskTrace)
+    }
+    const graph = parseTraceGraphDelta(record.update.graph)
+    if (graph.asOfSeq !== record.update.asOfSeq) {
+      throw new ConversationError('stream_event_invalid')
+    }
+    return {
+      ...record,
+      update: { ...record.update, graph, runFailures: parseRunFailures(record.runFailures) },
+    } as unknown as ConversationTraceEvent
+  }
+  if (record.type === 'error' && record.code === 'trace_unavailable') {
+    return { type: 'error', code: 'trace_unavailable' }
+  }
+  throw new ConversationError('stream_event_invalid')
+}
+
+export async function* followConversationTrace(
+  threadId: string,
+  options: { includeTaskTrace: boolean; signal?: AbortSignal },
+): AsyncGenerator<ConversationTraceEvent> {
+  const search = new URLSearchParams({
+    includeTaskTrace: String(options.includeTaskTrace),
+  })
+  const response = await requestEventStream(
+    CONVERSATION_API_PATH + '/' + encodeURIComponent(threadId) + '/trace?' + search,
+    { signal: options.signal, suppressGlobalError: true },
+  )
+  if (!response.body) throw new ConversationError('stream_body_missing')
+  for await (const frame of parseJsonSseStream(response.body, options.signal)) {
+    if (frame.event !== 'trace') throw new ConversationError('stream_event_invalid')
+    yield parseTraceEvent(frame.data, options.includeTaskTrace)
+  }
+}
+
+/** 重命名或置顶会话，仅传需要修改的字段并返回更新后的会话摘要 */
+export const patchConversation = (
+  threadId: string,
+  body: { title?: string; pinned?: boolean },
+): Promise<ConversationHistoryListItem> =>
+  requestJson<ConversationHistoryListItem>(
+    CONVERSATION_API_PATH + '/' + encodeURIComponent(threadId),
+    {
+      method: 'PATCH',
+      body,
+      suppressGlobalError: true,
+    },
+  )
+
+/** 删除 Trace、Checkpoint、Messaging 与 Studio 自有会话记录 */
+export const deleteConversation = async (threadId: string): Promise<void> => {
+  await requestJson<null>(CONVERSATION_API_PATH + '/' + encodeURIComponent(threadId), {
+    method: 'DELETE',
+    suppressGlobalError: true,
+  })
+}

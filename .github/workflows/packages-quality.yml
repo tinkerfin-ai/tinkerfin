@@ -1,0 +1,176 @@
+name: Packages quality
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  repository-and-studio:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: "3.11"
+      - name: Install locked workspace
+        run: uv sync --locked --all-packages --group dev
+      - name: Check repository and Studio formatting
+        run: uv run ruff format --check apps/studio/server scripts tests
+      - name: Lint repository and Studio contracts
+        run: uv run ruff check apps/studio/server scripts tests
+      - name: Test latest-only and Studio behavior
+        run: >-
+          uv run pytest tests/test_latest_only_contracts.py
+          tests/test_documentation.py tests/test_docker_services.py
+          apps/studio/server --durations=10
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/studio/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.8.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: apps/studio/web/pnpm-lock.yaml
+      - name: Install locked web dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Test web behavior
+        run: pnpm test
+      - name: Install Chromium
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Test web proxy
+        run: pnpm test:proxy
+      - name: Lint web source
+        run: pnpm lint
+      - name: Test browser behavior and accessibility
+        run: pnpm test:browser
+      - name: Upload browser failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-browser-results
+          path: /tmp/tinkerfin-studio-playwright/
+          retention-days: 7
+
+  packages:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+      - name: Install locked workspace
+        run: uv sync --locked --all-packages --group dev
+      - name: Check formatting
+        if: matrix.python-version == '3.11'
+        run: uv run ruff format --check packages
+      - name: Lint packages
+        if: matrix.python-version == '3.11'
+        run: uv run ruff check packages
+      - name: Check public API docstrings
+        if: matrix.python-version == '3.11'
+        run: >-
+          uv run ruff check packages/*/src
+          --select D100,D101,D102,D103,D104,D105,D106,D107
+      - name: Check repository types
+        if: matrix.python-version == '3.11'
+        run: uv run pyright
+      - name: Check package source types strictly
+        if: matrix.python-version == '3.11'
+        run: uv run pyright -p pyright-packages-strict.json
+      - name: Test package coverage
+        if: matrix.python-version == '3.11'
+        run: >-
+          uv run pytest packages tests/test_package_logging_contract.py
+          --durations=20
+          -o faulthandler_timeout=60
+          --cov=tinkerfin
+          --cov=tinkerfin_contracts
+          --cov=tinkerfin_native_stream
+          --cov=tinkerfin_tracing
+          --cov=tinkerfin_langgraph_mysql
+          --cov=langgraph.store.mysql
+          --cov=tinkerfin_agui_adapter
+          --cov=tinkerfin_messaging
+          --cov=tinkerfin_sandbox
+          --cov-branch
+          --cov-report=term-missing
+          --cov-fail-under=80
+      - name: Test packages on supported Python
+        if: matrix.python-version != '3.11'
+        run: uv run pytest packages --durations=20
+
+  wheel-boundaries:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+      - name: Install packaging test runner
+        run: uv sync --locked --all-packages --group dev
+      - name: Verify isolated wheel boundaries
+        run: >-
+          uv run pytest tests/packaging
+          -m packaging_e2e
+
+  docker-integrations:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: "3.11"
+      - name: Install locked workspace
+        run: uv sync --locked --all-packages --group dev
+      - name: Verify Docker daemon
+        run: docker info
+      - name: Test disposable Docker integrations
+        run: >-
+          uv run pytest -m docker_integration
+          --durations=20 -o faulthandler_timeout=60 -v
+
+  quality-gate:
+    name: Quality gate
+    if: always()
+    needs: [repository-and-studio, web, packages, wheel-boundaries, docker-integrations]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every check to succeed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for result in $RESULTS; do
+            [[ "$result" == success ]] || exit 1
+          done

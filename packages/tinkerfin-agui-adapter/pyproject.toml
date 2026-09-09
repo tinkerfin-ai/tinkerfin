@@ -1,0 +1,45 @@
+[project]
+name = "tinkerfin-agui-adapter"
+version = "0.1.0"
+description = "Deep Agents v2 stream conversion for AG-UI."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+]
+
+dependencies = [
+    "ag-ui-protocol==0.1.19",
+    "jsonschema>=4.25,<5",
+    "langchain-core==1.5.3",
+    "pydantic>=2,<3",
+    "pydantic-core>=2,<3",
+    "tinkerfin-contracts>=0.1.0,<0.9.0",
+    "tinkerfin-native-stream>=0.1.0,<0.9.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/tinkerfin-ai/tinkerfin"
+Repository = "https://github.com/tinkerfin-ai/tinkerfin"
+Issues = "https://github.com/tinkerfin-ai/tinkerfin/issues"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+tinkerfin_agui_adapter = ["py.typed", "contracts/*.json"]
+
+[tool.uv.sources]
+tinkerfin-contracts = { workspace = true }
+tinkerfin-native-stream = { workspace = true }
