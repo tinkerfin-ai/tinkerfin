@@ -608,8 +608,8 @@ async def test_undispatched_pause_timeout_or_cancel_restores_both_handles(
         working = world.spawn(second_handle.aexecute("hold"))
         await asyncio.wait_for(world.remote.command_started.wait(), timeout=1)
         pausing = world.spawn(first.pause("owner", timeout=3 if cancel else 0.2))
-        await _phase(world.states[0], "draining")
         if cancel:
+            await _phase(world.states[0], "draining")
             pausing.cancel("pause cancelled")
             with pytest.raises(asyncio.CancelledError):
                 await asyncio.wait_for(pausing, timeout=1)
