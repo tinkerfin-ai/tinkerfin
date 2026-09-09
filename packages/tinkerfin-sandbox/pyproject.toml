@@ -1,0 +1,44 @@
+[project]
+name = "tinkerfin-sandbox"
+version = "0.1.0"
+description = "Sandbox integration package for TinkerFin."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+
+dependencies = [
+    "deepagents==0.7.5",
+    "httpx>=0.28.1,<1",
+    "langchain==1.3.14",
+    "langchain-core==1.5.3",
+    "opensandbox==0.1.16",
+    "pydantic>=2,<3",
+    "typing-extensions>=4.12.2,<5",
+]
+
+[project.optional-dependencies]
+sqlite = [
+    "aiosqlite>=0.22,<0.23",
+    "sqlalchemy[asyncio]==2.0.52",
+]
+mysql = [
+    "asyncmy==0.2.14",
+    "sqlalchemy[asyncio]==2.0.52",
+]
+
+[project.urls]
+Homepage = "https://github.com/tinkerfin-ai/tinkerfin"
+Repository = "https://github.com/tinkerfin-ai/tinkerfin"
+Issues = "https://github.com/tinkerfin-ai/tinkerfin/issues"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+tinkerfin_sandbox = ["py.typed"]
+"tinkerfin_sandbox.backends" = ["_rooted_helper.py.txt"]

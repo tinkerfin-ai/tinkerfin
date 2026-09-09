@@ -1,0 +1,62 @@
+name: tinkerfin-studio
+
+include:
+  - docker-compose-base.yaml
+
+services:
+  server:
+    image: ${STUDIO_IMAGE:-ghcr.io/tinkerfin-ai/studio-server:0.1.0}
+    build:
+      context: ../../../..
+      dockerfile: apps/studio/server/Dockerfile
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+    logging:
+      driver: local
+      options:
+        max-size: "50m"
+        max-file: "3"
+    env_file: ${STUDIO_ENV_FILE:-.env}
+    environment:
+      DATABASE_URL_FILE: /run/secrets/database_url
+      REDIS_CONTROL_PASSWORD_FILE: /run/secrets/redis_control_password
+      REDIS_RUNTIME_PASSWORD_FILE: /run/secrets/redis_runtime_password
+      OPEN_SANDBOX_API_KEY_FILE: /run/secrets/opensandbox_api_key
+      ATTACHMENT_DIRECTORY: /app/attachments
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    secrets: [database_url, redis_control_password, redis_runtime_password, opensandbox_api_key]
+    ports:
+      - "${STUDIO_BIND_ADDRESS:-127.0.0.1}:${STUDIO_PORT:-8090}:8090"
+    volumes:
+      - studio-attachments:/app/attachments
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+        required: false
+      redis-control:
+        condition: service_healthy
+        required: false
+      redis-runtime:
+        condition: service_healthy
+        required: false
+      opensandbox:
+        condition: service_healthy
+        required: false
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health/ready', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+
+volumes:
+  studio-attachments:

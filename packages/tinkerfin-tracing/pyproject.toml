@@ -1,0 +1,50 @@
+[project]
+name = "tinkerfin-tracing"
+version = "0.1.0"
+description = "Semantic Runtime tracing with bounded in-memory and SQL persistence."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Typing :: Typed",
+]
+
+dependencies = [
+    "pydantic>=2.12,<3",
+    "tinkerfin-contracts>=0.1.0,<0.9.0",
+]
+
+[project.optional-dependencies]
+sqlite = [
+    "aiosqlite>=0.22,<0.23",
+    "sqlalchemy[asyncio]==2.0.52",
+]
+mysql = [
+    "asyncmy==0.2.14",
+    "sqlalchemy[asyncio]==2.0.52",
+]
+
+[project.urls]
+Homepage = "https://github.com/tinkerfin-ai/tinkerfin"
+Repository = "https://github.com/tinkerfin-ai/tinkerfin"
+Issues = "https://github.com/tinkerfin-ai/tinkerfin/issues"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+tinkerfin_tracing = ["py.typed"]
+
+[tool.uv.sources]
+tinkerfin-contracts = { workspace = true }

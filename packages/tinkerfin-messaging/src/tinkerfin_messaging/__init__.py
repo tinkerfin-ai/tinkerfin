@@ -1,0 +1,258 @@
+"""Replayable messaging with TinkerFin Native and AG-UI integration."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Never
+
+from ._messaging_transition import (
+    resolve_messaging_transition as resolve_messaging_transition,
+)
+from .backend import ActiveRunStatus as ActiveRunStatus
+from .backend import FailedRunStatus as FailedRunStatus
+from .backend import FinalRunStatus as FinalRunStatus
+from .backend import MemoryBackend as MemoryBackend
+from .backend import RunStatus as RunStatus
+from .backend import is_active_run_status as is_active_run_status
+from .backend import is_failed_run_status as is_failed_run_status
+from .backend import is_final_run_status as is_final_run_status
+from .backend_contract import CommittedMessagePage as CommittedMessagePage
+from .backend_contract import CommittedMessageQuery as CommittedMessageQuery
+from .backend_contract import MessagingBackend as MessagingBackend
+from .backend_contract import MessagingBackendSettings as MessagingBackendSettings
+from .backend_contract import MessagingChangeCursor as MessagingChangeCursor
+from .backend_contract import MessagingChangeWait as MessagingChangeWait
+from .backend_contract import MessagingCleanupReason as MessagingCleanupReason
+from .backend_contract import MessagingLeaseAction as MessagingLeaseAction
+from .backend_contract import MessagingRetentionAction as MessagingRetentionAction
+from .backend_contract import MessagingRunReference as MessagingRunReference
+from .backend_contract import MessagingStateQuery as MessagingStateQuery
+from .backend_contract import MessagingStateSnapshot as MessagingStateSnapshot
+from .backend_contract import MessagingStorageEffect as MessagingStorageEffect
+from .backend_contract import MessagingStreamDisposition as MessagingStreamDisposition
+from .backend_contract import MessagingTransition as MessagingTransition
+from .backend_contract import MessagingTransitionKind as MessagingTransitionKind
+from .backend_contract import MessagingTransitionResult as MessagingTransitionResult
+from .backend_contract import StoredMessageEvidence as StoredMessageEvidence
+from .backend_contract import StoredMessagingChannel as StoredMessagingChannel
+from .backend_contract import StoredMessagingRun as StoredMessagingRun
+from .backend_contract import StoredMessagingStream as StoredMessagingStream
+from .backend_contract import StreamGenerationPurge as StreamGenerationPurge
+from .backend_contract import (
+    StreamGenerationPurgeResult as StreamGenerationPurgeResult,
+)
+from .errors import BackendOwnershipLost as BackendOwnershipLost
+from .errors import CancellationUnsupported as CancellationUnsupported
+from .errors import CodecMismatch as CodecMismatch
+from .errors import InvalidCursor as InvalidCursor
+from .errors import MessageIdConflict as MessageIdConflict
+from .errors import MessagingBackendError as MessagingBackendError
+from .errors import MessagingBackendProtocolError as MessagingBackendProtocolError
+from .errors import MessagingBackendTimeout as MessagingBackendTimeout
+from .errors import MessagingBackendUnavailable as MessagingBackendUnavailable
+from .errors import MessagingClosed as MessagingClosed
+from .errors import MessagingError as MessagingError
+from .errors import MessagingErrorCode as MessagingErrorCode
+from .errors import MessagingNotStarted as MessagingNotStarted
+from .errors import MessagingQuotaExceeded as MessagingQuotaExceeded
+from .errors import MessagingSettlementTimeout as MessagingSettlementTimeout
+from .errors import PublicationRejected as PublicationRejected
+from .errors import RecoveryUnsupported as RecoveryUnsupported
+from .errors import RunAlreadyActive as RunAlreadyActive
+from .errors import RunNotFound as RunNotFound
+from .errors import RunProducerFailed as RunProducerFailed
+from .errors import SourceProfileMismatch as SourceProfileMismatch
+from .errors import SseRenderingUnsupported as SseRenderingUnsupported
+from .errors import StreamDeleteConflict as StreamDeleteConflict
+from .errors import StreamDeleted as StreamDeleted
+from .errors import StreamExpired as StreamExpired
+from .errors import UnexpectedMessagingBackendError as UnexpectedMessagingBackendError
+from .limits import MessagingLimits as MessagingLimits
+from .messaging import CancelCallback as CancelCallback
+from .messaging import CancelContext as CancelContext
+from .messaging import CommittedCallback as CommittedCallback
+from .messaging import MessageChannel as MessageChannel
+from .messaging import MessageSubscription as MessageSubscription
+from .messaging import Messaging as Messaging
+from .models import DecodedMessage as DecodedMessage
+from .models import MessageEnvelope as MessageEnvelope
+from .models import RecoverableMessage as RecoverableMessage
+from .models import RecoveryCheckpoint as RecoveryCheckpoint
+from .protocols import MessageCodec as MessageCodec
+from .protocols import MessageCodecInputSource as MessageCodecInputSource
+from .protocols import MessagePublicationPolicy as MessagePublicationPolicy
+from .protocols import MessageSource as MessageSource
+from .protocols import ProfiledMessageSource as ProfiledMessageSource
+from .protocols import RecoverableSource as RecoverableSource
+from .protocols import SseRenderer as SseRenderer
+from .retention import MessagingRetentionPolicy as MessagingRetentionPolicy
+from .sources import CancellableMessageSource as CancellableMessageSource
+from .sources import DeferredMessageSource as DeferredMessageSource
+from .sources import FiniteMessageSource as FiniteMessageSource
+from .sources import MessageSourceBinding as MessageSourceBinding
+from .sources import ProfiledDeferredMessageSource as ProfiledDeferredMessageSource
+from .sources import map_source as map_source
+from .sse import parse_sse_event_id as parse_sse_event_id
+
+if TYPE_CHECKING:
+    from .agui import AgUiCodec as AgUiCodec
+    from .agui import create_agui_run_source as create_agui_run_source
+    from .native import NativeStreamPart as NativeStreamPart
+    from .native import NativeStreamPartCodec as NativeStreamPartCodec
+    from .redis import RedisBackend as RedisBackend
+
+__all__ = [
+    "ActiveRunStatus",
+    "AgUiCodec",
+    "BackendOwnershipLost",
+    "CancelCallback",
+    "CancelContext",
+    "CancellableMessageSource",
+    "CancellationUnsupported",
+    "CodecMismatch",
+    "CommittedCallback",
+    "CommittedMessagePage",
+    "CommittedMessageQuery",
+    "DecodedMessage",
+    "DeferredMessageSource",
+    "FailedRunStatus",
+    "FinalRunStatus",
+    "FiniteMessageSource",
+    "InvalidCursor",
+    "MemoryBackend",
+    "MessageChannel",
+    "MessageCodec",
+    "MessageCodecInputSource",
+    "MessageEnvelope",
+    "MessageIdConflict",
+    "MessagePublicationPolicy",
+    "MessageSource",
+    "MessageSourceBinding",
+    "MessageSubscription",
+    "Messaging",
+    "MessagingBackend",
+    "MessagingBackendError",
+    "MessagingBackendProtocolError",
+    "MessagingBackendSettings",
+    "MessagingBackendTimeout",
+    "MessagingBackendUnavailable",
+    "MessagingChangeCursor",
+    "MessagingChangeWait",
+    "MessagingCleanupReason",
+    "MessagingClosed",
+    "MessagingError",
+    "MessagingErrorCode",
+    "MessagingLeaseAction",
+    "MessagingLimits",
+    "MessagingNotStarted",
+    "MessagingQuotaExceeded",
+    "MessagingRetentionAction",
+    "MessagingRetentionPolicy",
+    "MessagingRunReference",
+    "MessagingSettlementTimeout",
+    "MessagingStateQuery",
+    "MessagingStateSnapshot",
+    "MessagingStorageEffect",
+    "MessagingStreamDisposition",
+    "MessagingTransition",
+    "MessagingTransitionKind",
+    "MessagingTransitionResult",
+    "NativeStreamPart",
+    "NativeStreamPartCodec",
+    "ProfiledDeferredMessageSource",
+    "ProfiledMessageSource",
+    "PublicationRejected",
+    "RecoverableMessage",
+    "RecoverableSource",
+    "RecoveryCheckpoint",
+    "RecoveryUnsupported",
+    "RedisBackend",
+    "RunAlreadyActive",
+    "RunNotFound",
+    "RunProducerFailed",
+    "RunStatus",
+    "SourceProfileMismatch",
+    "SseRenderer",
+    "SseRenderingUnsupported",
+    "StoredMessageEvidence",
+    "StoredMessagingChannel",
+    "StoredMessagingRun",
+    "StoredMessagingStream",
+    "StreamDeleteConflict",
+    "StreamDeleted",
+    "StreamExpired",
+    "StreamGenerationPurge",
+    "StreamGenerationPurgeResult",
+    "UnexpectedMessagingBackendError",
+    "create_agui_run_source",
+    "is_active_run_status",
+    "is_failed_run_status",
+    "is_final_run_status",
+    "map_source",
+    "parse_sse_event_id",
+    "resolve_messaging_transition",
+]
+
+
+def _raise_missing_extra(
+    error: ModuleNotFoundError,
+    *,
+    symbol: str,
+    extra: str,
+    packages: tuple[str, ...],
+) -> Never:
+    missing = error.name
+    if missing is None or not any(
+        missing == package or missing.startswith(f"{package}.") for package in packages
+    ):
+        raise error
+    raise ImportError(
+        f"{symbol} requires optional dependencies from the {extra!r} extra; "
+        f'install them with: pip install "tinkerfin-messaging[{extra}]"'
+    ) from error
+
+
+def __getattr__(name: str) -> object:
+    """Load optional integrations only when their public symbol is requested."""
+
+    if name in {"AgUiCodec", "create_agui_run_source"}:
+        try:
+            from .agui import AgUiCodec, create_agui_run_source
+        except ModuleNotFoundError as error:
+            _raise_missing_extra(
+                error,
+                symbol=name,
+                extra="agui",
+                packages=("ag_ui",),
+            )
+
+        globals()["AgUiCodec"] = AgUiCodec
+        globals()["create_agui_run_source"] = create_agui_run_source
+        return globals()[name]
+    if name in {"NativeStreamPart", "NativeStreamPartCodec"}:
+        try:
+            from .native import NativeStreamPart, NativeStreamPartCodec
+        except ModuleNotFoundError as error:
+            _raise_missing_extra(
+                error,
+                symbol=name,
+                extra="native",
+                packages=("tinkerfin_native_stream",),
+            )
+
+        globals()["NativeStreamPart"] = NativeStreamPart
+        globals()["NativeStreamPartCodec"] = NativeStreamPartCodec
+        return globals()[name]
+    if name == "RedisBackend":
+        try:
+            from .redis import RedisBackend
+        except ModuleNotFoundError as error:
+            _raise_missing_extra(
+                error,
+                symbol=name,
+                extra="redis",
+                packages=("redis",),
+            )
+
+        globals()[name] = RedisBackend
+        return RedisBackend
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

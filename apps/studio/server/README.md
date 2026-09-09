@@ -1,0 +1,163 @@
+# TinkerFin Studio 后端
+
+提供用户认证、模型配置、Agent 会话、附件、会话历史和 Sandbox 工作区。
+首次使用见 [Studio 上手指南](../../../docs/cn/studio/quick_start.md)；HTTP 接口见 [API 参考](docs/api.md)。
+
+## 快速部署
+
+需要 Docker、Docker Compose 2.24 或更高版本，以及 Bash。Windows 请在 WSL 中执行。
+
+```bash
+git clone https://github.com/tinkerfin-ai/tinkerfin.git
+cd tinkerfin/apps/studio/server/deploy
+./deploy.sh
+```
+
+首次执行会创建 `.env` 和随机凭据，拉取镜像并等待服务就绪。默认 API 地址为
+`http://127.0.0.1:8090/api`，健康检查地址为 `http://127.0.0.1:8090/health/ready`。
+首次预热 Sandbox 时还需要下载运行镜像，耗时取决于网络。
+
+Docker 项目名为 `tinkerfin-studio`，包含 `server`、`mysql`、`redis-control`、
+`redis-runtime` 和 `opensandbox`。只部署后端，不包含 Web 页面。
+全新数据库初始化时预置账号 `tinkerfin`，密码 `123456`。已有数据卷不重新初始化或覆盖账号。
+当前没有公开注册接口；对外开放前按[上手指南](../../../docs/cn/studio/quick_start.md#修改初始密码)修改初始密码。
+
+脚本可以从任意目录通过完整路径执行；配置默认读取脚本所在目录的 `.env`：
+
+```bash
+/path/to/tinkerfin/apps/studio/server/deploy/deploy.sh
+```
+使用其他配置文件时执行 `./deploy.sh --env-file /path/to/.env`，凭据目录为该文件旁的 `secrets/`。
+
+## 修改配置
+
+需要先改配置时，执行：
+
+```bash
+./setup.sh
+# 编辑生成的 .env
+./deploy.sh
+```
+
+已有 `.env` 和密码会保留。不要删除 `secrets/` 后重新生成密码；目录缺失或文件不完整时，
+应从备份恢复。目录权限为 `0700`，请勿放宽。
+
+在 `.env` 中修改应用连接参数：
+
+| 配置 | 默认值 | 用途 |
+| --- | --- | --- |
+| `STUDIO_IMAGE` | `ghcr.io/tinkerfin-ai/studio-server:0.1.0` | 后端镜像 |
+| `STUDIO_BIND_ADDRESS` | `127.0.0.1` | 后端监听地址；允许远程访问时设为 `0.0.0.0` |
+| `STUDIO_PORT` | `8090` | 后端对外端口 |
+| `DEPLOY_WAIT_TIMEOUT` | `600` | 等待服务就绪的秒数 |
+| `MYSQL_HOST` / `MYSQL_PORT` | `mysql` / `3306` | 后端连接的数据库地址和端口 |
+| `MYSQL_DATABASE` / `MYSQL_USER` | `tinkerfin` / `studio` | 数据库名和账号 |
+| `MYSQL_PUBLISHED_PORT` | `13306` | 从本机连接内置 MySQL 的端口 |
+| `REDIS_CONTROL_PUBLISHED_PORT` | `6379` | 本机访问 Redis Control 的端口 |
+| `REDIS_RUNTIME_PUBLISHED_PORT` | `6380` | 本机访问 Redis Runtime 的端口 |
+| `OPEN_SANDBOX_PUBLISHED_PORT` | `8091` | 本机访问 OpenSandbox 的端口 |
+| `LOG_LEVEL` | `INFO` | 后端日志等级 |
+
+中间件端口仅绑定宿主机的 `127.0.0.1`。修改 `MYSQL_PUBLISHED_PORT` 不改变容器内部的
+数据库连接。MySQL 密码保存在 `secrets/mysql_password`，Redis 与 OpenSandbox 密码分别
+保存在同名 Secret 文件中；`secrets/database_url` 由脚本根据 MySQL 配置自动生成，不要手动编辑。
+
+内置 MySQL 只在新数据卷首次启动时创建账号、数据库并导入业务表。已有数据库的账号、密码
+或库名必须先由管理员调整，再同步 `.env` 和密码文件；更改配置不会修改现有数据库账号。
+
+## 使用自己的镜像
+
+修改 `.env` 中的 `STUDIO_IMAGE` 后执行 `./deploy.sh`。私有仓库需要先执行 `docker login`。
+
+修改源码后，可直接构建并部署：
+
+```bash
+./deploy.sh --build
+```
+
+默认生成 `tinkerfin-studio-server:local`；已设置自定义镜像名时使用该名称。
+构建在 Docker 内完成，不需要宿主机安装 Python 或 uv。脚本使用当前检出的源码，
+构建后直接启动本地镜像。
+
+## 只启动基础依赖
+
+```bash
+./setup.sh
+docker compose -f docker-compose-base.yaml up -d --wait
+```
+
+随后可在 PyCharm 或命令行启动 Studio。宿主机连接 MySQL 使用 `127.0.0.1:13306`，
+两个 Redis 使用 `127.0.0.1:6379` 和 `127.0.0.1:6380`，OpenSandbox 使用 `127.0.0.1:8091`。
+本地后端配置中的密码应与 `deploy/secrets/` 中对应文件一致。
+
+## 使用外部依赖
+
+执行 `./setup.sh`，编辑 `.env` 中的 MySQL、Redis 和 OpenSandbox 地址，并把已有服务的
+密码填入 `secrets/` 对应文件，然后执行：
+
+```bash
+./deploy.sh --external
+```
+
+此模式只启动 `server`。两个 Redis 必须使用不同物理服务。
+外部 MySQL 需要事先创建数据库，并在新库中导入 `database/mysql/schema.sql`。
+
+只替换 MySQL 时，在 `.env` 中设置外部 MySQL 参数和：
+
+```dotenv
+COMPOSE_PROFILES=redis-control,redis-runtime,opensandbox
+```
+
+然后执行普通的 `./deploy.sh`。容器访问宿主机服务时可使用 `host.docker.internal`。
+
+## 日志与数据
+
+以下命令在 `deploy/` 目录执行：
+
+```bash
+docker compose ps
+docker compose logs -f server
+docker compose down
+```
+
+重新部署会重新创建服务容器并短暂中断服务，数据卷会保留。`docker compose down` 也会保留
+数据；`docker compose down -v` 会永久删除本项目的数据库、Redis、OpenSandbox 和附件卷。
+删除前应完成备份。
+
+`server` 服务的 Docker 日志按 50 MiB 滚动，最多保留 3 个文件。需要独立文件日志时，在 `.env` 中启用
+`LOG_FILE_ENABLED=true`，设置绝对路径 `LOG_FILE_PATH` 并给对应目录挂载可写卷。
+
+附件使用 `studio-attachments` 卷，容器内目录为 `/app/attachments`。Sandbox 工作区跨会话
+保留，不会因闲置自动删除；OpenSandbox 需要访问宿主机 Docker，请只在受信任的主机部署。
+
+## 本地开发
+
+在仓库根目录执行：
+
+```bash
+uv sync --all-packages --group dev --locked
+cp apps/studio/server/.env.example apps/studio/server/.env
+# 编辑 server/.env，填写可从宿主机访问的依赖地址和密码
+uv run python -m tinkerfin_studio --host 127.0.0.1 --port 8090 --reload
+```
+
+本地配置来自 `server/.env`。附件默认位于 `server/.data/attachments`，可选文件日志默认
+位于 `server/logs/studio.log`。相对路径以配置文件所在目录为基准。
+
+```bash
+uv run pytest -q apps/studio/server/tests
+uv run ruff check apps/studio/server
+uv run pyright apps/studio/server/src apps/studio/server/tests
+```
+
+## 发布后端镜像
+
+更新 `src/tinkerfin_studio/version.py` 中的版本、部署示例和 Compose 默认镜像版本后，
+推送对应的 `studio-v<版本>` Git tag。GitHub Actions 会构建、检查并发布 `amd64` 和 `arm64`
+镜像到 `ghcr.io/tinkerfin-ai/studio-server`。首次发布需在 GitHub Packages 中把该镜像设为公开，
+使用者才能匿名拉取。若首次公开拉取检查失败，调整可见性后只需重跑失败的
+`Verify public Studio image` 任务。
+
+## 许可证
+
+[Apache License 2.0](LICENSE)。

@@ -1,0 +1,148 @@
+[project]
+name = "tinkerfin-workspace"
+version = "0.0.1"
+description = "Development workspace for the TinkerFin libraries and Studio application."
+requires-python = ">=3.11"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "ag-ui-protocol==0.1.19",
+    "aiosqlite>=0.22,<1",
+    "asyncmy>=0.2.11,<1",
+    "deepagents>=0.7.1,<0.8.0",
+    "docker>=7.2,<8",
+    "langgraph>=1.2.10,<2",
+    "langgraph-checkpoint>=4.1,<5",
+    "pyright>=1.1.411,<2.0.0",
+    "pytest>=8.3.5,<10.0.0",
+    "pytest-asyncio>=0.25.3,<2.0.0",
+    "pytest-cov>=7,<8",
+    "ruff>=0.16.1,<0.17.0",
+    "sqlalchemy[asyncio]>=2.0.48,<3",
+    "testcontainers>=4.15,<5",
+]
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+tinkerfin = { workspace = true }
+tinkerfin-contracts = { workspace = true }
+tinkerfin-tracing = { workspace = true }
+tinkerfin-langgraph-mysql = { workspace = true }
+tinkerfin-sandbox = { workspace = true }
+tinkerfin-agui-adapter = { workspace = true }
+tinkerfin-messaging = { workspace = true }
+
+[[tool.uv.index]]
+name = "tuna"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
+[tool.uv.workspace]
+members = [
+    "packages/*",
+    "apps/studio/server",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+src = [
+    "packages/*/src",
+    "apps/*/*/src",
+]
+
+[tool.ruff.lint]
+select = [
+    "B009",
+    "BLE001",
+    "DTZ005",
+    "E4",
+    "E7",
+    "E9",
+    "F",
+    "FURB167",
+    "I001",
+    "RUF022",
+    "RUF100",
+    "SIM102",
+    "TRY004",
+    "UP",
+]
+
+[tool.pyright]
+include = [
+    "conftest.py",
+    "scripts",
+    "tests",
+    "packages/tinkerfin/src",
+    "packages/tinkerfin/tests",
+    "packages/tinkerfin-contracts/src",
+    "packages/tinkerfin-contracts/tests",
+    "packages/tinkerfin-native-stream/src",
+    "packages/tinkerfin-native-stream/tests",
+    "packages/tinkerfin-tracing/src",
+    "packages/tinkerfin-tracing/tests",
+    "packages/tinkerfin-langgraph-mysql/src",
+    "packages/tinkerfin-langgraph-mysql/tests",
+    "packages/tinkerfin-agui-adapter/src",
+    "packages/tinkerfin-agui-adapter/tests",
+    "packages/tinkerfin-messaging/src",
+    "packages/tinkerfin-messaging/tests",
+    "packages/tinkerfin-sandbox/src",
+    "packages/tinkerfin-sandbox/tests",
+    "apps/studio/server/src",
+    "apps/studio/server/tests",
+]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
+reportMissingTypeStubs = "none"
+reportIncompatibleMethodOverride = "error"
+
+executionEnvironments = [{ root = "." }]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+required_plugins = ["pytest-asyncio"]
+markers = [
+    "docker_integration: uses repository-owned disposable Docker services",
+    "opensandbox_e2e: uses a test-owned disposable OpenSandbox Server and Sandbox",
+    "mysql_integration: uses a test-owned disposable MySQL database",
+    "packaging_e2e: builds and installs wheels in isolated environments",
+    "redis_e2e: uses a test-owned disposable Redis Stack service",
+    "studio_mysql_integration: uses test-owned disposable Studio MySQL databases",
+    "studio_e2e: requires the real Studio dependencies and explicit E2E configuration",
+]
+
+testpaths = [
+    "tests",
+    "packages",
+    "apps/studio/server",
+]
+
+addopts = [
+    "--strict-config",
+    "--strict-markers",
+    "-m",
+    "not docker_integration and not packaging_e2e",
+]
+
+[tool.coverage.run]
+branch = true
+source = [
+    "tinkerfin",
+    "tinkerfin_contracts",
+    "tinkerfin_native_stream",
+    "tinkerfin_tracing",
+    "tinkerfin_langgraph_mysql",
+    "langgraph.store.mysql",
+    "tinkerfin_agui_adapter",
+    "tinkerfin_messaging",
+    "tinkerfin_sandbox",
+]
+
+[tool.coverage.report]
+fail_under = 80
+precision = 2
+show_missing = true

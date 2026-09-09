@@ -1,0 +1,447 @@
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+
+import type {
+  TraceGraphFilter,
+  TraceGraphNode,
+  TraceGraphPage,
+} from '../../../api/conversation/traceGraph'
+import { LocaleProvider } from '../../../i18n'
+import { ChainTraceView } from './ChainTraceView'
+
+const useChainTrace = vi.hoisted(() => vi.fn())
+const queryTraceGraph = vi.hoisted(() => vi.fn())
+vi.mock('./useChainTrace', () => ({ useChainTrace }))
+vi.mock('../../../api/conversation/traceGraph', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../../../api/conversation/traceGraph')>(),
+  queryTraceGraph,
+}))
+
+const BASE_TIME = Date.parse('2026-09-04T00:00:00.000Z')
+
+const node = (
+  id: string,
+  kind: TraceGraphNode['kind'],
+  startedSeq: number,
+  values: Partial<TraceGraphNode> = {},
+): TraceGraphNode => ({
+  id,
+  turnId: startedSeq < 10 ? 'turn-1' : 'turn-2',
+  parentSubagentId: null,
+  modelCallId: null,
+  kind,
+  status: 'succeeded',
+  name: kind === 'human_message'
+    ? 'HumanMessage'
+    : kind === 'assistant_message' ? 'AssistantMessage' : id,
+  runId: startedSeq < 10 ? 'run-1' : 'run-2',
+  namespace: [],
+  startedAt: new Date(BASE_TIME + startedSeq * 100).toISOString(),
+  completedAt: new Date(BASE_TIME + startedSeq * 100 + 50).toISOString(),
+  startedSeq,
+  updatedSeq: startedSeq,
+  contentOmitted: false,
+  toolCallOnly: false,
+  requestOmitted: false,
+  resultOmitted: false,
+  linkIssues: [],
+  ...values,
+})
+
+const nodes: TraceGraphNode[] = [
+  node('human-1', 'human_message', 1, { content: '第一轮问题' }),
+  node('context-1', 'custom', 2, { name: '检索上下文', result: '第一轮上下文' }),
+  node('human-2', 'human_message', 10, { content: '第二轮问题' }),
+  node('context-2', 'context', 11, {
+    content: [{ type: 'text', text: '# 最终系统提示词' }],
+  }),
+  node('model-2', 'model', 12, {
+    name: 'deepseek-chat',
+    provider: 'deepseek',
+    model: 'deepseek-chat',
+    firstOutputAt: new Date(BASE_TIME + 1220).toISOString(),
+    request: {
+      messages: [{
+        messageType: 'system',
+        content: [{ type: 'text', text: '# 最终系统提示词' }],
+      }],
+    },
+    usage: {
+      input_tokens: 4872,
+      output_tokens: 185,
+      total_tokens: 5057,
+    },
+    responseMetadata: { finish_reason: 'stop' },
+  }),
+  node('assistant-2', 'assistant_message', 13, {
+    modelCallId: 'model-2',
+    content: '完成',
+  }),
+  node('failed-tool', 'tool', 14, {
+    modelCallId: 'model-2',
+    name: 'search',
+    status: 'failed',
+    failure: {
+      errorType: 'builtins.TimeoutError',
+      message: '搜索服务超时',
+    },
+  }),
+  node('subagent-2', 'subagent', 15, {
+    modelCallId: 'model-2',
+    name: 'researcher',
+    namespace: ['tools:child'],
+    request: {
+      description: '核验子任务',
+      subagent_type: 'researcher',
+    },
+    sourceId: 'call-task',
+  }),
+  node('subagent-input', 'human_message', 16, {
+    parentSubagentId: 'subagent-2',
+    namespace: ['tools:child'],
+    content: '核验子任务',
+  }),
+  node('child-model', 'model', 17, {
+    parentSubagentId: 'subagent-2',
+    namespace: ['tools:child'],
+    name: 'deepseek-research',
+  }),
+  node('child-assistant', 'assistant_message', 18, {
+    parentSubagentId: 'subagent-2',
+    modelCallId: 'child-model',
+    namespace: ['tools:child'],
+    content: '子任务完成',
+  }),
+]
+
+const turns = [
+  {
+    id: 'turn-1',
+    ordinal: 1,
+    startedAt: nodes[0]!.startedAt,
+  },
+  {
+    id: 'turn-2',
+    ordinal: 2,
+    startedAt: nodes[2]!.startedAt,
+  },
+]
+
+const graphPage = (
+  returnedNodes: TraceGraphNode[],
+  matchedNodeIds = returnedNodes.map((item) => item.id),
+): TraceGraphPage => ({
+  turns: turns.filter((turn) => returnedNodes.some((item) => item.turnId === turn.id)),
+  nodes: returnedNodes,
+  orderedNodeIds: returnedNodes.map((item) => item.id),
+  matchedNodeIds,
+  nextCursor: null,
+  asOfSeq: 30,
+  completeness: {
+    callTrackingMissing: false,
+    relationshipEvidenceMissing: false,
+    detailsOmitted: false,
+  },
+})
+
+const filteredPage = (filter: TraceGraphFilter): TraceGraphPage => {
+  const query = filter.query?.toLocaleLowerCase()
+  const direct = nodes.filter((item) => (
+    (!filter.kinds || filter.kinds.includes(item.kind))
+    && (!query || JSON.stringify(item).toLocaleLowerCase().includes(query))
+  ))
+  const returnedIds = new Set(direct.map((item) => item.id))
+  const byId = new Map(nodes.map((item) => [item.id, item]))
+  direct.forEach((item) => {
+    let ownerId = item.parentSubagentId
+    while (ownerId) {
+      returnedIds.add(ownerId)
+      ownerId = byId.get(ownerId)?.parentSubagentId ?? null
+    }
+  })
+  const returned = nodes.filter((item) => returnedIds.has(item.id))
+  return graphPage(returned, direct.map((item) => item.id))
+}
+
+const row = (name: string | RegExp) => screen.getByRole('button', { name })
+
+describe('ChainTraceView', () => {
+  beforeEach(() => {
+    useChainTrace.mockReset()
+    queryTraceGraph.mockReset()
+    window.localStorage.clear()
+    useChainTrace.mockImplementation(({ filter }: { filter: TraceGraphFilter }) => ({
+      state: { phase: 'ready', page: filteredPage(filter) },
+      retry: vi.fn(),
+    }))
+  })
+
+  it('renders the six product lanes and complete Model details', async () => {
+    render(<ChainTraceView threadId="thread-1" active live={false} />)
+
+    expect([...document.querySelectorAll('.chain-trace-lane-label')].map(
+      (element) => element.textContent,
+    )).toEqual(['用户', '上下文', '模型', '工具', '子智能体', '助手'])
+    expect(screen.queryByRole('group', { name: '节点类型' })).not.toBeInTheDocument()
+    expect(screen.getByRole('region', { name: '执行序列' })).toBeVisible()
+    expect(screen.getAllByRole('button', { name: /^选择 / })).toHaveLength(nodes.length)
+    expect(document.querySelectorAll('.chain-trace-sequence-turn-boundary')).toHaveLength(1)
+    expect(document.querySelector('.chain-trace-ticks')).not.toBeInTheDocument()
+    const context = row(/^上下文，# 最终系统提示词/)
+    expect(within(context).queryByText('Context', { exact: true })).not.toBeInTheDocument()
+    fireEvent.click(context)
+    const contextDetails = screen.getByRole('complementary', { name: '链路详情' })
+    expect(within(contextDetails).getByRole('heading', { name: '最终系统提示词' }))
+      .toBeVisible()
+    expect(within(contextDetails).queryByRole('tab', { name: '系统提示词' }))
+      .not.toBeInTheDocument()
+    fireEvent.click(within(contextDetails).getByRole('button', { name: '关闭链路详情' }))
+    const failedTool = row('工具，search，失败，查看详情')
+    fireEvent.click(failedTool)
+    expect(failedTool).toHaveAttribute('aria-current', 'true')
+
+    const errorDetails = await screen.findByRole('complementary', { name: '链路详情' })
+    expect(within(errorDetails).getByText('搜索服务超时')).toBeVisible()
+    fireEvent.click(within(errorDetails).getByRole('button', { name: '关闭链路详情' }))
+    await waitFor(() => expect(failedTool).toHaveFocus())
+
+    fireEvent.click(row('模型，deepseek-chat，已完成，查看详情'))
+    const modelDetails = screen.getByRole('complementary', { name: '链路详情' })
+    fireEvent.click(within(modelDetails).getByRole('tab', { name: '响应' }))
+    expect(within(modelDetails).getByText('完成')).toBeVisible()
+    expect(within(modelDetails).getByText(/"name": "search"/)).toBeVisible()
+    expect(within(modelDetails).getByText(/"name": "researcher"/)).toBeVisible()
+    expect(within(modelDetails).getByText(/"input_tokens": 4872/)).toBeVisible()
+    expect(within(modelDetails).getByText(/"finish_reason": "stop"/)).toBeVisible()
+    expect(queryTraceGraph).not.toHaveBeenCalled()
+
+    fireEvent.click(within(modelDetails).getByRole('tab', { name: '系统提示词' }))
+    expect(within(modelDetails).getByRole('heading', { name: '最终系统提示词' }))
+      .toBeVisible()
+    fireEvent.click(within(modelDetails).getByRole('tab', { name: '用量' }))
+    expect(within(modelDetails).getByText('4,872')).toBeVisible()
+  })
+
+  it('explains when a Context has no final SystemMessage', () => {
+    const context = node('context-empty', 'context', 11, { content: null })
+    useChainTrace.mockReturnValue({
+      state: { phase: 'ready', page: graphPage([context]) },
+      retry: vi.fn(),
+    })
+    render(<ChainTraceView threadId="thread-empty-context" active live={false} />)
+
+    fireEvent.click(row('上下文，不可用，已完成，查看详情'))
+
+    expect(screen.getByText('本次模型请求没有最终系统提示词')).toBeVisible()
+    expect(screen.queryByRole('tab', { name: '系统提示词' })).not.toBeInTheDocument()
+  })
+
+  it('labels only assistants with concrete Tool output as Tool-call-only', () => {
+    const toolOnlyNodes = [
+      node('human-tool-only', 'human_message', 1, { content: '调用工具' }),
+      node('model-tool-only', 'model', 2, { name: 'deepseek-chat' }),
+      node('assistant-tool-only', 'assistant_message', 3, {
+        modelCallId: 'model-tool-only',
+        content: '',
+        toolCallOnly: true,
+      }),
+      node('tool-only-result', 'tool', 4, {
+        modelCallId: 'model-tool-only',
+        name: 'read_file',
+      }),
+      node('assistant-unknown', 'assistant_message', 5, {
+        modelCallId: 'model-without-tool',
+        content: '',
+      }),
+    ]
+    useChainTrace.mockReturnValue({
+      state: { phase: 'ready', page: graphPage(toolOnlyNodes) },
+      retry: vi.fn(),
+    })
+    render(<ChainTraceView threadId="thread-tool-only" active live={false} />)
+
+    const toolOnly = row('助手，（仅工具调用），已完成，查看详情')
+    expect(within(toolOnly).getByText('（仅工具调用）')).toHaveClass('is-muted')
+    expect(row('助手，不可用，已完成，查看详情')).toBeVisible()
+  })
+
+  it('scopes the timeline summary to the selected Turn', () => {
+    const { container } = render(<ChainTraceView threadId="thread-1" active live={false} />)
+    const summary = container.querySelector('.chain-trace-range-summary')
+    const lastTick = () => container.querySelector('.chain-trace-ticks span:last-child')
+
+    fireEvent.click(row(/^用户，第一轮问题/))
+    expect(summary).not.toHaveTextContent('当前范围')
+    expect(summary).toHaveTextContent('第 1 轮')
+    expect(summary).toHaveTextContent('2 节点')
+    expect(lastTick()).toHaveTextContent('150 毫秒')
+
+    fireEvent.click(row(/^助手，完成/))
+    expect(summary).toHaveTextContent('第 2 轮')
+    expect(summary).toHaveTextContent('9 节点')
+    expect(lastTick()).toHaveTextContent('850 毫秒')
+  })
+
+  it('requests the complete Graph without a Studio kind filter', () => {
+    render(<ChainTraceView threadId="thread-1" active live={false} />)
+
+    expect(useChainTrace.mock.calls.at(-1)?.[0].filter).toEqual({ query: undefined })
+    expect(screen.queryByRole('group', { name: '节点类型' })).not.toBeInTheDocument()
+  })
+
+  it('collapses and expands only one nested Subagent scope', () => {
+    render(<ChainTraceView threadId="thread-1" active live={false} />)
+
+    expect(row('用户，核验子任务，已完成，查看详情')).toBeVisible()
+    expect(row('模型，deepseek-chat，已完成，查看详情')).toBeVisible()
+    fireEvent.click(screen.getByRole('button', {
+      name: '收起子智能体 researcher，第 2 轮步骤 6',
+    }))
+    expect(screen.queryByRole('button', { name: '用户，核验子任务，已完成，查看详情' }))
+      .not.toBeInTheDocument()
+    expect(row('用户，第二轮问题，已完成，查看详情')).toBeVisible()
+    fireEvent.click(screen.getByRole('button', {
+      name: '展开子智能体 researcher，第 2 轮步骤 6',
+    }))
+    expect(row('助手，子任务完成，已完成，查看详情')).toBeVisible()
+  })
+
+  it('queries hidden Model responses through modelCallId without a type filter', async () => {
+    queryTraceGraph.mockResolvedValue(graphPage(
+      nodes.filter((item) => item.modelCallId === 'model-2'),
+    ))
+    render(<ChainTraceView threadId="thread-1" active live={false} />)
+
+    fireEvent.click(screen.getByRole('button', { name: '搜索链路节点' }))
+    fireEvent.change(screen.getByRole('searchbox', { name: '搜索链路节点' }), {
+      target: { value: 'deepseek-chat' },
+    })
+    await waitFor(() => expect(useChainTrace.mock.calls.at(-1)?.[0].filter.query)
+      .toBe('deepseek-chat'))
+    fireEvent.click(row('模型，deepseek-chat，已完成，查看详情'))
+    const details = screen.getByRole('complementary', { name: '链路详情' })
+    fireEvent.click(within(details).getByRole('tab', { name: '响应' }))
+
+    expect(await within(details).findByText('完成')).toBeVisible()
+    expect(queryTraceGraph).toHaveBeenCalledWith(
+      'thread-1',
+      {
+        modelCallId: 'model-2',
+      },
+      expect.objectContaining({ limit: 1000, signal: expect.any(AbortSignal) }),
+    )
+  })
+
+  it('opens one compact search control and clears it with Escape', async () => {
+    render(<ChainTraceView threadId="thread-1" active live={false} />)
+
+    const trigger = screen.getByRole('button', { name: '搜索链路节点' })
+    expect(screen.queryByRole('searchbox', { name: '搜索链路节点' }))
+      .not.toBeInTheDocument()
+    fireEvent.click(trigger)
+    const searchbox = screen.getByRole('searchbox', { name: '搜索链路节点' })
+    expect(searchbox).toHaveAttribute('placeholder', '搜索节点、内容')
+    fireEvent.change(searchbox, { target: { value: '模型' } })
+    fireEvent.keyDown(searchbox, { key: 'Escape' })
+    await waitFor(() => expect(
+      screen.getByRole('button', { name: '搜索链路节点' }),
+    ).toHaveFocus())
+    expect(screen.queryByRole('searchbox', { name: '搜索链路节点' }))
+      .not.toBeInTheDocument()
+    expect(screen.getAllByRole('button', { name: '搜索链路节点' })).toHaveLength(1)
+  })
+
+  it('shows Trace actions only after Graph data is ready', () => {
+    useChainTrace.mockReturnValue({
+      state: { phase: 'loading' },
+      retry: vi.fn(),
+    })
+    const rendered = render(<ChainTraceView threadId="thread-1" active live={false} />)
+    expect(screen.queryByLabelText('链路操作')).not.toBeInTheDocument()
+    expect(screen.getByText('正在加载链路…')).toBeVisible()
+
+    rendered.unmount()
+    useChainTrace.mockReturnValue({
+      state: { phase: 'ready', page: graphPage([]) },
+      retry: vi.fn(),
+    })
+    const empty = render(<ChainTraceView threadId="thread-1" active live={false} />)
+    expect(screen.getByLabelText('链路操作')).toBeVisible()
+    expect(screen.getByText('没有匹配的链路节点')).toBeVisible()
+
+    empty.unmount()
+    const retry = vi.fn()
+    const onError = vi.fn()
+    useChainTrace.mockReturnValue({ state: { phase: 'error' }, retry })
+    const failed = render(<ChainTraceView threadId="thread-1" active live={false} onError={onError} />)
+    expect(screen.queryByLabelText('链路操作')).not.toBeInTheDocument()
+    expect(onError).toHaveBeenCalledExactlyOnceWith('链路加载失败')
+    expect(screen.queryByText('链路加载失败')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '重新加载' }))
+    expect(retry).toHaveBeenCalledOnce()
+
+    failed.unmount()
+    useChainTrace.mockReturnValue({
+      state: {
+        phase: 'ready',
+        page: { ...graphPage(nodes), nextCursor: 'older-page' },
+      },
+      retry: vi.fn(),
+    })
+    render(<ChainTraceView threadId="thread-1" active live={false} />)
+    expect(screen.getByRole('status')).toHaveTextContent(
+      '链路超过完整视图上限，请使用搜索缩小范围',
+    )
+    expect(screen.queryByRole('region', { name: '调用时间线' }))
+      .not.toBeInTheDocument()
+  })
+
+  it('renders the complete one-thousand-node boundary', () => {
+    const boundaryNodes = Array.from({ length: 1000 }, (_, index) => node(
+      `boundary-${index}`,
+      index === 0 ? 'human_message' : 'assistant_message',
+      index + 1,
+      {
+        turnId: 'turn-boundary',
+        runId: 'run-boundary',
+        content: `item-${index}`,
+      },
+    ))
+    const boundaryPage: TraceGraphPage = {
+      ...graphPage(boundaryNodes),
+      turns: [{
+        id: 'turn-boundary',
+        ordinal: 1,
+        startedAt: boundaryNodes[0]!.startedAt,
+      }],
+    }
+    useChainTrace.mockReturnValue({
+      state: { phase: 'ready', page: boundaryPage },
+      retry: vi.fn(),
+    })
+
+    const { container } = render(
+      <ChainTraceView threadId="thread-boundary" active live={false} />,
+    )
+
+    expect(container.querySelectorAll('.chain-trace-ledger-row')).toHaveLength(1000)
+    expect(useChainTrace.mock.calls.at(-1)?.[0].limit).toBe(1000)
+  })
+
+  it('uses the correct English Turn unit', () => {
+    window.localStorage.setItem('tinkerfin:language', 'en')
+    useChainTrace.mockReturnValue({
+      state: { phase: 'ready', page: graphPage(nodes.slice(2)) },
+      retry: vi.fn(),
+    })
+    render(
+      <LocaleProvider>
+        <ChainTraceView threadId="thread-1" active live={false} />
+      </LocaleProvider>,
+    )
+
+    const summary = document.querySelector('.chain-trace-range-summary')
+    expect(summary).toHaveTextContent('Total 1 turn')
+    expect(summary?.querySelector('strong')).toHaveTextContent('1')
+  })
+})

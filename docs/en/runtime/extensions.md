@@ -1,0 +1,119 @@
+# Run coordination and Redis leases
+
+[Streams and SSE](streams-and-sse.md) · [中文](../../cn/runtime/extensions.md)
+
+Configure a run coordinator when matching business identities must not execute at the
+same time. The coordinator applies to every Runtime created by that TinkerFin factory.
+
+## Serialize runs for one identity
+
+```python
+from tinkerfin import RunIdentity, InMemoryRunCoordinator, TinkerFin
+
+
+coordinator = InMemoryRunCoordinator(
+    key_resolver=lambda identity: identity.thread_id,
+)
+tinkerfin = TinkerFin(run_coordinator=coordinator)
+
+identity = RunIdentity(threadId="tenant-7/user-42", runId="run-1")
+agent = tinkerfin.create_deep_agent(model=model, tools=tools)
+stream = await tinkerfin.open_run(
+    identity,
+    agent=agent,
+    input=graph_input,
+)
+```
+
+Every managed run has a `RunIdentity`. The coordinator receives that same complete value
+and holds its scope for the lifetime of the native or AG-UI stream.
+
+The built-in coordinator only covers the current process. If several processes must share locks, implement `RunCoordinator` with a shared lock service:
+
+```python
+from contextlib import asynccontextmanager
+
+
+class CustomRunCoordinator:
+    @asynccontextmanager
+    async def __call__(self, identity: RunIdentity):
+        lock = await acquire_lock(identity.thread_id)
+        try:
+            yield
+        finally:
+            await lock.release()
+```
+
+A custom coordinator must release locks during cancellation and use bounded lock waits. Coordination controls concurrency; it does not replace a checkpointer.
+
+## Use a renewable Redis lease when needed
+
+```bash
+pip install "tinkerfin[redis]"
+```
+
+```python
+from tinkerfin.redis import RedisLeaseLock
+
+
+lock = RedisLeaseLock.from_client(redis, key_prefix="my-app:locks")
+
+async with lock:
+    async with lock.hold("invoice-42") as lease:
+        print(lease.fencing_token)
+        await update_invoice()
+```
+
+The lock can also create and own its Redis client:
+
+```python
+lock = RedisLeaseLock.from_url(
+    "redis://localhost:6379/0",
+    key_prefix="my-app:locks",
+)
+```
+
+| Constructor | Required input | Who closes the Redis client |
+| --- | --- | --- |
+| `from_client(client, ...)` | Async Redis client | Caller; the lock borrows it |
+| `from_url(url, ...)` | Redis URL | `RedisLeaseLock` |
+
+Both constructors accept the same options:
+
+| Parameter | Default | Purpose |
+| --- | --- | --- |
+| `key_prefix` | `"tinkerfin:lease:"` | Isolates this application's lock keys; must be non-blank without surrounding whitespace |
+| `lease_ttl_seconds` | `30.0` | Redis TTL for one lease; must be positive |
+| `renew_interval_seconds` | `None` | `None` means one third of the TTL; an explicit value must be less than half the TTL |
+| `wait_poll_seconds` | `0.1` | Delay before retrying an occupied resource; must be positive |
+
+`hold(resource_key)` waits for that resource and yields an immutable `RedisLease` containing `resource_key` and `fencing_token`. Waiting is cancellable, and one lock instance can manage different resource keys concurrently.
+
+The lock renews automatically. An uncertain result, timeout, connection failure, or owner-token mismatch cancels the owner task. Exit waits for renewal cleanup and releases only when the owner token still matches. Redis failure is fail-closed and never falls back to unlocked execution.
+
+After a lease expires, a new holder may enter while a paused old holder later resumes and attempts an external write. The fencing token increases for each successful acquisition of the same resource; use it in conditional writes when the external store must reject stale holders. Applications that only need Redis exclusion may ignore fencing and decide whether database locking or another consistency mechanism is necessary.
+
+Closing `RedisLeaseLock` rejects new scopes and waits for active scopes to clean up. Fencing counters remain in Redis to prevent rollback during normal operation. After Redis data loss or restoration, the application must decide how external fencing monotonicity is preserved.
+
+Active leases, waiters, and releases issue short commands through the shared Redis pool; they do not reserve a connection between polling or renewal attempts. Size the pool for peak concurrent acquire, renew, release, and application Redis work. Redis Cluster is unsupported.
+
+## Choose the observation boundary
+
+Use `TinkerFin.observe(runtime_observer)` for framework-level run/native semantics that
+must cover input, resume checkpoint, interrupt, terminal, close, and validated Native
+parts. The observer opens one request-scoped session, participates in hard durability
+boundaries, and fails the Run closed if it cannot preserve its contract. The provided
+`tinkerfin-tracing.Tracer` uses this boundary.
+
+Use `on_part` and AG-UI's `on_event` to:
+
+- record metrics;
+- write audit events;
+- update progress;
+- perform light validation before delivery.
+
+All three observation paths are awaited in the main stream lifecycle. Avoid synchronous
+network I/O and work that cannot be cancelled. Use logs, metrics, or OTel for transport
+delivery diagnostics; do not write AG-UI or Messaging state into the user semantic Trace.
+
+Next: [Runtime usage reference](api-reference.md).
