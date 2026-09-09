@@ -250,14 +250,24 @@ async def _discard_cancelled_connection(
 ) -> None:
     """Discard a driver connection that may no longer match the server protocol.
 
+    SQLite must finish closing its background connection before cancellation returns,
+    so a following writer does not contend with the cancelled transaction. In
+    SQLAlchemy's aiosqlite adapter, invalidation outside a greenlet only queues a
+    worker stop; AsyncConnection.invalidate awaits graceful driver closure instead.
+
     asyncmy marks an interrupted command as ``Cancelled during execution``. Returning
     that socket through the normal rollback-on-return path produces a reset failure and
     may leave the pool checkout owned until garbage collection. The public pool proxy
-    can synchronously invalidate an async driver outside SQLAlchemy's cancelled
+    can synchronously invalidate asyncmy's socket outside SQLAlchemy's cancelled
     greenlet; a following rollback only clears SQLAlchemy's local transaction state.
+
+    Args:
+        connection: Borrowed connection whose cancelled transaction must release locks.
+        pooled: Pool checkout captured before cancellation, when available.
+        error: Original cancellation retained if cleanup also fails.
     """
 
-    if pooled is None:
+    if pooled is None or connection.dialect.name == "sqlite":
         await _complete_connection_cleanup(
             connection.invalidate(error),
             task_name="tinkerfin-trace-connection-invalidate",

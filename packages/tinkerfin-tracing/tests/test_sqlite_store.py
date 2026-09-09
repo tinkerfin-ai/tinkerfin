@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import sqlite3
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Event as ThreadEvent
 from typing import Any, Literal, TypeVar
 
 import pytest
@@ -2792,6 +2794,83 @@ async def test_sqlite_cancelled_lock_wait_releases_connection_for_retry(
         await writer.aclose()
         await engine.dispose()
         await blocker_engine.dispose()
+
+
+async def test_sqlite_cancelled_transaction_releases_writer_lock_before_returning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver_closed = ThreadEvent()
+    close_delayed = False
+
+    class SlowClosingConnection(sqlite3.Connection):
+        def close(self) -> None:
+            nonlocal close_delayed
+            if close_delayed:
+                super().close()
+                return
+            close_delayed = True
+            # Cancellation must await this worker's physical connection closure.
+            time.sleep(0.25)
+            super().close()
+            driver_closed.set()
+
+    database = tmp_path / "cancelled-transaction.db"
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{database}",
+        connect_args={"factory": SlowClosingConnection},
+    )
+    peer_engine = create_async_engine(
+        f"sqlite+aiosqlite:///{database}", connect_args={"timeout": 0}
+    )
+    store = SqlAlchemyTraceStore(engine)
+    writer = await store.open_writer(_identity())
+    backend = _backend(store)
+    original = backend._raw_write_connection
+    transaction_started = asyncio.Event()
+    release_transaction = asyncio.Event()
+
+    @asynccontextmanager
+    async def held_transaction() -> AsyncIterator[AsyncConnection]:
+        async with original() as connection:
+            transaction_started.set()
+            await release_transaction.wait()
+            yield connection
+
+    monkeypatch.setattr(backend, "_raw_write_connection", held_transaction)
+    writing = asyncio.create_task(writer.append((_fact("started"),)))
+    cancellation_requested = False
+    try:
+        await asyncio.wait_for(transaction_started.wait(), timeout=3)
+        cancellation_requested = True
+        writing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await writing
+        assert driver_closed.is_set()
+        async with peer_engine.connect() as peer:
+            await peer.exec_driver_sql("BEGIN IMMEDIATE")
+            await peer.rollback()
+        monkeypatch.setattr(backend, "_raw_write_connection", original)
+        committed = await writer.append((_fact("started"),))
+        assert committed[0].trace_seq == 1
+        await writer.aclose()
+    finally:
+        release_transaction.set()
+        if not writing.done():
+            writing.cancel()
+        await asyncio.gather(writing, return_exceptions=True)
+        monkeypatch.setattr(backend, "_raw_write_connection", original)
+        try:
+            try:
+                if cancellation_requested:
+                    assert await asyncio.to_thread(driver_closed.wait, 3)
+            finally:
+                await writer.aclose()
+        finally:
+            try:
+                await engine.dispose()
+            finally:
+                await peer_engine.dispose()
 
 
 async def test_sqlite_background_heartbeat_renews_across_initial_lease(

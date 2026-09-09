@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -10,6 +11,8 @@ from pathlib import Path
 from typing import Literal
 
 import pytest
+from sqlalchemy import event
+from sqlalchemy.engine import ExceptionContext
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 
 from tinkerfin_contracts import RunIdentity
@@ -192,7 +195,11 @@ async def test_sqlite_backend_satisfies_public_cross_instance_verifier(
     database = tmp_path / "backend-contract.db"
     first_engine = create_async_engine(f"sqlite+aiosqlite:///{database}")
     second_engine = create_async_engine(f"sqlite+aiosqlite:///{database}")
-    options = TraceStoreOptions()
+    # Conformance checks shared data, not transaction latency. Allow a bounded
+    # 5.25 seconds of retry backoff; exhaustion is tested separately.
+    options = TraceStoreOptions(
+        commit_retry_attempts=15, commit_retry_delay_seconds=0.05
+    )
     primary = _SqlAlchemyTraceLedgerBackend(
         first_engine, namespace="sqlite-backend-contract", options=options
     )
@@ -200,23 +207,37 @@ async def test_sqlite_backend_satisfies_public_cross_instance_verifier(
         second_engine, namespace="sqlite-backend-contract", options=options
     )
     peer_locked = asyncio.Event()
+    close_contended = asyncio.Event()
     if held_peer_close:
         original_primary_commit = primary.commit_ledger_change
         original_peer_commit = peer.commit_ledger_change
         original_peer_transaction = peer._raw_write_connection
 
+        def observe_contention(context: ExceptionContext) -> None:
+            error = context.original_exception
+            if (
+                peer_locked.is_set()
+                and context.statement == "BEGIN IMMEDIATE"
+                and isinstance(error, sqlite3.Error)
+                and getattr(error, "sqlite_errorcode", 0) & 0xFF == sqlite3.SQLITE_BUSY
+            ):
+                close_contended.set()
+
+        event.listen(first_engine.sync_engine, "handle_error", observe_contention)
+
         @asynccontextmanager
         async def held_transaction() -> AsyncIterator[AsyncConnection]:
             async with original_peer_transaction() as connection:
                 peer_locked.set()
-                # A legitimate peer close can hold SQLite's writer lock while the
-                # other client retries. Conformance must retain that concurrency.
-                await asyncio.sleep(0.15)
+                # Release only after the competing client observes a real busy
+                # error, without imposing a transaction-speed assumption.
+                async with asyncio.timeout(10):
+                    await close_contended.wait()
                 yield connection
 
         async def primary_commit(change: TraceLedgerChange):
             if change.kind == "close_writer" and change.run_id == "contract-first":
-                async with asyncio.timeout(3):
+                async with asyncio.timeout(10):
                     await peer_locked.wait()
             return await original_primary_commit(change)
 
@@ -237,6 +258,7 @@ async def test_sqlite_backend_satisfies_public_cross_instance_verifier(
             options=options,
         )
         assert peer_locked.is_set() is held_peer_close
+        assert close_contended.is_set() is held_peer_close
     finally:
         try:
             await first_engine.dispose()
