@@ -2,9 +2,13 @@
 
 ## What it is
 
-`tinkerfin` adds request-scoped native streams and optional AG-UI streams to Deep Agents while keeping
-the installed `create_deep_agent(...)` and `CompiledStateGraph.astream(...)` parameter
-shapes. Streams can be sent directly as SSE or persisted by `tinkerfin-messaging`.
+`tinkerfin` manages agent runs, plan review, execution observations, and asynchronous
+output. Runtime profiles connect agent implementations to a shared stream and lifecycle
+contract. The built-in profiles integrate Deep Agents; custom profiles implement
+`DeepAgentsRuntimeProfile` and are selected explicitly.
+
+Consume native streams or optional AG-UI events, send them as SSE, or persist and replay
+them with `tinkerfin-messaging`.
 
 Models, tools, backends, checkpointers, stores, Sandbox resources, and request mapping
 remain host-owned.

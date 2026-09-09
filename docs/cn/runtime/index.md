@@ -112,10 +112,6 @@ result = await graph.ainvoke(graph_input, config=config)
 所选 Profile 及其 `profile_id` 只构成框架私有的集成与 checkpoint 恢复边界。宿主在框架装配时
 选择该边界；Profile identity 不是应用数据库字段，也不进入 HTTP 请求或响应。
 
-当前不提供 Archive/S3/Blob、payload Encryption/KMS 或 OpenTelemetry exporter。具体集成只能
-通过 `TraceLedgerBackend` 接入活动 Trace 存储；高级集成可完整替换 `TraceStore`、包装 canonical
-payload codec、观察 `RuntimeObserver` 或装饰 Store/Messaging Backend 边界。项目不提供空占位接口。
-
 ## 下一步
 
 - [创建和运行 Deep Agent](deep-agents.md)

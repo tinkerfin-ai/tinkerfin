@@ -1,9 +1,7 @@
 # TinkerFin Contracts
 
-`tinkerfin-contracts` contains the protocol-neutral run identity and Runtime
-observation interfaces shared by TinkerFin integrations. It intentionally has no
-dependency on Deep Agents, LangGraph, LangChain, AG-UI, Messaging, SQL, Redis, or a
-host application.
+`tinkerfin-contracts` provides protocol-neutral run identities and Runtime observation
+interfaces so integrations can share execution data through one common contract.
 
 ## Installation
 
@@ -30,8 +28,7 @@ idempotently at the Runtime boundary.
 
 `RunSourceContext` carries the canonical identity, ordinary/branch/resume/abandon input
 kind, parent lineage, Runtime mode, finite input/config snapshots, public resume
-summaries, and Runtime-owned private state keys. It contains no AG-UI, Messaging, SQL,
-Redis, or host authentication model.
+summaries, and Runtime-owned private state keys.
 
 The observation union contains:
 
@@ -46,9 +43,6 @@ cannot be reassigned, but nested dictionaries and lists remain mutable. Treat re
 evidence as read-only; the Runtime supplies an independent copy to each observer.
 `Command(resume=...)` remains invocation input and is represented only through the
 protocol-neutral Run source summary and checkpoint Observation.
-
-The package defines one current contract. It does not expose protocol-version fields,
-compatibility aliases, persistence implementations, or transport events.
 
 ## License
 

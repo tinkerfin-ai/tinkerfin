@@ -21,16 +21,22 @@ Connect model capabilities to your business—from research and document workflo
 
 ![Studio demo with a conversation, task checklist, and report](docs/assets/screenshots/studio-en.png)
 
-## Built for business workflows
+## Framework capabilities
 
-- **Complete application delivery** — Connect agent execution to a user workspace with frontend interactions, persistent conversations, and file outputs. Deploy Studio directly or integrate the framework into your business systems.
-- **Complex task orchestration** — Turn business goals into execution plans, coordinate tools and subagents, and follow progress as each step moves toward completion.
-- **Human decisions in the workflow** — Require review for plans and selected tool operations. Support approval, rejection, and cancellation to keep business judgment part of automated execution.
-- **Unified execution tracing** — Connect conversations, model calls, tools, and subagents in one execution record. Inspect relationships, timing, and results to diagnose issues and improve workflows.
-- **Persistent conversations and isolated execution** — Store conversations and events, reconnect to receive output, replay streams, and cancel runs. Use isolated file and command environments for business tasks that need ongoing follow-up.
-- **Deployment and integration on your terms** — Built on Deep Agents, with your choice of models, business tools, and storage. Connect frontends through AG-UI and compose the capabilities your application needs in your own environment.
+- **Compose the capabilities your application needs** — Configure models, tools, skills, and subagents, then compose run management, messaging, tracing, and sandbox capabilities as needed. Connect your own frontend or use Studio.
+- **Review the plan before execution** — Plan mode clarifies requirements and drafts a plan for user approval before handing it to the agent. Selected tool operations can require separate approval, keeping people involved in decisions throughout a task.
+- **Stream events and replay after reconnection** — Convert agent output to AG-UI events, then persist, deliver, and replay them through a message channel. Application code can publish custom events during a run through the same subscription and replay mechanism as agent output.
+- **Follow a conversation down to each call** — Trace relationships, inputs, outputs, and timing across models, tools, and subagents. Follow progress live or query past executions to find failed steps and slow operations.
+- **Manage dedicated agent workspaces** — Read files, write files, and run commands in isolated environments, with reuse, warm capacity, pause, and resume. Your application decides how environments are assigned; the framework manages connections and resource lifecycles.
+- **Persist state and coordinate across processes** — Connect checkpointers, storage, and run coordination as needed to retain conversation state and continue after approval. Manage run ownership, duplicate requests, and cancellation across service processes.
+- **Multitenant integration** — Let your application scope conversations and sandboxes by tenant, user, or project, and separate data through storage namespaces. Your application remains responsible for authentication and access authorization.
+- **Context management (planned)** — Select relevant material, compress lengthy histories, and retain goals, constraints, and intermediate findings so limited context stays focused on what matters for the next decision.
+- **Long-term memory governance (planned)** — Store and retrieve user preferences, project knowledge, and lessons from tasks across conversations, with source tracking, tenant isolation, updates and corrections, expiration policies, and explicit deletion.
+- **Task automation (planned)** — Scheduled and event-triggered runs are planned so recurring work and business events can start agent tasks without a new manual conversation each time.
 
-## Studio: the workspace for business agents
+## Studio: a multimodal agent workspace
+
+Start tasks with text, images, and documents. Analyze content, generate images, and receive files in the same conversation. Image understanding and generation require the corresponding models to be configured.
 
 ### Turn business goals into execution plans
 

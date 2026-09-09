@@ -2,7 +2,7 @@
 
 [取消、延迟创建与恢复](cancellation-and-recovery.md) · [English](../../en/messaging/backends-and-codecs.md)
 
-默认 `MemoryBackend` 适合单进程开发。如果多个进程要共享事件、运行状态和取消请求，使用 Redis。
+默认 `MemoryBackend` 适合单进程开发。多个进程共享事件、运行状态和取消请求时，可使用内置 `RedisBackend`，或按下文的公共契约接入自定义共享存储。
 
 ## 使用 Redis
 

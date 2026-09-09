@@ -2,7 +2,7 @@
 
 [Cancellation, deferred sources, and recovery](cancellation-and-recovery.md) · [中文](../../cn/messaging/backends-and-codecs.md)
 
-The default `MemoryBackend` is for one-process development. Use Redis when multiple processes share events, run state, and cancellation.
+The default `MemoryBackend` is for one-process development. To share events, run state, and cancellation across processes, use the built-in `RedisBackend` or integrate custom shared storage through the public contract below.
 
 ## Use Redis
 

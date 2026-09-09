@@ -126,12 +126,6 @@ The selected Profile and its `profile_id` form a framework-private integration a
 checkpoint-recovery boundary. A host selects that boundary during framework assembly;
 the identity is not an application database field or HTTP request/response value.
 
-Archive/S3/Blob storage, payload encryption/KMS, and OpenTelemetry exporters are not
-provided. Active Trace storage implements `TraceLedgerBackend`; advanced integrations
-may replace `TraceStore`, wrap the canonical payload codec, observe `RuntimeObserver`,
-or decorate Store/Messaging Backend boundaries. No placeholder API represents an
-unavailable capability.
-
 ## Next steps
 
 - [Create and run a Deep Agent](deep-agents.md)

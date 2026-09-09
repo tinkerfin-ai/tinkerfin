@@ -168,6 +168,4 @@ Store 只拥有 namespace、thread、writer、Ledger event、Projection checkpoi
 自定义持久化实现 `TraceLedgerBackend`，Graph 查询和重建使用独立的可选协议。Codec 可加密规范
 字节；Runtime Observer 或 Backend decorator 可导出遥测，不需要改变语义 fact。
 
-当前不提供 Archive/S3/Blob 实现或 OpenTelemetry exporter。高级集成可以实现
-`TraceLedgerBackend`、替换 `TraceStore`、包装 canonical codec、观察 `RuntimeObserver` 或装饰
-Store 操作。Messaging Backend 扩展仍属于独立投递边界，不持久化 Trace fact。
+需要完整定制查询与持久化行为时，可替换 `TraceStore`。消息投递与回放通过独立的 Messaging Backend 扩展，Trace fact 仍由 Trace 存储管理。

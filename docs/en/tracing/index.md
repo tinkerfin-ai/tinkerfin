@@ -203,7 +203,6 @@ Custom storage implements `TraceLedgerBackend`; optional Graph query and rebuild
 capabilities have separate protocols. Codecs can encrypt canonical bytes, and Runtime
 observers or Backend decorators can export telemetry without changing semantic facts.
 
-Archive/S3/Blob implementations and OpenTelemetry exporters are not provided. Advanced
-integrations may implement `TraceLedgerBackend`, replace `TraceStore`, wrap the canonical
-codec, observe `RuntimeObserver`, or decorate Store operations. Messaging Backend
-extensions remain a separate delivery boundary and do not persist Trace facts.
+Replace `TraceStore` when you need to customize query and persistence behavior together.
+Extend Messaging Backends separately for message delivery and replay; Trace facts remain
+managed by Trace storage.

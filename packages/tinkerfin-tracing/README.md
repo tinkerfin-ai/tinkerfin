@@ -2,7 +2,7 @@
 
 TinkerFin Tracing records normalized Runtime observations in one replayable semantic
 Ledger. It provides canonical execution graphs, fixed-prefix conversation history,
-live updates, bounded in-memory storage, and durable SQLite or MySQL storage.
+live updates, and replaceable storage, with built-in bounded memory, SQLite, and MySQL implementations.
 
 Tracing does not persist AG-UI frames, HTTP state, or Messaging delivery state.
 
@@ -291,9 +291,7 @@ canonical fact and checkpoint bytes without changing their pre-transform digest.
 Graph mutations supply `model_call_seq` together with `model_call_id` when establishing
 that relationship. Stored and decoded Graph records return `model_call_event` at that
 sequence; its fact must prove the association for the same node, scope, and Run lineage.
-Runtime observers and Backend decorators
-remain the integration points for telemetry or archival. The package does not provide
-an S3, KMS, or OpenTelemetry implementation.
+Use Runtime observers and Backend decorators to integrate telemetry or archival services.
 
 The low-level `TraceWriter` accepts already captured semantic facts and is a trusted
 storage boundary. Applications that need mandatory framework and business redaction use
