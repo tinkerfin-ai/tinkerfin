@@ -420,7 +420,6 @@ class _RenewalObservedSQLState(SQLAlchemyOpenSandboxState):
             url=url, namespace="test", lease_ttl=_SQL_CLAIM_TEST_TTL, poll_interval=0.01
         )
         self.renewed = asyncio.Event()
-        self.warm_claim_checked = asyncio.Event()
 
     async def renew_owner(self, claim: OpenSandboxOwnerClaim) -> bool:
         renewed = await super().renew_owner(claim)
@@ -439,11 +438,6 @@ class _RenewalObservedSQLState(SQLAlchemyOpenSandboxState):
         if renewed:
             self.renewed.set()
         return renewed
-
-    async def claim_warm_slot(self) -> OpenSandboxWarmClaim | None:
-        claim = await super().claim_warm_slot()
-        self.warm_claim_checked.set()
-        return claim
 
     async def wait_for_renewal_beyond_initial_lease(self) -> None:
         loop = asyncio.get_running_loop()
@@ -3152,6 +3146,8 @@ async def test_manager_renews_sql_warm_claim_during_slow_create(
 ) -> None:
     client = _ReconnectableFakeClient()
     client.create_gate = asyncio.Event()
+    # A duplicate creation must reach the count assertion instead of waiting on the gate.
+    client.release_after_create_count = 2
     url = f"sqlite+aiosqlite:///{tmp_path / 'warm-renewal.db'}"
     first_state = _RenewalObservedSQLState(url=url)
     first_manager = _new_manager(
@@ -3173,7 +3169,7 @@ async def test_manager_renews_sql_warm_claim_during_slow_create(
         await first_state.wait_for_renewal_beyond_initial_lease()
         second_start = asyncio.create_task(second_manager.start())
         starts.append(second_start)
-        await asyncio.wait_for(second_state.warm_claim_checked.wait(), timeout=1)
+        await second_start
         assert client.create_calls == 1
     finally:
         client.create_gate.set()
