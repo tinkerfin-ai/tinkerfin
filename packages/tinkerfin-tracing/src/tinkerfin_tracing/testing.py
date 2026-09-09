@@ -41,7 +41,9 @@ async def verify_trace_ledger_backend(
         primary_backend: First backend instance used for writer ownership and reads.
         peer_backend: Independent instance observing and mutating the same storage.
         namespace: Optional empty test namespace controlled by the caller.
-        options: Optional short test lease and polling settings.
+        options: Store settings, using standard ``TraceStoreOptions`` defaults when
+            omitted. Configure borrowed backends with matching provider settings;
+            the verifier does not reconfigure their connections or retry policies.
 
     Raises:
         TypeError: A backend does not implement the complete public protocol.
@@ -56,13 +58,7 @@ async def verify_trace_ledger_backend(
     if primary_backend is peer_backend:
         raise ValueError("backend verifier requires two independent instances")
     resolved_namespace = namespace or f"trace-backend-contract-{uuid4().hex}"
-    resolved_options = options or TraceStoreOptions(
-        writer_lease_seconds=2.0,
-        writer_heartbeat_interval_seconds=0.5,
-        follow_poll_seconds=0.01,
-        commit_retry_attempts=5,
-        commit_retry_delay_seconds=0.001,
-    )
+    resolved_options = options or TraceStoreOptions()
     primary = DurableTraceStore(
         primary_backend,
         namespace=resolved_namespace,

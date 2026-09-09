@@ -78,11 +78,30 @@ def test_trace_store_options_use_storage_role_names() -> None:
     }
 
 
-async def test_public_backend_verifier_exercises_independent_shared_instances() -> None:
+@pytest.mark.parametrize(
+    "options",
+    (None, TraceStoreOptions(follow_poll_seconds=0.01)),
+    ids=("defaults", "explicit-options"),
+)
+async def test_public_backend_verifier_exercises_independent_shared_instances(
+    monkeypatch: pytest.MonkeyPatch,
+    options: TraceStoreOptions | None,
+) -> None:
     primary = _InMemoryTraceLedgerBackend()
     peer = primary._shared_peer()
+    observed: list[TraceStoreOptions] = []
+    original = primary.commit_ledger_change
 
-    await verify_trace_ledger_backend(primary, peer)
+    async def record_options(change: TraceLedgerChange):
+        observed.append(change.options)
+        return await original(change)
+
+    monkeypatch.setattr(primary, "commit_ledger_change", record_options)
+
+    await verify_trace_ledger_backend(primary, peer, options=options)
+
+    assert observed
+    assert all(value == (options or TraceStoreOptions()) for value in observed)
 
 
 async def test_backend_verifier_cleans_first_writer_when_peer_open_fails(

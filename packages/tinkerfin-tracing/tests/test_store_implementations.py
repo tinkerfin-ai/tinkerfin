@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
 import pytest
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 
 from tinkerfin_contracts import RunIdentity
 from tinkerfin_tracing import (
@@ -21,6 +23,7 @@ from tinkerfin_tracing import (
     TraceThreadKey,
     verify_trace_ledger_backend,
 )
+from tinkerfin_tracing.backend import TraceLedgerChange
 from tinkerfin_tracing.errors import (
     TraceProjectionCheckpointConflict,
     TraceRunConflict,
@@ -178,37 +181,67 @@ async def test_sqlite_store_satisfies_shared_contract(tmp_path: Path) -> None:
         await engine.dispose()
 
 
+@pytest.mark.parametrize(
+    "held_peer_close", (False, True), ids=("ordinary", "held-close")
+)
 async def test_sqlite_backend_satisfies_public_cross_instance_verifier(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    held_peer_close: bool,
 ) -> None:
     database = tmp_path / "backend-contract.db"
     first_engine = create_async_engine(f"sqlite+aiosqlite:///{database}")
     second_engine = create_async_engine(f"sqlite+aiosqlite:///{database}")
-    options = TraceStoreOptions(
-        writer_lease_seconds=2,
-        writer_heartbeat_interval_seconds=0.5,
-        follow_poll_seconds=0.01,
-        commit_retry_attempts=10,
-        commit_retry_delay_seconds=0.001,
+    options = TraceStoreOptions()
+    primary = _SqlAlchemyTraceLedgerBackend(
+        first_engine, namespace="sqlite-backend-contract", options=options
     )
+    peer = _SqlAlchemyTraceLedgerBackend(
+        second_engine, namespace="sqlite-backend-contract", options=options
+    )
+    peer_locked = asyncio.Event()
+    if held_peer_close:
+        original_primary_commit = primary.commit_ledger_change
+        original_peer_commit = peer.commit_ledger_change
+        original_peer_transaction = peer._raw_write_connection
+
+        @asynccontextmanager
+        async def held_transaction() -> AsyncIterator[AsyncConnection]:
+            async with original_peer_transaction() as connection:
+                peer_locked.set()
+                # A legitimate peer close can hold SQLite's writer lock while the
+                # other client retries. Conformance must retain that concurrency.
+                await asyncio.sleep(0.15)
+                yield connection
+
+        async def primary_commit(change: TraceLedgerChange):
+            if change.kind == "close_writer" and change.run_id == "contract-first":
+                async with asyncio.timeout(3):
+                    await peer_locked.wait()
+            return await original_primary_commit(change)
+
+        async def peer_commit(change: TraceLedgerChange):
+            if change.kind == "close_writer" and change.run_id == "contract-second":
+                with monkeypatch.context() as patch:
+                    patch.setattr(peer, "_raw_write_connection", held_transaction)
+                    return await original_peer_commit(change)
+            return await original_peer_commit(change)
+
+        monkeypatch.setattr(primary, "commit_ledger_change", primary_commit)
+        monkeypatch.setattr(peer, "commit_ledger_change", peer_commit)
     try:
         await verify_trace_ledger_backend(
-            _SqlAlchemyTraceLedgerBackend(
-                first_engine,
-                namespace="sqlite-backend-contract",
-                options=options,
-            ),
-            _SqlAlchemyTraceLedgerBackend(
-                second_engine,
-                namespace="sqlite-backend-contract",
-                options=options,
-            ),
+            primary,
+            peer,
             namespace="sqlite-backend-contract",
             options=options,
         )
+        assert peer_locked.is_set() is held_peer_close
     finally:
-        await first_engine.dispose()
-        await second_engine.dispose()
+        try:
+            await first_engine.dispose()
+        finally:
+            await second_engine.dispose()
 
 
 async def test_sqlite_concurrent_schema_first_start_uses_one_current_shape(

@@ -1132,13 +1132,7 @@ async def test_mysql_backend_satisfies_public_cross_instance_verifier() -> None:
     first_engine = create_async_engine(_url(), pool_pre_ping=True)
     second_engine = create_async_engine(_url(), pool_pre_ping=True)
     namespace = f"mysql-backend-contract-{uuid4().hex}"
-    options = TraceStoreOptions(
-        writer_lease_seconds=3,
-        writer_heartbeat_interval_seconds=0.5,
-        follow_poll_seconds=0.01,
-        commit_retry_attempts=10,
-        commit_retry_delay_seconds=0.001,
-    )
+    options = TraceStoreOptions()
     try:
         await verify_trace_ledger_backend(
             _SqlAlchemyTraceLedgerBackend(
