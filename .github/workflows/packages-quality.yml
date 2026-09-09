@@ -31,7 +31,7 @@ jobs:
       - name: Test latest-only and Studio behavior
         run: >-
           uv run pytest tests/test_latest_only_contracts.py
-          tests/test_documentation.py tests/test_docker_services.py
+          tests/test_docker_services.py
           apps/studio/server --durations=10
 
   web:

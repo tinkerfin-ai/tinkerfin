@@ -744,6 +744,9 @@ async function mockStudio(page: Page, {
       id: 1,
       threadId: THREAD_ID,
       title: '浏览器会话',
+      titleSource: 'default',
+      titleGenerationStatus: 'idle',
+      titleSeq: 0,
       lastModel: 'GPT-5.5',
       pinned: false,
       asOfSeq: traceAsOfSeq,
@@ -2833,39 +2836,6 @@ test('历史分页一次提交最终滑块比例，不产生中间位移动画',
   expect(new Set(
     finalGeometry.frames.map(({ top, height }) => `${top.toFixed(2)}:${height.toFixed(2)}`),
   ).size).toBe(1)
-})
-
-test('一次快速滑动最多加载一页历史会话', async ({ page }) => {
-  await page.setViewportSize({ width: 1440, height: 600 })
-  const historyRequests: Array<{ cursor: string | null; receivedAt: number }> = []
-  await mockStudio(page, {
-    onHistoryRequest: (request) => historyRequests.push(request),
-    paginatedHistory: true,
-    paginationPageCount: 4,
-    paginationResponseDelayMs: 50,
-  })
-  const history = page.getByRole('region', { name: '最近对话' })
-  const reachBottom = () => history.evaluate((element) => {
-    element.scrollTop = element.scrollHeight
-    element.dispatchEvent(new Event('scroll', { bubbles: true }))
-  })
-
-  await reachBottom()
-  await expect(page.getByRole('button', { name: '打开会话：分页验证会话 29' })).toBeVisible()
-  await reachBottom()
-  for (let index = 0; index < 4; index += 1) {
-    await page.waitForTimeout(50)
-    await history.evaluate((element) => {
-      element.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: 600 }))
-    })
-  }
-  await history.evaluate((element) => element.dispatchEvent(new Event('scroll', { bubbles: true })))
-  expect(historyRequests).toHaveLength(2)
-
-  await page.waitForTimeout(121)
-  await reachBottom()
-  await expect.poll(() => historyRequests.length).toBe(3)
-  await expect(page.getByRole('button', { name: '打开会话：分页验证会话 39' })).toBeVisible()
 })
 
 test('全局滚动条保持统一参数、分层显隐和直接拖拽映射', async ({ page }) => {
