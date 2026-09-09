@@ -93,9 +93,7 @@ def test_agui_adapter_docs_use_the_current_abort_signature() -> None:
     assert all("adapter.abort()" in content for content in contents[2:])
 
 
-def test_public_docs_state_unavailable_capabilities_and_real_extension_boundaries() -> (
-    None
-):
+def test_public_docs_describe_real_extensions_without_capability_inventories() -> None:
     runtime_en = (_REPOSITORY_ROOT / "docs" / "en" / "runtime" / "index.md").read_text(
         encoding="utf-8"
     )
@@ -112,16 +110,18 @@ def test_public_docs_state_unavailable_capabilities_and_real_extension_boundarie
     for content in (runtime_en, runtime_zh):
         assert "Deep Agents v3" in content
         assert "TodoGroups" in content
-        assert "TraceLedgerBackend" in content
-        assert "TraceStore" in content
-        assert "RuntimeObserver" in content
+        assert "profile_id" in content
+        assert "Archive/S3/Blob" not in content
+        assert "placeholder" not in content
     for content in (tracing_en, tracing_zh):
-        assert "S3/Blob" in content
+        compact = re.sub(r"\s+", "", content).lower()
         assert "TraceLedgerBackend" in content
         assert "TraceStore" in content
-        assert "canonical" in content
-        assert "RuntimeObserver" in content
+        assert "Codec" in content
+        assert "runtimeobserver" in compact
         assert "Messaging Backend" in content
+        assert "Archive/S3/Blob" not in content
+        assert "OpenTelemetry exporter" not in content
 
 
 def test_repository_license_docs_name_the_nested_mit_distribution() -> None:
